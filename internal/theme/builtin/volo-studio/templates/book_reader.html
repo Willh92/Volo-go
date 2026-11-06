@@ -1,0 +1,43 @@
+{{define "content"}}
+<div class="book-reader-layout">
+  <aside class="sidebar-card" style="position:sticky;top:92px;max-height:calc(100vh - 120px);overflow-y:auto">
+    <a href="/books" style="font-size:.84rem;color:var(--volo-muted)">← {{t .Locale "bookshelf.title"}}</a>
+    <h2 style="margin:8px 0 4px;font-size:1.15rem">{{.BookDetail.Title}}</h2>
+    <div style="font-size:.82rem;color:var(--volo-muted);margin-bottom:14px">
+      {{t .Locale "bookshelf.chapters" (dict "count" (len .BookDetail.FlatChapters))}}
+    </div>
+    <nav style="display:flex;flex-direction:column;gap:6px;font-size:.9rem">
+      {{range .BookDetail.FlatChapters}}
+        {{if hasPrefix .URL "/"}}
+          <a href="{{.URL}}" class="studio-nav__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
+        {{else if .URL}}
+          {{if eq $.BookDetail.EmbedMode "iframe"}}
+            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" class="studio-nav__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
+          {{else}}
+            <a href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax class="studio-nav__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}} ↗</a>
+          {{end}}
+        {{else}}
+          <span class="studio-nav__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</span>
+        {{end}}
+      {{end}}
+    </nav>
+  </aside>
+
+  <article class="studio-article">
+    {{if .ActiveChapter}}
+      <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
+      {{if eq .BookDetail.EmbedMode "iframe"}}
+        <iframe src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" style="width:100%;min-height:72vh;border:1px solid var(--volo-line);border-radius:10px" sandbox="allow-same-origin allow-scripts"></iframe>
+      {{else}}
+        <p><a class="volo-btn" style="display:inline-flex;align-items:center" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax>{{.ActiveChapter.Title}} ↗</a></p>
+      {{end}}
+    {{else}}
+      <h1 class="studio-article__title">{{.BookDetail.Title}}</h1>
+      {{if .BookDetail.Description}}<p>{{.BookDetail.Description}}</p>{{end}}
+      {{if .BookDetail.SourceURL}}
+        <p><a class="volo-btn" style="display:inline-flex;align-items:center" href="{{.BookDetail.SourceURL}}" target="_blank" rel="noopener" data-no-pjax>{{.BookDetail.SourceURL}} ↗</a></p>
+      {{end}}
+    {{end}}
+  </article>
+</div>
+{{end}}

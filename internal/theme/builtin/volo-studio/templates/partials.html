@@ -1,0 +1,98 @@
+{{define "sidebar"}}
+<aside class="studio-sidebar">
+  <section class="sidebar-card">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <img src="{{if .Site.LogoURL}}{{.Site.LogoURL}}{{else}}/avatars/author.svg{{end}}" alt="{{.Site.Title}}" width="46" height="46" style="border-radius:12px">
+      <div>
+        <div style="font-weight:700">{{.Site.Title}}</div>
+        <div style="font-size:.82rem;color:var(--volo-muted)">{{.Site.Subtitle}}</div>
+      </div>
+    </div>
+    {{if .Site.Description}}<p style="margin:8px 0;font-size:.88rem;color:var(--volo-muted)">{{.Site.Description}}</p>{{end}}
+    {{if .Site.NoticeBoard}}<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--volo-raised);font-size:.84rem">{{.Site.NoticeBoard}}</div>{{end}}
+    {{if .Site.SocialLinks}}
+      <div class="tag-cloud" style="margin-top:10px">
+        {{range .Site.SocialLinks}}
+          <a class="tag-chip" href="{{.URL}}" target="_blank" rel="me noopener" data-no-pjax>{{.Label}}</a>
+        {{end}}
+      </div>
+    {{end}}
+  </section>
+
+  {{range .SidebarWidgets}}
+    <section class="sidebar-card">{{safeHTML .HTML}}</section>
+  {{end}}
+
+  {{if .SidebarCategories}}
+    <section class="sidebar-card">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.categories"}}</h3>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        {{range .SidebarCategories}}
+          <a href="/categories/{{.Slug}}" style="display:flex;justify-content:space-between;color:var(--volo-text);font-size:.9rem">
+            <span>{{.Name}}</span>
+            <span style="color:var(--volo-muted)">{{.ArticleCount}}</span>
+          </a>
+        {{end}}
+      </div>
+    </section>
+  {{end}}
+
+  {{if .SidebarTags}}
+    <section class="sidebar-card">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.tags"}}</h3>
+      <div class="tag-cloud">
+        {{range .SidebarTags}}
+          <a class="tag-chip" href="/tags/{{.Slug}}">#{{.Name}} <span>{{.ArticleCount}}</span></a>
+        {{end}}
+      </div>
+    </section>
+  {{end}}
+
+  {{if .RecentComments}}
+    <section class="sidebar-card">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.recent_comments"}}</h3>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        {{range .RecentComments}}
+          <a href="{{.TargetURL}}" style="color:var(--volo-text);font-size:.86rem;text-decoration:none">
+            <div><strong>{{.AuthorName}}</strong>: {{.Excerpt}}</div>
+            <div style="font-size:.78rem;color:var(--volo-muted)">{{.TargetTitle}}</div>
+          </a>
+        {{end}}
+      </div>
+    </section>
+  {{end}}
+</aside>
+{{end}}
+
+{{define "article_card"}}
+<article class="article__item">
+  <a class="article__cover" href="{{.Card.URL}}" aria-label="{{.Card.Title}}">
+    {{if .Card.IsPasswordProtected}}
+      {{coverSVG .Card.Slug true}}
+    {{else if .Card.CoverURL}}
+      <img src="{{.Card.CoverURL}}" alt="{{.Card.Title}}" loading="lazy" width="320" height="214">
+    {{else}}
+      {{coverSVG .Card.Slug false}}
+    {{end}}
+  </a>
+  <div>
+    <div class="article__meta-top">
+      {{if .Card.IsPinned}}<span class="volo-badge">{{t .Locale "article.pinned"}}</span>{{end}}
+      {{if .Card.IsPasswordProtected}}<span class="volo-badge">🔒 {{t .Locale "article.protected_title"}}</span>{{end}}
+      {{if .Card.HasAudio}}<span class="volo-badge">🎙 {{t .Locale "podcast.badge"}}</span>{{end}}
+      {{if .Card.CategoryName}}<a class="volo-badge" href="/categories/{{.Card.CategorySlug}}">{{.Card.CategoryName}}</a>{{end}}
+      <time datetime="{{fmtISO .Card.PublishedAt}}">{{fmtDate .Card.PublishedAt}}</time>
+    </div>
+    <h2 class="article__title"><a href="{{.Card.URL}}">{{.Card.Title}}</a></h2>
+    <p class="article__summary">{{.Card.Summary}}</p>
+    <div class="article__footer">
+      {{if not .Card.IsPasswordProtected}}
+        <span>{{t .Locale "article.reading_stats" (dict "words" .Card.WordCount "minutes" .Card.ReadingMinutes)}}</span>
+      {{end}}
+      {{range .Card.Tags}}
+        <a class="tag-chip" href="/tags/{{.Slug}}">#{{.Name}}</a>
+      {{end}}
+    </div>
+  </div>
+</article>
+{{end}}

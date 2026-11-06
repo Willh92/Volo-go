@@ -88,5 +88,20 @@
   "error.unauthorized": "Authentication required",
   "error.forbidden": "You do not have permission to access this resource",
   "error.rate_limited": "Too many requests. Please slow down and try again.",
-  "error.not_found": "The requested page or resource was not found"
+  "error.not_found": "The requested page or resource was not found",
+
+  "sidebar.categories": "Categories",
+  "sidebar.tags": "Popular Tags",
+  "sidebar.recent_comments": "Recent Comments",
+  "pagination.prev": "Previous",
+  "pagination.next": "Next",
+  "pagination.page_info": "Page {page} of {total}",
+  "search.empty": "No matching posts found",
+  "search.results_count": "Found {count} matching posts",
+  "reader.login_title": "Reader Sign In & Registration",
+  "reader.register_tab": "Register with Email",
+  "reader.send_code": "Send Code",
+  "reader.code_sent": "Verification code sent",
+  "footer.rss": "RSS Feed",
+  "footer.sitemap": "Sitemap"
 }

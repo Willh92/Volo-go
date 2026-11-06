@@ -1,0 +1,28 @@
+{{define "content"}}
+<div style="max-width:760px;margin:36px auto 64px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:22px">
+  <section class="studio-article" style="padding:26px">
+    <h2 style="margin-top:0">{{t .Locale "nav.login"}}</h2>
+    <form id="volo-reader-login-form" style="display:flex;flex-direction:column;gap:12px">
+      <input class="volo-input" name="ident" required placeholder="Username / Email">
+      <input class="volo-input" name="password" type="password" required placeholder="Password">
+      <div class="js-auth-msg" style="font-size:.85rem;color:var(--volo-danger)"></div>
+      <button class="volo-btn" type="submit">{{t .Locale "nav.login"}}</button>
+    </form>
+  </section>
+
+  <section class="studio-article" style="padding:26px">
+    <h2 style="margin-top:0">{{t .Locale "reader.register_tab"}}</h2>
+    <form id="volo-reader-reg-form" style="display:flex;flex-direction:column;gap:12px">
+      <input class="volo-input" name="username" required minlength="2" maxlength="48" placeholder="Username">
+      <div style="display:flex;gap:8px">
+        <input class="volo-input" style="flex:1" name="email" type="email" required placeholder="Email">
+        <button id="volo-send-code-btn" class="studio-icon-btn" type="button">{{t .Locale "reader.send_code"}}</button>
+      </div>
+      <input class="volo-input" name="code" required maxlength="6" placeholder="6-digit code">
+      <input class="volo-input" name="password" type="password" required minlength="8" placeholder="Password (≥ 8 chars)">
+      <div class="js-auth-msg" style="font-size:.85rem;color:var(--volo-accent)"></div>
+      <button class="volo-btn" type="submit">{{t .Locale "reader.register_tab"}}</button>
+    </form>
+  </section>
+</div>
+{{end}}

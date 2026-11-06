@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,6 +28,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/server"
 	"github.com/Willh92/Volo-go/pkg/id"
+	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
 // Version can be overridden at link time via -ldflags="-X main.Version=v1.0.0".
@@ -280,7 +280,48 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "volo serve: settings load failed: %v\n", err)
 		return 1
 	}
-	_ = catalog
+
+	pluginMgr := plugin.NewManager(plugin.ManagerOptions{
+		Store:      store,
+		Keys:       cfg.KeyRing,
+		PluginsDir: cfg.PluginsDir,
+		DataDir:    cfg.DataDir,
+		Catalog:    catalog,
+	})
+	_ = pluginMgr.DiscoverAndStart(ctx)
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = pluginMgr.Close(shutCtx)
+	}()
+
+	startedAt := time.Now()
+	appSrv, err := server.NewAppServer(server.AppDeps{
+		Config:    cfg,
+		Store:     store,
+		Settings:  settingsMgr,
+		Catalog:   catalog,
+		Plugins:   pluginMgr,
+		StartedAt: startedAt,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "volo serve: server init failed: %v\n", err)
+		return 1
+	}
+
+	// Background scheduled-article publisher (checks every 30s)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = appSrv.Deps().Content.PublishDueScheduled(ctx)
+			}
+		}
+	}()
 
 	handle, err := server.OpenListener(cfg)
 	if err != nil {
@@ -288,14 +329,10 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 
-	startedAt := time.Now()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", server.NewHealthzHandler(store, startedAt))
-
 	fmt.Fprintf(stdout, "Volo-go %s listening on %s://%s (dialect=%s, admin=%s)\n",
 		Version, handle.Network, handle.Address, store.Dialect().Name(), cfg.AdminPath)
 
-	if err := server.ServeWithGracefulShutdown(ctx, handle, mux, cfg.ShutdownTimeout); err != nil {
+	if err := server.ServeWithGracefulShutdown(ctx, handle, appSrv.Handler(), cfg.ShutdownTimeout); err != nil {
 		fmt.Fprintf(stderr, "volo serve: shutdown error: %v\n", err)
 		return 1
 	}

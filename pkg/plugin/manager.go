@@ -1608,9 +1608,10 @@ func RedactArticleForPlugin(in ArticleHookPayload, trustedProtected bool) Articl
 		out.OmittedProtected = true
 		return out
 	}
-	if in.HasContentLock || strings.Contains(in.ContentMD, ":::lock") || strings.Contains(in.SummaryMD, ":::lock") {
+	if in.HasContentLock || strings.Contains(in.ContentMD, ":::lock") || strings.Contains(in.SummaryMD, ":::lock") || strings.Contains(in.HTML, ":::lock") {
 		out.SummaryMD = StripLockedMarkdownBlocks(in.SummaryMD)
 		out.ContentMD = StripLockedMarkdownBlocks(in.ContentMD)
+		out.HTML = ""
 	}
 	return out
 }

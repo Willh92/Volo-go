@@ -1,0 +1,16 @@
+{
+  "id": "volo-studio",
+  "name": {
+    "zh-CN": "Volo Studio 书房",
+    "en-US": "Volo Studio"
+  },
+  "version": "1.0.0",
+  "author": "Volo-go",
+  "description": {
+    "zh-CN": "现代温润纸感与森林墨绿调性的独立创作主题，原生支持四态深浅色、六套共享强调色、无刷新持久挂件路由与播客书架。",
+    "en-US": "Botanical editorial theme with warm paper palette, 4-mode appearance, 6 shared accents, persistent PJAX islands, podcast player, and bookshelf reader."
+  },
+  "accents": ["forest", "ocean", "teal", "amber", "plum", "rose"],
+  "supports_dark_mode": true,
+  "supports_pjax": true
+}

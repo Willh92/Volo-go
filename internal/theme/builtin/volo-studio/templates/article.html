@@ -1,0 +1,167 @@
+{{define "content"}}
+<div class="studio-layout" style="margin-top:28px">
+  <div>
+    <article class="studio-article">
+      {{if .Detail.UnlockedViaShare}}
+        <div class="volo-banner volo-banner--warn">{{t .Locale "article.preview_banner"}}</div>
+      {{end}}
+
+      <div class="article__meta-top">
+        {{if .Detail.CategoryName}}<a class="volo-badge" href="/categories/{{.Detail.CategorySlug}}">{{.Detail.CategoryName}}</a>{{end}}
+        <time datetime="{{fmtISO .Detail.PublishedAt}}">{{fmtDate .Detail.PublishedAt}}</time>
+        {{if and (not .Detail.RequiresPassword) .Reading.EnableReadingStats}}
+          <span>· {{t .Locale "article.reading_stats" (dict "words" .Detail.WordCount "minutes" .Detail.ReadingMinutes)}}</span>
+        {{end}}
+      </div>
+
+      <h1 class="studio-article__title">{{.Detail.Title}}</h1>
+
+      {{if .Alternates}}
+        <div style="margin-bottom:16px;font-size:.86rem;color:var(--volo-muted)">
+          {{t .Locale "article.other_languages"}}
+          {{range .Alternates}}
+            <a class="tag-chip" href="{{.URL}}">{{.Lang}} · {{.Title}}</a>
+          {{end}}
+        </div>
+      {{end}}
+
+      {{if .Detail.RequiresPassword}}
+        <div class="volo-lock-card">
+          <div style="font-size:1.5rem;margin-bottom:6px">🔒</div>
+          <strong>{{t .Locale "article.protected_title"}}</strong>
+          <p style="margin:6px 0 0;color:var(--volo-muted)">{{t .Locale "article.unlock_prompt"}}</p>
+          <form class="volo-unlock-form js-volo-unlock-form" data-article-id="{{.Detail.ID}}">
+            <input class="volo-input" type="password" name="password" required autocomplete="off" placeholder="••••••">
+            <button class="volo-btn" type="submit">{{t .Locale "article.unlock_button"}}</button>
+            <div class="js-unlock-msg" hidden style="width:100%;color:var(--volo-danger);font-size:.86rem">{{t .Locale "article.unlock_wrong_pwd"}}</div>
+          </form>
+        </div>
+      {{else}}
+        {{if gt .OutdatedDays 0}}
+          <div class="volo-banner volo-banner--warn">{{t .Locale "article.outdated_notice" (dict "days" .OutdatedDays)}}</div>
+        {{end}}
+
+        {{if .SeriesContext}}
+          <div class="volo-banner">
+            <a href="/series/{{.SeriesContext.Series.Slug}}">
+              {{t .Locale "article.series_header" (dict "title" .SeriesContext.Series.Title "index" .SeriesContext.Index "total" .SeriesContext.Total)}}
+            </a>
+          </div>
+        {{end}}
+
+        {{if .Detail.AudioURL}}
+          <div class="volo-podcast-box">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span class="volo-badge">🎙 {{t .Locale "podcast.badge"}}</span>
+              <button type="button" id="volo-podcast-speed" class="studio-icon-btn" style="height:28px">1x</button>
+            </div>
+            <audio id="volo-podcast-audio" controls preload="metadata" src="{{.Detail.AudioURL}}"></audio>
+          </div>
+        {{end}}
+
+        <div class="volo-prose">
+          {{safeHTML .Detail.HTML}}
+        </div>
+
+        {{if .Detail.HasLockedSections}}
+          <div class="volo-lock-card">
+            <p style="margin:0 0 8px;color:var(--volo-muted)">{{t .Locale "article.lock_pwd_hint"}}</p>
+            <form class="volo-unlock-form js-volo-unlock-form" data-article-id="{{.Detail.ID}}">
+              <input class="volo-input" type="password" name="password" required autocomplete="off" placeholder="••••••">
+              <button class="volo-btn" type="submit">{{t .Locale "article.unlock_button"}}</button>
+              <div class="js-unlock-msg" hidden style="width:100%;color:var(--volo-danger);font-size:.86rem">{{t .Locale "article.unlock_wrong_pwd"}}</div>
+            </form>
+          </div>
+        {{end}}
+
+        {{if .Detail.Tags}}
+          <div class="tag-cloud" style="margin-top:24px">
+            {{range .Detail.Tags}}
+              <a class="tag-chip" href="/tags/{{.Slug}}">#{{.Name}}</a>
+            {{end}}
+          </div>
+        {{end}}
+
+        {{if .Detail.LicenseText}}
+          <div class="volo-banner" style="margin-top:24px;font-size:.85rem;color:var(--volo-muted)">
+            {{.Detail.LicenseText}}
+          </div>
+        {{end}}
+
+        <div class="volo-reactions">
+          <button type="button" class="volo-reaction-btn" data-target-type="article" data-target-id="{{.Detail.ID}}" data-kind="like">👍 <span class="js-rcnt">{{index .Reactions "like"}}</span></button>
+          <button type="button" class="volo-reaction-btn" data-target-type="article" data-target-id="{{.Detail.ID}}" data-kind="clap">👏 <span class="js-rcnt">{{index .Reactions "clap"}}</span></button>
+          <button type="button" class="volo-reaction-btn" data-target-type="article" data-target-id="{{.Detail.ID}}" data-kind="insight">💡 <span class="js-rcnt">{{index .Reactions "insight"}}</span></button>
+          <button type="button" class="volo-reaction-btn" data-target-type="article" data-target-id="{{.Detail.ID}}" data-kind="rocket">🚀 <span class="js-rcnt">{{index .Reactions "rocket"}}</span></button>
+        </div>
+
+        {{if or .PrevPost .NextPost}}
+          <div class="volo-neighbors">
+            {{if .PrevPost}}
+              <a class="volo-neighbor-card" href="{{.PrevPost.URL}}">
+                <div style="font-size:.78rem;color:var(--volo-muted)">← {{t .Locale "article.prev_post"}}</div>
+                <strong>{{.PrevPost.Title}}</strong>
+              </a>
+            {{end}}
+            {{if .NextPost}}
+              <a class="volo-neighbor-card" href="{{.NextPost.URL}}">
+                <div style="font-size:.78rem;color:var(--volo-muted)">{{t .Locale "article.next_post"}} →</div>
+                <strong>{{.NextPost.Title}}</strong>
+              </a>
+            {{end}}
+          </div>
+        {{end}}
+
+        {{if .Backlinks}}
+          <section style="margin-top:26px;padding-top:18px;border-top:1px solid var(--volo-line)">
+            <h3 style="font-size:1rem;margin:0 0 10px">{{t .Locale "article.backlinks_header"}}</h3>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              {{range .Backlinks}}
+                <a href="{{.URL}}" style="color:var(--volo-text)">
+                  <strong>{{.Title}}</strong>
+                </a>
+              {{end}}
+            </div>
+          </section>
+        {{end}}
+      {{end}}
+    </article>
+
+    {{if and (not .Detail.RequiresPassword) .Detail.AllowComment}}
+      <section id="volo-comments" class="volo-comments-card"
+               data-target-type="article"
+               data-target-id="{{.Detail.ID}}"
+               data-access-mode="{{.Reading.CommentAccessMode}}"
+               data-is-logged="{{if .Viewer}}true{{else}}false{{end}}"
+               data-l-title="{{t .Locale "comment.section_title" (dict "count" .Detail.CommentCount)}}"
+               data-l-nick="{{t .Locale "comment.nickname"}}"
+               data-l-email="{{t .Locale "comment.email_private"}}"
+               data-l-site="{{t .Locale "comment.website"}}"
+               data-l-ph="{{t .Locale "comment.placeholder"}}"
+               data-l-submit="{{t .Locale "comment.submit"}}"
+               data-l-pow="{{t .Locale "comment.submitting_pow"}}"
+               data-l-pending="{{t .Locale "comment.pending_notice"}}"
+               data-l-regonly="{{t .Locale "comment.registered_only"}}"
+               data-l-reply="{{t .Locale "comment.reply"}}"
+               data-l-edit="{{t .Locale "comment.edit"}}"
+               data-l-del="{{t .Locale "comment.delete"}}"
+               data-l-claim="{{t .Locale "comment.claim_guest_prompt" (dict "count" "")}}">
+      </section>
+    {{end}}
+  </div>
+
+  <div>
+    {{if and (not .Detail.RequiresPassword) .Detail.TOC}}
+      <section class="sidebar-card" style="margin-bottom:18px">
+        <h3 class="sidebar-card__title">{{t .Locale "article.toc_title"}}</h3>
+        <nav style="display:flex;flex-direction:column;gap:6px;font-size:.86rem">
+          {{range .Detail.TOC}}
+            <a href="#{{.ID}}" style="padding-left:{{mul (sub .Level 1) 10}}px;color:var(--volo-muted)">{{.Text}}</a>
+          {{end}}
+        </nav>
+      </section>
+    {{end}}
+    {{template "sidebar" .}}
+  </div>
+</div>
+{{end}}

@@ -1,0 +1,124 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="{{.Locale}}" dir="{{.TextDir}}"
+      data-default-mode="{{.Appearance.DefaultMode}}"
+      data-accent="{{.Appearance.Accent}}"
+      data-pjax="{{if .EnablePJAX}}true{{else}}false{{end}}"
+      data-i18n-copy="{{t .Locale "article.copy_code"}}"
+      data-i18n-copied="{{t .Locale "article.copied_code"}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.PageTitle}}</title>
+  <meta name="description" content="{{.MetaDescription}}">
+  {{if .NoIndex}}<meta name="robots" content="noindex, nofollow">{{end}}
+  {{if .CanonicalURL}}<link rel="canonical" href="{{.CanonicalURL}}">{{end}}
+  {{range .Alternates}}<link rel="alternate" hreflang="{{.Lang}}" href="{{.URL}}">
+  {{end}}
+  <meta property="og:site_name" content="{{.Site.Title}}">
+  <meta property="og:title" content="{{.PageTitle}}">
+  <meta property="og:description" content="{{.MetaDescription}}">
+  <meta property="og:type" content="{{if .IsArticle}}article{{else}}website{{end}}">
+  {{if .CanonicalURL}}<meta property="og:url" content="{{.CanonicalURL}}">{{end}}
+  {{if .OGImage}}<meta property="og:image" content="{{.OGImage}}">{{end}}
+  <meta name="twitter:card" content="{{if .OGImage}}summary_large_image{{else}}summary{{end}}">
+  <link rel="alternate" type="application/rss+xml" title="{{.Site.Title}} RSS" href="/rss.xml">
+  <link rel="alternate" type="application/atom+xml" title="{{.Site.Title}} Atom" href="/atom.xml">
+  {{if .Feed.Podcast.Enabled}}<link rel="alternate" type="application/rss+xml" title="{{.Site.Title}} Podcast" href="/podcast.xml">{{end}}
+  {{if .Site.FaviconURL}}<link rel="icon" href="{{.Site.FaviconURL}}">{{end}}
+  <script>
+    (function(){
+      var m = "";
+      try { m = localStorage.getItem("volo_theme_mode") || ""; } catch(_){}
+      if (!m) m = document.documentElement.getAttribute("data-default-mode") || "auto";
+      var eff = m;
+      if (m === "system") eff = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+      else if (m !== "light" && m !== "dark") { var h = new Date().getHours(); eff = (h >= 7 && h < 19) ? "light" : "dark"; }
+      document.documentElement.setAttribute("data-mode", m);
+      document.documentElement.setAttribute("data-theme", eff);
+    })();
+  </script>
+  <link rel="stylesheet" href="{{assetURL .ThemeID "volo-studio.css"}}">
+  {{if .JSONLD}}<script type="application/ld+json">{{safeJS .JSONLD}}</script>{{end}}
+  {{if .Site.CustomHeadMeta}}{{safeHTML .Site.CustomHeadMeta}}{{end}}
+  {{range .HeadWidgets}}{{safeHTML .HTML}}{{end}}
+</head>
+<body>
+  <header class="studio-header">
+    <div class="studio-container studio-header__inner">
+      <a class="studio-brand" href="/">
+        {{if .Site.LogoURL}}<img class="studio-brand__logo" src="{{.Site.LogoURL}}" alt="{{.Site.Title}}" width="32" height="32">{{end}}
+        <span>{{.Site.Title}}</span>
+      </a>
+      <nav class="studio-nav" aria-label="Primary">
+        <a class="studio-nav__link {{if eq .CurrentPath "/"}}is-active{{end}}" href="/">{{t .Locale "nav.home"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/categories"}}is-active{{end}}" href="/categories">{{t .Locale "nav.categories"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/tags"}}is-active{{end}}" href="/tags">{{t .Locale "nav.tags"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/archives"}}is-active{{end}}" href="/archives">{{t .Locale "nav.archives"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/series"}}is-active{{end}}" href="/series">{{t .Locale "nav.series"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/books"}}is-active{{end}}" href="/books">{{t .Locale "nav.bookshelf"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/links"}}is-active{{end}}" href="/links">{{t .Locale "nav.links"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/follows"}}is-active{{end}}" href="/follows">{{t .Locale "nav.follows"}}</a>
+        {{range .NavItems}}
+          <a class="studio-nav__link {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>{{.Title}}</a>
+        {{end}}
+      </nav>
+      <div class="studio-actions">
+        {{if .Reading.EnableInstantSearch}}
+          <button type="button" id="volo-search-btn" class="studio-icon-btn" title="{{t .Locale "nav.search_placeholder"}}">⌘K</button>
+        {{end}}
+        <button type="button" id="volo-theme-btn" class="studio-icon-btn" title="{{t .Locale "appearance.auto"}}">◐</button>
+        {{if and .Site.AllowLocaleSwitch (gt (len .Locales) 1)}}
+          {{range .Locales}}
+            {{if ne .Code $.Locale}}
+              <button type="button" class="studio-icon-btn" data-set-lang="{{.Code}}">{{.Name}}</button>
+            {{end}}
+          {{end}}
+        {{end}}
+        {{if .Viewer}}
+          {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
+            <a class="studio-icon-btn" href="{{.AdminPath}}" data-no-pjax>{{t .Locale "nav.admin_console"}}</a>
+          {{else}}
+            <button type="button" id="volo-reader-logout" class="studio-icon-btn">{{t .Locale "nav.logout"}} ({{.Viewer.DisplayName}})</button>
+          {{end}}
+        {{else if .Reading.AllowReaderRegister}}
+          <a class="studio-icon-btn" href="/reader/login">{{t .Locale "nav.login"}}</a>
+        {{end}}
+      </div>
+    </div>
+  </header>
+
+  <main id="studio-main" class="studio-container">
+    {{template "content" .}}
+  </main>
+
+  <footer class="studio-footer">
+    <div class="studio-container" style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px">
+      <div>
+        <strong>{{.Site.Title}}</strong>
+        {{if .Site.FooterText}} · <span>{{.Site.FooterText}}</span>{{end}}
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap">
+        <a href="/rss.xml" data-no-pjax>{{t .Locale "footer.rss"}}</a>
+        {{if .Feed.Podcast.Enabled}}<a href="/podcast.xml" data-no-pjax>{{t .Locale "podcast.subscribe_rss"}}</a>{{end}}
+        <a href="/sitemap.xml" data-no-pjax>{{t .Locale "footer.sitemap"}}</a>
+        {{if .Feed.EnableLLMSTxt}}<a href="/llms.txt" data-no-pjax>llms.txt</a>{{end}}
+      </div>
+    </div>
+  </footer>
+
+  <div id="volo-search-modal" class="volo-modal" hidden data-empty="{{t .Locale "search.empty"}}">
+    <div class="volo-modal__panel" role="dialog" aria-modal="true">
+      <input id="volo-search-input" class="volo-search-input" type="search" placeholder="{{t .Locale "nav.search_placeholder"}}" autocomplete="off">
+      <div id="volo-search-results" class="volo-search-results"></div>
+    </div>
+  </div>
+
+  <!-- Persistent Plugin & Media Islands Surviving PJAX Transitions -->
+  <div id="volo-persist-dock" data-volo-persist="plugins">
+    {{range .FooterWidgets}}{{safeHTML .HTML}}{{end}}
+  </div>
+
+  <script defer src="{{assetURL .ThemeID "volo-studio.js"}}"></script>
+  <script defer src="{{assetURL .ThemeID "comment-widget.js"}}"></script>
+</body>
+</html>{{end}}

@@ -333,21 +333,29 @@ func (m *SettingsManager) GetBackupSecrets(ctx context.Context) (domain.BackupSe
 	return m.openBackupSecrets(rec.SecretCiphertext)
 }
 
+// PeekShareTokenSecret reads the current ShareToken HMAC secret from ReadDB with zero write side-effects.
+func (m *SettingsManager) PeekShareTokenSecret(ctx context.Context) string {
+	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
+		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
+	if err != nil || rec.SecretCiphertext == "" {
+		return ""
+	}
+	opened, openErr := m.keyRing.OpenString(rec.SecretCiphertext, "settings:security")
+	if openErr != nil {
+		return ""
+	}
+	var sec domain.SecuritySecrets
+	if json.Unmarshal([]byte(opened), &sec) == nil {
+		return sec.ShareTokenSecret
+	}
+	return ""
+}
+
 // GetOrInitShareTokenSecret returns (or initializes & encrypts) the global ShareToken HMAC secret,
 // supporting one-click rotation via RotateShareTokenSecret.
 func (m *SettingsManager) GetOrInitShareTokenSecret(ctx context.Context) (string, error) {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
-		`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
-	if err == nil && rec.SecretCiphertext != "" {
-		opened, openErr := m.keyRing.OpenString(rec.SecretCiphertext, "settings:security")
-		if openErr == nil {
-			var sec domain.SecuritySecrets
-			if json.Unmarshal([]byte(opened), &sec) == nil && len(sec.ShareTokenSecret) >= 32 {
-				return sec.ShareTokenSecret, nil
-			}
-		}
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+	if cur := m.PeekShareTokenSecret(ctx); len(cur) >= 32 {
+		return cur, nil
 	}
 	return m.RotateShareTokenSecret(ctx)
 }

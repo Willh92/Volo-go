@@ -1,0 +1,31 @@
+{{define "content"}}
+<section class="studio-hero">
+  <h1 class="studio-hero__title">{{t .Locale "bookshelf.title"}}</h1>
+  {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+</section>
+
+<div class="studio-layout">
+  <div class="bookshelf-grid">
+    {{range .Books}}
+      <article class="book-card">
+        {{if .CoverURL}}
+          <img src="{{.CoverURL}}" alt="{{.Title}}" loading="lazy" width="240" height="320" style="aspect-ratio:3/4;object-fit:cover">
+        {{end}}
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span class="volo-badge">{{.SourceType}}</span>
+          <span style="font-size:.82rem;color:var(--volo-muted)">{{t $.Locale "bookshelf.chapters" (dict "count" .ChapterCount)}}</span>
+        </div>
+        <h2 style="margin:0;font-size:1.1rem"><a href="/books/{{.Slug}}">{{.Title}}</a></h2>
+        {{if .Description}}<p style="margin:0;font-size:.88rem;color:var(--volo-muted)">{{.Description}}</p>{{end}}
+        <div style="margin-top:auto;padding-top:8px">
+          <a class="studio-icon-btn" href="/books/{{.Slug}}">{{t $.Locale "bookshelf.open_reader"}}</a>
+        </div>
+      </article>
+    {{else}}
+      <div class="sidebar-card" style="color:var(--volo-muted)">{{t .Locale "search.empty"}}</div>
+    {{end}}
+  </div>
+
+  {{template "sidebar" .}}
+</div>
+{{end}}

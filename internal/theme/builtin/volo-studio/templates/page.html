@@ -1,0 +1,44 @@
+{{define "content"}}
+<div class="studio-layout" style="margin-top:28px">
+  <div>
+    <article class="studio-article">
+      <h1 class="studio-article__title">{{.StandalonePage.Title}}</h1>
+      {{if .Alternates}}
+        <div style="margin-bottom:16px;font-size:.86rem;color:var(--volo-muted)">
+          {{t .Locale "article.other_languages"}}
+          {{range .Alternates}}
+            <a class="tag-chip" href="{{.URL}}">{{.Lang}} · {{.Title}}</a>
+          {{end}}
+        </div>
+      {{end}}
+      <div class="volo-prose">
+        {{safeHTML .StandalonePage.HTML}}
+      </div>
+    </article>
+
+    {{if .StandalonePage.AllowComment}}
+      <section id="volo-comments" class="volo-comments-card"
+               data-target-type="page"
+               data-target-id="{{.StandalonePage.ID}}"
+               data-access-mode="{{.Reading.CommentAccessMode}}"
+               data-is-logged="{{if .Viewer}}true{{else}}false{{end}}"
+               data-l-title="{{t .Locale "comment.section_title" (dict "count" .StandalonePage.CommentCount)}}"
+               data-l-nick="{{t .Locale "comment.nickname"}}"
+               data-l-email="{{t .Locale "comment.email_private"}}"
+               data-l-site="{{t .Locale "comment.website"}}"
+               data-l-ph="{{t .Locale "comment.placeholder"}}"
+               data-l-submit="{{t .Locale "comment.submit"}}"
+               data-l-pow="{{t .Locale "comment.submitting_pow"}}"
+               data-l-pending="{{t .Locale "comment.pending_notice"}}"
+               data-l-regonly="{{t .Locale "comment.registered_only"}}"
+               data-l-reply="{{t .Locale "comment.reply"}}"
+               data-l-edit="{{t .Locale "comment.edit"}}"
+               data-l-del="{{t .Locale "comment.delete"}}"
+               data-l-claim="{{t .Locale "comment.claim_guest_prompt" (dict "count" "")}}">
+      </section>
+    {{end}}
+  </div>
+
+  {{template "sidebar" .}}
+</div>
+{{end}}

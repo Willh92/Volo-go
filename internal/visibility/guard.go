@@ -1,0 +1,708 @@
+package visibility
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Willh92/Volo-go/internal/config"
+	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/guest"
+	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/render"
+	"github.com/Willh92/Volo-go/internal/repo"
+)
+
+// ErrProtectedForbidden is returned when an un-unlocked request attempts to access comments or raw .md of a protected post.
+var ErrProtectedForbidden = errors.New("visibility: article is password-protected")
+
+// PublicArticleCard is the strictly redacted view model for home, category, tag, archive, and series lists.
+type PublicArticleCard struct {
+	ID                  string       `json:"id"`
+	Title               string       `json:"title"`
+	Slug                string       `json:"slug"`
+	URL                 string       `json:"url"`
+	CategoryID          string       `json:"category_id,omitempty"`
+	CategoryName        string       `json:"category_name,omitempty"`
+	CategorySlug        string       `json:"category_slug,omitempty"`
+	Tags                []domain.Tag `json:"tags,omitempty"`
+	Summary             string       `json:"summary"`
+	CoverURL            string       `json:"cover_url,omitempty"` // Empty on locked posts -> triggers offline SVG cover-art
+	Lang                string       `json:"lang"`
+	PublishedAt         int64        `json:"published_at"`
+	UpdatedAt           int64        `json:"updated_at"`
+	IsPinned            bool         `json:"is_pinned"`
+	IsPasswordProtected bool         `json:"is_password_protected"`
+	HasContentLock      bool         `json:"has_content_lock"`
+	HasAudio            bool         `json:"has_audio"`
+	WordCount           int          `json:"word_count"`
+	ReadingMinutes      int          `json:"reading_minutes"`
+	ViewCount           int64        `json:"view_count"`
+	CommentCount        int          `json:"comment_count"`
+}
+
+// PublicNeighbor is the strictly minimal metadata for adjacent (Prev/Next) and sidebar related links.
+type PublicNeighbor struct {
+	ID                  string `json:"id"`
+	Title               string `json:"title"`
+	Slug                string `json:"slug"`
+	URL                 string `json:"url"`
+	PublishedAt         int64  `json:"published_at"`
+	IsPasswordProtected bool   `json:"is_password_protected"`
+}
+
+// TranslationAlternate links another language version in the same translation_group.
+type TranslationAlternate struct {
+	Lang  string `json:"lang"`
+	Title string `json:"title"`
+	Slug  string `json:"slug"`
+	URL   string `json:"url"`
+}
+
+// PublicArticleView is the sanitized full-page article view model passed to volo-studio templates.
+type PublicArticleView struct {
+	ID                  string                 `json:"id"`
+	AuthorID            string                 `json:"author_id"`
+	AuthorName          string                 `json:"author_name"`
+	CategoryID          string                 `json:"category_id,omitempty"`
+	CategoryName        string                 `json:"category_name,omitempty"`
+	CategorySlug        string                 `json:"category_slug,omitempty"`
+	Tags                []domain.Tag           `json:"tags,omitempty"`
+	Title               string                 `json:"title"`
+	Slug                string                 `json:"slug"`
+	URL                 string                 `json:"url"`
+	Summary             string                 `json:"summary"`
+	HTML                string                 `json:"html"`
+	CoverURL            string                 `json:"cover_url,omitempty"`
+	OGImageURL          string                 `json:"og_image_url,omitempty"`
+	AllowComment        bool                   `json:"allow_comment"`
+	IsPasswordProtected bool                   `json:"is_password_protected"`
+	RequiresPassword    bool                   `json:"requires_password"`
+	UnlockedViaShare    bool                   `json:"unlocked_via_share"`
+	HasContentLock      bool                   `json:"has_content_lock"`
+	HasLockedSections   bool                   `json:"has_locked_sections"`
+	AudioURL            string                 `json:"audio_url,omitempty"`
+	AudioDurationSec    int                    `json:"audio_duration_sec,omitempty"`
+	AudioSizeBytes      int64                  `json:"audio_size_bytes,omitempty"`
+	AudioMIME           string                 `json:"audio_mime,omitempty"`
+	Lang                string                 `json:"lang"`
+	TranslationGroup    string                 `json:"translation_group,omitempty"`
+	Translations        []TranslationAlternate `json:"translations,omitempty"`
+	LicenseText         string                 `json:"license_text,omitempty"`
+	TOC                 []render.TOCItem       `json:"toc,omitempty"`
+	WordCount           int                    `json:"word_count"`
+	ReadingMinutes      int                    `json:"reading_minutes"`
+	ViewCount           int64                  `json:"view_count"`
+	CommentCount        int                    `json:"comment_count"`
+	PublishedAt         int64                  `json:"published_at"`
+	UpdatedAt           int64                  `json:"updated_at"`
+	NeedsMath           bool                   `json:"needs_math"`
+	NeedsMermaid        bool                   `json:"needs_mermaid"`
+}
+
+// FeedItem represents a sanitized RSS / Atom / Podcast feed entry.
+type FeedItem struct {
+	ID               string
+	Title            string
+	URL              string
+	Summary          string
+	HTML             string
+	AuthorName       string
+	CategoryName     string
+	PublishedAt      int64
+	UpdatedAt        int64
+	AudioURL         string
+	AudioDurationSec int
+	AudioSizeBytes   int64
+	AudioMIME        string
+}
+
+// Guard enforces the 10-surface content visibility perimeter and stateless ShareToken verification.
+type Guard struct {
+	keys      *config.KeyRing
+	settings  *repo.SettingsManager
+	passports *guest.PassportManager
+	catalog   *i18n.Catalog
+	renderer  *render.Engine
+	nowFn     func() time.Time
+}
+
+// NewGuard constructs a ContentVisibilityGuard.
+func NewGuard(
+	keys *config.KeyRing,
+	settings *repo.SettingsManager,
+	passports *guest.PassportManager,
+	catalog *i18n.Catalog,
+	renderer *render.Engine,
+) *Guard {
+	if renderer == nil {
+		renderer = render.Default()
+	}
+	return &Guard{
+		keys:      keys,
+		settings:  settings,
+		passports: passports,
+		catalog:   catalog,
+		renderer:  renderer,
+		nowFn:     time.Now,
+	}
+}
+
+// ArticlePath returns the canonical path `/posts/{slug}` for an article.
+func ArticlePath(slug string) string {
+	return "/posts/" + url.PathEscape(strings.TrimSpace(slug))
+}
+
+// DecryptArticlePassword opens raw.PasswordCiphertext with AES-256-GCM bound to "articles.password:"+raw.ID.
+// If decryption fails (e.g. tampered DB or changed master key), it FAILS CLOSED by returning a non-matchable sentinel!
+func (g *Guard) DecryptArticlePassword(raw domain.RawArticle) (plain string, protected bool) {
+	if strings.TrimSpace(raw.PasswordCiphertext) == "" {
+		return "", false
+	}
+	if g.keys == nil {
+		return "\x00fail-closed-locked", true
+	}
+	opened, err := g.keys.OpenString(raw.PasswordCiphertext, "articles.password:"+raw.ID)
+	if err != nil || opened == "" {
+		return "\x00fail-closed-locked", true
+	}
+	return opened, true
+}
+
+// SealArticlePassword encrypts a plaintext article/lock password with AES-256-GCM bound to articleID.
+func (g *Guard) SealArticlePassword(articleID string, plainPassword string) (string, error) {
+	trimmed := strings.TrimSpace(plainPassword)
+	if trimmed == "" {
+		return "", nil
+	}
+	return g.keys.SealString(trimmed, "articles.password:"+articleID)
+}
+
+// EffectiveUnlockPassword resolves the password required to unlock either a whole-article protected post
+// or an inline `:::lock pwd="..."` block on a public post.
+func (g *Guard) EffectiveUnlockPassword(raw domain.RawArticle) (plain string, isWholeProtected bool, hasAnyPwd bool) {
+	if p, whole := g.DecryptArticlePassword(raw); whole {
+		return p, true, true
+	}
+	if inlinePwd := render.ExtractFirstLockPassword(raw.ContentMD); inlinePwd != "" {
+		return inlinePwd, false, true
+	}
+	return "", false, false
+}
+
+// VerifyArticlePassword checks user-supplied password in constant time against the article's decrypted password
+// (or its inline `:::lock pwd="..."` password).
+func (g *Guard) VerifyArticlePassword(raw domain.RawArticle, candidate string) (string, bool) {
+	plain, _, hasPwd := g.EffectiveUnlockPassword(raw)
+	if !hasPwd || strings.HasPrefix(plain, "\x00") {
+		return "", false
+	}
+	c := strings.TrimSpace(candidate)
+	if c == "" {
+		return "", false
+	}
+	h1 := sha256.Sum256([]byte(plain))
+	h2 := sha256.Sum256([]byte(c))
+	if subtle.ConstantTimeCompare(h1[:], h2[:]) != 1 {
+		return "", false
+	}
+	return plain, true
+}
+
+// --- Timed Passwordless ShareToken (`?preview=<exp>.<sig>`) ---
+
+// IssueShareToken generates a stateless, time-limited preview token bound to BOTH articleID
+// and SHA-256(current_article_password) plus the rotatable ShareTokenSecret.
+func (g *Guard) IssueShareToken(ctx context.Context, raw domain.RawArticle, ttl time.Duration) (string, int64, error) {
+	plainPwd, isWhole, _ := g.EffectiveUnlockPassword(raw)
+	if !isWhole && !raw.HasContentLock && !render.ContainsLockDirective(raw.ContentMD) {
+		return "", 0, errors.New("visibility: article has no password or content lock")
+	}
+	if strings.HasPrefix(plainPwd, "\x00") {
+		return "", 0, errors.New("visibility: article password cannot be decrypted")
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	if ttl > 90*24*time.Hour {
+		ttl = 90 * 24 * time.Hour
+	}
+	var rotSecret string
+	if g.settings != nil {
+		var err error
+		rotSecret, err = g.settings.GetOrInitShareTokenSecret(ctx)
+		if err != nil {
+			return "", 0, err
+		}
+	}
+	exp := g.nowFn().Add(ttl).Unix()
+	sig := g.computeShareMAC(rotSecret, raw.ID, exp, plainPwd)
+	return fmt.Sprintf("%d.%s", exp, sig), exp, nil
+}
+
+// VerifyShareToken validates `?preview=<exp>.<sig>` against the article's current password and rotatable secret
+// with zero database write side-effects.
+func (g *Guard) VerifyShareToken(ctx context.Context, raw domain.RawArticle, token string) bool {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 2 {
+		return false
+	}
+	exp, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || g.nowFn().Unix() >= exp {
+		return false
+	}
+	plainPwd, _, _ := g.EffectiveUnlockPassword(raw)
+	if strings.HasPrefix(plainPwd, "\x00") {
+		return false
+	}
+	var rotSecret string
+	if g.settings != nil {
+		rotSecret = g.settings.PeekShareTokenSecret(ctx)
+	}
+	expected := g.computeShareMAC(rotSecret, raw.ID, exp, plainPwd)
+	return subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expected)) == 1
+}
+
+func (g *Guard) computeShareMAC(rotSecret string, articleID string, exp int64, plainPwd string) string {
+	seed := g.keys.ShareTokenKey()
+	pwdDigest := sha256.Sum256([]byte(plainPwd))
+	mac := hmac.New(sha256.New, seed[:])
+	fmt.Fprintf(mac, "volo-share:v1:%s:%s:%d:%x", rotSecret, articleID, exp, pwdDigest[:])
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:24])
+}
+
+// UnlockStatus describes how/whether the current HTTP request has unlocked a protected article.
+type UnlockStatus struct {
+	Unlocked      bool
+	ViaShareToken bool
+	IsStaffOwner  bool
+}
+
+// CheckRequestUnlock evaluates whether r is authorized to view protected content of raw.
+// Note: unsigned `env_fp` is NEVER accepted for unlocking!
+func (g *Guard) CheckRequestUnlock(r *http.Request, raw domain.RawArticle, viewer *domain.User) UnlockStatus {
+	plainPwd, isWholeProtected, hasAnyPwd := g.EffectiveUnlockPassword(raw)
+	if !isWholeProtected && !raw.HasContentLock && !hasAnyPwd && !render.ContainsLockDirective(raw.ContentMD) {
+		return UnlockStatus{Unlocked: true}
+	}
+
+	// 1. Admin or the Editor who authored the post always has access.
+	if viewer != nil && viewer.Status == domain.UserStatusActive {
+		if viewer.Role == domain.RoleAdmin || (viewer.Role == domain.RoleEditor && viewer.ID == raw.AuthorID) {
+			return UnlockStatus{Unlocked: true, IsStaffOwner: true}
+		}
+	}
+
+	// 2. Timed ShareToken (`?preview=<exp>.<sig>` or `X-Volo-Share-Token`).
+	if r != nil {
+		shareTok := strings.TrimSpace(r.URL.Query().Get("preview"))
+		if shareTok == "" {
+			shareTok = strings.TrimSpace(r.Header.Get("X-Volo-Share-Token"))
+		}
+		if shareTok != "" && g.VerifyShareToken(r.Context(), raw, shareTok) {
+			return UnlockStatus{Unlocked: true, ViaShareToken: true}
+		}
+	}
+
+	// 3. Cryptographically signed GuestPassport + password-hash-bound unlock cookie.
+	if r != nil && g.passports != nil && plainPwd != "" && !strings.HasPrefix(plainPwd, "\x00") {
+		if gp, ok := g.passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
+			if g.passports.HasArticleUnlock(r, gp.GuestID, raw.ID, plainPwd) {
+				return UnlockStatus{Unlocked: true}
+			}
+		}
+	}
+
+	return UnlockStatus{Unlocked: false}
+}
+
+// ApplyNoIndexPrivateHeaders enforces anti-indexing & anti-caching headers on ShareToken or unlocked views.
+func ApplyNoIndexPrivateHeaders(w http.ResponseWriter) {
+	if w == nil {
+		return
+	}
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	w.Header().Set("Cache-Control", "private, no-store")
+}
+
+// --- Surface 1 & 2: List Cards, Summaries & Cover / OG Image Redaction ---
+
+// ToCard converts RawArticle into a zero-leak PublicArticleCard.
+func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Category, tags []domain.Tag, lookupDims func(string) (int, int, bool)) PublicArticleCard {
+	card := PublicArticleCard{
+		ID:             raw.ID,
+		Title:          raw.Title,
+		Slug:           raw.Slug,
+		URL:            ArticlePath(raw.Slug),
+		CategoryID:     raw.CategoryID,
+		Tags:           tags,
+		Lang:           raw.Lang,
+		PublishedAt:    raw.PublishedAt,
+		UpdatedAt:      raw.UpdatedAt,
+		IsPinned:       raw.IsPinned,
+		HasContentLock: raw.HasContentLock,
+		WordCount:      raw.WordCount,
+		ReadingMinutes: raw.ReadingMinutes,
+		ViewCount:      raw.ViewCount,
+		CommentCount:   raw.CommentCount,
+	}
+	if cat != nil {
+		card.CategoryName = cat.Name
+		card.CategorySlug = cat.Slug
+	}
+
+	if _, isProtected := g.DecryptArticlePassword(raw); isProtected {
+		card.IsPasswordProtected = true
+		card.Summary = g.protectedNotice(locale)
+		// Surface 2: NEVER expose custom cover_url, body first-image, word count, or audio presence on locked posts!
+		card.CoverURL = ""
+		card.HasAudio = false
+		card.WordCount = 0
+		card.ReadingMinutes = 1
+		return card
+	}
+
+	// Surface 1 & 2 for `:::lock` posts: physically strip ALL `:::lock ... :::` blocks BEFORE summary & image extraction!
+	safeSummaryMD := render.StripAllLockBlocks(raw.SummaryMD)
+	safeContentMD := render.StripAllLockBlocks(raw.ContentMD)
+
+	renderedContent := g.renderer.Render(safeContentMD, render.Options{
+		Mode:            render.RenderModeWeb,
+		Locale:          locale,
+		ArticleID:       raw.ID,
+		Unlocked:        false,
+		LookupMediaDims: lookupDims,
+	})
+
+	summaryText := ""
+	if strings.TrimSpace(safeSummaryMD) != "" {
+		sumOut := g.renderer.Render(safeSummaryMD, render.Options{
+			Mode:     render.RenderModeWeb,
+			Locale:   locale,
+			Unlocked: false,
+		})
+		summaryText = sumOut.PlainText
+	} else {
+		summaryText = truncateRunes(renderedContent.PlainText, 180)
+	}
+
+	cover := strings.TrimSpace(raw.CoverURL)
+	if cover == "" {
+		cover = renderedContent.FirstImageURL
+	}
+
+	card.Summary = summaryText
+	card.CoverURL = cover
+	card.HasAudio = strings.TrimSpace(raw.AudioURL) != ""
+	if card.WordCount <= 0 {
+		card.WordCount = renderedContent.WordCount
+	}
+	if card.ReadingMinutes <= 0 {
+		card.ReadingMinutes = renderedContent.ReadingMinutes
+	}
+	return card
+}
+
+// --- Surface 3: Adjacent Prev/Next & Related Articles ---
+
+// ToNeighbor strips all summary & cover fields for Prev/Next & Related links.
+func (g *Guard) ToNeighbor(raw domain.RawArticle) PublicNeighbor {
+	_, isProtected := g.DecryptArticlePassword(raw)
+	return PublicNeighbor{
+		ID:                  raw.ID,
+		Title:               raw.Title,
+		Slug:                raw.Slug,
+		URL:                 ArticlePath(raw.Slug),
+		PublishedAt:         raw.PublishedAt,
+		IsPasswordProtected: isProtected,
+	}
+}
+
+// --- Full Detail View ---
+
+// DetailRenderDeps supplies optional per-page enrichments (bookshelf cards, media dimensions, translations).
+type DetailRenderDeps struct {
+	Locale            string
+	AuthorName        string
+	Category          *domain.Category
+	Tags              []domain.Tag
+	Translations      []TranslationAlternate
+	DefaultOGImageURL string
+	SiteTitle         string
+	PublicBaseURL     string
+	LicenseTemplate   string
+	ShowLineNumbers   bool
+	LookupBook        func(slug string) (render.BookCardInfo, bool)
+	ListBooks         func() []render.BookCardInfo
+	LookupMediaDims   func(src string) (int, int, bool)
+}
+
+// ToDetail produces a sanitized PublicArticleView for article detail pages.
+func (g *Guard) ToDetail(
+	w http.ResponseWriter,
+	r *http.Request,
+	raw domain.RawArticle,
+	viewer *domain.User,
+	deps DetailRenderDeps,
+) PublicArticleView {
+	_, isWholeProtected := g.DecryptArticlePassword(raw)
+	status := g.CheckRequestUnlock(r, raw, viewer)
+	if status.ViaShareToken || (isWholeProtected && status.Unlocked) {
+		ApplyNoIndexPrivateHeaders(w)
+	}
+
+	artURL := ArticlePath(raw.Slug)
+	view := PublicArticleView{
+		ID:                  raw.ID,
+		AuthorID:            raw.AuthorID,
+		AuthorName:          deps.AuthorName,
+		CategoryID:          raw.CategoryID,
+		Tags:                deps.Tags,
+		Title:               raw.Title,
+		Slug:                raw.Slug,
+		URL:                 artURL,
+		AllowComment:        raw.AllowComment,
+		IsPasswordProtected: isWholeProtected,
+		UnlockedViaShare:    status.ViaShareToken,
+		HasContentLock:      raw.HasContentLock,
+		Lang:                raw.Lang,
+		TranslationGroup:    raw.TranslationGroup,
+		Translations:        deps.Translations,
+		ViewCount:           raw.ViewCount,
+		CommentCount:        raw.CommentCount,
+		PublishedAt:         raw.PublishedAt,
+		UpdatedAt:           raw.UpdatedAt,
+	}
+	if deps.Category != nil {
+		view.CategoryName = deps.Category.Name
+		view.CategorySlug = deps.Category.Slug
+	}
+
+	if isWholeProtected && !status.Unlocked {
+		view.RequiresPassword = true
+		view.Summary = g.protectedNotice(deps.Locale)
+		view.OGImageURL = deps.DefaultOGImageURL
+		return view
+	}
+
+	out := g.renderer.Render(raw.ContentMD, render.Options{
+		Mode:             render.RenderModeWeb,
+		Locale:           deps.Locale,
+		ArticleID:        raw.ID,
+		Unlocked:         status.Unlocked,
+		IsReaderLoggedIn: viewer != nil && viewer.Status == domain.UserStatusActive,
+		HasAudio:         strings.TrimSpace(raw.AudioURL) != "",
+		ShowLineNumbers:  deps.ShowLineNumbers,
+		LookupBook:       deps.LookupBook,
+		ListBooks:        deps.ListBooks,
+		LookupMediaDims:  deps.LookupMediaDims,
+	})
+
+	view.HTML = out.HTML
+	view.TOC = out.TOC
+	view.NeedsMath = out.NeedsMath
+	view.NeedsMermaid = out.NeedsMermaid
+	view.HasLockedSections = out.HasLockBlock && !status.Unlocked
+	view.WordCount = raw.WordCount
+	if view.WordCount <= 0 {
+		view.WordCount = out.WordCount
+	}
+	view.ReadingMinutes = raw.ReadingMinutes
+	if view.ReadingMinutes <= 0 {
+		view.ReadingMinutes = out.ReadingMinutes
+	}
+
+	// Compute public-safe summary & OG image (never leaking locked blocks into meta tags!).
+	publicSummarySrc := render.StripAllLockBlocks(raw.SummaryMD)
+	publicContentSrc := render.StripAllLockBlocks(raw.ContentMD)
+	pubOut := g.renderer.Render(publicContentSrc, render.Options{
+		Mode:            render.RenderModeWeb,
+		Locale:          deps.Locale,
+		Unlocked:        false,
+		LookupMediaDims: deps.LookupMediaDims,
+	})
+	if strings.TrimSpace(publicSummarySrc) != "" {
+		sOut := g.renderer.Render(publicSummarySrc, render.Options{Locale: deps.Locale})
+		view.Summary = sOut.PlainText
+	} else {
+		view.Summary = truncateRunes(pubOut.PlainText, 160)
+	}
+
+	if isWholeProtected {
+		// Even when unlocked by the current visitor, OG meta tags remain generic!
+		view.OGImageURL = deps.DefaultOGImageURL
+	} else {
+		view.CoverURL = raw.CoverURL
+		og := strings.TrimSpace(raw.CoverURL)
+		if og == "" {
+			og = pubOut.FirstImageURL
+		}
+		if og == "" {
+			og = deps.DefaultOGImageURL
+		}
+		view.OGImageURL = og
+	}
+
+	view.AudioURL = raw.AudioURL
+	view.AudioDurationSec = raw.AudioDurationSec
+	view.AudioSizeBytes = raw.AudioSizeBytes
+	view.AudioMIME = raw.AudioMIME
+	view.LicenseText = formatLicense(raw.LicenseOverride, deps.LicenseTemplate, raw.Title, deps.AuthorName, strings.TrimRight(deps.PublicBaseURL, "/")+artURL, raw.PublishedAt)
+
+	return view
+}
+
+// --- Surface 4: Comments Access Guard ---
+
+// CanAccessArticleComments enforces Surface 4: reading or posting comments on a whole-article
+// password-protected post is strictly forbidden (403) unless the requester has unlocked the post!
+func (g *Guard) CanAccessArticleComments(r *http.Request, raw domain.RawArticle, viewer *domain.User) bool {
+	if _, isProtected := g.DecryptArticlePassword(raw); !isProtected {
+		return true
+	}
+	st := g.CheckRequestUnlock(r, raw, viewer)
+	return st.Unlocked
+}
+
+// --- Surface 6: RSS / Atom / Podcast Feeds ---
+
+// ToFeedItem enforces Surface 6:
+// - Password-protected articles (and their audio enclosures) NEVER enter any public feed.
+// - Partial `:::lock` blocks are replaced by a localized notice blockquote with zero inner text.
+func (g *Guard) ToFeedItem(raw domain.RawArticle, fullOutput bool, locale string, publicBaseURL string, authorName string, categoryName string) (FeedItem, bool) {
+	if _, isProtected := g.DecryptArticlePassword(raw); isProtected {
+		return FeedItem{}, false
+	}
+	safeSummaryMD := render.StripAllLockBlocks(raw.SummaryMD)
+	safeContentMD := render.StripAllLockBlocks(raw.ContentMD)
+
+	feedOut := g.renderer.Render(raw.ContentMD, render.Options{
+		Mode:      render.RenderModeFeed,
+		Locale:    locale,
+		ArticleID: raw.ID,
+		Unlocked:  false,
+	})
+	pubPlainOut := g.renderer.Render(safeContentMD, render.Options{
+		Mode:     render.RenderModeFeed,
+		Locale:   locale,
+		Unlocked: false,
+	})
+
+	summary := ""
+	if strings.TrimSpace(safeSummaryMD) != "" {
+		sOut := g.renderer.Render(safeSummaryMD, render.Options{Mode: render.RenderModeFeed, Locale: locale})
+		summary = sOut.PlainText
+	} else {
+		summary = truncateRunes(pubPlainOut.PlainText, 200)
+	}
+
+	bodyHTML := feedOut.HTML
+	if !fullOutput {
+		bodyHTML = "<p>" + strings.ReplaceAll(summary, "&", "&amp;") + "</p>"
+	}
+
+	absURL := strings.TrimRight(publicBaseURL, "/") + ArticlePath(raw.Slug)
+	audioURL := strings.TrimSpace(raw.AudioURL)
+	if strings.HasPrefix(audioURL, "/") {
+		audioURL = strings.TrimRight(publicBaseURL, "/") + audioURL
+	}
+
+	return FeedItem{
+		ID:               raw.ID,
+		Title:            raw.Title,
+		URL:              absURL,
+		Summary:          summary,
+		HTML:             bodyHTML,
+		AuthorName:       authorName,
+		CategoryName:     categoryName,
+		PublishedAt:      raw.PublishedAt,
+		UpdatedAt:        raw.UpdatedAt,
+		AudioURL:         audioURL,
+		AudioDurationSec: raw.AudioDurationSec,
+		AudioSizeBytes:   raw.AudioSizeBytes,
+		AudioMIME:        raw.AudioMIME,
+	}, true
+}
+
+// --- Surface 7 & 8: Sitemap / IndexNow & Backlinks Eligibility ---
+
+// IsPublicIndexable reports whether raw may appear in /sitemap.xml, IndexNow pushes, or public backlinks.
+func (g *Guard) IsPublicIndexable(raw domain.RawArticle) bool {
+	if raw.Status != domain.ArticleStatusPublished {
+		return false
+	}
+	_, isProtected := g.DecryptArticlePassword(raw)
+	return !isProtected
+}
+
+// --- Surface 9: /llms.txt & /posts/{slug}.md ---
+
+// ToSafeRawMarkdown enforces Surface 9:
+// - Password-protected articles return ("", false) -> excluded from /llms.txt and 403 on /posts/{slug}.md.
+// - Partial `:::lock` articles physically strip all locked sections before returning Markdown.
+func (g *Guard) ToSafeRawMarkdown(raw domain.RawArticle) (string, bool) {
+	if _, isProtected := g.DecryptArticlePassword(raw); isProtected {
+		return "", false
+	}
+	cleanBody := render.StripAllLockBlocks(raw.ContentMD)
+	var b strings.Builder
+	b.WriteString("# ")
+	b.WriteString(raw.Title)
+	b.WriteString("\n\n")
+	b.WriteString(cleanBody)
+	if !strings.HasSuffix(cleanBody, "\n") {
+		b.WriteByte('\n')
+	}
+	return b.String(), true
+}
+
+func (g *Guard) protectedNotice(locale string) string {
+	if g.catalog != nil {
+		msg := g.catalog.T(locale, "article.protected_summary")
+		if msg != "article.protected_summary" && msg != "" {
+			return msg
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(locale), "en") {
+		return "This post is password-protected."
+	}
+	return "受密码保护的文章"
+}
+
+func formatLicense(override string, tmpl string, title string, author string, fullURL string, pubUnix int64) string {
+	src := strings.TrimSpace(override)
+	if src == "" {
+		src = strings.TrimSpace(tmpl)
+	}
+	if src == "" {
+		return ""
+	}
+	dateStr := ""
+	if pubUnix > 0 {
+		dateStr = time.UnixMilli(pubUnix).UTC().Format("2006-01-02")
+	}
+	r := strings.NewReplacer(
+		"{title}", title,
+		"{author}", author,
+		"{url}", fullURL,
+		"{date}", dateStr,
+	)
+	return r.Replace(src)
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(strings.TrimSpace(s))
+	if len(runes) <= maxRunes {
+		return string(runes)
+	}
+	return strings.TrimSpace(string(runes[:maxRunes])) + "…"
+}

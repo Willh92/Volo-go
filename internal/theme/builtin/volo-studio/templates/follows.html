@@ -1,0 +1,36 @@
+{{define "content"}}
+<section class="studio-hero">
+  <h1 class="studio-hero__title">{{t .Locale "nav.follows"}}</h1>
+  {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+</section>
+
+<div class="studio-layout">
+  <div style="display:flex;flex-direction:column;gap:18px">
+    {{range .FollowGroups}}
+      <section class="studio-article" style="padding:24px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px">
+          <div style="display:flex;align-items:center;gap:10px">
+            <img src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" alt="{{.Title}}" width="36" height="36" style="border-radius:9px">
+            <div>
+              <strong>{{.Title}}</strong>
+              {{if .SiteURL}}<div><a href="{{.SiteURL}}" target="_blank" rel="noopener" data-no-pjax style="font-size:.82rem">{{.SiteURL}}</a></div>{{end}}
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          {{range .Items}}
+            <a href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax style="display:flex;justify-content:space-between;gap:12px;padding:8px 10px;border-radius:8px;background:var(--volo-raised);color:var(--volo-text)">
+              <span>{{.Title}}</span>
+              <time style="font-size:.8rem;color:var(--volo-muted);white-space:nowrap">{{fmtDate .PublishedAt}}</time>
+            </a>
+          {{end}}
+        </div>
+      </section>
+    {{else}}
+      <div class="sidebar-card" style="color:var(--volo-muted)">{{t .Locale "search.empty"}}</div>
+    {{end}}
+  </div>
+
+  {{template "sidebar" .}}
+</div>
+{{end}}

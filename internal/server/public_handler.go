@@ -1,0 +1,1313 @@
+package server
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Willh92/Volo-go/internal/auth"
+	"github.com/Willh92/Volo-go/internal/config"
+	"github.com/Willh92/Volo-go/internal/content"
+	"github.com/Willh92/Volo-go/internal/db/sqlx"
+	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/guest"
+	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/render"
+	"github.com/Willh92/Volo-go/internal/repo"
+	"github.com/Willh92/Volo-go/internal/security"
+	"github.com/Willh92/Volo-go/internal/theme"
+	"github.com/Willh92/Volo-go/internal/visibility"
+	"github.com/Willh92/Volo-go/pkg/plugin"
+)
+
+// VerificationMailSender is an optional callback wired in M5 to deliver reader 6-digit email codes via SMTP.
+type VerificationMailSender func(ctx context.Context, toEmail string, code string, locale string) error
+
+// CommentEventNotifier is an optional callback wired in M5 to dispatch email/webhook comment notifications.
+type CommentEventNotifier func(ctx context.Context, comment content.PublicCommentView, in content.CreateCommentInput)
+
+// AppDeps bundles all runtime dependencies for the unified Volo-go HTTP server.
+type AppDeps struct {
+	Config         *config.Config
+	Store          *sqlx.Store
+	Settings       *repo.SettingsManager
+	Catalog        *i18n.Catalog
+	Auth           *auth.Service
+	Passports      *guest.PassportManager
+	PoW            *guest.PoWVerifier
+	Geo            *security.GeoEngine
+	WAF            *security.WAFEngine
+	OutboundDialer *security.OutboundSafeDialer
+	Plugins        *plugin.Manager
+	Content        *content.Service
+	Themes         *theme.Engine
+	StartedAt      time.Time
+
+	SendVerificationMail VerificationMailSender
+	NotifyCommentCreated CommentEventNotifier
+	ExtraMuxSetup        func(mux *http.ServeMux)
+}
+
+// AppServer serves all public pages, feeds, zero-copy Range media, plugins, and v1 APIs (plus Admin/Setup routes).
+type AppServer struct {
+	deps    AppDeps
+	handler http.Handler
+}
+
+// NewAppServer constructs and wires a complete AppServer instance.
+func NewAppServer(deps AppDeps) (*AppServer, error) {
+	if deps.StartedAt.IsZero() {
+		deps.StartedAt = time.Now()
+	}
+	if deps.OutboundDialer == nil {
+		deps.OutboundDialer = &security.OutboundSafeDialer{Timeout: 10 * time.Second}
+	}
+	if deps.Catalog == nil {
+		cat, err := i18n.NewCatalog(deps.Config.DefaultLocale, deps.Config.LocalesDir)
+		if err != nil {
+			return nil, err
+		}
+		deps.Catalog = cat
+	}
+	if deps.Settings == nil {
+		deps.Settings = repo.NewSettingsManager(deps.Store, deps.Config.KeyRing, deps.Config.DefaultLocale)
+		_, _ = deps.Settings.Reload(context.Background())
+	}
+	if deps.Passports == nil {
+		deps.Passports = guest.NewPassportManager(deps.Config.KeyRing, deps.Config.PublicURL)
+	}
+	if deps.PoW == nil {
+		deps.PoW = guest.NewPoWVerifier(deps.Config.KeyRing)
+	}
+	if deps.Auth == nil {
+		deps.Auth = auth.NewService(deps.Store, deps.Config.KeyRing, deps.Settings, deps.Config.PublicURL)
+	}
+	if deps.Geo == nil {
+		deps.Geo = security.NewGeoEngine(deps.Config.GeoIPDir, deps.Settings)
+		_ = deps.Geo.ReloadRules(context.Background(), deps.Store)
+	}
+	if deps.WAF == nil {
+		deps.WAF = security.NewWAFEngine(deps.Config, deps.Store, deps.Settings, deps.Geo)
+		_ = deps.WAF.ReloadBans(context.Background())
+	}
+	if deps.Themes == nil {
+		th, err := theme.NewEngine(deps.Catalog, deps.Config.ThemesDir)
+		if err != nil {
+			return nil, err
+		}
+		deps.Themes = th
+	}
+	if deps.Content == nil {
+		rnd := render.Default()
+		grd := visibility.NewGuard(deps.Config.KeyRing, deps.Settings, deps.Passports, deps.Catalog, rnd)
+		srch := visibility.NewSearchIndex(deps.Store, rnd, visibility.DefaultSearchMaxBytes)
+		deps.Content = content.NewService(content.ServiceOptions{
+			Store:          deps.Store,
+			Keys:           deps.Config.KeyRing,
+			Settings:       deps.Settings,
+			Passports:      deps.Passports,
+			PoW:            deps.PoW,
+			Guard:          grd,
+			Search:         srch,
+			Renderer:       rnd,
+			Plugins:        deps.Plugins,
+			Catalog:        deps.Catalog,
+			OutboundDialer: deps.OutboundDialer,
+		})
+		_ = deps.Content.WarmCaches(context.Background())
+	}
+
+	s := &AppServer{deps: deps}
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
+	if deps.ExtraMuxSetup != nil {
+		deps.ExtraMuxSetup(mux)
+	}
+
+	var root http.Handler = mux
+	root = s.withRedirectGuardian(root)
+	if deps.WAF != nil {
+		root = deps.WAF.WrapHTTP(root)
+	}
+	s.handler = root
+	return s, nil
+}
+
+func (s *AppServer) Handler() http.Handler { return s.handler }
+func (s *AppServer) Deps() AppDeps         { return s.deps }
+
+func (s *AppServer) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/healthz", NewHealthzHandler(s.deps.Store, s.deps.StartedAt))
+	mux.HandleFunc("/uploads/", s.handleServeUpload)
+	mux.HandleFunc("/themes/", s.handleServeThemeAsset)
+	mux.HandleFunc("/avatars/", s.handleServeAvatar)
+	if s.deps.Plugins != nil {
+		mux.Handle("/plugins/", s.deps.Plugins.Handler())
+	}
+
+	// Machine & AI Distribution Feeds
+	mux.HandleFunc("/rss.xml", s.handleRSS)
+	mux.HandleFunc("/atom.xml", s.handleAtom)
+	mux.HandleFunc("/podcast.xml", s.handlePodcast)
+	mux.HandleFunc("/sitemap.xml", s.handleSitemap)
+	mux.HandleFunc("/robots.txt", s.handleRobotsTxt)
+	mux.HandleFunc("/llms.txt", func(w http.ResponseWriter, r *http.Request) { s.handleLLMSTxt(w, r, false) })
+	mux.HandleFunc("/llms-full.txt", func(w http.ResponseWriter, r *http.Request) { s.handleLLMSTxt(w, r, true) })
+	mux.HandleFunc("/github-stats/", s.handleGitHubStatsSVG)
+
+	// Public JSON v1 APIs
+	mux.HandleFunc("/api/v1/pow/challenge", s.handlePoWChallenge)
+	mux.HandleFunc("/api/v1/guest/passport", s.handleGuestPassport)
+	mux.HandleFunc("/api/v1/search", s.handleSearchAPI)
+	mux.HandleFunc("/api/v1/articles/", s.handleArticleActionAPI)
+	mux.HandleFunc("/api/v1/comments", s.handleCommentsRootAPI)
+	mux.HandleFunc("/api/v1/comments/", s.handleCommentItemAPI)
+	mux.HandleFunc("/api/v1/reactions", s.handleReactionsAPI)
+	mux.HandleFunc("/api/v1/reader/send-code", s.handleReaderSendCode)
+	mux.HandleFunc("/api/v1/reader/register", s.handleReaderRegister)
+	mux.HandleFunc("/api/v1/reader/login", s.handleReaderLogin)
+	mux.HandleFunc("/api/v1/reader/logout", s.handleReaderLogout)
+	mux.HandleFunc("/api/v1/reader/claim-guest-comments", s.handleReaderClaimComments)
+
+	// Public Studio HTML Routes
+	mux.HandleFunc("/posts/", s.handlePostRoute)
+	mux.HandleFunc("/categories", s.handleCategoriesOverview)
+	mux.HandleFunc("/categories/", s.handleCategoryPosts)
+	mux.HandleFunc("/tags", s.handleTagsOverview)
+	mux.HandleFunc("/tags/", s.handleTagPosts)
+	mux.HandleFunc("/archives", s.handleArchivesOverview)
+	mux.HandleFunc("/archives/", s.handleArchiveMonthPosts)
+	mux.HandleFunc("/series", s.handleSeriesOverview)
+	mux.HandleFunc("/series/", s.handleSeriesDetail)
+	mux.HandleFunc("/books", s.handleBookshelf)
+	mux.HandleFunc("/books/", s.handleBookReader)
+	mux.HandleFunc("/links", s.handleLinksPage)
+	mux.HandleFunc("/follows", s.handleFollowsPage)
+	mux.HandleFunc("/reader/login", s.handleReaderAuthPage)
+	mux.HandleFunc("/", s.handleRootOrStandalonePage)
+}
+
+func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			p != "/" &&
+			!strings.HasPrefix(p, "/api/") &&
+			!strings.HasPrefix(p, "/themes/") &&
+			!strings.HasPrefix(p, "/uploads/") &&
+			!strings.HasPrefix(p, "/plugins/") &&
+			!strings.HasPrefix(p, "/avatars/") &&
+			p != "/healthz" {
+			if target, code, ok := s.deps.Content.ResolveRedirect(r.Context(), p); ok {
+				dest := target
+				if r.URL.RawQuery != "" && !strings.Contains(dest, "?") {
+					dest += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, dest, code)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Zero-Copy Media Range Serving & Theme Assets ---
+
+func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	rel := strings.TrimPrefix(r.URL.Path, "/uploads/")
+	cleanRel := strings.TrimPrefix(path.Clean("/"+rel), "/")
+	if cleanRel == "" || strings.Contains(cleanRel, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	rootAbs, err := filepath.Abs(s.deps.Config.UploadDir)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if evalRoot, eErr := filepath.EvalSymlinks(rootAbs); eErr == nil {
+		rootAbs = evalRoot
+	}
+
+	fullPath := filepath.Join(rootAbs, filepath.FromSlash(cleanRel))
+	realFile, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if realFile != rootAbs && !strings.HasPrefix(realFile, rootAbs+string(filepath.Separator)) {
+		http.NotFound(w, r)
+		return
+	}
+
+	f, err := os.Open(realFile)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'")
+	w.Header().Set("Cache-Control", "public, max-age=2592000")
+	etag := fmt.Sprintf(`"%x-%x"`, st.ModTime().UnixNano(), st.Size())
+	w.Header().Set("ETag", etag)
+
+	// Zero-copy HTTP Range / 206 Partial Content streaming via stdlib http.ServeContent!
+	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
+}
+
+func (s *AppServer) handleServeThemeAsset(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/themes/")
+	parts := strings.SplitN(rest, "/assets/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	s.deps.Themes.ServeAsset(w, r, parts[0], parts[1])
+}
+
+func (s *AppServer) handleServeAvatar(w http.ResponseWriter, r *http.Request) {
+	seed := strings.TrimPrefix(r.URL.Path, "/avatars/")
+	guest.ServeAvatarHTTP(w, r, seed)
+}
+
+// --- Feeds, Sitemap, Robots, LLMs & Raw Markdown ---
+
+func (s *AppServer) publicBaseURL(r *http.Request) string {
+	if s.deps.Config != nil && strings.TrimSpace(s.deps.Config.PublicURL) != "" {
+		return strings.TrimRight(strings.TrimSpace(s.deps.Config.PublicURL), "/")
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	host := r.Host
+	if host == "" {
+		host = "localhost:8080"
+	}
+	return scheme + "://" + host
+}
+
+func (s *AppServer) resolveLocale(r *http.Request) string {
+	snap := s.deps.Settings.Snapshot()
+	return s.deps.Catalog.ResolveRequest(r, snap.Site.DefaultLocale, snap.Site.AllowLocaleSwitch)
+}
+
+func (s *AppServer) resolveViewer(r *http.Request) (*domain.User, *domain.UserSession) {
+	if r == nil || s.deps.Auth == nil {
+		return nil, nil
+	}
+	ck, err := r.Cookie(auth.SessionCookieName)
+	if err != nil || strings.TrimSpace(ck.Value) == "" {
+		return nil, nil
+	}
+	u, sess, err := s.deps.Auth.AuthenticateSession(r.Context(), ck.Value)
+	if err != nil {
+		return nil, nil
+	}
+	return u, sess
+}
+
+func (s *AppServer) handleRSS(w http.ResponseWriter, r *http.Request) {
+	xmlBytes, err := s.deps.Content.BuildRSSXML(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
+	if err != nil {
+		http.Error(w, "feed error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(xmlBytes)
+}
+
+func (s *AppServer) handleAtom(w http.ResponseWriter, r *http.Request) {
+	xmlBytes, err := s.deps.Content.BuildAtomXML(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
+	if err != nil {
+		http.Error(w, "feed error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(xmlBytes)
+}
+
+func (s *AppServer) handlePodcast(w http.ResponseWriter, r *http.Request) {
+	if !s.deps.Settings.Snapshot().Feed.Podcast.Enabled {
+		http.NotFound(w, r)
+		return
+	}
+	xmlBytes, err := s.deps.Content.BuildPodcastXML(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
+	if err != nil {
+		http.Error(w, "podcast feed error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(xmlBytes)
+}
+
+func (s *AppServer) handleSitemap(w http.ResponseWriter, r *http.Request) {
+	xmlBytes, err := s.deps.Content.BuildSitemapXML(r.Context(), s.publicBaseURL(r))
+	if err != nil {
+		http.Error(w, "sitemap error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(xmlBytes)
+}
+
+func (s *AppServer) handleRobotsTxt(w http.ResponseWriter, r *http.Request) {
+	adminPath := config.DefaultAdminPath
+	if s.deps.Config != nil && s.deps.Config.AdminPath != "" {
+		adminPath = s.deps.Config.AdminPath
+	}
+	var sb strings.Builder
+	sb.WriteString("User-agent: *\nAllow: /\nDisallow: /api/\n")
+	if !s.deps.Config.IsCustomAdminPath {
+		sb.WriteString("Disallow: " + adminPath + "/\n")
+	}
+	sb.WriteString("Sitemap: " + s.publicBaseURL(r) + "/sitemap.xml\n")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(sb.String()))
+}
+
+func (s *AppServer) handleLLMSTxt(w http.ResponseWriter, r *http.Request, full bool) {
+	if !s.deps.Settings.Snapshot().Feed.EnableLLMSTxt {
+		http.NotFound(w, r)
+		return
+	}
+	txt, err := s.deps.Content.BuildLLMSTxt(r.Context(), s.publicBaseURL(r), full)
+	if err != nil {
+		http.Error(w, "llms.txt error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(txt)
+}
+
+func (s *AppServer) handleGitHubStatsSVG(w http.ResponseWriter, r *http.Request) {
+	user := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/github-stats/"), ".svg")
+	if strings.TrimSpace(user) == "" {
+		http.NotFound(w, r)
+		return
+	}
+	svg := s.deps.Content.BuildGitHubStatsSVG(user)
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(svg)
+}
+
+// --- Public JSON v1 APIs ---
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (s *AppServer) handlePoWChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	bits := s.deps.Settings.Snapshot().Reading.PoWDifficultyBits
+	if bits <= 0 {
+		bits = 14
+	}
+	chal, err := s.deps.PoW.IssueChallenge(bits)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, chal)
+}
+
+func (s *AppServer) handleGuestPassport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	gp, _ := s.deps.Passports.ResolveOrHeal(w, r, true)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"guest_id":       gp.GuestID,
+		"passport_token": gp.SignedToken,
+		"source":         gp.Source,
+	})
+}
+
+func (s *AppServer) handleSearchAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.deps.Settings.Snapshot().Reading.EnableInstantSearch {
+		http.NotFound(w, r)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	hits, err := s.deps.Content.SearchIndex().Search(r.Context(), q, 20)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "search failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hits": hits})
+}
+
+func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Request) {
+	// Matches POST /api/v1/articles/{id}/unlock
+	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/articles/")
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || parts[1] != "unlock" || r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	articleID := strings.TrimSpace(parts[0])
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("unlock:"+articleID, clientIP, 10, 5*time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		return
+	}
+
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+
+	raw, err := s.deps.Content.GetRawArticleByID(r.Context(), articleID)
+	if err != nil || raw.Status != domain.ArticleStatusPublished {
+		http.NotFound(w, r)
+		return
+	}
+	plainPwd, ok := s.deps.Content.Guard().VerifyArticlePassword(raw, req.Password)
+	if !ok {
+		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "article.unlock_wrong_pwd")})
+		return
+	}
+
+	gp, _ := s.deps.Passports.ResolveOrHeal(w, r, true)
+	unlockState, err := s.deps.Passports.GrantArticleUnlock(w, r, gp.GuestID, raw.ID, plainPwd)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	visibility.ApplyNoIndexPrivateHeaders(w)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"unlocked":       true,
+		"passport_token": gp.SignedToken,
+		"unlock_state":   unlockState,
+	})
+}
+
+func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	switch r.Method {
+	case http.MethodGet:
+		tType := r.URL.Query().Get("target_type")
+		tID := r.URL.Query().Get("target_id")
+		list, err := s.deps.Content.ListTargetComments(r.Context(), r, viewer, tType, tID)
+		if errors.Is(err, visibility.ErrProtectedForbidden) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"comments": list})
+
+	case http.MethodPost:
+		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		if !s.deps.WAF.AllowRate("comment_post", clientIP, 12, time.Minute) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+			return
+		}
+		var in content.CreateCommentInput
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.TrimSpace(in.EnvFPSignal) == "" {
+			in.EnvFPSignal = r.Header.Get(guest.EnvFPHeaderName)
+		}
+		in.ClientIP = clientIP.String()
+		if loc, ok := s.deps.Geo.Lookup(clientIP); ok {
+			in.GeoRegion = loc.Region
+		}
+		in.Locale = s.resolveLocale(r)
+
+		created, passportTok, err := s.deps.Content.CreateComment(r.Context(), w, r, viewer, in)
+		if errors.Is(err, visibility.ErrProtectedForbidden) || errors.Is(err, content.ErrCommentsClosed) || errors.Is(err, content.ErrRegisteredOnly) || errors.Is(err, content.ErrCommentRejected) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if s.deps.NotifyCommentCreated != nil {
+			go s.deps.NotifyCommentCreated(context.Background(), created, in)
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"comment":        created,
+			"passport_token": passportTok,
+		})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request) {
+	commentID := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/v1/comments/"))
+	if commentID == "" || strings.Contains(commentID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	viewer, _ := s.resolveViewer(r)
+
+	switch r.Method {
+	case http.MethodPatch:
+		var body struct {
+			ContentMD string `json:"content_md"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		updated, err := s.deps.Content.UpdateOwnComment(r.Context(), r, viewer, commentID, body.ContentMD)
+		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, visibility.ErrProtectedForbidden) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"comment": updated})
+
+	case http.MethodDelete:
+		err := s.deps.Content.DeleteOwnComment(r.Context(), r, viewer, commentID)
+		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, visibility.ErrProtectedForbidden) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TargetType string `json:"target_type"`
+		TargetID   string `json:"target_id"`
+		Kind       string `json:"kind"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	viewer, _ := s.resolveViewer(r)
+	actorHash := ""
+	if viewer != nil {
+		actorHash = "user:" + viewer.ID
+	} else if gp, ok := s.deps.Passports.ResolveOrHeal(w, r, true); ok && gp != nil {
+		actorHash = "gp:" + gp.GuestIDHash
+	} else if fp := guest.ComputeEnvFPHash(s.deps.Config.KeyRing, r.Header.Get(guest.EnvFPHeaderName)); fp != "" {
+		actorHash = "fp:" + fp
+	}
+	counts, added, err := s.deps.Content.ToggleReaction(r.Context(), req.TargetType, req.TargetID, actorHash, req.Kind)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "added": added})
+}
+
+// --- Isolated Reader Auth & One-Click Historical Guest Comment Claim ---
+
+func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "reader registration disabled"})
+		return
+	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("reader_code", clientIP, 5, 10*time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		return
+	}
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	code, err := s.deps.Auth.IssueReaderVerificationCode(req.Email)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	locale := s.resolveLocale(r)
+	if s.deps.SendVerificationMail != nil {
+		_ = s.deps.SendVerificationMail(r.Context(), req.Email, code, locale)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": s.deps.Catalog.T(locale, "reader.code_sent")})
+}
+
+func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "reader registration disabled"})
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	locale := s.resolveLocale(r)
+	u, err := s.deps.Auth.RegisterReader(r.Context(), req.Username, req.Email, req.Password, req.Code, locale)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	var geo string
+	if loc, ok := s.deps.Geo.Lookup(clientIP); ok {
+		geo = loc.Region
+	}
+	_, rawTok, err := s.deps.Auth.CreateSession(r.Context(), u.ID, clientIP, geo, r.UserAgent(), 0)
+	if err == nil {
+		s.setSessionCookie(w, rawTok)
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"user": u})
+}
+
+func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("reader_login", clientIP, 10, 5*time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		return
+	}
+	var req struct {
+		Ident    string `json:"ident"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	var geo string
+	if loc, ok := s.deps.Geo.Lookup(clientIP); ok {
+		geo = loc.Region
+	}
+	res, err := s.deps.Auth.LoginReader(r.Context(), req.Ident, req.Password, clientIP, geo, r.UserAgent())
+	if errors.Is(err, auth.ErrForbidden) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
+	s.setSessionCookie(w, res.RawToken)
+	writeJSON(w, http.StatusOK, map[string]any{"user": res.User, "csrf_token": res.CSRFToken})
+}
+
+func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	viewer, sess := s.resolveViewer(r)
+	if viewer != nil && sess != nil {
+		_ = s.deps.Auth.RevokeSession(r.Context(), viewer, sess.ID)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *AppServer) handleReaderClaimComments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	viewer, _ := s.resolveViewer(r)
+	if viewer == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "sign in required"})
+		return
+	}
+	gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false)
+	if !ok || gp == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no verified guest passport found"})
+		return
+	}
+	claimed, err := s.deps.Auth.ClaimGuestComments(r.Context(), viewer, gp)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	msg := s.deps.Catalog.T(s.resolveLocale(r), "comment.claim_guest_success", map[string]any{"count": claimed})
+	writeJSON(w, http.StatusOK, map[string]any{"claimed": claimed, "message": msg})
+}
+
+func (s *AppServer) setSessionCookie(w http.ResponseWriter, rawToken string) {
+	secure := strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.deps.Config.PublicURL)), "https://")
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.SessionCookieName,
+		Value:    rawToken,
+		Path:     "/",
+		MaxAge:   int(auth.SessionTTL / time.Second),
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// --- Public Studio HTML Pages ---
+
+func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.PageContext {
+	snap := s.deps.Settings.Snapshot()
+	locale := s.resolveLocale(r)
+	navItems, _ := s.deps.Content.ListPublicNavItems(r.Context(), locale)
+	cats, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
+	tags, _ := s.deps.Content.ListTagsWithCounts(r.Context(), snap.Reading.PopularTagsCount)
+	recentComments, _ := s.deps.Content.ListRecentPublicComments(r.Context(), snap.Reading.RecentCommentsCount)
+
+	var headSlots, footerSlots []plugin.RenderedSlot
+	if s.deps.Plugins != nil {
+		slotCtx := plugin.SlotRenderContext{
+			Locale:      locale,
+			Path:        r.URL.Path,
+			ThemeAccent: snap.Appearance.Accent,
+		}
+		headSlots = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotPublicHead, slotCtx)
+		footerSlots = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotPublicFooter, slotCtx)
+	}
+
+	adminPath := config.DefaultAdminPath
+	if s.deps.Config != nil && s.deps.Config.AdminPath != "" {
+		adminPath = s.deps.Config.AdminPath
+	}
+
+	desc := snap.SEO.MetaDescription
+	if desc == "" {
+		desc = snap.Site.Description
+	}
+
+	return theme.PageContext{
+		Locale:            locale,
+		TextDir:           "ltr",
+		Locales:           s.deps.Catalog.Locales(),
+		CurrentPath:       r.URL.Path,
+		BasePath:          r.URL.Path,
+		CanonicalURL:      s.publicBaseURL(r) + r.URL.Path,
+		PageTitle:         snap.Site.Title,
+		MetaDescription:   desc,
+		OGImage:           snap.SEO.DefaultOGImageURL,
+		AdminPath:         adminPath,
+		Site:              snap.Site,
+		Reading:           snap.Reading,
+		Feed:              snap.Feed,
+		SEO:               snap.SEO,
+		Appearance:        snap.Appearance,
+		Viewer:            viewer,
+		NavItems:          navItems,
+		SidebarCategories: cats,
+		SidebarTags:       tags,
+		RecentComments:    recentComments,
+		HeadWidgets:       headSlots,
+		FooterWidgets:     footerSlots,
+	}
+}
+
+func (s *AppServer) renderStudio(w http.ResponseWriter, r *http.Request, status int, pageName string, pctx theme.PageContext) {
+	activeTheme := s.deps.Themes.ResolveActiveTheme(r, pctx.Viewer, pctx.Appearance.ActiveTheme)
+	if err := s.deps.Themes.Render(w, status, activeTheme, pageName, pctx); err != nil {
+		http.Error(w, "render error: "+err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (s *AppServer) renderErrorPage(w http.ResponseWriter, r *http.Request, status int, msgKey string) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.StatusCode = status
+	pctx.ErrorMessage = s.deps.Catalog.T(pctx.Locale, msgKey)
+	pctx.NoIndex = true
+	s.renderStudio(w, r, status, "error.html", pctx)
+}
+
+func parsePageParam(r *http.Request) int {
+	p, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if p < 1 {
+		return 1
+	}
+	return p
+}
+
+func computeTotalPages(total int, pageSize int) int {
+	if pageSize <= 0 {
+		pageSize = 15
+	}
+	if total <= 0 {
+		return 1
+	}
+	return int(math.Ceil(float64(total) / float64(pageSize)))
+}
+
+func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		viewer, _ := s.resolveViewer(r)
+		pctx := s.basePageContext(r, viewer)
+		page := parsePageParam(r)
+		cards, total, err := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
+			Page:     page,
+			PageSize: pctx.Reading.PostsPerPage,
+			Locale:   pctx.Locale,
+		})
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		pctx.HeroTitle = pctx.Site.Title
+		pctx.HeroSubtitle = pctx.Site.Subtitle
+		pctx.ArticleCards = cards
+		pctx.Page = page
+		pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
+		s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+		return
+	}
+
+	// Check IndexNow `{key}.txt` if enabled
+	seo := s.deps.Settings.Snapshot().SEO
+	if seo.IndexNowEnabled && seo.IndexNowKey != "" && r.URL.Path == "/"+seo.IndexNowKey+".txt" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(seo.IndexNowKey))
+		return
+	}
+
+	// Lookup Standalone Markdown Page (`/{slug}`)
+	slug := strings.TrimPrefix(r.URL.Path, "/")
+	if slug == "" || strings.Contains(slug, "/") {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	viewer, _ := s.resolveViewer(r)
+	locale := s.resolveLocale(r)
+	pgView, err := s.deps.Content.GetPublicPageBySlug(r.Context(), slug, locale)
+	if err != nil {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	pctx := s.basePageContext(r, viewer)
+	pctx.PageTitle = pgView.Title + " · " + pctx.Site.Title
+	if pgView.PlainSummary != "" {
+		pctx.MetaDescription = pgView.PlainSummary
+	}
+	pctx.StandalonePage = pgView
+	pctx.Alternates = pgView.Translations
+	s.recordPageView(r, domain.TargetTypePage, pgView.ID)
+	s.renderStudio(w, r, http.StatusOK, "page.html", pctx)
+}
+
+func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
+	rawSeg := strings.TrimPrefix(r.URL.Path, "/posts/")
+	if rawSeg == "" || strings.Contains(rawSeg, "/") {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	slugDecoded, _ := url.PathUnescape(rawSeg)
+
+	// Surface 9: Raw Markdown endpoint (`GET /posts/{slug}.md`)
+	if strings.HasSuffix(slugDecoded, ".md") {
+		if !s.deps.Settings.Snapshot().Feed.EnableRawMarkdown {
+			http.NotFound(w, r)
+			return
+		}
+		baseSlug := strings.TrimSuffix(slugDecoded, ".md")
+		raw, err := s.deps.Content.GetPublishedRawArticleBySlug(r.Context(), baseSlug)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		safeMD, ok := s.deps.Content.Guard().ToSafeRawMarkdown(raw)
+		if !ok {
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(safeMD))
+		return
+	}
+
+	raw, err := s.deps.Content.GetPublishedRawArticleBySlug(r.Context(), slugDecoded)
+	if err != nil {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	detail, prev, next, backlinks, err := s.deps.Content.RenderArticleDetail(
+		r.Context(), w, r, raw, viewer, pctx.Locale, s.publicBaseURL(r),
+	)
+	if err != nil {
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+
+	pctx.IsArticle = true
+	pctx.PageTitle = detail.Title + " · " + pctx.Site.Title
+	pctx.MetaDescription = detail.Summary
+	pctx.OGImage = detail.OGImageURL
+	pctx.NoIndex = detail.RequiresPassword || detail.UnlockedViaShare || detail.IsPasswordProtected
+	pctx.Detail = detail
+	pctx.PrevPost = prev
+	pctx.NextPost = next
+	pctx.Backlinks = backlinks
+	pctx.Alternates = detail.Translations
+	pctx.Reactions, _ = s.deps.Content.GetReactionCounts(r.Context(), domain.TargetTypeArticle, raw.ID)
+
+	if pctx.Reading.OutdatedNoticeDays > 0 && raw.UpdatedAt > 0 {
+		days := int(time.Since(time.UnixMilli(raw.UpdatedAt)).Hours() / 24)
+		if days >= pctx.Reading.OutdatedNoticeDays {
+			pctx.OutdatedDays = days
+		}
+	}
+	if sc := s.lookupArticleSeriesContext(r.Context(), raw.ID); sc != nil {
+		pctx.SeriesContext = sc
+	}
+	if !pctx.NoIndex {
+		ld, _ := json.Marshal(map[string]any{
+			"@context":      "https://schema.org",
+			"@type":         "BlogPosting",
+			"headline":      detail.Title,
+			"description":   detail.Summary,
+			"datePublished": time.UnixMilli(detail.PublishedAt).UTC().Format(time.RFC3339),
+			"dateModified":  time.UnixMilli(detail.UpdatedAt).UTC().Format(time.RFC3339),
+			"url":           pctx.CanonicalURL,
+		})
+		pctx.JSONLD = string(ld)
+	}
+
+	s.recordPageView(r, domain.TargetTypeArticle, raw.ID)
+	s.renderStudio(w, r, http.StatusOK, "article.html", pctx)
+}
+
+func (s *AppServer) lookupArticleSeriesContext(ctx context.Context, articleID string) *theme.ArticleSeriesContext {
+	sa, err := sqlx.Get[domain.SeriesArticle](ctx, s.deps.Store, `SELECT * FROM series_articles WHERE article_id = ?`, articleID)
+	if err != nil {
+		return nil
+	}
+	ser, err := sqlx.Get[domain.Series](ctx, s.deps.Store, `SELECT * FROM series WHERE id = ?`, sa.SeriesID)
+	if err != nil {
+		return nil
+	}
+	all, _ := sqlx.Select[domain.SeriesArticle](ctx, s.deps.Store, `SELECT * FROM series_articles WHERE series_id = ? ORDER BY sort_order ASC`, ser.ID)
+	idx := 1
+	for i, item := range all {
+		if item.ArticleID == articleID {
+			idx = i + 1
+			break
+		}
+	}
+	return &theme.ArticleSeriesContext{
+		Series: ser,
+		Index:  idx,
+		Total:  len(all),
+	}
+}
+
+func (s *AppServer) recordPageView(r *http.Request, targetType string, targetID string) {
+	if r.Method != http.MethodGet {
+		return
+	}
+	actorFP := ""
+	if gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
+		actorFP = gp.GuestIDHash
+	} else {
+		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		actorFP = guest.ComputeEnvFPHash(s.deps.Config.KeyRing, clientIP.String()+"|"+r.UserAgent())
+	}
+	refHost := ""
+	if ref := strings.TrimSpace(r.Referer()); ref != "" {
+		if u, err := url.Parse(ref); err == nil {
+			refHost = u.Hostname()
+		}
+	}
+	s.deps.Content.RecordView(r.Context(), targetType, targetID, actorFP, refHost)
+}
+
+func (s *AppServer) handleCategoriesOverview(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.TaxonomyKind = "categories"
+	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.categories")
+	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
+	pctx.Categories = pctx.SidebarCategories
+	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+}
+
+func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) {
+	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/categories/"))
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	page := parsePageParam(r)
+	cards, total, _ := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
+		Page:         page,
+		PageSize:     pctx.Reading.PostsPerPage,
+		CategorySlug: slug,
+		Locale:       pctx.Locale,
+	})
+	pctx.HeroTitle = slug
+	for _, c := range pctx.SidebarCategories {
+		if c.Slug == slug {
+			pctx.HeroTitle = c.Name
+			pctx.HeroSubtitle = c.Description
+			break
+		}
+	}
+	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
+	pctx.ArticleCards = cards
+	pctx.Page = page
+	pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
+	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+}
+
+func (s *AppServer) handleTagsOverview(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.TaxonomyKind = "tags"
+	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.tags")
+	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
+	pctx.Tags, _ = s.deps.Content.ListTagsWithCounts(r.Context(), 200)
+	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+}
+
+func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
+	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/tags/"))
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	page := parsePageParam(r)
+	cards, total, _ := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
+		Page:     page,
+		PageSize: pctx.Reading.PostsPerPage,
+		TagSlug:  slug,
+		Locale:   pctx.Locale,
+	})
+	pctx.HeroTitle = "#" + slug
+	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
+	pctx.ArticleCards = cards
+	pctx.Page = page
+	pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
+	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+}
+
+func (s *AppServer) handleArchivesOverview(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.TaxonomyKind = "archives"
+	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.archives")
+	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
+	pctx.ArchiveBuckets, _ = s.deps.Content.ListArchiveMonths(r.Context())
+	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+}
+
+func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Request) {
+	ym := strings.TrimPrefix(r.URL.Path, "/archives/")
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	page := parsePageParam(r)
+	cards, total, _ := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
+		Page:      page,
+		PageSize:  pctx.Reading.PostsPerPage,
+		YearMonth: ym,
+		Locale:    pctx.Locale,
+	})
+	pctx.HeroTitle = ym
+	pctx.PageTitle = ym + " · " + pctx.Site.Title
+	pctx.ArticleCards = cards
+	pctx.Page = page
+	pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
+	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+}
+
+func (s *AppServer) handleSeriesOverview(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.TaxonomyKind = "series"
+	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.series")
+	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
+	pctx.SeriesList, _ = s.deps.Content.ListSeries(r.Context())
+	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+}
+
+func (s *AppServer) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
+	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/series/"))
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	sv, err := s.deps.Content.GetSeriesBySlug(r.Context(), slug, pctx.Locale)
+	if err != nil {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	pctx.HeroTitle = sv.Title
+	pctx.HeroSubtitle = sv.Description
+	pctx.PageTitle = sv.Title + " · " + pctx.Site.Title
+	pctx.ArticleCards = sv.Articles
+	pctx.Page = 1
+	pctx.TotalPages = 1
+	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+}
+
+func (s *AppServer) handleBookshelf(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "bookshelf.title") + " · " + pctx.Site.Title
+	pctx.Books, _ = s.deps.Content.ListBooks(r.Context())
+	s.renderStudio(w, r, http.StatusOK, "bookshelf.html", pctx)
+}
+
+func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
+	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/books/"))
+	viewer, _ := s.resolveViewer(r)
+	bk, err := s.deps.Content.GetBookBySlug(r.Context(), slug)
+	if err != nil {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	pctx := s.basePageContext(r, viewer)
+	pctx.PageTitle = bk.Title + " · " + pctx.Site.Title
+	pctx.BookDetail = bk
+	if chID := strings.TrimSpace(r.URL.Query().Get("ch")); chID != "" {
+		for i := range bk.FlatChapters {
+			if bk.FlatChapters[i].ID == chID {
+				pctx.ActiveChapter = &bk.FlatChapters[i]
+				break
+			}
+		}
+	}
+	s.renderStudio(w, r, http.StatusOK, "book_reader.html", pctx)
+}
+
+func (s *AppServer) handleLinksPage(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "nav.links") + " · " + pctx.Site.Title
+	links, _ := s.deps.Content.ListLinks(r.Context())
+	grouped := make(map[string][]domain.Link)
+	for _, lk := range links {
+		cat := strings.TrimSpace(lk.CategoryName)
+		if cat == "" {
+			cat = s.deps.Catalog.T(pctx.Locale, "nav.links")
+		}
+		grouped[cat] = append(grouped[cat], lk)
+	}
+	pctx.LinksByCategory = grouped
+	s.renderStudio(w, r, http.StatusOK, "links.html", pctx)
+}
+
+func (s *AppServer) handleFollowsPage(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "nav.follows") + " · " + pctx.Site.Title
+	pctx.FollowGroups, _ = s.deps.Content.ListFollowsWithItems(r.Context(), 6)
+	s.renderStudio(w, r, http.StatusOK, "follows.html", pctx)
+}
+
+func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	if viewer != nil {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	pctx := s.basePageContext(r, nil)
+	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "reader.login_title") + " · " + pctx.Site.Title
+	pctx.NoIndex = true
+	s.renderStudio(w, r, http.StatusOK, "reader_auth.html", pctx)
+}

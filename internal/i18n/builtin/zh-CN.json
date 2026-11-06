@@ -88,5 +88,20 @@
   "error.unauthorized": "请先登录后再执行此操作",
   "error.forbidden": "当前账号无权访问该资源",
   "error.rate_limited": "操作过于频繁，请稍后再试",
-  "error.not_found": "请求的页面或资源不存在"
+  "error.not_found": "请求的页面或资源不存在",
+
+  "sidebar.categories": "分类目录",
+  "sidebar.tags": "热门标签",
+  "sidebar.recent_comments": "最新评论",
+  "pagination.prev": "上一页",
+  "pagination.next": "下一页",
+  "pagination.page_info": "第 {page} / {total} 页",
+  "search.empty": "未找到匹配的文章",
+  "search.results_count": "找到 {count} 篇相关文章",
+  "reader.login_title": "读者登录与注册",
+  "reader.register_tab": "邮箱验证注册",
+  "reader.send_code": "发送验证码",
+  "reader.code_sent": "验证码已发送至邮箱",
+  "footer.rss": "RSS 订阅",
+  "footer.sitemap": "站点地图"
 }
