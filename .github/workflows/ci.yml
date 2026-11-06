@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build, Test & Budget Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/admin/package-lock.json
+
+      - name: Build Admin Console SPA & Verify Gzip Budget (< 300 KB)
+        working-directory: web/admin
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          PRE_GZ=$(find ../../internal/adminui/dist -type f -name "*.gz" -exec cat {} + | wc -c | tr -d ' ')
+          RAW_GZ=$(find ../../internal/adminui/dist -type f ! -name "*.gz" ! -name "*.map" -exec gzip -9 -c {} + | wc -c | tr -d ' ')
+          GZIP_BYTES=$((PRE_GZ + RAW_GZ))
+          echo "Admin SPA total gzipped size: ${GZIP_BYTES} bytes"
+          if [ "${GZIP_BYTES}" -ge 307200 ]; then
+            echo "Admin SPA exceeds 300 KB Gzip budget (${GZIP_BYTES} bytes)" >&2
+            exit 1
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compile Pure-Go Packages (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Run Unit & Integration Suite (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+
+      - name: Run Race Detector Suite
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./...
+
+      - name: Verify Cross-Compilation Matrix (5 Targets, CGO_ENABLED=0, < 20 MiB Each)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p /tmp/volo-cross
+          GOOS=linux   GOARCH=amd64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-amd64     ./cmd/volo
+          GOOS=linux   GOARCH=arm64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-arm64     ./cmd/volo
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-amd64    ./cmd/volo
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-arm64    ./cmd/volo
+          GOOS=windows GOARCH=amd64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-windows-amd64.exe ./cmd/volo
+          ls -lh /tmp/volo-cross
+          for bin in /tmp/volo-cross/*; do
+            SZ=$(wc -c < "$bin" | tr -d ' ')
+            if [ "$SZ" -ge 20971520 ]; then
+              echo "FAIL: $bin ($SZ bytes) exceeds 20 MiB budget" >&2
+              exit 1
+            fi
+          done
+
+      - name: Enforce Binary Size (< 20 MiB), Static Linkage & Idle RSS (< 35 MiB)
+        run: bash scripts/verify-binary-budget.sh

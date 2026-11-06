@@ -1,0 +1,16 @@
+.git
+.github
+data
+dist
+volo
+volo.exe
+*.db
+*.db-shm
+*.db-wal
+*.sock
+*.sock.lock
+.env
+web/admin/node_modules
+web/node_modules
+coverage.txt
+*.test

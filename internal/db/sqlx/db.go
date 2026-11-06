@@ -16,8 +16,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "modernc.org/sqlite"
 
 	"github.com/Willh92/Volo-go/internal/db/dialect"
@@ -187,14 +186,14 @@ func openPostgres(ctx context.Context, d dialect.Dialect, opts Options) (*Store,
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("sqlx: VOLO_DB_DSN is required for postgres driver")
 	}
-	cfg, err := pgx.ParseConfig(opts.DSN)
+	cfg, err := pgconn.ParseConfig(opts.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("sqlx: parse postgres DSN: %w", err)
 	}
-	if opts.SimpleProtocol {
-		cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	}
-	db := stdlib.OpenDB(*cfg)
+	db := sql.OpenDB(&pgConnConnector{
+		cfg:            cfg,
+		simpleProtocol: opts.SimpleProtocol,
+	})
 	applyPoolSettings(db, opts)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()

@@ -76,7 +76,7 @@ func TestBackupCreateDryRunRestoreAndIntegrityProtection(t *testing.T) {
 	}
 
 	_, err = srcDB.ExecContext(ctx, `INSERT INTO plugin_kv (plugin_id, k, value_text, value_int, expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		"kanbanniang", "stats", `{"pats":9}`, 9, 0, now,
+		"sample-widget", "stats", `{"pats":9}`, 9, 0, now,
 	)
 	if err != nil {
 		t.Fatalf("seed plugin_kv: %v", err)

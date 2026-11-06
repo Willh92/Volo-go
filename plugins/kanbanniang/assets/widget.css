@@ -1,0 +1,55 @@
+.volo-kbn-dock {
+  position: fixed;
+  bottom: 20px;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+}
+.volo-kbn-right {
+  right: 22px;
+}
+.volo-kbn-left {
+  left: 22px;
+}
+.volo-kbn-bubble {
+  max-width: 210px;
+  padding: 7px 11px;
+  border-radius: 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  background: var(--surface-elevated, #ffffff);
+  color: var(--text-primary, #1d2420);
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.volo-kbn-btn {
+  width: 58px;
+  height: 58px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+  background: var(--surface-elevated, #ffffff);
+  color: var(--accent, #2d6a4f);
+  cursor: pointer;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.1);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.volo-kbn-btn:hover {
+  transform: translateY(-3px) scale(1.04);
+}
+.volo-kbn-btn:active {
+  transform: scale(0.95);
+}
+@media (max-width: 768px) {
+  .volo-kbn-hide-mobile {
+    display: none !important;
+  }
+}

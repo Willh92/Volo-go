@@ -1,0 +1,23 @@
+/* Volo Journal — Scoped Serif Editorial Layer (zero global leakage) */
+html[data-volo-skin="volo-journal"] body {
+  font-family: "Noto Serif SC", "Source Han Serif SC", Georgia, "Times New Roman", serif;
+  letter-spacing: 0.01em;
+}
+
+html[data-volo-skin="volo-journal"] .studio-container {
+  max-width: 820px;
+}
+
+html[data-volo-skin="volo-journal"] .studio-header {
+  border-bottom-style: double;
+  border-bottom-width: 3px;
+}
+
+html[data-volo-skin="volo-journal"] .studio-brand span {
+  font-variant: small-caps;
+  letter-spacing: 0.04em;
+}
+
+html[data-volo-skin="volo-journal"] .studio-grid {
+  grid-template-columns: minmax(0, 1fr);
+}

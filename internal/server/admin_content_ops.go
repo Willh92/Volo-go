@@ -770,7 +770,7 @@ func truncateRunes(s string, max int) string {
 
 // --- GitHub Public Repositories Showcase Sync & IndexNow Push ---
 
-func (s *AppServer) syncGitHubRepositories(ctx context.Context, usernameOverride string) ([]domain.GitHubRepoItem, error) {
+func (s *AppServer) refreshGitHubRepositories(ctx context.Context, usernameOverride string) ([]domain.GitHubRepoItem, error) {
 	seo := s.deps.Settings.Snapshot().SEO
 	uname := strings.TrimSpace(usernameOverride)
 	if uname == "" {

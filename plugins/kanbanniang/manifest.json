@@ -1,0 +1,77 @@
+{
+  "id": "kanbanniang",
+  "version": "1.0.0",
+  "min_host_version": "0.1.0",
+  "runtime": "goja",
+  "entry": "main.js",
+  "author": "Volo Studio",
+  "homepage": "https://github.com/Willh92/Volo-go",
+  "name": {
+    "zh-CN": "工作室看板娘 (Mascot Companion)",
+    "en-US": "Studio Mascot Companion"
+  },
+  "description": {
+    "zh-CN": "纯离线 SVG 轻量互动看板娘挂件，原生支持 PJAX 跨页常驻与 plugin_kv 摸头计数，宿主零硬编码耦合。",
+    "en-US": "Self-contained SVG interactive mascot companion surviving PJAX navigation with persistent plugin_kv head-pat counter and zero host coupling."
+  },
+  "permissions": [
+    "kv",
+    "slots:public.footer",
+    "slots:admin.dashboard_card",
+    "http:routes"
+  ],
+  "ui_slots": [
+    {
+      "slot": "public.footer",
+      "persist": true,
+      "dynamic": true,
+      "style_asset": "widget.css",
+      "script_asset": "widget.js"
+    },
+    {
+      "slot": "admin.dashboard_card",
+      "dynamic": true
+    }
+  ],
+  "config_schema": [
+    {
+      "key": "character",
+      "type": "select",
+      "default": "neko",
+      "options": [
+        { "value": "neko", "label": { "zh-CN": "墨绿小猫 (Neko)", "en-US": "Studio Neko" } },
+        { "value": "owl", "label": { "zh-CN": "守夜猫头鹰 (Owl)", "en-US": "Night Owl" } },
+        { "value": "bot", "label": { "zh-CN": "极简像素机 (Bot)", "en-US": "Minimal Bot" } }
+      ],
+      "label": { "zh-CN": "角色形象", "en-US": "Character Style" }
+    },
+    {
+      "key": "position",
+      "type": "select",
+      "default": "right",
+      "options": [
+        { "value": "right", "label": { "zh-CN": "右下角", "en-US": "Bottom Right" } },
+        { "value": "left", "label": { "zh-CN": "左下角", "en-US": "Bottom Left" } }
+      ],
+      "label": { "zh-CN": "停靠位置", "en-US": "Dock Position" }
+    },
+    {
+      "key": "greeting_zh",
+      "type": "string",
+      "default": "欢迎来到独立博客，点我可以摸摸头～",
+      "label": { "zh-CN": "中文问候语", "en-US": "Chinese Greeting" }
+    },
+    {
+      "key": "greeting_en",
+      "type": "string",
+      "default": "Welcome! Click me for a head-pat~",
+      "label": { "zh-CN": "英文问候语", "en-US": "English Greeting" }
+    },
+    {
+      "key": "hide_on_mobile",
+      "type": "boolean",
+      "default": true,
+      "label": { "zh-CN": "窄屏自动隐藏", "en-US": "Hide on Mobile Screens" }
+    }
+  ]
+}

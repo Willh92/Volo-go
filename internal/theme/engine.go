@@ -172,7 +172,7 @@ func (e *Engine) Reload() error {
 	if err != nil {
 		return fmt.Errorf("theme: open embedded volo-studio: %w", err)
 	}
-	builtinLoaded, err := e.compileThemeFS(subFS, true)
+	builtinLoaded, err := e.compileThemeFS(subFS, nil, true)
 	if err != nil {
 		return fmt.Errorf("theme: compile embedded volo-studio: %w", err)
 	}
@@ -189,7 +189,7 @@ func (e *Engine) Reload() error {
 				if st, lErr := os.Lstat(dirPath); lErr != nil || st.Mode()&os.ModeSymlink != 0 {
 					continue
 				}
-				extLoaded, cErr := e.compileThemeFS(os.DirFS(dirPath), false)
+				extLoaded, cErr := e.compileThemeFS(os.DirFS(dirPath), subFS, false)
 				if cErr == nil && extLoaded.manifest.ID != "" && extLoaded.manifest.ID != DefaultThemeID {
 					next[extLoaded.manifest.ID] = extLoaded
 				}
@@ -344,7 +344,7 @@ func (e *Engine) GzippedAssetSize(themeID string, relAsset string) (int, bool) {
 	return len(a.gzipped), true
 }
 
-func (e *Engine) compileThemeFS(fsys fs.FS, isBuiltin bool) (*loadedTheme, error) {
+func (e *Engine) compileThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*loadedTheme, error) {
 	rawManifest, err := fs.ReadFile(fsys, "theme.json")
 	if err != nil {
 		return nil, err
@@ -359,59 +359,87 @@ func (e *Engine) compileThemeFS(fsys fs.FS, isBuiltin bool) (*loadedTheme, error
 	}
 
 	assets := make(map[string]cachedAsset)
-	_ = fs.WalkDir(fsys, "assets", func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() {
-			return nil
+	loadAssetsFrom := func(srcFS fs.FS) {
+		if srcFS == nil {
+			return
 		}
-		raw, rErr := fs.ReadFile(fsys, p)
-		if rErr != nil {
-			return nil
-		}
-		rel := strings.TrimPrefix(p, "assets/")
-		sum := sha256.Sum256(raw)
-		short := hex.EncodeToString(sum[:4])
-		etag := `"` + hex.EncodeToString(sum[:12]) + `"`
+		_ = fs.WalkDir(srcFS, "assets", func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() {
+				return nil
+			}
+			raw, rErr := fs.ReadFile(srcFS, p)
+			if rErr != nil {
+				return nil
+			}
+			rel := strings.TrimPrefix(p, "assets/")
+			sum := sha256.Sum256(raw)
+			short := hex.EncodeToString(sum[:4])
+			etag := `"` + hex.EncodeToString(sum[:12]) + `"`
 
-		var gzBuf bytes.Buffer
-		gzW, _ := gzip.NewWriterLevel(&gzBuf, gzip.BestCompression)
-		_, _ = gzW.Write(raw)
-		_ = gzW.Close()
+			var gzBuf bytes.Buffer
+			gzW, _ := gzip.NewWriterLevel(&gzBuf, gzip.BestCompression)
+			_, _ = gzW.Write(raw)
+			_ = gzW.Close()
 
-		ctype := mime.TypeByExtension(filepath.Ext(rel))
-		if ctype == "" {
-			ctype = "application/octet-stream"
+			ctype := mime.TypeByExtension(filepath.Ext(rel))
+			if ctype == "" {
+				ctype = "application/octet-stream"
+			}
+			assets[rel] = cachedAsset{
+				raw:         raw,
+				gzipped:     gzBuf.Bytes(),
+				contentType: ctype,
+				etag:        etag,
+				shortHash:   short,
+			}
+			return nil
+		})
+	}
+	loadAssetsFrom(fallbackFS)
+	loadAssetsFrom(fsys)
+
+	readTemplateFile := func(relPath string) ([]byte, error) {
+		if b, rErr := fs.ReadFile(fsys, relPath); rErr == nil {
+			return b, nil
 		}
-		assets[rel] = cachedAsset{
-			raw:         raw,
-			gzipped:     gzBuf.Bytes(),
-			contentType: ctype,
-			etag:        etag,
-			shortHash:   short,
+		if fallbackFS != nil {
+			return fs.ReadFile(fallbackFS, relPath)
 		}
-		return nil
-	})
+		return nil, fs.ErrNotExist
+	}
 
 	funcs := e.templateFuncMap(mf.ID, assets)
 	base := template.New("root").Funcs(funcs)
 	for _, sharedName := range []string{"templates/layout.html", "templates/partials.html"} {
-		if b, rErr := fs.ReadFile(fsys, sharedName); rErr == nil {
+		if b, rErr := readTemplateFile(sharedName); rErr == nil {
 			if _, pErr := base.Parse(string(b)); pErr != nil {
 				return nil, fmt.Errorf("parse %s: %w", sharedName, pErr)
 			}
 		}
 	}
 
-	tplEntries, err := fs.ReadDir(fsys, "templates")
-	if err != nil {
-		return nil, err
-	}
-	compiledPages := make(map[string]*template.Template)
-	for _, ent := range tplEntries {
-		name := ent.Name()
-		if ent.IsDir() || !strings.HasSuffix(name, ".html") || name == "layout.html" || name == "partials.html" {
+	pageNames := make(map[string]struct{})
+	for _, srcFS := range []fs.FS{fallbackFS, fsys} {
+		if srcFS == nil {
 			continue
 		}
-		rawTpl, rErr := fs.ReadFile(fsys, "templates/"+name)
+		if tplEntries, dErr := fs.ReadDir(srcFS, "templates"); dErr == nil {
+			for _, ent := range tplEntries {
+				name := ent.Name()
+				if ent.IsDir() || !strings.HasSuffix(name, ".html") || name == "layout.html" || name == "partials.html" {
+					continue
+				}
+				pageNames[name] = struct{}{}
+			}
+		}
+	}
+	if len(pageNames) == 0 {
+		return nil, fmt.Errorf("theme %s: no page templates found", mf.ID)
+	}
+
+	compiledPages := make(map[string]*template.Template, len(pageNames))
+	for name := range pageNames {
+		rawTpl, rErr := readTemplateFile("templates/" + name)
 		if rErr != nil {
 			return nil, rErr
 		}

@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-frontend:
+    name: Build Embedded Admin Console
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/admin/package-lock.json
+
+      - name: Build Admin SPA
+        working-directory: web/admin
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Upload Built Admin Dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-dist
+          path: internal/adminui/dist
+
+  cross-binaries:
+    name: Build Static Binaries (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+            archive: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Built Admin Dist
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-dist
+          path: internal/adminui/dist
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Package Pure-Go Release Bundle
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          STAGE="volo-${VERSION}-${GOOS}-${GOARCH}"
+          mkdir -p "dist/${STAGE}"
+          go build -trimpath -gcflags="all=-l" \
+            -ldflags="-s -w -X main.Version=${VERSION}" \
+            -o "dist/${STAGE}/volo${{ matrix.ext }}" \
+            ./cmd/volo
+
+          BIN_BYTES=$(wc -c < "dist/${STAGE}/volo${{ matrix.ext }}" | tr -d ' ')
+          if [ "${BIN_BYTES}" -ge 20971520 ]; then
+            echo "Binary exceeds 20 MiB budget (${BIN_BYTES} bytes)" >&2
+            exit 1
+          fi
+
+          cp .env.example README.md docker-compose.yml "dist/${STAGE}/"
+          cp -r plugins "dist/${STAGE}/plugins"
+          cp -r themes "dist/${STAGE}/themes"
+
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -rq "${STAGE}.zip" "${STAGE}"
+          else
+            tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          fi
+          rm -rf "${STAGE}"
+
+      - name: Upload Target Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  publish-release:
+    name: Publish GitHub Release & Checksums
+    needs: cross-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Target Archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*
+
+  publish-ghcr:
+    name: Build & Push Multi-Arch GHCR Container
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and Push Multi-Arch Image (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

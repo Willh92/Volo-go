@@ -86,7 +86,27 @@ func newHandler() *Handler {
 		return h
 	}
 	_ = fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, wErr error) error {
-		if wErr != nil || d.IsDir() || strings.HasSuffix(p, ".gz") || strings.HasSuffix(p, ".map") {
+		if wErr != nil || d.IsDir() || strings.HasSuffix(p, ".map") {
+			return nil
+		}
+		if strings.HasSuffix(p, ".gz") {
+			logical := strings.TrimSuffix(p, ".gz")
+			gzBytes, rErr := fs.ReadFile(sub, p)
+			if rErr != nil {
+				return nil
+			}
+			ct := detectContentType(logical)
+			sumGZ := sha256.Sum256(gzBytes)
+			h.assets[logical] = cachedAsset{
+				gz:          gzBytes,
+				contentType: ct,
+				etagRaw:     fmt.Sprintf(`"%x"`, sumGZ[:12]),
+				etagGZ:      fmt.Sprintf(`"%x-gz"`, sumGZ[:12]),
+				immutable:   strings.HasPrefix(logical, "assets/"),
+			}
+			return nil
+		}
+		if _, exists := h.assets[p]; exists {
 			return nil
 		}
 		raw, rErr := fs.ReadFile(sub, p)
@@ -196,10 +216,8 @@ func serveCachedAsset(w http.ResponseWriter, r *http.Request, item cachedAsset) 
 
 	useGZ := len(item.gz) > 0 && acceptsGzip(r.Header.Get("Accept-Encoding"))
 	etag := item.etagRaw
-	payload := item.raw
 	if useGZ {
 		etag = item.etagGZ
-		payload = item.gz
 		w.Header().Set("Content-Encoding", "gzip")
 	}
 	w.Header().Set("ETag", etag)
@@ -212,7 +230,22 @@ func serveCachedAsset(w http.ResponseWriter, r *http.Request, item cachedAsset) 
 	if r.Method == http.MethodHead {
 		return
 	}
-	_, _ = w.Write(payload)
+	if useGZ {
+		_, _ = w.Write(item.gz)
+		return
+	}
+	if len(item.raw) > 0 {
+		_, _ = w.Write(item.raw)
+		return
+	}
+	if len(item.gz) > 0 {
+		if gr, err := gzip.NewReader(bytes.NewReader(item.gz)); err == nil {
+			defer gr.Close()
+			var out bytes.Buffer
+			_, _ = out.ReadFrom(gr)
+			_, _ = w.Write(out.Bytes())
+		}
+	}
 }
 
 func acceptsGzip(hdr string) bool {

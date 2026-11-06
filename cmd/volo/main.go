@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,6 +27,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/etl"
 	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/notify"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
@@ -62,6 +65,8 @@ func runCLI(ctx context.Context, args []string, stdout io.Writer, stderr io.Writ
 		return cmdImportLegacy(ctx, args[1:], stdout, stderr)
 	case "doctor":
 		return cmdDoctor(ctx, args[1:], stdout, stderr)
+	case "healthcheck":
+		return cmdHealthcheck(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintf(stdout, "volo %s (%s %s/%s, pure-go static)\n",
 			Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
@@ -85,8 +90,9 @@ Usage:
   volo admin disable-2fa --user <u|email>       Emergency disable TOTP & recovery codes for user
   volo backup create [--output file]            Create streaming database (+ optional media) backup
   volo backup restore <archive.zip> [--dry-run] Verify SHA-256 & restore cross-DB native backup
-  volo import-legacy <bolo.zip|json> [--dry-run] Stream & normalize legacy bolo-solo 15-table backup
+  volo import-legacy <archive.zip|json> [--dry-run] Stream & normalize legacy 15-table backup
   volo doctor [--json]                          Run environment, crypto, DB WAL & FS diagnostics
+  volo healthcheck [--url <healthz_url>]        Probe live /healthz over TCP or Unix Socket (Distroless ready)
   volo version                                  Print binary version & runtime info
 `)
 }
@@ -298,6 +304,15 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	}()
 
 	outboundDialer := &security.OutboundSafeDialer{Timeout: 10 * time.Second}
+	mediaPipe := media.NewPipeline(media.PipelineOptions{
+		Store:          store,
+		Settings:       settingsMgr,
+		UploadDir:      cfg.UploadDir,
+		OutboundDialer: outboundDialer,
+		Plugins:        pluginMgr,
+	})
+	pluginMgr.Providers().RegisterStorage("builtin-media", mediaPipe)
+
 	notifier := notify.NewDispatcher(notify.DispatcherOptions{
 		Store:          store,
 		Keys:           cfg.KeyRing,
@@ -316,6 +331,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		Catalog:              catalog,
 		OutboundDialer:       outboundDialer,
 		Plugins:              pluginMgr,
+		Media:                mediaPipe,
 		StartedAt:            startedAt,
 		SendVerificationMail: notifier.SendVerificationCode,
 		NotifyCommentCreated: notifier.NotifyCommentCreated,
@@ -329,6 +345,17 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "volo serve: server init failed: %v\n", err)
 		return 1
 	}
+
+	// Background rolling local + S3/WebDAV backup scheduler
+	backupSched := backup.NewScheduler(backup.SchedulerOptions{
+		Store:          store,
+		Settings:       settingsMgr,
+		BackupDir:      cfg.BackupDir,
+		UploadDir:      cfg.UploadDir,
+		OutboundDialer: outboundDialer,
+		Logger:         stderr,
+	})
+	backupSched.Start(ctx)
 
 	// Background scheduled-article publisher (checks every 30s)
 	go func() {
@@ -692,6 +719,71 @@ func cmdDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 	if !rep.Healthy {
 		return 1
 	}
+	return 0
+}
+
+func cmdHealthcheck(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
+	fs := flag.NewFlagSet("volo healthcheck", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var common boundCommonFlags
+	registerCommonFlags(fs, &common)
+	targetURL := fs.String("url", "", "Explicit /healthz URL override")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	transport := &http.Transport{Proxy: nil}
+	client := &http.Client{
+		Timeout:   4 * time.Second,
+		Transport: transport,
+	}
+	urlStr := strings.TrimSpace(*targetURL)
+	if urlStr == "" {
+		cfg, err := config.Load(buildCLIOverrides(fs, &common))
+		if err != nil {
+			fmt.Fprintf(stderr, "volo healthcheck: %v\n", err)
+			return 1
+		}
+		if cfg.ListenSocket != nil && cfg.ListenSocket.Path != "" {
+			sockPath := cfg.ListenSocket.Path
+			transport.DialContext = func(dCtx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(dCtx, "unix", sockPath)
+			}
+			urlStr = "http://unix/healthz"
+		} else {
+			host, port, sErr := net.SplitHostPort(cfg.ListenAddr)
+			if sErr != nil {
+				urlStr = "http://127.0.0.1:8080/healthz"
+			} else {
+				if host == "" || host == "0.0.0.0" || host == "::" {
+					host = "127.0.0.1"
+				}
+				urlStr = "http://" + net.JoinHostPort(host, port) + "/healthz"
+			}
+		}
+	}
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "volo healthcheck: %v\n", err)
+		return 1
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(stderr, "volo healthcheck: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(stderr, "volo healthcheck: HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(body)))
+		return 1
+	}
+	fmt.Fprintln(stdout, strings.TrimSpace(string(body)))
 	return 0
 }
 

@@ -1,0 +1,74 @@
+services:
+  volo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: v1.0.0
+    image: ghcr.io/willh92/volo-go:latest
+    container_name: volo-go
+    restart: unless-stopped
+    ports:
+      - "${VOLO_HOST_PORT:-8080}:8080"
+    environment:
+      VOLO_LISTEN_ADDR: "0.0.0.0:8080"
+      VOLO_PUBLIC_URL: "${VOLO_PUBLIC_URL:-http://localhost:8080}"
+      VOLO_TRUSTED_PROXIES: "${VOLO_TRUSTED_PROXIES:-127.0.0.1,::1}"
+      VOLO_ADMIN_PATH: "${VOLO_ADMIN_PATH:-/console}"
+      VOLO_SECRET_KEY: "${VOLO_SECRET_KEY:-}"
+      VOLO_GEO_ACCESS_ENABLED: "${VOLO_GEO_ACCESS_ENABLED:-true}"
+      VOLO_DEFAULT_LOCALE: "${VOLO_DEFAULT_LOCALE:-zh-CN}"
+      VOLO_DB_DRIVER: "${VOLO_DB_DRIVER:-sqlite}"
+      VOLO_DB_DSN: "${VOLO_DB_DSN:-}"
+      VOLO_DB_SIMPLE_PROTOCOL: "${VOLO_DB_SIMPLE_PROTOCOL:-false}"
+    volumes:
+      - ./data:/app/data
+      - ./plugins:/app/plugins
+      - ./themes:/app/themes
+      - ./locales:/app/locales
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/volo", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Optional PostgreSQL 16 backend (`docker compose --profile postgres up -d`)
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: volo
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-change-me-strong-password}"
+      POSTGRES_DB: volo
+    volumes:
+      - volo-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U volo -d volo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional MySQL 8.4 backend (`docker compose --profile mysql up -d`)
+  mysql:
+    image: mysql:8.4
+    profiles: ["mysql"]
+    restart: unless-stopped
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-change-me-root-password}"
+      MYSQL_DATABASE: volo
+      MYSQL_USER: volo
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:-change-me-strong-password}"
+    volumes:
+      - volo-mysqldata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  volo-pgdata:
+  volo-mysqldata:

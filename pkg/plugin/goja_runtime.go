@@ -10,10 +10,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/dop251/goja"
 
 	"github.com/Willh92/Volo-go/internal/i18n"
 	"github.com/Willh92/Volo-go/internal/security"
@@ -30,15 +29,15 @@ const (
 var ErrExecutionTimeout = errors.New("plugin: execution interrupted due to timeout")
 
 type pooledVM struct {
-	vm      *goja.Runtime
-	exports *goja.Object
+	vm      *jsRuntime
+	exports *jsObject
 	reqCtx  context.Context
 }
 
 type gojaPluginRuntime struct {
 	manifest   Manifest
 	pluginDir  string
-	program    *goja.Program
+	program    *jsProgram
 	localI18n  map[string]map[string]string
 	kv         *KVStore
 	logger     *PluginLogger
@@ -78,7 +77,7 @@ func newGojaPluginRuntime(opts gojaRuntimeOptions) (*gojaPluginRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("plugin %q: read entry %q: %w", opts.manifest.ID, opts.manifest.Entry, err)
 	}
-	prog, err := goja.Compile(opts.manifest.Entry, string(srcBytes), true)
+	prog, err := compileJSProgram(opts.manifest.Entry, string(srcBytes))
 	if err != nil {
 		return nil, fmt.Errorf("plugin %q: compile %q: %w", opts.manifest.ID, opts.manifest.Entry, err)
 	}
@@ -176,51 +175,50 @@ func applyPlaceholders(tmpl string, vars map[string]any) string {
 }
 
 func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
-	vm := goja.New()
-	vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
+	vm := newJSRuntime()
 	vm.SetMaxCallStackSize(defaultVMStackLimit)
 
 	wrapper := &pooledVM{vm: vm}
 
 	// Inject safe console object wired to isolated JSONL plugin logger.
 	consoleObj := vm.NewObject()
-	logFn := func(level string) func(goja.FunctionCall) goja.Value {
-		return func(call goja.FunctionCall) goja.Value {
-			parts := make([]string, len(call.Arguments))
-			for i, a := range call.Arguments {
-				parts[i] = a.String()
+	logFn := func(level string) jsNativeFn {
+		return func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			parts := make([]string, len(args))
+			for i, a := range args {
+				parts[i] = a.toString()
 			}
 			r.logger.Write(r.manifest.ID, level, "console", strings.Join(parts, " "))
-			return goja.Undefined()
+			return jsUndefinedVal, nil
 		}
 	}
-	_ = consoleObj.Set("log", logFn("info"))
-	_ = consoleObj.Set("info", logFn("info"))
-	_ = consoleObj.Set("warn", logFn("warn"))
-	_ = consoleObj.Set("error", logFn("error"))
-	_ = vm.Set("console", consoleObj)
+	consoleObj.setVal("log", nativeVal(logFn("info")))
+	consoleObj.setVal("info", nativeVal(logFn("info")))
+	consoleObj.setVal("warn", nativeVal(logFn("warn")))
+	consoleObj.setVal("error", nativeVal(logFn("error")))
+	vm.Set("console", consoleObj)
 
 	// Inject CommonJS module.exports container.
 	moduleObj := vm.NewObject()
 	exportsObj := vm.NewObject()
-	_ = moduleObj.Set("exports", exportsObj)
-	_ = vm.Set("module", moduleObj)
-	_ = vm.Set("exports", exportsObj)
+	moduleObj.setVal("exports", jsValue{kind: valObject, obj: exportsObj})
+	vm.Set("module", moduleObj)
+	vm.Set("exports", exportsObj)
 
 	// Inject capability-gated `volo` (and alias `ctx`) host bridge.
 	voloObj := vm.NewObject()
-	_ = voloObj.Set("pluginId", r.manifest.ID)
-	_ = voloObj.Set("version", r.manifest.Version)
+	voloObj.Set("pluginId", r.manifest.ID)
+	voloObj.Set("version", r.manifest.Version)
 
 	cfgObj := vm.NewObject()
-	_ = cfgObj.Set("get", func(key string) any {
+	cfgObj.Set("get", func(key string) any {
 		cfg := r.getConfig()
 		if cfg == nil {
 			return nil
 		}
 		return cfg[key]
 	})
-	_ = cfgObj.Set("all", func() map[string]any {
+	cfgObj.Set("all", func() map[string]any {
 		cfg := r.getConfig()
 		out := make(map[string]any, len(cfg))
 		for k, v := range cfg {
@@ -228,82 +226,80 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 		}
 		return out
 	})
-	_ = voloObj.Set("config", cfgObj)
+	voloObj.Set("config", cfgObj)
 
 	logBridge := vm.NewObject()
-	_ = logBridge.Set("info", logFn("info"))
-	_ = logBridge.Set("warn", logFn("warn"))
-	_ = logBridge.Set("error", logFn("error"))
-	_ = voloObj.Set("log", logBridge)
+	logBridge.setVal("info", nativeVal(logFn("info")))
+	logBridge.setVal("warn", nativeVal(logFn("warn")))
+	logBridge.setVal("error", nativeVal(logFn("error")))
+	voloObj.Set("log", logBridge)
 
 	i18nBridge := vm.NewObject()
-	_ = i18nBridge.Set("t", func(locale string, key string, vars map[string]any) string {
+	i18nBridge.Set("t", func(locale string, key string, vars map[string]any) string {
 		return r.translate(locale, key, vars)
 	})
-	_ = voloObj.Set("i18n", i18nBridge)
+	voloObj.Set("i18n", i18nBridge)
 
 	// Capability 1: plugin_kv (ONLY injected if manifest declares kv / kv:rw / kv:read).
 	if r.manifest.CanReadKV() && r.kv != nil {
 		kvBridge := vm.NewObject()
-		_ = kvBridge.Set("get", func(key string) any {
+		kvBridge.Set("get", func(key string) (any, error) {
 			val, ok, gErr := r.kv.Get(wrapper.activeCtx(), key)
 			if gErr != nil {
-				panic(vm.NewGoError(gErr))
+				return nil, gErr
 			}
 			if !ok {
-				return nil
+				return nil, nil
 			}
-			return val
+			return val, nil
 		})
-		_ = kvBridge.Set("list", func(prefix string, limit int) []KVItem {
-			items, lErr := r.kv.ListPrefix(wrapper.activeCtx(), prefix, limit)
-			if lErr != nil {
-				panic(vm.NewGoError(lErr))
+		kvBridge.Set("getInt", func(key string) (int64, error) {
+			val, ok, gErr := r.kv.Get(wrapper.activeCtx(), key)
+			if gErr != nil || !ok {
+				return 0, gErr
 			}
-			return items
+			n, _ := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+			return n, nil
+		})
+		kvBridge.Set("list", func(prefix string, limit int) ([]KVItem, error) {
+			return r.kv.ListPrefix(wrapper.activeCtx(), prefix, limit)
 		})
 		if r.manifest.CanWriteKV() {
-			_ = kvBridge.Set("set", func(key string, value string, ttlSec int64) {
+			kvBridge.Set("set", func(key string, value string, ttlSec int64) (bool, error) {
 				if sErr := r.kv.Set(wrapper.activeCtx(), key, value, ttlSec); sErr != nil {
-					panic(vm.NewGoError(sErr))
+					return false, sErr
 				}
+				return true, nil
 			})
-			delFn := func(key string) {
+			delFn := func(key string) (bool, error) {
 				if dErr := r.kv.Delete(wrapper.activeCtx(), key); dErr != nil {
-					panic(vm.NewGoError(dErr))
+					return false, dErr
 				}
+				return true, nil
 			}
-			_ = kvBridge.Set("del", delFn)
-			_ = kvBridge.Set("delete", delFn)
-			_ = kvBridge.Set("incr", func(key string, delta int64, ttlSec int64) int64 {
+			kvBridge.Set("del", delFn)
+			kvBridge.Set("delete", delFn)
+			kvBridge.Set("incr", func(key string, delta int64, ttlSec int64) (int64, error) {
 				if delta == 0 {
 					delta = 1
 				}
-				next, iErr := r.kv.IncrBy(wrapper.activeCtx(), key, delta, ttlSec)
-				if iErr != nil {
-					panic(vm.NewGoError(iErr))
-				}
-				return next
+				return r.kv.IncrBy(wrapper.activeCtx(), key, delta, ttlSec)
 			})
 		}
-		_ = voloObj.Set("kv", kvBridge)
+		voloObj.Set("kv", kvBridge)
 	}
 
 	// Capability 2: Outbound SSRF-safe HTTP client (ONLY injected if allowed_hosts / http.outbound:<host> declared).
 	if r.httpClient != nil {
 		httpBridge := vm.NewObject()
-		_ = httpBridge.Set("fetch", func(rawURL string, opts map[string]any) map[string]any {
-			res, fErr := r.executeFetch(wrapper.activeCtx(), rawURL, opts)
-			if fErr != nil {
-				panic(vm.NewGoError(fErr))
-			}
-			return res
+		httpBridge.Set("fetch", func(rawURL string, opts map[string]any) (map[string]any, error) {
+			return r.executeFetch(wrapper.activeCtx(), rawURL, opts)
 		})
-		_ = voloObj.Set("http", httpBridge)
+		voloObj.Set("http", httpBridge)
 	}
 
-	_ = vm.Set("volo", voloObj)
-	_ = vm.Set("ctx", voloObj)
+	vm.Set("volo", voloObj)
+	vm.Set("ctx", voloObj)
 
 	// Guard top-level module evaluation with a strict 500ms timeout and panic recovery.
 	timer := time.AfterFunc(500*time.Millisecond, func() {
@@ -318,12 +314,12 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	}()
 
 	if _, runErr := vm.RunProgram(r.program); runErr != nil {
-		return nil, normalizeGojaError(r.manifest.ID, "init", runErr)
+		return nil, normalizeJSError(r.manifest.ID, "init", runErr)
 	}
 
-	modVal := moduleObj.Get("exports")
-	if modVal != nil && !goja.IsUndefined(modVal) && !goja.IsNull(modVal) {
-		wrapper.exports = modVal.ToObject(vm)
+	modVal := moduleObj.get("exports")
+	if modVal.kind == valObject && modVal.obj != nil {
+		wrapper.exports = modVal.obj
 	} else {
 		wrapper.exports = exportsObj
 	}
@@ -401,7 +397,7 @@ func (r *gojaPluginRuntime) executeFetch(ctx context.Context, rawURL string, opt
 	}, nil
 }
 
-// invoke borrows or creates a sandboxed goja VM, calls fnName (from module.exports or global scope)
+// invoke borrows or creates a sandboxed JS VM, calls fnName (from module.exports or global scope)
 // under strict timeout + stack limit + panic recovery, and recycles the VM only if healthy.
 func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, fnName string, args ...any) (out any, found bool, err error) {
 	if timeout <= 0 {
@@ -449,7 +445,7 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 		return nil, false, nil
 	}
 
-	jsArgs := make([]goja.Value, len(args))
+	jsArgs := make([]jsValue, len(args))
 	for i, a := range args {
 		jsArgs[i] = vm.ToValue(a)
 	}
@@ -472,35 +468,31 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 		close(done)
 	}()
 
-	res, callErr := callable(goja.Undefined(), jsArgs...)
+	res, callErr := vm.callFunc(callable, jsUndefinedVal, jsArgs)
 	if callErr != nil {
 		tainted = true
-		return nil, true, normalizeGojaError(r.manifest.ID, fnName, callErr)
+		return nil, true, normalizeJSError(r.manifest.ID, fnName, callErr)
 	}
-	if res == nil || goja.IsUndefined(res) || goja.IsNull(res) {
+	if res.kind == valUndefined || res.kind == valNull {
 		return nil, true, nil
 	}
 	return res.Export(), true, nil
 }
 
-func resolveCallable(vm *goja.Runtime, exports *goja.Object, fnName string) (goja.Callable, bool) {
+func resolveCallable(vm *jsRuntime, exports *jsObject, fnName string) (*jsFunc, bool) {
 	if exports != nil {
-		if v := exports.Get(fnName); v != nil && !goja.IsUndefined(v) && !goja.IsNull(v) {
-			if fn, ok := goja.AssertFunction(v); ok {
-				return fn, true
-			}
+		if v := exports.get(fnName); v.kind == valFunc && v.fn != nil {
+			return v.fn, true
 		}
 	}
-	if v := vm.Get(fnName); v != nil && !goja.IsUndefined(v) && !goja.IsNull(v) {
-		if fn, ok := goja.AssertFunction(v); ok {
-			return fn, true
-		}
+	if v := vm.Get(fnName); v.kind == valFunc && v.fn != nil {
+		return v.fn, true
 	}
 	return nil, false
 }
 
-func normalizeGojaError(pluginID string, stage string, err error) error {
-	var interrupted *goja.InterruptedError
+func normalizeJSError(pluginID string, stage string, err error) error {
+	var interrupted *jsInterruptedError
 	if errors.As(err, &interrupted) {
 		valStr := fmt.Sprint(interrupted.Value())
 		if strings.Contains(valStr, ErrExecutionTimeout.Error()) {

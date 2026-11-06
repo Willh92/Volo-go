@@ -89,7 +89,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			Username string `json:"username"`
 		}
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
-		repos, err := s.syncGitHubRepositories(r.Context(), req.Username)
+		repos, err := s.refreshGitHubRepositories(r.Context(), req.Username)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return

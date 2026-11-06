@@ -11,10 +11,6 @@ import (
 	"sync"
 	"unicode"
 
-	"github.com/alecthomas/chroma/v2"
-	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
-	"github.com/alecthomas/chroma/v2/lexers"
-	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
@@ -476,39 +472,6 @@ func renderBookshelfGrid(opts Options) string {
 	}
 	b.WriteString(`</section>`)
 	return b.String()
-}
-
-func highlightCodeChroma(code string, lang string, withLineNumbers bool) string {
-	var lexer chroma.Lexer
-	if lang != "" {
-		lexer = lexers.Get(lang)
-	}
-	if lexer == nil {
-		lexer = lexers.Fallback
-	}
-	lexer = chroma.Coalesce(lexer)
-
-	formatterOpts := []chromahtml.Option{
-		chromahtml.WithClasses(true), // Zero inline theme colors -> pure CSS variables for instant light/dark switch!
-		chromahtml.PreventSurroundingPre(false),
-	}
-	if withLineNumbers {
-		formatterOpts = append(formatterOpts, chromahtml.WithLineNumbers(true))
-	}
-	formatter := chromahtml.New(formatterOpts...)
-	iterator, err := lexer.Tokenise(nil, code)
-	if err != nil {
-		return `<pre class="chroma"><code>` + html.EscapeString(code) + `</code></pre>`
-	}
-	var buf bytes.Buffer
-	if err := formatter.Format(&buf, styles.Fallback, iterator); err != nil {
-		return `<pre class="chroma"><code>` + html.EscapeString(code) + `</code></pre>`
-	}
-	langAttr := ""
-	if lang != "" {
-		langAttr = ` data-lang="` + html.EscapeString(lang) + `"`
-	}
-	return `<figure class="volo-codeblock"` + langAttr + `>` + buf.String() + `</figure>`
 }
 
 var (

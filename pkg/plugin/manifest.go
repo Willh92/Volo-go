@@ -195,14 +195,14 @@ func (m *Manifest) Validate() error {
 			if err != nil {
 				return fmt.Errorf("plugin %q: invalid script_asset %q: %w", m.ID, slot.ScriptAsset, err)
 			}
-			slot.ScriptAsset = clean
+			slot.ScriptAsset = strings.TrimPrefix(clean, "assets/")
 		}
 		if slot.StyleAsset != "" {
 			clean, err := sanitizeRelativeAssetPath(slot.StyleAsset)
 			if err != nil {
 				return fmt.Errorf("plugin %q: invalid style_asset %q: %w", m.ID, slot.StyleAsset, err)
 			}
-			slot.StyleAsset = clean
+			slot.StyleAsset = strings.TrimPrefix(clean, "assets/")
 		}
 		if slot.Slot == SlotEditorQuickInsert && slot.QuickInsert == nil && !slot.Dynamic {
 			return fmt.Errorf("plugin %q: editor.quick_insert slot requires quick_insert metadata or dynamic=true", m.ID)
