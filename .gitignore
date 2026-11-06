@@ -1,0 +1,33 @@
+# Binaries & build artifacts
+/dist/
+/volo
+/volo.exe
+*.test
+*.out
+coverage.txt
+
+# Runtime data & local secrets (never commit!)
+/data/
+/.env
+*.db
+*.db-shm
+*.db-wal
+*.sock
+*.sock.lock
+
+# Frontend build intermediates
+/web/node_modules/
+/web/admin/node_modules/
+/web/comment-widget/node_modules/
+/.pnpm-store/
+
+# External runtime mounts (dev local)
+/themes/*
+!/themes/volo-studio/
+/plugins/*
+!/plugins/kanbanniang/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
