@@ -141,6 +141,18 @@ func (g *GeoEngine) SetRules(rules []domain.SecurityGeoRule) {
 	g.mu.Unlock()
 }
 
+// LookupDisplay returns a concise human-readable geolocation label (Region or CountryISO), or "" if unknown.
+func (g *GeoEngine) LookupDisplay(addr netip.Addr) string {
+	loc, ok := g.Lookup(addr)
+	if !ok {
+		return ""
+	}
+	if loc.Region != "" {
+		return loc.Region
+	}
+	return loc.CountryISO
+}
+
 // Lookup resolves CountryISO + Region for addr using overrideFn -> MMDB -> ip2region XDB cascade.
 func (g *GeoEngine) Lookup(addr netip.Addr) (GeoLocation, bool) {
 	if !addr.IsValid() {

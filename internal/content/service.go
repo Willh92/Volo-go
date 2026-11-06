@@ -372,6 +372,15 @@ func (s *Service) GetPublishedRawArticleBySlug(ctx context.Context, slug string)
 	)
 }
 
+// GetRawArticleBySlugAnyStatus fetches a RawArticle regardless of publication status (used only when gated by Staff ownership or valid ShareToken).
+func (s *Service) GetRawArticleBySlugAnyStatus(ctx context.Context, slug string) (domain.RawArticle, error) {
+	return sqlx.Get[domain.RawArticle](
+		ctx, s.store,
+		`SELECT * FROM articles WHERE slug = ?`,
+		strings.TrimSpace(slug),
+	)
+}
+
 // GetRawArticleByID fetches a RawArticle by ID.
 func (s *Service) GetRawArticleByID(ctx context.Context, articleID string) (domain.RawArticle, error) {
 	return sqlx.Get[domain.RawArticle](ctx, s.store, `SELECT * FROM articles WHERE id = ?`, strings.TrimSpace(articleID))

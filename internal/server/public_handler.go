@@ -54,9 +54,13 @@ type AppDeps struct {
 	Themes         *theme.Engine
 	StartedAt      time.Time
 
-	SendVerificationMail VerificationMailSender
-	NotifyCommentCreated CommentEventNotifier
-	ExtraMuxSetup        func(mux *http.ServeMux)
+	SendVerificationMail   VerificationMailSender
+	NotifyCommentCreated   CommentEventNotifier
+	Media                  MediaProcessor
+	NotifyArticlePublished func(ctx context.Context, raw domain.RawArticle)
+	TestSMTP               func(ctx context.Context, cfg domain.NotificationsSettings, overridePassword string, toEmail string, locale string) error
+	TestWebhook            func(ctx context.Context, wh domain.Webhook, locale string) (int, error)
+	ExtraMuxSetup          func(mux *http.ServeMux)
 }
 
 // AppServer serves all public pages, feeds, zero-copy Range media, plugins, and v1 APIs (plus Admin/Setup routes).
@@ -131,6 +135,8 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	s := &AppServer{deps: deps}
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
+	s.registerSetupRoutes(mux)
+	s.registerAdminRoutes(mux)
 	if deps.ExtraMuxSetup != nil {
 		deps.ExtraMuxSetup(mux)
 	}
@@ -199,10 +205,18 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 }
 
 func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
+	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
+	if adminPrefix == "/" {
+		adminPrefix = "/console"
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 			p != "/" &&
+			p != "/setup" &&
+			!strings.HasPrefix(p, "/setup/") &&
+			p != adminPrefix &&
+			!strings.HasPrefix(p, adminPrefix+"/") &&
 			!strings.HasPrefix(p, "/api/") &&
 			!strings.HasPrefix(p, "/themes/") &&
 			!strings.HasPrefix(p, "/uploads/") &&
@@ -941,6 +955,10 @@ func computeTotalPages(total int, pageSize int) int {
 
 func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" {
+		if s.isSetupUnlocked(r.Context()) {
+			http.Redirect(w, r, "/setup", http.StatusFound)
+			return
+		}
 		viewer, _ := s.resolveViewer(r)
 		pctx := s.basePageContext(r, viewer)
 		page := parsePageParam(r)
@@ -1026,12 +1044,29 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	viewer, _ := s.resolveViewer(r)
 	raw, err := s.deps.Content.GetPublishedRawArticleBySlug(r.Context(), slugDecoded)
 	if err != nil {
-		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
-		return
+		// Allow draft/scheduled preview ONLY when caller presents a valid timed ShareToken or is the Staff owner;
+		// all other callers receive an indistinguishable 404 Not Found.
+		cand, cErr := s.deps.Content.GetRawArticleBySlugAnyStatus(r.Context(), slugDecoded)
+		if cErr != nil {
+			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+			return
+		}
+		shareTok := strings.TrimSpace(r.URL.Query().Get("preview"))
+		if shareTok == "" {
+			shareTok = strings.TrimSpace(r.Header.Get("X-Volo-Share-Token"))
+		}
+		staffOwner := viewer != nil && viewer.Status == domain.UserStatusActive &&
+			(viewer.Role == domain.RoleAdmin || (viewer.Role == domain.RoleEditor && viewer.ID == cand.AuthorID))
+		if !staffOwner && (shareTok == "" || !s.deps.Content.Guard().VerifyShareToken(r.Context(), cand, shareTok)) {
+			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		raw = cand
 	}
-	viewer, _ := s.resolveViewer(r)
 	pctx := s.basePageContext(r, viewer)
 	detail, prev, next, backlinks, err := s.deps.Content.RenderArticleDetail(
 		r.Context(), w, r, raw, viewer, pctx.Locale, s.publicBaseURL(r),
@@ -1045,7 +1080,7 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 	pctx.PageTitle = detail.Title + " · " + pctx.Site.Title
 	pctx.MetaDescription = detail.Summary
 	pctx.OGImage = detail.OGImageURL
-	pctx.NoIndex = detail.RequiresPassword || detail.UnlockedViaShare || detail.IsPasswordProtected
+	pctx.NoIndex = raw.Status != domain.ArticleStatusPublished || detail.RequiresPassword || detail.UnlockedViaShare || detail.IsPasswordProtected
 	pctx.Detail = detail
 	pctx.PrevPost = prev
 	pctx.NextPost = next

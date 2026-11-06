@@ -83,7 +83,12 @@
   "notify.verify_code.subject": "[{site}] 你的读者邮箱验证码：{code}",
   "notify.verify_code.body": "你好！你正在 {site} 验证读者邮箱，6 位一次性验证码为：{code}（10 分钟内有效）。如非本人操作请忽略。",
   "notify.new_comment.subject": "[{site}] 新评论提醒：《{title}》",
+  "notify.new_comment.body": "{author} 在《{title}》发表了新评论：\n\n{content}\n\n查看详情：{url}",
   "notify.reply_comment.subject": "[{site}] 你在《{title}》下的评论收到了新回复",
+  "notify.reply_comment.body": "{author} 回复了你在《{title}》下的评论：\n\n{content}\n\n点击查看：{url}",
+  "notify.test_smtp.subject": "[{site}] SMTP 邮件通道连通性测试",
+  "notify.test_smtp.body": "恭喜！你的 {site} SMTP 邮件通知服务配置正确且 TLS 握手验证通过。",
+  "notify.webhook.test_title": "Volo-go Webhook 通道连通性测试",
 
   "error.unauthorized": "请先登录后再执行此操作",
   "error.forbidden": "当前账号无权访问该资源",

@@ -83,7 +83,12 @@
   "notify.verify_code.subject": "[{site}] Verification code: {code}",
   "notify.verify_code.body": "Hello! Your 6-digit verification code for {site} is {code} (valid for 10 minutes).",
   "notify.new_comment.subject": "[{site}] New comment on \"{title}\"",
+  "notify.new_comment.body": "{author} posted a new comment on \"{title}\":\n\n{content}\n\nView thread: {url}",
   "notify.reply_comment.subject": "[{site}] New reply to your comment on \"{title}\"",
+  "notify.reply_comment.body": "{author} replied to your comment on \"{title}\":\n\n{content}\n\nView reply: {url}",
+  "notify.test_smtp.subject": "[{site}] SMTP Delivery Test",
+  "notify.test_smtp.body": "Success! Your {site} SMTP notification channel is configured properly with verified TLS.",
+  "notify.webhook.test_title": "Volo-go Webhook Connectivity Test",
 
   "error.unauthorized": "Authentication required",
   "error.forbidden": "You do not have permission to access this resource",

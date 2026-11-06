@@ -113,6 +113,50 @@ func (idx *SearchIndex) Stats() (usedBytes int, docCount int, complete bool) {
 	return idx.used, len(idx.docs), idx.complete
 }
 
+// Remove deletes an article ID from the in-memory search index if present.
+func (idx *SearchIndex) Remove(articleID string) {
+	if strings.TrimSpace(articleID) == "" {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for i, d := range idx.docs {
+		if d.id == articleID {
+			idx.used -= d.byteCost
+			if idx.used < 0 {
+				idx.used = 0
+			}
+			idx.docs = append(idx.docs[:i], idx.docs[i+1:]...)
+			return
+		}
+	}
+}
+
+// Upsert inserts or updates a published, non-password-protected article in the bounded RAM index.
+// If the article is non-public or password-protected, it is immediately removed from the index.
+func (idx *SearchIndex) Upsert(r domain.RawArticle) {
+	if r.Status != domain.ArticleStatusPublished || strings.TrimSpace(r.PasswordCiphertext) != "" {
+		idx.Remove(r.ID)
+		return
+	}
+	doc := idx.buildSafeDoc(r)
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for i, existing := range idx.docs {
+		if existing.id == r.ID {
+			idx.used -= existing.byteCost
+			idx.docs = append(idx.docs[:i], idx.docs[i+1:]...)
+			break
+		}
+	}
+	if idx.used+doc.byteCost > idx.maxBytes {
+		idx.complete = false
+		return
+	}
+	idx.used += doc.byteCost
+	idx.docs = append([]searchDoc{doc}, idx.docs...)
+}
+
 func (idx *SearchIndex) buildSafeDoc(r domain.RawArticle) searchDoc {
 	// Strictly strip ALL `:::lock ... :::` (including unclosed locks) BEFORE extracting plain text!
 	safeSummary := render.StripAllLockBlocks(r.SummaryMD)

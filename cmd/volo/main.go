@@ -25,7 +25,9 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/etl"
 	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/notify"
 	"github.com/Willh92/Volo-go/internal/repo"
+	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/server"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
@@ -295,14 +297,33 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		_ = pluginMgr.Close(shutCtx)
 	}()
 
+	outboundDialer := &security.OutboundSafeDialer{Timeout: 10 * time.Second}
+	notifier := notify.NewDispatcher(notify.DispatcherOptions{
+		Store:          store,
+		Keys:           cfg.KeyRing,
+		Settings:       settingsMgr,
+		Catalog:        catalog,
+		Plugins:        pluginMgr,
+		OutboundDialer: outboundDialer,
+		PublicURL:      cfg.PublicURL,
+	})
+
 	startedAt := time.Now()
 	appSrv, err := server.NewAppServer(server.AppDeps{
-		Config:    cfg,
-		Store:     store,
-		Settings:  settingsMgr,
-		Catalog:   catalog,
-		Plugins:   pluginMgr,
-		StartedAt: startedAt,
+		Config:               cfg,
+		Store:                store,
+		Settings:             settingsMgr,
+		Catalog:              catalog,
+		OutboundDialer:       outboundDialer,
+		Plugins:              pluginMgr,
+		StartedAt:            startedAt,
+		SendVerificationMail: notifier.SendVerificationCode,
+		NotifyCommentCreated: notifier.NotifyCommentCreated,
+		NotifyArticlePublished: func(pubCtx context.Context, raw domain.RawArticle) {
+			notifier.BroadcastArticlePublished(pubCtx, raw, "")
+		},
+		TestSMTP:    notifier.SendTestSMTP,
+		TestWebhook: notifier.TriggerTestWebhook,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "volo serve: server init failed: %v\n", err)
