@@ -5,7 +5,7 @@ go 1.27.3
 require (
 	github.com/HugoSmits86/nativewebp v1.3.0
 	github.com/go-sql-driver/mysql v1.9.3
-	github.com/jackc/pgx/v5 v5.9.1
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/lionsoul2014/ip2region/binding/golang v0.0.0-20261028042204-6a276cc7c4f9
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/oschwald/maxminddb-golang/v2 v2.9.0
