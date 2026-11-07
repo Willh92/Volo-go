@@ -571,3 +571,183 @@ func TestPillarsSecurityHeadersAuthHardeningPublic404sBookReaderAndAdminBatchEnd
 		t.Fatalf("expected concurrent session #2 to be revoked (401) after password change, got %d", me2Resp.StatusCode)
 	}
 }
+
+func TestVoloSoloUIPolish_CommentsDesc_Bookshelf_Templates(t *testing.T) {
+	env := setupM5TestEnv(t, "/console")
+	stResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/setup/status", nil, nil, nil)
+	var setupCSRF string
+	for _, c := range stResp.Cookies() {
+		if strings.Contains(c.Name, "csrf") {
+			setupCSRF = c.Value
+		}
+	}
+	compResp, compBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/setup/complete", map[string]any{
+		"admin_username":     "uiadmin",
+		"admin_email":        "uiadmin@example.com",
+		"admin_password":     "UiPass99!",
+		"admin_display_name": "UI Admin",
+		"site_title":         "Volo Parity Studio",
+		"default_locale":     "zh-CN",
+	}, stResp.Cookies(), map[string]string{"X-CSRF-Token": setupCSRF})
+	if compResp.StatusCode != http.StatusOK {
+		t.Fatalf("setup complete: %d %s", compResp.StatusCode, string(compBody))
+	}
+	adminCookies := compResp.Cookies()
+	var setupDone struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	_ = json.Unmarshal(compBody, &setupDone)
+	csrfHdr := map[string]string{auth.CSRFHeaderName: setupDone.CSRFToken}
+
+	// 1. Insert a book (no cover -> fallback spine cover) + an external iframe book
+	book1ID := id.Next()
+	_, err := env.store.ExecContext(env.ctx,
+		`INSERT INTO books (id, title, slug, description, cover_url, source_type, source_url, series_id, embed_mode, chapter_count, synced_at, sort_order, created_at, updated_at)
+		 VALUES (?, 'Go 实战手册', 'go-handbook', '云原生与低内存实践', '', 'external', 'https://book.example.com/go', '', 'iframe', 12, 0, 1, 1700000000000, 1700000000000)`,
+		book1ID)
+	if err != nil {
+		t.Fatalf("insert book: %v", err)
+	}
+	chap1ID := id.Next()
+	_, err = env.store.ExecContext(env.ctx,
+		`INSERT INTO book_chapters (id, book_id, parent_id, title, url, depth, sort_order)
+		 VALUES (?, ?, '', '第一章 导论', 'https://book.example.com/go/ch1', 0, 1)`,
+		chap1ID, book1ID)
+	if err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+
+	// 2. Create a legacy-imported bookshelf article (`:::bookshelf:::` + headings + tag)
+	artResp, artBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/articles", map[string]any{
+		"title":      "在线书架导览",
+		"slug":       "online-bookshelf",
+		"summary_md": "精选在线书籍汇总",
+		"content_md": "## 推荐书目\n\n:::bookshelf:::\n\n### 延伸阅读\n\n| A | B | C |\n|---|---|---|\n| 1 | 2 | 3 |\n",
+		"tags":       []string{"UNIQUE_TAG_ONCE_88"},
+		"status":     domain.ArticleStatusPublished,
+	}, adminCookies, csrfHdr)
+	if artResp.StatusCode != http.StatusCreated && artResp.StatusCode != http.StatusOK {
+		t.Fatalf("create bookshelf article failed: %d %s", artResp.StatusCode, string(artBody))
+	}
+	var createdArt struct {
+		Article domain.RawArticle `json:"article"`
+	}
+	_ = json.Unmarshal(artBody, &createdArt)
+	artID := createdArt.Article.ID
+
+	// Simulate pre-existing legacy DB row with stale word_count = 1
+	_, err = env.store.ExecContext(env.ctx, `UPDATE articles SET word_count = 1, view_count = 42 WHERE id = ?`, artID)
+	if err != nil {
+		t.Fatalf("update stale word_count: %v", err)
+	}
+
+	// 3. Homepage without notice_board: no .studio-hero, no .studio-author-card / .studio-stats-card, has .studio-post-views
+	homeResp, homeHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, nil)
+	if homeResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / = %d", homeResp.StatusCode)
+	}
+	if bytes.Contains(homeHTML, []byte(`class="studio-hero`)) {
+		t.Fatalf("expected no .studio-hero when NoticeBoard is empty")
+	}
+	if bytes.Contains(homeHTML, []byte("studio-author-card")) || bytes.Contains(homeHTML, []byte("studio-stats-card")) {
+		t.Fatalf("expected invented author/stats sidebar cards removed")
+	}
+	if !bytes.Contains(homeHTML, []byte("studio-post-views")) {
+		t.Fatalf("expected .studio-post-views on homepage article card")
+	}
+
+	// Enable NoticeBoard Markdown -> homepage renders .studio-hero with rendered <strong>, /archives renders .studio-notice
+	if _, _, err := env.settings.PatchDomain(env.ctx, "site", []byte(`{"notice_board":"欢迎阅读 **Volo 公告**"}`), 0); err != nil {
+		t.Fatalf("PatchDomain site notice_board: %v", err)
+	}
+	_, homeNoticeHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, nil)
+	if !bytes.Contains(homeNoticeHTML, []byte(`class="studio-hero`)) || !bytes.Contains(homeNoticeHTML, []byte("<strong>Volo 公告</strong>")) {
+		t.Fatalf("expected rendered Markdown NoticeBoard inside .studio-hero on homepage")
+	}
+	_, archHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/archives", nil, nil, nil)
+	if !bytes.Contains(archHTML, []byte("studio-notice")) {
+		t.Fatalf("expected standalone .studio-notice in sidebar on /archives when NoticeBoard is non-empty")
+	}
+
+	// 4. Public article page: renders inline :::bookshelf::: grid + fallback spine cover, single tag occurrence, sticky TOC slot, view count, no sidebar
+	postResp, postHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/posts/online-bookshelf", nil, nil, nil)
+	if postResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /posts/online-bookshelf = %d", postResp.StatusCode)
+	}
+	postStr := string(postHTML)
+	for _, mustHave := range []string{
+		"volo-embed-bookshelf",
+		"volo-book-tile",
+		"volo-embed-book__cover--fallback",
+		"Go 实战手册",
+		`id="volo-toc-slot"`,
+		"studio-article-counts",
+		"volo-table-scroll",
+	} {
+		if !strings.Contains(postStr, mustHave) {
+			t.Fatalf("expected %q in rendered article page", mustHave)
+		}
+	}
+	for _, mustNotHave := range []string{
+		"studio-article__foot-tags",
+		`class="studio-sidebar"`,
+		"studio-author-card",
+	} {
+		if strings.Contains(postStr, mustNotHave) {
+			t.Fatalf("unexpected %q in rendered article page", mustNotHave)
+		}
+	}
+	if tagCount := strings.Count(postStr, "#UNIQUE_TAG_ONCE_88"); tagCount != 1 {
+		t.Fatalf("expected article tag #UNIQUE_TAG_ONCE_88 rendered exactly once, got %d", tagCount)
+	}
+
+	// 5. External iframe book reader: SSR auto-collapses sidebar (`is-toc-collapsed`) and exposes `.js-book-toggle-toc`
+	brResp, brHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/books/go-handbook", nil, nil, nil)
+	if brResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /books/go-handbook = %d", brResp.StatusCode)
+	}
+	if !bytes.Contains(brHTML, []byte("is-toc-collapsed")) || !bytes.Contains(brHTML, []byte("js-book-toggle-toc")) {
+		t.Fatalf("expected external iframe book reader to render is-toc-collapsed and js-book-toggle-toc")
+	}
+
+	// 6. Comments tree order: top-level comments DESC (newest first), nested replies ASC (chronological)
+	root1, root2 := id.Next(), id.Next()
+	rep1A, rep1B := id.Next(), id.Next()
+	insertCmt := func(cid, parentID, author string, ts int64) {
+		_, err := env.store.ExecContext(env.ctx,
+			`INSERT INTO comments (id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash, author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale, client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at)
+			 VALUES (?, 'article', ?, ?, '', '', '', '', ?, '', '', '', 'zh-CN', '', '203.0.*.*', '', 'hello', 'approved', ?, ?, ?)`,
+			cid, artID, parentID, author, false, ts, ts)
+		if err != nil {
+			t.Fatalf("insert comment %s: %v", author, err)
+		}
+	}
+	insertCmt(root1, "", "RootOlder", 1700000001000)
+	insertCmt(root2, "", "RootNewer", 1700000005000)
+	insertCmt(rep1A, root1, "ReplyFirst", 1700000002000)
+	insertCmt(rep1B, root1, "ReplySecond", 1700000003000)
+
+	cmtListResp, cmtListBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/comments?target_type=article&target_id="+artID, nil, nil, nil)
+	if cmtListResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/comments = %d %s", cmtListResp.StatusCode, string(cmtListBody))
+	}
+	var cmtPayload struct {
+		Comments []struct {
+			AuthorName string `json:"author_name"`
+			Replies    []struct {
+				AuthorName string `json:"author_name"`
+			} `json:"replies"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal(cmtListBody, &cmtPayload); err != nil {
+		t.Fatalf("unmarshal comments: %v", err)
+	}
+	if len(cmtPayload.Comments) != 2 || cmtPayload.Comments[0].AuthorName != "RootNewer" || cmtPayload.Comments[1].AuthorName != "RootOlder" {
+		t.Fatalf("expected root comments DESC [RootNewer, RootOlder], got %+v", cmtPayload.Comments)
+	}
+	replies := cmtPayload.Comments[1].Replies
+	if len(replies) != 2 || replies[0].AuthorName != "ReplyFirst" || replies[1].AuthorName != "ReplySecond" {
+		t.Fatalf("expected nested replies ASC [ReplyFirst, ReplySecond], got %+v", replies)
+	}
+}
+

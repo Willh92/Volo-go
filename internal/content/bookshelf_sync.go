@@ -102,6 +102,7 @@ func (s *Service) lookupBookCard(ctx context.Context, slug string) (render.BookC
 		Title:        bk.Title,
 		Description:  bk.Description,
 		CoverURL:     bk.CoverURL,
+		SourceURL:    bk.SourceURL,
 		ChapterCount: bk.ChapterCount,
 	}, true
 }
@@ -118,6 +119,7 @@ func (s *Service) listBookCards(ctx context.Context) []render.BookCardInfo {
 			Title:        bk.Title,
 			Description:  bk.Description,
 			CoverURL:     bk.CoverURL,
+			SourceURL:    bk.SourceURL,
 			ChapterCount: bk.ChapterCount,
 		})
 	}

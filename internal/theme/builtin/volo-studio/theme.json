@@ -23,21 +23,15 @@
       "default": ""
     },
     {
-      "key": "show_author_card",
-      "type": "boolean",
-      "label": { "zh-CN": "侧栏显示站长名片与公告", "en-US": "Show Author Profile & Notice Card" },
-      "default": true
-    },
-    {
       "key": "show_recent_posts",
       "type": "boolean",
-      "label": { "zh-CN": "侧栏显示近期文章列表", "en-US": "Show Recent Posts in Sidebar" },
+      "label": { "zh-CN": "侧栏显示近期与热门文章列表", "en-US": "Show Recent & Popular Posts in Sidebar" },
       "default": true
     },
     {
       "key": "show_site_stats",
       "type": "boolean",
-      "label": { "zh-CN": "侧栏显示全站统计概览", "en-US": "Show Site Statistics Card" },
+      "label": { "zh-CN": "页脚显示全站统计概览", "en-US": "Show Site Statistics in Footer" },
       "default": true
     }
   ]

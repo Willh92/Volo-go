@@ -1,28 +1,9 @@
 {{define "sidebar"}}
 <aside class="studio-sidebar">
-  {{if themeCfgBool .ThemeConfig "show_author_card" true}}
-    {{$ownerName := coalesce .Owner.DisplayName .Owner.Username .Site.Title}}
-    {{$ownerBio := coalesce .Owner.Bio .Site.Description .Site.Subtitle}}
-    {{$ownerAvatar := coalesce .Owner.AvatarURL .Site.LogoURL}}
-    <section class="sidebar-card studio-author-card">
-      <div class="studio-author-card__head">
-        {{if $ownerAvatar}}
-          <img class="studio-author-card__avatar" src="{{$ownerAvatar}}" alt="{{$ownerName}}" width="46" height="46" loading="lazy" decoding="async" data-brand-avatar="1">
-          <span class="studio-author-card__monogram" hidden aria-hidden="true">V.</span>
-        {{else}}
-          <img class="studio-author-card__avatar" src="/avatars/{{urlEncode (coalesce .Owner.ID .Owner.Username "owner")}}.svg" alt="{{$ownerName}}" width="46" height="46" loading="lazy" decoding="async">
-        {{end}}
-        <div class="studio-author-card__meta">
-          <strong class="studio-author-card__name">{{$ownerName}}</strong>
-          {{if $ownerBio}}<p class="studio-author-card__bio">{{$ownerBio}}</p>{{end}}
-        </div>
-      </div>
-      {{if and (not .IsHome) .Site.NoticeBoard}}
-        <div class="studio-author-card__notice">
-          <h3 class="sidebar-card__title">{{t .Locale "sidebar.notice"}}</h3>
-          <div class="sidebar-notice-text">{{.Site.NoticeBoard}}</div>
-        </div>
-      {{end}}
+  {{if and (not .IsHome) (ne (trim .Site.NoticeBoard) "")}}
+    <section class="sidebar-card studio-notice">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.notice"}}</h3>
+      <div class="sidebar-notice-text">{{renderNotice .Site.NoticeBoard}}</div>
     </section>
   {{end}}
 
@@ -86,18 +67,6 @@
     {{end}}
   {{end}}
 
-  {{if themeCfgBool .ThemeConfig "show_site_stats" true}}
-    <section class="sidebar-card studio-stats-card">
-      <h3 class="sidebar-card__title">{{t .Locale "sidebar.stats"}}</h3>
-      <dl class="studio-stats-grid">
-        <div><dt>{{t .Locale "stats.articles"}}</dt><dd>{{.Stats.ArticleCount}}</dd></div>
-        <div><dt>{{t .Locale "stats.categories"}}</dt><dd>{{.Stats.CategoryCount}}</dd></div>
-        <div><dt>{{t .Locale "stats.tags"}}</dt><dd>{{.Stats.TagCount}}</dd></div>
-        <div><dt>{{t .Locale "stats.comments"}}</dt><dd>{{.Stats.CommentCount}}</dd></div>
-      </dl>
-    </section>
-  {{end}}
-
   {{if and .IsHome .Viewer (eq .Viewer.Role "admin") .RecentComments}}
     <section class="sidebar-card studio-recent-comments">
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.recent_comments"}}</h3>
@@ -140,18 +109,22 @@
   </div>
   <h2 class="article__title"><a rel="bookmark" href="{{.Card.URL}}">{{.Card.Title}}</a></h2>
   <p class="studio-abstract">{{.Card.Summary}}</p>
-  {{if or .Card.CategoryName .Card.Tags}}
-    <div class="studio-post-foot">
-      <span class="studio-post-tags">
-        {{if .Card.CategoryName}}
-          <a class="studio-cat-chip" href="/categories/{{.Card.CategorySlug}}">{{.Card.CategoryName}}</a>
-        {{end}}
-        {{range .Card.Tags}}
-          <a href="/tags/{{.Slug}}"># {{.Name}}</a>
-        {{end}}
-      </span>
-    </div>
-  {{end}}
+  <div class="studio-post-foot">
+    <span class="studio-post-tags">
+      {{if .Card.CategoryName}}
+        <a class="studio-cat-chip" href="/categories/{{.Card.CategorySlug}}">{{.Card.CategoryName}}</a>
+      {{end}}
+      {{range first 3 .Card.Tags}}
+        <a href="/tags/{{.Slug}}"># {{.Name}}</a>
+      {{end}}
+    </span>
+    <span class="studio-post-foot__right">
+      {{if not .Card.IsPasswordProtected}}
+        <span class="studio-post-views">{{t .Locale "studio.views_count" (dict "count" .Card.ViewCount)}}</span>
+      {{end}}
+      <a class="article__more" href="{{.Card.URL}}" aria-label="{{t .Locale "studio.read_more"}} {{.Card.Title}}">{{t .Locale "studio.read_more"}} <span aria-hidden="true">↗</span></a>
+    </span>
+  </div>
 </article>
 {{end}}
 

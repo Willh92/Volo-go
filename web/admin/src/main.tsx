@@ -659,13 +659,13 @@ function App() {
       )}
 
       <aside class={`volo-rail ${mobileMenuOpen ? "mobile-open" : ""}`}>
-        <div class="volo-brand">
+        <a class="volo-brand" href="/" title={t("shell.view_blog")}>
           <BrandLogo size={34} variant="rail" />
           <div style={{ minWidth: 0 }}>
             <div class="volo-brand-title">Volo</div>
             <div class="volo-brand-sub">{t("shell.brand_sub")}</div>
           </div>
-        </div>
+        </a>
 
         <nav class="volo-nav-scroll">
           <div class="volo-nav-caption">{t("nav.caption")}</div>

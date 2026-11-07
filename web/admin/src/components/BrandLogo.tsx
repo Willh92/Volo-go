@@ -6,7 +6,7 @@ export function BrandLogo({
   variant?: "default" | "rail";
 }) {
   const isRail = variant === "rail";
-  const bg = isRail ? "var(--volo-nav-mark, #9bcab1)" : "var(--volo-accent, #246b51)";
+  const bg = isRail ? "var(--volo-nav-mark, #9bcab1)" : "var(--volo-btn-bg, #246b51)";
   const fg = isRail ? "var(--volo-nav-mark-ink, #102a27)" : "#eef5ee";
 
   return (

@@ -110,3 +110,80 @@ func TestEngineRenderFeaturesXSSAndFailClosedLocks(t *testing.T) {
 		t.Fatalf("expected ExtractFirstLockPassword='topsecret', got %q", gotPwd)
 	}
 }
+
+func TestLegacyBookshelfDirectivesAndWideTable(t *testing.T) {
+	eng := NewEngine()
+
+	books := []BookCardInfo{
+		{
+			Slug:         "the-way-to-go",
+			Title:        "Go 语言入门指南",
+			Description:  "The Way to Go 中文译本与实战笔记",
+			ChapterCount: 42,
+		},
+		{
+			Slug:         "gopl-notes",
+			Title:        "Go 程序设计语言导读",
+			CoverURL:     "/uploads/gopl.png",
+			ChapterCount: 13,
+		},
+	}
+
+	// 1. Legacy single-line `:::bookshelf:::` must render bookshelf grid, NOT literal `<p>:::bookshelf:::</p>`!
+	outShelf := eng.Render(":::bookshelf:::", Options{
+		Mode:   RenderModeWeb,
+		Locale: "zh-CN",
+		ListBooks: func() []BookCardInfo {
+			return books
+		},
+	})
+	if strings.Contains(outShelf.HTML, ":::bookshelf") {
+		t.Fatalf("raw :::bookshelf::: directive leaked into HTML: %s", outShelf.HTML)
+	}
+	if !strings.Contains(outShelf.HTML, `class="volo-embed-bookshelf"`) ||
+		!strings.Contains(outShelf.HTML, `/books/the-way-to-go`) ||
+		!strings.Contains(outShelf.HTML, `42 章`) ||
+		!strings.Contains(outShelf.HTML, `开始阅读 →`) ||
+		!strings.Contains(outShelf.HTML, `volo-embed-book__cover--fallback`) {
+		t.Fatalf("unexpected bookshelf HTML: %s", outShelf.HTML)
+	}
+	if outShelf.WordCount < 10 {
+		t.Fatalf("expected rendered bookshelf WordCount >= 10, got %d", outShelf.WordCount)
+	}
+
+	// 2. Single-line `:::book id='the-way-to-go':::` and unquoted `:::book slug=gopl-notes:::`
+	outBook := eng.Render(":::book id='the-way-to-go':::\n\n:::book slug=gopl-notes:::", Options{
+		Mode:   RenderModeWeb,
+		Locale: "en-US",
+		LookupBook: func(slug string) (BookCardInfo, bool) {
+			for _, b := range books {
+				if b.Slug == slug {
+					return b, true
+				}
+			}
+			return BookCardInfo{}, false
+		},
+	})
+	if strings.Contains(outBook.HTML, ":::book") {
+		t.Fatalf("raw :::book directive leaked into HTML: %s", outBook.HTML)
+	}
+	if !strings.Contains(outBook.HTML, "42 chapters") || !strings.Contains(outBook.HTML, "Read →") {
+		t.Fatalf("expected localized chapter badge & CTA in book card: %s", outBook.HTML)
+	}
+
+	// 3. Wide 20-column GFM table wraps cleanly in `.volo-table-scroll`
+	var cols []string
+	var seps []string
+	var vals []string
+	for i := 1; i <= 20; i++ {
+		cols = append(cols, "C")
+		seps = append(seps, "---")
+		vals = append(vals, "11%")
+	}
+	wideTableMD := "| " + strings.Join(cols, " | ") + " |\n| " + strings.Join(seps, " | ") + " |\n| " + strings.Join(vals, " | ") + " |"
+	outTbl := eng.Render(wideTableMD, Options{Mode: RenderModeWeb})
+	if !strings.Contains(outTbl.HTML, `<div class="volo-table-scroll"><table>`) {
+		t.Fatalf("expected wide table wrapped in .volo-table-scroll, got: %s", outTbl.HTML)
+	}
+}
+

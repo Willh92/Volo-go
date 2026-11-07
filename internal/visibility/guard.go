@@ -584,13 +584,18 @@ func (g *Guard) ToDetail(
 	view.NeedsMath = out.NeedsMath
 	view.NeedsMermaid = out.NeedsMermaid
 	view.HasLockedSections = out.HasLockBlock && !status.Unlocked
-	view.WordCount = raw.WordCount
-	if view.WordCount <= 0 {
+	if !view.HasLockedSections {
 		view.WordCount = out.WordCount
-	}
-	view.ReadingMinutes = raw.ReadingMinutes
-	if view.ReadingMinutes <= 0 {
 		view.ReadingMinutes = out.ReadingMinutes
+	} else {
+		view.WordCount = raw.WordCount
+		if view.WordCount <= 0 {
+			view.WordCount = out.WordCount
+		}
+		view.ReadingMinutes = raw.ReadingMinutes
+		if view.ReadingMinutes <= 0 {
+			view.ReadingMinutes = out.ReadingMinutes
+		}
 	}
 
 	// Compute public-safe summary & OG image (never leaking locked blocks into meta tags!).

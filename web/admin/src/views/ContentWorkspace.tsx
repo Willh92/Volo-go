@@ -112,11 +112,10 @@ export function ContentWorkspace({
   const [pageIdx, setPageIdx] = useState(1);
   const [loading, setLoading] = useState(false);
 
-  // Pages (list + 2-column Studio Page Editor)
+  // Pages (list + full-width Studio Page Editor)
   const [pages, setPages] = useState<any[]>([]);
   const [pageEditorOpen, setPageEditorOpen] = useState(false);
   const [editPage, setEditPage] = useState<any | null>(null);
-  const [pageInspectorOpen, setPageInspectorOpen] = useState(true);
   const [savingPage, setSavingPage] = useState(false);
   const savePageRef = useRef<() => void>(() => {});
 
@@ -1890,119 +1889,105 @@ export function ContentWorkspace({
                       {t("common.preview")} ↗
                     </a>
                   )}
-                  <button
-                    type="button"
-                    class="volo-btn volo-btn-sm"
-                    onClick={() => setPageInspectorOpen((v) => !v)}
-                  >
-                    {pageInspectorOpen ? t("ov.hide_inspector") : t("ov.show_inspector")}
-                  </button>
                   <button type="submit" class="volo-btn volo-btn-primary volo-btn-sm" disabled={savingPage}>
                     {t("common.save")}
                   </button>
                 </div>
               </div>
 
-              <div class={`volo-studio-split ${pageInspectorOpen ? "" : "is-collapsed"}`}>
-                <div>
-                  <div class="volo-field">
-                    <input
-                      class="volo-editor-title-input"
-                      required
-                      placeholder={t("cnt.page_title_ph")}
-                      value={editPage.title || ""}
-                      onInput={(e) => updatePageDraft({ title: (e.currentTarget as HTMLInputElement).value })}
-                    />
+              <div class="volo-field">
+                <input
+                  class="volo-editor-title-input"
+                  required
+                  placeholder={t("cnt.page_title_ph")}
+                  value={editPage.title || ""}
+                  onInput={(e) => updatePageDraft({ title: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field">
+                <CM6Editor
+                  value={editPage.content_md || ""}
+                  onChange={(md) => updatePageDraft({ content_md: md })}
+                  onSave={() => void savePage()}
+                />
+              </div>
+
+              <div class="volo-editor-panels">
+                <div class="volo-inspector-box">
+                  <div class="volo-inspector-title">{t("ov.panel_publish")}</div>
+                  <div class="volo-auto-grid">
+                    <div class="volo-field">
+                      <label>{t("cnt.page_slug")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder="about"
+                        value={editPage.slug || ""}
+                        onInput={(e) => updatePageDraft({ slug: (e.currentTarget as HTMLInputElement).value })}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("cnt.page_template")}</label>
+                      <ConsoleSelect
+                        value={editPage.template || "default"}
+                        onChange={(val) => updatePageDraft({ template: val })}
+                        options={[
+                          { value: "default", label: t("cnt.page_tpl_default") },
+                          { value: "wide", label: t("cnt.page_tpl_wide") },
+                          { value: "minimal", label: t("cnt.page_tpl_minimal") },
+                        ]}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("cnt.lbl_page_locale")}</label>
+                      <ConsoleSelect
+                        value={editPage.lang || "zh-CN"}
+                        onChange={(val) => updatePageDraft({ lang: val })}
+                        options={locales.map((loc) => ({
+                          value: loc.code,
+                          label: loc.name,
+                          badge: loc.code,
+                        }))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("cnt.lbl_page_group")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder="group-about"
+                        value={editPage.translation_group || ""}
+                        onInput={(e) =>
+                          updatePageDraft({ translation_group: (e.currentTarget as HTMLInputElement).value })
+                        }
+                      />
+                    </div>
                   </div>
-                  <div class="volo-field">
-                    <CM6Editor
-                      value={editPage.content_md || ""}
-                      onChange={(md) => updatePageDraft({ content_md: md })}
-                      onSave={() => void savePage()}
+                  <div class="volo-check-grid" style={{ marginBottom: 0 }}>
+                    <SwitchToggle
+                      checked={editPage.is_published !== false}
+                      onChange={(v) => updatePageDraft({ is_published: v })}
+                      label={t("cnt.page_published")}
                     />
-                  </div>
-                  <div class="volo-form-actions">
-                    <button type="button" class="volo-btn" onClick={() => void closePageEditor()}>
-                      {t("common.cancel")}
-                    </button>
-                    <button type="submit" class="volo-btn volo-btn-primary" disabled={savingPage}>
-                      {t("common.save")}
-                    </button>
+                    <SwitchToggle
+                      checked={!!editPage.show_toc}
+                      onChange={(v) => updatePageDraft({ show_toc: v })}
+                      label={t("cnt.page_show_toc")}
+                    />
+                    <SwitchToggle
+                      checked={editPage.allow_comment !== false}
+                      onChange={(v) => updatePageDraft({ allow_comment: v })}
+                      label={t("art.allow_comment")}
+                    />
                   </div>
                 </div>
+              </div>
 
-                {pageInspectorOpen && (
-                  <aside class="volo-studio-inspector">
-                    <div class="volo-inspector-box">
-                      <div class="volo-inspector-title">{t("ov.panel_publish")}</div>
-                      <div class="volo-field">
-                        <label>{t("cnt.page_slug")}</label>
-                        <input
-                          class="volo-input"
-                          placeholder="about"
-                          value={editPage.slug || ""}
-                          onInput={(e) => updatePageDraft({ slug: (e.currentTarget as HTMLInputElement).value })}
-                        />
-                      </div>
-                      <div class="volo-field">
-                        <label>{t("cnt.page_template")}</label>
-                        <ConsoleSelect
-                          value={editPage.template || "default"}
-                          onChange={(val) => updatePageDraft({ template: val })}
-                          options={[
-                            { value: "default", label: t("cnt.page_tpl_default") },
-                            { value: "wide", label: t("cnt.page_tpl_wide") },
-                            { value: "minimal", label: t("cnt.page_tpl_minimal") },
-                          ]}
-                        />
-                      </div>
-                      <div class="volo-check-grid">
-                        <SwitchToggle
-                          checked={editPage.is_published !== false}
-                          onChange={(v) => updatePageDraft({ is_published: v })}
-                          label={t("cnt.page_published")}
-                        />
-                        <SwitchToggle
-                          checked={!!editPage.show_toc}
-                          onChange={(v) => updatePageDraft({ show_toc: v })}
-                          label={t("cnt.page_show_toc")}
-                        />
-                        <SwitchToggle
-                          checked={editPage.allow_comment !== false}
-                          onChange={(v) => updatePageDraft({ allow_comment: v })}
-                          label={t("art.allow_comment")}
-                        />
-                      </div>
-                    </div>
-
-                    <div class="volo-inspector-box">
-                      <div class="volo-inspector-title">{t("cnt.page_locale_group")}</div>
-                      <div class="volo-field">
-                        <label>{t("cnt.lbl_page_locale")}</label>
-                        <ConsoleSelect
-                          value={editPage.lang || "zh-CN"}
-                          onChange={(val) => updatePageDraft({ lang: val })}
-                          options={locales.map((loc) => ({
-                            value: loc.code,
-                            label: loc.name,
-                            badge: loc.code,
-                          }))}
-                        />
-                      </div>
-                      <div class="volo-field">
-                        <label>{t("cnt.lbl_page_group")}</label>
-                        <input
-                          class="volo-input"
-                          placeholder="group-about"
-                          value={editPage.translation_group || ""}
-                          onInput={(e) =>
-                            updatePageDraft({ translation_group: (e.currentTarget as HTMLInputElement).value })
-                          }
-                        />
-                      </div>
-                    </div>
-                  </aside>
-                )}
+              <div class="volo-form-actions">
+                <button type="button" class="volo-btn" onClick={() => void closePageEditor()}>
+                  {t("common.cancel")}
+                </button>
+                <button type="submit" class="volo-btn volo-btn-primary" disabled={savingPage}>
+                  {t("common.save")}
+                </button>
               </div>
             </form>
           ) : (

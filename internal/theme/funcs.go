@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Willh92/Volo-go/internal/render"
 )
 
 func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, fallbackAssets map[string]cachedAsset, themeLocales map[string]map[string]string) template.FuncMap {
@@ -174,6 +176,13 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 		},
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
+		},
+		"renderNotice": func(raw string) template.HTML {
+			clean := strings.TrimSpace(raw)
+			if clean == "" {
+				return ""
+			}
+			return template.HTML(render.Default().Render(clean, render.Options{Mode: render.RenderModeWeb}).HTML)
 		},
 		"safeCSS": func(s string) template.CSS {
 			return template.CSS(sanitizeStyleContent(s))

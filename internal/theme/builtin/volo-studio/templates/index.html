@@ -2,11 +2,11 @@
 <h1 class="studio-sr-only">{{.HeroTitle}}</h1>
 
 {{if .IsHome}}
-  {{if .Site.NoticeBoard}}
+  {{if and (le .Page 1) (ne (trim .Site.NoticeBoard) "")}}
     <section class="studio-hero" aria-label="{{t .Locale "sidebar.notice"}}">
       <div class="studio-hero-copy">
         <h2 class="studio-hero-label">{{coalesce (themeCfg .ThemeConfig "hero_badge" "") (t .Locale "sidebar.notice")}}</h2>
-        <div class="studio-hero-notice">{{.Site.NoticeBoard}}</div>
+        <div class="studio-hero-notice">{{renderNotice .Site.NoticeBoard}}</div>
       </div>
       <svg class="studio-hero-graphic" viewBox="0 0 168 104" aria-hidden="true">
         <circle class="studio-hero-orbit" cx="91" cy="51" r="40"/>

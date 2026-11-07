@@ -1642,6 +1642,13 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 			return
 		}
+	} else if bk.EmbedMode == "iframe" || bk.EmbedMode == "inline" {
+		for i := range bk.FlatChapters {
+			if strings.TrimSpace(bk.FlatChapters[i].URL) != "" {
+				pctx.ActiveChapter = &bk.FlatChapters[i]
+				break
+			}
+		}
 	}
 	if pctx.ActiveChapter != nil {
 		if postSlug := s.extractLocalPostSlugFromChapterURL(r, pctx.ActiveChapter.URL); postSlug != "" {

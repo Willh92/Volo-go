@@ -128,7 +128,7 @@ func (s *Service) ListTargetComments(
 		ctx, s.store,
 		`SELECT * FROM comments
 		 WHERE target_type = ? AND target_id = ? AND is_deleted = ?
-		 ORDER BY created_at ASC`,
+		 ORDER BY created_at ASC, id ASC`,
 		tType, tID, false,
 	)
 	if err != nil {
@@ -155,6 +155,10 @@ func (s *Service) ListTargetComments(
 			// Flatten deeper replies onto top level with @ReplyToName preserved (clean 2-level design).
 			roots = append(roots, view)
 		}
+	}
+	// Top-level comments sort newest-first (DESC) while replies inside each thread stay chronological (ASC).
+	for i, j := 0, len(roots)-1; i < j; i, j = i+1, j-1 {
+		roots[i], roots[j] = roots[j], roots[i]
 	}
 	return roots, nil
 }

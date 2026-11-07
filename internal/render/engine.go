@@ -39,6 +39,7 @@ type BookCardInfo struct {
 	Title        string `json:"title"`
 	Description  string `json:"description"`
 	CoverURL     string `json:"cover_url"`
+	SourceURL    string `json:"source_url,omitempty"`
 	ChapterCount int    `json:"chapter_count"`
 }
 
@@ -210,7 +211,7 @@ type preprocessResult struct {
 	needsMermaid bool
 }
 
-var attrPairRe = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"`)
+var attrPairRe = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'\]:]+))`)
 
 func preprocessDirectives(src string, opts Options) preprocessResult {
 	normalized := strings.ReplaceAll(src, "\r\n", "\n")
@@ -325,16 +326,21 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 			continue
 		}
 
-		// 3. `:::book id="..."` / `:::book slug="..."`
+		// 3. `:::book id="..."` / `:::book slug="..."` / `:::book id="...":::`
 		if isDirectivePrefix(trimmed, ":::book") && !isDirectivePrefix(trimmed, ":::bookshelf") {
-			attrs := parseDirectiveAttrs(trimmed[len(":::book"):])
+			rawArgs := trimmed[len(":::book"):]
+			hasInlineClose := strings.HasSuffix(strings.TrimSpace(rawArgs), ":::")
+			attrs := parseDirectiveAttrs(rawArgs)
 			slug := attrs["slug"]
 			if slug == "" {
 				slug = attrs["id"]
 			}
+			if slug == "" {
+				slug = attrs["book"]
+			}
 			i++
-			// Consume optional closing `:::` if block-style was used
-			if i < len(lines) && strings.TrimSpace(lines[i]) == ":::" {
+			// Consume optional closing `:::` only if block-style (multi-line) was used
+			if !hasInlineClose && i < len(lines) && strings.TrimSpace(lines[i]) == ":::" {
 				i++
 			}
 			tok := nextToken("BOOK")
@@ -343,10 +349,12 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 			continue
 		}
 
-		// 4. `:::bookshelf`
+		// 4. `:::bookshelf` / `:::bookshelf:::`
 		if isDirectivePrefix(trimmed, ":::bookshelf") {
+			rawArgs := trimmed[len(":::bookshelf"):]
+			hasInlineClose := strings.HasSuffix(strings.TrimSpace(rawArgs), ":::")
 			i++
-			if i < len(lines) && strings.TrimSpace(lines[i]) == ":::" {
+			if !hasInlineClose && i < len(lines) && strings.TrimSpace(lines[i]) == ":::" {
 				i++
 			}
 			tok := nextToken("BOOKSHELF")
@@ -392,13 +400,36 @@ func isDirectivePrefix(trimmed string, directive string) bool {
 		return false
 	}
 	rest := trimmed[len(directive):]
-	return rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '['
+	if rest == "" || rest == ":::" {
+		return true
+	}
+	return rest[0] == ' ' || rest[0] == '\t' || rest[0] == '['
 }
+
+var bracketArgRe = regexp.MustCompile(`^\[\s*([^\]]+?)\s*\]$`)
 
 func parseDirectiveAttrs(raw string) map[string]string {
 	out := make(map[string]string)
-	for _, m := range attrPairRe.FindAllStringSubmatch(raw, -1) {
-		out[strings.ToLower(m[1])] = m[2]
+	clean := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), ":::"))
+	if clean == "" {
+		return out
+	}
+	matches := attrPairRe.FindAllStringSubmatch(clean, -1)
+	for _, m := range matches {
+		val := m[2]
+		if val == "" && m[3] != "" {
+			val = m[3]
+		} else if val == "" && m[4] != "" {
+			val = m[4]
+		}
+		out[strings.ToLower(m[1])] = val
+	}
+	if len(out) == 0 {
+		if bm := bracketArgRe.FindStringSubmatch(clean); len(bm) >= 2 {
+			out["slug"] = strings.Trim(bm[1], `"'`)
+		} else if !strings.ContainsAny(clean, " \t=") {
+			out["slug"] = strings.Trim(clean, `"'`)
+		}
 	}
 	return out
 }
@@ -467,6 +498,50 @@ func formatBookChapterBadge(count int, locale string) string {
 	return fmt.Sprintf("%d 章", count)
 }
 
+func formatBookReadCTA(locale string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(locale)), "en") {
+		return "Read →"
+	}
+	return "开始阅读 →"
+}
+
+func bookMonogram(title string) string {
+	for _, r := range strings.TrimSpace(title) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			return strings.ToUpper(string(r))
+		}
+	}
+	return "B"
+}
+
+func writeBookCardInner(b *strings.Builder, info BookCardInfo, locale string) {
+	bookHref := "/books/" + url.PathEscape(info.Slug)
+	if cover := strings.TrimSpace(info.CoverURL); cover != "" && isSafeImageSrc(cover) {
+		b.WriteString(`<a class="volo-embed-book__cover-link" href="` + bookHref + `" tabindex="-1" aria-hidden="true">`)
+		b.WriteString(`<img class="volo-embed-book__cover" src="` + html.EscapeString(cover) + `" alt="` + html.EscapeString(info.Title) + `" loading="lazy" decoding="async">`)
+		b.WriteString(`</a>`)
+	} else {
+		b.WriteString(`<a class="volo-embed-book__cover volo-embed-book__cover--fallback" href="` + bookHref + `" tabindex="-1" aria-hidden="true">`)
+		b.WriteString(`<span class="volo-embed-book__spine"></span>`)
+		b.WriteString(`<span class="volo-embed-book__monogram">` + html.EscapeString(bookMonogram(info.Title)) + `</span>`)
+		b.WriteString(`</a>`)
+	}
+	b.WriteString(`<div class="volo-embed-book__body">`)
+	b.WriteString(`<div class="volo-embed-book__head">`)
+	b.WriteString(`<a class="volo-embed-book__title" href="` + bookHref + `"><strong>` + html.EscapeString(info.Title) + `</strong></a>`)
+	if info.ChapterCount > 0 {
+		b.WriteString(`<span class="volo-embed-book__chapters">` + html.EscapeString(formatBookChapterBadge(info.ChapterCount, locale)) + `</span>`)
+	}
+	b.WriteString(`</div>`)
+	if desc := strings.TrimSpace(info.Description); desc != "" {
+		b.WriteString(`<p class="volo-embed-book__desc">` + html.EscapeString(desc) + `</p>`)
+	}
+	b.WriteString(`<div class="volo-embed-book__foot">`)
+	b.WriteString(`<a class="volo-embed-book__cta" href="` + bookHref + `">` + html.EscapeString(formatBookReadCTA(locale)) + `</a>`)
+	b.WriteString(`</div>`)
+	b.WriteString(`</div>`)
+}
+
 func renderBookCard(slug string, opts Options) string {
 	cleanSlug := strings.TrimSpace(slug)
 	if cleanSlug == "" {
@@ -480,42 +555,29 @@ func renderBookCard(slug string, opts Options) string {
 	}
 	var b strings.Builder
 	b.WriteString(`<section class="volo-embed-book" data-book-slug="` + html.EscapeString(info.Slug) + `">`)
-	if cover := strings.TrimSpace(info.CoverURL); cover != "" && isSafeImageSrc(cover) {
-		b.WriteString(`<img class="volo-embed-book__cover" src="` + html.EscapeString(cover) + `" alt="` + html.EscapeString(info.Title) + `" loading="lazy" decoding="async">`)
-	}
-	b.WriteString(`<div class="volo-embed-book__body">`)
-	b.WriteString(`<a href="/books/` + url.PathEscape(info.Slug) + `"><strong>` + html.EscapeString(info.Title) + `</strong></a>`)
-	if info.ChapterCount > 0 {
-		b.WriteString(` <span class="volo-embed-book__chapters">` + html.EscapeString(formatBookChapterBadge(info.ChapterCount, opts.Locale)) + `</span>`)
-	}
-	if info.Description != "" {
-		b.WriteString(`<p>` + html.EscapeString(info.Description) + `</p>`)
-	}
-	b.WriteString(`</div></section>`)
+	writeBookCardInner(&b, info, opts.Locale)
+	b.WriteString(`</section>`)
 	return b.String()
 }
 
 func renderBookshelfGrid(opts Options) string {
-	if opts.ListBooks == nil {
-		return `<section class="volo-embed-bookshelf"></section>`
+	var books []BookCardInfo
+	if opts.ListBooks != nil {
+		books = opts.ListBooks()
 	}
-	books := opts.ListBooks()
+	if len(books) == 0 {
+		emptyMsg := "暂无已发布的在线书籍"
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(opts.Locale)), "en") {
+			emptyMsg = "No online books published yet."
+		}
+		return `<section class="volo-embed-bookshelf volo-embed-bookshelf--empty"><p class="volo-embed-bookshelf__empty">` + html.EscapeString(emptyMsg) + `</p></section>`
+	}
 	var b strings.Builder
 	b.WriteString(`<section class="volo-embed-bookshelf">`)
 	for _, bk := range books {
 		b.WriteString(`<article class="volo-book-tile" data-book-slug="` + html.EscapeString(bk.Slug) + `">`)
-		if cover := strings.TrimSpace(bk.CoverURL); cover != "" && isSafeImageSrc(cover) {
-			b.WriteString(`<img class="volo-embed-book__cover" src="` + html.EscapeString(cover) + `" alt="` + html.EscapeString(bk.Title) + `" loading="lazy" decoding="async">`)
-		}
-		b.WriteString(`<div class="volo-embed-book__body">`)
-		b.WriteString(`<a href="/books/` + url.PathEscape(bk.Slug) + `"><strong>` + html.EscapeString(bk.Title) + `</strong></a>`)
-		if bk.ChapterCount > 0 {
-			b.WriteString(` <span class="volo-embed-book__chapters">` + html.EscapeString(formatBookChapterBadge(bk.ChapterCount, opts.Locale)) + `</span>`)
-		}
-		if bk.Description != "" {
-			b.WriteString(`<p>` + html.EscapeString(bk.Description) + `</p>`)
-		}
-		b.WriteString(`</div></article>`)
+		writeBookCardInner(&b, bk, opts.Locale)
+		b.WriteString(`</article>`)
 	}
 	b.WriteString(`</section>`)
 	return b.String()

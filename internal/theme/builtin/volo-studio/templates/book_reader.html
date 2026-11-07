@@ -1,19 +1,22 @@
 {{define "content"}}
-<div class="book-reader-layout {{if .ActiveChapter}}has-active-chapter{{end}}"
+{{$isExternalChapter := and .ActiveChapter (or (hasPrefix .ActiveChapter.URL "https://") (hasPrefix .ActiveChapter.URL "http://"))}}
+{{$isExternalSource := or (hasPrefix .BookDetail.SourceURL "https://") (hasPrefix .BookDetail.SourceURL "http://")}}
+{{$isExternalIframe := and (eq .BookDetail.EmbedMode "iframe") (or (and $isExternalChapter (not .ActiveChapterHTML)) (and (not .ActiveChapter) $isExternalSource))}}
+<div class="book-reader-layout{{if .ActiveChapter}} has-active-chapter{{end}}{{if $isExternalIframe}} is-toc-collapsed{{end}}"
      data-book-reader="{{.BookDetail.Slug}}"
+     {{if $isExternalIframe}}data-external-iframe="1"{{end}}
      {{if .ActiveChapter}}data-active-chapter-id="{{.ActiveChapter.ID}}" data-active-chapter-title="{{.ActiveChapter.Title}}" data-active-chapter-url="/books/{{.BookDetail.Slug}}?ch={{.ActiveChapter.ID}}"{{end}}>
-  <div class="book-reader-toolbar">
-    <button type="button" class="studio-icon-btn js-book-toggle-toc"
-            aria-expanded="true"
-            data-collapse-label="{{t .Locale "bookshelf.toggle_toc"}}"
-            data-expand-label="{{t .Locale "bookshelf.expand_toc"}}">{{t .Locale "bookshelf.toggle_toc"}}</button>
-    <button type="button" class="studio-icon-btn js-book-fullscreen"
-            data-enter-label="{{t .Locale "bookshelf.focus_fullscreen"}}"
-            data-exit-label="{{t .Locale "bookshelf.exit_fullscreen"}}">{{t .Locale "bookshelf.focus_fullscreen"}}</button>
-  </div>
 
   <aside class="sidebar-card book-reader-toc">
-    <a class="book-reader-back" href="/books">← {{t .Locale "bookshelf.title"}}</a>
+    <div class="book-reader-toc__top">
+      <a class="book-reader-back" href="/books">← {{t .Locale "bookshelf.title"}}</a>
+      <button type="button" class="studio-icon-btn studio-icon-btn--square book-reader-toc__collapse js-book-toggle-toc"
+              aria-expanded="{{if $isExternalIframe}}false{{else}}true{{end}}"
+              title="{{t .Locale "bookshelf.toggle_toc"}}"
+              aria-label="{{t .Locale "bookshelf.toggle_toc"}}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 7-5 5 5 5M19 7l-5 5 5 5"/></svg>
+      </button>
+    </div>
     <h2 class="book-reader-toc__title">{{.BookDetail.Title}}</h2>
     <div class="book-reader-toc__count">
       {{t .Locale "bookshelf.chapters" (dict "count" (len .BookDetail.FlatChapters))}}
@@ -35,16 +38,48 @@
     </nav>
   </aside>
 
-  <article class="studio-article book-reader-main">
+  <article class="studio-article book-reader-main{{if $isExternalIframe}} book-reader-main--frame{{end}}">
+    <div class="book-reader-bar">
+      <div class="book-reader-bar__left">
+        <button type="button" class="studio-icon-btn js-book-toggle-toc"
+                aria-expanded="{{if $isExternalIframe}}false{{else}}true{{end}}"
+                data-collapse-label="{{t .Locale "bookshelf.toggle_toc"}}"
+                data-expand-label="{{t .Locale "bookshelf.expand_toc"}}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16"/></svg>
+          <span class="js-book-toggle-label">{{if $isExternalIframe}}{{t .Locale "bookshelf.expand_toc"}}{{else}}{{t .Locale "bookshelf.toggle_toc"}}{{end}}</span>
+        </button>
+        <span class="book-reader-bar__book">{{.BookDetail.Title}}</span>
+      </div>
+      <div class="book-reader-bar__right">
+        {{if $isExternalChapter}}
+          <a class="studio-icon-btn" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax title="{{.ActiveChapter.Title}}">
+            <span>{{t .Locale "bookshelf.open_reader"}}</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+        {{else if $isExternalSource}}
+          <a class="studio-icon-btn" href="{{.BookDetail.SourceURL}}" target="_blank" rel="noopener" data-no-pjax title="{{.BookDetail.Title}}">
+            <span>{{t .Locale "bookshelf.open_reader"}}</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+        {{end}}
+        <button type="button" class="studio-icon-btn js-book-fullscreen"
+                data-enter-label="{{t .Locale "bookshelf.focus_fullscreen"}}"
+                data-exit-label="{{t .Locale "bookshelf.exit_fullscreen"}}">{{t .Locale "bookshelf.focus_fullscreen"}}</button>
+      </div>
+    </div>
+
     {{if .ActiveChapter}}
-      <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
       {{if .ActiveChapterHTML}}
+        <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
         <div class="volo-prose book-reader-prose">{{safeHTML .ActiveChapterHTML}}</div>
       {{else if eq .BookDetail.EmbedMode "iframe"}}
         <iframe class="book-reader-frame" src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" sandbox="allow-same-origin allow-scripts"></iframe>
       {{else}}
+        <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
         <p><a class="volo-btn studio-inline-btn book-source-btn" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax><span class="book-source-btn__text">{{.ActiveChapter.Title}}</span><span aria-hidden="true">↗</span></a></p>
       {{end}}
+    {{else if $isExternalIframe}}
+      <iframe class="book-reader-frame" src="{{.BookDetail.SourceURL}}" title="{{.BookDetail.Title}}" sandbox="allow-same-origin allow-scripts"></iframe>
     {{else}}
       <h1 class="studio-article__title">{{.BookDetail.Title}}</h1>
       {{if .ActiveChapterHTML}}

@@ -228,13 +228,15 @@
       a.classList.toggle("is-active", match);
       if (match) {
         var nav = a.closest(".volo-toc__list, .volo-toc-nav");
-        if (nav && nav.scrollHeight > nav.clientHeight) {
-          var itemTop = a.offsetTop;
-          var itemBottom = itemTop + a.offsetHeight;
+        if (nav && nav.scrollHeight > nav.clientHeight && nav.offsetParent !== null) {
+          var navRect = nav.getBoundingClientRect();
+          var linkRect = a.getBoundingClientRect();
+          var relTop = linkRect.top - navRect.top + nav.scrollTop;
+          var relBottom = relTop + linkRect.height;
           var viewTop = nav.scrollTop;
           var viewBottom = viewTop + nav.clientHeight;
-          if (itemTop < viewTop + 20 || itemBottom > viewBottom - 20) {
-            nav.scrollTop = Math.max(0, itemTop - Math.round(nav.clientHeight * 0.35));
+          if (relTop < viewTop + 20 || relBottom > viewBottom - 20) {
+            nav.scrollTop = Math.max(0, relTop - Math.round(nav.clientHeight * 0.35));
           }
         }
       }
@@ -635,9 +637,8 @@
     });
 
     var spyPending = false;
-    function updateSpyAndDock() {
+    function updateSpy() {
       spyPending = false;
-
       if (headings.length) {
         var threshold = getHeaderOffset() + 18;
         var activeID = headings[0].id;
@@ -650,51 +651,12 @@
         }
         setActiveTOCLink(activeID);
       }
-
-      if (tocCard && tocSlot) {
-        if (window.innerWidth <= 900) {
-          tocCard.classList.remove("is-docked");
-          tocCard.style.left = "";
-          tocCard.style.top = "";
-          tocSlot.style.minHeight = "";
-          return;
-        }
-        var rail = tocSlot.closest(".studio-side-rail");
-        var sidebar = rail && rail.querySelector(".studio-sidebar");
-        var slotRect = tocSlot.getBoundingClientRect();
-        var triggerPassed = sidebar
-          ? sidebar.getBoundingClientRect().bottom <= 78
-          : slotRect.top <= 90;
-
-        if (triggerPassed) {
-          if (!tocCard.classList.contains("is-docked")) {
-            tocSlot.style.minHeight = tocCard.offsetHeight + "px";
-            tocCard.classList.add("is-docked");
-          }
-          tocCard.style.setProperty("--toc-slot-width", Math.round(slotRect.width) + "px");
-          tocCard.style.left = Math.round(slotRect.left) + "px";
-          var footer = document.querySelector(".studio-footer");
-          if (footer) {
-            var footerTop = footer.getBoundingClientRect().top;
-            var cardH = tocCard.offsetHeight;
-            var maxTop = footerTop - cardH - 24;
-            tocCard.style.top = (maxTop < 90 ? Math.round(maxTop) : 90) + "px";
-          } else {
-            tocCard.style.top = "90px";
-          }
-        } else if (tocCard.classList.contains("is-docked")) {
-          tocCard.classList.remove("is-docked");
-          tocCard.style.left = "";
-          tocCard.style.top = "";
-          tocSlot.style.minHeight = "";
-        }
-      }
     }
 
     function requestSpy() {
       if (!spyPending) {
         spyPending = true;
-        requestAnimationFrame(updateSpyAndDock);
+        requestAnimationFrame(updateSpy);
       }
     }
 
@@ -703,14 +665,8 @@
     tocCleanups.push(function () {
       window.removeEventListener("scroll", requestSpy);
       window.removeEventListener("resize", requestSpy);
-      if (tocCard) {
-        tocCard.classList.remove("is-docked");
-        tocCard.style.left = "";
-        tocCard.style.top = "";
-      }
-      if (tocSlot) tocSlot.style.minHeight = "";
     });
-    updateSpyAndDock();
+    updateSpy();
   }
 
   /* Auto-Linkify [mm:ss] / [hh:mm:ss] Timestamps in Prose When Podcast Audio Exists */
@@ -793,6 +749,7 @@
     var activeID = reader.getAttribute("data-active-chapter-id") || "";
     var activeTitle = reader.getAttribute("data-active-chapter-title") || "";
     var activeURL = reader.getAttribute("data-active-chapter-url") || "";
+    var isExternalIframe = reader.getAttribute("data-external-iframe") === "1";
     if (slug && activeID && activeURL) {
       writeBookProgress(slug, { chapterId: activeID, chapterTitle: activeTitle, url: activeURL, ts: Date.now() });
     }
@@ -808,24 +765,44 @@
       });
     });
 
+    var prefKey = "volo_book_toc_" + (slug || "default");
+    var savedPref = "";
+    try { savedPref = sessionStorage.getItem(prefKey) || ""; } catch (_) {}
+
     if (activeID && window.innerWidth <= 900 && reader.dataset.mobileTocInit !== "1") {
       reader.dataset.mobileTocInit = "1";
       reader.classList.add("is-toc-collapsed");
+    } else if (savedPref === "collapsed") {
+      reader.classList.add("is-toc-collapsed");
+    } else if (savedPref === "expanded") {
+      reader.classList.remove("is-toc-collapsed");
+    } else if (isExternalIframe) {
+      reader.classList.add("is-toc-collapsed");
     }
 
-    var tocBtn = reader.querySelector(".js-book-toggle-toc");
-    if (tocBtn) {
-      var syncTocBtn = function () {
+    var tocBtns = Array.prototype.slice.call(reader.querySelectorAll(".js-book-toggle-toc"));
+    if (tocBtns.length) {
+      var syncTocBtns = function () {
         var isCol = reader.classList.contains("is-toc-collapsed");
-        tocBtn.setAttribute("aria-expanded", isCol ? "false" : "true");
-        tocBtn.textContent = isCol
-          ? (tocBtn.getAttribute("data-expand-label") || tocBtn.textContent)
-          : (tocBtn.getAttribute("data-collapse-label") || tocBtn.textContent);
+        tocBtns.forEach(function (btn) {
+          btn.setAttribute("aria-expanded", isCol ? "false" : "true");
+          var expLbl = btn.getAttribute("data-expand-label");
+          var colLbl = btn.getAttribute("data-collapse-label");
+          var lblSpan = btn.querySelector(".js-book-toggle-label");
+          if (lblSpan && (expLbl || colLbl)) {
+            lblSpan.textContent = isCol ? (expLbl || lblSpan.textContent) : (colLbl || lblSpan.textContent);
+          } else if (expLbl || colLbl) {
+            btn.textContent = isCol ? (expLbl || btn.textContent) : (colLbl || btn.textContent);
+          }
+        });
       };
-      syncTocBtn();
-      tocBtn.addEventListener("click", function () {
-        reader.classList.toggle("is-toc-collapsed");
-        syncTocBtn();
+      syncTocBtns();
+      tocBtns.forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var nextCol = reader.classList.toggle("is-toc-collapsed");
+          try { sessionStorage.setItem(prefKey, nextCol ? "collapsed" : "expanded"); } catch (_) {}
+          syncTocBtns();
+        });
       });
     }
 

@@ -1,4 +1,6 @@
-:root {
+:root,
+[data-theme="light"] {
+  color-scheme: light;
   --volo-bg: #f6f7f3;
   --volo-surface: #ffffff;
   --volo-raised: #f9faf7;
@@ -9,6 +11,7 @@
   --volo-accent-hover: #1b5741;
   --volo-accent-soft: rgba(36, 107, 81, 0.11);
   --volo-btn-bg: #246b51;
+  --volo-btn-hover: #1b5741;
   --volo-nav: #173f3b;
   --volo-nav-mark: #9bcab1;
   --volo-nav-mark-ink: #102a27;
@@ -31,6 +34,7 @@
   --volo-accent-hover: #23516b;
   --volo-accent-soft: rgba(45, 101, 131, 0.12);
   --volo-btn-bg: #2d6583;
+  --volo-btn-hover: #23516b;
   --volo-nav: #1f3d50;
   --volo-nav-mark: #a2c5dd;
   --volo-nav-mark-ink: #122634;
@@ -40,6 +44,7 @@
   --volo-accent-hover: #20575a;
   --volo-accent-soft: rgba(40, 108, 112, 0.12);
   --volo-btn-bg: #286c70;
+  --volo-btn-hover: #20575a;
   --volo-nav: #1c4143;
   --volo-nav-mark: #9acbcc;
   --volo-nav-mark-ink: #10292b;
@@ -49,6 +54,7 @@
   --volo-accent-hover: #6e4a20;
   --volo-accent-soft: rgba(133, 92, 39, 0.12);
   --volo-btn-bg: #855c27;
+  --volo-btn-hover: #6e4a20;
   --volo-nav: #4a3824;
   --volo-nav-mark: #d6bd91;
   --volo-nav-mark-ink: #2c2013;
@@ -58,6 +64,7 @@
   --volo-accent-hover: #5a4167;
   --volo-accent-soft: rgba(112, 81, 125, 0.12);
   --volo-btn-bg: #70517d;
+  --volo-btn-hover: #5a4167;
   --volo-nav: #3d2f49;
   --volo-nav-mark: #c8b5d7;
   --volo-nav-mark-ink: #231a2b;
@@ -67,28 +74,72 @@
   --volo-accent-hover: #714450;
   --volo-accent-soft: rgba(135, 82, 95, 0.12);
   --volo-btn-bg: #87525f;
+  --volo-btn-hover: #714450;
   --volo-nav: #4b303b;
   --volo-nav-mark: #d6b1bd;
   --volo-nav-mark-ink: #2c1920;
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --volo-bg: #121715;
   --volo-surface: #19201e;
   --volo-raised: #202926;
   --volo-line: #2b3733;
   --volo-text: #eaf0ed;
   --volo-muted: #93a39d;
+  --volo-accent: #9bcab1;
+  --volo-accent-hover: #b4dbc6;
+  --volo-accent-soft: rgba(155, 202, 177, 0.15);
   --volo-nav: #202d2a;
   --volo-btn-bg: #476e59;
+  --volo-btn-hover: #537f67;
+  --volo-ok: #5ec98f;
+  --volo-warn: #e8ad54;
+  --volo-danger: #ef7d77;
   --volo-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
   --volo-shadow-pop: 0 18px 42px rgba(0, 0, 0, 0.5);
 }
-[data-theme="dark"][data-accent="ocean"] { --volo-nav: #222d35; --volo-btn-bg: #476b85; }
-[data-theme="dark"][data-accent="teal"]  { --volo-nav: #202f30; --volo-btn-bg: #416e71; }
-[data-theme="dark"][data-accent="amber"] { --volo-nav: #302b25; --volo-btn-bg: #795f3c; }
-[data-theme="dark"][data-accent="plum"]  { --volo-nav: #2d2733; --volo-btn-bg: #6d567d; }
-[data-theme="dark"][data-accent="rose"]  { --volo-nav: #32272b; --volo-btn-bg: #7d5865; }
+[data-theme="dark"][data-accent="ocean"] {
+  --volo-accent: #a2c5dd;
+  --volo-accent-hover: #bad6ea;
+  --volo-accent-soft: rgba(162, 197, 221, 0.15);
+  --volo-nav: #222d35;
+  --volo-btn-bg: #476b85;
+  --volo-btn-hover: #537b98;
+}
+[data-theme="dark"][data-accent="teal"] {
+  --volo-accent: #9acbcc;
+  --volo-accent-hover: #b4dcdd;
+  --volo-accent-soft: rgba(154, 203, 204, 0.15);
+  --volo-nav: #202f30;
+  --volo-btn-bg: #416e71;
+  --volo-btn-hover: #4d7f82;
+}
+[data-theme="dark"][data-accent="amber"] {
+  --volo-accent: #d6bd91;
+  --volo-accent-hover: #e4cfa9;
+  --volo-accent-soft: rgba(214, 189, 145, 0.15);
+  --volo-nav: #302b25;
+  --volo-btn-bg: #795f3c;
+  --volo-btn-hover: #8a6d46;
+}
+[data-theme="dark"][data-accent="plum"] {
+  --volo-accent: #c8b5d7;
+  --volo-accent-hover: #dacbe6;
+  --volo-accent-soft: rgba(200, 181, 215, 0.15);
+  --volo-nav: #2d2733;
+  --volo-btn-bg: #6d567d;
+  --volo-btn-hover: #7d648f;
+}
+[data-theme="dark"][data-accent="rose"] {
+  --volo-accent: #d6b1bd;
+  --volo-accent-hover: #e5c6d0;
+  --volo-accent-soft: rgba(214, 177, 189, 0.15);
+  --volo-nav: #32272b;
+  --volo-btn-bg: #7d5865;
+  --volo-btn-hover: #8e6573;
+}
 
 * {
   box-sizing: border-box;
@@ -177,6 +228,7 @@ html, body {
 button, input, select, textarea {
   font-family: inherit;
   font-size: inherit;
+  color: inherit;
 }
 
 a {
@@ -229,6 +281,13 @@ a {
   gap: 11px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
   flex-shrink: 0;
+  text-decoration: none;
+  color: var(--volo-nav-text);
+  transition: background 0.15s ease;
+}
+
+.volo-brand:hover {
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .volo-brand-title {
@@ -532,18 +591,25 @@ a {
   border-radius: 999px;
   border: 1px solid var(--volo-line);
   background: var(--volo-raised);
+  color: var(--volo-text);
   display: inline-flex;
   align-items: center;
   gap: 8px;
   font-size: 13px;
   font-weight: 550;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.volo-user-pill:hover {
+  border-color: var(--volo-accent);
+  background: var(--volo-surface);
 }
 
 .volo-user-avatar {
   width: 26px;
   height: 26px;
   border-radius: 999px;
-  background: var(--volo-accent);
+  background: var(--volo-btn-bg);
   color: #ffffff;
   font-size: 12px;
   font-weight: 700;
@@ -551,6 +617,7 @@ a {
   align-items: center;
   justify-content: center;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .volo-user-avatar img {
@@ -620,7 +687,7 @@ a {
 }
 
 .volo-seg-btn.active {
-  background: var(--volo-accent);
+  background: var(--volo-btn-bg);
   color: #ffffff;
 }
 
@@ -944,19 +1011,19 @@ input[type="checkbox"] {
 }
 
 .volo-btn-primary:hover:not(:disabled) {
-  background: var(--volo-accent-hover);
-  border-color: var(--volo-accent-hover);
+  background: var(--volo-btn-hover);
+  border-color: var(--volo-btn-hover);
   color: #ffffff;
 }
 
 .volo-btn-danger {
   color: var(--volo-danger);
-  border-color: rgba(196, 60, 53, 0.35);
+  border-color: color-mix(in srgb, var(--volo-danger) 38%, transparent);
 }
 
 .volo-btn-danger:hover:not(:disabled) {
-  background: rgba(196, 60, 53, 0.09);
-  border-color: rgba(196, 60, 53, 0.52);
+  background: color-mix(in srgb, var(--volo-danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--volo-danger) 55%, transparent);
   color: var(--volo-danger);
 }
 
@@ -978,9 +1045,9 @@ input[type="checkbox"] {
   color: var(--volo-accent);
 }
 
-.volo-badge-ok { background: rgba(29, 124, 77, 0.14); color: var(--volo-ok); }
-.volo-badge-warn { background: rgba(184, 115, 20, 0.15); color: var(--volo-warn); }
-.volo-badge-danger { background: rgba(196, 60, 53, 0.14); color: var(--volo-danger); }
+.volo-badge-ok { background: color-mix(in srgb, var(--volo-ok) 15%, transparent); color: var(--volo-ok); }
+.volo-badge-warn { background: color-mix(in srgb, var(--volo-warn) 16%, transparent); color: var(--volo-warn); }
+.volo-badge-danger { background: color-mix(in srgb, var(--volo-danger) 15%, transparent); color: var(--volo-danger); }
 
 /* Volo Studio Editorial Data Tables & Filter Toolbars */
 .volo-filter-bar {
@@ -1025,6 +1092,10 @@ input[type="checkbox"] {
   color: var(--volo-accent);
   font-weight: 650;
   box-shadow: 0 1px 4px rgba(16, 28, 23, 0.08);
+}
+
+[data-theme="dark"] .volo-filter-pill.active {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.34), inset 0 0 0 1px var(--volo-line);
 }
 
 .volo-filter-controls {
@@ -1168,7 +1239,7 @@ input[type="checkbox"] {
 }
 
 .volo-mini-tag.warn {
-  background: rgba(184, 115, 20, 0.14);
+  background: color-mix(in srgb, var(--volo-warn) 16%, transparent);
   color: var(--volo-warn);
 }
 
@@ -1217,20 +1288,20 @@ input[type="checkbox"] {
 }
 
 .volo-status-pill.ok {
-  background: rgba(29, 124, 77, 0.1);
-  border-color: rgba(29, 124, 77, 0.24);
+  background: color-mix(in srgb, var(--volo-ok) 13%, transparent);
+  border-color: color-mix(in srgb, var(--volo-ok) 28%, transparent);
   color: var(--volo-ok);
 }
 
 .volo-status-pill.warn {
-  background: rgba(184, 115, 20, 0.12);
-  border-color: rgba(184, 115, 20, 0.26);
+  background: color-mix(in srgb, var(--volo-warn) 14%, transparent);
+  border-color: color-mix(in srgb, var(--volo-warn) 30%, transparent);
   color: var(--volo-warn);
 }
 
 .volo-status-pill.danger {
-  background: rgba(196, 60, 53, 0.1);
-  border-color: rgba(196, 60, 53, 0.25);
+  background: color-mix(in srgb, var(--volo-danger) 13%, transparent);
+  border-color: color-mix(in srgb, var(--volo-danger) 28%, transparent);
   color: var(--volo-danger);
 }
 
@@ -1286,9 +1357,9 @@ input[type="checkbox"] {
 }
 
 .volo-act-btn.danger:hover {
-  border-color: rgba(196, 60, 53, 0.42);
+  border-color: color-mix(in srgb, var(--volo-danger) 45%, transparent);
   color: var(--volo-danger);
-  background: rgba(196, 60, 53, 0.09);
+  background: color-mix(in srgb, var(--volo-danger) 12%, transparent);
 }
 
 .volo-empty-state {
@@ -2133,6 +2204,53 @@ input[type="checkbox"] {
   background: var(--volo-surface);
 }
 
+.volo-cm-host .cm-editor {
+  background: var(--volo-surface);
+  color: var(--volo-text);
+}
+
+.volo-cm-host .cm-content {
+  caret-color: var(--volo-accent);
+  color: var(--volo-text);
+}
+
+.volo-cm-host .cm-cursor,
+.volo-cm-host .cm-dropCursor {
+  border-left-color: var(--volo-accent) !important;
+}
+
+.volo-cm-host .cm-gutters {
+  background: var(--volo-raised) !important;
+  color: var(--volo-muted) !important;
+  border-right: 1px solid var(--volo-line) !important;
+}
+
+.volo-cm-host .cm-activeLineGutter {
+  background: color-mix(in srgb, var(--volo-accent) 12%, var(--volo-raised)) !important;
+  color: var(--volo-text) !important;
+}
+
+.volo-cm-host .cm-activeLine {
+  background: color-mix(in srgb, var(--volo-raised) 65%, transparent);
+}
+
+.volo-cm-host .cm-selectionBackground,
+.volo-cm-host .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground,
+.volo-cm-host .cm-content ::selection {
+  background: color-mix(in srgb, var(--volo-accent) 24%, transparent) !important;
+}
+
+.volo-cm-host .cm-placeholder {
+  color: var(--volo-muted) !important;
+}
+
+.volo-cm-host .cm-panels,
+.volo-cm-host .cm-tooltip {
+  background: var(--volo-surface) !important;
+  color: var(--volo-text) !important;
+  border-color: var(--volo-line) !important;
+}
+
 .volo-studio-editor .volo-cm-host .cm-editor {
   height: 520px;
   outline: none;
@@ -2213,6 +2331,7 @@ input[type="checkbox"] {
   font-size: 15px;
   line-height: 1.75;
   background: var(--volo-surface);
+  color: var(--volo-text);
 }
 
 .volo-wysiwyg-surface h1,
@@ -2226,6 +2345,15 @@ input[type="checkbox"] {
   line-height: 1.35;
 }
 
+.volo-wysiwyg-surface code,
+.volo-preview-pane code {
+  font-family: var(--volo-mono);
+  font-size: 0.88em;
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--volo-raised);
+}
+
 .volo-wysiwyg-surface pre,
 .volo-preview-pane pre {
   background: var(--volo-raised);
@@ -2235,6 +2363,12 @@ input[type="checkbox"] {
   overflow-x: auto;
   font-family: var(--volo-mono);
   font-size: 13px;
+}
+
+.volo-wysiwyg-surface pre code,
+.volo-preview-pane pre code {
+  padding: 0;
+  background: transparent;
 }
 
 .volo-wysiwyg-surface blockquote,
@@ -2250,6 +2384,60 @@ input[type="checkbox"] {
 .volo-preview-pane img {
   max-width: 100%;
   border-radius: 8px;
+}
+
+.volo-preview-pane .volo-table-scroll,
+.volo-wysiwyg-surface .volo-table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 1em 0;
+  border: 1px solid var(--volo-line);
+  border-radius: 9px;
+  background: var(--volo-surface);
+}
+
+.volo-preview-pane table,
+.volo-wysiwyg-surface table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1em 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
+.volo-preview-pane .volo-table-scroll > table,
+.volo-wysiwyg-surface .volo-table-scroll > table {
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+  border: 0;
+}
+
+.volo-preview-pane th,
+.volo-preview-pane td,
+.volo-wysiwyg-surface th,
+.volo-wysiwyg-surface td {
+  padding: 8px 12px;
+  border: 1px solid var(--volo-line);
+  text-align: left;
+  vertical-align: top;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
+.volo-preview-pane th,
+.volo-wysiwyg-surface th {
+  background: var(--volo-raised);
+  font-weight: 600;
+  color: var(--volo-text);
+  white-space: nowrap;
+}
+
+.volo-preview-pane tbody tr:nth-child(2n) td,
+.volo-wysiwyg-surface tbody tr:nth-child(2n) td {
+  background: color-mix(in srgb, var(--volo-raised) 48%, transparent);
 }
 
 .volo-studio-editor .volo-preview-pane {
@@ -2419,13 +2607,19 @@ input[type="checkbox"] {
 }
 
 .volo-diff-add {
-  background: rgba(29, 124, 77, 0.14);
+  background: color-mix(in srgb, var(--volo-ok) 15%, transparent);
   color: var(--volo-ok);
 }
 
 .volo-diff-del {
-  background: rgba(196, 60, 53, 0.14);
+  background: color-mix(in srgb, var(--volo-danger) 15%, transparent);
   color: var(--volo-danger);
+}
+
+@media (max-width: 1120px) {
+  .volo-grid-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 /* Responsive < 920px, < 768px & < 480px Full Mobile Compatibility */
@@ -2454,14 +2648,21 @@ input[type="checkbox"] {
   }
   .volo-mobile-toggle {
     display: inline-flex;
+    flex-shrink: 0;
   }
   .volo-topbar {
-    height: 64px;
+    height: 60px;
     padding: 0 12px;
+    gap: 8px;
+  }
+  .volo-topbar-left {
+    flex: 1;
+    min-width: 0;
     gap: 8px;
   }
   .volo-topbar-title {
     font-size: 16px;
+    margin: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2507,30 +2708,32 @@ input[type="checkbox"] {
   .volo-grid-2, .volo-grid-3, .volo-grid-4, .volo-editor-split {
     grid-template-columns: 1fr !important;
   }
+  .volo-eyebrow,
   .volo-pill-label,
-  .volo-locale-trigger-text {
+  .volo-locale-trigger-text,
+  .volo-locale-trigger .volo-cselect-chev,
+  .volo-site-pill {
     display: none !important;
   }
-  .volo-site-pill,
-  .volo-cmdk-trigger {
-    width: 34px;
-    height: 34px;
-    padding: 0;
-    justify-content: center;
+  .volo-topbar-actions {
+    gap: 5px;
+    flex-shrink: 0;
   }
+  .volo-cmdk-trigger,
+  .volo-icon-btn,
   .volo-user-pill {
-    height: 34px;
-    padding: 0 4px;
+    width: 32px;
+    height: 32px;
+    padding: 0;
     gap: 0;
+    justify-content: center;
   }
   .volo-locale-trigger,
   .volo-appearance-trigger {
-    height: 34px;
-    padding: 0 8px;
-  }
-  .volo-icon-btn {
-    width: 34px;
-    height: 34px;
+    height: 32px;
+    min-height: 32px;
+    padding: 0 7px;
+    gap: 4px;
   }
   .volo-subtabs {
     overflow-x: auto;
@@ -3176,7 +3379,7 @@ input[type="checkbox"] {
 
 .volo-media-card.is-orphan {
   border-style: dashed;
-  border-color: rgba(184, 115, 20, 0.55);
+  border-color: color-mix(in srgb, var(--volo-warn) 55%, transparent);
 }
 
 .volo-media-thumb {
@@ -3847,43 +4050,35 @@ input[type="checkbox"] {
   border-bottom: 0;
 }
 
-/* 2-Column Desktop Studio Editor (`>= 1180px`) */
-.volo-studio-split {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 18px;
-  align-items: start;
+/* Full-Width Studio Editor Settings Panels */
+.volo-editor-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 6px;
 }
 
-@media (min-width: 1180px) {
-  .volo-studio-split {
-    grid-template-columns: minmax(0, 1fr) 336px;
-  }
-  .volo-studio-split.is-collapsed {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .volo-studio-inspector {
-    position: sticky;
-    top: 96px;
-    max-height: calc(100vh - 116px);
-    overflow-y: auto;
-    padding-right: 4px;
-  }
+.volo-editor-panels .volo-auto-grid {
+  grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
 }
 
 .volo-inspector-box {
   background: var(--volo-raised);
   border: 1px solid var(--volo-line);
   border-radius: 12px;
-  padding: 14px 15px;
+  padding: 16px 18px;
   margin-bottom: 12px;
 }
 
+.volo-editor-panels .volo-inspector-box {
+  margin-bottom: 0;
+}
+
 .volo-inspector-title {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 700;
   color: var(--volo-text);
-  margin: 0 0 10px;
+  margin: 0 0 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
