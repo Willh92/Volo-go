@@ -1,10 +1,16 @@
 {{define "content"}}
-<div style="max-width:760px;margin:36px auto 64px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:22px">
+<div style="max-width:780px;margin:36px auto 64px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:22px">
   <section class="studio-article" style="padding:26px">
     <h2 style="margin-top:0">{{t .Locale "nav.login"}}</h2>
     <form id="volo-reader-login-form" style="display:flex;flex-direction:column;gap:12px">
-      <input class="volo-input" name="ident" required placeholder="{{t .Locale "reader.ident_placeholder"}}">
-      <input class="volo-input" name="password" type="password" required placeholder="{{t .Locale "reader.password_placeholder"}}">
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label style="font-size:12px;font-weight:600;color:var(--volo-muted)">{{t .Locale "reader.ident_placeholder"}}</label>
+        <input class="volo-input" name="ident" required autocomplete="username" placeholder="{{t .Locale "reader.ident_placeholder"}}">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label style="font-size:12px;font-weight:600;color:var(--volo-muted)">{{t .Locale "reader.password_placeholder"}}</label>
+        <input class="volo-input" name="password" type="password" required autocomplete="current-password" placeholder="{{t .Locale "reader.password_placeholder"}}">
+      </div>
       <div class="js-auth-msg" style="font-size:.85rem;color:var(--volo-danger)"></div>
       <button class="volo-btn" type="submit">{{t .Locale "nav.login"}}</button>
     </form>
@@ -12,14 +18,26 @@
 
   <section class="studio-article" style="padding:26px">
     <h2 style="margin-top:0">{{t .Locale "reader.register_tab"}}</h2>
-    <form id="volo-reader-reg-form" style="display:flex;flex-direction:column;gap:12px">
-      <input class="volo-input" name="username" required minlength="2" maxlength="48" placeholder="{{t .Locale "reader.username_placeholder"}}">
-      <div style="display:flex;gap:8px">
-        <input class="volo-input" style="flex:1" name="email" type="email" required placeholder="{{t .Locale "reader.email_placeholder"}}">
-        <button id="volo-send-code-btn" class="studio-icon-btn" type="button">{{t .Locale "reader.send_code"}}</button>
+    <form id="volo-reader-reg-form" autocomplete="off" style="display:flex;flex-direction:column;gap:12px">
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label style="font-size:12px;font-weight:600;color:var(--volo-muted)">{{t .Locale "reader.username_placeholder"}}</label>
+        <input class="volo-input" name="username" required minlength="2" maxlength="48" autocomplete="off" placeholder="{{t .Locale "reader.username_placeholder"}}">
       </div>
-      <input class="volo-input" name="code" required maxlength="6" placeholder="{{t .Locale "reader.code_placeholder"}}">
-      <input class="volo-input" name="password" type="password" required minlength="6" placeholder="{{t .Locale "reader.new_password_placeholder"}}">
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label style="font-size:12px;font-weight:600;color:var(--volo-muted)">{{t .Locale "reader.email_placeholder"}}</label>
+        <div style="display:flex;gap:8px">
+          <input class="volo-input" style="flex:1" name="email" type="email" required autocomplete="email" placeholder="{{t .Locale "reader.email_placeholder"}}">
+          <button id="volo-send-code-btn" class="studio-icon-btn" type="button">{{t .Locale "reader.send_code"}}</button>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label style="font-size:12px;font-weight:600;color:var(--volo-muted)">{{t .Locale "reader.code_placeholder"}}</label>
+        <input class="volo-input" name="code" required maxlength="6" autocomplete="one-time-code" placeholder="{{t .Locale "reader.code_placeholder"}}">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label style="font-size:12px;font-weight:600;color:var(--volo-muted)">{{t .Locale "reader.new_password_placeholder"}}</label>
+        <input class="volo-input" name="password" type="password" required minlength="6" autocomplete="new-password" placeholder="{{t .Locale "reader.new_password_placeholder"}}">
+      </div>
       <div class="js-auth-msg" style="font-size:.85rem;color:var(--volo-accent)"></div>
       <button class="volo-btn" type="submit">{{t .Locale "reader.register_tab"}}</button>
     </form>

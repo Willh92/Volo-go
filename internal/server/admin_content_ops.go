@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -780,25 +781,7 @@ func (s *AppServer) refreshGitHubRepositories(ctx context.Context, usernameOverr
 		return nil, errors.New("github_username is not configured")
 	}
 
-	apiURL := "https://api.github.com/users/" + url.PathEscape(uname) + "/repos?per_page=100&sort=updated"
-	client := s.deps.OutboundDialer.NewHTTPClient(10 * time.Second)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "Volo-go-Showcase/1.0")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned HTTP %d", resp.StatusCode)
-	}
-
-	var ghRaw []struct {
+	type ghRawRepo struct {
 		Name            string `json:"name"`
 		FullName        string `json:"full_name"`
 		Description     string `json:"description"`
@@ -810,22 +793,59 @@ func (s *AppServer) refreshGitHubRepositories(ctx context.Context, usernameOverr
 		Fork            bool   `json:"fork"`
 		UpdatedAt       string `json:"updated_at"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&ghRaw); err != nil {
-		return nil, err
+
+	client := s.deps.OutboundDialer.NewHTTPClient(12 * time.Second)
+	var allRaw []ghRawRepo
+	for page := 1; page <= 5; page++ {
+		apiURL := fmt.Sprintf("https://api.github.com/users/%s/repos?per_page=100&page=%d&sort=updated", url.PathEscape(uname), page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "Volo-go-Showcase/1.0")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("GitHub API returned HTTP %d", resp.StatusCode)
+		}
+		var batch []ghRawRepo
+		decErr := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&batch)
+		_ = resp.Body.Close()
+		if decErr != nil {
+			return nil, decErr
+		}
+		allRaw = append(allRaw, batch...)
+		if len(batch) < 100 {
+			break
+		}
 	}
 
 	hiddenSet := make(map[string]bool)
 	for _, existing := range seo.GitHubRepos {
 		if existing.Hidden {
-			hiddenSet[existing.FullName] = true
+			if k := strings.ToLower(strings.TrimSpace(existing.FullName)); k != "" {
+				hiddenSet[k] = true
+			}
+			if k := strings.ToLower(strings.TrimSpace(existing.Name)); k != "" {
+				hiddenSet[k] = true
+			}
 		}
 	}
 
-	items := make([]domain.GitHubRepoItem, 0, len(ghRaw))
-	for _, r := range ghRaw {
-		if r.Fork && !seo.GitHubIncludeForks {
+	seen := make(map[string]bool, len(allRaw))
+	items := make([]domain.GitHubRepoItem, 0, len(allRaw))
+	for _, r := range allRaw {
+		fullLower := strings.ToLower(strings.TrimSpace(r.FullName))
+		nameLower := strings.ToLower(strings.TrimSpace(r.Name))
+		if nameLower == "" || seen[fullLower] {
 			continue
 		}
+		seen[fullLower] = true
 		items = append(items, domain.GitHubRepoItem{
 			Name:        r.Name,
 			FullName:    r.FullName,
@@ -836,18 +856,185 @@ func (s *AppServer) refreshGitHubRepositories(ctx context.Context, usernameOverr
 			Stars:       r.StargazersCount,
 			Forks:       r.ForksCount,
 			IsFork:      r.Fork,
-			Hidden:      hiddenSet[r.FullName],
+			Hidden:      hiddenSet[fullLower] || hiddenSet[nameLower],
 			UpdatedAt:   r.UpdatedAt,
 		})
 	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Stars != items[j].Stars {
+			return items[i].Stars > items[j].Stars
+		}
+		if items[i].Forks != items[j].Forks {
+			return items[i].Forks > items[j].Forks
+		}
+		return strings.ToLower(items[i].FullName) < strings.ToLower(items[j].FullName)
+	})
 
 	patchBytes, _ := json.Marshal(map[string]any{
 		"github_username":  uname,
 		"github_repos":     items,
 		"github_synced_at": time.Now().UnixMilli(),
 	})
-	_, _, err = s.deps.Settings.PatchDomain(ctx, domain.SettingsDomainSEO, patchBytes, 0)
+	_, _, err := s.deps.Settings.PatchDomain(ctx, domain.SettingsDomainSEO, patchBytes, 0)
 	return items, err
+}
+
+func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *domain.User) (*domain.RawArticle, error) {
+	snap := s.deps.Settings.Snapshot()
+	seo := snap.SEO
+	uname := strings.TrimSpace(seo.GitHubUsername)
+	if uname == "" {
+		return nil, errors.New("github_username is not configured")
+	}
+
+	visible := make([]domain.GitHubRepoItem, 0, len(seo.GitHubRepos))
+	totalStars := 0
+	totalForks := 0
+	for _, rp := range seo.GitHubRepos {
+		if rp.Hidden {
+			continue
+		}
+		if rp.IsFork && !seo.GitHubIncludeForks {
+			continue
+		}
+		visible = append(visible, rp)
+		totalStars += rp.Stars
+		totalForks += rp.Forks
+	}
+
+	var md strings.Builder
+	md.WriteString(fmt.Sprintf("![%s GitHub Stats](/github-stats/%s.svg)\n\n", uname, url.PathEscape(uname)))
+	md.WriteString(fmt.Sprintf("> GitHub 主页：[https://github.com/%s](https://github.com/%s) · 共精选展示 **%d** 个开源仓库（累计 **%d** Stars · **%d** Forks）\n\n",
+		uname, uname, len(visible), totalStars, totalForks))
+
+	if len(visible) == 0 {
+		md.WriteString("_暂无勾选展示的公开仓库，请在管理台「开源作品展示」中同步并勾选需要展示的项目。_\n")
+	} else {
+		md.WriteString("| 项目 | 主要语言 | Stars / Forks | 简介 |\n")
+		md.WriteString("| :--- | :--- | :--- | :--- |\n")
+		for _, rp := range visible {
+			lang := strings.TrimSpace(rp.Language)
+			if lang == "" {
+				lang = "—"
+			}
+			desc := strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(rp.Description), "|", "\\|"), "\n", " ")
+			if desc == "" {
+				desc = "—"
+			}
+			if hp := strings.TrimSpace(rp.Homepage); hp != "" && (strings.HasPrefix(hp, "http://") || strings.HasPrefix(hp, "https://")) {
+				desc += fmt.Sprintf(" ([站点 ↗](%s))", hp)
+			}
+			repoLabel := rp.Name
+			if rp.IsFork {
+				repoLabel += " `Fork`"
+			}
+			repoURL := strings.TrimSpace(rp.HTMLURL)
+			if repoURL == "" {
+				repoURL = "https://github.com/" + strings.TrimPrefix(rp.FullName, "/")
+			}
+			md.WriteString(fmt.Sprintf("| [**%s**](%s) | `%s` | ★ %d · ⑂ %d | %s |\n",
+				repoLabel, repoURL, lang, rp.Stars, rp.Forks, desc))
+		}
+	}
+
+	contentStr := md.String()
+	summaryStr := fmt.Sprintf("汇总我在 GitHub (@%s) 上持续维护的 %d 个开源项目（累计 %d Stars）。", uname, len(visible), totalStars)
+	words, mins := computeReadingMetrics(contentStr)
+	now := time.Now().UnixMilli()
+
+	existing, err := sqlx.Get[domain.RawArticle](ctx, s.deps.Store,
+		`SELECT * FROM articles WHERE slug IN ('github', 'my-github-repos') OR legacy_permalink IN ('/my-github-repos', '/github') ORDER BY updated_at DESC LIMIT 1`)
+	isCreate := err != nil || existing.ID == ""
+
+	authorID := ""
+	if actor != nil && actor.ID != "" {
+		authorID = actor.ID
+	} else {
+		_ = s.deps.Store.QueryRowContext(ctx, `SELECT id FROM users WHERE role = ? LIMIT 1`, domain.RoleAdmin).Scan(&authorID)
+	}
+
+	var cur domain.RawArticle
+	if isCreate {
+		cur = domain.RawArticle{
+			ID:              id.Next(),
+			AuthorID:        authorID,
+			Title:           "我在 GitHub 上的开源项目",
+			Slug:            "github",
+			LegacyPermalink: "/my-github-repos",
+			SummaryMD:       summaryStr,
+			ContentMD:       contentStr,
+			CoverURL:        "/images/github_repo.jpg",
+			Status:          domain.ArticleStatusPublished,
+			PublishedAt:     now,
+			AllowComment:    true,
+			Lang:            snap.Site.DefaultLocale,
+			WordCount:       words,
+			ReadingMinutes:  mins,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+	} else {
+		cur = existing
+		cur.Title = "我在 GitHub 上的开源项目"
+		cur.SummaryMD = summaryStr
+		cur.ContentMD = contentStr
+		if strings.TrimSpace(cur.CoverURL) == "" {
+			cur.CoverURL = "/images/github_repo.jpg"
+		}
+		cur.Status = domain.ArticleStatusPublished
+		if cur.PublishedAt <= 0 {
+			cur.PublishedAt = now
+		}
+		cur.WordCount = words
+		cur.ReadingMinutes = mins
+		cur.UpdatedAt = now
+	}
+
+	txErr := s.deps.Store.WithTx(ctx, func(tx *sqlx.Tx) error {
+		if isCreate {
+			if _, iErr := tx.ExecContext(ctx,
+				`INSERT INTO articles (
+					id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md,
+					cover_url, status, published_at, scheduled_at, is_pinned, allow_comment,
+					password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes, audio_mime,
+					lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count,
+					created_at, updated_at
+				) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '', ?, '', 0, 0, '', ?, '', '', ?, ?, 0, 0, ?, ?)`,
+				cur.ID, cur.AuthorID, cur.Title, cur.Slug, cur.LegacyPermalink, cur.SummaryMD, cur.ContentMD,
+				cur.CoverURL, cur.Status, cur.PublishedAt, cur.IsPinned, cur.AllowComment, false,
+				cur.Lang, cur.WordCount, cur.ReadingMinutes, cur.CreatedAt, cur.UpdatedAt); iErr != nil {
+				return iErr
+			}
+		} else {
+			if _, uErr := tx.ExecContext(ctx,
+				`UPDATE articles SET title = ?, summary_md = ?, content_md = ?, cover_url = ?, status = ?, published_at = ?, word_count = ?, reading_minutes = ?, updated_at = ? WHERE id = ?`,
+				cur.Title, cur.SummaryMD, cur.ContentMD, cur.CoverURL, cur.Status, cur.PublishedAt, cur.WordCount, cur.ReadingMinutes, cur.UpdatedAt, cur.ID); uErr != nil {
+				return uErr
+			}
+		}
+		if bErr := s.bindArticleTagsByNamesTx(ctx, tx, cur.ID, []string{"开源", "GitHub"}, now); bErr != nil {
+			return bErr
+		}
+		targetURL := "/posts/" + cur.Slug
+		var navCnt int
+		_ = tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM nav_items WHERE url IN (?, '/posts/github', '/posts/my-github-repos', '/my-github-repos', '/github')`,
+			targetURL).Scan(&navCnt)
+		if navCnt == 0 {
+			_, _ = tx.ExecContext(ctx,
+				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
+				 VALUES (?, '', '我的开源', '{"zh-CN":"我的开源","en-US":"Open Source"}', ?, ?, '/images/github-icon-light.svg', 5, ?, ?, ?)`,
+				id.Next(), targetURL, false, true, now, now)
+		}
+		return s.deps.Content.ReindexArticleBacklinksTx(ctx, tx, cur)
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	s.deps.Content.SearchIndex().Upsert(cur)
+	_ = s.deps.Content.WarmCaches(ctx)
+	return &cur, nil
 }
 
 func (s *AppServer) pushIndexNowURLs(ctx context.Context, baseURL string) (int, error) {

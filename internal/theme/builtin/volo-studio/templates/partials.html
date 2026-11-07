@@ -1,9 +1,9 @@
 {{define "sidebar"}}
 <aside class="studio-sidebar">
-  {{if and (themeBool .ThemeConfig "show_author_card" true) (ne .CurrentPath "/") .Site.NoticeBoard}}
+  {{if and (ne .CurrentPath "/") .Site.NoticeBoard}}
     <section class="sidebar-card">
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.notice"}}</h3>
-      <div style="font-size:13px;line-height:1.8;color:var(--volo-text)">{{.Site.NoticeBoard}}</div>
+      <div class="sidebar-notice-text">{{.Site.NoticeBoard}}</div>
     </section>
   {{end}}
 
@@ -12,27 +12,13 @@
     <div class="studio-side-links">
       <a href="/links"><span>{{t .Locale "nav.links"}}</span><span>→</span></a>
       <a href="/follows"><span>{{t .Locale "nav.follows"}}</span><span>→</span></a>
-      <a href="/dynamic"><span>{{t .Locale "nav.dynamic"}}</span><span>→</span></a>
+      <a href="/books"><span>{{t .Locale "nav.bookshelf"}}</span><span>→</span></a>
       <a href="/rss.xml" data-no-pjax><span>{{t .Locale "footer.rss"}}</span><span>↗</span></a>
     </div>
   </section>
 
   {{range .SidebarWidgets}}
     <section class="sidebar-card">{{safeHTML .HTML}}</section>
-  {{end}}
-
-  {{if .SidebarCategories}}
-    <section class="sidebar-card">
-      <h3 class="sidebar-card__title">{{t .Locale "sidebar.categories"}}</h3>
-      <div class="studio-side-links">
-        {{range .SidebarCategories}}
-          <a href="/categories/{{.Slug}}">
-            <span>{{.Name}}</span>
-            <span>{{.ArticleCount}}</span>
-          </a>
-        {{end}}
-      </div>
-    </section>
   {{end}}
 
   {{if .SidebarTags}}
@@ -80,7 +66,8 @@
     {{if .Card.IsPasswordProtected}}
       {{coverSVG .Card.Slug true}}
     {{else if .Card.CoverURL}}
-      <img src="{{.Card.CoverURL}}" alt="" loading="lazy" decoding="async" width="320" height="214">
+      <img src="{{.Card.CoverURL}}" alt="" loading="lazy" decoding="async" width="320" height="214" data-cover-img="1">
+      <span class="studio-cover-fallback" hidden>{{coverSVG .Card.Slug false}}</span>
     {{else}}
       {{coverSVG .Card.Slug false}}
     {{end}}
@@ -91,15 +78,18 @@
       {{if .Card.IsPinned}}<span class="studio-badge">{{t .Locale "article.pinned"}}</span>{{end}}
       {{if .Card.IsPasswordProtected}}<span class="studio-badge">🔒 {{t .Locale "article.protected_title"}}</span>{{end}}
       {{if .Card.HasAudio}}<span class="studio-badge">🎙 {{t .Locale "podcast.badge"}}</span>{{end}}
-      {{if .Card.CategoryName}}<a class="studio-badge" href="/categories/{{.Card.CategorySlug}}">{{.Card.CategoryName}}</a>{{end}}
     </span>
   </div>
   <h2 class="article__title"><a rel="bookmark" href="{{.Card.URL}}">{{.Card.Title}}</a></h2>
   <p class="studio-abstract">{{.Card.Summary}}</p>
   <div class="studio-post-foot">
     <span class="studio-post-tags">
-      {{range .Card.Tags}}
-        <a href="/tags/{{.Slug}}"># {{.Name}}</a>
+      {{if .Card.Tags}}
+        {{range .Card.Tags}}
+          <a href="/tags/{{.Slug}}"># {{.Name}}</a>
+        {{end}}
+      {{else if .Card.CategoryName}}
+        <a href="/categories/{{.Card.CategorySlug}}"># {{.Card.CategoryName}}</a>
       {{end}}
     </span>
     <a class="article__more" href="{{.Card.URL}}" aria-label="{{t .Locale "studio.read_more"}} {{.Card.Title}}">{{t .Locale "studio.read_more"}} <span aria-hidden="true">↗</span></a>

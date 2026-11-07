@@ -413,3 +413,127 @@ func splitIntoNChunks(s string, n int) []string {
 	}
 	return out
 }
+
+func TestImportLegacyResilientToMissingChunksAndRealWorldAnomalies(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(tmp, "resilient.db"),
+	})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer store.Close()
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatalf("migrate up: %v", err)
+	}
+
+	kr, _, err := config.LoadOrInitKeyRing(strings.Repeat("b", 64), tmp)
+	if err != nil {
+		t.Fatalf("keyring: %v", err)
+	}
+	settingsMgr := repo.NewSettingsManager(store, kr, "zh-CN")
+
+	booksJSON := `[{"id":"b7b80c66","title":"Broken TOC Book","sourceType":"gitbook","sourceUrl":"https://docs.example.com","chapterCount":12}]`
+	seriesJSON := `[{"id":"ser_real","title":"Go Deep Dive","articleIds":["art_gh","art_deleted_ghost"]}]`
+	ghReposJSON := `[{"githubrepoName":"Volo-go","githubrepoFullName":"Willh92/Volo-go","githubrepoDescription":"Pure Go blog","githubrepoHTMLURL":"https://github.com/Willh92/Volo-go","githubrepoLanguage":"Go","githubrepoStargazersCount":128,"githubrepoForksCount":16,"githubrepoFork":false,"githubrepoUpdated":1730900000000},{"githubrepoName":"SecretRepo","githubrepoFullName":"Willh92/SecretRepo","githubrepoFork":true,"githubrepoUpdated":1730800000000}]`
+	ghDisplayJSON := `{"includeForks":true,"hidden":["willh92/secretrepo"]}`
+
+	rawDoc := map[string]any{
+		"users": []map[string]any{
+			{
+				"oId":              "550e8400-e29b-41d4-a716-446655440000",
+				"userName":         "will",
+				"userEmail":        "will@example.com",
+				"userRole":         "adminRole",
+				"userPasswordHash": "pbkdf2$sha256$120000$00112233445566778899aabbccddeeff$0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+			{
+				"oId":       "550e8400-e29b-41d4-a716-446655440001",
+				"userName":  "guest_uuid_2",
+				"userEmail": "guest2@example.com",
+				"userRole":  "visitorRole",
+			},
+		},
+		"options": []map[string]any{
+			{"oId": "blogTitle", "optionValue": "Will Studio"},
+			{"oId": "myGitHubID", "optionValue": "Willh92"},
+			{"oId": "voloBooks", "optionValue": booksJSON},
+			// Root manifest referencing a missing chunk (exact reproduction of user's backup failure!)
+			{"oId": "voloBookToc.b7b80c66", "optionValue": `{"count":2,"generation":"9003c49a46ad4af0baf8916fcd6f8e2c","storage":"chunks"}`},
+			{"oId": "voloSeries", "optionValue": seriesJSON},
+			{"oId": "githubRepos", "optionValue": ghReposJSON},
+			{"oId": "githubRepositoryDisplay", "optionValue": ghDisplayJSON},
+		},
+		"articles": []map[string]any{
+			{
+				"oId":              "art_gh",
+				"articleTitle":     "我在 GitHub 上的开源项目",
+				"articleAbstract":  "开源作品汇总",
+				"articleContent":   "![stats](/github-stats/Willh92.svg)",
+				"articleAuthorId":  "550e8400-e29b-41d4-a716-446655440000",
+				"articlePermalink": "/my-github-repos",
+				"articleStatus":    0,
+				"articlePutTop":    true,
+				"articleCreated":   1730900000000,
+				"articleUpdated":   1730900000000,
+			},
+		},
+		"articleRevisions": []map[string]any{
+			{
+				"oId":             "rev_orphan",
+				"articleOId":      "art_deleted_ghost",
+				"revisionTitle":   "Ghost",
+				"revisionContent": "Orphan revision must not break FK",
+			},
+		},
+		"pages": []map[string]any{
+			{
+				"oId":           "nav_gh",
+				"pageTitle":     "我的开源",
+				"pagePermalink": "/my-github-repos",
+				"pageIcon":      "/images/github-icon.png",
+				"pageOrder":     1,
+			},
+			{
+				"oId":           "nav_admin",
+				"pageTitle":     "管理后台",
+				"pagePermalink": "/admin-index.do",
+				"pageIcon":      "/images/admin-panel.svg",
+				"pageOrder":     2,
+			},
+		},
+	}
+
+	jsonPath := filepath.Join(tmp, "legacy-broken-chunk.json")
+	rawBytes, _ := json.Marshal(rawDoc)
+	if err := os.WriteFile(jsonPath, rawBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := ImportLegacyArchive(ctx, store, settingsMgr, kr, jsonPath, ImportOptions{})
+	if err != nil {
+		t.Fatalf("expected resilient import to succeed despite missing book TOC chunk, got: %v", err)
+	}
+	if rep.Users != 2 || rep.Books != 1 || rep.Articles != 1 {
+		t.Fatalf("unexpected counts: %+v", rep)
+	}
+	if len(rep.Warnings) == 0 {
+		t.Fatalf("expected warning recorded for missing voloBookToc chunk")
+	}
+
+	snap := settingsMgr.Snapshot()
+	if len(snap.SEO.GitHubRepos) != 2 {
+		t.Fatalf("expected 2 GitHub repos parsed (numeric Updated timestamp), got %d", len(snap.SEO.GitHubRepos))
+	}
+	if snap.SEO.GitHubRepos[0].Hidden || !snap.SEO.GitHubRepos[1].Hidden {
+		t.Fatalf("expected case-insensitive hidden repo mapping preserved: %+v", snap.SEO.GitHubRepos)
+	}
+
+	navs, _ := sqlx.Select[domain.NavItem](ctx, store, `SELECT * FROM nav_items ORDER BY sort_order ASC`)
+	if len(navs) != 2 || navs[0].Icon != "/images/github-icon.png" || navs[1].URL != "/console" {
+		t.Fatalf("unexpected migrated nav items: %+v", navs)
+	}
+}

@@ -1,6 +1,7 @@
 import { useState } from "preact/hooks";
 import { apiFetch, b64urlToBytes, bytesToB64url, csrfTokenSig, currentUserSig, refreshMe, showToast, StaffUser } from "../api";
 import { BrandLogo } from "../components/BrandLogo";
+import { LocalePopover } from "../components/UIControls";
 import { availableLocalesSig, ensureLocaleLoaded, localeSig, normalizeLocale, t } from "../i18n";
 
 export function LoginView() {
@@ -115,19 +116,14 @@ export function LoginView() {
             <BrandLogo size={36} />
             <h1 style={{ margin: 0, fontSize: "20px" }}>{t("auth.sign_in")}</h1>
           </div>
-          <select
-            class="volo-select"
-            style={{ width: "118px" }}
+          <LocalePopover
             value={localeSig.value}
-            onChange={(e) => {
-              const next = normalizeLocale((e.currentTarget as HTMLSelectElement).value);
+            locales={locales}
+            onChange={(nextRaw) => {
+              const next = normalizeLocale(nextRaw);
               void ensureLocaleLoaded(next);
             }}
-          >
-            {locales.map((loc) => (
-              <option key={loc.code} value={loc.code}>{loc.name}</option>
-            ))}
-          </select>
+          />
         </div>
 
         {!challengeToken ? (
@@ -136,6 +132,8 @@ export function LoginView() {
               <label>{t("auth.ident")}</label>
               <input
                 class="volo-input"
+                name="username"
+                autoComplete="username"
                 required
                 autoFocus
                 value={ident}
@@ -147,6 +145,8 @@ export function LoginView() {
               <input
                 type="password"
                 class="volo-input"
+                name="password"
+                autoComplete="current-password"
                 required
                 value={password}
                 onInput={(e) => setPassword((e.currentTarget as HTMLInputElement).value)}
@@ -166,11 +166,13 @@ export function LoginView() {
             </button>
           </form>
         ) : (
-          <form onSubmit={handle2FASubmit}>
+          <form onSubmit={handle2FASubmit} autoComplete="off">
             <div class="volo-field">
               <label>{t("auth.totp_code")}</label>
               <input
                 class="volo-input"
+                name="totp_otp_code"
+                autoComplete="one-time-code"
                 required
                 autoFocus
                 placeholder="123456 / ABCD-EFGH"

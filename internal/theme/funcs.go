@@ -3,6 +3,7 @@ package theme
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"html/template"
 	"net/url"
 	"reflect"
@@ -351,6 +352,7 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			return template.JS(b)
 		},
 		"socialIconSVG": renderSocialIconSVG,
+		"navIconHTML":   renderNavIconHTML,
 		"coverSVG":      renderDeterministicCoverSVG,
 	}
 }
@@ -468,6 +470,30 @@ func renderSocialIconSVG(icon string) template.HTML {
 		inner = `<circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M2 8h12M8 1.8c1.8 1.8 2.8 4 2.8 6.2S9.8 12.4 8 14.2C6.2 12.4 5.2 10.2 5.2 8S6.2 3.6 8 1.8Z" stroke="currentColor" stroke-width="1.3" fill="none"/>`
 	}
 	return template.HTML(`<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" style="vertical-align:-2px">` + inner + `</svg>`)
+}
+
+func renderNavIconHTML(icon string) template.HTML {
+	trimmed := strings.TrimSpace(icon)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	switch {
+	case lower == "github" || strings.Contains(lower, "github-icon"):
+		return template.HTML(`<svg class="studio-nav-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z" fill="currentColor"/></svg>`)
+	case lower == "panel" || lower == "admin" || lower == "console" || strings.Contains(lower, "admin-panel"):
+		return template.HTML(`<svg class="studio-nav-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.2" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="9" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="2.2" y="9" width="4.8" height="4.8" rx="1"/><rect x="9" y="9" width="4.8" height="4.8" rx="1"/></svg>`)
+	case lower == "logout" || strings.Contains(lower, "admin-logout"):
+		return template.HTML(`<svg class="studio-nav-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 2.5H3.6A1.4 1.4 0 0 0 2.2 3.9v8.2a1.4 1.4 0 0 0 1.4 1.4h2.6"/><path d="M10.5 11.2 13.8 8l-3.3-3.2"/><path d="M13.8 8H6.2"/></svg>`)
+	case lower == "book" || lower == "books":
+		return template.HTML(`<svg class="studio-nav-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 3.2A1.7 1.7 0 0 1 4.2 1.5h8.8v11.6H4.2a1.7 1.7 0 0 0-1.7 1.4V3.2Z"/><path d="M4.2 11.6h8.8"/></svg>`)
+	case lower == "external" || lower == "link":
+		return template.HTML(`<svg class="studio-nav-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.2 8.8"/><path d="M12.5 9.2v3.3a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1h3.3"/></svg>`)
+	}
+	if strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "vbscript:") || strings.HasPrefix(lower, "data:text/html") {
+		return ""
+	}
+	return template.HTML(`<img class="studio-nav-icon" src="` + html.EscapeString(trimmed) + `" alt="" loading="lazy" decoding="async" data-hide-on-error="1" />`)
 }
 
 func jsonMarshalSafe(v any) ([]byte, error) {

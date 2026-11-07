@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, showToast } from "../api";
+import { apiFetch, currentUserSig, showToast } from "../api";
 import { CM6Editor } from "../components/CM6Editor";
+import { ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
 
 export type ContentSubTab = "pages" | "categories" | "tags" | "series" | "books" | "comments" | "media";
@@ -27,6 +28,8 @@ export function ContentWorkspace({
 }) {
   const [sub, setSub] = useState<ContentSubTab>(activeTab);
   const locales = availableLocalesSig.value;
+  const isAdmin = currentUserSig.value?.role === "admin";
+  const [pageIdx, setPageIdx] = useState<number>(1);
 
   // Pages
   const [pages, setPages] = useState<any[]>([]);
@@ -54,6 +57,7 @@ export function ContentWorkspace({
   useEffect(() => {
     setSub(activeTab);
     setEditPage(null);
+    setPageIdx(1);
   }, [activeTab]);
 
   const loadSub = async () => {
@@ -90,6 +94,7 @@ export function ContentWorkspace({
   };
 
   useEffect(() => {
+    setPageIdx(1);
     void loadSub();
   }, [sub, cmtStatus]);
 
@@ -158,6 +163,19 @@ export function ContentWorkspace({
     }
   };
 
+  const cleanupUnusedTags = async () => {
+    try {
+      const res = await apiFetch<{ deleted: number; items: any[] }>("/api/admin/tags/cleanup", {
+        method: "POST",
+        body: "{}",
+      });
+      setTags(res.items || []);
+      showToast(t("cnt.tag_cleaned", { count: res.deleted ?? 0 }));
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
   const cmtStatusLabel = (st: string) => {
     if (st === "approved") return t("cnt.cmt_approved");
     if (st === "pending") return t("cnt.cmt_pending");
@@ -172,11 +190,21 @@ export function ContentWorkspace({
   const filteredMedia = mediaQuery.trim()
     ? media.filter((m) => {
         const q = mediaQuery.trim().toLowerCase();
-        const name = String(m.original_name || m.object_key || "").toLowerCase();
+        const name = String(m.original_name || m.orig_filename || m.object_key || "").toLowerCase();
         const url = String(m.public_url || "").toLowerCase();
         return name.includes(q) || url.includes(q);
       })
     : media;
+
+  const totalMediaBytes = media.reduce((acc, m) => acc + Number(m.size_bytes || 0), 0);
+
+  const pagedPages = paginateItems(pages, pageIdx, 15);
+  const pagedCats = paginateItems(categories, pageIdx, 15);
+  const pagedTags = paginateItems(filteredTags, pageIdx, 15);
+  const pagedSeries = paginateItems(series, pageIdx, 15);
+  const pagedBooks = paginateItems(books, pageIdx, 15);
+  const pagedComments = paginateItems(comments, pageIdx, 15);
+  const pagedMedia = paginateItems(filteredMedia, pageIdx, 15);
 
   return (
     <div>
@@ -189,6 +217,7 @@ export function ContentWorkspace({
               class={`volo-tab ${sub === k ? "active" : ""}`}
               onClick={() => {
                 setSub(k);
+                setPageIdx(1);
                 onNavigate?.(k);
               }}
             >
@@ -201,7 +230,7 @@ export function ContentWorkspace({
       {sub === "pages" && (
         <div class="volo-card">
           {editPage ? (
-            <form onSubmit={savePage}>
+            <form onSubmit={savePage} autoComplete="off">
               <div class="volo-sec-head">
                 <div class="volo-sec-copy">
                   <h3 class="volo-card-title">{t("cnt.page_editor_title", { slug: editPage.slug || "about" })}</h3>
@@ -211,39 +240,74 @@ export function ContentWorkspace({
                   {t("common.cancel")}
                 </button>
               </div>
-              <div class="volo-grid-3">
+              <div class="volo-grid-4">
                 <div class="volo-field">
                   <label>{t("art.title")}</label>
-                  <input class="volo-input" required value={editPage.title} onInput={(e) => setEditPage({ ...editPage, title: (e.currentTarget as HTMLInputElement).value })} />
+                  <input
+                    class="volo-input"
+                    required
+                    value={editPage.title}
+                    onInput={(e) => setEditPage({ ...editPage, title: (e.currentTarget as HTMLInputElement).value })}
+                  />
                 </div>
                 <div class="volo-field">
                   <label>{t("cnt.page_slug")}</label>
-                  <input class="volo-input" placeholder="about" value={editPage.slug} onInput={(e) => setEditPage({ ...editPage, slug: (e.currentTarget as HTMLInputElement).value })} />
+                  <input
+                    class="volo-input"
+                    placeholder="about"
+                    value={editPage.slug}
+                    onInput={(e) => setEditPage({ ...editPage, slug: (e.currentTarget as HTMLInputElement).value })}
+                  />
                 </div>
                 <div class="volo-field">
-                  <label>{t("cnt.page_locale_group")}</label>
-                  <div style={{ display: "flex", gap: "6px" }}>
-                    <select class="volo-select" value={editPage.lang || "zh-CN"} onChange={(e) => setEditPage({ ...editPage, lang: (e.currentTarget as HTMLSelectElement).value })}>
-                      {locales.map((loc) => (
-                        <option key={loc.code} value={loc.code}>{loc.name} ({loc.code})</option>
-                      ))}
-                    </select>
-                    <input class="volo-input" placeholder="group-about" value={editPage.translation_group || ""} onInput={(e) => setEditPage({ ...editPage, translation_group: (e.currentTarget as HTMLInputElement).value })} />
-                  </div>
+                  <label>{t("cnt.lbl_page_locale")}</label>
+                  <ConsoleSelect
+                    value={editPage.lang || "zh-CN"}
+                    onChange={(val) => setEditPage({ ...editPage, lang: val })}
+                    options={locales.map((loc) => ({
+                      value: loc.code,
+                      label: loc.name,
+                      badge: loc.code,
+                    }))}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("cnt.lbl_page_group")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder="group-about"
+                    value={editPage.translation_group || ""}
+                    onInput={(e) => setEditPage({ ...editPage, translation_group: (e.currentTarget as HTMLInputElement).value })}
+                  />
                 </div>
               </div>
-              <CM6Editor value={editPage.content_md || ""} onChange={(md) => setEditPage({ ...editPage, content_md: md })} />
+              <div class="volo-field">
+                <label>{t("art.md_body")}</label>
+                <CM6Editor value={editPage.content_md || ""} onChange={(md) => setEditPage({ ...editPage, content_md: md })} />
+              </div>
               <div class="volo-check-grid">
                 <label class="volo-check-item">
-                  <input type="checkbox" checked={editPage.is_published !== false} onChange={(e) => setEditPage({ ...editPage, is_published: (e.currentTarget as HTMLInputElement).checked })} />
+                  <input
+                    type="checkbox"
+                    checked={editPage.is_published !== false}
+                    onChange={(e) => setEditPage({ ...editPage, is_published: (e.currentTarget as HTMLInputElement).checked })}
+                  />
                   <span>{t("cnt.page_published")}</span>
                 </label>
                 <label class="volo-check-item">
-                  <input type="checkbox" checked={editPage.allow_comment !== false} onChange={(e) => setEditPage({ ...editPage, allow_comment: (e.currentTarget as HTMLInputElement).checked })} />
+                  <input
+                    type="checkbox"
+                    checked={editPage.allow_comment !== false}
+                    onChange={(e) => setEditPage({ ...editPage, allow_comment: (e.currentTarget as HTMLInputElement).checked })}
+                  />
                   <span>{t("art.allow_comment")}</span>
                 </label>
                 <label class="volo-check-item">
-                  <input type="checkbox" checked={!!editPage.show_toc} onChange={(e) => setEditPage({ ...editPage, show_toc: (e.currentTarget as HTMLInputElement).checked })} />
+                  <input
+                    type="checkbox"
+                    checked={!!editPage.show_toc}
+                    onChange={(e) => setEditPage({ ...editPage, show_toc: (e.currentTarget as HTMLInputElement).checked })}
+                  />
                   <span>{t("cnt.page_show_toc")}</span>
                 </label>
               </div>
@@ -259,7 +323,17 @@ export function ContentWorkspace({
                 <button
                   type="button"
                   class="volo-btn volo-btn-primary volo-btn-sm"
-                  onClick={() => setEditPage({ title: "", slug: "", content_md: "", is_published: true, allow_comment: true, show_toc: false, lang: localeSig.value })}
+                  onClick={() =>
+                    setEditPage({
+                      title: "",
+                      slug: "",
+                      content_md: "",
+                      is_published: true,
+                      allow_comment: true,
+                      show_toc: false,
+                      lang: localeSig.value,
+                    })
+                  }
                 >
                   + {t("common.create")}
                 </button>
@@ -276,12 +350,12 @@ export function ContentWorkspace({
                     </tr>
                   </thead>
                   <tbody>
-                    {pages.length === 0 ? (
+                    {pagedPages.slice.length === 0 ? (
                       <tr>
                         <td colSpan={5} class="volo-empty-state">{t("tbl.empty")}</td>
                       </tr>
                     ) : (
-                      pages.map((p) => (
+                      pagedPages.slice.map((p) => (
                         <tr key={p.id}>
                           <td class="col-fluid">
                             <div class="volo-cell-main">
@@ -301,11 +375,16 @@ export function ContentWorkspace({
                           <td class="col-num">
                             <div class="volo-metric-pair">
                               <span class="volo-metric-item" title="PV">
-                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+                                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+                                  <circle cx="12" cy="12" r="3" />
+                                </svg>
                                 {p.view_count ?? 0}
                               </span>
                               <span class="volo-metric-item" title={t("nav.comments")}>
-                                <svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                                <svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+                                  <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                                </svg>
                                 {p.comment_count ?? 0}
                               </span>
                             </div>
@@ -313,15 +392,29 @@ export function ContentWorkspace({
                           <td class="col-date">{formatDateTime(p.updated_at)}</td>
                           <td class="col-act">
                             <div class="volo-row-actions">
-                              <a class="volo-act-btn" href={`/${encodeURIComponent(p.slug)}`} target="_blank" rel="noreferrer">{t("common.view")}</a>
-                              <button type="button" class="volo-act-btn" onClick={async () => {
-                                const full = await apiFetch<{ page: any }>(`/api/admin/pages/${p.id}`);
-                                setEditPage(full.page);
-                              }}>{t("common.edit")}</button>
-                              <button type="button" class="volo-act-btn danger" onClick={async () => {
-                                await apiFetch(`/api/admin/pages/${p.id}`, { method: "DELETE" });
-                                void loadSub();
-                              }}>{t("common.delete")}</button>
+                              <a class="volo-act-btn" href={`/${encodeURIComponent(p.slug)}`} target="_blank" rel="noreferrer">
+                                {t("common.view")}
+                              </a>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={async () => {
+                                  const full = await apiFetch<{ page: any }>(`/api/admin/pages/${p.id}`);
+                                  setEditPage(full.page);
+                                }}
+                              >
+                                {t("common.edit")}
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn danger"
+                                onClick={async () => {
+                                  await apiFetch(`/api/admin/pages/${p.id}`, { method: "DELETE" });
+                                  void loadSub();
+                                }}
+                              >
+                                {t("common.delete")}
+                              </button>
                             </div>
                           </td>
                         </tr>
@@ -330,6 +423,7 @@ export function ContentWorkspace({
                   </tbody>
                 </table>
               </div>
+              <Pagination total={pages.length} page={pagedPages.safePage} pageSize={15} onChange={setPageIdx} />
             </>
           )}
         </div>
@@ -343,22 +437,58 @@ export function ContentWorkspace({
               <p class="volo-sec-desc">{t("cnt.cat_desc")}</p>
             </div>
           </div>
-          <form onSubmit={saveCategory} class="volo-form-bar">
-            <div class="volo-grid-3">
-              <input class="volo-input" required placeholder={t("cnt.cat_name_ph")} value={catForm.name} onInput={(e) => setCatForm({ ...catForm, name: (e.currentTarget as HTMLInputElement).value })} />
-              <input class="volo-input" placeholder={t("cnt.cat_slug_ph")} value={catForm.slug} onInput={(e) => setCatForm({ ...catForm, slug: (e.currentTarget as HTMLInputElement).value })} />
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input class="volo-input" placeholder={t("cnt.desc_ph")} value={catForm.description} onInput={(e) => setCatForm({ ...catForm, description: (e.currentTarget as HTMLInputElement).value })} />
-                <button type="submit" class="volo-btn volo-btn-primary">{catForm.id ? t("common.save") : t("common.create")}</button>
-                {catForm.id && (
-                  <button
-                    type="button"
-                    class="volo-btn"
-                    onClick={() => setCatForm({ id: "", name: "", slug: "", description: "", sort_order: 1 })}
-                  >
-                    {t("common.cancel")}
+          <form onSubmit={saveCategory} class="volo-form-bar" autoComplete="off">
+            <div class="volo-grid-4">
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_cat_name")}</label>
+                <input
+                  class="volo-input"
+                  required
+                  placeholder={t("cnt.cat_name_ph")}
+                  value={catForm.name}
+                  onInput={(e) => setCatForm({ ...catForm, name: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_slug")}</label>
+                <input
+                  class="volo-input"
+                  placeholder={t("cnt.cat_slug_ph")}
+                  value={catForm.slug}
+                  onInput={(e) => setCatForm({ ...catForm, slug: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_sort")}</label>
+                <input
+                  type="number"
+                  class="volo-input"
+                  value={catForm.sort_order ?? 1}
+                  onInput={(e) => setCatForm({ ...catForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_desc")}</label>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <input
+                    class="volo-input"
+                    placeholder={t("cnt.desc_ph")}
+                    value={catForm.description}
+                    onInput={(e) => setCatForm({ ...catForm, description: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                  <button type="submit" class="volo-btn volo-btn-primary">
+                    {catForm.id ? t("common.save") : t("common.create")}
                   </button>
-                )}
+                  {catForm.id && (
+                    <button
+                      type="button"
+                      class="volo-btn"
+                      onClick={() => setCatForm({ id: "", name: "", slug: "", description: "", sort_order: 1 })}
+                    >
+                      {t("common.cancel")}
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </form>
@@ -373,12 +503,12 @@ export function ContentWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {categories.length === 0 ? (
+                {pagedCats.slice.length === 0 ? (
                   <tr>
                     <td colSpan={4} class="volo-empty-state">{t("tbl.empty")}</td>
                   </tr>
                 ) : (
-                  categories.map((c) => (
+                  pagedCats.slice.map((c) => (
                     <tr key={c.id}>
                       <td class="col-fluid">
                         <div class="volo-cell-main">
@@ -394,12 +524,22 @@ export function ContentWorkspace({
                       </td>
                       <td class="col-act">
                         <div class="volo-row-actions">
-                          <a class="volo-act-btn" href={`/categories/${encodeURIComponent(c.slug)}`} target="_blank" rel="noreferrer">{t("common.view")}</a>
-                          <button type="button" class="volo-act-btn" onClick={() => setCatForm(c)}>{t("common.edit")}</button>
-                          <button type="button" class="volo-act-btn danger" onClick={async () => {
-                            await apiFetch(`/api/admin/categories/${c.id}`, { method: "DELETE" });
-                            void loadSub();
-                          }}>{t("common.delete")}</button>
+                          <a class="volo-act-btn" href={`/categories/${encodeURIComponent(c.slug)}`} target="_blank" rel="noreferrer">
+                            {t("common.view")}
+                          </a>
+                          <button type="button" class="volo-act-btn" onClick={() => setCatForm(c)}>
+                            {t("common.edit")}
+                          </button>
+                          <button
+                            type="button"
+                            class="volo-act-btn danger"
+                            onClick={async () => {
+                              await apiFetch(`/api/admin/categories/${c.id}`, { method: "DELETE" });
+                              void loadSub();
+                            }}
+                          >
+                            {t("common.delete")}
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -408,6 +548,7 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={categories.length} page={pagedCats.safePage} pageSize={15} onChange={setPageIdx} />
         </div>
       )}
 
@@ -424,12 +565,21 @@ export function ContentWorkspace({
                 style={{ width: "200px" }}
                 placeholder={t("cnt.tag_filter_ph")}
                 value={tagFilter}
-                onInput={(e) => setTagFilter((e.currentTarget as HTMLInputElement).value)}
+                onInput={(e) => {
+                  setTagFilter((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
               />
+              {isAdmin && (
+                <button type="button" class="volo-btn volo-btn-sm" onClick={cleanupUnusedTags}>
+                  {t("cnt.tag_cleanup")}
+                </button>
+              )}
             </div>
           </div>
 
           <form
+            autoComplete="off"
             onSubmit={async (e) => {
               e.preventDefault();
               await apiFetch("/api/admin/tags", { method: "POST", body: JSON.stringify({ name: tagName }) });
@@ -437,10 +587,20 @@ export function ContentWorkspace({
               void loadSub();
             }}
             class="volo-form-bar"
-            style={{ display: "flex", gap: "8px", alignItems: "center" }}
           >
-            <input class="volo-input" style={{ maxWidth: "320px" }} required placeholder={t("cnt.tag_new_ph")} value={tagName} onInput={(e) => setTagName((e.currentTarget as HTMLInputElement).value)} />
-            <button type="submit" class="volo-btn volo-btn-primary">{t("common.create")}</button>
+            <div class="volo-field" style={{ marginBottom: 0, maxWidth: "460px" }}>
+              <label>{t("cnt.lbl_tag_name")}</label>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <input
+                  class="volo-input"
+                  required
+                  placeholder={t("cnt.tag_new_ph")}
+                  value={tagName}
+                  onInput={(e) => setTagName((e.currentTarget as HTMLInputElement).value)}
+                />
+                <button type="submit" class="volo-btn volo-btn-primary">{t("common.create")}</button>
+              </div>
+            </div>
           </form>
 
           <div class="volo-table-wrap">
@@ -454,12 +614,12 @@ export function ContentWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {filteredTags.length === 0 ? (
+                {pagedTags.slice.length === 0 ? (
                   <tr>
                     <td colSpan={4} class="volo-empty-state">{t("tbl.empty")}</td>
                   </tr>
                 ) : (
-                  filteredTags.map((tg) => (
+                  pagedTags.slice.map((tg) => (
                     <tr key={tg.id}>
                       <td class="col-fluid">
                         <div class="volo-cell-title">#{tg.name}</div>
@@ -472,11 +632,19 @@ export function ContentWorkspace({
                       </td>
                       <td class="col-act">
                         <div class="volo-row-actions">
-                          <a class="volo-act-btn" href={`/tags/${encodeURIComponent(tg.slug || tg.name)}`} target="_blank" rel="noreferrer">{t("common.view")}</a>
-                          <button type="button" class="volo-act-btn danger" onClick={async () => {
-                            await apiFetch(`/api/admin/tags/${tg.id}`, { method: "DELETE" });
-                            void loadSub();
-                          }}>{t("common.delete")}</button>
+                          <a class="volo-act-btn" href={`/tags/${encodeURIComponent(tg.slug || tg.name)}`} target="_blank" rel="noreferrer">
+                            {t("common.view")}
+                          </a>
+                          <button
+                            type="button"
+                            class="volo-act-btn danger"
+                            onClick={async () => {
+                              await apiFetch(`/api/admin/tags/${tg.id}`, { method: "DELETE" });
+                              void loadSub();
+                            }}
+                          >
+                            {t("common.delete")}
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -485,6 +653,7 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={filteredTags.length} page={pagedTags.safePage} pageSize={15} onChange={setPageIdx} />
         </div>
       )}
 
@@ -496,22 +665,58 @@ export function ContentWorkspace({
               <p class="volo-sec-desc">{t("cnt.ser_desc")}</p>
             </div>
           </div>
-          <form onSubmit={saveSeries} class="volo-form-bar">
-            <div class="volo-grid-3">
-              <input class="volo-input" required placeholder={t("cnt.ser_title_ph")} value={serForm.title} onInput={(e) => setSerForm({ ...serForm, title: (e.currentTarget as HTMLInputElement).value })} />
-              <input class="volo-input" placeholder={t("cnt.cat_slug_ph")} value={serForm.slug} onInput={(e) => setSerForm({ ...serForm, slug: (e.currentTarget as HTMLInputElement).value })} />
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input class="volo-input" placeholder={t("cnt.desc_ph")} value={serForm.description} onInput={(e) => setSerForm({ ...serForm, description: (e.currentTarget as HTMLInputElement).value })} />
-                <button type="submit" class="volo-btn volo-btn-primary">{serForm.id ? t("common.save") : t("common.create")}</button>
-                {serForm.id && (
-                  <button
-                    type="button"
-                    class="volo-btn"
-                    onClick={() => setSerForm({ id: "", title: "", slug: "", description: "", sort_order: 1 })}
-                  >
-                    {t("common.cancel")}
+          <form onSubmit={saveSeries} class="volo-form-bar" autoComplete="off">
+            <div class="volo-grid-4">
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_ser_title")}</label>
+                <input
+                  class="volo-input"
+                  required
+                  placeholder={t("cnt.ser_title_ph")}
+                  value={serForm.title}
+                  onInput={(e) => setSerForm({ ...serForm, title: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_slug")}</label>
+                <input
+                  class="volo-input"
+                  placeholder={t("cnt.cat_slug_ph")}
+                  value={serForm.slug}
+                  onInput={(e) => setSerForm({ ...serForm, slug: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_sort")}</label>
+                <input
+                  type="number"
+                  class="volo-input"
+                  value={serForm.sort_order ?? 1}
+                  onInput={(e) => setSerForm({ ...serForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_desc")}</label>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <input
+                    class="volo-input"
+                    placeholder={t("cnt.desc_ph")}
+                    value={serForm.description}
+                    onInput={(e) => setSerForm({ ...serForm, description: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                  <button type="submit" class="volo-btn volo-btn-primary">
+                    {serForm.id ? t("common.save") : t("common.create")}
                   </button>
-                )}
+                  {serForm.id && (
+                    <button
+                      type="button"
+                      class="volo-btn"
+                      onClick={() => setSerForm({ id: "", title: "", slug: "", description: "", sort_order: 1 })}
+                    >
+                      {t("common.cancel")}
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </form>
@@ -525,12 +730,12 @@ export function ContentWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {series.length === 0 ? (
+                {pagedSeries.slice.length === 0 ? (
                   <tr>
                     <td colSpan={3} class="volo-empty-state">{t("tbl.empty")}</td>
                   </tr>
                 ) : (
-                  series.map((s) => (
+                  pagedSeries.slice.map((s) => (
                     <tr key={s.id}>
                       <td class="col-fluid">
                         <div class="volo-cell-main">
@@ -543,12 +748,22 @@ export function ContentWorkspace({
                       </td>
                       <td class="col-act">
                         <div class="volo-row-actions">
-                          <a class="volo-act-btn" href={`/series/${encodeURIComponent(s.slug)}`} target="_blank" rel="noreferrer">{t("common.view")}</a>
-                          <button type="button" class="volo-act-btn" onClick={() => setSerForm(s)}>{t("common.edit")}</button>
-                          <button type="button" class="volo-act-btn danger" onClick={async () => {
-                            await apiFetch(`/api/admin/series/${s.id}`, { method: "DELETE" });
-                            void loadSub();
-                          }}>{t("common.delete")}</button>
+                          <a class="volo-act-btn" href={`/series/${encodeURIComponent(s.slug)}`} target="_blank" rel="noreferrer">
+                            {t("common.view")}
+                          </a>
+                          <button type="button" class="volo-act-btn" onClick={() => setSerForm(s)}>
+                            {t("common.edit")}
+                          </button>
+                          <button
+                            type="button"
+                            class="volo-act-btn danger"
+                            onClick={async () => {
+                              await apiFetch(`/api/admin/series/${s.id}`, { method: "DELETE" });
+                              void loadSub();
+                            }}
+                          >
+                            {t("common.delete")}
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -557,6 +772,7 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={series.length} page={pagedSeries.safePage} pageSize={15} onChange={setPageIdx} />
         </div>
       )}
 
@@ -568,61 +784,115 @@ export function ContentWorkspace({
               <p class="volo-sec-desc">{t("cnt.book_desc")}</p>
             </div>
           </div>
-          <form onSubmit={saveBook} class="volo-form-bar">
-            <div class="volo-grid-3">
-              <input class="volo-input" required placeholder={t("cnt.book_title_ph")} value={bookForm.title} onInput={(e) => setBookForm({ ...bookForm, title: (e.currentTarget as HTMLInputElement).value })} />
-              <input class="volo-input" placeholder={t("cnt.cat_slug_ph")} value={bookForm.slug} onInput={(e) => setBookForm({ ...bookForm, slug: (e.currentTarget as HTMLInputElement).value })} />
-              <input class="volo-input" placeholder={t("cnt.book_cover_ph")} value={bookForm.cover_url} onInput={(e) => setBookForm({ ...bookForm, cover_url: (e.currentTarget as HTMLInputElement).value })} />
-            </div>
-            <div class="volo-grid-3" style={{ marginTop: "8px" }}>
-              <select
-                class="volo-select"
-                value={bookForm.source_type}
-                onChange={(e) => setBookForm({ ...bookForm, source_type: (e.currentTarget as HTMLSelectElement).value })}
-              >
-                <option value="auto">{t("cnt.book_src_auto")}</option>
-                <option value="gitbook">{t("cnt.book_src_gitbook")}</option>
-                <option value="mdbook">{t("cnt.book_src_mdbook")}</option>
-                <option value="vuepress">{t("cnt.book_src_vuepress")}</option>
-                <option value="series">{t("cnt.book_src_series")}</option>
-                <option value="manual">{t("cnt.book_src_manual")}</option>
-              </select>
-              {bookForm.source_type === "series" ? (
-                <select
-                  class="volo-select"
-                  value={bookForm.series_id}
-                  onChange={(e) => setBookForm({ ...bookForm, series_id: (e.currentTarget as HTMLSelectElement).value })}
-                >
-                  <option value="">{t("art.series_none")}</option>
-                  {series.map((s) => (
-                    <option key={s.id} value={s.id}>{s.title}</option>
-                  ))}
-                </select>
-              ) : (
+          <form onSubmit={saveBook} class="volo-form-bar" autoComplete="off">
+            <div class="volo-grid-4">
+              <div class="volo-field">
+                <label>{t("cnt.lbl_book_title")}</label>
                 <input
                   class="volo-input"
-                  placeholder={t("cnt.book_toc_ph")}
-                  value={bookForm.source_url}
-                  onInput={(e) => setBookForm({ ...bookForm, source_url: (e.currentTarget as HTMLInputElement).value })}
+                  required
+                  placeholder={t("cnt.book_title_ph")}
+                  value={bookForm.title}
+                  onInput={(e) => setBookForm({ ...bookForm, title: (e.currentTarget as HTMLInputElement).value })}
                 />
-              )}
-              <select
-                class="volo-select"
-                value={bookForm.embed_mode}
-                onChange={(e) => setBookForm({ ...bookForm, embed_mode: (e.currentTarget as HTMLSelectElement).value })}
-              >
-                <option value="iframe">{t("cnt.book_embed_iframe")}</option>
-                <option value="link">{t("cnt.book_embed_link")}</option>
-              </select>
+              </div>
+              <div class="volo-field">
+                <label>{t("cnt.lbl_slug")}</label>
+                <input
+                  class="volo-input"
+                  placeholder={t("cnt.cat_slug_ph")}
+                  value={bookForm.slug}
+                  onInput={(e) => setBookForm({ ...bookForm, slug: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("cnt.lbl_book_cover")}</label>
+                <input
+                  class="volo-input"
+                  placeholder={t("cnt.book_cover_ph")}
+                  value={bookForm.cover_url}
+                  onInput={(e) => setBookForm({ ...bookForm, cover_url: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("cnt.lbl_sort")}</label>
+                <input
+                  type="number"
+                  class="volo-input"
+                  value={bookForm.sort_order ?? 1}
+                  onInput={(e) => setBookForm({ ...bookForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
+                />
+              </div>
             </div>
-            <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-              <input class="volo-input" placeholder={t("cnt.book_notes_ph")} value={bookForm.description} onInput={(e) => setBookForm({ ...bookForm, description: (e.currentTarget as HTMLInputElement).value })} />
-              <button type="submit" class="volo-btn volo-btn-primary">{bookForm.id ? t("common.save") : t("common.create")}</button>
-              {bookForm.id && (
-                <button type="button" class="volo-btn" onClick={() => setBookForm({ ...EMPTY_BOOK })}>
-                  {t("common.cancel")}
-                </button>
+            <div class="volo-grid-3">
+              <div class="volo-field">
+                <label>{t("cnt.lbl_book_source")}</label>
+                <ConsoleSelect
+                  value={bookForm.source_type}
+                  onChange={(val) => setBookForm({ ...bookForm, source_type: val })}
+                  options={[
+                    { value: "auto", label: t("cnt.book_src_auto") },
+                    { value: "gitbook", label: t("cnt.book_src_gitbook") },
+                    { value: "mdbook", label: t("cnt.book_src_mdbook") },
+                    { value: "vuepress", label: t("cnt.book_src_vuepress") },
+                    { value: "series", label: t("cnt.book_src_series") },
+                    { value: "manual", label: t("cnt.book_src_manual") },
+                  ]}
+                />
+              </div>
+              {bookForm.source_type === "series" ? (
+                <div class="volo-field">
+                  <label>{t("art.series")}</label>
+                  <ConsoleSelect
+                    value={bookForm.series_id}
+                    onChange={(val) => setBookForm({ ...bookForm, series_id: val })}
+                    options={[
+                      { value: "", label: t("art.series_none") },
+                      ...series.map((s) => ({ value: s.id, label: s.title })),
+                    ]}
+                  />
+                </div>
+              ) : (
+                <div class="volo-field">
+                  <label>{t("cnt.lbl_book_toc")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder={t("cnt.book_toc_ph")}
+                    value={bookForm.source_url}
+                    onInput={(e) => setBookForm({ ...bookForm, source_url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
               )}
+              <div class="volo-field">
+                <label>{t("cnt.lbl_book_embed")}</label>
+                <ConsoleSelect
+                  value={bookForm.embed_mode}
+                  onChange={(val) => setBookForm({ ...bookForm, embed_mode: val })}
+                  options={[
+                    { value: "iframe", label: t("cnt.book_embed_iframe") },
+                    { value: "link", label: t("cnt.book_embed_link") },
+                  ]}
+                />
+              </div>
+            </div>
+            <div class="volo-field" style={{ marginBottom: 0 }}>
+              <label>{t("cnt.lbl_book_notes")}</label>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <input
+                  class="volo-input"
+                  placeholder={t("cnt.book_notes_ph")}
+                  value={bookForm.description}
+                  onInput={(e) => setBookForm({ ...bookForm, description: (e.currentTarget as HTMLInputElement).value })}
+                />
+                <button type="submit" class="volo-btn volo-btn-primary">
+                  {bookForm.id ? t("common.save") : t("common.create")}
+                </button>
+                {bookForm.id && (
+                  <button type="button" class="volo-btn" onClick={() => setBookForm({ ...EMPTY_BOOK })}>
+                    {t("common.cancel")}
+                  </button>
+                )}
+              </div>
             </div>
           </form>
           <div class="volo-table-wrap">
@@ -636,12 +906,12 @@ export function ContentWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {books.length === 0 ? (
+                {pagedBooks.slice.length === 0 ? (
                   <tr>
                     <td colSpan={4} class="volo-empty-state">{t("tbl.empty")}</td>
                   </tr>
                 ) : (
-                  books.map((b) => (
+                  pagedBooks.slice.map((b) => (
                     <tr key={b.id}>
                       <td class="col-fluid">
                         <div class="volo-cell-main">
@@ -666,23 +936,42 @@ export function ContentWorkspace({
                       </td>
                       <td class="col-act">
                         <div class="volo-row-actions">
-                          <a class="volo-act-btn" href={`/books/${encodeURIComponent(b.slug)}`} target="_blank" rel="noreferrer">{t("common.view")}</a>
+                          <a class="volo-act-btn" href={`/books/${encodeURIComponent(b.slug)}`} target="_blank" rel="noreferrer">
+                            {t("common.view")}
+                          </a>
                           {(b.source_url || b.series_id) && (
-                            <button type="button" class="volo-act-btn" onClick={async () => {
-                              try {
-                                const r = await apiFetch<{ chapter_count: number }>(`/api/admin/books/${b.id}/sync`, { method: "POST", body: "{}" });
-                                showToast(t("cnt.book_synced", { count: r.chapter_count ?? 0 }));
-                                void loadSub();
-                              } catch (err: any) {
-                                showToast(err.message);
-                              }
-                            }}>{t("cnt.book_sync_toc")}</button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              onClick={async () => {
+                                try {
+                                  const r = await apiFetch<{ chapter_count: number }>(`/api/admin/books/${b.id}/sync`, {
+                                    method: "POST",
+                                    body: "{}",
+                                  });
+                                  showToast(t("cnt.book_synced", { count: r.chapter_count ?? 0 }));
+                                  void loadSub();
+                                } catch (err: any) {
+                                  showToast(err.message);
+                                }
+                              }}
+                            >
+                              {t("cnt.book_sync_toc")}
+                            </button>
                           )}
-                          <button type="button" class="volo-act-btn" onClick={() => setBookForm({ ...EMPTY_BOOK, ...b })}>{t("common.edit")}</button>
-                          <button type="button" class="volo-act-btn danger" onClick={async () => {
-                            await apiFetch(`/api/admin/books/${b.id}`, { method: "DELETE" });
-                            void loadSub();
-                          }}>{t("common.delete")}</button>
+                          <button type="button" class="volo-act-btn" onClick={() => setBookForm({ ...EMPTY_BOOK, ...b })}>
+                            {t("common.edit")}
+                          </button>
+                          <button
+                            type="button"
+                            class="volo-act-btn danger"
+                            onClick={async () => {
+                              await apiFetch(`/api/admin/books/${b.id}`, { method: "DELETE" });
+                              void loadSub();
+                            }}
+                          >
+                            {t("common.delete")}
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -691,6 +980,7 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={books.length} page={pagedBooks.safePage} pageSize={15} onChange={setPageIdx} />
         </div>
       )}
 
@@ -731,12 +1021,12 @@ export function ContentWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {comments.length === 0 ? (
+                {pagedComments.slice.length === 0 ? (
                   <tr>
                     <td colSpan={4} class="volo-empty-state">{t("cnt.cmt_empty")}</td>
                   </tr>
                 ) : (
-                  comments.map((row) => {
+                  pagedComments.slice.map((row) => {
                     const c = row.comment || row;
                     return (
                       <tr key={c.id}>
@@ -754,6 +1044,7 @@ export function ContentWorkspace({
                             <div style={{ display: "flex", gap: "6px", maxWidth: "520px" }}>
                               <input
                                 class="volo-input"
+                                autoComplete="off"
                                 style={{ height: "30px", fontSize: "12.5px", padding: "0 10px" }}
                                 placeholder={t("cnt.cmt_reply_ph")}
                                 value={replyText[c.id] || ""}
@@ -765,7 +1056,10 @@ export function ContentWorkspace({
                                 onClick={async () => {
                                   const txt = (replyText[c.id] || "").trim();
                                   if (!txt) return;
-                                  await apiFetch(`/api/admin/comments/${c.id}/reply`, { method: "POST", body: JSON.stringify({ content_md: txt }) });
+                                  await apiFetch(`/api/admin/comments/${c.id}/reply`, {
+                                    method: "POST",
+                                    body: JSON.stringify({ content_md: txt }),
+                                  });
                                   setReplyText({ ...replyText, [c.id]: "" });
                                   showToast(t("cnt.cmt_replied"));
                                   void loadSub();
@@ -786,21 +1080,45 @@ export function ContentWorkspace({
                         <td class="col-act">
                           <div class="volo-row-actions">
                             {c.status !== "approved" && (
-                              <button type="button" class="volo-act-btn" onClick={async () => {
-                                await apiFetch(`/api/admin/comments/${c.id}`, { method: "PATCH", body: JSON.stringify({ status: "approved" }) });
-                                void loadSub();
-                              }}>{t("cnt.cmt_approve")}</button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={async () => {
+                                  await apiFetch(`/api/admin/comments/${c.id}`, {
+                                    method: "PATCH",
+                                    body: JSON.stringify({ status: "approved" }),
+                                  });
+                                  void loadSub();
+                                }}
+                              >
+                                {t("cnt.cmt_approve")}
+                              </button>
                             )}
                             {c.status !== "rejected" && (
-                              <button type="button" class="volo-act-btn" onClick={async () => {
-                                await apiFetch(`/api/admin/comments/${c.id}`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
-                                void loadSub();
-                              }}>{t("cnt.cmt_reject")}</button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={async () => {
+                                  await apiFetch(`/api/admin/comments/${c.id}`, {
+                                    method: "PATCH",
+                                    body: JSON.stringify({ status: "rejected" }),
+                                  });
+                                  void loadSub();
+                                }}
+                              >
+                                {t("cnt.cmt_reject")}
+                              </button>
                             )}
-                            <button type="button" class="volo-act-btn danger" onClick={async () => {
-                              await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
-                              void loadSub();
-                            }}>{t("common.delete")}</button>
+                            <button
+                              type="button"
+                              class="volo-act-btn danger"
+                              onClick={async () => {
+                                await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
+                                void loadSub();
+                              }}
+                            >
+                              {t("common.delete")}
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -810,6 +1128,7 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={comments.length} page={pagedComments.safePage} pageSize={15} onChange={setPageIdx} />
         </div>
       )}
 
@@ -817,16 +1136,28 @@ export function ContentWorkspace({
         <div class="volo-card">
           <div class="volo-sec-head">
             <div class="volo-sec-copy">
-              <h3 class="volo-card-title">{t("cnt.media_head")}</h3>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                <h3 class="volo-card-title">{t("cnt.media_head")}</h3>
+                <span class="volo-badge">
+                  {t("cnt.media_total_stat", {
+                    count: media.length,
+                    mb: (totalMediaBytes / (1024 * 1024)).toFixed(2),
+                  })}
+                </span>
+              </div>
               <p class="volo-sec-desc">{t("cnt.media_desc")}</p>
             </div>
             <div class="volo-filter-controls">
               <input
                 class="volo-input"
+                autoComplete="off"
                 style={{ width: "200px" }}
                 placeholder={t("cnt.media_search_ph")}
                 value={mediaQuery}
-                onInput={(e) => setMediaQuery((e.currentTarget as HTMLInputElement).value)}
+                onInput={(e) => {
+                  setMediaQuery((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
               />
               <label class="volo-btn volo-btn-primary volo-btn-sm" style={{ cursor: "pointer" }}>
                 {t("cnt.media_upload")}
@@ -845,22 +1176,24 @@ export function ContentWorkspace({
                   }}
                 />
               </label>
-              <button
-                type="button"
-                class="volo-btn volo-btn-sm"
-                onClick={async () => {
-                  const res = await apiFetch<{ orphans: any[] }>("/api/admin/media/orphans", {
-                    method: "POST",
-                    body: "{}",
-                  });
-                  const list = res.orphans || [];
-                  setOrphans(list);
-                  showToast(t("cnt.media_found_orphans", { count: list.length }));
-                }}
-              >
-                {t("cnt.media_scan_orphans")}
-              </button>
-              {orphans && orphans.length > 0 && (
+              {isAdmin && (
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm"
+                  onClick={async () => {
+                    const res = await apiFetch<{ orphans: any[] }>("/api/admin/media/orphans", {
+                      method: "POST",
+                      body: "{}",
+                    });
+                    const list = res.orphans || [];
+                    setOrphans(list);
+                    showToast(t("cnt.media_found_orphans", { count: list.length }));
+                  }}
+                >
+                  {t("cnt.media_scan_orphans")}
+                </button>
+              )}
+              {isAdmin && orphans && orphans.length > 0 && (
                 <button
                   type="button"
                   class="volo-btn volo-btn-sm volo-btn-danger"
@@ -892,12 +1225,12 @@ export function ContentWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {filteredMedia.length === 0 ? (
+                {pagedMedia.slice.length === 0 ? (
                   <tr>
                     <td colSpan={5} class="volo-empty-state">{t("tbl.empty")}</td>
                   </tr>
                 ) : (
-                  filteredMedia.map((m) => {
+                  pagedMedia.slice.map((m) => {
                     const displayName = m.original_name || m.orig_filename || m.object_key || m.storage_key || m.id;
                     const isImage = String(m.mime_type || "").startsWith("image/");
                     return (
@@ -923,19 +1256,37 @@ export function ContentWorkspace({
                         <td class="col-date">{formatDateTime(m.created_at)}</td>
                         <td class="col-act">
                           <div class="volo-row-actions">
-                            <button type="button" class="volo-act-btn" onClick={() => {
-                              void navigator.clipboard?.writeText(m.public_url);
-                              showToast(t("cnt.media_copied"));
-                            }}>{t("cnt.media_copy")}</button>
-                            <button type="button" class="volo-act-btn" onClick={() => {
-                              const md = isImage ? `![${displayName}](${m.public_url})` : `[${displayName}](${m.public_url})`;
-                              void navigator.clipboard?.writeText(md);
-                              showToast(t("cnt.media_copied"));
-                            }}>{t("cnt.media_copy_md")}</button>
-                            <button type="button" class="volo-act-btn danger" onClick={async () => {
-                              await apiFetch(`/api/admin/media/${m.id}`, { method: "DELETE" });
-                              void loadSub();
-                            }}>{t("common.delete")}</button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              onClick={() => {
+                                void navigator.clipboard?.writeText(m.public_url);
+                                showToast(t("cnt.media_copied"));
+                              }}
+                            >
+                              {t("cnt.media_copy")}
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              onClick={() => {
+                                const md = isImage ? `![${displayName}](${m.public_url})` : `[${displayName}](${m.public_url})`;
+                                void navigator.clipboard?.writeText(md);
+                                showToast(t("cnt.media_copied"));
+                              }}
+                            >
+                              {t("cnt.media_copy_md")}
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn danger"
+                              onClick={async () => {
+                                await apiFetch(`/api/admin/media/${m.id}`, { method: "DELETE" });
+                                void loadSub();
+                              }}
+                            >
+                              {t("common.delete")}
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -945,6 +1296,7 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={filteredMedia.length} page={pagedMedia.safePage} pageSize={15} onChange={setPageIdx} />
         </div>
       )}
     </div>

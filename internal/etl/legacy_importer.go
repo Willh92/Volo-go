@@ -140,7 +140,7 @@ func ImportLegacyArchive(
 		if err := insertPass1EntitiesTx(ctx, tx, pass1State, decomposed, existingAdmins, report); err != nil {
 			return err
 		}
-		return streamPass2IntoTx(ctx, tx, openStream, pass1State, keyRing, report)
+		return streamPass2IntoTx(ctx, tx, openStream, pass1State, decomposed.seriesArticles, keyRing, report)
 	})
 	if err != nil {
 		return nil, err
@@ -283,7 +283,9 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), rep
 	}
 
 	usedCatSlugs := make(map[string]bool)
+	usedCatIDs := make(map[string]bool)
 	usedTagSlugs := make(map[string]bool)
+	usedUserIDs := make(map[string]bool)
 	usedUsernames := make(map[string]bool)
 	usedEmails := make(map[string]bool)
 
@@ -320,19 +322,27 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), rep
 
 		case "users":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				origID := strVal(raw["oId"])
+				origID := strings.TrimSpace(strVal(raw["oId"]))
 				if origID == "" {
 					return nil
 				}
-				mappedID := origID
-				if origID == "default" || len(origID) > 32 {
-					mappedID = defaultMappedAdminID
-					if _, taken := st.userIDMap[origID]; !taken {
-						st.userIDMap[origID] = mappedID
-					}
-				} else {
-					st.userIDMap[origID] = mappedID
+				if _, alreadySeen := st.userIDMap[origID]; alreadySeen {
+					return nil
 				}
+				role := mapLegacyRole(strVal(raw["userRole"]))
+				mappedID := origID
+				if origID == "default" || len(origID) > 32 || usedUserIDs[origID] {
+					if !usedUserIDs[defaultMappedAdminID] && (origID == "default" || role == domain.RoleAdmin) {
+						mappedID = defaultMappedAdminID
+					} else {
+						mappedID = id.Next()
+						for usedUserIDs[mappedID] {
+							mappedID = id.Next()
+						}
+					}
+				}
+				usedUserIDs[mappedID] = true
+				st.userIDMap[origID] = mappedID
 
 				uname := strings.TrimSpace(strVal(raw["userName"]))
 				if uname == "" {
@@ -346,7 +356,6 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), rep
 				}
 				email = dedupEmail(email, usedEmails)
 
-				role := mapLegacyRole(strVal(raw["userRole"]))
 				if role == domain.RoleAdmin && st.defaultAdminID == "" {
 					st.defaultAdminID = mappedID
 				}
@@ -390,11 +399,15 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), rep
 
 		case "categories":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				cid := strVal(raw["oId"])
+				cid := strings.TrimSpace(strVal(raw["oId"]))
 				title := strings.TrimSpace(strVal(raw["categoryTitle"]))
-				if cid == "" || title == "" {
+				if cid == "" || title == "" || usedCatIDs[cid] {
 					return nil
 				}
+				if len(cid) > 32 {
+					cid = id.Next()
+				}
+				usedCatIDs[cid] = true
 				uri := strings.Trim(strings.TrimSpace(strVal(raw["categoryURI"])), "/")
 				slug := dedupSlug(slugify(firstNonEmpty(uri, title, cid)), usedCatSlugs)
 				order := int(int64Val(raw["categoryOrder"]))
@@ -418,13 +431,16 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), rep
 
 		case "tags":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				tid := strVal(raw["oId"])
+				tid := strings.TrimSpace(strVal(raw["oId"]))
 				title := strings.TrimSpace(strVal(raw["tagTitle"]))
-				if tid == "" || title == "" {
+				if tid == "" || title == "" || st.tagIDSet[tid] {
 					return nil
 				}
 				if _, dup := st.tagByName[strings.ToLower(title)]; dup {
 					return nil
+				}
+				if len(tid) > 32 {
+					tid = id.Next()
 				}
 				slug := dedupSlug(slugify(firstNonEmpty(title, tid)), usedTagSlugs)
 				st.tags = append(st.tags, domain.Tag{
@@ -523,19 +539,40 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), rep
 		}
 	}
 
+	if st.defaultAdminID == "" {
+		if len(st.users) > 0 {
+			st.users[0].Role = domain.RoleAdmin
+			st.defaultAdminID = st.users[0].ID
+		} else {
+			now := time.Now().UnixMilli()
+			st.defaultAdminID = defaultMappedAdminID
+			st.users = append(st.users, domain.User{
+				ID:          defaultMappedAdminID,
+				Username:    "admin",
+				Email:       "admin@local.volo",
+				DisplayName: "Admin",
+				Role:        domain.RoleAdmin,
+				Status:      domain.UserStatusActive,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			})
+		}
+	}
+
 	return st, nil
 }
 
 // reassembleOptionDoc reconstructs a potentially chunked option JSON payload strictly
-// in chunk index order 0..count-1 (immune to lexicographical ".10" before ".2" ordering!).
-func (st *pass1Data) reassembleOptionDoc(rootID string) (string, bool, error) {
+// in chunk index order 0..count-1 (immune to lexicographical ".10" before ".2" ordering!),
+// checking both st.chunks and st.options and recording a warning instead of aborting on missing chunks.
+func (st *pass1Data) reassembleOptionDoc(rootID string, report *ImportReport) (string, bool) {
 	root, ok := st.options[rootID]
 	if !ok {
-		return "", false, nil
+		return "", false
 	}
-	val := root.Value
-	if !strings.HasPrefix(val, chunkManifestPrefix) {
-		return val, true, nil
+	val := strings.TrimSpace(root.Value)
+	if !strings.HasPrefix(val, "{") || !strings.Contains(val, `"storage"`) || !strings.Contains(val, `"chunks"`) {
+		return root.Value, true
 	}
 	var manifest struct {
 		Storage    string `json:"storage"`
@@ -543,21 +580,36 @@ func (st *pass1Data) reassembleOptionDoc(rootID string) (string, bool, error) {
 		Count      int    `json:"count"`
 	}
 	if err := json.Unmarshal([]byte(val), &manifest); err != nil {
-		return "", false, fmt.Errorf("etl: parse chunk manifest for %q: %w", rootID, err)
+		if report != nil {
+			report.Warnings = append(report.Warnings, fmt.Sprintf("skipped malformed chunk manifest for %q", rootID))
+		}
+		return "", false
 	}
-	if manifest.Storage != "chunks" || !hexGenRe.MatchString(manifest.Generation) || manifest.Count < 1 || manifest.Count > 256 {
-		return "", false, fmt.Errorf("etl: invalid chunk manifest for %q", rootID)
+	if manifest.Storage != "chunks" || !hexGenRe.MatchString(manifest.Generation) || manifest.Count < 1 || manifest.Count > 4096 {
+		if report != nil {
+			report.Warnings = append(report.Warnings, fmt.Sprintf("skipped invalid chunk manifest for %q", rootID))
+		}
+		return "", false
 	}
 	var sb strings.Builder
 	for i := 0; i < manifest.Count; i++ {
 		chunkKey := fmt.Sprintf("%s.%s.%d", rootID, manifest.Generation, i)
 		part, exists := st.chunks[chunkKey]
 		if !exists {
-			return "", false, fmt.Errorf("etl: missing chunk %q while reassembling %q", chunkKey, rootID)
+			if optRow, optExists := st.options[chunkKey]; optExists {
+				part = optRow.Value
+				exists = true
+			}
+		}
+		if !exists {
+			if report != nil {
+				report.Warnings = append(report.Warnings, fmt.Sprintf("skipped incomplete chunked option %q (missing chunk %q)", rootID, chunkKey))
+			}
+			return "", false
 		}
 		sb.WriteString(part)
 	}
-	return sb.String(), true, nil
+	return sb.String(), true
 }
 
 type decomposedState struct {
@@ -626,7 +678,7 @@ func decomposeOptions(st *pass1Data, base domain.SettingsSnapshot, kr *config.Ke
 			out.settings.Site.LicenseTemplate = tpl
 		}
 	}
-	if usiteRaw, ok, err := st.reassembleOptionDoc("usite"); err == nil && ok && usiteRaw != "" {
+	if usiteRaw, ok := st.reassembleOptionDoc("usite", report); ok && usiteRaw != "" {
 		out.settings.Site.SocialLinks = convertDynamicSocialLinks(usiteRaw)
 	}
 
@@ -735,8 +787,8 @@ func decomposeOptions(st *pass1Data, base domain.SettingsSnapshot, kr *config.Ke
 	if v := getOpt("myGitHubID"); v != "" {
 		out.settings.SEO.GitHubUsername = v
 	}
-	if ghRaw, ok, err := st.reassembleOptionDoc("githubRepos"); err == nil && ok && ghRaw != "" {
-		dispRaw, _, _ := st.reassembleOptionDoc("githubRepositoryDisplay")
+	if ghRaw, ok := st.reassembleOptionDoc("githubRepos", report); ok && ghRaw != "" {
+		dispRaw, _ := st.reassembleOptionDoc("githubRepositoryDisplay", report)
 		parseLegacyGitHubRepos(ghRaw, dispRaw, &out.settings.SEO)
 	}
 
@@ -764,10 +816,10 @@ func decomposeOptions(st *pass1Data, base domain.SettingsSnapshot, kr *config.Ke
 	if n := parseIntBound(getOpt("wafCurrentLimitTimes"), 1, 100000); n > 0 {
 		out.settings.Security.WAFMaxRequests = n
 	}
-	if bansRaw, ok, err := st.reassembleOptionDoc("voloIpBans"); err == nil && ok && bansRaw != "" {
+	if bansRaw, ok := st.reassembleOptionDoc("voloIpBans", report); ok && bansRaw != "" {
 		out.ipBans = parseLegacyIPBans(bansRaw)
 	}
-	if geoRaw, ok, err := st.reassembleOptionDoc("voloGeoAccess"); err == nil && ok && geoRaw != "" {
+	if geoRaw, ok := st.reassembleOptionDoc("voloGeoAccess", report); ok && geoRaw != "" {
 		out.geoRules = parseLegacyGeoAccess(geoRaw, &out.settings.Security)
 	}
 
@@ -778,32 +830,25 @@ func decomposeOptions(st *pass1Data, base domain.SettingsSnapshot, kr *config.Ke
 	if n := parseIntBound(getOpt("localBackupKeepCount"), 1, 365); n > 0 {
 		out.settings.Backup.LocalKeepCount = n
 	}
-	if rbRaw, ok, err := st.reassembleOptionDoc("voloRemoteBackup"); err == nil && ok && rbRaw != "" {
+	if rbRaw, ok := st.reassembleOptionDoc("voloRemoteBackup", report); ok && rbRaw != "" {
 		parseLegacyRemoteBackup(rbRaw, &out.settings.Backup, &out.backupSecrets)
 	}
 
 	// 8. Friend Link Health Cache ("voloLinkHealth")
-	if lhRaw, ok, err := st.reassembleOptionDoc("voloLinkHealth"); err == nil && ok && lhRaw != "" {
+	if lhRaw, ok := st.reassembleOptionDoc("voloLinkHealth", report); ok && lhRaw != "" {
 		_ = json.Unmarshal([]byte(lhRaw), &st.linkHealth)
 	}
 
 	// 9. Chunked Option Payloads -> First-Class Normalized Tables!
 	// 9a. voloSeries -> series & series_articles
-	if serRaw, ok, err := st.reassembleOptionDoc("voloSeries"); err != nil {
-		return nil, err
-	} else if ok && serRaw != "" {
+	if serRaw, ok := st.reassembleOptionDoc("voloSeries", report); ok && serRaw != "" {
 		out.series, out.seriesArticles = parseLegacySeries(serRaw)
 		report.Series = len(out.series)
 	}
 
 	// 9b. voloBooks + voloBookToc.<id> -> books & book_chapters
-	if booksRaw, ok, err := st.reassembleOptionDoc("voloBooks"); err != nil {
-		return nil, err
-	} else if ok && booksRaw != "" {
-		books, chapters, bErr := parseLegacyBooksAndTOCs(booksRaw, st)
-		if bErr != nil {
-			return nil, bErr
-		}
+	if booksRaw, ok := st.reassembleOptionDoc("voloBooks", report); ok && booksRaw != "" {
+		books, chapters := parseLegacyBooksAndTOCs(booksRaw, st, report)
 		out.books = books
 		out.bookChapters = chapters
 		report.Books = len(books)
@@ -811,18 +856,14 @@ func decomposeOptions(st *pass1Data, base domain.SettingsSnapshot, kr *config.Ke
 	}
 
 	// 9c. voloDailyStats -> analytics_daily & analytics_top_items
-	if statsRaw, ok, err := st.reassembleOptionDoc("voloDailyStats"); err != nil {
-		return nil, err
-	} else if ok && statsRaw != "" {
+	if statsRaw, ok := st.reassembleOptionDoc("voloDailyStats", report); ok && statsRaw != "" {
 		out.analyticsDaily, out.analyticsTop = parseLegacyAnalytics(statsRaw)
 		report.AnalyticsDays = len(out.analyticsDaily)
 	}
 
 	// 9d. voloWebhooks -> webhooks (with AES-256-GCM secret encryption)
-	if whRaw, ok, err := st.reassembleOptionDoc("voloWebhooks"); err != nil {
-		return nil, err
-	} else if ok && whRaw != "" {
-		whs, wErr := parseLegacyWebhooks(whRaw, kr)
+	if whRaw, ok := st.reassembleOptionDoc("voloWebhooks", report); ok && whRaw != "" {
+		whs, wErr := parseLegacyWebhooks(whRaw, kr, report)
 		if wErr != nil {
 			return nil, wErr
 		}
@@ -890,7 +931,12 @@ func insertPass1EntitiesTx(
 		report.Tags++
 	}
 
+	importedSeriesIDs := make(map[string]bool, len(dec.series))
 	for _, s := range dec.series {
+		if importedSeriesIDs[s.ID] {
+			continue
+		}
+		importedSeriesIDs[s.ID] = true
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO series (id, title, slug, description, cover_url, sort_order, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -899,16 +945,13 @@ func insertPass1EntitiesTx(
 			return fmt.Errorf("etl: insert series %s: %w", s.ID, err)
 		}
 	}
-	for _, sa := range dec.seriesArticles {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO series_articles (series_id, article_id, sort_order) VALUES (?, ?, ?)`,
-			sa.SeriesID, sa.ArticleID, sa.SortOrder,
-		); err != nil {
-			return fmt.Errorf("etl: insert series_article: %w", err)
-		}
-	}
 
+	importedBookIDs := make(map[string]bool, len(dec.books))
 	for _, bk := range dec.books {
+		if importedBookIDs[bk.ID] {
+			continue
+		}
+		importedBookIDs[bk.ID] = true
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO books (id, title, slug, description, cover_url, source_type, source_url, series_id, embed_mode, chapter_count, synced_at, sort_order, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -919,6 +962,9 @@ func insertPass1EntitiesTx(
 		}
 	}
 	for _, ch := range dec.bookChapters {
+		if !importedBookIDs[ch.BookID] {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO book_chapters (id, book_id, parent_id, title, url, depth, sort_order)
 			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -928,7 +974,12 @@ func insertPass1EntitiesTx(
 		}
 	}
 
+	seenDates := make(map[string]bool, len(dec.analyticsDaily))
 	for _, ad := range dec.analyticsDaily {
+		if seenDates[ad.StatDate] {
+			continue
+		}
+		seenDates[ad.StatDate] = true
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO analytics_daily (stat_date, pv, uv, updated_at) VALUES (?, ?, ?, ?)`,
 			ad.StatDate, ad.PV, ad.UV, ad.UpdatedAt,
@@ -936,7 +987,13 @@ func insertPass1EntitiesTx(
 			return fmt.Errorf("etl: insert analytics_daily %s: %w", ad.StatDate, err)
 		}
 	}
+	seenTopKeys := make(map[string]bool, len(dec.analyticsTop))
 	for _, top := range dec.analyticsTop {
+		tk := top.StatDate + "|" + top.Kind + "|" + top.ItemKey
+		if seenTopKeys[tk] {
+			continue
+		}
+		seenTopKeys[tk] = true
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO analytics_top_items (stat_date, kind, item_key, hits) VALUES (?, ?, ?, ?)`,
 			top.StatDate, top.Kind, top.ItemKey, top.Hits,
@@ -945,7 +1002,12 @@ func insertPass1EntitiesTx(
 		}
 	}
 
+	seenWebhookIDs := make(map[string]bool, len(dec.webhooks))
 	for _, wh := range dec.webhooks {
+		if seenWebhookIDs[wh.ID] {
+			wh.ID = id.NextPrefixed("wh")
+		}
+		seenWebhookIDs[wh.ID] = true
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO webhooks (id, name, provider, url, secret_ciphertext, chat_id, events_json, is_enabled, last_status_code, last_error, last_triggered_at, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -979,11 +1041,46 @@ func insertPass1EntitiesTx(
 	return nil
 }
 
+type deferredRevision struct {
+	id         string
+	articleID  string
+	title      string
+	summaryMD  string
+	contentMD  string
+	authorName string
+	note       string
+	createdAt  int64
+}
+
+func normalizeLegacyNavURL(rawURL string) string {
+	u := strings.TrimSpace(rawURL)
+	switch {
+	case u == "/admin-index.do", strings.HasPrefix(u, "/admin-index.do#"),
+		u == "/admin/index.do", strings.HasPrefix(u, "/admin/index.do#"):
+		return "/console"
+	case u == "/archives.html":
+		return "/archives"
+	case u == "/tags.html":
+		return "/tags"
+	case u == "/categories.html":
+		return "/categories"
+	case u == "/links.html":
+		return "/links"
+	case u == "/follows.html":
+		return "/follows"
+	case u == "/dynamic.html":
+		return "/dynamic"
+	default:
+		return u
+	}
+}
+
 func streamPass2IntoTx(
 	ctx context.Context,
 	tx *sqlx.Tx,
 	openStream func() (io.ReadCloser, error),
 	st *pass1Data,
+	seriesArticles []domain.SeriesArticle,
 	kr *config.KeyRing,
 	report *ImportReport,
 ) error {
@@ -1000,8 +1097,15 @@ func streamPass2IntoTx(
 		return errors.New("etl: invalid root JSON in pass 2")
 	}
 
+	importedArticleIDs := make(map[string]bool)
 	usedArticleSlugs := make(map[string]bool)
 	usedRedirects := make(map[string]bool)
+	usedNavIDs := make(map[string]bool)
+	usedCommentIDs := make(map[string]bool)
+	usedLinkIDs := make(map[string]bool)
+	usedFollowIDs := make(map[string]bool)
+	var pendingRevs []deferredRevision
+
 	defaultLocale := i18n.NormalizeLocale(st.options["localeString"].Value)
 	if defaultLocale == "" {
 		defaultLocale = "zh-CN"
@@ -1023,18 +1127,16 @@ func streamPass2IntoTx(
 		switch rootKey {
 		case "articles":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				aid := strVal(raw["oId"])
-				if aid == "" {
+				aid := strings.TrimSpace(strVal(raw["oId"]))
+				if aid == "" || importedArticleIDs[aid] {
 					return nil
+				}
+				if len(aid) > 32 {
+					aid = id.Next()
 				}
 				origPermalink := normalizeLegacyPath(strVal(raw["articlePermalink"]))
-				if origPermalink == "/my-github-repos" {
-					// Cleanly skip auto-generated legacy GitHub HTML pseudo-article
-					report.Warnings = append(report.Warnings, "skipped legacy auto-generated /my-github-repos pseudo-article (replaced by native GitHub showcase)")
-					return nil
-				}
 
-				authorID := st.userIDMap[strVal(raw["articleAuthorId"])]
+				authorID := st.userIDMap[strings.TrimSpace(strVal(raw["articleAuthorId"]))]
 				if authorID == "" {
 					authorID = st.defaultAdminID
 				}
@@ -1104,6 +1206,7 @@ func streamPass2IntoTx(
 				); err != nil {
 					return fmt.Errorf("etl: insert article %s: %w", aid, err)
 				}
+				importedArticleIDs[aid] = true
 				report.Articles++
 
 				// Bind free-form tags (from tag_articles + fallback comma-separated articleTags)
@@ -1141,21 +1244,24 @@ func streamPass2IntoTx(
 
 		case "articleRevisions", "revisions", "article_revision":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				rid := firstNonEmpty(strVal(raw["oId"]), id.Next())
-				aid := strVal(raw["articleOId"])
+				rid := firstNonEmpty(strings.TrimSpace(strVal(raw["oId"])), id.Next())
+				if len(rid) > 32 {
+					rid = id.Next()
+				}
+				aid := strings.TrimSpace(strVal(raw["articleOId"]))
 				if aid == "" {
 					return nil
 				}
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO article_revisions (id, article_id, title, summary_md, content_md, author_name, note, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-					rid, aid, strVal(raw["revisionTitle"]), strVal(raw["revisionAbstract"]),
-					strVal(raw["revisionContent"]), strVal(raw["revisionAuthorName"]),
-					strVal(raw["revisionNote"]), int64Val(raw["revisionCreated"]),
-				); err != nil {
-					return fmt.Errorf("etl: insert revision %s: %w", rid, err)
-				}
-				report.Revisions++
+				pendingRevs = append(pendingRevs, deferredRevision{
+					id:         rid,
+					articleID:  aid,
+					title:      strVal(raw["revisionTitle"]),
+					summaryMD:  strVal(raw["revisionAbstract"]),
+					contentMD:  strVal(raw["revisionContent"]),
+					authorName: strVal(raw["revisionAuthorName"]),
+					note:       strVal(raw["revisionNote"]),
+					createdAt:  int64Val(raw["revisionCreated"]),
+				})
 				return nil
 			}); err != nil {
 				return err
@@ -1164,14 +1270,18 @@ func streamPass2IntoTx(
 		case "pages":
 			// Legacy "page" table held ONLY header navigation items -> split cleanly into nav_items!
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				nid := firstNonEmpty(strVal(raw["oId"]), id.Next())
+				nid := firstNonEmpty(strings.TrimSpace(strVal(raw["oId"])), id.Next())
+				if len(nid) > 32 || usedNavIDs[nid] {
+					nid = id.Next()
+				}
 				title := strings.TrimSpace(strVal(raw["pageTitle"]))
-				targetURL := strings.TrimSpace(strVal(raw["pagePermalink"]))
+				targetURL := normalizeLegacyNavURL(strVal(raw["pagePermalink"]))
 				if title == "" || targetURL == "" {
 					return nil
 				}
+				usedNavIDs[nid] = true
 				newTab := strings.EqualFold(strVal(raw["pageOpenTarget"]), "_blank")
-				icon := strVal(raw["pageIcon"])
+				icon := strings.TrimSpace(strVal(raw["pageIcon"]))
 				if isLegacyExternalAsset(icon) {
 					icon = ""
 				}
@@ -1191,12 +1301,16 @@ func streamPass2IntoTx(
 
 		case "comments":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				cid := strVal(raw["oId"])
-				onID := strVal(raw["commentOnId"])
-				if cid == "" || onID == "" {
+				cid := strings.TrimSpace(strVal(raw["oId"]))
+				onID := strings.TrimSpace(strVal(raw["commentOnId"]))
+				if cid == "" || onID == "" || usedCommentIDs[cid] {
 					return nil
 				}
-				rawUID := strVal(raw["commentUserId"])
+				if len(cid) > 32 {
+					cid = id.Next()
+				}
+				usedCommentIDs[cid] = true
+				rawUID := strings.TrimSpace(strVal(raw["commentUserId"]))
 				mappedUID := st.userIDMap[rawUID]
 
 				notifyEmail := strings.TrimSpace(strVal(raw["commentNotifyEmail"]))
@@ -1246,11 +1360,15 @@ func streamPass2IntoTx(
 
 		case "links":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				lid := firstNonEmpty(strVal(raw["oId"]), id.Next())
+				lid := firstNonEmpty(strings.TrimSpace(strVal(raw["oId"])), id.Next())
+				if len(lid) > 32 || usedLinkIDs[lid] {
+					lid = id.Next()
+				}
 				addr := strings.TrimSpace(strVal(raw["linkAddress"]))
 				if addr == "" {
 					return nil
 				}
+				usedLinkIDs[lid] = true
 				lh := st.linkHealth[lid]
 				hStatus := "unknown"
 				if lh.Status != "" {
@@ -1287,11 +1405,15 @@ func streamPass2IntoTx(
 
 		case "follows":
 			if err := streamJSONArray(dec, func(raw map[string]any) error {
-				fid := firstNonEmpty(strVal(raw["oId"]), id.Next())
+				fid := firstNonEmpty(strings.TrimSpace(strVal(raw["oId"])), id.Next())
+				if len(fid) > 32 || usedFollowIDs[fid] {
+					fid = id.Next()
+				}
 				addr := strings.TrimSpace(strVal(raw["followAddress"]))
 				if addr == "" {
 					return nil
 				}
+				usedFollowIDs[fid] = true
 				ts := parseMillisFallback(fid)
 				icon := strVal(raw["followIcon"])
 				if isLegacyExternalAsset(icon) {
@@ -1317,6 +1439,56 @@ func streamPass2IntoTx(
 			}
 		}
 	}
+
+	// Insert deferred FK-dependent revisions and series_articles only for valid imported articles!
+	usedRevIDs := make(map[string]bool, len(pendingRevs))
+	for _, rev := range pendingRevs {
+		if !importedArticleIDs[rev.articleID] {
+			continue
+		}
+		rid := rev.id
+		if usedRevIDs[rid] {
+			rid = id.Next()
+		}
+		usedRevIDs[rid] = true
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO article_revisions (id, article_id, title, summary_md, content_md, author_name, note, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			rid, rev.articleID, rev.title, rev.summaryMD, rev.contentMD, rev.authorName, rev.note, rev.createdAt,
+		); err != nil {
+			return fmt.Errorf("etl: insert revision %s: %w", rid, err)
+		}
+		report.Revisions++
+	}
+
+	var existingSeriesRows []struct {
+		ID string `db:"id"`
+	}
+	existingSeriesRows, _ = sqlx.Select[struct {
+		ID string `db:"id"`
+	}](ctx, tx, `SELECT id FROM series`)
+	validSeries := make(map[string]bool, len(existingSeriesRows))
+	for _, r := range existingSeriesRows {
+		validSeries[r.ID] = true
+	}
+	seenSeriesArt := make(map[string]bool, len(seriesArticles))
+	for _, sa := range seriesArticles {
+		if !validSeries[sa.SeriesID] || !importedArticleIDs[sa.ArticleID] {
+			continue
+		}
+		key := sa.SeriesID + ":" + sa.ArticleID
+		if seenSeriesArt[key] {
+			continue
+		}
+		seenSeriesArt[key] = true
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO series_articles (series_id, article_id, sort_order) VALUES (?, ?, ?)`,
+			sa.SeriesID, sa.ArticleID, sa.SortOrder,
+		); err != nil {
+			return fmt.Errorf("etl: insert series_article: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -1349,7 +1521,7 @@ func countPass2Entities(ctx context.Context, openStream func() (io.ReadCloser, e
 		switch key {
 		case "articles":
 			_ = streamJSONArray(dec, func(raw map[string]any) error {
-				if normalizeLegacyPath(strVal(raw["articlePermalink"])) != "/my-github-repos" {
+				if strings.TrimSpace(strVal(raw["oId"])) != "" {
 					report.Articles++
 				}
 				return nil
@@ -1486,7 +1658,7 @@ type legacyTocNode struct {
 	Children []legacyTocNode `json:"children"`
 }
 
-func parseLegacyBooksAndTOCs(raw string, st *pass1Data) ([]domain.Book, []domain.BookChapter, error) {
+func parseLegacyBooksAndTOCs(raw string, st *pass1Data, report *ImportReport) ([]domain.Book, []domain.BookChapter) {
 	var arr []struct {
 		ID           string `json:"id"`
 		Title        string `json:"title"`
@@ -1500,7 +1672,10 @@ func parseLegacyBooksAndTOCs(raw string, st *pass1Data) ([]domain.Book, []domain
 		SyncedAt     int64  `json:"syncedAt"`
 	}
 	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
-		return nil, nil, fmt.Errorf("etl: parse voloBooks: %w", err)
+		if report != nil {
+			report.Warnings = append(report.Warnings, fmt.Sprintf("malformed voloBooks option payload skipped: %v", err))
+		}
+		return nil, nil
 	}
 	usedSlugs := make(map[string]bool)
 	now := time.Now().UnixMilli()
@@ -1516,9 +1691,7 @@ func parseLegacyBooksAndTOCs(raw string, st *pass1Data) ([]domain.Book, []domain
 		slug := dedupSlug(slugify(firstNonEmpty(bid, title)), usedSlugs)
 
 		var bookChapters []domain.BookChapter
-		if tocRaw, ok, err := st.reassembleOptionDoc("voloBookToc." + b.ID); err != nil {
-			return nil, nil, err
-		} else if ok && tocRaw != "" {
+		if tocRaw, ok := st.reassembleOptionDoc("voloBookToc."+b.ID, report); ok && tocRaw != "" {
 			var nodes []legacyTocNode
 			if json.Unmarshal([]byte(tocRaw), &nodes) == nil {
 				orderSeq := 0
@@ -1567,7 +1740,7 @@ func parseLegacyBooksAndTOCs(raw string, st *pass1Data) ([]domain.Book, []domain
 		})
 		chapsOut = append(chapsOut, bookChapters...)
 	}
-	return booksOut, chapsOut, nil
+	return booksOut, chapsOut
 }
 
 func parseLegacyAnalytics(raw string) ([]domain.AnalyticsDaily, []domain.AnalyticsTopItem) {
@@ -1618,7 +1791,7 @@ func parseLegacyAnalytics(raw string) ([]domain.AnalyticsDaily, []domain.Analyti
 	return dailyOut, topOut
 }
 
-func parseLegacyWebhooks(raw string, kr *config.KeyRing) ([]domain.Webhook, error) {
+func parseLegacyWebhooks(raw string, kr *config.KeyRing, report *ImportReport) ([]domain.Webhook, error) {
 	var arr []struct {
 		ID        string   `json:"id"`
 		Name      string   `json:"name"`
@@ -1631,7 +1804,10 @@ func parseLegacyWebhooks(raw string, kr *config.KeyRing) ([]domain.Webhook, erro
 		UpdatedAt int64    `json:"updatedAt"`
 	}
 	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
-		return nil, fmt.Errorf("etl: parse voloWebhooks: %w", err)
+		if report != nil {
+			report.Warnings = append(report.Warnings, fmt.Sprintf("malformed voloWebhooks option payload skipped: %v", err))
+		}
+		return nil, nil
 	}
 	var out []domain.Webhook
 	now := time.Now().UnixMilli()
@@ -1986,7 +2162,9 @@ func parseLegacyGitHubRepos(ghRaw string, dispRaw string, seo *domain.SEOSetting
 		if json.Unmarshal([]byte(dispRaw), &disp) == nil {
 			seo.GitHubIncludeForks = disp.IncludeForks
 			for _, h := range disp.Hidden {
-				hiddenSet[h] = true
+				if k := strings.ToLower(strings.TrimSpace(h)); k != "" {
+					hiddenSet[k] = true
+				}
 			}
 		}
 	}
@@ -2001,7 +2179,7 @@ func parseLegacyGitHubRepos(ghRaw string, dispRaw string, seo *domain.SEOSetting
 		Stars       int    `json:"githubrepoStargazersCount"`
 		Forks       int    `json:"githubrepoForksCount"`
 		Fork        bool   `json:"githubrepoFork"`
-		Updated     string `json:"githubrepoUpdated"`
+		Updated     any    `json:"githubrepoUpdated"`
 	}
 
 	var list []rawRepo
@@ -2028,6 +2206,8 @@ func parseLegacyGitHubRepos(ghRaw string, dispRaw string, seo *domain.SEOSetting
 		if r.Name == "" {
 			continue
 		}
+		fullLower := strings.ToLower(strings.TrimSpace(r.FullName))
+		nameLower := strings.ToLower(strings.TrimSpace(r.Name))
 		out = append(out, domain.GitHubRepoItem{
 			Name:        r.Name,
 			FullName:    r.FullName,
@@ -2038,8 +2218,8 @@ func parseLegacyGitHubRepos(ghRaw string, dispRaw string, seo *domain.SEOSetting
 			Stars:       r.Stars,
 			Forks:       r.Forks,
 			IsFork:      r.Fork,
-			Hidden:      hiddenSet[r.FullName] || hiddenSet[r.Name],
-			UpdatedAt:   r.Updated,
+			Hidden:      hiddenSet[fullLower] || hiddenSet[nameLower],
+			UpdatedAt:   strVal(r.Updated),
 		})
 	}
 	seo.GitHubRepos = out

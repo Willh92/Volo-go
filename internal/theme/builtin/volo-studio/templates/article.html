@@ -32,7 +32,7 @@
           <strong>{{t .Locale "article.protected_title"}}</strong>
           <p style="margin:6px 0 0;color:var(--volo-muted)">{{t .Locale "article.unlock_prompt"}}</p>
           <form class="volo-unlock-form js-volo-unlock-form" data-article-id="{{.Detail.ID}}">
-            <input class="volo-input" type="password" name="password" required autocomplete="off" placeholder="••••••">
+            <input class="volo-input" type="password" name="article_unlock_pwd" required autocomplete="new-password" placeholder="••••••">
             <button class="volo-btn" type="submit">{{t .Locale "article.unlock_button"}}</button>
             <div class="js-unlock-msg" hidden style="width:100%;color:var(--volo-danger);font-size:.86rem">{{t .Locale "article.unlock_wrong_pwd"}}</div>
           </form>
@@ -60,6 +60,17 @@
           </div>
         {{end}}
 
+        {{if .Detail.TOC}}
+          <details class="volo-mobile-toc">
+            <summary class="volo-mobile-toc__sum">{{t .Locale "article.toc_title"}}</summary>
+            <nav class="volo-toc-nav" aria-label="{{t .Locale "article.toc_title"}}">
+              {{range .Detail.TOC}}
+                <a class="volo-toc-link" data-toc-id="{{.ID}}" href="#{{.ID}}" style="padding-left:{{add 10 (mul (sub .Level 1) 12)}}px">{{.Text}}</a>
+              {{end}}
+            </nav>
+          </details>
+        {{end}}
+
         <div class="volo-prose">
           {{safeHTML .Detail.HTML}}
         </div>
@@ -68,7 +79,7 @@
           <div class="volo-lock-card">
             <p style="margin:0 0 8px;color:var(--volo-muted)">{{t .Locale "article.lock_pwd_hint"}}</p>
             <form class="volo-unlock-form js-volo-unlock-form" data-article-id="{{.Detail.ID}}">
-              <input class="volo-input" type="password" name="password" required autocomplete="off" placeholder="••••••">
+              <input class="volo-input" type="password" name="article_unlock_pwd" required autocomplete="new-password" placeholder="••••••">
               <button class="volo-btn" type="submit">{{t .Locale "article.unlock_button"}}</button>
               <div class="js-unlock-msg" hidden style="width:100%;color:var(--volo-danger);font-size:.86rem">{{t .Locale "article.unlock_wrong_pwd"}}</div>
             </form>
@@ -165,15 +176,24 @@
     {{end}}
   </div>
 
-  <div>
+  <div class="studio-side-rail">
     {{if and (not .Detail.RequiresPassword) .Detail.TOC}}
-      <section class="sidebar-card" style="margin-bottom:18px">
-        <h3 class="sidebar-card__title">{{t .Locale "article.toc_title"}}</h3>
-        <nav style="display:flex;flex-direction:column;gap:6px;font-size:.86rem">
-          {{range .Detail.TOC}}
-            <a href="#{{.ID}}" style="padding-left:{{mul (sub .Level 1) 10}}px;color:var(--volo-muted)">{{.Text}}</a>
-          {{end}}
-        </nav>
+      <section id="volo-toc-card" class="sidebar-card volo-toc-card">
+        <div class="volo-toc-head">
+          <h3 class="sidebar-card__title" style="margin:0">{{t .Locale "article.toc_title"}}</h3>
+          <button type="button" id="volo-toc-toggle" class="volo-toc-toggle" aria-expanded="true" aria-label="{{t .Locale "article.toc_title"}}">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 10 4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <div id="volo-toc-body" class="volo-toc-body">
+          <div class="volo-toc-body__inner">
+            <nav class="volo-toc-nav" aria-label="{{t .Locale "article.toc_title"}}">
+              {{range .Detail.TOC}}
+                <a class="volo-toc-link" data-toc-id="{{.ID}}" href="#{{.ID}}" style="padding-left:{{add 10 (mul (sub .Level 1) 12)}}px">{{.Text}}</a>
+              {{end}}
+            </nav>
+          </div>
+        </div>
       </section>
     {{end}}
     {{template "sidebar" .}}

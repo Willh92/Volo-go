@@ -1027,6 +1027,24 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if len(parts) == 2 && parts[1] == "pin" && r.Method == http.MethodPost {
+		nextPinned := !raw.IsPinned
+		now := time.Now().UnixMilli()
+		if _, err := s.deps.Store.ExecContext(r.Context(),
+			`UPDATE articles SET is_pinned = ?, updated_at = ? WHERE id = ?`,
+			nextPinned, now, raw.ID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		raw.IsPinned = nextPinned
+		if raw.Status == domain.ArticleStatusPublished {
+			s.deps.Content.SearchIndex().Upsert(raw)
+		}
+		s.recordAuditLog(r, actor, "article.pin", "article", raw.ID, map[string]any{"is_pinned": nextPinned})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "is_pinned": nextPinned})
+		return
+	}
+
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodGet:
@@ -1538,6 +1556,23 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 
 func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if rest == "cleanup" && r.Method == http.MethodPost {
+		if err := auth.RequireAdmin(actor); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		res, err := s.deps.Store.ExecContext(r.Context(),
+			`DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM article_tags)`)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		deleted, _ := res.RowsAffected()
+		s.recordAuditLog(r, actor, "tags.cleanup", "tag", "unused", map[string]any{"deleted": deleted})
+		rows, _ := s.deps.Content.ListTagsWithCounts(r.Context(), 500)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": deleted, "items": rows})
+		return
+	}
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:

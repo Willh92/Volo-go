@@ -160,20 +160,55 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	rep, err := s.streamLegacyImportUpload(w, r)
+	rep, dryRun, err := s.streamLegacyImportUpload(w, r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	// Mark site initialized if legacy archive contained admin + site settings
+	if dryRun {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"dry_run":    true,
+			"report":     rep,
+			"admin_path": s.deps.Config.AdminPath,
+		})
+		return
+	}
+
+	_, _ = s.deps.Settings.Reload(r.Context())
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
 	_ = s.deps.Content.WarmCaches(r.Context())
+	if s.deps.WAF != nil {
+		_ = s.deps.WAF.ReloadBans(r.Context())
+	}
+	if s.deps.Geo != nil {
+		_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
+	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"ok":         true,
 		"report":     rep,
 		"admin_path": s.deps.Config.AdminPath,
-	})
+	}
+	// Automatically sign in the primary imported administrator so entering /console works seamlessly!
+	if adminUser, qErr := sqlx.Get[domain.User](r.Context(), s.deps.Store,
+		`SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
+		domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
+		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		geo := ""
+		if s.deps.Geo != nil {
+			geo = s.deps.Geo.LookupDisplay(clientIP)
+		}
+		if sess, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), adminUser.ID, clientIP, geo, r.UserAgent(), 0); sErr == nil {
+			s.setSessionCookie(w, rawTok)
+			adminUser.PasswordHash = ""
+			adminUser.LegacyHash = ""
+			resp["user"] = adminUser
+			resp["csrf_token"] = s.deps.Auth.ComputeCSRFToken(sess.ID)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
@@ -368,15 +403,15 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Request) (*etl.ImportReport, error) {
+func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Request) (*etl.ImportReport, bool, error) {
 	const maxLegacyBytes = 256 << 20 // 256 MiB streaming cap
 	r.Body = http.MaxBytesReader(w, r.Body, maxLegacyBytes)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		return nil, fmt.Errorf("upload parse error: %w", err)
+		return nil, false, fmt.Errorf("upload parse error: %w", err)
 	}
 	file, hdr, err := r.FormFile("file")
 	if err != nil {
-		return nil, fmt.Errorf("missing multipart 'file' field")
+		return nil, false, fmt.Errorf("missing multipart 'file' field")
 	}
 	defer file.Close()
 
@@ -386,14 +421,14 @@ func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Requ
 	}
 	tmpFile, err := os.CreateTemp(s.deps.Config.DataDir, "volo-legacy-*"+ext)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
 	if _, err := io.Copy(tmpFile, io.LimitReader(file, maxLegacyBytes)); err != nil {
 		_ = tmpFile.Close()
-		return nil, err
+		return nil, false, err
 	}
 	_ = tmpFile.Close()
 
@@ -403,7 +438,7 @@ func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Requ
 		TargetUploadDir: s.deps.Config.UploadDir,
 	})
 	if err != nil {
-		return nil, err
+		return nil, dryRun, err
 	}
-	return rep, nil
+	return rep, dryRun, nil
 }

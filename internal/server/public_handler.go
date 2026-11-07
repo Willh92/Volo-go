@@ -204,7 +204,7 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/reader/logout", s.handleReaderLogout)
 	mux.HandleFunc("/api/v1/reader/claim-guest-comments", s.handleReaderClaimComments)
 
-	// Legacy Bolo-Solo 301 Canonical Skin Routes
+	// Legacy Bolo-Solo 301 Canonical Skin Routes & Compatibility Shims
 	mux.HandleFunc("/archives.html", s.permanentRedirectTo("/archives"))
 	mux.HandleFunc("/tags.html", s.permanentRedirectTo("/tags"))
 	mux.HandleFunc("/categories.html", s.permanentRedirectTo("/categories"))
@@ -213,6 +213,12 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/dynamic.html", s.permanentRedirectTo("/dynamic"))
 	mux.HandleFunc("/category/", s.handleLegacyCategoryRedirect)
 	mux.HandleFunc("/articles/", s.handleLegacyArticleRedirect)
+	mux.HandleFunc("/admin-index.do", s.handleLegacyAdminRedirect)
+	mux.HandleFunc("/admin/index.do", s.handleLegacyAdminRedirect)
+	mux.HandleFunc("/logout", s.handlePublicLogoutRedirect)
+	mux.HandleFunc("/github", s.handlePublicGitHubShowcaseRoute)
+	mux.HandleFunc("/my-github-repos", s.handlePublicGitHubShowcaseRoute)
+	mux.HandleFunc("/images/", s.handleLegacyImageShim)
 
 	// Public Studio HTML Routes
 	mux.HandleFunc("/posts/", s.handlePostRoute)
@@ -249,8 +255,10 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 			!strings.HasPrefix(p, "/api/") &&
 			!strings.HasPrefix(p, "/themes/") &&
 			!strings.HasPrefix(p, "/uploads/") &&
+			!strings.HasPrefix(p, "/images/") &&
 			!strings.HasPrefix(p, "/plugins/") &&
 			!strings.HasPrefix(p, "/avatars/") &&
+			p != "/logout" &&
 			p != "/favicon.svg" &&
 			p != "/favicon.ico" &&
 			p != "/assets/favicon.svg" &&
@@ -1473,4 +1481,93 @@ func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request)
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "reader.login_title") + " · " + pctx.Site.Title
 	pctx.NoIndex = true
 	s.renderStudio(w, r, http.StatusOK, "reader_auth.html", pctx)
+}
+
+func (s *AppServer) handleLegacyAdminRedirect(w http.ResponseWriter, r *http.Request) {
+	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
+	if adminPrefix == "/" {
+		adminPrefix = "/console"
+	}
+	http.Redirect(w, r, adminPrefix, http.StatusFound)
+}
+
+func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Request) {
+	viewer, sess := s.resolveViewer(r)
+	if viewer != nil && sess != nil {
+		_ = s.deps.Auth.RevokeSession(r.Context(), viewer, sess.ID)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (s *AppServer) handlePublicGitHubShowcaseRoute(w http.ResponseWriter, r *http.Request) {
+	var slug string
+	err := s.deps.Store.QueryRowContext(r.Context(),
+		`SELECT slug FROM articles WHERE status = ? AND (slug IN ('github', 'my-github-repos') OR legacy_permalink IN ('/my-github-repos', '/github')) ORDER BY updated_at DESC LIMIT 1`,
+		domain.ArticleStatusPublished).Scan(&slug)
+	if err == nil && slug != "" {
+		http.Redirect(w, r, visibility.ArticlePath(slug), http.StatusFound)
+		return
+	}
+	// If GitHub username is configured, lazily materialize the showcase post on first visit!
+	if strings.TrimSpace(s.deps.Settings.Snapshot().SEO.GitHubUsername) != "" {
+		if art, pErr := s.publishGitHubShowcaseArticle(r.Context(), nil); pErr == nil && art != nil {
+			http.Redirect(w, r, visibility.ArticlePath(art.Slug), http.StatusFound)
+			return
+		}
+	}
+	s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+}
+
+func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	rel := strings.TrimPrefix(r.URL.Path, "/images/")
+	clean := strings.TrimPrefix(path.Clean("/"+rel), "/")
+	if clean == "" || strings.Contains(clean, "..") {
+		http.NotFound(w, r)
+		return
+	}
+	// Serve user-provided static file if placed in uploads/images/ or data/images/
+	for _, baseDir := range []string{s.deps.Config.UploadDir, s.deps.Config.DataDir} {
+		if strings.TrimSpace(baseDir) == "" {
+			continue
+		}
+		cand := filepath.Join(baseDir, "images", filepath.FromSlash(clean))
+		if info, err := os.Stat(cand); err == nil && !info.IsDir() {
+			http.ServeFile(w, r, cand)
+			return
+		}
+	}
+
+	var svg string
+	switch strings.ToLower(clean) {
+	case "github-icon.png", "github-icon-light.svg", "github-icon.svg":
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path fill="#24292f" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></svg>`
+	case "admin-panel.svg":
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.2" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="9" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="2.2" y="9" width="4.8" height="4.8" rx="1"/><rect x="9" y="9" width="4.8" height="4.8" rx="1"/></svg>`
+	case "admin-logout.svg":
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 2.5H3.6A1.4 1.4 0 0 0 2.2 3.9v8.2a1.4 1.4 0 0 0 1.4 1.4h2.6"/><path d="M10.5 11.2 13.8 8l-3.3-3.2"/><path d="M13.8 8H6.2"/></svg>`
+	case "github_repo.jpg", "github_repo.png", "github_repo.svg":
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="800" height="450"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#f7f5ef"/><stop offset="100%" stop-color="#ece8dd"/></linearGradient></defs><rect width="800" height="450" fill="url(#g)"/><g fill="none" stroke="#2f5d50" stroke-opacity="0.16" stroke-width="2"><rect x="44" y="40" width="712" height="370" rx="18"/><line x1="88" y1="120" x2="360" y2="120"/><line x1="88" y1="162" x2="520" y2="162"/><line x1="88" y1="204" x2="460" y2="204"/></g><g transform="translate(560,155) scale(8.5)"><path fill="#2f5d50" fill-opacity="0.82" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></g><text x="88" y="320" font-family="system-ui,-apple-system,sans-serif" font-size="30" font-weight="600" fill="#1e2420">Open Source Showcase</text><text x="88" y="356" font-family="ui-monospace,monospace" font-size="16" fill="#5e6862">GitHub Public Repositories</text></svg>`
+	default:
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(svg))
+	}
 }

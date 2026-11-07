@@ -7,6 +7,7 @@ import {
   syncExternalLocales,
   t,
 } from "../i18n";
+import { ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
 
 export type AppearanceTab = "themes" | "locales" | "plugins";
 
@@ -39,9 +40,11 @@ export function AppearanceWorkspace({
   const [locPacks, setLocPacks] = useState<any[]>([]);
   const [localesDir, setLocalesDir] = useState<string>("");
   const [defaultLocale, setDefaultLocale] = useState<string>("zh-CN");
+  const [locPage, setLocPage] = useState<number>(1);
 
   // Plugins state
   const [plugins, setPlugins] = useState<any[]>([]);
+  const [pluginPage, setPluginPage] = useState<number>(1);
   const [cfgModal, setCfgModal] = useState<any | null>(null);
   const [cfgValues, setCfgValues] = useState<Record<string, any>>({});
   const [logsModal, setLogsModal] = useState<{ id: string; logs: any[] } | null>(null);
@@ -416,7 +419,7 @@ export function AppearanceWorkspace({
                     <td colSpan={5} class="volo-empty-state">{t("tbl.empty")}</td>
                   </tr>
                 ) : (
-                  locPacks.map((p) => {
+                  paginateItems(locPacks, locPage, 12).slice.map((p) => {
                     const isDef = p.code === defaultLocale;
                     const isUI = p.code === curLocale;
                     const srcLabel =
@@ -536,6 +539,7 @@ export function AppearanceWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={locPacks.length} page={locPage} pageSize={12} onChange={setLocPage} />
         </div>
       )}
 
@@ -589,7 +593,7 @@ export function AppearanceWorkspace({
                     <td colSpan={4} class="volo-empty-state">{t("app.plugins_empty")}</td>
                   </tr>
                 ) : (
-                  plugins.map((p) => (
+                  paginateItems(plugins, pluginPage, 12).slice.map((p) => (
                     <tr key={p.id}>
                       <td class="col-fluid">
                         <div class="volo-cell-main">
@@ -699,12 +703,13 @@ export function AppearanceWorkspace({
               </tbody>
             </table>
           </div>
+          <Pagination total={plugins.length} page={pluginPage} pageSize={12} onChange={setPluginPage} />
         </div>
       )}
 
       {themeModal && (
         <div class="volo-modal-backdrop" onClick={() => setThemeModal(null)}>
-          <div class="volo-modal" onClick={(e) => e.stopPropagation()}>
+          <form class="volo-modal" autoComplete="off" onSubmit={(e) => e.preventDefault()} onClick={(e) => e.stopPropagation()}>
             <div class="volo-card-head">
               <h3 class="volo-card-title">
                 {t("app.theme_cfg_title", { name: themeModal.display_name || themeModal.name || themeModal.id })}
@@ -729,17 +734,14 @@ export function AppearanceWorkspace({
                     <span>{f.label || f.key}</span>
                   </label>
                 ) : f.type === "select" && f.options ? (
-                  <select
-                    class="volo-select"
+                  <ConsoleSelect
                     value={String(themeCfgVals[f.key] ?? f.default ?? "")}
-                    onChange={(e) =>
-                      setThemeCfgVals({ ...themeCfgVals, [f.key]: (e.currentTarget as HTMLSelectElement).value })
-                    }
-                  >
-                    {f.options.map((op: any) => (
-                      <option key={op.value} value={op.value}>{op.label || op.value}</option>
-                    ))}
-                  </select>
+                    onChange={(v) => setThemeCfgVals({ ...themeCfgVals, [f.key]: v })}
+                    options={f.options.map((op: any) => ({
+                      value: String(op.value),
+                      label: String(op.label || op.value),
+                    }))}
+                  />
                 ) : f.type === "textarea" ? (
                   <textarea
                     class="volo-textarea"
@@ -753,6 +755,8 @@ export function AppearanceWorkspace({
                   <input
                     type={f.type === "number" ? "number" : "text"}
                     class="volo-input"
+                    name={`theme_opt_${f.key}`}
+                    autoComplete="off"
                     value={themeCfgVals[f.key] ?? f.default ?? ""}
                     onInput={(e) => {
                       const raw = (e.currentTarget as HTMLInputElement).value;
@@ -781,13 +785,13 @@ export function AppearanceWorkspace({
             >
               {t("common.save")}
             </button>
-          </div>
+          </form>
         </div>
       )}
 
       {cfgModal && (
         <div class="volo-modal-backdrop" onClick={() => setCfgModal(null)}>
-          <div class="volo-modal" onClick={(e) => e.stopPropagation()}>
+          <form class="volo-modal" autoComplete="off" onSubmit={(e) => e.preventDefault()} onClick={(e) => e.stopPropagation()}>
             <div class="volo-card-head">
               <h3 class="volo-card-title">{t("app.cfg_title", { name: cfgModal.name || cfgModal.id })}</h3>
               <button type="button" class="volo-btn volo-btn-sm" onClick={() => setCfgModal(null)}>{t("common.close")}</button>
@@ -810,19 +814,20 @@ export function AppearanceWorkspace({
                     <span>{f.label || f.key}</span>
                   </label>
                 ) : f.type === "select" && f.options ? (
-                  <select
-                    class="volo-select"
+                  <ConsoleSelect
                     value={String(cfgValues[f.key] ?? f.default ?? "")}
-                    onChange={(e) => setCfgValues({ ...cfgValues, [f.key]: (e.currentTarget as HTMLSelectElement).value })}
-                  >
-                    {f.options.map((op: any) => (
-                      <option key={op.value} value={op.value}>{op.label || op.value}</option>
-                    ))}
-                  </select>
+                    onChange={(v) => setCfgValues({ ...cfgValues, [f.key]: v })}
+                    options={f.options.map((op: any) => ({
+                      value: String(op.value),
+                      label: String(op.label || op.value),
+                    }))}
+                  />
                 ) : (
                   <input
                     type={f.secret ? "password" : f.type === "number" ? "number" : "text"}
                     class="volo-input"
+                    name={`plugin_cfg_${f.key}`}
+                    autoComplete={f.secret ? "new-password" : "off"}
                     placeholder={f.secret ? "••••••••" : ""}
                     value={cfgValues[f.key] ?? ""}
                     onInput={(e) => {
@@ -848,7 +853,7 @@ export function AppearanceWorkspace({
             >
               {t("common.save")}
             </button>
-          </div>
+          </form>
         </div>
       )}
 

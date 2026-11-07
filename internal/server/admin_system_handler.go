@@ -1,6 +1,7 @@
 package server
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/doctor"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/etl"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
@@ -88,15 +91,45 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case sub == "seo/github-sync" && r.Method == http.MethodPost:
 		var req struct {
-			Username string `json:"username"`
+			Username       string `json:"username"`
+			IncludeForks   *bool  `json:"include_forks"`
+			PublishArticle bool   `json:"publish_article"`
 		}
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
+		if req.IncludeForks != nil {
+			patchForks, _ := json.Marshal(map[string]any{"github_include_forks": *req.IncludeForks})
+			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSEO, patchForks, 0)
+		}
 		repos, err := s.refreshGitHubRepositories(r.Context(), req.Username)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"repos": repos})
+		resp := map[string]any{
+			"repos":            repos,
+			"github_synced_at": s.deps.Settings.Snapshot().SEO.GitHubSyncedAt,
+		}
+		if req.PublishArticle {
+			if art, pErr := s.publishGitHubShowcaseArticle(r.Context(), actor); pErr == nil && art != nil {
+				resp["article_slug"] = art.Slug
+				resp["article_id"] = art.ID
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
+
+	case sub == "seo/github-publish" && r.Method == http.MethodPost:
+		art, err := s.publishGitHubShowcaseArticle(r.Context(), actor)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.recordAuditLog(r, actor, "github.publish_showcase", "article", art.ID, map[string]any{"slug": art.Slug})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"article_id":   art.ID,
+			"article_slug": art.Slug,
+			"article_url":  "/posts/" + art.Slug,
+		})
 
 	case sub == "seo/indexnow-push" && r.Method == http.MethodPost:
 		n, err := s.pushIndexNowURLs(r.Context(), s.publicBaseURL(r))
@@ -143,18 +176,30 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": rows})
 
+	case sub == "backup/local" || strings.HasPrefix(sub, "backup/local/"):
+		s.handleAdminLocalBackups(w, r, actor, strings.TrimPrefix(sub, "backup/local"))
+
 	case sub == "backup/restore" && r.Method == http.MethodPost:
 		s.handleAdminBackupRestore(w, r, actor)
 
 	case sub == "backup/import-legacy" && r.Method == http.MethodPost:
-		rep, err := s.streamLegacyImportUpload(w, r)
+		rep, dryRun, err := s.streamLegacyImportUpload(w, r)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		_ = s.deps.Content.WarmCaches(r.Context())
-		s.recordAuditLog(r, actor, "backup.import_legacy", "system", "etl", nil)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "report": rep})
+		if !dryRun {
+			_, _ = s.deps.Settings.Reload(r.Context())
+			_ = s.deps.Content.WarmCaches(r.Context())
+			if s.deps.WAF != nil {
+				_ = s.deps.WAF.ReloadBans(r.Context())
+			}
+			if s.deps.Geo != nil {
+				_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
+			}
+			s.recordAuditLog(r, actor, "backup.import_legacy", "system", "etl", nil)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "report": rep})
 
 	case sub == "doctor" && r.Method == http.MethodGet:
 		rep := doctor.Run(r.Context(), s.deps.Config, s.deps.Store)
@@ -1404,6 +1449,136 @@ func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+type localBackupItem struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func (s *AppServer) listLocalBackups(backupDir string) []localBackupItem {
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return []localBackupItem{}
+	}
+	items := make([]localBackupItem, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
+			continue
+		}
+		info, iErr := e.Info()
+		if iErr != nil {
+			continue
+		}
+		items = append(items, localBackupItem{
+			Name:      e.Name(),
+			SizeBytes: info.Size(),
+			CreatedAt: info.ModTime().UnixMilli(),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt > items[j].CreatedAt
+	})
+	return items
+}
+
+func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
+	rest = strings.TrimPrefix(rest, "/")
+	backupDir := filepath.Join(s.deps.Config.DataDir, "backups")
+
+	if rest == "" {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, map[string]any{"items": s.listLocalBackups(backupDir)})
+		case http.MethodPost:
+			sched := backup.NewScheduler(backup.SchedulerOptions{
+				Store:          s.deps.Store,
+				Settings:       s.deps.Settings,
+				BackupDir:      backupDir,
+				UploadDir:      s.deps.Config.UploadDir,
+				OutboundDialer: s.deps.OutboundDialer,
+			})
+			res, err := sched.RunOnce(r.Context())
+			if err != nil && (res == nil || res.LocalPath == "") {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			warn := ""
+			if err != nil {
+				warn = err.Error()
+			}
+			s.recordAuditLog(r, actor, "backup.local_snapshot", "system", filepath.Base(res.LocalPath), nil)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":              true,
+				"file":            filepath.Base(res.LocalPath),
+				"pruned_count":    res.PrunedCount,
+				"remote_uploaded": res.RemoteUploaded,
+				"remote_warning":  warn,
+				"items":           s.listLocalBackups(backupDir),
+			})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	base := filepath.Base(rest)
+	if base != rest || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid backup filename"})
+		return
+	}
+	fullPath := filepath.Join(backupDir, base)
+
+	switch r.Method {
+	case http.MethodGet:
+		f, err := os.Open(fullPath)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil || info.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, base))
+		http.ServeContent(w, r, base, info.ModTime(), f)
+	case http.MethodDelete:
+		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		s.recordAuditLog(r, actor, "backup.local_delete", "system", base, nil)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": s.listLocalBackups(backupDir)})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func isLegacyArchiveFile(archivePath string) bool {
+	if strings.HasSuffix(strings.ToLower(archivePath), ".json") {
+		return true
+	}
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return false
+	}
+	defer zr.Close()
+	hasManifest := false
+	hasJSON := false
+	for _, f := range zr.File {
+		name := strings.ToLower(strings.TrimPrefix(filepath.ToSlash(f.Name), "./"))
+		if name == "manifest.json" {
+			hasManifest = true
+		}
+		if strings.HasSuffix(name, ".json") {
+			hasJSON = true
+		}
+	}
+	return !hasManifest && hasJSON
+}
+
 func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Request, actor *domain.User) {
 	const maxRestoreUpload = 512 << 20
 	r.Body = http.MaxBytesReader(w, r.Body, maxRestoreUpload)
@@ -1411,14 +1586,18 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart backup archive"})
 		return
 	}
-	f, _, err := r.FormFile("file")
+	f, hdr, err := r.FormFile("file")
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
 		return
 	}
 	defer f.Close()
 
-	tmp, err := os.CreateTemp(s.deps.Config.DataDir, "volo-restore-*.zip")
+	ext := strings.ToLower(filepath.Ext(hdr.Filename))
+	if ext != ".zip" && ext != ".json" {
+		ext = ".zip"
+	}
+	tmp, err := os.CreateTemp(s.deps.Config.DataDir, "volo-restore-*"+ext)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1434,6 +1613,31 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 	_ = tmp.Close()
 
 	dryRun, _ := strconv.ParseBool(r.FormValue("dry_run"))
+	if isLegacyArchiveFile(tmpPath) {
+		rep, lErr := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, etl.ImportOptions{
+			DryRun:          dryRun,
+			TargetUploadDir: s.deps.Config.UploadDir,
+		})
+		if lErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": lErr.Error()})
+			return
+		}
+		if !dryRun {
+			_, _ = s.deps.Settings.Reload(r.Context())
+			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
+			_ = s.deps.Content.WarmCaches(r.Context())
+			if s.deps.WAF != nil {
+				_ = s.deps.WAF.ReloadBans(r.Context())
+			}
+			if s.deps.Geo != nil {
+				_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
+			}
+			s.recordAuditLog(r, actor, "backup.restore_legacy", "system", "legacy", nil)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "legacy": true, "report": rep})
+		return
+	}
+
 	sum, err := backup.RestoreFromFile(r.Context(), s.deps.Store, tmpPath, backup.RestoreOptions{
 		DryRun:    dryRun,
 		UploadDir: s.deps.Config.UploadDir,

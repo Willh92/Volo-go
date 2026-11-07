@@ -58,6 +58,7 @@ if (bootConfig.locales) {
 export const csrfTokenSig = signal<string>("");
 export const currentUserSig = signal<StaffUser | null>(null);
 export const toastSig = signal<string>("");
+export const busyCountSig = signal<number>(0);
 export const themeModeSig = signal<string>(
   localStorage.getItem("volo_console_theme") || bootConfig.default_theme || "auto"
 );
@@ -71,7 +72,30 @@ export function showToast(msg: string) {
   if (toastTimer) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => {
     toastSig.value = "";
-  }, 3400);
+  }, 3600);
+}
+
+export function pauseToast() {
+  if (toastTimer) {
+    window.clearTimeout(toastTimer);
+    toastTimer = undefined;
+  }
+}
+
+export function resumeToast() {
+  if (!toastSig.value) return;
+  if (toastTimer) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toastSig.value = "";
+  }, 1800);
+}
+
+export function dismissToast() {
+  if (toastTimer) {
+    window.clearTimeout(toastTimer);
+    toastTimer = undefined;
+  }
+  toastSig.value = "";
 }
 
 export function applyThemeAttributes(mode: string, accent: string, persistAccent = false) {
@@ -93,7 +117,7 @@ export function applyThemeAttributes(mode: string, accent: string, persistAccent
     dark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ?? false;
   } else if (cleanMode === "auto") {
     const h = new Date().getHours();
-    dark = h < 6 || h >= 19 || (window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ?? false);
+    dark = h < 7 || h >= 19;
   }
   document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
 }
@@ -120,24 +144,30 @@ export async function apiFetch<T = any>(
   if (csrfTokenSig.value && method !== "GET" && method !== "HEAD") {
     headers.set("X-CSRF-Token", csrfTokenSig.value);
   }
-  const res = await fetch(url, {
-    ...opts,
-    method,
-    headers,
-    credentials: "same-origin",
-  });
-  const ct = res.headers.get("Content-Type") || "";
-  let payload: any = null;
-  if (ct.includes("application/json")) {
-    payload = await res.json().catch(() => null);
-  } else {
-    payload = await res.text().catch(() => "");
+  const trackBusy = !url.endsWith("/articles/preview");
+  if (trackBusy) busyCountSig.value = busyCountSig.value + 1;
+  try {
+    const res = await fetch(url, {
+      ...opts,
+      method,
+      headers,
+      credentials: "same-origin",
+    });
+    const ct = res.headers.get("Content-Type") || "";
+    let payload: any = null;
+    if (ct.includes("application/json")) {
+      payload = await res.json().catch(() => null);
+    } else {
+      payload = await res.text().catch(() => "");
+    }
+    if (!res.ok) {
+      const msg = (payload && typeof payload === "object" && payload.error) || `HTTP ${res.status}`;
+      throw new ApiError(res.status, msg, payload);
+    }
+    return payload as T;
+  } finally {
+    if (trackBusy) busyCountSig.value = Math.max(0, busyCountSig.value - 1);
   }
-  if (!res.ok) {
-    const msg = (payload && typeof payload === "object" && payload.error) || `HTTP ${res.status}`;
-    throw new ApiError(res.status, msg, payload);
-  }
-  return payload as T;
 }
 
 export async function refreshMe(): Promise<StaffUser | null> {

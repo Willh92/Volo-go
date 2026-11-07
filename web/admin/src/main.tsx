@@ -6,9 +6,13 @@ import {
   apiFetch,
   applyThemeAttributes,
   bootConfig,
+  busyCountSig,
   csrfTokenSig,
   currentUserSig,
+  dismissToast,
+  pauseToast,
   refreshMe,
+  resumeToast,
   themeModeSig,
   toastSig,
 } from "./api";
@@ -21,6 +25,7 @@ import {
   t,
 } from "./i18n";
 import { BrandLogo } from "./components/BrandLogo";
+import { LocalePopover } from "./components/UIControls";
 import { SetupWizard } from "./views/SetupWizard";
 import { LoginView } from "./views/LoginView";
 import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
@@ -63,6 +68,7 @@ const SECTION_LABEL_KEYS: Record<NavSection, string> = {
   nav_redirects: "nav.nav_redirects",
   media: "nav.media",
   feed_seo: "nav.feed_seo",
+  github: "nav.github",
   links: "nav.links",
   follows: "nav.follows",
   webhooks: "nav.webhooks",
@@ -124,6 +130,7 @@ const SIDEBAR_ENTRIES: NavEntry[] = [
     icon: "distribute",
     children: [
       { section: "feed_seo", labelKey: "nav.feed_seo", adminOnly: true },
+      { section: "github", labelKey: "nav.github", adminOnly: true },
       { section: "links", labelKey: "nav.links" },
       { section: "follows", labelKey: "nav.follows" },
       { section: "webhooks", labelKey: "nav.webhooks", adminOnly: true },
@@ -171,33 +178,33 @@ function NavIcon({ name }: { name: string }) {
   switch (name) {
     case "home":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 10.5L12 3l9 7.5" />
           <path d="M5.5 9.5V20h13V9.5" />
         </svg>
       );
     case "posts":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 20h9" />
           <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
         </svg>
       );
     case "comments":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
         </svg>
       );
     case "content":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
         </svg>
       );
     case "distribute":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M4 11a9 9 0 0 1 9 9" />
           <path d="M4 4a16 16 0 0 1 16 16" />
           <circle cx="5" cy="19" r="1.5" fill="currentColor" />
@@ -205,7 +212,7 @@ function NavIcon({ name }: { name: string }) {
       );
     case "appearance":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="13.5" cy="6.5" r=".8" fill="currentColor" />
           <circle cx="17.5" cy="10.5" r=".8" fill="currentColor" />
           <circle cx="8.5" cy="7.5" r=".8" fill="currentColor" />
@@ -215,7 +222,7 @@ function NavIcon({ name }: { name: string }) {
       );
     case "settings":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <line x1="4" y1="6" x2="20" y2="6" />
           <line x1="4" y1="12" x2="20" y2="12" />
           <line x1="4" y1="18" x2="20" y2="18" />
@@ -226,11 +233,33 @@ function NavIcon({ name }: { name: string }) {
       );
     default:
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
         </svg>
       );
   }
+}
+
+function ToastBanner() {
+  if (!toastSig.value) return null;
+  return (
+    <div
+      class="volo-toast"
+      role="status"
+      onMouseEnter={pauseToast}
+      onMouseLeave={resumeToast}
+    >
+      <span>{toastSig.value}</span>
+      <button
+        type="button"
+        class="volo-toast-close"
+        aria-label={t("common.close")}
+        onClick={dismissToast}
+      >
+        ×
+      </button>
+    </div>
+  );
 }
 
 function findParentGroup(sec: NavSection): string | null {
@@ -249,7 +278,7 @@ function App() {
     posts: true,
     content: true,
   });
-  const [openPopover, setOpenPopover] = useState<"mode" | "accent" | null>(null);
+  const [appearanceOpen, setAppearanceOpen] = useState<boolean>(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
 
   const curLocale = localeSig.value;
@@ -257,6 +286,7 @@ function App() {
   const user = currentUserSig.value;
   const curMode = themeModeSig.value;
   const curAccent = accentSig.value;
+  const isBusy = busyCountSig.value > 0;
 
   const navigateTo = (rawSec: string) => {
     const next = (rawSec in SECTION_LABEL_KEYS ? rawSec : "dashboard") as NavSection;
@@ -278,7 +308,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const onDocClick = () => setOpenPopover(null);
+    const onDocClick = () => setAppearanceOpen(false);
     document.addEventListener("click", onDocClick);
     return () => document.removeEventListener("click", onDocClick);
   }, []);
@@ -299,8 +329,9 @@ function App() {
   if (bootConfig.mode === "setup") {
     return (
       <>
+        <div class={`volo-top-progress ${isBusy ? "is-busy" : ""}`} />
         <SetupWizard />
-        {toastSig.value && <div class="volo-toast">{toastSig.value}</div>}
+        <ToastBanner />
       </>
     );
   }
@@ -308,6 +339,7 @@ function App() {
   if (!ready) {
     return (
       <div class="volo-center-stage">
+        <div class="volo-top-progress is-busy" />
         <span class="volo-help">{t("shell.loading")}</span>
       </div>
     );
@@ -316,8 +348,9 @@ function App() {
   if (!user) {
     return (
       <>
+        <div class={`volo-top-progress ${isBusy ? "is-busy" : ""}`} />
         <LoginView />
-        {toastSig.value && <div class="volo-toast">{toastSig.value}</div>}
+        <ToastBanner />
       </>
     );
   }
@@ -328,6 +361,8 @@ function App() {
 
   return (
     <div class="volo-shell">
+      <div class={`volo-top-progress ${isBusy ? "is-busy" : ""}`} />
+
       {mobileMenuOpen && (
         <div class="volo-mobile-backdrop" onClick={() => setMobileMenuOpen(false)} />
       )}
@@ -377,6 +412,7 @@ function App() {
                 <button
                   type="button"
                   class="volo-nav-group-btn"
+                  aria-expanded={isOpen}
                   onClick={() =>
                     setOpenGroups((prev) => ({ ...prev, [entry.id]: !prev[entry.id] }))
                   }
@@ -385,17 +421,18 @@ function App() {
                     <NavIcon name={entry.icon} />
                     <span>{t(entry.labelKey)}</span>
                   </span>
-                  <svg class="volo-nav-chev" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <svg class="volo-nav-chev" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <polyline points="7 5 13 10 7 15" />
                   </svg>
                 </button>
 
-                {isOpen && (
+                <div class="volo-nav-sub-wrap" aria-hidden={!isOpen}>
                   <div class="volo-nav-sub">
                     {visibleChildren.map((child) => (
                       <button
                         key={child.section}
                         type="button"
+                        tabIndex={isOpen ? 0 : -1}
                         class={`volo-nav-btn ${section === child.section ? "active" : ""}`}
                         onClick={() => navigateTo(child.section)}
                       >
@@ -403,7 +440,7 @@ function App() {
                       </button>
                     ))}
                   </div>
-                )}
+                </div>
               </div>
             );
           })}
@@ -427,7 +464,7 @@ function App() {
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
               aria-label={t("shell.console_title")}
             >
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                 <line x1="4" y1="7" x2="20" y2="7" />
                 <line x1="4" y1="12" x2="20" y2="12" />
                 <line x1="4" y1="17" x2="20" y2="17" />
@@ -440,98 +477,81 @@ function App() {
           </div>
 
           <div class="volo-topbar-actions">
-            {/* 4-Mode Popover */}
+            {/* Unified Appearance Popover (4 Modes + 6 Circular Accent Swatches) */}
             <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
               <button
                 type="button"
-                class="volo-icon-btn"
-                title={`${t("shell.mode_title")}: ${t(`mode.${curMode}`)}`}
-                onClick={() => setOpenPopover(openPopover === "mode" ? null : "mode")}
+                class="volo-appearance-trigger"
+                title={`${t("shell.appearance_title")}: ${t(`mode.${curMode}`)} · ${t(`accent.${curAccent}`)}`}
+                onClick={() => setAppearanceOpen((p) => !p)}
               >
                 {curMode === "dark" ? (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" />
                   </svg>
                 ) : (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                     <circle cx="12" cy="12" r="4.5" />
                     <path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6" />
                   </svg>
                 )}
+                <span class="volo-swatch-dot" style={{ background: activeSwatch, width: "12px", height: "12px" }} />
               </button>
-              {openPopover === "mode" && (
-                <div class="volo-pop-menu">
+
+              {appearanceOpen && (
+                <div class="volo-pop-menu volo-appearance-pop">
                   <div class="volo-pop-caption">{t("shell.mode_title")}</div>
-                  {MODE_OPTIONS.map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      class={`volo-pop-item ${curMode === m ? "active" : ""}`}
-                      onClick={() => {
-                        applyThemeAttributes(m, curAccent, false);
-                        setOpenPopover(null);
-                      }}
-                    >
-                      <span>{t(`mode.${m}`)}</span>
-                      {curMode === m && <span>✓</span>}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+                  <div class="volo-mode-grid">
+                    {MODE_OPTIONS.map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        class={`volo-pop-item ${curMode === m ? "active" : ""}`}
+                        onClick={() => applyThemeAttributes(m, curAccent, false)}
+                      >
+                        <span>{t(`mode.${m}`)}</span>
+                        {curMode === m && <span>✓</span>}
+                      </button>
+                    ))}
+                  </div>
 
-            {/* 6-Accent Swatch Popover */}
-            <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
-              <button
-                type="button"
-                class="volo-icon-btn"
-                title={`${t("shell.accent_title")}: ${t(`accent.${curAccent}`)}`}
-                onClick={() => setOpenPopover(openPopover === "accent" ? null : "accent")}
-              >
-                <span class="volo-swatch-dot" style={{ background: activeSwatch }} />
-              </button>
-              {openPopover === "accent" && (
-                <div class="volo-pop-menu">
+                  <div class="volo-pop-divider" />
                   <div class="volo-pop-caption">{t("shell.accent_title")}</div>
-                  {ACCENT_OPTIONS.map((ac) => (
-                    <button
-                      key={ac.id}
-                      type="button"
-                      class={`volo-pop-item ${curAccent === ac.id ? "active" : ""}`}
-                      onClick={() => {
-                        applyThemeAttributes(curMode, ac.id, true);
-                        setOpenPopover(null);
-                      }}
-                    >
-                      <span style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
-                        <span class="volo-swatch-dot" style={{ background: ac.swatch, width: "13px", height: "13px" }} />
-                        <span>{t(`accent.${ac.id}`)}</span>
-                      </span>
-                      {curAccent === ac.id && <span>✓</span>}
-                    </button>
-                  ))}
+                  <div class="volo-accent-row">
+                    {ACCENT_OPTIONS.map((ac) => {
+                      const isAct = curAccent === ac.id;
+                      return (
+                        <button
+                          key={ac.id}
+                          type="button"
+                          class={`volo-accent-dot-btn ${isAct ? "active" : ""}`}
+                          style={{ background: ac.swatch }}
+                          title={t(`accent.${ac.id}`)}
+                          aria-label={t(`accent.${ac.id}`)}
+                          onClick={() => applyThemeAttributes(curMode, ac.id, true)}
+                        >
+                          {isAct && <span>✓</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>
 
-            {/* Language Switcher */}
-            <select
-              class="volo-select"
-              style={{ width: "112px", height: "36px", borderRadius: "999px", padding: "0 12px" }}
+            {/* Scalable Language Popover */}
+            <LocalePopover
               value={localeSig.value}
-              onChange={async (e) => {
-                const next = normalizeLocale((e.currentTarget as HTMLSelectElement).value);
+              locales={locales}
+              onChange={async (nextRaw) => {
+                const next = normalizeLocale(nextRaw);
                 await ensureLocaleLoaded(next);
                 await apiFetch("/api/admin/me", {
                   method: "PATCH",
                   body: JSON.stringify({ preferred_locale: next }),
                 }).catch(() => {});
               }}
-            >
-              {locales.map((loc) => (
-                <option key={loc.code} value={loc.code}>{loc.name}</option>
-              ))}
-            </select>
+            />
 
             {/* Open Public Blog */}
             <a class="volo-site-pill" href="/" target="_blank" rel="noreferrer">
@@ -564,7 +584,7 @@ function App() {
                 csrfTokenSig.value = "";
               }}
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
                 <polyline points="16 17 21 12 16 7" />
                 <line x1="21" y1="12" x2="9" y2="12" />
@@ -590,6 +610,7 @@ function App() {
 
           {(section === "nav_redirects" ||
             section === "feed_seo" ||
+            section === "github" ||
             section === "links" ||
             section === "follows" ||
             section === "webhooks") && (
@@ -612,7 +633,7 @@ function App() {
         </main>
       </div>
 
-      {toastSig.value && <div class="volo-toast">{toastSig.value}</div>}
+      <ToastBanner />
     </div>
   );
 }

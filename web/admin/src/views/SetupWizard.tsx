@@ -1,6 +1,16 @@
 import { useEffect, useState } from "preact/hooks";
-import { accentSig, apiFetch, applyThemeAttributes, bootConfig, showToast, themeModeSig } from "../api";
+import {
+  accentSig,
+  apiFetch,
+  applyThemeAttributes,
+  bootConfig,
+  csrfTokenSig,
+  currentUserSig,
+  showToast,
+  themeModeSig,
+} from "../api";
 import { BrandLogo } from "../components/BrandLogo";
+import { ConsoleSelect, LocalePopover } from "../components/UIControls";
 import {
   availableLocalesSig,
   ensureLocaleLoaded,
@@ -122,13 +132,14 @@ export function SetupWizard() {
         method: "POST",
         body: fd,
       });
+      if (res.user) currentUserSig.value = res.user;
+      if (res.csrf_token) csrfTokenSig.value = res.csrf_token;
       setEtlResult(res.report || res);
       showToast(t("setup.legacy_done"));
-      if (res.admin_path) {
-        window.setTimeout(() => {
-          window.location.href = res.admin_path;
-        }, 1200);
-      }
+      const nextUrl = res.admin_path || bootConfig.admin_path || "/console";
+      window.setTimeout(() => {
+        window.location.href = nextUrl;
+      }, 1100);
     } catch (err: any) {
       showToast(err.message);
     } finally {
@@ -147,22 +158,17 @@ export function SetupWizard() {
               <div class="volo-help">{t("setup.subtitle")}</div>
             </div>
           </div>
-          <select
-            class="volo-select"
-            style={{ width: "124px" }}
+          <LocalePopover
             value={localeSig.value}
-            onChange={(e) => {
+            locales={locales}
+            onChange={(nextRaw) => {
               const prev = localeSig.value;
-              const next = normalizeLocale((e.currentTarget as HTMLSelectElement).value);
+              const next = normalizeLocale(nextRaw);
               void ensureLocaleLoaded(next).then(() => {
                 syncLocalizedDefaults(prev, next);
               });
             }}
-          >
-            {locales.map((loc) => (
-              <option key={loc.code} value={loc.code}>{loc.name}</option>
-            ))}
-          </select>
+          />
         </div>
 
         <div class="volo-subtabs">
@@ -175,22 +181,28 @@ export function SetupWizard() {
         </div>
 
         {tab === "fresh" ? (
-          <form onSubmit={submitFresh}>
+          <form onSubmit={submitFresh} autoComplete="off">
             <div class="volo-card" style={{ padding: "14px", marginBottom: "14px" }}>
               <div style={{ fontWeight: 650, marginBottom: "10px" }}>{t("setup.step1")}</div>
               <div class="volo-grid-2">
                 <div class="volo-field">
                   <label>{t("setup.dialect")}</label>
-                  <select class="volo-select" value={driver} onChange={(e) => setDriver((e.currentTarget as HTMLSelectElement).value)}>
-                    <option value="sqlite">{t("setup.dialect_sqlite")}</option>
-                    <option value="postgres">{t("setup.dialect_postgres")}</option>
-                    <option value="mysql">{t("setup.dialect_mysql")}</option>
-                  </select>
+                  <ConsoleSelect
+                    value={driver}
+                    onChange={(v) => setDriver(v)}
+                    options={[
+                      { value: "sqlite", label: t("setup.dialect_sqlite") },
+                      { value: "postgres", label: t("setup.dialect_postgres") },
+                      { value: "mysql", label: t("setup.dialect_mysql") },
+                    ]}
+                  />
                 </div>
                 <div class="volo-field">
                   <label>{t("setup.dsn")}</label>
                   <input
                     class="volo-input"
+                    name="setup_db_dsn_str"
+                    autoComplete="off"
                     value={dsn}
                     onInput={(e) => setDsn((e.currentTarget as HTMLInputElement).value)}
                     placeholder={driver === "sqlite" ? "./data/volo.db" : driver === "postgres" ? "postgres://..." : "user:pass@tcp(host:3306)/volo"}
@@ -203,7 +215,7 @@ export function SetupWizard() {
                   {t("setup.simple_proto")}
                 </label>
               )}
-              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
                 <button type="button" class="volo-btn volo-btn-sm" disabled={busy} onClick={testDB}>
                   {t("setup.test_db")}
                 </button>
@@ -214,36 +226,58 @@ export function SetupWizard() {
             <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("setup.site_title")}</label>
-                <input class="volo-input" required value={siteTitle} onInput={(e) => setSiteTitle((e.currentTarget as HTMLInputElement).value)} />
+                <input
+                  class="volo-input"
+                  name="setup_blog_title"
+                  required
+                  value={siteTitle}
+                  onInput={(e) => setSiteTitle((e.currentTarget as HTMLInputElement).value)}
+                />
               </div>
               <div class="volo-field">
                 <label>{t("setup.timezone")}</label>
-                <input class="volo-input" value={timezone} onInput={(e) => setTimezone((e.currentTarget as HTMLInputElement).value)} />
+                <input
+                  class="volo-input"
+                  name="setup_tz_iana"
+                  value={timezone}
+                  onInput={(e) => setTimezone((e.currentTarget as HTMLInputElement).value)}
+                />
               </div>
             </div>
 
             <div class="volo-field">
               <label>{t("setup.site_subtitle")}</label>
-              <input class="volo-input" value={siteSubtitle} onInput={(e) => setSiteSubtitle((e.currentTarget as HTMLInputElement).value)} />
+              <input
+                class="volo-input"
+                name="setup_blog_subtitle"
+                value={siteSubtitle}
+                onInput={(e) => setSiteSubtitle((e.currentTarget as HTMLInputElement).value)}
+              />
             </div>
 
             <div class="volo-field">
               <label>{t("setup.studio_accent")}</label>
-              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                {ACCENTS.map((ac) => (
-                  <button
-                    key={ac.id}
-                    type="button"
-                    class={`volo-btn volo-btn-sm ${accent === ac.id ? "volo-btn-primary" : ""}`}
-                    onClick={() => {
-                      setAccent(ac.id);
-                      applyThemeAttributes(themeModeSig.value, ac.id, true);
-                    }}
-                  >
-                    <span class="volo-swatch-dot" style={{ background: ac.swatch, width: "11px", height: "11px" }} />
-                    {t(`accent.${ac.id}`)}
-                  </button>
-                ))}
+              <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", paddingTop: "2px" }}>
+                {ACCENTS.map((ac) => {
+                  const isAct = accent === ac.id;
+                  return (
+                    <button
+                      key={ac.id}
+                      type="button"
+                      class={`volo-accent-dot-btn ${isAct ? "active" : ""}`}
+                      style={{ background: ac.swatch }}
+                      title={t(`accent.${ac.id}`)}
+                      aria-label={t(`accent.${ac.id}`)}
+                      onClick={() => {
+                        setAccent(ac.id);
+                        applyThemeAttributes(themeModeSig.value, ac.id, true);
+                      }}
+                    >
+                      {isAct && <span>✓</span>}
+                    </button>
+                  );
+                })}
+                <span class="volo-help" style={{ marginLeft: "4px" }}>{t(`accent.${accent}`)}</span>
               </div>
             </div>
 
@@ -252,23 +286,46 @@ export function SetupWizard() {
             <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("setup.admin_username")}</label>
-                <input class="volo-input" required value={username} onInput={(e) => setUsername((e.currentTarget as HTMLInputElement).value)} />
+                <input
+                  class="volo-input"
+                  name="setup_owner_handle"
+                  autoComplete="off"
+                  required
+                  value={username}
+                  onInput={(e) => setUsername((e.currentTarget as HTMLInputElement).value)}
+                />
               </div>
               <div class="volo-field">
                 <label>{t("setup.display_name")}</label>
-                <input class="volo-input" value={displayName} onInput={(e) => setDisplayName((e.currentTarget as HTMLInputElement).value)} />
+                <input
+                  class="volo-input"
+                  name="setup_owner_nick"
+                  autoComplete="off"
+                  value={displayName}
+                  onInput={(e) => setDisplayName((e.currentTarget as HTMLInputElement).value)}
+                />
               </div>
             </div>
             <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("setup.admin_email")}</label>
-                <input type="email" class="volo-input" required value={email} onInput={(e) => setEmail((e.currentTarget as HTMLInputElement).value)} />
+                <input
+                  type="email"
+                  class="volo-input"
+                  name="setup_owner_email"
+                  autoComplete="off"
+                  required
+                  value={email}
+                  onInput={(e) => setEmail((e.currentTarget as HTMLInputElement).value)}
+                />
               </div>
               <div class="volo-field">
                 <label>{t("setup.admin_password")}</label>
                 <input
                   type="password"
                   class="volo-input"
+                  name="setup_owner_new_pwd"
+                  autoComplete="new-password"
                   required
                   minLength={6}
                   value={password}
@@ -295,6 +352,7 @@ export function SetupWizard() {
                 onChange={(e) => {
                   const f = (e.currentTarget as HTMLInputElement).files?.[0];
                   if (f) void handleLegacyUpload(f);
+                  (e.currentTarget as HTMLInputElement).value = "";
                 }}
               />
             </label>
