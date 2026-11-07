@@ -111,6 +111,10 @@ jobs:
           cp -r plugins "dist/${STAGE}/plugins"
           cp -r themes "dist/${STAGE}/themes"
 
+          if [ "${GOOS}" = "windows" ]; then
+            python3 -c 'import sys; p, v = sys.argv[1], sys.argv[2]; lines = ["@echo off", "chcp 65001 >nul", "cd /d \"%~dp0\"", "echo ==========================================================", f"echo   Volo-go {v} Local Server Starting on 127.0.0.1:8080", "echo ==========================================================", "start \"\" \"http://127.0.0.1:8080\"", "\"%~dp0volo.exe\" serve --listen-addr 127.0.0.1:8080", "pause", ""]; open(p, "wb").write("\r\n".join(lines).encode("ascii"))' "dist/${STAGE}/start-volo.bat" "${VERSION}"
+          fi
+
           cd dist
           if [ "${{ matrix.archive }}" = "zip" ]; then
             zip -rq "${STAGE}.zip" "${STAGE}"
