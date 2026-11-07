@@ -1,6 +1,6 @@
 {{define "sidebar"}}
 <aside class="studio-sidebar">
-  {{if and (ne .CurrentPath "/") .Site.NoticeBoard}}
+  {{if and (not .IsHome) .Site.NoticeBoard}}
     <section class="sidebar-card">
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.notice"}}</h3>
       <div class="sidebar-notice-text">{{.Site.NoticeBoard}}</div>
@@ -10,10 +10,10 @@
   <section class="sidebar-card">
     <h3 class="sidebar-card__title">{{t .Locale "studio.links_and_feeds"}}</h3>
     <div class="studio-side-links">
-      <a href="/links"><span>{{t .Locale "nav.links"}}</span><span>→</span></a>
-      <a href="/follows"><span>{{t .Locale "nav.follows"}}</span><span>→</span></a>
-      <a href="/books"><span>{{t .Locale "nav.bookshelf"}}</span><span>→</span></a>
-      <a href="/rss.xml" data-no-pjax><span>{{t .Locale "footer.rss"}}</span><span>↗</span></a>
+      <a href="/links"><span>{{t .Locale "studio.friend_links"}}</span><span class="studio-side-arrow" aria-hidden="true">→</span></a>
+      <a href="/follows"><span>{{t .Locale "studio.my_follows"}}</span><span class="studio-side-arrow" aria-hidden="true">→</span></a>
+      <a href="/books"><span>{{t .Locale "bookshelf.title"}}</span><span class="studio-side-arrow" aria-hidden="true">→</span></a>
+      <a href="/rss.xml" data-no-pjax><span>{{t .Locale "studio.subscribe_rss"}}</span><span class="studio-side-arrow" aria-hidden="true">↗</span></a>
     </div>
   </section>
 
@@ -43,14 +43,25 @@
     </section>
   {{end}}
 
-  {{if .RecentComments}}
+  {{if .MostCommentedPosts}}
     <section class="sidebar-card">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.most_commented"}}</h3>
+      <ul class="studio-side-articles">
+        {{range .MostCommentedPosts}}
+          <li><a href="{{.URL}}" title="{{.Title}}">{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</a></li>
+        {{end}}
+      </ul>
+    </section>
+  {{end}}
+
+  {{if and .IsHome .Viewer (eq .Viewer.Role "admin") .RecentComments}}
+    <section class="sidebar-card studio-recent-comments">
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.recent_comments"}}</h3>
       <ul class="studio-side-articles">
         {{range .RecentComments}}
           <li>
             <a href="{{.TargetURL}}" title="{{.Excerpt}}">
-              <strong style="color:var(--volo-text)">{{.AuthorName}}：</strong>{{.Excerpt}}
+              <strong>{{.AuthorName}}：</strong><span>{{.Excerpt}}</span>
             </a>
           </li>
         {{end}}
@@ -68,6 +79,9 @@
     {{else if .Card.CoverURL}}
       <img src="{{.Card.CoverURL}}" alt="" loading="lazy" decoding="async" width="320" height="214" data-cover-img="1">
       <span class="studio-cover-fallback" hidden>{{coverSVG .Card.Slug false}}</span>
+    {{else if or (eq .Card.Slug "github") (eq .Card.Slug "my-github-repos")}}
+      <img src="/images/github_repo.jpg" alt="" loading="lazy" decoding="async" width="320" height="214" data-cover-img="1">
+      <span class="studio-cover-fallback" hidden>{{coverSVG .Card.Slug false}}</span>
     {{else}}
       {{coverSVG .Card.Slug false}}
     {{end}}
@@ -82,19 +96,84 @@
   </div>
   <h2 class="article__title"><a rel="bookmark" href="{{.Card.URL}}">{{.Card.Title}}</a></h2>
   <p class="studio-abstract">{{.Card.Summary}}</p>
-  <div class="studio-post-foot">
-    <span class="studio-post-tags">
-      {{if .Card.Tags}}
+  {{if or .Card.CategoryName .Card.Tags}}
+    <div class="studio-post-foot">
+      <span class="studio-post-tags">
+        {{if .Card.CategoryName}}
+          <a class="studio-cat-chip" href="/categories/{{.Card.CategorySlug}}">{{.Card.CategoryName}}</a>
+        {{end}}
         {{range .Card.Tags}}
           <a href="/tags/{{.Slug}}"># {{.Name}}</a>
         {{end}}
-      {{else if .Card.CategoryName}}
-        <a href="/categories/{{.Card.CategorySlug}}"># {{.Card.CategoryName}}</a>
-      {{end}}
-    </span>
-    <a class="article__more" href="{{.Card.URL}}" aria-label="{{t .Locale "studio.read_more"}} {{.Card.Title}}">{{t .Locale "studio.read_more"}} <span aria-hidden="true">↗</span></a>
-  </div>
+      </span>
+    </div>
+  {{end}}
 </article>
+{{end}}
+
+{{define "empty_state"}}
+<div class="studio-empty">
+  <div class="studio-empty__icon" aria-hidden="true">
+    <svg viewBox="0 0 48 48" width="42" height="42" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="9" y="7" width="30" height="34" rx="6"/>
+      <path d="M16 17h16M16 24h16M16 31h10"/>
+      <circle cx="35" cy="34" r="7" fill="var(--volo-surface)"/>
+      <path d="M35 31v3.5l2.2 1.5"/>
+    </svg>
+  </div>
+  <h2>{{.Title}}</h2>
+  <p>{{.Desc}}</p>
+</div>
+{{end}}
+
+{{define "comment_mount"}}
+<section id="volo-comments" class="volo-comments-card"
+         data-target-type="{{.TargetType}}"
+         data-target-id="{{.TargetID}}"
+         data-access-mode="{{.Ctx.Reading.CommentAccessMode}}"
+         data-is-logged="{{if .Ctx.Viewer}}true{{else}}false{{end}}"
+         data-viewer-id="{{if .Ctx.Viewer}}{{.Ctx.Viewer.ID}}{{end}}"
+         data-viewer-name="{{if .Ctx.Viewer}}{{coalesce .Ctx.Viewer.DisplayName .Ctx.Viewer.Username}}{{end}}"
+         data-viewer-role="{{if .Ctx.Viewer}}{{.Ctx.Viewer.Role}}{{end}}"
+         data-viewer-avatar="{{if .Ctx.Viewer}}{{.Ctx.Viewer.AvatarURL}}{{end}}"
+         data-csrf-token="{{.Ctx.ViewerCSRFToken}}"
+         data-l-title="{{t .Ctx.Locale "comment.section_title" (dict "count" .CommentCount)}}"
+         data-l-trigger="{{t .Ctx.Locale "comment.trigger_prompt"}}"
+         data-l-nick="{{t .Ctx.Locale "comment.nickname"}}"
+         data-l-email="{{t .Ctx.Locale "comment.email_private"}}"
+         data-l-site="{{t .Ctx.Locale "comment.website"}}"
+         data-l-ph="{{t .Ctx.Locale "comment.placeholder"}}"
+         data-l-submit="{{t .Ctx.Locale "comment.submit"}}"
+         data-l-save="{{t .Ctx.Locale "comment.save_edit"}}"
+         data-l-cancel="{{t .Ctx.Locale "comment.cancel"}}"
+         data-l-pow="{{t .Ctx.Locale "comment.submitting_pow"}}"
+         data-l-pending="{{t .Ctx.Locale "comment.pending_notice"}}"
+         data-l-pending-badge="{{t .Ctx.Locale "comment.pending_badge"}}"
+         data-l-regonly="{{t .Ctx.Locale "comment.registered_only"}}"
+         data-l-reply="{{t .Ctx.Locale "comment.reply"}}"
+         data-l-edit="{{t .Ctx.Locale "comment.edit"}}"
+         data-l-del="{{t .Ctx.Locale "comment.delete"}}"
+         data-l-author="{{t .Ctx.Locale "comment.author_badge"}}"
+         data-l-guest-as="{{t .Ctx.Locale "comment.guest_as" (dict "name" "{name}")}}"
+         data-l-edit-profile="{{t .Ctx.Locale "comment.edit_profile"}}"
+         data-l-write="{{t .Ctx.Locale "comment.tab_write"}}"
+         data-l-preview="{{t .Ctx.Locale "comment.tab_preview"}}"
+         data-l-preview-empty="{{t .Ctx.Locale "comment.preview_empty"}}"
+         data-l-editing="{{t .Ctx.Locale "comment.editing_badge"}}"
+         data-l-replying="{{t .Ctx.Locale "comment.replying_to" (dict "name" "{name}")}}"
+         data-l-empty="{{t .Ctx.Locale "comment.empty_list"}}"
+         data-l-shortcut="{{t .Ctx.Locale "comment.shortcut_submit"}}"
+         data-l-approve="{{t .Ctx.Locale "comment.mod_approve"}}"
+         data-l-ban="{{t .Ctx.Locale "comment.mod_ban_ip"}}"
+         data-l-ban-title="{{t .Ctx.Locale "comment.ban_modal_title"}}"
+         data-l-ban-24h="{{t .Ctx.Locale "comment.ban_24h"}}"
+         data-l-ban-7d="{{t .Ctx.Locale "comment.ban_7d"}}"
+         data-l-ban-forever="{{t .Ctx.Locale "comment.ban_forever"}}"
+         data-l-ban-reject="{{t .Ctx.Locale "comment.ban_also_reject"}}"
+         data-l-ban-note="{{t .Ctx.Locale "comment.ban_note_ph"}}"
+         data-l-ban-confirm="{{t .Ctx.Locale "comment.ban_confirm"}}"
+         data-l-claim="{{t .Ctx.Locale "comment.claim_guest_prompt" (dict "count" "")}}">
+</section>
 {{end}}
 
 {{define "pagination"}}

@@ -37,10 +37,14 @@ type PublicCommentView struct {
 	AuthorName  string              `json:"author_name"`
 	AuthorURL   string              `json:"author_url,omitempty"`
 	AvatarURL   string              `json:"avatar_url"`
+	AvatarSeed  string              `json:"avatar_seed"`
 	IsAuthor    bool                `json:"is_author,omitempty"`
 	ContentHTML string              `json:"content_html"`
 	ContentMD   string              `json:"content_md,omitempty"` // Only populated when CanEdit==true!
 	GeoRegion   string              `json:"geo_region,omitempty"`
+	IPMasked    string              `json:"ip_masked,omitempty"`    // Only populated for active admin!
+	CanBanIP    bool                `json:"can_ban_ip,omitempty"`   // Only populated for active admin!
+	CanModerate bool                `json:"can_moderate,omitempty"` // Only populated for active admin!
 	Status      string              `json:"status"`
 	CanEdit     bool                `json:"can_edit"`
 	CreatedAt   int64               `json:"created_at"`
@@ -136,11 +140,12 @@ func (s *Service) ListTargetComments(
 	rootIdxByID := make(map[string]int)
 
 	for _, c := range rows {
+		isAdmin := viewer != nil && viewer.Role == domain.RoleAdmin && viewer.Status == domain.UserStatusActive
 		isOwn := canModifyComment(c, callerUserID, callerGuestHash, nowMS)
-		if c.Status != domain.CommentStatusApproved && !isOwn && (viewer == nil || viewer.Role != domain.RoleAdmin) {
+		if c.Status != domain.CommentStatusApproved && !isOwn && !isAdmin {
 			continue
 		}
-		view := s.toPublicCommentView(c, postAuthorID, isOwn)
+		view := s.toPublicCommentView(c, postAuthorID, isOwn || isAdmin, viewer)
 		if strings.TrimSpace(c.ParentID) == "" {
 			rootIdxByID[c.ID] = len(roots)
 			roots = append(roots, view)
@@ -441,7 +446,7 @@ func (s *Service) CreateComment(
 		})
 	}
 
-	return s.toPublicCommentView(record, postAuthorID, true), passportToken, nil
+	return s.toPublicCommentView(record, postAuthorID, true, viewer), passportToken, nil
 }
 
 // UpdateOwnComment edits a comment ONLY if caller owns it via authenticated UserID OR valid
@@ -463,12 +468,16 @@ func (s *Service) UpdateOwnComment(
 		return PublicCommentView{}, err
 	}
 
+	var postAuthorID string
 	// Surface 4: also verify protected article remains unlocked!
 	if existing.TargetType == domain.TargetTypeArticle {
 		raw, aErr := s.GetRawArticleByID(ctx, existing.TargetID)
 		if aErr != nil || !s.guard.CanAccessArticleComments(r, raw, viewer) {
 			return PublicCommentView{}, visibility.ErrProtectedForbidden
 		}
+		postAuthorID = raw.AuthorID
+	} else if existing.TargetType == domain.TargetTypePage {
+		_ = s.store.QueryRowContext(ctx, `SELECT author_id FROM pages WHERE id = ?`, existing.TargetID).Scan(&postAuthorID)
 	}
 
 	var callerGuestHash, callerUserID string
@@ -492,7 +501,7 @@ func (s *Service) UpdateOwnComment(
 	if _, err := s.store.ExecContext(ctx, `UPDATE comments SET content_md = ?, updated_at = ? WHERE id = ?`, trimmed, nowMS, existing.ID); err != nil {
 		return PublicCommentView{}, err
 	}
-	return s.toPublicCommentView(existing, "", true), nil
+	return s.toPublicCommentView(existing, postAuthorID, true, viewer), nil
 }
 
 // DeleteOwnComment soft-deletes a comment ONLY if caller owns it via authenticated UserID OR valid
@@ -603,18 +612,38 @@ func canModifyComment(c domain.Comment, callerUserID string, callerGuestHash str
 	return false
 }
 
-func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, canEdit bool) PublicCommentView {
+func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, canEdit bool, viewer *domain.User) PublicCommentView {
 	out := s.renderer.Render(c.ContentMD, render.Options{
 		Mode: render.RenderModeWeb,
 	})
+	seed := strings.TrimSpace(c.UserID)
+	if seed == "" && len(c.GuestIDHash) >= 16 {
+		seed = c.GuestIDHash[:16]
+	}
+	if seed == "" && len(c.EnvFPHash) >= 16 {
+		seed = c.EnvFPHash[:16]
+	}
+	if seed == "" {
+		seed = c.ID
+	}
+	ownerID := ""
+	if snap := s.caches.chrome.Load(); snap != nil {
+		ownerID = snap.owner.ID
+	}
+	isAuthor := c.UserID != "" && ((postAuthorID != "" && c.UserID == postAuthorID) || (ownerID != "" && c.UserID == ownerID))
+	avatarURL := strings.TrimSpace(c.AvatarURL)
+	if avatarURL == "" {
+		avatarURL = "/avatars/" + seed + ".svg"
+	}
 	view := PublicCommentView{
 		ID:          c.ID,
 		ParentID:    c.ParentID,
 		ReplyToName: c.ReplyToName,
 		AuthorName:  c.AuthorName,
 		AuthorURL:   c.AuthorURL,
-		AvatarURL:   c.AvatarURL,
-		IsAuthor:    c.UserID != "" && postAuthorID != "" && c.UserID == postAuthorID,
+		AvatarURL:   avatarURL,
+		AvatarSeed:  seed,
+		IsAuthor:    isAuthor,
 		ContentHTML: out.HTML,
 		GeoRegion:   c.GeoRegion,
 		Status:      c.Status,
@@ -623,6 +652,11 @@ func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, can
 	}
 	if canEdit {
 		view.ContentMD = c.ContentMD
+	}
+	if viewer != nil && viewer.Role == domain.RoleAdmin && viewer.Status == domain.UserStatusActive {
+		view.IPMasked = c.IPMasked
+		view.CanBanIP = strings.TrimSpace(c.ClientIP) != ""
+		view.CanModerate = true
 	}
 	return view
 }

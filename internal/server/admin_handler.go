@@ -196,6 +196,13 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		s.handleAdminOverview(w, r, actor)
 
+	case sub == "about/project-info":
+		_, _, ok := s.authenticateAdminRequest(w, r, auth.ScopeArticlesRead, false)
+		if !ok {
+			return
+		}
+		s.handleAdminAboutProjectInfo(w, r)
+
 	case sub == "articles" || strings.HasPrefix(sub, "articles/"):
 		patScope := auth.ScopeArticlesWrite
 		if r.Method == http.MethodGet {
@@ -458,9 +465,10 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			"csrf_token":   csrf,
 			"totp_enabled": totpCnt > 0,
 			"passkeys":     pkCnt,
-			"site":         snap.Site,
-			"appearance":   snap.Appearance,
-			"locales":      s.deps.Catalog.Locales(),
+			"site":           snap.Site,
+			"appearance":     snap.Appearance,
+			"storage_driver": snap.Storage.ActiveDriver,
+			"locales":        s.deps.Catalog.Locales(),
 		})
 		return
 	}
@@ -778,9 +786,10 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
+	snap := s.deps.Settings.Snapshot()
 	locale := actor.PreferredLocale
 	if locale == "" {
-		locale = s.deps.Settings.Snapshot().Site.DefaultLocale
+		locale = snap.Site.DefaultLocale
 	}
 	var quickInserts []plugin.EditorQuickInsertView
 	var dashCards []plugin.RenderedSlot
@@ -798,6 +807,61 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		dashCards = []plugin.RenderedSlot{}
 	}
 
+	// 12-month published article trend (dialect-agnostic Go bucketing)
+	type monthBucket struct {
+		Month string `json:"month"`
+		Count int    `json:"count"`
+	}
+	monthKeys := make([]string, 0, 12)
+	monthCounts := make(map[string]int, 12)
+	curMonthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	for i := 11; i >= 0; i-- {
+		m := curMonthStart.AddDate(0, -i, 0).Format("2006-01")
+		monthKeys = append(monthKeys, m)
+		monthCounts[m] = 0
+	}
+	earliestMS := curMonthStart.AddDate(0, -11, 0).UnixMilli()
+	artDates, _ := sqlx.Select[struct {
+		PublishedAt int64 `db:"published_at"`
+		CreatedAt   int64 `db:"created_at"`
+	}](r.Context(), s.deps.Store,
+		`SELECT published_at, created_at FROM articles WHERE status = 'published' AND (published_at >= ? OR created_at >= ?)`,
+		earliestMS, earliestMS)
+	for _, ad := range artDates {
+		ts := ad.PublishedAt
+		if ts <= 0 {
+			ts = ad.CreatedAt
+		}
+		if ts > 0 {
+			ym := time.UnixMilli(ts).In(now.Location()).Format("2006-01")
+			if _, ok := monthCounts[ym]; ok {
+				monthCounts[ym]++
+			}
+		}
+	}
+	monthlyArticles := make([]monthBucket, 0, 12)
+	for _, m := range monthKeys {
+		monthlyArticles = append(monthlyArticles, monthBucket{Month: m, Count: monthCounts[m]})
+	}
+
+	catUsage, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
+	topTags, _ := s.deps.Content.ListTagsWithCounts(r.Context(), 5)
+
+	var recentLogs []domain.AuditLog
+	if actor.Role == domain.RoleAdmin {
+		recentLogs, _ = sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store,
+			`SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 8`)
+	} else {
+		recentLogs, _ = sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store,
+			`SELECT * FROM audit_logs WHERE actor_id = ? ORDER BY created_at DESC LIMIT 8`, actor.ID)
+		for i := range recentLogs {
+			recentLogs[i].ClientIP = ""
+		}
+	}
+	if recentLogs == nil {
+		recentLogs = []domain.AuditLog{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts": map[string]int{
 			"published":        pubCnt,
@@ -813,6 +877,11 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		"analytics_series": series,
 		"top_articles":     topPosts,
 		"top_referers":     topReferers,
+		"monthly_articles": monthlyArticles,
+		"category_usage":   catUsage,
+		"top_tags":         topTags,
+		"notice_board":     snap.Site.NoticeBoard,
+		"recent_logs":      recentLogs,
 		"quick_inserts":    quickInserts,
 		"plugin_cards":     dashCards,
 		"runtime_dialect":  s.deps.Store.Dialect().Name(),
@@ -1607,7 +1676,29 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		}
 		return
 	}
-	if r.Method == http.MethodDelete {
+	switch r.Method {
+	case http.MethodPut:
+		var in domain.Tag
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		name := strings.TrimSpace(in.Name)
+		if name == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+			return
+		}
+		slug := sanitizeSlug(in.Slug)
+		if slug == "" {
+			slug = sanitizeSlug(name)
+		}
+		if _, err := s.deps.Store.ExecContext(r.Context(),
+			`UPDATE tags SET name = ?, slug = ? WHERE id = ?`, name, slug, rest); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case http.MethodDelete:
 		if err := auth.RequireAdmin(actor); err != nil {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 			return
@@ -1618,9 +1709,9 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			return err
 		})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-		return
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
-	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, _ *domain.User, rest string) {
@@ -1629,10 +1720,24 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, _ 
 		switch r.Method {
 		case http.MethodGet:
 			rows, _ := sqlx.Select[domain.Series](r.Context(), s.deps.Store, `SELECT * FROM series ORDER BY sort_order ASC, created_at DESC`)
-			if rows == nil {
-				rows = []domain.Series{}
+			rels, _ := sqlx.Select[domain.SeriesArticle](r.Context(), s.deps.Store, `SELECT * FROM series_articles ORDER BY sort_order ASC`)
+			bySeries := make(map[string][]string)
+			for _, rel := range rels {
+				bySeries[rel.SeriesID] = append(bySeries[rel.SeriesID], rel.ArticleID)
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+			type seriesAdminView struct {
+				domain.Series
+				ArticleIDs []string `json:"article_ids"`
+			}
+			items := make([]seriesAdminView, 0, len(rows))
+			for _, sr := range rows {
+				aids := bySeries[sr.ID]
+				if aids == nil {
+					aids = []string{}
+				}
+				items = append(items, seriesAdminView{Series: sr, ArticleIDs: aids})
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"items": items})
 		case http.MethodPost:
 			var in struct {
 				domain.Series
@@ -1941,6 +2046,47 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if len(parts) == 2 && parts[1] == "ban-ip" && r.Method == http.MethodPost {
+		if err := auth.RequireAdmin(actor); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		targetIP := strings.TrimSpace(cmt.ClientIP)
+		if targetIP == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "comment has no recorded client IP"})
+			return
+		}
+		var req struct {
+			Note          string `json:"note"`
+			ExpiresHours  int    `json:"expires_hours"`
+			RejectComment bool   `json:"reject_comment"`
+		}
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req)
+		note := strings.TrimSpace(req.Note)
+		if note == "" {
+			note = "comment moderation (" + cmt.AuthorName + ")"
+		}
+		var expMS int64
+		if req.ExpiresHours > 0 {
+			expMS = time.Now().Add(time.Duration(req.ExpiresHours) * time.Hour).UnixMilli()
+		}
+		callerIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		rec, bErr := s.deps.WAF.AddManualBan(r.Context(), targetIP, note, expMS, callerIP)
+		if bErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": bErr.Error()})
+			return
+		}
+		if req.RejectComment {
+			_, _ = s.deps.Store.ExecContext(r.Context(),
+				`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+				domain.CommentStatusRejected, time.Now().UnixMilli(), cmtID)
+			s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
+		}
+		s.recordAuditLog(r, actor, "security.comment_ip_ban", "ip_ban", rec.ID, map[string]any{"comment_id": cmtID, "cidr": rec.CIDR})
+		writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "ban": rec})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodPatch:
 		var req struct {
@@ -1992,12 +2138,16 @@ func (s *AppServer) recountTargetComments(ctx context.Context, targetType, targe
 func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "" && r.Method == http.MethodGet {
-		rows, _ := sqlx.Select[domain.MediaAsset](r.Context(), s.deps.Store,
-			`SELECT * FROM media_assets ORDER BY created_at DESC LIMIT 300`)
-		if rows == nil {
-			rows = []domain.MediaAsset{}
+		items, orphanCnt := s.listMediaWithRefs(r.Context(), 500)
+		drv := strings.TrimSpace(s.deps.Settings.Snapshot().Storage.ActiveDriver)
+		if drv == "" {
+			drv = "local"
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":          items,
+			"orphan_count":   orphanCnt,
+			"storage_driver": drv,
+		})
 		return
 	}
 
@@ -2040,16 +2190,22 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			return
 		}
 		clean := r.URL.Query().Get("delete") == "1" || r.URL.Query().Get("delete") == "true"
-		if s.deps.Media != nil {
-			orphans, err := s.deps.Media.ScanOrphans(r.Context(), clean)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"orphans": orphans, "deleted": clean})
+		orphans, freed, err := s.scanOrCleanOrphans(r.Context(), clean)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"orphans": []domain.MediaAsset{}, "deleted": false})
+		deletedCnt := 0
+		if clean {
+			deletedCnt = len(orphans)
+			s.recordAuditLog(r, actor, "media.orphans_clean", "media_asset", "orphans", map[string]any{"deleted_count": deletedCnt, "freed_bytes": freed})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"orphans":       orphans,
+			"deleted":       clean,
+			"deleted_count": deletedCnt,
+			"freed_bytes":   freed,
+		})
 		return
 	}
 

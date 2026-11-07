@@ -1,6 +1,17 @@
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, b64urlToBytes, bytesToB64url, csrfTokenSig, currentUserSig, refreshMe, showToast } from "../api";
-import { ConsoleSelect, Pagination, paginateItems } from "../components/UIControls";
+import {
+  apiFetch,
+  b64urlToBytes,
+  bytesToB64url,
+  csrfTokenSig,
+  currentUserSig,
+  refreshMe,
+  resetConsoleScroll,
+  showToast,
+  storageDriverSig,
+} from "../api";
+import { MediaPickButton } from "../components/MediaLibraryModal";
+import { AnimatedModal, ConsoleSelect, NavIconPreview, Pagination, paginateItems } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, t } from "../i18n";
 
 export type SysTab =
@@ -43,6 +54,31 @@ function formatBytes(bytes: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+function renderSysTabLabel(tab: SysTab): string {
+  switch (tab) {
+    case "settings_site":
+      return t("sys.settings_site");
+    case "settings_io":
+      return t("sys.settings_io");
+    case "users":
+      return t("sys.users");
+    case "backup":
+      return t("sys.backup");
+    case "account":
+      return t("sys.account");
+    case "waf":
+      return t("sys.waf");
+    case "audit":
+      return t("sys.audit");
+  }
+}
+
+function renderRoleLabel(role: string): string {
+  if (role === "admin") return t("role.admin");
+  if (role === "editor") return t("role.editor");
+  return t("role.reader");
+}
+
 export function SystemWorkspace({
   activeTab,
   onNavigate,
@@ -70,19 +106,23 @@ export function SystemWorkspace({
   // Account Security state
   const [meInfo, setMeInfo] = useState<any>(null);
   const [profileForm, setProfileForm] = useState({
+    avatar_url: currentUserSig.value?.avatar_url || "",
     display_name: "",
     bio: "",
     website_url: "",
     current_password: "",
     new_password: "",
   });
+  const [avatarImgErr, setAvatarImgErr] = useState(false);
   const [totpEnroll, setTotpEnroll] = useState<{ secret: string; otpauth_uri: string } | null>(null);
   const [totpCode, setTotpCode] = useState("");
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [passkeys, setPasskeys] = useState<any[]>([]);
+  const [pkModalOpen, setPkModalOpen] = useState(false);
   const [pkName, setPkName] = useState(() => t("sys.pk_default_name"));
   const [sessions, setSessions] = useState<any[]>([]);
   const [tokens, setTokens] = useState<any[]>([]);
+  const [patModalOpen, setPatModalOpen] = useState(false);
   const [patName, setPatName] = useState("Obsidian CLI");
   const [patScopes, setPatScopes] = useState<string[]>(["articles:read", "articles:write", "media:write"]);
   const [issuedPAT, setIssuedPAT] = useState<string>("");
@@ -99,12 +139,37 @@ export function SystemWorkspace({
 
   // Users / WAF / Backup / Audit
   const [users, setUsers] = useState<any[]>([]);
-  const [userForm, setUserForm] = useState({ username: "", email: "", display_name: "", role: "editor", password: "" });
+  const [userRoleFilter, setUserRoleFilter] = useState<"all" | "admin" | "editor" | "reader">("all");
+  const [userQuery, setUserQuery] = useState("");
+  const [userModalOpen, setUserModalOpen] = useState(false);
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [userForm, setUserForm] = useState({
+    username: "",
+    email: "",
+    display_name: "",
+    role: "editor",
+    status: "active",
+    password: "",
+  });
+
   const [bans, setBans] = useState<any[]>([]);
+  const [banModalOpen, setBanModalOpen] = useState(false);
   const [banForm, setBanForm] = useState({ cidr: "", note: "manual", expires_hours: 24 });
+
   const [geoRules, setGeoRules] = useState<any[]>([]);
   const [geoCircuitEnabled, setGeoCircuitEnabled] = useState<boolean>(true);
-  const [geoForm, setGeoForm] = useState({ name: "Geo Rule", action: "deny", countries: "", regions: "", sort_order: 10 });
+  const [geoModalOpen, setGeoModalOpen] = useState(false);
+  const [editingGeoId, setEditingGeoId] = useState<string | null>(null);
+  const [geoForm, setGeoForm] = useState({
+    name: "Geo Rule",
+    action: "deny",
+    countries: "",
+    regions: "",
+    sort_order: 10,
+    is_enabled: true,
+    on_miss: "next",
+  });
+
   const [includeMediaExport, setIncludeMediaExport] = useState<boolean>(true);
   const [dryRunRestore, setDryRunRestore] = useState<boolean>(false);
   const [localBackups, setLocalBackups] = useState<Array<{ name: string; size_bytes: number; created_at: number }>>([]);
@@ -113,8 +178,13 @@ export function SystemWorkspace({
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
 
   useEffect(() => {
+    setAvatarImgErr(false);
+  }, [profileForm.avatar_url]);
+
+  useEffect(() => {
     if (activeTab) {
       setSub(activeTab);
+      resetConsoleScroll();
     }
   }, [activeTab]);
 
@@ -128,7 +198,11 @@ export function SystemWorkspace({
           apiFetch<{ items: any[] }>("/api/admin/security/tokens"),
         ]);
         setMeInfo(me);
+        if (me.storage_driver) {
+          storageDriverSig.value = me.storage_driver;
+        }
         setProfileForm({
+          avatar_url: me.user?.avatar_url || "",
           display_name: me.user?.display_name || "",
           bio: me.user?.bio || "",
           website_url: me.user?.website_url || "",
@@ -142,6 +216,9 @@ export function SystemWorkspace({
         const res = await apiFetch<any>("/api/admin/settings");
         setDomains(res.domains || {});
         setVersions(res.versions || {});
+        if (res.domains?.storage) {
+          storageDriverSig.value = res.domains.storage.active_driver || "local";
+        }
       } else if (sub === "users" && isAdmin) {
         const res = await apiFetch<{ items: any[] }>("/api/admin/users");
         setUsers(res.items || []);
@@ -156,6 +233,9 @@ export function SystemWorkspace({
         setGeoCircuitEnabled(g.geo_access_circuit_enabled !== false);
         setDomains(st.domains || {});
         setVersions(st.versions || {});
+        if (st.domains?.storage) {
+          storageDriverSig.value = st.domains.storage.active_driver || "local";
+        }
       } else if (sub === "backup" && isAdmin) {
         const [doc, st, lb] = await Promise.all([
           apiFetch<any>("/api/admin/doctor"),
@@ -166,6 +246,9 @@ export function SystemWorkspace({
         setDomains(st.domains || {});
         setVersions(st.versions || {});
         setLocalBackups(lb.items || []);
+        if (st.domains?.storage) {
+          storageDriverSig.value = st.domains.storage.active_driver || "local";
+        }
       } else if (sub === "audit" && isAdmin) {
         const logs = await apiFetch<{ items: any[] }>("/api/admin/audit-logs");
         setAuditLogs(logs.items || []);
@@ -188,7 +271,32 @@ export function SystemWorkspace({
       });
       setDomains((prev) => ({ ...(prev || {}), [domainName]: res.value }));
       setVersions((prev) => ({ ...prev, [domainName]: res.version }));
+      if (domainName === "storage") {
+        storageDriverSig.value = res.value?.active_driver || bodyObj.active_driver || "local";
+      }
       showToast(t("common.saved"));
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const uploadImageAsset = async (file: File, onUploaded: (url: string) => void) => {
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await apiFetch<{
+        url?: string;
+        asset?: { public_url?: string };
+        item?: { public_url?: string };
+      }>("/api/admin/media/upload", {
+        method: "POST",
+        body: fd,
+      });
+      const nextUrl = res.url || res.asset?.public_url || res.item?.public_url || "";
+      if (nextUrl) {
+        onUploaded(nextUrl);
+        showToast(t("ed.uploaded", { name: file.name }));
+      }
     } catch (err: any) {
       showToast(err.message);
     }
@@ -229,6 +337,7 @@ export function SystemWorkspace({
           attestation_object: bytesToB64url(resp.attestationObject),
         }),
       });
+      setPkModalOpen(false);
       showToast(t("sys.pk_registered"));
       void loadSub();
     } catch (err: any) {
@@ -250,7 +359,20 @@ export function SystemWorkspace({
     }));
   };
 
-  const usersPaged = paginateItems(users, usersPage, 15);
+  const filteredUsers = users.filter((u) => {
+    if (userRoleFilter !== "all" && u.role !== userRoleFilter) return false;
+    if (userQuery.trim()) {
+      const q = userQuery.trim().toLowerCase();
+      return (
+        String(u.username || "").toLowerCase().includes(q) ||
+        String(u.display_name || "").toLowerCase().includes(q) ||
+        String(u.email || "").toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
+
+  const usersPaged = paginateItems(filteredUsers, usersPage, 15);
   const bansPaged = paginateItems(bans, bansPage, 15);
   const geoPaged = paginateItems(geoRules, geoPage, 15);
   const localBakPaged = paginateItems(localBackups, localBakPage, 10);
@@ -268,10 +390,11 @@ export function SystemWorkspace({
               class={`volo-tab ${sub === k ? "active" : ""}`}
               onClick={() => {
                 setSub(k);
+                resetConsoleScroll();
                 onNavigate?.(k);
               }}
             >
-              {t(`sys.${k}`)}
+              {renderSysTabLabel(k)}
             </button>
           ))}
         </div>
@@ -325,9 +448,10 @@ export function SystemWorkspace({
                 onInput={(e) => setDomField("site", "description", (e.currentTarget as HTMLTextAreaElement).value)}
               />
             </div>
-            <div class="volo-grid-2">
-              <div class="volo-field">
-                <label>{t("sys.lbl_logo_url")}</label>
+            <div class="volo-field">
+              <label>{t("sys.lbl_logo_url")}</label>
+              <div class="volo-input-row">
+                <NavIconPreview icon={domains.site?.logo_url} fallbackLabel={domains.site?.title || "V"} />
                 <input
                   class="volo-input"
                   name="site_brand_logo"
@@ -335,9 +459,28 @@ export function SystemWorkspace({
                   value={domains.site?.logo_url || ""}
                   onInput={(e) => setDomField("site", "logo_url", (e.currentTarget as HTMLInputElement).value)}
                 />
+                <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer", flexShrink: 0 }}>
+                  {t("sys.upload_img_btn")}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    style={{ display: "none" }}
+                    onChange={(e) => {
+                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
+                      if (f) {
+                        void uploadImageAsset(f, (url) => setDomField("site", "logo_url", url));
+                      }
+                      (e.currentTarget as HTMLInputElement).value = "";
+                    }}
+                  />
+                </label>
+                <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "logo_url", url)} />
               </div>
-              <div class="volo-field">
-                <label>{t("sys.lbl_fav_url")}</label>
+            </div>
+            <div class="volo-field">
+              <label>{t("sys.lbl_fav_url")}</label>
+              <div class="volo-input-row">
+                <NavIconPreview icon={domains.site?.favicon_url} fallbackLabel="F" />
                 <input
                   class="volo-input"
                   name="site_favicon_path"
@@ -345,6 +488,22 @@ export function SystemWorkspace({
                   value={domains.site?.favicon_url || ""}
                   onInput={(e) => setDomField("site", "favicon_url", (e.currentTarget as HTMLInputElement).value)}
                 />
+                <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer", flexShrink: 0 }}>
+                  {t("sys.upload_img_btn")}
+                  <input
+                    type="file"
+                    accept="image/*,.ico,.svg"
+                    style={{ display: "none" }}
+                    onChange={(e) => {
+                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
+                      if (f) {
+                        void uploadImageAsset(f, (url) => setDomField("site", "favicon_url", url));
+                      }
+                      (e.currentTarget as HTMLInputElement).value = "";
+                    }}
+                  />
+                </label>
+                <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "favicon_url", url)} />
               </div>
             </div>
             <div class="volo-grid-2">
@@ -491,30 +650,53 @@ export function SystemWorkspace({
                 </div>
               </div>
               {Array.isArray(domains.site?.social_links) && domains.site.social_links.length > 0 && (
-                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "4px" }}>
-                  {domains.site.social_links.map((sl: any, idx: number) => (
-                    <span key={sl.id || idx} class="volo-cat-chip" style={{ maxWidth: "none" }}>
-                      <strong>{sl.label}</strong>
-                      <span class="volo-help">{sl.url}</span>
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "8px" }}>
+                  {domains.site.social_links.map((s: any, idx: number) => (
+                    <div
+                      key={s.id || idx}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        padding: "6px 10px",
+                        borderRadius: "8px",
+                        border: "1px solid var(--volo-line)",
+                        background: "var(--volo-surface)",
+                      }}
+                    >
+                      <NavIconPreview
+                        icon={s.icon || String(s.label || "").toLowerCase()}
+                        fallbackLabel={s.label}
+                        size={15}
+                      />
+                      <strong style={{ fontSize: "13px" }}>{s.label}</strong>
+                      <span
+                        class="volo-help"
+                        style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                      >
+                        {s.url}
+                      </span>
                       <button
                         type="button"
-                        style={{ border: 0, background: "transparent", cursor: "pointer", color: "inherit", fontWeight: 700 }}
+                        class="volo-act-btn danger"
                         onClick={() => {
                           const next = domains.site.social_links.filter((_: any, i: number) => i !== idx);
                           setDomField("site", "social_links", next);
                         }}
                       >
-                        ×
+                        {t("common.delete")}
                       </button>
-                    </span>
+                    </div>
                   ))}
                 </div>
               )}
             </div>
 
-            <button type="submit" class="volo-btn volo-btn-primary">
-              {t("sys.save_site")}
-            </button>
+            <div class="volo-form-actions">
+              <button type="submit" class="volo-btn volo-btn-primary">
+                {t("sys.save_site")}
+              </button>
+            </div>
           </form>
 
           {/* Reading & Comment Protection Domain */}
@@ -706,9 +888,11 @@ export function SystemWorkspace({
               </div>
             </div>
 
-            <button type="submit" class="volo-btn volo-btn-primary">
-              {t("sys.save_reading")}
-            </button>
+            <div class="volo-form-actions">
+              <button type="submit" class="volo-btn volo-btn-primary">
+                {t("sys.save_reading")}
+              </button>
+            </div>
           </form>
         </div>
       )}
@@ -878,10 +1062,7 @@ export function SystemWorkspace({
               </label>
             </div>
 
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              <button type="submit" class="volo-btn volo-btn-primary">
-                {t("sys.save_storage")}
-              </button>
+            <div class="volo-form-actions">
               <button
                 type="button"
                 class="volo-btn"
@@ -898,6 +1079,9 @@ export function SystemWorkspace({
                 }}
               >
                 {t("sys.test_storage")}
+              </button>
+              <button type="submit" class="volo-btn volo-btn-primary">
+                {t("sys.save_storage")}
               </button>
             </div>
           </form>
@@ -1043,40 +1227,39 @@ export function SystemWorkspace({
             <div class="volo-subcard">
               <div class="volo-field" style={{ marginBottom: 0 }}>
                 <label>{t("sys.lbl_test_mail")}</label>
-                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                  <input
-                    class="volo-input"
-                    style={{ flex: 1, minWidth: "200px" }}
-                    name="smtp_probe_recipient"
-                    autoComplete="off"
-                    placeholder={t("sys.test_mail_ph")}
-                    value={testMailTo}
-                    onInput={(e) => setTestMailTo((e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <button
-                    type="button"
-                    class="volo-btn"
-                    onClick={async () => {
-                      try {
-                        await apiFetch("/api/admin/settings/notifications/test-smtp", {
-                          method: "POST",
-                          body: JSON.stringify({ to_email: testMailTo, settings: domains.notifications, smtp_password: smtpPwd }),
-                        });
-                        showToast(t("sys.smtp_sent_toast"));
-                      } catch (err: any) {
-                        showToast(err.message);
-                      }
-                    }}
-                  >
-                    {t("sys.test_smtp")}
-                  </button>
-                </div>
+                <input
+                  class="volo-input"
+                  name="smtp_probe_recipient"
+                  autoComplete="off"
+                  placeholder={t("sys.test_mail_ph")}
+                  value={testMailTo}
+                  onInput={(e) => setTestMailTo((e.currentTarget as HTMLInputElement).value)}
+                />
               </div>
             </div>
 
-            <button type="submit" class="volo-btn volo-btn-primary">
-              {t("sys.save_notify")}
-            </button>
+            <div class="volo-form-actions">
+              <button
+                type="button"
+                class="volo-btn"
+                onClick={async () => {
+                  try {
+                    await apiFetch("/api/admin/settings/notifications/test-smtp", {
+                      method: "POST",
+                      body: JSON.stringify({ to_email: testMailTo, settings: domains.notifications, smtp_password: smtpPwd }),
+                    });
+                    showToast(t("sys.smtp_sent_toast"));
+                  } catch (err: any) {
+                    showToast(err.message);
+                  }
+                }}
+              >
+                {t("sys.test_smtp")}
+              </button>
+              <button type="submit" class="volo-btn volo-btn-primary">
+                {t("sys.save_notify")}
+              </button>
+            </div>
           </form>
         </div>
       )}
@@ -1087,14 +1270,20 @@ export function SystemWorkspace({
             <button
               type="button"
               class={`volo-seg-btn ${accSub === "profile" ? "active" : ""}`}
-              onClick={() => setAccSub("profile")}
+              onClick={() => {
+                setAccSub("profile");
+                resetConsoleScroll();
+              }}
             >
               {t("sys.sub_acc_profile")}
             </button>
             <button
               type="button"
               class={`volo-seg-btn ${accSub === "sessions" ? "active" : ""}`}
-              onClick={() => setAccSub("sessions")}
+              onClick={() => {
+                setAccSub("sessions");
+                resetConsoleScroll();
+              }}
             >
               {t("sys.sub_acc_sessions")}
             </button>
@@ -1114,8 +1303,18 @@ export function SystemWorkspace({
                   onSubmit={async (e) => {
                     e.preventDefault();
                     try {
-                      await apiFetch("/api/admin/me", { method: "PATCH", body: JSON.stringify(profileForm) });
-                      setProfileForm({ ...profileForm, current_password: "", new_password: "" });
+                      await apiFetch("/api/admin/me", {
+                        method: "PATCH",
+                        body: JSON.stringify({
+                          avatar_url: profileForm.avatar_url,
+                          display_name: profileForm.display_name,
+                          bio: profileForm.bio,
+                          website_url: profileForm.website_url,
+                          current_password: profileForm.current_password,
+                          new_password: profileForm.new_password,
+                        }),
+                      });
+                      setProfileForm((prev) => ({ ...prev, current_password: "", new_password: "" }));
                       await refreshMe();
                       showToast(t("common.saved"));
                     } catch (err: any) {
@@ -1123,6 +1322,64 @@ export function SystemWorkspace({
                     }
                   }}
                 >
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_avatar_url")}</label>
+                    <div class="volo-avatar-edit-row">
+                      <div class="volo-avatar-preview">
+                        {profileForm.avatar_url.trim() && !avatarImgErr ? (
+                          <img
+                            src={profileForm.avatar_url}
+                            alt={profileForm.display_name || currentUserSig.value?.username || "avatar"}
+                            onError={() => setAvatarImgErr(true)}
+                          />
+                        ) : (
+                          <span>
+                            {(profileForm.display_name || currentUserSig.value?.username || "U")
+                              .trim()
+                              .charAt(0)
+                              .toUpperCase()}
+                          </span>
+                        )}
+                      </div>
+                      <div class="volo-input-row" style={{ flex: 1, minWidth: "220px" }}>
+                        <input
+                          class="volo-input"
+                          name="author_avatar_url"
+                          autoComplete="off"
+                          placeholder={t("sys.avatar_url_ph")}
+                          value={profileForm.avatar_url}
+                          onInput={(e) =>
+                            setProfileForm((prev) => ({
+                              ...prev,
+                              avatar_url: (e.currentTarget as HTMLInputElement).value,
+                            }))
+                          }
+                        />
+                        <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer", flexShrink: 0 }}>
+                          {t("sys.upload_img_btn")}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            style={{ display: "none" }}
+                            onChange={(e) => {
+                              const f = (e.currentTarget as HTMLInputElement).files?.[0];
+                              if (f) {
+                                void uploadImageAsset(f, (url) =>
+                                  setProfileForm((prev) => ({ ...prev, avatar_url: url })),
+                                );
+                              }
+                              (e.currentTarget as HTMLInputElement).value = "";
+                            }}
+                          />
+                        </label>
+                        <MediaPickButton
+                          filterKind="image"
+                          onPick={(url) => setProfileForm((prev) => ({ ...prev, avatar_url: url }))}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
                   <div class="volo-grid-2">
                     <div class="volo-field">
                       <label>{t("setup.display_name")}</label>
@@ -1182,9 +1439,11 @@ export function SystemWorkspace({
                       />
                     </div>
                   </div>
-                  <button type="submit" class="volo-btn volo-btn-primary">
-                    {t("common.save")}
-                  </button>
+                  <div class="volo-form-actions">
+                    <button type="submit" class="volo-btn volo-btn-primary">
+                      {t("common.save")}
+                    </button>
+                  </div>
                 </form>
               </div>
 
@@ -1207,8 +1466,12 @@ export function SystemWorkspace({
                         class="volo-act-btn danger"
                         onClick={async () => {
                           if (!window.confirm(t("sys.confirm_disable_totp"))) return;
-                          await apiFetch("/api/admin/security/totp", { method: "DELETE" });
-                          void loadSub();
+                          try {
+                            await apiFetch("/api/admin/security/totp", { method: "DELETE" });
+                            void loadSub();
+                          } catch (err: any) {
+                            showToast(err.message);
+                          }
                         }}
                       >
                         {t("sys.totp_disable")}
@@ -1221,22 +1484,33 @@ export function SystemWorkspace({
                         <br />
                         {t("sys.totp_uri")} <code>{totpEnroll.otpauth_uri}</code>
                       </div>
-                      <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <div class="volo-field">
                         <label>{t("sys.totp_code_ph")}</label>
-                        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                          <input
-                            class="volo-input"
-                            style={{ flex: 1, minWidth: "160px" }}
-                            name="totp_verify_digits"
-                            autoComplete="one-time-code"
-                            placeholder={t("sys.totp_code_ph")}
-                            value={totpCode}
-                            onInput={(e) => setTotpCode((e.currentTarget as HTMLInputElement).value)}
-                          />
-                          <button
-                            type="button"
-                            class="volo-btn volo-btn-primary"
-                            onClick={async () => {
+                        <input
+                          class="volo-input"
+                          name="totp_verify_digits"
+                          autoComplete="one-time-code"
+                          placeholder={t("sys.totp_code_ph")}
+                          value={totpCode}
+                          onInput={(e) => setTotpCode((e.currentTarget as HTMLInputElement).value)}
+                        />
+                      </div>
+                      <div class="volo-form-actions">
+                        <button
+                          type="button"
+                          class="volo-btn"
+                          onClick={() => {
+                            setTotpEnroll(null);
+                            setTotpCode("");
+                          }}
+                        >
+                          {t("common.cancel")}
+                        </button>
+                        <button
+                          type="button"
+                          class="volo-btn volo-btn-primary"
+                          onClick={async () => {
+                            try {
                               const res = await apiFetch<{ recovery_codes: string[] }>("/api/admin/security/totp/enroll", {
                                 method: "POST",
                                 body: JSON.stringify({ secret: totpEnroll.secret, code: totpCode }),
@@ -1245,27 +1519,35 @@ export function SystemWorkspace({
                               setTotpEnroll(null);
                               setTotpCode("");
                               void loadSub();
-                            }}
-                          >
-                            {t("sys.totp_activate")}
-                          </button>
-                        </div>
+                            } catch (err: any) {
+                              showToast(err.message);
+                            }
+                          }}
+                        >
+                          {t("sys.totp_activate")}
+                        </button>
                       </div>
                     </div>
                   ) : (
-                    <button
-                      type="button"
-                      class="volo-btn volo-btn-sm volo-btn-primary"
-                      onClick={async () => {
-                        const res = await apiFetch<{ secret: string; otpauth_uri: string }>("/api/admin/security/totp/setup", {
-                          method: "POST",
-                          body: "{}",
-                        });
-                        setTotpEnroll(res);
-                      }}
-                    >
-                      {t("sys.totp_enroll")}
-                    </button>
+                    <div class="volo-form-actions no-border" style={{ marginTop: 0, paddingTop: 0 }}>
+                      <button
+                        type="button"
+                        class="volo-btn volo-btn-sm volo-btn-primary"
+                        onClick={async () => {
+                          try {
+                            const res = await apiFetch<{ secret: string; otpauth_uri: string }>("/api/admin/security/totp/setup", {
+                              method: "POST",
+                              body: "{}",
+                            });
+                            setTotpEnroll(res);
+                          } catch (err: any) {
+                            showToast(err.message);
+                          }
+                        }}
+                      >
+                        {t("sys.totp_enroll")}
+                      </button>
+                    </div>
                   )}
                   {recoveryCodes && (
                     <pre
@@ -1297,25 +1579,16 @@ export function SystemWorkspace({
                       <h3 class="volo-card-title">{t("sys.pk_col_device")}</h3>
                       <p class="volo-sec-desc">{t("sys.totp_desc")}</p>
                     </div>
-                  </div>
-                  <div class="volo-form-bar">
-                    <div class="volo-field" style={{ marginBottom: 0 }}>
-                      <label>{t("sys.lbl_pk_name")}</label>
-                      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                        <input
-                          class="volo-input"
-                          style={{ flex: 1, minWidth: "180px" }}
-                          name="passkey_device_label"
-                          autoComplete="off"
-                          placeholder={t("sys.pk_name_ph")}
-                          value={pkName}
-                          onInput={(e) => setPkName((e.currentTarget as HTMLInputElement).value)}
-                        />
-                        <button type="button" class="volo-btn volo-btn-primary" onClick={registerPasskey}>
-                          {t("sys.pk_add")}
-                        </button>
-                      </div>
-                    </div>
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-primary volo-btn-sm"
+                      onClick={() => {
+                        setPkName(t("sys.pk_default_name"));
+                        setPkModalOpen(true);
+                      }}
+                    >
+                      {t("sys.pk_add")}
+                    </button>
                   </div>
 
                   <div class="volo-table-wrap">
@@ -1347,8 +1620,12 @@ export function SystemWorkspace({
                                     type="button"
                                     class="volo-act-btn danger"
                                     onClick={async () => {
-                                      await apiFetch(`/api/admin/security/passkeys/${pk.id}`, { method: "DELETE" });
-                                      void loadSub();
+                                      try {
+                                        await apiFetch(`/api/admin/security/passkeys/${pk.id}`, { method: "DELETE" });
+                                        void loadSub();
+                                      } catch (err: any) {
+                                        showToast(err.message);
+                                      }
                                     }}
                                   >
                                     {t("common.delete")}
@@ -1369,60 +1646,51 @@ export function SystemWorkspace({
                       <h3 class="volo-card-title">{t("sys.pat_head")}</h3>
                       <p class="volo-sec-desc">{t("sys.pat_desc")}</p>
                     </div>
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-primary volo-btn-sm"
+                      onClick={() => {
+                        setIssuedPAT("");
+                        setPatName("Obsidian CLI");
+                        setPatScopes(["articles:read", "articles:write", "media:write"]);
+                        setPatModalOpen(true);
+                      }}
+                    >
+                      + {t("sys.pat_generate")}
+                    </button>
                   </div>
-                  <div class="volo-form-bar">
-                    <div class="volo-field">
-                      <label>{t("sys.lbl_pat_name")}</label>
-                      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                        <input
-                          class="volo-input"
-                          style={{ flex: 1, minWidth: "180px" }}
-                          name="pat_purpose_label"
-                          autoComplete="off"
-                          placeholder={t("sys.pat_label_ph")}
-                          value={patName}
-                          onInput={(e) => setPatName((e.currentTarget as HTMLInputElement).value)}
-                        />
-                        <button
-                          type="button"
-                          class="volo-btn volo-btn-primary"
-                          onClick={async () => {
-                            const res = await apiFetch<{ plaintext_token: string }>("/api/admin/security/tokens", {
-                              method: "POST",
-                              body: JSON.stringify({ name: patName, scopes: patScopes }),
-                            });
-                            setIssuedPAT(res.plaintext_token);
-                            void loadSub();
-                          }}
-                        >
-                          {t("sys.pat_generate")}
-                        </button>
+
+                  {issuedPAT && !patModalOpen && (
+                    <div
+                      class="volo-subcard"
+                      style={{
+                        marginTop: 0,
+                        background: "var(--volo-accent-soft)",
+                        wordBreak: "break-all",
+                        fontSize: "12px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "10px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: "200px" }}>
+                        <strong>{t("sys.pat_copy_once")}</strong> <code>{issuedPAT}</code>
                       </div>
-                    </div>
-                    <div class="volo-field" style={{ marginBottom: 0 }}>
-                      <label>{t("sys.lbl_pat_scopes")}</label>
-                      <div class="volo-check-grid" style={{ marginBottom: 0 }}>
-                        {PAT_SCOPES.map((sc) => (
-                          <label key={sc} class="volo-check-item">
-                            <input
-                              type="checkbox"
-                              checked={patScopes.includes(sc)}
-                              onChange={(e) => {
-                                const on = (e.currentTarget as HTMLInputElement).checked;
-                                setPatScopes(on ? [...patScopes, sc] : patScopes.filter((x) => x !== sc));
-                              }}
-                            />
-                            <span>{sc}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                  {issuedPAT && (
-                    <div class="volo-subcard" style={{ background: "var(--volo-accent-soft)", wordBreak: "break-all", fontSize: "12px" }}>
-                      <strong>{t("sys.pat_copy_once")}</strong> <code>{issuedPAT}</code>
+                      <button
+                        type="button"
+                        class="volo-btn volo-btn-sm"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(issuedPAT);
+                          showToast(t("cnt.media_copied"));
+                        }}
+                      >
+                        {t("cnt.media_copy")}
+                      </button>
                     </div>
                   )}
+
                   <div class="volo-table-wrap">
                     <table class="volo-table" style={{ minWidth: "100%" }}>
                       <thead>
@@ -1457,8 +1725,12 @@ export function SystemWorkspace({
                                     type="button"
                                     class="volo-act-btn danger"
                                     onClick={async () => {
-                                      await apiFetch(`/api/admin/security/tokens/${tk.id}`, { method: "DELETE" });
-                                      void loadSub();
+                                      try {
+                                        await apiFetch(`/api/admin/security/tokens/${tk.id}`, { method: "DELETE" });
+                                        void loadSub();
+                                      } catch (err: any) {
+                                        showToast(err.message);
+                                      }
                                     }}
                                   >
                                     {t("sys.pat_revoke")}
@@ -1524,8 +1796,12 @@ export function SystemWorkspace({
                                     type="button"
                                     class="volo-act-btn danger"
                                     onClick={async () => {
-                                      await apiFetch(`/api/admin/security/sessions/${s.id}`, { method: "DELETE" });
-                                      void loadSub();
+                                      try {
+                                        await apiFetch(`/api/admin/security/sessions/${s.id}`, { method: "DELETE" });
+                                        void loadSub();
+                                      } catch (err: any) {
+                                        showToast(err.message);
+                                      }
                                     }}
                                   >
                                     {t("sys.sess_kick")}
@@ -1539,8 +1815,180 @@ export function SystemWorkspace({
                     </tbody>
                   </table>
                 </div>
-                <Pagination total={sessions.length} page={sessPaged.safePage} pageSize={10} onChange={setSessPage} />
+                <Pagination
+                  total={sessions.length}
+                  page={sessPaged.safePage}
+                  pageSize={10}
+                  onChange={(p) => {
+                    setSessPage(p);
+                    resetConsoleScroll();
+                  }}
+                />
               </div>
+
+              <AnimatedModal
+                open={pkModalOpen}
+                onClose={() => setPkModalOpen(false)}
+                title={t("sys.pk_modal_title")}
+                maxWidth="480px"
+                footer={
+                  <>
+                    <button type="button" class="volo-btn" onClick={() => setPkModalOpen(false)}>
+                      {t("common.cancel")}
+                    </button>
+                    <button type="button" class="volo-btn volo-btn-primary" onClick={() => void registerPasskey()}>
+                      {t("sys.pk_register_btn")}
+                    </button>
+                  </>
+                }
+              >
+                <form
+                  autoComplete="off"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void registerPasskey();
+                  }}
+                >
+                  <div class="volo-field" style={{ marginBottom: 0 }}>
+                    <label>{t("sys.lbl_pk_name")}</label>
+                    <input
+                      class="volo-input"
+                      name="passkey_device_label"
+                      autoComplete="off"
+                      placeholder={t("sys.pk_name_ph")}
+                      value={pkName}
+                      onInput={(e) => setPkName((e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                </form>
+              </AnimatedModal>
+
+              <AnimatedModal
+                open={patModalOpen}
+                onClose={() => setPatModalOpen(false)}
+                title={t("sys.pat_modal_title")}
+                maxWidth="540px"
+                footer={
+                  issuedPAT ? (
+                    <>
+                      <button type="button" class="volo-btn" onClick={() => setPatModalOpen(false)}>
+                        {t("common.close")}
+                      </button>
+                      <button
+                        type="button"
+                        class="volo-btn volo-btn-primary"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(issuedPAT);
+                          showToast(t("cnt.media_copied"));
+                        }}
+                      >
+                        {t("cnt.media_copy")}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button type="button" class="volo-btn" onClick={() => setPatModalOpen(false)}>
+                        {t("common.cancel")}
+                      </button>
+                      <button
+                        type="button"
+                        class="volo-btn volo-btn-primary"
+                        onClick={async () => {
+                          try {
+                            const res = await apiFetch<{ plaintext_token: string }>("/api/admin/security/tokens", {
+                              method: "POST",
+                              body: JSON.stringify({ name: patName, scopes: patScopes }),
+                            });
+                            setIssuedPAT(res.plaintext_token);
+                            void loadSub();
+                          } catch (err: any) {
+                            showToast(err.message);
+                          }
+                        }}
+                      >
+                        {t("sys.pat_generate")}
+                      </button>
+                    </>
+                  )
+                }
+              >
+                {issuedPAT ? (
+                  <div
+                    class="volo-subcard"
+                    style={{
+                      marginTop: 0,
+                      marginBottom: 0,
+                      background: "var(--volo-accent-soft)",
+                      wordBreak: "break-all",
+                    }}
+                  >
+                    <div style={{ fontWeight: 650, fontSize: "13px", marginBottom: "8px" }}>
+                      {t("sys.pat_copy_once")}
+                    </div>
+                    <code
+                      style={{
+                        display: "block",
+                        padding: "10px 12px",
+                        borderRadius: "8px",
+                        background: "var(--volo-surface)",
+                        border: "1px solid var(--volo-line)",
+                        fontSize: "12.5px",
+                        userSelect: "all",
+                      }}
+                    >
+                      {issuedPAT}
+                    </code>
+                  </div>
+                ) : (
+                  <form
+                    autoComplete="off"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      try {
+                        const res = await apiFetch<{ plaintext_token: string }>("/api/admin/security/tokens", {
+                          method: "POST",
+                          body: JSON.stringify({ name: patName, scopes: patScopes }),
+                        });
+                        setIssuedPAT(res.plaintext_token);
+                        void loadSub();
+                      } catch (err: any) {
+                        showToast(err.message);
+                      }
+                    }}
+                  >
+                    <div class="volo-field">
+                      <label>{t("sys.lbl_pat_name")}</label>
+                      <input
+                        class="volo-input"
+                        required
+                        name="pat_purpose_label"
+                        autoComplete="off"
+                        placeholder={t("sys.pat_label_ph")}
+                        value={patName}
+                        onInput={(e) => setPatName((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <label>{t("sys.lbl_pat_scopes")}</label>
+                      <div class="volo-check-grid" style={{ marginBottom: 0 }}>
+                        {PAT_SCOPES.map((sc) => (
+                          <label key={sc} class="volo-check-item">
+                            <input
+                              type="checkbox"
+                              checked={patScopes.includes(sc)}
+                              onChange={(e) => {
+                                const on = (e.currentTarget as HTMLInputElement).checked;
+                                setPatScopes(on ? [...patScopes, sc] : patScopes.filter((x) => x !== sc));
+                              }}
+                            />
+                            <span>{sc}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </form>
+                )}
+              </AnimatedModal>
             </>
           )}
         </div>
@@ -1553,95 +2001,58 @@ export function SystemWorkspace({
               <h3 class="volo-card-title">{t("sys.users_head")}</h3>
               <p class="volo-sec-desc">{t("sys.users_desc")}</p>
             </div>
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary volo-btn-sm"
+              onClick={() => {
+                setEditingUserId(null);
+                setUserForm({
+                  username: "",
+                  email: "",
+                  display_name: "",
+                  role: "editor",
+                  status: "active",
+                  password: "",
+                });
+                setUserModalOpen(true);
+              }}
+            >
+              + {t("sys.new_user")}
+            </button>
           </div>
-          <form
-            autoComplete="off"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              try {
-                await apiFetch("/api/admin/users", { method: "POST", body: JSON.stringify(userForm) });
-                setUserForm({ username: "", email: "", display_name: "", role: "editor", password: "" });
-                showToast(t("common.saved"));
-                void loadSub();
-              } catch (err: any) {
-                showToast(err.message);
-              }
-            }}
-            class="volo-form-bar"
-          >
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("sys.lbl_user_name")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  name="new_member_handle"
-                  autoComplete="off"
-                  placeholder={t("sys.user_name_ph")}
-                  value={userForm.username}
-                  onInput={(e) => setUserForm({ ...userForm, username: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("sys.lbl_user_disp")}</label>
-                <input
-                  class="volo-input"
-                  name="new_member_alias"
-                  autoComplete="off"
-                  placeholder={t("sys.user_disp_ph")}
-                  value={userForm.display_name}
-                  onInput={(e) => setUserForm({ ...userForm, display_name: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("sys.lbl_user_email")}</label>
-                <input
-                  type="email"
-                  class="volo-input"
-                  required
-                  name="new_member_mailbox"
-                  autoComplete="off"
-                  placeholder={t("sys.user_email_ph")}
-                  value={userForm.email}
-                  onInput={(e) => setUserForm({ ...userForm, email: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
+
+          <div class="volo-filter-bar">
+            <div class="volo-filter-pills">
+              {(["all", "admin", "editor", "reader"] as const).map((rf) => (
+                <button
+                  key={rf}
+                  type="button"
+                  class={`volo-filter-pill ${userRoleFilter === rf ? "active" : ""}`}
+                  onClick={() => {
+                    setUserRoleFilter(rf);
+                    setUsersPage(1);
+                  }}
+                >
+                  {rf === "all" ? t("art.all") : renderRoleLabel(rf)}
+                </button>
+              ))}
             </div>
-            <div class="volo-grid-2" style={{ alignItems: "end" }}>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("sys.lbl_user_role")}</label>
-                <ConsoleSelect
-                  value={userForm.role}
-                  options={[
-                    { value: "editor", label: t("sys.role_editor_opt") },
-                    { value: "reader", label: t("sys.role_reader_opt") },
-                    { value: "admin", label: t("sys.role_admin_opt") },
-                  ]}
-                  onChange={(v) => setUserForm({ ...userForm, role: v })}
-                />
-              </div>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("sys.lbl_user_pwd")}</label>
-                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                  <input
-                    type="password"
-                    class="volo-input"
-                    style={{ flex: 1, minWidth: "180px" }}
-                    required
-                    minLength={6}
-                    name="new_member_passphrase"
-                    autoComplete="new-password"
-                    placeholder={t("sys.user_pwd_ph")}
-                    value={userForm.password}
-                    onInput={(e) => setUserForm({ ...userForm, password: (e.currentTarget as HTMLInputElement).value })}
-                  />
-                  <button type="submit" class="volo-btn volo-btn-primary">
-                    {t("common.create")}
-                  </button>
-                </div>
-              </div>
+            <div class="volo-filter-controls">
+              <input
+                class="volo-input"
+                style={{ width: "220px" }}
+                name="users_search_filter"
+                autoComplete="off"
+                placeholder={t("sys.user_search_ph")}
+                value={userQuery}
+                onInput={(e) => {
+                  setUserQuery((e.currentTarget as HTMLInputElement).value);
+                  setUsersPage(1);
+                }}
+              />
             </div>
-          </form>
+          </div>
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -1680,7 +2091,7 @@ export function SystemWorkspace({
                         </td>
                         <td class="col-cat" style={{ minWidth: "150px" }}>
                           {isSelf ? (
-                            <span class="volo-cat-chip">{t(`role.${u.role}`)}</span>
+                            <span class="volo-cat-chip">{renderRoleLabel(u.role)}</span>
                           ) : (
                             <ConsoleSelect
                               value={u.role}
@@ -1713,18 +2124,40 @@ export function SystemWorkspace({
                         <td class="col-date">{formatDateTime(u.created_at)}</td>
                         <td class="col-act">
                           <div class="volo-row-actions">
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              onClick={() => {
+                                setEditingUserId(u.id);
+                                setUserForm({
+                                  username: u.username || "",
+                                  email: u.email || "",
+                                  display_name: u.display_name || "",
+                                  role: u.role || "editor",
+                                  status: u.status || "active",
+                                  password: "",
+                                });
+                                setUserModalOpen(true);
+                              }}
+                            >
+                              {t("common.edit")}
+                            </button>
                             {!isSelf && (
                               <>
                                 <button
                                   type="button"
                                   class="volo-act-btn"
                                   onClick={async () => {
-                                    const nextSt = u.status === "active" ? "disabled" : "active";
-                                    await apiFetch(`/api/admin/users/${u.id}`, {
-                                      method: "PATCH",
-                                      body: JSON.stringify({ status: nextSt }),
-                                    });
-                                    void loadSub();
+                                    try {
+                                      const nextSt = u.status === "active" ? "disabled" : "active";
+                                      await apiFetch(`/api/admin/users/${u.id}`, {
+                                        method: "PATCH",
+                                        body: JSON.stringify({ status: nextSt }),
+                                      });
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
                                   }}
                                 >
                                   {u.status === "active" ? t("sys.user_disable") : t("sys.user_enable")}
@@ -1733,8 +2166,13 @@ export function SystemWorkspace({
                                   type="button"
                                   class="volo-act-btn danger"
                                   onClick={async () => {
-                                    await apiFetch(`/api/admin/users/${u.id}`, { method: "DELETE" });
-                                    void loadSub();
+                                    if (!window.confirm(t("sys.confirm_del_user", { name: u.username }))) return;
+                                    try {
+                                      await apiFetch(`/api/admin/users/${u.id}`, { method: "DELETE" });
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
                                   }}
                                 >
                                   {t("common.delete")}
@@ -1750,7 +2188,176 @@ export function SystemWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={users.length} page={usersPaged.safePage} pageSize={15} onChange={setUsersPage} />
+          <Pagination
+            total={filteredUsers.length}
+            page={usersPaged.safePage}
+            pageSize={15}
+            onChange={(p) => {
+              setUsersPage(p);
+              resetConsoleScroll();
+            }}
+          />
+
+          <AnimatedModal
+            open={userModalOpen}
+            onClose={() => setUserModalOpen(false)}
+            title={editingUserId ? t("sys.edit_user") : t("sys.new_user")}
+            maxWidth="580px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setUserModalOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button type="submit" form="volo-sys-user-form" class="volo-btn volo-btn-primary">
+                  {editingUserId ? t("common.save") : t("common.create")}
+                </button>
+              </>
+            }
+          >
+            <form
+              id="volo-sys-user-form"
+              autoComplete="off"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                try {
+                  if (editingUserId) {
+                    const isSelfEdit = editingUserId === currentUserSig.value?.id;
+                    const body: Record<string, any> = {
+                      display_name: userForm.display_name,
+                      email: userForm.email,
+                      role: userForm.role,
+                      status: userForm.status,
+                    };
+                    if (userForm.password.trim()) {
+                      body.password = userForm.password;
+                    }
+                    await apiFetch(`/api/admin/users/${editingUserId}`, {
+                      method: "PATCH",
+                      body: JSON.stringify(body),
+                    });
+                    if (isSelfEdit) {
+                      await refreshMe();
+                    }
+                  } else {
+                    await apiFetch("/api/admin/users", {
+                      method: "POST",
+                      body: JSON.stringify({
+                        username: userForm.username,
+                        display_name: userForm.display_name,
+                        email: userForm.email,
+                        role: userForm.role,
+                        password: userForm.password,
+                      }),
+                    });
+                  }
+                  setUserModalOpen(false);
+                  showToast(t("common.saved"));
+                  void loadSub();
+                } catch (err: any) {
+                  showToast(err.message);
+                }
+              }}
+            >
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("sys.lbl_user_name")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    disabled={!!editingUserId}
+                    name="member_handle_field"
+                    autoComplete="off"
+                    placeholder={t("sys.user_name_ph")}
+                    value={userForm.username}
+                    onInput={(e) => setUserForm({ ...userForm, username: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("sys.lbl_user_disp")}</label>
+                  <input
+                    class="volo-input"
+                    name="member_alias_field"
+                    autoComplete="off"
+                    placeholder={t("sys.user_disp_ph")}
+                    value={userForm.display_name}
+                    onInput={(e) => setUserForm({ ...userForm, display_name: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-field">
+                <label>{t("sys.lbl_user_email")}</label>
+                <input
+                  type="email"
+                  class="volo-input"
+                  required
+                  name="member_mailbox_field"
+                  autoComplete="off"
+                  placeholder={t("sys.user_email_ph")}
+                  value={userForm.email}
+                  onInput={(e) => setUserForm({ ...userForm, email: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+
+              {editingUserId ? (
+                <div class="volo-grid-2">
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_user_role")}</label>
+                    <ConsoleSelect
+                      value={userForm.role}
+                      disabled={editingUserId === currentUserSig.value?.id}
+                      options={[
+                        { value: "editor", label: t("sys.role_editor_opt") },
+                        { value: "reader", label: t("sys.role_reader_opt") },
+                        { value: "admin", label: t("sys.role_admin_opt") },
+                      ]}
+                      onChange={(v) => setUserForm({ ...userForm, role: v })}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_user_status")}</label>
+                    <ConsoleSelect
+                      value={userForm.status}
+                      disabled={editingUserId === currentUserSig.value?.id}
+                      options={[
+                        { value: "active", label: t("tbl.status_active") },
+                        { value: "disabled", label: t("tbl.status_disabled") },
+                      ]}
+                      onChange={(v) => setUserForm({ ...userForm, status: v })}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div class="volo-field">
+                  <label>{t("sys.lbl_user_role")}</label>
+                  <ConsoleSelect
+                    value={userForm.role}
+                    options={[
+                      { value: "editor", label: t("sys.role_editor_opt") },
+                      { value: "reader", label: t("sys.role_reader_opt") },
+                      { value: "admin", label: t("sys.role_admin_opt") },
+                    ]}
+                    onChange={(v) => setUserForm({ ...userForm, role: v })}
+                  />
+                </div>
+              )}
+
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{editingUserId ? t("sys.lbl_user_pwd_reset") : t("sys.lbl_user_pwd")}</label>
+                <input
+                  type="password"
+                  class="volo-input"
+                  required={!editingUserId}
+                  minLength={6}
+                  name="member_passphrase_field"
+                  autoComplete="new-password"
+                  placeholder={editingUserId ? t("sys.user_pwd_reset_ph") : t("sys.user_pwd_ph")}
+                  value={userForm.password}
+                  onInput={(e) => setUserForm({ ...userForm, password: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
         </div>
       )}
 
@@ -1760,21 +2367,30 @@ export function SystemWorkspace({
             <button
               type="button"
               class={`volo-seg-btn ${wafSub === "policy" ? "active" : ""}`}
-              onClick={() => setWafSub("policy")}
+              onClick={() => {
+                setWafSub("policy");
+                resetConsoleScroll();
+              }}
             >
               {t("sys.sub_waf_policy")}
             </button>
             <button
               type="button"
               class={`volo-seg-btn ${wafSub === "bans" ? "active" : ""}`}
-              onClick={() => setWafSub("bans")}
+              onClick={() => {
+                setWafSub("bans");
+                resetConsoleScroll();
+              }}
             >
               {t("sys.sub_waf_bans")} ({bans.length})
             </button>
             <button
               type="button"
               class={`volo-seg-btn ${wafSub === "geo" ? "active" : ""}`}
-              onClick={() => setWafSub("geo")}
+              onClick={() => {
+                setWafSub("geo");
+                resetConsoleScroll();
+              }}
             >
               {t("sys.sub_waf_geo")} ({geoRules.length})
             </button>
@@ -1794,20 +2410,6 @@ export function SystemWorkspace({
                   <h3 class="volo-card-title">{t("sys.sec_policy_head")}</h3>
                   <p class="volo-sec-desc">{t("sys.sec_policy_desc")}</p>
                 </div>
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-sm"
-                  onClick={async () => {
-                    try {
-                      await apiFetch("/api/admin/security/rotate-share-secret", { method: "POST", body: "{}" });
-                      showToast(t("sys.share_rotated"));
-                    } catch (err: any) {
-                      showToast(err.message);
-                    }
-                  }}
-                >
-                  {t("sys.rotate_share")}
-                </button>
               </div>
               <div class="volo-grid-3">
                 <div class="volo-field">
@@ -1878,9 +2480,25 @@ export function SystemWorkspace({
                   <span>{t("sys.geo_policy_on")}</span>
                 </label>
               </div>
-              <button type="submit" class="volo-btn volo-btn-primary">
-                {t("sys.save_sec_policy")}
-              </button>
+              <div class="volo-form-actions">
+                <button
+                  type="button"
+                  class="volo-btn"
+                  onClick={async () => {
+                    try {
+                      await apiFetch("/api/admin/security/rotate-share-secret", { method: "POST", body: "{}" });
+                      showToast(t("sys.share_rotated"));
+                    } catch (err: any) {
+                      showToast(err.message);
+                    }
+                  }}
+                >
+                  {t("sys.rotate_share")}
+                </button>
+                <button type="submit" class="volo-btn volo-btn-primary">
+                  {t("sys.save_sec_policy")}
+                </button>
+              </div>
             </form>
           )}
 
@@ -1891,64 +2509,18 @@ export function SystemWorkspace({
                   <h3 class="volo-card-title">{t("sys.waf_bans_head")}</h3>
                   <p class="volo-sec-desc">{t("sys.waf_bans_desc")}</p>
                 </div>
-              </div>
-              <form
-                autoComplete="off"
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  try {
-                    await apiFetch("/api/admin/security/ip-bans", { method: "POST", body: JSON.stringify(banForm) });
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary volo-btn-sm"
+                  onClick={() => {
                     setBanForm({ cidr: "", note: "manual", expires_hours: 24 });
-                    void loadSub();
-                  } catch (err: any) {
-                    showToast(err.message);
-                  }
-                }}
-                class="volo-form-bar"
-              >
-                <div class="volo-grid-3" style={{ alignItems: "end" }}>
-                  <div class="volo-field" style={{ marginBottom: 0 }}>
-                    <label>{t("sys.lbl_ban_cidr")}</label>
-                    <input
-                      class="volo-input"
-                      required
-                      name="waf_ban_cidr_target"
-                      autoComplete="off"
-                      placeholder={t("sys.waf_cidr_ph")}
-                      value={banForm.cidr}
-                      onInput={(e) => setBanForm({ ...banForm, cidr: (e.currentTarget as HTMLInputElement).value })}
-                    />
-                  </div>
-                  <div class="volo-field" style={{ marginBottom: 0 }}>
-                    <label>{t("sys.lbl_ban_dur")}</label>
-                    <ConsoleSelect
-                      value={String(banForm.expires_hours)}
-                      options={[
-                        { value: "24", label: t("sys.waf_dur_24h") },
-                        { value: "168", label: t("sys.waf_dur_7d") },
-                        { value: "720", label: t("sys.waf_dur_30d") },
-                        { value: "0", label: t("sys.waf_dur_perm") },
-                      ]}
-                      onChange={(v) => setBanForm({ ...banForm, expires_hours: Number(v) })}
-                    />
-                  </div>
-                  <div class="volo-field" style={{ marginBottom: 0 }}>
-                    <label>{t("sys.lbl_ban_reason")}</label>
-                    <div style={{ display: "flex", gap: "8px" }}>
-                      <input
-                        class="volo-input"
-                        name="waf_ban_reason_note"
-                        autoComplete="off"
-                        value={banForm.note}
-                        onInput={(e) => setBanForm({ ...banForm, note: (e.currentTarget as HTMLInputElement).value })}
-                      />
-                      <button type="submit" class="volo-btn volo-btn-primary" style={{ flexShrink: 0 }}>
-                        {t("sys.waf_ban_btn")}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </form>
+                    setBanModalOpen(true);
+                  }}
+                >
+                  + {t("sys.new_ban")}
+                </button>
+              </div>
+
               <div class="volo-table-wrap">
                 <table class="volo-table" style={{ minWidth: "100%" }}>
                   <thead>
@@ -1983,8 +2555,12 @@ export function SystemWorkspace({
                                 type="button"
                                 class="volo-act-btn"
                                 onClick={async () => {
-                                  await apiFetch(`/api/admin/security/ip-bans/${b.id}`, { method: "DELETE" });
-                                  void loadSub();
+                                  try {
+                                    await apiFetch(`/api/admin/security/ip-bans/${b.id}`, { method: "DELETE" });
+                                    void loadSub();
+                                  } catch (err: any) {
+                                    showToast(err.message);
+                                  }
                                 }}
                               >
                                 {t("sys.waf_unban_btn")}
@@ -1997,7 +2573,91 @@ export function SystemWorkspace({
                   </tbody>
                 </table>
               </div>
-              <Pagination total={bans.length} page={bansPaged.safePage} pageSize={15} onChange={setBansPage} />
+              <Pagination
+                total={bans.length}
+                page={bansPaged.safePage}
+                pageSize={15}
+                onChange={(p) => {
+                  setBansPage(p);
+                  resetConsoleScroll();
+                }}
+              />
+
+              <AnimatedModal
+                open={banModalOpen}
+                onClose={() => setBanModalOpen(false)}
+                title={t("sys.new_ban")}
+                maxWidth="520px"
+                footer={
+                  <>
+                    <button type="button" class="volo-btn" onClick={() => setBanModalOpen(false)}>
+                      {t("common.cancel")}
+                    </button>
+                    <button type="submit" form="volo-sys-ban-form" class="volo-btn volo-btn-primary">
+                      {t("sys.waf_ban_btn")}
+                    </button>
+                  </>
+                }
+              >
+                <form
+                  id="volo-sys-ban-form"
+                  autoComplete="off"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    try {
+                      await apiFetch("/api/admin/security/ip-bans", {
+                        method: "POST",
+                        body: JSON.stringify({
+                          cidr: banForm.cidr,
+                          note: banForm.note,
+                          expires_hours: banForm.expires_hours,
+                        }),
+                      });
+                      setBanModalOpen(false);
+                      showToast(t("common.saved"));
+                      void loadSub();
+                    } catch (err: any) {
+                      showToast(err.message);
+                    }
+                  }}
+                >
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_ban_cidr")}</label>
+                    <input
+                      class="volo-input"
+                      required
+                      name="waf_ban_cidr_target"
+                      autoComplete="off"
+                      placeholder={t("sys.waf_cidr_ph")}
+                      value={banForm.cidr}
+                      onInput={(e) => setBanForm({ ...banForm, cidr: (e.currentTarget as HTMLInputElement).value })}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_ban_dur")}</label>
+                    <ConsoleSelect
+                      value={String(banForm.expires_hours)}
+                      options={[
+                        { value: "24", label: t("sys.waf_dur_24h") },
+                        { value: "168", label: t("sys.waf_dur_7d") },
+                        { value: "720", label: t("sys.waf_dur_30d") },
+                        { value: "0", label: t("sys.waf_dur_perm") },
+                      ]}
+                      onChange={(v) => setBanForm({ ...banForm, expires_hours: Number(v) })}
+                    />
+                  </div>
+                  <div class="volo-field" style={{ marginBottom: 0 }}>
+                    <label>{t("sys.lbl_ban_reason")}</label>
+                    <input
+                      class="volo-input"
+                      name="waf_ban_reason_note"
+                      autoComplete="off"
+                      value={banForm.note}
+                      onInput={(e) => setBanForm({ ...banForm, note: (e.currentTarget as HTMLInputElement).value })}
+                    />
+                  </div>
+                </form>
+              </AnimatedModal>
             </div>
           )}
 
@@ -2008,82 +2668,31 @@ export function SystemWorkspace({
                   <h3 class="volo-card-title">{t("sys.geo_head")}</h3>
                   <p class="volo-sec-desc">{t("sys.geo_desc")}</p>
                 </div>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary volo-btn-sm"
+                  onClick={() => {
+                    setEditingGeoId(null);
+                    setGeoForm({
+                      name: "Geo Rule",
+                      action: "deny",
+                      countries: "",
+                      regions: "",
+                      sort_order: 10,
+                      is_enabled: true,
+                      on_miss: "next",
+                    });
+                    setGeoModalOpen(true);
+                  }}
+                >
+                  + {t("sys.new_geo_rule")}
+                </button>
               </div>
               {!geoCircuitEnabled && (
                 <div class="volo-subcard" style={{ marginTop: 0, fontSize: "12.5px", color: "var(--volo-warn)" }}>
                   {t("sys.geo_circuit_off")}
                 </div>
               )}
-              <form
-                autoComplete="off"
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  try {
-                    await apiFetch("/api/admin/security/geo-rules", {
-                      method: "POST",
-                      body: JSON.stringify({ ...geoForm, is_enabled: true }),
-                    });
-                    setGeoForm({ name: "Geo Rule", action: "deny", countries: "", regions: "", sort_order: 10 });
-                    void loadSub();
-                  } catch (err: any) {
-                    showToast(err.message);
-                  }
-                }}
-                class="volo-form-bar"
-              >
-                <div class="volo-grid-2">
-                  <div class="volo-field">
-                    <label>{t("sys.lbl_geo_mode")}</label>
-                    <ConsoleSelect
-                      value={geoForm.action}
-                      options={[
-                        { value: "deny", label: t("sys.geo_deny") },
-                        { value: "allow", label: t("sys.geo_allow") },
-                      ]}
-                      onChange={(v) => setGeoForm({ ...geoForm, action: v })}
-                    />
-                  </div>
-                  <div class="volo-field">
-                    <label>{t("sys.lbl_geo_note")}</label>
-                    <input
-                      class="volo-input"
-                      name="geo_rule_title_note"
-                      autoComplete="off"
-                      value={geoForm.name}
-                      onInput={(e) => setGeoForm({ ...geoForm, name: (e.currentTarget as HTMLInputElement).value })}
-                    />
-                  </div>
-                </div>
-                <div class="volo-grid-2" style={{ alignItems: "end" }}>
-                  <div class="volo-field" style={{ marginBottom: 0 }}>
-                    <label>{t("sys.lbl_geo_country")}</label>
-                    <input
-                      class="volo-input"
-                      name="geo_iso_codes"
-                      autoComplete="off"
-                      placeholder={t("sys.geo_iso_ph")}
-                      value={geoForm.countries}
-                      onInput={(e) => setGeoForm({ ...geoForm, countries: (e.currentTarget as HTMLInputElement).value })}
-                    />
-                  </div>
-                  <div class="volo-field" style={{ marginBottom: 0 }}>
-                    <label>{t("sys.lbl_geo_region")}</label>
-                    <div style={{ display: "flex", gap: "8px" }}>
-                      <input
-                        class="volo-input"
-                        name="geo_subdivision_codes"
-                        autoComplete="off"
-                        placeholder={t("sys.geo_region_ph")}
-                        value={geoForm.regions}
-                        onInput={(e) => setGeoForm({ ...geoForm, regions: (e.currentTarget as HTMLInputElement).value })}
-                      />
-                      <button type="submit" class="volo-btn volo-btn-primary" style={{ flexShrink: 0 }}>
-                        {t("common.create")}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </form>
               <div class="volo-table-wrap">
                 <table class="volo-table" style={{ minWidth: "100%" }}>
                   <thead>
@@ -2105,10 +2714,15 @@ export function SystemWorkspace({
                       geoPaged.slice.map((g) => (
                         <tr key={g.id}>
                           <td>
-                            <span class={`volo-status-pill ${g.action === "deny" ? "danger" : "ok"}`}>
-                              <span class="volo-status-dot" />
-                              {g.action === "deny" ? t("sys.geo_deny") : t("sys.geo_allow")}
-                            </span>
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                              <span class={`volo-status-pill ${g.action === "deny" ? "danger" : "ok"}`}>
+                                <span class="volo-status-dot" />
+                                {g.action === "deny" ? t("sys.geo_deny") : t("sys.geo_allow")}
+                              </span>
+                              {g.is_enabled === false && (
+                                <span class="volo-mini-tag warn">{t("tbl.status_disabled")}</span>
+                              )}
+                            </div>
                           </td>
                           <td>
                             <span class="volo-code-chip">
@@ -2116,16 +2730,42 @@ export function SystemWorkspace({
                             </span>
                           </td>
                           <td>
-                            <span class="volo-help">{g.name || "—"}</span>
+                            <div class="volo-cell-meta">
+                              <span>{g.name || "—"}</span>
+                              {typeof g.sort_order === "number" && <span class="volo-code-chip">#{g.sort_order}</span>}
+                            </div>
                           </td>
                           <td class="col-act">
                             <div class="volo-row-actions">
                               <button
                                 type="button"
+                                class="volo-act-btn"
+                                onClick={() => {
+                                  setEditingGeoId(g.id);
+                                  setGeoForm({
+                                    name: g.name || "Geo Rule",
+                                    action: g.action || "deny",
+                                    countries: g.countries || "",
+                                    regions: g.regions || "",
+                                    sort_order: typeof g.sort_order === "number" ? g.sort_order : 10,
+                                    is_enabled: g.is_enabled !== false,
+                                    on_miss: g.on_miss || "next",
+                                  });
+                                  setGeoModalOpen(true);
+                                }}
+                              >
+                                {t("common.edit")}
+                              </button>
+                              <button
+                                type="button"
                                 class="volo-act-btn danger"
                                 onClick={async () => {
-                                  await apiFetch(`/api/admin/security/geo-rules/${g.id}`, { method: "DELETE" });
-                                  void loadSub();
+                                  try {
+                                    await apiFetch(`/api/admin/security/geo-rules/${g.id}`, { method: "DELETE" });
+                                    void loadSub();
+                                  } catch (err: any) {
+                                    showToast(err.message);
+                                  }
                                 }}
                               >
                                 {t("common.delete")}
@@ -2138,7 +2778,123 @@ export function SystemWorkspace({
                   </tbody>
                 </table>
               </div>
-              <Pagination total={geoRules.length} page={geoPaged.safePage} pageSize={15} onChange={setGeoPage} />
+              <Pagination
+                total={geoRules.length}
+                page={geoPaged.safePage}
+                pageSize={15}
+                onChange={(p) => {
+                  setGeoPage(p);
+                  resetConsoleScroll();
+                }}
+              />
+
+              <AnimatedModal
+                open={geoModalOpen}
+                onClose={() => setGeoModalOpen(false)}
+                title={editingGeoId ? t("sys.edit_geo_rule") : t("sys.new_geo_rule")}
+                maxWidth="540px"
+                footer={
+                  <>
+                    <button type="button" class="volo-btn" onClick={() => setGeoModalOpen(false)}>
+                      {t("common.cancel")}
+                    </button>
+                    <button type="submit" form="volo-sys-geo-form" class="volo-btn volo-btn-primary">
+                      {editingGeoId ? t("common.save") : t("common.create")}
+                    </button>
+                  </>
+                }
+              >
+                <form
+                  id="volo-sys-geo-form"
+                  autoComplete="off"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    try {
+                      if (editingGeoId) {
+                        await apiFetch(`/api/admin/security/geo-rules/${editingGeoId}`, {
+                          method: "PUT",
+                          body: JSON.stringify(geoForm),
+                        });
+                      } else {
+                        await apiFetch("/api/admin/security/geo-rules", {
+                          method: "POST",
+                          body: JSON.stringify(geoForm),
+                        });
+                      }
+                      setGeoModalOpen(false);
+                      showToast(t("common.saved"));
+                      void loadSub();
+                    } catch (err: any) {
+                      showToast(err.message);
+                    }
+                  }}
+                >
+                  <div class="volo-grid-2">
+                    <div class="volo-field">
+                      <label>{t("sys.lbl_geo_mode")}</label>
+                      <ConsoleSelect
+                        value={geoForm.action}
+                        options={[
+                          { value: "deny", label: t("sys.geo_deny") },
+                          { value: "allow", label: t("sys.geo_allow") },
+                        ]}
+                        onChange={(v) => setGeoForm({ ...geoForm, action: v })}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.lbl_geo_sort")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        value={geoForm.sort_order}
+                        onInput={(e) => setGeoForm({ ...geoForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) })}
+                      />
+                    </div>
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_geo_note")}</label>
+                    <input
+                      class="volo-input"
+                      name="geo_rule_title_note"
+                      autoComplete="off"
+                      value={geoForm.name}
+                      onInput={(e) => setGeoForm({ ...geoForm, name: (e.currentTarget as HTMLInputElement).value })}
+                    />
+                  </div>
+                  <div class="volo-grid-2">
+                    <div class="volo-field">
+                      <label>{t("sys.lbl_geo_country")}</label>
+                      <input
+                        class="volo-input"
+                        name="geo_iso_codes"
+                        autoComplete="off"
+                        placeholder={t("sys.geo_iso_ph")}
+                        value={geoForm.countries}
+                        onInput={(e) => setGeoForm({ ...geoForm, countries: (e.currentTarget as HTMLInputElement).value })}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.lbl_geo_region")}</label>
+                      <input
+                        class="volo-input"
+                        name="geo_subdivision_codes"
+                        autoComplete="off"
+                        placeholder={t("sys.geo_region_ph")}
+                        value={geoForm.regions}
+                        onInput={(e) => setGeoForm({ ...geoForm, regions: (e.currentTarget as HTMLInputElement).value })}
+                      />
+                    </div>
+                  </div>
+                  <label class="volo-check-item" style={{ marginBottom: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={geoForm.is_enabled}
+                      onChange={(e) => setGeoForm({ ...geoForm, is_enabled: (e.currentTarget as HTMLInputElement).checked })}
+                    />
+                    <span>{t("sys.geo_rule_enabled")}</span>
+                  </label>
+                </form>
+              </AnimatedModal>
             </div>
           )}
         </div>
@@ -2156,7 +2912,7 @@ export function SystemWorkspace({
               </div>
 
               <div class="volo-subcard" style={{ marginTop: 0, marginBottom: 0 }}>
-                <div class="volo-check-grid" style={{ marginTop: 0 }}>
+                <div class="volo-check-grid" style={{ marginTop: 0, marginBottom: 0 }}>
                   <label class="volo-check-item">
                     <input
                       type="checkbox"
@@ -2174,84 +2930,84 @@ export function SystemWorkspace({
                     <span>{t("sys.backup_dry_run")}</span>
                   </label>
                 </div>
+              </div>
 
-                <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    class="volo-btn volo-btn-primary"
-                    onClick={async () => {
-                      const csrf = csrfTokenSig.value || (await apiFetch<any>("/api/admin/me")).csrf_token;
-                      const res = await fetch(`/api/admin/backup/export?media=${includeMediaExport ? 1 : 0}`, {
-                        method: "POST",
-                        headers: { "X-CSRF-Token": csrf },
-                        credentials: "same-origin",
-                      });
-                      if (!res.ok) {
-                        showToast(t("sys.backup_export_err"));
+              <div class="volo-form-actions">
+                <label class="volo-btn" style={{ cursor: "pointer" }}>
+                  {t("sys.backup_legacy")}
+                  <input
+                    type="file"
+                    accept=".zip,.json"
+                    style={{ display: "none" }}
+                    onChange={async (e) => {
+                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
+                      if (!f) return;
+                      try {
+                        const fd = new FormData();
+                        fd.append("file", f);
+                        await apiFetch("/api/admin/backup/import-legacy", { method: "POST", body: fd });
+                        showToast(t("setup.legacy_done"));
+                        void loadSub();
+                      } catch (err: any) {
+                        showToast(err.message);
+                      }
+                      (e.currentTarget as HTMLInputElement).value = "";
+                    }}
+                  />
+                </label>
+
+                <label class="volo-btn" style={{ cursor: "pointer" }}>
+                  {t("sys.backup_restore")}
+                  <input
+                    type="file"
+                    accept=".zip,.json"
+                    style={{ display: "none" }}
+                    onChange={async (e) => {
+                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
+                      if (!f) return;
+                      if (!dryRunRestore && !window.confirm(t("sys.confirm_restore"))) {
+                        (e.currentTarget as HTMLInputElement).value = "";
                         return;
                       }
-                      const blob = await res.blob();
-                      const a = document.createElement("a");
-                      a.href = URL.createObjectURL(blob);
-                      a.download = `volo-backup-${Date.now()}.zip`;
-                      a.click();
-                      URL.revokeObjectURL(a.href);
+                      try {
+                        const fd = new FormData();
+                        fd.append("file", f);
+                        fd.append("dry_run", dryRunRestore ? "true" : "false");
+                        await apiFetch("/api/admin/backup/restore", { method: "POST", body: fd });
+                        showToast(dryRunRestore ? t("sys.backup_dry_ok") : t("sys.backup_restored"));
+                        void loadSub();
+                      } catch (err: any) {
+                        showToast(err.message);
+                      }
+                      (e.currentTarget as HTMLInputElement).value = "";
                     }}
-                  >
-                    {t("sys.backup_export")}
-                  </button>
+                  />
+                </label>
 
-                  <label class="volo-btn" style={{ cursor: "pointer" }}>
-                    {t("sys.backup_restore")}
-                    <input
-                      type="file"
-                      accept=".zip,.json"
-                      style={{ display: "none" }}
-                      onChange={async (e) => {
-                        const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                        if (!f) return;
-                        if (!dryRunRestore && !window.confirm(t("sys.confirm_restore"))) {
-                          (e.currentTarget as HTMLInputElement).value = "";
-                          return;
-                        }
-                        try {
-                          const fd = new FormData();
-                          fd.append("file", f);
-                          fd.append("dry_run", dryRunRestore ? "true" : "false");
-                          await apiFetch("/api/admin/backup/restore", { method: "POST", body: fd });
-                          showToast(dryRunRestore ? t("sys.backup_dry_ok") : t("sys.backup_restored"));
-                          void loadSub();
-                        } catch (err: any) {
-                          showToast(err.message);
-                        }
-                        (e.currentTarget as HTMLInputElement).value = "";
-                      }}
-                    />
-                  </label>
-
-                  <label class="volo-btn" style={{ cursor: "pointer" }}>
-                    {t("sys.backup_legacy")}
-                    <input
-                      type="file"
-                      accept=".zip,.json"
-                      style={{ display: "none" }}
-                      onChange={async (e) => {
-                        const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                        if (!f) return;
-                        try {
-                          const fd = new FormData();
-                          fd.append("file", f);
-                          await apiFetch("/api/admin/backup/import-legacy", { method: "POST", body: fd });
-                          showToast(t("setup.legacy_done"));
-                          void loadSub();
-                        } catch (err: any) {
-                          showToast(err.message);
-                        }
-                        (e.currentTarget as HTMLInputElement).value = "";
-                      }}
-                    />
-                  </label>
-                </div>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary"
+                  onClick={async () => {
+                    const csrf = csrfTokenSig.value || (await apiFetch<any>("/api/admin/me")).csrf_token;
+                    const res = await fetch(`/api/admin/backup/export?media=${includeMediaExport ? 1 : 0}`, {
+                      method: "POST",
+                      headers: { "X-CSRF-Token": csrf },
+                      credentials: "same-origin",
+                    });
+                    if (!res.ok) {
+                      showToast(t("sys.backup_export_err"));
+                      return;
+                    }
+                    const blob = await res.blob();
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `volo-backup-${Date.now()}.zip`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                  }}
+                >
+                  {t("sys.backup_export")}
+                </button>
               </div>
             </div>
 
@@ -2445,9 +3201,11 @@ export function SystemWorkspace({
                   </div>
                 )}
 
-                <button type="submit" class="volo-btn volo-btn-primary">
-                  {t("sys.save_backup_cfg")}
-                </button>
+                <div class="volo-form-actions">
+                  <button type="submit" class="volo-btn volo-btn-primary">
+                    {t("sys.save_backup_cfg")}
+                  </button>
+                </div>
               </form>
             )}
           </div>
@@ -2552,7 +3310,15 @@ export function SystemWorkspace({
                 </tbody>
               </table>
             </div>
-            <Pagination total={localBackups.length} page={localBakPaged.safePage} pageSize={10} onChange={setLocalBakPage} />
+            <Pagination
+              total={localBackups.length}
+              page={localBakPaged.safePage}
+              pageSize={10}
+              onChange={(p) => {
+                setLocalBakPage(p);
+                resetConsoleScroll();
+              }}
+            />
           </div>
 
           <div class="volo-card">
@@ -2675,7 +3441,15 @@ export function SystemWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={auditLogs.length} page={auditPaged.safePage} pageSize={20} onChange={setAuditPage} />
+          <Pagination
+            total={auditLogs.length}
+            page={auditPaged.safePage}
+            pageSize={20}
+            onChange={(p) => {
+              setAuditPage(p);
+              resetConsoleScroll();
+            }}
+          />
         </div>
       )}
     </div>

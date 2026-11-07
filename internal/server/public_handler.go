@@ -53,6 +53,7 @@ type AppDeps struct {
 	Content        *content.Service
 	Themes         *theme.Engine
 	StartedAt      time.Time
+	Version        string
 
 	SendVerificationMail   VerificationMailSender
 	NotifyCommentCreated   CommentEventNotifier
@@ -976,8 +977,20 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 	navItems, _ := s.deps.Content.ListPublicNavItems(r.Context(), locale)
 	cats, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
 	tags, _ := s.deps.Content.ListTagsWithCounts(r.Context(), snap.Reading.PopularTagsCount)
-	recentComments, _ := s.deps.Content.ListRecentPublicComments(r.Context(), snap.Reading.RecentCommentsCount)
+	var recentComments []content.RecentCommentItem
+	if r.URL.Path == "/" && viewer != nil && viewer.Role == domain.RoleAdmin && viewer.Status == domain.UserStatusActive {
+		recentComments, _ = s.deps.Content.ListRecentPublicComments(r.Context(), snap.Reading.RecentCommentsCount)
+	}
 	extras := s.deps.Content.GetPublicChromeExtras(r.Context(), locale, 6)
+
+	viewerCSRF := ""
+	if viewer != nil && s.deps.Auth != nil {
+		if ck, err := r.Cookie(auth.SessionCookieName); err == nil && strings.TrimSpace(ck.Value) != "" {
+			if _, sess, aErr := s.deps.Auth.AuthenticateSession(r.Context(), ck.Value); aErr == nil && sess != nil {
+				viewerCSRF = s.deps.Auth.ComputeCSRFToken(sess.ID)
+			}
+		}
+	}
 
 	var headSlots, footerSlots []plugin.RenderedSlot
 	if s.deps.Plugins != nil {
@@ -1018,6 +1031,7 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 		SEO:                snap.SEO,
 		Appearance:         snap.Appearance,
 		Viewer:             viewer,
+		ViewerCSRFToken:    viewerCSRF,
 		Owner:              extras.Owner,
 		Authors:            extras.Authors,
 		Stats:              extras.Stats,
@@ -1080,6 +1094,7 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 		}
 		viewer, _ := s.resolveViewer(r)
 		pctx := s.basePageContext(r, viewer)
+		pctx.IsHome = true
 		page := parsePageParam(r)
 		cards, total, err := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
 			Page:     page,
@@ -1504,7 +1519,31 @@ func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Re
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, "/", http.StatusFound)
+	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
+	if adminPrefix == "/" {
+		adminPrefix = "/console"
+	}
+	isSafeTarget := func(cand string) bool {
+		if !strings.HasPrefix(cand, "/") || strings.HasPrefix(cand, "//") || strings.ContainsAny(cand, "\r\n") {
+			return false
+		}
+		if cand == "/logout" || strings.HasPrefix(cand, "/logout?") || cand == adminPrefix || strings.HasPrefix(cand, adminPrefix+"/") {
+			return false
+		}
+		return true
+	}
+	dest := "/"
+	if qRedir := strings.TrimSpace(r.URL.Query().Get("redirect")); isSafeTarget(qRedir) {
+		dest = qRedir
+	} else if ref := strings.TrimSpace(r.Referer()); ref != "" {
+		if u, err := url.Parse(ref); err == nil && (u.Host == "" || strings.EqualFold(u.Host, r.Host)) {
+			cand := u.RequestURI()
+			if isSafeTarget(cand) {
+				dest = cand
+			}
+		}
+	}
+	http.Redirect(w, r, dest, http.StatusSeeOther)
 }
 
 func (s *AppServer) handlePublicGitHubShowcaseRoute(w http.ResponseWriter, r *http.Request) {
@@ -1558,7 +1597,7 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 	case "admin-logout.svg":
 		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 2.5H3.6A1.4 1.4 0 0 0 2.2 3.9v8.2a1.4 1.4 0 0 0 1.4 1.4h2.6"/><path d="M10.5 11.2 13.8 8l-3.3-3.2"/><path d="M13.8 8H6.2"/></svg>`
 	case "github_repo.jpg", "github_repo.png", "github_repo.svg":
-		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="800" height="450"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#f7f5ef"/><stop offset="100%" stop-color="#ece8dd"/></linearGradient></defs><rect width="800" height="450" fill="url(#g)"/><g fill="none" stroke="#2f5d50" stroke-opacity="0.16" stroke-width="2"><rect x="44" y="40" width="712" height="370" rx="18"/><line x1="88" y1="120" x2="360" y2="120"/><line x1="88" y1="162" x2="520" y2="162"/><line x1="88" y1="204" x2="460" y2="204"/></g><g transform="translate(560,155) scale(8.5)"><path fill="#2f5d50" fill-opacity="0.82" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></g><text x="88" y="320" font-family="system-ui,-apple-system,sans-serif" font-size="30" font-weight="600" fill="#1e2420">Open Source Showcase</text><text x="88" y="356" font-family="ui-monospace,monospace" font-size="16" fill="#5e6862">GitHub Public Repositories</text></svg>`
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="800" height="450"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0d1513"/><stop offset="55%" stop-color="#14231e"/><stop offset="100%" stop-color="#1d352d"/></linearGradient><pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#5fb399" stroke-opacity="0.08" stroke-width="1"/></pattern></defs><rect width="800" height="450" fill="url(#bg)"/><rect width="800" height="450" fill="url(#grid)"/><g fill="none" stroke="#64c3a6" stroke-opacity="0.22" stroke-width="1.5"><rect x="44" y="38" width="712" height="374" rx="18"/><circle cx="78" cy="68" r="5" fill="#e06c75" stroke="none"/><circle cx="96" cy="68" r="5" fill="#e5c07b" stroke="none"/><circle cx="114" cy="68" r="5" fill="#98c379" stroke="none"/><line x1="44" y1="94" x2="756" y2="94"/></g><g stroke-linecap="round"><line x1="84" y1="142" x2="220" y2="142" stroke="#64c3a6" stroke-opacity="0.65" stroke-width="6"/><line x1="238" y1="142" x2="394" y2="142" stroke="#8ab4f8" stroke-opacity="0.35" stroke-width="6"/><line x1="84" y1="176" x2="462" y2="176" stroke="#d8e6e0" stroke-opacity="0.22" stroke-width="5"/><line x1="84" y1="208" x2="348" y2="208" stroke="#64c3a6" stroke-opacity="0.38" stroke-width="5"/><line x1="366" y1="208" x2="498" y2="208" stroke="#e5c07b" stroke-opacity="0.32" stroke-width="5"/><line x1="84" y1="240" x2="412" y2="240" stroke="#d8e6e0" stroke-opacity="0.16" stroke-width="5"/></g><g transform="translate(556,142) scale(8.8)"><path fill="#e6f2ed" fill-opacity="0.9" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></g><text x="84" y="330" font-family="system-ui,-apple-system,sans-serif" font-size="30" font-weight="700" fill="#eef6f2" letter-spacing="0.4">OPEN SOURCE MATRIX</text><text x="84" y="364" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="15" fill="#8fb5a7">git://github.com · public repositories &amp; craft</text></svg>`
 	default:
 		http.NotFound(w, r)
 		return

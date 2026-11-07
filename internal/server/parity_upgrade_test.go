@@ -274,3 +274,229 @@ func TestParityUpgrades_Password6_BrandIcon_Locales_Themes_Analytics(t *testing.
 		t.Fatalf("expected 30 analytics_series buckets for ?days=30, got %d", len(ovPayload.AnalyticsSeries))
 	}
 }
+
+func TestUXAndAdminModalCRUDParity(t *testing.T) {
+	env := setupM5TestEnv(t, "/console")
+
+	stResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/setup/status", nil, nil, nil)
+	var setupCSRF string
+	for _, c := range stResp.Cookies() {
+		if strings.Contains(c.Name, "csrf") {
+			setupCSRF = c.Value
+		}
+	}
+	okSetupResp, okSetupBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/setup/complete", map[string]any{
+		"admin_username":     "uxadmin",
+		"admin_email":        "ux@studio.example.com",
+		"admin_password":     "123456",
+		"admin_display_name": "UX Admin",
+		"site_title":         "Volo UX",
+		"default_locale":     "zh-CN",
+	}, stResp.Cookies(), map[string]string{"X-CSRF-Token": setupCSRF})
+	if okSetupResp.StatusCode != http.StatusOK {
+		t.Fatalf("setup complete failed: %d %s", okSetupResp.StatusCode, string(okSetupBody))
+	}
+	adminCookies := okSetupResp.Cookies()
+	var setupDone struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	_ = json.Unmarshal(okSetupBody, &setupDone)
+	adminCSRF := map[string]string{"X-CSRF-Token": setupDone.CSRFToken}
+
+	// 1. `/images/github_repo.jpg` serves Open Source Showcase SVG cover
+	ghCoverResp, ghCoverBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/images/github_repo.jpg", nil, nil, nil)
+	if ghCoverResp.StatusCode != http.StatusOK || !bytes.Contains(ghCoverBody, []byte("<svg")) {
+		t.Fatalf("GET /images/github_repo.jpg failed: status=%d", ghCoverResp.StatusCode)
+	}
+
+	// 2. `GET /api/admin/me` returns `storage_driver`
+	meResp, meBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/me", nil, adminCookies, nil)
+	if meResp.StatusCode != http.StatusOK || !bytes.Contains(meBody, []byte(`"storage_driver":"local"`)) {
+		t.Fatalf("GET /api/admin/me missing storage_driver: %d %s", meResp.StatusCode, string(meBody))
+	}
+
+	// 3. `GET /api/admin/media` reconciles untracked local uploads & `POST /api/admin/media/orphans?delete=1` cleans orphans
+	tinyPNG := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+		0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41,
+		0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+		0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+		0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+		0x42, 0x60, 0x82,
+	}
+	orphanPath := filepath.Join(env.cfg.UploadDir, "dropped-orphan.png")
+	if err := os.WriteFile(orphanPath, tinyPNG, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mediaResp, mediaBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/media", nil, adminCookies, nil)
+	if mediaResp.StatusCode != http.StatusOK || !bytes.Contains(mediaBody, []byte(`"dropped-orphan.png"`)) || !bytes.Contains(mediaBody, []byte(`"is_orphan":true`)) {
+		t.Fatalf("GET /api/admin/media failed to reconcile orphan upload: %d %s", mediaResp.StatusCode, string(mediaBody))
+	}
+	cleanResp, cleanBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/media/orphans?delete=1", map[string]any{}, adminCookies, adminCSRF)
+	if cleanResp.StatusCode != http.StatusOK || !bytes.Contains(cleanBody, []byte(`"deleted_count":1`)) {
+		t.Fatalf("POST /api/admin/media/orphans?delete=1 failed: %d %s", cleanResp.StatusCode, string(cleanBody))
+	}
+
+	// 4. Modal `PUT` endpoints on tags, redirects, and geo-rules
+	tagCreateResp, tagCreateBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/tags", map[string]any{
+		"name": "Golang",
+		"slug": "golang",
+	}, adminCookies, adminCSRF)
+	if tagCreateResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/admin/tags = %d %s", tagCreateResp.StatusCode, string(tagCreateBody))
+	}
+	var createdTag struct {
+		Tag struct {
+			ID string `json:"id"`
+		} `json:"tag"`
+	}
+	_ = json.Unmarshal(tagCreateBody, &createdTag)
+	tagPutResp, _ := doJSONReq(t, http.MethodPut, env.ts.URL+"/api/admin/tags/"+createdTag.Tag.ID, map[string]any{
+		"name": "Go Runtime",
+		"slug": "go-runtime",
+	}, adminCookies, adminCSRF)
+	if tagPutResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /api/admin/tags/{id} = %d", tagPutResp.StatusCode)
+	}
+
+	redCreateResp, redCreateBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/redirects", map[string]any{
+		"source_path": "/old-note",
+		"target_path": "/posts/new-note",
+		"status_code": 301,
+		"is_enabled":  true,
+	}, adminCookies, adminCSRF)
+	if redCreateResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/admin/redirects = %d %s", redCreateResp.StatusCode, string(redCreateBody))
+	}
+	var createdRed struct {
+		Item struct {
+			ID string `json:"id"`
+		} `json:"item"`
+		Redirect struct {
+			ID string `json:"id"`
+		} `json:"redirect"`
+	}
+	_ = json.Unmarshal(redCreateBody, &createdRed)
+	redID := createdRed.Item.ID
+	if redID == "" {
+		redID = createdRed.Redirect.ID
+	}
+	if redID != "" {
+		redPutResp, _ := doJSONReq(t, http.MethodPut, env.ts.URL+"/api/admin/redirects/"+redID, map[string]any{
+			"source_path": "/old-note-v2",
+			"target_path": "/posts/new-note-v2",
+			"status_code": 302,
+			"is_enabled":  true,
+		}, adminCookies, adminCSRF)
+		if redPutResp.StatusCode != http.StatusOK {
+			t.Fatalf("PUT /api/admin/redirects/{id} = %d", redPutResp.StatusCode)
+		}
+	}
+
+	geoCreateResp, geoCreateBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules", map[string]any{
+		"name":       "Test Disabled Rule",
+		"is_enabled": false,
+		"action":     "deny",
+		"on_miss":    "next",
+		"countries":  "AQ",
+		"sort_order": 10,
+	}, adminCookies, adminCSRF)
+	if geoCreateResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/admin/security/geo-rules = %d %s", geoCreateResp.StatusCode, string(geoCreateBody))
+	}
+	var createdGeo struct {
+		Rule struct {
+			ID string `json:"id"`
+		} `json:"rule"`
+	}
+	_ = json.Unmarshal(geoCreateBody, &createdGeo)
+	geoPutResp, _ := doJSONReq(t, http.MethodPut, env.ts.URL+"/api/admin/security/geo-rules/"+createdGeo.Rule.ID, map[string]any{
+		"name":       "Updated Disabled Rule",
+		"is_enabled": false,
+		"action":     "deny",
+		"on_miss":    "allow",
+		"countries":  "AQ",
+		"sort_order": 5,
+	}, adminCookies, adminCSRF)
+	if geoPutResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /api/admin/security/geo-rules/{id} = %d", geoPutResp.StatusCode)
+	}
+
+	// 5. Article + Comment Moderation (`POST /api/admin/comments/{id}/ban-ip`) + Admin-Only Homepage RecentComments
+	artCreateResp, artCreateBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/articles", map[string]any{
+		"title":      "Hello Parity World",
+		"slug":       "hello-parity-world",
+		"content_md": "## Section One\n\nBody text.",
+		"status":     "published",
+		"tags":       []string{"Go Runtime"},
+	}, adminCookies, adminCSRF)
+	if artCreateResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/admin/articles = %d %s", artCreateResp.StatusCode, string(artCreateBody))
+	}
+	var createdArt struct {
+		Article struct {
+			ID string `json:"id"`
+		} `json:"article"`
+	}
+	_ = json.Unmarshal(artCreateBody, &createdArt)
+
+	_, err := env.store.ExecContext(env.ctx,
+		`INSERT INTO comments (id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash, author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale, client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at)
+		 VALUES ('cmt-test-1', 'article', ?, '', '', '', '', '', 'Visitor Bob', '', '', '', 'zh-CN', '203.0.113.77', '203.0.113.*', 'US', 'UNIQUE_RECENT_COMMENT_SNIPPET', 'approved', 0, 1700000000000, 1700000000000)`,
+		createdArt.Article.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Guest homepage should NOT display `UNIQUE_RECENT_COMMENT_SNIPPET`, whereas logged-in admin homepage DOES display it
+	_, guestHomeHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, nil)
+	if bytes.Contains(guestHomeHTML, []byte("UNIQUE_RECENT_COMMENT_SNIPPET")) {
+		t.Fatalf("guest homepage must NOT expose RecentComments")
+	}
+	_, adminHomeHTML := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, adminCookies, nil)
+	if !bytes.Contains(adminHomeHTML, []byte("UNIQUE_RECENT_COMMENT_SNIPPET")) {
+		t.Fatalf("logged-in admin homepage expected to display RecentComments")
+	}
+
+	// Ban commenter IP via `POST /api/admin/comments/cmt-test-1/ban-ip`
+	banResp, banBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/comments/cmt-test-1/ban-ip", map[string]any{
+		"note":           "spammer",
+		"expires_hours":  24,
+		"reject_comment": true,
+	}, adminCookies, adminCSRF)
+	if banResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/admin/comments/cmt-test-1/ban-ip = %d %s", banResp.StatusCode, string(banBody))
+	}
+
+	// 6. Overview enriched fields (`monthly_articles`, `category_usage`, `top_tags`, `recent_logs`) & `about/project-info`
+	ovResp, ovBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/overview", nil, adminCookies, nil)
+	if ovResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/admin/overview = %d", ovResp.StatusCode)
+	}
+	var ovData struct {
+		MonthlyArticles []any `json:"monthly_articles"`
+		TopTags         []any `json:"top_tags"`
+		RecentLogs      []any `json:"recent_logs"`
+	}
+	if err := json.Unmarshal(ovBody, &ovData); err != nil {
+		t.Fatal(err)
+	}
+	if len(ovData.MonthlyArticles) != 12 || len(ovData.RecentLogs) == 0 {
+		t.Fatalf("expected 12 monthly_articles and non-empty recent_logs, got months=%d logs=%d", len(ovData.MonthlyArticles), len(ovData.RecentLogs))
+	}
+
+	abResp, abBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/about/project-info", nil, adminCookies, nil)
+	if abResp.StatusCode != http.StatusOK || !bytes.Contains(abBody, []byte(`"go_version"`)) {
+		t.Fatalf("GET /api/admin/about/project-info = %d %s", abResp.StatusCode, string(abBody))
+	}
+
+	// 7. `GET /logout?redirect=/archives` revokes session & redirects `303 SeeOther`
+	logoutResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/logout?redirect=/archives", nil, adminCookies, nil)
+	if logoutResp.StatusCode != http.StatusSeeOther || logoutResp.Header.Get("Location") != "/archives" {
+		t.Fatalf("GET /logout?redirect=/archives expected 303 -> /archives, got %d -> %q", logoutResp.StatusCode, logoutResp.Header.Get("Location"))
+	}
+}
+

@@ -40,7 +40,7 @@ func TestSettingsManagerAtomicPatchSecretMaskingAndHotReload(t *testing.T) {
 		t.Fatalf("PatchDomain(site) failed: v=%d err=%v", v1, err)
 	}
 	snap := mgr.Snapshot()
-	if snap.Site.Title != "Will's Notes" || snap.Site.Subtitle != "Independent thoughts & craft" || len(snap.Site.SocialLinks) != 1 {
+	if snap.Site.Title != "Will's Notes" || snap.Site.Subtitle != "记录 · 思考 · 分享" || len(snap.Site.SocialLinks) != 1 {
 		t.Fatalf("unexpected site snapshot after partial PATCH: %+v", snap.Site)
 	}
 

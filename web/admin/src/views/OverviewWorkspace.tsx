@@ -5,11 +5,13 @@ import {
   currentUserSig,
   loadLocalDraft,
   LocalDraft,
+  resetConsoleScroll,
   saveLocalDraft,
   showToast,
 } from "../api";
 import { CM6Editor, QuickInsertItem } from "../components/CM6Editor";
-import { ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
+import { MediaPickButton } from "../components/MediaLibraryModal";
+import { AnimatedModal, ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
 
 export type OverviewSection = "dashboard" | "editor" | "articles" | "drafts";
@@ -18,6 +20,16 @@ interface ChartPoint {
   x: number;
   y: number;
 }
+
+const DONUT_PALETTE = [
+  "#246b51",
+  "#2d6583",
+  "#c9822b",
+  "#70517d",
+  "#87525f",
+  "#3b7a75",
+  "#8c6d3f",
+];
 
 function buildSmoothCurve(pts: ChartPoint[]): string {
   if (pts.length === 0) return "";
@@ -44,6 +56,37 @@ function buildFallbackDays(days: number): Array<{ stat_date: string; pv: number;
       uv: 0,
     });
   }
+  return out;
+}
+
+function buildFallbackMonths(months = 12): Array<{ month: string; count: number }> {
+  const out: Array<{ month: string; count: number }> = [];
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  for (let i = months - 1; i >= 0; i--) {
+    const dt = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    out.push({
+      month: `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}`,
+      count: 0,
+    });
+  }
+  return out;
+}
+
+function parseTagList(raw: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  raw
+    .split(/[,，]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .forEach((item) => {
+      const k = item.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(item);
+      }
+    });
   return out;
 }
 
@@ -106,6 +149,212 @@ function computeLineDiff(oldText: string, newText: string): DiffLine[] {
   return out;
 }
 
+function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: number }> }) {
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const series = items.length > 0 ? items : buildFallbackMonths(12);
+  const W = 320;
+  const H = 158;
+  const padL = 28;
+  const padR = 14;
+  const padT = 14;
+  const padB = 26;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const maxVal = Math.max(2, ...series.map((d) => Number(d.count || 0)));
+  const yMax = Math.ceil(maxVal / 2) * 2;
+  const n = series.length;
+
+  const pts: ChartPoint[] = series.map((d, idx) => ({
+    x: padL + (n <= 1 ? plotW / 2 : (idx / (n - 1)) * plotW),
+    y: padT + plotH - (Number(d.count || 0) / yMax) * plotH,
+  }));
+  const line = buildSmoothCurve(pts);
+  const area =
+    pts.length > 0
+      ? `${line} L ${pts[pts.length - 1].x.toFixed(1)} ${(padT + plotH).toFixed(1)} L ${pts[0].x.toFixed(1)} ${(padT + plotH).toFixed(1)} Z`
+      : "";
+
+  const active = hoverIdx !== null && series[hoverIdx] ? series[hoverIdx] : null;
+  const activePt = hoverIdx !== null && pts[hoverIdx] ? pts[hoverIdx] : null;
+
+  return (
+    <div class="volo-chart-stage" style={{ flex: 1, display: "flex", alignItems: "center" }}>
+      {active && activePt && (
+        <div
+          class="volo-chart-tooltip"
+          style={{
+            left: activePt.x > W * 0.62 ? "auto" : `${Math.max(6, (activePt.x / W) * 100)}%`,
+            right: activePt.x > W * 0.62 ? `${Math.max(6, ((W - activePt.x) / W) * 100)}%` : "auto",
+          }}
+        >
+          <div style={{ fontWeight: 650 }}>{active.month}</div>
+          <div>{t("ov.published")}: {active.count}</div>
+        </div>
+      )}
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        style={{ width: "100%", height: "auto", display: "block" }}
+        onMouseMove={(e) => {
+          const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
+          if (rect.width <= 0 || n === 0) return;
+          const svgX = ((e.clientX - rect.left) / rect.width) * W;
+          const rawIdx = n <= 1 ? 0 : Math.round(((svgX - padL) / plotW) * (n - 1));
+          setHoverIdx(Math.max(0, Math.min(n - 1, rawIdx)));
+        }}
+        onMouseLeave={() => setHoverIdx(null)}
+      >
+        <defs>
+          <linearGradient id="voloMonthlyGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="var(--volo-accent)" stop-opacity="0.24" />
+            <stop offset="100%" stop-color="var(--volo-accent)" stop-opacity="0.02" />
+          </linearGradient>
+        </defs>
+        {[0, 0.5, 1].map((ratio, idx) => {
+          const y = padT + plotH - ratio * plotH;
+          const val = Math.round(ratio * yMax);
+          return (
+            <g key={idx}>
+              <line
+                x1={padL}
+                y1={y}
+                x2={W - padR}
+                y2={y}
+                stroke="var(--volo-line)"
+                stroke-dasharray={ratio === 0 ? undefined : "3 3"}
+              />
+              <text x={padL - 5} y={y + 3.5} text-anchor="end" font-size="10" fill="var(--volo-muted)">
+                {val}
+              </text>
+            </g>
+          );
+        })}
+        {area && <path d={area} fill="url(#voloMonthlyGrad)" />}
+        {line && <path d={line} fill="none" stroke="var(--volo-accent)" stroke-width="2.2" stroke-linecap="round" />}
+        {activePt && (
+          <line
+            x1={activePt.x}
+            y1={padT}
+            x2={activePt.x}
+            y2={padT + plotH}
+            stroke="var(--volo-accent)"
+            stroke-dasharray="3 3"
+            stroke-opacity="0.55"
+          />
+        )}
+        {series.map((d, idx) => {
+          const p = pts[idx];
+          const showLbl = idx === 0 || idx === Math.floor(n / 2) || idx === n - 1;
+          const isHover = hoverIdx === idx;
+          return (
+            <g key={d.month}>
+              <circle
+                cx={p.x}
+                cy={p.y}
+                r={isHover ? 4.4 : 2.6}
+                fill="var(--volo-surface)"
+                stroke="var(--volo-accent)"
+                stroke-width={isHover ? 2.4 : 1.8}
+              />
+              {showLbl && (
+                <text x={p.x} y={H - 6} text-anchor="middle" font-size="10" fill="var(--volo-muted)">
+                  {String(d.month).slice(2)}
+                </text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function DonutChart({
+  items,
+  emptyText,
+  prefix = "",
+}: {
+  items: Array<{ name: string; count: number }>;
+  emptyText: string;
+  prefix?: string;
+}) {
+  const positive = (items || []).filter((it) => Number(it.count || 0) > 0).slice(0, 6);
+  const total = positive.reduce((acc, it) => acc + Number(it.count || 0), 0);
+
+  if (positive.length === 0 || total <= 0) {
+    return (
+      <div class="volo-empty-state" style={{ padding: "28px 10px", flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        {emptyText}
+      </div>
+    );
+  }
+
+  const r = 38;
+  const cx = 52;
+  const cy = 52;
+  const circ = 2 * Math.PI * r;
+  let offsetAcc = 0;
+
+  return (
+    <div class="volo-donut-wrap">
+      <svg width="104" height="104" viewBox="0 0 104 104" style={{ flexShrink: 0 }}>
+        <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--volo-line)" stroke-width="15" />
+        {positive.map((it, idx) => {
+          const val = Number(it.count || 0);
+          const frac = val / total;
+          const segLen = Math.max(0, frac * circ);
+          const curOffset = offsetAcc;
+          offsetAcc += segLen;
+          const color = DONUT_PALETTE[idx % DONUT_PALETTE.length];
+          const pct = Math.round(frac * 100);
+          return (
+            <circle
+              key={`${it.name}-${idx}`}
+              cx={cx}
+              cy={cy}
+              r={r}
+              fill="none"
+              stroke={color}
+              stroke-width="15"
+              stroke-dasharray={`${segLen.toFixed(2)} ${circ.toFixed(2)}`}
+              stroke-dashoffset={(-curOffset).toFixed(2)}
+              transform={`rotate(-90 ${cx} ${cy})`}
+            >
+              <title>{`${prefix}${it.name}: ${val} (${pct}%)`}</title>
+            </circle>
+          );
+        })}
+        <text x={cx} y={cy - 1} text-anchor="middle" font-size="15" font-weight="700" fill="var(--volo-text)">
+          {total}
+        </text>
+        <text x={cx} y={cy + 13} text-anchor="middle" font-size="9.5" fill="var(--volo-muted)">
+          {t("ov.chart_total")}
+        </text>
+      </svg>
+
+      <div class="volo-donut-legend">
+        {positive.map((it, idx) => {
+          const val = Number(it.count || 0);
+          const pct = Math.round((val / total) * 100);
+          const color = DONUT_PALETTE[idx % DONUT_PALETTE.length];
+          return (
+            <div key={`${it.name}-${idx}`} class="volo-donut-legend-row">
+              <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
+                <span class="volo-donut-dot" style={{ background: color }} />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={`${prefix}${it.name}`}>
+                  {prefix}{it.name}
+                </span>
+              </div>
+              <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", whiteSpace: "nowrap" }}>
+                {val} ({pct}%)
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function OverviewWorkspace({
   section = "dashboard",
   onNavigate,
@@ -119,6 +368,7 @@ export function OverviewWorkspace({
 
   const [overview, setOverview] = useState<any>(null);
   const [trendDays, setTrendDays] = useState<7 | 30>(7);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [articles, setArticles] = useState<any[]>([]);
   const [categories, setCategories] = useState<any[]>([]);
   const [seriesList, setSeriesList] = useState<any[]>([]);
@@ -134,6 +384,8 @@ export function OverviewWorkspace({
   const [slug, setSlug] = useState("");
   const [categoryID, setCategoryID] = useState("");
   const [tagsText, setTagsText] = useState("");
+  const [tagDraft, setTagDraft] = useState("");
+  const [tagPoolOpen, setTagPoolOpen] = useState(false);
   const [seriesID, setSeriesID] = useState("");
   const [summaryMD, setSummaryMD] = useState("");
   const [contentMD, setContentMD] = useState("");
@@ -167,6 +419,8 @@ export function OverviewWorkspace({
     setSlug("");
     setCategoryID(catList[0]?.id || "");
     setTagsText("");
+    setTagDraft("");
+    setTagPoolOpen(false);
     setSeriesID("");
     setSummaryMD("");
     setContentMD("");
@@ -184,6 +438,7 @@ export function OverviewWorkspace({
     setTranslationGroup("");
     setRevisionNote("");
     setShareURL("");
+    resetConsoleScroll();
     const saved = await loadLocalDraft("article:new");
     if (saved && (saved.title || saved.content_md)) {
       setPendingDraft(saved);
@@ -242,6 +497,7 @@ export function OverviewWorkspace({
   }, [section, curLocale]);
 
   useEffect(() => {
+    setHoverIdx(null);
     void loadOverview(trendDays);
   }, [trendDays]);
 
@@ -261,6 +517,8 @@ export function OverviewWorkspace({
       setSlug(a.slug || "");
       setCategoryID(a.category_id || "");
       setTagsText((data.tags || []).join(", "));
+      setTagDraft("");
+      setTagPoolOpen(false);
       setSeriesID(data.series_id || "");
       setSummaryMD(a.summary_md || "");
       setContentMD(a.content_md || "");
@@ -279,6 +537,7 @@ export function OverviewWorkspace({
       setTranslationGroup(a.translation_group || "");
       setRevisionNote("");
       setShareURL("");
+      resetConsoleScroll();
       const saved = await loadLocalDraft(`article:${id}`);
       if (saved && saved.content_md && saved.content_md !== a.content_md) {
         setPendingDraft(saved);
@@ -309,28 +568,45 @@ export function OverviewWorkspace({
 
   const closeEditor = () => {
     setEditingID(null);
+    setTagDraft("");
+    resetConsoleScroll();
     if (section === "editor") {
       onNavigate?.("articles");
     }
   };
 
+  const selectedTags = parseTagList(tagsText);
+
+  const addTagTokens = (rawInput: string) => {
+    const incoming = parseTagList(rawInput);
+    if (incoming.length === 0) return;
+    const merged = [...selectedTags];
+    incoming.forEach((tg) => {
+      if (!merged.some((x) => x.toLowerCase() === tg.toLowerCase())) {
+        merged.push(tg);
+      }
+    });
+    setTagsText(merged.join(", "));
+    setTagDraft("");
+  };
+
+  const removeTagToken = (tagName: string) => {
+    const filtered = selectedTags.filter((x) => x.toLowerCase() !== tagName.toLowerCase());
+    setTagsText(filtered.join(", "));
+  };
+
   const toggleTagChip = (tagName: string) => {
-    const existing = tagsText
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const idx = existing.findIndex((x) => x.toLowerCase() === tagName.toLowerCase());
-    if (idx >= 0) {
-      existing.splice(idx, 1);
+    if (selectedTags.some((x) => x.toLowerCase() === tagName.toLowerCase())) {
+      removeTagToken(tagName);
     } else {
-      existing.push(tagName);
+      addTagTokens(tagName);
     }
-    setTagsText(existing.join(", "));
   };
 
   const saveArticle = async (e: Event) => {
     e.preventDefault();
     try {
+      const finalTags = parseTagList(tagDraft.trim() ? `${tagsText}, ${tagDraft}` : tagsText);
       const payload: any = {
         category_id: categoryID,
         title,
@@ -349,10 +625,7 @@ export function OverviewWorkspace({
         audio_mime: audioMime,
         lang,
         translation_group: translationGroup,
-        tags: tagsText
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean),
+        tags: finalTags,
         series_id: seriesID,
         revision_note: revisionNote,
       };
@@ -367,6 +640,8 @@ export function OverviewWorkspace({
       if (draftKey) await clearLocalDraft(draftKey);
       showToast(t("common.saved"));
       setEditingID(null);
+      setTagDraft("");
+      resetConsoleScroll();
       if (section === "editor") {
         onNavigate?.("articles");
       } else {
@@ -466,18 +741,13 @@ export function OverviewWorkspace({
   // 1. Editor View (`section === "editor"` or editing an existing post)
   if (editingID !== null || section === "editor") {
     const quickInserts: QuickInsertItem[] = overview?.quick_inserts || [];
-    const activeTagsLower = new Set(
-      tagsText
-        .split(",")
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean)
-    );
+    const activeTagsLower = new Set(selectedTags.map((s) => s.toLowerCase()));
 
     return (
       <div>
         <div class="volo-card">
           <div class="volo-card-head">
-            <h2 class="volo-card-title">{!editingID ? t("art.new") : `${t("common.edit")}: ${title}`}</h2>
+            <h2 class="volo-card-title">{!editingID ? t("art.new") : `${t("common.edit")}: ${title || t("art.title")}`}</h2>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
               {editingID && (
                 <>
@@ -575,16 +845,102 @@ export function OverviewWorkspace({
           )}
 
           <form onSubmit={saveArticle} autoComplete="off">
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("art.title")}</label>
+            {/* 1. Prominent Full-Width Article Title */}
+            <div class="volo-field" style={{ marginBottom: "14px" }}>
+              <input
+                class="volo-editor-title-input"
+                required
+                aria-label={t("art.title")}
+                placeholder={t("art.title_ph")}
+                value={title}
+                onInput={(e) => setTitle((e.currentTarget as HTMLInputElement).value)}
+              />
+            </div>
+
+            {/* 2. Full-Width Markdown Studio Editor Immediately Below Title */}
+            <div class="volo-field" style={{ marginBottom: "16px" }}>
+              <label>{t("art.md_body")}</label>
+              <CM6Editor value={contentMD} onChange={setContentMD} quickInserts={quickInserts} />
+            </div>
+
+            {/* 3. Custom Summary */}
+            <div class="volo-field">
+              <label>{t("art.summary")}</label>
+              <textarea
+                class="volo-textarea"
+                rows={2}
+                value={summaryMD}
+                onInput={(e) => setSummaryMD((e.currentTarget as HTMLTextAreaElement).value)}
+              />
+            </div>
+
+            {/* 4. Capsule Tag Selector (Full Width, Zero Right-Side Whitespace) */}
+            <div class="volo-field">
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", marginBottom: "6px" }}>
+                <label style={{ margin: 0 }}>{t("art.free_tags")}</label>
+                {allTags.length > 0 && (
+                  <button
+                    type="button"
+                    class={`volo-chip-btn ${tagPoolOpen ? "active" : ""}`}
+                    onClick={() => setTagPoolOpen(!tagPoolOpen)}
+                  >
+                    {t("art.toggle_tag_pool", { count: allTags.length })}
+                  </button>
+                )}
+              </div>
+              <div class="volo-tag-capsule-box">
+                {selectedTags.map((tg) => (
+                  <span key={tg} class="volo-tag-pill">
+                    #{tg}
+                    <button
+                      type="button"
+                      aria-label={t("common.delete")}
+                      onClick={() => removeTagToken(tg)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
                 <input
-                  class="volo-input"
-                  required
-                  value={title}
-                  onInput={(e) => setTitle((e.currentTarget as HTMLInputElement).value)}
+                  class="volo-tag-inline-input"
+                  value={tagDraft}
+                  placeholder={selectedTags.length === 0 ? t("art.tags_placeholder") : t("art.tag_input_more")}
+                  onInput={(e) => setTagDraft((e.currentTarget as HTMLInputElement).value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === "," || e.key === "，") {
+                      e.preventDefault();
+                      if (tagDraft.trim()) addTagTokens(tagDraft);
+                    } else if (e.key === "Backspace" && !tagDraft && selectedTags.length > 0) {
+                      removeTagToken(selectedTags[selectedTags.length - 1]);
+                    }
+                  }}
+                  onBlur={() => {
+                    if (tagDraft.trim()) addTagTokens(tagDraft);
+                  }}
                 />
               </div>
+              {tagPoolOpen && allTags.length > 0 && (
+                <div class="volo-tag-pool" style={{ marginTop: "8px" }}>
+                  <span class="volo-help" style={{ fontSize: "11.5px" }}>{t("art.tag_pool_hint")}</span>
+                  {allTags.map((tg) => {
+                    const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
+                    return (
+                      <button
+                        key={tg.id}
+                        type="button"
+                        class={`volo-chip-btn ${active ? "active" : ""}`}
+                        onClick={() => toggleTagChip(tg.name)}
+                      >
+                        #{tg.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* 5. Compact Publishing Settings Grid */}
+            <div class="volo-grid-3">
               <div class="volo-field">
                 <label>{t("art.slug")}</label>
                 <input
@@ -605,47 +961,6 @@ export function OverviewWorkspace({
                   ]}
                 />
               </div>
-            </div>
-
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("art.free_tags")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("art.tags_placeholder")}
-                  value={tagsText}
-                  onInput={(e) => setTagsText((e.currentTarget as HTMLInputElement).value)}
-                />
-                {allTags.length > 0 && (
-                  <div class="volo-tag-pool">
-                    <span class="volo-help" style={{ fontSize: "11.5px" }}>{t("art.tag_pool_hint")}</span>
-                    {allTags.slice(0, 18).map((tg) => {
-                      const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
-                      return (
-                        <button
-                          key={tg.id}
-                          type="button"
-                          class={`volo-chip-btn ${active ? "active" : ""}`}
-                          onClick={() => toggleTagChip(tg.name)}
-                        >
-                          #{tg.name}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-              <div class="volo-field">
-                <label>{t("art.series")}</label>
-                <ConsoleSelect
-                  value={seriesID}
-                  onChange={setSeriesID}
-                  options={[
-                    { value: "", label: t("art.series_none") },
-                    ...seriesList.map((s) => ({ value: s.id, label: s.title })),
-                  ]}
-                />
-              </div>
               <div class="volo-field">
                 <label>{t("art.status")}</label>
                 <ConsoleSelect
@@ -660,59 +975,16 @@ export function OverviewWorkspace({
               </div>
             </div>
 
-            <div class="volo-grid-2">
-              {status === "scheduled" && (
-                <div class="volo-field">
-                  <label>{t("art.scheduled_at")}</label>
-                  <input
-                    type="datetime-local"
-                    class="volo-input"
-                    required
-                    value={scheduledAtStr}
-                    onInput={(e) => setScheduledAtStr((e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-              )}
-              <div class="volo-field">
-                <label>{t("art.published_at")}</label>
-                <input
-                  type="datetime-local"
-                  class="volo-input"
-                  value={publishedAtStr}
-                  onInput={(e) => setPublishedAtStr((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-            </div>
-
-            <div class="volo-field">
-              <label>{t("art.md_body")}</label>
-              <CM6Editor value={contentMD} onChange={setContentMD} quickInserts={quickInserts} />
-            </div>
-
-            <div class="volo-field" style={{ marginTop: "12px" }}>
-              <label>{t("art.summary")}</label>
-              <textarea
-                class="volo-textarea"
-                rows={2}
-                value={summaryMD}
-                onInput={(e) => setSummaryMD((e.currentTarget as HTMLTextAreaElement).value)}
-              />
-            </div>
-
             <div class="volo-grid-3">
               <div class="volo-field">
-                <label>{t("art.password")}</label>
-                <input
-                  type="password"
-                  name="article_lock_passphrase"
-                  autoComplete="new-password"
-                  class="volo-input"
-                  placeholder={t("art.password_placeholder")}
-                  value={password}
-                  onInput={(e) => {
-                    setPassword((e.currentTarget as HTMLInputElement).value);
-                    setClearPassword(false);
-                  }}
+                <label>{t("art.series")}</label>
+                <ConsoleSelect
+                  value={seriesID}
+                  onChange={setSeriesID}
+                  options={[
+                    { value: "", label: t("art.series_none") },
+                    ...seriesList.map((s) => ({ value: s.id, label: s.title })),
+                  ]}
                 />
               </div>
               <div class="volo-field">
@@ -738,14 +1010,79 @@ export function OverviewWorkspace({
               </div>
             </div>
 
-            <div class="volo-grid-4">
+            <div class="volo-grid-3">
               <div class="volo-field">
-                <label>{t("art.cover_url")}</label>
+                <label>{t("art.password")}</label>
+                <input
+                  type="password"
+                  name="article_lock_passphrase"
+                  autoComplete="new-password"
+                  class="volo-input"
+                  placeholder={t("art.password_placeholder")}
+                  value={password}
+                  onInput={(e) => {
+                    setPassword((e.currentTarget as HTMLInputElement).value);
+                    setClearPassword(false);
+                  }}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("art.published_at")}</label>
+                <input
+                  type="datetime-local"
+                  class="volo-input"
+                  value={publishedAtStr}
+                  onInput={(e) => setPublishedAtStr((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+              {status === "scheduled" ? (
+                <div class="volo-field">
+                  <label>{t("art.scheduled_at")}</label>
+                  <input
+                    type="datetime-local"
+                    class="volo-input"
+                    required
+                    value={scheduledAtStr}
+                    onInput={(e) => setScheduledAtStr((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              ) : (
+                <div class="volo-field">
+                  <label>{t("art.rev_note")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder={t("art.rev_note_placeholder")}
+                    value={revisionNote}
+                    onInput={(e) => setRevisionNote((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              )}
+            </div>
+
+            {status === "scheduled" && (
+              <div class="volo-field">
+                <label>{t("art.rev_note")}</label>
                 <input
                   class="volo-input"
-                  value={coverURL}
-                  onInput={(e) => setCoverURL((e.currentTarget as HTMLInputElement).value)}
+                  placeholder={t("art.rev_note_placeholder")}
+                  value={revisionNote}
+                  onInput={(e) => setRevisionNote((e.currentTarget as HTMLInputElement).value)}
                 />
+              </div>
+            )}
+
+            {/* 6. Cover Image & Podcast Audio with Media Library Pickers */}
+            <div class="volo-grid-3">
+              <div class="volo-field">
+                <label>{t("art.cover_url")}</label>
+                <div class="volo-input-row">
+                  <input
+                    class="volo-input"
+                    value={coverURL}
+                    onInput={(e) => setCoverURL((e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <MediaPickButton filterKind="image" onPick={(url) => setCoverURL(url)} />
+                </div>
                 {coverURL.trim() && (
                   <img
                     src={coverURL}
@@ -763,11 +1100,14 @@ export function OverviewWorkspace({
               </div>
               <div class="volo-field">
                 <label>{t("art.audio_url")}</label>
-                <input
-                  class="volo-input"
-                  value={audioURL}
-                  onInput={(e) => setAudioURL((e.currentTarget as HTMLInputElement).value)}
-                />
+                <div class="volo-input-row">
+                  <input
+                    class="volo-input"
+                    value={audioURL}
+                    onInput={(e) => setAudioURL((e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <MediaPickButton filterKind="audio" onPick={(url) => setAudioURL(url)} />
+                </div>
               </div>
               <div class="volo-field">
                 <label>{t("art.audio_duration")}</label>
@@ -779,19 +1119,10 @@ export function OverviewWorkspace({
                   onInput={(e) => setAudioDuration(Number((e.currentTarget as HTMLInputElement).value) || 0)}
                 />
               </div>
-              <div class="volo-field">
-                <label>{t("art.rev_note")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("art.rev_note_placeholder")}
-                  value={revisionNote}
-                  onInput={(e) => setRevisionNote((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
             </div>
 
-            <div style={{ display: "flex", alignItems: "center", gap: "18px", flexWrap: "wrap", margin: "8px 0 16px" }}>
-              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "18px", flexWrap: "wrap", margin: "8px 0 4px" }}>
+              <label class="volo-check-item">
                 <input
                   type="checkbox"
                   checked={isPinned}
@@ -799,7 +1130,7 @@ export function OverviewWorkspace({
                 />
                 {t("art.pin_top")}
               </label>
-              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+              <label class="volo-check-item">
                 <input
                   type="checkbox"
                   checked={allowComment}
@@ -808,7 +1139,7 @@ export function OverviewWorkspace({
                 {t("art.allow_comment")}
               </label>
               {editingID && (
-                <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <label class="volo-check-item">
                   <input
                     type="checkbox"
                     checked={clearPassword}
@@ -823,75 +1154,81 @@ export function OverviewWorkspace({
               )}
             </div>
 
-            <button type="submit" class="volo-btn volo-btn-primary">
-              {t("art.save")}
-            </button>
+            {/* 7. Right-Aligned Form Actions */}
+            <div class="volo-form-actions">
+              <button type="button" class="volo-btn" onClick={closeEditor}>
+                {t("common.cancel")}
+              </button>
+              <button type="submit" class="volo-btn volo-btn-primary">
+                {t("art.save")}
+              </button>
+            </div>
           </form>
         </div>
 
-        {revisions && (
-          <div class="volo-modal-backdrop" onClick={() => setRevisions(null)}>
-            <div class="volo-modal" style={{ maxWidth: "760px" }} onClick={(e) => e.stopPropagation()}>
-              <div class="volo-card-head">
-                <h3 class="volo-card-title">{t("art.revisions_max")}</h3>
-                <button type="button" class="volo-btn volo-btn-sm" onClick={() => setRevisions(null)}>
-                  {t("common.close")}
-                </button>
-              </div>
-              {revisions.length === 0 ? (
-                <p class="volo-help">{t("art.revisions_empty")}</p>
-              ) : (
-                revisions.map((r) => {
-                  const showDiff = diffRevID === r.id;
-                  const diffLines = showDiff ? computeLineDiff(r.content_md || "", contentMD) : [];
-                  return (
-                    <div key={r.id} class="volo-card" style={{ padding: "12px", marginBottom: "10px" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "6px" }}>
-                        <div>
-                          <strong>{r.title}</strong>{" "}
-                          <span class="volo-help">· {formatDateTime(r.created_at)} · {r.note || t("art.snapshot")}</span>
-                        </div>
-                        <div style={{ display: "flex", gap: "6px" }}>
-                          <button
-                            type="button"
-                            class="volo-btn volo-btn-sm"
-                            onClick={() => setDiffRevID(showDiff ? null : r.id)}
-                          >
-                            {t("art.diff_btn")}
-                          </button>
-                          <button type="button" class="volo-btn volo-btn-sm volo-btn-primary" onClick={() => restoreRevision(r.id)}>
-                            {t("art.rollback")}
-                          </button>
-                        </div>
-                      </div>
-                      {showDiff ? (
-                        <div>
-                          <div class="volo-help" style={{ marginBottom: "4px" }}>{t("art.diff_title")}</div>
-                          <div class="volo-diff-box">
-                            {diffLines.map((ln, idx) => (
-                              <div
-                                key={idx}
-                                class={`volo-diff-line ${
-                                  ln.kind === "add" ? "volo-diff-add" : ln.kind === "del" ? "volo-diff-del" : ""
-                                }`}
-                              >
-                                {ln.text}
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      ) : (
-                        <pre style={{ margin: 0, maxHeight: "110px", overflow: "auto", fontSize: "11.5px", background: "var(--volo-raised)", padding: "8px", borderRadius: "6px" }}>
-                          {(r.content_md || "").slice(0, 600)}
-                        </pre>
-                      )}
+        <AnimatedModal
+          open={Boolean(revisions)}
+          onClose={() => setRevisions(null)}
+          title={t("art.revisions_max")}
+          maxWidth="760px"
+          footer={
+            <button type="button" class="volo-btn" onClick={() => setRevisions(null)}>
+              {t("common.close")}
+            </button>
+          }
+        >
+          {!revisions || revisions.length === 0 ? (
+            <p class="volo-help">{t("art.revisions_empty")}</p>
+          ) : (
+            revisions.map((r) => {
+              const showDiff = diffRevID === r.id;
+              const diffLines = showDiff ? computeLineDiff(r.content_md || "", contentMD) : [];
+              return (
+                <div key={r.id} class="volo-card" style={{ padding: "12px", marginBottom: "10px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "6px" }}>
+                    <div>
+                      <strong>{r.title}</strong>{" "}
+                      <span class="volo-help">· {formatDateTime(r.created_at)} · {r.note || t("art.snapshot")}</span>
                     </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-        )}
+                    <div style={{ display: "flex", gap: "6px" }}>
+                      <button
+                        type="button"
+                        class="volo-btn volo-btn-sm"
+                        onClick={() => setDiffRevID(showDiff ? null : r.id)}
+                      >
+                        {t("art.diff_btn")}
+                      </button>
+                      <button type="button" class="volo-btn volo-btn-sm volo-btn-primary" onClick={() => restoreRevision(r.id)}>
+                        {t("art.rollback")}
+                      </button>
+                    </div>
+                  </div>
+                  {showDiff ? (
+                    <div>
+                      <div class="volo-help" style={{ marginBottom: "4px" }}>{t("art.diff_title")}</div>
+                      <div class="volo-diff-box">
+                        {diffLines.map((ln, idx) => (
+                          <div
+                            key={idx}
+                            class={`volo-diff-line ${
+                              ln.kind === "add" ? "volo-diff-add" : ln.kind === "del" ? "volo-diff-del" : ""
+                            }`}
+                          >
+                            {ln.text}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <pre style={{ margin: 0, maxHeight: "110px", overflow: "auto", fontSize: "11.5px", background: "var(--volo-raised)", padding: "8px", borderRadius: "6px" }}>
+                      {(r.content_md || "").slice(0, 600)}
+                    </pre>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </AnimatedModal>
       </div>
     );
   }
@@ -937,7 +1274,7 @@ export function OverviewWorkspace({
                 }
               }}
             />
-            <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer", height: "34px" }}>
+            <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer" }}>
               {t("art.import_md")}
               <input
                 type="file"
@@ -953,7 +1290,6 @@ export function OverviewWorkspace({
             <button
               type="button"
               class="volo-btn volo-btn-primary volo-btn-sm"
-              style={{ height: "34px" }}
               onClick={() => {
                 void startNewArticle();
                 onNavigate?.("editor");
@@ -1085,7 +1421,7 @@ export function OverviewWorkspace({
 
   // SVG Chart Geometry (`padR = 34` prevents rightmost MM-DD label clipping)
   const W = 860;
-  const H = 220;
+  const H = 228;
   const padL = 44;
   const padR = 34;
   const padT = 18;
@@ -1111,9 +1447,20 @@ export function OverviewWorkspace({
     pvPts.length > 0
       ? `${pvLine} L ${pvPts[pvPts.length - 1].x.toFixed(1)} ${(padT + plotH).toFixed(1)} L ${pvPts[0].x.toFixed(1)} ${(padT + plotH).toFixed(1)} Z`
       : "";
-  const xLabelStep = Math.max(1, Math.ceil(n / 8));
+  const uvArea =
+    uvPts.length > 0
+      ? `${uvLine} L ${uvPts[uvPts.length - 1].x.toFixed(1)} ${(padT + plotH).toFixed(1)} L ${uvPts[0].x.toFixed(1)} ${(padT + plotH).toFixed(1)} Z`
+      : "";
+  // Show every single date tick in 7-day mode (`n <= 10`)
+  const xLabelStep = n <= 10 ? 1 : Math.ceil(n / 8);
   const topArticles: any[] = overview?.top_articles || [];
   const topReferers: any[] = overview?.top_referers || [];
+  const recentLogs: any[] = overview?.recent_logs || [];
+  const noticeBoard: string = overview?.notice_board || "";
+
+  const activeTrend = hoverIdx !== null && rawSeries[hoverIdx] ? rawSeries[hoverIdx] : null;
+  const activePvPt = hoverIdx !== null && pvPts[hoverIdx] ? pvPts[hoverIdx] : null;
+  const activeUvPt = hoverIdx !== null && uvPts[hoverIdx] ? uvPts[hoverIdx] : null;
 
   return (
     <div>
@@ -1227,76 +1574,158 @@ export function OverviewWorkspace({
         <div class="volo-chart-box">
           <div class="volo-chart-legend">
             <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <span style={{ width: "10px", height: "10px", borderRadius: "999px", background: "var(--volo-accent)" }} />
+              <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "var(--volo-accent)" }} />
               {t("ov.legend_pv")}
             </span>
             <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <span style={{ width: "12px", height: "0", borderTop: "2px dashed #c9822b" }} />
+              <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "#c9822b" }} />
               {t("ov.legend_uv")}
             </span>
           </div>
-          <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
-            <defs>
-              <linearGradient id="voloPvGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="var(--volo-accent)" stop-opacity="0.22" />
-                <stop offset="100%" stop-color="var(--volo-accent)" stop-opacity="0.01" />
-              </linearGradient>
-            </defs>
 
-            {/* Horizontal Y-axis gridlines */}
-            {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
-              const y = padT + plotH - ratio * plotH;
-              const val = Math.round(ratio * yMax);
-              return (
-                <g key={idx}>
+          <div class="volo-chart-stage">
+            {activeTrend && activePvPt && (
+              <div
+                class="volo-chart-tooltip"
+                style={{
+                  left: activePvPt.x > W * 0.68 ? "auto" : `${Math.max(5, (activePvPt.x / W) * 100)}%`,
+                  right: activePvPt.x > W * 0.68 ? `${Math.max(5, ((W - activePvPt.x) / W) * 100)}%` : "auto",
+                }}
+              >
+                <div style={{ fontWeight: 650, marginBottom: "2px" }}>{activeTrend.stat_date}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <span>PV: <strong>{activeTrend.pv}</strong></span>
+                  <span style={{ color: "#f5be72" }}>UV: <strong>{activeTrend.uv}</strong></span>
+                </div>
+              </div>
+            )}
+
+            <svg
+              viewBox={`0 0 ${W} ${H}`}
+              style={{ width: "100%", height: "auto", display: "block", cursor: "crosshair" }}
+              onMouseMove={(e) => {
+                const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
+                if (rect.width <= 0 || n === 0) return;
+                const svgX = ((e.clientX - rect.left) / rect.width) * W;
+                const rawIdx = n <= 1 ? 0 : Math.round(((svgX - padL) / plotW) * (n - 1));
+                setHoverIdx(Math.max(0, Math.min(n - 1, rawIdx)));
+              }}
+              onMouseLeave={() => setHoverIdx(null)}
+            >
+              <defs>
+                <linearGradient id="voloPvGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="var(--volo-accent)" stop-opacity="0.22" />
+                  <stop offset="100%" stop-color="var(--volo-accent)" stop-opacity="0.01" />
+                </linearGradient>
+                <linearGradient id="voloUvGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#c9822b" stop-opacity="0.16" />
+                  <stop offset="100%" stop-color="#c9822b" stop-opacity="0.01" />
+                </linearGradient>
+              </defs>
+
+              {/* Vertical X-axis dashed gridlines */}
+              {rawSeries.map((d, idx) => {
+                const showTick = idx % xLabelStep === 0 || idx === n - 1;
+                if (!showTick) return null;
+                const p = pvPts[idx];
+                return (
                   <line
-                    x1={padL}
-                    y1={y}
-                    x2={W - padR}
-                    y2={y}
+                    key={`vx-${d.stat_date}`}
+                    x1={p.x}
+                    y1={padT}
+                    x2={p.x}
+                    y2={padT + plotH}
                     stroke="var(--volo-line)"
-                    stroke-dasharray={ratio === 0 ? undefined : "4 4"}
+                    stroke-dasharray="3 4"
+                    stroke-opacity="0.65"
                   />
-                  <text
-                    x={padL - 8}
-                    y={y + 4}
-                    text-anchor="end"
-                    font-size="11"
-                    fill="var(--volo-muted)"
-                  >
-                    {val}
-                  </text>
-                </g>
-              );
-            })}
+                );
+              })}
 
-            {pvArea && <path d={pvArea} fill="url(#voloPvGrad)" />}
-            {pvLine && <path d={pvLine} fill="none" stroke="var(--volo-accent)" stroke-width="2.5" stroke-linecap="round" />}
-            {uvLine && <path d={uvLine} fill="none" stroke="#c9822b" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round" />}
-
-            {rawSeries.map((d, idx) => {
-              const p = pvPts[idx];
-              const showLabel = idx % xLabelStep === 0 || idx === n - 1;
-              return (
-                <g key={d.stat_date}>
-                  <circle cx={p.x} cy={p.y} r="3.4" fill="var(--volo-surface)" stroke="var(--volo-accent)" stroke-width="2">
-                    <title>{`${d.stat_date}: ${d.pv} PV / ${d.uv} UV`}</title>
-                  </circle>
-                  {showLabel && (
+              {/* Horizontal Y-axis gridlines */}
+              {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
+                const y = padT + plotH - ratio * plotH;
+                const val = Math.round(ratio * yMax);
+                return (
+                  <g key={idx}>
+                    <line
+                      x1={padL}
+                      y1={y}
+                      x2={W - padR}
+                      y2={y}
+                      stroke="var(--volo-line)"
+                      stroke-dasharray={ratio === 0 ? undefined : "4 4"}
+                    />
                     <text
-                      x={p.x}
-                      y={H - 8}
-                      text-anchor="middle"
+                      x={padL - 8}
+                      y={y + 4}
+                      text-anchor="end"
                       font-size="11"
                       fill="var(--volo-muted)"
                     >
-                      {String(d.stat_date).slice(5)}
+                      {val}
                     </text>
-                  )}
-                </g>
-              );
-            })}
-          </svg>
+                  </g>
+                );
+              })}
+
+              {uvArea && <path d={uvArea} fill="url(#voloUvGrad)" />}
+              {pvArea && <path d={pvArea} fill="url(#voloPvGrad)" />}
+              {pvLine && <path d={pvLine} fill="none" stroke="var(--volo-accent)" stroke-width="2.5" stroke-linecap="round" />}
+              {uvLine && <path d={uvLine} fill="none" stroke="#c9822b" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round" />}
+
+              {activePvPt && (
+                <line
+                  x1={activePvPt.x}
+                  y1={padT}
+                  x2={activePvPt.x}
+                  y2={padT + plotH}
+                  stroke="var(--volo-accent)"
+                  stroke-dasharray="3 3"
+                  stroke-opacity="0.6"
+                />
+              )}
+
+              {rawSeries.map((d, idx) => {
+                const p = pvPts[idx];
+                const u = uvPts[idx];
+                const showLabel = idx % xLabelStep === 0 || idx === n - 1;
+                const isHover = hoverIdx === idx;
+                return (
+                  <g key={d.stat_date}>
+                    <circle
+                      cx={u.x}
+                      cy={u.y}
+                      r={isHover ? 4.4 : 2.6}
+                      fill="var(--volo-surface)"
+                      stroke="#c9822b"
+                      stroke-width={isHover ? 2.2 : 1.6}
+                    />
+                    <circle
+                      cx={p.x}
+                      cy={p.y}
+                      r={isHover ? 5 : 3.4}
+                      fill="var(--volo-surface)"
+                      stroke="var(--volo-accent)"
+                      stroke-width={isHover ? 2.5 : 2}
+                    />
+                    {showLabel && (
+                      <text
+                        x={p.x}
+                        y={H - 8}
+                        text-anchor="middle"
+                        font-size="11"
+                        fill={isHover ? "var(--volo-text)" : "var(--volo-muted)"}
+                        font-weight={isHover ? "650" : "400"}
+                      >
+                        {String(d.stat_date).slice(5)}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
         </div>
 
         {/* 2-Column Top 10 Rank Cards */}
@@ -1349,6 +1778,89 @@ export function OverviewWorkspace({
               ))
             )}
           </div>
+        </div>
+      </div>
+
+      {/* Content Structure & Monthly Output Panel (3 Charts) */}
+      <div class="volo-card">
+        <div class="volo-card-head">
+          <div>
+            <h3 class="volo-card-title">{t("ov.data_head")}</h3>
+            <div class="volo-help" style={{ marginTop: "2px" }}>{t("ov.data_sub")}</div>
+          </div>
+        </div>
+        <div class="volo-grid-3">
+          <div class="volo-mini-chart-card">
+            <h4 class="volo-mini-chart-title">{t("ov.chart_monthly")}</h4>
+            <MonthlyArticlesChart items={overview?.monthly_articles || []} />
+          </div>
+          <div class="volo-mini-chart-card">
+            <h4 class="volo-mini-chart-title">{t("ov.chart_categories")}</h4>
+            <DonutChart items={overview?.category_usage || []} emptyText={t("ov.chart_empty")} />
+          </div>
+          <div class="volo-mini-chart-card">
+            <h4 class="volo-mini-chart-title">{t("ov.chart_top_tags")}</h4>
+            <DonutChart items={overview?.top_tags || []} emptyText={t("ov.chart_empty")} prefix="#" />
+          </div>
+        </div>
+      </div>
+
+      {/* Notice Board & Recent Audit Logs Row */}
+      <div class="volo-grid-2">
+        <div class="volo-card">
+          <div class="volo-card-head">
+            <h3 class="volo-card-title">{t("ov.notice_head")}</h3>
+            {isAdmin && (
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => onNavigate?.("settings_site")}>
+                {t("ov.edit_notice")}
+              </button>
+            )}
+          </div>
+          {noticeBoard.trim() ? (
+            <div
+              class="volo-subcard"
+              style={{ margin: 0, whiteSpace: "pre-wrap", lineHeight: 1.65, fontSize: "13.5px" }}
+            >
+              {noticeBoard}
+            </div>
+          ) : (
+            <div class="volo-empty-state" style={{ padding: "26px 12px" }}>
+              {t("ov.notice_empty")}
+            </div>
+          )}
+        </div>
+
+        <div class="volo-card">
+          <div class="volo-card-head">
+            <h3 class="volo-card-title">{t("ov.recent_logs_head")}</h3>
+            {isAdmin && (
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => onNavigate?.("audit")}>
+                {t("ov.view_all_logs")} →
+              </button>
+            )}
+          </div>
+          {recentLogs.length === 0 ? (
+            <div class="volo-empty-state" style={{ padding: "26px 12px" }}>
+              {t("ov.recent_logs_empty")}
+            </div>
+          ) : (
+            <div>
+              {recentLogs.slice(0, 6).map((lg: any) => (
+                <div key={lg.id} class="volo-rank-row">
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
+                    <span class="volo-code-chip">{lg.action}</span>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "13px" }}>
+                      <strong>{lg.actor_name || "-"}</strong>
+                      {lg.resource_type ? ` · ${lg.resource_type}` : ""}
+                    </span>
+                  </div>
+                  <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", fontSize: "11.5px", whiteSpace: "nowrap" }}>
+                    {formatDateTime(lg.created_at)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 

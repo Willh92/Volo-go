@@ -62,9 +62,22 @@ export const busyCountSig = signal<number>(0);
 export const themeModeSig = signal<string>(
   localStorage.getItem("volo_console_theme") || bootConfig.default_theme || "auto"
 );
-export const accentSig = signal<string>(
-  localStorage.getItem("volo_console_accent") || bootConfig.accent || "forest"
-);
+export const accentSig = signal<string>(bootConfig.accent || "forest");
+export const storageDriverSig = signal<string>("local");
+
+export function resetConsoleScroll() {
+  if (typeof window !== "undefined") {
+    window.scrollTo(0, 0);
+  }
+  if (typeof document !== "undefined") {
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+    const scrollers = document.querySelectorAll<HTMLElement>(".volo-main, .volo-content");
+    scrollers.forEach((el) => {
+      el.scrollTop = 0;
+    });
+  }
+}
 
 let toastTimer: number | undefined;
 export function showToast(msg: string) {
@@ -98,15 +111,13 @@ export function dismissToast() {
   toastSig.value = "";
 }
 
-export function applyThemeAttributes(mode: string, accent: string, persistAccent = false) {
+export function applyThemeAttributes(mode: string, accent: string, _persistAccent = false) {
   const cleanMode = mode || "auto";
   const cleanAccent = accent || "forest";
   themeModeSig.value = cleanMode;
   accentSig.value = cleanAccent;
   localStorage.setItem("volo_console_theme", cleanMode);
-  if (persistAccent) {
-    localStorage.setItem("volo_console_accent", cleanAccent);
-  }
+  localStorage.removeItem("volo_console_accent");
   document.documentElement.setAttribute("data-mode", cleanMode);
   document.documentElement.setAttribute("data-accent", cleanAccent);
 
@@ -120,6 +131,21 @@ export function applyThemeAttributes(mode: string, accent: string, persistAccent
     dark = h < 7 || h >= 19;
   }
   document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+}
+
+export async function saveGlobalAccent(nextAccent: string): Promise<void> {
+  const cleanAccent = nextAccent || "forest";
+  applyThemeAttributes(themeModeSig.value, cleanAccent, false);
+  if (currentUserSig.value?.role === "admin") {
+    try {
+      await apiFetch("/api/admin/settings/appearance", {
+        method: "PATCH",
+        body: JSON.stringify({ accent: cleanAccent }),
+      });
+    } catch (err: any) {
+      showToast(err?.message || "Failed to save accent");
+    }
+  }
 }
 
 export class ApiError extends Error {
@@ -175,17 +201,20 @@ export async function refreshMe(): Promise<StaffUser | null> {
     const data = await apiFetch<{
       user: StaffUser;
       csrf_token: string;
+      storage_driver?: string;
       appearance?: { accent?: string; default_mode?: string };
     }>("/api/admin/me");
     currentUserSig.value = data.user;
     csrfTokenSig.value = data.csrf_token || "";
+    if (data.storage_driver) {
+      storageDriverSig.value = data.storage_driver;
+    }
     if (data.user?.preferred_locale) {
       const nextLoc = normalizeLocale(data.user.preferred_locale);
       localeSig.value = nextLoc;
       void ensureLocaleLoaded(nextLoc);
     }
-    const savedAccent = localStorage.getItem("volo_console_accent");
-    if (!savedAccent && data.appearance?.accent) {
+    if (data.appearance?.accent) {
       applyThemeAttributes(themeModeSig.value, data.appearance.accent, false);
     }
     return data.user;

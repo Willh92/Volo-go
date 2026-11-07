@@ -1,29 +1,35 @@
 {{define "content"}}
-<section class="studio-hero">
-  <h1 class="studio-hero__title">{{t .Locale "nav.links"}}</h1>
-  {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+<section class="studio-hero studio-hero--simple">
+  <div class="studio-hero-copy">
+    <h1 class="studio-hero__title">{{t .Locale "nav.links"}}</h1>
+    {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+  </div>
 </section>
 
 <div class="studio-layout">
-  <div style="display:flex;flex-direction:column;gap:22px">
-    {{range $cat, $items := .LinksByCategory}}
-      <section class="studio-article" style="padding:24px">
-        <h2 style="margin:0 0 14px;font-size:1.15rem">{{$cat}}</h2>
-        <div class="bookshelf-grid">
-          {{range $items}}
-            <a class="book-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax style="text-decoration:none;color:var(--volo-text)">
-              <div style="display:flex;align-items:center;gap:10px">
-                <img src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" alt="{{.Title}}" width="40" height="40" style="border-radius:10px">
-                <div>
-                  <strong>{{.Title}}</strong>
-                  <div style="font-size:.78rem;color:var(--volo-muted)">{{if eq .HealthStatus "broken"}}⚠{{else}}●{{end}}</div>
+  <div class="studio-stack">
+    {{if .LinksByCategory}}
+      {{range $cat, $items := .LinksByCategory}}
+        <section class="studio-article studio-card-pad">
+          <h2 class="studio-card-title">{{$cat}}</h2>
+          <div class="bookshelf-grid">
+            {{range $items}}
+              <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax>
+                <div class="studio-link-card__head">
+                  <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
+                  <div class="studio-link-card__meta">
+                    <strong>{{.Title}}</strong>
+                    <div class="studio-link-card__status">{{if eq .HealthStatus "broken"}}⚠{{else}}●{{end}}</div>
+                  </div>
                 </div>
-              </div>
-              {{if .Description}}<p style="margin:0;font-size:.86rem;color:var(--volo-muted)">{{.Description}}</p>{{end}}
-            </a>
-          {{end}}
-        </div>
-      </section>
+                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+              </a>
+            {{end}}
+          </div>
+        </section>
+      {{end}}
+    {{else}}
+      {{template "empty_state" (dict "Title" (t .Locale "studio.empty_links_title") "Desc" (t .Locale "studio.empty_links_desc"))}}
     {{end}}
   </div>
 

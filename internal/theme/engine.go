@@ -200,6 +200,7 @@ type PageContext struct {
 	OGImage         string
 	JSONLD          string
 	NoIndex         bool
+	IsHome          bool
 	IsArticle       bool
 	AdminPath       string
 
@@ -209,8 +210,9 @@ type PageContext struct {
 	SEO        domain.SEOSettings
 	Appearance domain.AppearanceSettings
 
-	Viewer   *domain.User
-	Owner    content.PublicAuthorProfile
+	Viewer          *domain.User
+	ViewerCSRFToken string
+	Owner           content.PublicAuthorProfile
 	Authors  []content.PublicAuthorProfile
 	Stats    content.PublicSiteStats
 	NavItems []content.PublicNavNode

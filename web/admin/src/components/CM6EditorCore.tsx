@@ -12,9 +12,10 @@ import {
 } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, redo, undo } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
-import { apiFetch, showToast } from "../api";
+import { apiFetch, showToast, storageDriverSig } from "../api";
 import { localeSig, t } from "../i18n";
-import { ConsoleSelect } from "./UIControls";
+import { AnimatedModal, ConsoleSelect } from "./UIControls";
+import { MediaLibraryModal } from "./MediaLibraryModal";
 import type { CM6EditorProps } from "./CM6Editor";
 
 type EditorMode = "ir" | "wysiwyg" | "sv";
@@ -344,6 +345,9 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
   const [fullscreen, setFullscreen] = useState<boolean>(false);
   const [showOutline, setShowOutline] = useState<boolean>(false);
   const [headingOpen, setHeadingOpen] = useState<boolean>(false);
+  const [mediaMenuOpen, setMediaMenuOpen] = useState<boolean>(false);
+  const [mediaModalOpen, setMediaModalOpen] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Quick Insert Modal State
   const [qiOpen, setQiOpen] = useState<boolean>(false);
@@ -638,6 +642,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
     return () => document.removeEventListener("click", close);
   }, [headingOpen]);
 
+  useEffect(() => {
+    if (!mediaMenuOpen) return;
+    const close = () => setMediaMenuOpen(false);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [mediaMenuOpen]);
+
   // Load Quick Insert data when modal opens
   useEffect(() => {
     if (!qiOpen) return;
@@ -834,14 +845,28 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
             </svg>
           </button>
 
-          {/* Upload Media */}
-          <label class="volo-ed-btn" title={uploading ? t("ed.uploading") : t("ed.upload_media")} style={{ cursor: "pointer" }}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <circle cx="8.5" cy="8.5" r="1.5" />
-              <polyline points="21 15 16 10 5 21" />
-            </svg>
+          {/* Upload Media / Insert from Media Library (when local storage is active) */}
+          <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              class={`volo-ed-btn ${mediaMenuOpen ? "active" : ""}`}
+              title={uploading ? t("ed.uploading") : t("ed.upload_media")}
+              onClick={() => {
+                if (storageDriverSig.value === "local") {
+                  setMediaMenuOpen((v) => !v);
+                } else {
+                  fileInputRef.current?.click();
+                }
+              }}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <circle cx="8.5" cy="8.5" r="1.5" />
+                <polyline points="21 15 16 10 5 21" />
+              </svg>
+            </button>
             <input
+              ref={fileInputRef}
               type="file"
               accept="image/*,audio/*"
               style={{ display: "none" }}
@@ -851,7 +876,31 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
                 (e.currentTarget as HTMLInputElement).value = "";
               }}
             />
-          </label>
+            {mediaMenuOpen && storageDriverSig.value === "local" && (
+              <div class="volo-pop-menu" style={{ left: 0, right: "auto", minWidth: "184px" }}>
+                <button
+                  type="button"
+                  class="volo-pop-item"
+                  onClick={() => {
+                    setMediaMenuOpen(false);
+                    fileInputRef.current?.click();
+                  }}
+                >
+                  <span>{t("ed.upload_local_file")}</span>
+                </button>
+                <button
+                  type="button"
+                  class="volo-pop-item"
+                  onClick={() => {
+                    setMediaMenuOpen(false);
+                    setMediaModalOpen(true);
+                  }}
+                >
+                  <span>{t("ed.insert_from_library")}</span>
+                </button>
+              </div>
+            )}
+          </div>
 
           {/* Quick Insert + Modal Trigger */}
           <button
@@ -1011,207 +1060,233 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
         <span>{uploading ? t("ed.uploading") : t(`ed.mode_${mode}`)}</span>
       </div>
 
-      {/* Quick Insert 4-Tab Modal */}
-      {qiOpen && (
-        <div class="volo-modal-backdrop" onClick={() => setQiOpen(false)}>
-          <div class="volo-modal" style={{ maxWidth: "640px" }} onClick={(e) => e.stopPropagation()}>
-            <div class="volo-card-head">
-              <h3 class="volo-card-title">{t("ed.quick_insert")}</h3>
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => setQiOpen(false)}>
-                {t("common.close")}
+      {/* Media Library Picker Modal */}
+      <MediaLibraryModal
+        open={mediaModalOpen}
+        onClose={() => setMediaModalOpen(false)}
+        filterKind="all"
+        onSelect={(asset) => {
+          const name = asset.original_name || asset.id;
+          const isImg = (asset.mime_type || "").startsWith("image/");
+          const isAudio = (asset.mime_type || "").startsWith("audio/");
+          if (isImg) {
+            insertSnippet(`![${name}](${asset.public_url})`);
+          } else if (isAudio) {
+            insertSnippet(`[${t("ed.audio_label")}: ${name}](${asset.public_url})`);
+          } else {
+            insertSnippet(`[${name}](${asset.public_url})`);
+          }
+        }}
+      />
+
+      {/* Quick Insert 4-Tab AnimatedModal */}
+      <AnimatedModal
+        open={qiOpen}
+        onClose={() => setQiOpen(false)}
+        title={t("ed.quick_insert")}
+        maxWidth="660px"
+        footer={
+          qiTab === "lock" ? (
+            <>
+              <button type="button" class="volo-btn" onClick={() => setQiOpen(false)}>
+                {t("common.cancel")}
               </button>
-            </div>
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary"
+                onClick={() => {
+                  const attr =
+                    lockMode === "user"
+                      ? `type="user"${lockHint ? ` hint="${lockHint}"` : ""}`
+                      : `pwd="${lockPwd || "123456"}"${lockHint ? ` hint="${lockHint}"` : ""}`;
+                  insertSnippet(`\n:::lock ${attr}\n${lockBody || "..."}\n:::\n`);
+                  setQiOpen(false);
+                }}
+              >
+                {t("ed.qi_insert_btn")}
+              </button>
+            </>
+          ) : (
+            <button type="button" class="volo-btn" onClick={() => setQiOpen(false)}>
+              {t("common.close")}
+            </button>
+          )
+        }
+      >
+        <div class="volo-subtabs" style={{ marginBottom: "14px" }}>
+          {(["media", "books", "lock", "cite"] as const).map((tabId) => (
+            <button
+              key={tabId}
+              type="button"
+              class={`volo-tab ${qiTab === tabId ? "active" : ""}`}
+              onClick={() => setQiTab(tabId)}
+            >
+              {t(`ed.qi_${tabId}`)}
+            </button>
+          ))}
+        </div>
 
-            <div class="volo-subtabs" style={{ marginBottom: "14px" }}>
-              {(["media", "books", "lock", "cite"] as const).map((tabId) => (
-                <button
-                  key={tabId}
-                  type="button"
-                  class={`volo-tab ${qiTab === tabId ? "active" : ""}`}
-                  onClick={() => setQiTab(tabId)}
-                >
-                  {t(`ed.qi_${tabId}`)}
-                </button>
-              ))}
-            </div>
-
-            {qiTab === "media" && (
-              <div class="volo-qi-grid">
-                {qiMedia.length === 0 ? (
-                  <div class="volo-help">{t("tbl.empty")}</div>
-                ) : (
-                  qiMedia.slice(0, 24).map((m) => {
-                    const name = m.orig_filename || m.original_name || m.id;
-                    const isImg = String(m.mime_type || "").startsWith("image/");
-                    return (
-                      <button
-                        key={m.id}
-                        type="button"
-                        class="volo-qi-media-card"
-                        onClick={() => {
-                          insertSnippet(isImg ? `![${name}](${m.public_url})` : `[${name}](${m.public_url})`);
-                          setQiOpen(false);
-                        }}
-                      >
-                        {isImg ? (
-                          <img src={m.public_url} alt={name} loading="lazy" />
-                        ) : (
-                          <div class="volo-qi-file-badge">{m.mime_type || "FILE"}</div>
-                        )}
-                        <span>{name}</span>
-                      </button>
-                    );
-                  })
-                )}
-              </div>
-            )}
-
-            {qiTab === "books" && (
-              <div>
-                <div style={{ marginBottom: "10px" }}>
+        {qiTab === "media" && (
+          <div class="volo-qi-grid">
+            {qiMedia.length === 0 ? (
+              <div class="volo-help">{t("tbl.empty")}</div>
+            ) : (
+              qiMedia.slice(0, 24).map((m) => {
+                const name = m.orig_filename || m.original_name || m.id;
+                const isImg = String(m.mime_type || "").startsWith("image/");
+                return (
                   <button
+                    key={m.id}
                     type="button"
-                    class="volo-btn volo-btn-sm volo-btn-primary"
+                    class="volo-qi-media-card"
                     onClick={() => {
-                      insertSnippet("\n:::bookshelf\n:::\n");
+                      insertSnippet(isImg ? `![${name}](${m.public_url})` : `[${name}](${m.public_url})`);
                       setQiOpen(false);
                     }}
                   >
-                    + {t("ed.bookshelf")}
+                    {isImg ? (
+                      <img src={m.public_url} alt={name} loading="lazy" />
+                    ) : (
+                      <div class="volo-qi-file-badge">{m.mime_type || "FILE"}</div>
+                    )}
+                    <span>{name}</span>
                   </button>
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "260px", overflowY: "auto" }}>
-                  {qiBooks.map((b) => (
-                    <div key={b.id} class="volo-subcard" style={{ padding: "10px 12px", margin: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <div>
-                        <div style={{ fontWeight: 650, fontSize: "13px" }}>{b.title}</div>
-                        <div class="volo-help">{b.description || `/books/${b.slug}`}</div>
-                      </div>
-                      <button
-                        type="button"
-                        class="volo-btn volo-btn-sm"
-                        onClick={() => {
-                          const body = b.description || `[${b.title}](/books/${b.slug})`;
-                          insertSnippet(`\n:::book title="${b.title}" status="reading"\n${body}\n:::\n`);
-                          setQiOpen(false);
-                        }}
-                      >
-                        {t("ed.qi_insert_btn")}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {qiTab === "lock" && (
-              <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
-                <div class="volo-grid-2">
-                  <div class="volo-field">
-                    <label>{t("ed.qi_lock_mode")}</label>
-                    <ConsoleSelect
-                      value={lockMode}
-                      onChange={(v) => setLockMode(v as "pwd" | "user")}
-                      options={[
-                        { value: "pwd", label: t("ed.qi_lock_pwd_mode") },
-                        { value: "user", label: t("ed.qi_lock_user_mode") },
-                      ]}
-                    />
-                  </div>
-                  {lockMode === "pwd" ? (
-                    <div class="volo-field">
-                      <label>{t("ed.qi_lock_pwd_lbl")}</label>
-                      <input
-                        class="volo-input"
-                        name="qi_block_lock_token"
-                        autoComplete="off"
-                        value={lockPwd}
-                        onInput={(e) => setLockPwd((e.currentTarget as HTMLInputElement).value)}
-                      />
-                    </div>
-                  ) : (
-                    <div class="volo-field">
-                      <label>{t("ed.qi_lock_hint_lbl")}</label>
-                      <input
-                        class="volo-input"
-                        value={lockHint}
-                        onInput={(e) => setLockHint((e.currentTarget as HTMLInputElement).value)}
-                      />
-                    </div>
-                  )}
-                </div>
-                {lockMode === "pwd" && (
-                  <div class="volo-field">
-                    <label>{t("ed.qi_lock_hint_lbl")}</label>
-                    <input
-                      class="volo-input"
-                      value={lockHint}
-                      onInput={(e) => setLockHint((e.currentTarget as HTMLInputElement).value)}
-                    />
-                  </div>
-                )}
-                <div class="volo-field">
-                  <label>{t("ed.qi_lock_body_lbl")}</label>
-                  <textarea
-                    class="volo-textarea"
-                    style={{ minHeight: "88px" }}
-                    value={lockBody}
-                    onInput={(e) => setLockBody((e.currentTarget as HTMLTextAreaElement).value)}
-                  />
-                </div>
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-primary"
-                  onClick={() => {
-                    const attr =
-                      lockMode === "user"
-                        ? `type="user"${lockHint ? ` hint="${lockHint}"` : ""}`
-                        : `pwd="${lockPwd || "123456"}"${lockHint ? ` hint="${lockHint}"` : ""}`;
-                    insertSnippet(`\n:::lock ${attr}\n${lockBody || "..."}\n:::\n`);
-                    setQiOpen(false);
-                  }}
-                >
-                  {t("ed.qi_insert_btn")}
-                </button>
-              </form>
-            )}
-
-            {qiTab === "cite" && (
-              <div>
-                <div class="volo-field">
-                  <label>{t("ed.qi_cite")}</label>
-                  <input
-                    class="volo-input"
-                    placeholder={t("ed.qi_search_art")}
-                    value={qiArtSearch}
-                    onInput={(e) => setQiArtSearch((e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "240px", overflowY: "auto" }}>
-                  {qiArticles
-                    .filter((a) => !qiArtSearch || String(a.title || "").toLowerCase().includes(qiArtSearch.toLowerCase()))
-                    .slice(0, 20)
-                    .map((a) => (
-                      <div key={a.id} class="volo-subcard" style={{ padding: "8px 12px", margin: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <span style={{ fontSize: "13px", fontWeight: 550 }}>{a.title}</span>
-                        <button
-                          type="button"
-                          class="volo-btn volo-btn-sm"
-                          onClick={() => {
-                            insertSnippet(`[${a.title}](/posts/${a.slug})`);
-                            setQiOpen(false);
-                          }}
-                        >
-                          {t("ed.qi_insert_btn")}
-                        </button>
-                      </div>
-                    ))}
-                </div>
-              </div>
+                );
+              })
             )}
           </div>
-        </div>
-      )}
+        )}
+
+        {qiTab === "books" && (
+          <div>
+            <div style={{ marginBottom: "10px", display: "flex", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm volo-btn-primary"
+                onClick={() => {
+                  insertSnippet("\n:::bookshelf\n:::\n");
+                  setQiOpen(false);
+                }}
+              >
+                + {t("ed.bookshelf")}
+              </button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "260px", overflowY: "auto" }}>
+              {qiBooks.map((b) => (
+                <div key={b.id} class="volo-subcard" style={{ padding: "10px 12px", margin: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontWeight: 650, fontSize: "13px" }}>{b.title}</div>
+                    <div class="volo-help">{b.description || `/books/${b.slug}`}</div>
+                  </div>
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-sm"
+                    onClick={() => {
+                      const body = b.description || `[${b.title}](/books/${b.slug})`;
+                      insertSnippet(`\n:::book title="${b.title}" status="reading"\n${body}\n:::\n`);
+                      setQiOpen(false);
+                    }}
+                  >
+                    {t("ed.qi_insert_btn")}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {qiTab === "lock" && (
+          <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
+            <div class="volo-grid-2">
+              <div class="volo-field">
+                <label>{t("ed.qi_lock_mode")}</label>
+                <ConsoleSelect
+                  value={lockMode}
+                  onChange={(v) => setLockMode(v as "pwd" | "user")}
+                  options={[
+                    { value: "pwd", label: t("ed.qi_lock_pwd_mode") },
+                    { value: "user", label: t("ed.qi_lock_user_mode") },
+                  ]}
+                />
+              </div>
+              {lockMode === "pwd" ? (
+                <div class="volo-field">
+                  <label>{t("ed.qi_lock_pwd_lbl")}</label>
+                  <input
+                    class="volo-input"
+                    name="qi_block_lock_token"
+                    autoComplete="off"
+                    value={lockPwd}
+                    onInput={(e) => setLockPwd((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              ) : (
+                <div class="volo-field">
+                  <label>{t("ed.qi_lock_hint_lbl")}</label>
+                  <input
+                    class="volo-input"
+                    value={lockHint}
+                    onInput={(e) => setLockHint((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              )}
+            </div>
+            {lockMode === "pwd" && (
+              <div class="volo-field">
+                <label>{t("ed.qi_lock_hint_lbl")}</label>
+                <input
+                  class="volo-input"
+                  value={lockHint}
+                  onInput={(e) => setLockHint((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+            )}
+            <div class="volo-field" style={{ marginBottom: 0 }}>
+              <label>{t("ed.qi_lock_body_lbl")}</label>
+              <textarea
+                class="volo-textarea"
+                style={{ minHeight: "88px" }}
+                value={lockBody}
+                onInput={(e) => setLockBody((e.currentTarget as HTMLTextAreaElement).value)}
+              />
+            </div>
+          </form>
+        )}
+
+        {qiTab === "cite" && (
+          <div>
+            <div class="volo-field">
+              <label>{t("ed.qi_cite")}</label>
+              <input
+                class="volo-input"
+                placeholder={t("ed.qi_search_art")}
+                value={qiArtSearch}
+                onInput={(e) => setQiArtSearch((e.currentTarget as HTMLInputElement).value)}
+              />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "240px", overflowY: "auto" }}>
+              {qiArticles
+                .filter((a) => !qiArtSearch || String(a.title || "").toLowerCase().includes(qiArtSearch.toLowerCase()))
+                .slice(0, 20)
+                .map((a) => (
+                  <div key={a.id} class="volo-subcard" style={{ padding: "8px 12px", margin: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: "13px", fontWeight: 550 }}>{a.title}</span>
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-sm"
+                      onClick={() => {
+                        insertSnippet(`[${a.title}](/posts/${a.slug})`);
+                        setQiOpen(false);
+                      }}
+                    >
+                      {t("ed.qi_insert_btn")}
+                    </button>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+      </AnimatedModal>
     </div>
   );
 }

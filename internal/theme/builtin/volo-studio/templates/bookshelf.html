@@ -1,28 +1,38 @@
 {{define "content"}}
-<section class="studio-hero">
-  <h1 class="studio-hero__title">{{t .Locale "bookshelf.title"}}</h1>
-  {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+<section class="studio-hero studio-hero--simple">
+  <div class="studio-hero-copy">
+    <h1 class="studio-hero__title">{{t .Locale "bookshelf.title"}}</h1>
+    {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+  </div>
 </section>
 
 <div class="studio-layout">
-  <div class="bookshelf-grid">
-    {{range .Books}}
-      <article class="book-card">
-        {{if .CoverURL}}
-          <img src="{{.CoverURL}}" alt="{{.Title}}" loading="lazy" width="240" height="320" style="aspect-ratio:3/4;object-fit:cover">
+  <div>
+    {{if .Books}}
+      <div class="bookshelf-grid">
+        {{range .Books}}
+          <article class="book-card" data-book-card="{{.Slug}}">
+            {{if .CoverURL}}
+              <a class="book-card__cover" href="/books/{{.Slug}}" tabindex="-1" aria-hidden="true">
+                <img src="{{.CoverURL}}" alt="{{.Title}}" loading="lazy" width="240" height="320" data-cover-img="1">
+                <span class="studio-cover-fallback" hidden>{{coverSVG .Slug false}}</span>
+              </a>
+            {{end}}
+            <div class="book-card__meta">
+              <span class="volo-badge">{{.SourceType}}</span>
+              <span>{{t $.Locale "bookshelf.chapters" (dict "count" .ChapterCount)}}</span>
+            </div>
+            <h2 class="book-card__title"><a href="/books/{{.Slug}}">{{.Title}}</a></h2>
+            {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+            <div class="book-card__foot">
+              <a class="studio-icon-btn" href="/books/{{.Slug}}">{{t $.Locale "bookshelf.open_reader"}}</a>
+              <a class="studio-resume-badge js-book-resume" href="/books/{{.Slug}}" hidden data-label="{{t $.Locale "bookshelf.continue_reading"}}">{{t $.Locale "bookshelf.continue_reading"}} →</a>
+            </div>
+          </article>
         {{end}}
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-          <span class="volo-badge">{{.SourceType}}</span>
-          <span style="font-size:.82rem;color:var(--volo-muted)">{{t $.Locale "bookshelf.chapters" (dict "count" .ChapterCount)}}</span>
-        </div>
-        <h2 style="margin:0;font-size:1.1rem"><a href="/books/{{.Slug}}">{{.Title}}</a></h2>
-        {{if .Description}}<p style="margin:0;font-size:.88rem;color:var(--volo-muted)">{{.Description}}</p>{{end}}
-        <div style="margin-top:auto;padding-top:8px">
-          <a class="studio-icon-btn" href="/books/{{.Slug}}">{{t $.Locale "bookshelf.open_reader"}}</a>
-        </div>
-      </article>
+      </div>
     {{else}}
-      <div class="sidebar-card" style="color:var(--volo-muted)">{{t .Locale "search.empty"}}</div>
+      {{template "empty_state" (dict "Title" (t .Locale "studio.empty_books_title") "Desc" (t .Locale "studio.empty_books_desc"))}}
     {{end}}
   </div>
 

@@ -119,6 +119,59 @@ func TestLanguagePackExtensionLifecycleAndZhTWBundle(t *testing.T) {
 		t.Fatalf("expected zh-TW CustomMap admin.nav.locales = 語言包擴充, got %q", customTW["admin.nav.locales"])
 	}
 
+	// Verify 100% key & placeholder parity of locales/zh-TW.json against public + admin catalogs
+	pubZhRaw, err := os.ReadFile(filepath.Join(repoRoot, "internal", "i18n", "builtin", "zh-CN.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	admZhRaw, err := os.ReadFile(filepath.Join(repoRoot, "web", "admin", "src", "locales", "zh-CN.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	twFileRaw, err := os.ReadFile(filepath.Join(repoRoot, "locales", "zh-TW.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pubZh, admZh, twMap map[string]string
+	if err := json.Unmarshal(pubZhRaw, &pubZh); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(admZhRaw, &admZh); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(twFileRaw, &twMap); err != nil {
+		t.Fatal(err)
+	}
+	expectedTW := make(map[string]string, len(pubZh)+len(admZh))
+	for k, v := range pubZh {
+		if !strings.HasPrefix(k, "meta.") {
+			expectedTW[k] = v
+		}
+	}
+	for k, v := range admZh {
+		if strings.HasPrefix(k, "meta.") {
+			continue
+		}
+		mapped := k
+		if strings.HasPrefix(k, "nav.") {
+			mapped = "admin." + k
+		}
+		expectedTW[mapped] = v
+	}
+	for k, zhVal := range expectedTW {
+		twVal, ok := twMap[k]
+		if !ok || strings.TrimSpace(twVal) == "" {
+			t.Fatalf("locales/zh-TW.json missing or empty key %q", k)
+		}
+		zhVars := placeholderRe.FindAllString(zhVal, -1)
+		twVars := placeholderRe.FindAllString(twVal, -1)
+		sort.Strings(zhVars)
+		sort.Strings(twVars)
+		if strings.Join(zhVars, ",") != strings.Join(twVars, ",") {
+			t.Fatalf("locales/zh-TW.json placeholder mismatch on %q: zh=%v vs tw=%v", k, zhVars, twVars)
+		}
+	}
+
 	// 2. Hot-install single JSON pack, ZIP pack, export JSON, and delete external pack
 	tmpDir := t.TempDir()
 	cat, err := NewCatalog("zh-CN", tmpDir)

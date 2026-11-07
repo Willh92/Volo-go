@@ -1,41 +1,52 @@
 {{define "content"}}
-<div class="book-reader-layout">
-  <aside class="sidebar-card" style="position:sticky;top:92px;max-height:calc(100vh - 120px);overflow-y:auto">
-    <a href="/books" style="font-size:.84rem;color:var(--volo-muted)">← {{t .Locale "bookshelf.title"}}</a>
-    <h2 style="margin:8px 0 4px;font-size:1.15rem">{{.BookDetail.Title}}</h2>
-    <div style="font-size:.82rem;color:var(--volo-muted);margin-bottom:14px">
+<div class="book-reader-layout"
+     data-book-reader="{{.BookDetail.Slug}}"
+     {{if .ActiveChapter}}data-active-chapter-id="{{.ActiveChapter.ID}}" data-active-chapter-title="{{.ActiveChapter.Title}}" data-active-chapter-url="/books/{{.BookDetail.Slug}}?ch={{.ActiveChapter.ID}}"{{end}}>
+  <aside class="sidebar-card book-reader-toc">
+    <a class="book-reader-back" href="/books">← {{t .Locale "bookshelf.title"}}</a>
+    <h2 class="book-reader-toc__title">{{.BookDetail.Title}}</h2>
+    <div class="book-reader-toc__count">
       {{t .Locale "bookshelf.chapters" (dict "count" (len .BookDetail.FlatChapters))}}
     </div>
-    <nav style="display:flex;flex-direction:column;gap:6px;font-size:.9rem">
+    <nav class="book-reader-toc__nav" aria-label="{{.BookDetail.Title}}">
       {{range .BookDetail.FlatChapters}}
         {{if hasPrefix .URL "/"}}
-          <a href="{{.URL}}" class="studio-nav__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
+          <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
         {{else if .URL}}
           {{if eq $.BookDetail.EmbedMode "iframe"}}
-            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" class="studio-nav__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
+            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
           {{else}}
-            <a href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax class="studio-nav__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}} ↗</a>
+            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}} ↗</a>
           {{end}}
         {{else}}
-          <span class="studio-nav__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</span>
+          <span class="book-reader-toc__group" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</span>
         {{end}}
       {{end}}
     </nav>
   </aside>
 
-  <article class="studio-article">
+  <article class="studio-article book-reader-main">
+    <div class="book-reader-toolbar">
+      <button type="button" class="studio-icon-btn js-book-toggle-toc"
+              data-collapse-label="{{t .Locale "bookshelf.toggle_toc"}}"
+              data-expand-label="{{t .Locale "bookshelf.expand_toc"}}">{{t .Locale "bookshelf.toggle_toc"}}</button>
+      <button type="button" class="studio-icon-btn js-book-fullscreen"
+              data-enter-label="{{t .Locale "bookshelf.focus_fullscreen"}}"
+              data-exit-label="{{t .Locale "bookshelf.exit_fullscreen"}}">{{t .Locale "bookshelf.focus_fullscreen"}}</button>
+    </div>
+
     {{if .ActiveChapter}}
       <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
       {{if eq .BookDetail.EmbedMode "iframe"}}
-        <iframe src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" style="width:100%;min-height:72vh;border:1px solid var(--volo-line);border-radius:10px" sandbox="allow-same-origin allow-scripts"></iframe>
+        <iframe class="book-reader-frame" src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" sandbox="allow-same-origin allow-scripts"></iframe>
       {{else}}
-        <p><a class="volo-btn" style="display:inline-flex;align-items:center" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax>{{.ActiveChapter.Title}} ↗</a></p>
+        <p><a class="volo-btn studio-inline-btn" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax>{{.ActiveChapter.Title}} ↗</a></p>
       {{end}}
     {{else}}
       <h1 class="studio-article__title">{{.BookDetail.Title}}</h1>
       {{if .BookDetail.Description}}<p>{{.BookDetail.Description}}</p>{{end}}
       {{if .BookDetail.SourceURL}}
-        <p><a class="volo-btn" style="display:inline-flex;align-items:center" href="{{.BookDetail.SourceURL}}" target="_blank" rel="noopener" data-no-pjax>{{.BookDetail.SourceURL}} ↗</a></p>
+        <p><a class="volo-btn studio-inline-btn" href="{{.BookDetail.SourceURL}}" target="_blank" rel="noopener" data-no-pjax>{{.BookDetail.SourceURL}} ↗</a></p>
       {{end}}
     {{end}}
   </article>

@@ -37,7 +37,7 @@ import (
 )
 
 // Version can be overridden at link time via -ldflags="-X main.Version=v1.0.0".
-var Version = "v0.1.0-dev"
+var Version = "v1.0.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -333,6 +333,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		Plugins:              pluginMgr,
 		Media:                mediaPipe,
 		StartedAt:            startedAt,
+		Version:              Version,
 		SendVerificationMail: notifier.SendVerificationCode,
 		NotifyCommentCreated: notifier.NotifyCommentCreated,
 		NotifyArticlePublished: func(pubCtx context.Context, raw domain.RawArticle) {

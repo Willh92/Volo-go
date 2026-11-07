@@ -275,7 +275,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	siteSubtitle := strings.TrimSpace(req.SiteSubtitle)
 	if siteSubtitle == "" {
 		if isZH {
-			siteSubtitle = "独立思考与工程手艺"
+			siteSubtitle = "记录 · 思考 · 分享"
 		} else {
 			siteSubtitle = "Independent thoughts & craft"
 		}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { JSX } from "preact";
+import type { ComponentChildren, JSX } from "preact";
 import type { LocaleOption } from "../i18n";
 import { t } from "../i18n";
 
@@ -29,21 +29,39 @@ export function ConsoleSelect({
   align = "left",
 }: ConsoleSelectProps) {
   const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
   const [flipUp, setFlipUp] = useState(false);
   const [focusIdx, setFocusIdx] = useState<number>(-1);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | undefined>(undefined);
 
   const selected = options.find((o) => o.value === value) || options[0];
+
+  const closeAnimated = () => {
+    if (!open || closing) return;
+    setClosing(true);
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = window.setTimeout(() => {
+      setOpen(false);
+      setClosing(false);
+    }, 140);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     const onDocDown = (ev: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(ev.target as Node)) {
-        setOpen(false);
+        closeAnimated();
       }
     };
     const onEsc = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") setOpen(false);
+      if (ev.key === "Escape") closeAnimated();
     };
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
@@ -51,40 +69,46 @@ export function ConsoleSelect({
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
     };
-  }, [open]);
+  }, [open, closing]);
 
   const toggleOpen = () => {
     if (disabled) return;
-    if (!open && wrapRef.current) {
+    if (open && !closing) {
+      closeAnimated();
+      return;
+    }
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    setClosing(false);
+    if (wrapRef.current) {
       const rect = wrapRef.current.getBoundingClientRect();
       const spaceBelow = window.innerHeight - rect.bottom;
       setFlipUp(spaceBelow < 230 && rect.top > 220);
       const curIdx = options.findIndex((o) => o.value === value);
       setFocusIdx(curIdx >= 0 ? curIdx : 0);
     }
-    setOpen((prev) => !prev);
+    setOpen(true);
   };
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (disabled) return;
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      if (!open) {
+      if (!open || closing) {
         toggleOpen();
       } else if (focusIdx >= 0 && focusIdx < options.length) {
         onChange(options[focusIdx].value);
-        setOpen(false);
+        closeAnimated();
       }
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      if (!open) {
+      if (!open || closing) {
         toggleOpen();
       } else {
         setFocusIdx((i) => (i + 1) % Math.max(1, options.length));
       }
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      if (!open) {
+      if (!open || closing) {
         toggleOpen();
       } else {
         setFocusIdx((i) => (i - 1 + options.length) % Math.max(1, options.length));
@@ -95,7 +119,7 @@ export function ConsoleSelect({
   return (
     <div
       ref={wrapRef}
-      class={`volo-cselect ${open ? "is-open" : ""} ${disabled ? "is-disabled" : ""} ${className}`.trim()}
+      class={`volo-cselect ${open && !closing ? "is-open" : ""} ${disabled ? "is-disabled" : ""} ${className}`.trim()}
       style={style}
     >
       <button
@@ -103,7 +127,7 @@ export function ConsoleSelect({
         class="volo-cselect-btn"
         disabled={disabled}
         aria-haspopup="listbox"
-        aria-expanded={open}
+        aria-expanded={open && !closing}
         onClick={toggleOpen}
         onKeyDown={handleKeyDown}
       >
@@ -123,7 +147,7 @@ export function ConsoleSelect({
 
       {open && (
         <div
-          class={`volo-cselect-menu ${flipUp ? "flip-up" : ""} ${align === "right" ? "align-right" : ""}`}
+          class={`volo-cselect-menu ${flipUp ? "flip-up" : ""} ${align === "right" ? "align-right" : ""} ${closing ? "is-closing" : ""}`}
           role="listbox"
         >
           {options.map((opt, idx) => {
@@ -139,7 +163,7 @@ export function ConsoleSelect({
                 onMouseEnter={() => setFocusIdx(idx)}
                 onClick={() => {
                   onChange(opt.value);
-                  setOpen(false);
+                  closeAnimated();
                 }}
               >
                 <span class="volo-cselect-item-text">{opt.label}</span>
@@ -177,18 +201,36 @@ export interface LocalePopoverProps {
 
 export function LocalePopover({ value, locales, onChange, pill = true }: LocalePopoverProps) {
   const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | undefined>(undefined);
   const current = locales.find((l) => l.code === value) || locales[0];
+
+  const closeAnimated = () => {
+    if (!open || closing) return;
+    setClosing(true);
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = window.setTimeout(() => {
+      setOpen(false);
+      setClosing(false);
+    }, 140);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     const onDocDown = (ev: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(ev.target as Node)) {
-        setOpen(false);
+        closeAnimated();
       }
     };
     const onEsc = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") setOpen(false);
+      if (ev.key === "Escape") closeAnimated();
     };
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
@@ -196,17 +238,27 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
     };
-  }, [open]);
+  }, [open, closing]);
+
+  const toggle = () => {
+    if (open && !closing) {
+      closeAnimated();
+    } else {
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+      setClosing(false);
+      setOpen(true);
+    }
+  };
 
   return (
-    <div ref={wrapRef} class={`volo-cselect volo-locale-pop ${open ? "is-open" : ""}`}>
+    <div ref={wrapRef} class={`volo-cselect volo-locale-pop ${open && !closing ? "is-open" : ""}`}>
       <button
         type="button"
         class={pill ? "volo-locale-trigger" : "volo-cselect-btn"}
         title={t("shell.lang_title")}
         aria-haspopup="listbox"
-        aria-expanded={open}
-        onClick={() => setOpen((p) => !p)}
+        aria-expanded={open && !closing}
+        onClick={toggle}
       >
         <svg
           width="15"
@@ -238,7 +290,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
       </button>
 
       {open && (
-        <div class="volo-cselect-menu align-right volo-locale-menu" role="listbox">
+        <div class={`volo-cselect-menu align-right volo-locale-menu ${closing ? "is-closing" : ""}`} role="listbox">
           <div class="volo-pop-caption">{t("shell.lang_title")}</div>
           {locales.map((loc) => {
             const isAct = loc.code === value;
@@ -251,7 +303,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
                 class={`volo-cselect-item ${isAct ? "active" : ""}`}
                 onClick={() => {
                   onChange(loc.code);
-                  setOpen(false);
+                  closeAnimated();
                 }}
               >
                 <span class="volo-cselect-item-text">{loc.name}</span>
@@ -279,6 +331,240 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
         </div>
       )}
     </div>
+  );
+}
+
+export interface AnimatedModalProps {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  subtitle?: string;
+  maxWidth?: string;
+  children: ComponentChildren;
+  footer?: ComponentChildren;
+}
+
+export function AnimatedModal({
+  open,
+  onClose,
+  title,
+  subtitle,
+  maxWidth = "640px",
+  children,
+  footer,
+}: AnimatedModalProps) {
+  const [rendered, setRendered] = useState(open);
+  const [closing, setClosing] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setRendered(true);
+      setClosing(false);
+    } else if (rendered) {
+      setClosing(true);
+      const timer = window.setTimeout(() => {
+        setRendered(false);
+        setClosing(false);
+      }, 170);
+      return () => window.clearTimeout(timer);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!rendered || closing) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [rendered, closing, onClose]);
+
+  if (!rendered) return null;
+
+  return (
+    <div
+      class={`volo-modal-backdrop ${closing ? "is-closing" : ""}`}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        class={`volo-modal ${closing ? "is-closing" : ""}`}
+        style={{ maxWidth }}
+        role="dialog"
+        aria-modal="true"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div class="volo-modal-head">
+          <div style={{ minWidth: 0 }}>
+            <h3 class="volo-card-title" style={{ fontSize: "16.5px" }}>{title}</h3>
+            {subtitle && <p class="volo-sec-desc" style={{ marginTop: "3px" }}>{subtitle}</p>}
+          </div>
+          <button
+            type="button"
+            class="volo-modal-close"
+            aria-label={t("common.close")}
+            title={t("common.close")}
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </div>
+        <div class="volo-modal-body">{children}</div>
+        {footer && <div class="volo-form-actions">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
+export interface NavIconPreviewProps {
+  icon?: string;
+  fallbackLabel?: string;
+  size?: number;
+}
+
+export function NavIconPreview({ icon, fallbackLabel, size = 16 }: NavIconPreviewProps) {
+  const [imgErr, setImgErr] = useState(false);
+  const raw = (icon || "").trim();
+  const low = raw.toLowerCase();
+
+  useEffect(() => {
+    setImgErr(false);
+  }, [raw]);
+
+  const boxSize = Math.max(26, size + 12);
+
+  if (
+    low === "github" ||
+    low.includes("github-icon") ||
+    low === "https://github.com/favicon.ico"
+  ) {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.09 3.29 9.4 7.86 10.92.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11.02 11.02 0 0 1 5.78 0c2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.24 2.76.12 3.05.74.81 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.26 5.67.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (low === "admin" || low.includes("admin-panel")) {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="9" rx="1.5" />
+          <rect x="14" y="3" width="7" height="5" rx="1.5" />
+          <rect x="14" y="12" width="7" height="9" rx="1.5" />
+          <rect x="3" y="16" width="7" height="5" rx="1.5" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (low === "logout" || low.includes("admin-logout")) {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+          <polyline points="16 17 21 12 16 7" />
+          <line x1="21" y1="12" x2="9" y2="12" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (low === "book" || low === "books") {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2z" />
+          <path d="M22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (low === "rss" || low === "feed") {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 11a9 9 0 0 1 9 9" />
+          <path d="M4 4a16 16 0 0 1 16 16" />
+          <circle cx="5" cy="19" r="1.5" fill="currentColor" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (low === "mail" || low === "email") {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="5" width="18" height="14" rx="2" />
+          <path d="m3 7 9 6 9-6" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (low === "external") {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 4h6v6" />
+          <path d="M10 14 20 4" />
+          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (low === "link") {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (!imgErr && (raw.startsWith("/") || raw.startsWith("http://") || raw.startsWith("https://") || raw.startsWith("data:"))) {
+    return (
+      <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
+        <img
+          src={raw}
+          alt=""
+          style={{ width: `${size + 2}px`, height: `${size + 2}px`, objectFit: "contain", borderRadius: "4px" }}
+          onError={() => setImgErr(true)}
+        />
+      </span>
+    );
+  }
+
+  const ch = (fallbackLabel || "").trim().charAt(0).toUpperCase();
+  return (
+    <span
+      class="volo-icon-preview-box is-fallback"
+      style={{ width: `${boxSize}px`, height: `${boxSize}px` }}
+      title={raw || fallbackLabel || ""}
+    >
+      {ch ? (
+        <span style={{ fontSize: "11.5px", fontWeight: 700 }}>{ch}</span>
+      ) : (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M3.6 9h16.8M3.6 15h16.8" />
+          <path d="M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18" />
+        </svg>
+      )}
+    </span>
   );
 }
 

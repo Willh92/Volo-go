@@ -1,47 +1,73 @@
 {{define "content"}}
-<section class="studio-hero">
-  <h1 class="studio-hero__title">{{.HeroTitle}}</h1>
-  {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+<section class="studio-hero studio-hero--simple">
+  <div class="studio-hero-copy">
+    <h1 class="studio-hero__title">{{.HeroTitle}}</h1>
+    {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+  </div>
 </section>
 
 <div class="studio-layout">
-  <div class="studio-article">
+  <div>
     {{if eq .TaxonomyKind "categories"}}
-      <div class="bookshelf-grid">
-        {{range .Categories}}
-          <a class="book-card" href="/categories/{{.Slug}}" style="color:var(--volo-text);text-decoration:none">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-              <strong>{{.Name}}</strong>
-              <span class="volo-badge">{{.ArticleCount}}</span>
-            </div>
-            {{if .Description}}<p style="margin:0;color:var(--volo-muted);font-size:.88rem">{{.Description}}</p>{{end}}
-          </a>
-        {{end}}
-      </div>
+      {{if .Categories}}
+        <div class="studio-article">
+          <div class="bookshelf-grid">
+            {{range .Categories}}
+              <a class="book-card studio-tax-card" href="/categories/{{.Slug}}">
+                <div class="studio-tax-card__head">
+                  <strong>{{.Name}}</strong>
+                  <span class="volo-badge">{{.ArticleCount}}</span>
+                </div>
+                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+              </a>
+            {{end}}
+          </div>
+        </div>
+      {{else}}
+        {{template "empty_state" (dict "Title" (t .Locale "studio.empty_categories_title") "Desc" (t .Locale "studio.empty_categories_desc"))}}
+      {{end}}
     {{else if eq .TaxonomyKind "tags"}}
-      <div class="tag-cloud">
-        {{range .Tags}}
-          <a class="tag-chip" href="/tags/{{.Slug}}" style="font-size:.95rem;padding:6px 14px">#{{.Name}} <strong>{{.ArticleCount}}</strong></a>
-        {{end}}
-      </div>
+      {{if .Tags}}
+        <div class="studio-article">
+          <div class="tag-cloud studio-tax-tags">
+            {{range .Tags}}
+              <a class="tag-chip studio-tax-tag" href="/tags/{{.Slug}}">#{{.Name}} <strong>{{.ArticleCount}}</strong></a>
+            {{end}}
+          </div>
+        </div>
+      {{else}}
+        {{template "empty_state" (dict "Title" (t .Locale "studio.empty_tags_title") "Desc" (t .Locale "studio.empty_tags_desc"))}}
+      {{end}}
     {{else if eq .TaxonomyKind "archives"}}
-      <div style="display:flex;flex-direction:column;gap:10px">
-        {{range .ArchiveBuckets}}
-          <a href="/archives/{{.YearMonth}}" style="display:flex;justify-content:space-between;padding:10px 14px;border-radius:9px;background:var(--volo-raised);color:var(--volo-text)">
-            <strong>{{.YearMonth}}</strong>
-            <span class="volo-badge">{{.Count}}</span>
-          </a>
-        {{end}}
-      </div>
+      {{if .ArchiveBuckets}}
+        <div class="studio-article">
+          <div class="studio-archive-list">
+            {{range .ArchiveBuckets}}
+              <a class="studio-archive-row" href="/archives/{{.YearMonth}}">
+                <strong>{{.YearMonth}}</strong>
+                <span class="volo-badge">{{.Count}}</span>
+              </a>
+            {{end}}
+          </div>
+        </div>
+      {{else}}
+        {{template "empty_state" (dict "Title" (t .Locale "studio.empty_archives_title") "Desc" (t .Locale "studio.empty_archives_desc"))}}
+      {{end}}
     {{else if eq .TaxonomyKind "series"}}
-      <div class="bookshelf-grid">
-        {{range .SeriesList}}
-          <a class="book-card" href="/series/{{.Slug}}" style="color:var(--volo-text);text-decoration:none">
-            <strong>{{.Title}}</strong>
-            {{if .Description}}<p style="margin:0;color:var(--volo-muted);font-size:.88rem">{{.Description}}</p>{{end}}
-          </a>
-        {{end}}
-      </div>
+      {{if .SeriesList}}
+        <div class="studio-article">
+          <div class="bookshelf-grid">
+            {{range .SeriesList}}
+              <a class="book-card studio-tax-card" href="/series/{{.Slug}}">
+                <strong>{{.Title}}</strong>
+                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+              </a>
+            {{end}}
+          </div>
+        </div>
+      {{else}}
+        {{template "empty_state" (dict "Title" (t .Locale "studio.empty_series_title") "Desc" (t .Locale "studio.empty_series_desc"))}}
+      {{end}}
     {{end}}
   </div>
 

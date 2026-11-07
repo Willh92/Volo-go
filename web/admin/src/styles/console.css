@@ -861,11 +861,21 @@ a {
   width: 100%;
   padding: 8px 11px;
   border: 1px solid var(--volo-line);
-  border-radius: var(--volo-radius-sm);
+  border-radius: 8px;
   background: var(--volo-surface);
   color: var(--volo-text);
   outline: none;
   transition: border-color 0.16s ease, box-shadow 0.16s ease, background-color 0.16s ease;
+}
+
+.volo-input, .volo-select {
+  height: 38px;
+  padding: 0 11px;
+}
+
+.volo-textarea {
+  padding: 9px 11px;
+  line-height: 1.55;
 }
 
 .volo-input:hover:not(:disabled), .volo-select:hover:not(:disabled), .volo-textarea:hover:not(:disabled) {
@@ -902,19 +912,23 @@ input[type="checkbox"] {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 8px 14px;
-  border-radius: var(--volo-radius-sm);
+  height: 38px;
+  padding: 0 15px;
+  border-radius: 8px;
   border: 1px solid var(--volo-line);
   background: var(--volo-surface);
   color: var(--volo-text);
+  font-size: 13.5px;
   font-weight: 550;
   cursor: pointer;
   white-space: nowrap;
   text-decoration: none;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.12s ease;
 }
 
 .volo-btn:hover:not(:disabled) {
   background: var(--volo-raised);
+  border-color: color-mix(in srgb, var(--volo-accent) 36%, var(--volo-line));
 }
 
 .volo-btn:disabled {
@@ -931,6 +945,7 @@ input[type="checkbox"] {
 .volo-btn-primary:hover:not(:disabled) {
   background: var(--volo-accent-hover);
   border-color: var(--volo-accent-hover);
+  color: #ffffff;
 }
 
 .volo-btn-danger {
@@ -938,9 +953,17 @@ input[type="checkbox"] {
   border-color: rgba(196, 60, 53, 0.35);
 }
 
+.volo-btn-danger:hover:not(:disabled) {
+  background: rgba(196, 60, 53, 0.09);
+  border-color: rgba(196, 60, 53, 0.52);
+  color: var(--volo-danger);
+}
+
 .volo-btn-sm {
-  padding: 5px 10px;
-  font-size: 12px;
+  height: 34px;
+  padding: 0 12px;
+  font-size: 12.5px;
+  border-radius: 8px;
 }
 
 .volo-badge {
@@ -973,17 +996,19 @@ input[type="checkbox"] {
   flex-wrap: wrap;
   gap: 2px;
   padding: 3px;
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--volo-raised);
   border: 1px solid var(--volo-line);
+  min-height: 34px;
+  align-items: center;
 }
 
 .volo-filter-pill {
   border: 0;
   background: transparent;
   color: var(--volo-muted);
-  padding: 5.5px 12px;
-  border-radius: 7px;
+  padding: 4.5px 12px;
+  border-radius: 6px;
   font-size: 12.5px;
   font-weight: 550;
   cursor: pointer;
@@ -1009,10 +1034,19 @@ input[type="checkbox"] {
 }
 
 .volo-filter-controls .volo-input,
-.volo-filter-controls .volo-select {
+.volo-filter-controls .volo-select,
+.volo-filter-controls .volo-cselect-btn,
+.volo-filter-controls .volo-btn {
   height: 34px;
-  padding: 0 11px;
+  min-height: 34px;
+  border-radius: 8px;
   font-size: 13px;
+}
+
+.volo-filter-controls .volo-input,
+.volo-filter-controls .volo-select,
+.volo-filter-controls .volo-cselect-btn {
+  padding: 0 11px;
 }
 
 .volo-table-wrap {
@@ -1459,14 +1493,18 @@ input[type="checkbox"] {
 .volo-modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.48);
-  backdrop-filter: blur(2px);
+  background: rgba(12, 20, 17, 0.48);
+  backdrop-filter: blur(3px);
   z-index: 95;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 20px;
-  animation: volo-fade-in 0.16s ease;
+  animation: volo-fade-in 0.18s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.volo-modal-backdrop.is-closing {
+  animation: volo-fade-out 0.16s ease forwards;
 }
 
 @keyframes volo-fade-in {
@@ -1474,16 +1512,109 @@ input[type="checkbox"] {
   to { opacity: 1; }
 }
 
+@keyframes volo-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
 .volo-modal {
   background: var(--volo-surface);
   border: 1px solid var(--volo-line);
-  border-radius: var(--volo-radius);
-  padding: 22px;
+  border-radius: 16px;
+  padding: 22px 24px;
   width: 100%;
   max-width: 720px;
-  max-height: 86vh;
-  overflow-y: auto;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
   box-shadow: var(--volo-shadow-pop);
+  animation: volo-modal-enter 0.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.volo-modal.is-closing {
+  animation: volo-modal-exit 0.16s ease forwards;
+}
+
+@keyframes volo-modal-enter {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.965);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes volo-modal-exit {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(6px) scale(0.975);
+  }
+}
+
+.volo-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--volo-line);
+  flex-shrink: 0;
+}
+
+.volo-modal-close {
+  appearance: none;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  color: var(--volo-muted);
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  font-size: 18px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
+}
+
+.volo-modal-close:hover {
+  border-color: var(--volo-accent);
+  color: var(--volo-text);
+  background: var(--volo-surface);
+}
+
+.volo-modal-body {
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+  padding-right: 2px;
+}
+
+.volo-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--volo-line);
+  flex-shrink: 0;
+}
+
+.volo-form-actions.no-border {
+  border-top: 0;
+  padding-top: 4px;
+  margin-top: 10px;
 }
 
 /* Custom Rounded Select (`ConsoleSelect`) & Scalable `LocalePopover` */
@@ -1499,10 +1630,11 @@ input[type="checkbox"] {
 
 .volo-cselect-btn {
   width: 100%;
-  min-height: 37px;
-  padding: 7px 11px;
+  height: 38px;
+  min-height: 38px;
+  padding: 0 11px;
   border: 1px solid var(--volo-line);
-  border-radius: var(--volo-radius-sm);
+  border-radius: 8px;
   background: var(--volo-surface);
   color: var(--volo-text);
   display: inline-flex;
@@ -1545,6 +1677,15 @@ input[type="checkbox"] {
   color: var(--volo-accent);
 }
 
+.volo-pop-menu {
+  transform-origin: top right;
+  animation: volo-pop-open 0.16s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.volo-pop-menu.is-closing {
+  animation: volo-pop-close 0.14s ease forwards;
+}
+
 .volo-cselect-menu {
   position: absolute;
   top: calc(100% + 5px);
@@ -1561,17 +1702,24 @@ input[type="checkbox"] {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  animation: volo-pop-open 0.15s cubic-bezier(0.22, 1, 0.36, 1);
+  transform-origin: top center;
+  animation: volo-pop-open 0.16s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.volo-cselect-menu.is-closing {
+  animation: volo-pop-close 0.14s ease forwards;
 }
 
 .volo-cselect-menu.flip-up {
   top: auto;
   bottom: calc(100% + 5px);
+  transform-origin: bottom center;
 }
 
 .volo-cselect-menu.align-right {
   left: auto;
   right: 0;
+  transform-origin: top right;
 }
 
 .volo-locale-menu {
@@ -1581,11 +1729,22 @@ input[type="checkbox"] {
 @keyframes volo-pop-open {
   from {
     opacity: 0;
-    transform: translateY(-4px) scale(0.985);
+    transform: translateY(-5px) scale(0.975);
   }
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes volo-pop-close {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
   }
 }
 
@@ -2367,5 +2526,909 @@ input[type="checkbox"] {
   .volo-ed-right {
     width: 100%;
     justify-content: space-between;
+  }
+}
+
+/* =========================================================================
+   Volo Parity Upgrade: Auth Two-Column Story Card, Media Grid, Capsule Tags,
+   Icon Preview, Interactive Analytics Charts, About & Help Workspace
+   ========================================================================= */
+
+/* 1. Legacy Two-Column Login Page (`start.ftl` + `account.scss` parity) */
+.volo-auth-page {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  background: var(--volo-bg);
+  color: var(--volo-text);
+}
+
+.volo-auth-header {
+  width: 100%;
+  max-width: 1060px;
+  margin: 0 auto;
+  padding: 20px 24px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.volo-auth-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  text-decoration: none;
+  color: var(--volo-text);
+}
+
+.volo-auth-mark {
+  width: 42px;
+  height: 42px;
+  border-radius: 13px;
+  background: var(--volo-btn-bg);
+  color: #ffffff;
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--volo-accent) 26%, transparent);
+}
+
+.volo-auth-brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.volo-auth-brand-text strong {
+  font-size: 18px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+}
+
+.volo-auth-brand-text small {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--volo-muted);
+  margin-top: 2px;
+}
+
+.volo-auth-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.volo-auth-back {
+  height: 36px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-surface);
+  color: var(--volo-text);
+  font-size: 13px;
+  font-weight: 550;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.volo-auth-back:hover {
+  border-color: var(--volo-accent);
+  color: var(--volo-accent);
+}
+
+.volo-auth-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px 24px 28px;
+}
+
+.volo-auth-layout {
+  width: 100%;
+  max-width: 960px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-radius: 24px;
+  overflow: hidden;
+  box-shadow: 0 22px 60px rgba(14, 24, 20, 0.12);
+}
+
+.volo-auth-story {
+  position: relative;
+  min-height: 500px;
+  padding: 42px 40px 36px;
+  background: var(--volo-nav);
+  color: #f3f8f5;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  overflow: hidden;
+}
+
+.volo-auth-story-eyebrow {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--volo-nav-mark);
+  margin-bottom: 14px;
+}
+
+.volo-auth-story h1 {
+  margin: 0 0 14px;
+  font-size: 31px;
+  line-height: 1.28;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  color: #ffffff;
+}
+
+.volo-auth-story p {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.72;
+  color: rgba(240, 247, 243, 0.78);
+  max-width: 340px;
+}
+
+.volo-auth-story-art {
+  position: relative;
+  height: 190px;
+  margin: 18px 0 8px;
+  pointer-events: none;
+}
+
+.volo-auth-shape {
+  position: absolute;
+  width: 162px;
+  height: 162px;
+  border-radius: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  transform: rotate(-18deg);
+}
+
+.volo-auth-shape.s1 {
+  left: 14px;
+  top: 16px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.02));
+}
+
+.volo-auth-shape.s2 {
+  left: 96px;
+  top: 28px;
+  background: color-mix(in srgb, var(--volo-nav-mark) 22%, transparent);
+  border-color: color-mix(in srgb, var(--volo-nav-mark) 40%, rgba(255, 255, 255, 0.12));
+}
+
+.volo-auth-shape.s3 {
+  left: 178px;
+  top: 8px;
+  width: 132px;
+  height: 132px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.volo-auth-story-foot {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: rgba(240, 247, 243, 0.68);
+  position: relative;
+  z-index: 2;
+}
+
+.volo-auth-card {
+  background: var(--volo-surface);
+  border: 1px solid var(--volo-line);
+  border-left: 0;
+  border-radius: 0 24px 24px 0;
+  padding: 40px 40px 34px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.volo-auth-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.volo-auth-kicker {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--volo-accent);
+  background: var(--volo-accent-soft);
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+
+.volo-auth-version {
+  font-family: var(--volo-mono);
+  font-size: 11.5px;
+  color: var(--volo-muted);
+}
+
+.volo-auth-card h2 {
+  margin: 0 0 6px;
+  font-size: 24px;
+  font-weight: 740;
+  letter-spacing: -0.015em;
+}
+
+.volo-auth-sub {
+  margin: 0 0 22px;
+  font-size: 13.5px;
+  color: var(--volo-muted);
+}
+
+.volo-auth-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.volo-auth-input-icon {
+  position: absolute;
+  left: 12px;
+  color: var(--volo-muted);
+  display: inline-flex;
+  pointer-events: none;
+}
+
+.volo-auth-input-wrap .volo-input {
+  height: 42px;
+  padding-left: 38px;
+  padding-right: 38px;
+}
+
+.volo-auth-eye {
+  position: absolute;
+  right: 8px;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--volo-muted);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.volo-auth-eye:hover {
+  color: var(--volo-text);
+  background: var(--volo-raised);
+}
+
+.volo-auth-submit {
+  width: 100%;
+  height: 42px;
+  font-size: 14px;
+  font-weight: 650;
+  margin-top: 6px;
+}
+
+.volo-auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 12px;
+  color: var(--volo-muted);
+  font-size: 12px;
+}
+
+.volo-auth-divider::before,
+.volo-auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--volo-line);
+}
+
+.volo-auth-card-foot {
+  margin-top: 22px;
+  padding-top: 14px;
+  border-top: 1px solid var(--volo-line);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--volo-muted);
+}
+
+.volo-auth-footer {
+  width: 100%;
+  max-width: 1060px;
+  margin: 0 auto;
+  padding: 8px 24px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--volo-muted);
+}
+
+.volo-auth-footer a {
+  color: var(--volo-muted);
+  text-decoration: none;
+}
+
+.volo-auth-footer a:hover {
+  color: var(--volo-accent);
+}
+
+/* 2. Real Icon Preview Box & Input-With-Picker Row */
+.volo-icon-preview-box {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  color: var(--volo-text);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.volo-icon-preview-box.is-fallback {
+  color: var(--volo-muted);
+}
+
+.volo-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.volo-input-row > .volo-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.volo-avatar-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.volo-avatar-preview {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-accent-soft);
+  color: var(--volo-accent);
+  font-size: 20px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.volo-avatar-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* 3. Prominent Top Article Title & Capsule Tag Selector */
+.volo-editor-title-input {
+  width: 100%;
+  height: 52px;
+  padding: 0 16px;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  border: 1px solid var(--volo-line);
+  border-radius: 11px;
+  background: var(--volo-surface);
+  color: var(--volo-text);
+  outline: none;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.volo-editor-title-input:focus {
+  border-color: var(--volo-accent);
+  box-shadow: 0 0 0 3px var(--volo-accent-soft);
+}
+
+.volo-tag-capsule-box {
+  min-height: 38px;
+  padding: 4px 8px;
+  border: 1px solid var(--volo-line);
+  border-radius: 8px;
+  background: var(--volo-surface);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.volo-tag-capsule-box:focus-within {
+  border-color: var(--volo-accent);
+  box-shadow: 0 0 0 3px var(--volo-accent-soft);
+}
+
+.volo-tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--volo-accent-soft);
+  color: var(--volo-accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.volo-tag-pill button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 0 1px;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.75;
+}
+
+.volo-tag-pill button:hover {
+  opacity: 1;
+}
+
+.volo-tag-inline-input {
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--volo-text);
+  font-size: 13px;
+  min-width: 120px;
+  flex: 1;
+  height: 28px;
+  padding: 0 4px;
+}
+
+/* 4. Visual Media Library Grid (`console-media-grid`) & Picker Modal */
+.volo-media-dropzone {
+  border: 1.5px dashed var(--volo-line);
+  border-radius: 12px;
+  padding: 2px;
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+
+.volo-media-dropzone.is-dragging {
+  border-color: var(--volo-accent);
+  background: var(--volo-accent-soft);
+}
+
+.volo-media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
+  gap: 14px;
+}
+
+.volo-media-card {
+  border: 1px solid var(--volo-line);
+  border-radius: 12px;
+  background: var(--volo-surface);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
+}
+
+.volo-media-card:hover {
+  border-color: color-mix(in srgb, var(--volo-accent) 48%, var(--volo-line));
+  transform: translateY(-2px);
+  box-shadow: var(--volo-shadow);
+}
+
+.volo-media-card.is-orphan {
+  border-style: dashed;
+  border-color: rgba(184, 115, 20, 0.55);
+}
+
+.volo-media-thumb {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  background: var(--volo-raised);
+  border-bottom: 1px solid var(--volo-line);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.volo-media-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.24s ease;
+}
+
+.volo-media-card:hover .volo-media-thumb img {
+  transform: scale(1.03);
+}
+
+.volo-media-type-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--volo-muted);
+  font-family: var(--volo-mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 12px;
+  width: 100%;
+}
+
+.volo-media-ref-pill {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2.5px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  backdrop-filter: blur(6px);
+}
+
+.volo-media-ref-pill.used {
+  background: rgba(21, 108, 67, 0.86);
+  color: #ffffff;
+}
+
+.volo-media-ref-pill.orphan {
+  background: rgba(184, 104, 18, 0.92);
+  color: #ffffff;
+}
+
+.volo-media-body {
+  padding: 11px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+}
+
+.volo-media-name {
+  font-size: 13px;
+  font-weight: 620;
+  color: var(--volo-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volo-media-meta {
+  font-family: var(--volo-mono);
+  font-size: 11.5px;
+  color: var(--volo-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.volo-media-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  padding-top: 6px;
+  margin-top: auto;
+  border-top: 1px solid var(--volo-line);
+}
+
+.volo-media-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
+  gap: 10px;
+  max-height: 440px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+.volo-media-picker-card {
+  appearance: none;
+  border: 1px solid var(--volo-line);
+  border-radius: 10px;
+  background: var(--volo-raised);
+  padding: 0;
+  overflow: hidden;
+  cursor: pointer;
+  text-align: left;
+  color: var(--volo-text);
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.14s ease, transform 0.14s ease;
+}
+
+.volo-media-picker-card:hover {
+  border-color: var(--volo-accent);
+  transform: translateY(-1px);
+}
+
+.volo-media-picker-thumb {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  background: var(--volo-surface);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+
+.volo-media-picker-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.volo-media-picker-meta {
+  padding: 7px 9px;
+}
+
+.volo-media-picker-name {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volo-media-picker-sub {
+  font-family: var(--volo-mono);
+  font-size: 10.5px;
+  color: var(--volo-muted);
+  margin-top: 2px;
+}
+
+.volo-lightbox-img-wrap {
+  background: var(--volo-raised);
+  border: 1px solid var(--volo-line);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-height: 56vh;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.volo-lightbox-img-wrap img {
+  max-width: 100%;
+  max-height: 52vh;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+/* 5. Overview Interactive Chart Tooltip & 3-Chart Data Panel */
+.volo-chart-stage {
+  position: relative;
+}
+
+.volo-chart-tooltip {
+  position: absolute;
+  top: 8px;
+  pointer-events: none;
+  background: var(--volo-nav);
+  color: #ffffff;
+  padding: 7px 11px;
+  border-radius: 9px;
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: var(--volo-shadow-pop);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  z-index: 8;
+  white-space: nowrap;
+}
+
+.volo-mini-chart-card {
+  background: var(--volo-raised);
+  border: 1px solid var(--volo-line);
+  border-radius: 12px;
+  padding: 15px 16px;
+  display: flex;
+  flex-direction: column;
+  min-height: 230px;
+}
+
+.volo-mini-chart-title {
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--volo-text);
+}
+
+.volo-donut-wrap {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 1;
+}
+
+.volo-donut-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.volo-donut-legend-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.volo-donut-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+/* 6. About & Help Workspace */
+.volo-about-hero {
+  background: linear-gradient(135deg, var(--volo-nav) 0%, color-mix(in srgb, var(--volo-accent) 42%, var(--volo-nav)) 100%);
+  color: #ffffff;
+  border-radius: 16px;
+  padding: 28px 30px;
+  margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  box-shadow: var(--volo-shadow);
+}
+
+.volo-about-hero-left {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.volo-about-mark {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  font-size: 24px;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  flex-shrink: 0;
+}
+
+.volo-repo-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.volo-repo-stat {
+  background: var(--volo-raised);
+  border: 1px solid var(--volo-line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.volo-repo-stat strong {
+  display: block;
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.volo-repo-stat span {
+  font-size: 11.5px;
+  color: var(--volo-muted);
+}
+
+.volo-about-kv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.volo-about-kv {
+  background: var(--volo-raised);
+  border: 1px solid var(--volo-line);
+  border-radius: 9px;
+  padding: 9px 12px;
+}
+
+.volo-about-kv small {
+  display: block;
+  font-size: 11px;
+  color: var(--volo-muted);
+  margin-bottom: 2px;
+}
+
+.volo-about-kv span {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--volo-mono);
+}
+
+.volo-kbd {
+  font-family: var(--volo-mono);
+  font-size: 11.5px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  color: var(--volo-text);
+}
+
+@media (max-width: 780px) {
+  .volo-auth-layout {
+    grid-template-columns: 1fr;
+  }
+  .volo-auth-story {
+    min-height: 240px;
+    padding: 28px 24px;
+    border-radius: 20px 20px 0 0;
+  }
+  .volo-auth-story-art {
+    display: none;
+  }
+  .volo-auth-card {
+    border-left: 1px solid var(--volo-line);
+    border-top: 0;
+    border-radius: 0 0 20px 20px;
+    padding: 28px 22px;
+  }
+  .volo-donut-wrap {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .volo-modal-backdrop,
+  .volo-modal,
+  .volo-pop-menu,
+  .volo-cselect-menu,
+  .volo-toast {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
   }
 }

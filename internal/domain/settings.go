@@ -1,5 +1,7 @@
 package domain
 
+import "strings"
+
 // SocialLink represents an item in the dynamic social profile links list (replacing legacy fixed 21 usite* fields).
 type SocialLink struct {
 	ID    string `json:"id"`
@@ -220,12 +222,19 @@ func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 	if defaultLocale == "" {
 		defaultLocale = "zh-CN"
 	}
+	isZH := strings.HasPrefix(strings.ToLower(strings.TrimSpace(defaultLocale)), "zh")
+	defaultSubtitle := "Independent thoughts & craft"
+	defaultDesc := "A fast, sovereign personal blog powered by Volo-go."
+	if isZH {
+		defaultSubtitle = "记录 · 思考 · 分享"
+		defaultDesc = "由 Volo-go 驱动的独立个人博客。"
+	}
 	return SettingsSnapshot{
 		Site: SiteSettings{
 			Initialized:         false,
 			Title:               "Volo Blog",
-			Subtitle:            "Independent thoughts & craft",
-			Description:         "A fast, sovereign personal blog powered by Volo-go.",
+			Subtitle:            defaultSubtitle,
+			Description:         defaultDesc,
 			LogoURL:             "",
 			FaviconURL:          "/favicon.svg",
 			DefaultLocale:       defaultLocale,

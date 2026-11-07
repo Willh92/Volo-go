@@ -1,11 +1,13 @@
 {{define "content"}}
-<div class="studio-layout" style="margin-top:28px">
-  <div>
+<div class="studio-layout studio-layout--article">
+  <div class="studio-article-col">
     <article class="studio-article">
-      <h1 class="studio-article__title">{{.StandalonePage.Title}}</h1>
+      <header class="studio-article__header">
+        <h1 class="studio-article__title">{{.StandalonePage.Title}}</h1>
+      </header>
       {{if .Alternates}}
-        <div style="margin-bottom:16px;font-size:.86rem;color:var(--volo-muted)">
-          {{t .Locale "article.other_languages"}}
+        <div class="studio-alternates">
+          <span>{{t .Locale "article.other_languages"}}</span>
           {{range .Alternates}}
             <a class="tag-chip" href="{{.URL}}">{{.Lang}} · {{.Title}}</a>
           {{end}}
@@ -17,25 +19,7 @@
     </article>
 
     {{if .StandalonePage.AllowComment}}
-      <section id="volo-comments" class="volo-comments-card"
-               data-target-type="page"
-               data-target-id="{{.StandalonePage.ID}}"
-               data-access-mode="{{.Reading.CommentAccessMode}}"
-               data-is-logged="{{if .Viewer}}true{{else}}false{{end}}"
-               data-l-title="{{t .Locale "comment.section_title" (dict "count" .StandalonePage.CommentCount)}}"
-               data-l-nick="{{t .Locale "comment.nickname"}}"
-               data-l-email="{{t .Locale "comment.email_private"}}"
-               data-l-site="{{t .Locale "comment.website"}}"
-               data-l-ph="{{t .Locale "comment.placeholder"}}"
-               data-l-submit="{{t .Locale "comment.submit"}}"
-               data-l-pow="{{t .Locale "comment.submitting_pow"}}"
-               data-l-pending="{{t .Locale "comment.pending_notice"}}"
-               data-l-regonly="{{t .Locale "comment.registered_only"}}"
-               data-l-reply="{{t .Locale "comment.reply"}}"
-               data-l-edit="{{t .Locale "comment.edit"}}"
-               data-l-del="{{t .Locale "comment.delete"}}"
-               data-l-claim="{{t .Locale "comment.claim_guest_prompt" (dict "count" "")}}">
-      </section>
+      {{template "comment_mount" (dict "Ctx" . "TargetType" "page" "TargetID" .StandalonePage.ID "CommentCount" .StandalonePage.CommentCount)}}
     {{end}}
   </div>
 

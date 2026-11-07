@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, currentUserSig, showToast } from "../api";
-import { ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
+import { apiFetch, currentUserSig, resetConsoleScroll, showToast, storageDriverSig } from "../api";
+import { MediaPickButton } from "../components/MediaLibraryModal";
+import { AnimatedModal, ConsoleSelect, NavIconPreview, paginateItems, Pagination } from "../components/UIControls";
 import { formatDateTime, t } from "../i18n";
 
 export type DistTab = "nav_redirects" | "feed_seo" | "github" | "links" | "follows" | "webhooks";
@@ -13,11 +14,112 @@ const WH_EVENTS = [
 ] as const;
 
 const NAV_ICON_PRESETS = [
-  { label: "GitHub", value: "/images/github-icon-light.svg" },
-  { label: "Admin", value: "/images/admin-panel.svg" },
-  { label: "Book", value: "book" },
-  { label: "External", value: "external" },
+  { label: "github", value: "github" },
+  { label: "book", value: "book" },
+  { label: "rss", value: "rss" },
+  { label: "mail", value: "mail" },
+  { label: "link", value: "link" },
+  { label: "external", value: "external" },
+  { label: "admin", value: "admin" },
 ] as const;
+
+const EMPTY_NAV = {
+  id: "",
+  title: "",
+  url: "/",
+  zh: "",
+  en: "",
+  icon: "",
+  sort_order: 10,
+  open_in_new_tab: false,
+  is_enabled: true,
+};
+
+const EMPTY_REDIR = {
+  id: "",
+  source_path: "",
+  target_path: "",
+  status_code: 301,
+};
+
+const EMPTY_LINK = {
+  id: "",
+  title: "",
+  url: "",
+  icon_url: "",
+  description: "",
+  category_name: "",
+  sort_order: 1,
+};
+
+const EMPTY_FOLLOW = {
+  id: "",
+  title: "",
+  site_url: "",
+  feed_url: "",
+  icon_url: "",
+  description: "",
+  sort_order: 1,
+};
+
+const EMPTY_WH = {
+  id: "",
+  name: "",
+  provider: "custom",
+  url: "",
+  chat_id: "",
+  secret: "",
+  secret_set: false,
+  events: ["article.published", "comment.created"] as string[],
+  is_enabled: true,
+};
+
+function distTabLabel(k: DistTab): string {
+  switch (k) {
+    case "nav_redirects":
+      return t("dist.nav_redirects");
+    case "feed_seo":
+      return t("dist.feed_seo");
+    case "github":
+      return t("nav.github");
+    case "links":
+      return t("dist.links");
+    case "follows":
+      return t("dist.follows");
+    case "webhooks":
+      return t("dist.webhooks");
+  }
+}
+
+function whProviderLabel(prov: string): string {
+  switch (prov) {
+    case "feishu":
+      return t("dist.wh_feishu");
+    case "dingtalk":
+      return t("dist.wh_dingtalk");
+    case "wecom":
+      return t("dist.wh_wecom");
+    case "bark":
+      return t("dist.wh_bark");
+    case "telegram":
+      return t("dist.wh_telegram");
+    default:
+      return t("dist.wh_custom");
+  }
+}
+
+function whEventLabel(labelKey: (typeof WH_EVENTS)[number]["labelKey"]): string {
+  switch (labelKey) {
+    case "dist.wh_ev_post":
+      return t("dist.wh_ev_post");
+    case "dist.wh_ev_cmt":
+      return t("dist.wh_ev_cmt");
+    case "dist.wh_ev_sec":
+      return t("dist.wh_ev_sec");
+    case "dist.wh_ev_bak":
+      return t("dist.wh_ev_bak");
+  }
+}
 
 export function DistributeWorkspace({
   activeTab = "links",
@@ -31,55 +133,35 @@ export function DistributeWorkspace({
   const [navSub, setNavSub] = useState<"nav" | "redirects">("nav");
   const [pageIdx, setPageIdx] = useState<number>(1);
 
+  // Nav
   const [navItems, setNavItems] = useState<any[]>([]);
-  const [navForm, setNavForm] = useState({
-    id: "",
-    title: "",
-    url: "/",
-    zh: "",
-    en: "",
-    icon: "",
-    sort_order: 10,
-    open_in_new_tab: false,
-  });
+  const [navModalOpen, setNavModalOpen] = useState<boolean>(false);
+  const [navForm, setNavForm] = useState({ ...EMPTY_NAV });
 
-  const [links, setLinks] = useState<any[]>([]);
-  const [linkForm, setLinkForm] = useState({
-    id: "",
-    title: "",
-    url: "",
-    icon_url: "",
-    description: "",
-    category_name: "",
-    sort_order: 1,
-  });
-
-  const [follows, setFollows] = useState<any[]>([]);
-  const [followForm, setFollowForm] = useState({
-    id: "",
-    title: "",
-    site_url: "",
-    feed_url: "",
-    icon_url: "",
-    description: "",
-    sort_order: 1,
-  });
-
+  // Redirects
   const [redirects, setRedirects] = useState<any[]>([]);
-  const [redirForm, setRedirForm] = useState({ source_path: "", target_path: "", status_code: 301 });
+  const [redirSearch, setRedirSearch] = useState<string>("");
+  const [redirModalOpen, setRedirModalOpen] = useState<boolean>(false);
+  const [redirForm, setRedirForm] = useState({ ...EMPTY_REDIR });
 
+  // Links
+  const [links, setLinks] = useState<any[]>([]);
+  const [linkCatFilter, setLinkCatFilter] = useState<string>("");
+  const [linkSearch, setLinkSearch] = useState<string>("");
+  const [linkModalOpen, setLinkModalOpen] = useState<boolean>(false);
+  const [linkForm, setLinkForm] = useState({ ...EMPTY_LINK });
+
+  // Follows
+  const [follows, setFollows] = useState<any[]>([]);
+  const [followModalOpen, setFollowModalOpen] = useState<boolean>(false);
+  const [followForm, setFollowForm] = useState({ ...EMPTY_FOLLOW });
+
+  // Webhooks
   const [webhooks, setWebhooks] = useState<any[]>([]);
-  const [whForm, setWhForm] = useState({
-    id: "",
-    name: "",
-    provider: "custom",
-    url: "",
-    chat_id: "",
-    secret: "",
-    events: ["article.published", "comment.created"] as string[],
-    is_enabled: true,
-  });
+  const [whModalOpen, setWhModalOpen] = useState<boolean>(false);
+  const [whForm, setWhForm] = useState({ ...EMPTY_WH });
 
+  // Feed / SEO / GitHub Showcase
   const [feedCfg, setFeedCfg] = useState<any>(null);
   const [feedVer, setFeedVer] = useState<number>(0);
   const [seoCfg, setSeoCfg] = useState<any>(null);
@@ -89,7 +171,21 @@ export function DistributeWorkspace({
   useEffect(() => {
     setSub(activeTab);
     setPageIdx(1);
+    resetConsoleScroll();
   }, [activeTab]);
+
+  const switchDistSub = (next: DistTab) => {
+    setSub(next);
+    setPageIdx(1);
+    resetConsoleScroll();
+    onNavigate?.(next);
+  };
+
+  const switchNavSub = (next: "nav" | "redirects") => {
+    setNavSub(next);
+    setPageIdx(1);
+    resetConsoleScroll();
+  };
 
   const loadSub = async () => {
     try {
@@ -115,6 +211,9 @@ export function DistributeWorkspace({
         setFeedVer(s.versions?.feed || 0);
         setSeoCfg(s.domains?.seo || {});
         setSeoVer(s.versions?.seo || 0);
+        if (s.domains?.storage?.driver) {
+          storageDriverSig.value = s.domains.storage.driver;
+        }
       }
     } catch (err: any) {
       showToast(err.message);
@@ -136,6 +235,138 @@ export function DistributeWorkspace({
     return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
   };
 
+  const saveNav = async (e?: Event) => {
+    e?.preventDefault();
+    if (!navForm.title.trim() || !navForm.url.trim()) return;
+    try {
+      const i18nTitles: Record<string, string> = {};
+      if (navForm.zh.trim()) i18nTitles["zh-CN"] = navForm.zh.trim();
+      if (navForm.en.trim()) i18nTitles["en-US"] = navForm.en.trim();
+      const payload = {
+        title: navForm.title.trim(),
+        url: navForm.url.trim(),
+        icon: navForm.icon.trim(),
+        i18n_titles_json: JSON.stringify(i18nTitles),
+        sort_order: Number(navForm.sort_order) || 10,
+        open_in_new_tab: navForm.open_in_new_tab,
+        is_enabled: navForm.is_enabled !== false,
+      };
+      if (!navForm.id) {
+        await apiFetch("/api/admin/nav", { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await apiFetch(`/api/admin/nav/${navForm.id}`, { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setNavModalOpen(false);
+      setNavForm({ ...EMPTY_NAV });
+      showToast(t("common.saved"));
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const saveRedirect = async (e?: Event) => {
+    e?.preventDefault();
+    if (!redirForm.source_path.trim() || !redirForm.target_path.trim()) return;
+    try {
+      const payload = {
+        source_path: redirForm.source_path.trim(),
+        target_path: redirForm.target_path.trim(),
+        status_code: Number(redirForm.status_code) || 301,
+      };
+      if (!redirForm.id) {
+        await apiFetch("/api/admin/redirects", { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await apiFetch(`/api/admin/redirects/${redirForm.id}`, { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setRedirModalOpen(false);
+      setRedirForm({ ...EMPTY_REDIR });
+      showToast(t("common.saved"));
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const saveLink = async (e?: Event) => {
+    e?.preventDefault();
+    if (!linkForm.title.trim() || !linkForm.url.trim()) return;
+    try {
+      const payload = {
+        title: linkForm.title.trim(),
+        url: linkForm.url.trim(),
+        icon_url: linkForm.icon_url.trim(),
+        description: linkForm.description,
+        category_name: linkForm.category_name.trim(),
+        sort_order: Number(linkForm.sort_order) || 0,
+      };
+      if (!linkForm.id) {
+        await apiFetch("/api/admin/links", { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await apiFetch(`/api/admin/links/${linkForm.id}`, { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setLinkModalOpen(false);
+      setLinkForm({ ...EMPTY_LINK });
+      showToast(t("common.saved"));
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const saveFollow = async (e?: Event) => {
+    e?.preventDefault();
+    if (!followForm.title.trim() || !followForm.feed_url.trim()) return;
+    try {
+      const payload = {
+        title: followForm.title.trim(),
+        site_url: followForm.site_url.trim(),
+        feed_url: followForm.feed_url.trim(),
+        icon_url: followForm.icon_url.trim(),
+        description: followForm.description,
+        sort_order: Number(followForm.sort_order) || 0,
+      };
+      if (!followForm.id) {
+        await apiFetch("/api/admin/follows", { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await apiFetch(`/api/admin/follows/${followForm.id}`, { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setFollowModalOpen(false);
+      setFollowForm({ ...EMPTY_FOLLOW });
+      showToast(t("common.saved"));
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const saveWebhook = async (e?: Event) => {
+    e?.preventDefault();
+    if (!whForm.name.trim() || !whForm.url.trim()) return;
+    try {
+      const payload = {
+        name: whForm.name.trim(),
+        provider: whForm.provider,
+        url: whForm.url.trim(),
+        chat_id: whForm.chat_id.trim(),
+        secret: whForm.secret,
+        events: whForm.events,
+        is_enabled: whForm.is_enabled,
+      };
+      if (!whForm.id) {
+        await apiFetch("/api/admin/webhooks", { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await apiFetch(`/api/admin/webhooks/${whForm.id}`, { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setWhModalOpen(false);
+      setWhForm({ ...EMPTY_WH });
+      showToast(t("common.saved"));
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
   const saveSeoSettings = async (silent = false) => {
     if (!seoCfg) return false;
     try {
@@ -153,7 +384,7 @@ export function DistributeWorkspace({
     }
   };
 
-  const syncGitHubRepos = async () => {
+  const pullGitHubRepos = async () => {
     if (!seoCfg) return;
     try {
       const r = await apiFetch<{ repos: any[]; github_synced_at?: number }>("/api/admin/seo/github-sync", {
@@ -189,6 +420,35 @@ export function DistributeWorkspace({
     }
   };
 
+  const filteredRedirects = redirSearch.trim()
+    ? redirects.filter((r) => {
+        const q = redirSearch.trim().toLowerCase();
+        return (
+          String(r.source_path || "").toLowerCase().includes(q) ||
+          String(r.target_path || "").toLowerCase().includes(q)
+        );
+      })
+    : redirects;
+
+  const linkCategories = Array.from(
+    new Set(links.map((l) => String(l.category_name || "").trim()).filter(Boolean))
+  );
+
+  const filteredLinks = links.filter((l) => {
+    if (linkCatFilter && String(l.category_name || "").trim() !== linkCatFilter) {
+      return false;
+    }
+    if (linkSearch.trim()) {
+      const q = linkSearch.trim().toLowerCase();
+      return (
+        String(l.title || l.name || "").toLowerCase().includes(q) ||
+        String(l.url || "").toLowerCase().includes(q) ||
+        String(l.description || "").toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
+
   const allGhRepos: any[] = Array.isArray(seoCfg?.github_repos) ? seoCfg.github_repos : [];
   const filteredGhRepos = ghSearch.trim()
     ? allGhRepos.filter((rp) => {
@@ -206,9 +466,9 @@ export function DistributeWorkspace({
   const totalGhForks = visibleGhRepos.reduce((acc, rp) => acc + Number(rp.forks || 0), 0);
 
   const pagedNav = paginateItems(navItems, pageIdx, 15);
-  const pagedRedir = paginateItems(redirects, pageIdx, 15);
+  const pagedRedir = paginateItems(filteredRedirects, pageIdx, 15);
   const pagedGh = paginateItems(filteredGhRepos, pageIdx, 15);
-  const pagedLinks = paginateItems(links, pageIdx, 15);
+  const pagedLinks = paginateItems(filteredLinks, pageIdx, 15);
   const pagedFollows = paginateItems(follows, pageIdx, 15);
   const pagedWebhooks = paginateItems(webhooks, pageIdx, 15);
 
@@ -219,20 +479,14 @@ export function DistributeWorkspace({
           <button
             type="button"
             class={`volo-tab ${navSub === "nav" ? "active" : ""}`}
-            onClick={() => {
-              setNavSub("nav");
-              setPageIdx(1);
-            }}
+            onClick={() => switchNavSub("nav")}
           >
             {t("dist.nav")}
           </button>
           <button
             type="button"
             class={`volo-tab ${navSub === "redirects" ? "active" : ""}`}
-            onClick={() => {
-              setNavSub("redirects");
-              setPageIdx(1);
-            }}
+            onClick={() => switchNavSub("redirects")}
           >
             {t("dist.redirects")}
           </button>
@@ -244,18 +498,15 @@ export function DistributeWorkspace({
               key={k}
               type="button"
               class={`volo-tab ${sub === k ? "active" : ""}`}
-              onClick={() => {
-                setSub(k);
-                setPageIdx(1);
-                onNavigate?.(k);
-              }}
+              onClick={() => switchDistSub(k)}
             >
-              {k === "github" ? t("nav.github") : t(`dist.${k}`)}
+              {distTabLabel(k)}
             </button>
           ))}
         </div>
       )}
 
+      {/* 1A. Top Navigation */}
       {sub === "nav_redirects" && navSub === "nav" && (
         <div class="volo-card">
           <div class="volo-sec-head">
@@ -263,139 +514,17 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.nav_head")}</h3>
               <p class="volo-sec-desc">{t("dist.nav_desc")}</p>
             </div>
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary volo-btn-sm"
+              onClick={() => {
+                setNavForm({ ...EMPTY_NAV });
+                setNavModalOpen(true);
+              }}
+            >
+              + {t("dist.new_nav")}
+            </button>
           </div>
-          <form
-            autoComplete="off"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              const i18nTitles: Record<string, string> = {};
-              if (navForm.zh) i18nTitles["zh-CN"] = navForm.zh;
-              if (navForm.en) i18nTitles["en-US"] = navForm.en;
-              const payload = {
-                title: navForm.title,
-                url: navForm.url,
-                icon: navForm.icon,
-                i18n_titles_json: JSON.stringify(i18nTitles),
-                sort_order: Number(navForm.sort_order) || 10,
-                open_in_new_tab: navForm.open_in_new_tab,
-                is_enabled: true,
-              };
-              if (!navForm.id) {
-                await apiFetch("/api/admin/nav", { method: "POST", body: JSON.stringify(payload) });
-              } else {
-                await apiFetch(`/api/admin/nav/${navForm.id}`, { method: "PUT", body: JSON.stringify(payload) });
-              }
-              setNavForm({ id: "", title: "", url: "/", zh: "", en: "", icon: "", sort_order: 10, open_in_new_tab: false });
-              showToast(t("common.saved"));
-              void loadSub();
-            }}
-            class="volo-form-bar"
-          >
-            <div class="volo-grid-4">
-              <div class="volo-field">
-                <label>{t("dist.lbl_nav_label")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.nav_label_ph")}
-                  value={navForm.title}
-                  onInput={(e) => setNavForm({ ...navForm, title: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_nav_url")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.nav_url_ph")}
-                  value={navForm.url}
-                  onInput={(e) => setNavForm({ ...navForm, url: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_nav_zh")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("dist.nav_zh_ph")}
-                  value={navForm.zh}
-                  onInput={(e) => setNavForm({ ...navForm, zh: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_nav_en")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("dist.nav_en_ph")}
-                  value={navForm.en}
-                  onInput={(e) => setNavForm({ ...navForm, en: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-            </div>
-
-            <div class="volo-grid-3">
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("dist.lbl_nav_icon")}</label>
-                <input
-                  class="volo-input"
-                  placeholder="/images/github-icon-light.svg"
-                  value={navForm.icon}
-                  onInput={(e) => setNavForm({ ...navForm, icon: (e.currentTarget as HTMLInputElement).value })}
-                />
-                <div class="volo-tag-pool">
-                  <span class="volo-help" style={{ fontSize: "11.5px" }}>{t("dist.nav_icon_presets")}</span>
-                  {NAV_ICON_PRESETS.map((pr) => (
-                    <button
-                      key={pr.value}
-                      type="button"
-                      class={`volo-chip-btn ${navForm.icon === pr.value ? "active" : ""}`}
-                      onClick={() => setNavForm({ ...navForm, icon: navForm.icon === pr.value ? "" : pr.value })}
-                    >
-                      {pr.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("cnt.lbl_sort")}</label>
-                <input
-                  type="number"
-                  class="volo-input"
-                  value={navForm.sort_order}
-                  onInput={(e) => setNavForm({ ...navForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) })}
-                />
-              </div>
-
-              <div class="volo-field" style={{ marginBottom: 0, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
-                  <label class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={navForm.open_in_new_tab}
-                      onChange={(e) => setNavForm({ ...navForm, open_in_new_tab: (e.currentTarget as HTMLInputElement).checked })}
-                    />
-                    <span>{t("dist.nav_new_tab")}</span>
-                  </label>
-                  <div style={{ display: "flex", gap: "8px" }}>
-                    {navForm.id && (
-                      <button
-                        type="button"
-                        class="volo-btn"
-                        onClick={() =>
-                          setNavForm({ id: "", title: "", url: "/", zh: "", en: "", icon: "", sort_order: 10, open_in_new_tab: false })
-                        }
-                      >
-                        {t("common.cancel")}
-                      </button>
-                    )}
-                    <button type="submit" class="volo-btn volo-btn-primary">
-                      {navForm.id ? t("common.save") : t("common.create")}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </form>
 
           <div class="volo-table-wrap">
             <table class="volo-table">
@@ -428,9 +557,11 @@ export function DistributeWorkspace({
                       <tr key={it.id}>
                         <td class="col-fluid">
                           <div class="volo-cell-title">
+                            <NavIconPreview icon={it.icon} fallbackLabel={it.title} />
                             <span>{it.title}</span>
                             {it.icon && <span class="volo-code-chip">{it.icon}</span>}
                             {it.open_in_new_tab && <span class="volo-mini-tag">↗</span>}
+                            {it.is_enabled === false && <span class="volo-mini-tag warn">{t("tbl.status_disabled")}</span>}
                           </div>
                         </td>
                         <td class="col-cat">
@@ -444,7 +575,7 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              onClick={() =>
+                              onClick={() => {
                                 setNavForm({
                                   id: it.id,
                                   title: it.title || "",
@@ -454,8 +585,10 @@ export function DistributeWorkspace({
                                   icon: it.icon || "",
                                   sort_order: it.sort_order ?? 10,
                                   open_in_new_tab: !!it.open_in_new_tab,
-                                })
-                              }
+                                  is_enabled: it.is_enabled !== false,
+                                });
+                                setNavModalOpen(true);
+                              }}
                             >
                               {t("common.edit")}
                             </button>
@@ -479,9 +612,136 @@ export function DistributeWorkspace({
             </table>
           </div>
           <Pagination total={navItems.length} page={pagedNav.safePage} pageSize={15} onChange={setPageIdx} />
+
+          <AnimatedModal
+            open={navModalOpen}
+            onClose={() => setNavModalOpen(false)}
+            title={navForm.id ? t("dist.edit_nav") : t("dist.new_nav")}
+            subtitle={t("dist.nav_desc")}
+            maxWidth="620px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setNavModalOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button type="button" class="volo-btn volo-btn-primary" onClick={() => void saveNav()}>
+                  {t("common.save")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void saveNav(e)} autoComplete="off">
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("dist.lbl_nav_label")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    placeholder={t("dist.nav_label_ph")}
+                    value={navForm.title}
+                    onInput={(e) => setNavForm({ ...navForm, title: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("dist.lbl_nav_url")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    placeholder={t("dist.nav_url_ph")}
+                    value={navForm.url}
+                    onInput={(e) => setNavForm({ ...navForm, url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("dist.lbl_nav_zh")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder={t("dist.nav_zh_ph")}
+                    value={navForm.zh}
+                    onInput={(e) => setNavForm({ ...navForm, zh: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("dist.lbl_nav_en")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder={t("dist.nav_en_ph")}
+                    value={navForm.en}
+                    onInput={(e) => setNavForm({ ...navForm, en: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-field">
+                <label>{t("dist.lbl_nav_icon")}</label>
+                <div class="volo-input-row">
+                  <NavIconPreview icon={navForm.icon} fallbackLabel={navForm.title} size={18} />
+                  <input
+                    class="volo-input"
+                    placeholder="github / book / /uploads/..."
+                    value={navForm.icon}
+                    onInput={(e) => setNavForm({ ...navForm, icon: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                  <MediaPickButton
+                    filterKind="image"
+                    onPick={(u) => setNavForm({ ...navForm, icon: u })}
+                  />
+                </div>
+                <div class="volo-tag-pool">
+                  <span class="volo-help" style={{ fontSize: "11.5px" }}>{t("dist.nav_icon_presets")}</span>
+                  {NAV_ICON_PRESETS.map((pr) => (
+                    <button
+                      key={pr.value}
+                      type="button"
+                      class={`volo-chip-btn ${navForm.icon === pr.value ? "active" : ""}`}
+                      onClick={() => setNavForm({ ...navForm, icon: navForm.icon === pr.value ? "" : pr.value })}
+                    >
+                      {pr.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div class="volo-grid-2">
+                <div class="volo-field" style={{ marginBottom: 0 }}>
+                  <label>{t("cnt.lbl_sort")}</label>
+                  <input
+                    type="number"
+                    class="volo-input"
+                    value={navForm.sort_order}
+                    onInput={(e) => setNavForm({ ...navForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
+                  />
+                </div>
+                <div class="volo-field" style={{ marginBottom: 0, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
+                  <div class="volo-check-grid" style={{ margin: 0 }}>
+                    <label class="volo-check-item">
+                      <input
+                        type="checkbox"
+                        checked={navForm.open_in_new_tab}
+                        onChange={(e) => setNavForm({ ...navForm, open_in_new_tab: (e.currentTarget as HTMLInputElement).checked })}
+                      />
+                      <span>{t("dist.nav_new_tab")}</span>
+                    </label>
+                    <label class="volo-check-item">
+                      <input
+                        type="checkbox"
+                        checked={navForm.is_enabled !== false}
+                        onChange={(e) => setNavForm({ ...navForm, is_enabled: (e.currentTarget as HTMLInputElement).checked })}
+                      />
+                      <span>{t("tbl.status_active")}</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </form>
+          </AnimatedModal>
         </div>
       )}
 
+      {/* 1B. Redirects */}
       {sub === "nav_redirects" && navSub === "redirects" && (
         <div class="volo-card">
           <div class="volo-sec-head">
@@ -489,56 +749,30 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.redir_head")}</h3>
               <p class="volo-sec-desc">{t("dist.redir_desc")}</p>
             </div>
-          </div>
-          <form
-            autoComplete="off"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              await apiFetch("/api/admin/redirects", { method: "POST", body: JSON.stringify(redirForm) });
-              setRedirForm({ source_path: "", target_path: "", status_code: 301 });
-              showToast(t("common.saved"));
-              void loadSub();
-            }}
-            class="volo-form-bar"
-          >
-            <div class="volo-grid-3">
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("dist.lbl_redir_src")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.redir_src_ph")}
-                  value={redirForm.source_path}
-                  onInput={(e) => setRedirForm({ ...redirForm, source_path: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("dist.lbl_redir_dst")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.redir_dst_ph")}
-                  value={redirForm.target_path}
-                  onInput={(e) => setRedirForm({ ...redirForm, target_path: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("dist.lbl_redir_code")}</label>
-                <div style={{ display: "flex", gap: "8px" }}>
-                  <ConsoleSelect
-                    style={{ flex: 1 }}
-                    value={String(redirForm.status_code)}
-                    onChange={(val) => setRedirForm({ ...redirForm, status_code: Number(val) })}
-                    options={[
-                      { value: "301", label: t("dist.redir_301") },
-                      { value: "302", label: t("dist.redir_302") },
-                    ]}
-                  />
-                  <button type="submit" class="volo-btn volo-btn-primary">{t("common.create")}</button>
-                </div>
-              </div>
+            <div class="volo-filter-controls">
+              <input
+                class="volo-input"
+                style={{ width: "220px" }}
+                placeholder={t("dist.redir_search_ph")}
+                value={redirSearch}
+                onInput={(e) => {
+                  setRedirSearch((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  setRedirForm({ ...EMPTY_REDIR });
+                  setRedirModalOpen(true);
+                }}
+              >
+                + {t("dist.new_redir")}
+              </button>
             </div>
-          </form>
+          </div>
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -580,6 +814,21 @@ export function DistributeWorkspace({
                         <div class="volo-row-actions">
                           <button
                             type="button"
+                            class="volo-act-btn"
+                            onClick={() => {
+                              setRedirForm({
+                                id: r.id,
+                                source_path: r.source_path || "",
+                                target_path: r.target_path || "",
+                                status_code: r.status_code || 301,
+                              });
+                              setRedirModalOpen(true);
+                            }}
+                          >
+                            {t("common.edit")}
+                          </button>
+                          <button
+                            type="button"
                             class="volo-act-btn danger"
                             onClick={async () => {
                               await apiFetch(`/api/admin/redirects/${r.id}`, { method: "DELETE" });
@@ -596,10 +845,63 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={redirects.length} page={pagedRedir.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination total={filteredRedirects.length} page={pagedRedir.safePage} pageSize={15} onChange={setPageIdx} />
+
+          <AnimatedModal
+            open={redirModalOpen}
+            onClose={() => setRedirModalOpen(false)}
+            title={redirForm.id ? t("dist.edit_redir") : t("dist.new_redir")}
+            subtitle={t("dist.redir_desc")}
+            maxWidth="560px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setRedirModalOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button type="button" class="volo-btn volo-btn-primary" onClick={() => void saveRedirect()}>
+                  {t("common.save")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void saveRedirect(e)} autoComplete="off">
+              <div class="volo-field">
+                <label>{t("dist.lbl_redir_src")}</label>
+                <input
+                  class="volo-input"
+                  required
+                  placeholder={t("dist.redir_src_ph")}
+                  value={redirForm.source_path}
+                  onInput={(e) => setRedirForm({ ...redirForm, source_path: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("dist.lbl_redir_dst")}</label>
+                <input
+                  class="volo-input"
+                  required
+                  placeholder={t("dist.redir_dst_ph")}
+                  value={redirForm.target_path}
+                  onInput={(e) => setRedirForm({ ...redirForm, target_path: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("dist.lbl_redir_code")}</label>
+                <ConsoleSelect
+                  value={String(redirForm.status_code)}
+                  onChange={(val) => setRedirForm({ ...redirForm, status_code: Number(val) })}
+                  options={[
+                    { value: "301", label: t("dist.redir_301") },
+                    { value: "302", label: t("dist.redir_302") },
+                  ]}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
         </div>
       )}
 
+      {/* 2. GitHub Showcase */}
       {sub === "github" && isAdmin && seoCfg && (
         <div class="volo-card">
           <div class="volo-sec-head">
@@ -608,10 +910,10 @@ export function DistributeWorkspace({
               <p class="volo-sec-desc">{t("dist.gh_desc")}</p>
             </div>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => saveSeoSettings(false)}>
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void saveSeoSettings(false)}>
                 {t("dist.gh_save_sel")}
               </button>
-              <button type="button" class="volo-btn volo-btn-sm volo-btn-primary" onClick={publishGitHubShowcase}>
+              <button type="button" class="volo-btn volo-btn-sm volo-btn-primary" onClick={() => void publishGitHubShowcase()}>
                 {t("dist.gh_publish_btn")}
               </button>
             </div>
@@ -621,7 +923,7 @@ export function DistributeWorkspace({
             autoComplete="off"
             onSubmit={(e) => {
               e.preventDefault();
-              void syncGitHubRepos();
+              void pullGitHubRepos();
             }}
             class="volo-form-bar"
           >
@@ -646,15 +948,15 @@ export function DistributeWorkspace({
                 </label>
               </div>
               <div class="volo-field" style={{ marginBottom: 0, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
-                <div style={{ display: "flex", gap: "8px" }}>
-                  <button type="submit" class="volo-btn volo-btn-primary">
-                    {t("dist.sync_gh")}
-                  </button>
+                <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
                   {seoCfg.github_username && (
                     <a class="volo-btn" href="/posts/github" target="_blank" rel="noreferrer">
                       {t("common.preview")}
                     </a>
                   )}
+                  <button type="submit" class="volo-btn volo-btn-primary">
+                    {t("dist.sync_gh")}
+                  </button>
                 </div>
               </div>
             </div>
@@ -809,9 +1111,19 @@ export function DistributeWorkspace({
             </table>
           </div>
           <Pagination total={filteredGhRepos.length} page={pagedGh.safePage} pageSize={15} onChange={setPageIdx} />
+
+          <div class="volo-form-actions">
+            <button type="button" class="volo-btn" onClick={() => void saveSeoSettings(false)}>
+              {t("dist.gh_save_sel")}
+            </button>
+            <button type="button" class="volo-btn volo-btn-primary" onClick={() => void publishGitHubShowcase()}>
+              {t("dist.gh_publish_btn")}
+            </button>
+          </div>
         </div>
       )}
 
+      {/* 3. Links */}
       {sub === "links" && (
         <div class="volo-card">
           <div class="volo-sec-head">
@@ -819,115 +1131,64 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.links")}</h3>
               <p class="volo-sec-desc">{t("dist.links_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-sm"
-              onClick={async () => {
-                const r = await apiFetch<{ checked: number; items?: any[] }>("/api/admin/links/patrol", {
-                  method: "POST",
-                  body: "{}",
-                });
-                const list = r.items || [];
-                const healthy = list.filter((x) => x.health_status === "ok" || x.health_status === "redirect").length;
-                setLinks(list);
-                showToast(t("dist.links_patrolled", { checked: r.checked ?? list.length, healthy }));
-              }}
-            >
-              {t("dist.links_patrol")}
-            </button>
+            <div class="volo-filter-controls">
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={async () => {
+                  const r = await apiFetch<{ checked: number; items?: any[] }>("/api/admin/links/patrol", {
+                    method: "POST",
+                    body: "{}",
+                  });
+                  const list = r.items || [];
+                  const healthy = list.filter((x) => x.health_status === "ok" || x.health_status === "redirect").length;
+                  setLinks(list);
+                  showToast(t("dist.links_patrolled", { checked: r.checked ?? list.length, healthy }));
+                }}
+              >
+                {t("dist.links_patrol")}
+              </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  setLinkForm({ ...EMPTY_LINK });
+                  setLinkModalOpen(true);
+                }}
+              >
+                + {t("dist.new_link")}
+              </button>
+            </div>
           </div>
-          <form
-            autoComplete="off"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              if (!linkForm.id) {
-                await apiFetch("/api/admin/links", { method: "POST", body: JSON.stringify(linkForm) });
-              } else {
-                await apiFetch(`/api/admin/links/${linkForm.id}`, { method: "PUT", body: JSON.stringify(linkForm) });
-              }
-              setLinkForm({ id: "", title: "", url: "", icon_url: "", description: "", category_name: "", sort_order: 1 });
-              showToast(t("common.saved"));
-              void loadSub();
-            }}
-            class="volo-form-bar"
-          >
-            <div class="volo-grid-4">
-              <div class="volo-field">
-                <label>{t("dist.lbl_link_name")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.links_name_ph")}
-                  value={linkForm.title}
-                  onInput={(e) => setLinkForm({ ...linkForm, title: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_link_url")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder="https://example.com"
-                  value={linkForm.url}
-                  onInput={(e) => setLinkForm({ ...linkForm, url: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_link_cat")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("dist.links_cat_ph")}
-                  value={linkForm.category_name}
-                  onInput={(e) => setLinkForm({ ...linkForm, category_name: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("cnt.lbl_sort")}</label>
-                <input
-                  type="number"
-                  class="volo-input"
-                  value={linkForm.sort_order ?? 1}
-                  onInput={(e) => setLinkForm({ ...linkForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
-                />
-              </div>
+
+          <div class="volo-filter-bar" style={{ marginBottom: "14px" }}>
+            <div class="volo-filter-controls">
+              <ConsoleSelect
+                style={{ width: "176px" }}
+                value={linkCatFilter}
+                onChange={(val) => {
+                  setLinkCatFilter(val);
+                  setPageIdx(1);
+                }}
+                options={[
+                  { value: "", label: t("art.all_categories") },
+                  ...linkCategories.map((cat) => ({ value: cat, label: cat })),
+                ]}
+              />
+              <input
+                class="volo-input"
+                autoComplete="off"
+                style={{ width: "220px" }}
+                placeholder={t("dist.links_search_ph")}
+                value={linkSearch}
+                onInput={(e) => {
+                  setLinkSearch((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
             </div>
-            <div class="volo-grid-2">
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("dist.lbl_link_icon")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("dist.links_icon_ph")}
-                  value={linkForm.icon_url}
-                  onInput={(e) => setLinkForm({ ...linkForm, icon_url: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("cnt.lbl_desc")}</label>
-                <div style={{ display: "flex", gap: "8px" }}>
-                  <input
-                    class="volo-input"
-                    placeholder={t("cnt.desc_ph")}
-                    value={linkForm.description}
-                    onInput={(e) => setLinkForm({ ...linkForm, description: (e.currentTarget as HTMLInputElement).value })}
-                  />
-                  {linkForm.id && (
-                    <button
-                      type="button"
-                      class="volo-btn"
-                      onClick={() =>
-                        setLinkForm({ id: "", title: "", url: "", icon_url: "", description: "", category_name: "", sort_order: 1 })
-                      }
-                    >
-                      {t("common.cancel")}
-                    </button>
-                  )}
-                  <button type="submit" class="volo-btn volo-btn-primary">
-                    {linkForm.id ? t("common.save") : t("common.create")}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </form>
+          </div>
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -955,12 +1216,14 @@ export function DistributeWorkspace({
                         : hs === "unknown"
                         ? t("dist.links_unknown")
                         : t("dist.links_unreachable");
+                    const label = l.title || l.name || "";
                     return (
                       <tr key={l.id}>
                         <td class="col-fluid">
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
-                              <span>{l.title || l.name}</span>
+                              <NavIconPreview icon={l.icon_url} fallbackLabel={label} />
+                              <span>{label}</span>
                               {l.category_name && <span class="volo-mini-tag">{l.category_name}</span>}
                             </div>
                             {l.description && <div class="volo-cell-meta"><span>{l.description}</span></div>}
@@ -988,17 +1251,18 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              onClick={() =>
+                              onClick={() => {
                                 setLinkForm({
                                   id: l.id,
-                                  title: l.title || "",
+                                  title: l.title || l.name || "",
                                   url: l.url || "",
                                   icon_url: l.icon_url || "",
                                   description: l.description || "",
                                   category_name: l.category_name || "",
                                   sort_order: l.sort_order ?? 1,
-                                })
-                              }
+                                });
+                                setLinkModalOpen(true);
+                              }}
                             >
                               {t("common.edit")}
                             </button>
@@ -1021,10 +1285,103 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={links.length} page={pagedLinks.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination total={filteredLinks.length} page={pagedLinks.safePage} pageSize={15} onChange={setPageIdx} />
+
+          <AnimatedModal
+            open={linkModalOpen}
+            onClose={() => setLinkModalOpen(false)}
+            title={linkForm.id ? t("dist.edit_link") : t("dist.new_link")}
+            subtitle={t("dist.links_desc")}
+            maxWidth="620px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setLinkModalOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button type="button" class="volo-btn volo-btn-primary" onClick={() => void saveLink()}>
+                  {t("common.save")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void saveLink(e)} autoComplete="off">
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("dist.lbl_link_name")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    placeholder={t("dist.links_name_ph")}
+                    value={linkForm.title}
+                    onInput={(e) => setLinkForm({ ...linkForm, title: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("dist.lbl_link_url")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    placeholder="https://example.com"
+                    value={linkForm.url}
+                    onInput={(e) => setLinkForm({ ...linkForm, url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("dist.lbl_link_cat")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder={t("dist.links_cat_ph")}
+                    value={linkForm.category_name}
+                    onInput={(e) => setLinkForm({ ...linkForm, category_name: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("cnt.lbl_sort")}</label>
+                  <input
+                    type="number"
+                    class="volo-input"
+                    value={linkForm.sort_order ?? 1}
+                    onInput={(e) => setLinkForm({ ...linkForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-field">
+                <label>{t("dist.lbl_link_icon")}</label>
+                <div class="volo-input-row">
+                  <NavIconPreview icon={linkForm.icon_url} fallbackLabel={linkForm.title} size={18} />
+                  <input
+                    class="volo-input"
+                    placeholder={t("dist.links_icon_ph")}
+                    value={linkForm.icon_url}
+                    onInput={(e) => setLinkForm({ ...linkForm, icon_url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                  <MediaPickButton
+                    filterKind="image"
+                    onPick={(u) => setLinkForm({ ...linkForm, icon_url: u })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.lbl_desc")}</label>
+                <textarea
+                  class="volo-textarea"
+                  rows={2}
+                  placeholder={t("cnt.desc_ph")}
+                  value={linkForm.description}
+                  onInput={(e) => setLinkForm({ ...linkForm, description: (e.currentTarget as HTMLTextAreaElement).value })}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
         </div>
       )}
 
+      {/* 4. Follows */}
       {sub === "follows" && (
         <div class="volo-card">
           <div class="volo-sec-head">
@@ -1032,110 +1389,31 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.follows")}</h3>
               <p class="volo-sec-desc">{t("dist.follows_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-sm"
-              onClick={async () => {
-                const r = await apiFetch<{ synced_items: number }>("/api/admin/follows/sync", { method: "POST", body: "{}" });
-                showToast(t("dist.follows_synced", { count: r.synced_items }));
-                void loadSub();
-              }}
-            >
-              {t("dist.follows_sync")}
-            </button>
+            <div class="volo-filter-controls">
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={async () => {
+                  const r = await apiFetch<{ synced_items: number }>("/api/admin/follows/sync", { method: "POST", body: "{}" });
+                  showToast(t("dist.follows_synced", { count: r.synced_items }));
+                  void loadSub();
+                }}
+              >
+                {t("dist.follows_sync")}
+              </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  setFollowForm({ ...EMPTY_FOLLOW });
+                  setFollowModalOpen(true);
+                }}
+              >
+                + {t("dist.new_follow")}
+              </button>
+            </div>
           </div>
-          <form
-            autoComplete="off"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              if (!followForm.id) {
-                await apiFetch("/api/admin/follows", { method: "POST", body: JSON.stringify(followForm) });
-              } else {
-                await apiFetch(`/api/admin/follows/${followForm.id}`, { method: "PUT", body: JSON.stringify(followForm) });
-              }
-              setFollowForm({ id: "", title: "", site_url: "", feed_url: "", icon_url: "", description: "", sort_order: 1 });
-              showToast(t("common.saved"));
-              void loadSub();
-            }}
-            class="volo-form-bar"
-          >
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("dist.lbl_follow_name")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.follows_name_ph")}
-                  value={followForm.title}
-                  onInput={(e) => setFollowForm({ ...followForm, title: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_follow_feed")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.follows_feed_ph")}
-                  value={followForm.feed_url}
-                  onInput={(e) => setFollowForm({ ...followForm, feed_url: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_follow_site")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("dist.follows_site_ph")}
-                  value={followForm.site_url}
-                  onInput={(e) => setFollowForm({ ...followForm, site_url: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-            </div>
-            <div class="volo-grid-3">
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("dist.lbl_follow_icon")}</label>
-                <input
-                  class="volo-input"
-                  placeholder="https://example.com/avatar.png"
-                  value={followForm.icon_url}
-                  onInput={(e) => setFollowForm({ ...followForm, icon_url: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("cnt.lbl_sort")}</label>
-                <input
-                  type="number"
-                  class="volo-input"
-                  value={followForm.sort_order ?? 1}
-                  onInput={(e) => setFollowForm({ ...followForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
-                />
-              </div>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <label>{t("dist.lbl_follow_desc")}</label>
-                <div style={{ display: "flex", gap: "8px" }}>
-                  <input
-                    class="volo-input"
-                    placeholder={t("cnt.desc_ph")}
-                    value={followForm.description}
-                    onInput={(e) => setFollowForm({ ...followForm, description: (e.currentTarget as HTMLInputElement).value })}
-                  />
-                  {followForm.id && (
-                    <button
-                      type="button"
-                      class="volo-btn"
-                      onClick={() =>
-                        setFollowForm({ id: "", title: "", site_url: "", feed_url: "", icon_url: "", description: "", sort_order: 1 })
-                      }
-                    >
-                      {t("common.cancel")}
-                    </button>
-                  )}
-                  <button type="submit" class="volo-btn volo-btn-primary">
-                    {followForm.id ? t("common.save") : t("common.create")}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </form>
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -1152,72 +1430,172 @@ export function DistributeWorkspace({
                     <td colSpan={4} class="volo-empty-state">{t("tbl.empty")}</td>
                   </tr>
                 ) : (
-                  pagedFollows.slice.map((f) => (
-                    <tr key={f.id}>
-                      <td class="col-fluid">
-                        <div class="volo-cell-main">
-                          <div class="volo-cell-title">{f.title}</div>
-                          <div class="volo-cell-meta">
-                            {f.site_url && <span>{f.site_url}</span>}
-                            {f.description && <span>{f.description}</span>}
+                  pagedFollows.slice.map((f) => {
+                    const label = f.title || f.name || "";
+                    return (
+                      <tr key={f.id}>
+                        <td class="col-fluid">
+                          <div class="volo-cell-main">
+                            <div class="volo-cell-title">
+                              <NavIconPreview icon={f.icon_url} fallbackLabel={label} />
+                              <span>{label}</span>
+                            </div>
+                            <div class="volo-cell-meta">
+                              {f.site_url && <span>{f.site_url}</span>}
+                              {f.description && <span>{f.description}</span>}
+                            </div>
                           </div>
-                        </div>
-                      </td>
-                      <td class="col-fluid">
-                        <span class="volo-code-chip">{f.feed_url}</span>
-                      </td>
-                      <td class="col-date">
-                        <div class="volo-cell-main">
-                          <span>{formatDateTime(f.last_synced_at)}</span>
-                          {f.sync_error && (
-                            <span class="volo-status-pill danger">
-                              <span class="volo-status-dot" />
-                              {t("dist.follows_err", { err: f.sync_error })}
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                      <td class="col-act">
-                        <div class="volo-row-actions">
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            onClick={() =>
-                              setFollowForm({
-                                id: f.id,
-                                title: f.title || "",
-                                site_url: f.site_url || "",
-                                feed_url: f.feed_url || "",
-                                icon_url: f.icon_url || "",
-                                description: f.description || "",
-                                sort_order: f.sort_order ?? 1,
-                              })
-                            }
-                          >
-                            {t("common.edit")}
-                          </button>
-                          <button
-                            type="button"
-                            class="volo-act-btn danger"
-                            onClick={async () => {
-                              await apiFetch(`/api/admin/follows/${f.id}`, { method: "DELETE" });
-                              void loadSub();
-                            }}
-                          >
-                            {t("common.delete")}
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))
+                        </td>
+                        <td class="col-fluid">
+                          <span class="volo-code-chip">{f.feed_url}</span>
+                        </td>
+                        <td class="col-date">
+                          <div class="volo-cell-main">
+                            <span>{formatDateTime(f.last_synced_at)}</span>
+                            {f.sync_error && (
+                              <span class="volo-status-pill danger">
+                                <span class="volo-status-dot" />
+                                {t("dist.follows_err", { err: f.sync_error })}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td class="col-act">
+                          <div class="volo-row-actions">
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              onClick={() => {
+                                setFollowForm({
+                                  id: f.id,
+                                  title: f.title || f.name || "",
+                                  site_url: f.site_url || "",
+                                  feed_url: f.feed_url || "",
+                                  icon_url: f.icon_url || "",
+                                  description: f.description || "",
+                                  sort_order: f.sort_order ?? 1,
+                                });
+                                setFollowModalOpen(true);
+                              }}
+                            >
+                              {t("common.edit")}
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn danger"
+                              onClick={async () => {
+                                await apiFetch(`/api/admin/follows/${f.id}`, { method: "DELETE" });
+                                void loadSub();
+                              }}
+                            >
+                              {t("common.delete")}
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
           </div>
           <Pagination total={follows.length} page={pagedFollows.safePage} pageSize={15} onChange={setPageIdx} />
+
+          <AnimatedModal
+            open={followModalOpen}
+            onClose={() => setFollowModalOpen(false)}
+            title={followForm.id ? t("dist.edit_follow") : t("dist.new_follow")}
+            subtitle={t("dist.follows_desc")}
+            maxWidth="620px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setFollowModalOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button type="button" class="volo-btn volo-btn-primary" onClick={() => void saveFollow()}>
+                  {t("common.save")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void saveFollow(e)} autoComplete="off">
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("dist.lbl_follow_name")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    placeholder={t("dist.follows_name_ph")}
+                    value={followForm.title}
+                    onInput={(e) => setFollowForm({ ...followForm, title: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("dist.lbl_follow_feed")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    placeholder={t("dist.follows_feed_ph")}
+                    value={followForm.feed_url}
+                    onInput={(e) => setFollowForm({ ...followForm, feed_url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("dist.lbl_follow_site")}</label>
+                  <input
+                    class="volo-input"
+                    placeholder={t("dist.follows_site_ph")}
+                    value={followForm.site_url}
+                    onInput={(e) => setFollowForm({ ...followForm, site_url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("cnt.lbl_sort")}</label>
+                  <input
+                    type="number"
+                    class="volo-input"
+                    value={followForm.sort_order ?? 1}
+                    onInput={(e) => setFollowForm({ ...followForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-field">
+                <label>{t("dist.lbl_follow_icon")}</label>
+                <div class="volo-input-row">
+                  <NavIconPreview icon={followForm.icon_url} fallbackLabel={followForm.title} size={18} />
+                  <input
+                    class="volo-input"
+                    placeholder="https://example.com/avatar.png"
+                    value={followForm.icon_url}
+                    onInput={(e) => setFollowForm({ ...followForm, icon_url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                  <MediaPickButton
+                    filterKind="image"
+                    onPick={(u) => setFollowForm({ ...followForm, icon_url: u })}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("dist.lbl_follow_desc")}</label>
+                <textarea
+                  class="volo-textarea"
+                  rows={2}
+                  placeholder={t("cnt.desc_ph")}
+                  value={followForm.description}
+                  onInput={(e) => setFollowForm({ ...followForm, description: (e.currentTarget as HTMLTextAreaElement).value })}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
         </div>
       )}
 
+      {/* 5. Webhooks */}
       {sub === "webhooks" && isAdmin && (
         <div class="volo-card">
           <div class="volo-sec-head">
@@ -1225,178 +1603,17 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.wh_head")}</h3>
               <p class="volo-sec-desc">{t("dist.wh_desc")}</p>
             </div>
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary volo-btn-sm"
+              onClick={() => {
+                setWhForm({ ...EMPTY_WH, events: ["article.published", "comment.created"] });
+                setWhModalOpen(true);
+              }}
+            >
+              + {t("dist.new_wh")}
+            </button>
           </div>
-          <form
-            autoComplete="off"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              if (!whForm.id) {
-                await apiFetch("/api/admin/webhooks", {
-                  method: "POST",
-                  body: JSON.stringify(whForm),
-                });
-              } else {
-                await apiFetch(`/api/admin/webhooks/${whForm.id}`, {
-                  method: "PUT",
-                  body: JSON.stringify(whForm),
-                });
-              }
-              setWhForm({
-                id: "",
-                name: "",
-                provider: "custom",
-                url: "",
-                chat_id: "",
-                secret: "",
-                events: ["article.published", "comment.created"],
-                is_enabled: true,
-              });
-              showToast(t("common.saved"));
-              void loadSub();
-            }}
-            class="volo-form-bar"
-          >
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("dist.lbl_wh_name")}</label>
-                <input
-                  class="volo-input"
-                  required
-                  placeholder={t("dist.wh_name_ph")}
-                  value={whForm.name}
-                  onInput={(e) => setWhForm({ ...whForm, name: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_wh_provider")}</label>
-                <ConsoleSelect
-                  value={whForm.provider}
-                  onChange={(val) => setWhForm({ ...whForm, provider: val })}
-                  options={[
-                    { value: "custom", label: t("dist.wh_custom") },
-                    { value: "feishu", label: t("dist.wh_feishu") },
-                    { value: "dingtalk", label: t("dist.wh_dingtalk") },
-                    { value: "wecom", label: t("dist.wh_wecom") },
-                    { value: "bark", label: t("dist.wh_bark") },
-                    { value: "telegram", label: t("dist.wh_telegram") },
-                  ]}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.lbl_wh_secret")}</label>
-                <input
-                  type="password"
-                  name="webhook_hmac_token"
-                  autoComplete="new-password"
-                  class="volo-input"
-                  placeholder={t("dist.wh_secret_ph")}
-                  value={whForm.secret}
-                  onInput={(e) => setWhForm({ ...whForm, secret: (e.currentTarget as HTMLInputElement).value })}
-                />
-              </div>
-            </div>
-
-            <div class={whForm.provider === "telegram" ? "volo-grid-2" : "volo-field"}>
-              <div class="volo-field">
-                <label>{t("dist.lbl_wh_url")}</label>
-                <div style={{ display: "flex", gap: "8px" }}>
-                  <input
-                    class="volo-input"
-                    required
-                    placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
-                    value={whForm.url}
-                    onInput={(e) => setWhForm({ ...whForm, url: (e.currentTarget as HTMLInputElement).value })}
-                  />
-                  {whForm.provider !== "telegram" && (
-                    <>
-                      {whForm.id && (
-                        <button
-                          type="button"
-                          class="volo-btn"
-                          onClick={() =>
-                            setWhForm({
-                              id: "",
-                              name: "",
-                              provider: "custom",
-                              url: "",
-                              chat_id: "",
-                              secret: "",
-                              events: ["article.published", "comment.created"],
-                              is_enabled: true,
-                            })
-                          }
-                        >
-                          {t("common.cancel")}
-                        </button>
-                      )}
-                      <button type="submit" class="volo-btn volo-btn-primary">
-                        {whForm.id ? t("common.save") : t("common.create")}
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-
-              {whForm.provider === "telegram" && (
-                <div class="volo-field">
-                  <label>{t("dist.lbl_wh_chat")}</label>
-                  <div style={{ display: "flex", gap: "8px" }}>
-                    <input
-                      class="volo-input"
-                      placeholder={t("dist.wh_chat_id_ph")}
-                      value={whForm.chat_id}
-                      onInput={(e) => setWhForm({ ...whForm, chat_id: (e.currentTarget as HTMLInputElement).value })}
-                    />
-                    {whForm.id && (
-                      <button
-                        type="button"
-                        class="volo-btn"
-                        onClick={() =>
-                          setWhForm({
-                            id: "",
-                            name: "",
-                            provider: "custom",
-                            url: "",
-                            chat_id: "",
-                            secret: "",
-                            events: ["article.published", "comment.created"],
-                            is_enabled: true,
-                          })
-                        }
-                      >
-                        {t("common.cancel")}
-                      </button>
-                    )}
-                    <button type="submit" class="volo-btn volo-btn-primary">
-                      {whForm.id ? t("common.save") : t("common.create")}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div class="volo-field" style={{ marginBottom: 0 }}>
-              <label>{t("dist.lbl_wh_events")}</label>
-              <div class="volo-check-grid" style={{ margin: "4px 0 0" }}>
-                {WH_EVENTS.map((ev) => (
-                  <label key={ev.key} class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={whForm.events.includes(ev.key)}
-                      onChange={(e) => {
-                        const on = (e.currentTarget as HTMLInputElement).checked;
-                        setWhForm({
-                          ...whForm,
-                          events: on ? [...whForm.events, ev.key] : whForm.events.filter((x) => x !== ev.key),
-                        });
-                      }}
-                    />
-                    <span>{t(ev.labelKey)}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          </form>
 
           <div class="volo-table-wrap">
             <table class="volo-table">
@@ -1433,7 +1650,7 @@ export function DistributeWorkspace({
                           </div>
                         </td>
                         <td class="col-cat">
-                          <span class="volo-cat-chip">{t(`dist.wh_${prov}`)}</span>
+                          <span class="volo-cat-chip">{whProviderLabel(prov)}</span>
                         </td>
                         <td class="col-fluid">
                           <span class="volo-code-chip">{w.url || w.target_url}</span>
@@ -1475,7 +1692,7 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              onClick={() =>
+                              onClick={() => {
                                 setWhForm({
                                   id: w.id,
                                   name: w.name || "",
@@ -1483,10 +1700,12 @@ export function DistributeWorkspace({
                                   url: w.url || "",
                                   chat_id: w.chat_id || "",
                                   secret: "",
+                                  secret_set: !!item.secret_set,
                                   events: evList.length > 0 ? evList : ["article.published", "comment.created"],
                                   is_enabled: w.is_enabled !== false,
-                                })
-                              }
+                                });
+                                setWhModalOpen(true);
+                              }}
                             >
                               {t("common.edit")}
                             </button>
@@ -1510,9 +1729,126 @@ export function DistributeWorkspace({
             </table>
           </div>
           <Pagination total={webhooks.length} page={pagedWebhooks.safePage} pageSize={15} onChange={setPageIdx} />
+
+          <AnimatedModal
+            open={whModalOpen}
+            onClose={() => setWhModalOpen(false)}
+            title={whForm.id ? t("dist.edit_wh") : t("dist.new_wh")}
+            subtitle={t("dist.wh_desc")}
+            maxWidth="640px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setWhModalOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button type="button" class="volo-btn volo-btn-primary" onClick={() => void saveWebhook()}>
+                  {t("common.save")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void saveWebhook(e)} autoComplete="off">
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("dist.lbl_wh_name")}</label>
+                  <input
+                    class="volo-input"
+                    required
+                    placeholder={t("dist.wh_name_ph")}
+                    value={whForm.name}
+                    onInput={(e) => setWhForm({ ...whForm, name: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("dist.lbl_wh_provider")}</label>
+                  <ConsoleSelect
+                    value={whForm.provider}
+                    onChange={(val) => setWhForm({ ...whForm, provider: val })}
+                    options={[
+                      { value: "custom", label: t("dist.wh_custom") },
+                      { value: "feishu", label: t("dist.wh_feishu") },
+                      { value: "dingtalk", label: t("dist.wh_dingtalk") },
+                      { value: "wecom", label: t("dist.wh_wecom") },
+                      { value: "bark", label: t("dist.wh_bark") },
+                      { value: "telegram", label: t("dist.wh_telegram") },
+                    ]}
+                  />
+                </div>
+              </div>
+
+              <div class="volo-field">
+                <label>{t("dist.lbl_wh_url")}</label>
+                <input
+                  class="volo-input"
+                  required
+                  placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                  value={whForm.url}
+                  onInput={(e) => setWhForm({ ...whForm, url: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+
+              <div class={whForm.provider === "telegram" ? "volo-grid-2" : "volo-field"}>
+                <div class="volo-field" style={{ marginBottom: whForm.provider === "telegram" ? undefined : 0 }}>
+                  <label>{t("dist.lbl_wh_secret")}</label>
+                  <input
+                    type="password"
+                    name="webhook_hmac_token"
+                    autoComplete="new-password"
+                    class="volo-input"
+                    placeholder={whForm.secret_set ? t("sys.keep_blank_ph") : t("dist.wh_secret_ph")}
+                    value={whForm.secret}
+                    onInput={(e) => setWhForm({ ...whForm, secret: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                {whForm.provider === "telegram" && (
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_wh_chat")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.wh_chat_id_ph")}
+                      value={whForm.chat_id}
+                      onInput={(e) => setWhForm({ ...whForm, chat_id: (e.currentTarget as HTMLInputElement).value })}
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div class="volo-field">
+                <label>{t("dist.lbl_wh_events")}</label>
+                <div class="volo-check-grid" style={{ margin: "4px 0 0" }}>
+                  {WH_EVENTS.map((ev) => (
+                    <label key={ev.key} class="volo-check-item">
+                      <input
+                        type="checkbox"
+                        checked={whForm.events.includes(ev.key)}
+                        onChange={(e) => {
+                          const on = (e.currentTarget as HTMLInputElement).checked;
+                          setWhForm({
+                            ...whForm,
+                            events: on ? [...whForm.events, ev.key] : whForm.events.filter((x) => x !== ev.key),
+                          });
+                        }}
+                      />
+                      <span>{whEventLabel(ev.labelKey)}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <label class="volo-check-item">
+                <input
+                  type="checkbox"
+                  checked={whForm.is_enabled}
+                  onChange={(e) => setWhForm({ ...whForm, is_enabled: (e.currentTarget as HTMLInputElement).checked })}
+                />
+                <span>{t("tbl.status_active")}</span>
+              </label>
+            </form>
+          </AnimatedModal>
         </div>
       )}
 
+      {/* 6. Feed & SEO */}
       {sub === "feed_seo" && isAdmin && feedCfg && seoCfg && (
         <div class="volo-grid-2">
           <div class="volo-card">
@@ -1634,17 +1970,28 @@ export function DistributeWorkspace({
               </div>
               <div class="volo-field">
                 <label>{t("dist.lbl_pod_cover")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("dist.podcast_cover_ph")}
-                  value={feedCfg.podcast?.cover_image_url || ""}
-                  onInput={(e) =>
-                    setFeedCfg({
-                      ...feedCfg,
-                      podcast: { ...(feedCfg.podcast || {}), cover_image_url: (e.currentTarget as HTMLInputElement).value },
-                    })
-                  }
-                />
+                <div class="volo-input-row">
+                  <input
+                    class="volo-input"
+                    placeholder={t("dist.podcast_cover_ph")}
+                    value={feedCfg.podcast?.cover_image_url || ""}
+                    onInput={(e) =>
+                      setFeedCfg({
+                        ...feedCfg,
+                        podcast: { ...(feedCfg.podcast || {}), cover_image_url: (e.currentTarget as HTMLInputElement).value },
+                      })
+                    }
+                  />
+                  <MediaPickButton
+                    filterKind="image"
+                    onPick={(u) =>
+                      setFeedCfg({
+                        ...feedCfg,
+                        podcast: { ...(feedCfg.podcast || {}), cover_image_url: u },
+                      })
+                    }
+                  />
+                </div>
               </div>
               <div class="volo-field" style={{ marginBottom: 0 }}>
                 <label>{t("dist.lbl_pod_sum")}</label>
@@ -1660,21 +2007,23 @@ export function DistributeWorkspace({
               </div>
             </div>
 
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary"
-              onClick={async () => {
-                const res = await apiFetch<any>("/api/admin/settings/feed", {
-                  method: "PATCH",
-                  body: JSON.stringify({ expected_version: feedVer, ...feedCfg }),
-                });
-                setFeedCfg(res.value || feedCfg);
-                setFeedVer(res.version);
-                showToast(t("common.saved"));
-              }}
-            >
-              {t("dist.save_feed")}
-            </button>
+            <div class="volo-form-actions">
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary"
+                onClick={async () => {
+                  const res = await apiFetch<any>("/api/admin/settings/feed", {
+                    method: "PATCH",
+                    body: JSON.stringify({ expected_version: feedVer, ...feedCfg }),
+                  });
+                  setFeedCfg(res.value || feedCfg);
+                  setFeedVer(res.version);
+                  showToast(t("common.saved"));
+                }}
+              >
+                {t("dist.save_feed")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-card">
@@ -1703,11 +2052,17 @@ export function DistributeWorkspace({
             </div>
             <div class="volo-field">
               <label>{t("dist.seo_og")}</label>
-              <input
-                class="volo-input"
-                value={seoCfg.default_og_image_url || ""}
-                onInput={(e) => setSeoCfg({ ...seoCfg, default_og_image_url: (e.currentTarget as HTMLInputElement).value })}
-              />
+              <div class="volo-input-row">
+                <input
+                  class="volo-input"
+                  value={seoCfg.default_og_image_url || ""}
+                  onInput={(e) => setSeoCfg({ ...seoCfg, default_og_image_url: (e.currentTarget as HTMLInputElement).value })}
+                />
+                <MediaPickButton
+                  filterKind="image"
+                  onPick={(u) => setSeoCfg({ ...seoCfg, default_og_image_url: u })}
+                />
+              </div>
             </div>
 
             <div class="volo-subcard">
@@ -1761,14 +2116,11 @@ export function DistributeWorkspace({
                   <button
                     type="button"
                     class="volo-act-btn"
-                    onClick={() => {
-                      setSub("github");
-                      onNavigate?.("github");
-                    }}
+                    onClick={() => switchDistSub("github")}
                   >
                     {t("nav.github")}
                   </button>
-                  <button type="button" class="volo-act-btn" onClick={syncGitHubRepos}>
+                  <button type="button" class="volo-act-btn" onClick={() => void pullGitHubRepos()}>
                     {t("dist.sync_gh")}
                   </button>
                 </div>
@@ -1791,9 +2143,11 @@ export function DistributeWorkspace({
               </label>
             </div>
 
-            <button type="button" class="volo-btn volo-btn-primary" onClick={() => saveSeoSettings(false)}>
-              {t("dist.save_seo")}
-            </button>
+            <div class="volo-form-actions">
+              <button type="button" class="volo-btn volo-btn-primary" onClick={() => void saveSeoSettings(false)}>
+                {t("dist.save_seo")}
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -115,8 +115,8 @@ func NewEngine() *Engine {
 
 func buildSanitizerPolicy() *bluemonday.Policy {
 	p := bluemonday.UGCPolicy()
-	p.AllowAttrs("id", "class", "tabindex", "aria-label", "aria-hidden", "role").Globally()
-	p.AllowAttrs("data-lang", "data-lock-type", "data-article-id", "data-audio-seek", "data-book-slug").Globally()
+	p.AllowAttrs("id", "class", "tabindex", "aria-label", "aria-hidden", "role", "title").Globally()
+	p.AllowAttrs("data-lang", "data-lock-type", "data-article-id", "data-audio-seek", "data-book-slug", "data-github-profile").Globally()
 	p.AllowElements("figure", "figcaption", "section", "aside", "details", "summary", "mark", "kbd", "abbr", "button", "audio", "source")
 	p.AllowAttrs("type").OnElements("button", "input")
 	p.AllowAttrs("checked", "disabled").OnElements("input")
@@ -157,6 +157,11 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 	var firstImg string
 	rendered = enhanceImages(rendered, opts.LookupMediaDims, &firstImg)
 
+	// Enhance GitHub showcase stats/tables and wrap prose tables for responsive overflow protection in web mode.
+	if opts.Mode == RenderModeWeb {
+		rendered = enhanceTablesAndGitHubShowcase(rendered)
+	}
+
 	// Convert [mm:ss] / [hh:mm:ss] timestamps outside code/links when podcast audio is attached.
 	if opts.HasAudio && opts.Mode == RenderModeWeb {
 		rendered = injectAudioTimestamps(rendered)
@@ -164,6 +169,9 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 
 	// Sanitize with bluemonday to neutralize any script/event-handler XSS vectors.
 	safeHTML := e.sanitizer.Sanitize(rendered)
+	if opts.Mode == RenderModeWeb {
+		safeHTML = assignReadableHeadingIDs(safeHTML)
+	}
 
 	toc := extractHeadingsTOC(safeHTML)
 	plain := ExtractPlainTextFromHTML(safeHTML)

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
-import { accentSig, apiFetch, applyThemeAttributes, showToast, themeModeSig } from "../api";
+import { accentSig, apiFetch, applyThemeAttributes, resetConsoleScroll, showToast, themeModeSig } from "../api";
 import {
   ensureLocaleLoaded,
   exportFullTemplateJSON,
@@ -7,7 +7,7 @@ import {
   syncExternalLocales,
   t,
 } from "../i18n";
-import { ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
+import { AnimatedModal, ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
 
 export type AppearanceTab = "themes" | "locales" | "plugins";
 
@@ -19,6 +19,23 @@ const ACCENTS: Array<{ id: string; swatch: string }> = [
   { id: "plum", swatch: "#70517d" },
   { id: "rose", swatch: "#87525f" },
 ];
+
+function renderAccentLabel(id: string): string {
+  switch (id) {
+    case "ocean":
+      return t("accent.ocean");
+    case "teal":
+      return t("accent.teal");
+    case "amber":
+      return t("accent.amber");
+    case "plum":
+      return t("accent.plum");
+    case "rose":
+      return t("accent.rose");
+    default:
+      return t("accent.forest");
+  }
+}
 
 export function AppearanceWorkspace({
   activeTab = "themes",
@@ -34,6 +51,7 @@ export function AppearanceWorkspace({
   const [appVer, setAppVer] = useState<number>(0);
 
   const [themeModal, setThemeModal] = useState<any | null>(null);
+  const [themeModalOpen, setThemeModalOpen] = useState<boolean>(false);
   const [themeCfgVals, setThemeCfgVals] = useState<Record<string, any>>({});
 
   // Language Pack Extensions state
@@ -46,11 +64,14 @@ export function AppearanceWorkspace({
   const [plugins, setPlugins] = useState<any[]>([]);
   const [pluginPage, setPluginPage] = useState<number>(1);
   const [cfgModal, setCfgModal] = useState<any | null>(null);
+  const [cfgModalOpen, setCfgModalOpen] = useState<boolean>(false);
   const [cfgValues, setCfgValues] = useState<Record<string, any>>({});
   const [logsModal, setLogsModal] = useState<{ id: string; logs: any[] } | null>(null);
+  const [logsModalOpen, setLogsModalOpen] = useState<boolean>(false);
 
   useEffect(() => {
     setSub(activeTab);
+    resetConsoleScroll();
   }, [activeTab]);
 
   const loadData = async () => {
@@ -125,10 +146,11 @@ export function AppearanceWorkspace({
             class={`volo-tab ${sub === tab ? "active" : ""}`}
             onClick={() => {
               setSub(tab);
+              resetConsoleScroll();
               onNavigate?.(tab);
             }}
           >
-            {t(`app.${tab}`)}
+            {tab === "themes" ? t("app.themes") : tab === "locales" ? t("app.locales") : t("app.plugins")}
           </button>
         ))}
       </div>
@@ -221,6 +243,7 @@ export function AppearanceWorkspace({
                               });
                               setThemeCfgVals({ ...defaults, ...(th.config_values || {}) });
                               setThemeModal(th);
+                              setThemeModalOpen(true);
                             }}
                           >
                             {t("app.theme_settings")}
@@ -262,16 +285,16 @@ export function AppearanceWorkspace({
             <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("app.default_mode")}</label>
-                <select
-                  class="volo-select"
+                <ConsoleSelect
                   value={appCfg.default_mode || "auto"}
-                  onChange={(e) => setAppCfg({ ...appCfg, default_mode: (e.currentTarget as HTMLSelectElement).value })}
-                >
-                  <option value="auto">{t("app.mode_auto")}</option>
-                  <option value="system">{t("app.mode_system")}</option>
-                  <option value="light">{t("app.mode_light")}</option>
-                  <option value="dark">{t("app.mode_dark")}</option>
-                </select>
+                  options={[
+                    { value: "auto", label: t("app.mode_auto") },
+                    { value: "system", label: t("app.mode_system") },
+                    { value: "light", label: t("app.mode_light") },
+                    { value: "dark", label: t("app.mode_dark") },
+                  ]}
+                  onChange={(v) => setAppCfg({ ...appCfg, default_mode: v })}
+                />
               </div>
               <div class="volo-field">
                 <label>{t("app.shared_accent")}</label>
@@ -283,11 +306,11 @@ export function AppearanceWorkspace({
                       class={`volo-btn volo-btn-sm ${(appCfg.accent || accentSig.value) === ac.id ? "volo-btn-primary" : ""}`}
                       onClick={() => {
                         setAppCfg({ ...appCfg, accent: ac.id });
-                        applyThemeAttributes(themeModeSig.value, ac.id, true);
+                        applyThemeAttributes(themeModeSig.value, ac.id, false);
                       }}
                     >
                       <span class="volo-swatch-dot" style={{ background: ac.swatch, width: "11px", height: "11px" }} />
-                      {t(`accent.${ac.id}`)}
+                      {renderAccentLabel(ac.id)}
                     </button>
                   ))}
                 </div>
@@ -305,21 +328,7 @@ export function AppearanceWorkspace({
               />
             </div>
 
-            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
-              <button
-                type="button"
-                class="volo-btn volo-btn-primary"
-                onClick={async () => {
-                  const res = await apiFetch<any>("/api/admin/settings/appearance", {
-                    method: "PATCH",
-                    body: JSON.stringify({ expected_version: appVer, ...appCfg }),
-                  });
-                  setAppVer(res.version);
-                  showToast(t("common.saved"));
-                }}
-              >
-                {t("common.save")}
-              </button>
+            <div class="volo-form-actions">
               <a
                 class="volo-btn"
                 href={`/?skin=${encodeURIComponent(appCfg.active_theme || "volo-studio")}`}
@@ -328,6 +337,27 @@ export function AppearanceWorkspace({
               >
                 {t("app.preview_theme")} ↗
               </a>
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary"
+                onClick={async () => {
+                  try {
+                    const nextAccent = appCfg.accent || accentSig.value || "forest";
+                    const res = await apiFetch<any>("/api/admin/settings/appearance", {
+                      method: "PATCH",
+                      body: JSON.stringify({ expected_version: appVer, ...appCfg, accent: nextAccent }),
+                    });
+                    setAppCfg(res.value || { ...appCfg, accent: nextAccent });
+                    setAppVer(res.version);
+                    applyThemeAttributes(themeModeSig.value, nextAccent, false);
+                    showToast(t("common.saved"));
+                  } catch (err: any) {
+                    showToast(err.message);
+                  }
+                }}
+              >
+                {t("common.save")}
+              </button>
             </div>
           </div>
         </>
@@ -539,7 +569,15 @@ export function AppearanceWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={locPacks.length} page={locPage} pageSize={12} onChange={setLocPage} />
+          <Pagination
+            total={locPacks.length}
+            page={locPage}
+            pageSize={12}
+            onChange={(p) => {
+              setLocPage(p);
+              resetConsoleScroll();
+            }}
+          />
         </div>
       )}
 
@@ -667,6 +705,7 @@ export function AppearanceWorkspace({
                               onClick={() => {
                                 setCfgModal(p);
                                 setCfgValues({ ...(p.public_config || {}) });
+                                setCfgModalOpen(true);
                               }}
                             >
                               {t("app.configure")}
@@ -676,8 +715,13 @@ export function AppearanceWorkspace({
                             type="button"
                             class="volo-act-btn"
                             onClick={async () => {
-                              const r = await apiFetch<{ items: any[] }>(`/api/admin/plugins/${p.id}/logs`);
-                              setLogsModal({ id: p.id, logs: r.items || [] });
+                              try {
+                                const r = await apiFetch<{ items: any[] }>(`/api/admin/plugins/${p.id}/logs`);
+                                setLogsModal({ id: p.id, logs: r.items || [] });
+                                setLogsModalOpen(true);
+                              } catch (err: any) {
+                                showToast(err.message);
+                              }
                             }}
                           >
                             {t("app.logs")}
@@ -703,79 +747,41 @@ export function AppearanceWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={plugins.length} page={pluginPage} pageSize={12} onChange={setPluginPage} />
+          <Pagination
+            total={plugins.length}
+            page={pluginPage}
+            pageSize={12}
+            onChange={(p) => {
+              setPluginPage(p);
+              resetConsoleScroll();
+            }}
+          />
         </div>
       )}
 
-      {themeModal && (
-        <div class="volo-modal-backdrop" onClick={() => setThemeModal(null)}>
-          <form class="volo-modal" autoComplete="off" onSubmit={(e) => e.preventDefault()} onClick={(e) => e.stopPropagation()}>
-            <div class="volo-card-head">
-              <h3 class="volo-card-title">
-                {t("app.theme_cfg_title", { name: themeModal.display_name || themeModal.name || themeModal.id })}
-              </h3>
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => setThemeModal(null)}>
-                {t("common.close")}
-              </button>
-            </div>
-            {(themeModal.localized_schema || themeModal.config_schema || []).map((f: any) => (
-              <div key={f.key} class="volo-field">
-                <label>{f.label || f.key}</label>
-                {f.description && <div class="volo-help">{f.description}</div>}
-                {f.type === "boolean" ? (
-                  <label class="volo-check-item" style={{ marginTop: "4px" }}>
-                    <input
-                      type="checkbox"
-                      checked={Boolean(themeCfgVals[f.key] ?? f.default)}
-                      onChange={(e) =>
-                        setThemeCfgVals({ ...themeCfgVals, [f.key]: (e.currentTarget as HTMLInputElement).checked })
-                      }
-                    />
-                    <span>{f.label || f.key}</span>
-                  </label>
-                ) : f.type === "select" && f.options ? (
-                  <ConsoleSelect
-                    value={String(themeCfgVals[f.key] ?? f.default ?? "")}
-                    onChange={(v) => setThemeCfgVals({ ...themeCfgVals, [f.key]: v })}
-                    options={f.options.map((op: any) => ({
-                      value: String(op.value),
-                      label: String(op.label || op.value),
-                    }))}
-                  />
-                ) : f.type === "textarea" ? (
-                  <textarea
-                    class="volo-textarea"
-                    rows={3}
-                    value={String(themeCfgVals[f.key] ?? f.default ?? "")}
-                    onInput={(e) =>
-                      setThemeCfgVals({ ...themeCfgVals, [f.key]: (e.currentTarget as HTMLTextAreaElement).value })
-                    }
-                  />
-                ) : (
-                  <input
-                    type={f.type === "number" ? "number" : "text"}
-                    class="volo-input"
-                    name={`theme_opt_${f.key}`}
-                    autoComplete="off"
-                    value={themeCfgVals[f.key] ?? f.default ?? ""}
-                    onInput={(e) => {
-                      const raw = (e.currentTarget as HTMLInputElement).value;
-                      setThemeCfgVals({ ...themeCfgVals, [f.key]: f.type === "number" ? Number(raw) : raw });
-                    }}
-                  />
-                )}
-              </div>
-            ))}
+      <AnimatedModal
+        open={themeModalOpen}
+        onClose={() => setThemeModalOpen(false)}
+        title={t("app.theme_cfg_title", {
+          name: themeModal?.display_name || themeModal?.name || themeModal?.id || "",
+        })}
+        maxWidth="560px"
+        footer={
+          <>
+            <button type="button" class="volo-btn" onClick={() => setThemeModalOpen(false)}>
+              {t("common.cancel")}
+            </button>
             <button
               type="button"
               class="volo-btn volo-btn-primary"
               onClick={async () => {
+                if (!themeModal) return;
                 try {
                   await apiFetch(`/api/admin/themes/${encodeURIComponent(themeModal.id)}/config`, {
                     method: "PUT",
                     body: JSON.stringify(themeCfgVals),
                   });
-                  setThemeModal(null);
+                  setThemeModalOpen(false);
                   showToast(t("common.saved"));
                   void loadData();
                 } catch (err: any) {
@@ -785,93 +791,178 @@ export function AppearanceWorkspace({
             >
               {t("common.save")}
             </button>
-          </form>
-        </div>
-      )}
-
-      {cfgModal && (
-        <div class="volo-modal-backdrop" onClick={() => setCfgModal(null)}>
-          <form class="volo-modal" autoComplete="off" onSubmit={(e) => e.preventDefault()} onClick={(e) => e.stopPropagation()}>
-            <div class="volo-card-head">
-              <h3 class="volo-card-title">{t("app.cfg_title", { name: cfgModal.name || cfgModal.id })}</h3>
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => setCfgModal(null)}>{t("common.close")}</button>
-            </div>
-            {(cfgModal.config_schema || []).map((f: any) => (
-              <div key={f.key} class="volo-field">
-                <label>
-                  {f.label || f.key}{" "}
-                  {f.secret && cfgModal.secret_keys_set?.[f.key] && (
-                    <span class="volo-badge volo-badge-ok">{t("app.secret_sealed_hint")}</span>
-                  )}
-                </label>
-                {f.type === "boolean" ? (
-                  <label class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(cfgValues[f.key] ?? f.default)}
-                      onChange={(e) => setCfgValues({ ...cfgValues, [f.key]: (e.currentTarget as HTMLInputElement).checked })}
-                    />
-                    <span>{f.label || f.key}</span>
-                  </label>
-                ) : f.type === "select" && f.options ? (
-                  <ConsoleSelect
-                    value={String(cfgValues[f.key] ?? f.default ?? "")}
-                    onChange={(v) => setCfgValues({ ...cfgValues, [f.key]: v })}
-                    options={f.options.map((op: any) => ({
-                      value: String(op.value),
-                      label: String(op.label || op.value),
-                    }))}
-                  />
-                ) : (
+          </>
+        }
+      >
+        <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
+          {(themeModal?.localized_schema || themeModal?.config_schema || []).map((f: any) => (
+            <div key={f.key} class="volo-field">
+              <label>{f.label || f.key}</label>
+              {f.description && <div class="volo-help">{f.description}</div>}
+              {f.type === "boolean" ? (
+                <label class="volo-check-item" style={{ marginTop: "4px" }}>
                   <input
-                    type={f.secret ? "password" : f.type === "number" ? "number" : "text"}
-                    class="volo-input"
-                    name={`plugin_cfg_${f.key}`}
-                    autoComplete={f.secret ? "new-password" : "off"}
-                    placeholder={f.secret ? "••••••••" : ""}
-                    value={cfgValues[f.key] ?? ""}
-                    onInput={(e) => {
-                      const raw = (e.currentTarget as HTMLInputElement).value;
-                      setCfgValues({ ...cfgValues, [f.key]: f.type === "number" ? Number(raw) : raw });
-                    }}
+                    type="checkbox"
+                    checked={Boolean(themeCfgVals[f.key] ?? f.default)}
+                    onChange={(e) =>
+                      setThemeCfgVals({ ...themeCfgVals, [f.key]: (e.currentTarget as HTMLInputElement).checked })
+                    }
                   />
-                )}
-              </div>
-            ))}
+                  <span>{f.label || f.key}</span>
+                </label>
+              ) : f.type === "select" && f.options ? (
+                <ConsoleSelect
+                  value={String(themeCfgVals[f.key] ?? f.default ?? "")}
+                  onChange={(v) => setThemeCfgVals({ ...themeCfgVals, [f.key]: v })}
+                  options={f.options.map((op: any) => ({
+                    value: String(op.value),
+                    label: String(op.label || op.value),
+                  }))}
+                />
+              ) : f.type === "textarea" ? (
+                <textarea
+                  class="volo-textarea"
+                  rows={3}
+                  value={String(themeCfgVals[f.key] ?? f.default ?? "")}
+                  onInput={(e) =>
+                    setThemeCfgVals({ ...themeCfgVals, [f.key]: (e.currentTarget as HTMLTextAreaElement).value })
+                  }
+                />
+              ) : (
+                <input
+                  type={f.type === "number" ? "number" : "text"}
+                  class="volo-input"
+                  name={`theme_opt_${f.key}`}
+                  autoComplete="off"
+                  value={themeCfgVals[f.key] ?? f.default ?? ""}
+                  onInput={(e) => {
+                    const raw = (e.currentTarget as HTMLInputElement).value;
+                    setThemeCfgVals({ ...themeCfgVals, [f.key]: f.type === "number" ? Number(raw) : raw });
+                  }}
+                />
+              )}
+            </div>
+          ))}
+        </form>
+      </AnimatedModal>
+
+      <AnimatedModal
+        open={cfgModalOpen}
+        onClose={() => setCfgModalOpen(false)}
+        title={t("app.cfg_title", { name: cfgModal?.name || cfgModal?.id || "" })}
+        maxWidth="560px"
+        footer={
+          <>
+            <button type="button" class="volo-btn" onClick={() => setCfgModalOpen(false)}>
+              {t("common.cancel")}
+            </button>
             <button
               type="button"
               class="volo-btn volo-btn-primary"
               onClick={async () => {
-                await apiFetch(`/api/admin/plugins/${cfgModal.id}/config`, {
-                  method: "PATCH",
-                  body: JSON.stringify(cfgValues),
-                });
-                setCfgModal(null);
-                showToast(t("common.saved"));
-                void loadData();
+                if (!cfgModal) return;
+                try {
+                  await apiFetch(`/api/admin/plugins/${cfgModal.id}/config`, {
+                    method: "PATCH",
+                    body: JSON.stringify(cfgValues),
+                  });
+                  setCfgModalOpen(false);
+                  showToast(t("common.saved"));
+                  void loadData();
+                } catch (err: any) {
+                  showToast(err.message);
+                }
               }}
             >
               {t("common.save")}
             </button>
-          </form>
-        </div>
-      )}
-
-      {logsModal && (
-        <div class="volo-modal-backdrop" onClick={() => setLogsModal(null)}>
-          <div class="volo-modal" onClick={(e) => e.stopPropagation()}>
-            <div class="volo-card-head">
-              <h3 class="volo-card-title">{t("app.logs_title", { id: logsModal.id })}</h3>
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => setLogsModal(null)}>{t("common.close")}</button>
+          </>
+        }
+      >
+        <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
+          {(cfgModal?.config_schema || []).map((f: any) => (
+            <div key={f.key} class="volo-field">
+              <label>
+                {f.label || f.key}{" "}
+                {f.secret && cfgModal?.secret_keys_set?.[f.key] && (
+                  <span class="volo-badge volo-badge-ok">{t("app.secret_sealed_hint")}</span>
+                )}
+              </label>
+              {f.type === "boolean" ? (
+                <label class="volo-check-item">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(cfgValues[f.key] ?? f.default)}
+                    onChange={(e) =>
+                      setCfgValues({ ...cfgValues, [f.key]: (e.currentTarget as HTMLInputElement).checked })
+                    }
+                  />
+                  <span>{f.label || f.key}</span>
+                </label>
+              ) : f.type === "select" && f.options ? (
+                <ConsoleSelect
+                  value={String(cfgValues[f.key] ?? f.default ?? "")}
+                  onChange={(v) => setCfgValues({ ...cfgValues, [f.key]: v })}
+                  options={f.options.map((op: any) => ({
+                    value: String(op.value),
+                    label: String(op.label || op.value),
+                  }))}
+                />
+              ) : f.type === "textarea" ? (
+                <textarea
+                  class="volo-textarea"
+                  rows={3}
+                  value={String(cfgValues[f.key] ?? f.default ?? "")}
+                  onInput={(e) =>
+                    setCfgValues({ ...cfgValues, [f.key]: (e.currentTarget as HTMLTextAreaElement).value })
+                  }
+                />
+              ) : (
+                <input
+                  type={f.secret ? "password" : f.type === "number" ? "number" : "text"}
+                  class="volo-input"
+                  name={`plugin_cfg_${f.key}`}
+                  autoComplete={f.secret ? "new-password" : "off"}
+                  placeholder={f.secret ? "••••••••" : ""}
+                  value={cfgValues[f.key] ?? ""}
+                  onInput={(e) => {
+                    const raw = (e.currentTarget as HTMLInputElement).value;
+                    setCfgValues({ ...cfgValues, [f.key]: f.type === "number" ? Number(raw) : raw });
+                  }}
+                />
+              )}
             </div>
-            <pre style={{ maxHeight: "360px", overflow: "auto", fontSize: "12px", background: "var(--volo-raised)", padding: "12px", borderRadius: "8px" }}>
-              {logsModal.logs.length === 0
-                ? t("app.logs_empty")
-                : logsModal.logs.map((l) => `[${l.level}] ${l.event}: ${l.message}`).join("\n")}
-            </pre>
-          </div>
-        </div>
-      )}
+          ))}
+        </form>
+      </AnimatedModal>
+
+      <AnimatedModal
+        open={logsModalOpen}
+        onClose={() => setLogsModalOpen(false)}
+        title={t("app.logs_title", { id: logsModal?.id || "" })}
+        maxWidth="680px"
+        footer={
+          <button type="button" class="volo-btn" onClick={() => setLogsModalOpen(false)}>
+            {t("common.close")}
+          </button>
+        }
+      >
+        <pre
+          style={{
+            maxHeight: "360px",
+            overflow: "auto",
+            fontSize: "12px",
+            background: "var(--volo-raised)",
+            padding: "12px",
+            borderRadius: "8px",
+            margin: 0,
+          }}
+        >
+          {!logsModal || logsModal.logs.length === 0
+            ? t("app.logs_empty")
+            : logsModal.logs.map((l) => `[${l.level}] ${l.event}: ${l.message}`).join("\n")}
+        </pre>
+      </AnimatedModal>
     </div>
   );
 }

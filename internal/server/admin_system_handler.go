@@ -479,12 +479,35 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 		}
 		return
 	}
-	if r.Method == http.MethodDelete {
+	switch r.Method {
+	case http.MethodPut:
+		var in domain.RedirectRule
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		src := "/" + strings.TrimLeft(strings.TrimSpace(in.SourcePath), "/")
+		dst := strings.TrimSpace(in.TargetPath)
+		if src == "/" || dst == "" || src == dst {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and target_path required"})
+			return
+		}
+		if in.StatusCode != 301 && in.StatusCode != 302 {
+			in.StatusCode = 301
+		}
+		if _, err := s.deps.Store.ExecContext(r.Context(),
+			`UPDATE redirects SET source_path = ?, target_path = ?, status_code = ? WHERE id = ?`,
+			src, dst, in.StatusCode, rest); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM redirects WHERE id = ?`, rest)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-		return
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
-	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
@@ -1261,9 +1284,12 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 	switch r.Method {
 	case http.MethodPatch:
 		var req struct {
-			Role     *string `json:"role"`
-			Status   *string `json:"status"`
-			Password string  `json:"password"`
+			DisplayName     *string `json:"display_name"`
+			Email           *string `json:"email"`
+			PreferredLocale *string `json:"preferred_locale"`
+			Role            *string `json:"role"`
+			Status          *string `json:"status"`
+			Password        string  `json:"password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -1277,6 +1303,15 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		if rest == actor.ID && ((req.Status != nil && *req.Status != domain.UserStatusActive) || (req.Role != nil && *req.Role != domain.RoleAdmin)) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot demote or disable your own admin account"})
 			return
+		}
+		if req.DisplayName != nil && strings.TrimSpace(*req.DisplayName) != "" {
+			u.DisplayName = strings.TrimSpace(*req.DisplayName)
+		}
+		if req.Email != nil && strings.TrimSpace(*req.Email) != "" {
+			u.Email = strings.ToLower(strings.TrimSpace(*req.Email))
+		}
+		if req.PreferredLocale != nil {
+			u.PreferredLocale = s.deps.Catalog.Match(*req.PreferredLocale, "")
 		}
 		if req.Role != nil && (*req.Role == domain.RoleAdmin || *req.Role == domain.RoleEditor || *req.Role == domain.RoleReader) {
 			u.Role = *req.Role
@@ -1293,8 +1328,8 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			u.LegacyHash = ""
 		}
 		_, err = s.deps.Store.ExecContext(r.Context(),
-			`UPDATE users SET role = ?, status = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
-			u.Role, u.Status, u.PasswordHash, u.LegacyHash, time.Now().UnixMilli(), rest)
+			`UPDATE users SET display_name = ?, email = ?, preferred_locale = ?, role = ?, status = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
+			u.DisplayName, u.Email, u.PreferredLocale, u.Role, u.Status, u.PasswordHash, u.LegacyHash, time.Now().UnixMilli(), rest)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -1424,13 +1459,53 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	if r.Method == http.MethodDelete {
+	switch r.Method {
+	case http.MethodPut:
+		prev, pErr := sqlx.Get[domain.SecurityGeoRule](r.Context(), s.deps.Store, `SELECT * FROM security_geo_rules WHERE id = ?`, rest)
+		if pErr != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "geo rule not found"})
+			return
+		}
+		var in domain.SecurityGeoRule
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		in.Name = strings.TrimSpace(in.Name)
+		if in.Action != "allow" && in.Action != "deny" {
+			in.Action = "deny"
+		}
+		if in.OnMiss != "next" && in.OnMiss != "allow" && in.OnMiss != "deny" {
+			in.OnMiss = "next"
+		}
+		now := time.Now().UnixMilli()
+		if _, err := s.deps.Store.ExecContext(r.Context(),
+			`UPDATE security_geo_rules SET name = ?, is_enabled = ?, action = ?, on_miss = ?, countries = ?, regions = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
+			in.Name, in.IsEnabled, in.Action, in.OnMiss, in.Countries, in.Regions, in.SortOrder, now, rest); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
+		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		if s.deps.Config.GeoAccessEnabled && !s.deps.Geo.Allows(clientIP) {
+			_, _ = s.deps.Store.ExecContext(r.Context(),
+				`UPDATE security_geo_rules SET name = ?, is_enabled = ?, action = ?, on_miss = ?, countries = ?, regions = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
+				prev.Name, prev.IsEnabled, prev.Action, prev.OnMiss, prev.Countries, prev.Regions, prev.SortOrder, prev.UpdatedAt, rest)
+			_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "refusing GeoIP rule update that would immediately lock out your current IP"})
+			return
+		}
+		s.recordAuditLog(r, actor, "security.geo_rule_update", "geo_rule", rest, nil)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+
+	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM security_geo_rules WHERE id = ?`, rest)
 		_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-		return
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
-	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Request, actor *domain.User) {

@@ -2,6 +2,7 @@
 /dist/
 /volo
 /volo.exe
+/*.zip
 *.test
 *.out
 coverage.txt

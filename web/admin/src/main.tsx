@@ -1,5 +1,5 @@
 import { render } from "preact";
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import "./styles/console.css";
 import {
   accentSig,
@@ -12,7 +12,9 @@ import {
   dismissToast,
   pauseToast,
   refreshMe,
+  resetConsoleScroll,
   resumeToast,
+  saveGlobalAccent,
   themeModeSig,
   toastSig,
 } from "./api";
@@ -33,6 +35,7 @@ import { ContentSubTab, ContentWorkspace } from "./views/ContentWorkspace";
 import { DistTab, DistributeWorkspace } from "./views/DistributeWorkspace";
 import { AppearanceWorkspace } from "./views/AppearanceWorkspace";
 import { SysTab, SystemWorkspace } from "./views/SystemWorkspace";
+import { AboutHelpTab, AboutHelpWorkspace } from "./views/AboutHelpWorkspace";
 
 type NavSection =
   | OverviewSection
@@ -41,7 +44,8 @@ type NavSection =
   | "themes"
   | "locales"
   | "plugins"
-  | SysTab;
+  | SysTab
+  | AboutHelpTab;
 
 const ACCENT_OPTIONS: Array<{ id: string; swatch: string }> = [
   { id: "forest", swatch: "#246b51" },
@@ -82,6 +86,8 @@ const SECTION_LABEL_KEYS: Record<NavSection, string> = {
   account: "nav.account",
   waf: "nav.waf",
   audit: "nav.audit",
+  about: "nav.about",
+  help: "nav.help",
 };
 
 interface NavEntry {
@@ -172,6 +178,8 @@ const SIDEBAR_ENTRIES: NavEntry[] = [
       { section: "audit", labelKey: "nav.audit", adminOnly: true },
     ],
   },
+  { kind: "item", id: "about", labelKey: "nav.about", icon: "info", section: "about" },
+  { kind: "item", id: "help", labelKey: "nav.help", icon: "help", section: "help" },
 ];
 
 function NavIcon({ name }: { name: string }) {
@@ -231,6 +239,22 @@ function NavIcon({ name }: { name: string }) {
           <circle cx="10" cy="18" r="2" fill="var(--volo-nav)" />
         </svg>
       );
+    case "info":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9.5" />
+          <line x1="12" y1="16" x2="12" y2="11.5" />
+          <circle cx="12" cy="8" r="0.8" fill="currentColor" />
+        </svg>
+      );
+    case "help":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9.5" />
+          <path d="M9.4 9.2a2.7 2.7 0 0 1 5.1 1c0 1.7-2.5 2.2-2.5 3.6" />
+          <circle cx="12" cy="17.2" r="0.8" fill="currentColor" />
+        </svg>
+      );
     default:
       return (
         <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -271,15 +295,29 @@ function findParentGroup(sec: NavSection): string | null {
   return null;
 }
 
+function resolveHashSection(): NavSection {
+  if (typeof window === "undefined") return "dashboard";
+  const raw = window.location.hash.replace(/^#/, "").trim();
+  return (raw in SECTION_LABEL_KEYS ? raw : "dashboard") as NavSection;
+}
+
 function App() {
   const [ready, setReady] = useState(bootConfig.mode === "setup");
-  const [section, setSection] = useState<NavSection>("dashboard");
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({
-    posts: true,
-    content: true,
+  const [section, setSection] = useState<NavSection>(resolveHashSection);
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
+    const initial = resolveHashSection();
+    const p = findParentGroup(initial);
+    return {
+      posts: true,
+      content: true,
+      ...(p ? { [p]: true } : {}),
+    };
   });
   const [appearanceOpen, setAppearanceOpen] = useState<boolean>(false);
+  const [appearanceClosing, setAppearanceClosing] = useState<boolean>(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const [avatarErr, setAvatarErr] = useState<boolean>(false);
+  const appCloseTimer = useRef<number | undefined>(undefined);
 
   const curLocale = localeSig.value;
   const locales = availableLocalesSig.value;
@@ -287,6 +325,30 @@ function App() {
   const curMode = themeModeSig.value;
   const curAccent = accentSig.value;
   const isBusy = busyCountSig.value > 0;
+
+  useEffect(() => {
+    setAvatarErr(false);
+  }, [user?.avatar_url]);
+
+  const closeAppearanceAnimated = () => {
+    if (!appearanceOpen || appearanceClosing) return;
+    setAppearanceClosing(true);
+    if (appCloseTimer.current) window.clearTimeout(appCloseTimer.current);
+    appCloseTimer.current = window.setTimeout(() => {
+      setAppearanceOpen(false);
+      setAppearanceClosing(false);
+    }, 140);
+  };
+
+  const toggleAppearance = () => {
+    if (appearanceOpen && !appearanceClosing) {
+      closeAppearanceAnimated();
+    } else {
+      if (appCloseTimer.current) window.clearTimeout(appCloseTimer.current);
+      setAppearanceClosing(false);
+      setAppearanceOpen(true);
+    }
+  };
 
   const navigateTo = (rawSec: string) => {
     const next = (rawSec in SECTION_LABEL_KEYS ? rawSec : "dashboard") as NavSection;
@@ -296,6 +358,13 @@ function App() {
     if (parent) {
       setOpenGroups((prev) => ({ ...prev, [parent]: true }));
     }
+    if (typeof window !== "undefined") {
+      const targetHash = `#${next}`;
+      if (window.location.hash !== targetHash) {
+        window.history.replaceState(null, "", targetHash);
+      }
+    }
+    resetConsoleScroll();
   };
 
   useEffect(() => {
@@ -308,10 +377,32 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const onDocClick = () => setAppearanceOpen(false);
-    document.addEventListener("click", onDocClick);
-    return () => document.removeEventListener("click", onDocClick);
+    const onHashChange = () => {
+      const next = resolveHashSection();
+      setSection(next);
+      const parent = findParentGroup(next);
+      if (parent) {
+        setOpenGroups((prev) => ({ ...prev, [parent]: true }));
+      }
+      resetConsoleScroll();
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+
+  useEffect(() => {
+    if (!appearanceOpen) return;
+    const onDocClick = () => closeAppearanceAnimated();
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeAppearanceAnimated();
+    };
+    document.addEventListener("click", onDocClick);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("click", onDocClick);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [appearanceOpen, appearanceClosing]);
 
   useEffect(() => {
     document.documentElement.lang = curLocale;
@@ -477,13 +568,14 @@ function App() {
           </div>
 
           <div class="volo-topbar-actions">
-            {/* Unified Appearance Popover (4 Modes + 6 Circular Accent Swatches) */}
+            {/* Unified Appearance Popover (4 Modes + Admin-Persisted Accent Swatches) */}
             <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
               <button
                 type="button"
                 class="volo-appearance-trigger"
                 title={`${t("shell.appearance_title")}: ${t(`mode.${curMode}`)} · ${t(`accent.${curAccent}`)}`}
-                onClick={() => setAppearanceOpen((p) => !p)}
+                aria-expanded={appearanceOpen && !appearanceClosing}
+                onClick={toggleAppearance}
               >
                 {curMode === "dark" ? (
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -499,7 +591,7 @@ function App() {
               </button>
 
               {appearanceOpen && (
-                <div class="volo-pop-menu volo-appearance-pop">
+                <div class={`volo-pop-menu volo-appearance-pop ${appearanceClosing ? "is-closing" : ""}`}>
                   <div class="volo-pop-caption">{t("shell.mode_title")}</div>
                   <div class="volo-mode-grid">
                     {MODE_OPTIONS.map((m) => (
@@ -515,26 +607,30 @@ function App() {
                     ))}
                   </div>
 
-                  <div class="volo-pop-divider" />
-                  <div class="volo-pop-caption">{t("shell.accent_title")}</div>
-                  <div class="volo-accent-row">
-                    {ACCENT_OPTIONS.map((ac) => {
-                      const isAct = curAccent === ac.id;
-                      return (
-                        <button
-                          key={ac.id}
-                          type="button"
-                          class={`volo-accent-dot-btn ${isAct ? "active" : ""}`}
-                          style={{ background: ac.swatch }}
-                          title={t(`accent.${ac.id}`)}
-                          aria-label={t(`accent.${ac.id}`)}
-                          onClick={() => applyThemeAttributes(curMode, ac.id, true)}
-                        >
-                          {isAct && <span>✓</span>}
-                        </button>
-                      );
-                    })}
-                  </div>
+                  {isAdmin && (
+                    <>
+                      <div class="volo-pop-divider" />
+                      <div class="volo-pop-caption">{t("shell.accent_title")}</div>
+                      <div class="volo-accent-row">
+                        {ACCENT_OPTIONS.map((ac) => {
+                          const isAct = curAccent === ac.id;
+                          return (
+                            <button
+                              key={ac.id}
+                              type="button"
+                              class={`volo-accent-dot-btn ${isAct ? "active" : ""}`}
+                              style={{ background: ac.swatch }}
+                              title={t(`accent.${ac.id}`)}
+                              aria-label={t(`accent.${ac.id}`)}
+                              onClick={() => void saveGlobalAccent(ac.id)}
+                            >
+                              {isAct && <span>✓</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -568,7 +664,11 @@ function App() {
               title={t("nav.account")}
             >
               <span class="volo-user-avatar">
-                {user.avatar_url ? <img src={user.avatar_url} alt="" /> : initialChar}
+                {user.avatar_url && !avatarErr ? (
+                  <img src={user.avatar_url} alt="" onError={() => setAvatarErr(true)} />
+                ) : (
+                  initialChar
+                )}
               </span>
               <span>{user.display_name || user.username}</span>
             </button>
@@ -629,6 +729,10 @@ function App() {
             section === "waf" ||
             section === "audit") && (
             <SystemWorkspace activeTab={section} onNavigate={navigateTo} />
+          )}
+
+          {(section === "about" || section === "help") && (
+            <AboutHelpWorkspace activeTab={section} onNavigate={navigateTo} />
           )}
         </main>
       </div>

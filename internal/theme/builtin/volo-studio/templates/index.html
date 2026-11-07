@@ -1,10 +1,10 @@
 {{define "content"}}
 <h1 class="studio-sr-only">{{.HeroTitle}}</h1>
 
-{{if eq .CurrentPath "/"}}
+{{if .IsHome}}
   {{if .Site.NoticeBoard}}
     <section class="studio-hero" aria-label="{{t .Locale "sidebar.notice"}}">
-      <div>
+      <div class="studio-hero-copy">
         <h2 class="studio-hero-label">{{coalesce (themeCfg .ThemeConfig "hero_badge" "") (t .Locale "sidebar.notice")}}</h2>
         <div class="studio-hero-notice">{{.Site.NoticeBoard}}</div>
       </div>
@@ -18,7 +18,7 @@
   {{end}}
 {{else}}
   <section class="studio-hero studio-hero--simple">
-    <div>
+    <div class="studio-hero-copy">
       <h2 class="studio-hero__title">{{.HeroTitle}}</h2>
       {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
     </div>
@@ -26,8 +26,8 @@
 {{end}}
 
 <div class="studio-layout">
-  <div>
-    {{if eq .CurrentPath "/"}}
+  <div class="studio-feed">
+    {{if .IsHome}}
       <div class="studio-section-heading">
         <h2>{{t .Locale "studio.latest_updates"}}</h2>
       </div>
@@ -36,10 +36,7 @@
       {{range .ArticleCards}}
         {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
       {{else}}
-        <div class="studio-empty">
-          <h2>{{t .Locale "studio.empty_title"}}</h2>
-          <p>{{t .Locale "studio.empty_desc"}}</p>
-        </div>
+        {{template "empty_state" (dict "Title" (t .Locale "studio.empty_title") "Desc" (t .Locale "studio.empty_desc"))}}
       {{end}}
     </div>
 

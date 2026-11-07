@@ -46,9 +46,9 @@ export function SetupWizard() {
   const [timezone, setTimezone] = useState<string>("Asia/Shanghai");
   const [accent, setAccent] = useState<string>(accentSig.value || "forest");
 
-  const [username, setUsername] = useState<string>("admin");
+  const [username, setUsername] = useState<string>("");
   const [displayName, setDisplayName] = useState<string>(() => tFor(initLoc, "setup.default_display_name"));
-  const [email, setEmail] = useState<string>("admin@example.com");
+  const [email, setEmail] = useState<string>("");
   const [password, setPassword] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
   const [etlResult, setEtlResult] = useState<any>(null);
@@ -181,7 +181,7 @@ export function SetupWizard() {
         </div>
 
         {tab === "fresh" ? (
-          <form onSubmit={submitFresh} autoComplete="off">
+          <form onSubmit={submitFresh} autoComplete="off" data-form-type="other">
             <div class="volo-card" style={{ padding: "14px", marginBottom: "14px" }}>
               <div style={{ fontWeight: 650, marginBottom: "10px" }}>{t("setup.step1")}</div>
               <div class="volo-grid-2">
@@ -215,11 +215,11 @@ export function SetupWizard() {
                   {t("setup.simple_proto")}
                 </label>
               )}
-              <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+              <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px" }}>
+                {dbPingMsg && <span class="volo-badge" style={{ marginRight: "auto" }}>{dbPingMsg}</span>}
                 <button type="button" class="volo-btn volo-btn-sm" disabled={busy} onClick={testDB}>
                   {t("setup.test_db")}
                 </button>
-                {dbPingMsg && <span class="volo-badge">{dbPingMsg}</span>}
               </div>
             </div>
 
@@ -270,7 +270,7 @@ export function SetupWizard() {
                       aria-label={t(`accent.${ac.id}`)}
                       onClick={() => {
                         setAccent(ac.id);
-                        applyThemeAttributes(themeModeSig.value, ac.id, true);
+                        applyThemeAttributes(themeModeSig.value, ac.id, false);
                       }}
                     >
                       {isAct && <span>✓</span>}
@@ -290,6 +290,9 @@ export function SetupWizard() {
                   class="volo-input"
                   name="setup_owner_handle"
                   autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                  placeholder="admin"
                   required
                   value={username}
                   onInput={(e) => setUsername((e.currentTarget as HTMLInputElement).value)}
@@ -314,6 +317,9 @@ export function SetupWizard() {
                   class="volo-input"
                   name="setup_owner_email"
                   autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
+                  placeholder="admin@example.com"
                   required
                   value={email}
                   onInput={(e) => setEmail((e.currentTarget as HTMLInputElement).value)}
@@ -326,6 +332,8 @@ export function SetupWizard() {
                   class="volo-input"
                   name="setup_owner_new_pwd"
                   autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                   required
                   minLength={6}
                   value={password}
@@ -333,9 +341,11 @@ export function SetupWizard() {
                 />
               </div>
             </div>
-            <button type="submit" class="volo-btn volo-btn-primary" style={{ width: "100%", marginTop: "8px" }} disabled={busy}>
-              {t("setup.launch")}
-            </button>
+            <div class="volo-form-actions">
+              <button type="submit" class="volo-btn volo-btn-primary" disabled={busy}>
+                {t("setup.launch")}
+              </button>
+            </div>
           </form>
         ) : (
           <div>

@@ -29,13 +29,9 @@
   <link rel="alternate icon" sizes="32x32" href="/favicon.ico">
   <script>
     (function(){
-      var m = "", a = "";
-      try {
-        m = localStorage.getItem("volo_theme_mode") || "";
-        a = localStorage.getItem("volo_theme_accent") || "";
-      } catch(_){}
+      var m = "";
+      try { m = localStorage.getItem("volo_theme_mode") || ""; } catch(_){}
       if (!m) m = document.documentElement.getAttribute("data-default-mode") || "auto";
-      if (a) document.documentElement.setAttribute("data-accent", a);
       var eff = m;
       if (m === "system") eff = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
       else if (m !== "light" && m !== "dark") { var h = new Date().getHours(); eff = (h >= 7 && h < 19) ? "light" : "dark"; }
@@ -50,51 +46,135 @@
   {{if .Site.CustomHeadMeta}}{{safeHTML .Site.CustomHeadMeta}}{{end}}
   {{range .HeadWidgets}}{{safeHTML .HTML}}{{end}}
 </head>
-<body>
+<body class="studio-page">
+  <div id="volo-pjax-bar" class="volo-pjax-bar" aria-hidden="true"></div>
+  <div id="volo-read-bar" class="volo-read-bar" aria-hidden="true"></div>
+
   <header class="studio-header">
     <div class="studio-container studio-header__inner">
+      {{$brandAvatar := coalesce .Owner.AvatarURL .Site.LogoURL}}
       <a class="studio-brand" href="/">
-        {{if .Site.LogoURL}}<img class="studio-brand__logo" src="{{.Site.LogoURL}}" alt="{{.Site.Title}}" width="38" height="38">{{else}}<span class="studio-brand__mark" aria-hidden="true">V.</span>{{end}}
+        {{if $brandAvatar}}
+          <span class="studio-brand__avatar-wrap"><img class="studio-brand__logo" src="{{$brandAvatar}}" alt="{{.Site.Title}}" width="38" height="38" data-brand-avatar="1"><span class="studio-brand__mark" hidden aria-hidden="true">V.</span></span>
+        {{else}}
+          <span class="studio-brand__mark" aria-hidden="true">V.</span>
+        {{end}}
         <span class="studio-brand__copy">
           <span class="studio-brand__title">{{.Site.Title}}</span>
-          <span class="studio-brand__tagline">{{default (default .Site.Subtitle (tt .ThemeID .Locale "journal.edition")) (themeCfg .ThemeConfig "journal_motto" "")}}</span>
+          <span class="studio-brand__tagline">{{default (default (t .Locale "studio.brand_tagline") .Site.Subtitle) (themeCfg .ThemeConfig "journal_motto" "")}}</span>
         </span>
       </a>
+
       <nav class="studio-nav" aria-label="Primary">
         <a class="studio-nav__link {{if eq .CurrentPath "/"}}is-active{{end}}" href="/">{{t .Locale "nav.home"}}</a>
         <a class="studio-nav__link {{if hasPrefix .CurrentPath "/categories"}}is-active{{end}}" href="/categories">{{t .Locale "nav.categories"}}</a>
         <a class="studio-nav__link {{if hasPrefix .CurrentPath "/tags"}}is-active{{end}}" href="/tags">{{t .Locale "nav.tags"}}</a>
         <a class="studio-nav__link {{if hasPrefix .CurrentPath "/archives"}}is-active{{end}}" href="/archives">{{t .Locale "nav.archives"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/series"}}is-active{{end}}" href="/series">{{t .Locale "nav.series"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/books"}}is-active{{end}}" href="/books">{{t .Locale "nav.bookshelf"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/links"}}is-active{{end}}" href="/links">{{t .Locale "nav.links"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/follows"}}is-active{{end}}" href="/follows">{{t .Locale "nav.follows"}}</a>
-        {{range .NavItems}}
-          <a class="studio-nav__link {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>{{.Title}}</a>
-        {{end}}
-      </nav>
-      <div class="studio-actions">
-        {{if .Reading.EnableInstantSearch}}
-          <button type="button" id="volo-search-btn" class="studio-icon-btn" title="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-          </button>
-        {{end}}
-        <button type="button" id="volo-theme-btn" class="studio-icon-btn" title="{{t .Locale "appearance.auto"}}">◐</button>
-        {{if and .Site.AllowLocaleSwitch (gt (len .Locales) 1)}}
-          {{range .Locales}}
-            {{if ne .Code $.Locale}}
-              <button type="button" class="studio-icon-btn" data-set-lang="{{.Code}}">{{.Name}}</button>
+        <div class="studio-custom-links">
+          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/series"}}is-active{{end}}" href="/series">{{t .Locale "nav.series"}}</a>
+          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/books"}}is-active{{end}}" href="/books">{{t .Locale "nav.bookshelf"}}</a>
+          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/links"}}is-active{{end}}" href="/links">{{t .Locale "nav.links"}}</a>
+          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/follows"}}is-active{{end}}" href="/follows">{{t .Locale "nav.follows"}}</a>
+          {{range .NavItems}}
+            {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
+              <a class="studio-nav__link {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>{{navIconHTML .Icon}}<span>{{.Title}}</span></a>
             {{end}}
           {{end}}
+        </div>
+
+        <div class="studio-nav-more studio-only-mobile">
+          <button type="button" id="volo-nav-more-btn" class="studio-nav__link studio-nav-more__summary" aria-haspopup="menu" aria-expanded="false">
+            <span>{{t .Locale "nav.more"}}</span>
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div id="volo-nav-more-menu" class="volo-popover studio-nav-more__menu" role="menu" hidden>
+            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/series"}}is-active{{end}}" href="/series" role="menuitem"><span>{{t .Locale "nav.series"}}</span></a>
+            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/books"}}is-active{{end}}" href="/books" role="menuitem">{{navIconHTML "book"}}<span>{{t .Locale "nav.bookshelf"}}</span></a>
+            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/links"}}is-active{{end}}" href="/links" role="menuitem"><span>{{t .Locale "nav.links"}}</span></a>
+            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/follows"}}is-active{{end}}" href="/follows" role="menuitem"><span>{{t .Locale "nav.follows"}}</span></a>
+            {{range .NavItems}}
+              {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
+                <a class="studio-nav-more__item {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" role="menuitem" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>{{navIconHTML .Icon}}<span>{{.Title}}</span></a>
+              {{end}}
+            {{end}}
+            {{if .Viewer}}
+              <div class="volo-appearance__divider"></div>
+              {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
+                <a class="studio-nav-more__item" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
+                <a class="studio-nav-more__item" href="/logout" data-no-pjax role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></a>
+              {{else}}
+                <a class="studio-nav-more__item" href="/logout" data-no-pjax role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></a>
+              {{end}}
+            {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
+              <div class="volo-appearance__divider"></div>
+              <a class="studio-nav-more__item" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><span>{{t .Locale "nav.login"}}</span></a>
+            {{end}}
+          </div>
+        </div>
+      </nav>
+
+      <div class="studio-actions">
+        {{if .Reading.EnableInstantSearch}}
+          <button type="button" id="volo-search-btn" class="studio-icon-btn studio-icon-btn--square" title="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}">
+            <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          </button>
         {{end}}
+
+        <div class="volo-appearance">
+          <button type="button" id="volo-theme-btn" class="studio-icon-btn"
+                  aria-haspopup="menu" aria-expanded="false"
+                  data-label-auto="{{t .Locale "studio.short_auto"}}"
+                  data-label-system="{{t .Locale "studio.short_system"}}"
+                  data-label-light="{{t .Locale "studio.short_light"}}"
+                  data-label-dark="{{t .Locale "studio.short_dark"}}"
+                  title="{{t .Locale "appearance.auto"}}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 3v2m0 14v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M3 12h2m14 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+            <span id="volo-theme-label">{{t .Locale "studio.short_auto"}}</span>
+          </button>
+          <div id="volo-theme-menu" class="volo-popover volo-appearance__menu" role="menu" hidden>
+            <button type="button" class="volo-appearance__item" data-volo-mode="auto" role="menuitemradio"><span>{{t .Locale "appearance.auto"}}</span><span class="volo-menu-check">✓</span></button>
+            <button type="button" class="volo-appearance__item" data-volo-mode="system" role="menuitemradio"><span>{{t .Locale "appearance.system"}}</span><span class="volo-menu-check">✓</span></button>
+            <button type="button" class="volo-appearance__item" data-volo-mode="light" role="menuitemradio"><span>{{t .Locale "appearance.light"}}</span><span class="volo-menu-check">✓</span></button>
+            <button type="button" class="volo-appearance__item" data-volo-mode="dark" role="menuitemradio"><span>{{t .Locale "appearance.dark"}}</span><span class="volo-menu-check">✓</span></button>
+          </div>
+        </div>
+
+        {{if and .Site.AllowLocaleSwitch (gt (len .Locales) 1)}}
+          {{$curLocaleName := .Locale}}
+          {{range .Locales}}{{if eq .Code $.Locale}}{{$curLocaleName = .Name}}{{end}}{{end}}
+          <div class="volo-lang-pop">
+            <button type="button" id="volo-lang-btn" class="studio-icon-btn" aria-haspopup="menu" aria-expanded="false" title="{{t .Locale "appearance.switch_lang"}}">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg>
+              <span class="volo-lang-btn__text">{{$curLocaleName}}</span>
+            </button>
+            <div id="volo-lang-menu" class="volo-popover volo-appearance__menu volo-lang-menu" role="menu" hidden>
+              {{range .Locales}}
+                <button type="button" class="volo-appearance__item {{if eq .Code $.Locale}}is-selected{{end}}" data-set-lang="{{.Code}}" role="menuitem">
+                  <span>{{.Name}}</span>
+                  <span class="volo-lang-meta">{{if eq .Code $.Locale}}✓{{else}}{{.Code}}{{end}}</span>
+                </button>
+              {{end}}
+            </div>
+          </div>
+        {{end}}
+
         {{if .Viewer}}
           {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
-            <a class="studio-icon-btn" href="{{.AdminPath}}" data-no-pjax>{{t .Locale "nav.admin_console"}}</a>
+            <a class="studio-icon-btn studio-auth-btn" href="{{.AdminPath}}" data-no-pjax title="{{t .Locale "nav.admin_console"}}" aria-label="{{t .Locale "nav.admin_console"}}">
+              {{navIconHTML "admin"}}<span class="studio-auth-btn__label">{{t .Locale "nav.admin_console"}}</span>
+            </a>
+            <a class="studio-icon-btn studio-auth-btn" href="/logout" data-no-pjax title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+              {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
+            </a>
           {{else}}
-            <button type="button" id="volo-reader-logout" class="studio-icon-btn">{{t .Locale "nav.logout"}} ({{.Viewer.DisplayName}})</button>
+            <a id="volo-reader-logout" class="studio-icon-btn studio-auth-btn" href="/logout" data-no-pjax title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+              {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
+            </a>
           {{end}}
-        {{else if .Reading.AllowReaderRegister}}
-          <a class="studio-icon-btn" href="/reader/login">{{t .Locale "nav.login"}}</a>
+        {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
+          <a class="studio-icon-btn studio-auth-btn" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}}>
+            <span class="studio-auth-btn__label">{{t .Locale "nav.login"}}</span>
+          </a>
         {{end}}
       </div>
     </div>
@@ -120,11 +200,37 @@
     </div>
   </footer>
 
-  <div id="volo-search-modal" class="volo-modal" hidden data-empty="{{t .Locale "search.empty"}}">
-    <div class="volo-modal__panel" role="dialog" aria-modal="true">
-      <input id="volo-search-input" class="volo-search-input" type="search" placeholder="{{t .Locale "nav.search_placeholder"}}" autocomplete="off">
-      <div id="volo-search-results" class="volo-search-results"></div>
+  <div class="studio-fab-dock" aria-label="Quick actions">
+    <button id="volo-mobile-toc-btn" class="studio-fab-btn studio-fab-btn--toc" type="button" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" aria-expanded="false" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
+      <span class="studio-fab-btn__text">{{t .Locale "article.toc_title"}}</span>
+    </button>
+    <button id="studioBackToTop" class="studio-fab-btn studio-back-top" type="button" title="{{t .Locale "studio.back_to_top"}}" aria-label="{{t .Locale "studio.back_to_top"}}" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg>
+    </button>
+  </div>
+
+  <div id="volo-search-modal" class="volo-modal" hidden data-empty="{{t .Locale "search.empty"}}" data-all="{{t .Locale "search.all_filter"}}">
+    <div class="volo-modal__panel" role="dialog" aria-modal="true" aria-label="{{t .Locale "nav.search_placeholder"}}">
+      <div class="volo-search-head">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>
+        <input id="volo-search-input" class="volo-search-input" type="search" placeholder="{{t .Locale "nav.search_placeholder"}}" autocomplete="off">
+        <button type="button" class="volo-search-esc" data-search-close>ESC</button>
+      </div>
+      <div id="volo-search-filters" class="volo-search-filters" hidden>
+        {{range .SidebarCategories}}<button type="button" class="volo-filter-pill" data-seed-cat="{{.Name}}">📁 {{.Name}}</button>{{end}}
+        {{range .SidebarTags}}<button type="button" class="volo-filter-pill" data-seed-tag="{{.Name}}"># {{.Name}}</button>{{end}}
+      </div>
+      <div id="volo-search-results" class="volo-search-results" role="listbox"></div>
+      <div class="volo-search-foot">
+        <span>{{t .Locale "search.shortcut_hint"}}</span>
+        <span>Ctrl+K / /</span>
+      </div>
     </div>
+  </div>
+
+  <div id="volo-lightbox" class="volo-lightbox" hidden role="dialog" aria-modal="true">
+    <img id="volo-lightbox-img" class="volo-lightbox__img" alt="">
   </div>
 
   <div id="volo-persist-dock" data-volo-persist="plugins">

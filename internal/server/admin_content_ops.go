@@ -911,8 +911,8 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 	if len(visible) == 0 {
 		md.WriteString("_暂无勾选展示的公开仓库，请在管理台「开源作品展示」中同步并勾选需要展示的项目。_\n")
 	} else {
-		md.WriteString("| 项目 | 主要语言 | Stars / Forks | 简介 |\n")
-		md.WriteString("| :--- | :--- | :--- | :--- |\n")
+		md.WriteString("| 仓库 | 项目简介 | Stars | Forks | 编程语言 |\n")
+		md.WriteString("| :--- | :--- | ---: | ---: | :--- |\n")
 		for _, rp := range visible {
 			lang := strings.TrimSpace(rp.Language)
 			if lang == "" {
@@ -933,8 +933,8 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 			if repoURL == "" {
 				repoURL = "https://github.com/" + strings.TrimPrefix(rp.FullName, "/")
 			}
-			md.WriteString(fmt.Sprintf("| [**%s**](%s) | `%s` | ★ %d · ⑂ %d | %s |\n",
-				repoLabel, repoURL, lang, rp.Stars, rp.Forks, desc))
+			md.WriteString(fmt.Sprintf("| [**%s**](%s) | %s | %d | %d | %s |\n",
+				repoLabel, repoURL, desc, rp.Stars, rp.Forks, lang))
 		}
 	}
 

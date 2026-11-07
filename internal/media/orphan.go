@@ -136,11 +136,17 @@ func (p *Pipeline) collectAll9ReferenceScopes(ctx context.Context) ([]string, er
 	if err := appendQuery(`SELECT content_md, avatar_url FROM comments WHERE is_deleted = 0`); err != nil {
 		return nil, err
 	}
-	// Scope 9: settings + plugins
+	// Scope 9: settings + plugins + follows + nav_items
 	if err := appendQuery(`SELECT value_json FROM settings`); err != nil {
 		return nil, err
 	}
 	if err := appendQuery(`SELECT config_json FROM plugins`); err != nil {
+		return nil, err
+	}
+	if err := appendQuery(`SELECT icon_url, description FROM follows`); err != nil {
+		return nil, err
+	}
+	if err := appendQuery(`SELECT icon FROM nav_items`); err != nil {
 		return nil, err
 	}
 	return blobs, nil
