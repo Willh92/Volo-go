@@ -331,9 +331,13 @@ func TestUXAndAdminModalCRUDParity(t *testing.T) {
 	if err := os.WriteFile(orphanPath, tinyPNG, 0o640); err != nil {
 		t.Fatal(err)
 	}
+	recResp, recBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/media/reconcile", map[string]any{}, adminCookies, adminCSRF)
+	if recResp.StatusCode != http.StatusOK || !bytes.Contains(recBody, []byte(`"imported":1`)) {
+		t.Fatalf("POST /api/admin/media/reconcile failed: %d %s", recResp.StatusCode, string(recBody))
+	}
 	mediaResp, mediaBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/media", nil, adminCookies, nil)
 	if mediaResp.StatusCode != http.StatusOK || !bytes.Contains(mediaBody, []byte(`"dropped-orphan.png"`)) || !bytes.Contains(mediaBody, []byte(`"is_orphan":true`)) {
-		t.Fatalf("GET /api/admin/media failed to reconcile orphan upload: %d %s", mediaResp.StatusCode, string(mediaBody))
+		t.Fatalf("GET /api/admin/media failed after reconcile: %d %s", mediaResp.StatusCode, string(mediaBody))
 	}
 	cleanResp, cleanBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/media/orphans?delete=1", map[string]any{}, adminCookies, adminCSRF)
 	if cleanResp.StatusCode != http.StatusOK || !bytes.Contains(cleanBody, []byte(`"deleted_count":1`)) {

@@ -24,11 +24,21 @@ import (
 )
 
 const (
-	BackupFormatVersion    = "volo-backup-v1"
-	maxSingleEntryBytes    = 512 * 1024 * 1024  // 512 MiB per stream guard against zip bombs
-	maxTotalRestoreBytes   = 2048 * 1024 * 1024 // 2 GiB total unpacked cap
-	restoreBatchSize       = 200
+	BackupFormatVersion  = "volo-backup-v1"
+	maxRestoreZipEntries = 10000
+	maxSingleEntryBytes  = 512 * 1024 * 1024  // 512 MiB per stream guard against zip bombs
+	maxTotalRestoreBytes = 2048 * 1024 * 1024 // 2 GiB total unpacked cap
+	restoreBatchSize     = 200
 )
+
+func isBlockedRestoreUploadExt(p string) bool {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".svg", ".html", ".htm", ".xml", ".xhtml", ".js", ".mjs":
+		return true
+	default:
+		return false
+	}
+}
 
 // FileDigest records integrity & row metrics for a single stream inside manifest.json.
 type FileDigest struct {
@@ -360,11 +370,18 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		return nil, fmt.Errorf("backup: invalid zip archive: %w", err)
 	}
 
+	if len(zr.File) > maxRestoreZipEntries {
+		return nil, fmt.Errorf("backup: archive exceeds maximum %d entries", maxRestoreZipEntries)
+	}
+
 	fileIndex := make(map[string]*zip.File, len(zr.File))
 	for _, zf := range zr.File {
 		clean := path.Clean(strings.TrimPrefix(zf.Name, "/"))
 		if clean == ".." || strings.HasPrefix(clean, "../") {
 			return nil, fmt.Errorf("backup: path traversal entry %q rejected", zf.Name)
+		}
+		if !zf.FileInfo().IsDir() && !zf.Mode().IsRegular() {
+			return nil, fmt.Errorf("backup: non-regular entry %q rejected", zf.Name)
 		}
 		fileIndex[clean] = zf
 	}
@@ -385,6 +402,9 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 	var totalBytes int64
 	expectedMap := make(map[string]FileDigest, len(manifest.Files))
 	for _, fd := range manifest.Files {
+		if strings.HasPrefix(fd.Path, "uploads/") && isBlockedRestoreUploadExt(fd.Path) {
+			return nil, fmt.Errorf("backup: active script/markup media entry %q rejected", fd.Path)
+		}
 		zf, exists := fileIndex[fd.Path]
 		if !exists {
 			return nil, fmt.Errorf("backup: missing declared entry %q", fd.Path)

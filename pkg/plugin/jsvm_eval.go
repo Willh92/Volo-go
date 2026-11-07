@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +52,8 @@ var (
 type jsObject struct {
 	props   map[string]jsValue
 	isError bool
+	isDate  bool
+	epochMs float64
 }
 
 type jsArray struct {
@@ -72,6 +75,7 @@ type jsFunc struct {
 	body   []jsStmt
 	env    *jsScope
 	native jsNativeFn
+	props  map[string]jsValue
 }
 
 type jsScope struct {
@@ -220,8 +224,7 @@ func (o *jsObject) Set(key string, v any) {
 	if o.props == nil {
 		o.props = make(map[string]jsValue)
 	}
-	panicUnused := newJSRuntime()
-	o.props[key] = panicUnused.ToValue(v)
+	o.props[key] = goToJSValue(v)
 }
 
 func (o *jsObject) setVal(key string, v jsValue) {
@@ -855,6 +858,9 @@ func (rt *jsRuntime) evalExpr(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVal
 			}
 		}
 		if e.isNew && receiver.kind == valUndefined {
+			if calleeVal.kind != valFunc || calleeVal.fn == nil {
+				return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", calleeVal.toString()+" is not a constructor")}
+			}
 			newThis := jsValue{kind: valObject, obj: rt.NewObject()}
 			res, err := rt.callFunc(calleeVal.fn, newThis, argVals)
 			if err != nil {
@@ -1078,6 +1084,11 @@ func (v jsValue) toNumber() float64 {
 			return math.NaN()
 		}
 		return f
+	case valObject:
+		if v.obj != nil && v.obj.isDate {
+			return v.obj.epochMs
+		}
+		return math.NaN()
 	default:
 		return math.NaN()
 	}
@@ -1119,13 +1130,21 @@ func (v jsValue) toString() string {
 		}
 		return strings.Join(parts, ",")
 	case valObject:
-		if v.obj != nil && v.obj.isError {
-			name := v.obj.get("name").toString()
-			msg := v.obj.get("message").toString()
-			if msg != "" {
-				return name + ": " + msg
+		if v.obj != nil {
+			if v.obj.isError {
+				name := v.obj.get("name").toString()
+				msg := v.obj.get("message").toString()
+				if msg != "" {
+					return name + ": " + msg
+				}
+				return name
 			}
-			return name
+			if v.obj.isDate {
+				if math.IsNaN(v.obj.epochMs) || math.IsInf(v.obj.epochMs, 0) {
+					return "Invalid Date"
+				}
+				return time.UnixMilli(int64(v.obj.epochMs)).UTC().Format(time.RFC1123)
+			}
 		}
 		return "[object Object]"
 	default:
@@ -1197,6 +1216,12 @@ func (rt *jsRuntime) getProperty(target jsValue, prop string) jsValue {
 				})
 			}
 			return target.obj.get(prop)
+		}
+	case valFunc:
+		if target.fn != nil && target.fn.props != nil {
+			if v, ok := target.fn.props[prop]; ok {
+				return v
+			}
 		}
 	case valString:
 		return stringProperty(target.str, prop)
@@ -1787,16 +1812,252 @@ func (rt *jsRuntime) installBuiltins() {
 	}))
 	rt.global.define("Object", jsValue{kind: valObject, obj: objCtor}, false)
 
-	dateObj := rt.NewObject()
-	dateObj.setVal("now", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		return jsValue{kind: valNumber, num: float64(time.Now().UnixMilli())}, nil
+	// Web-standard Base64 helpers (btoa / atob)
+	rt.global.define("btoa", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		var s string
+		if len(args) > 0 {
+			s = args[0].toString()
+		}
+		buf := make([]byte, 0, len(s))
+		for _, rn := range s {
+			if rn > 255 {
+				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("InvalidCharacterError", "btoa input contains characters outside Latin1 range")}
+			}
+			buf = append(buf, byte(rn))
+		}
+		return jsValue{kind: valString, str: base64.StdEncoding.EncodeToString(buf)}, nil
+	}), false)
+
+	rt.global.define("atob", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		var s string
+		if len(args) > 0 {
+			s = args[0].toString()
+		}
+		var clean strings.Builder
+		clean.Grow(len(s))
+		for i := 0; i < len(s); i++ {
+			switch s[i] {
+			case ' ', '\t', '\n', '\r', '\f':
+				continue
+			default:
+				clean.WriteByte(s[i])
+			}
+		}
+		encoded := clean.String()
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(encoded, "="))
+			if err != nil {
+				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("InvalidCharacterError", "atob input is not valid base64")}
+			}
+		}
+		runes := make([]rune, len(decoded))
+		for i, b := range decoded {
+			runes[i] = rune(b)
+		}
+		return jsValue{kind: valString, str: string(runes)}, nil
+	}), false)
+
+	// Constructible Date (`new Date()`, `new Date(ms)`, `new Date(isoStr)`, `Date()`, `Date.now()`, `Date.parse()`)
+	dateCtor := &jsFunc{
+		name: "Date",
+		native: func(r *jsRuntime, thisVal jsValue, args []jsValue) (jsValue, error) {
+			if thisVal.kind == valUndefined {
+				return jsValue{kind: valString, str: time.Now().UTC().Format(time.RFC1123)}, nil
+			}
+			ms := parseJSDateArgs(args)
+			return newJSDateVal(r, ms), nil
+		},
+		props: map[string]jsValue{
+			"now": nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+				return jsValue{kind: valNumber, num: float64(time.Now().UnixMilli())}, nil
+			}),
+			"parse": nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+				if len(args) == 0 {
+					return jsValue{kind: valNumber, num: math.NaN()}, nil
+				}
+				return jsValue{kind: valNumber, num: parseJSDateString(args[0].toString())}, nil
+			}),
+		},
+	}
+	rt.global.define("Date", jsValue{kind: valFunc, fn: dateCtor}, false)
+}
+
+func parseJSDateArgs(args []jsValue) float64 {
+	if len(args) == 0 {
+		return float64(time.Now().UnixMilli())
+	}
+	if len(args) == 1 {
+		a := args[0]
+		if a.kind == valObject && a.obj != nil && a.obj.isDate {
+			return a.obj.epochMs
+		}
+		if a.kind == valString {
+			return parseJSDateString(a.str)
+		}
+		n := a.toNumber()
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return math.NaN()
+		}
+		return math.Trunc(n)
+	}
+	year := int(args[0].toNumber())
+	if year >= 0 && year <= 99 {
+		year += 1900
+	}
+	month := int(args[1].toNumber()) + 1
+	day := 1
+	if len(args) > 2 {
+		day = int(args[2].toNumber())
+	}
+	var hour, min, sec, msec int
+	if len(args) > 3 {
+		hour = int(args[3].toNumber())
+	}
+	if len(args) > 4 {
+		min = int(args[4].toNumber())
+	}
+	if len(args) > 5 {
+		sec = int(args[5].toNumber())
+	}
+	if len(args) > 6 {
+		msec = int(args[6].toNumber())
+	}
+	t := time.Date(year, time.Month(month), day, hour, min, sec, msec*int(time.Millisecond), time.UTC)
+	return float64(t.UnixMilli())
+}
+
+func parseJSDateString(raw string) float64 {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return math.NaN()
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC822Z,
+		time.RFC822,
+		time.ANSIC,
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return float64(t.UnixMilli())
+		}
+	}
+	return math.NaN()
+}
+
+func newJSDateVal(rt *jsRuntime, epochMs float64) jsValue {
+	d := &jsObject{
+		isDate:  true,
+		epochMs: epochMs,
+		props:   make(map[string]jsValue, 14),
+	}
+	validTime := func() (time.Time, bool) {
+		if math.IsNaN(d.epochMs) || math.IsInf(d.epochMs, 0) {
+			return time.Time{}, false
+		}
+		return time.UnixMilli(int64(d.epochMs)).UTC(), true
+	}
+	isoFn := nativeVal(func(r *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid time value")}
+		}
+		return jsValue{kind: valString, str: t.Format("2006-01-02T15:04:05.000Z")}, nil
+	})
+	d.setVal("toISOString", isoFn)
+	d.setVal("toJSON", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsNullVal, nil
+		}
+		return jsValue{kind: valString, str: t.Format("2006-01-02T15:04:05.000Z")}, nil
 	}))
-	rt.global.define("Date", jsValue{kind: valObject, obj: dateObj}, false)
+	timeFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		return jsValue{kind: valNumber, num: d.epochMs}, nil
+	})
+	d.setVal("getTime", timeFn)
+	d.setVal("valueOf", timeFn)
+	utcStrFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsValue{kind: valString, str: "Invalid Date"}, nil
+		}
+		return jsValue{kind: valString, str: t.Format(time.RFC1123)}, nil
+	})
+	d.setVal("toUTCString", utcStrFn)
+	d.setVal("toString", utcStrFn)
+	yearFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsValue{kind: valNumber, num: math.NaN()}, nil
+		}
+		return jsValue{kind: valNumber, num: float64(t.Year())}, nil
+	})
+	d.setVal("getFullYear", yearFn)
+	d.setVal("getUTCFullYear", yearFn)
+	monthFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsValue{kind: valNumber, num: math.NaN()}, nil
+		}
+		return jsValue{kind: valNumber, num: float64(t.Month() - 1)}, nil
+	})
+	d.setVal("getMonth", monthFn)
+	d.setVal("getUTCMonth", monthFn)
+	dayFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsValue{kind: valNumber, num: math.NaN()}, nil
+		}
+		return jsValue{kind: valNumber, num: float64(t.Day())}, nil
+	})
+	d.setVal("getDate", dayFn)
+	d.setVal("getUTCDate", dayFn)
+	hourFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsValue{kind: valNumber, num: math.NaN()}, nil
+		}
+		return jsValue{kind: valNumber, num: float64(t.Hour())}, nil
+	})
+	d.setVal("getHours", hourFn)
+	d.setVal("getUTCHours", hourFn)
+	minFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsValue{kind: valNumber, num: math.NaN()}, nil
+		}
+		return jsValue{kind: valNumber, num: float64(t.Minute())}, nil
+	})
+	d.setVal("getMinutes", minFn)
+	d.setVal("getUTCMinutes", minFn)
+	secFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+		t, ok := validTime()
+		if !ok {
+			return jsValue{kind: valNumber, num: math.NaN()}, nil
+		}
+		return jsValue{kind: valNumber, num: float64(t.Second())}, nil
+	})
+	d.setVal("getSeconds", secFn)
+	d.setVal("getUTCSeconds", secFn)
+	_ = rt
+	return jsValue{kind: valObject, obj: d}
 }
 
 // --- Go <-> JS Marshaling (`json` struct tag aware) ---
 
 func (rt *jsRuntime) ToValue(v any) jsValue {
+	return goToJSValue(v)
+}
+
+func goToJSValue(v any) jsValue {
 	if v == nil {
 		return jsNullVal
 	}
@@ -1821,13 +2082,13 @@ func (rt *jsRuntime) ToValue(v any) jsValue {
 	case string:
 		return jsValue{kind: valString, str: x}
 	case map[string]any:
-		o := rt.NewObject()
+		o := &jsObject{props: make(map[string]jsValue, len(x))}
 		for k, val := range x {
-			o.setVal(k, rt.ToValue(val))
+			o.setVal(k, goToJSValue(val))
 		}
 		return jsValue{kind: valObject, obj: o}
 	case map[string]string:
-		o := rt.NewObject()
+		o := &jsObject{props: make(map[string]jsValue, len(x))}
 		for k, val := range x {
 			o.setVal(k, jsValue{kind: valString, str: val})
 		}
@@ -1844,7 +2105,7 @@ func (rt *jsRuntime) ToValue(v any) jsValue {
 
 	switch rv.Kind() {
 	case reflect.Struct:
-		o := rt.NewObject()
+		o := &jsObject{props: make(map[string]jsValue, rv.NumField())}
 		rtStruct := rv.Type()
 		for i := 0; i < rv.NumField(); i++ {
 			sf := rtStruct.Field(i)
@@ -1861,24 +2122,24 @@ func (rt *jsRuntime) ToValue(v any) jsValue {
 					key = namePart
 				}
 			}
-			o.setVal(key, rt.ToValue(rv.Field(i).Interface()))
+			o.setVal(key, goToJSValue(rv.Field(i).Interface()))
 		}
 		return jsValue{kind: valObject, obj: o}
 	case reflect.Slice, reflect.Array:
 		items := make([]jsValue, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
-			items[i] = rt.ToValue(rv.Index(i).Interface())
+			items[i] = goToJSValue(rv.Index(i).Interface())
 		}
 		return jsValue{kind: valArray, arr: &jsArray{items: items}}
 	case reflect.Map:
-		o := rt.NewObject()
+		o := &jsObject{props: make(map[string]jsValue, rv.Len())}
 		iter := rv.MapRange()
 		for iter.Next() {
-			o.setVal(fmt.Sprint(iter.Key().Interface()), rt.ToValue(iter.Value().Interface()))
+			o.setVal(fmt.Sprint(iter.Key().Interface()), goToJSValue(iter.Value().Interface()))
 		}
 		return jsValue{kind: valObject, obj: o}
 	case reflect.Func:
-		return rt.wrapGoFunc(rv)
+		return wrapGoFuncVal(rv)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return jsValue{kind: valNumber, num: float64(rv.Int())}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
@@ -1894,6 +2155,10 @@ func (rt *jsRuntime) ToValue(v any) jsValue {
 }
 
 func (rt *jsRuntime) wrapGoFunc(fnVal reflect.Value) jsValue {
+	return wrapGoFuncVal(fnVal)
+}
+
+func wrapGoFuncVal(fnVal reflect.Value) jsValue {
 	fnType := fnVal.Type()
 	return nativeVal(func(callRT *jsRuntime, _ jsValue, args []jsValue) (ret jsValue, retErr error) {
 		defer func() {
@@ -1924,7 +2189,7 @@ func (rt *jsRuntime) wrapGoFunc(fnVal reflect.Value) jsValue {
 				return jsUndefinedVal, &jsThrownError{val: callRT.newErrorVal("Error", errVal.Error())}
 			}
 		}
-		return callRT.ToValue(outs[0].Interface()), nil
+		return goToJSValue(outs[0].Interface()), nil
 	})
 }
 
@@ -1984,6 +2249,12 @@ func (v jsValue) Export() any {
 	case valObject:
 		if v.obj == nil {
 			return map[string]any{}
+		}
+		if v.obj.isDate {
+			if math.IsNaN(v.obj.epochMs) || math.IsInf(v.obj.epochMs, 0) {
+				return nil
+			}
+			return time.UnixMilli(int64(v.obj.epochMs)).UTC().Format("2006-01-02T15:04:05.000Z")
 		}
 		out := make(map[string]any, len(v.obj.props))
 		for k, pv := range v.obj.props {

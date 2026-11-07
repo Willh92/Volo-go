@@ -244,14 +244,27 @@ func (rt *ssrfValidatingRoundTripper) RoundTrip(req *http.Request) (*http.Respon
 	}
 	// Even if an outbound HTTP_PROXY environment variable is active, pre-check literal/resolvable host safety!
 	host := u.Hostname()
-	if _, lErr := netip.ParseAddr(host); lErr != nil && rt.dialer.Resolver != nil {
-		ips, rErr := rt.dialer.Resolver(req.Context(), host)
-		if rErr != nil {
-			return nil, fmt.Errorf("security: dns lookup %q: %w", host, rErr)
+	if _, lErr := netip.ParseAddr(host); lErr != nil {
+		resolve := rt.dialer.Resolver
+		if resolve == nil {
+			if proxyURL, pErr := http.ProxyFromEnvironment(req); pErr == nil && proxyURL == nil {
+				resolve = func(ctx context.Context, h string) ([]netip.Addr, error) {
+					return net.DefaultResolver.LookupNetIP(ctx, "ip", h)
+				}
+			}
 		}
-		for _, ip := range ips {
-			if !(rt.dialer.AllowLoopbackForTests && ip.Unmap().IsLoopback()) && !IsPublicRoutableIP(ip) {
-				return nil, fmt.Errorf("%w: resolved address %s for %q is non-public", ErrSSRFBlocked, ip.String(), host)
+		if resolve != nil {
+			ips, rErr := resolve(req.Context(), host)
+			if rErr != nil {
+				return nil, fmt.Errorf("security: dns lookup %q: %w", host, rErr)
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("%w: %q resolved to zero addresses", ErrSSRFBlocked, host)
+			}
+			for _, ip := range ips {
+				if !(rt.dialer.AllowLoopbackForTests && ip.Unmap().IsLoopback()) && !IsPublicRoutableIP(ip) {
+					return nil, fmt.Errorf("%w: resolved address %s for %q is non-public", ErrSSRFBlocked, ip.String(), host)
+				}
 			}
 		}
 	}

@@ -11,20 +11,22 @@ export interface LocaleOption {
 // Auto-discover all built-in per-language JSON catalogs in `./locales/*.json` at build time.
 // Adding a new built-in language (e.g. `src/locales/zh-TW.json` or `src/locales/ja-JP.json`)
 // requires zero changes to TypeScript code.
-const bundledModules = import.meta.glob<Record<string, string>>("./locales/*.json", {
-  eager: true,
-  import: "default",
-});
+import { codes as bundledCodes, columns as bundledCols, keys as bundledKeys } from "virtual:volo-locales";
 
 const bundledCatalogs: Record<string, Record<string, string>> = {};
 const catalogs: Record<string, Record<string, string>> = {};
 const initialLocales: LocaleOption[] = [];
 
-for (const [filePath, table] of Object.entries(bundledModules)) {
-  const fileBase = filePath.split("/").pop()?.replace(/\.json$/i, "") || "";
-  const code = canonicalizeLocaleTag(table["meta.code"] || fileBase);
+for (let ci = 0; ci < bundledCodes.length; ci++) {
+  const col = bundledCols[ci];
+  const table: Record<string, string> = {};
+  for (let ki = 0; ki < bundledKeys.length; ki++) {
+    const val = col[ki];
+    if (val) table[bundledKeys[ki]] = val;
+  }
+  const code = canonicalizeLocaleTag(table["meta.code"] || bundledCodes[ci]);
   if (!code) continue;
-  bundledCatalogs[code] = { ...table };
+  bundledCatalogs[code] = table;
   catalogs[code] = { ...table };
   initialLocales.push({
     code,

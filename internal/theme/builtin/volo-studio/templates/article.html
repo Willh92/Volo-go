@@ -1,7 +1,9 @@
 {{define "content"}}
 <div class="studio-layout studio-layout--article">
   <div class="studio-article-col">
-    <article class="studio-article">
+    <article class="studio-article"
+             data-needs-math="{{if and (not .Detail.RequiresPassword) .Detail.NeedsMath}}1{{end}}"
+             data-needs-mermaid="{{if and (not .Detail.RequiresPassword) .Detail.NeedsMermaid}}1{{end}}">
       {{if .Detail.UnlockedViaShare}}
         <div class="volo-banner volo-banner--warn">{{t .Locale "article.preview_banner"}}</div>
       {{end}}
@@ -68,18 +70,22 @@
         {{end}}
 
         {{if .Detail.AudioURL}}
-          <div class="volo-podcast-box">
-            <div class="volo-podcast-box__head">
+          <div class="volo-podcast-box volo-podcast-card">
+            <div class="volo-podcast-box__head volo-podcast-card__head">
               <span class="volo-badge">🎙 {{t .Locale "podcast.badge"}}</span>
               <button type="button" id="volo-podcast-speed" class="studio-icon-btn volo-podcast-speed">1x</button>
             </div>
-            <audio id="volo-podcast-audio" controls preload="metadata" src="{{.Detail.AudioURL}}"></audio>
+            <audio id="volo-podcast-audio" class="volo-podcast-card__player" controls preload="metadata" src="{{.Detail.AudioURL}}"></audio>
           </div>
         {{end}}
+
+        {{range .ArticleBeforeWidgets}}{{safeHTML .HTML}}{{end}}
 
         <div class="volo-prose">
           {{safeHTML .Detail.HTML}}
         </div>
+
+        {{range .ArticleAfterWidgets}}{{safeHTML .HTML}}{{end}}
 
         {{if .Detail.HasLockedSections}}
           <div class="volo-lock-card">
@@ -101,10 +107,41 @@
         {{end}}
 
         {{if .Detail.LicenseText}}
-          <div class="volo-banner volo-license-banner">
+          <div class="volo-banner volo-license-banner volo-license-box">
             {{.Detail.LicenseText}}
           </div>
         {{end}}
+
+        <div class="volo-share-bar" aria-label="{{t .Locale "article.share_label"}}">
+          <span class="volo-share-bar__label">{{t .Locale "article.share_label"}}</span>
+          <div class="volo-share-bar__actions">
+            <button type="button" class="studio-icon-btn volo-share-btn"
+                    data-share-act="copy-link"
+                    data-share-url="{{.CanonicalURL}}"
+                    data-label-default="{{t .Locale "article.copy_link"}}"
+                    data-label-done="{{t .Locale "article.copied_link"}}">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+              <span class="js-share-label">{{t .Locale "article.copy_link"}}</span>
+            </button>
+            <button type="button" class="studio-icon-btn volo-share-btn"
+                    data-share-act="copy-md"
+                    data-share-title="{{.Detail.Title}}"
+                    data-share-url="{{.CanonicalURL}}"
+                    data-label-default="{{t .Locale "article.copy_markdown"}}"
+                    data-label-done="{{t .Locale "article.copied_markdown"}}">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M7 15V9l2.5 3L12 9v6m5-6v6m-2-2 2 2 2-2"/></svg>
+              <span class="js-share-label">{{t .Locale "article.copy_markdown"}}</span>
+            </button>
+            <button type="button" class="studio-icon-btn volo-share-btn"
+                    data-share-act="native"
+                    data-share-title="{{.Detail.Title}}"
+                    data-share-url="{{.CanonicalURL}}"
+                    hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="m16 6-4-4-4 4M12 2v13"/></svg>
+              <span>{{t .Locale "article.native_share"}}</span>
+            </button>
+          </div>
+        </div>
 
         <div class="volo-reactions">
           <button type="button" class="volo-reaction-btn" data-target-type="article" data-target-id="{{.Detail.ID}}" data-kind="like">👍 <span class="js-rcnt">{{index .Reactions "like"}}</span></button>
@@ -114,15 +151,15 @@
         </div>
 
         {{if or .PrevPost .NextPost}}
-          <div class="volo-neighbors">
+          <div class="volo-neighbors studio-neighbors">
             {{if .PrevPost}}
-              <a class="volo-neighbor-card" href="{{.PrevPost.URL}}">
+              <a class="volo-neighbor-card studio-neighbor" href="{{.PrevPost.URL}}">
                 <div class="volo-neighbor-card__dir">← {{t .Locale "article.prev_post"}}</div>
                 <strong>{{.PrevPost.Title}}</strong>
               </a>
             {{end}}
             {{if .NextPost}}
-              <a class="volo-neighbor-card" href="{{.NextPost.URL}}">
+              <a class="volo-neighbor-card studio-neighbor" href="{{.NextPost.URL}}">
                 <div class="volo-neighbor-card__dir">{{t .Locale "article.next_post"}} →</div>
                 <strong>{{.NextPost.Title}}</strong>
               </a>
@@ -176,7 +213,7 @@
           </div>
           <div id="volo-toc-body" class="volo-toc-body">
             <div class="volo-toc-body__inner">
-              <nav class="volo-toc-nav" aria-label="{{t .Locale "article.toc_title"}}">
+              <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
                 {{range .Detail.TOC}}
                   <a class="volo-toc-link" data-toc-id="{{.ID}}" href="#{{.ID}}" style="padding-left:{{add 10 (mul (sub .Level 1) 12)}}px">{{.Text}}</a>
                 {{end}}
@@ -195,9 +232,9 @@
     <div class="volo-toc-drawer__panel" role="dialog" aria-modal="true" aria-label="{{t .Locale "article.toc_title"}}">
       <div class="volo-toc-drawer__head">
         <strong>{{t .Locale "article.toc_title"}}</strong>
-        <button type="button" class="studio-icon-btn studio-icon-btn--square" data-toc-close aria-label="Close">✕</button>
+        <button type="button" class="studio-icon-btn studio-icon-btn--square" data-toc-close aria-label="{{t .Locale "studio.close"}}">✕</button>
       </div>
-      <nav class="volo-toc-nav" aria-label="{{t .Locale "article.toc_title"}}">
+      <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
         {{range .Detail.TOC}}
           <a class="volo-toc-link" data-toc-id="{{.ID}}" href="#{{.ID}}" style="padding-left:{{add 12 (mul (sub .Level 1) 12)}}px">{{.Text}}</a>
         {{end}}

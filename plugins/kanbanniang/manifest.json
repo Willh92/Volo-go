@@ -48,10 +48,10 @@
     {
       "key": "position",
       "type": "select",
-      "default": "right",
+      "default": "left",
       "options": [
-        { "value": "right", "label": { "zh-CN": "右下角", "en-US": "Bottom Right" } },
-        { "value": "left", "label": { "zh-CN": "左下角", "en-US": "Bottom Left" } }
+        { "value": "left", "label": { "zh-CN": "左下角", "en-US": "Bottom Left" } },
+        { "value": "right", "label": { "zh-CN": "右下角", "en-US": "Bottom Right" } }
       ],
       "label": { "zh-CN": "停靠位置", "en-US": "Dock Position" }
     },

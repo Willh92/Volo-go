@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/Willh92/Volo-go/internal/auth"
 	"github.com/Willh92/Volo-go/internal/config"
@@ -16,11 +15,28 @@ import (
 
 const minDynamicGzipBytes = 1024
 
-var dynamicGzipPool = sync.Pool{
-	New: func() any {
-		zw, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+var dynamicGzipChan = make(chan *gzip.Writer, 1)
+
+func acquireDynamicGzipWriter(w io.Writer) *gzip.Writer {
+	select {
+	case zw := <-dynamicGzipChan:
+		zw.Reset(w)
 		return zw
-	},
+	default:
+		zw, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		return zw
+	}
+}
+
+func releaseDynamicGzipWriter(zw *gzip.Writer) {
+	if zw == nil {
+		return
+	}
+	zw.Reset(io.Discard)
+	select {
+	case dynamicGzipChan <- zw:
+	default:
+	}
 }
 
 // serveCachedDocument serves a revision-coherent cached XML/Markdown document with
@@ -186,11 +202,13 @@ func eligibleForPublicDynamicGzip(r *http.Request, adminPath string) bool {
 		return false
 	}
 	if strings.HasPrefix(p, "/uploads/") ||
+		strings.HasPrefix(p, "/images/") ||
 		strings.HasPrefix(p, "/themes/") ||
 		strings.HasPrefix(p, "/avatars/") ||
 		strings.HasPrefix(p, "/plugins/") ||
 		strings.HasPrefix(p, "/api/admin") ||
 		strings.HasPrefix(p, "/setup") ||
+		strings.HasPrefix(p, "/api/v1/i18n") ||
 		strings.HasPrefix(p, "/api/v1/pow/") ||
 		strings.HasPrefix(p, "/api/v1/guest/") ||
 		strings.HasPrefix(p, "/api/v1/reader/") ||
@@ -268,9 +286,7 @@ func (g *dynamicGzipResponseWriter) decide(totalPending int) {
 	h.Set("Content-Encoding", "gzip")
 	g.ResponseWriter.WriteHeader(g.statusCode)
 
-	zw := dynamicGzipPool.Get().(*gzip.Writer)
-	zw.Reset(g.ResponseWriter)
-	g.gz = zw
+	g.gz = acquireDynamicGzipWriter(g.ResponseWriter)
 	if len(g.buf) > 0 {
 		_, _ = g.gz.Write(g.buf)
 		g.buf = nil
@@ -309,8 +325,7 @@ func (g *dynamicGzipResponseWriter) finish() {
 	}
 	if g.gz != nil {
 		_ = g.gz.Close()
-		g.gz.Reset(io.Discard)
-		dynamicGzipPool.Put(g.gz)
+		releaseDynamicGzipWriter(g.gz)
 		g.gz = nil
 	}
 }

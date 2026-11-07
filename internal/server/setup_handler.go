@@ -5,20 +5,457 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/adminui"
 	"github.com/Willh92/Volo-go/internal/auth"
+	"github.com/Willh92/Volo-go/internal/config"
+	"github.com/Willh92/Volo-go/internal/db/migrate"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/etl"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
+
+// isSameOriginRequest enforces browser Same-Origin verification on unauthenticated / public / setup
+// state-changing endpoints while allowing non-browser CLI/API clients that omit Origin/Referer/Sec-Fetch-Site.
+func (s *AppServer) isSameOriginRequest(r *http.Request) bool {
+	sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	if sfs == "cross-site" {
+		return false
+	}
+	reqHost := strings.ToLower(strings.TrimSpace(r.Host))
+	pubHost := ""
+	if s.deps.Config != nil && strings.TrimSpace(s.deps.Config.PublicURL) != "" {
+		if u, err := url.Parse(strings.TrimSpace(s.deps.Config.PublicURL)); err == nil {
+			pubHost = strings.ToLower(strings.TrimSpace(u.Host))
+		}
+	}
+	matchesHost := func(raw string) bool {
+		if strings.EqualFold(raw, "null") {
+			return false
+		}
+		u, err := url.Parse(raw)
+		if err != nil || strings.TrimSpace(u.Host) == "" {
+			return false
+		}
+		h := strings.ToLower(strings.TrimSpace(u.Host))
+		return (reqHost != "" && h == reqHost) || (pubHost != "" && h == pubHost)
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		return matchesHost(origin)
+	}
+	if ref := strings.TrimSpace(r.Header.Get("Referer")); ref != "" {
+		return matchesHost(ref)
+	}
+	return true
+}
+
+func (s *AppServer) requireSameOrigin(w http.ResponseWriter, r *http.Request) bool {
+	if !s.isSameOriginRequest(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request blocked"})
+		return false
+	}
+	return true
+}
+
+var blockedSetupDBPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
+
+func isForbiddenSetupDBPort(port int) bool {
+	if port <= 0 || port > 65535 || port < 1024 {
+		return true
+	}
+	switch port {
+	case 2375, 2376, 2379, 6379, 8500, 9200, 10250, 11211:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateSetupDBEndpoint(ctx context.Context, host string, port int) error {
+	clean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(strings.Trim(host, "[]")), "."))
+	if clean == "" || clean == "metadata" || strings.HasSuffix(clean, ".internal") {
+		return fmt.Errorf("forbidden database hostname %q", host)
+	}
+	if isForbiddenSetupDBPort(port) {
+		return fmt.Errorf("forbidden database port %d", port)
+	}
+	checkIP := func(ip netip.Addr) error {
+		u := ip.Unmap()
+		if !u.IsValid() || u.IsUnspecified() || u.IsLinkLocalUnicast() || u.IsLinkLocalMulticast() || u.IsMulticast() {
+			return fmt.Errorf("forbidden database target address %s", u.String())
+		}
+		for _, pfx := range blockedSetupDBPrefixes {
+			if pfx.Contains(u) {
+				return fmt.Errorf("forbidden database target address %s", u.String())
+			}
+		}
+		return nil
+	}
+	if ip, err := netip.ParseAddr(clean); err == nil {
+		return checkIP(ip)
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", clean)
+	if err != nil || len(addrs) == 0 {
+		return fmt.Errorf("cannot resolve database host %q", host)
+	}
+	for _, ip := range addrs {
+		if err := checkIP(ip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func extractSetupSQLTargets(driver, dsn string) ([]struct {
+	host string
+	port int
+}, error) {
+	lower := strings.ToLower(dsn)
+	for _, bad := range []string{
+		"allowallfiles", "allowurlinlocalinfile", "allowlocalinfile", "infile",
+		"unix(", "host=/", "passfile=", "service=", "sslrootcert=", "sslcert=", "sslkey=",
+	} {
+		if strings.Contains(lower, bad) {
+			return nil, fmt.Errorf("forbidden database DSN parameter %q", strings.Trim(bad, "=(/"))
+		}
+	}
+
+	var out []struct {
+		host string
+		port int
+	}
+	addHostPort := func(raw string, defaultPort int) error {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return fmt.Errorf("missing database host")
+		}
+		h := raw
+		p := defaultPort
+		if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+			h = strings.Trim(raw, "[]")
+		} else if sh, sp, err := net.SplitHostPort(raw); err == nil {
+			h = sh
+			parsedPort, pErr := strconv.Atoi(sp)
+			if pErr != nil {
+				return fmt.Errorf("invalid database port %q", sp)
+			}
+			p = parsedPort
+		} else if strings.Count(raw, ":") == 1 {
+			return fmt.Errorf("invalid database host:port %q", raw)
+		}
+		if strings.HasPrefix(h, "/") {
+			return fmt.Errorf("unix socket database paths are not permitted")
+		}
+		out = append(out, struct {
+			host string
+			port int
+		}{host: h, port: p})
+		return nil
+	}
+
+	switch driver {
+	case "postgres":
+		if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
+			u, err := url.Parse(dsn)
+			if err != nil {
+				return nil, fmt.Errorf("invalid postgres URL")
+			}
+			if qh := strings.TrimSpace(u.Query().Get("host")); qh != "" {
+				if strings.HasPrefix(qh, "/") {
+					return nil, fmt.Errorf("unix socket database paths are not permitted")
+				}
+				for _, item := range strings.Split(qh, ",") {
+					if err := addHostPort(item, 5432); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if strings.TrimSpace(u.Host) != "" {
+				for _, item := range strings.Split(u.Host, ",") {
+					if err := addHostPort(item, 5432); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if len(out) == 0 {
+				return nil, fmt.Errorf("missing postgres host")
+			}
+			return out, nil
+		}
+		hostVal := ""
+		portVal := 5432
+		for _, tok := range strings.Fields(dsn) {
+			kv := strings.SplitN(tok, "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			k := strings.ToLower(strings.TrimSpace(kv[0]))
+			v := strings.Trim(strings.TrimSpace(kv[1]), `"'`)
+			switch k {
+			case "host", "hostaddr":
+				hostVal = v
+			case "port":
+				if p, err := strconv.Atoi(v); err == nil {
+					portVal = p
+				} else {
+					return nil, fmt.Errorf("invalid postgres port %q", v)
+				}
+			}
+		}
+		if hostVal == "" {
+			return nil, fmt.Errorf("missing postgres host")
+		}
+		for _, h := range strings.Split(hostVal, ",") {
+			h = strings.TrimSpace(h)
+			if strings.HasPrefix(h, "/") {
+				return nil, fmt.Errorf("unix socket database paths are not permitted")
+			}
+			out = append(out, struct {
+				host string
+				port int
+			}{host: h, port: portVal})
+		}
+		return out, nil
+
+	case "mysql":
+		rest := dsn
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			rest = rest[at+1:]
+		}
+		slash := strings.IndexByte(rest, '/')
+		if slash < 0 {
+			return nil, fmt.Errorf("invalid mysql DSN: missing '/dbname'")
+		}
+		netPart := strings.TrimSpace(rest[:slash])
+		if netPart == "" {
+			if err := addHostPort("127.0.0.1:3306", 3306); err != nil {
+				return nil, err
+			}
+			return out, nil
+		}
+		if !strings.HasPrefix(strings.ToLower(netPart), "tcp(") || !strings.HasSuffix(netPart, ")") {
+			return nil, fmt.Errorf("mysql DSN must use tcp(host:port)")
+		}
+		addr := netPart[4 : len(netPart)-1]
+		if err := addHostPort(addr, 3306); err != nil {
+			return nil, err
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported database driver %q", driver)
+	}
+}
+
+func (s *AppServer) validateAndNormalizeSetupDB(ctx context.Context, rawDriver, rawDSN string) (string, string, error) {
+	driver := strings.ToLower(strings.TrimSpace(rawDriver))
+	switch driver {
+	case "", "sqlite", "sqlite3":
+		driver = "sqlite"
+	case "postgres", "postgresql", "pgx":
+		driver = "postgres"
+	case "mysql", "mariadb":
+		driver = "mysql"
+	default:
+		return "", "", fmt.Errorf("unsupported database driver %q", rawDriver)
+	}
+
+	dsn := strings.TrimSpace(rawDSN)
+	if strings.ContainsRune(dsn, 0) {
+		return "", "", fmt.Errorf("invalid database DSN")
+	}
+
+	if driver == "sqlite" {
+		if dsn == "" {
+			dsn = filepath.Join(s.deps.Config.DataDir, "volo.db")
+		}
+		if dsn == ":memory:" || strings.HasPrefix(dsn, "file::memory:") {
+			if s.deps.OutboundDialer != nil && !s.deps.OutboundDialer.AllowLoopbackForTests {
+				return "", "", fmt.Errorf("in-memory sqlite is disabled in production setup")
+			}
+			return "sqlite", dsn, nil
+		}
+		if strings.ContainsAny(dsn, "?#") || strings.HasPrefix(strings.ToLower(dsn), "file:") || strings.Contains(dsn, "..") {
+			return "", "", fmt.Errorf("sqlite path must be a plain .db/.sqlite/.sqlite3 file inside data directory")
+		}
+		dataAbs, err := filepath.Abs(s.deps.Config.DataDir)
+		if err != nil {
+			return "", "", err
+		}
+		var cand string
+		if filepath.IsAbs(dsn) {
+			cand, err = filepath.Abs(dsn)
+			if err != nil {
+				return "", "", err
+			}
+		} else {
+			cand = filepath.Join(dataAbs, dsn)
+		}
+		cand = filepath.Clean(cand)
+		if !strings.HasPrefix(cand, dataAbs+string(filepath.Separator)) {
+			return "", "", fmt.Errorf("sqlite database path must reside inside data directory")
+		}
+		switch strings.ToLower(filepath.Ext(cand)) {
+		case ".db", ".sqlite", ".sqlite3":
+		default:
+			return "", "", fmt.Errorf("sqlite database file must end with .db, .sqlite, or .sqlite3")
+		}
+		parentDir := filepath.Dir(cand)
+		if err := os.MkdirAll(parentDir, 0o750); err != nil {
+			return "", "", err
+		}
+		if realParent, err := filepath.EvalSymlinks(parentDir); err == nil {
+			realData, dErr := filepath.EvalSymlinks(dataAbs)
+			if dErr == nil && realParent != realData && !strings.HasPrefix(realParent, realData+string(filepath.Separator)) {
+				return "", "", fmt.Errorf("sqlite database path escapes data directory via symlink")
+			}
+		}
+		return "sqlite", cand, nil
+	}
+
+	if dsn == "" {
+		return "", "", fmt.Errorf("database DSN is required for %s", driver)
+	}
+	targets, err := extractSetupSQLTargets(driver, dsn)
+	if err != nil {
+		return "", "", err
+	}
+	for _, t := range targets {
+		if err := validateSetupDBEndpoint(ctx, t.host, t.port); err != nil {
+			return "", "", err
+		}
+	}
+	return driver, dsn, nil
+}
+
+func (s *AppServer) isSameCurrentDB(driver, dsn string, simpleProto bool) bool {
+	curDriver := strings.ToLower(strings.TrimSpace(s.deps.Config.DBDriver))
+	if curDriver == "" {
+		curDriver = s.deps.Store.Dialect().Name()
+	}
+	if driver != curDriver || simpleProto != s.deps.Config.DBSimpleProtocol {
+		return false
+	}
+	if driver == "sqlite" {
+		curAbs, err1 := filepath.Abs(strings.TrimSpace(s.deps.Config.DBDSN))
+		reqAbs, err2 := filepath.Abs(strings.TrimSpace(dsn))
+		if err1 == nil && err2 == nil && filepath.Clean(curAbs) == filepath.Clean(reqAbs) {
+			return true
+		}
+	}
+	return strings.TrimSpace(dsn) == strings.TrimSpace(s.deps.Config.DBDSN)
+}
+
+func (s *AppServer) probeSetupDB(ctx context.Context, driver, dsn string, simpleProto bool) (string, int64, error) {
+	testCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	existedBefore := true
+	if driver == "sqlite" && dsn != ":memory:" && !strings.HasPrefix(dsn, "file::memory:") {
+		if _, err := os.Stat(dsn); os.IsNotExist(err) {
+			existedBefore = false
+		}
+	}
+	cleanupSQLiteProbe := func() {
+		if !existedBefore {
+			_ = os.Remove(dsn)
+			_ = os.Remove(dsn + "-wal")
+			_ = os.Remove(dsn + "-shm")
+		}
+	}
+
+	start := time.Now()
+	probeStore, err := sqlx.Open(testCtx, sqlx.Options{
+		Driver:         driver,
+		DSN:            dsn,
+		SimpleProtocol: simpleProto,
+		MaxOpenConns:   2,
+		MaxIdleConns:   1,
+	})
+	if err != nil {
+		cleanupSQLiteProbe()
+		return "", 0, err
+	}
+
+	var one int
+	qErr := probeStore.QueryRowContext(testCtx, "SELECT 1").Scan(&one)
+	dialectName := probeStore.Dialect().Name()
+	_ = probeStore.Close()
+	cleanupSQLiteProbe()
+	if qErr != nil {
+		return "", 0, qErr
+	}
+	return dialectName, time.Since(start).Milliseconds(), nil
+}
+
+// applySetupDatabaseSelection atomically opens, migrates, persists, and swaps the runtime DB pool
+// when the Setup Wizard selects a database connection different from the boot configuration.
+func (s *AppServer) applySetupDatabaseSelection(ctx context.Context, rawDriver, rawDSN string, simpleProto bool) error {
+	if strings.TrimSpace(rawDriver) == "" && strings.TrimSpace(rawDSN) == "" {
+		return nil
+	}
+	if strings.TrimSpace(rawDriver) == "" {
+		rawDriver = s.deps.Config.DBDriver
+	}
+	driver, dsn, err := s.validateAndNormalizeSetupDB(ctx, rawDriver, rawDSN)
+	if err != nil {
+		return err
+	}
+	if s.isSameCurrentDB(driver, dsn, simpleProto) {
+		return nil
+	}
+
+	newStore, err := sqlx.Open(ctx, sqlx.Options{
+		Driver:         driver,
+		DSN:            dsn,
+		SimpleProtocol: simpleProto,
+		MaxOpenConns:   s.deps.Config.DBMaxOpenConns,
+		MaxIdleConns:   s.deps.Config.DBMaxIdleConns,
+	})
+	if err != nil {
+		return err
+	}
+	if err := migrate.Up(ctx, newStore); err != nil {
+		_ = newStore.Close()
+		return err
+	}
+	if err := config.SaveWizardDBConfig(s.deps.Config.DataDir, s.deps.Config.KeyRing, config.WizardDBSelection{
+		Driver:         driver,
+		DSN:            dsn,
+		SimpleProtocol: simpleProto,
+	}); err != nil {
+		_ = newStore.Close()
+		return err
+	}
+
+	s.deps.Config.DBDriver = driver
+	s.deps.Config.DBDSN = dsn
+	s.deps.Config.DBSimpleProtocol = simpleProto
+	s.deps.Store.Swap(newStore)
+	if _, err := s.deps.Settings.Reload(ctx); err != nil {
+		return err
+	}
+	return nil
+}
 
 // isSetupUnlocked reports whether the first-boot Setup Wizard is still unlocked.
 // Once `Site.Initialized == true` OR any `admin` user exists in `users`, `/setup` and `/api/setup/*`
@@ -92,6 +529,9 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("setup:testdb", clientIP, 15, time.Minute) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
@@ -107,26 +547,16 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	driver := strings.ToLower(strings.TrimSpace(req.Driver))
-	dsn := strings.TrimSpace(req.DSN)
-	if driver == "" {
-		driver = s.deps.Config.DBDriver
+	rawDriver := strings.TrimSpace(req.Driver)
+	rawDSN := strings.TrimSpace(req.DSN)
+	if rawDriver == "" {
+		rawDriver = s.deps.Config.DBDriver
 	}
-	if dsn == "" && driver == s.deps.Config.DBDriver {
-		dsn = s.deps.Config.DBDSN
+	if rawDSN == "" && strings.EqualFold(rawDriver, s.deps.Config.DBDriver) {
+		rawDSN = s.deps.Config.DBDSN
 	}
 
-	testCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	probeStore, err := sqlx.Open(testCtx, sqlx.Options{
-		Driver:         driver,
-		DSN:            dsn,
-		SimpleProtocol: req.SimpleProtocol,
-		MaxOpenConns:   2,
-		MaxIdleConns:   1,
-	})
+	driver, dsn, err := s.validateAndNormalizeSetupDB(r.Context(), rawDriver, rawDSN)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"ok":    false,
@@ -134,10 +564,9 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer probeStore.Close()
 
-	var one int
-	if err := probeStore.QueryRowContext(testCtx, "SELECT 1").Scan(&one); err != nil {
+	dialectName, latencyMS, err := s.probeSetupDB(r.Context(), driver, dsn, req.SimpleProtocol)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"ok":    false,
 			"error": err.Error(),
@@ -146,8 +575,8 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
-		"dialect":    probeStore.Dialect().Name(),
-		"latency_ms": time.Since(start).Milliseconds(),
+		"dialect":    dialectName,
+		"latency_ms": latencyMS,
 	})
 }
 
@@ -160,21 +589,41 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	rep, dryRun, err := s.streamLegacyImportUpload(w, r)
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("setup:import", clientIP, 15, time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		return
+	}
+
+	rep, dryRun, newSiteURL, err := s.streamLegacyImportUpload(w, r, true)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	if dryRun {
+		targetDialect := s.deps.Store.Dialect().Name()
+		if rep != nil && rep.TargetDialect != "" {
+			targetDialect = rep.TargetDialect
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"dry_run":    true,
-			"report":     rep,
-			"admin_path": s.deps.Config.AdminPath,
+			"ok":             true,
+			"dry_run":        true,
+			"report":         rep,
+			"admin_path":     s.deps.Config.AdminPath,
+			"target_dialect": targetDialect,
 		})
 		return
 	}
 
+	if newSiteURL != "" {
+		s.deps.Config.PublicURL = strings.TrimRight(newSiteURL, "/")
+		if s.deps.WAF != nil {
+			s.deps.WAF.SetPublicURL(s.deps.Config.PublicURL)
+		}
+	}
 	_, _ = s.deps.Settings.Reload(r.Context())
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
 	_ = s.deps.Content.WarmCaches(r.Context())
@@ -186,15 +635,15 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 	}
 
 	resp := map[string]any{
-		"ok":         true,
-		"report":     rep,
-		"admin_path": s.deps.Config.AdminPath,
+		"ok":             true,
+		"report":         rep,
+		"admin_path":     s.deps.Config.AdminPath,
+		"target_dialect": s.deps.Store.Dialect().Name(),
 	}
 	// Automatically sign in the primary imported administrator so entering /console works seamlessly!
 	if adminUser, qErr := sqlx.Get[domain.User](r.Context(), s.deps.Store,
 		`SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
 		domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
-		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 		geo := ""
 		if s.deps.Geo != nil {
 			geo = s.deps.Geo.LookupDisplay(clientIP)
@@ -220,8 +669,22 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("setup:complete", clientIP, 10, time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		return
+	}
 
 	var req struct {
+		Driver           string `json:"driver"`
+		DBDriver         string `json:"db_driver"`
+		DSN              string `json:"dsn"`
+		DBDSN            string `json:"db_dsn"`
+		SimpleProtocol   *bool  `json:"simple_protocol"`
+		DBSimpleProtocol *bool  `json:"db_simple_protocol"`
 		SiteTitle        string `json:"site_title"`
 		SiteSubtitle     string `json:"site_subtitle"`
 		SiteDescription  string `json:"site_description"`
@@ -255,6 +718,25 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	pwHash, err := auth.HashPassword(req.AdminPassword)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "password hashing failed"})
+		return
+	}
+
+	chosenDriver := strings.TrimSpace(req.Driver)
+	if chosenDriver == "" {
+		chosenDriver = strings.TrimSpace(req.DBDriver)
+	}
+	chosenDSN := strings.TrimSpace(req.DSN)
+	if chosenDSN == "" {
+		chosenDSN = strings.TrimSpace(req.DBDSN)
+	}
+	chosenSimpleProto := s.deps.Config.DBSimpleProtocol
+	if req.SimpleProtocol != nil {
+		chosenSimpleProto = *req.SimpleProtocol
+	} else if req.DBSimpleProtocol != nil {
+		chosenSimpleProto = *req.DBSimpleProtocol
+	}
+	if err := s.applySetupDatabaseSelection(r.Context(), chosenDriver, chosenDSN, chosenSimpleProto); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -354,12 +836,12 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 			}
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO pages (id, author_id, title, slug, content_md, is_published, allow_comment, show_toc, lang, translation_group, view_count, comment_count, created_at, updated_at)
-				 VALUES (?, ?, ?, 'about', ?, 1, 1, 0, ?, '', 0, 0, ?, ?)`,
-				pageID, adminUser.ID, aboutTitle, aboutBody, locale, now, now)
+				 VALUES (?, ?, ?, 'about', ?, ?, ?, ?, ?, '', 0, 0, ?, ?)`,
+				pageID, adminUser.ID, aboutTitle, aboutBody, true, true, false, locale, now, now)
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
-				 VALUES (?, '', ?, '{"zh-CN":"关于","en-US":"About"}', '/about', 0, '', 10, 1, ?, ?)`,
-				id.Next(), aboutTitle, now, now)
+				 VALUES (?, '', ?, '{"zh-CN":"关于","en-US":"About"}', '/about', ?, '', 10, ?, ?, ?)`,
+				id.Next(), aboutTitle, false, true, now, now)
 		}
 		return nil
 	})
@@ -382,7 +864,6 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, appPatch, 0)
 	_ = s.deps.Content.WarmCaches(r.Context())
 
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	geo := ""
 	if s.deps.Geo != nil {
 		geo = s.deps.Geo.LookupDisplay(clientIP)
@@ -396,24 +877,123 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	adminUser.PasswordHash = ""
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":         true,
-		"admin_path": s.deps.Config.AdminPath,
-		"user":       adminUser,
-		"csrf_token": s.deps.Auth.ComputeCSRFToken(sess.ID),
+		"ok":             true,
+		"admin_path":     s.deps.Config.AdminPath,
+		"target_dialect": s.deps.Store.Dialect().Name(),
+		"user":           adminUser,
+		"csrf_token":     s.deps.Auth.ComputeCSRFToken(sess.ID),
 	})
 }
 
-func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Request) (*etl.ImportReport, bool, error) {
+func splitSetupURLPrefixes(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func parseSetupBoolField(raw string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Request, allowDBSwap bool) (*etl.ImportReport, bool, string, error) {
 	const maxLegacyBytes = 256 << 20 // 256 MiB streaming cap
 	r.Body = http.MaxBytesReader(w, r.Body, maxLegacyBytes)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		return nil, false, fmt.Errorf("upload parse error: %w", err)
+		return nil, false, "", fmt.Errorf("upload parse error: %w", err)
 	}
 	file, hdr, err := r.FormFile("file")
 	if err != nil {
-		return nil, false, fmt.Errorf("missing multipart 'file' field")
+		return nil, false, "", fmt.Errorf("missing multipart 'file' field")
 	}
 	defer file.Close()
+
+	dryRaw := strings.TrimSpace(r.URL.Query().Get("dry_run"))
+	if dryRaw == "" {
+		dryRaw = strings.TrimSpace(r.FormValue("dry_run"))
+	}
+	dryRun := strings.EqualFold(dryRaw, "true") || dryRaw == "1"
+
+	rawDriver := strings.TrimSpace(r.FormValue("driver"))
+	if rawDriver == "" {
+		rawDriver = strings.TrimSpace(r.FormValue("db_driver"))
+	}
+	rawDSN := strings.TrimSpace(r.FormValue("dsn"))
+	if rawDSN == "" {
+		rawDSN = strings.TrimSpace(r.FormValue("db_dsn"))
+	}
+	simpleRaw := strings.TrimSpace(r.FormValue("simple_protocol"))
+	if simpleRaw == "" {
+		simpleRaw = strings.TrimSpace(r.FormValue("db_simple_protocol"))
+	}
+	simpleProto := parseSetupBoolField(simpleRaw, s.deps.Config.DBSimpleProtocol)
+
+	newSiteURL := strings.TrimSpace(r.FormValue("new_site_url"))
+	if newSiteURL != "" {
+		parsedURL, uErr := url.Parse(newSiteURL)
+		if uErr != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || strings.TrimSpace(parsedURL.Host) == "" {
+			return nil, dryRun, "", fmt.Errorf("new_site_url must be a valid http(s):// URL")
+		}
+		newSiteURL = strings.TrimRight(newSiteURL, "/")
+	}
+
+	adminUsername := strings.TrimSpace(r.FormValue("admin_username"))
+	if adminUsername != "" && (len(adminUsername) < 2 || len(adminUsername) > 48) {
+		return nil, dryRun, "", fmt.Errorf("admin_username must be 2-48 characters")
+	}
+	adminEmail := strings.ToLower(strings.TrimSpace(r.FormValue("admin_email")))
+	if adminEmail != "" && (!strings.Contains(adminEmail, "@") || len(adminEmail) > 190) {
+		return nil, dryRun, "", fmt.Errorf("valid admin_email is required")
+	}
+	adminDisplayName := strings.TrimSpace(r.FormValue("admin_display_name"))
+	adminPassword := r.FormValue("admin_password")
+	adminPasswordHash := ""
+	if adminPassword != "" {
+		if err := auth.ValidatePasswordPolicy(adminPassword); err != nil {
+			return nil, dryRun, "", err
+		}
+		h, hErr := auth.HashPassword(adminPassword)
+		if hErr != nil {
+			return nil, dryRun, "", fmt.Errorf("password hashing failed")
+		}
+		adminPasswordHash = h
+	}
+
+	var prevalidatedDialect string
+	if allowDBSwap && dryRun {
+		if rawDriver != "" || rawDSN != "" {
+			probeDriver := rawDriver
+			if probeDriver == "" {
+				probeDriver = s.deps.Config.DBDriver
+			}
+			normDriver, normDSN, vErr := s.validateAndNormalizeSetupDB(r.Context(), probeDriver, rawDSN)
+			if vErr != nil {
+				return nil, true, "", vErr
+			}
+			prevalidatedDialect = normDriver
+			if !s.isSameCurrentDB(normDriver, normDSN, simpleProto) {
+				if dName, _, pErr := s.probeSetupDB(r.Context(), normDriver, normDSN, simpleProto); pErr != nil {
+					return nil, true, "", pErr
+				} else if dName != "" {
+					prevalidatedDialect = dName
+				}
+			}
+		}
+	}
 
 	ext := strings.ToLower(filepath.Ext(hdr.Filename))
 	if ext != ".zip" && ext != ".json" {
@@ -421,24 +1001,48 @@ func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Requ
 	}
 	tmpFile, err := os.CreateTemp(s.deps.Config.DataDir, "volo-legacy-*"+ext)
 	if err != nil {
-		return nil, false, err
+		return nil, dryRun, "", err
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
 	if _, err := io.Copy(tmpFile, io.LimitReader(file, maxLegacyBytes)); err != nil {
 		_ = tmpFile.Close()
-		return nil, false, err
+		return nil, dryRun, "", err
 	}
 	_ = tmpFile.Close()
 
-	dryRun := strings.EqualFold(r.FormValue("dry_run"), "true") || r.FormValue("dry_run") == "1"
-	rep, err := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, etl.ImportOptions{
-		DryRun:          dryRun,
-		TargetUploadDir: s.deps.Config.UploadDir,
-	})
-	if err != nil {
-		return nil, dryRun, err
+	if allowDBSwap && !dryRun {
+		if err := s.applySetupDatabaseSelection(r.Context(), rawDriver, rawDSN, simpleProto); err != nil {
+			return nil, false, "", err
+		}
 	}
-	return rep, dryRun, nil
+
+	storageMode := strings.ToLower(strings.TrimSpace(r.FormValue("storage_mode")))
+	opts := etl.ImportOptions{
+		DryRun:            dryRun,
+		TargetUploadDir:   s.deps.Config.UploadDir,
+		AdminPath:         s.deps.Config.AdminPath,
+		OldURLPrefixes:    splitSetupURLPrefixes(r.FormValue("old_site_url")),
+		NewSiteURL:        newSiteURL,
+		SiteTitle:         strings.TrimSpace(r.FormValue("site_title")),
+		SiteSubtitle:      strings.TrimSpace(r.FormValue("site_subtitle")),
+		DefaultLocale:     strings.TrimSpace(r.FormValue("default_locale")),
+		TimeZone:          strings.TrimSpace(r.FormValue("timezone")),
+		Accent:            strings.TrimSpace(r.FormValue("accent")),
+		ForceLocalStorage: storageMode == "local",
+		AdminUsername:     adminUsername,
+		AdminEmail:        adminEmail,
+		AdminDisplayName:  adminDisplayName,
+		AdminPasswordHash: adminPasswordHash,
+	}
+
+	rep, err := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, opts)
+	if err != nil {
+		return nil, dryRun, "", err
+	}
+	if dryRun && prevalidatedDialect != "" && rep != nil {
+		rep.TargetDialect = prevalidatedDialect
+	}
+	return rep, dryRun, newSiteURL, nil
 }

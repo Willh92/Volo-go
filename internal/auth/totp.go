@@ -112,19 +112,26 @@ func VerifyTOTPCode(userID string, secretBase32 string, code string, now time.Ti
 	}
 
 	if replayGuard != nil && userID != "" {
+		const maxTOTPSeen = 4096
 		rk := fmt.Sprintf("%s:%d", userID, matchedStep)
 		nowUnix := now.Unix()
 		replayGuard.mu.Lock()
 		defer replayGuard.mu.Unlock()
-		if len(replayGuard.seen) > 8192 {
+		if exp, dup := replayGuard.seen[rk]; dup && nowUnix <= exp {
+			return ErrTOTPReplay
+		}
+		if len(replayGuard.seen) >= maxTOTPSeen {
 			for k, exp := range replayGuard.seen {
 				if nowUnix > exp {
 					delete(replayGuard.seen, k)
 				}
 			}
-		}
-		if _, dup := replayGuard.seen[rk]; dup {
-			return ErrTOTPReplay
+			for k := range replayGuard.seen {
+				if len(replayGuard.seen) < maxTOTPSeen {
+					break
+				}
+				delete(replayGuard.seen, k)
+			}
 		}
 		replayGuard.seen[rk] = nowUnix + int64((windowSteps+2)*totpPeriodSec)
 	}

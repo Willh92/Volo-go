@@ -3,6 +3,10 @@ package plugin
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/i18n"
@@ -20,9 +25,10 @@ import (
 
 const (
 	defaultVMStackLimit     = 512
-	defaultVMPoolCap        = 4
+	defaultVMPoolCap        = 1
 	defaultVMMaxConcurrency = 8
 	maxPluginFetchBodyBytes = 1 << 20 // 1 MiB cap on outbound HTTP responses
+	maxPluginRateLimitKeys  = 2048
 )
 
 // ErrExecutionTimeout is returned when a plugin hook, route, slot, or cron exceeds its time budget.
@@ -34,16 +40,25 @@ type pooledVM struct {
 	reqCtx  context.Context
 }
 
+type pluginRateBucket struct {
+	windowMin int64
+	count     int
+}
+
 type gojaPluginRuntime struct {
-	manifest   Manifest
-	pluginDir  string
-	program    *jsProgram
-	localI18n  map[string]map[string]string
-	kv         *KVStore
-	logger     *PluginLogger
-	hostI18n   *i18n.Catalog
-	getConfig  func() map[string]any
-	httpClient *http.Client
+	manifest    Manifest
+	pluginDir   string
+	program     *jsProgram
+	localI18n   map[string]map[string]string
+	kv          *KVStore
+	logger      *PluginLogger
+	hostI18n    *i18n.Catalog
+	getConfig   func() map[string]any
+	getSiteInfo func() map[string]any
+	httpClient  *http.Client
+
+	rateMu      sync.Mutex
+	rateBuckets map[string]pluginRateBucket
 
 	pool chan *pooledVM
 	sem  chan struct{}
@@ -56,6 +71,7 @@ type gojaRuntimeOptions struct {
 	logger                *PluginLogger
 	hostI18n              *i18n.Catalog
 	getConfig             func() map[string]any
+	getSiteInfo           func() map[string]any
 	customResolver        security.ResolverFunc
 	allowLoopbackForTests bool
 }
@@ -97,17 +113,19 @@ func newGojaPluginRuntime(opts gojaRuntimeOptions) (*gojaPluginRuntime, error) {
 	}
 
 	rt := &gojaPluginRuntime{
-		manifest:   opts.manifest,
-		pluginDir:  realPluginDir,
-		program:    prog,
-		localI18n:  localDicts,
-		kv:         opts.kv,
-		logger:     opts.logger,
-		hostI18n:   opts.hostI18n,
-		getConfig:  opts.getConfig,
-		httpClient: httpClient,
-		pool:       make(chan *pooledVM, defaultVMPoolCap),
-		sem:        make(chan struct{}, defaultVMMaxConcurrency),
+		manifest:    opts.manifest,
+		pluginDir:   realPluginDir,
+		program:     prog,
+		localI18n:   localDicts,
+		kv:          opts.kv,
+		logger:      opts.logger,
+		hostI18n:    opts.hostI18n,
+		getConfig:   opts.getConfig,
+		getSiteInfo: opts.getSiteInfo,
+		httpClient:  httpClient,
+		rateBuckets: make(map[string]pluginRateBucket),
+		pool:        make(chan *pooledVM, defaultVMPoolCap),
+		sem:         make(chan struct{}, defaultVMMaxConcurrency),
 	}
 
 	// Smoke-initialize one VM immediately so top-level runtime errors or infinite loops fail on load.
@@ -239,6 +257,64 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 		return r.translate(locale, key, vars)
 	})
 	voloObj.Set("i18n", i18nBridge)
+
+	cryptoBridge := vm.NewObject()
+	cryptoBridge.Set("sha256", func(input string) string {
+		sum := sha256.Sum256([]byte(input))
+		return hex.EncodeToString(sum[:])
+	})
+	cryptoBridge.Set("hmacSha256", func(secret string, msg string) string {
+		mac := hmac.New(sha256.New, []byte(secret))
+		_, _ = mac.Write([]byte(msg))
+		return hex.EncodeToString(mac.Sum(nil))
+	})
+	cryptoBridge.Set("randomUUID", func() (string, error) {
+		var b [16]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", err
+		}
+		b[6] = (b[6] & 0x0f) | 0x40
+		b[8] = (b[8] & 0x3f) | 0x80
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+	})
+	voloObj.Set("crypto", cryptoBridge)
+
+	siteBridge := vm.NewObject()
+	siteBridge.Set("info", func() map[string]any {
+		if r.getSiteInfo == nil {
+			return map[string]any{}
+		}
+		info := r.getSiteInfo()
+		if info == nil {
+			return map[string]any{}
+		}
+		out := make(map[string]any, len(info))
+		for k, v := range info {
+			out[k] = v
+		}
+		return out
+	})
+	voloObj.Set("site", siteBridge)
+
+	rlNative := func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if len(args) < 2 {
+			return jsFalseVal, nil
+		}
+		if r.checkRateLimit(args[0].toString(), int(args[1].toNumber())) {
+			return jsTrueVal, nil
+		}
+		return jsFalseVal, nil
+	}
+	voloObj.setVal("rateLimit", jsValue{
+		kind: valFunc,
+		fn: &jsFunc{
+			name:   "rateLimit",
+			native: rlNative,
+			props: map[string]jsValue{
+				"allow": nativeVal(rlNative),
+			},
+		},
+	})
 
 	// Capability 1: plugin_kv (ONLY injected if manifest declares kv / kv:rw / kv:read).
 	if r.manifest.CanReadKV() && r.kv != nil {
@@ -501,6 +577,49 @@ func normalizeJSError(pluginID string, stage string, err error) error {
 		return fmt.Errorf("plugin %q (%s): interrupted: %s", pluginID, stage, valStr)
 	}
 	return fmt.Errorf("plugin %q (%s): %w", pluginID, stage, err)
+}
+
+func (r *gojaPluginRuntime) checkRateLimit(key string, maxPerMinute int) bool {
+	if maxPerMinute <= 0 {
+		return false
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "default"
+	}
+	if len(key) > 256 {
+		key = key[:256]
+	}
+	nowMin := time.Now().Unix() / 60
+
+	r.rateMu.Lock()
+	defer r.rateMu.Unlock()
+
+	if len(r.rateBuckets) >= maxPluginRateLimitKeys {
+		for k, b := range r.rateBuckets {
+			if b.windowMin < nowMin {
+				delete(r.rateBuckets, k)
+			}
+		}
+		for len(r.rateBuckets) >= maxPluginRateLimitKeys {
+			for k := range r.rateBuckets {
+				delete(r.rateBuckets, k)
+				break
+			}
+		}
+	}
+
+	b := r.rateBuckets[key]
+	if b.windowMin != nowMin {
+		b = pluginRateBucket{windowMin: nowMin, count: 0}
+	}
+	if b.count >= maxPerMinute {
+		r.rateBuckets[key] = b
+		return false
+	}
+	b.count++
+	r.rateBuckets[key] = b
+	return true
 }
 
 func isSubPath(rootReal string, targetReal string) bool {

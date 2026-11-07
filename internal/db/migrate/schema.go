@@ -11,7 +11,7 @@ import (
 )
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 3
 
 type migrationStep struct {
 	Version     int
@@ -30,6 +30,11 @@ var steps = []migrationStep{
 		Description: "Add composite hot-path read indexes for follow_items, pages, articles, and media_assets",
 		Statements:  buildV2Indexes,
 	},
+	{
+		Version:     3,
+		Description: "Add alt_text accessibility column to media_assets",
+		Statements:  buildV3MediaAltText,
+	},
 }
 
 func buildV2Indexes(_ dialect.Dialect) []string {
@@ -38,6 +43,13 @@ func buildV2Indexes(_ dialect.Dialect) []string {
 		`CREATE INDEX idx_pages_pub_updated ON pages (is_published, updated_at)`,
 		`CREATE INDEX idx_articles_status_pub ON articles (status, published_at)`,
 		`CREATE INDEX idx_media_assets_dims ON media_assets (width, height)`,
+	}
+}
+
+func buildV3MediaAltText(d dialect.Dialect) []string {
+	t := d.Types()
+	return []string{
+		fmt.Sprintf(`ALTER TABLE media_assets ADD COLUMN alt_text%s NOT NULL DEFAULT ''`, t.Varchar512),
 	}
 }
 
@@ -73,10 +85,17 @@ func Up(ctx context.Context, store *sqlx.Store) error {
 		}
 		stmts := step.Statements(d)
 		for _, stmt := range stmts {
-			if strings.HasPrefix(strings.TrimSpace(strings.ToUpper(stmt)), "CREATE INDEX ") ||
-				strings.HasPrefix(strings.TrimSpace(strings.ToUpper(stmt)), "CREATE UNIQUE INDEX ") {
+			upper := strings.TrimSpace(strings.ToUpper(stmt))
+			if strings.HasPrefix(upper, "CREATE INDEX ") ||
+				strings.HasPrefix(upper, "CREATE UNIQUE INDEX ") {
 				if err := execIdempotentIndex(ctx, store, stmt); err != nil {
 					return fmt.Errorf("migrate v%d index failed (%s): %w", step.Version, stmt, err)
+				}
+				continue
+			}
+			if strings.HasPrefix(upper, "ALTER TABLE ") && strings.Contains(upper, " ADD COLUMN ") {
+				if err := execIdempotentAddColumn(ctx, store, stmt); err != nil {
+					return fmt.Errorf("migrate v%d add column failed (%s): %w", step.Version, stmt, err)
 				}
 				continue
 			}
@@ -109,6 +128,21 @@ func execIdempotentIndex(ctx context.Context, store *sqlx.Store, stmt string) er
 	// MySQL 8.0 lacks IF NOT EXISTS on CREATE INDEX; ignore duplicate key name (Error 1061).
 	_, err := store.ExecContext(ctx, stmt)
 	if err != nil && (strings.Contains(err.Error(), "1061") || strings.Contains(strings.ToLower(err.Error()), "duplicate key name")) {
+		return nil
+	}
+	return err
+}
+
+func execIdempotentAddColumn(ctx context.Context, store *sqlx.Store, stmt string) error {
+	_, err := store.ExecContext(ctx, stmt)
+	if err == nil {
+		return nil
+	}
+	low := strings.ToLower(err.Error())
+	if strings.Contains(low, "duplicate column") ||
+		strings.Contains(low, "already exists") ||
+		strings.Contains(err.Error(), "1060") ||
+		strings.Contains(err.Error(), "42701") {
 		return nil
 	}
 	return err
@@ -221,7 +255,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			name%s NOT NULL,
 			slug%s NOT NULL UNIQUE,
 			description%s NOT NULL,
-			icon%s NOT NULL,
+			icon%s NOT NULL DEFAULT '',
 			sort_order%s NOT NULL DEFAULT 0,
 			created_at%s NOT NULL,
 			updated_at%s NOT NULL
@@ -494,6 +528,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			object_key%s NOT NULL UNIQUE,
 			public_url%s NOT NULL,
 			original_name%s NOT NULL,
+			alt_text%s NOT NULL DEFAULT '',
 			mime_type%s NOT NULL,
 			size_bytes%s NOT NULL,
 			width%s NOT NULL DEFAULT 0,
@@ -502,7 +537,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			exif_stripped%s NOT NULL DEFAULT %s,
 			uploader_id%s NOT NULL,
 			created_at%s NOT NULL
-		)%s`, t.Varchar32, t.Varchar32, vk, t.Varchar512, t.Varchar255, t.Varchar64,
+		)%s`, t.Varchar32, t.Varchar32, vk, t.Varchar512, t.Varchar255, t.Varchar512, t.Varchar64,
 			t.BigInt, t.Int, t.Int, t.Varchar64, t.Bool, t.BoolTrueLit, t.Varchar32, t.BigInt, sfx),
 		`CREATE INDEX idx_media_assets_created ON media_assets (created_at)`,
 

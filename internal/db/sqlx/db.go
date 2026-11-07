@@ -46,18 +46,54 @@ type Options struct {
 	ConnLifetime   time.Duration
 }
 
-// Store manages dialect-aware read/write connection pools, enforcing:
-// 1. Read-only queries run with zero DB write side-effects (enforced via query_only=ON on SQLite ReadDB).
-// 2. Multi-statement writes execute inside WithTx with guaranteed rollback on error or panic.
-// 3. Case-insensitive struct column scanning across SQLite, PostgreSQL, MySQL, MariaDB, and TiDB.
-type Store struct {
+type storeState struct {
 	dialect     dialect.Dialect
 	writeDB     *sql.DB
 	readDB      *sql.DB
 	splitPools  bool
 	sqliteInMem bool
 	closeOnce   sync.Once
-	dataRev     atomic.Uint64
+}
+
+func (st *storeState) close() error {
+	if st == nil {
+		return nil
+	}
+	var firstErr error
+	st.closeOnce.Do(func() {
+		if st.dialect != nil && st.dialect.Name() == "sqlite" && !st.sqliteInMem && st.writeDB != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, _ = st.writeDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+			cancel()
+		}
+		if st.splitPools && st.readDB != nil {
+			if err := st.readDB.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if st.writeDB != nil {
+			if err := st.writeDB.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	})
+	return firstErr
+}
+
+// Store manages dialect-aware read/write connection pools, enforcing:
+// 1. Read-only queries run with zero DB write side-effects (enforced via query_only=ON on SQLite ReadDB).
+// 2. Multi-statement writes execute inside WithTx with guaranteed rollback on error or panic.
+// 3. Case-insensitive struct column scanning across SQLite, PostgreSQL, MySQL, MariaDB, and TiDB.
+type Store struct {
+	state   atomic.Pointer[storeState]
+	dataRev atomic.Uint64
+}
+
+func newStoreFromState(st *storeState) *Store {
+	s := &Store{}
+	s.state.Store(st)
+	s.dataRev.Store(1)
+	return s
 }
 
 // Open initializes the pure-Go database pool(s) for the configured driver.
@@ -117,13 +153,13 @@ func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, e
 	}
 
 	if isMem {
-		return &Store{
+		return newStoreFromState(&storeState{
 			dialect:     d,
 			writeDB:     wdb,
 			readDB:      wdb,
 			splitPools:  false,
 			sqliteInMem: true,
-		}, nil
+		}), nil
 	}
 
 	readURI := buildSQLiteURI(dsn, true, false)
@@ -132,12 +168,10 @@ func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, e
 		_ = wdb.Close()
 		return nil, fmt.Errorf("sqlx: open sqlite reader: %w", err)
 	}
-	readers := runtime.NumCPU()
-	if readers < 4 {
-		readers = 4
-	}
+	readers := min(4, max(2, runtime.NumCPU()))
 	rdb.SetMaxOpenConns(readers)
-	rdb.SetMaxIdleConns(readers)
+	rdb.SetMaxIdleConns(1)
+	rdb.SetConnMaxIdleTime(60 * time.Second)
 	rdb.SetConnMaxLifetime(0)
 
 	if err := rdb.PingContext(ctx); err != nil {
@@ -146,12 +180,12 @@ func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, e
 		return nil, fmt.Errorf("sqlx: ping sqlite reader: %w", err)
 	}
 
-	return &Store{
+	return newStoreFromState(&storeState{
 		dialect:    d,
 		writeDB:    wdb,
 		readDB:     rdb,
 		splitPools: true,
-	}, nil
+	}), nil
 }
 
 func buildSQLiteURI(raw string, readOnly bool, isMem bool) string {
@@ -177,8 +211,7 @@ func buildSQLiteURI(raw string, readOnly bool, isMem bool) string {
 		"synchronous(NORMAL)",
 		"busy_timeout(5000)",
 		"foreign_keys(ON)",
-		"temp_store(MEMORY)",
-		"cache_size(-4096)", // Bounded ~4 MiB page cache per connection pool to accelerate hot B-tree reads within < 35 MiB RSS budget
+		"cache_size(-1024)", // Bounded ~1 MiB page cache per active connection within < 25 MiB VmRSS budget
 	}
 	if readOnly {
 		pragmas = append(pragmas, "query_only(ON)")
@@ -208,7 +241,7 @@ func openPostgres(ctx context.Context, d dialect.Dialect, opts Options) (*Store,
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlx: ping postgres: %w", err)
 	}
-	return &Store{dialect: d, writeDB: db, readDB: db}, nil
+	return newStoreFromState(&storeState{dialect: d, writeDB: db, readDB: db}), nil
 }
 
 func openMySQL(ctx context.Context, d dialect.Dialect, opts Options) (*Store, error) {
@@ -225,7 +258,7 @@ func openMySQL(ctx context.Context, d dialect.Dialect, opts Options) (*Store, er
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlx: ping mysql: %w", err)
 	}
-	return &Store{dialect: d, writeDB: db, readDB: db}, nil
+	return newStoreFromState(&storeState{dialect: d, writeDB: db, readDB: db}), nil
 }
 
 func ensureMySQLParams(dsn string) string {
@@ -271,9 +304,43 @@ func applyPoolSettings(db *sql.DB, opts Options) {
 	db.SetConnMaxLifetime(life)
 }
 
-func (s *Store) Dialect() dialect.Dialect { return s.dialect }
-func (s *Store) WriteDB() *sql.DB         { return s.writeDB }
-func (s *Store) ReadDB() *sql.DB          { return s.readDB }
+func (s *Store) Dialect() dialect.Dialect {
+	if st := s.state.Load(); st != nil {
+		return st.dialect
+	}
+	return nil
+}
+
+func (s *Store) WriteDB() *sql.DB {
+	if st := s.state.Load(); st != nil {
+		return st.writeDB
+	}
+	return nil
+}
+
+func (s *Store) ReadDB() *sql.DB {
+	if st := s.state.Load(); st != nil {
+		return st.readDB
+	}
+	return nil
+}
+
+// Swap atomically switches this Store's underlying pools and dialect to other's pools,
+// increments DataRevision so all read caches invalidate immediately, and closes the previous pools.
+func (s *Store) Swap(other *Store) {
+	if s == nil || other == nil || s == other {
+		return
+	}
+	next := other.state.Load()
+	if next == nil {
+		return
+	}
+	prev := s.state.Swap(next)
+	s.dataRev.Add(1)
+	if prev != nil && prev != next {
+		_ = prev.close()
+	}
+}
 
 // DataRevision returns a monotonically increasing sequence incremented whenever content/config
 // rows mutate via ExecContext or WithTx. Read-side caches compare this in 1ns lock-free!
@@ -293,50 +360,44 @@ func (s *Store) BumpRevision() {
 
 // Ping verifies both read and write database pools are healthy.
 func (s *Store) Ping(ctx context.Context) error {
-	if err := s.readDB.PingContext(ctx); err != nil {
+	st := s.state.Load()
+	if st == nil {
+		return errors.New("sqlx: store not initialized")
+	}
+	if err := st.readDB.PingContext(ctx); err != nil {
 		return err
 	}
-	if s.splitPools {
-		return s.writeDB.PingContext(ctx)
+	if st.splitPools {
+		return st.writeDB.PingContext(ctx)
 	}
 	return nil
 }
 
 // Close performs a clean WAL checkpoint (if SQLite file DB) and closes all database pools.
 func (s *Store) Close() error {
-	var firstErr error
-	s.closeOnce.Do(func() {
-		if s.dialect.Name() == "sqlite" && !s.sqliteInMem {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, _ = s.writeDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
-			cancel()
-		}
-		if s.splitPools {
-			if err := s.readDB.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		if err := s.writeDB.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	})
-	return firstErr
+	if s == nil {
+		return nil
+	}
+	return s.state.Load().close()
 }
 
 // QueryContext executes a read-only query against ReadDB with automatic ? -> $N rebinding.
 func (s *Store) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return s.readDB.QueryContext(ctx, s.dialect.Rebind(query), args...)
+	st := s.state.Load()
+	return st.readDB.QueryContext(ctx, st.dialect.Rebind(query), args...)
 }
 
 // QueryRowContext executes a single-row read-only query against ReadDB with automatic ? -> $N rebinding.
 func (s *Store) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	return s.readDB.QueryRowContext(ctx, s.dialect.Rebind(query), args...)
+	st := s.state.Load()
+	return st.readDB.QueryRowContext(ctx, st.dialect.Rebind(query), args...)
 }
 
 // ExecContext executes a single atomic write statement against WriteDB with automatic ? -> $N rebinding
 // and bumps DataRevision so read-side snapshots invalidate immediately.
 func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	res, err := s.writeDB.ExecContext(ctx, s.dialect.Rebind(query), args...)
+	st := s.state.Load()
+	res, err := st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 	if err == nil {
 		s.dataRev.Add(1)
 	}
@@ -346,7 +407,8 @@ func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql
 // ExecBgContext executes a background telemetry/session-timestamp update on WriteDB without
 // invalidating content/feed/chrome caches.
 func (s *Store) ExecBgContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return s.writeDB.ExecContext(ctx, s.dialect.Rebind(query), args...)
+	st := s.state.Load()
+	return st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 }
 
 // Tx wraps *sql.Tx with dialect-aware placeholder rebinding.
@@ -382,11 +444,12 @@ func (s *Store) WithBgTx(ctx context.Context, fn func(tx *Tx) error) error {
 }
 
 func (s *Store) runTx(ctx context.Context, bumpRev bool, fn func(tx *Tx) error) (err error) {
-	rawTx, err := s.writeDB.BeginTx(ctx, nil)
+	st := s.state.Load()
+	rawTx, err := st.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlx: begin tx: %w", err)
 	}
-	wrapped := &Tx{raw: rawTx, dialect: s.dialect}
+	wrapped := &Tx{raw: rawTx, dialect: st.dialect}
 	defer func() {
 		if p := recover(); p != nil {
 			_ = rawTx.Rollback()

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -12,7 +13,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/render"
 )
 
-const DefaultSearchMaxBytes = 8 * 1024 * 1024 // <= 8 MiB strict RAM budget for instant search index
+const DefaultSearchMaxBytes = 2 << 20 // <= 2 MiB strict RAM budget for instant search index
 
 // SearchHit represents a zero-leak public search result for Ctrl/Cmd+K instant search.
 type SearchHit struct {
@@ -28,10 +29,8 @@ type SearchHit struct {
 type searchDoc struct {
 	id          string
 	title       string
-	titleLower  string
 	slug        string
 	publicPlain string
-	plainLower  string
 	publishedAt int64
 	byteCost    int
 }
@@ -39,8 +38,8 @@ type searchDoc struct {
 // SearchIndex implements Surface 5 (Two-Stage Low-Memory Instant Search):
 // 1. Excludes all password-protected articles (`password_ciphertext != ''`).
 // 2. Strips all `:::lock ... :::` blocks BEFORE indexing or snippet extraction.
-// 3. Caps resident index memory strictly at maxBytes (default 8 MiB); if an archive exceeds maxBytes,
-//    Stage 2 falls back to streaming DB batches and re-verifies every token against `StripAllLockBlocks`
+// 3. Caps resident index memory strictly at maxBytes (default 2 MiB); if an archive exceeds maxBytes,
+//    Stage 2 falls back to streaming DB rows and re-verifies every token against `StripAllLockBlocks`
 //    public plaintext in Go (zero SQL LIKE side-channel!).
 type SearchIndex struct {
 	mu       sync.RWMutex
@@ -67,11 +66,10 @@ func NewSearchIndex(store *sqlx.Store, renderer *render.Engine, maxBytes int) *S
 	}
 }
 
-// Rebuild reloads published, non-password-protected articles into the bounded RAM index (newest first).
+// Rebuild streams published, non-password-protected articles into the bounded RAM index (newest first).
 func (idx *SearchIndex) Rebuild(ctx context.Context) error {
-	rows, err := sqlx.Select[domain.RawArticle](
+	rows, err := idx.store.QueryContext(
 		ctx,
-		idx.store,
 		`SELECT id, title, slug, summary_md, content_md, published_at, password_ciphertext, has_content_lock
 		 FROM articles
 		 WHERE status = ? AND password_ciphertext = ''
@@ -81,12 +79,17 @@ func (idx *SearchIndex) Rebuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 
 	var nextDocs []searchDoc
 	usedBytes := 0
 	allFit := true
 
-	for _, r := range rows {
+	for rows.Next() {
+		var r domain.RawArticle
+		if sErr := rows.Scan(&r.ID, &r.Title, &r.Slug, &r.SummaryMD, &r.ContentMD, &r.PublishedAt, &r.PasswordCiphertext, &r.HasContentLock); sErr != nil {
+			return sErr
+		}
 		if strings.TrimSpace(r.PasswordCiphertext) != "" {
 			continue
 		}
@@ -97,6 +100,9 @@ func (idx *SearchIndex) Rebuild(ctx context.Context) error {
 		}
 		usedBytes += doc.byteCost
 		nextDocs = append(nextDocs, doc)
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 
 	idx.mu.Lock()
@@ -169,24 +175,20 @@ func (idx *SearchIndex) buildSafeDoc(r domain.RawArticle) searchDoc {
 		Unlocked: false,
 	})
 	plain := out.PlainText
-	plainLower := strings.ToLower(plain)
-	titleLower := strings.ToLower(r.Title)
 
-	cost := len(r.ID) + len(r.Title) + len(titleLower) + len(r.Slug) + len(plain) + len(plainLower) + 64
+	cost := len(r.ID) + len(r.Title) + len(r.Slug) + len(plain) + 64
 	return searchDoc{
 		id:          r.ID,
 		title:       r.Title,
-		titleLower:  titleLower,
 		slug:        r.Slug,
 		publicPlain: plain,
-		plainLower:  plainLower,
 		publishedAt: r.PublishedAt,
 		byteCost:    cost,
 	}
 }
 
 // Search queries the index and returns up to limit verified public hits.
-// Even when `complete == false` (archive > 8 MiB), overflow rows are verified in Go AFTER
+// Even when `complete == false` (archive > 2 MiB), overflow rows are streamed and verified in Go AFTER
 // `StripAllLockBlocks`, NEVER trusting raw SQL `LIKE` matches!
 func (idx *SearchIndex) Search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	tokens := splitQueryTokens(query)
@@ -220,12 +222,11 @@ func (idx *SearchIndex) Search(ctx context.Context, query string, limit int) ([]
 		}
 	}
 
-	// Stage 2 overflow scan if archive exceeded 8 MiB resident cap:
+	// Stage 2 streaming overflow scan if archive exceeded resident cap:
 	// Note that we DO NOT pass user tokens into `content_md LIKE ?` directly without post-strip verification!
 	if !complete && idx.store != nil {
-		overflowRows, err := sqlx.Select[domain.RawArticle](
+		rows, err := idx.store.QueryContext(
 			ctx,
-			idx.store,
 			`SELECT id, title, slug, summary_md, content_md, published_at, password_ciphertext, has_content_lock
 			 FROM articles
 			 WHERE status = ? AND password_ciphertext = ''
@@ -235,7 +236,13 @@ func (idx *SearchIndex) Search(ctx context.Context, query string, limit int) ([]
 		if err != nil {
 			return nil, err
 		}
-		for _, r := range overflowRows {
+		defer rows.Close()
+
+		for rows.Next() {
+			var r domain.RawArticle
+			if sErr := rows.Scan(&r.ID, &r.Title, &r.Slug, &r.SummaryMD, &r.ContentMD, &r.PublishedAt, &r.PasswordCiphertext, &r.HasContentLock); sErr != nil {
+				return nil, sErr
+			}
 			if seen[r.ID] || strings.TrimSpace(r.PasswordCiphertext) != "" {
 				continue
 			}
@@ -243,6 +250,9 @@ func (idx *SearchIndex) Search(ctx context.Context, query string, limit int) ([]
 			if hit, ok := matchDoc(doc, tokens); ok {
 				hits = append(hits, hit)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -272,13 +282,90 @@ func splitQueryTokens(q string) []string {
 	return out
 }
 
+func indexFoldLowerNeedle(haystack string, lowerNeedle string) int {
+	if lowerNeedle == "" {
+		return 0
+	}
+	if len(haystack) == 0 {
+		return -1
+	}
+	firstRune, firstWidth := utf8.DecodeRuneInString(lowerNeedle)
+	isASCII := true
+	for i := 0; i < len(lowerNeedle); i++ {
+		if lowerNeedle[i] >= utf8.RuneSelf {
+			isASCII = false
+			break
+		}
+	}
+	if isASCII {
+		nLen := len(lowerNeedle)
+		if len(haystack) < nLen {
+			return -1
+		}
+		c0 := lowerNeedle[0]
+		limit := len(haystack) - nLen
+		for i := 0; i <= limit; i++ {
+			b := haystack[i]
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if b != c0 {
+				continue
+			}
+			match := true
+			for j := 1; j < nLen; j++ {
+				hb := haystack[i+j]
+				if hb >= 'A' && hb <= 'Z' {
+					hb += 'a' - 'A'
+				}
+				if hb != lowerNeedle[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return i
+			}
+		}
+		return -1
+	}
+
+	rest := lowerNeedle[firstWidth:]
+	for idx, r := range haystack {
+		if unicode.ToLower(r) != firstRune {
+			continue
+		}
+		rem := haystack[idx+utf8.RuneLen(r):]
+		if hasPrefixFoldLower(rem, rest) {
+			return idx
+		}
+	}
+	return -1
+}
+
+func hasPrefixFoldLower(s string, lowerPrefix string) bool {
+	for len(lowerPrefix) > 0 {
+		if len(s) == 0 {
+			return false
+		}
+		sr, sw := utf8.DecodeRuneInString(s)
+		pr, pw := utf8.DecodeRuneInString(lowerPrefix)
+		if unicode.ToLower(sr) != pr {
+			return false
+		}
+		s = s[sw:]
+		lowerPrefix = lowerPrefix[pw:]
+	}
+	return true
+}
+
 func matchDoc(doc searchDoc, tokens []string) (SearchHit, bool) {
 	score := 0
 	firstMatchByte := -1
 
 	for _, tok := range tokens {
-		inTitle := strings.Contains(doc.titleLower, tok)
-		posBody := strings.Index(doc.plainLower, tok)
+		inTitle := indexFoldLowerNeedle(doc.title, tok) >= 0
+		posBody := indexFoldLowerNeedle(doc.publicPlain, tok)
 		if !inTitle && posBody < 0 {
 			return SearchHit{}, false
 		}
@@ -293,7 +380,7 @@ func matchDoc(doc searchDoc, tokens []string) (SearchHit, bool) {
 		}
 	}
 
-	snippet := extractSafeSnippetFast(doc.publicPlain, doc.plainLower, tokens[0], firstMatchByte, 140)
+	snippet := extractSafeSnippetFast(doc.publicPlain, doc.publicPlain, tokens[0], firstMatchByte, 140)
 	return SearchHit{
 		ID:          doc.id,
 		Title:       doc.title,

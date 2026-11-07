@@ -13,11 +13,36 @@ html[data-volo-skin="volo-journal"] .studio-header {
   border-bottom-width: 3px;
 }
 
-html[data-volo-skin="volo-journal"] .studio-brand span {
+html[data-volo-skin="volo-journal"] .studio-brand__title {
   font-variant: small-caps;
   letter-spacing: 0.04em;
 }
 
-html[data-volo-skin="volo-journal"] .studio-grid {
+html[data-volo-skin="volo-journal"] .studio-layout,
+html[data-volo-skin="volo-journal"] .studio-layout--article {
   grid-template-columns: minmax(0, 1fr);
+}
+
+html[data-volo-skin="volo-journal"] .volo-toc-card.is-docked {
+  position: static;
+  width: auto;
+  top: auto !important;
+  left: auto !important;
+  box-shadow: none;
+}
+
+html[data-volo-skin="volo-journal"] .studio-footer {
+  width: min(820px, calc(100% - 48px));
+}
+
+html[data-volo-skin="volo-journal"] .journal-colophon {
+  font-size: 0.82rem;
+  color: var(--volo-muted);
+  margin-top: 4px;
+}
+
+@media (max-width: 760px) {
+  html[data-volo-skin="volo-journal"] .studio-footer {
+    width: calc(100% - 28px);
+  }
 }

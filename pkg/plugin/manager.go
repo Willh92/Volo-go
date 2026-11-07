@@ -4,13 +4,16 @@ import (
 	"archive/zip"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"io"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,6 +41,19 @@ const (
 	DefaultMaxFailures  = 5
 )
 
+// HookRejectedError signals an intentional business-rule rejection returned by a pre-action hook (e.g. comment.before_create).
+type HookRejectedError struct {
+	PluginID string
+	Reason   string
+}
+
+func (e *HookRejectedError) Error() string {
+	if strings.TrimSpace(e.Reason) != "" {
+		return e.Reason
+	}
+	return "rejected by plugin " + e.PluginID
+}
+
 // APIRequest represents a sanitized HTTP request routed to /plugins/<id>/api/*.
 type APIRequest struct {
 	Method         string            `json:"method"`
@@ -47,6 +63,7 @@ type APIRequest struct {
 	Body           string            `json:"body"`
 	Locale         string            `json:"locale"`
 	ClientIPMasked string            `json:"client_ip_masked"`
+	IsAdmin        bool              `json:"is_admin"`
 }
 
 // APIResponse represents a plugin's HTTP response from /plugins/<id>/api/*.
@@ -259,6 +276,9 @@ type Manager struct {
 	customResolver        security.ResolverFunc
 	allowLoopbackForTests bool
 
+	siteInfoFn   atomic.Pointer[func() map[string]any]
+	reqInspector atomic.Pointer[func(*http.Request) (bool, string)]
+
 	plugins map[string]*managedPlugin
 	closed  bool
 }
@@ -308,6 +328,46 @@ func NewManager(opts ManagerOptions) *Manager {
 func (m *Manager) Providers() *ProviderRegistry { return m.providers }
 func (m *Manager) Logger() *PluginLogger        { return m.logger }
 
+// SetSiteInfoFunc registers a host callback returning sanitized site metadata for volo.site.info().
+func (m *Manager) SetSiteInfoFunc(fn func() map[string]any) {
+	if fn == nil {
+		m.siteInfoFn.Store(nil)
+		return
+	}
+	m.siteInfoFn.Store(&fn)
+}
+
+func (m *Manager) getSiteInfo() map[string]any {
+	ptr := m.siteInfoFn.Load()
+	if ptr == nil || *ptr == nil {
+		return map[string]any{}
+	}
+	return (*ptr)()
+}
+
+// SetRequestInspector registers a host callback resolving (isAdmin, clientIPMasked) on /plugins/<id>/api/* requests.
+func (m *Manager) SetRequestInspector(fn func(r *http.Request) (isAdmin bool, clientIPMasked string)) {
+	if fn == nil {
+		m.reqInspector.Store(nil)
+		return
+	}
+	m.reqInspector.Store(&fn)
+}
+
+func (m *Manager) inspectRequest(r *http.Request) (bool, string) {
+	if ptr := m.reqInspector.Load(); ptr != nil && *ptr != nil {
+		return (*ptr)(r)
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	if addr, pErr := netip.ParseAddr(host); pErr == nil {
+		return false, security.MaskIP(addr)
+	}
+	return false, ""
+}
+
 // RegisterBuiltin registers a compiled-in Go plugin prior to or after DiscoverAndStart.
 func (m *Manager) RegisterBuiltin(ctx context.Context, bp BuiltinPlugin) error {
 	manifest := bp.Manifest()
@@ -331,7 +391,8 @@ func (m *Manager) RegisterBuiltin(ctx context.Context, bp BuiltinPlugin) error {
 }
 
 // DiscoverAndStart scans pluginsDir for external plugins (<pluginsDir>/<id>/manifest.json),
-// reconciles state with the `plugins` table, and activates all enabled, non-circuit-broken plugins.
+// reconciles state with the `plugins` table, and activates newly discovered enabled plugins.
+// Calling DiscoverAndStart multiple times is idempotent and never overwrites active runtimes or cron goroutines.
 func (m *Manager) DiscoverAndStart(ctx context.Context) error {
 	if strings.TrimSpace(m.pluginsDir) == "" {
 		return nil
@@ -348,6 +409,9 @@ func (m *Manager) DiscoverAndStart(ctx context.Context) error {
 		if !ent.IsDir() || strings.HasPrefix(ent.Name(), ".") {
 			continue
 		}
+		if _, alreadyLoaded := m.getPlugin(ent.Name()); alreadyLoaded {
+			continue
+		}
 		dir := filepath.Join(m.pluginsDir, ent.Name())
 		manifestBytes, rErr := os.ReadFile(filepath.Join(dir, "manifest.json"))
 		if rErr != nil {
@@ -362,12 +426,19 @@ func (m *Manager) DiscoverAndStart(ctx context.Context) error {
 			m.logger.Write(ent.Name(), "error", "discover", "directory name does not match manifest.id")
 			continue
 		}
+		if _, alreadyLoaded := m.getPlugin(manifest.ID); alreadyLoaded {
+			continue
+		}
 		mp, sErr := m.syncRecordWithDB(ctx, manifest, "external", dir, nil)
 		if sErr != nil {
 			m.logger.Write(manifest.ID, "error", "discover", sErr.Error())
 			continue
 		}
 		m.mu.Lock()
+		if _, exists := m.plugins[manifest.ID]; exists {
+			m.mu.Unlock()
+			continue
+		}
 		m.plugins[manifest.ID] = mp
 		m.mu.Unlock()
 
@@ -378,6 +449,70 @@ func (m *Manager) DiscoverAndStart(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// ReloadPlugin cleanly stops an existing plugin runtime (including cron tickers and providers),
+// re-reads its manifest and JS source from disk (for external plugins), and reactivates it if enabled.
+func (m *Manager) ReloadPlugin(ctx context.Context, pluginID string, locale string) (PluginSummary, error) {
+	idClean := strings.TrimSpace(pluginID)
+	if !validPluginIDRe.MatchString(idClean) {
+		return PluginSummary{}, fmt.Errorf("plugin: invalid plugin id %q", idClean)
+	}
+
+	existing, exists := m.getPlugin(idClean)
+	if exists && existing.kind == "builtin" {
+		m.deactivateRuntime(ctx, existing)
+		existing.mu.Lock()
+		shouldActivate := existing.enabled && existing.circuitState == CircuitClosed
+		existing.mu.Unlock()
+		if shouldActivate {
+			if err := m.activateRuntime(ctx, existing); err != nil {
+				m.recordFailure(ctx, existing, "reload", err)
+				return m.toSummary(existing, locale), err
+			}
+		}
+		return m.toSummary(existing, locale), nil
+	}
+
+	if strings.TrimSpace(m.pluginsDir) == "" {
+		return PluginSummary{}, fmt.Errorf("plugin %q not found", idClean)
+	}
+	dir := filepath.Join(m.pluginsDir, idClean)
+	manifestBytes, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		return PluginSummary{}, fmt.Errorf("plugin %q: read manifest.json: %w", idClean, err)
+	}
+	manifest, err := ParseManifest(manifestBytes)
+	if err != nil {
+		return PluginSummary{}, err
+	}
+	if manifest.ID != idClean {
+		return PluginSummary{}, fmt.Errorf("plugin %q: directory name does not match manifest.id %q", idClean, manifest.ID)
+	}
+
+	if exists {
+		m.deactivateRuntime(ctx, existing)
+	}
+
+	mp, err := m.syncRecordWithDB(ctx, manifest, "external", dir, nil)
+	if err != nil {
+		return PluginSummary{}, err
+	}
+	now := time.Now().Unix()
+	mp.updatedAt = now
+	_, _ = m.store.ExecContext(ctx, `UPDATE plugins SET version = ?, updated_at = ? WHERE id = ?`, manifest.Version, now, manifest.ID)
+
+	m.mu.Lock()
+	m.plugins[manifest.ID] = mp
+	m.mu.Unlock()
+
+	if mp.enabled && mp.circuitState == CircuitClosed {
+		if aErr := m.activateRuntime(ctx, mp); aErr != nil {
+			m.recordFailure(ctx, mp, "reload", aErr)
+			return m.toSummary(mp, locale), aErr
+		}
+	}
+	return m.toSummary(mp, locale), nil
 }
 
 func (m *Manager) syncRecordWithDB(
@@ -547,6 +682,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			logger:                m.logger,
 			hostI18n:              m.catalog,
 			getConfig:             mp.getConfigMap,
+			getSiteInfo:           m.getSiteInfo,
 			customResolver:        m.customResolver,
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		})
@@ -561,9 +697,21 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			return err
 		}
 
-		// Register JS AntiSpamProvider if declared in permissions.
+		// Register JS providers if declared in permissions.
 		if mp.manifest.HasPermission("provider:antispam") {
 			m.providers.RegisterAntiSpam(mp.manifest.ID, &gojaAntiSpamAdapter{
+				manager: m,
+				mp:      mp,
+			})
+		}
+		if mp.manifest.HasPermission("provider:notifier") {
+			m.providers.RegisterNotifier(mp.manifest.ID, &gojaNotifierAdapter{
+				manager: m,
+				mp:      mp,
+			})
+		}
+		if mp.manifest.HasPermission("provider:storage") {
+			m.providers.RegisterStorage(mp.manifest.ID, &gojaStorageAdapter{
 				manager: m,
 				mp:      mp,
 			})
@@ -1083,11 +1231,31 @@ func (m *Manager) DispatchHook(ctx context.Context, hookName string, payload any
 		}
 		res, invoked, err := m.invokeHook(ctx, mp, hookName, cur)
 		if err != nil {
+			var rej *HookRejectedError
+			if errors.As(err, &rej) {
+				m.recordSuccess(ctx, mp)
+				return cur, rej
+			}
 			m.recordFailure(ctx, mp, "hook:"+hookName, err)
 			continue
 		}
 		if invoked {
 			m.recordSuccess(ctx, mp)
+			if hookName == HookCommentBeforeCreate {
+				if allowVal, isBool := res.(bool); isBool && !allowVal {
+					return cur, &HookRejectedError{PluginID: mp.manifest.ID, Reason: "comment rejected by plugin"}
+				}
+				if resMap, isMap := res.(map[string]any); isMap {
+					if allowVal, hasAllow := resMap["allow"].(bool); hasAllow && !allowVal {
+						reason, _ := resMap["reason"].(string)
+						return cur, &HookRejectedError{PluginID: mp.manifest.ID, Reason: reason}
+					}
+					if rejVal, hasRej := resMap["reject"].(bool); hasRej && rejVal {
+						reason, _ := resMap["reason"].(string)
+						return cur, &HookRejectedError{PluginID: mp.manifest.ID, Reason: reason}
+					}
+				}
+			}
 			if res != nil {
 				cur = res
 			}
@@ -1211,7 +1379,10 @@ func (m *Manager) EditorQuickInserts(locale string) []EditorQuickInsertView {
 	var out []EditorQuickInsertView
 	for _, mp := range active {
 		for _, spec := range mp.manifest.UISlots {
-			if spec.Slot == SlotEditorQuickInsert && spec.QuickInsert != nil {
+			if spec.Slot != SlotEditorQuickInsert {
+				continue
+			}
+			if spec.QuickInsert != nil {
 				out = append(out, EditorQuickInsertView{
 					PluginID: mp.manifest.ID,
 					ID:       spec.QuickInsert.ID,
@@ -1220,7 +1391,82 @@ func (m *Manager) EditorQuickInserts(locale string) []EditorQuickInsertView {
 					Template: spec.QuickInsert.Template,
 				})
 			}
+			if spec.Dynamic {
+				out = append(out, m.invokeDynamicQuickInserts(mp, locale)...)
+			}
 		}
+	}
+	return out
+}
+
+func (m *Manager) invokeDynamicQuickInserts(mp *managedPlugin, locale string) []EditorQuickInsertView {
+	mp.mu.Lock()
+	enabled := mp.enabled && mp.circuitState == CircuitClosed
+	rt := mp.gojaRT
+	mp.mu.Unlock()
+	if !enabled || rt == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), m.hookTimeout)
+	defer cancel()
+
+	res, found, err := rt.invoke(ctx, m.hookTimeout, "editorQuickInserts", locale)
+	if !found && err == nil {
+		res, found, err = rt.invoke(ctx, m.hookTimeout, "renderSlot", SlotEditorQuickInsert, SlotRenderContext{Locale: locale})
+	}
+	if err != nil {
+		m.recordFailure(ctx, mp, "slot:"+SlotEditorQuickInsert, err)
+		return nil
+	}
+	if !found || res == nil {
+		return nil
+	}
+	m.recordSuccess(ctx, mp)
+
+	var items []any
+	switch raw := res.(type) {
+	case []any:
+		items = raw
+	case string:
+		_ = json.Unmarshal([]byte(raw), &items)
+	}
+	var out []EditorQuickInsertView
+	for i, it := range items {
+		itemMap, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		tmpl, _ := itemMap["template"].(string)
+		if strings.TrimSpace(tmpl) == "" {
+			continue
+		}
+		itemID, _ := itemMap["id"].(string)
+		if strings.TrimSpace(itemID) == "" {
+			itemID = fmt.Sprintf("dyn-%d", i+1)
+		}
+		var label string
+		switch lv := itemMap["label"].(type) {
+		case string:
+			label = lv
+		case map[string]any:
+			lblMap := make(map[string]string, len(lv))
+			for k, v := range lv {
+				lblMap[k] = fmt.Sprint(v)
+			}
+			label = ResolveLocalized(lblMap, locale)
+		}
+		if strings.TrimSpace(label) == "" {
+			label = itemID
+		}
+		icon, _ := itemMap["icon"].(string)
+		out = append(out, EditorQuickInsertView{
+			PluginID: mp.manifest.ID,
+			ID:       itemID,
+			Label:    label,
+			Icon:     icon,
+			Template: tmpl,
+		})
 	}
 	return out
 }
@@ -1290,13 +1536,16 @@ func (m *Manager) servePluginAPI(w http.ResponseWriter, r *http.Request, mp *man
 	if m.catalog != nil {
 		locale = m.catalog.ResolveRequest(r, "zh-CN", true)
 	}
+	isAdmin, ipMasked := m.inspectRequest(r)
 	apiReq := APIRequest{
-		Method:  r.Method,
-		Path:    subPath,
-		Query:   queryMap,
-		Headers: hdrMap,
-		Body:    string(bodyBytes),
-		Locale:  locale,
+		Method:         r.Method,
+		Path:           subPath,
+		Query:          queryMap,
+		Headers:        hdrMap,
+		Body:           string(bodyBytes),
+		Locale:         locale,
+		ClientIPMasked: ipMasked,
+		IsAdmin:        isAdmin,
 	}
 
 	reqCtx, cancel := context.WithTimeout(r.Context(), m.routeTimeout)
@@ -1589,6 +1838,145 @@ func (a *gojaAntiSpamAdapter) CheckComment(ctx context.Context, input CommentChe
 		return verdict, nil
 	}
 	return SpamVerdict{Action: SpamActionAllow}, nil
+}
+
+type gojaNotifierAdapter struct {
+	manager *Manager
+	mp      *managedPlugin
+}
+
+func (a *gojaNotifierAdapter) Name() string { return "plugin:" + a.mp.manifest.ID }
+
+func (a *gojaNotifierAdapter) Send(ctx context.Context, event NotificationEvent) error {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return errors.New("plugin notifier inactive")
+	}
+	timeout := a.manager.routeTimeout
+	if timeout < 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	_, found, err := rt.invoke(ctx, timeout, "sendNotification", event)
+	if !found && err == nil {
+		_, found, err = rt.invoke(ctx, timeout, "onNotify", event)
+	}
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:notifier", err)
+		return err
+	}
+	if !found {
+		return errors.New("sendNotification function not exported")
+	}
+	a.manager.recordSuccess(ctx, a.mp)
+	return nil
+}
+
+type gojaStorageAdapter struct {
+	manager *Manager
+	mp      *managedPlugin
+}
+
+func (a *gojaStorageAdapter) Name() string { return a.mp.manifest.ID }
+
+func (a *gojaStorageAdapter) Put(ctx context.Context, objectKey string, r io.Reader, size int64, contentType string) (string, error) {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return "", errors.New("plugin storage inactive")
+	}
+	const maxPluginStorageBytes = 64 << 20
+	if size > maxPluginStorageBytes {
+		return "", errors.New("plugin storage: payload exceeds 64 MiB limit")
+	}
+	rawBytes, err := io.ReadAll(io.LimitReader(r, maxPluginStorageBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(rawBytes) > maxPluginStorageBytes {
+		return "", errors.New("plugin storage: payload exceeds 64 MiB limit")
+	}
+	b64 := base64.StdEncoding.EncodeToString(rawBytes)
+	timeout := a.manager.cronTimeout
+	if timeout < 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	res, found, err := rt.invoke(ctx, timeout, "storagePut", objectKey, b64, contentType)
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:storage:put", err)
+		return "", err
+	}
+	if !found {
+		return "", errors.New("storagePut function not exported")
+	}
+	a.manager.recordSuccess(ctx, a.mp)
+
+	switch v := res.(type) {
+	case string:
+		u := strings.TrimSpace(v)
+		if u == "" {
+			return "", errors.New("storagePut returned empty URL")
+		}
+		return u, nil
+	case map[string]any:
+		if u, ok := v["url"].(string); ok && strings.TrimSpace(u) != "" {
+			return strings.TrimSpace(u), nil
+		}
+		if u, ok := v["public_url"].(string); ok && strings.TrimSpace(u) != "" {
+			return strings.TrimSpace(u), nil
+		}
+	}
+	return "", errors.New("storagePut must return a non-empty URL string")
+}
+
+func (a *gojaStorageAdapter) Delete(ctx context.Context, objectKey string) error {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return errors.New("plugin storage inactive")
+	}
+	_, found, err := rt.invoke(ctx, a.manager.routeTimeout, "storageDelete", objectKey)
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:storage:delete", err)
+		return err
+	}
+	if !found {
+		return nil
+	}
+	a.manager.recordSuccess(ctx, a.mp)
+	return nil
+}
+
+func (a *gojaStorageAdapter) HealthCheck(ctx context.Context) error {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return errors.New("plugin storage inactive")
+	}
+	res, found, err := rt.invoke(ctx, a.manager.routeTimeout, "storageHealthCheck")
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:storage:health", err)
+		return err
+	}
+	if found {
+		a.manager.recordSuccess(ctx, a.mp)
+		if okVal, isBool := res.(bool); isBool && !okVal {
+			return errors.New("plugin storage health check reported unhealthy")
+		}
+	}
+	return nil
 }
 
 // RedactArticleForPlugin enforces the 10th Privacy Surface:

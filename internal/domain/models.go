@@ -343,6 +343,7 @@ type MediaAsset struct {
 	ObjectKey     string `db:"object_key" json:"object_key"`
 	PublicURL     string `db:"public_url" json:"public_url"`
 	OriginalName  string `db:"original_name" json:"original_name"`
+	AltText       string `db:"alt_text" json:"alt_text"`
 	MIMEType      string `db:"mime_type" json:"mime_type"`
 	SizeBytes     int64  `db:"size_bytes" json:"size_bytes"`
 	Width         int    `db:"width" json:"width"`

@@ -87,6 +87,8 @@ func newHandler() *Handler {
 	if err != nil {
 		return h
 	}
+	var gzBuf bytes.Buffer
+	gzw, _ := gzip.NewWriterLevel(&gzBuf, gzip.BestCompression)
 	_ = fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, wErr error) error {
 		if wErr != nil || d.IsDir() || strings.HasSuffix(p, ".map") {
 			return nil
@@ -121,13 +123,13 @@ func newHandler() *Handler {
 
 		var gzBytes []byte
 		var etagGZ string
-		if isCompressible(p, ct) {
-			var buf bytes.Buffer
-			gzw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+		if isCompressible(p, ct) && gzw != nil {
+			gzBuf.Reset()
+			gzw.Reset(&gzBuf)
 			_, _ = gzw.Write(raw)
 			_ = gzw.Close()
-			if buf.Len() < len(raw) {
-				gzBytes = buf.Bytes()
+			if gzBuf.Len() < len(raw) {
+				gzBytes = append([]byte(nil), gzBuf.Bytes()...)
 				sumGZ := sha256.Sum256(gzBytes)
 				etagGZ = fmt.Sprintf(`"%x-gz"`, sumGZ[:12])
 			}
@@ -171,11 +173,12 @@ func (h *Handler) ServeMount(w http.ResponseWriter, r *http.Request, mountPrefix
 		return
 	}
 
-	// Otherwise serve SPA index.html shell with no-store cache control
+	// Otherwise serve SPA index.html shell with no-store cache control & strict CSP
 	rendered := h.renderIndexHTML(cleanMount+"/", boot)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Vary", "Accept-Encoding")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; media-src 'self' data: blob: https: http:; connect-src 'self' https:; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return

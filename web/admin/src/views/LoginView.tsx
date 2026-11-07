@@ -10,7 +10,7 @@ import {
   showToast,
   StaffUser,
 } from "../api";
-import { LocalePopover } from "../components/UIControls";
+import { LocalePopover, SwitchToggle } from "../components/UIControls";
 import { availableLocalesSig, ensureLocaleLoaded, localeSig, normalizeLocale, t } from "../i18n";
 
 export function LoginView() {
@@ -46,7 +46,7 @@ export function LoginView() {
         await refreshMe();
       }
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     } finally {
       setBusy(false);
     }
@@ -68,7 +68,7 @@ export function LoginView() {
       csrfTokenSig.value = res.csrf_token || "";
       await refreshMe();
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     } finally {
       setBusy(false);
     }
@@ -76,7 +76,7 @@ export function LoginView() {
 
   const handlePasskeyLogin = async () => {
     if (!window.PublicKeyCredential || !navigator.credentials) {
-      showToast(t("auth.passkey_https_only"));
+      showToast(t("auth.passkey_https_only"), "warn");
       return;
     }
     setBusy(true);
@@ -112,7 +112,7 @@ export function LoginView() {
       csrfTokenSig.value = res.csrf_token || "";
       await refreshMe();
     } catch (err: any) {
-      showToast(err?.message || t("auth.passkey_cancelled"));
+      showToast(err?.message || t("auth.passkey_cancelled"), "err");
     } finally {
       setBusy(false);
     }
@@ -298,14 +298,13 @@ export function LoginView() {
                       />
                     </div>
                   </div>
-                  <label style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "14px", fontSize: "13px" }}>
-                    <input
-                      type="checkbox"
+                  <div style={{ marginBottom: "14px" }}>
+                    <SwitchToggle
                       checked={rememberDevice}
-                      onChange={(e) => setRememberDevice((e.currentTarget as HTMLInputElement).checked)}
+                      onChange={setRememberDevice}
+                      label={t("auth.remember_2fa")}
                     />
-                    {t("auth.remember_2fa")}
-                  </label>
+                  </div>
                   <button type="submit" class="volo-btn volo-btn-primary volo-auth-submit" disabled={busy}>
                     {t("auth.verify")}
                   </button>

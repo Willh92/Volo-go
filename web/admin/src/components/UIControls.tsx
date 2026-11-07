@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { ComponentChildren, JSX } from "preact";
+import { confirmSig, resolveConfirm } from "../api";
 import type { LocaleOption } from "../i18n";
 import { t } from "../i18n";
 
@@ -31,6 +32,7 @@ export function ConsoleSelect({
   const [open, setOpen] = useState(false);
   const [closing, setClosing] = useState(false);
   const [flipUp, setFlipUp] = useState(false);
+  const [autoRight, setAutoRight] = useState(align === "right");
   const [focusIdx, setFocusIdx] = useState<number>(-1);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
@@ -83,6 +85,7 @@ export function ConsoleSelect({
       const rect = wrapRef.current.getBoundingClientRect();
       const spaceBelow = window.innerHeight - rect.bottom;
       setFlipUp(spaceBelow < 230 && rect.top > 220);
+      setAutoRight(align === "right" || (rect.left > window.innerWidth - 220 && rect.right > 180));
       const curIdx = options.findIndex((o) => o.value === value);
       setFocusIdx(curIdx >= 0 ? curIdx : 0);
     }
@@ -147,7 +150,7 @@ export function ConsoleSelect({
 
       {open && (
         <div
-          class={`volo-cselect-menu ${flipUp ? "flip-up" : ""} ${align === "right" ? "align-right" : ""} ${closing ? "is-closing" : ""}`}
+          class={`volo-cselect-menu ${flipUp ? "flip-up" : ""} ${autoRight ? "align-right" : ""} ${closing ? "is-closing" : ""}`}
           role="listbox"
         >
           {options.map((opt, idx) => {
@@ -419,6 +422,243 @@ export function AnimatedModal({
         {footer && <div class="volo-form-actions">{footer}</div>}
       </div>
     </div>
+  );
+}
+
+export interface SwitchToggleProps {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label?: ComponentChildren;
+  hint?: string;
+  disabled?: boolean;
+  className?: string;
+}
+
+export function SwitchToggle({
+  checked,
+  onChange,
+  label,
+  hint,
+  disabled = false,
+  className = "",
+}: SwitchToggleProps) {
+  return (
+    <label
+      class={`volo-switch-wrap ${disabled ? "is-disabled" : ""} ${className}`.trim()}
+      onClick={(e) => {
+        if (disabled) {
+          e.preventDefault();
+          return;
+        }
+        e.preventDefault();
+        onChange(!checked);
+      }}
+    >
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        disabled={disabled}
+        class={`volo-switch ${checked ? "is-on" : ""}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!disabled) onChange(!checked);
+        }}
+      >
+        <span class="volo-switch-thumb" />
+      </button>
+      {label && (
+        <span class="volo-switch-copy">
+          <span class="volo-switch-label">{label}</span>
+          {hint && <small class="volo-help">{hint}</small>}
+        </span>
+      )}
+    </label>
+  );
+}
+
+export interface UploadButtonProps {
+  accept?: string;
+  onFile: (file: File) => void;
+  busy?: boolean;
+  disabled?: boolean;
+  label: string;
+  busyLabel?: string;
+  primary?: boolean;
+  small?: boolean;
+  className?: string;
+}
+
+export function UploadButton({
+  accept,
+  onFile,
+  busy = false,
+  disabled = false,
+  label,
+  busyLabel,
+  primary = false,
+  small = true,
+  className = "",
+}: UploadButtonProps) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const isDisabled = busy || disabled;
+
+  return (
+    <>
+      <button
+        type="button"
+        disabled={isDisabled}
+        class={`volo-btn ${primary ? "volo-btn-primary" : ""} ${small ? "volo-btn-sm" : ""} ${dragging ? "is-dragover" : ""} ${className}`.trim()}
+        onClick={() => inputRef.current?.click()}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (!isDisabled) setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          if (isDisabled) return;
+          const f = e.dataTransfer?.files?.[0];
+          if (f) onFile(f);
+        }}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+          <polyline points="17 8 12 3 7 8" />
+          <line x1="12" y1="3" x2="12" y2="15" />
+        </svg>
+        <span>{busy ? busyLabel || t("ed.uploading") : label}</span>
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept={accept}
+        style={{ display: "none" }}
+        disabled={isDisabled}
+        onChange={(e) => {
+          const f = (e.currentTarget as HTMLInputElement).files?.[0];
+          if (f) onFile(f);
+          (e.currentTarget as HTMLInputElement).value = "";
+        }}
+      />
+    </>
+  );
+}
+
+export interface BatchBarProps {
+  count: number;
+  onClear: () => void;
+  children: ComponentChildren;
+}
+
+export function BatchBar({ count, onClear, children }: BatchBarProps) {
+  if (count <= 0) return null;
+  return (
+    <div class="volo-batch-bar" role="region" aria-label={t("ui.batch_label")}>
+      <div class="volo-batch-count">
+        <span class="volo-batch-num">{count}</span>
+        <span>{t("ui.batch_selected", { n: count })}</span>
+      </div>
+      <div class="volo-batch-actions">
+        {children}
+        <button type="button" class="volo-act-btn" onClick={onClear}>
+          {t("ui.batch_clear")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function ConsoleEmpty({
+  text,
+  hint,
+  colSpan,
+}: {
+  text?: string;
+  hint?: string;
+  colSpan?: number;
+}) {
+  const inner = (
+    <div class="volo-empty-box">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2.5" />
+        <path d="M3 14h5l2 2.5h4L16 14h5" />
+      </svg>
+      <div class="volo-empty-title">{text || t("tbl.empty")}</div>
+      {hint && <div class="volo-help">{hint}</div>}
+    </div>
+  );
+  if (colSpan) {
+    return (
+      <tr>
+        <td colSpan={colSpan} class="volo-empty-state">
+          {inner}
+        </td>
+      </tr>
+    );
+  }
+  return <div class="volo-empty-state">{inner}</div>;
+}
+
+export function TableSkeleton({ cols = 5, rows = 4 }: { cols?: number; rows?: number }) {
+  return (
+    <>
+      {Array.from({ length: rows }).map((_, rIdx) => (
+        <tr key={rIdx} class="volo-skel-tr">
+          {Array.from({ length: cols }).map((__, cIdx) => (
+            <td key={cIdx}>
+              <div class={`volo-skel-bar ${cIdx === 0 ? "is-wide" : ""}`} />
+            </td>
+          ))}
+        </tr>
+      ))}
+    </>
+  );
+}
+
+export function GlobalConfirmModal() {
+  const cur = confirmSig.value;
+  return (
+    <AnimatedModal
+      open={Boolean(cur)}
+      onClose={() => resolveConfirm(false)}
+      title={cur?.title || t("ui.confirm_title")}
+      maxWidth="450px"
+      footer={
+        <>
+          <button type="button" class="volo-btn" onClick={() => resolveConfirm(false)}>
+            {t("common.cancel")}
+          </button>
+          <button
+            type="button"
+            class={`volo-btn ${cur?.danger !== false ? "volo-btn-danger" : "volo-btn-primary"}`}
+            onClick={() => resolveConfirm(true)}
+          >
+            {cur?.confirmText || t("ui.confirm_ok")}
+          </button>
+        </>
+      }
+    >
+      <p style={{ margin: "2px 0 8px", fontSize: "13.5px", lineHeight: 1.6, color: "var(--volo-text)" }}>
+        {cur?.message || ""}
+      </p>
+      {cur?.items && cur.items.length > 0 && (
+        <div class="volo-confirm-list">
+          {cur.items.slice(0, 60).map((it, i) => (
+            <div key={i} class="volo-confirm-list-item">
+              {it}
+            </div>
+          ))}
+          {cur.items.length > 60 && (
+            <div class="volo-help" style={{ padding: "4px 6px" }}>
+              +{cur.items.length - 60}…
+            </div>
+          )}
+        </div>
+      )}
+    </AnimatedModal>
   );
 }
 

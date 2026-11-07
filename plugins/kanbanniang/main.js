@@ -13,8 +13,8 @@ function safeSettings(locale) {
   var cfg = volo.config.all() || {};
   var ch = String(cfg.character || "neko");
   if (!ALLOWED_CHARACTERS[ch]) ch = "neko";
-  var pos = String(cfg.position || "right");
-  if (!ALLOWED_POSITIONS[pos]) pos = "right";
+  var pos = String(cfg.position || "left");
+  if (!ALLOWED_POSITIONS[pos]) pos = "left";
   var isEN = String(locale || "").toLowerCase().indexOf("en") === 0;
   var greeting = isEN
     ? cfg.greeting_en || "Welcome! Click me for a head-pat~"
@@ -57,6 +57,8 @@ function renderSlot(slotName, slotCtx) {
     return (
       '<aside id="volo-kanbanniang-root" class="' +
       cls +
+      '" data-position="' +
+      escapeAttr(st.position) +
       '" data-character="' +
       escapeAttr(st.character) +
       '" data-greeting="' +

@@ -55,15 +55,49 @@ if (bootConfig.locales) {
   registerExternalLocales(bootConfig.locales);
 }
 
+export type ToastKind = "ok" | "err" | "warn";
+export interface ToastItem {
+  id: number;
+  text: string;
+  kind: ToastKind;
+  closing?: boolean;
+}
+
+export interface ConfirmOptions {
+  title?: string;
+  message: string;
+  confirmText?: string;
+  danger?: boolean;
+  items?: string[];
+}
+
 export const csrfTokenSig = signal<string>("");
 export const currentUserSig = signal<StaffUser | null>(null);
-export const toastSig = signal<string>("");
+export const toastSig = signal<ToastItem | null>(null);
+export const confirmSig = signal<(ConfirmOptions & { resolve: (ok: boolean) => void }) | null>(null);
+export const dirtyEditorSig = signal<boolean>(false);
 export const busyCountSig = signal<number>(0);
 export const themeModeSig = signal<string>(
   localStorage.getItem("volo_console_theme") || bootConfig.default_theme || "auto"
 );
 export const accentSig = signal<string>(bootConfig.accent || "forest");
 export const storageDriverSig = signal<string>("local");
+
+export function openConfirm(opts: ConfirmOptions | string): Promise<boolean> {
+  const norm: ConfirmOptions = typeof opts === "string" ? { message: opts, danger: true } : opts;
+  return new Promise<boolean>((resolve) => {
+    if (confirmSig.value) {
+      confirmSig.value.resolve(false);
+    }
+    confirmSig.value = { danger: true, ...norm, resolve };
+  });
+}
+
+export function resolveConfirm(ok: boolean) {
+  const cur = confirmSig.value;
+  confirmSig.value = null;
+  if (cur) cur.resolve(ok);
+}
 
 export function resetConsoleScroll() {
   if (typeof window !== "undefined") {
@@ -80,12 +114,30 @@ export function resetConsoleScroll() {
 }
 
 let toastTimer: number | undefined;
-export function showToast(msg: string) {
-  toastSig.value = msg;
+let toastCloseTimer: number | undefined;
+let toastSeq = 0;
+
+function inferToastKind(msg: string): ToastKind {
+  if (/(HTTP \d{3}|fail|error|invalid|denied|forbid|timeout|cannot|unable|失败|错误|无效|拒绝|异常|超时|必填|不能为空)/i.test(msg)) {
+    return "err";
+  }
+  return "ok";
+}
+
+function scheduleToastDismiss(delayMs: number) {
   if (toastTimer) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => {
-    toastSig.value = "";
-  }, 3600);
+    dismissToast();
+  }, delayMs);
+}
+
+export function showToast(msg: string, kind?: ToastKind) {
+  if (!msg) return;
+  if (toastTimer) window.clearTimeout(toastTimer);
+  if (toastCloseTimer) window.clearTimeout(toastCloseTimer);
+  const resolvedKind = kind || inferToastKind(msg);
+  toastSig.value = { id: ++toastSeq, text: msg, kind: resolvedKind, closing: false };
+  scheduleToastDismiss(resolvedKind === "err" ? 4600 : 3400);
 }
 
 export function pauseToast() {
@@ -96,11 +148,8 @@ export function pauseToast() {
 }
 
 export function resumeToast() {
-  if (!toastSig.value) return;
-  if (toastTimer) window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => {
-    toastSig.value = "";
-  }, 1800);
+  if (!toastSig.value || toastSig.value.closing) return;
+  scheduleToastDismiss(1800);
 }
 
 export function dismissToast() {
@@ -108,7 +157,13 @@ export function dismissToast() {
     window.clearTimeout(toastTimer);
     toastTimer = undefined;
   }
-  toastSig.value = "";
+  const cur = toastSig.value;
+  if (!cur || cur.closing) return;
+  toastSig.value = { ...cur, closing: true };
+  if (toastCloseTimer) window.clearTimeout(toastCloseTimer);
+  toastCloseTimer = window.setTimeout(() => {
+    toastSig.value = null;
+  }, 160);
 }
 
 export function applyThemeAttributes(mode: string, accent: string, _persistAccent = false) {

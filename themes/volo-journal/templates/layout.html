@@ -4,6 +4,7 @@
       data-default-mode="{{.Appearance.DefaultMode}}"
       data-accent="{{.Appearance.Accent}}"
       data-pjax="{{if .EnablePJAX}}true{{else}}false{{end}}"
+      data-cdn-prefix="{{.Reading.AssetCDNPrefix}}"
       data-i18n-copy="{{t .Locale "article.copy_code"}}"
       data-i18n-copied="{{t .Locale "article.copied_code"}}">
 <head>
@@ -20,7 +21,7 @@
   <meta property="og:description" content="{{.MetaDescription}}">
   <meta property="og:type" content="{{if .IsArticle}}article{{else}}website{{end}}">
   {{if .CanonicalURL}}<meta property="og:url" content="{{.CanonicalURL}}">{{end}}
-  {{if .OGImage}}<link rel="preload" as="image" href="{{.OGImage}}"><meta property="og:image" content="{{.OGImage}}">{{end}}
+  {{if .OGImage}}<meta property="og:image" content="{{.OGImage}}">{{end}}
   <meta name="twitter:card" content="{{if .OGImage}}summary_large_image{{else}}summary{{end}}">
   <link rel="alternate" type="application/rss+xml" title="{{.Site.Title}} RSS" href="/rss.xml">
   <link rel="alternate" type="application/atom+xml" title="{{.Site.Title}} Atom" href="/atom.xml">
@@ -49,6 +50,7 @@
 <body class="studio-page">
   <div id="volo-pjax-bar" class="volo-pjax-bar" aria-hidden="true"></div>
   <div id="volo-read-bar" class="volo-read-bar" aria-hidden="true"></div>
+  <a class="studio-skip" href="#studio-main">{{t .Locale "studio.skip_to_content"}}</a>
 
   <header class="studio-header">
     <div class="studio-container studio-header__inner">
@@ -59,55 +61,63 @@
         {{else}}
           <span class="studio-brand__mark" aria-hidden="true">V.</span>
         {{end}}
-        <span class="studio-brand__copy">
+        <span class="studio-brand-copy">
           <span class="studio-brand__title">{{.Site.Title}}</span>
-          <span class="studio-brand__tagline">{{default (default (t .Locale "studio.brand_tagline") .Site.Subtitle) (themeCfg .ThemeConfig "journal_motto" "")}}</span>
+          <small>{{default (default (t .Locale "studio.brand_tagline") .Site.Subtitle) (themeCfg .ThemeConfig "journal_motto" "")}}</small>
         </span>
       </a>
 
       <nav class="studio-nav" aria-label="Primary">
         <a class="studio-nav__link {{if eq .CurrentPath "/"}}is-active{{end}}" href="/">{{t .Locale "nav.home"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/categories"}}is-active{{end}}" href="/categories">{{t .Locale "nav.categories"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/tags"}}is-active{{end}}" href="/tags">{{t .Locale "nav.tags"}}</a>
         <a class="studio-nav__link {{if hasPrefix .CurrentPath "/archives"}}is-active{{end}}" href="/archives">{{t .Locale "nav.archives"}}</a>
-        <div class="studio-custom-links">
-          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/series"}}is-active{{end}}" href="/series">{{t .Locale "nav.series"}}</a>
-          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/books"}}is-active{{end}}" href="/books">{{t .Locale "nav.bookshelf"}}</a>
-          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/links"}}is-active{{end}}" href="/links">{{t .Locale "nav.links"}}</a>
-          <a class="studio-nav__link {{if hasPrefix .CurrentPath "/follows"}}is-active{{end}}" href="/follows">{{t .Locale "nav.follows"}}</a>
-          {{range .NavItems}}
-            {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
-              <a class="studio-nav__link {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>{{navIconHTML .Icon}}<span>{{.Title}}</span></a>
-            {{end}}
-          {{end}}
-        </div>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/tags"}}is-active{{end}}" href="/tags">{{t .Locale "nav.tags"}}</a>
+        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/categories"}}is-active{{end}}" href="/categories">{{t .Locale "nav.categories"}}</a>
 
-        <div class="studio-nav-more studio-only-mobile">
-          <button type="button" id="volo-nav-more-btn" class="studio-nav__link studio-nav-more__summary" aria-haspopup="menu" aria-expanded="false">
+        {{if .NavItems}}
+          <div class="studio-custom-links">
+            {{range .NavItems}}
+              {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
+                <a class="studio-nav__link {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
+                  {{navIconHTML .Icon}}<span>{{.Title}}</span>
+                </a>
+              {{end}}
+            {{end}}
+          </div>
+        {{end}}
+
+        <div class="studio-nav-more">
+          <button type="button" id="volo-nav-more-btn" class="studio-nav__link studio-nav-more__summary {{if or (hasPrefix .CurrentPath "/series") (hasPrefix .CurrentPath "/books") (hasPrefix .CurrentPath "/links") (hasPrefix .CurrentPath "/follows") (hasPrefix .CurrentPath "/dynamic")}}is-active{{end}}" aria-haspopup="menu" aria-expanded="false">
             <span>{{t .Locale "nav.more"}}</span>
             <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <div id="volo-nav-more-menu" class="volo-popover studio-nav-more__menu" role="menu" hidden>
+            {{range .NavItems}}
+              {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
+                <a class="studio-nav-more__item studio-only-mobile {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" role="menuitem" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
+                  {{navIconHTML .Icon}}<span>{{.Title}}</span>
+                </a>
+              {{end}}
+            {{end}}
             <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/series"}}is-active{{end}}" href="/series" role="menuitem"><span>{{t .Locale "nav.series"}}</span></a>
             <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/books"}}is-active{{end}}" href="/books" role="menuitem">{{navIconHTML "book"}}<span>{{t .Locale "nav.bookshelf"}}</span></a>
             <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/links"}}is-active{{end}}" href="/links" role="menuitem"><span>{{t .Locale "nav.links"}}</span></a>
             <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/follows"}}is-active{{end}}" href="/follows" role="menuitem"><span>{{t .Locale "nav.follows"}}</span></a>
-            {{range .NavItems}}
-              {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
-                <a class="studio-nav-more__item {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" role="menuitem" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>{{navIconHTML .Icon}}<span>{{.Title}}</span></a>
-              {{end}}
-            {{end}}
+            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/dynamic"}}is-active{{end}}" href="/dynamic" role="menuitem"><span>{{t .Locale "nav.dynamic"}}</span></a>
             {{if .Viewer}}
-              <div class="volo-appearance__divider"></div>
+              <div class="volo-appearance__divider studio-only-mobile"></div>
               {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
-                <a class="studio-nav-more__item" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
-                <a class="studio-nav-more__item" href="/logout" data-no-pjax role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></a>
+                <a class="studio-nav-more__item studio-only-mobile" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
+                <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                  <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></button>
+                </form>
               {{else}}
-                <a class="studio-nav-more__item" href="/logout" data-no-pjax role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></a>
+                <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                  <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></button>
+                </form>
               {{end}}
             {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
-              <div class="volo-appearance__divider"></div>
-              <a class="studio-nav-more__item" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><span>{{t .Locale "nav.login"}}</span></a>
+              <div class="volo-appearance__divider studio-only-mobile"></div>
+              <a class="studio-nav-more__item studio-only-mobile" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><span>{{t .Locale "nav.login"}}</span></a>
             {{end}}
           </div>
         </div>
@@ -116,7 +126,7 @@
       <div class="studio-actions">
         {{if .Reading.EnableInstantSearch}}
           <button type="button" id="volo-search-btn" class="studio-icon-btn studio-icon-btn--square" title="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}">
-            <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>
           </button>
         {{end}}
 
@@ -146,6 +156,7 @@
             <button type="button" id="volo-lang-btn" class="studio-icon-btn" aria-haspopup="menu" aria-expanded="false" title="{{t .Locale "appearance.switch_lang"}}">
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg>
               <span class="volo-lang-btn__text">{{$curLocaleName}}</span>
+              <svg class="volo-lang-caret" viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 6.5 3.5 3.5 3.5-3.5"/></svg>
             </button>
             <div id="volo-lang-menu" class="volo-popover volo-appearance__menu volo-lang-menu" role="menu" hidden>
               {{range .Locales}}
@@ -163,13 +174,17 @@
             <a class="studio-icon-btn studio-auth-btn" href="{{.AdminPath}}" data-no-pjax title="{{t .Locale "nav.admin_console"}}" aria-label="{{t .Locale "nav.admin_console"}}">
               {{navIconHTML "admin"}}<span class="studio-auth-btn__label">{{t .Locale "nav.admin_console"}}</span>
             </a>
-            <a class="studio-icon-btn studio-auth-btn" href="/logout" data-no-pjax title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
-              {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
-            </a>
+            <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+              <button type="submit" class="studio-icon-btn studio-auth-btn" title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+                {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
+              </button>
+            </form>
           {{else}}
-            <a id="volo-reader-logout" class="studio-icon-btn studio-auth-btn" href="/logout" data-no-pjax title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
-              {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
-            </a>
+            <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+              <button id="volo-reader-logout" type="submit" class="studio-icon-btn studio-auth-btn" title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+                {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
+              </button>
+            </form>
           {{end}}
         {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
           <a class="studio-icon-btn studio-auth-btn" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}}>
@@ -179,29 +194,43 @@
       </div>
     </div>
   </header>
+  {{if .HeaderWidgets}}
+    <div class="studio-container studio-header-widgets">
+      {{range .HeaderWidgets}}{{safeHTML .HTML}}{{end}}
+    </div>
+  {{end}}
 
   <main id="studio-main" class="studio-container">
     {{template "content" .}}
   </main>
 
   <footer class="studio-footer">
-    <div class="studio-container" style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px">
+    {{if .Site.SocialLinks}}
+      <nav class="studio-contacts" aria-label="Contacts">
+        {{range .Site.SocialLinks}}
+          <a class="studio-contact-btn" href="{{safeURL .URL}}" target="_blank" rel="me noopener" title="{{.Label}}" aria-label="{{.Label}}" data-no-pjax>{{socialIconSVG .Icon}}</a>
+        {{end}}
+        <a class="studio-contact-btn" href="/rss.xml" title="{{t .Locale "footer.rss"}}" aria-label="{{t .Locale "footer.rss"}}" data-no-pjax>{{socialIconSVG "rss"}}</a>
+      </nav>
+    {{end}}
+    <div class="studio-footer-meta">
       <div>
-        <strong>{{.Site.Title}}</strong>
-        {{if .Site.FooterText}} · <span>{{.Site.FooterText}}</span>{{end}}
+        <span>© {{if .Year}}{{.Year}} {{end}}{{.Site.Title}}{{if .Site.FooterText}} · {{.Site.FooterText}}{{end}}</span>
         {{template "journal_colophon" .}}
       </div>
-      <div style="display:flex;gap:14px;flex-wrap:wrap">
-        <a href="/rss.xml" data-no-pjax>{{t .Locale "footer.rss"}}</a>
-        {{if .Feed.Podcast.Enabled}}<a href="/podcast.xml" data-no-pjax>{{t .Locale "podcast.subscribe_rss"}}</a>{{end}}
-        <a href="/sitemap.xml" data-no-pjax>{{t .Locale "footer.sitemap"}}</a>
-        {{if .Feed.EnableLLMSTxt}}<a href="/llms.txt" data-no-pjax>llms.txt</a>{{end}}
-      </div>
+      <span>Made with <a href="https://github.com/Willh92/Volo-go" target="_blank" rel="noopener noreferrer" data-no-pjax>Volo</a> · Journal</span>
+    </div>
+    <div class="studio-statistics">
+      <a href="/rss.xml" data-no-pjax>{{t .Locale "footer.rss"}}</a>
+      {{if .Feed.Podcast.Enabled}}<a href="/podcast.xml" data-no-pjax>{{t .Locale "podcast.subscribe_rss"}}</a>{{end}}
+      <a href="/sitemap.xml" data-no-pjax>{{t .Locale "footer.sitemap"}}</a>
+      {{if .Feed.EnableLLMSTxt}}<a href="/llms.txt" data-no-pjax>llms.txt</a>{{end}}
     </div>
   </footer>
 
+  {{$hasMobileTOC := or (and .IsArticle (not .Detail.RequiresPassword) (gt (len .Detail.TOC) 0)) (and .IsStandalonePage .StandalonePage.ShowTOC (gt (len .StandalonePage.TOC) 0))}}
   <div class="studio-fab-dock" aria-label="Quick actions">
-    <button id="volo-mobile-toc-btn" class="studio-fab-btn studio-fab-btn--toc" type="button" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" aria-expanded="false" hidden>
+    <button id="volo-mobile-toc-btn" class="studio-fab-btn studio-fab-btn--toc" type="button" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" aria-expanded="false" {{if not $hasMobileTOC}}hidden{{end}}>
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
       <span class="studio-fab-btn__text">{{t .Locale "article.toc_title"}}</span>
     </button>
@@ -224,13 +253,17 @@
       <div id="volo-search-results" class="volo-search-results" role="listbox"></div>
       <div class="volo-search-foot">
         <span>{{t .Locale "search.shortcut_hint"}}</span>
-        <span>Ctrl+K / /</span>
+        <span class="volo-search-foot__kbd">Ctrl+K / /</span>
       </div>
     </div>
   </div>
 
-  <div id="volo-lightbox" class="volo-lightbox" hidden role="dialog" aria-modal="true">
-    <img id="volo-lightbox-img" class="volo-lightbox__img" alt="">
+  <div id="volo-lightbox" class="volo-lightbox" hidden role="dialog" aria-modal="true" aria-label="{{t .Locale "studio.lightbox_label"}}">
+    <button type="button" class="volo-lightbox__close" data-lightbox-close aria-label="{{t .Locale "studio.lightbox_close"}}">✕</button>
+    <figure class="volo-lightbox__figure">
+      <img id="volo-lightbox-img" class="volo-lightbox__img" alt="">
+      <figcaption id="volo-lightbox-caption" class="volo-lightbox__caption" hidden></figcaption>
+    </figure>
   </div>
 
   <div id="volo-persist-dock" data-volo-persist="plugins">

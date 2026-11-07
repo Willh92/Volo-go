@@ -27,6 +27,14 @@ const (
 	legacyBoloMD5Prefix = "bolomd5x2$"
 )
 
+var argonSem = make(chan struct{}, 2)
+
+func deriveArgon2Key(password, salt []byte, timeCost, mem uint32, threads uint8, keyLen uint32) []byte {
+	argonSem <- struct{}{}
+	defer func() { <-argonSem }()
+	return argon2.IDKey(password, salt, timeCost, mem, threads, keyLen)
+}
+
 const (
 	// MinPasswordLength is the minimum allowed password length in runes.
 	MinPasswordLength = 6
@@ -59,7 +67,7 @@ func HashPassword(raw string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("auth: generate salt: %w", err)
 	}
-	dk := argon2.IDKey([]byte(raw), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+	dk := deriveArgon2Key([]byte(raw), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
 	b64Salt := base64.RawStdEncoding.EncodeToString(salt)
 	b64Key := base64.RawStdEncoding.EncodeToString(dk)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
@@ -113,7 +121,7 @@ func verifyArgon2id(raw string, encoded string) (bool, bool) {
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &mem, &timeCost, &threads); err != nil {
 		return false, false
 	}
-	if mem < 8*1024 || mem > 512*1024 || timeCost < 1 || timeCost > 16 || threads < 1 {
+	if mem < 8*1024 || mem > argon2Memory || timeCost < 1 || timeCost > 16 || threads < 1 || threads > 4 {
 		return false, false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
@@ -124,7 +132,7 @@ func verifyArgon2id(raw string, encoded string) (bool, bool) {
 	if err != nil || len(expected) < 16 {
 		return false, false
 	}
-	actual := argon2.IDKey([]byte(raw), salt, timeCost, mem, threads, uint32(len(expected)))
+	actual := deriveArgon2Key([]byte(raw), salt, timeCost, mem, threads, uint32(len(expected)))
 	if subtle.ConstantTimeCompare(actual, expected) != 1 {
 		return false, false
 	}

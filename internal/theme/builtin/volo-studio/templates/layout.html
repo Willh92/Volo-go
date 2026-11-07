@@ -3,6 +3,7 @@
       data-default-mode="{{.Appearance.DefaultMode}}"
       data-accent="{{.Appearance.Accent}}"
       data-pjax="{{if .EnablePJAX}}true{{else}}false{{end}}"
+      data-cdn-prefix="{{.Reading.AssetCDNPrefix}}"
       data-i18n-copy="{{t .Locale "article.copy_code"}}"
       data-i18n-copied="{{t .Locale "article.copied_code"}}">
 <head>
@@ -104,9 +105,13 @@
               <div class="volo-appearance__divider studio-only-mobile"></div>
               {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
                 <a class="studio-nav-more__item studio-only-mobile" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
-                <a class="studio-nav-more__item studio-only-mobile" href="/logout" data-no-pjax role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></a>
+                <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                  <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></button>
+                </form>
               {{else}}
-                <a class="studio-nav-more__item studio-only-mobile" href="/logout" data-no-pjax role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></a>
+                <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                  <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></button>
+                </form>
               {{end}}
             {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
               <div class="volo-appearance__divider studio-only-mobile"></div>
@@ -167,13 +172,17 @@
             <a class="studio-icon-btn studio-auth-btn" href="{{.AdminPath}}" data-no-pjax title="{{t .Locale "nav.admin_console"}}" aria-label="{{t .Locale "nav.admin_console"}}">
               {{navIconHTML "admin"}}<span class="studio-auth-btn__label">{{t .Locale "nav.admin_console"}}</span>
             </a>
-            <a class="studio-icon-btn studio-auth-btn" href="/logout" data-no-pjax title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
-              {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
-            </a>
+            <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+              <button type="submit" class="studio-icon-btn studio-auth-btn" title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+                {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
+              </button>
+            </form>
           {{else}}
-            <a id="volo-reader-logout" class="studio-icon-btn studio-auth-btn" href="/logout" data-no-pjax title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
-              {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
-            </a>
+            <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+              <button id="volo-reader-logout" type="submit" class="studio-icon-btn studio-auth-btn" title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+                {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
+              </button>
+            </form>
           {{end}}
         {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
           <a class="studio-icon-btn studio-auth-btn" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}}>
@@ -183,6 +192,11 @@
       </div>
     </div>
   </header>
+  {{if .HeaderWidgets}}
+    <div class="studio-container studio-header-widgets">
+      {{range .HeaderWidgets}}{{safeHTML .HTML}}{{end}}
+    </div>
+  {{end}}
 
   <main id="studio-main" class="studio-container">
     {{template "content" .}}
@@ -202,9 +216,11 @@
       <span>Made with <a href="https://github.com/Willh92/Volo-go" target="_blank" rel="noopener noreferrer" data-no-pjax>Volo</a> · Studio</span>
     </div>
     <div class="studio-statistics">
-      <span>{{t .Locale "studio.articles_count" (dict "count" .Stats.ArticleCount)}}</span>
-      <a href="/dynamic">{{t .Locale "studio.comments_count" (dict "count" .Stats.CommentCount)}}</a>
-      <span>{{t .Locale "studio.views_count" (dict "count" .Stats.ViewCount)}}</span>
+      {{if themeCfgBool .ThemeConfig "show_site_stats" true}}
+        <span>{{t .Locale "studio.articles_count" (dict "count" .Stats.ArticleCount)}}</span>
+        <a href="/dynamic">{{t .Locale "studio.comments_count" (dict "count" .Stats.CommentCount)}}</a>
+        <span>{{t .Locale "studio.views_count" (dict "count" .Stats.ViewCount)}}</span>
+      {{end}}
       <a href="/rss.xml" data-no-pjax>{{t .Locale "footer.rss"}}</a>
       {{if .Feed.Podcast.Enabled}}<a href="/podcast.xml" data-no-pjax>{{t .Locale "podcast.subscribe_rss"}}</a>{{end}}
       <a href="/sitemap.xml" data-no-pjax>{{t .Locale "footer.sitemap"}}</a>
@@ -212,8 +228,9 @@
     </div>
   </footer>
 
+  {{$hasMobileTOC := or (and .IsArticle (not .Detail.RequiresPassword) (gt (len .Detail.TOC) 0)) (and .IsStandalonePage .StandalonePage.ShowTOC (gt (len .StandalonePage.TOC) 0))}}
   <div class="studio-fab-dock" aria-label="Quick actions">
-    <button id="volo-mobile-toc-btn" class="studio-fab-btn studio-fab-btn--toc" type="button" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" aria-expanded="false" hidden>
+    <button id="volo-mobile-toc-btn" class="studio-fab-btn studio-fab-btn--toc" type="button" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" aria-expanded="false" {{if not $hasMobileTOC}}hidden{{end}}>
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
       <span class="studio-fab-btn__text">{{t .Locale "article.toc_title"}}</span>
     </button>
@@ -236,13 +253,17 @@
       <div id="volo-search-results" class="volo-search-results" role="listbox"></div>
       <div class="volo-search-foot">
         <span>{{t .Locale "search.shortcut_hint"}}</span>
-        <span>Ctrl+K / /</span>
+        <span class="volo-search-foot__kbd">Ctrl+K / /</span>
       </div>
     </div>
   </div>
 
-  <div id="volo-lightbox" class="volo-lightbox" hidden role="dialog" aria-modal="true">
-    <img id="volo-lightbox-img" class="volo-lightbox__img" alt="">
+  <div id="volo-lightbox" class="volo-lightbox" hidden role="dialog" aria-modal="true" aria-label="{{t .Locale "studio.lightbox_label"}}">
+    <button type="button" class="volo-lightbox__close" data-lightbox-close aria-label="{{t .Locale "studio.lightbox_close"}}">✕</button>
+    <figure class="volo-lightbox__figure">
+      <img id="volo-lightbox-img" class="volo-lightbox__img" alt="">
+      <figcaption id="volo-lightbox-caption" class="volo-lightbox__caption" hidden></figcaption>
+    </figure>
   </div>
 
   <!-- Persistent Plugin & Media Islands Surviving PJAX Transitions -->

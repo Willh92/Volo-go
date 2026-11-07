@@ -33,14 +33,14 @@ func (p *Pipeline) ScanOrphans(ctx context.Context, deleteOrphans bool) ([]domai
 		return []domain.MediaAsset{}, nil
 	}
 
-	corpus, err := p.collectAll9ReferenceScopes(ctx)
+	referenced, err := p.streamReferencedAssetIndexes(ctx, assets)
 	if err != nil {
 		return nil, err
 	}
 
 	orphans := make([]domain.MediaAsset, 0)
-	for _, a := range assets {
-		if isAssetReferencedInCorpus(a, corpus) {
+	for i, a := range assets {
+		if referenced[i] {
 			continue
 		}
 		orphans = append(orphans, a)
@@ -54,27 +54,54 @@ func (p *Pipeline) ScanOrphans(ctx context.Context, deleteOrphans bool) ([]domai
 	return orphans, nil
 }
 
-func isAssetReferencedInCorpus(a domain.MediaAsset, corpus []string) bool {
-	pubURL := strings.TrimSpace(a.PublicURL)
-	objKey := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
-	for _, blob := range corpus {
-		if blob == "" {
-			continue
-		}
-		if pubURL != "" && strings.Contains(blob, pubURL) {
-			return true
-		}
-		if objKey != "" && strings.Contains(blob, objKey) {
-			return true
-		}
-	}
-	return false
+type assetMatchNeedle struct {
+	idx    int
+	pubURL string
+	objKey string
 }
 
-func (p *Pipeline) collectAll9ReferenceScopes(ctx context.Context) ([]string, error) {
-	var blobs []string
-	appendQuery := func(q string) error {
-		rows, err := p.store.QueryContext(ctx, q)
+func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []domain.MediaAsset) ([]bool, error) {
+	referenced := make([]bool, len(assets))
+	pending := make([]assetMatchNeedle, 0, len(assets))
+	for i, a := range assets {
+		pubURL := strings.TrimSpace(a.PublicURL)
+		objKey := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
+		if pubURL == "" && objKey == "" {
+			continue
+		}
+		pending = append(pending, assetMatchNeedle{
+			idx:    i,
+			pubURL: pubURL,
+			objKey: objKey,
+		})
+	}
+	if len(pending) == 0 {
+		return referenced, nil
+	}
+
+	matchBlob := func(blob string) {
+		if blob == "" || len(pending) == 0 {
+			return
+		}
+		writeIdx := 0
+		for _, cand := range pending {
+			hit := (cand.pubURL != "" && strings.Contains(blob, cand.pubURL)) ||
+				(cand.objKey != "" && strings.Contains(blob, cand.objKey))
+			if hit {
+				referenced[cand.idx] = true
+				continue
+			}
+			pending[writeIdx] = cand
+			writeIdx++
+		}
+		pending = pending[:writeIdx]
+	}
+
+	scanScope := func(q string, args ...any) error {
+		if len(pending) == 0 {
+			return nil
+		}
+		rows, err := p.store.QueryContext(ctx, q, args...)
 		if err != nil {
 			return err
 		}
@@ -97,59 +124,42 @@ func (p *Pipeline) collectAll9ReferenceScopes(ctx context.Context) ([]string, er
 			}
 			for _, v := range strVals {
 				if v != "" {
-					blobs = append(blobs, v)
+					matchBlob(v)
 				}
+			}
+			if len(pending) == 0 {
+				return nil
 			}
 		}
 		return rows.Err()
 	}
 
-	// Scope 1: articles
-	if err := appendQuery(`SELECT content_md, summary_md, cover_url, audio_url FROM articles`); err != nil {
-		return nil, err
+	scopes := []struct {
+		query string
+		args  []any
+	}{
+		{query: `SELECT content_md, summary_md, cover_url, audio_url FROM articles`},
+		{query: `SELECT content_md, summary_md FROM article_revisions`},
+		{query: `SELECT content_md FROM pages`},
+		{query: `SELECT cover_url, description FROM series`},
+		{query: `SELECT cover_url, description FROM books`},
+		{query: `SELECT icon_url, description FROM links`},
+		{query: `SELECT avatar_url, bio FROM users`},
+		{query: `SELECT content_md, avatar_url FROM comments WHERE is_deleted = ?`, args: []any{false}},
+		{query: `SELECT value_json FROM settings`},
+		{query: `SELECT config_json FROM plugins`},
+		{query: `SELECT icon_url, description FROM follows`},
+		{query: `SELECT icon FROM nav_items`},
 	}
-	// Scope 2: article_revisions
-	if err := appendQuery(`SELECT content_md, summary_md FROM article_revisions`); err != nil {
-		return nil, err
+	for _, sc := range scopes {
+		if len(pending) == 0 {
+			break
+		}
+		if err := scanScope(sc.query, sc.args...); err != nil {
+			return nil, err
+		}
 	}
-	// Scope 3: pages
-	if err := appendQuery(`SELECT content_md FROM pages`); err != nil {
-		return nil, err
-	}
-	// Scope 4: series
-	if err := appendQuery(`SELECT cover_url, description FROM series`); err != nil {
-		return nil, err
-	}
-	// Scope 5: books
-	if err := appendQuery(`SELECT cover_url, description FROM books`); err != nil {
-		return nil, err
-	}
-	// Scope 6: links
-	if err := appendQuery(`SELECT icon_url, description FROM links`); err != nil {
-		return nil, err
-	}
-	// Scope 7: users
-	if err := appendQuery(`SELECT avatar_url, bio FROM users`); err != nil {
-		return nil, err
-	}
-	// Scope 8: comments (non-deleted)
-	if err := appendQuery(`SELECT content_md, avatar_url FROM comments WHERE is_deleted = 0`); err != nil {
-		return nil, err
-	}
-	// Scope 9: settings + plugins + follows + nav_items
-	if err := appendQuery(`SELECT value_json FROM settings`); err != nil {
-		return nil, err
-	}
-	if err := appendQuery(`SELECT config_json FROM plugins`); err != nil {
-		return nil, err
-	}
-	if err := appendQuery(`SELECT icon_url, description FROM follows`); err != nil {
-		return nil, err
-	}
-	if err := appendQuery(`SELECT icon FROM nav_items`); err != nil {
-		return nil, err
-	}
-	return blobs, nil
+	return referenced, nil
 }
 
 // safeDeleteLocalUpload verifies via `filepath.EvalSymlinks` that target resides strictly inside uploadDir

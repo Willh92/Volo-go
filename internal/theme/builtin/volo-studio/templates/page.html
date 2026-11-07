@@ -1,7 +1,10 @@
 {{define "content"}}
+{{$showPageTOC := and .StandalonePage.ShowTOC (gt (len .StandalonePage.TOC) 0)}}
 <div class="studio-layout studio-layout--article">
   <div class="studio-article-col">
-    <article class="studio-article">
+    <article class="studio-article"
+             data-needs-math="{{if .StandalonePage.NeedsMath}}1{{end}}"
+             data-needs-mermaid="{{if .StandalonePage.NeedsMermaid}}1{{end}}">
       <header class="studio-article__header">
         <h1 class="studio-article__title">{{.StandalonePage.Title}}</h1>
       </header>
@@ -13,9 +16,11 @@
           {{end}}
         </div>
       {{end}}
+      {{range .ArticleBeforeWidgets}}{{safeHTML .HTML}}{{end}}
       <div class="volo-prose">
         {{safeHTML .StandalonePage.HTML}}
       </div>
+      {{range .ArticleAfterWidgets}}{{safeHTML .HTML}}{{end}}
     </article>
 
     {{if .StandalonePage.AllowComment}}
@@ -23,6 +28,45 @@
     {{end}}
   </div>
 
-  {{template "sidebar" .}}
+  <div class="studio-side-rail">
+    {{if $showPageTOC}}
+      <div id="volo-toc-slot" class="studio-toc-slot">
+        <section id="volo-toc-card" class="sidebar-card studio-toc volo-toc-card">
+          <div class="volo-toc-head">
+            <h3 class="sidebar-card__title">{{t .Locale "article.toc_title"}}</h3>
+            <button type="button" id="volo-toc-toggle" class="volo-toc-toggle" aria-expanded="true" aria-label="{{t .Locale "article.toc_title"}}">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 10 4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+          <div id="volo-toc-body" class="volo-toc-body">
+            <div class="volo-toc-body__inner">
+              <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
+                {{range .StandalonePage.TOC}}
+                  <a class="volo-toc-link" data-toc-id="{{.ID}}" href="#{{.ID}}" style="padding-left:{{add 10 (mul (sub .Level 1) 12)}}px">{{.Text}}</a>
+                {{end}}
+              </nav>
+            </div>
+          </div>
+        </section>
+      </div>
+    {{end}}
+    {{template "sidebar" .}}
+  </div>
 </div>
+
+{{if $showPageTOC}}
+  <div id="volo-toc-drawer" class="volo-toc-drawer" hidden>
+    <div class="volo-toc-drawer__panel" role="dialog" aria-modal="true" aria-label="{{t .Locale "article.toc_title"}}">
+      <div class="volo-toc-drawer__head">
+        <strong>{{t .Locale "article.toc_title"}}</strong>
+        <button type="button" class="studio-icon-btn studio-icon-btn--square" data-toc-close aria-label="{{t .Locale "studio.close"}}">✕</button>
+      </div>
+      <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
+        {{range .StandalonePage.TOC}}
+          <a class="volo-toc-link" data-toc-id="{{.ID}}" href="#{{.ID}}" style="padding-left:{{add 12 (mul (sub .Level 1) 12)}}px">{{.Text}}</a>
+        {{end}}
+      </nav>
+    </div>
+  </div>
+{{end}}
 {{end}}

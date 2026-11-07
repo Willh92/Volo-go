@@ -518,6 +518,13 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if v.PoWDifficultyBits < 8 || v.PoWDifficultyBits > 24 {
 			v.PoWDifficultyBits = 16
 		}
+		v.AssetCDNPrefix = strings.TrimRight(strings.TrimSpace(v.AssetCDNPrefix), "/")
+		if v.AssetCDNPrefix != "" {
+			low := strings.ToLower(v.AssetCDNPrefix)
+			if !strings.HasPrefix(low, "https://") && !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "//") {
+				return nil, fmt.Errorf("settings: invalid reading.asset_cdn_prefix %q", v.AssetCDNPrefix)
+			}
+		}
 		return json.Marshal(v)
 	case domain.SettingsDomainFeed:
 		var v domain.FeedSettings
@@ -542,7 +549,7 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
-		if v.ActiveDriver != "local" && v.ActiveDriver != "s3" {
+		if !isValidStorageDriverID(v.ActiveDriver) {
 			return nil, fmt.Errorf("settings: invalid storage.active_driver %q", v.ActiveDriver)
 		}
 		v.S3SecretKeySet = false
@@ -639,4 +646,24 @@ func sanitizeCustomCSS(css string) string {
 		s = s[:idx] + s[idx+7:]
 	}
 	return s
+}
+
+func isValidStorageDriverID(id string) bool {
+	if id == "local" || id == "s3" {
+		return true
+	}
+	if len(id) < 2 || len(id) > 63 {
+		return false
+	}
+	first := id[0]
+	if !((first >= 'a' && first <= 'z') || (first >= '0' && first <= '9')) {
+		return false
+	}
+	for i := 1; i < len(id); i++ {
+		c := id[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }

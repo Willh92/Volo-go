@@ -61,6 +61,7 @@ type WAFEngine struct {
 	geo         *GeoEngine
 
 	mu         sync.RWMutex
+	publicURL  string
 	activeBans []compiledBan
 	strikes    map[string]*strikeBucket
 	rates      map[string]*rateWindow
@@ -71,15 +72,35 @@ type compiledBan struct {
 	prefix netip.Prefix
 }
 
+const (
+	maxWAFStrikes = 4096
+	maxWAFRates   = 8192
+)
+
 func NewWAFEngine(cfg *config.Config, store *sqlx.Store, settingsMgr *repo.SettingsManager, geo *GeoEngine) *WAFEngine {
+	pubURL := ""
+	if cfg != nil {
+		pubURL = strings.TrimSpace(cfg.PublicURL)
+	}
 	return &WAFEngine{
 		cfg:         cfg,
 		store:       store,
 		settingsMgr: settingsMgr,
 		geo:         geo,
+		publicURL:   pubURL,
 		strikes:     make(map[string]*strikeBucket),
 		rates:       make(map[string]*rateWindow),
 	}
+}
+
+// SetPublicURL updates the canonical public URL used for conditional HTTPS security headers (HSTS).
+func (w *WAFEngine) SetPublicURL(publicURL string) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	w.publicURL = strings.TrimSpace(publicURL)
+	w.mu.Unlock()
 }
 
 // ReloadBans refreshes active IP/CIDR bans from the database into memory.
@@ -213,6 +234,19 @@ func (w *WAFEngine) RecordStrike(ctx context.Context, clientAddr netip.Addr, rea
 	w.mu.Lock()
 	sb, exists := w.strikes[bucketKey]
 	if !exists || now.Sub(sb.windowStart) > 10*time.Minute {
+		if !exists && len(w.strikes) >= maxWAFStrikes {
+			for k, v := range w.strikes {
+				if now.Sub(v.windowStart) > 10*time.Minute {
+					delete(w.strikes, k)
+				}
+			}
+			for k := range w.strikes {
+				if len(w.strikes) < maxWAFStrikes {
+					break
+				}
+				delete(w.strikes, k)
+			}
+		}
 		sb = &strikeBucket{score: 0, occurrences: 0, windowStart: now}
 		w.strikes[bucketKey] = sb
 	}
@@ -275,16 +309,22 @@ func (w *WAFEngine) AllowRate(scope string, clientAddr netip.Addr, limit int, wi
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.rates) > 32768 {
-		// Bounded GC sweep of expired windows so RAM stays tiny under DDoS
-		for k, v := range w.rates {
-			if now.After(v.windowReset) {
+	rw, exists := w.rates[key]
+	if !exists || now.After(rw.windowReset) {
+		if !exists && len(w.rates) >= maxWAFRates {
+			// Bounded GC sweep of expired windows + hard cap eviction so RAM stays tiny under DDoS
+			for k, v := range w.rates {
+				if now.After(v.windowReset) {
+					delete(w.rates, k)
+				}
+			}
+			for k := range w.rates {
+				if len(w.rates) < maxWAFRates {
+					break
+				}
 				delete(w.rates, k)
 			}
 		}
-	}
-	rw, exists := w.rates[key]
-	if !exists || now.After(rw.windowReset) {
 		w.rates[key] = &rateWindow{count: 1, windowReset: now.Add(window)}
 		return true
 	}
@@ -307,6 +347,14 @@ func (w *WAFEngine) WrapHTTP(next http.Handler) http.Handler {
 		rw.Header().Set("X-Content-Type-Options", "nosniff")
 		rw.Header().Set("X-Frame-Options", "SAMEORIGIN")
 		rw.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		rw.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+
+		w.mu.RLock()
+		pubURL := w.publicURL
+		w.mu.RUnlock()
+		if r.TLS != nil || strings.HasPrefix(strings.ToLower(pubURL), "https://") {
+			rw.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 
 		reqPath := r.URL.Path
 		if reqPath == "/healthz" {

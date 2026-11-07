@@ -1,55 +1,86 @@
 .volo-kbn-dock {
   position: fixed;
-  bottom: 20px;
-  z-index: 45;
+  bottom: max(20px, calc(env(safe-area-inset-bottom) + 14px));
+  z-index: 42;
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   user-select: none;
-  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+  font-family: var(--volo-font-sans, system-ui, -apple-system, sans-serif);
 }
-.volo-kbn-right {
-  right: 22px;
-}
-.volo-kbn-left {
+
+.volo-kbn-left,
+.volo-kbn-dock[data-position="left"] {
   left: 22px;
+  right: auto;
+  align-items: flex-start;
 }
+
+/* Offset right-docked mascot cleanly above .studio-fab-dock (Mobile TOC + Back-to-Top) */
+.volo-kbn-right,
+.volo-kbn-dock[data-position="right"] {
+  right: 22px;
+  left: auto;
+  bottom: max(112px, calc(env(safe-area-inset-bottom) + 96px));
+  align-items: flex-end;
+}
+
 .volo-kbn-bubble {
-  max-width: 210px;
+  max-width: min(210px, calc(100vw - 36px));
   padding: 7px 11px;
   border-radius: 12px;
   font-size: 12px;
   line-height: 1.45;
-  background: var(--surface-elevated, #ffffff);
-  color: var(--text-primary, #1d2420);
-  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  background: var(--volo-surface, #ffffff);
+  color: var(--volo-text, #1d2420);
+  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.1));
+  box-shadow: var(--volo-shadow, 0 6px 20px rgba(0, 0, 0, 0.08));
+  transition: opacity 0.2s ease, transform 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
 }
+
 .volo-kbn-btn {
-  width: 58px;
-  height: 58px;
+  width: 56px;
+  height: 56px;
   padding: 0;
   border-radius: 50%;
-  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
-  background: var(--surface-elevated, #ffffff);
-  color: var(--accent, #2d6a4f);
+  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.12));
+  background: var(--volo-surface, #ffffff);
+  color: var(--volo-accent, #2d6a4f);
   cursor: pointer;
-  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.1);
+  box-shadow: var(--volo-shadow, 0 8px 22px rgba(0, 0, 0, 0.1));
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1), border-color 0.18s ease, color 0.18s ease;
 }
+
 .volo-kbn-btn:hover {
   transform: translateY(-3px) scale(1.04);
+  border-color: color-mix(in srgb, var(--volo-accent, #2d6a4f) 50%, var(--volo-line, transparent));
 }
+
 .volo-kbn-btn:active {
   transform: scale(0.95);
 }
+
+.volo-kbn-btn:focus-visible {
+  outline: 2px solid var(--volo-accent, #2d6a4f);
+  outline-offset: 2px;
+}
+
 @media (max-width: 768px) {
   .volo-kbn-hide-mobile {
     display: none !important;
+  }
+  .volo-kbn-left,
+  .volo-kbn-dock[data-position="left"] {
+    left: 14px;
+    bottom: max(16px, calc(env(safe-area-inset-bottom) + 12px));
+  }
+  .volo-kbn-right,
+  .volo-kbn-dock[data-position="right"] {
+    right: 14px;
+    bottom: max(106px, calc(env(safe-area-inset-bottom) + 92px));
   }
 }

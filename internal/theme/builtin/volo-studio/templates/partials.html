@@ -1,9 +1,28 @@
 {{define "sidebar"}}
 <aside class="studio-sidebar">
-  {{if and (not .IsHome) .Site.NoticeBoard}}
-    <section class="sidebar-card">
-      <h3 class="sidebar-card__title">{{t .Locale "sidebar.notice"}}</h3>
-      <div class="sidebar-notice-text">{{.Site.NoticeBoard}}</div>
+  {{if themeCfgBool .ThemeConfig "show_author_card" true}}
+    {{$ownerName := coalesce .Owner.DisplayName .Owner.Username .Site.Title}}
+    {{$ownerBio := coalesce .Owner.Bio .Site.Description .Site.Subtitle}}
+    {{$ownerAvatar := coalesce .Owner.AvatarURL .Site.LogoURL}}
+    <section class="sidebar-card studio-author-card">
+      <div class="studio-author-card__head">
+        {{if $ownerAvatar}}
+          <img class="studio-author-card__avatar" src="{{$ownerAvatar}}" alt="{{$ownerName}}" width="46" height="46" loading="lazy" decoding="async" data-brand-avatar="1">
+          <span class="studio-author-card__monogram" hidden aria-hidden="true">V.</span>
+        {{else}}
+          <img class="studio-author-card__avatar" src="/avatars/{{urlEncode (coalesce .Owner.ID .Owner.Username "owner")}}.svg" alt="{{$ownerName}}" width="46" height="46" loading="lazy" decoding="async">
+        {{end}}
+        <div class="studio-author-card__meta">
+          <strong class="studio-author-card__name">{{$ownerName}}</strong>
+          {{if $ownerBio}}<p class="studio-author-card__bio">{{$ownerBio}}</p>{{end}}
+        </div>
+      </div>
+      {{if and (not .IsHome) .Site.NoticeBoard}}
+        <div class="studio-author-card__notice">
+          <h3 class="sidebar-card__title">{{t .Locale "sidebar.notice"}}</h3>
+          <div class="sidebar-notice-text">{{.Site.NoticeBoard}}</div>
+        </div>
+      {{end}}
     </section>
   {{end}}
 
@@ -32,25 +51,50 @@
     </section>
   {{end}}
 
-  {{if and (themeBool .ThemeConfig "show_recent_posts" true) .MostViewedPosts}}
-    <section class="sidebar-card">
-      <h3 class="sidebar-card__title">{{t .Locale "sidebar.popular_posts"}}</h3>
-      <ul class="studio-side-articles">
-        {{range .MostViewedPosts}}
-          <li><a href="{{.URL}}" title="{{.Title}}">{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</a></li>
-        {{end}}
-      </ul>
-    </section>
+  {{if themeCfgBool .ThemeConfig "show_recent_posts" true}}
+    {{if and (not .IsHome) .RecentPosts}}
+      <section class="sidebar-card">
+        <h3 class="sidebar-card__title">{{t .Locale "sidebar.recent_posts"}}</h3>
+        <ul class="studio-side-articles">
+          {{range .RecentPosts}}
+            <li><a href="{{.URL}}" title="{{.Title}}">{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</a></li>
+          {{end}}
+        </ul>
+      </section>
+    {{end}}
+
+    {{if .MostViewedPosts}}
+      <section class="sidebar-card">
+        <h3 class="sidebar-card__title">{{t .Locale "sidebar.popular_posts"}}</h3>
+        <ul class="studio-side-articles">
+          {{range .MostViewedPosts}}
+            <li><a href="{{.URL}}" title="{{.Title}}">{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</a></li>
+          {{end}}
+        </ul>
+      </section>
+    {{end}}
+
+    {{if .MostCommentedPosts}}
+      <section class="sidebar-card">
+        <h3 class="sidebar-card__title">{{t .Locale "sidebar.most_commented"}}</h3>
+        <ul class="studio-side-articles">
+          {{range .MostCommentedPosts}}
+            <li><a href="{{.URL}}" title="{{.Title}}">{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</a></li>
+          {{end}}
+        </ul>
+      </section>
+    {{end}}
   {{end}}
 
-  {{if .MostCommentedPosts}}
-    <section class="sidebar-card">
-      <h3 class="sidebar-card__title">{{t .Locale "sidebar.most_commented"}}</h3>
-      <ul class="studio-side-articles">
-        {{range .MostCommentedPosts}}
-          <li><a href="{{.URL}}" title="{{.Title}}">{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</a></li>
-        {{end}}
-      </ul>
+  {{if themeCfgBool .ThemeConfig "show_site_stats" true}}
+    <section class="sidebar-card studio-stats-card">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.stats"}}</h3>
+      <dl class="studio-stats-grid">
+        <div><dt>{{t .Locale "stats.articles"}}</dt><dd>{{.Stats.ArticleCount}}</dd></div>
+        <div><dt>{{t .Locale "stats.categories"}}</dt><dd>{{.Stats.CategoryCount}}</dd></div>
+        <div><dt>{{t .Locale "stats.tags"}}</dt><dd>{{.Stats.TagCount}}</dd></div>
+        <div><dt>{{t .Locale "stats.comments"}}</dt><dd>{{.Stats.CommentCount}}</dd></div>
+      </dl>
     </section>
   {{end}}
 
@@ -185,7 +229,7 @@
     {{if .Pagination.PageNumbers}}
       {{if .Pagination.ShowFirst}}
         <a class="pagination__item" href="{{pageURL .BasePath 1}}">1</a>
-        <span style="color:var(--volo-muted)">…</span>
+        <span class="pagination__ellipsis">…</span>
       {{end}}
       {{range .Pagination.PageNumbers}}
         {{if eq . $.Page}}
@@ -195,7 +239,7 @@
         {{end}}
       {{end}}
       {{if .Pagination.ShowLast}}
-        <span style="color:var(--volo-muted)">…</span>
+        <span class="pagination__ellipsis">…</span>
         <a class="pagination__item" href="{{pageURL .BasePath .TotalPages}}">{{.TotalPages}}</a>
       {{end}}
     {{end}}

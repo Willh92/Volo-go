@@ -1,17 +1,29 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import {
   apiFetch,
   clearLocalDraft,
   currentUserSig,
+  dirtyEditorSig,
   loadLocalDraft,
   LocalDraft,
+  openConfirm,
   resetConsoleScroll,
   saveLocalDraft,
   showToast,
 } from "../api";
 import { CM6Editor, QuickInsertItem } from "../components/CM6Editor";
 import { MediaPickButton } from "../components/MediaLibraryModal";
-import { AnimatedModal, ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
+import {
+  AnimatedModal,
+  BatchBar,
+  ConsoleEmpty,
+  ConsoleSelect,
+  paginateItems,
+  Pagination,
+  SwitchToggle,
+  TableSkeleton,
+  UploadButton,
+} from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
 
 export type OverviewSection = "dashboard" | "editor" | "articles" | "drafts";
@@ -22,13 +34,13 @@ interface ChartPoint {
 }
 
 const DONUT_PALETTE = [
-  "#246b51",
-  "#2d6583",
-  "#c9822b",
-  "#70517d",
-  "#87525f",
-  "#3b7a75",
-  "#8c6d3f",
+  "#2d9d78",
+  "#3b82f6",
+  "#e59934",
+  "#9b6bcc",
+  "#e06377",
+  "#2bb3b1",
+  "#c28e46",
 ];
 
 function buildSmoothCurve(pts: ChartPoint[]): string {
@@ -42,6 +54,21 @@ function buildSmoothCurve(pts: ChartPoint[]): string {
     d += ` C ${(p0.x + dx).toFixed(1)} ${p0.y.toFixed(1)}, ${(p1.x - dx).toFixed(1)} ${p1.y.toFixed(1)}, ${p1.x.toFixed(1)} ${p1.y.toFixed(1)}`;
   }
   return d;
+}
+
+function pickSvgIndex(
+  svg: SVGSVGElement,
+  clientX: number,
+  count: number,
+  totalW: number,
+  padL: number,
+  plotW: number
+): number | null {
+  const rect = svg.getBoundingClientRect();
+  if (rect.width <= 0 || count <= 0) return null;
+  const svgX = ((clientX - rect.left) / rect.width) * totalW;
+  const rawIdx = count <= 1 ? 0 : Math.round(((svgX - padL) / plotW) * (count - 1));
+  return Math.max(0, Math.min(count - 1, rawIdx));
 }
 
 function buildFallbackDays(days: number): Array<{ stat_date: string; pv: number; uv: number }> {
@@ -153,11 +180,11 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const series = items.length > 0 ? items : buildFallbackMonths(12);
   const W = 320;
-  const H = 158;
-  const padL = 28;
+  const H = 160;
+  const padL = 30;
   const padR = 14;
   const padT = 14;
-  const padB = 26;
+  const padB = 28;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
   const maxVal = Math.max(2, ...series.map((d) => Number(d.count || 0)));
@@ -177,6 +204,13 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
   const active = hoverIdx !== null && series[hoverIdx] ? series[hoverIdx] : null;
   const activePt = hoverIdx !== null && pts[hoverIdx] ? pts[hoverIdx] : null;
 
+  const onTouch = (e: TouchEvent) => {
+    const touch = e.touches?.[0];
+    if (!touch) return;
+    const idx = pickSvgIndex(e.currentTarget as SVGSVGElement, touch.clientX, n, W, padL, plotW);
+    if (idx !== null) setHoverIdx(idx);
+  };
+
   return (
     <div class="volo-chart-stage" style={{ flex: 1, display: "flex", alignItems: "center" }}>
       {active && activePt && (
@@ -193,15 +227,14 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
       )}
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        style={{ width: "100%", height: "auto", display: "block" }}
+        style={{ width: "100%", height: "auto", display: "block", touchAction: "pan-y" }}
         onMouseMove={(e) => {
-          const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
-          if (rect.width <= 0 || n === 0) return;
-          const svgX = ((e.clientX - rect.left) / rect.width) * W;
-          const rawIdx = n <= 1 ? 0 : Math.round(((svgX - padL) / plotW) * (n - 1));
-          setHoverIdx(Math.max(0, Math.min(n - 1, rawIdx)));
+          const idx = pickSvgIndex(e.currentTarget as SVGSVGElement, e.clientX, n, W, padL, plotW);
+          if (idx !== null) setHoverIdx(idx);
         }}
         onMouseLeave={() => setHoverIdx(null)}
+        onTouchStart={onTouch}
+        onTouchMove={onTouch}
       >
         <defs>
           <linearGradient id="voloMonthlyGrad" x1="0" y1="0" x2="0" y2="1">
@@ -222,7 +255,7 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
                 stroke="var(--volo-line)"
                 stroke-dasharray={ratio === 0 ? undefined : "3 3"}
               />
-              <text x={padL - 5} y={y + 3.5} text-anchor="end" font-size="10" fill="var(--volo-muted)">
+              <text x={padL - 5} y={y + 3.5} text-anchor="end" font-size="11" fill="var(--volo-muted)">
                 {val}
               </text>
             </g>
@@ -256,7 +289,7 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
                 stroke-width={isHover ? 2.4 : 1.8}
               />
               {showLbl && (
-                <text x={p.x} y={H - 6} text-anchor="middle" font-size="10" fill="var(--volo-muted)">
+                <text x={p.x} y={H - 6} text-anchor="middle" font-size="11" fill="var(--volo-muted)">
                   {String(d.month).slice(2)}
                 </text>
               )}
@@ -326,7 +359,7 @@ function DonutChart({
         <text x={cx} y={cy - 1} text-anchor="middle" font-size="15" font-weight="700" fill="var(--volo-text)">
           {total}
         </text>
-        <text x={cx} y={cy + 13} text-anchor="middle" font-size="9.5" fill="var(--volo-muted)">
+        <text x={cx} y={cy + 14} text-anchor="middle" font-size="11" fill="var(--volo-muted)">
           {t("ov.chart_total")}
         </text>
       </svg>
@@ -370,6 +403,11 @@ export function OverviewWorkspace({
   const [trendDays, setTrendDays] = useState<7 | 30>(7);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [articles, setArticles] = useState<any[]>([]);
+  const [artLoading, setArtLoading] = useState<boolean>(false);
+  const [importingZip, setImportingZip] = useState<boolean>(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [batchCatId, setBatchCatId] = useState<string>("");
+
   const [categories, setCategories] = useState<any[]>([]);
   const [seriesList, setSeriesList] = useState<any[]>([]);
   const [allTags, setAllTags] = useState<any[]>([]);
@@ -378,8 +416,9 @@ export function OverviewWorkspace({
   const [query, setQuery] = useState<string>("");
   const [artPage, setArtPage] = useState<number>(1);
 
-  // Editor state (`null` = not editing, `""` = new post, `"id"` = editing post)
+  // Studio Editor state (`null` = not editing, `""` = new post, `"id"` = editing post)
   const [editingID, setEditingID] = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState<boolean>(true);
   const [title, setTitle] = useState("");
   const [slug, setSlug] = useState("");
   const [categoryID, setCategoryID] = useState("");
@@ -395,6 +434,8 @@ export function OverviewWorkspace({
   const [scheduledAtStr, setScheduledAtStr] = useState("");
   const [isPinned, setIsPinned] = useState(false);
   const [allowComment, setAllowComment] = useState(true);
+  const [visibilityMode, setVisibilityMode] = useState<"public" | "password">("public");
+  const [hasSavedPassword, setHasSavedPassword] = useState(false);
   const [password, setPassword] = useState("");
   const [clearPassword, setClearPassword] = useState(false);
   const [audioURL, setAudioURL] = useState("");
@@ -403,17 +444,27 @@ export function OverviewWorkspace({
   const [lang, setLang] = useState("zh-CN");
   const [translationGroup, setTranslationGroup] = useState("");
   const [revisionNote, setRevisionNote] = useState("");
+  const [previewURL, setPreviewURL] = useState("");
+  const [inlinePreviewHTML, setInlinePreviewHTML] = useState<string | null>(null);
 
   const [pendingDraft, setPendingDraft] = useState<LocalDraft | null>(null);
+  const [inlineRevs, setInlineRevs] = useState<any[]>([]);
   const [revisions, setRevisions] = useState<any[] | null>(null);
   const [diffRevID, setDiffRevID] = useState<string | null>(null);
   const [shareTTL, setShareTTL] = useState<string>("72");
   const [shareURL, setShareURL] = useState<string>("");
 
+  const editingIDRef = useRef<string | null>(null);
+  const sectionRef = useRef<OverviewSection>(section);
+  editingIDRef.current = editingID;
+  sectionRef.current = section;
+
   const draftKey = editingID === "" ? "article:new" : editingID ? `article:${editingID}` : "";
 
   const startNewArticle = async (catsOverride?: any[]) => {
     const catList = catsOverride || categories;
+    dirtyEditorSig.value = false;
+    editingIDRef.current = "";
     setEditingID("");
     setTitle("");
     setSlug("");
@@ -430,6 +481,8 @@ export function OverviewWorkspace({
     setScheduledAtStr("");
     setIsPinned(false);
     setAllowComment(true);
+    setVisibilityMode("public");
+    setHasSavedPassword(false);
     setPassword("");
     setClearPassword(false);
     setAudioURL("");
@@ -437,7 +490,9 @@ export function OverviewWorkspace({
     setLang(localeSig.value);
     setTranslationGroup("");
     setRevisionNote("");
+    setPreviewURL("");
     setShareURL("");
+    setInlineRevs([]);
     resetConsoleScroll();
     const saved = await loadLocalDraft("article:new");
     if (saved && (saved.title || saved.content_md)) {
@@ -455,33 +510,104 @@ export function OverviewWorkspace({
   };
 
   const loadArticlesAndTaxonomies = async (effStatus = statusFilter, effCat = catFilter, effQuery = query) => {
-    const [arts, cats, sers, tgs] = await Promise.all([
-      apiFetch<{ items: any[] }>(
-        `/api/admin/articles?status=${encodeURIComponent(effStatus)}&category_id=${encodeURIComponent(effCat)}&q=${encodeURIComponent(effQuery)}`
-      ).catch(() => ({ items: [] })),
-      apiFetch<{ items: any[] }>("/api/admin/categories").catch(() => ({ items: [] })),
-      apiFetch<{ items: any[] }>("/api/admin/series").catch(() => ({ items: [] })),
-      apiFetch<{ items: any[] }>("/api/admin/tags").catch(() => ({ items: [] })),
-    ]);
-    setArticles(arts.items || []);
-    setCategories(cats.items || []);
-    setSeriesList(sers.items || []);
-    setAllTags(tgs.items || []);
-    return cats.items || [];
+    setArtLoading(true);
+    try {
+      const [arts, cats, sers, tgs] = await Promise.all([
+        apiFetch<{ items: any[] }>(
+          `/api/admin/articles?status=${encodeURIComponent(effStatus)}&category_id=${encodeURIComponent(effCat)}&q=${encodeURIComponent(effQuery)}`
+        ).catch(() => ({ items: [] })),
+        apiFetch<{ items: any[] }>("/api/admin/categories").catch(() => ({ items: [] })),
+        apiFetch<{ items: any[] }>("/api/admin/series").catch(() => ({ items: [] })),
+        apiFetch<{ items: any[] }>("/api/admin/tags").catch(() => ({ items: [] })),
+      ]);
+      const nextItems = arts.items || [];
+      setArticles(nextItems);
+      setCategories(cats.items || []);
+      setSeriesList(sers.items || []);
+      setAllTags(tgs.items || []);
+      const validIds = new Set(nextItems.map((r: any) => r.article?.id));
+      setSelectedIds((prev) => prev.filter((id) => validIds.has(id)));
+      return cats.items || [];
+    } finally {
+      setArtLoading(false);
+    }
   };
 
-  // Synchronize sidebar section selection
+  const openEditArticle = async (id: string) => {
+    editingIDRef.current = id;
+    try {
+      const data = await apiFetch<any>(`/api/admin/articles/${encodeURIComponent(id)}`);
+      const a = data.article;
+      const locked = Boolean(data.password || data.is_password_protected);
+      dirtyEditorSig.value = false;
+      editingIDRef.current = a.id;
+      setEditingID(a.id);
+      setTitle(a.title || "");
+      setSlug(a.slug || "");
+      setCategoryID(a.category_id || "");
+      setTagsText((data.tags || []).join(", "));
+      setTagDraft("");
+      setTagPoolOpen(false);
+      setSeriesID(data.series_id || "");
+      setSummaryMD(a.summary_md || "");
+      setContentMD(a.content_md || "");
+      setCoverURL(a.cover_url || "");
+      setStatus(a.status || "published");
+      setPublishedAtStr(msToLocalDatetimeInput(a.published_at));
+      setScheduledAtStr(msToLocalDatetimeInput(a.scheduled_at));
+      setIsPinned(!!a.is_pinned);
+      setAllowComment(a.allow_comment !== false);
+      setVisibilityMode(locked ? "password" : "public");
+      setHasSavedPassword(locked);
+      setPassword(data.password || "");
+      setClearPassword(false);
+      setAudioURL(a.audio_url || "");
+      setAudioDuration(a.audio_duration_sec || 0);
+      setAudioMime(a.audio_mime || "audio/mpeg");
+      setLang(a.lang || "zh-CN");
+      setTranslationGroup(a.translation_group || "");
+      setRevisionNote("");
+      setPreviewURL(data.preview_url || a.preview_url || "");
+      setShareURL("");
+      resetConsoleScroll();
+      apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(a.id)}/revisions`)
+        .then((r) => setInlineRevs(r.items || []))
+        .catch(() => setInlineRevs([]));
+      const saved = await loadLocalDraft(`article:${id}`);
+      if (saved && saved.content_md && saved.content_md !== a.content_md) {
+        setPendingDraft(saved);
+      } else {
+        setPendingDraft(null);
+      }
+    } catch (err: any) {
+      editingIDRef.current = null;
+      showToast(err.message, "err");
+    }
+  };
+
+  // Synchronize sidebar section selection & CommandPalette jump
   useEffect(() => {
     setArtPage(1);
+    setSelectedIds([]);
+    const jumpID = sessionStorage.getItem("volo_jump_article_id");
+    if (jumpID) {
+      sessionStorage.removeItem("volo_jump_article_id");
+      void loadArticlesAndTaxonomies();
+      void loadOverview(trendDays);
+      void openEditArticle(jumpID);
+      return;
+    }
     if (section === "editor") {
       void loadArticlesAndTaxonomies().then((cats) => {
-        if (editingID === null) {
+        if (editingIDRef.current === null) {
           void startNewArticle(cats);
         }
       });
       void loadOverview(trendDays);
       return;
     }
+    dirtyEditorSig.value = false;
+    editingIDRef.current = null;
     setEditingID(null);
     if (section === "drafts") {
       setStatusFilter("draft");
@@ -503,51 +629,11 @@ export function OverviewWorkspace({
 
   useEffect(() => {
     setArtPage(1);
+    setSelectedIds([]);
     if (section === "articles" || section === "drafts") {
       void loadArticlesAndTaxonomies(statusFilter, catFilter, query);
     }
   }, [statusFilter, catFilter]);
-
-  const openEditArticle = async (id: string) => {
-    try {
-      const data = await apiFetch<any>(`/api/admin/articles/${id}`);
-      const a = data.article;
-      setEditingID(a.id);
-      setTitle(a.title || "");
-      setSlug(a.slug || "");
-      setCategoryID(a.category_id || "");
-      setTagsText((data.tags || []).join(", "));
-      setTagDraft("");
-      setTagPoolOpen(false);
-      setSeriesID(data.series_id || "");
-      setSummaryMD(a.summary_md || "");
-      setContentMD(a.content_md || "");
-      setCoverURL(a.cover_url || "");
-      setStatus(a.status || "published");
-      setPublishedAtStr(msToLocalDatetimeInput(a.published_at));
-      setScheduledAtStr(msToLocalDatetimeInput(a.scheduled_at));
-      setIsPinned(!!a.is_pinned);
-      setAllowComment(a.allow_comment !== false);
-      setPassword(data.password || "");
-      setClearPassword(false);
-      setAudioURL(a.audio_url || "");
-      setAudioDuration(a.audio_duration_sec || 0);
-      setAudioMime(a.audio_mime || "audio/mpeg");
-      setLang(a.lang || "zh-CN");
-      setTranslationGroup(a.translation_group || "");
-      setRevisionNote("");
-      setShareURL("");
-      resetConsoleScroll();
-      const saved = await loadLocalDraft(`article:${id}`);
-      if (saved && saved.content_md && saved.content_md !== a.content_md) {
-        setPendingDraft(saved);
-      } else {
-        setPendingDraft(null);
-      }
-    } catch (err: any) {
-      showToast(err.message);
-    }
-  };
 
   // Auto-persist local draft to IndexedDB every 1.2s while editing
   useEffect(() => {
@@ -566,7 +652,18 @@ export function OverviewWorkspace({
     return () => window.clearTimeout(timer);
   }, [editingID, title, slug, summaryMD, contentMD]);
 
-  const closeEditor = () => {
+  const closeEditor = async () => {
+    if (dirtyEditorSig.value) {
+      const ok = await openConfirm({
+        title: t("ui.unsaved_title"),
+        message: t("ui.unsaved_msg"),
+        confirmText: t("ui.unsaved_leave"),
+        danger: true,
+      });
+      if (!ok) return;
+      dirtyEditorSig.value = false;
+    }
+    editingIDRef.current = null;
     setEditingID(null);
     setTagDraft("");
     resetConsoleScroll();
@@ -603,23 +700,28 @@ export function OverviewWorkspace({
     }
   };
 
-  const saveArticle = async (e: Event) => {
-    e.preventDefault();
+  const handleSave = async (overrideStatus?: string, stayOpen = false) => {
+    if (!title.trim()) {
+      showToast(t("art.title_ph"), "warn");
+      return;
+    }
+    const nextStatus = overrideStatus || status;
     try {
       const finalTags = parseTagList(tagDraft.trim() ? `${tagsText}, ${tagDraft}` : tagsText);
+      const shouldClearPwd = visibilityMode === "public" ? clearPassword || hasSavedPassword : false;
       const payload: any = {
         category_id: categoryID,
-        title,
+        title: title.trim(),
         slug,
         summary_md: summaryMD,
         content_md: contentMD,
         cover_url: coverURL,
-        status,
+        status: nextStatus,
         published_at: localDatetimeInputToMs(publishedAtStr),
-        scheduled_at: status === "scheduled" ? localDatetimeInputToMs(scheduledAtStr) : 0,
+        scheduled_at: nextStatus === "scheduled" ? localDatetimeInputToMs(scheduledAtStr) : 0,
         is_pinned: isPinned,
         allow_comment: allowComment,
-        clear_password: clearPassword,
+        clear_password: shouldClearPwd,
         audio_url: audioURL,
         audio_duration_sec: Number(audioDuration) || 0,
         audio_mime: audioMime,
@@ -629,16 +731,48 @@ export function OverviewWorkspace({
         series_id: seriesID,
         revision_note: revisionNote,
       };
-      if (!clearPassword) {
-        payload.password = password;
+      if (visibilityMode === "password" && password.trim() !== "") {
+        payload.password = password.trim();
+      } else if (visibilityMode === "public" && !shouldClearPwd) {
+        payload.password = "";
       }
-      if (editingID === "") {
-        await apiFetch("/api/admin/articles", { method: "POST", body: JSON.stringify(payload) });
-      } else {
-        await apiFetch(`/api/admin/articles/${editingID}`, { method: "PUT", body: JSON.stringify(payload) });
-      }
+
+      const isCreate = editingID === "" || editingID === null;
+      const res = isCreate
+        ? await apiFetch<any>("/api/admin/articles", { method: "POST", body: JSON.stringify(payload) })
+        : await apiFetch<any>(`/api/admin/articles/${encodeURIComponent(editingID)}`, {
+            method: "PUT",
+            body: JSON.stringify(payload),
+          });
+
       if (draftKey) await clearLocalDraft(draftKey);
-      showToast(t("common.saved"));
+      dirtyEditorSig.value = false;
+      if (overrideStatus) setStatus(overrideStatus);
+      if (tagDraft.trim()) {
+        setTagsText(finalTags.join(", "));
+        setTagDraft("");
+      }
+      setRevisionNote("");
+      showToast(t("common.saved"), "ok");
+
+      if (stayOpen) {
+        const savedArt = res?.article;
+        if (savedArt?.id) {
+          editingIDRef.current = savedArt.id;
+          setEditingID(savedArt.id);
+          if (savedArt.slug) setSlug(savedArt.slug);
+          setHasSavedPassword(Boolean(res?.is_password_protected));
+          setClearPassword(false);
+          apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(savedArt.id)}/revisions`)
+            .then((rv) => setInlineRevs(rv.items || []))
+            .catch(() => {});
+        }
+        void loadArticlesAndTaxonomies();
+        void loadOverview(trendDays);
+        return;
+      }
+
+      editingIDRef.current = null;
       setEditingID(null);
       setTagDraft("");
       resetConsoleScroll();
@@ -649,33 +783,120 @@ export function OverviewWorkspace({
         void loadOverview(trendDays);
       }
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
+    }
+  };
+
+  const saveRef = useRef(handleSave);
+  const openEditRef = useRef(openEditArticle);
+  saveRef.current = handleSave;
+  openEditRef.current = openEditArticle;
+
+  useEffect(() => {
+    const onGlobalSave = () => {
+      if (editingIDRef.current !== null || sectionRef.current === "editor") {
+        void saveRef.current(undefined, true);
+      }
+    };
+    const onJumpEdit = (ev: Event) => {
+      const id = (ev as CustomEvent).detail || sessionStorage.getItem("volo_jump_article_id");
+      if (id) {
+        sessionStorage.removeItem("volo_jump_article_id");
+        void openEditRef.current(String(id));
+      }
+    };
+    window.addEventListener("volo:save", onGlobalSave);
+    window.addEventListener("volo:edit-article", onJumpEdit);
+    return () => {
+      window.removeEventListener("volo:save", onGlobalSave);
+      window.removeEventListener("volo:edit-article", onJumpEdit);
+      dirtyEditorSig.value = false;
+    };
+  }, []);
+
+  const handlePreview = async () => {
+    const directUrl = shareURL || previewURL;
+    if (directUrl) {
+      window.open(directUrl, "_blank", "noopener");
+      return;
+    }
+    if (editingID && slug.trim()) {
+      window.open(`/posts/${encodeURIComponent(slug.trim())}?preview=1`, "_blank", "noopener");
+      return;
+    }
+    if (!contentMD.trim()) {
+      showToast(t("ov.preview_save_first"), "warn");
+      return;
+    }
+    try {
+      const res = await apiFetch<{ html: string }>("/api/admin/articles/preview", {
+        method: "POST",
+        body: JSON.stringify({ content_md: contentMD, locale: lang }),
+      });
+      setInlinePreviewHTML(res.html || "");
+    } catch (err: any) {
+      showToast(err.message, "err");
     }
   };
 
   const togglePinArticle = async (id: string) => {
     try {
-      await apiFetch(`/api/admin/articles/${id}/pin`, { method: "POST", body: "{}" });
-      showToast(t("common.saved"));
+      await apiFetch(`/api/admin/articles/${encodeURIComponent(id)}/pin`, { method: "POST", body: "{}" });
+      showToast(t("common.saved"), "ok");
       void loadArticlesAndTaxonomies();
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     }
   };
 
   const deleteArticle = async (id: string) => {
-    if (!window.confirm(t("art.confirm_delete"))) return;
+    if (!(await openConfirm({ message: t("ov.confirm_del_post"), danger: true }))) return;
     try {
-      await apiFetch(`/api/admin/articles/${id}`, { method: "DELETE" });
-      showToast(t("common.deleted"));
+      await apiFetch(`/api/admin/articles/${encodeURIComponent(id)}`, { method: "DELETE" });
+      showToast(t("common.deleted"), "ok");
+      setSelectedIds((prev) => prev.filter((x) => x !== id));
       void loadArticlesAndTaxonomies();
       void loadOverview(trendDays);
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
+    }
+  };
+
+  const runBatchAction = async (
+    action: "publish" | "draft" | "pin" | "unpin" | "category" | "delete",
+    targetCatId?: string
+  ) => {
+    if (selectedIds.length === 0) return;
+    if (action === "delete") {
+      const selectedTitles = articles
+        .filter((r) => selectedIds.includes(r.article?.id))
+        .map((r) => r.article?.title || r.article?.slug || r.article?.id);
+      const ok = await openConfirm({
+        message: t("ov.confirm_batch_del", { n: selectedIds.length }),
+        danger: true,
+        items: selectedTitles,
+      });
+      if (!ok) return;
+    }
+    try {
+      const body: Record<string, any> = { ids: selectedIds, action };
+      if (action === "category") body.category_id = targetCatId ?? "";
+      await apiFetch("/api/admin/articles/batch", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      showToast(t("ov.batch_done", { n: selectedIds.length }), "ok");
+      setSelectedIds([]);
+      setBatchCatId("");
+      void loadArticlesAndTaxonomies();
+      void loadOverview(trendDays);
+    } catch (err: any) {
+      showToast(err.message, "err");
     }
   };
 
   const handleBatchImport = async (file: File) => {
+    setImportingZip(true);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -683,53 +904,65 @@ export function OverviewWorkspace({
         method: "POST",
         body: fd,
       });
-      showToast(t("art.imported_toast", { count: res.imported_count }));
+      showToast(t("art.imported_toast", { count: res.imported_count }), "ok");
       void loadArticlesAndTaxonomies();
       void loadOverview(trendDays);
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
+    } finally {
+      setImportingZip(false);
     }
   };
 
-  const openRevisions = async () => {
+  const openRevisions = async (initialDiffId: string | null = null) => {
     if (!editingID) return;
     try {
-      const res = await apiFetch<{ items: any[] }>(`/api/admin/articles/${editingID}/revisions`);
-      setDiffRevID(null);
-      setRevisions(res.items || []);
+      const res = await apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(editingID)}/revisions`);
+      const items = res.items || [];
+      setInlineRevs(items);
+      setDiffRevID(initialDiffId);
+      setRevisions(items);
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     }
   };
 
   const restoreRevision = async (revID: string) => {
     if (!editingID) return;
+    if (!(await openConfirm({ message: t("ov.confirm_rollback"), danger: true }))) return;
     try {
-      const res = await apiFetch<{ article: any }>(`/api/admin/articles/${editingID}/revisions/${revID}/restore`, {
-        method: "POST",
-        body: "{}",
-      });
+      const res = await apiFetch<{ article: any }>(
+        `/api/admin/articles/${encodeURIComponent(editingID)}/revisions/${encodeURIComponent(revID)}/restore`,
+        { method: "POST", body: "{}" }
+      );
       setTitle(res.article.title || "");
       setSummaryMD(res.article.summary_md || "");
       setContentMD(res.article.content_md || "");
+      dirtyEditorSig.value = false;
       setRevisions(null);
-      showToast(t("art.rev_restored"));
+      showToast(t("art.rev_restored"), "ok");
+      apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(editingID)}/revisions`)
+        .then((rv) => setInlineRevs(rv.items || []))
+        .catch(() => {});
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     }
   };
 
   const issueShareLink = async () => {
     if (!editingID) return;
     try {
-      const res = await apiFetch<{ share_url: string }>(`/api/admin/articles/${editingID}/share-token`, {
-        method: "POST",
-        body: JSON.stringify({ ttl_hours: Number(shareTTL) || 72 }),
-      });
+      const res = await apiFetch<{ share_url: string }>(
+        `/api/admin/articles/${encodeURIComponent(editingID)}/share-token`,
+        {
+          method: "POST",
+          body: JSON.stringify({ ttl_hours: Number(shareTTL) || 72 }),
+        }
+      );
       setShareURL(res.share_url);
-      showToast(t("art.share_generated"));
+      showToast(t("art.share_generated"), "ok");
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     }
   };
 
@@ -738,7 +971,7 @@ export function OverviewWorkspace({
     catNameMap[c.id] = c.name;
   });
 
-  // 1. Editor View (`section === "editor"` or editing an existing post)
+  // 1. Desktop 2-Column Studio Editor (`section === "editor"` or editing an existing post)
   if (editingID !== null || section === "editor") {
     const quickInserts: QuickInsertItem[] = overview?.quick_inserts || [];
     const activeTagsLower = new Set(selectedTags.map((s) => s.toLowerCase()));
@@ -747,41 +980,42 @@ export function OverviewWorkspace({
       <div>
         <div class="volo-card">
           <div class="volo-card-head">
-            <h2 class="volo-card-title">{!editingID ? t("art.new") : `${t("common.edit")}: ${title || t("art.title")}`}</h2>
+            <h2 class="volo-card-title">
+              {!editingID ? t("art.new") : `${t("common.edit")}: ${title || t("art.title")}`}
+            </h2>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
-              {editingID && (
-                <>
-                  <button type="button" class="volo-btn volo-btn-sm" onClick={openRevisions}>
-                    {t("art.revisions")}
-                  </button>
-                  <div style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                    <span class="volo-help" style={{ whiteSpace: "nowrap" }}>{t("art.share_ttl")}:</span>
-                    <ConsoleSelect
-                      style={{ width: "96px" }}
-                      value={shareTTL}
-                      onChange={setShareTTL}
-                      options={[
-                        { value: "1", label: "1h" },
-                        { value: "24", label: "24h" },
-                        { value: "72", label: "72h" },
-                        { value: "168", label: "7d" },
-                        { value: "720", label: "30d" },
-                      ]}
-                    />
-                    <button type="button" class="volo-btn volo-btn-sm" onClick={issueShareLink}>
-                      {t("art.share_token")}
-                    </button>
-                  </div>
-                </>
-              )}
-              <button type="button" class="volo-btn volo-btn-sm" onClick={closeEditor}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={() => setInspectorOpen(!inspectorOpen)}
+              >
+                {inspectorOpen ? t("ov.hide_inspector") : t("ov.show_inspector")}
+              </button>
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void handlePreview()}>
+                {t("common.preview")} ↗
+              </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={() => void handleSave("draft", true)}
+              >
+                {t("ov.save_draft")}
+              </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm volo-btn-primary"
+                onClick={() => void handleSave(status === "scheduled" ? "scheduled" : "published", false)}
+              >
+                {t("ov.publish_btn")}
+              </button>
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void closeEditor()}>
                 {t("common.cancel")}
               </button>
             </div>
           </div>
 
           {pendingDraft && (
-            <div class="volo-card" style={{ background: "var(--volo-accent-soft)", padding: "12px 16px" }}>
+            <div class="volo-subcard" style={{ background: "var(--volo-accent-soft)" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
                 <span>{t("art.draft_recovered")} ({formatDateTime(pendingDraft.saved_at)})</span>
                 <div style={{ display: "flex", gap: "8px" }}>
@@ -793,6 +1027,7 @@ export function OverviewWorkspace({
                       setSlug(pendingDraft.slug);
                       setSummaryMD(pendingDraft.summary_md);
                       setContentMD(pendingDraft.content_md);
+                      dirtyEditorSig.value = true;
                       setPendingDraft(null);
                     }}
                   >
@@ -814,20 +1049,8 @@ export function OverviewWorkspace({
           )}
 
           {shareURL && (
-            <div
-              class="volo-subcard"
-              style={{
-                padding: "10px 14px",
-                fontSize: "12.5px",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "12px",
-                flexWrap: "wrap",
-                marginBottom: "14px",
-              }}
-            >
-              <div style={{ wordBreak: "break-all" }}>
+            <div class="volo-subcard" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+              <div style={{ wordBreak: "break-all", fontSize: "12.5px" }}>
                 <strong>{t("art.share_label")}</strong>{" "}
                 <a href={shareURL} target="_blank" rel="noreferrer">{shareURL}</a>
               </div>
@@ -836,7 +1059,7 @@ export function OverviewWorkspace({
                 class="volo-btn volo-btn-sm"
                 onClick={() => {
                   void navigator.clipboard?.writeText(shareURL);
-                  showToast(t("art.share_copied"));
+                  showToast(t("art.share_copied"), "ok");
                 }}
               >
                 {t("art.share_copy")}
@@ -844,328 +1067,431 @@ export function OverviewWorkspace({
             </div>
           )}
 
-          <form onSubmit={saveArticle} autoComplete="off">
-            {/* 1. Prominent Full-Width Article Title */}
-            <div class="volo-field" style={{ marginBottom: "14px" }}>
-              <input
-                class="volo-editor-title-input"
-                required
-                aria-label={t("art.title")}
-                placeholder={t("art.title_ph")}
-                value={title}
-                onInput={(e) => setTitle((e.currentTarget as HTMLInputElement).value)}
-              />
-            </div>
-
-            {/* 2. Full-Width Markdown Studio Editor Immediately Below Title */}
-            <div class="volo-field" style={{ marginBottom: "16px" }}>
-              <label>{t("art.md_body")}</label>
-              <CM6Editor value={contentMD} onChange={setContentMD} quickInserts={quickInserts} />
-            </div>
-
-            {/* 3. Custom Summary */}
-            <div class="volo-field">
-              <label>{t("art.summary")}</label>
-              <textarea
-                class="volo-textarea"
-                rows={2}
-                value={summaryMD}
-                onInput={(e) => setSummaryMD((e.currentTarget as HTMLTextAreaElement).value)}
-              />
-            </div>
-
-            {/* 4. Capsule Tag Selector (Full Width, Zero Right-Side Whitespace) */}
-            <div class="volo-field">
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", marginBottom: "6px" }}>
-                <label style={{ margin: 0 }}>{t("art.free_tags")}</label>
-                {allTags.length > 0 && (
-                  <button
-                    type="button"
-                    class={`volo-chip-btn ${tagPoolOpen ? "active" : ""}`}
-                    onClick={() => setTagPoolOpen(!tagPoolOpen)}
-                  >
-                    {t("art.toggle_tag_pool", { count: allTags.length })}
-                  </button>
-                )}
-              </div>
-              <div class="volo-tag-capsule-box">
-                {selectedTags.map((tg) => (
-                  <span key={tg} class="volo-tag-pill">
-                    #{tg}
-                    <button
-                      type="button"
-                      aria-label={t("common.delete")}
-                      onClick={() => removeTagToken(tg)}
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
-                <input
-                  class="volo-tag-inline-input"
-                  value={tagDraft}
-                  placeholder={selectedTags.length === 0 ? t("art.tags_placeholder") : t("art.tag_input_more")}
-                  onInput={(e) => setTagDraft((e.currentTarget as HTMLInputElement).value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === "," || e.key === "，") {
-                      e.preventDefault();
-                      if (tagDraft.trim()) addTagTokens(tagDraft);
-                    } else if (e.key === "Backspace" && !tagDraft && selectedTags.length > 0) {
-                      removeTagToken(selectedTags[selectedTags.length - 1]);
-                    }
-                  }}
-                  onBlur={() => {
-                    if (tagDraft.trim()) addTagTokens(tagDraft);
-                  }}
-                />
-              </div>
-              {tagPoolOpen && allTags.length > 0 && (
-                <div class="volo-tag-pool" style={{ marginTop: "8px" }}>
-                  <span class="volo-help" style={{ fontSize: "11.5px" }}>{t("art.tag_pool_hint")}</span>
-                  {allTags.map((tg) => {
-                    const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
-                    return (
-                      <button
-                        key={tg.id}
-                        type="button"
-                        class={`volo-chip-btn ${active ? "active" : ""}`}
-                        onClick={() => toggleTagChip(tg.name)}
-                      >
-                        #{tg.name}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            {/* 5. Compact Publishing Settings Grid */}
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("art.slug")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("art.slug_placeholder")}
-                  value={slug}
-                  onInput={(e) => setSlug((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("art.category")}</label>
-                <ConsoleSelect
-                  value={categoryID}
-                  onChange={setCategoryID}
-                  options={[
-                    { value: "", label: t("art.uncategorized") },
-                    ...categories.map((c) => ({ value: c.id, label: c.name })),
-                  ]}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("art.status")}</label>
-                <ConsoleSelect
-                  value={status}
-                  onChange={setStatus}
-                  options={[
-                    { value: "published", label: t("art.published") },
-                    { value: "draft", label: t("art.draft") },
-                    { value: "scheduled", label: t("art.scheduled") },
-                  ]}
-                />
-              </div>
-            </div>
-
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("art.series")}</label>
-                <ConsoleSelect
-                  value={seriesID}
-                  onChange={setSeriesID}
-                  options={[
-                    { value: "", label: t("art.series_none") },
-                    ...seriesList.map((s) => ({ value: s.id, label: s.title })),
-                  ]}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("art.lang")}</label>
-                <ConsoleSelect
-                  value={lang}
-                  onChange={setLang}
-                  options={locales.map((loc) => ({
-                    value: loc.code,
-                    label: loc.name,
-                    badge: loc.code,
-                  }))}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("art.trans_group")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("art.trans_placeholder")}
-                  value={translationGroup}
-                  onInput={(e) => setTranslationGroup((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-            </div>
-
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("art.password")}</label>
-                <input
-                  type="password"
-                  name="article_lock_passphrase"
-                  autoComplete="new-password"
-                  class="volo-input"
-                  placeholder={t("art.password_placeholder")}
-                  value={password}
-                  onInput={(e) => {
-                    setPassword((e.currentTarget as HTMLInputElement).value);
-                    setClearPassword(false);
-                  }}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("art.published_at")}</label>
-                <input
-                  type="datetime-local"
-                  class="volo-input"
-                  value={publishedAtStr}
-                  onInput={(e) => setPublishedAtStr((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              {status === "scheduled" ? (
+          <form
+            autoComplete="off"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void handleSave(undefined, false);
+            }}
+          >
+            <div class={`volo-studio-split ${inspectorOpen ? "" : "is-collapsed"}`}>
+              {/* Left Column: Prominent Title + Markdown Studio + Bottom Actions */}
+              <div>
                 <div class="volo-field">
-                  <label>{t("art.scheduled_at")}</label>
                   <input
-                    type="datetime-local"
-                    class="volo-input"
+                    class="volo-editor-title-input"
                     required
-                    value={scheduledAtStr}
-                    onInput={(e) => setScheduledAtStr((e.currentTarget as HTMLInputElement).value)}
+                    aria-label={t("art.title")}
+                    placeholder={t("art.title_ph")}
+                    value={title}
+                    onInput={(e) => {
+                      setTitle((e.currentTarget as HTMLInputElement).value);
+                      dirtyEditorSig.value = true;
+                    }}
                   />
                 </div>
-              ) : (
+
                 <div class="volo-field">
-                  <label>{t("art.rev_note")}</label>
-                  <input
-                    class="volo-input"
-                    placeholder={t("art.rev_note_placeholder")}
-                    value={revisionNote}
-                    onInput={(e) => setRevisionNote((e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-              )}
-            </div>
-
-            {status === "scheduled" && (
-              <div class="volo-field">
-                <label>{t("art.rev_note")}</label>
-                <input
-                  class="volo-input"
-                  placeholder={t("art.rev_note_placeholder")}
-                  value={revisionNote}
-                  onInput={(e) => setRevisionNote((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-            )}
-
-            {/* 6. Cover Image & Podcast Audio with Media Library Pickers */}
-            <div class="volo-grid-3">
-              <div class="volo-field">
-                <label>{t("art.cover_url")}</label>
-                <div class="volo-input-row">
-                  <input
-                    class="volo-input"
-                    value={coverURL}
-                    onInput={(e) => setCoverURL((e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <MediaPickButton filterKind="image" onPick={(url) => setCoverURL(url)} />
-                </div>
-                {coverURL.trim() && (
-                  <img
-                    src={coverURL}
-                    alt="cover"
-                    style={{
-                      marginTop: "6px",
-                      maxHeight: "68px",
-                      maxWidth: "140px",
-                      objectFit: "cover",
-                      borderRadius: "6px",
-                      border: "1px solid var(--volo-line)",
+                  <label>{t("art.md_body")}</label>
+                  <CM6Editor
+                    value={contentMD}
+                    onChange={(next) => {
+                      setContentMD(next);
+                      dirtyEditorSig.value = true;
                     }}
+                    quickInserts={quickInserts}
+                    onSave={() => void handleSave(undefined, true)}
                   />
-                )}
-              </div>
-              <div class="volo-field">
-                <label>{t("art.audio_url")}</label>
-                <div class="volo-input-row">
-                  <input
-                    class="volo-input"
-                    value={audioURL}
-                    onInput={(e) => setAudioURL((e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <MediaPickButton filterKind="audio" onPick={(url) => setAudioURL(url)} />
+                </div>
+
+                <div class="volo-form-actions">
+                  <button type="button" class="volo-btn" onClick={() => void closeEditor()}>
+                    {t("common.cancel")}
+                  </button>
+                  <button type="button" class="volo-btn" onClick={() => void handleSave("draft", true)}>
+                    {t("ov.save_draft")}
+                  </button>
+                  <button type="submit" class="volo-btn volo-btn-primary">
+                    {t("art.save")}
+                  </button>
                 </div>
               </div>
-              <div class="volo-field">
-                <label>{t("art.audio_duration")}</label>
-                <input
-                  type="number"
-                  min={0}
-                  class="volo-input"
-                  value={audioDuration}
-                  onInput={(e) => setAudioDuration(Number((e.currentTarget as HTMLInputElement).value) || 0)}
-                />
-              </div>
-            </div>
 
-            <div style={{ display: "flex", alignItems: "center", gap: "18px", flexWrap: "wrap", margin: "8px 0 4px" }}>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={isPinned}
-                  onChange={(e) => setIsPinned((e.currentTarget as HTMLInputElement).checked)}
-                />
-                {t("art.pin_top")}
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={allowComment}
-                  onChange={(e) => setAllowComment((e.currentTarget as HTMLInputElement).checked)}
-                />
-                {t("art.allow_comment")}
-              </label>
-              {editingID && (
-                <label class="volo-check-item">
-                  <input
-                    type="checkbox"
-                    checked={clearPassword}
-                    onChange={(e) => {
-                      const checked = (e.currentTarget as HTMLInputElement).checked;
-                      setClearPassword(checked);
-                      if (checked) setPassword("");
-                    }}
-                  />
-                  {t("art.clear_password")}
-                </label>
+              {/* Right Column: Sticky Inspector Panels */}
+              {inspectorOpen && (
+                <aside class="volo-studio-inspector">
+                  {/* 1. Publishing & Visibility */}
+                  <div class="volo-inspector-box">
+                    <h4 class="volo-inspector-title">{t("ov.panel_publish")}</h4>
+                    <div class="volo-field">
+                      <label>{t("art.status")}</label>
+                      <ConsoleSelect
+                        value={status}
+                        onChange={setStatus}
+                        options={[
+                          { value: "published", label: t("art.published") },
+                          { value: "draft", label: t("art.draft") },
+                          { value: "scheduled", label: t("art.scheduled") },
+                        ]}
+                      />
+                    </div>
+                    {status === "scheduled" && (
+                      <div class="volo-field">
+                        <label>{t("art.scheduled_at")}</label>
+                        <input
+                          type="datetime-local"
+                          class="volo-input"
+                          required
+                          value={scheduledAtStr}
+                          onInput={(e) => setScheduledAtStr((e.currentTarget as HTMLInputElement).value)}
+                        />
+                      </div>
+                    )}
+                    <div class="volo-field">
+                      <label>{t("art.slug")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder={t("art.slug_placeholder")}
+                        value={slug}
+                        onInput={(e) => {
+                          setSlug((e.currentTarget as HTMLInputElement).value);
+                          dirtyEditorSig.value = true;
+                        }}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("art.category")}</label>
+                      <ConsoleSelect
+                        value={categoryID}
+                        onChange={setCategoryID}
+                        options={[
+                          { value: "", label: t("art.uncategorized") },
+                          ...categories.map((c) => ({ value: c.id, label: c.name })),
+                        ]}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("ov.visibility")}</label>
+                      <ConsoleSelect
+                        value={visibilityMode}
+                        onChange={(v) => {
+                          const nextVis = v === "password" ? "password" : "public";
+                          setVisibilityMode(nextVis);
+                          if (nextVis === "public") {
+                            setPassword("");
+                            setClearPassword(hasSavedPassword);
+                          } else {
+                            setClearPassword(false);
+                          }
+                        }}
+                        options={[
+                          { value: "public", label: t("ov.vis_public") },
+                          { value: "password", label: t("ov.vis_password") },
+                        ]}
+                      />
+                    </div>
+                    {visibilityMode === "password" && (
+                      <div class="volo-field">
+                        <label>{t("art.password")}</label>
+                        <input
+                          type="password"
+                          name="article_lock_passphrase"
+                          autoComplete="new-password"
+                          class="volo-input"
+                          placeholder={hasSavedPassword ? "••••••••" : t("art.password_placeholder")}
+                          value={password}
+                          onInput={(e) => {
+                            setPassword((e.currentTarget as HTMLInputElement).value);
+                            setClearPassword(false);
+                          }}
+                        />
+                      </div>
+                    )}
+                    <div class="volo-field">
+                      <label>{t("art.published_at")}</label>
+                      <input
+                        type="datetime-local"
+                        class="volo-input"
+                        value={publishedAtStr}
+                        onInput={(e) => setPublishedAtStr((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("art.series")}</label>
+                      <ConsoleSelect
+                        value={seriesID}
+                        onChange={setSeriesID}
+                        options={[
+                          { value: "", label: t("art.series_none") },
+                          ...seriesList.map((s) => ({ value: s.id, label: s.title })),
+                        ]}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("art.lang")}</label>
+                      <ConsoleSelect
+                        value={lang}
+                        onChange={setLang}
+                        options={locales.map((loc) => ({
+                          value: loc.code,
+                          label: loc.name,
+                          badge: loc.code,
+                        }))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("art.trans_group")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder={t("art.trans_placeholder")}
+                        value={translationGroup}
+                        onInput={(e) => setTranslationGroup((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginTop: "6px" }}>
+                      <SwitchToggle
+                        checked={isPinned}
+                        onChange={setIsPinned}
+                        label={t("art.pin_top")}
+                      />
+                      <SwitchToggle
+                        checked={allowComment}
+                        onChange={setAllowComment}
+                        label={t("art.allow_comment")}
+                      />
+                    </div>
+                  </div>
+
+                  {/* 2. Capsule Tags Selector & Preset Pool */}
+                  <div class="volo-inspector-box">
+                    <div class="volo-inspector-title">
+                      <span>{t("art.free_tags")}</span>
+                      {allTags.length > 0 && (
+                        <button
+                          type="button"
+                          class={`volo-chip-btn ${tagPoolOpen ? "active" : ""}`}
+                          onClick={() => setTagPoolOpen(!tagPoolOpen)}
+                        >
+                          {t("art.toggle_tag_pool", { count: allTags.length })}
+                        </button>
+                      )}
+                    </div>
+                    <div class="volo-tag-capsule-box">
+                      {selectedTags.map((tg) => (
+                        <span key={tg} class="volo-tag-pill">
+                          #{tg}
+                          <button
+                            type="button"
+                            aria-label={t("common.delete")}
+                            onClick={() => removeTagToken(tg)}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                      <input
+                        class="volo-tag-inline-input"
+                        value={tagDraft}
+                        placeholder={selectedTags.length === 0 ? t("art.tags_placeholder") : t("art.tag_input_more")}
+                        onInput={(e) => setTagDraft((e.currentTarget as HTMLInputElement).value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === "," || e.key === "，") {
+                            e.preventDefault();
+                            if (tagDraft.trim()) addTagTokens(tagDraft);
+                          } else if (e.key === "Backspace" && !tagDraft && selectedTags.length > 0) {
+                            removeTagToken(selectedTags[selectedTags.length - 1]);
+                          }
+                        }}
+                        onBlur={() => {
+                          if (tagDraft.trim()) addTagTokens(tagDraft);
+                        }}
+                      />
+                    </div>
+                    {tagPoolOpen && allTags.length > 0 && (
+                      <div class="volo-tag-pool" style={{ marginTop: "8px" }}>
+                        <span class="volo-help">{t("art.tag_pool_hint")}</span>
+                        {allTags.map((tg) => {
+                          const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
+                          return (
+                            <button
+                              key={tg.id}
+                              type="button"
+                              class={`volo-chip-btn ${active ? "active" : ""}`}
+                              onClick={() => toggleTagChip(tg.name)}
+                            >
+                              #{tg.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 3. Media & Summary */}
+                  <div class="volo-inspector-box">
+                    <h4 class="volo-inspector-title">{t("ov.panel_media")}</h4>
+                    <div class="volo-field">
+                      <label>{t("art.cover_url")}</label>
+                      <div class="volo-input-row">
+                        <input
+                          class="volo-input"
+                          value={coverURL}
+                          onInput={(e) => setCoverURL((e.currentTarget as HTMLInputElement).value)}
+                        />
+                        <MediaPickButton filterKind="image" onPick={(url) => setCoverURL(url)} />
+                      </div>
+                      {coverURL.trim() && (
+                        <img
+                          src={coverURL}
+                          alt="cover"
+                          style={{
+                            marginTop: "6px",
+                            maxHeight: "84px",
+                            width: "100%",
+                            objectFit: "cover",
+                            borderRadius: "8px",
+                            border: "1px solid var(--volo-line)",
+                          }}
+                        />
+                      )}
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("art.audio_url")}</label>
+                      <div class="volo-input-row">
+                        <input
+                          class="volo-input"
+                          value={audioURL}
+                          onInput={(e) => setAudioURL((e.currentTarget as HTMLInputElement).value)}
+                        />
+                        <MediaPickButton filterKind="audio" onPick={(url) => setAudioURL(url)} />
+                      </div>
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("art.audio_duration")}</label>
+                      <input
+                        type="number"
+                        min={0}
+                        class="volo-input"
+                        value={audioDuration}
+                        onInput={(e) => setAudioDuration(Number((e.currentTarget as HTMLInputElement).value) || 0)}
+                      />
+                    </div>
+                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <label>{t("art.summary")}</label>
+                      <textarea
+                        class="volo-textarea"
+                        rows={3}
+                        value={summaryMD}
+                        onInput={(e) => {
+                          setSummaryMD((e.currentTarget as HTMLTextAreaElement).value);
+                          dirtyEditorSig.value = true;
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* 4. Revisions History & Timed Share Link */}
+                  <div class="volo-inspector-box">
+                    <div class="volo-inspector-title">
+                      <span>{t("art.revisions")}</span>
+                      {editingID && (
+                        <button type="button" class="volo-act-btn" onClick={() => void openRevisions()}>
+                          {t("art.diff_btn")} ({inlineRevs.length})
+                        </button>
+                      )}
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("art.rev_note")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder={t("art.rev_note_placeholder")}
+                        value={revisionNote}
+                        onInput={(e) => setRevisionNote((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                    {editingID && (
+                      <>
+                        {inlineRevs.length > 0 && (
+                          <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "10px" }}>
+                            {inlineRevs.slice(0, 4).map((rv) => (
+                              <div
+                                key={rv.id}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: "6px",
+                                  fontSize: "12px",
+                                  padding: "6px 8px",
+                                  borderRadius: "7px",
+                                  background: "var(--volo-surface)",
+                                  border: "1px solid var(--volo-line)",
+                                }}
+                              >
+                                <span class="volo-help" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {formatDateTime(rv.created_at)} · {rv.note || t("art.snapshot")}
+                                </span>
+                                <div style={{ display: "inline-flex", gap: "4px", flexShrink: 0 }}>
+                                  <button type="button" class="volo-act-btn" onClick={() => void openRevisions(rv.id)}>
+                                    {t("art.diff_btn")}
+                                  </button>
+                                  <button type="button" class="volo-act-btn" onClick={() => void restoreRevision(rv.id)}>
+                                    {t("art.rollback")}
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div class="volo-field" style={{ marginBottom: 0 }}>
+                          <label>{t("art.share_token")}</label>
+                          <div class="volo-input-row">
+                            <ConsoleSelect
+                              style={{ width: "92px", flexShrink: 0 }}
+                              value={shareTTL}
+                              onChange={setShareTTL}
+                              options={[
+                                { value: "1", label: "1h" },
+                                { value: "24", label: "24h" },
+                                { value: "72", label: "72h" },
+                                { value: "168", label: "7d" },
+                                { value: "720", label: "30d" },
+                              ]}
+                            />
+                            <button type="button" class="volo-btn volo-btn-sm" onClick={() => void issueShareLink()}>
+                              {t("art.share_token")}
+                            </button>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </aside>
               )}
-            </div>
-
-            {/* 7. Right-Aligned Form Actions */}
-            <div class="volo-form-actions">
-              <button type="button" class="volo-btn" onClick={closeEditor}>
-                {t("common.cancel")}
-              </button>
-              <button type="submit" class="volo-btn volo-btn-primary">
-                {t("art.save")}
-              </button>
             </div>
           </form>
         </div>
 
+        {/* Unsaved Draft Inline Preview Modal */}
+        <AnimatedModal
+          open={inlinePreviewHTML !== null}
+          onClose={() => setInlinePreviewHTML(null)}
+          title={title || t("common.preview")}
+          maxWidth="780px"
+          footer={
+            <button type="button" class="volo-btn" onClick={() => setInlinePreviewHTML(null)}>
+              {t("common.close")}
+            </button>
+          }
+        >
+          <div
+            class="volo-preview-pane"
+            style={{ height: "auto", maxHeight: "65vh" }}
+            dangerouslySetInnerHTML={{ __html: inlinePreviewHTML || "" }}
+          />
+        </AnimatedModal>
+
+        {/* Revisions & Line Diff Viewer Modal */}
         <AnimatedModal
           open={Boolean(revisions)}
           onClose={() => setRevisions(null)}
@@ -1178,13 +1504,13 @@ export function OverviewWorkspace({
           }
         >
           {!revisions || revisions.length === 0 ? (
-            <p class="volo-help">{t("art.revisions_empty")}</p>
+            <ConsoleEmpty text={t("art.revisions_empty")} />
           ) : (
             revisions.map((r) => {
               const showDiff = diffRevID === r.id;
               const diffLines = showDiff ? computeLineDiff(r.content_md || "", contentMD) : [];
               return (
-                <div key={r.id} class="volo-card" style={{ padding: "12px", marginBottom: "10px" }}>
+                <div key={r.id} class="volo-subcard">
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "6px" }}>
                     <div>
                       <strong>{r.title}</strong>{" "}
@@ -1198,7 +1524,11 @@ export function OverviewWorkspace({
                       >
                         {t("art.diff_btn")}
                       </button>
-                      <button type="button" class="volo-btn volo-btn-sm volo-btn-primary" onClick={() => restoreRevision(r.id)}>
+                      <button
+                        type="button"
+                        class="volo-btn volo-btn-sm volo-btn-primary"
+                        onClick={() => void restoreRevision(r.id)}
+                      >
                         {t("art.rollback")}
                       </button>
                     </div>
@@ -1220,7 +1550,7 @@ export function OverviewWorkspace({
                       </div>
                     </div>
                   ) : (
-                    <pre style={{ margin: 0, maxHeight: "110px", overflow: "auto", fontSize: "11.5px", background: "var(--volo-raised)", padding: "8px", borderRadius: "6px" }}>
+                    <pre style={{ margin: 0, maxHeight: "110px", overflow: "auto", fontSize: "11.5px", background: "var(--volo-surface)", padding: "8px", borderRadius: "6px" }}>
                       {(r.content_md || "").slice(0, 600)}
                     </pre>
                   )}
@@ -1236,6 +1566,9 @@ export function OverviewWorkspace({
   // 2. Article Management / Drafts View (`section === "articles" | "drafts"`)
   if (section === "articles" || section === "drafts") {
     const pagedArts = paginateItems(articles, artPage, 15);
+    const pageIds = pagedArts.slice.map((r) => r.article.id);
+    const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.includes(id));
+
     return (
       <div class="volo-card">
         <div class="volo-filter-bar">
@@ -1262,8 +1595,7 @@ export function OverviewWorkspace({
               ]}
             />
             <input
-              class="volo-input"
-              style={{ width: "204px" }}
+              class="volo-input volo-search-input"
               placeholder={t("art.search_placeholder")}
               value={query}
               onInput={(e) => setQuery((e.currentTarget as HTMLInputElement).value)}
@@ -1274,19 +1606,12 @@ export function OverviewWorkspace({
                 }
               }}
             />
-            <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer" }}>
-              {t("art.import_md")}
-              <input
-                type="file"
-                accept=".md,.markdown,.zip"
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                  if (f) void handleBatchImport(f);
-                  (e.currentTarget as HTMLInputElement).value = "";
-                }}
-              />
-            </label>
+            <UploadButton
+              accept=".md,.markdown,.zip"
+              busy={importingZip}
+              label={t("art.import_md")}
+              onFile={(f) => void handleBatchImport(f)}
+            />
             <button
               type="button"
               class="volo-btn volo-btn-primary volo-btn-sm"
@@ -1304,6 +1629,22 @@ export function OverviewWorkspace({
           <table class="volo-table">
             <thead>
               <tr>
+                <th style={{ width: "40px" }}>
+                  <input
+                    type="checkbox"
+                    aria-label={t("ov.select_all")}
+                    checked={allPageSelected}
+                    onChange={(e) => {
+                      const checked = (e.currentTarget as HTMLInputElement).checked;
+                      if (checked) {
+                        setSelectedIds((prev) => Array.from(new Set([...prev, ...pageIds])));
+                      } else {
+                        const rm = new Set(pageIds);
+                        setSelectedIds((prev) => prev.filter((id) => !rm.has(id)));
+                      }
+                    }}
+                  />
+                </th>
                 <th class="col-fluid">{t("art.title")}</th>
                 <th class="col-status">{t("art.status")}</th>
                 <th class="col-cat">{t("art.category")}</th>
@@ -1313,23 +1654,35 @@ export function OverviewWorkspace({
               </tr>
             </thead>
             <tbody>
-              {pagedArts.slice.length === 0 ? (
-                <tr>
-                  <td colSpan={6} class="volo-empty-state">
-                    {t("art.empty", { btn: t("art.new") })}
-                  </td>
-                </tr>
+              {artLoading ? (
+                <TableSkeleton cols={7} />
+              ) : pagedArts.slice.length === 0 ? (
+                <ConsoleEmpty colSpan={7} text={t("art.empty", { btn: t("art.new") })} />
               ) : (
                 pagedArts.slice.map((row) => {
                   const a = row.article;
                   const catLabel = catNameMap[a.category_id];
+                  const isChecked = selectedIds.includes(a.id);
                   return (
                     <tr key={a.id}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          aria-label={a.title}
+                          checked={isChecked}
+                          onChange={(e) => {
+                            const checked = (e.currentTarget as HTMLInputElement).checked;
+                            setSelectedIds((prev) =>
+                              checked ? (prev.includes(a.id) ? prev : [...prev, a.id]) : prev.filter((id) => id !== a.id)
+                            );
+                          }}
+                        />
+                      </td>
                       <td class="col-fluid">
                         <div class="volo-cell-main">
                           <div class="volo-cell-title">
                             <a
-                              href="javascript:void(0)"
+                              href={`#edit-${a.id}`}
                               onClick={(e) => {
                                 e.preventDefault();
                                 void openEditArticle(a.id);
@@ -1350,18 +1703,18 @@ export function OverviewWorkspace({
                           </div>
                         </div>
                       </td>
-                      <td class="col-status">
+                      <td class="col-status" data-label={t("art.status")}>
                         <span class={`volo-status-pill ${a.status === "published" ? "ok" : "warn"}`}>
                           <span class="volo-status-dot" />
                           {t(`art.${a.status}`)}
                         </span>
                       </td>
-                      <td class="col-cat">
+                      <td class="col-cat" data-label={t("art.category")}>
                         <span class={`volo-cat-chip ${catLabel ? "" : "muted"}`}>
                           {catLabel || t("art.uncategorized")}
                         </span>
                       </td>
-                      <td class="col-num">
+                      <td class="col-num" data-label={t("art.metrics")}>
                         <div class="volo-metric-pair">
                           <span class="volo-metric-item" title="PV">
                             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
@@ -1378,19 +1731,24 @@ export function OverviewWorkspace({
                           </span>
                         </div>
                       </td>
-                      <td class="col-date">{formatDateTime(a.updated_at)}</td>
+                      <td class="col-date" data-label={t("art.updated")}>{formatDateTime(a.updated_at)}</td>
                       <td class="col-act">
                         <div class="volo-row-actions">
-                          <a class="volo-act-btn" href={`/posts/${encodeURIComponent(a.slug)}`} target="_blank" rel="noreferrer">
+                          <a
+                            class="volo-act-btn"
+                            href={`/posts/${encodeURIComponent(a.slug)}${a.status !== "published" ? "?preview=1" : ""}`}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
                             {t("common.view")}
                           </a>
-                          <button type="button" class="volo-act-btn" onClick={() => togglePinArticle(a.id)}>
+                          <button type="button" class="volo-act-btn" onClick={() => void togglePinArticle(a.id)}>
                             {a.is_pinned ? t("art.unpin_action") : t("art.pin_action")}
                           </button>
-                          <button type="button" class="volo-act-btn" onClick={() => openEditArticle(a.id)}>
+                          <button type="button" class="volo-act-btn" onClick={() => void openEditArticle(a.id)}>
                             {t("common.edit")}
                           </button>
-                          <button type="button" class="volo-act-btn danger" onClick={() => deleteArticle(a.id)}>
+                          <button type="button" class="volo-act-btn danger" onClick={() => void deleteArticle(a.id)}>
                             {t("common.delete")}
                           </button>
                         </div>
@@ -1402,6 +1760,38 @@ export function OverviewWorkspace({
             </tbody>
           </table>
         </div>
+
+        <BatchBar count={selectedIds.length} onClear={() => setSelectedIds([])}>
+          <button type="button" class="volo-act-btn" onClick={() => void runBatchAction("publish")}>
+            {t("art.published")}
+          </button>
+          <button type="button" class="volo-act-btn" onClick={() => void runBatchAction("draft")}>
+            {t("art.draft")}
+          </button>
+          <button type="button" class="volo-act-btn" onClick={() => void runBatchAction("pin")}>
+            {t("art.pin_action")}
+          </button>
+          <button type="button" class="volo-act-btn" onClick={() => void runBatchAction("unpin")}>
+            {t("art.unpin_action")}
+          </button>
+          <ConsoleSelect
+            style={{ width: "148px" }}
+            value={batchCatId}
+            onChange={(val) => {
+              if (val === "__prompt__") return;
+              setBatchCatId(val);
+              void runBatchAction("category", val === "__none__" ? "" : val);
+            }}
+            options={[
+              { value: "__prompt__", label: t("ov.batch_move_cat") },
+              { value: "__none__", label: t("art.uncategorized") },
+              ...categories.map((c) => ({ value: c.id, label: c.name })),
+            ]}
+          />
+          <button type="button" class="volo-act-btn danger" onClick={() => void runBatchAction("delete")}>
+            {t("common.delete")}
+          </button>
+        </BatchBar>
 
         <Pagination total={articles.length} page={pagedArts.safePage} pageSize={15} onChange={setArtPage} />
       </div>
@@ -1419,7 +1809,6 @@ export function OverviewWorkspace({
   const rangePV = rawSeries.reduce((acc, item) => acc + Number(item.pv || 0), 0);
   const rangeUV = rawSeries.reduce((acc, item) => acc + Number(item.uv || 0), 0);
 
-  // SVG Chart Geometry (`padR = 34` prevents rightmost MM-DD label clipping)
   const W = 860;
   const H = 228;
   const padL = 44;
@@ -1451,7 +1840,6 @@ export function OverviewWorkspace({
     uvPts.length > 0
       ? `${uvLine} L ${uvPts[uvPts.length - 1].x.toFixed(1)} ${(padT + plotH).toFixed(1)} L ${uvPts[0].x.toFixed(1)} ${(padT + plotH).toFixed(1)} Z`
       : "";
-  // Show every single date tick in 7-day mode (`n <= 10`)
   const xLabelStep = n <= 10 ? 1 : Math.ceil(n / 8);
   const topArticles: any[] = overview?.top_articles || [];
   const topReferers: any[] = overview?.top_referers || [];
@@ -1460,7 +1848,13 @@ export function OverviewWorkspace({
 
   const activeTrend = hoverIdx !== null && rawSeries[hoverIdx] ? rawSeries[hoverIdx] : null;
   const activePvPt = hoverIdx !== null && pvPts[hoverIdx] ? pvPts[hoverIdx] : null;
-  const activeUvPt = hoverIdx !== null && uvPts[hoverIdx] ? uvPts[hoverIdx] : null;
+
+  const handleTrendTouch = (e: TouchEvent) => {
+    const touch = e.touches?.[0];
+    if (!touch) return;
+    const idx = pickSvgIndex(e.currentTarget as SVGSVGElement, touch.clientX, n, W, padL, plotW);
+    if (idx !== null) setHoverIdx(idx);
+  };
 
   return (
     <div>
@@ -1578,7 +1972,7 @@ export function OverviewWorkspace({
               {t("ov.legend_pv")}
             </span>
             <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "#c9822b" }} />
+              <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "#e59934" }} />
               {t("ov.legend_uv")}
             </span>
           </div>
@@ -1602,15 +1996,14 @@ export function OverviewWorkspace({
 
             <svg
               viewBox={`0 0 ${W} ${H}`}
-              style={{ width: "100%", height: "auto", display: "block", cursor: "crosshair" }}
+              style={{ width: "100%", height: "auto", display: "block", cursor: "crosshair", touchAction: "pan-y" }}
               onMouseMove={(e) => {
-                const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
-                if (rect.width <= 0 || n === 0) return;
-                const svgX = ((e.clientX - rect.left) / rect.width) * W;
-                const rawIdx = n <= 1 ? 0 : Math.round(((svgX - padL) / plotW) * (n - 1));
-                setHoverIdx(Math.max(0, Math.min(n - 1, rawIdx)));
+                const idx = pickSvgIndex(e.currentTarget as SVGSVGElement, e.clientX, n, W, padL, plotW);
+                if (idx !== null) setHoverIdx(idx);
               }}
               onMouseLeave={() => setHoverIdx(null)}
+              onTouchStart={handleTrendTouch}
+              onTouchMove={handleTrendTouch}
             >
               <defs>
                 <linearGradient id="voloPvGrad" x1="0" y1="0" x2="0" y2="1">
@@ -1618,12 +2011,11 @@ export function OverviewWorkspace({
                   <stop offset="100%" stop-color="var(--volo-accent)" stop-opacity="0.01" />
                 </linearGradient>
                 <linearGradient id="voloUvGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#c9822b" stop-opacity="0.16" />
-                  <stop offset="100%" stop-color="#c9822b" stop-opacity="0.01" />
+                  <stop offset="0%" stop-color="#e59934" stop-opacity="0.16" />
+                  <stop offset="100%" stop-color="#e59934" stop-opacity="0.01" />
                 </linearGradient>
               </defs>
 
-              {/* Vertical X-axis dashed gridlines */}
               {rawSeries.map((d, idx) => {
                 const showTick = idx % xLabelStep === 0 || idx === n - 1;
                 if (!showTick) return null;
@@ -1642,7 +2034,6 @@ export function OverviewWorkspace({
                 );
               })}
 
-              {/* Horizontal Y-axis gridlines */}
               {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
                 const y = padT + plotH - ratio * plotH;
                 const val = Math.round(ratio * yMax);
@@ -1660,7 +2051,7 @@ export function OverviewWorkspace({
                       x={padL - 8}
                       y={y + 4}
                       text-anchor="end"
-                      font-size="11"
+                      font-size="11.5"
                       fill="var(--volo-muted)"
                     >
                       {val}
@@ -1672,7 +2063,7 @@ export function OverviewWorkspace({
               {uvArea && <path d={uvArea} fill="url(#voloUvGrad)" />}
               {pvArea && <path d={pvArea} fill="url(#voloPvGrad)" />}
               {pvLine && <path d={pvLine} fill="none" stroke="var(--volo-accent)" stroke-width="2.5" stroke-linecap="round" />}
-              {uvLine && <path d={uvLine} fill="none" stroke="#c9822b" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round" />}
+              {uvLine && <path d={uvLine} fill="none" stroke="#e59934" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round" />}
 
               {activePvPt && (
                 <line
@@ -1698,7 +2089,7 @@ export function OverviewWorkspace({
                       cy={u.y}
                       r={isHover ? 4.4 : 2.6}
                       fill="var(--volo-surface)"
-                      stroke="#c9822b"
+                      stroke="#e59934"
                       stroke-width={isHover ? 2.2 : 1.6}
                     />
                     <circle
@@ -1714,7 +2105,7 @@ export function OverviewWorkspace({
                         x={p.x}
                         y={H - 8}
                         text-anchor="middle"
-                        font-size="11"
+                        font-size="11.5"
                         fill={isHover ? "var(--volo-text)" : "var(--volo-muted)"}
                         font-weight={isHover ? "650" : "400"}
                       >

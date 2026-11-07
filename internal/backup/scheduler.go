@@ -180,6 +180,11 @@ func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return "", fmt.Errorf("invalid webdav_url %q", base)
 	}
+	if safeDialer != nil {
+		if _, err := safeDialer.ValidateOutboundURL(u.String()); err != nil {
+			return "", err
+		}
+	}
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -191,7 +196,20 @@ func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password
 	if safeDialer != nil {
 		tr.DialContext = safeDialer.DialContext
 	}
-	client := &http.Client{Transport: tr, Timeout: 10 * time.Minute}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   10 * time.Minute,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("webdav: stopped after 3 redirects")
+			}
+			if safeDialer != nil {
+				_, vErr := safeDialer.ValidateOutboundURL(req.URL.String())
+				return vErr
+			}
+			return nil
+		},
+	}
 
 	dirRel := strings.Trim(cfg.WebDAVDir, "/")
 	if dirRel != "" {

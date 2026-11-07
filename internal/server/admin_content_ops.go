@@ -192,10 +192,10 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 					password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes, audio_mime,
 					lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count,
 					created_at, updated_at
-				) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0, 0, 1, '', ?, '', 0, 0, '', ?, '', '', ?, ?, 0, 0, ?, ?)`,
+				) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0, ?, ?, '', ?, '', 0, 0, '', ?, '', '', ?, ?, 0, 0, ?, ?)`,
 				savedRaw.ID, savedRaw.AuthorID, savedRaw.CategoryID, savedRaw.Title, savedRaw.Slug,
 				savedRaw.SummaryMD, savedRaw.ContentMD, savedRaw.CoverURL, savedRaw.Status, savedRaw.PublishedAt,
-				savedRaw.HasContentLock, savedRaw.Lang, savedRaw.WordCount, savedRaw.ReadingMinutes,
+				false, true, savedRaw.HasContentLock, savedRaw.Lang, savedRaw.WordCount, savedRaw.ReadingMinutes,
 				savedRaw.CreatedAt, savedRaw.UpdatedAt,
 			); iErr != nil {
 				return iErr
@@ -459,10 +459,18 @@ func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	client := s.deps.OutboundDialer.NewHTTPClient(8 * time.Second)
+	client := &http.Client{Timeout: 8 * time.Second}
+	if s.deps.OutboundDialer != nil {
+		client = s.deps.OutboundDialer.NewHTTPClient(8 * time.Second)
+	}
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 4 {
 			return errors.New("too many redirects")
+		}
+		if s.deps.OutboundDialer != nil {
+			if _, err := s.deps.OutboundDialer.ValidateOutboundURL(req.URL.String()); err != nil {
+				return err
+			}
 		}
 		return nil
 	}

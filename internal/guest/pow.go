@@ -106,18 +106,25 @@ func (pv *PoWVerifier) Verify(challenge string, solution string, honeypot string
 		return ErrPoWInvalid
 	}
 
+	const maxPoWUsed = 8192
 	nowSec := time.Now().Unix()
 	pv.mu.Lock()
 	defer pv.mu.Unlock()
-	if len(pv.used) > 16384 {
+	if exp, already := pv.used[nonce]; already && nowSec <= exp {
+		return ErrPoWReplayed
+	}
+	if len(pv.used) >= maxPoWUsed {
 		for k, exp := range pv.used {
 			if nowSec > exp {
 				delete(pv.used, k)
 			}
 		}
-	}
-	if _, already := pv.used[nonce]; already {
-		return ErrPoWReplayed
+		for k := range pv.used {
+			if len(pv.used) < maxPoWUsed {
+				break
+			}
+			delete(pv.used, k)
+		}
 	}
 	pv.used[nonce] = expSec + 60
 	return nil

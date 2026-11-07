@@ -10,7 +10,7 @@ import {
   themeModeSig,
 } from "../api";
 import { BrandLogo } from "../components/BrandLogo";
-import { ConsoleSelect, LocalePopover } from "../components/UIControls";
+import { ConsoleSelect, LocalePopover, SwitchToggle, UploadButton } from "../components/UIControls";
 import {
   availableLocalesSig,
   ensureLocaleLoaded,
@@ -39,10 +39,11 @@ export function SetupWizard() {
   const [dsn, setDsn] = useState<string>("");
   const [simpleProto, setSimpleProto] = useState<boolean>(false);
   const [dbPingMsg, setDbPingMsg] = useState<string>("");
+  const [dbPingErr, setDbPingErr] = useState<boolean>(false);
 
   const [siteTitle, setSiteTitle] = useState<string>(() => tFor(initLoc, "setup.default_site_title"));
   const [siteSubtitle, setSiteSubtitle] = useState<string>(() => tFor(initLoc, "setup.default_site_subtitle"));
-  const [siteDesc, setSiteDesc] = useState<string>("");
+  const [siteDesc] = useState<string>("");
   const [timezone, setTimezone] = useState<string>("Asia/Shanghai");
   const [accent, setAccent] = useState<string>(accentSig.value || "forest");
 
@@ -50,7 +51,20 @@ export function SetupWizard() {
   const [displayName, setDisplayName] = useState<string>(() => tFor(initLoc, "setup.default_display_name"));
   const [email, setEmail] = useState<string>("");
   const [password, setPassword] = useState<string>("");
+
+  // Legacy migration adjustment & URL replacement state
+  const [oldSiteUrl, setOldSiteUrl] = useState<string>("");
+  const [newSiteUrl, setNewSiteUrl] = useState<string>("");
+  const [legSiteTitle, setLegSiteTitle] = useState<string>("");
+  const [legSiteSubtitle, setLegSiteSubtitle] = useState<string>("");
+  const [legTimezone, setLegTimezone] = useState<string>("");
+  const [storageMode, setStorageMode] = useState<string>("keep");
+  const [legAdminUser, setLegAdminUser] = useState<string>("");
+  const [legAdminEmail, setLegAdminEmail] = useState<string>("");
+  const [legAdminPwd, setLegAdminPwd] = useState<string>("");
+
   const [busy, setBusy] = useState<boolean>(false);
+  const [dryRun, setDryRun] = useState<boolean>(false);
   const [etlResult, setEtlResult] = useState<any>(null);
 
   const syncLocalizedDefaults = (prev: LocaleCode, next: LocaleCode) => {
@@ -88,8 +102,10 @@ export function SetupWizard() {
         method: "POST",
         body: JSON.stringify({ driver, dsn, simple_protocol: simpleProto }),
       });
+      setDbPingErr(false);
       setDbPingMsg(t("setup.db_ok", { dialect: res.dialect, ms: res.latency_ms }));
     } catch (err: any) {
+      setDbPingErr(true);
       setDbPingMsg(t("setup.db_err", { msg: err.message }));
     } finally {
       setBusy(false);
@@ -103,6 +119,12 @@ export function SetupWizard() {
       const res = await apiFetch<{ admin_path: string }>("/api/setup/complete", {
         method: "POST",
         body: JSON.stringify({
+          driver,
+          dsn,
+          simple_protocol: simpleProto,
+          db_driver: driver,
+          db_dsn: dsn,
+          db_simple_protocol: simpleProto,
           site_title: siteTitle,
           site_subtitle: siteSubtitle,
           site_description: siteDesc,
@@ -117,7 +139,7 @@ export function SetupWizard() {
       });
       window.location.href = res.admin_path || bootConfig.admin_path || "/console";
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     } finally {
       setBusy(false);
     }
@@ -128,32 +150,109 @@ export function SetupWizard() {
     try {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await apiFetch<any>("/api/setup/import-legacy", {
+      fd.append("driver", driver);
+      fd.append("dsn", dsn);
+      fd.append("simple_protocol", simpleProto ? "1" : "0");
+      if (oldSiteUrl.trim()) fd.append("old_site_url", oldSiteUrl.trim());
+      if (newSiteUrl.trim()) fd.append("new_site_url", newSiteUrl.trim());
+      if (legSiteTitle.trim()) fd.append("site_title", legSiteTitle.trim());
+      if (legSiteSubtitle.trim()) fd.append("site_subtitle", legSiteSubtitle.trim());
+      if (legTimezone.trim()) fd.append("timezone", legTimezone.trim());
+      fd.append("storage_mode", storageMode);
+      if (legAdminUser.trim()) fd.append("admin_username", legAdminUser.trim());
+      if (legAdminEmail.trim()) fd.append("admin_email", legAdminEmail.trim());
+      if (legAdminPwd) fd.append("admin_password", legAdminPwd);
+
+      const url = dryRun ? "/api/setup/import-legacy?dry_run=1" : "/api/setup/import-legacy";
+      const res = await apiFetch<any>(url, {
         method: "POST",
         body: fd,
       });
+      setEtlResult(res.report || res);
+      if (dryRun) {
+        showToast(t("sys.import_dryrun_ok"), "ok");
+        return;
+      }
       if (res.user) currentUserSig.value = res.user;
       if (res.csrf_token) csrfTokenSig.value = res.csrf_token;
-      setEtlResult(res.report || res);
-      showToast(t("setup.legacy_done"));
+      showToast(t("setup.legacy_done"), "ok");
       const nextUrl = res.admin_path || bootConfig.admin_path || "/console";
       window.setTimeout(() => {
         window.location.href = nextUrl;
       }, 1100);
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     } finally {
       setBusy(false);
     }
   };
 
+  const dbSelectorCard = (
+    <div class="volo-subcard" style={{ marginTop: 0 }}>
+      <div class="volo-subcard-title">{t("setup.step1")}</div>
+      <div class="volo-grid-2">
+        <div class="volo-field">
+          <label>{t("setup.dialect")}</label>
+          <ConsoleSelect
+            value={driver}
+            onChange={(v) => {
+              setDriver(v);
+              setDbPingMsg("");
+            }}
+            options={[
+              { value: "sqlite", label: t("setup.dialect_sqlite") },
+              { value: "postgres", label: t("setup.dialect_postgres") },
+              { value: "mysql", label: t("setup.dialect_mysql") },
+            ]}
+          />
+        </div>
+        <div class="volo-field">
+          <label>{t("setup.dsn")}</label>
+          <input
+            class="volo-input"
+            name="setup_db_dsn_str"
+            autoComplete="off"
+            value={dsn}
+            onInput={(e) => setDsn((e.currentTarget as HTMLInputElement).value)}
+            placeholder={
+              driver === "sqlite"
+                ? "./data/volo.db"
+                : driver === "postgres"
+                ? "postgres://user:pass@host:5432/volo?sslmode=disable"
+                : "user:pass@tcp(host:3306)/volo"
+            }
+          />
+        </div>
+      </div>
+      {driver === "postgres" && (
+        <div style={{ marginBottom: "8px" }}>
+          <SwitchToggle
+            checked={simpleProto}
+            onChange={setSimpleProto}
+            label={t("setup.simple_proto")}
+          />
+        </div>
+      )}
+      <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px" }}>
+        {dbPingMsg && (
+          <span class={`volo-badge ${dbPingErr ? "volo-badge-danger" : "volo-badge-ok"}`} style={{ marginRight: "auto" }}>
+            {dbPingMsg}
+          </span>
+        )}
+        <button type="button" class="volo-btn volo-btn-sm" disabled={busy} onClick={testDB}>
+          {t("setup.test_db")}
+        </button>
+      </div>
+    </div>
+  );
+
   return (
-    <div class="volo-center-stage">
+    <div class="volo-center-stage is-setup">
       <div class="volo-wizard-box">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "12px", marginBottom: "18px" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "12px", flexWrap: "wrap", marginBottom: "18px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", minWidth: 0 }}>
             <BrandLogo size={42} />
-            <div>
+            <div style={{ minWidth: 0 }}>
               <h1 style={{ margin: "0 0 4px", fontSize: "21px" }}>{t("setup.title")}</h1>
               <div class="volo-help">{t("setup.subtitle")}</div>
             </div>
@@ -182,46 +281,7 @@ export function SetupWizard() {
 
         {tab === "fresh" ? (
           <form onSubmit={submitFresh} autoComplete="off" data-form-type="other">
-            <div class="volo-card" style={{ padding: "14px", marginBottom: "14px" }}>
-              <div style={{ fontWeight: 650, marginBottom: "10px" }}>{t("setup.step1")}</div>
-              <div class="volo-grid-2">
-                <div class="volo-field">
-                  <label>{t("setup.dialect")}</label>
-                  <ConsoleSelect
-                    value={driver}
-                    onChange={(v) => setDriver(v)}
-                    options={[
-                      { value: "sqlite", label: t("setup.dialect_sqlite") },
-                      { value: "postgres", label: t("setup.dialect_postgres") },
-                      { value: "mysql", label: t("setup.dialect_mysql") },
-                    ]}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("setup.dsn")}</label>
-                  <input
-                    class="volo-input"
-                    name="setup_db_dsn_str"
-                    autoComplete="off"
-                    value={dsn}
-                    onInput={(e) => setDsn((e.currentTarget as HTMLInputElement).value)}
-                    placeholder={driver === "sqlite" ? "./data/volo.db" : driver === "postgres" ? "postgres://..." : "user:pass@tcp(host:3306)/volo"}
-                  />
-                </div>
-              </div>
-              {driver === "postgres" && (
-                <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12.5px", marginBottom: "8px" }}>
-                  <input type="checkbox" checked={simpleProto} onChange={(e) => setSimpleProto((e.currentTarget as HTMLInputElement).checked)} />
-                  {t("setup.simple_proto")}
-                </label>
-              )}
-              <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px" }}>
-                {dbPingMsg && <span class="volo-badge" style={{ marginRight: "auto" }}>{dbPingMsg}</span>}
-                <button type="button" class="volo-btn volo-btn-sm" disabled={busy} onClick={testDB}>
-                  {t("setup.test_db")}
-                </button>
-              </div>
-            </div>
+            {dbSelectorCard}
 
             <div class="volo-grid-2">
               <div class="volo-field">
@@ -349,25 +409,148 @@ export function SetupWizard() {
           </form>
         ) : (
           <div>
-            <p class="volo-help" style={{ marginBottom: "14px" }}>
+            <p class="volo-help" style={{ marginBottom: "12px" }}>
               {t("setup.legacy_desc")}
             </p>
-            <label class="volo-btn volo-btn-primary" style={{ width: "100%", cursor: "pointer" }}>
-              {busy ? t("setup.importing") : t("setup.import_btn")}
-              <input
-                type="file"
-                accept=".zip,.json"
-                style={{ display: "none" }}
-                disabled={busy}
-                onChange={(e) => {
-                  const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                  if (f) void handleLegacyUpload(f);
-                  (e.currentTarget as HTMLInputElement).value = "";
-                }}
+
+            {dbSelectorCard}
+
+            <div class="volo-subcard">
+              <div class="volo-subcard-title">{t("setup.leg_adjust_head")}</div>
+              <div class="volo-help" style={{ marginBottom: "10px" }}>{t("setup.leg_adjust_hint")}</div>
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("setup.leg_old_url")}</label>
+                  <input
+                    class="volo-input"
+                    autoComplete="off"
+                    value={oldSiteUrl}
+                    placeholder={t("setup.leg_old_url_ph")}
+                    onInput={(e) => setOldSiteUrl((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("setup.leg_new_url")}</label>
+                  <input
+                    class="volo-input"
+                    autoComplete="off"
+                    value={newSiteUrl}
+                    placeholder={t("setup.leg_new_url_ph")}
+                    onInput={(e) => setNewSiteUrl((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              </div>
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("setup.leg_site_title")}</label>
+                  <input
+                    class="volo-input"
+                    autoComplete="off"
+                    value={legSiteTitle}
+                    placeholder={t("setup.leg_keep_ph")}
+                    onInput={(e) => setLegSiteTitle((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("setup.leg_site_sub")}</label>
+                  <input
+                    class="volo-input"
+                    autoComplete="off"
+                    value={legSiteSubtitle}
+                    placeholder={t("setup.leg_keep_ph")}
+                    onInput={(e) => setLegSiteSubtitle((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              </div>
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("setup.leg_storage")}</label>
+                  <ConsoleSelect
+                    value={storageMode}
+                    onChange={setStorageMode}
+                    options={[
+                      { value: "keep", label: t("setup.leg_storage_keep") },
+                      { value: "local", label: t("setup.leg_storage_local") },
+                    ]}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("setup.timezone")}</label>
+                  <input
+                    class="volo-input"
+                    autoComplete="off"
+                    value={legTimezone}
+                    placeholder={timezone || "Asia/Shanghai"}
+                    onInput={(e) => setLegTimezone((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div class="volo-subcard">
+              <div class="volo-subcard-title">{t("setup.leg_admin_head")}</div>
+              <div class="volo-grid-3">
+                <div class="volo-field">
+                  <label>{t("setup.leg_admin_user")}</label>
+                  <input
+                    class="volo-input"
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    value={legAdminUser}
+                    placeholder={t("setup.leg_keep_ph")}
+                    onInput={(e) => setLegAdminUser((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("setup.leg_admin_email")}</label>
+                  <input
+                    type="email"
+                    class="volo-input"
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    value={legAdminEmail}
+                    placeholder={t("setup.leg_keep_ph")}
+                    onInput={(e) => setLegAdminEmail((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("setup.leg_admin_pwd")}</label>
+                  <input
+                    type="password"
+                    class="volo-input"
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    minLength={6}
+                    value={legAdminPwd}
+                    placeholder={t("setup.leg_keep_ph")}
+                    onInput={(e) => setLegAdminPwd((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div style={{ margin: "12px 0" }}>
+              <SwitchToggle
+                checked={dryRun}
+                onChange={setDryRun}
+                label={t("sys.import_dryrun_lbl")}
               />
-            </label>
+            </div>
+            <UploadButton
+              accept=".zip,.json"
+              busy={busy}
+              busyLabel={t("setup.importing")}
+              label={t("setup.import_btn")}
+              primary
+              small={false}
+              className="volo-w-full"
+              onFile={(f) => void handleLegacyUpload(f)}
+            />
             {etlResult && (
-              <pre class="volo-card" style={{ marginTop: "14px", fontSize: "12px", overflowX: "auto" }}>
+              <pre class="volo-subcard" style={{ marginTop: "14px", fontSize: "12px", overflowX: "auto" }}>
                 {JSON.stringify(etlResult, null, 2)}
               </pre>
             )}

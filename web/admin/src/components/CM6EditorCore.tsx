@@ -326,7 +326,7 @@ interface OutlineItem {
   line: number;
 }
 
-export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorProps) {
+export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM6EditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const wysiwygRef = useRef<HTMLDivElement | null>(null);
@@ -334,6 +334,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
   const modeCompartment = useRef(new Compartment());
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const onSaveRef = useRef(onSave);
+  onSaveRef.current = onSave;
 
   const curLocale = localeSig.value;
   const [mode, setMode] = useState<EditorMode>(() => {
@@ -344,9 +346,11 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
   const [uploading, setUploading] = useState<boolean>(false);
   const [fullscreen, setFullscreen] = useState<boolean>(false);
   const [showOutline, setShowOutline] = useState<boolean>(false);
+  const [mobilePane, setMobilePane] = useState<"write" | "preview" | "outline">("write");
   const [headingOpen, setHeadingOpen] = useState<boolean>(false);
   const [mediaMenuOpen, setMediaMenuOpen] = useState<boolean>(false);
   const [mediaModalOpen, setMediaModalOpen] = useState<boolean>(false);
+  const [dynQuickInserts, setDynQuickInserts] = useState<CM6EditorProps["quickInserts"]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Quick Insert Modal State
@@ -525,6 +529,17 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
 
     const shortcutKeymap = keymap.of([
       {
+        key: "Mod-s",
+        run: () => {
+          if (onSaveRef.current) {
+            onSaveRef.current();
+          } else {
+            window.dispatchEvent(new CustomEvent("volo:save"));
+          }
+          return true;
+        },
+      },
+      {
         key: "Mod-b",
         run: () => {
           wrapSelection("**", "**", "bold");
@@ -541,7 +556,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
       {
         key: "Mod-k",
         run: () => {
-          wrapSelection("[", "](https://)", "link");
+          wrapSelection("[", "](https://)", t("ed.link_text_ph"));
           return true;
         },
       },
@@ -577,6 +592,15 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
       viewRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (quickInserts.length > 0) return;
+    apiFetch<{ items?: CM6EditorProps["quickInserts"]; quick_inserts?: CM6EditorProps["quickInserts"] }>(
+      "/api/admin/plugins/quick-inserts"
+    )
+      .then((r) => setDynQuickInserts(r.items || r.quick_inserts || []))
+      .catch(() => {});
+  }, [quickInserts.length]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -670,6 +694,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
   }, [qiOpen, qiTab]);
 
   const jumpToLine = (lineNo: number) => {
+    setMobilePane("write");
     const view = viewRef.current;
     if (!view || mode === "wysiwyg") return;
     const safe = Math.min(Math.max(1, lineNo), view.state.doc.lines);
@@ -680,6 +705,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
     });
     view.focus();
   };
+
+  const mergedQuickInserts = quickInserts.length > 0 ? quickInserts : dynQuickInserts || [];
 
   return (
     <div class={`volo-studio-editor ${fullscreen ? "is-fullscreen" : ""}`}>
@@ -812,7 +839,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
 
           <span class="volo-ed-sep" />
 
-          <button type="button" class="volo-ed-btn" title={t("ed.link")} onClick={() => wrapSelection("[", "](https://)", "链接文字")}>
+          <button type="button" class="volo-ed-btn" title={t("ed.link")} onClick={() => wrapSelection("[", "](https://)", t("ed.link_text_ph"))}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
               <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
@@ -822,7 +849,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
             type="button"
             class="volo-ed-btn"
             title={t("ed.table")}
-            onClick={() => insertSnippet("\n| 列 1 | 列 2 | 列 3 |\n| --- | --- | --- |\n| 内容 | 内容 | 内容 |\n")}
+            onClick={() => insertSnippet(`\n${t("ed.table_tpl")}\n`)}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <rect x="3" y="3" width="18" height="18" rx="2" />
@@ -845,19 +872,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
             </svg>
           </button>
 
-          {/* Upload Media / Insert from Media Library (when local storage is active) */}
+          {/* Upload Media / Insert from Media Library (works for both local & S3) */}
           <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
             <button
               type="button"
               class={`volo-ed-btn ${mediaMenuOpen ? "active" : ""}`}
               title={uploading ? t("ed.uploading") : t("ed.upload_media")}
-              onClick={() => {
-                if (storageDriverSig.value === "local") {
-                  setMediaMenuOpen((v) => !v);
-                } else {
-                  fileInputRef.current?.click();
-                }
-              }}
+              onClick={() => setMediaMenuOpen((v) => !v)}
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="3" y="3" width="18" height="18" rx="2" />
@@ -876,8 +897,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
                 (e.currentTarget as HTMLInputElement).value = "";
               }}
             />
-            {mediaMenuOpen && storageDriverSig.value === "local" && (
-              <div class="volo-pop-menu" style={{ left: 0, right: "auto", minWidth: "184px" }}>
+            {mediaMenuOpen && (
+              <div class="volo-pop-menu volo-ed-media-pop">
                 <button
                   type="button"
                   class="volo-pop-item"
@@ -915,7 +936,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
             </svg>
           </button>
 
-          {quickInserts.map((qi) => (
+          {mergedQuickInserts.map((qi) => (
             <button
               key={`${qi.plugin_id || "core"}:${qi.id}`}
               type="button"
@@ -933,14 +954,20 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
             <button
               type="button"
               class={`volo-ed-mode-btn ${mode === "ir" ? "active" : ""}`}
-              onClick={() => switchMode("ir")}
+              onClick={() => {
+                switchMode("ir");
+                setMobilePane("write");
+              }}
             >
               {t("ed.mode_ir")}
             </button>
             <button
               type="button"
               class={`volo-ed-mode-btn ${mode === "wysiwyg" ? "active" : ""}`}
-              onClick={() => switchMode("wysiwyg")}
+              onClick={() => {
+                switchMode("wysiwyg");
+                setMobilePane("write");
+              }}
             >
               {t("ed.mode_wysiwyg")}
             </button>
@@ -957,7 +984,14 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
             type="button"
             class={`volo-ed-btn ${showOutline ? "active" : ""}`}
             title={t("ed.outline")}
-            onClick={() => setShowOutline((v) => !v)}
+            onClick={() =>
+              setShowOutline((v) => {
+                const next = !v;
+                if (next) setMobilePane("outline");
+                else if (mobilePane === "outline") setMobilePane("write");
+                return next;
+              })
+            }
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <line x1="3" y1="6" x2="21" y2="6" />
@@ -991,8 +1025,39 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
         </div>
       </div>
 
+      {/* Mobile Segmented Pane Bar when Split View or Outline is active */}
+      {(mode === "sv" || showOutline) && (
+        <div class="volo-ed-mobile-tabs">
+          <button
+            type="button"
+            class={`volo-filter-pill ${mobilePane === "write" ? "active" : ""}`}
+            onClick={() => setMobilePane("write")}
+          >
+            {t("ed.mob_write")}
+          </button>
+          {mode === "sv" && (
+            <button
+              type="button"
+              class={`volo-filter-pill ${mobilePane === "preview" ? "active" : ""}`}
+              onClick={() => setMobilePane("preview")}
+            >
+              {t("ed.mob_preview")}
+            </button>
+          )}
+          {showOutline && (
+            <button
+              type="button"
+              class={`volo-filter-pill ${mobilePane === "outline" ? "active" : ""}`}
+              onClick={() => setMobilePane("outline")}
+            >
+              {t("ed.outline")}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Main Editor Body */}
-      <div class={`volo-ed-body mode-${mode} ${showOutline ? "with-outline" : ""}`}>
+      <div class={`volo-ed-body mode-${mode} mob-pane-${mobilePane} ${showOutline ? "with-outline" : ""}`}>
         {/* CM6 Host stays mounted for undo history; hidden only in pure visual mode */}
         <div
           class={`volo-cm-host ${mode === "ir" ? "is-ir-mode" : ""}`}

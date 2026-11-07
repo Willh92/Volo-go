@@ -49,6 +49,7 @@ type ReadingSettings struct {
 	BlockedKeywords       []string `json:"blocked_keywords"`
 	AllowedKeywords       []string `json:"allowed_keywords"`
 	PoWDifficultyBits     int      `json:"pow_difficulty_bits"`
+	AssetCDNPrefix        string   `json:"asset_cdn_prefix"`
 }
 
 // PodcastChannelConfig holds full Apple/Spotify iTunes Podcast metadata inside "feed" domain.

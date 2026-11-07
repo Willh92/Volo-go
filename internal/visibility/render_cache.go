@@ -11,9 +11,9 @@ import (
 	"github.com/Willh92/Volo-go/internal/render"
 )
 
-// DefaultRenderCacheMaxBytes bounds resident Markdown card/detail/feed render cache memory to <= 4 MiB,
-// ensuring Volo-go stays comfortably within its < 35 MiB RSS budget while eliminating hot-path re-parsing.
-const DefaultRenderCacheMaxBytes = 4 * 1024 * 1024
+// DefaultRenderCacheMaxBytes bounds resident Markdown card/detail/feed render cache memory to <= 1.5 MiB,
+// ensuring Volo-go stays comfortably within its < 25 MiB RSS budget while eliminating hot-path re-parsing.
+const DefaultRenderCacheMaxBytes = 1536 << 10
 
 type cachedCardMeta struct {
 	summary        string

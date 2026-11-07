@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html"
 	"html/template"
+	"io"
 	"io/fs"
 	"mime"
 	"net/http"
@@ -175,12 +176,21 @@ type cachedAsset struct {
 
 type loadedTheme struct {
 	manifest   Manifest
-	pages      map[string]*template.Template
+	fsys       fs.FS
+	fallbackFS fs.FS
+	pageNames  map[string]struct{}
 	hasOwnPage map[string]bool
-	assets     map[string]cachedAsset
-	locales    map[string]map[string]string
-	preview    cachedAsset
-	hasPreview bool
+
+	mu          sync.Mutex
+	assetsReady bool
+	assets      map[string]cachedAsset
+	preview     cachedAsset
+	hasPreview  bool
+
+	baseReady bool
+	base      *template.Template
+	locales   map[string]map[string]string
+	pages     map[string]*template.Template
 }
 
 // PageContext holds all data passed into theme templates.
@@ -239,7 +249,8 @@ type PageContext struct {
 	OutdatedDays  int
 
 	// Standalone Page
-	StandalonePage content.PublicPageView
+	IsStandalonePage bool
+	StandalonePage   content.PublicPageView
 
 	// Taxonomies, Books, Links, Follows
 	TaxonomyKind      string
@@ -264,9 +275,12 @@ type PageContext struct {
 	RecentComments     []content.RecentCommentItem
 
 	// Plugin Widget Slots
-	HeadWidgets    []plugin.RenderedSlot
-	SidebarWidgets []plugin.RenderedSlot
-	FooterWidgets  []plugin.RenderedSlot
+	HeadWidgets          []plugin.RenderedSlot
+	HeaderWidgets        []plugin.RenderedSlot
+	ArticleBeforeWidgets []plugin.RenderedSlot
+	ArticleAfterWidgets  []plugin.RenderedSlot
+	SidebarWidgets       []plugin.RenderedSlot
+	FooterWidgets        []plugin.RenderedSlot
 
 	// Error Page
 	StatusCode   int
@@ -275,11 +289,29 @@ type PageContext struct {
 
 // Engine manages embedded `volo-studio` and hot-reloadable external `./themes/<id>` packages.
 type Engine struct {
-	catalog   *i18n.Catalog
-	themesDir string
+	catalog     *i18n.Catalog
+	themesDir   string
+	cdnPrefixFn func() string
 
 	mu     sync.RWMutex
 	themes map[string]*loadedTheme
+}
+
+// SetAssetCDNPrefixFunc registers an optional dynamic getter for Reading.AssetCDNPrefix.
+func (e *Engine) SetAssetCDNPrefixFunc(fn func() string) {
+	e.mu.Lock()
+	e.cdnPrefixFn = fn
+	e.mu.Unlock()
+}
+
+func (e *Engine) assetCDNPrefix() string {
+	e.mu.RLock()
+	fn := e.cdnPrefixFn
+	e.mu.RUnlock()
+	if fn == nil {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSpace(fn()), "/")
 }
 
 // NewEngine loads the embedded `volo-studio` theme and scans themesDir for external themes.
@@ -295,7 +327,8 @@ func NewEngine(catalog *i18n.Catalog, themesDir string) (*Engine, error) {
 	return e, nil
 }
 
-// Reload reloads built-in `volo-studio` and discovers any valid external themes in themesDir.
+// Reload discovers built-in `volo-studio` and any valid external themes in themesDir,
+// validating manifests and template layout cheaply while deferring template AST and gzip asset compilation until first use.
 func (e *Engine) Reload() error {
 	next := make(map[string]*loadedTheme)
 
@@ -303,9 +336,9 @@ func (e *Engine) Reload() error {
 	if err != nil {
 		return fmt.Errorf("theme: open embedded volo-studio: %w", err)
 	}
-	builtinLoaded, err := e.compileThemeFS(subFS, nil, true)
+	builtinLoaded, err := e.inspectThemeFS(subFS, nil, true)
 	if err != nil {
-		return fmt.Errorf("theme: compile embedded volo-studio: %w", err)
+		return fmt.Errorf("theme: inspect embedded volo-studio: %w", err)
 	}
 	next[builtinLoaded.manifest.ID] = builtinLoaded
 
@@ -320,7 +353,7 @@ func (e *Engine) Reload() error {
 				if st, lErr := os.Lstat(dirPath); lErr != nil || st.Mode()&os.ModeSymlink != 0 {
 					continue
 				}
-				extLoaded, cErr := e.compileThemeFS(os.DirFS(dirPath), subFS, false)
+				extLoaded, cErr := e.inspectThemeFS(os.DirFS(dirPath), subFS, false)
 				if cErr == nil && extLoaded.manifest.ID != "" && extLoaded.manifest.ID != DefaultThemeID {
 					next[extLoaded.manifest.ID] = extLoaded
 				}
@@ -332,6 +365,237 @@ func (e *Engine) Reload() error {
 	e.themes = next
 	e.mu.Unlock()
 	return nil
+}
+
+func (e *Engine) inspectThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*loadedTheme, error) {
+	rawManifest, err := fs.ReadFile(fsys, "theme.json")
+	if err != nil {
+		return nil, err
+	}
+	var mf Manifest
+	if err := json.Unmarshal(rawManifest, &mf); err != nil {
+		return nil, err
+	}
+	mf.IsBuiltin = isBuiltin
+	if mf.ID == "" {
+		return nil, fmt.Errorf("theme.json missing id")
+	}
+	validSchema, err := validateThemeConfigSchema(mf.ConfigSchema)
+	if err != nil {
+		return nil, err
+	}
+	mf.ConfigSchema = validSchema
+
+	pageNames := make(map[string]struct{})
+	hasOwnPage := make(map[string]bool)
+	collectPages := func(srcFS fs.FS, isOwn bool) {
+		if srcFS == nil {
+			return
+		}
+		if tplEntries, dErr := fs.ReadDir(srcFS, "templates"); dErr == nil {
+			for _, ent := range tplEntries {
+				name := ent.Name()
+				if ent.IsDir() || !strings.HasSuffix(name, ".html") || isSharedTemplateRel(name) {
+					continue
+				}
+				pageNames[name] = struct{}{}
+				if isOwn {
+					hasOwnPage[name] = true
+				}
+			}
+		}
+	}
+	collectPages(fallbackFS, false)
+	collectPages(fsys, true)
+	if len(pageNames) == 0 {
+		return nil, fmt.Errorf("theme %s: no page templates found", mf.ID)
+	}
+
+	return &loadedTheme{
+		manifest:   mf,
+		fsys:       fsys,
+		fallbackFS: fallbackFS,
+		pageNames:  pageNames,
+		hasOwnPage: hasOwnPage,
+		pages:      make(map[string]*template.Template),
+	}, nil
+}
+
+func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
+	if th == nil {
+		return nil
+	}
+	th.mu.Lock()
+	defer th.mu.Unlock()
+	if th.assetsReady {
+		return th.assets
+	}
+
+	var gzBuf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&gzBuf, gzip.BestCompression)
+	if err != nil {
+		th.assets = make(map[string]cachedAsset)
+		th.assetsReady = true
+		return th.assets
+	}
+
+	assets := make(map[string]cachedAsset)
+	if th.fsys != nil {
+		_ = fs.WalkDir(th.fsys, "assets", func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() {
+				return nil
+			}
+			raw, rErr := fs.ReadFile(th.fsys, p)
+			if rErr != nil {
+				return nil
+			}
+			rel := strings.TrimPrefix(p, "assets/")
+			assets[rel] = buildCachedAssetWithWriter(raw, rel, zw, &gzBuf)
+			return nil
+		})
+	}
+
+	var previewAsset cachedAsset
+	var hasPreview bool
+	var previewCandidates []string
+	if th.manifest.Preview != "" {
+		previewCandidates = append(previewCandidates, strings.TrimPrefix(path.Clean("/"+th.manifest.Preview), "/"))
+	}
+	previewCandidates = append(previewCandidates, "preview.svg", "preview.png", "preview.webp", "preview.jpg", "assets/preview.svg", "assets/preview.png")
+	if th.fsys != nil {
+		for _, cand := range previewCandidates {
+			if rawPrev, pErr := fs.ReadFile(th.fsys, cand); pErr == nil && len(rawPrev) > 0 {
+				previewAsset = buildCachedAssetWithWriter(rawPrev, cand, zw, &gzBuf)
+				hasPreview = true
+				break
+			}
+		}
+	}
+
+	th.assets = assets
+	th.preview = previewAsset
+	th.hasPreview = hasPreview
+	th.assetsReady = true
+	return assets
+}
+
+func (e *Engine) getOrCompilePage(th *loadedTheme, defTh *loadedTheme, selected string) (*template.Template, error) {
+	var fallbackAssets map[string]cachedAsset
+	if th.fallbackFS != nil && defTh != nil && defTh != th {
+		fallbackAssets = e.ensureAssets(defTh)
+	}
+	ownAssets := e.ensureAssets(th)
+
+	th.mu.Lock()
+	defer th.mu.Unlock()
+	if t, ok := th.pages[selected]; ok {
+		return t, nil
+	}
+
+	if !th.baseReady {
+		themeLocales := make(map[string]map[string]string)
+		loadLocalesFrom := func(srcFS fs.FS) {
+			if srcFS == nil {
+				return
+			}
+			entries, dErr := fs.ReadDir(srcFS, "locales")
+			if dErr != nil {
+				return
+			}
+			for _, ent := range entries {
+				if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
+					continue
+				}
+				code := strings.TrimSuffix(ent.Name(), ".json")
+				rawLoc, rErr := fs.ReadFile(srcFS, "locales/"+ent.Name())
+				if rErr != nil {
+					continue
+				}
+				var rawMap map[string]any
+				if jErr := json.Unmarshal(rawLoc, &rawMap); jErr != nil {
+					continue
+				}
+				if themeLocales[code] == nil {
+					themeLocales[code] = make(map[string]string, len(rawMap))
+				}
+				for k, v := range rawMap {
+					if k == "_meta" || strings.HasPrefix(k, "$") {
+						continue
+					}
+					if s, isStr := v.(string); isStr {
+						themeLocales[code][k] = s
+					}
+				}
+			}
+		}
+		loadLocalesFrom(th.fallbackFS)
+		loadLocalesFrom(th.fsys)
+
+		funcs := e.templateFuncMap(th.manifest.ID, ownAssets, fallbackAssets, themeLocales)
+		base := template.New("root").Funcs(funcs)
+
+		parseSharedFrom := func(srcFS fs.FS) error {
+			if srcFS == nil {
+				return nil
+			}
+			var sharedPaths []string
+			_ = fs.WalkDir(srcFS, "templates", func(p string, d fs.DirEntry, walkErr error) error {
+				if walkErr != nil || d.IsDir() || !strings.HasSuffix(p, ".html") {
+					return nil
+				}
+				rel := strings.TrimPrefix(p, "templates/")
+				if isSharedTemplateRel(rel) {
+					sharedPaths = append(sharedPaths, p)
+				}
+				return nil
+			})
+			sort.Strings(sharedPaths)
+			for _, sp := range sharedPaths {
+				b, rErr := fs.ReadFile(srcFS, sp)
+				if rErr != nil {
+					return rErr
+				}
+				if _, pErr := base.Parse(string(b)); pErr != nil {
+					return fmt.Errorf("parse %s: %w", sp, pErr)
+				}
+			}
+			return nil
+		}
+		if err := parseSharedFrom(th.fallbackFS); err != nil {
+			return nil, err
+		}
+		if err := parseSharedFrom(th.fsys); err != nil {
+			return nil, err
+		}
+		th.locales = themeLocales
+		th.base = base
+		th.baseReady = true
+	}
+
+	var rawTpl []byte
+	var rErr error
+	if th.fsys != nil {
+		rawTpl, rErr = fs.ReadFile(th.fsys, "templates/"+selected)
+	}
+	if (th.fsys == nil || rErr != nil) && th.fallbackFS != nil {
+		rawTpl, rErr = fs.ReadFile(th.fallbackFS, "templates/"+selected)
+	}
+	if rErr != nil {
+		return nil, rErr
+	}
+
+	cloned, cErr := th.base.Clone()
+	if cErr != nil {
+		return nil, cErr
+	}
+	if _, pErr := cloned.New(selected).Parse(string(rawTpl)); pErr != nil {
+		return nil, fmt.Errorf("parse page %s: %w", selected, pErr)
+	}
+	if th.pages == nil {
+		th.pages = make(map[string]*template.Template)
+	}
+	th.pages[selected] = cloned
+	return cloned, nil
 }
 
 // List returns all loaded theme manifests sorted with `volo-studio` first.
@@ -459,28 +723,28 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 		return fmt.Errorf("theme %s: empty template candidate list", themeID)
 	}
 	e.mu.RLock()
+	defTh := e.themes[DefaultThemeID]
 	th, ok := e.themes[themeID]
 	if !ok {
-		th = e.themes[DefaultThemeID]
+		th = defTh
 		themeID = DefaultThemeID
+	}
+	if th == nil {
+		e.mu.RUnlock()
+		return fmt.Errorf("theme %s: not loaded", themeID)
 	}
 
 	var selected string
-	var tmpl *template.Template
 	for _, cand := range candidates {
 		if th.hasOwnPage[cand] {
-			if t, exists := th.pages[cand]; exists {
-				selected = cand
-				tmpl = t
-				break
-			}
+			selected = cand
+			break
 		}
 	}
-	if tmpl == nil {
+	if selected == "" {
 		for _, cand := range candidates {
-			if t, exists := th.pages[cand]; exists {
+			if _, exists := th.pageNames[cand]; exists {
 				selected = cand
-				tmpl = t
 				break
 			}
 		}
@@ -488,8 +752,12 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 	supportsPJAX := th.manifest.SupportsPJAX
 	e.mu.RUnlock()
 
-	if tmpl == nil {
+	if selected == "" {
 		return fmt.Errorf("theme %s: missing page templates %v", themeID, candidates)
+	}
+	tmpl, err := e.getOrCompilePage(th, defTh, selected)
+	if err != nil {
+		return fmt.Errorf("theme %s compile %s: %w", themeID, selected, err)
 	}
 	data.ThemeID = themeID
 	data.EnablePJAX = supportsPJAX
@@ -512,7 +780,7 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 		w.Header().Set("X-Robots-Tag", "noindex, nofollow")
 	}
 	w.WriteHeader(status)
-	_, err := w.Write(buf.Bytes())
+	_, err = w.Write(buf.Bytes())
 	return err
 }
 
@@ -530,13 +798,20 @@ func (e *Engine) ServePreview(w http.ResponseWriter, r *http.Request, themeID st
 		http.NotFound(w, r)
 		return
 	}
-	if th.hasPreview {
-		serveCachedAsset(w, r, th.preview, false)
+	_ = e.ensureAssets(th)
+	th.mu.Lock()
+	hasPreview := th.hasPreview
+	preview := th.preview
+	th.mu.Unlock()
+
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if hasPreview {
+		serveCachedAsset(w, r, preview, false)
 		return
 	}
 	svg := renderThemePreviewSVG(th.manifest)
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
@@ -556,12 +831,19 @@ func (e *Engine) ServeAsset(w http.ResponseWriter, r *http.Request, themeID stri
 	cleanRel := strings.TrimPrefix(path.Clean("/"+relAsset), "/")
 	e.mu.RLock()
 	th, ok := e.themes[themeID]
-	var asset cachedAsset
-	var found bool
-	if ok {
-		asset, found = th.assets[cleanRel]
-	}
+	defTh := e.themes[DefaultThemeID]
 	e.mu.RUnlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	assets := e.ensureAssets(th)
+	asset, found := assets[cleanRel]
+	if !found && themeID != DefaultThemeID && defTh != nil {
+		defAssets := e.ensureAssets(defTh)
+		asset, found = defAssets[cleanRel]
+	}
 
 	if !found {
 		http.NotFound(w, r)
@@ -587,34 +869,79 @@ func serveCachedAsset(w http.ResponseWriter, r *http.Request, asset cachedAsset,
 	}
 
 	useGzip := len(asset.gzipped) > 0 && acceptsGzip(r.Header.Get("Accept-Encoding"))
-	payload := asset.raw
 	if useGzip {
 		w.Header().Set("Content-Encoding", "gzip")
-		payload = asset.gzipped
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
+		_, _ = w.Write(asset.gzipped)
+		return
 	}
+
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
 	}
-	_, _ = w.Write(payload)
+	if asset.raw != nil {
+		_, _ = w.Write(asset.raw)
+		return
+	}
+	if len(asset.gzipped) > 0 {
+		if gr, err := gzip.NewReader(bytes.NewReader(asset.gzipped)); err == nil {
+			_, _ = io.Copy(w, gr)
+			_ = gr.Close()
+		}
+	}
 }
 
 // GzippedAssetSize returns the pre-compressed Gzip byte size of a theme asset (used in budget tests).
 func (e *Engine) GzippedAssetSize(themeID string, relAsset string) (int, bool) {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
 	th, ok := e.themes[themeID]
+	defTh := e.themes[DefaultThemeID]
+	e.mu.RUnlock()
 	if !ok {
 		return 0, false
 	}
-	a, ok := th.assets[relAsset]
+	assets := e.ensureAssets(th)
+	a, ok := assets[relAsset]
+	if !ok && themeID != DefaultThemeID && defTh != nil {
+		defAssets := e.ensureAssets(defTh)
+		a, ok = defAssets[relAsset]
+	}
 	if !ok {
 		return 0, false
 	}
 	return len(a.gzipped), true
 }
 
-func (e *Engine) compileThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*loadedTheme, error) {
+func validateThemeConfigSchema(schema []ConfigField) ([]ConfigField, error) {
+	if len(schema) == 0 {
+		return nil, nil
+	}
+	out := make([]ConfigField, len(schema))
+	for i, f := range schema {
+		f.Key = strings.TrimSpace(f.Key)
+		if f.Key == "" {
+			return nil, fmt.Errorf("theme.json config_schema[%d] missing key", i)
+		}
+		ft := strings.ToLower(strings.TrimSpace(f.Type))
+		if ft == "" {
+			ft = "text"
+		}
+		switch ft {
+		case "text", "string", "textarea", "url", "color", "image", "boolean", "number", "select":
+		default:
+			return nil, fmt.Errorf("theme.json config_schema[%q] unsupported type %q", f.Key, f.Type)
+		}
+		f.Type = ft
+		out[i] = f
+	}
+	return out, nil
+}
+
+func (e *Engine) compileThemeFS(fsys fs.FS, fallbackFS fs.FS, fallbackAssets map[string]cachedAsset, isBuiltin bool, zw *gzip.Writer, gzBuf *bytes.Buffer) (*loadedTheme, error) {
 	rawManifest, err := fs.ReadFile(fsys, "theme.json")
 	if err != nil {
 		return nil, err
@@ -627,27 +954,38 @@ func (e *Engine) compileThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 	if mf.ID == "" {
 		return nil, fmt.Errorf("theme.json missing id")
 	}
+	validSchema, err := validateThemeConfigSchema(mf.ConfigSchema)
+	if err != nil {
+		return nil, err
+	}
+	mf.ConfigSchema = validSchema
 
-	assets := make(map[string]cachedAsset)
-	loadAssetsFrom := func(srcFS fs.FS) {
-		if srcFS == nil {
-			return
+	if zw == nil || gzBuf == nil {
+		var localBuf bytes.Buffer
+		localZW, zErr := gzip.NewWriterLevel(&localBuf, gzip.BestCompression)
+		if zErr != nil {
+			return nil, zErr
 		}
-		_ = fs.WalkDir(srcFS, "assets", func(p string, d fs.DirEntry, walkErr error) error {
+		zw = localZW
+		gzBuf = &localBuf
+	}
+
+	// Only load the theme's own assets into `assets`; external themes fall back to DefaultThemeID assets on lookup.
+	assets := make(map[string]cachedAsset)
+	if fsys != nil {
+		_ = fs.WalkDir(fsys, "assets", func(p string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil || d.IsDir() {
 				return nil
 			}
-			raw, rErr := fs.ReadFile(srcFS, p)
+			raw, rErr := fs.ReadFile(fsys, p)
 			if rErr != nil {
 				return nil
 			}
 			rel := strings.TrimPrefix(p, "assets/")
-			assets[rel] = buildCachedAsset(raw, rel)
+			assets[rel] = buildCachedAssetWithWriter(raw, rel, zw, gzBuf)
 			return nil
 		})
 	}
-	loadAssetsFrom(fallbackFS)
-	loadAssetsFrom(fsys)
 
 	// Load optional preview image (configured `preview` path or root `preview.{svg,png,webp,jpg}`)
 	var previewAsset cachedAsset
@@ -659,7 +997,7 @@ func (e *Engine) compileThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 	previewCandidates = append(previewCandidates, "preview.svg", "preview.png", "preview.webp", "preview.jpg", "assets/preview.svg", "assets/preview.png")
 	for _, cand := range previewCandidates {
 		if rawPrev, pErr := fs.ReadFile(fsys, cand); pErr == nil && len(rawPrev) > 0 {
-			previewAsset = buildCachedAsset(rawPrev, cand)
+			previewAsset = buildCachedAssetWithWriter(rawPrev, cand, zw, gzBuf)
 			hasPreview = true
 			break
 		}
@@ -704,7 +1042,7 @@ func (e *Engine) compileThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 	loadLocalesFrom(fallbackFS)
 	loadLocalesFrom(fsys)
 
-	funcs := e.templateFuncMap(mf.ID, assets, themeLocales)
+	funcs := e.templateFuncMap(mf.ID, assets, fallbackAssets, themeLocales)
 	base := template.New("root").Funcs(funcs)
 
 	// Parse shared layout, macro, and modular partial templates in deterministic order (`fallbackFS` then `fsys` override)
@@ -815,23 +1153,28 @@ func isSharedTemplateRel(rel string) bool {
 		strings.HasPrefix(rel, "macro_")
 }
 
-func buildCachedAsset(raw []byte, rel string) cachedAsset {
+func buildCachedAssetWithWriter(raw []byte, rel string, zw *gzip.Writer, gzBuf *bytes.Buffer) cachedAsset {
 	sum := sha256.Sum256(raw)
 	short := hex.EncodeToString(sum[:4])
 	etag := `"` + hex.EncodeToString(sum[:12]) + `"`
 
-	var gzBuf bytes.Buffer
-	gzW, _ := gzip.NewWriterLevel(&gzBuf, gzip.BestCompression)
-	_, _ = gzW.Write(raw)
-	_ = gzW.Close()
+	gzBuf.Reset()
+	zw.Reset(gzBuf)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	gzipped := bytes.Clone(gzBuf.Bytes())
 
 	ctype := mime.TypeByExtension(filepath.Ext(rel))
 	if ctype == "" {
 		ctype = "application/octet-stream"
 	}
+	var retainedRaw []byte
+	if len(gzipped) == 0 {
+		retainedRaw = raw
+	}
 	return cachedAsset{
-		raw:         raw,
-		gzipped:     gzBuf.Bytes(),
+		raw:         retainedRaw,
+		gzipped:     gzipped,
 		contentType: ctype,
 		etag:        etag,
 		shortHash:   short,

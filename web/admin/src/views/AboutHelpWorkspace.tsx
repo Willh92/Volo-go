@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { apiFetch, resetConsoleScroll, showToast } from "../api";
+import { ConsoleEmpty } from "../components/UIControls";
 import { t } from "../i18n";
 
 export type AboutHelpTab = "about" | "help";
@@ -56,10 +57,10 @@ export function AboutHelpWorkspace({
       const res = await apiFetch<ProjectInfoPayload>(url);
       setInfo(res);
       if (forceRefresh) {
-        showToast(t("about.refreshed_toast"));
+        showToast(t("about.refreshed_toast"), "ok");
       }
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     } finally {
       setLoading(false);
     }
@@ -96,6 +97,7 @@ export function AboutHelpWorkspace({
       desc: t("help.shortcut_desc"),
       items: [
         { code: "Ctrl / Cmd + K", text: t("help.sc_item_search") },
+        { code: "Ctrl / Cmd + S", text: t("help.sc_item_save") },
         { code: "Ctrl / Cmd + B / I", text: t("help.sc_item_format") },
         { code: "IR / WYSIWYG / SV", text: t("help.sc_item_modes") },
         { code: "Drag & Paste", text: t("help.sc_item_upload") },
@@ -161,7 +163,7 @@ export function AboutHelpWorkspace({
           <div class="volo-about-hero">
             <div class="volo-about-hero-left">
               <div class="volo-about-mark">V.</div>
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "0.15em", opacity: 0.8 }}>
                   A SPACE FOR YOUR WORDS
                 </div>
@@ -277,7 +279,7 @@ export function AboutHelpWorkspace({
                 </div>
 
                 <div class="volo-subcard" style={{ margin: "6px 0 12px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                     <span class="volo-help">{t("about.latest_tag")}</span>
                     <span class="volo-code-chip">
                       {info?.latest_release?.tag_name || info?.version || "v1.0.0"}
@@ -332,8 +334,7 @@ export function AboutHelpWorkspace({
               </div>
               <div class="volo-filter-controls">
                 <input
-                  class="volo-input"
-                  style={{ width: "260px" }}
+                  class="volo-input volo-search-input"
                   placeholder={t("help.search_ph")}
                   value={helpQuery}
                   onInput={(e) => setHelpQuery((e.target as HTMLInputElement).value)}
@@ -342,32 +343,39 @@ export function AboutHelpWorkspace({
             </div>
           </div>
 
-          <div class="volo-grid-2">
-            {visibleHelp.map((card) => (
-              <div key={card.id} class="volo-card" style={{ marginBottom: 0 }}>
-                <h3 class="volo-card-title" style={{ marginBottom: "4px" }}>{card.title}</h3>
-                <p class="volo-sec-desc" style={{ marginBottom: "14px" }}>{card.desc}</p>
-                <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                  {card.items.map((it, idx) => (
-                    <div
-                      key={idx}
-                      style={{
-                        display: "flex",
-                        alignItems: "flex-start",
-                        justifyContent: "space-between",
-                        gap: "12px",
-                        paddingBottom: idx < card.items.length - 1 ? "9px" : 0,
-                        borderBottom: idx < card.items.length - 1 ? "1px dashed var(--volo-line)" : "0",
-                      }}
-                    >
-                      <span style={{ fontSize: "13px", lineHeight: 1.5 }}>{it.text}</span>
-                      <code class="volo-kbd" style={{ flexShrink: 0 }}>{it.code}</code>
-                    </div>
-                  ))}
+          {visibleHelp.length === 0 ? (
+            <div class="volo-card">
+              <ConsoleEmpty text={t("tbl.empty")} />
+            </div>
+          ) : (
+            <div class="volo-grid-2">
+              {visibleHelp.map((card) => (
+                <div key={card.id} class="volo-card" style={{ marginBottom: 0 }}>
+                  <h3 class="volo-card-title" style={{ marginBottom: "4px" }}>{card.title}</h3>
+                  <p class="volo-sec-desc" style={{ marginBottom: "14px" }}>{card.desc}</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                    {card.items.map((it, idx) => (
+                      <div
+                        key={idx}
+                        style={{
+                          display: "flex",
+                          alignItems: "flex-start",
+                          justifyContent: "space-between",
+                          gap: "8px 12px",
+                          flexWrap: "wrap",
+                          paddingBottom: idx < card.items.length - 1 ? "9px" : 0,
+                          borderBottom: idx < card.items.length - 1 ? "1px dashed var(--volo-line)" : "0",
+                        }}
+                      >
+                        <span style={{ fontSize: "13px", lineHeight: 1.5 }}>{it.text}</span>
+                        <code class="volo-kbd" style={{ overflowWrap: "anywhere" }}>{it.code}</code>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

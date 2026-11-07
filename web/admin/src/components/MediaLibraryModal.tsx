@@ -1,11 +1,13 @@
 import { useEffect, useState } from "preact/hooks";
 import { apiFetch, showToast, storageDriverSig } from "../api";
 import { t } from "../i18n";
-import { AnimatedModal } from "./UIControls";
+import { AnimatedModal, ConsoleEmpty, UploadButton } from "./UIControls";
 
 export interface MediaAssetRecord {
   id: string;
   original_name: string;
+  orig_filename?: string;
+  alt_text?: string;
   mime_type: string;
   size_bytes: number;
   width: number;
@@ -35,6 +37,7 @@ export function MediaLibraryModal({
   const [items, setItems] = useState<MediaAssetRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [reconciling, setReconciling] = useState(false);
   const [query, setQuery] = useState("");
   const [kindTab, setKindTab] = useState<"all" | "image" | "audio">(filterKind);
 
@@ -49,12 +52,17 @@ export function MediaLibraryModal({
         items: MediaAssetRecord[];
         storage_driver?: string;
       }>("/api/admin/media");
-      setItems(res.items || []);
+      setItems(
+        (res.items || []).map((it) => ({
+          ...it,
+          original_name: it.original_name || it.orig_filename || it.id,
+        }))
+      );
       if (res.storage_driver) {
         storageDriverSig.value = res.storage_driver;
       }
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     } finally {
       setLoading(false);
     }
@@ -66,22 +74,43 @@ export function MediaLibraryModal({
     }
   }, [open]);
 
+  const handleReconcile = async () => {
+    setReconciling(true);
+    try {
+      await apiFetch("/api/admin/media/reconcile", { method: "POST", body: "{}" });
+      await loadAssets();
+      showToast(t("cnt.media_reconciled"), "ok");
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setReconciling(false);
+    }
+  };
+
   const handleUploadAndPick = async (file: File) => {
     setUploading(true);
     try {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await apiFetch<{ item: MediaAssetRecord }>("/api/admin/media/upload", {
-        method: "POST",
-        body: fd,
-      });
-      if (res.item) {
-        showToast(t("ed.uploaded", { name: file.name }));
-        onSelect(res.item);
+      const res = await apiFetch<{ asset?: MediaAssetRecord; item?: MediaAssetRecord }>(
+        "/api/admin/media/upload",
+        {
+          method: "POST",
+          body: fd,
+        }
+      );
+      const picked = res.asset || res.item;
+      if (picked) {
+        const normalized: MediaAssetRecord = {
+          ...picked,
+          original_name: picked.original_name || picked.orig_filename || file.name,
+        };
+        showToast(t("ed.uploaded", { name: normalized.original_name }), "ok");
+        onSelect(normalized);
         onClose();
       }
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     } finally {
       setUploading(false);
     }
@@ -95,6 +124,7 @@ export function MediaLibraryModal({
       const q = query.trim().toLowerCase();
       return (
         (m.original_name || "").toLowerCase().includes(q) ||
+        (m.alt_text || "").toLowerCase().includes(q) ||
         (m.public_url || "").toLowerCase().includes(q)
       );
     }
@@ -147,33 +177,35 @@ export function MediaLibraryModal({
 
         <div class="volo-filter-controls">
           <input
-            class="volo-input"
-            style={{ width: "220px" }}
+            class="volo-input volo-search-input"
             placeholder={t("cnt.media_search_ph")}
             value={query}
             onInput={(e) => setQuery((e.target as HTMLInputElement).value)}
           />
-          <label class="volo-btn volo-btn-primary volo-btn-sm" style={{ cursor: "pointer" }}>
-            {uploading ? t("ed.uploading") : t("cnt.media_upload_pick")}
-            <input
-              type="file"
-              accept={acceptAttr}
-              style={{ display: "none" }}
-              disabled={uploading}
-              onChange={(e) => {
-                const f = (e.target as HTMLInputElement).files?.[0];
-                if (f) void handleUploadAndPick(f);
-                (e.target as HTMLInputElement).value = "";
-              }}
-            />
-          </label>
+          {storageDriverSig.value === "local" && (
+            <button
+              type="button"
+              class="volo-btn volo-btn-sm"
+              disabled={reconciling}
+              onClick={() => void handleReconcile()}
+            >
+              {reconciling ? t("shell.loading") : t("cnt.media_scan_btn")}
+            </button>
+          )}
+          <UploadButton
+            accept={acceptAttr}
+            busy={uploading}
+            primary
+            label={t("cnt.media_upload_pick")}
+            onFile={(f) => void handleUploadAndPick(f)}
+          />
         </div>
       </div>
 
       {loading ? (
         <div class="volo-empty-state">{t("shell.loading")}</div>
       ) : filtered.length === 0 ? (
-        <div class="volo-empty-state">{t("tbl.empty")}</div>
+        <ConsoleEmpty text={t("tbl.empty")} />
       ) : (
         <div class="volo-media-picker-grid">
           {filtered.map((m) => {
@@ -191,7 +223,7 @@ export function MediaLibraryModal({
               >
                 <div class="volo-media-picker-thumb">
                   {isImg ? (
-                    <img src={m.public_url} alt={m.original_name} loading="lazy" />
+                    <img src={m.public_url} alt={m.alt_text || m.original_name} loading="lazy" />
                   ) : isAudio ? (
                     <div class="volo-media-type-placeholder">
                       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -242,11 +274,6 @@ export function MediaPickButton({
   className = "",
 }: MediaPickButtonProps) {
   const [open, setOpen] = useState(false);
-  const driver = storageDriverSig.value;
-
-  if (driver && driver !== "local") {
-    return null;
-  }
 
   return (
     <>

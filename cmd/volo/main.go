@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -249,6 +250,13 @@ func openMigratedStore(ctx context.Context, cfg *config.Config) (*sqlx.Store, er
 }
 
 func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(28 << 20)
+	}
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(60)
+	}
+
 	fs := flag.NewFlagSet("volo serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var common boundCommonFlags
@@ -351,6 +359,12 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		defer cancel()
 		_ = appSrv.Close(shutCtx)
 	}()
+
+	if appSrv.Deps().Content != nil {
+		_ = appSrv.Deps().Content.WarmCaches(ctx)
+	}
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	// Background rolling local + S3/WebDAV backup scheduler
 	backupSched := backup.NewScheduler(backup.SchedulerOptions{
@@ -651,7 +665,10 @@ func cmdImportLegacy(ctx context.Context, args []string, stdout io.Writer, stder
 	fs.SetOutput(stderr)
 	var common boundCommonFlags
 	registerCommonFlags(fs, &common)
-	dryRun := fs.Bool("dry-run", false, "Validate and summarize legacy bolo-solo archive without writing")
+	dryRun := fs.Bool("dry-run", false, "Validate and summarize legacy archive without writing")
+	oldSiteURL := fs.String("old-site-url", "", "Comma-separated legacy site URL prefixes to rewrite into relative paths")
+	newSiteURL := fs.String("new-site-url", "", "New canonical site URL override")
+	forceLocal := fs.Bool("storage-local", false, "Force storage driver to local after legacy import")
 	posPath, flagArgs := extractFirstPositional(args)
 	if err := fs.Parse(flagArgs); err != nil {
 		return 2
@@ -660,7 +677,7 @@ func cmdImportLegacy(ctx context.Context, args []string, stdout io.Writer, stder
 		posPath = fs.Arg(0)
 	}
 	if strings.TrimSpace(posPath) == "" {
-		fmt.Fprintln(stderr, "usage: volo import-legacy <bolo-solo-backup.zip|data.json> [--dry-run]")
+		fmt.Fprintln(stderr, "usage: volo import-legacy <legacy-backup.zip|data.json> [--dry-run] [--old-site-url URL] [--new-site-url URL] [--storage-local]")
 		return 2
 	}
 
@@ -679,9 +696,22 @@ func cmdImportLegacy(ctx context.Context, args []string, stdout io.Writer, stder
 	settingsMgr := repo.NewSettingsManager(store, cfg.KeyRing, cfg.DefaultLocale)
 	_, _ = settingsMgr.Reload(ctx)
 
+	var oldPrefixes []string
+	for _, p := range strings.FieldsFunc(*oldSiteURL, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t'
+	}) {
+		if p = strings.TrimSpace(p); p != "" {
+			oldPrefixes = append(oldPrefixes, p)
+		}
+	}
+
 	rep, err := etl.ImportLegacyArchive(ctx, store, settingsMgr, cfg.KeyRing, posPath, etl.ImportOptions{
-		DryRun:          *dryRun,
-		TargetUploadDir: cfg.UploadDir,
+		DryRun:            *dryRun,
+		TargetUploadDir:   cfg.UploadDir,
+		AdminPath:         cfg.AdminPath,
+		OldURLPrefixes:    oldPrefixes,
+		NewSiteURL:        strings.TrimSpace(*newSiteURL),
+		ForceLocalStorage: *forceLocal,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "volo import-legacy: %v\n", err)

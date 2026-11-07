@@ -208,7 +208,9 @@ func TestTenSurfaceCanaryZeroLeakRedTeamAndShareTokenLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = env.store.ExecContext(ctx, `INSERT INTO categories (id, name, slug, description, sort_order, created_at, updated_at) VALUES ('cat_tech', 'Tech', 'tech', 'Engineering', 1, ?, ?)`, now, now)
+	if _, err := env.store.ExecContext(ctx, `INSERT INTO categories (id, name, slug, description, icon, sort_order, created_at, updated_at) VALUES ('cat_tech', 'Tech', 'tech', 'Engineering', '', 1, ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
 	_, _ = env.store.ExecContext(ctx, `INSERT INTO tags (id, name, slug, created_at) VALUES ('tag_go', 'Go', 'go', ?)`, now)
 	_, _ = env.store.ExecContext(ctx, `INSERT INTO series (id, title, slug, description, cover_url, sort_order, created_at, updated_at) VALUES ('ser_1', 'Deep Dive', 'deep-dive', 'Architecture series', '', 1, ?, ?)`, now, now)
 

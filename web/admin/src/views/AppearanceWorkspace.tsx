@@ -1,5 +1,13 @@
 import { useEffect, useState } from "preact/hooks";
-import { accentSig, apiFetch, applyThemeAttributes, resetConsoleScroll, showToast, themeModeSig } from "../api";
+import {
+  accentSig,
+  apiFetch,
+  applyThemeAttributes,
+  openConfirm,
+  resetConsoleScroll,
+  showToast,
+  themeModeSig,
+} from "../api";
 import {
   ensureLocaleLoaded,
   exportFullTemplateJSON,
@@ -7,9 +15,21 @@ import {
   syncExternalLocales,
   t,
 } from "../i18n";
-import { AnimatedModal, ConsoleSelect, paginateItems, Pagination } from "../components/UIControls";
+import {
+  AnimatedModal,
+  ConsoleEmpty,
+  ConsoleSelect,
+  paginateItems,
+  Pagination,
+  SwitchToggle,
+  TableSkeleton,
+  UploadButton,
+} from "../components/UIControls";
+import { MediaPickButton } from "../components/MediaLibraryModal";
 
 export type AppearanceTab = "themes" | "locales" | "plugins";
+
+const CLEAR_SECRET_SENTINEL = "__VOLO_CLEAR_SECRET__";
 
 const ACCENTS: Array<{ id: string; swatch: string }> = [
   { id: "forest", swatch: "#246b51" },
@@ -37,6 +57,173 @@ function renderAccentLabel(id: string): string {
   }
 }
 
+function buildSchemaDefaults(schema: any[]): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const f of schema || []) {
+    if (!f?.key) continue;
+    const isSecret = Boolean(f.secret || f.type === "secret" || f.type === "password");
+    if (isSecret) {
+      out[f.key] = "";
+    } else if (f.default !== undefined) {
+      out[f.key] = f.default;
+    } else if (f.type === "boolean") {
+      out[f.key] = false;
+    } else if (f.type === "number") {
+      out[f.key] = 0;
+    } else {
+      out[f.key] = "";
+    }
+  }
+  return out;
+}
+
+function SchemaFieldControl({
+  field: f,
+  values,
+  onChange,
+  secretKeysSet,
+  namePrefix,
+}: {
+  field: any;
+  values: Record<string, any>;
+  onChange: (key: string, next: any) => void;
+  secretKeysSet?: Record<string, boolean>;
+  namePrefix: string;
+}) {
+  const label = f.label || f.key;
+  const isSecret = Boolean(f.secret || f.type === "secret" || f.type === "password");
+
+  if (f.type === "boolean") {
+    return (
+      <div class="volo-field">
+        <SwitchToggle
+          checked={Boolean(values[f.key] ?? f.default)}
+          onChange={(next) => onChange(f.key, next)}
+          label={label}
+          hint={f.description}
+        />
+      </div>
+    );
+  }
+
+  if (isSecret) {
+    const curVal = values[f.key];
+    const isClearing = curVal === CLEAR_SECRET_SENTINEL;
+    const isSealed = Boolean(secretKeysSet?.[f.key]);
+    return (
+      <div class="volo-field">
+        <label>
+          {label}{" "}
+          {isSealed && !isClearing && (
+            <span class="volo-badge volo-badge-ok">{t("app.secret_sealed_hint")}</span>
+          )}
+        </label>
+        {f.description && <div class="volo-help">{f.description}</div>}
+        <input
+          type="password"
+          class="volo-input"
+          name={`${namePrefix}_${f.key}`}
+          autoComplete="new-password"
+          disabled={isClearing}
+          placeholder={isClearing ? t("app.clear_saved_secret") : "••••••••"}
+          value={isClearing ? "" : String(curVal ?? "")}
+          onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
+        />
+        <div style={{ marginTop: "6px" }}>
+          <SwitchToggle
+            checked={isClearing}
+            onChange={(clear) => onChange(f.key, clear ? CLEAR_SECRET_SENTINEL : "")}
+            label={t("app.clear_saved_secret")}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div class="volo-field">
+      <label>{label}</label>
+      {f.description && <div class="volo-help">{f.description}</div>}
+      {f.type === "select" && Array.isArray(f.options) ? (
+        <ConsoleSelect
+          value={String(values[f.key] ?? f.default ?? "")}
+          onChange={(v) => onChange(f.key, v)}
+          options={f.options.map((op: any) =>
+            typeof op === "object" && op !== null
+              ? { value: String(op.value), label: String(op.label || op.value) }
+              : { value: String(op), label: String(op) },
+          )}
+        />
+      ) : f.type === "color" ? (
+        (() => {
+          const rawColor = String(values[f.key] ?? f.default ?? "");
+          const swatchVal = /^#[0-9a-fA-F]{6}$/.test(rawColor.trim()) ? rawColor.trim() : "#246b51";
+          return (
+            <div class="volo-input-row">
+              <input
+                type="color"
+                value={swatchVal}
+                aria-label={label}
+                style={{
+                  width: "40px",
+                  height: "36px",
+                  padding: "2px",
+                  border: "1px solid var(--volo-line)",
+                  borderRadius: "8px",
+                  background: "var(--volo-surface)",
+                  cursor: "pointer",
+                  flexShrink: 0,
+                }}
+                onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
+              />
+              <input
+                type="text"
+                class="volo-input"
+                name={`${namePrefix}_${f.key}`}
+                autoComplete="off"
+                placeholder="#246b51"
+                value={rawColor}
+                onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
+              />
+            </div>
+          );
+        })()
+      ) : f.type === "image" ? (
+        <div class="volo-input-row">
+          <input
+            type="text"
+            class="volo-input"
+            name={`${namePrefix}_${f.key}`}
+            autoComplete="off"
+            value={String(values[f.key] ?? f.default ?? "")}
+            onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
+          />
+          <MediaPickButton filterKind="image" onPick={(url) => onChange(f.key, url)} />
+        </div>
+      ) : f.type === "textarea" ? (
+        <textarea
+          class="volo-textarea"
+          rows={3}
+          value={String(values[f.key] ?? f.default ?? "")}
+          onInput={(e) => onChange(f.key, (e.currentTarget as HTMLTextAreaElement).value)}
+        />
+      ) : (
+        <input
+          type={f.type === "number" ? "number" : f.type === "url" ? "url" : "text"}
+          class="volo-input"
+          name={`${namePrefix}_${f.key}`}
+          autoComplete="off"
+          value={values[f.key] ?? f.default ?? ""}
+          onInput={(e) => {
+            const raw = (e.currentTarget as HTMLInputElement).value;
+            onChange(f.key, f.type === "number" ? (raw === "" ? 0 : Number(raw)) : raw);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 export function AppearanceWorkspace({
   activeTab = "themes",
   onNavigate,
@@ -46,6 +233,9 @@ export function AppearanceWorkspace({
 }) {
   const curLocale = localeSig.value;
   const [sub, setSub] = useState<AppearanceTab>(activeTab);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [uploading, setUploading] = useState<boolean>(false);
+
   const [themes, setThemes] = useState<any[]>([]);
   const [appCfg, setAppCfg] = useState<any>(null);
   const [appVer, setAppVer] = useState<number>(0);
@@ -54,13 +244,11 @@ export function AppearanceWorkspace({
   const [themeModalOpen, setThemeModalOpen] = useState<boolean>(false);
   const [themeCfgVals, setThemeCfgVals] = useState<Record<string, any>>({});
 
-  // Language Pack Extensions state
   const [locPacks, setLocPacks] = useState<any[]>([]);
   const [localesDir, setLocalesDir] = useState<string>("");
   const [defaultLocale, setDefaultLocale] = useState<string>("zh-CN");
   const [locPage, setLocPage] = useState<number>(1);
 
-  // Plugins state
   const [plugins, setPlugins] = useState<any[]>([]);
   const [pluginPage, setPluginPage] = useState<number>(1);
   const [cfgModal, setCfgModal] = useState<any | null>(null);
@@ -74,15 +262,18 @@ export function AppearanceWorkspace({
     resetConsoleScroll();
   }, [activeTab]);
 
-  const loadData = async () => {
+  const loadData = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       if (sub === "themes") {
         const [th, st] = await Promise.all([
-          apiFetch<{ themes?: any[]; items?: any[] }>(`/api/admin/themes?locale=${encodeURIComponent(localeSig.value)}`),
+          apiFetch<{ themes?: any[]; items?: any[]; appearance?: any }>(
+            `/api/admin/themes?locale=${encodeURIComponent(localeSig.value)}`,
+          ),
           apiFetch<any>("/api/admin/settings"),
         ]);
         setThemes(th.themes || th.items || []);
-        setAppCfg(st.domains?.appearance || {});
+        setAppCfg({ ...(th.appearance || {}), ...(st.domains?.appearance || {}) });
         setAppVer(st.versions?.appearance || 0);
       } else if (sub === "locales") {
         const res = await apiFetch<{
@@ -98,11 +289,15 @@ export function AppearanceWorkspace({
           syncExternalLocales(res.locales);
         }
       } else {
-        const pl = await apiFetch<{ items: any[] }>(`/api/admin/plugins?locale=${encodeURIComponent(localeSig.value)}`);
+        const pl = await apiFetch<{ items: any[] }>(
+          `/api/admin/plugins?locale=${encodeURIComponent(localeSig.value)}`,
+        );
         setPlugins(pl.items || []);
       }
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -120,9 +315,9 @@ export function AppearanceWorkspace({
       });
       setAppCfg(res.value || nextCfg);
       setAppVer(res.version);
-      showToast(t("common.saved"));
+      showToast(t("common.saved"), "ok");
     } catch (err: any) {
-      showToast(err.message);
+      showToast(err.message, "err");
     }
   };
 
@@ -135,6 +330,9 @@ export function AppearanceWorkspace({
     a.click();
     URL.revokeObjectURL(a.href);
   };
+
+  const themeSchema: any[] = themeModal?.localized_schema || themeModal?.config_schema || [];
+  const pluginSchema: any[] = cfgModal?.localized_schema || cfgModal?.config_schema || [];
 
   return (
     <div>
@@ -163,35 +361,35 @@ export function AppearanceWorkspace({
                 <h3 class="volo-card-title">{t("app.gallery_head")}</h3>
                 <p class="volo-sec-desc">{t("app.gallery_sub")}</p>
               </div>
-              <label class="volo-btn volo-btn-primary volo-btn-sm" style={{ cursor: "pointer" }}>
-                {t("app.install_theme_zip")}
-                <input
-                  type="file"
-                  accept=".zip"
-                  style={{ display: "none" }}
-                  onChange={async (e) => {
-                    const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                    if (!f) return;
-                    try {
-                      const fd = new FormData();
-                      fd.append("file", f);
-                      await apiFetch(`/api/admin/themes/install?locale=${encodeURIComponent(localeSig.value)}`, {
-                        method: "POST",
-                        body: fd,
-                      });
-                      showToast(t("app.theme_installed"));
-                      void loadData();
-                    } catch (err: any) {
-                      showToast(err.message);
-                    }
-                    (e.currentTarget as HTMLInputElement).value = "";
-                  }}
-                />
-              </label>
+              <UploadButton
+                accept=".zip"
+                primary
+                small
+                busy={uploading}
+                label={t("app.install_theme_zip")}
+                onFile={async (f) => {
+                  setUploading(true);
+                  try {
+                    const fd = new FormData();
+                    fd.append("file", f);
+                    await apiFetch(`/api/admin/themes/install?locale=${encodeURIComponent(localeSig.value)}`, {
+                      method: "POST",
+                      body: fd,
+                    });
+                    showToast(t("app.theme_installed"), "ok");
+                    void loadData(true);
+                  } catch (err: any) {
+                    showToast(err.message, "err");
+                  } finally {
+                    setUploading(false);
+                  }
+                }}
+              />
             </div>
 
             <div class="volo-theme-grid">
               {themes.map((th) => {
+                const isBuiltin = Boolean(th.is_builtin || th.builtin);
                 const isActive = (appCfg.active_theme || "volo-studio") === th.id;
                 const schema: any[] = th.localized_schema || th.config_schema || [];
                 const previewSrc = th.preview_url || `/themes/${encodeURIComponent(th.id)}/preview`;
@@ -204,7 +402,7 @@ export function AppearanceWorkspace({
                       <div class="volo-theme-badges">
                         {isActive && <span class="volo-badge volo-badge-ok">{t("app.theme_active_badge")}</span>}
                         <span class="volo-badge">
-                          {th.builtin ? t("app.theme_builtin") : t("app.theme_external")}
+                          {isBuiltin ? t("app.theme_builtin") : t("app.theme_external")}
                         </span>
                       </div>
                     </div>
@@ -219,7 +417,7 @@ export function AppearanceWorkspace({
                           <button
                             type="button"
                             class="volo-btn volo-btn-sm volo-btn-primary"
-                            onClick={() => activateTheme(th.id)}
+                            onClick={() => void activateTheme(th.id)}
                           >
                             {t("app.theme_activate")}
                           </button>
@@ -237,11 +435,13 @@ export function AppearanceWorkspace({
                             type="button"
                             class="volo-btn volo-btn-sm"
                             onClick={() => {
-                              const defaults: Record<string, any> = {};
-                              schema.forEach((f: any) => {
-                                if (f.default !== undefined) defaults[f.key] = f.default;
+                              const defaults = buildSchemaDefaults(schema);
+                              const saved = appCfg?.theme_configs?.[th.id] || th.config_values || {};
+                              setThemeCfgVals({
+                                ...defaults,
+                                ...(th.config_values || {}),
+                                ...saved,
                               });
-                              setThemeCfgVals({ ...defaults, ...(th.config_values || {}) });
                               setThemeModal(th);
                               setThemeModalOpen(true);
                             }}
@@ -249,18 +449,27 @@ export function AppearanceWorkspace({
                             {t("app.theme_settings")}
                           </button>
                         )}
-                        {!th.builtin && !isActive && (
+                        {!isBuiltin && !isActive && (
                           <button
                             type="button"
                             class="volo-btn volo-btn-sm volo-btn-danger"
                             onClick={async () => {
-                              if (!window.confirm(t("app.theme_uninstall_confirm", { id: th.id }))) return;
+                              if (
+                                !(await openConfirm({
+                                  message: t("app.theme_uninstall_confirm", { id: th.id }),
+                                  danger: true,
+                                }))
+                              ) {
+                                return;
+                              }
                               try {
-                                await apiFetch(`/api/admin/themes/${encodeURIComponent(th.id)}`, { method: "DELETE" });
-                                showToast(t("common.deleted"));
-                                void loadData();
+                                await apiFetch(`/api/admin/themes/${encodeURIComponent(th.id)}`, {
+                                  method: "DELETE",
+                                });
+                                showToast(t("common.deleted"), "ok");
+                                void loadData(true);
                               } catch (err: any) {
-                                showToast(err.message);
+                                showToast(err.message, "err");
                               }
                             }}
                           >
@@ -350,9 +559,9 @@ export function AppearanceWorkspace({
                     setAppCfg(res.value || { ...appCfg, accent: nextAccent });
                     setAppVer(res.version);
                     applyThemeAttributes(themeModeSig.value, nextAccent, false);
-                    showToast(t("common.saved"));
+                    showToast(t("common.saved"), "ok");
                   } catch (err: any) {
-                    showToast(err.message);
+                    showToast(err.message, "err");
                   }
                 }}
               >
@@ -376,33 +585,32 @@ export function AppearanceWorkspace({
               </p>
             </div>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              <label class="volo-btn volo-btn-primary volo-btn-sm" style={{ cursor: "pointer" }}>
-                {t("app.loc_install_btn")}
-                <input
-                  type="file"
-                  accept=".json,.zip"
-                  style={{ display: "none" }}
-                  onChange={async (e) => {
-                    const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                    if (!f) return;
-                    try {
-                      const fd = new FormData();
-                      fd.append("file", f);
-                      const res = await apiFetch<{ items?: any[]; locales?: any[] }>("/api/admin/locales/install", {
-                        method: "POST",
-                        body: fd,
-                      });
-                      if (res.locales) syncExternalLocales(res.locales);
-                      if (res.items) setLocPacks(res.items);
-                      await ensureLocaleLoaded(localeSig.value, true);
-                      showToast(t("app.loc_installed"));
-                    } catch (err: any) {
-                      showToast(err.message);
-                    }
-                    (e.currentTarget as HTMLInputElement).value = "";
-                  }}
-                />
-              </label>
+              <UploadButton
+                accept=".json,.zip"
+                primary
+                small
+                busy={uploading}
+                label={t("app.loc_install_btn")}
+                onFile={async (f) => {
+                  setUploading(true);
+                  try {
+                    const fd = new FormData();
+                    fd.append("file", f);
+                    const res = await apiFetch<{ items?: any[]; locales?: any[] }>("/api/admin/locales/install", {
+                      method: "POST",
+                      body: fd,
+                    });
+                    if (res.locales) syncExternalLocales(res.locales);
+                    if (res.items) setLocPacks(res.items);
+                    await ensureLocaleLoaded(localeSig.value, true);
+                    showToast(t("app.loc_installed"), "ok");
+                  } catch (err: any) {
+                    showToast(err.message, "err");
+                  } finally {
+                    setUploading(false);
+                  }
+                }}
+              />
               <button
                 type="button"
                 class="volo-btn volo-btn-sm"
@@ -415,18 +623,18 @@ export function AppearanceWorkspace({
                     if (res.locales) syncExternalLocales(res.locales);
                     if (res.items) setLocPacks(res.items);
                     await ensureLocaleLoaded(localeSig.value, true);
-                    showToast(t("app.loc_reloaded"));
+                    showToast(t("app.loc_reloaded"), "ok");
                   } catch (err: any) {
-                    showToast(err.message);
+                    showToast(err.message, "err");
                   }
                 }}
               >
                 {t("app.loc_reload_btn")}
               </button>
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => downloadStarterTemplate("zh-CN")}>
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void downloadStarterTemplate("zh-CN")}>
                 {t("app.loc_tpl_zh")}
               </button>
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => downloadStarterTemplate("en-US")}>
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void downloadStarterTemplate("en-US")}>
                 {t("app.loc_tpl_en")}
               </button>
             </div>
@@ -444,10 +652,10 @@ export function AppearanceWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {locPacks.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} class="volo-empty-state">{t("tbl.empty")}</td>
-                  </tr>
+                {loading ? (
+                  <TableSkeleton cols={5} />
+                ) : locPacks.length === 0 ? (
+                  <ConsoleEmpty colSpan={5} />
                 ) : (
                   paginateItems(locPacks, locPage, 12).slice.map((p) => {
                     const isDef = p.code === defaultLocale;
@@ -474,19 +682,19 @@ export function AppearanceWorkspace({
                             </div>
                           </div>
                         </td>
-                        <td class="col-cat">
+                        <td class="col-cat" data-label={t("app.loc_col_code")}>
                           <div class="volo-cell-meta">
                             <span class="volo-code-chip">{p.code}</span>
                             <span class="volo-cat-chip">{String(p.dir || "ltr").toUpperCase()}</span>
                           </div>
                         </td>
-                        <td class="col-status">
+                        <td class="col-status" data-label={t("app.loc_col_source")}>
                           <span class={`volo-status-pill ${p.source === "external" ? "ok" : p.source === "override" ? "warn" : ""}`}>
                             <span class="volo-status-dot" />
                             {srcLabel}
                           </span>
                         </td>
-                        <td class="col-num">
+                        <td class="col-num" data-label={t("app.loc_col_keys")}>
                           <div class="volo-cell-main">
                             <span>{t("app.loc_keys_stat", { total: p.total_keys ?? 0 })}</span>
                             {p.custom_keys > 0 && (
@@ -522,9 +730,9 @@ export function AppearanceWorkspace({
                                       body: JSON.stringify({ default_locale: p.code }),
                                     });
                                     setDefaultLocale(p.code);
-                                    showToast(t("common.saved"));
+                                    showToast(t("common.saved"), "ok");
                                   } catch (err: any) {
-                                    showToast(err.message);
+                                    showToast(err.message, "err");
                                   }
                                 }}
                               >
@@ -542,7 +750,14 @@ export function AppearanceWorkspace({
                                 type="button"
                                 class="volo-act-btn danger"
                                 onClick={async () => {
-                                  if (!window.confirm(t("app.loc_confirm_del", { code: p.code }))) return;
+                                  if (
+                                    !(await openConfirm({
+                                      message: t("app.loc_confirm_del", { code: p.code }),
+                                      danger: true,
+                                    }))
+                                  ) {
+                                    return;
+                                  }
                                   try {
                                     const res = await apiFetch<{ items?: any[]; locales?: any[] }>(
                                       `/api/admin/locales/${encodeURIComponent(p.code)}`,
@@ -550,10 +765,10 @@ export function AppearanceWorkspace({
                                     );
                                     if (res.locales) syncExternalLocales(res.locales);
                                     if (res.items) setLocPacks(res.items);
-                                    showToast(t("app.loc_deleted"));
-                                    void loadData();
+                                    showToast(t("app.loc_deleted"), "ok");
+                                    void loadData(true);
                                   } catch (err: any) {
-                                    showToast(err.message);
+                                    showToast(err.message, "err");
                                   }
                                 }}
                               >
@@ -588,31 +803,30 @@ export function AppearanceWorkspace({
               <h3 class="volo-card-title">{t("app.plugins_head")}</h3>
               <p class="volo-sec-desc">{t("app.plugins_desc")}</p>
             </div>
-            <label class="volo-btn volo-btn-primary volo-btn-sm" style={{ cursor: "pointer" }}>
-              {t("app.install_zip")}
-              <input
-                type="file"
-                accept=".zip"
-                style={{ display: "none" }}
-                onChange={async (e) => {
-                  const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                  if (!f) return;
-                  try {
-                    const fd = new FormData();
-                    fd.append("file", f);
-                    await apiFetch(`/api/admin/plugins/install?locale=${encodeURIComponent(localeSig.value)}`, {
-                      method: "POST",
-                      body: fd,
-                    });
-                    showToast(t("app.installed_toast"));
-                    void loadData();
-                  } catch (err: any) {
-                    showToast(err.message);
-                  }
-                  (e.currentTarget as HTMLInputElement).value = "";
-                }}
-              />
-            </label>
+            <UploadButton
+              accept=".zip"
+              primary
+              small
+              busy={uploading}
+              label={t("app.install_zip")}
+              onFile={async (f) => {
+                setUploading(true);
+                try {
+                  const fd = new FormData();
+                  fd.append("file", f);
+                  await apiFetch(`/api/admin/plugins/install?locale=${encodeURIComponent(localeSig.value)}`, {
+                    method: "POST",
+                    body: fd,
+                  });
+                  showToast(t("app.installed_toast"), "ok");
+                  void loadData(true);
+                } catch (err: any) {
+                  showToast(err.message, "err");
+                } finally {
+                  setUploading(false);
+                }
+              }}
+            />
           </div>
 
           <div class="volo-table-wrap">
@@ -626,123 +840,162 @@ export function AppearanceWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {plugins.length === 0 ? (
-                  <tr>
-                    <td colSpan={4} class="volo-empty-state">{t("app.plugins_empty")}</td>
-                  </tr>
+                {loading ? (
+                  <TableSkeleton cols={4} />
+                ) : plugins.length === 0 ? (
+                  <ConsoleEmpty colSpan={4} text={t("app.plugins_empty")} />
                 ) : (
-                  paginateItems(plugins, pluginPage, 12).slice.map((p) => (
-                    <tr key={p.id}>
-                      <td class="col-fluid">
-                        <div class="volo-cell-main">
-                          <div class="volo-cell-title">
-                            <span>{p.name || p.id}</span>
-                            <span class="volo-code-chip">{p.id}</span>
-                          </div>
-                          {p.description && <div class="volo-cell-meta"><span>{p.description}</span></div>}
-                          {p.last_error && (
-                            <div style={{ color: "var(--volo-danger)", fontSize: "12px" }}>
-                              {t("app.last_error", { err: p.last_error })}
+                  paginateItems(plugins, pluginPage, 12).slice.map((p) => {
+                    const pSchema: any[] = p.localized_schema || p.config_schema || [];
+                    return (
+                      <tr key={p.id}>
+                        <td class="col-fluid">
+                          <div class="volo-cell-main">
+                            <div class="volo-cell-title">
+                              <span>{p.name || p.id}</span>
+                              <span class="volo-code-chip">{p.id}</span>
                             </div>
-                          )}
-                        </div>
-                      </td>
-                      <td class="col-cat">
-                        <span class="volo-cat-chip">
-                          {p.kind} · {p.runtime} · v{p.version}
-                        </span>
-                      </td>
-                      <td class="col-status">
-                        {p.circuit_state === "CIRCUIT_OPEN" ? (
-                          <span class="volo-status-pill danger">
-                            <span class="volo-status-dot" />
-                            {t("app.circuit_open", { count: p.failure_count })}
+                            {p.description && <div class="volo-cell-meta"><span>{p.description}</span></div>}
+                            {p.last_error && (
+                              <div style={{ color: "var(--volo-danger)", fontSize: "12px" }}>
+                                {t("app.last_error", { err: p.last_error })}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td class="col-cat" data-label={t("app.plugin_col_runtime")}>
+                          <span class="volo-cat-chip">
+                            {p.kind} · {p.runtime} · v{p.version}
                           </span>
-                        ) : p.is_enabled ? (
-                          <span class="volo-status-pill ok">
-                            <span class="volo-status-dot" />
-                            {t("app.enabled")}
-                          </span>
-                        ) : (
-                          <span class="volo-status-pill">
-                            <span class="volo-status-dot" />
-                            {t("app.disabled")}
-                          </span>
-                        )}
-                      </td>
-                      <td class="col-act">
-                        <div class="volo-row-actions">
-                          {p.circuit_state === "CIRCUIT_OPEN" && (
+                        </td>
+                        <td class="col-status" data-label={t("art.status")}>
+                          <div style={{ display: "flex", flexDirection: "column", gap: "6px", alignItems: "flex-start" }}>
+                            <SwitchToggle
+                              checked={Boolean(p.is_enabled)}
+                              label={p.is_enabled ? t("app.enabled") : t("app.disabled")}
+                              onChange={async () => {
+                                try {
+                                  await apiFetch(
+                                    `/api/admin/plugins/${encodeURIComponent(p.id)}/${p.is_enabled ? "disable" : "enable"}`,
+                                    { method: "POST", body: "{}" },
+                                  );
+                                  void loadData(true);
+                                } catch (err: any) {
+                                  showToast(err.message, "err");
+                                }
+                              }}
+                            />
+                            {p.circuit_state === "CIRCUIT_OPEN" && (
+                              <span class="volo-status-pill danger">
+                                <span class="volo-status-dot" />
+                                {t("app.circuit_open", { count: p.failure_count })}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td class="col-act">
+                          <div class="volo-row-actions">
+                            {p.circuit_state === "CIRCUIT_OPEN" && (
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={async () => {
+                                  try {
+                                    await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/reset-circuit`, {
+                                      method: "POST",
+                                      body: "{}",
+                                    });
+                                    showToast(t("app.circuit_reset_toast"), "ok");
+                                    void loadData(true);
+                                  } catch (err: any) {
+                                    showToast(err.message, "err");
+                                  }
+                                }}
+                              >
+                                {t("app.reset_circuit")}
+                              </button>
+                            )}
                             <button
                               type="button"
                               class="volo-act-btn"
                               onClick={async () => {
-                                await apiFetch(`/api/admin/plugins/${p.id}/reset-circuit`, { method: "POST", body: "{}" });
-                                showToast(t("app.circuit_reset_toast"));
-                                void loadData();
+                                try {
+                                  await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/reload`, {
+                                    method: "POST",
+                                    body: "{}",
+                                  });
+                                  showToast(t("app.plugin_reloaded"), "ok");
+                                  void loadData(true);
+                                } catch (err: any) {
+                                  showToast(err.message, "err");
+                                }
                               }}
                             >
-                              {t("app.reset_circuit")}
+                              {t("app.plugin_reload")}
                             </button>
-                          )}
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            onClick={async () => {
-                              await apiFetch(`/api/admin/plugins/${p.id}/${p.is_enabled ? "disable" : "enable"}`, {
-                                method: "POST",
-                                body: "{}",
-                              });
-                              void loadData();
-                            }}
-                          >
-                            {p.is_enabled ? t("app.disable") : t("app.enable")}
-                          </button>
-                          {p.config_schema?.length > 0 && (
+                            {pSchema.length > 0 && (
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={() => {
+                                  const defaults = buildSchemaDefaults(pSchema);
+                                  setCfgModal(p);
+                                  setCfgValues({ ...defaults, ...(p.public_config || {}) });
+                                  setCfgModalOpen(true);
+                                }}
+                              >
+                                {t("app.configure")}
+                              </button>
+                            )}
                             <button
                               type="button"
                               class="volo-act-btn"
-                              onClick={() => {
-                                setCfgModal(p);
-                                setCfgValues({ ...(p.public_config || {}) });
-                                setCfgModalOpen(true);
-                              }}
-                            >
-                              {t("app.configure")}
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            onClick={async () => {
-                              try {
-                                const r = await apiFetch<{ items: any[] }>(`/api/admin/plugins/${p.id}/logs`);
-                                setLogsModal({ id: p.id, logs: r.items || [] });
-                                setLogsModalOpen(true);
-                              } catch (err: any) {
-                                showToast(err.message);
-                              }
-                            }}
-                          >
-                            {t("app.logs")}
-                          </button>
-                          {p.kind === "external" && (
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
                               onClick={async () => {
-                                if (!window.confirm(t("app.confirm_uninstall", { id: p.id }))) return;
-                                await apiFetch(`/api/admin/plugins/${p.id}`, { method: "DELETE" });
-                                void loadData();
+                                try {
+                                  const r = await apiFetch<{ items: any[] }>(
+                                    `/api/admin/plugins/${encodeURIComponent(p.id)}/logs`,
+                                  );
+                                  setLogsModal({ id: p.id, logs: r.items || [] });
+                                  setLogsModalOpen(true);
+                                } catch (err: any) {
+                                  showToast(err.message, "err");
+                                }
                               }}
                             >
-                              {t("app.uninstall")}
+                              {t("app.logs")}
                             </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))
+                            {p.kind === "external" && !p.is_builtin && !p.builtin && (
+                              <button
+                                type="button"
+                                class="volo-act-btn danger"
+                                onClick={async () => {
+                                  if (
+                                    !(await openConfirm({
+                                      message: t("app.confirm_uninstall", { id: p.id }),
+                                      danger: true,
+                                    }))
+                                  ) {
+                                    return;
+                                  }
+                                  try {
+                                    await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}`, {
+                                      method: "DELETE",
+                                    });
+                                    showToast(t("common.deleted"), "ok");
+                                    void loadData(true);
+                                  } catch (err: any) {
+                                    showToast(err.message, "err");
+                                  }
+                                }}
+                              >
+                                {t("app.uninstall")}
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -768,6 +1021,17 @@ export function AppearanceWorkspace({
         maxWidth="560px"
         footer={
           <>
+            <button
+              type="button"
+              class="volo-btn"
+              style={{ marginRight: "auto" }}
+              onClick={async () => {
+                if (!(await openConfirm({ message: t("app.confirm_reset_cfg"), danger: false }))) return;
+                setThemeCfgVals(buildSchemaDefaults(themeSchema));
+              }}
+            >
+              {t("app.reset_defaults")}
+            </button>
             <button type="button" class="volo-btn" onClick={() => setThemeModalOpen(false)}>
               {t("common.cancel")}
             </button>
@@ -777,15 +1041,20 @@ export function AppearanceWorkspace({
               onClick={async () => {
                 if (!themeModal) return;
                 try {
-                  await apiFetch(`/api/admin/themes/${encodeURIComponent(themeModal.id)}/config`, {
-                    method: "PUT",
-                    body: JSON.stringify(themeCfgVals),
-                  });
+                  const res = await apiFetch<{ appearance?: any; version?: number }>(
+                    `/api/admin/themes/${encodeURIComponent(themeModal.id)}/config`,
+                    {
+                      method: "PUT",
+                      body: JSON.stringify(themeCfgVals),
+                    },
+                  );
+                  if (res?.appearance) setAppCfg(res.appearance);
+                  if (typeof res?.version === "number") setAppVer(res.version);
                   setThemeModalOpen(false);
-                  showToast(t("common.saved"));
-                  void loadData();
+                  showToast(t("common.saved"), "ok");
+                  void loadData(true);
                 } catch (err: any) {
-                  showToast(err.message);
+                  showToast(err.message, "err");
                 }
               }}
             >
@@ -795,53 +1064,15 @@ export function AppearanceWorkspace({
         }
       >
         <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
-          {(themeModal?.localized_schema || themeModal?.config_schema || []).map((f: any) => (
-            <div key={f.key} class="volo-field">
-              <label>{f.label || f.key}</label>
-              {f.description && <div class="volo-help">{f.description}</div>}
-              {f.type === "boolean" ? (
-                <label class="volo-check-item" style={{ marginTop: "4px" }}>
-                  <input
-                    type="checkbox"
-                    checked={Boolean(themeCfgVals[f.key] ?? f.default)}
-                    onChange={(e) =>
-                      setThemeCfgVals({ ...themeCfgVals, [f.key]: (e.currentTarget as HTMLInputElement).checked })
-                    }
-                  />
-                  <span>{f.label || f.key}</span>
-                </label>
-              ) : f.type === "select" && f.options ? (
-                <ConsoleSelect
-                  value={String(themeCfgVals[f.key] ?? f.default ?? "")}
-                  onChange={(v) => setThemeCfgVals({ ...themeCfgVals, [f.key]: v })}
-                  options={f.options.map((op: any) => ({
-                    value: String(op.value),
-                    label: String(op.label || op.value),
-                  }))}
-                />
-              ) : f.type === "textarea" ? (
-                <textarea
-                  class="volo-textarea"
-                  rows={3}
-                  value={String(themeCfgVals[f.key] ?? f.default ?? "")}
-                  onInput={(e) =>
-                    setThemeCfgVals({ ...themeCfgVals, [f.key]: (e.currentTarget as HTMLTextAreaElement).value })
-                  }
-                />
-              ) : (
-                <input
-                  type={f.type === "number" ? "number" : "text"}
-                  class="volo-input"
-                  name={`theme_opt_${f.key}`}
-                  autoComplete="off"
-                  value={themeCfgVals[f.key] ?? f.default ?? ""}
-                  onInput={(e) => {
-                    const raw = (e.currentTarget as HTMLInputElement).value;
-                    setThemeCfgVals({ ...themeCfgVals, [f.key]: f.type === "number" ? Number(raw) : raw });
-                  }}
-                />
-              )}
-            </div>
+          {themeSchema.map((f: any) => (
+            <SchemaFieldControl
+              key={f.key}
+              field={f}
+              values={themeCfgVals}
+              onChange={(key, next) => setThemeCfgVals((prev) => ({ ...prev, [key]: next }))}
+              secretKeysSet={themeModal?.secret_keys_set}
+              namePrefix="theme_opt"
+            />
           ))}
         </form>
       </AnimatedModal>
@@ -853,6 +1084,17 @@ export function AppearanceWorkspace({
         maxWidth="560px"
         footer={
           <>
+            <button
+              type="button"
+              class="volo-btn"
+              style={{ marginRight: "auto" }}
+              onClick={async () => {
+                if (!(await openConfirm({ message: t("app.confirm_reset_cfg"), danger: false }))) return;
+                setCfgValues(buildSchemaDefaults(pluginSchema));
+              }}
+            >
+              {t("app.reset_defaults")}
+            </button>
             <button type="button" class="volo-btn" onClick={() => setCfgModalOpen(false)}>
               {t("common.cancel")}
             </button>
@@ -862,15 +1104,15 @@ export function AppearanceWorkspace({
               onClick={async () => {
                 if (!cfgModal) return;
                 try {
-                  await apiFetch(`/api/admin/plugins/${cfgModal.id}/config`, {
+                  await apiFetch(`/api/admin/plugins/${encodeURIComponent(cfgModal.id)}/config`, {
                     method: "PATCH",
                     body: JSON.stringify(cfgValues),
                   });
                   setCfgModalOpen(false);
-                  showToast(t("common.saved"));
-                  void loadData();
+                  showToast(t("common.saved"), "ok");
+                  void loadData(true);
                 } catch (err: any) {
-                  showToast(err.message);
+                  showToast(err.message, "err");
                 }
               }}
             >
@@ -880,58 +1122,15 @@ export function AppearanceWorkspace({
         }
       >
         <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
-          {(cfgModal?.config_schema || []).map((f: any) => (
-            <div key={f.key} class="volo-field">
-              <label>
-                {f.label || f.key}{" "}
-                {f.secret && cfgModal?.secret_keys_set?.[f.key] && (
-                  <span class="volo-badge volo-badge-ok">{t("app.secret_sealed_hint")}</span>
-                )}
-              </label>
-              {f.type === "boolean" ? (
-                <label class="volo-check-item">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(cfgValues[f.key] ?? f.default)}
-                    onChange={(e) =>
-                      setCfgValues({ ...cfgValues, [f.key]: (e.currentTarget as HTMLInputElement).checked })
-                    }
-                  />
-                  <span>{f.label || f.key}</span>
-                </label>
-              ) : f.type === "select" && f.options ? (
-                <ConsoleSelect
-                  value={String(cfgValues[f.key] ?? f.default ?? "")}
-                  onChange={(v) => setCfgValues({ ...cfgValues, [f.key]: v })}
-                  options={f.options.map((op: any) => ({
-                    value: String(op.value),
-                    label: String(op.label || op.value),
-                  }))}
-                />
-              ) : f.type === "textarea" ? (
-                <textarea
-                  class="volo-textarea"
-                  rows={3}
-                  value={String(cfgValues[f.key] ?? f.default ?? "")}
-                  onInput={(e) =>
-                    setCfgValues({ ...cfgValues, [f.key]: (e.currentTarget as HTMLTextAreaElement).value })
-                  }
-                />
-              ) : (
-                <input
-                  type={f.secret ? "password" : f.type === "number" ? "number" : "text"}
-                  class="volo-input"
-                  name={`plugin_cfg_${f.key}`}
-                  autoComplete={f.secret ? "new-password" : "off"}
-                  placeholder={f.secret ? "••••••••" : ""}
-                  value={cfgValues[f.key] ?? ""}
-                  onInput={(e) => {
-                    const raw = (e.currentTarget as HTMLInputElement).value;
-                    setCfgValues({ ...cfgValues, [f.key]: f.type === "number" ? Number(raw) : raw });
-                  }}
-                />
-              )}
-            </div>
+          {pluginSchema.map((f: any) => (
+            <SchemaFieldControl
+              key={f.key}
+              field={f}
+              values={cfgValues}
+              onChange={(key, next) => setCfgValues((prev) => ({ ...prev, [key]: next }))}
+              secretKeysSet={cfgModal?.secret_keys_set}
+              namePrefix="plugin_cfg"
+            />
           ))}
         </form>
       </AnimatedModal>

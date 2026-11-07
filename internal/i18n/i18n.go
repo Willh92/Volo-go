@@ -2,7 +2,9 @@ package i18n
 
 import (
 	"archive/zip"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +45,13 @@ type LocalePackSummary struct {
 	CompletionPct  int    `json:"completion_pct"`
 }
 
+// CachedI18nResponse holds pre-serialized JSON bytes and ETag for `/api/v1/i18n/{code}`.
+type CachedI18nResponse struct {
+	Locale string
+	JSON   []byte
+	ETag   string
+}
+
 // Catalog manages embedded built-in locales (zh-CN, en-US) layered with optional external
 // JSON language packs/overrides from VOLO_LOCALES_DIR (e.g., zh-TW.json, ja-JP.json).
 type Catalog struct {
@@ -51,8 +60,8 @@ type Catalog struct {
 	externalDir   string
 	builtin       map[string]map[string]string
 	custom        map[string]map[string]string
-	messages      map[string]map[string]string
 	order         []string
+	apiCache      map[string]CachedI18nResponse
 }
 
 // NewCatalog loads built-in embedded dictionaries and optionally overlays externalDir (*.json).
@@ -62,7 +71,7 @@ func NewCatalog(defaultLocale string, externalDir string) (*Catalog, error) {
 		externalDir:   strings.TrimSpace(externalDir),
 		builtin:       make(map[string]map[string]string),
 		custom:        make(map[string]map[string]string),
-		messages:      make(map[string]map[string]string),
+		apiCache:      make(map[string]CachedI18nResponse),
 	}
 	if c.defaultLocale == "" {
 		c.defaultLocale = "zh-CN"
@@ -89,7 +98,7 @@ func (c *Catalog) ReloadDir() error {
 func (c *Catalog) Reload(externalDir string) error {
 	builtinMap := make(map[string]map[string]string)
 	customMap := make(map[string]map[string]string)
-	merged := make(map[string]map[string]string)
+	codeSet := make(map[string]struct{})
 
 	entries, err := fs.ReadDir(builtinFS, "builtin")
 	if err != nil {
@@ -104,10 +113,13 @@ func (c *Catalog) Reload(externalDir string) error {
 			return fmt.Errorf("i18n: read builtin %s: %w", ent.Name(), err)
 		}
 		code := NormalizeLocale(strings.TrimSuffix(ent.Name(), ".json"))
-		if err := mergeLocaleBytes(builtinMap, code, raw); err != nil {
+		resolvedCode, err := mergeLocaleParsedOnce(builtinMap, code, raw)
+		if err != nil {
 			return fmt.Errorf("i18n: parse builtin %s: %w", ent.Name(), err)
 		}
-		_ = mergeLocaleBytes(merged, code, raw)
+		if resolvedCode != "" {
+			codeSet[resolvedCode] = struct{}{}
+		}
 	}
 
 	extDir := strings.TrimSpace(externalDir)
@@ -120,7 +132,11 @@ func (c *Catalog) Reload(externalDir string) error {
 			if ent.IsDir() || !strings.HasSuffix(strings.ToLower(ent.Name()), ".json") {
 				continue
 			}
-			raw, err := os.ReadFile(filepath.Join(extDir, ent.Name()))
+			fullPath := filepath.Join(extDir, ent.Name())
+			if st, lErr := os.Lstat(fullPath); lErr != nil || !st.Mode().IsRegular() {
+				continue
+			}
+			raw, err := os.ReadFile(fullPath)
 			if err != nil {
 				return fmt.Errorf("i18n: read external locale %s: %w", ent.Name(), err)
 			}
@@ -129,15 +145,18 @@ func (c *Catalog) Reload(externalDir string) error {
 			if code == "" {
 				continue
 			}
-			if err := mergeLocaleBytes(customMap, code, raw); err != nil {
+			resolvedCode, err := mergeLocaleParsedOnce(customMap, code, raw)
+			if err != nil {
 				return fmt.Errorf("i18n: parse external locale %s: %w", ent.Name(), err)
 			}
-			_ = mergeLocaleBytes(merged, code, raw)
+			if resolvedCode != "" {
+				codeSet[resolvedCode] = struct{}{}
+			}
 		}
 	}
 
-	codes := make([]string, 0, len(merged))
-	for k := range merged {
+	codes := make([]string, 0, len(codeSet))
+	for k := range codeSet {
 		codes = append(codes, k)
 	}
 	sort.Strings(codes)
@@ -146,23 +165,26 @@ func (c *Catalog) Reload(externalDir string) error {
 	c.externalDir = extDir
 	c.builtin = builtinMap
 	c.custom = customMap
-	c.messages = merged
 	c.order = codes
+	c.apiCache = make(map[string]CachedI18nResponse)
 	c.mu.Unlock()
 	return nil
 }
 
-func mergeLocaleBytes(dst map[string]map[string]string, code string, raw []byte) error {
+func mergeLocaleParsedOnce(dst map[string]map[string]string, code string, raw []byte) (string, error) {
 	var parsed map[string]string
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return err
+		return "", err
 	}
 	if codeVal := strings.TrimSpace(parsed["meta.code"]); codeVal != "" && code == "" {
 		code = NormalizeLocale(codeVal)
 	}
+	if code == "" {
+		return "", nil
+	}
 	table, ok := dst[code]
 	if !ok {
-		table = make(map[string]string, len(parsed))
+		table = make(map[string]string, len(parsed)+3)
 		dst[code] = table
 	}
 	for k, v := range parsed {
@@ -177,7 +199,131 @@ func mergeLocaleBytes(dst map[string]map[string]string, code string, raw []byte)
 	if table["meta.dir"] == "" {
 		table["meta.dir"] = "ltr"
 	}
-	return nil
+	return code, nil
+}
+
+func lookupFromMaps(builtinMap, customMap map[string]map[string]string, code, key string) (string, bool) {
+	if tbl := customMap[code]; tbl != nil {
+		if v, ok := tbl[key]; ok {
+			return v, true
+		}
+	}
+	if tbl := builtinMap[code]; tbl != nil {
+		if v, ok := tbl[key]; ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func buildResolvedMapFromMaps(builtinMap, customMap map[string]map[string]string, defaultLocale, resolved string) map[string]string {
+	out := make(map[string]string, len(builtinMap["en-US"])+16)
+	overlayLocale := func(loc string) {
+		if loc == "" {
+			return
+		}
+		for k, v := range builtinMap[loc] {
+			out[k] = v
+		}
+		for k, v := range customMap[loc] {
+			out[k] = v
+		}
+	}
+	overlayLocale("en-US")
+	if defaultLocale != "en-US" {
+		overlayLocale(defaultLocale)
+	}
+	if resolved != "en-US" && resolved != defaultLocale {
+		overlayLocale(resolved)
+	}
+	return out
+}
+
+func (c *Catalog) hasCodeLocked(code string) bool {
+	if code == "" {
+		return false
+	}
+	if _, ok := c.builtin[code]; ok {
+		return true
+	}
+	_, ok := c.custom[code]
+	return ok
+}
+
+func (c *Catalog) lookupLocked(code, key string) (string, bool) {
+	return lookupFromMaps(c.builtin, c.custom, code, key)
+}
+
+// CachedAPIResponse returns the cached JSON payload and ETag for `/api/v1/i18n/{code}`,
+// building and caching each locale payload lazily on first request and invalidating on Reload.
+func (c *Catalog) CachedAPIResponse(requested string, siteDefault string) (CachedI18nResponse, bool) {
+	resolved := c.Match(requested, siteDefault)
+	c.mu.RLock()
+	if cached, ok := c.apiCache[resolved]; ok {
+		c.mu.RUnlock()
+		return cached, true
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cached, ok := c.apiCache[resolved]; ok {
+		return cached, true
+	}
+	if !c.hasCodeLocked(resolved) {
+		return CachedI18nResponse{}, false
+	}
+
+	localesList := make([]LocaleInfo, 0, len(c.order))
+	for _, code := range c.order {
+		name, _ := c.lookupLocked(code, "meta.name")
+		if name == "" {
+			name = code
+		}
+		dir, _ := c.lookupLocked(code, "meta.dir")
+		if strings.EqualFold(strings.TrimSpace(dir), "rtl") {
+			dir = "rtl"
+		} else {
+			dir = "ltr"
+		}
+		localesList = append(localesList, LocaleInfo{Code: code, Name: name, Dir: dir})
+	}
+
+	fullMap := buildResolvedMapFromMaps(c.builtin, c.custom, c.defaultLocale, resolved)
+	custCopy := make(map[string]string, len(c.custom[resolved]))
+	for k, v := range c.custom[resolved] {
+		custCopy[k] = v
+	}
+	dir := "ltr"
+	if dVal, _ := c.lookupLocked(resolved, "meta.dir"); strings.EqualFold(strings.TrimSpace(dVal), "rtl") {
+		dir = "rtl"
+	}
+	payload := struct {
+		Locale         string            `json:"locale"`
+		Dir            string            `json:"dir"`
+		Locales        []LocaleInfo      `json:"locales"`
+		Messages       map[string]string `json:"messages"`
+		CustomMessages map[string]string `json:"custom_messages"`
+	}{
+		Locale:         resolved,
+		Dir:            dir,
+		Locales:        localesList,
+		Messages:       fullMap,
+		CustomMessages: custCopy,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return CachedI18nResponse{}, false
+	}
+	encoded = append(encoded, '\n')
+	sum := sha256.Sum256(encoded)
+	built := CachedI18nResponse{
+		Locale: resolved,
+		JSON:   encoded,
+		ETag:   `"i18n-` + hex.EncodeToString(sum[:12]) + `"`,
+	}
+	c.apiCache[resolved] = built
+	return built, true
 }
 
 // ValidateLocaleCode validates and normalizes a BCP-47 locale tag for safe filesystem storage.
@@ -202,11 +348,12 @@ func (c *Catalog) Locales() []LocaleInfo {
 	defer c.mu.RUnlock()
 	out := make([]LocaleInfo, 0, len(c.order))
 	for _, code := range c.order {
-		tbl := c.messages[code]
+		name, _ := c.lookupLocked(code, "meta.name")
+		dir, _ := c.lookupLocked(code, "meta.dir")
 		out = append(out, LocaleInfo{
 			Code: code,
-			Name: tbl["meta.name"],
-			Dir:  tbl["meta.dir"],
+			Name: name,
+			Dir:  dir,
 		})
 	}
 	return out
@@ -227,13 +374,19 @@ func (c *Catalog) Packs() []LocalePackSummary {
 
 	out := make([]LocalePackSummary, 0, len(c.order))
 	for _, code := range c.order {
-		tbl := c.messages[code]
-		_, isBuiltin := c.builtin[code]
+		builtTbl, isBuiltin := c.builtin[code]
 		custTbl, hasOverride := c.custom[code]
+
+		keyCount := len(builtTbl)
+		for k := range custTbl {
+			if _, exists := builtTbl[k]; !exists {
+				keyCount++
+			}
+		}
 
 		covered := 0
 		for k := range c.builtin["en-US"] {
-			if strings.TrimSpace(tbl[k]) != "" {
+			if val, ok := c.lookupLocked(code, k); ok && strings.TrimSpace(val) != "" {
 				covered++
 			}
 		}
@@ -242,15 +395,20 @@ func (c *Catalog) Packs() []LocalePackSummary {
 			pct = 100
 		}
 
+		name, _ := c.lookupLocked(code, "meta.name")
+		dir, _ := c.lookupLocked(code, "meta.dir")
+		author, _ := c.lookupLocked(code, "meta.author")
+		ver, _ := c.lookupLocked(code, "meta.version")
+
 		out = append(out, LocalePackSummary{
 			Code:           code,
-			Name:           tbl["meta.name"],
-			Dir:            tbl["meta.dir"],
-			Author:         tbl["meta.author"],
-			Version:        tbl["meta.version"],
+			Name:           name,
+			Dir:            dir,
+			Author:         author,
+			Version:        ver,
 			Builtin:        isBuiltin,
 			HasOverride:    hasOverride,
-			KeyCount:       len(tbl),
+			KeyCount:       keyCount,
 			CustomKeyCount: len(custTbl),
 			CompletionPct:  pct,
 		})
@@ -263,29 +421,27 @@ func (c *Catalog) CustomMap(locale string) map[string]string {
 	resolved := c.Match(locale, "")
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make(map[string]string)
+	out := make(map[string]string, len(c.custom[resolved]))
 	for k, v := range c.custom[resolved] {
 		out[k] = v
 	}
 	return out
 }
 
-// InstallPackJSON validates and writes a single JSON language pack into externalDir and hot-reloads.
-func (c *Catalog) InstallPackJSON(codeHint string, raw []byte, overwrite bool) (LocalePackSummary, error) {
-	extDir := c.ExternalDir()
+func (c *Catalog) writePackJSONFile(extDir string, codeHint string, raw []byte, overwrite bool) (string, map[string]string, error) {
 	if extDir == "" {
-		return LocalePackSummary{}, errors.New("external locales directory is not configured")
+		return "", nil, errors.New("external locales directory is not configured")
 	}
 	if len(raw) == 0 || len(raw) > 4<<20 {
-		return LocalePackSummary{}, errors.New("language pack JSON must be between 1B and 4MB")
+		return "", nil, errors.New("language pack JSON must be between 1B and 4MB")
 	}
 
 	var parsed map[string]string
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return LocalePackSummary{}, fmt.Errorf("invalid language pack JSON: %w", err)
+		return "", nil, fmt.Errorf("invalid language pack JSON: %w", err)
 	}
 	if len(parsed) == 0 {
-		return LocalePackSummary{}, errors.New("language pack JSON cannot be empty")
+		return "", nil, errors.New("language pack JSON cannot be empty")
 	}
 
 	candidate := strings.TrimSpace(codeHint)
@@ -294,7 +450,7 @@ func (c *Catalog) InstallPackJSON(codeHint string, raw []byte, overwrite bool) (
 	}
 	code, err := ValidateLocaleCode(candidate)
 	if err != nil {
-		return LocalePackSummary{}, err
+		return "", nil, err
 	}
 	parsed["meta.code"] = code
 	if strings.TrimSpace(parsed["meta.name"]) == "" {
@@ -307,28 +463,37 @@ func (c *Catalog) InstallPackJSON(codeHint string, raw []byte, overwrite bool) (
 	parsed["meta.dir"] = dir
 
 	if err := os.MkdirAll(extDir, 0o755); err != nil {
-		return LocalePackSummary{}, fmt.Errorf("create locales dir: %w", err)
+		return "", nil, fmt.Errorf("create locales dir: %w", err)
 	}
 	dstPath := filepath.Join(extDir, code+".json")
 	if !overwrite {
 		if _, statErr := os.Stat(dstPath); statErr == nil {
-			return LocalePackSummary{}, fmt.Errorf("language pack %s already exists", code)
+			return "", nil, fmt.Errorf("language pack %s already exists", code)
 		}
 	}
 
 	formatted, err := marshalSortedMap(parsed)
 	if err != nil {
-		return LocalePackSummary{}, err
+		return "", nil, err
 	}
 	tmpPath := dstPath + ".tmp"
 	if err := os.WriteFile(tmpPath, formatted, 0o644); err != nil {
-		return LocalePackSummary{}, fmt.Errorf("write locale pack: %w", err)
+		return "", nil, fmt.Errorf("write locale pack: %w", err)
 	}
 	if err := os.Rename(tmpPath, dstPath); err != nil {
 		_ = os.Remove(tmpPath)
-		return LocalePackSummary{}, fmt.Errorf("commit locale pack: %w", err)
+		return "", nil, fmt.Errorf("commit locale pack: %w", err)
 	}
+	return code, parsed, nil
+}
 
+// InstallPackJSON validates and writes a single JSON language pack into externalDir and hot-reloads.
+func (c *Catalog) InstallPackJSON(codeHint string, raw []byte, overwrite bool) (LocalePackSummary, error) {
+	extDir := c.ExternalDir()
+	code, parsed, err := c.writePackJSONFile(extDir, codeHint, raw, overwrite)
+	if err != nil {
+		return LocalePackSummary{}, err
+	}
 	if err := c.Reload(extDir); err != nil {
 		return LocalePackSummary{}, err
 	}
@@ -337,19 +502,37 @@ func (c *Catalog) InstallPackJSON(codeHint string, raw []byte, overwrite bool) (
 			return p, nil
 		}
 	}
-	return LocalePackSummary{Code: code, Name: parsed["meta.name"], Dir: dir}, nil
+	return LocalePackSummary{Code: code, Name: parsed["meta.name"], Dir: parsed["meta.dir"]}, nil
 }
 
 // InstallPackZip extracts one or more *.json language packs from a .zip archive into externalDir.
 func (c *Catalog) InstallPackZip(r io.ReaderAt, size int64, overwrite bool) ([]LocalePackSummary, error) {
+	extDir := c.ExternalDir()
+	if extDir == "" {
+		return nil, errors.New("external locales directory is not configured")
+	}
 	zr, err := zip.NewReader(r, size)
 	if err != nil {
 		return nil, fmt.Errorf("invalid language pack zip: %w", err)
 	}
-	var installed []LocalePackSummary
+	if len(zr.File) == 0 || len(zr.File) > 500 {
+		return nil, errors.New("language pack zip must contain between 1 and 500 entries")
+	}
+
+	const maxZipUnpackedBytes int64 = 16 << 20
+	var totalUnpacked int64
+	var installedCodes []string
+
 	for _, f := range zr.File {
+		mode := f.Mode()
+		if mode&os.ModeSymlink != 0 {
+			return nil, errors.New("symbolic links are forbidden in language pack zip")
+		}
 		if f.FileInfo().IsDir() {
 			continue
+		}
+		if !mode.IsRegular() {
+			return nil, errors.New("non-regular files are forbidden in language pack zip")
 		}
 		base := filepath.Base(f.Name)
 		if strings.HasPrefix(base, ".") || !strings.HasSuffix(strings.ToLower(base), ".json") {
@@ -357,6 +540,9 @@ func (c *Catalog) InstallPackZip(r io.ReaderAt, size int64, overwrite bool) ([]L
 		}
 		if f.UncompressedSize64 > 4<<20 {
 			return nil, fmt.Errorf("file %s exceeds 4MB limit", base)
+		}
+		if int64(f.UncompressedSize64)+totalUnpacked > maxZipUnpackedBytes {
+			return nil, errors.New("language pack zip exceeds 16MB total unpacked limit")
 		}
 		rc, err := f.Open()
 		if err != nil {
@@ -367,20 +553,43 @@ func (c *Catalog) InstallPackZip(r io.ReaderAt, size int64, overwrite bool) ([]L
 		if rErr != nil {
 			return nil, rErr
 		}
+		if int64(len(raw)) > 4<<20 {
+			return nil, fmt.Errorf("file %s exceeds 4MB limit", base)
+		}
+		totalUnpacked += int64(len(raw))
+		if totalUnpacked > maxZipUnpackedBytes {
+			return nil, errors.New("language pack zip exceeds 16MB total unpacked limit")
+		}
+
 		hint := strings.TrimSuffix(base, filepath.Ext(base))
 		// Infer code from JSON meta.code first if filename is generic like template.json or locale.json
 		var peek map[string]string
 		if json.Unmarshal(raw, &peek) == nil && strings.TrimSpace(peek["meta.code"]) != "" {
 			hint = peek["meta.code"]
 		}
-		sum, iErr := c.InstallPackJSON(hint, raw, overwrite)
+		code, _, iErr := c.writePackJSONFile(extDir, hint, raw, overwrite)
 		if iErr != nil {
 			return nil, iErr
 		}
-		installed = append(installed, sum)
+		installedCodes = append(installedCodes, code)
 	}
-	if len(installed) == 0 {
+	if len(installedCodes) == 0 {
 		return nil, errors.New("no valid *.json language pack found in zip archive")
+	}
+	if err := c.Reload(extDir); err != nil {
+		return nil, err
+	}
+	packByCode := make(map[string]LocalePackSummary)
+	for _, p := range c.Packs() {
+		packByCode[p.Code] = p
+	}
+	installed := make([]LocalePackSummary, 0, len(installedCodes))
+	for _, code := range installedCodes {
+		if sum, ok := packByCode[code]; ok {
+			installed = append(installed, sum)
+		} else {
+			installed = append(installed, LocalePackSummary{Code: code, Name: code, Dir: "ltr"})
+		}
 	}
 	return installed, nil
 }
@@ -439,7 +648,7 @@ func marshalSortedMap(m map[string]string) ([]byte, error) {
 func (c *Catalog) Has(locale string) bool {
 	norm := NormalizeLocale(locale)
 	c.mu.RLock()
-	_, ok := c.messages[norm]
+	ok := c.hasCodeLocked(norm)
 	c.mu.RUnlock()
 	return ok
 }
@@ -448,7 +657,7 @@ func (c *Catalog) Has(locale string) bool {
 func (c *Catalog) Dir(locale string) string {
 	resolved := c.Match(locale, "")
 	c.mu.RLock()
-	dir := c.messages[resolved]["meta.dir"]
+	dir, _ := c.lookupLocked(resolved, "meta.dir")
 	c.mu.RUnlock()
 	if strings.EqualFold(strings.TrimSpace(dir), "rtl") {
 		return "rtl"
@@ -462,34 +671,19 @@ func (c *Catalog) Map(locale string) map[string]string {
 	resolved := c.Match(locale, "")
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-
-	out := make(map[string]string)
-	for k, v := range c.messages["en-US"] {
-		out[k] = v
-	}
-	if defTbl, ok := c.messages[c.defaultLocale]; ok {
-		for k, v := range defTbl {
-			out[k] = v
-		}
-	}
-	if tbl, ok := c.messages[resolved]; ok {
-		for k, v := range tbl {
-			out[k] = v
-		}
-	}
-	return out
+	return buildResolvedMapFromMaps(c.builtin, c.custom, c.defaultLocale, resolved)
 }
 
 // T translates key in locale with optional named placeholder substitutions ({name} -> val).
 func (c *Catalog) T(locale string, key string, vars ...map[string]any) string {
 	norm := c.Match(locale, "")
 	c.mu.RLock()
-	val, ok := c.messages[norm][key]
+	val, ok := c.lookupLocked(norm, key)
 	if !ok {
-		val, ok = c.messages[c.defaultLocale][key]
+		val, ok = c.lookupLocked(c.defaultLocale, key)
 	}
 	if !ok {
-		val, ok = c.messages["en-US"][key]
+		val, ok = c.lookupLocked("en-US", key)
 	}
 	c.mu.RUnlock()
 	if !ok {
@@ -513,7 +707,7 @@ func (c *Catalog) Match(requested string, siteDefault string) string {
 	defer c.mu.RUnlock()
 
 	if norm != "" {
-		if _, ok := c.messages[norm]; ok {
+		if c.hasCodeLocked(norm) {
 			return norm
 		}
 		langPrefix := strings.ToLower(strings.Split(norm, "-")[0])
@@ -525,12 +719,10 @@ func (c *Catalog) Match(requested string, siteDefault string) string {
 	}
 
 	sd := NormalizeLocale(siteDefault)
-	if sd != "" {
-		if _, ok := c.messages[sd]; ok {
-			return sd
-		}
+	if sd != "" && c.hasCodeLocked(sd) {
+		return sd
 	}
-	if _, ok := c.messages[c.defaultLocale]; ok {
+	if c.hasCodeLocked(c.defaultLocale) {
 		return c.defaultLocale
 	}
 	return "zh-CN"
@@ -569,7 +761,7 @@ func (c *Catalog) HasLanguageMatch(requested string) bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if _, ok := c.messages[norm]; ok {
+	if c.hasCodeLocked(norm) {
 		return true
 	}
 	prefix := strings.ToLower(strings.Split(norm, "-")[0])

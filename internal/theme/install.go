@@ -145,7 +145,13 @@ func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest
 	if err != nil {
 		return Manifest{}, err
 	}
-	compiled, err := e.compileThemeFS(os.DirFS(stageDir), subFS, false)
+	e.mu.RLock()
+	var builtinAssets map[string]cachedAsset
+	if bt := e.themes[DefaultThemeID]; bt != nil {
+		builtinAssets = bt.assets
+	}
+	e.mu.RUnlock()
+	compiled, err := e.compileThemeFS(os.DirFS(stageDir), subFS, builtinAssets, false, nil, nil)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("theme: validation failed: %w", err)
 	}

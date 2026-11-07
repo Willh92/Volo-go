@@ -33,11 +33,14 @@ const (
 const (
 	SlotPublicHead           = "public.head"
 	SlotPublicHeader         = "public.header"
+	SlotPublicSidebar        = "public.sidebar"
 	SlotArticleBeforeContent = "article.before_content"
 	SlotArticleAfterContent  = "article.after_content"
 	SlotPublicFooter         = "public.footer"
 	SlotEditorQuickInsert    = "editor.quick_insert"
 	SlotAdminDashboardCard   = "admin.dashboard_card"
+
+	ClearSecretSentinel = "__VOLO_CLEAR_SECRET__"
 )
 
 var validPluginIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,62}$`)
@@ -46,6 +49,7 @@ var validSemverLooseRe = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+([0-9A-Za-
 var allowedSlotNames = map[string]bool{
 	SlotPublicHead:           true,
 	SlotPublicHeader:         true,
+	SlotPublicSidebar:        true,
 	SlotArticleBeforeContent: true,
 	SlotArticleAfterContent:  true,
 	SlotPublicFooter:         true,
@@ -237,7 +241,7 @@ func (m *Manifest) Validate() error {
 		}
 		seenKeys[k] = true
 		switch f.Type {
-		case "string", "text", "number", "boolean", "select", "url":
+		case "string", "text", "textarea", "number", "boolean", "select", "url", "color", "image":
 		default:
 			return fmt.Errorf("plugin %q: config field %q has unsupported type %q", m.ID, k, f.Type)
 		}
@@ -271,7 +275,7 @@ func validatePermissionToken(perm string) error {
 			return fmt.Errorf("invalid outbound host pattern %q", host)
 		}
 		return nil
-	case p == "cron" || p == "articles:read_protected":
+	case p == "cron" || p == "articles:read_protected" || p == "crypto" || p == "site:read" || p == "ratelimit":
 		return nil
 	case p == "provider:storage" || p == "provider:notifier" || p == "provider:oidc" || p == "provider:antispam":
 		return nil
@@ -463,7 +467,7 @@ func (m *Manifest) ValidateAndMergeConfig(
 			if !sOk {
 				return nil, nil, fmt.Errorf("plugin %q: secret field %q must be a string", m.ID, k)
 			}
-			if clearSet[k] {
+			if clearSet[k] || strings.TrimSpace(strVal) == ClearSecretSentinel {
 				delete(mergedSecrets, k)
 			} else if strings.TrimSpace(strVal) != "" {
 				mergedSecrets[k] = strVal
@@ -499,7 +503,7 @@ func (m *Manifest) ValidateAndMergeConfig(
 
 func coerceConfigValue(field ConfigField, raw any) (any, error) {
 	switch field.Type {
-	case "string", "text":
+	case "string", "text", "textarea":
 		s, ok := raw.(string)
 		if !ok {
 			return nil, errors.New("expected string")
@@ -509,7 +513,18 @@ func coerceConfigValue(field ConfigField, raw any) (any, error) {
 		}
 		return s, nil
 
-	case "url":
+	case "color":
+		s, ok := raw.(string)
+		if !ok {
+			return nil, errors.New("expected color string")
+		}
+		s = strings.TrimSpace(s)
+		if len(s) > 64 || strings.ContainsAny(s, ";<>{}\"\\") {
+			return nil, errors.New("invalid CSS color value")
+		}
+		return s, nil
+
+	case "url", "image":
 		s, ok := raw.(string)
 		if !ok {
 			return nil, errors.New("expected URL string")

@@ -1,6 +1,6 @@
 {{define "journal_colophon"}}
 {{if themeCfgBool .ThemeConfig "show_colophon" true}}
-<div class="journal-colophon" style="font-size:0.82rem;color:var(--volo-muted);margin-top:6px">
+<div class="journal-colophon">
   {{tt .ThemeID .Locale "journal.colophon" (dict "posts" .Stats.ArticleCount "views" .Stats.ViewCount)}}
 </div>
 {{end}}

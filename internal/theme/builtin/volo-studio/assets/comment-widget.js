@@ -346,9 +346,9 @@
 
         var guestRow = isLogged ? "" :
           '<div class="vc-row js-vc-guest-row"' + (prof.name ? " hidden" : "") + ">" +
-          '<input class="volo-input" name="author_name" required maxlength="48" placeholder="' + esc(L.nick) + '" value="' + esc(prof.name || "") + '">' +
-          '<input class="volo-input" name="notify_email" type="email" placeholder="' + esc(L.email) + '" value="' + esc(prof.email || "") + '">' +
-          '<input class="volo-input" name="author_url" type="url" placeholder="' + esc(L.site) + '" value="' + esc(prof.url || "") + '">' +
+          '<input class="volo-input vc-input" name="author_name" required maxlength="48" placeholder="' + esc(L.nick) + '" value="' + esc(prof.name || "") + '">' +
+          '<input class="volo-input vc-input" name="notify_email" type="email" placeholder="' + esc(L.email) + '" value="' + esc(prof.email || "") + '">' +
+          '<input class="volo-input vc-input" name="author_url" type="url" placeholder="' + esc(L.site) + '" value="' + esc(prof.url || "") + '">' +
           "</div>";
 
         drawerHTML = '<div class="vc-backdrop js-vc-backdrop" hidden></div>' +
@@ -392,7 +392,7 @@
           '<button type="button" class="vc-dur-btn is-active" data-hours="0">' + esc(L.banForever) + "</button>" +
           "</div>" +
           '<label class="vc-ban-check"><input type="checkbox" class="js-vc-ban-reject" checked><span>' + esc(L.banReject) + "</span></label>" +
-          '<input type="text" class="volo-input js-vc-ban-note" maxlength="160" placeholder="' + esc(L.banNote) + '">' +
+          '<input type="text" class="volo-input vc-input js-vc-ban-note" maxlength="160" placeholder="' + esc(L.banNote) + '">' +
           '<div class="vc-ban-foot">' +
           '<button type="button" class="studio-icon-btn js-vc-ban-cancel">' + esc(L.cancel) + "</button>" +
           '<button type="button" class="volo-btn vc-btn-danger js-vc-ban-ok">' + esc(L.banConfirm) + "</button>" +
@@ -416,6 +416,7 @@
       var msgEl = el.querySelector(".js-vc-msg");
       var statusBanner = el.querySelector(".js-vc-status");
       var banModal = el.querySelector(".js-vc-ban-modal");
+      var syncLock = function () { if (window.__voloSyncScrollLock) window.__voloSyncScrollLock(); };
 
       function syncCtxUI() {
         if (!ctxPill || !ctxText || !submitBtn) return;
@@ -453,6 +454,7 @@
         void drawer.offsetWidth;
         backdrop.classList.add("is-open");
         drawer.classList.add("is-open");
+        syncLock();
         setTab("write");
         setTimeout(function () { if (ta) ta.focus(); }, 30);
       }
@@ -463,11 +465,13 @@
         drawer.classList.remove("is-open");
         backdrop.classList.add("is-closing");
         drawer.classList.add("is-closing");
+        syncLock();
         setTimeout(function () {
           backdrop.classList.remove("is-closing");
           drawer.classList.remove("is-closing");
           backdrop.hidden = true;
           drawer.hidden = true;
+          syncLock();
         }, 200);
       }
 
@@ -495,7 +499,7 @@
       }
 
       el._closeOverlays = function () {
-        if (banModal && !banModal.hidden) { banModal.hidden = true; return; }
+        if (banModal && !banModal.hidden) { banModal.hidden = true; syncLock(); return; }
         if (drawer && !drawer.hidden) closeDrawer();
       };
 
@@ -705,6 +709,7 @@
           var bTitle = banModal.querySelector(".js-vc-ban-title");
           if (bTitle) bTitle.textContent = L.banTitle + (ipTxt ? " (" + ipTxt + ")" : "");
           banModal.hidden = false;
+          syncLock();
           return;
         }
 
@@ -716,7 +721,7 @@
         }
 
         if (ev.target.closest(".js-vc-ban-cancel") || (banModal && ev.target === banModal)) {
-          if (banModal) banModal.hidden = true;
+          if (banModal) { banModal.hidden = true; syncLock(); }
           return;
         }
 
@@ -733,6 +738,7 @@
             })
           }).then(function (r) {
             banModal.hidden = true;
+            syncLock();
             if (r.ok) refreshList();
           });
           return;

@@ -13,6 +13,7 @@ export interface CM6EditorProps {
   value: string;
   onChange: (next: string) => void;
   quickInserts?: QuickInsertItem[];
+  onSave?: () => void;
 }
 
 let cachedEditorImpl: FunctionComponent<CM6EditorProps> | null = null;

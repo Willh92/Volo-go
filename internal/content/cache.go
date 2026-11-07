@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	maxFeedCacheBytes   = 2 * 1024 * 1024 // <= 2 MiB ceiling for pre-compressed RSS/Atom/Podcast/Sitemap/LLMs artifacts
+	maxFeedCacheBytes   = 512 << 10 // <= 512 KiB ceiling for pre-compressed RSS/Atom/Podcast/Sitemap/LLMs artifacts
 	maxCachedRecentCmts = 20
 )
 
@@ -36,21 +36,21 @@ type redirectTableSnapshot struct {
 }
 
 type publicChromeSnapshot struct {
-	dataRev          uint64
-	settingsRev      uint64
-	rawNavItems      []domain.NavItem
-	categories       []CategoryWithCount
-	catsByID         map[string]domain.Category
-	tags             []TagWithCount
-	recentCmts       []RecentCommentItem
-	archiveBuckets   []ArchiveMonth
-	owner            PublicAuthorProfile
-	authors          []PublicAuthorProfile
-	authorsByID      map[string]PublicAuthorProfile
-	stats            PublicSiteStats
-	recentRaw        []domain.RawArticle
-	mostViewedRaw    []domain.RawArticle
-	mostCommentedRaw []domain.RawArticle
+	dataRev            uint64
+	settingsRev        uint64
+	rawNavItems        []domain.NavItem
+	categories         []CategoryWithCount
+	catsByID           map[string]domain.Category
+	tags               []TagWithCount
+	recentCmts         []RecentCommentItem
+	archiveBuckets     []ArchiveMonth
+	owner              PublicAuthorProfile
+	authors            []PublicAuthorProfile
+	authorsByID        map[string]PublicAuthorProfile
+	stats              PublicSiteStats
+	recentCards        []visibility.PublicArticleCard
+	mostViewedCards    []visibility.PublicArticleCard
+	mostCommentedCards []visibility.PublicArticleCard
 }
 
 // CachedDocument holds a revision-coherent public XML/Markdown distribution document
@@ -209,22 +209,60 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 	)
 	mostCommentedRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, cmtedSQL, append([]any{domain.ArticleStatusPublished}, cmtedArgs...)...)
 
+	seenArt := make(map[string]struct{}, len(recentRaw)+len(mostViewedRaw)+len(mostCommentedRaw))
+	uniqueRaw := make([]domain.RawArticle, 0, len(recentRaw)+len(mostViewedRaw)+len(mostCommentedRaw))
+	for _, list := range [][]domain.RawArticle{recentRaw, mostViewedRaw, mostCommentedRaw} {
+		for _, r := range list {
+			if _, ok := seenArt[r.ID]; !ok {
+				seenArt[r.ID] = struct{}{}
+				uniqueRaw = append(uniqueRaw, r)
+			}
+		}
+	}
+	tagsByArt, _ := s.loadTagsForArticles(ctx, uniqueRaw)
+	defaultLoc := "zh-CN"
+	if s.settings != nil {
+		if loc := strings.TrimSpace(s.settings.Snapshot().Site.DefaultLocale); loc != "" {
+			defaultLoc = loc
+		}
+	}
+	buildSnapshotCards := func(src []domain.RawArticle) []visibility.PublicArticleCard {
+		cards := make([]visibility.PublicArticleCard, 0, len(src))
+		for _, r := range src {
+			var catPtr *domain.Category
+			if c, ok := catsByID[r.CategoryID]; ok {
+				cCopy := c
+				catPtr = &cCopy
+			}
+			card := s.guard.ToCard(r, defaultLoc, catPtr, tagsByArt[r.ID], s.LookupMediaDims)
+			if au, ok := authorsByID[r.AuthorID]; ok {
+				card.AuthorName = au.DisplayName
+				card.AuthorAvatarURL = au.AvatarURL
+			} else if owner.DisplayName != "" {
+				card.AuthorName = owner.DisplayName
+				card.AuthorAvatarURL = owner.AvatarURL
+			}
+			cards = append(cards, card)
+		}
+		return cards
+	}
+
 	next := &publicChromeSnapshot{
-		dataRev:          dRev,
-		settingsRev:      sRev,
-		rawNavItems:      navRows,
-		categories:       cats,
-		catsByID:         catsByID,
-		tags:             tags,
-		recentCmts:       recentCmts,
-		archiveBuckets:   archiveBuckets,
-		owner:            owner,
-		authors:          authors,
-		authorsByID:      authorsByID,
-		stats:            stats,
-		recentRaw:        recentRaw,
-		mostViewedRaw:    mostViewedRaw,
-		mostCommentedRaw: mostCommentedRaw,
+		dataRev:            dRev,
+		settingsRev:        sRev,
+		rawNavItems:        navRows,
+		categories:         cats,
+		catsByID:           catsByID,
+		tags:               tags,
+		recentCmts:         recentCmts,
+		archiveBuckets:     archiveBuckets,
+		owner:              owner,
+		authors:            authors,
+		authorsByID:        authorsByID,
+		stats:              stats,
+		recentCards:        buildSnapshotCards(recentRaw),
+		mostViewedCards:    buildSnapshotCards(mostViewedRaw),
+		mostCommentedCards: buildSnapshotCards(mostCommentedRaw),
 	}
 	s.caches.chrome.Store(next)
 	return next, nil

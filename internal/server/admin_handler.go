@@ -172,6 +172,10 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case sub == "auth/logout":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		actor, sess, ok := s.authenticateAdminRequest(w, r, "", false)
 		if !ok {
 			return
@@ -180,6 +184,7 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			_ = s.deps.Auth.RevokeSession(r.Context(), actor, sess.ID)
 		}
 		http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		http.SetCookie(w, &http.Cookie{Name: trusted2FACookieName, Value: "", Path: "/api/admin/auth", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case sub == "me":
@@ -202,6 +207,24 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleAdminAboutProjectInfo(w, r)
+
+	case sub == "plugins/quick-inserts" && r.Method == http.MethodGet:
+		actor, _, ok := s.authenticateAdminRequest(w, r, auth.ScopeArticlesRead, false)
+		if !ok {
+			return
+		}
+		locale := actor.PreferredLocale
+		if locale == "" {
+			locale = s.deps.Settings.Snapshot().Site.DefaultLocale
+		}
+		var items []plugin.EditorQuickInsertView
+		if s.deps.Plugins != nil {
+			items = s.deps.Plugins.EditorQuickInserts(locale)
+		}
+		if items == nil {
+			items = []plugin.EditorQuickInsertView{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "quick_inserts": items})
 
 	case sub == "articles" || strings.HasPrefix(sub, "articles/"):
 		patScope := auth.ScopeArticlesWrite
@@ -319,7 +342,7 @@ func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	res, err := s.deps.Auth.LoginStaff(r.Context(), req.Ident, req.Password, clientIP, geo, r.UserAgent(), trusted2FA)
 	if errors.Is(err, auth.ErrForbidden) {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 2)
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": auth.ErrInvalidCredentials.Error()})
 		return
 	}
 	if err != nil {
@@ -460,11 +483,11 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM user_credentials WHERE user_id = ? AND kind = 'passkey'`, actor.ID).Scan(&pkCnt)
 		snap := s.deps.Settings.Snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"user":         actor,
-			"session_id":   sessID,
-			"csrf_token":   csrf,
-			"totp_enabled": totpCnt > 0,
-			"passkeys":     pkCnt,
+			"user":           actor,
+			"session_id":     sessID,
+			"csrf_token":     csrf,
+			"totp_enabled":   totpCnt > 0,
+			"passkeys":       pkCnt,
 			"site":           snap.Site,
 			"appearance":     snap.Appearance,
 			"storage_driver": snap.Storage.ActiveDriver,
@@ -476,6 +499,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 	if r.Method == http.MethodPatch {
 		var req struct {
 			DisplayName     *string `json:"display_name"`
+			Email           *string `json:"email"`
 			Bio             *string `json:"bio"`
 			WebsiteURL      *string `json:"website_url"`
 			AvatarURL       *string `json:"avatar_url"`
@@ -494,6 +518,21 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		}
 		if req.DisplayName != nil && strings.TrimSpace(*req.DisplayName) != "" {
 			fullUser.DisplayName = strings.TrimSpace(*req.DisplayName)
+		}
+		if req.Email != nil {
+			nextEmail := strings.ToLower(strings.TrimSpace(*req.Email))
+			if nextEmail != "" && nextEmail != strings.ToLower(fullUser.Email) {
+				if !strings.Contains(nextEmail, "@") || len(nextEmail) > 190 {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid email address"})
+					return
+				}
+				ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
+				if !ok {
+					writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+					return
+				}
+				fullUser.Email = nextEmail
+			}
 		}
 		if req.Bio != nil {
 			fullUser.Bio = strings.TrimSpace(*req.Bio)
@@ -527,12 +566,19 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		}
 		fullUser.UpdatedAt = time.Now().UnixMilli()
 		_, err = s.deps.Store.ExecContext(r.Context(),
-			`UPDATE users SET display_name = ?, bio = ?, website_url = ?, avatar_url = ?, preferred_locale = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
-			fullUser.DisplayName, fullUser.Bio, fullUser.WebsiteURL, fullUser.AvatarURL, fullUser.PreferredLocale,
+			`UPDATE users SET display_name = ?, email = ?, bio = ?, website_url = ?, avatar_url = ?, preferred_locale = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
+			fullUser.DisplayName, fullUser.Email, fullUser.Bio, fullUser.WebsiteURL, fullUser.AvatarURL, fullUser.PreferredLocale,
 			fullUser.PasswordHash, fullUser.LegacyHash, fullUser.UpdatedAt, fullUser.ID)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
+		}
+		if req.NewPassword != "" {
+			curSessID := ""
+			if sess != nil {
+				curSessID = sess.ID
+			}
+			_ = s.deps.Auth.RevokeOtherSessions(r.Context(), fullUser.ID, curSessID)
 		}
 		fullUser.PasswordHash = ""
 		fullUser.LegacyHash = ""
@@ -571,6 +617,20 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusOK, map[string]any{"recovery_codes": codes})
 
 	case sub == "totp" && r.Method == http.MethodDelete:
+		var req struct {
+			CurrentPassword string `json:"current_password"`
+		}
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
+		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			return
+		}
+		ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
+		if !ok {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+			return
+		}
 		_, _ = s.deps.Store.ExecContext(r.Context(),
 			`DELETE FROM user_credentials WHERE user_id = ? AND kind IN ('totp', 'recovery_codes')`, actor.ID)
 		s.recordAuditLog(r, actor, "security.totp_disable", "user", actor.ID, nil)
@@ -945,6 +1005,130 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 
 	if rest == "import" && r.Method == http.MethodPost {
 		s.handleAdminBatchImportArticles(w, r, actor)
+		return
+	}
+
+	if rest == "batch" && r.Method == http.MethodPost {
+		var req struct {
+			Action     string   `json:"action"`
+			IDs        []string `json:"ids"`
+			CategoryID string   `json:"category_id"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		action := strings.ToLower(strings.TrimSpace(req.Action))
+		switch action {
+		case "publish", "draft", "delete", "category", "pin", "unpin":
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			return
+		}
+		ids := dedupCleanIDs(req.IDs, 200)
+		if len(ids) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			return
+		}
+		articles := make([]domain.RawArticle, 0, len(ids))
+		for _, aid := range ids {
+			raw, gErr := s.deps.Content.GetRawArticleByID(r.Context(), aid)
+			if gErr != nil {
+				continue
+			}
+			if !auth.CanManageArticle(actor, raw.AuthorID) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+				return
+			}
+			articles = append(articles, raw)
+		}
+		now := time.Now().UnixMilli()
+		affected := 0
+		catID := strings.TrimSpace(req.CategoryID)
+		for _, raw := range articles {
+			switch action {
+			case "publish":
+				wasPublished := raw.Status == domain.ArticleStatusPublished
+				pubAt := raw.PublishedAt
+				if pubAt <= 0 {
+					pubAt = now
+				}
+				if _, uErr := s.deps.Store.ExecContext(r.Context(),
+					`UPDATE articles SET status = ?, published_at = ?, updated_at = ? WHERE id = ?`,
+					domain.ArticleStatusPublished, pubAt, now, raw.ID); uErr == nil {
+					raw.Status = domain.ArticleStatusPublished
+					raw.PublishedAt = pubAt
+					raw.UpdatedAt = now
+					s.deps.Content.SearchIndex().Upsert(raw)
+					if !wasPublished {
+						if s.deps.Plugins != nil {
+							s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticlePublished, plugin.ArticleHookPayload{
+								ID:                  raw.ID,
+								Title:               raw.Title,
+								Slug:                raw.Slug,
+								Lang:                raw.Lang,
+								SummaryMD:           raw.SummaryMD,
+								ContentMD:           raw.ContentMD,
+								CoverURL:            raw.CoverURL,
+								AudioURL:            raw.AudioURL,
+								IsPasswordProtected: raw.PasswordCiphertext != "",
+								HasContentLock:      raw.HasContentLock,
+							})
+						}
+						if s.deps.NotifyArticlePublished != nil {
+							s.deps.NotifyArticlePublished(r.Context(), raw)
+						}
+					}
+					affected++
+				}
+			case "draft":
+				if _, uErr := s.deps.Store.ExecContext(r.Context(),
+					`UPDATE articles SET status = ?, updated_at = ? WHERE id = ?`,
+					domain.ArticleStatusDraft, now, raw.ID); uErr == nil {
+					s.deps.Content.SearchIndex().Remove(raw.ID)
+					affected++
+				}
+			case "category":
+				if _, uErr := s.deps.Store.ExecContext(r.Context(),
+					`UPDATE articles SET category_id = ?, updated_at = ? WHERE id = ?`,
+					catID, now, raw.ID); uErr == nil {
+					raw.CategoryID = catID
+					raw.UpdatedAt = now
+					if raw.Status == domain.ArticleStatusPublished {
+						s.deps.Content.SearchIndex().Upsert(raw)
+					}
+					affected++
+				}
+			case "pin", "unpin":
+				pinned := action == "pin"
+				if _, uErr := s.deps.Store.ExecContext(r.Context(),
+					`UPDATE articles SET is_pinned = ?, updated_at = ? WHERE id = ?`,
+					pinned, now, raw.ID); uErr == nil {
+					raw.IsPinned = pinned
+					raw.UpdatedAt = now
+					if raw.Status == domain.ArticleStatusPublished {
+						s.deps.Content.SearchIndex().Upsert(raw)
+					}
+					affected++
+				}
+			case "delete":
+				dErr := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+					_, _ = tx.ExecContext(r.Context(), `DELETE FROM article_tags WHERE article_id = ?`, raw.ID)
+					_, _ = tx.ExecContext(r.Context(), `DELETE FROM series_articles WHERE article_id = ?`, raw.ID)
+					_, _ = tx.ExecContext(r.Context(), `DELETE FROM article_revisions WHERE article_id = ?`, raw.ID)
+					_, _ = tx.ExecContext(r.Context(), `DELETE FROM article_backlinks WHERE source_article_id = ? OR target_article_id = ?`, raw.ID, raw.ID)
+					_, _ = tx.ExecContext(r.Context(), `DELETE FROM comments WHERE target_type = ? AND target_id = ?`, domain.TargetTypeArticle, raw.ID)
+					_, err := tx.ExecContext(r.Context(), `DELETE FROM articles WHERE id = ?`, raw.ID)
+					return err
+				})
+				if dErr == nil {
+					s.deps.Content.SearchIndex().Remove(raw.ID)
+					affected++
+				}
+			}
+		}
+		s.recordAuditLog(r, actor, "article.batch", "article", action, map[string]any{"action": action, "affected": affected})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
 		return
 	}
 
@@ -1676,6 +1860,50 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		}
 		return
 	}
+	if rest == "batch" && r.Method == http.MethodPost {
+		if err := auth.RequireAdmin(actor); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		var req struct {
+			Action string   `json:"action"`
+			IDs    []string `json:"ids"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			return
+		}
+		ids := dedupCleanIDs(req.IDs, 200)
+		if len(ids) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			return
+		}
+		affected := 0
+		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			for _, tid := range ids {
+				_, _ = tx.ExecContext(r.Context(), `DELETE FROM article_tags WHERE tag_id = ?`, tid)
+				if res, dErr := tx.ExecContext(r.Context(), `DELETE FROM tags WHERE id = ?`, tid); dErr == nil {
+					if n, _ := res.RowsAffected(); n > 0 {
+						affected += int(n)
+					}
+				} else {
+					return dErr
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.recordAuditLog(r, actor, "tag.batch_delete", "tag", "batch", map[string]any{"affected": affected})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		var in domain.Tag
@@ -1962,30 +2190,40 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		status := strings.TrimSpace(r.URL.Query().Get("status"))
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		var rows []domain.Comment
 		var err error
 		if actor.Role == domain.RoleAdmin {
+			where := []string{"is_deleted = ?"}
+			args := []any{false}
 			if status != "" && status != "all" {
-				rows, err = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
-					`SELECT * FROM comments WHERE status = ? AND is_deleted = 0 ORDER BY created_at DESC LIMIT 250`, status)
-			} else {
-				rows, err = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
-					`SELECT * FROM comments WHERE is_deleted = 0 ORDER BY created_at DESC LIMIT 250`)
+				where = append(where, "status = ?")
+				args = append(args, status)
 			}
+			if q != "" {
+				pat := "%" + q + "%"
+				where = append(where, "(LOWER(content_md) LIKE LOWER(?) OR LOWER(author_name) LIKE LOWER(?))")
+				args = append(args, pat, pat)
+			}
+			rows, err = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
+				`SELECT * FROM comments WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC LIMIT 250`, args...)
 		} else {
+			where := []string{"a.author_id = ?", "c.is_deleted = ?"}
+			args := []any{actor.ID, false}
 			if status != "" && status != "all" {
-				rows, err = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
-					`SELECT c.* FROM comments c
-					 INNER JOIN articles a ON c.target_type = 'article' AND c.target_id = a.id
-					 WHERE a.author_id = ? AND c.status = ? AND c.is_deleted = 0
-					 ORDER BY c.created_at DESC LIMIT 250`, actor.ID, status)
-			} else {
-				rows, err = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
-					`SELECT c.* FROM comments c
-					 INNER JOIN articles a ON c.target_type = 'article' AND c.target_id = a.id
-					 WHERE a.author_id = ? AND c.is_deleted = 0
-					 ORDER BY c.created_at DESC LIMIT 250`, actor.ID)
+				where = append(where, "c.status = ?")
+				args = append(args, status)
 			}
+			if q != "" {
+				pat := "%" + q + "%"
+				where = append(where, "(LOWER(c.content_md) LIKE LOWER(?) OR LOWER(c.author_name) LIKE LOWER(?))")
+				args = append(args, pat, pat)
+			}
+			rows, err = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
+				`SELECT c.* FROM comments c
+				 INNER JOIN articles a ON c.target_type = 'article' AND c.target_id = a.id
+				 WHERE `+strings.Join(where, " AND ")+`
+				 ORDER BY c.created_at DESC LIMIT 250`, args...)
 		}
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -2005,6 +2243,107 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		return
+	}
+
+	if rest == "batch" && r.Method == http.MethodPost {
+		var req struct {
+			Action string   `json:"action"`
+			IDs    []string `json:"ids"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		action := strings.ToLower(strings.TrimSpace(req.Action))
+		switch action {
+		case "approve", "approved":
+			action = "approve"
+		case "reject", "rejected":
+			action = "reject"
+		case "pending":
+			action = "pending"
+		case "delete":
+			action = "delete"
+		case "ban_ip", "ban-ip":
+			if err := auth.RequireAdmin(actor); err != nil {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+				return
+			}
+			action = "ban_ip"
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			return
+		}
+		ids := dedupCleanIDs(req.IDs, 200)
+		if len(ids) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			return
+		}
+		comments := make([]domain.Comment, 0, len(ids))
+		for _, cid := range ids {
+			cmt, gErr := sqlx.Get[domain.Comment](r.Context(), s.deps.Store, `SELECT * FROM comments WHERE id = ?`, cid)
+			if gErr != nil {
+				continue
+			}
+			artAuthorID := ""
+			if cmt.TargetType == domain.TargetTypeArticle {
+				_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT author_id FROM articles WHERE id = ?`, cmt.TargetID).Scan(&artAuthorID)
+			}
+			if _, authErr := auth.AuthorizeAndScrubCommentForStaff(actor, cmt, artAuthorID); authErr != nil {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": authErr.Error()})
+				return
+			}
+			comments = append(comments, cmt)
+		}
+		now := time.Now().UnixMilli()
+		callerIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		affected := 0
+		type targetPair struct {
+			tType string
+			tID   string
+		}
+		recountSet := make(map[targetPair]struct{})
+		for _, cmt := range comments {
+			var uErr error
+			switch action {
+			case "approve":
+				_, uErr = s.deps.Store.ExecContext(r.Context(),
+					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+					domain.CommentStatusApproved, now, cmt.ID)
+			case "reject":
+				_, uErr = s.deps.Store.ExecContext(r.Context(),
+					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+					domain.CommentStatusRejected, now, cmt.ID)
+			case "pending":
+				_, uErr = s.deps.Store.ExecContext(r.Context(),
+					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+					domain.CommentStatusPending, now, cmt.ID)
+			case "delete":
+				_, uErr = s.deps.Store.ExecContext(r.Context(),
+					`UPDATE comments SET is_deleted = ?, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
+					true, now, cmt.ID)
+			case "ban_ip":
+				targetIP := strings.TrimSpace(cmt.ClientIP)
+				if targetIP != "" && s.deps.WAF != nil {
+					note := "comment batch moderation (" + cmt.AuthorName + ")"
+					expMS := time.Now().Add(30 * 24 * time.Hour).UnixMilli()
+					_, _ = s.deps.WAF.AddManualBan(r.Context(), targetIP, note, expMS, callerIP)
+				}
+				_, uErr = s.deps.Store.ExecContext(r.Context(),
+					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+					domain.CommentStatusRejected, now, cmt.ID)
+			}
+			if uErr == nil {
+				affected++
+				recountSet[targetPair{tType: cmt.TargetType, tID: cmt.TargetID}] = struct{}{}
+			}
+		}
+		for tp := range recountSet {
+			s.recountTargetComments(r.Context(), tp.tType, tp.tID)
+		}
+		s.recordAuditLog(r, actor, "comment.batch", "comment", action, map[string]any{"action": action, "affected": affected})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
 		return
 	}
 
@@ -2090,20 +2429,43 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 	switch r.Method {
 	case http.MethodPatch:
 		var req struct {
-			Status string `json:"status"`
+			Status    *string `json:"status"`
+			ContentMD *string `json:"content_md"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		switch req.Status {
-		case domain.CommentStatusApproved, domain.CommentStatusPending, domain.CommentStatusRejected:
-		default:
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid comment status"})
+		if req.Status == nil && req.ContentMD == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status or content_md required"})
 			return
 		}
+		nextStatus := cmt.Status
+		if req.Status != nil && strings.TrimSpace(*req.Status) != "" {
+			sVal := strings.TrimSpace(*req.Status)
+			switch sVal {
+			case domain.CommentStatusApproved, domain.CommentStatusPending, domain.CommentStatusRejected:
+				nextStatus = sVal
+			default:
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid comment status"})
+				return
+			}
+		}
+		nextContent := cmt.ContentMD
+		if req.ContentMD != nil {
+			trimmed := strings.TrimSpace(*req.ContentMD)
+			if trimmed == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content_md required"})
+				return
+			}
+			if len([]rune(trimmed)) > 8000 {
+				trimmed = string([]rune(trimmed)[:8000])
+			}
+			nextContent = trimmed
+		}
 		_, err := s.deps.Store.ExecContext(r.Context(),
-			`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`, req.Status, time.Now().UnixMilli(), cmtID)
+			`UPDATE comments SET status = ?, content_md = ?, updated_at = ? WHERE id = ?`,
+			nextStatus, nextContent, time.Now().UnixMilli(), cmtID)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -2113,8 +2475,8 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(),
-			`UPDATE comments SET is_deleted = 1, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
-			time.Now().UnixMilli(), cmtID)
+			`UPDATE comments SET is_deleted = ?, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
+			true, time.Now().UnixMilli(), cmtID)
 		s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
@@ -2126,8 +2488,8 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 func (s *AppServer) recountTargetComments(ctx context.Context, targetType, targetID string) {
 	var cnt int
 	_ = s.deps.Store.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM comments WHERE target_type = ? AND target_id = ? AND status = 'approved' AND is_deleted = 0`,
-		targetType, targetID).Scan(&cnt)
+		`SELECT COUNT(*) FROM comments WHERE target_type = ? AND target_id = ? AND status = 'approved' AND is_deleted = ?`,
+		targetType, targetID, false).Scan(&cnt)
 	if targetType == domain.TargetTypePage {
 		_, _ = s.deps.Store.ExecContext(ctx, `UPDATE pages SET comment_count = ? WHERE id = ?`, cnt, targetID)
 	} else {
@@ -2148,6 +2510,69 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			"orphan_count":   orphanCnt,
 			"storage_driver": drv,
 		})
+		return
+	}
+
+	if rest == "reconcile" && r.Method == http.MethodPost {
+		imported := s.reconcileLocalUploads(r.Context())
+		if imported > 0 {
+			_ = s.deps.Content.RefreshMediaDimsCache(r.Context())
+		}
+		s.recordAuditLog(r, actor, "media.reconcile", "media_asset", "local", map[string]any{"imported": imported})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported})
+		return
+	}
+
+	if rest == "batch" && r.Method == http.MethodPost {
+		var req struct {
+			Action string   `json:"action"`
+			IDs    []string `json:"ids"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			return
+		}
+		ids := dedupCleanIDs(req.IDs, 200)
+		if len(ids) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			return
+		}
+		assets := make([]domain.MediaAsset, 0, len(ids))
+		for _, mid := range ids {
+			asset, gErr := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, mid)
+			if gErr != nil {
+				continue
+			}
+			if actor.Role != domain.RoleAdmin && asset.UploaderID != actor.ID {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+				return
+			}
+			assets = append(assets, asset)
+		}
+		affected := 0
+		for _, asset := range assets {
+			if s.deps.Media != nil {
+				if dErr := s.deps.Media.Delete(r.Context(), asset.ID); dErr == nil {
+					affected++
+				}
+			} else {
+				if asset.StorageDriver == "local" && asset.ObjectKey != "" {
+					safeUnlinkLocalAsset(s.deps.Config.UploadDir, asset.ObjectKey)
+				}
+				if _, dErr := s.deps.Store.ExecContext(r.Context(), `DELETE FROM media_assets WHERE id = ?`, asset.ID); dErr == nil {
+					affected++
+				}
+			}
+		}
+		if affected > 0 {
+			_ = s.deps.Content.RefreshMediaDimsCache(r.Context())
+		}
+		s.recordAuditLog(r, actor, "media.batch_delete", "media_asset", "batch", map[string]any{"affected": affected})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
 		return
 	}
 
@@ -2209,6 +2634,50 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		return
 	}
 
+	if rest != "" && r.Method == http.MethodPatch {
+		asset, err := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, rest)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
+			return
+		}
+		if actor.Role != domain.RoleAdmin && asset.UploaderID != actor.ID {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			return
+		}
+		var req struct {
+			OriginalName *string `json:"original_name"`
+			AltText      *string `json:"alt_text"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if req.OriginalName != nil {
+			cleanName := strings.TrimSpace(filepath.Base(strings.ReplaceAll(*req.OriginalName, "\\", "/")))
+			if cleanName != "" && cleanName != "." && cleanName != ".." {
+				if len([]rune(cleanName)) > 180 {
+					cleanName = string([]rune(cleanName)[:180])
+				}
+				asset.OriginalName = cleanName
+			}
+		}
+		if req.AltText != nil {
+			alt := strings.TrimSpace(*req.AltText)
+			if len([]rune(alt)) > 500 {
+				alt = string([]rune(alt)[:500])
+			}
+			asset.AltText = alt
+		}
+		if _, uErr := s.deps.Store.ExecContext(r.Context(),
+			`UPDATE media_assets SET original_name = ?, alt_text = ? WHERE id = ?`,
+			asset.OriginalName, asset.AltText, asset.ID); uErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": uErr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "asset": asset})
+		return
+	}
+
 	if rest != "" && r.Method == http.MethodDelete {
 		asset, err := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, rest)
 		if err != nil {
@@ -2226,10 +2695,11 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			}
 		} else {
 			if asset.StorageDriver == "local" && asset.ObjectKey != "" {
-				_ = os.Remove(filepath.Join(s.deps.Config.UploadDir, filepath.FromSlash(asset.ObjectKey)))
+				safeUnlinkLocalAsset(s.deps.Config.UploadDir, asset.ObjectKey)
 			}
 			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM media_assets WHERE id = ?`, rest)
 		}
+		_ = s.deps.Content.RefreshMediaDimsCache(r.Context())
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
@@ -2247,12 +2717,11 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 	sniff := http.DetectContentType(raw[:minInt(512, len(raw))])
 	ext := strings.ToLower(filepath.Ext(origName))
 	switch ext {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".mp3", ".m4a", ".ogg", ".wav", ".pdf", ".zip":
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp3", ".m4a", ".ogg", ".wav", ".pdf", ".zip":
+	case ".svg":
+		return nil, errors.New("raw SVG upload disallowed for XSS safety; use PNG/WebP/JPEG")
 	default:
 		return nil, fmt.Errorf("unsupported file extension %q", ext)
-	}
-	if ext == ".svg" {
-		return nil, errors.New("raw SVG upload disallowed for XSS safety; use PNG/WebP/JPEG")
 	}
 
 	var width, height int
@@ -2278,6 +2747,7 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 		ObjectKey:     relKey,
 		PublicURL:     "/uploads/" + relKey,
 		OriginalName:  filepath.Base(origName),
+		AltText:       "",
 		MIMEType:      sniff,
 		SizeBytes:     int64(len(raw)),
 		Width:         width,
@@ -2288,13 +2758,36 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 		CreatedAt:     now.UnixMilli(),
 	}
 	if _, err := s.deps.Store.ExecContext(ctx,
-		`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		asset.ID, asset.StorageDriver, asset.ObjectKey, asset.PublicURL, asset.OriginalName, asset.MIMEType,
+		`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, alt_text, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		asset.ID, asset.StorageDriver, asset.ObjectKey, asset.PublicURL, asset.OriginalName, asset.AltText, asset.MIMEType,
 		asset.SizeBytes, asset.Width, asset.Height, asset.SHA256, asset.EXIFStripped, asset.UploaderID, asset.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &asset, nil
+}
+
+func dedupCleanIDs(raw []string, maxCount int) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, minInt(len(raw), maxCount))
+	out := make([]string, 0, minInt(len(raw), maxCount))
+	for _, s := range raw {
+		v := strings.TrimSpace(s)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+		if len(out) >= maxCount {
+			break
+		}
+	}
+	return out
 }
 
 func minInt(a, b int) int {

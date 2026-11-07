@@ -74,7 +74,9 @@ type Output struct {
 
 // Engine is a thread-safe, zero-CGO Markdown rendering pipeline powered by goldmark + chroma/v2 + bluemonday.
 type Engine struct {
+	mdOnce    sync.Once
 	md        goldmark.Markdown
+	sanOnce   sync.Once
 	sanitizer *bluemonday.Policy
 }
 
@@ -91,26 +93,36 @@ func Default() *Engine {
 	return defaultEngineInst
 }
 
-// NewEngine constructs a configured Markdown rendering Engine.
+// NewEngine constructs a configured Markdown rendering Engine with lazy parser and sanitizer initialization.
 func NewEngine() *Engine {
-	md := goldmark.New(
-		goldmark.WithExtensions(
-			extension.GFM,
-			extension.Footnote,
-			extension.DefinitionList,
-			extension.Typographer,
-		),
-		goldmark.WithParserOptions(
-			parser.WithAutoHeadingID(),
-		),
-		goldmark.WithRendererOptions(
-			gmhtml.WithUnsafe(), // Raw HTML is strictly filtered by bluemonday policy right after rendering
-		),
-	)
-	return &Engine{
-		md:        md,
-		sanitizer: buildSanitizerPolicy(),
-	}
+	return &Engine{}
+}
+
+func (e *Engine) ensureMarkdown() goldmark.Markdown {
+	e.mdOnce.Do(func() {
+		e.md = goldmark.New(
+			goldmark.WithExtensions(
+				extension.GFM,
+				extension.Footnote,
+				extension.DefinitionList,
+				extension.Typographer,
+			),
+			goldmark.WithParserOptions(
+				parser.WithAutoHeadingID(),
+			),
+			goldmark.WithRendererOptions(
+				gmhtml.WithUnsafe(), // Raw HTML is strictly filtered by bluemonday policy right after rendering
+			),
+		)
+	})
+	return e.md
+}
+
+func (e *Engine) ensureSanitizer() *bluemonday.Policy {
+	e.sanOnce.Do(func() {
+		e.sanitizer = buildSanitizerPolicy()
+	})
+	return e.sanitizer
 }
 
 func buildSanitizerPolicy() *bluemonday.Policy {
@@ -132,7 +144,7 @@ func buildSanitizerPolicy() *bluemonday.Policy {
 
 // SanitizeHTML passes an HTML fragment directly through the engine's strict bluemonday XSS policy.
 func (e *Engine) SanitizeHTML(rawHTML string) string {
-	return e.sanitizer.Sanitize(rawHTML)
+	return e.ensureSanitizer().Sanitize(rawHTML)
 }
 
 // Render transforms Markdown into sanitized, zero-JS syntax-highlighted HTML while strictly
@@ -144,7 +156,7 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 	prep := preprocessDirectives(markdownSrc, opts)
 
 	var rawBuf bytes.Buffer
-	_ = e.md.Convert([]byte(prep.markdown), &rawBuf)
+	_ = e.ensureMarkdown().Convert([]byte(prep.markdown), &rawBuf)
 	rendered := rawBuf.String()
 
 	// Replace placeholders (Chroma code blocks, Mermaid diagrams, Lock cards, Book cards) before sanitization.
@@ -168,7 +180,7 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 	}
 
 	// Sanitize with bluemonday to neutralize any script/event-handler XSS vectors.
-	safeHTML := e.sanitizer.Sanitize(rendered)
+	safeHTML := e.ensureSanitizer().Sanitize(rendered)
 	if opts.Mode == RenderModeWeb {
 		safeHTML = assignReadableHeadingIDs(safeHTML)
 	}
@@ -442,6 +454,19 @@ func renderLockedPlaceholder(lockType string, hint string, opts Options) string 
 	return b.String()
 }
 
+func formatBookChapterBadge(count int, locale string) string {
+	if count <= 0 {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(locale)), "en") {
+		if count == 1 {
+			return "1 chapter"
+		}
+		return fmt.Sprintf("%d chapters", count)
+	}
+	return fmt.Sprintf("%d 章", count)
+}
+
 func renderBookCard(slug string, opts Options) string {
 	cleanSlug := strings.TrimSpace(slug)
 	if cleanSlug == "" {
@@ -455,11 +480,18 @@ func renderBookCard(slug string, opts Options) string {
 	}
 	var b strings.Builder
 	b.WriteString(`<section class="volo-embed-book" data-book-slug="` + html.EscapeString(info.Slug) + `">`)
+	if cover := strings.TrimSpace(info.CoverURL); cover != "" && isSafeImageSrc(cover) {
+		b.WriteString(`<img class="volo-embed-book__cover" src="` + html.EscapeString(cover) + `" alt="` + html.EscapeString(info.Title) + `" loading="lazy" decoding="async">`)
+	}
+	b.WriteString(`<div class="volo-embed-book__body">`)
 	b.WriteString(`<a href="/books/` + url.PathEscape(info.Slug) + `"><strong>` + html.EscapeString(info.Title) + `</strong></a>`)
+	if info.ChapterCount > 0 {
+		b.WriteString(` <span class="volo-embed-book__chapters">` + html.EscapeString(formatBookChapterBadge(info.ChapterCount, opts.Locale)) + `</span>`)
+	}
 	if info.Description != "" {
 		b.WriteString(`<p>` + html.EscapeString(info.Description) + `</p>`)
 	}
-	b.WriteString(`</section>`)
+	b.WriteString(`</div></section>`)
 	return b.String()
 }
 
@@ -472,11 +504,18 @@ func renderBookshelfGrid(opts Options) string {
 	b.WriteString(`<section class="volo-embed-bookshelf">`)
 	for _, bk := range books {
 		b.WriteString(`<article class="volo-book-tile" data-book-slug="` + html.EscapeString(bk.Slug) + `">`)
+		if cover := strings.TrimSpace(bk.CoverURL); cover != "" && isSafeImageSrc(cover) {
+			b.WriteString(`<img class="volo-embed-book__cover" src="` + html.EscapeString(cover) + `" alt="` + html.EscapeString(bk.Title) + `" loading="lazy" decoding="async">`)
+		}
+		b.WriteString(`<div class="volo-embed-book__body">`)
 		b.WriteString(`<a href="/books/` + url.PathEscape(bk.Slug) + `"><strong>` + html.EscapeString(bk.Title) + `</strong></a>`)
+		if bk.ChapterCount > 0 {
+			b.WriteString(` <span class="volo-embed-book__chapters">` + html.EscapeString(formatBookChapterBadge(bk.ChapterCount, opts.Locale)) + `</span>`)
+		}
 		if bk.Description != "" {
 			b.WriteString(`<p>` + html.EscapeString(bk.Description) + `</p>`)
 		}
-		b.WriteString(`</article>`)
+		b.WriteString(`</div></article>`)
 	}
 	b.WriteString(`</section>`)
 	return b.String()

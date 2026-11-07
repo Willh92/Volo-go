@@ -5,13 +5,24 @@ import {
   bytesToB64url,
   csrfTokenSig,
   currentUserSig,
+  openConfirm,
   refreshMe,
   resetConsoleScroll,
   showToast,
   storageDriverSig,
 } from "../api";
 import { MediaPickButton } from "../components/MediaLibraryModal";
-import { AnimatedModal, ConsoleSelect, NavIconPreview, Pagination, paginateItems } from "../components/UIControls";
+import {
+  AnimatedModal,
+  ConsoleEmpty,
+  ConsoleSelect,
+  NavIconPreview,
+  Pagination,
+  paginateItems,
+  SwitchToggle,
+  TableSkeleton,
+  UploadButton,
+} from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, t } from "../i18n";
 
 export type SysTab =
@@ -45,6 +56,55 @@ function parseCSVList(raw: string): string[] {
     .split(/[,，\n]/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function parseScopes(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
+  const str = String(raw || "").trim();
+  if (!str) return [];
+  try {
+    const parsed = JSON.parse(str);
+    if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean);
+  } catch {
+    // Fallback to CSV split
+  }
+  return parseCSVList(str);
+}
+
+function summarizeUA(raw: string): string {
+  const ua = String(raw || "").trim();
+  if (!ua) return "—";
+  let browser = "";
+  if (/Edg\//i.test(ua)) browser = "Edge";
+  else if (/OPR\/|Opera/i.test(ua)) browser = "Opera";
+  else if (/Firefox\//i.test(ua)) browser = "Firefox";
+  else if (/Obsidian/i.test(ua)) browser = "Obsidian";
+  else if (/curl\//i.test(ua)) browser = "curl";
+  else if (/CriOS|Chrome\//i.test(ua)) browser = "Chrome";
+  else if (/Safari\//i.test(ua)) browser = "Safari";
+
+  let os = "";
+  if (/iPhone|iPad|iPod/i.test(ua)) os = "iOS";
+  else if (/Android/i.test(ua)) os = "Android";
+  else if (/Mac OS X|Macintosh/i.test(ua)) os = "macOS";
+  else if (/Windows/i.test(ua)) os = "Windows";
+  else if (/Linux/i.test(ua)) os = "Linux";
+
+  if (browser && os) return `${browser} · ${os}`;
+  if (browser || os) return browser || os;
+  return ua.length > 42 ? `${ua.slice(0, 42)}…` : ua;
+}
+
+function formatDetailJSON(raw: unknown): string {
+  const str = typeof raw === "string" ? raw.trim() : JSON.stringify(raw ?? {});
+  if (!str || str === "{}" || str === "null") return "";
+  try {
+    const obj = JSON.parse(str);
+    if (!obj || (typeof obj === "object" && Object.keys(obj).length === 0)) return "";
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return str;
+  }
 }
 
 function formatBytes(bytes: number): string {
@@ -90,12 +150,11 @@ export function SystemWorkspace({
   const locales = availableLocalesSig.value;
   const defaultTab: SysTab = isAdmin ? "settings_site" : "account";
   const [sub, setSub] = useState<SysTab>(activeTab || defaultTab);
+  const [loading, setLoading] = useState(false);
 
-  // Secondary sub-tabs for dense security workspaces
   const [accSub, setAccSub] = useState<"profile" | "sessions">("profile");
   const [wafSub, setWafSub] = useState<"policy" | "bans" | "geo">("policy");
 
-  // Pagination state
   const [usersPage, setUsersPage] = useState(1);
   const [bansPage, setBansPage] = useState(1);
   const [geoPage, setGeoPage] = useState(1);
@@ -108,6 +167,7 @@ export function SystemWorkspace({
   const [profileForm, setProfileForm] = useState({
     avatar_url: currentUserSig.value?.avatar_url || "",
     display_name: "",
+    email: currentUserSig.value?.email || "",
     bio: "",
     website_url: "",
     current_password: "",
@@ -116,6 +176,8 @@ export function SystemWorkspace({
   const [avatarImgErr, setAvatarImgErr] = useState(false);
   const [totpEnroll, setTotpEnroll] = useState<{ secret: string; otpauth_uri: string } | null>(null);
   const [totpCode, setTotpCode] = useState("");
+  const [totpDisableOpen, setTotpDisableOpen] = useState(false);
+  const [totpDisablePwd, setTotpDisablePwd] = useState("");
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [passkeys, setPasskeys] = useState<any[]>([]);
   const [pkModalOpen, setPkModalOpen] = useState(false);
@@ -127,9 +189,10 @@ export function SystemWorkspace({
   const [patScopes, setPatScopes] = useState<string[]>(["articles:read", "articles:write", "media:write"]);
   const [issuedPAT, setIssuedPAT] = useState<string>("");
 
-  // Atomic Domain Settings state (`domains` + `versions`)
+  // Atomic Domain Settings state
   const [domains, setDomains] = useState<Record<string, any> | null>(null);
   const [versions, setVersions] = useState<Record<string, number>>({});
+  const [storageDrivers, setStorageDrivers] = useState<any[]>([]);
   const [smtpPwd, setSmtpPwd] = useState("");
   const [testMailTo, setTestMailTo] = useState("");
   const [s3Secret, setS3Secret] = useState("");
@@ -172,10 +235,18 @@ export function SystemWorkspace({
 
   const [includeMediaExport, setIncludeMediaExport] = useState<boolean>(true);
   const [dryRunRestore, setDryRunRestore] = useState<boolean>(false);
+  const [legacyDryRun, setLegacyDryRun] = useState<boolean>(true);
+  const [legacyBusy, setLegacyBusy] = useState<boolean>(false);
+  const [restoreBusy, setRestoreBusy] = useState<boolean>(false);
+  const [legacyReport, setLegacyReport] = useState<any>(null);
   const [localBackups, setLocalBackups] = useState<Array<{ name: string; size_bytes: number; created_at: number }>>([]);
   const [creatingSnapshot, setCreatingSnapshot] = useState<boolean>(false);
   const [doctorReport, setDoctorReport] = useState<any>(null);
+
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
+  const [auditQuery, setAuditQuery] = useState("");
+  const [auditAction, setAuditAction] = useState("all");
+  const [expandedAuditId, setExpandedAuditId] = useState<string | null>(null);
 
   useEffect(() => {
     setAvatarImgErr(false);
@@ -188,7 +259,17 @@ export function SystemWorkspace({
     }
   }, [activeTab]);
 
+  const loadAuditLogs = async (q = auditQuery, act = auditAction) => {
+    const params = new URLSearchParams();
+    if (q.trim()) params.set("q", q.trim());
+    if (act && act !== "all") params.set("action", act);
+    const qs = params.toString();
+    const res = await apiFetch<{ items: any[] }>(`/api/admin/audit-logs${qs ? `?${qs}` : ""}`);
+    setAuditLogs(res.items || []);
+  };
+
   const loadSub = async () => {
+    setLoading(true);
     try {
       if (sub === "account") {
         const [me, pks, sess, tks] = await Promise.all([
@@ -198,12 +279,11 @@ export function SystemWorkspace({
           apiFetch<{ items: any[] }>("/api/admin/security/tokens"),
         ]);
         setMeInfo(me);
-        if (me.storage_driver) {
-          storageDriverSig.value = me.storage_driver;
-        }
+        if (me.storage_driver) storageDriverSig.value = me.storage_driver;
         setProfileForm({
           avatar_url: me.user?.avatar_url || "",
           display_name: me.user?.display_name || "",
+          email: me.user?.email || "",
           bio: me.user?.bio || "",
           website_url: me.user?.website_url || "",
           current_password: "",
@@ -216,9 +296,8 @@ export function SystemWorkspace({
         const res = await apiFetch<any>("/api/admin/settings");
         setDomains(res.domains || {});
         setVersions(res.versions || {});
-        if (res.domains?.storage) {
-          storageDriverSig.value = res.domains.storage.active_driver || "local";
-        }
+        if (Array.isArray(res.storage_drivers)) setStorageDrivers(res.storage_drivers);
+        if (res.domains?.storage) storageDriverSig.value = res.domains.storage.active_driver || "local";
       } else if (sub === "users" && isAdmin) {
         const res = await apiFetch<{ items: any[] }>("/api/admin/users");
         setUsers(res.items || []);
@@ -233,9 +312,7 @@ export function SystemWorkspace({
         setGeoCircuitEnabled(g.geo_access_circuit_enabled !== false);
         setDomains(st.domains || {});
         setVersions(st.versions || {});
-        if (st.domains?.storage) {
-          storageDriverSig.value = st.domains.storage.active_driver || "local";
-        }
+        if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       } else if (sub === "backup" && isAdmin) {
         const [doc, st, lb] = await Promise.all([
           apiFetch<any>("/api/admin/doctor"),
@@ -246,15 +323,14 @@ export function SystemWorkspace({
         setDomains(st.domains || {});
         setVersions(st.versions || {});
         setLocalBackups(lb.items || []);
-        if (st.domains?.storage) {
-          storageDriverSig.value = st.domains.storage.active_driver || "local";
-        }
+        if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       } else if (sub === "audit" && isAdmin) {
-        const logs = await apiFetch<{ items: any[] }>("/api/admin/audit-logs");
-        setAuditLogs(logs.items || []);
+        await loadAuditLogs();
       }
     } catch (err: any) {
       showToast(err.message);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -288,10 +364,7 @@ export function SystemWorkspace({
         url?: string;
         asset?: { public_url?: string };
         item?: { public_url?: string };
-      }>("/api/admin/media/upload", {
-        method: "POST",
-        body: fd,
-      });
+      }>("/api/admin/media/upload", { method: "POST", body: fd });
       const nextUrl = res.url || res.asset?.public_url || res.item?.public_url || "";
       if (nextUrl) {
         onUploaded(nextUrl);
@@ -359,6 +432,29 @@ export function SystemWorkspace({
     }));
   };
 
+  const storageDriverOpts = (() => {
+    const opts: Array<{ value: string; label: string; badge?: string }> = [
+      { value: "local", label: t("sys.driver_local") },
+      { value: "s3", label: t("sys.driver_s3") },
+    ];
+    for (const d of storageDrivers) {
+      const id = typeof d === "string" ? d : d?.id || d?.value;
+      const label = typeof d === "string" ? d : d?.label || d?.name || id;
+      if (id && !opts.some((o) => o.value === id)) {
+        opts.push({ value: id, label, badge: "plugin" });
+      }
+    }
+    const cur = domains?.storage?.active_driver || "";
+    if (cur && !opts.some((o) => o.value === cur)) {
+      opts.push({ value: cur, label: cur, badge: "plugin" });
+    }
+    return opts;
+  })();
+
+  const origEmail = (meInfo?.user?.email || currentUserSig.value?.email || "").trim().toLowerCase();
+  const emailChanged = profileForm.email.trim().toLowerCase() !== origEmail;
+  const needsProfileReauth = Boolean(profileForm.new_password.trim()) || emailChanged;
+
   const filteredUsers = users.filter((u) => {
     if (userRoleFilter !== "all" && u.role !== userRoleFilter) return false;
     if (userQuery.trim()) {
@@ -372,12 +468,46 @@ export function SystemWorkspace({
     return true;
   });
 
+  const auditActionOptions = (() => {
+    const set = new Set<string>();
+    for (const l of auditLogs) {
+      if (l.action) set.add(String(l.action));
+    }
+    if (auditAction !== "all") set.add(auditAction);
+    return [
+      { value: "all", label: t("art.all") },
+      ...Array.from(set)
+        .sort()
+        .map((a) => ({ value: a, label: a })),
+    ];
+  })();
+
+  const filteredAudit = auditLogs.filter((l) => {
+    if (auditAction !== "all" && l.action !== auditAction) return false;
+    if (auditQuery.trim()) {
+      const q = auditQuery.trim().toLowerCase();
+      const hay = `${l.actor_name || ""} ${l.action || ""} ${l.resource_type || ""} ${l.resource_id || ""} ${l.client_ip || ""} ${l.detail_json || ""}`.toLowerCase();
+      return hay.includes(q);
+    }
+    return true;
+  });
+
   const usersPaged = paginateItems(filteredUsers, usersPage, 15);
   const bansPaged = paginateItems(bans, bansPage, 15);
   const geoPaged = paginateItems(geoRules, geoPage, 15);
   const localBakPaged = paginateItems(localBackups, localBakPage, 10);
-  const auditPaged = paginateItems(auditLogs, auditPage, 20);
+  const auditPaged = paginateItems(filteredAudit, auditPage, 20);
   const sessPaged = paginateItems(sessions, sessPage, 10);
+
+  const geoMissOptions = [
+    { value: "next", label: t("sys.geo_miss_next") },
+    { value: "allow", label: t("sys.geo_allow") },
+    { value: "challenge", label: t("sys.geo_miss_challenge") },
+    { value: "deny", label: t("sys.geo_deny") },
+  ];
+  if (geoForm.on_miss && !geoMissOptions.some((o) => o.value === geoForm.on_miss)) {
+    geoMissOptions.push({ value: geoForm.on_miss, label: geoForm.on_miss });
+  }
 
   return (
     <div>
@@ -459,21 +589,11 @@ export function SystemWorkspace({
                   value={domains.site?.logo_url || ""}
                   onInput={(e) => setDomField("site", "logo_url", (e.currentTarget as HTMLInputElement).value)}
                 />
-                <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer", flexShrink: 0 }}>
-                  {t("sys.upload_img_btn")}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    style={{ display: "none" }}
-                    onChange={(e) => {
-                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                      if (f) {
-                        void uploadImageAsset(f, (url) => setDomField("site", "logo_url", url));
-                      }
-                      (e.currentTarget as HTMLInputElement).value = "";
-                    }}
-                  />
-                </label>
+                <UploadButton
+                  accept="image/*"
+                  label={t("sys.upload_img_btn")}
+                  onFile={(f) => void uploadImageAsset(f, (url) => setDomField("site", "logo_url", url))}
+                />
                 <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "logo_url", url)} />
               </div>
             </div>
@@ -488,21 +608,11 @@ export function SystemWorkspace({
                   value={domains.site?.favicon_url || ""}
                   onInput={(e) => setDomField("site", "favicon_url", (e.currentTarget as HTMLInputElement).value)}
                 />
-                <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer", flexShrink: 0 }}>
-                  {t("sys.upload_img_btn")}
-                  <input
-                    type="file"
-                    accept="image/*,.ico,.svg"
-                    style={{ display: "none" }}
-                    onChange={(e) => {
-                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                      if (f) {
-                        void uploadImageAsset(f, (url) => setDomField("site", "favicon_url", url));
-                      }
-                      (e.currentTarget as HTMLInputElement).value = "";
-                    }}
-                  />
-                </label>
+                <UploadButton
+                  accept="image/*,.ico,.svg"
+                  label={t("sys.upload_img_btn")}
+                  onFile={(f) => void uploadImageAsset(f, (url) => setDomField("site", "favicon_url", url))}
+                />
                 <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "favicon_url", url)} />
               </div>
             </div>
@@ -511,11 +621,7 @@ export function SystemWorkspace({
                 <label>{t("sys.default_locale")}</label>
                 <ConsoleSelect
                   value={domains.site?.default_locale || "zh-CN"}
-                  options={locales.map((loc) => ({
-                    value: loc.code,
-                    label: loc.name,
-                    badge: loc.code,
-                  }))}
+                  options={locales.map((loc) => ({ value: loc.code, label: loc.name, badge: loc.code }))}
                   onChange={(v) => setDomField("site", "default_locale", v)}
                 />
               </div>
@@ -561,53 +667,41 @@ export function SystemWorkspace({
               <textarea
                 class="volo-textarea"
                 rows={2}
-                style={{ fontFamily: "var(--volo-mono)", fontSize: "12px" }}
                 value={domains.site?.custom_head_meta || ""}
                 onInput={(e) => setDomField("site", "custom_head_meta", (e.currentTarget as HTMLTextAreaElement).value)}
               />
             </div>
 
             <div class="volo-check-grid">
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.site?.allow_locale_switch !== false}
-                  onChange={(e) => setDomField("site", "allow_locale_switch", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.allow_locale_switch")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={!!domains.site?.show_admin_login_entry}
-                  onChange={(e) => setDomField("site", "show_admin_login_entry", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.show_admin_entry")}</span>
-              </label>
+              <SwitchToggle
+                checked={domains.site?.allow_locale_switch !== false}
+                onChange={(v) => setDomField("site", "allow_locale_switch", v)}
+                label={t("sys.allow_locale_switch")}
+              />
+              <SwitchToggle
+                checked={!!domains.site?.show_admin_login_entry}
+                onChange={(v) => setDomField("site", "show_admin_login_entry", v)}
+                label={t("sys.show_admin_entry")}
+              />
             </div>
 
             <div class="volo-subcard">
               <div class="volo-subcard-title">{t("sys.social_title")}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginBottom: "10px" }}>
+              <div class="volo-input-row" style={{ marginBottom: "10px", flexWrap: "wrap" }}>
                 <span class="volo-help">{t("sys.social_presets")}</span>
                 {SOCIAL_PRESETS.map((p) => (
                   <button
                     key={p.label}
                     type="button"
                     class="volo-preset-chip"
-                    onClick={() =>
-                      setSocialDraft((prev) => ({
-                        label: p.label,
-                        url: prev.url || p.urlHint,
-                      }))
-                    }
+                    onClick={() => setSocialDraft((prev) => ({ label: p.label, url: prev.url || p.urlHint }))}
                   >
                     {p.label}
                   </button>
                 ))}
               </div>
               <div class="volo-grid-2">
-                <div class="volo-field" style={{ marginBottom: "8px" }}>
+                <div class="volo-field">
                   <label>{t("sys.lbl_social_name")}</label>
                   <input
                     class="volo-input"
@@ -617,9 +711,9 @@ export function SystemWorkspace({
                     onInput={(e) => setSocialDraft({ ...socialDraft, label: (e.currentTarget as HTMLInputElement).value })}
                   />
                 </div>
-                <div class="volo-field" style={{ marginBottom: "8px" }}>
+                <div class="volo-field">
                   <label>{t("sys.lbl_social_url")}</label>
-                  <div style={{ display: "flex", gap: "6px" }}>
+                  <div class="volo-input-row">
                     <input
                       class="volo-input"
                       name="social_profile_link"
@@ -630,7 +724,6 @@ export function SystemWorkspace({
                     <button
                       type="button"
                       class="volo-btn volo-btn-sm"
-                      style={{ flexShrink: 0 }}
                       onClick={() => {
                         if (!socialDraft.label.trim() || !socialDraft.url.trim()) return;
                         const list = Array.isArray(domains.site?.social_links) ? [...domains.site.social_links] : [];
@@ -649,47 +742,27 @@ export function SystemWorkspace({
                   </div>
                 </div>
               </div>
-              {Array.isArray(domains.site?.social_links) && domains.site.social_links.length > 0 && (
-                <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "8px" }}>
-                  {domains.site.social_links.map((s: any, idx: number) => (
-                    <div
-                      key={s.id || idx}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "8px",
-                        padding: "6px 10px",
-                        borderRadius: "8px",
-                        border: "1px solid var(--volo-line)",
-                        background: "var(--volo-surface)",
+              {Array.isArray(domains.site?.social_links) &&
+                domains.site.social_links.map((s: any, idx: number) => (
+                  <div key={s.id || idx} class="volo-input-row" style={{ marginTop: "6px" }}>
+                    <NavIconPreview icon={s.icon || String(s.label || "").toLowerCase()} fallbackLabel={s.label} size={15} />
+                    <strong>{s.label}</strong>
+                    <span class="volo-help" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {s.url}
+                    </span>
+                    <button
+                      type="button"
+                      class="volo-act-btn danger"
+                      onClick={async () => {
+                        if (!(await openConfirm({ message: t("sys.confirm_del_social", { name: s.label }), danger: true }))) return;
+                        const next = domains.site.social_links.filter((_: any, i: number) => i !== idx);
+                        setDomField("site", "social_links", next);
                       }}
                     >
-                      <NavIconPreview
-                        icon={s.icon || String(s.label || "").toLowerCase()}
-                        fallbackLabel={s.label}
-                        size={15}
-                      />
-                      <strong style={{ fontSize: "13px" }}>{s.label}</strong>
-                      <span
-                        class="volo-help"
-                        style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                      >
-                        {s.url}
-                      </span>
-                      <button
-                        type="button"
-                        class="volo-act-btn danger"
-                        onClick={() => {
-                          const next = domains.site.social_links.filter((_: any, i: number) => i !== idx);
-                          setDomField("site", "social_links", next);
-                        }}
-                      >
-                        {t("common.delete")}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
+                      {t("common.delete")}
+                    </button>
+                  </div>
+                ))}
             </div>
 
             <div class="volo-form-actions">
@@ -714,7 +787,7 @@ export function SystemWorkspace({
                 <p class="volo-sec-desc">{t("sys.dom2_desc")}</p>
               </div>
             </div>
-            <div class="volo-grid-3">
+            <div class="volo-auto-grid">
               <div class="volo-field">
                 <label>{t("sys.list_style")}</label>
                 <ConsoleSelect
@@ -747,7 +820,7 @@ export function SystemWorkspace({
               </div>
             </div>
 
-            <div class="volo-grid-2">
+            <div class="volo-auto-grid">
               <div class="volo-field">
                 <label>{t("sys.sb_hot_posts")}</label>
                 <input
@@ -786,44 +859,44 @@ export function SystemWorkspace({
               </div>
             </div>
 
+            <div class="volo-field">
+              <label>{t("sys.asset_cdn_prefix")}</label>
+              <input
+                class="volo-input"
+                name="reading_asset_cdn_prefix"
+                placeholder="https://cdn.example.com/assets"
+                value={domains.reading?.asset_cdn_prefix || ""}
+                onInput={(e) => setDomField("reading", "asset_cdn_prefix", (e.currentTarget as HTMLInputElement).value)}
+              />
+              <small class="volo-help">{t("sys.asset_cdn_hint")}</small>
+            </div>
+
             <div class="volo-check-grid">
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.reading?.enable_reading_stats !== false}
-                  onChange={(e) => setDomField("reading", "enable_reading_stats", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.enable_read_stats")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.reading?.enable_instant_search !== false}
-                  onChange={(e) => setDomField("reading", "enable_instant_search", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.enable_search")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={!!domains.reading?.show_code_line_numbers}
-                  onChange={(e) => setDomField("reading", "show_code_line_numbers", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.show_line_num")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={!!domains.reading?.allow_reader_register}
-                  onChange={(e) => setDomField("reading", "allow_reader_register", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.allow_reader_reg")}</span>
-              </label>
+              <SwitchToggle
+                checked={domains.reading?.enable_reading_stats !== false}
+                onChange={(v) => setDomField("reading", "enable_reading_stats", v)}
+                label={t("sys.enable_read_stats")}
+              />
+              <SwitchToggle
+                checked={domains.reading?.enable_instant_search !== false}
+                onChange={(v) => setDomField("reading", "enable_instant_search", v)}
+                label={t("sys.enable_search")}
+              />
+              <SwitchToggle
+                checked={!!domains.reading?.show_code_line_numbers}
+                onChange={(v) => setDomField("reading", "show_code_line_numbers", v)}
+                label={t("sys.show_line_num")}
+              />
+              <SwitchToggle
+                checked={!!domains.reading?.allow_reader_register}
+                onChange={(v) => setDomField("reading", "allow_reader_register", v)}
+                label={t("sys.allow_reader_reg")}
+              />
             </div>
 
             <div class="volo-subcard">
               <div class="volo-subcard-title">{t("sys.cmt_policy_title")}</div>
-              <div class="volo-grid-3">
+              <div class="volo-auto-grid">
                 <div class="volo-field">
                   <label>{t("sys.cmt_access")}</label>
                   <ConsoleSelect
@@ -858,16 +931,15 @@ export function SystemWorkspace({
                   />
                 </div>
               </div>
-              <label class="volo-check-item" style={{ marginBottom: "10px" }}>
-                <input
-                  type="checkbox"
+              <div class="volo-check-grid">
+                <SwitchToggle
                   checked={domains.reading?.builtin_spam_filter !== false}
-                  onChange={(e) => setDomField("reading", "builtin_spam_filter", (e.currentTarget as HTMLInputElement).checked)}
+                  onChange={(v) => setDomField("reading", "builtin_spam_filter", v)}
+                  label={t("sys.spam_filter")}
                 />
-                <span>{t("sys.spam_filter")}</span>
-              </label>
+              </div>
               <div class="volo-grid-2">
-                <div class="volo-field" style={{ marginBottom: 0 }}>
+                <div class="volo-field">
                   <label>{t("sys.blocked_kw")}</label>
                   <input
                     class="volo-input"
@@ -876,7 +948,7 @@ export function SystemWorkspace({
                     onInput={(e) => setDomField("reading", "blocked_keywords", parseCSVList((e.currentTarget as HTMLInputElement).value))}
                   />
                 </div>
-                <div class="volo-field" style={{ marginBottom: 0 }}>
+                <div class="volo-field">
                   <label>{t("sys.allowed_kw")}</label>
                   <input
                     class="volo-input"
@@ -917,15 +989,12 @@ export function SystemWorkspace({
                 <p class="volo-sec-desc">{t("sys.dom4_desc")}</p>
               </div>
             </div>
-            <div class="volo-grid-3">
+            <div class="volo-auto-grid">
               <div class="volo-field">
                 <label>{t("sys.storage_driver")}</label>
                 <ConsoleSelect
                   value={domains.storage?.active_driver || "local"}
-                  options={[
-                    { value: "local", label: t("sys.driver_local") },
-                    { value: "s3", label: t("sys.driver_s3") },
-                  ]}
+                  options={storageDriverOpts}
                   onChange={(v) => setDomField("storage", "active_driver", v)}
                 />
               </div>
@@ -950,22 +1019,16 @@ export function SystemWorkspace({
             </div>
 
             <div class="volo-check-grid">
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.storage?.strip_exif !== false}
-                  onChange={(e) => setDomField("storage", "strip_exif", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.strip_exif")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.storage?.adaptive_webp !== false}
-                  onChange={(e) => setDomField("storage", "adaptive_webp", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.adaptive_webp")}</span>
-              </label>
+              <SwitchToggle
+                checked={domains.storage?.strip_exif !== false}
+                onChange={(v) => setDomField("storage", "strip_exif", v)}
+                label={t("sys.strip_exif")}
+              />
+              <SwitchToggle
+                checked={domains.storage?.adaptive_webp !== false}
+                onChange={(v) => setDomField("storage", "adaptive_webp", v)}
+                label={t("sys.adaptive_webp")}
+              />
             </div>
 
             <div class="volo-subcard">
@@ -992,7 +1055,7 @@ export function SystemWorkspace({
                   />
                 </div>
               </div>
-              <div class="volo-grid-3">
+              <div class="volo-auto-grid">
                 <div class="volo-field">
                   <label>{t("sys.lbl_s3_bucket")}</label>
                   <input
@@ -1052,14 +1115,11 @@ export function SystemWorkspace({
                   />
                 </div>
               </div>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={!!domains.storage?.s3_path_style}
-                  onChange={(e) => setDomField("storage", "s3_path_style", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.s3_path_style")}</span>
-              </label>
+              <SwitchToggle
+                checked={!!domains.storage?.s3_path_style}
+                onChange={(v) => setDomField("storage", "s3_path_style", v)}
+                label={t("sys.s3_path_style")}
+              />
             </div>
 
             <div class="volo-form-actions">
@@ -1104,7 +1164,7 @@ export function SystemWorkspace({
                 <p class="volo-sec-desc">{t("sys.dom3_desc")}</p>
               </div>
             </div>
-            <div class="volo-grid-3">
+            <div class="volo-auto-grid">
               <div class="volo-field">
                 <label>{t("sys.smtp_host")}</label>
                 <input
@@ -1190,42 +1250,30 @@ export function SystemWorkspace({
             </div>
 
             <div class="volo-check-grid">
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={!!domains.notifications?.smtp_enabled}
-                  onChange={(e) => setDomField("notifications", "smtp_enabled", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.enable_smtp")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.notifications?.smtp_auth !== false}
-                  onChange={(e) => setDomField("notifications", "smtp_auth", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.smtp_auth")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.notifications?.notify_admin_on_comment !== false}
-                  onChange={(e) => setDomField("notifications", "notify_admin_on_comment", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.notify_admin_cmt")}</span>
-              </label>
-              <label class="volo-check-item">
-                <input
-                  type="checkbox"
-                  checked={domains.notifications?.notify_reply_by_email !== false}
-                  onChange={(e) => setDomField("notifications", "notify_reply_by_email", (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>{t("sys.notify_reply_mail")}</span>
-              </label>
+              <SwitchToggle
+                checked={!!domains.notifications?.smtp_enabled}
+                onChange={(v) => setDomField("notifications", "smtp_enabled", v)}
+                label={t("sys.enable_smtp")}
+              />
+              <SwitchToggle
+                checked={domains.notifications?.smtp_auth !== false}
+                onChange={(v) => setDomField("notifications", "smtp_auth", v)}
+                label={t("sys.smtp_auth")}
+              />
+              <SwitchToggle
+                checked={domains.notifications?.notify_admin_on_comment !== false}
+                onChange={(v) => setDomField("notifications", "notify_admin_on_comment", v)}
+                label={t("sys.notify_admin_cmt")}
+              />
+              <SwitchToggle
+                checked={domains.notifications?.notify_reply_by_email !== false}
+                onChange={(v) => setDomField("notifications", "notify_reply_by_email", v)}
+                label={t("sys.notify_reply_mail")}
+              />
             </div>
 
             <div class="volo-subcard">
-              <div class="volo-field" style={{ marginBottom: 0 }}>
+              <div class="volo-field">
                 <label>{t("sys.lbl_test_mail")}</label>
                 <input
                   class="volo-input"
@@ -1302,12 +1350,17 @@ export function SystemWorkspace({
                   autoComplete="off"
                   onSubmit={async (e) => {
                     e.preventDefault();
+                    if (needsProfileReauth && !profileForm.current_password.trim()) {
+                      showToast(t("sys.reauth_pwd_required"), "err");
+                      return;
+                    }
                     try {
                       await apiFetch("/api/admin/me", {
                         method: "PATCH",
                         body: JSON.stringify({
                           avatar_url: profileForm.avatar_url,
                           display_name: profileForm.display_name,
+                          email: profileForm.email.trim(),
                           bio: profileForm.bio,
                           website_url: profileForm.website_url,
                           current_password: profileForm.current_password,
@@ -1316,6 +1369,7 @@ export function SystemWorkspace({
                       });
                       setProfileForm((prev) => ({ ...prev, current_password: "", new_password: "" }));
                       await refreshMe();
+                      void loadSub();
                       showToast(t("common.saved"));
                     } catch (err: any) {
                       showToast(err.message);
@@ -1334,48 +1388,25 @@ export function SystemWorkspace({
                           />
                         ) : (
                           <span>
-                            {(profileForm.display_name || currentUserSig.value?.username || "U")
-                              .trim()
-                              .charAt(0)
-                              .toUpperCase()}
+                            {(profileForm.display_name || currentUserSig.value?.username || "U").trim().charAt(0).toUpperCase()}
                           </span>
                         )}
                       </div>
-                      <div class="volo-input-row" style={{ flex: 1, minWidth: "220px" }}>
+                      <div class="volo-input-row" style={{ flex: 1 }}>
                         <input
                           class="volo-input"
                           name="author_avatar_url"
                           autoComplete="off"
                           placeholder={t("sys.avatar_url_ph")}
                           value={profileForm.avatar_url}
-                          onInput={(e) =>
-                            setProfileForm((prev) => ({
-                              ...prev,
-                              avatar_url: (e.currentTarget as HTMLInputElement).value,
-                            }))
-                          }
+                          onInput={(e) => setProfileForm((prev) => ({ ...prev, avatar_url: (e.currentTarget as HTMLInputElement).value }))}
                         />
-                        <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer", flexShrink: 0 }}>
-                          {t("sys.upload_img_btn")}
-                          <input
-                            type="file"
-                            accept="image/*"
-                            style={{ display: "none" }}
-                            onChange={(e) => {
-                              const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                              if (f) {
-                                void uploadImageAsset(f, (url) =>
-                                  setProfileForm((prev) => ({ ...prev, avatar_url: url })),
-                                );
-                              }
-                              (e.currentTarget as HTMLInputElement).value = "";
-                            }}
-                          />
-                        </label>
-                        <MediaPickButton
-                          filterKind="image"
-                          onPick={(url) => setProfileForm((prev) => ({ ...prev, avatar_url: url }))}
+                        <UploadButton
+                          accept="image/*"
+                          label={t("sys.upload_img_btn")}
+                          onFile={(f) => void uploadImageAsset(f, (url) => setProfileForm((prev) => ({ ...prev, avatar_url: url })))}
                         />
+                        <MediaPickButton filterKind="image" onPick={(url) => setProfileForm((prev) => ({ ...prev, avatar_url: url }))} />
                       </div>
                     </div>
                   </div>
@@ -1392,17 +1423,28 @@ export function SystemWorkspace({
                       />
                     </div>
                     <div class="volo-field">
-                      <label>{t("sys.website_url")}</label>
+                      <label>{t("sys.lbl_user_email")}</label>
                       <input
                         class="volo-input"
-                        type="url"
-                        name="author_public_blog_url"
-                        autoComplete="url"
-                        placeholder="https://"
-                        value={profileForm.website_url}
-                        onInput={(e) => setProfileForm({ ...profileForm, website_url: (e.currentTarget as HTMLInputElement).value })}
+                        type="email"
+                        name="author_account_email"
+                        autoComplete="off"
+                        value={profileForm.email}
+                        onInput={(e) => setProfileForm({ ...profileForm, email: (e.currentTarget as HTMLInputElement).value })}
                       />
                     </div>
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.website_url")}</label>
+                    <input
+                      class="volo-input"
+                      type="url"
+                      name="author_public_blog_url"
+                      autoComplete="url"
+                      placeholder="https://"
+                      value={profileForm.website_url}
+                      onInput={(e) => setProfileForm({ ...profileForm, website_url: (e.currentTarget as HTMLInputElement).value })}
+                    />
                   </div>
                   <div class="volo-field">
                     <label>{t("sys.bio")}</label>
@@ -1416,12 +1458,17 @@ export function SystemWorkspace({
                   </div>
                   <div class="volo-grid-2">
                     <div class="volo-field">
-                      <label>{t("sys.cur_pwd")}</label>
+                      <label>
+                        {t("sys.cur_pwd")}
+                        {needsProfileReauth ? " *" : ""}
+                      </label>
                       <input
                         type="password"
                         class="volo-input"
+                        required={needsProfileReauth}
                         name="staff_old_passphrase"
                         autoComplete="new-password"
+                        placeholder={needsProfileReauth ? t("sys.reauth_pwd_ph") : ""}
                         value={profileForm.current_password}
                         onInput={(e) => setProfileForm({ ...profileForm, current_password: (e.currentTarget as HTMLInputElement).value })}
                       />
@@ -1454,9 +1501,9 @@ export function SystemWorkspace({
                     <p class="volo-sec-desc">{t("sys.totp_desc")}</p>
                   </div>
                 </div>
-                <div class="volo-subcard" style={{ marginTop: 0, marginBottom: 0 }}>
+                <div class="volo-subcard">
                   {meInfo?.totp_enabled ? (
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
+                    <div class="volo-input-row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
                       <span class="volo-status-pill ok">
                         <span class="volo-status-dot" />
                         {t("sys.totp_enabled")}
@@ -1464,14 +1511,9 @@ export function SystemWorkspace({
                       <button
                         type="button"
                         class="volo-act-btn danger"
-                        onClick={async () => {
-                          if (!window.confirm(t("sys.confirm_disable_totp"))) return;
-                          try {
-                            await apiFetch("/api/admin/security/totp", { method: "DELETE" });
-                            void loadSub();
-                          } catch (err: any) {
-                            showToast(err.message);
-                          }
+                        onClick={() => {
+                          setTotpDisablePwd("");
+                          setTotpDisableOpen(true);
                         }}
                       >
                         {t("sys.totp_disable")}
@@ -1529,7 +1571,7 @@ export function SystemWorkspace({
                       </div>
                     </div>
                   ) : (
-                    <div class="volo-form-actions no-border" style={{ marginTop: 0, paddingTop: 0 }}>
+                    <div class="volo-form-actions no-border">
                       <button
                         type="button"
                         class="volo-btn volo-btn-sm volo-btn-primary"
@@ -1550,22 +1592,68 @@ export function SystemWorkspace({
                     </div>
                   )}
                   {recoveryCodes && (
-                    <pre
-                      style={{
-                        background: "var(--volo-surface)",
-                        padding: "10px",
-                        borderRadius: "8px",
-                        fontSize: "12px",
-                        marginTop: "10px",
-                        whiteSpace: "pre-wrap",
-                      }}
-                    >
+                    <pre class="volo-subcard" style={{ fontSize: "12px", whiteSpace: "pre-wrap" }}>
                       {t("sys.recovery_codes_tip")}
                       {"\n"}
                       {recoveryCodes.join("   ")}
                     </pre>
                   )}
                 </div>
+
+                <AnimatedModal
+                  open={totpDisableOpen}
+                  onClose={() => setTotpDisableOpen(false)}
+                  title={t("sys.totp_disable")}
+                  subtitle={t("sys.confirm_disable_totp")}
+                  maxWidth="440px"
+                  footer={
+                    <>
+                      <button type="button" class="volo-btn" onClick={() => setTotpDisableOpen(false)}>
+                        {t("common.cancel")}
+                      </button>
+                      <button type="submit" form="volo-totp-disable-form" class="volo-btn volo-btn-danger">
+                        {t("sys.totp_disable")}
+                      </button>
+                    </>
+                  }
+                >
+                  <form
+                    id="volo-totp-disable-form"
+                    autoComplete="off"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      if (!totpDisablePwd.trim()) {
+                        showToast(t("sys.reauth_pwd_required"), "err");
+                        return;
+                      }
+                      try {
+                        await apiFetch("/api/admin/security/totp", {
+                          method: "DELETE",
+                          body: JSON.stringify({ current_password: totpDisablePwd }),
+                        });
+                        setTotpDisableOpen(false);
+                        setTotpDisablePwd("");
+                        showToast(t("common.saved"));
+                        void loadSub();
+                      } catch (err: any) {
+                        showToast(err.message);
+                      }
+                    }}
+                  >
+                    <div class="volo-field">
+                      <label>{t("sys.cur_pwd")} *</label>
+                      <input
+                        type="password"
+                        class="volo-input"
+                        required
+                        autoComplete="current-password"
+                        placeholder={t("sys.reauth_pwd_ph")}
+                        value={totpDisablePwd}
+                        onInput={(e) => setTotpDisablePwd((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                  </form>
+                </AnimatedModal>
               </div>
             </div>
           )}
@@ -1592,7 +1680,7 @@ export function SystemWorkspace({
                   </div>
 
                   <div class="volo-table-wrap">
-                    <table class="volo-table" style={{ minWidth: "100%" }}>
+                    <table class="volo-table">
                       <thead>
                         <tr>
                           <th>{t("sys.pk_col_device")}</th>
@@ -1601,25 +1689,26 @@ export function SystemWorkspace({
                         </tr>
                       </thead>
                       <tbody>
-                        {passkeys.length === 0 ? (
-                          <tr>
-                            <td colSpan={3} class="volo-empty-state">
-                              {t("tbl.empty")}
-                            </td>
-                          </tr>
+                        {loading ? (
+                          <TableSkeleton cols={3} rows={3} />
+                        ) : passkeys.length === 0 ? (
+                          <ConsoleEmpty colSpan={3} />
                         ) : (
                           passkeys.map((pk) => (
                             <tr key={pk.id}>
-                              <td>
+                              <td data-label={t("sys.pk_col_device")}>
                                 <div class="volo-cell-title">{pk.name}</div>
                               </td>
-                              <td class="col-date">{formatDateTime(pk.created_at)}</td>
-                              <td class="col-act">
+                              <td class="col-date" data-label={t("sys.col_created")}>
+                                {formatDateTime(pk.created_at)}
+                              </td>
+                              <td class="col-act" data-label={t("art.actions")}>
                                 <div class="volo-row-actions">
                                   <button
                                     type="button"
                                     class="volo-act-btn danger"
                                     onClick={async () => {
+                                      if (!(await openConfirm({ message: t("sys.confirm_del_pk", { name: pk.name }), danger: true }))) return;
                                       try {
                                         await apiFetch(`/api/admin/security/passkeys/${pk.id}`, { method: "DELETE" });
                                         void loadSub();
@@ -1661,21 +1750,8 @@ export function SystemWorkspace({
                   </div>
 
                   {issuedPAT && !patModalOpen && (
-                    <div
-                      class="volo-subcard"
-                      style={{
-                        marginTop: 0,
-                        background: "var(--volo-accent-soft)",
-                        wordBreak: "break-all",
-                        fontSize: "12px",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "10px",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <div style={{ flex: 1, minWidth: "200px" }}>
+                    <div class="volo-subcard volo-input-row" style={{ justifyContent: "space-between", flexWrap: "wrap", wordBreak: "break-all" }}>
+                      <div>
                         <strong>{t("sys.pat_copy_once")}</strong> <code>{issuedPAT}</code>
                       </div>
                       <button
@@ -1692,7 +1768,7 @@ export function SystemWorkspace({
                   )}
 
                   <div class="volo-table-wrap">
-                    <table class="volo-table" style={{ minWidth: "100%" }}>
+                    <table class="volo-table">
                       <thead>
                         <tr>
                           <th>{t("sys.pat_col_token")}</th>
@@ -1701,44 +1777,50 @@ export function SystemWorkspace({
                         </tr>
                       </thead>
                       <tbody>
-                        {tokens.length === 0 ? (
-                          <tr>
-                            <td colSpan={3} class="volo-empty-state">
-                              {t("tbl.empty")}
-                            </td>
-                          </tr>
+                        {loading ? (
+                          <TableSkeleton cols={3} rows={3} />
+                        ) : tokens.length === 0 ? (
+                          <ConsoleEmpty colSpan={3} />
                         ) : (
-                          tokens.map((tk) => (
-                            <tr key={tk.id}>
-                              <td>
-                                <div class="volo-cell-main">
-                                  <div class="volo-cell-title">{tk.name}</div>
-                                  <span class="volo-code-chip">{tk.token_prefix}…</span>
-                                </div>
-                              </td>
-                              <td>
-                                <span class="volo-help">{tk.scopes_json}</span>
-                              </td>
-                              <td class="col-act">
-                                <div class="volo-row-actions">
-                                  <button
-                                    type="button"
-                                    class="volo-act-btn danger"
-                                    onClick={async () => {
-                                      try {
-                                        await apiFetch(`/api/admin/security/tokens/${tk.id}`, { method: "DELETE" });
-                                        void loadSub();
-                                      } catch (err: any) {
-                                        showToast(err.message);
-                                      }
-                                    }}
-                                  >
-                                    {t("sys.pat_revoke")}
-                                  </button>
-                                </div>
-                              </td>
-                            </tr>
-                          ))
+                          tokens.map((tk) => {
+                            const scList = parseScopes(tk.scopes_json);
+                            return (
+                              <tr key={tk.id}>
+                                <td data-label={t("sys.pat_col_token")}>
+                                  <div class="volo-cell-main">
+                                    <div class="volo-cell-title">{tk.name}</div>
+                                    <span class="volo-code-chip">{tk.token_prefix}…</span>
+                                  </div>
+                                </td>
+                                <td data-label={t("sys.pat_col_scopes")}>
+                                  <div class="volo-cell-meta" style={{ flexWrap: "wrap", gap: "4px" }}>
+                                    {scList.length > 0 ? scList.map((sc) => (
+                                      <span key={sc} class="volo-mini-tag">{sc}</span>
+                                    )) : <span class="volo-help">—</span>}
+                                  </div>
+                                </td>
+                                <td class="col-act" data-label={t("art.actions")}>
+                                  <div class="volo-row-actions">
+                                    <button
+                                      type="button"
+                                      class="volo-act-btn danger"
+                                      onClick={async () => {
+                                        if (!(await openConfirm({ message: t("sys.confirm_revoke_pat", { name: tk.name }), danger: true }))) return;
+                                        try {
+                                          await apiFetch(`/api/admin/security/tokens/${tk.id}`, { method: "DELETE" });
+                                          void loadSub();
+                                        } catch (err: any) {
+                                          showToast(err.message);
+                                        }
+                                      }}
+                                    >
+                                      {t("sys.pat_revoke")}
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })
                         )}
                       </tbody>
                     </table>
@@ -1754,7 +1836,7 @@ export function SystemWorkspace({
                   </div>
                 </div>
                 <div class="volo-table-wrap">
-                  <table class="volo-table" style={{ minWidth: "100%" }}>
+                  <table class="volo-table">
                     <thead>
                       <tr>
                         <th>{t("sys.sess_col_device")}</th>
@@ -1762,20 +1844,21 @@ export function SystemWorkspace({
                       </tr>
                     </thead>
                     <tbody>
-                      {sessPaged.slice.length === 0 ? (
-                        <tr>
-                          <td colSpan={2} class="volo-empty-state">
-                            {t("tbl.empty")}
-                          </td>
-                        </tr>
+                      {loading ? (
+                        <TableSkeleton cols={2} rows={4} />
+                      ) : sessPaged.slice.length === 0 ? (
+                        <ConsoleEmpty colSpan={2} />
                       ) : (
                         sessPaged.slice.map((s) => (
                           <tr key={s.id}>
-                            <td>
+                            <td data-label={t("sys.sess_col_device")}>
                               <div class="volo-cell-main">
                                 <div class="volo-cell-title">
-                                  <span class="volo-code-chip">{s.client_ip}</span>
+                                  <span class="volo-code-chip">{s.client_ip || s.ip_masked}</span>
                                   {s.geo_region && <span class="volo-mini-tag">{s.geo_region}</span>}
+                                  <span class="volo-mini-tag" title={s.user_agent || ""}>
+                                    {summarizeUA(s.user_agent)}
+                                  </span>
                                   {s.id === meInfo?.session_id && (
                                     <span class="volo-status-pill ok">
                                       <span class="volo-status-dot" />
@@ -1784,18 +1867,18 @@ export function SystemWorkspace({
                                   )}
                                 </div>
                                 <div class="volo-cell-meta">
-                                  <span>{String(s.user_agent || "").slice(0, 72)}</span>
-                                  <span>{formatDateTime(s.last_seen_at)}</span>
+                                  <span title={s.user_agent || ""}>{formatDateTime(s.last_seen_at)}</span>
                                 </div>
                               </div>
                             </td>
-                            <td class="col-act">
+                            <td class="col-act" data-label={t("art.actions")}>
                               <div class="volo-row-actions">
                                 {s.id !== meInfo?.session_id && (
                                   <button
                                     type="button"
                                     class="volo-act-btn danger"
                                     onClick={async () => {
+                                      if (!(await openConfirm({ message: t("sys.confirm_kick_sess"), danger: true }))) return;
                                       try {
                                         await apiFetch(`/api/admin/security/sessions/${s.id}`, { method: "DELETE" });
                                         void loadSub();
@@ -1849,7 +1932,7 @@ export function SystemWorkspace({
                     void registerPasskey();
                   }}
                 >
-                  <div class="volo-field" style={{ marginBottom: 0 }}>
+                  <div class="volo-field">
                     <label>{t("sys.lbl_pk_name")}</label>
                     <input
                       class="volo-input"
@@ -1913,31 +1996,9 @@ export function SystemWorkspace({
                 }
               >
                 {issuedPAT ? (
-                  <div
-                    class="volo-subcard"
-                    style={{
-                      marginTop: 0,
-                      marginBottom: 0,
-                      background: "var(--volo-accent-soft)",
-                      wordBreak: "break-all",
-                    }}
-                  >
-                    <div style={{ fontWeight: 650, fontSize: "13px", marginBottom: "8px" }}>
-                      {t("sys.pat_copy_once")}
-                    </div>
-                    <code
-                      style={{
-                        display: "block",
-                        padding: "10px 12px",
-                        borderRadius: "8px",
-                        background: "var(--volo-surface)",
-                        border: "1px solid var(--volo-line)",
-                        fontSize: "12.5px",
-                        userSelect: "all",
-                      }}
-                    >
-                      {issuedPAT}
-                    </code>
+                  <div class="volo-subcard" style={{ wordBreak: "break-all" }}>
+                    <div class="volo-subcard-title">{t("sys.pat_copy_once")}</div>
+                    <code style={{ display: "block", userSelect: "all" }}>{issuedPAT}</code>
                   </div>
                 ) : (
                   <form
@@ -1968,21 +2029,16 @@ export function SystemWorkspace({
                         onInput={(e) => setPatName((e.currentTarget as HTMLInputElement).value)}
                       />
                     </div>
-                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                    <div class="volo-field">
                       <label>{t("sys.lbl_pat_scopes")}</label>
-                      <div class="volo-check-grid" style={{ marginBottom: 0 }}>
+                      <div class="volo-check-grid">
                         {PAT_SCOPES.map((sc) => (
-                          <label key={sc} class="volo-check-item">
-                            <input
-                              type="checkbox"
-                              checked={patScopes.includes(sc)}
-                              onChange={(e) => {
-                                const on = (e.currentTarget as HTMLInputElement).checked;
-                                setPatScopes(on ? [...patScopes, sc] : patScopes.filter((x) => x !== sc));
-                              }}
-                            />
-                            <span>{sc}</span>
-                          </label>
+                          <SwitchToggle
+                            key={sc}
+                            checked={patScopes.includes(sc)}
+                            onChange={(on) => setPatScopes(on ? [...patScopes, sc] : patScopes.filter((x) => x !== sc))}
+                            label={sc}
+                          />
                         ))}
                       </div>
                     </div>
@@ -2039,8 +2095,7 @@ export function SystemWorkspace({
             </div>
             <div class="volo-filter-controls">
               <input
-                class="volo-input"
-                style={{ width: "220px" }}
+                class="volo-input volo-search-input"
                 name="users_search_filter"
                 autoComplete="off"
                 placeholder={t("sys.user_search_ph")}
@@ -2065,18 +2120,16 @@ export function SystemWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {usersPaged.slice.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} class="volo-empty-state">
-                      {t("tbl.empty")}
-                    </td>
-                  </tr>
+                {loading ? (
+                  <TableSkeleton cols={5} rows={4} />
+                ) : usersPaged.slice.length === 0 ? (
+                  <ConsoleEmpty colSpan={5} />
                 ) : (
                   usersPaged.slice.map((u) => {
                     const isSelf = u.id === currentUserSig.value?.id;
                     return (
                       <tr key={u.id}>
-                        <td class="col-fluid">
+                        <td class="col-fluid" data-label={t("sys.col_user")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
                               <span>{u.display_name || u.username}</span>
@@ -2089,7 +2142,7 @@ export function SystemWorkspace({
                             )}
                           </div>
                         </td>
-                        <td class="col-cat" style={{ minWidth: "150px" }}>
+                        <td class="col-cat" data-label={t("sys.col_role")}>
                           {isSelf ? (
                             <span class="volo-cat-chip">{renderRoleLabel(u.role)}</span>
                           ) : (
@@ -2115,14 +2168,16 @@ export function SystemWorkspace({
                             />
                           )}
                         </td>
-                        <td class="col-status">
+                        <td class="col-status" data-label={t("art.status")}>
                           <span class={`volo-status-pill ${u.status === "active" ? "ok" : "warn"}`}>
                             <span class="volo-status-dot" />
                             {u.status === "active" ? t("tbl.status_active") : t("tbl.status_disabled")}
                           </span>
                         </td>
-                        <td class="col-date">{formatDateTime(u.created_at)}</td>
-                        <td class="col-act">
+                        <td class="col-date" data-label={t("sys.col_created")}>
+                          {formatDateTime(u.created_at)}
+                        </td>
+                        <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
                             <button
                               type="button"
@@ -2148,8 +2203,14 @@ export function SystemWorkspace({
                                   type="button"
                                   class="volo-act-btn"
                                   onClick={async () => {
+                                    const nextSt = u.status === "active" ? "disabled" : "active";
+                                    if (
+                                      nextSt === "disabled" &&
+                                      !(await openConfirm({ message: t("sys.confirm_disable_user", { name: u.username }), danger: true }))
+                                    ) {
+                                      return;
+                                    }
                                     try {
-                                      const nextSt = u.status === "active" ? "disabled" : "active";
                                       await apiFetch(`/api/admin/users/${u.id}`, {
                                         method: "PATCH",
                                         body: JSON.stringify({ status: nextSt }),
@@ -2166,7 +2227,7 @@ export function SystemWorkspace({
                                   type="button"
                                   class="volo-act-btn danger"
                                   onClick={async () => {
-                                    if (!window.confirm(t("sys.confirm_del_user", { name: u.username }))) return;
+                                    if (!(await openConfirm({ message: t("sys.confirm_del_user", { name: u.username }), danger: true }))) return;
                                     try {
                                       await apiFetch(`/api/admin/users/${u.id}`, { method: "DELETE" });
                                       void loadSub();
@@ -2228,16 +2289,12 @@ export function SystemWorkspace({
                       role: userForm.role,
                       status: userForm.status,
                     };
-                    if (userForm.password.trim()) {
-                      body.password = userForm.password;
-                    }
+                    if (userForm.password.trim()) body.password = userForm.password;
                     await apiFetch(`/api/admin/users/${editingUserId}`, {
                       method: "PATCH",
                       body: JSON.stringify(body),
                     });
-                    if (isSelfEdit) {
-                      await refreshMe();
-                    }
+                    if (isSelfEdit) await refreshMe();
                   } else {
                     await apiFetch("/api/admin/users", {
                       method: "POST",
@@ -2342,7 +2399,7 @@ export function SystemWorkspace({
                 </div>
               )}
 
-              <div class="volo-field" style={{ marginBottom: 0 }}>
+              <div class="volo-field">
                 <label>{editingUserId ? t("sys.lbl_user_pwd_reset") : t("sys.lbl_user_pwd")}</label>
                 <input
                   type="password"
@@ -2411,7 +2468,7 @@ export function SystemWorkspace({
                   <p class="volo-sec-desc">{t("sys.sec_policy_desc")}</p>
                 </div>
               </div>
-              <div class="volo-grid-3">
+              <div class="volo-auto-grid">
                 <div class="volo-field">
                   <label>{t("sys.waf_window_sec")}</label>
                   <input
@@ -2455,36 +2512,28 @@ export function SystemWorkspace({
                 />
               </div>
               <div class="volo-check-grid">
-                <label class="volo-check-item">
-                  <input
-                    type="checkbox"
-                    checked={domains.security?.risk_control_enabled !== false}
-                    onChange={(e) => setDomField("security", "risk_control_enabled", (e.currentTarget as HTMLInputElement).checked)}
-                  />
-                  <span>{t("sys.risk_on")}</span>
-                </label>
-                <label class="volo-check-item">
-                  <input
-                    type="checkbox"
-                    checked={domains.security?.waf_enabled !== false}
-                    onChange={(e) => setDomField("security", "waf_enabled", (e.currentTarget as HTMLInputElement).checked)}
-                  />
-                  <span>{t("sys.waf_on")}</span>
-                </label>
-                <label class="volo-check-item">
-                  <input
-                    type="checkbox"
-                    checked={!!domains.security?.geo_policy_active}
-                    onChange={(e) => setDomField("security", "geo_policy_active", (e.currentTarget as HTMLInputElement).checked)}
-                  />
-                  <span>{t("sys.geo_policy_on")}</span>
-                </label>
+                <SwitchToggle
+                  checked={domains.security?.risk_control_enabled !== false}
+                  onChange={(v) => setDomField("security", "risk_control_enabled", v)}
+                  label={t("sys.risk_on")}
+                />
+                <SwitchToggle
+                  checked={domains.security?.waf_enabled !== false}
+                  onChange={(v) => setDomField("security", "waf_enabled", v)}
+                  label={t("sys.waf_on")}
+                />
+                <SwitchToggle
+                  checked={!!domains.security?.geo_policy_active}
+                  onChange={(v) => setDomField("security", "geo_policy_active", v)}
+                  label={t("sys.geo_policy_on")}
+                />
               </div>
               <div class="volo-form-actions">
                 <button
                   type="button"
                   class="volo-btn"
                   onClick={async () => {
+                    if (!(await openConfirm({ message: t("sys.confirm_rotate_share"), danger: true }))) return;
                     try {
                       await apiFetch("/api/admin/security/rotate-share-secret", { method: "POST", body: "{}" });
                       showToast(t("sys.share_rotated"));
@@ -2522,7 +2571,7 @@ export function SystemWorkspace({
               </div>
 
               <div class="volo-table-wrap">
-                <table class="volo-table" style={{ minWidth: "100%" }}>
+                <table class="volo-table">
                   <thead>
                     <tr>
                       <th>{t("tbl.col_cidr")}</th>
@@ -2531,30 +2580,29 @@ export function SystemWorkspace({
                     </tr>
                   </thead>
                   <tbody>
-                    {bansPaged.slice.length === 0 ? (
-                      <tr>
-                        <td colSpan={3} class="volo-empty-state">
-                          {t("tbl.empty")}
-                        </td>
-                      </tr>
+                    {loading ? (
+                      <TableSkeleton cols={3} rows={4} />
+                    ) : bansPaged.slice.length === 0 ? (
+                      <ConsoleEmpty colSpan={3} />
                     ) : (
                       bansPaged.slice.map((b) => (
                         <tr key={b.id}>
-                          <td>
+                          <td data-label={t("tbl.col_cidr")}>
                             <span class="volo-code-chip">{b.cidr}</span>
                           </td>
-                          <td>
+                          <td data-label={t("tbl.col_note")}>
                             <div class="volo-cell-meta">
                               <span>{b.note || b.reason || "—"}</span>
                               <span>{b.expires_at > 0 ? formatDateTime(b.expires_at) : t("sys.waf_dur_perm")}</span>
                             </div>
                           </td>
-                          <td class="col-act">
+                          <td class="col-act" data-label={t("art.actions")}>
                             <div class="volo-row-actions">
                               <button
                                 type="button"
-                                class="volo-act-btn"
+                                class="volo-act-btn danger"
                                 onClick={async () => {
+                                  if (!(await openConfirm({ message: t("sys.confirm_unban_ip", { cidr: b.cidr }), danger: true }))) return;
                                   try {
                                     await apiFetch(`/api/admin/security/ip-bans/${b.id}`, { method: "DELETE" });
                                     void loadSub();
@@ -2646,7 +2694,7 @@ export function SystemWorkspace({
                       onChange={(v) => setBanForm({ ...banForm, expires_hours: Number(v) })}
                     />
                   </div>
-                  <div class="volo-field" style={{ marginBottom: 0 }}>
+                  <div class="volo-field">
                     <label>{t("sys.lbl_ban_reason")}</label>
                     <input
                       class="volo-input"
@@ -2689,12 +2737,12 @@ export function SystemWorkspace({
                 </button>
               </div>
               {!geoCircuitEnabled && (
-                <div class="volo-subcard" style={{ marginTop: 0, fontSize: "12.5px", color: "var(--volo-warn)" }}>
+                <div class="volo-subcard" style={{ color: "var(--volo-warn)" }}>
                   {t("sys.geo_circuit_off")}
                 </div>
               )}
               <div class="volo-table-wrap">
-                <table class="volo-table" style={{ minWidth: "100%" }}>
+                <table class="volo-table">
                   <thead>
                     <tr>
                       <th>{t("art.status")}</th>
@@ -2704,38 +2752,35 @@ export function SystemWorkspace({
                     </tr>
                   </thead>
                   <tbody>
-                    {geoPaged.slice.length === 0 ? (
-                      <tr>
-                        <td colSpan={4} class="volo-empty-state">
-                          {t("tbl.empty")}
-                        </td>
-                      </tr>
+                    {loading ? (
+                      <TableSkeleton cols={4} rows={4} />
+                    ) : geoPaged.slice.length === 0 ? (
+                      <ConsoleEmpty colSpan={4} />
                     ) : (
                       geoPaged.slice.map((g) => (
                         <tr key={g.id}>
-                          <td>
-                            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                          <td data-label={t("art.status")}>
+                            <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
                               <span class={`volo-status-pill ${g.action === "deny" ? "danger" : "ok"}`}>
                                 <span class="volo-status-dot" />
                                 {g.action === "deny" ? t("sys.geo_deny") : t("sys.geo_allow")}
                               </span>
-                              {g.is_enabled === false && (
-                                <span class="volo-mini-tag warn">{t("tbl.status_disabled")}</span>
-                              )}
+                              {g.on_miss && g.on_miss !== "next" && <span class="volo-mini-tag">miss:{g.on_miss}</span>}
+                              {g.is_enabled === false && <span class="volo-mini-tag warn">{t("tbl.status_disabled")}</span>}
                             </div>
                           </td>
-                          <td>
+                          <td data-label={t("tbl.col_scope")}>
                             <span class="volo-code-chip">
                               ISO={g.countries || "*"} · {g.regions || "*"}
                             </span>
                           </td>
-                          <td>
+                          <td data-label={t("tbl.col_note")}>
                             <div class="volo-cell-meta">
                               <span>{g.name || "—"}</span>
                               {typeof g.sort_order === "number" && <span class="volo-code-chip">#{g.sort_order}</span>}
                             </div>
                           </td>
-                          <td class="col-act">
+                          <td class="col-act" data-label={t("art.actions")}>
                             <div class="volo-row-actions">
                               <button
                                 type="button"
@@ -2760,6 +2805,14 @@ export function SystemWorkspace({
                                 type="button"
                                 class="volo-act-btn danger"
                                 onClick={async () => {
+                                  if (
+                                    !(await openConfirm({
+                                      message: t("sys.confirm_del_geo", { name: g.name || g.countries || "*" }),
+                                      danger: true,
+                                    }))
+                                  ) {
+                                    return;
+                                  }
                                   try {
                                     await apiFetch(`/api/admin/security/geo-rules/${g.id}`, { method: "DELETE" });
                                     void loadSub();
@@ -2829,7 +2882,7 @@ export function SystemWorkspace({
                     }
                   }}
                 >
-                  <div class="volo-grid-2">
+                  <div class="volo-auto-grid">
                     <div class="volo-field">
                       <label>{t("sys.lbl_geo_mode")}</label>
                       <ConsoleSelect
@@ -2839,6 +2892,14 @@ export function SystemWorkspace({
                           { value: "allow", label: t("sys.geo_allow") },
                         ]}
                         onChange={(v) => setGeoForm({ ...geoForm, action: v })}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.lbl_geo_on_miss")}</label>
+                      <ConsoleSelect
+                        value={geoForm.on_miss}
+                        options={geoMissOptions}
+                        onChange={(v) => setGeoForm({ ...geoForm, on_miss: v })}
                       />
                     </div>
                     <div class="volo-field">
@@ -2885,14 +2946,11 @@ export function SystemWorkspace({
                       />
                     </div>
                   </div>
-                  <label class="volo-check-item" style={{ marginBottom: 0 }}>
-                    <input
-                      type="checkbox"
-                      checked={geoForm.is_enabled}
-                      onChange={(e) => setGeoForm({ ...geoForm, is_enabled: (e.currentTarget as HTMLInputElement).checked })}
-                    />
-                    <span>{t("sys.geo_rule_enabled")}</span>
-                  </label>
+                  <SwitchToggle
+                    checked={geoForm.is_enabled}
+                    onChange={(v) => setGeoForm({ ...geoForm, is_enabled: v })}
+                    label={t("sys.geo_rule_enabled")}
+                  />
                 </form>
               </AnimatedModal>
             </div>
@@ -2911,64 +2969,28 @@ export function SystemWorkspace({
                 </div>
               </div>
 
-              <div class="volo-subcard" style={{ marginTop: 0, marginBottom: 0 }}>
-                <div class="volo-check-grid" style={{ marginTop: 0, marginBottom: 0 }}>
-                  <label class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={includeMediaExport}
-                      onChange={(e) => setIncludeMediaExport((e.currentTarget as HTMLInputElement).checked)}
-                    />
-                    <span>{t("sys.backup_with_media")}</span>
-                  </label>
-                  <label class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={dryRunRestore}
-                      onChange={(e) => setDryRunRestore((e.currentTarget as HTMLInputElement).checked)}
-                    />
-                    <span>{t("sys.backup_dry_run")}</span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="volo-form-actions">
-                <label class="volo-btn" style={{ cursor: "pointer" }}>
-                  {t("sys.backup_legacy")}
-                  <input
-                    type="file"
-                    accept=".zip,.json"
-                    style={{ display: "none" }}
-                    onChange={async (e) => {
-                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                      if (!f) return;
-                      try {
-                        const fd = new FormData();
-                        fd.append("file", f);
-                        await apiFetch("/api/admin/backup/import-legacy", { method: "POST", body: fd });
-                        showToast(t("setup.legacy_done"));
-                        void loadSub();
-                      } catch (err: any) {
-                        showToast(err.message);
-                      }
-                      (e.currentTarget as HTMLInputElement).value = "";
-                    }}
+              <div class="volo-subcard">
+                <div class="volo-check-grid">
+                  <SwitchToggle
+                    checked={includeMediaExport}
+                    onChange={setIncludeMediaExport}
+                    label={t("sys.backup_with_media")}
                   />
-                </label>
-
-                <label class="volo-btn" style={{ cursor: "pointer" }}>
-                  {t("sys.backup_restore")}
-                  <input
-                    type="file"
+                  <SwitchToggle
+                    checked={dryRunRestore}
+                    onChange={setDryRunRestore}
+                    label={t("sys.backup_dry_run")}
+                  />
+                </div>
+                <div class="volo-form-actions">
+                  <UploadButton
                     accept=".zip,.json"
-                    style={{ display: "none" }}
-                    onChange={async (e) => {
-                      const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                      if (!f) return;
-                      if (!dryRunRestore && !window.confirm(t("sys.confirm_restore"))) {
-                        (e.currentTarget as HTMLInputElement).value = "";
-                        return;
-                      }
+                    small={false}
+                    busy={restoreBusy}
+                    label={t("sys.backup_restore")}
+                    onFile={async (f) => {
+                      if (!dryRunRestore && !(await openConfirm({ message: t("sys.confirm_restore"), danger: true }))) return;
+                      setRestoreBusy(true);
                       try {
                         const fd = new FormData();
                         fd.append("file", f);
@@ -2978,36 +3000,129 @@ export function SystemWorkspace({
                         void loadSub();
                       } catch (err: any) {
                         showToast(err.message);
+                      } finally {
+                        setRestoreBusy(false);
                       }
-                      (e.currentTarget as HTMLInputElement).value = "";
                     }}
                   />
-                </label>
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-primary"
+                    onClick={async () => {
+                      const csrf = csrfTokenSig.value || (await apiFetch<any>("/api/admin/me")).csrf_token;
+                      const res = await fetch(`/api/admin/backup/export?media=${includeMediaExport ? 1 : 0}`, {
+                        method: "POST",
+                        headers: { "X-CSRF-Token": csrf },
+                        credentials: "same-origin",
+                      });
+                      if (!res.ok) {
+                        showToast(t("sys.backup_export_err"), "err");
+                        return;
+                      }
+                      const blob = await res.blob();
+                      const a = document.createElement("a");
+                      a.href = URL.createObjectURL(blob);
+                      a.download = `volo-backup-${Date.now()}.zip`;
+                      a.click();
+                      URL.revokeObjectURL(a.href);
+                    }}
+                  >
+                    {t("sys.backup_export")}
+                  </button>
+                </div>
+              </div>
 
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-primary"
-                  onClick={async () => {
-                    const csrf = csrfTokenSig.value || (await apiFetch<any>("/api/admin/me")).csrf_token;
-                    const res = await fetch(`/api/admin/backup/export?media=${includeMediaExport ? 1 : 0}`, {
-                      method: "POST",
-                      headers: { "X-CSRF-Token": csrf },
-                      credentials: "same-origin",
-                    });
-                    if (!res.ok) {
-                      showToast(t("sys.backup_export_err"));
-                      return;
-                    }
-                    const blob = await res.blob();
-                    const a = document.createElement("a");
-                    a.href = URL.createObjectURL(blob);
-                    a.download = `volo-backup-${Date.now()}.zip`;
-                    a.click();
-                    URL.revokeObjectURL(a.href);
-                  }}
-                >
-                  {t("sys.backup_export")}
-                </button>
+              <div class="volo-subcard">
+                <div class="volo-subcard-title">{t("sys.backup_legacy")}</div>
+                <div class="volo-check-grid">
+                  <SwitchToggle
+                    checked={legacyDryRun}
+                    onChange={setLegacyDryRun}
+                    label={t("sys.import_dryrun_lbl")}
+                  />
+                </div>
+                <div class="volo-form-actions no-border">
+                  <UploadButton
+                    accept=".zip,.json"
+                    small={false}
+                    busy={legacyBusy}
+                    busyLabel={t("setup.importing")}
+                    label={t("sys.backup_legacy")}
+                    onFile={async (f) => {
+                      if (!legacyDryRun && !(await openConfirm({ message: t("sys.confirm_import_legacy"), danger: true }))) return;
+                      setLegacyBusy(true);
+                      try {
+                        const fd = new FormData();
+                        fd.append("file", f);
+                        fd.append("dry_run", legacyDryRun ? "1" : "0");
+                        const res = await apiFetch<{ report?: any; dry_run?: boolean }>(
+                          `/api/admin/backup/import-legacy${legacyDryRun ? "?dry_run=1" : ""}`,
+                          { method: "POST", body: fd },
+                        );
+                        setLegacyReport(res.report || res);
+                        showToast(legacyDryRun ? t("sys.import_dryrun_ok") : t("setup.legacy_done"), "ok");
+                        if (!legacyDryRun) void loadSub();
+                      } catch (err: any) {
+                        showToast(err.message);
+                      } finally {
+                        setLegacyBusy(false);
+                      }
+                    }}
+                  />
+                </div>
+
+                {legacyReport && (
+                  <div class="volo-subcard">
+                    <div class="volo-input-row" style={{ justifyContent: "space-between", marginBottom: "8px", flexWrap: "wrap" }}>
+                      <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
+                        <span class={`volo-status-pill ${legacyReport.dry_run ? "warn" : "ok"}`}>
+                          <span class="volo-status-dot" />
+                          {legacyReport.dry_run ? t("sys.legacy_preview_badge") : t("setup.legacy_done")}
+                        </span>
+                        {legacyReport.source_version && <span class="volo-code-chip">v:{legacyReport.source_version}</span>}
+                      </div>
+                      <button type="button" class="volo-act-btn" onClick={() => setLegacyReport(null)}>
+                        {t("common.close")}
+                      </button>
+                    </div>
+                    <div class="volo-cell-meta" style={{ flexWrap: "wrap", gap: "6px" }}>
+                      {(
+                        [
+                          ["articles", legacyReport.articles],
+                          ["revisions", legacyReport.revisions],
+                          ["categories", legacyReport.categories],
+                          ["tags", legacyReport.tags],
+                          ["comments", legacyReport.comments],
+                          ["links", legacyReport.links],
+                          ["follows", legacyReport.follows],
+                          ["series", legacyReport.series],
+                          ["books", legacyReport.books],
+                          ["nav_items", legacyReport.nav_items],
+                          ["redirects", legacyReport.redirects_created],
+                          ["users", legacyReport.users],
+                        ] as Array<[string, number | undefined]>
+                      )
+                        .filter(([, n]) => typeof n === "number")
+                        .map(([k, n]) => (
+                          <span key={k} class="volo-mini-tag">
+                            {k}: {n}
+                          </span>
+                        ))}
+                    </div>
+                    {Array.isArray(legacyReport.category_conflicts) && legacyReport.category_conflicts.length > 0 && (
+                      <div class="volo-help" style={{ marginTop: "6px" }}>
+                        <strong>Conflicts ({legacyReport.category_conflicts.length}):</strong>{" "}
+                        {legacyReport.category_conflicts.slice(0, 10).join("; ")}
+                      </div>
+                    )}
+                    {Array.isArray(legacyReport.warnings) && legacyReport.warnings.length > 0 && (
+                      <div class="volo-help" style={{ marginTop: "6px", color: "var(--volo-warn)" }}>
+                        <strong>Warnings ({legacyReport.warnings.length}):</strong>{" "}
+                        {legacyReport.warnings.slice(0, 10).join("; ")}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -3031,7 +3146,7 @@ export function SystemWorkspace({
                     <p class="volo-sec-desc">{t("sys.auto_bak_desc")}</p>
                   </div>
                 </div>
-                <div class="volo-grid-3">
+                <div class="volo-auto-grid">
                   <div class="volo-field">
                     <label>{t("sys.auto_interval_h")}</label>
                     <input
@@ -3063,30 +3178,21 @@ export function SystemWorkspace({
                   </div>
                 </div>
                 <div class="volo-check-grid">
-                  <label class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={!!domains.backup?.local_auto_enabled}
-                      onChange={(e) => setDomField("backup", "local_auto_enabled", (e.currentTarget as HTMLInputElement).checked)}
-                    />
-                    <span>{t("sys.auto_local_on")}</span>
-                  </label>
-                  <label class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={!!domains.backup?.include_media_in_auto}
-                      onChange={(e) => setDomField("backup", "include_media_in_auto", (e.currentTarget as HTMLInputElement).checked)}
-                    />
-                    <span>{t("sys.auto_media_on")}</span>
-                  </label>
-                  <label class="volo-check-item">
-                    <input
-                      type="checkbox"
-                      checked={!!domains.backup?.remote_enabled}
-                      onChange={(e) => setDomField("backup", "remote_enabled", (e.currentTarget as HTMLInputElement).checked)}
-                    />
-                    <span>{t("sys.remote_bak_on")}</span>
-                  </label>
+                  <SwitchToggle
+                    checked={!!domains.backup?.local_auto_enabled}
+                    onChange={(v) => setDomField("backup", "local_auto_enabled", v)}
+                    label={t("sys.auto_local_on")}
+                  />
+                  <SwitchToggle
+                    checked={!!domains.backup?.include_media_in_auto}
+                    onChange={(v) => setDomField("backup", "include_media_in_auto", v)}
+                    label={t("sys.auto_media_on")}
+                  />
+                  <SwitchToggle
+                    checked={!!domains.backup?.remote_enabled}
+                    onChange={(v) => setDomField("backup", "remote_enabled", v)}
+                    label={t("sys.remote_bak_on")}
+                  />
                 </div>
 
                 {domains.backup?.remote_protocol === "webdav" ? (
@@ -3116,7 +3222,7 @@ export function SystemWorkspace({
                       </div>
                     </div>
                     <div class="volo-grid-2">
-                      <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <div class="volo-field">
                         <label>{t("sys.lbl_webdav_user")}</label>
                         <input
                           class="volo-input"
@@ -3127,7 +3233,7 @@ export function SystemWorkspace({
                           onInput={(e) => setDomField("backup", "webdav_user", (e.currentTarget as HTMLInputElement).value)}
                         />
                       </div>
-                      <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <div class="volo-field">
                         <label>
                           {t("sys.lbl_webdav_pwd")}{" "}
                           {domains.backup?.webdav_password_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
@@ -3171,7 +3277,7 @@ export function SystemWorkspace({
                       </div>
                     </div>
                     <div class="volo-grid-2">
-                      <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <div class="volo-field">
                         <label>{t("sys.lbl_s3_ak")}</label>
                         <input
                           class="volo-input"
@@ -3182,7 +3288,7 @@ export function SystemWorkspace({
                           onInput={(e) => setDomField("backup", "s3_access_key", (e.currentTarget as HTMLInputElement).value)}
                         />
                       </div>
-                      <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <div class="volo-field">
                         <label>
                           {t("sys.lbl_s3_sk")}{" "}
                           {domains.backup?.s3_secret_key_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
@@ -3229,12 +3335,13 @@ export function SystemWorkspace({
                       remote_warning?: string;
                       items?: Array<{ name: string; size_bytes: number; created_at: number }>;
                     }>("/api/admin/backup/local", { method: "POST", body: "{}" });
-                    if (Array.isArray(res.items)) {
-                      setLocalBackups(res.items);
+                    if (Array.isArray(res.items)) setLocalBackups(res.items);
+                    else void loadSub();
+                    if (res.remote_warning) {
+                      showToast(res.remote_warning, "warn");
                     } else {
-                      void loadSub();
+                      showToast(t("sys.bak_local_created", { name: res.file || "snapshot.zip" }));
                     }
-                    showToast(t("sys.bak_local_created", { name: res.file || "snapshot.zip" }));
                   } catch (err: any) {
                     showToast(err.message);
                   } finally {
@@ -3256,23 +3363,23 @@ export function SystemWorkspace({
                   </tr>
                 </thead>
                 <tbody>
-                  {localBakPaged.slice.length === 0 ? (
-                    <tr>
-                      <td colSpan={4} class="volo-empty-state">
-                        {t("tbl.empty")}
-                      </td>
-                    </tr>
+                  {loading ? (
+                    <TableSkeleton cols={4} rows={3} />
+                  ) : localBakPaged.slice.length === 0 ? (
+                    <ConsoleEmpty colSpan={4} />
                   ) : (
                     localBakPaged.slice.map((b) => (
                       <tr key={b.name}>
-                        <td class="col-fluid">
+                        <td class="col-fluid" data-label={t("sys.bak_col_file")}>
                           <span class="volo-code-chip">{b.name}</span>
                         </td>
-                        <td class="col-cat">
+                        <td class="col-cat" data-label={t("cnt.media_col_size")}>
                           <span class="volo-help">{formatBytes(b.size_bytes)}</span>
                         </td>
-                        <td class="col-date">{formatDateTime(b.created_at)}</td>
-                        <td class="col-act">
+                        <td class="col-date" data-label={t("sys.col_created")}>
+                          {formatDateTime(b.created_at)}
+                        </td>
+                        <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
                             <a
                               class="volo-act-btn"
@@ -3283,17 +3390,34 @@ export function SystemWorkspace({
                             </a>
                             <button
                               type="button"
+                              class="volo-act-btn"
+                              onClick={async () => {
+                                if (!(await openConfirm({ message: t("sys.confirm_restore_snap", { name: b.name }), danger: true }))) return;
+                                try {
+                                  await apiFetch(`/api/admin/backup/local/${encodeURIComponent(b.name)}/restore`, {
+                                    method: "POST",
+                                    body: "{}",
+                                  });
+                                  showToast(t("sys.backup_restored"));
+                                  void loadSub();
+                                } catch (err: any) {
+                                  showToast(err.message);
+                                }
+                              }}
+                            >
+                              {t("sys.bak_restore_btn")}
+                            </button>
+                            <button
+                              type="button"
                               class="volo-act-btn danger"
                               onClick={async () => {
+                                if (!(await openConfirm({ message: t("sys.confirm_del_snap", { name: b.name }), danger: true }))) return;
                                 try {
                                   const res = await apiFetch<{
                                     items?: Array<{ name: string; size_bytes: number; created_at: number }>;
                                   }>(`/api/admin/backup/local/${encodeURIComponent(b.name)}`, { method: "DELETE" });
-                                  if (Array.isArray(res.items)) {
-                                    setLocalBackups(res.items);
-                                  } else {
-                                    void loadSub();
-                                  }
+                                  if (Array.isArray(res.items)) setLocalBackups(res.items);
+                                  else void loadSub();
                                   showToast(t("common.deleted"));
                                 } catch (err: any) {
                                   showToast(err.message);
@@ -3327,14 +3451,14 @@ export function SystemWorkspace({
                 <h3 class="volo-card-title">{t("sys.doctor_head")}</h3>
                 <p class="volo-sec-desc">{t("sys.doctor_desc")}</p>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
                 {doctorReport && (
                   <span class={`volo-status-pill ${doctorReport.healthy ? "ok" : "danger"}`}>
                     <span class="volo-status-dot" />
                     {doctorReport.healthy ? t("sys.doctor_healthy") : t("sys.doctor_issues")}
                   </span>
                 )}
-                <button type="button" class="volo-btn volo-btn-sm" onClick={() => loadSub()}>
+                <button type="button" class="volo-btn volo-btn-sm" onClick={() => void loadSub()}>
                   {t("common.refresh")}
                 </button>
               </div>
@@ -3350,28 +3474,24 @@ export function SystemWorkspace({
                 </thead>
                 <tbody>
                   {!doctorReport ? (
-                    <tr>
-                      <td colSpan={3} class="volo-empty-state">
-                        {t("sys.doctor_loading")}
-                      </td>
-                    </tr>
+                    <TableSkeleton cols={3} rows={4} />
+                  ) : (doctorReport.checks || []).length === 0 ? (
+                    <ConsoleEmpty colSpan={3} />
                   ) : (
                     (doctorReport.checks || []).map((chk: any) => (
                       <tr key={chk.name}>
-                        <td class="col-cat">
+                        <td class="col-cat" data-label={t("sys.doctor_col_check")}>
                           <span class="volo-code-chip">{chk.name}</span>
                         </td>
-                        <td class="col-status">
+                        <td class="col-status" data-label={t("art.status")}>
                           <span class={`volo-status-pill ${chk.status === "ok" ? "ok" : chk.status === "warn" ? "warn" : "danger"}`}>
                             <span class="volo-status-dot" />
                             {String(chk.status || "ok").toUpperCase()}
                           </span>
                         </td>
-                        <td class="col-fluid">
+                        <td class="col-fluid" data-label={t("sys.doctor_col_summary")}>
                           <div class="volo-cell-main">
-                            <div class="volo-cell-title" style={{ fontWeight: 550 }}>
-                              {chk.summary}
-                            </div>
+                            <div class="volo-cell-title">{chk.summary}</div>
                             {chk.detail && (
                               <div class="volo-cell-meta">
                                 <span>{chk.detail}</span>
@@ -3396,10 +3516,40 @@ export function SystemWorkspace({
               <h3 class="volo-card-title">{t("sys.audit")}</h3>
               <p class="volo-sec-desc">{t("sys.audit_desc")}</p>
             </div>
-            <button type="button" class="volo-btn volo-btn-sm" onClick={() => loadSub()}>
+            <button type="button" class="volo-btn volo-btn-sm" onClick={() => void loadAuditLogs()}>
               {t("common.refresh")}
             </button>
           </div>
+
+          <div class="volo-filter-bar">
+            <div class="volo-filter-controls">
+              <ConsoleSelect
+                value={auditAction}
+                options={auditActionOptions}
+                onChange={(v) => {
+                  setAuditAction(v);
+                  setAuditPage(1);
+                  void loadAuditLogs(auditQuery, v);
+                }}
+              />
+              <input
+                class="volo-input volo-search-input"
+                name="audit_search_filter"
+                autoComplete="off"
+                placeholder={t("sys.audit_search_ph")}
+                value={auditQuery}
+                onInput={(e) => {
+                  const nextQ = (e.currentTarget as HTMLInputElement).value;
+                  setAuditQuery(nextQ);
+                  setAuditPage(1);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void loadAuditLogs(auditQuery, auditAction);
+                }}
+              />
+            </div>
+          </div>
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -3411,38 +3561,56 @@ export function SystemWorkspace({
                 </tr>
               </thead>
               <tbody>
-                {auditPaged.slice.length === 0 ? (
-                  <tr>
-                    <td colSpan={4} class="volo-empty-state">
-                      {t("tbl.empty")}
-                    </td>
-                  </tr>
+                {loading ? (
+                  <TableSkeleton cols={4} rows={5} />
+                ) : auditPaged.slice.length === 0 ? (
+                  <ConsoleEmpty colSpan={4} />
                 ) : (
-                  auditPaged.slice.map((l) => (
-                    <tr key={l.id}>
-                      <td class="col-date">{formatDateTime(l.created_at)}</td>
-                      <td class="col-cat">
-                        <span class="volo-cat-chip">{l.actor_name}</span>
-                      </td>
-                      <td class="col-cat">
-                        <span class="volo-mini-tag">{l.action}</span>
-                      </td>
-                      <td class="col-fluid">
-                        <div class="volo-cell-meta" style={{ color: "var(--volo-text)" }}>
-                          <span>
-                            {l.resource_type}:{l.resource_id}
-                          </span>
-                          {l.client_ip && <span class="volo-code-chip">{l.client_ip}</span>}
-                        </div>
-                      </td>
-                    </tr>
-                  ))
+                  auditPaged.slice.map((l) => {
+                    const prettyDetail = formatDetailJSON(l.detail_json);
+                    const isExpanded = expandedAuditId === l.id;
+                    return (
+                      <tr key={l.id}>
+                        <td class="col-date" data-label={t("sys.audit_col_time")}>
+                          {formatDateTime(l.created_at)}
+                        </td>
+                        <td class="col-cat" data-label={t("sys.audit_col_actor")}>
+                          <span class="volo-cat-chip">{l.actor_name}</span>
+                        </td>
+                        <td class="col-cat" data-label={t("sys.audit_col_action")}>
+                          <span class="volo-mini-tag">{l.action}</span>
+                        </td>
+                        <td class="col-fluid" data-label={t("sys.audit_col_res")}>
+                          <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
+                            <span>
+                              {l.resource_type}:{l.resource_id}
+                            </span>
+                            {l.client_ip && <span class="volo-code-chip">{l.client_ip}</span>}
+                            {prettyDetail && (
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={() => setExpandedAuditId(isExpanded ? null : l.id)}
+                              >
+                                {isExpanded ? t("common.close") : t("sys.audit_detail_btn")}
+                              </button>
+                            )}
+                          </div>
+                          {isExpanded && prettyDetail && (
+                            <pre class="volo-subcard" style={{ marginTop: "8px", fontSize: "12px", overflowX: "auto" }}>
+                              {prettyDetail}
+                            </pre>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
           </div>
           <Pagination
-            total={auditLogs.length}
+            total={filteredAudit.length}
             page={auditPaged.safePage}
             pageSize={20}
             onChange={(p) => {

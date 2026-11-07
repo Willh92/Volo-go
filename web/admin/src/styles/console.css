@@ -565,7 +565,8 @@ a {
 
 .volo-content {
   padding: 26px 30px 52px;
-  max-width: 1420px;
+  max-width: 1480px;
+  margin: 0 auto;
   width: 100%;
 }
 
@@ -1437,24 +1438,56 @@ input[type="checkbox"] {
   box-shadow: var(--volo-shadow);
 }
 
-/* Top-Right Slide-In Toast with Hover Pause */
+/* Top-Right Slide-In Toast with Hover Pause & Semantic States */
 .volo-toast {
   position: fixed;
   right: 22px;
   top: 22px;
   z-index: 140;
-  padding: 11px 14px 11px 16px;
+  padding: 10px 13px 10px 12px;
   border-radius: 11px;
   background: var(--volo-nav);
   color: #ffffff;
   box-shadow: var(--volo-shadow-pop);
   font-size: 13px;
-  max-width: min(390px, calc(100vw - 28px));
+  max-width: min(410px, calc(100vw - 24px));
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  animation: volo-toast-slide 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  gap: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  animation: volo-toast-slide 0.22s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.volo-toast.is-err {
+  background: #8f2822;
+  border-color: rgba(255, 190, 185, 0.32);
+}
+
+.volo-toast.is-warn {
+  background: #7c4f12;
+  border-color: rgba(255, 224, 170, 0.3);
+}
+
+.volo-toast.is-closing {
+  animation: volo-toast-exit 0.16s ease forwards;
+}
+
+.volo-toast-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11.5px;
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.volo-toast-text {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 @keyframes volo-toast-slide {
@@ -1465,6 +1498,17 @@ input[type="checkbox"] {
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes volo-toast-exit {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
   }
 }
 
@@ -1525,6 +1569,7 @@ input[type="checkbox"] {
   width: 100%;
   max-width: 720px;
   max-height: 88vh;
+  max-height: 88dvh;
   display: flex;
   flex-direction: column;
   box-shadow: var(--volo-shadow-pop);
@@ -2412,20 +2457,23 @@ input[type="checkbox"] {
   }
   .volo-topbar {
     height: 64px;
-    padding: 0 14px;
+    padding: 0 12px;
     gap: 8px;
   }
   .volo-topbar-title {
-    font-size: 16.5px;
+    font-size: 16px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .volo-content {
-    padding: 16px 14px 40px;
+    padding: 16px 12px 68px;
   }
   .volo-trend-kpis {
     grid-template-columns: 1fr;
+  }
+  .volo-ed-mobile-tabs {
+    display: flex;
   }
   .volo-ed-body.mode-sv,
   .volo-ed-body.mode-sv.with-outline,
@@ -2437,7 +2485,21 @@ input[type="checkbox"] {
   .volo-ed-outline {
     border-left: 0;
     border-top: 1px solid var(--volo-line);
-    height: 340px;
+    height: 440px;
+    max-height: none;
+  }
+  .volo-ed-body.mob-pane-write .volo-preview-pane,
+  .volo-ed-body.mob-pane-write .volo-ed-outline {
+    display: none !important;
+  }
+  .volo-ed-body.mob-pane-preview .volo-cm-host,
+  .volo-ed-body.mob-pane-preview .volo-ed-outline {
+    display: none !important;
+  }
+  .volo-ed-body.mob-pane-outline .volo-cm-host,
+  .volo-ed-body.mob-pane-outline .volo-preview-pane,
+  .volo-ed-body.mob-pane-outline .volo-wysiwyg-surface {
+    display: none !important;
   }
 }
 
@@ -2445,20 +2507,40 @@ input[type="checkbox"] {
   .volo-grid-2, .volo-grid-3, .volo-grid-4, .volo-editor-split {
     grid-template-columns: 1fr !important;
   }
-  .volo-site-pill span,
-  .volo-user-pill span,
+  .volo-pill-label,
   .volo-locale-trigger-text {
-    display: none;
+    display: none !important;
+  }
+  .volo-site-pill,
+  .volo-cmdk-trigger {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+  .volo-user-pill {
+    height: 34px;
+    padding: 0 4px;
+    gap: 0;
   }
   .volo-locale-trigger,
   .volo-appearance-trigger {
-    padding: 0 9px;
+    height: 34px;
+    padding: 0 8px;
+  }
+  .volo-icon-btn {
+    width: 34px;
+    height: 34px;
   }
   .volo-subtabs {
     overflow-x: auto;
     flex-wrap: nowrap;
     white-space: nowrap;
-    padding-bottom: 4px;
+    padding-bottom: 6px;
+    scrollbar-width: none;
+  }
+  .volo-subtabs::-webkit-scrollbar {
+    display: none;
   }
   .volo-filter-bar,
   .volo-sec-head {
@@ -2477,12 +2559,33 @@ input[type="checkbox"] {
     overflow-x: auto;
     flex-wrap: nowrap;
     max-width: 100%;
+    scrollbar-width: none;
+  }
+  .volo-filter-pills::-webkit-scrollbar {
+    display: none;
+  }
+  .volo-ed-tools {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    max-width: 100%;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+  }
+  .volo-ed-tools::-webkit-scrollbar {
+    display: none;
   }
   .volo-card {
+    padding: 15px 13px;
+  }
+  .volo-modal-backdrop {
+    padding: 10px;
+  }
+  .volo-modal {
     padding: 16px 14px;
+    max-height: 90dvh;
   }
   .volo-wizard-box {
-    padding: 20px 16px;
+    padding: 20px 15px;
   }
   .volo-table {
     min-width: 0;
@@ -2500,25 +2603,44 @@ input[type="checkbox"] {
   }
   .volo-table td {
     border: 0;
-    padding: 4px 0;
+    padding: 4.5px 0;
     text-align: left !important;
     white-space: normal !important;
     width: 100% !important;
   }
-  .volo-row-actions {
-    justify-content: flex-start;
+  .volo-table td[data-label] {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     flex-wrap: wrap;
-    margin-top: 4px;
+  }
+  .volo-table td[data-label]::before {
+    content: attr(data-label);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--volo-muted);
+    flex-shrink: 0;
+  }
+  .volo-row-actions {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    margin-top: 6px;
+    width: 100%;
   }
   .volo-pagination {
     flex-direction: column;
     align-items: flex-start;
   }
+  .volo-pg-btn {
+    min-width: 36px;
+    height: 36px;
+  }
 }
 
-@media (max-width: 480px) {
+@media (max-width: 520px) {
   .volo-topbar-actions {
-    gap: 5px;
+    gap: 4px;
   }
   .volo-eyebrow {
     display: none;
@@ -2526,6 +2648,15 @@ input[type="checkbox"] {
   .volo-ed-right {
     width: 100%;
     justify-content: space-between;
+  }
+  .volo-topbar .volo-pop-menu,
+  .volo-topbar .volo-locale-menu {
+    position: fixed;
+    top: 60px;
+    left: 12px;
+    right: 12px;
+    min-width: 0;
+    max-width: none;
   }
 }
 
@@ -3398,14 +3529,405 @@ input[type="checkbox"] {
   color: var(--volo-text);
 }
 
+/* 7. Unified UX Upgrade: View Transitions, SwitchToggle, BatchBar, CommandPalette & 2-Column Studio Editor */
+.volo-view-enter {
+  animation: volo-view-rise 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes volo-view-rise {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.volo-pop-menu,
+.volo-cselect-menu {
+  max-width: calc(100vw - 24px);
+}
+
+.volo-ed-media-pop {
+  left: auto;
+  right: 0;
+  min-width: 184px;
+}
+
+.volo-ed-mobile-tabs {
+  display: none;
+  gap: 4px;
+  padding: 6px 10px;
+  background: var(--volo-surface);
+  border-bottom: 1px solid var(--volo-line);
+}
+
+.volo-studio-editor.is-fullscreen {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.volo-studio-editor.is-fullscreen .volo-ed-body {
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.volo-studio-editor.is-fullscreen .volo-cm-host,
+.volo-studio-editor.is-fullscreen .volo-cm-host .cm-editor,
+.volo-studio-editor.is-fullscreen .volo-preview-pane,
+.volo-studio-editor.is-fullscreen .volo-wysiwyg-surface,
+.volo-studio-editor.is-fullscreen .volo-ed-outline {
+  height: 100% !important;
+  max-height: none;
+}
+
+.volo-search-input {
+  width: 215px;
+  max-width: 100%;
+}
+
+.volo-auto-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(195px, 1fr));
+  gap: 14px;
+}
+
+.volo-input-row {
+  flex-wrap: wrap;
+}
+
+.volo-input-row > .volo-input {
+  min-width: 145px;
+}
+
+.volo-center-stage.is-setup {
+  align-items: flex-start;
+  padding-top: 38px;
+}
+
+/* Command Palette Trigger & List */
+.volo-cmdk-trigger {
+  height: 36px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  color: var(--volo-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.volo-cmdk-trigger:hover {
+  border-color: var(--volo-accent);
+  color: var(--volo-text);
+  background: var(--volo-surface);
+}
+
+.volo-cmdk-trigger kbd {
+  font-family: var(--volo-mono);
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-surface);
+}
+
+.volo-cmdk-search {
+  margin-bottom: 10px;
+}
+
+.volo-cmdk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 330px;
+  overflow-y: auto;
+}
+
+.volo-cmdk-item {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--volo-text);
+  padding: 8.5px 11px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+}
+
+.volo-cmdk-item.active,
+.volo-cmdk-item:hover {
+  background: var(--volo-accent-soft);
+  color: var(--volo-accent);
+}
+
+.volo-cmdk-item-title {
+  font-weight: 580;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* SwitchToggle */
+.volo-switch-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.volo-switch-wrap.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.volo-switch {
+  appearance: none;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--volo-line);
+  background: color-mix(in srgb, var(--volo-muted) 26%, var(--volo-raised));
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.volo-switch.is-on {
+  background: var(--volo-btn-bg);
+  border-color: var(--volo-btn-bg);
+}
+
+.volo-switch-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24);
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.volo-switch.is-on .volo-switch-thumb {
+  transform: translateX(15px);
+}
+
+.volo-switch-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.volo-switch-label {
+  font-size: 13px;
+  font-weight: 540;
+  color: var(--volo-text);
+  line-height: 1.35;
+}
+
+/* Floating Batch Action Bar */
+.volo-batch-bar {
+  position: sticky;
+  bottom: 14px;
+  z-index: 45;
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--volo-nav);
+  color: #ffffff;
+  box-shadow: var(--volo-shadow-pop);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  animation: volo-view-rise 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.volo-batch-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.volo-batch-num {
+  min-width: 22px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--volo-nav-mark);
+  color: var(--volo-nav-mark-ink);
+  font-size: 12px;
+  font-weight: 750;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.volo-batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* Skeleton Shimmer & Illustrated Empty State & Confirm Preview List */
+.volo-empty-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  color: var(--volo-muted);
+}
+
+.volo-empty-title {
+  font-size: 13.5px;
+  font-weight: 560;
+  color: var(--volo-text);
+}
+
+.volo-skel-bar {
+  height: 13px;
+  width: 68%;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--volo-raised) 25%, var(--volo-line) 50%, var(--volo-raised) 75%);
+  background-size: 200% 100%;
+  animation: volo-shimmer 1.2s ease-in-out infinite;
+}
+
+.volo-skel-bar.is-wide {
+  width: 86%;
+  height: 15px;
+}
+
+@keyframes volo-shimmer {
+  0% { background-position: 180% 0; }
+  100% { background-position: -20% 0; }
+}
+
+.volo-confirm-list {
+  max-height: 190px;
+  overflow-y: auto;
+  border: 1px solid var(--volo-line);
+  border-radius: 8px;
+  background: var(--volo-raised);
+  padding: 6px 8px;
+  margin-top: 8px;
+  font-family: var(--volo-mono);
+  font-size: 11.5px;
+}
+
+.volo-confirm-list-item {
+  padding: 3px 4px;
+  border-bottom: 1px dashed var(--volo-line);
+  overflow-wrap: anywhere;
+}
+
+.volo-confirm-list-item:last-child {
+  border-bottom: 0;
+}
+
+/* 2-Column Desktop Studio Editor (`>= 1180px`) */
+.volo-studio-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+@media (min-width: 1180px) {
+  .volo-studio-split {
+    grid-template-columns: minmax(0, 1fr) 336px;
+  }
+  .volo-studio-split.is-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .volo-studio-inspector {
+    position: sticky;
+    top: 96px;
+    max-height: calc(100vh - 116px);
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+}
+
+.volo-inspector-box {
+  background: var(--volo-raised);
+  border: 1px solid var(--volo-line);
+  border-radius: 12px;
+  padding: 14px 15px;
+  margin-bottom: 12px;
+}
+
+.volo-inspector-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--volo-text);
+  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.volo-media-card.is-selected {
+  border-color: var(--volo-accent);
+  box-shadow: 0 0 0 2px var(--volo-accent-soft);
+}
+
+.volo-media-select-cb {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: rgba(18, 25, 22, 0.68);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 @media (max-width: 780px) {
+  .volo-auth-header,
+  .volo-auth-footer {
+    padding: 14px 16px;
+    flex-wrap: wrap;
+  }
+  .volo-auth-stage {
+    padding: 10px 14px 20px;
+  }
   .volo-auth-layout {
     grid-template-columns: 1fr;
   }
   .volo-auth-story {
-    min-height: 240px;
-    padding: 28px 24px;
+    min-height: 0;
+    padding: 20px 20px 18px;
     border-radius: 20px 20px 0 0;
+  }
+  .volo-auth-story h1 {
+    font-size: 22px;
+    margin-bottom: 8px;
   }
   .volo-auth-story-art {
     display: none;
@@ -3414,12 +3936,36 @@ input[type="checkbox"] {
     border-left: 1px solid var(--volo-line);
     border-top: 0;
     border-radius: 0 0 20px 20px;
-    padding: 28px 22px;
+    padding: 24px 18px;
   }
   .volo-donut-wrap {
     flex-direction: column;
     align-items: flex-start;
   }
+  .volo-about-hero {
+    padding: 20px 18px;
+  }
+  .volo-repo-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .volo-about-kv-grid {
+    grid-template-columns: 1fr;
+  }
+  .volo-about-kv span {
+    overflow-wrap: anywhere;
+  }
+  .volo-media-picker-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .volo-center-stage.is-setup {
+    padding: 16px 12px;
+  }
+}
+
+.volo-w-full {
+  width: 100%;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3427,8 +3973,10 @@ input[type="checkbox"] {
   .volo-modal,
   .volo-pop-menu,
   .volo-cselect-menu,
-  .volo-toast {
+  .volo-toast,
+  .volo-view-enter {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
 }
+

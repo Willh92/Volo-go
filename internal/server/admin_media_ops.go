@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,19 +39,19 @@ func isSupportedReconcileExt(ext string) bool {
 	}
 }
 
-// reconcileLocalUploads ensures any untracked valid media files dropped directly into UploadDir
-// (excluding legacy `images/`, hidden dotfiles, and symlinks) are registered in `media_assets`.
-func (s *AppServer) reconcileLocalUploads(ctx context.Context) {
+// reconcileLocalUploads scans UploadDir on explicit operator request (`POST /api/admin/media/reconcile`)
+// and registers untracked valid media files in `media_assets`, returning the number of newly imported rows.
+func (s *AppServer) reconcileLocalUploads(ctx context.Context) int {
 	if s.deps.Config == nil || strings.TrimSpace(s.deps.Config.UploadDir) == "" {
-		return
+		return 0
 	}
 	rootAbs, err := filepath.Abs(s.deps.Config.UploadDir)
 	if err != nil {
-		return
+		return 0
 	}
 	st, err := os.Stat(rootAbs)
 	if err != nil || !st.IsDir() {
-		return
+		return 0
 	}
 
 	existingKeys := make(map[string]struct{})
@@ -73,7 +74,7 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) {
 		}
 	}
 
-	addedAny := false
+	imported := 0
 	_ = filepath.WalkDir(rootAbs, func(fullPath string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -96,7 +97,7 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) {
 			}
 			return nil
 		}
-		if d.Type()&os.ModeSymlink != 0 {
+		if d.Type()&os.ModeSymlink != 0 || !d.Type().IsRegular() {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(name))
@@ -115,7 +116,6 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) {
 		if oErr != nil {
 			return nil
 		}
-		defer f.Close()
 
 		var head [512]byte
 		n, _ := io.ReadFull(f, head[:])
@@ -138,6 +138,7 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) {
 		_, _ = f.Seek(0, io.SeekStart)
 		hasher := sha256.New()
 		_, _ = io.Copy(hasher, f)
+		_ = f.Close()
 		sumHex := hex.EncodeToString(hasher.Sum(nil))
 
 		createdAt := info.ModTime().UnixMilli()
@@ -145,73 +146,19 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) {
 			createdAt = time.Now().UnixMilli()
 		}
 		_, insErr := s.deps.Store.ExecContext(ctx,
-			`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
-			 VALUES (?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)`,
+			`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, alt_text, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
+			 VALUES (?, 'local', ?, ?, ?, '', ?, ?, ?, ?, ?, ?, '', ?)`,
 			id.Next(), relSlash, "/uploads/"+relSlash, name, mimeType, info.Size(), width, height, sumHex, false, createdAt)
 		if insErr == nil {
 			existingKeys[relSlash] = struct{}{}
-			addedAny = true
+			imported++
 		}
 		return nil
 	})
-	if addedAny && s.deps.Content != nil {
+	if imported > 0 && s.deps.Content != nil {
 		_ = s.deps.Content.RefreshMediaDimsCache(ctx)
 	}
-}
-
-// collectAllMediaReferenceBlobs gathers text/URL columns across all 11 content & settings scopes.
-func (s *AppServer) collectAllMediaReferenceBlobs(ctx context.Context) []string {
-	var blobs []string
-	appendQuery := func(q string, args ...any) {
-		rows, err := s.deps.Store.QueryContext(ctx, q, args...)
-		if err != nil {
-			return
-		}
-		defer rows.Close()
-		cols, err := rows.Columns()
-		if err != nil {
-			return
-		}
-		vals := make([]sqlNullString, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		for rows.Next() {
-			for i := range vals {
-				vals[i].val = ""
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				continue
-			}
-			var rowBuf strings.Builder
-			for _, v := range vals {
-				if v.val != "" {
-					if rowBuf.Len() > 0 {
-						rowBuf.WriteByte('\n')
-					}
-					rowBuf.WriteString(v.val)
-				}
-			}
-			if rowBuf.Len() > 0 {
-				blobs = append(blobs, rowBuf.String())
-			}
-		}
-	}
-
-	appendQuery(`SELECT content_md, summary_md, cover_url, audio_url FROM articles`)
-	appendQuery(`SELECT content_md, summary_md FROM article_revisions`)
-	appendQuery(`SELECT content_md FROM pages`)
-	appendQuery(`SELECT cover_url, description FROM series`)
-	appendQuery(`SELECT cover_url, description FROM books`)
-	appendQuery(`SELECT icon_url, description FROM links`)
-	appendQuery(`SELECT avatar_url, bio FROM users`)
-	appendQuery(`SELECT content_md, avatar_url FROM comments WHERE is_deleted = ?`, false)
-	appendQuery(`SELECT value_json FROM settings`)
-	appendQuery(`SELECT config_json FROM plugins`)
-	appendQuery(`SELECT icon_url, description FROM follows`)
-	appendQuery(`SELECT icon FROM nav_items`)
-	return blobs
+	return imported
 }
 
 type sqlNullString struct {
@@ -232,29 +179,83 @@ func (ns *sqlNullString) Scan(src any) error {
 	return nil
 }
 
-func countAssetReferences(a domain.MediaAsset, blobs []string) int {
-	pubURL := strings.TrimSpace(a.PublicURL)
-	objKey := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
-	cnt := 0
-	for _, blob := range blobs {
-		if blob == "" {
-			continue
-		}
-		matched := false
-		if pubURL != "" && strings.Contains(blob, pubURL) {
-			matched = true
-		} else if objKey != "" && strings.Contains(blob, objKey) {
-			matched = true
-		}
-		if matched {
-			cnt++
+// countAssetsReferencesStreaming streams one database row at a time across all content & configuration
+// tables so reference counting never retains all article/revision Markdown bodies in memory.
+func (s *AppServer) countAssetsReferencesStreaming(ctx context.Context, assets []domain.MediaAsset) []int {
+	counts := make([]int, len(assets))
+	if len(assets) == 0 {
+		return counts
+	}
+
+	type needlePair struct {
+		pubURL string
+		objKey string
+	}
+	needles := make([]needlePair, len(assets))
+	for i, a := range assets {
+		needles[i] = needlePair{
+			pubURL: strings.TrimSpace(a.PublicURL),
+			objKey: strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/"),
 		}
 	}
-	return cnt
+
+	scanQuery := func(q string, args ...any) {
+		rows, err := s.deps.Store.QueryContext(ctx, q, args...)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		cols, err := rows.Columns()
+		if err != nil || len(cols) == 0 {
+			return
+		}
+		vals := make([]sqlNullString, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		for rows.Next() {
+			for i := range vals {
+				vals[i].val = ""
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				continue
+			}
+			for idx, np := range needles {
+				matched := false
+				for _, col := range vals {
+					if col.val == "" {
+						continue
+					}
+					if (np.pubURL != "" && strings.Contains(col.val, np.pubURL)) ||
+						(np.objKey != "" && strings.Contains(col.val, np.objKey)) {
+						matched = true
+						break
+					}
+				}
+				if matched {
+					counts[idx]++
+				}
+			}
+		}
+	}
+
+	scanQuery(`SELECT content_md, summary_md, cover_url, audio_url FROM articles`)
+	scanQuery(`SELECT content_md, summary_md FROM article_revisions`)
+	scanQuery(`SELECT content_md FROM pages`)
+	scanQuery(`SELECT cover_url, description FROM series`)
+	scanQuery(`SELECT cover_url, description FROM books`)
+	scanQuery(`SELECT icon_url, description FROM links`)
+	scanQuery(`SELECT avatar_url, bio FROM users`)
+	scanQuery(`SELECT content_md, avatar_url FROM comments WHERE is_deleted = ?`, false)
+	scanQuery(`SELECT value_json FROM settings`)
+	scanQuery(`SELECT config_json FROM plugins`)
+	scanQuery(`SELECT icon_url, description FROM follows`)
+	scanQuery(`SELECT icon FROM nav_items`)
+	return counts
 }
 
 func (s *AppServer) listMediaWithRefs(ctx context.Context, limit int) ([]MediaAssetView, int) {
-	s.reconcileLocalUploads(ctx)
 	if limit <= 0 {
 		limit = 500
 	}
@@ -264,11 +265,11 @@ func (s *AppServer) listMediaWithRefs(ctx context.Context, limit int) ([]MediaAs
 	if len(rows) == 0 {
 		return []MediaAssetView{}, 0
 	}
-	blobs := s.collectAllMediaReferenceBlobs(ctx)
+	refCounts := s.countAssetsReferencesStreaming(ctx, rows)
 	out := make([]MediaAssetView, 0, len(rows))
 	orphanCnt := 0
-	for _, a := range rows {
-		rc := countAssetReferences(a, blobs)
+	for i, a := range rows {
+		rc := refCounts[i]
 		isOrp := rc == 0
 		if isOrp {
 			orphanCnt++
@@ -283,7 +284,6 @@ func (s *AppServer) listMediaWithRefs(ctx context.Context, limit int) ([]MediaAs
 }
 
 func (s *AppServer) scanOrCleanOrphans(ctx context.Context, deleteOrphans bool) ([]domain.MediaAsset, int64, error) {
-	s.reconcileLocalUploads(ctx)
 	if s.deps.Media != nil {
 		orphans, err := s.deps.Media.ScanOrphans(ctx, deleteOrphans)
 		if err != nil {
@@ -305,11 +305,11 @@ func (s *AppServer) scanOrCleanOrphans(ctx context.Context, deleteOrphans bool) 
 	if err != nil {
 		return nil, 0, err
 	}
-	blobs := s.collectAllMediaReferenceBlobs(ctx)
+	refCounts := s.countAssetsReferencesStreaming(ctx, rows)
 	orphans := make([]domain.MediaAsset, 0)
 	var freed int64
-	for _, a := range rows {
-		if countAssetReferences(a, blobs) == 0 {
+	for i, a := range rows {
+		if refCounts[i] == 0 {
 			orphans = append(orphans, a)
 			if deleteOrphans {
 				if a.StorageDriver == "local" && a.ObjectKey != "" && s.deps.Config != nil && s.deps.Config.UploadDir != "" {
@@ -347,9 +347,66 @@ func safeUnlinkLocalAsset(uploadDir string, objectKey string) error {
 	return os.Remove(resolved)
 }
 
+// CompareSemVer compares two semantic version strings numerically (`v1.10.0 > v1.9.0`, `v1.2.0 > v1.2.0-rc.1`).
+// Returns 1 if a > b, -1 if a < b, and 0 if equal or non-comparable.
+func CompareSemVer(a, b string) int {
+	parse := func(raw string) ([3]int, string, bool) {
+		s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "v"))
+		s = strings.TrimPrefix(s, "V")
+		if idx := strings.IndexByte(s, '+'); idx >= 0 {
+			s = s[:idx]
+		}
+		pre := ""
+		if idx := strings.IndexByte(s, '-'); idx >= 0 {
+			pre = s[idx+1:]
+			s = s[:idx]
+		}
+		parts := strings.Split(s, ".")
+		if len(parts) == 0 || len(parts) > 3 {
+			return [3]int{}, "", false
+		}
+		var nums [3]int
+		for i := 0; i < len(parts); i++ {
+			n, err := strconv.Atoi(parts[i])
+			if err != nil || n < 0 {
+				return [3]int{}, "", false
+			}
+			nums[i] = n
+		}
+		return nums, pre, true
+	}
+	na, preA, okA := parse(a)
+	nb, preB, okB := parse(b)
+	if !okA || !okB {
+		return 0
+	}
+	for i := 0; i < 3; i++ {
+		if na[i] > nb[i] {
+			return 1
+		}
+		if na[i] < nb[i] {
+			return -1
+		}
+	}
+	if preA == "" && preB != "" {
+		return 1
+	}
+	if preA != "" && preB == "" {
+		return -1
+	}
+	if preA == preB {
+		return 0
+	}
+	if preA > preB {
+		return 1
+	}
+	return -1
+}
+
 // Cached GitHub repository metadata for Admin About page (`/api/admin/about/project-info`)
 var aboutProjectCache struct {
 	mu        sync.Mutex
+	fetchMu   sync.Mutex
 	fetchedAt time.Time
 	stars     int
 	forks     int
@@ -369,8 +426,14 @@ func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.R
 	}
 	repoURL := "https://github.com/Willh92/Volo-go"
 
+	forceRefresh := r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true"
+	cacheTTL := 30 * time.Minute
+	if forceRefresh {
+		cacheTTL = 10 * time.Second
+	}
+
 	aboutProjectCache.mu.Lock()
-	stale := time.Since(aboutProjectCache.fetchedAt) > 30*time.Minute
+	stale := time.Since(aboutProjectCache.fetchedAt) > cacheTTL
 	stars := aboutProjectCache.stars
 	forks := aboutProjectCache.forks
 	latestTag := aboutProjectCache.latestTag
@@ -378,55 +441,68 @@ func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.R
 	aboutProjectCache.mu.Unlock()
 
 	if stale && r.URL.Query().Get("offline") != "1" && s.deps.OutboundDialer != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 3500*time.Millisecond)
-		defer cancel()
-		cli := s.deps.OutboundDialer.NewHTTPClient(3500 * time.Millisecond)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/Willh92/Volo-go", nil)
-		if err == nil {
-			req.Header.Set("Accept", "application/vnd.github+json")
-			req.Header.Set("User-Agent", "Volo-go/"+ver)
-			if resp, rErr := cli.Do(req); rErr == nil {
-				var meta struct {
-					StargazersCount int    `json:"stargazers_count"`
-					ForksCount      int    `json:"forks_count"`
-					HTMLURL         string `json:"html_url"`
-				}
-				if resp.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&meta) == nil {
-					stars = meta.StargazersCount
-					forks = meta.ForksCount
-					liveOK = true
-				}
-				_ = resp.Body.Close()
-			}
-		}
-		relReq, relErr := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/Willh92/Volo-go/releases/latest", nil)
-		if relErr == nil {
-			relReq.Header.Set("Accept", "application/vnd.github+json")
-			relReq.Header.Set("User-Agent", "Volo-go/"+ver)
-			if resp, rErr := cli.Do(relReq); rErr == nil {
-				var rel struct {
-					TagName string `json:"tag_name"`
-				}
-				if resp.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&rel) == nil && strings.TrimSpace(rel.TagName) != "" {
-					latestTag = strings.TrimSpace(rel.TagName)
-					liveOK = true
-				}
-				_ = resp.Body.Close()
-			}
-		}
+		aboutProjectCache.fetchMu.Lock()
 		aboutProjectCache.mu.Lock()
-		aboutProjectCache.fetchedAt = time.Now()
-		aboutProjectCache.stars = stars
-		aboutProjectCache.forks = forks
-		aboutProjectCache.latestTag = latestTag
-		aboutProjectCache.liveOK = liveOK
+		stillStale := time.Since(aboutProjectCache.fetchedAt) > cacheTTL
+		stars = aboutProjectCache.stars
+		forks = aboutProjectCache.forks
+		latestTag = aboutProjectCache.latestTag
+		liveOK = aboutProjectCache.liveOK
 		aboutProjectCache.mu.Unlock()
+
+		if stillStale {
+			ctx, cancel := context.WithTimeout(r.Context(), 3500*time.Millisecond)
+			cli := s.deps.OutboundDialer.NewHTTPClient(3500 * time.Millisecond)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/Willh92/Volo-go", nil)
+			if err == nil {
+				req.Header.Set("Accept", "application/vnd.github+json")
+				req.Header.Set("User-Agent", "Volo-go/"+ver)
+				if resp, rErr := cli.Do(req); rErr == nil {
+					var meta struct {
+						StargazersCount int    `json:"stargazers_count"`
+						ForksCount      int    `json:"forks_count"`
+						HTMLURL         string `json:"html_url"`
+					}
+					if resp.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&meta) == nil {
+						stars = meta.StargazersCount
+						forks = meta.ForksCount
+						liveOK = true
+					}
+					_ = resp.Body.Close()
+				}
+			}
+			relReq, relErr := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/Willh92/Volo-go/releases/latest", nil)
+			if relErr == nil {
+				relReq.Header.Set("Accept", "application/vnd.github+json")
+				relReq.Header.Set("User-Agent", "Volo-go/"+ver)
+				if resp, rErr := cli.Do(relReq); rErr == nil {
+					var rel struct {
+						TagName string `json:"tag_name"`
+					}
+					if resp.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&rel) == nil && strings.TrimSpace(rel.TagName) != "" {
+						latestTag = strings.TrimSpace(rel.TagName)
+						liveOK = true
+					}
+					_ = resp.Body.Close()
+				}
+			}
+			cancel()
+
+			aboutProjectCache.mu.Lock()
+			aboutProjectCache.fetchedAt = time.Now()
+			aboutProjectCache.stars = stars
+			aboutProjectCache.forks = forks
+			aboutProjectCache.latestTag = latestTag
+			aboutProjectCache.liveOK = liveOK
+			aboutProjectCache.mu.Unlock()
+		}
+		aboutProjectCache.fetchMu.Unlock()
 	}
 
 	if latestTag == "" {
 		latestTag = ver
 	}
-	hasUpdate := latestTag != "" && latestTag != ver && strings.TrimPrefix(latestTag, "v") > strings.TrimPrefix(ver, "v")
+	hasUpdate := latestTag != "" && CompareSemVer(latestTag, ver) > 0
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"project_name":   "Volo-go",

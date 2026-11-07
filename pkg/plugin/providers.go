@@ -192,6 +192,30 @@ func (r *ProviderRegistry) ActiveStorage() StorageProvider {
 	return r.defaultStorage
 }
 
+// StorageByID returns the StorageProvider registered by pluginID if active.
+func (r *ProviderRegistry) StorageByID(pluginID string) (StorageProvider, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for i := len(r.storageList) - 1; i >= 0; i-- {
+		if r.storageList[i].pluginID == pluginID {
+			return r.storageList[i].provider, true
+		}
+	}
+	return nil, false
+}
+
+// StorageProviderIDs returns sorted IDs of all active plugin StorageProviders.
+func (r *ProviderRegistry) StorageProviderIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.storageList))
+	for _, ent := range r.storageList {
+		ids = append(ids, ent.pluginID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // Notifiers returns a snapshot of all active plugin NotifierProviders.
 func (r *ProviderRegistry) Notifiers() []NotifierProvider {
 	r.mu.RLock()

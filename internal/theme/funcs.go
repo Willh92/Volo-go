@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 )
 
-func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, themeLocales map[string]map[string]string) template.FuncMap {
+func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, fallbackAssets map[string]cachedAsset, themeLocales map[string]map[string]string) template.FuncMap {
 	translate := func(locale string, key string, vars ...map[string]any) string {
 		if msg, ok := lookupThemeLocaleMessage(themeLocales, locale, key); ok {
 			if len(vars) > 0 && vars[0] != nil {
@@ -113,10 +113,15 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 				tid = themeID
 			}
 			clean := strings.TrimPrefix(rel, "/")
-			if a, ok := assets[clean]; ok && a.shortHash != "" {
-				return fmt.Sprintf("/themes/%s/assets/%s?v=%s", tid, clean, a.shortHash)
+			a, ok := assets[clean]
+			if !ok && fallbackAssets != nil {
+				a, ok = fallbackAssets[clean]
 			}
-			return fmt.Sprintf("/themes/%s/assets/%s", tid, clean)
+			prefix := e.assetCDNPrefix()
+			if ok && a.shortHash != "" {
+				return fmt.Sprintf("%s/themes/%s/assets/%s?v=%s", prefix, tid, clean, a.shortHash)
+			}
+			return fmt.Sprintf("%s/themes/%s/assets/%s", prefix, tid, clean)
 		},
 		"themeCfg": func(cfg map[string]any, key string, fallback ...any) any {
 			var def any

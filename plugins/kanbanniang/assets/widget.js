@@ -25,7 +25,7 @@
     btn.innerHTML = SVGS[ch] || SVGS.neko;
 
     btn.addEventListener("click", function () {
-      fetch("/api/plugins/kanbanniang/pat", {
+      fetch("/plugins/kanbanniang/api/pat", {
         method: "POST",
         headers: { Accept: "application/json" }
       })
@@ -36,6 +36,7 @@
           } else {
             pats += 1;
           }
+          root.setAttribute("data-pats", String(pats));
           bubble.textContent = "✨ +" + pats;
         })
         .catch(function () {
@@ -48,16 +49,19 @@
     root.appendChild(btn);
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", mount);
-  } else {
-    mount();
-  }
-  document.addEventListener("volo:page-load", function () {
+  function resetBubble() {
     var bubble = document.querySelector("#volo-kanbanniang-root .volo-kbn-bubble");
     var root = document.getElementById("volo-kanbanniang-root");
     if (bubble && root) {
       bubble.textContent = root.getAttribute("data-greeting") || bubble.textContent;
     }
-  });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", mount);
+  } else {
+    mount();
+  }
+  window.addEventListener("volo:after-navigate", resetBubble);
+  document.addEventListener("volo:page-load", resetBubble);
 })();

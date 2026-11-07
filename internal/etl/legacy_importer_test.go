@@ -537,3 +537,220 @@ func TestImportLegacyResilientToMissingChunksAndRealWorldAnomalies(t *testing.T)
 		t.Fatalf("unexpected migrated nav items: %+v", navs)
 	}
 }
+
+func TestImportLegacyArchiveURLRewriteMediaExtractAndOverrides(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	uploadDir := filepath.Join(tmp, "uploads")
+	if err := os.MkdirAll(uploadDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(tmp, "rewrite-migrated.db"),
+	})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer store.Close()
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatalf("migrate up: %v", err)
+	}
+
+	kr, _, err := config.LoadOrInitKeyRing(strings.Repeat("c", 64), tmp)
+	if err != nil {
+		t.Fatalf("keyring: %v", err)
+	}
+	settingsMgr := repo.NewSettingsManager(store, kr, "zh-CN")
+
+	legacyDoc := map[string]any{
+		"options": []map[string]any{
+			{"oId": "blogTitle", "optionValue": "Old Legacy Title"},
+			{"oId": "blogSubtitle", "optionValue": "Old Subtitle"},
+			{"oId": "storageType", "optionValue": "s3"},
+			{"oId": "voloBooks", "optionValue": `[{"id":"bk_1","title":"Handbook","coverUrl":"https://cdn.old.example.com/image/banner.png","sourceUrl":"https://old.example.com/articles/2023/05/18/111.html"}]`},
+			{"oId": "voloBookToc.bk_1", "optionValue": `[{"title":"Intro","url":"https://old.example.com/articles/2023/05/18/111.html"}]`},
+		},
+		"users": []map[string]any{
+			{
+				"oId":              "default",
+				"userName":         "legacyadmin",
+				"userEmail":        "old@example.com",
+				"userRole":         "adminRole",
+				"userAvatar":       "https://cdn.old.example.com/image/banner.png",
+				"userPasswordHash": "pbkdf2$sha256$120000$0011223344556677$0123456789abcdef0123456789abcdef",
+			},
+		},
+		"articles": []map[string]any{
+			{
+				"oId":              "art_first",
+				"articleTitle":     "First Migrated Post",
+				"articleAbstract":  "See ![banner](https://cdn.old.example.com/image/banner.png)",
+				"articleContent":   "Read [Second Post](https://old.example.com/articles/2023/05/19/222.html) and ![photo](/upload/2023/photo.jpg)",
+				"articleAuthorId":  "default",
+				"articlePermalink": "/articles/2023/05/18/111.html",
+				"articleStatus":    0,
+				"articleCreated":   1684400000000,
+				"articleUpdated":   1684400000000,
+			},
+			{
+				"oId":              "art_second",
+				"articleTitle":     "Second Target Post",
+				"articleAbstract":  "Target summary",
+				"articleContent":   "Backlink to [First](/articles/2023/05/18/111.html)",
+				"articleAuthorId":  "default",
+				"articlePermalink": "/articles/2023/05/19/222.html",
+				"articleStatus":    0,
+				"articleCreated":   1684500000000,
+				"articleUpdated":   1684500000000,
+			},
+		},
+		"comments": []map[string]any{
+			{
+				"oId":            "cmt_rw",
+				"commentOnId":    "art_first",
+				"commentName":    "Reader",
+				"commentURL":     "https://old.example.com",
+				"commentContent": "Check https://old.example.com/articles/2023/05/19/222.html",
+				"commentCreated": 1684600000000,
+			},
+		},
+		"pages": []map[string]any{
+			{
+				"oId":           "nav_custom_admin",
+				"pageTitle":     "Console",
+				"pagePermalink": "/start",
+				"pageOrder":     1,
+			},
+		},
+	}
+
+	docBytes, err := json.Marshal(legacyDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pngBytes := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00, 0x00, 0x00, 0x0d}
+	jpgBytes := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01}
+
+	zipPath := filepath.Join(tmp, "legacy-with-media.zip")
+	var zbuf bytes.Buffer
+	zw := zip.NewWriter(&zbuf)
+	addZipEntry := func(name string, data []byte) {
+		w, cErr := zw.Create(name)
+		if cErr != nil {
+			t.Fatal(cErr)
+		}
+		if _, wErr := w.Write(data); wErr != nil {
+			t.Fatal(wErr)
+		}
+	}
+	addZipEntry("data.json", docBytes)
+	addZipEntry("image/banner.png", pngBytes)
+	addZipEntry("upload/2023/photo.jpg", jpgBytes)
+	addZipEntry("image/xss.svg", []byte("<svg onload=alert(1)></svg>"))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zipPath, zbuf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := ImportOptions{
+		TargetUploadDir:   uploadDir,
+		AdminPath:         "/studio-admin",
+		OldURLPrefixes:    []string{"https://old.example.com", "https://cdn.old.example.com"},
+		NewSiteURL:        "https://new.example.com",
+		SiteTitle:         "Fresh Migrated Studio",
+		SiteSubtitle:      "New Era",
+		DefaultLocale:     "en-US",
+		TimeZone:          "UTC",
+		Accent:            "amber",
+		ForceLocalStorage: true,
+		AdminUsername:     "newowner",
+		AdminEmail:        "newowner@example.com",
+		AdminDisplayName:  "New Owner",
+		AdminPasswordHash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNo",
+	}
+
+	dryRep, err := ImportLegacyArchive(ctx, store, settingsMgr, kr, zipPath, ImportOptions{
+		DryRun:          true,
+		TargetUploadDir: uploadDir,
+		OldURLPrefixes:  opts.OldURLPrefixes,
+	})
+	if err != nil {
+		t.Fatalf("dry-run ImportLegacyArchive: %v", err)
+	}
+	if dryRep.MediaFiles != 2 || dryRep.URLsRewritten == 0 || dryRep.TargetDialect != "sqlite" {
+		t.Fatalf("unexpected dry-run report: %+v", dryRep)
+	}
+
+	rep, err := ImportLegacyArchive(ctx, store, settingsMgr, kr, zipPath, opts)
+	if err != nil {
+		t.Fatalf("live ImportLegacyArchive: %v", err)
+	}
+	if rep.MediaFiles != 2 || rep.URLsRewritten < 4 {
+		t.Fatalf("expected 2 safe media files extracted and >=4 URLs rewritten, got: %+v", rep)
+	}
+
+	// Unsafe .svg must never be extracted while .png and .jpg exist under uploads/
+	if _, err := os.Stat(filepath.Join(uploadDir, "banner.png")); err != nil {
+		t.Fatalf("expected extracted banner.png: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(uploadDir, "2023", "photo.jpg")); err != nil {
+		t.Fatalf("expected extracted 2023/photo.jpg: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(uploadDir, "xss.svg")); err == nil {
+		t.Fatal("unsafe .svg should not be extracted from legacy archive")
+	}
+
+	// Forward cross-article link in art_first (pointing to art_second which appeared AFTER art_first) must be rewritten via Pass 1 map!
+	art1, err := sqlx.Get[domain.RawArticle](ctx, store, `SELECT * FROM articles WHERE id = ?`, "art_first")
+	if err != nil {
+		t.Fatalf("load art_first: %v", err)
+	}
+	art2, err := sqlx.Get[domain.RawArticle](ctx, store, `SELECT * FROM articles WHERE id = ?`, "art_second")
+	if err != nil {
+		t.Fatalf("load art_second: %v", err)
+	}
+	if !strings.Contains(art1.ContentMD, "https://new.example.com/posts/"+art2.Slug) || strings.Contains(art1.ContentMD, "old.example.com") {
+		t.Fatalf("expected forward cross-article link rewritten to https://new.example.com/posts/%s, got: %s", art2.Slug, art1.ContentMD)
+	}
+	if !strings.Contains(art1.SummaryMD, "https://new.example.com/uploads/banner.png") || !strings.Contains(art1.ContentMD, "/uploads/2023/photo.jpg") {
+		t.Fatalf("expected bundled media URLs rewritten to /uploads/..., got summary=%q content=%q", art1.SummaryMD, art1.ContentMD)
+	}
+
+	// Book chapter URL should also rewrite to https://new.example.com/posts/<art1.Slug>
+	chaps, _ := sqlx.Select[domain.BookChapter](ctx, store, `SELECT * FROM book_chapters WHERE book_id = ?`, "bk_1")
+	if len(chaps) != 1 || !strings.HasSuffix(chaps[0].URL, "/posts/"+art1.Slug) {
+		t.Fatalf("expected book chapter URL rewritten to .../posts/%s, got %+v", art1.Slug, chaps)
+	}
+
+	// Nav item `/start` must rewrite to custom AdminPath `/studio-admin`
+	navs, _ := sqlx.Select[domain.NavItem](ctx, store, `SELECT * FROM nav_items`)
+	if len(navs) != 1 || navs[0].URL != "/studio-admin" {
+		t.Fatalf("expected /start nav rewritten to /studio-admin, got %+v", navs)
+	}
+
+	// Verify site, locale, appearance, and ForceLocalStorage overrides
+	snap := settingsMgr.Snapshot()
+	if snap.Site.Title != "Fresh Migrated Studio" || snap.Site.Subtitle != "New Era" || snap.Site.DefaultLocale != "en-US" || snap.Site.TimeZone != "UTC" {
+		t.Fatalf("unexpected site overrides: %+v", snap.Site)
+	}
+	if snap.Appearance.Accent != "amber" || snap.Storage.ActiveDriver != "local" {
+		t.Fatalf("expected accent=amber and storage=local override, got appearance=%+v storage=%+v", snap.Appearance, snap.Storage)
+	}
+
+	// Verify primary admin credential overrides cleared LegacyHash and applied new Argon2id PasswordHash
+	admin, err := sqlx.Get[domain.User](ctx, store, `SELECT * FROM users WHERE id = ?`, defaultMappedAdminID)
+	if err != nil {
+		t.Fatalf("load primary admin: %v", err)
+	}
+	if admin.Username != "newowner" || admin.Email != "newowner@example.com" || admin.DisplayName != "New Owner" || admin.PasswordHash != opts.AdminPasswordHash || admin.LegacyHash != "" {
+		t.Fatalf("unexpected primary admin overrides: %+v", admin)
+	}
+	if !strings.HasSuffix(admin.AvatarURL, "/uploads/banner.png") {
+		t.Fatalf("expected admin avatar URL rewritten to .../uploads/banner.png, got %q", admin.AvatarURL)
+	}
+}
+

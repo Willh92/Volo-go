@@ -841,3 +841,239 @@ func TestBuiltinPluginAndQuickInserts(t *testing.T) {
 	}
 }
 
+func TestPluginSDKUpgradesZeroRuntimeSetCryptoSiteRateLimitReloadAndCommentHook(t *testing.T) {
+	ctx := context.Background()
+	store, kr, cat, tmpDir := openTestPluginEnv(t)
+
+	// 1. Verify stateless goToJSValue / jsObject.Set works without spinning up extra JS runtimes.
+	rt := newJSRuntime()
+	obj := rt.NewObject()
+	obj.Set("str", "hello")
+	obj.Set("nested", map[string]any{"count": 42, "tags": []string{"a", "b"}})
+	rt.Set("probeObj", obj)
+	prog, err := compileJSProgram("probe.js", `var probeResult = probeObj.str + ":" + probeObj.nested.count + ":" + probeObj.nested.tags.join(",");`)
+	if err != nil {
+		t.Fatalf("compileJSProgram: %v", err)
+	}
+	if _, err := rt.RunProgram(prog); err != nil {
+		t.Fatalf("RunProgram: %v", err)
+	}
+	if got := fmt.Sprint(rt.Get("probeResult").Export()); got != "hello:42:a,b" {
+		t.Fatalf("unexpected jsObject.Set evaluation: %q", got)
+	}
+
+	providers := NewProviderRegistry(nil, nil)
+	mgr := NewManager(ManagerOptions{
+		Store:      store,
+		Keys:       kr,
+		PluginsDir: filepath.Join(tmpDir, "plugins"),
+		DataDir:    filepath.Join(tmpDir, "data"),
+		Catalog:    cat,
+		Providers:  providers,
+	})
+	t.Cleanup(func() { _ = mgr.Close(ctx) })
+
+	mgr.SetSiteInfoFunc(func() map[string]any {
+		return map[string]any{
+			"title":          "Volo SDK Test",
+			"public_url":     "https://sdk.example.com",
+			"default_locale": "en-US",
+		}
+	})
+	mgr.SetRequestInspector(func(r *http.Request) (bool, string) {
+		return r.Header.Get("X-Test-Admin") == "1", "198.51.*.*"
+	})
+
+	manifestJSON := `{
+		"id": "sdk-suite",
+		"version": "1.0.0",
+		"runtime": "goja",
+		"entry": "main.js",
+		"name": {"en-US": "SDK Suite"},
+		"permissions": [
+			"kv",
+			"crypto",
+			"site:read",
+			"http:routes",
+			"cron",
+			"hooks:comment.before_create",
+			"provider:notifier",
+			"provider:storage"
+		],
+		"cron": [
+			{"name": "heartbeat", "interval_seconds": 60, "handler": "onTick"}
+		]
+	}`
+	mainJSV1 := `
+		module.exports = {
+			onRequest: function(req) {
+				var d = new Date(1700000000000);
+				var b64 = btoa("VoloJS");
+				var decoded = atob(b64);
+				var allowed1 = volo.rateLimit.allow("ip:" + req.client_ip_masked, 2, 60);
+				var allowed2 = volo.rateLimit.allow("ip:" + req.client_ip_masked, 2, 60);
+				var allowed3 = volo.rateLimit.allow("ip:" + req.client_ip_masked, 2, 60);
+				return {
+					status: 200,
+					json: {
+						version: "v1",
+						iso: d.toISOString(),
+						roundtrip: decoded,
+						sha: volo.crypto.sha256("abc"),
+						hmac: volo.crypto.hmacSha256("key", "msg"),
+						uuidLen: volo.crypto.randomUUID().length,
+						siteTitle: volo.site.info().title,
+						isAdmin: req.is_admin,
+						rl: [allowed1, allowed2, allowed3]
+					}
+				};
+			},
+			onHook: function(name, payload) {
+				if (name === "comment.before_create") {
+					if (payload.content_md.indexOf("FORBIDDEN_WORD") >= 0) {
+						return { reject: true, reason: "blocked-by-before-create" };
+					}
+					payload.content_md = payload.content_md + " [verified]";
+					return payload;
+				}
+				return payload;
+			},
+			sendNotification: function(ev) {
+				volo.kv.set("last_notif", ev.event + ":" + ev.title, 0);
+				return true;
+			},
+			storagePut: function(objectKey, base64Body, contentType) {
+				volo.kv.set("last_obj", objectKey + ":" + contentType + ":" + atob(base64Body), 0);
+				return "https://cdn.sdk.example.com/" + objectKey;
+			},
+			storageDelete: function(objectKey) {
+				volo.kv.del("last_obj");
+				return true;
+			},
+			storageHealthCheck: function() {
+				return true;
+			},
+			onTick: function() {}
+		};
+	`
+
+	pluginDir := filepath.Join(tmpDir, "plugins", "sdk-suite")
+	if err := os.MkdirAll(pluginDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginDir, "manifest.json"), []byte(manifestJSON), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginDir, "main.js"), []byte(mainJSV1), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.DiscoverAndStart(ctx); err != nil {
+		t.Fatalf("DiscoverAndStart: %v", err)
+	}
+	if err := mgr.Enable(ctx, "sdk-suite"); err != nil {
+		t.Fatalf("Enable sdk-suite: %v", err)
+	}
+
+	// Idempotent DiscoverAndStart must NOT leak cron goroutines or overwrite active runtime!
+	gBefore := runtime.NumGoroutine()
+	for i := 0; i < 5; i++ {
+		if err := mgr.DiscoverAndStart(ctx); err != nil {
+			t.Fatalf("repeat DiscoverAndStart %d: %v", i, err)
+		}
+	}
+	if gAfter := runtime.NumGoroutine(); gAfter > gBefore+2 {
+		t.Fatalf("DiscoverAndStart leaked goroutines: before=%d after=%d", gBefore, gAfter)
+	}
+
+	srv := httptest.NewServer(mgr.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/plugins/sdk-suite/api/test", nil)
+	req.Header.Set("X-Test-Admin", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /plugins/sdk-suite/api/test: %v", err)
+	}
+	var out struct {
+		Version   string `json:"version"`
+		ISO       string `json:"iso"`
+		Roundtrip string `json:"roundtrip"`
+		SHA       string `json:"sha"`
+		HMAC      string `json:"hmac"`
+		UUIDLen   int    `json:"uuidLen"`
+		SiteTitle string `json:"siteTitle"`
+		IsAdmin   bool   `json:"isAdmin"`
+		RL        []bool `json:"rl"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if out.Version != "v1" || out.ISO != "2023-11-14T22:13:20.000Z" || out.Roundtrip != "VoloJS" ||
+		out.SHA != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" ||
+		out.HMAC == "" || out.UUIDLen != 36 || out.SiteTitle != "Volo SDK Test" || !out.IsAdmin ||
+		len(out.RL) != 3 || !out.RL[0] || !out.RL[1] || out.RL[2] {
+		t.Fatalf("unexpected SDK runtime output: %+v", out)
+	}
+
+	// Verify JS NotifierProvider and StorageProvider registration & execution
+	notifiers := providers.Notifiers()
+	if len(notifiers) != 1 {
+		t.Fatalf("expected 1 active JS NotifierProvider, got %d", len(notifiers))
+	}
+	if err := notifiers[0].Send(ctx, NotificationEvent{Event: "comment.created", Title: "Hello"}); err != nil {
+		t.Fatalf("JS NotifierProvider.Send: %v", err)
+	}
+	sp, ok := providers.StorageByID("sdk-suite")
+	if !ok {
+		t.Fatal("expected StorageByID('sdk-suite') to be registered")
+	}
+	pubURL, err := sp.Put(ctx, "2026/11/hello.txt", strings.NewReader("storage-payload"), 15, "text/plain")
+	if err != nil || pubURL != "https://cdn.sdk.example.com/2026/11/hello.txt" {
+		t.Fatalf("JS StorageProvider.Put failed: url=%q err=%v", pubURL, err)
+	}
+	if err := sp.HealthCheck(ctx); err != nil {
+		t.Fatalf("JS StorageProvider.HealthCheck: %v", err)
+	}
+	kv := NewKVStore(store, "sdk-suite")
+	if v, ok, _ := kv.Get(ctx, "last_notif"); !ok || v != "comment.created:Hello" {
+		t.Fatalf("unexpected last_notif in KV: %q (ok=%v)", v, ok)
+	}
+	if v, ok, _ := kv.Get(ctx, "last_obj"); !ok || v != "2026/11/hello.txt:text/plain:storage-payload" {
+		t.Fatalf("unexpected last_obj in KV: %q (ok=%v)", v, ok)
+	}
+
+	// Verify HookCommentBeforeCreate rejection AND content mutation
+	_, rejErr := mgr.DispatchHook(ctx, HookCommentBeforeCreate, map[string]any{"content_md": "spam FORBIDDEN_WORD here"})
+	if rejErr == nil || !strings.Contains(rejErr.Error(), "blocked-by-before-create") {
+		t.Fatalf("expected HookRejectedError on FORBIDDEN_WORD, got: %v", rejErr)
+	}
+	mutOut, mutErr := mgr.DispatchHook(ctx, HookCommentBeforeCreate, map[string]any{"content_md": "clean comment"})
+	if mutErr != nil {
+		t.Fatalf("unexpected error on clean comment hook: %v", mutErr)
+	}
+	mutMap, _ := mutOut.(map[string]any)
+	if mutMap["content_md"] != "clean comment [verified]" {
+		t.Fatalf("expected mutated content_md, got: %+v", mutOut)
+	}
+
+	// Verify hot ReloadPlugin picks up updated main.js on disk cleanly without restarting process
+	mainJSV2 := strings.Replace(mainJSV1, `version: "v1"`, `version: "v2-hot-reloaded"`, 1)
+	if err := os.WriteFile(filepath.Join(pluginDir, "main.js"), []byte(mainJSV2), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ReloadPlugin(ctx, "sdk-suite", "en-US"); err != nil {
+		t.Fatalf("ReloadPlugin: %v", err)
+	}
+	resp2, err := http.Get(srv.URL + "/plugins/sdk-suite/api/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out2 struct {
+		Version string `json:"version"`
+	}
+	_ = json.NewDecoder(resp2.Body).Decode(&out2)
+	resp2.Body.Close()
+	if out2.Version != "v2-hot-reloaded" {
+		t.Fatalf("expected v2-hot-reloaded after ReloadPlugin, got %q", out2.Version)
+	}
+}

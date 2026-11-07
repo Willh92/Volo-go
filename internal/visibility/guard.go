@@ -356,6 +356,11 @@ func ApplyNoIndexPrivateHeaders(w http.ResponseWriter) {
 
 // --- Surface 1 & 2: List Cards, Summaries & Cover / OG Image Redaction ---
 
+// ProtectedNotice returns the localized redaction placeholder for password-protected article summaries.
+func (g *Guard) ProtectedNotice(locale string) string {
+	return g.protectedNotice(locale)
+}
+
 // ToCard converts RawArticle into a zero-leak PublicArticleCard.
 func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Category, tags []domain.Tag, lookupDims func(string) (int, int, bool)) PublicArticleCard {
 	card := PublicArticleCard{

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -161,6 +162,8 @@ type Service struct {
 
 	mediaMu   sync.RWMutex
 	mediaDims map[string][2]int
+
+	onArticlePublished atomic.Pointer[func(context.Context, domain.RawArticle)]
 }
 
 // NewService constructs a Content Service.
@@ -204,6 +207,15 @@ func (s *Service) Guard() *visibility.Guard             { return s.guard }
 func (s *Service) SearchIndex() *visibility.SearchIndex { return s.search }
 func (s *Service) Renderer() *render.Engine             { return s.renderer }
 
+// SetArticlePublishedCallback registers a host callback invoked when scheduled articles transition to published.
+func (s *Service) SetArticlePublishedCallback(fn func(context.Context, domain.RawArticle)) {
+	if fn == nil {
+		s.onArticlePublished.Store(nil)
+		return
+	}
+	s.onArticlePublished.Store(&fn)
+}
+
 // FlushAnalytics flushes all buffered view_count, redirect hit_count, and analytics_daily deltas to the database.
 func (s *Service) FlushAnalytics(ctx context.Context) error {
 	if s == nil || s.views == nil {
@@ -220,7 +232,7 @@ func (s *Service) Close(ctx context.Context) error {
 	return s.views.Close(ctx)
 }
 
-// WarmCaches preloads the 8 MiB two-stage search index, media intrinsic dimensions, redirect table, and chrome snapshot.
+// WarmCaches preloads the 2 MiB two-stage search index, media intrinsic dimensions, redirect table, and chrome snapshot.
 func (s *Service) WarmCaches(ctx context.Context) error {
 	_ = s.RefreshMediaDimsCache(ctx)
 	_, _ = s.getRedirectSnapshot(ctx)
@@ -275,15 +287,18 @@ func (s *Service) PublishDueScheduled(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	err = s.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		for _, a := range due {
-			pubAt := a.ScheduledAt
+		for i := range due {
+			pubAt := due[i].ScheduledAt
 			if pubAt <= 0 {
 				pubAt = now
 			}
+			due[i].Status = domain.ArticleStatusPublished
+			due[i].PublishedAt = pubAt
+			due[i].UpdatedAt = now
 			if _, uErr := tx.ExecContext(
 				ctx,
 				`UPDATE articles SET status = ?, published_at = ?, updated_at = ? WHERE id = ?`,
-				domain.ArticleStatusPublished, pubAt, now, a.ID,
+				domain.ArticleStatusPublished, pubAt, now, due[i].ID,
 			); uErr != nil {
 				return uErr
 			}
@@ -294,6 +309,27 @@ func (s *Service) PublishDueScheduled(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	_ = s.search.Rebuild(ctx)
+	cbPtr := s.onArticlePublished.Load()
+	for _, a := range due {
+		if s.plugins != nil {
+			isProtected := strings.TrimSpace(a.PasswordCiphertext) != ""
+			_ = s.plugins.DispatchArticleHook(ctx, plugin.HookArticlePublished, plugin.ArticleHookPayload{
+				ID:                  a.ID,
+				Title:               a.Title,
+				Slug:                a.Slug,
+				Lang:                a.Lang,
+				SummaryMD:           a.SummaryMD,
+				ContentMD:           a.ContentMD,
+				CoverURL:            a.CoverURL,
+				AudioURL:            a.AudioURL,
+				IsPasswordProtected: isProtected,
+				HasContentLock:      a.HasContentLock,
+			})
+		}
+		if cbPtr != nil && *cbPtr != nil {
+			(*cbPtr)(ctx, a)
+		}
+	}
 	return len(due), nil
 }
 
@@ -1222,15 +1258,23 @@ func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, side
 	if sidebarPostLimit > maxCachedRecentCmts {
 		sidebarPostLimit = maxCachedRecentCmts
 	}
-	sliceUpTo := func(src []domain.RawArticle, n int) []domain.RawArticle {
-		if len(src) <= n {
-			return src
+	cloneCards := func(src []visibility.PublicArticleCard, n int) []visibility.PublicArticleCard {
+		if len(src) > n {
+			src = src[:n]
 		}
-		return src[:n]
+		out := make([]visibility.PublicArticleCard, len(src))
+		for i, c := range src {
+			c.ViewCount += s.views.PendingArticleViews(c.ID)
+			if c.IsPasswordProtected {
+				c.Summary = s.guard.ProtectedNotice(locale)
+			}
+			out[i] = c
+		}
+		return out
 	}
-	recentCards, _ := s.hydrateCards(ctx, sliceUpTo(snap.recentRaw, sidebarPostLimit), locale)
-	viewedCards, _ := s.hydrateCards(ctx, sliceUpTo(snap.mostViewedRaw, sidebarPostLimit), locale)
-	cmtedCards, _ := s.hydrateCards(ctx, sliceUpTo(snap.mostCommentedRaw, sidebarPostLimit), locale)
+	recentCards := cloneCards(snap.recentCards, sidebarPostLimit)
+	viewedCards := cloneCards(snap.mostViewedCards, sidebarPostLimit)
+	cmtedCards := cloneCards(snap.mostCommentedCards, sidebarPostLimit)
 
 	authorsCopy := make([]PublicAuthorProfile, len(snap.authors))
 	copy(authorsCopy, snap.authors)
@@ -1238,8 +1282,8 @@ func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, side
 	copy(archivesCopy, snap.archiveBuckets)
 
 	stats := snap.stats
-	for _, r := range snap.recentRaw {
-		stats.ViewCount += s.views.PendingArticleViews(r.ID)
+	for _, c := range snap.recentCards {
+		stats.ViewCount += s.views.PendingArticleViews(c.ID)
 	}
 
 	return PublicChromeExtras{
@@ -1326,12 +1370,13 @@ func (s *Service) ListRandomArticles(ctx context.Context, excludeID string, loca
 		return nil
 	}
 	seen := map[string]bool{excludeID: true}
-	var pool []domain.RawArticle
-	for _, src := range [][]domain.RawArticle{snap.recentRaw, snap.mostViewedRaw} {
-		for _, r := range src {
-			if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
-				seen[r.ID] = true
-				pool = append(pool, r)
+	var pool []visibility.PublicArticleCard
+	for _, src := range [][]visibility.PublicArticleCard{snap.recentCards, snap.mostViewedCards} {
+		for _, c := range src {
+			if !seen[c.ID] && !c.IsPasswordProtected {
+				seen[c.ID] = true
+				c.ViewCount += s.views.PendingArticleViews(c.ID)
+				pool = append(pool, c)
 			}
 		}
 	}
@@ -1343,14 +1388,13 @@ func (s *Service) ListRandomArticles(ctx context.Context, excludeID string, loca
 		for i := 0; i < len(excludeID); i++ {
 			offset = (offset*31 + int(excludeID[i])) % len(pool)
 		}
-		picked := make([]domain.RawArticle, 0, limit)
+		picked := make([]visibility.PublicArticleCard, 0, limit)
 		for i := 0; i < limit; i++ {
 			picked = append(picked, pool[(offset+i)%len(pool)])
 		}
 		pool = picked
 	}
-	cards, _ := s.hydrateCards(ctx, pool, locale)
-	return cards
+	return pool
 }
 
 // Helper ensuring `id` import is actively referenced for entity creation helpers in content package.

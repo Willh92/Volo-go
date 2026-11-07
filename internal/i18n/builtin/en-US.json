@@ -195,5 +195,19 @@
   "studio.comments_count": "{count} comments",
   "studio.views_count": "{count} views",
   "footer.rss": "RSS Feed",
-  "footer.sitemap": "Sitemap"
+  "footer.sitemap": "Sitemap",
+  "article.share_label": "Share & Cite",
+  "article.copy_link": "Copy Link",
+  "article.copied_link": "Link Copied",
+  "article.copy_markdown": "Copy Markdown",
+  "article.copied_markdown": "Markdown Copied",
+  "article.native_share": "Share",
+  "error.default_title": "Something Went Wrong",
+  "error.hint_404": "This link may have moved or never existed. Try searching the site or head back home.",
+  "error.hint_default": "Your request could not be completed right now. Please try again later or return home.",
+  "error.back_home": "Back to Home",
+  "error.search_site": "Search Site",
+  "studio.close": "Close",
+  "studio.lightbox_label": "Image Preview",
+  "studio.lightbox_close": "Close Preview"
 }

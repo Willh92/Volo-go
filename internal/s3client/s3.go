@@ -76,6 +76,9 @@ func NewClient(cfg Config, safeDialer *security.OutboundSafeDialer) (*Client, er
 		httpClient: &http.Client{
 			Transport: tr,
 			Timeout:   90 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		nowFn: time.Now,
 	}, nil

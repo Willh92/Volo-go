@@ -402,13 +402,31 @@ func (s *Service) CreateComment(
 	}
 
 	if s.plugins != nil {
-		_, _ = s.plugins.DispatchHook(ctx, plugin.HookCommentBeforeCreate, map[string]any{
+		hookOut, hookErr := s.plugins.DispatchHook(ctx, plugin.HookCommentBeforeCreate, map[string]any{
 			"id":          record.ID,
 			"target_type": record.TargetType,
 			"target_id":   record.TargetID,
 			"author_name": record.AuthorName,
 			"content_md":  record.ContentMD,
+			"status":      record.Status,
 		})
+		if hookErr != nil {
+			var rej *plugin.HookRejectedError
+			if errors.As(hookErr, &rej) {
+				return PublicCommentView{}, "", ErrCommentRejected
+			}
+		} else if resMap, ok := hookOut.(map[string]any); ok {
+			if nextMD, sOk := resMap["content_md"].(string); sOk {
+				trimmedNext := strings.TrimSpace(nextMD)
+				if trimmedNext == "" || len([]rune(trimmedNext)) > 4000 {
+					return PublicCommentView{}, "", ErrCommentRejected
+				}
+				record.ContentMD = trimmedNext
+			}
+			if nextStatus, sOk := resMap["status"].(string); sOk && nextStatus == domain.CommentStatusPending {
+				record.Status = domain.CommentStatusPending
+			}
+		}
 	}
 
 	err := s.store.WithTx(ctx, func(tx *sqlx.Tx) error {

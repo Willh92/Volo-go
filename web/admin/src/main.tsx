@@ -1,5 +1,5 @@
 import { render } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import "./styles/console.css";
 import {
   accentSig,
@@ -9,7 +9,9 @@ import {
   busyCountSig,
   csrfTokenSig,
   currentUserSig,
+  dirtyEditorSig,
   dismissToast,
+  openConfirm,
   pauseToast,
   refreshMe,
   resetConsoleScroll,
@@ -27,7 +29,7 @@ import {
   t,
 } from "./i18n";
 import { BrandLogo } from "./components/BrandLogo";
-import { LocalePopover } from "./components/UIControls";
+import { AnimatedModal, GlobalConfirmModal, LocalePopover } from "./components/UIControls";
 import { SetupWizard } from "./views/SetupWizard";
 import { LoginView } from "./views/LoginView";
 import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
@@ -265,15 +267,20 @@ function NavIcon({ name }: { name: string }) {
 }
 
 function ToastBanner() {
-  if (!toastSig.value) return null;
+  const cur = toastSig.value;
+  if (!cur) return null;
   return (
     <div
-      class="volo-toast"
+      key={cur.id}
+      class={`volo-toast is-${cur.kind} ${cur.closing ? "is-closing" : ""}`}
       role="status"
       onMouseEnter={pauseToast}
       onMouseLeave={resumeToast}
     >
-      <span>{toastSig.value}</span>
+      <span class="volo-toast-icon" aria-hidden="true">
+        {cur.kind === "err" ? "!" : cur.kind === "warn" ? "i" : "✓"}
+      </span>
+      <span class="volo-toast-text">{cur.text}</span>
       <button
         type="button"
         class="volo-toast-close"
@@ -283,6 +290,157 @@ function ToastBanner() {
         ×
       </button>
     </div>
+  );
+}
+
+interface CmdItem {
+  id: string;
+  title: string;
+  sub: string;
+  run: () => void;
+}
+
+function CommandPalette({
+  open,
+  onClose,
+  isAdmin,
+  onNavigate,
+}: {
+  open: boolean;
+  onClose: () => void;
+  isAdmin: boolean;
+  onNavigate: (sec: string) => void;
+}) {
+  const [q, setQ] = useState("");
+  const [idx, setIdx] = useState(0);
+  const [posts, setPosts] = useState<Array<{ id: string; title: string; slug: string; status: string }>>([]);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setQ("");
+    setIdx(0);
+    window.setTimeout(() => inputRef.current?.focus(), 30);
+    apiFetch<{ items?: any[]; articles?: any[] }>("/api/admin/articles")
+      .then((res) => {
+        const raw = res.items || res.articles || [];
+        setPosts(
+          raw.slice(0, 60).map((it: any) => {
+            const a = it.article || it;
+            return { id: a.id, title: a.title || a.slug, slug: a.slug || "", status: a.status || "published" };
+          })
+        );
+      })
+      .catch(() => {});
+  }, [open]);
+
+  const items = useMemo<CmdItem[]>(() => {
+    const out: CmdItem[] = [];
+    for (const entry of SIDEBAR_ENTRIES) {
+      if (entry.adminOnly && !isAdmin) continue;
+      if (entry.kind === "item" && entry.section) {
+        out.push({
+          id: `sec:${entry.section}`,
+          title: t(entry.labelKey),
+          sub: t("nav.caption"),
+          run: () => onNavigate(entry.section!),
+        });
+      }
+      for (const ch of entry.children || []) {
+        if (ch.adminOnly && !isAdmin) continue;
+        out.push({
+          id: `sec:${ch.section}`,
+          title: t(ch.labelKey),
+          sub: t(entry.labelKey),
+          run: () => onNavigate(ch.section),
+        });
+      }
+    }
+    out.push({
+      id: "act:theme",
+      title: `${t("shell.mode_title")}: ${themeModeSig.value === "dark" ? t("mode.light") : t("mode.dark")}`,
+      sub: t("shell.appearance_title"),
+      run: () => applyThemeAttributes(themeModeSig.value === "dark" ? "light" : "dark", accentSig.value, false),
+    });
+    out.push({
+      id: "act:blog",
+      title: t("shell.view_blog"),
+      sub: "/",
+      run: () => window.open("/", "_blank", "noopener"),
+    });
+    for (const p of posts) {
+      out.push({
+        id: `post:${p.id}`,
+        title: p.title,
+        sub: `/posts/${p.slug}`,
+        run: () => {
+          sessionStorage.setItem("volo_jump_article_id", p.id);
+          onNavigate("editor");
+          window.dispatchEvent(new CustomEvent("volo:edit-article", { detail: p.id }));
+        },
+      });
+    }
+    const kw = q.trim().toLowerCase();
+    if (!kw) return out.slice(0, 18);
+    return out.filter((it) => it.title.toLowerCase().includes(kw) || it.sub.toLowerCase().includes(kw)).slice(0, 24);
+  }, [q, isAdmin, posts, localeSig.value]);
+
+  useEffect(() => {
+    setIdx(0);
+  }, [q]);
+
+  return (
+    <AnimatedModal
+      open={open}
+      onClose={onClose}
+      title={t("ui.cmdk_title")}
+      maxWidth="560px"
+    >
+      <div class="volo-cmdk-search">
+        <input
+          ref={inputRef}
+          class="volo-input"
+          placeholder={t("ui.cmdk_ph")}
+          value={q}
+          onInput={(e) => setQ((e.currentTarget as HTMLInputElement).value)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              setIdx((i) => (i + 1) % Math.max(1, items.length));
+            } else if (e.key === "ArrowUp") {
+              e.preventDefault();
+              setIdx((i) => (i - 1 + items.length) % Math.max(1, items.length));
+            } else if (e.key === "Enter" && items[idx]) {
+              e.preventDefault();
+              const target = items[idx];
+              onClose();
+              target.run();
+            }
+          }}
+        />
+      </div>
+      <div class="volo-cmdk-list">
+        {items.length === 0 ? (
+          <div class="volo-empty-state">{t("tbl.empty")}</div>
+        ) : (
+          items.map((it, i) => (
+            <button
+              key={it.id}
+              type="button"
+              class={`volo-cmdk-item ${i === idx ? "active" : ""}`}
+              onMouseEnter={() => setIdx(i)}
+              onClick={() => {
+                onClose();
+                it.run();
+              }}
+            >
+              <span class="volo-cmdk-item-title">{it.title}</span>
+              <span class="volo-code-chip">{it.sub}</span>
+            </button>
+          ))
+        )}
+      </div>
+    </AnimatedModal>
   );
 }
 
@@ -316,6 +474,7 @@ function App() {
   const [appearanceOpen, setAppearanceOpen] = useState<boolean>(false);
   const [appearanceClosing, setAppearanceClosing] = useState<boolean>(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const [cmdkOpen, setCmdkOpen] = useState<boolean>(false);
   const [avatarErr, setAvatarErr] = useState<boolean>(false);
   const appCloseTimer = useRef<number | undefined>(undefined);
 
@@ -350,8 +509,18 @@ function App() {
     }
   };
 
-  const navigateTo = (rawSec: string) => {
+  const navigateTo = async (rawSec: string) => {
     const next = (rawSec in SECTION_LABEL_KEYS ? rawSec : "dashboard") as NavSection;
+    if (next !== section && dirtyEditorSig.value) {
+      const ok = await openConfirm({
+        title: t("ui.unsaved_title"),
+        message: t("ui.unsaved_msg"),
+        confirmText: t("ui.unsaved_leave"),
+        danger: true,
+      });
+      if (!ok) return;
+      dirtyEditorSig.value = false;
+    }
     setSection(next);
     setMobileMenuOpen(false);
     const parent = findParentGroup(next);
@@ -374,6 +543,35 @@ function App() {
     if (bootConfig.mode !== "setup") {
       refreshMe().finally(() => setReady(true));
     }
+  }, []);
+
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (dirtyEditorSig.value) {
+        e.preventDefault();
+        e.returnValue = "";
+      }
+    };
+    const onGlobalKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        const inCm = (e.target as HTMLElement | null)?.closest?.(".cm-editor");
+        if (!inCm && currentUserSig.value && bootConfig.mode !== "setup") {
+          e.preventDefault();
+          setCmdkOpen((v) => !v);
+        }
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        if (currentUserSig.value && bootConfig.mode !== "setup") {
+          e.preventDefault();
+          window.dispatchEvent(new CustomEvent("volo:save"));
+        }
+      }
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    window.addEventListener("keydown", onGlobalKey);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      window.removeEventListener("keydown", onGlobalKey);
+    };
   }, []);
 
   useEffect(() => {
@@ -422,6 +620,7 @@ function App() {
       <>
         <div class={`volo-top-progress ${isBusy ? "is-busy" : ""}`} />
         <SetupWizard />
+        <GlobalConfirmModal />
         <ToastBanner />
       </>
     );
@@ -441,6 +640,7 @@ function App() {
       <>
         <div class={`volo-top-progress ${isBusy ? "is-busy" : ""}`} />
         <LoginView />
+        <GlobalConfirmModal />
         <ToastBanner />
       </>
     );
@@ -480,7 +680,7 @@ function App() {
                   key={entry.id}
                   type="button"
                   class={`volo-nav-btn ${isAct ? "active" : ""}`}
-                  onClick={() => navigateTo(entry.section!)}
+                  onClick={() => void navigateTo(entry.section!)}
                 >
                   <span class="volo-nav-label">
                     <NavIcon name={entry.icon} />
@@ -525,7 +725,7 @@ function App() {
                         type="button"
                         tabIndex={isOpen ? 0 : -1}
                         class={`volo-nav-btn ${section === child.section ? "active" : ""}`}
-                        onClick={() => navigateTo(child.section)}
+                        onClick={() => void navigateTo(child.section)}
                       >
                         <span>{t(child.labelKey)}</span>
                       </button>
@@ -561,13 +761,28 @@ function App() {
                 <line x1="4" y1="17" x2="20" y2="17" />
               </svg>
             </button>
-            <div>
+            <div style={{ minWidth: 0 }}>
               <div class="volo-eyebrow">{t("shell.eyebrow")}</div>
               <h1 class="volo-topbar-title">{t(SECTION_LABEL_KEYS[section])}</h1>
             </div>
           </div>
 
           <div class="volo-topbar-actions">
+            {/* Command Palette Quick Jump (Ctrl/Cmd + K) */}
+            <button
+              type="button"
+              class="volo-cmdk-trigger"
+              title={`${t("ui.cmdk_title")} (Ctrl/Cmd+K)`}
+              onClick={() => setCmdkOpen(true)}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="7.5" />
+                <line x1="20.5" y1="20.5" x2="16.4" y2="16.4" />
+              </svg>
+              <span class="volo-pill-label">{t("ui.cmdk_btn")}</span>
+              <kbd class="volo-pill-label">⌘K</kbd>
+            </button>
+
             {/* Unified Appearance Popover (4 Modes + Admin-Persisted Accent Swatches) */}
             <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
               <button
@@ -650,9 +865,9 @@ function App() {
             />
 
             {/* Open Public Blog */}
-            <a class="volo-site-pill" href="/" target="_blank" rel="noreferrer">
-              <span style={{ fontSize: "12px" }}>↗</span>
-              <span>{t("shell.view_blog")}</span>
+            <a class="volo-site-pill" href="/" target="_blank" rel="noreferrer" title={t("shell.view_blog")}>
+              <span class="volo-site-arrow">↗</span>
+              <span class="volo-pill-label">{t("shell.view_blog")}</span>
             </a>
 
             {/* User Avatar Pill */}
@@ -660,7 +875,7 @@ function App() {
               type="button"
               class="volo-user-pill"
               style={{ cursor: "pointer" }}
-              onClick={() => navigateTo("account")}
+              onClick={() => void navigateTo("account")}
               title={t("nav.account")}
             >
               <span class="volo-user-avatar">
@@ -670,7 +885,7 @@ function App() {
                   initialChar
                 )}
               </span>
-              <span>{user.display_name || user.username}</span>
+              <span class="volo-pill-label">{user.display_name || user.username}</span>
             </button>
 
             {/* Logout Icon Button */}
@@ -694,49 +909,58 @@ function App() {
         </header>
 
         <main class="volo-content">
-          {(section === "dashboard" || section === "editor" || section === "articles" || section === "drafts") && (
-            <OverviewWorkspace section={section} onNavigate={navigateTo} />
-          )}
+          <div key={section} class="volo-view-enter">
+            {(section === "dashboard" || section === "editor" || section === "articles" || section === "drafts") && (
+              <OverviewWorkspace section={section} onNavigate={(s) => void navigateTo(s)} />
+            )}
 
-          {(section === "comments" ||
-            section === "categories" ||
-            section === "tags" ||
-            section === "series" ||
-            section === "books" ||
-            section === "pages" ||
-            section === "media") && (
-            <ContentWorkspace activeTab={section} onNavigate={navigateTo} />
-          )}
+            {(section === "comments" ||
+              section === "categories" ||
+              section === "tags" ||
+              section === "series" ||
+              section === "books" ||
+              section === "pages" ||
+              section === "media") && (
+              <ContentWorkspace activeTab={section} onNavigate={(s) => void navigateTo(s)} />
+            )}
 
-          {(section === "nav_redirects" ||
-            section === "feed_seo" ||
-            section === "github" ||
-            section === "links" ||
-            section === "follows" ||
-            section === "webhooks") && (
-            <DistributeWorkspace activeTab={section} onNavigate={navigateTo} />
-          )}
+            {(section === "nav_redirects" ||
+              section === "feed_seo" ||
+              section === "github" ||
+              section === "links" ||
+              section === "follows" ||
+              section === "webhooks") && (
+              <DistributeWorkspace activeTab={section} onNavigate={(s) => void navigateTo(s)} />
+            )}
 
-          {(section === "themes" || section === "locales" || section === "plugins") && isAdmin && (
-            <AppearanceWorkspace activeTab={section} onNavigate={navigateTo} />
-          )}
+            {(section === "themes" || section === "locales" || section === "plugins") && isAdmin && (
+              <AppearanceWorkspace activeTab={section} onNavigate={(s) => void navigateTo(s)} />
+            )}
 
-          {(section === "settings_site" ||
-            section === "settings_io" ||
-            section === "users" ||
-            section === "backup" ||
-            section === "account" ||
-            section === "waf" ||
-            section === "audit") && (
-            <SystemWorkspace activeTab={section} onNavigate={navigateTo} />
-          )}
+            {(section === "settings_site" ||
+              section === "settings_io" ||
+              section === "users" ||
+              section === "backup" ||
+              section === "account" ||
+              section === "waf" ||
+              section === "audit") && (
+              <SystemWorkspace activeTab={section} onNavigate={(s) => void navigateTo(s)} />
+            )}
 
-          {(section === "about" || section === "help") && (
-            <AboutHelpWorkspace activeTab={section} onNavigate={navigateTo} />
-          )}
+            {(section === "about" || section === "help") && (
+              <AboutHelpWorkspace activeTab={section} onNavigate={(s) => void navigateTo(s)} />
+            )}
+          </div>
         </main>
       </div>
 
+      <CommandPalette
+        open={cmdkOpen}
+        onClose={() => setCmdkOpen(false)}
+        isAdmin={isAdmin}
+        onNavigate={(s) => void navigateTo(s)}
+      />
+      <GlobalConfirmModal />
       <ToastBanner />
     </div>
   );

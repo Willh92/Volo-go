@@ -105,6 +105,8 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	if deps.WAF == nil {
 		deps.WAF = security.NewWAFEngine(deps.Config, deps.Store, deps.Settings, deps.Geo)
 		_ = deps.WAF.ReloadBans(context.Background())
+	} else if deps.Config != nil {
+		deps.WAF.SetPublicURL(deps.Config.PublicURL)
 	}
 	if deps.Themes == nil {
 		th, err := theme.NewEngine(deps.Catalog, deps.Config.ThemesDir)
@@ -113,6 +115,9 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		}
 		deps.Themes = th
 	}
+	deps.Themes.SetAssetCDNPrefixFunc(func() string {
+		return deps.Settings.Snapshot().Reading.AssetCDNPrefix
+	})
 	if deps.Content == nil {
 		rnd := render.Default()
 		grd := visibility.NewGuard(deps.Config.KeyRing, deps.Settings, deps.Passports, deps.Catalog, rnd)
@@ -132,8 +137,39 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		})
 		_ = deps.Content.WarmCaches(context.Background())
 	}
+	if deps.Content != nil && deps.NotifyArticlePublished != nil {
+		deps.Content.SetArticlePublishedCallback(deps.NotifyArticlePublished)
+	}
 
 	s := &AppServer{deps: deps}
+	if deps.Plugins != nil {
+		deps.Plugins.SetSiteInfoFunc(func() map[string]any {
+			snap := deps.Settings.Snapshot()
+			pubURL := ""
+			if deps.Config != nil {
+				pubURL = deps.Config.PublicURL
+			}
+			return map[string]any{
+				"title":          snap.Site.Title,
+				"subtitle":       snap.Site.Subtitle,
+				"description":    snap.Site.Description,
+				"public_url":     pubURL,
+				"default_locale": snap.Site.DefaultLocale,
+				"active_theme":   snap.Appearance.ActiveTheme,
+				"version":        deps.Version,
+			}
+		})
+		deps.Plugins.SetRequestInspector(func(r *http.Request) (bool, string) {
+			viewer, _ := s.resolveViewer(r)
+			isAdmin := viewer != nil && viewer.Status == domain.UserStatusActive && viewer.Role == domain.RoleAdmin
+			var proxies config.TrustedProxiesPolicy
+			if s.deps.Config != nil {
+				proxies = s.deps.Config.TrustedProxies
+			}
+			clientIP := security.ResolveClientIP(r, proxies)
+			return isAdmin, security.MaskIP(clientIP)
+		})
+	}
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 	s.registerSetupRoutes(mux)
@@ -279,6 +315,67 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 
 // --- Zero-Copy Media Range Serving & Theme Assets ---
 
+func isInlineSafeUploadExt(ext string) bool {
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav":
+		return true
+	default:
+		return false
+	}
+}
+
+var contentDispositionSanitizer = strings.NewReplacer(`"`, "_", "\r", "", "\n", "", `\`, "_")
+
+func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir string, cleanRel string) bool {
+	if strings.TrimSpace(baseDir) == "" || cleanRel == "" || strings.Contains(cleanRel, "..") {
+		return false
+	}
+	rootAbs, err := filepath.Abs(baseDir)
+	if err != nil {
+		return false
+	}
+	if evalRoot, eErr := filepath.EvalSymlinks(rootAbs); eErr == nil {
+		rootAbs = evalRoot
+	}
+
+	fullPath := filepath.Join(rootAbs, filepath.FromSlash(cleanRel))
+	realFile, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		return false
+	}
+	if realFile != rootAbs && !strings.HasPrefix(realFile, rootAbs+string(filepath.Separator)) {
+		return false
+	}
+
+	f, err := os.Open(realFile)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil || st.IsDir() || !st.Mode().IsRegular() {
+		return false
+	}
+
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("Cache-Control", "public, max-age=2592000")
+	etag := fmt.Sprintf(`"%x-%x"`, st.ModTime().UnixNano(), st.Size())
+	w.Header().Set("ETag", etag)
+
+	name := st.Name()
+	if !isInlineSafeUploadExt(filepath.Ext(name)) {
+		safeName := contentDispositionSanitizer.Replace(name)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, safeName))
+	}
+
+	// Zero-copy HTTP Range / 206 Partial Content streaming via stdlib http.ServeContent!
+	http.ServeContent(w, r, name, st.ModTime(), f)
+	return true
+}
+
 func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -291,48 +388,9 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-
-	rootAbs, err := filepath.Abs(s.deps.Config.UploadDir)
-	if err != nil {
+	if !serveSafeUserStaticFile(w, r, s.deps.Config.UploadDir, cleanRel) {
 		http.NotFound(w, r)
-		return
 	}
-	if evalRoot, eErr := filepath.EvalSymlinks(rootAbs); eErr == nil {
-		rootAbs = evalRoot
-	}
-
-	fullPath := filepath.Join(rootAbs, filepath.FromSlash(cleanRel))
-	realFile, err := filepath.EvalSymlinks(fullPath)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	if realFile != rootAbs && !strings.HasPrefix(realFile, rootAbs+string(filepath.Separator)) {
-		http.NotFound(w, r)
-		return
-	}
-
-	f, err := os.Open(realFile)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer f.Close()
-
-	st, err := f.Stat()
-	if err != nil || st.IsDir() {
-		http.NotFound(w, r)
-		return
-	}
-
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'")
-	w.Header().Set("Cache-Control", "public, max-age=2592000")
-	etag := fmt.Sprintf(`"%x-%x"`, st.ModTime().UnixNano(), st.Size())
-	w.Header().Set("ETag", etag)
-
-	// Zero-copy HTTP Range / 206 Partial Content streaming via stdlib http.ServeContent!
-	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
 }
 
 func (s *AppServer) handleServeThemeAsset(w http.ResponseWriter, r *http.Request) {
@@ -515,7 +573,8 @@ func (s *AppServer) handleGitHubStatsSVG(w http.ResponseWriter, r *http.Request)
 	}
 	svg := s.deps.Content.BuildGitHubStatsSVG(user)
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(svg)
@@ -542,6 +601,24 @@ func (s *AppServer) handlePublicI18nAPI(w http.ResponseWriter, r *http.Request) 
 	}
 	if requested == "" {
 		requested = s.resolveLocale(r)
+	}
+	if cached, ok := s.deps.Catalog.CachedAPIResponse(requested, snap.Site.DefaultLocale); ok && len(cached.JSON) > 0 {
+		h := w.Header()
+		h.Set("Content-Type", "application/json; charset=utf-8")
+		h.Set("Cache-Control", "no-cache")
+		if cached.ETag != "" {
+			h.Set("ETag", cached.ETag)
+			if ifNoneMatchMatches(r.Header.Get("If-None-Match"), cached.ETag) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+		h.Set("Content-Length", strconv.Itoa(len(cached.JSON)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(cached.JSON)
+		}
+		return
 	}
 	resolved := s.deps.Catalog.Match(requested, snap.Site.DefaultLocale)
 	w.Header().Set("Cache-Control", "no-cache")
@@ -577,6 +654,9 @@ func (s *AppServer) handleGuestPassport(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if r.Method == http.MethodPost && !s.requireSameOrigin(w, r) {
+		return
+	}
 	gp, _ := s.deps.Passports.ResolveOrHeal(w, r, true)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -610,6 +690,9 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	parts := strings.Split(rest, "/")
 	if len(parts) != 2 || parts[1] != "unlock" || r.Method != http.MethodPost {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.requireSameOrigin(w, r) {
 		return
 	}
 	articleID := strings.TrimSpace(parts[0])
@@ -675,6 +758,9 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusOK, map[string]any{"comments": list})
 
 	case http.MethodPost:
+		if !s.requireSameOrigin(w, r) {
+			return
+		}
 		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 		if !s.deps.WAF.AllowRate("comment_post", clientIP, 12, time.Minute) {
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
@@ -730,6 +816,9 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 
 	switch r.Method {
 	case http.MethodPatch:
+		if !s.requireSameOrigin(w, r) {
+			return
+		}
 		var body struct {
 			ContentMD string `json:"content_md"`
 		}
@@ -753,6 +842,9 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]any{"comment": updated})
 
 	case http.MethodDelete:
+		if !s.requireSameOrigin(w, r) {
+			return
+		}
 		err := s.deps.Content.DeleteOwnComment(r.Context(), r, viewer, commentID)
 		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, visibility.ErrProtectedForbidden) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
@@ -776,6 +868,9 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireSameOrigin(w, r) {
 		return
 	}
 	var req struct {
@@ -811,6 +906,9 @@ func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
 	if !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "reader registration disabled"})
 		return
@@ -842,6 +940,9 @@ func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request)
 func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireSameOrigin(w, r) {
 		return
 	}
 	if !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
@@ -881,6 +982,9 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("reader_login", clientIP, 10, 5*time.Minute) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
@@ -899,13 +1003,13 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 		geo = loc.Region
 	}
 	res, err := s.deps.Auth.LoginReader(r.Context(), req.Ident, req.Password, clientIP, geo, r.UserAgent())
-	if errors.Is(err, auth.ErrForbidden) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-		return
-	}
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		msg := err.Error()
+		if errors.Is(err, auth.ErrForbidden) {
+			msg = auth.ErrInvalidCredentials.Error()
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": msg})
 		return
 	}
 	s.setSessionCookie(w, res.RawToken)
@@ -915,6 +1019,9 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireSameOrigin(w, r) {
 		return
 	}
 	viewer, sess := s.resolveViewer(r)
@@ -935,6 +1042,9 @@ func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
 func (s *AppServer) handleReaderClaimComments(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireSameOrigin(w, r) {
 		return
 	}
 	viewer, _ := s.resolveViewer(r)
@@ -992,7 +1102,7 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 		}
 	}
 
-	var headSlots, footerSlots []plugin.RenderedSlot
+	var headSlots, headerSlots, sidebarSlots, footerSlots []plugin.RenderedSlot
 	if s.deps.Plugins != nil {
 		slotCtx := plugin.SlotRenderContext{
 			Locale:      locale,
@@ -1000,6 +1110,8 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 			ThemeAccent: snap.Appearance.Accent,
 		}
 		headSlots = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotPublicHead, slotCtx)
+		headerSlots = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotPublicHeader, slotCtx)
+		sidebarSlots = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotPublicSidebar, slotCtx)
 		footerSlots = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotPublicFooter, slotCtx)
 	}
 
@@ -1044,6 +1156,8 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 		MostCommentedPosts: extras.MostCommentedPosts,
 		RecentComments:     recentComments,
 		HeadWidgets:        headSlots,
+		HeaderWidgets:      headerSlots,
+		SidebarWidgets:     sidebarSlots,
 		FooterWidgets:      footerSlots,
 	}
 }
@@ -1138,6 +1252,7 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 		return
 	}
 	pctx := s.basePageContext(r, viewer)
+	pctx.IsStandalonePage = true
 	pctx.PageTitle = pgView.Title + " · " + pctx.Site.Title
 	if pgView.PlainSummary != "" {
 		pctx.MetaDescription = pgView.PlainSummary
@@ -1225,6 +1340,18 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 	pctx.Alternates = detail.Translations
 	pctx.Reactions, _ = s.deps.Content.GetReactionCounts(r.Context(), domain.TargetTypeArticle, raw.ID)
 
+	if s.deps.Plugins != nil {
+		slotCtx := plugin.SlotRenderContext{
+			Locale:      pctx.Locale,
+			Path:        r.URL.Path,
+			ArticleID:   raw.ID,
+			ArticleSlug: raw.Slug,
+			ThemeAccent: pctx.Appearance.Accent,
+		}
+		pctx.ArticleBeforeWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotArticleBeforeContent, slotCtx)
+		pctx.ArticleAfterWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotArticleAfterContent, slotCtx)
+	}
+
 	if pctx.Reading.OutdatedNoticeDays > 0 && raw.UpdatedAt > 0 {
 		days := int(time.Since(time.UnixMilli(raw.UpdatedAt)).Hours() / 24)
 		if days >= pctx.Reading.OutdatedNoticeDays {
@@ -1306,7 +1433,17 @@ func (s *AppServer) handleCategoriesOverview(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) {
-	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/categories/"))
+	rawSlug := strings.TrimPrefix(r.URL.Path, "/categories/")
+	if rawSlug == "" || strings.Contains(rawSlug, "/") {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	slug, _ := url.PathUnescape(rawSlug)
+	catRow, err := sqlx.Get[domain.Category](r.Context(), s.deps.Store, `SELECT * FROM categories WHERE slug = ?`, slug)
+	if err != nil {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
 	viewer, _ := s.resolveViewer(r)
 	pctx := s.basePageContext(r, viewer)
 	page := parsePageParam(r)
@@ -1316,14 +1453,8 @@ func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) 
 		CategorySlug: slug,
 		Locale:       pctx.Locale,
 	})
-	pctx.HeroTitle = slug
-	for _, c := range pctx.SidebarCategories {
-		if c.Slug == slug {
-			pctx.HeroTitle = c.Name
-			pctx.HeroSubtitle = c.Description
-			break
-		}
-	}
+	pctx.HeroTitle = catRow.Name
+	pctx.HeroSubtitle = catRow.Description
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.ArticleCards = cards
 	pctx.Page = page
@@ -1343,7 +1474,17 @@ func (s *AppServer) handleTagsOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
-	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/tags/"))
+	rawSlug := strings.TrimPrefix(r.URL.Path, "/tags/")
+	if rawSlug == "" || strings.Contains(rawSlug, "/") {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	slug, _ := url.PathUnescape(rawSlug)
+	tagRow, err := sqlx.Get[domain.Tag](r.Context(), s.deps.Store, `SELECT * FROM tags WHERE slug = ?`, slug)
+	if err != nil {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
 	viewer, _ := s.resolveViewer(r)
 	pctx := s.basePageContext(r, viewer)
 	page := parsePageParam(r)
@@ -1353,7 +1494,7 @@ func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
 		TagSlug:  slug,
 		Locale:   pctx.Locale,
 	})
-	pctx.HeroTitle = "#" + slug
+	pctx.HeroTitle = "#" + tagRow.Name
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.ArticleCards = cards
 	pctx.Page = page
@@ -1372,8 +1513,21 @@ func (s *AppServer) handleArchivesOverview(w http.ResponseWriter, r *http.Reques
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"archives.html", "taxonomies.html"}, pctx)
 }
 
+func isValidArchiveYearMonth(ym string) bool {
+	if len(ym) != 7 || ym[4] != '-' {
+		return false
+	}
+	yr, err1 := strconv.Atoi(ym[:4])
+	mo, err2 := strconv.Atoi(ym[5:7])
+	return err1 == nil && err2 == nil && yr >= 1970 && yr <= 9999 && mo >= 1 && mo <= 12
+}
+
 func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Request) {
 	ym := strings.TrimPrefix(r.URL.Path, "/archives/")
+	if !isValidArchiveYearMonth(ym) {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
 	viewer, _ := s.resolveViewer(r)
 	pctx := s.basePageContext(r, viewer)
 	page := parsePageParam(r)
@@ -1383,6 +1537,10 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 		YearMonth: ym,
 		Locale:    pctx.Locale,
 	})
+	if total == 0 {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
 	pctx.HeroTitle = ym
 	pctx.PageTitle = ym + " · " + pctx.Site.Title
 	pctx.ArticleCards = cards
@@ -1429,6 +1587,39 @@ func (s *AppServer) handleBookshelf(w http.ResponseWriter, r *http.Request) {
 	s.renderStudio(w, r, http.StatusOK, "bookshelf.html", pctx)
 }
 
+func (s *AppServer) extractLocalPostSlugFromChapterURL(r *http.Request, rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	pathPart := ""
+	if strings.HasPrefix(rawURL, "/") && !strings.HasPrefix(rawURL, "//") {
+		pathPart = rawURL
+	} else if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
+		pubBase := s.publicBaseURL(r)
+		pubParsed, pErr := url.Parse(pubBase)
+		sameHost := strings.EqualFold(u.Host, r.Host) || (pErr == nil && strings.EqualFold(u.Host, pubParsed.Host))
+		if sameHost {
+			pathPart = u.Path
+		}
+	}
+	if idx := strings.IndexAny(pathPart, "?#"); idx >= 0 {
+		pathPart = pathPart[:idx]
+	}
+	if !strings.HasPrefix(pathPart, "/posts/") {
+		return ""
+	}
+	seg := strings.Trim(strings.TrimPrefix(pathPart, "/posts/"), "/")
+	if seg == "" || strings.Contains(seg, "/") || strings.HasSuffix(seg, ".md") {
+		return ""
+	}
+	decoded, err := url.PathUnescape(seg)
+	if err != nil || decoded == "" {
+		return seg
+	}
+	return decoded
+}
+
 func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/books/"))
 	viewer, _ := s.resolveViewer(r)
@@ -1445,6 +1636,26 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 			if bk.FlatChapters[i].ID == chID {
 				pctx.ActiveChapter = &bk.FlatChapters[i]
 				break
+			}
+		}
+		if pctx.ActiveChapter == nil {
+			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+			return
+		}
+	}
+	if pctx.ActiveChapter != nil {
+		if postSlug := s.extractLocalPostSlugFromChapterURL(r, pctx.ActiveChapter.URL); postSlug != "" {
+			if raw, gErr := s.deps.Content.GetPublishedRawArticleBySlug(r.Context(), postSlug); gErr == nil {
+				if detail, _, _, _, rErr := s.deps.Content.RenderArticleDetail(
+					r.Context(), w, r, raw, viewer, pctx.Locale, s.publicBaseURL(r),
+				); rErr == nil {
+					if detail.IsPasswordProtected || detail.RequiresPassword || detail.UnlockedViaShare {
+						pctx.NoIndex = true
+					}
+					if !detail.RequiresPassword {
+						pctx.ActiveChapterHTML = detail.HTML
+					}
+				}
 			}
 		}
 	}
@@ -1507,6 +1718,28 @@ func (s *AppServer) handleLegacyAdminRedirect(w http.ResponseWriter, r *http.Req
 }
 
 func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.isSameOriginRequest(r) {
+		http.Error(w, "403 Forbidden", http.StatusForbidden)
+		return
+	}
+	if r.Method == http.MethodGet {
+		// Reject subresource GET CSRF (e.g. <img src="/logout">, <script src="/logout">, cross-site iframe).
+		sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+		sfm := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")))
+		sfd := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")))
+		if (sfs != "" && sfs != "same-origin" && sfs != "none") ||
+			(sfm != "" && sfm != "navigate") ||
+			(sfd != "" && sfd != "document") {
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
 	viewer, sess := s.resolveViewer(r)
 	if viewer != nil && sess != nil {
 		_ = s.deps.Auth.RevokeSession(r.Context(), viewer, sess.ID)
@@ -1518,6 +1751,14 @@ func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Re
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "__volo_2fa_trust",
+		Value:    "",
+		Path:     "/api/admin/auth",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
 	})
 	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
 	if adminPrefix == "/" {
@@ -1555,13 +1796,6 @@ func (s *AppServer) handlePublicGitHubShowcaseRoute(w http.ResponseWriter, r *ht
 		http.Redirect(w, r, visibility.ArticlePath(slug), http.StatusFound)
 		return
 	}
-	// If GitHub username is configured, lazily materialize the showcase post on first visit!
-	if strings.TrimSpace(s.deps.Settings.Snapshot().SEO.GitHubUsername) != "" {
-		if art, pErr := s.publishGitHubShowcaseArticle(r.Context(), nil); pErr == nil && art != nil {
-			http.Redirect(w, r, visibility.ArticlePath(art.Slug), http.StatusFound)
-			return
-		}
-	}
 	s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 }
 
@@ -1576,14 +1810,12 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 		http.NotFound(w, r)
 		return
 	}
-	// Serve user-provided static file if placed in uploads/images/ or data/images/
+	// Serve user-provided static file if placed in uploads/images/ or data/images/ with strict CSP + attachment safety
 	for _, baseDir := range []string{s.deps.Config.UploadDir, s.deps.Config.DataDir} {
 		if strings.TrimSpace(baseDir) == "" {
 			continue
 		}
-		cand := filepath.Join(baseDir, "images", filepath.FromSlash(clean))
-		if info, err := os.Stat(cand); err == nil && !info.IsDir() {
-			http.ServeFile(w, r, cand)
+		if serveSafeUserStaticFile(w, r, filepath.Join(baseDir, "images"), clean) {
 			return
 		}
 	}
@@ -1604,6 +1836,8 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 	}
 
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {

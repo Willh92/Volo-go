@@ -195,5 +195,19 @@
   "studio.comments_count": "{count} 条评论",
   "studio.views_count": "{count} 次浏览",
   "footer.rss": "RSS 订阅",
-  "footer.sitemap": "站点地图"
+  "footer.sitemap": "站点地图",
+  "article.share_label": "分享与引用",
+  "article.copy_link": "复制链接",
+  "article.copied_link": "链接已复制",
+  "article.copy_markdown": "复制 Markdown 引用",
+  "article.copied_markdown": "引用已复制",
+  "article.native_share": "系统分享",
+  "error.default_title": "页面暂时无法访问",
+  "error.hint_404": "你可能访问了已移动的旧链接，可以尝试站内搜索或返回首页继续浏览。",
+  "error.hint_default": "请求未能顺利完成，请稍后重试或返回首页。",
+  "error.back_home": "返回首页",
+  "error.search_site": "搜索全站",
+  "studio.close": "关闭",
+  "studio.lightbox_label": "图片预览",
+  "studio.lightbox_close": "关闭预览"
 }

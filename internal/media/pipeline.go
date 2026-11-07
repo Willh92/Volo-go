@@ -30,9 +30,30 @@ import (
 )
 
 const (
-	maxImagePixels    = 64_000_000 // 64 Megapixel decompression-bomb ceiling
-	maxImageDimension = 16384
+	maxImagePixels       = 24_000_000 // 24 Megapixel decompression-bomb ceiling
+	maxGIFTotalPixels    = 32_000_000 // 32 Megapixel animated GIF multi-frame ceiling
+	maxImageDimension    = 16384
 )
+
+var transcodeSem = make(chan struct{}, 1)
+
+func isForbiddenUploadExt(ext string) bool {
+	switch strings.ToLower(strings.TrimSpace(ext)) {
+	case ".svg", ".html", ".htm", ".xml", ".xhtml", ".js", ".mjs":
+		return true
+	default:
+		return false
+	}
+}
+
+func isForbiddenUploadMIME(ct string) bool {
+	lower := strings.ToLower(strings.TrimSpace(ct))
+	return strings.Contains(lower, "svg") ||
+		strings.Contains(lower, "html") ||
+		strings.Contains(lower, "xml") ||
+		strings.Contains(lower, "javascript") ||
+		strings.Contains(lower, "ecmascript")
+}
 
 // PipelineOptions configures the privacy-first media upload, EXIF-strip, WebP, S3, and orphan scanner pipeline.
 type PipelineOptions struct {
@@ -71,6 +92,10 @@ func (p *Pipeline) Name() string { return "builtin-media" }
 
 // Put satisfies `plugin.StorageProvider` for raw binary storage according to the active storage driver.
 func (p *Pipeline) Put(ctx context.Context, objectKey string, r io.Reader, size int64, contentType string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(objectKey)))
+	if isForbiddenUploadExt(ext) || isForbiddenUploadMIME(contentType) {
+		return "", errors.New("active markup or script uploads (.svg/.html/.xml/.js) are forbidden")
+	}
 	maxBytes := p.maxUploadBytes()
 	if size > maxBytes {
 		return "", fmt.Errorf("payload size %d exceeds maximum %d bytes", size, maxBytes)
@@ -88,7 +113,7 @@ func (p *Pipeline) HealthCheck(ctx context.Context) error {
 	return p.TestStorage(ctx, nil, "")
 }
 
-// Upload validates magic bytes, blocks decompression bombs (`<= 64 MP`), normalizes EXIF orientation (`1..8`),
+// Upload validates magic bytes, blocks decompression bombs (`<= 24 MP`), normalizes EXIF orientation (`1..8`),
 // strips 100% of EXIF/GPS/camera metadata via clean pixel re-encoding, adaptively encodes pure-Go WebP,
 // extracts intrinsic `width`/`height` for zero-CLS rendering, and persists to Local/S3/Plugin storage.
 func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename string, _ string, r io.Reader) (*domain.MediaAsset, error) {
@@ -103,8 +128,8 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 
 	origBase := filepath.Base(strings.TrimSpace(origFilename))
 	ext := strings.ToLower(filepath.Ext(origBase))
-	if ext == ".svg" || ext == ".html" || ext == ".htm" || ext == ".xml" || ext == ".xhtml" {
-		return nil, errors.New("active markup uploads (.svg/.html/.xml) are forbidden for stored-XSS safety")
+	if isForbiddenUploadExt(ext) {
+		return nil, errors.New("active markup or script uploads (.svg/.html/.xml/.js) are forbidden for stored-XSS safety")
 	}
 
 	kind, detectedMIME, err := classifyAndVerifyMagic(ext, raw)
@@ -120,90 +145,106 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 	exifStripped := false
 
 	if kind == mediaKindImage {
-		// Step 1: Decompression-bomb pre-check BEFORE allocating full pixel buffers!
-		cfg, formatName, cfgErr := image.DecodeConfig(bytes.NewReader(raw))
-		if cfgErr != nil {
-			return nil, fmt.Errorf("invalid or corrupt image header: %w", cfgErr)
+		select {
+		case transcodeSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > maxImageDimension || cfg.Height > maxImageDimension ||
-			int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
-			return nil, fmt.Errorf("image dimensions %dx%d exceed 64MP decompression safety limit", cfg.Width, cfg.Height)
-		}
+		err = func() error {
+			defer func() { <-transcodeSem }()
 
-		// Multi-frame animated GIFs: preserve animation if clean (strip if EXIF/GPS present or single-frame)
-		isAnimatedGIF := false
-		if formatName == "gif" {
-			if g, gErr := gif.DecodeAll(bytes.NewReader(raw)); gErr == nil && len(g.Image) > 1 {
-				isAnimatedGIF = true
-				width, height = g.Config.Width, g.Config.Height
-				// Re-encode clean GIF frames without comment/application metadata extensions
-				var cleanGIF bytes.Buffer
-				if encErr := gif.EncodeAll(&cleanGIF, g); encErr == nil {
-					finalBytes = cleanGIF.Bytes()
-					exifStripped = true
-				}
+			// Step 1: Decompression-bomb pre-check BEFORE allocating full pixel buffers!
+			cfg, formatName, cfgErr := image.DecodeConfig(bytes.NewReader(raw))
+			if cfgErr != nil {
+				return fmt.Errorf("invalid or corrupt image header: %w", cfgErr)
 			}
-		}
-
-		if !isAnimatedGIF {
-			orient := ReadEXIFOrientation(raw)
-			img, _, decErr := image.Decode(bytes.NewReader(raw))
-			if decErr != nil {
-				return nil, fmt.Errorf("image decode failed: %w", decErr)
-			}
-			upright := ApplyEXIFOrientation(img, orient)
-			b := upright.Bounds()
-			width, height = b.Dx(), b.Dy()
-
-			quality := stCfg.ImageQuality
-			if quality < 40 || quality > 100 {
-				quality = 85
+			if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > maxImageDimension || cfg.Height > maxImageDimension ||
+				int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
+				return fmt.Errorf("image dimensions %dx%d exceed 24MP decompression safety limit", cfg.Width, cfg.Height)
 			}
 
-			// Always re-encode fresh pixel buffers so 100% of EXIF GPS, camera serials, thumbnails, and XMP are stripped!
-			var baselineBuf bytes.Buffer
-			baselineExt := ext
-			baselineMIME := detectedMIME
-			switch formatName {
-			case "png", "gif":
-				enc := png.Encoder{CompressionLevel: png.DefaultCompression}
-				if err := enc.Encode(&baselineBuf, upright); err != nil {
-					return nil, fmt.Errorf("png re-encode failed: %w", err)
-				}
-				baselineExt = ".png"
-				baselineMIME = "image/png"
-			case "webp":
-				if err := nativewebp.Encode(&baselineBuf, upright, nil); err != nil {
-					return nil, fmt.Errorf("webp re-encode failed: %w", err)
-				}
-				baselineExt = ".webp"
-				baselineMIME = "image/webp"
-			default: // jpeg
-				if err := jpeg.Encode(&baselineBuf, upright, &jpeg.Options{Quality: quality}); err != nil {
-					return nil, fmt.Errorf("jpeg re-encode failed: %w", err)
-				}
-				baselineExt = ".jpg"
-				baselineMIME = "image/jpeg"
-			}
-
-			finalBytes = baselineBuf.Bytes()
-			finalExt = baselineExt
-			finalMIME = baselineMIME
-
-			// Pure-Go Adaptive WebP: encode lossless WebP and adopt it whenever smaller than baseline (or when already WebP)
-			if stCfg.AdaptiveWebP && formatName != "webp" {
-				var webpBuf bytes.Buffer
-				if wErr := nativewebp.Encode(&webpBuf, upright, nil); wErr == nil && webpBuf.Len() > 0 && webpBuf.Len() < len(finalBytes) {
-					finalBytes = webpBuf.Bytes()
-					finalExt = ".webp"
-					finalMIME = "image/webp"
+			// Multi-frame animated GIFs: preserve animation if clean and bounded by total frame pixels
+			isAnimatedGIF := false
+			if formatName == "gif" {
+				if g, gErr := gif.DecodeAll(bytes.NewReader(raw)); gErr == nil && len(g.Image) > 1 {
+					totalGIFPixels := int64(cfg.Width) * int64(cfg.Height) * int64(len(g.Image))
+					if totalGIFPixels > maxGIFTotalPixels {
+						return fmt.Errorf("animated GIF frame budget (%d pixels across %d frames) exceeds 32MP safety limit", totalGIFPixels, len(g.Image))
+					}
+					isAnimatedGIF = true
+					width, height = g.Config.Width, g.Config.Height
+					var cleanGIF bytes.Buffer
+					if encErr := gif.EncodeAll(&cleanGIF, g); encErr == nil {
+						finalBytes = cleanGIF.Bytes()
+						exifStripped = true
+					}
 				}
 			}
 
-			if ContainsEXIFOrGPS(finalBytes) {
-				return nil, errors.New("privacy invariant violation: residual metadata detected after pixel re-encode")
+			if !isAnimatedGIF {
+				orient := ReadEXIFOrientation(raw)
+				img, _, decErr := image.Decode(bytes.NewReader(raw))
+				if decErr != nil {
+					return fmt.Errorf("image decode failed: %w", decErr)
+				}
+				upright := ApplyEXIFOrientation(img, orient)
+				b := upright.Bounds()
+				width, height = b.Dx(), b.Dy()
+
+				quality := stCfg.ImageQuality
+				if quality < 40 || quality > 100 {
+					quality = 85
+				}
+
+				// Always re-encode fresh pixel buffers so 100% of EXIF GPS, camera serials, thumbnails, and XMP are stripped!
+				var baselineBuf bytes.Buffer
+				baselineExt := ext
+				baselineMIME := detectedMIME
+				switch formatName {
+				case "png", "gif":
+					enc := png.Encoder{CompressionLevel: png.DefaultCompression}
+					if err := enc.Encode(&baselineBuf, upright); err != nil {
+						return fmt.Errorf("png re-encode failed: %w", err)
+					}
+					baselineExt = ".png"
+					baselineMIME = "image/png"
+				case "webp":
+					if err := nativewebp.Encode(&baselineBuf, upright, nil); err != nil {
+						return fmt.Errorf("webp re-encode failed: %w", err)
+					}
+					baselineExt = ".webp"
+					baselineMIME = "image/webp"
+				default: // jpeg
+					if err := jpeg.Encode(&baselineBuf, upright, &jpeg.Options{Quality: quality}); err != nil {
+						return fmt.Errorf("jpeg re-encode failed: %w", err)
+					}
+					baselineExt = ".jpg"
+					baselineMIME = "image/jpeg"
+				}
+
+				finalBytes = baselineBuf.Bytes()
+				finalExt = baselineExt
+				finalMIME = baselineMIME
+
+				// Pure-Go Adaptive WebP: encode lossless WebP and adopt it whenever smaller than baseline (or when already WebP)
+				if stCfg.AdaptiveWebP && formatName != "webp" {
+					var webpBuf bytes.Buffer
+					if wErr := nativewebp.Encode(&webpBuf, upright, nil); wErr == nil && webpBuf.Len() > 0 && webpBuf.Len() < len(finalBytes) {
+						finalBytes = webpBuf.Bytes()
+						finalExt = ".webp"
+						finalMIME = "image/webp"
+					}
+				}
+
+				if ContainsEXIFOrGPS(finalBytes) {
+					return errors.New("privacy invariant violation: residual metadata detected after pixel re-encode")
+				}
+				exifStripped = true
 			}
-			exifStripped = true
+			return nil
+		}()
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -221,6 +262,7 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 		ObjectKey:     objectKey,
 		PublicURL:     publicURL,
 		OriginalName:  origBase,
+		AltText:       "",
 		MIMEType:      finalMIME,
 		SizeBytes:     int64(len(finalBytes)),
 		Width:         width,
@@ -232,9 +274,9 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 	}
 
 	if _, err := p.store.ExecContext(ctx,
-		`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		asset.ID, asset.StorageDriver, asset.ObjectKey, asset.PublicURL, asset.OriginalName,
+		`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, alt_text, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		asset.ID, asset.StorageDriver, asset.ObjectKey, asset.PublicURL, asset.OriginalName, asset.AltText,
 		asset.MIMEType, asset.SizeBytes, asset.Width, asset.Height, asset.SHA256,
 		asset.EXIFStripped, asset.UploaderID, asset.CreatedAt,
 	); err != nil {
@@ -245,6 +287,20 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 		p.onDimsUpdated(asset.PublicURL, width, height)
 	}
 	return &asset, nil
+}
+
+func (p *Pipeline) resolvePluginStorage(driver string) plugin.StorageProvider {
+	if p.plugins == nil || driver == "" {
+		return nil
+	}
+	prov := p.plugins.Providers()
+	if sp, ok := prov.StorageByID(driver); ok && sp != nil {
+		return sp
+	}
+	if sp := prov.ActiveStorage(); sp != nil && strings.EqualFold(sp.Name(), driver) {
+		return sp
+	}
+	return nil
 }
 
 // Delete removes a MediaAsset by ID from both backing storage and `media_assets`.
@@ -269,10 +325,8 @@ func (p *Pipeline) deleteAssetRecord(ctx context.Context, asset domain.MediaAsse
 			}
 		}
 	default:
-		if p.plugins != nil {
-			if sp := p.plugins.Providers().ActiveStorage(); sp != nil && sp.Name() == asset.StorageDriver {
-				_ = sp.Delete(ctx, asset.ObjectKey)
-			}
+		if sp := p.resolvePluginStorage(asset.StorageDriver); sp != nil {
+			_ = sp.Delete(ctx, asset.ObjectKey)
 		}
 	}
 	_, err := p.store.ExecContext(ctx, `DELETE FROM media_assets WHERE id = ?`, asset.ID)
@@ -307,10 +361,8 @@ func (p *Pipeline) TestStorage(ctx context.Context, override *domain.StorageSett
 		}
 		return cli.HealthCheck(ctx)
 	default:
-		if p.plugins != nil {
-			if sp := p.plugins.Providers().ActiveStorage(); sp != nil && sp.Name() == driver {
-				return sp.HealthCheck(ctx)
-			}
+		if sp := p.resolvePluginStorage(driver); sp != nil {
+			return sp.HealthCheck(ctx)
 		}
 		return fmt.Errorf("unknown storage driver %q", driver)
 	}
@@ -321,11 +373,12 @@ func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []
 	driver := strings.ToLower(strings.TrimSpace(cfg.ActiveDriver))
 
 	// Check if an external plugin StorageProvider is explicitly selected
-	if driver != "" && driver != "local" && driver != "s3" && p.plugins != nil {
-		if sp := p.plugins.Providers().ActiveStorage(); sp != nil && sp.Name() == driver {
+	if driver != "" && driver != "local" && driver != "s3" {
+		if sp := p.resolvePluginStorage(driver); sp != nil {
 			u, err := sp.Put(ctx, objectKey, bytes.NewReader(data), int64(len(data)), contentType)
 			return driver, u, err
 		}
+		return "", "", fmt.Errorf("storage plugin %q is not active or registered", driver)
 	}
 
 	if driver == "s3" {

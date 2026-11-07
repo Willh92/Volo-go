@@ -85,6 +85,20 @@ type Service struct {
 	pendingCodes map[string]*pendingEmailCode
 }
 
+var (
+	dummyHashOnce     sync.Once
+	dummyPasswordHash string
+)
+
+func verifyDummyPassword(rawPassword string) {
+	dummyHashOnce.Do(func() {
+		dummyPasswordHash, _ = HashPassword("volo-timing-equalizer-dummy-secret")
+	})
+	if dummyPasswordHash != "" {
+		VerifyPassword(rawPassword, dummyPasswordHash, "")
+	}
+}
+
 func NewService(store *sqlx.Store, keyRing *config.KeyRing, settingsMgr *repo.SettingsManager, publicURL string) *Service {
 	return &Service{
 		store:        store,
@@ -177,6 +191,12 @@ func (s *Service) LoginStaff(
 ) (*LoginResult, error) {
 	u, err := s.findUserByIdent(ctx, ident)
 	if err != nil {
+		verifyDummyPassword(rawPassword)
+		return nil, ErrInvalidCredentials
+	}
+
+	matched, needsUpgrade := VerifyPassword(rawPassword, u.PasswordHash, u.LegacyHash)
+	if !matched {
 		return nil, ErrInvalidCredentials
 	}
 	// Physical boundary: Reader accounts CANNOT log in to the staff console!
@@ -185,11 +205,6 @@ func (s *Service) LoginStaff(
 	}
 	if u.Status != domain.UserStatusActive {
 		return nil, ErrForbidden
-	}
-
-	matched, needsUpgrade := VerifyPassword(rawPassword, u.PasswordHash, u.LegacyHash)
-	if !matched {
-		return nil, ErrInvalidCredentials
 	}
 
 	// Silent Legacy Password Upgrade (PBKDF2 / bolomd5x2 -> Argon2id) on first login!
@@ -207,7 +222,7 @@ func (s *Service) LoginStaff(
 	if err != nil {
 		return nil, err
 	}
-	if hasTOTP && !s.verifyTrusted2FATicket(trusted2FACookie, u.ID, userAgent) {
+	if hasTOTP && !s.verifyTrusted2FATicket(trusted2FACookie, u.ID, u.PasswordHash, userAgent) {
 		ipBucket := security.RateLimitBucketKey(clientIP)
 		chal, cErr := SealTwoFactorChallenge(s.keyRing, u.ID, ipBucket, userAgent)
 		if cErr != nil {
@@ -321,7 +336,7 @@ func (s *Service) CompleteStaff2FA(
 	var totpUntil int64
 	if rememberDevice {
 		totpUntil = now.Add(time.Duration(rememberDays) * 24 * time.Hour).UnixMilli()
-		trustedDeviceCookie, _ = s.mintTrusted2FATicket(u.ID, userAgent, totpUntil)
+		trustedDeviceCookie, _ = s.mintTrusted2FATicket(u.ID, u.PasswordHash, userAgent, totpUntil)
 	}
 
 	sess, rawTok, err := s.CreateSession(ctx, u.ID, clientIP, geoRegion, userAgent, totpUntil)
@@ -493,17 +508,25 @@ func (s *Service) IssueReaderVerificationCode(email string) (string, error) {
 	emailSum := sha256.Sum256([]byte(normEmail))
 	codeSum := sha256.Sum256([]byte(normEmail + ":" + code))
 
+	const maxPendingEmailCodes = 2048
+	key := hex.EncodeToString(emailSum[:])
 	s.codeMu.Lock()
-	if len(s.pendingCodes) > 4096 {
+	if _, exists := s.pendingCodes[key]; !exists && len(s.pendingCodes) >= maxPendingEmailCodes {
 		now := time.Now()
 		for k, v := range s.pendingCodes {
 			if now.After(v.expiresAt) {
 				delete(s.pendingCodes, k)
 			}
 		}
+		for k := range s.pendingCodes {
+			if len(s.pendingCodes) < maxPendingEmailCodes {
+				break
+			}
+			delete(s.pendingCodes, k)
+		}
 	}
-	s.pendingCodes[hex.EncodeToString(emailSum[:])] = &pendingEmailCode{
-		emailHash: hex.EncodeToString(emailSum[:]),
+	s.pendingCodes[key] = &pendingEmailCode{
+		emailHash: key,
 		codeHash:  hex.EncodeToString(codeSum[:]),
 		attempts:  0,
 		expiresAt: time.Now().Add(10 * time.Minute),
@@ -591,6 +614,11 @@ func (s *Service) LoginReader(
 ) (*LoginResult, error) {
 	u, err := s.findUserByIdent(ctx, ident)
 	if err != nil {
+		verifyDummyPassword(rawPassword)
+		return nil, ErrInvalidCredentials
+	}
+	matched, needsUpgrade := VerifyPassword(rawPassword, u.PasswordHash, u.LegacyHash)
+	if !matched {
 		return nil, ErrInvalidCredentials
 	}
 	// Block Admin and Editor accounts on public reader login endpoint!
@@ -599,10 +627,6 @@ func (s *Service) LoginReader(
 	}
 	if u.Status != domain.UserStatusActive || u.EmailVerifiedAt <= 0 {
 		return nil, ErrForbidden
-	}
-	matched, needsUpgrade := VerifyPassword(rawPassword, u.PasswordHash, u.LegacyHash)
-	if !matched {
-		return nil, ErrInvalidCredentials
 	}
 	if needsUpgrade {
 		if newHash, hErr := HashPassword(rawPassword); hErr == nil {
@@ -731,6 +755,19 @@ func (s *Service) RevokeSession(ctx context.Context, actor *domain.User, session
 		return err
 	}
 	_, err := s.store.ExecContext(ctx, `DELETE FROM user_sessions WHERE id = ? AND user_id = ?`, sessionID, actor.ID)
+	return err
+}
+
+// RevokeOtherSessions kicks all sessions of userID except keepSessionID (e.g. after password rotation).
+func (s *Service) RevokeOtherSessions(ctx context.Context, userID string, keepSessionID string) error {
+	if strings.TrimSpace(userID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(keepSessionID) == "" {
+		_, err := s.store.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ?`, userID)
+		return err
+	}
+	_, err := s.store.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ? AND id <> ?`, userID, keepSessionID)
 	return err
 }
 
@@ -888,13 +925,23 @@ func (s *Service) userHasTOTPEnabled(ctx context.Context, userID string) (bool, 
 	return len(rows) > 0, nil
 }
 
-func (s *Service) mintTrusted2FATicket(userID string, userAgent string, expiresAtMS int64) (string, error) {
+func passwordBindingDigest(pwHash string) string {
+	n := len(pwHash)
+	if n > 16 {
+		n = 16
+	}
+	sum := sha256.Sum256([]byte("volo-pwbind:v1:" + pwHash[:n]))
+	return hex.EncodeToString(sum[:8])
+}
+
+func (s *Service) mintTrusted2FATicket(userID string, passwordHash string, userAgent string, expiresAtMS int64) (string, error) {
 	uaSum := sha256.Sum256([]byte(strings.TrimSpace(userAgent)))
-	payload := fmt.Sprintf("%s|%x|%d", userID, uaSum[:8], expiresAtMS)
+	pwTag := passwordBindingDigest(passwordHash)
+	payload := fmt.Sprintf("%s|%x|%s|%d", userID, uaSum[:8], pwTag, expiresAtMS)
 	return s.keyRing.SealString(payload, "auth:trusted-2fa")
 }
 
-func (s *Service) verifyTrusted2FATicket(cookieVal string, expectedUserID string, userAgent string) bool {
+func (s *Service) verifyTrusted2FATicket(cookieVal string, expectedUserID string, passwordHash string, userAgent string) bool {
 	if strings.TrimSpace(cookieVal) == "" {
 		return false
 	}
@@ -903,15 +950,19 @@ func (s *Service) verifyTrusted2FATicket(cookieVal string, expectedUserID string
 		return false
 	}
 	parts := strings.Split(opened, "|")
-	if len(parts) != 3 || parts[0] != expectedUserID {
+	if len(parts) != 4 || parts[0] != expectedUserID {
 		return false
 	}
 	uaSum := sha256.Sum256([]byte(strings.TrimSpace(userAgent)))
 	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(hex.EncodeToString(uaSum[:8]))) != 1 {
 		return false
 	}
+	expectedPWTag := passwordBindingDigest(passwordHash)
+	if subtle.ConstantTimeCompare([]byte(parts[2]), []byte(expectedPWTag)) != 1 {
+		return false
+	}
 	var exp int64
-	_, _ = fmt.Sscanf(parts[2], "%d", &exp)
+	_, _ = fmt.Sscanf(parts[3], "%d", &exp)
 	return time.Now().UnixMilli() < exp
 }
 
