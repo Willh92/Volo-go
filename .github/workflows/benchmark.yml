@@ -1,0 +1,64 @@
+name: Benchmark
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Performance Benchmarks & Footprint Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24 & Build Admin SPA
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/admin/package-lock.json
+
+      - name: Build Embedded Admin Dist
+        working-directory: web/admin
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Benchmarks & Publish Step Summary
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go test -run=^$ -bench=. -benchmem -benchtime=250ms \
+            ./internal/render ./internal/visibility ./internal/db/sqlx ./internal/server | tee /tmp/bench.out
+          bash scripts/verify-binary-budget.sh | tee /tmp/budget.out
+
+          {
+            echo "## Volo-go Performance & Footprint Report"
+            echo ""
+            echo "### Binary & Memory Footprint Gate"
+            echo '```text'
+            cat /tmp/budget.out
+            echo '```'
+            echo ""
+            echo '### Micro & End-to-End Benchmarks (`CGO_ENABLED=0`)'
+            echo '```text'
+            grep -E '^(pkg:|Benchmark|PASS|ok)' /tmp/bench.out
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

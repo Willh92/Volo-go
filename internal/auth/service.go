@@ -706,7 +706,7 @@ func (s *Service) AuthenticateSession(ctx context.Context, rawToken string) (*do
 		return nil, nil, ErrUnauthorized
 	}
 	if now-sess.LastSeenAt > 60_000 {
-		_, _ = s.store.ExecContext(ctx, `UPDATE user_sessions SET last_seen_at = ? WHERE id = ?`, now, sess.ID)
+		_, _ = s.store.ExecBgContext(ctx, `UPDATE user_sessions SET last_seen_at = ? WHERE id = ?`, now, sess.ID)
 	}
 	sess.TokenHash = ""
 	clean := sanitizeUser(u)
@@ -857,7 +857,10 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 	if err := RequireStaff(&u); err != nil {
 		return nil, nil, err
 	}
-	_, _ = s.store.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`, now, rec.ID)
+	if now-rec.LastUsedAt > 60_000 {
+		_, _ = s.store.ExecBgContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`, now, rec.ID)
+		rec.LastUsedAt = now
+	}
 	rec.TokenHash = ""
 	clean := sanitizeUser(u)
 	return &clean, &rec, nil

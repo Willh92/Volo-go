@@ -1,0 +1,31 @@
+# ==============================================================================
+# Volo-go Caddy v2 Reverse Proxy Configuration (Automatic HTTPS + HTTP/3)
+# Matching .env settings:
+#   VOLO_LISTEN_ADDR=127.0.0.1:8080
+#   VOLO_PUBLIC_URL=https://blog.example.com
+#   VOLO_TRUSTED_PROXIES=127.0.0.1/32,::1/128
+# ==============================================================================
+
+blog.example.com {
+    request_body {
+        max_size 128MB
+    }
+
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    # Option A: TCP loopback (default)
+    reverse_proxy 127.0.0.1:8080 {
+        flush_interval -1
+        health_uri /healthz
+        health_interval 30s
+    }
+
+    # Option B: Unix Domain Socket (uncomment if VOLO_LISTEN_SOCKET=/run/volo/volo.sock)
+    # reverse_proxy unix//run/volo/volo.sock {
+    #     health_uri /healthz
+    # }
+}

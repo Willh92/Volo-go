@@ -1,0 +1,33 @@
+name: Feature Request / 功能建议
+description: Propose an enhancement aligned with Volo-go's lightweight single-binary design / 提出符合轻量单二进制理念的功能建议
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case / 使用场景与痛点
+      description: What problem does this solve for independent authors or self-hosters?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Design / 期望方案
+      description: Describe the expected CLI, API, UI, plugin, or theme behavior.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Architectural Layer / 归属层次
+      options:
+        - Core Engine (Go Backend / SQL Dialect / CLI)
+        - Studio Admin Console (Preact + Signals + CM6)
+        - Public Theme (`volo-studio` / `volo-journal` / External Theme)
+        - Plugin SDK (`goja` / External HTTP Webhook)
+        - Deployment / Service Scripts / Reverse Proxy
+    validations:
+      required: true

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.volo.blog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VOLO_BIN__</string>
+        <string>serve</string>
+        <string>--env-file</string>
+        <string>__VOLO_ENV_FILE__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__VOLO_WORK_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ExitTimeOut</key>
+    <integer>20</integer>
+
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__VOLO_LOG_DIR__/volo.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__VOLO_LOG_DIR__/volo.err.log</string>
+</dict>
+</plist>

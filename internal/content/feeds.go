@@ -77,6 +77,17 @@ func (s *Service) BuildRSSXML(ctx context.Context, publicBaseURL string, locale 
 		return nil, err
 	}
 
+	lastBuild := time.Now().UTC().Format(time.RFC1123Z)
+	if len(items) > 0 {
+		ts := items[0].UpdatedAt
+		if ts <= 0 {
+			ts = items[0].PublishedAt
+		}
+		if ts > 0 {
+			lastBuild = time.UnixMilli(ts).UTC().Format(time.RFC1123Z)
+		}
+	}
+
 	var b bytes.Buffer
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	b.WriteString(`<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom">` + "\n")
@@ -86,7 +97,7 @@ func (s *Service) BuildRSSXML(ctx context.Context, publicBaseURL string, locale 
 	writeXMLTag(&b, "    ", "description", snap.Site.Description)
 	writeXMLTag(&b, "    ", "language", snap.Site.DefaultLocale)
 	fmt.Fprintf(&b, "    <atom:link href=%q rel=\"self\" type=\"application/rss+xml\"/>\n", base+"/rss.xml")
-	writeXMLTag(&b, "    ", "lastBuildDate", time.Now().UTC().Format(time.RFC1123Z))
+	writeXMLTag(&b, "    ", "lastBuildDate", lastBuild)
 
 	for _, it := range items {
 		b.WriteString("    <item>\n")
@@ -112,6 +123,50 @@ func (s *Service) BuildRSSXML(ctx context.Context, publicBaseURL string, locale 
 
 	b.WriteString("  </channel>\n</rss>\n")
 	return b.Bytes(), nil
+}
+
+// GetCachedRSS returns a revision-coherent, pre-compressed RSS 2.0 document with strong ETag.
+func (s *Service) GetCachedRSS(ctx context.Context, publicBaseURL string, locale string) (CachedDocument, error) {
+	key := "rss|" + strings.TrimRight(publicBaseURL, "/") + "|" + locale
+	return s.getOrBuildCachedDoc(ctx, key, "application/rss+xml; charset=utf-8", func(c context.Context) ([]byte, error) {
+		return s.BuildRSSXML(c, publicBaseURL, locale)
+	})
+}
+
+// GetCachedAtom returns a revision-coherent, pre-compressed Atom 1.0 document with strong ETag.
+func (s *Service) GetCachedAtom(ctx context.Context, publicBaseURL string, locale string) (CachedDocument, error) {
+	key := "atom|" + strings.TrimRight(publicBaseURL, "/") + "|" + locale
+	return s.getOrBuildCachedDoc(ctx, key, "application/atom+xml; charset=utf-8", func(c context.Context) ([]byte, error) {
+		return s.BuildAtomXML(c, publicBaseURL, locale)
+	})
+}
+
+// GetCachedPodcast returns a revision-coherent, pre-compressed iTunes Podcast RSS document with strong ETag.
+func (s *Service) GetCachedPodcast(ctx context.Context, publicBaseURL string, locale string) (CachedDocument, error) {
+	key := "podcast|" + strings.TrimRight(publicBaseURL, "/") + "|" + locale
+	return s.getOrBuildCachedDoc(ctx, key, "application/rss+xml; charset=utf-8", func(c context.Context) ([]byte, error) {
+		return s.BuildPodcastXML(c, publicBaseURL, locale)
+	})
+}
+
+// GetCachedSitemap returns a revision-coherent, pre-compressed Sitemap XML document with strong ETag.
+func (s *Service) GetCachedSitemap(ctx context.Context, publicBaseURL string) (CachedDocument, error) {
+	key := "sitemap|" + strings.TrimRight(publicBaseURL, "/")
+	return s.getOrBuildCachedDoc(ctx, key, "application/xml; charset=utf-8", func(c context.Context) ([]byte, error) {
+		return s.BuildSitemapXML(c, publicBaseURL)
+	})
+}
+
+// GetCachedLLMSTxt returns a revision-coherent, pre-compressed /llms.txt or /llms-full.txt document with strong ETag.
+func (s *Service) GetCachedLLMSTxt(ctx context.Context, publicBaseURL string, full bool) (CachedDocument, error) {
+	kind := "llms"
+	if full {
+		kind = "llms-full"
+	}
+	key := kind + "|" + strings.TrimRight(publicBaseURL, "/")
+	return s.getOrBuildCachedDoc(ctx, key, "text/plain; charset=utf-8", func(c context.Context) ([]byte, error) {
+		return s.BuildLLMSTxt(c, publicBaseURL, full)
+	})
 }
 
 // BuildAtomXML renders an RFC 4287 Atom 1.0 feed (`/atom.xml`) strictly enforcing Surface 6.

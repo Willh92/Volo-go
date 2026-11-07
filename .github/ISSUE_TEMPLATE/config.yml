@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability Disclosure / 私密安全漏洞上报
+    url: https://github.com/Willh92/Volo-go/security/advisories/new
+    about: Report security or privacy boundary vulnerabilities privately via GitHub Security Advisories.
+  - name: Documentation (中文文档)
+    url: https://github.com/Willh92/Volo-go/tree/main/docs/zh-CN
+    about: 阅读架构、部署、反代、CLI/API、主题插件与数据迁移文档。
+  - name: Documentation (English Docs)
+    url: https://github.com/Willh92/Volo-go/tree/main/docs/en-US
+    about: Read architecture, deployment, reverse proxy, CLI/API, theme/plugin, and migration guides.

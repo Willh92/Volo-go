@@ -30,6 +30,7 @@ type SettingsManager struct {
 	defaultLocale string
 	writeMu       sync.Mutex
 	snap          atomic.Pointer[domain.SettingsSnapshot]
+	rev           atomic.Uint64
 }
 
 func NewSettingsManager(store *sqlx.Store, keyRing *config.KeyRing, defaultLocale string) *SettingsManager {
@@ -40,12 +41,21 @@ func NewSettingsManager(store *sqlx.Store, keyRing *config.KeyRing, defaultLocal
 	}
 	def := domain.DefaultSettingsSnapshot(defaultLocale)
 	m.snap.Store(&def)
+	m.rev.Store(1)
 	return m
 }
 
 // Snapshot returns the current immutable hot-reloaded settings snapshot with zero DB queries.
 func (m *SettingsManager) Snapshot() domain.SettingsSnapshot {
 	return *m.snap.Load()
+}
+
+// Revision returns a monotonically increasing sequence incremented whenever settings reload or patch.
+func (m *SettingsManager) Revision() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.rev.Load()
 }
 
 // Reload loads all persisted setting domains from the database and swaps the in-memory snapshot atomically.
@@ -63,6 +73,7 @@ func (m *SettingsManager) Reload(ctx context.Context) (domain.SettingsSnapshot, 
 		}
 	}
 	m.snap.Store(&next)
+	m.rev.Add(1)
 	return next, nil
 }
 

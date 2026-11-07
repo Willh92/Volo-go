@@ -159,6 +159,21 @@ func (s *Service) ListRecentPublicComments(ctx context.Context, limit int) ([]Re
 	if limit <= 0 {
 		limit = 8
 	}
+	if limit <= maxCachedRecentCmts {
+		if snap, err := s.getChromeSnapshot(ctx); err == nil && snap != nil {
+			if len(snap.recentCmts) <= limit {
+				return snap.recentCmts, nil
+			}
+			return snap.recentCmts[:limit], nil
+		}
+	}
+	return s.queryRecentPublicComments(ctx, limit)
+}
+
+func (s *Service) queryRecentPublicComments(ctx context.Context, limit int) ([]RecentCommentItem, error) {
+	if limit <= 0 {
+		limit = 8
+	}
 	type joinedRecent struct {
 		ID          string `db:"id"`
 		AuthorName  string `db:"author_name"`

@@ -26,7 +26,9 @@ COPY . .
 COPY --from=admin-builder /src/internal/adminui/dist ./internal/adminui/dist
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -gcflags="all=-l" \
+    go build -trimpath \
+    -gcflags="all=-l" \
+    -gcflags="github.com/Willh92/Volo-go/...=" \
     -ldflags="-s -w -X main.Version=${VERSION}" \
     -o /out/volo ./cmd/volo
 
@@ -38,6 +40,7 @@ RUN mkdir -p \
       /volo-root/plugins \
       /volo-root/themes \
       /volo-root/locales && \
+    cp ./LICENSE ./THIRD_PARTY_NOTICES.md /volo-root/ && \
     cp -r ./plugins/kanbanniang /volo-root/plugins/kanbanniang && \
     cp -r ./themes/volo-journal /volo-root/themes/volo-journal && \
     chown -R 65532:65532 /volo-root
@@ -46,6 +49,10 @@ RUN mkdir -p \
 # Stage 3: Minimal Distroless Non-Root Runtime
 # ------------------------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
+LABEL org.opencontainers.image.title="Volo-go" \
+      org.opencontainers.image.description="Pure-Go single-binary sovereign blog engine" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/Willh92/Volo-go"
 WORKDIR /app
 
 COPY --from=go-builder --chown=65532:65532 /volo-root/ /app/

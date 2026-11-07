@@ -142,6 +142,11 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	}
 
 	var root http.Handler = mux
+	adminPath := config.DefaultAdminPath
+	if deps.Config != nil && deps.Config.AdminPath != "" {
+		adminPath = deps.Config.AdminPath
+	}
+	root = wrapPublicDynamicGzip(root, adminPath)
 	root = s.withRedirectGuardian(root)
 	if deps.WAF != nil {
 		root = deps.WAF.WrapHTTP(root)
@@ -152,6 +157,14 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 
 func (s *AppServer) Handler() http.Handler { return s.handler }
 func (s *AppServer) Deps() AppDeps         { return s.deps }
+
+// Close flushes buffered view/analytics counters before database shutdown.
+func (s *AppServer) Close(ctx context.Context) error {
+	if s == nil || s.deps.Content == nil {
+		return nil
+	}
+	return s.deps.Content.Close(ctx)
+}
 
 func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", NewHealthzHandler(s.deps.Store, s.deps.StartedAt))
@@ -347,25 +360,21 @@ func (s *AppServer) resolveViewer(r *http.Request) (*domain.User, *domain.UserSe
 }
 
 func (s *AppServer) handleRSS(w http.ResponseWriter, r *http.Request) {
-	xmlBytes, err := s.deps.Content.BuildRSSXML(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
+	doc, err := s.deps.Content.GetCachedRSS(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
 	if err != nil {
 		http.Error(w, "feed error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(xmlBytes)
+	serveCachedDocument(w, r, doc)
 }
 
 func (s *AppServer) handleAtom(w http.ResponseWriter, r *http.Request) {
-	xmlBytes, err := s.deps.Content.BuildAtomXML(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
+	doc, err := s.deps.Content.GetCachedAtom(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
 	if err != nil {
 		http.Error(w, "feed error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/atom+xml; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(xmlBytes)
+	serveCachedDocument(w, r, doc)
 }
 
 func (s *AppServer) handlePodcast(w http.ResponseWriter, r *http.Request) {
@@ -373,25 +382,21 @@ func (s *AppServer) handlePodcast(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	xmlBytes, err := s.deps.Content.BuildPodcastXML(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
+	doc, err := s.deps.Content.GetCachedPodcast(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
 	if err != nil {
 		http.Error(w, "podcast feed error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(xmlBytes)
+	serveCachedDocument(w, r, doc)
 }
 
 func (s *AppServer) handleSitemap(w http.ResponseWriter, r *http.Request) {
-	xmlBytes, err := s.deps.Content.BuildSitemapXML(r.Context(), s.publicBaseURL(r))
+	doc, err := s.deps.Content.GetCachedSitemap(r.Context(), s.publicBaseURL(r))
 	if err != nil {
 		http.Error(w, "sitemap error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(xmlBytes)
+	serveCachedDocument(w, r, doc)
 }
 
 func (s *AppServer) handleRobotsTxt(w http.ResponseWriter, r *http.Request) {
@@ -415,14 +420,12 @@ func (s *AppServer) handleLLMSTxt(w http.ResponseWriter, r *http.Request, full b
 		http.NotFound(w, r)
 		return
 	}
-	txt, err := s.deps.Content.BuildLLMSTxt(r.Context(), s.publicBaseURL(r), full)
+	doc, err := s.deps.Content.GetCachedLLMSTxt(r.Context(), s.publicBaseURL(r), full)
 	if err != nil {
 		http.Error(w, "llms.txt error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(txt)
+	serveCachedDocument(w, r, doc)
 }
 
 func (s *AppServer) handleGitHubStatsSVG(w http.ResponseWriter, r *http.Request) {

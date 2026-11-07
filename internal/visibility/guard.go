@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/domain"
@@ -133,6 +134,7 @@ type Guard struct {
 	passports *guest.PassportManager
 	catalog   *i18n.Catalog
 	renderer  *render.Engine
+	cache     *boundedRenderLRU
 	nowFn     func() time.Time
 }
 
@@ -153,8 +155,17 @@ func NewGuard(
 		passports: passports,
 		catalog:   catalog,
 		renderer:  renderer,
+		cache:     newBoundedRenderLRU(DefaultRenderCacheMaxBytes),
 		nowFn:     time.Now,
 	}
+}
+
+// PurgeCache clears cached Markdown render artifacts (e.g. when media asset dimensions are refreshed).
+func (g *Guard) PurgeCache() {
+	if g == nil || g.cache == nil {
+		return
+	}
+	g.cache.Purge()
 }
 
 // ArticlePath returns the canonical path `/posts/{slug}` for an article.
@@ -371,6 +382,20 @@ func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Categor
 		return card
 	}
 
+	ck := cardCacheKey(raw, locale, lookupDims != nil)
+	if cached, ok := g.cache.getCard(ck); ok {
+		card.Summary = cached.summary
+		card.CoverURL = cached.coverURL
+		card.HasAudio = strings.TrimSpace(raw.AudioURL) != ""
+		if card.WordCount <= 0 {
+			card.WordCount = cached.wordCount
+		}
+		if card.ReadingMinutes <= 0 {
+			card.ReadingMinutes = cached.readingMinutes
+		}
+		return card
+	}
+
 	// Surface 1 & 2 for `:::lock` posts: physically strip ALL `:::lock ... :::` blocks BEFORE summary & image extraction!
 	safeSummaryMD := render.StripAllLockBlocks(raw.SummaryMD)
 	safeContentMD := render.StripAllLockBlocks(raw.ContentMD)
@@ -399,6 +424,13 @@ func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Categor
 	if cover == "" {
 		cover = renderedContent.FirstImageURL
 	}
+
+	g.cache.putCard(ck, cachedCardMeta{
+		summary:        summaryText,
+		coverURL:       cover,
+		wordCount:      renderedContent.WordCount,
+		readingMinutes: renderedContent.ReadingMinutes,
+	})
 
 	card.Summary = summaryText
 	card.CoverURL = cover
@@ -494,18 +526,34 @@ func (g *Guard) ToDetail(
 		return view
 	}
 
-	out := g.renderer.Render(raw.ContentMD, render.Options{
-		Mode:             render.RenderModeWeb,
-		Locale:           deps.Locale,
-		ArticleID:        raw.ID,
-		Unlocked:         status.Unlocked,
-		IsReaderLoggedIn: viewer != nil && viewer.Status == domain.UserStatusActive,
-		HasAudio:         strings.TrimSpace(raw.AudioURL) != "",
-		ShowLineNumbers:  deps.ShowLineNumbers,
-		LookupBook:       deps.LookupBook,
-		ListBooks:        deps.ListBooks,
-		LookupMediaDims:  deps.LookupMediaDims,
-	})
+	isReaderLoggedIn := viewer != nil && viewer.Status == domain.UserStatusActive
+	hasBookEmbed := strings.Contains(raw.ContentMD, ":::book")
+	cacheableDetail := !isWholeProtected && !status.ViaShareToken && !hasBookEmbed
+
+	var out render.Output
+	var gotCached bool
+	var outKey string
+	if cacheableDetail {
+		outKey = outputCacheKey(raw, render.RenderModeWeb, deps.Locale, status.Unlocked, isReaderLoggedIn, deps.ShowLineNumbers, deps.LookupMediaDims != nil)
+		out, gotCached = g.cache.getOutput(outKey)
+	}
+	if !gotCached {
+		out = g.renderer.Render(raw.ContentMD, render.Options{
+			Mode:             render.RenderModeWeb,
+			Locale:           deps.Locale,
+			ArticleID:        raw.ID,
+			Unlocked:         status.Unlocked,
+			IsReaderLoggedIn: isReaderLoggedIn,
+			HasAudio:         strings.TrimSpace(raw.AudioURL) != "",
+			ShowLineNumbers:  deps.ShowLineNumbers,
+			LookupBook:       deps.LookupBook,
+			ListBooks:        deps.ListBooks,
+			LookupMediaDims:  deps.LookupMediaDims,
+		})
+		if cacheableDetail {
+			g.cache.putOutput(outKey, out)
+		}
+	}
 
 	view.HTML = out.HTML
 	view.TOC = out.TOC
@@ -522,34 +570,55 @@ func (g *Guard) ToDetail(
 	}
 
 	// Compute public-safe summary & OG image (never leaking locked blocks into meta tags!).
-	publicSummarySrc := render.StripAllLockBlocks(raw.SummaryMD)
-	publicContentSrc := render.StripAllLockBlocks(raw.ContentMD)
-	pubOut := g.renderer.Render(publicContentSrc, render.Options{
-		Mode:            render.RenderModeWeb,
-		Locale:          deps.Locale,
-		Unlocked:        false,
-		LookupMediaDims: deps.LookupMediaDims,
-	})
-	if strings.TrimSpace(publicSummarySrc) != "" {
-		sOut := g.renderer.Render(publicSummarySrc, render.Options{Locale: deps.Locale})
-		view.Summary = sOut.PlainText
-	} else {
-		view.Summary = truncateRunes(pubOut.PlainText, 160)
-	}
-
-	if isWholeProtected {
-		// Even when unlocked by the current visitor, OG meta tags remain generic!
-		view.OGImageURL = deps.DefaultOGImageURL
-	} else {
+	// Fast-path: when the article contains NO lock blocks at all, `out` already represents 100% public content,
+	// avoiding a duplicate second full goldmark + bluemonday render pass!
+	hasAnyLock := isWholeProtected || raw.HasContentLock || out.HasLockBlock || render.ContainsLockDirective(raw.ContentMD) || render.ContainsLockDirective(raw.SummaryMD)
+	if !hasAnyLock {
+		if strings.TrimSpace(raw.SummaryMD) != "" {
+			sOut := g.renderer.Render(raw.SummaryMD, render.Options{Locale: deps.Locale})
+			view.Summary = sOut.PlainText
+		} else {
+			view.Summary = truncateRunes(out.PlainText, 160)
+		}
 		view.CoverURL = raw.CoverURL
 		og := strings.TrimSpace(raw.CoverURL)
 		if og == "" {
-			og = pubOut.FirstImageURL
+			og = out.FirstImageURL
 		}
 		if og == "" {
 			og = deps.DefaultOGImageURL
 		}
 		view.OGImageURL = og
+	} else {
+		publicSummarySrc := render.StripAllLockBlocks(raw.SummaryMD)
+		publicContentSrc := render.StripAllLockBlocks(raw.ContentMD)
+		pubOut := g.renderer.Render(publicContentSrc, render.Options{
+			Mode:            render.RenderModeWeb,
+			Locale:          deps.Locale,
+			Unlocked:        false,
+			LookupMediaDims: deps.LookupMediaDims,
+		})
+		if strings.TrimSpace(publicSummarySrc) != "" {
+			sOut := g.renderer.Render(publicSummarySrc, render.Options{Locale: deps.Locale})
+			view.Summary = sOut.PlainText
+		} else {
+			view.Summary = truncateRunes(pubOut.PlainText, 160)
+		}
+
+		if isWholeProtected {
+			// Even when unlocked by the current visitor, OG meta tags remain generic!
+			view.OGImageURL = deps.DefaultOGImageURL
+		} else {
+			view.CoverURL = raw.CoverURL
+			og := strings.TrimSpace(raw.CoverURL)
+			if og == "" {
+				og = pubOut.FirstImageURL
+			}
+			if og == "" {
+				og = deps.DefaultOGImageURL
+			}
+			view.OGImageURL = og
+		}
 	}
 
 	view.AudioURL = raw.AudioURL
@@ -582,27 +651,44 @@ func (g *Guard) ToFeedItem(raw domain.RawArticle, fullOutput bool, locale string
 	if _, isProtected := g.DecryptArticlePassword(raw); isProtected {
 		return FeedItem{}, false
 	}
-	safeSummaryMD := render.StripAllLockBlocks(raw.SummaryMD)
-	safeContentMD := render.StripAllLockBlocks(raw.ContentMD)
 
-	feedOut := g.renderer.Render(raw.ContentMD, render.Options{
-		Mode:      render.RenderModeFeed,
-		Locale:    locale,
-		ArticleID: raw.ID,
-		Unlocked:  false,
-	})
-	pubPlainOut := g.renderer.Render(safeContentMD, render.Options{
-		Mode:     render.RenderModeFeed,
-		Locale:   locale,
-		Unlocked: false,
-	})
+	fKey := outputCacheKey(raw, render.RenderModeFeed, locale, false, false, false, false)
+	feedOut, ok := g.cache.getOutput(fKey)
+	if !ok {
+		feedOut = g.renderer.Render(raw.ContentMD, render.Options{
+			Mode:      render.RenderModeFeed,
+			Locale:    locale,
+			ArticleID: raw.ID,
+			Unlocked:  false,
+		})
+		if !strings.Contains(raw.ContentMD, ":::book") {
+			g.cache.putOutput(fKey, feedOut)
+		}
+	}
 
+	hasAnyLock := raw.HasContentLock || feedOut.HasLockBlock || render.ContainsLockDirective(raw.ContentMD) || render.ContainsLockDirective(raw.SummaryMD)
 	summary := ""
-	if strings.TrimSpace(safeSummaryMD) != "" {
-		sOut := g.renderer.Render(safeSummaryMD, render.Options{Mode: render.RenderModeFeed, Locale: locale})
-		summary = sOut.PlainText
+	if !hasAnyLock {
+		if strings.TrimSpace(raw.SummaryMD) != "" {
+			sOut := g.renderer.Render(raw.SummaryMD, render.Options{Mode: render.RenderModeFeed, Locale: locale})
+			summary = sOut.PlainText
+		} else {
+			summary = truncateRunes(feedOut.PlainText, 200)
+		}
 	} else {
-		summary = truncateRunes(pubPlainOut.PlainText, 200)
+		safeSummaryMD := render.StripAllLockBlocks(raw.SummaryMD)
+		if strings.TrimSpace(safeSummaryMD) != "" {
+			sOut := g.renderer.Render(safeSummaryMD, render.Options{Mode: render.RenderModeFeed, Locale: locale})
+			summary = sOut.PlainText
+		} else {
+			safeContentMD := render.StripAllLockBlocks(raw.ContentMD)
+			pubPlainOut := g.renderer.Render(safeContentMD, render.Options{
+				Mode:     render.RenderModeFeed,
+				Locale:   locale,
+				Unlocked: false,
+			})
+			summary = truncateRunes(pubPlainOut.PlainText, 200)
+		}
 	}
 
 	bodyHTML := feedOut.HTML
@@ -700,9 +786,17 @@ func formatLicense(override string, tmpl string, title string, author string, fu
 }
 
 func truncateRunes(s string, maxRunes int) string {
-	runes := []rune(strings.TrimSpace(s))
-	if len(runes) <= maxRunes {
-		return string(runes)
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) <= maxRunes {
+		return trimmed
 	}
-	return strings.TrimSpace(string(runes[:maxRunes])) + "…"
+	pos := 0
+	for n := 0; n < maxRunes && pos < len(trimmed); n++ {
+		_, w := utf8.DecodeRuneInString(trimmed[pos:])
+		pos += w
+	}
+	if pos >= len(trimmed) {
+		return trimmed
+	}
+	return strings.TrimSpace(trimmed[:pos]) + "…"
 }

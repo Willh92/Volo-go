@@ -89,8 +89,10 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           STAGE="volo-${VERSION}-${GOOS}-${GOARCH}"
-          mkdir -p "dist/${STAGE}"
-          go build -trimpath -gcflags="all=-l" \
+          mkdir -p "dist/${STAGE}/scripts"
+          go build -trimpath \
+            -gcflags="all=-l" \
+            -gcflags="github.com/Willh92/Volo-go/...=" \
             -ldflags="-s -w -X main.Version=${VERSION}" \
             -o "dist/${STAGE}/volo${{ matrix.ext }}" \
             ./cmd/volo
@@ -101,7 +103,10 @@ jobs:
             exit 1
           fi
 
-          cp .env.example README.md docker-compose.yml "dist/${STAGE}/"
+          cp .env.example README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md docker-compose.yml "dist/${STAGE}/"
+          cp scripts/install-service-linux.sh scripts/install-service-macos.sh scripts/install-service-windows.ps1 "dist/${STAGE}/scripts/"
+          cp -r deploy "dist/${STAGE}/deploy"
+          cp -r docs "dist/${STAGE}/docs"
           cp -r plugins "dist/${STAGE}/plugins"
           cp -r themes "dist/${STAGE}/themes"
 
@@ -167,6 +172,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -182,5 +189,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

@@ -689,6 +689,9 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if s.deps.Content != nil {
+		_ = s.deps.Content.FlushAnalytics(r.Context())
+	}
 	var pubCnt, draftCnt, schedCnt, pageCnt, cmtPending, mediaCnt int
 	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'published'`).Scan(&pubCnt)
 	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'draft'`).Scan(&draftCnt)

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // TypeMap abstracts physical SQL DDL column types across SQLite, PostgreSQL, and MySQL/TiDB.
@@ -100,6 +102,13 @@ func (d sqliteDialect) PaginateSQL(baseQuery string, limit int, offset int) (str
 
 type postgresDialect struct{}
 
+var (
+	pgRebindCache sync.Map // map[string]string
+	pgRebindCount atomic.Int32
+)
+
+const maxPGRebindCacheEntries = 2048
+
 func (postgresDialect) Name() string { return "postgres" }
 func (postgresDialect) QuoteIdent(id string) string {
 	return `"` + strings.ReplaceAll(id, `"`, `""`) + `"`
@@ -127,6 +136,11 @@ func (postgresDialect) Types() TypeMap {
 func (postgresDialect) Rebind(query string) string {
 	if strings.IndexByte(query, '?') < 0 {
 		return query
+	}
+	if len(query) <= 4096 {
+		if cached, ok := pgRebindCache.Load(query); ok {
+			return cached.(string)
+		}
 	}
 	var b strings.Builder
 	b.Grow(len(query) + 16)
@@ -176,7 +190,13 @@ func (postgresDialect) Rebind(query string) string {
 			b.WriteByte(ch)
 		}
 	}
-	return b.String()
+	out := b.String()
+	if len(query) <= 4096 && pgRebindCount.Load() < maxPGRebindCacheEntries {
+		if _, loaded := pgRebindCache.LoadOrStore(query, out); !loaded {
+			pgRebindCount.Add(1)
+		}
+	}
+	return out
 }
 
 func (d postgresDialect) UpsertSQL(table string, cols []string, conflictCols []string, updateCols []string) string {

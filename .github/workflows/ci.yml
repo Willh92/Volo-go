@@ -9,15 +9,40 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
-    name: Build, Test & Budget Gate
+    name: Build, Vet, Test & Budget Gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Repository Hygiene, License & Service Installer Check
+        run: |
+          test -s LICENSE
+          test -s THIRD_PARTY_NOTICES.md
+          if find . -path ./web/admin/node_modules -prune -o -name "*.properties" -print | grep -q .; then
+            echo "FAIL: forbidden .properties file detected" >&2
+            exit 1
+          fi
+          if grep -RInE '\b(TODO|FIXME)\b' cmd internal pkg web/admin/src themes plugins; then
+            echo "FAIL: unresolved TODO/FIXME marker detected in source" >&2
+            exit 1
+          fi
+          if grep -RInE -i '(b3log|latke|hacpai|ld246|fishpi|vditor|jquery|mdui|bulma|sweetalert|optiondocuments|syncgithub)' cmd internal pkg web/admin/src themes plugins; then
+            echo "FAIL: banned legacy coupling identifier detected in source" >&2
+            exit 1
+          fi
+          bash -n scripts/install-service-linux.sh
+          bash -n scripts/install-service-macos.sh
+          bash scripts/install-service-linux.sh install --dry-run --init systemd --listen-socket /run/volo/volo.sock >/dev/null
+          bash scripts/install-service-macos.sh install --dry-run >/dev/null
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -46,10 +71,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Compile Pure-Go Packages (CGO_ENABLED=0)
+      - name: Compile & Static Analysis (go build & go vet)
         env:
           CGO_ENABLED: "0"
-        run: go build ./...
+        run: |
+          go build ./...
+          go vet ./...
 
       - name: Run Unit & Integration Suite (CGO_ENABLED=0)
         env:
@@ -61,16 +88,23 @@ jobs:
           CGO_ENABLED: "1"
         run: go test -race -count=1 ./...
 
+      - name: Run Benchmark Smoke Gate
+        env:
+          CGO_ENABLED: "0"
+        run: go test -run=^$ -bench=. -benchtime=50ms ./internal/render ./internal/visibility ./internal/db/sqlx ./internal/server
+
       - name: Verify Cross-Compilation Matrix (5 Targets, CGO_ENABLED=0, < 20 MiB Each)
         env:
           CGO_ENABLED: "0"
         run: |
           mkdir -p /tmp/volo-cross
-          GOOS=linux   GOARCH=amd64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-amd64     ./cmd/volo
-          GOOS=linux   GOARCH=arm64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-arm64     ./cmd/volo
-          GOOS=darwin  GOARCH=amd64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-amd64    ./cmd/volo
-          GOOS=darwin  GOARCH=arm64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-arm64    ./cmd/volo
-          GOOS=windows GOARCH=amd64 go build -trimpath -gcflags="all=-l" -ldflags="-s -w" -o /tmp/volo-cross/volo-windows-amd64.exe ./cmd/volo
+          GC_ALL="all=-l"
+          GC_VOLO="github.com/Willh92/Volo-go/...="
+          GOOS=linux   GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-amd64       ./cmd/volo
+          GOOS=linux   GOARCH=arm64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-arm64       ./cmd/volo
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-amd64      ./cmd/volo
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-arm64      ./cmd/volo
+          GOOS=windows GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-windows-amd64.exe ./cmd/volo
           ls -lh /tmp/volo-cross
           for bin in /tmp/volo-cross/*; do
             SZ=$(wc -c < "$bin" | tr -d ' ')

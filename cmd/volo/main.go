@@ -345,6 +345,11 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "volo serve: server init failed: %v\n", err)
 		return 1
 	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = appSrv.Close(shutCtx)
+	}()
 
 	// Background rolling local + S3/WebDAV backup scheduler
 	backupSched := backup.NewScheduler(backup.SchedulerOptions{

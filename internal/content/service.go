@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/dialect"
@@ -116,6 +117,9 @@ type Service struct {
 	catalog   *i18n.Catalog
 	dialer    *security.OutboundSafeDialer
 
+	views  *viewAnalyticsBuffer
+	caches *serviceCacheState
+
 	uvMu      sync.Mutex
 	uvDate    string
 	uvVisited map[string]struct{}
@@ -154,18 +158,38 @@ func NewService(opts ServiceOptions) *Service {
 		plugins:   opts.Plugins,
 		catalog:   opts.Catalog,
 		dialer:    dialer,
+		views:     newViewAnalyticsBuffer(opts.Store),
+		caches:    newServiceCacheState(),
 		uvVisited: make(map[string]struct{}),
 		mediaDims: make(map[string][2]int),
 	}
 }
 
-func (s *Service) Guard() *visibility.Guard        { return s.guard }
+func (s *Service) Guard() *visibility.Guard             { return s.guard }
 func (s *Service) SearchIndex() *visibility.SearchIndex { return s.search }
-func (s *Service) Renderer() *render.Engine        { return s.renderer }
+func (s *Service) Renderer() *render.Engine             { return s.renderer }
 
-// WarmCaches preloads the 8 MiB two-stage search index and media intrinsic dimensions map.
+// FlushAnalytics flushes all buffered view_count, redirect hit_count, and analytics_daily deltas to the database.
+func (s *Service) FlushAnalytics(ctx context.Context) error {
+	if s == nil || s.views == nil {
+		return nil
+	}
+	return s.views.Flush(ctx)
+}
+
+// Close stops background analytics flushing and deterministically flushes all buffered counters before shutdown.
+func (s *Service) Close(ctx context.Context) error {
+	if s == nil || s.views == nil {
+		return nil
+	}
+	return s.views.Close(ctx)
+}
+
+// WarmCaches preloads the 8 MiB two-stage search index, media intrinsic dimensions, redirect table, and chrome snapshot.
 func (s *Service) WarmCaches(ctx context.Context) error {
 	_ = s.RefreshMediaDimsCache(ctx)
+	_, _ = s.getRedirectSnapshot(ctx)
+	_, _ = s.getChromeSnapshot(ctx)
 	return s.search.Rebuild(ctx)
 }
 
@@ -187,6 +211,9 @@ func (s *Service) RefreshMediaDimsCache(ctx context.Context) error {
 	s.mediaMu.Lock()
 	s.mediaDims = next
 	s.mediaMu.Unlock()
+	if s.guard != nil {
+		s.guard.PurgeCache()
+	}
 	return nil
 }
 
@@ -235,41 +262,25 @@ func (s *Service) PublishDueScheduled(ctx context.Context) (int, error) {
 	return len(due), nil
 }
 
-// ResolveRedirect checks custom & legacy 301/302 rules in `redirects` AND `articles.legacy_permalink`,
-// guaranteeing zero 404 dead links for migrated `.html` URLs!
+// ResolveRedirect checks custom & legacy 301/302 rules in `redirects` AND `articles.legacy_permalink`
+// via a revision-coherent O(1) in-memory redirect table, guaranteeing zero 404 dead links and zero SQL on hot reads!
 func (s *Service) ResolveRedirect(ctx context.Context, reqPath string) (target string, statusCode int, matched bool) {
 	clean := strings.TrimSpace(reqPath)
 	if clean == "" || clean == "/" {
 		return "", 0, false
 	}
-	rule, err := sqlx.Get[domain.RedirectRule](
-		ctx, s.store,
-		`SELECT id, source_path, target_path, status_code FROM redirects WHERE source_path = ?`,
-		clean,
-	)
-	if err == nil && rule.TargetPath != "" && rule.TargetPath != clean {
-		code := rule.StatusCode
-		if code != http.StatusMovedPermanently && code != http.StatusFound {
-			code = http.StatusMovedPermanently
-		}
-		// Best-effort async hit counter update on WriteDB outside read transaction.
-		_, _ = s.store.ExecContext(ctx, `UPDATE redirects SET hit_count = hit_count + 1 WHERE id = ?`, rule.ID)
-		return rule.TargetPath, code, true
+	snap, err := s.getRedirectSnapshot(ctx)
+	if err != nil || snap == nil {
+		return "", 0, false
 	}
-
-	// Fallback check against articles.legacy_permalink (e.g., `/articles/2023/05/01/1682900000.html`).
-	art, aErr := sqlx.Get[domain.RawArticle](
-		ctx, s.store,
-		`SELECT slug FROM articles WHERE legacy_permalink = ? AND status = ?`,
-		clean, domain.ArticleStatusPublished,
-	)
-	if aErr == nil && art.Slug != "" {
-		dest := visibility.ArticlePath(art.Slug)
-		if dest != clean {
-			return dest, http.StatusMovedPermanently, true
-		}
+	entry, ok := snap.rules[clean]
+	if !ok || entry.targetPath == "" || entry.targetPath == clean {
+		return "", 0, false
 	}
-	return "", 0, false
+	if entry.id != "" {
+		s.views.RecordRedirectHit(entry.id)
+	}
+	return entry.targetPath, entry.statusCode, true
 }
 
 // ArticleListFilter specifies filtering and pagination for ListPublicCards.
@@ -353,6 +364,7 @@ func (s *Service) hydrateCards(ctx context.Context, raws []domain.RawArticle, lo
 
 	out := make([]visibility.PublicArticleCard, 0, len(raws))
 	for _, r := range raws {
+		r.ViewCount += s.views.PendingArticleViews(r.ID)
 		var catPtr *domain.Category
 		if c, ok := catsByID[r.CategoryID]; ok {
 			cCopy := c
@@ -411,12 +423,21 @@ func (s *Service) RenderArticleDetail(
 
 	var catPtr *domain.Category
 	if raw.CategoryID != "" {
-		if c, err := sqlx.Get[domain.Category](ctx, s.store, `SELECT * FROM categories WHERE id = ?`, raw.CategoryID); err == nil {
-			catPtr = &c
+		if catsByID, err := s.loadCategoriesMap(ctx); err == nil {
+			if c, ok := catsByID[raw.CategoryID]; ok {
+				cCopy := c
+				catPtr = &cCopy
+			}
+		}
+		if catPtr == nil {
+			if c, err := sqlx.Get[domain.Category](ctx, s.store, `SELECT * FROM categories WHERE id = ?`, raw.CategoryID); err == nil {
+				catPtr = &c
+			}
 		}
 	}
 	tagsMap, _ := s.loadTagsForArticles(ctx, []domain.RawArticle{raw})
 	alts := s.listArticleTranslations(ctx, raw)
+	raw.ViewCount += s.views.PendingArticleViews(raw.ID)
 
 	view := s.guard.ToDetail(w, r, raw, viewer, visibility.DetailRenderDeps{
 		Locale:            locale,
@@ -649,7 +670,7 @@ func (s *Service) GetPublicPageBySlug(ctx context.Context, slug string, locale s
 		Lang:             p.Lang,
 		TranslationGroup: p.TranslationGroup,
 		Translations:     alts,
-		ViewCount:        p.ViewCount,
+		ViewCount:        p.ViewCount + s.views.PendingPageViews(p.ID),
 		CommentCount:     p.CommentCount,
 		UpdatedAt:        p.UpdatedAt,
 		NeedsMath:        rendered.NeedsMath,
@@ -657,19 +678,17 @@ func (s *Service) GetPublicPageBySlug(ctx context.Context, slug string, locale s
 	}, nil
 }
 
-// ListPublicNavItems builds the localized top navigation menu from `nav_items`.
+// ListPublicNavItems builds the localized top navigation menu from revision-coherent `nav_items` snapshot.
 func (s *Service) ListPublicNavItems(ctx context.Context, locale string) ([]PublicNavNode, error) {
-	items, err := sqlx.Select[domain.NavItem](
-		ctx, s.store,
-		`SELECT * FROM nav_items WHERE is_enabled = ? ORDER BY sort_order ASC, created_at ASC`,
-		true,
-	)
+	snap, err := s.getChromeSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
-	byParent := make(map[string][]domain.NavItem)
+	items := snap.rawNavItems
+	byParent := make(map[string][]domain.NavItem, len(items))
 	for _, it := range items {
-		byParent[strings.TrimSpace(it.ParentID)] = append(byParent[strings.TrimSpace(it.ParentID)], it)
+		parent := strings.TrimSpace(it.ParentID)
+		byParent[parent] = append(byParent[parent], it)
 	}
 	var build func(parentID string) []PublicNavNode
 	build = func(parentID string) []PublicNavNode {
@@ -704,6 +723,16 @@ func (s *Service) ListPublicNavItems(ctx context.Context, locale string) ([]Publ
 
 // ListCategoriesWithCounts returns categories ordered by sort_order with published article counts.
 func (s *Service) ListCategoriesWithCounts(ctx context.Context) ([]CategoryWithCount, error) {
+	snap, err := s.getChromeSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CategoryWithCount, len(snap.categories))
+	copy(out, snap.categories)
+	return out, nil
+}
+
+func (s *Service) queryCategoriesWithCounts(ctx context.Context) ([]CategoryWithCount, error) {
 	cats, err := sqlx.Select[domain.Category](ctx, s.store, `SELECT * FROM categories ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -733,6 +762,20 @@ func (s *Service) ListCategoriesWithCounts(ctx context.Context) ([]CategoryWithC
 
 // ListTagsWithCounts returns tags ordered by article count DESC, name ASC.
 func (s *Service) ListTagsWithCounts(ctx context.Context, limit int) ([]TagWithCount, error) {
+	snap, err := s.getChromeSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	src := snap.tags
+	if limit > 0 && len(src) > limit {
+		src = src[:limit]
+	}
+	out := make([]TagWithCount, len(src))
+	copy(out, src)
+	return out, nil
+}
+
+func (s *Service) queryAllTagsWithCounts(ctx context.Context) ([]TagWithCount, error) {
 	tags, err := sqlx.Select[domain.Tag](ctx, s.store, `SELECT * FROM tags ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
@@ -767,9 +810,6 @@ func (s *Service) ListTagsWithCounts(ctx context.Context, limit int) ([]TagWithC
 		}
 		return out[i].Name < out[j].Name
 	})
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
 	return out, nil
 }
 
@@ -841,33 +881,32 @@ func (s *Service) ListLinks(ctx context.Context) ([]domain.Link, error) {
 	return sqlx.Select[domain.Link](ctx, s.store, `SELECT * FROM links ORDER BY sort_order ASC, created_at ASC`)
 }
 
-// ListFollowsWithItems returns RSS Follow subscriptions and their latest items.
+// ListFollowsWithItems returns RSS Follow subscriptions and their latest items using bounded indexed queries.
 func (s *Service) ListFollowsWithItems(ctx context.Context, itemsPerFollow int) ([]FollowGroup, error) {
 	if itemsPerFollow <= 0 {
 		itemsPerFollow = 5
 	}
 	follows, err := sqlx.Select[domain.Follow](ctx, s.store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
-	if err != nil {
-		return nil, err
+	if err != nil || len(follows) == 0 {
+		return []FollowGroup{}, err
 	}
-	allItems, _ := sqlx.Select[domain.FollowItem](ctx, s.store, `SELECT * FROM follow_items ORDER BY published_at DESC`)
-	byFollow := make(map[string][]domain.FollowItem)
-	for _, it := range allItems {
-		if len(byFollow[it.FollowID]) < itemsPerFollow {
-			byFollow[it.FollowID] = append(byFollow[it.FollowID], it)
-		}
-	}
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(
+		`SELECT * FROM follow_items WHERE follow_id = ? ORDER BY published_at DESC`,
+		itemsPerFollow, 0,
+	)
 	out := make([]FollowGroup, 0, len(follows))
 	for _, f := range follows {
-		out = append(out, FollowGroup{Follow: f, Items: byFollow[f.ID]})
+		qArgs := append([]any{f.ID}, pageArgs...)
+		items, _ := sqlx.Select[domain.FollowItem](ctx, s.store, pageSQL, qArgs...)
+		out = append(out, FollowGroup{Follow: f, Items: items})
 	}
 	return out, nil
 }
 
-// RecordView increments view_count and zero-PII daily PV/UV + top referer/article counters.
-func (s *Service) RecordView(ctx context.Context, targetType string, targetID string, actorFPHash string, refererHost string) {
+// RecordView coalesces view_count and zero-PII daily PV/UV + top referer/article counters
+// into the non-blocking write-behind analytics buffer, eliminating per-GET SQLite write-lock contention.
+func (s *Service) RecordView(_ context.Context, targetType string, targetID string, actorFPHash string, refererHost string) {
 	today := time.Now().In(s.siteLocation()).Format("2006-01-02")
-	now := time.Now().UnixMilli()
 
 	isNewUV := false
 	if actorFPHash != "" {
@@ -890,73 +929,15 @@ func (s *Service) RecordView(ctx context.Context, targetType string, targetID st
 		uvDelta = 1
 	}
 
-	_ = s.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		if targetType == domain.TargetTypeArticle && targetID != "" {
-			_, _ = tx.ExecContext(ctx, `UPDATE articles SET view_count = view_count + 1 WHERE id = ?`, targetID)
-			if err := upsertDailyTopItemTx(ctx, tx, today, "article", targetID); err != nil {
-				return err
-			}
-		} else if targetType == domain.TargetTypePage && targetID != "" {
-			_, _ = tx.ExecContext(ctx, `UPDATE pages SET view_count = view_count + 1 WHERE id = ?`, targetID)
-		}
-		if cleanRef := strings.ToLower(strings.TrimSpace(refererHost)); cleanRef != "" {
-			_ = upsertDailyTopItemTx(ctx, tx, today, "referer", cleanRef)
-		}
-
-		res, err := tx.ExecContext(
-			ctx,
-			`UPDATE analytics_daily SET pv = pv + 1, uv = uv + ?, updated_at = ? WHERE stat_date = ?`,
-			uvDelta, now, today,
-		)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			upsert := tx.Dialect().UpsertSQL(
-				"analytics_daily",
-				[]string{"stat_date", "pv", "uv", "updated_at"},
-				[]string{"stat_date"},
-				[]string{"updated_at"},
-			)
-			_, err = tx.ExecContext(ctx, upsert, today, int64(1), uvDelta, now)
-			return err
-		}
-		return nil
-	})
-}
-
-func upsertDailyTopItemTx(ctx context.Context, tx *sqlx.Tx, statDate string, kind string, itemKey string) error {
-	res, err := tx.ExecContext(
-		ctx,
-		`UPDATE analytics_top_items SET hits = hits + 1 WHERE stat_date = ? AND kind = ? AND item_key = ?`,
-		statDate, kind, itemKey,
-	)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		return nil
-	}
-	upsert := tx.Dialect().UpsertSQL(
-		"analytics_top_items",
-		[]string{"stat_date", "kind", "item_key", "hits"},
-		[]string{"stat_date", "kind", "item_key"},
-		[]string{},
-	)
-	_, err = tx.ExecContext(ctx, upsert, statDate, kind, itemKey, int64(1))
-	return err
+	s.views.RecordView(targetType, targetID, today, uvDelta, refererHost)
 }
 
 func (s *Service) loadCategoriesMap(ctx context.Context) (map[string]domain.Category, error) {
-	cats, err := sqlx.Select[domain.Category](ctx, s.store, `SELECT * FROM categories`)
+	snap, err := s.getChromeSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
-	m := make(map[string]domain.Category, len(cats))
-	for _, c := range cats {
-		m[c.ID] = c
-	}
-	return m, nil
+	return snap.catsByID, nil
 }
 
 func (s *Service) loadTagsForArticles(ctx context.Context, raws []domain.RawArticle) (map[string][]domain.Tag, error) {
@@ -1000,16 +981,22 @@ func (s *Service) loadTagsForArticles(ctx context.Context, raws []domain.RawArti
 	return out, nil
 }
 
+var defaultCSTLocation = time.FixedZone("CST", 8*3600)
+
 func (s *Service) siteLocation() *time.Location {
 	if s.settings != nil {
 		tz := strings.TrimSpace(s.settings.Snapshot().Site.TimeZone)
 		if tz != "" {
+			if cached, ok := tzLocationCache.Load(tz); ok {
+				return cached.(*time.Location)
+			}
 			if loc, err := time.LoadLocation(tz); err == nil {
+				tzLocationCache.Store(tz, loc)
 				return loc
 			}
 		}
 	}
-	return time.FixedZone("CST", 8*3600)
+	return defaultCSTLocation
 }
 
 func parseYearMonthBounds(ym string, loc *time.Location) (int64, int64, bool) {
@@ -1022,11 +1009,23 @@ func parseYearMonthBounds(ym string, loc *time.Location) (int64, int64, bool) {
 }
 
 func truncateForSummary(s string, maxRunes int) string {
-	rs := []rune(strings.TrimSpace(s))
-	if len(rs) <= maxRunes {
-		return string(rs)
+	s = strings.TrimSpace(s)
+	if s == "" || maxRunes <= 0 {
+		return ""
 	}
-	return strings.TrimSpace(string(rs[:maxRunes])) + "…"
+	if len(s) <= maxRunes {
+		return s
+	}
+	count := 0
+	for idx := 0; idx < len(s); {
+		if count == maxRunes {
+			return strings.TrimSpace(s[:idx]) + "…"
+		}
+		_, w := utf8.DecodeRuneInString(s[idx:])
+		idx += w
+		count++
+	}
+	return s
 }
 
 // Helper ensuring `id` import is actively referenced for entity creation helpers in content package.

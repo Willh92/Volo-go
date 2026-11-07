@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
@@ -204,11 +205,16 @@ func (idx *SearchIndex) Search(ctx context.Context, query string, limit int) ([]
 	complete := idx.complete
 	idx.mu.RUnlock()
 
-	seen := make(map[string]bool, len(docs))
-	hits := make([]SearchHit, 0)
+	var seen map[string]bool
+	if !complete {
+		seen = make(map[string]bool, len(docs))
+	}
+	hits := make([]SearchHit, 0, min(limit*2, 32))
 
 	for _, doc := range docs {
-		seen[doc.id] = true
+		if seen != nil {
+			seen[doc.id] = true
+		}
 		if hit, ok := matchDoc(doc, tokens); ok {
 			hits = append(hits, hit)
 		}
@@ -287,7 +293,7 @@ func matchDoc(doc searchDoc, tokens []string) (SearchHit, bool) {
 		}
 	}
 
-	snippet := extractSafeSnippet(doc.publicPlain, tokens[0], 140)
+	snippet := extractSafeSnippetFast(doc.publicPlain, doc.plainLower, tokens[0], firstMatchByte, 140)
 	return SearchHit{
 		ID:          doc.id,
 		Title:       doc.title,
@@ -299,7 +305,67 @@ func matchDoc(doc searchDoc, tokens []string) (SearchHit, bool) {
 	}, true
 }
 
-func extractSafeSnippet(plain string, firstToken string, maxRunes int) string {
+// extractSafeSnippetFast slices a UTF-8 rune-safe window around firstMatchByte with zero full-doc
+// []rune or strings.ToLower allocations whenever plain and plainLower share identical UTF-8 byte offsets.
+func extractSafeSnippetFast(plain string, plainLower string, firstToken string, firstMatchByte int, maxRunes int) string {
+	if len(plain) <= maxRunes {
+		return plain
+	}
+	if len(plain) != len(plainLower) {
+		return extractSafeSnippetFallback(plain, firstToken, maxRunes)
+	}
+
+	if firstMatchByte < 0 || !utf8.RuneStart(plain[firstMatchByte]) {
+		end := stepForwardRunes(plain, 0, maxRunes)
+		if end >= len(plain) {
+			return plain
+		}
+		return strings.TrimSpace(plain[:end]) + "…"
+	}
+
+	start := stepBackwardRunes(plain, firstMatchByte, 36)
+	end := stepForwardRunes(plain, start, maxRunes)
+	if start == 0 && end >= len(plain) {
+		return plain
+	}
+
+	var b strings.Builder
+	b.Grow((end - start) + 8)
+	if start > 0 {
+		b.WriteString("…")
+	}
+	b.WriteString(strings.TrimSpace(plain[start:end]))
+	if end < len(plain) {
+		b.WriteString("…")
+	}
+	return b.String()
+}
+
+func stepBackwardRunes(s string, idx int, count int) int {
+	pos := idx
+	for n := 0; n < count && pos > 0; n++ {
+		_, width := utf8.DecodeLastRuneInString(s[:pos])
+		pos -= width
+	}
+	if pos < 0 {
+		return 0
+	}
+	return pos
+}
+
+func stepForwardRunes(s string, idx int, count int) int {
+	pos := idx
+	for n := 0; n < count && pos < len(s); n++ {
+		_, width := utf8.DecodeRuneInString(s[pos:])
+		pos += width
+	}
+	if pos > len(s) {
+		return len(s)
+	}
+	return pos
+}
+
+func extractSafeSnippetFallback(plain string, firstToken string, maxRunes int) string {
 	runes := []rune(plain)
 	if len(runes) <= maxRunes {
 		return plain

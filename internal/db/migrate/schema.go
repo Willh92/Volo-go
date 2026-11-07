@@ -11,7 +11,7 @@ import (
 )
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 1
+const CurrentSchemaVersion = 2
 
 type migrationStep struct {
 	Version     int
@@ -25,6 +25,20 @@ var steps = []migrationStep{
 		Description: "Initialize normalized Volo-go v1 schema (all first-class domain tables & indexes)",
 		Statements:  buildV1Schema,
 	},
+	{
+		Version:     2,
+		Description: "Add composite hot-path read indexes for follow_items, pages, articles, and media_assets",
+		Statements:  buildV2Indexes,
+	},
+}
+
+func buildV2Indexes(_ dialect.Dialect) []string {
+	return []string{
+		`CREATE INDEX idx_follow_items_follow_pub ON follow_items (follow_id, published_at)`,
+		`CREATE INDEX idx_pages_pub_updated ON pages (is_published, updated_at)`,
+		`CREATE INDEX idx_articles_status_pub ON articles (status, published_at)`,
+		`CREATE INDEX idx_media_assets_dims ON media_assets (width, height)`,
+	}
 }
 
 // Up idempotently applies all pending schema migrations across SQLite, PostgreSQL, and MySQL.

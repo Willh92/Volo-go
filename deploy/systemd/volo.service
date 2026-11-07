@@ -1,0 +1,40 @@
+[Unit]
+Description=Volo-go Pure-Go Sovereign Blog Engine
+Documentation=https://github.com/Willh92/Volo-go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=volo
+Group=volo
+WorkingDirectory=/var/lib/volo
+EnvironmentFile=-/etc/volo/volo.env
+ExecStart=/usr/local/bin/volo serve
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=3
+
+# Runtime directory for zero-TCP-overhead Unix Domain Socket (/run/volo/volo.sock)
+RuntimeDirectory=volo
+RuntimeDirectoryMode=0755
+
+# File descriptor & process limits
+LimitNOFILE=65536
+
+# Systemd sandboxing & privilege hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0027
+ReadWritePaths=/var/lib/volo /run/volo
+
+[Install]
+WantedBy=multi-user.target

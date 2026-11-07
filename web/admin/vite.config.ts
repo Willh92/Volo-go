@@ -15,8 +15,11 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes("@codemirror") || id.includes("@lezer")) {
-            return "cm6";
+          if (id.includes("@lezer")) {
+            return "cm6-lezer";
+          }
+          if (id.includes("@codemirror")) {
+            return "cm6-editor";
           }
           return undefined;
         },

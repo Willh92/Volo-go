@@ -1,0 +1,62 @@
+name: Bug Report / 缺陷反馈
+description: Report a reproducible bug in Volo-go / 提交可复现的问题报告
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Security Notice / 安全提示**: Please do **NOT** report security vulnerabilities in public issues. Follow [SECURITY.md](../../SECURITY.md) to report privately.
+        > 请勿在公开 Issue 中披露安全漏洞，请参照 [SECURITY.md](../../SECURITY.md) 私密上报。
+
+  - type: input
+    id: version
+    attributes:
+      label: Volo-go Version / 版本号
+      description: Output of `volo --version` or container tag
+      placeholder: "v1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database Engine / 数据库引擎
+      options:
+        - SQLite (modernc.org/sqlite WAL)
+        - PostgreSQL / Supabase / Neon / CockroachDB
+        - MySQL 8+ / MariaDB / TiDB
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os_arch
+    attributes:
+      label: OS & Architecture / 操作系统与架构
+      options:
+        - linux/amd64
+        - linux/arm64
+        - darwin/arm64
+        - darwin/amd64
+        - windows/amd64
+        - Docker / GHCR Container
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce / 复现步骤
+      placeholder: |
+        1. Start `volo serve` with ...
+        2. Send request / open page ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`volo doctor` & Relevant Logs / 诊断输出与日志"
+      description: Redact any secrets or domain-sensitive values before pasting.
+      render: shell
