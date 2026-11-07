@@ -4,7 +4,7 @@ go 1.27.3
 
 require (
 	github.com/HugoSmits86/nativewebp v1.3.0
-	github.com/go-sql-driver/mysql v1.9.3
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/lionsoul2014/ip2region/binding/golang v0.0.0-20261028042204-6a276cc7c4f9
 	github.com/microcosm-cc/bluemonday v1.0.27
@@ -16,7 +16,7 @@ require (
 )
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
