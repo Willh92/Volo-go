@@ -82,61 +82,61 @@
 
 [data-theme="dark"] {
   color-scheme: dark;
-  --volo-bg: #121715;
-  --volo-surface: #19201e;
-  --volo-raised: #202926;
-  --volo-line: #2b3733;
-  --volo-text: #eaf0ed;
-  --volo-muted: #93a39d;
+  --volo-bg: #1b2021;
+  --volo-surface: #242b2c;
+  --volo-raised: #2b3434;
+  --volo-line: #3c4945;
+  --volo-text: #d6dfda;
+  --volo-muted: #a1b1a8;
   --volo-accent: #9bcab1;
   --volo-accent-hover: #b4dbc6;
-  --volo-accent-soft: rgba(155, 202, 177, 0.15);
-  --volo-nav: #202d2a;
+  --volo-accent-soft: rgba(155, 202, 177, 0.14);
+  --volo-nav: #202728;
   --volo-btn-bg: #476e59;
   --volo-btn-hover: #537f67;
-  --volo-ok: #5ec98f;
-  --volo-warn: #e8ad54;
-  --volo-danger: #ef7d77;
-  --volo-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
-  --volo-shadow-pop: 0 18px 42px rgba(0, 0, 0, 0.5);
+  --volo-ok: #7fc29b;
+  --volo-warn: #dfb069;
+  --volo-danger: #e09aa4;
+  --volo-shadow: 0 14px 32px rgba(9, 13, 14, 0.28);
+  --volo-shadow-pop: 0 18px 42px rgba(9, 13, 14, 0.44);
 }
 [data-theme="dark"][data-accent="ocean"] {
   --volo-accent: #a2c5dd;
   --volo-accent-hover: #bad6ea;
-  --volo-accent-soft: rgba(162, 197, 221, 0.15);
-  --volo-nav: #222d35;
+  --volo-accent-soft: rgba(162, 197, 221, 0.14);
+  --volo-nav: #21282d;
   --volo-btn-bg: #476b85;
   --volo-btn-hover: #537b98;
 }
 [data-theme="dark"][data-accent="teal"] {
   --volo-accent: #9acbcc;
   --volo-accent-hover: #b4dcdd;
-  --volo-accent-soft: rgba(154, 203, 204, 0.15);
-  --volo-nav: #202f30;
+  --volo-accent-soft: rgba(154, 203, 204, 0.14);
+  --volo-nav: #20292b;
   --volo-btn-bg: #416e71;
   --volo-btn-hover: #4d7f82;
 }
 [data-theme="dark"][data-accent="amber"] {
   --volo-accent: #d6bd91;
   --volo-accent-hover: #e4cfa9;
-  --volo-accent-soft: rgba(214, 189, 145, 0.15);
-  --volo-nav: #302b25;
+  --volo-accent-soft: rgba(214, 189, 145, 0.14);
+  --volo-nav: #292724;
   --volo-btn-bg: #795f3c;
   --volo-btn-hover: #8a6d46;
 }
 [data-theme="dark"][data-accent="plum"] {
   --volo-accent: #c8b5d7;
   --volo-accent-hover: #dacbe6;
-  --volo-accent-soft: rgba(200, 181, 215, 0.15);
-  --volo-nav: #2d2733;
+  --volo-accent-soft: rgba(200, 181, 215, 0.14);
+  --volo-nav: #27252c;
   --volo-btn-bg: #6d567d;
   --volo-btn-hover: #7d648f;
 }
 [data-theme="dark"][data-accent="rose"] {
   --volo-accent: #d6b1bd;
   --volo-accent-hover: #e5c6d0;
-  --volo-accent-soft: rgba(214, 177, 189, 0.15);
-  --volo-nav: #32272b;
+  --volo-accent-soft: rgba(214, 177, 189, 0.14);
+  --volo-nav: #2a2427;
   --volo-btn-bg: #7d5865;
   --volo-btn-hover: #8e6573;
 }
@@ -148,7 +148,7 @@
 }
 
 [data-theme="dark"] * {
-  scrollbar-color: rgba(234, 240, 237, 0.22) transparent;
+  scrollbar-color: rgba(214, 223, 218, 0.22) transparent;
 }
 
 *::-webkit-scrollbar {
@@ -212,6 +212,10 @@
 @keyframes volo-bar-sweep {
   0% { transform: translateX(-110%); }
   100% { transform: translateX(310%); }
+}
+
+html {
+  scrollbar-gutter: stable;
 }
 
 html, body {
@@ -1610,6 +1614,9 @@ input[type="checkbox"] {
   inset: 0;
   background: rgba(12, 20, 17, 0.48);
   backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  transform: translateZ(0);
+  backface-visibility: hidden;
   z-index: 95;
   display: flex;
   align-items: center;
@@ -1937,14 +1944,146 @@ input[type="checkbox"] {
 
 /* Unified Appearance Popover & 25x25px Circular Accent Swatches */
 .volo-appearance-pop {
-  min-width: 236px;
+  min-width: 260px;
   padding: 8px;
 }
 
 .volo-mode-grid {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+}
+
+.volo-mode-item {
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+}
+
+.volo-mode-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: var(--volo-raised);
+  color: var(--volo-muted);
+}
+
+.volo-pop-item.active .volo-mode-icon {
+  background: var(--volo-accent-soft);
+  color: var(--volo-accent);
+}
+
+.volo-mode-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  flex: 1;
+  line-height: 1.28;
+}
+
+.volo-mode-sub {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--volo-muted);
+  margin-top: 2px;
+}
+
+.volo-token-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+  font-size: 11.5px;
+  color: var(--volo-muted);
+}
+
+.volo-token-box {
+  max-height: 152px;
+  overflow-y: auto;
+  align-content: flex-start;
+  padding: 6px 8px;
+}
+
+.volo-sortable-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.volo-sortable-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--volo-line);
+  border-radius: 8px;
+  background: var(--volo-surface);
+  transition: border-color 0.15s ease, opacity 0.15s ease;
+}
+
+.volo-sortable-row.is-off {
+  opacity: 0.58;
+  background: var(--volo-raised);
+}
+
+.volo-sortable-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.volo-log-viewer {
+  background: #1b2021;
+  color: #d6dfda;
+  border: 1px solid #3c4945;
+  border-radius: 10px;
+  padding: 10px 12px;
+  max-height: 540px;
+  overflow: auto;
+  font-family: var(--volo-mono);
+  font-size: 12px;
+  line-height: 1.62;
+}
+
+.volo-log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  word-break: break-all;
+}
+
+.volo-log-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.volo-log-ts {
+  color: #8b9c94;
+  flex-shrink: 0;
+}
+
+.volo-log-lvl {
+  font-weight: 700;
+  flex-shrink: 0;
+  min-width: 44px;
+}
+
+.volo-log-lvl.info { color: #a3c5d3; }
+.volo-log-lvl.warn { color: #d2bc8c; }
+.volo-log-lvl.error { color: #dea4ac; }
+.volo-log-lvl.debug { color: #9ab3a8; }
+
+.volo-log-attrs {
+  color: #9ab0a6;
 }
 
 .volo-pop-divider {

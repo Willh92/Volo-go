@@ -64,8 +64,12 @@ function buildSchemaDefaults(schema: any[]): Record<string, any> {
     const isSecret = Boolean(f.secret || f.type === "secret" || f.type === "password");
     if (isSecret) {
       out[f.key] = "";
+    } else if (Array.isArray(f.default)) {
+      out[f.key] = [...f.default];
     } else if (f.default !== undefined) {
       out[f.key] = f.default;
+    } else if (f.type === "sortable_list") {
+      out[f.key] = [];
     } else if (f.type === "boolean") {
       out[f.key] = false;
     } else if (f.type === "number") {
@@ -102,6 +106,95 @@ function SchemaFieldControl({
           label={label}
           hint={f.description}
         />
+      </div>
+    );
+  }
+
+  if (f.type === "sortable_list" && Array.isArray(f.options)) {
+    const allOpts: Array<{ value: string; label: string }> = f.options.map((op: any) =>
+      typeof op === "object" && op !== null
+        ? { value: String(op.value), label: String(op.label || op.value) }
+        : { value: String(op), label: String(op) },
+    );
+    const optMap = new Map(allOpts.map((o) => [o.value, o.label]));
+    const rawCur = values[f.key] !== undefined ? values[f.key] : f.default;
+    const enabledKeys: string[] = (Array.isArray(rawCur) ? rawCur : [])
+      .map((k: any) => String(k))
+      .filter((k: string, idx: number, arr: string[]) => optMap.has(k) && arr.indexOf(k) === idx);
+    const enabledSet = new Set(enabledKeys);
+    const disabledOpts = allOpts.filter((o) => !enabledSet.has(o.value));
+    const showNavPlacement = f.key === "header_nav_items";
+    const primaryLimit = Math.max(0, Number(values.header_nav_primary_count ?? 5));
+
+    const moveItem = (idx: number, delta: number) => {
+      const target = idx + delta;
+      if (target < 0 || target >= enabledKeys.length) return;
+      const next = [...enabledKeys];
+      const [picked] = next.splice(idx, 1);
+      next.splice(target, 0, picked);
+      onChange(f.key, next);
+    };
+
+    return (
+      <div class="volo-field">
+        <label>{label}</label>
+        {f.description && <div class="volo-help">{f.description}</div>}
+        <div class="volo-sortable-list">
+          {enabledKeys.map((k, idx) => (
+            <div key={k} class="volo-sortable-row">
+              <SwitchToggle
+                checked={true}
+                onChange={(checked) => {
+                  if (!checked) {
+                    onChange(
+                      f.key,
+                      enabledKeys.filter((it) => it !== k),
+                    );
+                  }
+                }}
+                label={`${idx + 1}. ${optMap.get(k) || k}`}
+              />
+              <div class="volo-sortable-acts">
+                {showNavPlacement && (
+                  <span class={`volo-badge ${idx < primaryLimit ? "volo-badge-ok" : ""}`}>
+                    {idx < primaryLimit ? t("app.nav_slot_primary") : t("app.nav_slot_more")}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  class="volo-act-btn"
+                  disabled={idx === 0}
+                  title={t("app.move_up")}
+                  onClick={() => moveItem(idx, -1)}
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  class="volo-act-btn"
+                  disabled={idx === enabledKeys.length - 1}
+                  title={t("app.move_down")}
+                  onClick={() => moveItem(idx, 1)}
+                >
+                  ↓
+                </button>
+              </div>
+            </div>
+          ))}
+          {disabledOpts.map((opt) => (
+            <div key={opt.value} class="volo-sortable-row is-off">
+              <SwitchToggle
+                checked={false}
+                onChange={(checked) => {
+                  if (checked) {
+                    onChange(f.key, [...enabledKeys, opt.value]);
+                  }
+                }}
+                label={opt.label}
+              />
+            </div>
+          ))}
+        </div>
       </div>
     );
   }
@@ -209,11 +302,11 @@ function SchemaFieldControl({
         />
       ) : (
         <input
-          type={f.type === "number" ? "number" : f.type === "url" ? "url" : "text"}
+          type={(f.type === "number" ? "number" : f.type === "url" ? "url" : "text") as "text"}
           class="volo-input"
           name={`${namePrefix}_${f.key}`}
           autoComplete="off"
-          value={values[f.key] ?? f.default ?? ""}
+          value={String(values[f.key] ?? f.default ?? "")}
           onInput={(e) => {
             const raw = (e.currentTarget as HTMLInputElement).value;
             onChange(f.key, f.type === "number" ? (raw === "" ? 0 : Number(raw)) : raw);
@@ -305,16 +398,15 @@ export function AppearanceWorkspace({
     void loadData();
   }, [sub, curLocale]);
 
-  const activateTheme = async (themeID: string) => {
+  const activateTheme = async (themeID: string, target: "desktop" | "mobile" = "desktop") => {
     if (!appCfg) return;
     try {
-      const nextCfg = { ...appCfg, active_theme: themeID };
-      const res = await apiFetch<any>("/api/admin/settings/appearance", {
-        method: "PATCH",
-        body: JSON.stringify({ expected_version: appVer, ...nextCfg }),
+      const res = await apiFetch<{ appearance?: any; version?: number }>("/api/admin/themes/activate", {
+        method: "POST",
+        body: JSON.stringify({ theme_id: themeID, target }),
       });
-      setAppCfg(res.value || nextCfg);
-      setAppVer(res.version);
+      if (res?.appearance) setAppCfg(res.appearance);
+      if (typeof res?.version === "number") setAppVer(res.version);
       showToast(t("common.saved"), "ok");
     } catch (err: any) {
       showToast(err.message, "err");
@@ -391,16 +483,22 @@ export function AppearanceWorkspace({
               {themes.map((th) => {
                 const isBuiltin = Boolean(th.is_builtin || th.builtin);
                 const isActive = (appCfg.active_theme || "volo-studio") === th.id;
+                const isMobileActive = Boolean(
+                  appCfg.mobile_theme && appCfg.mobile_theme !== "same" && appCfg.mobile_theme === th.id,
+                );
                 const schema: any[] = th.localized_schema || th.config_schema || [];
                 const previewSrc = th.preview_url || `/themes/${encodeURIComponent(th.id)}/preview`;
                 const title = th.display_name || th.name || th.id;
                 const desc = th.display_description || th.description || "";
                 return (
-                  <div key={th.id} class={`volo-theme-card ${isActive ? "active" : ""}`}>
+                  <div key={th.id} class={`volo-theme-card ${isActive || isMobileActive ? "active" : ""}`}>
                     <div class="volo-theme-thumb">
                       <img src={previewSrc} alt={title} loading="lazy" />
                       <div class="volo-theme-badges">
                         {isActive && <span class="volo-badge volo-badge-ok">{t("app.theme_active_badge")}</span>}
+                        {isMobileActive && (
+                          <span class="volo-badge volo-badge-ok">{t("app.theme_mobile_badge")}</span>
+                        )}
                         <span class="volo-badge">
                           {isBuiltin ? t("app.theme_builtin") : t("app.theme_external")}
                         </span>
@@ -417,9 +515,26 @@ export function AppearanceWorkspace({
                           <button
                             type="button"
                             class="volo-btn volo-btn-sm volo-btn-primary"
-                            onClick={() => void activateTheme(th.id)}
+                            onClick={() => void activateTheme(th.id, "desktop")}
                           >
                             {t("app.theme_activate")}
+                          </button>
+                        )}
+                        {!isMobileActive ? (
+                          <button
+                            type="button"
+                            class="volo-btn volo-btn-sm"
+                            onClick={() => void activateTheme(th.id, "mobile")}
+                          >
+                            {t("app.theme_activate_mobile")}
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            class="volo-btn volo-btn-sm"
+                            onClick={() => void activateTheme("same", "mobile")}
+                          >
+                            {t("app.mobile_follow_desktop")}
                           </button>
                         )}
                         <a
@@ -449,7 +564,7 @@ export function AppearanceWorkspace({
                             {t("app.theme_settings")}
                           </button>
                         )}
-                        {!isBuiltin && !isActive && (
+                        {!isBuiltin && !isActive && !isMobileActive && (
                           <button
                             type="button"
                             class="volo-btn volo-btn-sm volo-btn-danger"
@@ -506,23 +621,38 @@ export function AppearanceWorkspace({
                 />
               </div>
               <div class="volo-field">
-                <label>{t("app.shared_accent")}</label>
-                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                  {ACCENTS.map((ac) => (
-                    <button
-                      key={ac.id}
-                      type="button"
-                      class={`volo-btn volo-btn-sm ${(appCfg.accent || accentSig.value) === ac.id ? "volo-btn-primary" : ""}`}
-                      onClick={() => {
-                        setAppCfg({ ...appCfg, accent: ac.id });
-                        applyThemeAttributes(themeModeSig.value, ac.id, false);
-                      }}
-                    >
-                      <span class="volo-swatch-dot" style={{ background: ac.swatch, width: "11px", height: "11px" }} />
-                      {renderAccentLabel(ac.id)}
-                    </button>
-                  ))}
-                </div>
+                <label>{t("app.mobile_theme_label")}</label>
+                <ConsoleSelect
+                  value={appCfg.mobile_theme === "same" ? "" : appCfg.mobile_theme || ""}
+                  options={[
+                    { value: "", label: t("app.mobile_follow_desktop") },
+                    ...themes.map((th) => ({
+                      value: String(th.id),
+                      label: String(th.display_name || th.name || th.id),
+                    })),
+                  ]}
+                  onChange={(v) => setAppCfg({ ...appCfg, mobile_theme: v })}
+                />
+              </div>
+            </div>
+
+            <div class="volo-field">
+              <label>{t("app.shared_accent")}</label>
+              <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                {ACCENTS.map((ac) => (
+                  <button
+                    key={ac.id}
+                    type="button"
+                    class={`volo-btn volo-btn-sm ${(appCfg.accent || accentSig.value) === ac.id ? "volo-btn-primary" : ""}`}
+                    onClick={() => {
+                      setAppCfg({ ...appCfg, accent: ac.id });
+                      applyThemeAttributes(themeModeSig.value, ac.id, false);
+                    }}
+                  >
+                    <span class="volo-swatch-dot" style={{ background: ac.swatch, width: "11px", height: "11px" }} />
+                    {renderAccentLabel(ac.id)}
+                  </button>
+                ))}
               </div>
             </div>
 
@@ -540,25 +670,36 @@ export function AppearanceWorkspace({
             <div class="volo-form-actions">
               <a
                 class="volo-btn"
-                href={`/?skin=${encodeURIComponent(appCfg.active_theme || "volo-studio")}`}
+                href={`/?skin=${encodeURIComponent(appCfg.active_theme || "volo-studio")}&device=desktop`}
                 target="_blank"
                 rel="noreferrer"
               >
                 {t("app.preview_theme")} ↗
               </a>
+              {appCfg.mobile_theme && appCfg.mobile_theme !== "same" && (
+                <a
+                  class="volo-btn"
+                  href={`/?skin=${encodeURIComponent(appCfg.mobile_theme)}&device=mobile`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {t("app.preview_mobile_theme")} ↗
+                </a>
+              )}
               <button
                 type="button"
                 class="volo-btn volo-btn-primary"
                 onClick={async () => {
                   try {
                     const nextAccent = appCfg.accent || accentSig.value || "forest";
+                    const nextMode = appCfg.default_mode || "auto";
                     const res = await apiFetch<any>("/api/admin/settings/appearance", {
                       method: "PATCH",
                       body: JSON.stringify({ expected_version: appVer, ...appCfg, accent: nextAccent }),
                     });
                     setAppCfg(res.value || { ...appCfg, accent: nextAccent });
                     setAppVer(res.version);
-                    applyThemeAttributes(themeModeSig.value, nextAccent, false);
+                    applyThemeAttributes(nextMode, nextAccent, true);
                     showToast(t("common.saved"), "ok");
                   } catch (err: any) {
                     showToast(err.message, "err");

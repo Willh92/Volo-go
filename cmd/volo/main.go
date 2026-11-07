@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/etl"
 	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/logging"
 	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/notify"
 	"github.com/Willh92/Volo-go/internal/repo"
@@ -256,6 +258,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(60)
 	}
+	slog.SetDefault(slog.New(logging.NewSlogHandler(stderr, logging.Default(), slog.LevelInfo)))
 
 	fs := flag.NewFlagSet("volo serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -284,6 +287,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 	defer store.Close()
+	slog.Info("database ready", "component", "db", "driver", store.Dialect().Name())
 
 	catalog, err := i18n.NewCatalog(cfg.DefaultLocale, cfg.LocalesDir)
 	if err != nil {
@@ -373,7 +377,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		BackupDir:      cfg.BackupDir,
 		UploadDir:      cfg.UploadDir,
 		OutboundDialer: outboundDialer,
-		Logger:         stderr,
+		Logger:         logging.TeeWriter(stderr, logging.Default()),
 	})
 	backupSched.Start(ctx)
 
@@ -386,7 +390,11 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, _ = appSrv.Deps().Content.PublishDueScheduled(ctx)
+				if n, pErr := appSrv.Deps().Content.PublishDueScheduled(ctx); pErr != nil {
+					slog.Warn("scheduled publish check failed", "component", "scheduler", "err", pErr)
+				} else if n > 0 {
+					slog.Info("published scheduled articles", "component", "scheduler", "count", n)
+				}
 			}
 		}
 	}()
@@ -397,13 +405,16 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 
+	slog.Info("server listening", "component", "http", "version", Version, "addr", handle.Network+"://"+handle.Address, "admin", cfg.AdminPath)
 	fmt.Fprintf(stdout, "Volo-go %s listening on %s://%s (dialect=%s, admin=%s)\n",
 		Version, handle.Network, handle.Address, store.Dialect().Name(), cfg.AdminPath)
 
 	if err := server.ServeWithGracefulShutdown(ctx, handle, appSrv.Handler(), cfg.ShutdownTimeout); err != nil {
+		slog.Error("server shutdown error", "component", "http", "err", err)
 		fmt.Fprintf(stderr, "volo serve: shutdown error: %v\n", err)
 		return 1
 	}
+	slog.Info("server stopped cleanly", "component", "http")
 	return 0
 }
 

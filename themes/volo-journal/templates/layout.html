@@ -68,59 +68,44 @@
       </a>
 
       <nav class="studio-nav" aria-label="Primary">
-        <a class="studio-nav__link {{if eq .CurrentPath "/"}}is-active{{end}}" href="/">{{t .Locale "nav.home"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/archives"}}is-active{{end}}" href="/archives">{{t .Locale "nav.archives"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/tags"}}is-active{{end}}" href="/tags">{{t .Locale "nav.tags"}}</a>
-        <a class="studio-nav__link {{if hasPrefix .CurrentPath "/categories"}}is-active{{end}}" href="/categories">{{t .Locale "nav.categories"}}</a>
-
-        {{if .NavItems}}
-          <div class="studio-custom-links">
-            {{range .NavItems}}
-              {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
-                <a class="studio-nav__link {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
-                  {{navIconHTML .Icon}}<span>{{.Title}}</span>
-                </a>
-              {{end}}
-            {{end}}
-          </div>
+        {{range .NavMenu.Primary}}
+          <a class="studio-nav__link {{if .IsActive}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
+            {{if .Icon}}{{navIconHTML .Icon}}{{end}}<span>{{.Title}}</span>
+          </a>
         {{end}}
 
-        <div class="studio-nav-more">
-          <button type="button" id="volo-nav-more-btn" class="studio-nav__link studio-nav-more__summary {{if or (hasPrefix .CurrentPath "/series") (hasPrefix .CurrentPath "/books") (hasPrefix .CurrentPath "/links") (hasPrefix .CurrentPath "/follows") (hasPrefix .CurrentPath "/dynamic")}}is-active{{end}}" aria-haspopup="menu" aria-expanded="false">
-            <span>{{t .Locale "nav.more"}}</span>
-            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-          <div id="volo-nav-more-menu" class="volo-popover studio-nav-more__menu" role="menu" hidden>
-            {{range .NavItems}}
-              {{if and (ne .URL $.AdminPath) (ne .URL "/logout")}}
-                <a class="studio-nav-more__item studio-only-mobile {{if eq $.CurrentPath .URL}}is-active{{end}}" href="{{.URL}}" role="menuitem" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
-                  {{navIconHTML .Icon}}<span>{{.Title}}</span>
+        {{$hasMobileAuth := or (ne .Viewer nil) .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
+        {{if or .NavMenu.Overflow $hasMobileAuth}}
+          <div class="studio-nav-more {{if not .NavMenu.Overflow}}studio-only-mobile{{end}}">
+            <button type="button" id="volo-nav-more-btn" class="studio-nav__link studio-nav-more__summary {{if .NavMenu.OverflowActive}}is-active{{end}}" aria-haspopup="menu" aria-expanded="false">
+              <span>{{t .Locale "nav.more"}}</span>
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div id="volo-nav-more-menu" class="volo-popover studio-nav-more__menu" role="menu" hidden>
+              {{range .NavMenu.Overflow}}
+                <a class="studio-nav-more__item {{if .IsActive}}is-active{{end}}" href="{{.URL}}" role="menuitem" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
+                  {{if .Icon}}{{navIconHTML .Icon}}{{end}}<span>{{.Title}}</span>
                 </a>
               {{end}}
-            {{end}}
-            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/series"}}is-active{{end}}" href="/series" role="menuitem"><span>{{t .Locale "nav.series"}}</span></a>
-            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/books"}}is-active{{end}}" href="/books" role="menuitem">{{navIconHTML "book"}}<span>{{t .Locale "nav.bookshelf"}}</span></a>
-            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/links"}}is-active{{end}}" href="/links" role="menuitem"><span>{{t .Locale "nav.links"}}</span></a>
-            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/follows"}}is-active{{end}}" href="/follows" role="menuitem"><span>{{t .Locale "nav.follows"}}</span></a>
-            <a class="studio-nav-more__item {{if hasPrefix .CurrentPath "/dynamic"}}is-active{{end}}" href="/dynamic" role="menuitem"><span>{{t .Locale "nav.dynamic"}}</span></a>
-            {{if .Viewer}}
-              <div class="volo-appearance__divider studio-only-mobile"></div>
-              {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
-                <a class="studio-nav-more__item studio-only-mobile" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
-                <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
-                  <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></button>
-                </form>
-              {{else}}
-                <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
-                  <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></button>
-                </form>
+              {{if .Viewer}}
+                {{if .NavMenu.Overflow}}<div class="volo-appearance__divider studio-only-mobile"></div>{{end}}
+                {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
+                  <a class="studio-nav-more__item studio-only-mobile" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
+                  <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                    <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></button>
+                  </form>
+                {{else}}
+                  <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                    <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></button>
+                  </form>
+                {{end}}
+              {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
+                {{if .NavMenu.Overflow}}<div class="volo-appearance__divider studio-only-mobile"></div>{{end}}
+                <a class="studio-nav-more__item studio-only-mobile" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><span>{{t .Locale "nav.login"}}</span></a>
               {{end}}
-            {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
-              <div class="volo-appearance__divider studio-only-mobile"></div>
-              <a class="studio-nav-more__item studio-only-mobile" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><span>{{t .Locale "nav.login"}}</span></a>
-            {{end}}
+            </div>
           </div>
-        </div>
+        {{end}}
       </nav>
 
       <div class="studio-actions">
@@ -142,10 +127,46 @@
             <span id="volo-theme-label">{{t .Locale "studio.short_auto"}}</span>
           </button>
           <div id="volo-theme-menu" class="volo-popover volo-appearance__menu" role="menu" hidden>
-            <button type="button" class="volo-appearance__item" data-volo-mode="auto" role="menuitemradio"><span>{{t .Locale "appearance.auto"}}</span><span class="volo-menu-check">✓</span></button>
-            <button type="button" class="volo-appearance__item" data-volo-mode="system" role="menuitemradio"><span>{{t .Locale "appearance.system"}}</span><span class="volo-menu-check">✓</span></button>
-            <button type="button" class="volo-appearance__item" data-volo-mode="light" role="menuitemradio"><span>{{t .Locale "appearance.light"}}</span><span class="volo-menu-check">✓</span></button>
-            <button type="button" class="volo-appearance__item" data-volo-mode="dark" role="menuitemradio"><span>{{t .Locale "appearance.dark"}}</span><span class="volo-menu-check">✓</span></button>
+            <button type="button" class="volo-appearance__item" data-volo-mode="auto" role="menuitemradio">
+              <span class="volo-appearance__lead">
+                <svg class="volo-appearance__icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg>
+                <span class="volo-appearance__copy">
+                  <span class="volo-appearance__title">{{t .Locale "appearance.auto"}}</span>
+                  <small class="volo-appearance__sub">{{t .Locale "appearance.auto_desc"}}</small>
+                </span>
+              </span>
+              <span class="volo-menu-check">✓</span>
+            </button>
+            <button type="button" class="volo-appearance__item" data-volo-mode="system" role="menuitemradio">
+              <span class="volo-appearance__lead">
+                <svg class="volo-appearance__icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+                <span class="volo-appearance__copy">
+                  <span class="volo-appearance__title">{{t .Locale "appearance.system"}}</span>
+                  <small class="volo-appearance__sub">{{t .Locale "appearance.system_desc"}}</small>
+                </span>
+              </span>
+              <span class="volo-menu-check">✓</span>
+            </button>
+            <button type="button" class="volo-appearance__item" data-volo-mode="light" role="menuitemradio">
+              <span class="volo-appearance__lead">
+                <svg class="volo-appearance__icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 3v2m0 14v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M3 12h2m14 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+                <span class="volo-appearance__copy">
+                  <span class="volo-appearance__title">{{t .Locale "appearance.light"}}</span>
+                  <small class="volo-appearance__sub">{{t .Locale "appearance.light_desc"}}</small>
+                </span>
+              </span>
+              <span class="volo-menu-check">✓</span>
+            </button>
+            <button type="button" class="volo-appearance__item" data-volo-mode="dark" role="menuitemradio">
+              <span class="volo-appearance__lead">
+                <svg class="volo-appearance__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+                <span class="volo-appearance__copy">
+                  <span class="volo-appearance__title">{{t .Locale "appearance.dark"}}</span>
+                  <small class="volo-appearance__sub">{{t .Locale "appearance.dark_desc"}}</small>
+                </span>
+              </span>
+              <span class="volo-menu-check">✓</span>
+            </button>
           </div>
         </div>
 
@@ -215,11 +236,14 @@
     {{end}}
     <div class="studio-footer-meta">
       <div>
-        <span>© {{if .Year}}{{.Year}} {{end}}{{.Site.Title}}{{if .Site.FooterText}} · {{.Site.FooterText}}{{end}}</span>
+        <span>© {{if .Year}}{{.Year}} {{end}}{{.Site.Title}}</span>
         {{template "journal_colophon" .}}
       </div>
       <span>Made with <a href="https://github.com/Willh92/Volo-go" target="_blank" rel="noopener noreferrer" data-no-pjax>Volo</a> · Journal</span>
     </div>
+    {{if and .Site.EnableFooterHTML .Site.FooterText}}
+      <div class="studio-footer-content">{{safeHTML .Site.FooterText}}</div>
+    {{end}}
     <div class="studio-statistics">
       <a href="/rss.xml" data-no-pjax>{{t .Locale "footer.rss"}}</a>
       {{if .Feed.Podcast.Enabled}}<a href="/podcast.xml" data-no-pjax>{{t .Locale "podcast.subscribe_rss"}}</a>{{end}}

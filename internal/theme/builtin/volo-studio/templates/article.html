@@ -16,15 +16,8 @@
           {{if gt .Detail.PublishedAt 0}}
             <time datetime="{{fmtISO .Detail.PublishedAt}}">{{fmtDate .Detail.PublishedAt}}{{if .Detail.HasUpdated}} / {{fmtDate .Detail.UpdatedAt}}{{end}}</time>
           {{end}}
-          {{if or .Detail.CategoryName .Detail.Tags}}
-            <span class="studio-article-tags">
-              {{if .Detail.CategoryName}}
-                <a class="volo-badge" href="/categories/{{.Detail.CategorySlug}}">{{.Detail.CategoryName}}</a>
-              {{end}}
-              {{range .Detail.Tags}}
-                <a class="studio-article-tag" rel="tag" href="/tags/{{.Slug}}">#{{.Name}}</a>
-              {{end}}
-            </span>
+          {{if .Detail.CategoryName}}
+            <a class="volo-badge" href="/categories/{{.Detail.CategorySlug}}">{{.Detail.CategoryName}}</a>
           {{end}}
           {{if and (not .Detail.RequiresPassword) .Reading.EnableReadingStats (gt .Detail.WordCount 15)}}
             <span class="studio-reading-stats">{{t .Locale "article.reading_stats" (dict "words" .Detail.WordCount "minutes" .Detail.ReadingMinutes)}}</span>
@@ -103,10 +96,19 @@
           </div>
         {{end}}
 
-        {{if .Detail.LicenseText}}
-          <div class="volo-banner volo-license-banner volo-license-box">
-            {{.Detail.LicenseText}}
+        {{if .Detail.Tags}}
+          <div class="studio-article__foot-tags">
+            {{range .Detail.Tags}}
+              <a class="tag-chip" rel="tag" href="/tags/{{.Slug}}">#{{.Name}}</a>
+            {{end}}
           </div>
+        {{end}}
+
+        {{if .Detail.LicenseText}}
+          <aside class="volo-license-box" aria-label="{{t .Locale "article.license_title"}}">
+            <span class="volo-license-box__mark" aria-hidden="true">©</span>
+            <div class="volo-license-box__body">{{linkifyLicense .Detail.LicenseText .CanonicalURL}}</div>
+          </aside>
         {{end}}
 
         <div class="volo-share-bar" aria-label="{{t .Locale "article.share_label"}}">

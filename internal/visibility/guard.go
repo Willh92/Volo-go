@@ -479,22 +479,23 @@ func (g *Guard) ToNeighbor(raw domain.RawArticle) PublicNeighbor {
 
 // DetailRenderDeps supplies optional per-page enrichments (bookshelf cards, media dimensions, translations).
 type DetailRenderDeps struct {
-	Locale            string
-	AuthorName        string
-	AuthorAvatarURL   string
-	AuthorBio         string
-	AuthorWebsiteURL  string
-	Category          *domain.Category
-	Tags              []domain.Tag
-	Translations      []TranslationAlternate
-	DefaultOGImageURL string
-	SiteTitle         string
-	PublicBaseURL     string
-	LicenseTemplate   string
-	ShowLineNumbers   bool
-	LookupBook        func(slug string) (render.BookCardInfo, bool)
-	ListBooks         func() []render.BookCardInfo
-	LookupMediaDims   func(src string) (int, int, bool)
+	Locale               string
+	AuthorName           string
+	AuthorAvatarURL      string
+	AuthorBio            string
+	AuthorWebsiteURL     string
+	Category             *domain.Category
+	Tags                 []domain.Tag
+	Translations         []TranslationAlternate
+	DefaultOGImageURL    string
+	SiteTitle            string
+	PublicBaseURL        string
+	LicenseTemplate      string
+	DisableLicenseNotice bool
+	ShowLineNumbers      bool
+	LookupBook           func(slug string) (render.BookCardInfo, bool)
+	ListBooks            func() []render.BookCardInfo
+	LookupMediaDims      func(src string) (int, int, bool)
 }
 
 // ToDetail produces a sanitized PublicArticleView for article detail pages.
@@ -654,7 +655,9 @@ func (g *Guard) ToDetail(
 	view.AudioDurationSec = raw.AudioDurationSec
 	view.AudioSizeBytes = raw.AudioSizeBytes
 	view.AudioMIME = raw.AudioMIME
-	view.LicenseText = formatLicense(raw.LicenseOverride, deps.LicenseTemplate, raw.Title, deps.AuthorName, strings.TrimRight(deps.PublicBaseURL, "/")+artURL, raw.PublishedAt)
+	if !deps.DisableLicenseNotice {
+		view.LicenseText = formatLicense(raw.LicenseOverride, deps.LicenseTemplate, deps.SiteTitle, raw.Title, deps.AuthorName, strings.TrimRight(deps.PublicBaseURL, "/")+artURL, raw.PublishedAt)
+	}
 
 	return view
 }
@@ -793,7 +796,7 @@ func (g *Guard) protectedNotice(locale string) string {
 	return "受密码保护的文章"
 }
 
-func formatLicense(override string, tmpl string, title string, author string, fullURL string, pubUnix int64) string {
+func formatLicense(override string, tmpl string, siteTitle string, title string, author string, fullURL string, pubUnix int64) string {
 	src := strings.TrimSpace(override)
 	if src == "" {
 		src = strings.TrimSpace(tmpl)
@@ -801,11 +804,19 @@ func formatLicense(override string, tmpl string, title string, author string, fu
 	if src == "" {
 		return ""
 	}
+	site := strings.TrimSpace(siteTitle)
+	if site == "" {
+		site = title
+	}
+	if src == "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}" {
+		src = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
+	}
 	dateStr := ""
 	if pubUnix > 0 {
 		dateStr = time.UnixMilli(pubUnix).UTC().Format("2006-01-02")
 	}
 	r := strings.NewReplacer(
+		"{site}", site,
 		"{title}", title,
 		"{author}", author,
 		"{url}", fullURL,

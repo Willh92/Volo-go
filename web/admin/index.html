@@ -5,6 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex, nofollow" />
   <title>Volo Studio Console</title>
+  <script>
+    (function () {
+      var cfg = {};
+      try {
+        var el = document.getElementById("volo-boot-config");
+        if (el && el.textContent) cfg = JSON.parse(el.textContent) || {};
+      } catch (_) {}
+      var m = "";
+      try {
+        m = localStorage.getItem("volo_theme_mode") || localStorage.getItem("volo_console_theme") || "";
+      } catch (_) {}
+      if (!m) m = cfg.default_theme || "auto";
+      var eff = m;
+      if (m === "system") {
+        eff = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      } else if (m !== "light" && m !== "dark") {
+        var h = new Date().getHours();
+        eff = h >= 7 && h < 19 ? "light" : "dark";
+      }
+      var root = document.documentElement;
+      root.setAttribute("data-mode", m);
+      root.setAttribute("data-theme", eff);
+      if (cfg.accent) root.setAttribute("data-accent", cfg.accent);
+    })();
+  </script>
 </head>
 <body>
   <div id="app"></div>

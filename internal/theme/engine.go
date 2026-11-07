@@ -42,7 +42,7 @@ type ConfigOption struct {
 // ConfigField defines a declarative per-theme configuration item in `theme.json`.
 type ConfigField struct {
 	Key         string            `json:"key"`
-	Type        string            `json:"type"` // "text" | "textarea" | "url" | "color" | "boolean" | "number" | "select"
+	Type        string            `json:"type"` // "text" | "textarea" | "url" | "color" | "boolean" | "number" | "select" | "sortable_list"
 	Label       map[string]string `json:"label"`
 	Description map[string]string `json:"description,omitempty"`
 	Placeholder map[string]string `json:"placeholder,omitempty"`
@@ -225,7 +225,9 @@ type PageContext struct {
 	Owner           content.PublicAuthorProfile
 	Authors  []content.PublicAuthorProfile
 	Stats    content.PublicSiteStats
-	NavItems []content.PublicNavNode
+	NavItems        []content.PublicNavNode
+	NavMenu         NavMenu
+	NavMenuResolved bool
 
 	HeroTitle    string
 	HeroSubtitle string
@@ -692,6 +694,38 @@ func (e *Engine) ResolveThemeConfig(themeID string, saved map[string]map[string]
 	return out
 }
 
+// IsMobileRequest detects mobile phone user-agents and Client Hints (`Sec-CH-UA-Mobile: ?1`),
+// while allowing staff preview overrides via `?device=mobile` or `?device=desktop`.
+func IsMobileRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if dev := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("device"))); dev != "" {
+		if dev == "mobile" || dev == "phone" {
+			return true
+		}
+		if dev == "desktop" || dev == "pc" {
+			return false
+		}
+	}
+	if strings.TrimSpace(r.Header.Get("Sec-CH-UA-Mobile")) == "?1" {
+		return true
+	}
+	ua := strings.ToLower(r.Header.Get("User-Agent"))
+	if ua == "" {
+		return false
+	}
+	if strings.Contains(ua, "ipad") || strings.Contains(ua, "tablet") {
+		return false
+	}
+	for _, kw := range []string{"mobi", "iphone", "ipod", "android", "windows phone", "harmonyos", "ucbrowser", "micromessenger"} {
+		if strings.Contains(ua, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // ResolveActiveTheme picks `?skin=<id>` or `?theme_preview=<id>` when viewer is Admin/Editor,
 // otherwise Appearance.ActiveTheme, falling back cleanly to `volo-studio` if an external theme was removed.
 func (e *Engine) ResolveActiveTheme(r *http.Request, viewer *domain.User, configuredID string) string {
@@ -708,6 +742,24 @@ func (e *Engine) ResolveActiveTheme(r *http.Request, viewer *domain.User, config
 		return cfg
 	}
 	return DefaultThemeID
+}
+
+// ResolveThemeForRequest resolves the active theme taking into account staff preview params,
+// separate MobileTheme configuration on mobile requests, and desktop ActiveTheme fallback.
+func (e *Engine) ResolveThemeForRequest(r *http.Request, viewer *domain.User, app domain.AppearanceSettings) string {
+	if r != nil && viewer != nil && viewer.Status == domain.UserStatusActive &&
+		(viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor) {
+		q := r.URL.Query()
+		for _, param := range []string{"skin", "theme_preview"} {
+			if candidate := strings.TrimSpace(q.Get(param)); candidate != "" && e.Has(candidate) {
+				return candidate
+			}
+		}
+	}
+	if mob := strings.TrimSpace(app.MobileTheme); mob != "" && mob != "same" && IsMobileRequest(r) && e.Has(mob) {
+		return mob
+	}
+	return e.ResolveActiveTheme(r, viewer, app.ActiveTheme)
 }
 
 // Render executes pageName (`index.html`, `article.html`, etc.) and writes HTML to w.
@@ -763,6 +815,10 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 	data.EnablePJAX = supportsPJAX
 	if data.ThemeConfig == nil {
 		data.ThemeConfig = e.ResolveThemeConfig(themeID, data.Appearance.ThemeConfigs)
+	}
+	if !data.NavMenuResolved {
+		data.NavMenu = e.ResolveNavMenu(data)
+		data.NavMenuResolved = true
 	}
 
 	entryTemplate := selected
@@ -931,7 +987,7 @@ func validateThemeConfigSchema(schema []ConfigField) ([]ConfigField, error) {
 			ft = "text"
 		}
 		switch ft {
-		case "text", "string", "textarea", "url", "color", "image", "boolean", "number", "select":
+		case "text", "string", "textarea", "url", "color", "image", "boolean", "number", "select", "sortable_list":
 		default:
 			return nil, fmt.Errorf("theme.json config_schema[%q] unsupported type %q", f.Key, f.Type)
 		}

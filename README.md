@@ -71,31 +71,32 @@ CGO_ENABLED=0 go build -trimpath \
 
 访问 `http://localhost:8080` 进入首次建站向导（支持选库测活、初始化管理员或一键上传导入旧版备份包）。
 
-#### 2. 各操作系统一键安装为后台服务
+#### 2. 各操作系统一键安装与极简在线更新后台服务
 
-仓库内置跨平台服务安装脚本与服务单元模板（位于 [`scripts/`](./scripts/) 与 [`deploy/`](./deploy/)，均支持 `--dry-run` 预演）：
+内置统一跨平台服务管理脚本 [`scripts/install-service.sh`](./scripts/install-service.sh)（Linux `systemd` 系统/用户级、`OpenRC` 及 macOS `launchd`）与 [`scripts/install-service.ps1`](./scripts/install-service.ps1)（Windows `NSSM` / 系统计划任务），本地存在二进制时优先使用本地文件，无本地文件或执行 `upgrade` / `update` 时自动从 GitHub Releases 拉取、强制校验 `SHA256SUMS.txt` 并执行预检后平滑重启（完整保留 `.env` 与 `data/`）：
 
 ```bash
-# Linux (自动识别 systemd 与 Alpine/Gentoo OpenRC，支持 TCP 或 Unix Socket)
-sudo bash scripts/install-service-linux.sh install \
-  --binary ./volo \
-  --public-url https://blog.example.com \
-  --listen-addr 127.0.0.1:8080
+# Linux / macOS 远程一行安装（默认监听 127.0.0.1:8080，可选传 --public-url https://blog.example.com）
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh | sudo sh
 
-# Linux + Nginx 零 TCP 开销 Unix Domain Socket 模式
-sudo bash scripts/install-service-linux.sh install \
-  --binary ./volo \
-  --group www-data \
-  --listen-socket /run/volo/volo.sock \
-  --socket-mode 0660 \
+# 日常极简在线更新（零附加参数，自动识别已安装路径与服务配置；支持 --version <tag> 与 --mirror https://ghfast.top）
+sudo ./scripts/install-service.sh upgrade
+# 或远程一行直接更新：
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh | sudo sh -s -- upgrade
+
+# Linux + Nginx 零 TCP 开销 Unix Domain Socket 高级模式
+sudo ./scripts/install-service.sh install \
+  --socket-group www-data \
+  --unix-socket /run/volo/volo.sock \
   --public-url https://blog.example.com
 
-# macOS (默认安装为当前用户 LaunchAgent 免 sudo；加 --system 安装为系统级 LaunchDaemon)
-bash scripts/install-service-macos.sh install --binary ./volo --public-url https://blog.example.com
+# macOS 当前用户免 sudo 安装（自动切换为 LaunchAgent）与在线更新
+./scripts/install-service.sh install --public-url https://blog.example.com
+./scripts/install-service.sh upgrade
 
-# Windows (PowerShell 管理员运行：自动适配 NSSM 或系统启动计划任务 + NTFS ACL 锁死 .env)
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 `
-  -Action Install -BinaryPath .\volo.exe -PublicUrl "https://blog.example.com"
+# Windows (PowerShell 管理员运行：零附加参数一键在线升级)
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Install -PublicUrl "https://blog.example.com"
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Upgrade
 ```
 
 配套开箱即用的 **Nginx（TCP 与 Unix Socket）、Caddy v2、Traefik v3、Apache httpd** 反代配置位于 [`deploy/reverse-proxy/`](./deploy/reverse-proxy/)，详尽说明请参阅 [反向代理与 CDN 配置指南](./docs/zh-CN/reverse-proxy.md)。

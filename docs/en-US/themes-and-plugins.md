@@ -67,6 +67,11 @@ Example `theme.json`:
 
 During smooth PJAX page transitions, the main article viewport swaps while widgets mounted in `public.footer` or `public.header` with `persist: true` remain alive inside persistent island containers — keeping **podcast audio playback uninterrupted** and **interactive companions (e.g., `kanbanniang`) stateful across navigations**.
 
+### 1.4 Separate Desktop & Mobile Themes and Header Navigation Ordering (`sortable_list` + `.NavMenu`)
+
+- **Independent Desktop & Mobile Theme Activation**: **Console -> Appearance & Extensions -> Themes** allows enabling one theme for Desktop (`active_theme`) and an optional dedicated theme for Mobile (`mobile_theme`, inheriting Desktop when unset) with cache-safe `Vary: User-Agent, Sec-CH-UA-Mobile` negotiation. Administrators can preview either mode live via `/?skin=<id>` and `/?skin=<id>&device=mobile`.
+- **Theme-Level Top Menu Ordering & Overflow**: Themes can declare `"type": "sortable_list"` fields in `theme.json` `config_schema` (such as `header_nav_items` and `header_nav_primary_count` in `volo-studio` and `volo-journal`) so site owners can toggle visibility and reorder built-in routes (`home`, `archives`, `tags`, `categories`, `series`, `books`, `links`, `follows`, `dynamic`) alongside the `custom` slot (which expands custom links from **Distribute -> Navigation** and defaults to the last position). Templates consume `PageContext.NavMenu` (`.NavMenu.Primary`, `.NavMenu.Overflow`, `.NavMenu.OverflowActive`, and `.NavMenu.Items`) directly without manual slice math.
+
 ---
 
 ## 2. Sandboxed Plugin Development (`manifest.json` + `goja`)

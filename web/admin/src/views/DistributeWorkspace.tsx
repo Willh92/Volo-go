@@ -11,6 +11,7 @@ import {
   Pagination,
   SwitchToggle,
   TableSkeleton,
+  TokenListInput,
 } from "../components/UIControls";
 import { formatDateTime, t } from "../i18n";
 
@@ -628,16 +629,27 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.nav_head")}</h3>
               <p class="volo-sec-desc">{t("dist.nav_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary volo-btn-sm"
-              onClick={() => {
-                setNavForm({ ...EMPTY_NAV });
-                setNavModalOpen(true);
-              }}
-            >
-              + {t("dist.new_nav")}
-            </button>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              {isAdmin && (
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm"
+                  onClick={() => onNavigate?.("themes")}
+                >
+                  {t("dist.nav_theme_order")}
+                </button>
+              )}
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  setNavForm({ ...EMPTY_NAV });
+                  setNavModalOpen(true);
+                }}
+              >
+                + {t("dist.new_nav")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-table-wrap">
@@ -2133,99 +2145,103 @@ export function DistributeWorkspace({
                   onChange={(v) => setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), enabled: v } })}
                   label={t("dist.feed_podcast")}
                 />
-                <SwitchToggle
-                  checked={!!feedCfg.podcast?.explicit}
-                  onChange={(v) => setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), explicit: v } })}
-                  label={t("dist.podcast_explicit")}
-                />
+                {!!feedCfg.podcast?.enabled && (
+                  <SwitchToggle
+                    checked={!!feedCfg.podcast?.explicit}
+                    onChange={(v) => setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), explicit: v } })}
+                    label={t("dist.podcast_explicit")}
+                  />
+                )}
               </div>
 
-              <div class="volo-subcard">
-                <div class="volo-subcard-title">{t("dist.podcast_meta")}</div>
-                <div class="volo-grid-2">
-                  <div class="volo-field">
-                    <label>{t("dist.lbl_pod_title")}</label>
-                    <input
-                      class="volo-input"
-                      placeholder={t("dist.podcast_title_ph")}
-                      value={feedCfg.podcast?.title || ""}
-                      onInput={(e) =>
-                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), title: (e.currentTarget as HTMLInputElement).value } })
-                      }
-                    />
+              {!!feedCfg.podcast?.enabled && (
+                <div class="volo-subcard">
+                  <div class="volo-subcard-title">{t("dist.podcast_meta")}</div>
+                  <div class="volo-grid-2">
+                    <div class="volo-field">
+                      <label>{t("dist.lbl_pod_title")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder={t("dist.podcast_title_ph")}
+                        value={feedCfg.podcast?.title || ""}
+                        onInput={(e) =>
+                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), title: (e.currentTarget as HTMLInputElement).value } })
+                        }
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("dist.lbl_pod_author")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder={t("dist.podcast_author_ph")}
+                        value={feedCfg.podcast?.author || ""}
+                        onInput={(e) =>
+                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), author: (e.currentTarget as HTMLInputElement).value } })
+                        }
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("dist.lbl_pod_email")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder={t("dist.podcast_email_ph")}
+                        value={feedCfg.podcast?.owner_email || ""}
+                        onInput={(e) =>
+                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), owner_email: (e.currentTarget as HTMLInputElement).value } })
+                        }
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("dist.lbl_pod_cat")}</label>
+                      <input
+                        class="volo-input"
+                        placeholder={t("dist.podcast_cat_ph")}
+                        value={feedCfg.podcast?.category || ""}
+                        onInput={(e) =>
+                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), category: (e.currentTarget as HTMLInputElement).value } })
+                        }
+                      />
+                    </div>
                   </div>
                   <div class="volo-field">
-                    <label>{t("dist.lbl_pod_author")}</label>
-                    <input
-                      class="volo-input"
-                      placeholder={t("dist.podcast_author_ph")}
-                      value={feedCfg.podcast?.author || ""}
-                      onInput={(e) =>
-                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), author: (e.currentTarget as HTMLInputElement).value } })
-                      }
-                    />
+                    <label>{t("dist.lbl_pod_cover")}</label>
+                    <div class="volo-input-row">
+                      <input
+                        class="volo-input"
+                        placeholder={t("dist.podcast_cover_ph")}
+                        value={feedCfg.podcast?.cover_image_url || ""}
+                        onInput={(e) =>
+                          setFeedCfg({
+                            ...feedCfg,
+                            podcast: { ...(feedCfg.podcast || {}), cover_image_url: (e.currentTarget as HTMLInputElement).value },
+                          })
+                        }
+                      />
+                      <MediaPickButton
+                        filterKind="image"
+                        onPick={(u) =>
+                          setFeedCfg({
+                            ...feedCfg,
+                            podcast: { ...(feedCfg.podcast || {}), cover_image_url: u },
+                          })
+                        }
+                      />
+                    </div>
                   </div>
                   <div class="volo-field">
-                    <label>{t("dist.lbl_pod_email")}</label>
-                    <input
-                      class="volo-input"
-                      placeholder={t("dist.podcast_email_ph")}
-                      value={feedCfg.podcast?.owner_email || ""}
+                    <label>{t("dist.lbl_pod_sum")}</label>
+                    <textarea
+                      class="volo-textarea"
+                      rows={2}
+                      placeholder={t("dist.podcast_sum_ph")}
+                      value={feedCfg.podcast?.summary || ""}
                       onInput={(e) =>
-                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), owner_email: (e.currentTarget as HTMLInputElement).value } })
-                      }
-                    />
-                  </div>
-                  <div class="volo-field">
-                    <label>{t("dist.lbl_pod_cat")}</label>
-                    <input
-                      class="volo-input"
-                      placeholder={t("dist.podcast_cat_ph")}
-                      value={feedCfg.podcast?.category || ""}
-                      onInput={(e) =>
-                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), category: (e.currentTarget as HTMLInputElement).value } })
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), summary: (e.currentTarget as HTMLTextAreaElement).value } })
                       }
                     />
                   </div>
                 </div>
-                <div class="volo-field">
-                  <label>{t("dist.lbl_pod_cover")}</label>
-                  <div class="volo-input-row">
-                    <input
-                      class="volo-input"
-                      placeholder={t("dist.podcast_cover_ph")}
-                      value={feedCfg.podcast?.cover_image_url || ""}
-                      onInput={(e) =>
-                        setFeedCfg({
-                          ...feedCfg,
-                          podcast: { ...(feedCfg.podcast || {}), cover_image_url: (e.currentTarget as HTMLInputElement).value },
-                        })
-                      }
-                    />
-                    <MediaPickButton
-                      filterKind="image"
-                      onPick={(u) =>
-                        setFeedCfg({
-                          ...feedCfg,
-                          podcast: { ...(feedCfg.podcast || {}), cover_image_url: u },
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-                <div class="volo-field">
-                  <label>{t("dist.lbl_pod_sum")}</label>
-                  <textarea
-                    class="volo-textarea"
-                    rows={2}
-                    placeholder={t("dist.podcast_sum_ph")}
-                    value={feedCfg.podcast?.summary || ""}
-                    onInput={(e) =>
-                      setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), summary: (e.currentTarget as HTMLTextAreaElement).value } })
-                    }
-                  />
-                </div>
-              </div>
+              )}
 
               <div class="volo-form-actions">
                 <button
@@ -2255,17 +2271,19 @@ export function DistributeWorkspace({
               </div>
               <div class="volo-field">
                 <label>{t("dist.seo_kw")}</label>
-                <input
-                  class="volo-input"
-                  value={seoCfg.meta_keywords || ""}
-                  onInput={(e) => setSeoCfg({ ...seoCfg, meta_keywords: (e.currentTarget as HTMLInputElement).value })}
+                <TokenListInput
+                  values={String(seoCfg.meta_keywords || "")
+                    .split(/[,，]/)
+                    .map((s) => s.trim())
+                    .filter(Boolean)}
+                  onChange={(next) => setSeoCfg({ ...seoCfg, meta_keywords: next.join(", ") })}
                 />
               </div>
               <div class="volo-field">
                 <label>{t("dist.seo_desc")}</label>
                 <textarea
                   class="volo-textarea"
-                  rows={2}
+                  rows={3}
                   value={seoCfg.meta_description || ""}
                   onInput={(e) => setSeoCfg({ ...seoCfg, meta_description: (e.currentTarget as HTMLTextAreaElement).value })}
                 />
@@ -2285,42 +2303,46 @@ export function DistributeWorkspace({
               <div class="volo-subcard">
                 <div class="volo-subcard-title">
                   <span>{t("dist.seo_indexnow_title")}</span>
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    onClick={async () => {
-                      try {
-                        const r = await apiFetch<{ pushed_urls: number }>("/api/admin/seo/indexnow-push", {
-                          method: "POST",
-                          body: "{}",
-                        });
-                        showToast(t("dist.seo_pushed", { count: r.pushed_urls ?? 0 }));
-                      } catch (err: any) {
-                        showToast(err.message);
-                      }
-                    }}
-                  >
-                    {t("dist.seo_push_now")}
-                  </button>
-                </div>
-                <div class="volo-field">
-                  <label>{t("dist.seo_indexnow_key")}</label>
-                  <div class="volo-input-row">
-                    <input
-                      class="volo-input"
-                      value={seoCfg.indexnow_key || ""}
-                      onInput={(e) => setSeoCfg({ ...seoCfg, indexnow_key: (e.currentTarget as HTMLInputElement).value })}
-                    />
-                    <button type="button" class="volo-btn volo-btn-sm" onClick={() => setSeoCfg({ ...seoCfg, indexnow_key: genRandomHexKey() })}>
-                      {t("dist.seo_gen_key")}
+                  {!!seoCfg.indexnow_enabled && (
+                    <button
+                      type="button"
+                      class="volo-act-btn"
+                      onClick={async () => {
+                        try {
+                          const r = await apiFetch<{ pushed_urls: number }>("/api/admin/seo/indexnow-push", {
+                            method: "POST",
+                            body: "{}",
+                          });
+                          showToast(t("dist.seo_pushed", { count: r.pushed_urls ?? 0 }));
+                        } catch (err: any) {
+                          showToast(err.message);
+                        }
+                      }}
+                    >
+                      {t("dist.seo_push_now")}
                     </button>
-                  </div>
+                  )}
                 </div>
                 <SwitchToggle
                   checked={!!seoCfg.indexnow_enabled}
                   onChange={(v) => setSeoCfg({ ...seoCfg, indexnow_enabled: v })}
                   label={t("dist.seo_indexnow_on")}
                 />
+                {!!seoCfg.indexnow_enabled && (
+                  <div class="volo-field" style={{ marginTop: "12px" }}>
+                    <label>{t("dist.seo_indexnow_key")}</label>
+                    <div class="volo-input-row">
+                      <input
+                        class="volo-input"
+                        value={seoCfg.indexnow_key || ""}
+                        onInput={(e) => setSeoCfg({ ...seoCfg, indexnow_key: (e.currentTarget as HTMLInputElement).value })}
+                      />
+                      <button type="button" class="volo-btn volo-btn-sm" onClick={() => setSeoCfg({ ...seoCfg, indexnow_key: genRandomHexKey() })}>
+                        {t("dist.seo_gen_key")}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div class="volo-subcard">

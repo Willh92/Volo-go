@@ -17,11 +17,18 @@
   "nav.login": "Sign In",
   "nav.logout": "Sign Out",
 
-  "appearance.auto": "Auto by Local Time (07:00-19:00 Light)",
-  "appearance.system": "Follow OS Theme",
+  "appearance.auto": "Auto",
+  "appearance.auto_desc": "07:00–19:00 light",
+  "appearance.system": "System",
+  "appearance.system_desc": "Match device setting",
   "appearance.light": "Light",
+  "appearance.light_desc": "Always light",
   "appearance.dark": "Dark",
+  "appearance.dark_desc": "Always dark",
   "appearance.switch_lang": "Language",
+
+  "article.license_title": "Copyright & License",
+  "studio.archive_summary": "{articles} posts across {months} months",
 
   "article.pinned": "Pinned",
   "article.reading_stats": "{words} words · {minutes} min read",

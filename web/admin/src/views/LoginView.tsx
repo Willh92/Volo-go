@@ -219,7 +219,7 @@ export function LoginView() {
                         </svg>
                       </span>
                       <input
-                        type={showPwd ? "text" : "password"}
+                        type={(showPwd ? "text" : "password") as "password"}
                         class="volo-input"
                         name="volo_staff_secret"
                         autoComplete="new-password"

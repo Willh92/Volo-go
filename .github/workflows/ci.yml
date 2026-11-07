@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Repository Hygiene, License & Service Installer Check
         run: |
@@ -39,13 +39,16 @@ jobs:
             echo "FAIL: banned legacy coupling identifier detected in source" >&2
             exit 1
           fi
-          bash -n scripts/install-service-linux.sh
-          bash -n scripts/install-service-macos.sh
+          sh -n scripts/install-service.sh
+          sh -n scripts/install-service-linux.sh
+          sh -n scripts/install-service-macos.sh
+          sh scripts/install-service.sh install --dry-run --init systemd --unix-socket /run/volo/volo.sock >/dev/null
+          sh scripts/install-service.sh upgrade --dry-run --init systemd >/dev/null
           bash scripts/install-service-linux.sh install --dry-run --init systemd --listen-socket /run/volo/volo.sock >/dev/null
           bash scripts/install-service-macos.sh install --dry-run >/dev/null
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "npm"
@@ -66,7 +69,7 @@ jobs:
           fi
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true

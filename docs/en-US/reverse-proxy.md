@@ -100,9 +100,9 @@ Template: [`deploy/reverse-proxy/nginx-unix-socket.conf`](../../deploy/reverse-p
 
 1. Install the service sharing Nginx's group (`www-data` on Debian/Ubuntu, `nginx` on RHEL/Rocky):
    ```bash
-   sudo bash scripts/install-service-linux.sh install \
+   sudo ./scripts/install-service.sh install \
      --group www-data \
-     --listen-socket /run/volo/volo.sock \
+     --unix-socket /run/volo/volo.sock \
      --socket-mode 0660 \
      --public-url https://blog.example.com
    ```

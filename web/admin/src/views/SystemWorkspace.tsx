@@ -21,6 +21,7 @@ import {
   paginateItems,
   SwitchToggle,
   TableSkeleton,
+  TokenListInput,
   UploadButton,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, t } from "../i18n";
@@ -32,6 +33,7 @@ export type SysTab =
   | "backup"
   | "account"
   | "waf"
+  | "logs"
   | "audit";
 
 const PAT_SCOPES = [
@@ -114,6 +116,13 @@ function formatBytes(bytes: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+function formatLogTs(ms: number): string {
+  if (!ms) return "";
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function renderSysTabLabel(tab: SysTab): string {
   switch (tab) {
     case "settings_site":
@@ -128,6 +137,8 @@ function renderSysTabLabel(tab: SysTab): string {
       return t("sys.account");
     case "waf":
       return t("sys.waf");
+    case "logs":
+      return t("nav.logs");
     case "audit":
       return t("sys.audit");
   }
@@ -248,6 +259,11 @@ export function SystemWorkspace({
   const [auditAction, setAuditAction] = useState("all");
   const [expandedAuditId, setExpandedAuditId] = useState<string | null>(null);
 
+  const [runtimeLogs, setRuntimeLogs] = useState<any[]>([]);
+  const [logStats, setLogStats] = useState<any>(null);
+  const [logLevel, setLogLevel] = useState("ALL");
+  const [logQuery, setLogQuery] = useState("");
+
   useEffect(() => {
     setAvatarImgErr(false);
   }, [profileForm.avatar_url]);
@@ -258,6 +274,15 @@ export function SystemWorkspace({
       resetConsoleScroll();
     }
   }, [activeTab]);
+
+  const loadRuntimeLogs = async (lvl = logLevel, q = logQuery) => {
+    const params = new URLSearchParams({ limit: "400" });
+    if (lvl && lvl !== "ALL") params.set("level", lvl);
+    if (q.trim()) params.set("q", q.trim());
+    const res = await apiFetch<any>(`/api/admin/runtime-logs?${params.toString()}`);
+    setRuntimeLogs(res.items || []);
+    setLogStats(res);
+  };
 
   const loadAuditLogs = async (q = auditQuery, act = auditAction) => {
     const params = new URLSearchParams();
@@ -324,6 +349,8 @@ export function SystemWorkspace({
         setVersions(st.versions || {});
         setLocalBackups(lb.items || []);
         if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
+      } else if (sub === "logs" && isAdmin) {
+        await loadRuntimeLogs();
       } else if (sub === "audit" && isAdmin) {
         await loadAuditLogs();
       }
@@ -418,10 +445,10 @@ export function SystemWorkspace({
     }
   };
 
-  const isSecurityGroup = sub === "account" || sub === "waf" || sub === "audit";
+  const isSecurityGroup = sub === "account" || sub === "waf" || sub === "logs" || sub === "audit";
   const groupTabs: SysTab[] = isSecurityGroup
     ? isAdmin
-      ? ["account", "waf", "audit"]
+      ? ["account", "waf", "logs", "audit"]
       : ["account"]
     : ["settings_site", "settings_io", "users", "backup"];
 
@@ -639,36 +666,9 @@ export function SystemWorkspace({
               <label>{t("sys.notice_board")}</label>
               <textarea
                 class="volo-textarea"
-                rows={2}
+                rows={3}
                 value={domains.site?.notice_board || ""}
                 onInput={(e) => setDomField("site", "notice_board", (e.currentTarget as HTMLTextAreaElement).value)}
-              />
-            </div>
-            <div class="volo-field">
-              <label>{t("sys.license_tpl")}</label>
-              <input
-                class="volo-input"
-                name="site_license_tpl"
-                value={domains.site?.license_template || ""}
-                onInput={(e) => setDomField("site", "license_template", (e.currentTarget as HTMLInputElement).value)}
-              />
-            </div>
-            <div class="volo-field">
-              <label>{t("sys.footer_text")}</label>
-              <input
-                class="volo-input"
-                name="site_footer_note"
-                value={domains.site?.footer_text || ""}
-                onInput={(e) => setDomField("site", "footer_text", (e.currentTarget as HTMLInputElement).value)}
-              />
-            </div>
-            <div class="volo-field">
-              <label>{t("sys.custom_head")}</label>
-              <textarea
-                class="volo-textarea"
-                rows={2}
-                value={domains.site?.custom_head_meta || ""}
-                onInput={(e) => setDomField("site", "custom_head_meta", (e.currentTarget as HTMLTextAreaElement).value)}
               />
             </div>
 
@@ -682,6 +682,52 @@ export function SystemWorkspace({
                 checked={!!domains.site?.show_admin_login_entry}
                 onChange={(v) => setDomField("site", "show_admin_login_entry", v)}
                 label={t("sys.show_admin_entry")}
+              />
+              <SwitchToggle
+                checked={domains.site?.enable_license_notice !== false}
+                onChange={(v) => setDomField("site", "enable_license_notice", v)}
+                label={t("sys.enable_license_notice")}
+              />
+              <SwitchToggle
+                checked={domains.site?.enable_footer_html !== false}
+                onChange={(v) => setDomField("site", "enable_footer_html", v)}
+                label={t("sys.enable_footer_html")}
+              />
+            </div>
+
+            {domains.site?.enable_license_notice !== false && (
+              <div class="volo-field">
+                <label>{t("sys.license_tpl")}</label>
+                <textarea
+                  class="volo-textarea"
+                  rows={2}
+                  value={domains.site?.license_template || ""}
+                  onInput={(e) => setDomField("site", "license_template", (e.currentTarget as HTMLTextAreaElement).value)}
+                />
+                <small class="volo-help">{t("sys.license_vars_hint")}</small>
+              </div>
+            )}
+
+            {domains.site?.enable_footer_html !== false && (
+              <div class="volo-field">
+                <label>{t("sys.footer_text")}</label>
+                <textarea
+                  class="volo-textarea"
+                  rows={3}
+                  value={domains.site?.footer_text || ""}
+                  onInput={(e) => setDomField("site", "footer_text", (e.currentTarget as HTMLTextAreaElement).value)}
+                />
+                <small class="volo-help">{t("sys.footer_html_hint")}</small>
+              </div>
+            )}
+
+            <div class="volo-field">
+              <label>{t("sys.custom_head")}</label>
+              <textarea
+                class="volo-textarea"
+                rows={3}
+                value={domains.site?.custom_head_meta || ""}
+                onInput={(e) => setDomField("site", "custom_head_meta", (e.currentTarget as HTMLTextAreaElement).value)}
               />
             </div>
 
@@ -809,15 +855,17 @@ export function SystemWorkspace({
                   onInput={(e) => setDomField("reading", "posts_per_page", Number((e.currentTarget as HTMLInputElement).value))}
                 />
               </div>
-              <div class="volo-field">
-                <label>{t("sys.outdated_days")}</label>
-                <input
-                  type="number"
-                  class="volo-input"
-                  value={domains.reading?.outdated_notice_days ?? 365}
-                  onInput={(e) => setDomField("reading", "outdated_notice_days", Number((e.currentTarget as HTMLInputElement).value))}
-                />
-              </div>
+              {domains.reading?.enable_outdated_notice !== false && (
+                <div class="volo-field">
+                  <label>{t("sys.outdated_days")}</label>
+                  <input
+                    type="number"
+                    class="volo-input"
+                    value={domains.reading?.outdated_notice_days ?? 365}
+                    onInput={(e) => setDomField("reading", "outdated_notice_days", Number((e.currentTarget as HTMLInputElement).value))}
+                  />
+                </div>
+              )}
             </div>
 
             <div class="volo-auto-grid">
@@ -878,6 +926,11 @@ export function SystemWorkspace({
                 label={t("sys.enable_read_stats")}
               />
               <SwitchToggle
+                checked={domains.reading?.enable_outdated_notice !== false}
+                onChange={(v) => setDomField("reading", "enable_outdated_notice", v)}
+                label={t("sys.enable_outdated_notice")}
+              />
+              <SwitchToggle
                 checked={domains.reading?.enable_instant_search !== false}
                 onChange={(v) => setDomField("reading", "enable_instant_search", v)}
                 label={t("sys.enable_search")}
@@ -909,55 +962,61 @@ export function SystemWorkspace({
                     onChange={(v) => setDomField("reading", "comment_access_mode", v)}
                   />
                 </div>
-                <div class="volo-field">
-                  <label>{t("sys.cmt_mod")}</label>
-                  <ConsoleSelect
-                    value={domains.reading?.comment_moderation_mode || "smart"}
-                    options={[
-                      { value: "smart", label: t("sys.cmt_mod_smart") },
-                      { value: "all", label: t("sys.cmt_mod_all") },
-                      { value: "off", label: t("sys.cmt_mod_off") },
-                    ]}
-                    onChange={(v) => setDomField("reading", "comment_moderation_mode", v)}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("sys.pow_bits")}</label>
-                  <input
-                    type="number"
-                    class="volo-input"
-                    value={domains.reading?.pow_difficulty_bits ?? 16}
-                    onInput={(e) => setDomField("reading", "pow_difficulty_bits", Number((e.currentTarget as HTMLInputElement).value))}
-                  />
-                </div>
+                {domains.reading?.comment_access_mode !== "off" && (
+                  <>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_mod")}</label>
+                      <ConsoleSelect
+                        value={domains.reading?.comment_moderation_mode || "smart"}
+                        options={[
+                          { value: "smart", label: t("sys.cmt_mod_smart") },
+                          { value: "all", label: t("sys.cmt_mod_all") },
+                          { value: "off", label: t("sys.cmt_mod_off") },
+                        ]}
+                        onChange={(v) => setDomField("reading", "comment_moderation_mode", v)}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.pow_bits")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        value={domains.reading?.pow_difficulty_bits ?? 16}
+                        onInput={(e) => setDomField("reading", "pow_difficulty_bits", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                  </>
+                )}
               </div>
-              <div class="volo-check-grid">
-                <SwitchToggle
-                  checked={domains.reading?.builtin_spam_filter !== false}
-                  onChange={(v) => setDomField("reading", "builtin_spam_filter", v)}
-                  label={t("sys.spam_filter")}
-                />
-              </div>
-              <div class="volo-grid-2">
-                <div class="volo-field">
-                  <label>{t("sys.blocked_kw")}</label>
-                  <input
-                    class="volo-input"
-                    name="cmt_blocked_words"
-                    value={Array.isArray(domains.reading?.blocked_keywords) ? domains.reading.blocked_keywords.join(", ") : ""}
-                    onInput={(e) => setDomField("reading", "blocked_keywords", parseCSVList((e.currentTarget as HTMLInputElement).value))}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("sys.allowed_kw")}</label>
-                  <input
-                    class="volo-input"
-                    name="cmt_allowed_words"
-                    value={Array.isArray(domains.reading?.allowed_keywords) ? domains.reading.allowed_keywords.join(", ") : ""}
-                    onInput={(e) => setDomField("reading", "allowed_keywords", parseCSVList((e.currentTarget as HTMLInputElement).value))}
-                  />
-                </div>
-              </div>
+              {domains.reading?.comment_access_mode !== "off" && (
+                <>
+                  <div class="volo-check-grid">
+                    <SwitchToggle
+                      checked={domains.reading?.builtin_spam_filter !== false}
+                      onChange={(v) => setDomField("reading", "builtin_spam_filter", v)}
+                      label={t("sys.spam_filter")}
+                    />
+                  </div>
+                  {domains.reading?.builtin_spam_filter !== false && (
+                    <>
+                      <div class="volo-field">
+                        <label>{t("sys.blocked_kw")}</label>
+                        <TokenListInput
+                          values={Array.isArray(domains.reading?.blocked_keywords) ? domains.reading.blocked_keywords : []}
+                          onChange={(next) => setDomField("reading", "blocked_keywords", next)}
+                        />
+                      </div>
+                      <div class="volo-field">
+                        <label>{t("sys.allowed_kw")}</label>
+                        <TokenListInput
+                          values={Array.isArray(domains.reading?.allowed_keywords) ? domains.reading.allowed_keywords : []}
+                          onChange={(next) => setDomField("reading", "allowed_keywords", next)}
+                        />
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
             </div>
 
             <div class="volo-form-actions">
@@ -1031,96 +1090,98 @@ export function SystemWorkspace({
               />
             </div>
 
-            <div class="volo-subcard">
-              <div class="volo-subcard-title">{t("sys.s3_sub_title")}</div>
-              <div class="volo-grid-2">
-                <div class="volo-field">
-                  <label>{t("sys.s3_endpoint")}</label>
-                  <input
-                    class="volo-input"
-                    name="storage_s3_endpoint"
-                    placeholder="https://s3.amazonaws.com"
-                    value={domains.storage?.s3_endpoint || ""}
-                    onInput={(e) => setDomField("storage", "s3_endpoint", (e.currentTarget as HTMLInputElement).value)}
-                  />
+            {domains.storage?.active_driver === "s3" && (
+              <div class="volo-subcard">
+                <div class="volo-subcard-title">{t("sys.s3_sub_title")}</div>
+                <div class="volo-grid-2">
+                  <div class="volo-field">
+                    <label>{t("sys.s3_endpoint")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_s3_endpoint"
+                      placeholder="https://s3.amazonaws.com"
+                      value={domains.storage?.s3_endpoint || ""}
+                      onInput={(e) => setDomField("storage", "s3_endpoint", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_s3_region")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_s3_region"
+                      placeholder={t("sys.s3_region_ph")}
+                      value={domains.storage?.s3_region || ""}
+                      onInput={(e) => setDomField("storage", "s3_region", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
                 </div>
-                <div class="volo-field">
-                  <label>{t("sys.lbl_s3_region")}</label>
-                  <input
-                    class="volo-input"
-                    name="storage_s3_region"
-                    placeholder={t("sys.s3_region_ph")}
-                    value={domains.storage?.s3_region || ""}
-                    onInput={(e) => setDomField("storage", "s3_region", (e.currentTarget as HTMLInputElement).value)}
-                  />
+                <div class="volo-auto-grid">
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_s3_bucket")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_s3_bucket"
+                      placeholder={t("sys.s3_bucket_ph")}
+                      value={domains.storage?.s3_bucket || ""}
+                      onInput={(e) => setDomField("storage", "s3_bucket", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_s3_ak")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_s3_ak_token"
+                      autoComplete="off"
+                      placeholder={t("sys.s3_ak_ph")}
+                      value={domains.storage?.s3_access_key || ""}
+                      onInput={(e) => setDomField("storage", "s3_access_key", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>
+                      {t("sys.lbl_s3_sk")}{" "}
+                      {domains.storage?.s3_secret_key_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                    </label>
+                    <input
+                      type="password"
+                      class="volo-input"
+                      name="s3_sealed_secret"
+                      autoComplete="new-password"
+                      placeholder={domains.storage?.s3_secret_key_set ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
+                      value={s3Secret}
+                      onInput={(e) => setS3Secret((e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
                 </div>
+                <div class="volo-grid-2">
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_s3_pub_url")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_s3_cdn_domain"
+                      placeholder={t("sys.s3_pub_url_ph")}
+                      value={domains.storage?.s3_public_base_url || ""}
+                      onInput={(e) => setDomField("storage", "s3_public_base_url", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_s3_prefix")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_s3_key_prefix"
+                      placeholder={t("sys.s3_prefix_ph")}
+                      value={domains.storage?.s3_key_prefix || ""}
+                      onInput={(e) => setDomField("storage", "s3_key_prefix", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                </div>
+                <SwitchToggle
+                  checked={!!domains.storage?.s3_path_style}
+                  onChange={(v) => setDomField("storage", "s3_path_style", v)}
+                  label={t("sys.s3_path_style")}
+                />
               </div>
-              <div class="volo-auto-grid">
-                <div class="volo-field">
-                  <label>{t("sys.lbl_s3_bucket")}</label>
-                  <input
-                    class="volo-input"
-                    name="storage_s3_bucket"
-                    placeholder={t("sys.s3_bucket_ph")}
-                    value={domains.storage?.s3_bucket || ""}
-                    onInput={(e) => setDomField("storage", "s3_bucket", (e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("sys.lbl_s3_ak")}</label>
-                  <input
-                    class="volo-input"
-                    name="storage_s3_ak_token"
-                    autoComplete="off"
-                    placeholder={t("sys.s3_ak_ph")}
-                    value={domains.storage?.s3_access_key || ""}
-                    onInput={(e) => setDomField("storage", "s3_access_key", (e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>
-                    {t("sys.lbl_s3_sk")}{" "}
-                    {domains.storage?.s3_secret_key_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
-                  </label>
-                  <input
-                    type="password"
-                    class="volo-input"
-                    name="s3_sealed_secret"
-                    autoComplete="new-password"
-                    placeholder={domains.storage?.s3_secret_key_set ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
-                    value={s3Secret}
-                    onInput={(e) => setS3Secret((e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-              </div>
-              <div class="volo-grid-2">
-                <div class="volo-field">
-                  <label>{t("sys.lbl_s3_pub_url")}</label>
-                  <input
-                    class="volo-input"
-                    name="storage_s3_cdn_domain"
-                    placeholder={t("sys.s3_pub_url_ph")}
-                    value={domains.storage?.s3_public_base_url || ""}
-                    onInput={(e) => setDomField("storage", "s3_public_base_url", (e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("sys.lbl_s3_prefix")}</label>
-                  <input
-                    class="volo-input"
-                    name="storage_s3_key_prefix"
-                    placeholder={t("sys.s3_prefix_ph")}
-                    value={domains.storage?.s3_key_prefix || ""}
-                    onInput={(e) => setDomField("storage", "s3_key_prefix", (e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-              </div>
-              <SwitchToggle
-                checked={!!domains.storage?.s3_path_style}
-                onChange={(v) => setDomField("storage", "s3_path_style", v)}
-                label={t("sys.s3_path_style")}
-              />
-            </div>
+            )}
 
             <div class="volo-form-actions">
               <button
@@ -1164,90 +1225,6 @@ export function SystemWorkspace({
                 <p class="volo-sec-desc">{t("sys.dom3_desc")}</p>
               </div>
             </div>
-            <div class="volo-auto-grid">
-              <div class="volo-field">
-                <label>{t("sys.smtp_host")}</label>
-                <input
-                  class="volo-input"
-                  name="smtp_relay_host"
-                  placeholder="smtp.example.com"
-                  value={domains.notifications?.smtp_host || ""}
-                  onInput={(e) => setDomField("notifications", "smtp_host", (e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("sys.smtp_port")}</label>
-                <input
-                  type="number"
-                  class="volo-input"
-                  value={domains.notifications?.smtp_port ?? 465}
-                  onInput={(e) => setDomField("notifications", "smtp_port", Number((e.currentTarget as HTMLInputElement).value))}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("sys.smtp_tls")}</label>
-                <ConsoleSelect
-                  value={domains.notifications?.smtp_security || "tls"}
-                  options={[
-                    { value: "tls", label: t("sys.tls_implicit") },
-                    { value: "starttls", label: t("sys.tls_starttls") },
-                    { value: "plain_internal", label: t("sys.tls_plain") },
-                  ]}
-                  onChange={(v) => setDomField("notifications", "smtp_security", v)}
-                />
-              </div>
-            </div>
-            <div class="volo-grid-2">
-              <div class="volo-field">
-                <label>{t("sys.lbl_smtp_user")}</label>
-                <input
-                  class="volo-input"
-                  name="smtp_relay_account"
-                  autoComplete="off"
-                  placeholder={t("sys.smtp_user_ph")}
-                  value={domains.notifications?.smtp_username || ""}
-                  onInput={(e) => setDomField("notifications", "smtp_username", (e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="volo-field">
-                <label>
-                  {t("sys.smtp_pwd")}{" "}
-                  {domains.notifications?.smtp_password_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
-                </label>
-                <input
-                  type="password"
-                  class="volo-input"
-                  name="smtp_sealed_secret"
-                  autoComplete="new-password"
-                  placeholder={t("sys.keep_blank_ph")}
-                  value={smtpPwd}
-                  onInput={(e) => setSmtpPwd((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-            </div>
-            <div class="volo-grid-2">
-              <div class="volo-field">
-                <label>{t("sys.lbl_smtp_from")}</label>
-                <input
-                  class="volo-input"
-                  name="smtp_sender_address"
-                  autoComplete="off"
-                  placeholder={t("sys.smtp_from_ph")}
-                  value={domains.notifications?.smtp_from_email || ""}
-                  onInput={(e) => setDomField("notifications", "smtp_from_email", (e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("sys.smtp_from_name")}</label>
-                <input
-                  class="volo-input"
-                  name="smtp_sender_title"
-                  placeholder={t("sys.smtp_from_name_ph")}
-                  value={domains.notifications?.smtp_from_name || ""}
-                  onInput={(e) => setDomField("notifications", "smtp_from_name", (e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-            </div>
 
             <div class="volo-check-grid">
               <SwitchToggle
@@ -1255,55 +1232,153 @@ export function SystemWorkspace({
                 onChange={(v) => setDomField("notifications", "smtp_enabled", v)}
                 label={t("sys.enable_smtp")}
               />
-              <SwitchToggle
-                checked={domains.notifications?.smtp_auth !== false}
-                onChange={(v) => setDomField("notifications", "smtp_auth", v)}
-                label={t("sys.smtp_auth")}
-              />
-              <SwitchToggle
-                checked={domains.notifications?.notify_admin_on_comment !== false}
-                onChange={(v) => setDomField("notifications", "notify_admin_on_comment", v)}
-                label={t("sys.notify_admin_cmt")}
-              />
-              <SwitchToggle
-                checked={domains.notifications?.notify_reply_by_email !== false}
-                onChange={(v) => setDomField("notifications", "notify_reply_by_email", v)}
-                label={t("sys.notify_reply_mail")}
-              />
             </div>
 
-            <div class="volo-subcard">
-              <div class="volo-field">
-                <label>{t("sys.lbl_test_mail")}</label>
-                <input
-                  class="volo-input"
-                  name="smtp_probe_recipient"
-                  autoComplete="off"
-                  placeholder={t("sys.test_mail_ph")}
-                  value={testMailTo}
-                  onInput={(e) => setTestMailTo((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-            </div>
+            {domains.notifications?.smtp_enabled && (
+              <>
+                <div class="volo-auto-grid">
+                  <div class="volo-field">
+                    <label>{t("sys.smtp_host")}</label>
+                    <input
+                      class="volo-input"
+                      name="smtp_relay_host"
+                      placeholder="smtp.example.com"
+                      value={domains.notifications?.smtp_host || ""}
+                      onInput={(e) => setDomField("notifications", "smtp_host", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.smtp_port")}</label>
+                    <input
+                      type="number"
+                      class="volo-input"
+                      value={domains.notifications?.smtp_port ?? 465}
+                      onInput={(e) => setDomField("notifications", "smtp_port", Number((e.currentTarget as HTMLInputElement).value))}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.smtp_tls")}</label>
+                    <ConsoleSelect
+                      value={domains.notifications?.smtp_security || "tls"}
+                      options={[
+                        { value: "tls", label: t("sys.tls_implicit") },
+                        { value: "starttls", label: t("sys.tls_starttls") },
+                        { value: "plain_internal", label: t("sys.tls_plain") },
+                      ]}
+                      onChange={(v) => setDomField("notifications", "smtp_security", v)}
+                    />
+                  </div>
+                </div>
+
+                <div class="volo-check-grid">
+                  <SwitchToggle
+                    checked={domains.notifications?.smtp_auth !== false}
+                    onChange={(v) => setDomField("notifications", "smtp_auth", v)}
+                    label={t("sys.smtp_auth")}
+                  />
+                  <SwitchToggle
+                    checked={domains.notifications?.notify_admin_on_comment !== false}
+                    onChange={(v) => setDomField("notifications", "notify_admin_on_comment", v)}
+                    label={t("sys.notify_admin_cmt")}
+                  />
+                  <SwitchToggle
+                    checked={domains.notifications?.notify_reply_by_email !== false}
+                    onChange={(v) => setDomField("notifications", "notify_reply_by_email", v)}
+                    label={t("sys.notify_reply_mail")}
+                  />
+                </div>
+
+                {domains.notifications?.smtp_auth !== false && (
+                  <div class="volo-grid-2">
+                    <div class="volo-field">
+                      <label>{t("sys.lbl_smtp_user")}</label>
+                      <input
+                        class="volo-input"
+                        name="smtp_relay_account"
+                        autoComplete="off"
+                        placeholder={t("sys.smtp_user_ph")}
+                        value={domains.notifications?.smtp_username || ""}
+                        onInput={(e) => setDomField("notifications", "smtp_username", (e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>
+                        {t("sys.smtp_pwd")}{" "}
+                        {domains.notifications?.smtp_password_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                      </label>
+                      <input
+                        type="password"
+                        class="volo-input"
+                        name="smtp_sealed_secret"
+                        autoComplete="new-password"
+                        placeholder={t("sys.keep_blank_ph")}
+                        value={smtpPwd}
+                        onInput={(e) => setSmtpPwd((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div class="volo-grid-2">
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_smtp_from")}</label>
+                    <input
+                      class="volo-input"
+                      name="smtp_sender_address"
+                      autoComplete="off"
+                      placeholder={t("sys.smtp_from_ph")}
+                      value={domains.notifications?.smtp_from_email || ""}
+                      onInput={(e) => setDomField("notifications", "smtp_from_email", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.smtp_from_name")}</label>
+                    <input
+                      class="volo-input"
+                      name="smtp_sender_title"
+                      placeholder={t("sys.smtp_from_name_ph")}
+                      value={domains.notifications?.smtp_from_name || ""}
+                      onInput={(e) => setDomField("notifications", "smtp_from_name", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                </div>
+
+                <div class="volo-subcard">
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_test_mail")}</label>
+                    <input
+                      class="volo-input"
+                      name="smtp_probe_recipient"
+                      autoComplete="off"
+                      placeholder={t("sys.test_mail_ph")}
+                      value={testMailTo}
+                      onInput={(e) => setTestMailTo((e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
 
             <div class="volo-form-actions">
-              <button
-                type="button"
-                class="volo-btn"
-                onClick={async () => {
-                  try {
-                    await apiFetch("/api/admin/settings/notifications/test-smtp", {
-                      method: "POST",
-                      body: JSON.stringify({ to_email: testMailTo, settings: domains.notifications, smtp_password: smtpPwd }),
-                    });
-                    showToast(t("sys.smtp_sent_toast"));
-                  } catch (err: any) {
-                    showToast(err.message);
-                  }
-                }}
-              >
-                {t("sys.test_smtp")}
-              </button>
+              {domains.notifications?.smtp_enabled && (
+                <button
+                  type="button"
+                  class="volo-btn"
+                  onClick={async () => {
+                    try {
+                      await apiFetch("/api/admin/settings/notifications/test-smtp", {
+                        method: "POST",
+                        body: JSON.stringify({ to_email: testMailTo, settings: domains.notifications, smtp_password: smtpPwd }),
+                      });
+                      showToast(t("sys.smtp_sent_toast"));
+                    } catch (err: any) {
+                      showToast(err.message);
+                    }
+                  }}
+                >
+                  {t("sys.test_smtp")}
+                </button>
+              )}
               <button type="submit" class="volo-btn volo-btn-primary">
                 {t("sys.save_notify")}
               </button>
@@ -2468,25 +2543,46 @@ export function SystemWorkspace({
                   <p class="volo-sec-desc">{t("sys.sec_policy_desc")}</p>
                 </div>
               </div>
+              <div class="volo-check-grid">
+                <SwitchToggle
+                  checked={domains.security?.risk_control_enabled !== false}
+                  onChange={(v) => setDomField("security", "risk_control_enabled", v)}
+                  label={t("sys.risk_on")}
+                />
+                <SwitchToggle
+                  checked={domains.security?.waf_enabled !== false}
+                  onChange={(v) => setDomField("security", "waf_enabled", v)}
+                  label={t("sys.waf_on")}
+                />
+                <SwitchToggle
+                  checked={!!domains.security?.geo_policy_active}
+                  onChange={(v) => setDomField("security", "geo_policy_active", v)}
+                  label={t("sys.geo_policy_on")}
+                />
+              </div>
               <div class="volo-auto-grid">
-                <div class="volo-field">
-                  <label>{t("sys.waf_window_sec")}</label>
-                  <input
-                    type="number"
-                    class="volo-input"
-                    value={domains.security?.waf_window_seconds ?? 180}
-                    onInput={(e) => setDomField("security", "waf_window_seconds", Number((e.currentTarget as HTMLInputElement).value))}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("sys.waf_max_req")}</label>
-                  <input
-                    type="number"
-                    class="volo-input"
-                    value={domains.security?.waf_max_requests ?? 180}
-                    onInput={(e) => setDomField("security", "waf_max_requests", Number((e.currentTarget as HTMLInputElement).value))}
-                  />
-                </div>
+                {domains.security?.waf_enabled !== false && (
+                  <>
+                    <div class="volo-field">
+                      <label>{t("sys.waf_window_sec")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        value={domains.security?.waf_window_seconds ?? 180}
+                        onInput={(e) => setDomField("security", "waf_window_seconds", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.waf_max_req")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        value={domains.security?.waf_max_requests ?? 180}
+                        onInput={(e) => setDomField("security", "waf_max_requests", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                  </>
+                )}
                 <div class="volo-field">
                   <label>{t("sys.totp_scope")}</label>
                   <ConsoleSelect
@@ -2509,23 +2605,6 @@ export function SystemWorkspace({
                   placeholder="/secret-entry"
                   value={domains.security?.dynamic_login_path || ""}
                   onInput={(e) => setDomField("security", "dynamic_login_path", (e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="volo-check-grid">
-                <SwitchToggle
-                  checked={domains.security?.risk_control_enabled !== false}
-                  onChange={(v) => setDomField("security", "risk_control_enabled", v)}
-                  label={t("sys.risk_on")}
-                />
-                <SwitchToggle
-                  checked={domains.security?.waf_enabled !== false}
-                  onChange={(v) => setDomField("security", "waf_enabled", v)}
-                  label={t("sys.waf_on")}
-                />
-                <SwitchToggle
-                  checked={!!domains.security?.geo_policy_active}
-                  onChange={(v) => setDomField("security", "geo_policy_active", v)}
-                  label={t("sys.geo_policy_on")}
                 />
               </div>
               <div class="volo-form-actions">
@@ -2922,29 +3001,22 @@ export function SystemWorkspace({
                       onInput={(e) => setGeoForm({ ...geoForm, name: (e.currentTarget as HTMLInputElement).value })}
                     />
                   </div>
-                  <div class="volo-grid-2">
-                    <div class="volo-field">
-                      <label>{t("sys.lbl_geo_country")}</label>
-                      <input
-                        class="volo-input"
-                        name="geo_iso_codes"
-                        autoComplete="off"
-                        placeholder={t("sys.geo_iso_ph")}
-                        value={geoForm.countries}
-                        onInput={(e) => setGeoForm({ ...geoForm, countries: (e.currentTarget as HTMLInputElement).value })}
-                      />
-                    </div>
-                    <div class="volo-field">
-                      <label>{t("sys.lbl_geo_region")}</label>
-                      <input
-                        class="volo-input"
-                        name="geo_subdivision_codes"
-                        autoComplete="off"
-                        placeholder={t("sys.geo_region_ph")}
-                        value={geoForm.regions}
-                        onInput={(e) => setGeoForm({ ...geoForm, regions: (e.currentTarget as HTMLInputElement).value })}
-                      />
-                    </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_geo_country")}</label>
+                    <TokenListInput
+                      uppercase
+                      placeholder={t("sys.geo_iso_ph")}
+                      values={parseCSVList(geoForm.countries)}
+                      onChange={(next) => setGeoForm({ ...geoForm, countries: next.join(",") })}
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_geo_region")}</label>
+                    <TokenListInput
+                      placeholder={t("sys.geo_region_ph")}
+                      values={parseCSVList(geoForm.regions)}
+                      onChange={(next) => setGeoForm({ ...geoForm, regions: next.join(",") })}
+                    />
                   </div>
                   <SwitchToggle
                     checked={geoForm.is_enabled}
@@ -3146,48 +3218,19 @@ export function SystemWorkspace({
                     <p class="volo-sec-desc">{t("sys.auto_bak_desc")}</p>
                   </div>
                 </div>
-                <div class="volo-auto-grid">
-                  <div class="volo-field">
-                    <label>{t("sys.auto_interval_h")}</label>
-                    <input
-                      type="number"
-                      class="volo-input"
-                      value={domains.backup?.local_interval_hours ?? 24}
-                      onInput={(e) => setDomField("backup", "local_interval_hours", Number((e.currentTarget as HTMLInputElement).value))}
-                    />
-                  </div>
-                  <div class="volo-field">
-                    <label>{t("sys.auto_keep_cnt")}</label>
-                    <input
-                      type="number"
-                      class="volo-input"
-                      value={domains.backup?.local_keep_count ?? 7}
-                      onInput={(e) => setDomField("backup", "local_keep_count", Number((e.currentTarget as HTMLInputElement).value))}
-                    />
-                  </div>
-                  <div class="volo-field">
-                    <label>{t("sys.remote_proto")}</label>
-                    <ConsoleSelect
-                      value={domains.backup?.remote_protocol || "s3"}
-                      options={[
-                        { value: "s3", label: "S3 / R2 / MinIO" },
-                        { value: "webdav", label: "WebDAV" },
-                      ]}
-                      onChange={(v) => setDomField("backup", "remote_protocol", v)}
-                    />
-                  </div>
-                </div>
                 <div class="volo-check-grid">
                   <SwitchToggle
                     checked={!!domains.backup?.local_auto_enabled}
                     onChange={(v) => setDomField("backup", "local_auto_enabled", v)}
                     label={t("sys.auto_local_on")}
                   />
-                  <SwitchToggle
-                    checked={!!domains.backup?.include_media_in_auto}
-                    onChange={(v) => setDomField("backup", "include_media_in_auto", v)}
-                    label={t("sys.auto_media_on")}
-                  />
+                  {domains.backup?.local_auto_enabled && (
+                    <SwitchToggle
+                      checked={!!domains.backup?.include_media_in_auto}
+                      onChange={(v) => setDomField("backup", "include_media_in_auto", v)}
+                      label={t("sys.auto_media_on")}
+                    />
+                  )}
                   <SwitchToggle
                     checked={!!domains.backup?.remote_enabled}
                     onChange={(v) => setDomField("backup", "remote_enabled", v)}
@@ -3195,116 +3238,155 @@ export function SystemWorkspace({
                   />
                 </div>
 
-                {domains.backup?.remote_protocol === "webdav" ? (
-                  <div class="volo-subcard">
-                    <div class="volo-grid-2">
-                      <div class="volo-field">
-                        <label>{t("sys.lbl_webdav_url")}</label>
-                        <input
-                          class="volo-input"
-                          name="bak_webdav_endpoint"
-                          autoComplete="off"
-                          placeholder={t("sys.webdav_url_ph")}
-                          value={domains.backup?.webdav_url || ""}
-                          onInput={(e) => setDomField("backup", "webdav_url", (e.currentTarget as HTMLInputElement).value)}
-                        />
-                      </div>
-                      <div class="volo-field">
-                        <label>{t("sys.lbl_webdav_dir")}</label>
-                        <input
-                          class="volo-input"
-                          name="bak_webdav_folder"
-                          autoComplete="off"
-                          placeholder={t("sys.webdav_dir_ph")}
-                          value={domains.backup?.webdav_dir || ""}
-                          onInput={(e) => setDomField("backup", "webdav_dir", (e.currentTarget as HTMLInputElement).value)}
-                        />
-                      </div>
+                {domains.backup?.local_auto_enabled && (
+                  <div class="volo-grid-2">
+                    <div class="volo-field">
+                      <label>{t("sys.auto_interval_h")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        value={domains.backup?.local_interval_hours ?? 24}
+                        onInput={(e) => setDomField("backup", "local_interval_hours", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
                     </div>
-                    <div class="volo-grid-2">
-                      <div class="volo-field">
-                        <label>{t("sys.lbl_webdav_user")}</label>
-                        <input
-                          class="volo-input"
-                          name="bak_webdav_account"
-                          autoComplete="off"
-                          placeholder={t("sys.webdav_user_ph")}
-                          value={domains.backup?.webdav_user || ""}
-                          onInput={(e) => setDomField("backup", "webdav_user", (e.currentTarget as HTMLInputElement).value)}
-                        />
-                      </div>
-                      <div class="volo-field">
-                        <label>
-                          {t("sys.lbl_webdav_pwd")}{" "}
-                          {domains.backup?.webdav_password_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
-                        </label>
-                        <input
-                          type="password"
-                          class="volo-input"
-                          name="bak_webdav_sealed_secret"
-                          autoComplete="new-password"
-                          placeholder={domains.backup?.webdav_password_set ? t("sys.s3_sk_sealed_ph") : t("sys.webdav_pwd_ph")}
-                          value={bakWebdavPwd}
-                          onInput={(e) => setBakWebdavPwd((e.currentTarget as HTMLInputElement).value)}
-                        />
-                      </div>
+                    <div class="volo-field">
+                      <label>{t("sys.auto_keep_cnt")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        value={domains.backup?.local_keep_count ?? 7}
+                        onInput={(e) => setDomField("backup", "local_keep_count", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
                     </div>
                   </div>
-                ) : (
-                  <div class="volo-subcard">
-                    <div class="volo-grid-2">
-                      <div class="volo-field">
-                        <label>{t("sys.s3_endpoint")}</label>
-                        <input
-                          class="volo-input"
-                          name="bak_s3_endpoint"
-                          autoComplete="off"
-                          placeholder="https://s3.amazonaws.com"
-                          value={domains.backup?.s3_endpoint || ""}
-                          onInput={(e) => setDomField("backup", "s3_endpoint", (e.currentTarget as HTMLInputElement).value)}
-                        />
-                      </div>
-                      <div class="volo-field">
-                        <label>{t("sys.lbl_s3_bucket")}</label>
-                        <input
-                          class="volo-input"
-                          name="bak_s3_bucket"
-                          autoComplete="off"
-                          placeholder={t("sys.s3_bucket_ph")}
-                          value={domains.backup?.s3_bucket || ""}
-                          onInput={(e) => setDomField("backup", "s3_bucket", (e.currentTarget as HTMLInputElement).value)}
-                        />
-                      </div>
+                )}
+
+                {domains.backup?.remote_enabled && (
+                  <>
+                    <div class="volo-field">
+                      <label>{t("sys.remote_proto")}</label>
+                      <ConsoleSelect
+                        value={domains.backup?.remote_protocol || "s3"}
+                        options={[
+                          { value: "s3", label: "S3 / R2 / MinIO" },
+                          { value: "webdav", label: "WebDAV" },
+                        ]}
+                        onChange={(v) => setDomField("backup", "remote_protocol", v)}
+                      />
                     </div>
-                    <div class="volo-grid-2">
-                      <div class="volo-field">
-                        <label>{t("sys.lbl_s3_ak")}</label>
-                        <input
-                          class="volo-input"
-                          name="bak_s3_ak_token"
-                          autoComplete="off"
-                          placeholder={t("sys.s3_ak_ph")}
-                          value={domains.backup?.s3_access_key || ""}
-                          onInput={(e) => setDomField("backup", "s3_access_key", (e.currentTarget as HTMLInputElement).value)}
-                        />
+
+                    {domains.backup?.remote_protocol === "webdav" ? (
+                      <div class="volo-subcard">
+                        <div class="volo-grid-2">
+                          <div class="volo-field">
+                            <label>{t("sys.lbl_webdav_url")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_webdav_endpoint"
+                              autoComplete="off"
+                              placeholder={t("sys.webdav_url_ph")}
+                              value={domains.backup?.webdav_url || ""}
+                              onInput={(e) => setDomField("backup", "webdav_url", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                          <div class="volo-field">
+                            <label>{t("sys.lbl_webdav_dir")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_webdav_folder"
+                              autoComplete="off"
+                              placeholder={t("sys.webdav_dir_ph")}
+                              value={domains.backup?.webdav_dir || ""}
+                              onInput={(e) => setDomField("backup", "webdav_dir", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                        </div>
+                        <div class="volo-grid-2">
+                          <div class="volo-field">
+                            <label>{t("sys.lbl_webdav_user")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_webdav_account"
+                              autoComplete="off"
+                              placeholder={t("sys.webdav_user_ph")}
+                              value={domains.backup?.webdav_user || ""}
+                              onInput={(e) => setDomField("backup", "webdav_user", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                          <div class="volo-field">
+                            <label>
+                              {t("sys.lbl_webdav_pwd")}{" "}
+                              {domains.backup?.webdav_password_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                            </label>
+                            <input
+                              type="password"
+                              class="volo-input"
+                              name="bak_webdav_sealed_secret"
+                              autoComplete="new-password"
+                              placeholder={domains.backup?.webdav_password_set ? t("sys.s3_sk_sealed_ph") : t("sys.webdav_pwd_ph")}
+                              value={bakWebdavPwd}
+                              onInput={(e) => setBakWebdavPwd((e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                        </div>
                       </div>
-                      <div class="volo-field">
-                        <label>
-                          {t("sys.lbl_s3_sk")}{" "}
-                          {domains.backup?.s3_secret_key_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
-                        </label>
-                        <input
-                          type="password"
-                          class="volo-input"
-                          name="bak_s3_sealed_secret"
-                          autoComplete="new-password"
-                          placeholder={domains.backup?.s3_secret_key_set ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
-                          value={bakS3Secret}
-                          onInput={(e) => setBakS3Secret((e.currentTarget as HTMLInputElement).value)}
-                        />
+                    ) : (
+                      <div class="volo-subcard">
+                        <div class="volo-grid-2">
+                          <div class="volo-field">
+                            <label>{t("sys.s3_endpoint")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_s3_endpoint"
+                              autoComplete="off"
+                              placeholder="https://s3.amazonaws.com"
+                              value={domains.backup?.s3_endpoint || ""}
+                              onInput={(e) => setDomField("backup", "s3_endpoint", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                          <div class="volo-field">
+                            <label>{t("sys.lbl_s3_bucket")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_s3_bucket"
+                              autoComplete="off"
+                              placeholder={t("sys.s3_bucket_ph")}
+                              value={domains.backup?.s3_bucket || ""}
+                              onInput={(e) => setDomField("backup", "s3_bucket", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                        </div>
+                        <div class="volo-grid-2">
+                          <div class="volo-field">
+                            <label>{t("sys.lbl_s3_ak")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_s3_ak_token"
+                              autoComplete="off"
+                              placeholder={t("sys.s3_ak_ph")}
+                              value={domains.backup?.s3_access_key || ""}
+                              onInput={(e) => setDomField("backup", "s3_access_key", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                          <div class="volo-field">
+                            <label>
+                              {t("sys.lbl_s3_sk")}{" "}
+                              {domains.backup?.s3_secret_key_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                            </label>
+                            <input
+                              type="password"
+                              class="volo-input"
+                              name="bak_s3_sealed_secret"
+                              autoComplete="new-password"
+                              placeholder={domains.backup?.s3_secret_key_set ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
+                              value={bakS3Secret}
+                              onInput={(e) => setBakS3Secret((e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  </div>
+                    )}
+                  </>
                 )}
 
                 <div class="volo-form-actions">
@@ -3507,6 +3589,103 @@ export function SystemWorkspace({
             </div>
           </div>
         </>
+      )}
+
+      {sub === "logs" && isAdmin && (
+        <div class="volo-card">
+          <div class="volo-sec-head">
+            <div class="volo-sec-copy">
+              <h3 class="volo-card-title">{t("sys.logs_head")}</h3>
+              <p class="volo-sec-desc">{t("sys.logs_sub")}</p>
+            </div>
+            <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
+              {logStats && (
+                <span class="volo-code-chip">
+                  {t("sys.logs_stats", {
+                    count: logStats.total ?? runtimeLogs.length,
+                    cap: logStats.capacity ?? 400,
+                    goroutines: logStats.goroutines ?? 0,
+                    mem: formatBytes(logStats.heap_alloc_bytes || 0),
+                  })}
+                </span>
+              )}
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void loadRuntimeLogs()}>
+                {t("common.refresh")}
+              </button>
+              <a
+                class="volo-btn volo-btn-sm"
+                href={`/api/admin/runtime-logs?format=text${logLevel !== "ALL" ? `&level=${encodeURIComponent(logLevel)}` : ""}${logQuery.trim() ? `&q=${encodeURIComponent(logQuery.trim())}` : ""}`}
+                download="volo-runtime.log"
+              >
+                {t("sys.logs_download")}
+              </a>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm volo-btn-danger"
+                onClick={async () => {
+                  if (!(await openConfirm({ message: t("sys.logs_clear_confirm"), danger: true }))) return;
+                  try {
+                    await apiFetch("/api/admin/runtime-logs", { method: "DELETE" });
+                    await loadRuntimeLogs();
+                  } catch (err: any) {
+                    showToast(err.message);
+                  }
+                }}
+              >
+                {t("sys.logs_clear")}
+              </button>
+            </div>
+          </div>
+
+          <div class="volo-filter-bar">
+            <div class="volo-filter-pills">
+              {(["ALL", "INFO", "WARN", "ERROR"] as const).map((lv) => (
+                <button
+                  key={lv}
+                  type="button"
+                  class={`volo-filter-pill ${logLevel === lv ? "active" : ""}`}
+                  onClick={() => {
+                    setLogLevel(lv);
+                    void loadRuntimeLogs(lv, logQuery);
+                  }}
+                >
+                  {lv === "ALL" ? t("art.all") : lv}
+                </button>
+              ))}
+            </div>
+            <div class="volo-filter-controls">
+              <input
+                class="volo-input volo-search-input"
+                name="runtime_logs_query"
+                autoComplete="off"
+                placeholder={t("sys.logs_search_ph")}
+                value={logQuery}
+                onInput={(e) => setLogQuery((e.currentTarget as HTMLInputElement).value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void loadRuntimeLogs(logLevel, logQuery);
+                }}
+              />
+            </div>
+          </div>
+
+          <div class="volo-log-viewer">
+            {runtimeLogs.length === 0 ? (
+              <div style={{ color: "#8b9c94", padding: "18px 8px", textAlign: "center" }}>{t("sys.logs_empty")}</div>
+            ) : (
+              runtimeLogs.map((l) => {
+                const lv = String(l.level || "INFO");
+                return (
+                  <div key={l.seq || `${l.timestamp}-${l.message}`} class="volo-log-row">
+                    <span class="volo-log-ts">{formatLogTs(l.timestamp)}</span>
+                    <span class={`volo-log-lvl ${lv.toLowerCase()}`}>{lv}</span>
+                    {l.source && <span class="volo-log-attrs">({l.source})</span>}
+                    <span>{l.message}</span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
       )}
 
       {sub === "audit" && isAdmin && (

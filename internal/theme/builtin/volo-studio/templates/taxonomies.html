@@ -1,16 +1,24 @@
 {{define "content"}}
-<section class="studio-hero studio-hero--simple">
-  <div class="studio-hero-copy">
-    <h1 class="studio-hero__title">{{.HeroTitle}}</h1>
-    {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
-  </div>
-</section>
-
 <div class="studio-layout">
-  <div>
+  <div class="studio-stack">
+    <section class="studio-hero studio-hero--simple studio-page-head">
+      <div class="studio-hero-copy">
+        <h1 class="studio-hero__title">{{.HeroTitle}}</h1>
+        {{if eq .TaxonomyKind "archives"}}
+          {{if .ArchiveBuckets}}
+            <p class="studio-hero__subtitle">{{t .Locale "studio.archive_summary" (dict "articles" .Stats.ArticleCount "months" (len .ArchiveBuckets))}}</p>
+          {{else if .HeroSubtitle}}
+            <p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>
+          {{end}}
+        {{else if .HeroSubtitle}}
+          <p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>
+        {{end}}
+      </div>
+    </section>
+
     {{if eq .TaxonomyKind "categories"}}
       {{if .Categories}}
-        <div class="studio-article">
+        <div class="studio-article studio-card-pad">
           <div class="bookshelf-grid">
             {{range .Categories}}
               <a class="book-card studio-tax-card" href="/categories/{{.Slug}}">
@@ -28,7 +36,7 @@
       {{end}}
     {{else if eq .TaxonomyKind "tags"}}
       {{if .Tags}}
-        <div class="studio-article">
+        <div class="studio-article studio-card-pad">
           <div class="tag-cloud studio-tax-tags">
             {{range .Tags}}
               <a class="tag-chip studio-tax-tag" href="/tags/{{.Slug}}">#{{.Name}} <strong>{{.ArticleCount}}</strong></a>
@@ -40,12 +48,12 @@
       {{end}}
     {{else if eq .TaxonomyKind "archives"}}
       {{if .ArchiveBuckets}}
-        <div class="studio-article">
-          <div class="studio-archive-list">
+        <div class="studio-article studio-card-pad">
+          <div class="studio-archive-grid">
             {{range .ArchiveBuckets}}
-              <a class="studio-archive-row" href="/archives/{{.YearMonth}}">
-                <strong>{{.YearMonth}}</strong>
-                <span class="volo-badge">{{.Count}}</span>
+              <a class="studio-archive-chip" href="/archives/{{.YearMonth}}">
+                <span class="studio-archive-chip__ym">{{.YearMonth}}</span>
+                <span class="studio-archive-chip__cnt">{{.Count}}</span>
               </a>
             {{end}}
           </div>
@@ -55,7 +63,7 @@
       {{end}}
     {{else if eq .TaxonomyKind "series"}}
       {{if .SeriesList}}
-        <div class="studio-article">
+        <div class="studio-article studio-card-pad">
           <div class="bookshelf-grid">
             {{range .SeriesList}}
               <a class="book-card studio-tax-card" href="/series/{{.Slug}}">

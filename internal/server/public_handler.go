@@ -1124,6 +1124,19 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 	if desc == "" {
 		desc = snap.Site.Description
 	}
+	activeTheme := theme.DefaultThemeID
+	var resolvedThemeCfg map[string]any
+	if s.deps.Themes != nil {
+		activeTheme = s.deps.Themes.ResolveThemeForRequest(r, viewer, snap.Appearance)
+		resolvedThemeCfg = s.deps.Themes.ResolveThemeConfig(activeTheme, snap.Appearance.ThemeConfigs)
+	}
+
+	siteCfg := snap.Site
+	if !siteCfg.EnableFooterHTML {
+		siteCfg.FooterText = ""
+	} else if siteCfg.FooterText != "" {
+		siteCfg.FooterText = render.Default().SanitizeHTML(siteCfg.FooterText)
+	}
 
 	return theme.PageContext{
 		Locale:             locale,
@@ -1137,7 +1150,9 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 		MetaDescription:    desc,
 		OGImage:            snap.SEO.DefaultOGImageURL,
 		AdminPath:          adminPath,
-		Site:               snap.Site,
+		ThemeID:            activeTheme,
+		ThemeConfig:        resolvedThemeCfg,
+		Site:               siteCfg,
 		Reading:            snap.Reading,
 		Feed:               snap.Feed,
 		SEO:                snap.SEO,
@@ -1167,9 +1182,39 @@ func (s *AppServer) renderStudio(w http.ResponseWriter, r *http.Request, status 
 }
 
 func (s *AppServer) renderStudioFallback(w http.ResponseWriter, r *http.Request, status int, candidates []string, pctx theme.PageContext) {
-	activeTheme := s.deps.Themes.ResolveActiveTheme(r, pctx.Viewer, pctx.Appearance.ActiveTheme)
+	activeTheme := s.deps.Themes.ResolveThemeForRequest(r, pctx.Viewer, pctx.Appearance)
+	if mob := strings.TrimSpace(pctx.Appearance.MobileTheme); mob != "" && mob != "same" && mob != pctx.Appearance.ActiveTheme {
+		appendVaryHeader(w.Header(), "User-Agent", "Sec-CH-UA-Mobile")
+	}
+	if pctx.ThemeID != activeTheme || pctx.ThemeConfig == nil {
+		pctx.ThemeID = activeTheme
+		pctx.ThemeConfig = s.deps.Themes.ResolveThemeConfig(activeTheme, pctx.Appearance.ThemeConfigs)
+	}
 	if err := s.deps.Themes.RenderWithFallback(w, status, activeTheme, candidates, pctx); err != nil {
 		http.Error(w, "render error: "+err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func appendVaryHeader(h http.Header, keys ...string) {
+	cur := h.Get("Vary")
+	existing := make(map[string]bool, 4)
+	for _, part := range strings.Split(cur, ",") {
+		if t := strings.TrimSpace(part); t != "" {
+			existing[strings.ToLower(t)] = true
+		}
+	}
+	var added []string
+	if strings.TrimSpace(cur) != "" {
+		added = append(added, cur)
+	}
+	for _, k := range keys {
+		if !existing[strings.ToLower(k)] {
+			added = append(added, k)
+			existing[strings.ToLower(k)] = true
+		}
+	}
+	if len(added) > 0 {
+		h.Set("Vary", strings.Join(added, ", "))
 	}
 }
 
@@ -1352,7 +1397,7 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 		pctx.ArticleAfterWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotArticleAfterContent, slotCtx)
 	}
 
-	if pctx.Reading.OutdatedNoticeDays > 0 && raw.UpdatedAt > 0 {
+	if pctx.Reading.EnableOutdatedNotice && pctx.Reading.OutdatedNoticeDays > 0 && raw.UpdatedAt > 0 {
 		days := int(time.Since(time.UnixMilli(raw.UpdatedAt)).Hours() / 24)
 		if days >= pctx.Reading.OutdatedNoticeDays {
 			pctx.OutdatedDays = days

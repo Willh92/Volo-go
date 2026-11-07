@@ -58,7 +58,7 @@ const ACCENT_OPTIONS: Array<{ id: string; swatch: string }> = [
   { id: "rose", swatch: "#87525f" },
 ];
 
-const MODE_OPTIONS = ["light", "dark", "auto", "system"] as const;
+const MODE_OPTIONS = ["auto", "system", "light", "dark"] as const;
 
 const SECTION_LABEL_KEYS: Record<NavSection, string> = {
   dashboard: "nav.home",
@@ -87,6 +87,7 @@ const SECTION_LABEL_KEYS: Record<NavSection, string> = {
   backup: "nav.backup",
   account: "nav.account",
   waf: "nav.waf",
+  logs: "nav.logs",
   audit: "nav.audit",
   about: "nav.about",
   help: "nav.help",
@@ -177,6 +178,7 @@ const SIDEBAR_ENTRIES: NavEntry[] = [
     children: [
       { section: "account", labelKey: "nav.account" },
       { section: "waf", labelKey: "nav.waf", adminOnly: true },
+      { section: "logs", labelKey: "nav.logs", adminOnly: true },
       { section: "audit", labelKey: "nav.audit", adminOnly: true },
     ],
   },
@@ -360,7 +362,7 @@ function CommandPalette({
       id: "act:theme",
       title: `${t("shell.mode_title")}: ${themeModeSig.value === "dark" ? t("mode.light") : t("mode.dark")}`,
       sub: t("shell.appearance_title"),
-      run: () => applyThemeAttributes(themeModeSig.value === "dark" ? "light" : "dark", accentSig.value, false),
+      run: () => applyThemeAttributes(themeModeSig.value === "dark" ? "light" : "dark", accentSig.value, true),
     });
     out.push({
       id: "act:blog",
@@ -813,10 +815,24 @@ function App() {
                       <button
                         key={m}
                         type="button"
-                        class={`volo-pop-item ${curMode === m ? "active" : ""}`}
-                        onClick={() => applyThemeAttributes(m, curAccent, false)}
+                        class={`volo-pop-item volo-mode-item ${curMode === m ? "active" : ""}`}
+                        onClick={() => applyThemeAttributes(m, curAccent, true)}
                       >
-                        <span>{t(`mode.${m}`)}</span>
+                        <span class="volo-mode-icon" aria-hidden="true">
+                          {m === "auto" ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+                          ) : m === "system" ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+                          ) : m === "light" ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6"/></svg>
+                          ) : (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+                          )}
+                        </span>
+                        <span class="volo-mode-copy">
+                          <span>{t(`mode.${m}`)}</span>
+                          <span class="volo-mode-sub">{t(`mode.${m}_desc`)}</span>
+                        </span>
                         {curMode === m && <span>✓</span>}
                       </button>
                     ))}
@@ -943,6 +959,7 @@ function App() {
               section === "backup" ||
               section === "account" ||
               section === "waf" ||
+              section === "logs" ||
               section === "audit") && (
               <SystemWorkspace activeTab={section} onNavigate={(s) => void navigateTo(s)} />
             )}

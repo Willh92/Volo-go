@@ -100,9 +100,9 @@ server {
 
 1. 使用安装脚本指定与 Nginx 共享的运行组（Debian/Ubuntu 为 `www-data`，CentOS/Rocky 为 `nginx`）：
    ```bash
-   sudo bash scripts/install-service-linux.sh install \
+   sudo ./scripts/install-service.sh install \
      --group www-data \
-     --listen-socket /run/volo/volo.sock \
+     --unix-socket /run/volo/volo.sock \
      --socket-mode 0660 \
      --public-url https://blog.example.com
    ```

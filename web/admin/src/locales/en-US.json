@@ -1182,5 +1182,41 @@
   "sys.lbl_geo_on_miss": "On Miss Action",
   "sys.legacy_preview_badge": "Dry-Run Report (No DB Writes)",
   "sys.reauth_pwd_ph": "Enter current password to confirm",
-  "sys.reauth_pwd_required": "Please enter your current password to change email/password or disable 2FA"
+  "sys.reauth_pwd_required": "Please enter your current password to change email/password or disable 2FA",
+
+  "nav.logs": "Runtime Logs",
+  "mode.auto_desc": "Light 07:00–19:00, dark overnight",
+  "mode.system_desc": "Match OS color scheme",
+  "mode.light_desc": "Always use warm paper light",
+  "mode.dark_desc": "Always use charcoal dark",
+
+  "ui.token_count": "{count} items",
+  "ui.token_clear": "Clear",
+  "ui.token_placeholder": "Press Enter or comma to add, paste supported…",
+
+  "app.theme_mobile_badge": "Mobile Active",
+  "app.theme_activate_mobile": "Set Mobile Theme",
+  "app.mobile_follow_desktop": "Follow Desktop Theme",
+  "app.mobile_theme_label": "Mobile Theme",
+  "app.preview_mobile_theme": "Preview Mobile Theme",
+  "app.nav_slot_primary": "Top Bar",
+  "app.nav_slot_more": "More Menu",
+  "app.move_up": "Move Up",
+  "app.move_down": "Move Down",
+
+  "dist.nav_theme_order": "Header Menu Items & Order",
+
+  "sys.enable_license_notice": "Show Article License Notice",
+  "sys.license_vars_hint": "Variables: {site} {author} {title} {url} {date}",
+  "sys.enable_footer_html": "Enable Custom Footer HTML",
+  "sys.footer_html_hint": "Supports safe HTML tags (<a>, <span>, <br>, <img>) for filing badges and links; scripts are stripped",
+  "sys.enable_outdated_notice": "Show Outdated Post Notice",
+  "sys.logs_head": "Runtime Logs",
+  "sys.logs_sub": "In-memory circular buffer of server runtime logs (up to 400 entries) with level filtering and export.",
+  "sys.logs_stats": "{count}/{cap} lines · Goroutines {goroutines} · Heap {mem}",
+  "sys.logs_search_ph": "Filter message or source…",
+  "sys.logs_download": "Export .log",
+  "sys.logs_clear": "Clear Buffer",
+  "sys.logs_clear_confirm": "Clear all entries in the in-memory runtime log buffer?",
+  "sys.logs_empty": "No matching runtime log entries"
 }

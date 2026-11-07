@@ -76,6 +76,7 @@
     return !!(el && !el.hidden && !el.classList.contains("is-closing"));
   }
 
+  var bodyScrollLocked = false;
   function syncBodyScrollLock() {
     var locked =
       isOverlayActive(document.getElementById("volo-search-modal")) ||
@@ -83,8 +84,24 @@
       isOverlayActive(document.getElementById("volo-toc-drawer")) ||
       isOverlayActive(document.querySelector(".volo-comment-composer")) ||
       isOverlayActive(document.querySelector(".vc-ban-modal"));
-    document.documentElement.style.overflow = locked ? "hidden" : "";
-    if (document.body) document.body.style.overflow = locked ? "hidden" : "";
+    if (locked === bodyScrollLocked) return;
+    if (locked) {
+      var sbw = Math.max(0, (window.innerWidth || 0) - (document.documentElement.clientWidth || 0));
+      var gtr = window.CSS && CSS.supports && CSS.supports("scrollbar-gutter: stable");
+      bodyScrollLocked = true;
+      document.documentElement.style.overflow = "hidden";
+      if (document.body) {
+        document.body.style.overflow = "hidden";
+        if (!gtr && sbw > 0) document.body.style.paddingRight = sbw + "px";
+      }
+    } else {
+      bodyScrollLocked = false;
+      document.documentElement.style.overflow = "";
+      if (document.body) {
+        document.body.style.overflow = "";
+        document.body.style.paddingRight = "";
+      }
+    }
   }
   window.__voloSyncScrollLock = syncBodyScrollLock;
 
@@ -211,15 +228,33 @@
 
   function findHeadingTarget(rawID) {
     if (!rawID) return null;
+    if (rawID === "comments") rawID = "volo-comments";
     var direct = document.getElementById(rawID);
     if (direct) return direct;
     try {
       var decoded = decodeURIComponent(rawID);
+      if (decoded === "comments") decoded = "volo-comments";
       return document.getElementById(decoded);
     } catch (_) {
       return null;
     }
   }
+
+  function pulseCommentTarget(el) {
+    if (!el || !el.classList || !el.classList.contains("vc-item")) return;
+    document.querySelectorAll(".vc-item.is-target").forEach(function (n) { n.classList.remove("is-target"); });
+    el.classList.add("is-target");
+    clearTimeout(el._targetTimer);
+    el._targetTimer = setTimeout(function () { el.classList.remove("is-target"); }, 2600);
+  }
+
+  window.__voloScrollToEl = function (targetEl, highlight) {
+    if (!targetEl) return false;
+    var destY = (window.scrollY || 0) + targetEl.getBoundingClientRect().top - getHeaderOffset();
+    if (highlight) pulseCommentTarget(targetEl);
+    smoothScrollToY(destY);
+    return true;
+  };
 
   function setActiveTOCLink(activeID) {
     if (!activeID) return;
@@ -257,6 +292,7 @@
       } catch (_) {}
     }
     setActiveTOCLink(targetEl.id);
+    pulseCommentTarget(targetEl);
     smoothScrollToY(destY);
     return true;
   }
@@ -1272,8 +1308,13 @@
         hydratePage(main);
 
         if (parsed.hash) {
-          if (!smoothScrollToHash(parsed.hash.slice(1), true)) {
-            window.scrollTo(0, 0);
+          var hID = parsed.hash.slice(1);
+          if (!smoothScrollToHash(hID, true)) {
+            if (hID.indexOf("comment-") === 0 || hID === "comments") {
+              if (!smoothScrollToHash("volo-comments", true)) window.scrollTo(0, 0);
+            } else {
+              window.scrollTo(0, 0);
+            }
           }
         } else {
           cancelSmoothScroll();
@@ -1297,11 +1338,9 @@
       a.classList.toggle("is-active", href === pathname || (href !== "/" && pathname.indexOf(href) === 0));
     });
     var moreBtn = document.getElementById("volo-nav-more-btn");
+    var moreMenu = document.getElementById("volo-nav-more-menu");
     if (moreBtn) {
-      var moreActive = ["/series", "/books", "/links", "/follows", "/dynamic"].some(function (p) {
-        return pathname.indexOf(p) === 0;
-      });
-      moreBtn.classList.toggle("is-active", moreActive);
+      moreBtn.classList.toggle("is-active", Boolean(moreMenu && moreMenu.querySelector(".studio-nav-more__item.is-active:not(.studio-only-mobile)")));
     }
   }
 
@@ -1492,6 +1531,9 @@
   }, { passive: true });
 
   applyTheme(null);
+  window.addEventListener("storage", function (ev) {
+    if (!ev || !ev.key || ev.key === "volo_theme_mode") applyTheme(null);
+  });
   if (window.matchMedia) {
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
       if ((document.documentElement.getAttribute("data-mode") || "auto") === "system") applyTheme("system");
@@ -1509,6 +1551,12 @@
     initSearchAndLightbox();
     initBackToTop();
     hydratePage(document);
+    if (window.location.hash && window.location.hash.length > 1) {
+      var initHash = window.location.hash.slice(1);
+      if (!smoothScrollToHash(initHash, true) && initHash.indexOf("comment-") === 0) {
+        smoothScrollToHash("volo-comments", true);
+      }
+    }
   }
 
   if (document.readyState === "loading") {

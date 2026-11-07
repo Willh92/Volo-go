@@ -17,11 +17,18 @@
   "nav.login": "读者登录",
   "nav.logout": "退出登录",
 
-  "appearance.auto": "按时间自动 (07:00-19:00 浅色)",
-  "appearance.system": "跟随系统外观",
-  "appearance.light": "浅色",
-  "appearance.dark": "深色",
+  "appearance.auto": "自动日夜",
+  "appearance.auto_desc": "07:00–19:00 浅色",
+  "appearance.system": "跟随系统",
+  "appearance.system_desc": "使用设备设置",
+  "appearance.light": "浅色模式",
+  "appearance.light_desc": "始终使用浅色",
+  "appearance.dark": "深色模式",
+  "appearance.dark_desc": "始终使用深色",
   "appearance.switch_lang": "切换语言",
+
+  "article.license_title": "版权声明",
+  "studio.archive_summary": "共 {articles} 篇文章 · 跨越 {months} 个月",
 
   "article.pinned": "置顶",
   "article.reading_stats": "全文约 {words} 字 · 预计阅读 {minutes} 分钟",

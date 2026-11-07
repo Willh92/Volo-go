@@ -38,108 +38,102 @@ Configuration is resolved deterministically in four layers (highest priority fir
 
 ---
 
-## 2. Linux Service Installation (`systemd` & `OpenRC`)
+### 2. Linux Service Installation & Zero-Flag Online Upgrades (`systemd` System/User & `OpenRC`)
 
-[`scripts/install-service-linux.sh`](../../scripts/install-service-linux.sh) auto-detects Debian / Ubuntu / RHEL / Rocky / Arch (`systemd`) as well as Alpine / Gentoo (`OpenRC`). It provisions a locked `nologin` `volo` system account, creates `0750` data directories, generates a 256-bit random `VOLO_SECRET_KEY` in `0640` `/etc/volo/volo.env`, and enables kernel sandboxing (`ProtectSystem=strict`, `ProtectHome=true`, `NoNewPrivileges=true`).
+[`scripts/install-service.sh`](../../scripts/install-service.sh) provides a unified cross-platform service manager for Linux and macOS (with `install-service-linux.sh` and `install-service-macos.sh` kept as compatibility shims):
+- **Zero-Flag Ergonomics**: Running `install` automatically uses a local binary when present or downloads the matching OS/Arch release from GitHub Releases; running `upgrade` (or `update`) requires **zero extra flags** — it automatically downloads the latest release, verifies `SHA256SUMS.txt` (fail-closed), runs a `volo version` preflight check, preserves existing paths and `/etc/volo/volo.env`, and restarts the service;
+- **Full Production Hardening**: Supports system-wide `systemd` (`ProtectSystem=strict`, `NoNewPrivileges=true`), rootless `--user-mode` (`systemd --user`), Alpine/Gentoo `OpenRC`, Unix Domain Socket group ACLs, `--mirror` download acceleration, `--bin` / `--archive` offline installs, and `--dry-run` previews.
 
-### 2.1 Standard TCP Loopback Mode (Behind Nginx / Caddy / Traefik)
+### 2.1 One-Line Remote Install & Zero-Flag Online Upgrade (Recommended)
 
 ```bash
-# Preview generated unit files and commands safely without root (--dry-run)
-bash scripts/install-service-linux.sh install \
-  --dry-run \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com \
-  --admin-path /studio-secret
+# One-line remote install & enable on boot (binds 127.0.0.1:8080 by default)
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh | sudo sh
 
-# Install, enable on boot, and start the hardened service
-sudo bash scripts/install-service-linux.sh install \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com \
-  --admin-path /studio-secret
+# Or customize public URL and stealth admin path on initial install
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh \
+  | sudo sh -s -- install --public-url https://blog.example.com --admin-path /studio-secret
+
+# Zero-flag online upgrade (preserves /etc/volo/volo.env & /var/lib/volo; supports --version <tag> and --mirror https://ghfast.top)
+sudo ./scripts/install-service.sh upgrade
+# Or run upgrade directly from remote:
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh | sudo sh -s -- upgrade
 ```
 
-### 2.2 Zero-TCP Unix Domain Socket Mode (Same-Host Nginx / Caddy)
-
-Set `--group` to the reverse proxy's group (`www-data` on Debian/Ubuntu, `nginx` or `caddy` on RHEL/Rocky/Alpine):
+### 2.2 Advanced Options: Unix Domain Sockets, User Mode & Offline Bundles
 
 ```bash
-sudo bash scripts/install-service-linux.sh install \
-  --binary ./volo \
-  --group www-data \
-  --listen-socket /run/volo/volo.sock \
-  --socket-mode 0660 \
+# Zero-TCP Unix Domain Socket mode granting group access to Nginx / Caddy (www-data / nginx)
+sudo ./scripts/install-service.sh install \
+  --socket-group www-data \
+  --supplementary-groups www-data \
+  --unix-socket /run/volo/volo.sock \
+  --unix-socket-perm 0660 \
   --public-url https://blog.example.com
+
+# Non-root user service (systemd --user)
+./scripts/install-service.sh install --user-mode --port 8080
+
+# Offline install/upgrade from local binary (--bin) or release bundle (--archive), plus --dry-run preview
+./scripts/install-service.sh install --dry-run --bin ./volo --public-url https://blog.example.com
+sudo ./scripts/install-service.sh upgrade --bin ./volo
 ```
 
-### 2.3 Seamless Upgrades, Diagnostics & Uninstallation
+### 2.3 Lifecycle Management & Diagnostics
 
 ```bash
-# Atomic binary upgrade + restart (preserves /etc/volo/volo.env and /var/lib/volo)
-sudo bash scripts/install-service-linux.sh upgrade --binary ./volo
-
-# Check service status & run comprehensive diagnostics
-sudo bash scripts/install-service-linux.sh status
+sudo ./scripts/install-service.sh status      # Inspect service status
+sudo ./scripts/install-service.sh logs        # Tail service logs
+sudo ./scripts/install-service.sh restart     # Restart service (also supports start / stop)
 sudo /usr/local/bin/volo doctor --env-file /etc/volo/volo.env
-
-# Uninstall service (keeps data by default; pass --purge-data to delete /var/lib/volo)
-sudo bash scripts/install-service-linux.sh uninstall
+sudo ./scripts/install-service.sh uninstall   # Remove service (keeps data; pass --purge-data to wipe)
 ```
 
 Reference unit templates are also available directly under [`deploy/systemd/volo.service`](../../deploy/systemd/volo.service) and [`deploy/openrc/volo.initd`](../../deploy/openrc/volo.initd).
 
 ---
 
-## 3. macOS Service Installation (`launchd`)
+## 3. macOS Service Installation & Upgrades (`launchd`)
 
-[`scripts/install-service-macos.sh`](../../scripts/install-service-macos.sh) supports both Intel (`darwin/amd64`) and Apple Silicon (`darwin/arm64`) Macs:
+The same [`scripts/install-service.sh`](../../scripts/install-service.sh) supports Intel (`darwin/amd64`) and Apple Silicon (`darwin/arm64`) Macs — running without `sudo` automatically installs a per-user `LaunchAgent`, while `sudo` (or `--system`) installs a boot-time `LaunchDaemon`:
 
 ```bash
-# Mode A: Per-user LaunchAgent (recommended for Mac mini home servers; no sudo required)
-bash scripts/install-service-macos.sh install \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com
+# Mode A: Per-user LaunchAgent (no sudo; installs under ~/.local/bin/volo & ~/Library/Application Support/Volo)
+./scripts/install-service.sh install --public-url https://blog.example.com
 
-# Mode B: System-wide LaunchDaemon (starts at boot before user login; requires sudo)
-sudo bash scripts/install-service-macos.sh install --system \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com
+# Mode B: System-wide LaunchDaemon (starts at boot before user login)
+sudo ./scripts/install-service.sh install --system --public-url https://blog.example.com
 
-# Status / Upgrade / Uninstall
-bash scripts/install-service-macos.sh status
-bash scripts/install-service-macos.sh upgrade --binary ./volo
-bash scripts/install-service-macos.sh uninstall
+# Zero-flag online upgrade / status / logs / uninstall
+./scripts/install-service.sh upgrade
+./scripts/install-service.sh status
+./scripts/install-service.sh logs
+./scripts/install-service.sh uninstall
 ```
 
 ---
 
-## 4. Windows Service Installation (PowerShell)
+## 4. Windows Service Installation & Upgrades (PowerShell)
 
-Run [`scripts/install-service-windows.ps1`](../../scripts/install-service-windows.ps1) in an Administrator PowerShell window:
-- If `nssm.exe` is available on `PATH`, it registers a native `SERVICE_AUTO_START` Windows Service;
-- Otherwise, it registers a zero-dependency boot-time Scheduled Task running as least-privilege `NT AUTHORITY\NETWORK SERVICE` with automatic crash recovery and restricts NTFS ACLs on `C:\ProgramData\Volo\volo.env` via `icacls.exe`.
+Run [`scripts/install-service.ps1`](../../scripts/install-service.ps1) in an Administrator PowerShell window (`install-service-windows.ps1` is also retained as a compatibility wrapper):
+- Uses a local `volo.exe` automatically when present, or downloads from GitHub Releases with mandatory `SHA256SUMS.txt` verification;
+- Registers a native Windows Service when `nssm.exe` is on `PATH`, or a zero-dependency boot-time Scheduled Task under `NT AUTHORITY\NetworkService` with NTFS ACL hardening via `icacls.exe`.
 
 ```powershell
-# Preview actions without modifying the system (-DryRun)
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 `
-  -Action Install -BinaryPath .\volo.exe -DryRun
-
-# Install and start service (binds 127.0.0.1:8080 behind IIS / Caddy / Nginx)
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 `
+# Install and start auto-start service (supports -Version <tag>, -Mirror "https://ghfast.top", -BinaryPath .\volo.exe, -DryRun)
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 `
   -Action Install `
-  -BinaryPath .\volo.exe `
-  -ListenAddr "127.0.0.1:8080" `
+  -HostAddr "127.0.0.1" -Port 8080 `
   -PublicUrl "https://blog.example.com" `
   -AdminPath "/studio-secret"
 
-# Status / Upgrade / Uninstall
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 -Action Status
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 -Action Upgrade -BinaryPath .\volo.exe
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 -Action Uninstall
+# Zero-flag online upgrade (gracefully stops service, smoke-tests volo.exe version, swaps binary, preserves volo.env & data\)
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Upgrade
+
+# Lifecycle management
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Status
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Restart
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Uninstall
 ```
 
 ---

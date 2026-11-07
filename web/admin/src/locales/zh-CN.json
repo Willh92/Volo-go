@@ -1182,5 +1182,41 @@
   "sys.lbl_geo_on_miss": "未命中时策略 (On Miss)",
   "sys.legacy_preview_badge": "预演报告（未写入数据库）",
   "sys.reauth_pwd_ph": "输入当前登录密码以确认敏感操作",
-  "sys.reauth_pwd_required": "修改邮箱、密码或关闭两步验证前，请先输入当前登录密码"
+  "sys.reauth_pwd_required": "修改邮箱、密码或关闭两步验证前，请先输入当前登录密码",
+
+  "nav.logs": "运行日志",
+  "mode.auto_desc": "07:00–19:00 浅色，其余深色",
+  "mode.system_desc": "自动同步操作系统外观",
+  "mode.light_desc": "始终使用温润纸感浅色",
+  "mode.dark_desc": "始终使用静谧炭灰深色",
+
+  "ui.token_count": "已添加 {count} 项",
+  "ui.token_clear": "清空",
+  "ui.token_placeholder": "输入后按回车或逗号添加，支持批量粘贴…",
+
+  "app.theme_mobile_badge": "手机端启用",
+  "app.theme_activate_mobile": "设为手机主题",
+  "app.mobile_follow_desktop": "跟随桌面主题",
+  "app.mobile_theme_label": "手机端独立主题",
+  "app.preview_mobile_theme": "预览手机主题",
+  "app.nav_slot_primary": "顶部直显",
+  "app.nav_slot_more": "更多菜单",
+  "app.move_up": "上移",
+  "app.move_down": "下移",
+
+  "dist.nav_theme_order": "顶部菜单显示与排序",
+
+  "sys.enable_license_notice": "展示文章底部版权声明",
+  "sys.license_vars_hint": "支持占位变量：{site} {author} {title} {url} {date}",
+  "sys.enable_footer_html": "启用页脚备案与自定义 HTML",
+  "sys.footer_html_hint": "支持安全 HTML 标签（<a>、<span>、<br>、<img>）用于备案号与链接，自动过滤脚本",
+  "sys.enable_outdated_notice": "启用久远文章时效提示",
+  "sys.logs_head": "系统运行日志",
+  "sys.logs_sub": "实时内存环形缓冲区运行日志（上限 400 条），支持按级别与关键词检索导出。",
+  "sys.logs_stats": "{count}/{cap} 条 · Goroutines {goroutines} · Heap {mem}",
+  "sys.logs_search_ph": "搜索日志内容或模块来源…",
+  "sys.logs_download": "导出 .log",
+  "sys.logs_clear": "清空缓冲",
+  "sys.logs_clear_confirm": "确定清空当前内存中的运行日志缓冲区吗？",
+  "sys.logs_empty": "暂无匹配的运行日志记录"
 }

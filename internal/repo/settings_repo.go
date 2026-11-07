@@ -80,7 +80,13 @@ func (m *SettingsManager) Reload(ctx context.Context) (domain.SettingsSnapshot, 
 func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec domain.SettingRecord) error {
 	switch rec.Domain {
 	case domain.SettingsDomainSite:
-		return json.Unmarshal([]byte(rec.ValueJSON), &s.Site)
+		if err := json.Unmarshal([]byte(rec.ValueJSON), &s.Site); err != nil {
+			return err
+		}
+		if s.Site.LicenseTemplate == "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}" {
+			s.Site.LicenseTemplate = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
+		}
+		return nil
 	case domain.SettingsDomainReading:
 		return json.Unmarshal([]byte(rec.ValueJSON), &s.Reading)
 	case domain.SettingsDomainFeed:
@@ -491,14 +497,18 @@ func extractDomainFromSnapshot(s domain.SettingsSnapshot, d string) any {
 }
 
 func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
+	def := domain.DefaultSettingsSnapshot("zh-CN")
 	switch d {
 	case domain.SettingsDomainSite:
-		var v domain.SiteSettings
+		v := def.Site
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
 		if strings.TrimSpace(v.Title) == "" {
 			return nil, errors.New("settings: site.title cannot be empty")
+		}
+		if v.LicenseTemplate == "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}" {
+			v.LicenseTemplate = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
 		}
 		if v.SocialLinks == nil {
 			v.SocialLinks = []domain.SocialLink{}
@@ -508,7 +518,7 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		}
 		return json.Marshal(v)
 	case domain.SettingsDomainReading:
-		var v domain.ReadingSettings
+		v := def.Reading
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
@@ -568,7 +578,7 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		}
 		return json.Marshal(v)
 	case domain.SettingsDomainAppearance:
-		var v domain.AppearanceSettings
+		v := def.Appearance
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
@@ -576,6 +586,10 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		case "forest", "ocean", "teal", "amber", "plum", "rose":
 		default:
 			return nil, fmt.Errorf("settings: invalid appearance.accent %q", v.Accent)
+		}
+		v.MobileTheme = strings.TrimSpace(v.MobileTheme)
+		if v.MobileTheme == "same" {
+			v.MobileTheme = ""
 		}
 		v.CustomCSS = sanitizeCustomCSS(v.CustomCSS)
 		if v.ThemeConfigs == nil {

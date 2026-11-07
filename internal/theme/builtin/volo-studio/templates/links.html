@@ -1,13 +1,12 @@
 {{define "content"}}
-<section class="studio-hero studio-hero--simple">
-  <div class="studio-hero-copy">
-    <h1 class="studio-hero__title">{{t .Locale "nav.links"}}</h1>
-    {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
-  </div>
-</section>
-
 <div class="studio-layout">
   <div class="studio-stack">
+    <section class="studio-hero studio-hero--simple studio-page-head">
+      <div class="studio-hero-copy">
+        <h1 class="studio-hero__title">{{t .Locale "nav.links"}}</h1>
+        {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+      </div>
+    </section>
     {{if .LinksByCategory}}
       {{range $cat, $items := .LinksByCategory}}
         <section class="studio-article studio-card-pad">

@@ -682,6 +682,7 @@ func TestVoloSoloUIPolish_CommentsDesc_Bookshelf_Templates(t *testing.T) {
 		"Go 实战手册",
 		`id="volo-toc-slot"`,
 		"studio-article-counts",
+		"studio-article__foot-tags",
 		"volo-table-scroll",
 	} {
 		if !strings.Contains(postStr, mustHave) {
@@ -689,7 +690,6 @@ func TestVoloSoloUIPolish_CommentsDesc_Bookshelf_Templates(t *testing.T) {
 		}
 	}
 	for _, mustNotHave := range []string{
-		"studio-article__foot-tags",
 		`class="studio-sidebar"`,
 		"studio-author-card",
 	} {
@@ -749,5 +749,28 @@ func TestVoloSoloUIPolish_CommentsDesc_Bookshelf_Templates(t *testing.T) {
 	if len(replies) != 2 || replies[0].AuthorName != "ReplyFirst" || replies[1].AuthorName != "ReplySecond" {
 		t.Fatalf("expected nested replies ASC [ReplyFirst, ReplySecond], got %+v", replies)
 	}
+
+	// 7. Sanitized Footer HTML + License Notice toggle + Runtime Logs API
+	if _, _, err := env.settings.PatchDomain(env.ctx, "site", []byte(`{"enable_footer_html":true,"footer_text":"<a href=\"https://beian.miit.gov.cn\">京ICP备000001号</a><script>alert(1)</script>","enable_license_notice":false}`), 0); err != nil {
+		t.Fatalf("PatchDomain site footer_text & license: %v", err)
+	}
+	_, postAfterToggle := doJSONReq(t, http.MethodGet, env.ts.URL+"/posts/online-bookshelf", nil, nil, nil)
+	postToggleStr := string(postAfterToggle)
+	if !strings.Contains(postToggleStr, "京ICP备000001号") || strings.Contains(postToggleStr, "<script>alert(1)</script>") {
+		t.Fatalf("expected sanitized ICP footer HTML without inline script")
+	}
+	if strings.Contains(postToggleStr, "volo-license-box") {
+		t.Fatalf("expected volo-license-box hidden when enable_license_notice=false")
+	}
+
+	rtResp, rtBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/runtime-logs?limit=20", nil, adminCookies, nil)
+	if rtResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/admin/runtime-logs = %d %s", rtResp.StatusCode, string(rtBody))
+	}
+	rtTxtResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/runtime-logs?format=text", nil, adminCookies, nil)
+	if rtTxtResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/admin/runtime-logs?format=text = %d", rtTxtResp.StatusCode)
+	}
 }
+
 

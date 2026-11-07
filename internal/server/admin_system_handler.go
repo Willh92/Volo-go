@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/doctor"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/etl"
+	"github.com/Willh92/Volo-go/internal/logging"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
@@ -167,6 +169,39 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case sub == "security/geo-rules" || strings.HasPrefix(sub, "security/geo-rules/"):
 		s.handleAdminGeoRules(w, r, actor, strings.TrimPrefix(sub, "security/geo-rules"))
+
+	case sub == "runtime-logs" && r.Method == http.MethodGet:
+		lvl := strings.TrimSpace(r.URL.Query().Get("level"))
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		limit, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+		if limit <= 0 || limit > logging.DefaultMaxEntries {
+			limit = logging.DefaultMaxEntries
+		}
+		items := logging.Default().List(lvl, q, limit)
+		if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("format")), "text") {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Content-Disposition", `attachment; filename="volo-runtime.log"`)
+			_, _ = w.Write([]byte(logging.FormatText(items)))
+			return
+		}
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":            items,
+			"total":            logging.Default().Count(),
+			"capacity":         logging.DefaultMaxEntries,
+			"goroutines":       runtime.NumGoroutine(),
+			"heap_alloc_bytes": ms.HeapAlloc,
+			"sys_bytes":        ms.Sys,
+			"uptime_sec":       int64(time.Since(s.deps.StartedAt).Seconds()),
+			"go_version":       runtime.Version(),
+			"version":          s.deps.Version,
+		})
+
+	case sub == "runtime-logs" && r.Method == http.MethodDelete:
+		logging.Default().Clear()
+		s.recordAuditLog(r, actor, "system.clear_runtime_logs", "system", "runtime_logs", nil)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case sub == "audit-logs" && r.Method == http.MethodGet:
 		act := strings.TrimSpace(r.URL.Query().Get("action"))
@@ -761,6 +796,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		snap := s.deps.Settings.Snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"active_theme": snap.Appearance.ActiveTheme,
+			"mobile_theme": snap.Appearance.MobileTheme,
 			"appearance":   snap.Appearance,
 			"themes":       s.deps.Themes.ListLocalized(locale),
 		})
@@ -776,6 +812,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":           true,
 			"active_theme": snap.Appearance.ActiveTheme,
+			"mobile_theme": snap.Appearance.MobileTheme,
 			"appearance":   snap.Appearance,
 			"themes":       s.deps.Themes.ListLocalized(locale),
 		})
@@ -785,23 +822,50 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	if rest == "activate" && r.Method == http.MethodPost {
 		var req struct {
 			ThemeID string `json:"theme_id"`
+			Target  string `json:"target"` // desktop (default) | mobile | both
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		_ = s.deps.Themes.Reload()
-		if !s.deps.Themes.Has(req.ThemeID) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme not found: " + req.ThemeID})
-			return
+		target := strings.ToLower(strings.TrimSpace(req.Target))
+		if target == "" {
+			target = "desktop"
 		}
-		patch, _ := json.Marshal(map[string]any{"active_theme": req.ThemeID})
+		tid := strings.TrimSpace(req.ThemeID)
+		_ = s.deps.Themes.Reload()
+		patchMap := map[string]any{}
+		switch target {
+		case "mobile":
+			if tid == "same" {
+				tid = ""
+			}
+			if tid != "" && !s.deps.Themes.Has(tid) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme not found: " + tid})
+				return
+			}
+			patchMap["mobile_theme"] = tid
+		case "both":
+			if !s.deps.Themes.Has(tid) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme not found: " + tid})
+				return
+			}
+			patchMap["active_theme"] = tid
+			patchMap["mobile_theme"] = tid
+		default:
+			if !s.deps.Themes.Has(tid) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme not found: " + tid})
+				return
+			}
+			patchMap["active_theme"] = tid
+		}
+		patch, _ := json.Marshal(patchMap)
 		val, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patch, 0)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		s.recordAuditLog(r, actor, "theme.activate", "theme", req.ThemeID, nil)
+		s.recordAuditLog(r, actor, "theme.activate", "theme", tid, map[string]any{"target": target})
 		writeJSON(w, http.StatusOK, map[string]any{"appearance": val, "version": ver})
 		return
 	}
@@ -885,14 +949,24 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		if s.deps.Settings.Snapshot().Appearance.ActiveTheme == themeID {
-			patchBytes, _ := json.Marshal(map[string]any{"active_theme": "volo-studio"})
+		curApp := s.deps.Settings.Snapshot().Appearance
+		patchReset := map[string]any{}
+		if curApp.ActiveTheme == themeID {
+			patchReset["active_theme"] = "volo-studio"
+		}
+		if curApp.MobileTheme == themeID {
+			patchReset["mobile_theme"] = ""
+		}
+		if len(patchReset) > 0 {
+			patchBytes, _ := json.Marshal(patchReset)
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 		}
 		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
+		nextApp := s.deps.Settings.Snapshot().Appearance
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":           true,
-			"active_theme": s.deps.Settings.Snapshot().Appearance.ActiveTheme,
+			"active_theme": nextApp.ActiveTheme,
+			"mobile_theme": nextApp.MobileTheme,
 			"themes":       s.deps.Themes.ListLocalized(locale),
 		})
 		return

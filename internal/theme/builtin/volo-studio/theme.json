@@ -16,6 +16,44 @@
   "supports_pjax": true,
   "config_schema": [
     {
+      "key": "header_nav_items",
+      "type": "sortable_list",
+      "label": {
+        "zh-CN": "顶部导航菜单项与排序",
+        "en-US": "Header Navigation Items & Order"
+      },
+      "description": {
+        "zh-CN": "选择需要显示的导航项并调整顺序；「自定义导航链接」对应「分发 → 导航与重定向」中的链接，默认排在最后。",
+        "en-US": "Toggle visible header items and reorder them; 'Custom Navigation Links' maps to Distribute -> Navigation and defaults to last."
+      },
+      "default": ["home", "archives", "tags", "categories", "series", "books", "links", "follows", "dynamic", "custom"],
+      "options": [
+        { "value": "home", "label": { "zh-CN": "首页 (/)", "en-US": "Home (/)" } },
+        { "value": "archives", "label": { "zh-CN": "归档 (/archives)", "en-US": "Archives (/archives)" } },
+        { "value": "tags", "label": { "zh-CN": "标签 (/tags)", "en-US": "Tags (/tags)" } },
+        { "value": "categories", "label": { "zh-CN": "分类 (/categories)", "en-US": "Categories (/categories)" } },
+        { "value": "series", "label": { "zh-CN": "专栏 (/series)", "en-US": "Series (/series)" } },
+        { "value": "books", "label": { "zh-CN": "书架 (/books)", "en-US": "Bookshelf (/books)" } },
+        { "value": "links", "label": { "zh-CN": "友链 (/links)", "en-US": "Links (/links)" } },
+        { "value": "follows", "label": { "zh-CN": "订阅 (/follows)", "en-US": "Following (/follows)" } },
+        { "value": "dynamic", "label": { "zh-CN": "动态 (/dynamic)", "en-US": "Stream (/dynamic)" } },
+        { "value": "custom", "label": { "zh-CN": "自定义导航链接", "en-US": "Custom Navigation Links" } }
+      ]
+    },
+    {
+      "key": "header_nav_primary_count",
+      "type": "number",
+      "label": {
+        "zh-CN": "顶部直显菜单数量上限",
+        "en-US": "Max Primary Top-Bar Links"
+      },
+      "description": {
+        "zh-CN": "排在前面的菜单项直接展示在顶部栏，超出部分自动收纳进「更多」菜单（设为较大的数如 20 可全部直显）。",
+        "en-US": "Leading items render directly in the header bar; remaining items fold into the 'More' menu (set e.g. 20 to show all inline)."
+      },
+      "default": 5
+    },
+    {
       "key": "hero_badge",
       "type": "text",
       "label": { "zh-CN": "首页顶部铭牌文案", "en-US": "Hero Eyebrow Badge" },

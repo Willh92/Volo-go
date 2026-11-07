@@ -24,7 +24,9 @@ type SiteSettings struct {
 	NoticeBoard         string            `json:"notice_board"`
 	SocialLinks         []SocialLink      `json:"social_links"`
 	LicenseTemplate     string            `json:"license_template"`
+	EnableLicenseNotice bool              `json:"enable_license_notice"`
 	FooterText          string            `json:"footer_text"`
+	EnableFooterHTML    bool              `json:"enable_footer_html"`
 	CustomHeadMeta      string            `json:"custom_head_meta"`
 	CustomVars          map[string]string `json:"custom_vars"`
 	ShowAdminLoginEntry bool              `json:"show_admin_login_entry"`
@@ -39,6 +41,7 @@ type ReadingSettings struct {
 	PopularTagsCount      int      `json:"popular_tags_count"`
 	RelatedPostsCount     int      `json:"related_posts_count"`
 	EnableReadingStats    bool     `json:"enable_reading_stats"`
+	EnableOutdatedNotice  bool     `json:"enable_outdated_notice"`
 	OutdatedNoticeDays    int      `json:"outdated_notice_days"` // 0 = disabled
 	EnableInstantSearch   bool     `json:"enable_instant_search"`
 	ShowCodeLineNumbers   bool     `json:"show_code_line_numbers"`
@@ -172,6 +175,7 @@ type SecuritySecrets struct {
 // AppearanceSettings ("appearance" domain).
 type AppearanceSettings struct {
 	ActiveTheme  string                    `json:"active_theme"`            // volo-studio or external theme id
+	MobileTheme  string                    `json:"mobile_theme,omitempty"`  // optional separate theme id for mobile devices
 	Accent       string                    `json:"accent"`                  // forest | ocean | teal | amber | plum | rose
 	DefaultMode  string                    `json:"default_mode"`            // auto | system | light | dark
 	CustomCSS    string                    `json:"custom_css,omitempty"`    // optional site-wide custom CSS
@@ -242,7 +246,9 @@ func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 			AllowLocaleSwitch:   true,
 			TimeZone:            "Asia/Shanghai",
 			SocialLinks:         []SocialLink{},
-			LicenseTemplate:     "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}",
+			LicenseTemplate:     "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}",
+			EnableLicenseNotice: true,
+			EnableFooterHTML:    true,
 			CustomVars:          map[string]string{},
 			ShowAdminLoginEntry: false,
 		},
@@ -254,6 +260,7 @@ func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 			PopularTagsCount:      20,
 			RelatedPostsCount:     5,
 			EnableReadingStats:    true,
+			EnableOutdatedNotice:  true,
 			OutdatedNoticeDays:    365,
 			EnableInstantSearch:   true,
 			ShowCodeLineNumbers:   false,

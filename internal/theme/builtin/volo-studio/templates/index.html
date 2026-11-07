@@ -16,13 +16,6 @@
       </svg>
     </section>
   {{end}}
-{{else}}
-  <section class="studio-hero studio-hero--simple">
-    <div class="studio-hero-copy">
-      <h2 class="studio-hero__title">{{.HeroTitle}}</h2>
-      {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
-    </div>
-  </section>
 {{end}}
 
 <div class="studio-layout">
@@ -31,6 +24,13 @@
       <div class="studio-section-heading">
         <h2>{{t .Locale "studio.latest_updates"}}</h2>
       </div>
+    {{else}}
+      <section class="studio-hero studio-hero--simple studio-page-head">
+        <div class="studio-hero-copy">
+          <h2 class="studio-hero__title">{{.HeroTitle}}</h2>
+          {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+        </div>
+      </section>
     {{end}}
     <div class="studio-posts">
       {{range .ArticleCards}}

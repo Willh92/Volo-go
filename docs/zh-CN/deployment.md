@@ -38,108 +38,102 @@
 
 ---
 
-## 2. Linux 系统服务安装（`systemd` 与 `OpenRC`）
+### 2. Linux 系统服务安装与极简在线更新（`systemd` 系统/用户级与 `OpenRC`）
 
-仓库内置 [`scripts/install-service-linux.sh`](../../scripts/install-service-linux.sh)，自动识别 Debian / Ubuntu / RHEL / Rocky / Arch（`systemd`）以及 Alpine / Gentoo（`OpenRC`），自动创建无登录权限的 `volo` 系统账户、初始化 `0750` 数据目录、生成随机 256-bit 主密钥写入 `0640` `/etc/volo/volo.env`，并开启 `ProtectSystem=strict` / `NoNewPrivileges=true` 等内核级沙箱加固。
+仓库内置统一跨平台服务管理器 [`scripts/install-service.sh`](../../scripts/install-service.sh)（同时保留 `install-service-linux.sh` / `install-service-macos.sh` 兼容入口）：
+- **零参数心智负担**：执行 `install` 时若本地未找到二进制自动从 GitHub Releases 下载；执行 `upgrade`（或 `update`）时**无需附加任何参数**即可自动拉取最新发行版、强制校验 `SHA256SUMS.txt`、执行 `volo version` 预检、保留已有服务路径与 `/etc/volo/volo.env` 并平滑重启；
+- **全套进阶能力**：支持 `systemd` 系统级与 `--user-mode` 非 root 用户级服务、Alpine/Gentoo `OpenRC`、Unix Domain Socket 权限组、内核级沙箱加固（`ProtectSystem=strict` / `NoNewPrivileges=true`）、`--mirror` 镜像加速、`--bin` / `--archive` 离线安装及 `--dry-run` 预演。
 
-### 2.1 标准 TCP 回环模式（配合本机 Nginx / Caddy / Traefik）
+### 2.1 一键远程安装与日常零参数更新（推荐）
 
 ```bash
-# 先用 --dry-run 预览将要执行的命令与生成的单元文件（无需 root）
-bash scripts/install-service-linux.sh install \
-  --dry-run \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com \
-  --admin-path /studio-secret
+# 远程一行安装并启动开机自启服务（默认监听 127.0.0.1:8080）
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh | sudo sh
 
-# 确认无误后正式安装并启动开机自启服务
-sudo bash scripts/install-service-linux.sh install \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com \
-  --admin-path /studio-secret
+# 或传入公开域名与自定义隐身后台路径
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh \
+  | sudo sh -s -- install --public-url https://blog.example.com --admin-path /studio-secret
+
+# 日常一键在线更新（零附加参数，100% 保留 /etc/volo/volo.env 与 /var/lib/volo 数据）
+sudo ./scripts/install-service.sh upgrade
+# 或直接远程执行更新（可选追加 --version v1.0.0 或 --mirror https://ghfast.top）：
+curl -fsSL https://raw.githubusercontent.com/Willh92/Volo-go/main/scripts/install-service.sh | sudo sh -s -- upgrade
 ```
 
-### 2.2 零 TCP 开销 Unix Domain Socket 模式（配合本机 Nginx / Caddy）
-
-将服务运行组指定为反向代理所在用户组（Debian/Ubuntu 通常为 `www-data`，RHEL/Rocky/Alpine 通常为 `nginx` 或 `caddy`）：
+### 2.2 进阶定制：Unix Domain Socket、非 root 用户级与离线安装
 
 ```bash
-sudo bash scripts/install-service-linux.sh install \
-  --binary ./volo \
-  --group www-data \
-  --listen-socket /run/volo/volo.sock \
-  --socket-mode 0660 \
+# 配合本机 Nginx / Caddy 的零 TCP 开销 Unix Domain Socket 模式
+sudo ./scripts/install-service.sh install \
+  --socket-group www-data \
+  --supplementary-groups www-data \
+  --unix-socket /run/volo/volo.sock \
+  --unix-socket-perm 0660 \
   --public-url https://blog.example.com
+
+# 非 root 当前用户级服务（systemd --user）
+./scripts/install-service.sh install --user-mode --port 8080
+
+# 指定本地编译二进制（--bin）或离线发行包（--archive），配合 --dry-run 预览生成的单元文件
+./scripts/install-service.sh install --dry-run --bin ./volo --public-url https://blog.example.com
+sudo ./scripts/install-service.sh upgrade --bin ./volo
 ```
 
-### 2.3 日常升级、状态检查与卸载
+### 2.3 服务全生命周期管理与健康诊断
 
 ```bash
-# 平滑升级二进制并重启服务（完整保留 /etc/volo/volo.env 与 /var/lib/volo 数据）
-sudo bash scripts/install-service-linux.sh upgrade --binary ./volo
-
-# 查看运行状态与健康诊断
-sudo bash scripts/install-service-linux.sh status
+sudo ./scripts/install-service.sh status      # 查看运行状态
+sudo ./scripts/install-service.sh logs        # 实时追踪运行日志
+sudo ./scripts/install-service.sh restart     # 重启服务（亦支持 start / stop）
 sudo /usr/local/bin/volo doctor --env-file /etc/volo/volo.env
-
-# 卸载服务（默认保留数据目录；如确认彻底清空数据可追加 --purge-data）
-sudo bash scripts/install-service-linux.sh uninstall
+sudo ./scripts/install-service.sh uninstall   # 卸载服务（默认保留数据；加 --purge-data 彻底清理）
 ```
 
 也可直接使用 [`deploy/systemd/volo.service`](../../deploy/systemd/volo.service) 或 [`deploy/openrc/volo.initd`](../../deploy/openrc/volo.initd) 手工定制。
 
 ---
 
-## 3. macOS 系统服务安装（`launchd`）
+## 3. macOS 系统服务安装与更新（`launchd`）
 
-[`scripts/install-service-macos.sh`](../../scripts/install-service-macos.sh) 原生支持 Intel (`darwin/amd64`) 与 Apple Silicon (`darwin/arm64`)，提供两种模式：
+同一份 [`scripts/install-service.sh`](../../scripts/install-service.sh) 原生支持 Intel (`darwin/amd64`) 与 Apple Silicon (`darwin/arm64`)：非 `root` 执行自动注册为当前用户 `LaunchAgent`（免 `sudo`），`sudo` 执行（或加 `--system`）注册为开机自启 `LaunchDaemon`：
 
 ```bash
-# 模式 A：当前用户 LaunchAgent（推荐 Mac mini 家庭服务器，免 sudo，登录后常驻自启）
-bash scripts/install-service-macos.sh install \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com
+# 模式 A：当前用户 LaunchAgent（免 sudo，自动安装至 ~/.local/bin/volo 与 ~/Library/Application Support/Volo）
+./scripts/install-service.sh install --public-url https://blog.example.com
 
-# 模式 B：系统级 LaunchDaemon（开机无需用户登录即在后台启动，需 sudo）
-sudo bash scripts/install-service-macos.sh install --system \
-  --binary ./volo \
-  --listen-addr 127.0.0.1:8080 \
-  --public-url https://blog.example.com
+# 模式 B：系统级 LaunchDaemon（开机无需登录即后台启动）
+sudo ./scripts/install-service.sh install --system --public-url https://blog.example.com
 
-# 查看状态 / 平滑升级 / 卸载
-bash scripts/install-service-macos.sh status
-bash scripts/install-service-macos.sh upgrade --binary ./volo
-bash scripts/install-service-macos.sh uninstall
+# 零参数在线更新 / 状态 / 实时日志 / 卸载
+./scripts/install-service.sh upgrade
+./scripts/install-service.sh status
+./scripts/install-service.sh logs
+./scripts/install-service.sh uninstall
 ```
 
 ---
 
-## 4. Windows 系统服务安装（PowerShell）
+## 4. Windows 系统服务安装与更新（PowerShell）
 
-在管理员权限 PowerShell 中运行 [`scripts/install-service-windows.ps1`](../../scripts/install-service-windows.ps1)：
-- 若系统 PATH 中已安装 `nssm.exe`，自动注册为标准 Windows 服务（`SERVICE_AUTO_START`）；
-- 若未安装 `nssm.exe`，零依赖自动注册为 `NT AUTHORITY\NETWORK SERVICE` 最小权限开机自启计划任务（异常退出自动拉起），并通过 `icacls.exe` 锁死 `C:\ProgramData\Volo\volo.env` 的 NTFS 读取权限。
+在管理员权限 PowerShell 中运行 [`scripts/install-service.ps1`](../../scripts/install-service.ps1)（同时保留 `install-service-windows.ps1` 兼容入口）：
+- 本地存在 `volo.exe` 时自动采用本地二进制，否则自动从 GitHub Releases 下载并强制校验 `SHA256SUMS.txt`；
+- 若 PATH 中已安装 `nssm.exe` 自动注册标准 Windows 服务，否则零依赖注册为 `NT AUTHORITY\NetworkService` 最小权限开机自启计划任务，并通过 `icacls.exe` 锁死 `C:\ProgramData\Volo` 的 NTFS ACL。
 
 ```powershell
-# 预览安装步骤（DryRun）
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 `
-  -Action Install -BinaryPath .\volo.exe -DryRun
-
-# 正式安装并启动服务（默认监听 127.0.0.1:8080 供 IIS / Caddy / Nginx 反代）
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 `
+# 安装并启动自启服务（支持 -Version <tag>、-Mirror "https://ghfast.top"、-BinaryPath .\volo.exe、-DryRun）
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 `
   -Action Install `
-  -BinaryPath .\volo.exe `
-  -ListenAddr "127.0.0.1:8080" `
+  -HostAddr "127.0.0.1" -Port 8080 `
   -PublicUrl "https://blog.example.com" `
   -AdminPath "/studio-secret"
 
-# 查询状态 / 平滑升级 / 卸载
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 -Action Status
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 -Action Upgrade -BinaryPath .\volo.exe
-powershell -ExecutionPolicy Bypass -File .\scripts\install-service-windows.ps1 -Action Uninstall
+# 零附加参数一键在线升级（自动停服解锁、预检 volo.exe version、原子替换并保留 volo.env 与 data\）
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Upgrade
+
+# 状态查询 / 重启 / 卸载
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Status
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Restart
+powershell -ExecutionPolicy Bypass -File .\scripts\install-service.ps1 -Action Uninstall
 ```
 
 ---

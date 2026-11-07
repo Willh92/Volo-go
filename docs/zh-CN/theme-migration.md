@@ -66,7 +66,7 @@ Volo-go 采用纯 Go 标准库 `html/template` 构建零依赖、高性能的主
 }
 ```
 
-支持的字段类型：`text`、`textarea`、`url`、`color`、`boolean`、`number`、`select`。
+支持的字段类型：`text`、`textarea`、`url`、`color`、`boolean`、`number`、`select`、`sortable_list`（可勾选显隐并上下排序的多选列表，如 `header_nav_items`）。
 在模板中读取配置：
 - 字符串：`{{themeCfg .ThemeConfig "hero_notice" ""}}`
 - 布尔值：`{{if themeCfgBool .ThemeConfig "show_site_stats" true}}...{{end}}`

@@ -303,6 +303,19 @@
         kids + "</div></div>";
     }
 
+    var initialScrollPending = true;
+    function focusHashComment() {
+      var h = (window.location.hash || "").slice(1);
+      if (!h) return;
+      try { h = decodeURIComponent(h); } catch (_) {}
+      if (h === "comments") h = "volo-comments";
+      if (h !== "volo-comments" && h.indexOf("comment-") !== 0) return;
+      var node = document.getElementById(h);
+      if (!node) return;
+      if (window.__voloScrollToEl) window.__voloScrollToEl(node, h.indexOf("comment-") === 0);
+      else node.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+
     function refreshList() {
       fetch("/api/v1/comments?target_type=" + encodeURIComponent(tType) + "&target_id=" + encodeURIComponent(tID), { headers: headers(false) })
         .then(function (r) { return r.ok ? r.json() : null; })
@@ -315,6 +328,10 @@
             titleEl.textContent = L.title.replace(/\(\d+\)/, "(" + countTree(arr) + ")");
           }
           box.innerHTML = arr.length ? arr.map(renderItem).join("") : '<div class="vc-empty">' + esc(L.empty) + "</div>";
+          if (initialScrollPending) {
+            initialScrollPending = false;
+            requestAnimationFrame(focusHashComment);
+          }
         });
     }
 
@@ -759,6 +776,16 @@
       var cur = document.getElementById("volo-comments");
       if (cur && cur._closeOverlays) cur._closeOverlays();
     }
+  });
+
+  window.addEventListener("hashchange", function () {
+    var h = (window.location.hash || "").slice(1);
+    if (!h) return;
+    try { h = decodeURIComponent(h); } catch (_) {}
+    if (h === "comments") h = "volo-comments";
+    if (h !== "volo-comments" && h.indexOf("comment-") !== 0) return;
+    var node = document.getElementById(h);
+    if (node && window.__voloScrollToEl) window.__voloScrollToEl(node, h.indexOf("comment-") === 0);
   });
 
   window.VoloCommentWidget = { mount: mount };

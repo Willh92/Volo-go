@@ -526,21 +526,34 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 		jsArgs[i] = vm.ToValue(a)
 	}
 
+	var intMu sync.Mutex
+	finished := false
+	interruptVM := func(cause error) {
+		intMu.Lock()
+		if !finished {
+			vm.Interrupt(cause)
+		}
+		intMu.Unlock()
+	}
+
 	done := make(chan struct{})
 	timer := time.AfterFunc(timeout, func() {
-		vm.Interrupt(ErrExecutionTimeout)
+		interruptVM(ErrExecutionTimeout)
 	})
 	if ctx.Done() != nil {
 		go func() {
 			select {
 			case <-ctx.Done():
-				vm.Interrupt(ctx.Err())
+				interruptVM(ctx.Err())
 			case <-done:
 			}
 		}()
 	}
 	defer func() {
 		timer.Stop()
+		intMu.Lock()
+		finished = true
+		intMu.Unlock()
 		close(done)
 	}()
 

@@ -184,6 +184,29 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			}
 			return template.HTML(render.Default().Render(clean, render.Options{Mode: render.RenderModeWeb}).HTML)
 		},
+		"linkifyLicense": func(licenseText string, canonicalURL string) template.HTML {
+			clean := strings.TrimSpace(licenseText)
+			if clean == "" {
+				return ""
+			}
+			esc := html.EscapeString(clean)
+			esc = strings.ReplaceAll(esc, "\r\n", "\n")
+			esc = strings.ReplaceAll(esc, "\n", "<br>")
+			u := strings.TrimSpace(canonicalURL)
+			if u != "" {
+				lower := strings.ToLower(u)
+				if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "/") {
+					escURL := html.EscapeString(u)
+					link := `<a class="volo-license-link" href="` + escURL + `">` + escURL + `</a>`
+					if strings.Contains(esc, escURL) {
+						esc = strings.ReplaceAll(esc, escURL, link)
+					} else {
+						esc += `<div class="volo-license-url">` + link + `</div>`
+					}
+				}
+			}
+			return template.HTML(esc)
+		},
 		"safeCSS": func(s string) template.CSS {
 			return template.CSS(sanitizeStyleContent(s))
 		},

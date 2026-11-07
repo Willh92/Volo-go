@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { ComponentChildren, JSX } from "preact";
+import type { CSSProperties, ComponentChildren, JSX } from "preact";
 import { confirmSig, resolveConfirm } from "../api";
 import type { LocaleOption } from "../i18n";
 import { t } from "../i18n";
@@ -14,7 +14,7 @@ export interface ConsoleSelectProps {
   value: string;
   options: SelectOption[];
   onChange: (nextValue: string) => void;
-  style?: JSX.CSSProperties;
+  style?: CSSProperties;
   className?: string;
   disabled?: boolean;
   align?: "left" | "right";
@@ -358,6 +358,8 @@ export function AnimatedModal({
 }: AnimatedModalProps) {
   const [rendered, setRendered] = useState(open);
   const [closing, setClosing] = useState(false);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (open) {
@@ -374,18 +376,17 @@ export function AnimatedModal({
   }, [open]);
 
   useEffect(() => {
-    if (!rendered || closing) return;
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    if (!rendered) return;
+    acquireModalScrollLock();
     const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     document.addEventListener("keydown", onEsc);
     return () => {
-      document.body.style.overflow = prevOverflow;
       document.removeEventListener("keydown", onEsc);
+      releaseModalScrollLock();
     };
-  }, [rendered, closing, onClose]);
+  }, [rendered]);
 
   if (!rendered) return null;
 
@@ -887,6 +888,150 @@ export function Pagination({ total, page, pageSize = 15, onChange }: PaginationP
         >
           {t("ui.pg_next")}
         </button>
+      </div>
+    </div>
+  );
+}
+
+let modalLockCount = 0;
+let savedBodyOverflow = "";
+let savedBodyPaddingRight = "";
+
+function acquireModalScrollLock() {
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+  if (modalLockCount === 0) {
+    savedBodyOverflow = document.body.style.overflow;
+    savedBodyPaddingRight = document.body.style.paddingRight;
+    const sbw = Math.max(0, window.innerWidth - document.documentElement.clientWidth);
+    const hasGutter =
+      typeof CSS !== "undefined" &&
+      typeof CSS.supports === "function" &&
+      CSS.supports("scrollbar-gutter: stable");
+    if (sbw > 0 && !hasGutter) {
+      const basePad = parseFloat(window.getComputedStyle(document.body).paddingRight || "0") || 0;
+      document.body.style.paddingRight = `${basePad + sbw}px`;
+    }
+    document.body.style.overflow = "hidden";
+  }
+  modalLockCount += 1;
+}
+
+function releaseModalScrollLock() {
+  if (typeof document === "undefined" || modalLockCount <= 0) return;
+  modalLockCount -= 1;
+  if (modalLockCount === 0) {
+    document.body.style.overflow = savedBodyOverflow;
+    document.body.style.paddingRight = savedBodyPaddingRight;
+  }
+}
+
+export function TokenListInput({
+  values,
+  onChange,
+  placeholder,
+  uppercase = false,
+}: {
+  values: string[];
+  onChange: (next: string[]) => void;
+  placeholder?: string;
+  uppercase?: boolean;
+}) {
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const safeValues = Array.isArray(values) ? values.filter(Boolean) : [];
+
+  const commitTokens = (raw: string) => {
+    const parts = raw
+      .split(/[,，;；\r\n]+/)
+      .map((s) => (uppercase ? s.trim().toUpperCase() : s.trim()))
+      .filter(Boolean);
+    if (parts.length === 0) return;
+    const seen = new Set(safeValues.map((v) => (uppercase ? v.toUpperCase() : v)));
+    const next = [...safeValues];
+    for (const p of parts) {
+      const key = uppercase ? p.toUpperCase() : p;
+      if (!seen.has(key)) {
+        seen.add(key);
+        next.push(p);
+      }
+    }
+    onChange(next);
+  };
+
+  return (
+    <div>
+      {safeValues.length > 0 && (
+        <div class="volo-token-head">
+          <span>{t("ui.token_count", { count: safeValues.length })}</span>
+          <button
+            type="button"
+            class="volo-act-btn danger"
+            onClick={() => onChange([])}
+          >
+            {t("ui.token_clear")}
+          </button>
+        </div>
+      )}
+      <div
+        class="volo-tag-capsule-box volo-token-box"
+        onClick={() => inputRef.current?.focus()}
+      >
+        {safeValues.map((item, idx) => (
+          <span key={`${item}-${idx}`} class="volo-tag-pill">
+            <span>{item}</span>
+            <button
+              type="button"
+              aria-label="Remove"
+              onClick={(e) => {
+                e.stopPropagation();
+                onChange(safeValues.filter((_, i) => i !== idx));
+              }}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        <input
+          ref={inputRef}
+          type="text"
+          class="volo-tag-inline-input"
+          value={draft}
+          placeholder={placeholder || t("ui.token_placeholder")}
+          onInput={(e) => {
+            const val = (e.currentTarget as HTMLInputElement).value;
+            if (/[,，;；\n]/.test(val)) {
+              commitTokens(val);
+              setDraft("");
+            } else {
+              setDraft(val);
+            }
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              if (draft.trim()) {
+                e.preventDefault();
+                commitTokens(draft);
+                setDraft("");
+              }
+            } else if (e.key === "Backspace" && !draft && safeValues.length > 0) {
+              onChange(safeValues.slice(0, -1));
+            }
+          }}
+          onPaste={(e) => {
+            const text = e.clipboardData?.getData("text") || "";
+            if (/[,，;；\r\n]/.test(text)) {
+              e.preventDefault();
+              commitTokens(text);
+              setDraft("");
+            }
+          }}
+          onBlur={() => {
+            if (draft.trim()) {
+              commitTokens(draft);
+              setDraft("");
+            }
+          }}
+        />
       </div>
     </div>
   );

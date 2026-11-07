@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { Compartment, EditorState, RangeSetBuilder } from "@codemirror/state";
+import { Compartment, EditorState, Prec, RangeSetBuilder } from "@codemirror/state";
 import {
   Decoration,
   DecorationSet,
@@ -11,7 +11,7 @@ import {
   ViewUpdate,
 } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, redo, undo } from "@codemirror/commands";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdownKeymap, markdownLanguage, pasteURLAsLink } from "@codemirror/lang-markdown";
 import { apiFetch, showToast, storageDriverSig } from "../api";
 import { localeSig, t } from "../i18n";
 import { AnimatedModal, ConsoleSelect } from "./UIControls";
@@ -567,7 +567,9 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       extensions: [
         modeCompartment.current.of(modeExtensions(mode)),
         history(),
-        markdown(),
+        markdownLanguage,
+        Prec.high(keymap.of(markdownKeymap)),
+        pasteURLAsLink,
         EditorView.lineWrapping,
         phCompartment.current.of(placeholder(t("ed.placeholder"))),
         shortcutKeymap,

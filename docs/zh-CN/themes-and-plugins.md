@@ -67,6 +67,11 @@ themes/my-editorial/
 
 当前台开启无刷新平滑导航（PJAX）时，主内容容器局部替换，而挂载在 `public.footer` 或 `public.header` 且声明 `persist: true` 的节点会自动包裹在常驻岛容器中——**播客迷你播放器音频流不断流、互动挂件（如看板娘）动画与状态跨页不重载**。
 
+### 1.4 桌面/手机双主题分流与顶部导航编排能力（`sortable_list` + `.NavMenu`）
+
+- **桌面与手机独立主题设置**：管理台 **「外观与扩展 -> 主题皮肤」** 支持为桌面端（`active_theme`）与手机端（`mobile_theme`，留空则跟随桌面主题）分别启用不同主题，服务端按请求设备特征自动分流并输出 `Vary: User-Agent, Sec-CH-UA-Mobile`；管理员可通过 `/?skin=<id>` 与 `/?skin=<id>&device=mobile` 免切换实时预览。
+- **主题级顶部菜单显隐、排序与溢出收纳**：主题可在 `theme.json` 的 `config_schema` 中声明 `"type": "sortable_list"`（如内置 `volo-studio` 与外部 `volo-journal` 的 `header_nav_items` + `header_nav_primary_count`），允许站长自由勾选并拖拽/调整内置栏目（`home`、`archives`、`tags`、`categories`、`series`、`books`、`links`、`follows`、`dynamic`）及自定义导航插槽（`custom`，自动展开后台自定义的导航链接且默认排在末尾）。模板直接读取 `PageContext.NavMenu`（含 `.NavMenu.Primary` 顶栏直出项、`.NavMenu.Overflow` “更多”收纳项与 `.NavMenu.OverflowActive` 高亮态）即可渲染自适应导航栏。
+
 ---
 
 ## 2. 安全沙箱插件开发（`manifest.json` + `goja`）

@@ -56,7 +56,7 @@ Themes can declare custom settings in `theme.json` without any database schema c
 }
 ```
 
-Supported field types: `text`, `textarea`, `url`, `color`, `boolean`, `number`, `select`.
+Supported field types: `text`, `textarea`, `url`, `color`, `boolean`, `number`, `select`, `sortable_list` (checkable and reorderable option list, e.g. `header_nav_items` driving `.NavMenu.Primary` / `.NavMenu.Overflow`).
 Read theme config values inside templates with `{{themeCfg .ThemeConfig "hero_notice" ""}}`, `{{themeCfgBool .ThemeConfig "show_site_stats" true}}`, and `{{themeCfgInt .ThemeConfig "recent_count" 6}}`.
 
 ---

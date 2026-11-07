@@ -363,8 +363,11 @@ func TestCapabilitySandboxAndSSRFFirewall(t *testing.T) {
 			Blocked bool   `json:"blocked"`
 			Error   string `json:"error"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&out)
+		decErr := json.NewDecoder(r.Body).Decode(&out)
 		r.Body.Close()
+		if r.StatusCode != http.StatusOK || decErr != nil {
+			t.Fatalf("fetch %s: unexpected status=%d decodeErr=%v", target, r.StatusCode, decErr)
+		}
 		if !out.Blocked {
 			t.Fatalf("SSRF breach: target %q was NOT blocked!", target)
 		}

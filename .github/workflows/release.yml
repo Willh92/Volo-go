@@ -15,10 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "npm"
@@ -31,7 +31,7 @@ jobs:
           npm run build
 
       - name: Upload Built Admin Dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: admin-dist
           path: internal/adminui/dist
@@ -67,16 +67,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download Built Admin Dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: admin-dist
           path: internal/adminui/dist
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -104,7 +104,8 @@ jobs:
           fi
 
           cp .env.example README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md docker-compose.yml "dist/${STAGE}/"
-          cp scripts/install-service-linux.sh scripts/install-service-macos.sh scripts/install-service-windows.ps1 "dist/${STAGE}/scripts/"
+          cp scripts/install-service.sh scripts/install-service.ps1 scripts/install-service-linux.sh scripts/install-service-macos.sh scripts/install-service-windows.ps1 "dist/${STAGE}/scripts/"
+          chmod +x "dist/${STAGE}/scripts/"*.sh
           cp -r deploy "dist/${STAGE}/deploy"
           cp -r docs "dist/${STAGE}/docs"
           cp -r locales "dist/${STAGE}/locales"
@@ -116,15 +117,18 @@ jobs:
           fi
 
           cd dist
+          STABLE="volo-${GOOS}-${GOARCH}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             zip -rq "${STAGE}.zip" "${STAGE}"
+            cp "${STAGE}.zip" "${STABLE}.zip"
           else
             tar -czf "${STAGE}.tar.gz" "${STAGE}"
+            cp "${STAGE}.tar.gz" "${STABLE}.tar.gz"
           fi
           rm -rf "${STAGE}"
 
       - name: Upload Target Archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
@@ -135,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download All Target Archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: bin-*
           path: release-assets
@@ -157,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -174,7 +178,7 @@ jobs:
 
       - name: Extract Docker Metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           labels: |
@@ -185,7 +189,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and Push Multi-Arch Image (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
