@@ -181,7 +181,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and Push Multi-Arch Image (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
