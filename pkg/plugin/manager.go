@@ -272,6 +272,7 @@ type Manager struct {
 	hookTimeout           time.Duration
 	routeTimeout          time.Duration
 	cronTimeout           time.Duration
+	cronBaseUnit          time.Duration
 	maxFailures           int
 	customResolver        security.ResolverFunc
 	allowLoopbackForTests bool
@@ -318,6 +319,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		hookTimeout:           hookTimeout,
 		routeTimeout:          routeTimeout,
 		cronTimeout:           cronTimeout,
+		cronBaseUnit:          time.Second,
 		maxFailures:           maxFailures,
 		customResolver:        opts.CustomResolver,
 		allowLoopbackForTests: opts.AllowLoopbackForTests,
@@ -506,7 +508,11 @@ func (m *Manager) ReloadPlugin(ctx context.Context, pluginID string, locale stri
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
 
-	if mp.enabled && mp.circuitState == CircuitClosed {
+	mp.mu.Lock()
+	shouldActivate := mp.enabled && mp.circuitState == CircuitClosed
+	mp.mu.Unlock()
+
+	if shouldActivate {
 		if aErr := m.activateRuntime(ctx, mp); aErr != nil {
 			m.recordFailure(ctx, mp, "reload", aErr)
 			return m.toSummary(mp, locale), aErr
@@ -647,9 +653,22 @@ func (m *Manager) openSecretsLenient(pluginID string, ciphertext string) map[str
 
 func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error {
 	mp.mu.Lock()
+	prevCancel := mp.cronCancel
+	mp.cronCancel = nil
+	mp.mu.Unlock()
+
+	if prevCancel != nil {
+		prevCancel()
+	}
+	mp.cronWG.Wait()
+
+	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	m.stopCronLocked(mp)
+	if mp.cronCancel != nil {
+		mp.cronCancel()
+		mp.cronCancel = nil
+	}
 	m.providers.DetachPlugin(mp.manifest.ID)
 
 	if mp.manifest.Runtime == RuntimeBuiltin {
@@ -724,17 +743,35 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 }
 
 func (m *Manager) deactivateRuntime(ctx context.Context, mp *managedPlugin) {
+	m.deactivateRuntimeOpts(ctx, mp, true)
+}
+
+func (m *Manager) deactivateRuntimeOpts(ctx context.Context, mp *managedPlugin, waitCron bool) {
 	mp.mu.Lock()
-	defer mp.mu.Unlock()
+	cancel := mp.cronCancel
+	mp.cronCancel = nil
+	mp.mu.Unlock()
 
-	m.stopCronLocked(mp)
+	if cancel != nil {
+		cancel()
+	}
+	// Never call mp.cronWG.Wait() while holding mp.mu.Lock() or from inside a cron goroutine itself!
+	if waitCron {
+		mp.cronWG.Wait()
+	}
+
+	mp.mu.Lock()
 	m.providers.DetachPlugin(mp.manifest.ID)
+	runtimeKind := mp.manifest.Runtime
+	builtin := mp.builtin
+	rt := mp.gojaRT
+	mp.gojaRT = nil
+	mp.mu.Unlock()
 
-	if mp.manifest.Runtime == RuntimeBuiltin && mp.builtin != nil {
-		_ = mp.builtin.OnDisable(ctx)
-	} else if mp.gojaRT != nil {
-		_, _, _ = mp.gojaRT.invoke(ctx, m.hookTimeout, "onDisable")
-		mp.gojaRT = nil
+	if runtimeKind == RuntimeBuiltin && builtin != nil {
+		_ = builtin.OnDisable(ctx)
+	} else if rt != nil {
+		_, _, _ = rt.invoke(ctx, m.hookTimeout, "onDisable")
 	}
 	m.logger.Write(mp.manifest.ID, "info", "lifecycle", "plugin disabled")
 }
@@ -745,10 +782,17 @@ func (m *Manager) startCronLocked(mp *managedPlugin) {
 	}
 	cronCtx, cancel := context.WithCancel(context.Background())
 	mp.cronCancel = cancel
+	unit := m.cronBaseUnit
+	if unit <= 0 {
+		unit = time.Second
+	}
 
 	for _, spec := range mp.manifest.Cron {
 		job := spec
-		interval := time.Duration(job.IntervalSeconds) * time.Second
+		interval := time.Duration(job.IntervalSeconds) * unit
+		if interval <= 0 {
+			interval = time.Second
+		}
 		mp.cronWG.Add(1)
 		go func() {
 			defer mp.cronWG.Done()
@@ -763,7 +807,7 @@ func (m *Manager) startCronLocked(mp *managedPlugin) {
 					err := m.runSingleCron(runCtx, mp, job.Handler)
 					runCancel()
 					if err != nil && !errors.Is(err, context.Canceled) {
-						m.recordFailure(context.Background(), mp, "cron:"+job.Name, err)
+						m.recordFailureWithOrigin(context.Background(), mp, "cron:"+job.Name, err, true)
 					} else if err == nil {
 						m.recordSuccess(context.Background(), mp)
 					}
@@ -771,14 +815,6 @@ func (m *Manager) startCronLocked(mp *managedPlugin) {
 			}
 		}()
 	}
-}
-
-func (m *Manager) stopCronLocked(mp *managedPlugin) {
-	if mp.cronCancel != nil {
-		mp.cronCancel()
-		mp.cronCancel = nil
-	}
-	mp.cronWG.Wait()
 }
 
 func (m *Manager) runSingleCron(ctx context.Context, mp *managedPlugin, handler string) error {
@@ -1515,8 +1551,16 @@ func (m *Manager) servePluginAPI(w http.ResponseWriter, r *http.Request, mp *man
 		http.NotFound(w, r)
 		return
 	}
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 256*1024))
+	r.Body = http.MaxBytesReader(w, r.Body, 256*1024)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":"request body too large"}`))
+			return
+		}
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -1548,15 +1592,27 @@ func (m *Manager) servePluginAPI(w http.ResponseWriter, r *http.Request, mp *man
 		IsAdmin:        isAdmin,
 	}
 
+	mp.mu.Lock()
+	enabled := mp.enabled && mp.circuitState == CircuitClosed
+	runtimeKind := mp.manifest.Runtime
+	bp := mp.builtin
+	rt := mp.gojaRT
+	mp.mu.Unlock()
+
+	if !enabled {
+		http.NotFound(w, r)
+		return
+	}
+
 	reqCtx, cancel := context.WithTimeout(r.Context(), m.routeTimeout)
 	defer cancel()
 
 	var resp APIResponse
 	var invokeErr error
-	if mp.manifest.Runtime == RuntimeBuiltin && mp.builtin != nil {
-		resp, invokeErr = mp.builtin.ServeAPI(reqCtx, apiReq)
-	} else if mp.gojaRT != nil {
-		raw, found, iErr := mp.gojaRT.invoke(reqCtx, m.routeTimeout, "onRequest", apiReq)
+	if runtimeKind == RuntimeBuiltin && bp != nil {
+		resp, invokeErr = bp.ServeAPI(reqCtx, apiReq)
+	} else if rt != nil {
+		raw, found, iErr := rt.invoke(reqCtx, m.routeTimeout, "onRequest", apiReq)
 		if iErr != nil {
 			invokeErr = iErr
 		} else if !found {
@@ -1697,6 +1753,10 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 }
 
 func (m *Manager) recordFailure(ctx context.Context, mp *managedPlugin, stage string, err error) {
+	m.recordFailureWithOrigin(ctx, mp, stage, err, false)
+}
+
+func (m *Manager) recordFailureWithOrigin(ctx context.Context, mp *managedPlugin, stage string, err error, fromCron bool) {
 	now := time.Now().Unix()
 	errMsg := err.Error()
 
@@ -1718,7 +1778,7 @@ func (m *Manager) recordFailure(ctx context.Context, mp *managedPlugin, stage st
 	m.logger.Write(mp.manifest.ID, "error", stage, fmt.Sprintf("failure #%d: %s", count, errMsg))
 
 	if tripped {
-		m.deactivateRuntime(ctx, mp)
+		m.deactivateRuntimeOpts(ctx, mp, !fromCron)
 		m.logger.Write(mp.manifest.ID, "error", "circuit", fmt.Sprintf("CIRCUIT_OPEN after %d consecutive failures; plugin auto-disabled", count))
 	}
 
@@ -1746,6 +1806,14 @@ func (m *Manager) recordSuccess(ctx context.Context, mp *managedPlugin) {
 		`UPDATE plugins SET failure_count = 0, last_error = '', updated_at = ? WHERE id = ?`,
 		now, mp.manifest.ID,
 	)
+}
+
+// PurgeExpiredKV deletes expired plugin_kv rows across all plugins.
+func (m *Manager) PurgeExpiredKV(ctx context.Context) (int64, error) {
+	if m == nil || m.store == nil {
+		return 0, nil
+	}
+	return PurgeExpiredKV(ctx, m.store, time.Now().Unix())
 }
 
 // Close gracefully stops all plugin background cron jobs and detaches runtimes.
@@ -1777,21 +1845,24 @@ func (m *Manager) getPlugin(pluginID string) (*managedPlugin, bool) {
 
 func (m *Manager) snapshotEnabledPlugins() []*managedPlugin {
 	m.mu.RLock()
-	ids := make([]string, 0, len(m.plugins))
-	for idKey, mp := range m.plugins {
+	candidates := make([]*managedPlugin, 0, len(m.plugins))
+	for _, mp := range m.plugins {
+		candidates = append(candidates, mp)
+	}
+	m.mu.RUnlock()
+
+	out := make([]*managedPlugin, 0, len(candidates))
+	for _, mp := range candidates {
 		mp.mu.Lock()
 		active := mp.enabled && mp.circuitState == CircuitClosed
 		mp.mu.Unlock()
 		if active {
-			ids = append(ids, idKey)
+			out = append(out, mp)
 		}
 	}
-	sort.Strings(ids)
-	out := make([]*managedPlugin, 0, len(ids))
-	for _, idKey := range ids {
-		out = append(out, m.plugins[idKey])
-	}
-	m.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].manifest.ID < out[j].manifest.ID
+	})
 	return out
 }
 

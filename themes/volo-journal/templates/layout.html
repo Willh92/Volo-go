@@ -4,7 +4,6 @@
       data-default-mode="{{.Appearance.DefaultMode}}"
       data-accent="{{.Appearance.Accent}}"
       data-pjax="{{if .EnablePJAX}}true{{else}}false{{end}}"
-      data-cdn-prefix="{{.Reading.AssetCDNPrefix}}"
       data-i18n-copy="{{t .Locale "article.copy_code"}}"
       data-i18n-copied="{{t .Locale "article.copied_code"}}">
 <head>
@@ -68,11 +67,13 @@
       </a>
 
       <nav class="studio-nav" aria-label="Primary">
-        {{range .NavMenu.Primary}}
-          <a class="studio-nav__link {{if .IsActive}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
-            {{if .Icon}}{{navIconHTML .Icon}}{{end}}<span>{{.Title}}</span>
-          </a>
-        {{end}}
+        <div class="studio-nav__track">
+          {{range .NavMenu.Primary}}
+            <a class="studio-nav__link {{if .IsActive}}is-active{{end}}" href="{{.URL}}" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
+              {{if .Icon}}{{navIconHTML .Icon}}{{end}}<span>{{.Title}}</span>
+            </a>
+          {{end}}
+        </div>
 
         {{$hasMobileAuth := or (ne .Viewer nil) .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
         {{if or .NavMenu.Overflow $hasMobileAuth}}
@@ -101,7 +102,7 @@
                 {{end}}
               {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
                 {{if .NavMenu.Overflow}}<div class="volo-appearance__divider studio-only-mobile"></div>{{end}}
-                <a class="studio-nav-more__item studio-only-mobile" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><span>{{t .Locale "nav.login"}}</span></a>
+                <a class="studio-nav-more__item studio-only-mobile" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><svg class="studio-nav-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span>{{t .Locale "nav.login"}}</span></a>
               {{end}}
             </div>
           </div>
@@ -208,8 +209,8 @@
             </form>
           {{end}}
         {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
-          <a class="studio-icon-btn studio-auth-btn" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}}>
-            <span class="studio-auth-btn__label">{{t .Locale "nav.login"}}</span>
+          <a class="studio-icon-btn studio-auth-btn" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" title="{{t .Locale "nav.login"}}" aria-label="{{t .Locale "nav.login"}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span class="studio-auth-btn__label">{{t .Locale "nav.login"}}</span>
           </a>
         {{end}}
       </div>
@@ -271,8 +272,8 @@
         <button type="button" class="volo-search-esc" data-search-close>ESC</button>
       </div>
       <div id="volo-search-filters" class="volo-search-filters" hidden>
-        {{range .SidebarCategories}}<button type="button" class="volo-filter-pill" data-seed-cat="{{.Name}}">📁 {{.Name}}</button>{{end}}
-        {{range .SidebarTags}}<button type="button" class="volo-filter-pill" data-seed-tag="{{.Name}}"># {{.Name}}</button>{{end}}
+        {{range $i, $c := .SidebarCategories}}{{if lt $i 8}}<button type="button" class="volo-filter-pill" data-seed-cat="{{$c.Name}}">📁 {{$c.Name}}</button>{{end}}{{end}}
+        {{range $i, $tag := .SidebarTags}}{{if lt $i 12}}<button type="button" class="volo-filter-pill" data-seed-tag="{{$tag.Name}}"># {{$tag.Name}}</button>{{end}}{{end}}
       </div>
       <div id="volo-search-results" class="volo-search-results" role="listbox"></div>
       <div class="volo-search-foot">

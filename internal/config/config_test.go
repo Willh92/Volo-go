@@ -146,3 +146,79 @@ func TestSocketAdminPathAndTrustedProxiesValidation(t *testing.T) {
 		t.Fatal("expected 10.24.1.9 to match 10.0.0.0/8")
 	}
 }
+
+func TestAADHelpersOpenStringFallbackAndThreadSafeConfig(t *testing.T) {
+	if got := ArticlePasswordAAD("a1"); got != "articles.password:a1" {
+		t.Fatalf("ArticlePasswordAAD = %q", got)
+	}
+	if got := WebhookSecretAAD("w1"); got != "webhook:w1" {
+		t.Fatalf("WebhookSecretAAD = %q", got)
+	}
+	if got := CommentNotifyEmailAAD("c1"); got != "comments.notify_email:c1" {
+		t.Fatalf("CommentNotifyEmailAAD = %q", got)
+	}
+
+	tmpDir := t.TempDir()
+	kr, _, err := LoadOrInitKeyRing("my-super-strong-volo-secret-key-2026", tmpDir)
+	if err != nil {
+		t.Fatalf("LoadOrInitKeyRing: %v", err)
+	}
+
+	// Primary AAD match
+	ctPrimary, err := kr.SealString("art-pass", ArticlePasswordAAD("42"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, err := kr.OpenStringFallback(ctPrimary, ArticlePasswordAAD("42"), "articles:password:42")
+	if err != nil || pt != "art-pass" {
+		t.Fatalf("primary fallback open failed: pt=%q err=%v", pt, err)
+	}
+
+	// Legacy fallback AAD match
+	ctLegacyComment, err := kr.SealString("reader@example.com", "comment:email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt2, err := kr.OpenStringFallback(ctLegacyComment, CommentNotifyEmailAAD("c99"), "comments:email:c99", "comment:email")
+	if err != nil || pt2 != "reader@example.com" {
+		t.Fatalf("legacy fallback open failed: pt=%q err=%v", pt2, err)
+	}
+
+	// Wrong AAD must still fail closed
+	if _, err := kr.OpenStringFallback(ctPrimary, ArticlePasswordAAD("999"), "articles:password:999"); err == nil {
+		t.Fatal("expected wrong AAD across all fallbacks to fail")
+	}
+	if empty, err := kr.OpenStringFallback("", ArticlePasswordAAD("1")); err != nil || empty != "" {
+		t.Fatalf("expected empty ciphertext to return empty nil, got %q %v", empty, err)
+	}
+
+	cfg, err := LoadWithEnviron(CLIOverrides{
+		EnvFile: filepath.Join(tmpDir, "missing.env"),
+		DataDir: &tmpDir,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			cfg.SetPublicURL("https://blog.example.com/")
+			cfg.SetDBSpec("postgresql", "postgres://u:p@127.0.0.1:5432/volo", true)
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		_ = cfg.GetPublicURL()
+		_, _, _ = cfg.GetDBSpec()
+	}
+	<-done
+
+	if got := cfg.GetPublicURL(); got != "https://blog.example.com" {
+		t.Fatalf("GetPublicURL = %q, want https://blog.example.com", got)
+	}
+	drv, dsn, simple := cfg.GetDBSpec()
+	if drv != "postgres" || dsn != "postgres://u:p@127.0.0.1:5432/volo" || !simple {
+		t.Fatalf("unexpected GetDBSpec: drv=%q dsn=%q simple=%v", drv, dsn, simple)
+	}
+}

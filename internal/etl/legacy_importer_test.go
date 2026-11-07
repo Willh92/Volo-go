@@ -137,6 +137,9 @@ func TestImportLegacyBoloSolo15TableArchiveStreamingAndZeroDeadLinks(t *testing.
 	if art2.PasswordCiphertext == "" || strings.Contains(art2.PasswordCiphertext, "s3cr3t-pass") || !art2.HasContentLock {
 		t.Fatalf("expected encrypted password_ciphertext + has_content_lock on art_102, got %+v", art2)
 	}
+	if openedPass, err := kr.OpenString(art2.PasswordCiphertext, config.ArticlePasswordAAD("art_102")); err != nil || openedPass != "s3cr3t-pass" {
+		t.Fatalf("failed to decrypt art_102 password ciphertext: %v / %q", err, openedPass)
+	}
 
 	// Assert out-of-order chunked voloSeries (.0, .1, .10, .2, ..., .11) reassembled without corruption!
 	ser, err := sqlx.Get[domain.Series](ctx, store, `SELECT * FROM series WHERE id = ?`, "ser_go_deep")
@@ -165,7 +168,7 @@ func TestImportLegacyBoloSolo15TableArchiveStreamingAndZeroDeadLinks(t *testing.
 	if strings.Contains(wh.SecretCiphertext, "my-webhook-hmac-secret") {
 		t.Fatal("webhook secret was stored in plaintext instead of AES-256-GCM ciphertext!")
 	}
-	openedSecret, err := kr.OpenString(wh.SecretCiphertext, "webhooks:secret:wh_ops")
+	openedSecret, err := kr.OpenString(wh.SecretCiphertext, config.WebhookSecretAAD("wh_ops"))
 	if err != nil || openedSecret != "my-webhook-hmac-secret" {
 		t.Fatalf("failed to decrypt webhook secret ciphertext: %v / %q", err, openedSecret)
 	}
@@ -175,7 +178,7 @@ func TestImportLegacyBoloSolo15TableArchiveStreamingAndZeroDeadLinks(t *testing.
 	if err != nil {
 		t.Fatalf("load cmt_1: %v", err)
 	}
-	openedEmail, err := kr.OpenString(cmt1.NotifyEmailCiphertext, "comments:email:cmt_1")
+	openedEmail, err := kr.OpenString(cmt1.NotifyEmailCiphertext, config.CommentNotifyEmailAAD("cmt_1"))
 	if err != nil || openedEmail != "reader_backfill@example.com" || cmt1.IPMasked != "203.0.*.*" {
 		t.Fatalf("expected backfilled encrypted email and masked IP on cmt_1, got err=%v email=%q ip=%q", err, openedEmail, cmt1.IPMasked)
 	}
@@ -753,4 +756,3 @@ func TestImportLegacyArchiveURLRewriteMediaExtractAndOverrides(t *testing.T) {
 		t.Fatalf("expected admin avatar URL rewritten to .../uploads/banner.png, got %q", admin.AvatarURL)
 	}
 }
-

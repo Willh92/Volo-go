@@ -15,6 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/Willh92/Volo-go/internal/adminui"
 	"github.com/Willh92/Volo-go/internal/auth"
 	"github.com/Willh92/Volo-go/internal/config"
@@ -131,11 +134,16 @@ func extractSetupSQLTargets(driver, dsn string) ([]struct {
 	port int
 }, error) {
 	lower := strings.ToLower(dsn)
+	unescapedLower := lower
+	if u, uErr := url.QueryUnescape(dsn); uErr == nil {
+		unescapedLower = strings.ToLower(u)
+	}
 	for _, bad := range []string{
-		"allowallfiles", "allowurlinlocalinfile", "allowlocalinfile", "infile",
-		"unix(", "host=/", "passfile=", "service=", "sslrootcert=", "sslcert=", "sslkey=",
+		"allowallfiles", "allowurlinlocalinfile", "allowlocalinfile", "localinfile", "infile",
+		"unix(", "host=/", "passfile", "service=", "servicefile",
+		"sslrootcert", "sslcert", "sslkey", "sslpassword", "serverpubkey",
 	} {
-		if strings.Contains(lower, bad) {
+		if strings.Contains(lower, bad) || strings.Contains(unescapedLower, bad) {
 			return nil, fmt.Errorf("forbidden database DSN parameter %q", strings.Trim(bad, "=(/"))
 		}
 	}
@@ -163,6 +171,10 @@ func extractSetupSQLTargets(driver, dsn string) ([]struct {
 		} else if strings.Count(raw, ":") == 1 {
 			return fmt.Errorf("invalid database host:port %q", raw)
 		}
+		h = strings.Trim(strings.TrimSpace(h), "[]")
+		if h == "" {
+			return fmt.Errorf("missing database host")
+		}
 		if strings.HasPrefix(h, "/") {
 			return fmt.Errorf("unix socket database paths are not permitted")
 		}
@@ -175,89 +187,67 @@ func extractSetupSQLTargets(driver, dsn string) ([]struct {
 
 	switch driver {
 	case "postgres":
-		if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
-			u, err := url.Parse(dsn)
-			if err != nil {
-				return nil, fmt.Errorf("invalid postgres URL")
-			}
-			if qh := strings.TrimSpace(u.Query().Get("host")); qh != "" {
-				if strings.HasPrefix(qh, "/") {
-					return nil, fmt.Errorf("unix socket database paths are not permitted")
-				}
-				for _, item := range strings.Split(qh, ",") {
-					if err := addHostPort(item, 5432); err != nil {
-						return nil, err
-					}
-				}
-			}
-			if strings.TrimSpace(u.Host) != "" {
-				for _, item := range strings.Split(u.Host, ",") {
-					if err := addHostPort(item, 5432); err != nil {
-						return nil, err
-					}
-				}
-			}
-			if len(out) == 0 {
-				return nil, fmt.Errorf("missing postgres host")
-			}
-			return out, nil
+		pgCfg, err := pgconn.ParseConfig(dsn)
+		if err != nil {
+			return nil, fmt.Errorf("invalid postgres DSN: %w", err)
 		}
-		hostVal := ""
-		portVal := 5432
-		for _, tok := range strings.Fields(dsn) {
-			kv := strings.SplitN(tok, "=", 2)
-			if len(kv) != 2 {
-				continue
-			}
-			k := strings.ToLower(strings.TrimSpace(kv[0]))
-			v := strings.Trim(strings.TrimSpace(kv[1]), `"'`)
-			switch k {
-			case "host", "hostaddr":
-				hostVal = v
-			case "port":
-				if p, err := strconv.Atoi(v); err == nil {
-					portVal = p
-				} else {
-					return nil, fmt.Errorf("invalid postgres port %q", v)
-				}
-			}
+		primaryHost := strings.TrimSpace(pgCfg.Host)
+		if primaryHost == "" || strings.HasPrefix(primaryHost, "/") {
+			return nil, fmt.Errorf("postgres DSN requires an explicit TCP host (unix sockets are forbidden)")
 		}
-		if hostVal == "" {
-			return nil, fmt.Errorf("missing postgres host")
+		primaryPort := int(pgCfg.Port)
+		if primaryPort <= 0 {
+			primaryPort = 5432
 		}
-		for _, h := range strings.Split(hostVal, ",") {
-			h = strings.TrimSpace(h)
-			if strings.HasPrefix(h, "/") {
-				return nil, fmt.Errorf("unix socket database paths are not permitted")
+		out = append(out, struct {
+			host string
+			port int
+		}{host: primaryHost, port: primaryPort})
+		for _, fb := range pgCfg.Fallbacks {
+			fbHost := strings.TrimSpace(fb.Host)
+			if fbHost == "" || strings.HasPrefix(fbHost, "/") {
+				return nil, fmt.Errorf("postgres fallback unix socket database paths are not permitted")
+			}
+			fbPort := int(fb.Port)
+			if fbPort <= 0 {
+				fbPort = primaryPort
 			}
 			out = append(out, struct {
 				host string
 				port int
-			}{host: h, port: portVal})
+			}{host: fbHost, port: fbPort})
 		}
 		return out, nil
 
 	case "mysql":
-		rest := dsn
-		if at := strings.LastIndex(rest, "@"); at >= 0 {
-			rest = rest[at+1:]
+		myCfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			return nil, fmt.Errorf("invalid mysql DSN: %w", err)
 		}
-		slash := strings.IndexByte(rest, '/')
-		if slash < 0 {
-			return nil, fmt.Errorf("invalid mysql DSN: missing '/dbname'")
+		if myCfg.AllowAllFiles {
+			return nil, fmt.Errorf("forbidden mysql DSN parameter AllowAllFiles")
 		}
-		netPart := strings.TrimSpace(rest[:slash])
-		if netPart == "" {
-			if err := addHostPort("127.0.0.1:3306", 3306); err != nil {
-				return nil, err
-			}
-			return out, nil
+		if myCfg.AllowOldPasswords {
+			return nil, fmt.Errorf("forbidden mysql DSN parameter AllowOldPasswords")
 		}
-		if !strings.HasPrefix(strings.ToLower(netPart), "tcp(") || !strings.HasSuffix(netPart, ")") {
+		if strings.TrimSpace(myCfg.ServerPubKey) != "" {
+			return nil, fmt.Errorf("forbidden mysql DSN parameter ServerPubKey")
+		}
+		if strings.ToLower(strings.TrimSpace(myCfg.Net)) != "tcp" {
 			return nil, fmt.Errorf("mysql DSN must use tcp(host:port)")
 		}
-		addr := netPart[4 : len(netPart)-1]
-		if err := addHostPort(addr, 3306); err != nil {
+		switch strings.ToLower(strings.TrimSpace(myCfg.TLSConfig)) {
+		case "", "true", "false", "skip-verify", "preferred":
+		default:
+			return nil, fmt.Errorf("unsupported custom mysql tls profile %q", myCfg.TLSConfig)
+		}
+		for k := range myCfg.Params {
+			kl := strings.ToLower(strings.TrimSpace(k))
+			if strings.Contains(kl, "infile") || strings.Contains(kl, "allow") {
+				return nil, fmt.Errorf("forbidden mysql DSN query parameter %q", k)
+			}
+		}
+		if err := addHostPort(myCfg.Addr, 3306); err != nil {
 			return nil, err
 		}
 		return out, nil
@@ -451,10 +441,44 @@ func (s *AppServer) applySetupDatabaseSelection(ctx context.Context, rawDriver, 
 	s.deps.Config.DBDSN = dsn
 	s.deps.Config.DBSimpleProtocol = simpleProto
 	s.deps.Store.Swap(newStore)
+	if s.deps.Content != nil {
+		s.deps.Content.ResetAnalyticsBuffer()
+	}
 	if _, err := s.deps.Settings.Reload(ctx); err != nil {
 		return err
 	}
+	s.reloadRuntimeAfterDBRestore(ctx)
 	return nil
+}
+
+// reloadRuntimeAfterDBRestore resets buffered analytics and reloads settings, WAF bans, GeoIP rules,
+// themes, external plugins, media dimensions, and public content/search caches after any DB swap or restore.
+func (s *AppServer) reloadRuntimeAfterDBRestore(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	if s.deps.Content != nil {
+		s.deps.Content.ResetAnalyticsBuffer()
+	}
+	if s.deps.Settings != nil {
+		_, _ = s.deps.Settings.Reload(ctx)
+	}
+	if s.deps.WAF != nil {
+		_ = s.deps.WAF.ReloadBans(ctx)
+	}
+	if s.deps.Geo != nil {
+		_ = s.deps.Geo.ReloadRules(ctx, s.deps.Store)
+	}
+	if s.deps.Themes != nil {
+		_ = s.deps.Themes.Reload()
+	}
+	if s.deps.Plugins != nil {
+		_ = s.deps.Plugins.DiscoverAndStart(ctx)
+	}
+	if s.deps.Content != nil {
+		_ = s.deps.Content.RefreshMediaDimsCache(ctx)
+		_ = s.deps.Content.WarmCaches(ctx)
+	}
 }
 
 // isSetupUnlocked reports whether the first-boot Setup Wizard is still unlocked.
@@ -626,13 +650,7 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 	}
 	_, _ = s.deps.Settings.Reload(r.Context())
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
-	_ = s.deps.Content.WarmCaches(r.Context())
-	if s.deps.WAF != nil {
-		_ = s.deps.WAF.ReloadBans(r.Context())
-	}
-	if s.deps.Geo != nil {
-		_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-	}
+	s.reloadRuntimeAfterDBRestore(r.Context())
 
 	resp := map[string]any{
 		"ok":             true,
@@ -999,7 +1017,7 @@ func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Requ
 	if ext != ".zip" && ext != ".json" {
 		ext = ".zip"
 	}
-	tmpFile, err := os.CreateTemp(s.deps.Config.DataDir, "volo-legacy-*"+ext)
+	tmpFile, err := os.CreateTemp(s.ensureTempDir(), "volo-legacy-*"+ext)
 	if err != nil {
 		return nil, dryRun, "", err
 	}

@@ -2,7 +2,12 @@
 set -euo pipefail
 
 # ==============================================================================
-# Volo-go Binary Size (< 20 MiB), Static Linkage & Idle RSS (< 35 MiB) Verifier
+# Volo-go Binary Size & Idle RSS Restraint Verifier
+# Policy: Treat default thresholds (< 20 MiB binary, < 35 MiB idle RSS) as
+# engineering restraint targets. When approaching or exceeding them, prioritize
+# architectural/algorithmic optimization or lighter alternatives first; relax
+# thresholds (or override via VOLO_BUDGET_BIN_MB / VOLO_BUDGET_RSS_MB) only when
+# core user requirements still genuinely require extra headroom.
 # ==============================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,8 +15,10 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/volo-budget-XXXXXX")"
 trap 'if [[ -n "${SERVER_PID:-}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then kill -TERM "${SERVER_PID}" 2>/dev/null || true; wait "${SERVER_PID}" 2>/dev/null || true; fi; rm -rf "${WORK_DIR}"' EXIT
 
 BIN_PATH="${WORK_DIR}/volo"
-MAX_BIN_BYTES=$((20 * 1024 * 1024)) # 20 MiB
-MAX_RSS_KB=$((35 * 1024))           # 35 MiB (35840 KiB)
+BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-20}"
+BUDGET_RSS_MB="${VOLO_BUDGET_RSS_MB:-35}"
+MAX_BIN_BYTES=$((BUDGET_BIN_MB * 1024 * 1024))
+MAX_RSS_KB=$((BUDGET_RSS_MB * 1024))
 PORT="${VOLO_BUDGET_PORT:-18991}"
 
 echo "[1/4] Building pure-Go static binary (CGO_ENABLED=0)..."
@@ -19,16 +26,18 @@ echo "[1/4] Building pure-Go static binary (CGO_ENABLED=0)..."
   cd "${ROOT_DIR}"
   CGO_ENABLED=0 go build -trimpath \
     -gcflags="all=-l" \
-    -gcflags="github.com/Willh92/Volo-go/...=" \
+    -gcflags="github.com/Willh92/Volo-go/internal/render=" \
+    -gcflags="github.com/Willh92/Volo-go/internal/visibility=" \
+    -gcflags="github.com/Willh92/Volo-go/internal/db/sqlx=" \
     -ldflags="-s -w -X main.Version=v1.0.0-verify" \
     -o "${BIN_PATH}" ./cmd/volo
 )
 
 BIN_BYTES="$(wc -c < "${BIN_PATH}" | tr -d ' ')"
 BIN_MB="$(awk -v b="${BIN_BYTES}" 'BEGIN { printf "%.2f", b / (1024 * 1024) }')"
-echo "      Binary size: ${BIN_BYTES} bytes (${BIN_MB} MiB) [budget < 20.00 MiB]"
+echo "      Binary size: ${BIN_BYTES} bytes (${BIN_MB} MiB) [target < ${BUDGET_BIN_MB}.00 MiB]"
 if (( BIN_BYTES >= MAX_BIN_BYTES )); then
-  echo "FAIL: binary size ${BIN_BYTES} exceeds 20 MiB budget (${MAX_BIN_BYTES})" >&2
+  echo "FAIL: binary size ${BIN_BYTES} exceeds ${BUDGET_BIN_MB} MiB target (${MAX_BIN_BYTES}); optimize or switch approach first before raising VOLO_BUDGET_BIN_MB" >&2
   exit 1
 fi
 
@@ -79,9 +88,9 @@ else
   RSS_KB="$(ps -o rss= -p "${SERVER_PID}" | tr -d ' ')"
 fi
 RSS_MB="$(awk -v kb="${RSS_KB}" 'BEGIN { printf "%.2f", kb / 1024 }')"
-echo "      Live idle VmRSS: ${RSS_KB} KiB (${RSS_MB} MiB) [budget < 35.00 MiB]"
+echo "      Live idle VmRSS: ${RSS_KB} KiB (${RSS_MB} MiB) [target < ${BUDGET_RSS_MB}.00 MiB]"
 if (( RSS_KB >= MAX_RSS_KB )); then
-  echo "FAIL: idle VmRSS ${RSS_KB} KiB exceeds 35 MiB budget (${MAX_RSS_KB} KiB)" >&2
+  echo "FAIL: idle VmRSS ${RSS_KB} KiB exceeds ${BUDGET_RSS_MB} MiB target (${MAX_RSS_KB} KiB); optimize memory footprint first before raising VOLO_BUDGET_RSS_MB" >&2
   exit 1
 fi
 
@@ -95,4 +104,4 @@ if (( EXIT_CODE != 0 )); then
   exit 1
 fi
 
-echo "PASS: Binary=${BIN_MB} MiB (< 20 MiB), Idle RSS=${RSS_MB} MiB (< 35 MiB), Static=OK, GracefulShutdown=OK"
+echo "PASS: Binary=${BIN_MB} MiB (< ${BUDGET_BIN_MB} MiB), Idle RSS=${RSS_MB} MiB (< ${BUDGET_RSS_MB} MiB), Static=OK, GracefulShutdown=OK"

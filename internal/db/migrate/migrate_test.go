@@ -160,3 +160,73 @@ func TestSQLiteWALReadOnlyZeroSideEffectsTxRollbackAndCaseInsensitiveScan(t *tes
 		t.Fatalf("unexpected paginated/upserted tags: %+v", tags)
 	}
 }
+
+func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
+	// 1. Verify across all 3 dialects that no index name maps to two different column definitions.
+	for _, drv := range []string{"sqlite", "postgres", "mysql"} {
+		d, err := dialect.For(drv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seenDef := make(map[string]string)
+		for _, step := range steps {
+			for _, stmt := range step.Statements(d) {
+				trimmed := strings.TrimSpace(stmt)
+				if !strings.HasPrefix(trimmed, "CREATE INDEX ") && !strings.HasPrefix(trimmed, "CREATE UNIQUE INDEX ") {
+					continue
+				}
+				rest := strings.TrimPrefix(strings.TrimPrefix(trimmed, "CREATE UNIQUE INDEX "), "CREATE INDEX ")
+				idxName := strings.Fields(rest)[0]
+				if prev, ok := seenDef[idxName]; ok && prev != trimmed {
+					t.Fatalf("dialect %s has colliding index name %q with different definitions:\n  %s\n  %s", drv, idxName, prev, trimmed)
+				}
+				seenDef[idxName] = trimmed
+			}
+		}
+	}
+
+	// 2. Verify all 11 composite indexes exist after migrate.Up AND after upgrading from v3.
+	ctx := context.Background()
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(t.TempDir(), "indexes.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := Up(ctx, store); err != nil {
+		t.Fatalf("migrate.Up: %v", err)
+	}
+
+	expectedIndexes := []string{
+		"idx_articles_status_pub_at",
+		"idx_articles_status_views_pub",
+		"idx_articles_status_comments_pub",
+		"idx_articles_pinned_updated",
+		"idx_articles_status_pinned_updated",
+		"idx_comments_target_del_created",
+		"idx_comments_del_status_created",
+		"idx_comments_del_created",
+		"idx_media_created",
+		"idx_redirects_created",
+		"idx_series_articles_sort",
+	}
+
+	rows, err := sqlx.Select[struct {
+		Name string `db:"name"`
+	}](ctx, store, `SELECT name FROM sqlite_master WHERE type = 'index'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		present[r.Name] = true
+	}
+	for _, idx := range expectedIndexes {
+		if !present[idx] {
+			t.Fatalf("expected index %q missing after migrate.Up", idx)
+		}
+	}
+}

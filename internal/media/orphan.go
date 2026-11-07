@@ -54,51 +54,134 @@ func (p *Pipeline) ScanOrphans(ctx context.Context, deleteOrphans bool) ([]domai
 	return orphans, nil
 }
 
-type assetMatchNeedle struct {
-	idx    int
-	pubURL string
-	objKey string
-}
-
 func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []domain.MediaAsset) ([]bool, error) {
 	referenced := make([]bool, len(assets))
-	pending := make([]assetMatchNeedle, 0, len(assets))
+	candidateToIdxs := make(map[string][]int, len(assets)*3)
+	matchedKeys := make(map[string]bool)
+	remaining := 0
+
+	addCandidate := func(key string, idx int) {
+		if key == "" {
+			return
+		}
+		list := candidateToIdxs[key]
+		for _, existing := range list {
+			if existing == idx {
+				return
+			}
+		}
+		candidateToIdxs[key] = append(list, idx)
+	}
+
 	for i, a := range assets {
 		pubURL := strings.TrimSpace(a.PublicURL)
 		objKey := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
 		if pubURL == "" && objKey == "" {
 			continue
 		}
-		pending = append(pending, assetMatchNeedle{
-			idx:    i,
-			pubURL: pubURL,
-			objKey: objKey,
-		})
+		remaining++
+		if pubURL != "" {
+			cleanPub := stripQueryAndFragment(pubURL)
+			addCandidate(pubURL, i)
+			addCandidate(cleanPub, i)
+			if pathPart := extractURLPath(cleanPub); pathPart != "" {
+				addCandidate(pathPart, i)
+				addCandidate(strings.TrimLeft(pathPart, "/"), i)
+			}
+		}
+		if objKey != "" {
+			addCandidate(objKey, i)
+			addCandidate("/uploads/"+objKey, i)
+			addCandidate("uploads/"+objKey, i)
+		}
 	}
-	if len(pending) == 0 {
+	if remaining == 0 {
 		return referenced, nil
 	}
 
-	matchBlob := func(blob string) {
-		if blob == "" || len(pending) == 0 {
+	markKey := func(k string) {
+		if k == "" || matchedKeys[k] {
 			return
 		}
-		writeIdx := 0
-		for _, cand := range pending {
-			hit := (cand.pubURL != "" && strings.Contains(blob, cand.pubURL)) ||
-				(cand.objKey != "" && strings.Contains(blob, cand.objKey))
-			if hit {
-				referenced[cand.idx] = true
+		idxs, ok := candidateToIdxs[k]
+		if !ok {
+			return
+		}
+		matchedKeys[k] = true
+		for _, idx := range idxs {
+			if !referenced[idx] {
+				referenced[idx] = true
+				remaining--
+			}
+		}
+	}
+
+	checkToken := func(raw string) {
+		if raw == "" || remaining == 0 {
+			return
+		}
+		if strings.Index(raw, `\/`) >= 0 {
+			raw = strings.ReplaceAll(raw, `\/`, "/")
+		}
+		tok := trimTokenPunctuation(raw)
+		if tok == "" {
+			return
+		}
+		markKey(tok)
+
+		clean := stripQueryAndFragment(tok)
+		if clean != tok {
+			markKey(clean)
+			clean = trimTokenPunctuation(clean)
+			markKey(clean)
+		}
+		if pathPart := extractURLPath(clean); pathPart != "" {
+			markKey(pathPart)
+			markKey(strings.TrimLeft(pathPart, "/"))
+			if tail := lastThreeSlashSegments(pathPart); tail != "" {
+				markKey(tail)
+			}
+		} else {
+			markKey(strings.TrimLeft(clean, "/"))
+			if tail := lastThreeSlashSegments(clean); tail != "" {
+				markKey(tail)
+			}
+		}
+		if upIdx := strings.Index(clean, "/uploads/"); upIdx > 0 {
+			sub := clean[upIdx:]
+			markKey(sub)
+			markKey(strings.TrimLeft(sub, "/"))
+		}
+	}
+
+	// Single linear pass per text blob: split candidate URL/path/key tokens without O(N_assets) substring scans.
+	matchBlob := func(blob string) {
+		if blob == "" || remaining == 0 {
+			return
+		}
+		start := -1
+		for i := 0; i < len(blob); i++ {
+			if isOrphanTokenDelimiter(blob[i]) {
+				if start >= 0 {
+					emitTokenAndParenSubtokens(blob[start:i], checkToken)
+					if remaining == 0 {
+						return
+					}
+					start = -1
+				}
 				continue
 			}
-			pending[writeIdx] = cand
-			writeIdx++
+			if start < 0 {
+				start = i
+			}
 		}
-		pending = pending[:writeIdx]
+		if start >= 0 && remaining > 0 {
+			emitTokenAndParenSubtokens(blob[start:], checkToken)
+		}
 	}
 
 	scanScope := func(q string, args ...any) error {
-		if len(pending) == 0 {
+		if remaining == 0 {
 			return nil
 		}
 		rows, err := p.store.QueryContext(ctx, q, args...)
@@ -127,7 +210,7 @@ func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []do
 					matchBlob(v)
 				}
 			}
-			if len(pending) == 0 {
+			if remaining == 0 {
 				return nil
 			}
 		}
@@ -152,7 +235,7 @@ func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []do
 		{query: `SELECT icon FROM nav_items`},
 	}
 	for _, sc := range scopes {
-		if len(pending) == 0 {
+		if remaining == 0 {
 			break
 		}
 		if err := scanScope(sc.query, sc.args...); err != nil {
@@ -160,6 +243,136 @@ func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []do
 		}
 	}
 	return referenced, nil
+}
+
+func isOrphanTokenDelimiter(b byte) bool {
+	if b <= ' ' {
+		return true
+	}
+	switch b {
+	case '"', '\'', '`', '<', '>', '[', ']', '{', '}', ',', ';', '|':
+		return true
+	default:
+		return false
+	}
+}
+
+func emitTokenAndParenSubtokens(seg string, fn func(string)) {
+	fn(seg)
+	if strings.IndexByte(seg, '(') < 0 && strings.IndexByte(seg, ')') < 0 {
+		return
+	}
+	subStart := -1
+	for i := 0; i < len(seg); i++ {
+		if seg[i] == '(' || seg[i] == ')' {
+			if subStart >= 0 {
+				fn(seg[subStart:i])
+				subStart = -1
+			}
+			continue
+		}
+		if subStart < 0 {
+			subStart = i
+		}
+	}
+	if subStart >= 0 {
+		fn(seg[subStart:])
+	}
+}
+
+func trimTokenPunctuation(s string) string {
+	start := 0
+	end := len(s)
+	// Preserve balanced inner parens like photo(1).jpg when stripping outer markdown parens.
+	for start < end {
+		switch s[start] {
+		case '(', '.', ':', '!', '?', '\\':
+			start++
+		default:
+			goto trimRight
+		}
+	}
+trimRight:
+	openCount := 0
+	closeCount := 0
+	for i := start; i < end; i++ {
+		if s[i] == '(' {
+			openCount++
+		} else if s[i] == ')' {
+			closeCount++
+		}
+	}
+	for end > start {
+		c := s[end-1]
+		if c == ')' {
+			if closeCount > openCount {
+				closeCount--
+				end--
+				continue
+			}
+			break
+		}
+		switch c {
+		case '.', ':', '!', '?', '\\':
+			end--
+		default:
+			return s[start:end]
+		}
+	}
+	return s[start:end]
+}
+
+func stripQueryAndFragment(s string) string {
+	if idx := strings.IndexByte(s, '#'); idx >= 0 {
+		s = s[:idx]
+	}
+	if idx := strings.IndexByte(s, '?'); idx >= 0 {
+		s = s[:idx]
+	}
+	return s
+}
+
+func extractURLPath(s string) string {
+	low := strings.ToLower(s)
+	var rest string
+	switch {
+	case strings.HasPrefix(low, "https://"):
+		rest = s[len("https://"):]
+	case strings.HasPrefix(low, "http://"):
+		rest = s[len("http://"):]
+	case strings.HasPrefix(s, "//"):
+		rest = s[2:]
+	default:
+		return ""
+	}
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return ""
+	}
+	return rest[slash:]
+}
+
+func lastThreeSlashSegments(s string) string {
+	trimmed := strings.Trim(s, "/")
+	if trimmed == "" {
+		return ""
+	}
+	slashes := 0
+	for i := len(trimmed) - 1; i >= 0; i-- {
+		if trimmed[i] == '/' {
+			slashes++
+			if slashes == 2 {
+				// Found the last 2 slashes -> 3 segments (e.g. "2026/11/01j...pdf"); check if preceded by another slash.
+				for j := i - 1; j >= 0; j-- {
+					if trimmed[j] == '/' {
+						return trimmed[j+1:]
+					}
+				}
+				return trimmed
+			}
+		}
+	}
+	return ""
 }
 
 // safeDeleteLocalUpload verifies via `filepath.EvalSymlinks` that target resides strictly inside uploadDir

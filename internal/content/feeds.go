@@ -13,6 +13,7 @@ import (
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/visibility"
 )
 
@@ -41,14 +42,35 @@ func (s *Service) collectPublicFeedItems(ctx context.Context, publicBaseURL stri
 	}
 
 	catsMap, _ := s.loadCategoriesMap(ctx)
-	users, _ := sqlx.Select[domain.User](ctx, s.store, `SELECT id, display_name, username FROM users`)
-	authorByID := make(map[string]string, len(users))
-	for _, u := range users {
-		name := u.DisplayName
-		if name == "" {
-			name = u.Username
+	authorByID := make(map[string]string)
+	var authorIDs []any
+	seenAuthor := make(map[string]struct{})
+	for _, r := range raws {
+		aid := strings.TrimSpace(r.AuthorID)
+		if aid != "" {
+			if _, ok := seenAuthor[aid]; !ok {
+				seenAuthor[aid] = struct{}{}
+				authorIDs = append(authorIDs, aid)
+			}
 		}
-		authorByID[u.ID] = name
+	}
+	if len(authorIDs) > 0 {
+		ph := make([]string, len(authorIDs))
+		for i := range authorIDs {
+			ph[i] = "?"
+		}
+		users, _ := sqlx.Select[domain.User](
+			ctx, s.store,
+			`SELECT id, display_name, username FROM users WHERE id IN (`+strings.Join(ph, ",")+`)`,
+			authorIDs...,
+		)
+		for _, u := range users {
+			name := u.DisplayName
+			if name == "" {
+				name = u.Username
+			}
+			authorByID[u.ID] = name
+		}
 	}
 
 	items := make([]visibility.FeedItem, 0, len(raws))
@@ -414,19 +436,53 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 	snap := s.settings.Snapshot()
 	base := strings.TrimRight(publicBaseURL, "/")
 
-	arts, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT * FROM articles WHERE status = ? AND password_ciphertext = '' ORDER BY published_at DESC`,
-		domain.ArticleStatusPublished,
+	var (
+		arts  []domain.RawArticle
+		pages []domain.Page
+		err   error
 	)
-	if err != nil {
-		return nil, err
+	if !full {
+		artSQL, artArgs := s.store.Dialect().PaginateSQL(
+			`SELECT id, author_id, category_id, title, slug, summary_md, cover_url, status, is_pinned,
+			        password_ciphertext, has_content_lock, audio_url, lang, word_count, reading_minutes,
+			        view_count, comment_count, published_at, updated_at
+			 FROM articles
+			 WHERE status = ? AND password_ciphertext = ''
+			 ORDER BY is_pinned DESC, published_at DESC`,
+			1000, 0,
+		)
+		arts, err = sqlx.Select[domain.RawArticle](
+			ctx, s.store, artSQL,
+			append([]any{domain.ArticleStatusPublished}, artArgs...)...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		pages, _ = sqlx.Select[domain.Page](
+			ctx, s.store,
+			`SELECT id, title, slug FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+			true,
+		)
+	} else {
+		artSQL, artArgs := s.store.Dialect().PaginateSQL(
+			`SELECT * FROM articles
+			 WHERE status = ? AND password_ciphertext = ''
+			 ORDER BY is_pinned DESC, published_at DESC`,
+			200, 0,
+		)
+		arts, err = sqlx.Select[domain.RawArticle](
+			ctx, s.store, artSQL,
+			append([]any{domain.ArticleStatusPublished}, artArgs...)...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		pages, _ = sqlx.Select[domain.Page](
+			ctx, s.store,
+			`SELECT * FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+			true,
+		)
 	}
-	pages, _ := sqlx.Select[domain.Page](
-		ctx, s.store,
-		`SELECT * FROM pages WHERE is_published = ? ORDER BY slug ASC`,
-		true,
-	)
 
 	var b strings.Builder
 	b.WriteString("# " + snap.Site.Title + "\n\n")
@@ -436,14 +492,24 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 
 	b.WriteString("## Articles\n\n")
 	for _, a := range arts {
-		md, ok := s.guard.ToSafeRawMarkdown(a)
-		if !ok {
+		if a.Status != domain.ArticleStatusPublished || strings.TrimSpace(a.PasswordCiphertext) != "" {
 			continue
 		}
 		if !full {
-			card := s.guard.ToCard(a, snap.Site.DefaultLocale, nil, nil, nil)
-			fmt.Fprintf(&b, "- [%s](%s%s.md): %s\n", a.Title, base, visibility.ArticlePath(a.Slug), card.Summary)
+			cleanSummaryMD := strings.TrimSpace(render.StripAllLockBlocks(a.SummaryMD))
+			summary := a.Title
+			if cleanSummaryMD != "" {
+				rendered := s.renderer.Render(cleanSummaryMD, render.Options{Mode: render.RenderModeWeb})
+				if plain := truncateForSummary(rendered.PlainText, 180); plain != "" {
+					summary = plain
+				}
+			}
+			fmt.Fprintf(&b, "- [%s](%s%s.md): %s\n", a.Title, base, visibility.ArticlePath(a.Slug), summary)
 		} else {
+			md, ok := s.guard.ToSafeRawMarkdown(a)
+			if !ok {
+				continue
+			}
 			fmt.Fprintf(&b, "---\nURL: %s%s\n\n%s\n", base, visibility.ArticlePath(a.Slug), md)
 		}
 	}
@@ -454,7 +520,8 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 			if !full {
 				fmt.Fprintf(&b, "- [%s](%s/%s)\n", p.Title, base, p.Slug)
 			} else {
-				fmt.Fprintf(&b, "---\nURL: %s/%s\n\n# %s\n\n%s\n", base, p.Slug, p.Title, p.ContentMD)
+				cleanPageMD := strings.TrimSpace(render.StripAllLockBlocks(p.ContentMD))
+				fmt.Fprintf(&b, "---\nURL: %s/%s\n\n# %s\n\n%s\n", base, p.Slug, p.Title, cleanPageMD)
 			}
 		}
 	}

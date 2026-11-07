@@ -3,8 +3,12 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/content"
@@ -17,16 +21,29 @@ import (
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
+const (
+	maxAsyncNotifyWorkers = 8
+	maxWebhookLastErrLen  = 240
+)
+
 // Dispatcher coordinates SMTP email notifications, multi-platform Webhooks, and NotifierProvider plugins.
 type Dispatcher struct {
-	store     *sqlx.Store
-	keys      *config.KeyRing
-	settings  *repo.SettingsManager
-	catalog   *i18n.Catalog
-	plugins   *plugin.Manager
-	mailer    *Mailer
-	webhooks  *WebhookSender
+	store    *sqlx.Store
+	keys     *config.KeyRing
+	settings *repo.SettingsManager
+	catalog  *i18n.Catalog
+	plugins  *plugin.Manager
+	mailer   *Mailer
+	webhooks *WebhookSender
+
+	mu        sync.RWMutex
 	publicURL string
+	closed    bool
+
+	sem      chan struct{}
+	wg       sync.WaitGroup
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
 }
 
 // DispatcherOptions configures a unified Notification Dispatcher.
@@ -42,6 +59,7 @@ type DispatcherOptions struct {
 
 // NewDispatcher constructs a notification Dispatcher.
 func NewDispatcher(opts DispatcherOptions) *Dispatcher {
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	return &Dispatcher{
 		store:     opts.Store,
 		keys:      opts.Keys,
@@ -51,11 +69,104 @@ func NewDispatcher(opts DispatcherOptions) *Dispatcher {
 		mailer:    NewMailer(),
 		webhooks:  NewWebhookSender(opts.OutboundDialer),
 		publicURL: strings.TrimRight(strings.TrimSpace(opts.PublicURL), "/"),
+		sem:       make(chan struct{}, maxAsyncNotifyWorkers),
+		bgCtx:     bgCtx,
+		bgCancel:  bgCancel,
 	}
 }
 
-func (d *Dispatcher) Mailer() *Mailer           { return d.mailer }
-func (d *Dispatcher) Webhooks() *WebhookSender  { return d.webhooks }
+func (d *Dispatcher) Mailer() *Mailer          { return d.mailer }
+func (d *Dispatcher) Webhooks() *WebhookSender { return d.webhooks }
+
+// SetPublicURL updates the canonical site base URL used in notification links dynamically.
+func (d *Dispatcher) SetPublicURL(u string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.publicURL = strings.TrimRight(strings.TrimSpace(u), "/")
+	d.mu.Unlock()
+}
+
+func (d *Dispatcher) getPublicURL() string {
+	if d == nil {
+		return ""
+	}
+	d.mu.RLock()
+	u := d.publicURL
+	d.mu.RUnlock()
+	return u
+}
+
+// Close stops accepting new background notifications and waits for in-flight deliveries to drain
+// (or aborts them if ctx expires) so callers can safely close the database store afterward.
+func (d *Dispatcher) Close(ctx context.Context) error {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if d.bgCancel != nil {
+			d.bgCancel()
+		}
+		return nil
+	case <-ctx.Done():
+		if d.bgCancel != nil {
+			d.bgCancel()
+		}
+		return ctx.Err()
+	}
+}
+
+func (d *Dispatcher) enqueueAsync(timeout time.Duration, fn func(context.Context)) {
+	if d == nil {
+		return
+	}
+	d.mu.RLock()
+	if d.closed {
+		d.mu.RUnlock()
+		return
+	}
+	d.wg.Add(1)
+	d.mu.RUnlock()
+
+	go func() {
+		defer d.wg.Done()
+		select {
+		case d.sem <- struct{}{}:
+			defer func() { <-d.sem }()
+		case <-d.bgCtx.Done():
+			return
+		}
+		runCtx, cancel := context.WithTimeout(d.bgCtx, timeout)
+		defer cancel()
+		fn(runCtx)
+	}()
+}
+
+func (d *Dispatcher) decryptWebhookSecret(wh domain.Webhook) (string, error) {
+	if strings.TrimSpace(wh.SecretCiphertext) == "" {
+		return "", nil
+	}
+	if d.keys == nil {
+		return "", errors.New("notify: keyring unavailable to decrypt webhook secret")
+	}
+	return d.keys.OpenStringFallback(
+		wh.SecretCiphertext,
+		config.WebhookSecretAAD(wh.ID),
+		"webhooks:secret:"+wh.ID,
+	)
+}
 
 // SendVerificationCode emails a 6-digit reader activation code via the configured SMTP channel.
 func (d *Dispatcher) SendVerificationCode(ctx context.Context, toEmail string, code string, locale string) error {
@@ -95,16 +206,19 @@ func (d *Dispatcher) SendTestSMTP(ctx context.Context, cfg domain.NotificationsS
 
 // TriggerTestWebhook dispatches a live connectivity test event to a Webhook and updates its status in DB.
 func (d *Dispatcher) TriggerTestWebhook(ctx context.Context, wh domain.Webhook, locale string) (int, error) {
-	plainSecret := ""
-	if wh.SecretCiphertext != "" && d.keys != nil {
-		plainSecret, _ = d.keys.OpenString(wh.SecretCiphertext, "webhook:"+wh.ID)
+	plainSecret, decErr := d.decryptWebhookSecret(wh)
+	if decErr != nil {
+		slog.Error("webhook secret decryption failed; refusing unsigned test webhook delivery",
+			"component", "notify", "webhook_id", wh.ID, "err", decErr)
+		d.recordWebhookOutcome(ctx, wh.ID, 0, decErr)
+		return 0, decErr
 	}
 	ev := WebhookEvent{
 		Event:     "webhook.test",
 		SiteTitle: d.settings.Snapshot().Site.Title,
 		Title:     d.catalog.T(locale, "notify.webhook.test_title"),
 		Body:      "Volo-go notification webhook is online.",
-		TargetURL: d.publicURL,
+		TargetURL: d.getPublicURL(),
 		Timestamp: time.Now().Unix(),
 	}
 	code, err := d.webhooks.Deliver(ctx, wh, plainSecret, ev)
@@ -116,18 +230,16 @@ func (d *Dispatcher) TriggerTestWebhook(ctx context.Context, wh domain.Webhook, 
 // SECURITY INVARIANTS:
 // - `comments.notify_email_ciphertext` is decrypted ONLY in memory for reply delivery and NEVER logged or returned!
 // - Pending/rejected spam comments do NOT trigger reply emails to third parties!
-func (d *Dispatcher) NotifyCommentCreated(ctx context.Context, view content.PublicCommentView, in content.CreateCommentInput) {
-	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
+func (d *Dispatcher) NotifyCommentCreated(_ context.Context, view content.PublicCommentView, in content.CreateCommentInput) {
+	d.enqueueAsync(15*time.Second, func(bgCtx context.Context) {
 		d.dispatchCommentNotifications(bgCtx, view, in)
-	}()
+	})
 }
 
 func (d *Dispatcher) dispatchCommentNotifications(ctx context.Context, view content.PublicCommentView, in content.CreateCommentInput) {
 	snap := d.settings.Snapshot()
 	title, targetPath := d.resolveTargetTitleAndPath(ctx, in.TargetType, in.TargetID)
-	fullURL := d.publicURL + targetPath + "#comment-" + view.ID
+	fullURL := d.getPublicURL() + targetPath + "#comment-" + view.ID
 
 	// 1. Dispatch Webhooks & Plugin Notifiers
 	d.BroadcastWebhookEvent(ctx, WebhookEvent{
@@ -204,7 +316,7 @@ func (d *Dispatcher) dispatchCommentNotifications(ctx context.Context, view cont
 }
 
 // BroadcastArticlePublished dispatches `article.published` to Webhooks with strict zero-leak scrubbing!
-func (d *Dispatcher) BroadcastArticlePublished(ctx context.Context, raw domain.RawArticle, safeSummary string) {
+func (d *Dispatcher) BroadcastArticlePublished(_ context.Context, raw domain.RawArticle, safeSummary string) {
 	snap := d.settings.Snapshot()
 	body := safeSummary
 	if strings.TrimSpace(raw.PasswordCiphertext) != "" {
@@ -212,11 +324,9 @@ func (d *Dispatcher) BroadcastArticlePublished(ctx context.Context, raw domain.R
 	} else if body == "" {
 		body = truncatePlain(plugin.StripLockedMarkdownBlocks(raw.ContentMD), 180)
 	}
-	fullURL := d.publicURL + visibility.ArticlePath(raw.Slug)
+	fullURL := d.getPublicURL() + visibility.ArticlePath(raw.Slug)
 
-	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-		defer cancel()
+	d.enqueueAsync(12*time.Second, func(bgCtx context.Context) {
 		d.BroadcastWebhookEvent(bgCtx, WebhookEvent{
 			Event:     "article.published",
 			SiteTitle: snap.Site.Title,
@@ -229,7 +339,7 @@ func (d *Dispatcher) BroadcastArticlePublished(ctx context.Context, raw domain.R
 				"slug":       raw.Slug,
 			},
 		})
-	}()
+	})
 }
 
 // BroadcastWebhookEvent delivers ev to all enabled Webhooks subscribed to ev.Event (plus NotifierProvider plugins).
@@ -238,10 +348,14 @@ func (d *Dispatcher) BroadcastWebhookEvent(ctx context.Context, ev WebhookEvent)
 		return
 	}
 	if d.plugins != nil {
+		defaultLoc := "zh-CN"
+		if d.settings != nil {
+			defaultLoc = d.settings.Snapshot().Site.DefaultLocale
+		}
 		for _, np := range d.plugins.Providers().Notifiers() {
 			_ = np.Send(ctx, plugin.NotificationEvent{
 				Event:   ev.Event,
-				Locale:  d.settings.Snapshot().Site.DefaultLocale,
+				Locale:  defaultLoc,
 				Title:   ev.Title,
 				Summary: ev.Body,
 				URL:     ev.TargetURL,
@@ -249,7 +363,7 @@ func (d *Dispatcher) BroadcastWebhookEvent(ctx context.Context, ev WebhookEvent)
 		}
 	}
 
-	hooks, err := sqlx.Select[domain.Webhook](ctx, d.store, `SELECT * FROM webhooks WHERE is_enabled = 1`)
+	hooks, err := sqlx.Select[domain.Webhook](ctx, d.store, `SELECT * FROM webhooks WHERE is_enabled = ?`, true)
 	if err != nil {
 		return
 	}
@@ -257,9 +371,12 @@ func (d *Dispatcher) BroadcastWebhookEvent(ctx context.Context, ev WebhookEvent)
 		if !webhookSubscribes(wh.EventsJSON, ev.Event) {
 			continue
 		}
-		plainSecret := ""
-		if wh.SecretCiphertext != "" && d.keys != nil {
-			plainSecret, _ = d.keys.OpenString(wh.SecretCiphertext, "webhook:"+wh.ID)
+		plainSecret, decErr := d.decryptWebhookSecret(wh)
+		if decErr != nil {
+			slog.Error("webhook secret decryption failed; skipping unsigned webhook delivery",
+				"component", "notify", "webhook_id", wh.ID, "err", decErr)
+			d.recordWebhookOutcome(ctx, wh.ID, 0, decErr)
+			continue
 		}
 		code, dErr := d.webhooks.Deliver(ctx, wh, plainSecret, ev)
 		d.recordWebhookOutcome(ctx, wh.ID, code, dErr)
@@ -268,7 +385,13 @@ func (d *Dispatcher) BroadcastWebhookEvent(ctx context.Context, ev WebhookEvent)
 
 func (d *Dispatcher) decryptCommentNotifyEmail(ctx context.Context, c domain.Comment) string {
 	if c.NotifyEmailCiphertext != "" && d.keys != nil {
-		if plain, err := d.keys.OpenString(c.NotifyEmailCiphertext, "comment:email"); err == nil && strings.Contains(plain, "@") {
+		plain, err := d.keys.OpenStringFallback(
+			c.NotifyEmailCiphertext,
+			config.CommentNotifyEmailAAD(c.ID),
+			"comments:email:"+c.ID,
+			"comment:email",
+		)
+		if err == nil && strings.Contains(plain, "@") {
 			return strings.TrimSpace(plain)
 		}
 	}
@@ -311,15 +434,26 @@ func (d *Dispatcher) recordWebhookOutcome(ctx context.Context, webhookID string,
 	}
 	errMsg := ""
 	if err != nil {
-		errMsg = err.Error()
-		if len(errMsg) > 400 {
-			errMsg = errMsg[:400]
-		}
+		errMsg = truncateUTF8Bytes(err.Error(), maxWebhookLastErrLen)
 	}
 	now := time.Now().UnixMilli()
 	_, _ = d.store.ExecContext(ctx,
 		`UPDATE webhooks SET last_status_code = ?, last_error = ?, last_triggered_at = ?, updated_at = ? WHERE id = ?`,
 		code, errMsg, now, now, webhookID)
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	if maxBytes <= 0 {
+		return ""
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 func webhookSubscribes(eventsJSON string, event string) bool {

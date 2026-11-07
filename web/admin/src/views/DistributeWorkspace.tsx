@@ -2,18 +2,21 @@ import { useEffect, useState } from "preact/hooks";
 import { apiFetch, currentUserSig, openConfirm, resetConsoleScroll, showToast, storageDriverSig } from "../api";
 import { MediaPickButton } from "../components/MediaLibraryModal";
 import {
+  ActionMenu,
   AnimatedModal,
   BatchBar,
   ConsoleEmpty,
   ConsoleSelect,
+  MobileSelectAllBar,
   NavIconPreview,
   paginateItems,
   Pagination,
   SwitchToggle,
   TableSkeleton,
   TokenListInput,
+  useDebouncedValue,
 } from "../components/UIControls";
-import { formatDateTime, t } from "../i18n";
+import { availableLocalesSig, formatDateTime, t } from "../i18n";
 
 export type DistTab = "nav_redirects" | "feed_seo" | "github" | "links" | "follows" | "webhooks";
 
@@ -30,10 +33,10 @@ const FEED_VERIFY_LINKS = ["/rss.xml", "/atom.xml", "/sitemap.xml", "/robots.txt
 
 const EMPTY_NAV = {
   id: "",
+  parent_id: "",
   title: "",
   url: "/",
-  zh: "",
-  en: "",
+  i18n: {} as Record<string, string>,
   icon: "",
   sort_order: 10,
   open_in_new_tab: false,
@@ -49,7 +52,7 @@ const EMPTY_LINK = {
   icon_url: "",
   description: "",
   category_name: "",
-  sort_order: 1,
+  sort_order: 10,
 };
 
 const EMPTY_FOLLOW = {
@@ -59,7 +62,7 @@ const EMPTY_FOLLOW = {
   feed_url: "",
   icon_url: "",
   description: "",
-  sort_order: 1,
+  sort_order: 10,
 };
 
 const EMPTY_WH = {
@@ -133,6 +136,29 @@ function parseJsonArr(raw: any): string[] {
   }
 }
 
+function parseI18nMap(raw: any): Record<string, string> {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "string" && v) out[k] = v;
+    }
+    return out;
+  }
+  try {
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "string" && v) out[k] = v;
+      }
+      return out;
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
 export function DistributeWorkspace({
   activeTab = "links",
   onNavigate,
@@ -141,33 +167,51 @@ export function DistributeWorkspace({
   onNavigate?: (sec: string) => void;
 }) {
   const isAdmin = currentUserSig.value?.role === "admin";
+  const localeOptions = availableLocalesSig.value;
   const [sub, setSub] = useState<DistTab>(activeTab);
   const [navSub, setNavSub] = useState<"nav" | "redirects">("nav");
   const [pageIdx, setPageIdx] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [loading, setLoading] = useState(false);
 
   // Nav
   const [navItems, setNavItems] = useState<any[]>([]);
+  const [navSearch, setNavSearch] = useState("");
   const [navModalOpen, setNavModalOpen] = useState(false);
   const [navForm, setNavForm] = useState({ ...EMPTY_NAV });
 
-  // Redirects
+  // Redirects (server-paginated)
   const [redirects, setRedirects] = useState<any[]>([]);
+  const [redirTotal, setRedirTotal] = useState(0);
   const [redirSearch, setRedirSearch] = useState("");
+  const debouncedRedirQ = useDebouncedValue(redirSearch, 250);
+  const [redirCodeFilter, setRedirCodeFilter] = useState("");
+  const [redirSourceFilter, setRedirSourceFilter] = useState("");
+  const [redirSort, setRedirSort] = useState("newest");
   const [selRedirIds, setSelRedirIds] = useState<string[]>([]);
   const [redirModalOpen, setRedirModalOpen] = useState(false);
   const [redirForm, setRedirForm] = useState({ ...EMPTY_REDIR });
 
-  // Links
+  // Links (server-paginated)
   const [links, setLinks] = useState<any[]>([]);
+  const [linkTotal, setLinkTotal] = useState(0);
+  const [knownLinkCategories, setKnownLinkCategories] = useState<string[]>([]);
   const [linkCatFilter, setLinkCatFilter] = useState("");
+  const [linkHealthFilter, setLinkHealthFilter] = useState("");
   const [linkSearch, setLinkSearch] = useState("");
+  const debouncedLinkQ = useDebouncedValue(linkSearch, 250);
+  const [patrolling, setPatrolling] = useState(false);
   const [selLinkIds, setSelLinkIds] = useState<string[]>([]);
   const [linkModalOpen, setLinkModalOpen] = useState(false);
   const [linkForm, setLinkForm] = useState({ ...EMPTY_LINK });
 
-  // Follows + Synced Items Preview
+  // Follows + Synced Items Preview (server-paginated)
   const [follows, setFollows] = useState<any[]>([]);
+  const [followTotal, setFollowTotal] = useState(0);
+  const [followSearch, setFollowSearch] = useState("");
+  const debouncedFollowQ = useDebouncedValue(followSearch, 250);
+  const [followStatusFilter, setFollowStatusFilter] = useState("");
+  const [syncingFollows, setSyncingFollows] = useState(false);
   const [followModalOpen, setFollowModalOpen] = useState(false);
   const [followForm, setFollowForm] = useState({ ...EMPTY_FOLLOW });
   const [followPreviewOpen, setFollowPreviewOpen] = useState(false);
@@ -176,14 +220,21 @@ export function DistributeWorkspace({
 
   // Webhooks
   const [webhooks, setWebhooks] = useState<any[]>([]);
+  const [whSearch, setWhSearch] = useState("");
+  const [testingWhId, setTestingWhId] = useState("");
   const [whModalOpen, setWhModalOpen] = useState(false);
   const [whForm, setWhForm] = useState({ ...EMPTY_WH });
 
   // Feed / SEO / GitHub Showcase
   const [feedCfg, setFeedCfg] = useState<any>(null);
   const [feedVer, setFeedVer] = useState(0);
+  const [savingFeed, setSavingFeed] = useState(false);
   const [seoCfg, setSeoCfg] = useState<any>(null);
   const [seoVer, setSeoVer] = useState(0);
+  const [savingSeo, setSavingSeo] = useState(false);
+  const [syncingGh, setSyncingGh] = useState(false);
+  const [publishingGh, setPublishingGh] = useState(false);
+  const [pushingIndexNow, setPushingIndexNow] = useState(false);
   const [ghSearch, setGhSearch] = useState("");
 
   useEffect(() => {
@@ -210,24 +261,102 @@ export function DistributeWorkspace({
     resetConsoleScroll();
   };
 
-  const loadSub = async () => {
+  const loadNav = async () => {
     setLoading(true);
     try {
-      if (sub === "nav_redirects") {
-        const [nv, rd] = await Promise.all([
-          apiFetch<{ items: any[] }>("/api/admin/nav"),
-          apiFetch<{ items: any[] }>("/api/admin/redirects"),
-        ]);
-        setNavItems(nv.items || []);
-        setRedirects(rd.items || []);
-      } else if (sub === "links") {
-        const r = await apiFetch<{ items: any[] }>("/api/admin/links");
-        setLinks(r.items || []);
-      } else if (sub === "follows") {
-        const r = await apiFetch<{ items: any[] }>("/api/admin/follows");
-        setFollows(r.items || []);
-      } else if (sub === "webhooks" && isAdmin) {
-        const r = await apiFetch<{ items: any[] }>("/api/admin/webhooks");
+      const nv = await apiFetch<{ items: any[] }>("/api/admin/nav?per_page=500");
+      setNavItems(nv.items || []);
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadRedirects = async () => {
+    setLoading(true);
+    try {
+      const sp = new URLSearchParams();
+      sp.set("page", String(pageIdx));
+      sp.set("per_page", String(pageSize));
+      if (debouncedRedirQ.trim()) sp.set("q", debouncedRedirQ.trim());
+      if (redirCodeFilter) sp.set("status_code", redirCodeFilter);
+      if (redirSourceFilter) sp.set("source", redirSourceFilter);
+      if (redirSort) sp.set("sort", redirSort);
+      const rd = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/redirects?${sp.toString()}`);
+      const list = rd.items || [];
+      setRedirects(list);
+      setRedirTotal(rd.total ?? list.length);
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadLinks = async () => {
+    setLoading(true);
+    try {
+      const sp = new URLSearchParams();
+      sp.set("page", String(linkCatFilter ? 1 : pageIdx));
+      sp.set("per_page", String(linkCatFilter ? 200 : pageSize));
+      if (debouncedLinkQ.trim()) sp.set("q", debouncedLinkQ.trim());
+      if (linkHealthFilter) sp.set("health", linkHealthFilter);
+      const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/links?${sp.toString()}`);
+      const list = r.items || [];
+      setLinks(list);
+      setLinkTotal(r.total ?? list.length);
+      const cats = list.map((l) => String(l.category_name || "").trim()).filter(Boolean);
+      if (cats.length > 0) {
+        setKnownLinkCategories((prev) => Array.from(new Set([...prev, ...cats])).sort());
+      }
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadFollows = async () => {
+    setLoading(true);
+    try {
+      const sp = new URLSearchParams();
+      sp.set("page", String(pageIdx));
+      sp.set("per_page", String(pageSize));
+      if (debouncedFollowQ.trim()) sp.set("q", debouncedFollowQ.trim());
+      if (followStatusFilter) sp.set("status", followStatusFilter);
+      const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/follows?${sp.toString()}`);
+      const list = r.items || [];
+      setFollows(list);
+      setFollowTotal(r.total ?? list.length);
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadSub = async () => {
+    if (sub === "nav_redirects") {
+      if (navSub === "nav") {
+        await loadNav();
+      } else {
+        await loadRedirects();
+      }
+      return;
+    }
+    if (sub === "links") {
+      await loadLinks();
+      return;
+    }
+    if (sub === "follows") {
+      await loadFollows();
+      return;
+    }
+    setLoading(true);
+    try {
+      if (sub === "webhooks" && isAdmin) {
+        const r = await apiFetch<{ items: any[] }>("/api/admin/webhooks?per_page=200");
         setWebhooks(r.items || []);
       } else if ((sub === "feed_seo" || sub === "github") && isAdmin) {
         const s = await apiFetch<any>("/api/admin/settings");
@@ -246,10 +375,48 @@ export function DistributeWorkspace({
     }
   };
 
+  // Seed link categories once when entering Friend Links so category dropdown stays complete across filters
   useEffect(() => {
-    setPageIdx(1);
-    void loadSub();
+    if (sub !== "links") return;
+    apiFetch<{ items: any[] }>("/api/admin/links?per_page=200")
+      .then((r) => {
+        const cats = (r.items || []).map((l) => String(l.category_name || "").trim()).filter(Boolean);
+        if (cats.length > 0) {
+          setKnownLinkCategories((prev) => Array.from(new Set([...prev, ...cats])).sort());
+        }
+      })
+      .catch(() => {});
   }, [sub]);
+
+  // Non-server-paginated tabs & Top Nav load
+  useEffect(() => {
+    if (sub === "nav_redirects" && navSub === "nav") {
+      void loadNav();
+    } else if (sub === "webhooks" || sub === "feed_seo" || sub === "github") {
+      void loadSub();
+    }
+  }, [sub, navSub]);
+
+  // Redirects server-paginated fetch
+  useEffect(() => {
+    if (sub !== "nav_redirects" || navSub !== "redirects") return;
+    if (redirSearch !== debouncedRedirQ) return;
+    void loadRedirects();
+  }, [sub, navSub, pageIdx, pageSize, debouncedRedirQ, redirCodeFilter, redirSourceFilter, redirSort]);
+
+  // Links server-paginated fetch
+  useEffect(() => {
+    if (sub !== "links") return;
+    if (linkSearch !== debouncedLinkQ) return;
+    void loadLinks();
+  }, [sub, pageIdx, pageSize, debouncedLinkQ, linkHealthFilter, linkCatFilter]);
+
+  // Follows server-paginated fetch
+  useEffect(() => {
+    if (sub !== "follows") return;
+    if (followSearch !== debouncedFollowQ) return;
+    void loadFollows();
+  }, [sub, pageIdx, pageSize, debouncedFollowQ, followStatusFilter]);
 
   const distTabs: DistTab[] = isAdmin
     ? ["feed_seo", "github", "links", "follows", "webhooks"]
@@ -266,9 +433,12 @@ export function DistributeWorkspace({
     if (!navForm.title.trim() || !navForm.url.trim()) return;
     try {
       const i18nTitles: Record<string, string> = {};
-      if (navForm.zh.trim()) i18nTitles["zh-CN"] = navForm.zh.trim();
-      if (navForm.en.trim()) i18nTitles["en-US"] = navForm.en.trim();
+      for (const [code, val] of Object.entries(navForm.i18n || {})) {
+        const trimmed = String(val || "").trim();
+        if (trimmed) i18nTitles[code] = trimmed;
+      }
       const payload = {
+        parent_id: navForm.parent_id || "",
         title: navForm.title.trim(),
         url: navForm.url.trim(),
         icon: navForm.icon.trim(),
@@ -285,33 +455,69 @@ export function DistributeWorkspace({
       setNavModalOpen(false);
       setNavForm({ ...EMPTY_NAV });
       showToast(t("common.saved"));
-      void loadSub();
+      void loadNav();
     } catch (err: any) {
       showToast(err.message);
     }
   };
 
-  const swapNavOrder = async (idx: number, dir: -1 | 1) => {
+  const sortedRawNav = [...navItems].sort((a, b) => Number(a.sort_order ?? 0) - Number(b.sort_order ?? 0));
+  const topLevelNav = sortedRawNav.filter((x) => !x.parent_id);
+  const topNavIdSet = new Set(topLevelNav.map((x) => x.id));
+  const orderedNavRows: Array<{ item: any; isChild: boolean; sibIdx: number; sibCount: number }> = [];
+  topLevelNav.forEach((top, ti) => {
+    orderedNavRows.push({ item: top, isChild: false, sibIdx: ti, sibCount: topLevelNav.length });
+    const children = sortedRawNav.filter((c) => c.parent_id === top.id);
+    children.forEach((ch, ci) => {
+      orderedNavRows.push({ item: ch, isChild: true, sibIdx: ci, sibCount: children.length });
+    });
+  });
+  const orphanNav = sortedRawNav.filter((x) => x.parent_id && !topNavIdSet.has(x.parent_id));
+  orphanNav.forEach((orph, oi) => {
+    orderedNavRows.push({ item: orph, isChild: true, sibIdx: oi, sibCount: orphanNav.length });
+  });
+
+  const swapNavOrder = async (itemId: string, dir: -1 | 1) => {
+    const target = sortedRawNav.find((x) => x.id === itemId);
+    if (!target) return;
+    const parentKey = target.parent_id || "";
+    const siblings = sortedRawNav.filter((x) => (x.parent_id || "") === parentKey);
+    const idx = siblings.findIndex((x) => x.id === itemId);
     const targetIdx = idx + dir;
-    if (targetIdx < 0 || targetIdx >= navItems.length) return;
-    const a = navItems[idx];
-    const b = navItems[targetIdx];
-    const orderA = Number(a.sort_order ?? idx * 10);
-    const orderB = Number(b.sort_order ?? targetIdx * 10);
-    const nextA = orderA === orderB ? orderB + dir : orderB;
-    const nextB = orderA === orderB ? orderA - dir : orderA;
+    if (idx < 0 || targetIdx < 0 || targetIdx >= siblings.length) return;
+    const hasTies = new Set(siblings.map((s) => Number(s.sort_order ?? 0))).size < siblings.length;
     try {
-      await Promise.all([
-        apiFetch(`/api/admin/nav/${a.id}`, {
-          method: "PUT",
-          body: JSON.stringify({ ...a, sort_order: nextA, is_enabled: a.is_enabled !== false }),
-        }),
-        apiFetch(`/api/admin/nav/${b.id}`, {
-          method: "PUT",
-          body: JSON.stringify({ ...b, sort_order: nextB, is_enabled: b.is_enabled !== false }),
-        }),
-      ]);
-      void loadSub();
+      if (hasTies) {
+        const reordered = [...siblings];
+        const [moved] = reordered.splice(idx, 1);
+        reordered.splice(targetIdx, 0, moved);
+        await Promise.all(
+          reordered.map((s, i) => {
+            const desired = (i + 1) * 10;
+            if (Number(s.sort_order) === desired) return Promise.resolve();
+            return apiFetch(`/api/admin/nav/${s.id}`, {
+              method: "PUT",
+              body: JSON.stringify({ ...s, sort_order: desired, is_enabled: s.is_enabled !== false }),
+            });
+          })
+        );
+      } else {
+        const a = siblings[idx];
+        const b = siblings[targetIdx];
+        const orderA = Number(a.sort_order ?? (idx + 1) * 10);
+        const orderB = Number(b.sort_order ?? (targetIdx + 1) * 10);
+        await Promise.all([
+          apiFetch(`/api/admin/nav/${a.id}`, {
+            method: "PUT",
+            body: JSON.stringify({ ...a, sort_order: orderB, is_enabled: a.is_enabled !== false }),
+          }),
+          apiFetch(`/api/admin/nav/${b.id}`, {
+            method: "PUT",
+            body: JSON.stringify({ ...b, sort_order: orderA, is_enabled: b.is_enabled !== false }),
+          }),
+        ]);
+      }
+      void loadNav();
     } catch (err: any) {
       showToast(err.message);
     }
@@ -334,7 +540,7 @@ export function DistributeWorkspace({
       setRedirModalOpen(false);
       setRedirForm({ ...EMPTY_REDIR });
       showToast(t("common.saved"));
-      void loadSub();
+      void loadRedirects();
     } catch (err: any) {
       showToast(err.message);
     }
@@ -350,7 +556,7 @@ export function DistributeWorkspace({
       });
       setSelRedirIds([]);
       showToast(t("common.deleted"));
-      void loadSub();
+      void loadRedirects();
     } catch (err: any) {
       showToast(err.message);
     }
@@ -373,10 +579,13 @@ export function DistributeWorkspace({
       } else {
         await apiFetch(`/api/admin/links/${linkForm.id}`, { method: "PUT", body: JSON.stringify(payload) });
       }
+      if (payload.category_name) {
+        setKnownLinkCategories((prev) => Array.from(new Set([...prev, payload.category_name])).sort());
+      }
       setLinkModalOpen(false);
       setLinkForm({ ...EMPTY_LINK });
       showToast(t("common.saved"));
-      void loadSub();
+      void loadLinks();
     } catch (err: any) {
       showToast(err.message);
     }
@@ -392,7 +601,7 @@ export function DistributeWorkspace({
       });
       setSelLinkIds([]);
       showToast(t("common.deleted"));
-      void loadSub();
+      void loadLinks();
     } catch (err: any) {
       showToast(err.message);
     }
@@ -418,7 +627,7 @@ export function DistributeWorkspace({
       setFollowModalOpen(false);
       setFollowForm({ ...EMPTY_FOLLOW });
       showToast(t("common.saved"));
-      void loadSub();
+      void loadFollows();
     } catch (err: any) {
       showToast(err.message);
     }
@@ -484,7 +693,8 @@ export function DistributeWorkspace({
   };
 
   const saveSeoSettings = async (silent = false) => {
-    if (!seoCfg) return false;
+    if (!seoCfg || savingSeo) return false;
+    setSavingSeo(true);
     try {
       const res = await apiFetch<any>("/api/admin/settings/seo", {
         method: "PATCH",
@@ -497,11 +707,14 @@ export function DistributeWorkspace({
     } catch (err: any) {
       showToast(err.message);
       return false;
+    } finally {
+      setSavingSeo(false);
     }
   };
 
   const pullGitHubRepos = async () => {
-    if (!seoCfg) return;
+    if (!seoCfg || syncingGh) return;
+    setSyncingGh(true);
     try {
       const r = await apiFetch<{ repos: any[]; github_synced_at?: number }>("/api/admin/seo/github-sync", {
         method: "POST",
@@ -516,49 +729,67 @@ export function DistributeWorkspace({
       showToast(t("dist.synced_gh", { count: r.repos?.length || 0 }));
     } catch (err: any) {
       showToast(err.message);
+    } finally {
+      setSyncingGh(false);
     }
   };
 
   const publishGitHubShowcase = async () => {
-    if (!seoCfg) return;
-    const ok = await saveSeoSettings(true);
-    if (!ok) return;
+    if (!seoCfg || publishingGh) return;
+    setPublishingGh(true);
     try {
+      const ok = await saveSeoSettings(true);
+      if (!ok) return;
       await apiFetch("/api/admin/seo/github-publish", { method: "POST", body: "{}" });
       const repos: any[] = Array.isArray(seoCfg.github_repos) ? seoCfg.github_repos : [];
       const shownCount = repos.filter((rp) => !rp.hidden && (!rp.is_fork || seoCfg.github_include_forks)).length;
       showToast(t("dist.gh_published_toast", { count: shownCount }));
     } catch (err: any) {
       showToast(err.message);
+    } finally {
+      setPublishingGh(false);
     }
   };
 
-  const filteredRedirects = redirSearch.trim()
-    ? redirects.filter((r) => {
-        const q = redirSearch.trim().toLowerCase();
+  const filteredNavRows = navSearch.trim()
+    ? orderedNavRows.filter(({ item }) => {
+        const q = navSearch.trim().toLowerCase();
+        const i18nStr = Object.values(parseI18nMap(item.i18n_titles_json)).join(" ").toLowerCase();
         return (
-          String(r.source_path || "").toLowerCase().includes(q) ||
-          String(r.target_path || "").toLowerCase().includes(q)
+          String(item.title || "").toLowerCase().includes(q) ||
+          String(item.url || "").toLowerCase().includes(q) ||
+          String(item.icon || "").toLowerCase().includes(q) ||
+          i18nStr.includes(q)
         );
       })
-    : redirects;
+    : orderedNavRows;
 
-  const linkCategories = Array.from(
-    new Set(links.map((l) => String(l.category_name || "").trim()).filter(Boolean))
-  );
+  const redirPageSlice =
+    redirects.length > pageSize ? paginateItems(redirects, pageIdx, pageSize).slice : redirects;
 
-  const filteredLinks = links.filter((l) => {
-    if (linkCatFilter && String(l.category_name || "").trim() !== linkCatFilter) return false;
-    if (linkSearch.trim()) {
-      const q = linkSearch.trim().toLowerCase();
-      return (
-        String(l.title || l.name || "").toLowerCase().includes(q) ||
-        String(l.url || "").toLowerCase().includes(q) ||
-        String(l.description || "").toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
+  const catFilteredLinks = linkCatFilter
+    ? links.filter((l) => String(l.category_name || "").trim() === linkCatFilter)
+    : links;
+  const effectiveLinkTotal = linkCatFilter ? catFilteredLinks.length : linkTotal;
+  const linkPageSlice =
+    linkCatFilter || catFilteredLinks.length > pageSize
+      ? paginateItems(catFilteredLinks, pageIdx, pageSize).slice
+      : catFilteredLinks;
+
+  const followPageSlice =
+    follows.length > pageSize ? paginateItems(follows, pageIdx, pageSize).slice : follows;
+
+  const filteredWebhooks = whSearch.trim()
+    ? webhooks.filter((item) => {
+        const w = item.webhook || item;
+        const q = whSearch.trim().toLowerCase();
+        return (
+          String(w.name || "").toLowerCase().includes(q) ||
+          String(w.url || w.target_url || "").toLowerCase().includes(q) ||
+          String(w.provider || w.platform || "").toLowerCase().includes(q)
+        );
+      })
+    : webhooks;
 
   const allGhRepos: any[] = Array.isArray(seoCfg?.github_repos) ? seoCfg.github_repos : [];
   const filteredGhRepos = ghSearch.trim()
@@ -576,15 +807,17 @@ export function DistributeWorkspace({
   const totalGhStars = visibleGhRepos.reduce((acc, rp) => acc + Number(rp.stars || 0), 0);
   const totalGhForks = visibleGhRepos.reduce((acc, rp) => acc + Number(rp.forks || 0), 0);
 
-  const pagedNav = paginateItems(navItems, pageIdx, 15);
-  const pagedRedir = paginateItems(filteredRedirects, pageIdx, 15);
-  const pagedGh = paginateItems(filteredGhRepos, pageIdx, 15);
-  const pagedLinks = paginateItems(filteredLinks, pageIdx, 15);
-  const pagedFollows = paginateItems(follows, pageIdx, 15);
-  const pagedWebhooks = paginateItems(webhooks, pageIdx, 15);
+  const pagedNav = paginateItems(filteredNavRows, pageIdx, pageSize);
+  const pagedGh = paginateItems(filteredGhRepos, pageIdx, pageSize);
+  const pagedWebhooks = paginateItems(filteredWebhooks, pageIdx, pageSize);
 
   const toggleSel = (list: string[], setList: (v: string[]) => void, id: string) => {
     setList(list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
+  };
+
+  const onChangePageSize = (sz: number) => {
+    setPageSize(sz);
+    setPageIdx(1);
   };
 
   return (
@@ -629,7 +862,17 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.nav_head")}</h3>
               <p class="volo-sec-desc">{t("dist.nav_desc")}</p>
             </div>
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            <div class="volo-filter-controls">
+              <input
+                class="volo-input volo-search-input"
+                autoComplete="off"
+                placeholder={t("dist.nav_search_ph")}
+                value={navSearch}
+                onInput={(e) => {
+                  setNavSearch((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
               {isAdmin && (
                 <button
                   type="button"
@@ -643,7 +886,8 @@ export function DistributeWorkspace({
                 type="button"
                 class="volo-btn volo-btn-primary volo-btn-sm"
                 onClick={() => {
-                  setNavForm({ ...EMPTY_NAV });
+                  const maxSort = navItems.reduce((m, x) => Math.max(m, Number(x.sort_order || 0)), 0);
+                  setNavForm({ ...EMPTY_NAV, i18n: {}, sort_order: maxSort + 10 });
                   setNavModalOpen(true);
                 }}
               >
@@ -668,22 +912,18 @@ export function DistributeWorkspace({
                 ) : pagedNav.slice.length === 0 ? (
                   <ConsoleEmpty colSpan={4} />
                 ) : (
-                  pagedNav.slice.map((it) => {
-                    const absIdx = navItems.findIndex((x) => x.id === it.id);
-                    let parsed: Record<string, string> = {};
-                    try {
-                      parsed = it.i18n_titles_json ? JSON.parse(it.i18n_titles_json) : {};
-                    } catch {
-                      parsed = {};
-                    }
+                  pagedNav.slice.map(({ item: it, isChild, sibIdx, sibCount }) => {
+                    const parsed = parseI18nMap(it.i18n_titles_json);
                     const i18nSummary = Object.entries(parsed)
                       .filter(([, v]) => Boolean(v))
                       .map(([k, v]) => `${k}: ${v}`)
                       .join(" · ");
+                    const searchActive = Boolean(navSearch.trim());
                     return (
                       <tr key={it.id}>
                         <td class="col-fluid" data-label={t("cnt.col_name")}>
-                          <div class="volo-cell-title">
+                          <div class="volo-cell-title" style={isChild ? { paddingLeft: "20px" } : undefined}>
+                            {isChild && <span class="volo-help">↳</span>}
                             <NavIconPreview icon={it.icon} fallbackLabel={it.title} />
                             <span>{it.title}</span>
                             {it.icon && <span class="volo-code-chip">{it.icon}</span>}
@@ -702,18 +942,18 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={absIdx <= 0}
+                              disabled={searchActive || sibIdx <= 0}
                               title={t("cnt.lbl_sort")}
-                              onClick={() => void swapNavOrder(absIdx, -1)}
+                              onClick={() => void swapNavOrder(it.id, -1)}
                             >
                               ↑
                             </button>
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={absIdx < 0 || absIdx >= navItems.length - 1}
+                              disabled={searchActive || sibIdx < 0 || sibIdx >= sibCount - 1}
                               title={t("cnt.lbl_sort")}
-                              onClick={() => void swapNavOrder(absIdx, 1)}
+                              onClick={() => void swapNavOrder(it.id, 1)}
                             >
                               ↓
                             </button>
@@ -723,10 +963,10 @@ export function DistributeWorkspace({
                               onClick={() => {
                                 setNavForm({
                                   id: it.id,
+                                  parent_id: it.parent_id || "",
                                   title: it.title || "",
                                   url: it.url || "/",
-                                  zh: parsed["zh-CN"] || "",
-                                  en: parsed["en-US"] || "",
+                                  i18n: parsed,
                                   icon: it.icon || "",
                                   sort_order: it.sort_order ?? 10,
                                   open_in_new_tab: !!it.open_in_new_tab,
@@ -737,18 +977,20 @@ export function DistributeWorkspace({
                             >
                               {t("common.edit")}
                             </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
-                              onClick={async () => {
-                                if (!(await openConfirm({ message: t("dist.confirm_del_nav"), danger: true }))) return;
-                                await apiFetch(`/api/admin/nav/${it.id}`, { method: "DELETE" });
-                                showToast(t("common.deleted"));
-                                void loadSub();
-                              }}
-                            >
-                              {t("common.delete")}
-                            </button>
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("common.delete"),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (!(await openConfirm({ message: t("dist.confirm_del_nav"), danger: true }))) return;
+                                    await apiFetch(`/api/admin/nav/${it.id}`, { method: "DELETE" });
+                                    showToast(t("common.deleted"));
+                                    void loadNav();
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -758,14 +1000,20 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={navItems.length} page={pagedNav.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={filteredNavRows.length}
+            page={pagedNav.safePage}
+            pageSize={pageSize}
+            onPageSizeChange={onChangePageSize}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={navModalOpen}
             onClose={() => setNavModalOpen(false)}
             title={navForm.id ? t("dist.edit_nav") : t("dist.new_nav")}
             subtitle={t("dist.nav_desc")}
-            maxWidth="620px"
+            maxWidth="640px"
             footer={
               <>
                 <button type="button" class="volo-btn" onClick={() => setNavModalOpen(false)}>
@@ -801,24 +1049,44 @@ export function DistributeWorkspace({
                 </div>
               </div>
 
-              <div class="volo-grid-2">
-                <div class="volo-field">
-                  <label>{t("dist.lbl_nav_zh")}</label>
-                  <input
-                    class="volo-input"
-                    placeholder={t("dist.nav_zh_ph")}
-                    value={navForm.zh}
-                    onInput={(e) => setNavForm({ ...navForm, zh: (e.currentTarget as HTMLInputElement).value })}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("dist.lbl_nav_en")}</label>
-                  <input
-                    class="volo-input"
-                    placeholder={t("dist.nav_en_ph")}
-                    value={navForm.en}
-                    onInput={(e) => setNavForm({ ...navForm, en: (e.currentTarget as HTMLInputElement).value })}
-                  />
+              <div class="volo-field">
+                <label>{t("dist.lbl_nav_parent")}</label>
+                <ConsoleSelect
+                  value={navForm.parent_id || ""}
+                  onChange={(val) => setNavForm({ ...navForm, parent_id: val })}
+                  options={[
+                    { value: "", label: t("dist.nav_parent_none") },
+                    ...topLevelNav
+                      .filter((x) => !x.parent_id && x.id !== navForm.id)
+                      .map((x) => ({ value: x.id, label: x.title })),
+                  ]}
+                />
+              </div>
+
+              <div class="volo-field">
+                <label>{t("dist.lbl_nav_i18n")}</label>
+                <div class="volo-grid-2">
+                  {localeOptions.map((loc) => (
+                    <div key={loc.code} class="volo-field" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: "12px", color: "var(--volo-muted)" }}>
+                        {loc.name} ({loc.code})
+                      </label>
+                      <input
+                        class="volo-input"
+                        placeholder={navForm.title || loc.name}
+                        value={navForm.i18n[loc.code] || ""}
+                        onInput={(e) =>
+                          setNavForm({
+                            ...navForm,
+                            i18n: {
+                              ...navForm.i18n,
+                              [loc.code]: (e.currentTarget as HTMLInputElement).value,
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                  ))}
                 </div>
               </div>
 
@@ -885,9 +1153,61 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.redir_head")}</h3>
               <p class="volo-sec-desc">{t("dist.redir_desc")}</p>
             </div>
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary volo-btn-sm"
+              onClick={() => {
+                setRedirForm({ ...EMPTY_REDIR });
+                setRedirModalOpen(true);
+              }}
+            >
+              + {t("dist.new_redir")}
+            </button>
+          </div>
+
+          <div class="volo-filter-bar">
             <div class="volo-filter-controls">
+              <ConsoleSelect
+                searchable={false}
+                value={redirCodeFilter}
+                onChange={(val) => {
+                  setRedirCodeFilter(val);
+                  setPageIdx(1);
+                }}
+                options={[
+                  { value: "", label: t("dist.redir_all_codes") },
+                  { value: "301", label: t("dist.redir_301") },
+                  { value: "302", label: t("dist.redir_302") },
+                ]}
+              />
+              <ConsoleSelect
+                searchable={false}
+                value={redirSourceFilter}
+                onChange={(val) => {
+                  setRedirSourceFilter(val);
+                  setPageIdx(1);
+                }}
+                options={[
+                  { value: "", label: t("dist.redir_all_sources") },
+                  { value: "manual", label: t("dist.redir_manual") },
+                  { value: "legacy", label: t("dist.redir_legacy") },
+                ]}
+              />
+              <ConsoleSelect
+                searchable={false}
+                value={redirSort}
+                onChange={(val) => {
+                  setRedirSort(val);
+                  setPageIdx(1);
+                }}
+                options={[
+                  { value: "newest", label: t("dist.redir_sort_newest") },
+                  { value: "hits", label: t("dist.redir_sort_hits") },
+                ]}
+              />
               <input
                 class="volo-input volo-search-input"
+                autoComplete="off"
                 placeholder={t("dist.redir_search_ph")}
                 value={redirSearch}
                 onInput={(e) => {
@@ -895,16 +1215,6 @@ export function DistributeWorkspace({
                   setPageIdx(1);
                 }}
               />
-              <button
-                type="button"
-                class="volo-btn volo-btn-primary volo-btn-sm"
-                onClick={() => {
-                  setRedirForm({ ...EMPTY_REDIR });
-                  setRedirModalOpen(true);
-                }}
-              >
-                + {t("dist.new_redir")}
-              </button>
             </div>
           </div>
 
@@ -914,6 +1224,20 @@ export function DistributeWorkspace({
             </button>
           </BatchBar>
 
+          <MobileSelectAllBar
+            checked={redirPageSlice.length > 0 && redirPageSlice.every((r) => selRedirIds.includes(r.id))}
+            count={selRedirIds.length}
+            total={redirPageSlice.length}
+            onToggle={(on) => {
+              const pageIds = redirPageSlice.map((r) => r.id);
+              setSelRedirIds(
+                on
+                  ? Array.from(new Set([...selRedirIds, ...pageIds]))
+                  : selRedirIds.filter((id) => !pageIds.includes(id))
+              );
+            }}
+          />
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -922,11 +1246,15 @@ export function DistributeWorkspace({
                     <input
                       type="checkbox"
                       aria-label={t("ov.select_all")}
-                      checked={pagedRedir.slice.length > 0 && pagedRedir.slice.every((r) => selRedirIds.includes(r.id))}
+                      checked={redirPageSlice.length > 0 && redirPageSlice.every((r) => selRedirIds.includes(r.id))}
                       onChange={(e) => {
                         const on = (e.currentTarget as HTMLInputElement).checked;
-                        const pageIds = pagedRedir.slice.map((r) => r.id);
-                        setSelRedirIds(on ? Array.from(new Set([...selRedirIds, ...pageIds])) : selRedirIds.filter((id) => !pageIds.includes(id)));
+                        const pageIds = redirPageSlice.map((r) => r.id);
+                        setSelRedirIds(
+                          on
+                            ? Array.from(new Set([...selRedirIds, ...pageIds]))
+                            : selRedirIds.filter((id) => !pageIds.includes(id))
+                        );
                       }}
                     />
                   </th>
@@ -940,10 +1268,10 @@ export function DistributeWorkspace({
               <tbody>
                 {loading && redirects.length === 0 ? (
                   <TableSkeleton cols={6} />
-                ) : pagedRedir.slice.length === 0 ? (
+                ) : redirPageSlice.length === 0 ? (
                   <ConsoleEmpty colSpan={6} />
                 ) : (
-                  pagedRedir.slice.map((r) => (
+                  redirPageSlice.map((r) => (
                     <tr key={r.id}>
                       <td class="col-check">
                         <input
@@ -962,10 +1290,10 @@ export function DistributeWorkspace({
                         </div>
                       </td>
                       <td class="col-fluid" data-label={t("tbl.col_source")}>
-                        <span class="volo-code-chip">{r.source_path}</span>
+                        <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{r.source_path}</span>
                       </td>
                       <td class="col-fluid" data-label={t("tbl.col_target")}>
-                        <span class="volo-code-chip">{r.target_path}</span>
+                        <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{r.target_path}</span>
                       </td>
                       <td class="col-num" data-label={t("tbl.col_hits")}>
                         <span class="volo-cat-chip">{t("dist.redir_hits", { count: r.hit_count ?? 0 })}</span>
@@ -994,7 +1322,7 @@ export function DistributeWorkspace({
                               if (!(await openConfirm({ message: t("dist.confirm_del_redir"), danger: true }))) return;
                               await apiFetch(`/api/admin/redirects/${r.id}`, { method: "DELETE" });
                               showToast(t("common.deleted"));
-                              void loadSub();
+                              void loadRedirects();
                             }}
                           >
                             {t("common.delete")}
@@ -1007,7 +1335,13 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={filteredRedirects.length} page={pagedRedir.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={redirTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={onChangePageSize}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={redirModalOpen}
@@ -1050,6 +1384,7 @@ export function DistributeWorkspace({
               <div class="volo-field">
                 <label>{t("dist.lbl_redir_code")}</label>
                 <ConsoleSelect
+                  searchable={false}
                   value={String(redirForm.status_code)}
                   onChange={(val) => setRedirForm({ ...redirForm, status_code: Number(val) })}
                   options={[
@@ -1072,10 +1407,20 @@ export function DistributeWorkspace({
               <p class="volo-sec-desc">{t("dist.gh_desc")}</p>
             </div>
             <div class="volo-filter-controls">
-              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void saveSeoSettings(false)}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                disabled={savingSeo || publishingGh}
+                onClick={() => void saveSeoSettings(false)}
+              >
                 {t("dist.gh_save_sel")}
               </button>
-              <button type="button" class="volo-btn volo-btn-sm volo-btn-primary" onClick={() => void publishGitHubShowcase()}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm volo-btn-primary"
+                disabled={publishingGh || syncingGh}
+                onClick={() => void publishGitHubShowcase()}
+              >
                 {t("dist.gh_publish_btn")}
               </button>
             </div>
@@ -1089,8 +1434,8 @@ export function DistributeWorkspace({
             }}
             class="volo-form-bar"
           >
-            <div class="volo-auto-grid">
-              <div class="volo-field">
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", gap: "12px" }}>
+              <div class="volo-field" style={{ flex: "1 1 220px", marginBottom: 0 }}>
                 <label>{t("dist.seo_gh_user")}</label>
                 <input
                   class="volo-input"
@@ -1099,20 +1444,20 @@ export function DistributeWorkspace({
                   onInput={(e) => setSeoCfg({ ...seoCfg, github_username: (e.currentTarget as HTMLInputElement).value })}
                 />
               </div>
-              <div class="volo-field">
+              <div style={{ paddingBottom: "4px" }}>
                 <SwitchToggle
                   checked={!!seoCfg.github_include_forks}
                   onChange={(v) => setSeoCfg({ ...seoCfg, github_include_forks: v })}
                   label={t("dist.seo_gh_forks")}
                 />
               </div>
-              <div class="volo-filter-controls">
+              <div class="volo-filter-controls" style={{ marginLeft: "auto" }}>
                 {seoCfg.github_username && (
                   <a class="volo-btn" href="/posts/github" target="_blank" rel="noreferrer">
                     {t("common.preview")}
                   </a>
                 )}
-                <button type="submit" class="volo-btn volo-btn-primary">
+                <button type="submit" class="volo-btn volo-btn-primary" disabled={syncingGh}>
                   {t("dist.sync_gh")}
                 </button>
               </div>
@@ -1141,7 +1486,13 @@ export function DistributeWorkspace({
                   <img
                     src={`/github-stats/${encodeURIComponent(seoCfg.github_username)}.svg?t=${seoVer}`}
                     alt={seoCfg.github_username}
-                    style={{ maxHeight: "74px", borderRadius: "8px", border: "1px solid var(--volo-line)" }}
+                    style={{
+                      maxHeight: "74px",
+                      maxWidth: "100%",
+                      height: "auto",
+                      borderRadius: "8px",
+                      border: "1px solid var(--volo-line)",
+                    }}
                   />
                 )}
               </div>
@@ -1254,13 +1605,29 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={filteredGhRepos.length} page={pagedGh.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={filteredGhRepos.length}
+            page={pagedGh.safePage}
+            pageSize={pageSize}
+            onPageSizeChange={onChangePageSize}
+            onChange={setPageIdx}
+          />
 
           <div class="volo-form-actions">
-            <button type="button" class="volo-btn" onClick={() => void saveSeoSettings(false)}>
+            <button
+              type="button"
+              class="volo-btn"
+              disabled={savingSeo || publishingGh}
+              onClick={() => void saveSeoSettings(false)}
+            >
               {t("dist.gh_save_sel")}
             </button>
-            <button type="button" class="volo-btn volo-btn-primary" onClick={() => void publishGitHubShowcase()}>
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary"
+              disabled={publishingGh || syncingGh}
+              onClick={() => void publishGitHubShowcase()}
+            >
               {t("dist.gh_publish_btn")}
             </button>
           </div>
@@ -1279,15 +1646,24 @@ export function DistributeWorkspace({
               <button
                 type="button"
                 class="volo-btn volo-btn-sm"
+                disabled={patrolling}
                 onClick={async () => {
-                  const r = await apiFetch<{ checked: number; items?: any[] }>("/api/admin/links/patrol", {
-                    method: "POST",
-                    body: "{}",
-                  });
-                  const list = r.items || [];
-                  const healthy = list.filter((x) => x.health_status === "ok" || x.health_status === "redirect").length;
-                  setLinks(list);
-                  showToast(t("dist.links_patrolled", { checked: r.checked ?? list.length, healthy }));
+                  if (patrolling) return;
+                  setPatrolling(true);
+                  try {
+                    const r = await apiFetch<{ checked: number; items?: any[] }>("/api/admin/links/patrol", {
+                      method: "POST",
+                      body: "{}",
+                    });
+                    const list = r.items || [];
+                    const healthy = list.filter((x) => x.health_status === "ok" || x.health_status === "redirect").length;
+                    showToast(t("dist.links_patrolled", { checked: r.checked ?? list.length, healthy }));
+                    await loadLinks();
+                  } catch (err: any) {
+                    showToast(err.message);
+                  } finally {
+                    setPatrolling(false);
+                  }
                 }}
               >
                 {t("dist.links_patrol")}
@@ -1296,7 +1672,8 @@ export function DistributeWorkspace({
                 type="button"
                 class="volo-btn volo-btn-primary volo-btn-sm"
                 onClick={() => {
-                  setLinkForm({ ...EMPTY_LINK });
+                  const maxSort = links.reduce((m, x) => Math.max(m, Number(x.sort_order || 0)), 0);
+                  setLinkForm({ ...EMPTY_LINK, sort_order: maxSort + 10 });
                   setLinkModalOpen(true);
                 }}
               >
@@ -1308,16 +1685,32 @@ export function DistributeWorkspace({
           <div class="volo-filter-bar">
             <div class="volo-filter-controls">
               <ConsoleSelect
-                value={linkCatFilter}
+                searchable={false}
+                value={linkHealthFilter}
                 onChange={(val) => {
-                  setLinkCatFilter(val);
+                  setLinkHealthFilter(val);
                   setPageIdx(1);
                 }}
                 options={[
-                  { value: "", label: t("art.all_categories") },
-                  ...linkCategories.map((cat) => ({ value: cat, label: cat })),
+                  { value: "", label: t("dist.links_health_all") },
+                  { value: "ok", label: t("dist.links_ok") },
+                  { value: "broken", label: t("dist.links_unreachable") },
+                  { value: "unchecked", label: t("dist.links_unknown") },
                 ]}
               />
+              {knownLinkCategories.length > 0 && (
+                <ConsoleSelect
+                  value={linkCatFilter}
+                  onChange={(val) => {
+                    setLinkCatFilter(val);
+                    setPageIdx(1);
+                  }}
+                  options={[
+                    { value: "", label: t("art.all_categories") },
+                    ...knownLinkCategories.map((cat) => ({ value: cat, label: cat })),
+                  ]}
+                />
+              )}
               <input
                 class="volo-input volo-search-input"
                 autoComplete="off"
@@ -1337,6 +1730,20 @@ export function DistributeWorkspace({
             </button>
           </BatchBar>
 
+          <MobileSelectAllBar
+            checked={linkPageSlice.length > 0 && linkPageSlice.every((l) => selLinkIds.includes(l.id))}
+            count={selLinkIds.length}
+            total={linkPageSlice.length}
+            onToggle={(on) => {
+              const pageIds = linkPageSlice.map((l) => l.id);
+              setSelLinkIds(
+                on
+                  ? Array.from(new Set([...selLinkIds, ...pageIds]))
+                  : selLinkIds.filter((id) => !pageIds.includes(id))
+              );
+            }}
+          />
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -1345,11 +1752,15 @@ export function DistributeWorkspace({
                     <input
                       type="checkbox"
                       aria-label={t("ov.select_all")}
-                      checked={pagedLinks.slice.length > 0 && pagedLinks.slice.every((l) => selLinkIds.includes(l.id))}
+                      checked={linkPageSlice.length > 0 && linkPageSlice.every((l) => selLinkIds.includes(l.id))}
                       onChange={(e) => {
                         const on = (e.currentTarget as HTMLInputElement).checked;
-                        const pageIds = pagedLinks.slice.map((l) => l.id);
-                        setSelLinkIds(on ? Array.from(new Set([...selLinkIds, ...pageIds])) : selLinkIds.filter((id) => !pageIds.includes(id)));
+                        const pageIds = linkPageSlice.map((l) => l.id);
+                        setSelLinkIds(
+                          on
+                            ? Array.from(new Set([...selLinkIds, ...pageIds]))
+                            : selLinkIds.filter((id) => !pageIds.includes(id))
+                        );
                       }}
                     />
                   </th>
@@ -1362,10 +1773,10 @@ export function DistributeWorkspace({
               <tbody>
                 {loading && links.length === 0 ? (
                   <TableSkeleton cols={5} />
-                ) : pagedLinks.slice.length === 0 ? (
+                ) : linkPageSlice.length === 0 ? (
                   <ConsoleEmpty colSpan={5} />
                 ) : (
-                  pagedLinks.slice.map((l) => {
+                  linkPageSlice.map((l) => {
                     const hs = l.health_status || "unknown";
                     const pillCls = hs === "ok" ? "ok" : hs === "redirect" ? "warn" : hs === "unknown" ? "" : "danger";
                     const statusText =
@@ -1401,7 +1812,7 @@ export function DistributeWorkspace({
                           </div>
                         </td>
                         <td class="col-fluid" data-label={t("tbl.col_url")}>
-                          <a href={l.url} target="_blank" rel="noreferrer" class="volo-code-chip">
+                          <a href={l.url} target="_blank" rel="noreferrer" class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>
                             {l.url}
                           </a>
                         </td>
@@ -1416,9 +1827,6 @@ export function DistributeWorkspace({
                         </td>
                         <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
-                            <a class="volo-act-btn" href={l.url} target="_blank" rel="noreferrer">
-                              {t("common.view")}
-                            </a>
                             <button
                               type="button"
                               class="volo-act-btn"
@@ -1430,25 +1838,32 @@ export function DistributeWorkspace({
                                   icon_url: l.icon_url || "",
                                   description: l.description || "",
                                   category_name: l.category_name || "",
-                                  sort_order: l.sort_order ?? 1,
+                                  sort_order: l.sort_order ?? 10,
                                 });
                                 setLinkModalOpen(true);
                               }}
                             >
                               {t("common.edit")}
                             </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
-                              onClick={async () => {
-                                if (!(await openConfirm({ message: t("dist.confirm_del_link"), danger: true }))) return;
-                                await apiFetch(`/api/admin/links/${l.id}`, { method: "DELETE" });
-                                showToast(t("common.deleted"));
-                                void loadSub();
-                              }}
-                            >
-                              {t("common.delete")}
-                            </button>
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("common.view"),
+                                  href: l.url,
+                                  target: "_blank",
+                                },
+                                {
+                                  label: t("common.delete"),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (!(await openConfirm({ message: t("dist.confirm_del_link"), danger: true }))) return;
+                                    await apiFetch(`/api/admin/links/${l.id}`, { method: "DELETE" });
+                                    showToast(t("common.deleted"));
+                                    void loadLinks();
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -1458,7 +1873,13 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={filteredLinks.length} page={pagedLinks.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={effectiveLinkTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={onChangePageSize}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={linkModalOpen}
@@ -1516,7 +1937,7 @@ export function DistributeWorkspace({
                   <input
                     type="number"
                     class="volo-input"
-                    value={linkForm.sort_order ?? 1}
+                    value={linkForm.sort_order ?? 10}
                     onInput={(e) => setLinkForm({ ...linkForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
                   />
                 </div>
@@ -1566,10 +1987,19 @@ export function DistributeWorkspace({
               <button
                 type="button"
                 class="volo-btn volo-btn-sm"
+                disabled={syncingFollows}
                 onClick={async () => {
-                  const r = await apiFetch<{ synced_items: number }>("/api/admin/follows/sync", { method: "POST", body: "{}" });
-                  showToast(t("dist.follows_synced", { count: r.synced_items }));
-                  void loadSub();
+                  if (syncingFollows) return;
+                  setSyncingFollows(true);
+                  try {
+                    const r = await apiFetch<{ synced_items: number }>("/api/admin/follows/sync", { method: "POST", body: "{}" });
+                    showToast(t("dist.follows_synced", { count: r.synced_items }));
+                    await loadFollows();
+                  } catch (err: any) {
+                    showToast(err.message);
+                  } finally {
+                    setSyncingFollows(false);
+                  }
                 }}
               >
                 {t("dist.follows_sync")}
@@ -1578,12 +2008,41 @@ export function DistributeWorkspace({
                 type="button"
                 class="volo-btn volo-btn-primary volo-btn-sm"
                 onClick={() => {
-                  setFollowForm({ ...EMPTY_FOLLOW });
+                  const maxSort = follows.reduce((m, x) => Math.max(m, Number(x.sort_order || 0)), 0);
+                  setFollowForm({ ...EMPTY_FOLLOW, sort_order: maxSort + 10 });
                   setFollowModalOpen(true);
                 }}
               >
                 + {t("dist.new_follow")}
               </button>
+            </div>
+          </div>
+
+          <div class="volo-filter-bar">
+            <div class="volo-filter-controls">
+              <ConsoleSelect
+                searchable={false}
+                value={followStatusFilter}
+                onChange={(val) => {
+                  setFollowStatusFilter(val);
+                  setPageIdx(1);
+                }}
+                options={[
+                  { value: "", label: t("dist.follows_status_all") },
+                  { value: "ok", label: t("dist.follows_status_ok") },
+                  { value: "error", label: t("dist.follows_status_err") },
+                ]}
+              />
+              <input
+                class="volo-input volo-search-input"
+                autoComplete="off"
+                placeholder={t("dist.follows_search_ph")}
+                value={followSearch}
+                onInput={(e) => {
+                  setFollowSearch((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
             </div>
           </div>
 
@@ -1600,10 +2059,10 @@ export function DistributeWorkspace({
               <tbody>
                 {loading && follows.length === 0 ? (
                   <TableSkeleton cols={4} />
-                ) : pagedFollows.slice.length === 0 ? (
+                ) : followPageSlice.length === 0 ? (
                   <ConsoleEmpty colSpan={4} />
                 ) : (
-                  pagedFollows.slice.map((f) => {
+                  followPageSlice.map((f) => {
                     const label = f.title || f.name || "";
                     return (
                       <tr key={f.id}>
@@ -1614,19 +2073,28 @@ export function DistributeWorkspace({
                               <span>{label}</span>
                             </div>
                             <div class="volo-cell-meta">
-                              {f.site_url && <span>{f.site_url}</span>}
+                              {f.site_url && <span style={{ overflowWrap: "anywhere" }}>{f.site_url}</span>}
                               {f.description && <span>{f.description}</span>}
                             </div>
                           </div>
                         </td>
                         <td class="col-fluid" data-label={t("tbl.col_feed")}>
-                          <span class="volo-code-chip">{f.feed_url}</span>
+                          <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{f.feed_url}</span>
                         </td>
                         <td class="col-date" data-label={t("tbl.col_sync")}>
                           <div class="volo-cell-main">
                             <span>{formatDateTime(f.last_synced_at)}</span>
                             {f.sync_error && (
-                              <span class="volo-status-pill danger" title={f.sync_error}>
+                              <span
+                                class="volo-status-pill danger"
+                                title={f.sync_error}
+                                style={{
+                                  maxWidth: "240px",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
                                 <span class="volo-status-dot" />
                                 {t("dist.follows_err", { err: f.sync_error })}
                               </span>
@@ -1646,7 +2114,7 @@ export function DistributeWorkspace({
                                   feed_url: f.feed_url || "",
                                   icon_url: f.icon_url || "",
                                   description: f.description || "",
-                                  sort_order: f.sort_order ?? 1,
+                                  sort_order: f.sort_order ?? 10,
                                 });
                                 setFollowModalOpen(true);
                               }}
@@ -1660,7 +2128,7 @@ export function DistributeWorkspace({
                                 if (!(await openConfirm({ message: t("dist.confirm_del_follow"), danger: true }))) return;
                                 await apiFetch(`/api/admin/follows/${f.id}`, { method: "DELETE" });
                                 showToast(t("common.deleted"));
-                                void loadSub();
+                                void loadFollows();
                               }}
                             >
                               {t("common.delete")}
@@ -1674,7 +2142,13 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={follows.length} page={pagedFollows.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={followTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={onChangePageSize}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={followModalOpen}
@@ -1732,7 +2206,7 @@ export function DistributeWorkspace({
                   <input
                     type="number"
                     class="volo-input"
-                    value={followForm.sort_order ?? 1}
+                    value={followForm.sort_order ?? 10}
                     onInput={(e) => setFollowForm({ ...followForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
                   />
                 </div>
@@ -1821,16 +2295,28 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.wh_head")}</h3>
               <p class="volo-sec-desc">{t("dist.wh_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary volo-btn-sm"
-              onClick={() => {
-                setWhForm({ ...EMPTY_WH, events: ["article.published", "comment.created"] });
-                setWhModalOpen(true);
-              }}
-            >
-              + {t("dist.new_wh")}
-            </button>
+            <div class="volo-filter-controls">
+              <input
+                class="volo-input volo-search-input"
+                autoComplete="off"
+                placeholder={t("dist.wh_search_ph")}
+                value={whSearch}
+                onInput={(e) => {
+                  setWhSearch((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  setWhForm({ ...EMPTY_WH, events: ["article.published", "comment.created"] });
+                  setWhModalOpen(true);
+                }}
+              >
+                + {t("dist.new_wh")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-table-wrap">
@@ -1875,7 +2361,7 @@ export function DistributeWorkspace({
                         </td>
                         <td class="col-fluid" data-label={t("tbl.col_url")}>
                           <div class="volo-cell-main">
-                            <span class="volo-code-chip">{w.url || w.target_url}</span>
+                            <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{w.url || w.target_url}</span>
                             {w.last_triggered_at > 0 && (
                               <span class="volo-help">{formatDateTime(w.last_triggered_at)}</span>
                             )}
@@ -1906,7 +2392,10 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
+                              disabled={testingWhId === w.id}
                               onClick={async () => {
+                                if (testingWhId) return;
+                                setTestingWhId(w.id);
                                 try {
                                   const r = await apiFetch<{ status_code: number }>(`/api/admin/webhooks/${w.id}/test`, {
                                     method: "POST",
@@ -1916,6 +2405,7 @@ export function DistributeWorkspace({
                                 } catch (err: any) {
                                   showToast(err.message);
                                 } finally {
+                                  setTestingWhId("");
                                   void loadSub();
                                 }
                               }}
@@ -1942,18 +2432,20 @@ export function DistributeWorkspace({
                             >
                               {t("common.edit")}
                             </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
-                              onClick={async () => {
-                                if (!(await openConfirm({ message: t("dist.confirm_del_wh"), danger: true }))) return;
-                                await apiFetch(`/api/admin/webhooks/${w.id}`, { method: "DELETE" });
-                                showToast(t("common.deleted"));
-                                void loadSub();
-                              }}
-                            >
-                              {t("common.delete")}
-                            </button>
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("common.delete"),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (!(await openConfirm({ message: t("dist.confirm_del_wh"), danger: true }))) return;
+                                    await apiFetch(`/api/admin/webhooks/${w.id}`, { method: "DELETE" });
+                                    showToast(t("common.deleted"));
+                                    void loadSub();
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -1963,7 +2455,13 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={webhooks.length} page={pagedWebhooks.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={filteredWebhooks.length}
+            page={pagedWebhooks.safePage}
+            pageSize={pageSize}
+            onPageSizeChange={onChangePageSize}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={whModalOpen}
@@ -1997,6 +2495,7 @@ export function DistributeWorkspace({
                 <div class="volo-field">
                   <label>{t("dist.lbl_wh_provider")}</label>
                   <ConsoleSelect
+                    searchable={false}
                     value={whForm.provider}
                     onChange={(val) => setWhForm({ ...whForm, provider: val })}
                     options={[
@@ -2110,6 +2609,7 @@ export function DistributeWorkspace({
                 <div class="volo-field">
                   <label>{t("dist.feed_mode")}</label>
                   <ConsoleSelect
+                    searchable={false}
                     value={feedCfg.output_mode || "summary"}
                     onChange={(val) => setFeedCfg({ ...feedCfg, output_mode: val })}
                     options={[
@@ -2247,14 +2747,23 @@ export function DistributeWorkspace({
                 <button
                   type="button"
                   class="volo-btn volo-btn-primary"
+                  disabled={savingFeed}
                   onClick={async () => {
-                    const res = await apiFetch<any>("/api/admin/settings/feed", {
-                      method: "PATCH",
-                      body: JSON.stringify({ expected_version: feedVer, ...feedCfg }),
-                    });
-                    setFeedCfg(res.value || feedCfg);
-                    setFeedVer(res.version);
-                    showToast(t("common.saved"));
+                    if (savingFeed) return;
+                    setSavingFeed(true);
+                    try {
+                      const res = await apiFetch<any>("/api/admin/settings/feed", {
+                        method: "PATCH",
+                        body: JSON.stringify({ expected_version: feedVer, ...feedCfg }),
+                      });
+                      setFeedCfg(res.value || feedCfg);
+                      setFeedVer(res.version);
+                      showToast(t("common.saved"));
+                    } catch (err: any) {
+                      showToast(err.message);
+                    } finally {
+                      setSavingFeed(false);
+                    }
                   }}
                 >
                   {t("dist.save_feed")}
@@ -2307,7 +2816,10 @@ export function DistributeWorkspace({
                     <button
                       type="button"
                       class="volo-act-btn"
+                      disabled={pushingIndexNow}
                       onClick={async () => {
+                        if (pushingIndexNow) return;
+                        setPushingIndexNow(true);
                         try {
                           const r = await apiFetch<{ pushed_urls: number }>("/api/admin/seo/indexnow-push", {
                             method: "POST",
@@ -2316,6 +2828,8 @@ export function DistributeWorkspace({
                           showToast(t("dist.seo_pushed", { count: r.pushed_urls ?? 0 }));
                         } catch (err: any) {
                           showToast(err.message);
+                        } finally {
+                          setPushingIndexNow(false);
                         }
                       }}
                     >
@@ -2348,32 +2862,20 @@ export function DistributeWorkspace({
               <div class="volo-subcard">
                 <div class="volo-subcard-title">
                   <span>{t("dist.seo_gh_title")}</span>
-                  <div class="volo-row-actions">
-                    <button type="button" class="volo-act-btn" onClick={() => switchDistSub("github")}>
-                      {t("nav.github")}
-                    </button>
-                    <button type="button" class="volo-act-btn" onClick={() => void pullGitHubRepos()}>
-                      {t("dist.sync_gh")}
-                    </button>
-                  </div>
+                  <button type="button" class="volo-act-btn" onClick={() => switchDistSub("github")}>
+                    {t("nav.github")} →
+                  </button>
                 </div>
-                <div class="volo-field">
-                  <label>{t("dist.seo_gh_user")}</label>
-                  <input
-                    class="volo-input"
-                    value={seoCfg.github_username || ""}
-                    onInput={(e) => setSeoCfg({ ...seoCfg, github_username: (e.currentTarget as HTMLInputElement).value })}
-                  />
-                </div>
-                <SwitchToggle
-                  checked={!!seoCfg.github_include_forks}
-                  onChange={(v) => setSeoCfg({ ...seoCfg, github_include_forks: v })}
-                  label={t("dist.seo_gh_forks")}
-                />
+                <div class="volo-help">{t("dist.seo_gh_hint")}</div>
               </div>
 
               <div class="volo-form-actions">
-                <button type="button" class="volo-btn volo-btn-primary" onClick={() => void saveSeoSettings(false)}>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary"
+                  disabled={savingSeo}
+                  onClick={() => void saveSeoSettings(false)}
+                >
                   {t("dist.save_seo")}
                 </button>
               </div>
@@ -2384,3 +2886,4 @@ export function DistributeWorkspace({
     </div>
   );
 }
+

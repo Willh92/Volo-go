@@ -99,4 +99,56 @@ func TestSettingsManagerAtomicPatchSecretMaskingAndHotReload(t *testing.T) {
 	if mgr.Snapshot().Storage.S3SecretKeySet {
 		t.Fatal("expected S3SecretKeySet=false after clear_secrets")
 	}
+
+	// 4. EnablePJAX defaults to true even for legacy DB rows missing "enable_pjax", and respects explicit false
+	if !mgr.Snapshot().Reading.EnablePJAX {
+		t.Fatal("expected EnablePJAX=true by default")
+	}
+	if _, err := store.ExecContext(ctx, `INSERT INTO settings (domain, value_json, secret_ciphertext, version, updated_at) VALUES ('reading', '{"posts_per_page":20,"list_style":"card"}', '', 1, 1000)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.Snapshot().Reading.EnablePJAX || mgr.Snapshot().Reading.PostsPerPage != 20 {
+		t.Fatalf("legacy reading JSON missing enable_pjax must default EnablePJAX=true, got %+v", mgr.Snapshot().Reading)
+	}
+	if _, _, err := mgr.PatchDomain(ctx, "reading", []byte(`{"enable_pjax":false}`), 1); err != nil {
+		t.Fatalf("PatchDomain(reading enable_pjax=false): %v", err)
+	}
+	if mgr.Snapshot().Reading.EnablePJAX {
+		t.Fatal("expected EnablePJAX=false after explicit patch")
+	}
+
+	// 5. UTF-8 case-folding (U+023A Ⱥ, U+212A K) + </style> breakout + nested javascript: in CustomCSS
+	trickyCSS := "/* \u023A\u212A\u023A */ body { background: url(javaJaVaScRiPt:script:alert(1)); } </style><script>alert(1)</script>"
+	if _, _, err := mgr.PatchDomain(ctx, "appearance", []byte(`{"custom_css":`+`"`+strings.ReplaceAll(trickyCSS, `"`, `\"`)+`"}`), 0); err != nil {
+		t.Fatalf("PatchDomain(appearance): %v", err)
+	}
+	gotCSS := mgr.Snapshot().Appearance.CustomCSS
+	if strings.Contains(strings.ToLower(gotCSS), "</style") || strings.Contains(strings.ToLower(gotCSS), "javascript:") {
+		t.Fatalf("CustomCSS failed to neutralize breakout/javascript: %q", gotCSS)
+	}
+
+	// 6. CustomHeadMeta allowlists safe <meta>/<link> and strips <script>, refresh, CSP, and event handlers
+	rawHead := `<meta name="google-site-verification" content="abc123" onclick="evil()"><meta http-equiv="refresh" content="0;url=https://evil.example"><link rel="me" href="https://github.com/Willh92"><link rel="stylesheet" href="javascript:alert(1)"><script>alert(1)</script>rawtext`
+	cleanHead := SanitizeCustomHeadMeta(rawHead)
+	if strings.Contains(strings.ToLower(cleanHead), "<script") ||
+		strings.Contains(strings.ToLower(cleanHead), "onclick") ||
+		strings.Contains(strings.ToLower(cleanHead), "refresh") ||
+		strings.Contains(strings.ToLower(cleanHead), "javascript:") ||
+		strings.Contains(cleanHead, "rawtext") {
+		t.Fatalf("SanitizeCustomHeadMeta leaked unsafe content: %q", cleanHead)
+	}
+	if !strings.Contains(cleanHead, `google-site-verification`) || !strings.Contains(cleanHead, `https://github.com/Willh92`) {
+		t.Fatalf("SanitizeCustomHeadMeta dropped valid tags: %q", cleanHead)
+	}
+
+	// 7. Reject javascript:/control-char/protocol-relative SocialLinks & FaviconURL on write
+	if _, _, err := mgr.PatchDomain(ctx, "site", []byte(`{"favicon_url":"java\u0009script:alert(1)"}`), 1); err == nil {
+		t.Fatal("expected error for control-obfuscated javascript: favicon_url")
+	}
+	if _, _, err := mgr.PatchDomain(ctx, "site", []byte(`{"favicon_url":"//evil.example/fav.ico"}`), 1); err == nil {
+		t.Fatal("expected error for protocol-relative // favicon_url")
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/config"
@@ -41,14 +42,23 @@ type Identity struct {
 // password-bound article/lock unlock state.
 type PassportManager struct {
 	keyRing      *config.KeyRing
-	secureCookie bool
+	secureCookie atomic.Bool
 }
 
 func NewPassportManager(keyRing *config.KeyRing, publicURL string) *PassportManager {
-	return &PassportManager{
-		keyRing:      keyRing,
-		secureCookie: strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicURL)), "https://"),
+	pm := &PassportManager{
+		keyRing: keyRing,
 	}
+	pm.SetPublicURL(publicURL)
+	return pm
+}
+
+// SetPublicURL dynamically updates the HTTPS Secure cookie policy when PublicURL changes at runtime.
+func (pm *PassportManager) SetPublicURL(publicURL string) {
+	if pm == nil {
+		return
+	}
+	pm.secureCookie.Store(strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicURL)), "https://"))
 }
 
 // HashGuestID computes the irreversible SHA-256 storage identifier for comments.guest_id_hash.
@@ -88,9 +98,9 @@ func (pm *PassportManager) VerifyPassport(token string) (guestID string, issuedA
 
 // ResolveOrHeal inspects HttpOnly cookie first, then falls back to X-Volo-Guest-Passport header
 // (mirrored in client localStorage + IndexedDB).
-// - If Cookie is missing/invalidated (e.g., Safari ITP) but Header carries a valid HMAC token,
-//   ResolveOrHeal self-heals by re-writing the HttpOnly cookie!
-// - If neither exists and mintIfMissing==true, it mints a fresh cryptographic GuestPassport and sets the cookie.
+//   - If Cookie is missing/invalidated (e.g., Safari ITP) but Header carries a valid HMAC token,
+//     ResolveOrHeal self-heals by re-writing the HttpOnly cookie!
+//   - If neither exists and mintIfMissing==true, it mints a fresh cryptographic GuestPassport and sets the cookie.
 func (pm *PassportManager) ResolveOrHeal(w http.ResponseWriter, r *http.Request, mintIfMissing bool) (*Identity, bool) {
 	if c, err := r.Cookie(PassportCookieName); err == nil && c.Value != "" {
 		if gid, ts, ok := pm.VerifyPassport(c.Value); ok {
@@ -145,7 +155,7 @@ func (pm *PassportManager) setPassportCookie(w http.ResponseWriter, token string
 		Path:     "/",
 		MaxAge:   PassportMaxAgeSec,
 		HttpOnly: true,
-		Secure:   pm.secureCookie,
+		Secure:   pm.secureCookie.Load(),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -201,7 +211,7 @@ func (pm *PassportManager) GrantArticleUnlock(w http.ResponseWriter, r *http.Req
 			Path:     "/",
 			MaxAge:   UnlockMaxAgeSec,
 			HttpOnly: true,
-			Secure:   pm.secureCookie,
+			Secure:   pm.secureCookie.Load(),
 			SameSite: http.SameSiteLaxMode,
 		})
 	}

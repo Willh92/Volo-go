@@ -41,7 +41,7 @@
           <div class="volo-toc-body__inner">
             <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
               {{range .StandalonePage.TOC}}
-                {{$depth := sub .Level $minLvl}}
+                {{$depth := sub .Level $minLvl}}{{if lt $depth 0}}{{$depth = 0}}{{end}}{{if gt $depth 4}}{{$depth = 4}}{{end}}
                 <a class="volo-toc-link{{if gt $depth 0}} is-sub{{end}}" data-toc-id="{{.ID}}" href="#{{.ID}}" title="{{.Text}}" style="padding-left:{{add 12 (mul $depth 12)}}px"><span class="volo-toc-label">{{.Text}}</span></a>
               {{end}}
             </nav>
@@ -62,7 +62,7 @@
       </div>
       <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
         {{range .StandalonePage.TOC}}
-          {{$depth := sub .Level $minLvl}}
+          {{$depth := sub .Level $minLvl}}{{if lt $depth 0}}{{$depth = 0}}{{end}}{{if gt $depth 4}}{{$depth = 4}}{{end}}
           <a class="volo-toc-link{{if gt $depth 0}} is-sub{{end}}" data-toc-id="{{.ID}}" href="#{{.ID}}" title="{{.Text}}" style="padding-left:{{add 12 (mul $depth 12)}}px"><span class="volo-toc-label">{{.Text}}</span></a>
         {{end}}
       </nav>

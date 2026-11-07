@@ -51,10 +51,56 @@ func (s *AppServer) recordAuditLog(r *http.Request, actor *domain.User, action s
 			detJSON = string(b)
 		}
 	}
-	_, _ = s.deps.Store.ExecContext(r.Context(),
+	_, _ = s.deps.Store.ExecBgContext(r.Context(),
 		`INSERT INTO audit_logs (id, actor_id, actor_name, action, resource_type, resource_id, client_ip, detail_json, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id.Next(), actor.ID, actor.Username, action, resourceType, resourceID, security.MaskIP(clientIP), detJSON, time.Now().UnixMilli())
+}
+
+func parseAdminPageParams(r *http.Request, defaultPerPage, maxPerPage int) (int, int) {
+	page := 1
+	if p, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page"))); err == nil && p > 0 {
+		page = p
+	}
+	perPage := defaultPerPage
+	if pp, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("per_page"))); err == nil && pp > 0 {
+		perPage = pp
+	}
+	if maxPerPage > 0 && perPage > maxPerPage {
+		perPage = maxPerPage
+	}
+	return page, perPage
+}
+
+func sanitizeAdminIconField(raw string) (string, bool) {
+	clean := strings.TrimSpace(repo.StripASCIIControls(raw))
+	if clean == "" {
+		return "", true
+	}
+	if strings.Contains(clean, "/") || strings.Contains(clean, ":") {
+		u, ok := repo.SanitizeAllowedURL(clean, false)
+		if !ok || u == "" {
+			return "", false
+		}
+		lower := strings.ToLower(u)
+		if strings.HasPrefix(u, "/") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+			return u, true
+		}
+		return "", false
+	}
+	return clean, true
+}
+
+func sanitizeRedirectTargetURL(raw string) (string, bool) {
+	u, ok := repo.SanitizeAllowedURL(raw, false)
+	if !ok || u == "" {
+		return "", false
+	}
+	lower := strings.ToLower(u)
+	if strings.HasPrefix(u, "/") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return u, true
+	}
+	return "", false
 }
 
 // handleAdminSystemRoutes serves Workspaces 3, 4, and 5.
@@ -204,6 +250,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case sub == "audit-logs" && r.Method == http.MethodGet:
+		page, perPage := parseAdminPageParams(r, 50, 200)
 		act := strings.TrimSpace(r.URL.Query().Get("action"))
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		where := []string{"1=1"}
@@ -217,12 +264,31 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			where = append(where, "(LOWER(actor_name) LIKE LOWER(?) OR LOWER(action) LIKE LOWER(?) OR LOWER(resource_type) LIKE LOWER(?) OR LOWER(resource_id) LIKE LOWER(?) OR LOWER(detail_json) LIKE LOWER(?) OR LOWER(client_ip) LIKE LOWER(?))")
 			args = append(args, pat, pat, pat, pat, pat, pat)
 		}
-		rows, _ := sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store,
-			`SELECT * FROM audit_logs WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC LIMIT 200`, args...)
+		whereSQL := strings.Join(where, " AND ")
+		var total int
+		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM audit_logs WHERE `+whereSQL, args...).Scan(&total)
+		baseSQL := `SELECT * FROM audit_logs WHERE ` + whereSQL + ` ORDER BY created_at DESC`
+		qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+		fullArgs := append(append([]any{}, args...), pageArgs...)
+		rows, _ := sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store, qSQL, fullArgs...)
 		if rows == nil {
 			rows = []domain.AuditLog{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+		actionRows, _ := sqlx.Select[struct {
+			Action string `db:"action"`
+		}](r.Context(), s.deps.Store, `SELECT DISTINCT action FROM audit_logs WHERE action <> '' ORDER BY action ASC`)
+		actions := make([]string, 0, len(actionRows))
+		for _, ar := range actionRows {
+			actions = append(actions, ar.Action)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":    rows,
+			"logs":     rows,
+			"actions":  actions,
+			"total":    total,
+			"page":     page,
+			"per_page": perPage,
+		})
 
 	case sub == "backup/local" || strings.HasPrefix(sub, "backup/local/"):
 		s.handleAdminLocalBackups(w, r, actor, strings.TrimPrefix(sub, "backup/local"))
@@ -243,14 +309,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 					s.deps.WAF.SetPublicURL(s.deps.Config.PublicURL)
 				}
 			}
-			_, _ = s.deps.Settings.Reload(r.Context())
-			_ = s.deps.Content.WarmCaches(r.Context())
-			if s.deps.WAF != nil {
-				_ = s.deps.WAF.ReloadBans(r.Context())
-			}
-			if s.deps.Geo != nil {
-				_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-			}
+			s.reloadRuntimeAfterDBRestore(r.Context())
 			s.recordAuditLog(r, actor, "backup.import_legacy", "system", "etl", nil)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "report": rep})
@@ -273,7 +332,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			if rows == nil {
 				rows = []domain.NavItem{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+			writeJSON(w, http.StatusOK, map[string]any{"items": rows, "nav_items": rows, "total": len(rows)})
 		case http.MethodPost:
 			var in domain.NavItem
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
@@ -282,11 +341,18 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			}
 			in.ID = id.Next()
 			in.Title = strings.TrimSpace(in.Title)
-			in.URL = strings.TrimSpace(in.URL)
-			if in.Title == "" || in.URL == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title and url required"})
+			cleanURL, urlOK := repo.SanitizeAllowedURL(in.URL, true)
+			if in.Title == "" || !urlOK || cleanURL == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and allowed url required"})
 				return
 			}
+			cleanIcon, iconOK := sanitizeAdminIconField(in.Icon)
+			if !iconOK {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon URL scheme"})
+				return
+			}
+			in.URL = cleanURL
+			in.Icon = cleanIcon
 			if strings.TrimSpace(in.I18nTitlesJSON) == "" {
 				in.I18nTitlesJSON = "{}"
 			}
@@ -314,13 +380,24 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
+		title := strings.TrimSpace(in.Title)
+		cleanURL, urlOK := repo.SanitizeAllowedURL(in.URL, true)
+		if title == "" || !urlOK || cleanURL == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and allowed url required"})
+			return
+		}
+		cleanIcon, iconOK := sanitizeAdminIconField(in.Icon)
+		if !iconOK {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon URL scheme"})
+			return
+		}
 		if strings.TrimSpace(in.I18nTitlesJSON) == "" {
 			in.I18nTitlesJSON = "{}"
 		}
 		_, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE nav_items SET parent_id = ?, title = ?, i18n_titles_json = ?, url = ?, open_in_new_tab = ?, icon = ?, sort_order = ?, is_enabled = ?, updated_at = ? WHERE id = ?`,
-			in.ParentID, strings.TrimSpace(in.Title), in.I18nTitlesJSON, strings.TrimSpace(in.URL),
-			in.OpenInNewTab, in.Icon, in.SortOrder, in.IsEnabled, time.Now().UnixMilli(), rest)
+			in.ParentID, title, in.I18nTitlesJSON, cleanURL,
+			in.OpenInNewTab, cleanIcon, in.SortOrder, in.IsEnabled, time.Now().UnixMilli(), rest)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -343,7 +420,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			return
 		}
 		rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
-		writeJSON(w, http.StatusOK, map[string]any{"checked": n, "items": rows})
+		writeJSON(w, http.StatusOK, map[string]any{"checked": n, "items": rows, "links": rows})
 		return
 	}
 	if rest == "batch" && r.Method == http.MethodPost {
@@ -400,11 +477,46 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC, created_at DESC`)
+			page, perPage := parseAdminPageParams(r, 50, 200)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			health := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("health")))
+			cat := strings.TrimSpace(r.URL.Query().Get("category"))
+			where := []string{"1=1"}
+			var args []any
+			if q != "" {
+				pat := "%" + q + "%"
+				where = append(where, "(LOWER(title) LIKE LOWER(?) OR LOWER(url) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?) OR LOWER(category_name) LIKE LOWER(?))")
+				args = append(args, pat, pat, pat, pat)
+			}
+			switch health {
+			case "ok":
+				where = append(where, "health_status = 'ok'")
+			case "broken", "error", "down":
+				where = append(where, "(health_status IN ('error', 'broken', 'down') OR http_code >= 400)")
+			case "unchecked", "unknown":
+				where = append(where, "(health_status = 'unknown' OR health_status = '')")
+			}
+			if cat != "" && cat != "all" {
+				where = append(where, "category_name = ?")
+				args = append(args, cat)
+			}
+			whereSQL := strings.Join(where, " AND ")
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM links WHERE `+whereSQL, args...).Scan(&total)
+			baseSQL := `SELECT * FROM links WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
+			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+			fullArgs := append(append([]any{}, args...), pageArgs...)
+			rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Link{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"items":    rows,
+				"links":    rows,
+				"total":    total,
+				"page":     page,
+				"per_page": perPage,
+			})
 		case http.MethodPost:
 			var in domain.Link
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
@@ -413,10 +525,21 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			}
 			in.ID = id.Next()
 			in.Title = strings.TrimSpace(in.Title)
-			in.URL = strings.TrimSpace(in.URL)
-			if in.Title == "" || in.URL == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title and url required"})
+			cleanURL, urlOK := sanitizeRedirectTargetURL(in.URL)
+			if in.Title == "" || !urlOK {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and http(s) or relative url required"})
 				return
+			}
+			in.URL = cleanURL
+			if strings.TrimSpace(in.IconURL) != "" {
+				cleanIcon, iconOK := sanitizeRedirectTargetURL(in.IconURL)
+				if !iconOK {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+					return
+				}
+				in.IconURL = cleanIcon
+			} else {
+				in.IconURL = ""
 			}
 			in.HealthStatus = "unknown"
 			now := time.Now().UnixMilli()
@@ -442,9 +565,24 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
+		title := strings.TrimSpace(in.Title)
+		cleanURL, urlOK := sanitizeRedirectTargetURL(in.URL)
+		if title == "" || !urlOK {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and http(s) or relative url required"})
+			return
+		}
+		cleanIcon := ""
+		if strings.TrimSpace(in.IconURL) != "" {
+			var iconOK bool
+			cleanIcon, iconOK = sanitizeRedirectTargetURL(in.IconURL)
+			if !iconOK {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+				return
+			}
+		}
 		_, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE links SET title = ?, url = ?, description = ?, icon_url = ?, category_name = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
-			strings.TrimSpace(in.Title), strings.TrimSpace(in.URL), in.Description, in.IconURL, in.CategoryName, in.SortOrder, time.Now().UnixMilli(), rest)
+			title, cleanURL, in.Description, cleanIcon, in.CategoryName, in.SortOrder, time.Now().UnixMilli(), rest)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -480,11 +618,41 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at DESC`)
+			page, perPage := parseAdminPageParams(r, 50, 200)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			st := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+			where := []string{"1=1"}
+			var args []any
+			if q != "" {
+				pat := "%" + q + "%"
+				where = append(where, "(LOWER(title) LIKE LOWER(?) OR LOWER(site_url) LIKE LOWER(?) OR LOWER(feed_url) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?))")
+				args = append(args, pat, pat, pat, pat)
+			}
+			switch st {
+			case "ok":
+				where = append(where, "(sync_error = '' AND last_synced_at > 0)")
+			case "error", "broken":
+				where = append(where, "sync_error <> ''")
+			case "pending", "unsynced":
+				where = append(where, "(sync_error = '' AND last_synced_at = 0)")
+			}
+			whereSQL := strings.Join(where, " AND ")
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM follows WHERE `+whereSQL, args...).Scan(&total)
+			baseSQL := `SELECT * FROM follows WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
+			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+			fullArgs := append(append([]any{}, args...), pageArgs...)
+			rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Follow{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"items":    rows,
+				"follows":  rows,
+				"total":    total,
+				"page":     page,
+				"per_page": perPage,
+			})
 		case http.MethodPost:
 			var in domain.Follow
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
@@ -493,10 +661,32 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 			}
 			in.ID = id.Next()
 			in.Title = strings.TrimSpace(in.Title)
-			in.FeedURL = strings.TrimSpace(in.FeedURL)
-			if in.Title == "" || in.FeedURL == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title and feed_url required"})
+			cleanFeed, feedOK := repo.SanitizeAllowedURL(in.FeedURL, false)
+			lowerFeed := strings.ToLower(cleanFeed)
+			if in.Title == "" || !feedOK || (!strings.HasPrefix(lowerFeed, "http://") && !strings.HasPrefix(lowerFeed, "https://")) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title and valid http(s) feed_url required"})
 				return
+			}
+			in.FeedURL = cleanFeed
+			if strings.TrimSpace(in.SiteURL) != "" {
+				cs, ok := sanitizeRedirectTargetURL(in.SiteURL)
+				if !ok {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid site_url"})
+					return
+				}
+				in.SiteURL = cs
+			} else {
+				in.SiteURL = ""
+			}
+			if strings.TrimSpace(in.IconURL) != "" {
+				ci, ok := sanitizeRedirectTargetURL(in.IconURL)
+				if !ok {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+					return
+				}
+				in.IconURL = ci
+			} else {
+				in.IconURL = ""
 			}
 			now := time.Now().UnixMilli()
 			in.CreatedAt = now
@@ -521,10 +711,35 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
+		title := strings.TrimSpace(in.Title)
+		cleanFeed, feedOK := repo.SanitizeAllowedURL(in.FeedURL, false)
+		lowerFeed := strings.ToLower(cleanFeed)
+		if title == "" || !feedOK || (!strings.HasPrefix(lowerFeed, "http://") && !strings.HasPrefix(lowerFeed, "https://")) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title and valid http(s) feed_url required"})
+			return
+		}
+		cleanSite := ""
+		if strings.TrimSpace(in.SiteURL) != "" {
+			var ok bool
+			cleanSite, ok = sanitizeRedirectTargetURL(in.SiteURL)
+			if !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid site_url"})
+				return
+			}
+		}
+		cleanIcon := ""
+		if strings.TrimSpace(in.IconURL) != "" {
+			var ok bool
+			cleanIcon, ok = sanitizeRedirectTargetURL(in.IconURL)
+			if !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+				return
+			}
+		}
 		_, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE follows SET title = ?, site_url = ?, feed_url = ?, description = ?, icon_url = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
-			strings.TrimSpace(in.Title), strings.TrimSpace(in.SiteURL), strings.TrimSpace(in.FeedURL),
-			in.Description, in.IconURL, in.SortOrder, time.Now().UnixMilli(), rest)
+			title, cleanSite, cleanFeed,
+			in.Description, cleanIcon, in.SortOrder, time.Now().UnixMilli(), rest)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -540,6 +755,20 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func normalizeRedirectSourcePath(raw string) (string, bool) {
+	clean := strings.TrimSpace(repo.StripASCIIControls(raw))
+	if clean == "" || strings.HasPrefix(clean, "//") || strings.ContainsAny(clean, "?# \t") {
+		return "", false
+	}
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	if clean == "/" || strings.HasPrefix(clean, "//") || strings.HasPrefix(clean, "/api/admin") || strings.HasPrefix(clean, "/setup") {
+		return "", false
+	}
+	return clean, true
 }
 
 func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
@@ -586,21 +815,63 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, `SELECT * FROM redirects ORDER BY created_at DESC LIMIT 300`)
+			page, perPage := parseAdminPageParams(r, 50, 300)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			codeStr := strings.TrimSpace(r.URL.Query().Get("status_code"))
+			srcKind := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("source")))
+			sortBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort")))
+
+			where := []string{"1=1"}
+			var args []any
+			if q != "" {
+				pat := "%" + q + "%"
+				where = append(where, "(LOWER(source_path) LIKE LOWER(?) OR LOWER(target_path) LIKE LOWER(?))")
+				args = append(args, pat, pat)
+			}
+			if codeStr == "301" || codeStr == "302" {
+				codeVal, _ := strconv.Atoi(codeStr)
+				where = append(where, "status_code = ?")
+				args = append(args, codeVal)
+			}
+			switch srcKind {
+			case "legacy", "system":
+				where = append(where, "is_system_legacy = ?")
+				args = append(args, true)
+			case "manual", "custom":
+				where = append(where, "is_system_legacy = ?")
+				args = append(args, false)
+			}
+			orderClause := "created_at DESC"
+			if sortBy == "hits" {
+				orderClause = "hit_count DESC, created_at DESC"
+			}
+			whereSQL := strings.Join(where, " AND ")
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM redirects WHERE `+whereSQL, args...).Scan(&total)
+			baseSQL := `SELECT * FROM redirects WHERE ` + whereSQL + ` ORDER BY ` + orderClause
+			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+			fullArgs := append(append([]any{}, args...), pageArgs...)
+			rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.RedirectRule{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"items":     rows,
+				"redirects": rows,
+				"total":     total,
+				"page":      page,
+				"per_page":  perPage,
+			})
 		case http.MethodPost:
 			var in domain.RedirectRule
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 				return
 			}
-			src := "/" + strings.TrimLeft(strings.TrimSpace(in.SourcePath), "/")
-			dst := strings.TrimSpace(in.TargetPath)
-			if src == "/" || dst == "" || src == dst {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and target_path required"})
+			src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
+			dst, dstOK := sanitizeRedirectTargetURL(in.TargetPath)
+			if !srcOK || !dstOK || src == dst {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and allowed target_path required"})
 				return
 			}
 			if in.StatusCode != 301 && in.StatusCode != 302 {
@@ -630,10 +901,10 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		src := "/" + strings.TrimLeft(strings.TrimSpace(in.SourcePath), "/")
-		dst := strings.TrimSpace(in.TargetPath)
-		if src == "/" || dst == "" || src == dst {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and target_path required"})
+		src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
+		dst, dstOK := sanitizeRedirectTargetURL(in.TargetPath)
+		if !srcOK || !dstOK || src == dst {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and allowed target_path required"})
 			return
 		}
 		if in.StatusCode != 301 && in.StatusCode != 302 {
@@ -882,7 +1153,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			return
 		}
 		defer f.Close()
-		tmp, err := os.CreateTemp(s.deps.Config.DataDir, "volo-theme-*.zip")
+		tmp, err := os.CreateTemp(s.ensureTempDir(), "volo-theme-*.zip")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -1192,7 +1463,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		defer f.Close()
-		tmp, err := os.CreateTemp(s.deps.Config.DataDir, "volo-plugin-*.zip")
+		tmp, err := os.CreateTemp(s.ensureTempDir(), "volo-plugin-*.zip")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -1417,13 +1688,42 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.User](r.Context(), s.deps.Store,
-				`SELECT id, username, email, display_name, avatar_url, bio, website_url, role, status, email_verified_at, preferred_locale, created_at, updated_at
-				 FROM users ORDER BY created_at ASC LIMIT 300`)
+			page, perPage := parseAdminPageParams(r, 50, 300)
+			roleFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("role")))
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			where := []string{"1=1"}
+			var args []any
+			switch roleFilter {
+			case domain.RoleAdmin, domain.RoleEditor, domain.RoleReader:
+				where = append(where, "role = ?")
+				args = append(args, roleFilter)
+			case "staff":
+				where = append(where, "role IN ('admin', 'editor')")
+			}
+			if q != "" {
+				pat := "%" + q + "%"
+				where = append(where, "(LOWER(username) LIKE LOWER(?) OR LOWER(email) LIKE LOWER(?) OR LOWER(display_name) LIKE LOWER(?))")
+				args = append(args, pat, pat, pat)
+			}
+			whereSQL := strings.Join(where, " AND ")
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM users WHERE `+whereSQL, args...).Scan(&total)
+			baseSQL := `SELECT id, username, email, display_name, avatar_url, bio, website_url, role, status, email_verified_at, preferred_locale, created_at, updated_at
+				 FROM users WHERE ` + whereSQL + `
+				 ORDER BY CASE WHEN role = 'admin' THEN 0 WHEN role = 'editor' THEN 1 ELSE 2 END, created_at DESC`
+			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+			fullArgs := append(append([]any{}, args...), pageArgs...)
+			rows, _ := sqlx.Select[domain.User](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.User{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"items":    rows,
+				"users":    rows,
+				"total":    total,
+				"page":     page,
+				"per_page": perPage,
+			})
 
 		case http.MethodPost:
 			var req struct {
@@ -1566,15 +1866,88 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 
 func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if rest == "batch" && r.Method == http.MethodPost {
+		var req struct {
+			Action string   `json:"action"`
+			IDs    []string `json:"ids"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			return
+		}
+		ids := dedupCleanIDs(req.IDs, 200)
+		if len(ids) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			return
+		}
+		affected := 0
+		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			for _, bid := range ids {
+				res, dErr := tx.ExecContext(r.Context(), `DELETE FROM security_ip_bans WHERE id = ?`, bid)
+				if dErr != nil {
+					return dErr
+				}
+				if n, _ := res.RowsAffected(); n > 0 {
+					affected += int(n)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if s.deps.WAF != nil {
+			_ = s.deps.WAF.ReloadBans(r.Context())
+		}
+		s.recordAuditLog(r, actor, "security.ip_ban_batch_delete", "ip_ban", "batch", map[string]any{"affected": affected})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		return
+	}
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.SecurityIPBan](r.Context(), s.deps.Store,
-				`SELECT * FROM security_ip_bans ORDER BY created_at DESC LIMIT 300`)
+			page, perPage := parseAdminPageParams(r, 50, 300)
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			state := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("state")))
+			now := time.Now().UnixMilli()
+
+			where := []string{"1=1"}
+			var args []any
+			if q != "" {
+				pat := "%" + q + "%"
+				where = append(where, "(LOWER(cidr) LIKE LOWER(?) OR LOWER(reason) LIKE LOWER(?) OR LOWER(note) LIKE LOWER(?))")
+				args = append(args, pat, pat, pat)
+			}
+			switch state {
+			case "active":
+				where = append(where, "(expires_at = 0 OR expires_at > ?)")
+				args = append(args, now)
+			case "expired":
+				where = append(where, "(expires_at > 0 AND expires_at <= ?)")
+				args = append(args, now)
+			}
+			whereSQL := strings.Join(where, " AND ")
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM security_ip_bans WHERE `+whereSQL, args...).Scan(&total)
+			baseSQL := `SELECT * FROM security_ip_bans WHERE ` + whereSQL + ` ORDER BY created_at DESC`
+			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+			fullArgs := append(append([]any{}, args...), pageArgs...)
+			rows, _ := sqlx.Select[domain.SecurityIPBan](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.SecurityIPBan{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"items":    rows,
+				"bans":     rows,
+				"total":    total,
+				"page":     page,
+				"per_page": perPage,
+			})
 
 		case http.MethodPost:
 			var req struct {
@@ -1841,13 +2214,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			if !dryRun {
 				_, _ = s.deps.Settings.Reload(r.Context())
 				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
-				_ = s.deps.Content.WarmCaches(r.Context())
-				if s.deps.WAF != nil {
-					_ = s.deps.WAF.ReloadBans(r.Context())
-				}
-				if s.deps.Geo != nil {
-					_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-				}
+				s.reloadRuntimeAfterDBRestore(r.Context())
 				s.recordAuditLog(r, actor, "backup.local_restore", "system", base, map[string]any{"legacy": true})
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "legacy": true, "report": rep})
@@ -1863,14 +2230,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if !dryRun {
-			_, _ = s.deps.Settings.Reload(r.Context())
-			_ = s.deps.Content.WarmCaches(r.Context())
-			if s.deps.WAF != nil {
-				_ = s.deps.WAF.ReloadBans(r.Context())
-			}
-			if s.deps.Geo != nil {
-				_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-			}
+			s.reloadRuntimeAfterDBRestore(r.Context())
 			s.recordAuditLog(r, actor, "backup.local_restore", "system", base, nil)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "summary": sum})
@@ -1953,7 +2313,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 	if ext != ".zip" && ext != ".json" {
 		ext = ".zip"
 	}
-	tmp, err := os.CreateTemp(s.deps.Config.DataDir, "volo-restore-*"+ext)
+	tmp, err := os.CreateTemp(s.ensureTempDir(), "volo-restore-*"+ext)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1982,13 +2342,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 		if !dryRun {
 			_, _ = s.deps.Settings.Reload(r.Context())
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
-			_ = s.deps.Content.WarmCaches(r.Context())
-			if s.deps.WAF != nil {
-				_ = s.deps.WAF.ReloadBans(r.Context())
-			}
-			if s.deps.Geo != nil {
-				_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-			}
+			s.reloadRuntimeAfterDBRestore(r.Context())
 			s.recordAuditLog(r, actor, "backup.restore_legacy", "system", "legacy", nil)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "legacy": true, "report": rep})
@@ -2004,14 +2358,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if !dryRun {
-		_, _ = s.deps.Settings.Reload(r.Context())
-		_ = s.deps.Content.WarmCaches(r.Context())
-		if s.deps.WAF != nil {
-			_ = s.deps.WAF.ReloadBans(r.Context())
-		}
-		if s.deps.Geo != nil {
-			_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-		}
+		s.reloadRuntimeAfterDBRestore(r.Context())
 		s.recordAuditLog(r, actor, "backup.restore", "system", "native", nil)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": sum})

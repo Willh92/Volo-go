@@ -11,21 +11,25 @@ import {
 import { CM6Editor } from "../components/CM6Editor";
 import { MediaAssetRecord, MediaPickButton } from "../components/MediaLibraryModal";
 import {
+  ActionMenu,
   AnimatedModal,
   BatchBar,
   ConsoleEmpty,
   ConsoleSelect,
+  MobileSelectAllBar,
   paginateItems,
   Pagination,
   SwitchToggle,
   TableSkeleton,
   UploadButton,
+  useDebouncedValue,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
 
 export type ContentSubTab = "pages" | "categories" | "tags" | "series" | "books" | "comments" | "media";
 
 interface BookChapterDraft {
+  _uid: string;
   id?: string;
   title: string;
   url: string;
@@ -33,7 +37,13 @@ interface BookChapterDraft {
   sort_order: number;
 }
 
-const EMPTY_CAT = { id: "", name: "", slug: "", description: "", sort_order: 1 };
+let chapUidSeq = 0;
+function nextChapUid(): string {
+  chapUidSeq += 1;
+  return `ch_${Date.now()}_${chapUidSeq}`;
+}
+
+const EMPTY_CAT = { id: "", name: "", slug: "", description: "", sort_order: 10 };
 const EMPTY_TAG = { id: "", name: "", slug: "" };
 const EMPTY_SER = {
   id: "",
@@ -41,7 +51,7 @@ const EMPTY_SER = {
   slug: "",
   description: "",
   cover_url: "",
-  sort_order: 1,
+  sort_order: 10,
   article_ids: [] as string[],
 };
 const EMPTY_BOOK = {
@@ -54,7 +64,7 @@ const EMPTY_BOOK = {
   source_url: "",
   series_id: "",
   embed_mode: "iframe",
-  sort_order: 1,
+  sort_order: 10,
 };
 
 function subTabLabel(k: ContentSubTab): string {
@@ -110,10 +120,17 @@ export function ContentWorkspace({
   const locales = availableLocalesSig.value;
   const isAdmin = currentUserSig.value?.role === "admin";
   const [pageIdx, setPageIdx] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [mediaPageSize, setMediaPageSize] = useState(24);
+  const [subTotal, setSubTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const reqSeqRef = useRef(0);
 
   // Pages (list + full-width Studio Page Editor)
   const [pages, setPages] = useState<any[]>([]);
+  const [pageQuery, setPageQuery] = useState("");
+  const [pageStatusFilter, setPageStatusFilter] = useState("");
+  const debouncedPageQuery = useDebouncedValue(pageQuery, 250);
   const [pageEditorOpen, setPageEditorOpen] = useState(false);
   const [editPage, setEditPage] = useState<any | null>(null);
   const [savingPage, setSavingPage] = useState(false);
@@ -121,45 +138,71 @@ export function ContentWorkspace({
 
   // Categories
   const [categories, setCategories] = useState<any[]>([]);
+  const [catQuery, setCatQuery] = useState("");
+  const debouncedCatQuery = useDebouncedValue(catQuery, 250);
   const [catModalOpen, setCatModalOpen] = useState(false);
   const [catForm, setCatForm] = useState({ ...EMPTY_CAT });
 
   // Tags
   const [tags, setTags] = useState<any[]>([]);
   const [tagFilter, setTagFilter] = useState("");
+  const [tagSort, setTagSort] = useState<"count" | "name">("count");
+  const debouncedTagFilter = useDebouncedValue(tagFilter, 250);
   const [selTagIds, setSelTagIds] = useState<string[]>([]);
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [tagForm, setTagForm] = useState({ ...EMPTY_TAG });
 
-  // Series + Articles checklist
+  // Series + Paginated Articles checklist
   const [series, setSeries] = useState<any[]>([]);
-  const [allArticles, setAllArticles] = useState<any[]>([]);
+  const [serQuery, setSerQuery] = useState("");
+  const debouncedSerQuery = useDebouncedValue(serQuery, 250);
+  const [knownArticlesMap, setKnownArticlesMap] = useState<Record<string, any>>({});
+  const [serPickerArticles, setSerPickerArticles] = useState<any[]>([]);
+  const [serArtPage, setSerArtPage] = useState(1);
+  const [serArtTotal, setSerArtTotal] = useState(0);
   const [serModalOpen, setSerModalOpen] = useState(false);
   const [serForm, setSerForm] = useState({ ...EMPTY_SER });
   const [serArtFilter, setSerArtFilter] = useState("");
+  const debouncedSerArtFilter = useDebouncedValue(serArtFilter, 250);
 
-  // Books + Manual Chapters modal
+  // Books + Manual Chapters tree modal
   const [books, setBooks] = useState<any[]>([]);
+  const [bookQuery, setBookQuery] = useState("");
+  const [bookFilter, setBookFilter] = useState("");
+  const debouncedBookQuery = useDebouncedValue(bookQuery, 250);
   const [bookModalOpen, setBookModalOpen] = useState(false);
   const [bookForm, setBookForm] = useState({ ...EMPTY_BOOK });
   const [chapModalOpen, setChapModalOpen] = useState(false);
   const [chapBook, setChapBook] = useState<any | null>(null);
   const [chapItems, setChapItems] = useState<BookChapterDraft[]>([]);
+  const [chapQuery, setChapQuery] = useState("");
+  const [chapPage, setChapPage] = useState(1);
+  const [collapsedChapUids, setCollapsedChapUids] = useState<string[]>([]);
 
   // Comments
   const [comments, setComments] = useState<any[]>([]);
   const [cmtStatus, setCmtStatus] = useState("");
+  const [cmtStatusCounts, setCmtStatusCounts] = useState<{
+    all?: number;
+    pending?: number;
+    approved?: number;
+    rejected?: number;
+  }>({});
   const [cmtQuery, setCmtQuery] = useState("");
+  const debouncedCmtQuery = useDebouncedValue(cmtQuery, 250);
   const [selCmtIds, setSelCmtIds] = useState<string[]>([]);
   const [cmtBox, setCmtBox] = useState<{ id: string; mode: "reply" | "edit"; text: string } | null>(null);
 
   // Media Library
   const [media, setMedia] = useState<MediaAssetRecord[]>([]);
+  const [mediaAllTotal, setMediaAllTotal] = useState(0);
   const [orphanCount, setOrphanCount] = useState(0);
   const [mediaView, setMediaView] = useState<"grid" | "list">("grid");
   const [mediaRefFilter, setMediaRefFilter] = useState<"all" | "orphan" | "used">("all");
   const [mediaKindFilter, setMediaKindFilter] = useState<"all" | "image" | "audio" | "other">("all");
+  const [mediaSort, setMediaSort] = useState<"newest" | "size" | "name">("newest");
   const [mediaQuery, setMediaQuery] = useState("");
+  const debouncedMediaQuery = useDebouncedValue(mediaQuery, 250);
   const [selMediaIds, setSelMediaIds] = useState<string[]>([]);
   const [isDraggingMedia, setIsDraggingMedia] = useState(false);
   const [uploadingMedia, setUploadingMedia] = useState(false);
@@ -211,59 +254,191 @@ export function ContentWorkspace({
   };
 
   const loadSub = async () => {
+    const reqId = ++reqSeqRef.current;
     setLoading(true);
     try {
       if (sub === "pages") {
-        const r = await apiFetch<{ items: any[] }>("/api/admin/pages");
-        setPages(r.items || []);
+        const qs = new URLSearchParams();
+        qs.set("page", String(pageIdx));
+        qs.set("per_page", String(pageSize));
+        if (pageStatusFilter) qs.set("status", pageStatusFilter);
+        if (debouncedPageQuery.trim()) qs.set("q", debouncedPageQuery.trim());
+        const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/pages?${qs.toString()}`);
+        if (reqId !== reqSeqRef.current) return;
+        const list = r.items || [];
+        setPages(list);
+        setSubTotal(typeof r.total === "number" ? r.total : list.length);
       } else if (sub === "categories") {
-        const r = await apiFetch<{ items: any[] }>("/api/admin/categories");
-        setCategories(r.items || []);
+        const qs = new URLSearchParams();
+        qs.set("page", String(pageIdx));
+        qs.set("per_page", String(pageSize));
+        if (debouncedCatQuery.trim()) qs.set("q", debouncedCatQuery.trim());
+        const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/categories?${qs.toString()}`);
+        if (reqId !== reqSeqRef.current) return;
+        const list = r.items || [];
+        setCategories(list);
+        setSubTotal(typeof r.total === "number" ? r.total : list.length);
       } else if (sub === "tags") {
-        const r = await apiFetch<{ items: any[] }>("/api/admin/tags");
-        setTags(r.items || []);
+        const qs = new URLSearchParams();
+        qs.set("page", String(pageIdx));
+        qs.set("per_page", String(pageSize));
+        qs.set("sort", tagSort);
+        if (debouncedTagFilter.trim()) qs.set("q", debouncedTagFilter.trim());
+        const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/tags?${qs.toString()}`);
+        if (reqId !== reqSeqRef.current) return;
+        const list = r.items || [];
+        setTags(list);
+        setSubTotal(typeof r.total === "number" ? r.total : list.length);
       } else if (sub === "series") {
-        const [serRes, artRes] = await Promise.all([
-          apiFetch<{ items: any[] }>("/api/admin/series"),
-          apiFetch<{ items: any[] }>("/api/admin/articles"),
-        ]);
-        setSeries(serRes.items || []);
-        setAllArticles((artRes.items || []).map((row: any) => row.article || row));
+        const qs = new URLSearchParams();
+        qs.set("page", String(pageIdx));
+        qs.set("per_page", String(pageSize));
+        if (debouncedSerQuery.trim()) qs.set("q", debouncedSerQuery.trim());
+        const serRes = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/series?${qs.toString()}`);
+        if (reqId !== reqSeqRef.current) return;
+        const list = serRes.items || [];
+        setSeries(list);
+        setSubTotal(typeof serRes.total === "number" ? serRes.total : list.length);
       } else if (sub === "books") {
+        const qs = new URLSearchParams();
+        qs.set("page", String(pageIdx));
+        qs.set("per_page", String(pageSize));
+        if (debouncedBookQuery.trim()) qs.set("q", debouncedBookQuery.trim());
         const [bkRes, serRes] = await Promise.all([
-          apiFetch<{ items: any[] }>("/api/admin/books"),
-          apiFetch<{ items: any[] }>("/api/admin/series"),
+          apiFetch<{ items: any[]; total?: number }>(`/api/admin/books?${qs.toString()}`),
+          apiFetch<{ items: any[] }>("/api/admin/series?per_page=200"),
         ]);
-        setBooks(bkRes.items || []);
+        if (reqId !== reqSeqRef.current) return;
+        const list = bkRes.items || [];
+        setBooks(list);
+        setSubTotal(typeof bkRes.total === "number" ? bkRes.total : list.length);
         setSeries(serRes.items || []);
       } else if (sub === "comments") {
         const qs = new URLSearchParams();
+        qs.set("page", String(pageIdx));
+        qs.set("per_page", String(pageSize));
         if (cmtStatus) qs.set("status", cmtStatus);
-        if (cmtQuery.trim()) qs.set("q", cmtQuery.trim());
-        const r = await apiFetch<{ items: any[] }>(`/api/admin/comments?${qs.toString()}`);
-        setComments(r.items || []);
+        if (debouncedCmtQuery.trim()) qs.set("q", debouncedCmtQuery.trim());
+        const r = await apiFetch<{
+          items: any[];
+          total?: number;
+          status_counts?: { all?: number; pending?: number; approved?: number; rejected?: number };
+        }>(`/api/admin/comments?${qs.toString()}`);
+        if (reqId !== reqSeqRef.current) return;
+        const list = r.items || [];
+        setComments(list);
+        setSubTotal(typeof r.total === "number" ? r.total : list.length);
+        if (r.status_counts) setCmtStatusCounts(r.status_counts);
       } else if (sub === "media") {
+        const qs = new URLSearchParams();
+        qs.set("page", String(pageIdx));
+        qs.set("per_page", String(mediaPageSize));
+        qs.set("sort", mediaSort);
+        if (mediaKindFilter !== "all") qs.set("mime", mediaKindFilter);
+        if (mediaRefFilter === "orphan") qs.set("orphan_only", "1");
+        if (debouncedMediaQuery.trim()) qs.set("q", debouncedMediaQuery.trim());
         const r = await apiFetch<{
           items: MediaAssetRecord[];
+          total?: number;
           orphan_count?: number;
           storage_driver?: string;
-        }>("/api/admin/media");
+        }>(`/api/admin/media?${qs.toString()}`);
+        if (reqId !== reqSeqRef.current) return;
         const list = r.items || [];
+        const tot = typeof r.total === "number" ? r.total : list.length;
         setMedia(list);
+        setSubTotal(tot);
+        if (mediaRefFilter === "all" && mediaKindFilter === "all" && !debouncedMediaQuery.trim()) {
+          setMediaAllTotal(tot);
+        } else if (mediaAllTotal === 0) {
+          setMediaAllTotal(tot);
+        }
         setOrphanCount(r.orphan_count ?? list.filter((x) => x.is_orphan).length);
         storageDriverSig.value = r.storage_driver || "local";
       }
     } catch (err: any) {
-      showToast(err.message);
+      if (reqId === reqSeqRef.current) showToast(err.message);
     } finally {
-      setLoading(false);
+      if (reqId === reqSeqRef.current) setLoading(false);
     }
   };
 
   useEffect(() => {
-    setPageIdx(1);
     void loadSub();
-  }, [sub, cmtStatus]);
+  }, [
+    sub,
+    pageIdx,
+    pageSize,
+    mediaPageSize,
+    debouncedPageQuery,
+    pageStatusFilter,
+    debouncedCatQuery,
+    debouncedTagFilter,
+    tagSort,
+    debouncedSerQuery,
+    debouncedBookQuery,
+    cmtStatus,
+    debouncedCmtQuery,
+    mediaRefFilter,
+    mediaKindFilter,
+    mediaSort,
+    debouncedMediaQuery,
+  ]);
+
+  // Paginated Series Article Picker loader inside Series Modal
+  useEffect(() => {
+    if (!serModalOpen) return;
+    let cancelled = false;
+    const qs = new URLSearchParams();
+    qs.set("page", String(serArtPage));
+    qs.set("per_page", "20");
+    if (debouncedSerArtFilter.trim()) qs.set("q", debouncedSerArtFilter.trim());
+    apiFetch<{ items: any[]; total?: number }>(`/api/admin/articles?${qs.toString()}`)
+      .then((res) => {
+        if (cancelled) return;
+        const rows = (res.items || []).map((row: any) => row.article || row);
+        setSerPickerArticles(rows);
+        setSerArtTotal(typeof res.total === "number" ? res.total : rows.length);
+        setKnownArticlesMap((prev) => {
+          const next = { ...prev };
+          rows.forEach((a: any) => {
+            if (a?.id) next[a.id] = a;
+          });
+          return next;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [serModalOpen, serArtPage, debouncedSerArtFilter]);
+
+  // Hydrate titles for any already-selected Series article IDs not yet in knownArticlesMap
+  useEffect(() => {
+    if (!serModalOpen || serForm.article_ids.length === 0) return;
+    const missing = serForm.article_ids.filter((id) => !knownArticlesMap[id]);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    Promise.all(
+      missing.slice(0, 30).map((id) =>
+        apiFetch<any>(`/api/admin/articles/${encodeURIComponent(id)}`)
+          .then((r) => r?.article || r)
+          .catch(() => null)
+      )
+    ).then((loaded) => {
+      if (cancelled) return;
+      setKnownArticlesMap((prev) => {
+        const next = { ...prev };
+        loaded.forEach((a) => {
+          if (a?.id) next[a.id] = a;
+        });
+        return next;
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [serModalOpen, serForm.article_ids.length]);
 
   const updatePageDraft = (patch: Record<string, any>) => {
     setEditPage((prev: any) => (prev ? { ...prev, ...patch } : prev));
@@ -379,17 +554,32 @@ export function ContentWorkspace({
   const swapCatOrder = async (idx: number, dir: -1 | 1) => {
     const targetIdx = idx + dir;
     if (targetIdx < 0 || targetIdx >= categories.length) return;
-    const a = categories[idx];
-    const b = categories[targetIdx];
-    const orderA = Number(a.sort_order ?? idx + 1);
-    const orderB = Number(b.sort_order ?? targetIdx + 1);
-    const nextA = orderA === orderB ? orderB + dir : orderB;
-    const nextB = orderA === orderB ? orderA - dir : orderA;
+    const orders = categories.map((c) => Number(c.sort_order ?? 0));
+    const hasTies = new Set(orders).size < categories.length;
     try {
-      await Promise.all([
-        apiFetch(`/api/admin/categories/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: nextA }) }),
-        apiFetch(`/api/admin/categories/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: nextB }) }),
-      ]);
+      if (hasTies) {
+        const reordered = [...categories];
+        [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
+        await Promise.all(
+          reordered.map((item, i) => {
+            const desired = (i + 1) * 10;
+            if (Number(item.sort_order) === desired) return Promise.resolve();
+            return apiFetch(`/api/admin/categories/${item.id}`, {
+              method: "PUT",
+              body: JSON.stringify({ ...item, sort_order: desired }),
+            });
+          })
+        );
+      } else {
+        const a = categories[idx];
+        const b = categories[targetIdx];
+        const orderA = Number(a.sort_order ?? (idx + 1) * 10);
+        const orderB = Number(b.sort_order ?? (targetIdx + 1) * 10);
+        await Promise.all([
+          apiFetch(`/api/admin/categories/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: orderB }) }),
+          apiFetch(`/api/admin/categories/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: orderA }) }),
+        ]);
+      }
       void loadSub();
     } catch (err: any) {
       showToast(err.message);
@@ -418,12 +608,13 @@ export function ContentWorkspace({
   const cleanupUnusedTags = async () => {
     if (!(await openConfirm({ message: t("cnt.confirm_cleanup_tags"), danger: true }))) return;
     try {
-      const res = await apiFetch<{ deleted: number; items: any[] }>("/api/admin/tags/cleanup", {
+      const res = await apiFetch<{ deleted: number; items?: any[] }>("/api/admin/tags/cleanup", {
         method: "POST",
         body: "{}",
       });
-      setTags(res.items || []);
       showToast(t("cnt.tag_cleaned", { count: res.deleted ?? 0 }));
+      setPageIdx(1);
+      void loadSub();
     } catch (err: any) {
       showToast(err.message);
     }
@@ -511,17 +702,32 @@ export function ContentWorkspace({
   const swapBookOrder = async (idx: number, dir: -1 | 1) => {
     const targetIdx = idx + dir;
     if (targetIdx < 0 || targetIdx >= books.length) return;
-    const a = books[idx];
-    const b = books[targetIdx];
-    const orderA = Number(a.sort_order ?? idx + 1);
-    const orderB = Number(b.sort_order ?? targetIdx + 1);
-    const nextA = orderA === orderB ? orderB + dir : orderB;
-    const nextB = orderA === orderB ? orderA - dir : orderA;
+    const orders = books.map((b) => Number(b.sort_order ?? 0));
+    const hasTies = new Set(orders).size < books.length;
     try {
-      await Promise.all([
-        apiFetch(`/api/admin/books/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: nextA }) }),
-        apiFetch(`/api/admin/books/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: nextB }) }),
-      ]);
+      if (hasTies) {
+        const reordered = [...books];
+        [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
+        await Promise.all(
+          reordered.map((item, i) => {
+            const desired = (i + 1) * 10;
+            if (Number(item.sort_order) === desired) return Promise.resolve();
+            return apiFetch(`/api/admin/books/${item.id}`, {
+              method: "PUT",
+              body: JSON.stringify({ ...item, sort_order: desired }),
+            });
+          })
+        );
+      } else {
+        const a = books[idx];
+        const b = books[targetIdx];
+        const orderA = Number(a.sort_order ?? (idx + 1) * 10);
+        const orderB = Number(b.sort_order ?? (targetIdx + 1) * 10);
+        await Promise.all([
+          apiFetch(`/api/admin/books/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: orderB }) }),
+          apiFetch(`/api/admin/books/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: orderA }) }),
+        ]);
+      }
       void loadSub();
     } catch (err: any) {
       showToast(err.message);
@@ -532,8 +738,12 @@ export function ContentWorkspace({
     try {
       const res = await apiFetch<{ book: any; chapters: any[] }>(`/api/admin/books/${book.id}`);
       setChapBook(res.book || book);
+      setChapQuery("");
+      setChapPage(1);
+      setCollapsedChapUids([]);
       setChapItems(
         (res.chapters || []).map((ch: any, idx: number) => ({
+          _uid: nextChapUid(),
           id: ch.id,
           title: ch.title || "",
           url: ch.url || "",
@@ -631,7 +841,7 @@ export function ContentWorkspace({
         okCount++;
       }
       if (okCount > 0) {
-        showToast(t("cnt.media_uploaded"));
+        showToast(okCount > 1 ? t("cnt.media_uploaded_n", { count: okCount }) : t("cnt.media_uploaded"));
         await loadSub();
       }
     } catch (err: any) {
@@ -776,62 +986,32 @@ export function ContentWorkspace({
     setList(list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
   };
 
-  const filteredTags = tagFilter.trim()
-    ? tags.filter((tg) => {
-        const q = tagFilter.trim().toLowerCase();
-        return String(tg.name || "").toLowerCase().includes(q) || String(tg.slug || "").toLowerCase().includes(q);
-      })
-    : tags;
-
-  const filteredSeriesArticles = serArtFilter.trim()
-    ? allArticles.filter((a) => {
-        const q = serArtFilter.trim().toLowerCase();
-        return String(a.title || "").toLowerCase().includes(q) || String(a.slug || "").toLowerCase().includes(q);
-      })
-    : allArticles;
-
-  const filteredComments = cmtQuery.trim()
-    ? comments.filter((row) => {
-        const c = row.comment || row;
-        const q = cmtQuery.trim().toLowerCase();
-        return (
-          String(c.author_name || "").toLowerCase().includes(q) ||
-          String(c.content_md || "").toLowerCase().includes(q) ||
-          String(row.target_title || c.target_id || "").toLowerCase().includes(q) ||
-          String(c.client_ip || c.ip_masked || "").toLowerCase().includes(q)
-        );
-      })
-    : comments;
-
   const totalMediaBytes = media.reduce((acc, m) => acc + Number(m.size_bytes || 0), 0);
   const totalMB = (totalMediaBytes / (1024 * 1024)).toFixed(2);
 
-  const filteredMedia = media.filter((m) => {
-    if (mediaRefFilter === "orphan" && !m.is_orphan) return false;
-    if (mediaRefFilter === "used" && m.is_orphan) return false;
-    const mime = String(m.mime_type || "").toLowerCase();
-    if (mediaKindFilter === "image" && !mime.startsWith("image/")) return false;
-    if (mediaKindFilter === "audio" && !mime.startsWith("audio/")) return false;
-    if (mediaKindFilter === "other" && (mime.startsWith("image/") || mime.startsWith("audio/"))) return false;
-    if (mediaQuery.trim()) {
-      const q = mediaQuery.trim().toLowerCase();
-      const name = String(m.original_name || "").toLowerCase();
-      const alt = String(m.alt_text || "").toLowerCase();
-      const url = String(m.public_url || "").toLowerCase();
-      if (!name.includes(q) && !alt.includes(q) && !url.includes(q)) return false;
-    }
-    return true;
-  });
+  // Client-side fallback filtering ONLY for attributes not sent as server params (e.g. mediaRefFilter === "used", bookFilter)
+  const filteredBooks = bookFilter
+    ? books.filter((b) => {
+        if (bookFilter.startsWith("rs:")) return (b.reading_status || "") === bookFilter.slice(3);
+        return (b.source_type || "auto") === bookFilter;
+      })
+    : books;
 
-  const pagedPages = paginateItems(pages, pageIdx, 15);
-  const pagedCats = paginateItems(categories, pageIdx, 15);
-  const pagedTags = paginateItems(filteredTags, pageIdx, 15);
-  const pagedSeries = paginateItems(series, pageIdx, 15);
-  const pagedBooks = paginateItems(books, pageIdx, 15);
-  const pagedComments = paginateItems(filteredComments, pageIdx, 15);
-  const pagedMedia = paginateItems(filteredMedia, pageIdx, 24);
+  const filteredPages = pageStatusFilter
+    ? pages.filter((p) => (pageStatusFilter === "published" ? p.is_published !== false : p.is_published === false))
+    : pages;
 
-  const artMap = new Map(allArticles.map((a) => [a.id, a]));
+  const filteredMedia =
+    mediaRefFilter === "used" ? media.filter((m) => !m.is_orphan) : media;
+
+  const displayPages = filteredPages.length > pageSize ? paginateItems(filteredPages, pageIdx, pageSize).slice : filteredPages;
+  const displayCats = categories.length > pageSize ? paginateItems(categories, pageIdx, pageSize).slice : categories;
+  const displayTags = tags.length > pageSize ? paginateItems(tags, pageIdx, pageSize).slice : tags;
+  const displaySeries = series.length > pageSize ? paginateItems(series, pageIdx, pageSize).slice : series;
+  const displayBooks = filteredBooks.length > pageSize ? paginateItems(filteredBooks, pageIdx, pageSize).slice : filteredBooks;
+  const displayComments = comments.length > pageSize ? paginateItems(comments, pageIdx, pageSize).slice : comments;
+  const displayMedia =
+    filteredMedia.length > mediaPageSize ? paginateItems(filteredMedia, pageIdx, mediaPageSize).slice : filteredMedia;
 
   return (
     <div>
@@ -858,16 +1038,28 @@ export function ContentWorkspace({
               <h3 class="volo-card-title">{t("cnt.cat_head")}</h3>
               <p class="volo-sec-desc">{t("cnt.cat_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary volo-btn-sm"
-              onClick={() => {
-                setCatForm({ ...EMPTY_CAT });
-                setCatModalOpen(true);
-              }}
-            >
-              + {t("cnt.new_cat")}
-            </button>
+            <div class="volo-filter-controls">
+              <input
+                class="volo-input volo-search-input"
+                placeholder={t("art.search_ph")}
+                value={catQuery}
+                onInput={(e) => {
+                  setCatQuery((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  const maxSort = categories.reduce((mx, c) => Math.max(mx, Number(c.sort_order || 0)), 0);
+                  setCatForm({ ...EMPTY_CAT, sort_order: maxSort + 10 });
+                  setCatModalOpen(true);
+                }}
+              >
+                + {t("cnt.new_cat")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-table-wrap">
@@ -883,10 +1075,10 @@ export function ContentWorkspace({
               <tbody>
                 {loading && categories.length === 0 ? (
                   <TableSkeleton cols={4} />
-                ) : pagedCats.slice.length === 0 ? (
+                ) : displayCats.length === 0 ? (
                   <ConsoleEmpty colSpan={4} />
                 ) : (
-                  pagedCats.slice.map((c) => {
+                  displayCats.map((c) => {
                     const absIdx = categories.findIndex((x) => x.id === c.id);
                     return (
                       <tr key={c.id}>
@@ -926,9 +1118,6 @@ export function ContentWorkspace({
                             >
                               ↓
                             </button>
-                            <a class="volo-act-btn" href={`/categories/${encodeURIComponent(c.slug)}`} target="_blank" rel="noreferrer">
-                              {t("common.view")}
-                            </a>
                             <button
                               type="button"
                               class="volo-act-btn"
@@ -938,25 +1127,32 @@ export function ContentWorkspace({
                                   name: c.name || "",
                                   slug: c.slug || "",
                                   description: c.description || "",
-                                  sort_order: c.sort_order ?? 1,
+                                  sort_order: c.sort_order ?? 10,
                                 });
                                 setCatModalOpen(true);
                               }}
                             >
                               {t("common.edit")}
                             </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
-                              onClick={async () => {
-                                if (!(await openConfirm({ message: t("cnt.confirm_del_cat"), danger: true }))) return;
-                                await apiFetch(`/api/admin/categories/${c.id}`, { method: "DELETE" });
-                                showToast(t("common.deleted"));
-                                void loadSub();
-                              }}
-                            >
-                              {t("common.delete")}
-                            </button>
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("common.view"),
+                                  href: `/categories/${encodeURIComponent(c.slug)}`,
+                                  target: "_blank",
+                                },
+                                {
+                                  label: t("common.delete"),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (!(await openConfirm({ message: t("cnt.confirm_del_cat"), danger: true }))) return;
+                                    await apiFetch(`/api/admin/categories/${c.id}`, { method: "DELETE" });
+                                    showToast(t("common.deleted"));
+                                    void loadSub();
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -966,7 +1162,16 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={categories.length} page={pagedCats.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={subTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={(sz) => {
+              setPageSize(sz);
+              setPageIdx(1);
+            }}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={catModalOpen}
@@ -1011,7 +1216,7 @@ export function ContentWorkspace({
                   <input
                     type="number"
                     class="volo-input"
-                    value={catForm.sort_order ?? 1}
+                    value={catForm.sort_order ?? 10}
                     onInput={(e) => setCatForm({ ...catForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
                   />
                 </div>
@@ -1040,6 +1245,18 @@ export function ContentWorkspace({
               <p class="volo-sec-desc">{t("cnt.tag_desc")}</p>
             </div>
             <div class="volo-filter-controls">
+              <ConsoleSelect
+                searchable={false}
+                value={tagSort}
+                onChange={(val) => {
+                  setTagSort((val as "count" | "name") || "count");
+                  setPageIdx(1);
+                }}
+                options={[
+                  { value: "count", label: t("cnt.tag_sort_count") },
+                  { value: "name", label: t("cnt.tag_sort_name") },
+                ]}
+              />
               <input
                 class="volo-input volo-search-input"
                 placeholder={t("cnt.tag_filter_ph")}
@@ -1073,6 +1290,18 @@ export function ContentWorkspace({
             </button>
           </BatchBar>
 
+          <MobileSelectAllBar
+            checked={displayTags.length > 0 && displayTags.every((tg) => selTagIds.includes(tg.id))}
+            count={selTagIds.length}
+            total={displayTags.length}
+            onToggle={(on) => {
+              const pageIds = displayTags.map((tg) => tg.id);
+              setSelTagIds(
+                on ? Array.from(new Set([...selTagIds, ...pageIds])) : selTagIds.filter((id) => !pageIds.includes(id))
+              );
+            }}
+          />
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -1081,10 +1310,10 @@ export function ContentWorkspace({
                     <input
                       type="checkbox"
                       aria-label={t("ov.select_all")}
-                      checked={pagedTags.slice.length > 0 && pagedTags.slice.every((tg) => selTagIds.includes(tg.id))}
+                      checked={displayTags.length > 0 && displayTags.every((tg) => selTagIds.includes(tg.id))}
                       onChange={(e) => {
                         const on = (e.currentTarget as HTMLInputElement).checked;
-                        const pageIds = pagedTags.slice.map((tg) => tg.id);
+                        const pageIds = displayTags.map((tg) => tg.id);
                         setSelTagIds(on ? Array.from(new Set([...selTagIds, ...pageIds])) : selTagIds.filter((id) => !pageIds.includes(id)));
                       }}
                     />
@@ -1098,10 +1327,10 @@ export function ContentWorkspace({
               <tbody>
                 {loading && tags.length === 0 ? (
                   <TableSkeleton cols={5} />
-                ) : pagedTags.slice.length === 0 ? (
+                ) : displayTags.length === 0 ? (
                   <ConsoleEmpty colSpan={5} />
                 ) : (
-                  pagedTags.slice.map((tg) => (
+                  displayTags.map((tg) => (
                     <tr key={tg.id}>
                       <td class="col-check">
                         <input
@@ -1154,7 +1383,16 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={filteredTags.length} page={pagedTags.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={subTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={(sz) => {
+              setPageSize(sz);
+              setPageIdx(1);
+            }}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={tagModalOpen}
@@ -1206,17 +1444,30 @@ export function ContentWorkspace({
               <h3 class="volo-card-title">{t("cnt.ser_head")}</h3>
               <p class="volo-sec-desc">{t("cnt.ser_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary volo-btn-sm"
-              onClick={() => {
-                setSerForm({ ...EMPTY_SER });
-                setSerArtFilter("");
-                setSerModalOpen(true);
-              }}
-            >
-              + {t("cnt.new_series")}
-            </button>
+            <div class="volo-filter-controls">
+              <input
+                class="volo-input volo-search-input"
+                placeholder={t("art.search_ph")}
+                value={serQuery}
+                onInput={(e) => {
+                  setSerQuery((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  const maxSort = series.reduce((mx, s) => Math.max(mx, Number(s.sort_order || 0)), 0);
+                  setSerForm({ ...EMPTY_SER, sort_order: maxSort + 10 });
+                  setSerArtFilter("");
+                  setSerArtPage(1);
+                  setSerModalOpen(true);
+                }}
+              >
+                + {t("cnt.new_series")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-table-wrap">
@@ -1232,10 +1483,10 @@ export function ContentWorkspace({
               <tbody>
                 {loading && series.length === 0 ? (
                   <TableSkeleton cols={4} />
-                ) : pagedSeries.slice.length === 0 ? (
+                ) : displaySeries.length === 0 ? (
                   <ConsoleEmpty colSpan={4} />
                 ) : (
-                  pagedSeries.slice.map((s) => (
+                  displaySeries.map((s) => (
                     <tr key={s.id}>
                       <td class="col-fluid" data-label={t("cnt.col_name")}>
                         <div class="volo-cell-main">
@@ -1270,10 +1521,11 @@ export function ContentWorkspace({
                                 slug: s.slug || "",
                                 description: s.description || "",
                                 cover_url: s.cover_url || "",
-                                sort_order: s.sort_order ?? 1,
+                                sort_order: s.sort_order ?? 10,
                                 article_ids: Array.isArray(s.article_ids) ? [...s.article_ids] : [],
                               });
                               setSerArtFilter("");
+                              setSerArtPage(1);
                               setSerModalOpen(true);
                             }}
                           >
@@ -1299,7 +1551,16 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={series.length} page={pagedSeries.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={subTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={(sz) => {
+              setPageSize(sz);
+              setPageIdx(1);
+            }}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={serModalOpen}
@@ -1344,7 +1605,7 @@ export function ContentWorkspace({
                   <input
                     type="number"
                     class="volo-input"
-                    value={serForm.sort_order ?? 1}
+                    value={serForm.sort_order ?? 10}
                     onInput={(e) => setSerForm({ ...serForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
                   />
                 </div>
@@ -1375,19 +1636,34 @@ export function ContentWorkspace({
               </div>
 
               {serForm.article_ids.length > 0 && (
-                <div class="volo-subcard">
+                <div class="volo-subcard" style={{ maxHeight: "196px", overflowY: "auto" }}>
                   <div class="volo-subcard-title">
                     <span>
                       {t("cnt.ser_articles_lbl")} ({serForm.article_ids.length})
                     </span>
                   </div>
                   {serForm.article_ids.map((aid, idx) => {
-                    const art = artMap.get(aid);
+                    const art = knownArticlesMap[aid];
+                    const titleText = art?.title || aid;
                     return (
-                      <div key={aid} class="volo-input-row" style={{ marginBottom: "6px" }}>
-                        <span class="volo-code-chip">#{idx + 1}</span>
-                        <span class="volo-w-full">{art?.title || aid}</span>
-                        <div class="volo-row-actions">
+                      <div key={aid} class="volo-input-row" style={{ marginBottom: "6px", flexWrap: "nowrap" }}>
+                        <span class="volo-code-chip" style={{ flexShrink: 0 }}>
+                          #{idx + 1}
+                        </span>
+                        <span
+                          style={{
+                            flex: 1,
+                            minWidth: 0,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                            fontSize: "13px",
+                          }}
+                          title={titleText}
+                        >
+                          {titleText}
+                        </span>
+                        <div class="volo-row-actions" style={{ flexShrink: 0 }}>
                           <button
                             type="button"
                             class="volo-act-btn"
@@ -1432,18 +1708,25 @@ export function ContentWorkspace({
                     class="volo-input volo-search-input"
                     placeholder={t("ed.qi_search_art")}
                     value={serArtFilter}
-                    onInput={(e) => setSerArtFilter((e.currentTarget as HTMLInputElement).value)}
+                    onInput={(e) => {
+                      setSerArtFilter((e.currentTarget as HTMLInputElement).value);
+                      setSerArtPage(1);
+                    }}
                   />
                 </div>
-                <div class="volo-subcard" style={{ maxHeight: "200px", overflowY: "auto" }}>
-                  {filteredSeriesArticles.length === 0 ? (
+                <div class="volo-subcard" style={{ maxHeight: "220px", overflowY: "auto" }}>
+                  {serPickerArticles.length === 0 ? (
                     <div class="volo-help">{t("tbl.empty")}</div>
                   ) : (
-                    filteredSeriesArticles.map((art) => {
+                    serPickerArticles.map((art) => {
                       const checked = serForm.article_ids.includes(art.id);
                       return (
-                        <label key={art.id} class="volo-check-item" style={{ justifyContent: "space-between" }}>
-                          <span class="volo-cell-title">
+                        <label
+                          key={art.id}
+                          class="volo-check-item"
+                          style={{ justifyContent: "space-between", gap: "8px" }}
+                        >
+                          <span class="volo-cell-title" style={{ minWidth: 0, flex: 1 }}>
                             <input
                               type="checkbox"
                               checked={checked}
@@ -1457,14 +1740,26 @@ export function ContentWorkspace({
                                 });
                               }}
                             />
-                            <span>{art.title}</span>
+                            <span
+                              style={{
+                                minWidth: 0,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {art.title || art.slug}
+                            </span>
                           </span>
-                          <span class="volo-code-chip">/{art.slug}</span>
+                          <span class="volo-code-chip" style={{ flexShrink: 0 }}>
+                            /{art.slug}
+                          </span>
                         </label>
                       );
                     })
                   )}
                 </div>
+                <Pagination total={serArtTotal} page={serArtPage} pageSize={20} onChange={setSerArtPage} />
               </div>
             </form>
           </AnimatedModal>
@@ -1479,16 +1774,52 @@ export function ContentWorkspace({
               <h3 class="volo-card-title">{t("cnt.book_head")}</h3>
               <p class="volo-sec-desc">{t("cnt.book_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary volo-btn-sm"
-              onClick={() => {
-                setBookForm({ ...EMPTY_BOOK });
-                setBookModalOpen(true);
-              }}
-            >
-              + {t("cnt.new_book")}
-            </button>
+            <div class="volo-filter-controls">
+              <ConsoleSelect
+                searchable={false}
+                value={bookFilter}
+                onChange={(val) => {
+                  setBookFilter(val);
+                  setPageIdx(1);
+                }}
+                options={[
+                  { value: "", label: t("art.all") },
+                  ...(books.some((b) => b.reading_status)
+                    ? [
+                        { value: "rs:reading", label: t("cnt.book_rs_reading") },
+                        { value: "rs:finished", label: t("cnt.book_rs_finished") },
+                        { value: "rs:wishlist", label: t("cnt.book_rs_wishlist") },
+                      ]
+                    : []),
+                  { value: "auto", label: t("cnt.book_src_auto") },
+                  { value: "gitbook", label: t("cnt.book_src_gitbook") },
+                  { value: "mdbook", label: t("cnt.book_src_mdbook") },
+                  { value: "vuepress", label: t("cnt.book_src_vuepress") },
+                  { value: "series", label: t("cnt.book_src_series") },
+                  { value: "manual", label: t("cnt.book_src_manual") },
+                ]}
+              />
+              <input
+                class="volo-input volo-search-input"
+                placeholder={t("ed.qi_search_books")}
+                value={bookQuery}
+                onInput={(e) => {
+                  setBookQuery((e.currentTarget as HTMLInputElement).value);
+                  setPageIdx(1);
+                }}
+              />
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  const maxSort = books.reduce((mx, b) => Math.max(mx, Number(b.sort_order || 0)), 0);
+                  setBookForm({ ...EMPTY_BOOK, sort_order: maxSort + 10 });
+                  setBookModalOpen(true);
+                }}
+              >
+                + {t("cnt.new_book")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-table-wrap">
@@ -1504,10 +1835,10 @@ export function ContentWorkspace({
               <tbody>
                 {loading && books.length === 0 ? (
                   <TableSkeleton cols={4} />
-                ) : pagedBooks.slice.length === 0 ? (
+                ) : displayBooks.length === 0 ? (
                   <ConsoleEmpty colSpan={4} />
                 ) : (
-                  pagedBooks.slice.map((b) => {
+                  displayBooks.map((b) => {
                     const absIdx = books.findIndex((x) => x.id === b.id);
                     return (
                       <tr key={b.id}>
@@ -1552,29 +1883,6 @@ export function ContentWorkspace({
                             >
                               ↓
                             </button>
-                            <a class="volo-act-btn" href={`/books/${encodeURIComponent(b.slug)}`} target="_blank" rel="noreferrer">
-                              {t("common.view")}
-                            </a>
-                            {(b.source_url || b.series_id) && (
-                              <button
-                                type="button"
-                                class="volo-act-btn"
-                                onClick={async () => {
-                                  try {
-                                    const r = await apiFetch<{ chapter_count: number }>(`/api/admin/books/${b.id}/sync`, {
-                                      method: "POST",
-                                      body: "{}",
-                                    });
-                                    showToast(t("cnt.book_synced", { count: r.chapter_count ?? 0 }));
-                                    void loadSub();
-                                  } catch (err: any) {
-                                    showToast(err.message);
-                                  }
-                                }}
-                              >
-                                {t("cnt.book_sync_toc")}
-                              </button>
-                            )}
                             <button type="button" class="volo-act-btn" onClick={() => void openManageChapters(b)}>
                               {t("cnt.manage_chapters")}
                             </button>
@@ -1588,18 +1896,41 @@ export function ContentWorkspace({
                             >
                               {t("common.edit")}
                             </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
-                              onClick={async () => {
-                                if (!(await openConfirm({ message: t("cnt.confirm_del_book"), danger: true }))) return;
-                                await apiFetch(`/api/admin/books/${b.id}`, { method: "DELETE" });
-                                showToast(t("common.deleted"));
-                                void loadSub();
-                              }}
-                            >
-                              {t("common.delete")}
-                            </button>
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("common.view"),
+                                  href: `/books/${encodeURIComponent(b.slug)}`,
+                                  target: "_blank",
+                                },
+                                {
+                                  label: t("cnt.book_sync_toc"),
+                                  hidden: !(b.source_url || b.series_id),
+                                  onClick: async () => {
+                                    try {
+                                      const r = await apiFetch<{ chapter_count: number }>(`/api/admin/books/${b.id}/sync`, {
+                                        method: "POST",
+                                        body: "{}",
+                                      });
+                                      showToast(t("cnt.book_synced", { count: r.chapter_count ?? 0 }));
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
+                                  },
+                                },
+                                {
+                                  label: t("common.delete"),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (!(await openConfirm({ message: t("cnt.confirm_del_book"), danger: true }))) return;
+                                    await apiFetch(`/api/admin/books/${b.id}`, { method: "DELETE" });
+                                    showToast(t("common.deleted"));
+                                    void loadSub();
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -1609,7 +1940,16 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={books.length} page={pagedBooks.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={bookFilter ? filteredBooks.length : subTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={(sz) => {
+              setPageSize(sz);
+              setPageIdx(1);
+            }}
+            onChange={setPageIdx}
+          />
 
           <AnimatedModal
             open={bookModalOpen}
@@ -1654,7 +1994,7 @@ export function ContentWorkspace({
                   <input
                     type="number"
                     class="volo-input"
-                    value={bookForm.sort_order ?? 1}
+                    value={bookForm.sort_order ?? 10}
                     onInput={(e) => setBookForm({ ...bookForm, sort_order: Number((e.currentTarget as HTMLInputElement).value) || 0 })}
                   />
                 </div>
@@ -1743,7 +2083,7 @@ export function ContentWorkspace({
             onClose={() => setChapModalOpen(false)}
             title={t("cnt.chap_modal_title", { title: chapBook?.title || "" })}
             subtitle={t("cnt.chap_modal_desc")}
-            maxWidth="680px"
+            maxWidth="760px"
             footer={
               <>
                 <button type="button" class="volo-btn" onClick={() => setChapModalOpen(false)}>
@@ -1755,108 +2095,243 @@ export function ContentWorkspace({
               </>
             }
           >
-            <div class="volo-sec-head">
+            <div class="volo-sec-head" style={{ marginBottom: "10px" }}>
               <span class="volo-help">{t("cnt.book_chapters", { count: chapItems.length })}</span>
-              <button
-                type="button"
-                class="volo-btn volo-btn-sm"
-                onClick={() =>
-                  setChapItems([...chapItems, { title: "", url: "", depth: 0, sort_order: chapItems.length + 1 }])
-                }
-              >
-                + {t("cnt.chap_add")}
-              </button>
+              <div class="volo-filter-controls">
+                {chapItems.length > 6 && (
+                  <input
+                    class="volo-input volo-search-input"
+                    placeholder={t("cnt.chap_search_ph")}
+                    value={chapQuery}
+                    onInput={(e) => {
+                      setChapQuery((e.currentTarget as HTMLInputElement).value);
+                      setChapPage(1);
+                    }}
+                  />
+                )}
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm volo-btn-primary"
+                  onClick={() => {
+                    const next = [
+                      ...chapItems,
+                      { _uid: nextChapUid(), title: "", url: "", depth: 0, sort_order: chapItems.length + 1 },
+                    ];
+                    setChapItems(next);
+                    setChapQuery("");
+                    setChapPage(Math.max(1, Math.ceil(next.length / 80)));
+                  }}
+                >
+                  + {t("cnt.chap_add")}
+                </button>
+              </div>
             </div>
             {chapItems.length === 0 ? (
               <ConsoleEmpty />
             ) : (
-              <div>
-                {chapItems.map((ch, idx) => (
-                  <div key={idx} class="volo-subcard">
-                    <div class="volo-grid-2">
-                      <div class="volo-field">
-                        <input
-                          class="volo-input"
-                          placeholder={t("cnt.chap_title_ph")}
-                          value={ch.title}
-                          onInput={(e) => {
-                            const next = [...chapItems];
-                            next[idx] = { ...ch, title: (e.currentTarget as HTMLInputElement).value };
-                            setChapItems(next);
-                          }}
-                        />
-                      </div>
-                      <div class="volo-field">
-                        <input
-                          class="volo-input"
-                          placeholder={t("cnt.chap_url_ph")}
-                          value={ch.url}
-                          onInput={(e) => {
-                            const next = [...chapItems];
-                            next[idx] = { ...ch, url: (e.currentTarget as HTMLInputElement).value };
-                            setChapItems(next);
-                          }}
-                        />
-                      </div>
+              (() => {
+                const q = chapQuery.trim().toLowerCase();
+                const collapsedSet = new Set(collapsedChapUids);
+                const visibleRows: Array<{ ch: BookChapterDraft; idx: number; hasChildren: boolean; isCollapsed: boolean }> = [];
+                let activeTopParentCollapsed = false;
+
+                for (let i = 0; i < chapItems.length; i++) {
+                  const ch = chapItems[i];
+                  const d = Math.max(0, Math.min(3, Number(ch.depth) || 0));
+                  const hasChildren = d === 0 && i + 1 < chapItems.length && (Number(chapItems[i + 1].depth) || 0) > 0;
+                  const isCollapsed = d === 0 && collapsedSet.has(ch._uid);
+                  if (d === 0) {
+                    activeTopParentCollapsed = isCollapsed;
+                  } else if (!q && activeTopParentCollapsed) {
+                    continue;
+                  }
+                  if (q && !ch.title.toLowerCase().includes(q) && !ch.url.toLowerCase().includes(q)) {
+                    continue;
+                  }
+                  visibleRows.push({ ch, idx: i, hasChildren, isCollapsed });
+                }
+
+                const pagedRows = paginateItems(visibleRows, chapPage, 80);
+
+                return visibleRows.length === 0 ? (
+                  <ConsoleEmpty />
+                ) : (
+                  <>
+                    <div class="volo-chap-tree">
+                      {pagedRows.slice.map(({ ch, idx, hasChildren, isCollapsed }) => {
+                        const depth = Math.max(0, Math.min(3, Number(ch.depth) || 0));
+                        return (
+                          <div
+                            key={ch._uid}
+                            class="volo-chap-row"
+                            style={{ paddingLeft: `${8 + depth * 20}px` }}
+                          >
+                            {hasChildren ? (
+                              <button
+                                type="button"
+                                class="volo-chap-btn"
+                                title={isCollapsed ? t("common.open") : t("common.close")}
+                                onClick={() =>
+                                  setCollapsedChapUids((prev) =>
+                                    prev.includes(ch._uid) ? prev.filter((u) => u !== ch._uid) : [...prev, ch._uid]
+                                  )
+                                }
+                              >
+                                {isCollapsed ? "▸" : "▾"}
+                              </button>
+                            ) : (
+                              <span
+                                style={{
+                                  width: "26px",
+                                  textAlign: "center",
+                                  color: "var(--volo-muted)",
+                                  fontSize: "11px",
+                                  flexShrink: 0,
+                                }}
+                              >
+                                {depth === 0 ? "•" : "↳"}
+                              </span>
+                            )}
+
+                            <div class="volo-chap-inputs">
+                              <input
+                                class="volo-input"
+                                placeholder={t("cnt.chap_title_ph")}
+                                value={ch.title}
+                                onInput={(e) => {
+                                  const val = (e.currentTarget as HTMLInputElement).value;
+                                  setChapItems((prev) => {
+                                    const next = [...prev];
+                                    next[idx] = { ...next[idx], title: val };
+                                    return next;
+                                  });
+                                }}
+                              />
+                              <input
+                                class="volo-input"
+                                placeholder={t("cnt.chap_url_ph")}
+                                value={ch.url}
+                                onInput={(e) => {
+                                  const val = (e.currentTarget as HTMLInputElement).value;
+                                  setChapItems((prev) => {
+                                    const next = [...prev];
+                                    next[idx] = { ...next[idx], url: val };
+                                    return next;
+                                  });
+                                }}
+                              />
+                            </div>
+
+                            <div class="volo-chap-acts">
+                              <button
+                                type="button"
+                                class="volo-chap-btn"
+                                disabled={depth <= 0}
+                                title={t("cnt.chap_depth_lbl")}
+                                onClick={() => {
+                                  setChapItems((prev) => {
+                                    const next = [...prev];
+                                    next[idx] = { ...next[idx], depth: Math.max(0, depth - 1) };
+                                    return next;
+                                  });
+                                }}
+                              >
+                                ←
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-chap-btn"
+                                disabled={depth >= 3}
+                                title={t("cnt.chap_depth_lbl")}
+                                onClick={() => {
+                                  setChapItems((prev) => {
+                                    const next = [...prev];
+                                    next[idx] = { ...next[idx], depth: Math.min(3, depth + 1) };
+                                    return next;
+                                  });
+                                }}
+                              >
+                                →
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-chap-btn"
+                                title={t("cnt.chap_add")}
+                                onClick={() => {
+                                  setCollapsedChapUids((prev) => prev.filter((u) => u !== ch._uid));
+                                  setChapItems((prev) => {
+                                    const next = [...prev];
+                                    next.splice(idx + 1, 0, {
+                                      _uid: nextChapUid(),
+                                      title: "",
+                                      url: "",
+                                      depth,
+                                      sort_order: idx + 2,
+                                    });
+                                    return next;
+                                  });
+                                }}
+                              >
+                                +
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-chap-btn"
+                                disabled={idx === 0}
+                                onClick={() => {
+                                  if (idx === 0) return;
+                                  setChapItems((prev) => {
+                                    const next = [...prev];
+                                    [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+                                    return next;
+                                  });
+                                }}
+                              >
+                                ↑
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-chap-btn"
+                                disabled={idx >= chapItems.length - 1}
+                                onClick={() => {
+                                  if (idx >= chapItems.length - 1) return;
+                                  setChapItems((prev) => {
+                                    const next = [...prev];
+                                    [next[idx + 1], next[idx]] = [next[idx], next[idx + 1]];
+                                    return next;
+                                  });
+                                }}
+                              >
+                                ↓
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-chap-btn danger"
+                                title={t("common.delete")}
+                                onClick={async () => {
+                                  const isEmpty = !ch.title.trim() && !ch.url.trim();
+                                  if (!isEmpty && !(await openConfirm({ message: t("cnt.confirm_del_chap"), danger: true }))) {
+                                    return;
+                                  }
+                                  setChapItems((prev) => prev.filter((_, i) => i !== idx));
+                                }}
+                              >
+                                ×
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
-                    <div class="volo-input-row">
-                      <span class="volo-help">{t("cnt.chap_depth_lbl")}</span>
-                      <ConsoleSelect
-                        value={String(ch.depth)}
-                        onChange={(val) => {
-                          const next = [...chapItems];
-                          next[idx] = { ...ch, depth: Number(val) || 0 };
-                          setChapItems(next);
-                        }}
-                        options={[
-                          { value: "0", label: "0" },
-                          { value: "1", label: "1" },
-                          { value: "2", label: "2" },
-                          { value: "3", label: "3" },
-                        ]}
-                      />
-                      <div class="volo-row-actions">
-                        <button
-                          type="button"
-                          class="volo-act-btn"
-                          disabled={idx === 0}
-                          onClick={() => {
-                            if (idx === 0) return;
-                            const next = [...chapItems];
-                            [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
-                            setChapItems(next);
-                          }}
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          class="volo-act-btn"
-                          disabled={idx === chapItems.length - 1}
-                          onClick={() => {
-                            if (idx >= chapItems.length - 1) return;
-                            const next = [...chapItems];
-                            [next[idx + 1], next[idx]] = [next[idx], next[idx + 1]];
-                            setChapItems(next);
-                          }}
-                        >
-                          ↓
-                        </button>
-                        <button
-                          type="button"
-                          class="volo-act-btn danger"
-                          onClick={async () => {
-                            if (!(await openConfirm({ message: t("cnt.confirm_del_chap"), danger: true }))) return;
-                            setChapItems(chapItems.filter((_, i) => i !== idx));
-                          }}
-                        >
-                          {t("common.delete")}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
+                    <Pagination
+                      total={visibleRows.length}
+                      page={pagedRows.safePage}
+                      pageSize={80}
+                      onChange={setChapPage}
+                    />
+                  </>
+                );
+              })()
             )}
           </AnimatedModal>
         </div>
@@ -1997,9 +2472,33 @@ export function ContentWorkspace({
                   <h3 class="volo-card-title">{t("cnt.pages")}</h3>
                   <p class="volo-sec-desc">{t("cnt.page_desc")}</p>
                 </div>
-                <button type="button" class="volo-btn volo-btn-primary volo-btn-sm" onClick={openNewPageEditor}>
-                  + {t("cnt.new_page")}
-                </button>
+                <div class="volo-filter-controls">
+                  <ConsoleSelect
+                    searchable={false}
+                    value={pageStatusFilter}
+                    onChange={(val) => {
+                      setPageStatusFilter(val);
+                      setPageIdx(1);
+                    }}
+                    options={[
+                      { value: "", label: t("art.all") },
+                      { value: "published", label: t("cnt.page_published") },
+                      { value: "draft", label: t("cnt.page_hidden") },
+                    ]}
+                  />
+                  <input
+                    class="volo-input volo-search-input"
+                    placeholder={t("art.search_ph")}
+                    value={pageQuery}
+                    onInput={(e) => {
+                      setPageQuery((e.currentTarget as HTMLInputElement).value);
+                      setPageIdx(1);
+                    }}
+                  />
+                  <button type="button" class="volo-btn volo-btn-primary volo-btn-sm" onClick={openNewPageEditor}>
+                    + {t("cnt.new_page")}
+                  </button>
+                </div>
               </div>
               <div class="volo-table-wrap">
                 <table class="volo-table">
@@ -2015,10 +2514,10 @@ export function ContentWorkspace({
                   <tbody>
                     {loading && pages.length === 0 ? (
                       <TableSkeleton cols={5} />
-                    ) : pagedPages.slice.length === 0 ? (
+                    ) : displayPages.length === 0 ? (
                       <ConsoleEmpty colSpan={5} />
                     ) : (
-                      pagedPages.slice.map((p) => (
+                      displayPages.map((p) => (
                         <tr key={p.id}>
                           <td class="col-fluid" data-label={t("cnt.page_col")}>
                             <div class="volo-cell-main">
@@ -2076,7 +2575,16 @@ export function ContentWorkspace({
                   </tbody>
                 </table>
               </div>
-              <Pagination total={pages.length} page={pagedPages.safePage} pageSize={15} onChange={setPageIdx} />
+              <Pagination
+                total={pageStatusFilter ? filteredPages.length : subTotal}
+                page={pageIdx}
+                pageSize={pageSize}
+                onPageSizeChange={(sz) => {
+                  setPageSize(sz);
+                  setPageIdx(1);
+                }}
+                onChange={setPageIdx}
+              />
             </>
           )}
         </div>
@@ -2105,18 +2613,22 @@ export function ContentWorkspace({
               />
               <div class="volo-filter-pills">
                 {[
-                  { val: "", label: t("cnt.cmt_all") },
-                  { val: "pending", label: t("cnt.cmt_pending") },
-                  { val: "approved", label: t("cnt.cmt_approved") },
-                  { val: "rejected", label: t("cnt.cmt_rejected") },
+                  { val: "", label: t("cnt.cmt_all"), count: cmtStatusCounts.all },
+                  { val: "pending", label: t("cnt.cmt_pending"), count: cmtStatusCounts.pending },
+                  { val: "approved", label: t("cnt.cmt_approved"), count: cmtStatusCounts.approved },
+                  { val: "rejected", label: t("cnt.cmt_rejected"), count: cmtStatusCounts.rejected },
                 ].map((it) => (
                   <button
                     key={it.val}
                     type="button"
                     class={`volo-filter-pill ${cmtStatus === it.val ? "active" : ""}`}
-                    onClick={() => setCmtStatus(it.val)}
+                    onClick={() => {
+                      setCmtStatus(it.val);
+                      setPageIdx(1);
+                    }}
                   >
                     {it.label}
+                    {typeof it.count === "number" ? ` (${it.count})` : ""}
                   </button>
                 ))}
               </div>
@@ -2140,6 +2652,23 @@ export function ContentWorkspace({
             </button>
           </BatchBar>
 
+          <MobileSelectAllBar
+            checked={
+              displayComments.length > 0 &&
+              displayComments.every((row) => selCmtIds.includes((row.comment || row).id))
+            }
+            count={selCmtIds.length}
+            total={displayComments.length}
+            onToggle={(on) => {
+              const pageIds = displayComments.map((row) => (row.comment || row).id);
+              setSelCmtIds(
+                on
+                  ? Array.from(new Set([...selCmtIds, ...pageIds]))
+                  : selCmtIds.filter((id) => !pageIds.includes(id))
+              );
+            }}
+          />
+
           <div class="volo-table-wrap">
             <table class="volo-table">
               <thead>
@@ -2149,12 +2678,12 @@ export function ContentWorkspace({
                       type="checkbox"
                       aria-label={t("ov.select_all")}
                       checked={
-                        pagedComments.slice.length > 0 &&
-                        pagedComments.slice.every((row) => selCmtIds.includes((row.comment || row).id))
+                        displayComments.length > 0 &&
+                        displayComments.every((row) => selCmtIds.includes((row.comment || row).id))
                       }
                       onChange={(e) => {
                         const on = (e.currentTarget as HTMLInputElement).checked;
-                        const pageIds = pagedComments.slice.map((row) => (row.comment || row).id);
+                        const pageIds = displayComments.map((row) => (row.comment || row).id);
                         setSelCmtIds(
                           on
                             ? Array.from(new Set([...selCmtIds, ...pageIds]))
@@ -2172,10 +2701,10 @@ export function ContentWorkspace({
               <tbody>
                 {loading && comments.length === 0 ? (
                   <TableSkeleton cols={5} />
-                ) : pagedComments.slice.length === 0 ? (
+                ) : displayComments.length === 0 ? (
                   <ConsoleEmpty text={t("cnt.cmt_empty")} colSpan={5} />
                 ) : (
-                  pagedComments.slice.map((row) => {
+                  displayComments.map((row) => {
                     const c = row.comment || row;
                     const canBanIp = isAdmin && Boolean(c.ip_masked || c.client_ip || c.author_name);
                     const targetTitle = row.target_title || row.target_slug || c.target_id;
@@ -2207,30 +2736,43 @@ export function ContentWorkspace({
                                 {t("cnt.cmt_on", { target: targetTitle })} ↗
                               </a>
                             </div>
-                            <div style={{ whiteSpace: "pre-wrap", fontSize: "13.5px", margin: "3px 0" }}>
+                            <div
+                              style={{
+                                whiteSpace: "pre-wrap",
+                                overflowWrap: "anywhere",
+                                wordBreak: "break-word",
+                                fontSize: "13.5px",
+                                margin: "3px 0",
+                              }}
+                            >
                               {c.content_md}
                             </div>
                             {isBoxOpen && cmtBox && (
-                              <div class="volo-input-row">
-                                <input
-                                  class="volo-input"
-                                  autoComplete="off"
+                              <div style={{ marginTop: "6px" }}>
+                                <textarea
+                                  class="volo-textarea"
+                                  rows={3}
                                   placeholder={cmtBox.mode === "reply" ? t("cnt.cmt_reply_ph") : ""}
                                   value={cmtBox.text}
                                   onInput={(e) =>
-                                    setCmtBox({ ...cmtBox, text: (e.currentTarget as HTMLInputElement).value })
+                                    setCmtBox({ ...cmtBox, text: (e.currentTarget as HTMLTextAreaElement).value })
                                   }
                                   onKeyDown={(e) => {
-                                    if (e.key === "Enter") void submitCommentBox();
+                                    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                                      e.preventDefault();
+                                      void submitCommentBox();
+                                    }
                                     if (e.key === "Escape") setCmtBox(null);
                                   }}
                                 />
-                                <button type="button" class="volo-act-btn" onClick={() => void submitCommentBox()}>
-                                  {cmtBox.mode === "reply" ? t("cnt.cmt_reply_btn") : t("common.save")}
-                                </button>
-                                <button type="button" class="volo-act-btn" onClick={() => setCmtBox(null)}>
-                                  {t("common.cancel")}
-                                </button>
+                                <div class="volo-row-actions" style={{ marginTop: "6px" }}>
+                                  <button type="button" class="volo-btn volo-btn-primary volo-btn-sm" onClick={() => void submitCommentBox()}>
+                                    {cmtBox.mode === "reply" ? t("cnt.cmt_reply_btn") : t("common.save")}
+                                  </button>
+                                  <button type="button" class="volo-btn volo-btn-sm" onClick={() => setCmtBox(null)}>
+                                    {t("common.cancel")}
+                                  </button>
+                                </div>
                               </div>
                             )}
                           </div>
@@ -2250,6 +2792,21 @@ export function ContentWorkspace({
                         </td>
                         <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
+                            {c.status !== "approved" && (
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={async () => {
+                                  await apiFetch(`/api/admin/comments/${c.id}`, {
+                                    method: "PATCH",
+                                    body: JSON.stringify({ status: "approved" }),
+                                  });
+                                  void loadSub();
+                                }}
+                              >
+                                {t("cnt.cmt_approve")}
+                              </button>
+                            )}
                             <button
                               type="button"
                               class="volo-act-btn"
@@ -2276,74 +2833,54 @@ export function ContentWorkspace({
                             >
                               {t("common.edit")}
                             </button>
-                            {c.status !== "approved" && (
-                              <button
-                                type="button"
-                                class="volo-act-btn"
-                                onClick={async () => {
-                                  await apiFetch(`/api/admin/comments/${c.id}`, {
-                                    method: "PATCH",
-                                    body: JSON.stringify({ status: "approved" }),
-                                  });
-                                  void loadSub();
-                                }}
-                              >
-                                {t("cnt.cmt_approve")}
-                              </button>
-                            )}
-                            {c.status !== "rejected" && (
-                              <button
-                                type="button"
-                                class="volo-act-btn"
-                                onClick={async () => {
-                                  await apiFetch(`/api/admin/comments/${c.id}`, {
-                                    method: "PATCH",
-                                    body: JSON.stringify({ status: "rejected" }),
-                                  });
-                                  void loadSub();
-                                }}
-                              >
-                                {t("cnt.cmt_reject")}
-                              </button>
-                            )}
-                            {canBanIp && (
-                              <button
-                                type="button"
-                                class="volo-act-btn danger"
-                                onClick={async () => {
-                                  if (!(await openConfirm({ message: t("cnt.cmt_confirm_ban_ip"), danger: true }))) return;
-                                  try {
-                                    await apiFetch(`/api/admin/comments/${c.id}/ban-ip`, {
-                                      method: "POST",
-                                      body: JSON.stringify({
-                                        duration_hours: 720,
-                                        expires_hours: 720,
-                                        reason: "comment spam",
-                                        note: "comment spam",
-                                      }),
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("cnt.cmt_reject"),
+                                  hidden: c.status === "rejected",
+                                  onClick: async () => {
+                                    await apiFetch(`/api/admin/comments/${c.id}`, {
+                                      method: "PATCH",
+                                      body: JSON.stringify({ status: "rejected" }),
                                     });
-                                    showToast(t("cnt.cmt_ip_banned"));
                                     void loadSub();
-                                  } catch (err: any) {
-                                    showToast(err.message);
-                                  }
-                                }}
-                              >
-                                {t("cnt.cmt_ban_ip")}
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
-                              onClick={async () => {
-                                if (!(await openConfirm({ message: t("cnt.confirm_del_cmt"), danger: true }))) return;
-                                await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
-                                showToast(t("common.deleted"));
-                                void loadSub();
-                              }}
-                            >
-                              {t("common.delete")}
-                            </button>
+                                  },
+                                },
+                                {
+                                  label: t("cnt.cmt_ban_ip"),
+                                  hidden: !canBanIp,
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (!(await openConfirm({ message: t("cnt.cmt_confirm_ban_ip"), danger: true }))) return;
+                                    try {
+                                      await apiFetch(`/api/admin/comments/${c.id}/ban-ip`, {
+                                        method: "POST",
+                                        body: JSON.stringify({
+                                          duration_hours: 720,
+                                          expires_hours: 720,
+                                          reason: "comment spam",
+                                          note: "comment spam",
+                                        }),
+                                      });
+                                      showToast(t("cnt.cmt_ip_banned"));
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
+                                  },
+                                },
+                                {
+                                  label: t("common.delete"),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (!(await openConfirm({ message: t("cnt.confirm_del_cmt"), danger: true }))) return;
+                                    await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
+                                    showToast(t("common.deleted"));
+                                    void loadSub();
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -2353,340 +2890,403 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
-          <Pagination total={filteredComments.length} page={pagedComments.safePage} pageSize={15} onChange={setPageIdx} />
+          <Pagination
+            total={subTotal}
+            page={pageIdx}
+            pageSize={pageSize}
+            onPageSizeChange={(sz) => {
+              setPageSize(sz);
+              setPageIdx(1);
+            }}
+            onChange={setPageIdx}
+          />
         </div>
       )}
 
       {/* 7. Media Library */}
-      {sub === "media" && (
-        <div
-          class={`volo-card volo-media-dropzone ${isDraggingMedia ? "is-dragging" : ""}`}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setIsDraggingMedia(true);
-          }}
-          onDragLeave={(e) => {
-            if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDraggingMedia(false);
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            setIsDraggingMedia(false);
-            if (e.dataTransfer?.files?.length) void uploadMediaFiles(e.dataTransfer.files);
-          }}
-        >
-          <div class="volo-sec-head">
-            <div class="volo-sec-copy">
-              <div class="volo-cell-title">
-                <h3 class="volo-card-title">{t("cnt.media_head")}</h3>
-                <span class="volo-badge">{t("cnt.media_total_stat", { count: media.length, mb: totalMB })}</span>
-                {orphanCount > 0 && (
-                  <span class="volo-status-pill warn">
-                    <span class="volo-status-dot" />
-                    {t("cnt.media_orphan_stat", { count: orphanCount })}
-                  </span>
-                )}
+      {sub === "media" && (() => {
+        const effectiveMediaTotal = mediaAllTotal || subTotal || media.length;
+        return (
+          <div
+            class={`volo-card volo-media-dropzone ${isDraggingMedia ? "is-dragging" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDraggingMedia(true);
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDraggingMedia(false);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDraggingMedia(false);
+              if (e.dataTransfer?.files?.length) void uploadMediaFiles(e.dataTransfer.files);
+            }}
+          >
+            <div class="volo-sec-head">
+              <div class="volo-sec-copy">
+                <div class="volo-cell-title">
+                  <h3 class="volo-card-title">{t("cnt.media_head")}</h3>
+                  <span class="volo-badge">{t("cnt.media_total_stat", { count: effectiveMediaTotal, mb: totalMB })}</span>
+                  {orphanCount > 0 && (
+                    <span class="volo-status-pill warn">
+                      <span class="volo-status-dot" />
+                      {t("cnt.media_orphan_stat", { count: orphanCount })}
+                    </span>
+                  )}
+                </div>
+                <p class="volo-sec-desc">{t("cnt.media_desc")}</p>
               </div>
-              <p class="volo-sec-desc">{t("cnt.media_desc")}</p>
+
+              <div class="volo-filter-controls">
+                <div class="volo-filter-pills">
+                  <button
+                    type="button"
+                    class={`volo-filter-pill ${mediaView === "grid" ? "active" : ""}`}
+                    onClick={() => {
+                      setMediaView("grid");
+                      setPageIdx(1);
+                    }}
+                  >
+                    {t("cnt.media_view_grid")}
+                  </button>
+                  <button
+                    type="button"
+                    class={`volo-filter-pill ${mediaView === "list" ? "active" : ""}`}
+                    onClick={() => {
+                      setMediaView("list");
+                      setPageIdx(1);
+                    }}
+                  >
+                    {t("cnt.media_view_list")}
+                  </button>
+                </div>
+
+                {(storageDriverSig.value || "local") === "local" && (
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-sm"
+                    disabled={reconcilingMedia}
+                    onClick={() => void handleReconcileDisk()}
+                  >
+                    {t("cnt.media_scan_btn")}
+                  </button>
+                )}
+
+                {isAdmin && (
+                  <button type="button" class="volo-btn volo-btn-sm volo-btn-danger" onClick={() => void handleCleanOrphans()}>
+                    {orphanCount > 0 ? t("cnt.media_clean_orphans", { count: orphanCount }) : t("cnt.clean_orphans")}
+                  </button>
+                )}
+
+                <UploadButton
+                  accept="image/*,audio/*,video/*,.pdf,.zip"
+                  label={t("cnt.media_upload")}
+                  busy={uploadingMedia}
+                  primary
+                  multiple
+                  onFiles={(files) => void uploadMediaFiles(files)}
+                />
+              </div>
             </div>
 
-            <div class="volo-filter-controls">
+            <div class="volo-filter-bar">
               <div class="volo-filter-pills">
                 <button
                   type="button"
-                  class={`volo-filter-pill ${mediaView === "grid" ? "active" : ""}`}
+                  class={`volo-filter-pill ${mediaRefFilter === "all" ? "active" : ""}`}
                   onClick={() => {
-                    setMediaView("grid");
+                    setMediaRefFilter("all");
                     setPageIdx(1);
                   }}
                 >
-                  {t("cnt.media_view_grid")}
+                  {t("cnt.media_filter_all")} ({effectiveMediaTotal})
                 </button>
                 <button
                   type="button"
-                  class={`volo-filter-pill ${mediaView === "list" ? "active" : ""}`}
+                  class={`volo-filter-pill ${mediaRefFilter === "orphan" ? "active" : ""}`}
                   onClick={() => {
-                    setMediaView("list");
+                    setMediaRefFilter("orphan");
                     setPageIdx(1);
                   }}
                 >
-                  {t("cnt.media_view_list")}
+                  {t("cnt.media_filter_orphan")} ({orphanCount})
+                </button>
+                <button
+                  type="button"
+                  class={`volo-filter-pill ${mediaRefFilter === "used" ? "active" : ""}`}
+                  onClick={() => {
+                    setMediaRefFilter("used");
+                    setPageIdx(1);
+                  }}
+                >
+                  {t("cnt.media_filter_used")} ({Math.max(0, effectiveMediaTotal - orphanCount)})
                 </button>
               </div>
 
-              {(storageDriverSig.value || "local") === "local" && (
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-sm"
-                  disabled={reconcilingMedia}
-                  onClick={() => void handleReconcileDisk()}
-                >
-                  {t("cnt.media_scan_btn")}
-                </button>
-              )}
-
-              {isAdmin && (
-                <button type="button" class="volo-btn volo-btn-sm volo-btn-danger" onClick={() => void handleCleanOrphans()}>
-                  {orphanCount > 0 ? t("cnt.media_clean_orphans", { count: orphanCount }) : t("cnt.clean_orphans")}
-                </button>
-              )}
-
-              <UploadButton
-                accept="image/*,audio/*,video/*,.pdf,.zip"
-                label={t("cnt.media_upload")}
-                busy={uploadingMedia}
-                primary
-                onFile={(f) => void uploadMediaFiles([f])}
-              />
+              <div class="volo-filter-controls">
+                <ConsoleSelect
+                  searchable={false}
+                  value={mediaSort}
+                  onChange={(val) => {
+                    setMediaSort((val as "newest" | "size" | "name") || "newest");
+                    setPageIdx(1);
+                  }}
+                  options={[
+                    { value: "newest", label: t("cnt.media_sort_newest") },
+                    { value: "size", label: t("cnt.media_sort_size") },
+                    { value: "name", label: t("cnt.media_sort_name") },
+                  ]}
+                />
+                <ConsoleSelect
+                  searchable={false}
+                  value={mediaKindFilter}
+                  onChange={(val) => {
+                    setMediaKindFilter(val as "all" | "image" | "audio" | "other");
+                    setPageIdx(1);
+                  }}
+                  options={[
+                    { value: "all", label: t("cnt.media_type_all") },
+                    { value: "image", label: t("cnt.media_type_image") },
+                    { value: "audio", label: t("cnt.media_type_audio") },
+                    { value: "other", label: t("cnt.media_type_other") },
+                  ]}
+                />
+                <input
+                  class="volo-input volo-search-input"
+                  autoComplete="off"
+                  placeholder={t("cnt.media_search_ph")}
+                  value={mediaQuery}
+                  onInput={(e) => {
+                    setMediaQuery((e.currentTarget as HTMLInputElement).value);
+                    setPageIdx(1);
+                  }}
+                />
+              </div>
             </div>
-          </div>
 
-          <div class="volo-filter-bar">
-            <div class="volo-filter-pills">
-              <button
-                type="button"
-                class={`volo-filter-pill ${mediaRefFilter === "all" ? "active" : ""}`}
-                onClick={() => {
-                  setMediaRefFilter("all");
-                  setPageIdx(1);
-                }}
-              >
-                {t("cnt.media_filter_all")} ({media.length})
+            <BatchBar count={selMediaIds.length} onClear={() => setSelMediaIds([])}>
+              <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteMedia()}>
+                {t("common.delete")}
               </button>
-              <button
-                type="button"
-                class={`volo-filter-pill ${mediaRefFilter === "orphan" ? "active" : ""}`}
-                onClick={() => {
-                  setMediaRefFilter("orphan");
-                  setPageIdx(1);
-                }}
-              >
-                {t("cnt.media_filter_orphan")} ({orphanCount})
-              </button>
-              <button
-                type="button"
-                class={`volo-filter-pill ${mediaRefFilter === "used" ? "active" : ""}`}
-                onClick={() => {
-                  setMediaRefFilter("used");
-                  setPageIdx(1);
-                }}
-              >
-                {t("cnt.media_filter_used")} ({Math.max(0, media.length - orphanCount)})
-              </button>
-            </div>
+            </BatchBar>
 
-            <div class="volo-filter-controls">
-              <ConsoleSelect
-                value={mediaKindFilter}
-                onChange={(val) => {
-                  setMediaKindFilter(val as "all" | "image" | "audio" | "other");
-                  setPageIdx(1);
-                }}
-                options={[
-                  { value: "all", label: t("cnt.media_type_all") },
-                  { value: "image", label: t("cnt.media_type_image") },
-                  { value: "audio", label: t("cnt.media_type_audio") },
-                  { value: "other", label: t("cnt.media_type_other") },
-                ]}
-              />
-              <input
-                class="volo-input volo-search-input"
-                autoComplete="off"
-                placeholder={t("cnt.media_search_ph")}
-                value={mediaQuery}
-                onInput={(e) => {
-                  setMediaQuery((e.currentTarget as HTMLInputElement).value);
-                  setPageIdx(1);
-                }}
-              />
-            </div>
-          </div>
-
-          <BatchBar count={selMediaIds.length} onClear={() => setSelMediaIds([])}>
-            <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteMedia()}>
-              {t("common.delete")}
-            </button>
-          </BatchBar>
-
-          {loading && media.length === 0 ? (
-            <div class="volo-table-wrap">
-              <table class="volo-table">
-                <tbody>
-                  <TableSkeleton cols={5} />
-                </tbody>
-              </table>
-            </div>
-          ) : pagedMedia.slice.length === 0 ? (
-            <ConsoleEmpty />
-          ) : mediaView === "grid" ? (
-            <div class="volo-media-grid">
-              {pagedMedia.slice.map((m) => {
-                const displayName = m.original_name || m.id;
-                const mime = String(m.mime_type || "");
-                const isImage = mime.startsWith("image/");
-                const isAudio = mime.startsWith("audio/");
-                const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE").toUpperCase();
-                const isSelected = selMediaIds.includes(m.id);
-                return (
-                  <div
-                    key={m.id}
-                    class={`volo-media-card ${m.is_orphan ? "is-orphan" : ""} ${isSelected ? "is-selected" : ""}`}
-                  >
-                    <div class="volo-media-thumb" onClick={() => openAssetLightbox(m)}>
-                      <label class="volo-media-select-cb" onClick={(e) => e.stopPropagation()}>
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => toggleSel(selMediaIds, setSelMediaIds, m.id)}
-                        />
-                      </label>
-                      {isImage ? (
-                        <img src={m.public_url} alt={m.alt_text || displayName} loading="lazy" />
-                      ) : isAudio ? (
-                        <div class="volo-media-type-placeholder">
-                          <audio
-                            controls
-                            preload="none"
-                            src={m.public_url}
-                            style={{ width: "90%", height: "32px" }}
-                            onClick={(e) => e.stopPropagation()}
-                          />
-                        </div>
-                      ) : (
-                        <div class="volo-media-type-placeholder">
-                          <span class="volo-code-chip">{extBadge}</span>
-                        </div>
-                      )}
-                      <span class={`volo-media-ref-pill ${m.is_orphan ? "orphan" : "used"}`}>
-                        {m.is_orphan
-                          ? t("cnt.media_badge_orphan")
-                          : t("cnt.media_badge_used", { count: m.ref_count || 1 })}
-                      </span>
-                    </div>
-
-                    <div class="volo-media-body">
-                      <div class="volo-media-name" title={displayName}>
-                        {displayName}
-                      </div>
-                      <div class="volo-media-meta">
-                        <span>{m.width > 0 ? `${m.width}×${m.height}` : mime || "file"}</span>
-                        <span>{formatAssetSize(m.size_bytes)}</span>
-                      </div>
-                      <div class="volo-media-actions">
-                        <button type="button" class="volo-act-btn" onClick={() => copyMediaMarkdown(m)}>
-                          {t("cnt.media_copy_md")}
-                        </button>
-                        <button type="button" class="volo-act-btn" onClick={() => copyMediaUrl(m)}>
-                          {t("cnt.media_copy")}
-                        </button>
-                        <button type="button" class="volo-act-btn danger" onClick={() => void handleDeleteMediaItem(m)}>
-                          {t("common.delete")}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div class="volo-table-wrap">
-              <table class="volo-table">
-                <thead>
-                  <tr>
-                    <th class="col-check">
-                      <input
-                        type="checkbox"
-                        aria-label={t("ov.select_all")}
-                        checked={pagedMedia.slice.length > 0 && pagedMedia.slice.every((m) => selMediaIds.includes(m.id))}
-                        onChange={(e) => {
-                          const on = (e.currentTarget as HTMLInputElement).checked;
-                          const pageIds = pagedMedia.slice.map((m) => m.id);
-                          setSelMediaIds(
-                            on
-                              ? Array.from(new Set([...selMediaIds, ...pageIds]))
-                              : selMediaIds.filter((id) => !pageIds.includes(id))
-                          );
-                        }}
-                      />
-                    </th>
-                    <th class="col-fluid">{t("cnt.media_col_asset")}</th>
-                    <th class="col-status">{t("art.status")}</th>
-                    <th class="col-cat">{t("cnt.media_col_mime")}</th>
-                    <th class="col-num">{t("cnt.media_col_size")}</th>
-                    <th class="col-date">{t("cnt.media_col_uploaded")}</th>
-                    <th class="col-act col-act-th">{t("art.actions")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pagedMedia.slice.map((m) => {
-                    const displayName = m.original_name || m.id;
-                    const mime = String(m.mime_type || "");
-                    return (
-                      <tr key={m.id}>
-                        <td class="col-check">
+            {loading && media.length === 0 ? (
+              <div class="volo-table-wrap">
+                <table class="volo-table">
+                  <tbody>
+                    <TableSkeleton cols={5} />
+                  </tbody>
+                </table>
+              </div>
+            ) : displayMedia.length === 0 ? (
+              <ConsoleEmpty />
+            ) : mediaView === "grid" ? (
+              <div class="volo-media-grid">
+                {displayMedia.map((m) => {
+                  const displayName = m.original_name || m.id;
+                  const mime = String(m.mime_type || "");
+                  const isImage = mime.startsWith("image/");
+                  const isAudio = mime.startsWith("audio/");
+                  const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE").toUpperCase();
+                  const isSelected = selMediaIds.includes(m.id);
+                  return (
+                    <div
+                      key={m.id}
+                      class={`volo-media-card ${m.is_orphan ? "is-orphan" : ""} ${isSelected ? "is-selected" : ""}`}
+                    >
+                      <div class="volo-media-thumb" onClick={() => openAssetLightbox(m)}>
+                        <label class="volo-media-select-cb" onClick={(e) => e.stopPropagation()}>
                           <input
                             type="checkbox"
-                            checked={selMediaIds.includes(m.id)}
+                            checked={isSelected}
                             onChange={() => toggleSel(selMediaIds, setSelMediaIds, m.id)}
                           />
-                        </td>
-                        <td class="col-fluid" data-label={t("cnt.media_col_asset")}>
-                          <div class="volo-cell-main">
-                            <div class="volo-cell-title">
-                              <button type="button" class="volo-act-btn" onClick={() => openAssetLightbox(m)}>
-                                {displayName}
-                              </button>
-                              {m.storage_driver && <span class="volo-mini-tag">{m.storage_driver}</span>}
-                            </div>
-                            <div class="volo-cell-meta">
-                              <span class="volo-code-chip">{m.public_url}</span>
-                            </div>
+                        </label>
+                        {isImage ? (
+                          <img src={m.public_url} alt={m.alt_text || displayName} loading="lazy" />
+                        ) : isAudio ? (
+                          <div class="volo-media-type-placeholder">
+                            <audio
+                              controls
+                              preload="none"
+                              src={m.public_url}
+                              style={{ width: "90%", height: "32px" }}
+                              onClick={(e) => e.stopPropagation()}
+                            />
                           </div>
-                        </td>
-                        <td class="col-status" data-label={t("art.status")}>
-                          <span class={`volo-status-pill ${m.is_orphan ? "warn" : "ok"}`}>
-                            <span class="volo-status-dot" />
-                            {m.is_orphan
-                              ? t("cnt.media_badge_orphan")
-                              : t("cnt.media_badge_used", { count: m.ref_count || 1 })}
-                          </span>
-                        </td>
-                        <td class="col-cat" data-label={t("cnt.media_col_mime")}>
-                          <div class="volo-cell-main">
-                            <span class="volo-cat-chip">{mime || "file"}</span>
-                            {m.width > 0 && <span class="volo-help">{m.width}×{m.height}</span>}
+                        ) : (
+                          <div class="volo-media-type-placeholder">
+                            <span class="volo-code-chip">{extBadge}</span>
                           </div>
-                        </td>
-                        <td class="col-num" data-label={t("cnt.media_col_size")}>
-                          {formatAssetSize(m.size_bytes)}
-                        </td>
-                        <td class="col-date" data-label={t("cnt.media_col_uploaded")}>
-                          {formatDateTime(m.created_at)}
-                        </td>
-                        <td class="col-act" data-label={t("art.actions")}>
-                          <div class="volo-row-actions">
-                            <button type="button" class="volo-act-btn" onClick={() => openAssetLightbox(m)}>
-                              {t("common.edit")}
-                            </button>
-                            <button type="button" class="volo-act-btn" onClick={() => copyMediaMarkdown(m)}>
-                              {t("cnt.media_copy_md")}
-                            </button>
-                            <button type="button" class="volo-act-btn" onClick={() => copyMediaUrl(m)}>
-                              {t("cnt.media_copy")}
-                            </button>
-                            <button type="button" class="volo-act-btn danger" onClick={() => void handleDeleteMediaItem(m)}>
-                              {t("common.delete")}
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
+                        )}
+                        <span class={`volo-media-ref-pill ${m.is_orphan ? "orphan" : "used"}`}>
+                          {m.is_orphan
+                            ? t("cnt.media_badge_orphan")
+                            : t("cnt.media_badge_used", { count: m.ref_count || 1 })}
+                        </span>
+                      </div>
 
-          <Pagination total={filteredMedia.length} page={pagedMedia.safePage} pageSize={24} onChange={setPageIdx} />
+                      <div class="volo-media-body">
+                        <div class="volo-media-name" title={displayName}>
+                          {displayName}
+                        </div>
+                        <div class="volo-media-meta">
+                          <span>{m.width > 0 ? `${m.width}×${m.height}` : mime || "file"}</span>
+                          <span>{formatAssetSize(m.size_bytes)}</span>
+                        </div>
+                        <div class="volo-media-actions">
+                          <button type="button" class="volo-act-btn" onClick={() => copyMediaMarkdown(m)}>
+                            {t("cnt.media_copy_md")}
+                          </button>
+                          <button type="button" class="volo-act-btn" onClick={() => copyMediaUrl(m)}>
+                            {t("cnt.media_copy")}
+                          </button>
+                          <button type="button" class="volo-act-btn danger" onClick={() => void handleDeleteMediaItem(m)}>
+                            {t("common.delete")}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <>
+                <MobileSelectAllBar
+                  checked={displayMedia.length > 0 && displayMedia.every((m) => selMediaIds.includes(m.id))}
+                  count={selMediaIds.length}
+                  total={displayMedia.length}
+                  onToggle={(on) => {
+                    const pageIds = displayMedia.map((m) => m.id);
+                    setSelMediaIds(
+                      on
+                        ? Array.from(new Set([...selMediaIds, ...pageIds]))
+                        : selMediaIds.filter((id) => !pageIds.includes(id))
+                    );
+                  }}
+                />
+                <div class="volo-table-wrap">
+                  <table class="volo-table">
+                    <thead>
+                      <tr>
+                        <th class="col-check">
+                          <input
+                            type="checkbox"
+                            aria-label={t("ov.select_all")}
+                            checked={displayMedia.length > 0 && displayMedia.every((m) => selMediaIds.includes(m.id))}
+                            onChange={(e) => {
+                              const on = (e.currentTarget as HTMLInputElement).checked;
+                              const pageIds = displayMedia.map((m) => m.id);
+                              setSelMediaIds(
+                                on
+                                  ? Array.from(new Set([...selMediaIds, ...pageIds]))
+                                  : selMediaIds.filter((id) => !pageIds.includes(id))
+                              );
+                            }}
+                          />
+                        </th>
+                        <th class="col-fluid">{t("cnt.media_col_asset")}</th>
+                        <th class="col-status">{t("art.status")}</th>
+                        <th class="col-cat">{t("cnt.media_col_mime")}</th>
+                        <th class="col-num">{t("cnt.media_col_size")}</th>
+                        <th class="col-date">{t("cnt.media_col_uploaded")}</th>
+                        <th class="col-act col-act-th">{t("art.actions")}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayMedia.map((m) => {
+                        const displayName = m.original_name || m.id;
+                        const mime = String(m.mime_type || "");
+                        return (
+                          <tr key={m.id}>
+                            <td class="col-check">
+                              <input
+                                type="checkbox"
+                                checked={selMediaIds.includes(m.id)}
+                                onChange={() => toggleSel(selMediaIds, setSelMediaIds, m.id)}
+                              />
+                            </td>
+                            <td class="col-fluid" data-label={t("cnt.media_col_asset")}>
+                              <div class="volo-cell-main">
+                                <div class="volo-cell-title">
+                                  <button type="button" class="volo-act-btn" onClick={() => openAssetLightbox(m)}>
+                                    {displayName}
+                                  </button>
+                                  {m.storage_driver && <span class="volo-mini-tag">{m.storage_driver}</span>}
+                                </div>
+                                <div class="volo-cell-meta">
+                                  <span class="volo-code-chip">{m.public_url}</span>
+                                </div>
+                              </div>
+                            </td>
+                            <td class="col-status" data-label={t("art.status")}>
+                              <span class={`volo-status-pill ${m.is_orphan ? "warn" : "ok"}`}>
+                                <span class="volo-status-dot" />
+                                {m.is_orphan
+                                  ? t("cnt.media_badge_orphan")
+                                  : t("cnt.media_badge_used", { count: m.ref_count || 1 })}
+                              </span>
+                            </td>
+                            <td class="col-cat" data-label={t("cnt.media_col_mime")}>
+                              <div class="volo-cell-main">
+                                <span class="volo-cat-chip">{mime || "file"}</span>
+                                {m.width > 0 && <span class="volo-help">{m.width}×{m.height}</span>}
+                              </div>
+                            </td>
+                            <td class="col-num" data-label={t("cnt.media_col_size")}>
+                              {formatAssetSize(m.size_bytes)}
+                            </td>
+                            <td class="col-date" data-label={t("cnt.media_col_uploaded")}>
+                              {formatDateTime(m.created_at)}
+                            </td>
+                            <td class="col-act" data-label={t("art.actions")}>
+                              <div class="volo-row-actions">
+                                <button type="button" class="volo-act-btn" onClick={() => openAssetLightbox(m)}>
+                                  {t("common.edit")}
+                                </button>
+                                <button type="button" class="volo-act-btn" onClick={() => copyMediaMarkdown(m)}>
+                                  {t("cnt.media_copy_md")}
+                                </button>
+                                <ActionMenu
+                                  items={[
+                                    {
+                                      label: t("cnt.media_copy"),
+                                      onClick: () => copyMediaUrl(m),
+                                    },
+                                    {
+                                      label: `${t("cnt.media_open_new")} ↗`,
+                                      href: m.public_url,
+                                      target: "_blank",
+                                    },
+                                    {
+                                      label: t("common.delete"),
+                                      danger: true,
+                                      onClick: () => void handleDeleteMediaItem(m),
+                                    },
+                                  ]}
+                                />
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+
+            <Pagination
+              total={mediaRefFilter === "used" ? filteredMedia.length : subTotal}
+              page={pageIdx}
+              pageSize={mediaPageSize}
+              pageSizeOptions={[24, 48, 96]}
+              onPageSizeChange={(sz) => {
+                setMediaPageSize(sz);
+                setPageIdx(1);
+              }}
+              onChange={setPageIdx}
+            />
 
           {/* Lightbox Asset Preview & Metadata Edit Modal */}
           <AnimatedModal
@@ -2794,8 +3394,9 @@ export function ContentWorkspace({
               </>
             )}
           </AnimatedModal>
-        </div>
-      )}
+          </div>
+        );
+      })()}
     </div>
   );
 }

@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	stdhtml "html"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	nethtml "golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -86,9 +90,41 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 		if s.Site.LicenseTemplate == "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}" {
 			s.Site.LicenseTemplate = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
 		}
+		s.Site.CustomHeadMeta = SanitizeCustomHeadMeta(s.Site.CustomHeadMeta)
+		if s.Site.FaviconURL != "" {
+			if cleanFav, ok := SanitizeAllowedURL(s.Site.FaviconURL, false); ok {
+				s.Site.FaviconURL = cleanFav
+			} else {
+				s.Site.FaviconURL = "/favicon.svg"
+			}
+		}
+		if s.Site.LogoURL != "" {
+			if cleanLogo, ok := SanitizeAllowedURL(s.Site.LogoURL, false); ok {
+				s.Site.LogoURL = cleanLogo
+			} else {
+				s.Site.LogoURL = ""
+			}
+		}
+		for i := range s.Site.SocialLinks {
+			if s.Site.SocialLinks[i].URL != "" {
+				if cleanU, ok := SanitizeAllowedURL(s.Site.SocialLinks[i].URL, true); ok {
+					s.Site.SocialLinks[i].URL = cleanU
+				} else {
+					s.Site.SocialLinks[i].URL = "#"
+				}
+			}
+		}
 		return nil
 	case domain.SettingsDomainReading:
-		return json.Unmarshal([]byte(rec.ValueJSON), &s.Reading)
+		s.Reading.EnablePJAX = true
+		s.Reading.VendorCDNPrefix = domain.DefaultVendorCDNPrefix
+		if err := json.Unmarshal([]byte(rec.ValueJSON), &s.Reading); err != nil {
+			return err
+		}
+		if strings.TrimSpace(s.Reading.VendorCDNPrefix) == "" {
+			s.Reading.VendorCDNPrefix = domain.DefaultVendorCDNPrefix
+		}
+		return nil
 	case domain.SettingsDomainFeed:
 		return json.Unmarshal([]byte(rec.ValueJSON), &s.Feed)
 	case domain.SettingsDomainSEO:
@@ -116,7 +152,11 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 	case domain.SettingsDomainSecurity:
 		return json.Unmarshal([]byte(rec.ValueJSON), &s.Security)
 	case domain.SettingsDomainAppearance:
-		return json.Unmarshal([]byte(rec.ValueJSON), &s.Appearance)
+		if err := json.Unmarshal([]byte(rec.ValueJSON), &s.Appearance); err != nil {
+			return err
+		}
+		s.Appearance.CustomCSS = sanitizeCustomCSS(s.Appearance.CustomCSS)
+		return nil
 	case domain.SettingsDomainBackup:
 		if err := json.Unmarshal([]byte(rec.ValueJSON), &s.Backup); err != nil {
 			return err
@@ -510,9 +550,38 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if v.LicenseTemplate == "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}" {
 			v.LicenseTemplate = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
 		}
+		v.FaviconURL = strings.TrimSpace(StripASCIIControls(v.FaviconURL))
+		if v.FaviconURL != "" {
+			cleanFav, ok := SanitizeAllowedURL(v.FaviconURL, false)
+			if !ok {
+				return nil, fmt.Errorf("settings: unsafe or invalid site.favicon_url %q", v.FaviconURL)
+			}
+			v.FaviconURL = cleanFav
+		}
+		v.LogoURL = strings.TrimSpace(StripASCIIControls(v.LogoURL))
+		if v.LogoURL != "" {
+			cleanLogo, ok := SanitizeAllowedURL(v.LogoURL, false)
+			if !ok {
+				return nil, fmt.Errorf("settings: unsafe or invalid site.logo_url %q", v.LogoURL)
+			}
+			v.LogoURL = cleanLogo
+		}
 		if v.SocialLinks == nil {
 			v.SocialLinks = []domain.SocialLink{}
 		}
+		for i := range v.SocialLinks {
+			rawU := strings.TrimSpace(StripASCIIControls(v.SocialLinks[i].URL))
+			if rawU != "" {
+				cleanU, ok := SanitizeAllowedURL(rawU, true)
+				if !ok {
+					return nil, fmt.Errorf("settings: unsafe or invalid site.social_links[%d].url %q", i, v.SocialLinks[i].URL)
+				}
+				v.SocialLinks[i].URL = cleanU
+			} else {
+				v.SocialLinks[i].URL = ""
+			}
+		}
+		v.CustomHeadMeta = SanitizeCustomHeadMeta(v.CustomHeadMeta)
 		if v.CustomVars == nil {
 			v.CustomVars = map[string]string{}
 		}
@@ -528,13 +597,19 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if v.PoWDifficultyBits < 8 || v.PoWDifficultyBits > 24 {
 			v.PoWDifficultyBits = 16
 		}
-		v.AssetCDNPrefix = strings.TrimRight(strings.TrimSpace(v.AssetCDNPrefix), "/")
-		if v.AssetCDNPrefix != "" {
-			low := strings.ToLower(v.AssetCDNPrefix)
-			if !strings.HasPrefix(low, "https://") && !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "//") {
-				return nil, fmt.Errorf("settings: invalid reading.asset_cdn_prefix %q", v.AssetCDNPrefix)
-			}
+		cleanAssetPrefix, okAsset := sanitizeCDNPrefix(v.AssetCDNPrefix)
+		if !okAsset {
+			return nil, fmt.Errorf("settings: invalid reading.asset_cdn_prefix %q", v.AssetCDNPrefix)
 		}
+		v.AssetCDNPrefix = cleanAssetPrefix
+		cleanVendorPrefix, okVendor := sanitizeCDNPrefix(v.VendorCDNPrefix)
+		if !okVendor {
+			return nil, fmt.Errorf("settings: invalid reading.vendor_cdn_prefix %q", v.VendorCDNPrefix)
+		}
+		if cleanVendorPrefix == "" {
+			cleanVendorPrefix = domain.DefaultVendorCDNPrefix
+		}
+		v.VendorCDNPrefix = cleanVendorPrefix
 		return json.Marshal(v)
 	case domain.SettingsDomainFeed:
 		var v domain.FeedSettings
@@ -642,24 +717,329 @@ func parseClearSecretsList(v any) map[string]bool {
 	return out
 }
 
+// StripASCIIControls strips all ASCII control characters (<= 0x1F and 0x7F) anywhere in s.
+func StripASCIIControls(s string) string {
+	hasCtrl := false
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x1F || s[i] == 0x7F {
+			hasCtrl = true
+			break
+		}
+	}
+	if !hasCtrl {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 0x1F || c == 0x7F {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// SanitizeAllowedURL strips ASCII control characters first, then enforces a strict scheme allowlist:
+//   - http://, https://, or single-slash site-relative /... NOT starting with // or /\
+//   - When allowMailTelAnchor is true, also allows mailto:, tel:, and #...
+func SanitizeAllowedURL(raw string, allowMailTelAnchor bool) (string, bool) {
+	clean := strings.TrimSpace(StripASCIIControls(raw))
+	if clean == "" {
+		return "", false
+	}
+	if strings.HasPrefix(clean, "/") {
+		if strings.HasPrefix(clean, "//") || strings.HasPrefix(clean, "/\\") {
+			return "", false
+		}
+		return clean, true
+	}
+	if allowMailTelAnchor && strings.HasPrefix(clean, "#") {
+		return clean, true
+	}
+	if hasPrefixFoldASCII(clean, "http://") && len(clean) > len("http://") {
+		return clean, true
+	}
+	if hasPrefixFoldASCII(clean, "https://") && len(clean) > len("https://") {
+		return clean, true
+	}
+	if allowMailTelAnchor {
+		if hasPrefixFoldASCII(clean, "mailto:") && len(clean) > len("mailto:") {
+			return clean, true
+		}
+		if hasPrefixFoldASCII(clean, "tel:") && len(clean) > len("tel:") {
+			return clean, true
+		}
+	}
+	return "", false
+}
+
+func asciiLowerByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func hasPrefixFoldASCII(s, lowerASCIIPrefix string) bool {
+	if len(s) < len(lowerASCIIPrefix) {
+		return false
+	}
+	for i := 0; i < len(lowerASCIIPrefix); i++ {
+		if asciiLowerByte(s[i]) != lowerASCIIPrefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func indexFoldASCII(s, lowerASCIINeedle string) int {
+	n := len(lowerASCIINeedle)
+	if n == 0 || len(s) < n {
+		return -1
+	}
+	first := lowerASCIINeedle[0]
+	limit := len(s) - n
+	for i := 0; i <= limit; i++ {
+		if asciiLowerByte(s[i]) != first {
+			continue
+		}
+		match := true
+		for j := 1; j < n; j++ {
+			if asciiLowerByte(s[i+j]) != lowerASCIINeedle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// sanitizeCustomCSS strips NUL bytes, removes ASCII case-insensitive `javascript:` / `expression(`,
+// and escapes every `</` sequence to `<\/` in a fixed-point loop without ever using strings.ToLower indices.
 func sanitizeCustomCSS(css string) string {
 	s := strings.TrimSpace(css)
 	if s == "" {
 		return ""
 	}
-	// Strip any case variation of `</style` or `<script` so inline `<style>` injection can never break out into HTML/JS.
 	for {
-		lower := strings.ToLower(s)
-		idx := strings.Index(lower, "</style")
-		if idx < 0 {
-			idx = strings.Index(lower, "<script")
+		prev := s
+		s = strings.ReplaceAll(s, "\x00", "")
+		for _, bad := range []string{"javascript:", "expression("} {
+			for {
+				idx := indexFoldASCII(s, bad)
+				if idx < 0 {
+					break
+				}
+				s = s[:idx] + s[idx+len(bad):]
+			}
 		}
-		if idx < 0 {
+		s = strings.ReplaceAll(s, "</", `<\/`)
+		if s == prev {
 			break
 		}
-		s = s[:idx] + s[idx+7:]
 	}
 	return s
+}
+
+// SanitizeCustomHeadMeta parses raw HTML inside a <head> context and emits ONLY safe
+// <meta> and <link> void elements with allowlisted attributes, stripping <script>,
+// event handlers, dangerous http-equiv directives, unsafe URL schemes, and raw text/elements.
+func SanitizeCustomHeadMeta(raw string) string {
+	trimmed := strings.TrimSpace(strings.ReplaceAll(raw, "\x00", ""))
+	if trimmed == "" {
+		return ""
+	}
+	headCtx := &nethtml.Node{
+		Type:     nethtml.ElementNode,
+		Data:     "head",
+		DataAtom: atom.Head,
+	}
+	nodes, err := nethtml.ParseFragment(strings.NewReader(trimmed), headCtx)
+	if err != nil || len(nodes) == 0 {
+		return ""
+	}
+
+	var lines []string
+	for _, n := range nodes {
+		if n == nil || n.Type != nethtml.ElementNode || n.Namespace != "" {
+			continue
+		}
+		switch strings.ToLower(n.Data) {
+		case "meta":
+			if tag := renderSafeMetaNode(n); tag != "" {
+				lines = append(lines, tag)
+			}
+		case "link":
+			if tag := renderSafeLinkNode(n); tag != "" {
+				lines = append(lines, tag)
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderSafeMetaNode(n *nethtml.Node) string {
+	type kv struct{ k, v string }
+	var attrs []kv
+	seen := make(map[string]bool, 6)
+	hasKey := false
+	hasContent := false
+	hasCharset := false
+
+	for _, a := range n.Attr {
+		if a.Namespace != "" {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(a.Key))
+		if seen[key] {
+			continue
+		}
+		val := strings.TrimSpace(StripASCIIControls(a.Val))
+		switch key {
+		case "name", "property":
+			if val == "" {
+				continue
+			}
+			seen[key] = true
+			hasKey = true
+			attrs = append(attrs, kv{key, val})
+		case "content":
+			seen[key] = true
+			hasContent = true
+			attrs = append(attrs, kv{key, val})
+		case "charset":
+			if !isSafeHeadToken(val) {
+				return ""
+			}
+			seen[key] = true
+			hasCharset = true
+			attrs = append(attrs, kv{key, val})
+		case "media":
+			if val == "" || indexFoldASCII(val, "javascript:") >= 0 || indexFoldASCII(val, "expression(") >= 0 {
+				continue
+			}
+			seen[key] = true
+			attrs = append(attrs, kv{key, val})
+		case "http-equiv":
+			low := strings.ToLower(val)
+			if low == "" || !isSafeHeadToken(low) ||
+				low == "refresh" ||
+				low == "set-cookie" ||
+				low == "location" ||
+				strings.HasPrefix(low, "content-security-policy") {
+				return ""
+			}
+			seen[key] = true
+			hasKey = true
+			attrs = append(attrs, kv{key, val})
+		}
+	}
+	if !hasCharset && !(hasKey && hasContent) {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<meta")
+	for _, a := range attrs {
+		b.WriteByte(' ')
+		b.WriteString(a.k)
+		b.WriteString(`="`)
+		b.WriteString(stdhtml.EscapeString(a.v))
+		b.WriteByte('"')
+	}
+	b.WriteByte('>')
+	return b.String()
+}
+
+func renderSafeLinkNode(n *nethtml.Node) string {
+	type kv struct{ k, v string }
+	var attrs []kv
+	seen := make(map[string]bool, 8)
+	hasRel := false
+	hasHref := false
+
+	for _, a := range n.Attr {
+		if a.Namespace != "" {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(a.Key))
+		if seen[key] {
+			continue
+		}
+		val := strings.TrimSpace(StripASCIIControls(a.Val))
+		switch key {
+		case "rel":
+			if val == "" {
+				return ""
+			}
+			for _, tok := range strings.Fields(strings.ToLower(val)) {
+				if tok == "import" {
+					return ""
+				}
+			}
+			seen[key] = true
+			hasRel = true
+			attrs = append(attrs, kv{key, val})
+		case "href":
+			cleanHref, ok := SanitizeAllowedURL(val, true)
+			if !ok || strings.HasPrefix(cleanHref, "#") || hasPrefixFoldASCII(cleanHref, "tel:") {
+				return ""
+			}
+			seen[key] = true
+			hasHref = true
+			attrs = append(attrs, kv{key, cleanHref})
+		case "type", "sizes", "title", "hreflang":
+			if val == "" {
+				continue
+			}
+			seen[key] = true
+			attrs = append(attrs, kv{key, val})
+		case "crossorigin":
+			low := strings.ToLower(val)
+			if low != "" && low != "anonymous" && low != "use-credentials" {
+				continue
+			}
+			seen[key] = true
+			attrs = append(attrs, kv{key, low})
+		case "media":
+			if val == "" || indexFoldASCII(val, "javascript:") >= 0 || indexFoldASCII(val, "expression(") >= 0 {
+				continue
+			}
+			seen[key] = true
+			attrs = append(attrs, kv{key, val})
+		}
+	}
+	if !hasRel || !hasHref {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<link")
+	for _, a := range attrs {
+		b.WriteByte(' ')
+		b.WriteString(a.k)
+		b.WriteString(`="`)
+		b.WriteString(stdhtml.EscapeString(a.v))
+		b.WriteByte('"')
+	}
+	b.WriteByte('>')
+	return b.String()
+}
+
+func isSafeHeadToken(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func isValidStorageDriverID(id string) bool {
@@ -681,3 +1061,38 @@ func isValidStorageDriverID(id string) bool {
 	}
 	return true
 }
+
+func sanitizeCDNPrefix(raw string) (string, bool) {
+	s := strings.TrimSpace(StripASCIIControls(raw))
+	if s == "" || s == "/" {
+		return "", true
+	}
+	clean := strings.TrimRight(s, "/")
+	if clean == "" {
+		return "", true
+	}
+	for i := 0; i < len(clean); i++ {
+		switch clean[i] {
+		case ' ', '\t', '\n', '\r', '<', '>', '"', '\'', '`', '\\', '?', '#':
+			return "", false
+		}
+	}
+	if strings.Contains(clean, "..") {
+		return "", false
+	}
+	low := strings.ToLower(clean)
+	if strings.HasPrefix(low, "https://") {
+		return clean, len(clean) > len("https://") && clean[len("https://")] != '/'
+	}
+	if strings.HasPrefix(low, "http://") {
+		return clean, len(clean) > len("http://") && clean[len("http://")] != '/'
+	}
+	if strings.HasPrefix(low, "//") {
+		return clean, len(clean) > 2 && clean[2] != '/'
+	}
+	if clean[0] == '/' {
+		return clean, len(clean) > 1 && clean[1] != '/'
+	}
+	return "", false
+}
+

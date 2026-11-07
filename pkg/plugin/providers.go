@@ -287,6 +287,7 @@ func removeEntries[T any](in []providerEntry[T], pluginID string) []providerEntr
 			out = append(out, ent)
 		}
 	}
+	clear(in[len(out):])
 	return out
 }
 

@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { createPortal } from "preact/compat";
+import type { CSSProperties } from "preact";
 import { Compartment, EditorState, Prec, RangeSetBuilder } from "@codemirror/state";
 import {
   Decoration,
@@ -12,9 +14,17 @@ import {
 } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, redo, undo } from "@codemirror/commands";
 import { markdownKeymap, markdownLanguage, pasteURLAsLink } from "@codemirror/lang-markdown";
-import { apiFetch, showToast, storageDriverSig } from "../api";
+import { apiFetch, showToast } from "../api";
 import { localeSig, t } from "../i18n";
-import { AnimatedModal, ConsoleSelect } from "./UIControls";
+import {
+  AnimatedModal,
+  computePortalMenuStyle,
+  ConsoleEmpty,
+  ConsoleSelect,
+  PaginationBar,
+  paginateItems,
+  useDebouncedValue,
+} from "./UIControls";
 import { MediaLibraryModal } from "./MediaLibraryModal";
 import type { CM6EditorProps } from "./CM6Editor";
 
@@ -348,7 +358,15 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
   const [showOutline, setShowOutline] = useState<boolean>(false);
   const [mobilePane, setMobilePane] = useState<"write" | "preview" | "outline">("write");
   const [headingOpen, setHeadingOpen] = useState<boolean>(false);
+  const [headingStyle, setHeadingStyle] = useState<CSSProperties>({});
+  const headingBtnRef = useRef<HTMLButtonElement | null>(null);
+  const headingMenuRef = useRef<HTMLDivElement | null>(null);
+
   const [mediaMenuOpen, setMediaMenuOpen] = useState<boolean>(false);
+  const [mediaStyle, setMediaStyle] = useState<CSSProperties>({});
+  const mediaBtnRef = useRef<HTMLButtonElement | null>(null);
+  const mediaMenuRef = useRef<HTMLDivElement | null>(null);
+
   const [mediaModalOpen, setMediaModalOpen] = useState<boolean>(false);
   const [dynQuickInserts, setDynQuickInserts] = useState<CM6EditorProps["quickInserts"]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -357,9 +375,24 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
   const [qiOpen, setQiOpen] = useState<boolean>(false);
   const [qiTab, setQiTab] = useState<"media" | "books" | "lock" | "cite">("media");
   const [qiMedia, setQiMedia] = useState<any[]>([]);
+  const [qiMediaTotal, setQiMediaTotal] = useState<number>(0);
+  const [qiMediaPage, setQiMediaPage] = useState<number>(1);
+  const [qiMediaSearch, setQiMediaSearch] = useState<string>("");
+  const [qiMediaMime, setQiMediaMime] = useState<"" | "image" | "audio">("");
+  const debouncedQiMediaQ = useDebouncedValue(qiMediaSearch, 250);
+
   const [qiBooks, setQiBooks] = useState<any[]>([]);
+  const [qiBooksTotal, setQiBooksTotal] = useState<number>(0);
+  const [qiBooksPage, setQiBooksPage] = useState<number>(1);
+  const [qiBookSearch, setQiBookSearch] = useState<string>("");
+  const debouncedQiBookQ = useDebouncedValue(qiBookSearch, 250);
+
   const [qiArticles, setQiArticles] = useState<any[]>([]);
+  const [qiArtTotal, setQiArtTotal] = useState<number>(0);
+  const [qiArtPage, setQiArtPage] = useState<number>(1);
   const [qiArtSearch, setQiArtSearch] = useState<string>("");
+  const debouncedQiArtQ = useDebouncedValue(qiArtSearch, 250);
+
   const [lockMode, setLockMode] = useState<"pwd" | "user">("pwd");
   const [lockPwd, setLockPwd] = useState<string>("");
   const [lockHint, setLockHint] = useState<string>("");
@@ -520,7 +553,12 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
         const files = event.dataTransfer?.files;
         if (files && files.length > 0) {
           event.preventDefault();
-          void uploadMediaFile(files[0]);
+          const list = Array.from(files);
+          void (async () => {
+            for (const f of list) {
+              await uploadMediaFile(f);
+            }
+          })();
           return true;
         }
         return false;
@@ -663,37 +701,118 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
   useEffect(() => {
     if (!headingOpen) return;
-    const close = () => setHeadingOpen(false);
-    document.addEventListener("click", close);
-    return () => document.removeEventListener("click", close);
+    const updatePos = () => {
+      if (!headingBtnRef.current) return;
+      const rect = headingBtnRef.current.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) {
+        setHeadingOpen(false);
+        return;
+      }
+      setHeadingStyle(computePortalMenuStyle(rect, { minW: 112, maxW: 180, maxH: 260, align: "left" }).style);
+    };
+    updatePos();
+    const onDocDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (headingBtnRef.current?.contains(target) || headingMenuRef.current?.contains(target)) return;
+      setHeadingOpen(false);
+    };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setHeadingOpen(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("keydown", onEsc);
+    window.addEventListener("resize", updatePos);
+    window.addEventListener("scroll", updatePos, true);
+    return () => {
+      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("keydown", onEsc);
+      window.removeEventListener("resize", updatePos);
+      window.removeEventListener("scroll", updatePos, true);
+    };
   }, [headingOpen]);
 
   useEffect(() => {
     if (!mediaMenuOpen) return;
-    const close = () => setMediaMenuOpen(false);
-    document.addEventListener("click", close);
-    return () => document.removeEventListener("click", close);
+    const updatePos = () => {
+      if (!mediaBtnRef.current) return;
+      const rect = mediaBtnRef.current.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) {
+        setMediaMenuOpen(false);
+        return;
+      }
+      setMediaStyle(computePortalMenuStyle(rect, { minW: 180, maxW: 260, maxH: 200, align: "left" }).style);
+    };
+    updatePos();
+    const onDocDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (mediaBtnRef.current?.contains(target) || mediaMenuRef.current?.contains(target)) return;
+      setMediaMenuOpen(false);
+    };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMediaMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("keydown", onEsc);
+    window.addEventListener("resize", updatePos);
+    window.addEventListener("scroll", updatePos, true);
+    return () => {
+      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("keydown", onEsc);
+      window.removeEventListener("resize", updatePos);
+      window.removeEventListener("scroll", updatePos, true);
+    };
   }, [mediaMenuOpen]);
 
-  // Load Quick Insert data when modal opens
+  // Load Quick Insert data dynamically with server-side search & pagination
   useEffect(() => {
-    if (!qiOpen) return;
-    if (qiTab === "media" && qiMedia.length === 0) {
-      apiFetch<{ items?: any[]; media?: any[] }>("/api/admin/media")
-        .then((r) => setQiMedia(r.items || r.media || []))
-        .catch(() => {});
-    } else if (qiTab === "books" && qiBooks.length === 0) {
-      apiFetch<{ items?: any[]; books?: any[] }>("/api/admin/books")
-        .then((r) => setQiBooks(r.items || r.books || []))
-        .catch(() => {});
-    } else if (qiTab === "cite" && qiArticles.length === 0) {
-      apiFetch<{ items?: any[]; articles?: any[] }>("/api/admin/articles")
-        .then((r) =>
-          setQiArticles((r.items || r.articles || []).map((it: any) => it.article || it))
-        )
-        .catch(() => {});
-    }
-  }, [qiOpen, qiTab]);
+    if (!qiOpen || qiTab !== "media") return;
+    const params = new URLSearchParams({
+      refs: "0",
+      page: String(qiMediaPage),
+      per_page: "18",
+    });
+    if (debouncedQiMediaQ.trim()) params.set("q", debouncedQiMediaQ.trim());
+    if (qiMediaMime) params.set("mime", qiMediaMime);
+    apiFetch<{ items?: any[]; media?: any[]; total?: number }>(`/api/admin/media?${params.toString()}`)
+      .then((r) => {
+        const list = r.items || r.media || [];
+        setQiMedia(list);
+        setQiMediaTotal(typeof r.total === "number" ? r.total : list.length);
+      })
+      .catch(() => {});
+  }, [qiOpen, qiTab, qiMediaPage, debouncedQiMediaQ, qiMediaMime]);
+
+  useEffect(() => {
+    if (!qiOpen || qiTab !== "books") return;
+    const params = new URLSearchParams({
+      page: String(qiBooksPage),
+      per_page: "10",
+    });
+    if (debouncedQiBookQ.trim()) params.set("q", debouncedQiBookQ.trim());
+    apiFetch<{ items?: any[]; books?: any[]; total?: number }>(`/api/admin/books?${params.toString()}`)
+      .then((r) => {
+        const list = r.items || r.books || [];
+        setQiBooks(list);
+        setQiBooksTotal(typeof r.total === "number" ? r.total : list.length);
+      })
+      .catch(() => {});
+  }, [qiOpen, qiTab, qiBooksPage, debouncedQiBookQ]);
+
+  useEffect(() => {
+    if (!qiOpen || qiTab !== "cite") return;
+    const params = new URLSearchParams({
+      page: String(qiArtPage),
+      per_page: "20",
+    });
+    if (debouncedQiArtQ.trim()) params.set("q", debouncedQiArtQ.trim());
+    apiFetch<{ items?: any[]; articles?: any[]; total?: number }>(`/api/admin/articles?${params.toString()}`)
+      .then((r) => {
+        const list = (r.items || r.articles || []).map((it: any) => it.article || it);
+        setQiArticles(list);
+        setQiArtTotal(typeof r.total === "number" ? r.total : list.length);
+      })
+      .catch(() => {});
+  }, [qiOpen, qiTab, qiArtPage, debouncedQiArtQ]);
 
   const jumpToLine = (lineNo: number) => {
     setMobilePane("write");
@@ -746,33 +865,44 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
           <span class="volo-ed-sep" />
 
-          {/* Heading H1-H6 Popover */}
-          <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
+          {/* Heading H1-H6 Popover (Portal-rendered to escape mobile overflow-x clipping) */}
+          <div class="volo-pop-wrap">
             <button
+              ref={headingBtnRef}
               type="button"
-              class="volo-ed-btn"
+              class={`volo-ed-btn ${headingOpen ? "active" : ""}`}
               title={t("ed.heading")}
-              onClick={() => setHeadingOpen((p) => !p)}
+              onClick={() => {
+                setMediaMenuOpen(false);
+                setHeadingOpen((p) => !p);
+              }}
             >
               <span style={{ fontWeight: 750, fontSize: "12.5px" }}>H▾</span>
             </button>
-            {headingOpen && (
-              <div class="volo-cselect-menu" style={{ minWidth: "110px" }}>
-                {[1, 2, 3, 4, 5, 6].map((lvl) => (
-                  <button
-                    key={lvl}
-                    type="button"
-                    class="volo-cselect-item"
-                    onClick={() => {
-                      prefixCurrentLine(`${"#".repeat(lvl)} `);
-                      setHeadingOpen(false);
-                    }}
-                  >
-                    <span style={{ fontWeight: 700, fontSize: `${Math.max(12, 17 - lvl)}px` }}>H{lvl}</span>
-                  </button>
-                ))}
-              </div>
-            )}
+            {headingOpen &&
+              typeof document !== "undefined" &&
+              createPortal(
+                <div
+                  ref={headingMenuRef}
+                  class="volo-cselect-menu is-portal volo-ed-pop"
+                  style={headingStyle}
+                >
+                  {[1, 2, 3, 4, 5, 6].map((lvl) => (
+                    <button
+                      key={lvl}
+                      type="button"
+                      class="volo-cselect-item"
+                      onClick={() => {
+                        prefixCurrentLine(`${"#".repeat(lvl)} `);
+                        setHeadingOpen(false);
+                      }}
+                    >
+                      <span style={{ fontWeight: 700, fontSize: `${Math.max(12, 17 - lvl)}px` }}>H{lvl}</span>
+                    </button>
+                  ))}
+                </div>,
+                document.body
+              )}
           </div>
 
           <button type="button" class="volo-ed-btn" title={t("ed.bold")} onClick={() => wrapSelection("**", "**", "bold")}>
@@ -874,13 +1004,17 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
             </svg>
           </button>
 
-          {/* Upload Media / Insert from Media Library (works for both local & S3) */}
-          <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
+          {/* Upload Media / Insert from Media Library (Portal-rendered to escape mobile overflow-x clipping) */}
+          <div class="volo-pop-wrap">
             <button
+              ref={mediaBtnRef}
               type="button"
               class={`volo-ed-btn ${mediaMenuOpen ? "active" : ""}`}
               title={uploading ? t("ed.uploading") : t("ed.upload_media")}
-              onClick={() => setMediaMenuOpen((v) => !v)}
+              onClick={() => {
+                setHeadingOpen(false);
+                setMediaMenuOpen((v) => !v);
+              }}
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="3" y="3" width="18" height="18" rx="2" />
@@ -891,38 +1025,50 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
             <input
               ref={fileInputRef}
               type="file"
+              multiple
               accept="image/*,audio/*"
               style={{ display: "none" }}
               onChange={(e) => {
-                const f = (e.currentTarget as HTMLInputElement).files?.[0];
-                if (f) void uploadMediaFile(f);
+                const files = Array.from((e.currentTarget as HTMLInputElement).files || []);
                 (e.currentTarget as HTMLInputElement).value = "";
+                void (async () => {
+                  for (const f of files) {
+                    await uploadMediaFile(f);
+                  }
+                })();
               }}
             />
-            {mediaMenuOpen && (
-              <div class="volo-pop-menu volo-ed-media-pop">
-                <button
-                  type="button"
-                  class="volo-pop-item"
-                  onClick={() => {
-                    setMediaMenuOpen(false);
-                    fileInputRef.current?.click();
-                  }}
+            {mediaMenuOpen &&
+              typeof document !== "undefined" &&
+              createPortal(
+                <div
+                  ref={mediaMenuRef}
+                  class="volo-cselect-menu is-portal volo-ed-pop volo-ed-media-pop"
+                  style={mediaStyle}
                 >
-                  <span>{t("ed.upload_local_file")}</span>
-                </button>
-                <button
-                  type="button"
-                  class="volo-pop-item"
-                  onClick={() => {
-                    setMediaMenuOpen(false);
-                    setMediaModalOpen(true);
-                  }}
-                >
-                  <span>{t("ed.insert_from_library")}</span>
-                </button>
-              </div>
-            )}
+                  <button
+                    type="button"
+                    class="volo-cselect-item"
+                    onClick={() => {
+                      setMediaMenuOpen(false);
+                      fileInputRef.current?.click();
+                    }}
+                  >
+                    <span class="volo-cselect-item-text">{t("ed.upload_local_file")}</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-cselect-item"
+                    onClick={() => {
+                      setMediaMenuOpen(false);
+                      setMediaModalOpen(true);
+                    }}
+                  >
+                    <span class="volo-cselect-item-text">{t("ed.insert_from_library")}</span>
+                  </button>
+                </div>,
+                document.body
+              )}
           </div>
 
           {/* Quick Insert + Modal Trigger */}
@@ -1194,42 +1340,99 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
         </div>
 
         {qiTab === "media" && (
-          <div class="volo-qi-grid">
-            {qiMedia.length === 0 ? (
-              <div class="volo-help">{t("tbl.empty")}</div>
+          <div>
+            <div class="volo-filter-bar" style={{ marginBottom: "10px", gap: "6px", flexWrap: "wrap" }}>
+              {(
+                [
+                  ["", t("cnt.media_type_all")],
+                  ["image", t("cnt.media_type_image")],
+                  ["audio", t("cnt.media_type_audio")],
+                ] as const
+              ).map(([mVal, mLabel]) => (
+                <button
+                  key={mVal || "all"}
+                  type="button"
+                  class={`volo-filter-pill ${qiMediaMime === mVal ? "active" : ""}`}
+                  onClick={() => {
+                    setQiMediaMime(mVal);
+                    setQiMediaPage(1);
+                  }}
+                >
+                  {mLabel}
+                </button>
+              ))}
+              <input
+                class="volo-input"
+                style={{ flex: "1 1 180px", minWidth: "140px", height: "32px" }}
+                placeholder={t("cnt.media_search_ph")}
+                value={qiMediaSearch}
+                onInput={(e) => {
+                  setQiMediaSearch((e.currentTarget as HTMLInputElement).value);
+                  setQiMediaPage(1);
+                }}
+              />
+            </div>
+            {(qiMedia.length > 18 ? paginateItems(qiMedia, qiMediaPage, 18).slice : qiMedia).length === 0 ? (
+              <ConsoleEmpty text={t("tbl.empty")} />
             ) : (
-              qiMedia.slice(0, 24).map((m) => {
-                const name = m.orig_filename || m.original_name || m.id;
-                const isImg = String(m.mime_type || "").startsWith("image/");
-                return (
-                  <button
-                    key={m.id}
-                    type="button"
-                    class="volo-qi-media-card"
-                    onClick={() => {
-                      insertSnippet(isImg ? `![${name}](${m.public_url})` : `[${name}](${m.public_url})`);
-                      setQiOpen(false);
-                    }}
-                  >
-                    {isImg ? (
-                      <img src={m.public_url} alt={name} loading="lazy" />
-                    ) : (
-                      <div class="volo-qi-file-badge">{m.mime_type || "FILE"}</div>
-                    )}
-                    <span>{name}</span>
-                  </button>
-                );
-              })
+              <div class="volo-qi-grid">
+                {(qiMedia.length > 18 ? paginateItems(qiMedia, qiMediaPage, 18).slice : qiMedia).map((m) => {
+                  const name = m.orig_filename || m.original_name || m.id;
+                  const isImg = String(m.mime_type || "").startsWith("image/");
+                  const isAudio = String(m.mime_type || "").startsWith("audio/");
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      class="volo-qi-media-card"
+                      onClick={() => {
+                        if (isImg) {
+                          insertSnippet(`![${name}](${m.public_url})`);
+                        } else if (isAudio) {
+                          insertSnippet(`[${t("ed.audio_label")}: ${name}](${m.public_url})`);
+                        } else {
+                          insertSnippet(`[${name}](${m.public_url})`);
+                        }
+                        setQiOpen(false);
+                      }}
+                    >
+                      {isImg ? (
+                        <img src={m.public_url} alt={name} loading="lazy" />
+                      ) : (
+                        <div class="volo-qi-file-badge">{m.mime_type || "FILE"}</div>
+                      )}
+                      <span>{name}</span>
+                    </button>
+                  );
+                })}
+              </div>
             )}
+            <PaginationBar
+              total={qiMediaTotal}
+              page={qiMediaPage}
+              pageSize={18}
+              onChange={(p) => setQiMediaPage(p)}
+            />
           </div>
         )}
 
         {qiTab === "books" && (
           <div>
-            <div style={{ marginBottom: "10px", display: "flex", justifyContent: "flex-end" }}>
+            <div style={{ marginBottom: "10px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+              <input
+                class="volo-input"
+                style={{ flex: "1 1 200px", minWidth: "150px", height: "34px" }}
+                placeholder={t("ed.qi_search_books")}
+                value={qiBookSearch}
+                onInput={(e) => {
+                  setQiBookSearch((e.currentTarget as HTMLInputElement).value);
+                  setQiBooksPage(1);
+                }}
+              />
               <button
                 type="button"
                 class="volo-btn volo-btn-sm volo-btn-primary"
+                style={{ flexShrink: 0 }}
                 onClick={() => {
                   insertSnippet("\n:::bookshelf\n:::\n");
                   setQiOpen(false);
@@ -1238,27 +1441,67 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
                 + {t("ed.bookshelf")}
               </button>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "260px", overflowY: "auto" }}>
-              {qiBooks.map((b) => (
-                <div key={b.id} class="volo-subcard" style={{ padding: "10px 12px", margin: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div>
-                    <div style={{ fontWeight: 650, fontSize: "13px" }}>{b.title}</div>
-                    <div class="volo-help">{b.description || `/books/${b.slug}`}</div>
-                  </div>
-                  <button
-                    type="button"
-                    class="volo-btn volo-btn-sm"
-                    onClick={() => {
-                      const body = b.description || `[${b.title}](/books/${b.slug})`;
-                      insertSnippet(`\n:::book title="${b.title}" status="reading"\n${body}\n:::\n`);
-                      setQiOpen(false);
-                    }}
-                  >
-                    {t("ed.qi_insert_btn")}
-                  </button>
+            {(() => {
+              const q = qiBookSearch.trim().toLowerCase();
+              const filtered =
+                qiBooks.length > 10 && q
+                  ? qiBooks.filter(
+                      (b) =>
+                        String(b.title || "").toLowerCase().includes(q) ||
+                        String(b.author || "").toLowerCase().includes(q) ||
+                        String(b.slug || "").toLowerCase().includes(q)
+                    )
+                  : qiBooks;
+              const rows = filtered.length > 10 ? paginateItems(filtered, qiBooksPage, 10).slice : filtered;
+              if (rows.length === 0) {
+                return <ConsoleEmpty text={t("tbl.empty")} />;
+              }
+              return (
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "260px", overflowY: "auto" }}>
+                  {rows.map((b) => (
+                    <div
+                      key={b.id}
+                      class="volo-subcard"
+                      style={{
+                        padding: "10px 12px",
+                        margin: 0,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: "10px",
+                      }}
+                    >
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ fontWeight: 650, fontSize: "13px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {b.title}
+                        </div>
+                        <div class="volo-help" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {b.description || `/books/${b.slug}`}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        class="volo-btn volo-btn-sm"
+                        style={{ flexShrink: 0 }}
+                        onClick={() => {
+                          const body = b.description || `[${b.title}](/books/${b.slug})`;
+                          insertSnippet(`\n:::book title="${b.title}" status="${b.reading_status || "reading"}"\n${body}\n:::\n`);
+                          setQiOpen(false);
+                        }}
+                      >
+                        {t("ed.qi_insert_btn")}
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              );
+            })()}
+            <PaginationBar
+              total={qiBooksTotal}
+              page={qiBooksPage}
+              pageSize={10}
+              onChange={(p) => setQiBooksPage(p)}
+            />
           </div>
         )}
 
@@ -1322,35 +1565,86 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
         {qiTab === "cite" && (
           <div>
-            <div class="volo-field">
+            <div class="volo-field" style={{ marginBottom: "10px" }}>
               <label>{t("ed.qi_cite")}</label>
               <input
                 class="volo-input"
                 placeholder={t("ed.qi_search_art")}
                 value={qiArtSearch}
-                onInput={(e) => setQiArtSearch((e.currentTarget as HTMLInputElement).value)}
+                onInput={(e) => {
+                  setQiArtSearch((e.currentTarget as HTMLInputElement).value);
+                  setQiArtPage(1);
+                }}
               />
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "240px", overflowY: "auto" }}>
-              {qiArticles
-                .filter((a) => !qiArtSearch || String(a.title || "").toLowerCase().includes(qiArtSearch.toLowerCase()))
-                .slice(0, 20)
-                .map((a) => (
-                  <div key={a.id} class="volo-subcard" style={{ padding: "8px 12px", margin: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ fontSize: "13px", fontWeight: 550 }}>{a.title}</span>
-                    <button
-                      type="button"
-                      class="volo-btn volo-btn-sm"
-                      onClick={() => {
-                        insertSnippet(`[${a.title}](/posts/${a.slug})`);
-                        setQiOpen(false);
-                      }}
-                    >
-                      {t("ed.qi_insert_btn")}
-                    </button>
-                  </div>
-                ))}
-            </div>
+            {(() => {
+              const q = qiArtSearch.trim().toLowerCase();
+              const filtered =
+                qiArticles.length > 20 && q
+                  ? qiArticles.filter(
+                      (a) =>
+                        String(a.title || "").toLowerCase().includes(q) ||
+                        String(a.slug || "").toLowerCase().includes(q)
+                    )
+                  : qiArticles;
+              const rows = filtered.length > 20 ? paginateItems(filtered, qiArtPage, 20).slice : filtered;
+              if (rows.length === 0) {
+                return <ConsoleEmpty text={t("tbl.empty")} />;
+              }
+              return (
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "240px", overflowY: "auto" }}>
+                  {rows.map((a) => {
+                    const st = String(a.status || "published");
+                    const stClass = st === "published" ? "published" : st === "scheduled" ? "scheduled" : "draft";
+                    return (
+                      <div
+                        key={a.id}
+                        class="volo-subcard"
+                        style={{
+                          padding: "8px 12px",
+                          margin: 0,
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          gap: "10px",
+                        }}
+                      >
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+                            <span style={{ fontSize: "13px", fontWeight: 550, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {a.title || a.slug}
+                            </span>
+                            <span class={`volo-status-pill ${stClass}`} style={{ flexShrink: 0 }}>
+                              {t(`art.${st}`)}
+                            </span>
+                          </div>
+                          <div class="volo-help" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            /posts/{a.slug}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          class="volo-btn volo-btn-sm"
+                          style={{ flexShrink: 0 }}
+                          onClick={() => {
+                            insertSnippet(`[${a.title || a.slug}](/posts/${a.slug})`);
+                            setQiOpen(false);
+                          }}
+                        >
+                          {t("ed.qi_insert_btn")}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+            <PaginationBar
+              total={qiArtTotal}
+              page={qiArtPage}
+              pageSize={20}
+              onChange={(p) => setQiArtPage(p)}
+            />
           </div>
         )}
       </AnimatedModal>

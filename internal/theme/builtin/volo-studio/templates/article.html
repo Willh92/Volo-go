@@ -60,11 +60,42 @@
         {{end}}
 
         {{if .SeriesContext}}
-          <div class="volo-banner">
-            <a href="/series/{{.SeriesContext.Series.Slug}}">
-              {{t .Locale "article.series_header" (dict "title" .SeriesContext.Series.Title "index" .SeriesContext.Index "total" .SeriesContext.Total)}}
-            </a>
-          </div>
+          {{$prevURL := ""}}{{$prevTitle := ""}}{{$nextURL := ""}}{{$nextTitle := ""}}{{$seenCurrent := false}}
+          {{range .SeriesContext.Episodes}}
+            {{if .IsCurrent}}
+              {{$seenCurrent = true}}
+            {{else if not $seenCurrent}}
+              {{$prevURL = printf "/posts/%s" .Slug}}{{$prevTitle = .Title}}
+            {{else if eq $nextURL ""}}
+              {{$nextURL = printf "/posts/%s" .Slug}}{{$nextTitle = .Title}}
+            {{end}}
+          {{end}}
+          {{if .SeriesContext.PrevInSeries}}{{$prevURL = .SeriesContext.PrevInSeries.URL}}{{$prevTitle = .SeriesContext.PrevInSeries.Title}}{{end}}
+          {{if .SeriesContext.NextInSeries}}{{$nextURL = .SeriesContext.NextInSeries.URL}}{{$nextTitle = .SeriesContext.NextInSeries.Title}}{{end}}
+          <details class="volo-banner volo-series-box">
+            <summary class="volo-series-box__summary">
+              <span class="volo-series-box__title">{{t .Locale "article.series_header" (dict "title" .SeriesContext.Series.Title "index" .SeriesContext.Index "total" .SeriesContext.Total)}}</span>
+              <span class="volo-series-box__quick">
+                {{if $prevURL}}<a class="volo-series-box__step" href="{{$prevURL}}" title="{{$prevTitle}}" data-series-link>← {{t .Locale "article.prev_post"}}</a>{{end}}
+                {{if $nextURL}}<a class="volo-series-box__step" href="{{$nextURL}}" title="{{$nextTitle}}" data-series-link>{{t .Locale "article.next_post"}} →</a>{{end}}
+                <a class="volo-series-box__overview" href="/series/{{.SeriesContext.Series.Slug}}" data-series-link>↗</a>
+                <svg class="volo-series-box__chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+            </summary>
+            {{if .SeriesContext.Episodes}}
+              <ol class="volo-series-box__list">
+                {{range .SeriesContext.Episodes}}
+                  <li class="volo-series-box__item{{if .IsCurrent}} is-current{{end}}">
+                    {{if .IsCurrent}}
+                      <span class="volo-series-box__link is-current" aria-current="page"><span class="volo-series-box__num">{{.Order}}.</span><span class="volo-series-box__ep-title">{{.Title}}</span></span>
+                    {{else}}
+                      <a class="volo-series-box__link" href="/posts/{{.Slug}}"><span class="volo-series-box__num">{{.Order}}.</span><span class="volo-series-box__ep-title">{{.Title}}</span></a>
+                    {{end}}
+                  </li>
+                {{end}}
+              </ol>
+            {{end}}
+          </details>
         {{end}}
 
         {{if .Detail.AudioURL}}
@@ -73,7 +104,7 @@
               <span class="volo-badge">🎙 {{t .Locale "podcast.badge"}}</span>
               <button type="button" id="volo-podcast-speed" class="studio-icon-btn volo-podcast-speed">1x</button>
             </div>
-            <audio id="volo-podcast-audio" class="volo-podcast-card__player" controls preload="metadata" src="{{.Detail.AudioURL}}"></audio>
+            <audio id="volo-podcast-audio" class="volo-podcast-card__player" controls preload="metadata" src="{{.Detail.AudioURL}}" data-episode-title="{{.Detail.Title}}" data-episode-url="/posts/{{.Detail.Slug}}"></audio>
           </div>
         {{end}}
 
@@ -181,15 +212,32 @@
         {{end}}
 
         {{if .Backlinks}}
+          {{$blLen := len .Backlinks}}
           <section class="studio-related-block">
             <h3 class="studio-related-block__title">{{t .Locale "article.backlinks_header"}}</h3>
             <div class="studio-related-list">
-              {{range .Backlinks}}
-                <a class="studio-related-item" href="{{.URL}}">
-                  <strong>{{.Title}}</strong>
-                </a>
+              {{range $i, $b := .Backlinks}}
+                {{if lt $i 8}}
+                  <a class="studio-related-item" href="{{$b.URL}}">
+                    <strong>{{$b.Title}}</strong>
+                  </a>
+                {{end}}
               {{end}}
             </div>
+            {{if gt $blLen 8}}
+              <details class="studio-backlinks-more">
+                <summary class="studio-backlinks-more__summary">+{{sub $blLen 8}} {{t .Locale "nav.more"}}</summary>
+                <div class="studio-related-list studio-related-list--more">
+                  {{range $i, $b := .Backlinks}}
+                    {{if ge $i 8}}
+                      <a class="studio-related-item" href="{{$b.URL}}">
+                        <strong>{{$b.Title}}</strong>
+                      </a>
+                    {{end}}
+                  {{end}}
+                </div>
+              </details>
+            {{end}}
           </section>
         {{end}}
       {{end}}
@@ -213,7 +261,7 @@
           <div class="volo-toc-body__inner">
             <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
               {{range .Detail.TOC}}
-                {{$depth := sub .Level $minLvl}}
+                {{$depth := sub .Level $minLvl}}{{if lt $depth 0}}{{$depth = 0}}{{end}}{{if gt $depth 4}}{{$depth = 4}}{{end}}
                 <a class="volo-toc-link{{if gt $depth 0}} is-sub{{end}}" data-toc-id="{{.ID}}" href="#{{.ID}}" title="{{.Text}}" style="padding-left:{{add 12 (mul $depth 12)}}px"><span class="volo-toc-label">{{.Text}}</span></a>
               {{end}}
             </nav>
@@ -234,7 +282,7 @@
       </div>
       <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
         {{range .Detail.TOC}}
-          {{$depth := sub .Level $minLvl}}
+          {{$depth := sub .Level $minLvl}}{{if lt $depth 0}}{{$depth = 0}}{{end}}{{if gt $depth 4}}{{$depth = 4}}{{end}}
           <a class="volo-toc-link{{if gt $depth 0}} is-sub{{end}}" data-toc-id="{{.ID}}" href="#{{.ID}}" title="{{.Text}}" style="padding-left:{{add 12 (mul $depth 12)}}px"><span class="volo-toc-label">{{.Text}}</span></a>
         {{end}}
       </nav>

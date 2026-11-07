@@ -7,6 +7,7 @@
   align-items: flex-start;
   gap: 6px;
   user-select: none;
+  pointer-events: none;
   font-family: var(--volo-font-sans, system-ui, -apple-system, sans-serif);
 }
 
@@ -17,18 +18,27 @@
   align-items: flex-start;
 }
 
+#volo-persist-dock:has(#volo-podcast-mini) .volo-kbn-left,
+#volo-persist-dock:has(#volo-podcast-mini) .volo-kbn-dock[data-position="left"] {
+  bottom: calc(max(20px, env(safe-area-inset-bottom)) + 96px);
+}
+
 /* Offset right-docked mascot cleanly above .studio-fab-dock (Mobile TOC + Back-to-Top) */
 .volo-kbn-right,
 .volo-kbn-dock[data-position="right"] {
   right: 22px;
   left: auto;
-  bottom: max(112px, calc(env(safe-area-inset-bottom) + 96px));
+  bottom: calc(max(20px, env(safe-area-inset-bottom)) + 108px);
   align-items: flex-end;
 }
 
 .volo-kbn-bubble {
-  max-width: min(210px, calc(100vw - 36px));
-  padding: 7px 11px;
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  max-width: min(216px, calc(100vw - 36px));
+  padding: 7px 9px 7px 11px;
   border-radius: 12px;
   font-size: 12px;
   line-height: 1.45;
@@ -39,7 +49,47 @@
   transition: opacity 0.2s ease, transform 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
 }
 
+.volo-kbn-bubble[hidden] {
+  display: none !important;
+}
+
+.volo-kbn-bubble.is-collapsed {
+  opacity: 0;
+  transform: translateY(4px) scale(0.96);
+  pointer-events: none;
+}
+
+.volo-kbn-bubble__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.volo-kbn-close {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  margin-top: -1px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--volo-muted, #6b7280);
+  font-size: 13px;
+  line-height: 1;
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.volo-kbn-close:hover {
+  background: var(--volo-raised, rgba(0, 0, 0, 0.06));
+  color: var(--volo-text, #1d2420);
+}
+
 .volo-kbn-btn {
+  pointer-events: auto;
   width: 56px;
   height: 56px;
   padding: 0;
@@ -69,7 +119,18 @@
   outline-offset: 2px;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 1180px) {
+  .volo-kbn-btn {
+    width: 48px;
+    height: 48px;
+  }
+  .volo-kbn-btn svg {
+    width: 32px;
+    height: 32px;
+  }
+}
+
+@media (max-width: 760px) {
   .volo-kbn-hide-mobile {
     display: none !important;
   }
@@ -81,6 +142,6 @@
   .volo-kbn-right,
   .volo-kbn-dock[data-position="right"] {
     right: 14px;
-    bottom: max(106px, calc(env(safe-area-inset-bottom) + 92px));
+    bottom: calc(max(16px, env(safe-area-inset-bottom)) + 102px);
   }
 }

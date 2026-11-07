@@ -125,6 +125,13 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			}
 			return fmt.Sprintf("%s/themes/%s/assets/%s", prefix, tid, clean)
 		},
+		"vendorURL": func(rel string) string {
+			clean := strings.TrimPrefix(strings.TrimSpace(rel), "/")
+			if clean == "" {
+				return ""
+			}
+			return fmt.Sprintf("%s/%s", e.vendorCDNPrefix(), clean)
+		},
 		"themeCfg": func(cfg map[string]any, key string, fallback ...any) any {
 			var def any
 			if len(fallback) > 0 {
@@ -161,18 +168,8 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			}
 			return def
 		},
-		"pageURL": func(basePath string, page int) string {
-			if basePath == "" {
-				basePath = "/"
-			}
-			if page <= 1 {
-				return basePath
-			}
-			sep := "?"
-			if strings.Contains(basePath, "?") {
-				sep = "&"
-			}
-			return basePath + sep + "page=" + strconv.Itoa(page)
+		"pageURL": func(rawPathAndQuery string, page int) string {
+			return buildThemePageURL(rawPathAndQuery, page)
 		},
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
@@ -192,17 +189,13 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			esc := html.EscapeString(clean)
 			esc = strings.ReplaceAll(esc, "\r\n", "\n")
 			esc = strings.ReplaceAll(esc, "\n", "<br>")
-			u := strings.TrimSpace(canonicalURL)
-			if u != "" {
-				lower := strings.ToLower(u)
-				if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "/") {
-					escURL := html.EscapeString(u)
-					link := `<a class="volo-license-link" href="` + escURL + `">` + escURL + `</a>`
-					if strings.Contains(esc, escURL) {
-						esc = strings.ReplaceAll(esc, escURL, link)
-					} else {
-						esc += `<div class="volo-license-url">` + link + `</div>`
-					}
+			if u, ok := sanitizeThemeURL(canonicalURL, false); ok {
+				escURL := html.EscapeString(u)
+				link := `<a class="volo-license-link" href="` + escURL + `">` + escURL + `</a>`
+				if strings.Contains(esc, escURL) {
+					esc = strings.ReplaceAll(esc, escURL, link)
+				} else {
+					esc += `<div class="volo-license-url">` + link + `</div>`
 				}
 			}
 			return template.HTML(esc)
@@ -214,21 +207,27 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			return template.JS(s)
 		},
 		"safeURL": func(s string) template.URL {
-			trimmed := strings.TrimSpace(s)
-			lower := strings.ToLower(trimmed)
-			if strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "vbscript:") || strings.HasPrefix(lower, "data:text/html") {
-				return template.URL("#")
+			if u, ok := sanitizeThemeURL(s, true); ok {
+				return template.URL(u)
 			}
-			return template.URL(trimmed)
+			return template.URL("#")
 		},
 		"cssURL": func(s string) template.CSS {
-			trimmed := strings.TrimSpace(s)
-			lower := strings.ToLower(trimmed)
-			if trimmed == "" || strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "data:text/html") {
+			u, ok := sanitizeThemeURL(s, false)
+			if !ok {
 				return template.CSS("none")
 			}
-			replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `'`, `\'`, `(`, `\(`, `)`, `\)`, "\n", "", "\r", "", "<", "")
-			return template.CSS(`url("` + replacer.Replace(trimmed) + `")`)
+			replacer := strings.NewReplacer(
+				`\`, `\\`,
+				`"`, `\"`,
+				`'`, `\'`,
+				`(`, `\(`,
+				`)`, `\)`,
+				`<`, `\3c `,
+				`>`, `\3e `,
+				`;`, `\3b `,
+			)
+			return template.CSS(`url("` + replacer.Replace(u) + `")`)
 		},
 		"fmtDate": func(ms int64) string {
 			if ms <= 0 {
@@ -472,18 +471,137 @@ func isEmptyTemplateValue(v any) bool {
 	return false
 }
 
+func stripThemeASCIIControls(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 0x1F || c == 0x7F {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+func hasPrefixFoldASCIITheme(s, prefixLower string) bool {
+	if len(s) < len(prefixLower) {
+		return false
+	}
+	for i := 0; i < len(prefixLower); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != prefixLower[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func indexFoldASCIITheme(s, needleLower string) int {
+	n := len(needleLower)
+	if n == 0 || len(s) < n {
+		return -1
+	}
+	limit := len(s) - n
+	for i := 0; i <= limit; i++ {
+		if hasPrefixFoldASCIITheme(s[i:], needleLower) {
+			return i
+		}
+	}
+	return -1
+}
+
+func sanitizeThemeURL(raw string, allowMailTelAnchor bool) (string, bool) {
+	cleaned := strings.TrimSpace(stripThemeASCIIControls(raw))
+	if cleaned == "" {
+		return "", false
+	}
+	if strings.HasPrefix(cleaned, "/") {
+		if strings.HasPrefix(cleaned, "//") || strings.HasPrefix(cleaned, `/\`) {
+			return "", false
+		}
+		return cleaned, true
+	}
+	if hasPrefixFoldASCIITheme(cleaned, "http://") && len(cleaned) > len("http://") {
+		return cleaned, true
+	}
+	if hasPrefixFoldASCIITheme(cleaned, "https://") && len(cleaned) > len("https://") {
+		return cleaned, true
+	}
+	if allowMailTelAnchor {
+		if strings.HasPrefix(cleaned, "#") {
+			return cleaned, true
+		}
+		if hasPrefixFoldASCIITheme(cleaned, "mailto:") && len(cleaned) > len("mailto:") {
+			return cleaned, true
+		}
+		if hasPrefixFoldASCIITheme(cleaned, "tel:") && len(cleaned) > len("tel:") {
+			return cleaned, true
+		}
+	}
+	return "", false
+}
+
+func buildThemePageURL(rawPathAndQuery string, page int) string {
+	cleaned := strings.TrimSpace(stripThemeASCIIControls(rawPathAndQuery))
+	if cleaned == "" {
+		cleaned = "/"
+	}
+	u, err := url.Parse(cleaned)
+	if err != nil {
+		if page <= 1 {
+			return "/"
+		}
+		return "/?page=" + strconv.Itoa(page)
+	}
+	basePath := u.Path
+	if basePath == "" {
+		basePath = "/"
+	}
+	q := u.Query()
+	if page <= 1 {
+		q.Del("page")
+	} else {
+		q.Set("page", strconv.Itoa(page))
+	}
+	out := basePath
+	if enc := q.Encode(); enc != "" {
+		out += "?" + enc
+	}
+	if u.Fragment != "" {
+		out += "#" + u.EscapedFragment()
+	}
+	return out
+}
+
 func sanitizeStyleContent(css string) string {
 	if css == "" {
 		return ""
 	}
-	clean := css
-	for _, bad := range []string{"</style", "<script", "javascript:", "expression("} {
-		idx := strings.Index(strings.ToLower(clean), bad)
-		for idx >= 0 {
-			clean = clean[:idx] + clean[idx+len(bad):]
-			idx = strings.Index(strings.ToLower(clean), bad)
+	clean := strings.ReplaceAll(css, "\x00", "")
+	for {
+		changed := false
+		for _, bad := range []string{"javascript:", "expression("} {
+			for {
+				idx := indexFoldASCIITheme(clean, bad)
+				if idx < 0 {
+					break
+				}
+				clean = clean[:idx] + clean[idx+len(bad):]
+				changed = true
+			}
+		}
+		if !changed {
+			break
 		}
 	}
+	clean = strings.ReplaceAll(clean, "</", `<\/`)
 	return clean
 }
 
@@ -510,7 +628,7 @@ func renderSocialIconSVG(icon string) template.HTML {
 }
 
 func renderNavIconHTML(icon string) template.HTML {
-	trimmed := strings.TrimSpace(icon)
+	trimmed := strings.TrimSpace(stripThemeASCIIControls(icon))
 	if trimmed == "" {
 		return ""
 	}
@@ -527,10 +645,11 @@ func renderNavIconHTML(icon string) template.HTML {
 	case lower == "external" || lower == "link":
 		return template.HTML(`<svg class="studio-nav-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.2 8.8"/><path d="M12.5 9.2v3.3a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1h3.3"/></svg>`)
 	}
-	if strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "vbscript:") || strings.HasPrefix(lower, "data:text/html") {
+	safeSrc, ok := sanitizeThemeURL(trimmed, false)
+	if !ok {
 		return ""
 	}
-	return template.HTML(`<img class="studio-nav-icon" src="` + html.EscapeString(trimmed) + `" alt="" loading="lazy" decoding="async" data-hide-on-error="1" />`)
+	return template.HTML(`<img class="studio-nav-icon" src="` + html.EscapeString(safeSrc) + `" alt="" loading="lazy" decoding="async" data-hide-on-error="1" />`)
 }
 
 func jsonMarshalSafe(v any) ([]byte, error) {

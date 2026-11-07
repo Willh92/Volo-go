@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	maxFeedCacheBytes   = 512 << 10 // <= 512 KiB ceiling for pre-compressed RSS/Atom/Podcast/Sitemap/LLMs artifacts
+	maxFeedCacheBytes   = 2 * 1024 * 1024 // <= 2 MiB ceiling for pre-compressed RSS/Atom/Podcast/Sitemap/LLMs artifacts
 	maxCachedRecentCmts = 20
 )
 
@@ -94,6 +94,24 @@ func (s *Service) currentRevisions() (dataRev uint64, settingsRev uint64) {
 		settingsRev = s.settings.Revision()
 	}
 	return dataRev, settingsRev
+}
+
+// PurgeRuntimeCaches clears in-memory redirect, chrome, feed, and visibility render caches.
+func (s *Service) PurgeRuntimeCaches() {
+	if s == nil {
+		return
+	}
+	if s.caches != nil {
+		s.caches.redirects.Store(nil)
+		s.caches.chrome.Store(nil)
+		s.caches.feedMu.Lock()
+		clear(s.caches.feedDocs)
+		s.caches.feedUsed = 0
+		s.caches.feedMu.Unlock()
+	}
+	if s.guard != nil {
+		s.guard.PurgeCache()
+	}
 }
 
 func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapshot, error) {

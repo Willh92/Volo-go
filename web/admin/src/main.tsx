@@ -1,4 +1,6 @@
 import { render } from "preact";
+import type { CSSProperties } from "preact";
+import { createPortal } from "preact/compat";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import "./styles/console.css";
 import {
@@ -29,7 +31,7 @@ import {
   t,
 } from "./i18n";
 import { BrandLogo } from "./components/BrandLogo";
-import { AnimatedModal, GlobalConfirmModal, LocalePopover } from "./components/UIControls";
+import { AnimatedModal, GlobalConfirmModal, LocalePopover, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
 import { SetupWizard } from "./views/SetupWizard";
 import { LoginView } from "./views/LoginView";
 import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
@@ -314,6 +316,7 @@ function CommandPalette({
   onNavigate: (sec: string) => void;
 }) {
   const [q, setQ] = useState("");
+  const debouncedQ = useDebouncedValue(q, 250);
   const [idx, setIdx] = useState(0);
   const [posts, setPosts] = useState<Array<{ id: string; title: string; slug: string; status: string }>>([]);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -323,18 +326,24 @@ function CommandPalette({
     setQ("");
     setIdx(0);
     window.setTimeout(() => inputRef.current?.focus(), 30);
-    apiFetch<{ items?: any[]; articles?: any[] }>("/api/admin/articles")
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const params = new URLSearchParams({ per_page: "50" });
+    if (debouncedQ.trim()) params.set("q", debouncedQ.trim());
+    apiFetch<{ items?: any[]; articles?: any[] }>(`/api/admin/articles?${params.toString()}`)
       .then((res) => {
         const raw = res.items || res.articles || [];
         setPosts(
-          raw.slice(0, 60).map((it: any) => {
+          raw.slice(0, 50).map((it: any) => {
             const a = it.article || it;
             return { id: a.id, title: a.title || a.slug, slug: a.slug || "", status: a.status || "published" };
           })
         );
       })
       .catch(() => {});
-  }, [open]);
+  }, [open, debouncedQ]);
 
   const items = useMemo<CmdItem[]>(() => {
     const out: CmdItem[] = [];
@@ -475,10 +484,13 @@ function App() {
   });
   const [appearanceOpen, setAppearanceOpen] = useState<boolean>(false);
   const [appearanceClosing, setAppearanceClosing] = useState<boolean>(false);
+  const [appearanceStyle, setAppearanceStyle] = useState<CSSProperties>({});
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
   const [cmdkOpen, setCmdkOpen] = useState<boolean>(false);
   const [avatarErr, setAvatarErr] = useState<boolean>(false);
   const appCloseTimer = useRef<number | undefined>(undefined);
+  const appBtnRef = useRef<HTMLButtonElement | null>(null);
+  const appMenuRef = useRef<HTMLDivElement | null>(null);
 
   const curLocale = localeSig.value;
   const locales = availableLocalesSig.value;
@@ -490,6 +502,12 @@ function App() {
   useEffect(() => {
     setAvatarErr(false);
   }, [user?.avatar_url]);
+
+  const updateAppearancePos = () => {
+    if (!appBtnRef.current) return;
+    const rect = appBtnRef.current.getBoundingClientRect();
+    setAppearanceStyle(computePortalMenuStyle(rect, { minW: 256, maxW: 300, maxH: 380, align: "right" }).style);
+  };
 
   const closeAppearanceAnimated = () => {
     if (!appearanceOpen || appearanceClosing) return;
@@ -507,6 +525,7 @@ function App() {
     } else {
       if (appCloseTimer.current) window.clearTimeout(appCloseTimer.current);
       setAppearanceClosing(false);
+      updateAppearancePos();
       setAppearanceOpen(true);
     }
   };
@@ -592,15 +611,23 @@ function App() {
 
   useEffect(() => {
     if (!appearanceOpen) return;
-    const onDocClick = () => closeAppearanceAnimated();
+    const onDocDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (appBtnRef.current?.contains(target) || appMenuRef.current?.contains(target)) return;
+      closeAppearanceAnimated();
+    };
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") closeAppearanceAnimated();
     };
-    document.addEventListener("click", onDocClick);
+    document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
+    window.addEventListener("resize", updateAppearancePos);
+    window.addEventListener("scroll", updateAppearancePos, true);
     return () => {
-      document.removeEventListener("click", onDocClick);
+      document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
+      window.removeEventListener("resize", updateAppearancePos);
+      window.removeEventListener("scroll", updateAppearancePos, true);
     };
   }, [appearanceOpen, appearanceClosing]);
 
@@ -786,8 +813,9 @@ function App() {
             </button>
 
             {/* Unified Appearance Popover (4 Modes + Admin-Persisted Accent Swatches) */}
-            <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
+            <div class="volo-pop-wrap">
               <button
+                ref={appBtnRef}
                 type="button"
                 class="volo-appearance-trigger"
                 title={`${t("shell.appearance_title")}: ${t(`mode.${curMode}`)} · ${t(`accent.${curAccent}`)}`}
@@ -807,63 +835,70 @@ function App() {
                 <span class="volo-swatch-dot" style={{ background: activeSwatch, width: "12px", height: "12px" }} />
               </button>
 
-              {appearanceOpen && (
-                <div class={`volo-pop-menu volo-appearance-pop ${appearanceClosing ? "is-closing" : ""}`}>
-                  <div class="volo-pop-caption">{t("shell.mode_title")}</div>
-                  <div class="volo-mode-grid">
-                    {MODE_OPTIONS.map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        class={`volo-pop-item volo-mode-item ${curMode === m ? "active" : ""}`}
-                        onClick={() => applyThemeAttributes(m, curAccent, true)}
-                      >
-                        <span class="volo-mode-icon" aria-hidden="true">
-                          {m === "auto" ? (
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
-                          ) : m === "system" ? (
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
-                          ) : m === "light" ? (
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6"/></svg>
-                          ) : (
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
-                          )}
-                        </span>
-                        <span class="volo-mode-copy">
-                          <span>{t(`mode.${m}`)}</span>
-                          <span class="volo-mode-sub">{t(`mode.${m}_desc`)}</span>
-                        </span>
-                        {curMode === m && <span>✓</span>}
-                      </button>
-                    ))}
-                  </div>
+              {appearanceOpen &&
+                typeof document !== "undefined" &&
+                createPortal(
+                  <div
+                    ref={appMenuRef}
+                    class={`volo-cselect-menu is-portal volo-appearance-pop ${appearanceClosing ? "is-closing" : ""}`}
+                    style={appearanceStyle}
+                  >
+                    <div class="volo-pop-caption">{t("shell.mode_title")}</div>
+                    <div class="volo-mode-grid">
+                      {MODE_OPTIONS.map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          class={`volo-pop-item volo-mode-item ${curMode === m ? "active" : ""}`}
+                          onClick={() => applyThemeAttributes(m, curAccent, true)}
+                        >
+                          <span class="volo-mode-icon" aria-hidden="true">
+                            {m === "auto" ? (
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+                            ) : m === "system" ? (
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+                            ) : m === "light" ? (
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6"/></svg>
+                            ) : (
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+                            )}
+                          </span>
+                          <span class="volo-mode-copy">
+                            <span>{t(`mode.${m}`)}</span>
+                            <span class="volo-mode-sub">{t(`mode.${m}_desc`)}</span>
+                          </span>
+                          {curMode === m && <span>✓</span>}
+                        </button>
+                      ))}
+                    </div>
 
-                  {isAdmin && (
-                    <>
-                      <div class="volo-pop-divider" />
-                      <div class="volo-pop-caption">{t("shell.accent_title")}</div>
-                      <div class="volo-accent-row">
-                        {ACCENT_OPTIONS.map((ac) => {
-                          const isAct = curAccent === ac.id;
-                          return (
-                            <button
-                              key={ac.id}
-                              type="button"
-                              class={`volo-accent-dot-btn ${isAct ? "active" : ""}`}
-                              style={{ background: ac.swatch }}
-                              title={t(`accent.${ac.id}`)}
-                              aria-label={t(`accent.${ac.id}`)}
-                              onClick={() => void saveGlobalAccent(ac.id)}
-                            >
-                              {isAct && <span>✓</span>}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
+                    {isAdmin && (
+                      <>
+                        <div class="volo-pop-divider" />
+                        <div class="volo-pop-caption">{t("shell.accent_title")}</div>
+                        <div class="volo-accent-row">
+                          {ACCENT_OPTIONS.map((ac) => {
+                            const isAct = curAccent === ac.id;
+                            return (
+                              <button
+                                key={ac.id}
+                                type="button"
+                                class={`volo-accent-dot-btn ${isAct ? "active" : ""}`}
+                                style={{ background: ac.swatch }}
+                                title={t(`accent.${ac.id}`)}
+                                aria-label={t(`accent.${ac.id}`)}
+                                onClick={() => void saveGlobalAccent(ac.id)}
+                              >
+                                {isAct && <span>✓</span>}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </div>,
+                  document.body
+                )}
             </div>
 
             {/* Scalable Language Popover */}

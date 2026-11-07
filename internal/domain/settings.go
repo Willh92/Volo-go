@@ -44,6 +44,7 @@ type ReadingSettings struct {
 	EnableOutdatedNotice  bool     `json:"enable_outdated_notice"`
 	OutdatedNoticeDays    int      `json:"outdated_notice_days"` // 0 = disabled
 	EnableInstantSearch   bool     `json:"enable_instant_search"`
+	EnablePJAX            bool     `json:"enable_pjax"`
 	ShowCodeLineNumbers   bool     `json:"show_code_line_numbers"`
 	AllowReaderRegister   bool     `json:"allow_reader_register"`
 	CommentAccessMode     string   `json:"comment_access_mode"`     // all | registered | off
@@ -53,6 +54,7 @@ type ReadingSettings struct {
 	AllowedKeywords       []string `json:"allowed_keywords"`
 	PoWDifficultyBits     int      `json:"pow_difficulty_bits"`
 	AssetCDNPrefix        string   `json:"asset_cdn_prefix"`
+	VendorCDNPrefix       string   `json:"vendor_cdn_prefix"`
 }
 
 // PodcastChannelConfig holds full Apple/Spotify iTunes Podcast metadata inside "feed" domain.
@@ -222,6 +224,35 @@ type SettingsSnapshot struct {
 	Backup        BackupSettings        `json:"backup"`
 }
 
+// DefaultReadingSettings returns safe default reading settings (with EnablePJAX enabled by default).
+func DefaultReadingSettings() ReadingSettings {
+	return ReadingSettings{
+		ListStyle:             "summary",
+		PostsPerPage:          15,
+		RecentPostsCount:      8,
+		RecentCommentsCount:   8,
+		PopularTagsCount:      20,
+		RelatedPostsCount:     5,
+		EnableReadingStats:    true,
+		EnableOutdatedNotice:  true,
+		OutdatedNoticeDays:    365,
+		EnableInstantSearch:   true,
+		EnablePJAX:            true,
+		ShowCodeLineNumbers:   false,
+		AllowReaderRegister:   false,
+		CommentAccessMode:     CommentAccessAll,
+		CommentModerationMode: CommentModerationSmart,
+		BuiltinSpamFilter:     true,
+		BlockedKeywords:       []string{},
+		AllowedKeywords:       []string{},
+		PoWDifficultyBits:     16,
+		VendorCDNPrefix:       DefaultVendorCDNPrefix,
+	}
+}
+
+// DefaultVendorCDNPrefix is the default npm CDN prefix for on-demand KaTeX & Mermaid libraries.
+const DefaultVendorCDNPrefix = "https://cdn.jsdelivr.net/npm"
+
 // DefaultSettingsSnapshot returns safe, privacy-first defaults out-of-the-box.
 func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 	if defaultLocale == "" {
@@ -252,26 +283,7 @@ func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 			CustomVars:          map[string]string{},
 			ShowAdminLoginEntry: false,
 		},
-		Reading: ReadingSettings{
-			ListStyle:             "summary",
-			PostsPerPage:          15,
-			RecentPostsCount:      8,
-			RecentCommentsCount:   8,
-			PopularTagsCount:      20,
-			RelatedPostsCount:     5,
-			EnableReadingStats:    true,
-			EnableOutdatedNotice:  true,
-			OutdatedNoticeDays:    365,
-			EnableInstantSearch:   true,
-			ShowCodeLineNumbers:   false,
-			AllowReaderRegister:   false,
-			CommentAccessMode:     CommentAccessAll,
-			CommentModerationMode: CommentModerationSmart,
-			BuiltinSpamFilter:     true,
-			BlockedKeywords:       []string{},
-			AllowedKeywords:       []string{},
-			PoWDifficultyBits:     16,
-		},
+		Reading: DefaultReadingSettings(),
 		Feed: FeedSettings{
 			OutputMode:        "summary",
 			ItemCount:         20,

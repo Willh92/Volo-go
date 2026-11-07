@@ -236,7 +236,13 @@
       banReject: attr("data-l-ban-reject", "Also reject comment"),
       banNote: attr("data-l-ban-note", "Note"),
       banConfirm: attr("data-l-ban-confirm", "Confirm Ban"),
-      claim: attr("data-l-claim", "Claim guest comments")
+      claim: attr("data-l-claim", "Claim guest comments"),
+      prev: attr("data-l-prev", "←"),
+      next: attr("data-l-next", "→"),
+      pageInfo: attr("data-l-page", "{page} / {total}"),
+      confirm: attr("data-l-confirm", "Confirm?"),
+      moreReplies: attr("data-l-more-replies", "Show {count} more replies"),
+      netErr: attr("data-l-net-err", "Request failed")
     };
 
     var gpToken = "";
@@ -245,6 +251,8 @@
     var editingID = "";
     var banTargetID = "";
     var banHours = 0;
+    var curPage = 1;
+    var totalPages = 1;
     var canCompose = mode !== "off" && !(mode === "registered_only" && !isLogged);
 
     function headers(withCSRF) {
@@ -261,77 +269,119 @@
       return n;
     }
 
-    function renderItem(c) {
+    function hashCommentID() {
+      var h = (window.location.hash || "").slice(1);
+      try { h = decodeURIComponent(h); } catch (_) {}
+      return h.indexOf("comment-") === 0 ? h.slice(8) : "";
+    }
+
+    function hasDescendant(list, targetID) {
+      if (!targetID) return false;
+      return (list || []).some(function (x) {
+        return String(x.id) === targetID || hasDescendant(x.replies, targetID);
+      });
+    }
+
+    function renderItem(c, depth) {
       var seed = c.avatar_seed || c.id || "guest";
       var av = c.avatar_url || ("/avatars/" + encodeURIComponent(seed) + ".svg");
       var at = c.reply_to_name ? '<span class="vc-reply-at">@' + esc(c.reply_to_name) + "</span>" : "";
-      var who = c.author_url
-        ? '<a href="' + esc(c.author_url) + '" rel="nofollow ugc noopener" target="_blank">' + esc(c.author_name) + "</a>"
+      var rawURL = c.author_url ? String(c.author_url).trim() : "";
+      var who = /^https?:\/\//i.test(rawURL)
+        ? '<a href="' + esc(rawURL) + '" rel="nofollow ugc noopener" target="_blank">' + esc(c.author_name) + "</a>"
         : "<strong>" + esc(c.author_name) + "</strong>";
       var authorBadge = c.is_author ? '<span class="vc-author-badge">' + esc(L.author) + "</span>" : "";
-      var pendBadge = c.status === "pending" ? '<span class="vc-pending-badge">' + esc(L.pendingBadge) + "</span>" : "";
+      var pendBadge = c.status === "pending" ? '<span class="vc-pending-badge vc-badge--pending">' + esc(L.pendingBadge) + "</span>" : "";
       var geo = c.geo_region ? '<span class="vc-geo">' + esc(c.geo_region) + "</span>" : "";
       var ip = c.ip_masked ? '<span class="vc-ip-badge">' + esc(c.ip_masked) + "</span>" : "";
+      var cid = esc(c.id);
+      var mkAct = function (cls, extra, lbl) {
+        return '<button type="button" class="vc-act-btn ' + cls + '" data-id="' + cid + '"' + extra + ">" + esc(lbl) + "</button>";
+      };
 
       var acts = [];
-      if (canCompose) {
-        acts.push('<button type="button" class="vc-act-btn js-vc-reply" data-id="' + esc(c.id) + '" data-name="' + esc(c.author_name) + '">' + esc(L.reply) + "</button>");
-      }
+      if (canCompose) acts.push(mkAct("js-vc-reply", ' data-name="' + esc(c.author_name) + '"', L.reply));
       if (c.can_edit) {
-        acts.push('<button type="button" class="vc-act-btn js-vc-edit" data-id="' + esc(c.id) + '" data-md="' + esc(c.content_md || "") + '">' + esc(L.edit) + "</button>");
-        acts.push('<button type="button" class="vc-act-btn vc-act-btn--danger js-vc-del" data-id="' + esc(c.id) + '">' + esc(L.del) + "</button>");
+        acts.push(mkAct("js-vc-edit", ' data-md="' + esc(c.content_md || "") + '"', L.edit));
+        acts.push(mkAct("vc-act-btn--danger js-vc-del", "", L.del));
       }
       if (c.can_moderate && csrfToken) {
-        if (c.status === "pending") {
-          acts.push('<button type="button" class="vc-act-btn js-vc-mod-approve" data-id="' + esc(c.id) + '">' + esc(L.approve) + "</button>");
-        }
-        if (!c.can_edit) {
-          acts.push('<button type="button" class="vc-act-btn vc-act-btn--danger js-vc-mod-del" data-id="' + esc(c.id) + '">' + esc(L.del) + "</button>");
-        }
-        if (c.can_ban_ip) {
-          acts.push('<button type="button" class="vc-act-btn vc-act-btn--danger js-vc-mod-ban" data-id="' + esc(c.id) + '" data-ip="' + esc(c.ip_masked || "") + '">' + esc(L.ban) + "</button>");
+        if (c.status === "pending") acts.push(mkAct("js-vc-mod-approve", "", L.approve));
+        if (!c.can_edit) acts.push(mkAct("vc-act-btn--danger js-vc-mod-del", "", L.del));
+        if (c.can_ban_ip) acts.push(mkAct("vc-act-btn--danger js-vc-mod-ban", ' data-ip="' + esc(c.ip_masked || "") + '"', L.ban));
+      }
+
+      var reps = c.replies || [];
+      var kids = "";
+      if (reps.length) {
+        var dNext = (depth || 0) + 1;
+        var mapR = function (arr) { return arr.map(function (r) { return renderItem(r, dNext); }).join(""); };
+        if (!depth && reps.length > 3 && !hasDescendant(reps.slice(3), hashCommentID())) {
+          kids = '<div class="vc-replies">' + mapR(reps.slice(0, 3)) +
+            '<div class="js-vc-more-box" hidden>' + mapR(reps.slice(3)) + "</div>" +
+            '<button type="button" class="vc-more-replies js-vc-show-more">' +
+            esc(L.moreReplies.replace("{count}", String(reps.length - 3))) + "</button></div>";
+        } else {
+          kids = '<div class="vc-replies">' + mapR(reps) + "</div>";
         }
       }
 
-      var kids = (c.replies || []).length ? '<div class="vc-replies">' + c.replies.map(renderItem).join("") + "</div>" : "";
-      return '<div class="vc-item" id="comment-' + esc(c.id) + '">' +
+      return '<div class="vc-item" id="comment-' + cid + '">' +
         '<img class="vc-avatar" src="' + esc(av) + '" data-avatar-seed="' + esc(seed) + '" alt="" width="38" height="38" loading="lazy">' +
         '<div class="vc-body">' +
         '<div class="vc-meta">' + who + authorBadge + pendBadge + "<span>· " + fmtTime(c.created_at) + "</span>" + geo + ip + "</div>" +
         '<div class="vc-content volo-prose">' + at + (c.content_html || "") + "</div>" +
         (acts.length ? '<div class="vc-actions">' + acts.join("") + "</div>" : "") +
-        kids + "</div></div>";
+        "</div>" + kids + "</div>";
     }
 
     var initialScrollPending = true;
-    function focusHashComment() {
-      var h = (window.location.hash || "").slice(1);
-      if (!h) return;
-      try { h = decodeURIComponent(h); } catch (_) {}
-      if (h === "comments") h = "volo-comments";
-      if (h !== "volo-comments" && h.indexOf("comment-") !== 0) return;
-      var node = document.getElementById(h);
-      if (!node) return;
-      if (window.__voloScrollToEl) window.__voloScrollToEl(node, h.indexOf("comment-") === 0);
-      else node.scrollIntoView({ behavior: "smooth", block: "center" });
+    var statusBanner = null;
+
+    function showBanner(txt, isErr) {
+      if (!statusBanner) statusBanner = el.querySelector(".js-vc-status");
+      if (!statusBanner) return;
+      statusBanner.textContent = txt || "";
+      statusBanner.classList.toggle("volo-banner--err", !!isErr);
+      statusBanner.hidden = !txt;
     }
 
-    function refreshList() {
-      fetch("/api/v1/comments?target_type=" + encodeURIComponent(tType) + "&target_id=" + encodeURIComponent(tID), { headers: headers(false) })
-        .then(function (r) { return r.ok ? r.json() : null; })
+    function refreshList(reqPage) {
+      if (reqPage) curPage = reqPage;
+      var qs = "target_type=" + encodeURIComponent(tType) + "&target_id=" + encodeURIComponent(tID) + "&page=" + curPage + "&per_page=20";
+      var fID = initialScrollPending ? hashCommentID() : "";
+      if (fID) qs += "&focus_comment=" + encodeURIComponent(fID);
+
+      fetch("/api/v1/comments?" + qs, { headers: headers(false) })
+        .then(function (r) { if (!r.ok) throw new Error(); return r.json(); })
         .then(function (d) {
           var box = el.querySelector(".js-vc-list");
           if (!box || !d) return;
           var arr = d.comments || [];
+          curPage = d.page || curPage || 1;
+          totalPages = d.total_pages || 1;
+          var totalCnt = typeof d.total_comments === "number" ? d.total_comments : countTree(arr);
           var titleEl = el.querySelector(".vc-head__title");
           if (titleEl) {
-            titleEl.textContent = L.title.replace(/\(\d+\)/, "(" + countTree(arr) + ")");
+            titleEl.textContent = L.title.replace(/\(\d+\)/, "(" + totalCnt + ")");
           }
-          box.innerHTML = arr.length ? arr.map(renderItem).join("") : '<div class="vc-empty">' + esc(L.empty) + "</div>";
+          var pager = totalPages > 1
+            ? '<nav class="vc-pager" aria-label="Comments pagination">' +
+              '<button type="button" class="pagination__item js-vc-page" data-page="' + (curPage - 1) + '"' + (curPage <= 1 ? " disabled" : "") + ">" + esc(L.prev) + "</button>" +
+              '<span class="vc-pager__info">' + esc(L.pageInfo.replace("{page}", String(curPage)).replace("{total}", String(totalPages))) + "</span>" +
+              '<button type="button" class="pagination__item js-vc-page" data-page="' + (curPage + 1) + '"' + (curPage >= totalPages ? " disabled" : "") + ">" + esc(L.next) + "</button></nav>"
+            : "";
+          box.innerHTML = (arr.length ? arr.map(function (c) { return renderItem(c, 0); }).join("") : '<div class="vc-empty">' + esc(L.empty) + "</div>") + pager;
+          if (statusBanner && statusBanner.classList.contains("volo-banner--err")) showBanner("", false);
           if (initialScrollPending) {
             initialScrollPending = false;
             requestAnimationFrame(focusHashComment);
           }
+        })
+        .catch(function () {
+          var box = el.querySelector(".js-vc-list");
+          if (box && !box.innerHTML) box.innerHTML = '<div class="vc-list-err">' + esc(L.netErr) + "</div>";
+          else showBanner(L.netErr, true);
         });
     }
 
@@ -419,21 +469,54 @@
       el.innerHTML = '<div class="vc-head"><h3 class="vc-head__title">' + esc(L.title) + "</h3>" + claimHTML + "</div>" +
         topPrompt + '<div class="js-vc-status volo-banner" hidden></div><div class="js-vc-list"></div>' + drawerHTML + banModalHTML;
 
-      refreshList();
-
-      var drawer = el.querySelector(".js-vc-drawer");
-      var backdrop = el.querySelector(".js-vc-backdrop");
-      var form = el.querySelector(".js-vc-form");
-      var ta = el.querySelector(".js-vc-ta");
-      var previewBox = el.querySelector(".js-vc-preview");
-      var cntEl = el.querySelector(".js-vc-cnt");
-      var ctxPill = el.querySelector(".js-vc-ctx");
-      var ctxText = el.querySelector(".js-vc-ctx-text");
-      var submitBtn = el.querySelector(".js-vc-submit");
-      var msgEl = el.querySelector(".js-vc-msg");
-      var statusBanner = el.querySelector(".js-vc-status");
-      var banModal = el.querySelector(".js-vc-ban-modal");
+      var q = function (s) { return el.querySelector(s); };
+      var drawer = q(".js-vc-drawer");
+      var backdrop = q(".js-vc-backdrop");
+      var form = q(".js-vc-form");
+      var ta = q(".js-vc-ta");
+      var previewBox = q(".js-vc-preview");
+      var cntEl = q(".js-vc-cnt");
+      var ctxPill = q(".js-vc-ctx");
+      var ctxText = q(".js-vc-ctx-text");
+      var submitBtn = q(".js-vc-submit");
+      var msgEl = q(".js-vc-msg");
+      statusBanner = q(".js-vc-status");
+      var banModal = q(".js-vc-ban-modal");
       var syncLock = function () { if (window.__voloSyncScrollLock) window.__voloSyncScrollLock(); };
+
+      refreshList(1);
+
+      function confirmTap(btn) {
+        if (btn.getAttribute("data-confirm") === "1") {
+          clearTimeout(btn._cfTimer);
+          btn.removeAttribute("data-confirm");
+          if (btn._origTxt) btn.textContent = btn._origTxt;
+          return true;
+        }
+        btn._origTxt = btn.textContent;
+        btn.setAttribute("data-confirm", "1");
+        btn.textContent = L.confirm;
+        btn._cfTimer = setTimeout(function () {
+          btn.removeAttribute("data-confirm");
+          btn.textContent = btn._origTxt;
+        }, 3000);
+        return false;
+      }
+
+      function actReq(url, opts, onOk) {
+        fetch(url, opts)
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d }; });
+          })
+          .then(function (res) {
+            if (!res.ok) {
+              showBanner((res.d && res.d.error) || L.netErr, true);
+              return;
+            }
+            onOk(res.d || {});
+          })
+          .catch(function () { showBanner(L.netErr, true); });
+      }
 
       function syncCtxUI() {
         if (!ctxPill || !ctxText || !submitBtn) return;
@@ -550,17 +633,20 @@
             }).then(function (r) {
               return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d }; });
             }).then(function (res) {
-              submitBtn.disabled = false;
               if (!res.ok) {
-                if (msgEl) { msgEl.textContent = (res.d && res.d.error) || "Failed"; msgEl.classList.add("is-err"); }
+                if (msgEl) { msgEl.textContent = (res.d && res.d.error) || L.netErr; msgEl.classList.add("is-err"); }
                 return;
               }
               editingID = "";
               ta.value = "";
               ta.dispatchEvent(new Event("input"));
-              syncCtxUI();
               closeDrawer();
-              refreshList();
+              refreshList(curPage);
+            }).catch(function () {
+              if (msgEl) { msgEl.textContent = L.netErr; msgEl.classList.add("is-err"); }
+            }).finally(function () {
+              submitBtn.disabled = false;
+              syncCtxUI();
             });
             return;
           }
@@ -569,6 +655,7 @@
             var nameVal = String(fd.get("author_name") || "").trim();
             var emailVal = String(fd.get("notify_email") || "").trim();
             var urlVal = String(fd.get("author_url") || "").trim();
+            var wasReply = !!replyParentID;
             fetch("/api/v1/comments", {
               method: "POST",
               headers: headers(false),
@@ -586,12 +673,10 @@
                 env_fp: window.__voloEnvFP ? window.__voloEnvFP() : ""
               })
             }).then(function (r) {
-              return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+              return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d }; });
             }).then(function (res) {
-              submitBtn.disabled = false;
-              syncCtxUI();
               if (!res.ok) {
-                if (msgEl) { msgEl.textContent = (res.d && res.d.error) || "Failed"; msgEl.classList.add("is-err"); }
+                if (msgEl) { msgEl.textContent = (res.d && res.d.error) || L.netErr; msgEl.classList.add("is-err"); }
                 return;
               }
               if (res.d && res.d.passport_token) { gpToken = res.d.passport_token; savePassport(gpToken); }
@@ -610,14 +695,15 @@
               replyParentID = "";
               replyParentName = "";
               ta.dispatchEvent(new Event("input"));
-              syncCtxUI();
               closeDrawer();
-              if (statusBanner) {
-                var isPend = res.d && res.d.comment && res.d.comment.status === "pending";
-                statusBanner.textContent = isPend ? L.pending : "";
-                statusBanner.hidden = !isPend;
-              }
-              refreshList();
+              var isPend = res.d && res.d.comment && res.d.comment.status === "pending";
+              showBanner(isPend ? L.pending : "", false);
+              refreshList(wasReply ? curPage : 1);
+            }).catch(function () {
+              if (msgEl) { msgEl.textContent = L.netErr; msgEl.classList.add("is-err"); }
+            }).finally(function () {
+              submitBtn.disabled = false;
+              syncCtxUI();
             });
           };
 
@@ -626,28 +712,25 @@
           } else {
             submitBtn.textContent = L.pow;
             fetch("/api/v1/pow/challenge")
-              .then(function (r) { return r.json(); })
+              .then(function (r) { if (!r.ok) throw new Error(); return r.json(); })
               .then(function (c) { return solvePoW(c.challenge, c.difficulty_bits).then(function (sol) { doPost(c.challenge, sol); }); })
-              .catch(function () { submitBtn.disabled = false; syncCtxUI(); });
+              .catch(function () {
+                submitBtn.disabled = false;
+                syncCtxUI();
+                if (msgEl) { msgEl.textContent = L.netErr; msgEl.classList.add("is-err"); }
+              });
           }
         });
       }
 
       el.addEventListener("click", function (ev) {
-        if (ev.target.closest(".js-vc-open")) {
-          openDrawer();
-          return;
-        }
-        if (ev.target.closest(".js-vc-close") || ev.target.closest(".js-vc-backdrop")) {
-          closeDrawer();
-          return;
-        }
-        if (ev.target.closest(".js-vc-clear-ctx")) {
-          clearCtx();
-          return;
-        }
-        if (ev.target.closest(".js-vc-toggle-guest")) {
-          var gRow = el.querySelector(".js-vc-guest-row");
+        var cl = function (s) { return ev.target.closest(s); };
+        var refreshCur = function () { refreshList(curPage); };
+        if (cl(".js-vc-open")) { openDrawer(); return; }
+        if (cl(".js-vc-close, .js-vc-backdrop")) { closeDrawer(); return; }
+        if (cl(".js-vc-clear-ctx")) { clearCtx(); return; }
+        if (cl(".js-vc-toggle-guest")) {
+          var gRow = q(".js-vc-guest-row");
           if (gRow) {
             gRow.hidden = !gRow.hidden;
             if (!gRow.hidden) {
@@ -658,20 +741,37 @@
           return;
         }
 
-        var mdBtn = ev.target.closest("[data-md-act]");
+        var pBtn = cl(".js-vc-page");
+        if (pBtn) {
+          if (!pBtn.disabled) {
+            refreshList(parseInt(pBtn.getAttribute("data-page") || "1", 10) || 1);
+            if (window.__voloScrollToEl) window.__voloScrollToEl(el, false);
+          }
+          return;
+        }
+
+        var smBtn = cl(".js-vc-show-more");
+        if (smBtn) {
+          var mBox = smBtn.previousElementSibling;
+          if (mBox) mBox.hidden = false;
+          smBtn.remove();
+          return;
+        }
+
+        var mdBtn = cl("[data-md-act]");
         if (mdBtn && ta) {
           setTab("write");
           applyMdTool(ta, mdBtn.getAttribute("data-md-act"));
           return;
         }
 
-        var tabBtn = ev.target.closest("[data-vc-tab]");
+        var tabBtn = cl("[data-vc-tab]");
         if (tabBtn) {
           setTab(tabBtn.getAttribute("data-vc-tab"));
           return;
         }
 
-        var rBtn = ev.target.closest(".js-vc-reply");
+        var rBtn = cl(".js-vc-reply");
         if (rBtn) {
           editingID = "";
           replyParentID = rBtn.getAttribute("data-id") || "";
@@ -681,7 +781,7 @@
           return;
         }
 
-        var eBtn = ev.target.closest(".js-vc-edit");
+        var eBtn = cl(".js-vc-edit");
         if (eBtn && ta) {
           replyParentID = "";
           replyParentName = "";
@@ -693,59 +793,61 @@
           return;
         }
 
-        var dBtn = ev.target.closest(".js-vc-del");
+        var dBtn = cl(".js-vc-del");
         if (dBtn) {
-          fetch("/api/v1/comments/" + encodeURIComponent(dBtn.getAttribute("data-id")), { method: "DELETE", headers: headers(false) })
-            .then(function (r) { if (r.ok) refreshList(); });
+          if (!confirmTap(dBtn)) return;
+          actReq("/api/v1/comments/" + encodeURIComponent(dBtn.getAttribute("data-id")), { method: "DELETE", headers: headers(false) }, refreshCur);
           return;
         }
 
-        var apBtn = ev.target.closest(".js-vc-mod-approve");
+        var apBtn = cl(".js-vc-mod-approve");
         if (apBtn) {
-          fetch("/api/admin/comments/" + encodeURIComponent(apBtn.getAttribute("data-id")), {
+          actReq("/api/admin/comments/" + encodeURIComponent(apBtn.getAttribute("data-id")), {
             method: "PATCH",
             headers: headers(true),
             body: JSON.stringify({ status: "approved" })
-          }).then(function (r) { if (r.ok) refreshList(); });
+          }, refreshCur);
           return;
         }
 
-        var mdDel = ev.target.closest(".js-vc-mod-del");
+        var mdDel = cl(".js-vc-mod-del");
         if (mdDel) {
-          fetch("/api/admin/comments/" + encodeURIComponent(mdDel.getAttribute("data-id")), {
-            method: "DELETE",
-            headers: headers(true)
-          }).then(function (r) { if (r.ok) refreshList(); });
+          if (!confirmTap(mdDel)) return;
+          actReq("/api/admin/comments/" + encodeURIComponent(mdDel.getAttribute("data-id")), { method: "DELETE", headers: headers(true) }, refreshCur);
           return;
         }
 
-        var banBtn = ev.target.closest(".js-vc-mod-ban");
+        var banBtn = cl(".js-vc-mod-ban");
         if (banBtn && banModal) {
           banTargetID = banBtn.getAttribute("data-id") || "";
           var ipTxt = banBtn.getAttribute("data-ip") || "";
           var bTitle = banModal.querySelector(".js-vc-ban-title");
+          var bNote = banModal.querySelector(".js-vc-ban-note");
           if (bTitle) bTitle.textContent = L.banTitle + (ipTxt ? " (" + ipTxt + ")" : "");
+          if (bNote) bNote.value = "";
           banModal.hidden = false;
           syncLock();
           return;
         }
 
-        var durBtn = ev.target.closest(".vc-dur-btn");
+        var durBtn = cl(".vc-dur-btn");
         if (durBtn && banModal) {
           banHours = parseInt(durBtn.getAttribute("data-hours") || "0", 10) || 0;
           banModal.querySelectorAll(".vc-dur-btn").forEach(function (b) { b.classList.toggle("is-active", b === durBtn); });
           return;
         }
 
-        if (ev.target.closest(".js-vc-ban-cancel") || (banModal && ev.target === banModal)) {
+        if (cl(".js-vc-ban-cancel") || (banModal && ev.target === banModal)) {
           if (banModal) { banModal.hidden = true; syncLock(); }
           return;
         }
 
-        if (ev.target.closest(".js-vc-ban-ok") && banModal && banTargetID) {
+        if (cl(".js-vc-ban-ok") && banModal && banTargetID) {
           var rej = banModal.querySelector(".js-vc-ban-reject");
           var noteIn = banModal.querySelector(".js-vc-ban-note");
-          fetch("/api/admin/comments/" + encodeURIComponent(banTargetID) + "/ban-ip", {
+          banModal.hidden = true;
+          syncLock();
+          actReq("/api/admin/comments/" + encodeURIComponent(banTargetID) + "/ban-ip", {
             method: "POST",
             headers: headers(true),
             body: JSON.stringify({
@@ -753,19 +855,16 @@
               expires_hours: banHours,
               reject_comment: rej ? !!rej.checked : true
             })
-          }).then(function (r) {
-            banModal.hidden = true;
-            syncLock();
-            if (r.ok) refreshList();
-          });
+          }, refreshCur);
           return;
         }
 
-        var cBtn = ev.target.closest(".js-vc-claim");
+        var cBtn = cl(".js-vc-claim");
         if (cBtn) {
-          fetch("/api/v1/reader/claim-guest-comments", { method: "POST", headers: headers(false) })
-            .then(function (r) { return r.json(); })
-            .then(function (d) { cBtn.textContent = (d && d.message) || "OK"; refreshList(); });
+          actReq("/api/v1/reader/claim-guest-comments", { method: "POST", headers: headers(false) }, function (d) {
+            cBtn.textContent = (d && d.message) || "OK";
+            refreshCur();
+          });
         }
       });
     });
@@ -778,15 +877,25 @@
     }
   });
 
-  window.addEventListener("hashchange", function () {
+  function focusHashComment() {
     var h = (window.location.hash || "").slice(1);
     if (!h) return;
     try { h = decodeURIComponent(h); } catch (_) {}
     if (h === "comments") h = "volo-comments";
     if (h !== "volo-comments" && h.indexOf("comment-") !== 0) return;
     var node = document.getElementById(h);
-    if (node && window.__voloScrollToEl) window.__voloScrollToEl(node, h.indexOf("comment-") === 0);
-  });
+    if (!node) return;
+    var hiddenBox = node.closest && node.closest(".js-vc-more-box[hidden]");
+    if (hiddenBox) {
+      hiddenBox.hidden = false;
+      var btn = hiddenBox.nextElementSibling;
+      if (btn && btn.classList.contains("js-vc-show-more")) btn.remove();
+    }
+    if (window.__voloScrollToEl) window.__voloScrollToEl(node, h.indexOf("comment-") === 0);
+    else node.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  window.addEventListener("hashchange", focusHashComment);
 
   window.VoloCommentWidget = { mount: mount };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount);

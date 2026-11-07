@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HugoSmits86/nativewebp"
@@ -30,12 +31,12 @@ import (
 )
 
 const (
-	maxImagePixels       = 24_000_000 // 24 Megapixel decompression-bomb ceiling
-	maxGIFTotalPixels    = 32_000_000 // 32 Megapixel animated GIF multi-frame ceiling
-	maxImageDimension    = 16384
+	maxImagePixels    = 24_000_000 // 24 Megapixel decompression-bomb ceiling
+	maxGIFTotalPixels = 32_000_000 // 32 Megapixel animated GIF multi-frame ceiling
+	maxImageDimension = 16384
 )
 
-var transcodeSem = make(chan struct{}, 1)
+var transcodeSem = make(chan struct{}, 2)
 
 func isForbiddenUploadExt(ext string) bool {
 	switch strings.ToLower(strings.TrimSpace(ext)) {
@@ -72,7 +73,9 @@ type Pipeline struct {
 	uploadDir      string
 	outboundDialer *security.OutboundSafeDialer
 	plugins        *plugin.Manager
-	onDimsUpdated  func(publicURL string, width, height int)
+
+	dimsMu        sync.RWMutex
+	onDimsUpdated func(publicURL string, width, height int)
 }
 
 // NewPipeline creates a privacy-first media pipeline.
@@ -85,6 +88,16 @@ func NewPipeline(opts PipelineOptions) *Pipeline {
 		plugins:        opts.Plugins,
 		onDimsUpdated:  opts.OnDimsUpdated,
 	}
+}
+
+// SetOnDimsUpdated registers or updates the callback invoked when an uploaded image's intrinsic dimensions are recorded.
+func (p *Pipeline) SetOnDimsUpdated(fn func(publicURL string, width, height int)) {
+	if p == nil {
+		return
+	}
+	p.dimsMu.Lock()
+	p.onDimsUpdated = fn
+	p.dimsMu.Unlock()
 }
 
 // Name satisfies `plugin.StorageProvider`.
@@ -100,11 +113,19 @@ func (p *Pipeline) Put(ctx context.Context, objectKey string, r io.Reader, size 
 	if size > maxBytes {
 		return "", fmt.Errorf("payload size %d exceeds maximum %d bytes", size, maxBytes)
 	}
-	raw, err := readBounded(r, maxBytes)
+	tmpFile, tmpPath, written, _, err := p.spoolToTempFile(r, maxBytes)
 	if err != nil {
 		return "", err
 	}
-	_, pubURL, err := p.storeRawObject(ctx, objectKey, raw, contentType)
+	defer func() {
+		if tmpFile != nil {
+			_ = tmpFile.Close()
+		}
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	_, pubURL, err := p.storeStreamObject(ctx, objectKey, &tmpFile, &tmpPath, written, contentType)
 	return pubURL, err
 }
 
@@ -117,34 +138,51 @@ func (p *Pipeline) HealthCheck(ctx context.Context) error {
 // strips 100% of EXIF/GPS/camera metadata via clean pixel re-encoding, adaptively encodes pure-Go WebP,
 // extracts intrinsic `width`/`height` for zero-CLS rendering, and persists to Local/S3/Plugin storage.
 func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename string, _ string, r io.Reader) (*domain.MediaAsset, error) {
-	maxBytes := p.maxUploadBytes()
-	raw, err := readBounded(r, maxBytes)
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) == 0 {
-		return nil, errors.New("empty file upload")
-	}
-
 	origBase := filepath.Base(strings.TrimSpace(origFilename))
 	ext := strings.ToLower(filepath.Ext(origBase))
 	if isForbiddenUploadExt(ext) {
 		return nil, errors.New("active markup or script uploads (.svg/.html/.xml/.js) are forbidden for stored-XSS safety")
 	}
 
-	kind, detectedMIME, err := classifyAndVerifyMagic(ext, raw)
+	var headBuf [512]byte
+	nHead, hErr := io.ReadFull(r, headBuf[:])
+	if hErr != nil && !errors.Is(hErr, io.EOF) && !errors.Is(hErr, io.ErrUnexpectedEOF) {
+		return nil, hErr
+	}
+	if nHead == 0 {
+		return nil, errors.New("empty file upload")
+	}
+	head := headBuf[:nHead]
+
+	kind, detectedMIME, err := classifyAndVerifyMagic(ext, head)
 	if err != nil {
 		return nil, err
 	}
 
+	maxBytes := p.maxUploadBytes()
+	fullReader := io.MultiReader(bytes.NewReader(head), r)
+
 	stCfg := p.storageSettings()
-	finalBytes := raw
 	finalExt := ext
 	finalMIME := detectedMIME
-	var width, height int
-	exifStripped := false
+	var (
+		width, height int
+		exifStripped  bool
+		driverUsed    string
+		publicURL     string
+		sizeBytes     int64
+		sha256Hex     string
+	)
+
+	now := time.Now().UTC()
 
 	if kind == mediaKindImage {
+		raw, rErr := readBounded(fullReader, maxBytes)
+		if rErr != nil {
+			return nil, rErr
+		}
+		var finalBytes []byte
+
 		select {
 		case transcodeSem <- struct{}{}:
 		case <-ctx.Done():
@@ -172,22 +210,26 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 						return fmt.Errorf("animated GIF frame budget (%d pixels across %d frames) exceeds 32MP safety limit", totalGIFPixels, len(g.Image))
 					}
 					isAnimatedGIF = true
+					raw = nil
 					width, height = g.Config.Width, g.Config.Height
 					var cleanGIF bytes.Buffer
-					if encErr := gif.EncodeAll(&cleanGIF, g); encErr == nil {
-						finalBytes = cleanGIF.Bytes()
-						exifStripped = true
+					if encErr := gif.EncodeAll(&cleanGIF, g); encErr != nil {
+						return fmt.Errorf("gif re-encode failed: %w", encErr)
 					}
+					finalBytes = cleanGIF.Bytes()
+					exifStripped = true
 				}
 			}
 
 			if !isAnimatedGIF {
 				orient := ReadEXIFOrientation(raw)
 				img, _, decErr := image.Decode(bytes.NewReader(raw))
+				raw = nil // Release compressed upload buffer before pixel transforms & WebP encoding.
 				if decErr != nil {
 					return fmt.Errorf("image decode failed: %w", decErr)
 				}
 				upright := ApplyEXIFOrientation(img, orient)
+				img = nil // Release pre-orientation pixel buffer promptly before encoding.
 				b := upright.Bounds()
 				width, height = b.Dx(), b.Dy()
 
@@ -235,6 +277,7 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 						finalMIME = "image/webp"
 					}
 				}
+				upright = nil
 
 				if ContainsEXIFOrGPS(finalBytes) {
 					return errors.New("privacy invariant violation: residual metadata detected after pixel re-encode")
@@ -246,16 +289,65 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 		if err != nil {
 			return nil, err
 		}
+
+		objectKey := fmt.Sprintf("%s/%s%s", now.Format("2006/01"), strings.ToLower(id.Next()), finalExt)
+		driverUsed, publicURL, err = p.storeRawObject(ctx, objectKey, finalBytes, finalMIME)
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(finalBytes)
+		sizeBytes = int64(len(finalBytes))
+		sha256Hex = hex.EncodeToString(sum[:])
+
+		asset := domain.MediaAsset{
+			ID:            id.Next(),
+			StorageDriver: driverUsed,
+			ObjectKey:     objectKey,
+			PublicURL:     publicURL,
+			OriginalName:  origBase,
+			AltText:       "",
+			MIMEType:      finalMIME,
+			SizeBytes:     sizeBytes,
+			Width:         width,
+			Height:        height,
+			SHA256:        sha256Hex,
+			EXIFStripped:  exifStripped,
+			UploaderID:    uploaderID,
+			CreatedAt:     now.UnixMilli(),
+		}
+		if err := p.insertMediaAsset(ctx, asset); err != nil {
+			return nil, err
+		}
+		p.dimsMu.RLock()
+		cb := p.onDimsUpdated
+		p.dimsMu.RUnlock()
+		if width > 0 && height > 0 && cb != nil {
+			cb(asset.PublicURL, width, height)
+		}
+		return &asset, nil
 	}
 
-	now := time.Now().UTC()
+	// Non-image uploads (audio/*, video/*, application/pdf, application/zip, etc.):
+	// stream via temporary file on disk instead of holding up to 512 MiB in heap.
+	tmpFile, tmpPath, written, sumHex, err := p.spoolToTempFile(fullReader, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if tmpFile != nil {
+			_ = tmpFile.Close()
+		}
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
 	objectKey := fmt.Sprintf("%s/%s%s", now.Format("2006/01"), strings.ToLower(id.Next()), finalExt)
-	driverUsed, publicURL, err := p.storeRawObject(ctx, objectKey, finalBytes, finalMIME)
+	driverUsed, publicURL, err = p.storeStreamObject(ctx, objectKey, &tmpFile, &tmpPath, written, finalMIME)
 	if err != nil {
 		return nil, err
 	}
 
-	sum := sha256.Sum256(finalBytes)
 	asset := domain.MediaAsset{
 		ID:            id.Next(),
 		StorageDriver: driverUsed,
@@ -264,29 +356,29 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 		OriginalName:  origBase,
 		AltText:       "",
 		MIMEType:      finalMIME,
-		SizeBytes:     int64(len(finalBytes)),
-		Width:         width,
-		Height:        height,
-		SHA256:        hex.EncodeToString(sum[:]),
-		EXIFStripped:  exifStripped,
+		SizeBytes:     written,
+		Width:         0,
+		Height:        0,
+		SHA256:        sumHex,
+		EXIFStripped:  false,
 		UploaderID:    uploaderID,
 		CreatedAt:     now.UnixMilli(),
 	}
+	if err := p.insertMediaAsset(ctx, asset); err != nil {
+		return nil, err
+	}
+	return &asset, nil
+}
 
-	if _, err := p.store.ExecContext(ctx,
+func (p *Pipeline) insertMediaAsset(ctx context.Context, asset domain.MediaAsset) error {
+	_, err := p.store.ExecContext(ctx,
 		`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, alt_text, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		asset.ID, asset.StorageDriver, asset.ObjectKey, asset.PublicURL, asset.OriginalName, asset.AltText,
 		asset.MIMEType, asset.SizeBytes, asset.Width, asset.Height, asset.SHA256,
 		asset.EXIFStripped, asset.UploaderID, asset.CreatedAt,
-	); err != nil {
-		return nil, err
-	}
-
-	if width > 0 && height > 0 && p.onDimsUpdated != nil {
-		p.onDimsUpdated(asset.PublicURL, width, height)
-	}
-	return &asset, nil
+	)
+	return err
 }
 
 func (p *Pipeline) resolvePluginStorage(driver string) plugin.StorageProvider {
@@ -405,6 +497,109 @@ func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []
 	return "local", "/uploads/" + strings.TrimLeft(filepath.ToSlash(cleanRel), "/"), nil
 }
 
+func (p *Pipeline) spoolToTempFile(r io.Reader, maxBytes int64) (*os.File, string, int64, string, error) {
+	tempDir := ""
+	if p.uploadDir != "" && os.MkdirAll(p.uploadDir, 0o750) == nil {
+		tempDir = p.uploadDir
+	}
+	tmp, err := os.CreateTemp(tempDir, ".volo-upload-*")
+	if err != nil && tempDir != "" {
+		tmp, err = os.CreateTemp("", "volo-upload-*")
+	}
+	if err != nil {
+		return nil, "", 0, "", err
+	}
+	tmpPath := tmp.Name()
+	hasher := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(r, maxBytes+1))
+	if copyErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return nil, "", 0, "", copyErr
+	}
+	if written > maxBytes {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return nil, "", 0, "", fmt.Errorf("upload exceeds maximum size (%d bytes)", maxBytes)
+	}
+	if _, sErr := tmp.Seek(0, io.SeekStart); sErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return nil, "", 0, "", sErr
+	}
+	return tmp, tmpPath, written, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func (p *Pipeline) storeStreamObject(ctx context.Context, objectKey string, tmpFile **os.File, tmpPath *string, size int64, contentType string) (string, string, error) {
+	cfg := p.storageSettings()
+	driver := strings.ToLower(strings.TrimSpace(cfg.ActiveDriver))
+
+	if driver != "" && driver != "local" && driver != "s3" {
+		if sp := p.resolvePluginStorage(driver); sp != nil {
+			if _, err := (*tmpFile).Seek(0, io.SeekStart); err != nil {
+				return "", "", err
+			}
+			u, err := sp.Put(ctx, objectKey, *tmpFile, size, contentType)
+			return driver, u, err
+		}
+		return "", "", fmt.Errorf("storage plugin %q is not active or registered", driver)
+	}
+
+	if driver == "s3" {
+		cli, err := p.buildS3Client(ctx, &cfg, "")
+		if err != nil {
+			return "", "", err
+		}
+		if _, err := (*tmpFile).Seek(0, io.SeekStart); err != nil {
+			return "", "", err
+		}
+		pubURL, err := cli.PutStream(ctx, objectKey, *tmpFile, size, contentType)
+		return "s3", pubURL, err
+	}
+
+	// Default: Local UploadDir storage (atomic rename when on same filesystem, streaming copy fallback)
+	cleanRel := filepath.Clean(filepath.FromSlash(strings.TrimLeft(objectKey, "/")))
+	if cleanRel == "." || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
+		return "", "", errors.New("invalid local object key")
+	}
+	dest := filepath.Join(p.uploadDir, cleanRel)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+		return "", "", err
+	}
+
+	srcPath := *tmpPath
+	if *tmpFile != nil {
+		_ = (*tmpFile).Close()
+		*tmpFile = nil
+	}
+	_ = os.Chmod(srcPath, 0o640)
+	if err := os.Rename(srcPath, dest); err == nil {
+		*tmpPath = ""
+		return "local", "/uploads/" + strings.TrimLeft(filepath.ToSlash(cleanRel), "/"), nil
+	}
+
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return "", "", err
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dest)
+		return "", "", err
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(dest)
+		return "", "", err
+	}
+	return "local", "/uploads/" + strings.TrimLeft(filepath.ToSlash(cleanRel), "/"), nil
+}
+
 func (p *Pipeline) buildS3Client(ctx context.Context, override *domain.StorageSettings, overrideSecret string) (*S3Client, error) {
 	cfg := p.storageSettings()
 	if override != nil {
@@ -459,6 +654,7 @@ type mediaKind int
 const (
 	mediaKindImage mediaKind = iota + 1
 	mediaKindAudio
+	mediaKindVideo
 	mediaKindDocument
 )
 
@@ -510,6 +706,16 @@ func classifyAndVerifyMagic(ext string, raw []byte) (mediaKind, string, error) {
 			return 0, "", errors.New("file magic bytes do not match WAV RIFF signature")
 		}
 		return mediaKindAudio, "audio/wav", nil
+	case ".mp4":
+		if len(raw) < 12 || string(raw[4:8]) != "ftyp" {
+			return 0, "", errors.New("file magic bytes do not match MP4 ftyp signature")
+		}
+		return mediaKindVideo, "video/mp4", nil
+	case ".webm":
+		if !bytes.HasPrefix(raw, []byte{0x1A, 0x45, 0xDF, 0xA3}) {
+			return 0, "", errors.New("file magic bytes do not match WebM EBML signature")
+		}
+		return mediaKindVideo, "video/webm", nil
 	case ".pdf":
 		if !bytes.HasPrefix(raw, []byte("%PDF-")) {
 			return 0, "", errors.New("file magic bytes do not match PDF signature")

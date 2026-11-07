@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { apiFetch, showToast, storageDriverSig } from "../api";
 import { t } from "../i18n";
-import { AnimatedModal, ConsoleEmpty, UploadButton } from "./UIControls";
+import { AnimatedModal, ConsoleEmpty, PaginationBar, UploadButton, paginateItems, useDebouncedValue } from "./UIControls";
 
 export interface MediaAssetRecord {
   id: string;
@@ -27,6 +27,8 @@ export interface MediaLibraryModalProps {
   title?: string;
 }
 
+const MODAL_PAGE_SIZE = 36;
+
 export function MediaLibraryModal({
   open,
   onClose,
@@ -35,29 +37,44 @@ export function MediaLibraryModal({
   title,
 }: MediaLibraryModalProps) {
   const [items, setItems] = useState<MediaAssetRecord[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [query, setQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(query, 250);
   const [kindTab, setKindTab] = useState<"all" | "image" | "audio">(filterKind);
 
   useEffect(() => {
     setKindTab(filterKind);
+    setPage(1);
   }, [filterKind, open]);
 
-  const loadAssets = async () => {
+  const loadAssets = async (targetPage = page, q = debouncedQuery, kind = kindTab) => {
     setLoading(true);
     try {
+      const params = new URLSearchParams({
+        refs: "0",
+        page: String(targetPage),
+        per_page: String(MODAL_PAGE_SIZE),
+      });
+      if (q.trim()) params.set("q", q.trim());
+      if (kind === "image") params.set("mime", "image");
+      else if (kind === "audio") params.set("mime", "audio");
+
       const res = await apiFetch<{
         items: MediaAssetRecord[];
+        total?: number;
         storage_driver?: string;
-      }>("/api/admin/media");
-      setItems(
-        (res.items || []).map((it) => ({
-          ...it,
-          original_name: it.original_name || it.orig_filename || it.id,
-        }))
-      );
+      }>(`/api/admin/media?${params.toString()}`);
+
+      const normalized = (res.items || []).map((it) => ({
+        ...it,
+        original_name: it.original_name || it.orig_filename || it.id,
+      }));
+      setItems(normalized);
+      setTotal(typeof res.total === "number" ? res.total : normalized.length);
       if (res.storage_driver) {
         storageDriverSig.value = res.storage_driver;
       }
@@ -70,15 +87,16 @@ export function MediaLibraryModal({
 
   useEffect(() => {
     if (open) {
-      void loadAssets();
+      void loadAssets(page, debouncedQuery, kindTab);
     }
-  }, [open]);
+  }, [open, page, debouncedQuery, kindTab]);
 
   const handleReconcile = async () => {
     setReconciling(true);
     try {
       await apiFetch("/api/admin/media/reconcile", { method: "POST", body: "{}" });
-      await loadAssets();
+      setPage(1);
+      await loadAssets(1, debouncedQuery, kindTab);
       showToast(t("cnt.media_reconciled"), "ok");
     } catch (err: any) {
       showToast(err.message, "err");
@@ -87,27 +105,36 @@ export function MediaLibraryModal({
     }
   };
 
-  const handleUploadAndPick = async (file: File) => {
+  const handleUploadFiles = async (files: File[]) => {
+    if (files.length === 0) return;
     setUploading(true);
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const res = await apiFetch<{ asset?: MediaAssetRecord; item?: MediaAssetRecord }>(
-        "/api/admin/media/upload",
-        {
-          method: "POST",
-          body: fd,
+      let lastPicked: MediaAssetRecord | null = null;
+      let uploadedCount = 0;
+      for (const file of files) {
+        const fd = new FormData();
+        fd.append("file", file);
+        const res = await apiFetch<{ asset?: MediaAssetRecord; item?: MediaAssetRecord }>(
+          "/api/admin/media/upload",
+          { method: "POST", body: fd }
+        );
+        const picked = res.asset || res.item;
+        if (picked) {
+          lastPicked = {
+            ...picked,
+            original_name: picked.original_name || picked.orig_filename || file.name,
+          };
+          uploadedCount++;
         }
-      );
-      const picked = res.asset || res.item;
-      if (picked) {
-        const normalized: MediaAssetRecord = {
-          ...picked,
-          original_name: picked.original_name || picked.orig_filename || file.name,
-        };
-        showToast(t("ed.uploaded", { name: normalized.original_name }), "ok");
-        onSelect(normalized);
+      }
+      if (files.length === 1 && lastPicked) {
+        showToast(t("ed.uploaded", { name: lastPicked.original_name }), "ok");
+        onSelect(lastPicked);
         onClose();
+      } else if (uploadedCount > 0) {
+        showToast(t("cnt.media_uploaded_n", { count: uploadedCount }), "ok");
+        setPage(1);
+        await loadAssets(1, debouncedQuery, kindTab);
       }
     } catch (err: any) {
       showToast(err.message, "err");
@@ -116,20 +143,8 @@ export function MediaLibraryModal({
     }
   };
 
-  const filtered = items.filter((m) => {
-    const mime = (m.mime_type || "").toLowerCase();
-    if (kindTab === "image" && !mime.startsWith("image/")) return false;
-    if (kindTab === "audio" && !mime.startsWith("audio/")) return false;
-    if (query.trim()) {
-      const q = query.trim().toLowerCase();
-      return (
-        (m.original_name || "").toLowerCase().includes(q) ||
-        (m.alt_text || "").toLowerCase().includes(q) ||
-        (m.public_url || "").toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
+  const displayItems =
+    items.length > MODAL_PAGE_SIZE ? paginateItems(items, page, MODAL_PAGE_SIZE).slice : items;
 
   const acceptAttr =
     filterKind === "image"
@@ -159,7 +174,10 @@ export function MediaLibraryModal({
                 key={k}
                 type="button"
                 class={`volo-filter-pill ${kindTab === k ? "active" : ""}`}
-                onClick={() => setKindTab(k)}
+                onClick={() => {
+                  setKindTab(k);
+                  setPage(1);
+                }}
               >
                 {k === "all"
                   ? t("cnt.media_type_all")
@@ -180,7 +198,10 @@ export function MediaLibraryModal({
             class="volo-input volo-search-input"
             placeholder={t("cnt.media_search_ph")}
             value={query}
-            onInput={(e) => setQuery((e.target as HTMLInputElement).value)}
+            onInput={(e) => {
+              setQuery((e.target as HTMLInputElement).value);
+              setPage(1);
+            }}
           />
           {storageDriverSig.value === "local" && (
             <button
@@ -194,67 +215,78 @@ export function MediaLibraryModal({
           )}
           <UploadButton
             accept={acceptAttr}
+            multiple
             busy={uploading}
             primary
             label={t("cnt.media_upload_pick")}
-            onFile={(f) => void handleUploadAndPick(f)}
+            onFiles={(files) => void handleUploadFiles(files)}
           />
         </div>
       </div>
 
       {loading ? (
         <div class="volo-empty-state">{t("shell.loading")}</div>
-      ) : filtered.length === 0 ? (
+      ) : displayItems.length === 0 ? (
         <ConsoleEmpty text={t("tbl.empty")} />
       ) : (
-        <div class="volo-media-picker-grid">
-          {filtered.map((m) => {
-            const isImg = (m.mime_type || "").startsWith("image/");
-            const isAudio = (m.mime_type || "").startsWith("audio/");
-            return (
-              <button
-                key={m.id}
-                type="button"
-                class="volo-media-picker-card"
-                onClick={() => {
-                  onSelect(m);
-                  onClose();
-                }}
-              >
-                <div class="volo-media-picker-thumb">
-                  {isImg ? (
-                    <img src={m.public_url} alt={m.alt_text || m.original_name} loading="lazy" />
-                  ) : isAudio ? (
-                    <div class="volo-media-type-placeholder">
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                        <path d="M9 18V5l12-2v13" />
-                        <circle cx="6" cy="18" r="3" />
-                        <circle cx="18" cy="16" r="3" />
-                      </svg>
-                      <span>AUDIO</span>
-                    </div>
-                  ) : (
-                    <div class="volo-media-type-placeholder">
-                      <span>{(m.mime_type || "FILE").split("/").pop()?.toUpperCase()}</span>
-                    </div>
-                  )}
-                  <span class={`volo-media-ref-pill ${m.is_orphan ? "orphan" : "used"}`}>
-                    {m.is_orphan ? t("cnt.media_orphan_short") : t("cnt.media_used_short")}
-                  </span>
-                </div>
-                <div class="volo-media-picker-meta">
-                  <div class="volo-media-picker-name" title={m.original_name}>
-                    {m.original_name}
+        <>
+          <div class="volo-media-picker-grid">
+            {displayItems.map((m) => {
+              const isImg = (m.mime_type || "").startsWith("image/");
+              const isAudio = (m.mime_type || "").startsWith("audio/");
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  class="volo-media-picker-card"
+                  onClick={() => {
+                    onSelect(m);
+                    onClose();
+                  }}
+                >
+                  <div class="volo-media-picker-thumb">
+                    {isImg ? (
+                      <img src={m.public_url} alt={m.alt_text || m.original_name} loading="lazy" />
+                    ) : isAudio ? (
+                      <div class="volo-media-type-placeholder">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                          <path d="M9 18V5l12-2v13" />
+                          <circle cx="6" cy="18" r="3" />
+                          <circle cx="18" cy="16" r="3" />
+                        </svg>
+                        <span>AUDIO</span>
+                      </div>
+                    ) : (
+                      <div class="volo-media-type-placeholder">
+                        <span>{(m.mime_type || "FILE").split("/").pop()?.toUpperCase()}</span>
+                      </div>
+                    )}
+                    {typeof m.ref_count === "number" && (
+                      <span class={`volo-media-ref-pill ${m.is_orphan ? "orphan" : "used"}`}>
+                        {m.is_orphan ? t("cnt.media_orphan_short") : t("cnt.media_used_short")}
+                      </span>
+                    )}
                   </div>
-                  <div class="volo-media-picker-sub">
-                    {m.width > 0 ? `${m.width}×${m.height} · ` : ""}
-                    {Math.max(1, Math.round((m.size_bytes || 0) / 1024))} KB
+                  <div class="volo-media-picker-meta">
+                    <div class="volo-media-picker-name" title={m.original_name}>
+                      {m.original_name}
+                    </div>
+                    <div class="volo-media-picker-sub">
+                      {m.width > 0 ? `${m.width}×${m.height} · ` : ""}
+                      {Math.max(1, Math.round((m.size_bytes || 0) / 1024))} KB
+                    </div>
                   </div>
-                </div>
-              </button>
-            );
-          })}
-        </div>
+                </button>
+              );
+            })}
+          </div>
+          <PaginationBar
+            total={total}
+            page={page}
+            pageSize={MODAL_PAGE_SIZE}
+            onChange={(nextPage) => setPage(nextPage)}
+          />
+        </>
       )}
     </AnimatedModal>
   );

@@ -236,31 +236,57 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 		return nil
 	})
 	if err != nil {
-		// Restore deltas so transient lock/IO errors never drop counts.
+		const maxFailedRestoreKeys = 4096
+		// Restore deltas (bounded to maxFailedRestoreKeys) so transient lock/IO errors neither drop counts nor grow unbounded.
 		b.mu.Lock()
 		for k, v := range artSnap {
-			b.articleViews[k] += v
+			if _, ok := b.articleViews[k]; ok || len(b.articleViews) < maxFailedRestoreKeys {
+				b.articleViews[k] += v
+			}
 		}
 		for k, v := range pageSnap {
-			b.pageViews[k] += v
+			if _, ok := b.pageViews[k]; ok || len(b.pageViews) < maxFailedRestoreKeys {
+				b.pageViews[k] += v
+			}
 		}
 		for k, v := range redSnap {
-			b.redirectHits[k] += v
+			if _, ok := b.redirectHits[k]; ok || len(b.redirectHits) < maxFailedRestoreKeys {
+				b.redirectHits[k] += v
+			}
 		}
 		for k, v := range dailySnap {
-			cur := b.daily[k]
-			cur.pv += v.pv
-			cur.uv += v.uv
-			b.daily[k] = cur
+			if _, ok := b.daily[k]; ok || len(b.daily) < maxFailedRestoreKeys {
+				cur := b.daily[k]
+				cur.pv += v.pv
+				cur.uv += v.uv
+				b.daily[k] = cur
+			}
 		}
 		for k, v := range topSnap {
-			b.topItems[k] += v
+			if _, ok := b.topItems[k]; ok || len(b.topItems) < maxFailedRestoreKeys {
+				b.topItems[k] += v
+			}
 		}
 		b.dirty = true
 		b.mu.Unlock()
 		return err
 	}
 	return nil
+}
+
+// Reset discards buffered analytics deltas (used after full database restore/swap).
+func (b *viewAnalyticsBuffer) Reset() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.articleViews = make(map[string]int64)
+	b.pageViews = make(map[string]int64)
+	b.redirectHits = make(map[string]int64)
+	b.daily = make(map[string]dailyTrafficDelta)
+	b.topItems = make(map[topItemBucketKey]int64)
+	b.dirty = false
+	b.mu.Unlock()
 }
 
 func (b *viewAnalyticsBuffer) Close(ctx context.Context) error {

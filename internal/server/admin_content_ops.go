@@ -58,6 +58,21 @@ type parsedFrontmatter struct {
 	BodyMD   string
 }
 
+func (s *AppServer) ensureTempDir() string {
+	base := ""
+	if s != nil && s.deps.Config != nil {
+		base = strings.TrimSpace(s.deps.Config.DataDir)
+	}
+	if base == "" {
+		return ""
+	}
+	tmpDir := filepath.Join(base, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		return base
+	}
+	return tmpDir
+}
+
 func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *http.Request, actor *domain.User) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBatchImportArchiveBytes)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
@@ -100,7 +115,7 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 			docs = append(docs, markdownImportDoc{Filename: filepath.Base(fh.Filename), Content: string(raw)})
 
 		case ".zip":
-			tmpZip, cErr := os.CreateTemp(s.deps.Config.DataDir, "volo-mdimport-*.zip")
+			tmpZip, cErr := os.CreateTemp(s.ensureTempDir(), "volo-mdimport-*.zip")
 			if cErr != nil {
 				_ = f.Close()
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": cErr.Error()})
@@ -649,6 +664,24 @@ func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
 					id.Next(), fw.ID, guidHash, ent.Title, ent.URL, truncateRunes(ent.Summary, 260), ent.Author, pub)
 				count++
 			}
+			pruneSQL, prunePageArgs := s.deps.Store.Dialect().PaginateSQL(
+				`SELECT id FROM follow_items WHERE follow_id = ? ORDER BY published_at DESC`, 1000, 30)
+			pruneArgs := make([]any, 0, 1+len(prunePageArgs))
+			pruneArgs = append(pruneArgs, fw.ID)
+			pruneArgs = append(pruneArgs, prunePageArgs...)
+			staleRows, _ := sqlx.Select[struct {
+				ID string `db:"id"`
+			}](ctx, s.deps.Store, pruneSQL, pruneArgs...)
+			if len(staleRows) > 0 {
+				ph := make([]string, len(staleRows))
+				delArgs := make([]any, len(staleRows))
+				for i, sr := range staleRows {
+					ph[i] = "?"
+					delArgs[i] = sr.ID
+				}
+				_, _ = s.deps.Store.ExecContext(ctx,
+					`DELETE FROM follow_items WHERE id IN (`+strings.Join(ph, ",")+`)`, delArgs...)
+			}
 			_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = '', updated_at = ? WHERE id = ?`, now, now, fw.ID)
 			mu.Lock()
 			totalItems += count
@@ -896,6 +929,10 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		return nil, errors.New("github_username is not configured")
 	}
 
+	locLower := strings.ToLower(strings.TrimSpace(snap.Site.DefaultLocale))
+	isEN := strings.HasPrefix(locLower, "en")
+	isZHTW := strings.HasPrefix(locLower, "zh-tw") || strings.HasPrefix(locLower, "zh-hk") || strings.HasPrefix(locLower, "zh-hant")
+
 	visible := make([]domain.GitHubRepoItem, 0, len(seo.GitHubRepos))
 	totalStars := 0
 	totalForks := 0
@@ -911,15 +948,57 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		totalForks += rp.Forks
 	}
 
+	var (
+		artTitle   string
+		summaryStr string
+		introLine  string
+		emptyLine  string
+		tblHeader  string
+		siteBadge  string
+		tagNames   []string
+		navTitle   string
+	)
+	switch {
+	case isEN:
+		artTitle = "My Open Source Projects on GitHub"
+		summaryStr = fmt.Sprintf("A curated showcase of %d open-source repositories maintained on GitHub (@%s, %d total Stars).", len(visible), uname, totalStars)
+		introLine = fmt.Sprintf("> GitHub Profile: [https://github.com/%s](https://github.com/%s) · Showcasing **%d** open-source repositories (**%d** Stars · **%d** Forks)\n\n",
+			uname, uname, len(visible), totalStars, totalForks)
+		emptyLine = "_No public repositories are currently selected for display. Sync and select repositories in Admin → Open Source Showcase._\n"
+		tblHeader = "| Repository | Description | Stars | Forks | Language |\n"
+		siteBadge = "Website ↗"
+		tagNames = []string{"Open Source", "GitHub"}
+		navTitle = "Open Source"
+	case isZHTW:
+		artTitle = "我在 GitHub 上的開源專案"
+		summaryStr = fmt.Sprintf("彙整我在 GitHub (@%s) 上持續維護的 %d 個開源專案（累計 %d Stars）。", uname, len(visible), totalStars)
+		introLine = fmt.Sprintf("> GitHub 主頁：[https://github.com/%s](https://github.com/%s) · 共精選展示 **%d** 個開源倉庫（累計 **%d** Stars · **%d** Forks）\n\n",
+			uname, uname, len(visible), totalStars, totalForks)
+		emptyLine = "_暫無勾選展示的公開倉庫，請在管理台「開源作品展示」中同步並勾選需要展示的專案。_\n"
+		tblHeader = "| 倉庫 | 專案簡介 | Stars | Forks | 程式語言 |\n"
+		siteBadge = "站點 ↗"
+		tagNames = []string{"開源", "GitHub"}
+		navTitle = "我的開源"
+	default:
+		artTitle = "我在 GitHub 上的开源项目"
+		summaryStr = fmt.Sprintf("汇总我在 GitHub (@%s) 上持续维护的 %d 个开源项目（累计 %d Stars）。", uname, len(visible), totalStars)
+		introLine = fmt.Sprintf("> GitHub 主页：[https://github.com/%s](https://github.com/%s) · 共精选展示 **%d** 个开源仓库（累计 **%d** Stars · **%d** Forks）\n\n",
+			uname, uname, len(visible), totalStars, totalForks)
+		emptyLine = "_暂无勾选展示的公开仓库，请在管理台「开源作品展示」中同步并勾选需要展示的项目。_\n"
+		tblHeader = "| 仓库 | 项目简介 | Stars | Forks | 编程语言 |\n"
+		siteBadge = "站点 ↗"
+		tagNames = []string{"开源", "GitHub"}
+		navTitle = "我的开源"
+	}
+
 	var md strings.Builder
 	md.WriteString(fmt.Sprintf("![%s GitHub Stats](/github-stats/%s.svg)\n\n", uname, url.PathEscape(uname)))
-	md.WriteString(fmt.Sprintf("> GitHub 主页：[https://github.com/%s](https://github.com/%s) · 共精选展示 **%d** 个开源仓库（累计 **%d** Stars · **%d** Forks）\n\n",
-		uname, uname, len(visible), totalStars, totalForks))
+	md.WriteString(introLine)
 
 	if len(visible) == 0 {
-		md.WriteString("_暂无勾选展示的公开仓库，请在管理台「开源作品展示」中同步并勾选需要展示的项目。_\n")
+		md.WriteString(emptyLine)
 	} else {
-		md.WriteString("| 仓库 | 项目简介 | Stars | Forks | 编程语言 |\n")
+		md.WriteString(tblHeader)
 		md.WriteString("| :--- | :--- | ---: | ---: | :--- |\n")
 		for _, rp := range visible {
 			lang := strings.TrimSpace(rp.Language)
@@ -931,7 +1010,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 				desc = "—"
 			}
 			if hp := strings.TrimSpace(rp.Homepage); hp != "" && (strings.HasPrefix(hp, "http://") || strings.HasPrefix(hp, "https://")) {
-				desc += fmt.Sprintf(" ([站点 ↗](%s))", hp)
+				desc += fmt.Sprintf(" ([%s](%s))", siteBadge, hp)
 			}
 			repoLabel := rp.Name
 			if rp.IsFork {
@@ -947,7 +1026,6 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 	}
 
 	contentStr := md.String()
-	summaryStr := fmt.Sprintf("汇总我在 GitHub (@%s) 上持续维护的 %d 个开源项目（累计 %d Stars）。", uname, len(visible), totalStars)
 	words, mins := computeReadingMetrics(contentStr)
 	now := time.Now().UnixMilli()
 
@@ -967,7 +1045,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		cur = domain.RawArticle{
 			ID:              id.Next(),
 			AuthorID:        authorID,
-			Title:           "我在 GitHub 上的开源项目",
+			Title:           artTitle,
 			Slug:            "github",
 			LegacyPermalink: "/my-github-repos",
 			SummaryMD:       summaryStr,
@@ -984,7 +1062,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		}
 	} else {
 		cur = existing
-		cur.Title = "我在 GitHub 上的开源项目"
+		cur.Title = artTitle
 		cur.SummaryMD = summaryStr
 		cur.ContentMD = contentStr
 		if strings.TrimSpace(cur.CoverURL) == "" {
@@ -994,6 +1072,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		if cur.PublishedAt <= 0 {
 			cur.PublishedAt = now
 		}
+		cur.Lang = snap.Site.DefaultLocale
 		cur.WordCount = words
 		cur.ReadingMinutes = mins
 		cur.UpdatedAt = now
@@ -1016,12 +1095,12 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 			}
 		} else {
 			if _, uErr := tx.ExecContext(ctx,
-				`UPDATE articles SET title = ?, summary_md = ?, content_md = ?, cover_url = ?, status = ?, published_at = ?, word_count = ?, reading_minutes = ?, updated_at = ? WHERE id = ?`,
-				cur.Title, cur.SummaryMD, cur.ContentMD, cur.CoverURL, cur.Status, cur.PublishedAt, cur.WordCount, cur.ReadingMinutes, cur.UpdatedAt, cur.ID); uErr != nil {
+				`UPDATE articles SET title = ?, summary_md = ?, content_md = ?, cover_url = ?, status = ?, published_at = ?, lang = ?, word_count = ?, reading_minutes = ?, updated_at = ? WHERE id = ?`,
+				cur.Title, cur.SummaryMD, cur.ContentMD, cur.CoverURL, cur.Status, cur.PublishedAt, cur.Lang, cur.WordCount, cur.ReadingMinutes, cur.UpdatedAt, cur.ID); uErr != nil {
 				return uErr
 			}
 		}
-		if bErr := s.bindArticleTagsByNamesTx(ctx, tx, cur.ID, []string{"开源", "GitHub"}, now); bErr != nil {
+		if bErr := s.bindArticleTagsByNamesTx(ctx, tx, cur.ID, tagNames, now); bErr != nil {
 			return bErr
 		}
 		targetURL := "/posts/" + cur.Slug
@@ -1032,8 +1111,8 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		if navCnt == 0 {
 			_, _ = tx.ExecContext(ctx,
 				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
-				 VALUES (?, '', '我的开源', '{"zh-CN":"我的开源","en-US":"Open Source"}', ?, ?, '/images/github-icon-light.svg', 5, ?, ?, ?)`,
-				id.Next(), targetURL, false, true, now, now)
+				 VALUES (?, '', ?, '{"zh-CN":"我的开源","zh-TW":"我的開源","en-US":"Open Source"}', ?, ?, '/images/github-icon-light.svg', 5, ?, ?, ?)`,
+				id.Next(), navTitle, targetURL, false, true, now, now)
 		}
 		return s.deps.Content.ReindexArticleBacklinksTx(ctx, tx, cur)
 	})

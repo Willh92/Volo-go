@@ -17,12 +17,14 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/auth"
 	"github.com/Willh92/Volo-go/internal/backup"
 	"github.com/Willh92/Volo-go/internal/config"
+	"github.com/Willh92/Volo-go/internal/content"
 	"github.com/Willh92/Volo-go/internal/db/migrate"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/doctor"
@@ -251,9 +253,26 @@ func openMigratedStore(ctx context.Context, cfg *config.Config) (*sqlx.Store, er
 	return store, nil
 }
 
+func pruneExpiredMaintenance(ctx context.Context, store *sqlx.Store, pluginMgr *plugin.Manager) {
+	if pluginMgr != nil {
+		if _, err := pluginMgr.PurgeExpiredKV(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("plugin_kv purge failed", "component", "maintenance", "err", err)
+		}
+	}
+	if store != nil {
+		nowMs := time.Now().UnixMilli()
+		if _, err := store.ExecContext(ctx, `DELETE FROM user_sessions WHERE expires_at <= ?`, nowMs); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("expired user_sessions purge failed", "component", "maintenance", "err", err)
+		}
+		if _, err := store.ExecContext(ctx, `DELETE FROM security_ip_bans WHERE expires_at > 0 AND expires_at <= ?`, nowMs); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("expired security_ip_bans purge failed", "component", "maintenance", "err", err)
+		}
+	}
+}
+
 func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
 	if os.Getenv("GOMEMLIMIT") == "" {
-		debug.SetMemoryLimit(28 << 20)
+		debug.SetMemoryLimit(96 << 20)
 	}
 	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(60)
@@ -332,8 +351,13 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		Catalog:        catalog,
 		Plugins:        pluginMgr,
 		OutboundDialer: outboundDialer,
-		PublicURL:      cfg.PublicURL,
+		PublicURL:      cfg.GetPublicURL(),
 	})
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = notifier.Close(shutCtx)
+	}()
 
 	startedAt := time.Now()
 	appSrv, err := server.NewAppServer(server.AppDeps{
@@ -347,12 +371,19 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		StartedAt:            startedAt,
 		Version:              Version,
 		SendVerificationMail: notifier.SendVerificationCode,
-		NotifyCommentCreated: notifier.NotifyCommentCreated,
+		NotifyCommentCreated: func(pubCtx context.Context, view content.PublicCommentView, in content.CreateCommentInput) {
+			notifier.SetPublicURL(cfg.GetPublicURL())
+			notifier.NotifyCommentCreated(pubCtx, view, in)
+		},
 		NotifyArticlePublished: func(pubCtx context.Context, raw domain.RawArticle) {
+			notifier.SetPublicURL(cfg.GetPublicURL())
 			notifier.BroadcastArticlePublished(pubCtx, raw, "")
 		},
-		TestSMTP:    notifier.SendTestSMTP,
-		TestWebhook: notifier.TriggerTestWebhook,
+		TestSMTP: notifier.SendTestSMTP,
+		TestWebhook: func(pubCtx context.Context, wh domain.Webhook, locale string) (int, error) {
+			notifier.SetPublicURL(cfg.GetPublicURL())
+			return notifier.TriggerTestWebhook(pubCtx, wh, locale)
+		},
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "volo serve: server init failed: %v\n", err)
@@ -365,7 +396,9 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	}()
 
 	if appSrv.Deps().Content != nil {
-		_ = appSrv.Deps().Content.WarmCaches(ctx)
+		contentSvc := appSrv.Deps().Content
+		mediaPipe.SetOnDimsUpdated(contentSvc.PutMediaDims)
+		_ = contentSvc.WarmCaches(ctx)
 	}
 	runtime.GC()
 	debug.FreeOSMemory()
@@ -380,21 +413,55 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		Logger:         logging.TeeWriter(stderr, logging.Default()),
 	})
 	backupSched.Start(ctx)
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = backupSched.Close(shutCtx)
+	}()
+
+	bgCtx, stopBg := context.WithCancel(ctx)
+	var bgWG sync.WaitGroup
+	defer func() {
+		stopBg()
+		bgWG.Wait()
+	}()
 
 	// Background scheduled-article publisher (checks every 30s)
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-bgCtx.Done():
 				return
 			case <-ticker.C:
-				if n, pErr := appSrv.Deps().Content.PublishDueScheduled(ctx); pErr != nil {
+				if appSrv.Deps().Content == nil {
+					continue
+				}
+				if n, pErr := appSrv.Deps().Content.PublishDueScheduled(bgCtx); pErr != nil && !errors.Is(pErr, context.Canceled) {
 					slog.Warn("scheduled publish check failed", "component", "scheduler", "err", pErr)
 				} else if n > 0 {
 					slog.Info("published scheduled articles", "component", "scheduler", "count", n)
 				}
+			}
+		}
+	}()
+
+	// Hourly background maintenance ticker (plugin_kv TTL purge + expired user_sessions / security_ip_bans cleanup)
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		pruneExpiredMaintenance(bgCtx, store, pluginMgr)
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bgCtx.Done():
+				return
+			case <-ticker.C:
+				pruneExpiredMaintenance(bgCtx, store, pluginMgr)
 			}
 		}
 	}()

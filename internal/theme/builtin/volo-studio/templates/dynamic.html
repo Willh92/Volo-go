@@ -61,6 +61,7 @@
           </div>
         </section>
       {{end}}
+      {{template "pagination" .}}
     {{else}}
       {{template "empty_state" (dict "Title" (t .Locale "studio.empty_dynamic_title") "Desc" (t .Locale "studio.empty_dynamic_desc"))}}
     {{end}}

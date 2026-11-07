@@ -18,15 +18,22 @@
             </div>
           </div>
           <div class="studio-follow-items">
-            {{range .Items}}
-              <a class="studio-follow-row" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax>
-                <span>{{.Title}}</span>
-                <time>{{fmtDate .PublishedAt}}</time>
-              </a>
+            {{if .Items}}
+              {{range .Items}}
+                <div class="studio-follow-item">
+                  <a class="studio-follow-row" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax>
+                    <span>{{.Title}}</span>
+                    <time>{{fmtDate .PublishedAt}}</time>
+                  </a>
+                </div>
+              {{end}}
+            {{else}}
+              <p class="studio-muted-empty studio-follow-empty">{{if hasPrefix $.Locale "en"}}No feed updates yet.{{else if eq $.Locale "zh-TW"}}暫無訂閱動態{{else}}暂无订阅动态{{end}}</p>
             {{end}}
           </div>
         </section>
       {{end}}
+      {{template "pagination" .}}
     {{else}}
       {{template "empty_state" (dict "Title" (t .Locale "studio.empty_follows_title") "Desc" (t .Locale "studio.empty_follows_desc"))}}
     {{end}}

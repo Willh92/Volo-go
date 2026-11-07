@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/config"
@@ -34,12 +35,60 @@ const (
 
 	maxCBORBytes = 64 * 1024
 	maxCBORDepth = 8
+
+	maxSeenPasskeyChallenges = 4096
+	passkeyChallengeTTL      = 5 * time.Minute
 )
 
 var (
 	ErrPasskeyVerifyFailed  = errors.New("auth: passkey ceremony verification failed")
 	ErrPasskeyCloneDetected = errors.New("auth: passkey signature counter regression (possible cloned authenticator)")
+
+	seenChallengesMu sync.Mutex
+	seenChallenges   = make(map[string]int64)
 )
+
+func consumePasskeyChallengeOnce(purpose string, challengeB64 string, envExpiresAt int64) bool {
+	if challengeB64 == "" {
+		return false
+	}
+	key := purpose + ":" + challengeB64
+	nowMS := time.Now().UnixMilli()
+
+	seenChallengesMu.Lock()
+	defer seenChallengesMu.Unlock()
+
+	for k, exp := range seenChallenges {
+		if nowMS > exp {
+			delete(seenChallenges, k)
+		}
+	}
+	if _, exists := seenChallenges[key]; exists {
+		return false
+	}
+	for len(seenChallenges) >= maxSeenPasskeyChallenges {
+		var oldestKey string
+		var oldestExp int64
+		first := true
+		for k, exp := range seenChallenges {
+			if first || exp < oldestExp {
+				oldestKey = k
+				oldestExp = exp
+				first = false
+			}
+		}
+		if first {
+			break
+		}
+		delete(seenChallenges, oldestKey)
+	}
+	expMS := nowMS + int64(passkeyChallengeTTL/time.Millisecond)
+	if envExpiresAt > expMS {
+		expMS = envExpiresAt
+	}
+	seenChallenges[key] = expMS
+	return true
+}
 
 type passkeyChallengeEnvelope struct {
 	ChallengeB64 string `json:"c"`
@@ -261,6 +310,9 @@ func openPasskeyState(kr *config.KeyRing, stateToken string, expectedPurpose str
 		return nil, ErrPasskeyVerifyFailed
 	}
 	if env.Purpose != expectedPurpose || time.Now().UnixMilli() > env.ExpiresAt {
+		return nil, ErrPasskeyVerifyFailed
+	}
+	if !consumePasskeyChallengeOnce(env.Purpose, env.ChallengeB64, env.ExpiresAt) {
 		return nil, ErrPasskeyVerifyFailed
 	}
 	return &env, nil

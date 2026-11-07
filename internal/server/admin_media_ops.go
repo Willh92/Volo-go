@@ -179,23 +179,134 @@ func (ns *sqlNullString) Scan(src any) error {
 	return nil
 }
 
+func isMediaRefDelim(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '"', '\'', '(', ')', '<', '>', '[', ']', '{', '}', ',', ';', '?', '#', '|', '`':
+		return true
+	default:
+		return false
+	}
+}
+
 // countAssetsReferencesStreaming streams one database row at a time across all content & configuration
-// tables so reference counting never retains all article/revision Markdown bodies in memory.
+// tables and matches `/uploads/...`, object keys, and external asset URLs in a single O(bytes) token pass
+// rather than an O(rows * assets) substring loop.
 func (s *AppServer) countAssetsReferencesStreaming(ctx context.Context, assets []domain.MediaAsset) []int {
 	counts := make([]int, len(assets))
 	if len(assets) == 0 {
 		return counts
 	}
 
-	type needlePair struct {
+	byPubURL := make(map[string][]int, len(assets))
+	byObjKey := make(map[string][]int, len(assets))
+	type spaceNeedle struct {
+		idx    int
 		pubURL string
 		objKey string
 	}
-	needles := make([]needlePair, len(assets))
+	var spaceAssets []spaceNeedle
+
 	for i, a := range assets {
-		needles[i] = needlePair{
-			pubURL: strings.TrimSpace(a.PublicURL),
-			objKey: strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/"),
+		pub := strings.TrimSpace(a.PublicURL)
+		obj := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
+		if pub != "" {
+			byPubURL[pub] = append(byPubURL[pub], i)
+		}
+		if obj != "" {
+			byObjKey[obj] = append(byObjKey[obj], i)
+		}
+		if strings.ContainsAny(pub, " \t") || strings.ContainsAny(obj, " \t") {
+			spaceAssets = append(spaceAssets, spaceNeedle{idx: i, pubURL: pub, objKey: obj})
+		}
+	}
+
+	rowSeen := make([]uint32, len(assets))
+	var rowGen uint32
+
+	markIndices := func(idxs []int) {
+		for _, idx := range idxs {
+			if rowSeen[idx] != rowGen {
+				rowSeen[idx] = rowGen
+				counts[idx]++
+			}
+		}
+	}
+
+	matchToken := func(tok string) {
+		if tok == "" {
+			return
+		}
+		if idxs, ok := byPubURL[tok]; ok {
+			markIndices(idxs)
+		}
+		trimmed := strings.TrimLeft(tok, "/")
+		if trimmed != "" {
+			if idxs, ok := byObjKey[trimmed]; ok {
+				markIndices(idxs)
+			}
+		}
+		if uIdx := strings.Index(tok, "/uploads/"); uIdx >= 0 {
+			subPub := tok[uIdx:]
+			if idxs, ok := byPubURL[subPub]; ok {
+				markIndices(idxs)
+			}
+			subKey := subPub[len("/uploads/"):]
+			if subKey != "" {
+				if idxs, ok := byObjKey[subKey]; ok {
+					markIndices(idxs)
+				}
+			}
+		} else if strings.HasPrefix(tok, "http://") || strings.HasPrefix(tok, "https://") {
+			if schemeEnd := strings.Index(tok, "://"); schemeEnd > 0 {
+				rest := tok[schemeEnd+3:]
+				if slash := strings.IndexByte(rest, '/'); slash >= 0 && slash+1 < len(rest) {
+					pathKey := rest[slash+1:]
+					if idxs, ok := byObjKey[pathKey]; ok {
+						markIndices(idxs)
+					}
+				}
+			}
+		}
+	}
+
+	scanColumn := func(raw string) {
+		if raw == "" {
+			return
+		}
+		s := raw
+		if strings.Contains(s, `\/`) {
+			s = strings.ReplaceAll(s, `\/`, "/")
+		}
+		whole := strings.TrimSpace(s)
+		matchToken(whole)
+
+		n := len(s)
+		start := -1
+		for i := 0; i < n; i++ {
+			if isMediaRefDelim(s[i]) {
+				if start >= 0 {
+					if i-start >= 3 {
+						matchToken(s[start:i])
+					}
+					start = -1
+				}
+			} else if start < 0 {
+				start = i
+			}
+		}
+		if start >= 0 && n-start >= 3 {
+			matchToken(s[start:n])
+		}
+
+		for _, sp := range spaceAssets {
+			if rowSeen[sp.idx] == rowGen {
+				continue
+			}
+			if (sp.pubURL != "" && strings.Contains(s, sp.pubURL)) ||
+				(sp.objKey != "" && strings.Contains(s, sp.objKey)) {
+				rowSeen[sp.idx] = rowGen
+				counts[sp.idx]++
+			}
 		}
 	}
 
@@ -221,21 +332,13 @@ func (s *AppServer) countAssetsReferencesStreaming(ctx context.Context, assets [
 			if err := rows.Scan(ptrs...); err != nil {
 				continue
 			}
-			for idx, np := range needles {
-				matched := false
-				for _, col := range vals {
-					if col.val == "" {
-						continue
-					}
-					if (np.pubURL != "" && strings.Contains(col.val, np.pubURL)) ||
-						(np.objKey != "" && strings.Contains(col.val, np.objKey)) {
-						matched = true
-						break
-					}
-				}
-				if matched {
-					counts[idx]++
-				}
+			rowGen++
+			if rowGen == 0 {
+				clear(rowSeen)
+				rowGen = 1
+			}
+			for _, col := range vals {
+				scanColumn(col.val)
 			}
 		}
 	}
@@ -255,24 +358,153 @@ func (s *AppServer) countAssetsReferencesStreaming(ctx context.Context, assets [
 	return counts
 }
 
-func (s *AppServer) listMediaWithRefs(ctx context.Context, limit int) ([]MediaAssetView, int) {
-	if limit <= 0 {
-		limit = 500
+func (s *AppServer) mediaTimeLocation() *time.Location {
+	if s != nil && s.deps.Settings != nil {
+		tz := strings.TrimSpace(s.deps.Settings.Snapshot().Site.TimeZone)
+		if tz != "" {
+			if loc, err := time.LoadLocation(tz); err == nil {
+				return loc
+			}
+		}
 	}
-	baseSQL := `SELECT * FROM media_assets ORDER BY created_at DESC`
-	q, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, limit, 0)
-	rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store, q, pageArgs...)
+	return time.UTC
+}
+
+func (s *AppServer) queryAdminMediaPage(
+	ctx context.Context,
+	qStr string,
+	mimeFilter string,
+	monthFilter string,
+	orphanOnly bool,
+	withRefs bool,
+	sortBy string,
+	page int,
+	perPage int,
+) ([]MediaAssetView, int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage <= 0 {
+		perPage = 50
+	}
+	if perPage > 200 {
+		perPage = 200
+	}
+
+	where := []string{"1=1"}
+	var args []any
+
+	qStr = strings.TrimSpace(qStr)
+	if qStr != "" {
+		pat := "%" + qStr + "%"
+		where = append(where, "(LOWER(original_name) LIKE LOWER(?) OR LOWER(object_key) LIKE LOWER(?) OR LOWER(public_url) LIKE LOWER(?) OR LOWER(alt_text) LIKE LOWER(?))")
+		args = append(args, pat, pat, pat, pat)
+	}
+
+	mf := strings.ToLower(strings.TrimSpace(mimeFilter))
+	if mf != "" && mf != "all" {
+		switch mf {
+		case "image", "images":
+			where = append(where, "LOWER(mime_type) LIKE 'image/%'")
+		case "audio":
+			where = append(where, "LOWER(mime_type) LIKE 'audio/%'")
+		case "other", "file", "files":
+			where = append(where, "(LOWER(mime_type) NOT LIKE 'image/%' AND LOWER(mime_type) NOT LIKE 'audio/%')")
+		default:
+			if strings.HasSuffix(mf, "/") {
+				where = append(where, "LOWER(mime_type) LIKE LOWER(?)")
+				args = append(args, mf+"%")
+			} else {
+				where = append(where, "LOWER(mime_type) LIKE LOWER(?)")
+				args = append(args, mf+"%")
+			}
+		}
+	}
+
+	monthClean := strings.TrimSpace(monthFilter)
+	if len(monthClean) == 7 && monthClean[4] == '-' {
+		if tStart, err := time.ParseInLocation("2006-01", monthClean, s.mediaTimeLocation()); err == nil {
+			tEnd := tStart.AddDate(0, 1, 0)
+			where = append(where, "(created_at >= ? AND created_at < ?)")
+			args = append(args, tStart.UnixMilli(), tEnd.UnixMilli())
+		}
+	}
+
+	orderClause := "created_at DESC"
+	switch strings.ToLower(strings.TrimSpace(sortBy)) {
+	case "size":
+		orderClause = "size_bytes DESC, created_at DESC"
+	case "name":
+		orderClause = "original_name ASC, created_at DESC"
+	case "oldest":
+		orderClause = "created_at ASC"
+	}
+
+	whereSQL := strings.Join(where, " AND ")
+
+	if orphanOnly {
+		rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store,
+			`SELECT * FROM media_assets WHERE `+whereSQL+` ORDER BY `+orderClause, args...)
+		if len(rows) == 0 {
+			return []MediaAssetView{}, 0, 0
+		}
+		refCounts := s.countAssetsReferencesStreaming(ctx, rows)
+		orphans := make([]MediaAssetView, 0)
+		for i, a := range rows {
+			if refCounts[i] == 0 {
+				orphans = append(orphans, MediaAssetView{
+					MediaAsset: a,
+					RefCount:   0,
+					IsOrphan:   true,
+				})
+			}
+		}
+		total := len(orphans)
+		start := (page - 1) * perPage
+		if start >= total {
+			return []MediaAssetView{}, total, total
+		}
+		end := start + perPage
+		if end > total {
+			end = total
+		}
+		return orphans[start:end], total, total
+	}
+
+	var total int
+	_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE `+whereSQL, args...).Scan(&total)
+	if total == 0 {
+		return []MediaAssetView{}, 0, 0
+	}
+
+	offset := (page - 1) * perPage
+	baseSQL := `SELECT * FROM media_assets WHERE ` + whereSQL + ` ORDER BY ` + orderClause
+	paginatedSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, offset)
+	fullArgs := make([]any, 0, len(args)+len(pageArgs))
+	fullArgs = append(fullArgs, args...)
+	fullArgs = append(fullArgs, pageArgs...)
+
+	rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store, paginatedSQL, fullArgs...)
 	if len(rows) == 0 {
-		return []MediaAssetView{}, 0
+		return []MediaAssetView{}, total, 0
 	}
-	refCounts := s.countAssetsReferencesStreaming(ctx, rows)
+
+	var refCounts []int
+	if withRefs {
+		refCounts = s.countAssetsReferencesStreaming(ctx, rows)
+	}
+
 	out := make([]MediaAssetView, 0, len(rows))
 	orphanCnt := 0
 	for i, a := range rows {
-		rc := refCounts[i]
-		isOrp := rc == 0
-		if isOrp {
-			orphanCnt++
+		rc := 0
+		isOrp := false
+		if withRefs {
+			rc = refCounts[i]
+			isOrp = rc == 0
+			if isOrp {
+				orphanCnt++
+			}
 		}
 		out = append(out, MediaAssetView{
 			MediaAsset: a,
@@ -280,7 +512,12 @@ func (s *AppServer) listMediaWithRefs(ctx context.Context, limit int) ([]MediaAs
 			IsOrphan:   isOrp,
 		})
 	}
-	return out, orphanCnt
+	return out, total, orphanCnt
+}
+
+func (s *AppServer) listMediaWithRefs(ctx context.Context, limit int) ([]MediaAssetView, int) {
+	items, _, orphanCnt := s.queryAdminMediaPage(ctx, "", "", "", false, true, "newest", 1, limit)
+	return items, orphanCnt
 }
 
 func (s *AppServer) scanOrCleanOrphans(ctx context.Context, deleteOrphans bool) ([]domain.MediaAsset, int64, error) {

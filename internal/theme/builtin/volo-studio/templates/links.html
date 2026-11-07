@@ -7,7 +7,33 @@
         {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
       </div>
     </section>
-    {{if .LinksByCategory}}
+    {{$okLabel := "正常"}}{{$brokenLabel := "连接异常"}}
+    {{if hasPrefix .Locale "en"}}{{$okLabel = "Healthy"}}{{$brokenLabel = "Unreachable"}}{{else if eq .Locale "zh-TW"}}{{$okLabel = "正常"}}{{$brokenLabel = "連線異常"}}{{end}}
+    {{if .LinkGroups}}
+      {{range .LinkGroups}}
+        <section class="studio-article studio-card-pad">
+          <h2 class="studio-card-title">{{.Category}}</h2>
+          <div class="bookshelf-grid">
+            {{range .Items}}
+              <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax>
+                <div class="studio-link-card__head">
+                  <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
+                  <div class="studio-link-card__meta">
+                    <strong>{{.Title}}</strong>
+                    {{if eq .HealthStatus "broken"}}
+                      <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
+                    {{else}}
+                      <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
+                    {{end}}
+                  </div>
+                </div>
+                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+              </a>
+            {{end}}
+          </div>
+        </section>
+      {{end}}
+    {{else if .LinksByCategory}}
       {{range $cat, $items := .LinksByCategory}}
         <section class="studio-article studio-card-pad">
           <h2 class="studio-card-title">{{$cat}}</h2>
@@ -18,7 +44,11 @@
                   <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
                   <div class="studio-link-card__meta">
                     <strong>{{.Title}}</strong>
-                    <div class="studio-link-card__status">{{if eq .HealthStatus "broken"}}⚠{{else}}●{{end}}</div>
+                    {{if eq .HealthStatus "broken"}}
+                      <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
+                    {{else}}
+                      <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
+                    {{end}}
                   </div>
                 </div>
                 {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}

@@ -357,3 +357,173 @@ func buildSyntheticWebAuthnAssertion(t *testing.T, challengeB64, origin, rpID st
 	}
 	return cdj, authData, sig
 }
+
+func TestPasskeySingleUseChallengeAntiReplay(t *testing.T) {
+	ctx := context.Background()
+	svc, store, kr := setupAuthTestService(t)
+	now := time.Now().UnixMilli()
+
+	pw, _ := HashPassword("AdminPass2026!")
+	_, err := store.ExecContext(ctx,
+		`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
+		 VALUES ('u_pk0', 'pkzero', 'pk0@example.com', 'PK Zero', '', '', '', 'admin', ?, '', 'active', ?, 'zh-CN', ?, ?)`,
+		pw, now, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Register a passkey whose authenticator always emits signCount == 0 (e.g. synced passkey).
+	beginReg, err := BeginPasskeyCeremony(kr, "u_pk0", "register", "https://blog.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credID := []byte("0000_synced_passkey_id")
+	regCDJ, attObj := buildSyntheticWebAuthnRegistration(t, beginReg.ChallengeB64URL, "https://blog.example.com", "blog.example.com", credID, &privKey.PublicKey, 0)
+	credRec, err := svc.RegisterPasskey(ctx, "u_pk0", "iCloud Keychain", beginReg.StateToken, regCDJ, attObj)
+	if err != nil {
+		t.Fatalf("RegisterPasskey signCount=0 failed: %v", err)
+	}
+
+	// Registration stateToken replay MUST fail!
+	if _, err := svc.RegisterPasskey(ctx, "u_pk0", "Replay Reg", beginReg.StateToken, regCDJ, attObj); err == nil {
+		t.Fatal("expected registration stateToken replay to be rejected")
+	}
+
+	// Login with signCount == 0 succeeds on first use of stateToken...
+	beginLogin, err := BeginPasskeyCeremony(kr, "", "login", "https://blog.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginCDJ, authData0, sig0 := buildSyntheticWebAuthnAssertion(t, beginLogin.ChallengeB64URL, "https://blog.example.com", "blog.example.com", privKey, 0)
+	if _, err := svc.LoginWithPasskey(ctx, beginLogin.StateToken, credRec.CredentialID, loginCDJ, authData0, sig0, netip.MustParseAddr("1.1.1.1"), "", "Safari"); err != nil {
+		t.Fatalf("first LoginWithPasskey signCount=0 failed: %v", err)
+	}
+
+	// ...and MUST be rejected on replay of the same stateToken + assertion!
+	if _, err := svc.LoginWithPasskey(ctx, beginLogin.StateToken, credRec.CredentialID, loginCDJ, authData0, sig0, netip.MustParseAddr("1.1.1.1"), "", "Safari"); !errors.Is(err, ErrPasskeyVerifyFailed) {
+		t.Fatalf("expected replayed signCount=0 assertion to fail with ErrPasskeyVerifyFailed, got %v", err)
+	}
+}
+
+func TestTrusted2FACookieInvalidatedOnPasswordAndTOTPRotation(t *testing.T) {
+	ctx := context.Background()
+	svc, store, _ := setupAuthTestService(t)
+	svc.SetPublicURL("https://updated.example.com/")
+	if got := svc.PublicURL(); got != "https://updated.example.com" {
+		t.Fatalf("PublicURL() = %q", got)
+	}
+	now := time.Now().UnixMilli()
+
+	pw1, _ := HashPassword("FirstPass2026!")
+	_, err := store.ExecContext(ctx,
+		`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
+		 VALUES ('u_2fa', 'secadmin', 'sec@example.com', 'Sec Admin', '', '', '', 'admin', ?, '', 'active', ?, 'zh-CN', ?, ?)`,
+		pw1, now, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secret1, err := GenerateTOTPSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code1, _ := ComputeTOTPCode(secret1, time.Now().Add(-30*time.Second))
+	if _, err := svc.EnrollTOTP(ctx, "u_2fa", secret1, code1); err != nil {
+		t.Fatalf("EnrollTOTP: %v", err)
+	}
+
+	ip := netip.MustParseAddr("203.0.113.10")
+	ua := "Mozilla/5.0 TestBrowser"
+	step1, err := svc.LoginStaff(ctx, "secadmin", "FirstPass2026!", ip, "", ua, "")
+	if err != nil || !step1.Requires2FA {
+		t.Fatalf("expected step1 2FA challenge, got %+v err=%v", step1, err)
+	}
+	codeNow, _ := ComputeTOTPCode(secret1, time.Now())
+	_, trustCookie, err := svc.CompleteStaff2FA(ctx, step1.ChallengeToken, codeNow, true, ip, "", ua)
+	if err != nil || trustCookie == "" {
+		t.Fatalf("CompleteStaff2FA failed: cookie=%q err=%v", trustCookie, err)
+	}
+
+	// Valid trustCookie skips 2FA when password & TOTP credential are unchanged:
+	bypassRes, err := svc.LoginStaff(ctx, "secadmin", "FirstPass2026!", ip, "", ua, trustCookie)
+	if err != nil || bypassRes.Requires2FA {
+		t.Fatalf("expected valid trustCookie to bypass 2FA, got %+v err=%v", bypassRes, err)
+	}
+
+	// 1. Rotating TOTP secret MUST immediately invalidate old trustCookie!
+	secret2, _ := GenerateTOTPSecret()
+	code2, _ := ComputeTOTPCode(secret2, time.Now().Add(30*time.Second))
+	recCodes2, err := svc.EnrollTOTP(ctx, "u_2fa", secret2, code2)
+	if err != nil || len(recCodes2) == 0 {
+		t.Fatalf("re-enroll TOTP: %v", err)
+	}
+	afterTOTPRotate, err := svc.LoginStaff(ctx, "secadmin", "FirstPass2026!", ip, "", ua, trustCookie)
+	if err != nil || !afterTOTPRotate.Requires2FA {
+		t.Fatalf("CRITICAL: old trustCookie was NOT invalidated after TOTP rotation!")
+	}
+
+	// Mint a new trust cookie for secret2, then change password -> MUST invalidate!
+	_, trustCookie2, err := svc.CompleteStaff2FA(ctx, afterTOTPRotate.ChallengeToken, recCodes2[0], true, ip, "", ua)
+	if err != nil || trustCookie2 == "" {
+		t.Fatalf("CompleteStaff2FA #2 failed: %v", err)
+	}
+	pw2, _ := HashPassword("SecondPass2026!")
+	if _, err := store.ExecContext(ctx, `UPDATE users SET password_hash = ? WHERE id = 'u_2fa'`, pw2); err != nil {
+		t.Fatal(err)
+	}
+	afterPWChange, err := svc.LoginStaff(ctx, "secadmin", "SecondPass2026!", ip, "", ua, trustCookie2)
+	if err != nil || !afterPWChange.Requires2FA {
+		t.Fatalf("CRITICAL: trustCookie2 was NOT invalidated after password change!")
+	}
+}
+
+func TestRenderQRCodeSVGAndMatrixInvariants(t *testing.T) {
+	secret, err := GenerateTOTPSecret()
+	if err != nil || secret == "" {
+		t.Fatalf("GenerateTOTPSecret: %v", err)
+	}
+	shortURI := BuildOTPAuthURI("Volo", "admin", secret)
+	longURI := BuildOTPAuthURI("Volo Sovereign Blog", "admin@blog.example.com", secret)
+
+	for _, uri := range []string{shortURI, longURI} {
+		svg := RenderQRCodeSVG(uri, 240)
+		if !strings.HasPrefix(svg, `<svg xmlns="http://www.w3.org/2000/svg"`) || !strings.HasSuffix(svg, `</svg>`) {
+			t.Fatalf("invalid SVG wrapper: %s", svg)
+		}
+		if !strings.Contains(svg, `width="240" height="240"`) || !strings.Contains(svg, `<path fill="#000000" d="M`) {
+			t.Fatalf("missing expected SVG dimensions or path data: %s", svg)
+		}
+
+		mat, ok := encodeQRMatrix([]byte(uri))
+		if !ok {
+			t.Fatalf("encodeQRMatrix returned false for otpauth URI (%d bytes)", len(uri))
+		}
+		n := len(mat)
+		if n < 21 || (n-17)%4 != 0 {
+			t.Fatalf("invalid QR module dimension %d", n)
+		}
+
+		// Verify 7x7 finder corners + white separator ring + dark module + timing alternating modules
+		for _, corner := range [][2]int{{0, 0}, {0, n - 7}, {n - 7, 0}} {
+			r0, c0 := corner[0], corner[1]
+			if !mat[r0][c0] || !mat[r0+6][c0+6] || !mat[r0+3][c0+3] {
+				t.Fatalf("finder pattern outer/center dark modules missing at corner %v", corner)
+			}
+			if mat[r0+1][c0+1] || mat[r0+5][c0+5] {
+				t.Fatalf("finder pattern inner white ring corrupted at corner %v", corner)
+			}
+		}
+		// Always-dark module at (4*V + 9, 8) == (n - 8, 8)
+		if !mat[n-8][8] {
+			t.Fatalf("expected ISO always-dark module at (%d, 8)", n-8)
+		}
+		// Timing pattern alternating along row 6 between cols 8..10
+		if !mat[6][8] || mat[6][9] || !mat[6][10] {
+			t.Fatalf("timing pattern alternating invariant violated at row 6")
+		}
+	}
+}

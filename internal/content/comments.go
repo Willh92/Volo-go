@@ -7,13 +7,17 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Willh92/Volo-go/internal/config"
+	"github.com/Willh92/Volo-go/internal/db/dialect"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/guest"
 	"github.com/Willh92/Volo-go/internal/render"
+	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
@@ -51,7 +55,18 @@ type PublicCommentView struct {
 	Replies     []PublicCommentView `json:"replies,omitempty"`
 }
 
-// RecentCommentItem is displayed in the volo-studio sidebar (strictly excluding protected articles!).
+// PaginatedCommentsResult holds a paginated slice of top-level comment threads (with full replies per thread).
+type PaginatedCommentsResult struct {
+	Comments      []PublicCommentView `json:"comments"`
+	Page          int                 `json:"page"`
+	PerPage       int                 `json:"per_page"`
+	TotalRoots    int                 `json:"total_roots"`
+	TotalComments int                 `json:"total_comments"`
+	TotalPages    int                 `json:"total_pages"`
+	HasMore       bool                `json:"has_more"`
+}
+
+// RecentCommentItem is displayed in the volo-studio sidebar and /dynamic page (strictly excluding protected/unpublished targets!).
 type RecentCommentItem struct {
 	ID          string `json:"id"`
 	AuthorName  string `json:"author_name"`
@@ -79,38 +94,57 @@ type CreateCommentInput struct {
 	Locale       string `json:"-"`
 }
 
-// ListTargetComments returns the nested 2-level public comment tree for an article or standalone page.
-// Surface 4 Enforcement: if target is a password-protected article and request has NOT unlocked it,
-// ListTargetComments returns visibility.ErrProtectedForbidden (HTTP 403)!
-func (s *Service) ListTargetComments(
+func (s *Service) authorizeCommentTarget(
 	ctx context.Context,
 	r *http.Request,
 	viewer *domain.User,
 	targetType string,
 	targetID string,
-) ([]PublicCommentView, error) {
+) (string, error) {
 	tType := strings.TrimSpace(targetType)
 	tID := strings.TrimSpace(targetID)
 
-	var postAuthorID string
 	switch tType {
 	case domain.TargetTypeArticle:
 		raw, err := s.GetRawArticleByID(ctx, tID)
 		if err != nil {
-			return nil, err
+			return "", err
+		}
+		if raw.Status != domain.ArticleStatusPublished && !s.guard.IsAuthorOrAdmin(raw, viewer) {
+			return "", sql.ErrNoRows
 		}
 		if !s.guard.CanAccessArticleComments(r, raw, viewer) {
-			return nil, visibility.ErrProtectedForbidden
+			return "", visibility.ErrProtectedForbidden
 		}
-		postAuthorID = raw.AuthorID
+		return raw.AuthorID, nil
 	case domain.TargetTypePage:
 		pg, err := sqlx.Get[domain.Page](ctx, s.store, `SELECT id, author_id, is_published FROM pages WHERE id = ?`, tID)
-		if err != nil || !pg.IsPublished {
-			return nil, sql.ErrNoRows
+		if err != nil {
+			return "", err
 		}
-		postAuthorID = pg.AuthorID
+		isPageStaff := viewer != nil && viewer.Status == domain.UserStatusActive &&
+			(viewer.Role == domain.RoleAdmin || (viewer.Role == domain.RoleEditor && viewer.ID == pg.AuthorID))
+		if !pg.IsPublished && !isPageStaff {
+			return "", sql.ErrNoRows
+		}
+		return pg.AuthorID, nil
 	default:
-		return nil, errors.New("comments: invalid target_type")
+		return "", errors.New("comments: invalid target_type")
+	}
+}
+
+func (s *Service) buildTargetCommentTree(
+	ctx context.Context,
+	r *http.Request,
+	viewer *domain.User,
+	targetType string,
+	targetID string,
+) ([]PublicCommentView, int, error) {
+	tType := strings.TrimSpace(targetType)
+	tID := strings.TrimSpace(targetID)
+	postAuthorID, err := s.authorizeCommentTarget(ctx, r, viewer, tType, tID)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	var callerGuestHash string
@@ -132,12 +166,13 @@ func (s *Service) ListTargetComments(
 		tType, tID, false,
 	)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	nowMS := time.Now().UnixMilli()
 	roots := make([]PublicCommentView, 0)
 	rootIdxByID := make(map[string]int)
+	totalComments := 0
 
 	for _, c := range rows {
 		isAdmin := viewer != nil && viewer.Role == domain.RoleAdmin && viewer.Status == domain.UserStatusActive
@@ -145,6 +180,7 @@ func (s *Service) ListTargetComments(
 		if c.Status != domain.CommentStatusApproved && !isOwn && !isAdmin {
 			continue
 		}
+		totalComments++
 		view := s.toPublicCommentView(c, postAuthorID, isOwn || isAdmin, viewer)
 		if strings.TrimSpace(c.ParentID) == "" {
 			rootIdxByID[c.ID] = len(roots)
@@ -160,10 +196,99 @@ func (s *Service) ListTargetComments(
 	for i, j := 0, len(roots)-1; i < j; i, j = i+1, j-1 {
 		roots[i], roots[j] = roots[j], roots[i]
 	}
-	return roots, nil
+	return roots, totalComments, nil
 }
 
-// ListRecentPublicComments fetches recent approved comments strictly excluding any password-protected articles (Surface 4).
+// ListTargetComments returns the nested 2-level public comment tree for an article or standalone page.
+// Surface 4 Enforcement: if target is unpublished -> sql.ErrNoRows (404); if password-protected and locked -> ErrProtectedForbidden (403)!
+func (s *Service) ListTargetComments(
+	ctx context.Context,
+	r *http.Request,
+	viewer *domain.User,
+	targetType string,
+	targetID string,
+) ([]PublicCommentView, error) {
+	roots, _, err := s.buildTargetCommentTree(ctx, r, viewer, targetType, targetID)
+	return roots, err
+}
+
+// ListTargetCommentsPage returns a paginated slice of root comment threads (newest-first, with replies intact).
+// If focusCommentID matches a root or reply, page automatically jumps to the page containing that thread.
+func (s *Service) ListTargetCommentsPage(
+	ctx context.Context,
+	r *http.Request,
+	viewer *domain.User,
+	targetType string,
+	targetID string,
+	page int,
+	perPage int,
+	focusCommentID string,
+) (PaginatedCommentsResult, error) {
+	roots, totalComments, err := s.buildTargetCommentTree(ctx, r, viewer, targetType, targetID)
+	if err != nil {
+		return PaginatedCommentsResult{}, err
+	}
+	if perPage <= 0 {
+		perPage = 20
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+	totalRoots := len(roots)
+	totalPages := 1
+	if totalRoots > 0 {
+		totalPages = (totalRoots + perPage - 1) / perPage
+	}
+
+	if focusID := strings.TrimSpace(focusCommentID); focusID != "" {
+		for i, root := range roots {
+			matched := root.ID == focusID
+			if !matched {
+				for _, rep := range root.Replies {
+					if rep.ID == focusID {
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
+				page = (i / perPage) + 1
+				break
+			}
+		}
+	}
+
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+
+	var slice []PublicCommentView
+	if totalRoots == 0 {
+		slice = []PublicCommentView{}
+	} else {
+		start := (page - 1) * perPage
+		end := start + perPage
+		if end > totalRoots {
+			end = totalRoots
+		}
+		slice = roots[start:end]
+	}
+
+	return PaginatedCommentsResult{
+		Comments:      slice,
+		Page:          page,
+		PerPage:       perPage,
+		TotalRoots:    totalRoots,
+		TotalComments: totalComments,
+		TotalPages:    totalPages,
+		HasMore:       page < totalPages,
+	}, nil
+}
+
+// ListRecentPublicComments fetches recent approved comments strictly excluding any password-protected or unpublished targets (Surface 4).
 func (s *Service) ListRecentPublicComments(ctx context.Context, limit int) ([]RecentCommentItem, error) {
 	if limit <= 0 {
 		limit = 8
@@ -179,10 +304,40 @@ func (s *Service) ListRecentPublicComments(ctx context.Context, limit int) ([]Re
 	return s.queryRecentPublicComments(ctx, limit)
 }
 
+// ListRecentPublicCommentsPage fetches a paginated page of recent public comments across published public articles and standalone pages.
+func (s *Service) ListRecentPublicCommentsPage(ctx context.Context, page int, perPage int) ([]RecentCommentItem, int, error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 20, 100)
+	whereFrom := `
+		FROM comments c
+		LEFT JOIN articles a ON c.target_type = 'article' AND a.id = c.target_id
+		LEFT JOIN pages p ON c.target_type = 'page' AND p.id = c.target_id
+		WHERE c.status = ? AND c.is_deleted = ?
+		  AND ((c.target_type = 'article' AND a.status = ? AND a.password_ciphertext = '')
+		    OR (c.target_type = 'page' AND p.is_published = ?))`
+	args := []any{domain.CommentStatusApproved, false, domain.ArticleStatusPublished, true}
+
+	var total int
+	if err := s.store.QueryRowContext(ctx, "SELECT COUNT(*) "+whereFrom, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []RecentCommentItem{}, 0, nil
+	}
+	items, err := s.queryRecentPublicCommentsOffset(ctx, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
 func (s *Service) queryRecentPublicComments(ctx context.Context, limit int) ([]RecentCommentItem, error) {
 	if limit <= 0 {
 		limit = 8
 	}
+	return s.queryRecentPublicCommentsOffset(ctx, limit, 0)
+}
+
+func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int, offset int) ([]RecentCommentItem, error) {
 	type joinedRecent struct {
 		ID          string `db:"id"`
 		AuthorName  string `db:"author_name"`
@@ -193,25 +348,38 @@ func (s *Service) queryRecentPublicComments(ctx context.Context, limit int) ([]R
 		CreatedAt   int64  `db:"created_at"`
 	}
 	baseSQL := `
-		SELECT c.id, c.author_name, c.content_md, a.title AS target_title, a.slug AS target_slug, c.target_type, c.created_at
+		SELECT c.id, c.author_name, c.content_md,
+		       COALESCE(a.title, p.title, '') AS target_title,
+		       COALESCE(a.slug, p.slug, '') AS target_slug,
+		       c.target_type, c.created_at
 		FROM comments c
-		INNER JOIN articles a ON c.target_type = 'article' AND a.id = c.target_id
-		WHERE c.status = ? AND c.is_deleted = ? AND a.status = ? AND a.password_ciphertext = ''
+		LEFT JOIN articles a ON c.target_type = 'article' AND a.id = c.target_id
+		LEFT JOIN pages p ON c.target_type = 'page' AND p.id = c.target_id
+		WHERE c.status = ? AND c.is_deleted = ?
+		  AND ((c.target_type = 'article' AND a.status = ? AND a.password_ciphertext = '')
+		    OR (c.target_type = 'page' AND p.is_published = ?))
 		ORDER BY c.created_at DESC`
-	q, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, 0)
-	rows, err := sqlx.Select[joinedRecent](ctx, s.store, q, append([]any{domain.CommentStatusApproved, false, domain.ArticleStatusPublished}, pageArgs...)...)
+	q, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
+	rows, err := sqlx.Select[joinedRecent](
+		ctx, s.store, q,
+		append([]any{domain.CommentStatusApproved, false, domain.ArticleStatusPublished, true}, pageArgs...)...,
+	)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]RecentCommentItem, 0, len(rows))
 	for _, r := range rows {
 		rendered := s.renderer.Render(r.ContentMD, render.Options{Mode: render.RenderModeWeb})
+		targetURL := visibility.ArticlePath(r.TargetSlug) + "#comment-" + r.ID
+		if r.TargetType == domain.TargetTypePage {
+			targetURL = "/" + r.TargetSlug + "#comment-" + r.ID
+		}
 		out = append(out, RecentCommentItem{
 			ID:          r.ID,
 			AuthorName:  r.AuthorName,
 			Excerpt:     truncateForSummary(rendered.PlainText, 64),
 			TargetTitle: r.TargetTitle,
-			TargetURL:   visibility.ArticlePath(r.TargetSlug) + "#comment-" + r.ID,
+			TargetURL:   targetURL,
 			CreatedAt:   r.CreatedAt,
 		})
 	}
@@ -286,7 +454,9 @@ func (s *Service) CreateComment(
 		if authorName == "" {
 			authorName = viewer.Username
 		}
-		authorURL = viewer.WebsiteURL
+		if cleanURL, ok := sanitizeCommentAuthorURL(viewer.WebsiteURL); ok {
+			authorURL = cleanURL
+		}
 		avatarURL = viewer.AvatarURL
 		if avatarURL == "" {
 			avatarURL = "/avatars/" + viewer.ID + ".svg"
@@ -490,16 +660,10 @@ func (s *Service) UpdateOwnComment(
 		return PublicCommentView{}, err
 	}
 
-	var postAuthorID string
-	// Surface 4: also verify protected article remains unlocked!
-	if existing.TargetType == domain.TargetTypeArticle {
-		raw, aErr := s.GetRawArticleByID(ctx, existing.TargetID)
-		if aErr != nil || !s.guard.CanAccessArticleComments(r, raw, viewer) {
-			return PublicCommentView{}, visibility.ErrProtectedForbidden
-		}
-		postAuthorID = raw.AuthorID
-	} else if existing.TargetType == domain.TargetTypePage {
-		_ = s.store.QueryRowContext(ctx, `SELECT author_id FROM pages WHERE id = ?`, existing.TargetID).Scan(&postAuthorID)
+	// Surface 4: reject unpublished targets (404) and locked password-protected articles (403)!
+	postAuthorID, tErr := s.authorizeCommentTarget(ctx, r, viewer, existing.TargetType, existing.TargetID)
+	if tErr != nil {
+		return PublicCommentView{}, tErr
 	}
 
 	var callerGuestHash, callerUserID string
@@ -534,6 +698,11 @@ func (s *Service) DeleteOwnComment(ctx context.Context, r *http.Request, viewer 
 		return err
 	}
 
+	// Surface 4: reject unpublished targets (404) and locked password-protected articles (403)!
+	if _, tErr := s.authorizeCommentTarget(ctx, r, viewer, existing.TargetType, existing.TargetID); tErr != nil {
+		return tErr
+	}
+
 	var callerGuestHash, callerUserID string
 	if viewer != nil && viewer.Status == domain.UserStatusActive {
 		callerUserID = viewer.ID
@@ -559,6 +728,7 @@ func (s *Service) DeleteOwnComment(ctx context.Context, r *http.Request, viewer 
 }
 
 // ToggleReaction toggles an emoji/like reaction deduplicated by actorHash (`user:<id>` or `envfp:<hash>`).
+// Uses WithBgTx so visitor reactions do NOT bump DataRevision or thrash public chrome/feed caches!
 func (s *Service) ToggleReaction(ctx context.Context, targetType string, targetID string, actorHash string, kind string) (map[string]int, bool, error) {
 	cleanKind := strings.ToLower(strings.TrimSpace(kind))
 	switch cleanKind {
@@ -571,7 +741,7 @@ func (s *Service) ToggleReaction(ctx context.Context, targetType string, targetI
 	}
 
 	added := false
-	err := s.store.WithTx(ctx, func(tx *sqlx.Tx) error {
+	err := s.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
 		res, dErr := tx.ExecContext(
 			ctx,
 			`DELETE FROM reactions WHERE target_type = ? AND target_id = ? AND actor_hash = ? AND kind = ?`,
@@ -622,6 +792,24 @@ func (s *Service) GetReactionCounts(ctx context.Context, targetType string, targ
 	return out, nil
 }
 
+// DecryptCommentNotifyEmail opens a comment's encrypted notify_email using canonical and legacy fallback AADs.
+func (s *Service) DecryptCommentNotifyEmail(c domain.Comment) (string, bool) {
+	if s == nil || s.keys == nil || strings.TrimSpace(c.NotifyEmailCiphertext) == "" {
+		return "", false
+	}
+	plain, err := s.keys.OpenStringFallback(
+		c.NotifyEmailCiphertext,
+		config.CommentNotifyEmailAAD(c.ID),
+		"comments:notify_email:"+c.ID,
+		"comments:email:"+c.ID,
+		"comment:email",
+	)
+	if err != nil || !strings.Contains(plain, "@") {
+		return "", false
+	}
+	return plain, true
+}
+
 func canModifyComment(c domain.Comment, callerUserID string, callerGuestHash string, nowMS int64) bool {
 	if callerUserID != "" && c.UserID != "" && c.UserID == callerUserID {
 		return true
@@ -634,10 +822,32 @@ func canModifyComment(c domain.Comment, callerUserID string, callerGuestHash str
 	return false
 }
 
+func (s *Service) renderCommentMarkdownHTML(c domain.Comment) string {
+	if c.ID != "" {
+		cacheKey := c.ID + ":" + strconv.FormatInt(c.UpdatedAt, 10)
+		s.commentHTMLMu.RLock()
+		if cached, ok := s.commentHTML[cacheKey]; ok {
+			s.commentHTMLMu.RUnlock()
+			return cached
+		}
+		s.commentHTMLMu.RUnlock()
+
+		html := s.renderer.Render(c.ContentMD, render.Options{Mode: render.RenderModeWeb}).HTML
+		s.commentHTMLMu.Lock()
+		if s.commentHTML == nil {
+			s.commentHTML = make(map[string]string, 256)
+		} else if len(s.commentHTML) >= 4096 {
+			clear(s.commentHTML)
+		}
+		s.commentHTML[cacheKey] = html
+		s.commentHTMLMu.Unlock()
+		return html
+	}
+	return s.renderer.Render(c.ContentMD, render.Options{Mode: render.RenderModeWeb}).HTML
+}
+
 func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, canEdit bool, viewer *domain.User) PublicCommentView {
-	out := s.renderer.Render(c.ContentMD, render.Options{
-		Mode: render.RenderModeWeb,
-	})
+	renderedHTML := s.renderCommentMarkdownHTML(c)
 	seed := strings.TrimSpace(c.UserID)
 	if seed == "" && len(c.GuestIDHash) >= 16 {
 		seed = c.GuestIDHash[:16]
@@ -666,7 +876,7 @@ func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, can
 		AvatarURL:   avatarURL,
 		AvatarSeed:  seed,
 		IsAuthor:    isAuthor,
-		ContentHTML: out.HTML,
+		ContentHTML: renderedHTML,
 		GeoRegion:   c.GeoRegion,
 		Status:      c.Status,
 		CanEdit:     canEdit,
@@ -705,7 +915,7 @@ func syncApprovedCommentCountTx(ctx context.Context, tx *sqlx.Tx, targetType str
 }
 
 func sanitizeCommentAuthorURL(raw string) (string, bool) {
-	s := strings.TrimSpace(raw)
+	s := strings.TrimSpace(repo.StripASCIIControls(raw))
 	if s == "" {
 		return "", false
 	}

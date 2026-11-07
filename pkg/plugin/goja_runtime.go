@@ -25,7 +25,7 @@ import (
 
 const (
 	defaultVMStackLimit     = 512
-	defaultVMPoolCap        = 1
+	defaultVMPoolCap        = 4
 	defaultVMMaxConcurrency = 8
 	maxPluginFetchBodyBytes = 1 << 20 // 1 MiB cap on outbound HTTP responses
 	maxPluginRateLimitKeys  = 2048

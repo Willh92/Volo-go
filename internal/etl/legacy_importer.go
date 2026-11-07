@@ -773,19 +773,19 @@ func (st *pass1Data) reassembleOptionDoc(rootID string, report *ImportReport) (s
 }
 
 type decomposedState struct {
-	settings           domain.SettingsSnapshot
-	storageSecret      string
-	smtpSecret         string
-	backupSecrets      domain.BackupSecrets
-	series             []domain.Series
-	seriesArticles     []domain.SeriesArticle
-	books              []domain.Book
-	bookChapters       []domain.BookChapter
-	analyticsDaily     []domain.AnalyticsDaily
-	analyticsTop       []domain.AnalyticsTopItem
-	webhooks           []domain.Webhook
-	ipBans             []domain.SecurityIPBan
-	geoRules           []domain.SecurityGeoRule
+	settings       domain.SettingsSnapshot
+	storageSecret  string
+	smtpSecret     string
+	backupSecrets  domain.BackupSecrets
+	series         []domain.Series
+	seriesArticles []domain.SeriesArticle
+	books          []domain.Book
+	bookChapters   []domain.BookChapter
+	analyticsDaily []domain.AnalyticsDaily
+	analyticsTop   []domain.AnalyticsTopItem
+	webhooks       []domain.Webhook
+	ipBans         []domain.SecurityIPBan
+	geoRules       []domain.SecurityGeoRule
 }
 
 func decomposeOptions(
@@ -1398,7 +1398,7 @@ func streamPass2IntoTx(
 				}
 
 				viewPwd := strVal(raw["articleViewPwd"])
-				pwdCipher, sErr := kr.SealString(viewPwd, "articles:password:"+aid)
+				pwdCipher, sErr := kr.SealString(viewPwd, config.ArticlePasswordAAD(aid))
 				if sErr != nil {
 					return sErr
 				}
@@ -1553,7 +1553,7 @@ func streamPass2IntoTx(
 				if notifyEmail == "" {
 					notifyEmail = st.commentMailFallback[origCID]
 				}
-				emailCipher, sErr := kr.SealString(notifyEmail, "comments:email:"+cid)
+				emailCipher, sErr := kr.SealString(notifyEmail, config.CommentNotifyEmailAAD(cid))
 				if sErr != nil {
 					return sErr
 				}
@@ -2141,7 +2141,7 @@ func parseLegacyWebhooks(raw string, kr *config.KeyRing, report *ImportReport) (
 			continue
 		}
 		wid := firstNonEmpty(strings.TrimSpace(w.ID), id.NextPrefixed("wh"))
-		sealed, err := kr.SealString(w.Secret, "webhooks:secret:"+wid)
+		sealed, err := kr.SealString(w.Secret, config.WebhookSecretAAD(wid))
 		if err != nil {
 			return nil, err
 		}

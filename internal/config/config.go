@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -82,21 +83,24 @@ type TrustedProxiesPolicy struct {
 	Prefixes  []netip.Prefix
 }
 
-// Config is the immutable runtime bootstrap configuration resolved from the 4-layer hierarchy.
+// Config holds the runtime bootstrap configuration resolved from the 4-layer hierarchy.
+// Dynamic runtime updates (Setup Wizard, Legacy Import) synchronize via mu.
 type Config struct {
-	ListenAddr         string
-	ListenSocket       *ListenSocketSpec
-	PublicURL          string
-	PublicOrigin       string // scheme://authority
-	TrustedProxiesRaw  string
-	TrustedProxies     TrustedProxiesPolicy
-	AdminPath          string
-	IsCustomAdminPath  bool
-	SecretKeySource    string
-	KeyRing            *KeyRing
-	GeoAccessEnabled   bool
-	ShutdownTimeout    time.Duration
-	DefaultLocale      string
+	mu sync.RWMutex
+
+	ListenAddr        string
+	ListenSocket      *ListenSocketSpec
+	PublicURL         string
+	PublicOrigin      string // scheme://authority
+	TrustedProxiesRaw string
+	TrustedProxies    TrustedProxiesPolicy
+	AdminPath         string
+	IsCustomAdminPath bool
+	SecretKeySource   string
+	KeyRing           *KeyRing
+	GeoAccessEnabled  bool
+	ShutdownTimeout   time.Duration
+	DefaultLocale     string
 
 	DataDir    string
 	UploadDir  string
@@ -112,6 +116,61 @@ type Config struct {
 	DBMaxOpenConns   int
 	DBMaxIdleConns   int
 	DBConnLifetime   time.Duration
+}
+
+// GetPublicURL returns the current canonical public URL in a thread-safe manner.
+func (c *Config) GetPublicURL() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.PublicURL
+}
+
+// SetPublicURL updates PublicURL (and PublicOrigin when valid) under a write lock.
+func (c *Config) SetPublicURL(u string) {
+	if c == nil {
+		return
+	}
+	clean, origin, err := normalizePublicURL(u)
+	if err != nil {
+		clean = strings.TrimRight(strings.TrimSpace(u), "/")
+		if parsed, pErr := url.Parse(clean); pErr == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+			origin = parsed.Scheme + "://" + parsed.Host
+		} else {
+			origin = ""
+		}
+	}
+	c.mu.Lock()
+	c.PublicURL = clean
+	if origin != "" || clean == "" {
+		c.PublicOrigin = origin
+	}
+	c.mu.Unlock()
+}
+
+// GetDBSpec returns the active database driver, DSN, and simple-protocol flag under a read lock.
+func (c *Config) GetDBSpec() (driver, dsn string, simpleProto bool) {
+	if c == nil {
+		return "", "", false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.DBDriver, c.DBDSN, c.DBSimpleProtocol
+}
+
+// SetDBSpec updates the active database driver, DSN, and simple-protocol flag under a write lock.
+func (c *Config) SetDBSpec(driver, dsn string, simpleProto bool) {
+	if c == nil {
+		return
+	}
+	normDriver := normalizeDriverName(driver)
+	c.mu.Lock()
+	c.DBDriver = normDriver
+	c.DBDSN = dsn
+	c.DBSimpleProtocol = simpleProto
+	c.mu.Unlock()
 }
 
 // PersistedDBConfig allows the First-Run Setup Wizard to save chosen DB settings encrypted on disk

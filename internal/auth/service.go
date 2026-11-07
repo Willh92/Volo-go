@@ -78,6 +78,7 @@ type Service struct {
 	store       *sqlx.Store
 	keyRing     *config.KeyRing
 	settingsMgr *repo.SettingsManager
+	pubMu       sync.RWMutex
 	publicURL   string
 	replayGuard *TOTPReplayGuard
 
@@ -104,10 +105,30 @@ func NewService(store *sqlx.Store, keyRing *config.KeyRing, settingsMgr *repo.Se
 		store:        store,
 		keyRing:      keyRing,
 		settingsMgr:  settingsMgr,
-		publicURL:    publicURL,
+		publicURL:    strings.TrimRight(strings.TrimSpace(publicURL), "/"),
 		replayGuard:  NewTOTPReplayGuard(),
 		pendingCodes: make(map[string]*pendingEmailCode),
 	}
+}
+
+// SetPublicURL dynamically updates the canonical public URL used by auth ceremonies.
+func (s *Service) SetPublicURL(publicURL string) {
+	if s == nil {
+		return
+	}
+	s.pubMu.Lock()
+	s.publicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
+	s.pubMu.Unlock()
+}
+
+// PublicURL returns the current canonical public URL in a thread-safe manner.
+func (s *Service) PublicURL() string {
+	if s == nil {
+		return ""
+	}
+	s.pubMu.RLock()
+	defer s.pubMu.RUnlock()
+	return s.publicURL
 }
 
 // --- Sovereign RBAC & Collaborator Isolation Guards ---
@@ -157,10 +178,10 @@ func CanManageArticle(actor *domain.User, articleAuthorID string) bool {
 }
 
 // AuthorizeAndScrubCommentForStaff enforces strict collaborator comment isolation & PII minimization:
-// - Admin can access and moderate all comments.
-// - Editor can ONLY access/moderate comments on articles authored by themselves (articleAuthorID == actor.ID),
-//   and sensitive PII (NotifyEmailCiphertext, ClientIP) is stripped so Editors only see IPMasked & GeoRegion!
-// - Reader is strictly forbidden.
+//   - Admin can access and moderate all comments.
+//   - Editor can ONLY access/moderate comments on articles authored by themselves (articleAuthorID == actor.ID),
+//     and sensitive PII (NotifyEmailCiphertext, ClientIP) is stripped so Editors only see IPMasked & GeoRegion!
+//   - Reader is strictly forbidden.
 func AuthorizeAndScrubCommentForStaff(actor *domain.User, c domain.Comment, articleAuthorID string) (domain.Comment, error) {
 	if err := RequireStaff(actor); err != nil {
 		return domain.Comment{}, err
@@ -218,11 +239,11 @@ func (s *Service) LoginStaff(
 		}
 	}
 
-	hasTOTP, err := s.userHasTOTPEnabled(ctx, u.ID)
+	totpSecretCipher, hasTOTP, err := s.activeTOTPSecretCiphertext(ctx, u.ID)
 	if err != nil {
 		return nil, err
 	}
-	if hasTOTP && !s.verifyTrusted2FATicket(trusted2FACookie, u.ID, u.PasswordHash, userAgent) {
+	if hasTOTP && !s.verifyTrusted2FATicket(trusted2FACookie, u.ID, u.PasswordHash, totpSecretCipher, userAgent) {
 		ipBucket := security.RateLimitBucketKey(clientIP)
 		chal, cErr := SealTwoFactorChallenge(s.keyRing, u.ID, ipBucket, userAgent)
 		if cErr != nil {
@@ -336,7 +357,7 @@ func (s *Service) CompleteStaff2FA(
 	var totpUntil int64
 	if rememberDevice {
 		totpUntil = now.Add(time.Duration(rememberDays) * 24 * time.Hour).UnixMilli()
-		trustedDeviceCookie, _ = s.mintTrusted2FATicket(u.ID, u.PasswordHash, userAgent, totpUntil)
+		trustedDeviceCookie, _ = s.mintTrusted2FATicket(u.ID, u.PasswordHash, totpCred.SecretCiphertext, userAgent, totpUntil)
 	}
 
 	sess, rawTok, err := s.CreateSession(ctx, u.ID, clientIP, geoRegion, userAgent, totpUntil)
@@ -510,26 +531,36 @@ func (s *Service) IssueReaderVerificationCode(email string) (string, error) {
 
 	const maxPendingEmailCodes = 2048
 	key := hex.EncodeToString(emailSum[:])
+	now := time.Now()
 	s.codeMu.Lock()
 	if _, exists := s.pendingCodes[key]; !exists && len(s.pendingCodes) >= maxPendingEmailCodes {
-		now := time.Now()
 		for k, v := range s.pendingCodes {
-			if now.After(v.expiresAt) {
+			if !now.Before(v.expiresAt) {
 				delete(s.pendingCodes, k)
 			}
 		}
-		for k := range s.pendingCodes {
-			if len(s.pendingCodes) < maxPendingEmailCodes {
+		for len(s.pendingCodes) >= maxPendingEmailCodes {
+			var oldestKey string
+			var oldestExp time.Time
+			first := true
+			for k, v := range s.pendingCodes {
+				if first || v.expiresAt.Before(oldestExp) {
+					oldestKey = k
+					oldestExp = v.expiresAt
+					first = false
+				}
+			}
+			if first {
 				break
 			}
-			delete(s.pendingCodes, k)
+			delete(s.pendingCodes, oldestKey)
 		}
 	}
 	s.pendingCodes[key] = &pendingEmailCode{
 		emailHash: key,
 		codeHash:  hex.EncodeToString(codeSum[:]),
 		attempts:  0,
-		expiresAt: time.Now().Add(10 * time.Minute),
+		expiresAt: now.Add(10 * time.Minute),
 	}
 	s.codeMu.Unlock()
 	return code, nil
@@ -915,34 +946,43 @@ func (s *Service) findUserByIdent(ctx context.Context, ident string) (domain.Use
 		clean, clean)
 }
 
-func (s *Service) userHasTOTPEnabled(ctx context.Context, userID string) (bool, error) {
+func (s *Service) activeTOTPSecretCiphertext(ctx context.Context, userID string) (string, bool, error) {
 	rows, err := sqlx.Select[struct {
-		ID string `db:"id"`
-	}](ctx, s.store, `SELECT id FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, userID)
+		SecretCiphertext string `db:"secret_ciphertext"`
+	}](ctx, s.store, `SELECT secret_ciphertext FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, userID)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return len(rows) > 0, nil
+	if len(rows) == 0 {
+		return "", false, nil
+	}
+	return rows[0].SecretCiphertext, true, nil
 }
 
-func passwordBindingDigest(pwHash string) string {
-	n := len(pwHash)
-	if n > 16 {
-		n = 16
-	}
-	sum := sha256.Sum256([]byte("volo-pwbind:v1:" + pwHash[:n]))
-	return hex.EncodeToString(sum[:8])
+func (s *Service) userHasTOTPEnabled(ctx context.Context, userID string) (bool, error) {
+	_, ok, err := s.activeTOTPSecretCiphertext(ctx, userID)
+	return ok, err
 }
 
-func (s *Service) mintTrusted2FATicket(userID string, passwordHash string, userAgent string, expiresAtMS int64) (string, error) {
+func credentialBindingDigest(pwHash string, totpSecretCiphertext string) string {
+	h := sha256.New()
+	h.Write([]byte("volo-2fabind:v2:"))
+	h.Write([]byte(pwHash))
+	h.Write([]byte{0})
+	h.Write([]byte(totpSecretCiphertext))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:12])
+}
+
+func (s *Service) mintTrusted2FATicket(userID string, passwordHash string, totpSecretCiphertext string, userAgent string, expiresAtMS int64) (string, error) {
 	uaSum := sha256.Sum256([]byte(strings.TrimSpace(userAgent)))
-	pwTag := passwordBindingDigest(passwordHash)
-	payload := fmt.Sprintf("%s|%x|%s|%d", userID, uaSum[:8], pwTag, expiresAtMS)
+	credTag := credentialBindingDigest(passwordHash, totpSecretCiphertext)
+	payload := fmt.Sprintf("%s|%x|%s|%d", userID, uaSum[:8], credTag, expiresAtMS)
 	return s.keyRing.SealString(payload, "auth:trusted-2fa")
 }
 
-func (s *Service) verifyTrusted2FATicket(cookieVal string, expectedUserID string, passwordHash string, userAgent string) bool {
-	if strings.TrimSpace(cookieVal) == "" {
+func (s *Service) verifyTrusted2FATicket(cookieVal string, expectedUserID string, passwordHash string, totpSecretCiphertext string, userAgent string) bool {
+	if strings.TrimSpace(cookieVal) == "" || strings.TrimSpace(totpSecretCiphertext) == "" {
 		return false
 	}
 	opened, err := s.keyRing.OpenString(strings.TrimSpace(cookieVal), "auth:trusted-2fa")
@@ -957,8 +997,8 @@ func (s *Service) verifyTrusted2FATicket(cookieVal string, expectedUserID string
 	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(hex.EncodeToString(uaSum[:8]))) != 1 {
 		return false
 	}
-	expectedPWTag := passwordBindingDigest(passwordHash)
-	if subtle.ConstantTimeCompare([]byte(parts[2]), []byte(expectedPWTag)) != 1 {
+	expectedCredTag := credentialBindingDigest(passwordHash, totpSecretCiphertext)
+	if subtle.ConstantTimeCompare([]byte(parts[2]), []byte(expectedCredTag)) != 1 {
 		return false
 	}
 	var exp int64

@@ -1,8 +1,69 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { CSSProperties, ComponentChildren, JSX } from "preact";
+import { createPortal } from "preact/compat";
+import type { CSSProperties, ComponentChildren } from "preact";
 import { confirmSig, resolveConfirm } from "../api";
 import type { LocaleOption } from "../i18n";
 import { t } from "../i18n";
+
+export function useDebouncedValue<T>(value: T, delay = 250): T {
+  const [debounced, setDebounced] = useState<T>(value);
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebounced(value), delay);
+    return () => window.clearTimeout(id);
+  }, [value, delay]);
+  return debounced;
+}
+
+export function computePortalMenuStyle(
+  anchorRect: DOMRect,
+  opts?: { minW?: number; maxW?: number; maxH?: number; align?: "left" | "right" }
+): { style: CSSProperties; flipUp: boolean } {
+  const vw = typeof window !== "undefined" ? window.innerWidth : 1024;
+  const vh = typeof window !== "undefined" ? window.innerHeight : 768;
+  const margin = 8;
+  const prefMaxW = opts?.maxW ?? 340;
+  const prefMaxH = opts?.maxH ?? 268;
+  const maxAllowedW = Math.max(136, Math.min(prefMaxW, vw - margin * 2));
+  const minW = Math.min(maxAllowedW, Math.max(opts?.minW ?? 164, Math.round(anchorRect.width)));
+
+  const spaceBelow = vh - anchorRect.bottom - margin;
+  const spaceAbove = anchorRect.top - margin;
+  const flipUp = spaceBelow < 220 && spaceAbove > spaceBelow;
+  const availH = Math.max(116, Math.min(prefMaxH, (flipUp ? spaceAbove : spaceBelow) - 6));
+
+  const preferRight =
+    opts?.align === "right" ||
+    (anchorRect.left + minW > vw - margin && anchorRect.right > vw / 2);
+
+  const style: CSSProperties = {
+    position: "fixed",
+    minWidth: `${minW}px`,
+    maxHeight: `${availH}px`,
+    zIndex: 1300,
+  };
+
+  if (preferRight) {
+    const rightPx = Math.max(margin, Math.min(vw - margin - minW, Math.round(vw - anchorRect.right)));
+    style.right = `${rightPx}px`;
+    style.left = "auto";
+    style.maxWidth = `${Math.max(minW, Math.min(maxAllowedW, vw - margin - rightPx))}px`;
+  } else {
+    const leftPx = Math.max(margin, Math.min(vw - margin - minW, Math.round(anchorRect.left)));
+    style.left = `${leftPx}px`;
+    style.right = "auto";
+    style.maxWidth = `${Math.max(minW, Math.min(maxAllowedW, vw - margin - leftPx))}px`;
+  }
+
+  if (flipUp) {
+    style.bottom = `${Math.max(margin, Math.round(vh - anchorRect.top + 5))}px`;
+    style.top = "auto";
+  } else {
+    style.top = `${Math.max(margin, Math.round(anchorRect.bottom + 5))}px`;
+    style.bottom = "auto";
+  }
+
+  return { style, flipUp };
+}
 
 export interface SelectOption {
   value: string;
@@ -18,6 +79,8 @@ export interface ConsoleSelectProps {
   className?: string;
   disabled?: boolean;
   align?: "left" | "right";
+  searchable?: boolean;
+  searchPlaceholder?: string;
 }
 
 export function ConsoleSelect({
@@ -28,16 +91,54 @@ export function ConsoleSelect({
   className = "",
   disabled = false,
   align = "left",
+  searchable,
+  searchPlaceholder,
 }: ConsoleSelectProps) {
   const [open, setOpen] = useState(false);
   const [closing, setClosing] = useState(false);
   const [flipUp, setFlipUp] = useState(false);
-  const [autoRight, setAutoRight] = useState(align === "right");
+  const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
   const [focusIdx, setFocusIdx] = useState<number>(-1);
+  const [searchQ, setSearchQ] = useState("");
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
 
+  const isSearchable = searchable ?? options.length > 10;
   const selected = options.find((o) => o.value === value) || options[0];
+
+  const filteredOptions =
+    isSearchable && searchQ.trim()
+      ? options.filter((o) => {
+          const q = searchQ.trim().toLowerCase();
+          return (
+            o.label.toLowerCase().includes(q) ||
+            o.value.toLowerCase().includes(q) ||
+            (o.badge && o.badge.toLowerCase().includes(q))
+          );
+        })
+      : options;
+
+  const updateMenuPosition = () => {
+    const el = btnRef.current || wrapRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.bottom < 0 || rect.top > window.innerHeight) {
+      setOpen(false);
+      setClosing(false);
+      return;
+    }
+    const pos = computePortalMenuStyle(rect, {
+      minW: 164,
+      maxW: 340,
+      maxH: isSearchable ? 300 : 264,
+      align,
+    });
+    setMenuStyle(pos.style);
+    setFlipUp(pos.flipUp);
+  };
 
   const closeAnimated = () => {
     if (!open || closing) return;
@@ -46,7 +147,8 @@ export function ConsoleSelect({
     closeTimerRef.current = window.setTimeout(() => {
       setOpen(false);
       setClosing(false);
-    }, 140);
+      setSearchQ("");
+    }, 130);
   };
 
   useEffect(() => {
@@ -58,20 +160,33 @@ export function ConsoleSelect({
   useEffect(() => {
     if (!open) return;
     const onDocDown = (ev: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(ev.target as Node)) {
-        closeAnimated();
-      }
+      const target = ev.target as Node;
+      if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      closeAnimated();
     };
     const onEsc = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") closeAnimated();
     };
+    const onScrollOrResize = (ev: Event) => {
+      if (ev.type === "scroll" && menuRef.current && ev.target instanceof Node && menuRef.current.contains(ev.target)) {
+        return;
+      }
+      updateMenuPosition();
+    };
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
+    window.addEventListener("resize", onScrollOrResize);
+    window.addEventListener("scroll", onScrollOrResize, true);
+    if (isSearchable) {
+      window.requestAnimationFrame(() => searchRef.current?.focus());
+    }
     return () => {
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
+      window.removeEventListener("resize", onScrollOrResize);
+      window.removeEventListener("scroll", onScrollOrResize, true);
     };
-  }, [open, closing]);
+  }, [open, closing, isSearchable]);
 
   const toggleOpen = () => {
     if (disabled) return;
@@ -81,14 +196,10 @@ export function ConsoleSelect({
     }
     if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
     setClosing(false);
-    if (wrapRef.current) {
-      const rect = wrapRef.current.getBoundingClientRect();
-      const spaceBelow = window.innerHeight - rect.bottom;
-      setFlipUp(spaceBelow < 230 && rect.top > 220);
-      setAutoRight(align === "right" || (rect.left > window.innerWidth - 220 && rect.right > 180));
-      const curIdx = options.findIndex((o) => o.value === value);
-      setFocusIdx(curIdx >= 0 ? curIdx : 0);
-    }
+    setSearchQ("");
+    updateMenuPosition();
+    const curIdx = options.findIndex((o) => o.value === value);
+    setFocusIdx(curIdx >= 0 ? curIdx : 0);
     setOpen(true);
   };
 
@@ -98,8 +209,8 @@ export function ConsoleSelect({
       e.preventDefault();
       if (!open || closing) {
         toggleOpen();
-      } else if (focusIdx >= 0 && focusIdx < options.length) {
-        onChange(options[focusIdx].value);
+      } else if (focusIdx >= 0 && focusIdx < filteredOptions.length) {
+        onChange(filteredOptions[focusIdx].value);
         closeAnimated();
       }
     } else if (e.key === "ArrowDown") {
@@ -107,17 +218,106 @@ export function ConsoleSelect({
       if (!open || closing) {
         toggleOpen();
       } else {
-        setFocusIdx((i) => (i + 1) % Math.max(1, options.length));
+        setFocusIdx((i) => (i + 1) % Math.max(1, filteredOptions.length));
       }
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       if (!open || closing) {
         toggleOpen();
       } else {
-        setFocusIdx((i) => (i - 1 + options.length) % Math.max(1, options.length));
+        setFocusIdx((i) => (i - 1 + filteredOptions.length) % Math.max(1, filteredOptions.length));
       }
     }
   };
+
+  const portalMenu =
+    open && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            ref={menuRef}
+            class={`volo-cselect-menu is-portal ${flipUp ? "flip-up" : ""} ${closing ? "is-closing" : ""}`}
+            style={menuStyle}
+            role="listbox"
+          >
+            {isSearchable && (
+              <div class="volo-cselect-search-wrap">
+                <input
+                  ref={searchRef}
+                  type="text"
+                  class="volo-cselect-search"
+                  placeholder={searchPlaceholder || t("ui.select_search_ph")}
+                  value={searchQ}
+                  onInput={(e) => {
+                    setSearchQ((e.currentTarget as HTMLInputElement).value);
+                    setFocusIdx(0);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setFocusIdx((i) => (i + 1) % Math.max(1, filteredOptions.length));
+                    } else if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setFocusIdx((i) => (i - 1 + filteredOptions.length) % Math.max(1, filteredOptions.length));
+                    } else if (e.key === "Enter") {
+                      e.preventDefault();
+                      if (focusIdx >= 0 && focusIdx < filteredOptions.length) {
+                        onChange(filteredOptions[focusIdx].value);
+                        closeAnimated();
+                      }
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      closeAnimated();
+                    }
+                  }}
+                />
+              </div>
+            )}
+            <div class="volo-cselect-list">
+              {filteredOptions.length === 0 ? (
+                <div class="volo-cselect-empty">{t("tbl.empty")}</div>
+              ) : (
+                filteredOptions.map((opt, idx) => {
+                  const isAct = opt.value === value;
+                  const isFocused = idx === focusIdx;
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      role="option"
+                      aria-selected={isAct}
+                      class={`volo-cselect-item ${isAct ? "active" : ""} ${isFocused ? "focused" : ""}`}
+                      onMouseEnter={() => setFocusIdx(idx)}
+                      onClick={() => {
+                        onChange(opt.value);
+                        closeAnimated();
+                      }}
+                    >
+                      <span class="volo-cselect-item-text">{opt.label}</span>
+                      <span class="volo-cselect-item-right">
+                        {opt.badge && <span class="volo-code-chip">{opt.badge}</span>}
+                        {isAct && (
+                          <svg
+                            class="volo-cselect-check"
+                            viewBox="0 0 20 20"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2.2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                          >
+                            <polyline points="4.5 10.5 8.5 14.5 15.5 6.5" />
+                          </svg>
+                        )}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
 
   return (
     <div
@@ -126,6 +326,7 @@ export function ConsoleSelect({
       style={style}
     >
       <button
+        ref={btnRef}
         type="button"
         class="volo-cselect-btn"
         disabled={disabled}
@@ -147,51 +348,165 @@ export function ConsoleSelect({
           <polyline points="5.5 7.5 10 12.5 14.5 7.5" />
         </svg>
       </button>
-
-      {open && (
-        <div
-          class={`volo-cselect-menu ${flipUp ? "flip-up" : ""} ${autoRight ? "align-right" : ""} ${closing ? "is-closing" : ""}`}
-          role="listbox"
-        >
-          {options.map((opt, idx) => {
-            const isAct = opt.value === value;
-            const isFocused = idx === focusIdx;
-            return (
-              <button
-                key={opt.value}
-                type="button"
-                role="option"
-                aria-selected={isAct}
-                class={`volo-cselect-item ${isAct ? "active" : ""} ${isFocused ? "focused" : ""}`}
-                onMouseEnter={() => setFocusIdx(idx)}
-                onClick={() => {
-                  onChange(opt.value);
-                  closeAnimated();
-                }}
-              >
-                <span class="volo-cselect-item-text">{opt.label}</span>
-                <span class="volo-cselect-item-right">
-                  {opt.badge && <span class="volo-code-chip">{opt.badge}</span>}
-                  {isAct && (
-                    <svg
-                      class="volo-cselect-check"
-                      viewBox="0 0 20 20"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2.2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    >
-                      <polyline points="4.5 10.5 8.5 14.5 15.5 6.5" />
-                    </svg>
-                  )}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      )}
+      {portalMenu}
     </div>
+  );
+}
+
+export interface ActionMenuItem {
+  label: string;
+  onClick?: () => void;
+  href?: string;
+  target?: string;
+  download?: string;
+  danger?: boolean;
+  disabled?: boolean;
+  hidden?: boolean;
+}
+
+export function ActionMenu({
+  items,
+  label,
+}: {
+  items: ActionMenuItem[];
+  label?: string;
+}) {
+  const visibleItems = items.filter((it) => !it.hidden);
+  const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [flipUp, setFlipUp] = useState(false);
+  const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | undefined>(undefined);
+
+  const updatePos = () => {
+    if (!btnRef.current) return;
+    const rect = btnRef.current.getBoundingClientRect();
+    if (rect.bottom < 0 || rect.top > window.innerHeight) {
+      setOpen(false);
+      setClosing(false);
+      return;
+    }
+    const pos = computePortalMenuStyle(rect, { minW: 152, maxW: 260, maxH: 280, align: "right" });
+    setMenuStyle(pos.style);
+    setFlipUp(pos.flipUp);
+  };
+
+  const closeAnimated = () => {
+    if (!open || closing) return;
+    setClosing(true);
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = window.setTimeout(() => {
+      setOpen(false);
+      setClosing(false);
+    }, 130);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocDown = (ev: MouseEvent) => {
+      const target = ev.target as Node;
+      if (btnRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      closeAnimated();
+    };
+    const onEsc = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") closeAnimated();
+    };
+    const onScrollOrResize = (ev: Event) => {
+      if (ev.type === "scroll" && menuRef.current && ev.target instanceof Node && menuRef.current.contains(ev.target)) {
+        return;
+      }
+      updatePos();
+    };
+    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("keydown", onEsc);
+    window.addEventListener("resize", onScrollOrResize);
+    window.addEventListener("scroll", onScrollOrResize, true);
+    return () => {
+      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("keydown", onEsc);
+      window.removeEventListener("resize", onScrollOrResize);
+      window.removeEventListener("scroll", onScrollOrResize, true);
+    };
+  }, [open, closing]);
+
+  if (visibleItems.length === 0) return null;
+
+  const toggle = () => {
+    if (open && !closing) {
+      closeAnimated();
+    } else {
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+      setClosing(false);
+      updatePos();
+      setOpen(true);
+    }
+  };
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        class={`volo-act-btn volo-act-more ${open && !closing ? "active" : ""}`.trim()}
+        aria-haspopup="menu"
+        aria-expanded={open && !closing}
+        aria-label={label || t("ui.more_actions")}
+        title={label || t("ui.more_actions")}
+        onClick={toggle}
+      >
+        ⋯
+      </button>
+      {open &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            ref={menuRef}
+            role="menu"
+            class={`volo-cselect-menu is-portal volo-action-menu ${flipUp ? "flip-up" : ""} ${closing ? "is-closing" : ""}`}
+            style={menuStyle}
+          >
+            {visibleItems.map((it, idx) =>
+              it.href ? (
+                <a
+                  key={`${it.label}-${idx}`}
+                  role="menuitem"
+                  href={it.href}
+                  target={it.target}
+                  rel={it.target === "_blank" ? "noreferrer" : undefined}
+                  download={it.download}
+                  class={`volo-cselect-item ${it.danger ? "is-danger" : ""}`}
+                  onClick={() => closeAnimated()}
+                >
+                  <span class="volo-cselect-item-text">{it.label}</span>
+                </a>
+              ) : (
+                <button
+                  key={`${it.label}-${idx}`}
+                  type="button"
+                  role="menuitem"
+                  disabled={it.disabled}
+                  class={`volo-cselect-item ${it.danger ? "is-danger" : ""}`}
+                  onClick={() => {
+                    closeAnimated();
+                    it.onClick?.();
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{it.label}</span>
+                </button>
+              )
+            )}
+          </div>,
+          document.body
+        )}
+    </>
   );
 }
 
@@ -205,9 +520,22 @@ export interface LocalePopoverProps {
 export function LocalePopover({ value, locales, onChange, pill = true }: LocalePopoverProps) {
   const [open, setOpen] = useState(false);
   const [closing, setClosing] = useState(false);
+  const [flipUp, setFlipUp] = useState(false);
+  const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
   const current = locales.find((l) => l.code === value) || locales[0];
+
+  const updatePos = () => {
+    const el = btnRef.current || wrapRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const pos = computePortalMenuStyle(rect, { minW: 196, maxW: 280, maxH: 280, align: "right" });
+    setMenuStyle(pos.style);
+    setFlipUp(pos.flipUp);
+  };
 
   const closeAnimated = () => {
     if (!open || closing) return;
@@ -228,18 +556,28 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
   useEffect(() => {
     if (!open) return;
     const onDocDown = (ev: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(ev.target as Node)) {
-        closeAnimated();
-      }
+      const target = ev.target as Node;
+      if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      closeAnimated();
     };
     const onEsc = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") closeAnimated();
     };
+    const onScrollOrResize = (ev: Event) => {
+      if (ev.type === "scroll" && menuRef.current && ev.target instanceof Node && menuRef.current.contains(ev.target)) {
+        return;
+      }
+      updatePos();
+    };
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
+    window.addEventListener("resize", onScrollOrResize);
+    window.addEventListener("scroll", onScrollOrResize, true);
     return () => {
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
+      window.removeEventListener("resize", onScrollOrResize);
+      window.removeEventListener("scroll", onScrollOrResize, true);
     };
   }, [open, closing]);
 
@@ -249,6 +587,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
     } else {
       if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
       setClosing(false);
+      updatePos();
       setOpen(true);
     }
   };
@@ -256,6 +595,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
   return (
     <div ref={wrapRef} class={`volo-cselect volo-locale-pop ${open && !closing ? "is-open" : ""}`}>
       <button
+        ref={btnRef}
         type="button"
         class={pill ? "volo-locale-trigger" : "volo-cselect-btn"}
         title={t("shell.lang_title")}
@@ -292,47 +632,55 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
         </svg>
       </button>
 
-      {open && (
-        <div class={`volo-cselect-menu align-right volo-locale-menu ${closing ? "is-closing" : ""}`} role="listbox">
-          <div class="volo-pop-caption">{t("shell.lang_title")}</div>
-          {locales.map((loc) => {
-            const isAct = loc.code === value;
-            return (
-              <button
-                key={loc.code}
-                type="button"
-                role="option"
-                aria-selected={isAct}
-                class={`volo-cselect-item ${isAct ? "active" : ""}`}
-                onClick={() => {
-                  onChange(loc.code);
-                  closeAnimated();
-                }}
-              >
-                <span class="volo-cselect-item-text">{loc.name}</span>
-                <span class="volo-cselect-item-right">
-                  <span class="volo-code-chip" style={{ fontSize: "10.5px", padding: "1px 5px" }}>
-                    {loc.code}
+      {open &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            ref={menuRef}
+            class={`volo-cselect-menu is-portal volo-locale-menu ${flipUp ? "flip-up" : ""} ${closing ? "is-closing" : ""}`}
+            style={menuStyle}
+            role="listbox"
+          >
+            <div class="volo-pop-caption">{t("shell.lang_title")}</div>
+            {locales.map((loc) => {
+              const isAct = loc.code === value;
+              return (
+                <button
+                  key={loc.code}
+                  type="button"
+                  role="option"
+                  aria-selected={isAct}
+                  class={`volo-cselect-item ${isAct ? "active" : ""}`}
+                  onClick={() => {
+                    onChange(loc.code);
+                    closeAnimated();
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{loc.name}</span>
+                  <span class="volo-cselect-item-right">
+                    <span class="volo-code-chip" style={{ fontSize: "10.5px", padding: "1px 5px" }}>
+                      {loc.code}
+                    </span>
+                    {isAct && (
+                      <svg
+                        class="volo-cselect-check"
+                        viewBox="0 0 20 20"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2.2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      >
+                        <polyline points="4.5 10.5 8.5 14.5 15.5 6.5" />
+                      </svg>
+                    )}
                   </span>
-                  {isAct && (
-                    <svg
-                      class="volo-cselect-check"
-                      viewBox="0 0 20 20"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2.2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    >
-                      <polyline points="4.5 10.5 8.5 14.5 15.5 6.5" />
-                    </svg>
-                  )}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      )}
+                </button>
+              );
+            })}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }
@@ -480,7 +828,9 @@ export function SwitchToggle({
 
 export interface UploadButtonProps {
   accept?: string;
-  onFile: (file: File) => void;
+  onFile?: (file: File) => void;
+  onFiles?: (files: File[]) => void;
+  multiple?: boolean;
   busy?: boolean;
   disabled?: boolean;
   label: string;
@@ -493,6 +843,8 @@ export interface UploadButtonProps {
 export function UploadButton({
   accept,
   onFile,
+  onFiles,
+  multiple = false,
   busy = false,
   disabled = false,
   label,
@@ -504,6 +856,20 @@ export function UploadButton({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [dragging, setDragging] = useState(false);
   const isDisabled = busy || disabled;
+
+  const dispatchFiles = (list: FileList | null | undefined) => {
+    const arr = list ? Array.from(list) : [];
+    if (arr.length === 0) return;
+    if (onFiles) {
+      onFiles(multiple ? arr : arr.slice(0, 1));
+    } else if (onFile) {
+      if (multiple) {
+        for (const f of arr) onFile(f);
+      } else {
+        onFile(arr[0]);
+      }
+    }
+  };
 
   return (
     <>
@@ -521,8 +887,7 @@ export function UploadButton({
           e.preventDefault();
           setDragging(false);
           if (isDisabled) return;
-          const f = e.dataTransfer?.files?.[0];
-          if (f) onFile(f);
+          dispatchFiles(e.dataTransfer?.files);
         }}
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -536,15 +901,42 @@ export function UploadButton({
         ref={inputRef}
         type="file"
         accept={accept}
+        multiple={multiple}
         style={{ display: "none" }}
         disabled={isDisabled}
         onChange={(e) => {
-          const f = (e.currentTarget as HTMLInputElement).files?.[0];
-          if (f) onFile(f);
+          dispatchFiles((e.currentTarget as HTMLInputElement).files);
           (e.currentTarget as HTMLInputElement).value = "";
         }}
       />
     </>
+  );
+}
+
+export function MobileSelectAllBar({
+  checked,
+  count,
+  total,
+  onToggle,
+}: {
+  checked: boolean;
+  count: number;
+  total: number;
+  onToggle: (next: boolean) => void;
+}) {
+  if (total <= 0) return null;
+  return (
+    <div class="volo-mobile-select-bar">
+      <label class="volo-mobile-select-lbl">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onToggle((e.currentTarget as HTMLInputElement).checked)}
+        />
+        <span>{t("ui.select_all_page")}</span>
+      </label>
+      {count > 0 && <span class="volo-mini-tag">{t("ui.batch_selected", { n: count })}</span>}
+    </div>
   );
 }
 
@@ -828,11 +1220,24 @@ export interface PaginationProps {
   total: number;
   page: number;
   pageSize?: number;
+  pageSizeOptions?: number[];
+  onPageSizeChange?: (nextSize: number) => void;
   onChange: (nextPage: number) => void;
 }
 
-export function Pagination({ total, page, pageSize = 15, onChange }: PaginationProps) {
-  if (total <= pageSize) return null;
+export function Pagination({
+  total,
+  page,
+  pageSize = 20,
+  pageSizeOptions = [20, 50, 100],
+  onPageSizeChange,
+  onChange,
+}: PaginationProps) {
+  if (total <= 0) return null;
+  const minOpt = pageSizeOptions.length > 0 ? Math.min(...pageSizeOptions) : pageSize;
+  const showSizePicker = Boolean(onPageSizeChange) && (total > minOpt || pageSize !== pageSizeOptions[0]);
+  if (!onPageSizeChange && total <= pageSize) return null;
+
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(Math.max(1, page), totalPages);
 
@@ -852,46 +1257,67 @@ export function Pagination({ total, page, pageSize = 15, onChange }: PaginationP
 
   return (
     <div class="volo-pagination">
-      <span class="volo-pagination-info">
-        {t("ui.pg_summary", { total, page: safePage, pages: totalPages })}
-      </span>
-      <div class="volo-pagination-btns">
-        <button
-          type="button"
-          class="volo-pg-btn"
-          disabled={safePage <= 1}
-          onClick={() => onChange(safePage - 1)}
-        >
-          {t("ui.pg_prev")}
-        </button>
-        {buildPages().map((p, idx) =>
-          p === "..." ? (
-            <span key={`dots-${idx}`} class="volo-pg-dots">
-              …
-            </span>
-          ) : (
-            <button
-              key={p}
-              type="button"
-              class={`volo-pg-btn ${p === safePage ? "active" : ""}`}
-              onClick={() => onChange(p)}
-            >
-              {p}
-            </button>
-          )
+      <div class="volo-pagination-left">
+        <span class="volo-mini-tag">{t("ui.pg_total", { total })}</span>
+        {totalPages > 1 && (
+          <span class="volo-pagination-info">
+            {t("ui.pg_summary", { total, page: safePage, pages: totalPages })}
+          </span>
         )}
-        <button
-          type="button"
-          class="volo-pg-btn"
-          disabled={safePage >= totalPages}
-          onClick={() => onChange(safePage + 1)}
-        >
-          {t("ui.pg_next")}
-        </button>
+        {showSizePicker && onPageSizeChange && (
+          <ConsoleSelect
+            className="volo-pg-size-select"
+            searchable={false}
+            value={String(pageSize)}
+            options={pageSizeOptions.map((sz) => ({
+              value: String(sz),
+              label: t("ui.pg_per_page", { n: sz }),
+            }))}
+            onChange={(v) => onPageSizeChange(Number(v) || 20)}
+          />
+        )}
       </div>
+      {totalPages > 1 && (
+        <div class="volo-pagination-btns">
+          <button
+            type="button"
+            class="volo-pg-btn"
+            disabled={safePage <= 1}
+            onClick={() => onChange(safePage - 1)}
+          >
+            {t("ui.pg_prev")}
+          </button>
+          {buildPages().map((p, idx) =>
+            p === "..." ? (
+              <span key={`dots-${idx}`} class="volo-pg-dots">
+                …
+              </span>
+            ) : (
+              <button
+                key={p}
+                type="button"
+                class={`volo-pg-btn ${p === safePage ? "active" : ""}`}
+                onClick={() => onChange(p)}
+              >
+                {p}
+              </button>
+            )
+          )}
+          <button
+            type="button"
+            class="volo-pg-btn"
+            disabled={safePage >= totalPages}
+            onClick={() => onChange(safePage + 1)}
+          >
+            {t("ui.pg_next")}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
+
+export const PaginationBar = Pagination;
 
 let modalLockCount = 0;
 let savedBodyOverflow = "";

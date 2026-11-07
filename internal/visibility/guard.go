@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -182,7 +184,36 @@ func ArticlePath(slug string) string {
 	return "/posts/" + url.PathEscape(strings.TrimSpace(slug))
 }
 
-// DecryptArticlePassword opens raw.PasswordCiphertext with AES-256-GCM bound to "articles.password:"+raw.ID.
+func openKeyRingWithFallback(kr *config.KeyRing, ciphertext string, primaryAAD string, fallbackAADs ...string) (string, error) {
+	opened, err := kr.OpenString(ciphertext, primaryAAD)
+	if err == nil {
+		return opened, nil
+	}
+	for _, fb := range fallbackAADs {
+		if alt, fbErr := kr.OpenString(ciphertext, fb); fbErr == nil {
+			return alt, nil
+		}
+	}
+	return "", err
+}
+
+// InlineUnlockKey returns a lock-scoped passport entry key so multiple inline `:::lock pwd="..."` blocks
+// on the same article or page can be unlocked independently without overwriting each other in GuestPassport.
+func InlineUnlockKey(targetID string, pwd string) string {
+	sum := sha256.Sum256([]byte(pwd))
+	return targetID + "#" + hex.EncodeToString(sum[:6])
+}
+
+// IsAuthorOrAdmin reports whether viewer is an active Admin or the active Editor who authored raw.
+func (g *Guard) IsAuthorOrAdmin(raw domain.RawArticle, viewer *domain.User) bool {
+	if viewer == nil || viewer.Status != domain.UserStatusActive {
+		return false
+	}
+	return viewer.Role == domain.RoleAdmin || (viewer.Role == domain.RoleEditor && viewer.ID == raw.AuthorID)
+}
+
+// DecryptArticlePassword opens raw.PasswordCiphertext with AES-256-GCM bound to "articles.password:"+raw.ID
+// (with legacy fallback AAD "articles:password:"+raw.ID).
 // If decryption fails (e.g. tampered DB or changed master key), it FAILS CLOSED by returning a non-matchable sentinel!
 func (g *Guard) DecryptArticlePassword(raw domain.RawArticle) (plain string, protected bool) {
 	if strings.TrimSpace(raw.PasswordCiphertext) == "" {
@@ -191,7 +222,7 @@ func (g *Guard) DecryptArticlePassword(raw domain.RawArticle) (plain string, pro
 	if g.keys == nil {
 		return "\x00fail-closed-locked", true
 	}
-	opened, err := g.keys.OpenString(raw.PasswordCiphertext, "articles.password:"+raw.ID)
+	opened, err := openKeyRingWithFallback(g.keys, raw.PasswordCiphertext, "articles.password:"+raw.ID, "articles:password:"+raw.ID)
 	if err != nil || opened == "" {
 		return "\x00fail-closed-locked", true
 	}
@@ -207,8 +238,8 @@ func (g *Guard) SealArticlePassword(articleID string, plainPassword string) (str
 	return g.keys.SealString(trimmed, "articles.password:"+articleID)
 }
 
-// EffectiveUnlockPassword resolves the password required to unlock either a whole-article protected post
-// or an inline `:::lock pwd="..."` block on a public post.
+// EffectiveUnlockPassword resolves the primary password required to unlock either a whole-article protected post
+// or the first inline `:::lock pwd="..."` block on a public post.
 func (g *Guard) EffectiveUnlockPassword(raw domain.RawArticle) (plain string, isWholeProtected bool, hasAnyPwd bool) {
 	if p, whole := g.DecryptArticlePassword(raw); whole {
 		return p, true, true
@@ -219,23 +250,68 @@ func (g *Guard) EffectiveUnlockPassword(raw domain.RawArticle) (plain string, is
 	return "", false, false
 }
 
-// VerifyArticlePassword checks user-supplied password in constant time against the article's decrypted password
-// (or its inline `:::lock pwd="..."` password).
-func (g *Guard) VerifyArticlePassword(raw domain.RawArticle, candidate string) (string, bool) {
-	plain, _, hasPwd := g.EffectiveUnlockPassword(raw)
-	if !hasPwd || strings.HasPrefix(plain, "\x00") {
-		return "", false
+// UnlockEntryKey returns the GuestPassport entry key to store for matchedPwd on raw:
+// `raw.ID` when unlocking the whole-article password, or `InlineUnlockKey(raw.ID, matchedPwd)` for an inline lock block.
+func (g *Guard) UnlockEntryKey(raw domain.RawArticle, matchedPwd string) string {
+	if wholePwd, whole := g.DecryptArticlePassword(raw); whole && !strings.HasPrefix(wholePwd, "\x00") {
+		h1 := sha256.Sum256([]byte(wholePwd))
+		h2 := sha256.Sum256([]byte(matchedPwd))
+		if subtle.ConstantTimeCompare(h1[:], h2[:]) == 1 {
+			return raw.ID
+		}
 	}
+	return InlineUnlockKey(raw.ID, matchedPwd)
+}
+
+// VerifyArticlePassword checks user-supplied password in constant time against the article's decrypted whole-article
+// password AND any inline `:::lock pwd="..."` block passwords.
+func (g *Guard) VerifyArticlePassword(raw domain.RawArticle, candidate string) (string, bool) {
 	c := strings.TrimSpace(candidate)
 	if c == "" {
 		return "", false
 	}
-	h1 := sha256.Sum256([]byte(plain))
-	h2 := sha256.Sum256([]byte(c))
-	if subtle.ConstantTimeCompare(h1[:], h2[:]) != 1 {
+	candSum := sha256.Sum256([]byte(c))
+
+	var matched string
+	if wholePwd, whole := g.DecryptArticlePassword(raw); whole && !strings.HasPrefix(wholePwd, "\x00") {
+		wSum := sha256.Sum256([]byte(wholePwd))
+		if subtle.ConstantTimeCompare(wSum[:], candSum[:]) == 1 {
+			matched = wholePwd
+		}
+	}
+	for _, inlinePwd := range render.ExtractAllLockPasswords(raw.ContentMD) {
+		iSum := sha256.Sum256([]byte(inlinePwd))
+		if subtle.ConstantTimeCompare(iSum[:], candSum[:]) == 1 && matched == "" {
+			matched = inlinePwd
+		}
+	}
+	if matched == "" {
 		return "", false
 	}
-	return plain, true
+	return matched, true
+}
+
+// ResolveInlineUnlockedPasswords returns the map of inline `:::lock pwd="..."` passwords unlocked by r's GuestPassport.
+func (g *Guard) ResolveInlineUnlockedPasswords(r *http.Request, targetID string, contentMD string) map[string]bool {
+	unlocked := make(map[string]bool)
+	if r == nil || g.passports == nil || targetID == "" {
+		return unlocked
+	}
+	pwds := render.ExtractAllLockPasswords(contentMD)
+	if len(pwds) == 0 {
+		return unlocked
+	}
+	gp, ok := g.passports.ResolveOrHeal(nil, r, false)
+	if !ok || gp == nil {
+		return unlocked
+	}
+	for _, p := range pwds {
+		if g.passports.HasArticleUnlock(r, gp.GuestID, InlineUnlockKey(targetID, p), p) ||
+			g.passports.HasArticleUnlock(r, gp.GuestID, targetID, p) {
+			unlocked[p] = true
+		}
+	}
+	return unlocked
 }
 
 // --- Timed Passwordless ShareToken (`?preview=<exp>.<sig>`) ---
@@ -302,23 +378,32 @@ func (g *Guard) computeShareMAC(rotSecret string, articleID string, exp int64, p
 
 // UnlockStatus describes how/whether the current HTTP request has unlocked a protected article.
 type UnlockStatus struct {
-	Unlocked      bool
-	ViaShareToken bool
-	IsStaffOwner  bool
+	Unlocked            bool
+	WholeUnlocked       bool
+	AuthorOrShareBypass bool
+	UnlockedPasswords   map[string]bool
+	ViaShareToken       bool
+	IsStaffOwner        bool
 }
 
 // CheckRequestUnlock evaluates whether r is authorized to view protected content of raw.
 // Note: unsigned `env_fp` is NEVER accepted for unlocking!
 func (g *Guard) CheckRequestUnlock(r *http.Request, raw domain.RawArticle, viewer *domain.User) UnlockStatus {
-	plainPwd, isWholeProtected, hasAnyPwd := g.EffectiveUnlockPassword(raw)
-	if !isWholeProtected && !raw.HasContentLock && !hasAnyPwd && !render.ContainsLockDirective(raw.ContentMD) {
-		return UnlockStatus{Unlocked: true}
+	wholePwd, isWholeProtected := g.DecryptArticlePassword(raw)
+	inlinePwds := render.ExtractAllLockPasswords(raw.ContentMD)
+	hasAnyDirective := raw.HasContentLock || len(inlinePwds) > 0 || render.ContainsLockDirective(raw.ContentMD)
+
+	if !isWholeProtected && !hasAnyDirective {
+		return UnlockStatus{Unlocked: true, WholeUnlocked: true}
 	}
 
 	// 1. Admin or the Editor who authored the post always has access.
-	if viewer != nil && viewer.Status == domain.UserStatusActive {
-		if viewer.Role == domain.RoleAdmin || (viewer.Role == domain.RoleEditor && viewer.ID == raw.AuthorID) {
-			return UnlockStatus{Unlocked: true, IsStaffOwner: true}
+	if g.IsAuthorOrAdmin(raw, viewer) {
+		return UnlockStatus{
+			Unlocked:            true,
+			WholeUnlocked:       true,
+			AuthorOrShareBypass: true,
+			IsStaffOwner:        true,
 		}
 	}
 
@@ -329,20 +414,50 @@ func (g *Guard) CheckRequestUnlock(r *http.Request, raw domain.RawArticle, viewe
 			shareTok = strings.TrimSpace(r.Header.Get("X-Volo-Share-Token"))
 		}
 		if shareTok != "" && g.VerifyShareToken(r.Context(), raw, shareTok) {
-			return UnlockStatus{Unlocked: true, ViaShareToken: true}
-		}
-	}
-
-	// 3. Cryptographically signed GuestPassport + password-hash-bound unlock cookie.
-	if r != nil && g.passports != nil && plainPwd != "" && !strings.HasPrefix(plainPwd, "\x00") {
-		if gp, ok := g.passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
-			if g.passports.HasArticleUnlock(r, gp.GuestID, raw.ID, plainPwd) {
-				return UnlockStatus{Unlocked: true}
+			return UnlockStatus{
+				Unlocked:            true,
+				WholeUnlocked:       true,
+				AuthorOrShareBypass: true,
+				ViaShareToken:       true,
 			}
 		}
 	}
 
-	return UnlockStatus{Unlocked: false}
+	// 3. Cryptographically signed GuestPassport + password-hash-bound unlock cookie.
+	unlockedPwds := make(map[string]bool)
+	wholeUnlocked := !isWholeProtected
+	if r != nil && g.passports != nil {
+		if gp, ok := g.passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
+			if isWholeProtected && wholePwd != "" && !strings.HasPrefix(wholePwd, "\x00") {
+				if g.passports.HasArticleUnlock(r, gp.GuestID, raw.ID, wholePwd) {
+					wholeUnlocked = true
+					unlockedPwds[wholePwd] = true
+				}
+			}
+			for _, p := range inlinePwds {
+				if g.passports.HasArticleUnlock(r, gp.GuestID, InlineUnlockKey(raw.ID, p), p) ||
+					g.passports.HasArticleUnlock(r, gp.GuestID, raw.ID, p) {
+					unlockedPwds[p] = true
+				}
+			}
+		}
+	}
+
+	allUnlocked := wholeUnlocked
+	if allUnlocked && len(inlinePwds) > 0 {
+		for _, p := range inlinePwds {
+			if !unlockedPwds[p] {
+				allUnlocked = false
+				break
+			}
+		}
+	}
+
+	return UnlockStatus{
+		Unlocked:          allUnlocked && (!hasAnyDirective || len(inlinePwds) > 0 || isWholeProtected),
+		WholeUnlocked:     wholeUnlocked,
+		UnlockedPasswords: unlockedPwds,
+	}
 }
 
 // ApplyNoIndexPrivateHeaders enforces anti-indexing & anti-caching headers on ShareToken or unlocked views.
@@ -508,7 +623,7 @@ func (g *Guard) ToDetail(
 ) PublicArticleView {
 	_, isWholeProtected := g.DecryptArticlePassword(raw)
 	status := g.CheckRequestUnlock(r, raw, viewer)
-	if status.ViaShareToken || (isWholeProtected && status.Unlocked) {
+	if status.ViaShareToken || (isWholeProtected && status.WholeUnlocked) || len(status.UnlockedPasswords) > 0 {
 		ApplyNoIndexPrivateHeaders(w)
 	}
 
@@ -544,7 +659,7 @@ func (g *Guard) ToDetail(
 		view.CategorySlug = deps.Category.Slug
 	}
 
-	if isWholeProtected && !status.Unlocked {
+	if isWholeProtected && !status.WholeUnlocked {
 		view.RequiresPassword = true
 		view.Summary = g.protectedNotice(deps.Locale)
 		view.OGImageURL = deps.DefaultOGImageURL
@@ -553,27 +668,34 @@ func (g *Guard) ToDetail(
 
 	isReaderLoggedIn := viewer != nil && viewer.Status == domain.UserStatusActive
 	hasBookEmbed := strings.Contains(raw.ContentMD, ":::book")
-	cacheableDetail := !isWholeProtected && !status.ViaShareToken && !hasBookEmbed
+	unattributedUnlocked := isWholeProtected && status.WholeUnlocked
+	cacheableDetail := !isWholeProtected && !status.ViaShareToken && !status.AuthorOrShareBypass && !hasBookEmbed
 
 	var out render.Output
 	var gotCached bool
 	var outKey string
 	if cacheableDetail {
-		outKey = outputCacheKey(raw, render.RenderModeWeb, deps.Locale, status.Unlocked, isReaderLoggedIn, deps.ShowLineNumbers, deps.LookupMediaDims != nil)
+		outKey = outputCacheKey(raw, render.RenderModeWeb, deps.Locale, unattributedUnlocked, status.AuthorOrShareBypass, status.UnlockedPasswords, isReaderLoggedIn, deps.ShowLineNumbers, deps.LookupMediaDims != nil)
 		out, gotCached = g.cache.getOutput(outKey)
+	}
+	unlockedMap := status.UnlockedPasswords
+	if unlockedMap == nil {
+		unlockedMap = map[string]bool{}
 	}
 	if !gotCached {
 		out = g.renderer.Render(raw.ContentMD, render.Options{
-			Mode:             render.RenderModeWeb,
-			Locale:           deps.Locale,
-			ArticleID:        raw.ID,
-			Unlocked:         status.Unlocked,
-			IsReaderLoggedIn: isReaderLoggedIn,
-			HasAudio:         strings.TrimSpace(raw.AudioURL) != "",
-			ShowLineNumbers:  deps.ShowLineNumbers,
-			LookupBook:       deps.LookupBook,
-			ListBooks:        deps.ListBooks,
-			LookupMediaDims:  deps.LookupMediaDims,
+			Mode:                render.RenderModeWeb,
+			Locale:              deps.Locale,
+			ArticleID:           raw.ID,
+			Unlocked:            unattributedUnlocked,
+			AuthorOrShareBypass: status.AuthorOrShareBypass,
+			UnlockedPasswords:   unlockedMap,
+			IsReaderLoggedIn:    isReaderLoggedIn,
+			HasAudio:            strings.TrimSpace(raw.AudioURL) != "",
+			ShowLineNumbers:     deps.ShowLineNumbers,
+			LookupBook:          deps.LookupBook,
+			ListBooks:           deps.ListBooks,
+			LookupMediaDims:     deps.LookupMediaDims,
 		})
 		if cacheableDetail {
 			g.cache.putOutput(outKey, out)
@@ -584,7 +706,7 @@ func (g *Guard) ToDetail(
 	view.TOC = out.TOC
 	view.NeedsMath = out.NeedsMath
 	view.NeedsMermaid = out.NeedsMermaid
-	view.HasLockedSections = out.HasLockBlock && !status.Unlocked
+	view.HasLockedSections = out.HasUnresolvedLock
 	if !view.HasLockedSections {
 		view.WordCount = out.WordCount
 		view.ReadingMinutes = out.ReadingMinutes
@@ -671,7 +793,7 @@ func (g *Guard) CanAccessArticleComments(r *http.Request, raw domain.RawArticle,
 		return true
 	}
 	st := g.CheckRequestUnlock(r, raw, viewer)
-	return st.Unlocked
+	return st.WholeUnlocked
 }
 
 // --- Surface 6: RSS / Atom / Podcast Feeds ---
@@ -684,7 +806,7 @@ func (g *Guard) ToFeedItem(raw domain.RawArticle, fullOutput bool, locale string
 		return FeedItem{}, false
 	}
 
-	fKey := outputCacheKey(raw, render.RenderModeFeed, locale, false, false, false, false)
+	fKey := outputCacheKey(raw, render.RenderModeFeed, locale, false, false, nil, false, false, false)
 	feedOut, ok := g.cache.getOutput(fKey)
 	if !ok {
 		feedOut = g.renderer.Render(raw.ContentMD, render.Options{
@@ -725,7 +847,7 @@ func (g *Guard) ToFeedItem(raw domain.RawArticle, fullOutput bool, locale string
 
 	bodyHTML := feedOut.HTML
 	if !fullOutput {
-		bodyHTML = "<p>" + strings.ReplaceAll(summary, "&", "&amp;") + "</p>"
+		bodyHTML = "<p>" + html.EscapeString(summary) + "</p>"
 	}
 
 	absURL := strings.TrimRight(publicBaseURL, "/") + ArticlePath(raw.Slug)

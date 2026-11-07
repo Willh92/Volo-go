@@ -170,11 +170,39 @@ func articleDigestHex(raw domain.RawArticle) string {
 	return hex.EncodeToString(sum[:12])
 }
 
+func unlockedPasswordsDigest(pwds map[string]bool) string {
+	if len(pwds) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(pwds))
+	for k, v := range pwds {
+		if v {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	// Deterministic order
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+		}
+	}
+	h := sha256.New()
+	for _, k := range keys {
+		_, _ = h.Write([]byte(k))
+		_, _ = h.Write([]byte{0})
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:8])
+}
+
 func cardCacheKey(raw domain.RawArticle, locale string, hasDims bool) string {
 	return fmt.Sprintf("card|%s|%d|%s|%s|d=%t", raw.ID, raw.UpdatedAt, articleDigestHex(raw), locale, hasDims)
 }
 
-func outputCacheKey(raw domain.RawArticle, mode render.RenderMode, locale string, unlocked bool, isReader bool, lineNums bool, hasDims bool) string {
-	return fmt.Sprintf("out|%s|%d|%s|%s|%s|u=%t|r=%t|ln=%t|d=%t",
-		raw.ID, raw.UpdatedAt, articleDigestHex(raw), mode, locale, unlocked, isReader, lineNums, hasDims)
+func outputCacheKey(raw domain.RawArticle, mode render.RenderMode, locale string, unlocked bool, bypass bool, pwds map[string]bool, isReader bool, lineNums bool, hasDims bool) string {
+	return fmt.Sprintf("out|%s|%d|%s|%s|%s|u=%t|b=%t|p=%s|r=%t|ln=%t|d=%t",
+		raw.ID, raw.UpdatedAt, articleDigestHex(raw), mode, locale, unlocked, bypass, unlockedPasswordsDigest(pwds), isReader, lineNums, hasDims)
 }

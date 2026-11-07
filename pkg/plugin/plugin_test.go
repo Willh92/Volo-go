@@ -260,10 +260,10 @@ func TestChaosSandboxInfiniteLoopStackOverflowAndCircuitBreaker(t *testing.T) {
 	}
 }
 
-// 2. Capability Sandbox & Outbound SSRF Firewall Tests:
-// - Undeclared permissions (`kv`) are NOT injected into `volo` object (`undefined`)
-// - Outbound fetch to cloud metadata `169.254.169.254`, loopback `127.0.0.1`, DNS-rebound internal IP,
-//   and non-allowlisted host `evil.example.com` are 100% blocked!
+//  2. Capability Sandbox & Outbound SSRF Firewall Tests:
+//     - Undeclared permissions (`kv`) are NOT injected into `volo` object (`undefined`)
+//     - Outbound fetch to cloud metadata `169.254.169.254`, loopback `127.0.0.1`, DNS-rebound internal IP,
+//     and non-allowlisted host `evil.example.com` are 100% blocked!
 func TestCapabilitySandboxAndSSRFFirewall(t *testing.T) {
 	ctx := context.Background()
 	store, kr, cat, tmpDir := openTestPluginEnv(t)
@@ -1078,5 +1078,237 @@ func TestPluginSDKUpgradesZeroRuntimeSetCryptoSiteRateLimitReloadAndCommentHook(
 	resp2.Body.Close()
 	if out2.Version != "v2-hot-reloaded" {
 		t.Fatalf("expected v2-hot-reloaded after ReloadPlugin, got %q", out2.Version)
+	}
+}
+
+func TestCronCircuitBreakerNoDeadlockConcurrentSlotsAPI413AndJSVMMemoryCaps(t *testing.T) {
+	ctx := context.Background()
+	store, kr, cat, tmpDir := openTestPluginEnv(t)
+
+	// 1. JS VM RangeError memory caps (< 50ms each, zero multi-GiB allocation!).
+	memCases := []struct {
+		name string
+		src  string
+	}{
+		{
+			name: "sparse_array_100M",
+			src: `
+				var caught = "";
+				try { var a = []; a[100000000] = 1; } catch (e) { caught = e.name; }
+				if (caught !== "RangeError") { throw new Error("expected RangeError, got " + caught); }
+			`,
+		},
+		{
+			name: "string_doubling_30x",
+			src: `
+				var caught = "";
+				try {
+					var s = "x";
+					for (var i = 0; i < 30; i++) { s += s; }
+				} catch (e) { caught = e.name; }
+				if (caught !== "RangeError") { throw new Error("expected RangeError, got " + caught); }
+			`,
+		},
+		{
+			name: "string_repeat_10M",
+			src: `
+				var caught = "";
+				try { var r = "x".repeat(10000000); } catch (e) { caught = e.name; }
+				if (caught !== "RangeError") { throw new Error("expected RangeError, got " + caught); }
+			`,
+		},
+		{
+			name: "array_join_overflow",
+			src: `
+				var caught = "";
+				try {
+					var chunk = "x".repeat(4096);
+					var arr = [];
+					for (var i = 0; i < 1200; i++) { arr.push(chunk); }
+					arr.join("");
+				} catch (e) { caught = e.name; }
+				if (caught !== "RangeError") { throw new Error("expected RangeError, got " + caught); }
+			`,
+		},
+	}
+	for _, tc := range memCases {
+		start := time.Now()
+		rt := newJSRuntime()
+		prog, err := compileJSProgram(tc.name+".js", tc.src)
+		if err != nil {
+			t.Fatalf("%s compile: %v", tc.name, err)
+		}
+		if _, err := rt.RunProgram(prog); err != nil {
+			t.Fatalf("%s RunProgram: %v", tc.name, err)
+		}
+		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+			t.Fatalf("%s took too long (%v)", tc.name, elapsed)
+		}
+	}
+
+	// 2. UTF-8 rune-safe truncation in PluginLogger at 4096-byte boundary.
+	logger := NewPluginLogger(filepath.Join(tmpDir, "logs"))
+	multiByteMsg := strings.Repeat("好", 1500) // 4500 UTF-8 bytes
+	logger.Write("utf8-plug", "info", "test", multiByteMsg)
+	entries, tailErr := logger.Tail("utf8-plug", 10)
+	if tailErr != nil || len(entries) != 1 || !strings.HasSuffix(entries[0].Message, "...[truncated]") {
+		t.Fatalf("expected truncated log entry, got err=%v entries=%+v", tailErr, entries)
+	}
+	for i, r := range entries[0].Message {
+		if r == '\uFFFD' {
+			t.Fatalf("invalid UTF-8 replacement rune at byte %d after truncation", i)
+		}
+	}
+
+	// 3. Cron 5th-failure circuit breaker trip must NOT self-deadlock under concurrent RenderSlots/Handler/Close!
+	mgr := NewManager(ManagerOptions{
+		Store:       store,
+		Keys:        kr,
+		PluginsDir:  filepath.Join(tmpDir, "plugins"),
+		DataDir:     filepath.Join(tmpDir, "data"),
+		Catalog:     cat,
+		MaxFailures: 5,
+	})
+	mgr.cronBaseUnit = 2 * time.Millisecond // 5 * 2ms = 10ms cron interval
+	t.Cleanup(func() { _ = mgr.Close(ctx) })
+
+	cronDir := filepath.Join(tmpDir, "plugins", "cron-breaker")
+	if err := os.MkdirAll(cronDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	cronManifest := `{
+		"id": "cron-breaker",
+		"version": "1.0.0",
+		"runtime": "goja",
+		"entry": "main.js",
+		"name": {"en-US": "Cron Breaker"},
+		"permissions": ["cron", "http:routes"],
+		"cron": [{"name": "failjob", "interval_seconds": 5, "handler": "onFailTick"}]
+	}`
+	cronJS := `
+		module.exports = {
+			onFailTick: function() { throw new Error("cron-boom"); },
+			onRequest: function(req) { return { status: 200, body: "len=" + req.body.length }; }
+		};
+	`
+	if err := os.WriteFile(filepath.Join(cronDir, "manifest.json"), []byte(cronManifest), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cronDir, "main.js"), []byte(cronJS), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.DiscoverAndStart(ctx); err != nil {
+		t.Fatalf("DiscoverAndStart: %v", err)
+	}
+
+	// Also verify 413 Request Entity Too Large on >256 KiB request body BEFORE cron trips!
+	apiPluginDir := filepath.Join(tmpDir, "plugins", "api-limit")
+	if err := os.MkdirAll(apiPluginDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apiPluginDir, "manifest.json"), []byte(`{
+		"id": "api-limit",
+		"version": "1.0.0",
+		"runtime": "goja",
+		"entry": "main.js",
+		"name": {"en-US": "API Limit"},
+		"permissions": ["http:routes", "slots:public.footer"],
+		"ui_slots": [{"slot": "public.footer", "dynamic": true}]
+	}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apiPluginDir, "main.js"), []byte(`
+		module.exports = {
+			renderSlot: function() { return "<span>ok</span>"; },
+			onRequest: function(req) { return { status: 200, json: { size: req.body.length } }; }
+		};
+	`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.DiscoverAndStart(ctx); err != nil {
+		t.Fatalf("DiscoverAndStart api-limit: %v", err)
+	}
+	if err := mgr.Enable(ctx, "api-limit"); err != nil {
+		t.Fatalf("Enable api-limit: %v", err)
+	}
+
+	srv := httptest.NewServer(mgr.Handler())
+	defer srv.Close()
+
+	oversized := strings.NewReader(strings.Repeat("A", 256*1024+1))
+	resp413, err := http.Post(srv.URL+"/plugins/api-limit/api/upload", "text/plain", oversized)
+	if err != nil {
+		t.Fatalf("POST oversized body: %v", err)
+	}
+	resp413.Body.Close()
+	if resp413.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 Request Entity Too Large, got %d", resp413.StatusCode)
+	}
+
+	// Enable cron-breaker while hammering snapshotEnabledPlugins/RenderSlots/ReloadPlugin concurrently!
+	stopHammer := make(chan struct{})
+	var hammerWG sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		hammerWG.Add(1)
+		go func() {
+			defer hammerWG.Done()
+			for {
+				select {
+				case <-stopHammer:
+					return
+				default:
+					_ = mgr.RenderSlots(ctx, SlotPublicFooter, SlotRenderContext{Locale: "en-US"})
+					_, _ = http.Get(srv.URL + "/plugins/api-limit/api/ping")
+				}
+			}
+		}()
+	}
+	hammerWG.Add(1)
+	go func() {
+		defer hammerWG.Done()
+		for i := 0; i < 5; i++ {
+			select {
+			case <-stopHammer:
+				return
+			default:
+				_, _ = mgr.ReloadPlugin(ctx, "api-limit", "en-US")
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+
+	if err := mgr.Enable(ctx, "cron-breaker"); err != nil {
+		close(stopHammer)
+		hammerWG.Wait()
+		t.Fatalf("Enable cron-breaker: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	trippedOpen := false
+	for time.Now().Before(deadline) {
+		sum, ok := mgr.Get("cron-breaker", "en-US")
+		if ok && sum.CircuitState == CircuitOpen && !sum.IsEnabled {
+			trippedOpen = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stopHammer)
+	hammerWG.Wait()
+
+	if !trippedOpen {
+		sum, _ := mgr.Get("cron-breaker", "en-US")
+		t.Fatalf("expected cron-breaker to trip CIRCUIT_OPEN without deadlocking, got %+v", sum)
+	}
+
+	// 4. Verify Manager.PurgeExpiredKV cleans expired plugin_kv rows.
+	kv := NewKVStore(store, "api-limit")
+	kv.nowFn = func() time.Time { return time.Unix(1000, 0) }
+	if err := kv.Set(ctx, "ephemeral", "val", 10); err != nil {
+		t.Fatalf("kv.Set: %v", err)
+	}
+	purged, err := mgr.PurgeExpiredKV(ctx)
+	if err != nil || purged < 1 {
+		t.Fatalf("expected Manager.PurgeExpiredKV to purge >= 1 expired key, got purged=%d err=%v", purged, err)
 	}
 }

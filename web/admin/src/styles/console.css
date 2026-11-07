@@ -241,6 +241,7 @@ a {
 
 /* Console Shell: 240px Studio Rail + Fluid Main */
 .volo-shell {
+  --topbar-h: 80px;
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
   min-height: 100vh;
@@ -1224,7 +1225,7 @@ input[type="checkbox"] {
   color: var(--volo-muted);
   display: inline-flex;
   align-items: center;
-  max-width: 320px;
+  max-width: min(320px, 100%);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1280,6 +1281,9 @@ input[type="checkbox"] {
   background: var(--volo-raised);
   border: 1px solid var(--volo-line);
   color: var(--volo-muted);
+  max-width: min(240px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -1829,24 +1833,77 @@ input[type="checkbox"] {
   animation: volo-pop-open 0.16s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 
+.volo-cselect-menu.is-portal {
+  position: fixed;
+  min-width: 148px;
+  z-index: 1300;
+  overflow-y: auto;
+}
+
+.volo-cselect-search-wrap {
+  position: sticky;
+  top: -5px;
+  z-index: 2;
+  background: var(--volo-surface);
+  padding: 3px 2px 5px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--volo-line);
+  flex-shrink: 0;
+}
+
+.volo-cselect-search {
+  width: 100%;
+  height: 30px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  color: var(--volo-text);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.volo-cselect-search:focus {
+  border-color: var(--volo-accent);
+  background: var(--volo-surface);
+}
+
+.volo-cselect-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+}
+
+.volo-cselect-empty {
+  padding: 10px 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--volo-muted);
+}
+
 .volo-cselect-menu.is-closing {
   animation: volo-pop-close 0.14s ease forwards;
 }
 
-.volo-cselect-menu.flip-up {
+.volo-cselect-menu.flip-up:not(.is-portal) {
   top: auto;
   bottom: calc(100% + 5px);
   transform-origin: bottom center;
 }
 
-.volo-cselect-menu.align-right {
+.volo-cselect-menu.is-portal.flip-up {
+  transform-origin: bottom center;
+}
+
+.volo-cselect-menu.align-right:not(.is-portal) {
   left: auto;
   right: 0;
   transform-origin: top right;
 }
 
 .volo-locale-menu {
-  min-width: 210px;
+  min-width: min(210px, calc(100vw - 16px));
 }
 
 @keyframes volo-pop-open {
@@ -1886,11 +1943,17 @@ input[type="checkbox"] {
   gap: 10px;
   font-size: 13px;
   text-align: left;
+  text-decoration: none;
   transition: background 0.12s ease, color 0.12s ease;
 }
 
-.volo-cselect-item:hover,
-.volo-cselect-item.focused {
+.volo-cselect-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.volo-cselect-item:hover:not(:disabled),
+.volo-cselect-item.focused:not(:disabled) {
   background: var(--volo-raised);
 }
 
@@ -1898,6 +1961,23 @@ input[type="checkbox"] {
   background: var(--volo-accent-soft);
   color: var(--volo-accent);
   font-weight: 600;
+}
+
+.volo-cselect-item.is-danger {
+  color: var(--volo-danger);
+}
+
+.volo-cselect-item.is-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--volo-danger) 12%, transparent);
+  color: var(--volo-danger);
+}
+
+.volo-act-more {
+  min-width: 30px;
+  padding: 0 7px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .volo-cselect-item-text {
@@ -2138,6 +2218,26 @@ input[type="checkbox"] {
   border-top: 1px solid var(--volo-line);
 }
 
+.volo-pagination-left {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.volo-pg-size-select {
+  width: auto;
+  min-width: 108px;
+}
+
+.volo-pg-size-select .volo-cselect-btn {
+  height: 31px;
+  min-height: 31px;
+  padding: 0 9px;
+  font-size: 12px;
+  border-radius: 7px;
+}
+
 .volo-pagination-info {
   font-size: 12.5px;
   color: var(--volo-muted);
@@ -2217,10 +2317,17 @@ input[type="checkbox"] {
   border-radius: 12px 12px 0 0;
   position: sticky;
   top: 0;
-  z-index: 12;
+  z-index: 25;
+}
+
+.volo-studio-editor:not(.is-fullscreen) .volo-ed-toolbar,
+.volo-ed-shell:not(.is-fullscreen) .volo-ed-toolbar {
+  top: var(--topbar-h, 80px);
+  z-index: 25;
 }
 
 .volo-studio-editor.is-fullscreen .volo-ed-toolbar {
+  top: 0;
   border-radius: 0;
 }
 
@@ -2755,15 +2862,33 @@ input[type="checkbox"] {
   color: var(--volo-danger);
 }
 
+.volo-mobile-select-bar {
+  display: none;
+}
+
 @media (max-width: 1120px) {
   .volo-grid-3 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
-/* Responsive < 920px, < 768px & < 480px Full Mobile Compatibility */
-@media (max-width: 920px) {
+@media (min-width: 769px) and (max-width: 1120px) {
+  .volo-grid-3 > :last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 1080px) {
+  .volo-eyebrow,
+  .volo-topbar-sub {
+    display: none !important;
+  }
+}
+
+/* Responsive <= 1024px (Tablet Off-Canvas Drawer), <= 768px & <= 480px Full Mobile Compatibility */
+@media (max-width: 1024px) {
   .volo-shell {
+    --topbar-h: 60px;
     grid-template-columns: 1fr;
   }
   .volo-rail {
@@ -2791,7 +2916,7 @@ input[type="checkbox"] {
   }
   .volo-topbar {
     height: 60px;
-    padding: 0 12px;
+    padding: 0 14px;
     gap: 8px;
   }
   .volo-topbar-left {
@@ -2807,10 +2932,7 @@ input[type="checkbox"] {
     text-overflow: ellipsis;
   }
   .volo-content {
-    padding: 16px 12px 68px;
-  }
-  .volo-trend-kpis {
-    grid-template-columns: 1fr;
+    padding: 18px 16px 68px;
   }
   .volo-ed-mobile-tabs {
     display: flex;
@@ -2843,8 +2965,15 @@ input[type="checkbox"] {
   }
 }
 
-@media (max-width: 767px) {
-  .volo-grid-2, .volo-grid-3, .volo-grid-4, .volo-editor-split {
+@media (max-width: 768px) {
+  .volo-content {
+    padding: 16px 12px 68px;
+  }
+  .volo-trend-kpis,
+  .volo-grid-2,
+  .volo-grid-3,
+  .volo-grid-4,
+  .volo-editor-split {
     grid-template-columns: 1fr !important;
   }
   .volo-eyebrow,
@@ -2929,6 +3058,26 @@ input[type="checkbox"] {
   .volo-wizard-box {
     padding: 20px 15px;
   }
+  .volo-mobile-select-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    border-radius: 10px;
+    background: var(--volo-raised);
+    border: 1px solid var(--volo-line);
+    font-size: 12.5px;
+    font-weight: 560;
+  }
+  .volo-mobile-select-lbl {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+  }
   .volo-table {
     min-width: 0;
   }
@@ -2940,6 +3089,7 @@ input[type="checkbox"] {
     width: 100%;
   }
   .volo-table tr {
+    position: relative;
     padding: 12px;
     border-bottom: 1px solid var(--volo-line);
   }
@@ -2949,6 +3099,18 @@ input[type="checkbox"] {
     text-align: left !important;
     white-space: normal !important;
     width: 100% !important;
+  }
+  .volo-table td.col-check {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: auto !important;
+    padding: 0 !important;
+    border: 0 !important;
+    z-index: 2;
+  }
+  .volo-table tr:has(> td.col-check) > td:nth-child(2) {
+    padding-right: 30px;
   }
   .volo-table td[data-label] {
     display: flex;
@@ -2963,6 +3125,11 @@ input[type="checkbox"] {
     font-weight: 600;
     color: var(--volo-muted);
     flex-shrink: 0;
+  }
+  .volo-table td.col-fluid[data-label] {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
   }
   .volo-row-actions {
     justify-content: flex-end;
@@ -2984,15 +3151,11 @@ input[type="checkbox"] {
   .volo-topbar-actions {
     gap: 4px;
   }
-  .volo-eyebrow {
-    display: none;
-  }
   .volo-ed-right {
     width: 100%;
     justify-content: space-between;
   }
-  .volo-topbar .volo-pop-menu,
-  .volo-topbar .volo-locale-menu {
+  .volo-topbar .volo-pop-menu {
     position: fixed;
     top: 60px;
     left: 12px;
@@ -4133,6 +4296,48 @@ input[type="checkbox"] {
   flex-wrap: wrap;
 }
 
+.volo-batch-bar .volo-act-btn {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f6f8f7;
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.volo-batch-bar .volo-act-btn:hover {
+  background: rgba(255, 255, 255, 0.22);
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.45);
+}
+
+.volo-batch-bar .volo-act-btn.danger {
+  color: #fecaca;
+  border-color: rgba(254, 202, 202, 0.34);
+}
+
+.volo-batch-bar .volo-act-btn.danger:hover {
+  background: #dc2626;
+  color: #ffffff;
+  border-color: #dc2626;
+}
+
+.volo-batch-bar .volo-cselect-btn {
+  min-height: 30px;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.14);
+  color: #f6f8f7;
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.volo-batch-bar .volo-cselect-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
+  border-color: rgba(255, 255, 255, 0.45);
+}
+
+.volo-batch-bar .volo-cselect-chev {
+  color: rgba(246, 248, 247, 0.82);
+}
+
 /* Skeleton Shimmer & Illustrated Empty State & Confirm Preview List */
 .volo-empty-box {
   display: flex;
@@ -4199,6 +4404,165 @@ input[type="checkbox"] {
 
 .volo-editor-panels .volo-auto-grid {
   grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+}
+
+.volo-grid-2 .volo-auto-grid {
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+}
+
+.volo-table-compact {
+  min-width: 0 !important;
+  width: 100%;
+}
+
+.volo-break-any {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.volo-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.volo-quick-add-btn {
+  appearance: none;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-surface);
+  color: var(--volo-accent);
+  border-radius: 6px;
+  padding: 1px 7px;
+  font-size: 11.5px;
+  font-weight: 650;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.volo-quick-add-btn:hover {
+  border-color: var(--volo-accent);
+  background: var(--volo-accent-soft);
+}
+
+.volo-tag-pool-box {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--volo-line);
+  border-radius: 9px;
+  background: var(--volo-surface);
+}
+
+.volo-tag-pool-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 7px;
+}
+
+.volo-tag-pool-scroll {
+  max-height: 196px;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-content: flex-start;
+}
+
+/* Compact 40px Chapter Tree Rows */
+.volo-chap-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 56vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.volo-chap-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+}
+
+.volo-chap-inputs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.volo-chap-row .volo-input {
+  height: 31px;
+  min-height: 31px;
+  padding: 0 8px;
+  font-size: 12.5px;
+  flex: 1;
+  min-width: 0;
+}
+
+.volo-chap-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.volo-chap-btn {
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-surface);
+  color: var(--volo-text);
+  font-size: 12px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.volo-chap-btn:hover:not(:disabled) {
+  border-color: var(--volo-accent);
+  color: var(--volo-accent);
+}
+
+.volo-chap-btn.danger:hover:not(:disabled) {
+  border-color: var(--volo-danger);
+  color: var(--volo-danger);
+}
+
+.volo-chap-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+@media (max-width: 600px) {
+  .volo-chap-row {
+    flex-wrap: wrap;
+    padding: 7px 8px;
+  }
+  .volo-chap-inputs {
+    width: 100%;
+    flex: 1 1 100%;
+    flex-direction: column;
+  }
+  .volo-chap-acts {
+    margin-left: auto;
+  }
 }
 
 .volo-inspector-box {

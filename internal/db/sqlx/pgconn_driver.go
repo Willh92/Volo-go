@@ -160,15 +160,23 @@ func (c *pgDriverConn) QueryContext(ctx context.Context, query string, args []dr
 			return nil, err
 		}
 		mrr := c.conn.Exec(ctx, sqlText)
-		results, err := mrr.ReadAll()
-		if err != nil {
+		for mrr.NextResult() {
+			rr := mrr.ResultReader()
+			fields := rr.FieldDescriptions()
+			if len(fields) > 0 {
+				return newPGRows(rr, mrr, fields), nil
+			}
+			tag, cErr := rr.Close()
+			if cErr != nil {
+				_ = mrr.Close()
+				return nil, cErr
+			}
+			_ = tag
+		}
+		if err := mrr.Close(); err != nil {
 			return nil, err
 		}
-		if len(results) == 0 {
-			return &pgBufferedRows{}, nil
-		}
-		last := results[len(results)-1]
-		return newPGBufferedRows(last.FieldDescriptions, last.Rows), nil
+		return &pgRows{closed: true}, nil
 	}
 
 	params, err := encodePGParams(args)
@@ -176,11 +184,15 @@ func (c *pgDriverConn) QueryContext(ctx context.Context, query string, args []dr
 		return nil, err
 	}
 	rr := c.conn.ExecParams(ctx, query, params, nil, nil, nil)
-	res := rr.Read()
-	if res.Err != nil {
-		return nil, res.Err
+	fields := rr.FieldDescriptions()
+	if len(fields) == 0 {
+		tag, err := rr.Close()
+		if err != nil {
+			return nil, err
+		}
+		return &pgRows{closed: true, commandTag: tag}, nil
 	}
-	return newPGBufferedRows(res.FieldDescriptions, res.Rows), nil
+	return newPGRows(rr, nil, fields), nil
 }
 
 type pgDriverTx struct {
@@ -213,42 +225,89 @@ func (s *pgDriverStmt) Query(args []driver.Value) (driver.Rows, error) {
 	return s.conn.QueryContext(context.Background(), s.query, valuesToNamed(args))
 }
 
-type pgBufferedRows struct {
-	cols   []string
-	oids   []uint32
-	rows   [][][]byte
-	cursor int
+type pgRows struct {
+	cols       []string
+	oids       []uint32
+	rr         *pgconn.ResultReader
+	mrr        *pgconn.MultiResultReader
+	commandTag pgconn.CommandTag
+	closeErr   error
+	closed     bool
 }
 
-func newPGBufferedRows(fields []pgconn.FieldDescription, rawRows [][][]byte) *pgBufferedRows {
+func newPGRows(rr *pgconn.ResultReader, mrr *pgconn.MultiResultReader, fields []pgconn.FieldDescription) *pgRows {
 	cols := make([]string, len(fields))
 	oids := make([]uint32, len(fields))
 	for i, f := range fields {
 		cols[i] = f.Name
 		oids[i] = f.DataTypeOID
 	}
-	return &pgBufferedRows{
+	return &pgRows{
 		cols: cols,
 		oids: oids,
-		rows: rawRows,
+		rr:   rr,
+		mrr:  mrr,
 	}
 }
 
-func (r *pgBufferedRows) Columns() []string { return r.cols }
-func (r *pgBufferedRows) Close() error      { return nil }
+func (r *pgRows) Columns() []string { return r.cols }
 
-func (r *pgBufferedRows) Next(dest []driver.Value) error {
-	if r.cursor >= len(r.rows) {
+func (r *pgRows) Close() error {
+	return r.closeReader()
+}
+
+func (r *pgRows) CommandTag() pgconn.CommandTag {
+	return r.commandTag
+}
+
+func (r *pgRows) closeReader() error {
+	if r.closed {
+		return r.closeErr
+	}
+	r.closed = true
+	var firstErr error
+	if r.rr != nil {
+		tag, err := r.rr.Close()
+		r.commandTag = tag
+		r.rr = nil
+		if err != nil {
+			firstErr = err
+		}
+	}
+	if r.mrr != nil {
+		if err := r.mrr.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.mrr = nil
+	}
+	r.closeErr = firstErr
+	return r.closeErr
+}
+
+func (r *pgRows) Next(dest []driver.Value) error {
+	if r.closed || r.rr == nil {
 		return io.EOF
 	}
-	row := r.rows[r.cursor]
-	r.cursor++
+	if !r.rr.NextRow() {
+		if err := r.closeReader(); err != nil {
+			return err
+		}
+		return io.EOF
+	}
+	row := r.rr.Values()
 	for i := range dest {
 		if i >= len(row) || row[i] == nil {
 			dest[i] = nil
 			continue
 		}
-		val, err := decodePGTextValue(r.oids[i], row[i])
+		// Copy column bytes out of pgconn's reusable buffer before decoding.
+		rawCopy := make([]byte, len(row[i]))
+		copy(rawCopy, row[i])
+		var oid uint32
+		if i < len(r.oids) {
+			oid = r.oids[i]
+		}
+		val, err := decodePGTextValue(oid, rawCopy)
 		if err != nil {
 			return err
 		}

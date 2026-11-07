@@ -27,10 +27,12 @@ SERVICE_NAME="volo"
 MACOS_LABEL="io.volo.blog"
 
 ACTION="install"
+ACTION_SET="0"
 BIN_SRC=""
 ARCHIVE_SRC=""
 INSTALL_DIR=""
 INSTALL_BIN_OVERRIDE=""
+INSTALL_BIN_EXPLICIT="0"
 HOST_ADDR="127.0.0.1"
 PORT="8080"
 LISTEN_ADDR_EXPLICIT=""
@@ -38,13 +40,17 @@ UNIX_SOCKET=""
 UNIX_SOCKET_PERM="0660"
 SOCKET_GROUP=""
 DATA_DIR=""
+DATA_DIR_EXPLICIT="0"
 DATA_DIR_MODE="0750"
 ENV_FILE_OVERRIDE=""
+ENV_FILE_EXPLICIT="0"
 PUBLIC_URL="http://localhost:8080"
 ADMIN_PATH="/console"
 TRUSTED_PROXIES="127.0.0.1/32,::1/128"
 SVC_USER=""
+USER_EXPLICIT="0"
 SVC_GROUP=""
+GROUP_EXPLICIT="0"
 SUPP_GROUPS=""
 USER_MODE="0"
 FORCE_SYSTEM="0"
@@ -138,79 +144,82 @@ Options:
 EOF
 }
 
-if [ "$#" -gt 0 ]; then
-  case "$1" in
-    install|upgrade|update|uninstall|start|stop|restart|status|logs)
-      ACTION="$1"
-      [ "$ACTION" = "update" ] && ACTION="upgrade"
-      shift
-      ;;
-    -h|--help|help)
-      usage
-      exit 0
-      ;;
-  esac
-fi
+require_arg() {
+  if [ "$#" -lt 2 ]; then
+    log_err "Option '$1' requires a value."
+    exit 1
+  fi
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --bin|--binary) BIN_SRC="$2"; shift 2 ;;
+    install|upgrade|update|uninstall|start|stop|restart|status|logs)
+      if [ "$ACTION_SET" = "1" ]; then
+        log_err "Multiple commands specified ('$ACTION' and '$1')."
+        exit 1
+      fi
+      ACTION="$1"
+      [ "$ACTION" = "update" ] && ACTION="upgrade"
+      ACTION_SET="1"
+      shift 1
+      ;;
+    help|-h|--help) usage; exit 0 ;;
+    --bin|--binary) require_arg "$@"; BIN_SRC="$2"; shift 2 ;;
     --bin=*|--binary=*) BIN_SRC="${1#*=}"; shift 1 ;;
-    --archive) ARCHIVE_SRC="$2"; shift 2 ;;
+    --archive) require_arg "$@"; ARCHIVE_SRC="$2"; shift 2 ;;
     --archive=*) ARCHIVE_SRC="${1#*=}"; shift 1 ;;
-    --install-dir) INSTALL_DIR="$2"; shift 2 ;;
-    --install-dir=*) INSTALL_DIR="${1#*=}"; shift 1 ;;
-    --install-bin) INSTALL_BIN_OVERRIDE="$2"; shift 2 ;;
-    --install-bin=*) INSTALL_BIN_OVERRIDE="${1#*=}"; shift 1 ;;
+    --install-dir) require_arg "$@"; INSTALL_DIR="$2"; INSTALL_BIN_EXPLICIT="1"; shift 2 ;;
+    --install-dir=*) INSTALL_DIR="${1#*=}"; INSTALL_BIN_EXPLICIT="1"; shift 1 ;;
+    --install-bin) require_arg "$@"; INSTALL_BIN_OVERRIDE="$2"; INSTALL_BIN_EXPLICIT="1"; shift 2 ;;
+    --install-bin=*) INSTALL_BIN_OVERRIDE="${1#*=}"; INSTALL_BIN_EXPLICIT="1"; shift 1 ;;
     --download|--from-github) FORCE_DOWNLOAD="1"; shift 1 ;;
-    --version) RELEASE_VERSION="$2"; shift 2 ;;
+    --version) require_arg "$@"; RELEASE_VERSION="$2"; shift 2 ;;
     --version=*) RELEASE_VERSION="${1#*=}"; shift 1 ;;
-    --channel) RELEASE_CHANNEL="$2"; shift 2 ;;
+    --channel) require_arg "$@"; RELEASE_CHANNEL="$2"; shift 2 ;;
     --channel=*) RELEASE_CHANNEL="${1#*=}"; shift 1 ;;
-    --mirror|--github-proxy) GITHUB_MIRROR="$2"; shift 2 ;;
+    --mirror|--github-proxy) require_arg "$@"; GITHUB_MIRROR="$2"; shift 2 ;;
     --mirror=*|--github-proxy=*) GITHUB_MIRROR="${1#*=}"; shift 1 ;;
-    --repo) GITHUB_REPO="$2"; shift 2 ;;
+    --repo) require_arg "$@"; GITHUB_REPO="$2"; shift 2 ;;
     --repo=*) GITHUB_REPO="${1#*=}"; shift 1 ;;
     --no-verify|--skip-verify) SKIP_VERIFY="1"; shift 1 ;;
-    --host) HOST_ADDR="$2"; shift 2 ;;
+    --host) require_arg "$@"; HOST_ADDR="$2"; shift 2 ;;
     --host=*) HOST_ADDR="${1#*=}"; shift 1 ;;
-    --port) PORT="$2"; shift 2 ;;
+    --port) require_arg "$@"; PORT="$2"; shift 2 ;;
     --port=*) PORT="${1#*=}"; shift 1 ;;
-    --listen-addr) LISTEN_ADDR_EXPLICIT="$2"; shift 2 ;;
+    --listen-addr) require_arg "$@"; LISTEN_ADDR_EXPLICIT="$2"; shift 2 ;;
     --listen-addr=*) LISTEN_ADDR_EXPLICIT="${1#*=}"; shift 1 ;;
-    --unix-socket|--listen-socket) UNIX_SOCKET="$2"; shift 2 ;;
+    --unix-socket|--listen-socket) require_arg "$@"; UNIX_SOCKET="$2"; shift 2 ;;
     --unix-socket=*|--listen-socket=*) UNIX_SOCKET="${1#*=}"; shift 1 ;;
-    --unix-socket-perm|--socket-mode) UNIX_SOCKET_PERM="$2"; shift 2 ;;
+    --unix-socket-perm|--socket-mode) require_arg "$@"; UNIX_SOCKET_PERM="$2"; shift 2 ;;
     --unix-socket-perm=*|--socket-mode=*) UNIX_SOCKET_PERM="${1#*=}"; shift 1 ;;
-    --socket-group) SOCKET_GROUP="$2"; shift 2 ;;
+    --socket-group) require_arg "$@"; SOCKET_GROUP="$2"; shift 2 ;;
     --socket-group=*) SOCKET_GROUP="${1#*=}"; shift 1 ;;
-    --public-url) PUBLIC_URL="$2"; shift 2 ;;
+    --public-url) require_arg "$@"; PUBLIC_URL="$2"; shift 2 ;;
     --public-url=*) PUBLIC_URL="${1#*=}"; shift 1 ;;
-    --admin-path) ADMIN_PATH="$2"; shift 2 ;;
+    --admin-path) require_arg "$@"; ADMIN_PATH="$2"; shift 2 ;;
     --admin-path=*) ADMIN_PATH="${1#*=}"; shift 1 ;;
-    --trusted-proxies) TRUSTED_PROXIES="$2"; shift 2 ;;
+    --trusted-proxies) require_arg "$@"; TRUSTED_PROXIES="$2"; shift 2 ;;
     --trusted-proxies=*) TRUSTED_PROXIES="${1#*=}"; shift 1 ;;
-    --data-dir|--work-dir) DATA_DIR="$2"; shift 2 ;;
-    --data-dir=*|--work-dir=*) DATA_DIR="${1#*=}"; shift 1 ;;
-    --data-dir-mode) DATA_DIR_MODE="$2"; shift 2 ;;
+    --data-dir|--work-dir) require_arg "$@"; DATA_DIR="$2"; DATA_DIR_EXPLICIT="1"; shift 2 ;;
+    --data-dir=*|--work-dir=*) DATA_DIR="${1#*=}"; DATA_DIR_EXPLICIT="1"; shift 1 ;;
+    --data-dir-mode) require_arg "$@"; DATA_DIR_MODE="$2"; shift 2 ;;
     --data-dir-mode=*) DATA_DIR_MODE="${1#*=}"; shift 1 ;;
-    --env-file) ENV_FILE_OVERRIDE="$2"; shift 2 ;;
-    --env-file=*) ENV_FILE_OVERRIDE="${1#*=}"; shift 1 ;;
-    --user) SVC_USER="$2"; shift 2 ;;
-    --user=*) SVC_USER="${1#*=}"; shift 1 ;;
-    --group) SVC_GROUP="$2"; shift 2 ;;
-    --group=*) SVC_GROUP="${1#*=}"; shift 1 ;;
-    --supplementary-groups) SUPP_GROUPS="$2"; shift 2 ;;
+    --env-file) require_arg "$@"; ENV_FILE_OVERRIDE="$2"; ENV_FILE_EXPLICIT="1"; shift 2 ;;
+    --env-file=*) ENV_FILE_OVERRIDE="${1#*=}"; ENV_FILE_EXPLICIT="1"; shift 1 ;;
+    --user) require_arg "$@"; SVC_USER="$2"; USER_EXPLICIT="1"; shift 2 ;;
+    --user=*) SVC_USER="${1#*=}"; USER_EXPLICIT="1"; shift 1 ;;
+    --group) require_arg "$@"; SVC_GROUP="$2"; GROUP_EXPLICIT="1"; shift 2 ;;
+    --group=*) SVC_GROUP="${1#*=}"; GROUP_EXPLICIT="1"; shift 1 ;;
+    --supplementary-groups) require_arg "$@"; SUPP_GROUPS="$2"; shift 2 ;;
     --supplementary-groups=*) SUPP_GROUPS="${1#*=}"; shift 1 ;;
     --user-mode) USER_MODE="1"; shift 1 ;;
     --system) FORCE_SYSTEM="1"; USER_MODE="0"; shift 1 ;;
-    --init) INIT_OVERRIDE="$2"; shift 2 ;;
+    --init) require_arg "$@"; INIT_OVERRIDE="$2"; shift 2 ;;
     --init=*) INIT_OVERRIDE="${1#*=}"; shift 1 ;;
-    --target-os) TARGET_OS_OVERRIDE="$2"; shift 2 ;;
+    --target-os) require_arg "$@"; TARGET_OS_OVERRIDE="$2"; shift 2 ;;
     --target-os=*) TARGET_OS_OVERRIDE="${1#*=}"; shift 1 ;;
     --purge-data) PURGE_DATA="1"; shift 1 ;;
     --dry-run) DRY_RUN="1"; shift 1 ;;
-    -h|--help) usage; exit 0 ;;
     *)
       log_err "Unknown argument: $1"
       usage
@@ -218,6 +227,26 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+# Support passing --unix-socket="/path/to.sock,0660" or separate --unix-socket-perm
+if [ -n "$UNIX_SOCKET" ]; then
+  case "$UNIX_SOCKET" in
+    *,*)
+      UNIX_SOCKET_PERM="${UNIX_SOCKET##*,}"
+      UNIX_SOCKET="${UNIX_SOCKET%,*}"
+      ;;
+  esac
+  case ",${TRUSTED_PROXIES}," in
+    *,unix,*) ;;
+    *)
+      if [ -n "$TRUSTED_PROXIES" ]; then
+        TRUSTED_PROXIES="${TRUSTED_PROXIES},unix"
+      else
+        TRUSTED_PROXIES="unix"
+      fi
+      ;;
+  esac
+fi
 
 if [ "$TARGET_OS_OVERRIDE" != "auto" ]; then
   OS_RAW="$TARGET_OS_OVERRIDE"
@@ -290,6 +319,48 @@ normalize_dir_path() {
       fi
       ;;
   esac
+}
+
+validate_safe_purge_dir() {
+  CAND_DIR="$1"
+  if [ -z "$CAND_DIR" ]; then
+    log_err "Refusing to purge an empty directory path."
+    exit 1
+  fi
+  NORM_DIR="$(normalize_dir_path "$CAND_DIR")"
+  HOME_NORM=""
+  if [ -n "${HOME:-}" ]; then
+    HOME_NORM="${HOME%/}"
+  fi
+  if [ -n "$HOME_NORM" ] && [ "$NORM_DIR" = "$HOME_NORM" ]; then
+    log_err "Refusing to purge user home directory: ${NORM_DIR}"
+    exit 1
+  fi
+  case "$NORM_DIR" in
+    ""|/|/bin|/sbin|/etc|/var|/var/lib|/var/log|/run|/var/run|/usr|/usr/bin|/usr/sbin|/usr/local|/usr/local/bin|/opt|/home|/root|/tmp|/var/tmp|/Users|/Library|"/Library/Application Support"|/System)
+      log_err "Refusing to purge protected system directory: ${NORM_DIR}"
+      exit 1
+      ;;
+  esac
+}
+
+safe_remove_env_file() {
+  TARGET_E="$1"
+  [ -z "$TARGET_E" ] && return 0
+  rm -f "$TARGET_E"
+  ENV_PARENT="$(dirname "$TARGET_E")"
+  if [ "$ENV_PARENT" = "/etc/volo" ]; then
+    rmdir /etc/volo 2>/dev/null || true
+  fi
+}
+
+xml_escape() {
+  printf "%s" "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
 }
 
 is_standard_bin_dir() {
@@ -634,17 +705,48 @@ resolve_source_binary() {
   download_release_bundle
 }
 
+systemd_unescape_arg() {
+  RAW_ARG="$1"
+  case "$RAW_ARG" in
+    \"*\")
+      INNER="${RAW_ARG#\"}"
+      INNER="${INNER%\"}"
+      printf "%s" "$INNER" | sed 's/\\"/"/g; s/\\\\/\\/g'
+      ;;
+    \'*\')
+      INNER="${RAW_ARG#\'}"
+      printf "%s" "${INNER%\'}"
+      ;;
+    *)
+      printf "%s" "$RAW_ARG"
+      ;;
+  esac
+}
+
 extract_systemd_exec_bin() {
   U_FILE="$1"
   if [ -f "$U_FILE" ]; then
-    awk '
+    RAW_BIN="$(awk '
       /^ExecStart=/ {
         line = substr($0, 11)
         sub(/^[ \t@+-]+/, "", line)
         if (substr(line, 1, 1) == "\"") {
-          sub(/^"/, "", line)
-          sub(/".*$/, "", line)
-          print line
+          out = ""
+          esc = 0
+          for (i = 2; i <= length(line); i++) {
+            ch = substr(line, i, 1)
+            if (esc) {
+              out = out ch
+              esc = 0
+            } else if (ch == "\\") {
+              esc = 1
+            } else if (ch == "\"") {
+              break
+            } else {
+              out = out ch
+            }
+          }
+          print out
           exit
         } else if (substr(line, 1, 1) == "\047") {
           sub(/^\047/, "", line)
@@ -657,18 +759,117 @@ extract_systemd_exec_bin() {
           exit
         }
       }
-    ' "$U_FILE"
+    ' "$U_FILE")"
+    printf "%s" "$RAW_BIN"
   fi
 }
 
-extract_systemd_workdir() {
+extract_systemd_field() {
   U_FILE="$1"
-  if [ -f "$U_FILE" ]; then
-    sed -n 's/^WorkingDirectory=//p' "$U_FILE" | head -n 1 | sed 's/^"//; s/"$//'
+  F_KEY="$2"
+  [ ! -f "$U_FILE" ] && return 0
+  RAW_VAL="$(sed -n "s/^${F_KEY}=//p" "$U_FILE" | head -n 1)"
+  [ -z "$RAW_VAL" ] && return 0
+  if [ "$F_KEY" = "EnvironmentFile" ]; then
+    RAW_VAL="${RAW_VAL#-}"
+  fi
+  systemd_unescape_arg "$RAW_VAL"
+}
+
+recover_systemd_unit_config() {
+  U_FILE="$1"
+  [ ! -f "$U_FILE" ] && return 0
+  if [ "$INSTALL_BIN_EXPLICIT" = "0" ]; then
+    EXISTING_BIN="$(extract_systemd_exec_bin "$U_FILE")"
+    [ -n "$EXISTING_BIN" ] && INSTALL_BIN="$EXISTING_BIN"
+  fi
+  if [ "$DATA_DIR_EXPLICIT" = "0" ]; then
+    EXISTING_WD="$(extract_systemd_field "$U_FILE" "WorkingDirectory")"
+    [ -n "$EXISTING_WD" ] && DATA_DIR="$EXISTING_WD"
+  fi
+  if [ "$ENV_FILE_EXPLICIT" = "0" ]; then
+    EXISTING_EF="$(extract_systemd_field "$U_FILE" "EnvironmentFile")"
+    [ -n "$EXISTING_EF" ] && ENV_FILE="$EXISTING_EF"
+  fi
+  if [ "$USER_MODE" = "0" ]; then
+    if [ "$USER_EXPLICIT" = "0" ]; then
+      EXISTING_U="$(extract_systemd_field "$U_FILE" "User")"
+      [ -n "$EXISTING_U" ] && SVC_USER="$EXISTING_U"
+    fi
+    if [ "$GROUP_EXPLICIT" = "0" ]; then
+      EXISTING_G="$(extract_systemd_field "$U_FILE" "Group")"
+      [ -n "$EXISTING_G" ] && SVC_GROUP="$EXISTING_G"
+    fi
   fi
 }
 
-extract_macos_plist_bin() {
+extract_openrc_env_file() {
+  INIT_F="$1"
+  [ ! -f "$INIT_F" ] && return 0
+  awk '
+    /^command_args="/ {
+      line = substr($0, 15)
+      sub(/"[ \t]*$/, "", line)
+      gsub(/\\"/, "\"", line)
+      idx = index(line, "--env-file ")
+      if (idx > 0) {
+        rest = substr(line, idx + 11)
+        sub(/^[ \t]+/, "", rest)
+        if (substr(rest, 1, 1) == "\"") {
+          sub(/^"/, "", rest)
+          sub(/".*$/, "", rest)
+        } else {
+          sub(/[ \t].*$/, "", rest)
+        }
+        print rest
+        exit
+      }
+    }
+  ' "$INIT_F"
+}
+
+recover_openrc_config() {
+  INIT_F="$1"
+  [ ! -f "$INIT_F" ] && return 0
+  if [ "$INSTALL_BIN_EXPLICIT" = "0" ]; then
+    EXISTING_BIN="$(sed -n 's/^command="\([^"]*\)".*/\1/p' "$INIT_F" | head -n 1)"
+    [ -n "$EXISTING_BIN" ] && INSTALL_BIN="$EXISTING_BIN"
+  fi
+  if [ "$DATA_DIR_EXPLICIT" = "0" ]; then
+    EXISTING_WD="$(sed -n 's/^directory="\([^"]*\)".*/\1/p' "$INIT_F" | head -n 1)"
+    [ -n "$EXISTING_WD" ] && DATA_DIR="$EXISTING_WD"
+  fi
+  if [ "$ENV_FILE_EXPLICIT" = "0" ]; then
+    EXISTING_EF="$(extract_openrc_env_file "$INIT_F")"
+    [ -n "$EXISTING_EF" ] && ENV_FILE="$EXISTING_EF"
+  fi
+  EXISTING_CU="$(sed -n 's/^command_user="\([^"]*\)".*/\1/p' "$INIT_F" | head -n 1)"
+  if [ -n "$EXISTING_CU" ]; then
+    if [ "$USER_EXPLICIT" = "0" ]; then
+      PARSED_U="${EXISTING_CU%%:*}"
+      [ -n "$PARSED_U" ] && SVC_USER="$PARSED_U"
+    fi
+    case "$EXISTING_CU" in
+      *:*)
+        if [ "$GROUP_EXPLICIT" = "0" ]; then
+          PARSED_G="${EXISTING_CU#*:}"
+          [ -n "$PARSED_G" ] && SVC_GROUP="$PARSED_G"
+        fi
+        ;;
+    esac
+  fi
+}
+
+xml_unescape() {
+  printf "%s" "$1" | sed \
+    -e "s/&apos;/'/g" \
+    -e 's/&quot;/"/g' \
+    -e 's/&gt;/>/g' \
+    -e 's/&lt;/</g' \
+    -e 's/&amp;/\&/g'
+}
+
+read_plist_xml() {
   P_FILE="$1"
   [ ! -f "$P_FILE" ] && return 0
   PLIST_XML=""
@@ -676,7 +877,14 @@ extract_macos_plist_bin() {
     PLIST_XML="$(plutil -convert xml1 -o - "$P_FILE" 2>/dev/null || true)"
   fi
   [ -z "$PLIST_XML" ] && PLIST_XML="$(cat "$P_FILE" 2>/dev/null || true)"
-  printf "%s\n" "$PLIST_XML" | awk '
+  printf "%s\n" "$PLIST_XML"
+}
+
+extract_macos_plist_prog_arg() {
+  P_FILE="$1"
+  MODE_SEL="$2"
+  [ ! -f "$P_FILE" ] && return 0
+  RAW_OUT="$(read_plist_xml "$P_FILE" | awk -v mode="$MODE_SEL" '
     {
       line = $0
       if (!in_prog && match(line, /<key>[ \t]*ProgramArguments[ \t]*<\/key>/)) {
@@ -687,14 +895,72 @@ extract_macos_plist_bin() {
         in_arr = 1
         line = substr(line, RSTART + RLENGTH)
       }
-      if (in_arr && match(line, /<string>[^<]+<\/string>/)) {
+      while (in_arr && match(line, /<string>[^<]*<\/string>/)) {
         val = substr(line, RSTART + 8, RLENGTH - 17)
-        print val
-        exit
+        idx++
+        if (mode == "bin" && idx == 1) {
+          print val
+          exit
+        }
+        if (mode == "env" && prev == "--env-file") {
+          print val
+          exit
+        }
+        prev = val
+        line = substr(line, RSTART + RLENGTH)
       }
       if (in_arr && /<\/array>/) { exit }
     }
-  '
+  ')"
+  [ -n "$RAW_OUT" ] && xml_unescape "$RAW_OUT"
+}
+
+extract_macos_plist_key_string() {
+  P_FILE="$1"
+  K_NAME="$2"
+  [ ! -f "$P_FILE" ] && return 0
+  RAW_OUT="$(read_plist_xml "$P_FILE" | awk -v k="$K_NAME" '
+    {
+      line = $0
+      pat = "<key>[ \t]*" k "[ \t]*</key>"
+      if (!found_k && match(line, pat)) {
+        found_k = 1
+        line = substr(line, RSTART + RLENGTH)
+      }
+      if (found_k && match(line, /<string>[^<]*<\/string>/)) {
+        print substr(line, RSTART + 8, RLENGTH - 17)
+        exit
+      }
+    }
+  ')"
+  [ -n "$RAW_OUT" ] && xml_unescape "$RAW_OUT"
+}
+
+recover_macos_plist_config() {
+  P_FILE="$1"
+  [ ! -f "$P_FILE" ] && return 0
+  if [ "$INSTALL_BIN_EXPLICIT" = "0" ]; then
+    EXISTING_BIN="$(extract_macos_plist_prog_arg "$P_FILE" "bin")"
+    [ -n "$EXISTING_BIN" ] && INSTALL_BIN="$EXISTING_BIN"
+  fi
+  if [ "$DATA_DIR_EXPLICIT" = "0" ]; then
+    EXISTING_WD="$(extract_macos_plist_key_string "$P_FILE" "WorkingDirectory")"
+    [ -n "$EXISTING_WD" ] && DATA_DIR="$EXISTING_WD"
+  fi
+  if [ "$ENV_FILE_EXPLICIT" = "0" ]; then
+    EXISTING_EF="$(extract_macos_plist_prog_arg "$P_FILE" "env")"
+    [ -n "$EXISTING_EF" ] && ENV_FILE="$EXISTING_EF"
+  fi
+  if [ "$USER_MODE" = "0" ]; then
+    if [ "$USER_EXPLICIT" = "0" ]; then
+      EXISTING_U="$(extract_macos_plist_key_string "$P_FILE" "UserName")"
+      [ -n "$EXISTING_U" ] && SVC_USER="$EXISTING_U"
+    fi
+    if [ "$GROUP_EXPLICIT" = "0" ]; then
+      EXISTING_G="$(extract_macos_plist_key_string "$P_FILE" "GroupName")"
+      [ -n "$EXISTING_G" ] && SVC_GROUP="$EXISTING_G"
+    fi
+  fi
 }
 
 systemd_escape_dq() {
@@ -703,7 +969,7 @@ systemd_escape_dq() {
 
 format_systemd_arg() {
   case "$1" in
-    *[[:space:]]*) printf '"%s"' "$(systemd_escape_dq "$1")" ;;
+    *[[:space:]\"]*) printf '"%s"' "$(systemd_escape_dq "$1")" ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -719,18 +985,25 @@ write_volo_env_if_missing() {
     return 0
   fi
 
+  if [ -n "$UNIX_SOCKET" ]; then
+    SOCKET_ENV_LINE="VOLO_LISTEN_SOCKET=${UNIX_SOCKET},${UNIX_SOCKET_PERM}"
+  else
+    SOCKET_ENV_LINE="# VOLO_LISTEN_SOCKET=/run/volo/volo.sock,0660"
+  fi
+
   ENV_BODY="# Generated by Volo-go install-service.sh
 VOLO_LISTEN_ADDR=${LISTEN_ADDR}
-VOLO_LISTEN_SOCKET=${UNIX_SOCKET}
-VOLO_LISTEN_SOCKET_MODE=${UNIX_SOCKET_PERM}
+${SOCKET_ENV_LINE}
 VOLO_PUBLIC_URL=${PUBLIC_URL}
 VOLO_TRUSTED_PROXIES=${TRUSTED_PROXIES}
 VOLO_ADMIN_PATH=${ADMIN_PATH}
 VOLO_SECRET_KEY=<generated-256-bit-secret>
 VOLO_GEO_ACCESS_ENABLED=true
 
-VOLO_DB_DRIVER=sqlite
-VOLO_DB_DSN=${TARGET_ROOT}/data/volo.db
+# Database defaults to SQLite (<VOLO_DATA_DIR>/volo.db) or Setup Wizard data/db.json.
+# Uncomment only to force-override via environment variables:
+# VOLO_DB_DRIVER=sqlite
+# VOLO_DB_DSN=${TARGET_ROOT}/data/volo.db
 
 VOLO_DATA_DIR=${TARGET_ROOT}/data
 VOLO_UPLOAD_DIR=${TARGET_ROOT}/data/uploads
@@ -857,9 +1130,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${DATA_DIR}
-EnvironmentFile=-${ENV_FILE}
-ExecStart=$(format_systemd_arg "$INSTALL_BIN") serve
+WorkingDirectory=$(format_systemd_arg "$DATA_DIR")
+EnvironmentFile=-$(format_systemd_arg "$ENV_FILE")
+ExecStart=$(format_systemd_arg "$INSTALL_BIN") serve --env-file $(format_systemd_arg "$ENV_FILE")
 KillSignal=SIGTERM
 TimeoutStopSec=20
 Restart=on-failure
@@ -885,12 +1158,7 @@ WantedBy=default.target"
         log_info "Listen   : ${LISTEN_DISPLAY}"
         ;;
       upgrade)
-        if [ -z "$INSTALL_DIR" ] && [ -z "$INSTALL_BIN_OVERRIDE" ] && [ -f "$UNIT_FILE" ]; then
-          EXISTING_BIN="$(extract_systemd_exec_bin "$UNIT_FILE")"
-          [ -n "$EXISTING_BIN" ] && INSTALL_BIN="$EXISTING_BIN"
-          EXISTING_WD="$(extract_systemd_workdir "$UNIT_FILE")"
-          [ -n "$EXISTING_WD" ] && DATA_DIR="$EXISTING_WD"
-        fi
+        recover_systemd_unit_config "$UNIT_FILE"
         resolve_source_binary
         [ -d "$DATA_DIR" ] && sync_bundled_extensions "$DATA_DIR"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
@@ -907,11 +1175,23 @@ WantedBy=default.target"
         fi
         ;;
       uninstall)
-        systemctl --user disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
-        rm -f "$UNIT_FILE"
-        systemctl --user daemon-reload || true
+        recover_systemd_unit_config "$UNIT_FILE"
         if [ "$PURGE_DATA" = "1" ]; then
-          rm -rf "$DATA_DIR" "$ENV_FILE"
+          validate_safe_purge_dir "$DATA_DIR"
+        fi
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] systemctl --user disable --now %s.service && rm -f '%s' '%s'\n" "$SERVICE_NAME" "$UNIT_FILE" "$INSTALL_BIN"
+          if [ "$PURGE_DATA" = "1" ]; then
+            printf "[dry-run] rm -rf '%s' && rm -f '%s'\n" "$DATA_DIR" "$ENV_FILE"
+          fi
+          return 0
+        fi
+        systemctl --user disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+        rm -f "$UNIT_FILE" "$INSTALL_BIN"
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        if [ "$PURGE_DATA" = "1" ]; then
+          rm -rf "$DATA_DIR"
+          safe_remove_env_file "$ENV_FILE"
           log_ok "Uninstalled user service ${SERVICE_NAME} and purged ${DATA_DIR}."
         else
           log_ok "Uninstalled user service ${SERVICE_NAME} (data preserved at ${DATA_DIR})."
@@ -954,21 +1234,25 @@ WantedBy=default.target"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0640" "root:${SVC_GROUP}"
 
-        SUPP_LINE=""
+        SUPP_BLOCK=""
         if [ -n "$SUPP_GROUPS" ]; then
           SUPP_SPACED="$(printf "%s" "$SUPP_GROUPS" | tr ',' ' ')"
-          SUPP_LINE="SupplementaryGroups=${SUPP_SPACED}"
+          SUPP_BLOCK="SupplementaryGroups=${SUPP_SPACED}
+"
         elif [ -n "$SOCKET_GROUP" ] && [ "$SOCKET_GROUP" != "$SVC_GROUP" ]; then
-          SUPP_LINE="SupplementaryGroups=${SOCKET_GROUP}"
+          SUPP_BLOCK="SupplementaryGroups=${SOCKET_GROUP}
+"
         fi
 
-        RW_PATHS="${DATA_DIR} /run/volo"
+        RW_PATHS="$(format_systemd_arg "$DATA_DIR") /run/volo"
+        EXEC_PRE_BLOCK=""
         if [ -n "$UNIX_SOCKET" ]; then
-          SOCK_PARENT="$(dirname "$UNIX_SOCKET")"
-          case " $RW_PATHS " in
-            *" $SOCK_PARENT "*) ;;
-            *) RW_PATHS="${RW_PATHS} ${SOCK_PARENT}" ;;
-          esac
+          SOCK_PARENT="$(normalize_dir_path "$(dirname "$UNIX_SOCKET")")"
+          if [ "$SOCK_PARENT" != "/run/volo" ] && [ "$SOCK_PARENT" != "$DATA_DIR" ]; then
+            RW_PATHS="${RW_PATHS} $(format_systemd_arg "$SOCK_PARENT")"
+            EXEC_PRE_BLOCK="ExecStartPre=+install -d -m 0755 -o ${SVC_USER} -g ${SOCKET_GROUP:-$SVC_GROUP} $(format_systemd_arg "$SOCK_PARENT")
+"
+          fi
         fi
 
         UNIT_CONTENT="[Unit]
@@ -981,10 +1265,9 @@ Wants=network-online.target
 Type=simple
 User=${SVC_USER}
 Group=${SVC_GROUP}
-${SUPP_LINE}
-WorkingDirectory=${DATA_DIR}
-EnvironmentFile=-${ENV_FILE}
-ExecStart=$(format_systemd_arg "$INSTALL_BIN") serve
+${SUPP_BLOCK}WorkingDirectory=$(format_systemd_arg "$DATA_DIR")
+EnvironmentFile=-$(format_systemd_arg "$ENV_FILE")
+${EXEC_PRE_BLOCK}ExecStart=$(format_systemd_arg "$INSTALL_BIN") serve --env-file $(format_systemd_arg "$ENV_FILE")
 KillSignal=SIGTERM
 TimeoutStopSec=20
 Restart=on-failure
@@ -1035,12 +1318,7 @@ WantedBy=multi-user.target"
         log_info "Listen   : ${LISTEN_DISPLAY}"
         ;;
       upgrade)
-        if [ -z "$INSTALL_DIR" ] && [ -z "$INSTALL_BIN_OVERRIDE" ] && [ -f "$UNIT_FILE" ]; then
-          EXISTING_BIN="$(extract_systemd_exec_bin "$UNIT_FILE")"
-          [ -n "$EXISTING_BIN" ] && INSTALL_BIN="$EXISTING_BIN"
-          EXISTING_WD="$(extract_systemd_workdir "$UNIT_FILE")"
-          [ -n "$EXISTING_WD" ] && DATA_DIR="$EXISTING_WD"
-        fi
+        recover_systemd_unit_config "$UNIT_FILE"
         resolve_source_binary
         if [ -d "$DATA_DIR" ]; then
           sync_bundled_extensions "$DATA_DIR"
@@ -1060,15 +1338,23 @@ WantedBy=multi-user.target"
         fi
         ;;
       uninstall)
+        recover_systemd_unit_config "$UNIT_FILE"
+        if [ "$PURGE_DATA" = "1" ]; then
+          validate_safe_purge_dir "$DATA_DIR"
+        fi
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] systemctl disable --now %s.service && rm -f %s\n" "$SERVICE_NAME" "$UNIT_FILE"
+          printf "[dry-run] systemctl disable --now %s.service && rm -f '%s' '%s'\n" "$SERVICE_NAME" "$UNIT_FILE" "$INSTALL_BIN"
+          if [ "$PURGE_DATA" = "1" ]; then
+            printf "[dry-run] rm -rf '%s' && safe_remove_env_file '%s'\n" "$DATA_DIR" "$ENV_FILE"
+          fi
           return 0
         fi
         systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
         rm -f "$UNIT_FILE" "$INSTALL_BIN"
-        systemctl daemon-reload
+        systemctl daemon-reload >/dev/null 2>&1 || true
         if [ "$PURGE_DATA" = "1" ]; then
-          rm -rf "$DATA_DIR" "$(dirname "$ENV_FILE")"
+          rm -rf "$DATA_DIR"
+          safe_remove_env_file "$ENV_FILE"
           log_ok "Removed ${SERVICE_NAME}.service and purged ${DATA_DIR}."
         else
           log_ok "Removed systemd unit ${UNIT_FILE} (config & data preserved in ${ENV_FILE} and ${DATA_DIR})."
@@ -1093,11 +1379,20 @@ WantedBy=multi-user.target"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0640" "root:${SVC_GROUP}"
 
+        OPENRC_SOCK_CHECK=""
+        if [ -n "$UNIX_SOCKET" ]; then
+          SOCK_PARENT="$(normalize_dir_path "$(dirname "$UNIX_SOCKET")")"
+          if [ "$SOCK_PARENT" != "/run/volo" ] && [ "$SOCK_PARENT" != "$DATA_DIR" ]; then
+            OPENRC_SOCK_CHECK="
+    checkpath --directory --owner \"${SVC_USER}:${SOCKET_GROUP:-$SVC_GROUP}\" --mode 0755 \"${SOCK_PARENT}\""
+          fi
+        fi
+
         OPENRC_CONTENT="#!/sbin/openrc-run
 name=\"Volo-go\"
 description=\"Volo-go Pure-Go Sovereign Blog Engine\"
 command=\"${INSTALL_BIN}\"
-command_args=\"serve --env-file ${ENV_FILE}\"
+command_args=\"serve --env-file \\\"${ENV_FILE}\\\"\"
 command_user=\"${SVC_USER}:${SVC_GROUP}\"
 directory=\"${DATA_DIR}\"
 command_background=\"yes\"
@@ -1115,12 +1410,18 @@ depend() {
 
 start_pre() {
     checkpath --directory --owner \"\${command_user}\" --mode 0755 /run/volo /var/log/volo
-    checkpath --directory --owner \"\${command_user}\" --mode ${DATA_DIR_MODE} \"${DATA_DIR}\"
+    checkpath --directory --owner \"\${command_user}\" --mode ${DATA_DIR_MODE} \"${DATA_DIR}\"${OPENRC_SOCK_CHECK}
 }"
         if [ "$DRY_RUN" = "1" ]; then
           printf "[dry-run] write %s:\n%s\n" "$INIT_SCRIPT" "$OPENRC_CONTENT"
           printf "[dry-run] rc-update add %s default && rc-service %s restart\n" "$SERVICE_NAME" "$SERVICE_NAME"
           return 0
+        fi
+        if [ -n "$UNIX_SOCKET" ]; then
+          SOCK_PARENT="$(dirname "$UNIX_SOCKET")"
+          mkdir -p "$SOCK_PARENT"
+          chown "${SVC_USER}:${SOCKET_GROUP:-$SVC_GROUP}" "$SOCK_PARENT" 2>/dev/null || true
+          chmod 0755 "$SOCK_PARENT" 2>/dev/null || true
         fi
         chown -R "${SVC_USER}:${SVC_GROUP}" "$DATA_DIR"
         chmod "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data"
@@ -1136,12 +1437,7 @@ start_pre() {
         log_info "Listen   : ${LISTEN_DISPLAY}"
         ;;
       upgrade)
-        if [ -z "$INSTALL_DIR" ] && [ -z "$INSTALL_BIN_OVERRIDE" ] && [ -f "$INIT_SCRIPT" ]; then
-          EXISTING_BIN="$(sed -n 's/^command="\([^"]*\)".*/\1/p' "$INIT_SCRIPT" | head -n 1)"
-          [ -n "$EXISTING_BIN" ] && INSTALL_BIN="$EXISTING_BIN"
-          EXISTING_WD="$(sed -n 's/^directory="\([^"]*\)".*/\1/p' "$INIT_SCRIPT" | head -n 1)"
-          [ -n "$EXISTING_WD" ] && DATA_DIR="$EXISTING_WD"
-        fi
+        recover_openrc_config "$INIT_SCRIPT"
         resolve_source_binary
         if [ -d "$DATA_DIR" ]; then
           sync_bundled_extensions "$DATA_DIR"
@@ -1160,11 +1456,23 @@ start_pre() {
         fi
         ;;
       uninstall)
+        recover_openrc_config "$INIT_SCRIPT"
+        if [ "$PURGE_DATA" = "1" ]; then
+          validate_safe_purge_dir "$DATA_DIR"
+        fi
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] rc-service %s stop && rc-update del %s default && rm -f '%s' '%s'\n" "$SERVICE_NAME" "$SERVICE_NAME" "$INIT_SCRIPT" "$INSTALL_BIN"
+          if [ "$PURGE_DATA" = "1" ]; then
+            printf "[dry-run] rm -rf '%s' && safe_remove_env_file '%s'\n" "$DATA_DIR" "$ENV_FILE"
+          fi
+          return 0
+        fi
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
         rm -f "$INIT_SCRIPT" "$INSTALL_BIN"
         if [ "$PURGE_DATA" = "1" ]; then
-          rm -rf "$DATA_DIR" "$(dirname "$ENV_FILE")"
+          rm -rf "$DATA_DIR"
+          safe_remove_env_file "$ENV_FILE"
           log_ok "Removed OpenRC service ${SERVICE_NAME} and purged ${DATA_DIR}."
         else
           log_ok "Removed OpenRC service ${SERVICE_NAME} (data preserved in ${DATA_DIR})."
@@ -1183,6 +1491,18 @@ start_pre() {
 # ==============================================================================
 # macOS Implementation (launchd LaunchDaemons & LaunchAgents)
 # ==============================================================================
+compute_macos_owner() {
+  if [ "$USER_MODE" = "0" ] && [ -n "$SVC_USER" ]; then
+    if [ -n "$SVC_GROUP" ]; then
+      printf "%s:%s" "$SVC_USER" "$SVC_GROUP"
+    else
+      printf "%s" "$SVC_USER"
+    fi
+  else
+    printf ""
+  fi
+}
+
 run_macos() {
   if [ "$USER_MODE" = "1" ]; then
     if [ -n "$INSTALL_BIN_OVERRIDE" ]; then
@@ -1223,33 +1543,47 @@ run_macos() {
       prepare_work_dirs "$DATA_DIR"
       sync_bundled_extensions "$DATA_DIR"
       copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
-      write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0600" ""
+      MACOS_OWNER="$(compute_macos_owner)"
+      write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0600" "$MACOS_OWNER"
 
-      ROLE_PLIST_KEYS=""
+      ROLE_PLIST_BLOCK=""
       if [ "$USER_MODE" = "0" ]; then
-        [ -n "$SVC_USER" ] && ROLE_PLIST_KEYS="  <key>UserName</key>
-  <string>${SVC_USER}</string>"
-        [ -n "$SVC_GROUP" ] && ROLE_PLIST_KEYS="${ROLE_PLIST_KEYS}
-  <key>GroupName</key>
-  <string>${SVC_GROUP}</string>"
+        if [ -n "$SVC_USER" ]; then
+          ESC_U="$(xml_escape "$SVC_USER")"
+          ROLE_PLIST_BLOCK="  <key>UserName</key>
+  <string>${ESC_U}</string>
+"
+        fi
+        if [ -n "$SVC_GROUP" ]; then
+          ESC_G="$(xml_escape "$SVC_GROUP")"
+          ROLE_PLIST_BLOCK="${ROLE_PLIST_BLOCK}  <key>GroupName</key>
+  <string>${ESC_G}</string>
+"
+        fi
       fi
+
+      ESC_LABEL="$(xml_escape "$MACOS_LABEL")"
+      ESC_BIN="$(xml_escape "$INSTALL_BIN")"
+      ESC_ENV="$(xml_escape "$ENV_FILE")"
+      ESC_DATA="$(xml_escape "$DATA_DIR")"
+      ESC_OUT="$(xml_escape "$OUT_LOG")"
+      ESC_ERR="$(xml_escape "$ERR_LOG")"
 
       PLIST_CONTENT="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\">
 <dict>
   <key>Label</key>
-  <string>${MACOS_LABEL}</string>
-${ROLE_PLIST_KEYS}
-  <key>ProgramArguments</key>
+  <string>${ESC_LABEL}</string>
+${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
   <array>
-    <string>${INSTALL_BIN}</string>
+    <string>${ESC_BIN}</string>
     <string>serve</string>
     <string>--env-file</string>
-    <string>${ENV_FILE}</string>
+    <string>${ESC_ENV}</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${DATA_DIR}</string>
+  <string>${ESC_DATA}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -1265,19 +1599,35 @@ ${ROLE_PLIST_KEYS}
     <integer>65535</integer>
   </dict>
   <key>StandardOutPath</key>
-  <string>${OUT_LOG}</string>
+  <string>${ESC_OUT}</string>
   <key>StandardErrorPath</key>
-  <string>${ERR_LOG}</string>
+  <string>${ESC_ERR}</string>
 </dict>
 </plist>"
 
       if [ "$DRY_RUN" = "1" ]; then
+        if [ -n "$MACOS_OWNER" ]; then
+          printf "[dry-run] chown -R %s '%s' '%s'\n" "$MACOS_OWNER" "$DATA_DIR" "$LOG_DIR"
+        elif [ "$USER_MODE" = "0" ] && [ -n "$SVC_GROUP" ]; then
+          printf "[dry-run] chgrp -R %s '%s' '%s' '%s'\n" "$SVC_GROUP" "$DATA_DIR" "$LOG_DIR" "$ENV_FILE"
+        fi
         printf "[dry-run] write %s:\n%s\n" "$PLIST_FILE" "$PLIST_CONTENT"
         printf "[dry-run] launchctl bootstrap %s '%s'\n" "$DOMAIN_TARGET" "$PLIST_FILE"
         return 0
       fi
 
       mkdir -p "$LOG_DIR" "$PLIST_DIR"
+      if [ -n "$UNIX_SOCKET" ]; then
+        SOCK_PARENT="$(dirname "$UNIX_SOCKET")"
+        mkdir -p "$SOCK_PARENT"
+        [ -n "$MACOS_OWNER" ] && chown "$MACOS_OWNER" "$SOCK_PARENT" 2>/dev/null || true
+        chmod 0755 "$SOCK_PARENT" 2>/dev/null || true
+      fi
+      if [ -n "$MACOS_OWNER" ]; then
+        chown -R "$MACOS_OWNER" "$DATA_DIR" "$LOG_DIR"
+      elif [ "$USER_MODE" = "0" ] && [ -n "$SVC_GROUP" ]; then
+        chgrp -R "$SVC_GROUP" "$DATA_DIR" "$LOG_DIR" "$ENV_FILE" 2>/dev/null || true
+      fi
       xattr -d com.apple.quarantine "$INSTALL_BIN" >/dev/null 2>&1 || true
       chmod "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data" 2>/dev/null || true
       printf "%s\n" "$PLIST_CONTENT" > "$PLIST_FILE"
@@ -1295,12 +1645,15 @@ ${ROLE_PLIST_KEYS}
       log_info "Logs     : ${OUT_LOG}"
       ;;
     upgrade)
-      if [ -z "$INSTALL_DIR" ] && [ -z "$INSTALL_BIN_OVERRIDE" ] && [ -f "$PLIST_FILE" ]; then
-        EXISTING_BIN="$(extract_macos_plist_bin "$PLIST_FILE")"
-        [ -n "$EXISTING_BIN" ] && INSTALL_BIN="$EXISTING_BIN"
-      fi
+      recover_macos_plist_config "$PLIST_FILE"
+      MACOS_OWNER="$(compute_macos_owner)"
       resolve_source_binary
-      [ -d "$DATA_DIR" ] && sync_bundled_extensions "$DATA_DIR"
+      if [ -d "$DATA_DIR" ]; then
+        sync_bundled_extensions "$DATA_DIR"
+        if [ "$DRY_RUN" = "0" ] && [ -n "$MACOS_OWNER" ]; then
+          chown -R "$MACOS_OWNER" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
+        fi
+      fi
       copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
       if [ "$DRY_RUN" = "1" ]; then
         printf "[dry-run] launchctl kickstart -k %s/%s\n" "$DOMAIN_TARGET" "$MACOS_LABEL"
@@ -1315,14 +1668,23 @@ ${ROLE_PLIST_KEYS}
       fi
       ;;
     uninstall)
+      recover_macos_plist_config "$PLIST_FILE"
+      if [ "$PURGE_DATA" = "1" ]; then
+        validate_safe_purge_dir "$DATA_DIR"
+        validate_safe_purge_dir "$LOG_DIR"
+      fi
       if [ "$DRY_RUN" = "1" ]; then
-        printf "[dry-run] launchctl bootout %s/%s && rm -f '%s'\n" "$DOMAIN_TARGET" "$MACOS_LABEL" "$PLIST_FILE"
+        printf "[dry-run] launchctl bootout %s/%s && rm -f '%s' '%s'\n" "$DOMAIN_TARGET" "$MACOS_LABEL" "$PLIST_FILE" "$INSTALL_BIN"
+        if [ "$PURGE_DATA" = "1" ]; then
+          printf "[dry-run] rm -rf '%s' '%s' && safe_remove_env_file '%s'\n" "$DATA_DIR" "$LOG_DIR" "$ENV_FILE"
+        fi
         return 0
       fi
       launchctl bootout "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || launchctl unload -w "$PLIST_FILE" >/dev/null 2>&1 || true
       rm -f "$PLIST_FILE" "$INSTALL_BIN"
       if [ "$PURGE_DATA" = "1" ]; then
-        rm -rf "$DATA_DIR" "$ENV_FILE" "$LOG_DIR"
+        rm -rf "$DATA_DIR" "$LOG_DIR"
+        safe_remove_env_file "$ENV_FILE"
         log_ok "Uninstalled ${MACOS_LABEL} and purged ${DATA_DIR}."
       else
         log_ok "Uninstalled ${MACOS_LABEL} (data preserved in ${DATA_DIR})."

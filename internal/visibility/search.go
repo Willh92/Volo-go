@@ -13,7 +13,11 @@ import (
 	"github.com/Willh92/Volo-go/internal/render"
 )
 
-const DefaultSearchMaxBytes = 2 << 20 // <= 2 MiB strict RAM budget for instant search index
+const (
+	DefaultSearchMaxBytes   = 8 * 1024 * 1024 // 8 MiB RAM budget (~14,000+ articles in RAM)
+	maxIndexedExcerptRunes  = 600
+	fallbackSQLMatchLimit   = 30
+)
 
 // SearchHit represents a zero-leak public search result for Ctrl/Cmd+K instant search.
 type SearchHit struct {
@@ -32,15 +36,26 @@ type searchDoc struct {
 	slug        string
 	publicPlain string
 	publishedAt int64
+	isPinned    bool
 	byteCost    int
+}
+
+func docComesBefore(a, b searchDoc) bool {
+	if a.isPinned != b.isPinned {
+		return a.isPinned
+	}
+	if a.publishedAt != b.publishedAt {
+		return a.publishedAt > b.publishedAt
+	}
+	return a.id < b.id
 }
 
 // SearchIndex implements Surface 5 (Two-Stage Low-Memory Instant Search):
 // 1. Excludes all password-protected articles (`password_ciphertext != ''`).
-// 2. Strips all `:::lock ... :::` blocks BEFORE indexing or snippet extraction.
-// 3. Caps resident index memory strictly at maxBytes (default 2 MiB); if an archive exceeds maxBytes,
-//    Stage 2 falls back to streaming DB rows and re-verifies every token against `StripAllLockBlocks`
-//    public plaintext in Go (zero SQL LIKE side-channel!).
+// 2. Strips all `:::lock ... :::` blocks BEFORE indexing or snippet extraction, storing a compact 600-rune excerpt.
+// 3. Caps resident index memory strictly at maxBytes (default 8 MiB, holding 14,000+ articles);
+//    if an archive exceeds maxBytes (50,000+ posts), Stage 2 runs a lightweight metadata SQL fallback
+//    (`title / slug / summary_md`, LIMIT 30) verified after `StripAllLockBlocks` without invoking full Markdown renders.
 type SearchIndex struct {
 	mu       sync.RWMutex
 	store    *sqlx.Store
@@ -66,11 +81,11 @@ func NewSearchIndex(store *sqlx.Store, renderer *render.Engine, maxBytes int) *S
 	}
 }
 
-// Rebuild streams published, non-password-protected articles into the bounded RAM index (newest first).
+// Rebuild streams published, non-password-protected articles into the bounded RAM index (`is_pinned DESC, published_at DESC`).
 func (idx *SearchIndex) Rebuild(ctx context.Context) error {
 	rows, err := idx.store.QueryContext(
 		ctx,
-		`SELECT id, title, slug, summary_md, content_md, published_at, password_ciphertext, has_content_lock
+		`SELECT id, title, slug, summary_md, content_md, published_at, is_pinned, password_ciphertext, has_content_lock
 		 FROM articles
 		 WHERE status = ? AND password_ciphertext = ''
 		 ORDER BY is_pinned DESC, published_at DESC`,
@@ -87,7 +102,7 @@ func (idx *SearchIndex) Rebuild(ctx context.Context) error {
 
 	for rows.Next() {
 		var r domain.RawArticle
-		if sErr := rows.Scan(&r.ID, &r.Title, &r.Slug, &r.SummaryMD, &r.ContentMD, &r.PublishedAt, &r.PasswordCiphertext, &r.HasContentLock); sErr != nil {
+		if sErr := rows.Scan(&r.ID, &r.Title, &r.Slug, &r.SummaryMD, &r.ContentMD, &r.PublishedAt, &r.IsPinned, &r.PasswordCiphertext, &r.HasContentLock); sErr != nil {
 			return sErr
 		}
 		if strings.TrimSpace(r.PasswordCiphertext) != "" {
@@ -139,8 +154,13 @@ func (idx *SearchIndex) Remove(articleID string) {
 	}
 }
 
-// Upsert inserts or updates a published, non-password-protected article in the bounded RAM index.
-// If the article is non-public or password-protected, it is immediately removed from the index.
+// UpsertArticle is an alias for Upsert keeping `idx.docs` sorted by `(is_pinned DESC, published_at DESC)`.
+func (idx *SearchIndex) UpsertArticle(r domain.RawArticle) {
+	idx.Upsert(r)
+}
+
+// Upsert inserts or updates a published, non-password-protected article in the bounded RAM index,
+// maintaining `(is_pinned DESC, published_at DESC)` sort order.
 func (idx *SearchIndex) Upsert(r domain.RawArticle) {
 	if r.Status != domain.ArticleStatusPublished || strings.TrimSpace(r.PasswordCiphertext) != "" {
 		idx.Remove(r.ID)
@@ -152,6 +172,9 @@ func (idx *SearchIndex) Upsert(r domain.RawArticle) {
 	for i, existing := range idx.docs {
 		if existing.id == r.ID {
 			idx.used -= existing.byteCost
+			if idx.used < 0 {
+				idx.used = 0
+			}
 			idx.docs = append(idx.docs[:i], idx.docs[i+1:]...)
 			break
 		}
@@ -161,7 +184,12 @@ func (idx *SearchIndex) Upsert(r domain.RawArticle) {
 		return
 	}
 	idx.used += doc.byteCost
-	idx.docs = append([]searchDoc{doc}, idx.docs...)
+	insertAt := sort.Search(len(idx.docs), func(i int) bool {
+		return docComesBefore(doc, idx.docs[i])
+	})
+	idx.docs = append(idx.docs, searchDoc{})
+	copy(idx.docs[insertAt+1:], idx.docs[insertAt:])
+	idx.docs[insertAt] = doc
 }
 
 func (idx *SearchIndex) buildSafeDoc(r domain.RawArticle) searchDoc {
@@ -174,22 +202,37 @@ func (idx *SearchIndex) buildSafeDoc(r domain.RawArticle) searchDoc {
 		Mode:     render.RenderModeWeb,
 		Unlocked: false,
 	})
-	plain := out.PlainText
+	excerpt := truncateRunes(out.PlainText, maxIndexedExcerptRunes)
 
-	cost := len(r.ID) + len(r.Title) + len(r.Slug) + len(plain) + 64
+	cost := len(r.ID) + len(r.Title) + len(r.Slug) + len(excerpt) + 32
 	return searchDoc{
 		id:          r.ID,
 		title:       r.Title,
 		slug:        r.Slug,
-		publicPlain: plain,
+		publicPlain: excerpt,
 		publishedAt: r.PublishedAt,
+		isPinned:    r.IsPinned,
 		byteCost:    cost,
 	}
 }
 
+func buildLightweightOverflowDoc(id, title, slug, summaryMD string, publishedAt int64, isPinned bool) searchDoc {
+	safeSummary := strings.Join(strings.Fields(render.StripAllLockBlocks(summaryMD)), " ")
+	excerpt := truncateRunes(safeSummary, maxIndexedExcerptRunes)
+	return searchDoc{
+		id:          id,
+		title:       title,
+		slug:        slug,
+		publicPlain: excerpt,
+		publishedAt: publishedAt,
+		isPinned:    isPinned,
+	}
+}
+
 // Search queries the index and returns up to limit verified public hits.
-// Even when `complete == false` (archive > 2 MiB), overflow rows are streamed and verified in Go AFTER
-// `StripAllLockBlocks`, NEVER trusting raw SQL `LIKE` matches!
+// When `complete == false` (archive > 8 MiB / 50,000+ posts), fallback SQL matches lightweight
+// `title / slug / summary_md` (`LIMIT 30`) and verifies every token after `StripAllLockBlocks`
+// with ZERO `renderer.Render` calls!
 func (idx *SearchIndex) Search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	tokens := splitQueryTokens(query)
 	if len(tokens) == 0 {
@@ -222,31 +265,41 @@ func (idx *SearchIndex) Search(ctx context.Context, query string, limit int) ([]
 		}
 	}
 
-	// Stage 2 streaming overflow scan if archive exceeded resident cap:
-	// Note that we DO NOT pass user tokens into `content_md LIKE ?` directly without post-strip verification!
 	if !complete && idx.store != nil {
-		rows, err := idx.store.QueryContext(
-			ctx,
-			`SELECT id, title, slug, summary_md, content_md, published_at, password_ciphertext, has_content_lock
-			 FROM articles
-			 WHERE status = ? AND password_ciphertext = ''
-			 ORDER BY published_at DESC`,
-			domain.ArticleStatusPublished,
-		)
+		var sb strings.Builder
+		sb.WriteString(`SELECT id, title, slug, summary_md, published_at, is_pinned
+			FROM articles
+			WHERE status = ? AND password_ciphertext = ''`)
+		args := make([]any, 0, 1+len(tokens)*3)
+		args = append(args, domain.ArticleStatusPublished)
+		for _, tok := range tokens {
+			pat := "%" + tok + "%"
+			sb.WriteString(` AND (LOWER(title) LIKE ? OR LOWER(slug) LIKE ? OR LOWER(summary_md) LIKE ?)`)
+			args = append(args, pat, pat, pat)
+		}
+		sb.WriteString(` ORDER BY is_pinned DESC, published_at DESC`)
+		qSQL, pageArgs := idx.store.Dialect().PaginateSQL(sb.String(), fallbackSQLMatchLimit, 0)
+		args = append(args, pageArgs...)
+
+		rows, err := idx.store.QueryContext(ctx, qSQL, args...)
 		if err != nil {
 			return nil, err
 		}
 		defer rows.Close()
 
 		for rows.Next() {
-			var r domain.RawArticle
-			if sErr := rows.Scan(&r.ID, &r.Title, &r.Slug, &r.SummaryMD, &r.ContentMD, &r.PublishedAt, &r.PasswordCiphertext, &r.HasContentLock); sErr != nil {
+			var (
+				id, title, slug, summaryMD string
+				publishedAt                int64
+				isPinned                   bool
+			)
+			if sErr := rows.Scan(&id, &title, &slug, &summaryMD, &publishedAt, &isPinned); sErr != nil {
 				return nil, sErr
 			}
-			if seen[r.ID] || strings.TrimSpace(r.PasswordCiphertext) != "" {
+			if seen[id] {
 				continue
 			}
-			doc := idx.buildSafeDoc(r)
+			doc := buildLightweightOverflowDoc(id, title, slug, summaryMD, publishedAt, isPinned)
 			if hit, ok := matchDoc(doc, tokens); ok {
 				hits = append(hits, hit)
 			}
@@ -365,12 +418,16 @@ func matchDoc(doc searchDoc, tokens []string) (SearchHit, bool) {
 
 	for _, tok := range tokens {
 		inTitle := indexFoldLowerNeedle(doc.title, tok) >= 0
+		inSlug := indexFoldLowerNeedle(doc.slug, tok) >= 0
 		posBody := indexFoldLowerNeedle(doc.publicPlain, tok)
-		if !inTitle && posBody < 0 {
+		if !inTitle && !inSlug && posBody < 0 {
 			return SearchHit{}, false
 		}
 		if inTitle {
 			score += 10
+		}
+		if inSlug {
+			score += 6
 		}
 		if posBody >= 0 {
 			score += 3

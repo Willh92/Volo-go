@@ -197,15 +197,51 @@ func (d *OutboundSafeDialer) ValidateOutboundURL(rawURL string) (*url.URL, error
 	return u, nil
 }
 
+type approvedProxyAddrKey struct{}
+
+func canonicalProxyHostPort(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	host := u.Hostname()
+	if host == "" {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return net.JoinHostPort(host, "443")
+	case "socks5", "socks5h":
+		return net.JoinHostPort(host, "1080")
+	default:
+		return net.JoinHostPort(host, "80")
+	}
+}
+
 // NewHTTPClient builds a hardened *http.Client using DNS-pinned SSRF protection, strict TLS>=1.2
 // certificate verification (InsecureSkipVerify=false ALWAYS), and max 3 validated redirects.
 func (d *OutboundSafeDialer) NewHTTPClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
+	dialTimeout := d.Timeout
+	if dialTimeout <= 0 {
+		dialTimeout = 10 * time.Second
+	}
+	proxySocketDialer := &net.Dialer{
+		Timeout:   dialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           d.DialContext,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if approvedProxy, ok := ctx.Value(approvedProxyAddrKey{}).(string); ok && approvedProxy != "" && addr == approvedProxy {
+				return proxySocketDialer.DialContext(ctx, network, addr)
+			}
+			return d.DialContext(ctx, network, addr)
+		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          16,
 		IdleConnTimeout:       30 * time.Second,
@@ -242,30 +278,38 @@ func (rt *ssrfValidatingRoundTripper) RoundTrip(req *http.Request) (*http.Respon
 	if err != nil {
 		return nil, err
 	}
-	// Even if an outbound HTTP_PROXY environment variable is active, pre-check literal/resolvable host safety!
 	host := u.Hostname()
+	if err := rt.dialer.CheckHostAllowed(host); err != nil {
+		return nil, err
+	}
+	// Always resolve and validate non-literal target hostnames against private/loopback/link-local/metadata
+	// IP ranges, even when an outbound HTTP_PROXY environment variable is configured.
 	if _, lErr := netip.ParseAddr(host); lErr != nil {
 		resolve := rt.dialer.Resolver
 		if resolve == nil {
-			if proxyURL, pErr := http.ProxyFromEnvironment(req); pErr == nil && proxyURL == nil {
-				resolve = func(ctx context.Context, h string) ([]netip.Addr, error) {
-					return net.DefaultResolver.LookupNetIP(ctx, "ip", h)
-				}
+			resolve = func(ctx context.Context, h string) ([]netip.Addr, error) {
+				return net.DefaultResolver.LookupNetIP(ctx, "ip", h)
 			}
 		}
-		if resolve != nil {
-			ips, rErr := resolve(req.Context(), host)
-			if rErr != nil {
-				return nil, fmt.Errorf("security: dns lookup %q: %w", host, rErr)
+		ips, rErr := resolve(req.Context(), host)
+		if rErr != nil {
+			return nil, fmt.Errorf("security: dns lookup %q: %w", host, rErr)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("%w: %q resolved to zero addresses", ErrSSRFBlocked, host)
+		}
+		for _, ip := range ips {
+			if !(rt.dialer.AllowLoopbackForTests && ip.Unmap().IsLoopback()) && !IsPublicRoutableIP(ip) {
+				return nil, fmt.Errorf("%w: resolved address %s for %q is non-public", ErrSSRFBlocked, ip.String(), host)
 			}
-			if len(ips) == 0 {
-				return nil, fmt.Errorf("%w: %q resolved to zero addresses", ErrSSRFBlocked, host)
-			}
-			for _, ip := range ips {
-				if !(rt.dialer.AllowLoopbackForTests && ip.Unmap().IsLoopback()) && !IsPublicRoutableIP(ip) {
-					return nil, fmt.Errorf("%w: resolved address %s for %q is non-public", ErrSSRFBlocked, ip.String(), host)
-				}
-			}
+		}
+	}
+
+	// Only after the target req.URL.Hostname() has passed host & IP policy, allow the underlying
+	// transport to connect to a local/corporate HTTP proxy socket if configured in environment.
+	if proxyURL, pErr := http.ProxyFromEnvironment(req); pErr == nil && proxyURL != nil {
+		if proxyAddr := canonicalProxyHostPort(proxyURL); proxyAddr != "" {
+			req = req.WithContext(context.WithValue(req.Context(), approvedProxyAddrKey{}, proxyAddr))
 		}
 	}
 	return rt.next.RoundTrip(req)

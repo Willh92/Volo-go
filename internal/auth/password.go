@@ -17,11 +17,12 @@ import (
 )
 
 const (
-	argon2Time    uint32 = 3
-	argon2Memory  uint32 = 64 * 1024 // 64 MiB
-	argon2Threads uint8  = 2
-	argon2SaltLen        = 16
-	argon2KeyLen  uint32 = 32
+	argon2Time            uint32 = 2
+	argon2Memory          uint32 = 19 * 1024 // 19 MiB (OWASP recommended minimum for t=2, p=1)
+	argon2Threads         uint8  = 1
+	argon2SaltLen                = 16
+	argon2KeyLen          uint32 = 32
+	maxArgon2VerifyMemory uint32 = 128 * 1024 // Allow existing 64 MiB+ PHC hashes to verify seamlessly
 
 	legacyPBKDF2Prefix  = "pbkdf2$sha256$"
 	legacyBoloMD5Prefix = "bolomd5x2$"
@@ -121,7 +122,7 @@ func verifyArgon2id(raw string, encoded string) (bool, bool) {
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &mem, &timeCost, &threads); err != nil {
 		return false, false
 	}
-	if mem < 8*1024 || mem > argon2Memory || timeCost < 1 || timeCost > 16 || threads < 1 || threads > 4 {
+	if mem < 8*1024 || mem > maxArgon2VerifyMemory || timeCost < 1 || timeCost > 16 || threads < 1 || threads > 4 {
 		return false, false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])

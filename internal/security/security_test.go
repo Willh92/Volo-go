@@ -231,4 +231,124 @@ func TestWAFStealthAdmin404AutoBanGeoIPAndCircuitBreaker(t *testing.T) {
 	if waf.AllowRate("comment", ipRate, 2, time.Minute) {
 		t.Fatal("expected 3rd request to be rate limited")
 	}
+	waf.Close()
+	geo.Close()
+}
+
+func TestOutboundHTTPClientProxyValidatesTargetNotProxySocket(t *testing.T) {
+	var proxyHits int
+	localProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("proxied:" + r.URL.Host))
+	}))
+	defer localProxy.Close()
+
+	t.Setenv("HTTP_PROXY", localProxy.URL)
+	t.Setenv("HTTPS_PROXY", localProxy.URL)
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+
+	d := &OutboundSafeDialer{
+		AllowedHosts: []string{"allowed.public.example", "rebind.allowed.example"},
+		Resolver: func(ctx context.Context, host string) ([]netip.Addr, error) {
+			switch host {
+			case "allowed.public.example":
+				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+			case "rebind.allowed.example":
+				return []netip.Addr{netip.MustParseAddr("169.254.169.254")}, nil
+			default:
+				return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+			}
+		},
+	}
+	client := d.NewHTTPClient(5 * time.Second)
+
+	// 1. Disallowed host MUST be rejected even with HTTP_PROXY active.
+	if _, err := client.Get("http://unlisted.public.example/hook"); !errors.Is(err, ErrSSRFBlocked) {
+		t.Fatalf("expected disallowed host to be blocked with ErrSSRFBlocked, got %v", err)
+	}
+	// 2. Allowed host resolving to metadata/private IP MUST be rejected even with HTTP_PROXY active!
+	if _, err := client.Get("http://rebind.allowed.example/latest/meta-data/"); !errors.Is(err, ErrSSRFBlocked) {
+		t.Fatalf("expected non-public resolved host to be blocked under HTTP_PROXY, got %v", err)
+	}
+	// 3. Literal loopback/proxy URL as target MUST still be rejected!
+	if _, err := client.Get(localProxy.URL + "/admin"); !errors.Is(err, ErrSSRFBlocked) {
+		t.Fatalf("expected direct request to local proxy target URL to be blocked, got %v", err)
+	}
+	if proxyHits != 0 {
+		t.Fatalf("expected zero proxy hits for blocked targets, got %d", proxyHits)
+	}
+
+	// 4. Allowed public-resolving target URL succeeds via the local proxy socket!
+	resp, err := client.Get("http://allowed.public.example/webhook")
+	if err != nil {
+		t.Fatalf("expected allowed public target via local HTTP_PROXY to succeed, got %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || proxyHits != 1 {
+		t.Fatalf("expected 200 OK and 1 proxy hit, got status=%d hits=%d", resp.StatusCode, proxyHits)
+	}
+}
+
+func TestWAFBanDeduplicationPruningAndConcurrentAccess(t *testing.T) {
+	ctx := context.Background()
+	waf := NewWAFEngine(nil, nil, nil, nil)
+	defer waf.Close()
+
+	attacker := netip.MustParseAddr("198.51.100.42")
+	admin := netip.MustParseAddr("203.0.113.1")
+
+	// Repeatedly ban the same IP/CIDR via RecordStrike and AddManualBan; banPrefixes must remain deduplicated.
+	for i := 0; i < 20; i++ {
+		waf.RecordStrike(ctx, attacker, ReasonLoginFail, 5)
+	}
+	if _, err := waf.AddManualBan(ctx, "198.51.100.42/32", "repeat", time.Now().Add(time.Hour).UnixMilli(), admin); err != nil {
+		t.Fatal(err)
+	}
+	waf.bansMu.RLock()
+	prefixCount := len(waf.banPrefixes)
+	mapCount := len(waf.activeBans)
+	waf.bansMu.RUnlock()
+	if prefixCount != 1 || mapCount != 1 {
+		t.Fatalf("expected deduplicated ban count 1, got prefixes=%d map=%d", prefixCount, mapCount)
+	}
+
+	// Insert an already-expired ban and verify sweep prunes it while retaining active bans.
+	expiredIP := netip.MustParseAddr("198.51.100.99")
+	if _, err := waf.AddManualBan(ctx, expiredIP.String(), "expired", time.Now().Add(-time.Second).UnixMilli(), admin); err != nil {
+		t.Fatal(err)
+	}
+	if banned, _ := waf.IsBanned(expiredIP); banned {
+		t.Fatal("expired ban should not match IsBanned")
+	}
+	waf.sweep(time.Now())
+	waf.bansMu.RLock()
+	afterSweepPrefixes := len(waf.banPrefixes)
+	afterSweepMap := len(waf.activeBans)
+	waf.bansMu.RUnlock()
+	if afterSweepPrefixes != 1 || afterSweepMap != 1 {
+		t.Fatalf("expected sweep to prune expired ban leaving 1 active ban, got prefixes=%d map=%d", afterSweepPrefixes, afterSweepMap)
+	}
+
+	// Hammer IsBanned, AllowRate, RecordStrike, and sweep concurrently under -race.
+	done := make(chan struct{})
+	for g := 0; g < 4; g++ {
+		go func(id int) {
+			ip := netip.MustParseAddr("198.51.100.10")
+			for i := 0; i < 200; i++ {
+				_, _ = waf.IsBanned(attacker)
+				_, _ = waf.IsBanned(ip)
+				_ = waf.AllowRate("login", ip, 50, time.Minute)
+				_ = waf.RecordStrike(ctx, ip, ReasonScannerTrap, 1)
+				if i%50 == 0 {
+					waf.sweep(time.Now())
+				}
+			}
+			done <- struct{}{}
+		}(g)
+	}
+	for g := 0; g < 4; g++ {
+		<-done
+	}
 }

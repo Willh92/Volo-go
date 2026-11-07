@@ -35,19 +35,78 @@
         {{template "empty_state" (dict "Title" (t .Locale "studio.empty_categories_title") "Desc" (t .Locale "studio.empty_categories_desc"))}}
       {{end}}
     {{else if eq .TaxonomyKind "tags"}}
-      {{if .Tags}}
+      {{if or .Tags .TagQuery}}
         <div class="studio-article studio-card-pad">
-          <div class="tag-cloud studio-tax-tags">
-            {{range .Tags}}
-              <a class="tag-chip studio-tax-tag" href="/tags/{{.Slug}}">#{{.Name}} <strong>{{.ArticleCount}}</strong></a>
-            {{end}}
+          <div class="studio-tax-toolbar">
+            <form class="studio-tax-search" method="get" action="/tags">
+              {{if .TagSort}}<input type="hidden" name="sort" value="{{.TagSort}}">{{end}}
+              <input class="volo-input studio-tax-search__input js-tag-filter-input" type="search" name="q" value="{{.TagQuery}}" placeholder="{{if hasPrefix .Locale "en"}}Filter tags…{{else if eq .Locale "zh-TW"}}篩選標籤…{{else}}筛选标签…{{end}}" aria-label="{{t .Locale "nav.tags"}}" autocomplete="off">
+            </form>
+            <div class="studio-tax-sort" role="group" aria-label="Sort">
+              {{$isNameSort := eq .TagSort "name"}}
+              <a class="studio-sort-pill {{if not $isNameSort}}is-active{{end}}" href="/tags?sort=popular{{if .TagQuery}}&q={{urlquery .TagQuery}}{{end}}">{{if hasPrefix .Locale "en"}}Popular{{else if eq .Locale "zh-TW"}}熱門{{else}}热门{{end}}</a>
+              <a class="studio-sort-pill {{if $isNameSort}}is-active{{end}}" href="/tags?sort=name{{if .TagQuery}}&q={{urlquery .TagQuery}}{{end}}">A–Z</a>
+            </div>
           </div>
+          {{if .Tags}}
+            <div class="tag-cloud studio-tax-tags js-tag-filter-list">
+              {{range .Tags}}
+                <a class="tag-chip studio-tax-tag" href="/tags/{{.Slug}}" data-tag-name="{{lower .Name}}">#{{.Name}} <strong>{{.ArticleCount}}</strong></a>
+              {{end}}
+            </div>
+          {{else}}
+            <p class="studio-muted-empty">{{t .Locale "search.empty"}}</p>
+          {{end}}
+          <p class="studio-muted-empty js-tag-filter-empty" hidden>{{t .Locale "search.empty"}}</p>
         </div>
+        {{template "pagination" .}}
       {{else}}
         {{template "empty_state" (dict "Title" (t .Locale "studio.empty_tags_title") "Desc" (t .Locale "studio.empty_tags_desc"))}}
       {{end}}
     {{else if eq .TaxonomyKind "archives"}}
-      {{if .ArchiveBuckets}}
+      {{if .ArchiveYears}}
+        <nav class="studio-archive-years" aria-label="{{t .Locale "nav.archives"}}">
+          <a href="/archives" class="studio-year-pill {{if not .SelectedArchiveYear}}is-active{{end}}">{{t .Locale "search.all_filter"}} <small>{{.Stats.ArticleCount}}</small></a>
+          {{range .ArchiveYears}}
+            <a href="/archives?year={{urlquery .Year}}" class="studio-year-pill {{if eq $.SelectedArchiveYear .Year}}is-active{{end}}">{{.Year}} <small>{{.Count}}</small></a>
+          {{end}}
+        </nav>
+      {{end}}
+
+      {{if .ArchiveGroups}}
+        <div class="studio-archive-timeline">
+          {{range .ArchiveGroups}}
+            <section class="studio-article studio-card-pad studio-archive-year">
+              <header class="studio-archive-year__head">
+                <h2 class="studio-archive-year__title">{{.Year}}</h2>
+                <span class="volo-badge">{{.Count}}</span>
+              </header>
+              {{range .Months}}
+                <div class="studio-archive-month">
+                  <div class="studio-archive-month__head">
+                    <a class="studio-archive-month__link" href="/archives/{{.YearMonth}}">
+                      <strong>{{.YearMonth}}</strong>
+                      <small>{{.Count}}</small>
+                    </a>
+                  </div>
+                  <div class="studio-archive-posts">
+                    {{range .Posts}}
+                      <div class="studio-archive-post-row">
+                        <time class="studio-archive-post-row__date">{{.MonthDay}}</time>
+                        <a class="studio-archive-post-row__title" href="/posts/{{.Slug}}">{{.Title}}</a>
+                        {{if .CategoryName}}
+                          <a class="studio-cat-chip studio-archive-post-row__cat" href="/categories/{{.CategorySlug}}">{{.CategoryName}}</a>
+                        {{end}}
+                      </div>
+                    {{end}}
+                  </div>
+                </div>
+              {{end}}
+            </section>
+          {{end}}
+        </div>
+        {{template "pagination" .}}
+      {{else if .ArchiveBuckets}}
         <div class="studio-article studio-card-pad">
           <div class="studio-archive-grid">
             {{range .ArchiveBuckets}}
@@ -58,6 +117,7 @@
             {{end}}
           </div>
         </div>
+        {{template "pagination" .}}
       {{else}}
         {{template "empty_state" (dict "Title" (t .Locale "studio.empty_archives_title") "Desc" (t .Locale "studio.empty_archives_desc"))}}
       {{end}}

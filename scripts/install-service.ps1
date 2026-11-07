@@ -61,6 +61,13 @@ if ((-not $Mirror) -and $GitHubProxy) { $Mirror = $GitHubProxy }
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+if (-not $DryRun) {
+  $CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Administrator privileges are required to manage Windows services/tasks and ProgramData ACLs. Re-run in an elevated PowerShell prompt (or pass -DryRun)."
+  }
+}
+
 $Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
 $ScriptDir = if ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 $EffectiveListen = if ($ListenAddr) { $ListenAddr } else { "${HostAddr}:${Port}" }
@@ -78,6 +85,7 @@ if ($InstallDir) {
 $DataDir = [System.IO.Path]::GetFullPath($DataDir)
 $EnvFile = Join-Path $DataDir "volo.env"
 $NssmCmd = Get-Command "nssm.exe" -ErrorAction SilentlyContinue
+$CurlCmd = Get-Command "curl.exe" -ErrorAction SilentlyContinue
 $Script:TempDownloadDir = ""
 $Script:ResolvedBundleDir = ""
 
@@ -85,6 +93,129 @@ function New-RandomHex32 {
   $bytes = New-Object byte[] 32
   [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
   return ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+}
+
+function Invoke-FileDownload([string]$Url, [string]$OutFile, [switch]$Quiet) {
+  if ($CurlCmd) {
+    if ($Quiet) {
+      & $CurlCmd.Source -fsL --retry 3 --connect-timeout 15 -o $OutFile $Url
+    } else {
+      & $CurlCmd.Source -fL --retry 3 --connect-timeout 15 -o $OutFile $Url
+    }
+    return ($LASTEXITCODE -eq 0 -and (Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 0))
+  }
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+      Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 60 -Headers @{ "User-Agent" = "Volo-go-Installer" }
+      if ((Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 0)) {
+        return $true
+      }
+    } catch {
+      if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+    }
+  }
+  return $false
+}
+
+function Assert-SafePurgeDir([string]$TargetPath) {
+  if ([string]::IsNullOrWhiteSpace($TargetPath)) {
+    throw "Refusing to purge an empty directory path."
+  }
+  $full = [System.IO.Path]::GetFullPath($TargetPath).TrimEnd('\', '/')
+  $root = [System.IO.Path]::GetPathRoot($full).TrimEnd('\', '/')
+  if ($full.Length -le 3 -or [string]::Equals($full, $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to purge drive root: $full"
+  }
+  $protected = @(
+    $env:SystemRoot,
+    $env:ProgramFiles,
+    ${env:ProgramFiles(x86)},
+    $env:ProgramData,
+    $env:USERPROFILE,
+    $env:PUBLIC,
+    "C:\Windows",
+    "C:\Program Files",
+    "C:\Program Files (x86)",
+    "C:\ProgramData",
+    "C:\Users"
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  foreach ($p in $protected) {
+    $normP = [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/')
+    if ([string]::Equals($full, $normP, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Refusing to purge protected system directory: $full"
+    }
+  }
+}
+
+function Extract-EnvFileFromArgs([string]$ArgLine) {
+  if ([string]::IsNullOrWhiteSpace($ArgLine)) { return "" }
+  if ($ArgLine -match '--env-file(?:=|\s+)"([^"]+)"') { return $Matches[1] }
+  if ($ArgLine -match '--env-file(?:=|\s+)([^\s"]+)') { return $Matches[1] }
+  return ""
+}
+
+function Resolve-ExistingRegistration([ref]$RefBin, [ref]$RefDataDir, [ref]$RefEnvFile) {
+  $hasExplicitInstallDir = $Script:HasExplicitInstallDir
+  $hasExplicitDataDir = $Script:HasExplicitDataDir
+
+  # 1. Inspect NSSM or Win32_Service registration first.
+  $winSvc = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+  if ($winSvc) {
+    if ($NssmCmd) {
+      $nssmApp = (& $NssmCmd.Source get $ServiceName Application 2>$null | Out-String).Trim("`r", "`n", "`0", " ", '"')
+      $nssmDir = (& $NssmCmd.Source get $ServiceName AppDirectory 2>$null | Out-String).Trim("`r", "`n", "`0", " ", '"')
+      $nssmArgs = (& $NssmCmd.Source get $ServiceName AppParameters 2>$null | Out-String).Trim("`r", "`n", "`0", " ")
+      if ((-not $hasExplicitInstallDir) -and $nssmApp -and (Test-Path $nssmApp)) {
+        $RefBin.Value = [System.IO.Path]::GetFullPath($nssmApp)
+      }
+      if ((-not $hasExplicitDataDir) -and $nssmDir) {
+        $RefDataDir.Value = [System.IO.Path]::GetFullPath($nssmDir)
+      }
+      $parsedEnv = Extract-EnvFileFromArgs $nssmArgs
+      if ((-not $hasExplicitDataDir) -and $parsedEnv) {
+        $RefEnvFile.Value = [System.IO.Path]::GetFullPath($parsedEnv)
+      } elseif (-not $hasExplicitDataDir) {
+        $RefEnvFile.Value = Join-Path $RefDataDir.Value "volo.env"
+      }
+      return
+    }
+    if ($winSvc.PathName) {
+      $cmdLine = [string]$winSvc.PathName
+      $exeCandidate = ""
+      if ($cmdLine -match '^"([^"]+)"') {
+        $exeCandidate = $Matches[1]
+      } elseif ($cmdLine -match '^([^\s]+)') {
+        $exeCandidate = $Matches[1]
+      }
+      if ((-not $hasExplicitInstallDir) -and $exeCandidate -and ($exeCandidate -notmatch 'nssm\.exe$')) {
+        $RefBin.Value = [System.IO.Path]::GetFullPath($exeCandidate)
+      }
+      $parsedEnv = Extract-EnvFileFromArgs $cmdLine
+      if ((-not $hasExplicitDataDir) -and $parsedEnv) {
+        $RefEnvFile.Value = [System.IO.Path]::GetFullPath($parsedEnv)
+        $RefDataDir.Value = Split-Path -Parent $RefEnvFile.Value
+      }
+      return
+    }
+  }
+
+  # 2. Inspect Scheduled Task registration.
+  $task = Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
+  if ($task -and $task.Actions.Count -gt 0) {
+    $act = $task.Actions[0]
+    if ((-not $hasExplicitInstallDir) -and $act.Execute) {
+      $RefBin.Value = [System.IO.Path]::GetFullPath($act.Execute.Trim('"'))
+    }
+    if ((-not $hasExplicitDataDir) -and $act.WorkingDirectory) {
+      $RefDataDir.Value = [System.IO.Path]::GetFullPath($act.WorkingDirectory.Trim('"'))
+    }
+    $parsedEnv = Extract-EnvFileFromArgs ([string]$act.Arguments)
+    if ((-not $hasExplicitDataDir) -and $parsedEnv) {
+      $RefEnvFile.Value = [System.IO.Path]::GetFullPath($parsedEnv)
+    } elseif (-not $hasExplicitDataDir) {
+      $RefEnvFile.Value = Join-Path $RefDataDir.Value "volo.env"
+    }
+  }
 }
 
 function Get-ReleaseBaseUrl([string]$Ref) {
@@ -163,19 +294,12 @@ function Download-ReleaseBundle {
   $dlSum = Join-Path $tmpDir "SHA256SUMS.txt"
 
   Write-Host "[Volo] Downloading $assetName from GitHub Releases ($Repo @ $primary)..." -ForegroundColor Cyan
-  $ok = $false
-  & curl.exe -fL --retry 3 --connect-timeout 15 -o $dlZip "$baseUrl/$assetName"
-  if ($LASTEXITCODE -eq 0 -and (Test-Path $dlZip) -and ((Get-Item $dlZip).Length -gt 0)) {
-    $ok = $true
-  }
+  $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
 
   if (-not $ok -and $primary -ne "latest") {
     $assetName = "volo-$primary-windows-$Arch.zip"
     $dlZip = Join-Path $tmpDir $assetName
-    & curl.exe -fL --retry 3 --connect-timeout 15 -o $dlZip "$baseUrl/$assetName"
-    if ($LASTEXITCODE -eq 0 -and (Test-Path $dlZip) -and ((Get-Item $dlZip).Length -gt 0)) {
-      $ok = $true
-    }
+    $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
   }
 
   if (-not $ok -and ($primary -eq "latest") -and (-not $pinned)) {
@@ -185,8 +309,7 @@ function Download-ReleaseBundle {
         $baseUrl = Get-ReleaseBaseUrl ([string]$rel.tag_name)
         $assetName = "volo-$($rel.tag_name)-windows-$Arch.zip"
         $dlZip = Join-Path $tmpDir $assetName
-        & curl.exe -fL --retry 3 --connect-timeout 15 -o $dlZip "$baseUrl/$assetName"
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $dlZip) -and ((Get-Item $dlZip).Length -gt 0)) { $ok = $true }
+        $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
       }
     } catch {}
     if (-not $ok) {
@@ -194,8 +317,7 @@ function Download-ReleaseBundle {
       $baseUrl = Get-ReleaseBaseUrl "preview"
       $assetName = $stableAsset
       $dlZip = Join-Path $tmpDir $assetName
-      & curl.exe -fL --retry 3 --connect-timeout 15 -o $dlZip "$baseUrl/$assetName"
-      if ($LASTEXITCODE -eq 0 -and (Test-Path $dlZip) -and ((Get-Item $dlZip).Length -gt 0)) { $ok = $true }
+      $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
     }
   }
 
@@ -204,8 +326,8 @@ function Download-ReleaseBundle {
   }
 
   if (-not $NoVerify) {
-    & curl.exe -fsL --retry 3 --connect-timeout 15 -o $dlSum "$baseUrl/SHA256SUMS.txt"
-    if (($LASTEXITCODE -ne 0) -or (-not (Test-Path $dlSum)) -or ((Get-Item $dlSum).Length -eq 0)) {
+    $sumOk = Invoke-FileDownload -Url "$baseUrl/SHA256SUMS.txt" -OutFile $dlSum -Quiet
+    if (-not $sumOk) {
       throw "Failed to download SHA256SUMS.txt from $baseUrl/SHA256SUMS.txt (pass -NoVerify only for custom mirrors without checksums)."
     }
     $expected = $null
@@ -279,9 +401,22 @@ function Stop-VoloServiceAndWait([string]$TargetExe = "") {
   if ($NssmCmd) { & $NssmCmd.Source stop $ServiceName 2>$null | Out-Null }
   Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
   Stop-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 1
+
   if ($TargetExe -and (Test-Path $TargetExe)) {
     $fullTarget = [System.IO.Path]::GetFullPath($TargetExe)
+    for ($i = 0; $i -lt 30; $i++) {
+      $stillRunning = $false
+      foreach ($proc in @(Get-Process -Name "volo" -ErrorAction SilentlyContinue)) {
+        try {
+          if ($proc.Path -and [string]::Equals([System.IO.Path]::GetFullPath($proc.Path), $fullTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $stillRunning = $true
+            break
+          }
+        } catch {}
+      }
+      if (-not $stillRunning) { break }
+      Start-Sleep -Milliseconds 500
+    }
     foreach ($proc in @(Get-Process -Name "volo" -ErrorAction SilentlyContinue)) {
       try {
         if ($proc.Path -and [string]::Equals([System.IO.Path]::GetFullPath($proc.Path), $fullTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -289,6 +424,8 @@ function Stop-VoloServiceAndWait([string]$TargetExe = "") {
         }
       } catch {}
     }
+  } else {
+    Start-Sleep -Seconds 1
   }
 }
 
@@ -315,20 +452,36 @@ function Install-BinarySafe([string]$SourceExe, [string]$TargetExe) {
   }
 }
 
+function Resolve-IcaclsPrincipal([string]$Identity) {
+  if ([string]::IsNullOrWhiteSpace($Identity)) { return "" }
+  switch -Regex ($Identity.Trim()) {
+    '^(NT AUTHORITY\\)?SYSTEM$|^LocalSystem$' { return "*S-1-5-18" }
+    '^(BUILTIN\\)?Administrators$'            { return "*S-1-5-32-544" }
+    '^(NT AUTHORITY\\)?NetworkService$'       { return "*S-1-5-20" }
+    '^(NT AUTHORITY\\)?LocalService$'         { return "*S-1-5-19" }
+    default                                   { return $Identity.Trim() }
+  }
+}
+
 function Set-DataDirPermissions([string]$TargetDir, [string]$Account, [string]$Group) {
   if ($DryRun) {
-    Write-Host "[dry-run] Restrict NTFS ACLs on $TargetDir"
+    Write-Host "[dry-run] Restrict NTFS ACLs on $TargetDir (SID-based icacls)"
     return
   }
   & icacls $TargetDir /inheritance:r | Out-Null
-  & icacls $TargetDir /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
-  if ($Account -and ($Account -ne "SYSTEM") -and ($Account -ne "NT AUTHORITY\SYSTEM")) {
-    & icacls $TargetDir /grant:r "${Account}:(OI)(CI)M" | Out-Null
+  & icacls $TargetDir /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+  $acctSpec = Resolve-IcaclsPrincipal $Account
+  if ($acctSpec -and ($acctSpec -ne "*S-1-5-18") -and ($acctSpec -ne "*S-1-5-32-544")) {
+    & icacls $TargetDir /grant:r "${acctSpec}:(OI)(CI)M" | Out-Null
   }
-  if ($Group -and ($Group -ne "Administrators") -and ($Group -ne "BUILTIN\Administrators")) {
-    & icacls $TargetDir /grant:r "${Group}:(OI)(CI)RX" | Out-Null
+  $grpSpec = Resolve-IcaclsPrincipal $Group
+  if ($grpSpec -and ($grpSpec -ne "*S-1-5-18") -and ($grpSpec -ne "*S-1-5-32-544")) {
+    & icacls $TargetDir /grant:r "${grpSpec}:(OI)(CI)RX" | Out-Null
   }
 }
+
+$Script:HasExplicitInstallDir = $PSBoundParameters.ContainsKey("InstallDir")
+$Script:HasExplicitDataDir = $PSBoundParameters.ContainsKey("DataDir")
 
 try {
   $DestBin = [System.IO.Path]::GetFullPath((Join-Path $InstallDir "volo.exe"))
@@ -354,8 +507,11 @@ try {
           "VOLO_ADMIN_PATH=$AdminPath",
           "VOLO_SECRET_KEY=$SecretHex",
           "VOLO_GEO_ACCESS_ENABLED=true",
-          "VOLO_DB_DRIVER=sqlite",
-          "VOLO_DB_DSN=$($DataDir -replace '\\','/')/data/volo.db",
+          "",
+          "# Leave DB driver/DSN commented out so Setup Wizard (data/db.json) controls DB selection unless explicitly overridden:",
+          "# VOLO_DB_DRIVER=sqlite",
+          "# VOLO_DB_DSN=$($DataDir -replace '\\','/')/data/volo.db",
+          "",
           "VOLO_DATA_DIR=$($DataDir -replace '\\','/')/data",
           "VOLO_UPLOAD_DIR=$($DataDir -replace '\\','/')/data/uploads",
           "VOLO_BACKUP_DIR=$($DataDir -replace '\\','/')/data/backups",
@@ -378,6 +534,13 @@ try {
         & $NssmCmd.Source install $ServiceName $DestBin "serve" "--env-file" $EnvFile | Out-Null
         & $NssmCmd.Source set $ServiceName AppDirectory $DataDir | Out-Null
         & $NssmCmd.Source set $ServiceName Start SERVICE_AUTO_START | Out-Null
+        if ($ServiceAccount -and ($ServiceAccount -notmatch '^(LocalSystem|SYSTEM|NT AUTHORITY\\SYSTEM)$')) {
+          if ([string]::IsNullOrEmpty($ServicePassword)) {
+            & $NssmCmd.Source set $ServiceName ObjectName $ServiceAccount '""' | Out-Null
+          } else {
+            & $NssmCmd.Source set $ServiceName ObjectName $ServiceAccount $ServicePassword | Out-Null
+          }
+        }
         Start-Service -Name $ServiceName
       } else {
         $TaskAction = New-ScheduledTaskAction -Execute $DestBin -Argument "serve --env-file `"$EnvFile`"" -WorkingDirectory $DataDir
@@ -394,16 +557,14 @@ try {
       Write-Host "  Listen   : http://$EffectiveListen"
     }
     "Upgrade" {
-      $ExistingTask = Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
-      if ($ExistingTask -and (-not $PSBoundParameters.ContainsKey("InstallDir")) -and $ExistingTask.Actions.Count -gt 0 -and $ExistingTask.Actions[0].Execute) {
-        $DestBin = [System.IO.Path]::GetFullPath($ExistingTask.Actions[0].Execute.Trim('"'))
-      }
+      Resolve-ExistingRegistration ([ref]$DestBin) ([ref]$DataDir) ([ref]$EnvFile)
       $SrcBin = Resolve-VoloBinary
       Stop-VoloServiceAndWait -TargetExe $DestBin
       if ((-not $DryRun) -and (Test-Path $DataDir)) { Sync-BundledExtensions -DestRoot $DataDir }
       Install-BinarySafe -SourceExe $SrcBin -TargetExe $DestBin
       if (-not $DryRun) {
-        if ($NssmCmd -and (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+        $ExistingTask = Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
+        if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
           Start-Service -Name $ServiceName
         } elseif ($ExistingTask) {
           Start-ScheduledTask -TaskName $ServiceName
@@ -413,25 +574,36 @@ try {
       }
     }
     "Uninstall" {
+      Resolve-ExistingRegistration ([ref]$DestBin) ([ref]$DataDir) ([ref]$EnvFile)
       Stop-VoloServiceAndWait -TargetExe $DestBin
-      if (-not $DryRun) {
+      if ($DryRun) {
+        Write-Host "[dry-run] Uninstall '$ServiceName' (Binary: $DestBin, DataDir: $DataDir, PurgeData: $PurgeData)"
+      } else {
         if ($NssmCmd -and (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
           & $NssmCmd.Source remove $ServiceName confirm | Out-Null
         }
         Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false -ErrorAction SilentlyContinue
         Remove-Item -Force $DestBin -ErrorAction SilentlyContinue
-        if ($PurgeData) { Remove-Item -Recurse -Force $DataDir -ErrorAction SilentlyContinue }
+        if ($PurgeData) {
+          Assert-SafePurgeDir $DataDir
+          if ($EnvFile -and (Test-Path $EnvFile)) { Remove-Item -Force $EnvFile -ErrorAction SilentlyContinue }
+          Remove-Item -Recurse -Force $DataDir -ErrorAction SilentlyContinue
+        }
         Write-Host "[Volo] Uninstalled service '$ServiceName' (DataDir: $DataDir)" -ForegroundColor Green
       }
     }
     "Start" {
-      if ($NssmCmd -and (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Start-Service -Name $ServiceName }
+      if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) { Start-Service -Name $ServiceName }
       else { Start-ScheduledTask -TaskName $ServiceName }
     }
-    "Stop" { Stop-VoloServiceAndWait -TargetExe $DestBin }
-    "Restart" {
+    "Stop" {
+      Resolve-ExistingRegistration ([ref]$DestBin) ([ref]$DataDir) ([ref]$EnvFile)
       Stop-VoloServiceAndWait -TargetExe $DestBin
-      if ($NssmCmd -and (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Start-Service -Name $ServiceName }
+    }
+    "Restart" {
+      Resolve-ExistingRegistration ([ref]$DestBin) ([ref]$DataDir) ([ref]$EnvFile)
+      Stop-VoloServiceAndWait -TargetExe $DestBin
+      if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) { Start-Service -Name $ServiceName }
       else { Start-ScheduledTask -TaskName $ServiceName }
     }
     "Status" {

@@ -11,11 +11,13 @@ import {
 import {
   ensureLocaleLoaded,
   exportFullTemplateJSON,
+  exportLocalePackJSON,
   localeSig,
   syncExternalLocales,
   t,
 } from "../i18n";
 import {
+  ActionMenu,
   AnimatedModal,
   ConsoleEmpty,
   ConsoleSelect,
@@ -413,6 +415,8 @@ export function AppearanceWorkspace({
     }
   };
 
+  const [exportingCode, setExportingCode] = useState<string>("");
+
   const downloadStarterTemplate = async (base: "zh-CN" | "en-US") => {
     const jsonText = await exportFullTemplateJSON(base);
     const blob = new Blob([jsonText], { type: "application/json;charset=utf-8" });
@@ -421,6 +425,24 @@ export function AppearanceWorkspace({
     a.download = `volo-locale-template-${base}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
+  };
+
+  const handleExportLocale = async (code: string) => {
+    if (exportingCode) return;
+    setExportingCode(code);
+    try {
+      const jsonText = await exportLocalePackJSON(code);
+      const blob = new Blob([jsonText], { type: "application/json;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${code}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setExportingCode("");
+    }
   };
 
   const themeSchema: any[] = themeModal?.localized_schema || themeModal?.config_schema || [];
@@ -809,7 +831,7 @@ export function AppearanceWorkspace({
                           : t("app.loc_src_builtin");
                     return (
                       <tr key={p.code}>
-                        <td class="col-fluid">
+                        <td class="col-fluid" data-label={t("app.loc_col_lang")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
                               <span>{p.name || p.code}</span>
@@ -843,7 +865,7 @@ export function AppearanceWorkspace({
                             )}
                           </div>
                         </td>
-                        <td class="col-act">
+                        <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
                             {!isUI && (
                               <button
@@ -860,62 +882,61 @@ export function AppearanceWorkspace({
                                 {t("app.loc_use_ui")}
                               </button>
                             )}
-                            {!isDef && (
-                              <button
-                                type="button"
-                                class="volo-act-btn"
-                                onClick={async () => {
-                                  try {
-                                    await apiFetch("/api/admin/settings/site", {
-                                      method: "PATCH",
-                                      body: JSON.stringify({ default_locale: p.code }),
-                                    });
-                                    setDefaultLocale(p.code);
-                                    showToast(t("common.saved"), "ok");
-                                  } catch (err: any) {
-                                    showToast(err.message, "err");
-                                  }
-                                }}
-                              >
-                                {t("app.loc_set_default")}
-                              </button>
-                            )}
-                            <a
+                            <button
+                              type="button"
                               class="volo-act-btn"
-                              href={`/api/admin/locales/${encodeURIComponent(p.code)}/export`}
+                              disabled={exportingCode === p.code}
+                              onClick={() => void handleExportLocale(p.code)}
                             >
                               {t("app.loc_export")}
-                            </a>
-                            {p.has_external && (
-                              <button
-                                type="button"
-                                class="volo-act-btn danger"
-                                onClick={async () => {
-                                  if (
-                                    !(await openConfirm({
-                                      message: t("app.loc_confirm_del", { code: p.code }),
-                                      danger: true,
-                                    }))
-                                  ) {
-                                    return;
-                                  }
-                                  try {
-                                    const res = await apiFetch<{ items?: any[]; locales?: any[] }>(
-                                      `/api/admin/locales/${encodeURIComponent(p.code)}`,
-                                      { method: "DELETE" },
-                                    );
-                                    if (res.locales) syncExternalLocales(res.locales);
-                                    if (res.items) setLocPacks(res.items);
-                                    showToast(t("app.loc_deleted"), "ok");
-                                    void loadData(true);
-                                  } catch (err: any) {
-                                    showToast(err.message, "err");
-                                  }
-                                }}
-                              >
-                                {t("app.loc_remove")}
-                              </button>
-                            )}
+                            </button>
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("app.loc_set_default"),
+                                  hidden: isDef,
+                                  onClick: async () => {
+                                    try {
+                                      await apiFetch("/api/admin/settings/site", {
+                                        method: "PATCH",
+                                        body: JSON.stringify({ default_locale: p.code }),
+                                      });
+                                      setDefaultLocale(p.code);
+                                      showToast(t("common.saved"), "ok");
+                                    } catch (err: any) {
+                                      showToast(err.message, "err");
+                                    }
+                                  },
+                                },
+                                {
+                                  label: t("app.loc_remove"),
+                                  hidden: !p.has_external,
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (
+                                      !(await openConfirm({
+                                        message: t("app.loc_confirm_del", { code: p.code }),
+                                        danger: true,
+                                      }))
+                                    ) {
+                                      return;
+                                    }
+                                    try {
+                                      const res = await apiFetch<{ items?: any[]; locales?: any[] }>(
+                                        `/api/admin/locales/${encodeURIComponent(p.code)}`,
+                                        { method: "DELETE" },
+                                      );
+                                      if (res.locales) syncExternalLocales(res.locales);
+                                      if (res.items) setLocPacks(res.items);
+                                      showToast(t("app.loc_deleted"), "ok");
+                                      void loadData(true);
+                                    } catch (err: any) {
+                                      showToast(err.message, "err");
+                                    }
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -990,7 +1011,7 @@ export function AppearanceWorkspace({
                     const pSchema: any[] = p.localized_schema || p.config_schema || [];
                     return (
                       <tr key={p.id}>
-                        <td class="col-fluid">
+                        <td class="col-fluid" data-label={t("app.plugin_col_info")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
                               <span>{p.name || p.id}</span>
@@ -998,7 +1019,14 @@ export function AppearanceWorkspace({
                             </div>
                             {p.description && <div class="volo-cell-meta"><span>{p.description}</span></div>}
                             {p.last_error && (
-                              <div style={{ color: "var(--volo-danger)", fontSize: "12px" }}>
+                              <div
+                                style={{
+                                  color: "var(--volo-danger)",
+                                  fontSize: "12px",
+                                  overflowWrap: "anywhere",
+                                  wordBreak: "break-word",
+                                }}
+                              >
                                 {t("app.last_error", { err: p.last_error })}
                               </div>
                             )}
@@ -1034,46 +1062,8 @@ export function AppearanceWorkspace({
                             )}
                           </div>
                         </td>
-                        <td class="col-act">
+                        <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
-                            {p.circuit_state === "CIRCUIT_OPEN" && (
-                              <button
-                                type="button"
-                                class="volo-act-btn"
-                                onClick={async () => {
-                                  try {
-                                    await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/reset-circuit`, {
-                                      method: "POST",
-                                      body: "{}",
-                                    });
-                                    showToast(t("app.circuit_reset_toast"), "ok");
-                                    void loadData(true);
-                                  } catch (err: any) {
-                                    showToast(err.message, "err");
-                                  }
-                                }}
-                              >
-                                {t("app.reset_circuit")}
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              class="volo-act-btn"
-                              onClick={async () => {
-                                try {
-                                  await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/reload`, {
-                                    method: "POST",
-                                    body: "{}",
-                                  });
-                                  showToast(t("app.plugin_reloaded"), "ok");
-                                  void loadData(true);
-                                } catch (err: any) {
-                                  showToast(err.message, "err");
-                                }
-                              }}
-                            >
-                              {t("app.plugin_reload")}
-                            </button>
                             {pSchema.length > 0 && (
                               <button
                                 type="button"
@@ -1105,33 +1095,65 @@ export function AppearanceWorkspace({
                             >
                               {t("app.logs")}
                             </button>
-                            {p.kind === "external" && !p.is_builtin && !p.builtin && (
-                              <button
-                                type="button"
-                                class="volo-act-btn danger"
-                                onClick={async () => {
-                                  if (
-                                    !(await openConfirm({
-                                      message: t("app.confirm_uninstall", { id: p.id }),
-                                      danger: true,
-                                    }))
-                                  ) {
-                                    return;
-                                  }
-                                  try {
-                                    await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}`, {
-                                      method: "DELETE",
-                                    });
-                                    showToast(t("common.deleted"), "ok");
-                                    void loadData(true);
-                                  } catch (err: any) {
-                                    showToast(err.message, "err");
-                                  }
-                                }}
-                              >
-                                {t("app.uninstall")}
-                              </button>
-                            )}
+                            <ActionMenu
+                              items={[
+                                {
+                                  label: t("app.reset_circuit"),
+                                  hidden: p.circuit_state !== "CIRCUIT_OPEN",
+                                  onClick: async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/reset-circuit`, {
+                                        method: "POST",
+                                        body: "{}",
+                                      });
+                                      showToast(t("app.circuit_reset_toast"), "ok");
+                                      void loadData(true);
+                                    } catch (err: any) {
+                                      showToast(err.message, "err");
+                                    }
+                                  },
+                                },
+                                {
+                                  label: t("app.plugin_reload"),
+                                  onClick: async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/reload`, {
+                                        method: "POST",
+                                        body: "{}",
+                                      });
+                                      showToast(t("app.plugin_reloaded"), "ok");
+                                      void loadData(true);
+                                    } catch (err: any) {
+                                      showToast(err.message, "err");
+                                    }
+                                  },
+                                },
+                                {
+                                  label: t("app.uninstall"),
+                                  hidden: !(p.kind === "external" && !p.is_builtin && !p.builtin),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (
+                                      !(await openConfirm({
+                                        message: t("app.confirm_uninstall", { id: p.id }),
+                                        danger: true,
+                                      }))
+                                    ) {
+                                      return;
+                                    }
+                                    try {
+                                      await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}`, {
+                                        method: "DELETE",
+                                      });
+                                      showToast(t("common.deleted"), "ok");
+                                      void loadData(true);
+                                    } catch (err: any) {
+                                      showToast(err.message, "err");
+                                    }
+                                  },
+                                },
+                              ]}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -1291,6 +1313,8 @@ export function AppearanceWorkspace({
           style={{
             maxHeight: "360px",
             overflow: "auto",
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
             fontSize: "12px",
             background: "var(--volo-raised)",
             padding: "12px",

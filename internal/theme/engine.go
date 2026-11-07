@@ -28,7 +28,7 @@ import (
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
-//go:embed builtin/volo-studio/theme.json builtin/volo-studio/preview.svg builtin/volo-studio/templates/*.html builtin/volo-studio/assets/*
+//go:embed builtin/volo-studio/theme.json builtin/volo-studio/preview.svg builtin/volo-studio/templates/*.html builtin/volo-studio/assets_gz/*
 var builtinThemeFS embed.FS
 
 const DefaultThemeID = "volo-studio"
@@ -159,11 +159,61 @@ func BuildPagination(currentPage, totalPages, pageSize, totalItems, windowSize i
 	}
 }
 
+// SeriesEpisodeItem represents one episode row inside an ArticleSeriesContext.
+type SeriesEpisodeItem struct {
+	ID        string
+	Slug      string
+	Title     string
+	Order     int
+	IsCurrent bool
+}
+
 // ArticleSeriesContext describes the current article's position inside a Series.
 type ArticleSeriesContext struct {
-	Series domain.Series
-	Index  int
-	Total  int
+	Series       domain.Series
+	Index        int
+	Total        int
+	Episodes     []SeriesEpisodeItem
+	PrevInSeries *visibility.PublicNeighbor
+	NextInSeries *visibility.PublicNeighbor
+}
+
+// ArchivePostEntry holds one compact post row for the paginated /archives page.
+type ArchivePostEntry struct {
+	Slug         string
+	Title        string
+	CategoryName string
+	CategorySlug string
+	PublishedAt  int64
+	MonthDay     string
+	YearMonth    string
+}
+
+// ArchiveMonthGroup groups archive posts under a YYYY-MM bucket.
+type ArchiveMonthGroup struct {
+	YearMonth string
+	Month     string
+	Count     int
+	Posts     []ArchivePostEntry
+}
+
+// ArchiveYearGroup groups archive month buckets under a calendar year.
+type ArchiveYearGroup struct {
+	Year   string
+	Count  int
+	Months []ArchiveMonthGroup
+}
+
+// ArchiveYearStat summarizes the post count for a year filter chip on /archives.
+type ArchiveYearStat struct {
+	Year  string
+	Count int
+}
+
+// LinkCategoryGroup holds a deterministic ordered category section on /links.
+type LinkCategoryGroup struct {
+	Category string
+	Items    []domain.Link
 }
 
 type cachedAsset struct {
@@ -203,6 +253,7 @@ type PageContext struct {
 	Locales         []i18n.LocaleInfo
 	Year            int
 	CurrentPath     string
+	RawQuery        string
 	BasePath        string
 	CanonicalURL    string
 	PageTitle       string
@@ -223,8 +274,8 @@ type PageContext struct {
 	Viewer          *domain.User
 	ViewerCSRFToken string
 	Owner           content.PublicAuthorProfile
-	Authors  []content.PublicAuthorProfile
-	Stats    content.PublicSiteStats
+	Authors         []content.PublicAuthorProfile
+	Stats           content.PublicSiteStats
 	NavItems        []content.PublicNavNode
 	NavMenu         NavMenu
 	NavMenuResolved bool
@@ -255,17 +306,26 @@ type PageContext struct {
 	StandalonePage   content.PublicPageView
 
 	// Taxonomies, Books, Links, Follows
-	TaxonomyKind      string
-	Categories        []content.CategoryWithCount
-	Tags              []content.TagWithCount
-	ArchiveBuckets    []content.ArchiveMonth
-	SeriesList        []domain.Series
-	Books             []domain.Book
-	BookDetail        content.BookDetailView
-	ActiveChapter     *domain.BookChapter
-	ActiveChapterHTML string
-	LinksByCategory   map[string][]domain.Link
-	FollowGroups      []content.FollowGroup
+	TaxonomyKind           string
+	Categories             []content.CategoryWithCount
+	Tags                   []content.TagWithCount
+	TagQuery               string
+	TagSort                string
+	ArchiveBuckets         []content.ArchiveMonth
+	SelectedArchiveYear    string
+	ArchiveYears           []ArchiveYearStat
+	ArchiveGroups          []ArchiveYearGroup
+	SeriesList             []domain.Series
+	Books                  []domain.Book
+	BookDetail             content.BookDetailView
+	ActiveChapter          *domain.BookChapter
+	ActiveChapterHTML      string
+	ActiveChapterNeedsMath bool
+	PrevChapter            *domain.BookChapter
+	NextChapter            *domain.BookChapter
+	LinksByCategory        map[string][]domain.Link
+	LinkGroups             []LinkCategoryGroup
+	FollowGroups           []content.FollowGroup
 
 	// Sidebar & Global Lists
 	SidebarCategories  []content.CategoryWithCount
@@ -291,9 +351,10 @@ type PageContext struct {
 
 // Engine manages embedded `volo-studio` and hot-reloadable external `./themes/<id>` packages.
 type Engine struct {
-	catalog     *i18n.Catalog
-	themesDir   string
-	cdnPrefixFn func() string
+	catalog        *i18n.Catalog
+	themesDir      string
+	cdnPrefixFn    func() string
+	vendorPrefixFn func() string
 
 	mu     sync.RWMutex
 	themes map[string]*loadedTheme
@@ -306,6 +367,13 @@ func (e *Engine) SetAssetCDNPrefixFunc(fn func() string) {
 	e.mu.Unlock()
 }
 
+// SetVendorCDNPrefixFunc registers an optional dynamic getter for Reading.VendorCDNPrefix.
+func (e *Engine) SetVendorCDNPrefixFunc(fn func() string) {
+	e.mu.Lock()
+	e.vendorPrefixFn = fn
+	e.mu.Unlock()
+}
+
 func (e *Engine) assetCDNPrefix() string {
 	e.mu.RLock()
 	fn := e.cdnPrefixFn
@@ -314,6 +382,18 @@ func (e *Engine) assetCDNPrefix() string {
 		return ""
 	}
 	return strings.TrimRight(strings.TrimSpace(fn()), "/")
+}
+
+func (e *Engine) vendorCDNPrefix() string {
+	e.mu.RLock()
+	fn := e.vendorPrefixFn
+	e.mu.RUnlock()
+	if fn != nil {
+		if v := strings.TrimRight(strings.TrimSpace(fn()), "/"); v != "" {
+			return v
+		}
+	}
+	return domain.DefaultVendorCDNPrefix
 }
 
 // NewEngine loads the embedded `volo-studio` theme and scans themesDir for external themes.
@@ -423,6 +503,52 @@ func (e *Engine) inspectThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 	}, nil
 }
 
+const (
+	maxExternalAssetSingleBytes = 5 << 20  // 5 MiB
+	maxExternalAssetTotalBytes  = 20 << 20 // 20 MiB
+	maxPooledRenderBufCap       = 64 << 10 // 64 KiB
+)
+
+var renderBufPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 16<<10))
+	},
+}
+
+func readBoundedThemeFile(fsys fs.FS, name string, enforceLimit bool, maxSingle int64, totalUsed *int64, maxTotal int64) ([]byte, bool) {
+	if !enforceLimit {
+		raw, err := fs.ReadFile(fsys, name)
+		if err != nil {
+			return nil, false
+		}
+		return raw, true
+	}
+	f, err := fsys.Open(name)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	if info, sErr := f.Stat(); sErr == nil {
+		if info.IsDir() || info.Size() > maxSingle || *totalUsed+info.Size() > maxTotal {
+			return nil, false
+		}
+	}
+	rem := maxTotal - *totalUsed
+	limit := maxSingle
+	if rem < limit {
+		limit = rem
+	}
+	if limit < 0 {
+		return nil, false
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil || int64(len(raw)) > limit {
+		return nil, false
+	}
+	*totalUsed += int64(len(raw))
+	return raw, true
+}
+
 func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 	if th == nil {
 		return nil
@@ -441,14 +567,29 @@ func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 		return th.assets
 	}
 
+	enforceBounds := !th.manifest.IsBuiltin
+	var totalBytes int64
+
 	assets := make(map[string]cachedAsset)
 	if th.fsys != nil {
+		_ = fs.WalkDir(th.fsys, "assets_gz", func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() || !strings.HasSuffix(p, ".gz") {
+				return nil
+			}
+			gzBytes, ok := readBoundedThemeFile(th.fsys, p, enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes)
+			if !ok || len(gzBytes) == 0 {
+				return nil
+			}
+			rel := strings.TrimSuffix(strings.TrimPrefix(p, "assets_gz/"), ".gz")
+			assets[rel] = buildPrecompressedAsset(gzBytes, rel)
+			return nil
+		})
 		_ = fs.WalkDir(th.fsys, "assets", func(p string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil || d.IsDir() {
 				return nil
 			}
-			raw, rErr := fs.ReadFile(th.fsys, p)
-			if rErr != nil {
+			raw, ok := readBoundedThemeFile(th.fsys, p, enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes)
+			if !ok {
 				return nil
 			}
 			rel := strings.TrimPrefix(p, "assets/")
@@ -466,7 +607,7 @@ func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 	previewCandidates = append(previewCandidates, "preview.svg", "preview.png", "preview.webp", "preview.jpg", "assets/preview.svg", "assets/preview.png")
 	if th.fsys != nil {
 		for _, cand := range previewCandidates {
-			if rawPrev, pErr := fs.ReadFile(th.fsys, cand); pErr == nil && len(rawPrev) > 0 {
+			if rawPrev, ok := readBoundedThemeFile(th.fsys, cand, enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes); ok && len(rawPrev) > 0 {
 				previewAsset = buildCachedAssetWithWriter(rawPrev, cand, zw, &gzBuf)
 				hasPreview = true
 				break
@@ -812,7 +953,7 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 		return fmt.Errorf("theme %s compile %s: %w", themeID, selected, err)
 	}
 	data.ThemeID = themeID
-	data.EnablePJAX = supportsPJAX
+	data.EnablePJAX = supportsPJAX && data.Reading.EnablePJAX
 	if data.ThemeConfig == nil {
 		data.ThemeConfig = e.ResolveThemeConfig(themeID, data.Appearance.ThemeConfigs)
 	}
@@ -820,14 +961,23 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 		data.NavMenu = e.ResolveNavMenu(data)
 		data.NavMenuResolved = true
 	}
+	e.prependVendorHeadSlot(&data)
 
 	entryTemplate := selected
 	if tmpl.Lookup("content") != nil && tmpl.Lookup("layout") != nil {
 		entryTemplate = "layout"
 	}
 
-	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, entryTemplate, data); err != nil {
+	buf := renderBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= maxPooledRenderBufCap {
+			buf.Reset()
+			renderBufPool.Put(buf)
+		}
+	}()
+
+	if err := tmpl.ExecuteTemplate(buf, entryTemplate, data); err != nil {
 		return fmt.Errorf("theme %s render %s (via %s): %w", themeID, selected, entryTemplate, err)
 	}
 
@@ -838,6 +988,98 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 	w.WriteHeader(status)
 	_, err = w.Write(buf.Bytes())
 	return err
+}
+
+func (e *Engine) prependVendorHeadSlot(data *PageContext) {
+	if data == nil {
+		return
+	}
+	for _, hw := range data.HeadWidgets {
+		if hw.PluginID == "volo-core-vendor" {
+			return
+		}
+	}
+	primary := strings.TrimRight(strings.TrimSpace(data.Reading.VendorCDNPrefix), "/")
+	if primary == "" {
+		primary = e.vendorCDNPrefix()
+	}
+	fallbacks := []string{
+		primary,
+		"https://fastly.jsdelivr.net/npm",
+		"https://cdn.jsdelivr.net/npm",
+		"https://unpkg.com",
+	}
+	bases := make([]string, 0, len(fallbacks))
+	seen := make(map[string]struct{}, len(fallbacks))
+	for _, b := range fallbacks {
+		b = strings.TrimRight(strings.TrimSpace(b), "/")
+		if b == "" {
+			continue
+		}
+		if _, exists := seen[b]; exists {
+			continue
+		}
+		seen[b] = struct{}{}
+		bases = append(bases, b)
+	}
+	basesJSON, err := json.Marshal(bases)
+	if err != nil {
+		basesJSON = []byte(`["https://cdn.jsdelivr.net/npm"]`)
+	}
+	safeBasesJS := strings.ReplaceAll(string(basesJSON), "</", `<\/`)
+
+	var sb strings.Builder
+	needsVendor := data.Detail.NeedsMath || data.Detail.NeedsMermaid ||
+		data.StandalonePage.NeedsMath || data.StandalonePage.NeedsMermaid ||
+		data.ActiveChapterNeedsMath
+	if needsVendor {
+		if origin := extractOriginForPreconnect(primary); origin != "" {
+			sb.WriteString(`<link rel="preconnect" href="`)
+			sb.WriteString(html.EscapeString(origin))
+			sb.WriteString(`" crossorigin>`)
+		}
+	}
+	sb.WriteString(`<script>window.__VOLO_VENDOR__=(function(b){var m={};function n(s){return String(s||"").replace(/^\/+/,"");}return{bases:b,katexCss:"katex@0.16.11/dist/katex.min.css",katexJs:"katex@0.16.11/dist/katex.min.js",katexAutoRenderJs:"katex@0.16.11/dist/contrib/auto-render.min.js",mermaidJs:"mermaid@10/dist/mermaid.min.js",url:function(s){return b[0]+"/"+n(s);},loadStyle:function(id,s){if(document.getElementById(id))return Promise.resolve();var c=n(s);return new Promise(function(ok){(function go(i){if(i>=b.length){ok();return;}var l=document.createElement("link");l.id=id;l.rel="stylesheet";l.href=b[i]+"/"+c;l.onload=function(){ok();};l.onerror=function(){l.remove();go(i+1);};document.head.appendChild(l);})(0);});},loadScript:function(s){var c=n(s);if(m[c])return m[c];m[c]=new Promise(function(ok,err){(function go(i){if(i>=b.length){delete m[c];err(new Error("vendor load failed: "+c));return;}var el=document.createElement("script"),d=false,t=setTimeout(function(){if(d)return;d=true;el.remove();go(i+1);},8000);el.src=b[i]+"/"+c;el.async=true;el.onload=function(){if(d)return;d=true;clearTimeout(t);ok();};el.onerror=function(){if(d)return;d=true;clearTimeout(t);el.remove();go(i+1);};document.head.appendChild(el);})(0);});return m[c];}};})(`)
+	sb.WriteString(safeBasesJS)
+	sb.WriteString(`);</script>`)
+
+	slot := plugin.RenderedSlot{
+		PluginID: "volo-core-vendor",
+		Slot:     "head",
+		Persist:  true,
+		HTML:     sb.String(),
+	}
+	next := make([]plugin.RenderedSlot, 0, len(data.HeadWidgets)+1)
+	next = append(next, slot)
+	next = append(next, data.HeadWidgets...)
+	data.HeadWidgets = next
+}
+
+func extractOriginForPreconnect(prefix string) string {
+	low := strings.ToLower(prefix)
+	var rest string
+	var scheme string
+	switch {
+	case strings.HasPrefix(low, "https://"):
+		scheme = "https://"
+		rest = prefix[len("https://"):]
+	case strings.HasPrefix(low, "http://"):
+		scheme = "http://"
+		rest = prefix[len("http://"):]
+	case strings.HasPrefix(low, "//"):
+		scheme = "https://"
+		rest = prefix[2:]
+	default:
+		return ""
+	}
+	if idx := strings.IndexByte(rest, '/'); idx >= 0 {
+		rest = rest[:idx]
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return ""
+	}
+	return scheme + rest
 }
 
 // ServePreview serves `/themes/{theme}/preview` with either the theme's custom preview image or a generated SVG card.
@@ -905,6 +1147,7 @@ func (e *Engine) ServeAsset(w http.ResponseWriter, r *http.Request, themeID stri
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	serveCachedAsset(w, r, asset, r.URL.Query().Get("v") != "")
 }
 
@@ -1231,6 +1474,23 @@ func buildCachedAssetWithWriter(raw []byte, rel string, zw *gzip.Writer, gzBuf *
 	return cachedAsset{
 		raw:         retainedRaw,
 		gzipped:     gzipped,
+		contentType: ctype,
+		etag:        etag,
+		shortHash:   short,
+	}
+}
+
+func buildPrecompressedAsset(gzBytes []byte, rel string) cachedAsset {
+	sum := sha256.Sum256(gzBytes)
+	short := hex.EncodeToString(sum[:4])
+	etag := `"` + hex.EncodeToString(sum[:12]) + `"`
+	ctype := mime.TypeByExtension(filepath.Ext(rel))
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	return cachedAsset{
+		raw:         nil,
+		gzipped:     gzBytes,
 		contentType: ctype,
 		etag:        etag,
 		shortHash:   short,

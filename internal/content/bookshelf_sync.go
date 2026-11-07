@@ -36,9 +36,33 @@ type BookDetailView struct {
 	FlatChapters []domain.BookChapter `json:"flat_chapters"`
 }
 
-// ListBooks returns all books ordered by sort_order ASC, created_at DESC.
+// ListBooks returns all books ordered by sort_order ASC, created_at DESC with live chapter counts.
 func (s *Service) ListBooks(ctx context.Context) ([]domain.Book, error) {
-	return sqlx.Select[domain.Book](ctx, s.store, `SELECT * FROM books ORDER BY sort_order ASC, created_at DESC`)
+	books, err := sqlx.Select[domain.Book](ctx, s.store, `SELECT * FROM books ORDER BY sort_order ASC, created_at DESC`)
+	if err != nil || len(books) == 0 {
+		return books, err
+	}
+	type cntRow struct {
+		BookID string `db:"book_id"`
+		Cnt    int    `db:"cnt"`
+	}
+	counts, cErr := sqlx.Select[cntRow](ctx, s.store, `SELECT book_id, COUNT(*) AS cnt FROM book_chapters GROUP BY book_id`)
+	if cErr == nil {
+		cntMap := make(map[string]int, len(counts))
+		for _, c := range counts {
+			cntMap[c.BookID] = c.Cnt
+		}
+		for i := range books {
+			if cnt, ok := cntMap[books[i].ID]; ok {
+				if cnt > 0 || books[i].ChapterCount <= 0 {
+					books[i].ChapterCount = cnt
+				}
+			} else if books[i].SourceType != "external" {
+				books[i].ChapterCount = 0
+			}
+		}
+	}
+	return books, nil
 }
 
 // GetBookBySlug loads a Book and reconstructs its hierarchical chapter tree + flat reader sequence.
@@ -54,6 +78,9 @@ func (s *Service) GetBookBySlug(ctx context.Context, slug string) (BookDetailVie
 	)
 	if err != nil {
 		return BookDetailView{}, err
+	}
+	if len(chapters) > 0 || bk.SourceType != "external" {
+		bk.ChapterCount = len(chapters)
 	}
 	return BookDetailView{
 		Book:         bk,
@@ -96,6 +123,12 @@ func (s *Service) lookupBookCard(ctx context.Context, slug string) (render.BookC
 	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE slug = ? OR id = ?`, slug, slug)
 	if err != nil {
 		return render.BookCardInfo{}, false
+	}
+	var liveCnt int
+	if cErr := s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM book_chapters WHERE book_id = ?`, bk.ID).Scan(&liveCnt); cErr == nil {
+		if liveCnt > 0 || bk.ChapterCount <= 0 {
+			bk.ChapterCount = liveCnt
+		}
 	}
 	return render.BookCardInfo{
 		Slug:         bk.Slug,

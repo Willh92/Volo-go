@@ -45,32 +45,35 @@ type BookCardInfo struct {
 
 // Options configures a single Markdown rendering pass.
 type Options struct {
-	Mode              RenderMode
-	Locale            string
-	ArticleID         string
-	Unlocked          bool // True when visitor unlocked article/:::lock password
-	IsReaderLoggedIn  bool // True when authenticated reader/editor/admin (for :::lock type="user")
-	HasAudio          bool // Enables [mm:ss] / [hh:mm:ss] podcast seek buttons
-	ShowLineNumbers   bool
-	LockPromptTitle   string
-	LockPromptAction  string
-	FeedLockedNotice  string
-	LookupBook        func(slug string) (BookCardInfo, bool)
-	ListBooks         func() []BookCardInfo
-	LookupMediaDims   func(src string) (width int, height int, ok bool)
+	Mode                RenderMode
+	Locale              string
+	ArticleID           string
+	Unlocked            bool            // True when visitor unlocked whole-article/un-attributed :::lock password
+	AuthorOrShareBypass bool            // True when staff author/admin or valid ShareToken bypasses all locks
+	UnlockedPasswords   map[string]bool // Per-password unlock state for inline :::lock pwd="..." blocks
+	IsReaderLoggedIn    bool            // True when authenticated reader/editor/admin (for :::lock type="user")
+	HasAudio            bool            // Enables [mm:ss] / [hh:mm:ss] podcast seek buttons
+	ShowLineNumbers     bool
+	LockPromptTitle     string
+	LockPromptAction    string
+	FeedLockedNotice    string
+	LookupBook          func(slug string) (BookCardInfo, bool)
+	ListBooks           func() []BookCardInfo
+	LookupMediaDims     func(src string) (width int, height int, ok bool)
 }
 
 // Output contains sanitized HTML plus extracted outline, plain text, first public image, and lazy-load hints.
 type Output struct {
-	HTML           string    `json:"html"`
-	PlainText      string    `json:"plain_text"`
-	FirstImageURL  string    `json:"first_image_url"`
-	TOC            []TOCItem `json:"toc"`
-	WordCount      int       `json:"word_count"`
-	ReadingMinutes int       `json:"reading_minutes"`
-	HasLockBlock   bool      `json:"has_lock_block"`
-	NeedsMath      bool      `json:"needs_math"`
-	NeedsMermaid   bool      `json:"needs_mermaid"`
+	HTML              string    `json:"html"`
+	PlainText         string    `json:"plain_text"`
+	FirstImageURL     string    `json:"first_image_url"`
+	TOC               []TOCItem `json:"toc"`
+	WordCount         int       `json:"word_count"`
+	ReadingMinutes    int       `json:"reading_minutes"`
+	HasLockBlock      bool      `json:"has_lock_block"`
+	HasUnresolvedLock bool      `json:"has_unresolved_lock"`
+	NeedsMath         bool      `json:"needs_math"`
+	NeedsMermaid      bool      `json:"needs_mermaid"`
 }
 
 // Engine is a thread-safe, zero-CGO Markdown rendering pipeline powered by goldmark + chroma/v2 + bluemonday.
@@ -191,24 +194,26 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 	wc, mins := ComputeReadingStats(plain)
 
 	return Output{
-		HTML:           safeHTML,
-		PlainText:      plain,
-		FirstImageURL:  firstImg,
-		TOC:            toc,
-		WordCount:      wc,
-		ReadingMinutes: mins,
-		HasLockBlock:   prep.hasLock,
-		NeedsMath:      prep.needsMath,
-		NeedsMermaid:   prep.needsMermaid,
+		HTML:              safeHTML,
+		PlainText:         plain,
+		FirstImageURL:     firstImg,
+		TOC:               toc,
+		WordCount:         wc,
+		ReadingMinutes:    mins,
+		HasLockBlock:      prep.hasLock,
+		HasUnresolvedLock: prep.hasUnresolvedLock,
+		NeedsMath:         prep.needsMath,
+		NeedsMermaid:      prep.needsMermaid,
 	}
 }
 
 type preprocessResult struct {
-	markdown     string
-	replacements map[string]string
-	hasLock      bool
-	needsMath    bool
-	needsMermaid bool
+	markdown          string
+	replacements      map[string]string
+	hasLock           bool
+	hasUnresolvedLock bool
+	needsMath         bool
+	needsMermaid      bool
 }
 
 var attrPairRe = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'\]:]+))`)
@@ -263,13 +268,17 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 			continue
 		}
 
-		// 2. `:::lock [type="pwd|user"] [hint="..."]` — FAIL-CLOSED if unclosed at EOF!
+		// 2. `:::lock [type="pwd|user"] [pwd="..."] [hint="..."]` — FAIL-CLOSED if unclosed at EOF!
 		if isDirectivePrefix(trimmed, ":::lock") {
 			res.hasLock = true
 			attrs := parseDirectiveAttrs(trimmed[len(":::lock"):])
 			lockType := strings.ToLower(strings.TrimSpace(attrs["type"]))
 			if lockType == "" {
 				lockType = "pwd"
+			}
+			blockPwd := strings.TrimSpace(attrs["pwd"])
+			if blockPwd == "" {
+				blockPwd = strings.TrimSpace(attrs["password"])
 			}
 			hint := strings.TrimSpace(attrs["hint"])
 			i++
@@ -302,13 +311,35 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				i++
 			}
 
-			canView := opts.Unlocked || (lockType == "user" && opts.IsReaderLoggedIn)
-			if canView && opts.Mode == RenderModeWeb {
+			canView := false
+			if opts.Mode == RenderModeWeb {
+				if opts.AuthorOrShareBypass {
+					canView = true
+				} else if lockType == "user" {
+					canView = opts.IsReaderLoggedIn
+				} else if blockPwd != "" {
+					if opts.UnlockedPasswords != nil {
+						canView = opts.UnlockedPasswords[blockPwd]
+					} else {
+						canView = opts.Unlocked
+					}
+				} else {
+					canView = opts.Unlocked
+				}
+			}
+
+			if canView {
 				outLines = append(outLines, `<div class="volo-lock-block volo-lock-block--unlocked" data-lock-type="`+html.EscapeString(lockType)+`">`, "")
 				innerPrep := preprocessDirectives(strings.Join(innerLines, "\n"), opts)
 				for k, v := range innerPrep.replacements {
 					res.replacements["INNER"+strconv.Itoa(seq)+k] = v
 					innerPrep.markdown = strings.ReplaceAll(innerPrep.markdown, k, "INNER"+strconv.Itoa(seq)+k)
+				}
+				if innerPrep.hasLock {
+					res.hasLock = true
+				}
+				if innerPrep.hasUnresolvedLock {
+					res.hasUnresolvedLock = true
 				}
 				if innerPrep.needsMath {
 					res.needsMath = true
@@ -319,6 +350,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				outLines = append(outLines, innerPrep.markdown, "", `</div>`)
 			} else {
 				// Locked! Inner lines are completely discarded before AST parsing — zero chance of leakage!
+				res.hasUnresolvedLock = true
 				tok := nextToken("LOCK")
 				res.replacements[tok] = renderLockedPlaceholder(lockType, hint, opts)
 				outLines = append(outLines, "", tok, "")
@@ -683,7 +715,8 @@ func injectAudioTimestamps(htmlSrc string) string {
 				s, _ := strconv.Atoi(sub[2])
 				sec = m*60 + s
 			}
-			return fmt.Sprintf(`<button type="button" class="volo-ts-seek" data-audio-seek="%d">%s</button>`, sec, html.EscapeString(match))
+			rawTS := strings.TrimSuffix(strings.TrimPrefix(match, "["), "]")
+			return fmt.Sprintf(`<button type="button" class="volo-audio-ts" data-audio-seek="%d">▶ %s</button>`, sec, html.EscapeString(rawTS))
 		})
 		out.WriteString(rewritten)
 	}
@@ -910,13 +943,15 @@ func StripAllCodeAndLockBlocks(src string) string {
 	return strings.Join(out, "\n")
 }
 
-// ExtractFirstLockPassword scans Markdown outside fenced code blocks for `:::lock ... pwd="..."` (or `password="..."`)
-// so public articles with inline password-locked blocks can be unlocked via /api/v1/articles/{id}/unlock.
-func ExtractFirstLockPassword(src string) string {
+// ExtractAllLockPasswords scans Markdown outside fenced code blocks for all unique `:::lock ... pwd="..."`
+// (or `password="..."`) attributes in order of appearance.
+func ExtractAllLockPasswords(src string) []string {
 	lines := strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
 	inFence := false
 	var fenceChar byte
 	fenceLen := 0
+	var out []string
+	seen := make(map[string]struct{})
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if ch, n, ok := parseFenceStart(trimmed); ok {
@@ -931,15 +966,29 @@ func ExtractFirstLockPassword(src string) string {
 		}
 		if !inFence && isDirectivePrefix(trimmed, ":::lock") {
 			attrs := parseDirectiveAttrs(trimmed[len(":::lock"):])
-			if p := strings.TrimSpace(attrs["pwd"]); p != "" {
-				return p
+			p := strings.TrimSpace(attrs["pwd"])
+			if p == "" {
+				p = strings.TrimSpace(attrs["password"])
 			}
-			if p := strings.TrimSpace(attrs["password"]); p != "" {
-				return p
+			if p != "" {
+				if _, exists := seen[p]; !exists {
+					seen[p] = struct{}{}
+					out = append(out, p)
+				}
 			}
 		}
 	}
-	return ""
+	return out
+}
+
+// ExtractFirstLockPassword scans Markdown outside fenced code blocks for `:::lock ... pwd="..."` (or `password="..."`)
+// so public articles with inline password-locked blocks can be unlocked via /api/v1/articles/{id}/unlock.
+func ExtractFirstLockPassword(src string) string {
+	pwds := ExtractAllLockPasswords(src)
+	if len(pwds) == 0 {
+		return ""
+	}
+	return pwds[0]
 }
 
 // ContainsLockDirective reports whether src contains at least one `:::lock` directive outside fenced code blocks.

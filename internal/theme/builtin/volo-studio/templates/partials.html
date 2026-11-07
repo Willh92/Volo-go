@@ -189,35 +189,54 @@
          data-l-ban-reject="{{t .Ctx.Locale "comment.ban_also_reject"}}"
          data-l-ban-note="{{t .Ctx.Locale "comment.ban_note_ph"}}"
          data-l-ban-confirm="{{t .Ctx.Locale "comment.ban_confirm"}}"
-         data-l-claim="{{t .Ctx.Locale "comment.claim_guest_prompt" (dict "count" "")}}">
+         data-l-claim="{{t .Ctx.Locale "comment.claim_guest_prompt" (dict "count" "")}}"
+         data-l-prev="{{t .Ctx.Locale "pagination.prev"}}"
+         data-l-next="{{t .Ctx.Locale "pagination.next"}}"
+         data-l-page="{{t .Ctx.Locale "pagination.page_info" (dict "page" "{page}" "total" "{total}")}}"
+         data-l-confirm="{{if hasPrefix .Ctx.Locale "en"}}Confirm?{{else if eq .Ctx.Locale "zh-TW"}}確認刪除？{{else}}确认删除？{{end}}"
+         data-l-more-replies="{{if hasPrefix .Ctx.Locale "en"}}Show {count} more replies{{else if eq .Ctx.Locale "zh-TW"}}展開其餘 {count} 條回覆{{else}}展开其余 {count} 条回复{{end}}"
+         data-l-net-err="{{t .Ctx.Locale "error.hint_default"}}">
 </section>
 {{end}}
 
 {{define "pagination"}}
 {{if gt .TotalPages 1}}
+  {{$base := default (default "/" .CurrentPath) .BasePath}}
+  {{if and .RawQuery (not (contains $base "?"))}}
+    {{$base = printf "%s?%s" $base .RawQuery}}
+  {{end}}
+  {{if and .SelectedArchiveYear (not (contains $base "year="))}}
+    {{if contains $base "?"}}{{$base = printf "%s&year=%s" $base (urlquery .SelectedArchiveYear)}}{{else}}{{$base = printf "%s?year=%s" $base (urlquery .SelectedArchiveYear)}}{{end}}
+  {{end}}
+  {{if and .TagQuery (not (contains $base "q="))}}
+    {{if contains $base "?"}}{{$base = printf "%s&q=%s" $base (urlquery .TagQuery)}}{{else}}{{$base = printf "%s?q=%s" $base (urlquery .TagQuery)}}{{end}}
+  {{end}}
+  {{if and .TagSort (not (contains $base "sort="))}}
+    {{if contains $base "?"}}{{$base = printf "%s&sort=%s" $base (urlquery .TagSort)}}{{else}}{{$base = printf "%s?sort=%s" $base (urlquery .TagSort)}}{{end}}
+  {{end}}
   <nav class="pagination" aria-label="Pagination">
     {{if gt .Page 1}}
-      <a class="pagination__item" href="{{pageURL .BasePath (sub .Page 1)}}">←</a>
+      <a class="pagination__item" href="{{pageURL $base (sub .Page 1)}}" aria-label="{{t .Locale "pagination.prev"}}">←</a>
     {{end}}
     {{if .Pagination.PageNumbers}}
       {{if .Pagination.ShowFirst}}
-        <a class="pagination__item" href="{{pageURL .BasePath 1}}">1</a>
+        <a class="pagination__item" href="{{pageURL $base 1}}">1</a>
         <span class="pagination__ellipsis">…</span>
       {{end}}
       {{range .Pagination.PageNumbers}}
         {{if eq . $.Page}}
           <span class="pagination__item pagination__item--current" aria-current="page">{{.}}</span>
         {{else}}
-          <a class="pagination__item" href="{{pageURL $.BasePath .}}">{{.}}</a>
+          <a class="pagination__item" href="{{pageURL $base .}}">{{.}}</a>
         {{end}}
       {{end}}
       {{if .Pagination.ShowLast}}
         <span class="pagination__ellipsis">…</span>
-        <a class="pagination__item" href="{{pageURL .BasePath .TotalPages}}">{{.TotalPages}}</a>
+        <a class="pagination__item" href="{{pageURL $base .TotalPages}}">{{.TotalPages}}</a>
       {{end}}
     {{end}}
     {{if lt .Page .TotalPages}}
-      <a class="pagination__item" href="{{pageURL .BasePath (add .Page 1)}}">→</a>
+      <a class="pagination__item" href="{{pageURL $base (add .Page 1)}}" aria-label="{{t .Locale "pagination.next"}}">→</a>
     {{end}}
   </nav>
 {{end}}

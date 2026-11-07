@@ -140,15 +140,39 @@ func parseNavPrimaryCount(cfg map[string]any) int {
 	return n
 }
 
+func isNavPathPrefixActive(curPath, targetURL string) bool {
+	if targetURL == "" {
+		return false
+	}
+	if targetURL == "/" {
+		return curPath == "/"
+	}
+	if strings.HasPrefix(targetURL, "/") && !strings.HasPrefix(targetURL, "//") {
+		clean := targetURL
+		if idx := strings.IndexAny(clean, "?#"); idx >= 0 {
+			clean = clean[:idx]
+		}
+		clean = strings.TrimRight(clean, "/")
+		if clean == "" {
+			return curPath == "/"
+		}
+		return curPath == clean || strings.HasPrefix(curPath, clean+"/")
+	}
+	return curPath == targetURL
+}
+
 // ResolveNavMenu constructs a resolved NavMenu for `data` based on the active theme's
 // `header_nav_items` and `header_nav_primary_count` configuration and custom `NavItems`.
 func (e *Engine) ResolveNavMenu(data PageContext) NavMenu {
 	var themeLocales map[string]map[string]string
 	e.mu.RLock()
-	if th, ok := e.themes[data.ThemeID]; ok && th != nil {
-		themeLocales = th.locales
-	}
+	th := e.themes[data.ThemeID]
 	e.mu.RUnlock()
+	if th != nil {
+		th.mu.Lock()
+		themeLocales = th.locales
+		th.mu.Unlock()
+	}
 
 	tr := func(key, fallback string) string {
 		if msg, ok := lookupThemeLocaleMessage(themeLocales, data.Locale, key); ok && msg != "" {
@@ -182,7 +206,7 @@ func (e *Engine) ResolveNavMenu(data PageContext) NavMenu {
 					URL:          u,
 					Icon:         it.Icon,
 					OpenInNewTab: it.OpenInNewTab,
-					IsActive:     curPath == u,
+					IsActive:     isNavPathPrefixActive(curPath, u),
 					IsCustom:     true,
 				})
 			}
@@ -196,7 +220,7 @@ func (e *Engine) ResolveNavMenu(data PageContext) NavMenu {
 		if spec.exactPath {
 			active = curPath == spec.url
 		} else {
-			active = curPath == spec.url || strings.HasPrefix(curPath, spec.url+"/") || strings.HasPrefix(curPath, spec.url)
+			active = curPath == spec.url || strings.HasPrefix(curPath, spec.url+"/")
 		}
 		items = append(items, NavLink{
 			Key:      key,

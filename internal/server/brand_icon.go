@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/Willh92/Volo-go/internal/repo"
 )
 
 // voloFaviconSVG is the authentic Volo Studio `V.` emblem (#246b51 rounded squircle + `#eef5ee` bold V + period dot).
@@ -46,13 +48,19 @@ func (s *AppServer) resolveCustomFaviconRedirect() string {
 	if s == nil || s.deps.Settings == nil {
 		return ""
 	}
-	fav := strings.TrimSpace(s.deps.Settings.Snapshot().Site.FaviconURL)
+	fav, ok := repo.SanitizeAllowedURL(s.deps.Settings.Snapshot().Site.FaviconURL, false)
+	if !ok {
+		return ""
+	}
 	switch fav {
 	case "", "/favicon.svg", "/favicon.ico", "/assets/favicon.svg":
 		return ""
-	default:
+	}
+	lower := strings.ToLower(fav)
+	if strings.HasPrefix(fav, "/") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		return fav
 	}
+	return ""
 }
 
 func (s *AppServer) handleServeFaviconSVG(w http.ResponseWriter, r *http.Request) {

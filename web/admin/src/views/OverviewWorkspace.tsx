@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
+import { createPortal } from "preact/compat";
+import type { CSSProperties } from "preact";
 import {
   apiFetch,
   clearLocalDraft,
@@ -14,15 +16,19 @@ import {
 import { CM6Editor, QuickInsertItem } from "../components/CM6Editor";
 import { MediaPickButton } from "../components/MediaLibraryModal";
 import {
+  ActionMenu,
   AnimatedModal,
   BatchBar,
+  computePortalMenuStyle,
   ConsoleEmpty,
   ConsoleSelect,
+  MobileSelectAllBar,
   paginateItems,
   Pagination,
   SwitchToggle,
   TableSkeleton,
   UploadButton,
+  useDebouncedValue,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
 
@@ -42,6 +48,15 @@ const DONUT_PALETTE = [
   "#2bb3b1",
   "#c28e46",
 ];
+
+function formatCompactNum(raw: number): string {
+  const n = Number(raw || 0);
+  if (!Number.isFinite(n)) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(Math.round(n));
+}
 
 function buildSmoothCurve(pts: ChartPoint[]): string {
   if (pts.length === 0) return "";
@@ -181,7 +196,7 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
   const series = items.length > 0 ? items : buildFallbackMonths(12);
   const W = 320;
   const H = 160;
-  const padL = 30;
+  const padL = 38;
   const padR = 14;
   const padT = 14;
   const padB = 28;
@@ -222,7 +237,7 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
           }}
         >
           <div style={{ fontWeight: 650 }}>{active.month}</div>
-          <div>{t("ov.published")}: {active.count}</div>
+          <div>{t("ov.published")}: {Number(active.count || 0).toLocaleString()}</div>
         </div>
       )}
       <svg
@@ -256,7 +271,7 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
                 stroke-dasharray={ratio === 0 ? undefined : "3 3"}
               />
               <text x={padL - 5} y={y + 3.5} text-anchor="end" font-size="11" fill="var(--volo-muted)">
-                {val}
+                {formatCompactNum(val)}
               </text>
             </g>
           );
@@ -310,16 +325,28 @@ function DonutChart({
   emptyText: string;
   prefix?: string;
 }) {
-  const positive = (items || []).filter((it) => Number(it.count || 0) > 0).slice(0, 6);
-  const total = positive.reduce((acc, it) => acc + Number(it.count || 0), 0);
+  const allPositive = (items || []).filter((it) => Number(it.count || 0) > 0);
+  const total = allPositive.reduce((acc, it) => acc + Number(it.count || 0), 0);
 
-  if (positive.length === 0 || total <= 0) {
+  if (allPositive.length === 0 || total <= 0) {
     return (
       <div class="volo-empty-state" style={{ padding: "28px 10px", flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
         {emptyText}
       </div>
     );
   }
+
+  const segments: Array<{ name: string; count: number; isOthers?: boolean }> =
+    allPositive.length > 5
+      ? [
+          ...allPositive.slice(0, 5),
+          {
+            name: t("ov.chart_others"),
+            count: allPositive.slice(5).reduce((acc, it) => acc + Number(it.count || 0), 0),
+            isOthers: true,
+          },
+        ]
+      : allPositive;
 
   const r = 38;
   const cx = 52;
@@ -330,8 +357,9 @@ function DonutChart({
   return (
     <div class="volo-donut-wrap">
       <svg width="104" height="104" viewBox="0 0 104 104" style={{ flexShrink: 0 }}>
+        <title>{total.toLocaleString()}</title>
         <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--volo-line)" stroke-width="15" />
-        {positive.map((it, idx) => {
+        {segments.map((it, idx) => {
           const val = Number(it.count || 0);
           const frac = val / total;
           const segLen = Math.max(0, frac * circ);
@@ -339,6 +367,7 @@ function DonutChart({
           offsetAcc += segLen;
           const color = DONUT_PALETTE[idx % DONUT_PALETTE.length];
           const pct = Math.round(frac * 100);
+          const dispName = `${it.isOthers ? "" : prefix}${it.name}`;
           return (
             <circle
               key={`${it.name}-${idx}`}
@@ -352,12 +381,19 @@ function DonutChart({
               stroke-dashoffset={(-curOffset).toFixed(2)}
               transform={`rotate(-90 ${cx} ${cy})`}
             >
-              <title>{`${prefix}${it.name}: ${val} (${pct}%)`}</title>
+              <title>{`${dispName}: ${val.toLocaleString()} (${pct}%)`}</title>
             </circle>
           );
         })}
-        <text x={cx} y={cy - 1} text-anchor="middle" font-size="15" font-weight="700" fill="var(--volo-text)">
-          {total}
+        <text
+          x={cx}
+          y={cy - 1}
+          text-anchor="middle"
+          font-size={total >= 10000 ? "13.5" : "15"}
+          font-weight="700"
+          fill="var(--volo-text)"
+        >
+          {formatCompactNum(total)}
         </text>
         <text x={cx} y={cy + 14} text-anchor="middle" font-size="11" fill="var(--volo-muted)">
           {t("ov.chart_total")}
@@ -365,20 +401,21 @@ function DonutChart({
       </svg>
 
       <div class="volo-donut-legend">
-        {positive.map((it, idx) => {
+        {segments.map((it, idx) => {
           const val = Number(it.count || 0);
           const pct = Math.round((val / total) * 100);
           const color = DONUT_PALETTE[idx % DONUT_PALETTE.length];
+          const dispName = `${it.isOthers ? "" : prefix}${it.name}`;
           return (
             <div key={`${it.name}-${idx}`} class="volo-donut-legend-row">
               <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
                 <span class="volo-donut-dot" style={{ background: color }} />
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={`${prefix}${it.name}`}>
-                  {prefix}{it.name}
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={dispName}>
+                  {dispName}
                 </span>
               </div>
-              <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", whiteSpace: "nowrap" }}>
-                {val} ({pct}%)
+              <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", whiteSpace: "nowrap" }} title={val.toLocaleString()}>
+                {formatCompactNum(val)} ({pct}%)
               </span>
             </div>
           );
@@ -403,6 +440,14 @@ export function OverviewWorkspace({
   const [trendDays, setTrendDays] = useState<7 | 30>(7);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [articles, setArticles] = useState<any[]>([]);
+  const [artTotal, setArtTotal] = useState<number>(0);
+  const [artPageSize, setArtPageSize] = useState<number>(20);
+  const [statusCounts, setStatusCounts] = useState<{
+    all?: number;
+    published?: number;
+    scheduled?: number;
+    draft?: number;
+  }>({});
   const [artLoading, setArtLoading] = useState<boolean>(false);
   const [importingZip, setImportingZip] = useState<boolean>(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -411,10 +456,15 @@ export function OverviewWorkspace({
   const [categories, setCategories] = useState<any[]>([]);
   const [seriesList, setSeriesList] = useState<any[]>([]);
   const [allTags, setAllTags] = useState<any[]>([]);
+  const [totalTagCount, setTotalTagCount] = useState<number>(0);
   const [statusFilter, setStatusFilter] = useState<string>(section === "drafts" ? "draft" : "all");
   const [catFilter, setCatFilter] = useState<string>("");
+  const [visFilter, setVisFilter] = useState<string>("");
+  const [artSort, setArtSort] = useState<string>("updated");
   const [query, setQuery] = useState<string>("");
+  const debouncedQuery = useDebouncedValue(query, 250);
   const [artPage, setArtPage] = useState<number>(1);
+  const artReqSeqRef = useRef<number>(0);
 
   // Studio Editor state (`null` = not editing, `""` = new post, `"id"` = editing post)
   const [editingID, setEditingID] = useState<string | null>(null);
@@ -424,6 +474,24 @@ export function OverviewWorkspace({
   const [tagsText, setTagsText] = useState("");
   const [tagDraft, setTagDraft] = useState("");
   const [tagPoolOpen, setTagPoolOpen] = useState(false);
+  const [tagPoolQuery, setTagPoolQuery] = useState("");
+  const [tagPoolSort, setTagPoolSort] = useState<"count" | "name">("count");
+  const [remoteTags, setRemoteTags] = useState<any[]>([]);
+  const [tagSuggestOpen, setTagSuggestOpen] = useState(false);
+  const [tagSuggestIdx, setTagSuggestIdx] = useState(0);
+  const [tagSuggestStyle, setTagSuggestStyle] = useState<CSSProperties>({});
+  const tagBoxRef = useRef<HTMLDivElement | null>(null);
+  const tagInputRef = useRef<HTMLInputElement | null>(null);
+  const tagSuggestRef = useRef<HTMLDivElement | null>(null);
+  const debouncedTagDraft = useDebouncedValue(tagDraft, 180);
+  const debouncedTagPoolQ = useDebouncedValue(tagPoolQuery, 200);
+
+  // Quick-Create Category / Series modal inside Article Editor
+  const [quickCreateKind, setQuickCreateKind] = useState<"category" | "series" | null>(null);
+  const [quickCreateName, setQuickCreateName] = useState("");
+  const [quickCreateSlug, setQuickCreateSlug] = useState("");
+  const [quickCreateSaving, setQuickCreateSaving] = useState(false);
+
   const [seriesID, setSeriesID] = useState("");
   const [summaryMD, setSummaryMD] = useState("");
   const [contentMD, setContentMD] = useState("");
@@ -471,6 +539,8 @@ export function OverviewWorkspace({
     setTagsText("");
     setTagDraft("");
     setTagPoolOpen(false);
+    setTagPoolQuery("");
+    setTagSuggestOpen(false);
     setSeriesID("");
     setSummaryMD("");
     setContentMD("");
@@ -508,28 +578,81 @@ export function OverviewWorkspace({
     if (ov) setOverview(ov);
   };
 
-  const loadArticlesAndTaxonomies = async (effStatus = statusFilter, effCat = catFilter, effQuery = query) => {
+  const loadTaxonomies = async () => {
+    const [cats, sers, tgs] = await Promise.all([
+      apiFetch<{ items: any[]; total?: number }>("/api/admin/categories?per_page=200").catch(() => ({ items: [] })),
+      apiFetch<{ items: any[]; total?: number }>("/api/admin/series?per_page=200").catch(() => ({ items: [] })),
+      apiFetch<{ items: any[]; total?: number }>("/api/admin/tags?sort=count&per_page=200").catch(() => ({
+        items: [] as any[],
+        total: undefined as number | undefined,
+      })),
+    ]);
+    const catItems = cats.items || [];
+    const serItems = sers.items || [];
+    const tagItems = tgs.items || [];
+    setCategories(catItems);
+    setSeriesList(serItems);
+    setAllTags(tagItems);
+    setTotalTagCount(typeof tgs.total === "number" ? tgs.total : tagItems.length);
+    return catItems;
+  };
+
+  const loadArticlesPage = async (opts?: {
+    page?: number;
+    perPage?: number;
+    status?: string;
+    cat?: string;
+    vis?: string;
+    sort?: string;
+    q?: string;
+  }) => {
+    const reqId = ++artReqSeqRef.current;
+    const effPage = opts?.page ?? artPage;
+    const effPerPage = opts?.perPage ?? artPageSize;
+    const effStatus = opts?.status ?? statusFilter;
+    const effCat = opts?.cat ?? catFilter;
+    const effVis = opts?.vis ?? visFilter;
+    const effSort = opts?.sort ?? artSort;
+    const effQ = opts?.q ?? debouncedQuery;
+
     setArtLoading(true);
     try {
-      const [arts, cats, sers, tgs] = await Promise.all([
-        apiFetch<{ items: any[] }>(
-          `/api/admin/articles?status=${encodeURIComponent(effStatus)}&category_id=${encodeURIComponent(effCat)}&q=${encodeURIComponent(effQuery)}`
-        ).catch(() => ({ items: [] })),
-        apiFetch<{ items: any[] }>("/api/admin/categories").catch(() => ({ items: [] })),
-        apiFetch<{ items: any[] }>("/api/admin/series").catch(() => ({ items: [] })),
-        apiFetch<{ items: any[] }>("/api/admin/tags").catch(() => ({ items: [] })),
-      ]);
+      const qs = new URLSearchParams();
+      qs.set("page", String(effPage));
+      qs.set("per_page", String(effPerPage));
+      if (effStatus && effStatus !== "all") qs.set("status", effStatus);
+      else qs.set("status", "all");
+      if (effCat) qs.set("category_id", effCat);
+      if (effVis) qs.set("visibility", effVis);
+      if (effSort) qs.set("sort", effSort);
+      if (effQ.trim()) qs.set("q", effQ.trim());
+
+      const arts = await apiFetch<{
+        items: any[];
+        total?: number;
+        status_counts?: { all?: number; published?: number; scheduled?: number; draft?: number };
+      }>(`/api/admin/articles?${qs.toString()}`).catch(() => ({ items: [] as any[], total: 0, status_counts: undefined }));
+
+      if (reqId !== artReqSeqRef.current) return;
       const nextItems = arts.items || [];
       setArticles(nextItems);
-      setCategories(cats.items || []);
-      setSeriesList(sers.items || []);
-      setAllTags(tgs.items || []);
+      setArtTotal(typeof arts.total === "number" ? arts.total : nextItems.length);
+      if (arts.status_counts) {
+        setStatusCounts(arts.status_counts);
+      }
       const validIds = new Set(nextItems.map((r: any) => r.article?.id));
       setSelectedIds((prev) => prev.filter((id) => validIds.has(id)));
-      return cats.items || [];
     } finally {
-      setArtLoading(false);
+      if (reqId === artReqSeqRef.current) setArtLoading(false);
     }
+  };
+
+  const loadArticlesAndTaxonomies = async (effStatus = statusFilter, effCat = catFilter, effQuery = debouncedQuery) => {
+    const [cats] = await Promise.all([
+      loadTaxonomies(),
+      loadArticlesPage({ status: effStatus, cat: effCat, q: effQuery }),
+    ]);
+    return cats;
   };
 
   const openEditArticle = async (id: string) => {
@@ -547,6 +670,8 @@ export function OverviewWorkspace({
       setTagsText((data.tags || []).join(", "));
       setTagDraft("");
       setTagPoolOpen(false);
+      setTagPoolQuery("");
+      setTagSuggestOpen(false);
       setSeriesID(data.series_id || "");
       setSummaryMD(a.summary_md || "");
       setContentMD(a.content_md || "");
@@ -591,13 +716,13 @@ export function OverviewWorkspace({
     const jumpID = sessionStorage.getItem("volo_jump_article_id");
     if (jumpID) {
       sessionStorage.removeItem("volo_jump_article_id");
-      void loadArticlesAndTaxonomies();
+      void loadTaxonomies();
       void loadOverview(trendDays);
       void openEditArticle(jumpID);
       return;
     }
     if (section === "editor") {
-      void loadArticlesAndTaxonomies().then((cats) => {
+      void loadTaxonomies().then((cats) => {
         if (editingIDRef.current === null) {
           void startNewArticle(cats);
         }
@@ -608,31 +733,92 @@ export function OverviewWorkspace({
     dirtyEditorSig.value = false;
     editingIDRef.current = null;
     setEditingID(null);
+    void loadTaxonomies();
     if (section === "drafts") {
-      setStatusFilter("draft");
-      void loadArticlesAndTaxonomies("draft", catFilter, query);
+      if (statusFilter !== "draft") {
+        setStatusFilter("draft");
+      } else {
+        void loadArticlesPage({ page: 1, status: "draft" });
+      }
     } else if (section === "articles") {
       const nextSt = statusFilter === "draft" ? "all" : statusFilter;
-      if (nextSt !== statusFilter) setStatusFilter(nextSt);
-      void loadArticlesAndTaxonomies(nextSt, catFilter, query);
+      if (nextSt !== statusFilter) {
+        setStatusFilter(nextSt);
+      } else {
+        void loadArticlesPage({ page: 1, status: nextSt });
+      }
     } else {
       void loadOverview(trendDays);
-      void loadArticlesAndTaxonomies(statusFilter, catFilter, query);
     }
   }, [section, curLocale]);
 
   useEffect(() => {
     setHoverIdx(null);
-    void loadOverview(trendDays);
+    if (section === "dashboard") {
+      void loadOverview(trendDays);
+    }
   }, [trendDays]);
 
   useEffect(() => {
-    setArtPage(1);
+    if (section !== "articles" && section !== "drafts") return;
     setSelectedIds([]);
-    if (section === "articles" || section === "drafts") {
-      void loadArticlesAndTaxonomies(statusFilter, catFilter, query);
+    void loadArticlesPage({
+      page: artPage,
+      perPage: artPageSize,
+      status: statusFilter,
+      cat: catFilter,
+      vis: visFilter,
+      sort: artSort,
+      q: debouncedQuery,
+    });
+  }, [artPage, artPageSize, statusFilter, catFilter, visFilter, artSort, debouncedQuery]);
+
+  // Dynamic tag search when typing in tag picker or tag pool filter
+  useEffect(() => {
+    const activeQ = (debouncedTagDraft.trim() || debouncedTagPoolQ.trim()).trim();
+    if (!activeQ || (editingID === null && section !== "editor")) {
+      setRemoteTags([]);
+      return;
     }
-  }, [statusFilter, catFilter]);
+    let cancelled = false;
+    apiFetch<{ items: any[] }>(`/api/admin/tags?q=${encodeURIComponent(activeQ)}&sort=count&per_page=80`)
+      .then((res) => {
+        if (!cancelled) setRemoteTags(res.items || []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [debouncedTagDraft, debouncedTagPoolQ, editingID, section]);
+
+  // Reposition or close tag typeahead portal menu on scroll/resize/outside click
+  useEffect(() => {
+    if (!tagSuggestOpen) return;
+    const updatePos = () => {
+      if (!tagBoxRef.current) return;
+      const rect = tagBoxRef.current.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > window.innerHeight) {
+        setTagSuggestOpen(false);
+        return;
+      }
+      const pos = computePortalMenuStyle(rect, { minW: 220, maxW: 360, maxH: 260, align: "left" });
+      setTagSuggestStyle(pos.style);
+    };
+    updatePos();
+    const onDocDown = (ev: MouseEvent) => {
+      const target = ev.target as Node;
+      if (tagBoxRef.current?.contains(target) || tagSuggestRef.current?.contains(target)) return;
+      setTagSuggestOpen(false);
+    };
+    window.addEventListener("resize", updatePos);
+    window.addEventListener("scroll", updatePos, true);
+    document.addEventListener("mousedown", onDocDown);
+    return () => {
+      window.removeEventListener("resize", updatePos);
+      window.removeEventListener("scroll", updatePos, true);
+      document.removeEventListener("mousedown", onDocDown);
+    };
+  }, [tagSuggestOpen, tagDraft]);
 
   // Auto-persist local draft to IndexedDB every 1.2s while editing
   useEffect(() => {
@@ -965,6 +1151,65 @@ export function OverviewWorkspace({
     }
   };
 
+  const submitQuickCreate = async (e?: Event) => {
+    e?.preventDefault();
+    const nm = quickCreateName.trim();
+    if (!nm || !quickCreateKind || quickCreateSaving) return;
+    setQuickCreateSaving(true);
+    try {
+      if (quickCreateKind === "category") {
+        const maxSort = categories.reduce((mx, c) => Math.max(mx, Number(c.sort_order || 0)), 0);
+        const res = await apiFetch<any>("/api/admin/categories", {
+          method: "POST",
+          body: JSON.stringify({
+            name: nm,
+            slug: quickCreateSlug.trim(),
+            sort_order: maxSort + 10,
+            description: "",
+          }),
+        });
+        const refreshed = await loadTaxonomies();
+        const createdId =
+          res?.category?.id ||
+          res?.id ||
+          refreshed.find((c: any) => String(c.name || "").toLowerCase() === nm.toLowerCase())?.id ||
+          "";
+        if (createdId) setCategoryID(createdId);
+      } else {
+        const maxSort = seriesList.reduce((mx, s) => Math.max(mx, Number(s.sort_order || 0)), 0);
+        const res = await apiFetch<any>("/api/admin/series", {
+          method: "POST",
+          body: JSON.stringify({
+            title: nm,
+            slug: quickCreateSlug.trim(),
+            sort_order: maxSort + 10,
+            cover_url: "",
+            description: "",
+            article_ids: [],
+          }),
+        });
+        await loadTaxonomies();
+        const serRes = await apiFetch<{ items: any[] }>("/api/admin/series?per_page=200").catch(() => ({ items: [] }));
+        const sList = serRes.items || [];
+        setSeriesList(sList);
+        const createdId =
+          res?.series?.id ||
+          res?.id ||
+          sList.find((s: any) => String(s.title || "").toLowerCase() === nm.toLowerCase())?.id ||
+          "";
+        if (createdId) setSeriesID(createdId);
+      }
+      showToast(t("common.saved"), "ok");
+      setQuickCreateKind(null);
+      setQuickCreateName("");
+      setQuickCreateSlug("");
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setQuickCreateSaving(false);
+    }
+  };
+
   const catNameMap: Record<string, string> = {};
   categories.forEach((c) => {
     catNameMap[c.id] = c.name;
@@ -974,6 +1219,66 @@ export function OverviewWorkspace({
   if (editingID !== null || section === "editor") {
     const quickInserts: QuickInsertItem[] = overview?.quick_inserts || [];
     const activeTagsLower = new Set(selectedTags.map((s) => s.toLowerCase()));
+
+    // Merge initial top tags + dynamic search tags without duplicates
+    const mergedTagMap = new Map<string, any>();
+    [...allTags, ...remoteTags].forEach((tg) => {
+      const key = String(tg?.name || "").trim().toLowerCase();
+      if (key && !mergedTagMap.has(key)) {
+        mergedTagMap.set(key, tg);
+      }
+    });
+    const mergedTags = Array.from(mergedTagMap.values());
+    const getTagCount = (tg: any) => Number(tg?.article_count ?? tg?.count ?? 0);
+
+    // Typeahead suggestions (up to 10 matches sorted by prefix then count DESC + optional Create #tag row)
+    const draftTrim = tagDraft.trim().replace(/^#+/, "");
+    const draftLower = draftTrim.toLowerCase();
+    const typeaheadMatches = draftLower
+      ? mergedTags
+          .filter((tg) => {
+            const nm = String(tg.name || "");
+            const low = nm.toLowerCase();
+            return !activeTagsLower.has(low) && low.includes(draftLower);
+          })
+          .sort((a, b) => {
+            const aLow = String(a.name || "").toLowerCase();
+            const bLow = String(b.name || "").toLowerCase();
+            const aPref = aLow.startsWith(draftLower) ? 0 : 1;
+            const bPref = bLow.startsWith(draftLower) ? 0 : 1;
+            if (aPref !== bPref) return aPref - bPref;
+            const cDiff = getTagCount(b) - getTagCount(a);
+            if (cDiff !== 0) return cDiff;
+            return aLow.localeCompare(bLow);
+          })
+          .slice(0, 10)
+      : [];
+
+    const hasExactTag =
+      !draftLower ||
+      activeTagsLower.has(draftLower) ||
+      mergedTags.some((tg) => String(tg.name || "").toLowerCase() === draftLower);
+
+    const suggestOptions: Array<{ name: string; count: number; isCreate?: boolean }> = [
+      ...typeaheadMatches.map((tg) => ({ name: String(tg.name), count: getTagCount(tg) })),
+      ...(draftTrim && !hasExactTag ? [{ name: draftTrim, count: 0, isCreate: true }] : []),
+    ];
+    const safeSuggestIdx =
+      suggestOptions.length > 0 ? Math.max(0, Math.min(tagSuggestIdx, suggestOptions.length - 1)) : 0;
+
+    // Bounded Tag Pool (top 80 matches sorted by Popular or A-Z)
+    const poolQueryLower = tagPoolQuery.trim().toLowerCase();
+    const visiblePoolTags = mergedTags
+      .filter((tg) => !poolQueryLower || String(tg.name || "").toLowerCase().includes(poolQueryLower))
+      .sort((a, b) => {
+        if (tagPoolSort === "name") {
+          return String(a.name || "").localeCompare(String(b.name || ""));
+        }
+        const cDiff = getTagCount(b) - getTagCount(a);
+        if (cDiff !== 0) return cDiff;
+        return String(a.name || "").localeCompare(String(b.name || ""));
+      })
+      .slice(0, 80);
 
     return (
       <div>
@@ -1135,7 +1440,22 @@ export function OverviewWorkspace({
                     />
                   </div>
                   <div class="volo-field">
-                    <label>{t("art.category")}</label>
+                    <div class="volo-label-row">
+                      <label>{t("art.category")}</label>
+                      <button
+                        type="button"
+                        class="volo-quick-add-btn"
+                        title={t("cnt.new_cat")}
+                        aria-label={t("cnt.new_cat")}
+                        onClick={() => {
+                          setQuickCreateName("");
+                          setQuickCreateSlug("");
+                          setQuickCreateKind("category");
+                        }}
+                      >
+                        +
+                      </button>
+                    </div>
                     <ConsoleSelect
                       value={categoryID}
                       onChange={setCategoryID}
@@ -1192,7 +1512,22 @@ export function OverviewWorkspace({
                     />
                   </div>
                   <div class="volo-field">
-                    <label>{t("art.series")}</label>
+                    <div class="volo-label-row">
+                      <label>{t("art.series")}</label>
+                      <button
+                        type="button"
+                        class="volo-quick-add-btn"
+                        title={t("cnt.new_series")}
+                        aria-label={t("cnt.new_series")}
+                        onClick={() => {
+                          setQuickCreateName("");
+                          setQuickCreateSlug("");
+                          setQuickCreateKind("series");
+                        }}
+                      >
+                        +
+                      </button>
+                    </div>
                     <ConsoleSelect
                       value={seriesID}
                       onChange={setSeriesID}
@@ -1238,21 +1573,30 @@ export function OverviewWorkspace({
                 </div>
               </div>
 
-              {/* 2. Capsule Tags Selector & Preset Pool */}
+              {/* 2. Capsule Tags Selector & Bounded Preset Pool */}
               <div class="volo-inspector-box">
                 <div class="volo-inspector-title">
                   <span>{t("art.free_tags")}</span>
-                  {allTags.length > 0 && (
+                  {(totalTagCount > 0 || allTags.length > 0) && (
                     <button
                       type="button"
                       class={`volo-chip-btn ${tagPoolOpen ? "active" : ""}`}
                       onClick={() => setTagPoolOpen(!tagPoolOpen)}
                     >
-                      {t("art.toggle_tag_pool", { count: allTags.length })}
+                      {t("art.toggle_tag_pool", { count: totalTagCount || allTags.length })}
                     </button>
                   )}
                 </div>
-                <div class="volo-tag-capsule-box">
+                <div
+                  ref={tagBoxRef}
+                  class="volo-tag-capsule-box"
+                  style={{ cursor: "text" }}
+                  onClick={(e) => {
+                    if ((e.target as HTMLElement).tagName !== "BUTTON") {
+                      tagInputRef.current?.focus();
+                    }
+                  }}
+                >
                   {selectedTags.map((tg) => (
                     <span key={tg} class="volo-tag-pill">
                       #{tg}
@@ -1266,39 +1610,164 @@ export function OverviewWorkspace({
                     </span>
                   ))}
                   <input
+                    ref={tagInputRef}
                     class="volo-tag-inline-input"
                     value={tagDraft}
                     placeholder={selectedTags.length === 0 ? t("art.tags_placeholder") : t("art.tag_input_more")}
-                    onInput={(e) => setTagDraft((e.currentTarget as HTMLInputElement).value)}
+                    onFocus={() => {
+                      if (tagDraft.trim()) setTagSuggestOpen(true);
+                    }}
+                    onInput={(e) => {
+                      const v = (e.currentTarget as HTMLInputElement).value;
+                      setTagDraft(v);
+                      setTagSuggestIdx(0);
+                      setTagSuggestOpen(Boolean(v.trim()));
+                    }}
                     onKeyDown={(e) => {
+                      if (tagSuggestOpen && suggestOptions.length > 0) {
+                        if (e.key === "ArrowDown") {
+                          e.preventDefault();
+                          setTagSuggestIdx((idx) => (idx + 1) % suggestOptions.length);
+                          return;
+                        }
+                        if (e.key === "ArrowUp") {
+                          e.preventDefault();
+                          setTagSuggestIdx((idx) => (idx - 1 + suggestOptions.length) % suggestOptions.length);
+                          return;
+                        }
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setTagSuggestOpen(false);
+                          return;
+                        }
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          const chosen = suggestOptions[safeSuggestIdx];
+                          if (chosen) {
+                            addTagTokens(chosen.name);
+                            dirtyEditorSig.value = true;
+                            setTagSuggestOpen(false);
+                            return;
+                          }
+                        }
+                      }
                       if (e.key === "Enter" || e.key === "," || e.key === "，") {
                         e.preventDefault();
-                        if (tagDraft.trim()) addTagTokens(tagDraft);
+                        if (tagDraft.trim()) {
+                          addTagTokens(tagDraft);
+                          dirtyEditorSig.value = true;
+                          setTagSuggestOpen(false);
+                        }
                       } else if (e.key === "Backspace" && !tagDraft && selectedTags.length > 0) {
                         removeTagToken(selectedTags[selectedTags.length - 1]);
+                        dirtyEditorSig.value = true;
                       }
                     }}
                     onBlur={() => {
-                      if (tagDraft.trim()) addTagTokens(tagDraft);
+                      window.setTimeout(() => {
+                        setTagSuggestOpen(false);
+                      }, 120);
+                      if (tagDraft.trim()) {
+                        addTagTokens(tagDraft);
+                        dirtyEditorSig.value = true;
+                      }
                     }}
                   />
                 </div>
-                {tagPoolOpen && allTags.length > 0 && (
-                  <div class="volo-tag-pool" style={{ marginTop: "8px" }}>
-                    <span class="volo-help">{t("art.tag_pool_hint")}</span>
-                    {allTags.map((tg) => {
-                      const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
-                      return (
+
+                {tagSuggestOpen &&
+                  suggestOptions.length > 0 &&
+                  typeof document !== "undefined" &&
+                  createPortal(
+                    <div
+                      ref={tagSuggestRef}
+                      class="volo-cselect-menu is-portal"
+                      style={tagSuggestStyle}
+                      role="listbox"
+                    >
+                      <div class="volo-cselect-list">
+                        {suggestOptions.map((opt, idx) => (
+                          <button
+                            key={`${opt.isCreate ? "new" : "tag"}-${opt.name}`}
+                            type="button"
+                            role="option"
+                            aria-selected={idx === safeSuggestIdx}
+                            class={`volo-cselect-item ${idx === safeSuggestIdx ? "focused" : ""}`}
+                            onMouseEnter={() => setTagSuggestIdx(idx)}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              addTagTokens(opt.name);
+                              dirtyEditorSig.value = true;
+                              setTagSuggestOpen(false);
+                              tagInputRef.current?.focus();
+                            }}
+                          >
+                            <span class="volo-cselect-item-text">
+                              {opt.isCreate ? t("art.tag_create", { tag: opt.name }) : `#${opt.name}`}
+                            </span>
+                            {!opt.isCreate && (
+                              <span class="volo-cselect-item-right">
+                                <span class="volo-code-chip">{opt.count}</span>
+                              </span>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    </div>,
+                    document.body
+                  )}
+
+                {tagPoolOpen && (allTags.length > 0 || remoteTags.length > 0) && (
+                  <div class="volo-tag-pool-box">
+                    <div class="volo-tag-pool-head">
+                      <input
+                        type="text"
+                        class="volo-input volo-tag-pool-search"
+                        placeholder={t("art.tag_pool_search_ph")}
+                        value={tagPoolQuery}
+                        onInput={(e) => setTagPoolQuery((e.currentTarget as HTMLInputElement).value)}
+                      />
+                      <div class="volo-filter-pills">
                         <button
-                          key={tg.id}
                           type="button"
-                          class={`volo-chip-btn ${active ? "active" : ""}`}
-                          onClick={() => toggleTagChip(tg.name)}
+                          class={`volo-filter-pill ${tagPoolSort === "count" ? "active" : ""}`}
+                          onClick={() => setTagPoolSort("count")}
                         >
-                          #{tg.name}
+                          {t("art.tag_sort_popular")}
                         </button>
-                      );
-                    })}
+                        <button
+                          type="button"
+                          class={`volo-filter-pill ${tagPoolSort === "name" ? "active" : ""}`}
+                          onClick={() => setTagPoolSort("name")}
+                        >
+                          {t("art.tag_sort_az")}
+                        </button>
+                      </div>
+                    </div>
+                    <div class="volo-tag-pool-scroll">
+                      {visiblePoolTags.length === 0 ? (
+                        <span class="volo-help">{t("tbl.empty")}</span>
+                      ) : (
+                        visiblePoolTags.map((tg) => {
+                          const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
+                          const cnt = getTagCount(tg);
+                          return (
+                            <button
+                              key={tg.id || tg.name}
+                              type="button"
+                              class={`volo-chip-btn ${active ? "active" : ""}`}
+                              onClick={() => {
+                                toggleTagChip(tg.name);
+                                dirtyEditorSig.value = true;
+                              }}
+                            >
+                              #{tg.name}
+                              {cnt > 0 ? <span style={{ opacity: 0.65, marginLeft: "3px" }}>({cnt})</span> : null}
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -1460,6 +1929,51 @@ export function OverviewWorkspace({
           </form>
         </div>
 
+        {/* Quick-Create Category / Series Modal */}
+        <AnimatedModal
+          open={quickCreateKind !== null}
+          onClose={() => setQuickCreateKind(null)}
+          title={quickCreateKind === "category" ? t("cnt.new_cat") : t("cnt.new_series")}
+          maxWidth="440px"
+          footer={
+            <>
+              <button type="button" class="volo-btn" onClick={() => setQuickCreateKind(null)}>
+                {t("common.cancel")}
+              </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary"
+                disabled={quickCreateSaving || !quickCreateName.trim()}
+                onClick={() => void submitQuickCreate()}
+              >
+                {t("common.create")}
+              </button>
+            </>
+          }
+        >
+          <form onSubmit={(e) => void submitQuickCreate(e)}>
+            <div class="volo-field">
+              <label>{quickCreateKind === "category" ? t("cnt.cat_name") : t("cnt.series_title")}</label>
+              <input
+                class="volo-input"
+                required
+                autoFocus
+                value={quickCreateName}
+                onInput={(e) => setQuickCreateName((e.currentTarget as HTMLInputElement).value)}
+              />
+            </div>
+            <div class="volo-field" style={{ marginBottom: 0 }}>
+              <label>{t("art.slug")}</label>
+              <input
+                class="volo-input"
+                placeholder={t("art.slug_placeholder")}
+                value={quickCreateSlug}
+                onInput={(e) => setQuickCreateSlug((e.currentTarget as HTMLInputElement).value)}
+              />
+            </div>
+          </form>
+        </AnimatedModal>
+
         {/* Unsaved Draft Inline Preview Modal */}
         <AnimatedModal
           open={inlinePreviewHTML !== null}
@@ -1553,44 +2067,97 @@ export function OverviewWorkspace({
 
   // 2. Article Management / Drafts View (`section === "articles" | "drafts"`)
   if (section === "articles" || section === "drafts") {
-    const pagedArts = paginateItems(articles, artPage, 15);
-    const pageIds = pagedArts.slice.map((r) => r.article.id);
+    const displayArts =
+      articles.length > artPageSize ? paginateItems(articles, artPage, artPageSize).slice : articles;
+    const pageIds = displayArts.map((r) => r.article.id);
     const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.includes(id));
+
+    const togglePageAll = (checked: boolean) => {
+      if (checked) {
+        setSelectedIds((prev) => Array.from(new Set([...prev, ...pageIds])));
+      } else {
+        const rm = new Set(pageIds);
+        setSelectedIds((prev) => prev.filter((id) => !rm.has(id)));
+      }
+    };
 
     return (
       <div class="volo-card">
         <div class="volo-filter-bar">
           <div class="volo-filter-pills">
-            {(["all", "published", "draft", "scheduled", "protected"] as const).map((st) => (
-              <button
-                key={st}
-                type="button"
-                class={`volo-filter-pill ${statusFilter === st ? "active" : ""}`}
-                onClick={() => setStatusFilter(st)}
-              >
-                {t(`art.${st}`)}
-              </button>
-            ))}
+            {(["all", "published", "draft", "scheduled"] as const).map((st) => {
+              const cnt = statusCounts[st];
+              return (
+                <button
+                  key={st}
+                  type="button"
+                  class={`volo-filter-pill ${statusFilter === st ? "active" : ""}`}
+                  onClick={() => {
+                    setStatusFilter(st);
+                    setArtPage(1);
+                  }}
+                >
+                  {t(`art.${st}`)}
+                  {typeof cnt === "number" ? ` (${formatCompactNum(cnt)})` : ""}
+                </button>
+              );
+            })}
           </div>
           <div class="volo-filter-controls">
             <ConsoleSelect
-              style={{ width: "164px" }}
+              style={{ width: "152px" }}
               value={catFilter}
-              onChange={setCatFilter}
+              onChange={(v) => {
+                setCatFilter(v);
+                setArtPage(1);
+              }}
               options={[
                 { value: "", label: t("art.all_categories") },
                 ...categories.map((c) => ({ value: c.id, label: c.name })),
+              ]}
+            />
+            <ConsoleSelect
+              style={{ width: "148px" }}
+              value={visFilter}
+              onChange={(v) => {
+                setVisFilter(v);
+                setArtPage(1);
+              }}
+              options={[
+                { value: "", label: t("art.vis_all") },
+                { value: "public", label: t("ov.vis_public") },
+                { value: "password", label: t("ov.vis_password") },
+                { value: "locked", label: t("tbl.locked_block") },
+                { value: "pinned", label: t("tbl.pinned") },
+              ]}
+            />
+            <ConsoleSelect
+              style={{ width: "156px" }}
+              value={artSort}
+              onChange={(v) => {
+                setArtSort(v);
+                setArtPage(1);
+              }}
+              options={[
+                { value: "updated", label: t("art.sort_updated") },
+                { value: "published", label: t("art.sort_published") },
+                { value: "views", label: t("art.sort_views") },
+                { value: "comments", label: t("art.sort_comments") },
+                { value: "title", label: t("art.sort_title") },
               ]}
             />
             <input
               class="volo-input volo-search-input"
               placeholder={t("art.search_placeholder")}
               value={query}
-              onInput={(e) => setQuery((e.currentTarget as HTMLInputElement).value)}
+              onInput={(e) => {
+                setQuery((e.currentTarget as HTMLInputElement).value);
+                setArtPage(1);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   setArtPage(1);
-                  void loadArticlesAndTaxonomies(statusFilter, catFilter, query);
+                  void loadArticlesPage({ page: 1, q: query });
                 }
               }}
             />
@@ -1613,24 +2180,23 @@ export function OverviewWorkspace({
           </div>
         </div>
 
+        <MobileSelectAllBar
+          checked={allPageSelected}
+          count={selectedIds.length}
+          total={pageIds.length}
+          onToggle={togglePageAll}
+        />
+
         <div class="volo-table-wrap">
           <table class="volo-table">
             <thead>
               <tr>
-                <th style={{ width: "40px" }}>
+                <th class="col-check" style={{ width: "40px" }}>
                   <input
                     type="checkbox"
                     aria-label={t("ov.select_all")}
                     checked={allPageSelected}
-                    onChange={(e) => {
-                      const checked = (e.currentTarget as HTMLInputElement).checked;
-                      if (checked) {
-                        setSelectedIds((prev) => Array.from(new Set([...prev, ...pageIds])));
-                      } else {
-                        const rm = new Set(pageIds);
-                        setSelectedIds((prev) => prev.filter((id) => !rm.has(id)));
-                      }
-                    }}
+                    onChange={(e) => togglePageAll((e.currentTarget as HTMLInputElement).checked)}
                   />
                 </th>
                 <th class="col-fluid">{t("art.title")}</th>
@@ -1644,16 +2210,16 @@ export function OverviewWorkspace({
             <tbody>
               {artLoading ? (
                 <TableSkeleton cols={7} />
-              ) : pagedArts.slice.length === 0 ? (
+              ) : displayArts.length === 0 ? (
                 <ConsoleEmpty colSpan={7} text={t("art.empty", { btn: t("art.new") })} />
               ) : (
-                pagedArts.slice.map((row) => {
+                displayArts.map((row) => {
                   const a = row.article;
                   const catLabel = catNameMap[a.category_id];
                   const isChecked = selectedIds.includes(a.id);
                   return (
                     <tr key={a.id}>
-                      <td>
+                      <td class="col-check">
                         <input
                           type="checkbox"
                           aria-label={a.title}
@@ -1666,7 +2232,7 @@ export function OverviewWorkspace({
                           }}
                         />
                       </td>
-                      <td class="col-fluid">
+                      <td class="col-fluid" data-label={t("art.title")}>
                         <div class="volo-cell-main">
                           <div class="volo-cell-title">
                             <a
@@ -1704,23 +2270,23 @@ export function OverviewWorkspace({
                       </td>
                       <td class="col-num" data-label={t("art.metrics")}>
                         <div class="volo-metric-pair">
-                          <span class="volo-metric-item" title="PV">
+                          <span class="volo-metric-item" title={`PV: ${(a.view_count ?? 0).toLocaleString()}`}>
                             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
                               <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
                               <circle cx="12" cy="12" r="3" />
                             </svg>
-                            {a.view_count ?? 0}
+                            {formatCompactNum(a.view_count ?? 0)}
                           </span>
-                          <span class="volo-metric-item" title={t("nav.comments")}>
+                          <span class="volo-metric-item" title={`${t("nav.comments")}: ${(a.comment_count ?? 0).toLocaleString()}`}>
                             <svg width="12.5" height="12.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
                               <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                             </svg>
-                            {a.comment_count ?? 0}
+                            {formatCompactNum(a.comment_count ?? 0)}
                           </span>
                         </div>
                       </td>
                       <td class="col-date" data-label={t("art.updated")}>{formatDateTime(a.updated_at)}</td>
-                      <td class="col-act">
+                      <td class="col-act" data-label={t("art.actions")}>
                         <div class="volo-row-actions">
                           <a
                             class="volo-act-btn"
@@ -1730,15 +2296,22 @@ export function OverviewWorkspace({
                           >
                             {t("common.view")}
                           </a>
-                          <button type="button" class="volo-act-btn" onClick={() => void togglePinArticle(a.id)}>
-                            {a.is_pinned ? t("art.unpin_action") : t("art.pin_action")}
-                          </button>
                           <button type="button" class="volo-act-btn" onClick={() => void openEditArticle(a.id)}>
                             {t("common.edit")}
                           </button>
-                          <button type="button" class="volo-act-btn danger" onClick={() => void deleteArticle(a.id)}>
-                            {t("common.delete")}
-                          </button>
+                          <ActionMenu
+                            items={[
+                              {
+                                label: a.is_pinned ? t("art.unpin_action") : t("art.pin_action"),
+                                onClick: () => void togglePinArticle(a.id),
+                              },
+                              {
+                                label: t("common.delete"),
+                                danger: true,
+                                onClick: () => void deleteArticle(a.id),
+                              },
+                            ]}
+                          />
                         </div>
                       </td>
                     </tr>
@@ -1781,7 +2354,16 @@ export function OverviewWorkspace({
           </button>
         </BatchBar>
 
-        <Pagination total={articles.length} page={pagedArts.safePage} pageSize={15} onChange={setArtPage} />
+        <Pagination
+          total={artTotal}
+          page={artPage}
+          pageSize={artPageSize}
+          onPageSizeChange={(sz) => {
+            setArtPageSize(sz);
+            setArtPage(1);
+          }}
+          onChange={setArtPage}
+        />
       </div>
     );
   }
@@ -1799,7 +2381,7 @@ export function OverviewWorkspace({
 
   const W = 860;
   const H = 228;
-  const padL = 44;
+  const padL = 52;
   const padR = 34;
   const padT = 18;
   const padB = 32;
@@ -1882,19 +2464,27 @@ export function OverviewWorkspace({
         <div class="volo-kpi-grid">
           <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("articles")}>
             <div class="volo-kpi-label">{t("ov.published")}</div>
-            <div class="volo-kpi-val">{overview.counts?.published ?? 0}</div>
+            <div class="volo-kpi-val" title={Number(overview.counts?.published ?? 0).toLocaleString()}>
+              {formatCompactNum(overview.counts?.published ?? 0)}
+            </div>
           </div>
           <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("drafts")}>
             <div class="volo-kpi-label">{t("ov.drafts")}</div>
-            <div class="volo-kpi-val">{overview.counts?.drafts ?? 0}</div>
+            <div class="volo-kpi-val" title={Number(overview.counts?.drafts ?? 0).toLocaleString()}>
+              {formatCompactNum(overview.counts?.drafts ?? 0)}
+            </div>
           </div>
           <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("pages")}>
             <div class="volo-kpi-label">{t("ov.pages")}</div>
-            <div class="volo-kpi-val">{overview.counts?.pages ?? 0}</div>
+            <div class="volo-kpi-val" title={Number(overview.counts?.pages ?? 0).toLocaleString()}>
+              {formatCompactNum(overview.counts?.pages ?? 0)}
+            </div>
           </div>
           <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("comments")}>
             <div class="volo-kpi-label">{t("ov.pending_comments")}</div>
-            <div class="volo-kpi-val">{overview.counts?.pending_comments ?? 0}</div>
+            <div class="volo-kpi-val" title={Number(overview.counts?.pending_comments ?? 0).toLocaleString()}>
+              {formatCompactNum(overview.counts?.pending_comments ?? 0)}
+            </div>
           </div>
           <div class="volo-kpi">
             <div class="volo-kpi-label">{t("ov.runtime", { dialect: overview.runtime_dialect || "sqlite" })}</div>
@@ -1936,15 +2526,15 @@ export function OverviewWorkspace({
         <div class="volo-trend-kpis">
           <div class="volo-trend-kpi">
             <div class="volo-kpi-label">{t("ov.kpi_pv")}</div>
-            <div class="volo-kpi-val">{rangePV}</div>
+            <div class="volo-kpi-val" title={rangePV.toLocaleString()}>{formatCompactNum(rangePV)}</div>
           </div>
           <div class="volo-trend-kpi">
             <div class="volo-kpi-label">{t("ov.kpi_uv")}</div>
-            <div class="volo-kpi-val">{rangeUV}</div>
+            <div class="volo-kpi-val" title={rangeUV.toLocaleString()}>{formatCompactNum(rangeUV)}</div>
           </div>
           <div class="volo-trend-kpi">
             <div class="volo-kpi-label">{t("ov.kpi_privacy")}</div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "8px", flexWrap: "wrap" }}>
               <span class="volo-kpi-val" style={{ fontSize: "19px", color: "var(--volo-accent)" }}>
                 {t("ov.kpi_privacy_val")}
               </span>
@@ -1976,8 +2566,8 @@ export function OverviewWorkspace({
               >
                 <div style={{ fontWeight: 650, marginBottom: "2px" }}>{activeTrend.stat_date}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                  <span>PV: <strong>{activeTrend.pv}</strong></span>
-                  <span style={{ color: "#f5be72" }}>UV: <strong>{activeTrend.uv}</strong></span>
+                  <span>PV: <strong>{Number(activeTrend.pv || 0).toLocaleString()}</strong></span>
+                  <span style={{ color: "#f5be72" }}>UV: <strong>{Number(activeTrend.uv || 0).toLocaleString()}</strong></span>
                 </div>
               </div>
             )}
@@ -2042,7 +2632,7 @@ export function OverviewWorkspace({
                       font-size="11.5"
                       fill="var(--volo-muted)"
                     >
-                      {val}
+                      {formatCompactNum(val)}
                     </text>
                   </g>
                 );
@@ -2133,7 +2723,9 @@ export function OverviewWorkspace({
                       </span>
                     )}
                   </div>
-                  <span class="volo-badge">{t("ov.hits_unit", { hits: it.hits ?? 0 })}</span>
+                  <span class="volo-badge" title={Number(it.hits ?? 0).toLocaleString()}>
+                    {t("ov.hits_unit", { hits: formatCompactNum(it.hits ?? 0) })}
+                  </span>
                 </div>
               ))
             )}
@@ -2152,7 +2744,9 @@ export function OverviewWorkspace({
                       {it.item_key}
                     </span>
                   </div>
-                  <span class="volo-badge">{t("ov.hits_unit", { hits: it.hits ?? 0 })}</span>
+                  <span class="volo-badge" title={Number(it.hits ?? 0).toLocaleString()}>
+                    {t("ov.hits_unit", { hits: formatCompactNum(it.hits ?? 0) })}
+                  </span>
                 </div>
               ))
             )}
@@ -2198,7 +2792,15 @@ export function OverviewWorkspace({
           {noticeBoard.trim() ? (
             <div
               class="volo-subcard"
-              style={{ margin: 0, whiteSpace: "pre-wrap", lineHeight: 1.65, fontSize: "13.5px" }}
+              style={{
+                margin: 0,
+                whiteSpace: "pre-wrap",
+                lineHeight: 1.65,
+                fontSize: "13.5px",
+                maxHeight: "220px",
+                overflowY: "auto",
+                overflowWrap: "anywhere",
+              }}
             >
               {noticeBoard}
             </div>

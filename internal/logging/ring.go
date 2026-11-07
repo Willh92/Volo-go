@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -52,6 +53,20 @@ func NewRingBuffer(capacity int) *RingBuffer {
 	}
 }
 
+func truncateUTF8Bytes(s string, maxBytes int) (string, bool) {
+	if len(s) <= maxBytes {
+		return s, false
+	}
+	if maxBytes <= 0 {
+		return "", true
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
+}
+
 // Record appends a single runtime log entry into the circular buffer.
 func (rb *RingBuffer) Record(level string, source string, message string) {
 	if rb == nil {
@@ -61,8 +76,8 @@ func (rb *RingBuffer) Record(level string, source string, message string) {
 	if msg == "" {
 		return
 	}
-	if len(msg) > maxMessageRunesByte {
-		msg = msg[:maxMessageRunesByte] + "..."
+	if prefix, truncated := truncateUTF8Bytes(msg, maxMessageRunesByte); truncated {
+		msg = prefix + "..."
 	}
 	lvl := normalizeLevel(level)
 	src := strings.TrimSpace(source)

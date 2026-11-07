@@ -1,12 +1,38 @@
 /* Volo Journal — Scoped Serif Editorial Layer (zero global leakage) */
-html[data-volo-skin="volo-journal"] body {
+html[data-volo-skin="volo-journal"] .studio-brand__title,
+html[data-volo-skin="volo-journal"] .volo-prose,
+html[data-volo-skin="volo-journal"] .studio-article__title,
+html[data-volo-skin="volo-journal"] .article__title,
+html[data-volo-skin="volo-journal"] .studio-hero,
+html[data-volo-skin="volo-journal"] .journal-colophon {
   font-family: "Noto Serif SC", "Source Han Serif SC", Georgia, "Times New Roman", serif;
   letter-spacing: 0.01em;
 }
 
+html[data-volo-skin="volo-journal"] .volo-prose code,
+html[data-volo-skin="volo-journal"] .volo-prose pre,
+html[data-volo-skin="volo-journal"] .volo-code-head,
+html[data-volo-skin="volo-journal"] .volo-audio-ts,
+html[data-volo-skin="volo-journal"] .volo-ts-seek {
+  font-family: var(--volo-font-mono);
+  letter-spacing: 0;
+}
+
+html[data-volo-skin="volo-journal"] .studio-header__inner.studio-container,
 html[data-volo-skin="volo-journal"] #studio-main.studio-container,
+html[data-volo-skin="volo-journal"] .studio-header-widgets.studio-container,
+html[data-volo-skin="volo-journal"] .studio-footer {
+  width: min(1140px, calc(100% - 64px));
+}
+
+html[data-volo-skin="volo-journal"] #studio-main.studio-container:not(:has(.book-reader-layout)),
 html[data-volo-skin="volo-journal"] .studio-header-widgets.studio-container {
   max-width: 820px;
+}
+
+html[data-volo-skin="volo-journal"] body.is-book-fullscreen #studio-main.studio-container {
+  width: min(1360px, calc(100% - 28px));
+  max-width: 1360px;
 }
 
 html[data-volo-skin="volo-journal"] .studio-header {
@@ -31,6 +57,12 @@ html[data-volo-skin="volo-journal"] .studio-layout:has(.studio-section-heading) 
   padding-top: 0;
 }
 
+html[data-volo-skin="volo-journal"] .studio-sidebar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr));
+  gap: 18px;
+}
+
 html[data-volo-skin="volo-journal"] .studio-toc-slot {
   display: none !important;
 }
@@ -40,7 +72,7 @@ html[data-volo-skin="volo-journal"] .studio-fab-btn--toc:not([hidden]) {
 }
 
 html[data-volo-skin="volo-journal"] .studio-footer {
-  width: min(820px, calc(100% - 48px));
+  max-width: 820px;
 }
 
 html[data-volo-skin="volo-journal"] .journal-colophon {
@@ -50,6 +82,9 @@ html[data-volo-skin="volo-journal"] .journal-colophon {
 }
 
 @media (max-width: 760px) {
+  html[data-volo-skin="volo-journal"] .studio-header__inner.studio-container,
+  html[data-volo-skin="volo-journal"] #studio-main.studio-container,
+  html[data-volo-skin="volo-journal"] .studio-header-widgets.studio-container,
   html[data-volo-skin="volo-journal"] .studio-footer {
     width: calc(100% - 28px);
   }

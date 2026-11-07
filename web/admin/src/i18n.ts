@@ -240,6 +240,58 @@ export async function exportFullTemplateJSON(baseCode: "zh-CN" | "en-US"): Promi
   return JSON.stringify(sorted, null, 2) + "\n";
 }
 
+// exportLocalePackJSON fetches `/api/admin/locales/{code}/export` and merges any missing bundled Admin SPA keys
+// so row-level exported language packs always include the full public + admin keyset (~1,380+ keys).
+export async function exportLocalePackJSON(rawCode: string): Promise<string> {
+  const code = canonicalizeLocaleTag(rawCode) || rawCode;
+  const merged: Record<string, string> = {
+    "meta.code": code,
+    "meta.name": availableLocalesSig.value.find((l) => l.code === code)?.name || code,
+    "meta.dir": getLocaleDir(code),
+  };
+  try {
+    const res = await fetch(`/api/admin/locales/${encodeURIComponent(code)}/export`, {
+      credentials: "same-origin",
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && typeof data === "object") {
+        for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+          if (typeof v === "string") merged[k] = v;
+        }
+      }
+    }
+  } catch {
+    // Fallback to loaded/bundled catalog below
+  }
+  const fallbackAdmin =
+    bundledCatalogs[code] ||
+    catalogs[code] ||
+    (code.startsWith("zh") ? bundledCatalogs["zh-CN"] : bundledCatalogs["en-US"]) ||
+    bundledCatalogs["en-US"] ||
+    {};
+  const enAdmin = bundledCatalogs["en-US"] || {};
+  const allAdminKeys = new Set([...Object.keys(enAdmin), ...Object.keys(fallbackAdmin)]);
+  for (const k of allAdminKeys) {
+    if (k.startsWith("meta.")) continue;
+    const targetKey = k.startsWith("nav.") ? `admin.${k}` : k;
+    if (!merged[targetKey]) {
+      const val = catalogs[code]?.[k] || fallbackAdmin[k] || enAdmin[k];
+      if (val) merged[targetKey] = val;
+    }
+  }
+  const sorted: Record<string, string> = {};
+  for (const k of Object.keys(merged).sort((a, b) => {
+    const am = a.startsWith("meta.");
+    const bm = b.startsWith("meta.");
+    if (am !== bm) return am ? -1 : 1;
+    return a.localeCompare(b);
+  })) {
+    sorted[k] = merged[k];
+  }
+  return JSON.stringify(sorted, null, 2) + "\n";
+}
+
 export function getLocaleDir(code?: string): string {
   const target = code || localeSig.value;
   return (

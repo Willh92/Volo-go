@@ -23,22 +23,24 @@
     </div>
     <nav class="book-reader-toc__nav" aria-label="{{.BookDetail.Title}}">
       {{range .BookDetail.FlatChapters}}
+        {{$d := .Depth}}{{if lt $d 0}}{{$d = 0}}{{end}}{{if gt $d 4}}{{$d = 4}}{{end}}
         {{if hasPrefix .URL "/"}}
-          <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
+          <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
         {{else if .URL}}
           {{if or (eq $.BookDetail.EmbedMode "iframe") (eq $.BookDetail.EmbedMode "inline")}}
-            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</a>
+            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
           {{else}}
-            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}} ↗</a>
+            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}} ↗</a>
           {{end}}
         {{else}}
-          <span class="book-reader-toc__group" style="padding-left:{{add 12 (mul .Depth 12)}}px">{{.Title}}</span>
+          <span class="book-reader-toc__group" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</span>
         {{end}}
       {{end}}
     </nav>
   </aside>
 
-  <article class="studio-article book-reader-main{{if $isExternalIframe}} book-reader-main--frame{{end}}">
+  <article class="studio-article book-reader-main{{if $isExternalIframe}} book-reader-main--frame{{end}}"
+           {{if .ActiveChapterNeedsMath}}data-needs-math="1"{{end}}>
     <div class="book-reader-bar">
       <div class="book-reader-bar__left">
         <button type="button" class="studio-icon-btn js-book-toggle-toc"
@@ -72,14 +74,22 @@
       {{if .ActiveChapterHTML}}
         <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
         <div class="volo-prose book-reader-prose">{{safeHTML .ActiveChapterHTML}}</div>
-      {{else if eq .BookDetail.EmbedMode "iframe"}}
-        <iframe class="book-reader-frame" src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" sandbox="allow-same-origin allow-scripts"></iframe>
+      {{else if and (eq .BookDetail.EmbedMode "iframe") $isExternalChapter}}
+        <div class="book-reader-frame-wrap is-loading">
+          <div class="book-reader-spinner" aria-hidden="true"></div>
+          <iframe class="book-reader-frame" src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" sandbox="allow-scripts allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
+        </div>
       {{else}}
         <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
-        <p><a class="volo-btn studio-inline-btn book-source-btn" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax><span class="book-source-btn__text">{{.ActiveChapter.Title}}</span><span aria-hidden="true">↗</span></a></p>
+        {{if .ActiveChapter.URL}}
+          <p><a class="volo-btn studio-inline-btn book-source-btn" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax><span class="book-source-btn__text">{{.ActiveChapter.Title}}</span><span aria-hidden="true">↗</span></a></p>
+        {{end}}
       {{end}}
     {{else if $isExternalIframe}}
-      <iframe class="book-reader-frame" src="{{.BookDetail.SourceURL}}" title="{{.BookDetail.Title}}" sandbox="allow-same-origin allow-scripts"></iframe>
+      <div class="book-reader-frame-wrap is-loading">
+        <div class="book-reader-spinner" aria-hidden="true"></div>
+        <iframe class="book-reader-frame" src="{{.BookDetail.SourceURL}}" title="{{.BookDetail.Title}}" sandbox="allow-scripts allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
+      </div>
     {{else}}
       <h1 class="studio-article__title">{{.BookDetail.Title}}</h1>
       {{if .ActiveChapterHTML}}
@@ -91,6 +101,42 @@
         {{end}}
       {{end}}
     {{end}}
+
+    {{if or .PrevChapter .NextChapter}}
+      <div class="volo-neighbors studio-neighbors book-reader-neighbors">
+        {{if .PrevChapter}}
+          {{$prevHref := printf "/books/%s?ch=%d" .BookDetail.Slug .PrevChapter.ID}}
+          {{$prevExt := false}}
+          {{if hasPrefix .PrevChapter.URL "/"}}
+            {{$prevHref = .PrevChapter.URL}}
+          {{else if and .PrevChapter.URL (not (or (eq .BookDetail.EmbedMode "iframe") (eq .BookDetail.EmbedMode "inline")))}}
+            {{$prevHref = .PrevChapter.URL}}{{$prevExt = true}}
+          {{end}}
+          <a class="volo-neighbor-card studio-neighbor" href="{{$prevHref}}" {{if $prevExt}}target="_blank" rel="noopener" data-no-pjax{{end}}>
+            <div class="volo-neighbor-card__dir">← {{t .Locale "article.prev_post"}}</div>
+            <strong>{{.PrevChapter.Title}}</strong>
+          </a>
+        {{end}}
+        {{if .NextChapter}}
+          {{$nextHref := printf "/books/%s?ch=%d" .BookDetail.Slug .NextChapter.ID}}
+          {{$nextExt := false}}
+          {{if hasPrefix .NextChapter.URL "/"}}
+            {{$nextHref = .NextChapter.URL}}
+          {{else if and .NextChapter.URL (not (or (eq .BookDetail.EmbedMode "iframe") (eq .BookDetail.EmbedMode "inline")))}}
+            {{$nextHref = .NextChapter.URL}}{{$nextExt = true}}
+          {{end}}
+          <a class="volo-neighbor-card studio-neighbor" href="{{$nextHref}}" {{if $nextExt}}target="_blank" rel="noopener" data-no-pjax{{end}}>
+            <div class="volo-neighbor-card__dir">{{t .Locale "article.next_post"}} →</div>
+            <strong>{{.NextChapter.Title}}</strong>
+          </a>
+        {{end}}
+      </div>
+    {{end}}
   </article>
+
+  <button type="button" class="studio-fab-btn book-reader-fab-toc js-book-mobile-toc" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
+    <span class="studio-fab-btn__text">{{t .Locale "article.toc_title"}}</span>
+  </button>
 </div>
 {{end}}

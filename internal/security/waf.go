@@ -60,37 +60,131 @@ type WAFEngine struct {
 	settingsMgr *repo.SettingsManager
 	geo         *GeoEngine
 
-	mu         sync.RWMutex
-	publicURL  string
-	activeBans []compiledBan
-	strikes    map[string]*strikeBucket
-	rates      map[string]*rateWindow
-}
+	bansMu      sync.RWMutex
+	publicURL   string
+	activeBans  map[netip.Prefix]int64
+	banReasons  map[netip.Prefix]string
+	banPrefixes []netip.Prefix
 
-type compiledBan struct {
-	record domain.SecurityIPBan
-	prefix netip.Prefix
+	rateMu  sync.Mutex
+	strikes map[string]*strikeBucket
+	rates   map[string]*rateWindow
+
+	stopOnce sync.Once
+	stopCh   chan struct{}
 }
 
 const (
-	maxWAFStrikes = 4096
-	maxWAFRates   = 8192
+	maxWAFStrikes    = 4096
+	maxWAFRates      = 8192
+	maxWAFActiveBans = 16384
+	wafSweepInterval = time.Minute
 )
 
 func NewWAFEngine(cfg *config.Config, store *sqlx.Store, settingsMgr *repo.SettingsManager, geo *GeoEngine) *WAFEngine {
 	pubURL := ""
 	if cfg != nil {
-		pubURL = strings.TrimSpace(cfg.PublicURL)
+		pubURL = strings.TrimSpace(cfg.GetPublicURL())
 	}
-	return &WAFEngine{
+	w := &WAFEngine{
 		cfg:         cfg,
 		store:       store,
 		settingsMgr: settingsMgr,
 		geo:         geo,
 		publicURL:   pubURL,
+		activeBans:  make(map[netip.Prefix]int64),
+		banReasons:  make(map[netip.Prefix]string),
 		strikes:     make(map[string]*strikeBucket),
 		rates:       make(map[string]*rateWindow),
+		stopCh:      make(chan struct{}),
 	}
+	go w.sweepLoop()
+	return w
+}
+
+// Close stops the background sweep loop cleanly.
+func (w *WAFEngine) Close() {
+	if w == nil {
+		return
+	}
+	w.stopOnce.Do(func() {
+		close(w.stopCh)
+	})
+}
+
+func (w *WAFEngine) sweepLoop() {
+	ticker := time.NewTicker(wafSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.stopCh:
+			return
+		case now := <-ticker.C:
+			w.sweep(now)
+		}
+	}
+}
+
+func (w *WAFEngine) sweep(now time.Time) {
+	nowMS := now.UnixMilli()
+
+	w.bansMu.Lock()
+	w.pruneExpiredBansLocked(nowMS)
+	w.bansMu.Unlock()
+
+	w.rateMu.Lock()
+	for k, v := range w.strikes {
+		if now.Sub(v.windowStart) > 10*time.Minute {
+			delete(w.strikes, k)
+		}
+	}
+	for k, v := range w.rates {
+		if now.After(v.windowReset) {
+			delete(w.rates, k)
+		}
+	}
+	w.rateMu.Unlock()
+}
+
+func (w *WAFEngine) pruneExpiredBansLocked(nowMS int64) {
+	if len(w.banPrefixes) == 0 {
+		return
+	}
+	kept := w.banPrefixes[:0]
+	for _, pfx := range w.banPrefixes {
+		exp, ok := w.activeBans[pfx]
+		if !ok {
+			continue
+		}
+		if exp > 0 && exp <= nowMS {
+			delete(w.activeBans, pfx)
+			delete(w.banReasons, pfx)
+			continue
+		}
+		kept = append(kept, pfx)
+	}
+	clear(w.banPrefixes[len(kept):])
+	w.banPrefixes = kept
+}
+
+func (w *WAFEngine) upsertBanLocked(pfx netip.Prefix, expiresAt int64, reasonCode string, nowMS int64) {
+	if _, exists := w.activeBans[pfx]; !exists {
+		if len(w.banPrefixes) >= maxWAFActiveBans {
+			w.pruneExpiredBansLocked(nowMS)
+		}
+		if len(w.banPrefixes) >= maxWAFActiveBans {
+			// Evict oldest prefix if still at hard capacity under extreme churn.
+			oldest := w.banPrefixes[0]
+			delete(w.activeBans, oldest)
+			delete(w.banReasons, oldest)
+			copy(w.banPrefixes, w.banPrefixes[1:])
+			w.banPrefixes[len(w.banPrefixes)-1] = netip.Prefix{}
+			w.banPrefixes = w.banPrefixes[:len(w.banPrefixes)-1]
+		}
+		w.banPrefixes = append(w.banPrefixes, pfx)
+	}
+	w.activeBans[pfx] = expiresAt
+	w.banReasons[pfx] = reasonCode
 }
 
 // SetPublicURL updates the canonical public URL used for conditional HTTPS security headers (HSTS).
@@ -98,9 +192,9 @@ func (w *WAFEngine) SetPublicURL(publicURL string) {
 	if w == nil {
 		return
 	}
-	w.mu.Lock()
+	w.bansMu.Lock()
 	w.publicURL = strings.TrimSpace(publicURL)
-	w.mu.Unlock()
+	w.bansMu.Unlock()
 }
 
 // ReloadBans refreshes active IP/CIDR bans from the database into memory.
@@ -114,15 +208,34 @@ func (w *WAFEngine) ReloadBans(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	compiled := make([]compiledBan, 0, len(rows))
+	newBans := make(map[netip.Prefix]int64, len(rows))
+	newReasons := make(map[netip.Prefix]string, len(rows))
+	newPrefixes := make([]netip.Prefix, 0, len(rows))
 	for _, r := range rows {
-		if pfx, ok := parseBanPrefix(r.CIDR); ok {
-			compiled = append(compiled, compiledBan{record: r, prefix: pfx})
+		pfx, ok := parseBanPrefix(r.CIDR)
+		if !ok {
+			continue
 		}
+		if r.ExpiresAt > 0 && r.ExpiresAt <= now {
+			continue
+		}
+		if prevExp, seen := newBans[pfx]; seen {
+			// Keep permanent ban (0) or whichever expiration extends further.
+			if prevExp != 0 && (r.ExpiresAt == 0 || r.ExpiresAt > prevExp) {
+				newBans[pfx] = r.ExpiresAt
+				newReasons[pfx] = r.ReasonCode
+			}
+			continue
+		}
+		newBans[pfx] = r.ExpiresAt
+		newReasons[pfx] = r.ReasonCode
+		newPrefixes = append(newPrefixes, pfx)
 	}
-	w.mu.Lock()
-	w.activeBans = compiled
-	w.mu.Unlock()
+	w.bansMu.Lock()
+	w.activeBans = newBans
+	w.banReasons = newReasons
+	w.banPrefixes = newPrefixes
+	w.bansMu.Unlock()
 	return nil
 }
 
@@ -149,15 +262,39 @@ func (w *WAFEngine) IsBanned(clientAddr netip.Addr) (bool, string) {
 	u := clientAddr.Unmap()
 	now := time.Now().UnixMilli()
 
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	for _, b := range w.activeBans {
-		if b.record.ExpiresAt > 0 && b.record.ExpiresAt <= now {
+	w.bansMu.RLock()
+	defer w.bansMu.RUnlock()
+	if len(w.activeBans) == 0 {
+		return false, ""
+	}
+
+	// Fast-path O(1) lookup for exact host (/32 or /128) and IPv6 /64 auto-ban buckets.
+	if u.Is4() {
+		exact := netip.PrefixFrom(u, 32)
+		if exp, ok := w.activeBans[exact]; ok && (exp == 0 || exp > now) {
+			return true, w.banReasons[exact]
+		}
+	} else {
+		exact := netip.PrefixFrom(u, 128)
+		if exp, ok := w.activeBans[exact]; ok && (exp == 0 || exp > now) {
+			return true, w.banReasons[exact]
+		}
+		if pfx64, err := u.Prefix(64); err == nil {
+			if exp, ok := w.activeBans[pfx64]; ok && (exp == 0 || exp > now) {
+				return true, w.banReasons[pfx64]
+			}
+		}
+	}
+
+	for _, pfx := range w.banPrefixes {
+		if !pfx.Contains(u) {
 			continue
 		}
-		if b.prefix.Contains(u) {
-			return true, b.record.ReasonCode
+		exp, ok := w.activeBans[pfx]
+		if !ok || (exp > 0 && exp <= now) {
+			continue
 		}
+		return true, w.banReasons[pfx]
 	}
 	return false, ""
 }
@@ -200,9 +337,9 @@ func (w *WAFEngine) AddManualBan(ctx context.Context, cidrOrIP string, note stri
 		}
 		_ = w.ReloadBans(ctx)
 	} else {
-		w.mu.Lock()
-		w.activeBans = append(w.activeBans, compiledBan{record: rec, prefix: pfx})
-		w.mu.Unlock()
+		w.bansMu.Lock()
+		w.upsertBanLocked(pfx, rec.ExpiresAt, rec.ReasonCode, now)
+		w.bansMu.Unlock()
 	}
 	return &rec, nil
 }
@@ -231,7 +368,7 @@ func (w *WAFEngine) RecordStrike(ctx context.Context, clientAddr netip.Addr, rea
 	bucketKey := RateLimitBucketKey(clientAddr)
 	now := time.Now()
 
-	w.mu.Lock()
+	w.rateMu.Lock()
 	sb, exists := w.strikes[bucketKey]
 	if !exists || now.Sub(sb.windowStart) > 10*time.Minute {
 		if !exists && len(w.strikes) >= maxWAFStrikes {
@@ -255,13 +392,15 @@ func (w *WAFEngine) RecordStrike(ctx context.Context, clientAddr netip.Addr, rea
 
 	const threshold = 5
 	if sb.score < threshold {
-		w.mu.Unlock()
+		w.rateMu.Unlock()
 		return false
 	}
 
 	// Escalating ban ladder: 1st ban = 15m, 2nd = 1h, 3rd+ = 24h
 	sb.score = 0
 	occ := sb.occurrences
+	w.rateMu.Unlock()
+
 	const baseMins = 15
 	dur := time.Duration(baseMins) * time.Minute
 	if occ >= threshold*3 {
@@ -269,9 +408,13 @@ func (w *WAFEngine) RecordStrike(ctx context.Context, clientAddr netip.Addr, rea
 	} else if occ >= threshold*2 {
 		dur = time.Duration(baseMins*4) * time.Minute
 	}
+	nowMS := now.UnixMilli()
 	expiresAt := now.Add(dur).UnixMilli()
 
-	pfx, _ := parseBanPrefix(bucketKey)
+	pfx, ok := parseBanPrefix(bucketKey)
+	if !ok {
+		return false
+	}
 	rec := domain.SecurityIPBan{
 		ID:          id.Next(),
 		CIDR:        pfx.String(),
@@ -280,11 +423,12 @@ func (w *WAFEngine) RecordStrike(ctx context.Context, clientAddr netip.Addr, rea
 		Reason:      fmt.Sprintf("Automated defense triggered (%s)", reasonCode),
 		Occurrences: occ,
 		ExpiresAt:   expiresAt,
-		CreatedAt:   now.UnixMilli(),
-		UpdatedAt:   now.UnixMilli(),
+		CreatedAt:   nowMS,
+		UpdatedAt:   nowMS,
 	}
-	w.activeBans = append(w.activeBans, compiledBan{record: rec, prefix: pfx})
-	w.mu.Unlock()
+	w.bansMu.Lock()
+	w.upsertBanLocked(pfx, rec.ExpiresAt, rec.ReasonCode, nowMS)
+	w.bansMu.Unlock()
 
 	if w.store != nil {
 		upsert := w.store.Dialect().UpsertSQL(
@@ -307,8 +451,8 @@ func (w *WAFEngine) AllowRate(scope string, clientAddr netip.Addr, limit int, wi
 	key := scope + "|" + RateLimitBucketKey(clientAddr)
 	now := time.Now()
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.rateMu.Lock()
+	defer w.rateMu.Unlock()
 	rw, exists := w.rates[key]
 	if !exists || now.After(rw.windowReset) {
 		if !exists && len(w.rates) >= maxWAFRates {
@@ -349,9 +493,9 @@ func (w *WAFEngine) WrapHTTP(next http.Handler) http.Handler {
 		rw.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		rw.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 
-		w.mu.RLock()
+		w.bansMu.RLock()
 		pubURL := w.publicURL
-		w.mu.RUnlock()
+		w.bansMu.RUnlock()
 		if r.TLS != nil || strings.HasPrefix(strings.ToLower(pubURL), "https://") {
 			rw.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}

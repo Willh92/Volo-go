@@ -7,15 +7,25 @@
         {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
       </div>
     </section>
+    {{if or .Books .TagQuery}}
+      <div class="studio-tax-toolbar">
+        <form class="studio-tax-search" method="get" action="/books">
+          <input class="volo-input studio-tax-search__input js-book-filter-input" type="search" name="q" value="{{.TagQuery}}" placeholder="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}" autocomplete="off">
+          <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{t .Locale "nav.search_placeholder"}}">↵</button>
+        </form>
+      </div>
+    {{end}}
     {{if .Books}}
-      <div class="bookshelf-grid">
+      <div class="bookshelf-grid js-book-filter-grid">
         {{range .Books}}
-          <article class="book-card" data-book-card="{{.Slug}}">
+          <article class="book-card" data-book-card="{{.Slug}}" data-book-filter="{{lower .Title}} {{lower .Slug}} {{lower .Description}}">
             {{if .CoverURL}}
               <a class="book-card__cover" href="/books/{{.Slug}}" tabindex="-1" aria-hidden="true">
                 <img src="{{.CoverURL}}" alt="{{.Title}}" loading="lazy" width="240" height="320" data-cover-img="1">
                 <span class="studio-cover-fallback" hidden>{{coverSVG .Slug false}}</span>
               </a>
+            {{else}}
+              <a class="book-card__cover" href="/books/{{.Slug}}" tabindex="-1" aria-hidden="true">{{coverSVG .Slug false}}</a>
             {{end}}
             <div class="book-card__meta">
               <span class="volo-badge">{{.SourceType}}</span>
@@ -30,6 +40,8 @@
           </article>
         {{end}}
       </div>
+      <p class="studio-muted-empty js-book-filter-empty" hidden>{{t .Locale "search.empty"}}</p>
+      {{template "pagination" .}}
     {{else}}
       {{template "empty_state" (dict "Title" (t .Locale "studio.empty_books_title") "Desc" (t .Locale "studio.empty_books_desc"))}}
     {{end}}

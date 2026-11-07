@@ -27,7 +27,7 @@ func TestArgon2idHashAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HashPassword failed: %v", err)
 	}
-	if !strings.HasPrefix(hash, "$argon2id$v=19$m=65536,t=3,p=2$") {
+	if !strings.HasPrefix(hash, "$argon2id$v=19$m=19456,t=2,p=1$") {
 		t.Fatalf("unexpected PHC format: %s", hash)
 	}
 
@@ -38,6 +38,17 @@ func TestArgon2idHashAndVerify(t *testing.T) {
 	okWrong, _ := VerifyPassword("WrongPass2026!", hash, "")
 	if okWrong {
 		t.Fatal("expected wrong password to fail")
+	}
+
+	// Pre-existing 64 MiB (m=65536,t=3,p=2) Argon2id hashes MUST continue to verify seamlessly!
+	salt64 := []byte("0123456789abcdef")
+	dk64 := deriveArgon2Key([]byte("Existing64MiB!"), salt64, 3, 64*1024, 2, 32)
+	hash64 := fmt.Sprintf("$argon2id$v=19$m=65536,t=3,p=2$%s$%s",
+		base64.RawStdEncoding.EncodeToString(salt64),
+		base64.RawStdEncoding.EncodeToString(dk64),
+	)
+	if ok64, up64 := VerifyPassword("Existing64MiB!", hash64, ""); !ok64 || up64 {
+		t.Fatalf("expected existing 64 MiB hash to verify seamlessly, got ok=%v upgrade=%v", ok64, up64)
 	}
 }
 

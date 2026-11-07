@@ -31,6 +31,7 @@ type LookupFunc func(addr netip.Addr) (GeoLocation, bool)
 // ordered allow/deny rule evaluation, self-lockout protection, and emergency circuit-breaker support.
 type GeoEngine struct {
 	mu          sync.RWMutex
+	xdbMu       sync.Mutex
 	mmdbReader  *maxminddb.Reader
 	xdbSearcher *xdb.Searcher
 	rules       []domain.SecurityGeoRule
@@ -55,7 +56,8 @@ func (g *GeoEngine) SetLookupOverride(fn LookupFunc) {
 	g.mu.Unlock()
 }
 
-// LoadDatabases scans geoIPDir for any *.mmdb and *.xdb files and loads them into memory safely.
+// LoadDatabases scans geoIPDir for any *.mmdb and *.xdb files and loads them safely.
+// For ip2region (*.xdb), only the ~512 KiB vector index is cached in RAM rather than buffering the full ~11.5 MiB file.
 func (g *GeoEngine) LoadDatabases(geoIPDir string) error {
 	entries, err := os.ReadDir(geoIPDir)
 	if err != nil {
@@ -79,8 +81,8 @@ func (g *GeoEngine) LoadDatabases(geoIPDir string) error {
 				newMMDB = r
 			}
 		} else if strings.HasSuffix(low, ".xdb") && newXDB == nil {
-			if buf, rErr := xdb.LoadContentFromFile(fullPath); rErr == nil {
-				if s, sErr := xdb.NewWithBuffer(xdb.IPv4, buf); sErr == nil {
+			if vIndex, rErr := xdb.LoadVectorIndexFromFile(fullPath); rErr == nil {
+				if s, sErr := xdb.NewWithVectorIndex(xdb.IPv4, fullPath, vIndex); sErr == nil {
 					newXDB = s
 				}
 			}
@@ -89,10 +91,13 @@ func (g *GeoEngine) LoadDatabases(geoIPDir string) error {
 
 	g.mu.Lock()
 	oldMMDB := g.mmdbReader
-	oldXDB := g.xdbSearcher
 	g.mmdbReader = newMMDB
-	g.xdbSearcher = newXDB
 	g.mu.Unlock()
+
+	g.xdbMu.Lock()
+	oldXDB := g.xdbSearcher
+	g.xdbSearcher = newXDB
+	g.xdbMu.Unlock()
 
 	if oldMMDB != nil {
 		_ = oldMMDB.Close()
@@ -104,12 +109,19 @@ func (g *GeoEngine) LoadDatabases(geoIPDir string) error {
 }
 
 func (g *GeoEngine) Close() {
+	if g == nil {
+		return
+	}
 	g.mu.Lock()
 	oldMMDB := g.mmdbReader
-	oldXDB := g.xdbSearcher
 	g.mmdbReader = nil
-	g.xdbSearcher = nil
 	g.mu.Unlock()
+
+	g.xdbMu.Lock()
+	oldXDB := g.xdbSearcher
+	g.xdbSearcher = nil
+	g.xdbMu.Unlock()
+
 	if oldMMDB != nil {
 		_ = oldMMDB.Close()
 	}
@@ -165,18 +177,15 @@ func (g *GeoEngine) Lookup(addr netip.Addr) (GeoLocation, bool) {
 
 	g.mu.RLock()
 	override := g.overrideFn
-	mmdbR := g.mmdbReader
-	xdbS := g.xdbSearcher
-	g.mu.RUnlock()
-
 	if override != nil {
+		g.mu.RUnlock()
 		return override(u)
 	}
 
 	var out GeoLocation
 	var found bool
 
-	if mmdbR != nil {
+	if g.mmdbReader != nil {
 		var rec struct {
 			Country struct {
 				ISOCode string            `maxminddb:"iso_code"`
@@ -189,7 +198,7 @@ func (g *GeoEngine) Lookup(addr netip.Addr) (GeoLocation, bool) {
 				Names map[string]string `maxminddb:"names"`
 			} `maxminddb:"city"`
 		}
-		if err := mmdbR.Lookup(u).Decode(&rec); err == nil && rec.Country.ISOCode != "" {
+		if err := g.mmdbReader.Lookup(u).Decode(&rec); err == nil && rec.Country.ISOCode != "" {
 			out.CountryISO = strings.ToUpper(rec.Country.ISOCode)
 			var parts []string
 			if len(rec.Subdivisions) > 0 {
@@ -209,10 +218,20 @@ func (g *GeoEngine) Lookup(addr netip.Addr) (GeoLocation, bool) {
 			found = true
 		}
 	}
+	g.mu.RUnlock()
 
-	// Cascade into ip2region XDB for IPv4 precision (especially Chinese provinces/cities)
-	if xdbS != nil && u.Is4() {
-		if raw, err := xdbS.Search(u.String()); err == nil && raw != "" {
+	// Cascade into ip2region XDB for IPv4 precision (especially Chinese provinces/cities).
+	// Searcher.Search mutates internal ioCount and seeks its underlying file descriptor, so serialize via xdbMu.
+	if u.Is4() {
+		var raw string
+		var xErr error
+		g.xdbMu.Lock()
+		if g.xdbSearcher != nil {
+			raw, xErr = g.xdbSearcher.Search(u.String())
+		}
+		g.xdbMu.Unlock()
+
+		if xErr == nil && raw != "" {
 			// Format: Country|0|Province|City|ISP
 			segs := strings.Split(raw, "|")
 			if len(segs) >= 4 {

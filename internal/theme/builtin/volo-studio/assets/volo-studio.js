@@ -241,7 +241,16 @@
   }
 
   function pulseCommentTarget(el) {
-    if (!el || !el.classList || !el.classList.contains("vc-item")) return;
+    if (!el || !el.classList) return;
+    var fnItem = el.matches && el.matches(".footnotes li") ? el : (el.closest ? el.closest(".footnotes li") : null);
+    if (fnItem) {
+      document.querySelectorAll(".footnotes li.is-target").forEach(function (n) { n.classList.remove("is-target"); });
+      fnItem.classList.add("is-target");
+      clearTimeout(fnItem._targetTimer);
+      fnItem._targetTimer = setTimeout(function () { fnItem.classList.remove("is-target"); }, 2400);
+      return;
+    }
+    if (!el.classList.contains("vc-item")) return;
     document.querySelectorAll(".vc-item.is-target").forEach(function (n) { n.classList.remove("is-target"); });
     el.classList.add("is-target");
     clearTimeout(el._targetTimer);
@@ -288,7 +297,8 @@
     var destY = (window.scrollY || 0) + targetEl.getBoundingClientRect().top - getHeaderOffset();
     if (!skipHistory) {
       try {
-        history.replaceState(history.state, "", "#" + encodeURIComponent(targetEl.id));
+        var cleanHash = encodeURIComponent(targetEl.id).replace(/%3A/gi, ":");
+        history.replaceState(history.state, "", "#" + cleanHash);
       } catch (_) {}
     }
     setActiveTOCLink(targetEl.id);
@@ -464,54 +474,94 @@
     });
   }
 
-  /* On-Demand KaTeX & Mermaid Lazy Loader (Zero External Requests When Unused) */
-  function getCDNPrefix() {
-    var raw = (document.documentElement.getAttribute("data-cdn-prefix") || "").trim().replace(/\/+$/, "");
-    return raw || "https://cdn.jsdelivr.net/npm";
-  }
-
-  function loadStyleOnce(id, href) {
-    if (document.getElementById(id)) return;
-    var link = document.createElement("link");
-    link.id = id;
-    link.rel = "stylesheet";
-    link.href = href;
-    document.head.appendChild(link);
-  }
-
-  function loadScriptOnce(src) {
-    return new Promise(function (resolve, reject) {
-      var existing = document.querySelector('script[data-volo-lazy="' + src + '"]');
-      if (existing) {
-        if (existing.dataset.loaded === "1") return resolve();
-        existing.addEventListener("load", function () { resolve(); }, { once: true });
-        existing.addEventListener("error", function () { reject(new Error("script error")); }, { once: true });
-        return;
-      }
-      var s = document.createElement("script");
-      s.src = src;
-      s.async = true;
-      s.setAttribute("data-volo-lazy", src);
-      s.addEventListener("load", function () {
-        s.dataset.loaded = "1";
-        resolve();
-      }, { once: true });
-      s.addEventListener("error", function () {
-        s.remove();
-        reject(new Error("script error"));
-      }, { once: true });
-      document.head.appendChild(s);
-    });
+  /* On-Demand KaTeX & Mermaid Lazy Loader (Backend-Unified Vendor CDN + Multi-Mirror Fallback) */
+  function getVendorRuntime() {
+    if (window.__VOLO_VENDOR__ && typeof window.__VOLO_VENDOR__.loadScript === "function") {
+      return window.__VOLO_VENDOR__;
+    }
+    var bases = ["https://cdn.jsdelivr.net/npm", "https://fastly.jsdelivr.net/npm", "https://unpkg.com"];
+    var loaded = {};
+    function norm(sub) { return String(sub || "").replace(/^\/+/, ""); }
+    function loadStyle(id, sub) {
+      if (document.getElementById(id)) return Promise.resolve();
+      var clean = norm(sub);
+      return new Promise(function (resolve) {
+        function attempt(idx) {
+          if (idx >= bases.length) { resolve(); return; }
+          var link = document.createElement("link");
+          link.id = id;
+          link.rel = "stylesheet";
+          link.href = bases[idx] + "/" + clean;
+          link.onload = function () { resolve(); };
+          link.onerror = function () {
+            link.remove();
+            attempt(idx + 1);
+          };
+          document.head.appendChild(link);
+        }
+        attempt(0);
+      });
+    }
+    function loadScript(sub) {
+      var clean = norm(sub);
+      if (loaded[clean]) return loaded[clean];
+      loaded[clean] = new Promise(function (resolve, reject) {
+        function attempt(idx) {
+          if (idx >= bases.length) {
+            delete loaded[clean];
+            reject(new Error("vendor script load failed: " + clean));
+            return;
+          }
+          var s = document.createElement("script");
+          var done = false;
+          var timer = setTimeout(function () {
+            if (done) return;
+            done = true;
+            s.remove();
+            attempt(idx + 1);
+          }, 8000);
+          s.src = bases[idx] + "/" + clean;
+          s.async = true;
+          s.onload = function () {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            resolve();
+          };
+          s.onerror = function () {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            s.remove();
+            attempt(idx + 1);
+          };
+          document.head.appendChild(s);
+        }
+        attempt(0);
+      });
+      return loaded[clean];
+    }
+    window.__VOLO_VENDOR__ = {
+      bases: bases,
+      katexCss: "katex@0.16.11/dist/katex.min.css",
+      katexJs: "katex@0.16.11/dist/katex.min.js",
+      katexAutoRenderJs: "katex@0.16.11/dist/contrib/auto-render.min.js",
+      mermaidJs: "mermaid@10/dist/mermaid.min.js",
+      url: function (sub) { return bases[0] + "/" + norm(sub); },
+      loadStyle: loadStyle,
+      loadScript: loadScript
+    };
+    return window.__VOLO_VENDOR__;
   }
 
   function ensureKaTeX() {
     if (window.renderMathInElement) return Promise.resolve();
     if (!katexPromise) {
-      var cdn = getCDNPrefix();
-      loadStyleOnce("volo-katex-css", cdn + "/katex@0.16.11/dist/katex.min.css");
-      katexPromise = loadScriptOnce(cdn + "/katex@0.16.11/dist/katex.min.js")
+      var v = getVendorRuntime();
+      v.loadStyle("volo-katex-css", v.katexCss || "katex@0.16.11/dist/katex.min.css");
+      katexPromise = v.loadScript(v.katexJs || "katex@0.16.11/dist/katex.min.js")
         .then(function () {
-          return loadScriptOnce(cdn + "/katex@0.16.11/dist/contrib/auto-render.min.js");
+          return v.loadScript(v.katexAutoRenderJs || "katex@0.16.11/dist/contrib/auto-render.min.js");
         })
         .catch(function (err) {
           katexPromise = null;
@@ -524,8 +574,8 @@
   function ensureMermaid() {
     if (window.mermaid) return Promise.resolve(window.mermaid);
     if (!mermaidPromise) {
-      var cdn = getCDNPrefix();
-      mermaidPromise = loadScriptOnce(cdn + "/mermaid@10/dist/mermaid.min.js")
+      var v = getVendorRuntime();
+      mermaidPromise = v.loadScript(v.mermaidJs || "mermaid@10/dist/mermaid.min.js")
         .then(function () { return window.mermaid; })
         .catch(function (err) {
           mermaidPromise = null;
@@ -762,6 +812,66 @@
     try { localStorage.setItem(BOOK_PROGRESS_KEY, JSON.stringify(map)); } catch (_) {}
   }
 
+  function initTaxonomyAndBookFilters(scope) {
+    var root = scope || document;
+    var tagIn = root.querySelector(".js-tag-filter-input");
+    var tagList = root.querySelector(".js-tag-filter-list, .js-tag-filter-grid");
+    var tagEmpty = root.querySelector(".js-tag-filter-empty");
+    if (tagIn && tagList && tagIn.dataset.boundFilter !== "1") {
+      tagIn.dataset.boundFilter = "1";
+      var syncTagFilter = function () {
+        var q = String(tagIn.value || "").trim().toLowerCase();
+        var shown = 0;
+        tagList.querySelectorAll("[data-tag-name], [data-tag-filter]").forEach(function (item) {
+          var hay = (item.getAttribute("data-tag-name") || item.getAttribute("data-tag-filter") || item.textContent || "").toLowerCase();
+          var match = !q || hay.indexOf(q) !== -1;
+          item.hidden = !match;
+          if (match) shown++;
+        });
+        if (tagEmpty) tagEmpty.hidden = !q || shown > 0;
+      };
+      tagIn.addEventListener("input", syncTagFilter);
+      if (tagIn.value) syncTagFilter();
+    }
+
+    var bookIn = root.querySelector(".js-book-filter-input");
+    var bookGrid = root.querySelector(".js-book-filter-grid");
+    var bookEmpty = root.querySelector(".js-book-filter-empty");
+    if (bookIn && bookGrid && bookIn.dataset.boundFilter !== "1") {
+      bookIn.dataset.boundFilter = "1";
+      if (!bookIn.value) {
+        try {
+          var urlQ = new URLSearchParams(window.location.search).get("q") || "";
+          if (urlQ) bookIn.value = urlQ;
+        } catch (_) {}
+      }
+      var syncBookFilter = function () {
+        var q = String(bookIn.value || "").trim().toLowerCase();
+        var shown = 0;
+        bookGrid.querySelectorAll("[data-book-filter]").forEach(function (item) {
+          var hay = (item.getAttribute("data-book-filter") || item.textContent || "").toLowerCase();
+          var match = !q || hay.indexOf(q) !== -1;
+          item.hidden = !match;
+          if (match) shown++;
+        });
+        if (bookEmpty) bookEmpty.hidden = !q || shown > 0;
+      };
+      bookIn.addEventListener("input", syncBookFilter);
+      if (bookIn.value) syncBookFilter();
+    }
+  }
+
+  function centerActiveLinkInContainer(navEl, linkEl) {
+    if (!navEl || !linkEl) return;
+    requestAnimationFrame(function () {
+      var nr = navEl.getBoundingClientRect();
+      var lr = linkEl.getBoundingClientRect();
+      if (nr.height <= 0 || navEl.scrollHeight <= navEl.clientHeight) return;
+      var relTop = lr.top - nr.top + navEl.scrollTop;
+      navEl.scrollTop = Math.max(0, relTop - Math.round((navEl.clientHeight - lr.height) / 2));
+    });
+  }
+
   function initBookshelfAndReader(root) {
     var progress = readBookProgress();
     root.querySelectorAll("[data-book-card]").forEach(function (card) {
@@ -790,6 +900,17 @@
       writeBookProgress(slug, { chapterId: activeID, chapterTitle: activeTitle, url: activeURL, ts: Date.now() });
     }
 
+    reader.querySelectorAll(".book-reader-frame").forEach(function (frame) {
+      if (frame.dataset.boundLoad === "1") return;
+      frame.dataset.boundLoad = "1";
+      var wrap = frame.closest(".book-reader-frame-wrap");
+      if (!wrap) return;
+      var clearSpin = function () { wrap.classList.remove("is-loading"); };
+      frame.addEventListener("load", clearSpin, { once: true });
+      frame.addEventListener("error", clearSpin, { once: true });
+      setTimeout(clearSpin, 3500);
+    });
+
     reader.querySelectorAll("[data-chapter-id]").forEach(function (link) {
       link.addEventListener("click", function () {
         var cid = link.getAttribute("data-chapter-id") || "";
@@ -816,29 +937,62 @@
       reader.classList.add("is-toc-collapsed");
     }
 
+    var scrollBookTocActive = function () {
+      if (reader.classList.contains("is-toc-collapsed")) return;
+      var tocNav = reader.querySelector(".book-reader-toc__nav, .book-reader-toc");
+      var actCh = reader.querySelector(".book-reader-toc__link.is-active");
+      if (tocNav && actCh) centerActiveLinkInContainer(tocNav, actCh);
+    };
+
     var tocBtns = Array.prototype.slice.call(reader.querySelectorAll(".js-book-toggle-toc"));
+    var syncTocBtns = function () {
+      var isCol = reader.classList.contains("is-toc-collapsed");
+      tocBtns.forEach(function (btn) {
+        btn.setAttribute("aria-expanded", isCol ? "false" : "true");
+        var expLbl = btn.getAttribute("data-expand-label");
+        var colLbl = btn.getAttribute("data-collapse-label");
+        var lblSpan = btn.querySelector(".js-book-toggle-label");
+        if (lblSpan && (expLbl || colLbl)) {
+          lblSpan.textContent = isCol ? (expLbl || lblSpan.textContent) : (colLbl || lblSpan.textContent);
+        } else if (expLbl || colLbl) {
+          btn.textContent = isCol ? (expLbl || btn.textContent) : (colLbl || btn.textContent);
+        }
+      });
+    };
     if (tocBtns.length) {
-      var syncTocBtns = function () {
-        var isCol = reader.classList.contains("is-toc-collapsed");
-        tocBtns.forEach(function (btn) {
-          btn.setAttribute("aria-expanded", isCol ? "false" : "true");
-          var expLbl = btn.getAttribute("data-expand-label");
-          var colLbl = btn.getAttribute("data-collapse-label");
-          var lblSpan = btn.querySelector(".js-book-toggle-label");
-          if (lblSpan && (expLbl || colLbl)) {
-            lblSpan.textContent = isCol ? (expLbl || lblSpan.textContent) : (colLbl || lblSpan.textContent);
-          } else if (expLbl || colLbl) {
-            btn.textContent = isCol ? (expLbl || btn.textContent) : (colLbl || btn.textContent);
-          }
-        });
-      };
       syncTocBtns();
       tocBtns.forEach(function (btn) {
         btn.addEventListener("click", function () {
           var nextCol = reader.classList.toggle("is-toc-collapsed");
           try { sessionStorage.setItem(prefKey, nextCol ? "collapsed" : "expanded"); } catch (_) {}
           syncTocBtns();
+          if (!nextCol) scrollBookTocActive();
         });
+      });
+    }
+    scrollBookTocActive();
+
+    var mobTocBtn = reader.querySelector(".js-book-mobile-toc");
+    if (mobTocBtn) {
+      var syncMobBookBtn = function () {
+        mobTocBtn.hidden = !(window.innerWidth <= 900 && (window.scrollY || 0) > 240);
+      };
+      window.addEventListener("scroll", syncMobBookBtn, { passive: true });
+      window.addEventListener("resize", syncMobBookBtn, { passive: true });
+      tocCleanups.push(function () {
+        window.removeEventListener("scroll", syncMobBookBtn);
+        window.removeEventListener("resize", syncMobBookBtn);
+      });
+      syncMobBookBtn();
+      mobTocBtn.addEventListener("click", function () {
+        reader.classList.remove("is-toc-collapsed");
+        try { sessionStorage.setItem(prefKey, "expanded"); } catch (_) {}
+        syncTocBtns();
+        var tocAside = reader.querySelector(".book-reader-toc");
+        if (tocAside) {
+          smoothScrollToY((window.scrollY || 0) + tocAside.getBoundingClientRect().top - getHeaderOffset());
+        }
+        scrollBookTocActive();
       });
     }
 
@@ -853,8 +1007,97 @@
     }
   }
 
+  function normAudioHref(el) {
+    if (!el) return "";
+    var raw = el.getAttribute("src") || el.currentSrc || "";
+    if (!raw) return "";
+    try { return new URL(raw, window.location.origin).href; } catch (_) { return raw; }
+  }
+
+  function dockPlayingPodcastBeforePJAX(mainEl) {
+    if (!mainEl) return;
+    var liveAudio = mainEl.querySelector("#volo-podcast-audio");
+    if (!liveAudio || liveAudio.paused || liveAudio.ended) return;
+    var srcHref = normAudioHref(liveAudio);
+    if (!srcHref) return;
+    var dock = document.getElementById("volo-persist-dock") || document.body;
+    if (!dock) return;
+
+    var prevMini = document.getElementById("volo-podcast-mini");
+    if (prevMini) {
+      var prevAud = prevMini.querySelector("audio");
+      if (prevAud && prevAud !== liveAudio) { try { prevAud.pause(); } catch (_) {} }
+      prevMini.remove();
+    }
+
+    var epTitle = liveAudio.getAttribute("data-episode-title") || document.title || "Podcast";
+    var epURL = liveAudio.getAttribute("data-episode-url") || window.location.pathname;
+    liveAudio.removeAttribute("id");
+    liveAudio.className = "volo-podcast-mini__audio";
+
+    var mini = document.createElement("div");
+    mini.id = "volo-podcast-mini";
+    mini.className = "volo-podcast-mini";
+    mini.setAttribute("data-volo-persist", "podcast-mini");
+
+    var head = document.createElement("div");
+    head.className = "volo-podcast-mini__head";
+    var titleLink = document.createElement("a");
+    titleLink.className = "volo-podcast-mini__title";
+    titleLink.href = epURL;
+    titleLink.textContent = "🎙 " + epTitle;
+    titleLink.title = epTitle;
+    var closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "volo-podcast-mini__close";
+    closeBtn.setAttribute("aria-label", "Close");
+    closeBtn.textContent = "✕";
+    closeBtn.addEventListener("click", function () {
+      try { liveAudio.pause(); } catch (_) {}
+      mini.remove();
+    });
+    head.appendChild(titleLink);
+    head.appendChild(closeBtn);
+    mini.appendChild(head);
+    mini.appendChild(liveAudio);
+    dock.appendChild(mini);
+    if (liveAudio.paused) {
+      liveAudio.play().catch(function () {});
+    }
+  }
+
+  function reconcilePodcastMiniPlayer(root) {
+    var mini = document.getElementById("volo-podcast-mini");
+    var miniAudio = mini ? mini.querySelector("audio") : null;
+    var pageAudio = root.querySelector("#volo-podcast-audio");
+    if (!mini || !miniAudio || !pageAudio) return;
+
+    if (normAudioHref(miniAudio) === normAudioHref(pageAudio)) {
+      var wasPlaying = !miniAudio.paused;
+      miniAudio.id = "volo-podcast-audio";
+      miniAudio.className = "volo-podcast-card__player";
+      pageAudio.replaceWith(miniAudio);
+      mini.remove();
+      var spBtn = root.querySelector("#volo-podcast-speed");
+      if (spBtn && miniAudio.playbackRate) spBtn.textContent = miniAudio.playbackRate + "x";
+      if (wasPlaying && miniAudio.paused) {
+        miniAudio.play().catch(function () {});
+      }
+    } else if (pageAudio.dataset.boundMiniStop !== "1") {
+      pageAudio.dataset.boundMiniStop = "1";
+      pageAudio.addEventListener("play", function () {
+        var curMini = document.getElementById("volo-podcast-mini");
+        if (!curMini) return;
+        var curAud = curMini.querySelector("audio");
+        if (curAud) { try { curAud.pause(); } catch (_) {} }
+        curMini.remove();
+      });
+    }
+  }
+
   function initPodcastAndUnlock(scope) {
     var root = scope || document;
+    reconcilePodcastMiniPlayer(root);
     linkifyPodcastTimestamps(root);
 
     root.querySelectorAll("[data-audio-seek]").forEach(function (btn) {
@@ -927,6 +1170,7 @@
     });
 
     initReaderAuthForms(root);
+    initTaxonomyAndBookFilters(root);
     initBookshelfAndReader(root);
   }
 
@@ -1128,6 +1372,10 @@
           if (drawer.hidden || drawer.classList.contains("is-closing")) {
             closePopovers();
             openAnimated(drawer, mBtn);
+            centerActiveLinkInContainer(
+              drawer.querySelector(".volo-toc-nav, .volo-toc__list"),
+              drawer.querySelector(".volo-toc-link.is-active")
+            );
           } else {
             closeMobileTOC();
           }
@@ -1259,6 +1507,76 @@
     }
   }
 
+  function syncDocumentHead(doc) {
+    if (!doc || !doc.head || !document.head) return;
+    document.title = doc.title || document.title;
+    var nextLang = doc.documentElement && doc.documentElement.getAttribute("lang");
+    if (nextLang) document.documentElement.setAttribute("lang", nextLang);
+
+    var nextCanon = doc.head.querySelector('link[rel="canonical"]');
+    var curCanon = document.head.querySelector('link[rel="canonical"]');
+    if (nextCanon) {
+      if (!curCanon) {
+        curCanon = document.createElement("link");
+        curCanon.rel = "canonical";
+        document.head.appendChild(curCanon);
+      }
+      curCanon.href = nextCanon.getAttribute("href") || "";
+    } else if (curCanon) {
+      curCanon.remove();
+    }
+
+    ["description", "robots"].forEach(function (name) {
+      var nextMeta = doc.head.querySelector('meta[name="' + name + '"]');
+      var curMeta = document.head.querySelector('meta[name="' + name + '"]');
+      if (nextMeta) {
+        if (!curMeta) {
+          curMeta = document.createElement("meta");
+          curMeta.name = name;
+          document.head.appendChild(curMeta);
+        }
+        curMeta.content = nextMeta.getAttribute("content") || "";
+      } else if (curMeta) {
+        curMeta.remove();
+      }
+    });
+
+    document.head.querySelectorAll('script[type="application/ld+json"]').forEach(function (s) { s.remove(); });
+    doc.head.querySelectorAll('script[type="application/ld+json"]').forEach(function (s) {
+      var clone = document.createElement("script");
+      clone.type = "application/ld+json";
+      clone.textContent = s.textContent || "";
+      document.head.appendChild(clone);
+    });
+  }
+
+  function syncHeaderAndPersistDock(doc, mainEl) {
+    var curHW = document.querySelector(".studio-header-widgets");
+    var nextHW = doc.querySelector(".studio-header-widgets");
+    if (nextHW && curHW) {
+      curHW.innerHTML = nextHW.innerHTML;
+    } else if (nextHW && !curHW && mainEl && mainEl.parentNode) {
+      mainEl.parentNode.insertBefore(nextHW.cloneNode(true), mainEl);
+    } else if (!nextHW && curHW) {
+      curHW.remove();
+    }
+
+    var curDock = document.getElementById("volo-persist-dock");
+    var nextDock = doc.getElementById("volo-persist-dock");
+    if (!curDock || !nextDock) return;
+
+    Array.prototype.slice.call(curDock.children).forEach(function (ch) {
+      if (ch.hasAttribute("data-volo-persist") || ch.id === "volo-kanbanniang-root" || ch.id === "volo-podcast-mini") return;
+      ch.remove();
+    });
+    Array.prototype.slice.call(nextDock.children).forEach(function (ch) {
+      var pKey = ch.getAttribute("data-volo-persist");
+      if (pKey && curDock.querySelector('[data-volo-persist="' + pKey + '"]')) return;
+      if (ch.id && document.getElementById(ch.id)) return;
+      curDock.appendChild(ch.cloneNode(true));
+    });
+  }
+
   function navigatePJAX(rawURL, push) {
     var url = withPreviewParams(rawURL);
     var main = document.getElementById("studio-main");
@@ -1292,7 +1610,10 @@
         var nextAccent = doc.documentElement.getAttribute("data-accent");
         if (nextAccent) document.documentElement.setAttribute("data-accent", nextAccent);
 
-        document.title = doc.title || document.title;
+        dockPlayingPodcastBeforePJAX(main);
+        syncDocumentHead(doc);
+        syncHeaderAndPersistDock(doc, main);
+
         main.innerHTML = nextMain.innerHTML;
         main.classList.remove("is-transitioning");
         if (!prefersReducedMotion()) {
@@ -1332,15 +1653,21 @@
   }
 
   function syncActiveNav(pathname) {
+    var cleanPath = (pathname || "/").replace(/\/+$/, "") || "/";
     document.querySelectorAll(".studio-nav__link, .studio-nav-more__item").forEach(function (a) {
       var href = a.getAttribute("href") || "";
       if (!href) return;
-      a.classList.toggle("is-active", href === pathname || (href !== "/" && pathname.indexOf(href) === 0));
+      var cleanHref = href.split("?")[0].replace(/\/+$/, "") || "/";
+      var active = cleanPath === cleanHref || (cleanHref !== "/" && cleanPath.indexOf(cleanHref + "/") === 0);
+      a.classList.toggle("is-active", active);
     });
     var moreBtn = document.getElementById("volo-nav-more-btn");
     var moreMenu = document.getElementById("volo-nav-more-menu");
     if (moreBtn) {
-      moreBtn.classList.toggle("is-active", Boolean(moreMenu && moreMenu.querySelector(".studio-nav-more__item.is-active:not(.studio-only-mobile)")));
+      var sel = window.innerWidth <= 760
+        ? ".studio-nav-more__item.is-active"
+        : ".studio-nav-more__item.is-active:not(.studio-only-mobile)";
+      moreBtn.classList.toggle("is-active", Boolean(moreMenu && moreMenu.querySelector(sel)));
     }
   }
 
@@ -1357,6 +1684,22 @@
       window.VoloCommentWidget.mount();
     }
   }
+
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    if (!form || !form.matches || !form.matches("form.studio-tax-search")) return;
+    if ((form.getAttribute("method") || "get").toLowerCase() !== "get") return;
+    if (document.documentElement.getAttribute("data-pjax") === "false") return;
+    ev.preventDefault();
+    var act = form.getAttribute("action") || window.location.pathname;
+    var u = new URL(act, window.location.origin);
+    var fd = new FormData(form);
+    fd.forEach(function (val, key) {
+      var s = String(val || "").trim();
+      if (s) u.searchParams.set(key, s);
+    });
+    navigatePJAX(u.pathname + u.search, true);
+  });
 
   document.addEventListener("click", function (ev) {
     var themeMenu = document.getElementById("volo-theme-menu");
@@ -1527,7 +1870,10 @@
   var resizeTimer = null;
   window.addEventListener("resize", function () {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () { inspectGitHubDescriptions(document); }, 180);
+    resizeTimer = setTimeout(function () {
+      inspectGitHubDescriptions(document);
+      syncActiveNav(window.location.pathname);
+    }, 180);
   }, { passive: true });
 
   applyTheme(null);
@@ -1547,6 +1893,7 @@
         if (ev.target === mainEl) mainEl.classList.remove("is-transitioning");
       });
     }
+    syncActiveNav(window.location.pathname);
     checkBrokenImages(document);
     initSearchAndLightbox();
     initBackToTop();

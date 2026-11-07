@@ -69,8 +69,8 @@ func TestEngineRenderFeaturesXSSAndFailClosedLocks(t *testing.T) {
 	if strings.Contains(outAnon.HTML, "<script>") || strings.Contains(outAnon.HTML, "onerror") {
 		t.Fatalf("XSS payload was not stripped by bluemonday: %s", outAnon.HTML)
 	}
-	if !strings.Contains(outAnon.HTML, `data-audio-seek="205"`) {
-		t.Fatalf("expected [03:25] -> data-audio-seek=\"205\" button in HTML: %s", outAnon.HTML)
+	if !strings.Contains(outAnon.HTML, `class="volo-audio-ts" data-audio-seek="205">▶ 03:25</button>`) {
+		t.Fatalf("expected [03:25] -> unified volo-audio-ts ▶ 03:25 button in HTML: %s", outAnon.HTML)
 	}
 	if !strings.Contains(outAnon.HTML, `width="1280"`) || !strings.Contains(outAnon.HTML, `height="720"`) {
 		t.Fatalf("expected intrinsic width/height injected onto image: %s", outAnon.HTML)
@@ -91,14 +91,37 @@ func TestEngineRenderFeaturesXSSAndFailClosedLocks(t *testing.T) {
 		t.Fatalf("reader without password must NOT see type=pwd blocks")
 	}
 
-	// 3. Password-unlocked Web render reveals locked blocks, whereas Feed mode NEVER reveals them even if Unlocked=true!
+	// 3. Password-unlocked Web render reveals pwd blocks (NOT type="user"), whereas Feed mode NEVER reveals them even if Unlocked=true!
 	outUnlockedWeb := eng.Render(md, Options{Mode: RenderModeWeb, Unlocked: true})
 	if !strings.Contains(outUnlockedWeb.HTML, "HIDDEN_LOCKED_PARAGRAPH_1") || !strings.Contains(outUnlockedWeb.HTML, "UNCLOSED_EOF_SECRET_3") {
 		t.Fatalf("unlocked web mode should reveal locked blocks")
 	}
-	outFeed := eng.Render(md, Options{Mode: RenderModeFeed, Unlocked: true})
-	if strings.Contains(outFeed.HTML, "HIDDEN_LOCKED_PARAGRAPH_1") || strings.Contains(outFeed.HTML, "UNCLOSED_EOF_SECRET_3") {
-		t.Fatalf("RenderModeFeed must NEVER emit locked content even if Unlocked=true!")
+	if strings.Contains(outUnlockedWeb.HTML, "READER_ONLY_PARAGRAPH_2") {
+		t.Fatalf("password unlock without reader login MUST NOT reveal type=user block!")
+	}
+	outFeed := eng.Render(md, Options{Mode: RenderModeWeb, AuthorOrShareBypass: true})
+	if !strings.Contains(outFeed.HTML, "READER_ONLY_PARAGRAPH_2") || !strings.Contains(outFeed.HTML, "HIDDEN_LOCKED_PARAGRAPH_1") {
+		t.Fatalf("AuthorOrShareBypass should reveal all lock blocks in web mode")
+	}
+	outFeedMode := eng.Render(md, Options{Mode: RenderModeFeed, Unlocked: true, AuthorOrShareBypass: true})
+	if strings.Contains(outFeedMode.HTML, "HIDDEN_LOCKED_PARAGRAPH_1") || strings.Contains(outFeedMode.HTML, "UNCLOSED_EOF_SECRET_3") {
+		t.Fatalf("RenderModeFeed must NEVER emit locked content even if Unlocked/Bypass=true!")
+	}
+
+	// 3b. Multi-lock isolation: unlocking pwd="A" reveals ONLY block A, NOT pwd="B" and NOT type="user"!
+	multiMD := ":::" + "lock pwd=\"A\"\nSECRET_ALPHA\n:::\n\n:::lock pwd=\"B\"\nSECRET_BRAVO\n:::\n\n:::lock type=\"user\"\nSECRET_READER\n:::"
+	outOnlyA := eng.Render(multiMD, Options{
+		Mode:              RenderModeWeb,
+		UnlockedPasswords: map[string]bool{"A": true},
+	})
+	if !strings.Contains(outOnlyA.HTML, "SECRET_ALPHA") {
+		t.Fatalf("expected SECRET_ALPHA unlocked: %s", outOnlyA.HTML)
+	}
+	if strings.Contains(outOnlyA.HTML, "SECRET_BRAVO") || strings.Contains(outOnlyA.HTML, "SECRET_READER") {
+		t.Fatalf("unlocking pwd=A leaked sibling blocks: %s", outOnlyA.HTML)
+	}
+	if !outOnlyA.HasUnresolvedLock {
+		t.Fatalf("expected HasUnresolvedLock=true while block B and user block remain locked")
 	}
 
 	// 4. Outbound post slug extraction ignores links inside locked blocks and code fences!

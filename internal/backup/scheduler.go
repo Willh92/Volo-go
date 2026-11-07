@@ -47,21 +47,47 @@ type Scheduler struct {
 	opts    SchedulerOptions
 	mu      sync.Mutex
 	lastRun time.Time
+
+	stateMu sync.Mutex
+	closed  bool
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 }
 
 // NewScheduler constructs a rolling backup scheduler.
 func NewScheduler(opts SchedulerOptions) *Scheduler {
-	return &Scheduler{opts: opts}
+	return &Scheduler{
+		opts:   opts,
+		stopCh: make(chan struct{}),
+	}
 }
 
-// Start launches the background check loop until ctx is canceled.
+// Start launches the background check loop until ctx is canceled or Close is called.
 func (s *Scheduler) Start(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	s.stateMu.Lock()
+	if s.closed {
+		s.stateMu.Unlock()
+		return
+	}
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+	}
+	stopCh := s.stopCh
+	s.wg.Add(1)
+	s.stateMu.Unlock()
+
 	go func() {
+		defer s.wg.Done()
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-stopCh:
 				return
 			case <-ticker.C:
 				cfg := s.opts.Settings.Snapshot().Backup
@@ -79,7 +105,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 					continue
 				}
 				runCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-				if _, err := s.RunOnce(runCtx); err != nil && s.opts.Logger != nil {
+				if _, err := s.runCycle(runCtx); err != nil && s.opts.Logger != nil {
 					fmt.Fprintf(s.opts.Logger, "volo backup scheduler: cycle failed: %v\n", err)
 				}
 				cancel()
@@ -88,9 +114,54 @@ func (s *Scheduler) Start(ctx context.Context) {
 	}()
 }
 
+// Close stops the background scheduler loop and waits for any in-progress backup cycle to finish
+// (or returns ctx.Err() if the shutdown deadline expires first).
+func (s *Scheduler) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.stateMu.Lock()
+	if !s.closed {
+		s.closed = true
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+	}
+	s.stateMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // RunOnce creates a streaming local backup archive, prunes older `volo-auto-*.zip` files beyond
 // `LocalKeepCount`, and streams the archive to S3 or WebDAV if `RemoteEnabled` is active.
 func (s *Scheduler) RunOnce(ctx context.Context) (*RunResult, error) {
+	if s == nil {
+		return nil, errors.New("backup scheduler is nil")
+	}
+	s.stateMu.Lock()
+	if s.closed {
+		s.stateMu.Unlock()
+		return nil, errors.New("backup scheduler is closed")
+	}
+	s.wg.Add(1)
+	s.stateMu.Unlock()
+	defer s.wg.Done()
+
+	return s.runCycle(ctx)
+}
+
+func (s *Scheduler) runCycle(ctx context.Context) (*RunResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

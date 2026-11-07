@@ -439,3 +439,66 @@ func TestMedia_NineScopeOrphanScannerZeroFalsePositives(t *testing.T) {
 		t.Fatalf("CRITICAL: symlink escape deleted file outside UploadDir!")
 	}
 }
+
+func TestMedia_StreamingNonImageUploadsAndLinearOrphanTokenScanner(t *testing.T) {
+	ctx, store, settings, uploadDir, pipe, _, _ := setupMediaEnv(t)
+
+	// 1. Stream non-image MP3 and MP4 uploads and verify zero leftover .volo-upload-* temp files.
+	mp3Payload := append([]byte("ID3\x04\x00\x00\x00\x00\x00\x00"), bytes.Repeat([]byte("A"), 128*1024)...)
+	mp3Asset, err := pipe.Upload(ctx, "admin-1", "episode.mp3", "audio/mpeg", bytes.NewReader(mp3Payload))
+	if err != nil {
+		t.Fatalf("MP3 streaming upload failed: %v", err)
+	}
+	if mp3Asset.MIMEType != "audio/mpeg" || mp3Asset.SizeBytes != int64(len(mp3Payload)) {
+		t.Fatalf("unexpected MP3 asset: %+v", mp3Asset)
+	}
+
+	mp4Header := []byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 0}
+	mp4Payload := append(mp4Header, bytes.Repeat([]byte("V"), 64*1024)...)
+	mp4Asset, err := pipe.Upload(ctx, "admin-1", "clip.mp4", "video/mp4", bytes.NewReader(mp4Payload))
+	if err != nil {
+		t.Fatalf("MP4 streaming upload failed: %v", err)
+	}
+	if mp4Asset.MIMEType != "video/mp4" || mp4Asset.SizeBytes != int64(len(mp4Payload)) {
+		t.Fatalf("unexpected MP4 asset: %+v", mp4Asset)
+	}
+
+	pdfOrphan, err := pipe.Upload(ctx, "admin-1", "unused.pdf", "application/pdf", strings.NewReader("%PDF-1.7\n%%EOF\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(uploadDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".volo-upload-") {
+			t.Fatalf("leaked temporary upload file in UploadDir: %s", e.Name())
+		}
+	}
+
+	// 2. Reference mp3Asset via Markdown link with query+fragment and trailing period,
+	//    and mp4Asset via JSON-escaped slash URL in settings; pdfOrphan remains unreferenced.
+	now := time.Now().UnixMilli()
+	mdBody := "Listen to [Episode](" + mp3Asset.PublicURL + "?dl=1#t=30)."
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO articles (id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md, cover_url, status, published_at, scheduled_at, is_pinned, allow_comment, password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes, audio_mime, lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count, created_at, updated_at)
+		 VALUES ('a-tok', 'u1', '', 'T', 's-tok', '', '', ?, '', 'published', ?, 0, 0, 1, '', 0, '', 0, 0, '', 'zh-CN', '', '', 1, 1, 0, 0, ?, ?)`,
+		mdBody, now, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escapedURL := strings.ReplaceAll(mp4Asset.PublicURL, "/", `\/`)
+	if _, _, err := settings.PatchDomain(ctx, domain.SettingsDomainSite, []byte(`{"favicon_url":"`+escapedURL+`"}`), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	orphans, err := pipe.ScanOrphans(ctx, false)
+	if err != nil {
+		t.Fatalf("ScanOrphans failed: %v", err)
+	}
+	if len(orphans) != 1 || orphans[0].ID != pdfOrphan.ID {
+		t.Fatalf("expected only %s as orphan, got %+v", pdfOrphan.ID, orphans)
+	}
+}

@@ -102,12 +102,14 @@ jobs:
         run: |
           mkdir -p /tmp/volo-cross
           GC_ALL="all=-l"
-          GC_VOLO="github.com/Willh92/Volo-go/...="
-          GOOS=linux   GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-amd64       ./cmd/volo
-          GOOS=linux   GOARCH=arm64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-arm64       ./cmd/volo
-          GOOS=darwin  GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-amd64      ./cmd/volo
-          GOOS=darwin  GOARCH=arm64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-arm64      ./cmd/volo
-          GOOS=windows GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_VOLO}" -ldflags="-s -w" -o /tmp/volo-cross/volo-windows-amd64.exe ./cmd/volo
+          GC_RND="github.com/Willh92/Volo-go/internal/render="
+          GC_VIS="github.com/Willh92/Volo-go/internal/visibility="
+          GC_SQL="github.com/Willh92/Volo-go/internal/db/sqlx="
+          GOOS=linux   GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_RND}" -gcflags="${GC_VIS}" -gcflags="${GC_SQL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-amd64       ./cmd/volo
+          GOOS=linux   GOARCH=arm64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_RND}" -gcflags="${GC_VIS}" -gcflags="${GC_SQL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-arm64       ./cmd/volo
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_RND}" -gcflags="${GC_VIS}" -gcflags="${GC_SQL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-amd64      ./cmd/volo
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_RND}" -gcflags="${GC_VIS}" -gcflags="${GC_SQL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-arm64      ./cmd/volo
+          GOOS=windows GOARCH=amd64 go build -trimpath -gcflags="${GC_ALL}" -gcflags="${GC_RND}" -gcflags="${GC_VIS}" -gcflags="${GC_SQL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-windows-amd64.exe ./cmd/volo
           ls -lh /tmp/volo-cross
           for bin in /tmp/volo-cross/*; do
             SZ=$(wc -c < "$bin" | tr -d ' ')

@@ -28,7 +28,9 @@ COPY --from=admin-builder /src/internal/adminui/dist ./internal/adminui/dist
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath \
     -gcflags="all=-l" \
-    -gcflags="github.com/Willh92/Volo-go/...=" \
+    -gcflags="github.com/Willh92/Volo-go/internal/render=" \
+    -gcflags="github.com/Willh92/Volo-go/internal/visibility=" \
+    -gcflags="github.com/Willh92/Volo-go/internal/db/sqlx=" \
     -ldflags="-s -w -X main.Version=${VERSION}" \
     -o /out/volo ./cmd/volo
 

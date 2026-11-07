@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +22,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/auth"
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/content"
+	"github.com/Willh92/Volo-go/internal/db/dialect"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/guest"
@@ -117,6 +121,9 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	}
 	deps.Themes.SetAssetCDNPrefixFunc(func() string {
 		return deps.Settings.Snapshot().Reading.AssetCDNPrefix
+	})
+	deps.Themes.SetVendorCDNPrefixFunc(func() string {
+		return deps.Settings.Snapshot().Reading.VendorCDNPrefix
 	})
 	if deps.Content == nil {
 		rnd := render.Default()
@@ -675,6 +682,11 @@ func (s *AppServer) handleSearchAPI(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("public_search", clientIP, 60, time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		return
+	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	hits, err := s.deps.Content.SearchIndex().Search(r.Context(), q, 20)
 	if err != nil {
@@ -684,8 +696,24 @@ func (s *AppServer) handleSearchAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"hits": hits})
 }
 
+func verifyPageInlinePassword(contentMD string, candidate string) (string, bool) {
+	c := strings.TrimSpace(candidate)
+	if c == "" {
+		return "", false
+	}
+	candSum := sha256.Sum256([]byte(c))
+	var matched string
+	for _, inlinePwd := range render.ExtractAllLockPasswords(contentMD) {
+		iSum := sha256.Sum256([]byte(inlinePwd))
+		if subtle.ConstantTimeCompare(iSum[:], candSum[:]) == 1 && matched == "" {
+			matched = inlinePwd
+		}
+	}
+	return matched, matched != ""
+}
+
 func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Request) {
-	// Matches POST /api/v1/articles/{id}/unlock
+	// Matches POST /api/v1/articles/{id}/unlock (supports published articles AND published standalone pages!)
 	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/articles/")
 	parts := strings.Split(rest, "/")
 	if len(parts) != 2 || parts[1] != "unlock" || r.Method != http.MethodPost {
@@ -695,9 +723,9 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	if !s.requireSameOrigin(w, r) {
 		return
 	}
-	articleID := strings.TrimSpace(parts[0])
+	targetID := strings.TrimSpace(parts[0])
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
-	if !s.deps.WAF.AllowRate("unlock:"+articleID, clientIP, 10, 5*time.Minute) {
+	if !s.deps.WAF.AllowRate("unlock:"+targetID, clientIP, 10, 5*time.Minute) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
 		return
 	}
@@ -710,20 +738,52 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	raw, err := s.deps.Content.GetRawArticleByID(r.Context(), articleID)
-	if err != nil || raw.Status != domain.ArticleStatusPublished {
-		http.NotFound(w, r)
-		return
-	}
-	plainPwd, ok := s.deps.Content.Guard().VerifyArticlePassword(raw, req.Password)
-	if !ok {
-		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "article.unlock_wrong_pwd")})
-		return
+	var entryKey, plainPwd string
+	if strings.HasPrefix(targetID, "page:") {
+		pageID := strings.TrimSpace(strings.TrimPrefix(targetID, "page:"))
+		pg, pErr := sqlx.Get[domain.Page](r.Context(), s.deps.Store, `SELECT * FROM pages WHERE id = ? AND is_published = ?`, pageID, true)
+		if pErr != nil {
+			http.NotFound(w, r)
+			return
+		}
+		matched, ok := verifyPageInlinePassword(pg.ContentMD, req.Password)
+		if !ok {
+			s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "article.unlock_wrong_pwd")})
+			return
+		}
+		entryKey = visibility.InlineUnlockKey("page:"+pg.ID, matched)
+		plainPwd = matched
+	} else {
+		raw, err := s.deps.Content.GetRawArticleByID(r.Context(), targetID)
+		if err == nil && raw.Status == domain.ArticleStatusPublished {
+			matched, ok := s.deps.Content.Guard().VerifyArticlePassword(raw, req.Password)
+			if !ok {
+				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "article.unlock_wrong_pwd")})
+				return
+			}
+			entryKey = s.deps.Content.Guard().UnlockEntryKey(raw, matched)
+			plainPwd = matched
+		} else {
+			pg, pErr := sqlx.Get[domain.Page](r.Context(), s.deps.Store, `SELECT * FROM pages WHERE id = ? AND is_published = ?`, targetID, true)
+			if pErr != nil {
+				http.NotFound(w, r)
+				return
+			}
+			matched, ok := verifyPageInlinePassword(pg.ContentMD, req.Password)
+			if !ok {
+				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "article.unlock_wrong_pwd")})
+				return
+			}
+			entryKey = visibility.InlineUnlockKey("page:"+pg.ID, matched)
+			plainPwd = matched
+		}
 	}
 
 	gp, _ := s.deps.Passports.ResolveOrHeal(w, r, true)
-	unlockState, err := s.deps.Passports.GrantArticleUnlock(w, r, gp.GuestID, raw.ID, plainPwd)
+	unlockState, err := s.deps.Passports.GrantArticleUnlock(w, r, gp.GuestID, entryKey, plainPwd)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -740,9 +800,14 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 	viewer, _ := s.resolveViewer(r)
 	switch r.Method {
 	case http.MethodGet:
-		tType := r.URL.Query().Get("target_type")
-		tID := r.URL.Query().Get("target_id")
-		list, err := s.deps.Content.ListTargetComments(r.Context(), r, viewer, tType, tID)
+		q := r.URL.Query()
+		tType := q.Get("target_type")
+		tID := q.Get("target_id")
+		page := parsePageParam(r)
+		perPage, _ := strconv.Atoi(q.Get("per_page"))
+		focusComment := q.Get("focus_comment")
+
+		res, err := s.deps.Content.ListTargetCommentsPage(r.Context(), r, viewer, tType, tID, page, perPage, focusComment)
 		if errors.Is(err, visibility.ErrProtectedForbidden) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
 			return
@@ -755,7 +820,15 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"comments": list})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"comments":       res.Comments,
+			"page":           res.Page,
+			"per_page":       res.PerPage,
+			"total_roots":    res.TotalRoots,
+			"total_comments": res.TotalComments,
+			"total_pages":    res.TotalPages,
+			"has_more":       res.HasMore,
+		})
 
 	case http.MethodPost:
 		if !s.requireSameOrigin(w, r) {
@@ -865,12 +938,42 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (s *AppServer) isPubliclyReactableTarget(ctx context.Context, targetType string, targetID string) (bool, bool) {
+	tType := strings.TrimSpace(targetType)
+	tID := strings.TrimSpace(targetID)
+	if tID == "" {
+		return false, false
+	}
+	switch tType {
+	case domain.TargetTypeArticle:
+		var status string
+		err := s.deps.Store.QueryRowContext(ctx, `SELECT status FROM articles WHERE id = ?`, tID).Scan(&status)
+		return true, err == nil && status == domain.ArticleStatusPublished
+	case domain.TargetTypePage:
+		var isPub bool
+		err := s.deps.Store.QueryRowContext(ctx, `SELECT is_published FROM pages WHERE id = ?`, tID).Scan(&isPub)
+		return true, err == nil && isPub
+	case "comment":
+		var status string
+		var isDel bool
+		err := s.deps.Store.QueryRowContext(ctx, `SELECT status, is_deleted FROM comments WHERE id = ?`, tID).Scan(&status, &isDel)
+		return true, err == nil && status == domain.CommentStatusApproved && !isDel
+	default:
+		return false, false
+	}
+}
+
 func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("public_reactions", clientIP, 40, time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
 		return
 	}
 	var req struct {
@@ -882,6 +985,15 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
+	validType, visible := s.isPubliclyReactableTarget(r.Context(), req.TargetType, req.TargetID)
+	if !validType {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported target_type"})
+		return
+	}
+	if !visible {
+		http.NotFound(w, r)
+		return
+	}
 	viewer, _ := s.resolveViewer(r)
 	actorHash := ""
 	if viewer != nil {
@@ -891,7 +1003,7 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 	} else if fp := guest.ComputeEnvFPHash(s.deps.Config.KeyRing, r.Header.Get(guest.EnvFPHeaderName)); fp != "" {
 		actorHash = "fp:" + fp
 	}
-	counts, added, err := s.deps.Content.ToggleReaction(r.Context(), req.TargetType, req.TargetID, actorHash, req.Kind)
+	counts, added, err := s.deps.Content.ToggleReaction(r.Context(), strings.TrimSpace(req.TargetType), strings.TrimSpace(req.TargetID), actorHash, req.Kind)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -949,6 +1061,11 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "reader registration disabled"})
 		return
 	}
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if !s.deps.WAF.AllowRate("reader_register", clientIP, 8, 10*time.Minute) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Email    string `json:"email"`
@@ -965,7 +1082,6 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	var geo string
 	if loc, ok := s.deps.Geo.Lookup(clientIP); ok {
 		geo = loc.Region
@@ -1082,6 +1198,10 @@ func (s *AppServer) setSessionCookie(w http.ResponseWriter, rawToken string) {
 // --- Public Studio HTML Pages ---
 
 func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.PageContext {
+	return s.basePageContextWithSession(r, viewer, nil)
+}
+
+func (s *AppServer) basePageContextWithSession(r *http.Request, viewer *domain.User, sess *domain.UserSession) theme.PageContext {
 	snap := s.deps.Settings.Snapshot()
 	locale := s.resolveLocale(r)
 	navItems, _ := s.deps.Content.ListPublicNavItems(r.Context(), locale)
@@ -1095,9 +1215,11 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 
 	viewerCSRF := ""
 	if viewer != nil && s.deps.Auth != nil {
-		if ck, err := r.Cookie(auth.SessionCookieName); err == nil && strings.TrimSpace(ck.Value) != "" {
-			if _, sess, aErr := s.deps.Auth.AuthenticateSession(r.Context(), ck.Value); aErr == nil && sess != nil {
-				viewerCSRF = s.deps.Auth.ComputeCSRFToken(sess.ID)
+		if sess != nil {
+			viewerCSRF = s.deps.Auth.ComputeCSRFToken(sess.ID)
+		} else if ck, err := r.Cookie(auth.SessionCookieName); err == nil && strings.TrimSpace(ck.Value) != "" {
+			if _, resolvedSess, aErr := s.deps.Auth.AuthenticateSession(r.Context(), ck.Value); aErr == nil && resolvedSess != nil {
+				viewerCSRF = s.deps.Auth.ComputeCSRFToken(resolvedSess.ID)
 			}
 		}
 	}
@@ -1132,6 +1254,7 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 	}
 
 	siteCfg := snap.Site
+	siteCfg.CustomHeadMeta = repo.SanitizeCustomHeadMeta(siteCfg.CustomHeadMeta)
 	if !siteCfg.EnableFooterHTML {
 		siteCfg.FooterText = ""
 	} else if siteCfg.FooterText != "" {
@@ -1144,6 +1267,7 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 		Locales:            s.deps.Catalog.Locales(),
 		Year:               time.Now().Year(),
 		CurrentPath:        r.URL.Path,
+		RawQuery:           r.URL.RawQuery,
 		BasePath:           r.URL.Path,
 		CanonicalURL:       s.publicBaseURL(r) + r.URL.Path,
 		PageTitle:          snap.Site.Title,
@@ -1219,8 +1343,8 @@ func appendVaryHeader(h http.Header, keys ...string) {
 }
 
 func (s *AppServer) renderErrorPage(w http.ResponseWriter, r *http.Request, status int, msgKey string) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.StatusCode = status
 	pctx.ErrorMessage = s.deps.Catalog.T(pctx.Locale, msgKey)
 	pctx.NoIndex = true
@@ -1245,14 +1369,46 @@ func computeTotalPages(total int, pageSize int) int {
 	return int(math.Ceil(float64(total) / float64(pageSize)))
 }
 
+func clampPageBounds(page int, total int, perPage int) (clampedPage int, totalPages int, start int, end int) {
+	if perPage <= 0 {
+		perPage = 15
+	}
+	totalPages = computeTotalPages(total, perPage)
+	clampedPage = page
+	if clampedPage < 1 {
+		clampedPage = 1
+	}
+	if clampedPage > totalPages {
+		clampedPage = totalPages
+	}
+	if total == 0 {
+		return clampedPage, totalPages, 0, 0
+	}
+	start = (clampedPage - 1) * perPage
+	end = start + perPage
+	if end > total {
+		end = total
+	}
+	return clampedPage, totalPages, start, end
+}
+
+func (s *AppServer) siteTimezoneLocation(tz string) *time.Location {
+	if trimmed := strings.TrimSpace(tz); trimmed != "" {
+		if loc, err := time.LoadLocation(trimmed); err == nil {
+			return loc
+		}
+	}
+	return time.FixedZone("CST", 8*3600)
+}
+
 func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" {
 		if s.isSetupUnlocked(r.Context()) {
 			http.Redirect(w, r, "/setup", http.StatusFound)
 			return
 		}
-		viewer, _ := s.resolveViewer(r)
-		pctx := s.basePageContext(r, viewer)
+		viewer, sess := s.resolveViewer(r)
+		pctx := s.basePageContextWithSession(r, viewer, sess)
 		pctx.IsHome = true
 		page := parsePageParam(r)
 		cards, total, err := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
@@ -1289,14 +1445,17 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
-	viewer, _ := s.resolveViewer(r)
+	viewer, sess := s.resolveViewer(r)
 	locale := s.resolveLocale(r)
-	pgView, err := s.deps.Content.GetPublicPageBySlug(r.Context(), slug, locale)
+	pgView, err := s.deps.Content.GetPublicPageBySlugForViewer(r.Context(), r, slug, locale, viewer)
 	if err != nil {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
-	pctx := s.basePageContext(r, viewer)
+	if viewer != nil {
+		w.Header().Set("Cache-Control", "private, no-store")
+	}
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.IsStandalonePage = true
 	pctx.PageTitle = pgView.Title + " · " + pctx.Site.Title
 	if pgView.PlainSummary != "" {
@@ -1339,7 +1498,7 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	viewer, _ := s.resolveViewer(r)
+	viewer, sess := s.resolveViewer(r)
 	raw, err := s.deps.Content.GetPublishedRawArticleBySlug(r.Context(), slugDecoded)
 	if err != nil {
 		// Allow draft/scheduled preview ONLY when caller presents a valid timed ShareToken or is the Staff owner;
@@ -1362,7 +1521,7 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		raw = cand
 	}
-	pctx := s.basePageContext(r, viewer)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	detail, prev, next, backlinks, err := s.deps.Content.RenderArticleDetail(
 		r.Context(), w, r, raw, viewer, pctx.Locale, s.publicBaseURL(r),
 	)
@@ -1432,18 +1591,52 @@ func (s *AppServer) lookupArticleSeriesContext(ctx context.Context, articleID st
 	if err != nil {
 		return nil
 	}
-	all, _ := sqlx.Select[domain.SeriesArticle](ctx, s.deps.Store, `SELECT * FROM series_articles WHERE series_id = ? ORDER BY sort_order ASC`, ser.ID)
-	idx := 1
-	for i, item := range all {
-		if item.ArticleID == articleID {
-			idx = i + 1
-			break
+	rows, err := sqlx.Select[domain.RawArticle](
+		ctx, s.deps.Store,
+		`SELECT a.id, a.title, a.slug, a.published_at, a.password_ciphertext
+		 FROM series_articles sa
+		 INNER JOIN articles a ON a.id = sa.article_id
+		 WHERE sa.series_id = ? AND a.status = ?
+		 ORDER BY sa.sort_order ASC, a.published_at ASC`,
+		ser.ID, domain.ArticleStatusPublished,
+	)
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	curIdx := -1
+	episodes := make([]theme.SeriesEpisodeItem, 0, len(rows))
+	for i, item := range rows {
+		isCur := item.ID == articleID
+		if isCur {
+			curIdx = i
 		}
+		episodes = append(episodes, theme.SeriesEpisodeItem{
+			ID:        item.ID,
+			Slug:      item.Slug,
+			Title:     item.Title,
+			Order:     i + 1,
+			IsCurrent: isCur,
+		})
+	}
+	if curIdx < 0 {
+		return nil
+	}
+	var prevInSeries, nextInSeries *visibility.PublicNeighbor
+	if curIdx > 0 {
+		n := s.deps.Content.Guard().ToNeighbor(rows[curIdx-1])
+		prevInSeries = &n
+	}
+	if curIdx+1 < len(rows) {
+		n := s.deps.Content.Guard().ToNeighbor(rows[curIdx+1])
+		nextInSeries = &n
 	}
 	return &theme.ArticleSeriesContext{
-		Series: ser,
-		Index:  idx,
-		Total:  len(all),
+		Series:       ser,
+		Index:        curIdx + 1,
+		Total:        len(rows),
+		Episodes:     episodes,
+		PrevInSeries: prevInSeries,
+		NextInSeries: nextInSeries,
 	}
 }
 
@@ -1468,8 +1661,8 @@ func (s *AppServer) recordPageView(r *http.Request, targetType string, targetID 
 }
 
 func (s *AppServer) handleCategoriesOverview(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.TaxonomyKind = "categories"
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.categories")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
@@ -1489,8 +1682,8 @@ func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) 
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	page := parsePageParam(r)
 	cards, total, _ := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
 		Page:         page,
@@ -1509,12 +1702,55 @@ func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *AppServer) handleTagsOverview(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.TaxonomyKind = "tags"
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.tags")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
-	pctx.Tags, _ = s.deps.Content.ListTagsWithCounts(r.Context(), 200)
+
+	allTags, _ := s.deps.Content.ListTagsWithCounts(r.Context(), 0)
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	sortBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort")))
+	if sortBy != "name" {
+		sortBy = "popular"
+	}
+
+	filtered := allTags
+	if q != "" {
+		needle := strings.ToLower(q)
+		filtered = make([]content.TagWithCount, 0, len(allTags))
+		for _, t := range allTags {
+			if strings.Contains(strings.ToLower(t.Name), needle) || strings.Contains(strings.ToLower(t.Slug), needle) {
+				filtered = append(filtered, t)
+			}
+		}
+	}
+	if sortBy == "name" {
+		sorted := make([]content.TagWithCount, len(filtered))
+		copy(sorted, filtered)
+		sort.Slice(sorted, func(i, j int) bool {
+			li, lj := strings.ToLower(sorted[i].Name), strings.ToLower(sorted[j].Name)
+			if li != lj {
+				return li < lj
+			}
+			return sorted[i].Slug < sorted[j].Slug
+		})
+		filtered = sorted
+	}
+
+	const perPage = 120
+	page, totalPages, start, end := clampPageBounds(parsePageParam(r), len(filtered), perPage)
+	var paged []content.TagWithCount
+	if len(filtered) > 0 {
+		paged = filtered[start:end]
+	}
+
+	pctx.TagQuery = q
+	pctx.TagSort = sortBy
+	pctx.Tags = paged
+	pctx.Page = page
+	pctx.TotalPages = totalPages
+	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, len(filtered), 5)
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"tags.html", "taxonomies.html"}, pctx)
 }
 
@@ -1530,8 +1766,8 @@ func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	page := parsePageParam(r)
 	cards, total, _ := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
 		Page:     page,
@@ -1549,12 +1785,120 @@ func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleArchivesOverview(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.TaxonomyKind = "archives"
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.archives")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
-	pctx.ArchiveBuckets, _ = s.deps.Content.ListArchiveMonths(r.Context())
+	buckets, _ := s.deps.Content.ListArchiveMonths(r.Context())
+	pctx.ArchiveBuckets = buckets
+
+	yearCounts := make(map[string]int)
+	var yearOrder []string
+	for _, b := range buckets {
+		if len(b.YearMonth) >= 4 {
+			yr := b.YearMonth[:4]
+			if yearCounts[yr] == 0 {
+				yearOrder = append(yearOrder, yr)
+			}
+			yearCounts[yr] += b.Count
+		}
+	}
+	archiveYears := make([]theme.ArchiveYearStat, 0, len(yearOrder))
+	for _, yr := range yearOrder {
+		archiveYears = append(archiveYears, theme.ArchiveYearStat{Year: yr, Count: yearCounts[yr]})
+	}
+	pctx.ArchiveYears = archiveYears
+
+	loc := s.siteTimezoneLocation(pctx.Site.TimeZone)
+	selectedYear := strings.TrimSpace(r.URL.Query().Get("year"))
+	where := []string{"a.status = ?"}
+	args := []any{domain.ArticleStatusPublished}
+	if selectedYear != "" {
+		if yrNum, err := strconv.Atoi(selectedYear); err == nil && len(selectedYear) == 4 && yrNum >= 1970 && yrNum <= 9999 {
+			startT := time.Date(yrNum, 1, 1, 0, 0, 0, 0, loc)
+			endT := startT.AddDate(1, 0, 0)
+			where = append(where, "a.published_at >= ? AND a.published_at < ?")
+			args = append(args, startT.UnixMilli(), endT.UnixMilli())
+			pctx.SelectedArchiveYear = selectedYear
+		} else {
+			selectedYear = ""
+		}
+	}
+
+	const perPage = 50
+	whereSQL := strings.Join(where, " AND ")
+	var total int
+	_ = s.deps.Store.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM articles a WHERE "+whereSQL, args...).Scan(&total)
+
+	page := parsePageParam(r)
+	totalPages := computeTotalPages(total, perPage)
+	if page > totalPages {
+		page = totalPages
+	}
+	limit, offset := dialect.NormalizePage(page, perPage, perPage, 100)
+
+	type archiveRow struct {
+		Slug         string `db:"slug"`
+		Title        string `db:"title"`
+		PublishedAt  int64  `db:"published_at"`
+		CategoryName string `db:"category_name"`
+		CategorySlug string `db:"category_slug"`
+	}
+	var groups []theme.ArchiveYearGroup
+	if total > 0 {
+		baseSQL := `
+			SELECT a.slug, a.title, a.published_at,
+			       COALESCE(c.name, '') AS category_name,
+			       COALESCE(c.slug, '') AS category_slug
+			FROM articles a
+			LEFT JOIN categories c ON c.id = a.category_id
+			WHERE ` + whereSQL + `
+			ORDER BY a.published_at DESC, a.id DESC`
+		qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, limit, offset)
+		rows, _ := sqlx.Select[archiveRow](r.Context(), s.deps.Store, qSQL, append(append([]any{}, args...), pageArgs...)...)
+		yearIdx := make(map[string]int)
+		for _, row := range rows {
+			tm := time.UnixMilli(row.PublishedAt).In(loc)
+			yr := tm.Format("2006")
+			ym := tm.Format("2006-01")
+			mo := tm.Format("01")
+			md := tm.Format("01-02")
+
+			yi, exists := yearIdx[yr]
+			if !exists {
+				yi = len(groups)
+				yearIdx[yr] = yi
+				groups = append(groups, theme.ArchiveYearGroup{
+					Year:  yr,
+					Count: yearCounts[yr],
+				})
+			}
+			mLen := len(groups[yi].Months)
+			if mLen == 0 || groups[yi].Months[mLen-1].YearMonth != ym {
+				groups[yi].Months = append(groups[yi].Months, theme.ArchiveMonthGroup{
+					YearMonth: ym,
+					Month:     mo,
+				})
+				mLen++
+			}
+			groups[yi].Months[mLen-1].Posts = append(groups[yi].Months[mLen-1].Posts, theme.ArchivePostEntry{
+				Slug:         row.Slug,
+				Title:        row.Title,
+				CategoryName: row.CategoryName,
+				CategorySlug: row.CategorySlug,
+				PublishedAt:  row.PublishedAt,
+				MonthDay:     md,
+				YearMonth:    ym,
+			})
+			groups[yi].Months[mLen-1].Count = len(groups[yi].Months[mLen-1].Posts)
+		}
+	}
+
+	pctx.ArchiveGroups = groups
+	pctx.Page = page
+	pctx.TotalPages = totalPages
+	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, total, 5)
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"archives.html", "taxonomies.html"}, pctx)
 }
 
@@ -1573,8 +1917,8 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	page := parsePageParam(r)
 	cards, total, _ := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
 		Page:      page,
@@ -1596,8 +1940,8 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *AppServer) handleSeriesOverview(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.TaxonomyKind = "series"
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.series")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
@@ -1607,28 +1951,63 @@ func (s *AppServer) handleSeriesOverview(w http.ResponseWriter, r *http.Request)
 
 func (s *AppServer) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
 	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/series/"))
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	sv, err := s.deps.Content.GetSeriesBySlug(r.Context(), slug, pctx.Locale)
 	if err != nil {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
+	perPage := pctx.Reading.PostsPerPage
+	if perPage <= 0 {
+		perPage = 15
+	}
+	page, totalPages, start, end := clampPageBounds(parsePageParam(r), len(sv.Articles), perPage)
+	var slice []visibility.PublicArticleCard
+	if len(sv.Articles) > 0 {
+		slice = sv.Articles[start:end]
+	}
+
 	pctx.HeroTitle = sv.Title
 	pctx.HeroSubtitle = sv.Description
 	pctx.PageTitle = sv.Title + " · " + pctx.Site.Title
-	pctx.ArticleCards = sv.Articles
-	pctx.Page = 1
-	pctx.TotalPages = 1
-	pctx.Pagination = theme.BuildPagination(1, 1, len(sv.Articles), len(sv.Articles), 5)
+	pctx.ArticleCards = slice
+	pctx.Page = page
+	pctx.TotalPages = totalPages
+	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, len(sv.Articles), 5)
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"series_detail.html", "index.html"}, pctx)
 }
 
 func (s *AppServer) handleBookshelf(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "bookshelf.title") + " · " + pctx.Site.Title
-	pctx.Books, _ = s.deps.Content.ListBooks(r.Context())
+	allBooks, _ := s.deps.Content.ListBooks(r.Context())
+
+	if q := strings.TrimSpace(r.URL.Query().Get("q")); q != "" {
+		needle := strings.ToLower(q)
+		filtered := make([]domain.Book, 0, len(allBooks))
+		for _, bk := range allBooks {
+			if strings.Contains(strings.ToLower(bk.Title), needle) ||
+				strings.Contains(strings.ToLower(bk.Slug), needle) ||
+				strings.Contains(strings.ToLower(bk.Description), needle) {
+				filtered = append(filtered, bk)
+			}
+		}
+		allBooks = filtered
+	}
+
+	const perPage = 24
+	page, totalPages, start, end := clampPageBounds(parsePageParam(r), len(allBooks), perPage)
+	var paged []domain.Book
+	if len(allBooks) > 0 {
+		paged = allBooks[start:end]
+	}
+
+	pctx.Books = paged
+	pctx.Page = page
+	pctx.TotalPages = totalPages
+	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, len(allBooks), 5)
 	s.renderStudio(w, r, http.StatusOK, "bookshelf.html", pctx)
 }
 
@@ -1667,19 +2046,21 @@ func (s *AppServer) extractLocalPostSlugFromChapterURL(r *http.Request, rawURL s
 
 func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 	slug, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/books/"))
-	viewer, _ := s.resolveViewer(r)
+	viewer, sess := s.resolveViewer(r)
 	bk, err := s.deps.Content.GetBookBySlug(r.Context(), slug)
 	if err != nil {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
-	pctx := s.basePageContext(r, viewer)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.PageTitle = bk.Title + " · " + pctx.Site.Title
 	pctx.BookDetail = bk
+	activeIdx := -1
 	if chID := strings.TrimSpace(r.URL.Query().Get("ch")); chID != "" {
 		for i := range bk.FlatChapters {
 			if bk.FlatChapters[i].ID == chID {
 				pctx.ActiveChapter = &bk.FlatChapters[i]
+				activeIdx = i
 				break
 			}
 		}
@@ -1691,9 +2072,18 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 		for i := range bk.FlatChapters {
 			if strings.TrimSpace(bk.FlatChapters[i].URL) != "" {
 				pctx.ActiveChapter = &bk.FlatChapters[i]
+				activeIdx = i
 				break
 			}
 		}
+	}
+	if activeIdx > 0 {
+		prevCh := bk.FlatChapters[activeIdx-1]
+		pctx.PrevChapter = &prevCh
+	}
+	if activeIdx >= 0 && activeIdx+1 < len(bk.FlatChapters) {
+		nextCh := bk.FlatChapters[activeIdx+1]
+		pctx.NextChapter = &nextCh
 	}
 	if pctx.ActiveChapter != nil {
 		if postSlug := s.extractLocalPostSlugFromChapterURL(r, pctx.ActiveChapter.URL); postSlug != "" {
@@ -1706,6 +2096,7 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 					}
 					if !detail.RequiresPassword {
 						pctx.ActiveChapterHTML = detail.HTML
+						pctx.ActiveChapterNeedsMath = detail.NeedsMath
 					}
 				}
 			}
@@ -1715,37 +2106,75 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleLinksPage(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "nav.links") + " · " + pctx.Site.Title
 	links, _ := s.deps.Content.ListLinks(r.Context())
 	grouped := make(map[string][]domain.Link)
+	var catOrder []string
 	for _, lk := range links {
 		cat := strings.TrimSpace(lk.CategoryName)
 		if cat == "" {
 			cat = s.deps.Catalog.T(pctx.Locale, "nav.links")
 		}
+		if len(grouped[cat]) == 0 {
+			catOrder = append(catOrder, cat)
+		}
 		grouped[cat] = append(grouped[cat], lk)
 	}
+	linkGroups := make([]theme.LinkCategoryGroup, 0, len(catOrder))
+	for _, cat := range catOrder {
+		linkGroups = append(linkGroups, theme.LinkCategoryGroup{
+			Category: cat,
+			Items:    grouped[cat],
+		})
+	}
 	pctx.LinksByCategory = grouped
+	pctx.LinkGroups = linkGroups
 	s.renderStudio(w, r, http.StatusOK, "links.html", pctx)
 }
 
 func (s *AppServer) handleFollowsPage(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "nav.follows") + " · " + pctx.Site.Title
-	pctx.FollowGroups, _ = s.deps.Content.ListFollowsWithItems(r.Context(), 6)
+
+	const perPage = 18
+	page := parsePageParam(r)
+	groups, total, _ := s.deps.Content.ListFollowsWithItemsPage(r.Context(), page, perPage, 6)
+	totalPages := computeTotalPages(total, perPage)
+	if page > totalPages {
+		page = totalPages
+		groups, total, _ = s.deps.Content.ListFollowsWithItemsPage(r.Context(), page, perPage, 6)
+	}
+
+	pctx.FollowGroups = groups
+	pctx.Page = page
+	pctx.TotalPages = totalPages
+	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, total, 5)
 	s.renderStudio(w, r, http.StatusOK, "follows.html", pctx)
 }
 
 func (s *AppServer) handleDynamicPage(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	pctx := s.basePageContext(r, viewer)
+	viewer, sess := s.resolveViewer(r)
+	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.TaxonomyKind = "dynamic"
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.dynamic")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
-	pctx.RecentComments, _ = s.deps.Content.ListRecentPublicComments(r.Context(), 30)
+
+	const perPage = 20
+	page := parsePageParam(r)
+	recent, total, _ := s.deps.Content.ListRecentPublicCommentsPage(r.Context(), page, perPage)
+	totalPages := computeTotalPages(total, perPage)
+	if page > totalPages {
+		page = totalPages
+		recent, total, _ = s.deps.Content.ListRecentPublicCommentsPage(r.Context(), page, perPage)
+	}
+
+	pctx.RecentComments = recent
+	pctx.Page = page
+	pctx.TotalPages = totalPages
+	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, total, 5)
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"dynamic.html", "taxonomies.html"}, pctx)
 }
 

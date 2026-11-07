@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -44,6 +45,20 @@ func (l *PluginLogger) logPath(pluginID string) (string, bool) {
 	return filepath.Join(l.baseDir, pluginID+".jsonl"), true
 }
 
+func truncateLogUTF8Bytes(s string, maxBytes int) (string, bool) {
+	if len(s) <= maxBytes {
+		return s, false
+	}
+	if maxBytes <= 0 {
+		return "", true
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
+}
+
 // Write appends a structured JSONL entry and rotates <id>.jsonl -> <id>.jsonl.1 if size exceeds 1 MiB.
 func (l *PluginLogger) Write(pluginID string, level string, event string, msg string) {
 	if l == nil || l.baseDir == "" {
@@ -54,8 +69,8 @@ func (l *PluginLogger) Write(pluginID string, level string, event string, msg st
 		return
 	}
 	trimmed := strings.TrimSpace(msg)
-	if len(trimmed) > maxLogMessageLen {
-		trimmed = trimmed[:maxLogMessageLen] + "...[truncated]"
+	if prefix, truncated := truncateLogUTF8Bytes(trimmed, maxLogMessageLen); truncated {
+		trimmed = prefix + "...[truncated]"
 	}
 	entry := LogEntry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),

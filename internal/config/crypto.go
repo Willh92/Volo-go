@@ -204,6 +204,45 @@ func (kr *KeyRing) OpenString(envelope string, aad string) (string, error) {
 	return string(pt), nil
 }
 
+// ArticlePasswordAAD returns the canonical AES-256-GCM AAD for an article view password.
+func ArticlePasswordAAD(id string) string {
+	return "articles.password:" + id
+}
+
+// WebhookSecretAAD returns the canonical AES-256-GCM AAD for an outbound webhook signing secret.
+func WebhookSecretAAD(id string) string {
+	return "webhook:" + id
+}
+
+// CommentNotifyEmailAAD returns the canonical AES-256-GCM AAD for a comment reply notification email.
+func CommentNotifyEmailAAD(id string) string {
+	return "comments.notify_email:" + id
+}
+
+// OpenStringFallback decrypts an "enc:v1:..." envelope trying primaryAAD first,
+// then each fallbackAAD in order to seamlessly support legacy AAD bindings.
+func (kr *KeyRing) OpenStringFallback(ciphertext string, primaryAAD string, fallbackAADs ...string) (string, error) {
+	if ciphertext == "" {
+		return "", nil
+	}
+	if kr == nil {
+		return "", errors.New("config: keyring is nil")
+	}
+	pt, primaryErr := kr.OpenString(ciphertext, primaryAAD)
+	if primaryErr == nil {
+		return pt, nil
+	}
+	for _, fb := range fallbackAADs {
+		if fb == primaryAAD {
+			continue
+		}
+		if pt, err := kr.OpenString(ciphertext, fb); err == nil {
+			return pt, nil
+		}
+	}
+	return "", primaryErr
+}
+
 // GuestPassportKey returns a copy of the 32-byte HMAC key for GuestPassport signing.
 func (kr *KeyRing) GuestPassportKey() [32]byte { return kr.guestPassportKey }
 

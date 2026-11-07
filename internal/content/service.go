@@ -2,7 +2,9 @@ package content
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,23 +60,24 @@ type PublicNavNode struct {
 
 // PublicPageView is the rendered standalone Markdown page model (`/{slug}`).
 type PublicPageView struct {
-	ID               string                         `json:"id"`
-	Title            string                         `json:"title"`
-	Slug             string                         `json:"slug"`
-	URL              string                         `json:"url"`
-	HTML             string                         `json:"html"`
-	PlainSummary     string                         `json:"plain_summary"`
-	AllowComment     bool                           `json:"allow_comment"`
-	ShowTOC          bool                           `json:"show_toc"`
-	TOC              []render.TOCItem               `json:"toc,omitempty"`
-	Lang             string                         `json:"lang"`
-	TranslationGroup string                         `json:"translation_group,omitempty"`
-	Translations     []visibility.TranslationAlternate `json:"translations,omitempty"`
-	ViewCount        int64                          `json:"view_count"`
-	CommentCount     int                            `json:"comment_count"`
-	UpdatedAt        int64                          `json:"updated_at"`
-	NeedsMath        bool                           `json:"needs_math"`
-	NeedsMermaid     bool                           `json:"needs_mermaid"`
+	ID                string                            `json:"id"`
+	Title             string                            `json:"title"`
+	Slug              string                            `json:"slug"`
+	URL               string                            `json:"url"`
+	HTML              string                            `json:"html"`
+	PlainSummary      string                            `json:"plain_summary"`
+	AllowComment      bool                              `json:"allow_comment"`
+	ShowTOC           bool                              `json:"show_toc"`
+	TOC               []render.TOCItem                  `json:"toc,omitempty"`
+	Lang              string                            `json:"lang"`
+	TranslationGroup  string                            `json:"translation_group,omitempty"`
+	Translations      []visibility.TranslationAlternate `json:"translations,omitempty"`
+	ViewCount         int64                             `json:"view_count"`
+	CommentCount      int                               `json:"comment_count"`
+	UpdatedAt         int64                             `json:"updated_at"`
+	NeedsMath         bool                              `json:"needs_math"`
+	NeedsMermaid      bool                              `json:"needs_mermaid"`
+	HasLockedSections bool                              `json:"has_locked_sections,omitempty"`
 }
 
 // SeriesView pairs a Series with its ordered public article cards.
@@ -158,7 +161,10 @@ type Service struct {
 
 	uvMu      sync.Mutex
 	uvDate    string
-	uvVisited map[string]struct{}
+	uvVisited map[uint64]struct{}
+
+	commentHTMLMu sync.RWMutex
+	commentHTML   map[string]string
 
 	mediaMu   sync.RWMutex
 	mediaDims map[string][2]int
@@ -185,21 +191,22 @@ func NewService(opts ServiceOptions) *Service {
 		dialer = &security.OutboundSafeDialer{Timeout: 10 * time.Second}
 	}
 	return &Service{
-		store:     opts.Store,
-		keys:      opts.Keys,
-		settings:  opts.Settings,
-		passports: opts.Passports,
-		pow:       opts.PoW,
-		guard:     guard,
-		search:    searchIdx,
-		renderer:  rnd,
-		plugins:   opts.Plugins,
-		catalog:   opts.Catalog,
-		dialer:    dialer,
-		views:     newViewAnalyticsBuffer(opts.Store),
-		caches:    newServiceCacheState(),
-		uvVisited: make(map[string]struct{}),
-		mediaDims: make(map[string][2]int),
+		store:       opts.Store,
+		keys:        opts.Keys,
+		settings:    opts.Settings,
+		passports:   opts.Passports,
+		pow:         opts.PoW,
+		guard:       guard,
+		search:      searchIdx,
+		renderer:    rnd,
+		plugins:     opts.Plugins,
+		catalog:     opts.Catalog,
+		dialer:      dialer,
+		views:       newViewAnalyticsBuffer(opts.Store),
+		caches:      newServiceCacheState(),
+		uvVisited:   make(map[uint64]struct{}),
+		commentHTML: make(map[string]string, 256),
+		mediaDims:   make(map[string][2]int),
 	}
 }
 
@@ -224,6 +231,25 @@ func (s *Service) FlushAnalytics(ctx context.Context) error {
 	return s.views.Flush(ctx)
 }
 
+// ResetAnalyticsBuffer clears buffered view/redirect counters, daily UV dedup state,
+// rendered comment HTML cache, and runtime caches (used across DB swap / restore).
+func (s *Service) ResetAnalyticsBuffer() {
+	if s == nil {
+		return
+	}
+	if s.views != nil {
+		s.views.Reset()
+	}
+	s.uvMu.Lock()
+	s.uvDate = ""
+	clear(s.uvVisited)
+	s.uvMu.Unlock()
+	s.commentHTMLMu.Lock()
+	clear(s.commentHTML)
+	s.commentHTMLMu.Unlock()
+	s.PurgeRuntimeCaches()
+}
+
 // Close stops background analytics flushing and deterministically flushes all buffered counters before shutdown.
 func (s *Service) Close(ctx context.Context) error {
 	if s == nil || s.views == nil {
@@ -232,7 +258,7 @@ func (s *Service) Close(ctx context.Context) error {
 	return s.views.Close(ctx)
 }
 
-// WarmCaches preloads the 2 MiB two-stage search index, media intrinsic dimensions, redirect table, and chrome snapshot.
+// WarmCaches preloads the 8 MiB two-stage search index, media intrinsic dimensions, redirect table, and chrome snapshot.
 func (s *Service) WarmCaches(ctx context.Context) error {
 	_ = s.RefreshMediaDimsCache(ctx)
 	_, _ = s.getRedirectSnapshot(ctx)
@@ -256,12 +282,43 @@ func (s *Service) RefreshMediaDimsCache(ctx context.Context) error {
 		}
 	}
 	s.mediaMu.Lock()
+	changed := len(s.mediaDims) != len(next)
+	if !changed {
+		for k, v := range next {
+			if cur, ok := s.mediaDims[k]; !ok || cur != v {
+				changed = true
+				break
+			}
+		}
+	}
 	s.mediaDims = next
 	s.mediaMu.Unlock()
-	if s.guard != nil {
+	if changed && s.guard != nil {
 		s.guard.PurgeCache()
 	}
 	return nil
+}
+
+// PutMediaDims incrementally inserts or updates a single media asset's dimensions in O(1) without scanning media_assets.
+func (s *Service) PutMediaDims(publicURL string, width int, height int) {
+	u := strings.TrimSpace(publicURL)
+	if u == "" || width <= 0 || height <= 0 {
+		return
+	}
+	s.mediaMu.Lock()
+	if s.mediaDims == nil {
+		s.mediaDims = make(map[string][2]int, 64)
+	}
+	prev, existed := s.mediaDims[u]
+	next := [2]int{width, height}
+	changed := !existed || prev != next
+	if changed {
+		s.mediaDims[u] = next
+	}
+	s.mediaMu.Unlock()
+	if changed && s.guard != nil {
+		s.guard.PurgeCache()
+	}
 }
 
 // LookupMediaDims returns cached intrinsic pixel dimensions for a local/S3 media URL.
@@ -721,8 +778,20 @@ func (s *Service) listArticleTranslations(ctx context.Context, cur domain.RawArt
 
 // --- Standalone Pages (`pages` table — strictly decoupled from blog timeline & archives) ---
 
-// GetPublicPageBySlug renders a published Standalone Page (`/{slug}`).
+// GetPublicPageBySlug renders a published Standalone Page (`/{slug}`) for an anonymous visitor.
 func (s *Service) GetPublicPageBySlug(ctx context.Context, slug string, locale string) (PublicPageView, error) {
+	return s.GetPublicPageBySlugForViewer(ctx, nil, slug, locale, nil)
+}
+
+// GetPublicPageBySlugForViewer renders a published Standalone Page (`/{slug}`), strictly evaluating
+// per-block `:::lock` directives against the viewer/passport instead of hardcoding `Unlocked: true`!
+func (s *Service) GetPublicPageBySlugForViewer(
+	ctx context.Context,
+	r *http.Request,
+	slug string,
+	locale string,
+	viewer *domain.User,
+) (PublicPageView, error) {
 	p, err := sqlx.Get[domain.Page](
 		ctx, s.store,
 		`SELECT * FROM pages WHERE slug = ? AND is_published = ?`,
@@ -732,15 +801,44 @@ func (s *Service) GetPublicPageBySlug(ctx context.Context, slug string, locale s
 		return PublicPageView{}, err
 	}
 	snap := s.settings.Snapshot()
+
+	isPageStaff := viewer != nil && viewer.Status == domain.UserStatusActive &&
+		(viewer.Role == domain.RoleAdmin || (viewer.Role == domain.RoleEditor && viewer.ID == p.AuthorID))
+	isReaderLoggedIn := viewer != nil && viewer.Status == domain.UserStatusActive
+
+	var unlockedPwds map[string]bool
+	if r != nil && s.guard != nil {
+		byPagePrefix := s.guard.ResolveInlineUnlockedPasswords(r, "page:"+p.ID, p.ContentMD)
+		byRawID := s.guard.ResolveInlineUnlockedPasswords(r, p.ID, p.ContentMD)
+		if len(byPagePrefix) > 0 || len(byRawID) > 0 {
+			unlockedPwds = make(map[string]bool, len(byPagePrefix)+len(byRawID))
+			for k, v := range byPagePrefix {
+				unlockedPwds[k] = v
+			}
+			for k, v := range byRawID {
+				unlockedPwds[k] = v
+			}
+		}
+	}
+
 	rendered := s.renderer.Render(p.ContentMD, render.Options{
-		Mode:            render.RenderModeWeb,
-		Locale:          locale,
-		Unlocked:        true,
-		ShowLineNumbers: snap.Reading.ShowCodeLineNumbers,
-		LookupBook:      func(bSlug string) (render.BookCardInfo, bool) { return s.lookupBookCard(ctx, bSlug) },
-		ListBooks:       func() []render.BookCardInfo { return s.listBookCards(ctx) },
-		LookupMediaDims: s.LookupMediaDims,
+		Mode:                render.RenderModeWeb,
+		Locale:              locale,
+		Unlocked:            false,
+		AuthorOrShareBypass: isPageStaff,
+		IsReaderLoggedIn:    isReaderLoggedIn,
+		UnlockedPasswords:   unlockedPwds,
+		ShowLineNumbers:     snap.Reading.ShowCodeLineNumbers,
+		LookupBook:          func(bSlug string) (render.BookCardInfo, bool) { return s.lookupBookCard(ctx, bSlug) },
+		ListBooks:           func() []render.BookCardInfo { return s.listBookCards(ctx) },
+		LookupMediaDims:     s.LookupMediaDims,
 	})
+
+	plainSource := rendered.PlainText
+	if rendered.HasLockBlock {
+		safeOut := s.renderer.Render(render.StripAllLockBlocks(p.ContentMD), render.Options{Mode: render.RenderModeWeb})
+		plainSource = safeOut.PlainText
+	}
 
 	var alts []visibility.TranslationAlternate
 	if strings.TrimSpace(p.TranslationGroup) != "" {
@@ -766,23 +864,24 @@ func (s *Service) GetPublicPageBySlug(ctx context.Context, slug string, locale s
 		toc = rendered.TOC
 	}
 	return PublicPageView{
-		ID:               p.ID,
-		Title:            p.Title,
-		Slug:             p.Slug,
-		URL:              "/" + p.Slug,
-		HTML:             rendered.HTML,
-		PlainSummary:     truncateForSummary(rendered.PlainText, 160),
-		AllowComment:     p.AllowComment,
-		ShowTOC:          p.ShowTOC,
-		TOC:              toc,
-		Lang:             p.Lang,
-		TranslationGroup: p.TranslationGroup,
-		Translations:     alts,
-		ViewCount:        p.ViewCount + s.views.PendingPageViews(p.ID),
-		CommentCount:     p.CommentCount,
-		UpdatedAt:        p.UpdatedAt,
-		NeedsMath:        rendered.NeedsMath,
-		NeedsMermaid:     rendered.NeedsMermaid,
+		ID:                p.ID,
+		Title:             p.Title,
+		Slug:              p.Slug,
+		URL:               "/" + p.Slug,
+		HTML:              rendered.HTML,
+		PlainSummary:      truncateForSummary(plainSource, 160),
+		AllowComment:      p.AllowComment,
+		ShowTOC:           p.ShowTOC,
+		TOC:               toc,
+		Lang:              p.Lang,
+		TranslationGroup:  p.TranslationGroup,
+		Translations:      alts,
+		ViewCount:         p.ViewCount + s.views.PendingPageViews(p.ID),
+		CommentCount:      p.CommentCount,
+		UpdatedAt:         p.UpdatedAt,
+		NeedsMath:         rendered.NeedsMath,
+		NeedsMermaid:      rendered.NeedsMermaid,
+		HasLockedSections: rendered.HasUnresolvedLock,
 	}, nil
 }
 
@@ -999,26 +1098,65 @@ func (s *Service) ListLinks(ctx context.Context) ([]domain.Link, error) {
 	return sqlx.Select[domain.Link](ctx, s.store, `SELECT * FROM links ORDER BY sort_order ASC, created_at ASC`)
 }
 
-// ListFollowsWithItems returns RSS Follow subscriptions and their latest items using bounded indexed queries.
+// ListFollowsWithItems returns RSS Follow subscriptions and their latest items using 2 bounded batch queries.
 func (s *Service) ListFollowsWithItems(ctx context.Context, itemsPerFollow int) ([]FollowGroup, error) {
-	if itemsPerFollow <= 0 {
-		itemsPerFollow = 5
-	}
 	follows, err := sqlx.Select[domain.Follow](ctx, s.store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil || len(follows) == 0 {
 		return []FollowGroup{}, err
 	}
+	return s.hydrateFollowGroups(ctx, follows, itemsPerFollow), nil
+}
+
+// ListFollowsWithItemsPage returns a paginated slice of RSS Follow subscriptions and their latest items.
+func (s *Service) ListFollowsWithItemsPage(ctx context.Context, page int, perPage int, itemsPerFollow int) ([]FollowGroup, int, error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 18, 100)
+	var total int
+	if err := s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []FollowGroup{}, 0, nil
+	}
 	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(
-		`SELECT * FROM follow_items WHERE follow_id = ? ORDER BY published_at DESC`,
-		itemsPerFollow, 0,
+		`SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`,
+		limit, offset,
 	)
+	follows, err := sqlx.Select[domain.Follow](ctx, s.store, pageSQL, pageArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	return s.hydrateFollowGroups(ctx, follows, itemsPerFollow), total, nil
+}
+
+func (s *Service) hydrateFollowGroups(ctx context.Context, follows []domain.Follow, itemsPerFollow int) []FollowGroup {
+	if len(follows) == 0 {
+		return []FollowGroup{}
+	}
+	if itemsPerFollow <= 0 {
+		itemsPerFollow = 5
+	}
+	placeholders := make([]string, len(follows))
+	args := make([]any, len(follows))
+	for i, f := range follows {
+		placeholders[i] = "?"
+		args[i] = f.ID
+	}
+	q := fmt.Sprintf(
+		`SELECT * FROM follow_items WHERE follow_id IN (%s) ORDER BY published_at DESC`,
+		strings.Join(placeholders, ","),
+	)
+	allItems, _ := sqlx.Select[domain.FollowItem](ctx, s.store, q, args...)
+	byFollow := make(map[string][]domain.FollowItem, len(follows))
+	for _, it := range allItems {
+		if len(byFollow[it.FollowID]) < itemsPerFollow {
+			byFollow[it.FollowID] = append(byFollow[it.FollowID], it)
+		}
+	}
 	out := make([]FollowGroup, 0, len(follows))
 	for _, f := range follows {
-		qArgs := append([]any{f.ID}, pageArgs...)
-		items, _ := sqlx.Select[domain.FollowItem](ctx, s.store, pageSQL, qArgs...)
-		out = append(out, FollowGroup{Follow: f, Items: items})
+		out = append(out, FollowGroup{Follow: f, Items: byFollow[f.ID]})
 	}
-	return out, nil
+	return out
 }
 
 // RecordView coalesces view_count and zero-PII daily PV/UV + top referer/article counters
@@ -1028,14 +1166,16 @@ func (s *Service) RecordView(_ context.Context, targetType string, targetID stri
 
 	isNewUV := false
 	if actorFPHash != "" {
+		sum := sha256.Sum256([]byte(actorFPHash))
+		fpKey := binary.LittleEndian.Uint64(sum[:8])
 		s.uvMu.Lock()
 		if s.uvDate != today {
 			s.uvDate = today
-			s.uvVisited = make(map[string]struct{})
+			s.uvVisited = make(map[uint64]struct{})
 		}
 		if len(s.uvVisited) < 65536 {
-			if _, seen := s.uvVisited[actorFPHash]; !seen {
-				s.uvVisited[actorFPHash] = struct{}{}
+			if _, seen := s.uvVisited[fpKey]; !seen {
+				s.uvVisited[fpKey] = struct{}{}
 				isNewUV = true
 			}
 		}

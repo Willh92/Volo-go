@@ -11,7 +11,7 @@ import (
 )
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 3
+const CurrentSchemaVersion = 4
 
 type migrationStep struct {
 	Version     int
@@ -35,13 +35,18 @@ var steps = []migrationStep{
 		Description: "Add alt_text accessibility column to media_assets",
 		Statements:  buildV3MediaAltText,
 	},
+	{
+		Version:     4,
+		Description: "Fix idx_articles_status_pub name collision and add composite sort/filter indexes across articles, comments, media_assets, redirects, and series_articles",
+		Statements:  buildV4QueryIndexes,
+	},
 }
 
 func buildV2Indexes(_ dialect.Dialect) []string {
 	return []string{
 		`CREATE INDEX idx_follow_items_follow_pub ON follow_items (follow_id, published_at)`,
 		`CREATE INDEX idx_pages_pub_updated ON pages (is_published, updated_at)`,
-		`CREATE INDEX idx_articles_status_pub ON articles (status, published_at)`,
+		`CREATE INDEX idx_articles_status_pub_at ON articles (status, published_at)`,
 		`CREATE INDEX idx_media_assets_dims ON media_assets (width, height)`,
 	}
 }
@@ -50,6 +55,22 @@ func buildV3MediaAltText(d dialect.Dialect) []string {
 	t := d.Types()
 	return []string{
 		fmt.Sprintf(`ALTER TABLE media_assets ADD COLUMN alt_text%s NOT NULL DEFAULT ''`, t.Varchar512),
+	}
+}
+
+func buildV4QueryIndexes(_ dialect.Dialect) []string {
+	return []string{
+		`CREATE INDEX idx_articles_status_pub_at ON articles (status, published_at)`,
+		`CREATE INDEX idx_articles_status_views_pub ON articles (status, view_count, published_at)`,
+		`CREATE INDEX idx_articles_status_comments_pub ON articles (status, comment_count, published_at)`,
+		`CREATE INDEX idx_articles_pinned_updated ON articles (is_pinned, updated_at)`,
+		`CREATE INDEX idx_articles_status_pinned_updated ON articles (status, is_pinned, updated_at)`,
+		`CREATE INDEX idx_comments_target_del_created ON comments (target_type, target_id, is_deleted, created_at, id)`,
+		`CREATE INDEX idx_comments_del_status_created ON comments (is_deleted, status, created_at)`,
+		`CREATE INDEX idx_comments_del_created ON comments (is_deleted, created_at)`,
+		`CREATE INDEX idx_media_created ON media_assets (created_at)`,
+		`CREATE INDEX idx_redirects_created ON redirects (created_at)`,
+		`CREATE INDEX idx_series_articles_sort ON series_articles (series_id, sort_order)`,
 	}
 }
 
@@ -310,6 +331,11 @@ func buildV1Schema(d dialect.Dialect) []string {
 			t.Varchar32, t.Varchar128, t.Text,
 			t.Int, t.Int, t.BigInt, t.Int, t.BigInt, t.BigInt, sfx),
 		`CREATE INDEX idx_articles_status_pub ON articles (status, is_pinned, published_at)`,
+		`CREATE INDEX idx_articles_status_pub_at ON articles (status, published_at)`,
+		`CREATE INDEX idx_articles_status_views_pub ON articles (status, view_count, published_at)`,
+		`CREATE INDEX idx_articles_status_comments_pub ON articles (status, comment_count, published_at)`,
+		`CREATE INDEX idx_articles_pinned_updated ON articles (is_pinned, updated_at)`,
+		`CREATE INDEX idx_articles_status_pinned_updated ON articles (status, is_pinned, updated_at)`,
 		`CREATE INDEX idx_articles_category ON articles (category_id, status, published_at)`,
 		`CREATE INDEX idx_articles_author ON articles (author_id, status, updated_at)`,
 		`CREATE INDEX idx_articles_legacy_link ON articles (legacy_permalink)`,
@@ -402,6 +428,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			PRIMARY KEY (series_id, article_id)
 		)%s`, t.Varchar32, t.Varchar32, t.Int, sfx),
 		`CREATE INDEX idx_series_articles_art ON series_articles (article_id)`,
+		`CREATE INDEX idx_series_articles_sort ON series_articles (series_id, sort_order)`,
 
 		// 15. Bookshelf & Recursive Chapter Tree (replaces voloBooks + voloBookToc.* chunks)
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS books (
@@ -460,7 +487,10 @@ func buildV1Schema(d dialect.Dialect) []string {
 			t.Text, t.Varchar32, t.Varchar64, t.Varchar64, t.Varchar128,
 			t.Text, t.Varchar32, t.Bool, t.BoolFalseLit, t.BigInt, t.BigInt, sfx),
 		`CREATE INDEX idx_comments_target_status ON comments (target_type, target_id, status, created_at)`,
+		`CREATE INDEX idx_comments_target_del_created ON comments (target_type, target_id, is_deleted, created_at, id)`,
 		`CREATE INDEX idx_comments_status_created ON comments (status, created_at)`,
+		`CREATE INDEX idx_comments_del_status_created ON comments (is_deleted, status, created_at)`,
+		`CREATE INDEX idx_comments_del_created ON comments (is_deleted, created_at)`,
 		`CREATE INDEX idx_comments_guest ON comments (guest_id_hash)`,
 		`CREATE INDEX idx_comments_user ON comments (user_id)`,
 
@@ -540,6 +570,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 		)%s`, t.Varchar32, t.Varchar32, vk, t.Varchar512, t.Varchar255, t.Varchar512, t.Varchar64,
 			t.BigInt, t.Int, t.Int, t.Varchar64, t.Bool, t.BoolTrueLit, t.Varchar32, t.BigInt, sfx),
 		`CREATE INDEX idx_media_assets_created ON media_assets (created_at)`,
+		`CREATE INDEX idx_media_created ON media_assets (created_at)`,
 
 		// 20. 301/302 Redirects & Legacy Permalink Guardian
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS redirects (
@@ -551,6 +582,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			hit_count%s NOT NULL DEFAULT 0,
 			created_at%s NOT NULL
 		)%s`, t.Varchar32, vk, t.Varchar512, t.Int, t.Bool, t.BoolFalseLit, t.BigInt, t.BigInt, sfx),
+		`CREATE INDEX idx_redirects_created ON redirects (created_at)`,
 
 		// 21. Webhooks, Zero-PII Daily Analytics, Security Rules & Audit Logs
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS webhooks (

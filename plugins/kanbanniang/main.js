@@ -15,15 +15,23 @@ function safeSettings(locale) {
   if (!ALLOWED_CHARACTERS[ch]) ch = "neko";
   var pos = String(cfg.position || "left");
   if (!ALLOWED_POSITIONS[pos]) pos = "left";
-  var isEN = String(locale || "").toLowerCase().indexOf("en") === 0;
+  var loc = String(locale || "").toLowerCase();
+  var isEN = loc.indexOf("en") === 0;
+  var isTW = loc === "zh-tw" || loc.indexOf("zh-hant") === 0;
+  var defaultZh = isTW
+    ? "歡迎來到獨立部落格，點我可以摸摸頭～"
+    : "欢迎来到独立博客，点我可以摸摸头～";
   var greeting = isEN
     ? cfg.greeting_en || "Welcome! Click me for a head-pat~"
-    : cfg.greeting_zh || "欢迎来到独立博客，点我可以摸摸头～";
+    : cfg.greeting_zh || defaultZh;
   return {
     character: ch,
     position: pos,
     greeting: String(greeting).slice(0, 140),
     hideOnMobile: cfg.hide_on_mobile !== false,
+    ariaLabel: isEN ? "Studio Mascot" : "看板娘助手",
+    btnLabel: isEN ? "Pat mascot" : "摸摸看板娘",
+    closeLabel: isEN ? "Dismiss message" : "收起提示",
   };
 }
 
@@ -37,7 +45,12 @@ function renderSlot(slotName, slotCtx) {
   var pats = Number(volo.kv.getInt("total_pats") || 0);
 
   if (slotName === "admin.dashboard_card") {
-    var title = String(locale).toLowerCase().indexOf("en") === 0 ? "Mascot Head-Pats" : "看板娘互动统计";
+    var loc = String(locale).toLowerCase();
+    var title = loc.indexOf("en") === 0
+      ? "Mascot Head-Pats"
+      : loc === "zh-tw" || loc.indexOf("zh-hant") === 0
+        ? "看板娘互動統計"
+        : "看板娘互动统计";
     return (
       '<div class="kbn-admin-stat"><strong>' +
       escapeAttr(title) +
@@ -57,7 +70,7 @@ function renderSlot(slotName, slotCtx) {
     return (
       '<aside id="volo-kanbanniang-root" class="' +
       cls +
-      '" data-position="' +
+      '" data-volo-persist="kanbanniang" data-position="' +
       escapeAttr(st.position) +
       '" data-character="' +
       escapeAttr(st.character) +
@@ -65,7 +78,13 @@ function renderSlot(slotName, slotCtx) {
       escapeAttr(st.greeting) +
       '" data-pats="' +
       pats +
-      '" aria-label="Studio Mascot"></aside>'
+      '" data-btn-label="' +
+      escapeAttr(st.btnLabel) +
+      '" data-close-label="' +
+      escapeAttr(st.closeLabel) +
+      '" aria-label="' +
+      escapeAttr(st.ariaLabel) +
+      '"></aside>'
     );
   }
   return "";
