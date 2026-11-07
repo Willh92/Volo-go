@@ -70,7 +70,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download Built Admin Dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: admin-dist
           path: internal/adminui/dist
@@ -131,7 +131,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download All Target Archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: bin-*
           path: release-assets
