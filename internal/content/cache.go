@@ -36,13 +36,21 @@ type redirectTableSnapshot struct {
 }
 
 type publicChromeSnapshot struct {
-	dataRev     uint64
-	settingsRev uint64
-	rawNavItems []domain.NavItem
-	categories  []CategoryWithCount
-	catsByID    map[string]domain.Category
-	tags        []TagWithCount
-	recentCmts  []RecentCommentItem
+	dataRev          uint64
+	settingsRev      uint64
+	rawNavItems      []domain.NavItem
+	categories       []CategoryWithCount
+	catsByID         map[string]domain.Category
+	tags             []TagWithCount
+	recentCmts       []RecentCommentItem
+	archiveBuckets   []ArchiveMonth
+	owner            PublicAuthorProfile
+	authors          []PublicAuthorProfile
+	authorsByID      map[string]PublicAuthorProfile
+	stats            PublicSiteStats
+	recentRaw        []domain.RawArticle
+	mostViewedRaw    []domain.RawArticle
+	mostCommentedRaw []domain.RawArticle
 }
 
 // CachedDocument holds a revision-coherent public XML/Markdown distribution document
@@ -182,15 +190,41 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 		return nil, err
 	}
 	recentCmts, _ := s.queryRecentPublicComments(ctx, maxCachedRecentCmts)
+	archiveBuckets, _ := s.queryArchiveMonths(ctx)
+	owner, authors, authorsByID := s.queryPublicAuthors(ctx)
+	stats := s.queryPublicSiteStats(ctx, len(cats), len(tags))
+
+	recentSQL, recentArgs := s.store.Dialect().PaginateSQL(
+		`SELECT * FROM articles WHERE status = ? ORDER BY published_at DESC`, maxCachedRecentCmts, 0,
+	)
+	recentRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, recentSQL, append([]any{domain.ArticleStatusPublished}, recentArgs...)...)
+
+	viewedSQL, viewedArgs := s.store.Dialect().PaginateSQL(
+		`SELECT * FROM articles WHERE status = ? ORDER BY view_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
+	)
+	mostViewedRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, viewedSQL, append([]any{domain.ArticleStatusPublished}, viewedArgs...)...)
+
+	cmtedSQL, cmtedArgs := s.store.Dialect().PaginateSQL(
+		`SELECT * FROM articles WHERE status = ? ORDER BY comment_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
+	)
+	mostCommentedRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, cmtedSQL, append([]any{domain.ArticleStatusPublished}, cmtedArgs...)...)
 
 	next := &publicChromeSnapshot{
-		dataRev:     dRev,
-		settingsRev: sRev,
-		rawNavItems: navRows,
-		categories:  cats,
-		catsByID:    catsByID,
-		tags:        tags,
-		recentCmts:  recentCmts,
+		dataRev:          dRev,
+		settingsRev:      sRev,
+		rawNavItems:      navRows,
+		categories:       cats,
+		catsByID:         catsByID,
+		tags:             tags,
+		recentCmts:       recentCmts,
+		archiveBuckets:   archiveBuckets,
+		owner:            owner,
+		authors:          authors,
+		authorsByID:      authorsByID,
+		stats:            stats,
+		recentRaw:        recentRaw,
+		mostViewedRaw:    mostViewedRaw,
+		mostCommentedRaw: mostCommentedRaw,
 	}
 	s.caches.chrome.Store(next)
 	return next, nil

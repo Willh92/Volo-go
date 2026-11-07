@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -28,24 +27,23 @@ const (
 	legacyBoloMD5Prefix = "bolomd5x2$"
 )
 
-// ErrWeakPassword is returned when a password violates minimum length or complexity rules.
-var ErrWeakPassword = errors.New("auth: password must be 8-128 characters and include both letters and digits")
+const (
+	// MinPasswordLength is the minimum allowed password length in runes.
+	MinPasswordLength = 6
+	// MaxPasswordLength is the maximum allowed password length in runes.
+	MaxPasswordLength = 128
+)
 
-// ValidatePasswordPolicy enforces modern password rules (8-128 runes, at least one letter and one digit).
+// ErrWeakPassword is returned when a password violates length rules.
+var ErrWeakPassword = errors.New("auth: password must be 6-128 characters")
+
+// ValidatePasswordPolicy enforces password length rules (6-128 runes, not purely whitespace).
 func ValidatePasswordPolicy(raw string) error {
-	runes := []rune(raw)
-	if len(runes) < 8 || len(runes) > 128 {
+	if strings.TrimSpace(raw) == "" {
 		return ErrWeakPassword
 	}
-	var hasLetter, hasDigit bool
-	for _, r := range runes {
-		if unicode.IsLetter(r) {
-			hasLetter = true
-		} else if unicode.IsDigit(r) {
-			hasDigit = true
-		}
-	}
-	if !hasLetter || !hasDigit {
+	runes := []rune(raw)
+	if len(runes) < MinPasswordLength || len(runes) > MaxPasswordLength {
 		return ErrWeakPassword
 	}
 	return nil

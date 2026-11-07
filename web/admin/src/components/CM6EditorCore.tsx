@@ -1,18 +1,20 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import { EditorState } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, placeholder } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { apiFetch, showToast } from "../api";
-import { localeSig } from "../i18n";
+import { localeSig, t } from "../i18n";
 import type { CM6EditorProps } from "./CM6Editor";
 
 export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const phCompartment = useRef(new Compartment());
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
+  const curLocale = localeSig.value;
   const [previewHTML, setPreviewHTML] = useState<string>("");
   const [showPreview, setShowPreview] = useState<boolean>(true);
   const [uploading, setUploading] = useState<boolean>(false);
@@ -40,13 +42,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
       const url = res.asset.public_url;
       const name = res.asset.orig_filename || "asset";
       if (res.asset.mime_type?.startsWith("audio/")) {
-        insertSnippet(`\n[Audio: ${name}](${url})\n`);
+        insertSnippet(`\n[${t("ed.audio_label")}: ${name}](${url})\n`);
       } else {
         insertSnippet(`![${name}](${url})`);
       }
-      showToast(`Uploaded ${name}`);
+      showToast(t("ed.uploaded", { name }));
     } catch (err: any) {
-      showToast(err?.message || "Upload failed");
+      showToast(err?.message || t("ed.upload_failed"));
     } finally {
       setUploading(false);
     }
@@ -90,7 +92,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
         history(),
         markdown(),
         EditorView.lineWrapping,
-        placeholder("Write in Markdown... Drag & drop or paste images directly."),
+        phCompartment.current.of(placeholder(t("ed.placeholder"))),
         keymap.of([...defaultKeymap, ...historyKeymap]),
         domHandlers,
         EditorView.updateListener.of((update) => {
@@ -113,6 +115,15 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
     };
   }, []);
 
+  // Reconfigure CM6 placeholder reactively when language switches
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: phCompartment.current.reconfigure(placeholder(t("ed.placeholder"))),
+    });
+  }, [curLocale]);
+
   // Synchronize external value updates (e.g. loading an article or restoring a revision/draft)
   useEffect(() => {
     const view = viewRef.current;
@@ -132,7 +143,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
       try {
         const res = await apiFetch<{ html: string }>("/api/admin/articles/preview", {
           method: "POST",
-          body: JSON.stringify({ content_md: value, locale: localeSig.value }),
+          body: JSON.stringify({ content_md: value, locale: curLocale }),
         });
         setPreviewHTML(res.html || "");
       } catch {
@@ -140,35 +151,35 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
       }
     }, 260);
     return () => window.clearTimeout(timer);
-  }, [value, showPreview]);
+  }, [value, showPreview, curLocale]);
 
   return (
     <div>
       <div class="volo-toolbar">
-        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet("## ")}>H2</button>
-        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet("**bold**")}>B</button>
-        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet("`code`")}>Code</button>
-        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet("\n```go\n\n```\n")}>Code Block</button>
+        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet("## ")}>{t("ed.h2")}</button>
+        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet(t("ed.bold_sample"))}>{t("ed.bold")}</button>
+        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet("`code`")}>{t("ed.code")}</button>
+        <button type="button" class="volo-btn volo-btn-sm" onClick={() => insertSnippet("\n```go\n\n```\n")}>{t("ed.code_block")}</button>
         <button
           type="button"
           class="volo-btn volo-btn-sm"
-          onClick={() => insertSnippet('\n:::lock pwd="secret" hint="Protected section"\nLocked notes...\n:::\n')}
+          onClick={() => insertSnippet(t("ed.lock_tpl"))}
         >
-          :::lock
+          {t("ed.lock")}
         </button>
         <button
           type="button"
           class="volo-btn volo-btn-sm"
-          onClick={() => insertSnippet('\n:::book title="Designing Data-Intensive Applications" author="Martin Kleppmann" status="reading" rating="5"\nNotes...\n:::\n')}
+          onClick={() => insertSnippet(t("ed.book_tpl"))}
         >
-          :::book
+          {t("ed.book")}
         </button>
         <button
           type="button"
           class="volo-btn volo-btn-sm"
           onClick={() => insertSnippet("\n:::bookshelf\n:::\n")}
         >
-          :::bookshelf
+          {t("ed.bookshelf")}
         </button>
         {quickInserts.map((qi) => (
           <button
@@ -181,7 +192,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
           </button>
         ))}
         <label class="volo-btn volo-btn-sm" style={{ cursor: "pointer" }}>
-          {uploading ? "Uploading..." : "Upload Image / Audio"}
+          {uploading ? t("ed.uploading") : t("ed.upload_media")}
           <input
             type="file"
             accept="image/*,audio/*"
@@ -199,7 +210,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
           style={{ marginLeft: "auto" }}
           onClick={() => setShowPreview(!showPreview)}
         >
-          {showPreview ? "Hide Split Preview" : "Show Split Preview"}
+          {showPreview ? t("ed.hide_preview") : t("ed.show_preview")}
         </button>
       </div>
 
@@ -208,7 +219,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [] }: CM6EditorP
         {showPreview && (
           <div
             class="volo-preview-pane"
-            dangerouslySetInnerHTML={{ __html: previewHTML || "<p style='color:var(--volo-muted)'>Live preview...</p>" }}
+            dangerouslySetInnerHTML={{ __html: previewHTML || `<p style='color:var(--volo-muted)'>${t("ed.live_preview_empty")}</p>` }}
           />
         )}
       </div>

@@ -58,6 +58,7 @@ func (s *AppServer) handleSetupSPA(w http.ResponseWriter, r *http.Request) {
 		Accent:        snap.Appearance.Accent,
 		DefaultTheme:  snap.Appearance.DefaultMode,
 		SiteTitle:     snap.Site.Title,
+		Locales:       s.deps.Catalog.Locales(),
 	})
 }
 
@@ -223,17 +224,26 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	}
 
 	locale := s.deps.Catalog.Match(req.DefaultLocale, "")
+	isZH := strings.HasPrefix(strings.ToLower(locale), "zh")
 	displayName := strings.TrimSpace(req.AdminDisplayName)
 	if displayName == "" {
 		displayName = uname
 	}
 	siteTitle := strings.TrimSpace(req.SiteTitle)
 	if siteTitle == "" {
-		siteTitle = "Volo Blog"
+		if isZH {
+			siteTitle = "Volo 随笔"
+		} else {
+			siteTitle = "Volo Blog"
+		}
 	}
 	siteSubtitle := strings.TrimSpace(req.SiteSubtitle)
 	if siteSubtitle == "" {
-		siteSubtitle = "Independent thoughts & craft"
+		if isZH {
+			siteSubtitle = "独立思考与工程手艺"
+		} else {
+			siteSubtitle = "Independent thoughts & craft"
+		}
 	}
 	tz := strings.TrimSpace(req.TimeZone)
 	if tz == "" {
@@ -281,28 +291,40 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 			return iErr
 		}
 
-		// Seed default "Tech" category & "/about" standalone page if empty
+		// Seed default starter category & "/about" standalone page if empty
 		var catCnt int
 		_ = tx.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM categories`).Scan(&catCnt)
 		if catCnt == 0 {
 			catID := id.Next()
+			catName := "Notes"
+			catDesc := "Essays & engineering notes"
+			if isZH {
+				catName = "随笔"
+				catDesc = "独立思考与工程手记"
+			}
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO categories (id, name, slug, description, icon, sort_order, created_at, updated_at)
-				 VALUES (?, 'Notes', 'notes', 'Essays & engineering notes', '', 1, ?, ?)`,
-				catID, now, now)
+				 VALUES (?, ?, 'notes', ?, '', 1, ?, ?)`,
+				catID, catName, catDesc, now, now)
 		}
 		var pageCnt int
 		_ = tx.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM pages`).Scan(&pageCnt)
 		if pageCnt == 0 {
 			pageID := id.Next()
+			aboutTitle := "About"
+			aboutBody := "# About\n\nWelcome to **" + siteTitle + "**, powered by Volo-go."
+			if isZH {
+				aboutTitle = "关于"
+				aboutBody = "# 关于\n\n欢迎来到 **" + siteTitle + "**，本站由纯 Go 单文件独立博客引擎 Volo-go 驱动。"
+			}
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO pages (id, author_id, title, slug, content_md, is_published, allow_comment, show_toc, lang, translation_group, view_count, comment_count, created_at, updated_at)
-				 VALUES (?, ?, 'About', 'about', ?, 1, 1, 0, ?, '', 0, 0, ?, ?)`,
-				pageID, adminUser.ID, "# About\n\nWelcome to **"+siteTitle+"**, powered by Volo-go.", locale, now, now)
+				 VALUES (?, ?, ?, 'about', ?, 1, 1, 0, ?, '', 0, 0, ?, ?)`,
+				pageID, adminUser.ID, aboutTitle, aboutBody, locale, now, now)
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
-				 VALUES (?, '', 'About', '{"zh-CN":"关于","en-US":"About"}', '/about', 0, '', 10, 1, ?, ?)`,
-				id.Next(), now, now)
+				 VALUES (?, '', ?, '{"zh-CN":"关于","en-US":"About"}', '/about', 0, '', 10, 1, ?, ?)`,
+				id.Next(), aboutTitle, now, now)
 		}
 		return nil
 	})

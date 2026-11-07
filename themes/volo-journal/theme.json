@@ -4,13 +4,39 @@
     "zh-CN": "Volo Journal 纸刊",
     "en-US": "Volo Journal"
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Volo-go",
+  "license": "MIT",
+  "preview": "preview.svg",
   "description": {
-    "zh-CN": "单栏居中、经典衬线纸媒排版的外部扩展主题示例，继承 Volo Studio 色彩令牌与持久挂件协议，零样式冲突。",
-    "en-US": "Single-column serif editorial journal external theme demonstrating zero-conflict CSS scoping and persistent PJAX islands."
+    "zh-CN": "单栏居中、经典衬线纸媒排版的外部扩展主题示例，演示模块化局部模板、独立多语言词典与主题专属配置项。",
+    "en-US": "Single-column serif editorial journal external theme demonstrating modular partials, per-theme JSON locales, and declarative config schema."
   },
   "accents": ["forest", "ocean", "teal", "amber", "plum", "rose"],
   "supports_dark_mode": true,
-  "supports_pjax": true
+  "supports_pjax": true,
+  "config_schema": [
+    {
+      "key": "journal_motto",
+      "type": "text",
+      "label": {
+        "zh-CN": "刊首铭文",
+        "en-US": "Masthead Motto"
+      },
+      "description": {
+        "zh-CN": "显示在纸刊页头副标题位置，留空则使用站点副标题。",
+        "en-US": "Displayed under the journal masthead; falls back to site subtitle when empty."
+      },
+      "default": ""
+    },
+    {
+      "key": "show_colophon",
+      "type": "boolean",
+      "label": {
+        "zh-CN": "显示纸刊版权尾注 (Colophon)",
+        "en-US": "Show Editorial Colophon"
+      },
+      "default": true
+    }
+  ]
 }

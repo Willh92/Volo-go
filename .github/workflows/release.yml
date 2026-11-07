@@ -107,6 +107,7 @@ jobs:
           cp scripts/install-service-linux.sh scripts/install-service-macos.sh scripts/install-service-windows.ps1 "dist/${STAGE}/scripts/"
           cp -r deploy "dist/${STAGE}/deploy"
           cp -r docs "dist/${STAGE}/docs"
+          cp -r locales "dist/${STAGE}/locales"
           cp -r plugins "dist/${STAGE}/plugins"
           cp -r themes "dist/${STAGE}/themes"
 

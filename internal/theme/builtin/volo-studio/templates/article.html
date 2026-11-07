@@ -9,6 +9,7 @@
       <div class="article__meta-top">
         {{if .Detail.CategoryName}}<a class="volo-badge" href="/categories/{{.Detail.CategorySlug}}">{{.Detail.CategoryName}}</a>{{end}}
         <time datetime="{{fmtISO .Detail.PublishedAt}}">{{fmtDate .Detail.PublishedAt}}</time>
+        {{if .Detail.HasUpdated}}<span>· {{t .Locale "article.updated"}} {{fmtDate .Detail.UpdatedAt}}</span>{{end}}
         {{if and (not .Detail.RequiresPassword) .Reading.EnableReadingStats}}
           <span>· {{t .Locale "article.reading_stats" (dict "words" .Detail.WordCount "minutes" .Detail.ReadingMinutes)}}</span>
         {{end}}
@@ -110,6 +111,20 @@
               </a>
             {{end}}
           </div>
+        {{end}}
+
+        {{if .RelatedPosts}}
+          <section style="margin-top:26px;padding-top:18px;border-top:1px solid var(--volo-line)">
+            <h3 style="font-size:1rem;margin:0 0 10px">{{t .Locale "article.related_header"}}</h3>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              {{range .RelatedPosts}}
+                <a href="{{.URL}}" style="display:flex;justify-content:space-between;gap:12px;color:var(--volo-text);text-decoration:none">
+                  <strong>{{.Title}}</strong>
+                  <time datetime="{{fmtISO .PublishedAt}}" style="color:var(--volo-muted);font-size:.82rem;flex-shrink:0">{{fmtDate .PublishedAt}}</time>
+                </a>
+              {{end}}
+            </div>
+          </section>
         {{end}}
 
         {{if .Backlinks}}

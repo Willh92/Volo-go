@@ -1,0 +1,475 @@
+package theme
+
+import (
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"net/url"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
+
+func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, themeLocales map[string]map[string]string) template.FuncMap {
+	translate := func(locale string, key string, vars ...map[string]any) string {
+		if msg, ok := lookupThemeLocaleMessage(themeLocales, locale, key); ok {
+			if len(vars) > 0 && vars[0] != nil {
+				for k, v := range vars[0] {
+					s := fmt.Sprint(v)
+					msg = strings.ReplaceAll(msg, "{{"+k+"}}", s)
+					msg = strings.ReplaceAll(msg, "{"+k+"}", s)
+				}
+			}
+			return msg
+		}
+		if e.catalog == nil {
+			return key
+		}
+		return e.catalog.T(locale, key, vars...)
+	}
+
+	themeBoolFn := func(cfg map[string]any, key string, fallback bool) bool {
+		if cfg == nil {
+			return fallback
+		}
+		v, ok := cfg[key]
+		if !ok || v == nil {
+			return fallback
+		}
+		switch b := v.(type) {
+		case bool:
+			return b
+		case string:
+			switch strings.ToLower(strings.TrimSpace(b)) {
+			case "true", "1", "yes", "on":
+				return true
+			case "false", "0", "no", "off":
+				return false
+			}
+		case float64:
+			return b != 0
+		case int:
+			return b != 0
+		}
+		return fallback
+	}
+
+	themeIntFn := func(cfg map[string]any, key string, fallback int) int {
+		if cfg == nil {
+			return fallback
+		}
+		v, ok := cfg[key]
+		if !ok || v == nil {
+			return fallback
+		}
+		switch n := v.(type) {
+		case int:
+			return n
+		case int64:
+			return int(n)
+		case float64:
+			return int(n)
+		case string:
+			if parsed, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+				return parsed
+			}
+		}
+		return fallback
+	}
+
+	return template.FuncMap{
+		"t": translate,
+		"tt": func(args ...any) string {
+			// Supports:
+			//   {{tt .ThemeID .Locale "key" (dict ...)}}
+			//   {{tt .Locale "key" (dict ...)}}
+			//   {{tt "key" (dict ...)}}
+			var strs []string
+			var vars []map[string]any
+			for _, a := range args {
+				switch v := a.(type) {
+				case string:
+					strs = append(strs, v)
+				case map[string]any:
+					vars = append(vars, v)
+				}
+			}
+			switch {
+			case len(strs) >= 3:
+				return translate(strs[1], strs[2], vars...)
+			case len(strs) == 2:
+				return translate(strs[0], strs[1], vars...)
+			case len(strs) == 1:
+				return translate("zh-CN", strs[0], vars...)
+			default:
+				return ""
+			}
+		},
+		"assetURL": func(tid string, rel string) string {
+			if tid == "" {
+				tid = themeID
+			}
+			clean := strings.TrimPrefix(rel, "/")
+			if a, ok := assets[clean]; ok && a.shortHash != "" {
+				return fmt.Sprintf("/themes/%s/assets/%s?v=%s", tid, clean, a.shortHash)
+			}
+			return fmt.Sprintf("/themes/%s/assets/%s", tid, clean)
+		},
+		"themeCfg": func(cfg map[string]any, key string, fallback ...any) any {
+			var def any
+			if len(fallback) > 0 {
+				def = fallback[0]
+			}
+			if cfg == nil {
+				return def
+			}
+			v, ok := cfg[key]
+			if !ok || v == nil {
+				return def
+			}
+			if s, isStr := v.(string); isStr && s == "" && def != nil {
+				if _, defBool := def.(bool); !defBool {
+					return def
+				}
+			}
+			return v
+		},
+		"themeBool":    themeBoolFn,
+		"themeCfgBool": themeBoolFn,
+		"themeInt":     themeIntFn,
+		"themeCfgInt":  themeIntFn,
+		"customVar": func(vars map[string]string, key string, fallback ...string) string {
+			def := ""
+			if len(fallback) > 0 {
+				def = fallback[0]
+			}
+			if vars == nil {
+				return def
+			}
+			if v, ok := vars[key]; ok && v != "" {
+				return v
+			}
+			return def
+		},
+		"pageURL": func(basePath string, page int) string {
+			if basePath == "" {
+				basePath = "/"
+			}
+			if page <= 1 {
+				return basePath
+			}
+			sep := "?"
+			if strings.Contains(basePath, "?") {
+				sep = "&"
+			}
+			return basePath + sep + "page=" + strconv.Itoa(page)
+		},
+		"safeHTML": func(s string) template.HTML {
+			return template.HTML(s)
+		},
+		"safeCSS": func(s string) template.CSS {
+			return template.CSS(sanitizeStyleContent(s))
+		},
+		"safeJS": func(s string) template.JS {
+			return template.JS(s)
+		},
+		"safeURL": func(s string) template.URL {
+			trimmed := strings.TrimSpace(s)
+			lower := strings.ToLower(trimmed)
+			if strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "vbscript:") || strings.HasPrefix(lower, "data:text/html") {
+				return template.URL("#")
+			}
+			return template.URL(trimmed)
+		},
+		"cssURL": func(s string) template.CSS {
+			trimmed := strings.TrimSpace(s)
+			lower := strings.ToLower(trimmed)
+			if trimmed == "" || strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "data:text/html") {
+				return template.CSS("none")
+			}
+			replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `'`, `\'`, `(`, `\(`, `)`, `\)`, "\n", "", "\r", "", "<", "")
+			return template.CSS(`url("` + replacer.Replace(trimmed) + `")`)
+		},
+		"fmtDate": func(ms int64) string {
+			if ms <= 0 {
+				return ""
+			}
+			return time.UnixMilli(ms).Format("2006-01-02")
+		},
+		"formatDate": func(ms int64) string {
+			if ms <= 0 {
+				return ""
+			}
+			return time.UnixMilli(ms).Format("2006-01-02")
+		},
+		"formatDotDate": func(ms int64) string {
+			if ms <= 0 {
+				return ""
+			}
+			return time.UnixMilli(ms).Format("2006.01.02")
+		},
+		"formatMonthDay": func(ms int64) string {
+			if ms <= 0 {
+				return ""
+			}
+			return time.UnixMilli(ms).Format("01-02")
+		},
+		"fmtDateTime": func(ms int64) string {
+			if ms <= 0 {
+				return ""
+			}
+			return time.UnixMilli(ms).Format("2006-01-02 15:04")
+		},
+		"formatDateTime": func(ms int64) string {
+			if ms <= 0 {
+				return ""
+			}
+			return time.UnixMilli(ms).Format("2006-01-02 15:04")
+		},
+		"fmtTime": func(ms int64, layout string) string {
+			if ms <= 0 {
+				return ""
+			}
+			goLayout := normalizeDateLayout(layout)
+			if goLayout == "" {
+				goLayout = "2006-01-02"
+			}
+			return time.UnixMilli(ms).Format(goLayout)
+		},
+		"formatTime": func(ms int64, layout string) string {
+			if ms <= 0 {
+				return ""
+			}
+			goLayout := normalizeDateLayout(layout)
+			if goLayout == "" {
+				goLayout = "2006-01-02"
+			}
+			return time.UnixMilli(ms).Format(goLayout)
+		},
+		"fmtISO": func(ms int64) string {
+			if ms <= 0 {
+				return ""
+			}
+			return time.UnixMilli(ms).UTC().Format(time.RFC3339)
+		},
+		"default": func(fallback any, val any) any {
+			if isEmptyTemplateValue(val) {
+				return fallback
+			}
+			return val
+		},
+		"coalesce": func(vals ...any) any {
+			for _, v := range vals {
+				if !isEmptyTemplateValue(v) {
+					return v
+				}
+			}
+			return ""
+		},
+		"truncate": func(s string, maxRunes int) string {
+			if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+				return s
+			}
+			runes := []rune(s)
+			return strings.TrimSpace(string(runes[:maxRunes])) + "…"
+		},
+		"urlEncode": url.QueryEscape,
+		"hasPrefix": strings.HasPrefix,
+		"hasSuffix": strings.HasSuffix,
+		"contains":  strings.Contains,
+		"replace":   strings.ReplaceAll,
+		"split":     strings.Split,
+		"join":      strings.Join,
+		"trim":      strings.TrimSpace,
+		"lower":     strings.ToLower,
+		"upper":     strings.ToUpper,
+		"add":       func(a, b int) int { return a + b },
+		"sub":       func(a, b int) int { return a - b },
+		"mul":       func(a, b int) int { return a * b },
+		"div": func(a, b int) int {
+			if b == 0 {
+				return 0
+			}
+			return a / b
+		},
+		"mod": func(a, b int) int {
+			if b == 0 {
+				return 0
+			}
+			return a % b
+		},
+		"seq": func(start, end int) []int {
+			if end < start {
+				return nil
+			}
+			const maxSeq = 500
+			count := end - start + 1
+			if count > maxSeq {
+				count = maxSeq
+			}
+			out := make([]int, count)
+			for i := 0; i < count; i++ {
+				out[i] = start + i
+			}
+			return out
+		},
+		"dict": func(values ...any) map[string]any {
+			m := make(map[string]any, len(values)/2)
+			for i := 0; i+1 < len(values); i += 2 {
+				if k, ok := values[i].(string); ok {
+					m[k] = values[i+1]
+				}
+			}
+			return m
+		},
+		"list": func(values ...any) []any {
+			return values
+		},
+		"slice": func(values ...any) []any {
+			return values
+		},
+		"first": func(limit int, items any) any {
+			if limit <= 0 || items == nil {
+				return nil
+			}
+			rv := reflect.ValueOf(items)
+			if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+				return items
+			}
+			if rv.Len() <= limit {
+				return items
+			}
+			return rv.Slice(0, limit).Interface()
+		},
+		"json": func(v any) template.JS {
+			b, err := jsonMarshalSafe(v)
+			if err != nil {
+				return template.JS("null")
+			}
+			return template.JS(b)
+		},
+		"socialIconSVG": renderSocialIconSVG,
+		"coverSVG":      renderDeterministicCoverSVG,
+	}
+}
+
+func lookupThemeLocaleMessage(themeLocales map[string]map[string]string, locale string, key string) (string, bool) {
+	if len(themeLocales) == 0 {
+		return "", false
+	}
+	norm := strings.TrimSpace(locale)
+	if m, ok := themeLocales[norm]; ok {
+		if val, exists := m[key]; exists && val != "" {
+			return val, true
+		}
+	}
+	base := strings.ToLower(norm)
+	if idx := strings.IndexAny(base, "-_"); idx > 0 {
+		base = base[:idx]
+	}
+	for code, m := range themeLocales {
+		codeLower := strings.ToLower(code)
+		if codeLower == strings.ToLower(norm) || strings.HasPrefix(codeLower, base+"-") || codeLower == base {
+			if val, exists := m[key]; exists && val != "" {
+				return val, true
+			}
+		}
+	}
+	if m, ok := themeLocales["en-US"]; ok {
+		if val, exists := m[key]; exists && val != "" {
+			return val, true
+		}
+	}
+	return "", false
+}
+
+// normalizeDateLayout accepts either native Go reference time layouts ("2006-01-02")
+// or traditional pattern tokens ("yyyy-MM-dd HH:mm:ss") used in classic skin templates.
+func normalizeDateLayout(layout string) string {
+	l := strings.TrimSpace(layout)
+	if l == "" || strings.Contains(l, "2006") || strings.Contains(l, "15:04") || strings.Contains(l, "Jan") {
+		return l
+	}
+	replacer := strings.NewReplacer(
+		"yyyy", "2006",
+		"YYYY", "2006",
+		"yy", "06",
+		"MM", "01",
+		"dd", "02",
+		"DD", "02",
+		"HH", "15",
+		"hh", "03",
+		"mm", "04",
+		"ss", "05",
+	)
+	return replacer.Replace(l)
+}
+
+func isEmptyTemplateValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x) == ""
+	case bool:
+		return !x
+	case int:
+		return x == 0
+	case int64:
+		return x == 0
+	case float64:
+		return x == 0
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Map, reflect.Array:
+		return rv.Len() == 0
+	case reflect.Ptr, reflect.Interface:
+		return rv.IsNil()
+	}
+	return false
+}
+
+func sanitizeStyleContent(css string) string {
+	if css == "" {
+		return ""
+	}
+	clean := css
+	for _, bad := range []string{"</style", "<script", "javascript:", "expression("} {
+		idx := strings.Index(strings.ToLower(clean), bad)
+		for idx >= 0 {
+			clean = clean[:idx] + clean[idx+len(bad):]
+			idx = strings.Index(strings.ToLower(clean), bad)
+		}
+	}
+	return clean
+}
+
+func renderSocialIconSVG(icon string) template.HTML {
+	key := strings.ToLower(strings.TrimSpace(icon))
+	var inner string
+	switch key {
+	case "github":
+		inner = `<path d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z" fill="currentColor"/>`
+	case "x", "twitter":
+		inner = `<path d="M9.3 6.8 14.2 1.5h-1.2L8.7 6.1 5.3 1.5H1.4l5.1 7.2-5.1 5.8h1.2l4.5-5.1 3.6 5.1h3.9L9.3 6.8Zm-1.6 1.8-.5-.7L3.1 2.4h1.8l3.3 4.7.5.7 4.3 6.1h-1.8L7.7 8.6Z" fill="currentColor"/>`
+	case "rss", "feed":
+		inner = `<circle cx="3.8" cy="12.2" r="1.6" fill="currentColor"/><path d="M2.2 7.4a6.4 6.4 0 0 1 6.4 6.4M2.2 2.8a11 11 0 0 1 11 11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>`
+	case "email", "mail":
+		inner = `<rect x="1.8" y="3.2" width="12.4" height="9.6" rx="1.8" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="m2.4 4.2 5.6 4.4 5.6-4.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`
+	case "telegram":
+		inner = `<path d="M14.3 2.4 1.8 7.2c-.6.24-.59.82-.05 1l3.1 1 7.2-4.5c.34-.21.65-.1.4.13L6.6 10.1l-.22 3.2c.32 0 .46-.15.64-.32l1.55-1.5 3.2 2.36c.59.32 1.01.16 1.16-.54l2.05-9.7c.2-.78-.3-1.14-.68-1.2Z" fill="currentColor"/>`
+	case "bilibili", "video", "youtube":
+		inner = `<rect x="1.8" y="3.8" width="12.4" height="9.2" rx="2.2" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="m6.6 6.4 3.6 2-3.6 2V6.4Z" fill="currentColor"/>`
+	default:
+		inner = `<circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M2 8h12M8 1.8c1.8 1.8 2.8 4 2.8 6.2S9.8 12.4 8 14.2C6.2 12.4 5.2 10.2 5.2 8S6.2 3.6 8 1.8Z" stroke="currentColor" stroke-width="1.3" fill="none"/>`
+	}
+	return template.HTML(`<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" style="vertical-align:-2px">` + inner + `</svg>`)
+}
+
+func jsonMarshalSafe(v any) ([]byte, error) {
+	return json.Marshal(v)
+}

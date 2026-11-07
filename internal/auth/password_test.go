@@ -10,11 +10,14 @@ import (
 )
 
 func TestArgon2idHashAndVerify(t *testing.T) {
-	if err := ValidatePasswordPolicy("short1"); err == nil {
-		t.Fatal("expected short password rejection")
+	if err := ValidatePasswordPolicy("12345"); err == nil {
+		t.Fatal("expected <6 character password rejection")
 	}
-	if err := ValidatePasswordPolicy("onlyletters"); err == nil {
-		t.Fatal("expected digit-less password rejection")
+	if err := ValidatePasswordPolicy("      "); err == nil {
+		t.Fatal("expected whitespace-only password rejection")
+	}
+	if err := ValidatePasswordPolicy("123456"); err != nil {
+		t.Fatalf("expected 6-character password acceptance, got: %v", err)
 	}
 	if err := ValidatePasswordPolicy("Sovereign2026!"); err != nil {
 		t.Fatalf("unexpected policy error: %v", err)

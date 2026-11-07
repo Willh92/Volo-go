@@ -1,8 +1,10 @@
 import { useState } from "preact/hooks";
 import { apiFetch, b64urlToBytes, bytesToB64url, csrfTokenSig, currentUserSig, refreshMe, showToast, StaffUser } from "../api";
-import { localeSig, normalizeLocale, t } from "../i18n";
+import { BrandLogo } from "../components/BrandLogo";
+import { availableLocalesSig, ensureLocaleLoaded, localeSig, normalizeLocale, t } from "../i18n";
 
 export function LoginView() {
+  const locales = availableLocalesSig.value;
   const [ident, setIdent] = useState("");
   const [password, setPassword] = useState("");
   const [challengeToken, setChallengeToken] = useState("");
@@ -63,7 +65,7 @@ export function LoginView() {
 
   const handlePasskeyLogin = async () => {
     if (!window.PublicKeyCredential || !navigator.credentials) {
-      showToast("WebAuthn Passkeys require HTTPS or localhost.");
+      showToast(t("auth.passkey_https_only"));
       return;
     }
     setBusy(true);
@@ -99,7 +101,7 @@ export function LoginView() {
       csrfTokenSig.value = res.csrf_token || "";
       await refreshMe();
     } catch (err: any) {
-      showToast(err?.message || "Passkey verification cancelled");
+      showToast(err?.message || t("auth.passkey_cancelled"));
     } finally {
       setBusy(false);
     }
@@ -108,18 +110,23 @@ export function LoginView() {
   return (
     <div class="volo-center-stage">
       <div class="volo-wizard-box" style={{ maxWidth: "430px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "18px" }}>
-          <h1 style={{ margin: 0, fontSize: "20px" }}>{t("auth.sign_in")}</h1>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", marginBottom: "18px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <BrandLogo size={36} />
+            <h1 style={{ margin: 0, fontSize: "20px" }}>{t("auth.sign_in")}</h1>
+          </div>
           <select
             class="volo-select"
-            style={{ width: "112px" }}
+            style={{ width: "118px" }}
             value={localeSig.value}
             onChange={(e) => {
-              localeSig.value = normalizeLocale((e.currentTarget as HTMLSelectElement).value);
+              const next = normalizeLocale((e.currentTarget as HTMLSelectElement).value);
+              void ensureLocaleLoaded(next);
             }}
           >
-            <option value="zh-CN">简体中文</option>
-            <option value="en-US">English</option>
+            {locales.map((loc) => (
+              <option key={loc.code} value={loc.code}>{loc.name}</option>
+            ))}
           </select>
         </div>
 

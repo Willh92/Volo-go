@@ -25,12 +25,17 @@
   <link rel="alternate" type="application/rss+xml" title="{{.Site.Title}} RSS" href="/rss.xml">
   <link rel="alternate" type="application/atom+xml" title="{{.Site.Title}} Atom" href="/atom.xml">
   {{if .Feed.Podcast.Enabled}}<link rel="alternate" type="application/rss+xml" title="{{.Site.Title}} Podcast" href="/podcast.xml">{{end}}
-  {{if .Site.FaviconURL}}<link rel="icon" href="{{.Site.FaviconURL}}">{{end}}
+  {{if .Site.FaviconURL}}<link rel="icon" href="{{.Site.FaviconURL}}">{{else}}<link rel="icon" type="image/svg+xml" href="/favicon.svg">{{end}}
+  <link rel="alternate icon" sizes="32x32" href="/favicon.ico">
   <script>
     (function(){
-      var m = "";
-      try { m = localStorage.getItem("volo_theme_mode") || ""; } catch(_){}
+      var m = "", a = "";
+      try {
+        m = localStorage.getItem("volo_theme_mode") || "";
+        a = localStorage.getItem("volo_theme_accent") || "";
+      } catch(_){}
       if (!m) m = document.documentElement.getAttribute("data-default-mode") || "auto";
+      if (a) document.documentElement.setAttribute("data-accent", a);
       var eff = m;
       if (m === "system") eff = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
       else if (m !== "light" && m !== "dark") { var h = new Date().getHours(); eff = (h >= 7 && h < 19) ? "light" : "dark"; }
@@ -40,6 +45,7 @@
   </script>
   <link rel="stylesheet" href="{{assetURL .ThemeID "volo-studio.css"}}">
   <link rel="stylesheet" href="{{assetURL .ThemeID "volo-journal.css"}}">
+  {{if .Appearance.CustomCSS}}<style id="volo-custom-css">{{safeCSS .Appearance.CustomCSS}}</style>{{end}}
   {{if .JSONLD}}<script type="application/ld+json">{{safeJS .JSONLD}}</script>{{end}}
   {{if .Site.CustomHeadMeta}}{{safeHTML .Site.CustomHeadMeta}}{{end}}
   {{range .HeadWidgets}}{{safeHTML .HTML}}{{end}}
@@ -48,8 +54,11 @@
   <header class="studio-header">
     <div class="studio-container studio-header__inner">
       <a class="studio-brand" href="/">
-        {{if .Site.LogoURL}}<img class="studio-brand__logo" src="{{.Site.LogoURL}}" alt="{{.Site.Title}}" width="32" height="32">{{end}}
-        <span>{{.Site.Title}}</span>
+        {{if .Site.LogoURL}}<img class="studio-brand__logo" src="{{.Site.LogoURL}}" alt="{{.Site.Title}}" width="38" height="38">{{else}}<span class="studio-brand__mark" aria-hidden="true">V.</span>{{end}}
+        <span class="studio-brand__copy">
+          <span class="studio-brand__title">{{.Site.Title}}</span>
+          <span class="studio-brand__tagline">{{default (default .Site.Subtitle (tt .ThemeID .Locale "journal.edition")) (themeCfg .ThemeConfig "journal_motto" "")}}</span>
+        </span>
       </a>
       <nav class="studio-nav" aria-label="Primary">
         <a class="studio-nav__link {{if eq .CurrentPath "/"}}is-active{{end}}" href="/">{{t .Locale "nav.home"}}</a>
@@ -66,7 +75,9 @@
       </nav>
       <div class="studio-actions">
         {{if .Reading.EnableInstantSearch}}
-          <button type="button" id="volo-search-btn" class="studio-icon-btn" title="{{t .Locale "nav.search_placeholder"}}">⌘K</button>
+          <button type="button" id="volo-search-btn" class="studio-icon-btn" title="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          </button>
         {{end}}
         <button type="button" id="volo-theme-btn" class="studio-icon-btn" title="{{t .Locale "appearance.auto"}}">◐</button>
         {{if and .Site.AllowLocaleSwitch (gt (len .Locales) 1)}}
@@ -98,6 +109,7 @@
       <div>
         <strong>{{.Site.Title}}</strong>
         {{if .Site.FooterText}} · <span>{{.Site.FooterText}}</span>{{end}}
+        {{template "journal_colophon" .}}
       </div>
       <div style="display:flex;gap:14px;flex-wrap:wrap">
         <a href="/rss.xml" data-no-pjax>{{t .Locale "footer.rss"}}</a>

@@ -1,22 +1,20 @@
 {{define "sidebar"}}
 <aside class="studio-sidebar">
+  {{if and (themeBool .ThemeConfig "show_author_card" true) (ne .CurrentPath "/") .Site.NoticeBoard}}
+    <section class="sidebar-card">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.notice"}}</h3>
+      <div style="font-size:13px;line-height:1.8;color:var(--volo-text)">{{.Site.NoticeBoard}}</div>
+    </section>
+  {{end}}
+
   <section class="sidebar-card">
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
-      <img src="{{if .Site.LogoURL}}{{.Site.LogoURL}}{{else}}/avatars/author.svg{{end}}" alt="{{.Site.Title}}" width="46" height="46" style="border-radius:12px">
-      <div>
-        <div style="font-weight:700">{{.Site.Title}}</div>
-        <div style="font-size:.82rem;color:var(--volo-muted)">{{.Site.Subtitle}}</div>
-      </div>
+    <h3 class="sidebar-card__title">{{t .Locale "studio.links_and_feeds"}}</h3>
+    <div class="studio-side-links">
+      <a href="/links"><span>{{t .Locale "nav.links"}}</span><span>→</span></a>
+      <a href="/follows"><span>{{t .Locale "nav.follows"}}</span><span>→</span></a>
+      <a href="/dynamic"><span>{{t .Locale "nav.dynamic"}}</span><span>→</span></a>
+      <a href="/rss.xml" data-no-pjax><span>{{t .Locale "footer.rss"}}</span><span>↗</span></a>
     </div>
-    {{if .Site.Description}}<p style="margin:8px 0;font-size:.88rem;color:var(--volo-muted)">{{.Site.Description}}</p>{{end}}
-    {{if .Site.NoticeBoard}}<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--volo-raised);font-size:.84rem">{{.Site.NoticeBoard}}</div>{{end}}
-    {{if .Site.SocialLinks}}
-      <div class="tag-cloud" style="margin-top:10px">
-        {{range .Site.SocialLinks}}
-          <a class="tag-chip" href="{{.URL}}" target="_blank" rel="me noopener" data-no-pjax>{{.Label}}</a>
-        {{end}}
-      </div>
-    {{end}}
   </section>
 
   {{range .SidebarWidgets}}
@@ -26,11 +24,11 @@
   {{if .SidebarCategories}}
     <section class="sidebar-card">
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.categories"}}</h3>
-      <div style="display:flex;flex-direction:column;gap:6px">
+      <div class="studio-side-links">
         {{range .SidebarCategories}}
-          <a href="/categories/{{.Slug}}" style="display:flex;justify-content:space-between;color:var(--volo-text);font-size:.9rem">
+          <a href="/categories/{{.Slug}}">
             <span>{{.Name}}</span>
-            <span style="color:var(--volo-muted)">{{.ArticleCount}}</span>
+            <span>{{.ArticleCount}}</span>
           </a>
         {{end}}
       </div>
@@ -42,23 +40,35 @@
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.tags"}}</h3>
       <div class="tag-cloud">
         {{range .SidebarTags}}
-          <a class="tag-chip" href="/tags/{{.Slug}}">#{{.Name}} <span>{{.ArticleCount}}</span></a>
+          <a class="tag-chip" href="/tags/{{.Slug}}">{{.Name}}</a>
         {{end}}
       </div>
+    </section>
+  {{end}}
+
+  {{if and (themeBool .ThemeConfig "show_recent_posts" true) .MostViewedPosts}}
+    <section class="sidebar-card">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.popular_posts"}}</h3>
+      <ul class="studio-side-articles">
+        {{range .MostViewedPosts}}
+          <li><a href="{{.URL}}" title="{{.Title}}">{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</a></li>
+        {{end}}
+      </ul>
     </section>
   {{end}}
 
   {{if .RecentComments}}
     <section class="sidebar-card">
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.recent_comments"}}</h3>
-      <div style="display:flex;flex-direction:column;gap:10px">
+      <ul class="studio-side-articles">
         {{range .RecentComments}}
-          <a href="{{.TargetURL}}" style="color:var(--volo-text);font-size:.86rem;text-decoration:none">
-            <div><strong>{{.AuthorName}}</strong>: {{.Excerpt}}</div>
-            <div style="font-size:.78rem;color:var(--volo-muted)">{{.TargetTitle}}</div>
-          </a>
+          <li>
+            <a href="{{.TargetURL}}" title="{{.Excerpt}}">
+              <strong style="color:var(--volo-text)">{{.AuthorName}}：</strong>{{.Excerpt}}
+            </a>
+          </li>
         {{end}}
-      </div>
+      </ul>
     </section>
   {{end}}
 </aside>
@@ -66,33 +76,63 @@
 
 {{define "article_card"}}
 <article class="article__item">
-  <a class="article__cover" href="{{.Card.URL}}" aria-label="{{.Card.Title}}">
+  <a class="studio-post-cover" href="{{.Card.URL}}" tabindex="-1" aria-hidden="true">
     {{if .Card.IsPasswordProtected}}
       {{coverSVG .Card.Slug true}}
     {{else if .Card.CoverURL}}
-      <img src="{{.Card.CoverURL}}" alt="{{.Card.Title}}" loading="lazy" width="320" height="214">
+      <img src="{{.Card.CoverURL}}" alt="" loading="lazy" decoding="async" width="320" height="214">
     {{else}}
       {{coverSVG .Card.Slug false}}
     {{end}}
   </a>
-  <div>
-    <div class="article__meta-top">
-      {{if .Card.IsPinned}}<span class="volo-badge">{{t .Locale "article.pinned"}}</span>{{end}}
-      {{if .Card.IsPasswordProtected}}<span class="volo-badge">🔒 {{t .Locale "article.protected_title"}}</span>{{end}}
-      {{if .Card.HasAudio}}<span class="volo-badge">🎙 {{t .Locale "podcast.badge"}}</span>{{end}}
-      {{if .Card.CategoryName}}<a class="volo-badge" href="/categories/{{.Card.CategorySlug}}">{{.Card.CategoryName}}</a>{{end}}
-      <time datetime="{{fmtISO .Card.PublishedAt}}">{{fmtDate .Card.PublishedAt}}</time>
-    </div>
-    <h2 class="article__title"><a href="{{.Card.URL}}">{{.Card.Title}}</a></h2>
-    <p class="article__summary">{{.Card.Summary}}</p>
-    <div class="article__footer">
-      {{if not .Card.IsPasswordProtected}}
-        <span>{{t .Locale "article.reading_stats" (dict "words" .Card.WordCount "minutes" .Card.ReadingMinutes)}}</span>
-      {{end}}
+  <div class="studio-post-meta">
+    <time datetime="{{fmtISO .Card.PublishedAt}}">{{fmtTime .Card.PublishedAt "yyyy.MM.dd"}}</time>
+    <span class="studio-post-badges">
+      {{if .Card.IsPinned}}<span class="studio-badge">{{t .Locale "article.pinned"}}</span>{{end}}
+      {{if .Card.IsPasswordProtected}}<span class="studio-badge">🔒 {{t .Locale "article.protected_title"}}</span>{{end}}
+      {{if .Card.HasAudio}}<span class="studio-badge">🎙 {{t .Locale "podcast.badge"}}</span>{{end}}
+      {{if .Card.CategoryName}}<a class="studio-badge" href="/categories/{{.Card.CategorySlug}}">{{.Card.CategoryName}}</a>{{end}}
+    </span>
+  </div>
+  <h2 class="article__title"><a rel="bookmark" href="{{.Card.URL}}">{{.Card.Title}}</a></h2>
+  <p class="studio-abstract">{{.Card.Summary}}</p>
+  <div class="studio-post-foot">
+    <span class="studio-post-tags">
       {{range .Card.Tags}}
-        <a class="tag-chip" href="/tags/{{.Slug}}">#{{.Name}}</a>
+        <a href="/tags/{{.Slug}}"># {{.Name}}</a>
       {{end}}
-    </div>
+    </span>
+    <a class="article__more" href="{{.Card.URL}}" aria-label="{{t .Locale "studio.read_more"}} {{.Card.Title}}">{{t .Locale "studio.read_more"}} <span aria-hidden="true">↗</span></a>
   </div>
 </article>
+{{end}}
+
+{{define "pagination"}}
+{{if gt .TotalPages 1}}
+  <nav class="pagination" aria-label="Pagination">
+    {{if gt .Page 1}}
+      <a class="pagination__item" href="{{pageURL .BasePath (sub .Page 1)}}">←</a>
+    {{end}}
+    {{if .Pagination.PageNumbers}}
+      {{if .Pagination.ShowFirst}}
+        <a class="pagination__item" href="{{pageURL .BasePath 1}}">1</a>
+        <span style="color:var(--volo-muted)">…</span>
+      {{end}}
+      {{range .Pagination.PageNumbers}}
+        {{if eq . $.Page}}
+          <span class="pagination__item pagination__item--current" aria-current="page">{{.}}</span>
+        {{else}}
+          <a class="pagination__item" href="{{pageURL $.BasePath .}}">{{.}}</a>
+        {{end}}
+      {{end}}
+      {{if .Pagination.ShowLast}}
+        <span style="color:var(--volo-muted)">…</span>
+        <a class="pagination__item" href="{{pageURL .BasePath .TotalPages}}">{{.TotalPages}}</a>
+      {{end}}
+    {{end}}
+    {{if lt .Page .TotalPages}}
+      <a class="pagination__item" href="{{pageURL .BasePath (add .Page 1)}}">→</a>
+    {{end}}
+  </nav>
+{{end}}
 {{end}}

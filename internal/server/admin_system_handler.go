@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -106,6 +108,9 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case sub == "themes" || strings.HasPrefix(sub, "themes/"):
 		s.handleAdminThemes(w, r, actor, strings.TrimPrefix(sub, "themes"))
+
+	case sub == "locales" || strings.HasPrefix(sub, "locales/"):
+		s.handleAdminLocales(w, r, actor, strings.TrimPrefix(sub, "locales"))
 
 	case sub == "plugins" || strings.HasPrefix(sub, "plugins/"):
 		s.handleAdminPlugins(w, r, actor, strings.TrimPrefix(sub, "plugins"))
@@ -570,15 +575,23 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 
 func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
-	switch {
-	case rest == "" && r.Method == http.MethodGet:
+	locale := actor.PreferredLocale
+	if locale == "" {
+		locale = s.resolveLocale(r)
+	}
+
+	if rest == "" && r.Method == http.MethodGet {
 		_ = s.deps.Themes.Reload()
+		snap := s.deps.Settings.Snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"active_theme": s.deps.Settings.Snapshot().Appearance.ActiveTheme,
-			"appearance":   s.deps.Settings.Snapshot().Appearance,
-			"themes":       s.deps.Themes.List(),
+			"active_theme": snap.Appearance.ActiveTheme,
+			"appearance":   snap.Appearance,
+			"themes":       s.deps.Themes.ListLocalized(locale),
 		})
-	case rest == "activate" && r.Method == http.MethodPost:
+		return
+	}
+
+	if rest == "activate" && r.Method == http.MethodPost {
 		var req struct {
 			ThemeID string `json:"theme_id"`
 		}
@@ -599,9 +612,285 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		}
 		s.recordAuditLog(r, actor, "theme.activate", "theme", req.ThemeID, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"appearance": val, "version": ver})
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
 	}
+
+	if rest == "install" && r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 33<<20)
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme .zip upload exceeds 32MB limit"})
+			return
+		}
+		f, _, err := r.FormFile("file")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
+			return
+		}
+		defer f.Close()
+		tmp, err := os.CreateTemp(s.deps.Config.DataDir, "volo-theme-*.zip")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName)
+		sz, err := io.Copy(tmp, io.LimitReader(f, 32<<20+1))
+		if err != nil {
+			_ = tmp.Close()
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		_, _ = tmp.Seek(0, io.SeekStart)
+		overwrite := r.FormValue("overwrite") == "1" || strings.EqualFold(r.FormValue("overwrite"), "true")
+		mf, iErr := s.deps.Themes.InstallZip(tmp, sz, overwrite)
+		_ = tmp.Close()
+		if iErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": iErr.Error()})
+			return
+		}
+		s.recordAuditLog(r, actor, "theme.install", "theme", mf.ID, map[string]any{"version": mf.Version})
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"theme":  mf,
+			"themes": s.deps.Themes.ListLocalized(locale),
+		})
+		return
+	}
+
+	parts := strings.Split(rest, "/")
+	themeID := strings.TrimSpace(parts[0])
+	if len(parts) == 2 && parts[1] == "config" && (r.Method == http.MethodPut || r.Method == http.MethodPatch) {
+		if !s.deps.Themes.Has(themeID) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "theme not found: " + themeID})
+			return
+		}
+		var cfgPatch map[string]any
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&cfgPatch); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		cur := s.deps.Settings.Snapshot().Appearance
+		nextConfigs := make(map[string]map[string]any, len(cur.ThemeConfigs)+1)
+		for k, v := range cur.ThemeConfigs {
+			copied := make(map[string]any, len(v))
+			for ck, cv := range v {
+				copied[ck] = cv
+			}
+			nextConfigs[k] = copied
+		}
+		nextConfigs[themeID] = cfgPatch
+		patchBytes, _ := json.Marshal(map[string]any{"theme_configs": nextConfigs})
+		val, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.recordAuditLog(r, actor, "theme.config", "theme", themeID, nil)
+		writeJSON(w, http.StatusOK, map[string]any{"appearance": val, "version": ver})
+		return
+	}
+
+	if len(parts) == 1 && themeID != "" && r.Method == http.MethodDelete {
+		if err := s.deps.Themes.Uninstall(themeID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if s.deps.Settings.Snapshot().Appearance.ActiveTheme == themeID {
+			patchBytes, _ := json.Marshal(map[string]any{"active_theme": "volo-studio"})
+			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
+		}
+		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"active_theme": s.deps.Settings.Snapshot().Appearance.ActiveTheme,
+			"themes":       s.deps.Themes.ListLocalized(locale),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+func (s *AppServer) ensureLocalesDirReady() string {
+	if s.deps.Catalog == nil {
+		return ""
+	}
+	dir := s.deps.Catalog.ExternalDir()
+	if dir == "" && s.deps.Config != nil {
+		if strings.TrimSpace(s.deps.Config.LocalesDir) != "" {
+			dir = s.deps.Config.LocalesDir
+		} else if strings.TrimSpace(s.deps.Config.DataDir) != "" {
+			dir = filepath.Join(s.deps.Config.DataDir, "locales")
+		}
+		if dir != "" {
+			_ = s.deps.Catalog.Reload(dir)
+		}
+	}
+	return dir
+}
+
+func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
+	rest = strings.TrimPrefix(rest, "/")
+	extDir := s.ensureLocalesDirReady()
+
+	if rest == "" && r.Method == http.MethodGet {
+		snap := s.deps.Settings.Snapshot()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"locales_dir":         extDir,
+			"default_locale":      snap.Site.DefaultLocale,
+			"allow_locale_switch": snap.Site.AllowLocaleSwitch,
+			"items":               s.deps.Catalog.Packs(),
+			"locales":             s.deps.Catalog.Locales(),
+		})
+		return
+	}
+
+	if rest == "reload" && r.Method == http.MethodPost {
+		if err := s.deps.Catalog.ReloadDir(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if s.deps.Themes != nil {
+			_ = s.deps.Themes.Reload()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"items":   s.deps.Catalog.Packs(),
+			"locales": s.deps.Catalog.Locales(),
+		})
+		return
+	}
+
+	if rest == "install" && r.Method == http.MethodPost {
+		ct := strings.ToLower(r.Header.Get("Content-Type"))
+		if strings.HasPrefix(ct, "application/json") {
+			var req struct {
+				Code      string            `json:"code"`
+				Messages  map[string]string `json:"messages"`
+				Overwrite *bool             `json:"overwrite"`
+			}
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				return
+			}
+			raw, _ := json.Marshal(req.Messages)
+			ow := req.Overwrite == nil || *req.Overwrite
+			sum, err := s.deps.Catalog.InstallPackJSON(req.Code, raw, ow)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			if s.deps.Themes != nil {
+				_ = s.deps.Themes.Reload()
+			}
+			s.recordAuditLog(r, actor, "locale.install", "locale", sum.Code, nil)
+			writeJSON(w, http.StatusCreated, map[string]any{
+				"pack":    sum,
+				"items":   s.deps.Catalog.Packs(),
+				"locales": s.deps.Catalog.Locales(),
+			})
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "language pack upload exceeds 8MB limit"})
+			return
+		}
+		f, hdr, err := r.FormFile("file")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
+			return
+		}
+		defer f.Close()
+		raw, err := io.ReadAll(io.LimitReader(f, 8<<20+1))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		overwrite := r.FormValue("overwrite") == "" || r.FormValue("overwrite") == "1" || strings.EqualFold(r.FormValue("overwrite"), "true")
+		fname := strings.TrimSpace(hdr.Filename)
+		if strings.HasSuffix(strings.ToLower(fname), ".zip") {
+			installed, zErr := s.deps.Catalog.InstallPackZip(bytes.NewReader(raw), int64(len(raw)), overwrite)
+			if zErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": zErr.Error()})
+				return
+			}
+			if s.deps.Themes != nil {
+				_ = s.deps.Themes.Reload()
+			}
+			s.recordAuditLog(r, actor, "locale.install_zip", "locale", installed[0].Code, map[string]any{"count": len(installed)})
+			writeJSON(w, http.StatusCreated, map[string]any{
+				"installed": installed,
+				"items":     s.deps.Catalog.Packs(),
+				"locales":   s.deps.Catalog.Locales(),
+			})
+			return
+		}
+
+		codeHint := strings.TrimSpace(r.FormValue("code"))
+		if codeHint == "" {
+			var peek map[string]string
+			if json.Unmarshal(raw, &peek) == nil && strings.TrimSpace(peek["meta.code"]) != "" {
+				codeHint = strings.TrimSpace(peek["meta.code"])
+			} else {
+				codeHint = strings.TrimSuffix(filepath.Base(fname), filepath.Ext(fname))
+			}
+		}
+		sum, jErr := s.deps.Catalog.InstallPackJSON(codeHint, raw, overwrite)
+		if jErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": jErr.Error()})
+			return
+		}
+		if s.deps.Themes != nil {
+			_ = s.deps.Themes.Reload()
+		}
+		s.recordAuditLog(r, actor, "locale.install", "locale", sum.Code, nil)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"pack":    sum,
+			"items":   s.deps.Catalog.Packs(),
+			"locales": s.deps.Catalog.Locales(),
+		})
+		return
+	}
+
+	parts := strings.Split(rest, "/")
+	code := strings.TrimSpace(parts[0])
+	if len(parts) == 2 && parts[1] == "export" && r.Method == http.MethodGet {
+		data, err := s.deps.Catalog.ExportPackJSON(code)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		resolved := s.deps.Catalog.Match(code, "")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.json"`, resolved))
+		_, _ = w.Write(data)
+		return
+	}
+
+	if len(parts) == 1 && code != "" && r.Method == http.MethodDelete {
+		if err := s.deps.Catalog.DeleteExternalPack(code); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if s.deps.Themes != nil {
+			_ = s.deps.Themes.Reload()
+		}
+		snap := s.deps.Settings.Snapshot()
+		if !s.deps.Catalog.Has(snap.Site.DefaultLocale) {
+			patch, _ := json.Marshal(map[string]any{"default_locale": "zh-CN"})
+			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, patch, 0)
+		}
+		s.recordAuditLog(r, actor, "locale.delete", "locale", code, nil)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"items":   s.deps.Catalog.Packs(),
+			"locales": s.deps.Catalog.Locales(),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {

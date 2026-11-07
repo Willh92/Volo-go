@@ -570,6 +570,10 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		default:
 			return nil, fmt.Errorf("settings: invalid appearance.accent %q", v.Accent)
 		}
+		v.CustomCSS = sanitizeCustomCSS(v.CustomCSS)
+		if v.ThemeConfigs == nil {
+			v.ThemeConfigs = map[string]map[string]any{}
+		}
 		return json.Marshal(v)
 	case domain.SettingsDomainBackup:
 		var v domain.BackupSettings
@@ -615,4 +619,24 @@ func parseClearSecretsList(v any) map[string]bool {
 		}
 	}
 	return out
+}
+
+func sanitizeCustomCSS(css string) string {
+	s := strings.TrimSpace(css)
+	if s == "" {
+		return ""
+	}
+	// Strip any case variation of `</style` or `<script` so inline `<style>` injection can never break out into HTML/JS.
+	for {
+		lower := strings.ToLower(s)
+		idx := strings.Index(lower, "</style")
+		if idx < 0 {
+			idx = strings.Index(lower, "<script")
+		}
+		if idx < 0 {
+			break
+		}
+		s = s[:idx] + s[idx+7:]
+	}
+	return s
 }

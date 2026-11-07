@@ -1,0 +1,65 @@
+{{define "content"}}
+<section class="studio-hero">
+  <h1 class="studio-hero__title">{{.HeroTitle}}</h1>
+  {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+</section>
+
+<div class="studio-layout">
+  <div style="display:flex;flex-direction:column;gap:18px">
+    <section class="studio-article">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;text-align:center">
+        <div style="padding:12px;border-radius:10px;background:var(--volo-raised)">
+          <div style="font-size:1.35rem;font-weight:700">{{.Stats.ArticleCount}}</div>
+          <div style="font-size:.82rem;color:var(--volo-muted)">{{t .Locale "stats.articles"}}</div>
+        </div>
+        <div style="padding:12px;border-radius:10px;background:var(--volo-raised)">
+          <div style="font-size:1.35rem;font-weight:700">{{.Stats.CategoryCount}}</div>
+          <div style="font-size:.82rem;color:var(--volo-muted)">{{t .Locale "stats.categories"}}</div>
+        </div>
+        <div style="padding:12px;border-radius:10px;background:var(--volo-raised)">
+          <div style="font-size:1.35rem;font-weight:700">{{.Stats.TagCount}}</div>
+          <div style="font-size:.82rem;color:var(--volo-muted)">{{t .Locale "stats.tags"}}</div>
+        </div>
+        <div style="padding:12px;border-radius:10px;background:var(--volo-raised)">
+          <div style="font-size:1.35rem;font-weight:700">{{.Stats.CommentCount}}</div>
+          <div style="font-size:.82rem;color:var(--volo-muted)">{{t .Locale "stats.comments"}}</div>
+        </div>
+      </div>
+    </section>
+
+    {{if .RecentComments}}
+      <section class="studio-article">
+        <h2 style="margin:0 0 14px;font-size:1.1rem">{{t .Locale "sidebar.recent_comments"}}</h2>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          {{range .RecentComments}}
+            <a href="{{.TargetURL}}" style="padding:12px 14px;border-radius:10px;background:var(--volo-raised);color:var(--volo-text);text-decoration:none">
+              <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
+                <strong>{{.AuthorName}}</strong>
+                <time datetime="{{fmtISO .CreatedAt}}" style="font-size:.78rem;color:var(--volo-muted)">{{fmtDateTime .CreatedAt}}</time>
+              </div>
+              <div style="font-size:.92rem">{{.Excerpt}}</div>
+              <div style="font-size:.8rem;color:var(--volo-muted);margin-top:4px">→ {{.TargetTitle}}</div>
+            </a>
+          {{end}}
+        </div>
+      </section>
+    {{end}}
+
+    {{if .RecentPosts}}
+      <section class="studio-article">
+        <h2 style="margin:0 0 14px;font-size:1.1rem">{{t .Locale "sidebar.recent_posts"}}</h2>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          {{range .RecentPosts}}
+            <a href="{{.URL}}" style="display:flex;justify-content:space-between;gap:12px;padding:10px 14px;border-radius:10px;background:var(--volo-raised);color:var(--volo-text);text-decoration:none">
+              <strong>{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</strong>
+              <time datetime="{{fmtISO .PublishedAt}}" style="font-size:.82rem;color:var(--volo-muted);flex-shrink:0">{{fmtDate .PublishedAt}}</time>
+            </a>
+          {{end}}
+        </div>
+      </section>
+    {{end}}
+  </div>
+
+  {{template "sidebar" .}}
+</div>
+{{end}}

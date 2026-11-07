@@ -29,6 +29,9 @@ var ErrProtectedForbidden = errors.New("visibility: article is password-protecte
 // PublicArticleCard is the strictly redacted view model for home, category, tag, archive, and series lists.
 type PublicArticleCard struct {
 	ID                  string       `json:"id"`
+	AuthorID            string       `json:"author_id,omitempty"`
+	AuthorName          string       `json:"author_name,omitempty"`
+	AuthorAvatarURL     string       `json:"author_avatar_url,omitempty"`
 	Title               string       `json:"title"`
 	Slug                string       `json:"slug"`
 	URL                 string       `json:"url"`
@@ -41,6 +44,7 @@ type PublicArticleCard struct {
 	Lang                string       `json:"lang"`
 	PublishedAt         int64        `json:"published_at"`
 	UpdatedAt           int64        `json:"updated_at"`
+	HasUpdated          bool         `json:"has_updated"`
 	IsPinned            bool         `json:"is_pinned"`
 	IsPasswordProtected bool         `json:"is_password_protected"`
 	HasContentLock      bool         `json:"has_content_lock"`
@@ -74,6 +78,9 @@ type PublicArticleView struct {
 	ID                  string                 `json:"id"`
 	AuthorID            string                 `json:"author_id"`
 	AuthorName          string                 `json:"author_name"`
+	AuthorAvatarURL     string                 `json:"author_avatar_url,omitempty"`
+	AuthorBio           string                 `json:"author_bio,omitempty"`
+	AuthorWebsiteURL    string                 `json:"author_website_url,omitempty"`
 	CategoryID          string                 `json:"category_id,omitempty"`
 	CategoryName        string                 `json:"category_name,omitempty"`
 	CategorySlug        string                 `json:"category_slug,omitempty"`
@@ -85,6 +92,8 @@ type PublicArticleView struct {
 	HTML                string                 `json:"html"`
 	CoverURL            string                 `json:"cover_url,omitempty"`
 	OGImageURL          string                 `json:"og_image_url,omitempty"`
+	IsPinned            bool                   `json:"is_pinned"`
+	HasUpdated          bool                   `json:"has_updated"`
 	AllowComment        bool                   `json:"allow_comment"`
 	IsPasswordProtected bool                   `json:"is_password_protected"`
 	RequiresPassword    bool                   `json:"requires_password"`
@@ -351,6 +360,7 @@ func ApplyNoIndexPrivateHeaders(w http.ResponseWriter) {
 func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Category, tags []domain.Tag, lookupDims func(string) (int, int, bool)) PublicArticleCard {
 	card := PublicArticleCard{
 		ID:             raw.ID,
+		AuthorID:       raw.AuthorID,
 		Title:          raw.Title,
 		Slug:           raw.Slug,
 		URL:            ArticlePath(raw.Slug),
@@ -359,6 +369,7 @@ func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Categor
 		Lang:           raw.Lang,
 		PublishedAt:    raw.PublishedAt,
 		UpdatedAt:      raw.UpdatedAt,
+		HasUpdated:     raw.PublishedAt > 0 && raw.UpdatedAt > raw.PublishedAt+60_000,
 		IsPinned:       raw.IsPinned,
 		HasContentLock: raw.HasContentLock,
 		WordCount:      raw.WordCount,
@@ -465,6 +476,9 @@ func (g *Guard) ToNeighbor(raw domain.RawArticle) PublicNeighbor {
 type DetailRenderDeps struct {
 	Locale            string
 	AuthorName        string
+	AuthorAvatarURL   string
+	AuthorBio         string
+	AuthorWebsiteURL  string
 	Category          *domain.Category
 	Tags              []domain.Tag
 	Translations      []TranslationAlternate
@@ -497,11 +511,16 @@ func (g *Guard) ToDetail(
 		ID:                  raw.ID,
 		AuthorID:            raw.AuthorID,
 		AuthorName:          deps.AuthorName,
+		AuthorAvatarURL:     deps.AuthorAvatarURL,
+		AuthorBio:           deps.AuthorBio,
+		AuthorWebsiteURL:    deps.AuthorWebsiteURL,
 		CategoryID:          raw.CategoryID,
 		Tags:                deps.Tags,
 		Title:               raw.Title,
 		Slug:                raw.Slug,
 		URL:                 artURL,
+		IsPinned:            raw.IsPinned,
+		HasUpdated:          raw.PublishedAt > 0 && raw.UpdatedAt > raw.PublishedAt+60_000,
 		AllowComment:        raw.AllowComment,
 		IsPasswordProtected: isWholeProtected,
 		UnlockedViaShare:    status.ViaShareToken,

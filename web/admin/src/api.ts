@@ -1,5 +1,11 @@
 import { signal } from "@preact/signals";
-import { localeSig, normalizeLocale } from "./i18n";
+import {
+  ensureLocaleLoaded,
+  LocaleOption,
+  localeSig,
+  normalizeLocale,
+  registerExternalLocales,
+} from "./i18n";
 
 export interface BootConfig {
   mode: "console" | "setup";
@@ -9,6 +15,7 @@ export interface BootConfig {
   accent: string;
   default_theme: string;
   site_title: string;
+  locales?: LocaleOption[];
 }
 
 export interface StaffUser {
@@ -39,16 +46,24 @@ export function readBootConfig(): BootConfig {
     default_locale: "zh-CN",
     accent: "forest",
     default_theme: "auto",
-    site_title: "Volo Blog",
+    site_title: "Volo",
   };
 }
 
 export const bootConfig = readBootConfig();
+if (bootConfig.locales) {
+  registerExternalLocales(bootConfig.locales);
+}
+
 export const csrfTokenSig = signal<string>("");
 export const currentUserSig = signal<StaffUser | null>(null);
 export const toastSig = signal<string>("");
-export const themeModeSig = signal<string>(localStorage.getItem("volo_console_theme") || bootConfig.default_theme || "auto");
-export const accentSig = signal<string>(bootConfig.accent || "forest");
+export const themeModeSig = signal<string>(
+  localStorage.getItem("volo_console_theme") || bootConfig.default_theme || "auto"
+);
+export const accentSig = signal<string>(
+  localStorage.getItem("volo_console_accent") || bootConfig.accent || "forest"
+);
 
 let toastTimer: number | undefined;
 export function showToast(msg: string) {
@@ -59,18 +74,24 @@ export function showToast(msg: string) {
   }, 3400);
 }
 
-export function applyThemeAttributes(mode: string, accent: string) {
-  themeModeSig.value = mode;
-  accentSig.value = accent || "forest";
-  localStorage.setItem("volo_console_theme", mode);
-  document.documentElement.setAttribute("data-accent", accentSig.value);
+export function applyThemeAttributes(mode: string, accent: string, persistAccent = false) {
+  const cleanMode = mode || "auto";
+  const cleanAccent = accent || "forest";
+  themeModeSig.value = cleanMode;
+  accentSig.value = cleanAccent;
+  localStorage.setItem("volo_console_theme", cleanMode);
+  if (persistAccent) {
+    localStorage.setItem("volo_console_accent", cleanAccent);
+  }
+  document.documentElement.setAttribute("data-mode", cleanMode);
+  document.documentElement.setAttribute("data-accent", cleanAccent);
 
   let dark = false;
-  if (mode === "dark") {
+  if (cleanMode === "dark") {
     dark = true;
-  } else if (mode === "system") {
+  } else if (cleanMode === "system") {
     dark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ?? false;
-  } else if (mode === "auto") {
+  } else if (cleanMode === "auto") {
     const h = new Date().getHours();
     dark = h < 6 || h >= 19 || (window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ?? false);
   }
@@ -129,10 +150,13 @@ export async function refreshMe(): Promise<StaffUser | null> {
     currentUserSig.value = data.user;
     csrfTokenSig.value = data.csrf_token || "";
     if (data.user?.preferred_locale) {
-      localeSig.value = normalizeLocale(data.user.preferred_locale);
+      const nextLoc = normalizeLocale(data.user.preferred_locale);
+      localeSig.value = nextLoc;
+      void ensureLocaleLoaded(nextLoc);
     }
-    if (data.appearance?.accent) {
-      applyThemeAttributes(themeModeSig.value, data.appearance.accent);
+    const savedAccent = localStorage.getItem("volo_console_accent");
+    if (!savedAccent && data.appearance?.accent) {
+      applyThemeAttributes(themeModeSig.value, data.appearance.accent, false);
     }
     return data.user;
   } catch {

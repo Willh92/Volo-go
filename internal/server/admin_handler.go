@@ -65,6 +65,7 @@ func (s *AppServer) handleAdminSPA(w http.ResponseWriter, r *http.Request) {
 		Accent:        snap.Appearance.Accent,
 		DefaultTheme:  snap.Appearance.DefaultMode,
 		SiteTitle:     snap.Site.Title,
+		Locales:       s.deps.Catalog.Locales(),
 	})
 }
 
@@ -692,39 +693,87 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 	if s.deps.Content != nil {
 		_ = s.deps.Content.FlushAnalytics(r.Context())
 	}
-	var pubCnt, draftCnt, schedCnt, pageCnt, cmtPending, mediaCnt int
+	var pubCnt, draftCnt, schedCnt, protCnt, pageCnt, cmtPending, mediaCnt int
 	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'published'`).Scan(&pubCnt)
 	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'draft'`).Scan(&draftCnt)
 	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'scheduled'`).Scan(&schedCnt)
+	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE password_ciphertext <> '' OR has_content_lock = ?`, true).Scan(&protCnt)
 	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM pages`).Scan(&pageCnt)
 	if actor.Role == domain.RoleAdmin {
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM comments WHERE status = 'pending' AND is_deleted = 0`).Scan(&cmtPending)
+		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM comments WHERE status = 'pending' AND is_deleted = ?`, false).Scan(&cmtPending)
 	} else {
 		_ = s.deps.Store.QueryRowContext(r.Context(),
 			`SELECT COUNT(*) FROM comments c INNER JOIN articles a ON c.target_type = 'article' AND c.target_id = a.id
-			 WHERE a.author_id = ? AND c.status = 'pending' AND c.is_deleted = 0`, actor.ID).Scan(&cmtPending)
+			 WHERE a.author_id = ? AND c.status = 'pending' AND c.is_deleted = ?`, actor.ID, false).Scan(&cmtPending)
 	}
 	_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM media_assets`).Scan(&mediaCnt)
 
-	cutoffDate := time.Now().AddDate(0, 0, -29).Format("2006-01-02")
+	windowDays := 30
+	if rawDays, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("days"))); err == nil && rawDays == 7 {
+		windowDays = 7
+	}
+	now := time.Now()
+	cutoffDate := now.AddDate(0, 0, -(windowDays - 1)).Format("2006-01-02")
 	trend, _ := sqlx.Select[domain.AnalyticsDaily](r.Context(), s.deps.Store,
 		`SELECT * FROM analytics_daily WHERE stat_date >= ? ORDER BY stat_date ASC`, cutoffDate)
 	if trend == nil {
 		trend = []domain.AnalyticsDaily{}
 	}
-	topPosts, _ := sqlx.Select[struct {
+	byDate := make(map[string]domain.AnalyticsDaily, len(trend))
+	for _, pt := range trend {
+		byDate[pt.StatDate] = pt
+	}
+	series := make([]domain.AnalyticsDaily, 0, windowDays)
+	for i := windowDays - 1; i >= 0; i-- {
+		d := now.AddDate(0, 0, -i).Format("2006-01-02")
+		if pt, ok := byDate[d]; ok {
+			series = append(series, pt)
+		} else {
+			series = append(series, domain.AnalyticsDaily{StatDate: d, PV: 0, UV: 0})
+		}
+	}
+
+	rawTopPosts, _ := sqlx.Select[struct {
 		ItemKey string `db:"item_key" json:"item_key"`
 		Hits    int64  `db:"hits" json:"hits"`
 	}](r.Context(), s.deps.Store,
 		`SELECT item_key, SUM(hits) AS hits FROM analytics_top_items
 		 WHERE stat_date >= ? AND kind = 'article' GROUP BY item_key ORDER BY hits DESC LIMIT 10`, cutoffDate)
 
-	topReferers, _ := sqlx.Select[struct {
+	type topArticleView struct {
+		ItemKey string `json:"item_key"`
+		ID      string `json:"id"`
+		Title   string `json:"title"`
+		Slug    string `json:"slug"`
+		Hits    int64  `json:"hits"`
+	}
+	topPosts := make([]topArticleView, 0, len(rawTopPosts))
+	for _, tp := range rawTopPosts {
+		var title, slug string
+		_ = s.deps.Store.QueryRowContext(r.Context(),
+			`SELECT title, slug FROM articles WHERE id = ? OR slug = ? LIMIT 1`, tp.ItemKey, tp.ItemKey).Scan(&title, &slug)
+		if title == "" {
+			title = tp.ItemKey
+		}
+		topPosts = append(topPosts, topArticleView{
+			ItemKey: tp.ItemKey,
+			ID:      tp.ItemKey,
+			Title:   title,
+			Slug:    slug,
+			Hits:    tp.Hits,
+		})
+	}
+
+	type topRefererView struct {
 		ItemKey string `db:"item_key" json:"item_key"`
 		Hits    int64  `db:"hits" json:"hits"`
-	}](r.Context(), s.deps.Store,
+	}
+	topReferers, _ := sqlx.Select[topRefererView](r.Context(), s.deps.Store,
 		`SELECT item_key, SUM(hits) AS hits FROM analytics_top_items
 		 WHERE stat_date >= ? AND kind = 'referer' GROUP BY item_key ORDER BY hits DESC LIMIT 10`, cutoffDate)
+	if topReferers == nil {
+		topReferers = []topRefererView{}
+	}
 
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
@@ -754,20 +803,23 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 			"published":        pubCnt,
 			"drafts":           draftCnt,
 			"scheduled":        schedCnt,
+			"protected":        protCnt,
 			"pages":            pageCnt,
 			"pending_comments": cmtPending,
 			"media":            mediaCnt,
 		},
-		"analytics_daily": trend,
-		"top_articles":    topPosts,
-		"top_referers":    topReferers,
-		"quick_inserts":   quickInserts,
-		"plugin_cards":    dashCards,
-		"runtime_dialect": s.deps.Store.Dialect().Name(),
-		"uptime_seconds":  int64(time.Since(s.deps.StartedAt).Seconds()),
-		"heap_alloc_mb":   float64(mem.Alloc) / (1024 * 1024),
-		"goroutines":      runtime.NumGoroutine(),
-		"admin_bundle_kb": float64(adminui.Default().TotalGzipBytes()) / 1024.0,
+		"window_days":      windowDays,
+		"analytics_daily":  trend,
+		"analytics_series": series,
+		"top_articles":     topPosts,
+		"top_referers":     topReferers,
+		"quick_inserts":    quickInserts,
+		"plugin_cards":     dashCards,
+		"runtime_dialect":  s.deps.Store.Dialect().Name(),
+		"uptime_seconds":   int64(time.Since(s.deps.StartedAt).Seconds()),
+		"heap_alloc_mb":    float64(mem.Alloc) / (1024 * 1024),
+		"goroutines":       runtime.NumGoroutine(),
+		"admin_bundle_kb":  float64(adminui.Default().TotalGzipBytes()) / 1024.0,
 	})
 }
 
@@ -840,7 +892,10 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				where = append(where, "author_id = ?")
 				args = append(args, actor.ID)
 			}
-			if status != "" && status != "all" {
+			if status == "protected" {
+				where = append(where, "(password_ciphertext <> '' OR has_content_lock = ?)")
+				args = append(args, true)
+			} else if status != "" && status != "all" {
 				where = append(where, "status = ?")
 				args = append(args, status)
 			}
@@ -867,7 +922,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			}
 			items := make([]map[string]any, 0, len(rows))
 			for _, row := range rows {
-				hasPwd := strings.TrimSpace(row.PasswordCiphertext) != ""
+				hasPwd := strings.TrimSpace(row.PasswordCiphertext) != "" || row.HasContentLock
 				row.PasswordCiphertext = ""
 				items = append(items, map[string]any{
 					"article":               row,

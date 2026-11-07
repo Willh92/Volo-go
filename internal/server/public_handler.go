@@ -168,6 +168,9 @@ func (s *AppServer) Close(ctx context.Context) error {
 
 func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", NewHealthzHandler(s.deps.Store, s.deps.StartedAt))
+	mux.HandleFunc("/favicon.svg", s.handleServeFaviconSVG)
+	mux.HandleFunc("/assets/favicon.svg", s.handleServeFaviconSVG)
+	mux.HandleFunc("/favicon.ico", s.handleServeFaviconICO)
 	mux.HandleFunc("/uploads/", s.handleServeUpload)
 	mux.HandleFunc("/themes/", s.handleServeThemeAsset)
 	mux.HandleFunc("/avatars/", s.handleServeAvatar)
@@ -186,6 +189,8 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/github-stats/", s.handleGitHubStatsSVG)
 
 	// Public JSON v1 APIs
+	mux.HandleFunc("/api/v1/i18n", s.handlePublicI18nAPI)
+	mux.HandleFunc("/api/v1/i18n/", s.handlePublicI18nAPI)
 	mux.HandleFunc("/api/v1/pow/challenge", s.handlePoWChallenge)
 	mux.HandleFunc("/api/v1/guest/passport", s.handleGuestPassport)
 	mux.HandleFunc("/api/v1/search", s.handleSearchAPI)
@@ -198,6 +203,16 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/reader/login", s.handleReaderLogin)
 	mux.HandleFunc("/api/v1/reader/logout", s.handleReaderLogout)
 	mux.HandleFunc("/api/v1/reader/claim-guest-comments", s.handleReaderClaimComments)
+
+	// Legacy Bolo-Solo 301 Canonical Skin Routes
+	mux.HandleFunc("/archives.html", s.permanentRedirectTo("/archives"))
+	mux.HandleFunc("/tags.html", s.permanentRedirectTo("/tags"))
+	mux.HandleFunc("/categories.html", s.permanentRedirectTo("/categories"))
+	mux.HandleFunc("/links.html", s.permanentRedirectTo("/links"))
+	mux.HandleFunc("/follows.html", s.permanentRedirectTo("/follows"))
+	mux.HandleFunc("/dynamic.html", s.permanentRedirectTo("/dynamic"))
+	mux.HandleFunc("/category/", s.handleLegacyCategoryRedirect)
+	mux.HandleFunc("/articles/", s.handleLegacyArticleRedirect)
 
 	// Public Studio HTML Routes
 	mux.HandleFunc("/posts/", s.handlePostRoute)
@@ -213,6 +228,7 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/books/", s.handleBookReader)
 	mux.HandleFunc("/links", s.handleLinksPage)
 	mux.HandleFunc("/follows", s.handleFollowsPage)
+	mux.HandleFunc("/dynamic", s.handleDynamicPage)
 	mux.HandleFunc("/reader/login", s.handleReaderAuthPage)
 	mux.HandleFunc("/", s.handleRootOrStandalonePage)
 }
@@ -235,6 +251,9 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 			!strings.HasPrefix(p, "/uploads/") &&
 			!strings.HasPrefix(p, "/plugins/") &&
 			!strings.HasPrefix(p, "/avatars/") &&
+			p != "/favicon.svg" &&
+			p != "/favicon.ico" &&
+			p != "/assets/favicon.svg" &&
 			p != "/healthz" {
 			if target, code, ok := s.deps.Content.ResolveRedirect(r.Context(), p); ok {
 				dest := target
@@ -309,12 +328,63 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 
 func (s *AppServer) handleServeThemeAsset(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/themes/")
+	if strings.HasSuffix(rest, "/preview") {
+		themeID := strings.TrimSuffix(rest, "/preview")
+		if themeID == "" || strings.Contains(themeID, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		s.deps.Themes.ServePreview(w, r, themeID)
+		return
+	}
 	parts := strings.SplitN(rest, "/assets/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		http.NotFound(w, r)
 		return
 	}
 	s.deps.Themes.ServeAsset(w, r, parts[0], parts[1])
+}
+
+func (s *AppServer) permanentRedirectTo(target string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		dest := target
+		if r.URL.RawQuery != "" {
+			dest += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, dest, http.StatusMovedPermanently)
+	}
+}
+
+func (s *AppServer) handleLegacyCategoryRedirect(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/category/"), ".html")
+	if slug == "" {
+		http.Redirect(w, r, "/categories", http.StatusMovedPermanently)
+		return
+	}
+	dest := "/categories/" + slug
+	if r.URL.RawQuery != "" {
+		dest += "?" + r.URL.RawQuery
+	}
+	http.Redirect(w, r, dest, http.StatusMovedPermanently)
+}
+
+func (s *AppServer) handleLegacyArticleRedirect(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.Trim(strings.TrimPrefix(r.URL.Path, "/articles/"), "/")
+	if trimmed == "" {
+		http.Redirect(w, r, "/archives", http.StatusMovedPermanently)
+		return
+	}
+	parts := strings.Split(trimmed, "/")
+	slug := strings.TrimSuffix(parts[len(parts)-1], ".html")
+	if slug == "" || strings.Contains(slug, "..") {
+		http.NotFound(w, r)
+		return
+	}
+	dest := "/posts/" + slug
+	if r.URL.RawQuery != "" {
+		dest += "?" + r.URL.RawQuery
+	}
+	http.Redirect(w, r, dest, http.StatusMovedPermanently)
 }
 
 func (s *AppServer) handleServeAvatar(w http.ResponseWriter, r *http.Request) {
@@ -448,6 +518,31 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (s *AppServer) handlePublicI18nAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	snap := s.deps.Settings.Snapshot()
+	requested := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/i18n"), "/")
+	requested = strings.TrimSuffix(requested, ".json")
+	if requested == "" {
+		requested = strings.TrimSpace(r.URL.Query().Get("locale"))
+	}
+	if requested == "" {
+		requested = s.resolveLocale(r)
+	}
+	resolved := s.deps.Catalog.Match(requested, snap.Site.DefaultLocale)
+	w.Header().Set("Cache-Control", "no-cache")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"locale":          resolved,
+		"dir":             s.deps.Catalog.Dir(resolved),
+		"locales":         s.deps.Catalog.Locales(),
+		"messages":        s.deps.Catalog.Map(resolved),
+		"custom_messages": s.deps.Catalog.CustomMap(resolved),
+	})
 }
 
 func (s *AppServer) handlePoWChallenge(w http.ResponseWriter, r *http.Request) {
@@ -874,6 +969,7 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 	cats, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
 	tags, _ := s.deps.Content.ListTagsWithCounts(r.Context(), snap.Reading.PopularTagsCount)
 	recentComments, _ := s.deps.Content.ListRecentPublicComments(r.Context(), snap.Reading.RecentCommentsCount)
+	extras := s.deps.Content.GetPublicChromeExtras(r.Context(), locale, 6)
 
 	var headSlots, footerSlots []plugin.RenderedSlot
 	if s.deps.Plugins != nil {
@@ -897,34 +993,46 @@ func (s *AppServer) basePageContext(r *http.Request, viewer *domain.User) theme.
 	}
 
 	return theme.PageContext{
-		Locale:            locale,
-		TextDir:           "ltr",
-		Locales:           s.deps.Catalog.Locales(),
-		CurrentPath:       r.URL.Path,
-		BasePath:          r.URL.Path,
-		CanonicalURL:      s.publicBaseURL(r) + r.URL.Path,
-		PageTitle:         snap.Site.Title,
-		MetaDescription:   desc,
-		OGImage:           snap.SEO.DefaultOGImageURL,
-		AdminPath:         adminPath,
-		Site:              snap.Site,
-		Reading:           snap.Reading,
-		Feed:              snap.Feed,
-		SEO:               snap.SEO,
-		Appearance:        snap.Appearance,
-		Viewer:            viewer,
-		NavItems:          navItems,
-		SidebarCategories: cats,
-		SidebarTags:       tags,
-		RecentComments:    recentComments,
-		HeadWidgets:       headSlots,
-		FooterWidgets:     footerSlots,
+		Locale:             locale,
+		TextDir:            s.deps.Catalog.Dir(locale),
+		Locales:            s.deps.Catalog.Locales(),
+		Year:               time.Now().Year(),
+		CurrentPath:        r.URL.Path,
+		BasePath:           r.URL.Path,
+		CanonicalURL:       s.publicBaseURL(r) + r.URL.Path,
+		PageTitle:          snap.Site.Title,
+		MetaDescription:    desc,
+		OGImage:            snap.SEO.DefaultOGImageURL,
+		AdminPath:          adminPath,
+		Site:               snap.Site,
+		Reading:            snap.Reading,
+		Feed:               snap.Feed,
+		SEO:                snap.SEO,
+		Appearance:         snap.Appearance,
+		Viewer:             viewer,
+		Owner:              extras.Owner,
+		Authors:            extras.Authors,
+		Stats:              extras.Stats,
+		NavItems:           navItems,
+		SidebarCategories:  cats,
+		SidebarTags:        tags,
+		SidebarArchives:    extras.ArchiveBuckets,
+		RecentPosts:        extras.RecentPosts,
+		MostViewedPosts:    extras.MostViewedPosts,
+		MostCommentedPosts: extras.MostCommentedPosts,
+		RecentComments:     recentComments,
+		HeadWidgets:        headSlots,
+		FooterWidgets:      footerSlots,
 	}
 }
 
 func (s *AppServer) renderStudio(w http.ResponseWriter, r *http.Request, status int, pageName string, pctx theme.PageContext) {
+	s.renderStudioFallback(w, r, status, []string{pageName}, pctx)
+}
+
+func (s *AppServer) renderStudioFallback(w http.ResponseWriter, r *http.Request, status int, candidates []string, pctx theme.PageContext) {
 	activeTheme := s.deps.Themes.ResolveActiveTheme(r, pctx.Viewer, pctx.Appearance.ActiveTheme)
-	if err := s.deps.Themes.Render(w, status, activeTheme, pageName, pctx); err != nil {
+	if err := s.deps.Themes.RenderWithFallback(w, status, activeTheme, candidates, pctx); err != nil {
 		http.Error(w, "render error: "+err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -979,6 +1087,7 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 		pctx.ArticleCards = cards
 		pctx.Page = page
 		pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
+		pctx.Pagination = theme.BuildPagination(page, pctx.TotalPages, pctx.Reading.PostsPerPage, total, 5)
 		s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
 		return
 	}
@@ -1088,6 +1197,8 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 	pctx.PrevPost = prev
 	pctx.NextPost = next
 	pctx.Backlinks = backlinks
+	pctx.RelatedPosts = s.deps.Content.ListRelatedArticles(r.Context(), raw, pctx.Locale, 4)
+	pctx.RandomPosts = s.deps.Content.ListRandomArticles(r.Context(), raw.ID, pctx.Locale, 4)
 	pctx.Alternates = detail.Translations
 	pctx.Reactions, _ = s.deps.Content.GetReactionCounts(r.Context(), domain.TargetTypeArticle, raw.ID)
 
@@ -1168,7 +1279,7 @@ func (s *AppServer) handleCategoriesOverview(w http.ResponseWriter, r *http.Requ
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.categories")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.Categories = pctx.SidebarCategories
-	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"categories.html", "taxonomies.html"}, pctx)
 }
 
 func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) {
@@ -1194,7 +1305,8 @@ func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) 
 	pctx.ArticleCards = cards
 	pctx.Page = page
 	pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
-	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+	pctx.Pagination = theme.BuildPagination(page, pctx.TotalPages, pctx.Reading.PostsPerPage, total, 5)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"category_posts.html", "index.html"}, pctx)
 }
 
 func (s *AppServer) handleTagsOverview(w http.ResponseWriter, r *http.Request) {
@@ -1204,7 +1316,7 @@ func (s *AppServer) handleTagsOverview(w http.ResponseWriter, r *http.Request) {
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.tags")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.Tags, _ = s.deps.Content.ListTagsWithCounts(r.Context(), 200)
-	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"tags.html", "taxonomies.html"}, pctx)
 }
 
 func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
@@ -1223,7 +1335,8 @@ func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
 	pctx.ArticleCards = cards
 	pctx.Page = page
 	pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
-	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+	pctx.Pagination = theme.BuildPagination(page, pctx.TotalPages, pctx.Reading.PostsPerPage, total, 5)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"tag_posts.html", "index.html"}, pctx)
 }
 
 func (s *AppServer) handleArchivesOverview(w http.ResponseWriter, r *http.Request) {
@@ -1233,7 +1346,7 @@ func (s *AppServer) handleArchivesOverview(w http.ResponseWriter, r *http.Reques
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.archives")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.ArchiveBuckets, _ = s.deps.Content.ListArchiveMonths(r.Context())
-	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"archives.html", "taxonomies.html"}, pctx)
 }
 
 func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Request) {
@@ -1252,7 +1365,8 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 	pctx.ArticleCards = cards
 	pctx.Page = page
 	pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
-	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+	pctx.Pagination = theme.BuildPagination(page, pctx.TotalPages, pctx.Reading.PostsPerPage, total, 5)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"archive_posts.html", "index.html"}, pctx)
 }
 
 func (s *AppServer) handleSeriesOverview(w http.ResponseWriter, r *http.Request) {
@@ -1262,7 +1376,7 @@ func (s *AppServer) handleSeriesOverview(w http.ResponseWriter, r *http.Request)
 	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.series")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.SeriesList, _ = s.deps.Content.ListSeries(r.Context())
-	s.renderStudio(w, r, http.StatusOK, "taxonomies.html", pctx)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"series.html", "taxonomies.html"}, pctx)
 }
 
 func (s *AppServer) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
@@ -1280,7 +1394,8 @@ func (s *AppServer) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
 	pctx.ArticleCards = sv.Articles
 	pctx.Page = 1
 	pctx.TotalPages = 1
-	s.renderStudio(w, r, http.StatusOK, "index.html", pctx)
+	pctx.Pagination = theme.BuildPagination(1, 1, len(sv.Articles), len(sv.Articles), 5)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"series_detail.html", "index.html"}, pctx)
 }
 
 func (s *AppServer) handleBookshelf(w http.ResponseWriter, r *http.Request) {
@@ -1336,6 +1451,16 @@ func (s *AppServer) handleFollowsPage(w http.ResponseWriter, r *http.Request) {
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "nav.follows") + " · " + pctx.Site.Title
 	pctx.FollowGroups, _ = s.deps.Content.ListFollowsWithItems(r.Context(), 6)
 	s.renderStudio(w, r, http.StatusOK, "follows.html", pctx)
+}
+
+func (s *AppServer) handleDynamicPage(w http.ResponseWriter, r *http.Request) {
+	viewer, _ := s.resolveViewer(r)
+	pctx := s.basePageContext(r, viewer)
+	pctx.TaxonomyKind = "dynamic"
+	pctx.HeroTitle = s.deps.Catalog.T(pctx.Locale, "nav.dynamic")
+	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
+	pctx.RecentComments, _ = s.deps.Content.ListRecentPublicComments(r.Context(), 30)
+	s.renderStudioFallback(w, r, http.StatusOK, []string{"dynamic.html", "taxonomies.html"}, pctx)
 }
 
 func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request) {

@@ -1,28 +1,49 @@
 {{define "content"}}
-<section class="studio-hero">
-  <h1 class="studio-hero__title">{{.HeroTitle}}</h1>
-  {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
-</section>
+<h1 class="studio-sr-only">{{.HeroTitle}}</h1>
+
+{{if eq .CurrentPath "/"}}
+  {{if .Site.NoticeBoard}}
+    <section class="studio-hero" aria-label="{{t .Locale "sidebar.notice"}}">
+      <div>
+        <h2 class="studio-hero-label">{{coalesce (themeCfg .ThemeConfig "hero_badge" "") (t .Locale "sidebar.notice")}}</h2>
+        <div class="studio-hero-notice">{{.Site.NoticeBoard}}</div>
+      </div>
+      <svg class="studio-hero-graphic" viewBox="0 0 168 104" aria-hidden="true">
+        <circle class="studio-hero-orbit" cx="91" cy="51" r="40"/>
+        <path class="studio-notice-sound" d="M124 38a25 25 0 0 1 0 28m11-36a38 38 0 0 1 0 44"/>
+        <path class="studio-notice-horn" d="M55 39h19l34-17v60L74 65H55a9 9 0 0 1-9-9v-8a9 9 0 0 1 9-9Z"/>
+        <path class="studio-notice-detail" d="M74 39v26m-17 1 5 21h15l-6-21M36 43v19"/>
+      </svg>
+    </section>
+  {{end}}
+{{else}}
+  <section class="studio-hero studio-hero--simple">
+    <div>
+      <h2 class="studio-hero__title">{{.HeroTitle}}</h2>
+      {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+    </div>
+  </section>
+{{end}}
 
 <div class="studio-layout">
-  <div class="studio-posts">
-    {{range .ArticleCards}}
-      {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
-    {{else}}
-      <div class="sidebar-card" style="text-align:center;color:var(--volo-muted)">{{t .Locale "search.empty"}}</div>
+  <div>
+    {{if eq .CurrentPath "/"}}
+      <div class="studio-section-heading">
+        <h2>{{t .Locale "studio.latest_updates"}}</h2>
+      </div>
     {{end}}
+    <div class="studio-posts">
+      {{range .ArticleCards}}
+        {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
+      {{else}}
+        <div class="studio-empty">
+          <h2>{{t .Locale "studio.empty_title"}}</h2>
+          <p>{{t .Locale "studio.empty_desc"}}</p>
+        </div>
+      {{end}}
+    </div>
 
-    {{if gt .TotalPages 1}}
-      <nav style="display:flex;align-items:center;justify-content:space-between;margin-top:12px">
-        {{if gt .Page 1}}
-          <a class="studio-icon-btn" href="{{.BasePath}}?page={{sub .Page 1}}">{{t .Locale "pagination.prev"}}</a>
-        {{else}}<span></span>{{end}}
-        <span style="font-size:.88rem;color:var(--volo-muted)">{{t .Locale "pagination.page_info" (dict "page" .Page "total" .TotalPages)}}</span>
-        {{if lt .Page .TotalPages}}
-          <a class="studio-icon-btn" href="{{.BasePath}}?page={{add .Page 1}}">{{t .Locale "pagination.next"}}</a>
-        {{else}}<span></span>{{end}}
-      </nav>
-    {{end}}
+    {{template "pagination" .}}
   </div>
 
   {{template "sidebar" .}}

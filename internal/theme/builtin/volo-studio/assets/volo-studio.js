@@ -1,8 +1,9 @@
-/* Volo Studio Runtime — 4-Mode Theme, Persistent PJAX, Instant Search, Podcast & Reader Actions */
+/* Volo Studio Runtime — 4-Mode + 6-Accent Appearance Popover, Persistent PJAX, Instant Search, Podcast & Reader Actions */
 (function () {
   "use strict";
 
   var MODES = ["auto", "system", "light", "dark"];
+  var ACCENTS = ["forest", "ocean", "teal", "amber", "plum", "rose"];
   var activeFetchCtrl = null;
 
   function resolveEffectiveTheme(mode) {
@@ -14,20 +15,37 @@
     return h >= 7 && h < 19 ? "light" : "dark";
   }
 
-  function applyTheme(mode) {
+  function applyTheme(mode, accent) {
     var root = document.documentElement;
-    var chosen = mode || localStorage.getItem("volo_theme_mode") || root.getAttribute("data-default-mode") || "auto";
-    root.setAttribute("data-mode", chosen);
-    root.setAttribute("data-theme", resolveEffectiveTheme(chosen));
-    var btn = document.getElementById("volo-theme-btn");
-    if (btn) btn.setAttribute("data-current-mode", chosen);
-  }
+    var savedMode = "";
+    var savedAccent = "";
+    try {
+      savedMode = localStorage.getItem("volo_theme_mode") || "";
+      savedAccent = localStorage.getItem("volo_accent") || "";
+    } catch (_) {}
+    var chosenMode = mode || savedMode || root.getAttribute("data-default-mode") || "auto";
+    var chosenAccent = accent || savedAccent || root.getAttribute("data-default-accent") || root.getAttribute("data-accent") || "forest";
+    if (ACCENTS.indexOf(chosenAccent) === -1) chosenAccent = "forest";
 
-  function cycleTheme() {
-    var cur = document.documentElement.getAttribute("data-mode") || "auto";
-    var next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
-    try { localStorage.setItem("volo_theme_mode", next); } catch (_) {}
-    applyTheme(next);
+    root.setAttribute("data-mode", chosenMode);
+    root.setAttribute("data-theme", resolveEffectiveTheme(chosenMode));
+    root.setAttribute("data-accent", chosenAccent);
+
+    var labelEl = document.getElementById("volo-theme-label");
+    var toggleBtn = document.getElementById("volo-theme-btn");
+    if (toggleBtn) {
+      toggleBtn.setAttribute("data-current-mode", chosenMode);
+      if (labelEl) {
+        var shortAttr = toggleBtn.getAttribute("data-label-" + chosenMode);
+        if (shortAttr) labelEl.textContent = shortAttr;
+      }
+    }
+    document.querySelectorAll("[data-volo-mode]").forEach(function (el) {
+      el.classList.toggle("is-selected", el.getAttribute("data-volo-mode") === chosenMode);
+    });
+    document.querySelectorAll("[data-volo-accent]").forEach(function (el) {
+      el.classList.toggle("is-selected", el.getAttribute("data-volo-accent") === chosenAccent);
+    });
   }
 
   function collectEnvFP() {
@@ -216,8 +234,10 @@
       if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
         ev.preventDefault();
         if (modal.hidden) openSearch(); else closeSearch();
-      } else if (ev.key === "Escape" && !modal.hidden) {
-        closeSearch();
+      } else if (ev.key === "Escape") {
+        if (!modal.hidden) closeSearch();
+        var menu = document.getElementById("volo-theme-menu");
+        if (menu) menu.hidden = true;
       }
     });
 
@@ -236,11 +256,24 @@
               return;
             }
             list.innerHTML = hits.map(function (h) {
-              return '<a class="volo-search-hit" href="' + encodeURI(h.url) + '"><strong>' + escapeHTML(h.title) + '</strong><div style="font-size:.84rem;color:var(--volo-muted)">' + escapeHTML(h.snippet || "") + "</div></a>";
+              return '<a class="volo-search-hit" href="' + encodeURI(h.url) + '"><strong>' + escapeHTML(h.title) + '</strong><div style="font-size:12.5px;color:var(--volo-muted)">' + escapeHTML(h.snippet || "") + "</div></a>";
             }).join("");
           }).catch(function () {});
       }, 160);
     });
+  }
+
+  function initBackToTop() {
+    var topBtn = document.getElementById("studioBackToTop");
+    if (!topBtn) return;
+    function syncTopBtn() {
+      topBtn.hidden = window.scrollY < 320;
+    }
+    window.addEventListener("scroll", syncTopBtn, { passive: true });
+    topBtn.addEventListener("click", function () {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+    syncTopBtn();
   }
 
   function escapeHTML(s) {
@@ -249,7 +282,6 @@
     });
   }
 
-  /* Generic [data-volo-persist] PJAX Navigation Controller */
   function navigatePJAX(url, push) {
     var main = document.getElementById("studio-main");
     if (!main || document.documentElement.getAttribute("data-pjax") === "false") {
@@ -302,10 +334,38 @@
   }
 
   document.addEventListener("click", function (ev) {
-    if (ev.target.closest("#volo-theme-btn")) {
-      cycleTheme();
+    var menu = document.getElementById("volo-theme-menu");
+    var themeBtn = ev.target.closest("#volo-theme-btn");
+    if (themeBtn) {
+      if (menu) {
+        menu.hidden = !menu.hidden;
+      } else {
+        var cur = document.documentElement.getAttribute("data-mode") || "auto";
+        var next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
+        try { localStorage.setItem("volo_theme_mode", next); } catch (_) {}
+        applyTheme(next, null);
+      }
       return;
     }
+    var modeChoice = ev.target.closest("[data-volo-mode]");
+    if (modeChoice) {
+      var m = modeChoice.getAttribute("data-volo-mode") || "auto";
+      try { localStorage.setItem("volo_theme_mode", m); } catch (_) {}
+      applyTheme(m, null);
+      if (menu) menu.hidden = true;
+      return;
+    }
+    var accentChoice = ev.target.closest("[data-volo-accent]");
+    if (accentChoice) {
+      var ac = accentChoice.getAttribute("data-volo-accent") || "forest";
+      try { localStorage.setItem("volo_accent", ac); } catch (_) {}
+      applyTheme(null, ac);
+      return;
+    }
+    if (menu && !menu.hidden && !ev.target.closest(".volo-appearance")) {
+      menu.hidden = true;
+    }
+
     var langSel = ev.target.closest("[data-set-lang]");
     if (langSel) {
       var code = langSel.getAttribute("data-set-lang");
@@ -338,20 +398,22 @@
     navigatePJAX(window.location.pathname + window.location.search + window.location.hash, false);
   });
 
-  applyTheme();
+  applyTheme(null, null);
   if (window.matchMedia) {
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
-      if ((document.documentElement.getAttribute("data-mode") || "auto") === "system") applyTheme("system");
+      if ((document.documentElement.getAttribute("data-mode") || "auto") === "system") applyTheme("system", null);
     });
   }
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () {
       initSearchModal();
+      initBackToTop();
       hydratePage(document);
     });
   } else {
     initSearchModal();
+    initBackToTop();
     hydratePage(document);
   }
 })();

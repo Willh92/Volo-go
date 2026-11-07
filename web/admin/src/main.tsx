@@ -12,28 +12,289 @@ import {
   themeModeSig,
   toastSig,
 } from "./api";
-import { localeSig, normalizeLocale, t } from "./i18n";
+import {
+  availableLocalesSig,
+  ensureLocaleLoaded,
+  getLocaleDir,
+  localeSig,
+  normalizeLocale,
+  t,
+} from "./i18n";
+import { BrandLogo } from "./components/BrandLogo";
 import { SetupWizard } from "./views/SetupWizard";
 import { LoginView } from "./views/LoginView";
-import { OverviewWorkspace } from "./views/OverviewWorkspace";
-import { ContentWorkspace } from "./views/ContentWorkspace";
-import { DistributeWorkspace } from "./views/DistributeWorkspace";
+import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
+import { ContentSubTab, ContentWorkspace } from "./views/ContentWorkspace";
+import { DistTab, DistributeWorkspace } from "./views/DistributeWorkspace";
 import { AppearanceWorkspace } from "./views/AppearanceWorkspace";
-import { SystemWorkspace } from "./views/SystemWorkspace";
+import { SysTab, SystemWorkspace } from "./views/SystemWorkspace";
 
-type WorkspaceID = "overview" | "content" | "distribute" | "appearance" | "system";
+type NavSection =
+  | OverviewSection
+  | ContentSubTab
+  | DistTab
+  | "themes"
+  | "locales"
+  | "plugins"
+  | SysTab;
+
+const ACCENT_OPTIONS: Array<{ id: string; swatch: string }> = [
+  { id: "forest", swatch: "#246b51" },
+  { id: "ocean", swatch: "#2d6583" },
+  { id: "teal", swatch: "#286c70" },
+  { id: "amber", swatch: "#855c27" },
+  { id: "plum", swatch: "#70517d" },
+  { id: "rose", swatch: "#87525f" },
+];
+
+const MODE_OPTIONS = ["light", "dark", "auto", "system"] as const;
+
+const SECTION_LABEL_KEYS: Record<NavSection, string> = {
+  dashboard: "nav.home",
+  editor: "nav.post_new",
+  articles: "nav.post_list",
+  drafts: "nav.post_drafts",
+  comments: "nav.comments",
+  categories: "nav.categories",
+  tags: "nav.tags",
+  series: "nav.series",
+  books: "nav.books",
+  pages: "nav.pages",
+  nav_redirects: "nav.nav_redirects",
+  media: "nav.media",
+  feed_seo: "nav.feed_seo",
+  links: "nav.links",
+  follows: "nav.follows",
+  webhooks: "nav.webhooks",
+  themes: "nav.themes",
+  locales: "nav.locales",
+  plugins: "nav.plugins",
+  settings_site: "nav.settings_site",
+  settings_io: "nav.settings_io",
+  users: "nav.users",
+  backup: "nav.backup",
+  account: "nav.account",
+  waf: "nav.waf",
+  audit: "nav.audit",
+};
+
+interface NavEntry {
+  kind: "item" | "group";
+  id: string;
+  labelKey: string;
+  icon: string;
+  adminOnly?: boolean;
+  section?: NavSection;
+  children?: Array<{ section: NavSection; labelKey: string; adminOnly?: boolean }>;
+}
+
+const SIDEBAR_ENTRIES: NavEntry[] = [
+  { kind: "item", id: "home", labelKey: "nav.home", icon: "home", section: "dashboard" },
+  {
+    kind: "group",
+    id: "posts",
+    labelKey: "nav.group_posts",
+    icon: "posts",
+    children: [
+      { section: "editor", labelKey: "nav.post_new" },
+      { section: "articles", labelKey: "nav.post_list" },
+      { section: "drafts", labelKey: "nav.post_drafts" },
+    ],
+  },
+  { kind: "item", id: "comments", labelKey: "nav.comments", icon: "comments", section: "comments" },
+  {
+    kind: "group",
+    id: "content",
+    labelKey: "nav.group_content",
+    icon: "content",
+    children: [
+      { section: "categories", labelKey: "nav.categories" },
+      { section: "tags", labelKey: "nav.tags" },
+      { section: "series", labelKey: "nav.series" },
+      { section: "books", labelKey: "nav.books" },
+      { section: "pages", labelKey: "nav.pages" },
+      { section: "nav_redirects", labelKey: "nav.nav_redirects" },
+      { section: "media", labelKey: "nav.media" },
+    ],
+  },
+  {
+    kind: "group",
+    id: "distribute",
+    labelKey: "nav.group_distribute",
+    icon: "distribute",
+    children: [
+      { section: "feed_seo", labelKey: "nav.feed_seo", adminOnly: true },
+      { section: "links", labelKey: "nav.links" },
+      { section: "follows", labelKey: "nav.follows" },
+      { section: "webhooks", labelKey: "nav.webhooks", adminOnly: true },
+    ],
+  },
+  {
+    kind: "group",
+    id: "appearance",
+    labelKey: "nav.group_appearance",
+    icon: "appearance",
+    adminOnly: true,
+    children: [
+      { section: "themes", labelKey: "nav.themes", adminOnly: true },
+      { section: "locales", labelKey: "nav.locales", adminOnly: true },
+      { section: "plugins", labelKey: "nav.plugins", adminOnly: true },
+    ],
+  },
+  {
+    kind: "group",
+    id: "settings",
+    labelKey: "nav.group_settings",
+    icon: "settings",
+    adminOnly: true,
+    children: [
+      { section: "settings_site", labelKey: "nav.settings_site", adminOnly: true },
+      { section: "settings_io", labelKey: "nav.settings_io", adminOnly: true },
+      { section: "users", labelKey: "nav.users", adminOnly: true },
+      { section: "backup", labelKey: "nav.backup", adminOnly: true },
+    ],
+  },
+  {
+    kind: "group",
+    id: "security",
+    labelKey: "nav.group_security",
+    icon: "security",
+    children: [
+      { section: "account", labelKey: "nav.account" },
+      { section: "waf", labelKey: "nav.waf", adminOnly: true },
+      { section: "audit", labelKey: "nav.audit", adminOnly: true },
+    ],
+  },
+];
+
+function NavIcon({ name }: { name: string }) {
+  switch (name) {
+    case "home":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3 10.5L12 3l9 7.5" />
+          <path d="M5.5 9.5V20h13V9.5" />
+        </svg>
+      );
+    case "posts":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12 20h9" />
+          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+        </svg>
+      );
+    case "comments":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        </svg>
+      );
+    case "content":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+        </svg>
+      );
+    case "distribute":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M4 11a9 9 0 0 1 9 9" />
+          <path d="M4 4a16 16 0 0 1 16 16" />
+          <circle cx="5" cy="19" r="1.5" fill="currentColor" />
+        </svg>
+      );
+    case "appearance":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="13.5" cy="6.5" r=".8" fill="currentColor" />
+          <circle cx="17.5" cy="10.5" r=".8" fill="currentColor" />
+          <circle cx="8.5" cy="7.5" r=".8" fill="currentColor" />
+          <circle cx="6.5" cy="12.5" r=".8" fill="currentColor" />
+          <path d="M12 2a10 10 0 1 0 0 20 2.5 2.5 0 0 0 2.5-2.5c0-.6-.2-1.1-.6-1.5-.4-.4-.6-.9-.6-1.5A2.5 2.5 0 0 1 15.8 14H17a5 5 0 0 0 5-5c0-3.9-4.5-7-10-7z" />
+        </svg>
+      );
+    case "settings":
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <line x1="4" y1="6" x2="20" y2="6" />
+          <line x1="4" y1="12" x2="20" y2="12" />
+          <line x1="4" y1="18" x2="20" y2="18" />
+          <circle cx="9" cy="6" r="2" fill="var(--volo-nav)" />
+          <circle cx="15" cy="12" r="2" fill="var(--volo-nav)" />
+          <circle cx="10" cy="18" r="2" fill="var(--volo-nav)" />
+        </svg>
+      );
+    default:
+      return (
+        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+        </svg>
+      );
+  }
+}
+
+function findParentGroup(sec: NavSection): string | null {
+  for (const entry of SIDEBAR_ENTRIES) {
+    if (entry.kind === "group" && entry.children?.some((c) => c.section === sec)) {
+      return entry.id;
+    }
+  }
+  return null;
+}
 
 function App() {
   const [ready, setReady] = useState(bootConfig.mode === "setup");
-  const [ws, setWs] = useState<WorkspaceID>("overview");
+  const [section, setSection] = useState<NavSection>("dashboard");
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({
+    posts: true,
+    content: true,
+  });
+  const [openPopover, setOpenPopover] = useState<"mode" | "accent" | null>(null);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+
+  const curLocale = localeSig.value;
+  const locales = availableLocalesSig.value;
+  const user = currentUserSig.value;
+  const curMode = themeModeSig.value;
+  const curAccent = accentSig.value;
+
+  const navigateTo = (rawSec: string) => {
+    const next = (rawSec in SECTION_LABEL_KEYS ? rawSec : "dashboard") as NavSection;
+    setSection(next);
+    setMobileMenuOpen(false);
+    const parent = findParentGroup(next);
+    if (parent) {
+      setOpenGroups((prev) => ({ ...prev, [parent]: true }));
+    }
+  };
 
   useEffect(() => {
-    localeSig.value = normalizeLocale(bootConfig.default_locale);
-    applyThemeAttributes(themeModeSig.value, accentSig.value);
+    const initLoc = normalizeLocale(bootConfig.default_locale);
+    void ensureLocaleLoaded(initLoc);
+    applyThemeAttributes(themeModeSig.value, accentSig.value, false);
     if (bootConfig.mode !== "setup") {
       refreshMe().finally(() => setReady(true));
     }
   }, []);
+
+  useEffect(() => {
+    const onDocClick = () => setOpenPopover(null);
+    document.addEventListener("click", onDocClick);
+    return () => document.removeEventListener("click", onDocClick);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = curLocale;
+    document.documentElement.dir = getLocaleDir(curLocale);
+    if (bootConfig.mode === "setup") {
+      document.title = t("setup.title");
+    } else if (!user) {
+      document.title = `${t("auth.sign_in")} · ${t("shell.console_title")}`;
+    } else {
+      const site = bootConfig.site_title || "Volo";
+      document.title = `${t(SECTION_LABEL_KEYS[section])} · ${site} · ${t("shell.console_title")}`;
+    }
+  }, [curLocale, section, user]);
 
   if (bootConfig.mode === "setup") {
     return (
@@ -45,10 +306,13 @@ function App() {
   }
 
   if (!ready) {
-    return <div class="volo-center-stage"><span class="volo-help">Loading Studio Console...</span></div>;
+    return (
+      <div class="volo-center-stage">
+        <span class="volo-help">{t("shell.loading")}</span>
+      </div>
+    );
   }
 
-  const user = currentUserSig.value;
   if (!user) {
     return (
       <>
@@ -59,93 +323,292 @@ function App() {
   }
 
   const isAdmin = user.role === "admin";
-  const workspaces: WorkspaceID[] = isAdmin
-    ? ["overview", "content", "distribute", "appearance", "system"]
-    : ["overview", "content", "distribute", "system"];
+  const activeSwatch = ACCENT_OPTIONS.find((a) => a.id === curAccent)?.swatch || "#246b51";
+  const initialChar = (user.display_name || user.username || "V").trim().charAt(0).toUpperCase();
 
   return (
     <div class="volo-shell">
-      <aside class="volo-rail">
+      {mobileMenuOpen && (
+        <div class="volo-mobile-backdrop" onClick={() => setMobileMenuOpen(false)} />
+      )}
+
+      <aside class={`volo-rail ${mobileMenuOpen ? "mobile-open" : ""}`}>
         <div class="volo-brand">
-          <div class="volo-brand-mark">V</div>
-          <div>
-            <div class="volo-brand-title">{bootConfig.site_title || "Volo Studio"}</div>
-            <div class="volo-brand-sub">{user.role.toUpperCase()} · @{user.username}</div>
+          <BrandLogo size={34} variant="rail" />
+          <div style={{ minWidth: 0 }}>
+            <div class="volo-brand-title">Volo</div>
+            <div class="volo-brand-sub">{t("shell.brand_sub")}</div>
           </div>
         </div>
 
-        <nav class="volo-nav-list">
-          {workspaces.map((id) => (
-            <button
-              key={id}
-              type="button"
-              class={`volo-nav-btn ${ws === id ? "active" : ""}`}
-              onClick={() => setWs(id)}
-            >
-              <span>{t(`ws.${id}`)}</span>
-            </button>
-          ))}
+        <nav class="volo-nav-scroll">
+          <div class="volo-nav-caption">{t("nav.caption")}</div>
+
+          {SIDEBAR_ENTRIES.map((entry) => {
+            if (entry.adminOnly && !isAdmin) return null;
+
+            if (entry.kind === "item" && entry.section) {
+              const isAct = section === entry.section;
+              return (
+                <button
+                  key={entry.id}
+                  type="button"
+                  class={`volo-nav-btn ${isAct ? "active" : ""}`}
+                  onClick={() => navigateTo(entry.section!)}
+                >
+                  <span class="volo-nav-label">
+                    <NavIcon name={entry.icon} />
+                    <span>{t(entry.labelKey)}</span>
+                  </span>
+                </button>
+              );
+            }
+
+            const visibleChildren = (entry.children || []).filter((c) => !c.adminOnly || isAdmin);
+            if (visibleChildren.length === 0) return null;
+            const hasActiveChild = visibleChildren.some((c) => c.section === section);
+            const isOpen = Boolean(openGroups[entry.id]);
+
+            return (
+              <div
+                key={entry.id}
+                class={`volo-nav-group ${isOpen ? "open" : ""} ${hasActiveChild ? "has-active" : ""}`}
+              >
+                <button
+                  type="button"
+                  class="volo-nav-group-btn"
+                  onClick={() =>
+                    setOpenGroups((prev) => ({ ...prev, [entry.id]: !prev[entry.id] }))
+                  }
+                >
+                  <span class="volo-nav-label">
+                    <NavIcon name={entry.icon} />
+                    <span>{t(entry.labelKey)}</span>
+                  </span>
+                  <svg class="volo-nav-chev" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="7 5 13 10 7 15" />
+                  </svg>
+                </button>
+
+                {isOpen && (
+                  <div class="volo-nav-sub">
+                    {visibleChildren.map((child) => (
+                      <button
+                        key={child.section}
+                        type="button"
+                        class={`volo-nav-btn ${section === child.section ? "active" : ""}`}
+                        onClick={() => navigateTo(child.section)}
+                      >
+                        <span>{t(child.labelKey)}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </nav>
 
         <div class="volo-rail-footer">
-          <a class="volo-rail-link" href="/" target="_blank" rel="noreferrer">
-            <span>{t("nav.view_site")}</span>
-            <span>↗</span>
-          </a>
-          <button
-            type="button"
-            class="volo-nav-btn"
-            onClick={async () => {
-              await apiFetch("/api/admin/auth/logout", { method: "POST", body: "{}" }).catch(() => {});
-              currentUserSig.value = null;
-              csrfTokenSig.value = "";
-            }}
-          >
-            {t("nav.logout")}
-          </button>
+          <span>
+            <span class="volo-rail-dot" />
+            VOLO v1.0.0
+          </span>
+          <span>{t(`role.${user.role}`)}</span>
         </div>
       </aside>
 
       <div class="volo-main">
         <header class="volo-topbar">
-          <h1 class="volo-topbar-title">{t(`ws.${ws}`)}</h1>
-          <div class="volo-topbar-actions">
-            <select
-              class="volo-select"
-              style={{ width: "105px" }}
-              value={themeModeSig.value}
-              onChange={(e) => applyThemeAttributes((e.currentTarget as HTMLSelectElement).value, accentSig.value)}
+          <div class="volo-topbar-left">
+            <button
+              type="button"
+              class="volo-icon-btn volo-mobile-toggle"
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              aria-label={t("shell.console_title")}
             >
-              <option value="auto">Auto</option>
-              <option value="system">System</option>
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
-            </select>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <line x1="4" y1="7" x2="20" y2="7" />
+                <line x1="4" y1="12" x2="20" y2="12" />
+                <line x1="4" y1="17" x2="20" y2="17" />
+              </svg>
+            </button>
+            <div>
+              <div class="volo-eyebrow">{t("shell.eyebrow")}</div>
+              <h1 class="volo-topbar-title">{t(SECTION_LABEL_KEYS[section])}</h1>
+            </div>
+          </div>
+
+          <div class="volo-topbar-actions">
+            {/* 4-Mode Popover */}
+            <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
+              <button
+                type="button"
+                class="volo-icon-btn"
+                title={`${t("shell.mode_title")}: ${t(`mode.${curMode}`)}`}
+                onClick={() => setOpenPopover(openPopover === "mode" ? null : "mode")}
+              >
+                {curMode === "dark" ? (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" />
+                  </svg>
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="4.5" />
+                    <path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6" />
+                  </svg>
+                )}
+              </button>
+              {openPopover === "mode" && (
+                <div class="volo-pop-menu">
+                  <div class="volo-pop-caption">{t("shell.mode_title")}</div>
+                  {MODE_OPTIONS.map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      class={`volo-pop-item ${curMode === m ? "active" : ""}`}
+                      onClick={() => {
+                        applyThemeAttributes(m, curAccent, false);
+                        setOpenPopover(null);
+                      }}
+                    >
+                      <span>{t(`mode.${m}`)}</span>
+                      {curMode === m && <span>✓</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 6-Accent Swatch Popover */}
+            <div class="volo-pop-wrap" onClick={(e) => e.stopPropagation()}>
+              <button
+                type="button"
+                class="volo-icon-btn"
+                title={`${t("shell.accent_title")}: ${t(`accent.${curAccent}`)}`}
+                onClick={() => setOpenPopover(openPopover === "accent" ? null : "accent")}
+              >
+                <span class="volo-swatch-dot" style={{ background: activeSwatch }} />
+              </button>
+              {openPopover === "accent" && (
+                <div class="volo-pop-menu">
+                  <div class="volo-pop-caption">{t("shell.accent_title")}</div>
+                  {ACCENT_OPTIONS.map((ac) => (
+                    <button
+                      key={ac.id}
+                      type="button"
+                      class={`volo-pop-item ${curAccent === ac.id ? "active" : ""}`}
+                      onClick={() => {
+                        applyThemeAttributes(curMode, ac.id, true);
+                        setOpenPopover(null);
+                      }}
+                    >
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
+                        <span class="volo-swatch-dot" style={{ background: ac.swatch, width: "13px", height: "13px" }} />
+                        <span>{t(`accent.${ac.id}`)}</span>
+                      </span>
+                      {curAccent === ac.id && <span>✓</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Language Switcher */}
             <select
               class="volo-select"
-              style={{ width: "115px" }}
+              style={{ width: "112px", height: "36px", borderRadius: "999px", padding: "0 12px" }}
               value={localeSig.value}
               onChange={async (e) => {
                 const next = normalizeLocale((e.currentTarget as HTMLSelectElement).value);
-                localeSig.value = next;
+                await ensureLocaleLoaded(next);
                 await apiFetch("/api/admin/me", {
                   method: "PATCH",
                   body: JSON.stringify({ preferred_locale: next }),
                 }).catch(() => {});
               }}
             >
-              <option value="zh-CN">简体中文</option>
-              <option value="en-US">English</option>
+              {locales.map((loc) => (
+                <option key={loc.code} value={loc.code}>{loc.name}</option>
+              ))}
             </select>
+
+            {/* Open Public Blog */}
+            <a class="volo-site-pill" href="/" target="_blank" rel="noreferrer">
+              <span style={{ fontSize: "12px" }}>↗</span>
+              <span>{t("shell.view_blog")}</span>
+            </a>
+
+            {/* User Avatar Pill */}
+            <button
+              type="button"
+              class="volo-user-pill"
+              style={{ cursor: "pointer" }}
+              onClick={() => navigateTo("account")}
+              title={t("nav.account")}
+            >
+              <span class="volo-user-avatar">
+                {user.avatar_url ? <img src={user.avatar_url} alt="" /> : initialChar}
+              </span>
+              <span>{user.display_name || user.username}</span>
+            </button>
+
+            {/* Logout Icon Button */}
+            <button
+              type="button"
+              class="volo-icon-btn"
+              title={t("nav.logout")}
+              onClick={async () => {
+                await apiFetch("/api/admin/auth/logout", { method: "POST", body: "{}" }).catch(() => {});
+                currentUserSig.value = null;
+                csrfTokenSig.value = "";
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <polyline points="16 17 21 12 16 7" />
+                <line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+            </button>
           </div>
         </header>
 
         <main class="volo-content">
-          {ws === "overview" && <OverviewWorkspace />}
-          {ws === "content" && <ContentWorkspace />}
-          {ws === "distribute" && <DistributeWorkspace />}
-          {ws === "appearance" && isAdmin && <AppearanceWorkspace />}
-          {ws === "system" && <SystemWorkspace />}
+          {(section === "dashboard" || section === "editor" || section === "articles" || section === "drafts") && (
+            <OverviewWorkspace section={section} onNavigate={navigateTo} />
+          )}
+
+          {(section === "comments" ||
+            section === "categories" ||
+            section === "tags" ||
+            section === "series" ||
+            section === "books" ||
+            section === "pages" ||
+            section === "media") && (
+            <ContentWorkspace activeTab={section} onNavigate={navigateTo} />
+          )}
+
+          {(section === "nav_redirects" ||
+            section === "feed_seo" ||
+            section === "links" ||
+            section === "follows" ||
+            section === "webhooks") && (
+            <DistributeWorkspace activeTab={section} onNavigate={navigateTo} />
+          )}
+
+          {(section === "themes" || section === "locales" || section === "plugins") && isAdmin && (
+            <AppearanceWorkspace activeTab={section} onNavigate={navigateTo} />
+          )}
+
+          {(section === "settings_site" ||
+            section === "settings_io" ||
+            section === "users" ||
+            section === "backup" ||
+            section === "account" ||
+            section === "waf" ||
+            section === "audit") && (
+            <SystemWorkspace activeTab={section} onNavigate={navigateTo} />
+          )}
         </main>
       </div>
 

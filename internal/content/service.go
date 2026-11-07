@@ -88,6 +88,41 @@ type FollowGroup struct {
 	Items []domain.FollowItem `json:"items"`
 }
 
+// PublicAuthorProfile exposes strictly non-sensitive author/owner metadata for theme headers, sidebars, and bylines.
+type PublicAuthorProfile struct {
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	DisplayName  string `json:"display_name"`
+	AvatarURL    string `json:"avatar_url"`
+	Bio          string `json:"bio,omitempty"`
+	WebsiteURL   string `json:"website_url,omitempty"`
+	Role         string `json:"role"`
+	ArticleCount int    `json:"article_count"`
+}
+
+// PublicSiteStats holds site-wide counters for theme footers, sidebars, and activity pages.
+type PublicSiteStats struct {
+	ArticleCount  int   `json:"article_count"`
+	CommentCount  int   `json:"comment_count"`
+	ViewCount     int64 `json:"view_count"`
+	CategoryCount int   `json:"category_count"`
+	TagCount      int   `json:"tag_count"`
+	SeriesCount   int   `json:"series_count"`
+	BookCount     int   `json:"book_count"`
+	UptimeDays    int   `json:"uptime_days"`
+}
+
+// PublicChromeExtras bundles cached site owner, staff authors, site stats, archive buckets, and sidebar article lists.
+type PublicChromeExtras struct {
+	Owner              PublicAuthorProfile
+	Authors            []PublicAuthorProfile
+	Stats              PublicSiteStats
+	ArchiveBuckets     []ArchiveMonth
+	RecentPosts        []visibility.PublicArticleCard
+	MostViewedPosts    []visibility.PublicArticleCard
+	MostCommentedPosts []visibility.PublicArticleCard
+}
+
 // ServiceOptions configures the Content Service.
 type ServiceOptions struct {
 	Store          *sqlx.Store
@@ -359,7 +394,15 @@ func (s *Service) hydrateCards(ctx context.Context, raws []domain.RawArticle, lo
 	if len(raws) == 0 {
 		return []visibility.PublicArticleCard{}, nil
 	}
-	catsByID, _ := s.loadCategoriesMap(ctx)
+	chromeSnap, _ := s.getChromeSnapshot(ctx)
+	var catsByID map[string]domain.Category
+	var authorsByID map[string]PublicAuthorProfile
+	var fallbackOwner PublicAuthorProfile
+	if chromeSnap != nil {
+		catsByID = chromeSnap.catsByID
+		authorsByID = chromeSnap.authorsByID
+		fallbackOwner = chromeSnap.owner
+	}
 	tagsByArticle, _ := s.loadTagsForArticles(ctx, raws)
 
 	out := make([]visibility.PublicArticleCard, 0, len(raws))
@@ -370,7 +413,15 @@ func (s *Service) hydrateCards(ctx context.Context, raws []domain.RawArticle, lo
 			cCopy := c
 			catPtr = &cCopy
 		}
-		out = append(out, s.guard.ToCard(r, locale, catPtr, tagsByArticle[r.ID], s.LookupMediaDims))
+		card := s.guard.ToCard(r, locale, catPtr, tagsByArticle[r.ID], s.LookupMediaDims)
+		if au, ok := authorsByID[r.AuthorID]; ok {
+			card.AuthorName = au.DisplayName
+			card.AuthorAvatarURL = au.AvatarURL
+		} else if fallbackOwner.DisplayName != "" {
+			card.AuthorName = fallbackOwner.DisplayName
+			card.AuthorAvatarURL = fallbackOwner.AvatarURL
+		}
+		out = append(out, card)
 	}
 	return out, nil
 }
@@ -409,12 +460,29 @@ func (s *Service) RenderArticleDetail(
 	publicBaseURL string,
 ) (visibility.PublicArticleView, *visibility.PublicNeighbor, *visibility.PublicNeighbor, []visibility.PublicNeighbor, error) {
 	snap := s.settings.Snapshot()
+	chromeSnap, _ := s.getChromeSnapshot(ctx)
 
-	var authorName string
-	if u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT display_name, username FROM users WHERE id = ?`, raw.AuthorID); err == nil {
-		authorName = u.DisplayName
-		if authorName == "" {
-			authorName = u.Username
+	var authorName, authorAvatar, authorBio, authorWeb string
+	if chromeSnap != nil {
+		if au, ok := chromeSnap.authorsByID[raw.AuthorID]; ok {
+			authorName = au.DisplayName
+			authorAvatar = au.AvatarURL
+			authorBio = au.Bio
+			authorWeb = au.WebsiteURL
+		}
+	}
+	if authorName == "" {
+		if u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT display_name, username, avatar_url, bio, website_url FROM users WHERE id = ?`, raw.AuthorID); err == nil {
+			authorName = u.DisplayName
+			if authorName == "" {
+				authorName = u.Username
+			}
+			authorAvatar = u.AvatarURL
+			if authorAvatar == "" && u.Username != "" {
+				authorAvatar = "/avatars/" + u.Username
+			}
+			authorBio = u.Bio
+			authorWeb = u.WebsiteURL
 		}
 	}
 	if authorName == "" {
@@ -423,8 +491,8 @@ func (s *Service) RenderArticleDetail(
 
 	var catPtr *domain.Category
 	if raw.CategoryID != "" {
-		if catsByID, err := s.loadCategoriesMap(ctx); err == nil {
-			if c, ok := catsByID[raw.CategoryID]; ok {
+		if chromeSnap != nil {
+			if c, ok := chromeSnap.catsByID[raw.CategoryID]; ok {
 				cCopy := c
 				catPtr = &cCopy
 			}
@@ -442,6 +510,9 @@ func (s *Service) RenderArticleDetail(
 	view := s.guard.ToDetail(w, r, raw, viewer, visibility.DetailRenderDeps{
 		Locale:            locale,
 		AuthorName:        authorName,
+		AuthorAvatarURL:   authorAvatar,
+		AuthorBio:         authorBio,
+		AuthorWebsiteURL:  authorWeb,
 		Category:          catPtr,
 		Tags:              tagsMap[raw.ID],
 		Translations:      alts,
@@ -813,9 +884,19 @@ func (s *Service) queryAllTagsWithCounts(ctx context.Context) ([]TagWithCount, e
 	return out, nil
 }
 
-// ListArchiveMonths computes YYYY-MM archive buckets directly from `articles.published_at`
+// ListArchiveMonths returns cached YYYY-MM archive buckets computed from `articles.published_at`
 // (replacing legacy `archivedate` tables and strictly excluding Standalone Pages!).
 func (s *Service) ListArchiveMonths(ctx context.Context) ([]ArchiveMonth, error) {
+	snap, err := s.getChromeSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ArchiveMonth, len(snap.archiveBuckets))
+	copy(out, snap.archiveBuckets)
+	return out, nil
+}
+
+func (s *Service) queryArchiveMonths(ctx context.Context) ([]ArchiveMonth, error) {
 	type pubRow struct {
 		PublishedAt int64 `db:"published_at"`
 	}
@@ -1026,6 +1107,250 @@ func truncateForSummary(s string, maxRunes int) string {
 		count++
 	}
 	return s
+}
+
+func (s *Service) queryPublicAuthors(ctx context.Context) (PublicAuthorProfile, []PublicAuthorProfile, map[string]PublicAuthorProfile) {
+	rows, _ := sqlx.Select[domain.User](
+		ctx, s.store,
+		`SELECT id, username, display_name, avatar_url, bio, website_url, role
+		 FROM users
+		 WHERE status = ? AND (role = ? OR role = ?)
+		 ORDER BY created_at ASC`,
+		domain.UserStatusActive, domain.RoleAdmin, domain.RoleEditor,
+	)
+	type authorCnt struct {
+		AuthorID string `db:"author_id"`
+		Cnt      int    `db:"cnt"`
+	}
+	cntRows, _ := sqlx.Select[authorCnt](
+		ctx, s.store,
+		`SELECT author_id, COUNT(*) AS cnt FROM articles WHERE status = ? GROUP BY author_id`,
+		domain.ArticleStatusPublished,
+	)
+	cntMap := make(map[string]int, len(cntRows))
+	for _, c := range cntRows {
+		cntMap[c.AuthorID] = c.Cnt
+	}
+
+	authors := make([]PublicAuthorProfile, 0, len(rows))
+	byID := make(map[string]PublicAuthorProfile, len(rows))
+	var owner PublicAuthorProfile
+	for _, u := range rows {
+		name := strings.TrimSpace(u.DisplayName)
+		if name == "" {
+			name = u.Username
+		}
+		avatar := strings.TrimSpace(u.AvatarURL)
+		if avatar == "" && u.Username != "" {
+			avatar = "/avatars/" + u.Username
+		}
+		prof := PublicAuthorProfile{
+			ID:           u.ID,
+			Username:     u.Username,
+			DisplayName:  name,
+			AvatarURL:    avatar,
+			Bio:          u.Bio,
+			WebsiteURL:   u.WebsiteURL,
+			Role:         u.Role,
+			ArticleCount: cntMap[u.ID],
+		}
+		authors = append(authors, prof)
+		byID[u.ID] = prof
+		if owner.ID == "" && u.Role == domain.RoleAdmin {
+			owner = prof
+		}
+	}
+	if owner.ID == "" && len(authors) > 0 {
+		owner = authors[0]
+	}
+	if owner.DisplayName == "" && s.settings != nil {
+		owner.DisplayName = s.settings.Snapshot().Site.Title
+		owner.AvatarURL = "/favicon.svg"
+	}
+	return owner, authors, byID
+}
+
+func (s *Service) queryPublicSiteStats(ctx context.Context, catCount int, tagCount int) PublicSiteStats {
+	var artCnt, cmtCnt, serCnt, bookCnt int
+	var artViews, pageViews, minPubAt int64
+	_ = s.store.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*), COALESCE(SUM(view_count), 0), COALESCE(MIN(published_at), 0) FROM articles WHERE status = ?`,
+		domain.ArticleStatusPublished,
+	).Scan(&artCnt, &artViews, &minPubAt)
+	_ = s.store.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(SUM(view_count), 0) FROM pages WHERE is_published = ?`,
+		true,
+	).Scan(&pageViews)
+	_ = s.store.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM comments WHERE status = ? AND is_deleted = ?`,
+		domain.CommentStatusApproved, false,
+	).Scan(&cmtCnt)
+	_ = s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM series`).Scan(&serCnt)
+	_ = s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM books`).Scan(&bookCnt)
+
+	uptimeDays := 1
+	if minPubAt > 0 {
+		days := int(time.Since(time.UnixMilli(minPubAt)).Hours()/24) + 1
+		if days > uptimeDays {
+			uptimeDays = days
+		}
+	}
+	return PublicSiteStats{
+		ArticleCount:  artCnt,
+		CommentCount:  cmtCnt,
+		ViewCount:     artViews + pageViews,
+		CategoryCount: catCount,
+		TagCount:      tagCount,
+		SeriesCount:   serCnt,
+		BookCount:     bookCnt,
+		UptimeDays:    uptimeDays,
+	}
+}
+
+// GetPublicChromeExtras returns revision-coherent Owner, Authors, SiteStats, ArchiveBuckets, and Sidebar Article Cards with zero SQL on cache hits.
+func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, sidebarPostLimit int) PublicChromeExtras {
+	snap, err := s.getChromeSnapshot(ctx)
+	if err != nil || snap == nil {
+		return PublicChromeExtras{}
+	}
+	if sidebarPostLimit <= 0 {
+		sidebarPostLimit = 6
+	}
+	if sidebarPostLimit > maxCachedRecentCmts {
+		sidebarPostLimit = maxCachedRecentCmts
+	}
+	sliceUpTo := func(src []domain.RawArticle, n int) []domain.RawArticle {
+		if len(src) <= n {
+			return src
+		}
+		return src[:n]
+	}
+	recentCards, _ := s.hydrateCards(ctx, sliceUpTo(snap.recentRaw, sidebarPostLimit), locale)
+	viewedCards, _ := s.hydrateCards(ctx, sliceUpTo(snap.mostViewedRaw, sidebarPostLimit), locale)
+	cmtedCards, _ := s.hydrateCards(ctx, sliceUpTo(snap.mostCommentedRaw, sidebarPostLimit), locale)
+
+	authorsCopy := make([]PublicAuthorProfile, len(snap.authors))
+	copy(authorsCopy, snap.authors)
+	archivesCopy := make([]ArchiveMonth, len(snap.archiveBuckets))
+	copy(archivesCopy, snap.archiveBuckets)
+
+	stats := snap.stats
+	for _, r := range snap.recentRaw {
+		stats.ViewCount += s.views.PendingArticleViews(r.ID)
+	}
+
+	return PublicChromeExtras{
+		Owner:              snap.owner,
+		Authors:            authorsCopy,
+		Stats:              stats,
+		ArchiveBuckets:     archivesCopy,
+		RecentPosts:        recentCards,
+		MostViewedPosts:    viewedCards,
+		MostCommentedPosts: cmtedCards,
+	}
+}
+
+// ListRelatedArticles returns up to limit public Guard-redacted articles sharing tags or category with cur.
+// Password-protected posts never participate as source or candidate (Surface 3 & 8 zero-leak invariant).
+func (s *Service) ListRelatedArticles(ctx context.Context, cur domain.RawArticle, locale string, limit int) []visibility.PublicArticleCard {
+	if limit <= 0 || !s.guard.IsPublicIndexable(cur) {
+		return nil
+	}
+	if limit > 12 {
+		limit = 12
+	}
+	seen := map[string]bool{cur.ID: true}
+	var collected []domain.RawArticle
+
+	tagSQL, tagArgs := s.store.Dialect().PaginateSQL(
+		`SELECT DISTINCT a.* FROM articles a
+		 INNER JOIN article_tags at1 ON at1.article_id = a.id
+		 INNER JOIN article_tags at2 ON at2.tag_id = at1.tag_id
+		 WHERE at2.article_id = ? AND a.id <> ? AND a.status = ? AND a.password_ciphertext = ''
+		 ORDER BY a.published_at DESC`,
+		limit, 0,
+	)
+	if byTag, err := sqlx.Select[domain.RawArticle](
+		ctx, s.store, tagSQL,
+		append([]any{cur.ID, cur.ID, domain.ArticleStatusPublished}, tagArgs...)...,
+	); err == nil {
+		for _, r := range byTag {
+			if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
+				seen[r.ID] = true
+				collected = append(collected, r)
+			}
+		}
+	}
+
+	if len(collected) < limit && strings.TrimSpace(cur.CategoryID) != "" {
+		rem := limit - len(collected)
+		catSQL, catArgs := s.store.Dialect().PaginateSQL(
+			`SELECT * FROM articles
+			 WHERE category_id = ? AND id <> ? AND status = ? AND password_ciphertext = ''
+			 ORDER BY published_at DESC`,
+			rem+4, 0,
+		)
+		if byCat, err := sqlx.Select[domain.RawArticle](
+			ctx, s.store, catSQL,
+			append([]any{cur.CategoryID, cur.ID, domain.ArticleStatusPublished}, catArgs...)...,
+		); err == nil {
+			for _, r := range byCat {
+				if len(collected) >= limit {
+					break
+				}
+				if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
+					seen[r.ID] = true
+					collected = append(collected, r)
+				}
+			}
+		}
+	}
+
+	if len(collected) == 0 {
+		return nil
+	}
+	cards, _ := s.hydrateCards(ctx, collected, locale)
+	return cards
+}
+
+// ListRandomArticles returns a deterministic pseudo-random sample of public Guard-redacted articles from the in-memory chrome snapshot (zero SQL).
+func (s *Service) ListRandomArticles(ctx context.Context, excludeID string, locale string, limit int) []visibility.PublicArticleCard {
+	if limit <= 0 {
+		return nil
+	}
+	snap, err := s.getChromeSnapshot(ctx)
+	if err != nil || snap == nil {
+		return nil
+	}
+	seen := map[string]bool{excludeID: true}
+	var pool []domain.RawArticle
+	for _, src := range [][]domain.RawArticle{snap.recentRaw, snap.mostViewedRaw} {
+		for _, r := range src {
+			if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
+				seen[r.ID] = true
+				pool = append(pool, r)
+			}
+		}
+	}
+	if len(pool) == 0 {
+		return nil
+	}
+	if len(pool) > limit {
+		offset := 0
+		for i := 0; i < len(excludeID); i++ {
+			offset = (offset*31 + int(excludeID[i])) % len(pool)
+		}
+		picked := make([]domain.RawArticle, 0, limit)
+		for i := 0; i < limit; i++ {
+			picked = append(picked, pool[(offset+i)%len(pool)])
+		}
+		pool = picked
+	}
+	cards, _ := s.hydrateCards(ctx, pool, locale)
+	return cards
 }
 
 // Helper ensuring `id` import is actively referenced for entity creation helpers in content package.

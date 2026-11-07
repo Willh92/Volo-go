@@ -1,174 +1,269 @@
 import { signal } from "@preact/signals";
 
-export type LocaleCode = "zh-CN" | "en-US";
+export type LocaleCode = string;
 
-const dict: Record<LocaleCode, Record<string, string>> = {
-  "zh-CN": {
-    "ws.overview": "创作与总览",
-    "ws.content": "内容与媒体",
-    "ws.distribute": "分发与连接",
-    "ws.appearance": "外观与插件",
-    "ws.system": "系统与安全",
-    "nav.view_site": "访问前台站点",
-    "nav.logout": "退出登录",
-    "auth.sign_in": "登录管理工作台",
-    "auth.ident": "用户名或邮箱",
-    "auth.password": "登录密码",
-    "auth.passkey": "使用 Passkey 通行密钥登录",
-    "auth.totp_code": "输入 6 位动态验证码或恢复码",
-    "auth.remember_2fa": "信任当前浏览器 30 天",
-    "auth.verify": "验证并进入",
-    "setup.title": "初始化 Volo-go 独立博客",
-    "setup.subtitle": "纯 Go 单二进制 · 多数据库方言 · 零历史包袱",
-    "setup.step1": "1. 数据库校验",
-    "setup.step2": "2. 站点与美学",
-    "setup.step3": "3. 站长主权账户",
-    "setup.legacy_tab": "从旧版备份包一键迁移",
-    "setup.test_db": "测试数据库连接",
-    "setup.launch": "完成建站并进入工作台",
-    "setup.import_btn": "流式清洗导入旧备份 (.zip / .json)",
-    "ov.published": "已发布文章",
-    "ov.drafts": "草稿箱",
-    "ov.scheduled": "定时发布",
-    "ov.pages": "独立页面",
-    "ov.pending_comments": "待审评论",
-    "ov.media": "媒体资产",
-    "art.list": "统一文章管理",
-    "art.new": "撰写新文章",
-    "art.import_md": "批量导入 Markdown / ZIP",
-    "art.all": "全部",
-    "art.published": "已发布",
-    "art.draft": "草稿",
-    "art.scheduled": "定时",
-    "art.title": "标题",
-    "art.slug": "URL Slug",
-    "art.category": "直接分类",
-    "art.status": "状态",
-    "art.metrics": "阅读 / 评论",
-    "art.updated": "更新时间",
-    "art.actions": "操作",
-    "art.save": "保存文章",
-    "art.revisions": "历史版本与回滚",
-    "art.share_token": "生成免密限时分享链",
-    "art.draft_recovered": "检测到本地未提交草稿，是否恢复？",
-    "cnt.pages": "独立页面",
-    "cnt.categories": "分类目录",
-    "cnt.tags": "自由标签",
-    "cnt.series": "专题系列",
-    "cnt.books": "电子书架",
-    "cnt.comments": "评论审核",
-    "cnt.media": "媒体库与孤儿清理",
-    "dist.nav": "顶部导航菜单",
-    "dist.links": "友情链接与巡检",
-    "dist.follows": "RSS 订阅阅读",
-    "dist.redirects": "301/302 重定向守护",
-    "dist.webhooks": "多平台 Webhook",
-    "dist.feed_seo": "播客 / Feed / SEO / IndexNow",
-    "app.themes": "主题与配色方案",
-    "app.plugins": "双模插件与沙箱",
-    "sys.settings": "分域原子配置",
-    "sys.account": "账户安全 (TOTP / Passkey / API Token)",
-    "sys.users": "多角色成员 (RBAC)",
-    "sys.waf": "WAF 封禁与 GeoIP 规则",
-    "sys.backup": "跨库流式备份与 Doctor 诊断",
-    "sys.audit": "安全审计日志",
-    "common.save": "保存更改",
-    "common.cancel": "取消",
-    "common.delete": "删除",
-    "common.edit": "编辑",
-    "common.create": "新建",
-    "common.refresh": "刷新",
-    "common.saved": "已保存并即时热生效",
-  },
-  "en-US": {
-    "ws.overview": "Create & Overview",
-    "ws.content": "Content & Media",
-    "ws.distribute": "Distribute & Connect",
-    "ws.appearance": "Appearance & Plugins",
-    "ws.system": "System & Security",
-    "nav.view_site": "Open Public Blog",
-    "nav.logout": "Sign Out",
-    "auth.sign_in": "Sign in to Studio Console",
-    "auth.ident": "Username or Email",
-    "auth.password": "Password",
-    "auth.passkey": "Sign in with Passkey",
-    "auth.totp_code": "6-digit TOTP or Recovery Code",
-    "auth.remember_2fa": "Trust this browser for 30 days",
-    "auth.verify": "Verify & Continue",
-    "setup.title": "Initialize Volo-go Sovereign Blog",
-    "setup.subtitle": "Pure-Go Single Binary · Multi-Dialect SQL · Clean Architecture",
-    "setup.step1": "1. Database Check",
-    "setup.step2": "2. Site & Studio Accent",
-    "setup.step3": "3. Sovereign Admin",
-    "setup.legacy_tab": "1-Click Legacy Archive ETL",
-    "setup.test_db": "Test Connection",
-    "setup.launch": "Complete Setup & Enter Console",
-    "setup.import_btn": "Stream & Normalize Legacy Backup (.zip / .json)",
-    "ov.published": "Published Posts",
-    "ov.drafts": "Drafts",
-    "ov.scheduled": "Scheduled",
-    "ov.pages": "Standalone Pages",
-    "ov.pending_comments": "Pending Comments",
-    "ov.media": "Media Assets",
-    "art.list": "Unified Articles",
-    "art.new": "Write Post",
-    "art.import_md": "Batch Import .md / .zip",
-    "art.all": "All",
-    "art.published": "Published",
-    "art.draft": "Draft",
-    "art.scheduled": "Scheduled",
-    "art.title": "Title",
-    "art.slug": "URL Slug",
-    "art.category": "Category",
-    "art.status": "Status",
-    "art.metrics": "Views / Comments",
-    "art.updated": "Updated",
-    "art.actions": "Actions",
-    "art.save": "Save Article",
-    "art.revisions": "Revisions & Rollback",
-    "art.share_token": "Timed Share Link",
-    "art.draft_recovered": "Unsaved local draft detected in IndexedDB. Restore it?",
-    "cnt.pages": "Standalone Pages",
-    "cnt.categories": "Categories",
-    "cnt.tags": "Tags",
-    "cnt.series": "Series",
-    "cnt.books": "Bookshelf",
-    "cnt.comments": "Comments",
-    "cnt.media": "Media & Orphans",
-    "dist.nav": "Navigation Menu",
-    "dist.links": "Friend Links & Patrol",
-    "dist.follows": "RSS Follows",
-    "dist.redirects": "301/302 Redirects",
-    "dist.webhooks": "Webhooks",
-    "dist.feed_seo": "Podcast / Feed / SEO / IndexNow",
-    "app.themes": "Themes & Accents",
-    "app.plugins": "Plugins & Sandbox",
-    "sys.settings": "Atomic Domain Settings",
-    "sys.account": "Account Security (TOTP / Passkey / PAT)",
-    "sys.users": "Users & RBAC",
-    "sys.waf": "WAF & GeoIP Rules",
-    "sys.backup": "Streaming Backup & Doctor",
-    "sys.audit": "Audit Logs",
-    "common.save": "Save Changes",
-    "common.cancel": "Cancel",
-    "common.delete": "Delete",
-    "common.edit": "Edit",
-    "common.create": "Create",
-    "common.refresh": "Refresh",
-    "common.saved": "Saved & hot-reloaded",
-  },
-};
-
-export function normalizeLocale(raw?: string): LocaleCode {
-  if (raw && raw.toLowerCase().startsWith("en")) return "en-US";
-  return "zh-CN";
+export interface LocaleOption {
+  code: string;
+  name: string;
+  dir: string;
 }
 
-export const localeSig = signal<LocaleCode>("zh-CN");
+// Auto-discover all built-in per-language JSON catalogs in `./locales/*.json` at build time.
+// Adding a new built-in language (e.g. `src/locales/zh-TW.json` or `src/locales/ja-JP.json`)
+// requires zero changes to TypeScript code.
+const bundledModules = import.meta.glob<Record<string, string>>("./locales/*.json", {
+  eager: true,
+  import: "default",
+});
 
-export function t(key: string): string {
-  const code = localeSig.value;
-  return dict[code]?.[key] ?? dict["en-US"][key] ?? key;
+const bundledCatalogs: Record<string, Record<string, string>> = {};
+const catalogs: Record<string, Record<string, string>> = {};
+const initialLocales: LocaleOption[] = [];
+
+for (const [filePath, table] of Object.entries(bundledModules)) {
+  const fileBase = filePath.split("/").pop()?.replace(/\.json$/i, "") || "";
+  const code = canonicalizeLocaleTag(table["meta.code"] || fileBase);
+  if (!code) continue;
+  bundledCatalogs[code] = { ...table };
+  catalogs[code] = { ...table };
+  initialLocales.push({
+    code,
+    name: table["meta.name"] || code,
+    dir: table["meta.dir"] || "ltr",
+  });
+}
+
+function sortLocaleOptions(items: LocaleOption[]): LocaleOption[] {
+  return [...items].sort((a, b) => {
+    if (a.code === "zh-CN") return -1;
+    if (b.code === "zh-CN") return 1;
+    if (a.code === "en-US") return -1;
+    if (b.code === "en-US") return 1;
+    return a.code.localeCompare(b.code);
+  });
+}
+
+export const availableLocalesSig = signal<LocaleOption[]>(sortLocaleOptions(initialLocales));
+export const localeSig = signal<LocaleCode>("zh-CN");
+const catalogVersionSig = signal<number>(0);
+const loadedRuntimeOverlays = new Set<string>();
+
+export function canonicalizeLocaleTag(raw?: string): string {
+  const s = (raw || "").trim().replaceAll("_", "-");
+  if (!s) return "";
+  const parts = s.split("-");
+  const lang = parts[0].toLowerCase();
+  if (lang === "zh") {
+    const sub = (parts[1] || "").toLowerCase();
+    if (sub === "tw" || sub === "hant") return "zh-TW";
+    if (sub === "hk" || sub === "mo") return `zh-${sub.toUpperCase()}`;
+    return "zh-CN";
+  }
+  if (lang === "en") {
+    const sub = (parts[1] || "").toLowerCase();
+    if (sub && sub !== "us") return `en-${sub.toUpperCase()}`;
+    return "en-US";
+  }
+  if (parts.length === 1) {
+    return lang;
+  }
+  if (parts[1].length === 4) {
+    const script = parts[1][0].toUpperCase() + parts[1].slice(1).toLowerCase();
+    return parts[2] ? `${lang}-${script}-${parts[2].toUpperCase()}` : `${lang}-${script}`;
+  }
+  return `${lang}-${parts[1].toUpperCase()}`;
+}
+
+export function normalizeLocale(raw?: string): LocaleCode {
+  const norm = canonicalizeLocaleTag(raw);
+  if (!norm) return "zh-CN";
+  const known = availableLocalesSig.value;
+  if (known.some((l) => l.code === norm)) {
+    return norm;
+  }
+  const prefix = norm.split("-")[0].toLowerCase();
+  const byPrefix = known.find((l) => l.code.split("-")[0].toLowerCase() === prefix);
+  if (byPrefix) {
+    return byPrefix.code;
+  }
+  return catalogs[norm] ? norm : "zh-CN";
+}
+
+// registerExternalLocales merges server-discovered locales from `VOLO_LOCALES_DIR` (`./locales/*.json`)
+// so community language packs appear automatically in all Admin/Setup language switchers without rebuilding.
+export function registerExternalLocales(list?: LocaleOption[]) {
+  if (!Array.isArray(list) || list.length === 0) return;
+  const merged = new Map<string, LocaleOption>();
+  for (const item of availableLocalesSig.value) {
+    merged.set(item.code, item);
+  }
+  for (const raw of list) {
+    const code = canonicalizeLocaleTag(raw.code);
+    if (!code) continue;
+    merged.set(code, {
+      code,
+      name: raw.name || merged.get(code)?.name || code,
+      dir: raw.dir || merged.get(code)?.dir || "ltr",
+    });
+  }
+  availableLocalesSig.value = sortLocaleOptions(Array.from(merged.values()));
+}
+
+// syncExternalLocales reconciles availableLocalesSig with the authoritative server locale list
+// (used after hot-installing or uninstalling external language packs).
+export function syncExternalLocales(list?: LocaleOption[]) {
+  const merged = new Map<string, LocaleOption>();
+  for (const item of initialLocales) {
+    merged.set(item.code, item);
+  }
+  if (Array.isArray(list)) {
+    for (const raw of list) {
+      const code = canonicalizeLocaleTag(raw.code);
+      if (!code) continue;
+      merged.set(code, {
+        code,
+        name: raw.name || merged.get(code)?.name || code,
+        dir: raw.dir || merged.get(code)?.dir || "ltr",
+      });
+    }
+  }
+  // Clean cached overlays so updated/removed packs reflect immediately
+  loadedRuntimeOverlays.clear();
+  for (const code of Object.keys(catalogs)) {
+    if (bundledCatalogs[code]) {
+      catalogs[code] = { ...bundledCatalogs[code] };
+    } else if (!merged.has(code)) {
+      delete catalogs[code];
+    }
+  }
+  availableLocalesSig.value = sortLocaleOptions(Array.from(merged.values()));
+  if (!merged.has(localeSig.value)) {
+    localeSig.value = "zh-CN";
+  }
+  catalogVersionSig.value++;
+}
+
+// ensureLocaleLoaded fetches runtime JSON overrides/packs from `/api/v1/i18n/{code}` when needed
+// (e.g. external `./locales/zh-TW.json` or `ja-JP.json` installed in `VOLO_LOCALES_DIR`).
+export async function ensureLocaleLoaded(rawCode: string, forceReload = false): Promise<LocaleCode> {
+  const code = normalizeLocale(rawCode);
+  localeSig.value = code;
+  if (!forceReload && loadedRuntimeOverlays.has(code)) {
+    return code;
+  }
+  loadedRuntimeOverlays.add(code);
+  try {
+    const res = await fetch(`/api/v1/i18n/${encodeURIComponent(code)}`, { credentials: "same-origin" });
+    if (res.ok) {
+      const data = (await res.json()) as {
+        locales?: LocaleOption[];
+        messages?: Record<string, string>;
+        custom_messages?: Record<string, string>;
+      };
+      if (data.locales) {
+        registerExternalLocales(data.locales);
+      }
+      const isBundled = Boolean(bundledCatalogs[code]);
+      const source = isBundled ? data.custom_messages : data.custom_messages || data.messages;
+      if (source && typeof source === "object") {
+        const base = bundledCatalogs[code] ? { ...bundledCatalogs[code] } : catalogs[code] || {};
+        const overlay: Record<string, string> = { ...base };
+        for (const [k, v] of Object.entries(source)) {
+          if (typeof v !== "string" || !v) continue;
+          if (k.startsWith("admin.")) {
+            overlay[k.slice("admin.".length)] = v;
+          } else if (k.startsWith("nav.")) {
+            // Public `nav.*` belongs to blog theme navigation; admin sidebar uses `admin.nav.*` in single-file packs.
+            continue;
+          } else if (
+            base[k] !== undefined ||
+            !bundledCatalogs["en-US"] ||
+            bundledCatalogs["en-US"][k] !== undefined ||
+            k.startsWith("meta.")
+          ) {
+            overlay[k] = v;
+          }
+        }
+        catalogs[code] = overlay;
+        catalogVersionSig.value++;
+      }
+    }
+  } catch {
+    // Offline or non-overlay environment: bundled JSON catalog remains authoritative.
+  }
+  return code;
+}
+
+// exportFullTemplateJSON merges public/backend keys from `/api/v1/i18n/{baseCode}` with all Admin SPA keys
+// into a single unified starter JSON file for creating new community language packs.
+export async function exportFullTemplateJSON(baseCode: "zh-CN" | "en-US"): Promise<string> {
+  const merged: Record<string, string> = {
+    "meta.code": baseCode,
+    "meta.name": baseCode === "zh-CN" ? "简体中文" : "English",
+    "meta.dir": "ltr",
+    "meta.author": "Volo Community",
+    "meta.version": "1.0.0",
+  };
+  try {
+    const res = await fetch(`/api/v1/i18n/${encodeURIComponent(baseCode)}`, { credentials: "same-origin" });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.messages && typeof data.messages === "object") {
+        for (const [k, v] of Object.entries(data.messages as Record<string, string>)) {
+          merged[k] = v;
+        }
+      }
+    }
+  } catch {
+    // ignore fetch error; export admin keys
+  }
+  const adminDict = bundledCatalogs[baseCode] || bundledCatalogs["en-US"] || {};
+  for (const [k, v] of Object.entries(adminDict)) {
+    if (k.startsWith("meta.")) continue;
+    if (k.startsWith("nav.")) {
+      merged[`admin.${k}`] = v;
+    } else {
+      merged[k] = v;
+    }
+  }
+  const sorted: Record<string, string> = {};
+  for (const k of Object.keys(merged).sort((a, b) => {
+    const am = a.startsWith("meta.");
+    const bm = b.startsWith("meta.");
+    if (am !== bm) return am ? -1 : 1;
+    return a.localeCompare(b);
+  })) {
+    sorted[k] = merged[k];
+  }
+  return JSON.stringify(sorted, null, 2) + "\n";
+}
+
+export function getLocaleDir(code?: string): string {
+  const target = code || localeSig.value;
+  return (
+    availableLocalesSig.value.find((l) => l.code === target)?.dir ||
+    catalogs[target]?.["meta.dir"] ||
+    "ltr"
+  );
+}
+
+export function tFor(locale: string, key: string, vars?: Record<string, string | number>): string {
+  void catalogVersionSig.value;
+  let tpl =
+    catalogs[locale]?.[key] ??
+    catalogs["zh-CN"]?.[key] ??
+    catalogs["en-US"]?.[key] ??
+    key;
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      tpl = tpl.replaceAll(`{${k}}`, String(v));
+    }
+  }
+  return tpl;
+}
+
+export function t(key: string, vars?: Record<string, string | number>): string {
+  return tFor(localeSig.value, key, vars);
 }
 
 export function formatDateTime(ms?: number): string {

@@ -4,13 +4,41 @@
     "zh-CN": "Volo Studio 书房",
     "en-US": "Volo Studio"
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Volo-go",
+  "license": "Apache-2.0",
   "description": {
-    "zh-CN": "现代温润纸感与森林墨绿调性的独立创作主题，原生支持四态深浅色、六套共享强调色、无刷新持久挂件路由与播客书架。",
-    "en-US": "Botanical editorial theme with warm paper palette, 4-mode appearance, 6 shared accents, persistent PJAX islands, podcast player, and bookshelf reader."
+    "zh-CN": "现代温润纸感与森林墨绿调性的独立创作主题，原生支持四态深浅色、六套共享强调色、无刷新持久挂件路由、播客书架与侧栏自定义卡片。",
+    "en-US": "Botanical editorial theme with warm paper palette, 4-mode appearance, 6 shared accents, persistent PJAX islands, podcast player, bookshelf reader, and configurable sidebar widgets."
   },
   "accents": ["forest", "ocean", "teal", "amber", "plum", "rose"],
   "supports_dark_mode": true,
-  "supports_pjax": true
+  "supports_pjax": true,
+  "config_schema": [
+    {
+      "key": "hero_badge",
+      "type": "text",
+      "label": { "zh-CN": "首页顶部铭牌文案", "en-US": "Hero Eyebrow Badge" },
+      "placeholder": { "zh-CN": "留空则不显示，例如：独立写作 · 数字花园", "en-US": "Optional eyebrow text above hero title" },
+      "default": ""
+    },
+    {
+      "key": "show_author_card",
+      "type": "boolean",
+      "label": { "zh-CN": "侧栏显示站长名片与公告", "en-US": "Show Author Profile & Notice Card" },
+      "default": true
+    },
+    {
+      "key": "show_recent_posts",
+      "type": "boolean",
+      "label": { "zh-CN": "侧栏显示近期文章列表", "en-US": "Show Recent Posts in Sidebar" },
+      "default": true
+    },
+    {
+      "key": "show_site_stats",
+      "type": "boolean",
+      "label": { "zh-CN": "侧栏显示全站统计概览", "en-US": "Show Site Statistics Card" },
+      "default": true
+    }
+  ]
 }

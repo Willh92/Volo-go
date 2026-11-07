@@ -168,9 +168,11 @@ type SecuritySecrets struct {
 
 // AppearanceSettings ("appearance" domain).
 type AppearanceSettings struct {
-	ActiveTheme string `json:"active_theme"` // volo-studio or external theme id
-	Accent      string `json:"accent"`       // forest | ocean | teal | amber | plum | rose
-	DefaultMode string `json:"default_mode"` // auto | system | light | dark
+	ActiveTheme  string                    `json:"active_theme"`            // volo-studio or external theme id
+	Accent       string                    `json:"accent"`                  // forest | ocean | teal | amber | plum | rose
+	DefaultMode  string                    `json:"default_mode"`            // auto | system | light | dark
+	CustomCSS    string                    `json:"custom_css,omitempty"`    // optional site-wide custom CSS
+	ThemeConfigs map[string]map[string]any `json:"theme_configs,omitempty"` // per-theme declarative config values keyed by theme_id
 }
 
 // BackupSettings ("backup" domain).
@@ -225,7 +227,7 @@ func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 			Subtitle:            "Independent thoughts & craft",
 			Description:         "A fast, sovereign personal blog powered by Volo-go.",
 			LogoURL:             "",
-			FaviconURL:          "/assets/favicon.svg",
+			FaviconURL:          "/favicon.svg",
 			DefaultLocale:       defaultLocale,
 			AllowLocaleSwitch:   true,
 			TimeZone:            "Asia/Shanghai",
@@ -302,9 +304,10 @@ func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 			TOTPWindowSteps:    1,
 		},
 		Appearance: AppearanceSettings{
-			ActiveTheme: "volo-studio",
-			Accent:      "forest",
-			DefaultMode: "auto",
+			ActiveTheme:  "volo-studio",
+			Accent:       "forest",
+			DefaultMode:  "auto",
+			ThemeConfigs: map[string]map[string]any{},
 		},
 		Backup: BackupSettings{
 			LocalAutoEnabled:   false,

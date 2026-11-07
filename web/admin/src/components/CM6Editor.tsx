@@ -1,5 +1,6 @@
 import type { FunctionComponent } from "preact";
 import { useEffect, useState } from "preact/hooks";
+import { t } from "../i18n";
 
 export interface QuickInsertItem {
   plugin_id?: string;
@@ -40,7 +41,7 @@ export function CM6Editor(props: CM6EditorProps) {
         rows={14}
         value={props.value}
         onInput={(e) => props.onChange((e.currentTarget as HTMLTextAreaElement).value)}
-        placeholder="Loading Markdown Studio..."
+        placeholder={t("ed.loading")}
       />
     );
   }

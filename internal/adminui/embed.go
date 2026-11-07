@@ -15,6 +15,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"github.com/Willh92/Volo-go/internal/i18n"
 )
 
 //go:embed all:dist
@@ -23,13 +24,14 @@ var distFS embed.FS
 // BootConfig is injected as JSON inside `<script id="volo-boot-config" type="application/json">`
 // so the Admin Console & Setup Wizard SPA immediately knows the custom VOLO_ADMIN_PATH, locale, and Studio accent.
 type BootConfig struct {
-	Mode          string `json:"mode"` // "console" | "setup"
-	AdminPath     string `json:"admin_path"`
-	PublicURL     string `json:"public_url"`
-	DefaultLocale string `json:"default_locale"`
-	Accent        string `json:"accent"`
-	DefaultTheme  string `json:"default_theme"`
-	SiteTitle     string `json:"site_title"`
+	Mode          string            `json:"mode"` // "console" | "setup"
+	AdminPath     string            `json:"admin_path"`
+	PublicURL     string            `json:"public_url"`
+	DefaultLocale string            `json:"default_locale"`
+	Accent        string            `json:"accent"`
+	DefaultTheme  string            `json:"default_theme"`
+	SiteTitle     string            `json:"site_title"`
+	Locales       []i18n.LocaleInfo `json:"locales,omitempty"`
 }
 
 type cachedAsset struct {
@@ -187,15 +189,45 @@ func (h *Handler) renderIndexHTML(baseHref string, boot BootConfig) []byte {
 	enc.SetEscapeHTML(true)
 	_ = enc.Encode(boot)
 
+	lang := strings.TrimSpace(boot.DefaultLocale)
+	if lang == "" {
+		lang = "zh-CN"
+	}
+	isZH := strings.HasPrefix(strings.ToLower(lang), "zh")
+	pageTitle := "Volo Studio Console"
+	if boot.Mode == "setup" {
+		if isZH {
+			pageTitle = "初始化 Volo-go 独立博客"
+		} else {
+			pageTitle = "Initialize Volo-go"
+		}
+	} else {
+		siteTitle := strings.TrimSpace(boot.SiteTitle)
+		if isZH {
+			if siteTitle != "" {
+				pageTitle = siteTitle + " · Volo 管理工作台"
+			} else {
+				pageTitle = "Volo 管理工作台"
+			}
+		} else if siteTitle != "" {
+			pageTitle = siteTitle + " · Volo Studio Console"
+		}
+	}
+
 	inject := fmt.Sprintf(
-		`<base href="%s">`+"\n"+`<script id="volo-boot-config" type="application/json">%s</script>`,
+		`<base href="%s">`+"\n"+
+			`<link rel="icon" type="image/svg+xml" href="/favicon.svg">`+"\n"+
+			`<link rel="alternate icon" sizes="32x32" href="/favicon.ico">`+"\n"+
+			`<script id="volo-boot-config" type="application/json">%s</script>`,
 		html.EscapeString(baseHref),
 		strings.TrimSpace(cfgBuf.String()),
 	)
 	tpl := h.indexHTML
 	if tpl == "" {
-		tpl = "<!doctype html><html><head><meta charset=\"utf-8\"><!--VOLO_BOOT--></head><body><div id=\"app\"></div></body></html>"
+		tpl = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>Volo Studio Console</title><!--VOLO_BOOT--></head><body><div id=\"app\"></div></body></html>"
 	}
+	tpl = strings.Replace(tpl, `<html lang="zh-CN">`, `<html lang="`+html.EscapeString(lang)+`">`, 1)
+	tpl = strings.Replace(tpl, `<title>Volo Studio Console</title>`, `<title>`+html.EscapeString(pageTitle)+`</title>`, 1)
 	out := strings.Replace(tpl, "<!--VOLO_BOOT-->", inject, 1)
 	if out == tpl {
 		out = strings.Replace(tpl, "<head>", "<head>\n"+inject, 1)
