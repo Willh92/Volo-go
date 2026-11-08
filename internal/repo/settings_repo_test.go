@@ -130,18 +130,14 @@ func TestSettingsManagerAtomicPatchSecretMaskingAndHotReload(t *testing.T) {
 		t.Fatalf("CustomCSS failed to neutralize breakout/javascript: %q", gotCSS)
 	}
 
-	// 6. CustomHeadMeta allowlists safe <meta>/<link> and strips <script>, refresh, CSP, and event handlers
-	rawHead := `<meta name="google-site-verification" content="abc123" onclick="evil()"><meta http-equiv="refresh" content="0;url=https://evil.example"><link rel="me" href="https://github.com/Willh92"><link rel="stylesheet" href="javascript:alert(1)"><script>alert(1)</script>rawtext`
+	// 6. CustomHeadMeta & FooterText preserve Admin verification tags and third-party ad/analytics scripts while stripping NUL bytes
+	rawHead := "<meta name=\"google-site-verification\" content=\"abc123\">\x00\r\n<script async src=\"https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-123\" crossorigin=\"anonymous\"></script>"
 	cleanHead := SanitizeCustomHeadMeta(rawHead)
-	if strings.Contains(strings.ToLower(cleanHead), "<script") ||
-		strings.Contains(strings.ToLower(cleanHead), "onclick") ||
-		strings.Contains(strings.ToLower(cleanHead), "refresh") ||
-		strings.Contains(strings.ToLower(cleanHead), "javascript:") ||
-		strings.Contains(cleanHead, "rawtext") {
-		t.Fatalf("SanitizeCustomHeadMeta leaked unsafe content: %q", cleanHead)
+	if strings.Contains(cleanHead, "\x00") || strings.Contains(cleanHead, "\r") {
+		t.Fatalf("SanitizeCustomHeadMeta failed to strip NUL/CR bytes: %q", cleanHead)
 	}
-	if !strings.Contains(cleanHead, `google-site-verification`) || !strings.Contains(cleanHead, `https://github.com/Willh92`) {
-		t.Fatalf("SanitizeCustomHeadMeta dropped valid tags: %q", cleanHead)
+	if !strings.Contains(cleanHead, `google-site-verification`) || !strings.Contains(cleanHead, `googlesyndication.com`) {
+		t.Fatalf("SanitizeCustomHeadMeta dropped valid Admin head tags/scripts: %q", cleanHead)
 	}
 
 	// 7. Reject javascript:/control-char/protocol-relative SocialLinks & FaviconURL on write

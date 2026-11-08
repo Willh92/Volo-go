@@ -5,6 +5,7 @@ import {
   localeSig,
   normalizeLocale,
   registerExternalLocales,
+  t,
 } from "./i18n";
 
 export interface BootConfig {
@@ -158,7 +159,11 @@ let toastCloseTimer: number | undefined;
 let toastSeq = 0;
 
 function inferToastKind(msg: string): ToastKind {
-  if (/(HTTP \d{3}|fail|error|invalid|denied|forbid|timeout|cannot|unable|失败|错误|无效|拒绝|异常|超时|必填|不能为空)/i.test(msg)) {
+  if (
+    /(HTTP \d{3}|fail|error|invalid|denied|forbid|unauthorized|too many|rate limit|too large|unsupported|mismatch|expired|aborted|timeout|cannot|unable|失败|错误|无效|拒绝|异常|超时|必填|不能为空|未登录|未授权|权限不足|频繁|过大|不支持|不匹配|过期|中断|失敗|錯誤|無效|拒絕|異常|逾時|過大|頻繁|不支援|未授權|權限不足)/i.test(
+      msg
+    )
+  ) {
     return "err";
   }
   return "ok";
@@ -272,6 +277,97 @@ if (typeof window !== "undefined") {
   }, 60_000);
 }
 
+const EXACT_ADMIN_ERROR_KEYS: Record<string, string> = {
+  "invalid json": "api.err_invalid_json",
+  "invalid json body": "api.err_invalid_json",
+  "malformed json": "api.err_invalid_json",
+  "unauthorized": "api.err_unauthorized",
+  "authentication required": "api.err_unauthorized",
+  "session expired": "api.err_unauthorized",
+  "forbidden": "api.err_forbidden",
+  "admin role required": "api.err_forbidden",
+  "insufficient permissions": "api.err_forbidden",
+  "not found": "api.err_not_found",
+  "method not allowed": "api.err_method_not_allowed",
+  "csrf token mismatch": "api.err_csrf_mismatch",
+  "invalid csrf token": "api.err_csrf_mismatch",
+  "missing csrf token": "api.err_csrf_mismatch",
+  "rate limit exceeded": "api.err_rate_limit",
+  "too many requests": "api.err_rate_limit",
+  "invalid credentials": "api.err_invalid_credentials",
+  "invalid username or password": "api.err_invalid_credentials",
+  "current password is incorrect": "api.err_invalid_current_pwd",
+  "invalid current password": "api.err_invalid_current_pwd",
+  "current password required": "api.err_current_pwd_required",
+  "totp code required": "api.err_totp_required",
+  "2fa code required": "api.err_totp_required",
+  "invalid totp code": "api.err_invalid_totp",
+  "invalid 2fa code": "api.err_invalid_totp",
+  "invalid or expired challenge token": "api.err_challenge_expired",
+  "challenge expired": "api.err_challenge_expired",
+  "re-authentication required": "api.err_reauth_required",
+  "step-up authentication required": "api.err_reauth_required",
+  "account disabled": "api.err_account_disabled",
+  "user is disabled": "api.err_account_disabled",
+  "file too large": "api.err_file_too_large",
+  "request body too large": "api.err_file_too_large",
+  "http: request body too large": "api.err_file_too_large",
+  "unsupported media type": "api.err_unsupported_media",
+  "unsupported file type": "api.err_unsupported_media",
+  "missing file": "api.err_missing_file",
+  "no file uploaded": "api.err_missing_file",
+  "slug already exists": "api.err_duplicate_slug",
+  "duplicate slug": "api.err_duplicate_slug",
+  "title is required": "api.err_title_required",
+  "title required": "api.err_title_required",
+  "internal server error": "api.err_internal",
+  "network error": "api.err_network",
+  "upload aborted": "api.err_upload_aborted",
+};
+
+export function localizeAdminError(rawMsg: string): string {
+  const trimmed = String(rawMsg || "").trim();
+  if (!trimmed) return t("api.err_internal");
+
+  const norm = trimmed.replace(/[.!]+$/, "").trim().toLowerCase();
+  const exactKey = EXACT_ADMIN_ERROR_KEYS[norm];
+  if (exactKey) {
+    const val = t(exactKey);
+    if (val !== exactKey) return val;
+  }
+
+  const httpMatch = /^http\s+(\d{3})$/i.exec(trimmed);
+  if (httpMatch) {
+    const code = httpMatch[1];
+    if (code === "401") return t("api.err_unauthorized");
+    if (code === "403") return t("api.err_forbidden");
+    if (code === "404") return t("api.err_not_found");
+    if (code === "413") return t("api.err_file_too_large");
+    if (code === "415") return t("api.err_unsupported_media");
+    if (code === "429") return t("api.err_rate_limit");
+    return t("api.err_http_status", { status: code });
+  }
+
+  const prefixRules: Array<[RegExp, string]> = [
+    [/^settings:\s*(.+)$/i, "api.err_settings_prefix"],
+    [/^validation(?:\s+failed)?:\s*(.+)$/i, "api.err_validation_prefix"],
+    [/^database:\s*(.+)$/i, "api.err_db_prefix"],
+    [/^backup:\s*(.+)$/i, "api.err_backup_prefix"],
+    [/^plugin:\s*(.+)$/i, "api.err_plugin_prefix"],
+    [/^theme:\s*(.+)$/i, "api.err_theme_prefix"],
+  ];
+  for (const [re, key] of prefixRules) {
+    const m = re.exec(trimmed);
+    if (m && m[1]) {
+      const inner = localizeAdminError(m[1]);
+      const val = t(key, { detail: inner });
+      if (val !== key) return val;
+    }
+  }
+
+  return trimmed;
+}
+
 export async function saveGlobalAccent(nextAccent: string): Promise<void> {
   const cleanAccent = nextAccent || "forest";
   applyThemeAttributes(themeModeSig.value, cleanAccent, false);
@@ -282,7 +378,7 @@ export async function saveGlobalAccent(nextAccent: string): Promise<void> {
         body: JSON.stringify({ accent: cleanAccent }),
       });
     } catch (err: any) {
-      showToast(err?.message || "Failed to save accent");
+      showToast(err?.message || t("api.err_internal"), "err");
     }
   }
 }
@@ -326,8 +422,8 @@ export async function apiFetch<T = any>(
       payload = await res.text().catch(() => "");
     }
     if (!res.ok) {
-      const msg = (payload && typeof payload === "object" && payload.error) || `HTTP ${res.status}`;
-      throw new ApiError(res.status, msg, payload);
+      const rawMsg = (payload && typeof payload === "object" && payload.error) || `HTTP ${res.status}`;
+      throw new ApiError(res.status, localizeAdminError(String(rawMsg)), payload);
     }
     return payload as T;
   } finally {
@@ -446,17 +542,17 @@ export function uploadWithProgress<T = any>(
         if (onProgress) onProgress(100);
         resolve(payload as T);
       } else {
-        const msg = (payload && typeof payload === "object" && payload.error) || `HTTP ${xhr.status || 0}`;
-        reject(new ApiError(xhr.status || 0, msg, payload));
+        const rawMsg = (payload && typeof payload === "object" && payload.error) || `HTTP ${xhr.status || 0}`;
+        reject(new ApiError(xhr.status || 0, localizeAdminError(String(rawMsg)), payload));
       }
     };
     xhr.onerror = () => {
       busyCountSig.value = Math.max(0, busyCountSig.value - 1);
-      reject(new ApiError(0, "Network error"));
+      reject(new ApiError(0, localizeAdminError("network error")));
     };
     xhr.onabort = () => {
       busyCountSig.value = Math.max(0, busyCountSig.value - 1);
-      reject(new ApiError(0, "Upload aborted"));
+      reject(new ApiError(0, localizeAdminError("upload aborted")));
     };
     xhr.send(fd);
   });

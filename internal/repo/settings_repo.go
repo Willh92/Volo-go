@@ -6,14 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdhtml "html"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	nethtml "golang.org/x/net/html"
-	"golang.org/x/net/html/atom"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -90,7 +86,8 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 		if s.Site.LicenseTemplate == "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}" {
 			s.Site.LicenseTemplate = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
 		}
-		s.Site.CustomHeadMeta = SanitizeCustomHeadMeta(s.Site.CustomHeadMeta)
+		s.Site.CustomHeadMeta = NormalizeSiteInjectionHTML(s.Site.CustomHeadMeta)
+		s.Site.FooterText = NormalizeSiteInjectionHTML(s.Site.FooterText)
 		if s.Site.FaviconURL != "" {
 			if cleanFav, ok := SanitizeAllowedURL(s.Site.FaviconURL, false); ok {
 				s.Site.FaviconURL = cleanFav
@@ -581,7 +578,8 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 				v.SocialLinks[i].URL = ""
 			}
 		}
-		v.CustomHeadMeta = SanitizeCustomHeadMeta(v.CustomHeadMeta)
+		v.CustomHeadMeta = NormalizeSiteInjectionHTML(v.CustomHeadMeta)
+		v.FooterText = NormalizeSiteInjectionHTML(v.FooterText)
 		if v.CustomVars == nil {
 			v.CustomVars = map[string]string{}
 		}
@@ -846,200 +844,24 @@ func sanitizeCustomCSS(css string) string {
 	return s
 }
 
-// SanitizeCustomHeadMeta parses raw HTML inside a <head> context and emits ONLY safe
-// <meta> and <link> void elements with allowlisted attributes, stripping <script>,
-// event handlers, dangerous http-equiv directives, unsafe URL schemes, and raw text/elements.
+const maxSiteInjectionBytes = 65536
+
+// NormalizeSiteInjectionHTML cleans NUL bytes and CRLF line endings while preserving
+// Admin-configured <head> and footer HTML/script snippets (e.g. verification tags,
+// Google AdSense, Analytics, ICP links). Write access is strictly RoleAdmin-only.
+func NormalizeSiteInjectionHTML(raw string) string {
+	cleaned := strings.ReplaceAll(raw, "\x00", "")
+	cleaned = strings.ReplaceAll(cleaned, "\r\n", "\n")
+	cleaned = strings.TrimSpace(cleaned)
+	if len(cleaned) > maxSiteInjectionBytes {
+		cleaned = strings.TrimSpace(cleaned[:maxSiteInjectionBytes])
+	}
+	return cleaned
+}
+
+// SanitizeCustomHeadMeta is retained as an alias for NormalizeSiteInjectionHTML.
 func SanitizeCustomHeadMeta(raw string) string {
-	trimmed := strings.TrimSpace(strings.ReplaceAll(raw, "\x00", ""))
-	if trimmed == "" {
-		return ""
-	}
-	headCtx := &nethtml.Node{
-		Type:     nethtml.ElementNode,
-		Data:     "head",
-		DataAtom: atom.Head,
-	}
-	nodes, err := nethtml.ParseFragment(strings.NewReader(trimmed), headCtx)
-	if err != nil || len(nodes) == 0 {
-		return ""
-	}
-
-	var lines []string
-	for _, n := range nodes {
-		if n == nil || n.Type != nethtml.ElementNode || n.Namespace != "" {
-			continue
-		}
-		switch strings.ToLower(n.Data) {
-		case "meta":
-			if tag := renderSafeMetaNode(n); tag != "" {
-				lines = append(lines, tag)
-			}
-		case "link":
-			if tag := renderSafeLinkNode(n); tag != "" {
-				lines = append(lines, tag)
-			}
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-func renderSafeMetaNode(n *nethtml.Node) string {
-	type kv struct{ k, v string }
-	var attrs []kv
-	seen := make(map[string]bool, 6)
-	hasKey := false
-	hasContent := false
-	hasCharset := false
-
-	for _, a := range n.Attr {
-		if a.Namespace != "" {
-			continue
-		}
-		key := strings.ToLower(strings.TrimSpace(a.Key))
-		if seen[key] {
-			continue
-		}
-		val := strings.TrimSpace(StripASCIIControls(a.Val))
-		switch key {
-		case "name", "property":
-			if val == "" {
-				continue
-			}
-			seen[key] = true
-			hasKey = true
-			attrs = append(attrs, kv{key, val})
-		case "content":
-			seen[key] = true
-			hasContent = true
-			attrs = append(attrs, kv{key, val})
-		case "charset":
-			if !isSafeHeadToken(val) {
-				return ""
-			}
-			seen[key] = true
-			hasCharset = true
-			attrs = append(attrs, kv{key, val})
-		case "media":
-			if val == "" || indexFoldASCII(val, "javascript:") >= 0 || indexFoldASCII(val, "expression(") >= 0 {
-				continue
-			}
-			seen[key] = true
-			attrs = append(attrs, kv{key, val})
-		case "http-equiv":
-			low := strings.ToLower(val)
-			if low == "" || !isSafeHeadToken(low) ||
-				low == "refresh" ||
-				low == "set-cookie" ||
-				low == "location" ||
-				strings.HasPrefix(low, "content-security-policy") {
-				return ""
-			}
-			seen[key] = true
-			hasKey = true
-			attrs = append(attrs, kv{key, val})
-		}
-	}
-	if !hasCharset && !(hasKey && hasContent) {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("<meta")
-	for _, a := range attrs {
-		b.WriteByte(' ')
-		b.WriteString(a.k)
-		b.WriteString(`="`)
-		b.WriteString(stdhtml.EscapeString(a.v))
-		b.WriteByte('"')
-	}
-	b.WriteByte('>')
-	return b.String()
-}
-
-func renderSafeLinkNode(n *nethtml.Node) string {
-	type kv struct{ k, v string }
-	var attrs []kv
-	seen := make(map[string]bool, 8)
-	hasRel := false
-	hasHref := false
-
-	for _, a := range n.Attr {
-		if a.Namespace != "" {
-			continue
-		}
-		key := strings.ToLower(strings.TrimSpace(a.Key))
-		if seen[key] {
-			continue
-		}
-		val := strings.TrimSpace(StripASCIIControls(a.Val))
-		switch key {
-		case "rel":
-			if val == "" {
-				return ""
-			}
-			for _, tok := range strings.Fields(strings.ToLower(val)) {
-				if tok == "import" {
-					return ""
-				}
-			}
-			seen[key] = true
-			hasRel = true
-			attrs = append(attrs, kv{key, val})
-		case "href":
-			cleanHref, ok := SanitizeAllowedURL(val, true)
-			if !ok || strings.HasPrefix(cleanHref, "#") || hasPrefixFoldASCII(cleanHref, "tel:") {
-				return ""
-			}
-			seen[key] = true
-			hasHref = true
-			attrs = append(attrs, kv{key, cleanHref})
-		case "type", "sizes", "title", "hreflang":
-			if val == "" {
-				continue
-			}
-			seen[key] = true
-			attrs = append(attrs, kv{key, val})
-		case "crossorigin":
-			low := strings.ToLower(val)
-			if low != "" && low != "anonymous" && low != "use-credentials" {
-				continue
-			}
-			seen[key] = true
-			attrs = append(attrs, kv{key, low})
-		case "media":
-			if val == "" || indexFoldASCII(val, "javascript:") >= 0 || indexFoldASCII(val, "expression(") >= 0 {
-				continue
-			}
-			seen[key] = true
-			attrs = append(attrs, kv{key, val})
-		}
-	}
-	if !hasRel || !hasHref {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("<link")
-	for _, a := range attrs {
-		b.WriteByte(' ')
-		b.WriteString(a.k)
-		b.WriteString(`="`)
-		b.WriteString(stdhtml.EscapeString(a.v))
-		b.WriteByte('"')
-	}
-	b.WriteByte('>')
-	return b.String()
-}
-
-func isSafeHeadToken(s string) bool {
-	if len(s) == 0 || len(s) > 64 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
-			return false
-		}
-	}
-	return true
+	return NormalizeSiteInjectionHTML(raw)
 }
 
 func isValidStorageDriverID(id string) bool {

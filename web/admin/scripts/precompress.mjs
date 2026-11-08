@@ -1,6 +1,8 @@
 import { mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
+import { transform as transformCSS } from "lightningcss";
+import { minifySync } from "vite";
 
 const distDir = new URL("../../../internal/adminui/dist", import.meta.url).pathname;
 const themeAssetsDir = new URL("../../../internal/theme/builtin/volo-studio/assets", import.meta.url).pathname;
@@ -20,6 +22,23 @@ function deterministicGzip(raw) {
     gz[9] = 0x03;
   }
   return gz;
+}
+
+function minifyEmbeddedPayload(fileName, raw) {
+  if (fileName.endsWith(".js")) {
+    const out = minifySync(fileName, raw.toString("utf8"));
+    if (out && typeof out.code === "string" && (!out.errors || out.errors.length === 0)) {
+      return Buffer.from(out.code, "utf8");
+    }
+  } else if (fileName.endsWith(".css")) {
+    const out = transformCSS({ filename: fileName, code: raw, minify: true });
+    if (out && out.code) {
+      return Buffer.from(out.code);
+    }
+  } else if (fileName.endsWith(".json")) {
+    return Buffer.from(JSON.stringify(JSON.parse(raw.toString("utf8"))), "utf8");
+  }
+  return raw;
 }
 
 function walkAdminDist(dir) {
@@ -54,7 +73,7 @@ function precompressFlatDir(srcDir, outDir, suffix = "") {
     if (suffix && !ent.name.endsWith(suffix)) continue;
     if (!ent.isFile()) continue;
     const full = join(srcDir, ent.name);
-    const raw = readFileSync(full);
+    const raw = minifyEmbeddedPayload(ent.name, readFileSync(full));
     writeFileSync(join(outDir, `${ent.name}.gz`), deterministicGzip(raw));
   }
 }

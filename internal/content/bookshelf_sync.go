@@ -1,6 +1,7 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,9 +9,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+
+	nethtml "golang.org/x/net/html"
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
@@ -236,6 +241,7 @@ func (s *Service) SyncBookTOC(ctx context.Context, bookID string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	s.invalidateBookChapterCache(bk.ID)
 	return len(chapters), nil
 }
 
@@ -457,4 +463,644 @@ func isSafeSameHostChapterURL(raw string, baseURL *url.URL) bool {
 		return false
 	}
 	return true
+}
+
+const (
+	maxBookChapterCacheEntries   = 24
+	maxBookChapterCacheItemBytes = 256 << 10 // 256 KiB per chapter
+	bookChapterCacheTTL          = 15 * time.Minute
+)
+
+type cachedBookChapter struct {
+	bookID       string
+	html         string
+	needsMath    bool
+	needsMermaid bool
+	expiresAt    time.Time
+}
+
+func (s *Service) invalidateBookChapterCache(bookID string) {
+	s.bookChapterMu.Lock()
+	defer s.bookChapterMu.Unlock()
+	for k, v := range s.bookChapterCache {
+		if v.bookID == bookID {
+			delete(s.bookChapterCache, k)
+		}
+	}
+}
+
+// ExtractRemoteBookChapter fetches a remote book chapter via SSRF-safe OutboundSafeDialer,
+// strips redundant built-in TOC/sidebar/chrome (GitBook, HonKit, mdBook, VitePress, VuePress,
+// Sphinx, MkDocs, Docusaurus), resolves relative images/media, and rewrites inter-chapter links
+// to `/books/{slug}?ch={id}#frag` so all internal links and anchors work seamlessly inside Volo.
+func (s *Service) ExtractRemoteBookChapter(
+	ctx context.Context,
+	bk BookDetailView,
+	activeCh domain.BookChapter,
+) (htmlOut string, needsMath bool, needsMermaid bool, ok bool) {
+	rawURL := strings.TrimSpace(activeCh.URL)
+	if rawURL == "" || s.dialer == nil || s.renderer == nil {
+		return "", false, false, false
+	}
+	cacheKey := bk.ID + "|" + activeCh.ID + "|" + rawURL
+	now := time.Now()
+
+	s.bookChapterMu.Lock()
+	if entry, hit := s.bookChapterCache[cacheKey]; hit {
+		if now.Before(entry.expiresAt) {
+			s.bookChapterMu.Unlock()
+			return entry.html, entry.needsMath, entry.needsMermaid, entry.html != ""
+		}
+		delete(s.bookChapterCache, cacheKey)
+	}
+	s.bookChapterMu.Unlock()
+
+	validatedURL, err := s.dialer.ValidateOutboundURL(rawURL)
+	if err != nil {
+		return "", false, false, false
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	client := s.dialer.NewHTTPClient(6 * time.Second)
+	rawBody, finalURL, err := fetchBoundedText(fetchCtx, client, validatedURL.String())
+	if err != nil || strings.TrimSpace(rawBody) == "" {
+		return "", false, false, false
+	}
+	if finalURL == nil {
+		finalURL = validatedURL
+	}
+
+	cleanedHTML, ok := extractAndRewriteBookHTML(rawBody, finalURL, bk, activeCh, s.renderer)
+	if !ok || cleanedHTML == "" {
+		return "", false, false, false
+	}
+	hasMath := strings.Contains(cleanedHTML, "math-inline") || strings.Contains(cleanedHTML, "math-display") || strings.Contains(cleanedHTML, "katex")
+	hasMermaid := strings.Contains(cleanedHTML, `class="mermaid"`) || strings.Contains(cleanedHTML, `language-mermaid`)
+
+	if len(cleanedHTML) <= maxBookChapterCacheItemBytes {
+		s.bookChapterMu.Lock()
+		if s.bookChapterCache == nil {
+			s.bookChapterCache = make(map[string]cachedBookChapter, maxBookChapterCacheEntries)
+		}
+		for k, v := range s.bookChapterCache {
+			if now.After(v.expiresAt) {
+				delete(s.bookChapterCache, k)
+			}
+		}
+		if len(s.bookChapterCache) >= maxBookChapterCacheEntries {
+			var oldestKey string
+			var oldestExp time.Time
+			for k, v := range s.bookChapterCache {
+				if oldestKey == "" || v.expiresAt.Before(oldestExp) {
+					oldestKey = k
+					oldestExp = v.expiresAt
+				}
+			}
+			if oldestKey != "" {
+				delete(s.bookChapterCache, oldestKey)
+			}
+		}
+		s.bookChapterCache[cacheKey] = cachedBookChapter{
+			bookID:       bk.ID,
+			html:         cleanedHTML,
+			needsMath:    hasMath,
+			needsMermaid: hasMermaid,
+			expiresAt:    now.Add(bookChapterCacheTTL),
+		}
+		s.bookChapterMu.Unlock()
+	}
+
+	return cleanedHTML, hasMath, hasMermaid, true
+}
+
+func extractAndRewriteBookHTML(
+	rawDoc string,
+	finalURL *url.URL,
+	bk BookDetailView,
+	activeCh domain.BookChapter,
+	renderer *render.Engine,
+) (string, bool) {
+	// Support raw Markdown chapter sources (.md)
+	if finalURL != nil && strings.HasSuffix(strings.ToLower(finalURL.Path), ".md") && !strings.Contains(strings.ToLower(rawDoc[:min(len(rawDoc), 256)]), "<html") {
+		out := renderer.Render(rawDoc, render.Options{Mode: render.RenderModeWeb})
+		rawDoc = "<html><body><article class=\"markdown-section\">" + out.HTML + "</article></body></html>"
+	}
+
+	doc, err := nethtml.Parse(strings.NewReader(rawDoc))
+	if err != nil {
+		return "", false
+	}
+
+	root := selectBookProseContainer(doc)
+	if root == nil {
+		return "", false
+	}
+
+	pruneBookChromeNodes(root)
+	stripDuplicateLeadingH1(root, activeCh.Title)
+
+	if countVisibleRunes(root, 32) < 20 && !hasBookMediaElement(root) {
+		return "", false
+	}
+
+	chapterMap := buildBookChapterLookup(bk)
+	activeKeys := make(map[string]bool, 4)
+	if finalURL != nil {
+		for _, k := range bookURLKeys(finalURL) {
+			activeKeys[k] = true
+		}
+	}
+	if u, pErr := url.Parse(strings.TrimSpace(activeCh.URL)); pErr == nil {
+		for _, k := range bookURLKeys(u) {
+			activeKeys[k] = true
+		}
+	}
+
+	rewriteBookSubtreeURLs(root, finalURL, bk.Slug, activeCh.ID, activeKeys, chapterMap)
+
+	var buf bytes.Buffer
+	for c := root.FirstChild; c != nil; c = c.NextSibling {
+		_ = nethtml.Render(&buf, c)
+	}
+	sanitized := strings.TrimSpace(renderer.SanitizeHTML(buf.String()))
+	if sanitized == "" {
+		return "", false
+	}
+	return sanitized, true
+}
+
+func selectBookProseContainer(doc *nethtml.Node) *nethtml.Node {
+	var tier1, tier2, tier3, tier4, bodyNode *nethtml.Node
+	var walk func(n *nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		if n == nil || tier1 != nil {
+			return
+		}
+		if n.Type == nethtml.ElementNode {
+			tag := strings.ToLower(n.Data)
+			idVal := strings.ToLower(getNodeAttr(n, "id"))
+			cls := getNodeAttr(n, "class")
+			role := strings.ToLower(getNodeAttr(n, "role"))
+
+			if tag == "body" && bodyNode == nil {
+				bodyNode = n
+			}
+			// Do not descend into obvious navigation/sidebar containers when hunting for main prose
+			if isBookChromeContainer(tag, idVal, cls) {
+				return
+			}
+			if hasAnyClassToken(cls,
+				"markdown-section",
+				"vp-doc",
+				"theme-default-content",
+				"theme-hope-content",
+				"theme-doc-markdown",
+				"md-content__inner",
+				"rst-content",
+				"td-content",
+				"markdown-body",
+			) || (tag == "main" && n.Parent != nil && strings.EqualFold(getNodeAttr(n.Parent, "id"), "content")) {
+				tier1 = n
+				return
+			}
+			if tier2 == nil && tag == "article" {
+				tier2 = n
+			}
+			if tier3 == nil && (tag == "main" || role == "main") {
+				tier3 = n
+			}
+			if tier4 == nil && (idVal == "content" || idVal == "main-content" || idVal == "page-wrapper" ||
+				hasAnyClassToken(cls, "page-inner", "book-body", "doc-content", "content")) {
+				tier4 = n
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	for _, cand := range []*nethtml.Node{tier1, tier2, tier3, tier4, bodyNode} {
+		if cand != nil {
+			return cand
+		}
+	}
+	return nil
+}
+
+func isBookChromeContainer(tag, idLower, cls string) bool {
+	switch tag {
+	case "nav", "aside", "header", "footer", "script", "style", "noscript", "iframe", "form":
+		return true
+	}
+	switch idLower {
+	case "sidebar", "book-search-input", "book-search-results", "menu-bar", "page-toc", "toc", "table-of-contents":
+		return true
+	}
+	return hasAnyClassToken(cls,
+		"book-summary", "book-header", "navigation", "navigation-prev", "navigation-next",
+		"nav-chapters", "nav-wide-wrapper", "sidebar", "VPDocAside", "VPLocalNav", "VPSidebar",
+		"VPNav", "VPDocFooter", "edit-link", "page-edit", "page-nav", "pagination-nav",
+		"toc", "table-of-contents", "md-sidebar", "sphinxsidebar", "wy-nav-side",
+		"rst-versions", "rst-footer-buttons", "breadcrumbs", "wy-breadcrumbs", "search-results",
+	)
+}
+
+func pruneBookChromeNodes(root *nethtml.Node) {
+	var walk func(n *nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		for c := n.FirstChild; c != nil; {
+			next := c.NextSibling
+			if c.Type == nethtml.ElementNode {
+				tag := strings.ToLower(c.Data)
+				idRaw := getNodeAttr(c, "id")
+				nameRaw := getNodeAttr(c, "name")
+				cls := getNodeAttr(c, "class")
+
+				if isBookChromeContainer(tag, strings.ToLower(idRaw), cls) || hasNodeAttr(c, "hidden") {
+					n.RemoveChild(c)
+					c = next
+					continue
+				}
+				// Strip heading permalink '#' / '¶' clutter while preserving anchor IDs on parent heading!
+				if tag == "a" {
+					anchorID := strings.TrimSpace(idRaw)
+					if anchorID == "" {
+						anchorID = strings.TrimSpace(nameRaw)
+					}
+					txt := strings.TrimSpace(extractNodeText(c))
+					isPermalinkGlyph := hasAnyClassToken(cls, "headerlink", "header-anchor", "anchor", "anchorjs-link", "hash-link", "plugin-anchor") ||
+						((txt == "#" || txt == "¶" || txt == "") && strings.HasPrefix(strings.TrimSpace(getNodeAttr(c, "href")), "#")) ||
+						(txt == "" && anchorID != "" && getNodeAttr(c, "href") == "")
+					if isPermalinkGlyph {
+						if anchorID != "" && n.Type == nethtml.ElementNode && getNodeAttr(n, "id") == "" {
+							setNodeAttr(n, "id", anchorID)
+						}
+						n.RemoveChild(c)
+						c = next
+						continue
+					}
+				}
+			}
+			walk(c)
+			c = next
+		}
+	}
+	walk(root)
+}
+
+func stripDuplicateLeadingH1(root *nethtml.Node, chapterTitle string) {
+	want := normalizeTitleForMatch(chapterTitle)
+	if want == "" {
+		return
+	}
+	for c := root.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == nethtml.TextNode && strings.TrimSpace(c.Data) == "" {
+			continue
+		}
+		if c.Type == nethtml.CommentNode {
+			continue
+		}
+		if c.Type == nethtml.ElementNode && strings.EqualFold(c.Data, "h1") {
+			if normalizeTitleForMatch(extractNodeText(c)) == want {
+				// Preserve heading ID on first following element or keep an empty span anchor if needed
+				if hID := strings.TrimSpace(getNodeAttr(c, "id")); hID != "" {
+					c.Data = "div"
+					c.Attr = []nethtml.Attribute{{Key: "id", Val: hID}}
+					c.FirstChild = nil
+					c.LastChild = nil
+				} else {
+					root.RemoveChild(c)
+				}
+			}
+		}
+		break
+	}
+}
+
+func normalizeTitleForMatch(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		if unicode.IsSpace(r) || r == '#' || r == '¶' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func buildBookChapterLookup(bk BookDetailView) map[string]string {
+	m := make(map[string]string, len(bk.FlatChapters)*3+2)
+	for _, ch := range bk.FlatChapters {
+		u, err := url.Parse(strings.TrimSpace(ch.URL))
+		if err != nil || u.Host == "" {
+			continue
+		}
+		for _, k := range bookURLKeys(u) {
+			if _, exists := m[k]; !exists {
+				m[k] = ch.ID
+			}
+		}
+	}
+	if len(bk.FlatChapters) > 0 && strings.TrimSpace(bk.SourceURL) != "" {
+		if su, err := url.Parse(strings.TrimSpace(bk.SourceURL)); err == nil && su.Host != "" {
+			for _, k := range bookURLKeys(su) {
+				if _, exists := m[k]; !exists {
+					m[k] = bk.FlatChapters[0].ID
+				}
+			}
+		}
+	}
+	return m
+}
+
+func bookURLKeys(u *url.URL) []string {
+	if u == nil || u.Host == "" {
+		return nil
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil
+	}
+	host := strings.ToLower(u.Host)
+	rawPath := u.Path
+	if unesc, err := url.PathUnescape(rawPath); err == nil && unesc != "" {
+		rawPath = unesc
+	}
+	if rawPath == "" {
+		rawPath = "/"
+	}
+	cleanP := path.Clean(rawPath)
+	if !strings.HasPrefix(cleanP, "/") {
+		cleanP = "/" + cleanP
+	}
+
+	seen := make(map[string]bool, 5)
+	var keys []string
+	add := func(p string) {
+		k := scheme + "://" + host + p
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+
+	add(cleanP)
+	lowP := strings.ToLower(cleanP)
+	switch {
+	case strings.HasSuffix(lowP, "/index.html"):
+		dir := strings.TrimSuffix(cleanP[:len(cleanP)-len("/index.html")], "/")
+		if dir == "" {
+			add("/")
+		} else {
+			add(dir)
+			add(dir + "/")
+		}
+	case strings.HasSuffix(lowP, "/index.htm"):
+		dir := strings.TrimSuffix(cleanP[:len(cleanP)-len("/index.htm")], "/")
+		if dir == "" {
+			add("/")
+		} else {
+			add(dir)
+			add(dir + "/")
+		}
+	case strings.HasSuffix(lowP, "/readme.md"):
+		dir := strings.TrimSuffix(cleanP[:len(cleanP)-len("/readme.md")], "/")
+		if dir == "" {
+			add("/")
+		} else {
+			add(dir)
+			add(dir + "/")
+			add(dir + "/index.html")
+		}
+	case strings.HasSuffix(lowP, ".html"):
+		stem := cleanP[:len(cleanP)-len(".html")]
+		add(stem)
+		add(stem + ".md")
+	case strings.HasSuffix(lowP, ".md"):
+		stem := cleanP[:len(cleanP)-len(".md")]
+		add(stem + ".html")
+		add(stem)
+	default:
+		if cleanP == "/" {
+			add("/index.html")
+		} else {
+			trimmed := strings.TrimSuffix(cleanP, "/")
+			add(trimmed)
+			add(trimmed + "/")
+			add(trimmed + "/index.html")
+			add(trimmed + ".html")
+		}
+	}
+	return keys
+}
+
+func rewriteBookSubtreeURLs(
+	root *nethtml.Node,
+	finalURL *url.URL,
+	bookSlug string,
+	activeChapterID string,
+	activeKeys map[string]bool,
+	chapterMap map[string]string,
+) {
+	var walk func(n *nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		if n.Type == nethtml.ElementNode {
+			tag := strings.ToLower(n.Data)
+			switch tag {
+			case "a":
+				rawHref := strings.TrimSpace(getNodeAttr(n, "href"))
+				if rawHref == "" || isDangerousHrefScheme(rawHref) {
+					removeNodeAttr(n, "href")
+				} else if strings.HasPrefix(rawHref, "#") {
+					// Keep in-chapter #fragment; proseHTML binds it to current /books/{slug}?ch={id}#frag
+					removeNodeAttr(n, "target")
+					removeNodeAttr(n, "data-no-pjax")
+				} else if finalURL != nil {
+					if ref, err := url.Parse(rawHref); err == nil {
+						abs := finalURL.ResolveReference(ref)
+						frag := ""
+						if abs.Fragment != "" {
+							frag = "#" + abs.Fragment
+						}
+						matchedID := ""
+						isSelf := false
+						for _, k := range bookURLKeys(abs) {
+							if activeKeys[k] {
+								isSelf = true
+							}
+							if idHit, ok := chapterMap[k]; ok && matchedID == "" {
+								matchedID = idHit
+							}
+						}
+						if isSelf && frag != "" {
+							setNodeAttr(n, "href", frag)
+							removeNodeAttr(n, "target")
+							removeNodeAttr(n, "rel")
+							removeNodeAttr(n, "data-no-pjax")
+						} else if matchedID != "" || isSelf {
+							chID := matchedID
+							if chID == "" {
+								chID = activeChapterID
+							}
+							internalHref := fmt.Sprintf("/books/%s?ch=%s%s", url.PathEscape(bookSlug), url.QueryEscape(chID), frag)
+							setNodeAttr(n, "href", internalHref)
+							removeNodeAttr(n, "target")
+							removeNodeAttr(n, "rel")
+							removeNodeAttr(n, "data-no-pjax")
+						} else if abs.Scheme == "http" || abs.Scheme == "https" {
+							setNodeAttr(n, "href", abs.String())
+							setNodeAttr(n, "target", "_blank")
+							setNodeAttr(n, "rel", "noopener noreferrer")
+							setNodeAttr(n, "data-no-pjax", "1")
+						} else {
+							removeNodeAttr(n, "href")
+						}
+					}
+				}
+			case "img", "source", "audio", "video":
+				src := strings.TrimSpace(getNodeAttr(n, "src"))
+				if (src == "" || strings.HasPrefix(strings.ToLower(src), "data:")) && tag == "img" {
+					for _, altAttr := range []string{"data-src", "data-original", "data-lazy-src"} {
+						if ds := strings.TrimSpace(getNodeAttr(n, altAttr)); ds != "" && !isDangerousHrefScheme(ds) {
+							src = ds
+							break
+						}
+					}
+				}
+				if src != "" && finalURL != nil && !strings.HasPrefix(strings.ToLower(src), "data:") {
+					if ref, err := url.Parse(src); err == nil {
+						abs := finalURL.ResolveReference(ref)
+						if abs.Scheme == "http" || abs.Scheme == "https" {
+							setNodeAttr(n, "src", abs.String())
+						} else {
+							removeNodeAttr(n, "src")
+						}
+					}
+				}
+				removeNodeAttr(n, "srcset")
+				if tag == "img" && getNodeAttr(n, "loading") == "" {
+					setNodeAttr(n, "loading", "lazy")
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+}
+
+func getNodeAttr(n *nethtml.Node, key string) string {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, key) {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func hasNodeAttr(n *nethtml.Node, key string) bool {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func setNodeAttr(n *nethtml.Node, key, val string) {
+	for i := range n.Attr {
+		if strings.EqualFold(n.Attr[i].Key, key) {
+			n.Attr[i].Val = val
+			return
+		}
+	}
+	n.Attr = append(n.Attr, nethtml.Attribute{Key: key, Val: val})
+}
+
+func removeNodeAttr(n *nethtml.Node, key string) {
+	out := n.Attr[:0]
+	for _, a := range n.Attr {
+		if !strings.EqualFold(a.Key, key) {
+			out = append(out, a)
+		}
+	}
+	n.Attr = out
+}
+
+func hasAnyClassToken(cls string, targets ...string) bool {
+	if cls == "" {
+		return false
+	}
+	for _, tok := range strings.Fields(cls) {
+		for _, want := range targets {
+			if strings.EqualFold(tok, want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractNodeText(n *nethtml.Node) string {
+	var b strings.Builder
+	var walk func(cur *nethtml.Node)
+	walk = func(cur *nethtml.Node) {
+		if cur.Type == nethtml.TextNode {
+			b.WriteString(cur.Data)
+		}
+		for c := cur.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return b.String()
+}
+
+func countVisibleRunes(n *nethtml.Node, stopAt int) int {
+	cnt := 0
+	var walk func(cur *nethtml.Node)
+	walk = func(cur *nethtml.Node) {
+		if cnt >= stopAt {
+			return
+		}
+		if cur.Type == nethtml.TextNode {
+			for _, r := range cur.Data {
+				if !unicode.IsSpace(r) {
+					cnt++
+					if cnt >= stopAt {
+						return
+					}
+				}
+			}
+		}
+		for c := cur.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return cnt
+}
+
+func hasBookMediaElement(n *nethtml.Node) bool {
+	found := false
+	var walk func(cur *nethtml.Node)
+	walk = func(cur *nethtml.Node) {
+		if found {
+			return
+		}
+		if cur.Type == nethtml.ElementNode {
+			switch strings.ToLower(cur.Data) {
+			case "img", "pre", "table", "svg", "video", "audio":
+				found = true
+				return
+			}
+		}
+		for c := cur.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return found
 }

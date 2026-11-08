@@ -199,21 +199,38 @@
     closeAnimated(document.getElementById("volo-nav-more-menu"), document.getElementById("volo-nav-more-btn"), 180);
   }
 
+  var lastActiveTocID = "";
+  var pinnedTocID = "";
+  var pinnedTocY = -1;
+
+  function notifyScrollEnd() {
+    window.dispatchEvent(new Event("volo:scrollend"));
+  }
+
   /* Interruptible Cubic-Out Smooth Scroll Engine */
-  function cancelSmoothScroll() {
+  function cancelSmoothScroll(silent) {
     if (scrollAnimRAF) {
-      cancelAnimationFrame(scrollAnimRAF);
+      if (scrollAnimRAF > 0) cancelAnimationFrame(scrollAnimRAF);
       scrollAnimRAF = 0;
+      if (!silent) notifyScrollEnd();
     }
   }
 
-  window.addEventListener("wheel", cancelSmoothScroll, { passive: true });
-  window.addEventListener("touchstart", cancelSmoothScroll, { passive: true });
+  function onUserScrollInterrupt() {
+    pinnedTocID = "";
+    cancelSmoothScroll(false);
+  }
+
+  window.addEventListener("wheel", onUserScrollInterrupt, { passive: true });
+  window.addEventListener("touchstart", onUserScrollInterrupt, { passive: true });
   window.addEventListener("keydown", function (ev) {
     if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", " ", "Home", "End"].indexOf(ev.key) !== -1) {
-      cancelSmoothScroll();
+      onUserScrollInterrupt();
     }
   });
+  window.__voloIsScrolling = function () {
+    return scrollAnimRAF !== 0;
+  };
 
   function syncHeaderHeight() {
     var header = document.querySelector(".studio-header");
@@ -227,31 +244,46 @@
     return syncHeaderHeight() + 20;
   }
 
-  function smoothScrollToY(targetY) {
-    cancelSmoothScroll();
-    var maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+  function smoothScrollToY(targetY, duration) {
+    cancelSmoothScroll(true);
+    var maxScroll = Math.max(0, document.documentElement.scrollHeight - (window.innerHeight || 0));
     var destY = Math.min(maxScroll, Math.max(0, Math.round(targetY)));
     var startY = window.scrollY || window.pageYOffset || 0;
     var diff = destY - startY;
+    var dist = Math.abs(diff);
 
-    if (prefersReducedMotion() || Math.abs(diff) < 4) {
+    if (prefersReducedMotion() || dist < 4) {
       window.scrollTo(0, destY);
+      notifyScrollEnd();
       return;
     }
 
-    var duration = Math.min(560, Math.max(280, Math.round(Math.abs(diff) * 0.22)));
+    var maxGlide = Math.min(Math.max(Math.round((window.innerHeight || 800) * 1.15), 700), 1080);
+    var dur = duration
+      ? Math.min(280, Math.max(160, Math.round(duration)))
+      : Math.min(280, Math.max(160, Math.round(150 + Math.min(dist, 1200) * 0.1)));
+
+    if (dist > maxGlide) {
+      startY = destY - (diff > 0 ? maxGlide : -maxGlide);
+      diff = destY - startY;
+      dur = duration ? Math.min(280, Math.max(160, Math.round(duration))) : 240;
+      scrollAnimRAF = -1;
+      window.scrollTo(0, startY);
+    }
+
     var startTime = null;
 
     function step(ts) {
       if (startTime === null) startTime = ts;
       var elapsed = ts - startTime;
-      var t = Math.min(1, elapsed / duration);
+      var t = Math.min(1, elapsed / dur);
       var eased = 1 - Math.pow(1 - t, 3);
       window.scrollTo(0, Math.round(startY + diff * eased));
       if (t < 1) {
         scrollAnimRAF = requestAnimationFrame(step);
       } else {
         scrollAnimRAF = 0;
+        notifyScrollEnd();
       }
     }
     scrollAnimRAF = requestAnimationFrame(step);
@@ -296,22 +328,31 @@
     return true;
   };
 
-  function setActiveTOCLink(activeID) {
-    if (!activeID) return;
+  function setActiveTOCLink(activeID, force) {
+    if (!activeID || (!force && activeID === lastActiveTocID)) return;
+    lastActiveTocID = activeID;
     document.querySelectorAll(".volo-toc-link[data-toc-id]").forEach(function (a) {
       var match = a.getAttribute("data-toc-id") === activeID;
-      a.classList.toggle("is-active", match);
-      if (match) {
-        var nav = a.closest(".volo-toc__list, .volo-toc-nav");
+      if (a.classList.contains("is-active") !== match) {
+        a.classList.toggle("is-active", match);
+      }
+      if (match && a.closest("#volo-toc-card, .toc-card")) {
+        var nav = a.closest(".volo-toc__list, .volo-toc-nav, .toc-card");
         if (nav && nav.scrollHeight > nav.clientHeight && nav.offsetParent !== null) {
-          var navRect = nav.getBoundingClientRect();
-          var linkRect = a.getBoundingClientRect();
-          var relTop = linkRect.top - navRect.top + nav.scrollTop;
-          var relBottom = relTop + linkRect.height;
+          var relTop = a.offsetParent === nav
+            ? a.offsetTop
+            : (a.getBoundingClientRect().top - nav.getBoundingClientRect().top + nav.scrollTop);
+          var linkH = a.offsetHeight || 28;
+          var relBottom = relTop + linkH;
           var viewTop = nav.scrollTop;
           var viewBottom = viewTop + nav.clientHeight;
-          if (relTop < viewTop + 20 || relBottom > viewBottom - 20) {
-            nav.scrollTop = Math.max(0, relTop - Math.round(nav.clientHeight * 0.35));
+          if (relTop < viewTop + 24 || relBottom > viewBottom - 24) {
+            var nextTop = Math.max(0, relTop - Math.round((nav.clientHeight - linkH) * 0.38));
+            if (typeof nav.scrollTo === "function" && !prefersReducedMotion()) {
+              nav.scrollTo({ top: nextTop, behavior: "smooth" });
+            } else {
+              nav.scrollTop = nextTop;
+            }
           }
         }
       }
@@ -320,19 +361,23 @@
 
   function smoothScrollToHash(rawID, skipHistory) {
     if (!rawID) {
+      pinnedTocID = "";
       smoothScrollToY(0);
       return false;
     }
     var targetEl = findHeadingTarget(rawID);
     if (!targetEl) return false;
     var destY = (window.scrollY || 0) + targetEl.getBoundingClientRect().top - getHeaderOffset();
+    var maxScroll = Math.max(0, document.documentElement.scrollHeight - (window.innerHeight || 0));
+    pinnedTocID = targetEl.id;
+    pinnedTocY = Math.min(maxScroll, Math.max(0, Math.round(destY)));
     if (!skipHistory) {
       try {
         var cleanHash = encodeURIComponent(targetEl.id).replace(/%3A/gi, ":");
         history.replaceState(history.state, "", "#" + cleanHash);
       } catch (_) {}
     }
-    setActiveTOCLink(targetEl.id);
+    setActiveTOCLink(targetEl.id, false);
     pulseCommentTarget(targetEl);
     smoothScrollToY(destY);
     return true;
@@ -790,6 +835,9 @@
       var fn = tocCleanups.pop();
       try { fn(); } catch (_) {}
     }
+    lastActiveTocID = "";
+    pinnedTocID = "";
+    pinnedTocY = -1;
 
     var root = scope || document;
     var tocCard = root.querySelector("#volo-toc-card") || document.getElementById("volo-toc-card");
@@ -850,32 +898,48 @@
     var spyPending = false;
     function updateSpy() {
       spyPending = false;
-      if (headings.length) {
-        var threshold = getHeaderOffset() + 18;
-        var activeID = headings[0].id;
-        for (var i = 0; i < headings.length; i++) {
-          if (headings[i].getBoundingClientRect().top <= threshold) {
-            activeID = headings[i].id;
-          } else {
-            break;
-          }
+      if (scrollAnimRAF !== 0 || !headings.length) return;
+      if (pinnedTocID) {
+        if (Math.abs((window.scrollY || window.pageYOffset || 0) - pinnedTocY) <= 4) {
+          setActiveTOCLink(pinnedTocID, false);
+          return;
         }
-        setActiveTOCLink(activeID);
+        pinnedTocID = "";
       }
+      var threshold = getHeaderOffset() + 18;
+      var lo = 0;
+      var hi = headings.length - 1;
+      var idx = 0;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (headings[mid].getBoundingClientRect().top <= threshold) {
+          idx = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      setActiveTOCLink(headings[idx].id, false);
     }
 
     function requestSpy() {
-      if (!spyPending) {
-        spyPending = true;
-        requestAnimationFrame(updateSpy);
-      }
+      if (scrollAnimRAF !== 0 || spyPending) return;
+      spyPending = true;
+      requestAnimationFrame(updateSpy);
+    }
+
+    function onScrollEnd() {
+      spyPending = false;
+      updateSpy();
     }
 
     window.addEventListener("scroll", requestSpy, { passive: true });
     window.addEventListener("resize", requestSpy, { passive: true });
+    window.addEventListener("volo:scrollend", onScrollEnd);
     tocCleanups.push(function () {
       window.removeEventListener("scroll", requestSpy);
       window.removeEventListener("resize", requestSpy);
+      window.removeEventListener("volo:scrollend", onScrollEnd);
     });
     updateSpy();
   }
@@ -1464,11 +1528,12 @@
     }
 
     root.querySelectorAll(".js-volo-unlock-form").forEach(function (form) {
+      var msg = form.querySelector(".js-unlock-msg");
+      var defaultUnlockErr = (msg && msg.textContent.trim()) || "";
       form.addEventListener("submit", function (ev) {
         ev.preventDefault();
         var aid = form.getAttribute("data-article-id");
         var input = form.querySelector("input[type='password']") || form.querySelector("input[name='password']");
-        var msg = form.querySelector(".js-unlock-msg");
         if (!aid || !input) return;
         fetch("/api/v1/articles/" + encodeURIComponent(aid) + "/unlock", {
           method: "POST",
@@ -1481,10 +1546,15 @@
           }
           r.json().catch(function () { return {}; }).then(function (d) {
             if (msg) {
-              if (d && d.error) msg.textContent = d.error;
+              msg.textContent = (d && d.error) || form.getAttribute("data-err-unlock") || defaultUnlockErr || i18nFallback("unlockErr");
               msg.hidden = false;
             }
           });
+        }).catch(function () {
+          if (msg) {
+            msg.textContent = form.getAttribute("data-err-network") || i18nFallback("netErr");
+            msg.hidden = false;
+          }
         });
       });
     });
@@ -1516,6 +1586,54 @@
     initBookshelfAndReader(root);
   }
 
+  var I18N_FALLBACKS = {
+    "zh-CN": {
+      loginErr: "登录失败，请检查账号或密码",
+      regErr: "注册失败，请检查填写信息",
+      unlockErr: "密码错误，请重试",
+      reqErr: "请求失败，请稍后重试",
+      netErr: "网络错误，请检查连接后重试",
+      codeSent: "验证码已发送",
+      noResults: "未找到相关内容"
+    },
+    "zh-TW": {
+      loginErr: "登入失敗，請檢查帳號或密碼",
+      regErr: "註冊失敗，請檢查填寫資訊",
+      unlockErr: "密碼錯誤，請重試",
+      reqErr: "請求失敗，請稍後重試",
+      netErr: "網路錯誤，請檢查連線後重試",
+      codeSent: "驗證碼已發送",
+      noResults: "找不到相關內容"
+    },
+    en: {
+      loginErr: "Invalid credentials or sign-in failed",
+      regErr: "Registration failed",
+      unlockErr: "Incorrect password",
+      reqErr: "Request failed",
+      netErr: "Network error, please try again",
+      codeSent: "Verification code sent",
+      noResults: "No results"
+    }
+  };
+
+  function i18nFallback(key) {
+    var raw = String((document.documentElement && document.documentElement.getAttribute("lang")) || "").toLowerCase();
+    var dict = I18N_FALLBACKS.en;
+    if (raw.indexOf("zh") === 0) {
+      dict = (raw.indexOf("tw") !== -1 || raw.indexOf("hk") !== -1 || raw.indexOf("mo") !== -1 || raw.indexOf("hant") !== -1)
+        ? I18N_FALLBACKS["zh-TW"]
+        : I18N_FALLBACKS["zh-CN"];
+    }
+    return (dict && dict[key]) || I18N_FALLBACKS.en[key] || "";
+  }
+
+  function setAuthMsg(el, txt, isErr) {
+    if (!el) return;
+    el.textContent = txt || "";
+    el.classList.toggle("reader-auth-msg--error", !!isErr);
+    el.classList.toggle("reader-auth-msg--info", !isErr && !!txt);
+  }
+
   function resolveFormNextURL(fd) {
     var fromField = fd ? (fd.get("next") || "") : "";
     var fromQS = "";
@@ -1541,9 +1659,11 @@
           if (res.ok) {
             var target = sanitizeNextPath((res.d && (res.d.redirect || res.d.next)) || nextURL) || "/";
             window.location.href = window.location.origin + "/" + target.replace(/^[\/\\]+/, "");
-          } else if (statusEl) {
-            statusEl.textContent = (res.d && res.d.error) || "Sign-in failed";
+          } else {
+            setAuthMsg(statusEl, (res.d && res.d.error) || loginForm.getAttribute("data-err-login") || i18nFallback("loginErr"), true);
           }
+        }).catch(function () {
+          setAuthMsg(statusEl, loginForm.getAttribute("data-err-network") || i18nFallback("netErr"), true);
         });
       });
     }
@@ -1559,8 +1679,16 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: emailInput.value })
-        }).then(function (r) { return r.json(); }).then(function (d) {
-          if (statusEl) statusEl.textContent = d.message || d.error || "";
+        }).then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d }; });
+        }).then(function (res) {
+          if (res.ok) {
+            setAuthMsg(statusEl, (res.d && res.d.message) || sendBtn.getAttribute("data-msg-sent") || i18nFallback("codeSent"), false);
+          } else {
+            setAuthMsg(statusEl, (res.d && res.d.error) || regForm.getAttribute("data-err-code") || i18nFallback("reqErr"), true);
+          }
+        }).catch(function () {
+          setAuthMsg(statusEl, regForm.getAttribute("data-err-network") || i18nFallback("netErr"), true);
         });
       });
       regForm.addEventListener("submit", function (ev) {
@@ -1584,9 +1712,11 @@
           if (res.ok) {
             var target = sanitizeNextPath((res.d && (res.d.redirect || res.d.next)) || nextURL) || "/";
             window.location.href = window.location.origin + "/" + target.replace(/^[\/\\]+/, "");
-          } else if (statusEl) {
-            statusEl.textContent = (res.d && res.d.error) || "Registration failed";
+          } else {
+            setAuthMsg(statusEl, (res.d && res.d.error) || regForm.getAttribute("data-err-register") || i18nFallback("regErr"), true);
           }
+        }).catch(function () {
+          setAuthMsg(statusEl, regForm.getAttribute("data-err-network") || i18nFallback("netErr"), true);
         });
       });
     }
@@ -1688,7 +1818,7 @@
         .then(function (d) {
           var hits = (d && d.hits) || [];
           if (!hits.length) {
-            list.innerHTML = '<div class="volo-search-empty">' + escapeHTML(modal.getAttribute("data-empty") || "No results") + "</div>";
+            list.innerHTML = '<div class="volo-search-empty">' + escapeHTML(modal.getAttribute("data-empty") || i18nFallback("noResults")) + "</div>";
             return;
           }
           list.innerHTML = hits.map(function (h, i) {

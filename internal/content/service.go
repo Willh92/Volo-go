@@ -170,6 +170,9 @@ type Service struct {
 	mediaMu   sync.RWMutex
 	mediaDims map[string][2]int
 
+	bookChapterMu    sync.Mutex
+	bookChapterCache map[string]cachedBookChapter
+
 	onArticlePublished atomic.Pointer[func(context.Context, domain.RawArticle)]
 }
 

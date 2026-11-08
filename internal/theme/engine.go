@@ -343,6 +343,7 @@ type PageContext struct {
 	ActiveChapterHTML         string
 	ActiveChapterNeedsMath    bool
 	ActiveChapterNeedsMermaid bool
+	BookIframeAllowSameOrigin bool
 	PrevChapter               *domain.BookChapter
 	NextChapter               *domain.BookChapter
 	ReaderNextURL             string

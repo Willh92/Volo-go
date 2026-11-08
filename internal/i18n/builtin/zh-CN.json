@@ -223,5 +223,22 @@
   "studio.filter_empty": "没有匹配的筛选项",
   "studio.clear_filter": "清空",
   "reader.no_account_cta": "还没有读者账号？前往注册",
-  "reader.has_account_cta": "已有读者账号？返回登录"
+  "reader.has_account_cta": "已有读者账号？返回登录",
+  "error.bad_request": "请求参数格式有误，请检查后重试",
+  "error.server_busy": "服务暂时繁忙，请稍后再试",
+  "comment.err_no_guest_passport": "未检测到当前浏览器的有效游客凭证，无需认领",
+  "comment.err_length": "评论内容长度需在 1～4000 个字符之间",
+  "comment.err_nickname": "请填写昵称（1～48 个字符）",
+  "comment.err_parent_missing": "所回复的原评论不存在或已删除",
+  "comment.err_edit_forbidden": "无权修改或删除该评论（或已超过可编辑时限）",
+  "comment.err_antispam": "评论未通过反垃圾安全策略校验",
+  "comment.err_pow": "安全校验已过期或无效，请重新提交",
+  "reader.err_reg_disabled": "本站当前未开放读者注册",
+  "reader.err_invalid_credentials": "用户名/邮箱或密码不正确",
+  "reader.err_invalid_email": "请输入有效的电子邮箱地址",
+  "reader.err_username_len": "用户名长度需为 2～48 个字符",
+  "reader.err_password_policy": "密码长度不足或不符合安全要求",
+  "reader.err_verify_code": "邮箱验证码不正确或已过期",
+  "reader.err_code_cooldown": "验证码发送过于频繁，请等待 60 秒后再试",
+  "reader.err_account_exists": "该用户名或电子邮箱已被注册"
 }

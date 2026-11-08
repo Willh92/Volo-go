@@ -63,7 +63,7 @@ func bootstrapAuditEnv(t *testing.T) (*m5Env, []*http.Cookie, map[string]string,
 func TestAudit_Sanitization_FeedXSS_And_UnpublishedTargetPrivacy(t *testing.T) {
 	env, adminCookies, adminHdrs, _ := bootstrapAuditEnv(t)
 
-	// 1. Custom CSS UTF-8 U+023A / U+212A non-panic & </style> breakout defense + CustomHeadMeta <script> strip
+	// 1. Custom CSS UTF-8 U+023A / U+212A non-panic & </style> breakout defense + Admin Head & Footer Script/Ad Injection
 	resp, raw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/appearance", map[string]any{
 		"active_theme": "studio",
 		"default_mode": "system",
@@ -75,11 +75,13 @@ func TestAudit_Sanitization_FeedXSS_And_UnpublishedTargetPrivacy(t *testing.T) {
 	}
 
 	resp, raw = doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/site", map[string]any{
-		"title":            "Audit Studio",
-		"default_locale":   "en",
-		"timezone":         "UTC",
-		"favicon_url":      "/favicon.svg",
-		"custom_head_meta": `<meta name="google-site-verification" content="ok123"><script>alert('xss')</script><link rel="me" href="https://github.com/Willh92"><link rel="stylesheet" href="javascript:alert(1)">`,
+		"title":              "Audit Studio",
+		"default_locale":     "en",
+		"timezone":           "UTC",
+		"favicon_url":        "/favicon.svg",
+		"enable_footer_html": true,
+		"custom_head_meta":   `<meta name="google-site-verification" content="ok123"><script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-999"></script>`,
+		"footer_text":        `<ins class="adsbygoogle" data-ad-client="ca-pub-999"></ins><script>(adsbygoogle = window.adsbygoogle || []).push({});</script>`,
 	}, adminCookies, adminHdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PATCH settings/site = %d %s", resp.StatusCode, string(raw))
@@ -91,11 +93,13 @@ func TestAudit_Sanitization_FeedXSS_And_UnpublishedTargetPrivacy(t *testing.T) {
 		t.Fatalf("GET / = %d", resp.StatusCode)
 	}
 	homeHTML := string(homeBytes)
-	if strings.Contains(strings.ToLower(homeHTML), "</style><script>") || strings.Contains(homeHTML, "alert('xss')") {
-		t.Fatalf("XSS escaped into rendered home HTML:\n%s", homeHTML)
+	if strings.Contains(strings.ToLower(homeHTML), "</style><script>") {
+		t.Fatalf("CustomCSS breakout escaped into rendered home HTML:\n%s", homeHTML)
 	}
-	if !strings.Contains(homeHTML, `google-site-verification`) {
-		t.Fatalf("expected allowed <meta name=\"google-site-verification\"> in home HTML")
+	if !strings.Contains(homeHTML, `google-site-verification`) ||
+		!strings.Contains(homeHTML, `googlesyndication.com/pagead/js/adsbygoogle.js`) ||
+		!strings.Contains(homeHTML, `data-ad-client="ca-pub-999"`) {
+		t.Fatalf("expected Admin <head> & footer Google script injection in home HTML:\n%s", homeHTML)
 	}
 
 	// 2. Feed Stored XSS Fix: article summary containing backticked `<img src=x onerror=alert(1)>` (which stays literal in PlainText) MUST be escaped in RSS!
@@ -476,5 +480,62 @@ func TestAudit_AdminSecurity_Pagination_PasswordPreservation_And_BgAuditLog(t *t
 	_ = json.Unmarshal(auditRaw, &auditRes)
 	if auditRes.Total < 1 || auditRes.PerPage != 5 || len(auditRes.Actions) == 0 {
 		t.Fatalf("unexpected paginated audit-logs response: %+v", auditRes)
+	}
+}
+
+func TestAudit_GuestClaimRoleIsolationAndLocalizedPublicErrors(t *testing.T) {
+	env, adminCookies, adminHdrs, _ := bootstrapAuditEnv(t)
+
+	resp, artRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/articles", map[string]any{
+		"title":         "Guest Claim Isolation Post",
+		"slug":          "guest-claim-isolation",
+		"content_md":    "Testing guest comment claim isolation.",
+		"status":        "published",
+		"allow_comment": true,
+	}, adminCookies, adminHdrs)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/admin/articles = %d %s", resp.StatusCode, string(artRaw))
+	}
+	var createdArt struct {
+		Article domain.RawArticle `json:"article"`
+	}
+	_ = json.Unmarshal(artRaw, &createdArt)
+
+	// 1. Admin requesting /api/v1/guest/passport must NEVER mint a guest passport
+	resp, gpRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/guest/passport", nil, adminCookies, nil)
+	if resp.StatusCode != http.StatusOK || strings.Contains(string(gpRaw), `"passport_token":"v1.`) {
+		t.Fatalf("expected empty guest passport for staff admin, got %d %s", resp.StatusCode, string(gpRaw))
+	}
+
+	// 2. Admin loading GET /api/v1/comments must see claimable_guest_count=0 and clear_guest_passport=true
+	resp, cmtListRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/comments?target_type=article&target_id="+createdArt.Article.ID, nil, adminCookies, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/comments = %d %s", resp.StatusCode, string(cmtListRaw))
+	}
+	var cmtList struct {
+		ClaimableGuestCount int  `json:"claimable_guest_count"`
+		ClearGuestPassport  bool `json:"clear_guest_passport"`
+	}
+	_ = json.Unmarshal(cmtListRaw, &cmtList)
+	if cmtList.ClaimableGuestCount != 0 || !cmtList.ClearGuestPassport {
+		t.Fatalf("expected admin claimable_guest_count=0 and clear_guest_passport=true, got %+v", cmtList)
+	}
+
+	// 3. Admin calling POST /api/v1/reader/claim-guest-comments must get 403 localized zh-CN error (not raw English)
+	resp, claimAdmRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/v1/reader/claim-guest-comments", nil, adminCookies, map[string]string{
+		"Accept-Language": "zh-CN",
+	})
+	if resp.StatusCode != http.StatusForbidden || strings.Contains(string(claimAdmRaw), "no verified guest passport") || !strings.Contains(string(claimAdmRaw), "无权") {
+		t.Fatalf("expected 403 localized zh-CN forbidden for admin claim, got %d %s", resp.StatusCode, string(claimAdmRaw))
+	}
+
+	// 4. Invalid comment length under zh-CN returns localized Chinese message (not raw English)
+	resp, badCmtRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/v1/comments", map[string]any{
+		"target_type": "article",
+		"target_id":   createdArt.Article.ID,
+		"content_md":  "",
+	}, adminCookies, map[string]string{"Accept-Language": "zh-CN"})
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(badCmtRaw), "评论内容长度") {
+		t.Fatalf("expected localized zh-CN comment length error, got %d %s", resp.StatusCode, string(badCmtRaw))
 	}
 }

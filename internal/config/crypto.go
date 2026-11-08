@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -93,8 +94,8 @@ func readOrCreateSecretFile(path string) ([]byte, bool, error) {
 		if err != nil || len(decoded) < 32 {
 			return nil, false, fmt.Errorf("config: invalid secret key file %q (expected >= 64 hex chars)", path)
 		}
-		// Enforce 0600 on Unix if permissions drifted wider.
-		if info.Mode().Perm()&0o077 != 0 {
+		// Enforce 0600 on Unix if permissions drifted wider (Windows NTFS uses ACLs and reports 0666).
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 			_ = os.Chmod(path, 0o600)
 		}
 		return decoded, false, nil
@@ -127,9 +128,11 @@ func readOrCreateSecretFile(path string) ([]byte, bool, error) {
 		_ = os.Remove(tmpPath)
 		return nil, false, fmt.Errorf("config: close secret key file: %w", err)
 	}
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		_ = os.Remove(tmpPath)
-		return nil, false, fmt.Errorf("config: chmod 0600 secret key file: %w", err)
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(tmpPath, 0o600); err != nil {
+			_ = os.Remove(tmpPath)
+			return nil, false, fmt.Errorf("config: chmod 0600 secret key file: %w", err)
+		}
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)

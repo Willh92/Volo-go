@@ -759,14 +759,14 @@ func TestVoloSoloUIPolish_CommentsDesc_Bookshelf_Templates(t *testing.T) {
 		t.Fatalf("expected nested replies ASC [ReplyFirst, ReplySecond], got %+v", replies)
 	}
 
-	// 7. Sanitized Footer HTML + License Notice toggle + Runtime Logs API
-	if _, _, err := env.settings.PatchDomain(env.ctx, "site", []byte(`{"enable_footer_html":true,"footer_text":"<a href=\"https://beian.miit.gov.cn\">京ICP备000001号</a><script>alert(1)</script>","enable_license_notice":false}`), 0); err != nil {
-		t.Fatalf("PatchDomain site footer_text & license: %v", err)
+	// 7. Admin Head & Footer HTML/Script Injection + License Notice toggle + Runtime Logs API
+	if _, _, err := env.settings.PatchDomain(env.ctx, "site", []byte(`{"custom_head_meta":"<script data-slot=\"head-ad\" async src=\"https://example.com/head-ad.js\"></script>","enable_footer_html":true,"footer_text":"<a href=\"https://beian.miit.gov.cn\">京ICP备000001号</a><script data-slot=\"footer-ad\">window.__voloAdSlot=1;</script>","enable_license_notice":false}`), 0); err != nil {
+		t.Fatalf("PatchDomain site head/footer injection & license: %v", err)
 	}
 	_, postAfterToggle := doJSONReq(t, http.MethodGet, env.ts.URL+"/posts/online-bookshelf", nil, nil, nil)
 	postToggleStr := string(postAfterToggle)
-	if !strings.Contains(postToggleStr, "京ICP备000001号") || strings.Contains(postToggleStr, "<script>alert(1)</script>") {
-		t.Fatalf("expected sanitized ICP footer HTML without inline script")
+	if !strings.Contains(postToggleStr, `data-slot="head-ad"`) || !strings.Contains(postToggleStr, "京ICP备000001号") || !strings.Contains(postToggleStr, `<script data-slot="footer-ad">window.__voloAdSlot=1;</script>`) {
+		t.Fatalf("expected Admin head and footer HTML/script injection slots to render intact")
 	}
 	if strings.Contains(postToggleStr, "volo-license-box") {
 		t.Fatalf("expected volo-license-box hidden when enable_license_notice=false")

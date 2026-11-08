@@ -746,7 +746,7 @@ func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName
 		return domain.User{}, err
 	}
 
-	if s.deps.Passports != nil && s.deps.Auth != nil {
+	if user.Role == domain.RoleReader && s.deps.Passports != nil && s.deps.Auth != nil {
 		if gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
 			_, _ = s.deps.Auth.ClaimGuestComments(r.Context(), &user, gp)
 		}

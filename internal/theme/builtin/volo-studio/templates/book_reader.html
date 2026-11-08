@@ -1,7 +1,7 @@
 {{define "content"}}
 {{$isExternalChapter := and .ActiveChapter (or (hasPrefix .ActiveChapter.URL "https://") (hasPrefix .ActiveChapter.URL "http://"))}}
 {{$isExternalSource := or (hasPrefix .BookDetail.SourceURL "https://") (hasPrefix .BookDetail.SourceURL "http://")}}
-{{$isExternalIframe := and (eq .BookDetail.EmbedMode "iframe") (or (and $isExternalChapter (not .ActiveChapterHTML)) (and (not .ActiveChapter) $isExternalSource))}}
+{{$isExternalIframe := and (eq .BookDetail.EmbedMode "iframe") (or (and $isExternalChapter (not .ActiveChapterHTML)) (and (not .ActiveChapter) $isExternalSource (not .ActiveChapterHTML)))}}
 <div class="book-reader-layout{{if .ActiveChapter}} has-active-chapter{{end}}{{if $isExternalIframe}} is-toc-collapsed{{end}}"
      data-book-reader="{{.BookDetail.Slug}}"
      {{if $isExternalIframe}}data-external-iframe="1"{{end}}
@@ -113,7 +113,7 @@
       {{else if and (eq .BookDetail.EmbedMode "iframe") $isExternalChapter}}
         <div class="book-reader-frame-wrap is-loading">
           <div class="book-reader-spinner" aria-hidden="true"></div>
-          <iframe class="book-reader-frame" src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" sandbox="allow-scripts allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
+          <iframe class="book-reader-frame" src="{{.ActiveChapter.URL}}" title="{{.ActiveChapter.Title}}" sandbox="allow-scripts{{if .BookIframeAllowSameOrigin}} allow-same-origin{{end}} allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
         </div>
       {{else}}
         <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
@@ -124,7 +124,7 @@
     {{else if $isExternalIframe}}
       <div class="book-reader-frame-wrap is-loading">
         <div class="book-reader-spinner" aria-hidden="true"></div>
-        <iframe class="book-reader-frame" src="{{.BookDetail.SourceURL}}" title="{{.BookDetail.Title}}" sandbox="allow-scripts allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
+        <iframe class="book-reader-frame" src="{{.BookDetail.SourceURL}}" title="{{.BookDetail.Title}}" sandbox="allow-scripts{{if .BookIframeAllowSameOrigin}} allow-same-origin{{end}} allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
       </div>
     {{else}}
       <h1 class="studio-article__title">{{.BookDetail.Title}}</h1>

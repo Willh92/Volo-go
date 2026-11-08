@@ -1021,28 +1021,31 @@ export function SystemWorkspace({
               </div>
             )}
 
+            <div class="volo-field">
+              <label>{t("sys.custom_head")}</label>
+              <textarea
+                class="volo-textarea volo-mono"
+                rows={4}
+                spellcheck={false}
+                value={domains.site?.custom_head_meta || ""}
+                onInput={(e) => setDomField("site", "custom_head_meta", (e.currentTarget as HTMLTextAreaElement).value)}
+              />
+              <small class="volo-help">{t("sys.custom_head_hint")}</small>
+            </div>
+
             {domains.site?.enable_footer_html !== false && (
               <div class="volo-field">
                 <label>{t("sys.footer_text")}</label>
                 <textarea
-                  class="volo-textarea"
-                  rows={3}
+                  class="volo-textarea volo-mono"
+                  rows={4}
+                  spellcheck={false}
                   value={domains.site?.footer_text || ""}
                   onInput={(e) => setDomField("site", "footer_text", (e.currentTarget as HTMLTextAreaElement).value)}
                 />
                 <small class="volo-help">{t("sys.footer_html_hint")}</small>
               </div>
             )}
-
-            <div class="volo-field">
-              <label>{t("sys.custom_head")}</label>
-              <textarea
-                class="volo-textarea"
-                rows={3}
-                value={domains.site?.custom_head_meta || ""}
-                onInput={(e) => setDomField("site", "custom_head_meta", (e.currentTarget as HTMLTextAreaElement).value)}
-              />
-            </div>
 
             <div class="volo-subcard">
               <div class="volo-subcard-title">{t("sys.social_title")}</div>
@@ -4753,29 +4756,46 @@ export function SystemWorkspace({
                   ) : (doctorReport.checks || []).length === 0 ? (
                     <ConsoleEmpty colSpan={3} />
                   ) : (
-                    (doctorReport.checks || []).map((chk: any) => (
-                      <tr key={chk.name}>
-                        <td class="col-cat" data-label={t("sys.doctor_col_check")}>
-                          <span class="volo-code-chip">{chk.name}</span>
-                        </td>
-                        <td class="col-status" data-label={t("art.status")}>
-                          <span class={`volo-status-pill ${chk.status === "ok" ? "ok" : chk.status === "warn" ? "warn" : "danger"}`}>
-                            <span class="volo-status-dot" />
-                            {String(chk.status || "ok").toUpperCase()}
-                          </span>
-                        </td>
-                        <td class="col-fluid" data-label={t("sys.doctor_col_summary")}>
-                          <div class="volo-cell-main">
-                            <div class="volo-cell-title">{chk.summary}</div>
-                            {chk.detail && (
-                              <div class="volo-cell-meta">
-                                <span>{chk.detail}</span>
-                              </div>
+                    (doctorReport.checks || []).map((chk: any) => {
+                      const nameKey = `sys.doc_name_${chk.name}`;
+                      const localizedName = t(nameKey) !== nameKey ? t(nameKey) : chk.name;
+                      const rawStatus = String(chk.status || "ok").toLowerCase();
+                      const statusKey = `sys.doc_status_${rawStatus}`;
+                      const statusLabel = t(statusKey) !== statusKey ? t(statusKey) : rawStatus.toUpperCase();
+                      const codeKey = chk.code ? `sys.doc_${chk.code}` : "";
+                      const safeParams: Record<string, string> = { extra: "", ...(chk.params || {}) };
+                      const translatedSummary = codeKey ? t(codeKey, safeParams) : "";
+                      const localizedSummary =
+                        codeKey && translatedSummary !== codeKey ? translatedSummary : chk.summary;
+                      return (
+                        <tr key={chk.name}>
+                          <td class="col-cat" data-label={t("sys.doctor_col_check")}>
+                            <strong style={{ fontWeight: 600 }}>{localizedName}</strong>
+                            {localizedName !== chk.name && (
+                              <span class="volo-code-chip" style={{ marginLeft: "6px" }}>
+                                {chk.name}
+                              </span>
                             )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))
+                          </td>
+                          <td class="col-status" data-label={t("art.status")}>
+                            <span class={`volo-status-pill ${rawStatus === "ok" ? "ok" : rawStatus === "warn" ? "warn" : "danger"}`}>
+                              <span class="volo-status-dot" />
+                              {statusLabel}
+                            </span>
+                          </td>
+                          <td class="col-fluid" data-label={t("sys.doctor_col_summary")}>
+                            <div class="volo-cell-main">
+                              <div class="volo-cell-title">{localizedSummary}</div>
+                              {chk.detail && (
+                                <div class="volo-cell-meta">
+                                  <span>{chk.detail}</span>
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
                   )}
                 </tbody>
               </table>

@@ -85,34 +85,38 @@
               <span>{{t .Locale "nav.more"}}</span>
               <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
-            <div id="volo-nav-more-menu" class="volo-popover studio-nav-more__menu" role="menu" hidden>
+            <div id="volo-nav-more-menu" class="volo-popover studio-nav-more__menu studio-more-menu" role="menu" hidden>
               {{range .NavMenu.Overflow}}
                 <a class="studio-nav-more__item {{if .IsActive}}is-active{{end}}" href="{{.URL}}" role="menuitem" {{if .OpenInNewTab}}target="_blank" rel="noopener" data-no-pjax{{end}}>
                   {{if .Icon}}{{navIconHTML .Icon}}{{end}}<span>{{.Title}}</span>
                 </a>
               {{end}}
               {{if .Viewer}}
-                {{if .NavMenu.Overflow}}<div class="volo-appearance__divider studio-only-mobile"></div>{{end}}
-                {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
-                  <a class="studio-nav-more__item studio-only-mobile" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
-                  <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
-                    <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></button>
-                  </form>
-                {{else}}
-                  <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
-                    <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></button>
-                  </form>
-                {{end}}
+                <div class="studio-more-menu__auth studio-only-mobile">
+                  {{if .NavMenu.Overflow}}<div class="volo-appearance__divider"></div>{{end}}
+                  {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
+                    <a class="studio-nav-more__item studio-only-mobile" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
+                    <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                      <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></button>
+                    </form>
+                  {{else}}
+                    <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                      <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></button>
+                    </form>
+                  {{end}}
+                </div>
               {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
-                {{if .NavMenu.Overflow}}<div class="volo-appearance__divider studio-only-mobile"></div>{{end}}
-                <a class="studio-nav-more__item studio-only-mobile js-header-reader-login" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}{{$readerLoginHref}}{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{else}}data-reader-login="1"{{end}} role="menuitem"><svg class="studio-nav-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span>{{t .Locale "nav.login"}}</span></a>
+                <div class="studio-more-menu__auth studio-only-mobile">
+                  {{if .NavMenu.Overflow}}<div class="volo-appearance__divider"></div>{{end}}
+                  <a class="studio-nav-more__item studio-only-mobile js-header-reader-login" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}{{$readerLoginHref}}{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{else}}data-reader-login="1"{{end}} role="menuitem"><svg class="studio-nav-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span>{{t .Locale "nav.login"}}</span></a>
+                </div>
               {{end}}
             </div>
           </div>
         {{end}}
       </nav>
 
-      <div class="studio-actions studio-header-actions">
+      <div class="studio-actions studio-header-actions studio-header__actions">
         {{if .Reading.EnableInstantSearch}}
           <button type="button" id="volo-search-btn" class="studio-icon-btn studio-icon-btn--square" title="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>
@@ -203,24 +207,26 @@
         {{end}}
 
         {{if .Viewer}}
-          {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
-            <a class="studio-icon-btn studio-auth-btn" href="{{.AdminPath}}" data-no-pjax title="{{t .Locale "nav.admin_console"}}" aria-label="{{t .Locale "nav.admin_console"}}">
-              {{navIconHTML "admin"}}<span class="studio-auth-btn__label">{{t .Locale "nav.admin_console"}}</span>
-            </a>
-            <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
-              <button type="submit" class="studio-icon-btn studio-auth-btn" title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
-                {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
-              </button>
-            </form>
-          {{else}}
-            <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
-              <button id="volo-reader-logout" type="submit" class="studio-icon-btn studio-auth-btn" title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
-                {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
-              </button>
-            </form>
-          {{end}}
+          <div class="studio-reader-entry">
+            {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
+              <a class="studio-icon-btn studio-auth-btn" href="{{.AdminPath}}" data-no-pjax title="{{t .Locale "nav.admin_console"}}" aria-label="{{t .Locale "nav.admin_console"}}">
+                {{navIconHTML "admin"}}<span class="studio-auth-btn__label">{{t .Locale "nav.admin_console"}}</span>
+              </a>
+              <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+                <button type="submit" class="studio-icon-btn studio-auth-btn" title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+                  {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
+                </button>
+              </form>
+            {{else}}
+              <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+                <button id="volo-reader-logout" type="submit" class="studio-icon-btn studio-auth-btn" title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
+                  {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
+                </button>
+              </form>
+            {{end}}
+          </div>
         {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
-          <a class="studio-icon-btn studio-auth-btn js-header-reader-login" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}{{$readerLoginHref}}{{end}}" title="{{t .Locale "nav.login"}}" aria-label="{{t .Locale "nav.login"}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{else}}data-reader-login="1"{{end}}>
+          <a class="studio-icon-btn studio-auth-btn studio-reader-entry js-header-reader-login" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}{{$readerLoginHref}}{{end}}" title="{{t .Locale "nav.login"}}" aria-label="{{t .Locale "nav.login"}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{else}}data-reader-login="1"{{end}}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span class="studio-auth-btn__label">{{t .Locale "nav.login"}}</span>
           </a>
         {{end}}

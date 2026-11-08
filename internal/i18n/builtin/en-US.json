@@ -223,5 +223,22 @@
   "studio.filter_empty": "No matching items",
   "studio.clear_filter": "Clear",
   "reader.no_account_cta": "New reader? Create an account",
-  "reader.has_account_cta": "Already have an account? Sign in"
+  "reader.has_account_cta": "Already have an account? Sign in",
+  "error.bad_request": "Invalid request payload. Please check and try again.",
+  "error.server_busy": "Service temporarily unavailable. Please try again shortly.",
+  "comment.err_no_guest_passport": "No verified guest comment passport found in this browser.",
+  "comment.err_length": "Comment length must be between 1 and 4,000 characters.",
+  "comment.err_nickname": "Please enter a nickname (1–48 characters).",
+  "comment.err_parent_missing": "The parent comment no longer exists.",
+  "comment.err_edit_forbidden": "You can no longer edit or delete this comment.",
+  "comment.err_antispam": "Comment was blocked by anti-spam policy.",
+  "comment.err_pow": "Security verification expired or invalid. Please submit again.",
+  "reader.err_reg_disabled": "Reader registration is currently disabled.",
+  "reader.err_invalid_credentials": "Invalid username/email or password.",
+  "reader.err_invalid_email": "Please enter a valid email address.",
+  "reader.err_username_len": "Username must be between 2 and 48 characters.",
+  "reader.err_password_policy": "Password does not meet minimum security requirements.",
+  "reader.err_verify_code": "Verification code is invalid or expired.",
+  "reader.err_code_cooldown": "Please wait 60 seconds before requesting another code.",
+  "reader.err_account_exists": "That username or email is already registered."
 }

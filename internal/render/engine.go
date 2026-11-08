@@ -168,7 +168,7 @@ func buildSanitizerPolicy() *bluemonday.Policy {
 	p.AllowAttrs("controls", "preload").OnElements("audio", "source")
 	p.AllowAttrs("src").Matching(safeMediaSrcAttrRe).OnElements("audio", "source")
 	p.AllowAttrs("width", "height", "loading", "decoding", "src", "alt", "title").OnElements("img")
-	p.AllowAttrs("href", "title", "target", "rel").OnElements("a")
+	p.AllowAttrs("href", "title", "target", "rel", "data-no-pjax").OnElements("a")
 	p.RequireNoFollowOnLinks(false)
 	p.AddTargetBlankToFullyQualifiedLinks(false)
 	return p

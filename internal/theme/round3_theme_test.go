@@ -515,8 +515,8 @@ func TestRound3_VoloStudioSourceTemplates_RenderAllFeatures(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Render page.html (default): %v", err)
 	}
-	if !strings.Contains(recPageDefault.Body.String(), `studio-mobile-toc-bar`) || !strings.Contains(recPageDefault.Body.String(), `id="volo-toc-list"`) {
-		t.Fatalf("expected default standalone page with ShowTOC to render mobile TOC bar and #volo-toc-list")
+	if strings.Contains(recPageDefault.Body.String(), `studio-mobile-toc-bar`) || !strings.Contains(recPageDefault.Body.String(), `id="volo-mobile-toc-btn"`) || !strings.Contains(recPageDefault.Body.String(), `id="volo-toc-list"`) {
+		t.Fatalf("expected default standalone page with ShowTOC to render unified #volo-mobile-toc-btn and #volo-toc-list without duplicate inline mobile TOC bar")
 	}
 
 	recPageMinimal := httptest.NewRecorder()

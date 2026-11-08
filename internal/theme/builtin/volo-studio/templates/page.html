@@ -19,14 +19,6 @@
         </div>
       {{end}}
       {{range .ArticleBeforeWidgets}}{{safeHTML .HTML}}{{end}}
-      {{if $showPageTOC}}
-        <div class="studio-mobile-toc-bar">
-          <button type="button" class="studio-mobile-toc-bar__btn js-mobile-toc-trigger" aria-controls="volo-toc-drawer" aria-expanded="false">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
-            <span>{{t .Locale "article.toc_title"}}</span>
-          </button>
-        </div>
-      {{end}}
       <div class="volo-prose">
         {{proseHTML .StandalonePage.HTML (coalesce .CurrentPath (printf "/%s" .StandalonePage.Slug)) .RawQuery}}
       </div>

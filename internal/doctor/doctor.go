@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,10 +26,12 @@ const (
 
 // CheckResult describes a single diagnostic probe executed by volo doctor.
 type CheckResult struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"` // ok | warn | fail
-	Summary string `json:"summary"`
-	Detail  string `json:"detail,omitempty"`
+	Name    string            `json:"name"`
+	Status  string            `json:"status"` // ok | warn | fail
+	Code    string            `json:"code,omitempty"`
+	Params  map[string]string `json:"params,omitempty"`
+	Summary string            `json:"summary"`
+	Detail  string            `json:"detail,omitempty"`
 }
 
 // Report aggregates all diagnostic checks and overall health status.
@@ -36,6 +39,35 @@ type Report struct {
 	Healthy   bool          `json:"healthy"`
 	CheckedAt int64         `json:"checked_at"`
 	Checks    []CheckResult `json:"checks"`
+}
+
+func cleanDisplayPath(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return ""
+	}
+	return filepath.Clean(trimmed)
+}
+
+func cleanSecretSource(src string) string {
+	for _, pfx := range []string{"file:", "generated:"} {
+		if strings.HasPrefix(src, pfx) {
+			return pfx + cleanDisplayPath(strings.TrimPrefix(src, pfx))
+		}
+	}
+	return src
+}
+
+// isSecretKeyModeValid enforces regular non-symlink files on all OSes and strict 0600 on Unix.
+// On Windows NTFS, Go's os.Lstat synthesizes 0666 for writable regular files while ACLs govern access.
+func isSecretKeyModeValid(goos string, mode os.FileMode) bool {
+	if mode&os.ModeSymlink != 0 || !mode.IsRegular() {
+		return false
+	}
+	if goos == "windows" {
+		return true
+	}
+	return mode.Perm() == 0o600
 }
 
 // Run executes non-destructive environment, cryptographic, database, and filesystem checks.
@@ -64,20 +96,28 @@ func Run(ctx context.Context, cfg *config.Config, store *sqlx.Store) *Report {
 	add(checkWritableDirs(cfg))
 
 	// 5. Optional Offline GeoIP Databases
-	add(checkGeoIPAssets(cfg))
+	add(checkGeoIPAssets(ctx, cfg, store))
 
 	// 6. Admin Console Path Cloaking Posture
+	adminPath := "/console"
+	if cfg != nil && strings.TrimSpace(cfg.AdminPath) != "" {
+		adminPath = cfg.AdminPath
+	}
 	if cfg != nil && cfg.IsCustomAdminPath {
 		add(CheckResult{
 			Name:    "admin_stealth_path",
 			Status:  StatusOK,
-			Summary: fmt.Sprintf("custom admin path active (%s); default /console cloaked with 404", cfg.AdminPath),
+			Code:    "admin_path_custom_ok",
+			Params:  map[string]string{"path": adminPath},
+			Summary: fmt.Sprintf("custom admin path active (%s); default /console cloaked with 404", adminPath),
 		})
 	} else {
 		add(CheckResult{
 			Name:    "admin_stealth_path",
-			Status:  StatusWarn,
-			Summary: "using default VOLO_ADMIN_PATH=/console (set custom path in .env for stealth 404 cloaking)",
+			Status:  StatusOK,
+			Code:    "admin_path_default_ok",
+			Params:  map[string]string{"path": adminPath},
+			Summary: fmt.Sprintf("default admin path %s active (optional: set VOLO_ADMIN_PATH or --admin-path for 404 stealth cloaking)", adminPath),
 		})
 	}
 
@@ -87,8 +127,8 @@ func Run(ctx context.Context, cfg *config.Config, store *sqlx.Store) *Report {
 func checkRuntime() CheckResult {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	heapMiB := float64(ms.HeapAlloc) / (1024 * 1024)
-	sysMiB := float64(ms.Sys) / (1024 * 1024)
+	heapStr := fmt.Sprintf("%.2f", float64(ms.HeapAlloc)/(1024*1024))
+	sysStr := fmt.Sprintf("%.2f", float64(ms.Sys)/(1024*1024))
 
 	cgoSetting := "0"
 	if bi, ok := debug.ReadBuildInfo(); ok {
@@ -102,8 +142,17 @@ func checkRuntime() CheckResult {
 	return CheckResult{
 		Name:   "runtime",
 		Status: StatusOK,
-		Summary: fmt.Sprintf("%s %s/%s (CGO_ENABLED=%s, heap=%.2f MiB, sys=%.2f MiB)",
-			runtime.Version(), runtime.GOOS, runtime.GOARCH, cgoSetting, heapMiB, sysMiB),
+		Code:   "runtime_ok",
+		Params: map[string]string{
+			"version": runtime.Version(),
+			"os":      runtime.GOOS,
+			"arch":    runtime.GOARCH,
+			"cgo":     cgoSetting,
+			"heap":    heapStr,
+			"sys":     sysStr,
+		},
+		Summary: fmt.Sprintf("%s %s/%s (CGO_ENABLED=%s, heap=%s MiB, sys=%s MiB)",
+			runtime.Version(), runtime.GOOS, runtime.GOARCH, cgoSetting, heapStr, sysStr),
 	}
 }
 
@@ -112,27 +161,34 @@ func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.
 		return CheckResult{
 			Name:    "secret_key",
 			Status:  StatusFail,
+			Code:    "secret_uninit",
 			Summary: "KeyRing is uninitialized",
 		}
 	}
 
-	// Verify file permissions if file-backed
+	// Verify file integrity & permissions if file-backed
 	for _, pfx := range []string{"file:", "generated:"} {
 		if strings.HasPrefix(cfg.SecretKeySource, pfx) {
 			keyPath := strings.TrimPrefix(cfg.SecretKeySource, pfx)
+			dispPath := cleanDisplayPath(keyPath)
 			info, err := os.Lstat(keyPath)
 			if err != nil {
 				return CheckResult{
 					Name:    "secret_key",
 					Status:  StatusFail,
-					Summary: fmt.Sprintf("cannot stat secret key file %q: %v", keyPath, err),
+					Code:    "secret_stat_err",
+					Params:  map[string]string{"path": dispPath, "err": err.Error()},
+					Summary: fmt.Sprintf("cannot stat secret key file %s: %v", dispPath, err),
 				}
 			}
-			if info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 {
+			if !isSecretKeyModeValid(runtime.GOOS, info.Mode()) {
+				modeStr := fmt.Sprintf("%04o", info.Mode().Perm())
 				return CheckResult{
 					Name:    "secret_key",
 					Status:  StatusFail,
-					Summary: fmt.Sprintf("secret key file %q must be regular mode 0600 (got %04o)", keyPath, info.Mode().Perm()),
+					Code:    "secret_perm_err",
+					Params:  map[string]string{"path": dispPath, "mode": modeStr},
+					Summary: fmt.Sprintf("secret key file %s must be regular mode 0600 (got %s)", dispPath, modeStr),
 				}
 			}
 		}
@@ -140,11 +196,22 @@ func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.
 
 	sealed, err := cfg.KeyRing.SealString("volo-doctor-probe", "doctor:probe")
 	if err != nil {
-		return CheckResult{Name: "secret_key", Status: StatusFail, Summary: fmt.Sprintf("AES-GCM seal failed: %v", err)}
+		return CheckResult{
+			Name:    "secret_key",
+			Status:  StatusFail,
+			Code:    "secret_seal_err",
+			Params:  map[string]string{"err": err.Error()},
+			Summary: fmt.Sprintf("AES-GCM seal failed: %v", err),
+		}
 	}
 	opened, err := cfg.KeyRing.OpenString(sealed, "doctor:probe")
 	if err != nil || opened != "volo-doctor-probe" {
-		return CheckResult{Name: "secret_key", Status: StatusFail, Summary: "AES-GCM round-trip verification failed"}
+		return CheckResult{
+			Name:    "secret_key",
+			Status:  StatusFail,
+			Code:    "secret_roundtrip_err",
+			Summary: "AES-GCM round-trip verification failed",
+		}
 	}
 
 	// Verify existing encrypted secrets in settings table can be opened with active KeyRing
@@ -157,6 +224,8 @@ func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.
 					return CheckResult{
 						Name:    "secret_key",
 						Status:  StatusWarn,
+						Code:    "secret_mismatch_warn",
+						Params:  map[string]string{"domain": r.Domain},
 						Summary: fmt.Sprintf("settings.%s secret_ciphertext cannot be decrypted with current VOLO_SECRET_KEY (re-enter secret after cross-machine restore)", r.Domain),
 					}
 				}
@@ -164,20 +233,34 @@ func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.
 		}
 	}
 
+	cleanSrc := cleanSecretSource(cfg.SecretKeySource)
 	return CheckResult{
 		Name:    "secret_key",
 		Status:  StatusOK,
-		Summary: fmt.Sprintf("AES-256-GCM & HKDF subkeys verified (source=%s)", cfg.SecretKeySource),
+		Code:    "secret_ok",
+		Params:  map[string]string{"source": cleanSrc},
+		Summary: fmt.Sprintf("AES-256-GCM & HKDF subkeys verified (source=%s)", cleanSrc),
 	}
 }
 
 func checkDatabase(ctx context.Context, store *sqlx.Store) CheckResult {
 	if store == nil {
-		return CheckResult{Name: "database", Status: StatusFail, Summary: "database store is nil"}
+		return CheckResult{
+			Name:    "database",
+			Status:  StatusFail,
+			Code:    "db_nil",
+			Summary: "database store is nil",
+		}
 	}
 	start := time.Now()
 	if err := store.Ping(ctx); err != nil {
-		return CheckResult{Name: "database", Status: StatusFail, Summary: fmt.Sprintf("ping failed: %v", err)}
+		return CheckResult{
+			Name:    "database",
+			Status:  StatusFail,
+			Code:    "db_ping_err",
+			Params:  map[string]string{"err": err.Error()},
+			Summary: fmt.Sprintf("ping failed: %v", err),
+		}
 	}
 	latency := time.Since(start)
 	dName := store.Dialect().Name()
@@ -186,17 +269,26 @@ func checkDatabase(ctx context.Context, store *sqlx.Store) CheckResult {
 		Version int `db:"version"`
 	}](ctx, store, `SELECT version FROM schema_migrations ORDER BY version DESC`)
 	if err != nil || len(verRows) == 0 {
+		latStr := latency.Round(100 * time.Microsecond).String()
 		return CheckResult{
 			Name:    "database",
 			Status:  StatusFail,
-			Summary: fmt.Sprintf("dialect=%s reachable (%s), but schema_migrations missing or empty", dName, latency.Round(100*time.Microsecond)),
+			Code:    "db_migrations_missing",
+			Params:  map[string]string{"dialect": dName, "latency": latStr},
+			Summary: fmt.Sprintf("dialect=%s reachable (%s), but schema_migrations missing or empty", dName, latStr),
 		}
 	}
 	latestVer := verRows[0].Version
 	if latestVer < migrate.CurrentSchemaVersion {
 		return CheckResult{
-			Name:    "database",
-			Status:  StatusWarn,
+			Name:   "database",
+			Status: StatusWarn,
+			Code:   "db_schema_behind",
+			Params: map[string]string{
+				"dialect": dName,
+				"current": strconv.Itoa(latestVer),
+				"target":  strconv.Itoa(migrate.CurrentSchemaVersion),
+			},
 			Summary: fmt.Sprintf("dialect=%s schema v%d behind binary v%d", dName, latestVer, migrate.CurrentSchemaVersion),
 		}
 	}
@@ -209,17 +301,30 @@ func checkDatabase(ctx context.Context, store *sqlx.Store) CheckResult {
 		_ = store.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk)
 		extra = fmt.Sprintf(", journal_mode=%s, foreign_keys=%d", strings.ToLower(jm), fk)
 	}
+	pingStr := latency.Round(10 * time.Microsecond).String()
 
 	return CheckResult{
-		Name:    "database",
-		Status:  StatusOK,
-		Summary: fmt.Sprintf("dialect=%s, schema=v%d, ping=%s%s", dName, latestVer, latency.Round(10*time.Microsecond), extra),
+		Name:   "database",
+		Status: StatusOK,
+		Code:   "db_ok",
+		Params: map[string]string{
+			"dialect": dName,
+			"version": strconv.Itoa(latestVer),
+			"ping":    pingStr,
+			"extra":   extra,
+		},
+		Summary: fmt.Sprintf("dialect=%s, schema=v%d, ping=%s%s", dName, latestVer, pingStr, extra),
 	}
 }
 
 func checkWritableDirs(cfg *config.Config) CheckResult {
 	if cfg == nil {
-		return CheckResult{Name: "directories", Status: StatusFail, Summary: "nil config"}
+		return CheckResult{
+			Name:    "directories",
+			Status:  StatusFail,
+			Code:    "dirs_nil",
+			Summary: "nil config",
+		}
 	}
 	targets := []struct {
 		label string
@@ -230,11 +335,14 @@ func checkWritableDirs(cfg *config.Config) CheckResult {
 		{"backups", cfg.BackupDir},
 	}
 	for _, t := range targets {
+		dispDir := cleanDisplayPath(t.dir)
 		if err := os.MkdirAll(t.dir, 0o750); err != nil {
 			return CheckResult{
 				Name:    "directories",
 				Status:  StatusFail,
-				Summary: fmt.Sprintf("cannot create %s dir %q: %v", t.label, t.dir, err),
+				Code:    "dirs_mkdir_err",
+				Params:  map[string]string{"label": t.label, "dir": dispDir, "err": err.Error()},
+				Summary: fmt.Sprintf("cannot create %s dir %s: %v", t.label, dispDir, err),
 			}
 		}
 		probePath := filepath.Join(t.dir, fmt.Sprintf(".volo-doctor-%d.tmp", os.Getpid()))
@@ -242,51 +350,104 @@ func checkWritableDirs(cfg *config.Config) CheckResult {
 			return CheckResult{
 				Name:    "directories",
 				Status:  StatusFail,
-				Summary: fmt.Sprintf("%s dir %q is not writable: %v", t.label, t.dir, err),
+				Code:    "dirs_write_err",
+				Params:  map[string]string{"label": t.label, "dir": dispDir, "err": err.Error()},
+				Summary: fmt.Sprintf("%s dir %s is not writable: %v", t.label, dispDir, err),
 			}
 		}
 		_ = os.Remove(probePath)
 	}
+	dData := cleanDisplayPath(cfg.DataDir)
+	dUploads := cleanDisplayPath(cfg.UploadDir)
+	dBackups := cleanDisplayPath(cfg.BackupDir)
 	return CheckResult{
-		Name:    "directories",
-		Status:  StatusOK,
-		Summary: fmt.Sprintf("data (%s), uploads (%s), and backups (%s) writable", cfg.DataDir, cfg.UploadDir, cfg.BackupDir),
+		Name:   "directories",
+		Status: StatusOK,
+		Code:   "dirs_ok",
+		Params: map[string]string{
+			"data":    dData,
+			"uploads": dUploads,
+			"backups": dBackups,
+		},
+		Summary: fmt.Sprintf("data (%s), uploads (%s), and backups (%s) writable", dData, dUploads, dBackups),
 	}
 }
 
-func checkGeoIPAssets(cfg *config.Config) CheckResult {
-	if cfg == nil || strings.TrimSpace(cfg.GeoIPDir) == "" {
-		return CheckResult{Name: "geoip", Status: StatusWarn, Summary: "VOLO_GEOIP_DIR not configured"}
+func checkGeoIPAssets(ctx context.Context, cfg *config.Config, store *sqlx.Store) CheckResult {
+	if cfg == nil || !cfg.GeoAccessEnabled {
+		return CheckResult{
+			Name:    "geoip",
+			Status:  StatusOK,
+			Code:    "geoip_disabled_ok",
+			Summary: "GeoIP regional access control disabled (no offline database required)",
+		}
 	}
+
+	activeGeoRules := 0
+	if store != nil {
+		_ = store.QueryRowContext(ctx,
+			store.Dialect().Rebind(`SELECT COUNT(*) FROM security_geo_rules WHERE is_enabled = ?`), true,
+		).Scan(&activeGeoRules)
+	}
+
+	dispDir := cleanDisplayPath(cfg.GeoIPDir)
+	if dispDir == "" {
+		if activeGeoRules > 0 {
+			return CheckResult{
+				Name:    "geoip",
+				Status:  StatusWarn,
+				Code:    "geoip_missing_warn",
+				Params:  map[string]string{"dir": "(unset)", "rules": strconv.Itoa(activeGeoRules)},
+				Summary: fmt.Sprintf("%d active GeoIP rule(s), but VOLO_GEOIP_DIR is not configured", activeGeoRules),
+			}
+		}
+		return CheckResult{
+			Name:    "geoip",
+			Status:  StatusOK,
+			Code:    "geoip_disabled_ok",
+			Summary: "GeoIP regional rules not configured (offline database optional)",
+		}
+	}
+
 	entries, err := os.ReadDir(cfg.GeoIPDir)
-	if err != nil {
-		return CheckResult{
-			Name:    "geoip",
-			Status:  StatusWarn,
-			Summary: fmt.Sprintf("optional GeoIP dir %q not populated yet (.mmdb / .xdb optional)", cfg.GeoIPDir),
-		}
-	}
 	var found []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		low := strings.ToLower(e.Name())
-		if strings.HasSuffix(low, ".mmdb") || strings.HasSuffix(low, ".xdb") {
-			found = append(found, e.Name())
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			low := strings.ToLower(e.Name())
+			if strings.HasSuffix(low, ".mmdb") || strings.HasSuffix(low, ".xdb") {
+				found = append(found, e.Name())
+			}
 		}
 	}
-	if len(found) == 0 {
+	if len(found) > 0 {
+		filesStr := strings.Join(found, ", ")
+		return CheckResult{
+			Name:    "geoip",
+			Status:  StatusOK,
+			Code:    "geoip_ready_ok",
+			Params:  map[string]string{"files": filesStr},
+			Summary: fmt.Sprintf("offline GeoIP databases ready: %s", filesStr),
+		}
+	}
+
+	if activeGeoRules > 0 {
 		return CheckResult{
 			Name:    "geoip",
 			Status:  StatusWarn,
-			Summary: fmt.Sprintf("no .mmdb or .xdb files in %q (GeoIP rules will use fallback policy)", cfg.GeoIPDir),
+			Code:    "geoip_missing_warn",
+			Params:  map[string]string{"dir": dispDir, "rules": strconv.Itoa(activeGeoRules)},
+			Summary: fmt.Sprintf("%d active GeoIP rule(s), but no .mmdb or .xdb files in %s (using fallback policy)", activeGeoRules, dispDir),
 		}
 	}
 	return CheckResult{
 		Name:    "geoip",
 		Status:  StatusOK,
-		Summary: fmt.Sprintf("offline GeoIP databases ready: %s", strings.Join(found, ", ")),
+		Code:    "geoip_optional_ok",
+		Params:  map[string]string{"dir": dispDir},
+		Summary: fmt.Sprintf("optional offline GeoIP dir %s not populated (not needed until regional rules are added)", dispDir),
 	}
 }
 
