@@ -684,3 +684,62 @@ func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
 		t.Fatalf("expected external IP exceeding waf_max_requests to receive 429 custom error page")
 	}
 }
+
+func TestFollowUp_PermissionsPolicyLegacyImageShimAndIPBanReasonSearch(t *testing.T) {
+	env := setupM5TestEnv(t, "/console")
+	cookies, _ := bootstrapAuthenticatedAdmin(t, env)
+
+	// 1. Verify Permissions-Policy allows same-origin microphone=(self) for Admin audio recording while keeping camera/geolocation locked
+	homeResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, nil)
+	pp := homeResp.Header.Get("Permissions-Policy")
+	if !strings.Contains(pp, "microphone=(self)") || !strings.Contains(pp, "camera=()") {
+		t.Fatalf("expected Permissions-Policy with microphone=(self) and camera=(), got %q", pp)
+	}
+
+	// 2. Verify /image/ and /posts/image/ legacy shims serve migrated images while never exposing DataDir root files
+	img := image.NewNRGBA(image.Rect(0, 0, 8, 8))
+	img.Set(1, 1, color.NRGBA{R: 12, G: 130, B: 96, A: 255})
+	var pngBuf bytes.Buffer
+	if err := png.Encode(&pngBuf, img); err != nil {
+		t.Fatal(err)
+	}
+	legacyImgDir := filepath.Join(env.cfg.DataDir, "image")
+	if err := os.MkdirAll(legacyImgDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyImgDir, "php_20190706210325.png"), pngBuf.Bytes(), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	secretRootFile := filepath.Join(env.cfg.DataDir, "secret-sentinel.txt")
+	if err := os.WriteFile(secretRootFile, []byte("never-expose"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, okPath := range []string{"/image/php_20190706210325.png", "/posts/image/php_20190706210325.png"} {
+		r, _ := doJSONReq(t, http.MethodGet, env.ts.URL+okPath, nil, nil, nil)
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s expected 200 OK, got %d", okPath, r.StatusCode)
+		}
+	}
+	for _, blockedPath := range []string{"/image/secret-sentinel.txt", "/image/volo.db", "/posts/image/secret-sentinel.txt"} {
+		r, _ := doJSONReq(t, http.MethodGet, env.ts.URL+blockedPath, nil, nil, nil)
+		if r.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s must never expose DataDir root files, got %d", blockedPath, r.StatusCode)
+		}
+	}
+
+	// 3. Verify /api/admin/security/ip-bans?q=... searches reason_code for migrated Bolo/Volo records
+	now := time.Now().UnixMilli()
+	_, err := env.store.ExecContext(env.ctx,
+		`INSERT INTO security_ip_bans (id, cidr, source, reason_code, reason, note, occurrences, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id.Next(), "198.51.100.201/32", "auto", "script_scan", "", "", 3, 0, now, now,
+	)
+	if err != nil {
+		t.Fatalf("insert migrated ip ban: %v", err)
+	}
+	qResp, qRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/security/ip-bans?q=script_scan", nil, cookies, nil)
+	if qResp.StatusCode != http.StatusOK || !strings.Contains(string(qRaw), "198.51.100.201/32") {
+		t.Fatalf("expected reason_code search to find 198.51.100.201/32, got %d: %s", qResp.StatusCode, string(qRaw))
+	}
+}
+

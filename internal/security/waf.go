@@ -670,7 +670,7 @@ func (w *WAFEngine) WrapHTTP(next http.Handler) http.Handler {
 		rw.Header().Set("X-Content-Type-Options", "nosniff")
 		rw.Header().Set("X-Frame-Options", "SAMEORIGIN")
 		rw.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		rw.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+		rw.Header().Set("Permissions-Policy", "camera=(), microphone=(self), geolocation=(), payment=(), usb=()")
 
 		w.bansMu.RLock()
 		pubURL := w.publicURL

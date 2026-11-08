@@ -76,8 +76,11 @@ import {
   computePortalMenuStyle,
   ConsoleEmpty,
   ConsoleSelect,
+  notifyClosePopovers,
   PaginationBar,
   paginateItems,
+  PlusIcon,
+  POPOVER_CLOSE_EVENT,
   useDebouncedValue,
 } from "./UIControls";
 import { MediaLibraryModal } from "./MediaLibraryModal";
@@ -277,6 +280,24 @@ const pasteURLAsLinkExt = EditorView.domEventHandlers({
 
 const SAFE_IR_COLOR_RE = /^(?:#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,20}|rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\))$/;
 
+function parseMarkdownImageTarget(rawTarget: string): string {
+  const s = rawTarget.trim();
+  if (s.startsWith("<") && s.includes(">")) {
+    return s.slice(1, s.indexOf(">")).trim();
+  }
+  const m = /^(\S+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/.exec(s);
+  return m ? m[1] : s;
+}
+
+function resolveIRImageSrc(rawSrc: string): string {
+  const s = rawSrc.trim();
+  if (!s || /^(?:javascript|vbscript|file):/i.test(s) || s.startsWith("//") || s.startsWith("/\\")) return "";
+  if (/^(?:https?:\/\/|data:image\/|blob:|\/)/i.test(s)) return s;
+  if (s.startsWith("./")) return "/" + s.slice(2).replace(/^\/+/, "");
+  if (/^(?:image|images|uploads)\//i.test(s)) return "/" + s;
+  return s;
+}
+
 function buildInstantRenderPlugin() {
   const hideDeco = Decoration.replace({});
   const buildDecos = (view: EditorView): DecorationSet => {
@@ -406,7 +427,9 @@ function buildInstantRenderPlugin() {
         const hm = /^(#{1,6})\s+/.exec(text);
         const qm = /^(\s*>\s?)(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*)?/i.exec(text);
         const dm = /^\s*:::(?:bookshelf|book|lock)?.*$/.exec(text);
-        const hrm = /^\s*(?:---|\*\*\*|___)\s*$/.exec(text);
+        const hrm = /^\s*(?:---|\*\*\*|___|<hr\s*\/?>)\s*$/i.exec(text);
+        const soloBr = /^\s*<br\s*\/?>\s*$/i.exec(text);
+        const centerLine = /^(\s*<center>)(.*)(<\/center>\s*)$/i.exec(text);
 
         if (hm) {
           const lvl = hm[1].length;
@@ -436,7 +459,23 @@ function buildInstantRenderPlugin() {
         } else if (hrm) {
           builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-hr" }));
           if (!isCursorLine && markFree(0, text.length)) {
-            ops.push({ from: line.from, to: line.to, deco: Decoration.mark({ class: "cm-ir-fence-muted" }) });
+            ops.push({ from: line.from, to: line.to, deco: hideDeco });
+          }
+        } else if (soloBr) {
+          if (!isCursorLine && markFree(0, text.length)) {
+            ops.push({ from: line.from, to: line.to, deco: hideDeco });
+          }
+        } else if (centerLine) {
+          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-center" }));
+          if (!isCursorLine) {
+            const openLen = centerLine[1].length;
+            const closeStart = text.length - centerLine[3].length;
+            if (markFree(0, openLen)) {
+              ops.push({ from: line.from, to: line.from + openLen, deco: hideDeco });
+            }
+            if (markFree(closeStart, text.length)) {
+              ops.push({ from: line.from + closeStart, to: line.to, deco: hideDeco });
+            }
           }
         }
 
@@ -471,6 +510,21 @@ function buildInstantRenderPlugin() {
                 deco: Decoration.mark({ class: "cm-ir-inline-code" }),
               });
               ops.push({ from: line.from + e - 1, to: line.from + e, deco: hideDeco });
+            }
+          }
+
+          // Inline <br> / <br/> / <br /> inside prose lines
+          const brRe = /<br\s*\/?>/gi;
+          while ((m = brRe.exec(text)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            if (markFree(s, e)) {
+              const trailingOnly = /^\s*$/.test(text.slice(e));
+              ops.push({
+                from: line.from + s,
+                to: line.from + e,
+                deco: trailingOnly ? hideDeco : Decoration.replace({ widget: new BrIRWidget() }),
+              });
             }
           }
 
@@ -546,6 +600,31 @@ function buildInstantRenderPlugin() {
             }
           }
 
+          // HTML inline formatting tags (<strong>/<b>, <em>/<i>, <s>/<del>)
+          const htmlFmtRe = /(<(strong|b|em|i|s|del)>)([^<\n]+)(<\/\2>)/gi;
+          while ((m = htmlFmtRe.exec(text)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            if (markFree(s, e)) {
+              const tagLow = m[2].toLowerCase();
+              const cls =
+                tagLow === "strong" || tagLow === "b"
+                  ? "cm-ir-bold"
+                  : tagLow === "em" || tagLow === "i"
+                  ? "cm-ir-italic"
+                  : "cm-ir-strike";
+              const openEnd = s + m[1].length;
+              const closeStart = e - m[4].length;
+              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
+              ops.push({
+                from: line.from + openEnd,
+                to: line.from + closeStart,
+                deco: Decoration.mark({ class: cls }),
+              });
+              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
+            }
+          }
+
           // Bold **...**
           const boldRe = /\*\*([^*\n]+)\*\*/g;
           while ((m = boldRe.exec(text)) !== null) {
@@ -592,6 +671,43 @@ function buildInstantRenderPlugin() {
                 deco: Decoration.mark({ class: "cm-ir-italic" }),
               });
               ops.push({ from: line.from + e - 1, to: line.from + e, deco: hideDeco });
+            }
+          }
+
+          // Markdown Images ![alt](url) on non-cursor lines (claim BEFORE linkRe)
+          const mdImgRe = /!\[([^\]\n]*)\]\(([^)\n]+)\)/g;
+          while ((m = mdImgRe.exec(text)) !== null) {
+            const alt = (m[1] || "").trim();
+            const rawTarget = parseMarkdownImageTarget(m[2] || "");
+            const resolvedSrc = resolveIRImageSrc(rawTarget);
+            if (!resolvedSrc) continue;
+            const s = m.index;
+            const e = s + m[0].length;
+            if (markFree(s, e)) {
+              ops.push({
+                from: line.from + s,
+                to: line.from + e,
+                deco: Decoration.replace({ widget: new ImageIRWidget(resolvedSrc, rawTarget, alt, line.from + s) }),
+              });
+            }
+          }
+
+          // Inline HTML <img ... src="..."> on non-cursor lines
+          const htmlImgRe = /<img\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*\/?>/gi;
+          while ((m = htmlImgRe.exec(text)) !== null) {
+            const rawTarget = (m[1] || m[2] || m[3] || "").trim();
+            const resolvedSrc = resolveIRImageSrc(rawTarget);
+            if (!resolvedSrc) continue;
+            const altM = /\balt\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(m[0]);
+            const alt = (altM ? altM[1] ?? altM[2] ?? "" : "").trim();
+            const s = m.index;
+            const e = s + m[0].length;
+            if (markFree(s, e)) {
+              ops.push({
+                from: line.from + s,
+                to: line.from + e,
+                deco: Decoration.replace({ widget: new ImageIRWidget(resolvedSrc, rawTarget, alt, line.from + s) }),
+              });
             }
           }
 
@@ -657,6 +773,65 @@ function buildInstantRenderPlugin() {
     },
     { decorations: (v) => v.decorations }
   );
+}
+
+class BrIRWidget extends WidgetType {
+  eq(): boolean {
+    return true;
+  }
+  toDOM(): HTMLElement {
+    return document.createElement("br");
+  }
+}
+
+class ImageIRWidget extends WidgetType {
+  constructor(
+    readonly src: string,
+    readonly rawSrc: string,
+    readonly alt: string,
+    readonly pos: number
+  ) {
+    super();
+  }
+  eq(other: ImageIRWidget): boolean {
+    return this.src === other.src && this.rawSrc === other.rawSrc && this.alt === other.alt && this.pos === other.pos;
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = "cm-ir-img-wrap";
+    wrap.title = this.alt ? `${this.alt} (${this.rawSrc})` : this.rawSrc;
+
+    const img = document.createElement("img");
+    img.className = "cm-ir-img";
+    img.src = this.src;
+    img.alt = this.alt;
+    img.loading = "lazy";
+    img.decoding = "async";
+
+    const fb = document.createElement("span");
+    fb.className = "cm-ir-img-fallback";
+    fb.hidden = true;
+    fb.textContent = this.alt ? `🖼 ${this.alt} · ${this.rawSrc}` : `🖼 ${this.rawSrc}`;
+
+    img.onerror = () => {
+      img.hidden = true;
+      fb.hidden = false;
+    };
+
+    wrap.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const safePos = Math.min(this.pos, view.state.doc.length);
+      view.dispatch({ selection: { anchor: safePos } });
+      view.focus();
+    });
+
+    wrap.appendChild(img);
+    wrap.appendChild(fb);
+    return wrap;
+  }
+  ignoreEvent(): boolean {
+    return true;
+  }
 }
 
 class AudioIRWidget extends WidgetType {
@@ -1216,11 +1391,12 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     }
 
     if (
+      (typeof window !== "undefined" && !window.isSecureContext) ||
       typeof navigator === "undefined" ||
       !navigator.mediaDevices?.getUserMedia ||
       typeof MediaRecorder === "undefined"
     ) {
-      showToast(t("ed.record_unsupported"));
+      showToast(t("ed.record_unsupported"), "warn");
       return;
     }
 
@@ -1300,11 +1476,16 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       };
 
       recorder.start(250);
-      showToast(t("ed.record_started"));
-    } catch {
+      showToast(t("ed.record_started"), "ok");
+    } catch (err: any) {
       cleanupRecordingTracks();
       setRecording(false);
-      showToast(t("ed.record_denied"));
+      const errName = String(err?.name || "");
+      if (errName === "NotFoundError" || errName === "DevicesNotFoundError") {
+        showToast(t("ed.record_no_device"), "warn");
+      } else {
+        showToast(t("ed.record_denied"), "err");
+      }
     }
   };
 
@@ -1641,6 +1822,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       const estH = popMenuRef.current?.offsetHeight || dims.estH;
       setPopStyle(computePortalMenuStyle(rect, { ...dims, estH, align: "left" }).style);
     };
+    notifyClosePopovers(999999, false);
     updatePos();
     const onDocDown = (e: MouseEvent) => {
       const target = e.target as Node;
@@ -1648,19 +1830,26 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       if (btn?.contains(target) || popMenuRef.current?.contains(target)) return;
       setActivePop("");
     };
+    const onPopClose = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ exceptId?: number }>).detail;
+      if (detail?.exceptId === 999999) return;
+      setActivePop("");
+    };
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") setActivePop("");
     };
     const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("mousedown", onDocDown, true);
     document.addEventListener("keydown", onEsc);
+    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
     window.addEventListener("resize", updatePos);
     window.addEventListener("scroll", updatePos, true);
     vv?.addEventListener("resize", updatePos);
     vv?.addEventListener("scroll", updatePos);
     return () => {
-      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("mousedown", onDocDown, true);
       document.removeEventListener("keydown", onEsc);
+      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
       window.removeEventListener("resize", updatePos);
       window.removeEventListener("scroll", updatePos, true);
       vv?.removeEventListener("resize", updatePos);
@@ -2176,7 +2365,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
               class="volo-ed-chip"
               onClick={() => insertSnippet(qi.template)}
             >
-              + {qi.label}
+              <PlusIcon size={12} /> {qi.label}
             </button>
           ))}
         </div>
@@ -2731,7 +2920,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
                   setQiOpen(false);
                 }}
               >
-                + {t("ed.bookshelf")}
+                <PlusIcon size={13} /> {t("ed.bookshelf")}
               </button>
             </div>
             {(() => {

@@ -5,6 +5,50 @@ import { confirmSig, resolveConfirm } from "../api";
 import type { LocaleOption } from "../i18n";
 import { t } from "../i18n";
 
+export function PlusIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2.1"
+      stroke-linecap="round"
+      aria-hidden="true"
+      style={{ flexShrink: 0 }}
+    >
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
+export function CloseIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      aria-hidden="true"
+      style={{ flexShrink: 0 }}
+    >
+      <path d="M18 6 6 18M6 6l12 12" />
+    </svg>
+  );
+}
+
+let popoverSeq = 0;
+export const POPOVER_CLOSE_EVENT = "volo:close-popovers";
+
+export function notifyClosePopovers(exceptId = 0, immediate = false) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(POPOVER_CLOSE_EVENT, { detail: { exceptId, immediate } }));
+}
+
 export function useDebouncedValue<T>(value: T, delay = 250): T {
   const [debounced, setDebounced] = useState<T>(value);
   useEffect(() => {
@@ -100,6 +144,8 @@ export function ConsoleSelect({
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
   const [focusIdx, setFocusIdx] = useState<number>(-1);
   const [searchQ, setSearchQ] = useState("");
+  const popIdRef = useRef(0);
+  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -130,7 +176,11 @@ export function ConsoleSelect({
 
   const updateMenuPosition = () => {
     const el = btnRef.current || wrapRef.current;
-    if (!el) return;
+    if (!el || !el.isConnected) {
+      setOpen(false);
+      setClosing(false);
+      return;
+    }
     const rect = el.getBoundingClientRect();
     const vv = window.visualViewport;
     const vvTop = vv?.offsetTop ?? 0;
@@ -151,6 +201,13 @@ export function ConsoleSelect({
     });
     setMenuStyle(pos.style);
     setFlipUp(pos.flipUp);
+  };
+
+  const closeImmediate = () => {
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    setOpen(false);
+    setClosing(false);
+    setSearchQ("");
   };
 
   const closeAnimated = () => {
@@ -190,6 +247,15 @@ export function ConsoleSelect({
       if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
       closeAnimated();
     };
+    const onPopClose = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
+      if (detail?.exceptId === popIdRef.current) return;
+      if (detail?.immediate) {
+        closeImmediate();
+      } else {
+        closeAnimated();
+      }
+    };
     const onEsc = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") closeAnimated();
     };
@@ -200,8 +266,9 @@ export function ConsoleSelect({
       updateMenuPosition();
     };
     const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("mousedown", onDocDown, true);
     document.addEventListener("keydown", onEsc);
+    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
     window.addEventListener("resize", onScrollOrResize);
     window.addEventListener("scroll", onScrollOrResize, true);
     vv?.addEventListener("resize", onScrollOrResize);
@@ -211,8 +278,9 @@ export function ConsoleSelect({
       window.requestAnimationFrame(() => searchRef.current?.focus());
     }
     return () => {
-      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("mousedown", onDocDown, true);
       document.removeEventListener("keydown", onEsc);
+      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
       window.removeEventListener("resize", onScrollOrResize);
       window.removeEventListener("scroll", onScrollOrResize, true);
       vv?.removeEventListener("resize", onScrollOrResize);
@@ -226,6 +294,7 @@ export function ConsoleSelect({
       closeAnimated();
       return;
     }
+    notifyClosePopovers(popIdRef.current, false);
     if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
     setClosing(false);
     setSearchQ("");
@@ -474,6 +543,8 @@ export function ConsoleDatePicker({
   const [hourInput, setHourInput] = useState(pad2(parsed.hh));
   const [minInput, setMinInput] = useState(pad2(parsed.mm));
 
+  const popIdRef = useRef(0);
+  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
@@ -492,7 +563,11 @@ export function ConsoleDatePicker({
 
   const updatePosition = () => {
     const el = btnRef.current || wrapRef.current;
-    if (!el) return;
+    if (!el || !el.isConnected) {
+      setOpen(false);
+      setClosing(false);
+      return;
+    }
     const rect = el.getBoundingClientRect();
     const vv = window.visualViewport;
     const vvTop = vv?.offsetTop ?? 0;
@@ -516,6 +591,12 @@ export function ConsoleDatePicker({
       zIndex: 10050,
     });
     setFlipUp(pos.flipUp);
+  };
+
+  const closeImmediate = () => {
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    setOpen(false);
+    setClosing(false);
   };
 
   const closeAnimated = () => {
@@ -543,6 +624,15 @@ export function ConsoleDatePicker({
       if (wrapRef.current?.contains(target) || popRef.current?.contains(target)) return;
       closeAnimated();
     };
+    const onPopClose = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
+      if (detail?.exceptId === popIdRef.current) return;
+      if (detail?.immediate) {
+        closeImmediate();
+      } else {
+        closeAnimated();
+      }
+    };
     const onEsc = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") {
         ev.stopPropagation();
@@ -556,16 +646,18 @@ export function ConsoleDatePicker({
       updatePosition();
     };
     const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("mousedown", onDocDown, true);
     document.addEventListener("keydown", onEsc, true);
+    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
     window.addEventListener("resize", onRelayout);
     window.addEventListener("scroll", onRelayout, true);
     vv?.addEventListener("resize", onRelayout);
     vv?.addEventListener("scroll", onRelayout);
     return () => {
       window.cancelAnimationFrame(raf);
-      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("mousedown", onDocDown, true);
       document.removeEventListener("keydown", onEsc, true);
+      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
       window.removeEventListener("resize", onRelayout);
       window.removeEventListener("scroll", onRelayout, true);
       vv?.removeEventListener("resize", onRelayout);
@@ -579,6 +671,7 @@ export function ConsoleDatePicker({
       closeAnimated();
       return;
     }
+    notifyClosePopovers(popIdRef.current, false);
     if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
     syncFromProp();
     setClosing(false);
@@ -1012,7 +1105,7 @@ export function ConsoleDatePicker({
                 }
               }}
             >
-              ×
+              <CloseIcon size={12} />
             </span>
           )}
           <svg
@@ -1056,12 +1149,18 @@ export function ActionMenu({
   const [closing, setClosing] = useState(false);
   const [flipUp, setFlipUp] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
+  const popIdRef = useRef(0);
+  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
 
   const updatePos = () => {
-    if (!btnRef.current) return;
+    if (!btnRef.current || !btnRef.current.isConnected) {
+      setOpen(false);
+      setClosing(false);
+      return;
+    }
     const rect = btnRef.current.getBoundingClientRect();
     const vv = window.visualViewport;
     const vvTop = vv?.offsetTop ?? 0;
@@ -1075,6 +1174,12 @@ export function ActionMenu({
     const pos = computePortalMenuStyle(rect, { minW: 152, maxW: 260, maxH: 280, estH, align: "right" });
     setMenuStyle(pos.style);
     setFlipUp(pos.flipUp);
+  };
+
+  const closeImmediate = () => {
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    setOpen(false);
+    setClosing(false);
   };
 
   const closeAnimated = () => {
@@ -1100,6 +1205,15 @@ export function ActionMenu({
       if (btnRef.current?.contains(target) || menuRef.current?.contains(target)) return;
       closeAnimated();
     };
+    const onPopClose = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
+      if (detail?.exceptId === popIdRef.current) return;
+      if (detail?.immediate) {
+        closeImmediate();
+      } else {
+        closeAnimated();
+      }
+    };
     const onEsc = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") closeAnimated();
     };
@@ -1110,15 +1224,17 @@ export function ActionMenu({
       updatePos();
     };
     const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("mousedown", onDocDown, true);
     document.addEventListener("keydown", onEsc);
+    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
     window.addEventListener("resize", onScrollOrResize);
     window.addEventListener("scroll", onScrollOrResize, true);
     vv?.addEventListener("resize", onScrollOrResize);
     vv?.addEventListener("scroll", onScrollOrResize);
     return () => {
-      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("mousedown", onDocDown, true);
       document.removeEventListener("keydown", onEsc);
+      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
       window.removeEventListener("resize", onScrollOrResize);
       window.removeEventListener("scroll", onScrollOrResize, true);
       vv?.removeEventListener("resize", onScrollOrResize);
@@ -1132,6 +1248,7 @@ export function ActionMenu({
     if (open && !closing) {
       closeAnimated();
     } else {
+      notifyClosePopovers(popIdRef.current, false);
       if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
       setClosing(false);
       updatePos();
@@ -1211,6 +1328,8 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
   const [closing, setClosing] = useState(false);
   const [flipUp, setFlipUp] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
+  const popIdRef = useRef(0);
+  if (!popIdRef.current) popIdRef.current = ++popoverSeq;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -1219,12 +1338,22 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
 
   const updatePos = () => {
     const el = btnRef.current || wrapRef.current;
-    if (!el) return;
+    if (!el || !el.isConnected) {
+      setOpen(false);
+      setClosing(false);
+      return;
+    }
     const rect = el.getBoundingClientRect();
     const estH = menuRef.current?.offsetHeight || Math.max(1, locales.length) * 36 + 12;
     const pos = computePortalMenuStyle(rect, { minW: 196, maxW: 280, maxH: 280, estH, align: "right" });
     setMenuStyle(pos.style);
     setFlipUp(pos.flipUp);
+  };
+
+  const closeImmediate = () => {
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    setOpen(false);
+    setClosing(false);
   };
 
   const closeAnimated = () => {
@@ -1250,6 +1379,15 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
       if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
       closeAnimated();
     };
+    const onPopClose = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ exceptId?: number; immediate?: boolean }>).detail;
+      if (detail?.exceptId === popIdRef.current) return;
+      if (detail?.immediate) {
+        closeImmediate();
+      } else {
+        closeAnimated();
+      }
+    };
     const onEsc = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") closeAnimated();
     };
@@ -1260,15 +1398,17 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
       updatePos();
     };
     const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("mousedown", onDocDown, true);
     document.addEventListener("keydown", onEsc);
+    window.addEventListener(POPOVER_CLOSE_EVENT, onPopClose);
     window.addEventListener("resize", onScrollOrResize);
     window.addEventListener("scroll", onScrollOrResize, true);
     vv?.addEventListener("resize", onScrollOrResize);
     vv?.addEventListener("scroll", onScrollOrResize);
     return () => {
-      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("mousedown", onDocDown, true);
       document.removeEventListener("keydown", onEsc);
+      window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
       window.removeEventListener("resize", onScrollOrResize);
       window.removeEventListener("scroll", onScrollOrResize, true);
       vv?.removeEventListener("resize", onScrollOrResize);
@@ -1280,6 +1420,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
     if (open && !closing) {
       closeAnimated();
     } else {
+      notifyClosePopovers(popIdRef.current, false);
       if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
       setClosing(false);
       updatePos();
@@ -1442,6 +1583,7 @@ export function AnimatedModal({
         window.cancelAnimationFrame(raf);
       };
     } else if (rendered) {
+      notifyClosePopovers(0, true);
       isOpenRef.current = false;
       setEntered(false);
       setClosing(true);
@@ -1475,6 +1617,7 @@ export function AnimatedModal({
     };
     document.addEventListener("keydown", onEsc);
     return () => {
+      notifyClosePopovers(0, true);
       document.removeEventListener("keydown", onEsc);
       const idx = openModalStack.indexOf(id);
       if (idx >= 0) openModalStack.splice(idx, 1);
@@ -1493,13 +1636,19 @@ export function AnimatedModal({
       class={`volo-modal-backdrop ${isSpotlight ? "is-spotlight" : ""} ${showOpen ? "is-open" : ""} ${closing ? "is-closing" : ""}`}
       style={{ zIndex: 1000 + stackDepth * 20 }}
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) {
+          notifyClosePopovers(0, true);
+          onClose();
+        }
       }}
     >
       <div
         class="volo-modal-scrim"
         aria-hidden="true"
-        onMouseDown={() => onClose()}
+        onMouseDown={() => {
+          notifyClosePopovers(0, true);
+          onClose();
+        }}
       />
       <div
         class={`volo-modal ${isSpotlight ? "volo-modal--spotlight" : ""}`}
@@ -1507,7 +1656,6 @@ export function AnimatedModal({
         role="dialog"
         aria-modal="true"
         aria-label={isSpotlight ? title : undefined}
-        onMouseDown={(e) => e.stopPropagation()}
       >
         {!isSpotlight && (
           <div class="volo-modal-head">
@@ -1520,9 +1668,12 @@ export function AnimatedModal({
               class="volo-modal-close"
               aria-label={t("common.close")}
               title={t("common.close")}
-              onClick={onClose}
+              onClick={() => {
+                notifyClosePopovers(0, true);
+                onClose();
+              }}
             >
-              ×
+              <CloseIcon size={15} />
             </button>
           </div>
         )}
@@ -2195,7 +2346,7 @@ export function TokenListInput({
                 onChange(safeValues.filter((_, i) => i !== idx));
               }}
             >
-              ×
+              <CloseIcon size={12} />
             </button>
           </span>
         ))}

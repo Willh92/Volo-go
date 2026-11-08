@@ -30,6 +30,8 @@ import {
   TableSkeleton,
   UploadButton,
   useDebouncedValue,
+  PlusIcon,
+  CloseIcon,
 } from "../components/UIControls";
 import {
   availableLocalesSig,
@@ -1780,7 +1782,7 @@ export function OverviewWorkspace({
                               setQuickCreateKind("category");
                             }}
                           >
-                            +
+                            <PlusIcon size={15} />
                           </button>
                         </div>
                         <ConsoleSelect
@@ -1865,7 +1867,7 @@ export function OverviewWorkspace({
                               setQuickCreateKind("series");
                             }}
                           >
-                            +
+                            <PlusIcon size={15} />
                           </button>
                         </div>
                         <ConsoleSelect
@@ -1973,7 +1975,7 @@ export function OverviewWorkspace({
                         aria-label={t("common.delete")}
                         onClick={() => removeTagToken(tg)}
                       >
-                        ×
+                        <CloseIcon size={11} />
                       </button>
                     </span>
                   ))}
@@ -2628,7 +2630,7 @@ export function OverviewWorkspace({
                 onNavigate?.("editor");
               }}
             >
-              + {t("art.new")}
+              <PlusIcon size={14} /> {t("art.new")}
             </button>
           </div>
         </div>
@@ -2900,7 +2902,7 @@ export function OverviewWorkspace({
               onNavigate?.("editor");
             }}
           >
-            + {t("ov.write_post")}
+            <PlusIcon size={14} /> {t("ov.write_post")}
           </button>
           <button type="button" class="volo-btn" onClick={() => onNavigate?.("articles")}>
             {t("ov.manage_posts")}

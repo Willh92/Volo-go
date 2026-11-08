@@ -2896,6 +2896,9 @@ body.volo-is-sorting * {
 
 .volo-ed-chip {
   appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   border: 1px solid var(--volo-line);
   background: var(--volo-surface);
   color: var(--volo-text);
@@ -3209,6 +3212,38 @@ body.volo-is-sorting * {
 }
 .cm-ir-hr {
   border-bottom: 1px solid var(--volo-line);
+}
+.cm-ir-center {
+  text-align: center;
+}
+.cm-ir-img-wrap {
+  display: inline-block;
+  max-width: 100%;
+  margin: 4px 0;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.cm-ir-img:not([hidden]) {
+  display: block;
+  max-width: min(100%, 560px);
+  max-height: 300px;
+  width: auto;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--volo-line);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+}
+.cm-ir-img-fallback:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px dashed var(--volo-line);
+  background: var(--volo-raised);
+  color: var(--volo-muted);
+  font-family: var(--volo-mono);
+  font-size: 12px;
 }
 
 /* Editor Toolbar Color Glyph, Swatch Popover & Instant Dark Floating Tooltip */
@@ -4657,6 +4692,9 @@ html[data-theme="dark"] .volo-auth-story {
 
 .volo-tag-pill button {
   appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   background: transparent;
   color: inherit;

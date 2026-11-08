@@ -20,12 +20,14 @@ import {
 import {
   ActionMenu,
   AnimatedModal,
+  CloseIcon,
   ConsoleEmpty,
   ConsoleSelect,
   DragGripIcon,
   MoveTopIcon,
   paginateItems,
   Pagination,
+  PlusIcon,
   SwitchToggle,
   TableSkeleton,
   UploadButton,
@@ -64,12 +66,41 @@ function renderAccentLabel(id: string): string {
   }
 }
 
+function resolveSchemaText(raw: any): string {
+  if (raw === null || raw === undefined) return "";
+  if (typeof raw === "string") return raw.trim();
+  if (typeof raw === "number" || typeof raw === "boolean") return String(raw);
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    const loc = String(localeSig.value || "zh-CN").trim();
+    const locLow = loc.toLowerCase();
+    const baseLang = locLow.split("-")[0];
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "string" && v.trim() && k.toLowerCase() === locLow) return v.trim();
+    }
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "string" && v.trim() && k.toLowerCase().split("-")[0] === baseLang) return v.trim();
+    }
+    for (const fb of ["zh-CN", "en-US", "en", "zh-TW"]) {
+      const v = (raw as Record<string, unknown>)[fb];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    for (const v of Object.values(raw)) {
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+  }
+  return "";
+}
+
 function isSecretSchemaField(f: any): boolean {
   return Boolean(f?.secret || f?.type === "secret" || f?.type === "password");
 }
 
 function getSchemaFieldGroup(f: any): string {
-  return String(f?.localized_group || f?.group_label || f?.group || "").trim();
+  return (
+    resolveSchemaText(f?.localized_group) ||
+    resolveSchemaText(f?.group_label) ||
+    resolveSchemaText(f?.group)
+  );
 }
 
 function buildSchemaDefaults(schema: any[]): Record<string, any> {
@@ -102,7 +133,7 @@ function validateSchemaRequired(
 ): string | null {
   for (const f of schema || []) {
     if (!f?.key || !f.required) continue;
-    const label = String(f.label || f.key);
+    const label = resolveSchemaText(f.label) || String(f.key);
     if (isSecretSchemaField(f)) {
       const cur = values[f.key];
       const hasSaved = Boolean(secretKeysSet?.[f.key]) && cur !== CLEAR_SECRET_SENTINEL;
@@ -369,7 +400,7 @@ function SortableFreeItemsField({
           }}
         />
         <button type="button" class="volo-btn volo-btn-sm" onClick={addFree}>
-          +
+          <PlusIcon size={15} />
         </button>
       </div>
       {items.length > 0 && (
@@ -438,7 +469,7 @@ function SortableFreeItemsField({
                     class="volo-act-btn danger"
                     onClick={() => onChange(fieldKey, items.filter((_, i) => i !== idx))}
                   >
-                    ×
+                    <CloseIcon size={13} />
                   </button>
                 </div>
               </div>
@@ -464,10 +495,12 @@ function SchemaFieldControl({
   namePrefix: string;
 }) {
   const [freeItemDraft, setFreeItemDraft] = useState("");
-  const label = f.label || f.key;
+  const label = resolveSchemaText(f.label) || String(f.key);
+  const desc = resolveSchemaText(f.description) || resolveSchemaText(f.help) || undefined;
   const reqMark = f.required ? " *" : "";
   const isSecret = isSecretSchemaField(f);
-  const ph = f.placeholder ? String(f.placeholder) : undefined;
+  const phText = resolveSchemaText(f.placeholder);
+  const ph = phText ? phText : undefined;
 
   if (f.type === "boolean") {
     return (
@@ -476,7 +509,7 @@ function SchemaFieldControl({
           checked={Boolean(values[f.key] ?? f.default)}
           onChange={(next) => onChange(f.key, next)}
           label={`${label}${reqMark}`}
-          hint={f.description}
+          hint={desc}
         />
       </div>
     );
@@ -488,7 +521,7 @@ function SchemaFieldControl({
     if (hasFixedOpts) {
       const allOpts: Array<{ value: string; label: string }> = f.options.map((op: any) =>
         typeof op === "object" && op !== null
-          ? { value: String(op.value), label: String(op.label || op.value) }
+          ? { value: String(op.value), label: resolveSchemaText(op.label) || String(op.value) }
           : { value: String(op), label: String(op) },
       );
       const optMap = new Map(allOpts.map((o) => [o.value, o.label]));
@@ -516,7 +549,7 @@ function SchemaFieldControl({
           fieldKey={f.key}
           label={label}
           reqMark={reqMark}
-          description={f.description}
+          description={desc}
           allOpts={allOpts}
           enabledKeys={enabledKeys}
           disabledOpts={disabledOpts}
@@ -533,7 +566,7 @@ function SchemaFieldControl({
         fieldKey={f.key}
         label={label}
         reqMark={reqMark}
-        description={f.description}
+        description={desc}
         ph={ph}
         items={items}
         freeItemDraft={freeItemDraft}
@@ -556,7 +589,7 @@ function SchemaFieldControl({
             <span class="volo-badge volo-badge-ok">{t("app.secret_sealed_hint")}</span>
           )}
         </label>
-        {f.description && <div class="volo-help">{f.description}</div>}
+        {desc && <div class="volo-help">{desc}</div>}
         <input
           type="password"
           class="volo-input"
@@ -584,14 +617,14 @@ function SchemaFieldControl({
         {label}
         {reqMark}
       </label>
-      {f.description && <div class="volo-help">{f.description}</div>}
+      {desc && <div class="volo-help">{desc}</div>}
       {f.type === "select" && Array.isArray(f.options) ? (
         <ConsoleSelect
           value={String(values[f.key] ?? f.default ?? "")}
           onChange={(v) => onChange(f.key, v)}
           options={f.options.map((op: any) =>
             typeof op === "object" && op !== null
-              ? { value: String(op.value), label: String(op.label || op.value) }
+              ? { value: String(op.value), label: resolveSchemaText(op.label) || String(op.value) }
               : { value: String(op), label: String(op) },
           )}
         />
@@ -711,7 +744,7 @@ function SchemaConfigPanel({
     if (!f?.key) return false;
     if (groupFilter !== "__all__" && getSchemaFieldGroup(f) !== groupFilter) return false;
     if (qLower) {
-      const hay = `${f.key} ${f.label || ""} ${f.description || ""} ${getSchemaFieldGroup(f)}`.toLowerCase();
+      const hay = `${f.key} ${resolveSchemaText(f.label)} ${resolveSchemaText(f.description)} ${resolveSchemaText(f.help)} ${getSchemaFieldGroup(f)}`.toLowerCase();
       if (!hay.includes(qLower)) return false;
     }
     return true;
@@ -1672,10 +1705,12 @@ export function AppearanceWorkspace({
                         <td class="col-fluid" data-label={t("app.plugin_col_info")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
-                              <span>{p.name || p.id}</span>
+                              <span>{resolveSchemaText(p.name) || p.id}</span>
                               <span class="volo-code-chip">{p.id}</span>
                             </div>
-                            {p.description && <div class="volo-cell-meta"><span>{p.description}</span></div>}
+                            {resolveSchemaText(p.description) && (
+                              <div class="volo-cell-meta"><span>{resolveSchemaText(p.description)}</span></div>
+                            )}
                             {p.last_error && (
                               <div
                                 style={{
@@ -1926,7 +1961,7 @@ export function AppearanceWorkspace({
       <AnimatedModal
         open={cfgModalOpen}
         onClose={() => setCfgModalOpen(false)}
-        title={t("app.cfg_title", { name: cfgModal?.name || cfgModal?.id || "" })}
+        title={t("app.cfg_title", { name: resolveSchemaText(cfgModal?.name) || cfgModal?.id || "" })}
         maxWidth="720px"
         footer={
           <>

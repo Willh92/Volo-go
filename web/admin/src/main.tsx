@@ -34,7 +34,7 @@ import {
   t,
 } from "./i18n";
 import { BrandLogo } from "./components/BrandLogo";
-import { AnimatedModal, GlobalConfirmModal, LocalePopover, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
+import { AnimatedModal, CloseIcon, GlobalConfirmModal, LocalePopover, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
 import { SetupWizard } from "./views/SetupWizard";
 import { LoginView, formatOidcError } from "./views/LoginView";
 import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
@@ -311,7 +311,7 @@ function ToastBanner() {
         aria-label={t("common.close")}
         onClick={dismissToast}
       >
-        ×
+        <CloseIcon size={13} />
       </button>
     </div>
   );
@@ -509,7 +509,7 @@ function CommandPalette({
               inputRef.current?.focus();
             }}
           >
-            ×
+            <CloseIcon size={13} />
           </button>
         )}
         <button type="button" class="volo-cmdk-esc" onClick={onClose}>

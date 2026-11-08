@@ -499,11 +499,38 @@ const AUDIT_ACTION_KEYS: Record<string, string> = {
 
 const WAF_REASON_KEYS: Record<string, string> = {
   scanner_trap: "sys.waf_reason_scanner_trap",
+  script_scan: "sys.waf_reason_script_scan",
+  sensitive_probe: "sys.waf_reason_sensitive_probe",
+  manual_ban: "sys.waf_reason_manual_ban",
+  manual: "sys.waf_reason_manual_ban",
+  admin_ban: "sys.waf_reason_manual_ban",
+  admin_block: "sys.waf_reason_manual_ban",
   not_found_scan: "sys.waf_reason_not_found_scan",
+  not_found_flood: "sys.waf_reason_not_found_scan",
+  path_scan: "sys.waf_reason_not_found_scan",
+  dir_scan: "sys.waf_reason_not_found_scan",
+  "404_flood": "sys.waf_reason_not_found_scan",
   rate_abuse: "sys.waf_reason_rate_abuse",
+  rate_limit: "sys.waf_reason_rate_abuse",
+  burst_limit: "sys.waf_reason_rate_abuse",
+  cc_attack: "sys.waf_reason_rate_abuse",
+  flood: "sys.waf_reason_rate_abuse",
   login_fail: "sys.waf_reason_login_fail",
+  auth_fail: "sys.waf_reason_login_fail",
+  brute_force: "sys.waf_reason_login_fail",
+  login_bruteforce: "sys.waf_reason_login_fail",
   two_factor_fail: "sys.waf_reason_two_factor_fail",
   unlock_fail: "sys.waf_reason_unlock_fail",
+  comment_spam: "sys.waf_reason_comment_spam",
+  comment_ip_ban: "sys.waf_reason_comment_spam",
+  honeypot: "sys.waf_reason_comment_spam",
+  malicious_ua: "sys.waf_reason_malicious_ua",
+  ua_block: "sys.waf_reason_malicious_ua",
+  bad_bot: "sys.waf_reason_malicious_ua",
+  exploit_probe: "sys.waf_reason_exploit_probe",
+  payload_attack: "sys.waf_reason_exploit_probe",
+  sql_injection: "sys.waf_reason_exploit_probe",
+  xss_probe: "sys.waf_reason_exploit_probe",
 };
 
 export function localizeAuditAction(act?: string): string {
@@ -514,10 +541,9 @@ export function localizeAuditAction(act?: string): string {
 }
 
 export function localizeWafReason(code?: string): string {
-  const raw = String(code || "").trim().toLowerCase();
-  if (!raw) return "";
-  const key = WAF_REASON_KEYS[raw];
-  return key ? t(key) : raw;
+  const orig = String(code || "").trim();
+  if (!orig) return "";
+  const cleaned = orig.replace(/^auto[-_ ]?ban\s*:\s*/i, "").trim().toLowerCase();
+  const key = WAF_REASON_KEYS[cleaned];
+  return key ? t(key) : orig;
 }
-
-

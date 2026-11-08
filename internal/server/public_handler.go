@@ -371,6 +371,9 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/github", s.handlePublicGitHubShowcaseRoute)
 	mux.HandleFunc("/my-github-repos", s.handlePublicGitHubShowcaseRoute)
 	mux.HandleFunc("/images/", s.handleLegacyImageShim)
+	mux.HandleFunc("/image/", s.handleLegacyImageShim)
+	mux.HandleFunc("/posts/images/", s.handleLegacyImageShim)
+	mux.HandleFunc("/posts/image/", s.handleLegacyImageShim)
 
 	// Public Studio HTML Routes
 	mux.HandleFunc("/posts/", s.handlePostRoute)
@@ -409,6 +412,7 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 			!strings.HasPrefix(p, "/themes/") &&
 			!strings.HasPrefix(p, "/uploads/") &&
 			!strings.HasPrefix(p, "/images/") &&
+			!strings.HasPrefix(p, "/image/") &&
 			!strings.HasPrefix(p, "/plugins/") &&
 			!strings.HasPrefix(p, "/avatars/") &&
 			p != "/logout" &&
@@ -3078,18 +3082,35 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	rel := strings.TrimPrefix(r.URL.Path, "/images/")
+	var rel string
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/posts/images/"):
+		rel = strings.TrimPrefix(r.URL.Path, "/posts/images/")
+	case strings.HasPrefix(r.URL.Path, "/posts/image/"):
+		rel = strings.TrimPrefix(r.URL.Path, "/posts/image/")
+	case strings.HasPrefix(r.URL.Path, "/image/"):
+		rel = strings.TrimPrefix(r.URL.Path, "/image/")
+	default:
+		rel = strings.TrimPrefix(r.URL.Path, "/images/")
+	}
 	clean := strings.TrimPrefix(path.Clean("/"+rel), "/")
 	if clean == "" || strings.Contains(clean, "..") {
 		http.NotFound(w, r)
 		return
 	}
-	// Serve user-provided static file if placed in uploads/images/ or data/images/ with strict CSP + attachment safety
+	// Serve user-provided static file if placed in uploads/{images,image}/ or data/{images,image}/, or directly in uploads/
 	for _, baseDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir(), s.deps.Config.DataDir} {
 		if strings.TrimSpace(baseDir) == "" {
 			continue
 		}
-		if serveSafeUserStaticFile(w, r, filepath.Join(baseDir, "images"), clean) {
+		for _, sub := range []string{"images", "image"} {
+			if serveSafeUserStaticFile(w, r, filepath.Join(baseDir, sub), clean) {
+				return
+			}
+		}
+	}
+	for _, upDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir()} {
+		if strings.TrimSpace(upDir) != "" && serveSafeUserStaticFile(w, r, upDir, clean) {
 			return
 		}
 	}

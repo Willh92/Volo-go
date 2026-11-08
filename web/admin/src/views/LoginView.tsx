@@ -12,7 +12,7 @@ import {
   StaffUser,
   toggleEffectiveTheme,
 } from "../api";
-import { LocalePopover, SwitchToggle } from "../components/UIControls";
+import { CloseIcon, LocalePopover, SwitchToggle } from "../components/UIControls";
 import { availableLocalesSig, ensureLocaleLoaded, localeSig, normalizeLocale, t } from "../i18n";
 
 interface OidcProviderItem {
@@ -306,7 +306,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                     class="volo-act-btn"
                     onClick={() => setOidcErrorCode("")}
                   >
-                    ×
+                    <CloseIcon size={13} />
                   </button>
                 </div>
               )}

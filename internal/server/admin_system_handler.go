@@ -3349,8 +3349,8 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			var args []any
 			if q != "" {
 				pat := "%" + escapeLikePattern(q) + "%"
-				where = append(where, "(LOWER(cidr) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason) LIKE LOWER(?) ESCAPE '!' OR LOWER(note) LIKE LOWER(?) ESCAPE '!')")
-				args = append(args, pat, pat, pat)
+				where = append(where, "(LOWER(cidr) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason_code) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason) LIKE LOWER(?) ESCAPE '!' OR LOWER(note) LIKE LOWER(?) ESCAPE '!')")
+				args = append(args, pat, pat, pat, pat)
 			}
 			switch state {
 			case "active":

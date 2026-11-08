@@ -60,7 +60,7 @@
             <form class="studio-tax-search" method="get" action="/tags">
               {{if .TagSort}}<input type="hidden" name="sort" value="{{.TagSort}}">{{end}}
               <input class="volo-input studio-tax-search__input js-tag-filter-input" type="search" name="q" value="{{.TagQuery}}" placeholder="{{if hasPrefix .Locale "en"}}Filter tags…{{else if eq .Locale "zh-TW"}}篩選標籤…{{else}}筛选标签…{{end}}" aria-label="{{t .Locale "nav.tags"}}" autocomplete="off">
-              <a class="studio-icon-btn studio-tag-clear js-tag-filter-clear" href="/tags{{if .TagSort}}?sort={{urlquery .TagSort}}{{end}}" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}">✕ <span>{{t .Locale "studio.clear_filter"}}</span></a>
+              <a class="studio-icon-btn studio-tag-clear js-tag-filter-clear" href="/tags{{if .TagSort}}?sort={{urlquery .TagSort}}{{end}}" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg><span>{{t .Locale "studio.clear_filter"}}</span></a>
             </form>
             <div class="studio-tax-toolbar__right">
               <span class="volo-badge studio-tag-count js-tag-filter-count" data-page-count="{{$shownTagLen}}" data-total-count="{{$totalTagLen}}">{{if and (gt $totalTagLen $shownTagLen) (not .TagQuery)}}{{$shownTagLen}} / {{$totalTagLen}}{{else}}{{$shownTagLen}}{{end}}</span>

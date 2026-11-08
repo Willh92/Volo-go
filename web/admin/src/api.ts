@@ -168,11 +168,14 @@ let toastSeq = 0;
 
 function inferToastKind(msg: string): ToastKind {
   if (
-    /(HTTP \d{3}|fail|error|invalid|denied|forbid|unauthorized|too many|rate limit|too large|unsupported|mismatch|expired|aborted|timeout|cannot|unable|失败|错误|无效|拒绝|异常|超时|必填|不能为空|未登录|未授权|权限不足|频繁|过大|不支持|不匹配|过期|中断|失敗|錯誤|無效|拒絕|異常|逾時|過大|頻繁|不支援|未授權|權限不足)/i.test(
+    /(HTTP \d{3}|fail|error|invalid|denied|forbid|unauthorized|too many|rate limit|too large|unsupported|mismatch|expired|aborted|timeout|cannot|unable|失败|错误|无效|拒绝|无法|未能|不可用|受限|异常|超时|必填|不能为空|未登录|未授权|权限不足|频繁|过大|不支持|不匹配|过期|中断|失敗|錯誤|無效|拒絕|無法|異常|逾時|過大|頻繁|不支援|未授權|權限不足)/i.test(
       msg
     )
   ) {
     return "err";
+  }
+  if (/(not detected|no .* device|未检测到|未偵測到)/i.test(msg)) {
+    return "warn";
   }
   return "ok";
 }
@@ -190,7 +193,7 @@ export function showToast(msg: string, kind?: ToastKind) {
   if (toastCloseTimer) window.clearTimeout(toastCloseTimer);
   const resolvedKind = kind || inferToastKind(msg);
   toastSig.value = { id: ++toastSeq, text: msg, kind: resolvedKind, closing: false };
-  scheduleToastDismiss(resolvedKind === "err" ? 4600 : 3400);
+  scheduleToastDismiss(resolvedKind === "err" ? 4600 : resolvedKind === "warn" ? 4200 : 3400);
 }
 
 export function pauseToast() {

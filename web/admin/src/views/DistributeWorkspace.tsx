@@ -25,6 +25,7 @@ import {
   UploadButton,
   useDebouncedValue,
   useFlipList,
+  PlusIcon,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, t } from "../i18n";
 
@@ -1072,7 +1073,7 @@ export function DistributeWorkspace({
                   setNavModalOpen(true);
                 }}
               >
-                + {t("dist.new_nav")}
+                <PlusIcon size={14} /> {t("dist.new_nav")}
               </button>
             </div>
           </div>
@@ -1365,7 +1366,7 @@ export function DistributeWorkspace({
                   setRedirModalOpen(true);
                 }}
               >
-                + {t("dist.new_redir")}
+                <PlusIcon size={14} /> {t("dist.new_redir")}
               </button>
             </div>
           </div>
@@ -1961,7 +1962,7 @@ export function DistributeWorkspace({
                   setLinkModalOpen(true);
                 }}
               >
-                + {t("dist.new_link")}
+                <PlusIcon size={14} /> {t("dist.new_link")}
               </button>
             </div>
           </div>
@@ -2391,7 +2392,7 @@ export function DistributeWorkspace({
                   setFollowModalOpen(true);
                 }}
               >
-                + {t("dist.new_follow")}
+                <PlusIcon size={14} /> {t("dist.new_follow")}
               </button>
             </div>
           </div>
@@ -2745,7 +2746,7 @@ export function DistributeWorkspace({
                   setWhModalOpen(true);
                 }}
               >
-                + {t("dist.new_wh")}
+                <PlusIcon size={14} /> {t("dist.new_wh")}
               </button>
             </div>
           </div>

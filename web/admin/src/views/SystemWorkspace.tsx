@@ -31,6 +31,8 @@ import {
   UploadProgressBar,
   useDebouncedValue,
   useFlipList,
+  PlusIcon,
+  CloseIcon,
 } from "../components/UIControls";
 import {
   availableLocalesSig,
@@ -1192,7 +1194,7 @@ export function SystemWorkspace({
                         setSocialDirty(true);
                       }}
                     >
-                      {editingSocialIdx !== null ? t("common.save") : t("sys.social_add")}
+                      {editingSocialIdx !== null ? t("common.save") : (<><PlusIcon size={14} /> {t("sys.social_add")}</>)}
                     </button>
                     {editingSocialIdx !== null && (
                       <button
@@ -2324,7 +2326,7 @@ export function SystemWorkspace({
                             }
                           }}
                         >
-                          {t("sys.totp_enroll")}
+                          <PlusIcon size={14} /> {t("sys.totp_enroll")}
                         </button>
                       </div>
                     )}
@@ -2408,7 +2410,7 @@ export function SystemWorkspace({
                         setPkModalOpen(true);
                       }}
                     >
-                      {t("sys.pk_add")}
+                      <PlusIcon size={14} /> {t("sys.pk_add")}
                     </button>
                   </div>
 
@@ -2477,7 +2479,7 @@ export function SystemWorkspace({
                             class="volo-btn volo-btn-sm"
                             href={`/api/v1/auth/oidc/${encodeURIComponent(p.name)}/start?target=bind`}
                           >
-                            + {t("sys.oidc_link_btn", { provider: p.display_name || p.name })}
+                            <PlusIcon size={14} /> {t("sys.oidc_link_btn", { provider: p.display_name || p.name })}
                           </a>
                         ))}
                       </div>
@@ -2562,7 +2564,7 @@ export function SystemWorkspace({
                         setPatModalOpen(true);
                       }}
                     >
-                      + {t("sys.pat_generate")}
+                      <PlusIcon size={14} /> {t("sys.pat_generate")}
                     </button>
                   </div>
 
@@ -3118,7 +3120,7 @@ export function SystemWorkspace({
                 setUserModalOpen(true);
               }}
             >
-              + {t("sys.new_user")}
+              <PlusIcon size={14} /> {t("sys.new_user")}
             </button>
           </div>
 
@@ -3649,7 +3651,7 @@ export function SystemWorkspace({
                     setBanModalOpen(true);
                   }}
                 >
-                  + {t("sys.new_ban")}
+                  <PlusIcon size={14} /> {t("sys.new_ban")}
                 </button>
               </div>
 
@@ -3749,9 +3751,21 @@ export function SystemWorkspace({
                           <td class="col-fluid" data-label={t("tbl.col_note")}>
                             <div class="volo-cell-meta">
                               <span>
-                                {b.reason_code
-                                  ? `${localizeWafReason(b.reason_code)}${b.note && !String(b.note).startsWith("auto-ban:") ? ` · ${b.note}` : ""}`
-                                  : b.note || b.reason || "—"}
+                                {(() => {
+                                  const code = String(b.reason_code || "").trim();
+                                  const reason = String(b.reason || "").trim();
+                                  const note = String(b.note || "").trim();
+                                  const primaryRaw = code || reason || note;
+                                  if (!primaryRaw) return "—";
+                                  const primary = localizeWafReason(primaryRaw);
+                                  const extra =
+                                    note &&
+                                    note.toLowerCase() !== primaryRaw.toLowerCase() &&
+                                    !/^auto[-_ ]?ban\s*:/i.test(note)
+                                      ? localizeWafReason(note)
+                                      : "";
+                                  return extra && extra !== primary ? `${primary} · ${extra}` : primary;
+                                })()}
                               </span>
                               <span>{b.expires_at > 0 ? formatDateTime(b.expires_at) : t("sys.waf_dur_perm")}</span>
                             </div>
@@ -3932,7 +3946,7 @@ export function SystemWorkspace({
                     setGeoModalOpen(true);
                   }}
                 >
-                  + {t("sys.new_geo_rule")}
+                  <PlusIcon size={14} /> {t("sys.new_geo_rule")}
                 </button>
               </div>
               {!geoCircuitEnabled && (
@@ -5022,7 +5036,7 @@ export function SystemWorkspace({
               />
               {logQuery && (
                 <button type="button" class="volo-act-btn" onClick={() => setLogQuery("")}>
-                  ×
+                  <CloseIcon size={13} />
                 </button>
               )}
             </div>

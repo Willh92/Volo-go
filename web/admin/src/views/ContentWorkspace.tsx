@@ -34,6 +34,8 @@ import {
   useDebouncedValue,
   useFlipList,
   usePointerSortableList,
+  PlusIcon,
+  CloseIcon,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
 
@@ -1796,7 +1798,7 @@ export function ContentWorkspace({
                   setCatModalOpen(true);
                 }}
               >
-                + {t("cnt.new_cat")}
+                <PlusIcon size={14} /> {t("cnt.new_cat")}
               </button>
             </div>
           </div>
@@ -2032,7 +2034,7 @@ export function ContentWorkspace({
                   setTagModalOpen(true);
                 }}
               >
-                + {t("cnt.new_tag")}
+                <PlusIcon size={14} /> {t("cnt.new_tag")}
               </button>
             </div>
           </div>
@@ -2289,7 +2291,7 @@ export function ContentWorkspace({
                   setSerModalOpen(true);
                 }}
               >
-                + {t("cnt.new_series")}
+                <PlusIcon size={14} /> {t("cnt.new_series")}
               </button>
             </div>
           </div>
@@ -2581,7 +2583,7 @@ export function ContentWorkspace({
                                   })
                                 }
                               >
-                                ×
+                                <CloseIcon size={13} />
                               </button>
                             </div>
                           </div>
@@ -2710,7 +2712,7 @@ export function ContentWorkspace({
                   setBookModalOpen(true);
                 }}
               >
-                + {t("cnt.new_book")}
+                <PlusIcon size={14} /> {t("cnt.new_book")}
               </button>
             </div>
           </div>
@@ -3044,7 +3046,7 @@ export function ContentWorkspace({
                     setChapPage(Math.max(1, Math.ceil(next.length / 80)));
                   }}
                 >
-                  + {t("cnt.chap_add")}
+                  <PlusIcon size={14} /> {t("cnt.chap_add")}
                 </button>
               </div>
             </div>
@@ -3211,7 +3213,7 @@ export function ContentWorkspace({
                                   });
                                 }}
                               >
-                                +
+                                <PlusIcon size={14} />
                               </button>
                               <button
                                 type="button"
@@ -3253,7 +3255,7 @@ export function ContentWorkspace({
                                   setChapItems((prev) => prev.filter((_, i) => i !== idx));
                                 }}
                               >
-                                ×
+                                <CloseIcon size={13} />
                               </button>
                             </div>
                           </div>
@@ -3447,7 +3449,7 @@ export function ContentWorkspace({
                     class="volo-btn volo-btn-primary volo-btn-sm"
                     onClick={() => void openNewPageEditor()}
                   >
-                    + {t("cnt.new_page")}
+                    <PlusIcon size={14} /> {t("cnt.new_page")}
                   </button>
                 </div>
               </div>
