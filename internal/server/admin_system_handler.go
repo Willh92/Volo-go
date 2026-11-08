@@ -210,7 +210,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			}
 			actor, ok := s.consumeBackupExportTicket(r, ticket)
 			if !ok {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired backup export ticket"})
+				writeErrJSON(w, http.StatusUnauthorized, "invalid or expired backup export ticket")
 				return
 			}
 			s.handleAdminBackupExport(w, r, actor)
@@ -258,7 +258,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		}
 		repos, err := s.refreshGitHubRepositories(r.Context(), req.Username)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		resp := map[string]any{
@@ -276,7 +276,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 	case sub == "seo/github-publish" && r.Method == http.MethodPost:
 		art, err := s.publishGitHubShowcaseArticle(r.Context(), actor)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "github.publish_showcase", "article", art.ID, map[string]any{"slug": art.Slug})
@@ -290,7 +290,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 	case sub == "seo/indexnow-push" && r.Method == http.MethodPost:
 		n, err := s.pushIndexNowURLs(r.Context(), s.publicBaseURL(r))
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"pushed_urls": n})
@@ -312,11 +312,11 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case sub == "security/rotate-share-secret" && r.Method == http.MethodPost:
 		if _, err := s.deps.Settings.RotateShareTokenSecret(r.Context()); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "security.rotate_share_secret", "settings", "security", nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case sub == "security/ip-bans" || strings.HasPrefix(sub, "security/ip-bans/"):
 		s.handleAdminIPBans(w, r, actor, strings.TrimPrefix(sub, "security/ip-bans"))
@@ -355,7 +355,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 	case sub == "runtime-logs" && r.Method == http.MethodDelete:
 		logging.Default().Clear()
 		s.recordAuditLog(r, actor, "system.clear_runtime_logs", "system", "runtime_logs", nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case sub == "audit-logs" && r.Method == http.MethodGet:
 		page, perPage := parseAdminPageParams(r, 50, 200)
@@ -401,7 +401,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case (sub == "backup/ticket" || sub == "backups/ticket") && r.Method == http.MethodPost:
 		if sess == nil || sess.ID == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 			return
 		}
 		var req struct {
@@ -410,7 +410,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		}
 		if r.Body != nil {
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 		}
@@ -420,7 +420,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		ipBucket := security.RateLimitBucketKey(security.ResolveClientIP(r, s.deps.Config.TrustedProxies))
 		tok, err := s.mintBackupExportTicket(actor.ID, sess.ID, ipBucket)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		mediaQuery := ""
@@ -448,7 +448,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 	case (sub == "backup/import-legacy" || sub == "backups/import-legacy") && r.Method == http.MethodPost:
 		rep, dryRun, newSiteURL, err := s.streamLegacyImportUpload(w, r, false)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if !dryRun {
@@ -516,7 +516,7 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 
 	if r.Method == http.MethodDelete {
 		if sess == nil || sess.ID == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 			return
 		}
 		var req struct {
@@ -524,7 +524,7 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 		}
 		if r.Body != nil {
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 		}
@@ -535,15 +535,15 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 			`DELETE FROM user_credentials WHERE id = ? AND user_id = ? AND kind = 'oidc'`,
 			rest, actor.ID)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "oidc link not found"})
+			writeErrJSON(w, http.StatusNotFound, "oidc link not found")
 			return
 		}
 		s.recordAuditLog(r, actor, "security.oidc_unlink", "user_credential", rest, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 		return
 	}
 
@@ -563,7 +563,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 		case http.MethodPost:
 			var in domain.NavItem
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.ID = id.Next()
@@ -571,12 +571,12 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			in.Title = strings.TrimSpace(in.Title)
 			cleanURL, urlOK := repo.SanitizeAllowedURL(in.URL, true)
 			if in.Title == "" || !urlOK || cleanURL == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and allowed url required"})
+				writeErrJSON(w, http.StatusBadRequest, "valid title and allowed url required")
 				return
 			}
 			cleanIcon, iconOK := sanitizeAdminIconField(in.Icon)
 			if !iconOK {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon URL scheme"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid icon URL scheme")
 				return
 			}
 			in.URL = cleanURL
@@ -600,7 +600,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				in.ID, in.ParentID, in.Title, in.I18nTitlesJSON, in.URL, in.OpenInNewTab, in.Icon, in.SortOrder, in.IsEnabled, now, now)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -614,18 +614,18 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 	case http.MethodPut:
 		var in domain.NavItem
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		title := strings.TrimSpace(in.Title)
 		cleanURL, urlOK := repo.SanitizeAllowedURL(in.URL, true)
 		if title == "" || !urlOK || cleanURL == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and allowed url required"})
+			writeErrJSON(w, http.StatusBadRequest, "valid title and allowed url required")
 			return
 		}
 		cleanIcon, iconOK := sanitizeAdminIconField(in.Icon)
 		if !iconOK {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon URL scheme"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid icon URL scheme")
 			return
 		}
 		if strings.TrimSpace(in.I18nTitlesJSON) == "" {
@@ -636,10 +636,10 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			in.ParentID, title, in.I18nTitlesJSON, cleanURL,
 			in.OpenInNewTab, cleanIcon, in.SortOrder, in.IsEnabled, time.Now().UnixMilli(), rest)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	case http.MethodDelete:
 		delRows, _ := sqlx.Select[struct {
 			ID string `db:"id"`
@@ -655,7 +655,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			s.pruneDeletedNavFromThemeConfigs(r.Context(), delIDs)
 		}
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -666,7 +666,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 	if rest == "patrol" && r.Method == http.MethodPost {
 		n, err := s.patrolAllFriendLinks(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
@@ -680,17 +680,17 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			CategoryName string   `json:"category_name"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(req.Action))
 		if action != "delete" && action != "category" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
 		ids := dedupCleanIDs(req.IDs, 200)
 		if len(ids) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
 		affected := 0
@@ -717,7 +717,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if action == "delete" {
@@ -784,21 +784,21 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 		case http.MethodPost:
 			var in domain.Link
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.ID = id.Next()
 			in.Title = strings.TrimSpace(in.Title)
 			cleanURL, urlOK := sanitizeRedirectTargetURL(in.URL)
 			if in.Title == "" || !urlOK {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and http(s) or relative url required"})
+				writeErrJSON(w, http.StatusBadRequest, "valid title and http(s) or relative url required")
 				return
 			}
 			in.URL = cleanURL
 			if strings.TrimSpace(in.IconURL) != "" {
 				cleanIcon, iconOK := sanitizeRedirectTargetURL(in.IconURL)
 				if !iconOK {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid icon_url")
 					return
 				}
 				in.IconURL = cleanIcon
@@ -813,7 +813,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 				`INSERT INTO links (id, title, url, description, icon_url, category_name, sort_order, health_status, http_code, latency_ms, health_error, last_checked_at, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, 'unknown', 0, 0, '', 0, ?, ?)`,
 				in.ID, in.Title, in.URL, in.Description, in.IconURL, in.CategoryName, in.SortOrder, now, now); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -828,7 +828,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 	if len(parts) == 2 && parts[1] == "check" && r.Method == http.MethodPost {
 		lk, err := sqlx.Get[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links WHERE id = ?`, strings.TrimSpace(parts[0]))
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+			writeErrJSON(w, http.StatusNotFound, "link not found")
 			return
 		}
 		updated := s.checkSingleFriendLink(r.Context(), lk)
@@ -841,13 +841,13 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 	case http.MethodPut:
 		var in domain.Link
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		title := strings.TrimSpace(in.Title)
 		cleanURL, urlOK := sanitizeRedirectTargetURL(in.URL)
 		if title == "" || !urlOK {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid title and http(s) or relative url required"})
+			writeErrJSON(w, http.StatusBadRequest, "valid title and http(s) or relative url required")
 			return
 		}
 		cleanIcon := ""
@@ -855,7 +855,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			var iconOK bool
 			cleanIcon, iconOK = sanitizeRedirectTargetURL(in.IconURL)
 			if !iconOK {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid icon_url")
 				return
 			}
 		}
@@ -863,15 +863,15 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			`UPDATE links SET title = ?, url = ?, description = ?, icon_url = ?, category_name = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
 			title, cleanURL, in.Description, cleanIcon, in.CategoryName, in.SortOrder, time.Now().UnixMilli(), rest)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM links WHERE id = ?`, rest)
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -953,7 +953,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		}
 		xmlBytes, err := xml.MarshalIndent(doc, "", "  ")
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -969,7 +969,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		if strings.HasPrefix(ct, "multipart/form-data") {
 			files, fields, mErr := readMultipartInMemoryFiles(w, r, 4<<20, 4<<20, 2)
 			if mErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 				return
 			}
 			if len(files) > 0 {
@@ -982,7 +982,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		} else {
 			bodyBytes, rErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
 			if rErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": rErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, rErr.Error())
 				return
 			}
 			trimmed := bytes.TrimSpace(bodyBytes)
@@ -992,7 +992,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 					Data string `json:"data"`
 				}
 				if err := json.Unmarshal(trimmed, &jReq); err != nil {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid json")
 					return
 				}
 				if strings.TrimSpace(jReq.OPML) != "" {
@@ -1005,12 +1005,12 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			}
 		}
 		if len(bytes.TrimSpace(rawOPML)) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty OPML payload"})
+			writeErrJSON(w, http.StatusBadRequest, "empty OPML payload")
 			return
 		}
 		var doc opmlDocument
 		if err := xml.Unmarshal(rawOPML, &doc); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid OPML XML: " + err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, "invalid OPML XML: "+err.Error())
 			return
 		}
 		var flat []opmlOutline
@@ -1087,7 +1087,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 	if rest == "sync" && r.Method == http.MethodPost {
 		n, err := s.syncAllFollowFeeds(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"synced_items": n})
@@ -1143,7 +1143,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		case http.MethodPost:
 			var in domain.Follow
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.ID = id.Next()
@@ -1151,14 +1151,14 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			cleanFeed, feedOK := repo.SanitizeAllowedURL(in.FeedURL, false)
 			lowerFeed := strings.ToLower(cleanFeed)
 			if in.Title == "" || !feedOK || (!strings.HasPrefix(lowerFeed, "http://") && !strings.HasPrefix(lowerFeed, "https://")) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title and valid http(s) feed_url required"})
+				writeErrJSON(w, http.StatusBadRequest, "title and valid http(s) feed_url required")
 				return
 			}
 			in.FeedURL = cleanFeed
 			if strings.TrimSpace(in.SiteURL) != "" {
 				cs, ok := sanitizeRedirectTargetURL(in.SiteURL)
 				if !ok {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid site_url"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid site_url")
 					return
 				}
 				in.SiteURL = cs
@@ -1168,7 +1168,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			if strings.TrimSpace(in.IconURL) != "" {
 				ci, ok := sanitizeRedirectTargetURL(in.IconURL)
 				if !ok {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid icon_url")
 					return
 				}
 				in.IconURL = ci
@@ -1182,7 +1182,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 				`INSERT INTO follows (id, title, site_url, feed_url, description, icon_url, sort_order, last_synced_at, sync_error, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, ?)`,
 				in.ID, in.Title, in.SiteURL, in.FeedURL, in.Description, in.IconURL, in.SortOrder, now, now); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -1197,7 +1197,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 	if len(parts) == 2 && parts[1] == "sync" && r.Method == http.MethodPost {
 		fw, err := sqlx.Get[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows WHERE id = ?`, strings.TrimSpace(parts[0]))
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "follow subscription not found"})
+			writeErrJSON(w, http.StatusNotFound, "follow subscription not found")
 			return
 		}
 		cnt, updated, syncErr := s.syncSingleFollowFeed(r.Context(), fw)
@@ -1226,14 +1226,14 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 	case http.MethodPut:
 		var in domain.Follow
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		title := strings.TrimSpace(in.Title)
 		cleanFeed, feedOK := repo.SanitizeAllowedURL(in.FeedURL, false)
 		lowerFeed := strings.ToLower(cleanFeed)
 		if title == "" || !feedOK || (!strings.HasPrefix(lowerFeed, "http://") && !strings.HasPrefix(lowerFeed, "https://")) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title and valid http(s) feed_url required"})
+			writeErrJSON(w, http.StatusBadRequest, "title and valid http(s) feed_url required")
 			return
 		}
 		cleanSite := ""
@@ -1241,7 +1241,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			var ok bool
 			cleanSite, ok = sanitizeRedirectTargetURL(in.SiteURL)
 			if !ok {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid site_url"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid site_url")
 				return
 			}
 		}
@@ -1250,7 +1250,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			var ok bool
 			cleanIcon, ok = sanitizeRedirectTargetURL(in.IconURL)
 			if !ok {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid icon_url"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid icon_url")
 				return
 			}
 		}
@@ -1259,11 +1259,11 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			title, cleanSite, cleanFeed,
 			in.Description, cleanIcon, in.SortOrder, time.Now().UnixMilli(), rest)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	case http.MethodDelete:
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
 			_, _ = tx.ExecContext(r.Context(), `DELETE FROM follow_items WHERE follow_id = ?`, rest)
@@ -1271,7 +1271,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			return err
 		})
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -1469,7 +1469,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 		if strings.HasPrefix(ct, "multipart/form-data") {
 			files, fields, mErr := readMultipartInMemoryFiles(w, r, 8<<20, 8<<20, 2)
 			if mErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 				return
 			}
 			if fields["format"] != "" {
@@ -1492,14 +1492,14 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			var rErr error
 			rawPayload, rErr = io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
 			if rErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": rErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, rErr.Error())
 				return
 			}
 		}
 
 		candidates, pErr := parseRedirectImportCandidates(fmtHint, rawPayload)
 		if pErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": pErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, pErr.Error())
 			return
 		}
 		imported := 0
@@ -1545,7 +1545,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if imported == 0 && len(candidates) > 0 {
@@ -1579,16 +1579,16 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			IDs    []string `json:"ids"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
 		ids := dedupCleanIDs(req.IDs, 200)
 		if len(ids) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
 		affected := 0
@@ -1605,7 +1605,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if s.deps.Content != nil {
@@ -1669,17 +1669,17 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 		case http.MethodPost:
 			var in domain.RedirectRule
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
 			dst, dstOK := sanitizeRedirectTargetURL(in.TargetPath)
 			if !srcOK || !dstOK {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and allowed target_path required"})
+				writeErrJSON(w, http.StatusBadRequest, "valid distinct source_path and allowed target_path required")
 				return
 			}
 			if s.isRedirectSelfLoop(r, src, dst) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "redirect target cannot point to source_path (self-loop)"})
+				writeErrJSON(w, http.StatusBadRequest, "redirect target cannot point to source_path (self-loop)")
 				return
 			}
 			in.StatusCode = normalizeRedirectStatusCode(in.StatusCode)
@@ -1691,7 +1691,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 				`INSERT INTO redirects (id, source_path, target_path, status_code, is_system_legacy, hit_count, created_at)
 				 VALUES (?, ?, ?, ?, ?, 0, ?)`,
 				in.ID, in.SourcePath, in.TargetPath, in.StatusCode, false, in.CreatedAt); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			if s.deps.Content != nil {
@@ -1707,36 +1707,36 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 	case http.MethodPut:
 		var in domain.RedirectRule
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
 		dst, dstOK := sanitizeRedirectTargetURL(in.TargetPath)
 		if !srcOK || !dstOK {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and allowed target_path required"})
+			writeErrJSON(w, http.StatusBadRequest, "valid distinct source_path and allowed target_path required")
 			return
 		}
 		if s.isRedirectSelfLoop(r, src, dst) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "redirect target cannot point to source_path (self-loop)"})
+			writeErrJSON(w, http.StatusBadRequest, "redirect target cannot point to source_path (self-loop)")
 			return
 		}
 		in.StatusCode = normalizeRedirectStatusCode(in.StatusCode)
 		if _, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE redirects SET source_path = ?, target_path = ?, status_code = ? WHERE id = ?`,
 			src, dst, in.StatusCode, rest); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if s.deps.Content != nil {
 			s.deps.Content.WarmCaches(r.Context())
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM redirects WHERE id = ?`, rest)
 		if s.deps.Content != nil {
 			s.deps.Content.WarmCaches(r.Context())
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -1925,14 +1925,14 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 				Events []string `json:"events"`
 			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.ID = id.Next()
 			in.Name = strings.TrimSpace(in.Name)
 			in.URL = strings.TrimSpace(in.URL)
 			if in.Name == "" || in.URL == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and url required"})
+				writeErrJSON(w, http.StatusBadRequest, "name and url required")
 				return
 			}
 			if in.Provider == "" {
@@ -1949,7 +1949,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 				var sErr error
 				secCipher, sErr = s.deps.Config.KeyRing.SealString(strings.TrimSpace(in.Secret), config.WebhookSecretAAD(in.ID))
 				if sErr != nil {
-					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": sErr.Error()})
+					writeErrJSON(w, http.StatusInternalServerError, sErr.Error())
 					return
 				}
 			}
@@ -1960,7 +1960,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 				`INSERT INTO webhooks (id, name, provider, url, secret_ciphertext, chat_id, events_json, is_enabled, last_status_code, last_error, last_triggered_at, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0, ?, ?)`,
 				in.ID, in.Name, in.Provider, in.URL, secCipher, in.ChatID, in.EventsJSON, in.IsEnabled, now, now); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusCreated, map[string]any{"webhook": in.Webhook, "secret_set": secCipher != ""})
@@ -1975,7 +1975,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 	whID := parts[0]
 	wh, err := sqlx.Get[domain.Webhook](r.Context(), s.deps.Store, `SELECT * FROM webhooks WHERE id = ?`, whID)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "webhook not found"})
+		writeErrJSON(w, http.StatusNotFound, "webhook not found")
 		return
 	}
 	if len(parts) == 2 && parts[1] == "deliveries" && r.Method == http.MethodGet {
@@ -1995,7 +1995,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 		orig, dErr := sqlx.Get[domain.WebhookDelivery](r.Context(), s.deps.Store,
 			`SELECT * FROM webhook_deliveries WHERE id = ? AND webhook_id = ?`, strings.TrimSpace(parts[2]), wh.ID)
 		if dErr != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "webhook delivery not found"})
+			writeErrJSON(w, http.StatusNotFound, "webhook delivery not found")
 			return
 		}
 		newDeliv, rErr := s.replayWebhookDelivery(r.Context(), wh, orig)
@@ -2018,7 +2018,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 	}
 	if len(parts) == 2 && parts[1] == "test" && r.Method == http.MethodPost {
 		if s.deps.TestWebhook == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "webhook dispatcher not wired"})
+			writeErrJSON(w, http.StatusServiceUnavailable, "webhook dispatcher not wired")
 			return
 		}
 		code, tErr := s.deps.TestWebhook(r.Context(), wh, actor.PreferredLocale)
@@ -2039,7 +2039,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 			Events      []string `json:"events"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		secCipher := wh.SecretCiphertext
@@ -2059,15 +2059,15 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 			`UPDATE webhooks SET name = ?, provider = ?, url = ?, secret_ciphertext = ?, chat_id = ?, events_json = ?, is_enabled = ?, updated_at = ? WHERE id = ?`,
 			strings.TrimSpace(in.Name), in.Provider, strings.TrimSpace(in.URL), secCipher, in.ChatID, evJSON, in.IsEnabled, time.Now().UnixMilli(), whID)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM webhook_deliveries WHERE webhook_id = ?`, whID)
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM webhooks WHERE id = ?`, whID)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -2362,7 +2362,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 
 	if rest == "reload" && r.Method == http.MethodPost {
 		if err := s.deps.Themes.Reload(); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		snap := s.deps.Settings.Snapshot()
@@ -2383,7 +2383,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			Target  string `json:"target"` // desktop (default) | mobile | both
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		target := strings.ToLower(strings.TrimSpace(req.Target))
@@ -2399,20 +2399,20 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 				tid = ""
 			}
 			if tid != "" && !s.deps.Themes.Has(tid) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme not found: " + tid})
+				writeErrJSON(w, http.StatusBadRequest, "theme not found: "+tid)
 				return
 			}
 			patchMap["mobile_theme"] = tid
 		case "both":
 			if !s.deps.Themes.Has(tid) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme not found: " + tid})
+				writeErrJSON(w, http.StatusBadRequest, "theme not found: "+tid)
 				return
 			}
 			patchMap["active_theme"] = tid
 			patchMap["mobile_theme"] = tid
 		default:
 			if !s.deps.Themes.Has(tid) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme not found: " + tid})
+				writeErrJSON(w, http.StatusBadRequest, "theme not found: "+tid)
 				return
 			}
 			patchMap["active_theme"] = tid
@@ -2420,7 +2420,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		patch, _ := json.Marshal(patchMap)
 		val, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patch, 0)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "theme.activate", "theme", tid, map[string]any{"target": target})
@@ -2431,7 +2431,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	if rest == "install" && r.Method == http.MethodPost {
 		files, fields, mErr := readMultipartInMemoryFiles(w, r, 32<<20, 32<<20, 2)
 		if mErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 			return
 		}
 		var uf *inMemoryMultipartFile
@@ -2444,7 +2444,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			}
 		}
 		if uf == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
+			writeErrJSON(w, http.StatusBadRequest, "missing 'file' field")
 			return
 		}
 		owRaw := strings.TrimSpace(fields["overwrite"])
@@ -2454,7 +2454,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
 		mf, iErr := s.deps.Themes.InstallZip(bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite)
 		if iErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": iErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "theme.install", "theme", mf.ID, map[string]any{"version": mf.Version})
@@ -2469,12 +2469,12 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	themeID := strings.TrimSpace(parts[0])
 	if len(parts) == 2 && (parts[1] == "export" || parts[1] == "export.zip") && r.Method == http.MethodGet {
 		if s.deps.Themes == nil || !s.deps.Themes.Has(themeID) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "theme not found: " + themeID})
+			writeErrJSON(w, http.StatusNotFound, "theme not found: "+themeID)
 			return
 		}
 		var buf bytes.Buffer
 		if err := s.deps.Themes.ExportZip(&buf, themeID); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "theme.export", "theme", themeID, nil)
@@ -2486,12 +2486,12 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 
 	if len(parts) == 2 && parts[1] == "config" && (r.Method == http.MethodPut || r.Method == http.MethodPatch) {
 		if !s.deps.Themes.Has(themeID) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "theme not found: " + themeID})
+			writeErrJSON(w, http.StatusNotFound, "theme not found: "+themeID)
 			return
 		}
 		var cfgPatch map[string]any
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&cfgPatch); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if nested, ok := cfgPatch["values"].(map[string]any); ok && len(cfgPatch) == 1 {
@@ -2521,7 +2521,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		patchBytes, _ := json.Marshal(map[string]any{"theme_configs": nextConfigs})
 		val, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -2535,7 +2535,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 
 	if len(parts) == 1 && themeID != "" && r.Method == http.MethodDelete {
 		if err := s.deps.Themes.Uninstall(themeID); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		curApp := s.deps.Settings.Snapshot().Appearance
@@ -2603,7 +2603,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 
 	if rest == "reload" && r.Method == http.MethodPost {
 		if err := s.deps.Catalog.ReloadDir(); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if s.deps.Themes != nil {
@@ -2626,14 +2626,14 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 				Overwrite *bool             `json:"overwrite"`
 			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			raw, _ := json.Marshal(req.Messages)
 			ow := req.Overwrite == nil || *req.Overwrite
 			sum, err := s.deps.Catalog.InstallPackJSON(req.Code, raw, ow)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			if s.deps.Themes != nil {
@@ -2650,7 +2650,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 
 		files, fields, mErr := readMultipartInMemoryFiles(w, r, 8<<20, 8<<20, 2)
 		if mErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 			return
 		}
 		var uf *inMemoryMultipartFile
@@ -2663,7 +2663,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			}
 		}
 		if uf == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
+			writeErrJSON(w, http.StatusBadRequest, "missing 'file' field")
 			return
 		}
 		raw := uf.Data
@@ -2673,7 +2673,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		if strings.HasSuffix(strings.ToLower(fname), ".zip") {
 			installed, zErr := s.deps.Catalog.InstallPackZip(bytes.NewReader(raw), int64(len(raw)), overwrite)
 			if zErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": zErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, zErr.Error())
 				return
 			}
 			if s.deps.Themes != nil {
@@ -2699,7 +2699,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		}
 		sum, jErr := s.deps.Catalog.InstallPackJSON(codeHint, raw, overwrite)
 		if jErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": jErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, jErr.Error())
 			return
 		}
 		if s.deps.Themes != nil {
@@ -2719,7 +2719,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 	if len(parts) == 2 && parts[1] == "export" && r.Method == http.MethodGet {
 		data, err := s.deps.Catalog.ExportPackJSON(code)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		resolved := s.deps.Catalog.Match(code, "")
@@ -2731,7 +2731,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 
 	if len(parts) == 1 && code != "" && r.Method == http.MethodDelete {
 		if err := s.deps.Catalog.DeleteExternalPack(code); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if s.deps.Themes != nil {
@@ -2776,7 +2776,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 
 	if (rest == "reload" || rest == "discover") && r.Method == http.MethodPost {
 		if err := s.deps.Plugins.ReloadAll(r.Context()); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		list := s.deps.Plugins.List(locale)
@@ -2787,7 +2787,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 	if rest == "install" && r.Method == http.MethodPost {
 		files, fields, mErr := readMultipartInMemoryFiles(w, r, 32<<20, 32<<20, 2)
 		if mErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 			return
 		}
 		var uf *inMemoryMultipartFile
@@ -2800,7 +2800,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			}
 		}
 		if uf == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
+			writeErrJSON(w, http.StatusBadRequest, "missing 'file' field")
 			return
 		}
 		owRaw := strings.TrimSpace(fields["overwrite"])
@@ -2810,7 +2810,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
 		sum, iErr := s.deps.Plugins.InstallFromZip(r.Context(), bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite, locale)
 		if iErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": iErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "plugin.install", "plugin", sum.ID, map[string]any{"version": sum.Version})
@@ -2824,7 +2824,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		switch {
 		case parts[1] == "enable" && r.Method == http.MethodPost:
 			if err := s.deps.Plugins.Enable(r.Context(), pid); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.enable", "plugin", pid, nil)
@@ -2832,7 +2832,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "disable" && r.Method == http.MethodPost:
 			if err := s.deps.Plugins.Disable(r.Context(), pid); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.disable", "plugin", pid, nil)
@@ -2841,14 +2841,14 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		case parts[1] == "reload" && r.Method == http.MethodPost:
 			sum, err := s.deps.Plugins.ReloadPlugin(r.Context(), pid, locale)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.reload", "plugin", pid, nil)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum})
 		case parts[1] == "reset-circuit" && r.Method == http.MethodPost:
 			if err := s.deps.Plugins.ResetCircuit(r.Context(), pid); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			sum, _ := s.deps.Plugins.Get(pid, locale)
@@ -2856,7 +2856,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		case parts[1] == "kv" && r.Method == http.MethodDelete:
 			cleared, err := s.deps.Plugins.ClearPluginKV(r.Context(), pid)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.clear_kv", "plugin", pid, map[string]any{"cleared": cleared})
@@ -2864,12 +2864,12 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		case parts[1] == "config" && r.Method == http.MethodPatch:
 			var patch map[string]any
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&patch); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			sum, err := s.deps.Plugins.UpdateConfig(r.Context(), pid, patch, locale)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -2886,12 +2886,12 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 
 	if len(parts) == 1 && r.Method == http.MethodDelete {
 		if err := s.deps.Plugins.Uninstall(r.Context(), pid); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "plugin.uninstall", "plugin", pid, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 		return
 	}
 	w.WriteHeader(http.StatusMethodNotAllowed)
@@ -2949,7 +2949,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			Password string                        `json:"smtp_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		to := strings.TrimSpace(req.ToEmail)
@@ -2961,7 +2961,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			cfg = *req.Settings
 		}
 		if s.deps.TestSMTP == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "SMTP mailer not wired"})
+			writeErrJSON(w, http.StatusServiceUnavailable, "SMTP mailer not wired")
 			return
 		}
 		if err := s.deps.TestSMTP(r.Context(), cfg, req.Password, to, actor.PreferredLocale); err != nil {
@@ -2998,7 +2998,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		writeOKJSON(w)
 		return
 	}
 
@@ -3006,7 +3006,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 	case http.MethodGet:
 		val, ver, err := s.deps.Settings.GetDomain(r.Context(), rest)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
@@ -3015,7 +3015,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 	case http.MethodPatch:
 		rawBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256*1024))
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		var meta struct {
@@ -3024,7 +3024,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 		_ = json.Unmarshal(rawBytes, &meta)
 		var patchMap map[string]any
 		if err := json.Unmarshal(rawBytes, &patchMap); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		delete(patchMap, "expected_version")
@@ -3032,12 +3032,12 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			if rawLocalDir, hasLocalDir := patchMap["local_dir"]; hasLocalDir {
 				dirStr, ok := rawLocalDir.(string)
 				if !ok {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "local_dir must be a string"})
+					writeErrJSON(w, http.StatusBadRequest, "local_dir must be a string")
 					return
 				}
 				normDir, vErr := s.deps.Config.ValidateCustomUploadDir(dirStr)
 				if vErr != nil {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": vErr.Error()})
+					writeErrJSON(w, http.StatusBadRequest, vErr.Error())
 					return
 				}
 				patchMap["local_dir"] = normDir
@@ -3048,11 +3048,11 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 
 		val, ver, pErr := s.deps.Settings.PatchDomain(r.Context(), rest, cleanPatch, expectedVer)
 		if errors.Is(pErr, repo.ErrSettingsConflict) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": pErr.Error()})
+			writeErrJSON(w, http.StatusConflict, pErr.Error())
 			return
 		}
 		if pErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": pErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, pErr.Error())
 			return
 		}
 		if rest == domain.SettingsDomainStorage {
@@ -3148,11 +3148,11 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				PreferredLocale string `json:"preferred_locale"`
 			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			if err := auth.ValidatePasswordPolicy(req.Password); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			role := strings.ToLower(strings.TrimSpace(req.Role))
@@ -3161,7 +3161,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			}
 			pwHash, err := auth.HashPassword(req.Password)
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			now := time.Now().UnixMilli()
@@ -3188,7 +3188,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, '', '', ?, ?, '', ?, ?, ?, ?, ?)`,
 				u.ID, u.Username, u.Email, u.DisplayName, u.AvatarURL, u.Role, pwHash, u.Status, u.EmailVerifiedAt, u.PreferredLocale, now, now); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.recordAuditLog(r, actor, "user.create", "user", u.ID, map[string]any{"role": u.Role, "username": u.Username})
@@ -3201,7 +3201,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 	}
 
 	if rest == actor.ID && r.Method == http.MethodDelete {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot delete your own active admin account"})
+		writeErrJSON(w, http.StatusBadRequest, "cannot delete your own active admin account")
 		return
 	}
 	switch r.Method {
@@ -3216,16 +3216,16 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			CurrentPassword string  `json:"current_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		u, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, rest)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
 		}
 		if rest == actor.ID && ((req.Status != nil && *req.Status != domain.UserStatusActive) || (req.Role != nil && *req.Role != domain.RoleAdmin)) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot demote or disable your own admin account"})
+			writeErrJSON(w, http.StatusBadRequest, "cannot demote or disable your own admin account")
 			return
 		}
 		emailChanged := req.Email != nil && strings.TrimSpace(*req.Email) != "" && !strings.EqualFold(strings.TrimSpace(*req.Email), u.Email)
@@ -3251,7 +3251,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		}
 		if req.Password != "" {
 			if err := auth.ValidatePasswordPolicy(req.Password); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			u.PasswordHash, _ = auth.HashPassword(req.Password)
@@ -3261,7 +3261,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			`UPDATE users SET display_name = ?, email = ?, preferred_locale = ?, role = ?, status = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
 			u.DisplayName, u.Email, u.PreferredLocale, u.Role, u.Status, u.PasswordHash, u.LegacyHash, time.Now().UnixMilli(), rest)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if u.Status == domain.UserStatusDisabled || req.Password != "" {
@@ -3275,7 +3275,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			"email_changed":    emailChanged,
 			"password_changed": req.Password != "",
 		})
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case http.MethodDelete:
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -3286,7 +3286,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			return err
 		})
 		s.recordAuditLog(r, actor, "user.delete", "user", rest, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3301,16 +3301,16 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			IDs    []string `json:"ids"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
 		ids := dedupCleanIDs(req.IDs, 200)
 		if len(ids) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
 		affected := 0
@@ -3327,7 +3327,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if s.deps.WAF != nil {
@@ -3386,7 +3386,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 				ExpiresHours int    `json:"expires_hours"`
 			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			var expMS int64
@@ -3396,7 +3396,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 			rec, err := s.deps.WAF.AddManualBan(r.Context(), req.CIDR, req.Note, expMS, clientIP)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.recordAuditLog(r, actor, "security.ip_ban_add", "ip_ban", rec.ID, map[string]any{"cidr": rec.CIDR})
@@ -3412,7 +3412,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM security_ip_bans WHERE id = ?`, rest)
 		_ = s.deps.WAF.ReloadBans(r.Context())
 		s.recordAuditLog(r, actor, "security.ip_ban_remove", "ip_ban", rest, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 		return
 	}
 	w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3463,7 +3463,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 		case http.MethodPost:
 			var in domain.SecurityGeoRule
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.ID = id.Next()
@@ -3477,7 +3477,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 				`INSERT INTO security_geo_rules (id, name, is_enabled, action, on_miss, countries, regions, sort_order, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				in.ID, in.Name, in.IsEnabled, in.Action, in.OnMiss, in.Countries, in.Regions, in.SortOrder, now, now); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
@@ -3485,7 +3485,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			if s.deps.Config.GeoAccessEnabled && !s.deps.Geo.Allows(clientIP) {
 				_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM security_geo_rules WHERE id = ?`, in.ID)
 				_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "refusing GeoIP rule that would immediately lock out your current IP"})
+				writeErrJSON(w, http.StatusBadRequest, "refusing GeoIP rule that would immediately lock out your current IP")
 				return
 			}
 			s.recordAuditLog(r, actor, "security.geo_rule_add", "geo_rule", in.ID, nil)
@@ -3500,12 +3500,12 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 	case http.MethodPut:
 		prev, pErr := sqlx.Get[domain.SecurityGeoRule](r.Context(), s.deps.Store, `SELECT * FROM security_geo_rules WHERE id = ?`, rest)
 		if pErr != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "geo rule not found"})
+			writeErrJSON(w, http.StatusNotFound, "geo rule not found")
 			return
 		}
 		var in domain.SecurityGeoRule
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		in.Name = strings.TrimSpace(in.Name)
@@ -3515,7 +3515,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 		if _, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE security_geo_rules SET name = ?, is_enabled = ?, action = ?, on_miss = ?, countries = ?, regions = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
 			in.Name, in.IsEnabled, in.Action, in.OnMiss, in.Countries, in.Regions, in.SortOrder, now, rest); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
@@ -3525,16 +3525,16 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 				`UPDATE security_geo_rules SET name = ?, is_enabled = ?, action = ?, on_miss = ?, countries = ?, regions = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
 				prev.Name, prev.IsEnabled, prev.Action, prev.OnMiss, prev.Countries, prev.Regions, prev.SortOrder, prev.UpdatedAt, rest)
 			_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "refusing GeoIP rule update that would immediately lock out your current IP"})
+			writeErrJSON(w, http.StatusBadRequest, "refusing GeoIP rule update that would immediately lock out your current IP")
 			return
 		}
 		s.recordAuditLog(r, actor, "security.geo_rule_update", "geo_rule", rest, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM security_geo_rules WHERE id = ?`, rest)
 		_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3612,7 +3612,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			}
 			res, err := sched.RunOnce(r.Context())
 			if err != nil && (res == nil || res.LocalPath == "") {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			warn := ""
@@ -3638,7 +3638,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 	if len(parts) == 2 && parts[1] == "restore" && r.Method == http.MethodPost {
 		base := filepath.Base(parts[0])
 		if base != parts[0] || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid backup filename"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
 			return
 		}
 		fullPath := filepath.Join(backupDir, base)
@@ -3663,7 +3663,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 				AdminPath:       s.deps.Config.AdminPath,
 			})
 			if lErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": lErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, lErr.Error())
 				return
 			}
 			if !dryRun {
@@ -3681,7 +3681,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			UploadDir: s.deps.Config.GetUploadDir(),
 		})
 		if rErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": rErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, rErr.Error())
 			return
 		}
 		if !dryRun {
@@ -3694,7 +3694,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 
 	base := filepath.Base(rest)
 	if base != rest || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid backup filename"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
 		return
 	}
 	fullPath := filepath.Join(backupDir, base)
@@ -3717,7 +3717,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		http.ServeContent(w, r, base, info.ModTime(), f)
 	case http.MethodDelete:
 		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "backup.local_delete", "system", base, nil)
@@ -3754,7 +3754,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 	const maxRestoreUpload = 512 << 20
 	uploaded, sErr := streamMultipartSingleFile(w, r, "file", maxRestoreUpload, s.ensureTempDir(), "volo-restore-", ".zip", ".zip", ".json")
 	if sErr != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": sErr.Error()})
+		writeErrJSON(w, http.StatusBadRequest, sErr.Error())
 		return
 	}
 	tmpPath := uploaded.TempPath
@@ -3781,7 +3781,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 			AdminPath:       s.deps.Config.AdminPath,
 		})
 		if lErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": lErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, lErr.Error())
 			return
 		}
 		if !dryRun {
@@ -3799,7 +3799,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 		UploadDir: s.deps.Config.GetUploadDir(),
 	})
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !dryRun {
@@ -3808,4 +3808,3 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": sum})
 }
-

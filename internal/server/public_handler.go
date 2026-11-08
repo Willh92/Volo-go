@@ -216,12 +216,15 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	}
 
 	var root http.Handler = s.withDynamicAdminMount(mux)
+	root = s.wrapCustomErrorPages(root)
 	root = wrapPublicDynamicGzip(root, func() string {
 		p, _ := s.effectiveAdminPrefix()
 		return p
 	})
 	root = s.withRedirectGuardian(root)
 	if deps.WAF != nil {
+		deps.WAF.SetErrorHandler(s.handleWAFError)
+		deps.WAF.SetStaffBypassCheck(s.isStaffRequest)
 		root = deps.WAF.WrapHTTP(root)
 	}
 	s.handler = root
@@ -231,9 +234,15 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 func (s *AppServer) Handler() http.Handler { return s.handler }
 func (s *AppServer) Deps() AppDeps         { return s.deps }
 
-// Close flushes buffered view/analytics counters before database shutdown.
+// Close flushes buffered view/analytics counters and stops background workers before database shutdown.
 func (s *AppServer) Close(ctx context.Context) error {
-	if s == nil || s.deps.Content == nil {
+	if s == nil {
+		return nil
+	}
+	if s.deps.WAF != nil {
+		s.deps.WAF.Close()
+	}
+	if s.deps.Content == nil {
 		return nil
 	}
 	return s.deps.Content.Close(ctx)
@@ -746,10 +755,24 @@ func (s *AppServer) handleGitHubStatsSVG(w http.ResponseWriter, r *http.Request)
 
 // --- Public JSON v1 APIs ---
 
+type jsonErrPayload struct {
+	Error string `json:"error"`
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeErrJSON(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, jsonErrPayload{Error: msg})
+}
+
+func writeOKJSON(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("{\"ok\":true}\n"))
 }
 
 func (s *AppServer) handlePublicI18nAPI(w http.ResponseWriter, r *http.Request) {
@@ -807,7 +830,7 @@ func (s *AppServer) handlePoWChallenge(w http.ResponseWriter, r *http.Request) {
 	}
 	chal, err := s.deps.PoW.IssueChallenge(bits)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": s.localizePublicError(s.resolveLocale(r), err)})
+		writeErrJSON(w, http.StatusInternalServerError, s.localizePublicError(s.resolveLocale(r), err))
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -865,13 +888,13 @@ func (s *AppServer) handleSearchAPI(w http.ResponseWriter, r *http.Request) {
 	locale := s.resolveLocale(r)
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("public_search", clientIP, 60, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(locale, "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
 	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	hits, err := s.deps.Content.SearchIndex().Search(r.Context(), q, 20)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": s.deps.Catalog.T(locale, "error.server_busy")})
+		writeErrJSON(w, http.StatusInternalServerError, s.deps.Catalog.T(locale, "error.server_busy"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"hits": hits})
@@ -906,7 +929,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	targetID := strings.TrimSpace(parts[0])
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("unlock:"+targetID, clientIP, 10, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(locale, "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
 	}
 
@@ -914,7 +937,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 		return
 	}
 
@@ -929,7 +952,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 		matched, ok := verifyPageInlinePassword(pg.ContentMD, req.Password)
 		if !ok {
 			s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(locale, "article.unlock_wrong_pwd")})
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "article.unlock_wrong_pwd"))
 			return
 		}
 		entryKey = visibility.InlineUnlockKey("page:"+pg.ID, matched)
@@ -940,7 +963,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 			matched, ok := s.deps.Content.Guard().VerifyArticlePassword(raw, req.Password)
 			if !ok {
 				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(locale, "article.unlock_wrong_pwd")})
+				writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "article.unlock_wrong_pwd"))
 				return
 			}
 			entryKey = s.deps.Content.Guard().UnlockEntryKey(raw, matched)
@@ -954,7 +977,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 			matched, ok := verifyPageInlinePassword(pg.ContentMD, req.Password)
 			if !ok {
 				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(locale, "article.unlock_wrong_pwd")})
+				writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "article.unlock_wrong_pwd"))
 				return
 			}
 			entryKey = visibility.InlineUnlockKey("page:"+pg.ID, matched)
@@ -965,7 +988,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	gp, _ := s.deps.Passports.ResolveOrHeal(w, r, true)
 	unlockState, err := s.deps.Passports.GrantArticleUnlock(w, r, gp.GuestID, entryKey, plainPwd)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": s.localizePublicError(locale, err)})
+		writeErrJSON(w, http.StatusInternalServerError, s.localizePublicError(locale, err))
 		return
 	}
 	visibility.ApplyNoIndexPrivateHeaders(w)
@@ -1004,7 +1027,7 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 		locale := s.resolveLocale(r)
 		res, err := s.deps.Content.ListTargetCommentsPage(r.Context(), r, viewer, tType, tID, page, perPage, focusComment)
 		if errors.Is(err, visibility.ErrProtectedForbidden) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(locale, "error.forbidden")})
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "error.forbidden"))
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1012,7 +1035,7 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+			writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 			return
 		}
 
@@ -1042,15 +1065,15 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"comments":               res.Comments,
-			"page":                   res.Page,
-			"per_page":               res.PerPage,
-			"total_roots":            res.TotalRoots,
-			"total_comments":         res.TotalComments,
-			"total_pages":            res.TotalPages,
-			"has_more":               res.HasMore,
-			"claimable_guest_count":  claimableGuestCount,
-			"clear_guest_passport":   clearGuestPassport,
+			"comments":              res.Comments,
+			"page":                  res.Page,
+			"per_page":              res.PerPage,
+			"total_roots":           res.TotalRoots,
+			"total_comments":        res.TotalComments,
+			"total_pages":           res.TotalPages,
+			"has_more":              res.HasMore,
+			"claimable_guest_count": claimableGuestCount,
+			"clear_guest_passport":  clearGuestPassport,
 		})
 
 	case http.MethodPost:
@@ -1060,12 +1083,12 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 		locale := s.resolveLocale(r)
 		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 		if !s.deps.WAF.AllowRate("comment_post", clientIP, 12, time.Minute) {
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(locale, "error.rate_limited")})
+			writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 			return
 		}
 		var in content.CreateCommentInput
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+			writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 			return
 		}
 		if strings.TrimSpace(in.EnvFPSignal) == "" {
@@ -1079,7 +1102,7 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 
 		created, passportTok, err := s.deps.Content.CreateComment(r.Context(), w, r, viewer, in)
 		if errors.Is(err, visibility.ErrProtectedForbidden) || errors.Is(err, content.ErrCommentsClosed) || errors.Is(err, content.ErrRegisteredOnly) || errors.Is(err, content.ErrCommentRejected) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.localizePublicError(locale, err)})
+			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, err))
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1087,7 +1110,7 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+			writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 			return
 		}
 		if s.deps.NotifyCommentCreated != nil {
@@ -1121,12 +1144,12 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 			ContentMD string `json:"content_md"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&body); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+			writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 			return
 		}
 		updated, err := s.deps.Content.UpdateOwnComment(r.Context(), r, viewer, commentID, body.ContentMD)
 		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, content.ErrCommentRejected) || errors.Is(err, visibility.ErrProtectedForbidden) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.localizePublicError(locale, err)})
+			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, err))
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1134,7 +1157,7 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+			writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"comment": updated})
@@ -1145,7 +1168,7 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 		}
 		err := s.deps.Content.DeleteOwnComment(r.Context(), r, viewer, commentID)
 		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, visibility.ErrProtectedForbidden) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.localizePublicError(locale, err)})
+			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, err))
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1153,7 +1176,7 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+			writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
@@ -1199,7 +1222,7 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 	locale := s.resolveLocale(r)
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("public_reactions", clientIP, 40, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(locale, "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
 	}
 	var req struct {
@@ -1208,12 +1231,12 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 		Kind       string `json:"kind"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 		return
 	}
 	validType, visible := s.isPubliclyReactableTarget(r.Context(), req.TargetType, req.TargetID)
 	if !validType {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 		return
 	}
 	if !visible {
@@ -1231,7 +1254,7 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	counts, added, err := s.deps.Content.ToggleReaction(r.Context(), strings.TrimSpace(req.TargetType), strings.TrimSpace(req.TargetID), actorHash, req.Kind)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+		writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "added": added})
@@ -1249,24 +1272,24 @@ func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request)
 	}
 	locale := s.resolveLocale(r)
 	if !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(locale, "reader.err_reg_disabled")})
+		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "reader.err_reg_disabled"))
 		return
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("reader_code", clientIP, 5, 10*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(locale, "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
 	}
 	var req struct {
 		Email string `json:"email"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 		return
 	}
 	code, err := s.deps.Auth.IssueReaderVerificationCode(req.Email)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+		writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 		return
 	}
 	if s.deps.SendVerificationMail != nil {
@@ -1298,12 +1321,12 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 	}
 	locale := s.resolveLocale(r)
 	if !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(locale, "reader.err_reg_disabled")})
+		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "reader.err_reg_disabled"))
 		return
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("reader_register", clientIP, 8, 10*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(locale, "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
 	}
 	var req struct {
@@ -1314,12 +1337,12 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 		Next     string `json:"next"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 		return
 	}
 	u, err := s.deps.Auth.RegisterReader(r.Context(), req.Username, req.Email, req.Password, req.Code, locale)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+		writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 		return
 	}
 	if u.Role == domain.RoleReader && s.deps.Passports != nil {
@@ -1353,7 +1376,7 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 	locale := s.resolveLocale(r)
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("reader_login", clientIP, 10, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(locale, "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
 	}
 	var req struct {
@@ -1362,7 +1385,7 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 		Next     string `json:"next"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "error.bad_request")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 		return
 	}
 	var geo string
@@ -1375,7 +1398,7 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, auth.ErrForbidden) {
 			err = auth.ErrInvalidCredentials
 		}
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizePublicError(locale, err)})
+		writeErrJSON(w, http.StatusUnauthorized, s.localizePublicError(locale, err))
 		return
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
@@ -1407,7 +1430,7 @@ func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
 		Secure:   s.isCookieSecureForRequest(r),
 		SameSite: http.SameSiteLaxMode,
 	})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeOKJSON(w)
 }
 
 func (s *AppServer) handleReaderClaimComments(w http.ResponseWriter, r *http.Request) {
@@ -1421,22 +1444,22 @@ func (s *AppServer) handleReaderClaimComments(w http.ResponseWriter, r *http.Req
 	locale := s.resolveLocale(r)
 	viewer, _ := s.resolveViewer(r)
 	if viewer == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.deps.Catalog.T(locale, "error.unauthorized")})
+		writeErrJSON(w, http.StatusUnauthorized, s.deps.Catalog.T(locale, "error.unauthorized"))
 		return
 	}
 	if viewer.Role != domain.RoleReader {
 		s.clearGuestPassportCookie(w, r)
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(locale, "error.forbidden")})
+		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "error.forbidden"))
 		return
 	}
 	gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false)
 	if !ok || gp == nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(locale, "comment.err_no_guest_passport")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "comment.err_no_guest_passport"))
 		return
 	}
 	claimed, err := s.deps.Auth.ClaimGuestComments(r.Context(), viewer, gp)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizePublicError(locale, err)})
+		writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
 		return
 	}
 	s.clearGuestPassportCookie(w, r)
@@ -1623,6 +1646,9 @@ func appendVaryHeader(h http.Header, keys ...string) {
 
 func (s *AppServer) renderErrorPage(w http.ResponseWriter, r *http.Request, status int, msgKey string) {
 	viewer, sess := s.resolveViewer(r)
+	if status == http.StatusNotFound {
+		s.record404ProbeOnce(r, viewer, "", 0)
+	}
 	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.StatusCode = status
 	pctx.ErrorMessage = s.deps.Catalog.T(pctx.Locale, msgKey)

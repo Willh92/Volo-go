@@ -280,12 +280,29 @@ function ToastBanner() {
     <div
       key={cur.id}
       class={`volo-toast is-${cur.kind} ${cur.closing ? "is-closing" : ""}`}
-      role="status"
+      role={cur.kind === "err" ? "alert" : "status"}
+      aria-live={cur.kind === "err" ? "assertive" : "polite"}
       onMouseEnter={pauseToast}
       onMouseLeave={resumeToast}
     >
       <span class="volo-toast-icon" aria-hidden="true">
-        {cur.kind === "err" ? "!" : cur.kind === "warn" ? "i" : "✓"}
+        {cur.kind === "err" ? (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9.5" />
+            <line x1="12" y1="8" x2="12" y2="12.5" />
+            <circle cx="12" cy="16.2" r="0.9" fill="currentColor" stroke="none" />
+          </svg>
+        ) : cur.kind === "warn" ? (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+            <line x1="12" y1="9.2" x2="12" y2="13.5" />
+            <circle cx="12" cy="17" r="0.9" fill="currentColor" stroke="none" />
+          </svg>
+        ) : (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        )}
       </span>
       <span class="volo-toast-text">{cur.text}</span>
       <button
@@ -615,6 +632,41 @@ function App() {
     if (bootConfig.mode !== "setup") {
       refreshMe().finally(() => setReady(true));
     }
+  }, []);
+
+  useEffect(() => {
+    let invalidTickPending = false;
+    const onInvalidCapture = (ev: Event) => {
+      const target = ev.target as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null;
+      if (!target || typeof target.checkValidity !== "function") return;
+      ev.preventDefault();
+      target.classList.add("is-invalid");
+      const clearInvalid = () => {
+        target.classList.remove("is-invalid");
+        target.removeEventListener("input", clearInvalid);
+        target.removeEventListener("change", clearInvalid);
+      };
+      target.addEventListener("input", clearInvalid);
+      target.addEventListener("change", clearInvalid);
+
+      if (!invalidTickPending) {
+        invalidTickPending = true;
+        target.focus?.();
+        const fieldWrap = target.closest(".volo-field");
+        const lbl = fieldWrap?.querySelector("label")?.textContent?.replace(/\s*\*\s*$/, "").trim();
+        const msg = target.validationMessage && target.validity && !target.validity.valueMissing
+          ? target.validationMessage
+          : lbl
+          ? `${t("ui.field_required")}：${lbl}`
+          : t("ui.field_required");
+        showToast(msg, "err");
+        window.setTimeout(() => {
+          invalidTickPending = false;
+        }, 60);
+      }
+    };
+    document.addEventListener("invalid", onInvalidCapture, true);
+    return () => document.removeEventListener("invalid", onInvalidCapture, true);
   }, []);
 
   useEffect(() => {

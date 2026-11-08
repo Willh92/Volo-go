@@ -106,11 +106,10 @@ func (s *AppServer) withDynamicAdminMount(next http.Handler) http.Handler {
 			return
 		}
 		if activePrefix != staticPrefix && (p == staticPrefix || strings.HasPrefix(p, staticPrefix+"/")) {
-			if viewer, _ := s.resolveViewer(r); viewer == nil && s.deps.WAF != nil && s.deps.Config != nil {
-				clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
-				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonScannerTrap, 2)
-			}
-			http.NotFound(w, r)
+			r, _ = withErrorProbeTracker(r)
+			viewer, _ := s.resolveViewer(r)
+			s.record404ProbeOnce(r, viewer, security.ReasonScannerTrap, 2)
+			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -118,28 +117,28 @@ func (s *AppServer) withDynamicAdminMount(next http.Handler) http.Handler {
 }
 
 // authenticateAdminRequest resolves either:
-// 1. A scoped `Authorization: Bearer volo_pat_...` Personal Access Token (stateless, no CSRF needed), OR
-// 2. An active `__volo_sid` Staff Session Cookie (Admin or Editor; Reader physically rejected with 403!),
-//    enforcing `X-CSRF-Token` on all mutating HTTP verbs (`POST`, `PUT`, `PATCH`, `DELETE`).
+//  1. A scoped `Authorization: Bearer volo_pat_...` Personal Access Token (stateless, no CSRF needed), OR
+//  2. An active `__volo_sid` Staff Session Cookie (Admin or Editor; Reader physically rejected with 403!),
+//     enforcing `X-CSRF-Token` on all mutating HTTP verbs (`POST`, `PUT`, `PATCH`, `DELETE`).
 func (s *AppServer) authenticateAdminRequest(w http.ResponseWriter, r *http.Request, requiredPATScope string, requireAdminOnly bool) (*domain.User, *domain.UserSession, bool) {
 	authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(authHdr, "Bearer ") {
 		if requiredPATScope == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "this endpoint requires an interactive admin session"})
+			writeErrJSON(w, http.StatusForbidden, "this endpoint requires an interactive admin session")
 			return nil, nil, false
 		}
 		actor, _, err := s.deps.Auth.AuthenticateAPIToken(r.Context(), authHdr, requiredPATScope)
 		if errors.Is(err, auth.ErrForbidden) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return nil, nil, false
 		}
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired API token"})
+			writeErrJSON(w, http.StatusUnauthorized, "invalid or expired API token")
 			return nil, nil, false
 		}
 		if requireAdminOnly {
 			if aErr := auth.RequireAdmin(actor); aErr != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": aErr.Error()})
+				writeErrJSON(w, http.StatusForbidden, aErr.Error())
 				return nil, nil, false
 			}
 		}
@@ -161,23 +160,23 @@ func (s *AppServer) authenticateAdminRequest(w http.ResponseWriter, r *http.Requ
 
 	c, err := r.Cookie(auth.SessionCookieName)
 	if err != nil || strings.TrimSpace(c.Value) == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.unauthorized")})
+		writeErrJSON(w, http.StatusUnauthorized, s.deps.Catalog.T(s.resolveLocale(r), "error.unauthorized"))
 		return nil, nil, false
 	}
 	actor, sess, err := s.deps.Auth.AuthenticateSession(r.Context(), c.Value)
 	if err != nil || actor == nil || sess == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.unauthorized")})
+		writeErrJSON(w, http.StatusUnauthorized, s.deps.Catalog.T(s.resolveLocale(r), "error.unauthorized"))
 		return nil, nil, false
 	}
 
 	// Physical RBAC boundary: `reader` accounts NEVER pass RequireStaff!
 	if err := auth.RequireStaff(actor); err != nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 		return nil, nil, false
 	}
 	if requireAdminOnly {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 			return nil, nil, false
 		}
 	}
@@ -204,7 +203,7 @@ func (s *AppServer) authenticateAdminRequest(w http.ResponseWriter, r *http.Requ
 	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
 		csrf := r.Header.Get(auth.CSRFHeaderName)
 		if !s.deps.Auth.VerifyCSRFToken(sess.ID, csrf) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid or missing X-CSRF-Token"})
+			writeErrJSON(w, http.StatusForbidden, "invalid or missing X-CSRF-Token")
 			return nil, nil, false
 		}
 	}
@@ -248,7 +247,7 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: sec, SameSite: http.SameSiteLaxMode})
 		http.SetCookie(w, &http.Cookie{Name: trusted2FACookieName, Value: "", Path: "/api", MaxAge: -1, HttpOnly: true, Secure: sec, SameSite: http.SameSiteLaxMode})
 		http.SetCookie(w, &http.Cookie{Name: trusted2FACookieName, Value: "", Path: "/api/admin/auth", MaxAge: -1, HttpOnly: true, Secure: sec, SameSite: http.SameSiteLaxMode})
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case sub == "me":
 		actor, sess, ok := s.authenticateAdminRequest(w, r, auth.ScopeArticlesRead, false)
@@ -385,7 +384,7 @@ func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("admin:login", clientIP, 12, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
 	}
 
@@ -394,7 +393,7 @@ func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	geo := ""
@@ -409,12 +408,12 @@ func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	res, err := s.deps.Auth.LoginStaff(r.Context(), req.Ident, req.Password, clientIP, geo, r.UserAgent(), trusted2FA)
 	if errors.Is(err, auth.ErrForbidden) {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 2)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, auth.ErrInvalidCredentials)})
+		writeErrJSON(w, http.StatusUnauthorized, s.localizeAdminAuthError(r, auth.ErrInvalidCredentials))
 		return
 	}
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, err)})
+		writeErrJSON(w, http.StatusUnauthorized, s.localizeAdminAuthError(r, err))
 		return
 	}
 	if res.Requires2FA {
@@ -443,7 +442,7 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("admin:2fa", clientIP, 10, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
 	}
 	var req struct {
@@ -452,7 +451,7 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 		RememberDevice bool   `json:"remember_device"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	geo := ""
@@ -462,7 +461,7 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 	res, trustCookie, err := s.deps.Auth.CompleteStaff2FA(r.Context(), req.ChallengeToken, req.Code, req.RememberDevice, clientIP, geo, r.UserAgent())
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.Reason2FAFail, 1)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, err)})
+		writeErrJSON(w, http.StatusUnauthorized, s.localizeAdminAuthError(r, err))
 		return
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
@@ -494,12 +493,12 @@ func (s *AppServer) handleAdminPasskeyLoginBegin(w http.ResponseWriter, r *http.
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("admin:passkey:begin", clientIP, 15, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
 	}
 	res, err := auth.BeginPasskeyCeremony(s.deps.Config.KeyRing, "", "login", s.publicBaseURL(r))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizeAdminAuthError(r, err)})
+		writeErrJSON(w, http.StatusBadRequest, s.localizeAdminAuthError(r, err))
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -515,7 +514,7 @@ func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("admin:passkey:finish", clientIP, 12, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
 	}
 	var req struct {
@@ -526,14 +525,14 @@ func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http
 		Signature         string `json:"signature"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	cdBytes, err1 := base64.RawURLEncoding.DecodeString(req.ClientDataJSON)
 	adBytes, err2 := base64.RawURLEncoding.DecodeString(req.AuthenticatorData)
 	sigBytes, err3 := base64.RawURLEncoding.DecodeString(req.Signature)
 	if err1 != nil || err2 != nil || err3 != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.bad_request")})
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(s.resolveLocale(r), "error.bad_request"))
 		return
 	}
 	geo := ""
@@ -543,7 +542,7 @@ func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http
 	res, err := s.deps.Auth.LoginWithPasskey(r.Context(), req.StateToken, req.CredentialID, cdBytes, adBytes, sigBytes, clientIP, geo, r.UserAgent())
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, err)})
+		writeErrJSON(w, http.StatusUnauthorized, s.localizeAdminAuthError(r, err))
 		return
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
@@ -614,7 +613,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 
 	if r.Method == http.MethodPatch {
 		if sess == nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "profile mutation requires an interactive admin session"})
+			writeErrJSON(w, http.StatusForbidden, "profile mutation requires an interactive admin session")
 			return
 		}
 		var req struct {
@@ -628,12 +627,12 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			NewPassword     string  `json:"new_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
 		}
 		if req.DisplayName != nil && strings.TrimSpace(*req.DisplayName) != "" {
@@ -643,12 +642,12 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			nextEmail := strings.ToLower(strings.TrimSpace(*req.Email))
 			if nextEmail != "" && nextEmail != strings.ToLower(fullUser.Email) {
 				if !strings.Contains(nextEmail, "@") || len(nextEmail) > 190 {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid email address"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid email address")
 					return
 				}
 				ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
 				if !ok {
-					writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+					writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 					return
 				}
 				fullUser.Email = nextEmail
@@ -664,7 +663,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			} else {
 				cleanWeb, ok := sanitizeRedirectTargetURL(rawWeb)
 				if !ok {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid website_url"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid website_url")
 					return
 				}
 				fullUser.WebsiteURL = cleanWeb
@@ -677,7 +676,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			} else {
 				cleanAv, ok := sanitizeRedirectTargetURL(rawAv)
 				if !ok {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid avatar_url"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid avatar_url")
 					return
 				}
 				fullUser.AvatarURL = cleanAv
@@ -689,16 +688,16 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		if req.NewPassword != "" {
 			ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
 			if !ok {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+				writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 				return
 			}
 			if err := auth.ValidatePasswordPolicy(req.NewPassword); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			newHash, err := auth.HashPassword(req.NewPassword)
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			fullUser.PasswordHash = newHash
@@ -710,7 +709,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			fullUser.DisplayName, fullUser.Email, fullUser.Bio, fullUser.WebsiteURL, fullUser.AvatarURL, fullUser.PreferredLocale,
 			fullUser.PasswordHash, fullUser.LegacyHash, fullUser.UpdatedAt, fullUser.ID)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if req.NewPassword != "" {
@@ -760,17 +759,17 @@ func (s *AppServer) verifyStepUpPassword(w http.ResponseWriter, r *http.Request,
 		pwd = r.Header.Get("X-Volo-Current-Password")
 	}
 	if strings.TrimSpace(pwd) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.stepUpErrorMessage(r, true)})
+		writeErrJSON(w, http.StatusBadRequest, s.stepUpErrorMessage(r, true))
 		return false
 	}
 	fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actorID)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.stepUpErrorMessage(r, false)})
+		writeErrJSON(w, http.StatusUnauthorized, s.stepUpErrorMessage(r, false))
 		return false
 	}
 	ok, _ := auth.VerifyPassword(pwd, fullUser.PasswordHash, fullUser.LegacyHash)
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.stepUpErrorMessage(r, false)})
+		writeErrJSON(w, http.StatusUnauthorized, s.stepUpErrorMessage(r, false))
 		return false
 	}
 	return true
@@ -784,7 +783,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 	case sub == "totp/setup" && r.Method == http.MethodPost:
 		secret, err := auth.GenerateTOTPSecret()
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		uri := auth.BuildOTPAuthURI(s.deps.Settings.Snapshot().Site.Title, actor.Username, secret)
@@ -798,25 +797,25 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			CurrentPassword string `json:"current_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
 		}
 		if req.CurrentPassword == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 			return
 		}
 		if ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash); !ok {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 			return
 		}
 		codes, err := s.deps.Auth.EnrollTOTP(r.Context(), actor.ID, req.Secret, req.Code)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "security.totp_enroll", "user", actor.ID, nil)
@@ -829,18 +828,18 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
 		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
 		}
 		ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
 		if !ok {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 			return
 		}
 		_, _ = s.deps.Store.ExecContext(r.Context(),
 			`DELETE FROM user_credentials WHERE user_id = ? AND kind IN ('totp', 'recovery_codes')`, actor.ID)
 		s.recordAuditLog(r, actor, "security.totp_disable", "user", actor.ID, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case sub == "passkeys" && r.Method == http.MethodGet:
 		rows, _ := sqlx.Select[domain.UserCredential](r.Context(), s.deps.Store,
@@ -854,7 +853,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 	case sub == "passkeys/begin" && r.Method == http.MethodPost:
 		res, err := auth.BeginPasskeyCeremony(s.deps.Config.KeyRing, actor.ID, "register", s.publicBaseURL(r))
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, res)
@@ -868,31 +867,31 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			CurrentPassword   string `json:"current_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
 		}
 		if req.CurrentPassword == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 			return
 		}
 		if ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash); !ok {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "current_password is incorrect"})
+			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 			return
 		}
 		cdBytes, err1 := base64.RawURLEncoding.DecodeString(req.ClientDataJSON)
 		attBytes, err2 := base64.RawURLEncoding.DecodeString(req.AttestationObject)
 		if err1 != nil || err2 != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid base64url passkey registration payload"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid base64url passkey registration payload")
 			return
 		}
 		cred, err := s.deps.Auth.RegisterPasskey(r.Context(), actor.ID, req.Name, req.StateToken, cdBytes, attBytes)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		cred.PublicKeySPKI = ""
@@ -901,7 +900,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 
 	case strings.HasPrefix(sub, "passkeys/") && r.Method == http.MethodDelete:
 		if sess == nil || sess.ID == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 			return
 		}
 		var req struct {
@@ -909,7 +908,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		}
 		if r.Body != nil {
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 		}
@@ -920,7 +919,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		_, _ = s.deps.Store.ExecContext(r.Context(),
 			`DELETE FROM user_credentials WHERE id = ? AND user_id = ? AND kind = 'passkey'`, pkID, actor.ID)
 		s.recordAuditLog(r, actor, "security.passkey_delete", "user_credential", pkID, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case sub == "sessions" && r.Method == http.MethodGet:
 		rows, _ := s.deps.Auth.ListUserSessions(r.Context(), actor.ID)
@@ -946,7 +945,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 				`DELETE FROM user_sessions WHERE user_id = ?`, actor.ID)
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		revoked, _ := res.RowsAffected()
@@ -956,11 +955,11 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 	case strings.HasPrefix(sub, "sessions/") && r.Method == http.MethodDelete:
 		sid := strings.TrimPrefix(sub, "sessions/")
 		if err := s.deps.Auth.RevokeSession(r.Context(), actor, sid); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "security.session_revoke", "user_session", sid, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case sub == "tokens" && r.Method == http.MethodGet:
 		rows, _ := sqlx.Select[domain.APIToken](r.Context(), s.deps.Store,
@@ -973,7 +972,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 
 	case sub == "tokens" && r.Method == http.MethodPost:
 		if sess == nil || sess.ID == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 			return
 		}
 		var req struct {
@@ -983,7 +982,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			CurrentPassword string   `json:"current_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
@@ -995,11 +994,11 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		}
 		rec, plainTok, err := s.deps.Auth.CreateAPIToken(r.Context(), actor, req.Name, req.Scopes, expMS)
 		if errors.Is(err, auth.ErrForbidden) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "security.api_token_create", "api_token", rec.ID, map[string]any{"scopes": req.Scopes})
@@ -1009,7 +1008,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		tid := strings.TrimPrefix(sub, "tokens/")
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM api_tokens WHERE id = ? AND user_id = ?`, tid, actor.ID)
 		s.recordAuditLog(r, actor, "security.api_token_revoke", "api_token", tid, nil)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	default:
 		http.NotFound(w, r)
@@ -1446,7 +1445,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			Locale    string `json:"locale"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		out := render.Default().Render(req.ContentMD, render.Options{
@@ -1474,19 +1473,19 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			CategoryID string   `json:"category_id"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(req.Action))
 		switch action {
 		case "publish", "draft", "delete", "category", "pin", "unpin":
 		default:
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
 		ids := dedupCleanIDs(req.IDs, 200)
 		if len(ids) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
 		articles := make([]domain.RawArticle, 0, len(ids))
@@ -1496,7 +1495,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				continue
 			}
 			if !auth.CanManageArticle(actor, raw.AuthorID) {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+				writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 				return
 			}
 			articles = append(articles, raw)
@@ -1699,7 +1698,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			fullArgs := append(append([]any{}, args...), pageArgs...)
 			rows, err := sqlx.Select[domain.RawArticle](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			catRows, _ := sqlx.Select[domain.Category](r.Context(), s.deps.Store, `SELECT id, name FROM categories`)
@@ -1742,11 +1741,11 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 	artID := parts[0]
 	raw, err := s.deps.Content.GetRawArticleByID(r.Context(), artID)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "article not found"})
+		writeErrJSON(w, http.StatusNotFound, "article not found")
 		return
 	}
 	if !auth.CanManageArticle(actor, raw.AuthorID) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
 		return
 	}
 
@@ -1765,7 +1764,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 		rev, rErr := sqlx.Get[domain.ArticleRevision](r.Context(), s.deps.Store,
 			`SELECT * FROM article_revisions WHERE id = ? AND article_id = ?`, revID, artID)
 		if rErr != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "revision not found"})
+			writeErrJSON(w, http.StatusNotFound, "revision not found")
 			return
 		}
 		now := time.Now().UnixMilli()
@@ -1788,7 +1787,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			return s.deps.Content.ReindexArticleBacklinksTx(r.Context(), tx, raw)
 		})
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -1816,7 +1815,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 		}
 		tok, expUnix, tErr := s.deps.Content.Guard().IssueShareToken(r.Context(), raw, time.Duration(req.TTLHours)*time.Hour)
 		if tErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": tErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, tErr.Error())
 			return
 		}
 		shareURL := strings.TrimRight(s.publicBaseURL(r), "/") + visibility.ArticlePath(raw.Slug) + "?preview=" + tok
@@ -1835,7 +1834,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 		if _, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE articles SET is_pinned = ?, updated_at = ? WHERE id = ?`,
 			nextPinned, now, raw.ID); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		raw.IsPinned = nextPinned
@@ -1900,7 +1899,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				return dErr
 			})
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -1911,7 +1910,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleDeleted, articleHookPayloadFromRaw(deletedCopy))
 			}
 			s.recordAuditLog(r, actor, "article.delete", "article", artID, map[string]any{"title": raw.Title})
-			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+			writeOKJSON(w)
 
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1940,12 +1939,12 @@ func articleHookPayloadFromRaw(raw domain.RawArticle) plugin.ArticleHookPayload 
 func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, actor *domain.User, existingID string) {
 	var in adminArticlePayload
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	title := strings.TrimSpace(in.Title)
 	if title == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title is required"})
+		writeErrJSON(w, http.StatusBadRequest, "title is required")
 		return
 	}
 
@@ -1953,7 +1952,7 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 	if rawCover := strings.TrimSpace(in.CoverURL); rawCover != "" {
 		u, ok := sanitizeRedirectTargetURL(rawCover)
 		if !ok {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cover_url"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid cover_url")
 			return
 		}
 		cleanCover = u
@@ -1962,7 +1961,7 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 	if rawAudio := strings.TrimSpace(in.AudioURL); rawAudio != "" {
 		u, ok := sanitizeRedirectTargetURL(rawAudio)
 		if !ok {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid audio_url"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid audio_url")
 			return
 		}
 		cleanAudio = u
@@ -1980,11 +1979,11 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 	} else {
 		existing, err := s.deps.Content.GetRawArticleByID(r.Context(), existingID)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "article not found"})
+			writeErrJSON(w, http.StatusNotFound, "article not found")
 			return
 		}
 		if !auth.CanManageArticle(actor, existing.AuthorID) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			writeErrJSON(w, http.StatusForbidden, "forbidden")
 			return
 		}
 		cur = existing
@@ -1994,7 +1993,7 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 	if in.ClearLegacyPermalink {
 		if cur.LegacyPermalink != "" {
 			if err := auth.RequireAdmin(actor); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "only administrators can modify legacy_permalink"})
+				writeErrJSON(w, http.StatusForbidden, "only administrators can modify legacy_permalink")
 				return
 			}
 		}
@@ -2002,12 +2001,12 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 	} else if rawLeg := strings.TrimSpace(repo.StripASCIIControls(in.LegacyPermalink)); rawLeg != "" {
 		if rawLeg != cur.LegacyPermalink {
 			if err := auth.RequireAdmin(actor); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "only administrators can set or modify legacy_permalink"})
+				writeErrJSON(w, http.StatusForbidden, "only administrators can set or modify legacy_permalink")
 				return
 			}
 			cleanLeg, vErr := s.validateLegacyPermalink(r.Context(), rawLeg, cur.ID)
 			if vErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": vErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, vErr.Error())
 				return
 			}
 			cur.LegacyPermalink = cleanLeg
@@ -2048,7 +2047,7 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 		if p != "" {
 			sealed, sErr := s.deps.Content.Guard().SealArticlePassword(cur.ID, p)
 			if sErr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": sErr.Error()})
+				writeErrJSON(w, http.StatusInternalServerError, sErr.Error())
 				return
 			}
 			pwdCipher = sealed
@@ -2137,7 +2136,7 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 		return s.deps.Content.ReindexArticleBacklinksTx(r.Context(), tx, cur)
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -2344,12 +2343,12 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 		case http.MethodPost:
 			var in domain.Page
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.Title = strings.TrimSpace(in.Title)
 			if in.Title == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title is required"})
+				writeErrJSON(w, http.StatusBadRequest, "title is required")
 				return
 			}
 			in.ID = id.Next()
@@ -2370,7 +2369,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`,
 				in.ID, in.AuthorID, in.Title, in.Slug, in.Template, in.ContentMD, in.IsPublished, in.AllowComment, in.ShowTOC,
 				in.Lang, strings.TrimSpace(in.TranslationGroup), in.CreatedAt, in.UpdatedAt); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -2387,11 +2386,11 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 
 	pg, err := sqlx.Get[domain.Page](r.Context(), s.deps.Store, `SELECT * FROM pages WHERE id = ?`, rest)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "page not found"})
+		writeErrJSON(w, http.StatusNotFound, "page not found")
 		return
 	}
 	if !auth.CanManageArticle(actor, pg.AuthorID) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		writeErrJSON(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	switch r.Method {
@@ -2400,7 +2399,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 	case http.MethodPut:
 		var in domain.Page
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		wasPublished := pg.IsPublished
@@ -2420,7 +2419,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			strings.TrimSpace(in.Title), slug, tmpl, in.ContentMD, in.IsPublished, in.AllowComment, in.ShowTOC,
 			strings.TrimSpace(in.Lang), strings.TrimSpace(in.TranslationGroup), now, pg.ID)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -2441,7 +2440,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 		})
 		s.invalidateMediaRefCache()
 		s.dispatchPageLifecycleHook(r.Context(), plugin.HookPageDeleted, pg, "deleted")
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -2485,22 +2484,22 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 			})
 		case http.MethodPost:
 			if err := auth.RequireAdmin(actor); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusForbidden, err.Error())
 				return
 			}
 			var in domain.Category
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.Name = strings.TrimSpace(in.Name)
 			if in.Name == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+				writeErrJSON(w, http.StatusBadRequest, "name is required")
 				return
 			}
 			cleanIcon, ok := sanitizeAdminIconField(in.Icon)
 			if !ok {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid category icon"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid category icon")
 				return
 			}
 			in.Icon = cleanIcon
@@ -2517,7 +2516,7 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 				`INSERT INTO categories (id, name, slug, description, icon, sort_order, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 				in.ID, in.Name, in.Slug, strings.TrimSpace(in.Description), in.Icon, in.SortOrder, now, now); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusCreated, map[string]any{"category": in})
@@ -2530,17 +2529,17 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 	switch r.Method {
 	case http.MethodPut:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		var in domain.Category
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		cleanIcon, ok := sanitizeAdminIconField(in.Icon)
 		if !ok {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid category icon"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid category icon")
 			return
 		}
 		name := strings.TrimSpace(in.Name)
@@ -2553,13 +2552,13 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 			name, slug, strings.TrimSpace(in.Description), cleanIcon,
 			in.SortOrder, time.Now().UnixMilli(), rest)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	case http.MethodDelete:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -2567,7 +2566,7 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 			_, err := tx.ExecContext(r.Context(), `DELETE FROM categories WHERE id = ?`, rest)
 			return err
 		})
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -2577,13 +2576,13 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "cleanup" && r.Method == http.MethodPost {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		res, err := s.deps.Store.ExecContext(r.Context(),
 			`DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM article_tags)`)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		deleted, _ := res.RowsAffected()
@@ -2594,7 +2593,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 	}
 	if rest == "merge" && r.Method == http.MethodPost {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		var req struct {
@@ -2603,12 +2602,12 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			TargetID  string   `json:"target_id"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		targetID := strings.TrimSpace(req.TargetID)
 		if targetID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target_id is required"})
+			writeErrJSON(w, http.StatusBadRequest, "target_id is required")
 			return
 		}
 		rawSources := append([]string{}, req.SourceIDs...)
@@ -2623,13 +2622,13 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			}
 		}
 		if len(sourceIDs) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source_ids or source_id is required and must differ from target_id"})
+			writeErrJSON(w, http.StatusBadRequest, "source_ids or source_id is required and must differ from target_id")
 			return
 		}
 		var targetExists int
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM tags WHERE id = ?`, targetID).Scan(&targetExists)
 		if targetExists == 0 {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "target tag not found"})
+			writeErrJSON(w, http.StatusNotFound, "target tag not found")
 			return
 		}
 		merged := 0
@@ -2672,7 +2671,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "tags.merge", "tag", targetID, map[string]any{
@@ -2745,17 +2744,17 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			})
 		case http.MethodPost:
 			if err := auth.RequireAdmin(actor); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusForbidden, err.Error())
 				return
 			}
 			var in domain.Tag
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.Name = strings.TrimSpace(in.Name)
 			if in.Name == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+				writeErrJSON(w, http.StatusBadRequest, "name required")
 				return
 			}
 			in.ID = id.Next()
@@ -2767,7 +2766,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			if _, err := s.deps.Store.ExecContext(r.Context(),
 				`INSERT INTO tags (id, name, slug, created_at) VALUES (?, ?, ?, ?)`,
 				in.ID, in.Name, in.Slug, in.CreatedAt); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusCreated, map[string]any{"tag": in})
@@ -2778,7 +2777,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 	}
 	if rest == "batch" && r.Method == http.MethodPost {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		var req struct {
@@ -2786,16 +2785,16 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			IDs    []string `json:"ids"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
 		ids := dedupCleanIDs(req.IDs, 200)
 		if len(ids) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
 		affected := 0
@@ -2813,7 +2812,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.recordAuditLog(r, actor, "tag.batch_delete", "tag", "batch", map[string]any{"affected": affected})
@@ -2823,17 +2822,17 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 	switch r.Method {
 	case http.MethodPut:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		var in domain.Tag
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		name := strings.TrimSpace(in.Name)
 		if name == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+			writeErrJSON(w, http.StatusBadRequest, "name required")
 			return
 		}
 		slug := sanitizeSlug(in.Slug)
@@ -2842,13 +2841,13 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		}
 		if _, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE tags SET name = ?, slug = ? WHERE id = ?`, name, slug, rest); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	case http.MethodDelete:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -2856,7 +2855,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			_, err := tx.ExecContext(r.Context(), `DELETE FROM tags WHERE id = ?`, rest)
 			return err
 		})
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -2960,7 +2959,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			})
 		case http.MethodPost:
 			if err := auth.RequireAdmin(actor); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusForbidden, err.Error())
 				return
 			}
 			var in struct {
@@ -2968,18 +2967,18 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 				ArticleIDs []string `json:"article_ids"`
 			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.Title = strings.TrimSpace(in.Title)
 			if in.Title == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title is required"})
+				writeErrJSON(w, http.StatusBadRequest, "title is required")
 				return
 			}
 			if rawCov := strings.TrimSpace(in.CoverURL); rawCov != "" {
 				u, ok := sanitizeRedirectTargetURL(rawCov)
 				if !ok {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cover_url"})
+					writeErrJSON(w, http.StatusBadRequest, "invalid cover_url")
 					return
 				}
 				in.CoverURL = u
@@ -3009,7 +3008,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 				return nil
 			})
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -3023,7 +3022,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 	switch r.Method {
 	case http.MethodPut:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		var in struct {
@@ -3031,14 +3030,14 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			ArticleIDs []string `json:"article_ids"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		cleanCov := ""
 		if rawCov := strings.TrimSpace(in.CoverURL); rawCov != "" {
 			u, ok := sanitizeRedirectTargetURL(rawCov)
 			if !ok {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cover_url"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid cover_url")
 				return
 			}
 			cleanCov = u
@@ -3065,14 +3064,14 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	case http.MethodDelete:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -3081,7 +3080,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			return err
 		})
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -3179,7 +3178,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			})
 		case http.MethodPost:
 			if err := auth.RequireAdmin(actor); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusForbidden, err.Error())
 				return
 			}
 			var in struct {
@@ -3187,16 +3186,16 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				Chapters []domain.BookChapter `json:"chapters"`
 			}
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&in); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
 				return
 			}
 			in.Title = strings.TrimSpace(in.Title)
 			if in.Title == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title is required"})
+				writeErrJSON(w, http.StatusBadRequest, "title is required")
 				return
 			}
 			if err := sanitizeBookURLs(&in.Book, in.Chapters); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			in.ID = id.Next()
@@ -3239,7 +3238,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				return nil
 			})
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -3254,12 +3253,12 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 	bookID := parts[0]
 	if len(parts) == 2 && parts[1] == "sync" && r.Method == http.MethodPost {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		cnt, err := s.deps.Content.SyncBookTOC(r.Context(), bookID)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"chapter_count": cnt})
@@ -3270,7 +3269,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 	case http.MethodGet:
 		bk, err := sqlx.Get[domain.Book](r.Context(), s.deps.Store, `SELECT * FROM books WHERE id = ?`, bookID)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+			writeErrJSON(w, http.StatusNotFound, "book not found")
 			return
 		}
 		chs, _ := sqlx.Select[domain.BookChapter](r.Context(), s.deps.Store,
@@ -3279,7 +3278,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 
 	case http.MethodPut:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		var in struct {
@@ -3287,11 +3286,11 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			Chapters []domain.BookChapter `json:"chapters"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if err := sanitizeBookURLs(&in.Book, in.Chapters); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		title := strings.TrimSpace(in.Title)
@@ -3327,15 +3326,15 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			return nil
 		})
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case http.MethodDelete:
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -3344,7 +3343,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			return err
 		})
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3475,7 +3474,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		fullArgs := append(append([]any{}, args...), pageArgs...)
 		rows, err := sqlx.Select[domain.Comment](r.Context(), s.deps.Store, qSQL, fullArgs...)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 
@@ -3570,7 +3569,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			ExpiresHours int      `json:"expires_hours"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(req.Action))
@@ -3585,17 +3584,17 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			action = "delete"
 		case "ban_ip", "ban-ip":
 			if err := auth.RequireAdmin(actor); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+				writeErrJSON(w, http.StatusForbidden, err.Error())
 				return
 			}
 			action = "ban_ip"
 		default:
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
 		ids := dedupCleanIDs(req.IDs, 200)
 		if len(ids) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
 		comments := make([]domain.Comment, 0, len(ids))
@@ -3606,7 +3605,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			}
 			targetAuthorID := s.lookupCommentTargetAuthorID(r.Context(), cmt.TargetType, cmt.TargetID)
 			if _, authErr := authorizeAndScrubAdminComment(actor, cmt, targetAuthorID); authErr != nil {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": authErr.Error()})
+				writeErrJSON(w, http.StatusForbidden, authErr.Error())
 				return
 			}
 			comments = append(comments, cmt)
@@ -3681,12 +3680,12 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 	cmtID := parts[0]
 	cmt, err := sqlx.Get[domain.Comment](r.Context(), s.deps.Store, `SELECT * FROM comments WHERE id = ?`, cmtID)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "comment not found"})
+		writeErrJSON(w, http.StatusNotFound, "comment not found")
 		return
 	}
 	targetAuthorID := s.lookupCommentTargetAuthorID(r.Context(), cmt.TargetType, cmt.TargetID)
 	if _, authErr := authorizeAndScrubAdminComment(actor, cmt, targetAuthorID); authErr != nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": authErr.Error()})
+		writeErrJSON(w, http.StatusForbidden, authErr.Error())
 		return
 	}
 
@@ -3695,14 +3694,14 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			ContentMD string `json:"content_md"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil || strings.TrimSpace(req.ContentMD) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content_md required"})
+			writeErrJSON(w, http.StatusBadRequest, "content_md required")
 			return
 		}
 		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 		in := s.commentInputFromStaff(actor, cmt, req.ContentMD, clientIP.String())
 		view, _, cErr := s.deps.Content.CreateComment(r.Context(), w, r, actor, in)
 		if cErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": cErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, cErr.Error())
 			return
 		}
 		parentAutoApproved := false
@@ -3727,12 +3726,12 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 
 	if len(parts) == 2 && parts[1] == "ban-ip" && r.Method == http.MethodPost {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		targetIP := strings.TrimSpace(cmt.ClientIP)
 		if targetIP == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "comment has no recorded client IP"})
+			writeErrJSON(w, http.StatusBadRequest, "comment has no recorded client IP")
 			return
 		}
 		var req struct {
@@ -3753,7 +3752,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		callerIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 		rec, bErr := s.deps.WAF.AddManualBan(r.Context(), targetIP, note, expMS, callerIP)
 		if bErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": bErr.Error()})
+			writeErrJSON(w, http.StatusBadRequest, bErr.Error())
 			return
 		}
 		if req.RejectComment || req.RejectPending {
@@ -3777,11 +3776,11 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			ContentMD *string `json:"content_md"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if req.Status == nil && req.ContentMD == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status or content_md required"})
+			writeErrJSON(w, http.StatusBadRequest, "status or content_md required")
 			return
 		}
 		nextStatus := cmt.Status
@@ -3791,7 +3790,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			case domain.CommentStatusApproved, domain.CommentStatusPending, domain.CommentStatusRejected:
 				nextStatus = sVal
 			default:
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid comment status"})
+				writeErrJSON(w, http.StatusBadRequest, "invalid comment status")
 				return
 			}
 		}
@@ -3799,7 +3798,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		if req.ContentMD != nil {
 			trimmed := strings.TrimSpace(*req.ContentMD)
 			if trimmed == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content_md required"})
+				writeErrJSON(w, http.StatusBadRequest, "content_md required")
 				return
 			}
 			if len([]rune(trimmed)) > 8000 {
@@ -3811,21 +3810,21 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			`UPDATE comments SET status = ?, content_md = ?, updated_at = ? WHERE id = ?`,
 			nextStatus, nextContent, time.Now().UnixMilli(), cmtID)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
 		if nextStatus != cmt.Status {
 			s.dispatchCommentModeratedHook(r.Context(), cmt, nextStatus)
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(),
 			`UPDATE comments SET is_deleted = ?, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
 			true, time.Now().UnixMilli(), cmtID)
 		s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3883,7 +3882,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 
 	if rest == "reconcile" && r.Method == http.MethodPost {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		imported := s.reconcileLocalUploads(r.Context())
@@ -3902,16 +3901,16 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			IDs    []string `json:"ids"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch action"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
 		ids := dedupCleanIDs(req.IDs, 200)
 		if len(ids) == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids required"})
+			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
 		assets := make([]domain.MediaAsset, 0, len(ids))
@@ -3921,7 +3920,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 				continue
 			}
 			if actor.Role != domain.RoleAdmin && asset.UploaderID != actor.ID {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+				writeErrJSON(w, http.StatusForbidden, "forbidden")
 				return
 			}
 			assets = append(assets, asset)
@@ -3962,12 +3961,12 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		maxBytes := int64(maxMB) << 20
 		r.Body = http.MaxBytesReader(w, r.Body, maxBytes+1024*1024)
 		if err := r.ParseMultipartForm(8 << 20); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "upload exceeds maximum size"})
+			writeErrJSON(w, http.StatusBadRequest, "upload exceeds maximum size")
 			return
 		}
 		file, hdr, err := r.FormFile("file")
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
+			writeErrJSON(w, http.StatusBadRequest, "missing 'file' field")
 			return
 		}
 		defer file.Close()
@@ -3979,7 +3978,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			asset, err = s.saveFallbackLocalMedia(r.Context(), actor.ID, hdr.Filename, file, maxBytes)
 		}
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if asset != nil && asset.Width > 0 && asset.Height > 0 {
@@ -3992,13 +3991,13 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 
 	if rest == "orphans" && r.Method == http.MethodPost {
 		if err := auth.RequireAdmin(actor); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
 		clean := r.URL.Query().Get("delete") == "1" || r.URL.Query().Get("delete") == "true"
 		orphans, freed, err := s.scanOrCleanOrphans(r.Context(), clean)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		deletedCnt := 0
@@ -4019,11 +4018,11 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	if rest != "" && r.Method == http.MethodPatch {
 		asset, err := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, rest)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
+			writeErrJSON(w, http.StatusNotFound, "asset not found")
 			return
 		}
 		if actor.Role != domain.RoleAdmin && asset.UploaderID != actor.ID {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			writeErrJSON(w, http.StatusForbidden, "forbidden")
 			return
 		}
 		var req struct {
@@ -4031,7 +4030,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			AltText      *string `json:"alt_text"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if req.OriginalName != nil {
@@ -4053,7 +4052,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		if _, uErr := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE media_assets SET original_name = ?, alt_text = ? WHERE id = ?`,
 			asset.OriginalName, asset.AltText, asset.ID); uErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": uErr.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, uErr.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "asset": asset})
@@ -4063,16 +4062,16 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	if rest != "" && r.Method == http.MethodDelete {
 		asset, err := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, rest)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
+			writeErrJSON(w, http.StatusNotFound, "asset not found")
 			return
 		}
 		if actor.Role != domain.RoleAdmin && asset.UploaderID != actor.ID {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			writeErrJSON(w, http.StatusForbidden, "forbidden")
 			return
 		}
 		if s.deps.Media != nil {
 			if dErr := s.deps.Media.Delete(r.Context(), rest); dErr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": dErr.Error()})
+				writeErrJSON(w, http.StatusInternalServerError, dErr.Error())
 				return
 			}
 		} else {
@@ -4087,7 +4086,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		}
 		_ = s.deps.Content.RefreshMediaDimsCache(r.Context())
 		s.invalidateMediaRefCache()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		writeOKJSON(w)
 		return
 	}
 	w.WriteHeader(http.StatusMethodNotAllowed)

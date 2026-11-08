@@ -2433,7 +2433,7 @@ export function DistributeWorkspace({
                           </div>
                         </td>
                         <td class="col-fluid" data-label={t("tbl.col_feed")}>
-                          <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{f.feed_url}</span>
+                          <span class="volo-code-chip is-wrap" style={{ overflowWrap: "anywhere" }}>{f.feed_url}</span>
                         </td>
                         <td class="col-date" data-label={t("tbl.col_sync")}>
                           <div class="volo-cell-main">
@@ -2443,7 +2443,7 @@ export function DistributeWorkspace({
                                 class="volo-status-pill danger"
                                 title={f.sync_error}
                                 style={{
-                                  maxWidth: "240px",
+                                  maxWidth: "min(240px, 100%)",
                                   overflow: "hidden",
                                   textOverflow: "ellipsis",
                                   whiteSpace: "nowrap",
@@ -2768,7 +2768,7 @@ export function DistributeWorkspace({
                         </td>
                         <td class="col-fluid" data-label={t("tbl.col_url")}>
                           <div class="volo-cell-main">
-                            <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{w.url || w.target_url}</span>
+                            <span class="volo-code-chip is-wrap" style={{ overflowWrap: "anywhere" }}>{w.url || w.target_url}</span>
                             {w.last_triggered_at > 0 && (
                               <span class="volo-help">{formatDateTime(w.last_triggered_at)}</span>
                             )}

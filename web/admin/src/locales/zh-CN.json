@@ -1598,5 +1598,19 @@
   "audit.act.redir_batch_del": "批量删除重定向",
   "audit.act.webhook_replay": "重放 Webhook",
   "audit.act.gh_publish": "发布开源展示页",
-  "audit.act.sys_clear_logs": "清空运行日志"
+  "audit.act.sys_clear_logs": "清空运行日志",
+  "audit.act.sec_auto_ban": "WAF 自动封禁 IP",
+  "audit.act.sec_404_probe": "WAF 404 风控拦截",
+  "auth.err_ident_required": "请输入账号或电子邮箱",
+  "auth.err_pwd_required": "请输入登录密码",
+  "auth.err_totp_required": "请输入 6 位动态验证码或恢复码",
+  "ui.field_required": "请完善必填项后再提交",
+  "app.move_top": "置顶",
+  "app.drag_sort": "按住拖动排序",
+  "sys.waf_reason_scanner_trap": "敏感路径扫描诱捕",
+  "sys.waf_reason_not_found_scan": "高频 404 目录探测",
+  "sys.waf_reason_rate_abuse": "高频请求速率滥用",
+  "sys.waf_reason_login_fail": "多次登录认证失败",
+  "sys.waf_reason_two_factor_fail": "多次两步验证失败",
+  "sys.waf_reason_unlock_fail": "多次加密内容解锁失败"
 }

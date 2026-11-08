@@ -77,11 +77,11 @@ func (s *AppServer) ensureTempDir() string {
 func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *http.Request, actor *domain.User) {
 	files, _, err := readMultipartInMemoryFiles(w, r, maxBatchImportArchiveBytes, maxBatchImportArchiveBytes, maxBatchImportEntries)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "upload exceeds 32MB limit or invalid multipart form"})
+		writeErrJSON(w, http.StatusBadRequest, "upload exceeds 32MB limit or invalid multipart form")
 		return
 	}
 	if len(files) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no .md or .zip files uploaded"})
+		writeErrJSON(w, http.StatusBadRequest, "no .md or .zip files uploaded")
 		return
 	}
 
@@ -90,14 +90,14 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 
 	for _, uf := range files {
 		if len(docs) >= maxBatchImportEntries {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many files in batch import (max 500)"})
+			writeErrJSON(w, http.StatusBadRequest, "too many files in batch import (max 500)")
 			return
 		}
 		ext := strings.ToLower(filepath.Ext(uf.Filename))
 		switch ext {
 		case ".md", ".markdown":
 			if totalBytes+int64(len(uf.Data)) > maxBatchImportUncompressedBytes {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "uncompressed size exceeds 64MB batch import budget"})
+				writeErrJSON(w, http.StatusBadRequest, "uncompressed size exceeds 64MB batch import budget")
 				return
 			}
 			totalBytes += int64(len(uf.Data))
@@ -105,25 +105,25 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 
 		case ".zip":
 			if int64(len(uf.Data)) > maxBatchImportArchiveBytes {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ZIP archive exceeds 32MB"})
+				writeErrJSON(w, http.StatusBadRequest, "ZIP archive exceeds 32MB")
 				return
 			}
 			extracted, used, zErr := extractMarkdownDocsFromZipBytes(uf.Data, maxBatchImportUncompressedBytes-totalBytes, maxBatchImportEntries-len(docs))
 			if zErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": zErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, zErr.Error())
 				return
 			}
 			totalBytes += used
 			docs = append(docs, extracted...)
 
 		default:
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported file extension: " + ext})
+			writeErrJSON(w, http.StatusBadRequest, "unsupported file extension: "+ext)
 			return
 		}
 	}
 
 	if len(docs) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no valid Markdown documents found"})
+		writeErrJSON(w, http.StatusBadRequest, "no valid Markdown documents found")
 		return
 	}
 
@@ -213,7 +213,7 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 			return s.deps.Content.ReindexArticleBacklinksTx(r.Context(), tx, savedRaw)
 		})
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		if savedRaw.Status == domain.ArticleStatusPublished {

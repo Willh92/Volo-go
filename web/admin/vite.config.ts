@@ -148,13 +148,5 @@ export default defineConfig({
     cssCodeSplit: false,
     modulePreload: false,
     chunkSizeWarningLimit: 1000,
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (id.includes("@codemirror") || id.includes("CM6EditorCore")) return "cm6-editor";
-          return undefined;
-        },
-      },
-    },
   },
 });

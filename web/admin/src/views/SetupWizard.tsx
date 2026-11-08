@@ -167,6 +167,10 @@ export function SetupWizard() {
 
   const submitFresh = async (e: Event) => {
     e.preventDefault();
+    const formEl = e.currentTarget as HTMLFormElement | null;
+    if (formEl && !formEl.checkValidity()) {
+      return;
+    }
     if (password !== confirmPassword) {
       showToast(t("setup.pwd_mismatch"), "err");
       return;
@@ -393,7 +397,7 @@ export function SetupWizard() {
       )}
       <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px", flexWrap: "wrap", gap: "8px" }}>
         {dbPingMsg && (
-          <span class={`volo-badge ${dbPingErr ? "volo-badge-danger" : "volo-badge-ok"}`} style={{ marginRight: "auto" }}>
+          <span class={`volo-badge is-wrap ${dbPingErr ? "volo-badge-danger" : "volo-badge-ok"}`} style={{ marginRight: "auto" }}>
             {dbPingMsg}
           </span>
         )}

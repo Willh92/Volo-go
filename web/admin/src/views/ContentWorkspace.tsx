@@ -22,7 +22,9 @@ import {
   ConsoleDatePicker,
   ConsoleEmpty,
   ConsoleSelect,
+  DragGripIcon,
   MobileSelectAllBar,
+  MoveTopIcon,
   paginateItems,
   Pagination,
   SwitchToggle,
@@ -30,6 +32,7 @@ import {
   UploadButton,
   UploadProgressBar,
   useDebouncedValue,
+  usePointerSortableList,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
 
@@ -1145,6 +1148,68 @@ export function ContentWorkspace({
     });
   };
 
+  const moveChapterToTop = (idx: number) => {
+    setChapItems((prev) => {
+      if (idx <= 0 || idx >= prev.length) return prev;
+      const d = Math.max(0, Math.min(3, Number(prev[idx].depth) || 0));
+      let blockEnd = idx + 1;
+      while (blockEnd < prev.length && Math.max(0, Math.min(3, Number(prev[blockEnd].depth) || 0)) > d) {
+        blockEnd++;
+      }
+      let targetPos = 0;
+      if (d > 0) {
+        let p = idx - 1;
+        while (p >= 0 && Math.max(0, Math.min(3, Number(prev[p].depth) || 0)) >= d) {
+          p--;
+        }
+        targetPos = p + 1;
+      }
+      if (targetPos >= idx) return prev;
+      const block = prev.slice(idx, blockEnd);
+      return [...prev.slice(0, targetPos), ...block, ...prev.slice(targetPos, idx), ...prev.slice(blockEnd)];
+    });
+  };
+
+  const chapSliceUidsRef = useRef<string[]>([]);
+  const chapSortHook = usePointerSortableList(
+    chapSliceUidsRef.current,
+    (_nextUids, fromSliceIdx, toSliceIdx) => {
+      const sliceUids = chapSliceUidsRef.current;
+      const movedUid = sliceUids[fromSliceIdx];
+      const targetUid = sliceUids[toSliceIdx];
+      if (!movedUid || !targetUid || movedUid === targetUid) return;
+      const collapsedSet = new Set(collapsedChapUids);
+      setChapItems((prev) => {
+        const srcStart = prev.findIndex((c) => c._uid === movedUid);
+        if (srcStart < 0) return prev;
+        const srcD = Math.max(0, Math.min(3, Number(prev[srcStart].depth) || 0));
+        let srcEnd = srcStart + 1;
+        if (srcD === 0 && collapsedSet.has(movedUid)) {
+          while (srcEnd < prev.length && (Number(prev[srcEnd].depth) || 0) > 0) {
+            srcEnd++;
+          }
+        }
+        const block = prev.slice(srcStart, srcEnd);
+        const rest = [...prev.slice(0, srcStart), ...prev.slice(srcEnd)];
+        const dstIdx = rest.findIndex((c) => c._uid === targetUid);
+        if (dstIdx < 0) return prev;
+        let insertAt = dstIdx;
+        if (toSliceIdx > fromSliceIdx) {
+          insertAt = dstIdx + 1;
+          const dstD = Math.max(0, Math.min(3, Number(rest[dstIdx].depth) || 0));
+          if (dstD === 0 && collapsedSet.has(targetUid)) {
+            while (insertAt < rest.length && (Number(rest[insertAt].depth) || 0) > 0) {
+              insertAt++;
+            }
+          }
+        }
+        rest.splice(insertAt, 0, ...block);
+        return rest;
+      });
+    },
+    !chapQuery.trim()
+  );
+
   const saveChapters = async () => {
     if (!chapBook) return;
     try {
@@ -2229,7 +2294,7 @@ export function ContentWorkspace({
                         const art = knownArticlesMap[aid];
                         const titleText = art?.title || aid;
                         return (
-                          <div key={aid} class="volo-input-row" style={{ marginBottom: "6px", flexWrap: "nowrap", minWidth: 0 }}>
+                          <div key={aid} class="volo-input-row volo-series-sel-row" style={{ marginBottom: "6px", minWidth: 0 }}>
                             <input
                               key={`${aid}-${idx}`}
                               type="number"
@@ -2252,6 +2317,7 @@ export function ContentWorkspace({
                               }}
                             />
                             <span
+                              class="volo-series-sel-title"
                               style={{
                                 flex: 1,
                                 minWidth: 0,
@@ -2265,7 +2331,7 @@ export function ContentWorkspace({
                             >
                               {titleText}
                             </span>
-                            <div class="volo-row-actions" style={{ flexShrink: 0 }}>
+                            <div class="volo-row-actions volo-series-sel-acts" style={{ flexShrink: 0 }}>
                               <button
                                 type="button"
                                 class="volo-act-btn"
@@ -2472,7 +2538,9 @@ export function ContentWorkspace({
                               <span class="volo-code-chip">/books/{b.slug}</span>
                               {b.description && <span>{b.description}</span>}
                               {(b.source_url || b.series_id) && (
-                                <span class="volo-help">{t("cnt.book_source", { src: b.source_url || b.series_id })}</span>
+                                <span class="volo-help" style={{ overflowWrap: "anywhere" }}>
+                                  {t("cnt.book_source", { src: b.source_url || b.series_id })}
+                                </span>
                               )}
                             </div>
                           </div>
@@ -2798,20 +2866,34 @@ export function ContentWorkspace({
                 }
 
                 const pagedRows = paginateItems(visibleRows, chapPage, 80);
+                chapSliceUidsRef.current = pagedRows.slice.map((r) => r.ch._uid);
 
                 return visibleRows.length === 0 ? (
                   <ConsoleEmpty />
                 ) : (
                   <>
-                    <div class="volo-chap-tree">
-                      {pagedRows.slice.map(({ ch, idx, hasChildren, isCollapsed }) => {
+                    <div ref={chapSortHook.listRef} class="volo-chap-tree">
+                      {pagedRows.slice.map(({ ch, idx, hasChildren, isCollapsed }, sliceIdx) => {
                         const depth = Math.max(0, Math.min(3, Number(ch.depth) || 0));
+                        const canDrag = !q && pagedRows.slice.length > 1;
+                        const handleProps = chapSortHook.getHandleProps(sliceIdx);
                         return (
                           <div
                             key={ch._uid}
-                            class="volo-chap-row volo-chap-indent"
+                            data-sort-idx={sliceIdx}
+                            class={`volo-chap-row volo-chap-indent ${chapSortHook.draggingIdx === sliceIdx ? "is-dragging" : ""}`}
                             style={{ "--chap-depth": depth } as any}
                           >
+                            {canDrag && (
+                              <span
+                                class="volo-drag-handle"
+                                title={t("app.drag_sort")}
+                                aria-label={t("app.drag_sort")}
+                                {...(handleProps as any)}
+                              >
+                                <DragGripIcon />
+                              </span>
+                            )}
                             {hasChildren ? (
                               <button
                                 type="button"
@@ -2828,7 +2910,7 @@ export function ContentWorkspace({
                             ) : (
                               <span
                                 style={{
-                                  width: "26px",
+                                  width: "22px",
                                   textAlign: "center",
                                   color: "var(--volo-muted)",
                                   fontSize: "11px",
@@ -2924,6 +3006,17 @@ export function ContentWorkspace({
                                 type="button"
                                 class="volo-chap-btn"
                                 disabled={idx === 0}
+                                title={t("app.move_top")}
+                                aria-label={t("app.move_top")}
+                                onClick={() => moveChapterToTop(idx)}
+                              >
+                                <MoveTopIcon />
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-chap-btn"
+                                disabled={idx === 0}
+                                title={t("app.move_up")}
                                 onClick={() => moveChapterSubtree(idx, -1)}
                               >
                                 ↑
@@ -2932,6 +3025,7 @@ export function ContentWorkspace({
                                 type="button"
                                 class="volo-chap-btn"
                                 disabled={idx >= chapItems.length - 1}
+                                title={t("app.move_down")}
                                 onClick={() => moveChapterSubtree(idx, 1)}
                               >
                                 ↓

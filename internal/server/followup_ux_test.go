@@ -14,9 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Willh92/Volo-go/internal/config"
+	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/server"
+	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
@@ -521,3 +524,163 @@ func TestFollowUp_ArchiveTimezoneCanonicalAuthI18nCustomNavAndStealthMount(t *te
 
 func idxOr(a, _ int) int { return a }
 
+func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
+	env := setupM5TestEnv(t, "/console")
+	t.Cleanup(func() { _ = env.app.Close(env.ctx) })
+
+	if err := env.catalog.Reload("../../locales"); err != nil {
+		t.Fatalf("catalog.Reload(../../locales): %v", err)
+	}
+	tp, err := config.ParseTrustedProxies("127.0.0.1, ::1")
+	if err != nil {
+		t.Fatalf("ParseTrustedProxies: %v", err)
+	}
+	env.cfg.TrustedProxies = tp
+
+	thEng, err := theme.NewEngine(env.catalog, "../../themes")
+	if err != nil {
+		t.Fatalf("theme.NewEngine(../../themes): %v", err)
+	}
+
+	appSrv, err := server.NewAppServer(server.AppDeps{
+		Config:    env.cfg,
+		Store:     env.store,
+		Settings:  env.settings,
+		Catalog:   env.catalog,
+		Auth:      env.authSvc,
+		Content:   env.content,
+		Themes:    thEng,
+		StartedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("NewAppServer: %v", err)
+	}
+	t.Cleanup(func() { _ = appSrv.Close(env.ctx) })
+	env.ts.Config.Handler = appSrv.Handler()
+
+	cookies, headers := bootstrapAuthenticatedAdmin(t, env)
+
+	// 1. Custom HTML error.html rendered across public 404, scanner trap (/.env), and post-setup /setup
+	for _, p := range []string{"/missing-page-xyz", "/.env", "/setup"} {
+		resp, raw := doJSONReq(t, http.MethodGet, env.ts.URL+p, nil, nil, nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s = %d, want 404", p, resp.StatusCode)
+		}
+		bodyStr := string(raw)
+		if !strings.Contains(bodyStr, "studio-error-card") || !strings.Contains(bodyStr, ">404<") {
+			t.Fatalf("GET %s expected custom error.html with studio-error-card and 404 badge, got: %.240s", p, bodyStr)
+		}
+	}
+
+	// 2. Stealth /console cloaking when DynamicLoginPath is customized must also render custom error.html
+	secResp, secRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/security", map[string]any{
+		"dynamic_login_path": "vault",
+	}, cookies, headers)
+	if secResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH dynamic_login_path=vault failed: %d %s", secResp.StatusCode, string(secRaw))
+	}
+	cloakResp, cloakRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/console", nil, nil, nil)
+	if cloakResp.StatusCode != http.StatusNotFound || !strings.Contains(string(cloakRaw), "studio-error-card") {
+		t.Fatalf("GET /console when cloaked expected 404 custom error.html, got %d: %.200s", cloakResp.StatusCode, string(cloakRaw))
+	}
+
+	// 3. External theme (volo-journal) 404 must render custom error page with volo-journal skin
+	appResp, appRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/appearance", map[string]any{
+		"active_theme": "volo-journal",
+	}, cookies, headers)
+	if appResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH active_theme=volo-journal failed: %d %s", appResp.StatusCode, string(appRaw))
+	}
+	jResp, jRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/journal-missing-route", nil, nil, nil)
+	jStr := string(jRaw)
+	if jResp.StatusCode != http.StatusNotFound || !strings.Contains(jStr, `data-volo-skin="volo-journal"`) || !strings.Contains(jStr, "studio-error-card") {
+		t.Fatalf("GET /journal-missing-route expected 404 volo-journal custom error page, got %d: %.240s", jResp.StatusCode, jStr)
+	}
+
+	// Restore volo-studio for subsequent assertions
+	_, _ = doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/appearance", map[string]any{
+		"active_theme": "volo-studio",
+	}, cookies, headers)
+
+	// 4. API endpoints (/api/v1/... and /api/admin/...) MUST preserve application/json errors (never HTML)
+	for _, apiCase := range []struct {
+		path       string
+		wantStatus int
+	}{
+		{"/api/v1/articles/non-existent-slug-999", http.StatusNotFound},
+		{"/api/admin/overview", http.StatusUnauthorized},
+	} {
+		aResp, aRaw := doJSONReq(t, http.MethodGet, env.ts.URL+apiCase.path, nil, nil, nil)
+		if aResp.StatusCode != apiCase.wantStatus {
+			t.Fatalf("GET %s = %d, want %d", apiCase.path, aResp.StatusCode, apiCase.wantStatus)
+		}
+		ct := strings.ToLower(aResp.Header.Get("Content-Type"))
+		if !strings.Contains(ct, "application/json") || strings.Contains(string(aRaw), "studio-error-card") {
+			t.Fatalf("GET %s expected JSON error (got Content-Type=%q, body=%.160s)", apiCase.path, ct, string(aRaw))
+		}
+	}
+
+	// 5. Loopback 127.0.0.1 scanner probe records security.waf_404_probe in audit_logs without banning 127.0.0.1
+	probeAudits, err := sqlx.Select[domain.AuditLog](env.ctx, env.store,
+		`SELECT * FROM audit_logs WHERE action = ?`, "security.waf_404_probe")
+	if err != nil {
+		t.Fatalf("query security.waf_404_probe audit logs: %v", err)
+	}
+	if len(probeAudits) == 0 {
+		t.Fatalf("expected loopback scanner probe to record security.waf_404_probe in audit_logs")
+	}
+	homeLoopResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, nil)
+	if homeLoopResp.StatusCode != http.StatusOK {
+		t.Fatalf("loopback 127.0.0.1 must never be auto-banned, got GET / = %d", homeLoopResp.StatusCode)
+	}
+
+	// 6. External IP (198.51.100.77) hitting scanner traps / repeated 404s triggers auto-ban (403 custom HTML page)
+	extHeaders := map[string]string{"X-Real-IP": "198.51.100.77"}
+	for _, trap := range []string{"/.env", "/wp-admin"} {
+		tResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+trap, nil, nil, extHeaders)
+		if tResp.StatusCode != http.StatusNotFound {
+			t.Fatalf("external scanner GET %s = %d, want 404", trap, tResp.StatusCode)
+		}
+	}
+	banPageResp, banPageRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, extHeaders)
+	banPageStr := string(banPageRaw)
+	if banPageResp.StatusCode != http.StatusForbidden || !strings.Contains(banPageStr, "studio-error-card") || !strings.Contains(banPageStr, ">403<") {
+		t.Fatalf("banned external IP GET / expected 403 custom error.html, got %d: %.240s", banPageResp.StatusCode, banPageStr)
+	}
+	banAPIResp, banAPIRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/site", nil, nil, extHeaders)
+	if banAPIResp.StatusCode != http.StatusForbidden || !strings.Contains(strings.ToLower(banAPIResp.Header.Get("Content-Type")), "application/json") || strings.Contains(string(banAPIRaw), "studio-error-card") {
+		t.Fatalf("banned external IP GET /api/v1/site expected 403 JSON, got %d (%s)", banAPIResp.StatusCode, string(banAPIRaw))
+	}
+
+	autoBanAudits, err := sqlx.Select[domain.AuditLog](env.ctx, env.store,
+		`SELECT * FROM audit_logs WHERE action = ?`, "security.waf_auto_ban")
+	if err != nil || len(autoBanAudits) == 0 {
+		t.Fatalf("expected security.waf_auto_ban recorded in audit_logs (err=%v, count=%d)", err, len(autoBanAudits))
+	}
+
+	// 7. WAF Rate Shield (429) renders custom HTML error.html with 429 badge for non-API pages
+	rateCfgResp, rateCfgRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/security", map[string]any{
+		"waf_enabled":        true,
+		"waf_window_seconds": 60,
+		"waf_max_requests":   10,
+	}, cookies, headers)
+	if rateCfgResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH enable WAF rate shield failed: %d %s", rateCfgResp.StatusCode, string(rateCfgRaw))
+	}
+	rateExtHeaders := map[string]string{"X-Real-IP": "203.0.113.42"}
+	got429 := false
+	for i := 0; i < 15; i++ {
+		rResp, rRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, rateExtHeaders)
+		if rResp.StatusCode == http.StatusTooManyRequests {
+			rStr := string(rRaw)
+			if !strings.Contains(rStr, "studio-error-card") || !strings.Contains(rStr, ">429<") {
+				t.Fatalf("WAF 429 page expected studio-error-card and 429 badge, got: %.240s", rStr)
+			}
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Fatalf("expected external IP exceeding waf_max_requests to receive 429 custom error page")
+	}
+}

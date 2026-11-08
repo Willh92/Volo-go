@@ -250,5 +250,7 @@
   "auth.err_totp_invalid": "Invalid or expired two-factor verification code.",
   "auth.err_totp_replay": "This verification code was already used in the current window. Please wait for the next code.",
   "auth.err_2fa_expired": "Two-factor login challenge expired. Please sign in again.",
-  "auth.err_passkey_failed": "Passkey verification failed. Please try again or sign in with password."
+  "auth.err_passkey_failed": "Passkey verification failed. Please try again or sign in with password.",
+  "error.hint_403": "Access to this page is restricted by permissions or security policy.",
+  "error.hint_429": "Too many requests in a short period. Please wait a moment and try again."
 }

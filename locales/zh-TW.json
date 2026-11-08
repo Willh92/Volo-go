@@ -1870,5 +1870,21 @@
   "api.err_invalid_email": "請輸入有效的電子信箱地址",
   "api.err_username_len": "使用者名稱長度需為 2～48 個字元",
   "api.err_pat_scope_required": "請至少勾選一項 API 權杖權限範圍",
-  "api.err_invalid_dynamic_login_path": "自訂後台入口路徑格式無效或與系統公開路由衝突"
+  "api.err_invalid_dynamic_login_path": "自訂後台入口路徑格式無效或與系統公開路由衝突",
+  "error.hint_403": "目前請求因存取權限或安全策略限制無法繼續存取。",
+  "error.hint_429": "短時間內請求過於頻繁，請稍候片刻再重新整理重試。",
+  "audit.act.sec_auto_ban": "WAF 自動封鎖 IP",
+  "audit.act.sec_404_probe": "WAF 404 風控攔截",
+  "auth.err_ident_required": "請輸入帳號或電子信箱",
+  "auth.err_pwd_required": "請輸入登入密碼",
+  "auth.err_totp_required": "請輸入 6 位動態驗證碼或復原碼",
+  "ui.field_required": "請完善必填欄位後再提交",
+  "app.move_top": "置頂",
+  "app.drag_sort": "按住拖曳排序",
+  "sys.waf_reason_scanner_trap": "敏感路徑掃描誘捕",
+  "sys.waf_reason_not_found_scan": "高頻 404 目錄探測",
+  "sys.waf_reason_rate_abuse": "高頻請求速率濫用",
+  "sys.waf_reason_login_fail": "多次登入認證失敗",
+  "sys.waf_reason_two_factor_fail": "多次兩步驗證失敗",
+  "sys.waf_reason_unlock_fail": "多次加密內容解鎖失敗"
 }

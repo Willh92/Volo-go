@@ -226,6 +226,30 @@ html[data-volo-skin="volo-journal"] .journal-colophon {
   html[data-volo-skin="volo-journal"] .studio-footer {
     width: calc(100% - 28px);
   }
+
+  html[data-volo-skin="volo-journal"] .journal-masthead {
+    margin: 18px auto 18px;
+    padding: 16px 0 16px;
+  }
+
+  html[data-volo-skin="volo-journal"] .journal-masthead__title {
+    font-size: clamp(1.32rem, 5.4vw, 1.75rem);
+  }
+
+  html[data-volo-skin="volo-journal"] .journal-masthead__notice {
+    padding: 10px 14px;
+    font-size: 0.86rem;
+  }
+}
+
+@media (max-width: 380px) {
+  html[data-volo-skin="volo-journal"] .journal-shell,
+  html[data-volo-skin="volo-journal"] .studio-header__inner.studio-container,
+  html[data-volo-skin="volo-journal"] #studio-main.studio-container,
+  html[data-volo-skin="volo-journal"] .studio-header-widgets.studio-container,
+  html[data-volo-skin="volo-journal"] .studio-footer {
+    width: calc(100% - 20px);
+  }
 }
 
 /* Scoped Scrollbar Polish (prevent Windows Chromium classic scrollbar arrows) */

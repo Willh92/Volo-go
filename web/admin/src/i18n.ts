@@ -466,6 +466,8 @@ const AUDIT_ACTION_KEYS: Record<string, string> = {
   "locale.install_zip": "audit.act.locale_zip",
   "locale.delete": "audit.act.locale_delete",
   "security.ban": "audit.act.sec_ban",
+  "security.waf_auto_ban": "audit.act.sec_auto_ban",
+  "security.waf_404_probe": "audit.act.sec_404_probe",
   "security.ip_ban_add": "audit.act.sec_ban",
   "security.unban": "audit.act.sec_unban",
   "security.ip_ban_remove": "audit.act.sec_unban",
@@ -495,10 +497,27 @@ const AUDIT_ACTION_KEYS: Record<string, string> = {
   "system.clear_runtime_logs": "audit.act.sys_clear_logs",
 };
 
+const WAF_REASON_KEYS: Record<string, string> = {
+  scanner_trap: "sys.waf_reason_scanner_trap",
+  not_found_scan: "sys.waf_reason_not_found_scan",
+  rate_abuse: "sys.waf_reason_rate_abuse",
+  login_fail: "sys.waf_reason_login_fail",
+  two_factor_fail: "sys.waf_reason_two_factor_fail",
+  unlock_fail: "sys.waf_reason_unlock_fail",
+};
+
 export function localizeAuditAction(act?: string): string {
   const raw = String(act || "").trim();
   if (!raw) return "";
   const key = AUDIT_ACTION_KEYS[raw.toLowerCase()];
   return key ? t(key) : raw;
 }
+
+export function localizeWafReason(code?: string): string {
+  const raw = String(code || "").trim().toLowerCase();
+  if (!raw) return "";
+  const key = WAF_REASON_KEYS[raw];
+  return key ? t(key) : raw;
+}
+
 

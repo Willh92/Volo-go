@@ -731,6 +731,8 @@ a {
   background: var(--volo-raised);
   border: 1px solid var(--volo-line);
   gap: 2px;
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .volo-seg-btn {
@@ -742,6 +744,8 @@ a {
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .volo-seg-btn.active {
@@ -761,6 +765,7 @@ a {
   border: 1px solid var(--volo-line);
   border-radius: 11px;
   padding: 13px 16px;
+  min-width: 0;
 }
 
 .volo-chart-box {
@@ -769,13 +774,15 @@ a {
   border-radius: 12px;
   padding: 14px 16px 10px;
   margin-bottom: 16px;
+  min-width: 0;
 }
 
 .volo-chart-legend {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 18px;
+  flex-wrap: wrap;
+  gap: 8px 18px;
   font-size: 12px;
   color: var(--volo-muted);
   margin-bottom: 6px;
@@ -786,6 +793,8 @@ a {
   border: 1px solid var(--volo-line);
   border-radius: 12px;
   padding: 15px 17px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .volo-rank-row {
@@ -796,6 +805,12 @@ a {
   padding: 7px 0;
   border-bottom: 1px dashed var(--volo-line);
   font-size: 13px;
+  min-width: 0;
+}
+
+.volo-rank-row > :first-child {
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .volo-rank-row:last-child {
@@ -886,8 +901,11 @@ a {
 .volo-theme-badges {
   position: absolute;
   top: 10px;
+  left: 10px;
   right: 10px;
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
 }
 
@@ -934,6 +952,8 @@ a {
   padding: 20px 22px;
   box-shadow: var(--volo-shadow);
   margin-bottom: 18px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .volo-card:not(:has(.is-fullscreen)) {
@@ -968,6 +988,7 @@ a {
   border-radius: var(--volo-radius);
   padding: 15px 18px;
   box-shadow: var(--volo-shadow);
+  min-width: 0;
 }
 
 .volo-kpi-click {
@@ -1000,7 +1021,7 @@ a {
 
 @container (max-width: 520px) {
   .volo-grid-2 {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -1015,6 +1036,7 @@ a {
   flex-direction: column;
   gap: 5px;
   margin-bottom: 12px;
+  min-width: 0;
 }
 
 .volo-field label {
@@ -1056,6 +1078,13 @@ a {
 .volo-input:focus, .volo-select:focus, .volo-textarea:focus {
   border-color: var(--volo-accent);
   box-shadow: 0 0 0 3px var(--volo-accent-soft);
+}
+
+.volo-input.is-invalid,
+.volo-select.is-invalid,
+.volo-textarea.is-invalid {
+  border-color: var(--volo-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--volo-danger) 16%, transparent);
 }
 
 input:-webkit-autofill,
@@ -1146,6 +1175,20 @@ input[type="checkbox"] {
   font-weight: 600;
   background: var(--volo-accent-soft);
   color: var(--volo-accent);
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.volo-badge.is-wrap {
+  white-space: normal;
+  flex-shrink: 1;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .volo-badge-ok { background: color-mix(in srgb, var(--volo-ok) 15%, transparent); color: var(--volo-ok); }
@@ -1183,6 +1226,8 @@ input[type="checkbox"] {
   font-size: 12.5px;
   font-weight: 550;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: background 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
 }
 
@@ -1376,6 +1421,8 @@ input[type="checkbox"] {
   display: inline-flex;
   align-items: center;
   gap: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .volo-mini-tag.warn {
@@ -1661,54 +1708,83 @@ input[type="checkbox"] {
   box-shadow: var(--volo-shadow);
 }
 
-/* Top-Right Slide-In Toast with Hover Pause & Semantic States */
+/* Top-Center High-Contrast Semantic Toast Banner (Zero Scale Font Jitter) */
 .volo-toast {
   position: fixed;
-  right: 22px;
-  top: 22px;
-  z-index: 2600;
-  padding: 10px 13px 10px 12px;
-  border-radius: 11px;
-  background: var(--volo-nav);
+  top: max(18px, env(safe-area-inset-top));
+  left: 50%;
+  right: auto;
+  transform: translate3d(-50%, 0, 0);
+  z-index: 3200;
+  padding: 11px 14px 11px 12px;
+  border-radius: 13px;
+  background: linear-gradient(135deg, #155e47 0%, #104836 100%);
   color: #ffffff;
-  box-shadow: var(--volo-shadow-pop);
-  font-size: 13px;
-  max-width: min(410px, calc(100vw - 24px));
+  box-shadow: 0 14px 36px rgba(9, 28, 21, 0.32), 0 0 0 4px rgba(16, 185, 129, 0.16);
+  font-size: 13.5px;
+  font-weight: 600;
+  min-width: min(260px, calc(100vw - 24px));
+  max-width: min(480px, calc(100vw - 24px));
   display: inline-flex;
   align-items: center;
-  gap: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  animation: volo-toast-slide 0.22s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  gap: 10px;
+  border: 1.5px solid rgba(110, 231, 183, 0.56);
+  animation: volo-toast-slide 0.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 
 .volo-toast.is-err {
-  background: #8f2822;
-  border-color: rgba(255, 190, 185, 0.32);
+  background: linear-gradient(135deg, #b91c1c 0%, #881313 100%);
+  border-color: rgba(254, 163, 158, 0.72);
+  box-shadow: 0 16px 38px rgba(48, 8, 8, 0.38), 0 0 0 4px rgba(239, 68, 68, 0.2);
 }
 
 .volo-toast.is-warn {
-  background: #7c4f12;
-  border-color: rgba(255, 224, 170, 0.3);
+  background: linear-gradient(135deg, #9a4a0c 0%, #733407 100%);
+  border-color: rgba(252, 211, 77, 0.66);
+  box-shadow: 0 14px 36px rgba(40, 18, 4, 0.34), 0 0 0 4px rgba(245, 158, 11, 0.18);
+}
+
+[data-theme="dark"] .volo-toast {
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.62), 0 0 0 4px rgba(52, 211, 153, 0.22);
+}
+
+[data-theme="dark"] .volo-toast.is-err {
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.66), 0 0 0 4px rgba(248, 113, 113, 0.26);
+}
+
+[data-theme="dark"] .volo-toast.is-warn {
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.64), 0 0 0 4px rgba(251, 191, 36, 0.24);
 }
 
 .volo-toast.is-closing {
-  animation: volo-toast-exit 0.16s ease forwards;
+  animation: volo-toast-exit 0.15s ease forwards;
 }
 
 .volo-toast-icon {
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.18);
+  background: rgba(167, 243, 208, 0.24);
+  color: #a7f3d0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 11.5px;
-  font-weight: 800;
   flex-shrink: 0;
 }
 
+.volo-toast.is-err .volo-toast-icon {
+  background: rgba(254, 202, 202, 0.24);
+  color: #fee2e2;
+}
+
+.volo-toast.is-warn .volo-toast-icon {
+  background: rgba(253, 230, 138, 0.24);
+  color: #fef3c7;
+}
+
 .volo-toast-text {
+  flex: 1;
+  min-width: 0;
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -1716,45 +1792,46 @@ input[type="checkbox"] {
 @keyframes volo-toast-slide {
   from {
     opacity: 0;
-    transform: translateY(-10px) scale(0.98);
+    transform: translate3d(-50%, -14px, 0);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: translate3d(-50%, 0, 0);
   }
 }
 
 @keyframes volo-toast-exit {
   from {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: translate3d(-50%, 0, 0);
   }
   to {
     opacity: 0;
-    transform: translateY(-8px) scale(0.98);
+    transform: translate3d(-50%, -10px, 0);
   }
 }
 
 .volo-toast-close {
   appearance: none;
   border: 0;
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.16);
   color: #ffffff;
-  width: 20px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
   border-radius: 999px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1;
   padding: 0;
   flex-shrink: 0;
+  transition: background 0.14s ease;
 }
 
 .volo-toast-close:hover {
-  background: rgba(255, 255, 255, 0.26);
+  background: rgba(255, 255, 255, 0.28);
 }
 
 .volo-modal-backdrop {
@@ -1793,38 +1870,40 @@ input[type="checkbox"] {
   border-radius: 16px;
   padding: 22px 24px;
   width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
   max-width: 720px;
   max-height: 88vh;
   max-height: 88dvh;
   display: flex;
   flex-direction: column;
   box-shadow: var(--volo-shadow-pop);
-  animation: volo-modal-enter 0.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: volo-modal-enter 0.18s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 
 .volo-modal.is-closing {
-  animation: volo-modal-exit 0.16s ease forwards;
+  animation: volo-modal-exit 0.15s ease forwards;
 }
 
 @keyframes volo-modal-enter {
   from {
     opacity: 0;
-    transform: translateY(10px) scale(0.965);
+    transform: translateY(10px);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: none;
   }
 }
 
 @keyframes volo-modal-exit {
   from {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: none;
   }
   to {
     opacity: 0;
-    transform: translateY(6px) scale(0.975);
+    transform: translateY(6px);
   }
 }
 
@@ -1877,6 +1956,8 @@ input[type="checkbox"] {
 
 .volo-modal-body {
   overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   min-height: 0;
   flex: 1;
   padding-right: 2px;
@@ -1962,11 +2043,11 @@ input[type="checkbox"] {
 
 .volo-pop-menu {
   transform-origin: top right;
-  animation: volo-pop-open 0.16s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: volo-pop-open 0.15s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 
 .volo-pop-menu.is-closing {
-  animation: volo-pop-close 0.14s ease forwards;
+  animation: volo-pop-close 0.13s ease forwards;
 }
 
 .volo-cselect-menu {
@@ -1986,7 +2067,7 @@ input[type="checkbox"] {
   flex-direction: column;
   gap: 2px;
   transform-origin: top center;
-  animation: volo-pop-open 0.16s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: volo-pop-open 0.15s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 
 .volo-cselect-menu.is-portal {
@@ -2039,7 +2120,7 @@ input[type="checkbox"] {
 }
 
 .volo-cselect-menu.is-closing {
-  animation: volo-pop-close 0.14s ease forwards;
+  animation: volo-pop-close 0.13s ease forwards;
 }
 
 .volo-cselect-menu.flip-up:not(.is-portal) {
@@ -2065,22 +2146,22 @@ input[type="checkbox"] {
 @keyframes volo-pop-open {
   from {
     opacity: 0;
-    transform: translateY(-5px) scale(0.975);
+    transform: translateY(-5px);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: none;
   }
 }
 
 @keyframes volo-pop-close {
   from {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: none;
   }
   to {
     opacity: 0;
-    transform: translateY(-4px) scale(0.98);
+    transform: translateY(-4px);
   }
 }
 
@@ -2245,10 +2326,16 @@ input[type="checkbox"] {
   padding: 6px 8px;
 }
 
+body.volo-is-sorting,
+body.volo-is-sorting * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
 .volo-sortable-list {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
   margin-top: 6px;
 }
 
@@ -2261,12 +2348,68 @@ input[type="checkbox"] {
   border: 1px solid var(--volo-line);
   border-radius: 8px;
   background: var(--volo-surface);
-  transition: border-color 0.15s ease, opacity 0.15s ease;
+  min-width: 0;
+  transition: border-color 0.14s ease, background-color 0.14s ease, box-shadow 0.14s ease, opacity 0.14s ease;
+}
+
+.volo-sortable-row.is-dragging,
+.volo-chap-row.is-dragging {
+  border-color: var(--volo-accent);
+  background: color-mix(in srgb, var(--volo-accent-soft) 65%, var(--volo-surface));
+  box-shadow: 0 8px 22px rgba(12, 22, 18, 0.14);
+  position: relative;
+  z-index: 3;
 }
 
 .volo-sortable-row.is-off {
   opacity: 0.58;
   background: var(--volo-raised);
+}
+
+.volo-sortable-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.volo-sortable-label {
+  font-size: 13px;
+  font-weight: 540;
+  color: var(--volo-text);
+  line-height: 1.38;
+  min-width: 0;
+  flex: 1 1 0;
+  overflow-wrap: anywhere;
+  cursor: grab;
+  user-select: none;
+}
+
+.volo-drag-handle {
+  width: 22px;
+  height: 26px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--volo-muted);
+  cursor: grab;
+  flex-shrink: 0;
+  touch-action: none;
+  user-select: none;
+  transition: color 0.14s ease, background-color 0.14s ease;
+}
+
+.volo-drag-handle:hover:not(.is-disabled) {
+  color: var(--volo-accent);
+  background: var(--volo-accent-soft);
+}
+
+.volo-drag-handle.is-disabled {
+  opacity: 0.35;
+  cursor: default;
+  pointer-events: none;
 }
 
 .volo-sortable-acts {
@@ -3405,7 +3548,7 @@ input[type="checkbox"] {
 
 @media (max-width: 1180px) {
   .volo-grid-2 {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -3432,7 +3575,7 @@ input[type="checkbox"] {
 @media (max-width: 1024px) {
   .volo-shell {
     --topbar-h: 60px;
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .volo-rail {
     position: fixed;
@@ -3484,7 +3627,7 @@ input[type="checkbox"] {
   .volo-ed-body.mode-sv.with-outline,
   .volo-ed-body.mode-ir.with-outline,
   .volo-ed-body.mode-wysiwyg.with-outline {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .volo-studio-editor .volo-preview-pane,
   .volo-ed-outline {
@@ -3510,14 +3653,28 @@ input[type="checkbox"] {
 
 @media (max-width: 768px) {
   .volo-content {
-    padding: 16px 12px 68px;
+    padding: 16px 12px calc(68px + env(safe-area-inset-bottom, 0px));
   }
   .volo-trend-kpis,
   .volo-grid-2,
   .volo-grid-3,
   .volo-grid-4,
   .volo-editor-split {
-    grid-template-columns: 1fr !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .volo-input:not([type="number"]),
+  .volo-select,
+  .volo-textarea,
+  .volo-cselect-search,
+  .volo-tag-inline-input {
+    font-size: 16px;
+  }
+  .volo-seg {
+    align-self: flex-start;
+  }
+  .volo-tab {
+    flex-shrink: 0;
+    white-space: nowrap;
   }
   .volo-eyebrow,
   .volo-pill-label,
@@ -3582,6 +3739,18 @@ input[type="checkbox"] {
     max-width: 100%;
     padding-bottom: 2px;
   }
+  .volo-ed-tools > * {
+    flex-shrink: 0;
+  }
+  .volo-ed-chip,
+  .volo-ed-mode-btn {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .volo-ed-footer {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+  }
   .volo-ed-tools::-webkit-scrollbar {
     display: none;
   }
@@ -3596,7 +3765,7 @@ input[type="checkbox"] {
     padding: 15px 13px;
   }
   .volo-modal-backdrop {
-    padding: 10px;
+    padding: max(10px, env(safe-area-inset-top, 0px)) 10px max(10px, env(safe-area-inset-bottom, 0px));
   }
   .volo-modal {
     padding: 16px 14px;
@@ -3701,6 +3870,12 @@ input[type="checkbox"] {
   .volo-ed-right {
     width: 100%;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .volo-studio-editor .volo-wysiwyg-surface,
+  .volo-studio-editor .volo-preview-pane {
+    padding: 12px 14px;
   }
   .volo-topbar .volo-pop-menu {
     position: fixed;
@@ -3744,6 +3919,8 @@ input[type="checkbox"] {
   gap: 12px;
   text-decoration: none;
   color: var(--volo-text);
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .volo-auth-mark {
@@ -3758,6 +3935,7 @@ input[type="checkbox"] {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
   box-shadow: 0 6px 18px color-mix(in srgb, var(--volo-accent) 26%, transparent);
 }
 
@@ -3765,12 +3943,16 @@ input[type="checkbox"] {
   display: flex;
   flex-direction: column;
   line-height: 1.15;
+  min-width: 0;
 }
 
 .volo-auth-brand-text strong {
   font-size: 18px;
   font-weight: 750;
   letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .volo-auth-brand-text small {
@@ -3785,6 +3967,7 @@ input[type="checkbox"] {
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  flex-shrink: 0;
 }
 
 .volo-auth-back {
@@ -3800,6 +3983,7 @@ input[type="checkbox"] {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  white-space: nowrap;
   transition: border-color 0.15s ease, color 0.15s ease;
 }
 
@@ -3819,7 +4003,7 @@ input[type="checkbox"] {
   width: 100%;
   max-width: 960px;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   border-radius: 24px;
   overflow: hidden;
   box-shadow: 0 22px 60px rgba(14, 24, 20, 0.12);
@@ -4179,6 +4363,8 @@ html[data-theme="dark"] .volo-auth-story {
   color: var(--volo-accent);
   font-size: 12px;
   font-weight: 600;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .volo-tag-pill button {
@@ -4575,9 +4761,19 @@ html[data-theme="dark"] .volo-auth-story {
   border: 1px solid rgba(255, 255, 255, 0.14);
   z-index: 8;
   white-space: nowrap;
+  max-width: calc(100% - 12px);
+}
+
+@media (max-width: 520px) {
+  .volo-chart-tooltip {
+    white-space: normal;
+    padding: 6px 9px;
+    font-size: 11.5px;
+  }
 }
 
 .volo-mini-chart-card {
+  container-type: inline-size;
   background: var(--volo-raised);
   border: 1px solid var(--volo-line);
   border-radius: 12px;
@@ -4585,6 +4781,8 @@ html[data-theme="dark"] .volo-auth-story {
   display: flex;
   flex-direction: column;
   min-height: 230px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .volo-mini-chart-title {
@@ -4599,6 +4797,7 @@ html[data-theme="dark"] .volo-auth-story {
   align-items: center;
   gap: 16px;
   flex: 1;
+  min-width: 0;
 }
 
 .volo-donut-legend {
@@ -4608,6 +4807,20 @@ html[data-theme="dark"] .volo-auth-story {
   flex: 1;
   min-width: 0;
   font-size: 12.5px;
+}
+
+@container (max-width: 340px) {
+  .volo-donut-wrap {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .volo-donut-wrap > svg {
+    align-self: center;
+  }
+  .volo-donut-legend {
+    width: 100%;
+    flex: none;
+  }
 }
 
 .volo-donut-legend-row {
@@ -4891,10 +5104,17 @@ html[data-theme="dark"] .volo-auth-story {
 }
 
 .volo-cmdk-item-title {
+  flex: 1 1 0;
+  min-width: 0;
   font-weight: 580;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.volo-cmdk-item .volo-code-chip {
+  max-width: 40%;
+  flex-shrink: 0;
 }
 
 /* SwitchToggle */
@@ -5331,11 +5551,16 @@ html[data-theme="dark"] .volo-auth-story {
     padding: 14px 16px;
     flex-wrap: wrap;
   }
+  .volo-auth-back {
+    height: 32px;
+    padding: 0 11px;
+    font-size: 12.5px;
+  }
   .volo-auth-stage {
     padding: 10px 14px 20px;
   }
   .volo-auth-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .volo-auth-story {
     min-height: 0;
@@ -5355,9 +5580,23 @@ html[data-theme="dark"] .volo-auth-story {
     border-radius: 0 0 20px 20px;
     padding: 24px 18px;
   }
+  .volo-sso-btn {
+    white-space: normal;
+    height: auto;
+    padding: 8px 12px;
+    text-align: center;
+    line-height: 1.35;
+  }
   .volo-donut-wrap {
     flex-direction: column;
-    align-items: flex-start;
+    align-items: stretch;
+  }
+  .volo-donut-wrap > svg {
+    align-self: center;
+  }
+  .volo-donut-legend {
+    width: 100%;
+    flex: none;
   }
   .volo-about-hero {
     padding: 20px 18px;
@@ -5367,7 +5606,7 @@ html[data-theme="dark"] .volo-auth-story {
     gap: 6px;
   }
   .volo-about-kv-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .volo-about-kv span {
     overflow-wrap: anywhere;
@@ -5468,6 +5707,8 @@ html[data-theme="dark"] .volo-auth-story {
   color: var(--volo-muted);
   font-family: var(--volo-mono);
   font-size: 11px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .volo-log-chip b {
@@ -5491,20 +5732,68 @@ html[data-theme="dark"] .volo-auth-story {
   outline: none;
 }
 
-.volo-sortable-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.volo-series-sel-row {
+  flex-wrap: nowrap;
 }
 
-.volo-sortable-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border-radius: 8px;
-  border: 1px solid var(--volo-line);
-  background: var(--volo-surface);
+@media (max-width: 640px) {
+  .volo-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .volo-kpi-grid > :last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+  .volo-kpi {
+    padding: 13px 14px;
+  }
+  .volo-kpi-val {
+    font-size: 20px;
+  }
+  .volo-welcome {
+    padding: 16px 15px;
+  }
+  .volo-welcome-title {
+    font-size: 19px;
+  }
+  .volo-batch-bar {
+    bottom: max(10px, env(safe-area-inset-bottom, 0px));
+    padding: 9px 11px;
+    gap: 8px;
+  }
+}
+
+@media (max-width: 520px) {
+  .volo-series-sel-row {
+    flex-wrap: wrap !important;
+    gap: 6px;
+  }
+  .volo-series-sel-acts {
+    width: auto !important;
+    margin-top: 0 !important;
+    margin-left: auto;
+  }
+  .volo-sortable-row {
+    flex-wrap: wrap;
+    gap: 6px 8px;
+  }
+  .volo-sortable-main {
+    flex: 1 1 180px;
+  }
+  .volo-sortable-acts {
+    margin-left: auto;
+  }
+  .volo-audit-rank-row {
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+  .volo-audit-rank-row .volo-code-chip {
+    max-width: 140px;
+    flex-shrink: 0;
+  }
+  .volo-audit-rank-time {
+    margin-left: auto;
+  }
 }
 
 .volo-mono {

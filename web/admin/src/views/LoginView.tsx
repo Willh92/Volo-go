@@ -61,6 +61,11 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
   const [busy, setBusy] = useState(false);
   const [oidcProviders, setOidcProviders] = useState<OidcProviderItem[]>([]);
 
+  const [invalidField, setInvalidField] = useState<"" | "ident" | "password" | "totp">("");
+  const identRef = useState<{ el: HTMLInputElement | null }>({ el: null })[0];
+  const pwdRef = useState<{ el: HTMLInputElement | null }>({ el: null })[0];
+  const totpRef = useState<{ el: HTMLInputElement | null }>({ el: null })[0];
+
   useEffect(() => {
     if (initialChallengeToken.trim()) {
       setChallengeToken(initialChallengeToken.trim());
@@ -88,6 +93,19 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
 
   const handlePasswordSubmit = async (e: Event) => {
     e.preventDefault();
+    if (!ident.trim()) {
+      setInvalidField("ident");
+      identRef.el?.focus();
+      showToast(t("auth.err_ident_required"), "err");
+      return;
+    }
+    if (!password) {
+      setInvalidField("password");
+      pwdRef.el?.focus();
+      showToast(t("auth.err_pwd_required"), "err");
+      return;
+    }
+    setInvalidField("");
     setOidcErrorCode("");
     setBusy(true);
     try {
@@ -98,7 +116,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
         csrf_token?: string;
       }>("/api/admin/auth/login", {
         method: "POST",
-        body: JSON.stringify({ ident, password }),
+        body: JSON.stringify({ ident: ident.trim(), password }),
       });
       if (res.requires_2fa && res.challenge_token) {
         setChallengeToken(res.challenge_token);
@@ -118,13 +136,20 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
 
   const handle2FASubmit = async (e: Event) => {
     e.preventDefault();
+    if (!totpCode.trim()) {
+      setInvalidField("totp");
+      totpRef.el?.focus();
+      showToast(t("auth.err_totp_required"), "err");
+      return;
+    }
+    setInvalidField("");
     setBusy(true);
     try {
       const res = await apiFetch<{ user: StaffUser; csrf_token: string }>("/api/admin/auth/2fa", {
         method: "POST",
         body: JSON.stringify({
           challenge_token: challengeToken,
-          code: totpCode,
+          code: totpCode.trim(),
           remember_device: rememberDevice,
         }),
       });
@@ -287,7 +312,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
               )}
 
               {!challengeToken ? (
-                <form onSubmit={handlePasswordSubmit} autoComplete="off" data-form-type="other">
+                <form noValidate onSubmit={handlePasswordSubmit} autoComplete="off" data-form-type="other">
                   <div class="volo-field">
                     <label>{t("auth.ident")}</label>
                     <div class="volo-auth-input-wrap">
@@ -298,17 +323,22 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                         </svg>
                       </span>
                       <input
-                        class="volo-input"
+                        ref={(el) => {
+                          identRef.el = el;
+                        }}
+                        class={`volo-input ${invalidField === "ident" ? "is-invalid" : ""}`}
                         name="volo_staff_ident"
                         autoComplete="off"
                         data-lpignore="true"
                         data-1p-ignore="true"
                         data-form-type="other"
-                        required
                         autoFocus
                         placeholder={t("auth.ident_ph")}
                         value={ident}
-                        onInput={(e) => setIdent((e.currentTarget as HTMLInputElement).value)}
+                        onInput={(e) => {
+                          setIdent((e.currentTarget as HTMLInputElement).value);
+                          if (invalidField === "ident") setInvalidField("");
+                        }}
                       />
                     </div>
                   </div>
@@ -323,17 +353,22 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                         </svg>
                       </span>
                       <input
+                        ref={(el) => {
+                          pwdRef.el = el;
+                        }}
                         type={(showPwd ? "text" : "password") as "password"}
-                        class="volo-input"
+                        class={`volo-input ${invalidField === "password" ? "is-invalid" : ""}`}
                         name="volo_staff_secret"
                         autoComplete="new-password"
                         data-lpignore="true"
                         data-1p-ignore="true"
                         data-form-type="other"
-                        required
                         placeholder={t("auth.password_ph")}
                         value={password}
-                        onInput={(e) => setPassword((e.currentTarget as HTMLInputElement).value)}
+                        onInput={(e) => {
+                          setPassword((e.currentTarget as HTMLInputElement).value);
+                          if (invalidField === "password") setInvalidField("");
+                        }}
                       />
                       <button
                         type="button"
@@ -369,7 +404,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                     <button
                       type="button"
                       class="volo-btn"
-                      style={{ width: "100%", height: "40px" }}
+                      style={{ width: "100%", minHeight: "40px" }}
                       disabled={busy}
                       onClick={handlePasskeyLogin}
                     >
@@ -385,7 +420,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                         key={p.name}
                         href={p.start_url}
                         class="volo-btn volo-sso-btn"
-                        style={{ width: "100%", height: "40px" }}
+                        style={{ width: "100%", minHeight: "40px" }}
                       >
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
                           <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
@@ -398,7 +433,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                   </div>
                 </form>
               ) : (
-                <form onSubmit={handle2FASubmit} autoComplete="off">
+                <form noValidate onSubmit={handle2FASubmit} autoComplete="off">
                   <div class="volo-field">
                     <label>{t("auth.totp_code")}</label>
                     <div class="volo-auth-input-wrap">
@@ -408,14 +443,19 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                         </svg>
                       </span>
                       <input
-                        class="volo-input"
+                        ref={(el) => {
+                          totpRef.el = el;
+                        }}
+                        class={`volo-input ${invalidField === "totp" ? "is-invalid" : ""}`}
                         name="totp_otp_code"
                         autoComplete="one-time-code"
-                        required
                         autoFocus
                         placeholder="123456 / ABCD-EFGH"
                         value={totpCode}
-                        onInput={(e) => setTotpCode((e.currentTarget as HTMLInputElement).value)}
+                        onInput={(e) => {
+                          setTotpCode((e.currentTarget as HTMLInputElement).value);
+                          if (invalidField === "totp") setInvalidField("");
+                        }}
                       />
                     </div>
                   </div>
@@ -436,6 +476,7 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                     onClick={() => {
                       setChallengeToken("");
                       setTotpCode("");
+                      setInvalidField("");
                     }}
                   >
                     ← {t("auth.back_login")}

@@ -141,7 +141,7 @@ func (s *AppServer) isSameOriginRequest(r *http.Request) bool {
 
 func (s *AppServer) requireSameOrigin(w http.ResponseWriter, r *http.Request) bool {
 	if !s.isSameOriginRequest(r) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request blocked"})
+		writeErrJSON(w, http.StatusForbidden, "cross-origin request blocked")
 		return false
 	}
 	return true
@@ -747,7 +747,7 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("setup:testdb", clientIP, 15, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
 
@@ -757,7 +757,7 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 		SimpleProtocol bool   `json:"simple_protocol"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
@@ -816,7 +816,7 @@ func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Reques
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("setup:configdb", clientIP, 10, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
 
@@ -826,7 +826,7 @@ func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Reques
 		SimpleProtocol *bool  `json:"simple_protocol"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
@@ -866,14 +866,14 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("setup:import", clientIP, 15, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
 
 	// Spool the multipart upload BEFORE acquiring s.setupMu so slow clients cannot block concurrent wizard calls.
 	prep, err := s.spoolLegacyImportUpload(w, r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	defer os.Remove(prep.tmpPath)
@@ -887,7 +887,7 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 
 	rep, err := s.executeLegacyImport(r.Context(), prep, true)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if prep.dryRun {
@@ -956,7 +956,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("setup:complete", clientIP, 10, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
 
@@ -979,27 +979,27 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		AdminPassword    string `json:"admin_password"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
 	uname := strings.TrimSpace(req.AdminUsername)
 	email := strings.ToLower(strings.TrimSpace(req.AdminEmail))
 	if len(uname) < 2 || len(uname) > 48 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "admin_username must be 2-48 characters"})
+		writeErrJSON(w, http.StatusBadRequest, "admin_username must be 2-48 characters")
 		return
 	}
 	if !strings.Contains(email, "@") || len(email) > 190 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid admin_email is required"})
+		writeErrJSON(w, http.StatusBadRequest, "valid admin_email is required")
 		return
 	}
 	if err := auth.ValidatePasswordPolicy(req.AdminPassword); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	pwHash, err := auth.HashPassword(req.AdminPassword)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "password hashing failed"})
+		writeErrJSON(w, http.StatusInternalServerError, "password hashing failed")
 		return
 	}
 
@@ -1026,7 +1026,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		chosenSimpleProto = *req.DBSimpleProtocol
 	}
 	if err := s.applySetupDatabaseSelection(r.Context(), chosenDriver, chosenDSN, chosenSimpleProto); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1136,7 +1136,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		return nil
 	})
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusConflict, err.Error())
 		return
 	}
 
@@ -1160,7 +1160,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	}
 	sess, rawTok, err := s.deps.Auth.CreateSession(r.Context(), adminUser.ID, clientIP, geo, r.UserAgent(), 0)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.setSessionCookieForRequest(w, r, rawTok)
@@ -1573,7 +1573,7 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("setup:testlegacydb", clientIP, 15, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
 
@@ -1584,7 +1584,7 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 		SourceTablePrefix    string `json:"source_table_prefix"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	pfx, err := validateSourceTablePrefix(req.SourceTablePrefix)
@@ -1645,7 +1645,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("setup:migratedb", clientIP, 10, time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
 
@@ -1675,7 +1675,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		DryRun               bool   `json:"dry_run"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
@@ -1684,7 +1684,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 
 	pfx, err := validateSourceTablePrefix(req.SourceTablePrefix)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1692,7 +1692,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	if newSiteURL != "" {
 		parsedURL, uErr := url.Parse(newSiteURL)
 		if uErr != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || strings.TrimSpace(parsedURL.Host) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_site_url must be a valid http(s):// URL"})
+			writeErrJSON(w, http.StatusBadRequest, "new_site_url must be a valid http(s):// URL")
 			return
 		}
 		newSiteURL = strings.TrimRight(newSiteURL, "/")
@@ -1700,24 +1700,24 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 
 	adminUsername := strings.TrimSpace(req.AdminUsername)
 	if adminUsername != "" && (len(adminUsername) < 2 || len(adminUsername) > 48) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "admin_username must be 2-48 characters"})
+		writeErrJSON(w, http.StatusBadRequest, "admin_username must be 2-48 characters")
 		return
 	}
 	adminEmail := strings.ToLower(strings.TrimSpace(req.AdminEmail))
 	if adminEmail != "" && (!strings.Contains(adminEmail, "@") || len(adminEmail) > 190) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid admin_email is required"})
+		writeErrJSON(w, http.StatusBadRequest, "valid admin_email is required")
 		return
 	}
 	adminDisplayName := strings.TrimSpace(req.AdminDisplayName)
 	adminPasswordHash := ""
 	if req.AdminPassword != "" {
 		if err := auth.ValidatePasswordPolicy(req.AdminPassword); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		h, hErr := auth.HashPassword(req.AdminPassword)
 		if hErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "password hashing failed"})
+			writeErrJSON(w, http.StatusInternalServerError, "password hashing failed")
 			return
 		}
 		adminPasswordHash = h
@@ -1756,25 +1756,25 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	}
 	normTargetDriver, normTargetDSN, err := s.validateAndNormalizeSetupDB(r.Context(), effRawDriver, effRawDSN)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	srcStore, normSrcDriver, normSrcDSN, err := s.validateAndOpenSourceDBReadOnly(r.Context(), req.SourceDriver, req.SourceDSN, req.SourceSimpleProtocol)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	defer srcStore.Close()
 
 	if isSameSetupAndSourceDB(normTargetDriver, normTargetDSN, normSrcDriver, normSrcDSN) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source database and target database cannot be the same"})
+		writeErrJSON(w, http.StatusBadRequest, "source database and target database cannot be the same")
 		return
 	}
 
 	// Pre-flight verify source schema BEFORE swapping or touching the target database!
 	if _, err := etl.InspectSourceDatabase(r.Context(), srcStore, pfx); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1801,7 +1801,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		if !s.isSameCurrentDB(normTargetDriver, normTargetDSN, targetSimple) {
 			dName, _, pErr := s.probeSetupDB(r.Context(), normTargetDriver, normTargetDSN, targetSimple)
 			if pErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": pErr.Error()})
+				writeErrJSON(w, http.StatusBadRequest, pErr.Error())
 				return
 			}
 			if dName != "" {
@@ -1810,7 +1810,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		}
 		rep, insp, err := etl.ImportSourceDatabase(r.Context(), srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if rep != nil {
@@ -1828,13 +1828,13 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := s.applySetupDatabaseSelection(r.Context(), chosenDriver, chosenDSN, targetSimple); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	rep, insp, err := etl.ImportSourceDatabase(r.Context(), srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

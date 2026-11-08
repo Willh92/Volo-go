@@ -1598,5 +1598,19 @@
   "audit.act.redir_batch_del": "Batch Delete Redirects",
   "audit.act.webhook_replay": "Replay Webhook",
   "audit.act.gh_publish": "Publish GitHub Showcase",
-  "audit.act.sys_clear_logs": "Clear Runtime Logs"
+  "audit.act.sys_clear_logs": "Clear Runtime Logs",
+  "audit.act.sec_auto_ban": "WAF Auto-Banned IP",
+  "audit.act.sec_404_probe": "WAF 404 Probe Recorded",
+  "auth.err_ident_required": "Please enter your username or email.",
+  "auth.err_pwd_required": "Please enter your password.",
+  "auth.err_totp_required": "Please enter your 6-digit authentication code or recovery code.",
+  "ui.field_required": "Please complete the required fields before submitting.",
+  "app.move_top": "Move to top",
+  "app.drag_sort": "Drag to reorder",
+  "sys.waf_reason_scanner_trap": "Sensitive path scanner trap",
+  "sys.waf_reason_not_found_scan": "High-frequency 404 path enumeration",
+  "sys.waf_reason_rate_abuse": "High-frequency rate abuse",
+  "sys.waf_reason_login_fail": "Repeated login failures",
+  "sys.waf_reason_two_factor_fail": "Repeated 2FA failures",
+  "sys.waf_reason_unlock_fail": "Repeated content unlock failures"
 }

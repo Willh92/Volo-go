@@ -76,6 +76,9 @@ func setupPerfServerEnv(tb testing.TB) (*sqlx.Store, *server.AppServer) {
 	settings := repo.NewSettingsManager(store, cfg.KeyRing, "en-US")
 	_, _ = settings.Reload(ctx)
 	_, _, _ = settings.PatchDomain(ctx, domain.SettingsDomainSite, []byte(`{"initialized":true,"title":"Volo Performance Blog"}`), 0)
+	if _, isBench := tb.(*testing.B); isBench {
+		_, _, _ = settings.PatchDomain(ctx, domain.SettingsDomainSecurity, []byte(`{"waf_enabled":false}`), 0)
+	}
 
 	for i := 1; i <= 12; i++ {
 		_, err := store.ExecContext(ctx,

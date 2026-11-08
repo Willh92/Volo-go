@@ -2197,3 +2197,193 @@ export function TokenListInput({
     </div>
   );
 }
+
+export function DragGripIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+      <circle cx="5.5" cy="3.5" r="1.25" />
+      <circle cx="10.5" cy="3.5" r="1.25" />
+      <circle cx="5.5" cy="8" r="1.25" />
+      <circle cx="10.5" cy="8" r="1.25" />
+      <circle cx="5.5" cy="12.5" r="1.25" />
+      <circle cx="10.5" cy="12.5" r="1.25" />
+    </svg>
+  );
+}
+
+export function MoveTopIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.85"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M3.2 2.8h9.6" />
+      <path d="M8 13.4V5.3" />
+      <path d="M4.7 8.5 8 5.2l3.3 3.3" />
+    </svg>
+  );
+}
+
+function findScrollableAncestor(el: HTMLElement | null): HTMLElement | null {
+  let cur = el?.parentElement ?? null;
+  while (cur && cur !== document.body && cur !== document.documentElement) {
+    const st = window.getComputedStyle(cur);
+    const oy = st.overflowY;
+    if ((oy === "auto" || oy === "scroll" || oy === "overlay") && cur.scrollHeight > cur.clientHeight + 4) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+  return (document.scrollingElement as HTMLElement | null) || null;
+}
+
+export function usePointerSortableList<T>(
+  items: T[],
+  onReorder: (next: T[], fromIdx: number, toIdx: number) => void,
+  enabled = true
+) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const onReorderRef = useRef(onReorder);
+  onReorderRef.current = onReorder;
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+  const cleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      cleanupRef.current?.();
+    };
+  }, []);
+
+  const getHandleProps = (idx: number) => ({
+    onPointerDown: (e: PointerEvent) => {
+      if (!enabledRef.current || itemsRef.current.length < 2) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+
+      cleanupRef.current?.();
+
+      const startY = e.clientY;
+      let lastClientY = e.clientY;
+      const pointerId = e.pointerId;
+      const handleEl = e.currentTarget as HTMLElement | null;
+      let curIdx = idx;
+      let active = false;
+      let rafId = 0;
+      const scrollEl = findScrollableAncestor(listRef.current);
+
+      const checkSwap = (clientY: number) => {
+        const container = listRef.current;
+        if (!container) return;
+        const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx]");
+        if (!rows.length) return;
+
+        let targetIdx = curIdx;
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          const rIdx = Number(row.dataset.sortIdx);
+          if (!Number.isFinite(rIdx) || rIdx === curIdx) continue;
+          const rect = row.getBoundingClientRect();
+          const mid = rect.top + rect.height / 2;
+          if (rIdx < curIdx && clientY < mid) {
+            targetIdx = Math.min(targetIdx, rIdx);
+          } else if (rIdx > curIdx && clientY > mid) {
+            targetIdx = Math.max(targetIdx, rIdx);
+          }
+        }
+
+        if (targetIdx !== curIdx && targetIdx >= 0 && targetIdx < itemsRef.current.length) {
+          const next = [...itemsRef.current];
+          const [moved] = next.splice(curIdx, 1);
+          next.splice(targetIdx, 0, moved);
+          const prevIdx = curIdx;
+          itemsRef.current = next;
+          curIdx = targetIdx;
+          setDraggingIdx(targetIdx);
+          onReorderRef.current(next, prevIdx, targetIdx);
+        }
+      };
+
+      const stepAutoScroll = () => {
+        if (!active) return;
+        if (scrollEl) {
+          const isDoc = scrollEl === document.scrollingElement || scrollEl === document.documentElement;
+          const topEdge = isDoc ? 0 : scrollEl.getBoundingClientRect().top;
+          const bottomEdge = isDoc ? window.innerHeight : scrollEl.getBoundingClientRect().bottom;
+          const zone = 56;
+          let delta = 0;
+          if (lastClientY < topEdge + zone) {
+            delta = -Math.ceil(((topEdge + zone - lastClientY) / zone) * 14);
+          } else if (lastClientY > bottomEdge - zone) {
+            delta = Math.ceil(((lastClientY - (bottomEdge - zone)) / zone) * 14);
+          }
+          if (delta !== 0) {
+            const before = scrollEl.scrollTop;
+            scrollEl.scrollTop += delta;
+            if (scrollEl.scrollTop !== before) {
+              checkSwap(lastClientY);
+            }
+          }
+        }
+        rafId = window.requestAnimationFrame(stepAutoScroll);
+      };
+
+      const finish = () => {
+        if (rafId) {
+          window.cancelAnimationFrame(rafId);
+          rafId = 0;
+        }
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        document.body.classList.remove("volo-is-sorting");
+        if (active && handleEl) {
+          try {
+            if (handleEl.hasPointerCapture?.(pointerId)) {
+              handleEl.releasePointerCapture(pointerId);
+            }
+          } catch {}
+        }
+        active = false;
+        cleanupRef.current = null;
+        setDraggingIdx(null);
+      };
+
+      const onMove = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        lastClientY = ev.clientY;
+        if (!active) {
+          if (Math.abs(ev.clientY - startY) < 4) return;
+          active = true;
+          document.body.classList.add("volo-is-sorting");
+          if (handleEl) {
+            try {
+              handleEl.setPointerCapture(pointerId);
+            } catch {}
+          }
+          setDraggingIdx(curIdx);
+          rafId = window.requestAnimationFrame(stepAutoScroll);
+        }
+        if (ev.cancelable) ev.preventDefault();
+        checkSwap(ev.clientY);
+      };
+
+      cleanupRef.current = finish;
+      window.addEventListener("pointermove", onMove, { passive: false });
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+  });
+
+  return { listRef, draggingIdx, getHandleProps };
+}
+

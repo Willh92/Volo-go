@@ -22,11 +22,14 @@ import {
   AnimatedModal,
   ConsoleEmpty,
   ConsoleSelect,
+  DragGripIcon,
+  MoveTopIcon,
   paginateItems,
   Pagination,
   SwitchToggle,
   TableSkeleton,
   UploadButton,
+  usePointerSortableList,
 } from "../components/UIControls";
 import { MediaPickButton } from "../components/MediaLibraryModal";
 import { CM6CssEditor } from "../components/CM6Editor";
@@ -132,6 +135,317 @@ function validateSchemaRequired(
   return null;
 }
 
+function SortableFixedOptsField({
+  fieldKey,
+  label,
+  reqMark,
+  description,
+  allOpts,
+  enabledKeys,
+  disabledOpts,
+  showNavPlacement,
+  primaryLimit,
+  onChange,
+}: {
+  fieldKey: string;
+  label: string;
+  reqMark: string;
+  description?: string;
+  allOpts: Array<{ value: string; label: string }>;
+  enabledKeys: string[];
+  disabledOpts: Array<{ value: string; label: string }>;
+  showNavPlacement: boolean;
+  primaryLimit: number;
+  onChange: (key: string, next: any) => void;
+}) {
+  const optMap = new Map(allOpts.map((o) => [o.value, o.label]));
+  const { listRef, draggingIdx, getHandleProps } = usePointerSortableList(
+    enabledKeys,
+    (next) => onChange(fieldKey, next),
+    enabledKeys.length > 1
+  );
+
+  const moveItem = (idx: number, delta: number) => {
+    const target = idx + delta;
+    if (target < 0 || target >= enabledKeys.length) return;
+    const next = [...enabledKeys];
+    const [picked] = next.splice(idx, 1);
+    next.splice(target, 0, picked);
+    onChange(fieldKey, next);
+  };
+
+  const moveToTop = (idx: number) => {
+    if (idx <= 0 || idx >= enabledKeys.length) return;
+    const next = [...enabledKeys];
+    const [picked] = next.splice(idx, 1);
+    next.unshift(picked);
+    onChange(fieldKey, next);
+  };
+
+  return (
+    <div class="volo-field">
+      <label>
+        {label}
+        {reqMark}
+      </label>
+      {description && <div class="volo-help">{description}</div>}
+      <div ref={listRef} class="volo-sortable-list">
+        {enabledKeys.map((k, idx) => {
+          const handleProps = getHandleProps(idx);
+          return (
+            <div
+              key={k}
+              data-sort-idx={idx}
+              class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""}`}
+            >
+              <div class="volo-sortable-main">
+                <span
+                  class={`volo-drag-handle ${enabledKeys.length < 2 ? "is-disabled" : ""}`}
+                  title={t("app.drag_sort")}
+                  aria-label={t("app.drag_sort")}
+                  {...(handleProps as any)}
+                >
+                  <DragGripIcon />
+                </span>
+                <SwitchToggle
+                  checked={true}
+                  onChange={(checked) => {
+                    if (!checked) {
+                      onChange(
+                        fieldKey,
+                        enabledKeys.filter((it) => it !== k)
+                      );
+                    }
+                  }}
+                />
+                <span
+                  class="volo-sortable-label"
+                  onPointerDown={(e) => {
+                    if (e.pointerType === "mouse") {
+                      handleProps.onPointerDown(e as unknown as PointerEvent);
+                    }
+                  }}
+                >
+                  {idx + 1}. {optMap.get(k) || k}
+                </span>
+              </div>
+              <div class="volo-sortable-acts">
+                {showNavPlacement && (
+                  <span class={`volo-badge ${idx < primaryLimit ? "volo-badge-ok" : ""}`}>
+                    {idx < primaryLimit ? t("app.nav_slot_primary") : t("app.nav_slot_more")}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  class="volo-act-btn"
+                  disabled={idx === 0}
+                  title={t("app.move_top")}
+                  aria-label={t("app.move_top")}
+                  onClick={() => moveToTop(idx)}
+                >
+                  <MoveTopIcon />
+                </button>
+                <button
+                  type="button"
+                  class="volo-act-btn"
+                  disabled={idx === 0}
+                  title={t("app.move_up")}
+                  aria-label={t("app.move_up")}
+                  onClick={() => moveItem(idx, -1)}
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  class="volo-act-btn"
+                  disabled={idx === enabledKeys.length - 1}
+                  title={t("app.move_down")}
+                  aria-label={t("app.move_down")}
+                  onClick={() => moveItem(idx, 1)}
+                >
+                  ↓
+                </button>
+              </div>
+            </div>
+          );
+        })}
+        {disabledOpts.map((opt) => (
+          <div key={opt.value} class="volo-sortable-row is-off">
+            <div class="volo-sortable-main">
+              <span class="volo-drag-handle is-disabled" aria-hidden="true">
+                <DragGripIcon />
+              </span>
+              <SwitchToggle
+                checked={false}
+                onChange={(checked) => {
+                  if (checked) {
+                    onChange(fieldKey, [...enabledKeys, opt.value]);
+                  }
+                }}
+                label={opt.label}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SortableFreeItemsField({
+  fieldKey,
+  label,
+  reqMark,
+  description,
+  ph,
+  items,
+  freeItemDraft,
+  setFreeItemDraft,
+  onChange,
+}: {
+  fieldKey: string;
+  label: string;
+  reqMark: string;
+  description?: string;
+  ph?: string;
+  items: string[];
+  freeItemDraft: string;
+  setFreeItemDraft: (v: string) => void;
+  onChange: (key: string, next: any) => void;
+}) {
+  const { listRef, draggingIdx, getHandleProps } = usePointerSortableList(
+    items,
+    (next) => onChange(fieldKey, next),
+    items.length > 1
+  );
+
+  const moveFree = (idx: number, delta: number) => {
+    const target = idx + delta;
+    if (target < 0 || target >= items.length) return;
+    const next = [...items];
+    const [picked] = next.splice(idx, 1);
+    next.splice(target, 0, picked);
+    onChange(fieldKey, next);
+  };
+
+  const moveFreeTop = (idx: number) => {
+    if (idx <= 0 || idx >= items.length) return;
+    const next = [...items];
+    const [picked] = next.splice(idx, 1);
+    next.unshift(picked);
+    onChange(fieldKey, next);
+  };
+
+  const addFree = () => {
+    const trimmed = freeItemDraft.trim();
+    if (!trimmed || items.includes(trimmed)) return;
+    onChange(fieldKey, [...items, trimmed]);
+    setFreeItemDraft("");
+  };
+
+  return (
+    <div class="volo-field">
+      <label>
+        {label}
+        {reqMark}
+      </label>
+      {description && <div class="volo-help">{description}</div>}
+      <div class="volo-input-row" style={{ marginBottom: items.length > 0 ? "6px" : 0 }}>
+        <input
+          type="text"
+          class="volo-input"
+          placeholder={ph || ""}
+          value={freeItemDraft}
+          onInput={(e) => setFreeItemDraft((e.currentTarget as HTMLInputElement).value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              addFree();
+            }
+          }}
+        />
+        <button type="button" class="volo-btn volo-btn-sm" onClick={addFree}>
+          +
+        </button>
+      </div>
+      {items.length > 0 && (
+        <div ref={listRef} class="volo-sortable-list">
+          {items.map((item, idx) => {
+            const handleProps = getHandleProps(idx);
+            return (
+              <div
+                key={`${item}-${idx}`}
+                data-sort-idx={idx}
+                class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""}`}
+              >
+                <div class="volo-sortable-main">
+                  <span
+                    class={`volo-drag-handle ${items.length < 2 ? "is-disabled" : ""}`}
+                    title={t("app.drag_sort")}
+                    aria-label={t("app.drag_sort")}
+                    {...(handleProps as any)}
+                  >
+                    <DragGripIcon />
+                  </span>
+                  <span
+                    class="volo-sortable-label"
+                    onPointerDown={(e) => {
+                      if (e.pointerType === "mouse") {
+                        handleProps.onPointerDown(e as unknown as PointerEvent);
+                      }
+                    }}
+                  >
+                    {idx + 1}. {item}
+                  </span>
+                </div>
+                <div class="volo-sortable-acts">
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    disabled={idx === 0}
+                    title={t("app.move_top")}
+                    aria-label={t("app.move_top")}
+                    onClick={() => moveFreeTop(idx)}
+                  >
+                    <MoveTopIcon />
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    disabled={idx === 0}
+                    title={t("app.move_up")}
+                    aria-label={t("app.move_up")}
+                    onClick={() => moveFree(idx, -1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    disabled={idx === items.length - 1}
+                    title={t("app.move_down")}
+                    aria-label={t("app.move_down")}
+                    onClick={() => moveFree(idx, 1)}
+                  >
+                    ↓
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-act-btn danger"
+                    onClick={() => onChange(fieldKey, items.filter((_, i) => i !== idx))}
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SchemaFieldControl({
   field: f,
   values,
@@ -193,161 +507,35 @@ function SchemaFieldControl({
       const showNavPlacement = f.key === "header_nav_items";
       const primaryLimit = Math.max(0, Number(values.header_nav_primary_count ?? 5));
 
-      const moveItem = (idx: number, delta: number) => {
-        const target = idx + delta;
-        if (target < 0 || target >= enabledKeys.length) return;
-        const next = [...enabledKeys];
-        const [picked] = next.splice(idx, 1);
-        next.splice(target, 0, picked);
-        onChange(f.key, next);
-      };
-
       return (
-        <div class="volo-field">
-          <label>
-            {label}
-            {reqMark}
-          </label>
-          {f.description && <div class="volo-help">{f.description}</div>}
-          <div class="volo-sortable-list">
-            {enabledKeys.map((k, idx) => (
-              <div key={k} class="volo-sortable-row">
-                <SwitchToggle
-                  checked={true}
-                  onChange={(checked) => {
-                    if (!checked) {
-                      onChange(
-                        f.key,
-                        enabledKeys.filter((it) => it !== k),
-                      );
-                    }
-                  }}
-                  label={`${idx + 1}. ${optMap.get(k) || k}`}
-                />
-                <div class="volo-sortable-acts">
-                  {showNavPlacement && (
-                    <span class={`volo-badge ${idx < primaryLimit ? "volo-badge-ok" : ""}`}>
-                      {idx < primaryLimit ? t("app.nav_slot_primary") : t("app.nav_slot_more")}
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    disabled={idx === 0}
-                    title={t("app.move_up")}
-                    onClick={() => moveItem(idx, -1)}
-                  >
-                    ↑
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    disabled={idx === enabledKeys.length - 1}
-                    title={t("app.move_down")}
-                    onClick={() => moveItem(idx, 1)}
-                  >
-                    ↓
-                  </button>
-                </div>
-              </div>
-            ))}
-            {disabledOpts.map((opt) => (
-              <div key={opt.value} class="volo-sortable-row is-off">
-                <SwitchToggle
-                  checked={false}
-                  onChange={(checked) => {
-                    if (checked) {
-                      onChange(f.key, [...enabledKeys, opt.value]);
-                    }
-                  }}
-                  label={opt.label}
-                />
-              </div>
-            ))}
-          </div>
-        </div>
+        <SortableFixedOptsField
+          fieldKey={f.key}
+          label={label}
+          reqMark={reqMark}
+          description={f.description}
+          allOpts={allOpts}
+          enabledKeys={enabledKeys}
+          disabledOpts={disabledOpts}
+          showNavPlacement={showNavPlacement}
+          primaryLimit={primaryLimit}
+          onChange={onChange}
+        />
       );
     }
 
     const items: string[] = (Array.isArray(rawCur) ? rawCur : []).map((v: any) => String(v)).filter(Boolean);
-    const moveFree = (idx: number, delta: number) => {
-      const target = idx + delta;
-      if (target < 0 || target >= items.length) return;
-      const next = [...items];
-      const [picked] = next.splice(idx, 1);
-      next.splice(target, 0, picked);
-      onChange(f.key, next);
-    };
-    const addFree = () => {
-      const trimmed = freeItemDraft.trim();
-      if (!trimmed || items.includes(trimmed)) return;
-      onChange(f.key, [...items, trimmed]);
-      setFreeItemDraft("");
-    };
     return (
-      <div class="volo-field">
-        <label>
-          {label}
-          {reqMark}
-        </label>
-        {f.description && <div class="volo-help">{f.description}</div>}
-        <div class="volo-input-row" style={{ marginBottom: items.length > 0 ? "6px" : 0 }}>
-          <input
-            type="text"
-            class="volo-input"
-            placeholder={ph || ""}
-            value={freeItemDraft}
-            onInput={(e) => setFreeItemDraft((e.currentTarget as HTMLInputElement).value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                addFree();
-              }
-            }}
-          />
-          <button type="button" class="volo-btn volo-btn-sm" onClick={addFree}>
-            +
-          </button>
-        </div>
-        {items.length > 0 && (
-          <div class="volo-sortable-list">
-            {items.map((item, idx) => (
-              <div key={`${item}-${idx}`} class="volo-sortable-row">
-                <span style={{ fontSize: "13px", overflowWrap: "anywhere" }}>
-                  {idx + 1}. {item}
-                </span>
-                <div class="volo-sortable-acts">
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    disabled={idx === 0}
-                    title={t("app.move_up")}
-                    onClick={() => moveFree(idx, -1)}
-                  >
-                    ↑
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-act-btn"
-                    disabled={idx === items.length - 1}
-                    title={t("app.move_down")}
-                    onClick={() => moveFree(idx, 1)}
-                  >
-                    ↓
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-act-btn danger"
-                    onClick={() => onChange(f.key, items.filter((_, i) => i !== idx))}
-                  >
-                    ×
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+      <SortableFreeItemsField
+        fieldKey={f.key}
+        label={label}
+        reqMark={reqMark}
+        description={f.description}
+        ph={ph}
+        items={items}
+        freeItemDraft={freeItemDraft}
+        setFreeItemDraft={setFreeItemDraft}
+        onChange={onChange}
+      />
     );
   }
 

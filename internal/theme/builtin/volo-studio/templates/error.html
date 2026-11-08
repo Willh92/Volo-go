@@ -11,7 +11,7 @@
   <span class="volo-badge studio-error-card__code">{{if .StatusCode}}{{.StatusCode}}{{else}}404{{end}}</span>
   <h1 class="studio-error-card__title">{{coalesce .ErrorMessage (t .Locale "error.default_title")}}</h1>
   <p class="studio-error-card__hint">
-    {{if eq .StatusCode 404}}{{t .Locale "error.hint_404"}}{{else}}{{t .Locale "error.hint_default"}}{{end}}
+    {{if eq .StatusCode 404}}{{t .Locale "error.hint_404"}}{{else if eq .StatusCode 403}}{{t .Locale "error.hint_403"}}{{else if eq .StatusCode 429}}{{t .Locale "error.hint_429"}}{{else}}{{t .Locale "error.hint_default"}}{{end}}
   </p>
   <div class="studio-error-card__actions">
     <a class="volo-btn" href="/">{{t .Locale "error.back_home"}}</a>

@@ -37,6 +37,7 @@ import {
   localizeAuditAction,
   localizeAuditResource,
   localizeBackupTable,
+  localizeWafReason,
   t,
 } from "../i18n";
 
@@ -3676,7 +3677,11 @@ export function SystemWorkspace({
                           </td>
                           <td class="col-fluid" data-label={t("tbl.col_note")}>
                             <div class="volo-cell-meta">
-                              <span>{b.note || b.reason || "—"}</span>
+                              <span>
+                                {b.reason_code
+                                  ? `${localizeWafReason(b.reason_code)}${b.note && !String(b.note).startsWith("auto-ban:") ? ` · ${b.note}` : ""}`
+                                  : b.note || b.reason || "—"}
+                              </span>
                               <span>{b.expires_at > 0 ? formatDateTime(b.expires_at) : t("sys.waf_dur_perm")}</span>
                             </div>
                           </td>
@@ -4877,7 +4882,7 @@ export function SystemWorkspace({
             </div>
             <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
               {logStats && (
-                <span class="volo-code-chip">
+                <span class="volo-code-chip is-wrap">
                   {t("sys.logs_stats", {
                     count: logStats.total ?? runtimeLogs.length,
                     cap: logStats.capacity ?? 400,

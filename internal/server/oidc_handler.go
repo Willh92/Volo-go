@@ -196,7 +196,7 @@ func (s *AppServer) handleOIDCAuthRoutes(w http.ResponseWriter, r *http.Request)
 	if sub == "providers" {
 		rawTarget := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("target")))
 		if rawTarget != "" && rawTarget != "admin" && rawTarget != "reader" && rawTarget != "bind" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target must be admin, reader, or bind"})
+			writeErrJSON(w, http.StatusBadRequest, "target must be admin, reader, or bind")
 			return
 		}
 		if rawTarget == "" {
@@ -204,7 +204,7 @@ func (s *AppServer) handleOIDCAuthRoutes(w http.ResponseWriter, r *http.Request)
 		}
 		rawNext := strings.TrimSpace(r.URL.Query().Get("next"))
 		if rawNext != "" && !isSafeRelativeRedirect(rawNext) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid next redirect path"})
+			writeErrJSON(w, http.StatusBadRequest, "invalid next redirect path")
 			return
 		}
 		views := s.listOIDCProviderViews(s.resolveLocale(r), rawTarget, rawNext)

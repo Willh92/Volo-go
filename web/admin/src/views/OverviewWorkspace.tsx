@@ -344,8 +344,8 @@ function MonthlyArticlesChart({
         <div
           class="volo-chart-tooltip"
           style={{
-            left: activeCx > W * 0.62 ? "auto" : `${Math.max(6, (activeCx / W) * 100)}%`,
-            right: activeCx > W * 0.62 ? `${Math.max(6, ((W - activeCx) / W) * 100)}%` : "auto",
+            left: activeCx > W * 0.5 ? "auto" : `${Math.max(4, (activeCx / W) * 100)}%`,
+            right: activeCx > W * 0.5 ? `${Math.max(4, ((W - activeCx) / W) * 100)}%` : "auto",
           }}
         >
           <div style={{ fontWeight: 650 }}>{active.month}</div>
@@ -554,7 +554,7 @@ function DonutChart({
                   {dispName}
                 </span>
               </div>
-              <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", whiteSpace: "nowrap" }} title={val.toLocaleString()}>
+              <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", whiteSpace: "nowrap", flexShrink: 0 }} title={val.toLocaleString()}>
                 {formatCompactNum(val)} ({pct}%)
               </span>
             </div>
@@ -580,7 +580,19 @@ export function OverviewWorkspace({
   const [trendDays, setTrendDays] = useState<7 | 30>(7);
   const [monthlyRangeMode, setMonthlyRangeMode] = useState<"auto" | "12m" | "history">("auto");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [isNarrowChart, setIsNarrowChart] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.matchMedia("(max-width: 640px)").matches : false
+  );
   const chartStageRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mql = window.matchMedia("(max-width: 640px)");
+    const onChange = (ev: MediaQueryListEvent) => setIsNarrowChart(ev.matches);
+    setIsNarrowChart(mql.matches);
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
   const [articles, setArticles] = useState<any[]>([]);
   const [artTotal, setArtTotal] = useState<number>(0);
   const [artPageSize, setArtPageSize] = useState<number>(20);
@@ -2821,10 +2833,10 @@ export function OverviewWorkspace({
   const rangePV = rawSeries.reduce((acc, item) => acc + Number(item.pv || 0), 0);
   const rangeUV = rawSeries.reduce((acc, item) => acc + Number(item.uv || 0), 0);
 
-  const W = 860;
-  const H = 228;
-  const padL = 52;
-  const padR = 34;
+  const W = isNarrowChart ? 460 : 860;
+  const H = isNarrowChart ? 204 : 228;
+  const padL = isNarrowChart ? 40 : 52;
+  const padR = isNarrowChart ? 18 : 34;
   const padT = 18;
   const padB = 32;
   const plotW = W - padL - padR;
@@ -2852,7 +2864,7 @@ export function OverviewWorkspace({
     uvPts.length > 0
       ? `${uvLine} L ${uvPts[uvPts.length - 1].x.toFixed(1)} ${(padT + plotH).toFixed(1)} L ${uvPts[0].x.toFixed(1)} ${(padT + plotH).toFixed(1)} Z`
       : "";
-  const xLabelStep = n <= 10 ? 1 : Math.ceil(n / 8);
+  const xLabelStep = isNarrowChart ? (n <= 7 ? 1 : Math.ceil(n / 5)) : n <= 10 ? 1 : Math.ceil(n / 8);
   const minTickGap = Math.max(1, Math.floor(xLabelStep * 0.6));
   const topArticles: any[] = overview?.top_articles || [];
   const topReferers: any[] = overview?.top_referers || [];
@@ -3026,8 +3038,8 @@ export function OverviewWorkspace({
               <div
                 class="volo-chart-tooltip"
                 style={{
-                  left: activePvPt.x > W * 0.68 ? "auto" : `${Math.max(5, (activePvPt.x / W) * 100)}%`,
-                  right: activePvPt.x > W * 0.68 ? `${Math.max(5, ((W - activePvPt.x) / W) * 100)}%` : "auto",
+                  left: activePvPt.x > W * 0.5 ? "auto" : `${Math.max(4, (activePvPt.x / W) * 100)}%`,
+                  right: activePvPt.x > W * 0.5 ? `${Math.max(4, ((W - activePvPt.x) / W) * 100)}%` : "auto",
                 }}
               >
                 <div style={{ fontWeight: 650, marginBottom: "2px" }}>{activeTrend.stat_date}</div>
@@ -3332,17 +3344,17 @@ export function OverviewWorkspace({
           ) : (
             <div>
               {recentLogs.slice(0, 6).map((lg: any) => (
-                <div key={lg.id} class="volo-rank-row">
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
+                <div key={lg.id} class="volo-rank-row volo-audit-rank-row">
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0, flex: "1 1 0" }}>
                     <span class="volo-code-chip" title={lg.action}>
                       {localizeAuditAction(lg.action)}
                     </span>
-                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "13px" }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "13px", minWidth: 0 }}>
                       <strong>{lg.actor_name || "-"}</strong>
                       {lg.resource_type ? ` · ${localizeAuditResource(lg.resource_type)}` : ""}
                     </span>
                   </div>
-                  <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", fontSize: "11.5px", whiteSpace: "nowrap" }}>
+                  <span class="volo-help volo-audit-rank-time" style={{ fontFamily: "var(--volo-mono)", fontSize: "11.5px", whiteSpace: "nowrap", flexShrink: 0 }}>
                     {formatDateTime(lg.created_at)}
                   </span>
                 </div>
@@ -3356,7 +3368,7 @@ export function OverviewWorkspace({
       {overview?.plugin_cards?.length > 0 && (
         <div class="volo-grid-2">
           {overview.plugin_cards.map((c: any, idx: number) => (
-            <div key={idx} class="volo-card" dangerouslySetInnerHTML={{ __html: c.html || "" }} />
+            <div key={idx} class="volo-card" style={{ overflowX: "auto" }} dangerouslySetInnerHTML={{ __html: c.html || "" }} />
           ))}
         </div>
       )}
