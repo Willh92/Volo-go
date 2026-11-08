@@ -649,6 +649,7 @@ func (s *AppServer) reloadRuntimeAfterDBRestore(ctx context.Context) {
 		_, _ = s.deps.Settings.Reload(ctx)
 	}
 	s.syncConfiguredUploadDir()
+	_ = s.syncConfiguredGeoIPDir()
 	if s.deps.WAF != nil {
 		_ = s.deps.WAF.ReloadBans(ctx)
 	}

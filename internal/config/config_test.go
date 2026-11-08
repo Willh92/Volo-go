@@ -265,3 +265,80 @@ func TestListenSocketAutoTrustUnixUnlessExplicitEmpty(t *testing.T) {
 	}
 }
 
+func TestValidateCustomGeoIPPathAndRuntimeSetGeoIPDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "data")
+	uploadDir := filepath.Join(tmpDir, "uploads")
+	for _, d := range []string{dataDir, uploadDir} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg, err := LoadWithEnviron(CLIOverrides{
+		EnvFile:   filepath.Join(tmpDir, "missing.env"),
+		DataDir:   &dataDir,
+		UploadDir: &uploadDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf("LoadWithEnviron: %v", err)
+	}
+
+	defGeo := cfg.GetDefaultGeoIPDir()
+	if defGeo != filepath.Join(dataDir, "geoip") || cfg.GetGeoIPDir() != defGeo {
+		t.Fatalf("unexpected default GeoIP dir: default=%q active=%q", defGeo, cfg.GetGeoIPDir())
+	}
+
+	// Valid custom directory & direct .mmdb/.xdb file targets
+	customDir := filepath.Join(tmpDir, "custom-geo")
+	customMMDB := filepath.Join(customDir, "GeoLite2-City.mmdb")
+	if v, err := cfg.ValidateCustomGeoIPPath(customDir); err != nil || v == "" {
+		t.Fatalf("expected custom GeoIP dir to pass validation: v=%q err=%v", v, err)
+	}
+	if v, err := cfg.ValidateCustomGeoIPPath(customMMDB); err != nil || v == "" {
+		t.Fatalf("expected direct .mmdb file path to pass validation: v=%q err=%v", v, err)
+	}
+	if v, err := cfg.ValidateCustomGeoIPPath("/usr/share/GeoIP"); err != nil || v == "" {
+		t.Fatalf("expected /usr/share/GeoIP to be permitted: v=%q err=%v", v, err)
+	}
+
+	// SetGeoIPDir overrides active path and "" resets to DefaultGeoIPDir
+	cfg.SetGeoIPDir(customDir)
+	if got := cfg.GetGeoIPDir(); got != customDir {
+		t.Fatalf("GetGeoIPDir after SetGeoIPDir = %q, want %q", got, customDir)
+	}
+	cfg.SetGeoIPDir("")
+	if got := cfg.GetGeoIPDir(); got != defGeo {
+		t.Fatalf("GetGeoIPDir after reset = %q, want %q", got, defGeo)
+	}
+
+	// Reject traversal, OS roots, dataDir enclosure, upload overlap, bad extensions, and symlinks
+	symPath := filepath.Join(tmpDir, "geo-link")
+	_ = os.MkdirAll(customDir, 0o750)
+	_ = os.Symlink(customDir, symPath)
+	txtFile := filepath.Join(tmpDir, "notes.txt")
+	_ = os.WriteFile(txtFile, []byte("hello"), 0o600)
+
+	for _, bad := range []string{
+		"../outside",
+		"/etc",
+		"/etc/GeoIP",
+		"/proc/self",
+		dataDir,
+		uploadDir,
+		filepath.Join(uploadDir, "geo"),
+		filepath.Join(tmpDir, "volo.db"),
+		txtFile,
+		symPath,
+	} {
+		if _, err := cfg.ValidateCustomGeoIPPath(bad); err == nil {
+			t.Fatalf("expected unsafe GeoIP path %q to be rejected", bad)
+		}
+	}
+
+	// Also verify ValidateCustomUploadDir cannot overlap DefaultGeoIPDir
+	if _, err := cfg.ValidateCustomUploadDir(defGeo); err == nil {
+		t.Fatalf("expected ValidateCustomUploadDir to reject DefaultGeoIPDir %q", defGeo)
+	}
+}
+

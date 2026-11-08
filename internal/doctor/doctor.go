@@ -17,6 +17,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/migrate"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/security"
 )
 
 const (
@@ -404,13 +405,28 @@ func checkGeoIPAssets(ctx context.Context, cfg *config.Config, store *sqlx.Store
 	}
 
 	activeGeoRules := 0
+	effectivePath := cfg.GetGeoIPDir()
 	if store != nil {
 		_ = store.QueryRowContext(ctx,
 			store.Dialect().Rebind(`SELECT COUNT(*) FROM security_geo_rules WHERE is_enabled = ?`), true,
 		).Scan(&activeGeoRules)
+
+		if effectivePath == cfg.GetDefaultGeoIPDir() {
+			var secJSON string
+			if err := store.QueryRowContext(ctx, store.Dialect().Rebind(`SELECT value_json FROM settings WHERE domain = ?`), "security").Scan(&secJSON); err == nil && secJSON != "" {
+				var sec struct {
+					GeoIPDir string `json:"geoip_dir"`
+				}
+				if json.Unmarshal([]byte(secJSON), &sec) == nil && strings.TrimSpace(sec.GeoIPDir) != "" {
+					if validPath, vErr := cfg.ValidateCustomGeoIPPath(sec.GeoIPDir); vErr == nil && validPath != "" {
+						effectivePath = validPath
+					}
+				}
+			}
+		}
 	}
 
-	dispDir := cleanDisplayPath(cfg.GeoIPDir)
+	dispDir := cleanDisplayPath(effectivePath)
 	if dispDir == "" {
 		if activeGeoRules > 0 {
 			return CheckResult{
@@ -429,27 +445,29 @@ func checkGeoIPAssets(ctx context.Context, cfg *config.Config, store *sqlx.Store
 		}
 	}
 
-	entries, err := os.ReadDir(cfg.GeoIPDir)
-	var found []string
-	if err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			low := strings.ToLower(e.Name())
-			if strings.HasSuffix(low, ".mmdb") || strings.HasSuffix(low, ".xdb") {
-				found = append(found, e.Name())
-			}
+	st, _ := security.InspectGeoIPPath(effectivePath)
+	if len(st.ActiveFiles) > 0 {
+		filesStr := strings.Join(st.ActiveFiles, ", ")
+		if len(st.SkippedFiles) > 0 {
+			filesStr = fmt.Sprintf("%s (ignored: %s)", filesStr, strings.Join(st.SkippedFiles, ", "))
 		}
-	}
-	if len(found) > 0 {
-		filesStr := strings.Join(found, ", ")
 		return CheckResult{
 			Name:    "geoip",
 			Status:  StatusOK,
 			Code:    "geoip_ready_ok",
 			Params:  map[string]string{"files": filesStr},
 			Summary: fmt.Sprintf("offline GeoIP databases ready: %s", filesStr),
+		}
+	}
+
+	if len(st.SkippedFiles) > 0 {
+		skippedStr := strings.Join(st.SkippedFiles, ", ")
+		return CheckResult{
+			Name:    "geoip",
+			Status:  StatusWarn,
+			Code:    "geoip_unusable_warn",
+			Params:  map[string]string{"dir": dispDir, "skipped": skippedStr},
+			Summary: fmt.Sprintf("no usable regional GeoIP database in %s (skipped: %s)", dispDir, skippedStr),
 		}
 	}
 

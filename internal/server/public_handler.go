@@ -125,7 +125,18 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		deps.Auth = auth.NewService(deps.Store, deps.Config.KeyRing, deps.Settings, pubURL)
 	}
 	if deps.Geo == nil {
-		deps.Geo = security.NewGeoEngine(deps.Config.GeoIPDir, deps.Settings)
+		if deps.Config != nil && deps.Settings != nil {
+			if rawGeo := strings.TrimSpace(deps.Settings.Snapshot().Security.GeoIPDir); rawGeo != "" {
+				if validGeo, vErr := deps.Config.ValidateCustomGeoIPPath(rawGeo); vErr == nil && validGeo != "" {
+					deps.Config.SetGeoIPDir(validGeo)
+				}
+			}
+		}
+		geoDir := ""
+		if deps.Config != nil {
+			geoDir = deps.Config.GetGeoIPDir()
+		}
+		deps.Geo = security.NewGeoEngine(geoDir, deps.Settings)
 		_ = deps.Geo.ReloadRules(context.Background(), deps.Store)
 	}
 	if deps.WAF == nil {

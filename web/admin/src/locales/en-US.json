@@ -1637,5 +1637,17 @@
   "sys.waf_reason_manual_ban": "Manual administrator ban",
   "sys.waf_reason_comment_spam": "Honeypot & comment spam block",
   "sys.waf_reason_malicious_ua": "Malicious bot & signature block",
-  "sys.waf_reason_exploit_probe": "Exploit payload probe"
+  "sys.waf_reason_exploit_probe": "Exploit payload probe",
+  "audit.act.sec_geo_reload": "Reload GeoIP Databases",
+  "sys.doc_geoip_unusable_warn": "No usable regional GeoIP database in {dir} (ignored: {skipped})",
+  "sys.geo_db_sub_title": "Offline GeoIP Database Path & Hot-Reload",
+  "sys.geo_dir_label": "Offline GeoIP Directory or File Path (optional)",
+  "sys.geo_dir_hint": "Leave blank to use default ({dir}); accepts a directory (auto-ranks MMDB + dual IPv4/IPv6 XDB) or a direct .mmdb / .xdb file path, hot-reloading immediately without server restart.",
+  "sys.geo_save_path_btn": "Save Path & Hot-Reload",
+  "sys.geo_reload_btn": "Hot-Reload Databases",
+  "sys.geo_reloaded_toast": "Offline GeoIP databases hot-reloaded ({count} active)",
+  "sys.geo_status_active": "Mounted & Active:",
+  "sys.geo_status_empty": "No offline database loaded at {path}",
+  "sys.geo_status_skipped": "Ignored: {files}"
 }
+

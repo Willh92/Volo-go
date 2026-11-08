@@ -670,6 +670,7 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		v.DynamicLoginPath = normDyn
+		v.GeoIPDir = strings.TrimSpace(StripASCIIControls(v.GeoIPDir))
 		return json.Marshal(v)
 	case domain.SettingsDomainAppearance:
 		v := def.Appearance
