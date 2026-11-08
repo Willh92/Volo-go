@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -100,10 +101,28 @@ func Run(ctx context.Context, cfg *config.Config, store *sqlx.Store) *Report {
 
 	// 6. Admin Console Path Cloaking Posture
 	adminPath := "/console"
-	if cfg != nil && strings.TrimSpace(cfg.AdminPath) != "" {
-		adminPath = cfg.AdminPath
+	isCustomAdmin := false
+	if cfg != nil {
+		if strings.TrimSpace(cfg.AdminPath) != "" {
+			adminPath = cfg.AdminPath
+		}
+		isCustomAdmin = cfg.IsCustomAdminPath
 	}
-	if cfg != nil && cfg.IsCustomAdminPath {
+	if store != nil {
+		var secJSON string
+		if err := store.QueryRowContext(ctx, store.Dialect().Rebind(`SELECT value_json FROM settings WHERE domain = ?`), "security").Scan(&secJSON); err == nil && secJSON != "" {
+			var sec struct {
+				DynamicLoginPath string `json:"dynamic_login_path"`
+			}
+			if json.Unmarshal([]byte(secJSON), &sec) == nil {
+				if dyn := "/" + strings.Trim(strings.TrimSpace(sec.DynamicLoginPath), "/"); dyn != "/" {
+					adminPath = dyn
+					isCustomAdmin = dyn != "/console" || isCustomAdmin
+				}
+			}
+		}
+	}
+	if isCustomAdmin {
 		add(CheckResult{
 			Name:    "admin_stealth_path",
 			Status:  StatusOK,

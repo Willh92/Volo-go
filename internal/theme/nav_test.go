@@ -25,7 +25,7 @@ func TestResolveNavMenuDefaultPlacesCustomLinksLast(t *testing.T) {
 		NavItems: []content.PublicNavNode{
 			{ID: "n1", Title: "About", URL: "/posts/about"},
 			{ID: "n2", Title: "AdminSkip", URL: "/admin"},
-			{ID: "n3", Title: "GitHub", URL: "https://github.com/Willh92/Volo-go", OpenInNewTab: true, Icon: "github"},
+			{ID: "n3", Title: "GitHub", URL: "https://github.com/example/repo", OpenInNewTab: true, Icon: "github"},
 		},
 	}
 
@@ -33,7 +33,7 @@ func TestResolveNavMenuDefaultPlacesCustomLinksLast(t *testing.T) {
 	if len(menu.Items) != 11 {
 		t.Fatalf("expected 11 resolved items (9 builtin + 2 custom), got %d", len(menu.Items))
 	}
-	if menu.Items[len(menu.Items)-2].URL != "/posts/about" || menu.Items[len(menu.Items)-1].URL != "https://github.com/Willh92/Volo-go" {
+	if menu.Items[len(menu.Items)-2].URL != "/posts/about" || menu.Items[len(menu.Items)-1].URL != "https://github.com/example/repo" {
 		t.Fatalf("expected custom links after last builtin item, got %+v and %+v", menu.Items[len(menu.Items)-2], menu.Items[len(menu.Items)-1])
 	}
 	if len(menu.Primary) != DefaultNavPrimaryCount {
@@ -244,4 +244,61 @@ func TestDualCDNAssetAndVendorUnifiedRuntime(t *testing.T) {
 		t.Fatalf("ServeAsset Access-Control-Allow-Origin = %q, want *", got)
 	}
 }
+
+func TestResolveNavMenuIndividualCustomItemsAndSafeDeletion(t *testing.T) {
+	eng, err := NewEngine(nil, "../../themes")
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// 1. Individual custom:<id> items interleaved freely with built-in items and split across Primary/Overflow
+	pctx := PageContext{
+		ThemeID:     DefaultThemeID,
+		Locale:      "zh-CN",
+		CurrentPath: "/projects",
+		ThemeConfig: map[string]any{
+			"header_nav_items":         []any{"custom:Nav_Proj", "home", "custom:Nav_About", "archives"},
+			"header_nav_seen_custom":   []any{"Nav_Proj", "Nav_About", "Nav_Hidden"},
+			"header_nav_primary_count": float64(2),
+		},
+		NavItems: []content.PublicNavNode{
+			{ID: "Nav_About", Title: "关于", URL: "/about"},
+			{ID: "Nav_Proj", Title: "作品集", URL: "/projects"},
+			{ID: "Nav_Hidden", Title: "已取消勾选", URL: "/hidden"},
+			{ID: "Nav_New", Title: "新外链", URL: "https://docs.example.com", OpenInNewTab: true},
+		},
+	}
+
+	menu := eng.ResolveNavMenu(pctx)
+	// Expected: custom:Nav_Proj, home, custom:Nav_About, archives, plus unseen Nav_New auto-appended (Nav_Hidden stays hidden!)
+	wantURLs := []string{"/projects", "/", "/about", "/archives", "https://docs.example.com"}
+	if len(menu.Items) != len(wantURLs) {
+		t.Fatalf("expected %d items, got %d: %+v", len(wantURLs), len(menu.Items), menu.Items)
+	}
+	for i, u := range wantURLs {
+		if menu.Items[i].URL != u {
+			t.Fatalf("menu.Items[%d].URL = %q, want %q", i, menu.Items[i].URL, u)
+		}
+	}
+	if len(menu.Primary) != 2 || menu.Primary[0].URL != "/projects" || !menu.Primary[0].IsActive || len(menu.Overflow) != 3 {
+		t.Fatalf("unexpected Primary/Overflow split: primary=%+v overflow=%+v", menu.Primary, menu.Overflow)
+	}
+
+	// 2. Delete Nav_Proj from NavItems -> stale "custom:Nav_Proj" in ThemeConfig is silently skipped without dead link!
+	pctx.NavItems = []content.PublicNavNode{
+		{ID: "Nav_About", Title: "关于", URL: "/about"},
+		{ID: "Nav_Hidden", Title: "已取消勾选", URL: "/hidden"},
+	}
+	menuAfterDelete := eng.ResolveNavMenu(pctx)
+	wantAfterDelete := []string{"/", "/about", "/archives"}
+	if len(menuAfterDelete.Items) != len(wantAfterDelete) {
+		t.Fatalf("expected %d items after custom nav deletion, got %d: %+v", len(wantAfterDelete), len(menuAfterDelete.Items), menuAfterDelete.Items)
+	}
+	for i, u := range wantAfterDelete {
+		if menuAfterDelete.Items[i].URL != u {
+			t.Fatalf("menuAfterDelete.Items[%d].URL = %q, want %q", i, menuAfterDelete.Items[i].URL, u)
+		}
+	}
+}
+
 

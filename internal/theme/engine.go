@@ -28,7 +28,7 @@ import (
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
-//go:embed builtin/volo-studio/theme.json builtin/volo-studio/preview.svg builtin/volo-studio/templates_gz/* builtin/volo-studio/assets_gz/*
+//go:embed builtin/volo-studio/theme.json.gz builtin/volo-studio/preview.svg.gz builtin/volo-studio/templates_gz/* builtin/volo-studio/assets_gz/*
 var builtinThemeFS embed.FS
 
 const DefaultThemeID = "volo-studio"
@@ -485,7 +485,19 @@ func (e *Engine) Reload() error {
 func (e *Engine) inspectThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*loadedTheme, error) {
 	rawManifest, err := fs.ReadFile(fsys, "theme.json")
 	if err != nil {
-		return nil, err
+		gzManifest, gzErr := fs.ReadFile(fsys, "theme.json.gz")
+		if gzErr != nil {
+			return nil, err
+		}
+		gr, rErr := gzip.NewReader(bytes.NewReader(gzManifest))
+		if rErr != nil {
+			return nil, rErr
+		}
+		rawManifest, err = io.ReadAll(io.LimitReader(gr, maxExternalAssetSingleBytes))
+		_ = gr.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
 	var mf Manifest
 	if err := json.Unmarshal(rawManifest, &mf); err != nil {
@@ -700,6 +712,11 @@ func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 		for _, cand := range previewCandidates {
 			if rawPrev, ok := readBoundedThemeFile(th.fsys, cand, enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes); ok && len(rawPrev) > 0 {
 				previewAsset = buildCachedAssetWithWriter(rawPrev, cand, zw, &gzBuf)
+				hasPreview = true
+				break
+			}
+			if gzPrev, ok := readBoundedThemeFile(th.fsys, cand+".gz", enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes); ok && len(gzPrev) > 0 {
+				previewAsset = buildPrecompressedAsset(gzPrev, cand)
 				hasPreview = true
 				break
 			}

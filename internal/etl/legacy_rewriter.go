@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -556,7 +557,7 @@ func legacySystemRoute(relPath string, adminPath string) (string, bool) {
 	switch relPath {
 	case "/admin-index.do", "/admin/index.do", "/start":
 		return adminPath, true
-	case "/archives.html":
+	case "/archives.html", "/archive.html", "/archive", "/archivedate.html":
 		return "/archives", true
 	case "/tags.html":
 		return "/tags", true
@@ -570,9 +571,21 @@ func legacySystemRoute(relPath string, adminPath string) (string, bool) {
 		return "/dynamic", true
 	case "/rss.do":
 		return "/rss.xml", true
-	default:
-		return "", false
 	}
+	for _, pfx := range []string{"/archives/", "/archive/", "/archivedate/"} {
+		if strings.HasPrefix(relPath, pfx) {
+			sub := strings.Trim(strings.TrimSuffix(relPath[len(pfx):], ".html"), "/")
+			parts := strings.Split(sub, "/")
+			if len(parts) == 2 && len(parts[0]) == 4 && (len(parts[1]) == 1 || len(parts[1]) == 2) {
+				if yr, e1 := strconv.Atoi(parts[0]); e1 == nil && yr >= 1900 && yr <= 9999 {
+					if mo, e2 := strconv.Atoi(parts[1]); e2 == nil && mo >= 1 && mo <= 12 {
+						return fmt.Sprintf("/archives/%04d-%02d", yr, mo), true
+					}
+				}
+			}
+		}
+	}
+	return "", false
 }
 
 func isInternalSitePath(relPath string) bool {

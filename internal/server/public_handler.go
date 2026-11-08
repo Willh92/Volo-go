@@ -215,12 +215,11 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		deps.ExtraMuxSetup(mux)
 	}
 
-	var root http.Handler = mux
-	adminPath := config.DefaultAdminPath
-	if deps.Config != nil && deps.Config.AdminPath != "" {
-		adminPath = deps.Config.AdminPath
-	}
-	root = wrapPublicDynamicGzip(root, adminPath)
+	var root http.Handler = s.withDynamicAdminMount(mux)
+	root = wrapPublicDynamicGzip(root, func() string {
+		p, _ := s.effectiveAdminPrefix()
+		return p
+	})
 	root = s.withRedirectGuardian(root)
 	if deps.WAF != nil {
 		root = deps.WAF.WrapHTTP(root)
@@ -345,6 +344,11 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 
 	// Legacy Bolo-Solo 301 Canonical Skin Routes & Compatibility Shims
 	mux.HandleFunc("/archives.html", s.permanentRedirectTo("/archives"))
+	mux.HandleFunc("/archive.html", s.permanentRedirectTo("/archives"))
+	mux.HandleFunc("/archivedate.html", s.permanentRedirectTo("/archives"))
+	mux.HandleFunc("/archive", s.permanentRedirectTo("/archives"))
+	mux.HandleFunc("/archive/", s.handleLegacyArchiveRedirect)
+	mux.HandleFunc("/archivedate/", s.handleLegacyArchiveRedirect)
 	mux.HandleFunc("/tags.html", s.permanentRedirectTo("/tags"))
 	mux.HandleFunc("/categories.html", s.permanentRedirectTo("/categories"))
 	mux.HandleFunc("/links.html", s.permanentRedirectTo("/links"))
@@ -380,18 +384,18 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 }
 
 func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
-	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
-	if adminPrefix == "/" {
-		adminPrefix = "/console"
-	}
+	staticAdmin := s.staticAdminPrefix()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		adminPrefix, _ := s.effectiveAdminPrefix()
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 			p != "/" &&
 			p != "/setup" &&
 			!strings.HasPrefix(p, "/setup/") &&
 			p != adminPrefix &&
 			!strings.HasPrefix(p, adminPrefix+"/") &&
+			p != staticAdmin &&
+			!strings.HasPrefix(p, staticAdmin+"/") &&
 			!strings.HasPrefix(p, "/api/") &&
 			!strings.HasPrefix(p, "/themes/") &&
 			!strings.HasPrefix(p, "/uploads/") &&
@@ -699,13 +703,10 @@ func (s *AppServer) handleSitemap(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleRobotsTxt(w http.ResponseWriter, r *http.Request) {
-	adminPath := config.DefaultAdminPath
-	if s.deps.Config != nil && s.deps.Config.AdminPath != "" {
-		adminPath = s.deps.Config.AdminPath
-	}
+	adminPath, isCustom := s.effectiveAdminPrefix()
 	var sb strings.Builder
 	sb.WriteString("User-agent: *\nAllow: /\nDisallow: /api/\n")
-	if !s.deps.Config.IsCustomAdminPath {
+	if !isCustom {
 		sb.WriteString("Disallow: " + adminPath + "/\n")
 	}
 	sb.WriteString("Sitemap: " + s.publicBaseURL(r) + "/sitemap.xml\n")
@@ -1521,10 +1522,7 @@ func (s *AppServer) basePageContextWithSession(r *http.Request, viewer *domain.U
 		footerSlots = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotPublicFooter, slotCtx)
 	}
 
-	adminPath := config.DefaultAdminPath
-	if s.deps.Config != nil && s.deps.Config.AdminPath != "" {
-		adminPath = s.deps.Config.AdminPath
-	}
+	adminPath, _ := s.effectiveAdminPrefix()
 
 	desc := snap.SEO.MetaDescription
 	if desc == "" {
@@ -1674,10 +1672,11 @@ func clampPageBounds(page int, total int, perPage int) (clampedPage int, totalPa
 }
 
 func (s *AppServer) siteTimezoneLocation(tz string) *time.Location {
-	if trimmed := strings.TrimSpace(tz); trimmed != "" {
-		return theme.LoadSiteLocation(trimmed)
+	trimmed := strings.TrimSpace(tz)
+	if trimmed == "" {
+		trimmed = "Asia/Shanghai"
 	}
-	return time.FixedZone("CST", 8*3600)
+	return domain.ResolveSiteLocation(trimmed)
 }
 
 func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Request) {
@@ -2130,10 +2129,10 @@ func (s *AppServer) handleArchivesOverview(w http.ResponseWriter, r *http.Reques
 	where := []string{"a.status = ?"}
 	args := []any{domain.ArticleStatusPublished}
 	if selectedYear != "" {
-		if yrNum, err := strconv.Atoi(selectedYear); err == nil && len(selectedYear) == 4 && yrNum >= 1970 && yrNum <= 9999 {
+		if yrNum, err := strconv.Atoi(selectedYear); err == nil && len(selectedYear) == 4 && yrNum >= 1900 && yrNum <= 9999 {
 			startT := time.Date(yrNum, 1, 1, 0, 0, 0, 0, loc)
 			endT := startT.AddDate(1, 0, 0)
-			where = append(where, "a.published_at >= ? AND a.published_at < ?")
+			where = append(where, "(CASE WHEN a.published_at > 0 THEN a.published_at ELSE a.created_at END) >= ? AND (CASE WHEN a.published_at > 0 THEN a.published_at ELSE a.created_at END) < ?")
 			args = append(args, startT.UnixMilli(), endT.UnixMilli())
 			pctx.SelectedArchiveYear = selectedYear
 		} else {
@@ -2163,13 +2162,14 @@ func (s *AppServer) handleArchivesOverview(w http.ResponseWriter, r *http.Reques
 	var groups []theme.ArchiveYearGroup
 	if total > 0 {
 		baseSQL := `
-			SELECT a.slug, a.title, a.published_at,
+			SELECT a.slug, a.title,
+			       CASE WHEN a.published_at > 0 THEN a.published_at ELSE a.created_at END AS published_at,
 			       COALESCE(c.name, '') AS category_name,
 			       COALESCE(c.slug, '') AS category_slug
 			FROM articles a
 			LEFT JOIN categories c ON c.id = a.category_id
 			WHERE ` + whereSQL + `
-			ORDER BY a.published_at DESC, a.id DESC`
+			ORDER BY published_at DESC, a.id DESC`
 		qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, limit, offset)
 		rows, _ := sqlx.Select[archiveRow](r.Context(), s.deps.Store, qSQL, append(append([]any{}, args...), pageArgs...)...)
 		yearIdx := make(map[string]int)
@@ -2223,21 +2223,109 @@ func isValidArchiveYearMonth(ym string) bool {
 	}
 	yr, err1 := strconv.Atoi(ym[:4])
 	mo, err2 := strconv.Atoi(ym[5:7])
-	return err1 == nil && err2 == nil && yr >= 1970 && yr <= 9999 && mo >= 1 && mo <= 12
+	return err1 == nil && err2 == nil && yr >= 1900 && yr <= 9999 && mo >= 1 && mo <= 12
+}
+
+func canonicalizeArchiveTail(rawTail string) (dest string, isExactYM bool) {
+	hadTrailingSlash := strings.HasSuffix(rawTail, "/")
+	hadHTMLExt := strings.HasSuffix(strings.TrimRight(rawTail, "/"), ".html")
+	clean := strings.Trim(rawTail, "/")
+	clean = strings.TrimSuffix(clean, ".html")
+	clean = strings.Trim(clean, "/")
+	if clean == "" {
+		return "/archives", false
+	}
+	if len(clean) == 4 {
+		if yr, err := strconv.Atoi(clean); err == nil && yr >= 1900 && yr <= 9999 {
+			return "/archives?year=" + clean, false
+		}
+	}
+	if isValidArchiveYearMonth(clean) {
+		if hadTrailingSlash || hadHTMLExt {
+			return "/archives/" + clean, false
+		}
+		return clean, true
+	}
+	// Support YYYY-M, YYYY/MM, YYYY/M
+	var yrPart, moPart string
+	if idx := strings.IndexByte(clean, '-'); idx > 0 && !strings.Contains(clean, "/") {
+		yrPart, moPart = clean[:idx], clean[idx+1:]
+	} else {
+		parts := strings.Split(clean, "/")
+		if len(parts) == 2 {
+			yrPart, moPart = parts[0], parts[1]
+		} else if len(parts) >= 3 {
+			slug := strings.TrimSuffix(parts[len(parts)-1], ".html")
+			if slug != "" && !strings.Contains(slug, "..") {
+				return "/posts/" + slug, false
+			}
+		}
+	}
+	if len(yrPart) == 4 {
+		yr, err1 := strconv.Atoi(yrPart)
+		mo, err2 := strconv.Atoi(moPart)
+		if err1 == nil && err2 == nil && yr >= 1900 && yr <= 9999 && mo >= 1 && mo <= 12 {
+			return fmt.Sprintf("/archives/%04d-%02d", yr, mo), false
+		}
+	}
+	return "", false
+}
+
+func (s *AppServer) handleLegacyArchiveRedirect(w http.ResponseWriter, r *http.Request) {
+	tail := r.URL.Path
+	for _, pfx := range []string{"/archivedate/", "/archive/"} {
+		if strings.HasPrefix(tail, pfx) {
+			tail = strings.TrimPrefix(tail, pfx)
+			break
+		}
+	}
+	dest, isExactYM := canonicalizeArchiveTail(tail)
+	if isExactYM {
+		dest = "/archives/" + dest
+	}
+	if dest == "" {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
+	if r.URL.RawQuery != "" {
+		if strings.Contains(dest, "?") {
+			dest += "&" + r.URL.RawQuery
+		} else {
+			dest += "?" + r.URL.RawQuery
+		}
+	}
+	http.Redirect(w, r, dest, http.StatusMovedPermanently)
 }
 
 func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Request) {
-	ym := strings.TrimPrefix(r.URL.Path, "/archives/")
-	if !isValidArchiveYearMonth(ym) {
+	rawTail := strings.TrimPrefix(r.URL.Path, "/archives/")
+	ym, isExactYM := canonicalizeArchiveTail(rawTail)
+	if !isExactYM {
+		if ym != "" {
+			dest := ym
+			if r.URL.RawQuery != "" {
+				if strings.Contains(dest, "?") {
+					dest += "&" + r.URL.RawQuery
+				} else {
+					dest += "?" + r.URL.RawQuery
+				}
+			}
+			http.Redirect(w, r, dest, http.StatusMovedPermanently)
+			return
+		}
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
 	viewer, sess := s.resolveViewer(r)
 	pctx := s.basePageContextWithSession(r, viewer, sess)
+	perPage := pctx.Reading.PostsPerPage
+	if perPage <= 0 {
+		perPage = 15
+	}
 	page := parsePageParam(r)
 	cards, total, _ := s.deps.Content.ListPublicCards(r.Context(), content.ArticleListFilter{
 		Page:      page,
-		PageSize:  pctx.Reading.PostsPerPage,
+		PageSize:  perPage,
 		YearMonth: ym,
 		Locale:    pctx.Locale,
 	})
@@ -2251,8 +2339,8 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 	pctx.PageTitle = ym + " · " + pctx.Site.Title
 	pctx.ArticleCards = cards
 	pctx.Page = page
-	pctx.TotalPages = computeTotalPages(total, pctx.Reading.PostsPerPage)
-	pctx.Pagination = theme.BuildPagination(page, pctx.TotalPages, pctx.Reading.PostsPerPage, total, 5)
+	pctx.TotalPages = computeTotalPages(total, perPage)
+	pctx.Pagination = theme.BuildPagination(page, pctx.TotalPages, perPage, total, 5)
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"archive_posts.html", "index.html"}, pctx)
 }
 
@@ -2829,13 +2917,10 @@ func (s *AppServer) localizePublicError(locale string, err error) string {
 }
 
 func (s *AppServer) handleLegacyAdminRedirect(w http.ResponseWriter, r *http.Request) {
-	if s.deps.Config != nil && s.deps.Config.IsCustomAdminPath {
+	adminPrefix, isCustom := s.effectiveAdminPrefix()
+	if isCustom {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
-	}
-	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
-	if adminPrefix == "/" {
-		adminPrefix = "/console"
 	}
 	http.Redirect(w, r, adminPrefix, http.StatusFound)
 }
@@ -2895,15 +2980,15 @@ func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Re
 		Secure:   secure,
 		SameSite: http.SameSiteStrictMode,
 	})
-	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
-	if adminPrefix == "/" {
-		adminPrefix = "/console"
-	}
+	adminPrefix, _ := s.effectiveAdminPrefix()
+	staticAdmin := s.staticAdminPrefix()
 	isSafeTarget := func(cand string) bool {
 		if !isSafeRelativeRedirect(cand) {
 			return false
 		}
-		if cand == "/logout" || strings.HasPrefix(cand, "/logout?") || cand == adminPrefix || strings.HasPrefix(cand, adminPrefix+"/") {
+		if cand == "/logout" || strings.HasPrefix(cand, "/logout?") ||
+			cand == adminPrefix || strings.HasPrefix(cand, adminPrefix+"/") ||
+			cand == staticAdmin || strings.HasPrefix(cand, staticAdmin+"/") {
 			return false
 		}
 		return true

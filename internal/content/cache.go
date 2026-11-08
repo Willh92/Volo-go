@@ -23,8 +23,6 @@ const (
 	maxCachedChromeTags = 200
 )
 
-var tzLocationCache sync.Map // map[string]*time.Location
-
 type redirectEntry struct {
 	id         string // Non-empty for `redirects` table rows (records hit_count); empty for legacy_permalink
 	targetPath string

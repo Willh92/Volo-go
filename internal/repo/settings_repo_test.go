@@ -35,17 +35,17 @@ func TestSettingsManagerAtomicPatchSecretMaskingAndHotReload(t *testing.T) {
 	mgr := NewSettingsManager(store, kr, "zh-CN")
 
 	// 1. Partial PATCH on "site": updates title without overwriting subtitle or license_template!
-	_, v1, err := mgr.PatchDomain(ctx, "site", []byte(`{"title":"Will's Notes","social_links":[{"id":"gh","label":"GitHub","icon":"github","url":"https://github.com/Willh92"}]}`), 0)
+	_, v1, err := mgr.PatchDomain(ctx, "site", []byte(`{"title":"Studio Notes","social_links":[{"id":"gh","label":"GitHub","icon":"github","url":"https://github.com/octocat"}]}`), 0)
 	if err != nil || v1 != 1 {
 		t.Fatalf("PatchDomain(site) failed: v=%d err=%v", v1, err)
 	}
 	snap := mgr.Snapshot()
-	if snap.Site.Title != "Will's Notes" || snap.Site.Subtitle != "记录 · 思考 · 分享" || len(snap.Site.SocialLinks) != 1 {
+	if snap.Site.Title != "Studio Notes" || snap.Site.Subtitle != "记录 · 思考 · 分享" || len(snap.Site.SocialLinks) != 1 {
 		t.Fatalf("unexpected site snapshot after partial PATCH: %+v", snap.Site)
 	}
 
 	// 2. Partial PATCH on nested "feed.podcast" without wiping feed.item_count
-	_, _, err = mgr.PatchDomain(ctx, "feed", []byte(`{"podcast":{"title":"Volo Cast","author":"Will"}}`), 0)
+	_, _, err = mgr.PatchDomain(ctx, "feed", []byte(`{"podcast":{"title":"Volo Cast","author":"Alex"}}`), 0)
 	if err != nil {
 		t.Fatalf("PatchDomain(feed) failed: %v", err)
 	}

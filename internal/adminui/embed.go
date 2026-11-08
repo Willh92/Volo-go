@@ -26,6 +26,7 @@ var distFS embed.FS
 type BootConfig struct {
 	Mode          string            `json:"mode"` // "console" | "setup"
 	AdminPath     string            `json:"admin_path"`
+	BaseAdminPath string            `json:"base_admin_path,omitempty"`
 	PublicURL     string            `json:"public_url"`
 	DefaultLocale string            `json:"default_locale"`
 	Accent        string            `json:"accent"`

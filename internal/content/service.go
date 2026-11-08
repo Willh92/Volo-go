@@ -467,7 +467,7 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 		if !ok {
 			return []visibility.PublicArticleCard{}, 0, nil
 		}
-		where = append(where, "a.published_at >= ? AND a.published_at < ?")
+		where = append(where, "(CASE WHEN a.published_at > 0 THEN a.published_at ELSE a.created_at END) >= ? AND (CASE WHEN a.published_at > 0 THEN a.published_at ELSE a.created_at END) < ?")
 		args = append(args, startMS, endMS)
 	}
 
@@ -1210,7 +1210,7 @@ func (s *Service) queryArchiveMonths(ctx context.Context) ([]ArchiveMonth, error
 	}
 	rows, err := sqlx.Select[pubRow](
 		ctx, s.store,
-		`SELECT published_at FROM articles WHERE status = ? ORDER BY published_at DESC`,
+		`SELECT CASE WHEN published_at > 0 THEN published_at ELSE created_at END AS published_at FROM articles WHERE status = ? ORDER BY published_at DESC`,
 		domain.ArticleStatusPublished,
 	)
 	if err != nil {
@@ -1220,9 +1220,6 @@ func (s *Service) queryArchiveMonths(ctx context.Context) ([]ArchiveMonth, error
 	counts := make(map[string]int)
 	var order []string
 	for _, r := range rows {
-		if r.PublishedAt <= 0 {
-			continue
-		}
 		ym := time.UnixMilli(r.PublishedAt).In(loc).Format("2006-01")
 		if counts[ym] == 0 {
 			order = append(order, ym)
@@ -1411,22 +1408,14 @@ func (s *Service) loadTagsForArticles(ctx context.Context, raws []domain.RawArti
 	return out, nil
 }
 
-var defaultCSTLocation = time.FixedZone("CST", 8*3600)
-
 func (s *Service) siteLocation() *time.Location {
+	tz := "Asia/Shanghai"
 	if s.settings != nil {
-		tz := strings.TrimSpace(s.settings.Snapshot().Site.TimeZone)
-		if tz != "" {
-			if cached, ok := tzLocationCache.Load(tz); ok {
-				return cached.(*time.Location)
-			}
-			if loc, err := time.LoadLocation(tz); err == nil {
-				tzLocationCache.Store(tz, loc)
-				return loc
-			}
+		if v := strings.TrimSpace(s.settings.Snapshot().Site.TimeZone); v != "" {
+			tz = v
 		}
 	}
-	return defaultCSTLocation
+	return domain.ResolveSiteLocation(tz)
 }
 
 func parseYearMonthBounds(ym string, loc *time.Location) (int64, int64, bool) {

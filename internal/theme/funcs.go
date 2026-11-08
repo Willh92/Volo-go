@@ -9,30 +9,16 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
 )
 
-var siteLocationCache sync.Map // map[string]*time.Location
-
-// LoadSiteLocation resolves an IANA timezone name with caching, falling back safely to time.UTC.
+// LoadSiteLocation resolves an IANA timezone or UTC/GMT offset with caching, falling back safely to time.UTC.
 func LoadSiteLocation(tz string) *time.Location {
-	trimmed := strings.TrimSpace(tz)
-	if trimmed == "" || strings.EqualFold(trimmed, "UTC") || strings.EqualFold(trimmed, "Etc/UTC") {
-		return time.UTC
-	}
-	if cached, ok := siteLocationCache.Load(trimmed); ok {
-		return cached.(*time.Location)
-	}
-	loc, err := time.LoadLocation(trimmed)
-	if err != nil || loc == nil {
-		return time.UTC
-	}
-	siteLocationCache.Store(trimmed, loc)
-	return loc
+	return domain.ResolveSiteLocation(tz)
 }
 
 func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, fallbackAssets map[string]cachedAsset, themeLocales map[string]map[string]string, activeLocale string, siteLoc *time.Location) template.FuncMap {

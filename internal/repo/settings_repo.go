@@ -665,6 +665,11 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
+		normDyn, err := normalizeDynamicLoginPath(v.DynamicLoginPath)
+		if err != nil {
+			return nil, err
+		}
+		v.DynamicLoginPath = normDyn
 		return json.Marshal(v)
 	case domain.SettingsDomainAppearance:
 		v := def.Appearance
@@ -934,3 +939,41 @@ func sanitizeCDNPrefix(raw string) (string, bool) {
 	return "", false
 }
 
+var reservedDynamicLoginPrefixes = []string{
+	"/api", "/setup", "/posts", "/articles", "/categories", "/category", "/tags",
+	"/archives", "/archive", "/archivedate", "/series", "/books", "/links", "/follows",
+	"/dynamic", "/uploads", "/images", "/themes", "/plugins", "/avatars", "/assets",
+	"/static", "/reader", "/logout", "/healthz", "/github", "/my-github-repos",
+	"/github-stats", "/rss.xml", "/atom.xml", "/feed.json", "/podcast.xml",
+	"/sitemap.xml", "/robots.txt", "/llms.txt", "/llms-full.txt", "/favicon.svg", "/favicon.ico",
+}
+
+func normalizeDynamicLoginPath(raw string) (string, error) {
+	s := strings.TrimSpace(StripASCIIControls(raw))
+	if s == "" || s == "/" {
+		return "", nil
+	}
+	if !strings.HasPrefix(s, "/") {
+		s = "/" + s
+	}
+	s = strings.TrimRight(s, "/")
+	if s == "" {
+		return "", nil
+	}
+	if len(s) < 2 || len(s) > 64 || strings.Contains(s, "..") || strings.Contains(s, "//") {
+		return "", fmt.Errorf("settings: invalid dynamic_login_path")
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '/') {
+			return "", fmt.Errorf("settings: invalid dynamic_login_path")
+		}
+	}
+	low := strings.ToLower(s)
+	for _, pfx := range reservedDynamicLoginPrefixes {
+		if low == pfx || strings.HasPrefix(low, pfx+"/") {
+			return "", fmt.Errorf("settings: invalid dynamic_login_path")
+		}
+	}
+	return s, nil
+}

@@ -246,5 +246,9 @@
   "taxonomy.back_series": "All Series",
   "taxonomy.back_archives": "All Archives",
   "footer.powered_prefix": "Powered by",
-  "footer.powered_suffix": "Engine"
+  "footer.powered_suffix": "Engine",
+  "auth.err_totp_invalid": "Invalid or expired two-factor verification code.",
+  "auth.err_totp_replay": "This verification code was already used in the current window. Please wait for the next code.",
+  "auth.err_2fa_expired": "Two-factor login challenge expired. Please sign in again.",
+  "auth.err_passkey_failed": "Passkey verification failed. Please try again or sign in with password."
 }

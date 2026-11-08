@@ -41,6 +41,8 @@ function minifyEmbeddedPayload(fileName, raw) {
   return raw;
 }
 
+const themeRootDir = new URL("../../../internal/theme/builtin/volo-studio", import.meta.url).pathname;
+
 function walkAdminDist(dir) {
   for (const ent of readdirSync(dir, { withFileTypes: true })) {
     const full = join(dir, ent.name);
@@ -49,7 +51,7 @@ function walkAdminDist(dir) {
       continue;
     }
     if (ent.isFile() && (full.endsWith(".js") || full.endsWith(".css"))) {
-      const raw = readFileSync(full);
+      const raw = full.endsWith(".css") ? minifyEmbeddedPayload(ent.name, readFileSync(full)) : readFileSync(full);
       writeFileSync(`${full}.gz`, deterministicGzip(raw));
       unlinkSync(full);
     }
@@ -78,7 +80,15 @@ function precompressFlatDir(srcDir, outDir, suffix = "") {
   }
 }
 
+function precompressSingleFile(dir, fileName) {
+  const full = join(dir, fileName);
+  const raw = minifyEmbeddedPayload(fileName, readFileSync(full));
+  writeFileSync(join(dir, `${fileName}.gz`), deterministicGzip(raw));
+}
+
 walkAdminDist(distDir);
+precompressSingleFile(themeRootDir, "theme.json");
+precompressSingleFile(themeRootDir, "preview.svg");
 precompressFlatDir(themeAssetsDir, themeAssetsGzDir);
 precompressFlatDir(themeTemplatesDir, themeTemplatesGzDir, ".html");
 precompressFlatDir(i18nBuiltinDir, i18nBuiltinGzDir, ".json");

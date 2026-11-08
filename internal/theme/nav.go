@@ -65,6 +65,21 @@ var builtinNavSpecs = map[string]builtinNavSpec{
 	"dynamic":    {url: "/dynamic", i18nKey: "nav.dynamic", fallback: "Stream"},
 }
 
+func normalizeNavItemKey(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) > 7 && strings.EqualFold(trimmed[:7], "custom:") {
+		cid := strings.TrimSpace(trimmed[7:])
+		if cid == "" {
+			return ""
+		}
+		return "custom:" + cid
+	}
+	return strings.ToLower(trimmed)
+}
+
 func parseNavItemKeys(cfg map[string]any) []string {
 	if cfg == nil {
 		return DefaultNavItemKeys
@@ -99,7 +114,7 @@ func parseNavItemKeys(cfg map[string]any) []string {
 	seen := make(map[string]bool, len(candidates))
 	out := make([]string, 0, len(candidates))
 	for _, c := range candidates {
-		k := strings.ToLower(strings.TrimSpace(c))
+		k := normalizeNavItemKey(c)
 		if k == "" || seen[k] {
 			continue
 		}
@@ -107,6 +122,37 @@ func parseNavItemKeys(cfg map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func parseSeenCustomSet(cfg map[string]any) (map[string]bool, bool) {
+	if cfg == nil {
+		return nil, false
+	}
+	raw, exists := cfg["header_nav_seen_custom"]
+	if !exists || raw == nil {
+		return nil, false
+	}
+	set := make(map[string]bool)
+	switch v := raw.(type) {
+	case []string:
+		for _, s := range v {
+			if id := strings.TrimSpace(s); id != "" {
+				set[id] = true
+			}
+		}
+	case []any:
+		for _, elem := range v {
+			if elem == nil {
+				continue
+			}
+			if id := strings.TrimSpace(fmt.Sprint(elem)); id != "" {
+				set[id] = true
+			}
+		}
+	default:
+		return nil, false
+	}
+	return set, true
 }
 
 func parseNavPrimaryCount(cfg map[string]any) int {
@@ -191,24 +237,68 @@ func (e *Engine) ResolveNavMenu(data PageContext) NavMenu {
 		curPath = "/"
 	}
 
+	type resolvedCustom struct {
+		id           string
+		title        string
+		url          string
+		icon         string
+		openInNewTab bool
+	}
+	validCustomOrder := make([]resolvedCustom, 0, len(data.NavItems))
+	validCustomByID := make(map[string]resolvedCustom, len(data.NavItems))
+	for _, it := range data.NavItems {
+		u := strings.TrimSpace(it.URL)
+		id := strings.TrimSpace(it.ID)
+		if id == "" || u == "" || u == data.AdminPath || u == "/logout" {
+			continue
+		}
+		rc := resolvedCustom{
+			id:           id,
+			title:        it.Title,
+			url:          u,
+			icon:         it.Icon,
+			openInNewTab: it.OpenInNewTab,
+		}
+		if _, dup := validCustomByID[id]; !dup {
+			validCustomOrder = append(validCustomOrder, rc)
+			validCustomByID[id] = rc
+		}
+	}
+
+	appendCustomLink := func(dst []NavLink, rc resolvedCustom) []NavLink {
+		return append(dst, NavLink{
+			Key:          "custom:" + rc.id,
+			Title:        rc.title,
+			URL:          rc.url,
+			Icon:         rc.icon,
+			OpenInNewTab: rc.openInNewTab,
+			IsActive:     isNavPathPrefixActive(curPath, rc.url),
+			IsCustom:     true,
+		})
+	}
+
 	keys := parseNavItemKeys(data.ThemeConfig)
-	items := make([]NavLink, 0, len(keys)+len(data.NavItems))
+	items := make([]NavLink, 0, len(keys)+len(validCustomOrder))
+	placedCustom := make(map[string]bool, len(validCustomOrder))
+	hasWildcardCustom := false
+
 	for _, key := range keys {
 		if key == "custom" {
-			for _, it := range data.NavItems {
-				u := strings.TrimSpace(it.URL)
-				if u == "" || u == data.AdminPath || u == "/logout" {
+			hasWildcardCustom = true
+			for _, rc := range validCustomOrder {
+				if placedCustom[rc.id] {
 					continue
 				}
-				items = append(items, NavLink{
-					Key:          "custom:" + it.ID,
-					Title:        it.Title,
-					URL:          u,
-					Icon:         it.Icon,
-					OpenInNewTab: it.OpenInNewTab,
-					IsActive:     isNavPathPrefixActive(curPath, u),
-					IsCustom:     true,
-				})
+				placedCustom[rc.id] = true
+				items = appendCustomLink(items, rc)
+			}
+			continue
+		}
+		if strings.HasPrefix(key, "custom:") {
+			cid := key[len("custom:"):]
+			if rc, ok := validCustomByID[cid]; ok && !placedCustom[cid] {
+				placedCustom[cid] = true
+				items = appendCustomLink(items, rc)
 			}
 			continue
 		}
@@ -229,6 +319,19 @@ func (e *Engine) ResolveNavMenu(data PageContext) NavMenu {
 			Icon:     spec.icon,
 			IsActive: active,
 		})
+	}
+
+	// If `header_nav_items` was saved as individual items (without wildcard `custom`),
+	// automatically append any newly created custom links that were not yet present when saved.
+	if !hasWildcardCustom {
+		if seenSet, hasSeen := parseSeenCustomSet(data.ThemeConfig); hasSeen {
+			for _, rc := range validCustomOrder {
+				if !placedCustom[rc.id] && !seenSet[rc.id] {
+					placedCustom[rc.id] = true
+					items = appendCustomLink(items, rc)
+				}
+			}
+		}
 	}
 
 	primaryCount := parseNavPrimaryCount(data.ThemeConfig)

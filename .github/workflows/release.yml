@@ -91,10 +91,8 @@ jobs:
         run: |
           STAGE="volo-${VERSION}-${GOOS}-${GOARCH}"
           mkdir -p "dist/${STAGE}/scripts"
-          go build -trimpath \
+          go build -buildvcs=false -trimpath \
             -gcflags="all=-l" \
-            -gcflags="github.com/Willh92/Volo-go/internal/render=" \
-            -gcflags="github.com/Willh92/Volo-go/internal/visibility=" \
             -ldflags="-s -w -X main.Version=${VERSION}" \
             -o "dist/${STAGE}/volo${{ matrix.ext }}" \
             ./cmd/volo

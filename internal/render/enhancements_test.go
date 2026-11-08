@@ -11,13 +11,13 @@ func TestReadableHeadingIDsAndGitHubShowcaseTable(t *testing.T) {
 	md := strings.Join([]string{
 		"## 架构设计与概览",
 		"",
-		"![GitHub Stats](/github-stats/Willh92.svg)",
+		"![GitHub Stats](/github-stats/octocat.svg)",
 		"",
 		"## 架构设计与概览",
 		"",
 		"| 仓库 | 项目简介 | Stars | Forks | 编程语言 |",
 		"| --- | --- | :---: | :---: | --- |",
-		"| [Volo-go](https://github.com/Willh92/Volo-go) | 纯 Go 零外部依赖独立博客引擎，内置多方言与双栏工作室编辑器 | 128 | 16 | Go |",
+		"| [hello-world](https://github.com/octocat/hello-world) | 纯 Go 零外部依赖独立博客引擎，内置多方言与双栏工作室编辑器 | 128 | 16 | Go |",
 		"",
 		"| 指标 | 数值 |",
 		"| --- | --- |",
@@ -38,7 +38,7 @@ func TestReadableHeadingIDsAndGitHubShowcaseTable(t *testing.T) {
 	}
 
 	// 2. `/github-stats/{username}.svg` wrapped in external profile link
-	if !strings.Contains(out.HTML, `href="https://github.com/Willh92"`) || !strings.Contains(out.HTML, `data-github-profile="1"`) {
+	if !strings.Contains(out.HTML, `href="https://github.com/octocat"`) || !strings.Contains(out.HTML, `data-github-profile="1"`) {
 		t.Fatalf("expected github-stats SVG wrapped in profile link, got: %s", out.HTML)
 	}
 
@@ -49,7 +49,7 @@ func TestReadableHeadingIDsAndGitHubShowcaseTable(t *testing.T) {
 	if !strings.Contains(out.HTML, `class="volo-github-repo-desc-cell"`) || !strings.Contains(out.HTML, `class="volo-github-repo-desc" title="纯 Go 零外部依赖独立博客引擎，内置多方言与双栏工作室编辑器"`) {
 		t.Fatalf("expected GitHub repo 2-line clamp div with title attribute, got: %s", out.HTML)
 	}
-	if !strings.Contains(out.HTML, `href="https://github.com/Willh92/Volo-go"`) {
+	if !strings.Contains(out.HTML, `href="https://github.com/octocat/hello-world"`) {
 		t.Fatalf("expected repo link preserved, got: %s", out.HTML)
 	}
 

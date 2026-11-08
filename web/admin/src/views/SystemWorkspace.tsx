@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import {
   apiFetch,
   b64urlToBytes,
+  bootConfig,
   bytesToB64url,
   currentUserSig,
   openConfirm,
   refreshMe,
   resetConsoleScroll,
+  sanitizeAdminPath,
   showToast,
   storageDriverSig,
   uploadWithProgress,
@@ -621,6 +623,20 @@ export function SystemWorkspace({
       if (domainName === "site") {
         setSocialDirty(false);
         setEditingSocialIdx(null);
+      }
+      if (domainName === "security") {
+        const rawDyn = String(res.value?.dynamic_login_path || "").trim();
+        const fallbackMount = sanitizeAdminPath(bootConfig.base_admin_path || "/console");
+        const nextMount = rawDyn ? sanitizeAdminPath(rawDyn) : fallbackMount;
+        const curMount = sanitizeAdminPath(window.location.pathname.replace(/\/+$/, "") || "/console");
+        bootConfig.admin_path = nextMount;
+        if (nextMount !== curMount) {
+          showToast(t("common.saved"));
+          window.setTimeout(() => {
+            window.location.assign(`${nextMount}/${window.location.hash || "#waf"}`);
+          }, 350);
+          return true;
+        }
       }
       showToast(t("common.saved"));
       return true;

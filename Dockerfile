@@ -26,10 +26,8 @@ COPY . .
 COPY --from=admin-builder /src/internal/adminui/dist ./internal/adminui/dist
 
 RUN CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath \
+    go build -buildvcs=false -trimpath \
     -gcflags="all=-l" \
-    -gcflags="github.com/Willh92/Volo-go/internal/render=" \
-    -gcflags="github.com/Willh92/Volo-go/internal/visibility=" \
     -ldflags="-s -w -X main.Version=${VERSION}" \
     -o /out/volo ./cmd/volo
 

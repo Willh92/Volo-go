@@ -11,6 +11,7 @@ import {
 export interface BootConfig {
   mode: "console" | "setup";
   admin_path: string;
+  base_admin_path?: string;
   public_url: string;
   default_locale: string;
   accent: string;
@@ -33,10 +34,13 @@ export interface StaffUser {
 
 export function sanitizeAdminPath(raw?: string): string {
   const trimmed = String(raw || "").trim();
-  if (!trimmed || !/^\/[A-Za-z0-9/_-]+$/.test(trimmed) || trimmed.startsWith("//")) {
+  if (!trimmed) return "/console";
+  const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  const clean = withSlash.length > 1 ? withSlash.replace(/\/+$/, "") : withSlash;
+  if (clean === "/" || !/^\/[A-Za-z0-9/_-]+$/.test(clean) || clean.includes("//") || clean.includes("..")) {
     return "/console";
   }
-  return trimmed;
+  return clean;
 }
 
 export function readBootConfig(): BootConfig {
@@ -44,9 +48,12 @@ export function readBootConfig(): BootConfig {
   if (el && el.textContent) {
     try {
       const parsed = JSON.parse(el.textContent) as BootConfig;
+      const adminPath = sanitizeAdminPath(parsed.admin_path);
+      const baseAdminPath = parsed.base_admin_path ? sanitizeAdminPath(parsed.base_admin_path) : adminPath;
       return {
         ...parsed,
-        admin_path: sanitizeAdminPath(parsed.admin_path),
+        admin_path: adminPath,
+        base_admin_path: baseAdminPath,
       };
     } catch {
       // Fallback below
@@ -55,6 +62,7 @@ export function readBootConfig(): BootConfig {
   return {
     mode: window.location.pathname.startsWith("/setup") ? "setup" : "console",
     admin_path: "/console",
+    base_admin_path: "/console",
     public_url: window.location.origin,
     default_locale: "zh-CN",
     accent: "forest",
@@ -283,19 +291,25 @@ const EXACT_ADMIN_ERROR_KEYS: Record<string, string> = {
   "malformed json": "api.err_invalid_json",
   "unauthorized": "api.err_unauthorized",
   "authentication required": "api.err_unauthorized",
+  "invalid or expired api token": "api.err_unauthorized",
   "session expired": "api.err_unauthorized",
   "forbidden": "api.err_forbidden",
   "admin role required": "api.err_forbidden",
   "insufficient permissions": "api.err_forbidden",
+  "this endpoint requires an interactive admin session": "api.err_forbidden",
   "not found": "api.err_not_found",
   "method not allowed": "api.err_method_not_allowed",
   "csrf token mismatch": "api.err_csrf_mismatch",
   "invalid csrf token": "api.err_csrf_mismatch",
   "missing csrf token": "api.err_csrf_mismatch",
+  "invalid or missing x-csrf-token": "api.err_csrf_mismatch",
+  "cross-origin request blocked": "api.err_csrf_mismatch",
   "rate limit exceeded": "api.err_rate_limit",
+  "rate limited": "api.err_rate_limit",
   "too many requests": "api.err_rate_limit",
   "invalid credentials": "api.err_invalid_credentials",
   "invalid username or password": "api.err_invalid_credentials",
+  "invalid username/email or password": "api.err_invalid_credentials",
   "current password is incorrect": "api.err_invalid_current_pwd",
   "invalid current password": "api.err_invalid_current_pwd",
   "current password required": "api.err_current_pwd_required",
@@ -303,8 +317,20 @@ const EXACT_ADMIN_ERROR_KEYS: Record<string, string> = {
   "2fa code required": "api.err_totp_required",
   "invalid totp code": "api.err_invalid_totp",
   "invalid 2fa code": "api.err_invalid_totp",
+  "invalid or expired totp verification code": "api.err_invalid_totp",
+  "totp code already used in current time window": "api.err_totp_replay",
   "invalid or expired challenge token": "api.err_challenge_expired",
+  "two-factor login challenge expired or invalid": "api.err_challenge_expired",
   "challenge expired": "api.err_challenge_expired",
+  "passkey ceremony verification failed": "api.err_passkey_failed",
+  "passkey signature counter regression (possible cloned authenticator)": "api.err_passkey_failed",
+  "invalid volo_public_url for webauthn rp id": "api.err_passkey_failed",
+  "password must be 6-128 characters": "api.err_weak_password",
+  "password must not be empty": "api.err_weak_password",
+  "invalid email address": "api.err_invalid_email",
+  "username must be 2-48 characters": "api.err_username_len",
+  "at least one api token scope is required": "api.err_pat_scope_required",
+  "invalid dynamic_login_path": "api.err_invalid_dynamic_login_path",
   "re-authentication required": "api.err_reauth_required",
   "step-up authentication required": "api.err_reauth_required",
   "account disabled": "api.err_account_disabled",
@@ -334,6 +360,12 @@ export function localizeAdminError(rawMsg: string): string {
   if (exactKey) {
     const val = t(exactKey);
     if (val !== exactKey) return val;
+  }
+
+  const authMatch = /^auth:\s*(.+)$/i.exec(trimmed);
+  if (authMatch && authMatch[1]) {
+    const inner = localizeAdminError(authMatch[1]);
+    if (inner !== authMatch[1].trim()) return inner;
   }
 
   const httpMatch = /^http\s+(\d{3})$/i.exec(trimmed);
@@ -399,6 +431,9 @@ export async function apiFetch<T = any>(
 ): Promise<T> {
   const method = (opts.method || "GET").toUpperCase();
   const headers = new Headers(opts.headers || {});
+  if (!headers.has("Accept-Language") && localeSig.value) {
+    headers.set("Accept-Language", localeSig.value);
+  }
   if (!(opts.body instanceof FormData) && !headers.has("Content-Type") && method !== "GET" && method !== "HEAD") {
     headers.set("Content-Type", "application/json");
   }
@@ -515,6 +550,9 @@ export function uploadWithProgress<T = any>(
     const xhr = new XMLHttpRequest();
     xhr.open(method.toUpperCase(), url, true);
     xhr.withCredentials = true;
+    if (localeSig.value) {
+      xhr.setRequestHeader("Accept-Language", localeSig.value);
+    }
     if (csrfTokenSig.value) {
       xhr.setRequestHeader("X-CSRF-Token", csrfTokenSig.value);
     }

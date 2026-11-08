@@ -37,6 +37,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/logging"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
+	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
@@ -640,7 +641,20 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	case http.MethodDelete:
+		delRows, _ := sqlx.Select[struct {
+			ID string `db:"id"`
+		}](r.Context(), s.deps.Store, `SELECT id FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
+		if len(delRows) > 0 {
+			delIDs := make([]string, 0, len(delRows))
+			for _, row := range delRows {
+				if id := strings.TrimSpace(row.ID); id != "" {
+					delIDs = append(delIDs, id)
+				}
+			}
+			s.pruneDeletedNavFromThemeConfigs(r.Context(), delIDs)
+		}
+		s.invalidateMediaRefCache()
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -2060,20 +2074,288 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
+func (s *AppServer) listRenderableCustomNav(ctx context.Context, locale string) []content.PublicNavNode {
+	if s.deps.Content == nil {
+		return nil
+	}
+	raw, err := s.deps.Content.ListPublicNavItems(ctx, locale)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	adminPrefix, _ := s.effectiveAdminPrefix()
+	staticAdmin := s.staticAdminPrefix()
+	out := make([]content.PublicNavNode, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	for _, it := range raw {
+		id := strings.TrimSpace(it.ID)
+		u := strings.TrimSpace(it.URL)
+		if id == "" || seen[id] || u == "" || u == adminPrefix || u == staticAdmin || u == "/logout" {
+			continue
+		}
+		seen[id] = true
+		out = append(out, it)
+	}
+	return out
+}
+
+func toStringSliceAny(raw any) ([]string, bool) {
+	switch v := raw.(type) {
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, s := range v {
+			if t := strings.TrimSpace(s); t != "" {
+				out = append(out, t)
+			}
+		}
+		return out, true
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, elem := range v {
+			if elem == nil {
+				continue
+			}
+			if t := strings.TrimSpace(fmt.Sprint(elem)); t != "" {
+				out = append(out, t)
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func expandThemeNavKeyList(rawKeys []string, customNav []content.PublicNavNode, seenIDs []string, hasSeen bool) []string {
+	validCustomSet := make(map[string]bool, len(customNav))
+	for _, cn := range customNav {
+		validCustomSet[cn.ID] = true
+	}
+	seenCustomSet := make(map[string]bool, len(seenIDs))
+	for _, sid := range seenIDs {
+		seenCustomSet[sid] = true
+	}
+
+	out := make([]string, 0, len(rawKeys)+len(customNav))
+	emitted := make(map[string]bool, len(rawKeys)+len(customNav))
+	hadWildcard := false
+
+	for _, rawKey := range rawKeys {
+		k := strings.TrimSpace(rawKey)
+		if k == "" {
+			continue
+		}
+		if strings.EqualFold(k, "custom") {
+			hadWildcard = true
+			for _, cn := range customNav {
+				ck := "custom:" + cn.ID
+				if !emitted[ck] {
+					emitted[ck] = true
+					out = append(out, ck)
+				}
+			}
+			continue
+		}
+		if len(k) > 7 && strings.EqualFold(k[:7], "custom:") {
+			cid := strings.TrimSpace(k[7:])
+			if !validCustomSet[cid] {
+				continue
+			}
+			ck := "custom:" + cid
+			if !emitted[ck] {
+				emitted[ck] = true
+				out = append(out, ck)
+			}
+			continue
+		}
+		low := strings.ToLower(k)
+		if !emitted[low] {
+			emitted[low] = true
+			out = append(out, low)
+		}
+	}
+
+	if !hadWildcard && hasSeen {
+		for _, cn := range customNav {
+			ck := "custom:" + cn.ID
+			if !emitted[ck] && !seenCustomSet[cn.ID] {
+				emitted[ck] = true
+				out = append(out, ck)
+			}
+		}
+	}
+	return out
+}
+
+func (s *AppServer) enrichThemesWithCustomNav(ctx context.Context, locale string, themes []theme.LocalizedTheme) []theme.LocalizedTheme {
+	if len(themes) == 0 {
+		return themes
+	}
+	customNav := s.listRenderableCustomNav(ctx, locale)
+	out := make([]theme.LocalizedTheme, len(themes))
+	copy(out, themes)
+
+	for ti := range out {
+		if len(out[ti].LocalizedSchema) == 0 {
+			continue
+		}
+		schemaCopy := make([]theme.LocalizedConfigField, len(out[ti].LocalizedSchema))
+		copy(schemaCopy, out[ti].LocalizedSchema)
+		modified := false
+		for fi := range schemaCopy {
+			f := &schemaCopy[fi]
+			if f.Key != "header_nav_items" {
+				continue
+			}
+			modified = true
+			nextOpts := make([]theme.LocalizedConfigOption, 0, len(f.Options)+len(customNav))
+			expandedOpt := false
+			for _, opt := range f.Options {
+				if opt.Value == "custom" {
+					expandedOpt = true
+					for _, cn := range customNav {
+						lbl := strings.TrimSpace(cn.Title)
+						if lbl == "" {
+							lbl = cn.URL
+						}
+						nextOpts = append(nextOpts, theme.LocalizedConfigOption{
+							Value: "custom:" + cn.ID,
+							Label: fmt.Sprintf("%s (%s)", lbl, cn.URL),
+						})
+					}
+					continue
+				}
+				nextOpts = append(nextOpts, opt)
+			}
+			if !expandedOpt {
+				for _, cn := range customNav {
+					lbl := strings.TrimSpace(cn.Title)
+					if lbl == "" {
+						lbl = cn.URL
+					}
+					nextOpts = append(nextOpts, theme.LocalizedConfigOption{
+						Value: "custom:" + cn.ID,
+						Label: fmt.Sprintf("%s (%s)", lbl, cn.URL),
+					})
+				}
+			}
+			f.Options = nextOpts
+			if defSlice, ok := toStringSliceAny(f.Default); ok {
+				f.Default = expandThemeNavKeyList(defSlice, customNav, nil, false)
+			}
+		}
+		if modified {
+			out[ti].LocalizedSchema = schemaCopy
+		}
+	}
+	return out
+}
+
+func (s *AppServer) normalizeAppearanceNavConfigs(ctx context.Context, locale string, app domain.AppearanceSettings) domain.AppearanceSettings {
+	if len(app.ThemeConfigs) == 0 {
+		return app
+	}
+	customNav := s.listRenderableCustomNav(ctx, locale)
+	activeIDs := make([]string, 0, len(customNav))
+	for _, cn := range customNav {
+		activeIDs = append(activeIDs, cn.ID)
+	}
+	nextConfigs := make(map[string]map[string]any, len(app.ThemeConfigs))
+	for tid, cfg := range app.ThemeConfigs {
+		copied := make(map[string]any, len(cfg)+1)
+		for k, v := range cfg {
+			copied[k] = v
+		}
+		if rawItems, exists := copied["header_nav_items"]; exists {
+			if itemsSlice, ok := toStringSliceAny(rawItems); ok {
+				seenSlice, hasSeen := toStringSliceAny(copied["header_nav_seen_custom"])
+				copied["header_nav_items"] = expandThemeNavKeyList(itemsSlice, customNav, seenSlice, hasSeen)
+				copied["header_nav_seen_custom"] = activeIDs
+			}
+		}
+		nextConfigs[tid] = copied
+	}
+	app.ThemeConfigs = nextConfigs
+	return app
+}
+
+func (s *AppServer) pruneDeletedNavFromThemeConfigs(ctx context.Context, deletedIDs []string) {
+	if len(deletedIDs) == 0 || s.deps.Settings == nil {
+		return
+	}
+	delSet := make(map[string]bool, len(deletedIDs))
+	for _, id := range deletedIDs {
+		if t := strings.TrimSpace(id); t != "" {
+			delSet[t] = true
+		}
+	}
+	if len(delSet) == 0 {
+		return
+	}
+	cur := s.deps.Settings.Snapshot().Appearance
+	if len(cur.ThemeConfigs) == 0 {
+		return
+	}
+	changed := false
+	nextConfigs := make(map[string]map[string]any, len(cur.ThemeConfigs))
+	for tid, cfg := range cur.ThemeConfigs {
+		copied := make(map[string]any, len(cfg))
+		for k, v := range cfg {
+			copied[k] = v
+		}
+		if rawItems, exists := copied["header_nav_items"]; exists {
+			if itemsSlice, ok := toStringSliceAny(rawItems); ok {
+				filtered := make([]string, 0, len(itemsSlice))
+				for _, item := range itemsSlice {
+					if len(item) > 7 && strings.EqualFold(item[:7], "custom:") && delSet[strings.TrimSpace(item[7:])] {
+						changed = true
+						continue
+					}
+					filtered = append(filtered, item)
+				}
+				copied["header_nav_items"] = filtered
+			}
+		}
+		if rawSeen, exists := copied["header_nav_seen_custom"]; exists {
+			if seenSlice, ok := toStringSliceAny(rawSeen); ok {
+				filteredSeen := make([]string, 0, len(seenSlice))
+				for _, sid := range seenSlice {
+					if delSet[sid] {
+						changed = true
+						continue
+					}
+					filteredSeen = append(filteredSeen, sid)
+				}
+				copied["header_nav_seen_custom"] = filteredSeen
+			}
+		}
+		nextConfigs[tid] = copied
+	}
+	if !changed {
+		return
+	}
+	patchBytes, err := json.Marshal(map[string]any{"theme_configs": nextConfigs})
+	if err == nil {
+		_, _, _ = s.deps.Settings.PatchDomain(ctx, domain.SettingsDomainAppearance, patchBytes, 0)
+	}
+}
+
 func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	locale := actor.PreferredLocale
 	if locale == "" {
 		locale = s.resolveLocale(r)
 	}
+	if qLoc := strings.TrimSpace(r.URL.Query().Get("locale")); qLoc != "" {
+		locale = qLoc
+	}
 
 	if rest == "" && r.Method == http.MethodGet {
 		snap := s.deps.Settings.Snapshot()
+		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"active_theme": snap.Appearance.ActiveTheme,
-			"mobile_theme": snap.Appearance.MobileTheme,
-			"appearance":   snap.Appearance,
-			"themes":       s.deps.Themes.ListLocalized(locale),
+			"active_theme": normApp.ActiveTheme,
+			"mobile_theme": normApp.MobileTheme,
+			"appearance":   normApp,
+			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
 		})
 		return
 	}
@@ -2084,12 +2366,13 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			return
 		}
 		snap := s.deps.Settings.Snapshot()
+		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":           true,
-			"active_theme": snap.Appearance.ActiveTheme,
-			"mobile_theme": snap.Appearance.MobileTheme,
-			"appearance":   snap.Appearance,
-			"themes":       s.deps.Themes.ListLocalized(locale),
+			"active_theme": normApp.ActiveTheme,
+			"mobile_theme": normApp.MobileTheme,
+			"appearance":   normApp,
+			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
 		})
 		return
 	}
@@ -2177,7 +2460,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		s.recordAuditLog(r, actor, "theme.install", "theme", mf.ID, map[string]any{"version": mf.Version})
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"theme":  mf,
-			"themes": s.deps.Themes.ListLocalized(locale),
+			"themes": s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
 		})
 		return
 	}
@@ -2211,6 +2494,20 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
+		if nested, ok := cfgPatch["values"].(map[string]any); ok && len(cfgPatch) == 1 {
+			cfgPatch = nested
+		}
+		if rawItems, exists := cfgPatch["header_nav_items"]; exists {
+			customNav := s.listRenderableCustomNav(r.Context(), locale)
+			seenIDs := make([]string, 0, len(customNav))
+			for _, cn := range customNav {
+				seenIDs = append(seenIDs, cn.ID)
+			}
+			if itemsSlice, ok := toStringSliceAny(rawItems); ok {
+				cfgPatch["header_nav_items"] = expandThemeNavKeyList(itemsSlice, customNav, nil, false)
+			}
+			cfgPatch["header_nav_seen_custom"] = seenIDs
+		}
 		cur := s.deps.Settings.Snapshot().Appearance
 		nextConfigs := make(map[string]map[string]any, len(cur.ThemeConfigs)+1)
 		for k, v := range cur.ThemeConfigs {
@@ -2229,7 +2526,10 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		}
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "theme.config", "theme", themeID, nil)
-		writeJSON(w, http.StatusOK, map[string]any{"appearance": val, "version": ver})
+		outApp := s.deps.Settings.Snapshot().Appearance
+		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, outApp)
+		_ = val
+		writeJSON(w, http.StatusOK, map[string]any{"appearance": normApp, "version": ver})
 		return
 	}
 
@@ -2253,11 +2553,13 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
 		nextApp := s.deps.Settings.Snapshot().Appearance
+		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, nextApp)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":           true,
-			"active_theme": nextApp.ActiveTheme,
-			"mobile_theme": nextApp.MobileTheme,
-			"themes":       s.deps.Themes.ListLocalized(locale),
+			"active_theme": normApp.ActiveTheme,
+			"mobile_theme": normApp.MobileTheme,
+			"appearance":   normApp,
+			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
 		})
 		return
 	}

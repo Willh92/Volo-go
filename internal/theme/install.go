@@ -303,6 +303,20 @@ func (e *Engine) ExportZip(w io.Writer, themeID string) error {
 				return nil
 			}
 		}
+		if !strings.Contains(p, "/") && strings.HasSuffix(p, ".gz") {
+			relOut := strings.TrimSuffix(p, ".gz")
+			if _, exists := entriesByPath[relOut]; !exists {
+				if gr, gErr := gzip.NewReader(bytes.NewReader(data)); gErr == nil {
+					inflated, iErr := io.ReadAll(io.LimitReader(gr, maxThemeSingleBytes))
+					_ = gr.Close()
+					if iErr == nil {
+						entriesByPath[relOut] = inflated
+						return nil
+					}
+				}
+			}
+			return nil
+		}
 		entriesByPath[p] = data
 		return nil
 	})

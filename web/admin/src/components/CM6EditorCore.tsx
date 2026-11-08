@@ -12,8 +12,62 @@ import {
   ViewPlugin,
   ViewUpdate,
 } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, indentWithTab, redo, undo } from "@codemirror/commands";
-import { markdownKeymap, markdownLanguage, pasteURLAsLink } from "@codemirror/lang-markdown";
+import {
+  addCursorAbove,
+  addCursorBelow,
+  copyLineDown,
+  copyLineUp,
+  cursorCharLeft,
+  cursorCharRight,
+  cursorDocEnd,
+  cursorDocStart,
+  cursorGroupLeft,
+  cursorGroupRight,
+  cursorLineBoundaryBackward,
+  cursorLineBoundaryForward,
+  cursorLineBoundaryLeft,
+  cursorLineBoundaryRight,
+  cursorLineDown,
+  cursorLineUp,
+  cursorPageDown,
+  cursorPageUp,
+  deleteCharBackward,
+  deleteCharForward,
+  deleteGroupBackward,
+  deleteGroupForward,
+  deleteLine,
+  deleteLineBoundaryBackward,
+  deleteLineBoundaryForward,
+  emacsStyleKeymap,
+  history,
+  historyKeymap,
+  insertBlankLine,
+  insertNewlineKeepIndent,
+  insertTab,
+  moveLineDown,
+  moveLineUp,
+  redo,
+  selectAll,
+  selectCharLeft,
+  selectCharRight,
+  selectDocEnd,
+  selectDocStart,
+  selectGroupLeft,
+  selectGroupRight,
+  selectLine,
+  selectLineBoundaryBackward,
+  selectLineBoundaryForward,
+  selectLineBoundaryLeft,
+  selectLineBoundaryRight,
+  selectLineDown,
+  selectLineUp,
+  selectPageDown,
+  selectPageUp,
+  simplifySelection,
+  toggleTabFocusMode,
+  undo,
+} from "@codemirror/commands";
+import type { KeyBinding } from "@codemirror/view";
 import { apiFetch, openConfirm, showToast } from "../api";
 import { localeSig, t } from "../i18n";
 import {
@@ -29,6 +83,196 @@ import { MediaLibraryModal } from "./MediaLibraryModal";
 import type { CM6CssEditorProps, CM6EditorProps } from "./CM6Editor";
 
 type EditorMode = "ir" | "wysiwyg" | "sv";
+
+function dedentTwoSpaces(view: EditorView): boolean {
+  const { state } = view;
+  if (state.readOnly) return false;
+  const changes: Array<{ from: number; to: number; insert: string }> = [];
+  const seen = new Set<number>();
+  for (const r of state.selection.ranges) {
+    const startLine = state.doc.lineAt(r.from).number;
+    const endLine = state.doc.lineAt(r.to).number;
+    for (let ln = startLine; ln <= endLine; ln++) {
+      if (seen.has(ln)) continue;
+      seen.add(ln);
+      const line = state.doc.line(ln);
+      if (line.text.startsWith("\t")) {
+        changes.push({ from: line.from, to: line.from + 1, insert: "" });
+      } else if (line.text.startsWith("  ")) {
+        changes.push({ from: line.from, to: line.from + 2, insert: "" });
+      } else if (line.text.startsWith(" ")) {
+        changes.push({ from: line.from, to: line.from + 1, insert: "" });
+      }
+    }
+  }
+  if (changes.length > 0) {
+    view.dispatch({ changes, userEvent: "input.dedent" });
+  }
+  return true;
+}
+
+const voloIndentWithTab: KeyBinding = {
+  key: "Tab",
+  run: insertTab,
+  shift: dedentTwoSpaces,
+};
+
+const voloBaseKeymap: KeyBinding[] = [
+  { key: "ArrowLeft", run: cursorCharLeft, shift: selectCharLeft, preventDefault: true },
+  { key: "Mod-ArrowLeft", mac: "Alt-ArrowLeft", run: cursorGroupLeft, shift: selectGroupLeft, preventDefault: true },
+  { mac: "Cmd-ArrowLeft", run: cursorLineBoundaryLeft, shift: selectLineBoundaryLeft, preventDefault: true },
+  { key: "ArrowRight", run: cursorCharRight, shift: selectCharRight, preventDefault: true },
+  { key: "Mod-ArrowRight", mac: "Alt-ArrowRight", run: cursorGroupRight, shift: selectGroupRight, preventDefault: true },
+  { mac: "Cmd-ArrowRight", run: cursorLineBoundaryRight, shift: selectLineBoundaryRight, preventDefault: true },
+  { key: "ArrowUp", run: cursorLineUp, shift: selectLineUp, preventDefault: true },
+  { mac: "Cmd-ArrowUp", run: cursorDocStart, shift: selectDocStart },
+  { mac: "Ctrl-ArrowUp", run: cursorPageUp, shift: selectPageUp },
+  { key: "ArrowDown", run: cursorLineDown, shift: selectLineDown, preventDefault: true },
+  { mac: "Cmd-ArrowDown", run: cursorDocEnd, shift: selectDocEnd },
+  { mac: "Ctrl-ArrowDown", run: cursorPageDown, shift: selectPageDown },
+  { key: "PageUp", run: cursorPageUp, shift: selectPageUp },
+  { key: "PageDown", run: cursorPageDown, shift: selectPageDown },
+  { key: "Home", run: cursorLineBoundaryBackward, shift: selectLineBoundaryBackward, preventDefault: true },
+  { key: "Mod-Home", run: cursorDocStart, shift: selectDocStart },
+  { key: "End", run: cursorLineBoundaryForward, shift: selectLineBoundaryForward, preventDefault: true },
+  { key: "Mod-End", run: cursorDocEnd, shift: selectDocEnd },
+  { key: "Enter", run: insertNewlineKeepIndent, shift: insertNewlineKeepIndent },
+  { key: "Mod-a", run: selectAll },
+  { key: "Backspace", run: deleteCharBackward, shift: deleteCharBackward, preventDefault: true },
+  { key: "Delete", run: deleteCharForward, preventDefault: true },
+  { key: "Mod-Backspace", mac: "Alt-Backspace", run: deleteGroupBackward, preventDefault: true },
+  { key: "Mod-Delete", mac: "Alt-Delete", run: deleteGroupForward, preventDefault: true },
+  { mac: "Mod-Backspace", run: deleteLineBoundaryBackward, preventDefault: true },
+  { mac: "Mod-Delete", run: deleteLineBoundaryForward, preventDefault: true },
+  { key: "Alt-ArrowUp", run: moveLineUp },
+  { key: "Shift-Alt-ArrowUp", run: copyLineUp },
+  { key: "Alt-ArrowDown", run: moveLineDown },
+  { key: "Shift-Alt-ArrowDown", run: copyLineDown },
+  { key: "Mod-Alt-ArrowUp", run: addCursorAbove },
+  { key: "Mod-Alt-ArrowDown", run: addCursorBelow },
+  { key: "Escape", run: simplifySelection },
+  { key: "Mod-Enter", run: insertBlankLine },
+  { key: "Alt-l", mac: "Ctrl-l", run: selectLine },
+  { key: "Shift-Mod-k", run: deleteLine },
+  { key: "Ctrl-m", mac: "Shift-Alt-m", run: toggleTabFocusMode },
+  ...emacsStyleKeymap.map((b) => ({ mac: b.key, run: b.run, shift: b.shift })),
+];
+
+function isInsideFencedCode(state: EditorState, lineNumber: number): boolean {
+  let fenceChar = "";
+  let fenceLen = 0;
+  for (let n = 1; n < lineNumber; n++) {
+    const m = /^\s*(`{3,}|~{3,})/.exec(state.doc.line(n).text);
+    if (!m) continue;
+    const ch = m[1][0];
+    const len = m[1].length;
+    if (!fenceChar) {
+      fenceChar = ch;
+      fenceLen = len;
+    } else if (ch === fenceChar && len >= fenceLen) {
+      fenceChar = "";
+      fenceLen = 0;
+    }
+  }
+  return fenceChar !== "";
+}
+
+const mdLinePrefixRe =
+  /^(\s*(?:>\s*)*)(?:([-*+])\s+(\[[ xX]\]\s+)?|(\d+)([.)])\s+|)?(.*)$/;
+
+const markdownEditingKeymap = [
+  {
+    key: "Enter",
+    run(view: EditorView): boolean {
+      const { state } = view;
+      if (state.readOnly || state.selection.ranges.length !== 1 || !state.selection.main.empty) {
+        return false;
+      }
+      const pos = state.selection.main.head;
+      const line = state.doc.lineAt(pos);
+      if (isInsideFencedCode(state, line.number)) return false;
+
+      const beforeCursor = line.text.slice(0, pos - line.from);
+      const afterCursor = line.text.slice(pos - line.from);
+      const m = mdLinePrefixRe.exec(beforeCursor);
+      if (!m) return false;
+      const [, quotePrefix, bullet, taskBox, ordNum, ordDelim, restBefore] = m;
+      const hasMarker = Boolean(quotePrefix.trim() || bullet || ordNum);
+      if (!hasMarker) return false;
+
+      // Empty list item / empty blockquote line -> exit block cleanly
+      if (!restBefore.trim() && !afterCursor.trim()) {
+        view.dispatch({
+          changes: { from: line.from, to: line.to, insert: "" },
+          selection: { anchor: line.from },
+          userEvent: "input",
+        });
+        return true;
+      }
+
+      let nextPrefix = quotePrefix;
+      if (bullet) {
+        nextPrefix += `${bullet} ${taskBox ? "[ ] " : ""}`;
+      } else if (ordNum) {
+        nextPrefix += `${Number(ordNum) + 1}${ordDelim} `;
+      }
+      view.dispatch({
+        changes: { from: pos, to: pos, insert: `\n${nextPrefix}` },
+        selection: { anchor: pos + 1 + nextPrefix.length },
+        scrollIntoView: true,
+        userEvent: "input",
+      });
+      return true;
+    },
+  },
+  {
+    key: "Backspace",
+    run(view: EditorView): boolean {
+      const { state } = view;
+      if (state.readOnly || state.selection.ranges.length !== 1 || !state.selection.main.empty) {
+        return false;
+      }
+      const pos = state.selection.main.head;
+      const line = state.doc.lineAt(pos);
+      if (pos === line.from || isInsideFencedCode(state, line.number)) return false;
+      const before = line.text.slice(0, pos - line.from);
+      if (/^\s*(?:>\s*)+(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)?$/.test(before) ||
+          /^\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)$/.test(before)) {
+        const indent = /^\s*/.exec(before)?.[0] || "";
+        view.dispatch({
+          changes: { from: line.from, to: pos, insert: indent },
+          selection: { anchor: line.from + indent.length },
+          userEvent: "delete.backward",
+        });
+        return true;
+      }
+      return false;
+    },
+  },
+];
+
+const pasteURLAsLinkExt = EditorView.domEventHandlers({
+  paste(event, view) {
+    const { state } = view;
+    if (state.readOnly) return false;
+    const text = event.clipboardData?.getData("text/plain")?.trim() || "";
+    if (!/^https?:\/\/\S+$/i.test(text)) return false;
+    const sel = state.selection.main;
+    if (sel.empty) return false;
+    const line = state.doc.lineAt(sel.from);
+    if (sel.to > line.to || isInsideFencedCode(state, line.number)) return false;
+    const selected = state.sliceDoc(sel.from, sel.to);
+    if (!selected || /^https?:\/\//i.test(selected) || /[\[\]`]/.test(selected)) return false;
+    event.preventDefault();
+    const rep = `[${selected}](${text})`;
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert: rep },
+      selection: { anchor: sel.from + rep.length },
+      userEvent: "input.paste",
+    });
+    return true;
+  },
+});
 
 function buildInstantRenderPlugin() {
   const hideDeco = Decoration.replace({});
@@ -643,13 +887,12 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       extensions: [
         modeCompartment.current.of(modeExtensions(mode)),
         history(),
-        markdownLanguage,
-        Prec.high(keymap.of(markdownKeymap)),
-        pasteURLAsLink,
+        Prec.high(keymap.of(markdownEditingKeymap)),
+        pasteURLAsLinkExt,
         EditorView.lineWrapping,
         phCompartment.current.of(placeholder(t("ed.placeholder"))),
         shortcutKeymap,
-        keymap.of([...defaultKeymap, ...historyKeymap]),
+        keymap.of([...voloBaseKeymap, ...historyKeymap]),
         domHandlers,
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
@@ -1836,8 +2079,8 @@ export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave 
               return true;
             },
           },
-          indentWithTab,
-          ...defaultKeymap,
+          voloIndentWithTab,
+          ...voloBaseKeymap,
           ...historyKeymap,
         ]),
         EditorView.updateListener.of((u) => {

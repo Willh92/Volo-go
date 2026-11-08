@@ -174,9 +174,20 @@ function SchemaFieldControl({
           : { value: String(op), label: String(op) },
       );
       const optMap = new Map(allOpts.map((o) => [o.value, o.label]));
-      const enabledKeys: string[] = (Array.isArray(rawCur) ? rawCur : [])
-        .map((k: any) => String(k))
-        .filter((k: string, idx: number, arr: string[]) => optMap.has(k) && arr.indexOf(k) === idx);
+      const rawExpanded: string[] = [];
+      for (const rawItem of Array.isArray(rawCur) ? rawCur : []) {
+        const str = String(rawItem).trim();
+        if (f.key === "header_nav_items" && str.toLowerCase() === "custom") {
+          for (const opt of allOpts) {
+            if (opt.value.startsWith("custom:")) rawExpanded.push(opt.value);
+          }
+        } else {
+          rawExpanded.push(str);
+        }
+      }
+      const enabledKeys: string[] = rawExpanded.filter(
+        (k: string, idx: number, arr: string[]) => optMap.has(k) && arr.indexOf(k) === idx,
+      );
       const enabledSet = new Set(enabledKeys);
       const disabledOpts = allOpts.filter((o) => !enabledSet.has(o.value));
       const showNavPlacement = f.key === "header_nav_items";
@@ -712,7 +723,7 @@ export function AppearanceWorkspace({
           apiFetch<any>("/api/admin/settings"),
         ]);
         setThemes(th.themes || th.items || []);
-        const nextApp = { ...(th.appearance || {}), ...(st.domains?.appearance || {}) };
+        const nextApp = { ...(st.domains?.appearance || {}), ...(th.appearance || {}) };
         if (draftCssRef.current !== null) {
           nextApp.custom_css = draftCssRef.current;
         }

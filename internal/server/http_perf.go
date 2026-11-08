@@ -177,12 +177,14 @@ func addVaryHeader(h http.Header, tokens ...string) {
 // cache-safe GET responses >= 1 KiB while enforcing 100% BREACH/CRIME immunity:
 // any request carrying session/unlock credentials or preview tokens, or any response setting
 // cookies or private/no-store Cache-Control headers, bypasses compression completely.
-func wrapPublicDynamicGzip(next http.Handler, adminPath string) http.Handler {
-	cleanAdmin := strings.TrimSpace(adminPath)
-	if cleanAdmin == "" {
-		cleanAdmin = config.DefaultAdminPath
-	}
+func wrapPublicDynamicGzip(next http.Handler, adminPathFn func() string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cleanAdmin := config.DefaultAdminPath
+		if adminPathFn != nil {
+			if dyn := strings.TrimSpace(adminPathFn()); dyn != "" {
+				cleanAdmin = dyn
+			}
+		}
 		if !eligibleForPublicDynamicGzip(r, cleanAdmin) {
 			next.ServeHTTP(w, r)
 			return

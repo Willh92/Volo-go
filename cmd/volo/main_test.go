@@ -47,7 +47,7 @@ func TestCLISwissArmyKnifeEndToEnd(t *testing.T) {
 		t.Fatalf("volo import-legacy failed (code=%d): %s", code, errBuf.String())
 	}
 
-	// Seed a session + TOTP credential for imported admin ("will") so we can test reset-password & disable-2fa
+	// Seed a session + TOTP credential for imported admin ("admin") so we can test reset-password & disable-2fa
 	cfg, err := config.LoadWithEnviron(config.CLIOverrides{DataDir: &dataDir}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +57,7 @@ func TestCLISwissArmyKnifeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UnixMilli()
-	adminUser, err := sqlx.Get[domain.User](ctx, store, `SELECT * FROM users WHERE username = ?`, "will")
+	adminUser, err := sqlx.Get[domain.User](ctx, store, `SELECT * FROM users WHERE username = ?`, "admin")
 	if err != nil {
 		t.Fatalf("query imported user: %v", err)
 	}
@@ -77,26 +77,26 @@ func TestCLISwissArmyKnifeEndToEnd(t *testing.T) {
 	}
 	_ = store.Close()
 
-	// 3. volo admin reset-password --user will --password NewStrongPass99!
+	// 3. volo admin reset-password --user admin --password NewStrongPass99!
 	out.Reset()
 	errBuf.Reset()
 	code = runCLI(ctx, []string{
 		"admin", "reset-password",
 		"--data-dir", dataDir,
-		"--user", "will",
+		"--user", "admin",
 		"--password", "NewStrongPass99!",
 	}, &out, &errBuf)
 	if code != 0 {
 		t.Fatalf("admin reset-password failed (code=%d): %s", code, errBuf.String())
 	}
 
-	// 4. volo admin disable-2fa --user will@example.com
+	// 4. volo admin disable-2fa --user admin@example.com
 	out.Reset()
 	errBuf.Reset()
 	code = runCLI(ctx, []string{
 		"admin", "disable-2fa",
 		"--data-dir", dataDir,
-		"--user", "will@example.com",
+		"--user", "admin@example.com",
 	}, &out, &errBuf)
 	if code != 0 {
 		t.Fatalf("admin disable-2fa failed (code=%d): %s", code, errBuf.String())
@@ -178,7 +178,7 @@ func writeMinimalLegacyZip(t *testing.T, path string) {
 	t.Helper()
 	payload := `{
 		"options": [{"oId":"blogTitle","optionCategory":"preference","optionValue":"CLI Test Blog"}],
-		"users": [{"oId":"default","userName":"will","userEmail":"will@example.com","userRole":"adminRole"}],
+		"users": [{"oId":"default","userName":"admin","userEmail":"admin@example.com","userRole":"adminRole"}],
 		"categories": [{"oId":"c1","categoryTitle":"Tech","categoryURI":"tech","categoryOrder":1}],
 		"tags": [{"oId":"t1","tagTitle":"Go"}],
 		"category_tag": [{"oId":"ct1","category_oId":"c1","tag_oId":"t1"}],

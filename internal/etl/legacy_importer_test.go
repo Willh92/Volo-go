@@ -188,7 +188,7 @@ func TestImportLegacyBoloSolo15TableArchiveStreamingAndZeroDeadLinks(t *testing.
 	if snap.Appearance.ActiveTheme != "volo-studio" || snap.Appearance.Accent != "teal" {
 		t.Fatalf("unexpected appearance settings after legacy skin fallback: %+v", snap.Appearance)
 	}
-	if snap.Site.Title != "Will's Notes" || len(snap.Site.SocialLinks) != 2 {
+	if snap.Site.Title != "Studio Notes" || len(snap.Site.SocialLinks) != 2 {
 		t.Fatalf("unexpected site settings: %+v", snap.Site)
 	}
 }
@@ -202,12 +202,12 @@ func buildComprehensiveLegacy15TableZip(t *testing.T, zipPath string) {
 	chunks := splitIntoNChunks(seriesPayload, 12)
 	options := []map[string]any{
 		{"oId": "version", "optionCategory": "system", "optionValue": "3.0.0"},
-		{"oId": "blogTitle", "optionCategory": "preference", "optionValue": "Will's Notes"},
+		{"oId": "blogTitle", "optionCategory": "preference", "optionValue": "Studio Notes"},
 		{"oId": "blogSubtitle", "optionCategory": "preference", "optionValue": "Clean Architecture"},
 		{"oId": "localeString", "optionCategory": "preference", "optionValue": "zh_CN"},
 		{"oId": "skinDirName", "optionCategory": "skin", "optionValue": "Pinghsu"}, // legacy skin -> fallback volo-studio
 		{"oId": "appearanceAccent", "optionCategory": "preference", "optionValue": "teal"},
-		{"oId": "usite", "optionCategory": "preference", "optionValue": `{"usiteGithub":"https://github.com/Willh92","usiteX":"https://x.com/willh92"}`},
+		{"oId": "usite", "optionCategory": "preference", "optionValue": `{"usiteGithub":"https://github.com/octocat","usiteX":"https://x.com/octocat"}`},
 		{"oId": "mailUserContext", "optionCategory": "mail", "optionValue": "cmt_1:Bob:reader_backfill@example.com;"},
 		{
 			"oId":            "voloSeries",
@@ -251,8 +251,8 @@ func buildComprehensiveLegacy15TableZip(t *testing.T, zipPath string) {
 		"users": []map[string]any{
 			{
 				"oId":              "default",
-				"userName":         "will",
-				"userEmail":        "will@example.com",
+				"userName":         "admin",
+				"userEmail":        "admin@example.com",
 				"userPasswordHash": "pbkdf2$sha256$120000$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNo",
 				"userRole":         "adminRole",
 				"userAvatar":       "https://static." + "b3" + "log.org/icons/default-user-thumbnail.png",
@@ -321,7 +321,7 @@ func buildComprehensiveLegacy15TableZip(t *testing.T, zipPath string) {
 				"revisionTitle":      "Migrating Draft v1",
 				"revisionAbstract":   "Draft",
 				"revisionContent":    "Initial draft content",
-				"revisionAuthorName": "will",
+				"revisionAuthorName": "admin",
 				"revisionCreated":    1684390000000,
 			},
 		},
@@ -340,7 +340,7 @@ func buildComprehensiveLegacy15TableZip(t *testing.T, zipPath string) {
 			{
 				"oId":                      "cmt_2",
 				"commentOnId":              "art_101",
-				"commentName":              "will",
+				"commentName":              "admin",
 				"commentUserId":            "default",
 				"commentContent":           "Thanks Bob!",
 				"commentOriginalCommentId": "cmt_1",
@@ -351,7 +351,7 @@ func buildComprehensiveLegacy15TableZip(t *testing.T, zipPath string) {
 			{
 				"oId":            "nav_1",
 				"pageTitle":      "GitHub",
-				"pagePermalink":  "https://github.com/Willh92",
+				"pagePermalink":  "https://github.com/octocat",
 				"pageOpenTarget": "_blank",
 				"pageOrder":      1,
 			},
@@ -441,15 +441,15 @@ func TestImportLegacyResilientToMissingChunksAndRealWorldAnomalies(t *testing.T)
 
 	booksJSON := `[{"id":"b7b80c66","title":"Broken TOC Book","sourceType":"gitbook","sourceUrl":"https://docs.example.com","chapterCount":12}]`
 	seriesJSON := `[{"id":"ser_real","title":"Go Deep Dive","articleIds":["art_gh","art_deleted_ghost"]}]`
-	ghReposJSON := `[{"githubrepoName":"Volo-go","githubrepoFullName":"Willh92/Volo-go","githubrepoDescription":"Pure Go blog","githubrepoHTMLURL":"https://github.com/Willh92/Volo-go","githubrepoLanguage":"Go","githubrepoStargazersCount":128,"githubrepoForksCount":16,"githubrepoFork":false,"githubrepoUpdated":1730900000000},{"githubrepoName":"SecretRepo","githubrepoFullName":"Willh92/SecretRepo","githubrepoFork":true,"githubrepoUpdated":1730800000000}]`
-	ghDisplayJSON := `{"includeForks":true,"hidden":["willh92/secretrepo"]}`
+	ghReposJSON := `[{"githubrepoName":"hello-world","githubrepoFullName":"octocat/hello-world","githubrepoDescription":"Pure Go blog","githubrepoHTMLURL":"https://github.com/octocat/hello-world","githubrepoLanguage":"Go","githubrepoStargazersCount":128,"githubrepoForksCount":16,"githubrepoFork":false,"githubrepoUpdated":1730900000000},{"githubrepoName":"SecretRepo","githubrepoFullName":"octocat/SecretRepo","githubrepoFork":true,"githubrepoUpdated":1730800000000}]`
+	ghDisplayJSON := `{"includeForks":true,"hidden":["octocat/secretrepo"]}`
 
 	rawDoc := map[string]any{
 		"users": []map[string]any{
 			{
 				"oId":              "550e8400-e29b-41d4-a716-446655440000",
-				"userName":         "will",
-				"userEmail":        "will@example.com",
+				"userName":         "admin",
+				"userEmail":        "admin@example.com",
 				"userRole":         "adminRole",
 				"userPasswordHash": "pbkdf2$sha256$120000$00112233445566778899aabbccddeeff$0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 			},
@@ -461,8 +461,8 @@ func TestImportLegacyResilientToMissingChunksAndRealWorldAnomalies(t *testing.T)
 			},
 		},
 		"options": []map[string]any{
-			{"oId": "blogTitle", "optionValue": "Will Studio"},
-			{"oId": "myGitHubID", "optionValue": "Willh92"},
+			{"oId": "blogTitle", "optionValue": "Example Studio"},
+			{"oId": "myGitHubID", "optionValue": "octocat"},
 			{"oId": "voloBooks", "optionValue": booksJSON},
 			// Root manifest referencing a missing chunk (exact reproduction of user's backup failure!)
 			{"oId": "voloBookToc.b7b80c66", "optionValue": `{"count":2,"generation":"9003c49a46ad4af0baf8916fcd6f8e2c","storage":"chunks"}`},
@@ -475,7 +475,7 @@ func TestImportLegacyResilientToMissingChunksAndRealWorldAnomalies(t *testing.T)
 				"oId":              "art_gh",
 				"articleTitle":     "我在 GitHub 上的开源项目",
 				"articleAbstract":  "开源作品汇总",
-				"articleContent":   "![stats](/github-stats/Willh92.svg)",
+				"articleContent":   "![stats](/github-stats/octocat.svg)",
 				"articleAuthorId":  "550e8400-e29b-41d4-a716-446655440000",
 				"articlePermalink": "/my-github-repos",
 				"articleStatus":    0,
@@ -866,11 +866,11 @@ func TestETLRound3_DisguisedMarkup_RollbackCleanup_FKSafeClear_AnalyticsMapping_
 		"options": []map[string]any{
 			{"oId": "blogTitle", "optionValue": "Round 3 ETL"},
 			{"oId": "faviconURL", "optionValue": "javascript:alert(1)"},
-			{"oId": "usite", "optionValue": `{"github":"https://github.com/Willh92","weibo":"javascript:evil()"}`},
+			{"oId": "usite", "optionValue": `{"github":"https://github.com/octocat","weibo":"javascript:evil()"}`},
 			{"oId": "voloDailyStats", "optionValue": statsJSON},
 		},
 		"users": []map[string]any{
-			{"oId": "default", "userName": "will", "userEmail": "will@example.com", "userRole": "adminRole"},
+			{"oId": "default", "userName": "admin", "userEmail": "admin@example.com", "userRole": "adminRole"},
 		},
 		"tags": []map[string]any{
 			{"oId": "tag_go", "tagTitle": "Golang"},

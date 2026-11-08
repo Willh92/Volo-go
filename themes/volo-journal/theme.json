@@ -56,9 +56,9 @@
         "zh-TW": "頂部導覽選單項目與排序"
       },
       "description": {
-        "zh-CN": "选择需要显示的导航项并调整顺序；「自定义导航链接」默认排在最后。",
-        "en-US": "Toggle visible header items and reorder them; 'Custom Navigation Links' defaults to last.",
-        "zh-TW": "選擇需要顯示的導覽項目並調整順序；「自訂導覽連結」預設排在最後。"
+        "zh-CN": "选择需要显示的导航项并自由调整顺序；在「分发 → 导航与重定向」中添加的自定义导航链接会自动拆分为独立项供自由混排。",
+        "en-US": "Toggle visible header items and reorder them freely; custom links from Distribute -> Navigation appear as individual items.",
+        "zh-TW": "選擇需要顯示的導覽項目並自由調整順序；在「分發 → 導覽與重新導向」中新增的自訂導覽連結會自動拆分為獨立項目供自由混排。"
       },
       "default": ["home", "archives", "tags", "categories", "series", "books", "links", "follows", "dynamic", "custom"],
       "options": [

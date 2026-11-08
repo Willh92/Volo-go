@@ -1699,7 +1699,7 @@ export function DistributeWorkspace({
                 <label>{t("dist.seo_gh_user")}</label>
                 <input
                   class="volo-input"
-                  placeholder="Willh92"
+                  placeholder="octocat"
                   value={seoCfg.github_username || ""}
                   onInput={(e) => setSeoCfg({ ...seoCfg, github_username: (e.currentTarget as HTMLInputElement).value })}
                 />

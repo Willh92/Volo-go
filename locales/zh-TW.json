@@ -1859,5 +1859,16 @@
   "taxonomy.back_series": "返回全部專欄",
   "taxonomy.back_archives": "返回歸檔總覽",
   "footer.powered_prefix": "由 ",
-  "footer.powered_suffix": " 驅動"
+  "footer.powered_suffix": " 驅動",
+  "auth.err_totp_invalid": "兩步驗證動態口令無效或已過期",
+  "auth.err_totp_replay": "該動態口令在目前時間視窗內已使用，請等待下一組口令",
+  "auth.err_2fa_expired": "兩步驗證工作階段已過期，請重新登入",
+  "auth.err_passkey_failed": "通行金鑰驗證失敗，請重試或改用密碼登入",
+  "api.err_totp_replay": "該動態口令在目前時間視窗內已使用，請等待下一組口令",
+  "api.err_passkey_failed": "通行金鑰驗證失敗，請重試或改用密碼登入",
+  "api.err_weak_password": "密碼長度需在 6～128 個字元之間",
+  "api.err_invalid_email": "請輸入有效的電子信箱地址",
+  "api.err_username_len": "使用者名稱長度需為 2～48 個字元",
+  "api.err_pat_scope_required": "請至少勾選一項 API 權杖權限範圍",
+  "api.err_invalid_dynamic_login_path": "自訂後台入口路徑格式無效或與系統公開路由衝突"
 }

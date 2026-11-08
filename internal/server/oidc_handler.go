@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/security"
@@ -62,14 +61,8 @@ func isSafeRelativeRedirect(cand string) bool {
 }
 
 func (s *AppServer) adminMountPath() string {
-	adminPrefix := config.DefaultAdminPath
-	if s.deps.Config != nil && strings.TrimSpace(s.deps.Config.AdminPath) != "" {
-		adminPrefix = "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
-	}
-	if adminPrefix == "/" {
-		adminPrefix = config.DefaultAdminPath
-	}
-	return adminPrefix
+	p, _ := s.effectiveAdminPrefix()
+	return p
 }
 
 func (s *AppServer) oidcCallbackURL(r *http.Request, providerName string) string {

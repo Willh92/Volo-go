@@ -246,5 +246,9 @@
   "taxonomy.back_series": "返回全部专题",
   "taxonomy.back_archives": "返回全部归档",
   "footer.powered_prefix": "由",
-  "footer.powered_suffix": "驱动"
+  "footer.powered_suffix": "驱动",
+  "auth.err_totp_invalid": "两步验证动态口令无效或已过期",
+  "auth.err_totp_replay": "该动态口令在当前时间窗口内已使用，请等待下一组口令",
+  "auth.err_2fa_expired": "两步验证会话已过期，请重新登录",
+  "auth.err_passkey_failed": "通行密钥验证失败，请重试或改用密码登录"
 }

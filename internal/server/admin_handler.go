@@ -47,28 +47,73 @@ type MediaProcessor interface {
 	TestStorage(ctx context.Context, override *domain.StorageSettings, overrideSecret string) error
 }
 
-func (s *AppServer) registerAdminRoutes(mux *http.ServeMux) {
-	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
-	if adminPrefix == "/" {
-		adminPrefix = "/console"
+func (s *AppServer) staticAdminPrefix() string {
+	adminPrefix := "/console"
+	if s.deps.Config != nil {
+		if p := strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/"); p != "" {
+			adminPrefix = "/" + p
+		}
 	}
+	return adminPrefix
+}
+
+func (s *AppServer) effectiveAdminPrefix() (prefix string, isCustom bool) {
+	base := s.staticAdminPrefix()
+	custom := s.deps.Config != nil && s.deps.Config.IsCustomAdminPath
+	if s.deps.Settings != nil {
+		if dyn := strings.Trim(strings.TrimSpace(s.deps.Settings.Snapshot().Security.DynamicLoginPath), "/"); dyn != "" {
+			dynPrefix := "/" + dyn
+			return dynPrefix, dynPrefix != "/console" || custom
+		}
+	}
+	return base, custom
+}
+
+func (s *AppServer) registerAdminRoutes(mux *http.ServeMux) {
+	adminPrefix := s.staticAdminPrefix()
 	mux.HandleFunc(adminPrefix, s.handleAdminSPA)
 	mux.HandleFunc(adminPrefix+"/", s.handleAdminSPA)
 	mux.HandleFunc("/api/admin/", s.handleAdminAPI)
 }
 
 func (s *AppServer) handleAdminSPA(w http.ResponseWriter, r *http.Request) {
-	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
+	activePrefix, _ := s.effectiveAdminPrefix()
+	s.serveAdminSPAAt(w, r, activePrefix)
+}
+
+func (s *AppServer) serveAdminSPAAt(w http.ResponseWriter, r *http.Request, mountPrefix string) {
 	snap := s.deps.Settings.Snapshot()
-	adminui.Default().ServeMount(w, r, adminPrefix, adminui.BootConfig{
+	adminui.Default().ServeMount(w, r, mountPrefix, adminui.BootConfig{
 		Mode:          "console",
-		AdminPath:     adminPrefix,
+		AdminPath:     mountPrefix,
+		BaseAdminPath: s.staticAdminPrefix(),
 		PublicURL:     s.publicBaseURL(r),
 		DefaultLocale: snap.Site.DefaultLocale,
 		Accent:        snap.Appearance.Accent,
 		DefaultTheme:  snap.Appearance.DefaultMode,
 		SiteTitle:     snap.Site.Title,
 		Locales:       s.deps.Catalog.Locales(),
+	})
+}
+
+func (s *AppServer) withDynamicAdminMount(next http.Handler) http.Handler {
+	staticPrefix := s.staticAdminPrefix()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		activePrefix, _ := s.effectiveAdminPrefix()
+		if p == activePrefix || strings.HasPrefix(p, activePrefix+"/") {
+			s.serveAdminSPAAt(w, r, activePrefix)
+			return
+		}
+		if activePrefix != staticPrefix && (p == staticPrefix || strings.HasPrefix(p, staticPrefix+"/")) {
+			if viewer, _ := s.resolveViewer(r); viewer == nil && s.deps.WAF != nil && s.deps.Config != nil {
+				clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonScannerTrap, 2)
+			}
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -364,12 +409,12 @@ func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	res, err := s.deps.Auth.LoginStaff(r.Context(), req.Ident, req.Password, clientIP, geo, r.UserAgent(), trusted2FA)
 	if errors.Is(err, auth.ErrForbidden) {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 2)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": auth.ErrInvalidCredentials.Error()})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, auth.ErrInvalidCredentials)})
 		return
 	}
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, err)})
 		return
 	}
 	if res.Requires2FA {
@@ -398,7 +443,7 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 	}
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	if !s.deps.WAF.AllowRate("admin:2fa", clientIP, 10, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
 		return
 	}
 	var req struct {
@@ -417,7 +462,7 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 	res, trustCookie, err := s.deps.Auth.CompleteStaff2FA(r.Context(), req.ChallengeToken, req.Code, req.RememberDevice, clientIP, geo, r.UserAgent())
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.Reason2FAFail, 1)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, err)})
 		return
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
@@ -454,7 +499,7 @@ func (s *AppServer) handleAdminPasskeyLoginBegin(w http.ResponseWriter, r *http.
 	}
 	res, err := auth.BeginPasskeyCeremony(s.deps.Config.KeyRing, "", "login", s.publicBaseURL(r))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.localizeAdminAuthError(r, err)})
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -488,7 +533,7 @@ func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http
 	adBytes, err2 := base64.RawURLEncoding.DecodeString(req.AuthenticatorData)
 	sigBytes, err3 := base64.RawURLEncoding.DecodeString(req.Signature)
 	if err1 != nil || err2 != nil || err3 != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid base64url passkey fields"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.bad_request")})
 		return
 	}
 	geo := ""
@@ -498,7 +543,7 @@ func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http
 	res, err := s.deps.Auth.LoginWithPasskey(r.Context(), req.StateToken, req.CredentialID, cdBytes, adBytes, sigBytes, clientIP, geo, r.UserAgent())
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.localizeAdminAuthError(r, err)})
 		return
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
@@ -507,6 +552,38 @@ func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http
 		"user":       res.User,
 		"csrf_token": res.CSRFToken,
 	})
+}
+
+func (s *AppServer) localizeAdminAuthError(r *http.Request, err error) string {
+	if err == nil {
+		return ""
+	}
+	locale := s.resolveLocale(r)
+	cat := s.deps.Catalog
+	switch {
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		return cat.T(locale, "reader.err_invalid_credentials")
+	case errors.Is(err, auth.ErrUnauthorized):
+		return cat.T(locale, "error.unauthorized")
+	case errors.Is(err, auth.ErrForbidden):
+		return cat.T(locale, "error.forbidden")
+	case errors.Is(err, auth.ErrTOTPInvalid):
+		return cat.T(locale, "auth.err_totp_invalid")
+	case errors.Is(err, auth.ErrTOTPReplay):
+		return cat.T(locale, "auth.err_totp_replay")
+	case errors.Is(err, auth.ErrTwoFactorExpired):
+		return cat.T(locale, "auth.err_2fa_expired")
+	case errors.Is(err, auth.ErrPasskeyVerifyFailed), errors.Is(err, auth.ErrPasskeyCloneDetected):
+		return cat.T(locale, "auth.err_passkey_failed")
+	case errors.Is(err, auth.ErrWeakPassword):
+		return cat.T(locale, "reader.err_password_policy")
+	case errors.Is(err, auth.ErrVerificationCode):
+		return cat.T(locale, "reader.err_verify_code")
+	case errors.Is(err, auth.ErrCodeCooldown):
+		return cat.T(locale, "reader.err_code_cooldown")
+	default:
+		return err.Error()
+	}
 }
 
 func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor *domain.User, sess *domain.UserSession) {
@@ -1330,17 +1407,16 @@ func (s *AppServer) validateLegacyPermalink(ctx context.Context, rawLegacy strin
 		return "", errors.New("legacy_permalink must not contain whitespace, query strings, fragments, backslashes, or '..'")
 	}
 	low := strings.ToLower(clean)
-	adminPref := "/" + strings.ToLower(strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/"))
-	if adminPref == "/" {
-		adminPref = "/console"
-	}
+	adminPref := strings.ToLower(s.staticAdminPrefix())
+	effAdmin, _ := s.effectiveAdminPrefix()
+	effPref := strings.ToLower(effAdmin)
 	reservedPrefixes := []string{
 		"/api/", "/console/", "/setup/", "/posts/", "/uploads/", "/themes/", "/plugins/", "/static/", "/assets/",
-		adminPref + "/",
+		adminPref + "/", effPref + "/",
 	}
 	reservedExact := []string{
 		"/api", "/console", "/setup", "/feed", "/feed.xml", "/rss", "/rss.xml", "/atom.xml", "/feed.json",
-		"/sitemap.xml", "/robots.txt", "/llms.txt", "/llms-full.txt", adminPref,
+		"/sitemap.xml", "/robots.txt", "/llms.txt", "/llms-full.txt", adminPref, effPref,
 	}
 	for _, ex := range reservedExact {
 		if low == ex {

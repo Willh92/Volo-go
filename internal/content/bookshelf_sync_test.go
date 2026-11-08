@@ -99,7 +99,7 @@ func TestExtractAndRewriteBookHTML_StripsBuiltInTOCAndRewritesLinks(t *testing.T
 }
 
 func TestGitBook3SearchResultsWrapperAndNestedSidebarTOC(t *testing.T) {
-	baseURL, err := url.Parse("https://book.willh.cn/go/")
+	baseURL, err := url.Parse("https://books.example.com/go/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestGitBook3SearchResultsWrapperAndNestedSidebarTOC(t *testing.T) {
 			ID:        "bk_go",
 			Slug:      "the-way-to-go",
 			Title:     "Go 语言入门指南",
-			SourceURL: "https://book.willh.cn/go/",
+			SourceURL: "https://books.example.com/go/",
 			EmbedMode: "inline",
 		},
 		FlatChapters: toc,
@@ -185,20 +185,20 @@ func TestGitBook3SearchResultsWrapperAndNestedSidebarTOC(t *testing.T) {
 }
 
 func TestExtractAndRewriteBookHTML_NormalizesCodeBlockLineNumbers(t *testing.T) {
-	baseURL, err := url.Parse("https://book.willh.cn/chapter2/flutter_widget_intro.html")
+	baseURL, err := url.Parse("https://books.example.com/chapter2/widget_intro.html")
 	if err != nil {
 		t.Fatal(err)
 	}
 	bk := BookDetailView{
 		Book: domain.Book{
-			ID:        "bk_flutter",
-			Slug:      "flutter-in-action-2",
-			Title:     "Flutter实战·第二版",
-			SourceURL: "https://book.willh.cn/",
+			ID:        "bk_ui",
+			Slug:      "ui-handbook",
+			Title:     "UI 组件开发手册",
+			SourceURL: "https://books.example.com/",
 			EmbedMode: "inline",
 		},
 		FlatChapters: []domain.BookChapter{
-			{ID: "ch_2_2", BookID: "bk_flutter", Title: "2.2 Widget 简介", URL: "https://book.willh.cn/chapter2/flutter_widget_intro.html"},
+			{ID: "ch_2_2", BookID: "bk_ui", Title: "2.2 组件接口简介", URL: "https://books.example.com/chapter2/widget_intro.html"},
 		},
 	}
 
@@ -206,9 +206,9 @@ func TestExtractAndRewriteBookHTML_NormalizesCodeBlockLineNumbers(t *testing.T) 
 <html><body>
 <main class="page">
   <div class="theme-default-content">
-    <h1 id="_2-2-widget-简介"><a href="#_2-2-widget-简介" class="header-anchor">#</a> 2.2 Widget 简介</h1>
-    <h2 id="_2-2-2-widget-接口"><a href="#_2-2-2-widget-接口" class="header-anchor">#</a> 2.2.2 Widget 接口</h2>
-    <p>在 Flutter 中，Widget 的核心声明如下：</p>
+    <h1 id="_2-2-组件接口简介"><a href="#_2-2-组件接口简介" class="header-anchor">#</a> 2.2 组件接口简介</h1>
+    <h2 id="_2-2-2-组件接口"><a href="#_2-2-2-组件接口" class="header-anchor">#</a> 2.2.2 组件接口</h2>
+    <p>在声明式 UI 框架中，核心组件接口定义如下：</p>
     <div class="language-dart line-numbers-mode"><pre class="language-dart"><code><span class="token metadata symbol">@immutable</span> <span class="token comment">// 不可变的</span>
 <span class="token keyword">abstract</span> <span class="token keyword">class</span> <span class="token class-name">Widget</span> <span class="token keyword">extends</span> <span class="token class-name">DiagnosticableTree</span> <span class="token punctuation">{</span>
   <span class="token comment">/* multi-line
