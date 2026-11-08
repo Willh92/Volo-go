@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -32,6 +33,8 @@ const (
 
 	maxJSArrayLen    = 65536
 	maxJSStringBytes = 4 << 20 // 4 MiB string byte-length cap
+	maxJSExportDepth = 64      // Maximum object/array recursion depth
+	maxJSExportNodes = 50_000  // Maximum visited nodes during export/stringify/toString
 )
 
 type jsValue struct {
@@ -760,9 +763,12 @@ func (rt *jsRuntime) evalExpr(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVal
 			out = rhs
 		case tokPlusAssign:
 			if cur.kind == valString || rhs.kind == valString {
-				ls := cur.toString()
-				rs := rhs.toString()
-				if len(ls)+len(rs) > maxJSStringBytes {
+				ls, lok := cur.toStringChecked()
+				if !lok {
+					return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
+				}
+				rs, rok := rhs.toStringChecked()
+				if !rok || len(ls)+len(rs) > maxJSStringBytes {
 					return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
 				}
 				out = jsValue{kind: valString, str: ls + rs}
@@ -947,9 +953,12 @@ func (rt *jsRuntime) evalBinaryOp(op jsTokKind, l, r jsValue) (jsValue, error) {
 	switch op {
 	case tokPlus:
 		if l.kind == valString || r.kind == valString {
-			ls := l.toString()
-			rs := r.toString()
-			if len(ls)+len(rs) > maxJSStringBytes {
+			ls, lok := l.toStringChecked()
+			if !lok {
+				return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
+			}
+			rs, rok := r.toStringChecked()
+			if !rok || len(ls)+len(rs) > maxJSStringBytes {
 				return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
 			}
 			return jsValue{kind: valString, str: ls + rs}, nil
@@ -1126,6 +1135,14 @@ func (v jsValue) toNumber() float64 {
 	}
 }
 
+func appendBoundedString(b *strings.Builder, s string) bool {
+	if b.Len()+len(s) > maxJSStringBytes {
+		return false
+	}
+	b.WriteString(s)
+	return true
+}
+
 func (v jsValue) toString() string {
 	switch v.kind {
 	case valUndefined:
@@ -1150,37 +1167,114 @@ func (v jsValue) toString() string {
 		return strconv.FormatFloat(v.num, 'f', -1, 64)
 	case valString:
 		return v.str
-	case valArray:
-		if v.arr == nil {
-			return ""
+	}
+	var b strings.Builder
+	nodes := 0
+	_ = v.writeToString(&b, nil, nil, 0, &nodes)
+	return b.String()
+}
+
+func (v jsValue) toStringChecked() (string, bool) {
+	switch v.kind {
+	case valUndefined, valNull, valBool, valNumber:
+		return v.toString(), true
+	case valString:
+		if len(v.str) > maxJSStringBytes {
+			return "", false
 		}
-		parts := make([]string, len(v.arr.items))
+		return v.str, true
+	}
+	var b strings.Builder
+	nodes := 0
+	if !v.writeToString(&b, nil, nil, 0, &nodes) {
+		return "", false
+	}
+	return b.String(), true
+}
+
+func (v jsValue) writeToString(b *strings.Builder, seenArr map[*jsArray]bool, seenObj map[*jsObject]bool, depth int, nodes *int) bool {
+	*nodes++
+	if *nodes > maxJSExportNodes || depth > maxJSExportDepth {
+		return false
+	}
+	switch v.kind {
+	case valUndefined:
+		return appendBoundedString(b, "undefined")
+	case valNull:
+		return appendBoundedString(b, "null")
+	case valBool:
+		if v.b {
+			return appendBoundedString(b, "true")
+		}
+		return appendBoundedString(b, "false")
+	case valNumber:
+		return appendBoundedString(b, v.toString())
+	case valString:
+		return appendBoundedString(b, v.str)
+	case valArray:
+		if v.arr == nil || len(v.arr.items) == 0 {
+			return true
+		}
+		if seenArr != nil && seenArr[v.arr] {
+			// ECMAScript Array.prototype.join / toString breaks active cycles with empty string.
+			return true
+		}
+		if seenArr == nil {
+			seenArr = make(map[*jsArray]bool, 4)
+		}
+		seenArr[v.arr] = true
+		defer delete(seenArr, v.arr)
 		for i, it := range v.arr.items {
+			if i > 0 {
+				if !appendBoundedString(b, ",") {
+					return false
+				}
+			}
 			if it.kind != valUndefined && it.kind != valNull {
-				parts[i] = it.toString()
+				if !it.writeToString(b, seenArr, seenObj, depth+1, nodes) {
+					return false
+				}
 			}
 		}
-		return strings.Join(parts, ",")
+		return true
 	case valObject:
 		if v.obj != nil {
 			if v.obj.isError {
-				name := v.obj.get("name").toString()
-				msg := v.obj.get("message").toString()
-				if msg != "" {
-					return name + ": " + msg
+				if seenObj != nil && seenObj[v.obj] {
+					return appendBoundedString(b, "Error")
 				}
-				return name
+				if seenObj == nil {
+					seenObj = make(map[*jsObject]bool, 2)
+				}
+				seenObj[v.obj] = true
+				defer delete(seenObj, v.obj)
+				var nb, mb strings.Builder
+				if !v.obj.get("name").writeToString(&nb, seenArr, seenObj, depth+1, nodes) {
+					return false
+				}
+				if !v.obj.get("message").writeToString(&mb, seenArr, seenObj, depth+1, nodes) {
+					return false
+				}
+				name := nb.String()
+				msg := mb.String()
+				if msg != "" {
+					if !appendBoundedString(b, name) || !appendBoundedString(b, ": ") || !appendBoundedString(b, msg) {
+						return false
+					}
+					return true
+				}
+				return appendBoundedString(b, name)
 			}
 			if v.obj.isDate {
 				if math.IsNaN(v.obj.epochMs) || math.IsInf(v.obj.epochMs, 0) {
-					return "Invalid Date"
+					return appendBoundedString(b, "Invalid Date")
 				}
-				return time.UnixMilli(int64(v.obj.epochMs)).UTC().Format(time.RFC1123)
+				return appendBoundedString(b, time.UnixMilli(int64(v.obj.epochMs)).UTC().Format(time.RFC1123))
 			}
 		}
-		return "[object Object]"
+		return appendBoundedString(b, "[object Object]")
 	default:
-		return "[object]"
+		return appendBoundedString(b, "[object]")
 	}
 }
 
@@ -1439,43 +1533,25 @@ func stringProperty(s string, prop string) jsValue {
 			if len(args) < 2 {
 				return jsValue{kind: valString, str: s}, nil
 			}
-			repl := args[1].toString()
+			repl, rok := args[1].toStringChecked()
+			if !rok {
+				return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
+			}
 			if args[0].kind == valRegExp && args[0].re != nil {
 				rx := args[0].re
-				if rx.global || prop == "replaceAll" {
-					var out string
-					if strings.Contains(repl, "$") {
-						out = rx.re.ReplaceAllString(s, repl)
-					} else {
-						exceeded := false
-						var grown int64
-						out = rx.re.ReplaceAllStringFunc(s, func(matched string) string {
-							grown += int64(len(repl)) - int64(len(matched))
-							if int64(len(s))+grown > maxJSStringBytes {
-								exceeded = true
-								return ""
-							}
-							return repl
-						})
-						if exceeded {
-							return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
-						}
-					}
-					if len(out) > maxJSStringBytes {
-						return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
-					}
-					return jsValue{kind: valString, str: out}, nil
+				out, ok, iErr := replaceRegexpBounded(rt, s, rx, repl, rx.global || prop == "replaceAll")
+				if iErr != nil {
+					return jsUndefinedVal, iErr
 				}
-				loc := rx.re.FindStringIndex(s)
-				if loc == nil {
-					return jsValue{kind: valString, str: s}, nil
-				}
-				if len(s)-(loc[1]-loc[0])+len(repl) > maxJSStringBytes {
+				if !ok {
 					return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
 				}
-				return jsValue{kind: valString, str: s[:loc[0]] + repl + s[loc[1]:]}, nil
+				return jsValue{kind: valString, str: out}, nil
 			}
-			pat := args[0].toString()
+			pat, pok := args[0].toStringChecked()
+			if !pok {
+				return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
+			}
 			if prop == "replaceAll" {
 				if pat == "" {
 					projected := int64(len(s)) + (int64(utf8.RuneCountInString(s))+1)*int64(len(repl))
@@ -1490,11 +1566,14 @@ func stringProperty(s string, prop string) jsValue {
 				}
 				return jsValue{kind: valString, str: strings.ReplaceAll(s, pat, repl)}, nil
 			}
-			out := strings.Replace(s, pat, repl, 1)
-			if len(out) > maxJSStringBytes {
+			idx := strings.Index(s, pat)
+			if idx < 0 {
+				return jsValue{kind: valString, str: s}, nil
+			}
+			if int64(len(s))-int64(len(pat))+int64(len(repl)) > maxJSStringBytes {
 				return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
 			}
-			return jsValue{kind: valString, str: out}, nil
+			return jsValue{kind: valString, str: s[:idx] + repl + s[idx+len(pat):]}, nil
 		})
 	case "match":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -1568,37 +1647,51 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 			arr.items = arr.items[:len(arr.items)-1]
 			return last, nil
 		})
+	case "toString":
+		return nativeVal(func(rt *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+			s, ok := (jsValue{kind: valArray, arr: arr}).toStringChecked()
+			if !ok {
+				return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
+			}
+			return jsValue{kind: valString, str: s}, nil
+		})
 	case "join":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			sep := ","
 			if len(args) > 0 && args[0].kind != valUndefined {
-				sep = args[0].toString()
+				var sok bool
+				sep, sok = args[0].toStringChecked()
+				if !sok {
+					return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
+				}
 			}
 			if len(arr.items) == 0 {
 				return jsValue{kind: valString, str: ""}, nil
 			}
-			var totalBytes int64
 			if len(arr.items) > 1 && len(sep) > 0 {
-				totalBytes = int64(len(arr.items)-1) * int64(len(sep))
-				if totalBytes > maxJSStringBytes {
+				if int64(len(arr.items)-1)*int64(len(sep)) > maxJSStringBytes {
 					return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
 				}
 			}
-			parts := make([]string, len(arr.items))
+			var b strings.Builder
+			seenArr := map[*jsArray]bool{arr: true}
+			nodes := 0
 			for i, it := range arr.items {
 				if err := rt.checkInterrupt(); err != nil {
 					return jsUndefinedVal, err
 				}
-				if it.kind != valUndefined && it.kind != valNull {
-					p := it.toString()
-					totalBytes += int64(len(p))
-					if totalBytes > maxJSStringBytes {
+				if i > 0 && len(sep) > 0 {
+					if !appendBoundedString(&b, sep) {
 						return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
 					}
-					parts[i] = p
+				}
+				if it.kind != valUndefined && it.kind != valNull {
+					if !it.writeToString(&b, seenArr, nil, 1, &nodes) {
+						return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("RangeError", "Invalid string length")}
+					}
 				}
 			}
-			return jsValue{kind: valString, str: strings.Join(parts, sep)}, nil
+			return jsValue{kind: valString, str: b.String()}, nil
 		})
 	case "slice":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -1750,11 +1843,15 @@ func (rt *jsRuntime) installBuiltins() {
 	rt.global.define("NaN", jsValue{kind: valNumber, num: math.NaN()}, true)
 	rt.global.define("Infinity", jsValue{kind: valNumber, num: math.Inf(1)}, true)
 
-	rt.global.define("String", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+	rt.global.define("String", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 		if len(args) == 0 {
 			return jsValue{kind: valString, str: ""}, nil
 		}
-		return jsValue{kind: valString, str: args[0].toString()}, nil
+		s, ok := args[0].toStringChecked()
+		if !ok {
+			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
+		}
+		return jsValue{kind: valString, str: s}, nil
 	}), false)
 
 	rt.global.define("Number", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -1860,17 +1957,17 @@ func (rt *jsRuntime) installBuiltins() {
 	// JSON
 	jsonObj := rt.NewObject()
 	jsonObj.setVal("stringify", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 || args[0].kind == valUndefined {
+		if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valFunc {
 			return jsUndefinedVal, nil
 		}
-		b, err := json.Marshal(args[0].Export())
-		if err != nil {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", err.Error())}
+		out, errKind, errMsg := stringifyJSValueBounded(r, args[0])
+		if errKind != "" {
+			if errKind == "interrupt" {
+				return jsUndefinedVal, &jsInterruptedError{cause: r.interrupted.Load()}
+			}
+			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal(errKind, errMsg)}
 		}
-		if len(b) > maxJSStringBytes {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
-		}
-		return jsValue{kind: valString, str: string(b)}, nil
+		return jsValue{kind: valString, str: out}, nil
 	}))
 	jsonObj.setVal("parse", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 		if len(args) == 0 {
@@ -2387,7 +2484,432 @@ func coerceJSArgToReflect(v jsValue, target reflect.Type) reflect.Value {
 	return reflect.Zero(target)
 }
 
+func replaceRegexpBounded(rt *jsRuntime, s string, rx *jsRegExp, repl string, global bool) (string, bool, error) {
+	hasDollar := strings.Contains(repl, "$")
+	if !global {
+		var loc []int
+		if hasDollar {
+			loc = rx.re.FindStringSubmatchIndex(s)
+		} else {
+			loc = rx.re.FindStringIndex(s)
+		}
+		if loc == nil {
+			return s, true, nil
+		}
+		if !hasDollar {
+			if int64(len(s))-int64(loc[1]-loc[0])+int64(len(repl)) > maxJSStringBytes {
+				return "", false, nil
+			}
+			return s[:loc[0]] + repl + s[loc[1]:], true, nil
+		}
+		var b strings.Builder
+		if !appendBoundedString(&b, s[:loc[0]]) {
+			return "", false, nil
+		}
+		if !appendExpandedRegexpRepl(&b, rx.re, repl, s, loc) {
+			return "", false, nil
+		}
+		if !appendBoundedString(&b, s[loc[1]:]) {
+			return "", false, nil
+		}
+		return b.String(), true, nil
+	}
+
+	var b strings.Builder
+	hasAnchorOrWordBoundary := strings.Contains(rx.pattern, "^") ||
+		strings.Contains(rx.pattern, `\A`) ||
+		strings.Contains(rx.pattern, `\b`) ||
+		strings.Contains(rx.pattern, `\B`)
+
+	if hasAnchorOrWordBoundary {
+		var matches [][]int
+		if hasDollar {
+			matches = rx.re.FindAllStringSubmatchIndex(s, -1)
+		} else {
+			matches = rx.re.FindAllStringIndex(s, -1)
+		}
+		if len(matches) == 0 {
+			return s, true, nil
+		}
+		lastEnd := 0
+		for _, loc := range matches {
+			if err := rt.checkInterrupt(); err != nil {
+				return "", false, err
+			}
+			if !appendBoundedString(&b, s[lastEnd:loc[0]]) {
+				return "", false, nil
+			}
+			if hasDollar {
+				if !appendExpandedRegexpRepl(&b, rx.re, repl, s, loc) {
+					return "", false, nil
+				}
+			} else {
+				if !appendBoundedString(&b, repl) {
+					return "", false, nil
+				}
+			}
+			lastEnd = loc[1]
+		}
+		if !appendBoundedString(&b, s[lastEnd:]) {
+			return "", false, nil
+		}
+		return b.String(), true, nil
+	}
+
+	lastAppend := 0
+	searchPos := 0
+	prevNonEmptyEnd := -1
+	for searchPos <= len(s) {
+		if err := rt.checkInterrupt(); err != nil {
+			return "", false, err
+		}
+		var loc []int
+		if hasDollar {
+			loc = rx.re.FindStringSubmatchIndex(s[searchPos:])
+		} else {
+			loc = rx.re.FindStringIndex(s[searchPos:])
+		}
+		if loc == nil {
+			break
+		}
+		for i := range loc {
+			if loc[i] >= 0 {
+				loc[i] += searchPos
+			}
+		}
+		mStart, mEnd := loc[0], loc[1]
+		if mStart == mEnd && mEnd == prevNonEmptyEnd {
+			if mEnd >= len(s) {
+				break
+			}
+			_, wid := utf8.DecodeRuneInString(s[mEnd:])
+			searchPos = mEnd + wid
+			continue
+		}
+		if !appendBoundedString(&b, s[lastAppend:mStart]) {
+			return "", false, nil
+		}
+		if hasDollar {
+			if !appendExpandedRegexpRepl(&b, rx.re, repl, s, loc) {
+				return "", false, nil
+			}
+		} else {
+			if !appendBoundedString(&b, repl) {
+				return "", false, nil
+			}
+		}
+		lastAppend = mEnd
+		if mEnd > mStart {
+			prevNonEmptyEnd = mEnd
+			searchPos = mEnd
+		} else {
+			prevNonEmptyEnd = -1
+			if mEnd >= len(s) {
+				break
+			}
+			_, wid := utf8.DecodeRuneInString(s[mEnd:])
+			searchPos = mEnd + wid
+		}
+	}
+	if lastAppend == 0 && b.Len() == 0 {
+		return s, true, nil
+	}
+	if !appendBoundedString(&b, s[lastAppend:]) {
+		return "", false, nil
+	}
+	return b.String(), true, nil
+}
+
+func appendExpandedRegexpRepl(b *strings.Builder, re *regexp.Regexp, repl string, src string, match []int) bool {
+	numGroups := len(match) / 2
+	for i := 0; i < len(repl); {
+		idx := strings.IndexByte(repl[i:], '$')
+		if idx < 0 {
+			return appendBoundedString(b, repl[i:])
+		}
+		if idx > 0 {
+			if !appendBoundedString(b, repl[i:i+idx]) {
+				return false
+			}
+		}
+		i += idx + 1
+		if i >= len(repl) {
+			return appendBoundedString(b, "$")
+		}
+		ch := repl[i]
+		switch {
+		case ch == '$':
+			if !appendBoundedString(b, "$") {
+				return false
+			}
+			i++
+		case ch == '&':
+			if !appendBoundedString(b, src[match[0]:match[1]]) {
+				return false
+			}
+			i++
+		case ch == '`':
+			if !appendBoundedString(b, src[:match[0]]) {
+				return false
+			}
+			i++
+		case ch == '\'':
+			if !appendBoundedString(b, src[match[1]:]) {
+				return false
+			}
+			i++
+		case ch >= '0' && ch <= '9':
+			d1 := int(ch - '0')
+			if i+1 < len(repl) && repl[i+1] >= '0' && repl[i+1] <= '9' {
+				d2 := d1*10 + int(repl[i+1]-'0')
+				if d2 > 0 && d2 < numGroups {
+					if match[2*d2] >= 0 {
+						if !appendBoundedString(b, src[match[2*d2]:match[2*d2+1]]) {
+							return false
+						}
+					}
+					i += 2
+					continue
+				}
+			}
+			if d1 < numGroups {
+				if match[2*d1] >= 0 {
+					if !appendBoundedString(b, src[match[2*d1]:match[2*d1+1]]) {
+						return false
+					}
+				}
+				i++
+			} else {
+				if !appendBoundedString(b, "$") {
+					return false
+				}
+			}
+		case ch == '<' || ch == '{':
+			closeCh := byte('>')
+			if ch == '{' {
+				closeCh = '}'
+			}
+			end := strings.IndexByte(repl[i+1:], closeCh)
+			if end >= 0 {
+				name := repl[i+1 : i+1+end]
+				subIdx := re.SubexpIndex(name)
+				if subIdx >= 0 && subIdx < numGroups {
+					if match[2*subIdx] >= 0 {
+						if !appendBoundedString(b, src[match[2*subIdx]:match[2*subIdx+1]]) {
+							return false
+						}
+					}
+					i += end + 2
+					continue
+				}
+				if ch == '{' {
+					// Go ExpandString-style unknown named group expands to empty
+					i += end + 2
+					continue
+				}
+			}
+			if !appendBoundedString(b, "$") {
+				return false
+			}
+		default:
+			if !appendBoundedString(b, "$") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func stringifyJSValueBounded(rt *jsRuntime, root jsValue) (string, string, string) {
+	var b strings.Builder
+	seenObj := make(map[*jsObject]bool)
+	seenArr := make(map[*jsArray]bool)
+	nodes := 0
+
+	var writeVal func(v jsValue, depth int) (string, string)
+	writeVal = func(v jsValue, depth int) (string, string) {
+		if rt != nil {
+			if err := rt.checkInterrupt(); err != nil {
+				return "interrupt", err.Error()
+			}
+		}
+		nodes++
+		if depth > maxJSExportDepth {
+			return "RangeError", "Maximum call stack size exceeded"
+		}
+		if nodes > maxJSExportNodes {
+			return "RangeError", "Maximum JSON node budget exceeded"
+		}
+		switch v.kind {
+		case valUndefined, valNull, valFunc:
+			if !appendBoundedString(&b, "null") {
+				return "RangeError", "Invalid string length"
+			}
+			return "", ""
+		case valBool:
+			lit := "false"
+			if v.b {
+				lit = "true"
+			}
+			if !appendBoundedString(&b, lit) {
+				return "RangeError", "Invalid string length"
+			}
+			return "", ""
+		case valNumber:
+			if math.IsNaN(v.num) || math.IsInf(v.num, 0) {
+				if !appendBoundedString(&b, "null") {
+					return "RangeError", "Invalid string length"
+				}
+				return "", ""
+			}
+			var numStr string
+			if v.num == math.Trunc(v.num) && v.num >= -9007199254740991 && v.num <= 9007199254740991 {
+				numStr = strconv.FormatInt(int64(v.num), 10)
+			} else {
+				numStr = strconv.FormatFloat(v.num, 'g', -1, 64)
+			}
+			if !appendBoundedString(&b, numStr) {
+				return "RangeError", "Invalid string length"
+			}
+			return "", ""
+		case valString:
+			enc, err := json.Marshal(v.str)
+			if err != nil {
+				return "TypeError", err.Error()
+			}
+			if b.Len()+len(enc) > maxJSStringBytes {
+				return "RangeError", "Invalid string length"
+			}
+			b.Write(enc)
+			return "", ""
+		case valArray:
+			if v.arr == nil || len(v.arr.items) == 0 {
+				if !appendBoundedString(&b, "[]") {
+					return "RangeError", "Invalid string length"
+				}
+				return "", ""
+			}
+			if seenArr[v.arr] {
+				return "TypeError", "Converting circular structure to JSON"
+			}
+			seenArr[v.arr] = true
+			defer delete(seenArr, v.arr)
+
+			if !appendBoundedString(&b, "[") {
+				return "RangeError", "Invalid string length"
+			}
+			for i, it := range v.arr.items {
+				if i > 0 {
+					if !appendBoundedString(&b, ",") {
+						return "RangeError", "Invalid string length"
+					}
+				}
+				if ek, em := writeVal(it, depth+1); ek != "" {
+					return ek, em
+				}
+			}
+			if !appendBoundedString(&b, "]") {
+				return "RangeError", "Invalid string length"
+			}
+			return "", ""
+		case valObject:
+			if v.obj == nil {
+				if !appendBoundedString(&b, "{}") {
+					return "RangeError", "Invalid string length"
+				}
+				return "", ""
+			}
+			if v.obj.isDate {
+				if math.IsNaN(v.obj.epochMs) || math.IsInf(v.obj.epochMs, 0) {
+					if !appendBoundedString(&b, "null") {
+						return "RangeError", "Invalid string length"
+					}
+					return "", ""
+				}
+				iso := `"` + time.UnixMilli(int64(v.obj.epochMs)).UTC().Format("2006-01-02T15:04:05.000Z") + `"`
+				if !appendBoundedString(&b, iso) {
+					return "RangeError", "Invalid string length"
+				}
+				return "", ""
+			}
+			if seenObj[v.obj] {
+				return "TypeError", "Converting circular structure to JSON"
+			}
+			seenObj[v.obj] = true
+			defer delete(seenObj, v.obj)
+
+			if !appendBoundedString(&b, "{") {
+				return "RangeError", "Invalid string length"
+			}
+			if len(v.obj.props) > 0 {
+				keys := make([]string, 0, len(v.obj.props))
+				for k, pv := range v.obj.props {
+					if pv.kind != valUndefined && pv.kind != valFunc {
+						keys = append(keys, k)
+					}
+				}
+				sort.Strings(keys)
+				for i, k := range keys {
+					if i > 0 {
+						if !appendBoundedString(&b, ",") {
+							return "RangeError", "Invalid string length"
+						}
+					}
+					kEnc, err := json.Marshal(k)
+					if err != nil {
+						return "TypeError", err.Error()
+					}
+					if b.Len()+len(kEnc)+1 > maxJSStringBytes {
+						return "RangeError", "Invalid string length"
+					}
+					b.Write(kEnc)
+					b.WriteByte(':')
+					if ek, em := writeVal(v.obj.props[k], depth+1); ek != "" {
+						return ek, em
+					}
+				}
+			}
+			if !appendBoundedString(&b, "}") {
+				return "RangeError", "Invalid string length"
+			}
+			return "", ""
+		default:
+			if !appendBoundedString(&b, "null") {
+				return "RangeError", "Invalid string length"
+			}
+			return "", ""
+		}
+	}
+
+	if ek, em := writeVal(root, 0); ek != "" {
+		return "", ek, em
+	}
+	return b.String(), "", ""
+}
+
 func (v jsValue) Export() any {
+	switch v.kind {
+	case valUndefined, valNull:
+		return nil
+	case valBool:
+		return v.b
+	case valNumber:
+		if !math.IsNaN(v.num) && !math.IsInf(v.num, 0) && v.num == math.Trunc(v.num) && v.num >= -9007199254740991 && v.num <= 9007199254740991 {
+			return int64(v.num)
+		}
+		return v.num
+	case valString:
+		return v.str
+	}
+	nodes := 0
+	return v.exportBounded(nil, nil, 0, &nodes)
+}
+
+func (v jsValue) exportBounded(seenObj map[*jsObject]bool, seenArr map[*jsArray]bool, depth int, nodes *int) any {
+	*nodes++
+	if depth > maxJSExportDepth || *nodes > maxJSExportNodes {
+		return nil
+	}
 	switch v.kind {
 	case valUndefined, valNull:
 		return nil
@@ -2404,9 +2926,21 @@ func (v jsValue) Export() any {
 		if v.arr == nil {
 			return []any{}
 		}
+		if seenArr != nil && seenArr[v.arr] {
+			return nil
+		}
+		if seenArr == nil {
+			seenArr = make(map[*jsArray]bool, 4)
+		}
+		seenArr[v.arr] = true
+		defer delete(seenArr, v.arr)
+
 		out := make([]any, len(v.arr.items))
 		for i, it := range v.arr.items {
-			out[i] = it.Export()
+			if *nodes > maxJSExportNodes {
+				break
+			}
+			out[i] = it.exportBounded(seenObj, seenArr, depth+1, nodes)
 		}
 		return out
 	case valObject:
@@ -2419,10 +2953,22 @@ func (v jsValue) Export() any {
 			}
 			return time.UnixMilli(int64(v.obj.epochMs)).UTC().Format("2006-01-02T15:04:05.000Z")
 		}
+		if seenObj != nil && seenObj[v.obj] {
+			return nil
+		}
+		if seenObj == nil {
+			seenObj = make(map[*jsObject]bool, 4)
+		}
+		seenObj[v.obj] = true
+		defer delete(seenObj, v.obj)
+
 		out := make(map[string]any, len(v.obj.props))
 		for k, pv := range v.obj.props {
+			if *nodes > maxJSExportNodes {
+				break
+			}
 			if pv.kind != valUndefined && pv.kind != valFunc {
-				out[k] = pv.Export()
+				out[k] = pv.exportBounded(seenObj, seenArr, depth+1, nodes)
 			}
 		}
 		return out

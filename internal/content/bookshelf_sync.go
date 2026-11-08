@@ -319,7 +319,7 @@ func parseSummaryMarkdownTOC(bookID string, md string, baseURL *url.URL) []domai
 		}
 		title := strings.TrimSpace(m[2])
 		rawHref := strings.TrimSpace(m[3])
-		if title == "" || rawHref == "" {
+		if title == "" || rawHref == "" || isDangerousHrefScheme(rawHref) {
 			continue
 		}
 		// Convert Markdown `.md` chapter link to `.html` when hosted on mdBook/GitBook web root.
@@ -333,7 +333,7 @@ func parseSummaryMarkdownTOC(bookID string, md string, baseURL *url.URL) []domai
 		}
 
 		resolved := resolveRelativeURL(baseURL, webHref)
-		if !isSafeChapterURL(resolved) {
+		if !isSafeSameHostChapterURL(resolved, baseURL) {
 			continue
 		}
 
@@ -388,15 +388,11 @@ func parseHTMLSidebarTOC(bookID string, htmlDoc string, baseURL *url.URL) []doma
 		}
 		href := strings.TrimSpace(html.UnescapeString(m[1]))
 		title := strings.TrimSpace(html.UnescapeString(innerTagRe.ReplaceAllString(m[2], "")))
-		if title == "" || href == "" || strings.HasPrefix(strings.ToLower(href), "javascript:") || strings.HasPrefix(strings.ToLower(href), "mailto:") {
+		if title == "" || href == "" || isDangerousHrefScheme(href) {
 			continue
 		}
 		resolved := resolveRelativeURL(baseURL, href)
-		if !isSafeChapterURL(resolved) || seen[resolved] {
-			continue
-		}
-		u, err := url.Parse(resolved)
-		if err != nil || !strings.EqualFold(u.Host, baseURL.Host) {
+		if !isSafeSameHostChapterURL(resolved, baseURL) || seen[resolved] {
 			continue
 		}
 		seen[resolved] = true
@@ -418,7 +414,7 @@ func parseHTMLSidebarTOC(bookID string, htmlDoc string, baseURL *url.URL) []doma
 
 func resolveRelativeURL(base *url.URL, ref string) string {
 	if base == nil {
-		return ref
+		return ""
 	}
 	u, err := url.Parse(ref)
 	if err != nil {
@@ -427,14 +423,38 @@ func resolveRelativeURL(base *url.URL, ref string) string {
 	return base.ResolveReference(u).String()
 }
 
-func isSafeChapterURL(raw string) bool {
-	s := strings.TrimSpace(raw)
-	if strings.HasPrefix(s, "/") && !strings.HasPrefix(s, "//") {
-		return true
+func isDangerousHrefScheme(raw string) bool {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x1F || s[i] == 0x7F {
+			return true
+		}
 	}
-	u, err := url.Parse(s)
-	if err != nil {
+	return strings.HasPrefix(s, "javascript:") ||
+		strings.HasPrefix(s, "data:") ||
+		strings.HasPrefix(s, "vbscript:") ||
+		strings.HasPrefix(s, "mailto:") ||
+		strings.HasPrefix(s, "file:") ||
+		strings.HasPrefix(s, `/\`)
+}
+
+func isSafeSameHostChapterURL(raw string, baseURL *url.URL) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" || baseURL == nil || baseURL.Host == "" || isDangerousHrefScheme(s) {
 		return false
 	}
-	return u.Scheme == "http" || u.Scheme == "https"
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || u.User != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if !strings.EqualFold(u.Host, baseURL.Host) {
+		return false
+	}
+	if strings.EqualFold(baseURL.Scheme, "https") && u.Scheme != "https" {
+		return false
+	}
+	return true
 }

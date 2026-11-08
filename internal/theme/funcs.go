@@ -9,13 +9,40 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/render"
 )
 
-func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, fallbackAssets map[string]cachedAsset, themeLocales map[string]map[string]string) template.FuncMap {
+var siteLocationCache sync.Map // map[string]*time.Location
+
+// LoadSiteLocation resolves an IANA timezone name with caching, falling back safely to time.UTC.
+func LoadSiteLocation(tz string) *time.Location {
+	trimmed := strings.TrimSpace(tz)
+	if trimmed == "" || strings.EqualFold(trimmed, "UTC") || strings.EqualFold(trimmed, "Etc/UTC") {
+		return time.UTC
+	}
+	if cached, ok := siteLocationCache.Load(trimmed); ok {
+		return cached.(*time.Location)
+	}
+	loc, err := time.LoadLocation(trimmed)
+	if err != nil || loc == nil {
+		return time.UTC
+	}
+	siteLocationCache.Store(trimmed, loc)
+	return loc
+}
+
+func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, fallbackAssets map[string]cachedAsset, themeLocales map[string]map[string]string, activeLocale string, siteLoc *time.Location) template.FuncMap {
+	defaultLocale := strings.TrimSpace(activeLocale)
+	if defaultLocale == "" {
+		defaultLocale = "zh-CN"
+	}
+	if siteLoc == nil {
+		siteLoc = time.UTC
+	}
 	translate := func(locale string, key string, vars ...map[string]any) string {
 		if msg, ok := lookupThemeLocaleMessage(themeLocales, locale, key); ok {
 			if len(vars) > 0 && vars[0] != nil {
@@ -105,7 +132,7 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			case len(strs) == 2:
 				return translate(strs[0], strs[1], vars...)
 			case len(strs) == 1:
-				return translate("zh-CN", strs[0], vars...)
+				return translate(defaultLocale, strs[0], vars...)
 			default:
 				return ""
 			}
@@ -233,37 +260,37 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			if ms <= 0 {
 				return ""
 			}
-			return time.UnixMilli(ms).Format("2006-01-02")
+			return time.UnixMilli(ms).In(siteLoc).Format("2006-01-02")
 		},
 		"formatDate": func(ms int64) string {
 			if ms <= 0 {
 				return ""
 			}
-			return time.UnixMilli(ms).Format("2006-01-02")
+			return time.UnixMilli(ms).In(siteLoc).Format("2006-01-02")
 		},
 		"formatDotDate": func(ms int64) string {
 			if ms <= 0 {
 				return ""
 			}
-			return time.UnixMilli(ms).Format("2006.01.02")
+			return time.UnixMilli(ms).In(siteLoc).Format("2006.01.02")
 		},
 		"formatMonthDay": func(ms int64) string {
 			if ms <= 0 {
 				return ""
 			}
-			return time.UnixMilli(ms).Format("01-02")
+			return time.UnixMilli(ms).In(siteLoc).Format("01-02")
 		},
 		"fmtDateTime": func(ms int64) string {
 			if ms <= 0 {
 				return ""
 			}
-			return time.UnixMilli(ms).Format("2006-01-02 15:04")
+			return time.UnixMilli(ms).In(siteLoc).Format("2006-01-02 15:04")
 		},
 		"formatDateTime": func(ms int64) string {
 			if ms <= 0 {
 				return ""
 			}
-			return time.UnixMilli(ms).Format("2006-01-02 15:04")
+			return time.UnixMilli(ms).In(siteLoc).Format("2006-01-02 15:04")
 		},
 		"fmtTime": func(ms int64, layout string) string {
 			if ms <= 0 {
@@ -273,7 +300,7 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			if goLayout == "" {
 				goLayout = "2006-01-02"
 			}
-			return time.UnixMilli(ms).Format(goLayout)
+			return time.UnixMilli(ms).In(siteLoc).Format(goLayout)
 		},
 		"formatTime": func(ms int64, layout string) string {
 			if ms <= 0 {
@@ -283,7 +310,7 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			if goLayout == "" {
 				goLayout = "2006-01-02"
 			}
-			return time.UnixMilli(ms).Format(goLayout)
+			return time.UnixMilli(ms).In(siteLoc).Format(goLayout)
 		},
 		"fmtISO": func(ms int64) string {
 			if ms <= 0 {

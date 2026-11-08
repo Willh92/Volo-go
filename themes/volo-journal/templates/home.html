@@ -1,0 +1,55 @@
+{{define "content"}}
+<h1 class="studio-sr-only">{{.HeroTitle}}</h1>
+
+{{if .IsHome}}
+  {{$eyebrow := coalesce (themeCfg .ThemeConfig "hero_badge" "") (tt .ThemeID .Locale "journal.edition" nil)}}
+  {{$motto := default .Site.Subtitle (themeCfg .ThemeConfig "journal_motto" "")}}
+  {{if le .Page 1}}
+    <section class="journal-masthead" aria-label="{{.Site.Title}}">
+      {{if $eyebrow}}<div class="journal-masthead__badge">{{$eyebrow}}</div>{{end}}
+      <h2 class="journal-masthead__title">{{.Site.Title}}</h2>
+      {{if $motto}}<p class="journal-masthead__motto">{{$motto}}</p>{{end}}
+      {{if ne (trim .Site.NoticeBoard) ""}}
+        <div class="journal-masthead__notice">{{renderNotice .Site.NoticeBoard}}</div>
+      {{end}}
+    </section>
+  {{end}}
+{{end}}
+
+<div class="studio-layout journal-home-layout">
+  <div class="studio-feed">
+    {{if .IsHome}}
+      {{if themeCfgBool .ThemeConfig "show_recent_posts" true}}
+        <div class="studio-section-heading">
+          <h2>{{t .Locale "studio.latest_updates"}}</h2>
+        </div>
+        <div class="studio-posts">
+          {{range .ArticleCards}}
+            {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
+          {{else}}
+            {{template "empty_state" (dict "Title" (t .Locale "studio.empty_title") "Desc" (t .Locale "studio.empty_desc"))}}
+          {{end}}
+        </div>
+        {{template "pagination" .}}
+      {{end}}
+    {{else}}
+      <section class="studio-hero studio-hero--simple studio-page-head">
+        <div class="studio-hero-copy">
+          <h2 class="studio-hero__title">{{.HeroTitle}}</h2>
+          {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
+        </div>
+      </section>
+      <div class="studio-posts">
+        {{range .ArticleCards}}
+          {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
+        {{else}}
+          {{template "empty_state" (dict "Title" (t .Locale "studio.empty_title") "Desc" (t .Locale "studio.empty_desc"))}}
+        {{end}}
+      </div>
+      {{template "pagination" .}}
+    {{end}}
+  </div>
+
+  {{template "sidebar" .}}
+</div>
+{{end}}

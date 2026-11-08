@@ -14,6 +14,19 @@
       <div class="js-auth-msg reader-auth-msg reader-auth-msg--error"></div>
       <button class="volo-btn" type="submit">{{t .Locale "nav.login"}}</button>
     </form>
+    {{if .OIDCProviders}}
+      <div class="reader-oidc-divider" role="separator">
+        <span>{{if hasPrefix .Locale "en"}}Or continue with{{else if eq .Locale "zh-TW"}}或透過第三方帳號登入{{else}}或使用第三方账号登录{{end}}</span>
+      </div>
+      <div class="reader-oidc-list">
+        {{range .OIDCProviders}}
+          <a class="studio-btn-ghost reader-oidc-btn" href="{{.StartURL}}" data-no-pjax>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Zm0 5a3 3 0 1 1-3 3 3 3 0 0 1 3-3Zm0 12.2a7.2 7.2 0 0 1-5.8-2.9c.1-1.9 3.9-3 5.8-3s5.7 1.1 5.8 3a7.2 7.2 0 0 1-5.8 2.9Z"/></svg>
+            <span>{{coalesce .DisplayName .Name}}</span>
+          </a>
+        {{end}}
+      </div>
+    {{end}}
   </section>
 
   {{if .Reading.AllowReaderRegister}}

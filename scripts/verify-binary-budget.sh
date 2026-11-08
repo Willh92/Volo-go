@@ -24,11 +24,10 @@ PORT="${VOLO_BUDGET_PORT:-18991}"
 echo "[1/4] Building pure-Go static binary (CGO_ENABLED=0)..."
 (
   cd "${ROOT_DIR}"
-  CGO_ENABLED=0 go build -trimpath \
+  CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 go build -trimpath \
     -gcflags="all=-l" \
     -gcflags="github.com/Willh92/Volo-go/internal/render=" \
     -gcflags="github.com/Willh92/Volo-go/internal/visibility=" \
-    -gcflags="github.com/Willh92/Volo-go/internal/db/sqlx=" \
     -ldflags="-s -w -X main.Version=v1.0.0-verify" \
     -o "${BIN_PATH}" ./cmd/volo
 )

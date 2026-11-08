@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"os"
@@ -35,9 +36,10 @@ const (
 var ErrExecutionTimeout = errors.New("plugin: execution interrupted due to timeout")
 
 type pooledVM struct {
-	vm      *jsRuntime
-	exports *jsObject
-	reqCtx  context.Context
+	vm           *jsRuntime
+	exports      *jsObject
+	hookHandlers map[string][]*jsFunc
+	reqCtx       context.Context
 }
 
 type pluginRateBucket struct {
@@ -196,7 +198,10 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	vm := newJSRuntime()
 	vm.SetMaxCallStackSize(defaultVMStackLimit)
 
-	wrapper := &pooledVM{vm: vm}
+	wrapper := &pooledVM{
+		vm:           vm,
+		hookHandlers: make(map[string][]*jsFunc),
+	}
 
 	// Inject safe console object wired to isolated JSONL plugin logger.
 	consoleObj := vm.NewObject()
@@ -227,6 +232,20 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	voloObj := vm.NewObject()
 	voloObj.Set("pluginId", r.manifest.ID)
 	voloObj.Set("version", r.manifest.Version)
+	voloObj.Set("escapeHTML", func(raw string) string {
+		return html.EscapeString(raw)
+	})
+	voloObj.setVal("on", nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if len(args) < 2 {
+			return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", "volo.on requires (hookName, handlerFn)")}
+		}
+		hookName := strings.TrimSpace(args[0].toString())
+		if hookName == "" || args[1].kind != valFunc || args[1].fn == nil {
+			return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", "volo.on requires a non-empty hook name and function handler")}
+		}
+		wrapper.hookHandlers[hookName] = append(wrapper.hookHandlers[hookName], args[1].fn)
+		return jsUndefinedVal, nil
+	}))
 
 	cfgObj := vm.NewObject()
 	cfgObj.Set("get", func(key string) any {
@@ -337,8 +356,8 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 			n, _ := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
 			return n, nil
 		})
-		kvBridge.Set("list", func(prefix string, limit int) ([]KVItem, error) {
-			return r.kv.ListPrefix(wrapper.activeCtx(), prefix, limit)
+		kvBridge.Set("list", func(prefix string, limit int, afterKey string) ([]KVItem, error) {
+			return r.kv.ListPrefix(wrapper.activeCtx(), prefix, limit, afterKey)
 		})
 		if r.manifest.CanWriteKV() {
 			kvBridge.Set("set", func(key string, value string, ttlSec int64) (bool, error) {
@@ -473,8 +492,34 @@ func (r *gojaPluginRuntime) executeFetch(ctx context.Context, rawURL string, opt
 	}, nil
 }
 
-// invoke borrows or creates a sandboxed JS VM, calls fnName (from module.exports or global scope)
-// under strict timeout + stack limit + panic recovery, and recycles the VM only if healthy.
+// hasCallable reports whether fnName is defined on module.exports or global scope in the plugin runtime.
+func (r *gojaPluginRuntime) hasCallable(fnName string) bool {
+	if r == nil {
+		return false
+	}
+	var pvm *pooledVM
+	select {
+	case pvm = <-r.pool:
+	default:
+		created, err := r.createVM()
+		if err != nil {
+			return false
+		}
+		pvm = created
+	}
+	defer func() {
+		select {
+		case r.pool <- pvm:
+		default:
+		}
+	}()
+	_, ok := resolveCallable(pvm.vm, pvm.exports, fnName)
+	return ok
+}
+
+// invoke borrows or creates a sandboxed JS VM, calls fnName (from module.exports or global scope,
+// plus registered volo.on(hookName, fn) listeners when fnName == "onHook") under strict timeout +
+// stack limit + panic recovery, and recycles the VM only if healthy.
 func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, fnName string, args ...any) (out any, found bool, err error) {
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
@@ -517,13 +562,21 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 	pvm.reqCtx = ctx
 
 	callable, ok := resolveCallable(vm, pvm.exports, fnName)
-	if !ok {
-		return nil, false, nil
+	var extraHookHandlers []*jsFunc
+	var hookName string
+	if fnName == "onHook" && len(args) >= 1 {
+		if hn, hOk := args[0].(string); hOk && hn != "" && len(pvm.hookHandlers) > 0 {
+			hookName = hn
+			if hs := pvm.hookHandlers[hn]; len(hs) > 0 {
+				extraHookHandlers = append(extraHookHandlers, hs...)
+			}
+			if star := pvm.hookHandlers["*"]; len(star) > 0 {
+				extraHookHandlers = append(extraHookHandlers, star...)
+			}
+		}
 	}
-
-	jsArgs := make([]jsValue, len(args))
-	for i, a := range args {
-		jsArgs[i] = vm.ToValue(a)
+	if !ok && len(extraHookHandlers) == 0 {
+		return nil, false, nil
 	}
 
 	var intMu sync.Mutex
@@ -557,15 +610,47 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 		close(done)
 	}()
 
-	res, callErr := vm.callFunc(callable, jsUndefinedVal, jsArgs)
-	if callErr != nil {
-		tainted = true
-		return nil, true, normalizeJSError(r.manifest.ID, fnName, callErr)
+	var lastRes = jsUndefinedVal
+	var curPayloadVal = jsUndefinedVal
+	if len(args) >= 2 {
+		curPayloadVal = vm.ToValue(args[1])
 	}
-	if res.kind == valUndefined || res.kind == valNull {
+
+	if ok {
+		jsArgs := make([]jsValue, len(args))
+		for i, a := range args {
+			jsArgs[i] = vm.ToValue(a)
+		}
+		res, callErr := vm.callFunc(callable, jsUndefinedVal, jsArgs)
+		if callErr != nil {
+			tainted = true
+			return nil, true, normalizeJSError(r.manifest.ID, fnName, callErr)
+		}
+		if res.kind != valUndefined && res.kind != valNull {
+			lastRes = res
+			if fnName == "onHook" {
+				curPayloadVal = res
+			}
+		}
+	}
+
+	for _, handlerFn := range extraHookHandlers {
+		hArgs := []jsValue{curPayloadVal, {kind: valString, str: hookName}}
+		res, callErr := vm.callFunc(handlerFn, jsUndefinedVal, hArgs)
+		if callErr != nil {
+			tainted = true
+			return nil, true, normalizeJSError(r.manifest.ID, fnName+":"+hookName, callErr)
+		}
+		if res.kind != valUndefined && res.kind != valNull {
+			lastRes = res
+			curPayloadVal = res
+		}
+	}
+
+	if lastRes.kind == valUndefined || lastRes.kind == valNull {
 		return nil, true, nil
 	}
-	return res.Export(), true, nil
+	return lastRes.Export(), true, nil
 }
 
 func resolveCallable(vm *jsRuntime, exports *jsObject, fnName string) (*jsFunc, bool) {

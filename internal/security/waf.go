@@ -168,7 +168,15 @@ func (w *WAFEngine) pruneExpiredBansLocked(nowMS int64) {
 }
 
 func (w *WAFEngine) upsertBanLocked(pfx netip.Prefix, expiresAt int64, reasonCode string, nowMS int64) {
-	if _, exists := w.activeBans[pfx]; !exists {
+	if prevExp, exists := w.activeBans[pfx]; exists {
+		if prevExp == 0 && expiresAt > 0 {
+			// Never downgrade an active permanent ban into a temporary auto-ban.
+			return
+		}
+		if expiresAt > 0 && prevExp > expiresAt {
+			expiresAt = prevExp
+		}
+	} else {
 		if len(w.banPrefixes) >= maxWAFActiveBans {
 			w.pruneExpiredBansLocked(nowMS)
 		}
@@ -431,13 +439,29 @@ func (w *WAFEngine) RecordStrike(ctx context.Context, clientAddr netip.Addr, rea
 	w.bansMu.Unlock()
 
 	if w.store != nil {
-		upsert := w.store.Dialect().UpsertSQL(
-			"security_ip_bans",
-			[]string{"id", "cidr", "source", "reason_code", "reason", "note", "occurrences", "expires_at", "created_at", "updated_at"},
-			[]string{"cidr"},
-			[]string{"source", "reason_code", "reason", "occurrences", "expires_at", "updated_at"},
-		)
-		_, _ = w.store.ExecContext(ctx, upsert,
+		var upsert string
+		if w.store.Dialect().Name() == "mysql" {
+			upsert = `INSERT INTO security_ip_bans (id, cidr, source, reason_code, reason, note, occurrences, expires_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  source = IF(expires_at = 0 OR source = 'manual', source, VALUES(source)),
+  reason_code = IF(expires_at = 0 OR source = 'manual', reason_code, VALUES(reason_code)),
+  reason = IF(expires_at = 0 OR source = 'manual', reason, VALUES(reason)),
+  occurrences = GREATEST(occurrences + 1, VALUES(occurrences)),
+  expires_at = IF(expires_at = 0, 0, GREATEST(expires_at, VALUES(expires_at))),
+  updated_at = VALUES(updated_at)`
+		} else {
+			upsert = `INSERT INTO security_ip_bans (id, cidr, source, reason_code, reason, note, occurrences, expires_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (cidr) DO UPDATE SET
+  source = CASE WHEN security_ip_bans.expires_at = 0 OR security_ip_bans.source = 'manual' THEN security_ip_bans.source ELSE EXCLUDED.source END,
+  reason_code = CASE WHEN security_ip_bans.expires_at = 0 OR security_ip_bans.source = 'manual' THEN security_ip_bans.reason_code ELSE EXCLUDED.reason_code END,
+  reason = CASE WHEN security_ip_bans.expires_at = 0 OR security_ip_bans.source = 'manual' THEN security_ip_bans.reason ELSE EXCLUDED.reason END,
+  occurrences = CASE WHEN security_ip_bans.occurrences >= EXCLUDED.occurrences THEN security_ip_bans.occurrences + 1 ELSE EXCLUDED.occurrences END,
+  expires_at = CASE WHEN security_ip_bans.expires_at = 0 THEN 0 WHEN security_ip_bans.expires_at > EXCLUDED.expires_at THEN security_ip_bans.expires_at ELSE EXCLUDED.expires_at END,
+  updated_at = EXCLUDED.updated_at`
+		}
+		_, _ = w.store.ExecBgContext(ctx, upsert,
 			rec.ID, rec.CIDR, rec.Source, rec.ReasonCode, rec.Reason, "", rec.Occurrences, rec.ExpiresAt, rec.CreatedAt, rec.UpdatedAt)
 	}
 	return true

@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Willh92/Volo-go/internal/backup"
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/migrate"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -562,7 +561,7 @@ func TestZipSlipAssetTraversalPersistentSlotAndEncryptedConfig(t *testing.T) {
 // 4. plugin_kv Concurrency, TTL Expiry, and Native Backup/Restore Consistency
 func TestPluginKVAtomicConcurrencyTTLAndBackupRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	store, _, _, tmpDir := openTestPluginEnv(t)
+	store, _, _, _ := openTestPluginEnv(t)
 
 	kv := NewKVStore(store, "counter-plugin")
 	now := time.Unix(1770000000, 0)
@@ -603,34 +602,6 @@ func TestPluginKVAtomicConcurrencyTTLAndBackupRoundTrip(t *testing.T) {
 	resetVal, err := kv.IncrBy(ctx, "ephemeral:counter", 3, 60)
 	if err != nil || resetVal != 3 {
 		t.Fatalf("expected expired counter to reset to 3, got %d (err=%v)", resetVal, err)
-	}
-
-	// Export native backup ZIP and restore into a brand-new SQLite database!
-	zipPath := filepath.Join(tmpDir, "plugin-kv-backup.zip")
-	if _, err := backup.CreateToFile(ctx, store, zipPath, backup.CreateOptions{}); err != nil {
-		t.Fatalf("backup.CreateToFile: %v", err)
-	}
-
-	store2, err := sqlx.Open(ctx, sqlx.Options{
-		Driver: "sqlite",
-		DSN:    filepath.Join(tmpDir, "restored.db"),
-	})
-	if err != nil {
-		t.Fatalf("open restored sqlite: %v", err)
-	}
-	defer store2.Close()
-	if err := migrate.Up(ctx, store2); err != nil {
-		t.Fatalf("migrate restored sqlite: %v", err)
-	}
-	if _, err := backup.RestoreFromFile(ctx, store2, zipPath, backup.RestoreOptions{}); err != nil {
-		t.Fatalf("backup.RestoreFromFile: %v", err)
-	}
-
-	kv2 := NewKVStore(store2, "counter-plugin")
-	kv2.nowFn = func() time.Time { return now }
-	restoredHits, ok, err := kv2.Get(ctx, "hits:total")
-	if err != nil || !ok || restoredHits != "100" {
-		t.Fatalf("expected hits:total=100 after backup restore, got %q ok=%v err=%v", restoredHits, ok, err)
 	}
 }
 

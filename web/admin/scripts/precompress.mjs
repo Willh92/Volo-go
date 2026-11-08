@@ -5,6 +5,10 @@ import { gzipSync } from "node:zlib";
 const distDir = new URL("../../../internal/adminui/dist", import.meta.url).pathname;
 const themeAssetsDir = new URL("../../../internal/theme/builtin/volo-studio/assets", import.meta.url).pathname;
 const themeAssetsGzDir = new URL("../../../internal/theme/builtin/volo-studio/assets_gz", import.meta.url).pathname;
+const themeTemplatesDir = new URL("../../../internal/theme/builtin/volo-studio/templates", import.meta.url).pathname;
+const themeTemplatesGzDir = new URL("../../../internal/theme/builtin/volo-studio/templates_gz", import.meta.url).pathname;
+const i18nBuiltinDir = new URL("../../../internal/i18n/builtin", import.meta.url).pathname;
+const i18nBuiltinGzDir = new URL("../../../internal/i18n/builtin_gz", import.meta.url).pathname;
 
 function deterministicGzip(raw) {
   const gz = gzipSync(raw, { level: 9 });
@@ -34,7 +38,7 @@ function walkAdminDist(dir) {
   }
 }
 
-function precompressBuiltinThemeAssets(srcDir, outDir) {
+function precompressFlatDir(srcDir, outDir, suffix = "") {
   if (!existsSync(srcDir)) {
     return;
   }
@@ -42,6 +46,7 @@ function precompressBuiltinThemeAssets(srcDir, outDir) {
   mkdirSync(outDir, { recursive: true });
   for (const name of readdirSync(srcDir)) {
     if (name.startsWith(".")) continue;
+    if (suffix && !name.endsWith(suffix)) continue;
     const full = join(srcDir, name);
     const st = statSync(full);
     if (!st.isFile()) continue;
@@ -51,5 +56,6 @@ function precompressBuiltinThemeAssets(srcDir, outDir) {
 }
 
 walkAdminDist(distDir);
-precompressBuiltinThemeAssets(themeAssetsDir, themeAssetsGzDir);
-
+precompressFlatDir(themeAssetsDir, themeAssetsGzDir);
+precompressFlatDir(themeTemplatesDir, themeTemplatesGzDir, ".html");
+precompressFlatDir(i18nBuiltinDir, i18nBuiltinGzDir, ".json");

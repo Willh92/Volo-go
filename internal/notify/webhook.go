@@ -49,15 +49,30 @@ func NewWebhookSender(dialer *security.OutboundSafeDialer) *WebhookSender {
 	}
 }
 
+// WebhookDeliveryOutcome captures full telemetry from a single outbound webhook HTTP attempt.
+type WebhookDeliveryOutcome struct {
+	StatusCode   int
+	DurationMS   int
+	PayloadJSON  string
+	ResponseBody string
+}
+
 // Deliver sends ev to a single Webhook definition using its decrypted secret (if any) and returns the HTTP status code.
 func (s *WebhookSender) Deliver(ctx context.Context, wh domain.Webhook, plainSecret string, ev WebhookEvent) (int, error) {
+	out, err := s.DeliverDetailed(ctx, wh, plainSecret, ev)
+	return out.StatusCode, err
+}
+
+// DeliverDetailed sends ev to a single Webhook definition and returns detailed telemetry for webhook_deliveries.
+func (s *WebhookSender) DeliverDetailed(ctx context.Context, wh domain.Webhook, plainSecret string, ev WebhookEvent) (WebhookDeliveryOutcome, error) {
+	var out WebhookDeliveryOutcome
 	rawURL := strings.TrimSpace(wh.URL)
 	if rawURL == "" {
-		return 0, errors.New("webhook: url is required")
+		return out, errors.New("webhook: url is required")
 	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
-		return 0, errors.New("webhook: url must use https or http")
+		return out, errors.New("webhook: url must use https or http")
 	}
 	if ev.Timestamp <= 0 {
 		ev.Timestamp = time.Now().Unix()
@@ -65,12 +80,13 @@ func (s *WebhookSender) Deliver(ctx context.Context, wh domain.Webhook, plainSec
 
 	targetURL, bodyBytes, headers, err := BuildProviderPayload(wh, plainSecret, ev)
 	if err != nil {
-		return 0, err
+		return out, err
 	}
+	out.PayloadJSON = sanitizeStoredWebhookPayload(wh.Provider, bodyBytes)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return 0, err
+		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	req.Header.Set("User-Agent", "Volo-go-Webhook/1.0")
@@ -78,17 +94,40 @@ func (s *WebhookSender) Deliver(ctx context.Context, wh domain.Webhook, plainSec
 		req.Header.Set(k, v)
 	}
 
+	started := time.Now()
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return 0, err
+		out.DurationMS = int(time.Since(started).Milliseconds())
+		return out, err
 	}
 	defer resp.Body.Close()
 	respSnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	out.DurationMS = int(time.Since(started).Milliseconds())
+	out.StatusCode = resp.StatusCode
+	out.ResponseBody = truncateUTF8Bytes(strings.TrimSpace(string(respSnippet)), maxWebhookRespBytes)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, fmt.Errorf("webhook HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respSnippet)))
+		return out, fmt.Errorf("webhook HTTP %d: %s", resp.StatusCode, out.ResponseBody)
 	}
-	return resp.StatusCode, nil
+	return out, nil
+}
+
+func sanitizeStoredWebhookPayload(provider string, raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "feishu") {
+		var m map[string]any
+		if json.Unmarshal(raw, &m) == nil {
+			if _, ok := m["sign"]; ok {
+				m["sign"] = "[REDACTED]"
+				if scrubbed, err := json.Marshal(m); err == nil {
+					raw = scrubbed
+				}
+			}
+		}
+	}
+	return truncateUTF8Bytes(string(raw), maxWebhookPayloadBytes)
 }
 
 // BuildProviderPayload formats and cryptographically signs the outbound request for each provider.

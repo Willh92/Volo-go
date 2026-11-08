@@ -1,8 +1,10 @@
 {{define "content"}}
-{{$showPageTOC := and .StandalonePage.ShowTOC (gt (len .StandalonePage.TOC) 0)}}
-<div class="studio-layout studio-layout--article{{if $showPageTOC}} has-toc{{end}}">
+{{$pageTpl := default "default" .StandalonePage.Template}}
+{{$showPageTOC := and .StandalonePage.ShowTOC (gt (len .StandalonePage.TOC) 0) (ne $pageTpl "minimal")}}
+<div class="studio-layout studio-layout--article studio-layout--tpl-{{$pageTpl}}{{if $showPageTOC}} has-toc{{end}}">
   <div class="studio-article-col">
     <article class="studio-article"
+             data-page-template="{{if .StandalonePage.Template}}{{.StandalonePage.Template}}{{else}}default{{end}}"
              data-needs-math="{{if .StandalonePage.NeedsMath}}1{{end}}"
              data-needs-mermaid="{{if .StandalonePage.NeedsMermaid}}1{{end}}">
       <header class="studio-article__header">

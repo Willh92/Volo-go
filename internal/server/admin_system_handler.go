@@ -3,11 +3,20 @@ package server
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,9 +24,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/auth"
 	"github.com/Willh92/Volo-go/internal/backup"
+	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/content"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/doctor"
@@ -63,13 +74,80 @@ func parseAdminPageParams(r *http.Request, defaultPerPage, maxPerPage int) (int,
 		page = p
 	}
 	perPage := defaultPerPage
-	if pp, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("per_page"))); err == nil && pp > 0 {
+	rawPP := strings.TrimSpace(r.URL.Query().Get("per_page"))
+	if rawPP == "" {
+		rawPP = strings.TrimSpace(r.URL.Query().Get("page_size"))
+	}
+	if pp, err := strconv.Atoi(rawPP); err == nil && pp > 0 {
 		perPage = pp
 	}
 	if maxPerPage > 0 && perPage > maxPerPage {
 		perPage = maxPerPage
 	}
 	return page, perPage
+}
+
+func (s *AppServer) resolveBackupDir() string {
+	if s.deps.Config != nil && strings.TrimSpace(s.deps.Config.BackupDir) != "" {
+		return strings.TrimSpace(s.deps.Config.BackupDir)
+	}
+	if s.deps.Config != nil && strings.TrimSpace(s.deps.Config.DataDir) != "" {
+		return filepath.Join(s.deps.Config.DataDir, "backups")
+	}
+	return "backups"
+}
+
+func (s *AppServer) mintBackupExportTicket(actorID string) (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	tok := hex.EncodeToString(raw[:])
+	now := time.Now()
+	s.backupTicketMu.Lock()
+	defer s.backupTicketMu.Unlock()
+	if s.backupTickets == nil {
+		s.backupTickets = make(map[string]backupExportTicket)
+	}
+	for k, v := range s.backupTickets {
+		if now.After(v.ExpiresAt) {
+			delete(s.backupTickets, k)
+		}
+	}
+	s.backupTickets[tok] = backupExportTicket{
+		ActorID:   actorID,
+		ExpiresAt: now.Add(60 * time.Second),
+	}
+	return tok, nil
+}
+
+func (s *AppServer) consumeBackupExportTicket(ctx context.Context, rawTicket string) (*domain.User, bool) {
+	tok := strings.TrimSpace(rawTicket)
+	if len(tok) != 64 || s.deps.Store == nil {
+		return nil, false
+	}
+	now := time.Now()
+	s.backupTicketMu.Lock()
+	for k, v := range s.backupTickets {
+		if now.After(v.ExpiresAt) {
+			delete(s.backupTickets, k)
+		}
+	}
+	entry, exists := s.backupTickets[tok]
+	if exists {
+		delete(s.backupTickets, tok)
+	}
+	s.backupTicketMu.Unlock()
+	if !exists || now.After(entry.ExpiresAt) || entry.ActorID == "" {
+		return nil, false
+	}
+	u, err := sqlx.Get[domain.User](ctx, s.deps.Store,
+		`SELECT * FROM users WHERE id = ? AND status = ? AND role = ?`,
+		entry.ActorID, domain.UserStatusActive, domain.RoleAdmin)
+	if err != nil {
+		return nil, false
+	}
+	return &u, true
 }
 
 func sanitizeAdminIconField(raw string) (string, bool) {
@@ -107,7 +185,20 @@ func sanitizeRedirectTargetURL(raw string) (string, bool) {
 // SECURITY RED-LINE: All System, Settings, Appearance/Plugins, Users, WAF/GeoIP, and Backup routes
 // require `RoleAdmin` (`Editor` physically receives `403 Forbidden`)!
 func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Request, sub string) {
-	if sub == "backup/export" {
+	if sub == "backup/export" || sub == "backups/export" {
+		if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
+			if r.Method != http.MethodGet && r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			actor, ok := s.consumeBackupExportTicket(r.Context(), ticket)
+			if !ok {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired backup export ticket"})
+				return
+			}
+			s.handleAdminBackupExport(w, r, actor)
+			return
+		}
 		actor, _, ok := s.authenticateAdminRequest(w, r, auth.ScopeBackupRead, true)
 		if !ok {
 			return
@@ -260,8 +351,8 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			args = append(args, act)
 		}
 		if q != "" {
-			pat := "%" + q + "%"
-			where = append(where, "(LOWER(actor_name) LIKE LOWER(?) OR LOWER(action) LIKE LOWER(?) OR LOWER(resource_type) LIKE LOWER(?) OR LOWER(resource_id) LIKE LOWER(?) OR LOWER(detail_json) LIKE LOWER(?) OR LOWER(client_ip) LIKE LOWER(?))")
+			pat := "%" + escapeLikePattern(q) + "%"
+			where = append(where, "(LOWER(actor_name) LIKE LOWER(?) ESCAPE '!' OR LOWER(action) LIKE LOWER(?) ESCAPE '!' OR LOWER(resource_type) LIKE LOWER(?) ESCAPE '!' OR LOWER(resource_id) LIKE LOWER(?) ESCAPE '!' OR LOWER(detail_json) LIKE LOWER(?) ESCAPE '!' OR LOWER(client_ip) LIKE LOWER(?) ESCAPE '!')")
 			args = append(args, pat, pat, pat, pat, pat, pat)
 		}
 		whereSQL := strings.Join(where, " AND ")
@@ -282,21 +373,39 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			actions = append(actions, ar.Action)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"items":    rows,
-			"logs":     rows,
-			"actions":  actions,
-			"total":    total,
-			"page":     page,
-			"per_page": perPage,
+			"items":     rows,
+			"logs":      rows,
+			"actions":   actions,
+			"total":     total,
+			"page":      page,
+			"per_page":  perPage,
+			"page_size": perPage,
+		})
+
+	case (sub == "backup/ticket" || sub == "backups/ticket") && r.Method == http.MethodPost:
+		tok, err := s.mintBackupExportTicket(actor.ID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		s.recordAuditLog(r, actor, "backup.export_ticket", "system", "ticket", nil)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"ticket":     tok,
+			"expires_in": 60,
+			"export_url": "/api/admin/backups/export?ticket=" + tok,
 		})
 
 	case sub == "backup/local" || strings.HasPrefix(sub, "backup/local/"):
 		s.handleAdminLocalBackups(w, r, actor, strings.TrimPrefix(sub, "backup/local"))
 
-	case sub == "backup/restore" && r.Method == http.MethodPost:
+	case sub == "backups/local" || strings.HasPrefix(sub, "backups/local/"):
+		s.handleAdminLocalBackups(w, r, actor, strings.TrimPrefix(sub, "backups/local"))
+
+	case (sub == "backup/restore" || sub == "backups/restore") && r.Method == http.MethodPost:
 		s.handleAdminBackupRestore(w, r, actor)
 
-	case sub == "backup/import-legacy" && r.Method == http.MethodPost:
+	case (sub == "backup/import-legacy" || sub == "backups/import-legacy") && r.Method == http.MethodPost:
 		rep, dryRun, newSiteURL, err := s.streamLegacyImportUpload(w, r, false)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -470,6 +579,9 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		if action == "delete" {
+			s.invalidateMediaRefCache()
+		}
 		s.recordAuditLog(r, actor, "link.batch", "link", action, map[string]any{"action": action, "affected": affected})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
 		return
@@ -484,15 +596,17 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			where := []string{"1=1"}
 			var args []any
 			if q != "" {
-				pat := "%" + q + "%"
-				where = append(where, "(LOWER(title) LIKE LOWER(?) OR LOWER(url) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?) OR LOWER(category_name) LIKE LOWER(?))")
+				pat := "%" + escapeLikePattern(q) + "%"
+				where = append(where, "(LOWER(title) LIKE LOWER(?) ESCAPE '!' OR LOWER(url) LIKE LOWER(?) ESCAPE '!' OR LOWER(description) LIKE LOWER(?) ESCAPE '!' OR LOWER(category_name) LIKE LOWER(?) ESCAPE '!')")
 				args = append(args, pat, pat, pat, pat)
 			}
 			switch health {
 			case "ok":
 				where = append(where, "health_status = 'ok'")
-			case "broken", "error", "down":
-				where = append(where, "(health_status IN ('error', 'broken', 'down') OR http_code >= 400)")
+			case "redirect", "3xx":
+				where = append(where, "(health_status = 'redirect' OR (http_code >= 300 AND http_code < 400))")
+			case "broken", "error", "down", "blocked":
+				where = append(where, "(health_status IN ('error', 'broken', 'down', 'blocked') OR http_code >= 400)")
 			case "unchecked", "unknown":
 				where = append(where, "(health_status = 'unknown' OR health_status = '')")
 			}
@@ -510,12 +624,21 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			if rows == nil {
 				rows = []domain.Link{}
 			}
+			catRows, _ := sqlx.Select[struct {
+				CategoryName string `db:"category_name"`
+			}](r.Context(), s.deps.Store, `SELECT DISTINCT category_name FROM links WHERE TRIM(category_name) <> '' ORDER BY category_name ASC`)
+			categories := make([]string, 0, len(catRows))
+			for _, cr := range catRows {
+				categories = append(categories, cr.CategoryName)
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"items":    rows,
-				"links":    rows,
-				"total":    total,
-				"page":     page,
-				"per_page": perPage,
+				"items":      rows,
+				"links":      rows,
+				"categories": categories,
+				"total":      total,
+				"page":       page,
+				"per_page":   perPage,
+				"page_size":  perPage,
 			})
 		case http.MethodPost:
 			var in domain.Link
@@ -552,12 +675,27 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
+			s.invalidateMediaRefCache()
 			writeJSON(w, http.StatusCreated, map[string]any{"link": in})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 		return
 	}
+
+	parts := strings.Split(rest, "/")
+	if len(parts) == 2 && parts[1] == "check" && r.Method == http.MethodPost {
+		lk, err := sqlx.Get[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links WHERE id = ?`, strings.TrimSpace(parts[0]))
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+			return
+		}
+		updated := s.checkSingleFriendLink(r.Context(), lk)
+		s.recordAuditLog(r, actor, "link.check", "link", lk.ID, map[string]any{"health_status": updated.HealthStatus, "http_code": updated.HTTPCode})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "link": updated, "item": updated})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodPut:
 		var in domain.Link
@@ -587,17 +725,224 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		s.invalidateMediaRefCache()
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM links WHERE id = ?`, rest)
+		s.invalidateMediaRefCache()
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _ *domain.User, rest string) {
+type opmlDocument struct {
+	XMLName xml.Name    `xml:"opml"`
+	Version string      `xml:"version,attr"`
+	Head    opmlHead    `xml:"head"`
+	Body    opmlBodyDoc `xml:"body"`
+}
+
+type opmlHead struct {
+	Title       string `xml:"title,omitempty"`
+	DateCreated string `xml:"dateCreated,omitempty"`
+}
+
+type opmlBodyDoc struct {
+	Outlines []opmlOutline `xml:"outline"`
+}
+
+type opmlOutline struct {
+	Text         string        `xml:"text,attr,omitempty"`
+	Title        string        `xml:"title,attr,omitempty"`
+	Type         string        `xml:"type,attr,omitempty"`
+	XMLURL       string        `xml:"xmlUrl,attr,omitempty"`
+	XMLURLLower  string        `xml:"xmlurl,attr,omitempty"`
+	HTMLURL      string        `xml:"htmlUrl,attr,omitempty"`
+	HTMLURLLower string        `xml:"htmlurl,attr,omitempty"`
+	Description  string        `xml:"description,attr,omitempty"`
+	Outlines     []opmlOutline `xml:"outline,omitempty"`
+}
+
+func flattenOPMLOutlines(in []opmlOutline, dst *[]opmlOutline) {
+	for _, o := range in {
+		rawXML := strings.TrimSpace(o.XMLURL)
+		if rawXML == "" {
+			rawXML = strings.TrimSpace(o.XMLURLLower)
+		}
+		if rawXML != "" {
+			o.XMLURL = rawXML
+			if strings.TrimSpace(o.HTMLURL) == "" && strings.TrimSpace(o.HTMLURLLower) != "" {
+				o.HTMLURL = strings.TrimSpace(o.HTMLURLLower)
+			}
+			*dst = append(*dst, o)
+		}
+		if len(o.Outlines) > 0 {
+			flattenOPMLOutlines(o.Outlines, dst)
+		}
+	}
+}
+
+func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if (rest == "export.opml" || rest == "export" || rest == "opml") && r.Method == http.MethodGet {
+		rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
+		siteTitle := "Volo Subscriptions"
+		if s.deps.Settings != nil && strings.TrimSpace(s.deps.Settings.Snapshot().Site.Title) != "" {
+			siteTitle = strings.TrimSpace(s.deps.Settings.Snapshot().Site.Title) + " Subscriptions"
+		}
+		outlines := make([]opmlOutline, 0, len(rows))
+		for _, fw := range rows {
+			outlines = append(outlines, opmlOutline{
+				Text:        fw.Title,
+				Title:       fw.Title,
+				Type:        "rss",
+				XMLURL:      fw.FeedURL,
+				HTMLURL:     fw.SiteURL,
+				Description: fw.Description,
+			})
+		}
+		doc := opmlDocument{
+			Version: "2.0",
+			Head: opmlHead{
+				Title:       siteTitle,
+				DateCreated: time.Now().UTC().Format(time.RFC1123Z),
+			},
+			Body: opmlBodyDoc{Outlines: outlines},
+		}
+		xmlBytes, err := xml.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="volo-follows.opml"`)
+		_, _ = w.Write([]byte(xml.Header))
+		_, _ = w.Write(xmlBytes)
+		return
+	}
+
+	if (rest == "import-opml" || rest == "import") && r.Method == http.MethodPost {
+		var rawOPML []byte
+		ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+		if strings.HasPrefix(ct, "multipart/form-data") {
+			files, fields, mErr := readMultipartInMemoryFiles(w, r, 4<<20, 4<<20, 2)
+			if mErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
+				return
+			}
+			if len(files) > 0 {
+				rawOPML = files[0].Data
+			} else if strings.TrimSpace(fields["opml"]) != "" {
+				rawOPML = []byte(fields["opml"])
+			} else if strings.TrimSpace(fields["data"]) != "" {
+				rawOPML = []byte(fields["data"])
+			}
+		} else {
+			bodyBytes, rErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
+			if rErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": rErr.Error()})
+				return
+			}
+			trimmed := bytes.TrimSpace(bodyBytes)
+			if len(trimmed) > 0 && trimmed[0] == '{' {
+				var jReq struct {
+					OPML string `json:"opml"`
+					Data string `json:"data"`
+				}
+				if err := json.Unmarshal(trimmed, &jReq); err != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+					return
+				}
+				if strings.TrimSpace(jReq.OPML) != "" {
+					rawOPML = []byte(jReq.OPML)
+				} else {
+					rawOPML = []byte(jReq.Data)
+				}
+			} else {
+				rawOPML = trimmed
+			}
+		}
+		if len(bytes.TrimSpace(rawOPML)) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty OPML payload"})
+			return
+		}
+		var doc opmlDocument
+		if err := xml.Unmarshal(rawOPML, &doc); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid OPML XML: " + err.Error()})
+			return
+		}
+		var flat []opmlOutline
+		flattenOPMLOutlines(doc.Body.Outlines, &flat)
+
+		existing, _ := sqlx.Select[struct {
+			FeedURL string `db:"feed_url"`
+		}](r.Context(), s.deps.Store, `SELECT feed_url FROM follows`)
+		seen := make(map[string]struct{}, len(existing)+len(flat))
+		for _, ex := range existing {
+			seen[strings.ToLower(strings.TrimSpace(ex.FeedURL))] = struct{}{}
+		}
+
+		imported := 0
+		skipped := 0
+		now := time.Now().UnixMilli()
+		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			for idx, item := range flat {
+				if imported >= 500 {
+					skipped++
+					continue
+				}
+				cleanFeed, feedOK := repo.SanitizeAllowedURL(item.XMLURL, false)
+				lowerFeed := strings.ToLower(cleanFeed)
+				if !feedOK || (!strings.HasPrefix(lowerFeed, "http://") && !strings.HasPrefix(lowerFeed, "https://")) {
+					skipped++
+					continue
+				}
+				if _, dup := seen[lowerFeed]; dup {
+					skipped++
+					continue
+				}
+				title := strings.TrimSpace(item.Title)
+				if title == "" {
+					title = strings.TrimSpace(item.Text)
+				}
+				if title == "" {
+					if u, uErr := url.Parse(cleanFeed); uErr == nil && u.Host != "" {
+						title = u.Host
+					} else {
+						title = cleanFeed
+					}
+				}
+				cleanSite := ""
+				if strings.TrimSpace(item.HTMLURL) != "" {
+					if cs, ok := sanitizeRedirectTargetURL(item.HTMLURL); ok {
+						cleanSite = cs
+					}
+				}
+				desc := truncateRunes(strings.TrimSpace(item.Description), 300)
+				if _, iErr := tx.ExecContext(r.Context(),
+					`INSERT INTO follows (id, title, site_url, feed_url, description, icon_url, sort_order, last_synced_at, sync_error, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?, '', ?, 0, '', ?, ?)`,
+					id.Next(), truncateRunes(title, 120), cleanSite, cleanFeed, desc, idx, now, now); iErr != nil {
+					skipped++
+					continue
+				}
+				seen[lowerFeed] = struct{}{}
+				imported++
+			}
+			return nil
+		})
+		s.invalidateMediaRefCache()
+		s.recordAuditLog(r, actor, "follow.import_opml", "follow", "opml", map[string]any{"imported": imported, "skipped": skipped})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"imported": imported,
+			"count":    imported,
+			"skipped":  skipped,
+		})
+		return
+	}
+
 	if rest == "sync" && r.Method == http.MethodPost {
 		n, err := s.syncAllFollowFeeds(r.Context())
 		if err != nil {
@@ -624,8 +969,8 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 			where := []string{"1=1"}
 			var args []any
 			if q != "" {
-				pat := "%" + q + "%"
-				where = append(where, "(LOWER(title) LIKE LOWER(?) OR LOWER(site_url) LIKE LOWER(?) OR LOWER(feed_url) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?))")
+				pat := "%" + escapeLikePattern(q) + "%"
+				where = append(where, "(LOWER(title) LIKE LOWER(?) ESCAPE '!' OR LOWER(site_url) LIKE LOWER(?) ESCAPE '!' OR LOWER(feed_url) LIKE LOWER(?) ESCAPE '!' OR LOWER(description) LIKE LOWER(?) ESCAPE '!')")
 				args = append(args, pat, pat, pat, pat)
 			}
 			switch st {
@@ -647,11 +992,12 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 				rows = []domain.Follow{}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"items":    rows,
-				"follows":  rows,
-				"total":    total,
-				"page":     page,
-				"per_page": perPage,
+				"items":     rows,
+				"follows":   rows,
+				"total":     total,
+				"page":      page,
+				"per_page":  perPage,
+				"page_size": perPage,
 			})
 		case http.MethodPost:
 			var in domain.Follow
@@ -698,12 +1044,43 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
+			s.invalidateMediaRefCache()
 			writeJSON(w, http.StatusCreated, map[string]any{"follow": in})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 		return
 	}
+
+	parts := strings.Split(rest, "/")
+	if len(parts) == 2 && parts[1] == "sync" && r.Method == http.MethodPost {
+		fw, err := sqlx.Get[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows WHERE id = ?`, strings.TrimSpace(parts[0]))
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "follow subscription not found"})
+			return
+		}
+		cnt, updated, syncErr := s.syncSingleFollowFeed(r.Context(), fw)
+		if cnt > 0 && s.deps.Content != nil {
+			s.deps.Content.WarmCaches(r.Context())
+		}
+		s.recordAuditLog(r, actor, "follow.sync_single", "follow", fw.ID, map[string]any{"synced_items": cnt})
+		if syncErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok":           false,
+				"synced_items": cnt,
+				"follow":       updated,
+				"error":        syncErr.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"synced_items": cnt,
+			"follow":       updated,
+		})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodPut:
 		var in domain.Follow
@@ -744,6 +1121,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		s.invalidateMediaRefCache()
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	case http.MethodDelete:
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -751,6 +1129,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 			_, err := tx.ExecContext(r.Context(), `DELETE FROM follows WHERE id = ?`, rest)
 			return err
 		})
+		s.invalidateMediaRefCache()
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -759,7 +1138,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, _
 
 func normalizeRedirectSourcePath(raw string) (string, bool) {
 	clean := strings.TrimSpace(repo.StripASCIIControls(raw))
-	if clean == "" || strings.HasPrefix(clean, "//") || strings.ContainsAny(clean, "?# \t") {
+	if clean == "" || strings.HasPrefix(clean, "//") || strings.ContainsAny(clean, "?# \t\\") {
 		return "", false
 	}
 	if !strings.HasPrefix(clean, "/") {
@@ -771,8 +1150,288 @@ func normalizeRedirectSourcePath(raw string) (string, bool) {
 	return clean, true
 }
 
+func normalizeRedirectComparePath(p string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(p), "/")
+	if trimmed == "" {
+		return "/"
+	}
+	return trimmed
+}
+
+func normalizeRedirectStatusCode(code int) int {
+	switch code {
+	case 301, 302, 307, 308:
+		return code
+	default:
+		return 301
+	}
+}
+
+func (s *AppServer) isRedirectSelfLoop(r *http.Request, srcPath, dstTarget string) bool {
+	srcNorm := normalizeRedirectComparePath(srcPath)
+	dstTrim := strings.TrimSpace(dstTarget)
+	if dstTrim == "" || dstTrim == srcPath {
+		return true
+	}
+	u, err := url.Parse(dstTrim)
+	if err != nil {
+		return true
+	}
+	dstNorm := normalizeRedirectComparePath(u.Path)
+	if !u.IsAbs() && u.Host == "" {
+		return dstNorm == srcNorm
+	}
+	dstHost := strings.ToLower(strings.TrimSpace(u.Host))
+	dstHostname := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	matchHost := func(candidateHost string) bool {
+		ch := strings.ToLower(strings.TrimSpace(candidateHost))
+		if ch == "" {
+			return false
+		}
+		if ch == dstHost || ch == dstHostname {
+			return true
+		}
+		if cu, pErr := url.Parse("http://" + ch); pErr == nil && cu.Hostname() != "" {
+			return strings.ToLower(cu.Hostname()) == dstHostname
+		}
+		return false
+	}
+	sameHost := false
+	if r != nil && matchHost(r.Host) {
+		sameHost = true
+	}
+	if !sameHost {
+		if pubU, pErr := url.Parse(s.publicBaseURL(r)); pErr == nil && matchHost(pubU.Host) {
+			sameHost = true
+		}
+	}
+	return sameHost && dstNorm == srcNorm
+}
+
+type redirectImportCandidate struct {
+	SourcePath string `json:"source_path"`
+	TargetPath string `json:"target_path"`
+	StatusCode int    `json:"status_code"`
+}
+
+func parseRedirectImportCandidates(formatHint string, rawData []byte) ([]redirectImportCandidate, error) {
+	trimmed := bytes.TrimSpace(rawData)
+	if len(trimmed) == 0 {
+		return nil, errors.New("empty redirect import payload")
+	}
+	hint := strings.ToLower(strings.TrimSpace(formatHint))
+	if hint == "json" || (hint == "" && (trimmed[0] == '[' || trimmed[0] == '{')) {
+		if trimmed[0] == '[' {
+			var arr []redirectImportCandidate
+			if err := json.Unmarshal(trimmed, &arr); err != nil {
+				return nil, fmt.Errorf("invalid redirect JSON array: %w", err)
+			}
+			return arr, nil
+		}
+		var env struct {
+			Format    string                    `json:"format"`
+			Data      string                    `json:"data"`
+			Items     []redirectImportCandidate `json:"items"`
+			Redirects []redirectImportCandidate `json:"redirects"`
+		}
+		if err := json.Unmarshal(trimmed, &env); err != nil {
+			return nil, fmt.Errorf("invalid redirect JSON object: %w", err)
+		}
+		if strings.TrimSpace(env.Data) != "" {
+			innerFmt := env.Format
+			if innerFmt == "" {
+				innerFmt = "csv"
+				dt := strings.TrimSpace(env.Data)
+				if strings.HasPrefix(dt, "[") || strings.HasPrefix(dt, "{") {
+					innerFmt = "json"
+				}
+			}
+			return parseRedirectImportCandidates(innerFmt, []byte(env.Data))
+		}
+		if len(env.Items) > 0 {
+			return env.Items, nil
+		}
+		return env.Redirects, nil
+	}
+
+	cr := csv.NewReader(bytes.NewReader(trimmed))
+	cr.FieldsPerRecord = -1
+	cr.TrimLeadingSpace = true
+	records, err := cr.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect CSV: %w", err)
+	}
+	out := make([]redirectImportCandidate, 0, len(records))
+	for i, rec := range records {
+		if len(rec) < 2 {
+			continue
+		}
+		col0 := strings.TrimSpace(rec[0])
+		col1 := strings.TrimSpace(rec[1])
+		if col0 == "" || strings.HasPrefix(col0, "#") {
+			continue
+		}
+		if i == 0 && (strings.EqualFold(col0, "source_path") || strings.EqualFold(col0, "source") || strings.EqualFold(col0, "from")) {
+			continue
+		}
+		code := 301
+		if len(rec) >= 3 && strings.TrimSpace(rec[2]) != "" {
+			if c, cErr := strconv.Atoi(strings.TrimSpace(rec[2])); cErr == nil {
+				code = c
+			}
+		}
+		out = append(out, redirectImportCandidate{
+			SourcePath: col0,
+			TargetPath: col1,
+			StatusCode: code,
+		})
+	}
+	return out, nil
+}
+
 func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if rest == "export" && r.Method == http.MethodGet {
+		rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, `SELECT * FROM redirects ORDER BY created_at DESC`)
+		if rows == nil {
+			rows = []domain.RedirectRule{}
+		}
+		format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+		if format == "csv" {
+			var buf bytes.Buffer
+			cw := csv.NewWriter(&buf)
+			_ = cw.Write([]string{"source_path", "target_path", "status_code"})
+			for _, row := range rows {
+				_ = cw.Write([]string{row.SourcePath, row.TargetPath, strconv.Itoa(row.StatusCode)})
+			}
+			cw.Flush()
+			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+			w.Header().Set("Content-Disposition", `attachment; filename="volo-redirects.csv"`)
+			_, _ = w.Write(buf.Bytes())
+			return
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="volo-redirects.json"`)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":     rows,
+			"redirects": rows,
+			"total":     len(rows),
+		})
+		return
+	}
+
+	if rest == "import" && r.Method == http.MethodPost {
+		var (
+			rawPayload []byte
+			fmtHint    = strings.TrimSpace(r.URL.Query().Get("format"))
+		)
+		ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+		if strings.HasPrefix(ct, "multipart/form-data") {
+			files, fields, mErr := readMultipartInMemoryFiles(w, r, 8<<20, 8<<20, 2)
+			if mErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
+				return
+			}
+			if fields["format"] != "" {
+				fmtHint = fields["format"]
+			}
+			if len(files) > 0 {
+				rawPayload = files[0].Data
+				if fmtHint == "" && strings.HasSuffix(strings.ToLower(files[0].Filename), ".csv") {
+					fmtHint = "csv"
+				} else if fmtHint == "" && strings.HasSuffix(strings.ToLower(files[0].Filename), ".json") {
+					fmtHint = "json"
+				}
+			} else if fields["data"] != "" {
+				rawPayload = []byte(fields["data"])
+			}
+		} else {
+			if strings.Contains(ct, "text/csv") && fmtHint == "" {
+				fmtHint = "csv"
+			}
+			var rErr error
+			rawPayload, rErr = io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+			if rErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": rErr.Error()})
+				return
+			}
+		}
+
+		candidates, pErr := parseRedirectImportCandidates(fmtHint, rawPayload)
+		if pErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": pErr.Error()})
+			return
+		}
+		imported := 0
+		skipped := 0
+		selfLoops := 0
+		now := time.Now().UnixMilli()
+		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			for _, cand := range candidates {
+				if imported >= 2000 {
+					skipped++
+					continue
+				}
+				src, srcOK := normalizeRedirectSourcePath(cand.SourcePath)
+				dst, dstOK := sanitizeRedirectTargetURL(cand.TargetPath)
+				if !srcOK || !dstOK {
+					skipped++
+					continue
+				}
+				if s.isRedirectSelfLoop(r, src, dst) {
+					selfLoops++
+					skipped++
+					continue
+				}
+				code := normalizeRedirectStatusCode(cand.StatusCode)
+				var existingID string
+				_ = tx.QueryRowContext(r.Context(), `SELECT id FROM redirects WHERE source_path = ?`, src).Scan(&existingID)
+				if existingID != "" {
+					if _, uErr := tx.ExecContext(r.Context(),
+						`UPDATE redirects SET target_path = ?, status_code = ? WHERE id = ?`,
+						dst, code, existingID); uErr != nil {
+						return uErr
+					}
+				} else {
+					if _, iErr := tx.ExecContext(r.Context(),
+						`INSERT INTO redirects (id, source_path, target_path, status_code, is_system_legacy, hit_count, created_at)
+						 VALUES (?, ?, ?, ?, ?, 0, ?)`,
+						id.Next(), src, dst, code, false, now); iErr != nil {
+						return iErr
+					}
+				}
+				imported++
+			}
+			return nil
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if imported == 0 && len(candidates) > 0 {
+			errMsg := "no valid redirect rules found in payload"
+			if selfLoops > 0 {
+				errMsg = "redirect target cannot point to source_path (self-loop)"
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":    errMsg,
+				"imported": 0,
+				"skipped":  skipped,
+			})
+			return
+		}
+		if s.deps.Content != nil {
+			s.deps.Content.WarmCaches(r.Context())
+		}
+		s.recordAuditLog(r, actor, "redirect.import", "redirect", "import", map[string]any{"imported": imported, "skipped": skipped})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"imported": imported,
+			"count":    imported,
+			"skipped":  skipped,
+		})
+		return
+	}
+
 	if rest == "batch" && r.Method == http.MethodPost {
 		var req struct {
 			Action string   `json:"action"`
@@ -808,6 +1467,9 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.WarmCaches(r.Context())
+		}
 		s.recordAuditLog(r, actor, "redirect.batch_delete", "redirect", "batch", map[string]any{"affected": affected})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
 		return
@@ -824,11 +1486,11 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			where := []string{"1=1"}
 			var args []any
 			if q != "" {
-				pat := "%" + q + "%"
-				where = append(where, "(LOWER(source_path) LIKE LOWER(?) OR LOWER(target_path) LIKE LOWER(?))")
+				pat := "%" + escapeLikePattern(q) + "%"
+				where = append(where, "(LOWER(source_path) LIKE LOWER(?) ESCAPE '!' OR LOWER(target_path) LIKE LOWER(?) ESCAPE '!')")
 				args = append(args, pat, pat)
 			}
-			if codeStr == "301" || codeStr == "302" {
+			if codeStr == "301" || codeStr == "302" || codeStr == "307" || codeStr == "308" {
 				codeVal, _ := strconv.Atoi(codeStr)
 				where = append(where, "status_code = ?")
 				args = append(args, codeVal)
@@ -861,6 +1523,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 				"total":     total,
 				"page":      page,
 				"per_page":  perPage,
+				"page_size": perPage,
 			})
 		case http.MethodPost:
 			var in domain.RedirectRule
@@ -870,13 +1533,15 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			}
 			src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
 			dst, dstOK := sanitizeRedirectTargetURL(in.TargetPath)
-			if !srcOK || !dstOK || src == dst {
+			if !srcOK || !dstOK {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and allowed target_path required"})
 				return
 			}
-			if in.StatusCode != 301 && in.StatusCode != 302 {
-				in.StatusCode = 301
+			if s.isRedirectSelfLoop(r, src, dst) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "redirect target cannot point to source_path (self-loop)"})
+				return
 			}
+			in.StatusCode = normalizeRedirectStatusCode(in.StatusCode)
 			in.ID = id.Next()
 			in.SourcePath = src
 			in.TargetPath = dst
@@ -887,6 +1552,9 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 				in.ID, in.SourcePath, in.TargetPath, in.StatusCode, false, in.CreatedAt); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
+			}
+			if s.deps.Content != nil {
+				s.deps.Content.WarmCaches(r.Context())
 			}
 			writeJSON(w, http.StatusCreated, map[string]any{"redirect": in})
 		default:
@@ -903,26 +1571,196 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 		}
 		src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
 		dst, dstOK := sanitizeRedirectTargetURL(in.TargetPath)
-		if !srcOK || !dstOK || src == dst {
+		if !srcOK || !dstOK {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid distinct source_path and allowed target_path required"})
 			return
 		}
-		if in.StatusCode != 301 && in.StatusCode != 302 {
-			in.StatusCode = 301
+		if s.isRedirectSelfLoop(r, src, dst) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "redirect target cannot point to source_path (self-loop)"})
+			return
 		}
+		in.StatusCode = normalizeRedirectStatusCode(in.StatusCode)
 		if _, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE redirects SET source_path = ?, target_path = ?, status_code = ? WHERE id = ?`,
 			src, dst, in.StatusCode, rest); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.WarmCaches(r.Context())
+		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	case http.MethodDelete:
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM redirects WHERE id = ?`, rest)
+		if s.deps.Content != nil {
+			s.deps.Content.WarmCaches(r.Context())
+		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func truncateWebhookUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+func (s *AppServer) replayWebhookDelivery(ctx context.Context, wh domain.Webhook, orig domain.WebhookDelivery) (domain.WebhookDelivery, error) {
+	now := time.Now().UnixMilli()
+	evName := strings.TrimSpace(orig.Event)
+	if evName == "" {
+		evName = "webhook.replay"
+	}
+	evName = truncateWebhookUTF8Bytes(evName, 64)
+	storedPayload := truncateWebhookUTF8Bytes(orig.PayloadJSON, 32768)
+
+	persist := func(statusCode, durMS int, respBody string, dErr error) (domain.WebhookDelivery, error) {
+		errMsg := ""
+		if dErr != nil {
+			errMsg = truncateWebhookUTF8Bytes(dErr.Error(), 240)
+		}
+		success := dErr == nil && statusCode >= 200 && statusCode < 300
+		rec := domain.WebhookDelivery{
+			ID:           id.Next(),
+			WebhookID:    wh.ID,
+			Event:        evName,
+			StatusCode:   statusCode,
+			DurationMS:   durMS,
+			Success:      success,
+			PayloadJSON:  storedPayload,
+			ResponseBody: truncateWebhookUTF8Bytes(respBody, 4096),
+			ErrorText:    errMsg,
+			CreatedAt:    now,
+		}
+		_, _ = s.deps.Store.ExecBgContext(ctx,
+			`UPDATE webhooks SET last_status_code = ?, last_error = ?, last_triggered_at = ?, updated_at = ? WHERE id = ?`,
+			rec.StatusCode, rec.ErrorText, now, now, wh.ID)
+		_, _ = s.deps.Store.ExecBgContext(ctx,
+			`INSERT INTO webhook_deliveries (id, webhook_id, event, status_code, duration_ms, success, payload_json, response_body, error_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			rec.ID, rec.WebhookID, rec.Event, rec.StatusCode, rec.DurationMS, rec.Success, rec.PayloadJSON, rec.ResponseBody, rec.ErrorText, rec.CreatedAt)
+		_, _ = s.deps.Store.ExecBgContext(ctx,
+			`DELETE FROM webhook_deliveries WHERE webhook_id = ? AND id NOT IN (SELECT id FROM (SELECT id FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC, id DESC LIMIT 100) AS keep_rows)`,
+			wh.ID, wh.ID)
+		return rec, dErr
+	}
+
+	rawURL := strings.TrimSpace(wh.URL)
+	parsedURL, uErr := url.Parse(rawURL)
+	if rawURL == "" || uErr != nil || (parsedURL.Scheme != "https" && parsedURL.Scheme != "http") {
+		return persist(0, 0, "", errors.New("webhook: url must use https or http"))
+	}
+
+	plainSecret := ""
+	if strings.TrimSpace(wh.SecretCiphertext) != "" {
+		if s.deps.Config == nil || s.deps.Config.KeyRing == nil {
+			return persist(0, 0, "", errors.New("webhook: keyring unavailable to decrypt secret"))
+		}
+		var decErr error
+		plainSecret, decErr = s.deps.Config.KeyRing.OpenStringFallback(
+			wh.SecretCiphertext,
+			config.WebhookSecretAAD(wh.ID),
+			"webhooks:secret:"+wh.ID,
+		)
+		if decErr != nil {
+			return persist(0, 0, "", fmt.Errorf("webhook secret decryption failed: %w", decErr))
+		}
+	}
+
+	targetURL := rawURL
+	payloadBytes := []byte(orig.PayloadJSON)
+	headers := map[string]string{
+		"Content-Type":     "application/json; charset=utf-8",
+		"User-Agent":       "Volo-go-Webhook/1.0",
+		"X-Volo-Replay-Of": orig.ID,
+	}
+	tsSec := time.Now().Unix()
+	tsStr := strconv.FormatInt(tsSec, 10)
+	provider := strings.ToLower(strings.TrimSpace(wh.Provider))
+	if provider == "" {
+		provider = "custom"
+	}
+
+	switch provider {
+	case "feishu":
+		if plainSecret != "" {
+			var m map[string]any
+			if json.Unmarshal(payloadBytes, &m) == nil {
+				mac := hmac.New(sha256.New, []byte(tsStr+"\n"+plainSecret))
+				m["timestamp"] = tsStr
+				m["sign"] = base64.StdEncoding.EncodeToString(mac.Sum(nil))
+				if signedBytes, mErr := json.Marshal(m); mErr == nil {
+					payloadBytes = signedBytes
+				}
+				m["sign"] = "[REDACTED]"
+				if redactedBytes, rErr := json.Marshal(m); rErr == nil {
+					storedPayload = truncateWebhookUTF8Bytes(string(redactedBytes), 32768)
+				}
+			}
+		}
+	case "dingtalk":
+		if plainSecret != "" {
+			tsMS := strconv.FormatInt(tsSec*1000, 10)
+			mac := hmac.New(sha256.New, []byte(plainSecret))
+			mac.Write([]byte(tsMS + "\n" + plainSecret))
+			q := parsedURL.Query()
+			q.Set("timestamp", tsMS)
+			q.Set("sign", base64.StdEncoding.EncodeToString(mac.Sum(nil)))
+			parsedURL.RawQuery = q.Encode()
+			targetURL = parsedURL.String()
+		}
+	default:
+		headers["X-Volo-Event"] = evName
+		headers["X-Volo-Timestamp"] = tsStr
+		if plainSecret != "" {
+			mac := hmac.New(sha256.New, []byte(plainSecret))
+			mac.Write([]byte(tsStr + "."))
+			mac.Write(payloadBytes)
+			headers["X-Volo-Signature"] = "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		}
+	}
+
+	dialer := s.deps.OutboundDialer
+	if dialer == nil {
+		dialer = &security.OutboundSafeDialer{Timeout: 8 * time.Second}
+	}
+	client := dialer.NewHTTPClient(8 * time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	req, rErr := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(payloadBytes))
+	if rErr != nil {
+		return persist(0, 0, "", rErr)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	started := time.Now()
+	resp, doErr := client.Do(req)
+	durMS := int(time.Since(started).Milliseconds())
+	if durMS < 0 {
+		durMS = 0
+	}
+	if doErr != nil {
+		return persist(0, durMS, "", doErr)
+	}
+	respSnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	respStr := strings.TrimSpace(string(respSnippet))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return persist(resp.StatusCode, durMS, respStr, fmt.Errorf("webhook HTTP %d: %s", resp.StatusCode, respStr))
+	}
+	return persist(resp.StatusCode, durMS, respStr, nil)
 }
 
 func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
@@ -968,7 +1806,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 			secCipher := ""
 			if strings.TrimSpace(in.Secret) != "" {
 				var sErr error
-				secCipher, sErr = s.deps.Config.KeyRing.SealString(strings.TrimSpace(in.Secret), "webhook:"+in.ID)
+				secCipher, sErr = s.deps.Config.KeyRing.SealString(strings.TrimSpace(in.Secret), config.WebhookSecretAAD(in.ID))
 				if sErr != nil {
 					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": sErr.Error()})
 					return
@@ -997,6 +1835,44 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 	wh, err := sqlx.Get[domain.Webhook](r.Context(), s.deps.Store, `SELECT * FROM webhooks WHERE id = ?`, whID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "webhook not found"})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "deliveries" && r.Method == http.MethodGet {
+		rows, _ := sqlx.Select[domain.WebhookDelivery](r.Context(), s.deps.Store,
+			`SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC, id DESC LIMIT 100`, wh.ID)
+		if rows == nil {
+			rows = []domain.WebhookDelivery{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":      rows,
+			"deliveries": rows,
+			"total":      len(rows),
+		})
+		return
+	}
+	if len(parts) == 4 && parts[1] == "deliveries" && parts[3] == "replay" && r.Method == http.MethodPost {
+		orig, dErr := sqlx.Get[domain.WebhookDelivery](r.Context(), s.deps.Store,
+			`SELECT * FROM webhook_deliveries WHERE id = ? AND webhook_id = ?`, strings.TrimSpace(parts[2]), wh.ID)
+		if dErr != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "webhook delivery not found"})
+			return
+		}
+		newDeliv, rErr := s.replayWebhookDelivery(r.Context(), wh, orig)
+		s.recordAuditLog(r, actor, "webhook.replay", "webhook", wh.ID, map[string]any{"delivery_id": orig.ID, "new_delivery_id": newDeliv.ID, "status_code": newDeliv.StatusCode})
+		if rErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok":          false,
+				"status_code": newDeliv.StatusCode,
+				"delivery":    newDeliv,
+				"error":       rErr.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":          true,
+			"status_code": newDeliv.StatusCode,
+			"delivery":    newDeliv,
+		})
 		return
 	}
 	if len(parts) == 2 && parts[1] == "test" && r.Method == http.MethodPost {
@@ -1029,7 +1905,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 		if in.ClearSecret {
 			secCipher = ""
 		} else if strings.TrimSpace(in.Secret) != "" {
-			secCipher, _ = s.deps.Config.KeyRing.SealString(strings.TrimSpace(in.Secret), "webhook:"+whID)
+			secCipher, _ = s.deps.Config.KeyRing.SealString(strings.TrimSpace(in.Secret), config.WebhookSecretAAD(whID))
 		}
 		evJSON := wh.EventsJSON
 		if len(in.Events) > 0 {
@@ -1048,6 +1924,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case http.MethodDelete:
+		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM webhook_deliveries WHERE webhook_id = ?`, whID)
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM webhooks WHERE id = ?`, whID)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
@@ -1142,34 +2019,30 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	}
 
 	if rest == "install" && r.Method == http.MethodPost {
-		r.Body = http.MaxBytesReader(w, r.Body, 33<<20)
-		if err := r.ParseMultipartForm(8 << 20); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "theme .zip upload exceeds 32MB limit"})
+		files, fields, mErr := readMultipartInMemoryFiles(w, r, 32<<20, 32<<20, 2)
+		if mErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
 			return
 		}
-		f, _, err := r.FormFile("file")
-		if err != nil {
+		var uf *inMemoryMultipartFile
+		for i := range files {
+			if files[i].FieldName == "file" || uf == nil {
+				uf = &files[i]
+				if files[i].FieldName == "file" {
+					break
+				}
+			}
+		}
+		if uf == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
 			return
 		}
-		defer f.Close()
-		tmp, err := os.CreateTemp(s.ensureTempDir(), "volo-theme-*.zip")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
+		owRaw := strings.TrimSpace(fields["overwrite"])
+		if owRaw == "" {
+			owRaw = strings.TrimSpace(r.URL.Query().Get("overwrite"))
 		}
-		tmpName := tmp.Name()
-		defer os.Remove(tmpName)
-		sz, err := io.Copy(tmp, io.LimitReader(f, 32<<20+1))
-		if err != nil {
-			_ = tmp.Close()
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		_, _ = tmp.Seek(0, io.SeekStart)
-		overwrite := r.FormValue("overwrite") == "1" || strings.EqualFold(r.FormValue("overwrite"), "true")
-		mf, iErr := s.deps.Themes.InstallZip(tmp, sz, overwrite)
-		_ = tmp.Close()
+		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
+		mf, iErr := s.deps.Themes.InstallZip(bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite)
 		if iErr != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": iErr.Error()})
 			return
@@ -1184,6 +2057,23 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 
 	parts := strings.Split(rest, "/")
 	themeID := strings.TrimSpace(parts[0])
+	if len(parts) == 2 && (parts[1] == "export" || parts[1] == "export.zip") && r.Method == http.MethodGet {
+		if s.deps.Themes == nil || !s.deps.Themes.Has(themeID) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "theme not found: " + themeID})
+			return
+		}
+		var buf bytes.Buffer
+		if err := s.deps.Themes.ExportZip(&buf, themeID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.recordAuditLog(r, actor, "theme.export", "theme", themeID, nil)
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.zip"`, themeID))
+		_, _ = w.Write(buf.Bytes())
+		return
+	}
+
 	if len(parts) == 2 && parts[1] == "config" && (r.Method == http.MethodPut || r.Method == http.MethodPatch) {
 		if !s.deps.Themes.Has(themeID) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "theme not found: " + themeID})
@@ -1210,6 +2100,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "theme.config", "theme", themeID, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"appearance": val, "version": ver})
 		return
@@ -1232,6 +2123,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			patchBytes, _ := json.Marshal(patchReset)
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 		}
+		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
 		nextApp := s.deps.Settings.Snapshot().Appearance
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -1327,24 +2219,28 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 
-		r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
-		if err := r.ParseMultipartForm(8 << 20); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "language pack upload exceeds 8MB limit"})
+		files, fields, mErr := readMultipartInMemoryFiles(w, r, 8<<20, 8<<20, 2)
+		if mErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
 			return
 		}
-		f, hdr, err := r.FormFile("file")
-		if err != nil {
+		var uf *inMemoryMultipartFile
+		for i := range files {
+			if files[i].FieldName == "file" || uf == nil {
+				uf = &files[i]
+				if files[i].FieldName == "file" {
+					break
+				}
+			}
+		}
+		if uf == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
 			return
 		}
-		defer f.Close()
-		raw, err := io.ReadAll(io.LimitReader(f, 8<<20+1))
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		overwrite := r.FormValue("overwrite") == "" || r.FormValue("overwrite") == "1" || strings.EqualFold(r.FormValue("overwrite"), "true")
-		fname := strings.TrimSpace(hdr.Filename)
+		raw := uf.Data
+		owRaw := strings.TrimSpace(fields["overwrite"])
+		overwrite := owRaw == "" || owRaw == "1" || strings.EqualFold(owRaw, "true")
+		fname := strings.TrimSpace(uf.Filename)
 		if strings.HasSuffix(strings.ToLower(fname), ".zip") {
 			installed, zErr := s.deps.Catalog.InstallPackZip(bytes.NewReader(raw), int64(len(raw)), overwrite)
 			if zErr != nil {
@@ -1363,7 +2259,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 
-		codeHint := strings.TrimSpace(r.FormValue("code"))
+		codeHint := strings.TrimSpace(fields["code"])
 		if codeHint == "" {
 			var peek map[string]string
 			if json.Unmarshal(raw, &peek) == nil && strings.TrimSpace(peek["meta.code"]) != "" {
@@ -1434,52 +2330,56 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 		return
 	}
-	locale := actor.PreferredLocale
+	locale := strings.TrimSpace(r.URL.Query().Get("locale"))
+	if locale == "" {
+		locale = actor.PreferredLocale
+	}
 	if locale == "" {
 		locale = s.deps.Settings.Snapshot().Site.DefaultLocale
 	}
 	rest = strings.TrimPrefix(rest, "/")
 
 	if rest == "" && r.Method == http.MethodGet {
-		writeJSON(w, http.StatusOK, map[string]any{"items": s.deps.Plugins.List(locale)})
+		list := s.deps.Plugins.List(locale)
+		writeJSON(w, http.StatusOK, map[string]any{"items": list, "plugins": list})
 		return
 	}
 
-	if rest == "reload" && r.Method == http.MethodPost {
-		_ = s.deps.Plugins.DiscoverAndStart(r.Context())
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": s.deps.Plugins.List(locale)})
+	if (rest == "reload" || rest == "discover") && r.Method == http.MethodPost {
+		if err := s.deps.Plugins.ReloadAll(r.Context()); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		list := s.deps.Plugins.List(locale)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": list, "plugins": list})
 		return
 	}
 
 	if rest == "install" && r.Method == http.MethodPost {
-		r.Body = http.MaxBytesReader(w, r.Body, 33<<20)
-		if err := r.ParseMultipartForm(8 << 20); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "plugin .zip upload exceeds 32MB limit"})
+		files, fields, mErr := readMultipartInMemoryFiles(w, r, 32<<20, 32<<20, 2)
+		if mErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mErr.Error()})
 			return
 		}
-		f, _, err := r.FormFile("file")
-		if err != nil {
+		var uf *inMemoryMultipartFile
+		for i := range files {
+			if files[i].FieldName == "file" || uf == nil {
+				uf = &files[i]
+				if files[i].FieldName == "file" {
+					break
+				}
+			}
+		}
+		if uf == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
 			return
 		}
-		defer f.Close()
-		tmp, err := os.CreateTemp(s.ensureTempDir(), "volo-plugin-*.zip")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
+		owRaw := strings.TrimSpace(fields["overwrite"])
+		if owRaw == "" {
+			owRaw = strings.TrimSpace(r.URL.Query().Get("overwrite"))
 		}
-		tmpName := tmp.Name()
-		defer os.Remove(tmpName)
-		sz, err := io.Copy(tmp, io.LimitReader(f, 32<<20+1))
-		if err != nil {
-			_ = tmp.Close()
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		_, _ = tmp.Seek(0, io.SeekStart)
-		overwrite := r.FormValue("overwrite") == "1" || strings.EqualFold(r.FormValue("overwrite"), "true")
-		sum, iErr := s.deps.Plugins.InstallFromZip(r.Context(), tmp, sz, overwrite, locale)
-		_ = tmp.Close()
+		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
+		sum, iErr := s.deps.Plugins.InstallFromZip(r.Context(), bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite, locale)
 		if iErr != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": iErr.Error()})
 			return
@@ -1524,6 +2424,14 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			}
 			sum, _ := s.deps.Plugins.Get(pid, locale)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
+		case parts[1] == "kv" && r.Method == http.MethodDelete:
+			cleared, err := s.deps.Plugins.ClearPluginKV(r.Context(), pid)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			s.recordAuditLog(r, actor, "plugin.clear_kv", "plugin", pid, map[string]any{"cleared": cleared})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared, "deleted": cleared})
 		case parts[1] == "config" && r.Method == http.MethodPatch:
 			var patch map[string]any
 			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&patch); err != nil {
@@ -1535,6 +2443,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
+			s.invalidateMediaRefCache()
 			s.recordAuditLog(r, actor, "plugin.config_patch", "plugin", pid, nil)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "logs" && r.Method == http.MethodGet:
@@ -1551,6 +2460,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "plugin.uninstall", "plugin", pid, nil)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
@@ -1581,7 +2491,17 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 				versions[d] = ver
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"domains": result, "versions": versions})
+		storageDrivers := []string{"local", "s3"}
+		if s.deps.Plugins != nil && s.deps.Plugins.Providers() != nil {
+			if ids := s.deps.Plugins.Providers().StorageProviderIDs(); len(ids) > 0 {
+				storageDrivers = ids
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"domains":         result,
+			"versions":        versions,
+			"storage_drivers": storageDrivers,
+		})
 		return
 	}
 
@@ -1674,6 +2594,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": pErr.Error()})
 			return
 		}
+		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "settings.patch", "settings", rest, map[string]any{"version": ver})
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
 		writeJSON(w, http.StatusOK, map[string]any{"domain": rest, "value": val, "version": ver})
@@ -1701,8 +2622,8 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				where = append(where, "role IN ('admin', 'editor')")
 			}
 			if q != "" {
-				pat := "%" + q + "%"
-				where = append(where, "(LOWER(username) LIKE LOWER(?) OR LOWER(email) LIKE LOWER(?) OR LOWER(display_name) LIKE LOWER(?))")
+				pat := "%" + escapeLikePattern(q) + "%"
+				where = append(where, "(LOWER(username) LIKE LOWER(?) ESCAPE '!' OR LOWER(email) LIKE LOWER(?) ESCAPE '!' OR LOWER(display_name) LIKE LOWER(?) ESCAPE '!')")
 				args = append(args, pat, pat, pat)
 			}
 			whereSQL := strings.Join(where, " AND ")
@@ -1718,11 +2639,12 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				rows = []domain.User{}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"items":    rows,
-				"users":    rows,
-				"total":    total,
-				"page":     page,
-				"per_page": perPage,
+				"items":     rows,
+				"users":     rows,
+				"total":     total,
+				"page":      page,
+				"per_page":  perPage,
+				"page_size": perPage,
 			})
 
 		case http.MethodPost:
@@ -1919,8 +2841,8 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			where := []string{"1=1"}
 			var args []any
 			if q != "" {
-				pat := "%" + q + "%"
-				where = append(where, "(LOWER(cidr) LIKE LOWER(?) OR LOWER(reason) LIKE LOWER(?) OR LOWER(note) LIKE LOWER(?))")
+				pat := "%" + escapeLikePattern(q) + "%"
+				where = append(where, "(LOWER(cidr) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason) LIKE LOWER(?) ESCAPE '!' OR LOWER(note) LIKE LOWER(?) ESCAPE '!')")
 				args = append(args, pat, pat, pat)
 			}
 			switch state {
@@ -1942,11 +2864,12 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 				rows = []domain.SecurityIPBan{}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"items":    rows,
-				"bans":     rows,
-				"total":    total,
-				"page":     page,
-				"per_page": perPage,
+				"items":     rows,
+				"bans":      rows,
+				"total":     total,
+				"page":      page,
+				"per_page":  perPage,
+				"page_size": perPage,
 			})
 
 		case http.MethodPost:
@@ -1988,6 +2911,34 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
+func normalizeGeoAction(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "allow":
+		return "allow"
+	case "block":
+		return "block"
+	case "challenge":
+		return "challenge"
+	default:
+		return "deny"
+	}
+}
+
+func normalizeGeoOnMiss(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "allow":
+		return "allow"
+	case "deny":
+		return "deny"
+	case "block":
+		return "block"
+	case "challenge":
+		return "challenge"
+	default:
+		return "next"
+	}
+}
+
 func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "" {
@@ -2010,12 +2961,8 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			}
 			in.ID = id.Next()
 			in.Name = strings.TrimSpace(in.Name)
-			if in.Action != "allow" && in.Action != "deny" {
-				in.Action = "deny"
-			}
-			if in.OnMiss != "next" && in.OnMiss != "allow" && in.OnMiss != "deny" {
-				in.OnMiss = "next"
-			}
+			in.Action = normalizeGeoAction(in.Action)
+			in.OnMiss = normalizeGeoOnMiss(in.OnMiss)
 			now := time.Now().UnixMilli()
 			in.CreatedAt = now
 			in.UpdatedAt = now
@@ -2055,12 +3002,8 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		in.Name = strings.TrimSpace(in.Name)
-		if in.Action != "allow" && in.Action != "deny" {
-			in.Action = "deny"
-		}
-		if in.OnMiss != "next" && in.OnMiss != "allow" && in.OnMiss != "deny" {
-			in.OnMiss = "next"
-		}
+		in.Action = normalizeGeoAction(in.Action)
+		in.OnMiss = normalizeGeoOnMiss(in.OnMiss)
 		now := time.Now().UnixMilli()
 		if _, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE security_geo_rules SET name = ?, is_enabled = ?, action = ?, on_miss = ?, countries = ?, regions = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
@@ -2141,7 +3084,7 @@ func (s *AppServer) listLocalBackups(backupDir string) []localBackupItem {
 
 func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
-	backupDir := filepath.Join(s.deps.Config.DataDir, "backups")
+	backupDir := s.resolveBackupDir()
 
 	if rest == "" {
 		switch r.Method {
@@ -2297,38 +3240,19 @@ func isLegacyArchiveFile(archivePath string) bool {
 
 func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Request, actor *domain.User) {
 	const maxRestoreUpload = 512 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxRestoreUpload)
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart backup archive"})
+	uploaded, sErr := streamMultipartSingleFile(w, r, "file", maxRestoreUpload, s.ensureTempDir(), "volo-restore-", ".zip", ".zip", ".json")
+	if sErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": sErr.Error()})
 		return
 	}
-	f, hdr, err := r.FormFile("file")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing 'file' field"})
-		return
-	}
-	defer f.Close()
-
-	ext := strings.ToLower(filepath.Ext(hdr.Filename))
-	if ext != ".zip" && ext != ".json" {
-		ext = ".zip"
-	}
-	tmp, err := os.CreateTemp(s.ensureTempDir(), "volo-restore-*"+ext)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	tmpPath := tmp.Name()
+	tmpPath := uploaded.TempPath
 	defer os.Remove(tmpPath)
 
-	if _, err := io.Copy(tmp, io.LimitReader(f, maxRestoreUpload)); err != nil {
-		_ = tmp.Close()
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
+	dryRunRaw := strings.TrimSpace(uploaded.FormFields["dry_run"])
+	if dryRunRaw == "" {
+		dryRunRaw = strings.TrimSpace(r.URL.Query().Get("dry_run"))
 	}
-	_ = tmp.Close()
-
-	dryRun, _ := strconv.ParseBool(r.FormValue("dry_run"))
+	dryRun, _ := strconv.ParseBool(dryRunRaw)
 	if isLegacyArchiveFile(tmpPath) {
 		rep, lErr := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, etl.ImportOptions{
 			DryRun:          dryRun,
@@ -2363,3 +3287,4 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": sum})
 }
+

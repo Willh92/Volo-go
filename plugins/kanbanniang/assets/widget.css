@@ -18,9 +18,13 @@
   align-items: flex-start;
 }
 
-#volo-persist-dock:has(#volo-podcast-mini) .volo-kbn-left,
-#volo-persist-dock:has(#volo-podcast-mini) .volo-kbn-dock[data-position="left"] {
-  bottom: calc(max(20px, env(safe-area-inset-bottom)) + 96px);
+#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .volo-kbn-left,
+#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .volo-kbn-dock[data-position="left"],
+html[data-podcast-open="1"] .volo-kbn-left,
+html[data-podcast-open="1"] .volo-kbn-dock[data-position="left"],
+body.has-podcast-mini .volo-kbn-left,
+body.has-podcast-mini .volo-kbn-dock[data-position="left"] {
+  bottom: calc(92px + env(safe-area-inset-bottom, 0px));
 }
 
 /* Offset right-docked mascot cleanly above .studio-fab-dock (Mobile TOC + Back-to-Top) */
@@ -28,8 +32,15 @@
 .volo-kbn-dock[data-position="right"] {
   right: 22px;
   left: auto;
-  bottom: calc(max(20px, env(safe-area-inset-bottom)) + 108px);
+  bottom: calc(max(20px, env(safe-area-inset-bottom, 0px)) + 108px);
   align-items: flex-end;
+}
+
+html[data-podcast-open="1"] .volo-kbn-right,
+html[data-podcast-open="1"] .volo-kbn-dock[data-position="right"],
+body.has-podcast-mini .volo-kbn-right,
+body.has-podcast-mini .volo-kbn-dock[data-position="right"] {
+  bottom: calc(192px + env(safe-area-inset-bottom, 0px));
 }
 
 .volo-kbn-bubble {
@@ -143,5 +154,17 @@
   .volo-kbn-dock[data-position="right"] {
     right: 14px;
     bottom: calc(max(16px, env(safe-area-inset-bottom)) + 102px);
+  }
+  html[data-podcast-open="1"] .volo-kbn-left,
+  html[data-podcast-open="1"] .volo-kbn-dock[data-position="left"],
+  body.has-podcast-mini .volo-kbn-left,
+  body.has-podcast-mini .volo-kbn-dock[data-position="left"] {
+    bottom: calc(92px + env(safe-area-inset-bottom, 0px));
+  }
+  html[data-podcast-open="1"] .volo-kbn-right,
+  html[data-podcast-open="1"] .volo-kbn-dock[data-position="right"],
+  body.has-podcast-mini .volo-kbn-right,
+  body.has-podcast-mini .volo-kbn-dock[data-position="right"] {
+    bottom: calc(192px + env(safe-area-inset-bottom, 0px));
   }
 }

@@ -84,6 +84,7 @@ jobs:
       - name: Package Pure-Go Release Bundle
         env:
           CGO_ENABLED: "0"
+          GOEXPERIMENT: "nojsonv2"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
@@ -94,7 +95,6 @@ jobs:
             -gcflags="all=-l" \
             -gcflags="github.com/Willh92/Volo-go/internal/render=" \
             -gcflags="github.com/Willh92/Volo-go/internal/visibility=" \
-            -gcflags="github.com/Willh92/Volo-go/internal/db/sqlx=" \
             -ldflags="-s -w -X main.Version=${VERSION}" \
             -o "dist/${STAGE}/volo${{ matrix.ext }}" \
             ./cmd/volo

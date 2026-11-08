@@ -28,6 +28,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
+	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
 const (
@@ -74,64 +75,40 @@ func (s *AppServer) ensureTempDir() string {
 }
 
 func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *http.Request, actor *domain.User) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBatchImportArchiveBytes)
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
+	files, _, err := readMultipartInMemoryFiles(w, r, maxBatchImportArchiveBytes, maxBatchImportArchiveBytes, maxBatchImportEntries)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "upload exceeds 32MB limit or invalid multipart form"})
 		return
-	}
-
-	var docs []markdownImportDoc
-	var totalBytes int64
-
-	files := r.MultipartForm.File["files"]
-	if fSingle := r.MultipartForm.File["file"]; len(fSingle) > 0 {
-		files = append(files, fSingle...)
 	}
 	if len(files) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no .md or .zip files uploaded"})
 		return
 	}
 
-	for _, fh := range files {
+	var docs []markdownImportDoc
+	var totalBytes int64
+
+	for _, uf := range files {
 		if len(docs) >= maxBatchImportEntries {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many files in batch import (max 500)"})
 			return
 		}
-		ext := strings.ToLower(filepath.Ext(fh.Filename))
-		f, err := fh.Open()
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
+		ext := strings.ToLower(filepath.Ext(uf.Filename))
 		switch ext {
 		case ".md", ".markdown":
-			raw, rErr := readBoundedStream(f, maxBatchImportUncompressedBytes-totalBytes)
-			_ = f.Close()
-			if rErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": rErr.Error()})
+			if totalBytes+int64(len(uf.Data)) > maxBatchImportUncompressedBytes {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "uncompressed size exceeds 64MB batch import budget"})
 				return
 			}
-			totalBytes += int64(len(raw))
-			docs = append(docs, markdownImportDoc{Filename: filepath.Base(fh.Filename), Content: string(raw)})
+			totalBytes += int64(len(uf.Data))
+			docs = append(docs, markdownImportDoc{Filename: filepath.Base(uf.Filename), Content: string(uf.Data)})
 
 		case ".zip":
-			tmpZip, cErr := os.CreateTemp(s.ensureTempDir(), "volo-mdimport-*.zip")
-			if cErr != nil {
-				_ = f.Close()
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": cErr.Error()})
-				return
-			}
-			tmpName := tmpZip.Name()
-			sz, copyErr := io.Copy(tmpZip, io.LimitReader(f, maxBatchImportArchiveBytes+1))
-			_ = tmpZip.Close()
-			_ = f.Close()
-			if copyErr != nil || sz > maxBatchImportArchiveBytes {
-				_ = os.Remove(tmpName)
+			if int64(len(uf.Data)) > maxBatchImportArchiveBytes {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ZIP archive exceeds 32MB"})
 				return
 			}
-			extracted, used, zErr := extractMarkdownDocsFromZip(tmpName, maxBatchImportUncompressedBytes-totalBytes, maxBatchImportEntries-len(docs))
-			_ = os.Remove(tmpName)
+			extracted, used, zErr := extractMarkdownDocsFromZipBytes(uf.Data, maxBatchImportUncompressedBytes-totalBytes, maxBatchImportEntries-len(docs))
 			if zErr != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": zErr.Error()})
 				return
@@ -140,7 +117,6 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 			docs = append(docs, extracted...)
 
 		default:
-			_ = f.Close()
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported file extension: " + ext})
 			return
 		}
@@ -226,10 +202,17 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 		}
 		if savedRaw.Status == domain.ArticleStatusPublished {
 			s.deps.Content.SearchIndex().Upsert(savedRaw)
+			if s.deps.Plugins != nil {
+				_, _ = s.deps.Plugins.DispatchHook(r.Context(), plugin.HookArticlePublished, articleHookPayloadFromRaw(savedRaw))
+			}
+			if s.deps.NotifyArticlePublished != nil {
+				s.deps.NotifyArticlePublished(r.Context(), savedRaw)
+			}
 		}
 		importedSlugs = append(importedSlugs, savedRaw.Slug)
 	}
 
+	s.invalidateMediaRefCache()
 	s.recordAuditLog(r, actor, "article.batch_import", "article", fmt.Sprintf("count=%d", len(importedSlugs)), map[string]any{"slugs": importedSlugs})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"imported_count": len(importedSlugs),
@@ -237,12 +220,11 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 	})
 }
 
-func extractMarkdownDocsFromZip(zipPath string, maxTotalBytes int64, maxFiles int) ([]markdownImportDoc, int64, error) {
-	zr, err := zip.OpenReader(zipPath)
+func extractMarkdownDocsFromZipBytes(zipData []byte, maxTotalBytes int64, maxFiles int) ([]markdownImportDoc, int64, error) {
+	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid zip archive: %w", err)
 	}
-	defer zr.Close()
 
 	if len(zr.File) > maxBatchImportEntries*2 {
 		return nil, 0, errors.New("zip archive contains too many entries")
@@ -465,15 +447,7 @@ func computeReadingMetrics(md string) (words int, minutes int) {
 
 // --- Friend Link Concurrent SSRF-Safe Health Patrol ---
 
-func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
-	links, err := sqlx.Select[domain.Link](ctx, s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
-	if err != nil {
-		return 0, err
-	}
-	if len(links) == 0 {
-		return 0, nil
-	}
-
+func (s *AppServer) newLinkPatrolHTTPClient() *http.Client {
 	client := &http.Client{Timeout: 8 * time.Second}
 	if s.deps.OutboundDialer != nil {
 		client = s.deps.OutboundDialer.NewHTTPClient(8 * time.Second)
@@ -489,7 +463,93 @@ func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
 		}
 		return nil
 	}
+	return client
+}
 
+func (s *AppServer) checkSingleFriendLink(ctx context.Context, lk domain.Link) domain.Link {
+	return s.checkSingleFriendLinkWithClient(ctx, s.newLinkPatrolHTTPClient(), lk)
+}
+
+func (s *AppServer) checkSingleFriendLinkWithClient(ctx context.Context, client *http.Client, lk domain.Link) domain.Link {
+	start := time.Now()
+	status := "ok"
+	code := 0
+	errMsg := ""
+
+	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	req, rErr := http.NewRequestWithContext(reqCtx, http.MethodHead, lk.URL, nil)
+	if rErr != nil {
+		cancel()
+		status = "broken"
+		errMsg = rErr.Error()
+	} else {
+		req.Header.Set("User-Agent", "Volo-go-LinkPatrol/1.0")
+		resp, dErr := client.Do(req)
+		if dErr != nil || (resp != nil && (resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusForbidden)) {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			reqGet, gErr := http.NewRequestWithContext(reqCtx, http.MethodGet, lk.URL, nil)
+			if gErr == nil {
+				reqGet.Header.Set("User-Agent", "Volo-go-LinkPatrol/1.0")
+				resp, dErr = client.Do(reqGet)
+			}
+		}
+		if dErr != nil {
+			if strings.Contains(strings.ToLower(dErr.Error()), "ssrf") || strings.Contains(strings.ToLower(dErr.Error()), "blocked") {
+				status = "blocked"
+			} else {
+				status = "broken"
+			}
+			errMsg = dErr.Error()
+		} else if resp != nil {
+			code = resp.StatusCode
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			switch {
+			case code >= 200 && code < 300:
+				if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.String() != lk.URL {
+					status = "redirect"
+				} else {
+					status = "ok"
+				}
+			case code >= 300 && code < 400:
+				status = "redirect"
+			default:
+				status = "broken"
+				errMsg = fmt.Sprintf("HTTP %d", code)
+			}
+		}
+		cancel()
+	}
+
+	lat := int(time.Since(start).Milliseconds())
+	if len(errMsg) > 240 {
+		errMsg = errMsg[:240]
+	}
+	now := time.Now().UnixMilli()
+	_, _ = s.deps.Store.ExecContext(ctx,
+		`UPDATE links SET health_status = ?, http_code = ?, latency_ms = ?, health_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?`,
+		status, code, lat, errMsg, now, now, lk.ID)
+	lk.HealthStatus = status
+	lk.HTTPCode = code
+	lk.LatencyMS = lat
+	lk.HealthError = errMsg
+	lk.LastCheckedAt = now
+	lk.UpdatedAt = now
+	return lk
+}
+
+func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
+	links, err := sqlx.Select[domain.Link](ctx, s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
+	if err != nil {
+		return 0, err
+	}
+	if len(links) == 0 {
+		return 0, nil
+	}
+
+	client := s.newLinkPatrolHTTPClient()
 	sem := make(chan struct{}, 6)
 	var wg sync.WaitGroup
 	for _, lk := range links {
@@ -499,67 +559,7 @@ func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-
-			start := time.Now()
-			status := "ok"
-			code := 0
-			errMsg := ""
-
-			reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-			req, rErr := http.NewRequestWithContext(reqCtx, http.MethodHead, lk.URL, nil)
-			if rErr != nil {
-				cancel()
-				status = "broken"
-				errMsg = rErr.Error()
-			} else {
-				req.Header.Set("User-Agent", "Volo-go-LinkPatrol/1.0")
-				resp, dErr := client.Do(req)
-				if dErr != nil || (resp != nil && (resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusForbidden)) {
-					if resp != nil {
-						_ = resp.Body.Close()
-					}
-					reqGet, gErr := http.NewRequestWithContext(reqCtx, http.MethodGet, lk.URL, nil)
-					if gErr == nil {
-						reqGet.Header.Set("User-Agent", "Volo-go-LinkPatrol/1.0")
-						resp, dErr = client.Do(reqGet)
-					}
-				}
-				if dErr != nil {
-					if strings.Contains(strings.ToLower(dErr.Error()), "ssrf") || strings.Contains(strings.ToLower(dErr.Error()), "blocked") {
-						status = "blocked"
-					} else {
-						status = "broken"
-					}
-					errMsg = dErr.Error()
-				} else if resp != nil {
-					code = resp.StatusCode
-					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-					_ = resp.Body.Close()
-					switch {
-					case code >= 200 && code < 300:
-						if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.String() != lk.URL {
-							status = "redirect"
-						} else {
-							status = "ok"
-						}
-					case code >= 300 && code < 400:
-						status = "redirect"
-					default:
-						status = "broken"
-						errMsg = fmt.Sprintf("HTTP %d", code)
-					}
-				}
-				cancel()
-			}
-
-			lat := int(time.Since(start).Milliseconds())
-			if len(errMsg) > 240 {
-				errMsg = errMsg[:240]
-			}
-			now := time.Now().UnixMilli()
-			_, _ = s.deps.Store.ExecContext(ctx,
-				`UPDATE links SET health_status = ?, http_code = ?, latency_ms = ?, health_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?`,
-				status, code, lat, errMsg, now, now, lk.ID)
+			_ = s.checkSingleFriendLinkWithClient(ctx, client, lk)
 		}()
 	}
 	wg.Wait()
@@ -577,6 +577,110 @@ type parsedFeedEntry struct {
 	Published int64
 }
 
+func (s *AppServer) newFollowSyncHTTPClient() *http.Client {
+	if s.deps.OutboundDialer != nil {
+		return s.deps.OutboundDialer.NewHTTPClient(10 * time.Second)
+	}
+	return &http.Client{Timeout: 10 * time.Second}
+}
+
+func (s *AppServer) syncSingleFollowFeed(ctx context.Context, fw domain.Follow) (int, domain.Follow, error) {
+	return s.syncSingleFollowFeedWithClient(ctx, s.newFollowSyncHTTPClient(), fw)
+}
+
+func (s *AppServer) syncSingleFollowFeedWithClient(ctx context.Context, client *http.Client, fw domain.Follow) (int, domain.Follow, error) {
+	now := time.Now().UnixMilli()
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	recordErr := func(rawErr string) (int, domain.Follow, error) {
+		msg := strings.TrimSpace(rawErr)
+		if len(msg) > 250 {
+			msg = msg[:250]
+		}
+		_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = ? WHERE id = ?`, now, msg, fw.ID)
+		fw.LastSyncedAt = now
+		fw.SyncError = msg
+		return 0, fw, errors.New(msg)
+	}
+
+	req, rErr := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimSpace(fw.FeedURL), nil)
+	if rErr != nil {
+		return recordErr(rErr.Error())
+	}
+	req.Header.Set("User-Agent", "Volo-go-FollowReader/1.0")
+	resp, dErr := client.Do(req)
+	if dErr != nil {
+		return recordErr(dErr.Error())
+	}
+	rawXML, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	_ = resp.Body.Close()
+	if readErr != nil || resp.StatusCode >= 400 {
+		msg := fmt.Sprintf("HTTP %d", resp.StatusCode)
+		if readErr != nil {
+			msg = readErr.Error()
+		}
+		return recordErr(msg)
+	}
+
+	entries, pErr := parseRSSOrAtomFeed(rawXML)
+	if pErr != nil {
+		return recordErr(pErr.Error())
+	}
+
+	upsert := s.deps.Store.Dialect().UpsertSQL(
+		"follow_items",
+		[]string{"id", "follow_id", "guid_hash", "title", "url", "summary", "author_name", "published_at"},
+		[]string{"follow_id", "guid_hash"},
+		[]string{"title", "url", "summary", "author_name", "published_at"},
+	)
+	count := 0
+	for _, ent := range entries {
+		if count >= 25 {
+			break
+		}
+		if ent.Title == "" || ent.URL == "" {
+			continue
+		}
+		uParsed, uErr := url.Parse(ent.URL)
+		if uErr != nil || (uParsed.Scheme != "http" && uParsed.Scheme != "https") {
+			continue
+		}
+		sum := sha256.Sum256([]byte(ent.GUID))
+		guidHash := hex.EncodeToString(sum[:16])
+		pub := ent.Published
+		if pub <= 0 {
+			pub = now
+		}
+		_, _ = s.deps.Store.ExecContext(ctx, upsert,
+			id.Next(), fw.ID, guidHash, ent.Title, ent.URL, truncateRunes(ent.Summary, 260), ent.Author, pub)
+		count++
+	}
+	pruneSQL, prunePageArgs := s.deps.Store.Dialect().PaginateSQL(
+		`SELECT id FROM follow_items WHERE follow_id = ? ORDER BY published_at DESC`, 1000, 30)
+	pruneArgs := make([]any, 0, 1+len(prunePageArgs))
+	pruneArgs = append(pruneArgs, fw.ID)
+	pruneArgs = append(pruneArgs, prunePageArgs...)
+	staleRows, _ := sqlx.Select[struct {
+		ID string `db:"id"`
+	}](ctx, s.deps.Store, pruneSQL, pruneArgs...)
+	if len(staleRows) > 0 {
+		ph := make([]string, len(staleRows))
+		delArgs := make([]any, len(staleRows))
+		for i, sr := range staleRows {
+			ph[i] = "?"
+			delArgs[i] = sr.ID
+		}
+		_, _ = s.deps.Store.ExecContext(ctx,
+			`DELETE FROM follow_items WHERE id IN (`+strings.Join(ph, ",")+`)`, delArgs...)
+	}
+	_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = '', updated_at = ? WHERE id = ?`, now, now, fw.ID)
+	fw.LastSyncedAt = now
+	fw.SyncError = ""
+	fw.UpdatedAt = now
+	return count, fw, nil
+}
+
 func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
 	follows, err := sqlx.Select[domain.Follow](ctx, s.deps.Store, `SELECT * FROM follows ORDER BY sort_order ASC`)
 	if err != nil {
@@ -586,7 +690,7 @@ func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	client := s.deps.OutboundDialer.NewHTTPClient(10 * time.Second)
+	client := s.newFollowSyncHTTPClient()
 	totalItems := 0
 	var mu sync.Mutex
 	sem := make(chan struct{}, 4)
@@ -600,92 +704,12 @@ func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			now := time.Now().UnixMilli()
-			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-
-			req, rErr := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimSpace(fw.FeedURL), nil)
-			if rErr != nil {
-				_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = ? WHERE id = ?`, now, rErr.Error(), fw.ID)
-				return
+			count, _, syncErr := s.syncSingleFollowFeedWithClient(ctx, client, fw)
+			if syncErr == nil && count > 0 {
+				mu.Lock()
+				totalItems += count
+				mu.Unlock()
 			}
-			req.Header.Set("User-Agent", "Volo-go-FollowReader/1.0")
-			resp, dErr := client.Do(req)
-			if dErr != nil {
-				errStr := dErr.Error()
-				if len(errStr) > 250 {
-					errStr = errStr[:250]
-				}
-				_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = ? WHERE id = ?`, now, errStr, fw.ID)
-				return
-			}
-			rawXML, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-			_ = resp.Body.Close()
-			if readErr != nil || resp.StatusCode >= 400 {
-				msg := fmt.Sprintf("HTTP %d", resp.StatusCode)
-				if readErr != nil {
-					msg = readErr.Error()
-				}
-				_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = ? WHERE id = ?`, now, msg, fw.ID)
-				return
-			}
-
-			entries, pErr := parseRSSOrAtomFeed(rawXML)
-			if pErr != nil {
-				_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = ? WHERE id = ?`, now, pErr.Error(), fw.ID)
-				return
-			}
-
-			upsert := s.deps.Store.Dialect().UpsertSQL(
-				"follow_items",
-				[]string{"id", "follow_id", "guid_hash", "title", "url", "summary", "author_name", "published_at"},
-				[]string{"follow_id", "guid_hash"},
-				[]string{"title", "url", "summary", "author_name", "published_at"},
-			)
-			count := 0
-			for _, ent := range entries {
-				if count >= 25 {
-					break
-				}
-				if ent.Title == "" || ent.URL == "" {
-					continue
-				}
-				uParsed, uErr := url.Parse(ent.URL)
-				if uErr != nil || (uParsed.Scheme != "http" && uParsed.Scheme != "https") {
-					continue
-				}
-				sum := sha256.Sum256([]byte(ent.GUID))
-				guidHash := hex.EncodeToString(sum[:16])
-				pub := ent.Published
-				if pub <= 0 {
-					pub = now
-				}
-				_, _ = s.deps.Store.ExecContext(ctx, upsert,
-					id.Next(), fw.ID, guidHash, ent.Title, ent.URL, truncateRunes(ent.Summary, 260), ent.Author, pub)
-				count++
-			}
-			pruneSQL, prunePageArgs := s.deps.Store.Dialect().PaginateSQL(
-				`SELECT id FROM follow_items WHERE follow_id = ? ORDER BY published_at DESC`, 1000, 30)
-			pruneArgs := make([]any, 0, 1+len(prunePageArgs))
-			pruneArgs = append(pruneArgs, fw.ID)
-			pruneArgs = append(pruneArgs, prunePageArgs...)
-			staleRows, _ := sqlx.Select[struct {
-				ID string `db:"id"`
-			}](ctx, s.deps.Store, pruneSQL, pruneArgs...)
-			if len(staleRows) > 0 {
-				ph := make([]string, len(staleRows))
-				delArgs := make([]any, len(staleRows))
-				for i, sr := range staleRows {
-					ph[i] = "?"
-					delArgs[i] = sr.ID
-				}
-				_, _ = s.deps.Store.ExecContext(ctx,
-					`DELETE FROM follow_items WHERE id IN (`+strings.Join(ph, ",")+`)`, delArgs...)
-			}
-			_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = '', updated_at = ? WHERE id = ?`, now, now, fw.ID)
-			mu.Lock()
-			totalItems += count
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
@@ -1032,6 +1056,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 	existing, err := sqlx.Get[domain.RawArticle](ctx, s.deps.Store,
 		`SELECT * FROM articles WHERE slug IN ('github', 'my-github-repos') OR legacy_permalink IN ('/my-github-repos', '/github') ORDER BY updated_at DESC LIMIT 1`)
 	isCreate := err != nil || existing.ID == ""
+	wasPublished := !isCreate && existing.Status == domain.ArticleStatusPublished
 
 	authorID := ""
 	if actor != nil && actor.ID != "" {
@@ -1121,6 +1146,17 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 	}
 	s.deps.Content.SearchIndex().Upsert(cur)
 	_ = s.deps.Content.WarmCaches(ctx)
+	s.invalidateMediaRefCache()
+	if s.deps.Plugins != nil {
+		hookName := plugin.HookArticlePublished
+		if wasPublished {
+			hookName = plugin.HookArticleUpdated
+		}
+		_, _ = s.deps.Plugins.DispatchHook(ctx, hookName, articleHookPayloadFromRaw(cur))
+	}
+	if !wasPublished && s.deps.NotifyArticlePublished != nil {
+		s.deps.NotifyArticlePublished(ctx, cur)
+	}
 	return &cur, nil
 }
 

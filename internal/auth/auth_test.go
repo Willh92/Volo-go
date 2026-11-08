@@ -293,7 +293,7 @@ func buildSyntheticWebAuthnRegistration(t *testing.T, challengeB64, origin, rpID
 	rpHash := sha256.Sum256([]byte(rpID))
 	var authData bytes.Buffer
 	authData.Write(rpHash[:])
-	authData.WriteByte(authFlagUserPresent | authFlagAttested)
+	authData.WriteByte(authFlagUserPresent | authFlagUserVerify | authFlagAttested)
 	var sc [4]byte
 	binary.BigEndian.PutUint32(sc[:], signCount)
 	authData.Write(sc[:])
@@ -345,7 +345,7 @@ func buildSyntheticWebAuthnAssertion(t *testing.T, challengeB64, origin, rpID st
 	rpHash := sha256.Sum256([]byte(rpID))
 	authData := make([]byte, 37)
 	copy(authData[:32], rpHash[:])
-	authData[32] = authFlagUserPresent
+	authData[32] = authFlagUserPresent | authFlagUserVerify
 	binary.BigEndian.PutUint32(authData[33:37], signCount)
 
 	cHash := sha256.Sum256(cdj)

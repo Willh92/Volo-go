@@ -163,6 +163,67 @@ func (s *Service) GetCachedAtom(ctx context.Context, publicBaseURL string, local
 	})
 }
 
+// GetCachedJSONFeed returns a revision-coherent, pre-compressed JSON Feed 1.1 document with strong ETag.
+func (s *Service) GetCachedJSONFeed(ctx context.Context, publicBaseURL string, locale string) (CachedDocument, error) {
+	key := "jsonfeed|" + strings.TrimRight(publicBaseURL, "/") + "|" + locale
+	return s.getOrBuildCachedDoc(ctx, key, "application/feed+json; charset=utf-8", func(c context.Context) ([]byte, error) {
+		return s.BuildJSONFeed(c, publicBaseURL, locale)
+	})
+}
+
+// BuildJSONFeed renders a JSON Feed 1.1 document (`/feed.json`) strictly enforcing Surface 6.
+func (s *Service) BuildJSONFeed(ctx context.Context, publicBaseURL string, locale string) ([]byte, error) {
+	snap := s.settings.Snapshot()
+	base := strings.TrimRight(publicBaseURL, "/")
+	items, err := s.collectPublicFeedItems(ctx, base, locale, false, snap.Feed.ItemCount)
+	if err != nil {
+		return nil, err
+	}
+	type jsonAuthor struct {
+		Name string `json:"name,omitempty"`
+	}
+	type jsonItem struct {
+		ID            string       `json:"id"`
+		URL           string       `json:"url"`
+		Title         string       `json:"title"`
+		Summary       string       `json:"summary,omitempty"`
+		ContentHTML   string       `json:"content_html,omitempty"`
+		DatePublished string       `json:"date_published,omitempty"`
+		DateModified  string       `json:"date_modified,omitempty"`
+		Authors       []jsonAuthor `json:"authors,omitempty"`
+	}
+	outItems := make([]jsonItem, 0, len(items))
+	for _, it := range items {
+		upd := it.UpdatedAt
+		if upd <= 0 {
+			upd = it.PublishedAt
+		}
+		ji := jsonItem{
+			ID:            it.URL,
+			URL:           it.URL,
+			Title:         it.Title,
+			Summary:       it.Summary,
+			ContentHTML:   it.HTML,
+			DatePublished: time.UnixMilli(it.PublishedAt).UTC().Format(time.RFC3339),
+			DateModified:  time.UnixMilli(upd).UTC().Format(time.RFC3339),
+		}
+		if strings.TrimSpace(it.AuthorName) != "" {
+			ji.Authors = []jsonAuthor{{Name: it.AuthorName}}
+		}
+		outItems = append(outItems, ji)
+	}
+	doc := map[string]any{
+		"version":       "https://jsonfeed.org/version/1.1",
+		"title":         snap.Site.Title,
+		"home_page_url": base + "/",
+		"feed_url":      base + "/feed.json",
+		"description":   snap.Site.Description,
+		"language":      snap.Site.DefaultLocale,
+		"items":         outItems,
+	}
+	return json.MarshalIndent(doc, "", "  ")
+}
+
 // GetCachedPodcast returns a revision-coherent, pre-compressed iTunes Podcast RSS document with strong ETag.
 func (s *Service) GetCachedPodcast(ctx context.Context, publicBaseURL string, locale string) (CachedDocument, error) {
 	key := "podcast|" + strings.TrimRight(publicBaseURL, "/") + "|" + locale
@@ -530,6 +591,11 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 
 // BuildGitHubStatsSVG generates a crisp, local, zero-external-request SVG stats card from cached SEOSettings.
 func (s *Service) BuildGitHubStatsSVG(username string) []byte {
+	return s.BuildGitHubStatsSVGWithTheme(username, "auto")
+}
+
+// BuildGitHubStatsSVGWithTheme generates a GitHub stats SVG card supporting "auto" (prefers-color-scheme), "dark", or "light".
+func (s *Service) BuildGitHubStatsSVGWithTheme(username string, themeMode string) []byte {
 	snap := s.settings.Snapshot()
 	user := strings.TrimSpace(username)
 	if user == "" {
@@ -551,19 +617,31 @@ func (s *Service) BuildGitHubStatsSVG(username string) []byte {
 		totalForks += r.Forks
 	}
 
+	mode := strings.ToLower(strings.TrimSpace(themeMode))
+	lightRules := `.gh-card{fill:#f6f7f3;stroke:#dfe6de}.gh-line{stroke:#dfe6de}.gh-title{fill:#293d36}.gh-label{fill:#60756a}.gh-val{fill:#246b51}`
+	darkRules := `.gh-card{fill:#141b18;stroke:#27352f}.gh-line{stroke:#27352f}.gh-title{fill:#e7efe9}.gh-label{fill:#93a89e}.gh-val{fill:#5ec299}`
+	styleCSS := lightRules + `@media (prefers-color-scheme: dark){` + darkRules + `}`
+	switch mode {
+	case "dark":
+		styleCSS = darkRules
+	case "light":
+		styleCSS = lightRules
+	}
+
 	svg := fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" width="440" height="148" viewBox="0 0 440 148" role="img" aria-label="GitHub Stats for %s">
-  <rect x="1" y="1" width="438" height="146" rx="14" fill="#f6f7f3" stroke="#dfe6de" stroke-width="1.5"/>
-  <text x="24" y="38" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="16" font-weight="600" fill="#293d36">@%s · GitHub Open Source</text>
-  <line x1="24" y1="54" x2="416" y2="54" stroke="#dfe6de" stroke-width="1"/>
+  <style>%s</style>
+  <rect class="gh-card" x="1" y="1" width="438" height="146" rx="14" stroke-width="1.5"/>
+  <text class="gh-title" x="24" y="38" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="16" font-weight="600">@%s · GitHub Open Source</text>
+  <line class="gh-line" x1="24" y1="54" x2="416" y2="54" stroke-width="1"/>
   <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-    <text x="24" y="84" font-size="11" fill="#60756a">PUBLIC REPOS</text>
-    <text x="24" y="114" font-size="22" font-weight="700" fill="#246b51">%d</text>
-    <text x="172" y="84" font-size="11" fill="#60756a">TOTAL STARS</text>
-    <text x="172" y="114" font-size="22" font-weight="700" fill="#246b51">%d</text>
-    <text x="312" y="84" font-size="11" fill="#60756a">TOTAL FORKS</text>
-    <text x="312" y="114" font-size="22" font-weight="700" fill="#246b51">%d</text>
+    <text class="gh-label" x="24" y="84" font-size="11">PUBLIC REPOS</text>
+    <text class="gh-val" x="24" y="114" font-size="22" font-weight="700">%d</text>
+    <text class="gh-label" x="172" y="84" font-size="11">TOTAL STARS</text>
+    <text class="gh-val" x="172" y="114" font-size="22" font-weight="700">%d</text>
+    <text class="gh-label" x="312" y="84" font-size="11">TOTAL FORKS</text>
+    <text class="gh-val" x="312" y="114" font-size="22" font-weight="700">%d</text>
   </g>
-</svg>`, html.EscapeString(user), html.EscapeString(user), totalRepos, totalStars, totalForks)
+</svg>`, html.EscapeString(user), styleCSS, html.EscapeString(user), totalRepos, totalStars, totalForks)
 	return []byte(svg)
 }
 

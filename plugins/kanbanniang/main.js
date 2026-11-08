@@ -18,16 +18,17 @@ function safeSettings(locale) {
   var loc = String(locale || "").toLowerCase();
   var isEN = loc.indexOf("en") === 0;
   var isTW = loc === "zh-tw" || loc.indexOf("zh-hant") === 0;
-  var defaultZh = isTW
-    ? "歡迎來到獨立部落格，點我可以摸摸頭～"
-    : "欢迎来到独立博客，点我可以摸摸头～";
-  var greeting = isEN
-    ? cfg.greeting_en || "Welcome! Click me for a head-pat~"
-    : cfg.greeting_zh || defaultZh;
+  var zhCN = String(cfg.greeting_zh || "欢迎来到独立博客，点我可以摸摸头～").slice(0, 140);
+  var zhTW = String(cfg.greeting_tw || cfg.greeting_zh || "歡迎來到獨立部落格，點我可以摸摸頭～").slice(0, 140);
+  var enUS = String(cfg.greeting_en || "Welcome! Click me for a head-pat~").slice(0, 140);
+  var greeting = isEN ? enUS : isTW ? zhTW : zhCN;
   return {
     character: ch,
     position: pos,
-    greeting: String(greeting).slice(0, 140),
+    greeting: greeting,
+    greetingZh: zhCN,
+    greetingTw: zhTW,
+    greetingEn: enUS,
     hideOnMobile: cfg.hide_on_mobile !== false,
     ariaLabel: isEN ? "Studio Mascot" : "看板娘助手",
     btnLabel: isEN ? "Pat mascot" : "摸摸看板娘",
@@ -70,12 +71,18 @@ function renderSlot(slotName, slotCtx) {
     return (
       '<aside id="volo-kanbanniang-root" class="' +
       cls +
-      '" data-volo-persist="kanbanniang" data-position="' +
+      '" data-position="' +
       escapeAttr(st.position) +
       '" data-character="' +
       escapeAttr(st.character) +
       '" data-greeting="' +
       escapeAttr(st.greeting) +
+      '" data-greeting-zh="' +
+      escapeAttr(st.greetingZh) +
+      '" data-greeting-tw="' +
+      escapeAttr(st.greetingTw) +
+      '" data-greeting-en="' +
+      escapeAttr(st.greetingEn) +
       '" data-pats="' +
       pats +
       '" data-btn-label="' +
@@ -93,6 +100,14 @@ function renderSlot(slotName, slotCtx) {
 function onRequest(req) {
   var sub = String((req && req.path) || "").replace(/^\/+/, "");
   if (req.method === "POST" && (sub === "pat" || sub === "")) {
+    var ipKey = "pat:" + String((req && req.client_ip_masked) || "anon");
+    if (volo.rateLimit && typeof volo.rateLimit.allow === "function" && !volo.rateLimit.allow(ipKey, 20, 60)) {
+      return {
+        status: 429,
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ ok: false, error: "rate limit exceeded" }),
+      };
+    }
     var total = volo.kv.incr("total_pats", 1, 0);
     return {
       status: 200,

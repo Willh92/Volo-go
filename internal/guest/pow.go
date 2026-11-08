@@ -31,12 +31,16 @@ type PoWVerifier struct {
 	keyRing *config.KeyRing
 	mu      sync.Mutex
 	used    map[string]int64 // nonce -> expiresAt unix seconds
+	maxUsed int
 }
+
+const defaultMaxPoWUsed = 8192
 
 func NewPoWVerifier(keyRing *config.KeyRing) *PoWVerifier {
 	return &PoWVerifier{
 		keyRing: keyRing,
 		used:    make(map[string]int64),
+		maxUsed: defaultMaxPoWUsed,
 	}
 }
 
@@ -106,24 +110,37 @@ func (pv *PoWVerifier) Verify(challenge string, solution string, honeypot string
 		return ErrPoWInvalid
 	}
 
-	const maxPoWUsed = 8192
+	maxCap := pv.maxUsed
+	if maxCap <= 0 {
+		maxCap = defaultMaxPoWUsed
+	}
 	nowSec := time.Now().Unix()
 	pv.mu.Lock()
 	defer pv.mu.Unlock()
 	if exp, already := pv.used[nonce]; already && nowSec <= exp {
 		return ErrPoWReplayed
 	}
-	if len(pv.used) >= maxPoWUsed {
+	if len(pv.used) >= maxCap {
 		for k, exp := range pv.used {
 			if nowSec > exp {
 				delete(pv.used, k)
 			}
 		}
-		for k := range pv.used {
-			if len(pv.used) < maxPoWUsed {
+		for len(pv.used) >= maxCap {
+			var minKey string
+			var minExp int64
+			first := true
+			for k, exp := range pv.used {
+				if first || exp < minExp || (exp == minExp && k < minKey) {
+					minKey = k
+					minExp = exp
+					first = false
+				}
+			}
+			if first {
 				break
 			}
-			delete(pv.used, k)
+			delete(pv.used, minKey)
 		}
 	}
 	pv.used[nonce] = expSec + 60

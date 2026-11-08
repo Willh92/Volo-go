@@ -63,6 +63,7 @@ type PublicPageView struct {
 	ID                string                            `json:"id"`
 	Title             string                            `json:"title"`
 	Slug              string                            `json:"slug"`
+	Template          string                            `json:"template"`
 	URL               string                            `json:"url"`
 	HTML              string                            `json:"html"`
 	PlainSummary      string                            `json:"plain_summary"`
@@ -600,24 +601,45 @@ func (s *Service) RenderArticleDetail(
 	alts := s.listArticleTranslations(ctx, raw)
 	raw.ViewCount += s.views.PendingArticleViews(raw.ID)
 
-	view := s.guard.ToDetail(w, r, raw, viewer, visibility.DetailRenderDeps{
-		Locale:            locale,
-		AuthorName:        authorName,
-		AuthorAvatarURL:   authorAvatar,
-		AuthorBio:         authorBio,
-		AuthorWebsiteURL:  authorWeb,
-		Category:          catPtr,
-		Tags:              tagsMap[raw.ID],
-		Translations:      alts,
-		DefaultOGImageURL: snap.SEO.DefaultOGImageURL,
+	rawForRender := raw
+	if s.plugins != nil && strings.TrimSpace(raw.PasswordCiphertext) == "" && !raw.HasContentLock && !render.ContainsLockDirective(raw.ContentMD) {
+		preRes := s.plugins.DispatchArticleHook(ctx, plugin.HookRenderPreMarkdown, plugin.ArticleHookPayload{
+			ID:                  raw.ID,
+			Title:               raw.Title,
+			Slug:                raw.Slug,
+			Lang:                raw.Lang,
+			Status:              string(raw.Status),
+			SummaryMD:           raw.SummaryMD,
+			ContentMD:           raw.ContentMD,
+			IsPasswordProtected: false,
+			HasContentLock:      false,
+		})
+		if preRes.ContentMD != "" {
+			rawForRender.ContentMD = preRes.ContentMD
+		}
+		if preRes.SummaryMD != "" {
+			rawForRender.SummaryMD = preRes.SummaryMD
+		}
+	}
+
+	view := s.guard.ToDetail(w, r, rawForRender, viewer, visibility.DetailRenderDeps{
+		Locale:               locale,
+		AuthorName:           authorName,
+		AuthorAvatarURL:      authorAvatar,
+		AuthorBio:            authorBio,
+		AuthorWebsiteURL:     authorWeb,
+		Category:             catPtr,
+		Tags:                 tagsMap[raw.ID],
+		Translations:         alts,
+		DefaultOGImageURL:    snap.SEO.DefaultOGImageURL,
 		SiteTitle:            snap.Site.Title,
 		PublicBaseURL:        publicBaseURL,
 		LicenseTemplate:      snap.Site.LicenseTemplate,
 		DisableLicenseNotice: !snap.Site.EnableLicenseNotice,
 		ShowLineNumbers:      snap.Reading.ShowCodeLineNumbers,
-		LookupBook:        func(bSlug string) (render.BookCardInfo, bool) { return s.lookupBookCard(ctx, bSlug) },
-		ListBooks:         func() []render.BookCardInfo { return s.listBookCards(ctx) },
-		LookupMediaDims:   s.LookupMediaDims,
+		LookupBook:           func(bSlug string) (render.BookCardInfo, bool) { return s.lookupBookCard(ctx, bSlug) },
+		ListBooks:            func() []render.BookCardInfo { return s.listBookCards(ctx) },
+		LookupMediaDims:      s.LookupMediaDims,
 	})
 
 	// Surface 10: Only run `render.post_html` plugin hook when the article is public & free of locks!
@@ -627,6 +649,7 @@ func (s *Service) RenderArticleDetail(
 			Title:               raw.Title,
 			Slug:                raw.Slug,
 			Lang:                raw.Lang,
+			Status:              string(raw.Status),
 			HTML:                view.HTML,
 			IsPasswordProtected: false,
 			HasContentLock:      false,
@@ -821,7 +844,25 @@ func (s *Service) GetPublicPageBySlugForViewer(
 		}
 	}
 
-	rendered := s.renderer.Render(p.ContentMD, render.Options{
+	contentMD := p.ContentMD
+	hasLockDirective := render.ContainsLockDirective(contentMD)
+	if s.plugins != nil && !hasLockDirective {
+		preRes := s.plugins.DispatchArticleHook(ctx, plugin.HookRenderPreMarkdown, plugin.ArticleHookPayload{
+			ID:                  p.ID,
+			Title:               p.Title,
+			Slug:                p.Slug,
+			Lang:                p.Lang,
+			Status:              domain.ArticleStatusPublished,
+			ContentMD:           contentMD,
+			IsPasswordProtected: false,
+			HasContentLock:      false,
+		})
+		if preRes.ContentMD != "" {
+			contentMD = preRes.ContentMD
+		}
+	}
+
+	rendered := s.renderer.Render(contentMD, render.Options{
 		Mode:                render.RenderModeWeb,
 		Locale:              locale,
 		Unlocked:            false,
@@ -834,9 +875,26 @@ func (s *Service) GetPublicPageBySlugForViewer(
 		LookupMediaDims:     s.LookupMediaDims,
 	})
 
+	htmlOut := rendered.HTML
+	if s.plugins != nil && !rendered.HasLockBlock && !rendered.HasUnresolvedLock && htmlOut != "" {
+		postRes := s.plugins.DispatchArticleHook(ctx, plugin.HookRenderPostHTML, plugin.ArticleHookPayload{
+			ID:                  p.ID,
+			Title:               p.Title,
+			Slug:                p.Slug,
+			Lang:                p.Lang,
+			Status:              domain.ArticleStatusPublished,
+			HTML:                htmlOut,
+			IsPasswordProtected: false,
+			HasContentLock:      false,
+		})
+		if postRes.HTML != "" {
+			htmlOut = s.SanitizeHTMLFragment(postRes.HTML)
+		}
+	}
+
 	plainSource := rendered.PlainText
 	if rendered.HasLockBlock {
-		safeOut := s.renderer.Render(render.StripAllLockBlocks(p.ContentMD), render.Options{Mode: render.RenderModeWeb})
+		safeOut := s.renderer.Render(render.StripAllLockBlocks(contentMD), render.Options{Mode: render.RenderModeWeb})
 		plainSource = safeOut.PlainText
 	}
 
@@ -863,12 +921,17 @@ func (s *Service) GetPublicPageBySlugForViewer(
 	if p.ShowTOC {
 		toc = rendered.TOC
 	}
+	tpl := strings.TrimSpace(p.Template)
+	if tpl == "" {
+		tpl = "default"
+	}
 	return PublicPageView{
 		ID:                p.ID,
 		Title:             p.Title,
 		Slug:              p.Slug,
+		Template:          tpl,
 		URL:               "/" + p.Slug,
-		HTML:              rendered.HTML,
+		HTML:              htmlOut,
 		PlainSummary:      truncateForSummary(plainSource, 160),
 		AllowComment:      p.AllowComment,
 		ShowTOC:           p.ShowTOC,

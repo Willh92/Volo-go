@@ -2,7 +2,8 @@
   "id": "volo-journal",
   "name": {
     "zh-CN": "Volo Journal 纸刊",
-    "en-US": "Volo Journal"
+    "en-US": "Volo Journal",
+    "zh-TW": "Volo Journal 紙刊"
   },
   "version": "1.1.0",
   "author": "Volo-go",
@@ -10,35 +11,67 @@
   "preview": "preview.svg",
   "description": {
     "zh-CN": "单栏居中、经典衬线纸媒排版的外部扩展主题示例，演示模块化局部模板、独立多语言词典与主题专属配置项。",
-    "en-US": "Single-column serif editorial journal external theme demonstrating modular partials, per-theme JSON locales, and declarative config schema."
+    "en-US": "Single-column serif editorial journal external theme demonstrating modular partials, per-theme JSON locales, and declarative config schema.",
+    "zh-TW": "單欄置中、經典襯線紙媒排版的外部擴充主題範例，展示模組化局部模板、獨立多語言詞典與主題專屬設定項。"
   },
   "accents": ["forest", "ocean", "teal", "amber", "plum", "rose"],
   "supports_dark_mode": true,
   "supports_pjax": true,
+  "page_templates": [
+    {
+      "id": "default",
+      "value": "default",
+      "label": {
+        "zh-CN": "标准版式",
+        "en-US": "Default Layout",
+        "zh-TW": "標準版式"
+      }
+    },
+    {
+      "id": "wide",
+      "value": "wide",
+      "label": {
+        "zh-CN": "宽幅展示",
+        "en-US": "Wide Showcase",
+        "zh-TW": "寬幅展示"
+      }
+    },
+    {
+      "id": "minimal",
+      "value": "minimal",
+      "label": {
+        "zh-CN": "极简阅读",
+        "en-US": "Minimal Sheet",
+        "zh-TW": "極簡閱讀"
+      }
+    }
+  ],
   "config_schema": [
     {
       "key": "header_nav_items",
       "type": "sortable_list",
       "label": {
         "zh-CN": "顶部导航菜单项与排序",
-        "en-US": "Header Navigation Items & Order"
+        "en-US": "Header Navigation Items & Order",
+        "zh-TW": "頂部導覽選單項目與排序"
       },
       "description": {
         "zh-CN": "选择需要显示的导航项并调整顺序；「自定义导航链接」默认排在最后。",
-        "en-US": "Toggle visible header items and reorder them; 'Custom Navigation Links' defaults to last."
+        "en-US": "Toggle visible header items and reorder them; 'Custom Navigation Links' defaults to last.",
+        "zh-TW": "選擇需要顯示的導覽項目並調整順序；「自訂導覽連結」預設排在最後。"
       },
       "default": ["home", "archives", "tags", "categories", "series", "books", "links", "follows", "dynamic", "custom"],
       "options": [
-        { "value": "home", "label": { "zh-CN": "首页 (/)", "en-US": "Home (/)" } },
-        { "value": "archives", "label": { "zh-CN": "归档 (/archives)", "en-US": "Archives (/archives)" } },
-        { "value": "tags", "label": { "zh-CN": "标签 (/tags)", "en-US": "Tags (/tags)" } },
-        { "value": "categories", "label": { "zh-CN": "分类 (/categories)", "en-US": "Categories (/categories)" } },
-        { "value": "series", "label": { "zh-CN": "专栏 (/series)", "en-US": "Series (/series)" } },
-        { "value": "books", "label": { "zh-CN": "书架 (/books)", "en-US": "Bookshelf (/books)" } },
-        { "value": "links", "label": { "zh-CN": "友链 (/links)", "en-US": "Links (/links)" } },
-        { "value": "follows", "label": { "zh-CN": "订阅 (/follows)", "en-US": "Following (/follows)" } },
-        { "value": "dynamic", "label": { "zh-CN": "动态 (/dynamic)", "en-US": "Stream (/dynamic)" } },
-        { "value": "custom", "label": { "zh-CN": "自定义导航链接", "en-US": "Custom Navigation Links" } }
+        { "value": "home", "label": { "zh-CN": "首页 (/)", "en-US": "Home (/)", "zh-TW": "首頁 (/)" } },
+        { "value": "archives", "label": { "zh-CN": "归档 (/archives)", "en-US": "Archives (/archives)", "zh-TW": "歸檔 (/archives)" } },
+        { "value": "tags", "label": { "zh-CN": "标签 (/tags)", "en-US": "Tags (/tags)", "zh-TW": "標籤 (/tags)" } },
+        { "value": "categories", "label": { "zh-CN": "分类 (/categories)", "en-US": "Categories (/categories)", "zh-TW": "分類 (/categories)" } },
+        { "value": "series", "label": { "zh-CN": "专栏 (/series)", "en-US": "Series (/series)", "zh-TW": "專欄 (/series)" } },
+        { "value": "books", "label": { "zh-CN": "书架 (/books)", "en-US": "Bookshelf (/books)", "zh-TW": "書架 (/books)" } },
+        { "value": "links", "label": { "zh-CN": "友链 (/links)", "en-US": "Links (/links)", "zh-TW": "友鏈 (/links)" } },
+        { "value": "follows", "label": { "zh-CN": "订阅 (/follows)", "en-US": "Following (/follows)", "zh-TW": "訂閱 (/follows)" } },
+        { "value": "dynamic", "label": { "zh-CN": "动态 (/dynamic)", "en-US": "Stream (/dynamic)", "zh-TW": "動態 (/dynamic)" } },
+        { "value": "custom", "label": { "zh-CN": "自定义导航链接", "en-US": "Custom Navigation Links", "zh-TW": "自訂導覽連結" } }
       ]
     },
     {
@@ -46,11 +79,13 @@
       "type": "number",
       "label": {
         "zh-CN": "顶部直显菜单数量上限",
-        "en-US": "Max Primary Top-Bar Links"
+        "en-US": "Max Primary Top-Bar Links",
+        "zh-TW": "頂部直顯選單數量上限"
       },
       "description": {
         "zh-CN": "排在前面的菜单项直接展示在顶部栏，超出部分自动收纳进「更多」菜单。",
-        "en-US": "Leading items render directly in the header bar; remaining items fold into the 'More' menu."
+        "en-US": "Leading items render directly in the header bar; remaining items fold into the 'More' menu.",
+        "zh-TW": "排在前面的選單項目直接顯示於頂部欄，超出部分自動收納進「更多」選單。"
       },
       "default": 5
     },
@@ -59,20 +94,48 @@
       "type": "text",
       "label": {
         "zh-CN": "刊首铭文",
-        "en-US": "Masthead Motto"
+        "en-US": "Masthead Motto",
+        "zh-TW": "刊首銘文"
       },
       "description": {
         "zh-CN": "显示在纸刊页头副标题位置，留空则使用站点副标题。",
-        "en-US": "Displayed under the journal masthead; falls back to site subtitle when empty."
+        "en-US": "Displayed under the journal masthead; falls back to site subtitle when empty.",
+        "zh-TW": "顯示於紙刊頁首副標題位置，留空則使用網站副標題。"
       },
       "default": ""
+    },
+    {
+      "key": "hero_badge",
+      "type": "text",
+      "label": {
+        "zh-CN": "首页顶部铭牌文案",
+        "en-US": "Hero Eyebrow Badge",
+        "zh-TW": "首頁頂部銘牌文案"
+      },
+      "placeholder": {
+        "zh-CN": "留空则使用默认刊号标识，例如：独立写作 · 纸刊特辑",
+        "en-US": "Optional eyebrow text above journal masthead",
+        "zh-TW": "留空則使用預設刊號標識，例如：獨立寫作 · 紙刊特輯"
+      },
+      "default": ""
+    },
+    {
+      "key": "show_recent_posts",
+      "type": "boolean",
+      "label": {
+        "zh-CN": "显示近期与热门文章列表",
+        "en-US": "Show Recent & Popular Posts",
+        "zh-TW": "顯示近期與熱門文章列表"
+      },
+      "default": true
     },
     {
       "key": "show_colophon",
       "type": "boolean",
       "label": {
         "zh-CN": "显示纸刊版权尾注 (Colophon)",
-        "en-US": "Show Editorial Colophon"
+        "en-US": "Show Editorial Colophon",
+        "zh-TW": "顯示紙刊版權尾注 (Colophon)"
       },
       "default": true
     }

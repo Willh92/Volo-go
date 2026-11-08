@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -111,8 +112,18 @@ func (c *pgDriverConn) IsValid() bool {
 }
 
 func (c *pgDriverConn) ResetSession(_ context.Context) error {
-	if !c.IsValid() {
+	if !c.IsValid() || c.conn.TxStatus() != 'I' {
 		return driver.ErrBadConn
+	}
+	return nil
+}
+
+func (c *pgDriverConn) requireStandardConformingStrings() error {
+	if c.conn == nil {
+		return driver.ErrBadConn
+	}
+	if c.conn.ParameterStatus("standard_conforming_strings") != "on" {
+		return errors.New("sqlx: postgres simple-protocol parameter interpolation requires standard_conforming_strings=on")
 	}
 	return nil
 }
@@ -122,6 +133,11 @@ func (c *pgDriverConn) ExecContext(ctx context.Context, query string, args []dri
 		return nil, driver.ErrBadConn
 	}
 	if c.simpleProtocol || len(args) == 0 {
+		if len(args) > 0 {
+			if err := c.requireStandardConformingStrings(); err != nil {
+				return nil, err
+			}
+		}
 		sqlText, err := interpolateSimpleSQL(query, args)
 		if err != nil {
 			return nil, err
@@ -155,6 +171,11 @@ func (c *pgDriverConn) QueryContext(ctx context.Context, query string, args []dr
 		return nil, driver.ErrBadConn
 	}
 	if c.simpleProtocol {
+		if len(args) > 0 {
+			if err := c.requireStandardConformingStrings(); err != nil {
+				return nil, err
+			}
+		}
 		sqlText, err := interpolateSimpleSQL(query, args)
 		if err != nil {
 			return nil, err
@@ -200,12 +221,16 @@ type pgDriverTx struct {
 }
 
 func (tx *pgDriverTx) Commit() error {
-	_, err := tx.conn.ExecContext(context.Background(), "COMMIT", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := tx.conn.ExecContext(ctx, "COMMIT", nil)
 	return err
 }
 
 func (tx *pgDriverTx) Rollback() error {
-	_, err := tx.conn.ExecContext(context.Background(), "ROLLBACK", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := tx.conn.ExecContext(ctx, "ROLLBACK", nil)
 	return err
 }
 
@@ -327,7 +352,16 @@ func encodePGParams(args []driver.NamedValue) ([][]byte, error) {
 		case int64:
 			out[i] = []byte(strconv.FormatInt(v, 10))
 		case float64:
-			out[i] = []byte(strconv.FormatFloat(v, 'g', -1, 64))
+			switch {
+			case math.IsNaN(v):
+				out[i] = []byte("NaN")
+			case math.IsInf(v, 1):
+				out[i] = []byte("Infinity")
+			case math.IsInf(v, -1):
+				out[i] = []byte("-Infinity")
+			default:
+				out[i] = []byte(strconv.FormatFloat(v, 'g', -1, 64))
+			}
 		case bool:
 			if v {
 				out[i] = []byte("true")
@@ -399,7 +433,16 @@ func interpolateSimpleSQL(query string, args []driver.NamedValue) (string, error
 		case int64:
 			lit[i] = strconv.FormatInt(v, 10)
 		case float64:
-			lit[i] = strconv.FormatFloat(v, 'g', -1, 64)
+			switch {
+			case math.IsNaN(v):
+				lit[i] = "'NaN'::float8"
+			case math.IsInf(v, 1):
+				lit[i] = "'Infinity'::float8"
+			case math.IsInf(v, -1):
+				lit[i] = "'-Infinity'::float8"
+			default:
+				lit[i] = strconv.FormatFloat(v, 'g', -1, 64)
+			}
 		case bool:
 			if v {
 				lit[i] = "TRUE"
@@ -422,35 +465,153 @@ func interpolateSimpleSQL(query string, args []driver.NamedValue) (string, error
 
 	var b strings.Builder
 	b.Grow(len(query) + 32)
-	inSingle := false
-	inDouble := false
 	for i := 0; i < len(query); i++ {
 		ch := query[i]
-		if ch == '\'' && !inDouble {
-			inSingle = !inSingle
-			b.WriteByte(ch)
-			continue
-		}
-		if ch == '"' && !inSingle {
-			inDouble = !inDouble
-			b.WriteByte(ch)
-			continue
-		}
-		if ch == '$' && !inSingle && !inDouble && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9' {
-			j := i + 1
-			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
-				j++
+
+		// 1. Single-line comment: -- ... \n
+		if ch == '-' && i+1 < len(query) && query[i+1] == '-' {
+			nl := strings.IndexByte(query[i:], '\n')
+			if nl < 0 {
+				b.WriteString(query[i:])
+				break
 			}
-			idx, _ := strconv.Atoi(query[i+1 : j])
-			if idx >= 1 && idx <= len(lit) {
-				b.WriteString(lit[idx-1])
-				i = j - 1
+			b.WriteString(query[i : i+nl+1])
+			i += nl
+			continue
+		}
+
+		// 2. Nested block comment: /* ... */
+		if ch == '/' && i+1 < len(query) && query[i+1] == '*' {
+			depth := 1
+			b.WriteString("/*")
+			i += 2
+			for i < len(query) && depth > 0 {
+				if i+1 < len(query) && query[i] == '/' && query[i+1] == '*' {
+					depth++
+					b.WriteString("/*")
+					i += 2
+					continue
+				}
+				if i+1 < len(query) && query[i] == '*' && query[i+1] == '/' {
+					depth--
+					b.WriteString("*/")
+					i += 2
+					continue
+				}
+				b.WriteByte(query[i])
+				i++
+			}
+			i--
+			continue
+		}
+
+		// 3. Single-quoted literal: '...'
+		if ch == '\'' {
+			isEscapeStr := i > 0 && (query[i-1] == 'E' || query[i-1] == 'e') &&
+				(i == 1 || !isSimpleSQLIdentByte(query[i-2]))
+			b.WriteByte('\'')
+			i++
+			for i < len(query) {
+				c := query[i]
+				b.WriteByte(c)
+				if isEscapeStr && c == '\\' && i+1 < len(query) {
+					i++
+					b.WriteByte(query[i])
+					i++
+					continue
+				}
+				if c == '\'' {
+					if i+1 < len(query) && query[i+1] == '\'' {
+						b.WriteByte('\'')
+						i += 2
+						continue
+					}
+					break
+				}
+				i++
+			}
+			continue
+		}
+
+		// 4. Double-quoted identifier: "..."
+		if ch == '"' {
+			b.WriteByte('"')
+			i++
+			for i < len(query) {
+				c := query[i]
+				b.WriteByte(c)
+				if c == '"' {
+					if i+1 < len(query) && query[i+1] == '"' {
+						b.WriteByte('"')
+						i += 2
+						continue
+					}
+					break
+				}
+				i++
+			}
+			continue
+		}
+
+		// 5. Dollar-quoted string literal: $$...$$ or $tag$...$tag$
+		if ch == '$' {
+			if tag, ok := matchSimplePGDollarTag(query[i:]); ok {
+				endRel := strings.Index(query[i+len(tag):], tag)
+				if endRel < 0 {
+					b.WriteString(query[i:])
+					break
+				}
+				totalLen := len(tag) + endRel + len(tag)
+				b.WriteString(query[i : i+totalLen])
+				i += totalLen - 1
 				continue
 			}
+			if i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9' {
+				j := i + 1
+				for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+					j++
+				}
+				if j == len(query) || !isSimpleSQLIdentByte(query[j]) {
+					idx, _ := strconv.Atoi(query[i+1 : j])
+					if idx >= 1 && idx <= len(lit) {
+						b.WriteString(lit[idx-1])
+						i = j - 1
+						continue
+					}
+				}
+			}
 		}
+
 		b.WriteByte(ch)
 	}
 	return b.String(), nil
+}
+
+func isSimpleSQLIdentByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b >= 0x80
+}
+
+func matchSimplePGDollarTag(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '$' {
+		return "", false
+	}
+	if s[1] == '$' {
+		return "$$", true
+	}
+	first := s[1]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_' || first >= 0x80) {
+		return "", false
+	}
+	for j := 2; j < len(s); j++ {
+		c := s[j]
+		if c == '$' {
+			return s[:j+1], true
+		}
+		if !isSimpleSQLIdentByte(c) {
+			return "", false
+		}
+	}
+	return "", false
 }
 
 func valuesToNamed(vals []driver.Value) []driver.NamedValue {

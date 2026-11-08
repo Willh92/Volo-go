@@ -7,14 +7,17 @@
      {{if $isExternalIframe}}data-external-iframe="1"{{end}}
      {{if .ActiveChapter}}data-active-chapter-id="{{.ActiveChapter.ID}}" data-active-chapter-title="{{.ActiveChapter.Title}}" data-active-chapter-url="/books/{{.BookDetail.Slug}}?ch={{.ActiveChapter.ID}}"{{end}}>
 
-  <aside class="sidebar-card book-reader-toc">
+  <div class="book-reader-toc-backdrop js-book-toc-backdrop" hidden></div>
+
+  <aside class="sidebar-card book-reader-toc" aria-label="{{.BookDetail.Title}}">
     <div class="book-reader-toc__top">
       <a class="book-reader-back" href="/books">← {{t .Locale "bookshelf.title"}}</a>
       <button type="button" class="studio-icon-btn studio-icon-btn--square book-reader-toc__collapse js-book-toggle-toc"
               aria-expanded="{{if $isExternalIframe}}false{{else}}true{{end}}"
               title="{{t .Locale "bookshelf.toggle_toc"}}"
               aria-label="{{t .Locale "bookshelf.toggle_toc"}}">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 7-5 5 5 5M19 7l-5 5 5 5"/></svg>
+        <svg class="book-reader-toc__icon-desktop" viewBox="0 0 24 24" aria-hidden="true"><path d="m14 7-5 5 5 5M19 7l-5 5 5 5"/></svg>
+        <svg class="book-reader-toc__icon-mobile" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
     </div>
     <h2 class="book-reader-toc__title">{{.BookDetail.Title}}</h2>
@@ -41,9 +44,9 @@
 
   <article class="studio-article book-reader-main{{if $isExternalIframe}} book-reader-main--frame{{end}}"
            {{if .ActiveChapterNeedsMath}}data-needs-math="1"{{end}}>
-    <div class="book-reader-bar">
+    <div class="book-reader-bar book-reader-toolbar">
       <div class="book-reader-bar__left">
-        <button type="button" class="studio-icon-btn js-book-toggle-toc"
+        <button type="button" class="studio-icon-btn book-reader-toolbar__btn js-book-toggle-toc"
                 aria-expanded="{{if $isExternalIframe}}false{{else}}true{{end}}"
                 data-collapse-label="{{t .Locale "bookshelf.toggle_toc"}}"
                 data-expand-label="{{t .Locale "bookshelf.expand_toc"}}">
@@ -54,19 +57,24 @@
       </div>
       <div class="book-reader-bar__right">
         {{if $isExternalChapter}}
-          <a class="studio-icon-btn" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax title="{{.ActiveChapter.Title}}">
-            <span>{{t .Locale "bookshelf.open_reader"}}</span>
+          <a class="studio-icon-btn book-reader-toolbar__btn" href="{{.ActiveChapter.URL}}" target="_blank" rel="noopener" data-no-pjax title="{{.ActiveChapter.Title}}">
+            <span class="book-reader-toolbar__label">{{t .Locale "bookshelf.open_reader"}}</span>
             <span aria-hidden="true">↗</span>
           </a>
         {{else if $isExternalSource}}
-          <a class="studio-icon-btn" href="{{.BookDetail.SourceURL}}" target="_blank" rel="noopener" data-no-pjax title="{{.BookDetail.Title}}">
-            <span>{{t .Locale "bookshelf.open_reader"}}</span>
+          <a class="studio-icon-btn book-reader-toolbar__btn" href="{{.BookDetail.SourceURL}}" target="_blank" rel="noopener" data-no-pjax title="{{.BookDetail.Title}}">
+            <span class="book-reader-toolbar__label">{{t .Locale "bookshelf.open_reader"}}</span>
             <span aria-hidden="true">↗</span>
           </a>
         {{end}}
-        <button type="button" class="studio-icon-btn js-book-fullscreen"
+        <button type="button" class="studio-icon-btn book-reader-toolbar__btn js-book-fullscreen"
                 data-enter-label="{{t .Locale "bookshelf.focus_fullscreen"}}"
-                data-exit-label="{{t .Locale "bookshelf.exit_fullscreen"}}">{{t .Locale "bookshelf.focus_fullscreen"}}</button>
+                data-exit-label="{{t .Locale "bookshelf.exit_fullscreen"}}"
+                title="{{t .Locale "bookshelf.focus_fullscreen"}}"
+                aria-label="{{t .Locale "bookshelf.focus_fullscreen"}}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+          <span class="js-book-fs-label">{{t .Locale "bookshelf.focus_fullscreen"}}</span>
+        </button>
       </div>
     </div>
 

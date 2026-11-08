@@ -44,6 +44,13 @@ var (
 	ErrUnauthorized       = errors.New("auth: authentication required")
 	ErrForbidden          = errors.New("auth: insufficient permissions")
 	ErrVerificationCode   = errors.New("auth: invalid or expired email verification code")
+	ErrCodeCooldown       = errors.New("auth: verification code resend cooldown active, please wait 60 seconds")
+)
+
+const (
+	emailCodeResendCooldown = 60 * time.Second
+	emailCodeTTL            = 10 * time.Minute
+	maxActiveCodesPerEmail  = 3
 )
 
 var validAPITokenScopes = map[string]bool{
@@ -54,11 +61,17 @@ var validAPITokenScopes = map[string]bool{
 	ScopeBackupRead:    true,
 }
 
-type pendingEmailCode struct {
-	emailHash string
+type pendingCodeCandidate struct {
 	codeHash  string
-	attempts  int
 	expiresAt time.Time
+}
+
+type pendingEmailCode struct {
+	emailHash    string
+	codes        []pendingCodeCandidate
+	lastIssuedAt time.Time
+	attempts     int
+	expiresAt    time.Time
 }
 
 // LoginResult describes the outcome of staff login (either immediate session or 2FA challenge).
@@ -95,9 +108,14 @@ func verifyDummyPassword(rawPassword string) {
 	dummyHashOnce.Do(func() {
 		dummyPasswordHash, _ = HashPassword("volo-timing-equalizer-dummy-secret")
 	})
-	if dummyPasswordHash != "" {
-		VerifyPassword(rawPassword, dummyPasswordHash, "")
+	if dummyPasswordHash == "" {
+		return
 	}
+	probe := rawPassword
+	if probe == "" || len(probe) > MaxLoginPasswordBytes {
+		probe = "volo-dummy-password-probe-constant"
+	}
+	verifyArgon2id(probe, dummyPasswordHash)
 }
 
 func NewService(store *sqlx.Store, keyRing *config.KeyRing, settingsMgr *repo.SettingsManager, publicURL string) *Service {
@@ -513,8 +531,13 @@ func (s *Service) LoginWithPasskey(
 
 // --- Reader Email-Verified Registration, Reader Login Isolation & Guest Comment Claim ---
 
-// IssueReaderVerificationCode generates a 6-digit email verification code (10m TTL, max 5 attempts).
+// IssueReaderVerificationCode generates a 6-digit email verification code (10m TTL, 60s resend cooldown,
+// rolling window of up to 3 active codes per email, max 5 failed attempts).
 func (s *Service) IssueReaderVerificationCode(email string) (string, error) {
+	return s.issueReaderVerificationCodeAt(email, time.Now())
+}
+
+func (s *Service) issueReaderVerificationCodeAt(email string, now time.Time) (string, error) {
 	normEmail := strings.ToLower(strings.TrimSpace(email))
 	if !strings.Contains(normEmail, "@") || len(normEmail) > 190 {
 		return "", errors.New("auth: invalid email address")
@@ -531,9 +554,35 @@ func (s *Service) IssueReaderVerificationCode(email string) (string, error) {
 
 	const maxPendingEmailCodes = 2048
 	key := hex.EncodeToString(emailSum[:])
-	now := time.Now()
 	s.codeMu.Lock()
-	if _, exists := s.pendingCodes[key]; !exists && len(s.pendingCodes) >= maxPendingEmailCodes {
+	defer s.codeMu.Unlock()
+
+	if existing, exists := s.pendingCodes[key]; exists {
+		if now.Before(existing.expiresAt) && !existing.lastIssuedAt.IsZero() && now.Sub(existing.lastIssuedAt) < emailCodeResendCooldown {
+			return "", ErrCodeCooldown
+		}
+		validCodes := make([]pendingCodeCandidate, 0, maxActiveCodesPerEmail)
+		for _, c := range existing.codes {
+			if now.Before(c.expiresAt) {
+				validCodes = append(validCodes, c)
+			}
+		}
+		exp := now.Add(emailCodeTTL)
+		validCodes = append(validCodes, pendingCodeCandidate{
+			codeHash:  hex.EncodeToString(codeSum[:]),
+			expiresAt: exp,
+		})
+		if len(validCodes) > maxActiveCodesPerEmail {
+			validCodes = validCodes[len(validCodes)-maxActiveCodesPerEmail:]
+		}
+		existing.codes = validCodes
+		existing.lastIssuedAt = now
+		existing.expiresAt = exp
+		existing.attempts = 0
+		return code, nil
+	}
+
+	if len(s.pendingCodes) >= maxPendingEmailCodes {
 		for k, v := range s.pendingCodes {
 			if !now.Before(v.expiresAt) {
 				delete(s.pendingCodes, k)
@@ -556,13 +605,19 @@ func (s *Service) IssueReaderVerificationCode(email string) (string, error) {
 			delete(s.pendingCodes, oldestKey)
 		}
 	}
+	exp := now.Add(emailCodeTTL)
 	s.pendingCodes[key] = &pendingEmailCode{
 		emailHash: key,
-		codeHash:  hex.EncodeToString(codeSum[:]),
-		attempts:  0,
-		expiresAt: now.Add(10 * time.Minute),
+		codes: []pendingCodeCandidate{
+			{
+				codeHash:  hex.EncodeToString(codeSum[:]),
+				expiresAt: exp,
+			},
+		},
+		lastIssuedAt: now,
+		attempts:     0,
+		expiresAt:    exp,
 	}
-	s.codeMu.Unlock()
 	return code, nil
 }
 
@@ -589,15 +644,22 @@ func (s *Service) RegisterReader(
 	candSum := sha256.Sum256([]byte(normEmail + ":" + strings.TrimSpace(verificationCode)))
 	candHex := hex.EncodeToString(candSum[:])
 
+	nowTs := time.Now()
 	s.codeMu.Lock()
 	entry, exists := s.pendingCodes[key]
-	if !exists || time.Now().After(entry.expiresAt) || entry.attempts >= 5 {
+	if !exists || nowTs.After(entry.expiresAt) || entry.attempts >= 5 {
 		delete(s.pendingCodes, key)
 		s.codeMu.Unlock()
 		return nil, ErrVerificationCode
 	}
 	entry.attempts++
-	if subtle.ConstantTimeCompare([]byte(entry.codeHash), []byte(candHex)) != 1 {
+	matchedCode := 0
+	for _, item := range entry.codes {
+		if nowTs.Before(item.expiresAt) {
+			matchedCode |= subtle.ConstantTimeCompare([]byte(item.codeHash), []byte(candHex))
+		}
+	}
+	if matchedCode != 1 {
 		s.codeMu.Unlock()
 		return nil, ErrVerificationCode
 	}
@@ -643,8 +705,16 @@ func (s *Service) LoginReader(
 	geoRegion string,
 	userAgent string,
 ) (*LoginResult, error) {
+	if rawPassword == "" || len(rawPassword) > MaxLoginPasswordBytes {
+		verifyDummyPassword(rawPassword)
+		return nil, ErrInvalidCredentials
+	}
 	u, err := s.findUserByIdent(ctx, ident)
 	if err != nil {
+		verifyDummyPassword(rawPassword)
+		return nil, ErrInvalidCredentials
+	}
+	if strings.TrimSpace(u.PasswordHash) == "" && strings.TrimSpace(u.LegacyHash) == "" {
 		verifyDummyPassword(rawPassword)
 		return nil, ErrInvalidCredentials
 	}
@@ -791,15 +861,27 @@ func (s *Service) RevokeSession(ctx context.Context, actor *domain.User, session
 
 // RevokeOtherSessions kicks all sessions of userID except keepSessionID (e.g. after password rotation).
 func (s *Service) RevokeOtherSessions(ctx context.Context, userID string, keepSessionID string) error {
-	if strings.TrimSpace(userID) == "" {
-		return nil
-	}
-	if strings.TrimSpace(keepSessionID) == "" {
-		_, err := s.store.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ?`, userID)
-		return err
-	}
-	_, err := s.store.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ? AND id <> ?`, userID, keepSessionID)
+	_, err := s.RevokeOtherSessionsCount(ctx, userID, keepSessionID)
 	return err
+}
+
+// RevokeOtherSessionsCount kicks all sessions of userID except keepSessionID and returns the revoked count.
+func (s *Service) RevokeOtherSessionsCount(ctx context.Context, userID string, keepSessionID string) (int64, error) {
+	if strings.TrimSpace(userID) == "" {
+		return 0, nil
+	}
+	var res sql.Result
+	var err error
+	if strings.TrimSpace(keepSessionID) == "" {
+		res, err = s.store.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ?`, userID)
+	} else {
+		res, err = s.store.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ? AND id <> ?`, userID, keepSessionID)
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 func (s *Service) ComputeCSRFToken(sessionID string) string {

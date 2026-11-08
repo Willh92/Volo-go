@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -533,10 +534,15 @@ func (s *Service) CreateComment(
 				IsGuest:    !isLoggedUser,
 			})
 			if verdict.Action == plugin.SpamActionReject {
+				if reason := strings.TrimSpace(verdict.Reason); reason != "" {
+					return PublicCommentView{}, "", fmt.Errorf("%w: %s", ErrCommentRejected, reason)
+				}
 				return PublicCommentView{}, "", ErrCommentRejected
 			}
 			if verdict.Action == plugin.SpamActionModerate {
 				status = domain.CommentStatusPending
+			} else if verdict.Action == plugin.SpamActionAllow && snap.Reading.CommentModerationMode != domain.CommentModerationAll {
+				status = domain.CommentStatusApproved
 			}
 		}
 	}
@@ -587,6 +593,9 @@ func (s *Service) CreateComment(
 		if hookErr != nil {
 			var rej *plugin.HookRejectedError
 			if errors.As(hookErr, &rej) {
+				if reason := strings.TrimSpace(rej.Reason); reason != "" {
+					return PublicCommentView{}, "", fmt.Errorf("%w: %s", ErrCommentRejected, reason)
+				}
 				return PublicCommentView{}, "", ErrCommentRejected
 			}
 		} else if resMap, ok := hookOut.(map[string]any); ok {
@@ -678,13 +687,92 @@ func (s *Service) UpdateOwnComment(
 
 	nowMS := time.Now().UnixMilli()
 	isAdmin := viewer != nil && viewer.Role == domain.RoleAdmin && viewer.Status == domain.UserStatusActive
+	isStaff := viewer != nil && viewer.Status == domain.UserStatusActive &&
+		(viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor)
 	if !isAdmin && !canModifyComment(existing, callerUserID, callerGuestHash, nowMS) {
 		return PublicCommentView{}, ErrCommentEditForbidden
 	}
 
+	nextStatus := existing.Status
+	if !isStaff {
+		snap := s.settings.Snapshot()
+		keywordTriggered := false
+		if snap.Reading.CommentModerationMode == domain.CommentModerationAll {
+			nextStatus = domain.CommentStatusPending
+		} else if containsBlockedKeyword(trimmed, existing.AuthorName, snap.Reading.BlockedKeywords, snap.Reading.AllowedKeywords) {
+			nextStatus = domain.CommentStatusPending
+			keywordTriggered = true
+		}
+
+		if s.plugins != nil {
+			verdict := s.plugins.Providers().EvaluateComment(ctx, plugin.CommentCheckInput{
+				TargetType: existing.TargetType,
+				TargetID:   existing.TargetID,
+				AuthorName: existing.AuthorName,
+				AuthorURL:  existing.AuthorURL,
+				ContentMD:  trimmed,
+				IPMasked:   existing.IPMasked,
+				GeoRegion:  existing.GeoRegion,
+				Locale:     existing.NotifyLocale,
+				IsGuest:    strings.TrimSpace(existing.UserID) == "",
+			})
+			if verdict.Action == plugin.SpamActionReject {
+				if reason := strings.TrimSpace(verdict.Reason); reason != "" {
+					return PublicCommentView{}, fmt.Errorf("%w: %s", ErrCommentRejected, reason)
+				}
+				return PublicCommentView{}, ErrCommentRejected
+			}
+			if verdict.Action == plugin.SpamActionModerate {
+				nextStatus = domain.CommentStatusPending
+			} else if verdict.Action == plugin.SpamActionAllow && keywordTriggered && snap.Reading.CommentModerationMode != domain.CommentModerationAll {
+				nextStatus = existing.Status
+			}
+
+			hookOut, hookErr := s.plugins.DispatchHook(ctx, plugin.HookCommentBeforeCreate, map[string]any{
+				"id":          existing.ID,
+				"target_type": existing.TargetType,
+				"target_id":   existing.TargetID,
+				"author_name": existing.AuthorName,
+				"content_md":  trimmed,
+				"status":      nextStatus,
+				"is_edit":     true,
+			})
+			if hookErr != nil {
+				var rej *plugin.HookRejectedError
+				if errors.As(hookErr, &rej) {
+					if reason := strings.TrimSpace(rej.Reason); reason != "" {
+						return PublicCommentView{}, fmt.Errorf("%w: %s", ErrCommentRejected, reason)
+					}
+					return PublicCommentView{}, ErrCommentRejected
+				}
+			} else if resMap, ok := hookOut.(map[string]any); ok {
+				if nextMD, sOk := resMap["content_md"].(string); sOk {
+					trimmedNext := strings.TrimSpace(nextMD)
+					if trimmedNext == "" || len([]rune(trimmedNext)) > 4000 {
+						return PublicCommentView{}, ErrCommentRejected
+					}
+					trimmed = trimmedNext
+				}
+				if hs, sOk := resMap["status"].(string); sOk && hs == domain.CommentStatusPending {
+					nextStatus = domain.CommentStatusPending
+				}
+			}
+		}
+	}
+
+	prevStatus := existing.Status
 	existing.ContentMD = trimmed
+	existing.Status = nextStatus
 	existing.UpdatedAt = nowMS
-	if _, err := s.store.ExecContext(ctx, `UPDATE comments SET content_md = ?, updated_at = ? WHERE id = ?`, trimmed, nowMS, existing.ID); err != nil {
+	if err := s.store.WithTx(ctx, func(tx *sqlx.Tx) error {
+		if _, uErr := tx.ExecContext(ctx, `UPDATE comments SET content_md = ?, status = ?, updated_at = ? WHERE id = ?`, trimmed, nextStatus, nowMS, existing.ID); uErr != nil {
+			return uErr
+		}
+		if prevStatus != nextStatus {
+			return syncApprovedCommentCountTx(ctx, tx, existing.TargetType, existing.TargetID)
+		}
+		return nil
+	}); err != nil {
 		return PublicCommentView{}, err
 	}
 	return s.toPublicCommentView(existing, postAuthorID, true, viewer), nil

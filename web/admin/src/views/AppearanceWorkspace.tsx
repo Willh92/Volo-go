@@ -28,6 +28,7 @@ import {
   UploadButton,
 } from "../components/UIControls";
 import { MediaPickButton } from "../components/MediaLibraryModal";
+import { CM6CssEditor } from "../components/CM6Editor";
 
 export type AppearanceTab = "themes" | "locales" | "plugins";
 
@@ -59,12 +60,19 @@ function renderAccentLabel(id: string): string {
   }
 }
 
+function isSecretSchemaField(f: any): boolean {
+  return Boolean(f?.secret || f?.type === "secret" || f?.type === "password");
+}
+
+function getSchemaFieldGroup(f: any): string {
+  return String(f?.localized_group || f?.group_label || f?.group || "").trim();
+}
+
 function buildSchemaDefaults(schema: any[]): Record<string, any> {
   const out: Record<string, any> = {};
   for (const f of schema || []) {
     if (!f?.key) continue;
-    const isSecret = Boolean(f.secret || f.type === "secret" || f.type === "password");
-    if (isSecret) {
+    if (isSecretSchemaField(f)) {
       out[f.key] = "";
     } else if (Array.isArray(f.default)) {
       out[f.key] = [...f.default];
@@ -75,12 +83,52 @@ function buildSchemaDefaults(schema: any[]): Record<string, any> {
     } else if (f.type === "boolean") {
       out[f.key] = false;
     } else if (f.type === "number") {
-      out[f.key] = 0;
+      out[f.key] = typeof f.min === "number" ? f.min : 0;
     } else {
       out[f.key] = "";
     }
   }
   return out;
+}
+
+function validateSchemaRequired(
+  schema: any[],
+  values: Record<string, any>,
+  secretKeysSet?: Record<string, boolean>,
+): string | null {
+  for (const f of schema || []) {
+    if (!f?.key || !f.required) continue;
+    const label = String(f.label || f.key);
+    if (isSecretSchemaField(f)) {
+      const cur = values[f.key];
+      const hasSaved = Boolean(secretKeysSet?.[f.key]) && cur !== CLEAR_SECRET_SENTINEL;
+      if (!hasSaved && (!cur || cur === CLEAR_SECRET_SENTINEL)) {
+        return t("app.cfg_required_missing", { field: label });
+      }
+      continue;
+    }
+    const val = values[f.key] !== undefined ? values[f.key] : f.default;
+    if (f.type === "sortable_list") {
+      if (!Array.isArray(val) || val.length === 0) {
+        return t("app.cfg_required_missing", { field: label });
+      }
+    } else if (f.type === "number") {
+      if (val === "" || val === null || val === undefined || Number.isNaN(Number(val))) {
+        return t("app.cfg_required_missing", { field: label });
+      }
+      if (typeof f.min === "number" && Number(val) < f.min) {
+        return `${label} >= ${f.min}`;
+      }
+      if (typeof f.max === "number" && Number(val) > f.max) {
+        return `${label} <= ${f.max}`;
+      }
+    } else if (f.type !== "boolean") {
+      if (String(val ?? "").trim() === "") {
+        return t("app.cfg_required_missing", { field: label });
+      }
+    }
+  }
+  return null;
 }
 
 function SchemaFieldControl({
@@ -96,8 +144,11 @@ function SchemaFieldControl({
   secretKeysSet?: Record<string, boolean>;
   namePrefix: string;
 }) {
+  const [freeItemDraft, setFreeItemDraft] = useState("");
   const label = f.label || f.key;
-  const isSecret = Boolean(f.secret || f.type === "secret" || f.type === "password");
+  const reqMark = f.required ? " *" : "";
+  const isSecret = isSecretSchemaField(f);
+  const ph = f.placeholder ? String(f.placeholder) : undefined;
 
   if (f.type === "boolean") {
     return (
@@ -105,98 +156,185 @@ function SchemaFieldControl({
         <SwitchToggle
           checked={Boolean(values[f.key] ?? f.default)}
           onChange={(next) => onChange(f.key, next)}
-          label={label}
+          label={`${label}${reqMark}`}
           hint={f.description}
         />
       </div>
     );
   }
 
-  if (f.type === "sortable_list" && Array.isArray(f.options)) {
-    const allOpts: Array<{ value: string; label: string }> = f.options.map((op: any) =>
-      typeof op === "object" && op !== null
-        ? { value: String(op.value), label: String(op.label || op.value) }
-        : { value: String(op), label: String(op) },
-    );
-    const optMap = new Map(allOpts.map((o) => [o.value, o.label]));
+  if (f.type === "sortable_list") {
+    const hasFixedOpts = Array.isArray(f.options) && f.options.length > 0;
     const rawCur = values[f.key] !== undefined ? values[f.key] : f.default;
-    const enabledKeys: string[] = (Array.isArray(rawCur) ? rawCur : [])
-      .map((k: any) => String(k))
-      .filter((k: string, idx: number, arr: string[]) => optMap.has(k) && arr.indexOf(k) === idx);
-    const enabledSet = new Set(enabledKeys);
-    const disabledOpts = allOpts.filter((o) => !enabledSet.has(o.value));
-    const showNavPlacement = f.key === "header_nav_items";
-    const primaryLimit = Math.max(0, Number(values.header_nav_primary_count ?? 5));
+    if (hasFixedOpts) {
+      const allOpts: Array<{ value: string; label: string }> = f.options.map((op: any) =>
+        typeof op === "object" && op !== null
+          ? { value: String(op.value), label: String(op.label || op.value) }
+          : { value: String(op), label: String(op) },
+      );
+      const optMap = new Map(allOpts.map((o) => [o.value, o.label]));
+      const enabledKeys: string[] = (Array.isArray(rawCur) ? rawCur : [])
+        .map((k: any) => String(k))
+        .filter((k: string, idx: number, arr: string[]) => optMap.has(k) && arr.indexOf(k) === idx);
+      const enabledSet = new Set(enabledKeys);
+      const disabledOpts = allOpts.filter((o) => !enabledSet.has(o.value));
+      const showNavPlacement = f.key === "header_nav_items";
+      const primaryLimit = Math.max(0, Number(values.header_nav_primary_count ?? 5));
 
-    const moveItem = (idx: number, delta: number) => {
+      const moveItem = (idx: number, delta: number) => {
+        const target = idx + delta;
+        if (target < 0 || target >= enabledKeys.length) return;
+        const next = [...enabledKeys];
+        const [picked] = next.splice(idx, 1);
+        next.splice(target, 0, picked);
+        onChange(f.key, next);
+      };
+
+      return (
+        <div class="volo-field">
+          <label>
+            {label}
+            {reqMark}
+          </label>
+          {f.description && <div class="volo-help">{f.description}</div>}
+          <div class="volo-sortable-list">
+            {enabledKeys.map((k, idx) => (
+              <div key={k} class="volo-sortable-row">
+                <SwitchToggle
+                  checked={true}
+                  onChange={(checked) => {
+                    if (!checked) {
+                      onChange(
+                        f.key,
+                        enabledKeys.filter((it) => it !== k),
+                      );
+                    }
+                  }}
+                  label={`${idx + 1}. ${optMap.get(k) || k}`}
+                />
+                <div class="volo-sortable-acts">
+                  {showNavPlacement && (
+                    <span class={`volo-badge ${idx < primaryLimit ? "volo-badge-ok" : ""}`}>
+                      {idx < primaryLimit ? t("app.nav_slot_primary") : t("app.nav_slot_more")}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    disabled={idx === 0}
+                    title={t("app.move_up")}
+                    onClick={() => moveItem(idx, -1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    disabled={idx === enabledKeys.length - 1}
+                    title={t("app.move_down")}
+                    onClick={() => moveItem(idx, 1)}
+                  >
+                    ↓
+                  </button>
+                </div>
+              </div>
+            ))}
+            {disabledOpts.map((opt) => (
+              <div key={opt.value} class="volo-sortable-row is-off">
+                <SwitchToggle
+                  checked={false}
+                  onChange={(checked) => {
+                    if (checked) {
+                      onChange(f.key, [...enabledKeys, opt.value]);
+                    }
+                  }}
+                  label={opt.label}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const items: string[] = (Array.isArray(rawCur) ? rawCur : []).map((v: any) => String(v)).filter(Boolean);
+    const moveFree = (idx: number, delta: number) => {
       const target = idx + delta;
-      if (target < 0 || target >= enabledKeys.length) return;
-      const next = [...enabledKeys];
+      if (target < 0 || target >= items.length) return;
+      const next = [...items];
       const [picked] = next.splice(idx, 1);
       next.splice(target, 0, picked);
       onChange(f.key, next);
     };
-
+    const addFree = () => {
+      const trimmed = freeItemDraft.trim();
+      if (!trimmed || items.includes(trimmed)) return;
+      onChange(f.key, [...items, trimmed]);
+      setFreeItemDraft("");
+    };
     return (
       <div class="volo-field">
-        <label>{label}</label>
+        <label>
+          {label}
+          {reqMark}
+        </label>
         {f.description && <div class="volo-help">{f.description}</div>}
-        <div class="volo-sortable-list">
-          {enabledKeys.map((k, idx) => (
-            <div key={k} class="volo-sortable-row">
-              <SwitchToggle
-                checked={true}
-                onChange={(checked) => {
-                  if (!checked) {
-                    onChange(
-                      f.key,
-                      enabledKeys.filter((it) => it !== k),
-                    );
-                  }
-                }}
-                label={`${idx + 1}. ${optMap.get(k) || k}`}
-              />
-              <div class="volo-sortable-acts">
-                {showNavPlacement && (
-                  <span class={`volo-badge ${idx < primaryLimit ? "volo-badge-ok" : ""}`}>
-                    {idx < primaryLimit ? t("app.nav_slot_primary") : t("app.nav_slot_more")}
-                  </span>
-                )}
-                <button
-                  type="button"
-                  class="volo-act-btn"
-                  disabled={idx === 0}
-                  title={t("app.move_up")}
-                  onClick={() => moveItem(idx, -1)}
-                >
-                  ↑
-                </button>
-                <button
-                  type="button"
-                  class="volo-act-btn"
-                  disabled={idx === enabledKeys.length - 1}
-                  title={t("app.move_down")}
-                  onClick={() => moveItem(idx, 1)}
-                >
-                  ↓
-                </button>
-              </div>
-            </div>
-          ))}
-          {disabledOpts.map((opt) => (
-            <div key={opt.value} class="volo-sortable-row is-off">
-              <SwitchToggle
-                checked={false}
-                onChange={(checked) => {
-                  if (checked) {
-                    onChange(f.key, [...enabledKeys, opt.value]);
-                  }
-                }}
-                label={opt.label}
-              />
-            </div>
-          ))}
+        <div class="volo-input-row" style={{ marginBottom: items.length > 0 ? "6px" : 0 }}>
+          <input
+            type="text"
+            class="volo-input"
+            placeholder={ph || ""}
+            value={freeItemDraft}
+            onInput={(e) => setFreeItemDraft((e.currentTarget as HTMLInputElement).value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addFree();
+              }
+            }}
+          />
+          <button type="button" class="volo-btn volo-btn-sm" onClick={addFree}>
+            +
+          </button>
         </div>
+        {items.length > 0 && (
+          <div class="volo-sortable-list">
+            {items.map((item, idx) => (
+              <div key={`${item}-${idx}`} class="volo-sortable-row">
+                <span style={{ fontSize: "13px", overflowWrap: "anywhere" }}>
+                  {idx + 1}. {item}
+                </span>
+                <div class="volo-sortable-acts">
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    disabled={idx === 0}
+                    title={t("app.move_up")}
+                    onClick={() => moveFree(idx, -1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    disabled={idx === items.length - 1}
+                    title={t("app.move_down")}
+                    onClick={() => moveFree(idx, 1)}
+                  >
+                    ↓
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-act-btn danger"
+                    onClick={() => onChange(f.key, items.filter((_, i) => i !== idx))}
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   }
@@ -208,7 +346,8 @@ function SchemaFieldControl({
     return (
       <div class="volo-field">
         <label>
-          {label}{" "}
+          {label}
+          {reqMark}{" "}
           {isSealed && !isClearing && (
             <span class="volo-badge volo-badge-ok">{t("app.secret_sealed_hint")}</span>
           )}
@@ -220,7 +359,7 @@ function SchemaFieldControl({
           name={`${namePrefix}_${f.key}`}
           autoComplete="new-password"
           disabled={isClearing}
-          placeholder={isClearing ? t("app.clear_saved_secret") : "••••••••"}
+          placeholder={isClearing ? t("app.clear_saved_secret") : isSealed ? "••••••••" : ph || "••••••••"}
           value={isClearing ? "" : String(curVal ?? "")}
           onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
         />
@@ -237,7 +376,10 @@ function SchemaFieldControl({
 
   return (
     <div class="volo-field">
-      <label>{label}</label>
+      <label>
+        {label}
+        {reqMark}
+      </label>
       {f.description && <div class="volo-help">{f.description}</div>}
       {f.type === "select" && Array.isArray(f.options) ? (
         <ConsoleSelect
@@ -276,7 +418,8 @@ function SchemaFieldControl({
                 class="volo-input"
                 name={`${namePrefix}_${f.key}`}
                 autoComplete="off"
-                placeholder="#246b51"
+                required={Boolean(f.required)}
+                placeholder={ph || "#246b51"}
                 value={rawColor}
                 onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
               />
@@ -290,6 +433,8 @@ function SchemaFieldControl({
             class="volo-input"
             name={`${namePrefix}_${f.key}`}
             autoComplete="off"
+            required={Boolean(f.required)}
+            placeholder={ph}
             value={String(values[f.key] ?? f.default ?? "")}
             onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
           />
@@ -299,6 +444,8 @@ function SchemaFieldControl({
         <textarea
           class="volo-textarea"
           rows={3}
+          required={Boolean(f.required)}
+          placeholder={ph}
           value={String(values[f.key] ?? f.default ?? "")}
           onInput={(e) => onChange(f.key, (e.currentTarget as HTMLTextAreaElement).value)}
         />
@@ -308,14 +455,195 @@ function SchemaFieldControl({
           class="volo-input"
           name={`${namePrefix}_${f.key}`}
           autoComplete="off"
+          required={Boolean(f.required)}
+          placeholder={ph}
+          min={f.type === "number" && typeof f.min === "number" ? f.min : undefined}
+          max={f.type === "number" && typeof f.max === "number" ? f.max : undefined}
+          step={f.type === "number" && typeof f.step === "number" ? f.step : undefined}
           value={String(values[f.key] ?? f.default ?? "")}
           onInput={(e) => {
             const raw = (e.currentTarget as HTMLInputElement).value;
-            onChange(f.key, f.type === "number" ? (raw === "" ? 0 : Number(raw)) : raw);
+            onChange(f.key, f.type === "number" ? (raw === "" ? "" : Number(raw)) : raw);
           }}
         />
       )}
     </div>
+  );
+}
+
+function SchemaConfigPanel({
+  targetId,
+  schema,
+  values,
+  onChange,
+  onMergeValues,
+  secretKeysSet,
+  namePrefix,
+}: {
+  targetId: string;
+  schema: any[];
+  values: Record<string, any>;
+  onChange: (key: string, next: any) => void;
+  onMergeValues: (patch: Record<string, any>) => void;
+  secretKeysSet?: Record<string, boolean>;
+  namePrefix: string;
+}) {
+  const [groupFilter, setGroupFilter] = useState<string>("__all__");
+  const [searchQ, setSearchQ] = useState<string>("");
+
+  useEffect(() => {
+    setGroupFilter("__all__");
+    setSearchQ("");
+  }, [targetId]);
+
+  const groups: string[] = [];
+  for (const f of schema) {
+    const g = getSchemaFieldGroup(f);
+    if (g && !groups.includes(g)) groups.push(g);
+  }
+
+  const qLower = searchQ.trim().toLowerCase();
+  const visibleFields = schema.filter((f) => {
+    if (!f?.key) return false;
+    if (groupFilter !== "__all__" && getSchemaFieldGroup(f) !== groupFilter) return false;
+    if (qLower) {
+      const hay = `${f.key} ${f.label || ""} ${f.description || ""} ${getSchemaFieldGroup(f)}`.toLowerCase();
+      if (!hay.includes(qLower)) return false;
+    }
+    return true;
+  });
+
+  const exportConfigJSON = () => {
+    const out: Record<string, any> = {};
+    for (const f of schema) {
+      if (!f?.key || isSecretSchemaField(f)) continue;
+      const val = values[f.key] !== undefined ? values[f.key] : f.default;
+      if (val !== CLEAR_SECRET_SENTINEL) {
+        out[f.key] = val;
+      }
+    }
+    const blob = new Blob([JSON.stringify(out, null, 2) + "\n"], { type: "application/json;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${targetId || "config"}-config.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  return (
+    <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
+      <div
+        class="volo-input-row"
+        style={{ justifyContent: "space-between", flexWrap: "wrap", gap: "8px", marginBottom: "12px" }}
+      >
+        {(schema.length >= 8 || groups.length > 0) && (
+          <input
+            type="text"
+            class="volo-input volo-search-input"
+            style={{ flex: "1 1 180px", minWidth: 0 }}
+            placeholder={t("app.cfg_search_ph")}
+            value={searchQ}
+            onInput={(e) => setSearchQ((e.currentTarget as HTMLInputElement).value)}
+          />
+        )}
+        <div class="volo-input-row" style={{ gap: "6px", flexWrap: "wrap", marginLeft: "auto" }}>
+          <button type="button" class="volo-btn volo-btn-sm" onClick={exportConfigJSON}>
+            {t("app.cfg_export_json")}
+          </button>
+          <UploadButton
+            accept=".json"
+            small
+            label={t("app.cfg_import_json")}
+            onFile={async (file) => {
+              try {
+                const raw = await file.text();
+                const parsed = JSON.parse(raw);
+                if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                  showToast(t("app.cfg_import_invalid"), "err");
+                  return;
+                }
+                const allowed = new Map<string, any>();
+                for (const f of schema) {
+                  if (f?.key && !isSecretSchemaField(f)) allowed.set(f.key, f);
+                }
+                const patch: Record<string, any> = {};
+                for (const [k, v] of Object.entries(parsed as Record<string, any>)) {
+                  if (allowed.has(k) && v !== CLEAR_SECRET_SENTINEL) {
+                    patch[k] = v;
+                  }
+                }
+                onMergeValues(patch);
+                showToast(t("app.cfg_imported_toast"), "ok");
+              } catch {
+                showToast(t("app.cfg_import_invalid"), "err");
+              }
+            }}
+          />
+        </div>
+      </div>
+
+      {groups.length > 1 && (
+        <div class="volo-filter-pills" style={{ marginBottom: "12px" }}>
+          <button
+            type="button"
+            class={`volo-filter-pill ${groupFilter === "__all__" ? "active" : ""}`}
+            onClick={() => setGroupFilter("__all__")}
+          >
+            {t("art.all")}
+          </button>
+          {groups.map((g) => (
+            <button
+              key={g}
+              type="button"
+              class={`volo-filter-pill ${groupFilter === g ? "active" : ""}`}
+              onClick={() => setGroupFilter(g)}
+            >
+              {g}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {visibleFields.length === 0 ? (
+        <div class="volo-help" style={{ textAlign: "center", padding: "18px 8px" }}>
+          {t("common.empty")}
+        </div>
+      ) : (
+        visibleFields.map((f: any, idx: number) => {
+          const curGroup = getSchemaFieldGroup(f);
+          const prevGroup = idx > 0 ? getSchemaFieldGroup(visibleFields[idx - 1]) : "";
+          const showGroupHeader = groupFilter === "__all__" && groups.length > 0 && curGroup && curGroup !== prevGroup;
+          return (
+            <div key={f.key}>
+              {showGroupHeader && (
+                <div
+                  style={{
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    color: "var(--volo-muted)",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                    marginTop: idx === 0 ? "2px" : "14px",
+                    marginBottom: "8px",
+                    paddingBottom: "4px",
+                    borderBottom: "1px solid var(--volo-line)",
+                  }}
+                >
+                  {curGroup}
+                </div>
+              )}
+              <SchemaFieldControl
+                field={f}
+                values={values}
+                onChange={onChange}
+                secretKeysSet={secretKeysSet}
+                namePrefix={namePrefix}
+              />
+            </div>
+          );
+        })
+      )}
+    </form>
   );
 }
 
@@ -332,6 +660,7 @@ export function AppearanceWorkspace({
   const [uploading, setUploading] = useState<boolean>(false);
 
   const [themes, setThemes] = useState<any[]>([]);
+  const [brokenPreviews, setBrokenPreviews] = useState<Record<string, boolean>>({});
   const [appCfg, setAppCfg] = useState<any>(null);
   const [appVer, setAppVer] = useState<number>(0);
 
@@ -475,30 +804,53 @@ export function AppearanceWorkspace({
                 <h3 class="volo-card-title">{t("app.gallery_head")}</h3>
                 <p class="volo-sec-desc">{t("app.gallery_sub")}</p>
               </div>
-              <UploadButton
-                accept=".zip"
-                primary
-                small
-                busy={uploading}
-                label={t("app.install_theme_zip")}
-                onFile={async (f) => {
-                  setUploading(true);
-                  try {
-                    const fd = new FormData();
-                    fd.append("file", f);
-                    await apiFetch(`/api/admin/themes/install?locale=${encodeURIComponent(localeSig.value)}`, {
-                      method: "POST",
-                      body: fd,
-                    });
-                    showToast(t("app.theme_installed"), "ok");
-                    void loadData(true);
-                  } catch (err: any) {
-                    showToast(err.message, "err");
-                  } finally {
-                    setUploading(false);
-                  }
-                }}
-              />
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm"
+                  onClick={async () => {
+                    try {
+                      const res = await apiFetch<{ themes?: any[]; appearance?: any }>("/api/admin/themes/reload", {
+                        method: "POST",
+                        body: "{}",
+                      });
+                      setBrokenPreviews({});
+                      if (Array.isArray(res.themes)) setThemes(res.themes);
+                      else void loadData(true);
+                      showToast(t("app.themes_reloaded"), "ok");
+                    } catch (err: any) {
+                      showToast(err.message, "err");
+                    }
+                  }}
+                >
+                  {t("app.themes_reload")}
+                </button>
+                <UploadButton
+                  accept=".zip"
+                  primary
+                  small
+                  busy={uploading}
+                  label={t("app.install_theme_zip")}
+                  onFile={async (f) => {
+                    setUploading(true);
+                    try {
+                      const fd = new FormData();
+                      fd.append("file", f);
+                      await apiFetch(`/api/admin/themes/install?locale=${encodeURIComponent(localeSig.value)}`, {
+                        method: "POST",
+                        body: fd,
+                      });
+                      setBrokenPreviews({});
+                      showToast(t("app.theme_installed"), "ok");
+                      void loadData(true);
+                    } catch (err: any) {
+                      showToast(err.message, "err");
+                    } finally {
+                      setUploading(false);
+                    }
+                  }}
+                />
+              </div>
             </div>
 
             <div class="volo-theme-grid">
@@ -512,10 +864,38 @@ export function AppearanceWorkspace({
                 const previewSrc = th.preview_url || `/themes/${encodeURIComponent(th.id)}/preview`;
                 const title = th.display_name || th.name || th.id;
                 const desc = th.display_description || th.description || "";
+                const hasBrokenImg = Boolean(brokenPreviews[th.id]);
                 return (
                   <div key={th.id} class={`volo-theme-card ${isActive || isMobileActive ? "active" : ""}`}>
                     <div class="volo-theme-thumb">
-                      <img src={previewSrc} alt={title} loading="lazy" />
+                      {!hasBrokenImg ? (
+                        <img
+                          src={previewSrc}
+                          alt={title}
+                          loading="lazy"
+                          onError={() => setBrokenPreviews((prev) => ({ ...prev, [th.id]: true }))}
+                        />
+                      ) : (
+                        <div
+                          style={{
+                            width: "100%",
+                            height: "100%",
+                            minHeight: "140px",
+                            display: "flex",
+                            flexDirection: "column",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            gap: "4px",
+                            background: "color-mix(in srgb, var(--volo-accent) 9%, var(--volo-raised))",
+                            color: "var(--volo-muted)",
+                            padding: "12px",
+                            textAlign: "center",
+                          }}
+                        >
+                          <strong style={{ color: "var(--volo-text)", fontSize: "14px" }}>{title}</strong>
+                          <span class="volo-code-chip">{th.id}</span>
+                        </div>
+                      )}
                       <div class="volo-theme-badges">
                         {isActive && <span class="volo-badge volo-badge-ok">{t("app.theme_active_badge")}</span>}
                         {isMobileActive && (
@@ -566,6 +946,13 @@ export function AppearanceWorkspace({
                           rel="noreferrer"
                         >
                           {t("common.preview")} ↗
+                        </a>
+                        <a
+                          class="volo-btn volo-btn-sm"
+                          href={`/api/admin/themes/${encodeURIComponent(th.id)}/export`}
+                          download={`${th.id}.zip`}
+                        >
+                          {t("app.theme_export_zip")}
                         </a>
                         {schema.length > 0 && (
                           <button
@@ -680,12 +1067,9 @@ export function AppearanceWorkspace({
 
             <div class="volo-field">
               <label>{t("app.custom_css")}</label>
-              <textarea
-                class="volo-textarea"
-                rows={4}
-                style={{ fontFamily: "var(--volo-mono)", fontSize: "12.5px" }}
+              <CM6CssEditor
                 value={appCfg.custom_css || ""}
-                onInput={(e) => setAppCfg({ ...appCfg, custom_css: (e.currentTarget as HTMLTextAreaElement).value })}
+                onChange={(css) => setAppCfg({ ...appCfg, custom_css: css })}
               />
             </div>
 
@@ -965,30 +1349,59 @@ export function AppearanceWorkspace({
               <h3 class="volo-card-title">{t("app.plugins_head")}</h3>
               <p class="volo-sec-desc">{t("app.plugins_desc")}</p>
             </div>
-            <UploadButton
-              accept=".zip"
-              primary
-              small
-              busy={uploading}
-              label={t("app.install_zip")}
-              onFile={async (f) => {
-                setUploading(true);
-                try {
-                  const fd = new FormData();
-                  fd.append("file", f);
-                  await apiFetch(`/api/admin/plugins/install?locale=${encodeURIComponent(localeSig.value)}`, {
-                    method: "POST",
-                    body: fd,
-                  });
-                  showToast(t("app.installed_toast"), "ok");
-                  void loadData(true);
-                } catch (err: any) {
-                  showToast(err.message, "err");
-                } finally {
-                  setUploading(false);
-                }
-              }}
-            />
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={async () => {
+                  try {
+                    let res: { items?: any[] } | null = null;
+                    try {
+                      res = await apiFetch<{ items?: any[] }>(
+                        `/api/admin/plugins/discover?locale=${encodeURIComponent(localeSig.value)}`,
+                        { method: "POST", body: "{}" },
+                      );
+                    } catch {
+                      res = await apiFetch<{ items?: any[] }>(
+                        `/api/admin/plugins/reload?locale=${encodeURIComponent(localeSig.value)}`,
+                        { method: "POST", body: "{}" },
+                      );
+                    }
+                    if (Array.isArray(res?.items)) setPlugins(res!.items);
+                    else void loadData(true);
+                    showToast(t("app.plugins_discovered"), "ok");
+                  } catch (err: any) {
+                    showToast(err.message, "err");
+                  }
+                }}
+              >
+                {t("app.plugins_discover")}
+              </button>
+              <UploadButton
+                accept=".zip"
+                primary
+                small
+                busy={uploading}
+                label={t("app.install_zip")}
+                onFile={async (f) => {
+                  setUploading(true);
+                  try {
+                    const fd = new FormData();
+                    fd.append("file", f);
+                    await apiFetch(`/api/admin/plugins/install?locale=${encodeURIComponent(localeSig.value)}`, {
+                      method: "POST",
+                      body: fd,
+                    });
+                    showToast(t("app.installed_toast"), "ok");
+                    void loadData(true);
+                  } catch (err: any) {
+                    showToast(err.message, "err");
+                  } finally {
+                    setUploading(false);
+                  }
+                }}
+              />
+            </div>
           </div>
 
           <div class="volo-table-wrap">
@@ -1129,6 +1542,29 @@ export function AppearanceWorkspace({
                                   },
                                 },
                                 {
+                                  label: t("app.plugin_clear_kv"),
+                                  danger: true,
+                                  onClick: async () => {
+                                    if (
+                                      !(await openConfirm({
+                                        message: t("app.plugin_confirm_clear_kv", { id: p.id }),
+                                        danger: true,
+                                      }))
+                                    ) {
+                                      return;
+                                    }
+                                    try {
+                                      await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/kv`, {
+                                        method: "DELETE",
+                                      });
+                                      showToast(t("app.plugin_kv_cleared"), "ok");
+                                      void loadData(true);
+                                    } catch (err: any) {
+                                      showToast(err.message, "err");
+                                    }
+                                  },
+                                },
+                                {
                                   label: t("app.uninstall"),
                                   hidden: !(p.kind === "external" && !p.is_builtin && !p.builtin),
                                   danger: true,
@@ -1181,7 +1617,7 @@ export function AppearanceWorkspace({
         title={t("app.theme_cfg_title", {
           name: themeModal?.display_name || themeModal?.name || themeModal?.id || "",
         })}
-        maxWidth="560px"
+        maxWidth="720px"
         footer={
           <>
             <button
@@ -1203,6 +1639,11 @@ export function AppearanceWorkspace({
               class="volo-btn volo-btn-primary"
               onClick={async () => {
                 if (!themeModal) return;
+                const reqErr = validateSchemaRequired(themeSchema, themeCfgVals, themeModal?.secret_keys_set);
+                if (reqErr) {
+                  showToast(reqErr, "err");
+                  return;
+                }
                 try {
                   const res = await apiFetch<{ appearance?: any; version?: number }>(
                     `/api/admin/themes/${encodeURIComponent(themeModal.id)}/config`,
@@ -1226,25 +1667,22 @@ export function AppearanceWorkspace({
           </>
         }
       >
-        <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
-          {themeSchema.map((f: any) => (
-            <SchemaFieldControl
-              key={f.key}
-              field={f}
-              values={themeCfgVals}
-              onChange={(key, next) => setThemeCfgVals((prev) => ({ ...prev, [key]: next }))}
-              secretKeysSet={themeModal?.secret_keys_set}
-              namePrefix="theme_opt"
-            />
-          ))}
-        </form>
+        <SchemaConfigPanel
+          targetId={themeModal?.id || "theme"}
+          schema={themeSchema}
+          values={themeCfgVals}
+          onChange={(key, next) => setThemeCfgVals((prev) => ({ ...prev, [key]: next }))}
+          onMergeValues={(patch) => setThemeCfgVals((prev) => ({ ...prev, ...patch }))}
+          secretKeysSet={themeModal?.secret_keys_set}
+          namePrefix="theme_opt"
+        />
       </AnimatedModal>
 
       <AnimatedModal
         open={cfgModalOpen}
         onClose={() => setCfgModalOpen(false)}
         title={t("app.cfg_title", { name: cfgModal?.name || cfgModal?.id || "" })}
-        maxWidth="560px"
+        maxWidth="720px"
         footer={
           <>
             <button
@@ -1266,6 +1704,11 @@ export function AppearanceWorkspace({
               class="volo-btn volo-btn-primary"
               onClick={async () => {
                 if (!cfgModal) return;
+                const reqErr = validateSchemaRequired(pluginSchema, cfgValues, cfgModal?.secret_keys_set);
+                if (reqErr) {
+                  showToast(reqErr, "err");
+                  return;
+                }
                 try {
                   await apiFetch(`/api/admin/plugins/${encodeURIComponent(cfgModal.id)}/config`, {
                     method: "PATCH",
@@ -1284,18 +1727,15 @@ export function AppearanceWorkspace({
           </>
         }
       >
-        <form autoComplete="off" onSubmit={(e) => e.preventDefault()}>
-          {pluginSchema.map((f: any) => (
-            <SchemaFieldControl
-              key={f.key}
-              field={f}
-              values={cfgValues}
-              onChange={(key, next) => setCfgValues((prev) => ({ ...prev, [key]: next }))}
-              secretKeysSet={cfgModal?.secret_keys_set}
-              namePrefix="plugin_cfg"
-            />
-          ))}
-        </form>
+        <SchemaConfigPanel
+          targetId={cfgModal?.id || "plugin"}
+          schema={pluginSchema}
+          values={cfgValues}
+          onChange={(key, next) => setCfgValues((prev) => ({ ...prev, [key]: next }))}
+          onMergeValues={(patch) => setCfgValues((prev) => ({ ...prev, ...patch }))}
+          secretKeysSet={cfgModal?.secret_keys_set}
+          namePrefix="plugin_cfg"
+        />
       </AnimatedModal>
 
       <AnimatedModal

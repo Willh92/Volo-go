@@ -140,16 +140,37 @@ func acceptsGzipEncoding(acceptEncoding string) bool {
 	return false
 }
 
-func addVaryHeader(h http.Header, token string) {
-	existing := h.Values("Vary")
-	for _, v := range existing {
+func addVaryHeader(h http.Header, tokens ...string) {
+	if h == nil || len(tokens) == 0 {
+		return
+	}
+	var merged []string
+	seen := make(map[string]struct{}, 8)
+	addOne := func(tok string) {
+		clean := strings.TrimSpace(tok)
+		if clean == "" {
+			return
+		}
+		key := strings.ToLower(clean)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, clean)
+	}
+	for _, v := range h.Values("Vary") {
 		for _, item := range strings.Split(v, ",") {
-			if strings.EqualFold(strings.TrimSpace(item), token) {
-				return
-			}
+			addOne(item)
 		}
 	}
-	h.Add("Vary", token)
+	for _, tok := range tokens {
+		for _, item := range strings.Split(tok, ",") {
+			addOne(item)
+		}
+	}
+	if len(merged) > 0 {
+		h.Set("Vary", strings.Join(merged, ", "))
+	}
 }
 
 // wrapPublicDynamicGzip applies pooled BestSpeed Gzip compression strictly to anonymous, public,
@@ -191,14 +212,14 @@ func eligibleForPublicDynamicGzip(r *http.Request, adminPath string) bool {
 			return false
 		}
 	}
-	if strings.Contains(r.URL.RawQuery, "preview=") {
+	if q := r.URL.Query(); q.Get("preview") != "" || q.Get("st") != "" {
 		return false
 	}
 
 	p := r.URL.Path
 	// Skip static/Range/pre-compressed endpoints and sensitive/admin/auth namespaces.
 	switch p {
-	case "/healthz", "/rss.xml", "/atom.xml", "/podcast.xml", "/sitemap.xml", "/llms.txt", "/llms-full.txt":
+	case "/healthz", "/rss.xml", "/atom.xml", "/podcast.xml", "/feed.json", "/sitemap.xml", "/llms.txt", "/llms-full.txt":
 		return false
 	}
 	if strings.HasPrefix(p, "/uploads/") ||

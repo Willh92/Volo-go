@@ -193,6 +193,7 @@ type Page struct {
 	AuthorID         string `db:"author_id" json:"author_id"`
 	Title            string `db:"title" json:"title"`
 	Slug             string `db:"slug" json:"slug"`
+	Template         string `db:"template" json:"template"`
 	ContentMD        string `db:"content_md" json:"content_md"`
 	IsPublished      bool   `db:"is_published" json:"is_published"`
 	AllowComment     bool   `db:"allow_comment" json:"allow_comment"`
@@ -237,20 +238,21 @@ type SeriesArticle struct {
 }
 
 type Book struct {
-	ID           string `db:"id" json:"id"`
-	Title        string `db:"title" json:"title"`
-	Slug         string `db:"slug" json:"slug"`
-	Description  string `db:"description" json:"description"`
-	CoverURL     string `db:"cover_url" json:"cover_url"`
-	SourceType   string `db:"source_type" json:"source_type"` // auto | gitbook | mdbook | vuepress | series | manual
-	SourceURL    string `db:"source_url" json:"source_url"`
-	SeriesID     string `db:"series_id" json:"series_id"`
-	EmbedMode    string `db:"embed_mode" json:"embed_mode"` // iframe | link
-	ChapterCount int    `db:"chapter_count" json:"chapter_count"`
-	SyncedAt     int64  `db:"synced_at" json:"synced_at"`
-	SortOrder    int    `db:"sort_order" json:"sort_order"`
-	CreatedAt    int64  `db:"created_at" json:"created_at"`
-	UpdatedAt    int64  `db:"updated_at" json:"updated_at"`
+	ID            string `db:"id" json:"id"`
+	Title         string `db:"title" json:"title"`
+	Slug          string `db:"slug" json:"slug"`
+	Description   string `db:"description" json:"description"`
+	CoverURL      string `db:"cover_url" json:"cover_url"`
+	SourceType    string `db:"source_type" json:"source_type"` // auto | gitbook | mdbook | vuepress | series | manual
+	SourceURL     string `db:"source_url" json:"source_url"`
+	SeriesID      string `db:"series_id" json:"series_id"`
+	EmbedMode     string `db:"embed_mode" json:"embed_mode"` // iframe | link
+	ReadingStatus string `db:"reading_status" json:"reading_status"`
+	ChapterCount  int    `db:"chapter_count" json:"chapter_count"`
+	SyncedAt      int64  `db:"synced_at" json:"synced_at"`
+	SortOrder     int    `db:"sort_order" json:"sort_order"`
+	CreatedAt     int64  `db:"created_at" json:"created_at"`
+	UpdatedAt     int64  `db:"updated_at" json:"updated_at"`
 }
 
 type BookChapter struct {
@@ -378,6 +380,19 @@ type Webhook struct {
 	LastTriggeredAt  int64  `db:"last_triggered_at" json:"last_triggered_at"`
 	CreatedAt        int64  `db:"created_at" json:"created_at"`
 	UpdatedAt        int64  `db:"updated_at" json:"updated_at"`
+}
+
+type WebhookDelivery struct {
+	ID           string `db:"id" json:"id"`
+	WebhookID    string `db:"webhook_id" json:"webhook_id"`
+	Event        string `db:"event" json:"event"`
+	StatusCode   int    `db:"status_code" json:"status_code"`
+	DurationMS   int    `db:"duration_ms" json:"duration_ms"`
+	Success      bool   `db:"success" json:"success"`
+	PayloadJSON  string `db:"payload_json" json:"payload_json"`
+	ResponseBody string `db:"response_body" json:"response_body"`
+	ErrorText    string `db:"error_text" json:"error_text"`
+	CreatedAt    int64  `db:"created_at" json:"created_at"`
 }
 
 type AnalyticsDaily struct {

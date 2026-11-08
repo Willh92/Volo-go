@@ -72,6 +72,22 @@ During smooth PJAX page transitions, the main article viewport swaps while widge
 - **Independent Desktop & Mobile Theme Activation**: **Console -> Appearance & Extensions -> Themes** allows enabling one theme for Desktop (`active_theme`) and an optional dedicated theme for Mobile (`mobile_theme`, inheriting Desktop when unset) with cache-safe `Vary: User-Agent, Sec-CH-UA-Mobile` negotiation. Administrators can preview either mode live via `/?skin=<id>` and `/?skin=<id>&device=mobile`.
 - **Theme-Level Top Menu Ordering & Overflow**: Themes can declare `"type": "sortable_list"` fields in `theme.json` `config_schema` (such as `header_nav_items` and `header_nav_primary_count` in `volo-studio` and `volo-journal`) so site owners can toggle visibility and reorder built-in routes (`home`, `archives`, `tags`, `categories`, `series`, `books`, `links`, `follows`, `dynamic`) alongside the `custom` slot (which expands custom links from **Distribute -> Navigation** and defaults to the last position). Templates consume `PageContext.NavMenu` (`.NavMenu.Primary`, `.NavMenu.Overflow`, `.NavMenu.OverflowActive`, and `.NavMenu.Items`) directly without manual slice math.
 
+### 1.5 Custom Standalone Page Templates (`page_templates`)
+
+Themes can optionally declare selectable standalone page layouts in `theme.json` via `"page_templates"` (rendered from `templates/page-<id>.html`, automatically falling back to `templates/page.html` if a theme is switched):
+
+```json
+{
+  "page_templates": [
+    {
+      "id": "wide",
+      "name": { "zh-CN": "宽幅画廊排版", "en-US": "Wide Showcase" },
+      "description": { "zh-CN": "无侧栏全宽画布页面", "en-US": "Full-width layout without sidebar" }
+    }
+  ]
+}
+```
+
 ---
 
 ## 2. Sandboxed Plugin Development (`manifest.json` + `goja`)
@@ -83,15 +99,24 @@ During smooth PJAX page transitions, the main article viewport swaps while widge
 ```text
 plugins/hello-callout/
 ├── manifest.json           # Permissions, UI slots, hooks, cron jobs & localized config_schema
-├── main.js                 # Embedded pure-Go goja (ES2020+) sandbox entrypoint
+├── main.js                 # Embedded pure-Go JSVM sandbox entrypoint
 └── assets/                 # Optional static assets served under /plugins/hello-callout/assets/*
     ├── widget.css
     └── widget.js
 ```
 
-Administrators can either mount a directory under `./plugins/` or upload a `.zip` package directly in **Console -> Plugins** for validated hot-installation, automatic localized settings form generation, live enable/disable, or clean uninstallation.
+Administrators can either mount a directory under `./plugins/`, upload a `.zip` package directly in **Console -> Plugins**, or trigger **Rescan Plugins** for zero-downtime hot-reload, automatic localized settings form generation, live enable/disable, or clean uninstallation (with optional `plugin_kv` data purge).
 
-### 2.2 `manifest.json` Reference
+### 2.2 `manifest.json` Reference & Unified `config_schema`
+
+Both `theme.json` and `manifest.json` share a unified `config_schema` type system:
+- `string` / `text` (single-line text), `textarea` (multi-line text)
+- `number` (supports optional `min`, `max`, `step` constraints)
+- `boolean` (toggle switch)
+- `select` (dropdown with `options: [{ "value": "...", "label": { ... } }]`)
+- `url`, `image` (automatically sanitized to reject `javascript:` / `data:` URLs)
+- `color` (`#rgb` / `#rrggbb` color picker)
+- `sortable_list` (reorderable + toggleable item array)
 
 ```json
 {
@@ -112,11 +137,13 @@ Administrators can either mount a directory under `./plugins/` or upload a `.zip
   },
   "permissions": [
     "kv",
+    "hooks:render.pre_markdown",
     "hooks:render.post_html",
     "slots:article.after_content",
     "http.outbound:api.github.com"
   ],
-  "hooks": ["render.post_html"],
+  "allowed_hosts": ["api.github.com"],
+  "hooks": ["render.pre_markdown", "render.post_html"],
   "ui_slots": [
     {
       "slot": "article.after_content",
@@ -127,9 +154,24 @@ Administrators can either mount a directory under `./plugins/` or upload a `.zip
   "config_schema": [
     {
       "key": "banner_text",
-      "type": "string",
+      "type": "textarea",
       "default": "Thanks for reading — subscribe via RSS!",
       "label": { "zh-CN": "提示文案", "en-US": "Banner Text" }
+    },
+    {
+      "key": "accent_color",
+      "type": "color",
+      "default": "#1f5c48",
+      "label": { "zh-CN": "卡片强调色", "en-US": "Accent Color" }
+    },
+    {
+      "key": "max_items",
+      "type": "number",
+      "default": 5,
+      "min": 1,
+      "max": 20,
+      "step": 1,
+      "label": { "zh-CN": "最大条数", "en-US": "Max Items" }
     },
     {
       "key": "api_secret",
@@ -143,35 +185,70 @@ Administrators can either mount a directory under `./plugins/` or upload a `.zip
 
 > **Encrypted Secret Fields**: Any `config_schema` field marked `"secret": true` is sealed at rest via `AES-256-GCM` (`KeyRing`) and masked in admin API responses.
 
-### 2.3 Permissions, Domain Hooks & UI Slots
+### 2.3 Permissions, Domain Hooks, UI Slots & Provider Adapters
 
 1. **Permission Tokens**:
-   - Scoped Storage: `kv` (read/write), `kv:read` (read-only `plugin_kv` with per-plugin quota enforcement);
-   - Domain Hooks: `hooks:article.published`, `hooks:article.updated`, `hooks:comment.before_create`, `hooks:comment.created`, `hooks:render.post_html`;
-   - UI Slots: `slots:public.head`, `slots:public.header`, `slots:article.before_content`, `slots:article.after_content`, `slots:public.footer`, `slots:editor.quick_insert`, `slots:admin.dashboard_card`;
-   - HTTP & Networking: `http:routes` (custom `/plugins/<id>/api/*` endpoints), `http.outbound:<hostname>` (explicit hostname allowlist enforced with `OutboundSafeDialer` SSRF protection blocking loopback/RFC1918/cloud metadata IPs);
-   - Protected Content Opt-In: `articles:read_protected` (without this explicit permission, locked posts and `:::lock` blocks are redacted before reaching the plugin).
+   - **Scoped Storage**: `kv` (read/write), `kv:read` (read-only `plugin_kv` with per-plugin quota enforcement and background non-cache-invalidating writes);
+   - **Domain Hooks**:
+     - Articles: `hooks:article.published`, `hooks:article.updated`, `hooks:article.deleted`;
+     - Pages: `hooks:page.published`, `hooks:page.updated`, `hooks:page.deleted`;
+     - Comments: `hooks:comment.before_create`, `hooks:comment.created`, `hooks:comment.moderated`;
+     - Rendering Pipeline: `hooks:render.pre_markdown` (transforms `content_md` on unlocked articles prior to Markdown parsing) and `hooks:render.post_html` (transforms rendered HTML prior to XSS sanitization);
+   - **UI Slots**: `slots:public.head`, `slots:public.header`, `slots:article.before_content`, `slots:article.after_content`, `slots:comment.before`, `slots:comment.after`, `slots:public.footer`, `slots:editor.quick_insert`, `slots:admin.dashboard_card`;
+   - **HTTP & Networking**: `http:routes` (custom `/plugins/<id>/api/*` endpoints), `http:raw_headers` (exposes safe webhook verification headers such as `x-hub-signature-256`, `x-signature`, `stripe-signature`, `authorization`), `http.outbound:<hostname>` / `allowed_hosts` (explicit hostname or `*.domain.tld` allowlist enforced with `OutboundSafeDialer` SSRF protection);
+   - **Extension Providers**:
+     - `provider:storage`: Registers an external media/backup `StorageProvider` when `main.js` defines `storagePut(relKey, contentType, bodyBase64)` and `storageDelete(relKey)` (plus optional `storageHealthCheck()`). Public URLs returned by `storagePut` are sanitized, and uploads gracefully fall back to local disk if an external provider is unavailable;
+     - `provider:oidc`: Registers a third-party `OIDCProvider` for federated reader sign-in when `main.js` defines `oidcAuthURL(state, redirectURI)` and `oidcExchange(code, redirectURI)` (plus optional `oidcProviderInfo()` returning `{ id, display_name }`);
+     - `provider:notifier`: Registers a `NotifierProvider` (`notifySend(event)`) invoked alongside SMTP and outbound webhooks;
+     - `provider:captcha`: Registers a `CaptchaProvider` (`captchaRenderWidget(locale)` + `captchaVerify(token, clientIP)`);
+   - **Protected Content Opt-In**: `articles:read_protected` (without this explicit permission, password-protected posts and `:::lock` blocks are redacted before reaching the plugin).
 
-2. **Circuit Breakers, XSS Sanitization & CSS Scoping**:
-   - Every `goja` invocation runs under strict execution timeouts; repeated timeouts or panics trip the plugin's **Circuit Breaker (`CircuitOpen`)** so a misbehaving plugin can never stall reader requests;
-   - `render.post_html` output is re-sanitized through `bluemonday` to prevent stored XSS;
+2. **Circuit Breakers, Resource Caps, XSS Sanitization & CSS Scoping**:
+   - Every sandbox invocation runs under strict step budgets, wall-clock timeouts, cycle/depth caps (`Export` / `JSON.stringify`), and a `4 MiB` string allocation ceiling; repeated failures trip the plugin's **Circuit Breaker (`CircuitOpen`)** so a misbehaving plugin never stalls reader traffic;
+   - Both `render.post_html` and `admin.dashboard_card` outputs are sanitized against `<script>`, `<iframe>`, `on*` event attributes, and `javascript:`/`data:` URLs;
    - Plugin CSS custom properties must use `--volo-plugin-<id>-*` inside `.volo-plugin-scope[data-plugin="<id>"]`.
 
-### 2.4 Minimal `main.js` Example
+### 2.4 Sandbox SDK (`volo.*`) & `main.js` Example
+
+- `volo.on(hookName, handlerFn)` (or global `function onHook(hookName, payload)`): Subscribe to declared hooks;
+- `volo.escapeHTML(str)`: Safely escape untrusted strings before interpolating into slot HTML;
+- `volo.config.get(key)` / `volo.config.all()`: Read validated plugin configuration (including decrypted secrets inside the sandbox);
+- `volo.kv.get(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?)` / `volo.kv.list(prefix, limit?, afterKey?)`: Scoped KV storage with cursor pagination via `afterKey`;
+- `volo.http.fetch(url, options?)`: SSRF-guarded outbound HTTP client restricted to declared `http.outbound:<host>` / `allowed_hosts`;
+- `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`: Structured plugin diagnostics.
 
 ```javascript
-// Subscribe to post HTML post-processing hook
-volo.on("render.post_html", function (ctx) {
-  var hits = Number(volo.kv.get("rendered_count") || "0") + 1;
-  volo.kv.set("rendered_count", String(hits));
-  return ctx.html;
+// Subscribe to pre-Markdown and post-HTML hooks via volo.on(...)
+volo.on("render.pre_markdown", function (article) {
+  return {
+    content_md: article.content_md.replace(/\[toc\]/gi, "## Table of Contents\n")
+  };
 });
 
-// Render a dynamic UI slot
+volo.on("render.post_html", function (payload) {
+  volo.kv.incr("rendered_count", 1);
+  return { html: payload.html };
+});
+
+// Cursor pagination over plugin KV keys
+function listAllBadges() {
+  var out = [];
+  var cursor = "";
+  while (true) {
+    var batch = volo.kv.list("badge:", 100, cursor);
+    if (!batch || batch.length === 0) break;
+    out = out.concat(batch);
+    cursor = batch[batch.length - 1].key;
+    if (batch.length < 100) break;
+  }
+  return out;
+}
+
+// Render a dynamic UI slot safely with volo.escapeHTML
 function renderSlot(slotName, ctx) {
   if (slotName === "article.after_content") {
     var msg = volo.config.get("banner_text") || "Thanks for reading!";
-    return '<aside class="callout-box">' + volo.escapeHTML(msg) + "</aside>";
+    return '<aside class="callout-box">' + volo.escapeHTML(String(msg)) + "</aside>";
   }
   return "";
 }

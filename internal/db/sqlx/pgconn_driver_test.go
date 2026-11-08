@@ -57,6 +57,7 @@ func handleMockPGConn(conn net.Conn, row1ReadGate <-chan struct{}) {
 	backend.Send(&pgproto3.AuthenticationOk{})
 	backend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "16.0"})
 	backend.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
+	backend.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"})
 	backend.Send(&pgproto3.BackendKeyData{ProcessID: 1, SecretKey: []byte{0, 0, 0, 2}})
 	backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	if err := backend.Flush(); err != nil {

@@ -41,6 +41,8 @@ const (
 	MinPasswordLength = 6
 	// MaxPasswordLength is the maximum allowed password length in runes.
 	MaxPasswordLength = 128
+	// MaxLoginPasswordBytes caps raw login password length in bytes before KDF hashing.
+	MaxLoginPasswordBytes = 256
 )
 
 // ErrWeakPassword is returned when a password violates length rules.
@@ -80,6 +82,10 @@ func HashPassword(raw string) (string, error) {
 // and signals needsUpgrade=true so the caller silently upgrades the account to Argon2id on login.
 func VerifyPassword(raw string, passwordHash string, legacyHash string) (matched bool, needsUpgrade bool) {
 	if raw == "" {
+		return false, false
+	}
+	if len(raw) > MaxLoginPasswordBytes {
+		verifyDummyPassword("")
 		return false, false
 	}
 	if strings.TrimSpace(passwordHash) != "" {

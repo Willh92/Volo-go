@@ -329,11 +329,13 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 			}
 
 			if canView {
+				seq++
+				lockPrefix := "INNER" + strconv.Itoa(seq)
 				outLines = append(outLines, `<div class="volo-lock-block volo-lock-block--unlocked" data-lock-type="`+html.EscapeString(lockType)+`">`, "")
 				innerPrep := preprocessDirectives(strings.Join(innerLines, "\n"), opts)
 				for k, v := range innerPrep.replacements {
-					res.replacements["INNER"+strconv.Itoa(seq)+k] = v
-					innerPrep.markdown = strings.ReplaceAll(innerPrep.markdown, k, "INNER"+strconv.Itoa(seq)+k)
+					res.replacements[lockPrefix+k] = v
+					innerPrep.markdown = strings.ReplaceAll(innerPrep.markdown, k, lockPrefix+k)
 				}
 				if innerPrep.hasLock {
 					res.hasLock = true
@@ -655,6 +657,9 @@ func enhanceImages(htmlSrc string, lookupDims func(string) (int, int, bool), fir
 
 func isSafeImageSrc(src string) bool {
 	s := strings.TrimSpace(src)
+	if strings.HasPrefix(s, "//") || strings.HasPrefix(s, `/\`) {
+		return false
+	}
 	return strings.HasPrefix(s, "/") || strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
 }
 

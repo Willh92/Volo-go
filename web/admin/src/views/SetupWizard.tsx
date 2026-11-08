@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import {
   accentSig,
   apiFetch,
@@ -6,11 +6,14 @@ import {
   bootConfig,
   csrfTokenSig,
   currentUserSig,
+  effectiveDarkSig,
   showToast,
   themeModeSig,
+  toggleEffectiveTheme,
+  uploadWithProgress,
 } from "../api";
 import { BrandLogo } from "../components/BrandLogo";
-import { ConsoleSelect, LocalePopover, SwitchToggle, UploadButton } from "../components/UIControls";
+import { ConsoleSelect, LocalePopover, SwitchToggle, UploadButton, UploadProgressBar } from "../components/UIControls";
 import {
   availableLocalesSig,
   ensureLocaleLoaded,
@@ -31,9 +34,36 @@ const ACCENTS: Array<{ id: string; swatch: string }> = [
   { id: "rose", swatch: "#87525f" },
 ];
 
+const COMMON_TIMEZONES = [
+  "Asia/Shanghai",
+  "Asia/Taipei",
+  "Asia/Hong_Kong",
+  "Asia/Singapore",
+  "Asia/Tokyo",
+  "Asia/Seoul",
+  "UTC",
+  "Europe/London",
+  "Europe/Berlin",
+  "Europe/Paris",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "Australia/Sydney",
+];
+
 export function SetupWizard() {
   const initLoc = normalizeLocale(bootConfig.default_locale);
   const locales = availableLocalesSig.value;
+  const isDark = effectiveDarkSig.value;
+  const detectedTz = useMemo(() => {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
+    } catch {
+      return "Asia/Shanghai";
+    }
+  }, []);
+
   const [tab, setTab] = useState<"fresh" | "legacy">("fresh");
   const [driver, setDriver] = useState<string>("sqlite");
   const [dsn, setDsn] = useState<string>("");
@@ -44,13 +74,16 @@ export function SetupWizard() {
   const [siteTitle, setSiteTitle] = useState<string>(() => tFor(initLoc, "setup.default_site_title"));
   const [siteSubtitle, setSiteSubtitle] = useState<string>(() => tFor(initLoc, "setup.default_site_subtitle"));
   const [siteDesc] = useState<string>("");
-  const [timezone, setTimezone] = useState<string>("Asia/Shanghai");
+  const [timezone, setTimezone] = useState<string>(() => detectedTz || "Asia/Shanghai");
   const [accent, setAccent] = useState<string>(accentSig.value || "forest");
 
   const [username, setUsername] = useState<string>("");
   const [displayName, setDisplayName] = useState<string>(() => tFor(initLoc, "setup.default_display_name"));
   const [email, setEmail] = useState<string>("");
   const [password, setPassword] = useState<string>("");
+  const [confirmPassword, setConfirmPassword] = useState<string>("");
+  const [showPwd, setShowPwd] = useState<boolean>(false);
+  const [showLegPwd, setShowLegPwd] = useState<boolean>(false);
 
   // Legacy migration adjustment & URL replacement state
   const [oldSiteUrl, setOldSiteUrl] = useState<string>("");
@@ -64,8 +97,18 @@ export function SetupWizard() {
   const [legAdminPwd, setLegAdminPwd] = useState<string>("");
 
   const [busy, setBusy] = useState<boolean>(false);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const [uploadName, setUploadName] = useState<string>("");
   const [dryRun, setDryRun] = useState<boolean>(false);
   const [etlResult, setEtlResult] = useState<any>(null);
+
+  const tzOptions = useMemo(() => {
+    const set = new Set<string>(COMMON_TIMEZONES);
+    if (detectedTz) set.add(detectedTz);
+    if (timezone) set.add(timezone);
+    if (legTimezone) set.add(legTimezone);
+    return Array.from(set).map((tz) => ({ value: tz, label: tz }));
+  }, [detectedTz, timezone, legTimezone]);
 
   const syncLocalizedDefaults = (prev: LocaleCode, next: LocaleCode) => {
     setSiteTitle((cur) => (cur === tFor(prev, "setup.default_site_title") ? tFor(next, "setup.default_site_title") : cur));
@@ -114,6 +157,10 @@ export function SetupWizard() {
 
   const submitFresh = async (e: Event) => {
     e.preventDefault();
+    if (password !== confirmPassword) {
+      showToast(t("setup.pwd_mismatch"), "err");
+      return;
+    }
     setBusy(true);
     try {
       const res = await apiFetch<{ admin_path: string }>("/api/setup/complete", {
@@ -147,6 +194,8 @@ export function SetupWizard() {
 
   const handleLegacyUpload = async (file: File) => {
     setBusy(true);
+    setUploadName(file.name);
+    setUploadPct(0);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -164,10 +213,7 @@ export function SetupWizard() {
       if (legAdminPwd) fd.append("admin_password", legAdminPwd);
 
       const url = dryRun ? "/api/setup/import-legacy?dry_run=1" : "/api/setup/import-legacy";
-      const res = await apiFetch<any>(url, {
-        method: "POST",
-        body: fd,
-      });
+      const res = await uploadWithProgress<any>(url, fd, (pct) => setUploadPct(pct));
       setEtlResult(res.report || res);
       if (dryRun) {
         showToast(t("sys.import_dryrun_ok"), "ok");
@@ -184,6 +230,7 @@ export function SetupWizard() {
       showToast(err.message, "err");
     } finally {
       setBusy(false);
+      setUploadPct(null);
     }
   };
 
@@ -257,17 +304,37 @@ export function SetupWizard() {
               <div class="volo-help">{t("setup.subtitle")}</div>
             </div>
           </div>
-          <LocalePopover
-            value={localeSig.value}
-            locales={locales}
-            onChange={(nextRaw) => {
-              const prev = localeSig.value;
-              const next = normalizeLocale(nextRaw);
-              void ensureLocaleLoaded(next).then(() => {
-                syncLocalizedDefaults(prev, next);
-              });
-            }}
-          />
+          <div style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
+            <button
+              type="button"
+              class="volo-icon-btn"
+              title={`${t("shell.mode_title")}: ${isDark ? t("mode.light") : t("mode.dark")}`}
+              aria-label={t("shell.mode_title")}
+              onClick={() => toggleEffectiveTheme()}
+            >
+              {isDark ? (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                </svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="4.5" />
+                  <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+                </svg>
+              )}
+            </button>
+            <LocalePopover
+              value={localeSig.value}
+              locales={locales}
+              onChange={(nextRaw) => {
+                const prev = localeSig.value;
+                const next = normalizeLocale(nextRaw);
+                void ensureLocaleLoaded(next).then(() => {
+                  syncLocalizedDefaults(prev, next);
+                });
+              }}
+            />
+          </div>
         </div>
 
         <div class="volo-subtabs">
@@ -296,11 +363,10 @@ export function SetupWizard() {
               </div>
               <div class="volo-field">
                 <label>{t("setup.timezone")}</label>
-                <input
-                  class="volo-input"
-                  name="setup_tz_iana"
+                <ConsoleSelect
                   value={timezone}
-                  onInput={(e) => setTimezone((e.currentTarget as HTMLInputElement).value)}
+                  onChange={setTimezone}
+                  options={tzOptions}
                 />
               </div>
             </div>
@@ -343,7 +409,7 @@ export function SetupWizard() {
 
             <hr style={{ border: 0, borderTop: "1px solid var(--volo-line)", margin: "16px 0" }} />
             <div style={{ fontWeight: 650, marginBottom: "10px" }}>{t("setup.step3")}</div>
-            <div class="volo-grid-2">
+            <div class="volo-grid-3">
               <div class="volo-field">
                 <label>{t("setup.admin_username")}</label>
                 <input
@@ -368,8 +434,6 @@ export function SetupWizard() {
                   onInput={(e) => setDisplayName((e.currentTarget as HTMLInputElement).value)}
                 />
               </div>
-            </div>
-            <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("setup.admin_email")}</label>
                 <input
@@ -385,20 +449,64 @@ export function SetupWizard() {
                   onInput={(e) => setEmail((e.currentTarget as HTMLInputElement).value)}
                 />
               </div>
+            </div>
+            <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("setup.admin_password")}</label>
-                <input
-                  type="password"
-                  class="volo-input"
-                  name="setup_owner_new_pwd"
-                  autoComplete="new-password"
-                  data-lpignore="true"
-                  data-1p-ignore="true"
-                  required
-                  minLength={6}
-                  value={password}
-                  onInput={(e) => setPassword((e.currentTarget as HTMLInputElement).value)}
-                />
+                <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+                  <input
+                    type={(showPwd ? "text" : "password") as "password"}
+                    class="volo-input"
+                    style={{ paddingRight: "36px" }}
+                    name="setup_owner_new_pwd"
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    required
+                    minLength={6}
+                    value={password}
+                    onInput={(e) => setPassword((e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <button
+                    type="button"
+                    class="volo-auth-eye"
+                    tabIndex={-1}
+                    title={showPwd ? t("auth.hide_pwd") : t("auth.show_pwd")}
+                    aria-label={showPwd ? t("auth.hide_pwd") : t("auth.show_pwd")}
+                    onClick={() => setShowPwd((v) => !v)}
+                  >
+                    {showPwd ? (
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+                        <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                        <line x1="1" y1="1" x2="23" y2="23" />
+                      </svg>
+                    ) : (
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                        <circle cx="12" cy="12" r="3" />
+                      </svg>
+                    )}
+                  </button>
+                </div>
+              </div>
+              <div class="volo-field">
+                <label>{t("setup.confirm_password")}</label>
+                <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+                  <input
+                    type={(showPwd ? "text" : "password") as "password"}
+                    class="volo-input"
+                    style={{ paddingRight: "36px" }}
+                    name="setup_owner_confirm_pwd"
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    required
+                    minLength={6}
+                    value={confirmPassword}
+                    onInput={(e) => setConfirmPassword((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
               </div>
             </div>
             <div class="volo-form-actions">
@@ -476,12 +584,10 @@ export function SetupWizard() {
                 </div>
                 <div class="volo-field">
                   <label>{t("setup.timezone")}</label>
-                  <input
-                    class="volo-input"
-                    autoComplete="off"
+                  <ConsoleSelect
                     value={legTimezone}
-                    placeholder={timezone || "Asia/Shanghai"}
-                    onInput={(e) => setLegTimezone((e.currentTarget as HTMLInputElement).value)}
+                    onChange={setLegTimezone}
+                    options={[{ value: "", label: t("setup.leg_keep_ph") }, ...tzOptions]}
                   />
                 </div>
               </div>
@@ -517,17 +623,41 @@ export function SetupWizard() {
                 </div>
                 <div class="volo-field">
                   <label>{t("setup.leg_admin_pwd")}</label>
-                  <input
-                    type="password"
-                    class="volo-input"
-                    autoComplete="new-password"
-                    data-lpignore="true"
-                    data-1p-ignore="true"
-                    minLength={6}
-                    value={legAdminPwd}
-                    placeholder={t("setup.leg_keep_ph")}
-                    onInput={(e) => setLegAdminPwd((e.currentTarget as HTMLInputElement).value)}
-                  />
+                  <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+                    <input
+                      type={(showLegPwd ? "text" : "password") as "password"}
+                      class="volo-input"
+                      style={{ paddingRight: "36px" }}
+                      autoComplete="new-password"
+                      data-lpignore="true"
+                      data-1p-ignore="true"
+                      minLength={6}
+                      value={legAdminPwd}
+                      placeholder={t("setup.leg_keep_ph")}
+                      onInput={(e) => setLegAdminPwd((e.currentTarget as HTMLInputElement).value)}
+                    />
+                    <button
+                      type="button"
+                      class="volo-auth-eye"
+                      tabIndex={-1}
+                      title={showLegPwd ? t("auth.hide_pwd") : t("auth.show_pwd")}
+                      aria-label={showLegPwd ? t("auth.hide_pwd") : t("auth.show_pwd")}
+                      onClick={() => setShowLegPwd((v) => !v)}
+                    >
+                      {showLegPwd ? (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+                          <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                          <line x1="1" y1="1" x2="23" y2="23" />
+                        </svg>
+                      ) : (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                          <circle cx="12" cy="12" r="3" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -549,6 +679,7 @@ export function SetupWizard() {
               className="volo-w-full"
               onFile={(f) => void handleLegacyUpload(f)}
             />
+            <UploadProgressBar progress={uploadPct} label={uploadName} />
             {etlResult && (
               <pre class="volo-subcard" style={{ marginTop: "14px", fontSize: "12px", overflowX: "auto" }}>
                 {JSON.stringify(etlResult, null, 2)}
@@ -560,3 +691,4 @@ export function SetupWizard() {
     </div>
   );
 }
+

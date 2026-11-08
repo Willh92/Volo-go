@@ -13,6 +13,7 @@ import {
   currentUserSig,
   dirtyEditorSig,
   dismissToast,
+  effectiveDarkSig,
   openConfirm,
   pauseToast,
   refreshMe,
@@ -21,6 +22,7 @@ import {
   saveGlobalAccent,
   themeModeSig,
   toastSig,
+  toggleEffectiveTheme,
 } from "./api";
 import {
   availableLocalesSig,
@@ -319,7 +321,10 @@ function CommandPalette({
   const debouncedQ = useDebouncedValue(q, 250);
   const [idx, setIdx] = useState(0);
   const [posts, setPosts] = useState<Array<{ id: string; title: string; slug: string; status: string }>>([]);
+  const [searchedQ, setSearchedQ] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const isDark = effectiveDarkSig.value;
 
   useEffect(() => {
     if (!open) return;
@@ -330,8 +335,9 @@ function CommandPalette({
 
   useEffect(() => {
     if (!open) return;
+    const activeQ = debouncedQ.trim();
     const params = new URLSearchParams({ per_page: "50" });
-    if (debouncedQ.trim()) params.set("q", debouncedQ.trim());
+    if (activeQ) params.set("q", activeQ);
     apiFetch<{ items?: any[]; articles?: any[] }>(`/api/admin/articles?${params.toString()}`)
       .then((res) => {
         const raw = res.items || res.articles || [];
@@ -341,6 +347,7 @@ function CommandPalette({
             return { id: a.id, title: a.title || a.slug, slug: a.slug || "", status: a.status || "published" };
           })
         );
+        setSearchedQ(activeQ.toLowerCase());
       })
       .catch(() => {});
   }, [open, debouncedQ]);
@@ -369,9 +376,9 @@ function CommandPalette({
     }
     out.push({
       id: "act:theme",
-      title: `${t("shell.mode_title")}: ${themeModeSig.value === "dark" ? t("mode.light") : t("mode.dark")}`,
+      title: `${t("shell.mode_title")}: ${isDark ? t("mode.light") : t("mode.dark")}`,
       sub: t("shell.appearance_title"),
-      run: () => applyThemeAttributes(themeModeSig.value === "dark" ? "light" : "dark", accentSig.value, true),
+      run: () => toggleEffectiveTheme(),
     });
     out.push({
       id: "act:blog",
@@ -393,12 +400,23 @@ function CommandPalette({
     }
     const kw = q.trim().toLowerCase();
     if (!kw) return out.slice(0, 18);
-    return out.filter((it) => it.title.toLowerCase().includes(kw) || it.sub.toLowerCase().includes(kw)).slice(0, 24);
-  }, [q, isAdmin, posts, localeSig.value]);
+    return out
+      .filter((it) => {
+        if (it.id.startsWith("post:") && searchedQ === kw) return true;
+        return it.title.toLowerCase().includes(kw) || it.sub.toLowerCase().includes(kw);
+      })
+      .slice(0, 24);
+  }, [q, isAdmin, posts, searchedQ, isDark, localeSig.value]);
 
   useEffect(() => {
     setIdx(0);
   }, [q]);
+
+  useEffect(() => {
+    if (!open) return;
+    const activeEl = listRef.current?.querySelector(".volo-cmdk-item.active") as HTMLElement | null;
+    activeEl?.scrollIntoView({ block: "nearest" });
+  }, [idx, open]);
 
   return (
     <AnimatedModal
@@ -430,7 +448,7 @@ function CommandPalette({
           }}
         />
       </div>
-      <div class="volo-cmdk-list">
+      <div ref={listRef} class="volo-cmdk-list">
         {items.length === 0 ? (
           <div class="volo-empty-state">{t("tbl.empty")}</div>
         ) : (
@@ -473,6 +491,9 @@ function resolveHashSection(): NavSection {
 function App() {
   const [ready, setReady] = useState(bootConfig.mode === "setup");
   const [section, setSection] = useState<NavSection>(resolveHashSection);
+  const sectionRef = useRef<NavSection>(section);
+  sectionRef.current = section;
+  const ignoreHashRef = useRef<boolean>(false);
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
     const initial = resolveHashSection();
     const p = findParentGroup(initial);
@@ -496,6 +517,7 @@ function App() {
   const locales = availableLocalesSig.value;
   const user = currentUserSig.value;
   const curMode = themeModeSig.value;
+  const isDark = effectiveDarkSig.value;
   const curAccent = accentSig.value;
   const isBusy = busyCountSig.value > 0;
 
@@ -597,7 +619,34 @@ function App() {
 
   useEffect(() => {
     const onHashChange = () => {
+      if (ignoreHashRef.current) {
+        ignoreHashRef.current = false;
+        return;
+      }
       const next = resolveHashSection();
+      if (next === sectionRef.current) return;
+      if (dirtyEditorSig.value) {
+        const prevSec = sectionRef.current;
+        ignoreHashRef.current = true;
+        window.history.replaceState(null, "", `#${prevSec}`);
+        void openConfirm({
+          title: t("ui.unsaved_title"),
+          message: t("ui.unsaved_msg"),
+          confirmText: t("ui.unsaved_leave"),
+          danger: true,
+        }).then((ok) => {
+          if (!ok) return;
+          dirtyEditorSig.value = false;
+          setSection(next);
+          const parent = findParentGroup(next);
+          if (parent) {
+            setOpenGroups((prev) => ({ ...prev, [parent]: true }));
+          }
+          window.history.replaceState(null, "", `#${next}`);
+          resetConsoleScroll();
+        });
+        return;
+      }
       setSection(next);
       const parent = findParentGroup(next);
       if (parent) {
@@ -822,7 +871,7 @@ function App() {
                 aria-expanded={appearanceOpen && !appearanceClosing}
                 onClick={toggleAppearance}
               >
-                {curMode === "dark" ? (
+                {isDark ? (
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" />
                   </svg>

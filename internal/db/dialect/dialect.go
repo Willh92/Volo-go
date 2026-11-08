@@ -132,7 +132,8 @@ func (postgresDialect) Types() TypeMap {
 }
 
 // Rebind rewrites ? placeholders to PostgreSQL $1, $2, ... while safely skipping
-// single-quoted string literals ('...') and double-quoted identifiers ("...").
+// single-line comments (--...\n), nested block comments (/*...*/), single-quoted string
+// literals ('...'), double-quoted identifiers ("..."), and dollar-quoted literals ($tag$...$tag$).
 func (postgresDialect) Rebind(query string) string {
 	if strings.IndexByte(query, '?') < 0 {
 		return query
@@ -146,50 +147,118 @@ func (postgresDialect) Rebind(query string) string {
 	b.Grow(len(query) + 16)
 
 	argIdx := 1
-	inSingle := false
-	inDouble := false
-
 	for i := 0; i < len(query); i++ {
 		ch := query[i]
-		if inSingle {
-			b.WriteByte(ch)
-			if ch == '\'' {
-				if i+1 < len(query) && query[i+1] == '\'' {
-					b.WriteByte('\'')
-					i++
-				} else {
-					inSingle = false
+
+		// 1. Single-line comment: -- ... \n
+		if ch == '-' && i+1 < len(query) && query[i+1] == '-' {
+			nl := strings.IndexByte(query[i:], '\n')
+			if nl < 0 {
+				b.WriteString(query[i:])
+				break
+			}
+			b.WriteString(query[i : i+nl+1])
+			i += nl
+			continue
+		}
+
+		// 2. Block comment (supports PostgreSQL nested /* ... */ comments)
+		if ch == '/' && i+1 < len(query) && query[i+1] == '*' {
+			depth := 1
+			b.WriteString("/*")
+			i += 2
+			for i < len(query) && depth > 0 {
+				if i+1 < len(query) && query[i] == '/' && query[i+1] == '*' {
+					depth++
+					b.WriteString("/*")
+					i += 2
+					continue
 				}
+				if i+1 < len(query) && query[i] == '*' && query[i+1] == '/' {
+					depth--
+					b.WriteString("*/")
+					i += 2
+					continue
+				}
+				b.WriteByte(query[i])
+				i++
+			}
+			i--
+			continue
+		}
+
+		// 3. Single-quoted literal: '...' (with '' escapes, plus E'...' backslash escapes)
+		if ch == '\'' {
+			isEscapeStr := i > 0 && (query[i-1] == 'E' || query[i-1] == 'e') &&
+				(i == 1 || !isSQLIdentByte(query[i-2]))
+			b.WriteByte('\'')
+			i++
+			for i < len(query) {
+				c := query[i]
+				b.WriteByte(c)
+				if isEscapeStr && c == '\\' && i+1 < len(query) {
+					i++
+					b.WriteByte(query[i])
+					i++
+					continue
+				}
+				if c == '\'' {
+					if i+1 < len(query) && query[i+1] == '\'' {
+						b.WriteByte('\'')
+						i += 2
+						continue
+					}
+					break
+				}
+				i++
 			}
 			continue
 		}
-		if inDouble {
-			b.WriteByte(ch)
-			if ch == '"' {
-				if i+1 < len(query) && query[i+1] == '"' {
-					b.WriteByte('"')
-					i++
-				} else {
-					inDouble = false
+
+		// 4. Double-quoted identifier: "..."
+		if ch == '"' {
+			b.WriteByte('"')
+			i++
+			for i < len(query) {
+				c := query[i]
+				b.WriteByte(c)
+				if c == '"' {
+					if i+1 < len(query) && query[i+1] == '"' {
+						b.WriteByte('"')
+						i += 2
+						continue
+					}
+					break
 				}
+				i++
 			}
 			continue
 		}
-		switch ch {
-		case '\'':
-			inSingle = true
-			b.WriteByte(ch)
-		case '"':
-			inDouble = true
-			b.WriteByte(ch)
-		case '?':
+
+		// 5. PostgreSQL dollar-quoted string literal: $$...$$ or $tag$...$tag$
+		if ch == '$' {
+			if tag, ok := matchPGDollarQuoteTag(query[i:]); ok {
+				endRel := strings.Index(query[i+len(tag):], tag)
+				if endRel < 0 {
+					b.WriteString(query[i:])
+					break
+				}
+				totalLen := len(tag) + endRel + len(tag)
+				b.WriteString(query[i : i+totalLen])
+				i += totalLen - 1
+				continue
+			}
+		}
+
+		if ch == '?' {
 			b.WriteByte('$')
 			b.WriteString(strconv.Itoa(argIdx))
 			argIdx++
-		default:
+		} else {
 			b.WriteByte(ch)
 		}
 	}
+
 	out := b.String()
 	if len(query) <= 4096 && pgRebindCount.Load() < maxPGRebindCacheEntries {
 		if _, loaded := pgRebindCache.LoadOrStore(query, out); !loaded {
@@ -197,6 +266,34 @@ func (postgresDialect) Rebind(query string) string {
 		}
 	}
 	return out
+}
+
+func isSQLIdentByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b >= 0x80
+}
+
+func matchPGDollarQuoteTag(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '$' {
+		return "", false
+	}
+	if s[1] == '$' {
+		return "$$", true
+	}
+	// Tag cannot start with an ASCII digit (otherwise $1 is a positional parameter).
+	first := s[1]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_' || first >= 0x80) {
+		return "", false
+	}
+	for j := 2; j < len(s); j++ {
+		c := s[j]
+		if c == '$' {
+			return s[:j+1], true
+		}
+		if !isSQLIdentByte(c) {
+			return "", false
+		}
+	}
+	return "", false
 }
 
 func (d postgresDialect) UpsertSQL(table string, cols []string, conflictCols []string, updateCols []string) string {

@@ -342,7 +342,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		OutboundDialer: outboundDialer,
 		Plugins:        pluginMgr,
 	})
-	pluginMgr.Providers().RegisterStorage("builtin-media", mediaPipe)
+	pluginMgr.Providers().SetDefaults(mediaPipe, nil)
 
 	notifier := notify.NewDispatcher(notify.DispatcherOptions{
 		Store:          store,
@@ -403,10 +403,11 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	// Background rolling local + S3/WebDAV backup scheduler
+	// Background rolling local + S3/WebDAV/plugin backup scheduler
 	backupSched := backup.NewScheduler(backup.SchedulerOptions{
 		Store:          store,
 		Settings:       settingsMgr,
+		Plugins:        pluginMgr,
 		BackupDir:      cfg.BackupDir,
 		UploadDir:      cfg.UploadDir,
 		OutboundDialer: outboundDialer,

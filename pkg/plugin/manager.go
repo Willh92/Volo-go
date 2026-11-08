@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
@@ -98,6 +100,7 @@ type ArticleHookPayload struct {
 	Title               string `json:"title"`
 	Slug                string `json:"slug"`
 	Lang                string `json:"lang"`
+	Status              string `json:"status,omitempty"`
 	SummaryMD           string `json:"summary_md"`
 	ContentMD           string `json:"content_md"`
 	HTML                string `json:"html,omitempty"`
@@ -106,6 +109,23 @@ type ArticleHookPayload struct {
 	IsPasswordProtected bool   `json:"is_password_protected"`
 	HasContentLock      bool   `json:"has_content_lock"`
 	OmittedProtected    bool   `json:"omitted_protected,omitempty"`
+}
+
+// PageHookPayload carries standalone page lifecycle event data to plugin hooks.
+type PageHookPayload struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Slug     string `json:"slug"`
+	Template string `json:"template,omitempty"`
+	Status   string `json:"status,omitempty"`
+}
+
+// CommentModeratedHookPayload carries comment moderation status transitions to plugin hooks.
+type CommentModeratedHookPayload struct {
+	ID         string `json:"id"`
+	TargetType string `json:"target_type"`
+	TargetID   string `json:"target_id"`
+	Status     string `json:"status"`
 }
 
 // BuiltinPlugin is implemented by compiled-in Go plugins (zero goja overhead).
@@ -453,6 +473,84 @@ func (m *Manager) DiscoverAndStart(ctx context.Context) error {
 	return nil
 }
 
+// ReloadAll synchronizes every already-registered plugin with the database (e.g. after full-site DB restore),
+// stops runtimes that became disabled, re-activates enabled plugins with updated config, and discovers any new plugins on disk.
+func (m *Manager) ReloadAll(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.plugins))
+	for id := range m.plugins {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+	sort.Strings(ids)
+
+	for _, pid := range ids {
+		existing, ok := m.getPlugin(pid)
+		if !ok {
+			continue
+		}
+		m.deactivateRuntime(ctx, existing)
+		synced, err := m.syncRecordWithDB(ctx, existing.manifest, existing.kind, existing.pluginDir, existing.builtin)
+		if err != nil {
+			m.logger.Write(pid, "error", "reload_all", err.Error())
+			continue
+		}
+		existing.mu.Lock()
+		existing.enabled = synced.enabled
+		existing.circuitState = synced.circuitState
+		existing.failureCount = synced.failureCount
+		existing.lastError = synced.lastError
+		existing.installedAt = synced.installedAt
+		existing.updatedAt = synced.updatedAt
+		existing.publicConfig = synced.publicConfig
+		existing.secretConfig = synced.secretConfig
+		existing.rebuildConfigSnapshot()
+		shouldActivate := existing.enabled && existing.circuitState == CircuitClosed
+		existing.mu.Unlock()
+		if shouldActivate {
+			if aErr := m.activateRuntime(ctx, existing); aErr != nil {
+				m.recordFailure(ctx, existing, "reload_all", aErr)
+			}
+		}
+	}
+	return m.DiscoverAndStart(ctx)
+}
+
+// ClearPluginKV deletes all key-value entries stored by pluginID in plugin_kv without bumping content dataRev.
+func (m *Manager) ClearPluginKV(ctx context.Context, pluginID string) (int64, error) {
+	if m == nil || m.store == nil {
+		return 0, errors.New("plugin: store unavailable")
+	}
+	idClean := strings.TrimSpace(pluginID)
+	if !validPluginIDRe.MatchString(idClean) {
+		return 0, fmt.Errorf("plugin: invalid plugin id %q", pluginID)
+	}
+	if _, ok := m.getPlugin(idClean); !ok {
+		return 0, fmt.Errorf("plugin %q not found", idClean)
+	}
+	res, err := m.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, idClean)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// HasPermission reports whether pluginID is registered and declares perm in its manifest.
+func (m *Manager) HasPermission(pluginID string, perm string) bool {
+	if m == nil {
+		return false
+	}
+	mp, ok := m.getPlugin(strings.TrimSpace(pluginID))
+	if !ok {
+		return false
+	}
+	return mp.manifest.HasPermission(perm)
+}
+
 // ReloadPlugin cleanly stops an existing plugin runtime (including cron tickers and providers),
 // re-reads its manifest and JS source from disk (for external plugins), and reactivates it if enabled.
 func (m *Manager) ReloadPlugin(ctx context.Context, pluginID string, locale string) (PluginSummary, error) {
@@ -734,6 +832,10 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 				manager: m,
 				mp:      mp,
 			})
+		}
+		if mp.manifest.HasPermission("provider:oidc") && rt.hasCallable("oidcAuthURL") && rt.hasCallable("oidcExchange") {
+			adapter := newGojaOIDCAdapter(ctx, m, mp, rt)
+			m.providers.RegisterOIDC(mp.manifest.ID, adapter)
 		}
 	}
 
@@ -1231,7 +1333,7 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 			mp.builtin.AllowProtectedArticles() && mp.manifest.HasPermission("articles:read_protected")
 
 		// 10th Privacy Surface Redaction: untrusted / external plugins NEVER receive protected plaintext!
-		if !trustedProtected && cur.IsPasswordProtected && hookName == HookRenderPostHTML {
+		if !trustedProtected && cur.IsPasswordProtected && (hookName == HookRenderPostHTML || hookName == HookRenderPreMarkdown) {
 			continue
 		}
 		safePayload := RedactArticleForPlugin(cur, trustedProtected)
@@ -1243,6 +1345,22 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 		}
 		if invoked {
 			m.recordSuccess(ctx, mp)
+		}
+		if hookName == HookRenderPreMarkdown && !cur.IsPasswordProtected && !cur.HasContentLock {
+			switch out := res.(type) {
+			case map[string]any:
+				if nextMD, sOk := out["content_md"].(string); sOk && nextMD != "" {
+					cur.ContentMD = nextMD
+				}
+			case ArticleHookPayload:
+				if out.ContentMD != "" {
+					cur.ContentMD = out.ContentMD
+				}
+			case string:
+				if out != "" {
+					cur.ContentMD = out
+				}
+			}
 		}
 		if hookName == HookRenderPostHTML && !cur.IsPasswordProtected && !cur.HasContentLock {
 			if outMap, ok := res.(map[string]any); ok {
@@ -1324,12 +1442,18 @@ func (m *Manager) invokeHook(ctx context.Context, mp *managedPlugin, hookName st
 	return nil, false, nil
 }
 
+// RenderDashboardCards renders and strictly sanitizes `admin.dashboard_card` slots across enabled plugins.
+func (m *Manager) RenderDashboardCards(ctx context.Context, slotCtx SlotRenderContext) []RenderedSlot {
+	return m.RenderSlots(ctx, SlotAdminDashboardCard, slotCtx)
+}
+
 // RenderSlots collects rendered HTML/asset fragments for slotName across all enabled plugins.
 // Persistent slots (Persist=true) are automatically wrapped with `data-volo-persist="<plugin_id>"`
 // for zero-coupled PJAX survival in volo-studio.
 func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx SlotRenderContext) []RenderedSlot {
 	active := m.snapshotEnabledPlugins()
 	var out []RenderedSlot
+	isAdminCard := slotName == SlotAdminDashboardCard
 
 	for _, mp := range active {
 		for _, spec := range mp.manifest.UISlots {
@@ -1340,12 +1464,13 @@ func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx Slot
 			verEsc := html.EscapeString(mp.manifest.Version)
 			idEsc := html.EscapeString(mp.manifest.ID)
 
-			if spec.StyleAsset != "" {
+			if spec.StyleAsset != "" && !isAdminCard {
 				fmt.Fprintf(&buf, `<link rel="stylesheet" href="/plugins/%s/assets/%s?v=%s" data-volo-plugin="%s">`,
 					idEsc, html.EscapeString(spec.StyleAsset), verEsc, idEsc)
 			}
+			var bodyBuf strings.Builder
 			if spec.HTML != "" {
-				buf.WriteString(spec.HTML)
+				bodyBuf.WriteString(spec.HTML)
 			}
 			if spec.Dynamic {
 				dynHTML, invoked, err := m.invokeSlot(ctx, mp, slotName, slotCtx)
@@ -1356,24 +1481,29 @@ func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx Slot
 				if invoked {
 					m.recordSuccess(ctx, mp)
 				}
-				buf.WriteString(dynHTML)
+				bodyBuf.WriteString(dynHTML)
 			}
-			if spec.ScriptAsset != "" {
-				fmt.Fprintf(&buf, `<script defer src="/plugins/%s/assets/%s?v=%s" data-volo-plugin="%s"></script>`,
-					idEsc, html.EscapeString(spec.ScriptAsset), verEsc, idEsc)
+			if isAdminCard {
+				buf.WriteString(render.Default().SanitizeHTML(bodyBuf.String()))
+			} else {
+				buf.WriteString(bodyBuf.String())
+				if spec.ScriptAsset != "" {
+					fmt.Fprintf(&buf, `<script defer src="/plugins/%s/assets/%s?v=%s" data-volo-plugin="%s"></script>`,
+						idEsc, html.EscapeString(spec.ScriptAsset), verEsc, idEsc)
+				}
 			}
 
 			fragment := buf.String()
-			if fragment == "" {
+			if strings.TrimSpace(fragment) == "" {
 				continue
 			}
-			if spec.Persist {
+			if spec.Persist && !isAdminCard {
 				fragment = fmt.Sprintf(`<div data-volo-persist="%s" data-volo-plugin="%s">%s</div>`, idEsc, idEsc, fragment)
 			}
 			out = append(out, RenderedSlot{
 				PluginID: mp.manifest.ID,
 				Slot:     slotName,
-				Persist:  spec.Persist,
+				Persist:  spec.Persist && !isAdminCard,
 				HTML:     fragment,
 			})
 		}
@@ -1439,17 +1569,35 @@ func (m *Manager) invokeDynamicQuickInserts(mp *managedPlugin, locale string) []
 	mp.mu.Lock()
 	enabled := mp.enabled && mp.circuitState == CircuitClosed
 	rt := mp.gojaRT
+	bp := mp.builtin
+	runtimeKind := mp.manifest.Runtime
 	mp.mu.Unlock()
-	if !enabled || rt == nil {
+	if !enabled {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), m.hookTimeout)
 	defer cancel()
 
-	res, found, err := rt.invoke(ctx, m.hookTimeout, "editorQuickInserts", locale)
-	if !found && err == nil {
-		res, found, err = rt.invoke(ctx, m.hookTimeout, "renderSlot", SlotEditorQuickInsert, SlotRenderContext{Locale: locale})
+	var (
+		res   any
+		found bool
+		err   error
+	)
+	if runtimeKind == RuntimeBuiltin && bp != nil {
+		rawStr, bErr := bp.RenderSlot(ctx, SlotEditorQuickInsert, SlotRenderContext{Locale: locale})
+		err = bErr
+		if err == nil && strings.TrimSpace(rawStr) != "" {
+			res = rawStr
+			found = true
+		}
+	} else if rt != nil {
+		res, found, err = rt.invoke(ctx, m.hookTimeout, "editorQuickInserts", locale)
+		if !found && err == nil {
+			res, found, err = rt.invoke(ctx, m.hookTimeout, "renderSlot", SlotEditorQuickInsert, SlotRenderContext{Locale: locale})
+		}
+	} else {
+		return nil
 	}
 	if err != nil {
 		m.recordFailure(ctx, mp, "slot:"+SlotEditorQuickInsert, err)
@@ -1574,6 +1722,23 @@ func (m *Manager) servePluginAPI(w http.ResponseWriter, r *http.Request, mp *man
 	for _, allowedHdr := range []string{"Accept", "Content-Type", "Accept-Language", "User-Agent"} {
 		if v := r.Header.Get(allowedHdr); v != "" {
 			hdrMap[strings.ToLower(allowedHdr)] = v
+		}
+	}
+	if mp.manifest.HasPermission("http:raw_headers") || mp.manifest.HasPermission("raw_headers") {
+		for _, sigHdr := range []string{
+			"X-Hub-Signature-256",
+			"X-Hub-Signature",
+			"X-Signature",
+			"X-Webhook-Signature",
+			"Stripe-Signature",
+			"Authorization",
+			"User-Agent",
+			"X-GitHub-Event",
+			"X-GitHub-Delivery",
+		} {
+			if v := r.Header.Get(sigHdr); v != "" {
+				hdrMap[strings.ToLower(sigHdr)] = v
+			}
 		}
 	}
 	locale := "zh-CN"
@@ -1782,7 +1947,7 @@ func (m *Manager) recordFailureWithOrigin(ctx context.Context, mp *managedPlugin
 		m.logger.Write(mp.manifest.ID, "error", "circuit", fmt.Sprintf("CIRCUIT_OPEN after %d consecutive failures; plugin auto-disabled", count))
 	}
 
-	_, _ = m.store.ExecContext(
+	_, _ = m.store.ExecBgContext(
 		ctx,
 		`UPDATE plugins SET is_enabled = ?, circuit_state = ?, failure_count = ?, last_error = ?, updated_at = ? WHERE id = ?`,
 		enabled, state, count, errMsg, now, mp.manifest.ID,
@@ -1801,7 +1966,7 @@ func (m *Manager) recordSuccess(ctx context.Context, mp *managedPlugin) {
 	now := mp.updatedAt
 	mp.mu.Unlock()
 
-	_, _ = m.store.ExecContext(
+	_, _ = m.store.ExecBgContext(
 		ctx,
 		`UPDATE plugins SET failure_count = 0, last_error = '', updated_at = ? WHERE id = ?`,
 		now, mp.manifest.ID,
@@ -1864,6 +2029,189 @@ func (m *Manager) snapshotEnabledPlugins() []*managedPlugin {
 		return out[i].manifest.ID < out[j].manifest.ID
 	})
 	return out
+}
+
+type gojaOIDCAdapter struct {
+	manager      *Manager
+	mp           *managedPlugin
+	provName     string
+	displayNames map[string]string
+}
+
+func newGojaOIDCAdapter(ctx context.Context, m *Manager, mp *managedPlugin, rt *gojaPluginRuntime) *gojaOIDCAdapter {
+	provName := mp.manifest.ID
+	displayNames := make(map[string]string, len(mp.manifest.Name))
+	for k, v := range mp.manifest.Name {
+		displayNames[k] = v
+	}
+	if rt != nil && rt.hasCallable("oidcProviderInfo") {
+		if raw, found, err := rt.invoke(ctx, m.hookTimeout, "oidcProviderInfo"); err == nil && found && raw != nil {
+			if info, ok := raw.(map[string]any); ok {
+				for _, key := range []string{"id", "provider", "name"} {
+					if s, sOk := info[key].(string); sOk {
+						cand := strings.ToLower(strings.TrimSpace(s))
+						if validPluginIDRe.MatchString(cand) {
+							provName = cand
+							break
+						}
+					}
+				}
+				dnRaw := info["display_name"]
+				if dnRaw == nil {
+					dnRaw = info["label"]
+				}
+				if dnRaw == nil && (info["id"] != nil || info["provider"] != nil) {
+					dnRaw = info["name"]
+				}
+				switch dn := dnRaw.(type) {
+				case string:
+					if strings.TrimSpace(dn) != "" {
+						displayNames = map[string]string{"en-US": strings.TrimSpace(dn), "zh-CN": strings.TrimSpace(dn)}
+					}
+				case map[string]any:
+					custom := make(map[string]string, len(dn))
+					for k, v := range dn {
+						if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+							custom[k] = s
+						}
+					}
+					if len(custom) > 0 {
+						displayNames = custom
+					}
+				}
+			}
+		}
+	}
+	return &gojaOIDCAdapter{
+		manager:      m,
+		mp:           mp,
+		provName:     provName,
+		displayNames: displayNames,
+	}
+}
+
+func (a *gojaOIDCAdapter) Name() string { return a.provName }
+
+func (a *gojaOIDCAdapter) DisplayName(locale string) string {
+	if lbl := ResolveLocalized(a.displayNames, locale); lbl != "" {
+		return lbl
+	}
+	if lbl := ResolveLocalized(a.mp.manifest.Name, locale); lbl != "" {
+		return lbl
+	}
+	return a.provName
+}
+
+func (a *gojaOIDCAdapter) AuthCodeURL(state string, redirectURI string) (string, error) {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return "", errors.New("plugin oidc provider inactive")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), a.manager.routeTimeout)
+	defer cancel()
+
+	res, found, err := rt.invoke(ctx, a.manager.routeTimeout, "oidcAuthURL", state, redirectURI)
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:oidc:auth_url", err)
+		return "", err
+	}
+	if !found {
+		return "", errors.New("oidcAuthURL function not exported")
+	}
+	a.manager.recordSuccess(ctx, a.mp)
+
+	rawURL := ""
+	switch v := res.(type) {
+	case string:
+		rawURL = strings.TrimSpace(v)
+	case map[string]any:
+		if u, ok := v["url"].(string); ok {
+			rawURL = strings.TrimSpace(u)
+		}
+	}
+	uParsed, uErr := url.Parse(rawURL)
+	if rawURL == "" || uErr != nil || (uParsed.Scheme != "https" && uParsed.Scheme != "http") || uParsed.Host == "" {
+		return "", errors.New("oidcAuthURL must return a valid http/https authorization URL")
+	}
+	return rawURL, nil
+}
+
+func (a *gojaOIDCAdapter) Exchange(ctx context.Context, code string, redirectURI string) (OIDCIdentity, error) {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return OIDCIdentity{}, errors.New("plugin oidc provider inactive")
+	}
+	timeout := a.manager.routeTimeout
+	if timeout < 8*time.Second {
+		timeout = 8 * time.Second
+	}
+	res, found, err := rt.invoke(ctx, timeout, "oidcExchange", code, redirectURI)
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:oidc:exchange", err)
+		return OIDCIdentity{}, err
+	}
+	if !found {
+		return OIDCIdentity{}, errors.New("oidcExchange function not exported")
+	}
+	a.manager.recordSuccess(ctx, a.mp)
+
+	m, ok := res.(map[string]any)
+	if !ok {
+		return OIDCIdentity{}, errors.New("oidcExchange must return an identity object")
+	}
+	sub := ""
+	for _, k := range []string{"subject", "sub", "id"} {
+		if s, sOk := m[k].(string); sOk && strings.TrimSpace(s) != "" {
+			sub = strings.TrimSpace(s)
+			break
+		}
+	}
+	if sub == "" {
+		return OIDCIdentity{}, errors.New("oidcExchange returned empty subject")
+	}
+	prov := a.Name()
+	if pStr, sOk := m["provider"].(string); sOk && strings.TrimSpace(pStr) != "" {
+		prov = strings.TrimSpace(pStr)
+	}
+	email, _ := m["email"].(string)
+	email = strings.ToLower(strings.TrimSpace(email))
+
+	disp := ""
+	for _, k := range []string{"display_name", "name", "preferred_username"} {
+		if s, sOk := m[k].(string); sOk && strings.TrimSpace(s) != "" {
+			disp = strings.TrimSpace(s)
+			break
+		}
+	}
+	avatar := ""
+	for _, k := range []string{"avatar_url", "picture"} {
+		if s, sOk := m[k].(string); sOk && strings.TrimSpace(s) != "" {
+			cand := strings.TrimSpace(stripASCIIControlsString(s))
+			if strings.HasPrefix(cand, "/") && !strings.HasPrefix(cand, "//") && !strings.HasPrefix(cand, "/\\") {
+				avatar = cand
+				break
+			}
+			if u, uErr := url.Parse(cand); uErr == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" {
+				avatar = cand
+				break
+			}
+		}
+	}
+	return OIDCIdentity{
+		Provider:    prov,
+		Subject:     sub,
+		Email:       email,
+		DisplayName: disp,
+		AvatarURL:   avatar,
+	}, nil
 }
 
 type gojaAntiSpamAdapter struct {

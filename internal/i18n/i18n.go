@@ -2,6 +2,8 @@ package i18n
 
 import (
 	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -19,7 +21,7 @@ import (
 	"sync"
 )
 
-//go:embed builtin/*.json
+//go:embed builtin_gz/*.gz
 var builtinFS embed.FS
 
 var validLocaleCodeRe = regexp.MustCompile(`^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8}){0,2}$`)
@@ -100,19 +102,28 @@ func (c *Catalog) Reload(externalDir string) error {
 	customMap := make(map[string]map[string]string)
 	codeSet := make(map[string]struct{})
 
-	entries, err := fs.ReadDir(builtinFS, "builtin")
+	entries, err := fs.ReadDir(builtinFS, "builtin_gz")
 	if err != nil {
-		return fmt.Errorf("i18n: read builtin dir: %w", err)
+		return fmt.Errorf("i18n: read builtin_gz dir: %w", err)
 	}
 	for _, ent := range entries {
-		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json.gz") {
 			continue
 		}
-		raw, err := builtinFS.ReadFile("builtin/" + ent.Name())
+		gzRaw, err := builtinFS.ReadFile("builtin_gz/" + ent.Name())
 		if err != nil {
 			return fmt.Errorf("i18n: read builtin %s: %w", ent.Name(), err)
 		}
-		code := NormalizeLocale(strings.TrimSuffix(ent.Name(), ".json"))
+		gr, err := gzip.NewReader(bytes.NewReader(gzRaw))
+		if err != nil {
+			return fmt.Errorf("i18n: gunzip builtin %s: %w", ent.Name(), err)
+		}
+		raw, err := io.ReadAll(gr)
+		_ = gr.Close()
+		if err != nil {
+			return fmt.Errorf("i18n: inflate builtin %s: %w", ent.Name(), err)
+		}
+		code := NormalizeLocale(strings.TrimSuffix(ent.Name(), ".json.gz"))
 		resolvedCode, err := mergeLocaleParsedOnce(builtinMap, code, raw)
 		if err != nil {
 			return fmt.Errorf("i18n: parse builtin %s: %w", ent.Name(), err)

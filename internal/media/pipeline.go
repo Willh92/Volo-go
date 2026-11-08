@@ -12,6 +12,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,9 +32,11 @@ import (
 )
 
 const (
-	maxImagePixels    = 24_000_000 // 24 Megapixel decompression-bomb ceiling
-	maxGIFTotalPixels = 32_000_000 // 32 Megapixel animated GIF multi-frame ceiling
-	maxImageDimension = 16384
+	maxImagePixels      = 24_000_000 // 24 Megapixel decompression-bomb ceiling
+	maxGIFTotalPixels   = 32_000_000 // 32 Megapixel animated GIF multi-frame ceiling
+	maxGIFFrames        = 400        // Maximum frames permitted in an uploaded GIF
+	maxImageDimension   = 16384
+	maxImageUploadBytes = 25 << 20 // 25 MiB in-memory cap for raster image uploads
 )
 
 var transcodeSem = make(chan struct{}, 2)
@@ -177,7 +180,11 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 	now := time.Now().UTC()
 
 	if kind == mediaKindImage {
-		raw, rErr := readBounded(fullReader, maxBytes)
+		imgMaxBytes := maxBytes
+		if imgMaxBytes > maxImageUploadBytes {
+			imgMaxBytes = maxImageUploadBytes
+		}
+		raw, rErr := readBounded(fullReader, imgMaxBytes)
 		if rErr != nil {
 			return nil, rErr
 		}
@@ -201,13 +208,16 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 				return fmt.Errorf("image dimensions %dx%d exceed 24MP decompression safety limit", cfg.Width, cfg.Height)
 			}
 
-			// Multi-frame animated GIFs: preserve animation if clean and bounded by total frame pixels
+			// Multi-frame animated GIFs: pre-scan stream frame/pixel bounds in O(len(raw)) with zero image allocations BEFORE gif.DecodeAll!
 			isAnimatedGIF := false
 			if formatName == "gif" {
+				if err := inspectGIFStreamLimits(raw); err != nil {
+					return err
+				}
 				if g, gErr := gif.DecodeAll(bytes.NewReader(raw)); gErr == nil && len(g.Image) > 1 {
 					totalGIFPixels := int64(cfg.Width) * int64(cfg.Height) * int64(len(g.Image))
-					if totalGIFPixels > maxGIFTotalPixels {
-						return fmt.Errorf("animated GIF frame budget (%d pixels across %d frames) exceeds 32MP safety limit", totalGIFPixels, len(g.Image))
+					if totalGIFPixels > maxGIFTotalPixels*2 {
+						return fmt.Errorf("animated GIF frame budget (%d pixels across %d frames) exceeds safety limit", totalGIFPixels, len(g.Image))
 					}
 					isAnimatedGIF = true
 					raw = nil
@@ -460,6 +470,123 @@ func (p *Pipeline) TestStorage(ctx context.Context, override *domain.StorageSett
 	}
 }
 
+// inspectGIFStreamLimits parses GIF87a/GIF89a headers, extensions, and image descriptors in O(len(raw))
+// with zero image allocations to reject decompression bombs before gif.DecodeAll allocates frame buffers.
+func inspectGIFStreamLimits(raw []byte) error {
+	if len(raw) < 13 {
+		return errors.New("corrupt GIF stream: truncated header")
+	}
+	hdr := string(raw[:6])
+	if hdr != "GIF87a" && hdr != "GIF89a" {
+		return errors.New("corrupt GIF stream: invalid signature")
+	}
+	canvasW := int(raw[6]) | int(raw[7])<<8
+	canvasH := int(raw[8]) | int(raw[9])<<8
+	if canvasW <= 0 || canvasH <= 0 || canvasW > maxImageDimension || canvasH > maxImageDimension ||
+		int64(canvasW)*int64(canvasH) > maxImagePixels {
+		return fmt.Errorf("GIF canvas dimensions %dx%d exceed decompression safety limit", canvasW, canvasH)
+	}
+	packed := raw[10]
+	pos := 13
+	if packed&0x80 != 0 {
+		gctBytes := 3 * (1 << ((packed & 0x07) + 1))
+		if pos+gctBytes > len(raw) {
+			return errors.New("corrupt GIF stream: truncated global color table")
+		}
+		pos += gctBytes
+	}
+
+	var (
+		frames         int
+		totalSubPixels int64
+	)
+	canvasPixels := int64(canvasW) * int64(canvasH)
+
+	for pos < len(raw) {
+		block := raw[pos]
+		pos++
+		if block == 0x3B { // Trailer
+			break
+		}
+		switch block {
+		case 0x21: // Extension block (0x21 + label + sub-blocks terminated by 0x00)
+			if pos >= len(raw) {
+				return errors.New("corrupt GIF stream: truncated extension header")
+			}
+			pos++ // skip extension label
+			for {
+				if pos >= len(raw) {
+					return errors.New("corrupt GIF stream: truncated extension sub-block")
+				}
+				subLen := int(raw[pos])
+				pos++
+				if subLen == 0 {
+					break
+				}
+				if pos+subLen > len(raw) {
+					return errors.New("corrupt GIF stream: truncated extension payload")
+				}
+				pos += subLen
+			}
+		case 0x2C: // Image Descriptor (9 bytes + optional LCT + LZW min code size + data sub-blocks)
+			if pos+9 > len(raw) {
+				return errors.New("corrupt GIF stream: truncated image descriptor")
+			}
+			subW := int(raw[pos+4]) | int(raw[pos+5])<<8
+			subH := int(raw[pos+6]) | int(raw[pos+7])<<8
+			imgPacked := raw[pos+8]
+			pos += 9
+
+			if subW <= 0 || subH <= 0 || subW > maxImageDimension || subH > maxImageDimension {
+				return fmt.Errorf("GIF frame dimensions %dx%d exceed safety limit", subW, subH)
+			}
+			frames++
+			if frames > maxGIFFrames {
+				return fmt.Errorf("GIF frame count exceeds %d frame limit", maxGIFFrames)
+			}
+			totalSubPixels += int64(subW) * int64(subH)
+			if totalSubPixels > maxGIFTotalPixels {
+				return fmt.Errorf("GIF cumulative sub-image pixel budget (%d) exceeds %d limit", totalSubPixels, maxGIFTotalPixels)
+			}
+			if int64(frames)*canvasPixels > maxGIFTotalPixels*2 {
+				return fmt.Errorf("GIF canvas frame budget (%d pixels across %d frames) exceeds %d limit", int64(frames)*canvasPixels, frames, maxGIFTotalPixels*2)
+			}
+
+			if imgPacked&0x80 != 0 {
+				lctBytes := 3 * (1 << ((imgPacked & 0x07) + 1))
+				if pos+lctBytes > len(raw) {
+					return errors.New("corrupt GIF stream: truncated local color table")
+				}
+				pos += lctBytes
+			}
+			if pos >= len(raw) {
+				return errors.New("corrupt GIF stream: missing LZW minimum code size")
+			}
+			pos++ // skip LZW minimum code size
+			for {
+				if pos >= len(raw) {
+					return errors.New("corrupt GIF stream: truncated image data sub-block")
+				}
+				subLen := int(raw[pos])
+				pos++
+				if subLen == 0 {
+					break
+				}
+				if pos+subLen > len(raw) {
+					return errors.New("corrupt GIF stream: truncated image data payload")
+				}
+				pos += subLen
+			}
+		default:
+			return fmt.Errorf("corrupt GIF stream: unexpected block introducer 0x%02x", block)
+		}
+	}
+	if frames == 0 {
+		return errors.New("corrupt GIF stream: zero frames")
+	}
+	return nil
+}
+
 func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []byte, contentType string) (string, string, error) {
 	cfg := p.storageSettings()
 	driver := strings.ToLower(strings.TrimSpace(cfg.ActiveDriver))
@@ -468,9 +595,18 @@ func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []
 	if driver != "" && driver != "local" && driver != "s3" {
 		if sp := p.resolvePluginStorage(driver); sp != nil {
 			u, err := sp.Put(ctx, objectKey, bytes.NewReader(data), int64(len(data)), contentType)
-			return driver, u, err
+			if err == nil {
+				cleanURL, ok := repo.SanitizeAllowedURL(u, true)
+				if !ok || strings.HasPrefix(strings.ToLower(cleanURL), "mailto:") || strings.HasPrefix(strings.ToLower(cleanURL), "tel:") || strings.HasPrefix(cleanURL, "#") {
+					_ = sp.Delete(ctx, objectKey)
+					return "", "", fmt.Errorf("storage plugin %q returned invalid or unsafe public URL", driver)
+				}
+				return driver, cleanURL, nil
+			}
+			slog.Warn("storage plugin Put failed; falling back to local disk storage", "driver", driver, "object_key", objectKey, "err", err)
+		} else {
+			slog.Warn("storage plugin unavailable or detached; falling back to local disk storage", "driver", driver, "object_key", objectKey)
 		}
-		return "", "", fmt.Errorf("storage plugin %q is not active or registered", driver)
 	}
 
 	if driver == "s3" {
@@ -540,9 +676,18 @@ func (p *Pipeline) storeStreamObject(ctx context.Context, objectKey string, tmpF
 				return "", "", err
 			}
 			u, err := sp.Put(ctx, objectKey, *tmpFile, size, contentType)
-			return driver, u, err
+			if err == nil {
+				cleanURL, ok := repo.SanitizeAllowedURL(u, true)
+				if !ok || strings.HasPrefix(strings.ToLower(cleanURL), "mailto:") || strings.HasPrefix(strings.ToLower(cleanURL), "tel:") || strings.HasPrefix(cleanURL, "#") {
+					_ = sp.Delete(ctx, objectKey)
+					return "", "", fmt.Errorf("storage plugin %q returned invalid or unsafe public URL", driver)
+				}
+				return driver, cleanURL, nil
+			}
+			slog.Warn("storage plugin Put failed; falling back to local disk storage", "driver", driver, "object_key", objectKey, "err", err)
+		} else {
+			slog.Warn("storage plugin unavailable or detached; falling back to local disk storage", "driver", driver, "object_key", objectKey)
 		}
-		return "", "", fmt.Errorf("storage plugin %q is not active or registered", driver)
 	}
 
 	if driver == "s3" {

@@ -12,9 +12,9 @@ import {
   ViewPlugin,
   ViewUpdate,
 } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, redo, undo } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, indentWithTab, redo, undo } from "@codemirror/commands";
 import { markdownKeymap, markdownLanguage, pasteURLAsLink } from "@codemirror/lang-markdown";
-import { apiFetch, showToast } from "../api";
+import { apiFetch, openConfirm, showToast } from "../api";
 import { localeSig, t } from "../i18n";
 import {
   AnimatedModal,
@@ -26,7 +26,7 @@ import {
   useDebouncedValue,
 } from "./UIControls";
 import { MediaLibraryModal } from "./MediaLibraryModal";
-import type { CM6EditorProps } from "./CM6Editor";
+import type { CM6CssEditorProps, CM6EditorProps } from "./CM6Editor";
 
 type EditorMode = "ir" | "wysiwyg" | "sv";
 
@@ -245,17 +245,39 @@ function serializeNodeToMarkdown(node: Node): string {
     case "s":
     case "strike":
       return `~~${inner()}~~`;
+    case "figure": {
+      if (el.classList.contains("volo-codeblock") || el.hasAttribute("data-lang")) {
+        const codeEl = el.querySelector("code");
+        const preEl = el.querySelector("pre");
+        const cls = codeEl?.className || "";
+        const langMatch = /language-([a-zA-Z0-9_-]+)/.exec(cls);
+        const lang =
+          el.getAttribute("data-lang") ||
+          (langMatch ? langMatch[1] : "") ||
+          (el.querySelector(".volo-code-lang")?.textContent || "").trim();
+        const srcNode = (codeEl || preEl || el).cloneNode(true) as HTMLElement;
+        srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button").forEach((n) => n.remove());
+        const raw = srcNode.textContent || "";
+        return `\n\`\`\`${lang}\n${raw.replace(/\n$/, "")}\n\`\`\`\n\n`;
+      }
+      return inner();
+    }
     case "code":
       if (el.parentElement?.tagName.toLowerCase() === "pre") {
-        return el.textContent || "";
+        const clone = el.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll(".ln, .lnt").forEach((n) => n.remove());
+        return clone.textContent || "";
       }
       return `\`${el.textContent || ""}\``;
     case "pre": {
       const codeEl = el.querySelector("code");
       const cls = codeEl?.className || "";
       const langMatch = /language-([a-zA-Z0-9_-]+)/.exec(cls);
-      const lang = langMatch ? langMatch[1] : "";
-      const raw = (codeEl ? codeEl.textContent : el.textContent) || "";
+      const figLang = el.closest("figure[data-lang]")?.getAttribute("data-lang") || "";
+      const lang = figLang || (langMatch ? langMatch[1] : "");
+      const srcNode = (codeEl || el).cloneNode(true) as HTMLElement;
+      srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button").forEach((n) => n.remove());
+      const raw = srcNode.textContent || "";
       return `\n\`\`\`${lang}\n${raw.replace(/\n$/, "")}\n\`\`\`\n\n`;
     }
     case "blockquote": {
@@ -399,6 +421,20 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
   const [lockBody, setLockBody] = useState<string>("");
 
   const switchMode = (next: EditorMode) => {
+    if (next === "wysiwyg" && mode !== "wysiwyg" && /(?:^|\n):::(?:lock|book|bookshelf)\b/.test(value || "")) {
+      void openConfirm({
+        title: t("ed.wysiwyg_warn_title"),
+        message: t("ed.wysiwyg_warn_msg"),
+        confirmText: t("ui.confirm_ok"),
+        danger: false,
+      }).then((ok) => {
+        if (ok) {
+          setMode("wysiwyg");
+          localStorage.setItem("volo_editor_mode", "wysiwyg");
+        }
+      });
+      return;
+    }
     setMode(next);
     localStorage.setItem("volo_editor_mode", next);
   };
@@ -672,28 +708,41 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
   // Fetch server-rendered HTML for Split Preview (`sv`) and Visual (`wysiwyg`) modes
   useEffect(() => {
     if (mode === "ir") return;
+    const ctrl = new AbortController();
     const timer = window.setTimeout(async () => {
       try {
         const res = await apiFetch<{ html: string }>("/api/admin/articles/preview", {
           method: "POST",
           body: JSON.stringify({ content_md: value, locale: curLocale }),
+          signal: ctrl.signal,
         });
+        if (ctrl.signal.aborted) return;
         const html = res.html || "";
         setPreviewHTML(html);
         if (mode === "wysiwyg" && wysiwygRef.current && document.activeElement !== wysiwygRef.current) {
           wysiwygRef.current.innerHTML = html || `<p><br></p>`;
         }
       } catch {
-        // Ignore transient preview errors while typing
+        // Ignore aborted or transient preview errors while typing
       }
     }, 180);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      ctrl.abort();
+    };
   }, [value, mode, curLocale]);
 
   useEffect(() => {
     if (!fullscreen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setFullscreen(false);
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (
+        document.querySelector(".volo-modal-backdrop") ||
+        document.querySelector(".volo-cselect-menu.is-portal")
+      ) {
+        return;
+      }
+      setFullscreen(false);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -1147,6 +1196,16 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
               <line x1="11" y1="18" x2="21" y2="18" />
             </svg>
           </button>
+
+          {fullscreen && onSave && (
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary volo-btn-sm"
+              onClick={() => onSave()}
+            >
+              {t("common.save")}
+            </button>
+          )}
 
           <button
             type="button"
@@ -1651,3 +1710,124 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     </div>
   );
 }
+
+function buildCssSyntaxPlugin() {
+  const buildDecos = (view: EditorView): DecorationSet => {
+    const builder = new RangeSetBuilder<Decoration>();
+    const doc = view.state.doc;
+    for (const { from, to } of view.visibleRanges) {
+      const slice = doc.sliceString(from, to);
+      interface Tok {
+        s: number;
+        e: number;
+        cls: string;
+      }
+      const toks: Tok[] = [];
+      const used = new Uint8Array(slice.length);
+      const claim = (s: number, e: number, cls: string) => {
+        if (s >= e) return;
+        for (let i = s; i < e; i++) if (used[i]) return;
+        for (let i = s; i < e; i++) used[i] = 1;
+        toks.push({ s: from + s, e: from + e, cls });
+      };
+
+      let m: RegExpExecArray | null;
+      const cmtRe = /\/\*[\s\S]*?\*\//g;
+      while ((m = cmtRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "c");
+
+      const strRe = /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/g;
+      while ((m = strRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "s");
+
+      const atRe = /@[a-zA-Z-]+/g;
+      while ((m = atRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "k");
+
+      const varRe = /--[a-zA-Z0-9_-]+/g;
+      while ((m = varRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "na");
+
+      const propRe = /([a-zA-Z-]+)(\s*:)/g;
+      while ((m = propRe.exec(slice)) !== null) claim(m.index, m.index + m[1].length, "kt");
+
+      const numRe = /#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvh|%|s|ms|deg)?\b/g;
+      while ((m = numRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "m");
+
+      toks.sort((a, b) => a.s - b.s || a.e - b.e);
+      for (const tk of toks) {
+        builder.add(tk.s, tk.e, Decoration.mark({ class: tk.cls }));
+      }
+    }
+    return builder.finish();
+  };
+
+  return ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+      constructor(view: EditorView) {
+        this.decorations = buildDecos(view);
+      }
+      update(u: ViewUpdate) {
+        if (u.docChanged || u.viewportChanged) {
+          this.decorations = buildDecos(u.view);
+        }
+      }
+    },
+    { decorations: (v) => v.decorations }
+  );
+}
+
+export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave }: CM6CssEditorProps) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const onSaveRef = useRef(onSave);
+  onSaveRef.current = onSave;
+
+  useEffect(() => {
+    if (!hostRef.current) return;
+    const state = EditorState.create({
+      doc: value || "",
+      extensions: [
+        lineNumbers(),
+        history(),
+        EditorView.lineWrapping,
+        buildCssSyntaxPlugin(),
+        placeholder(phText || ""),
+        keymap.of([
+          {
+            key: "Mod-s",
+            run: () => {
+              onSaveRef.current?.();
+              return true;
+            },
+          },
+          indentWithTab,
+          ...defaultKeymap,
+          ...historyKeymap,
+        ]),
+        EditorView.updateListener.of((u) => {
+          if (u.docChanged) {
+            onChangeRef.current(u.state.doc.toString());
+          }
+        }),
+      ],
+    });
+    const view = new EditorView({ state, parent: hostRef.current });
+    viewRef.current = view;
+    return () => {
+      view.destroy();
+      viewRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const cur = view.state.doc.toString();
+    if (cur !== value) {
+      view.dispatch({ changes: { from: 0, to: cur.length, insert: value || "" } });
+    }
+  }, [value]);
+
+  return <div ref={hostRef} class="volo-cm-host volo-css-cm-host chroma" />;
+}
+

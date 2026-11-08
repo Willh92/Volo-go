@@ -1,15 +1,15 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import {
   apiFetch,
   b64urlToBytes,
   bytesToB64url,
-  csrfTokenSig,
   currentUserSig,
   openConfirm,
   refreshMe,
   resetConsoleScroll,
   showToast,
   storageDriverSig,
+  uploadWithProgress,
 } from "../api";
 import { MediaPickButton } from "../components/MediaLibraryModal";
 import {
@@ -26,6 +26,7 @@ import {
   TableSkeleton,
   TokenListInput,
   UploadButton,
+  UploadProgressBar,
   useDebouncedValue,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, t } from "../i18n";
@@ -127,6 +128,40 @@ function formatLogTs(ms: number): string {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+function extractLogAttrs(entry: any): { msg: string; attrs: Array<[string, string]> } {
+  const attrs: Array<[string, string]> = [];
+  const rawAttrs = entry?.attrs ?? entry?.fields;
+  if (rawAttrs) {
+    try {
+      const obj = typeof rawAttrs === "string" ? JSON.parse(rawAttrs) : rawAttrs;
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        for (const [k, v] of Object.entries(obj)) {
+          attrs.push([k, typeof v === "object" ? JSON.stringify(v) : String(v)]);
+        }
+      }
+    } catch {
+      // ignore malformed attrs JSON
+    }
+  }
+  let msg = String(entry?.message || "");
+  if (attrs.length === 0 && msg.includes("=")) {
+    const tokens = msg.split(/\s+/);
+    const tailAttrs: Array<[string, string]> = [];
+    while (tokens.length > 1) {
+      const last = tokens[tokens.length - 1];
+      const m = /^([a-zA-Z_][a-zA-Z0-9_.-]*)=([^\s]+)$/.exec(last);
+      if (!m) break;
+      tailAttrs.unshift([m[1], m[2]]);
+      tokens.pop();
+    }
+    if (tailAttrs.length > 0) {
+      msg = tokens.join(" ");
+      attrs.push(...tailAttrs);
+    }
+  }
+  return { msg, attrs };
+}
+
 function renderSysTabLabel(tab: SysTab): string {
   switch (tab) {
     case "settings_site":
@@ -202,12 +237,14 @@ export function SystemWorkspace({
     qr_svg?: string;
   } | null>(null);
   const [totpCode, setTotpCode] = useState("");
+  const [totpCurrPwd, setTotpCurrPwd] = useState("");
   const [totpDisableOpen, setTotpDisableOpen] = useState(false);
   const [totpDisablePwd, setTotpDisablePwd] = useState("");
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [passkeys, setPasskeys] = useState<any[]>([]);
   const [pkModalOpen, setPkModalOpen] = useState(false);
   const [pkName, setPkName] = useState(() => t("sys.pk_default_name"));
+  const [pkCurrPwd, setPkCurrPwd] = useState("");
   const [sessions, setSessions] = useState<any[]>([]);
   const [revokingOthers, setRevokingOthers] = useState(false);
   const [tokens, setTokens] = useState<any[]>([]);
@@ -279,9 +316,14 @@ export function SystemWorkspace({
   const [dryRunRestore, setDryRunRestore] = useState<boolean>(false);
   const [legacyDryRun, setLegacyDryRun] = useState<boolean>(true);
   const [legacyBusy, setLegacyBusy] = useState<boolean>(false);
+  const [legacyProgress, setLegacyProgress] = useState<number | null>(null);
   const [restoreBusy, setRestoreBusy] = useState<boolean>(false);
+  const [restoreProgress, setRestoreProgress] = useState<number | null>(null);
   const [legacyReport, setLegacyReport] = useState<any>(null);
-  const [localBackups, setLocalBackups] = useState<Array<{ name: string; size_bytes: number; created_at: number }>>([]);
+  const [localBakEndpoint, setLocalBakEndpoint] = useState<string>("/api/admin/backups/local");
+  const [localBackups, setLocalBackups] = useState<
+    Array<{ name: string; size_bytes: number; mod_time?: number | string; created_at?: number | string }>
+  >([]);
   const [creatingSnapshot, setCreatingSnapshot] = useState<boolean>(false);
   const [doctorReport, setDoctorReport] = useState<any>(null);
 
@@ -300,6 +342,8 @@ export function SystemWorkspace({
   const [logLevel, setLogLevel] = useState("ALL");
   const [logQuery, setLogQuery] = useState("");
   const debouncedLogQ = useDebouncedValue(logQuery, 250);
+  const [autoScrollLogs, setAutoScrollLogs] = useState<boolean>(true);
+  const logViewerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setAvatarImgErr(false);
@@ -459,15 +503,31 @@ export function SystemWorkspace({
         setVersions(st.versions || {});
         if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       } else if (sub === "backup" && isAdmin) {
+        const fetchLocalSnaps = async () => {
+          try {
+            const res = await apiFetch<{
+              items: Array<{ name: string; size_bytes: number; mod_time?: number | string; created_at?: number | string }>;
+            }>("/api/admin/backups/local");
+            setLocalBakEndpoint("/api/admin/backups/local");
+            return res;
+          } catch {
+            const res = await apiFetch<{
+              items: Array<{ name: string; size_bytes: number; mod_time?: number | string; created_at?: number | string }>;
+            }>("/api/admin/backup/local");
+            setLocalBakEndpoint("/api/admin/backup/local");
+            return res;
+          }
+        };
         const [doc, st, lb] = await Promise.all([
           apiFetch<any>("/api/admin/doctor"),
           apiFetch<any>("/api/admin/settings"),
-          apiFetch<{ items: Array<{ name: string; size_bytes: number; created_at: number }> }>("/api/admin/backup/local"),
+          fetchLocalSnaps(),
         ]);
         setDoctorReport(doc);
         setDomains(st.domains || {});
         setVersions(st.versions || {});
         setLocalBackups(lb.items || []);
+        if (Array.isArray(st.storage_drivers)) setStorageDrivers(st.storage_drivers);
         if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       }
     } catch (err: any) {
@@ -509,6 +569,11 @@ export function SystemWorkspace({
     if (logQuery !== debouncedLogQ) return;
     void loadRuntimeLogs(logLevel, debouncedLogQ);
   }, [sub, logLevel, debouncedLogQ]);
+
+  useEffect(() => {
+    if (sub !== "logs" || !autoScrollLogs || !logViewerRef.current) return;
+    logViewerRef.current.scrollTop = logViewerRef.current.scrollHeight;
+  }, [sub, runtimeLogs, autoScrollLogs]);
 
   const patchDomain = async (domainName: string, bodyObj: Record<string, any>) => {
     if (savingDomain) return;
@@ -556,6 +621,10 @@ export function SystemWorkspace({
   };
 
   const registerPasskey = async () => {
+    if (!pkCurrPwd.trim()) {
+      showToast(t("sys.reauth_pwd_required"), "err");
+      return;
+    }
     if (!window.PublicKeyCredential || !navigator.credentials) {
       showToast(t("auth.passkey_https_only"));
       return;
@@ -588,13 +657,79 @@ export function SystemWorkspace({
           name: pkName || "Passkey",
           client_data_json: bytesToB64url(resp.clientDataJSON),
           attestation_object: bytesToB64url(resp.attestationObject),
+          current_password: pkCurrPwd,
         }),
       });
       setPkModalOpen(false);
+      setPkCurrPwd("");
       showToast(t("sys.pk_registered"));
       void loadSub();
     } catch (err: any) {
       showToast(err?.message || t("auth.passkey_cancelled"));
+    }
+  };
+
+  const toggleGeoRuleEnabled = async (g: any, nextEnabled: boolean) => {
+    try {
+      await apiFetch(`/api/admin/security/geo-rules/${encodeURIComponent(g.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: g.name || "Geo Rule",
+          action: g.action || "deny",
+          countries: g.countries || "",
+          regions: g.regions || "",
+          sort_order: typeof g.sort_order === "number" ? g.sort_order : 10,
+          is_enabled: nextEnabled,
+          on_miss: g.on_miss || "next",
+        }),
+      });
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const moveGeoRule = async (ruleId: string, delta: -1 | 1) => {
+    const idx = geoRules.findIndex((r) => r.id === ruleId);
+    const targetIdx = idx + delta;
+    if (idx < 0 || targetIdx < 0 || targetIdx >= geoRules.length) return;
+    const cur = geoRules[idx];
+    const adj = geoRules[targetIdx];
+    let curSort = typeof cur.sort_order === "number" ? cur.sort_order : (idx + 1) * 10;
+    let adjSort = typeof adj.sort_order === "number" ? adj.sort_order : (targetIdx + 1) * 10;
+    if (curSort === adjSort) {
+      adjSort = curSort + delta * 10;
+    }
+    try {
+      await Promise.all([
+        apiFetch(`/api/admin/security/geo-rules/${encodeURIComponent(cur.id)}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            name: cur.name || "Geo Rule",
+            action: cur.action || "deny",
+            countries: cur.countries || "",
+            regions: cur.regions || "",
+            sort_order: adjSort,
+            is_enabled: cur.is_enabled !== false,
+            on_miss: cur.on_miss || "next",
+          }),
+        }),
+        apiFetch(`/api/admin/security/geo-rules/${encodeURIComponent(adj.id)}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            name: adj.name || "Geo Rule",
+            action: adj.action || "deny",
+            countries: adj.countries || "",
+            regions: adj.regions || "",
+            sort_order: curSort,
+            is_enabled: adj.is_enabled !== false,
+            on_miss: adj.on_miss || "next",
+          }),
+        }),
+      ]);
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
     }
   };
 
@@ -678,6 +813,7 @@ export function SystemWorkspace({
   const geoMissOptions = [
     { value: "next", label: t("sys.geo_miss_next") },
     { value: "allow", label: t("sys.geo_allow") },
+    { value: "block", label: t("sys.geo_miss_block") },
     { value: "challenge", label: t("sys.geo_miss_challenge") },
     { value: "deny", label: t("sys.geo_deny") },
   ];
@@ -1875,7 +2011,7 @@ export function SystemWorkspace({
                               padding: "10px",
                               background: "#fff",
                               borderRadius: "10px",
-                              border: "1px solid var(--volo-border)",
+                              border: "1px solid var(--volo-line)",
                               marginBottom: "10px",
                             }}
                           >
@@ -1906,16 +2042,31 @@ export function SystemWorkspace({
                             {t("sys.totp_uri")} <code>{totpEnroll.otpauth_url || totpEnroll.otpauth_uri}</code>
                           </div>
                         )}
-                        <div class="volo-field">
-                          <label>{t("sys.totp_code_ph")}</label>
-                          <input
-                            class="volo-input"
-                            name="totp_verify_digits"
-                            autoComplete="one-time-code"
-                            placeholder={t("sys.totp_code_ph")}
-                            value={totpCode}
-                            onInput={(e) => setTotpCode((e.currentTarget as HTMLInputElement).value)}
-                          />
+                        <div class="volo-grid-2">
+                          <div class="volo-field">
+                            <label>{t("sys.totp_code_ph")} *</label>
+                            <input
+                              class="volo-input"
+                              name="totp_verify_digits"
+                              autoComplete="one-time-code"
+                              placeholder={t("sys.totp_code_ph")}
+                              value={totpCode}
+                              onInput={(e) => setTotpCode((e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                          <div class="volo-field">
+                            <label>{t("sys.cur_pwd")} *</label>
+                            <input
+                              type="password"
+                              class="volo-input"
+                              required
+                              name="totp_stepup_password"
+                              autoComplete="current-password"
+                              placeholder={t("sys.reauth_pwd_ph")}
+                              value={totpCurrPwd}
+                              onInput={(e) => setTotpCurrPwd((e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
                         </div>
                         <div class="volo-form-actions">
                           <button
@@ -1924,6 +2075,7 @@ export function SystemWorkspace({
                             onClick={() => {
                               setTotpEnroll(null);
                               setTotpCode("");
+                              setTotpCurrPwd("");
                             }}
                           >
                             {t("common.cancel")}
@@ -1932,14 +2084,23 @@ export function SystemWorkspace({
                             type="button"
                             class="volo-btn volo-btn-primary"
                             onClick={async () => {
+                              if (!totpCurrPwd.trim()) {
+                                showToast(t("sys.reauth_pwd_required"), "err");
+                                return;
+                              }
                               try {
                                 const res = await apiFetch<{ recovery_codes: string[] }>("/api/admin/security/totp/enroll", {
                                   method: "POST",
-                                  body: JSON.stringify({ secret: totpEnroll.secret, code: totpCode }),
+                                  body: JSON.stringify({
+                                    secret: totpEnroll.secret,
+                                    code: totpCode,
+                                    current_password: totpCurrPwd,
+                                  }),
                                 });
                                 setRecoveryCodes(res.recovery_codes || []);
                                 setTotpEnroll(null);
                                 setTotpCode("");
+                                setTotpCurrPwd("");
                                 void loadSub();
                               } catch (err: any) {
                                 showToast(err.message);
@@ -1966,6 +2127,8 @@ export function SystemWorkspace({
                                 method: "POST",
                                 body: "{}",
                               });
+                              setTotpCode("");
+                              setTotpCurrPwd("");
                               setTotpEnroll(res);
                             } catch (err: any) {
                               showToast(err.message);
@@ -2052,6 +2215,7 @@ export function SystemWorkspace({
                       class="volo-btn volo-btn-primary volo-btn-sm"
                       onClick={() => {
                         setPkName(t("sys.pk_default_name"));
+                        setPkCurrPwd("");
                         setPkModalOpen(true);
                       }}
                     >
@@ -2063,7 +2227,7 @@ export function SystemWorkspace({
                     <table class="volo-table volo-table-compact">
                       <thead>
                         <tr>
-                          <th>{t("sys.pk_col_device")}</th>
+                          <th class="col-fluid">{t("sys.pk_col_device")}</th>
                           <th class="col-date">{t("sys.col_created")}</th>
                           <th class="col-act col-act-th">{t("art.actions")}</th>
                         </tr>
@@ -2076,7 +2240,7 @@ export function SystemWorkspace({
                         ) : (
                           pkPaged.slice.map((pk) => (
                             <tr key={pk.id}>
-                              <td data-label={t("sys.pk_col_device")}>
+                              <td class="col-fluid" data-label={t("sys.pk_col_device")}>
                                 <div class="volo-cell-title">{pk.name}</div>
                               </td>
                               <td class="col-date" data-label={t("sys.col_created")}>
@@ -2164,8 +2328,8 @@ export function SystemWorkspace({
                     <table class="volo-table volo-table-compact">
                       <thead>
                         <tr>
-                          <th>{t("sys.pat_col_token")}</th>
-                          <th>{t("sys.pat_col_scopes")}</th>
+                          <th class="col-fluid">{t("sys.pat_col_token")}</th>
+                          <th class="col-fluid">{t("sys.pat_col_scopes")}</th>
                           <th class="col-act col-act-th">{t("art.actions")}</th>
                         </tr>
                       </thead>
@@ -2179,7 +2343,7 @@ export function SystemWorkspace({
                             const scList = parseScopes(tk.scopes_json);
                             return (
                               <tr key={tk.id}>
-                                <td data-label={t("sys.pat_col_token")}>
+                                <td class="col-fluid" data-label={t("sys.pat_col_token")}>
                                   <div class="volo-cell-main">
                                     <div class="volo-cell-title">
                                       <span>{tk.name}</span>
@@ -2199,7 +2363,7 @@ export function SystemWorkspace({
                                     </div>
                                   </div>
                                 </td>
-                                <td data-label={t("sys.pat_col_scopes")}>
+                                <td class="col-fluid" data-label={t("sys.pat_col_scopes")}>
                                   <div class="volo-cell-meta" style={{ flexWrap: "wrap", gap: "4px" }}>
                                     {scList.length > 0 ? scList.map((sc) => (
                                       <span key={sc} class="volo-mini-tag">{sc}</span>
@@ -2280,7 +2444,7 @@ export function SystemWorkspace({
                     <table class="volo-table volo-table-compact">
                       <thead>
                         <tr>
-                          <th>{t("sys.sess_col_device")}</th>
+                          <th class="col-fluid">{t("sys.sess_col_device")}</th>
                           <th class="col-act col-act-th">{t("art.actions")}</th>
                         </tr>
                       </thead>
@@ -2292,7 +2456,7 @@ export function SystemWorkspace({
                         ) : (
                           sessPaged.slice.map((s) => (
                             <tr key={s.id}>
-                              <td data-label={t("sys.sess_col_device")}>
+                              <td class="col-fluid" data-label={t("sys.sess_col_device")}>
                                 <div class="volo-cell-main">
                                   <div class="volo-cell-title">
                                     <span class="volo-code-chip">{s.client_ip || s.ip_masked}</span>
@@ -2507,6 +2671,19 @@ export function SystemWorkspace({
                   placeholder={t("sys.pk_name_ph")}
                   value={pkName}
                   onInput={(e) => setPkName((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("sys.cur_pwd")} *</label>
+                <input
+                  type="password"
+                  class="volo-input"
+                  required
+                  name="pk_stepup_password"
+                  autoComplete="current-password"
+                  placeholder={t("sys.reauth_pwd_ph")}
+                  value={pkCurrPwd}
+                  onInput={(e) => setPkCurrPwd((e.currentTarget as HTMLInputElement).value)}
                 />
               </div>
             </form>
@@ -3080,35 +3257,6 @@ export function SystemWorkspace({
                 </div>
               </div>
 
-              <BatchBar count={selBanIds.length} onClear={() => setSelBanIds([])}>
-                <button
-                  type="button"
-                  class="volo-act-btn danger"
-                  onClick={async () => {
-                    if (
-                      !(await openConfirm({
-                        message: t("sys.confirm_batch_unban", { n: selBanIds.length }),
-                        danger: true,
-                      }))
-                    ) {
-                      return;
-                    }
-                    try {
-                      await apiFetch("/api/admin/security/ip-bans/batch", {
-                        method: "POST",
-                        body: JSON.stringify({ action: "delete", ids: selBanIds }),
-                      });
-                      setSelBanIds([]);
-                      void loadBansList();
-                    } catch (err: any) {
-                      showToast(err.message);
-                    }
-                  }}
-                >
-                  {t("sys.waf_unban_btn")}
-                </button>
-              </BatchBar>
-
               <MobileSelectAllBar
                 checked={bansPageSlice.length > 0 && bansPageSlice.every((b) => selBanIds.includes(b.id))}
                 count={selBanIds.length}
@@ -3139,7 +3287,7 @@ export function SystemWorkspace({
                         />
                       </th>
                       <th>{t("tbl.col_cidr")}</th>
-                      <th>{t("tbl.col_note")}</th>
+                      <th class="col-fluid">{t("tbl.col_note")}</th>
                       <th class="col-act col-act-th">{t("art.actions")}</th>
                     </tr>
                   </thead>
@@ -3164,7 +3312,7 @@ export function SystemWorkspace({
                           <td data-label={t("tbl.col_cidr")}>
                             <span class="volo-code-chip">{b.cidr}</span>
                           </td>
-                          <td data-label={t("tbl.col_note")}>
+                          <td class="col-fluid" data-label={t("tbl.col_note")}>
                             <div class="volo-cell-meta">
                               <span>{b.note || b.reason || "—"}</span>
                               <span>{b.expires_at > 0 ? formatDateTime(b.expires_at) : t("sys.waf_dur_perm")}</span>
@@ -3196,6 +3344,36 @@ export function SystemWorkspace({
                   </tbody>
                 </table>
               </div>
+
+              <BatchBar count={selBanIds.length} onClear={() => setSelBanIds([])}>
+                <button
+                  type="button"
+                  class="volo-act-btn danger"
+                  onClick={async () => {
+                    if (
+                      !(await openConfirm({
+                        message: t("sys.confirm_batch_unban", { n: selBanIds.length }),
+                        danger: true,
+                      }))
+                    ) {
+                      return;
+                    }
+                    try {
+                      await apiFetch("/api/admin/security/ip-bans/batch", {
+                        method: "POST",
+                        body: JSON.stringify({ action: "delete", ids: selBanIds }),
+                      });
+                      setSelBanIds([]);
+                      void loadBansList();
+                    } catch (err: any) {
+                      showToast(err.message);
+                    }
+                  }}
+                >
+                  {t("sys.waf_unban_btn")}
+                </button>
+              </BatchBar>
+
               <Pagination
                 total={bansTotal}
                 page={bansPage}
@@ -3344,8 +3522,8 @@ export function SystemWorkspace({
                   <thead>
                     <tr>
                       <th>{t("art.status")}</th>
-                      <th>{t("tbl.col_scope")}</th>
-                      <th>{t("tbl.col_note")}</th>
+                      <th class="col-fluid">{t("tbl.col_scope")}</th>
+                      <th class="col-fluid">{t("tbl.col_note")}</th>
                       <th class="col-act col-act-th">{t("art.actions")}</th>
                     </tr>
                   </thead>
@@ -3355,76 +3533,113 @@ export function SystemWorkspace({
                     ) : geoPaged.slice.length === 0 ? (
                       <ConsoleEmpty colSpan={4} />
                     ) : (
-                      geoPaged.slice.map((g) => (
-                        <tr key={g.id}>
-                          <td data-label={t("art.status")}>
-                            <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
-                              <span class={`volo-status-pill ${g.action === "deny" ? "danger" : "ok"}`}>
-                                <span class="volo-status-dot" />
-                                {g.action === "deny" ? t("sys.geo_deny") : t("sys.geo_allow")}
+                      geoPaged.slice.map((g) => {
+                        const fullIdx = geoRules.findIndex((r) => r.id === g.id);
+                        const canMove = !geoQuery.trim();
+                        const actTone =
+                          g.action === "allow" ? "ok" : g.action === "challenge" ? "warn" : "danger";
+                        const actLabel =
+                          g.action === "allow"
+                            ? t("sys.geo_allow")
+                            : g.action === "block"
+                              ? t("sys.geo_miss_block")
+                              : g.action === "challenge"
+                                ? t("sys.geo_miss_challenge")
+                                : t("sys.geo_deny");
+                        return (
+                          <tr key={g.id}>
+                            <td data-label={t("art.status")}>
+                              <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "8px" }}>
+                                <SwitchToggle
+                                  checked={g.is_enabled !== false}
+                                  onChange={(next) => void toggleGeoRuleEnabled(g, next)}
+                                />
+                                <span class={`volo-status-pill ${actTone}`}>
+                                  <span class="volo-status-dot" />
+                                  {actLabel}
+                                </span>
+                                {g.on_miss && g.on_miss !== "next" && <span class="volo-mini-tag">miss:{g.on_miss}</span>}
+                              </div>
+                            </td>
+                            <td class="col-fluid" data-label={t("tbl.col_scope")}>
+                              <span class="volo-code-chip">
+                                ISO={g.countries || "*"} · {g.regions || "*"}
                               </span>
-                              {g.on_miss && g.on_miss !== "next" && <span class="volo-mini-tag">miss:{g.on_miss}</span>}
-                              {g.is_enabled === false && <span class="volo-mini-tag warn">{t("tbl.status_disabled")}</span>}
-                            </div>
-                          </td>
-                          <td data-label={t("tbl.col_scope")}>
-                            <span class="volo-code-chip">
-                              ISO={g.countries || "*"} · {g.regions || "*"}
-                            </span>
-                          </td>
-                          <td data-label={t("tbl.col_note")}>
-                            <div class="volo-cell-meta">
-                              <span>{g.name || "—"}</span>
-                              {typeof g.sort_order === "number" && <span class="volo-code-chip">#{g.sort_order}</span>}
-                            </div>
-                          </td>
-                          <td class="col-act" data-label={t("art.actions")}>
-                            <div class="volo-row-actions">
-                              <button
-                                type="button"
-                                class="volo-act-btn"
-                                onClick={() => {
-                                  setEditingGeoId(g.id);
-                                  setGeoForm({
-                                    name: g.name || "Geo Rule",
-                                    action: g.action || "deny",
-                                    countries: g.countries || "",
-                                    regions: g.regions || "",
-                                    sort_order: typeof g.sort_order === "number" ? g.sort_order : 10,
-                                    is_enabled: g.is_enabled !== false,
-                                    on_miss: g.on_miss || "next",
-                                  });
-                                  setGeoModalOpen(true);
-                                }}
-                              >
-                                {t("common.edit")}
-                              </button>
-                              <button
-                                type="button"
-                                class="volo-act-btn danger"
-                                onClick={async () => {
-                                  if (
-                                    !(await openConfirm({
-                                      message: t("sys.confirm_del_geo", { name: g.name || g.countries || "*" }),
-                                      danger: true,
-                                    }))
-                                  ) {
-                                    return;
-                                  }
-                                  try {
-                                    await apiFetch(`/api/admin/security/geo-rules/${g.id}`, { method: "DELETE" });
-                                    void loadSub();
-                                  } catch (err: any) {
-                                    showToast(err.message);
-                                  }
-                                }}
-                              >
-                                {t("common.delete")}
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))
+                            </td>
+                            <td class="col-fluid" data-label={t("tbl.col_note")}>
+                              <div class="volo-cell-meta">
+                                <span>{g.name || "—"}</span>
+                                {typeof g.sort_order === "number" && <span class="volo-code-chip">#{g.sort_order}</span>}
+                              </div>
+                            </td>
+                            <td class="col-act" data-label={t("art.actions")}>
+                              <div class="volo-row-actions">
+                                <button
+                                  type="button"
+                                  class="volo-act-btn"
+                                  disabled={!canMove || fullIdx <= 0}
+                                  title={t("cnt.move_up")}
+                                  aria-label={t("cnt.move_up")}
+                                  onClick={() => void moveGeoRule(g.id, -1)}
+                                >
+                                  ↑
+                                </button>
+                                <button
+                                  type="button"
+                                  class="volo-act-btn"
+                                  disabled={!canMove || fullIdx < 0 || fullIdx >= geoRules.length - 1}
+                                  title={t("cnt.move_down")}
+                                  aria-label={t("cnt.move_down")}
+                                  onClick={() => void moveGeoRule(g.id, 1)}
+                                >
+                                  ↓
+                                </button>
+                                <button
+                                  type="button"
+                                  class="volo-act-btn"
+                                  onClick={() => {
+                                    setEditingGeoId(g.id);
+                                    setGeoForm({
+                                      name: g.name || "Geo Rule",
+                                      action: g.action || "deny",
+                                      countries: g.countries || "",
+                                      regions: g.regions || "",
+                                      sort_order: typeof g.sort_order === "number" ? g.sort_order : 10,
+                                      is_enabled: g.is_enabled !== false,
+                                      on_miss: g.on_miss || "next",
+                                    });
+                                    setGeoModalOpen(true);
+                                  }}
+                                >
+                                  {t("common.edit")}
+                                </button>
+                                <button
+                                  type="button"
+                                  class="volo-act-btn danger"
+                                  onClick={async () => {
+                                    if (
+                                      !(await openConfirm({
+                                        message: t("sys.confirm_del_geo", { name: g.name || g.countries || "*" }),
+                                        danger: true,
+                                      }))
+                                    ) {
+                                      return;
+                                    }
+                                    try {
+                                      await apiFetch(`/api/admin/security/geo-rules/${g.id}`, { method: "DELETE" });
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
+                                  }}
+                                >
+                                  {t("common.delete")}
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -3492,6 +3707,8 @@ export function SystemWorkspace({
                         options={[
                           { value: "deny", label: t("sys.geo_deny") },
                           { value: "allow", label: t("sys.geo_allow") },
+                          { value: "block", label: t("sys.geo_miss_block") },
+                          { value: "challenge", label: t("sys.geo_miss_challenge") },
                         ]}
                         onChange={(v) => setGeoForm({ ...geoForm, action: v })}
                       />
@@ -3577,6 +3794,7 @@ export function SystemWorkspace({
                     label={t("sys.backup_dry_run")}
                   />
                 </div>
+                <UploadProgressBar progress={restoreProgress} label={t("sys.backup_restore")} />
                 <div class="volo-form-actions">
                   <UploadButton
                     accept=".zip,.json"
@@ -3586,17 +3804,19 @@ export function SystemWorkspace({
                     onFile={async (f) => {
                       if (!dryRunRestore && !(await openConfirm({ message: t("sys.confirm_restore"), danger: true }))) return;
                       setRestoreBusy(true);
+                      setRestoreProgress(0);
                       try {
                         const fd = new FormData();
                         fd.append("file", f);
                         fd.append("dry_run", dryRunRestore ? "true" : "false");
-                        await apiFetch("/api/admin/backup/restore", { method: "POST", body: fd });
+                        await uploadWithProgress("/api/admin/backups/restore", fd, setRestoreProgress);
                         showToast(dryRunRestore ? t("sys.backup_dry_ok") : t("sys.backup_restored"));
                         void loadSub();
                       } catch (err: any) {
                         showToast(err.message);
                       } finally {
                         setRestoreBusy(false);
+                        setRestoreProgress(null);
                       }
                     }}
                   />
@@ -3608,22 +3828,29 @@ export function SystemWorkspace({
                       if (exportingBackup) return;
                       setExportingBackup(true);
                       try {
-                        const csrf = csrfTokenSig.value || (await apiFetch<any>("/api/admin/me")).csrf_token;
-                        const res = await fetch(`/api/admin/backup/export?media=${includeMediaExport ? 1 : 0}`, {
+                        const res = await apiFetch<{
+                          ticket: string;
+                          export_url?: string;
+                          download_url?: string;
+                        }>("/api/admin/backups/ticket", {
                           method: "POST",
-                          headers: { "X-CSRF-Token": csrf },
-                          credentials: "same-origin",
+                          body: JSON.stringify({ include_media: includeMediaExport }),
                         });
-                        if (!res.ok) {
-                          showToast(t("sys.backup_export_err"), "err");
-                          return;
-                        }
-                        const blob = await res.blob();
+                        const baseUrl =
+                          res.download_url ||
+                          res.export_url ||
+                          `/api/admin/backups/export?ticket=${encodeURIComponent(res.ticket)}`;
+                        const sep = baseUrl.includes("?") ? "&" : "?";
+                        const dlUrl = baseUrl.includes("media=")
+                          ? baseUrl
+                          : `${baseUrl}${sep}media=${includeMediaExport ? 1 : 0}`;
                         const a = document.createElement("a");
-                        a.href = URL.createObjectURL(blob);
-                        a.download = `volo-backup-${Date.now()}.zip`;
+                        a.href = dlUrl;
+                        a.download = "";
+                        a.style.display = "none";
+                        document.body.appendChild(a);
                         a.click();
-                        URL.revokeObjectURL(a.href);
+                        a.remove();
                       } catch (err: any) {
                         showToast(err?.message || t("sys.backup_export_err"), "err");
                       } finally {
@@ -3645,6 +3872,7 @@ export function SystemWorkspace({
                     label={t("sys.import_dryrun_lbl")}
                   />
                 </div>
+                <UploadProgressBar progress={legacyProgress} label={t("setup.importing")} />
                 <div class="volo-form-actions no-border">
                   <UploadButton
                     accept=".zip,.json"
@@ -3655,13 +3883,15 @@ export function SystemWorkspace({
                     onFile={async (f) => {
                       if (!legacyDryRun && !(await openConfirm({ message: t("sys.confirm_import_legacy"), danger: true }))) return;
                       setLegacyBusy(true);
+                      setLegacyProgress(0);
                       try {
                         const fd = new FormData();
                         fd.append("file", f);
                         fd.append("dry_run", legacyDryRun ? "1" : "0");
-                        const res = await apiFetch<{ report?: any; dry_run?: boolean }>(
-                          `/api/admin/backup/import-legacy${legacyDryRun ? "?dry_run=1" : ""}`,
-                          { method: "POST", body: fd },
+                        const res = await uploadWithProgress<{ report?: any; dry_run?: boolean }>(
+                          `/api/admin/backups/import-legacy${legacyDryRun ? "?dry_run=1" : ""}`,
+                          fd,
+                          setLegacyProgress,
                         );
                         setLegacyReport(res.report || res);
                         showToast(legacyDryRun ? t("sys.import_dryrun_ok") : t("setup.legacy_done"), "ok");
@@ -3670,6 +3900,7 @@ export function SystemWorkspace({
                         showToast(err.message);
                       } finally {
                         setLegacyBusy(false);
+                        setLegacyProgress(null);
                       }
                     }}
                   />
@@ -3945,16 +4176,17 @@ export function SystemWorkspace({
                   setCreatingSnapshot(true);
                   try {
                     const res = await apiFetch<{
-                      file: string;
+                      file?: string;
+                      name?: string;
                       remote_warning?: string;
-                      items?: Array<{ name: string; size_bytes: number; created_at: number }>;
-                    }>("/api/admin/backup/local", { method: "POST", body: "{}" });
+                      items?: Array<{ name: string; size_bytes: number; mod_time?: number | string; created_at?: number | string }>;
+                    }>(localBakEndpoint, { method: "POST", body: "{}" });
                     if (Array.isArray(res.items)) setLocalBackups(res.items);
                     else void loadSub();
                     if (res.remote_warning) {
                       showToast(res.remote_warning, "warn");
                     } else {
-                      showToast(t("sys.bak_local_created", { name: res.file || "snapshot.zip" }));
+                      showToast(t("sys.bak_local_created", { name: res.file || res.name || "snapshot.zip" }));
                     }
                   } catch (err: any) {
                     showToast(err.message);
@@ -3991,13 +4223,13 @@ export function SystemWorkspace({
                           <span class="volo-help">{formatBytes(b.size_bytes)}</span>
                         </td>
                         <td class="col-date" data-label={t("sys.col_created")}>
-                          {formatDateTime(b.created_at)}
+                          {formatDateTime(b.mod_time ?? b.created_at)}
                         </td>
                         <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
                             <a
                               class="volo-act-btn"
-                              href={`/api/admin/backup/local/${encodeURIComponent(b.name)}`}
+                              href={`${localBakEndpoint}/${encodeURIComponent(b.name)}`}
                               download={b.name}
                             >
                               {t("sys.bak_download")}
@@ -4007,13 +4239,21 @@ export function SystemWorkspace({
                                 {
                                   label: t("sys.bak_restore_btn"),
                                   onClick: async () => {
-                                    if (!(await openConfirm({ message: t("sys.confirm_restore_snap", { name: b.name }), danger: true }))) return;
+                                    if (
+                                      !dryRunRestore &&
+                                      !(await openConfirm({ message: t("sys.confirm_restore_snap", { name: b.name }), danger: true }))
+                                    ) {
+                                      return;
+                                    }
                                     try {
-                                      await apiFetch(`/api/admin/backup/local/${encodeURIComponent(b.name)}/restore`, {
-                                        method: "POST",
-                                        body: "{}",
-                                      });
-                                      showToast(t("sys.backup_restored"));
+                                      await apiFetch(
+                                        `${localBakEndpoint}/${encodeURIComponent(b.name)}/restore${dryRunRestore ? "?dry_run=1" : ""}`,
+                                        {
+                                          method: "POST",
+                                          body: JSON.stringify({ dry_run: dryRunRestore }),
+                                        }
+                                      );
+                                      showToast(dryRunRestore ? t("sys.backup_dry_ok") : t("sys.backup_restored"));
                                       void loadSub();
                                     } catch (err: any) {
                                       showToast(err.message);
@@ -4027,8 +4267,8 @@ export function SystemWorkspace({
                                     if (!(await openConfirm({ message: t("sys.confirm_del_snap", { name: b.name }), danger: true }))) return;
                                     try {
                                       const res = await apiFetch<{
-                                        items?: Array<{ name: string; size_bytes: number; created_at: number }>;
-                                      }>(`/api/admin/backup/local/${encodeURIComponent(b.name)}`, { method: "DELETE" });
+                                        items?: Array<{ name: string; size_bytes: number; mod_time?: number | string; created_at?: number | string }>;
+                                      }>(`${localBakEndpoint}/${encodeURIComponent(b.name)}`, { method: "DELETE" });
                                       if (Array.isArray(res.items)) setLocalBackups(res.items);
                                       else void loadSub();
                                       showToast(t("common.deleted"));
@@ -4182,6 +4422,11 @@ export function SystemWorkspace({
               ))}
             </div>
             <div class="volo-filter-controls">
+              <SwitchToggle
+                checked={autoScrollLogs}
+                onChange={setAutoScrollLogs}
+                label={t("sys.logs_autoscroll")}
+              />
               <input
                 class="volo-input volo-search-input"
                 name="runtime_logs_query"
@@ -4201,18 +4446,24 @@ export function SystemWorkspace({
             </div>
           </div>
 
-          <div class="volo-log-viewer">
+          <div ref={logViewerRef} class="volo-log-viewer">
             {runtimeLogs.length === 0 ? (
-              <div style={{ color: "#8b9c94", padding: "18px 8px", textAlign: "center" }}>{t("sys.logs_empty")}</div>
+              <div style={{ color: "var(--volo-muted)", padding: "18px 8px", textAlign: "center" }}>{t("sys.logs_empty")}</div>
             ) : (
               runtimeLogs.map((l) => {
                 const lv = String(l.level || "INFO");
+                const { msg, attrs } = extractLogAttrs(l);
                 return (
                   <div key={l.seq || `${l.timestamp}-${l.message}`} class="volo-log-row">
                     <span class="volo-log-ts">{formatLogTs(l.timestamp)}</span>
                     <span class={`volo-log-lvl ${lv.toLowerCase()}`}>{lv}</span>
                     {l.source && <span class="volo-log-attrs">({l.source})</span>}
-                    <span>{l.message}</span>
+                    <span>{msg}</span>
+                    {attrs.map(([ak, av], idx) => (
+                      <span key={`${ak}-${idx}`} class="volo-log-chip">
+                        {ak}={av}
+                      </span>
+                    ))}
                   </div>
                 );
               })

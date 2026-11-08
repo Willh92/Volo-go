@@ -28,7 +28,7 @@ import (
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
-//go:embed builtin/volo-studio/theme.json builtin/volo-studio/preview.svg builtin/volo-studio/templates/*.html builtin/volo-studio/assets_gz/*
+//go:embed builtin/volo-studio/theme.json builtin/volo-studio/preview.svg builtin/volo-studio/templates_gz/* builtin/volo-studio/assets_gz/*
 var builtinThemeFS embed.FS
 
 const DefaultThemeID = "volo-studio"
@@ -42,10 +42,15 @@ type ConfigOption struct {
 // ConfigField defines a declarative per-theme configuration item in `theme.json`.
 type ConfigField struct {
 	Key         string            `json:"key"`
-	Type        string            `json:"type"` // "text" | "textarea" | "url" | "color" | "boolean" | "number" | "select" | "sortable_list"
+	Type        string            `json:"type"` // "text" | "string" | "textarea" | "url" | "color" | "image" | "boolean" | "number" | "select" | "sortable_list"
+	Group       map[string]string `json:"group,omitempty"`
 	Label       map[string]string `json:"label"`
 	Description map[string]string `json:"description,omitempty"`
 	Placeholder map[string]string `json:"placeholder,omitempty"`
+	Required    bool              `json:"required,omitempty"`
+	Min         *float64          `json:"min,omitempty"`
+	Max         *float64          `json:"max,omitempty"`
+	Step        *float64          `json:"step,omitempty"`
 	Default     any               `json:"default,omitempty"`
 	Options     []ConfigOption    `json:"options,omitempty"`
 }
@@ -63,6 +68,7 @@ type Manifest struct {
 	Accents          []string          `json:"accents"`
 	SupportsDarkMode bool              `json:"supports_dark_mode"`
 	SupportsPJAX     bool              `json:"supports_pjax"`
+	PageTemplates    []ConfigOption    `json:"page_templates,omitempty"`
 	ConfigSchema     []ConfigField     `json:"config_schema,omitempty"`
 	IsBuiltin        bool              `json:"is_builtin"`
 }
@@ -77,9 +83,14 @@ type LocalizedConfigOption struct {
 type LocalizedConfigField struct {
 	Key         string                  `json:"key"`
 	Type        string                  `json:"type"`
+	Group       string                  `json:"group,omitempty"`
 	Label       string                  `json:"label"`
 	Description string                  `json:"description,omitempty"`
 	Placeholder string                  `json:"placeholder,omitempty"`
+	Required    bool                    `json:"required,omitempty"`
+	Min         *float64                `json:"min,omitempty"`
+	Max         *float64                `json:"max,omitempty"`
+	Step        *float64                `json:"step,omitempty"`
 	Default     any                     `json:"default,omitempty"`
 	Options     []LocalizedConfigOption `json:"options,omitempty"`
 }
@@ -87,10 +98,18 @@ type LocalizedConfigField struct {
 // LocalizedTheme extends Manifest with locale-resolved labels and preview endpoint URL.
 type LocalizedTheme struct {
 	Manifest
-	DisplayName        string                 `json:"display_name"`
-	DisplayDescription string                 `json:"display_description"`
-	PreviewURL         string                 `json:"preview_url"`
-	LocalizedSchema    []LocalizedConfigField `json:"localized_schema,omitempty"`
+	DisplayName            string                  `json:"display_name"`
+	DisplayDescription     string                  `json:"display_description"`
+	PreviewURL             string                  `json:"preview_url"`
+	LocalizedPageTemplates []LocalizedConfigOption `json:"localized_page_templates,omitempty"`
+	LocalizedSchema        []LocalizedConfigField  `json:"localized_schema,omitempty"`
+}
+
+// OIDCProviderView describes an active OIDC SSO provider button on login views.
+type OIDCProviderView struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	StartURL    string `json:"start_url"`
 }
 
 // PaginationView provides windowed page numbers and navigation pointers for templates.
@@ -237,10 +256,11 @@ type loadedTheme struct {
 	preview     cachedAsset
 	hasPreview  bool
 
-	baseReady bool
-	base      *template.Template
-	locales   map[string]map[string]string
-	pages     map[string]*template.Template
+	baseReady  bool
+	sharedSrcs []string
+	bases      map[string]*template.Template
+	locales    map[string]map[string]string
+	pages      map[string]*template.Template
 }
 
 // PageContext holds all data passed into theme templates.
@@ -273,6 +293,7 @@ type PageContext struct {
 
 	Viewer          *domain.User
 	ViewerCSRFToken string
+	OIDCProviders   []OIDCProviderView
 	Owner           content.PublicAuthorProfile
 	Authors         []content.PublicAuthorProfile
 	Stats           content.PublicSiteStats
@@ -341,6 +362,8 @@ type PageContext struct {
 	HeaderWidgets        []plugin.RenderedSlot
 	ArticleBeforeWidgets []plugin.RenderedSlot
 	ArticleAfterWidgets  []plugin.RenderedSlot
+	CommentBeforeWidgets []plugin.RenderedSlot
+	CommentAfterWidgets  []plugin.RenderedSlot
 	SidebarWidgets       []plugin.RenderedSlot
 	FooterWidgets        []plugin.RenderedSlot
 
@@ -471,21 +494,15 @@ func (e *Engine) inspectThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 	pageNames := make(map[string]struct{})
 	hasOwnPage := make(map[string]bool)
 	collectPages := func(srcFS fs.FS, isOwn bool) {
-		if srcFS == nil {
-			return
-		}
-		if tplEntries, dErr := fs.ReadDir(srcFS, "templates"); dErr == nil {
-			for _, ent := range tplEntries {
-				name := ent.Name()
-				if ent.IsDir() || !strings.HasSuffix(name, ".html") || isSharedTemplateRel(name) {
-					continue
-				}
-				pageNames[name] = struct{}{}
-				if isOwn {
-					hasOwnPage[name] = true
-				}
+		walkThemeTemplates(srcFS, func(rel string) {
+			if strings.Contains(rel, "/") || isSharedTemplateRel(rel) {
+				return
 			}
-		}
+			pageNames[rel] = struct{}{}
+			if isOwn {
+				hasOwnPage[rel] = true
+			}
+		})
 	}
 	collectPages(fallbackFS, false)
 	collectPages(fsys, true)
@@ -501,6 +518,53 @@ func (e *Engine) inspectThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 		hasOwnPage: hasOwnPage,
 		pages:      make(map[string]*template.Template),
 	}, nil
+}
+
+func walkThemeTemplates(srcFS fs.FS, visit func(rel string)) {
+	if srcFS == nil {
+		return
+	}
+	seen := make(map[string]struct{})
+	_ = fs.WalkDir(srcFS, "templates", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(p, ".html") {
+			return nil
+		}
+		rel := strings.TrimPrefix(p, "templates/")
+		seen[rel] = struct{}{}
+		visit(rel)
+		return nil
+	})
+	_ = fs.WalkDir(srcFS, "templates_gz", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(p, ".html.gz") {
+			return nil
+		}
+		rel := strings.TrimSuffix(strings.TrimPrefix(p, "templates_gz/"), ".gz")
+		if _, dup := seen[rel]; dup {
+			return nil
+		}
+		seen[rel] = struct{}{}
+		visit(rel)
+		return nil
+	})
+}
+
+func readThemeTemplateFile(srcFS fs.FS, rel string) ([]byte, error) {
+	if srcFS == nil {
+		return nil, fs.ErrNotExist
+	}
+	if b, err := fs.ReadFile(srcFS, "templates/"+rel); err == nil {
+		return b, nil
+	}
+	gz, err := fs.ReadFile(srcFS, "templates_gz/"+rel+".gz")
+	if err != nil {
+		return nil, err
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		return nil, err
+	}
+	defer gr.Close()
+	return io.ReadAll(io.LimitReader(gr, maxExternalAssetSingleBytes))
 }
 
 const (
@@ -622,16 +686,25 @@ func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 	return assets
 }
 
-func (e *Engine) getOrCompilePage(th *loadedTheme, defTh *loadedTheme, selected string) (*template.Template, error) {
+func (e *Engine) getOrCompilePage(th *loadedTheme, defTh *loadedTheme, selected string, activeLocale string, siteTimeZone string) (*template.Template, error) {
 	var fallbackAssets map[string]cachedAsset
 	if th.fallbackFS != nil && defTh != nil && defTh != th {
 		fallbackAssets = e.ensureAssets(defTh)
 	}
 	ownAssets := e.ensureAssets(th)
 
+	normLocale := strings.TrimSpace(activeLocale)
+	if normLocale == "" {
+		normLocale = "zh-CN"
+	}
+	siteLoc := LoadSiteLocation(siteTimeZone)
+	normTZ := siteLoc.String()
+	baseKey := normLocale + "\x00" + normTZ
+	pageKey := selected + "\x00" + baseKey
+
 	th.mu.Lock()
 	defer th.mu.Unlock()
-	if t, ok := th.pages[selected]; ok {
+	if t, ok := th.pages[pageKey]; ok {
 		return t, nil
 	}
 
@@ -674,60 +747,70 @@ func (e *Engine) getOrCompilePage(th *loadedTheme, defTh *loadedTheme, selected 
 		loadLocalesFrom(th.fallbackFS)
 		loadLocalesFrom(th.fsys)
 
-		funcs := e.templateFuncMap(th.manifest.ID, ownAssets, fallbackAssets, themeLocales)
-		base := template.New("root").Funcs(funcs)
-
-		parseSharedFrom := func(srcFS fs.FS) error {
+		var sharedSrcs []string
+		collectSharedFrom := func(srcFS fs.FS) error {
 			if srcFS == nil {
 				return nil
 			}
-			var sharedPaths []string
-			_ = fs.WalkDir(srcFS, "templates", func(p string, d fs.DirEntry, walkErr error) error {
-				if walkErr != nil || d.IsDir() || !strings.HasSuffix(p, ".html") {
-					return nil
-				}
-				rel := strings.TrimPrefix(p, "templates/")
+			var sharedRels []string
+			walkThemeTemplates(srcFS, func(rel string) {
 				if isSharedTemplateRel(rel) {
-					sharedPaths = append(sharedPaths, p)
+					sharedRels = append(sharedRels, rel)
 				}
-				return nil
 			})
-			sort.Strings(sharedPaths)
-			for _, sp := range sharedPaths {
-				b, rErr := fs.ReadFile(srcFS, sp)
+			sort.Strings(sharedRels)
+			for _, sr := range sharedRels {
+				b, rErr := readThemeTemplateFile(srcFS, sr)
 				if rErr != nil {
 					return rErr
 				}
-				if _, pErr := base.Parse(string(b)); pErr != nil {
-					return fmt.Errorf("parse %s: %w", sp, pErr)
-				}
+				sharedSrcs = append(sharedSrcs, string(b))
 			}
 			return nil
 		}
-		if err := parseSharedFrom(th.fallbackFS); err != nil {
+		if err := collectSharedFrom(th.fallbackFS); err != nil {
 			return nil, err
 		}
-		if err := parseSharedFrom(th.fsys); err != nil {
+		if err := collectSharedFrom(th.fsys); err != nil {
 			return nil, err
 		}
 		th.locales = themeLocales
-		th.base = base
+		th.sharedSrcs = sharedSrcs
+		th.bases = make(map[string]*template.Template)
 		th.baseReady = true
+	}
+
+	if th.bases == nil {
+		th.bases = make(map[string]*template.Template)
+	}
+	base, hasBase := th.bases[baseKey]
+	if !hasBase {
+		if len(th.bases) >= 32 {
+			clear(th.bases)
+		}
+		funcs := e.templateFuncMap(th.manifest.ID, ownAssets, fallbackAssets, th.locales, normLocale, siteLoc)
+		base = template.New("root").Funcs(funcs)
+		for _, src := range th.sharedSrcs {
+			if _, pErr := base.Parse(src); pErr != nil {
+				return nil, fmt.Errorf("parse shared template: %w", pErr)
+			}
+		}
+		th.bases[baseKey] = base
 	}
 
 	var rawTpl []byte
 	var rErr error
 	if th.fsys != nil {
-		rawTpl, rErr = fs.ReadFile(th.fsys, "templates/"+selected)
+		rawTpl, rErr = readThemeTemplateFile(th.fsys, selected)
 	}
 	if (th.fsys == nil || rErr != nil) && th.fallbackFS != nil {
-		rawTpl, rErr = fs.ReadFile(th.fallbackFS, "templates/"+selected)
+		rawTpl, rErr = readThemeTemplateFile(th.fallbackFS, selected)
 	}
 	if rErr != nil {
 		return nil, rErr
 	}
 
-	cloned, cErr := th.base.Clone()
+	cloned, cErr := base.Clone()
 	if cErr != nil {
 		return nil, cErr
 	}
@@ -737,7 +820,10 @@ func (e *Engine) getOrCompilePage(th *loadedTheme, defTh *loadedTheme, selected 
 	if th.pages == nil {
 		th.pages = make(map[string]*template.Template)
 	}
-	th.pages[selected] = cloned
+	if len(th.pages) >= 256 {
+		clear(th.pages)
+	}
+	th.pages[pageKey] = cloned
 	return cloned, nil
 }
 
@@ -761,6 +847,14 @@ func (e *Engine) List() []Manifest {
 	return out
 }
 
+func defaultPageTemplateOptions() []ConfigOption {
+	return []ConfigOption{
+		{Value: "default", Label: map[string]string{"zh-CN": "默认排版", "en-US": "Default"}},
+		{Value: "wide", Label: map[string]string{"zh-CN": "宽屏画布", "en-US": "Wide Canvas"}},
+		{Value: "minimal", Label: map[string]string{"zh-CN": "极简阅读", "en-US": "Minimal"}},
+	}
+}
+
 // ListLocalized returns all loaded themes with locale-resolved names, descriptions, preview URLs, and config schemas.
 func (e *Engine) ListLocalized(locale string) []LocalizedTheme {
 	manifests := e.List()
@@ -780,19 +874,36 @@ func (e *Engine) ListLocalized(locale string) []LocalizedTheme {
 			schema = append(schema, LocalizedConfigField{
 				Key:         f.Key,
 				Type:        f.Type,
+				Group:       pickLocalizedMapValue(f.Group, locale, ""),
 				Label:       pickLocalizedMapValue(f.Label, locale, f.Key),
 				Description: pickLocalizedMapValue(f.Description, locale, ""),
 				Placeholder: pickLocalizedMapValue(f.Placeholder, locale, ""),
+				Required:    f.Required,
+				Min:         f.Min,
+				Max:         f.Max,
+				Step:        f.Step,
 				Default:     f.Default,
 				Options:     opts,
 			})
 		}
+		rawPageTpls := mf.PageTemplates
+		if len(rawPageTpls) == 0 {
+			rawPageTpls = defaultPageTemplateOptions()
+		}
+		locPageTpls := make([]LocalizedConfigOption, 0, len(rawPageTpls))
+		for _, pt := range rawPageTpls {
+			locPageTpls = append(locPageTpls, LocalizedConfigOption{
+				Value: pt.Value,
+				Label: pickLocalizedMapValue(pt.Label, locale, pt.Value),
+			})
+		}
 		out = append(out, LocalizedTheme{
-			Manifest:           mf,
-			DisplayName:        dispName,
-			DisplayDescription: dispDesc,
-			PreviewURL:         "/themes/" + mf.ID + "/preview",
-			LocalizedSchema:    schema,
+			Manifest:               mf,
+			DisplayName:            dispName,
+			DisplayDescription:     dispDesc,
+			PreviewURL:             "/themes/" + mf.ID + "/preview",
+			LocalizedPageTemplates: locPageTpls,
+			LocalizedSchema:        schema,
 		})
 	}
 	return out
@@ -948,7 +1059,7 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 	if selected == "" {
 		return fmt.Errorf("theme %s: missing page templates %v", themeID, candidates)
 	}
-	tmpl, err := e.getOrCompilePage(th, defTh, selected)
+	tmpl, err := e.getOrCompilePage(th, defTh, selected, data.Locale, data.Site.TimeZone)
 	if err != nil {
 		return fmt.Errorf("theme %s compile %s: %w", themeID, selected, err)
 	}
@@ -1240,205 +1351,22 @@ func validateThemeConfigSchema(schema []ConfigField) ([]ConfigField, error) {
 	return out, nil
 }
 
-func (e *Engine) compileThemeFS(fsys fs.FS, fallbackFS fs.FS, fallbackAssets map[string]cachedAsset, isBuiltin bool, zw *gzip.Writer, gzBuf *bytes.Buffer) (*loadedTheme, error) {
-	rawManifest, err := fs.ReadFile(fsys, "theme.json")
+func (e *Engine) validateStagedThemeFS(fsys fs.FS, fallbackFS fs.FS, fallbackTheme *loadedTheme) (Manifest, error) {
+	loaded, err := e.inspectThemeFS(fsys, fallbackFS, false)
 	if err != nil {
-		return nil, err
+		return Manifest{}, err
 	}
-	var mf Manifest
-	if err := json.Unmarshal(rawManifest, &mf); err != nil {
-		return nil, err
+	names := make([]string, 0, len(loaded.pageNames))
+	for name := range loaded.pageNames {
+		names = append(names, name)
 	}
-	mf.IsBuiltin = isBuiltin
-	if mf.ID == "" {
-		return nil, fmt.Errorf("theme.json missing id")
-	}
-	validSchema, err := validateThemeConfigSchema(mf.ConfigSchema)
-	if err != nil {
-		return nil, err
-	}
-	mf.ConfigSchema = validSchema
-
-	if zw == nil || gzBuf == nil {
-		var localBuf bytes.Buffer
-		localZW, zErr := gzip.NewWriterLevel(&localBuf, gzip.BestCompression)
-		if zErr != nil {
-			return nil, zErr
-		}
-		zw = localZW
-		gzBuf = &localBuf
-	}
-
-	// Only load the theme's own assets into `assets`; external themes fall back to DefaultThemeID assets on lookup.
-	assets := make(map[string]cachedAsset)
-	if fsys != nil {
-		_ = fs.WalkDir(fsys, "assets", func(p string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil || d.IsDir() {
-				return nil
-			}
-			raw, rErr := fs.ReadFile(fsys, p)
-			if rErr != nil {
-				return nil
-			}
-			rel := strings.TrimPrefix(p, "assets/")
-			assets[rel] = buildCachedAssetWithWriter(raw, rel, zw, gzBuf)
-			return nil
-		})
-	}
-
-	// Load optional preview image (configured `preview` path or root `preview.{svg,png,webp,jpg}`)
-	var previewAsset cachedAsset
-	var hasPreview bool
-	previewCandidates := []string{}
-	if mf.Preview != "" {
-		previewCandidates = append(previewCandidates, strings.TrimPrefix(path.Clean("/"+mf.Preview), "/"))
-	}
-	previewCandidates = append(previewCandidates, "preview.svg", "preview.png", "preview.webp", "preview.jpg", "assets/preview.svg", "assets/preview.png")
-	for _, cand := range previewCandidates {
-		if rawPrev, pErr := fs.ReadFile(fsys, cand); pErr == nil && len(rawPrev) > 0 {
-			previewAsset = buildCachedAssetWithWriter(rawPrev, cand, zw, gzBuf)
-			hasPreview = true
-			break
+	sort.Strings(names)
+	for _, name := range names {
+		if _, err := e.getOrCompilePage(loaded, fallbackTheme, name, "zh-CN", ""); err != nil {
+			return Manifest{}, err
 		}
 	}
-
-	// Load per-theme JSON language packs (`locales/*.json`)
-	themeLocales := make(map[string]map[string]string)
-	loadLocalesFrom := func(srcFS fs.FS) {
-		if srcFS == nil {
-			return
-		}
-		entries, dErr := fs.ReadDir(srcFS, "locales")
-		if dErr != nil {
-			return
-		}
-		for _, ent := range entries {
-			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
-				continue
-			}
-			code := strings.TrimSuffix(ent.Name(), ".json")
-			rawLoc, rErr := fs.ReadFile(srcFS, "locales/"+ent.Name())
-			if rErr != nil {
-				continue
-			}
-			var rawMap map[string]any
-			if jErr := json.Unmarshal(rawLoc, &rawMap); jErr != nil {
-				continue
-			}
-			if themeLocales[code] == nil {
-				themeLocales[code] = make(map[string]string, len(rawMap))
-			}
-			for k, v := range rawMap {
-				if k == "_meta" || strings.HasPrefix(k, "$") {
-					continue
-				}
-				if s, isStr := v.(string); isStr {
-					themeLocales[code][k] = s
-				}
-			}
-		}
-	}
-	loadLocalesFrom(fallbackFS)
-	loadLocalesFrom(fsys)
-
-	funcs := e.templateFuncMap(mf.ID, assets, fallbackAssets, themeLocales)
-	base := template.New("root").Funcs(funcs)
-
-	// Parse shared layout, macro, and modular partial templates in deterministic order (`fallbackFS` then `fsys` override)
-	parseSharedFrom := func(srcFS fs.FS) error {
-		if srcFS == nil {
-			return nil
-		}
-		var sharedPaths []string
-		_ = fs.WalkDir(srcFS, "templates", func(p string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil || d.IsDir() || !strings.HasSuffix(p, ".html") {
-				return nil
-			}
-			rel := strings.TrimPrefix(p, "templates/")
-			if isSharedTemplateRel(rel) {
-				sharedPaths = append(sharedPaths, p)
-			}
-			return nil
-		})
-		sort.Strings(sharedPaths)
-		for _, sp := range sharedPaths {
-			b, rErr := fs.ReadFile(srcFS, sp)
-			if rErr != nil {
-				return rErr
-			}
-			if _, pErr := base.Parse(string(b)); pErr != nil {
-				return fmt.Errorf("parse %s: %w", sp, pErr)
-			}
-		}
-		return nil
-	}
-	if err := parseSharedFrom(fallbackFS); err != nil {
-		return nil, err
-	}
-	if err := parseSharedFrom(fsys); err != nil {
-		return nil, err
-	}
-
-	pageNames := make(map[string]struct{})
-	hasOwnPage := make(map[string]bool)
-	collectPages := func(srcFS fs.FS, isOwn bool) {
-		if srcFS == nil {
-			return
-		}
-		if tplEntries, dErr := fs.ReadDir(srcFS, "templates"); dErr == nil {
-			for _, ent := range tplEntries {
-				name := ent.Name()
-				if ent.IsDir() || !strings.HasSuffix(name, ".html") || isSharedTemplateRel(name) {
-					continue
-				}
-				pageNames[name] = struct{}{}
-				if isOwn {
-					hasOwnPage[name] = true
-				}
-			}
-		}
-	}
-	collectPages(fallbackFS, false)
-	collectPages(fsys, true)
-	if len(pageNames) == 0 {
-		return nil, fmt.Errorf("theme %s: no page templates found", mf.ID)
-	}
-
-	readTemplateFile := func(relPath string) ([]byte, error) {
-		if b, rErr := fs.ReadFile(fsys, relPath); rErr == nil {
-			return b, nil
-		}
-		if fallbackFS != nil {
-			return fs.ReadFile(fallbackFS, relPath)
-		}
-		return nil, fs.ErrNotExist
-	}
-
-	compiledPages := make(map[string]*template.Template, len(pageNames))
-	for name := range pageNames {
-		rawTpl, rErr := readTemplateFile("templates/" + name)
-		if rErr != nil {
-			return nil, rErr
-		}
-		cloned, cErr := base.Clone()
-		if cErr != nil {
-			return nil, cErr
-		}
-		if _, pErr := cloned.New(name).Parse(string(rawTpl)); pErr != nil {
-			return nil, fmt.Errorf("parse page %s: %w", name, pErr)
-		}
-		compiledPages[name] = cloned
-	}
-
-	return &loadedTheme{
-		manifest:   mf,
-		pages:      compiledPages,
-		hasOwnPage: hasOwnPage,
-		assets:     assets,
-		locales:    themeLocales,
-		preview:    previewAsset,
-		hasPreview: hasPreview,
-	}, nil
+	return loaded.manifest, nil
 }
 
 func isSharedTemplateRel(rel string) bool {

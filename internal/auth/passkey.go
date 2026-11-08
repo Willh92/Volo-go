@@ -102,10 +102,13 @@ type passkeyChallengeEnvelope struct {
 // PasskeyBeginResult contains both the browser PublicKeyCredentialCreationOptions/RequestOptions challenge
 // and the server-sealed state token to submit back on completion.
 type PasskeyBeginResult struct {
-	ChallengeB64URL string `json:"challenge"`
-	RPID            string `json:"rp_id"`
-	Origin          string `json:"origin"`
-	StateToken      string `json:"state_token"`
+	ChallengeB64URL        string            `json:"challenge"`
+	RPID                   string            `json:"rp_id"`
+	Origin                 string            `json:"origin"`
+	StateToken             string            `json:"state_token"`
+	UserVerification       string            `json:"userVerification"`
+	UserVerificationSnake  string            `json:"user_verification"`
+	AuthenticatorSelection map[string]string `json:"authenticatorSelection,omitempty"`
 }
 
 // VerifiedPasskeyRegistration holds validated credential material ready to persist in user_credentials.
@@ -149,12 +152,20 @@ func BeginPasskeyCeremony(kr *config.KeyRing, userID string, purpose string, pub
 	if err != nil {
 		return nil, err
 	}
-	return &PasskeyBeginResult{
-		ChallengeB64URL: chalB64,
-		RPID:            rpID,
-		Origin:          origin,
-		StateToken:      sealed,
-	}, nil
+	res := &PasskeyBeginResult{
+		ChallengeB64URL:       chalB64,
+		RPID:                  rpID,
+		Origin:                origin,
+		StateToken:            sealed,
+		UserVerification:      "required",
+		UserVerificationSnake: "required",
+	}
+	if purpose == "register" {
+		res.AuthenticatorSelection = map[string]string{
+			"userVerification": "required",
+		}
+	}
+	return res, nil
 }
 
 // FinishPasskeyRegistration validates a WebAuthn navigator.credentials.create() response (ES256 or RS256).
@@ -199,6 +210,9 @@ func FinishPasskeyRegistration(
 	if flags&authFlagUserPresent == 0 || flags&authFlagAttested == 0 {
 		return nil, ErrPasskeyVerifyFailed
 	}
+	if flags&authFlagUserVerify == 0 {
+		return nil, fmt.Errorf("%w: authenticator did not perform user verification (UV)", ErrPasskeyVerifyFailed)
+	}
 	signCount := int64(binary.BigEndian.Uint32(authData[33:37]))
 	credIDLen := int(binary.BigEndian.Uint16(authData[53:55]))
 	if credIDLen < 16 || credIDLen > 1024 || len(authData) < 55+credIDLen+1 {
@@ -230,7 +244,7 @@ func FinishPasskeyRegistration(
 }
 
 // FinishPasskeyAssertion validates a WebAuthn navigator.credentials.get() assertion, verifying
-// origin, challenge, RP ID hash, User Presence, cryptographic signature, and monotonic signCount!
+// origin, challenge, RP ID hash, User Presence + User Verification, cryptographic signature, and monotonic signCount!
 func FinishPasskeyAssertion(
 	kr *config.KeyRing,
 	stateToken string,
@@ -256,8 +270,12 @@ func FinishPasskeyAssertion(
 	if subtle.ConstantTimeCompare(authenticatorData[:32], rpHash[:]) != 1 {
 		return 0, ErrPasskeyVerifyFailed
 	}
-	if authenticatorData[32]&authFlagUserPresent == 0 {
+	flags := authenticatorData[32]
+	if flags&authFlagUserPresent == 0 {
 		return 0, ErrPasskeyVerifyFailed
+	}
+	if flags&authFlagUserVerify == 0 {
+		return 0, fmt.Errorf("%w: authenticator did not perform user verification (UV)", ErrPasskeyVerifyFailed)
 	}
 	newSignCount = int64(binary.BigEndian.Uint32(authenticatorData[33:37]))
 

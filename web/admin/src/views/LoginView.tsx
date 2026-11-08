@@ -1,4 +1,4 @@
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import {
   apiFetch,
   b64urlToBytes,
@@ -6,15 +6,24 @@ import {
   bytesToB64url,
   csrfTokenSig,
   currentUserSig,
+  effectiveDarkSig,
   refreshMe,
   showToast,
   StaffUser,
+  toggleEffectiveTheme,
 } from "../api";
 import { LocalePopover, SwitchToggle } from "../components/UIControls";
 import { availableLocalesSig, ensureLocaleLoaded, localeSig, normalizeLocale, t } from "../i18n";
 
+interface OidcProviderItem {
+  name: string;
+  display_name: string;
+  start_url: string;
+}
+
 export function LoginView() {
   const locales = availableLocalesSig.value;
+  const isDark = effectiveDarkSig.value;
   const [ident, setIdent] = useState("");
   const [password, setPassword] = useState("");
   const [showPwd, setShowPwd] = useState(false);
@@ -22,6 +31,20 @@ export function LoginView() {
   const [totpCode, setTotpCode] = useState("");
   const [rememberDevice, setRememberDevice] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [oidcProviders, setOidcProviders] = useState<OidcProviderItem[]>([]);
+
+  useEffect(() => {
+    const nextPath = bootConfig.admin_path || window.location.pathname || "/console";
+    apiFetch<{ providers?: OidcProviderItem[] }>(
+      `/api/v1/auth/oidc/providers?target=admin&next=${encodeURIComponent(nextPath)}`
+    )
+      .then((res) => {
+        if (Array.isArray(res?.providers)) {
+          setOidcProviders(res.providers.filter((p) => p && p.start_url));
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const handlePasswordSubmit = async (e: Event) => {
     e.preventDefault();
@@ -133,6 +156,24 @@ export function LoginView() {
         </a>
 
         <div class="volo-auth-header-right">
+          <button
+            type="button"
+            class="volo-icon-btn"
+            aria-label={t("shell.mode_title")}
+            title={`${t("shell.mode_title")}: ${isDark ? t("mode.light") : t("mode.dark")}`}
+            onClick={() => toggleEffectiveTheme()}
+          >
+            {isDark ? (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" />
+              </svg>
+            ) : (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="4.5" />
+                <path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6" />
+              </svg>
+            )}
+          </button>
           <LocalePopover
             value={localeSig.value}
             locales={locales}
@@ -261,20 +302,37 @@ export function LoginView() {
 
                   <div class="volo-auth-divider">{t("auth.or_passkey")}</div>
 
-                  <button
-                    type="button"
-                    class="volo-btn"
-                    style={{ width: "100%", height: "40px" }}
-                    disabled={busy}
-                    onClick={handlePasskeyLogin}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
-                      <circle cx="7.5" cy="15.5" r="5.5" />
-                      <path d="m21 2-9.6 9.6" />
-                      <path d="m15.5 7.5 3 3L22 7l-3-3" />
-                    </svg>
-                    <span>{t("auth.passkey")}</span>
-                  </button>
+                  <div class="volo-sso-list">
+                    <button
+                      type="button"
+                      class="volo-btn"
+                      style={{ width: "100%", height: "40px" }}
+                      disabled={busy}
+                      onClick={handlePasskeyLogin}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="7.5" cy="15.5" r="5.5" />
+                        <path d="m21 2-9.6 9.6" />
+                        <path d="m15.5 7.5 3 3L22 7l-3-3" />
+                      </svg>
+                      <span>{t("auth.passkey")}</span>
+                    </button>
+                    {oidcProviders.map((p) => (
+                      <a
+                        key={p.name}
+                        href={p.start_url}
+                        class="volo-btn volo-sso-btn"
+                        style={{ width: "100%", height: "40px" }}
+                      >
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
+                          <polyline points="10 17 15 12 10 7" />
+                          <line x1="15" y1="12" x2="3" y2="12" />
+                        </svg>
+                        <span>{t("auth.sso_continue", { provider: p.display_name || p.name })}</span>
+                      </a>
+                    ))}
+                  </div>
                 </form>
               ) : (
                 <form onSubmit={handle2FASubmit} autoComplete="off">

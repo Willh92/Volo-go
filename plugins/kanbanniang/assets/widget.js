@@ -12,10 +12,18 @@
   function resolveLabels(root) {
     var lang = String((document.documentElement && document.documentElement.lang) || "").toLowerCase();
     var isEN = lang.indexOf("en") === 0;
+    var isTW = lang === "zh-tw" || lang.indexOf("zh-hant") === 0;
+    var greeting = isEN
+      ? (root.getAttribute("data-greeting-en") || root.getAttribute("data-greeting") || "Welcome! Click me for a head-pat~")
+      : isTW
+        ? (root.getAttribute("data-greeting-tw") || root.getAttribute("data-greeting") || "歡迎來到獨立部落格，點我可以摸摸頭～")
+        : (root.getAttribute("data-greeting-zh") || root.getAttribute("data-greeting") || "欢迎来到独立博客，点我可以摸摸头～");
     return {
-      dock: root.getAttribute("aria-label") || (isEN ? "Studio Mascot" : "看板娘助手"),
-      btn: root.getAttribute("data-btn-label") || (isEN ? "Pat mascot" : "摸摸看板娘"),
-      close: root.getAttribute("data-close-label") || (isEN ? "Dismiss message" : "收起提示")
+      dock: isEN ? "Studio Mascot" : "看板娘助手",
+      btn: isEN ? "Pat mascot" : "摸摸看板娘",
+      close: isEN ? "Dismiss message" : "收起提示",
+      rateLimited: isEN ? "Gentle pats please~" : isTW ? "摸太快啦，休息一下～" : "摸太快啦，歇会儿再摸～",
+      greeting: greeting
     };
   }
 
@@ -49,13 +57,15 @@
     var root = document.getElementById("volo-kanbanniang-root");
     if (!root || root.getAttribute("data-mounted") === "1") return;
     root.setAttribute("data-mounted", "1");
-    root.setAttribute("data-volo-persist", "kanbanniang");
+    if (!root.parentElement || !root.parentElement.hasAttribute("data-volo-persist")) {
+      root.setAttribute("data-volo-persist", "kanbanniang");
+    }
 
     var labels = resolveLabels(root);
-    root.setAttribute("aria-label", labels.dock);
+    root.setAttribute("aria-label", root.getAttribute("aria-label") || labels.dock);
 
     var ch = root.getAttribute("data-character") || "neko";
-    var greeting = root.getAttribute("data-greeting") || "Hello!";
+    var greeting = root.getAttribute("data-greeting") || labels.greeting;
     var patCount = parseInt(root.getAttribute("data-pats") || "0", 10) || 0;
 
     var bubble = document.createElement("div");
@@ -67,8 +77,9 @@
     var closeBtn = document.createElement("button");
     closeBtn.type = "button";
     closeBtn.className = "volo-kbn-close";
-    closeBtn.setAttribute("aria-label", labels.close);
-    closeBtn.title = labels.close;
+    var initCloseLbl = root.getAttribute("data-close-label") || labels.close;
+    closeBtn.setAttribute("aria-label", initCloseLbl);
+    closeBtn.title = initCloseLbl;
     closeBtn.textContent = "×";
     closeBtn.addEventListener("click", function (ev) {
       ev.stopPropagation();
@@ -82,7 +93,7 @@
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "volo-kbn-btn";
-    btn.setAttribute("aria-label", labels.btn);
+    btn.setAttribute("aria-label", root.getAttribute("data-btn-label") || labels.btn);
     btn.innerHTML = SVGS[ch] || SVGS.neko;
 
     btn.addEventListener("mouseenter", function () {
@@ -98,15 +109,24 @@
 
     btn.addEventListener("click", function () {
       dismissed = false;
+      var curLabels = resolveLabels(root);
       fetch("/plugins/kanbanniang/api/pat", {
         method: "POST",
         headers: { Accept: "application/json" }
       })
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (d && typeof d.total_pats === "number") {
-            patCount = d.total_pats;
-          } else {
+        .then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (d) {
+            return { status: r.status, ok: r.ok, d: d };
+          });
+        })
+        .then(function (res) {
+          if (res.status === 429) {
+            showBubble(bubble, textSpan, curLabels.rateLimited, 3500);
+            return;
+          }
+          if (res.d && typeof res.d.total_pats === "number") {
+            patCount = res.d.total_pats;
+          } else if (res.ok) {
             patCount += 1;
           }
           root.setAttribute("data-pats", String(patCount));
@@ -143,9 +163,14 @@
       closeBtn.setAttribute("aria-label", labels.close);
       closeBtn.title = labels.close;
     }
+    var bubble = root.querySelector(".volo-kbn-bubble");
+    var textEl = root.querySelector(".volo-kbn-bubble__text");
+    if (textEl && (!bubble || bubble.hidden)) {
+      textEl.textContent = labels.greeting;
+    }
     /* Keep patCount intact across PJAX; collapse speech bubble on book reader so TOC/controls are unobstructed */
     if (document.querySelector("[data-book-reader]")) {
-      collapseBubble(root.querySelector(".volo-kbn-bubble"));
+      collapseBubble(bubble);
     }
   }
 
@@ -154,6 +179,8 @@
   } else {
     mount();
   }
+  window.addEventListener("volo:pjax:after", onAfterNavigate);
+  document.addEventListener("volo:pjax:after", onAfterNavigate);
   window.addEventListener("volo:after-navigate", onAfterNavigate);
   document.addEventListener("volo:page-load", onAfterNavigate);
 })();

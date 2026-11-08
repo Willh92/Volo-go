@@ -18,8 +18,9 @@ export function computePortalMenuStyle(
   anchorRect: DOMRect,
   opts?: { minW?: number; maxW?: number; maxH?: number; align?: "left" | "right" }
 ): { style: CSSProperties; flipUp: boolean } {
-  const vw = typeof window !== "undefined" ? window.innerWidth : 1024;
-  const vh = typeof window !== "undefined" ? window.innerHeight : 768;
+  const vv = typeof window !== "undefined" ? window.visualViewport : null;
+  const vw = vv?.width || (typeof window !== "undefined" ? window.innerWidth : 1024);
+  const vh = vv?.height || (typeof window !== "undefined" ? window.innerHeight : 768);
   const margin = 8;
   const prefMaxW = opts?.maxW ?? 340;
   const prefMaxH = opts?.maxH ?? 268;
@@ -29,7 +30,7 @@ export function computePortalMenuStyle(
   const spaceBelow = vh - anchorRect.bottom - margin;
   const spaceAbove = anchorRect.top - margin;
   const flipUp = spaceBelow < 220 && spaceAbove > spaceBelow;
-  const availH = Math.max(116, Math.min(prefMaxH, (flipUp ? spaceAbove : spaceBelow) - 6));
+  const availH = Math.max(96, Math.min(prefMaxH, (flipUp ? spaceAbove : spaceBelow) - 6));
 
   const preferRight =
     opts?.align === "right" ||
@@ -39,7 +40,7 @@ export function computePortalMenuStyle(
     position: "fixed",
     minWidth: `${minW}px`,
     maxHeight: `${availH}px`,
-    zIndex: 1300,
+    zIndex: 2200,
   };
 
   if (preferRight) {
@@ -125,7 +126,8 @@ export function ConsoleSelect({
     const el = btnRef.current || wrapRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    if (rect.bottom < 0 || rect.top > window.innerHeight) {
+    const vh = window.visualViewport?.height || window.innerHeight;
+    if (rect.bottom < 0 || rect.top > vh + 40) {
       setOpen(false);
       setClosing(false);
       return;
@@ -173,11 +175,15 @@ export function ConsoleSelect({
       }
       updateMenuPosition();
     };
+    const vv = window.visualViewport;
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
     window.addEventListener("resize", onScrollOrResize);
     window.addEventListener("scroll", onScrollOrResize, true);
-    if (isSearchable) {
+    vv?.addEventListener("resize", onScrollOrResize);
+    vv?.addEventListener("scroll", onScrollOrResize);
+    const isCoarse = Boolean(window.matchMedia?.("(pointer: coarse)")?.matches);
+    if (isSearchable && !isCoarse) {
       window.requestAnimationFrame(() => searchRef.current?.focus());
     }
     return () => {
@@ -185,6 +191,8 @@ export function ConsoleSelect({
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener("resize", onScrollOrResize);
       window.removeEventListener("scroll", onScrollOrResize, true);
+      vv?.removeEventListener("resize", onScrollOrResize);
+      vv?.removeEventListener("scroll", onScrollOrResize);
     };
   }, [open, closing, isSearchable]);
 
@@ -383,7 +391,8 @@ export function ActionMenu({
   const updatePos = () => {
     if (!btnRef.current) return;
     const rect = btnRef.current.getBoundingClientRect();
-    if (rect.bottom < 0 || rect.top > window.innerHeight) {
+    const vh = window.visualViewport?.height || window.innerHeight;
+    if (rect.bottom < 0 || rect.top > vh + 40) {
       setOpen(false);
       setClosing(false);
       return;
@@ -425,15 +434,20 @@ export function ActionMenu({
       }
       updatePos();
     };
+    const vv = window.visualViewport;
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
     window.addEventListener("resize", onScrollOrResize);
     window.addEventListener("scroll", onScrollOrResize, true);
+    vv?.addEventListener("resize", onScrollOrResize);
+    vv?.addEventListener("scroll", onScrollOrResize);
     return () => {
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener("resize", onScrollOrResize);
       window.removeEventListener("scroll", onScrollOrResize, true);
+      vv?.removeEventListener("resize", onScrollOrResize);
+      vv?.removeEventListener("scroll", onScrollOrResize);
     };
   }, [open, closing]);
 
@@ -569,15 +583,20 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
       }
       updatePos();
     };
+    const vv = window.visualViewport;
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
     window.addEventListener("resize", onScrollOrResize);
     window.addEventListener("scroll", onScrollOrResize, true);
+    vv?.addEventListener("resize", onScrollOrResize);
+    vv?.addEventListener("scroll", onScrollOrResize);
     return () => {
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener("resize", onScrollOrResize);
       window.removeEventListener("scroll", onScrollOrResize, true);
+      vv?.removeEventListener("resize", onScrollOrResize);
+      vv?.removeEventListener("scroll", onScrollOrResize);
     };
   }, [open, closing]);
 
@@ -685,6 +704,9 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
   );
 }
 
+let modalSeq = 0;
+const openModalStack: number[] = [];
+
 export interface AnimatedModalProps {
   open: boolean;
   onClose: () => void;
@@ -706,6 +728,7 @@ export function AnimatedModal({
 }: AnimatedModalProps) {
   const [rendered, setRendered] = useState(open);
   const [closing, setClosing] = useState(false);
+  const [stackDepth, setStackDepth] = useState(0);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
@@ -725,22 +748,35 @@ export function AnimatedModal({
 
   useEffect(() => {
     if (!rendered) return;
+    const id = ++modalSeq;
+    const depth = openModalStack.length;
+    openModalStack.push(id);
+    setStackDepth(depth);
     acquireModalScrollLock();
     const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCloseRef.current();
+      if (e.key !== "Escape") return;
+      if (openModalStack[openModalStack.length - 1] !== id) return;
+      if (typeof document !== "undefined" && document.querySelector(".volo-cselect-menu.is-portal:not(.is-closing)")) {
+        return;
+      }
+      e.stopPropagation();
+      onCloseRef.current();
     };
     document.addEventListener("keydown", onEsc);
     return () => {
       document.removeEventListener("keydown", onEsc);
+      const idx = openModalStack.indexOf(id);
+      if (idx >= 0) openModalStack.splice(idx, 1);
       releaseModalScrollLock();
     };
   }, [rendered]);
 
-  if (!rendered) return null;
+  if (!rendered || typeof document === "undefined") return null;
 
-  return (
+  return createPortal(
     <div
       class={`volo-modal-backdrop ${closing ? "is-closing" : ""}`}
+      style={{ zIndex: 1000 + stackDepth * 20 }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -769,6 +805,29 @@ export function AnimatedModal({
         </div>
         <div class="volo-modal-body">{children}</div>
         {footer && <div class="volo-form-actions">{footer}</div>}
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+export function UploadProgressBar({
+  progress,
+  label,
+}: {
+  progress: number | null;
+  label?: string;
+}) {
+  if (progress === null || progress === undefined) return null;
+  const pct = Math.max(0, Math.min(100, Math.round(progress)));
+  return (
+    <div class="volo-upload-progress" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+      <div class="volo-upload-progress-head">
+        <span>{label || t("ed.uploading")}</span>
+        <span class="volo-code-chip">{pct}%</span>
+      </div>
+      <div class="volo-upload-progress-track">
+        <div class="volo-upload-progress-fill" style={{ width: `${pct}%` }} />
       </div>
     </div>
   );

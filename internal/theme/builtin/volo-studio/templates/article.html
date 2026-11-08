@@ -128,9 +128,16 @@
         {{end}}
 
         {{if .Detail.Tags}}
-          <div class="studio-article__foot-tags">
-            {{range .Detail.Tags}}
-              <a class="tag-chip" rel="tag" href="/tags/{{.Slug}}">#{{.Name}}</a>
+          {{$tagLen := len .Detail.Tags}}
+          <div class="studio-article__foot-tags article-foot-tags">
+            {{range $i, $tag := .Detail.Tags}}
+              <a class="tag-chip" rel="tag" href="/tags/{{$tag.Slug}}"{{if ge $i 12}} data-extra-tag hidden{{end}}>#{{$tag.Name}}</a>
+            {{end}}
+            {{if gt $tagLen 12}}
+              <button type="button" class="tag-chip studio-tags-more-btn js-foot-tags-toggle"
+                      aria-expanded="false"
+                      data-more-label="+{{sub $tagLen 12}}"
+                      data-less-label="{{if hasPrefix .Locale "en"}}Show less{{else if eq .Locale "zh-TW"}}收起{{else}}收起{{end}}">+{{sub $tagLen 12}}</button>
             {{end}}
           </div>
         {{end}}

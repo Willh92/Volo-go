@@ -72,6 +72,22 @@ themes/my-editorial/
 - **桌面与手机独立主题设置**：管理台 **「外观与扩展 -> 主题皮肤」** 支持为桌面端（`active_theme`）与手机端（`mobile_theme`，留空则跟随桌面主题）分别启用不同主题，服务端按请求设备特征自动分流并输出 `Vary: User-Agent, Sec-CH-UA-Mobile`；管理员可通过 `/?skin=<id>` 与 `/?skin=<id>&device=mobile` 免切换实时预览。
 - **主题级顶部菜单显隐、排序与溢出收纳**：主题可在 `theme.json` 的 `config_schema` 中声明 `"type": "sortable_list"`（如内置 `volo-studio` 与外部 `volo-journal` 的 `header_nav_items` + `header_nav_primary_count`），允许站长自由勾选并拖拽/调整内置栏目（`home`、`archives`、`tags`、`categories`、`series`、`books`、`links`、`follows`、`dynamic`）及自定义导航插槽（`custom`，自动展开后台自定义的导航链接且默认排在末尾）。模板直接读取 `PageContext.NavMenu`（含 `.NavMenu.Primary` 顶栏直出项、`.NavMenu.Overflow` “更多”收纳项与 `.NavMenu.OverflowActive` 高亮态）即可渲染自适应导航栏。
 
+### 1.5 独立页面可选模板协议（`page_templates`）
+
+主题可在 `theme.json` 中通过 `"page_templates"` 声明供后台独立页面（Pages）选择的专属排版模板（对应渲染 `templates/page-<id>.html`，切换至不含该模板的主题时自动安全回退至 `templates/page.html`）：
+
+```json
+{
+  "page_templates": [
+    {
+      "id": "wide",
+      "name": { "zh-CN": "宽幅画廊排版", "en-US": "Wide Showcase" },
+      "description": { "zh-CN": "无侧栏全宽画布页面", "en-US": "Full-width layout without sidebar" }
+    }
+  ]
+}
+```
+
 ---
 
 ## 2. 安全沙箱插件开发（`manifest.json` + `goja`）
@@ -83,15 +99,24 @@ themes/my-editorial/
 ```text
 plugins/hello-callout/
 ├── manifest.json           # 权限、插槽、钩子、定时任务与配置表单 Schema
-├── main.js                 # 纯 Go 内嵌 goja (ES2020+) 沙箱入口脚本
+├── main.js                 # 纯 Go 内嵌 JSVM 沙箱入口脚本
 └── assets/                 # 可选静态资源（通过 /plugins/hello-callout/assets/* 分发）
     ├── widget.css
     └── widget.js
 ```
 
-管理员既可将目录直接放入 `./plugins/`，也可在管理台 **「插件扩展」** 页面直接上传 `.zip` 插件包一键校验安装、自动根据 `config_schema` 渲染多语言配置表单，并随时热启停或卸载。
+管理员既可将目录直接放入 `./plugins/`，也可在管理台 **「插件扩展」** 页面直接上传 `.zip` 插件包或点击 **「重新扫描插件」** 零停机热重载、自动根据 `config_schema` 渲染多语言配置表单，并随时热启停或卸载（支持按需一并清理 `plugin_kv` 数据）。
 
-### 2.2 `manifest.json` 完整字段说明
+### 2.2 `manifest.json` 完整字段与统一 `config_schema` 规范
+
+`theme.json` 与 `manifest.json` 共享完全一致的 `config_schema` 控件类型体系：
+- `string` / `text`（单行文本）、`textarea`（多行文本）
+- `number`（支持可选 `min`、`max`、`step` 数值范围与步进约束）
+- `boolean`（布尔开关）
+- `select`（下拉选择，配 `options: [{ "value": "...", "label": { ... } }]`）
+- `url`、`image`（自动安全净化，拦截 `javascript:` / `data:` 危险协议）
+- `color`（`#rgb` / `#rrggbb` 颜色选择器）
+- `sortable_list`（可勾选显隐并拖拽排序的列表项）
 
 ```json
 {
@@ -112,11 +137,13 @@ plugins/hello-callout/
   },
   "permissions": [
     "kv",
+    "hooks:render.pre_markdown",
     "hooks:render.post_html",
     "slots:article.after_content",
     "http.outbound:api.github.com"
   ],
-  "hooks": ["render.post_html"],
+  "allowed_hosts": ["api.github.com"],
+  "hooks": ["render.pre_markdown", "render.post_html"],
   "ui_slots": [
     {
       "slot": "article.after_content",
@@ -127,9 +154,24 @@ plugins/hello-callout/
   "config_schema": [
     {
       "key": "banner_text",
-      "type": "string",
+      "type": "textarea",
       "default": "感谢阅读，欢迎通过 RSS 订阅更新。",
       "label": { "zh-CN": "提示文案", "en-US": "Banner Text" }
+    },
+    {
+      "key": "accent_color",
+      "type": "color",
+      "default": "#1f5c48",
+      "label": { "zh-CN": "卡片强调色", "en-US": "Accent Color" }
+    },
+    {
+      "key": "max_items",
+      "type": "number",
+      "default": 5,
+      "min": 1,
+      "max": 20,
+      "step": 1,
+      "label": { "zh-CN": "最大条数", "en-US": "Max Items" }
     },
     {
       "key": "api_secret",
@@ -143,35 +185,70 @@ plugins/hello-callout/
 
 > **密钥落盘加密保证**：`config_schema` 中标记 `"secret": true` 的字段在写入数据库时自动使用 `KeyRing` 进行 `AES-256-GCM` 列级加密，且在后台配置接口中自动脱敏为掩码，不会明文回显。
 
-### 2.3 标准权限（Permissions）、钩子（Hooks）与插槽（UI Slots）
+### 2.3 标准权限（Permissions）、钩子（Hooks）、插槽（UI Slots）与扩展 Provider
 
 1. **权限白名单令牌**：
-   - 存储：`kv`（读写）、`kv:read`（只读 `plugin_kv`，单插件默认配额上限保护）；
-   - 领域钩子：`hooks:article.published`、`hooks:article.updated`、`hooks:comment.before_create`、`hooks:comment.created`、`hooks:render.post_html`；
-   - 界面插槽：`slots:public.head`、`slots:public.header`、`slots:article.before_content`、`slots:article.after_content`、`slots:public.footer`、`slots:editor.quick_insert`、`slots:admin.dashboard_card`；
-   - 网络与路由：`http:routes`（挂载 `/plugins/<id>/api/*` 自定义公开路由）、`http.outbound:<hostname>`（显式域名白名单 + `OutboundSafeDialer` 拦截内网/回环/云元数据 IP 防 SSRF）；
-   - 高敏读取：`articles:read_protected`（未显式声明此权限并经管理员知情启用的插件，绝不会收到密码保护文章或未解锁块内容）。
+   - **存储**：`kv`（读写）、`kv:read`（只读 `plugin_kv`，单插件默认配额上限保护，且后台 KV 写入采用非缓存失效通道，不抖动主站文章/RSS 缓存）；
+   - **领域钩子**：
+     - 文章生命周期：`hooks:article.published`、`hooks:article.updated`、`hooks:article.deleted`；
+     - 独立页面生命周期：`hooks:page.published`、`hooks:page.updated`、`hooks:page.deleted`；
+     - 评论治理：`hooks:comment.before_create`、`hooks:comment.created`、`hooks:comment.moderated`；
+     - 渲染管线：`hooks:render.pre_markdown`（在非加密文章进入 Markdown 解析器前改写 `content_md`）与 `hooks:render.post_html`（对渲染后的 HTML 做后处理并二次净化）；
+   - **界面插槽**：`slots:public.head`、`slots:public.header`、`slots:article.before_content`、`slots:article.after_content`、`slots:comment.before`、`slots:comment.after`、`slots:public.footer`、`slots:editor.quick_insert`、`slots:admin.dashboard_card`；
+   - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*` 自定义公开路由）、`http:raw_headers`（按需透传 `x-hub-signature-256`、`x-signature`、`stripe-signature`、`authorization` 等安全验签请求头）、`http.outbound:<hostname>` / `allowed_hosts`（显式域名或 `*.domain.tld` 白名单 + `OutboundSafeDialer` 防 SSRF）；
+   - **核心扩展 Provider**：
+     - `provider:storage`：当 `main.js` 实现 `storagePut(relKey, contentType, bodyBase64)` 与 `storageDelete(relKey)`（及可选 `storageHealthCheck()`）时自动注册外部媒体/备份对象存储驱动（`StorageProvider`）；返回的公开 URL 经安全校验，若插件熔断或不可用则自动降级回本地磁盘不中断上传；
+     - `provider:oidc`：当 `main.js` 实现 `oidcAuthURL(state, redirectURI)` 与 `oidcExchange(code, redirectURI)`（及可选 `oidcProviderInfo()` 返回 `{ id, display_name }`）时自动注册第三方读者联合登录驱动（`OIDCProvider`）；
+     - `provider:notifier`：注册自定义通知渠道（`notifySend(event)`），与邮件和 Webhook 并行分发；
+     - `provider:captcha`：注册自定义人机验证器（`captchaRenderWidget(locale)` + `captchaVerify(token, clientIP)`）；
+   - **高敏读取**：`articles:read_protected`（未显式声明此权限并经管理员知情启用的插件，绝不会收到密码保护文章或未解锁 `:::lock` 内容）。
 
-2. **沙箱熔断与样式隔离红线**：
-   - 每次 JS Hook / Slot 执行受严格指令中断超时与内存保护，连续异常或超时自动打开**熔断器（`CircuitOpen`）**旁路该插件，绝不拖垮主站响应；
-   - `render.post_html` 返回的 HTML 二次经过 `bluemonday` 白名单净化，杜绝插件引入存储型 XSS；
+2. **沙箱熔断、资源护栏与 XSS 隔离红线**：
+   - 每次 JS Hook / Slot 执行受严格指令步数预算、墙钟超时、循环引用深度上限（`Export` / `JSON.stringify`）及 `4 MiB` 字符串体积上限保护；连续异常或超时自动打开**熔断器（`CircuitOpen`）**旁路该插件；
+   - `render.post_html` 与后台仪表盘卡片 `admin.dashboard_card` 输出均经过严格白名单 HTML 净化（剥离 `<script>`、`<iframe>`、`on*` 事件属性与 `javascript:`/`data:` 协议）；
    - 插件 CSS 变量必须使用 `--volo-plugin-<id>-*` 命名空间，包裹容器自动带 `.volo-plugin-scope[data-plugin="<id>"]` 以避免污染宿主排版。
 
-### 2.4 `main.js` 编写示例
+### 2.4 沙箱 SDK（`volo.*`）与 `main.js` 编写示例
+
+- `volo.on(hookName, handlerFn)`（或全局 `function onHook(hookName, payload)`）：订阅已声明的领域/渲染钩子；
+- `volo.escapeHTML(str)`：对不可信文本做 HTML 实体转义，防止动态插槽拼接引入 XSS；
+- `volo.config.get(key)` / `volo.config.all()`：读取校验后的插件配置（含沙箱内自动解密的 `secret` 字段）；
+- `volo.kv.get(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?)` / `volo.kv.list(prefix, limit?, afterKey?)`：命名空间隔离 KV 存储，支持传入第 3 个参数 `afterKey` 进行游标翻页；
+- `volo.http.fetch(url, options?)`：受白名单与 `OutboundSafeDialer` 保护的出站 HTTP 请求；
+- `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`：结构化插件日志。
 
 ```javascript
-// 订阅文章 HTML 后处理钩子
-volo.on("render.post_html", function (ctx) {
-  var hits = Number(volo.kv.get("rendered_count") || "0") + 1;
-  volo.kv.set("rendered_count", String(hits));
-  return ctx.html;
+// 通过 volo.on(...) 订阅 Markdown 预处理与 HTML 后处理钩子
+volo.on("render.pre_markdown", function (article) {
+  return {
+    content_md: article.content_md.replace(/\[toc\]/gi, "## 目录\n")
+  };
 });
 
-// 动态渲染 UI 插槽
+volo.on("render.post_html", function (payload) {
+  volo.kv.incr("rendered_count", 1);
+  return { html: payload.html };
+});
+
+// 使用 afterKey 游标翻页遍历插件 KV
+function listAllBadges() {
+  var out = [];
+  var cursor = "";
+  while (true) {
+    var batch = volo.kv.list("badge:", 100, cursor);
+    if (!batch || batch.length === 0) break;
+    out = out.concat(batch);
+    cursor = batch[batch.length - 1].key;
+    if (batch.length < 100) break;
+  }
+  return out;
+}
+
+// 使用 volo.escapeHTML 安全渲染动态 UI 插槽
 function renderSlot(slotName, ctx) {
   if (slotName === "article.after_content") {
-    var msg = volo.config.get("banner_text") || "Thanks for reading!";
-    return '<aside class="callout-box">' + volo.escapeHTML(msg) + "</aside>";
+    var msg = volo.config.get("banner_text") || "感谢阅读！";
+    return '<aside class="callout-box">' + volo.escapeHTML(String(msg)) + "</aside>";
   }
   return "";
 }

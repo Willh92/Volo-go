@@ -2,6 +2,8 @@ package theme
 
 import (
 	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -148,15 +151,11 @@ func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest
 	e.mu.RLock()
 	bt := e.themes[DefaultThemeID]
 	e.mu.RUnlock()
-	var builtinAssets map[string]cachedAsset
-	if bt != nil {
-		builtinAssets = e.ensureAssets(bt)
-	}
-	compiled, err := e.compileThemeFS(os.DirFS(stageDir), subFS, builtinAssets, false, nil, nil)
+	mf, err := e.validateStagedThemeFS(os.DirFS(stageDir), subFS, bt)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("theme: validation failed: %w", err)
 	}
-	id := strings.TrimSpace(compiled.manifest.ID)
+	id := strings.TrimSpace(mf.ID)
 	if !validThemeIDRe.MatchString(id) {
 		return Manifest{}, fmt.Errorf("theme: invalid id %q (must match [a-z0-9][a-z0-9_-]{1,62})", id)
 	}
@@ -188,7 +187,7 @@ func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest
 	if err := e.Reload(); err != nil {
 		return Manifest{}, err
 	}
-	return compiled.manifest, nil
+	return mf, nil
 }
 
 // Uninstall removes an external theme directory from `themesDir` and reloads the engine.
@@ -227,4 +226,87 @@ func normalizeZipEntry(raw string) string {
 		return ""
 	}
 	return cleaned
+}
+
+// ExportZip streams the specified built-in or external theme package as a standard `.zip` archive.
+func (e *Engine) ExportZip(w io.Writer, themeID string) error {
+	id := strings.TrimSpace(themeID)
+	if id == "" {
+		return errors.New("theme: missing theme id")
+	}
+	e.mu.RLock()
+	th, ok := e.themes[id]
+	e.mu.RUnlock()
+	if !ok || th == nil || th.fsys == nil {
+		return fmt.Errorf("theme %q not found", id)
+	}
+
+	entriesByPath := make(map[string][]byte)
+
+	err := fs.WalkDir(th.fsys, ".", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || p == "." {
+			return nil
+		}
+		baseName := path.Base(p)
+		if strings.HasPrefix(baseName, ".") {
+			return nil
+		}
+		data, rErr := fs.ReadFile(th.fsys, p)
+		if rErr != nil {
+			return rErr
+		}
+		for _, pair := range [][2]string{{"assets_gz/", "assets/"}, {"templates_gz/", "templates/"}} {
+			if strings.HasPrefix(p, pair[0]) && strings.HasSuffix(p, ".gz") {
+				relOut := pair[1] + strings.TrimSuffix(strings.TrimPrefix(p, pair[0]), ".gz")
+				if _, exists := entriesByPath[relOut]; !exists {
+					gr, gErr := gzip.NewReader(bytes.NewReader(data))
+					if gErr == nil {
+						inflated, iErr := io.ReadAll(io.LimitReader(gr, maxThemeSingleBytes))
+						_ = gr.Close()
+						if iErr == nil {
+							entriesByPath[relOut] = inflated
+							return nil
+						}
+					}
+				}
+				return nil
+			}
+		}
+		entriesByPath[p] = data
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("theme: walk %s: %w", id, err)
+	}
+	if len(entriesByPath) == 0 {
+		return fmt.Errorf("theme %q has no exportable files", id)
+	}
+
+	sortedKeys := make([]string, 0, len(entriesByPath))
+	for k := range entriesByPath {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+
+	zw := zip.NewWriter(w)
+	for _, k := range sortedKeys {
+		hdr := &zip.FileHeader{
+			Name:   k,
+			Method: zip.Deflate,
+		}
+		hdr.SetMode(0o644)
+		fw, cErr := zw.CreateHeader(hdr)
+		if cErr != nil {
+			_ = zw.Close()
+			return cErr
+		}
+		if _, wErr := fw.Write(entriesByPath[k]); wErr != nil {
+			_ = zw.Close()
+			return wErr
+		}
+	}
+	return zw.Close()
 }

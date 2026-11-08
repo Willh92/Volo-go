@@ -2,42 +2,75 @@
   "id": "volo-studio",
   "name": {
     "zh-CN": "Volo Studio 书房",
-    "en-US": "Volo Studio"
+    "en-US": "Volo Studio",
+    "zh-TW": "Volo Studio 書房"
   },
   "version": "1.1.0",
   "author": "Volo-go",
   "license": "Apache-2.0",
   "description": {
     "zh-CN": "现代温润纸感与森林墨绿调性的独立创作主题，原生支持四态深浅色、六套共享强调色、无刷新持久挂件路由、播客书架与侧栏自定义卡片。",
-    "en-US": "Botanical editorial theme with warm paper palette, 4-mode appearance, 6 shared accents, persistent PJAX islands, podcast player, bookshelf reader, and configurable sidebar widgets."
+    "en-US": "Botanical editorial theme with warm paper palette, 4-mode appearance, 6 shared accents, persistent PJAX islands, podcast player, bookshelf reader, and configurable sidebar widgets.",
+    "zh-TW": "現代溫潤紙感與森林墨綠調性的獨立創作主題，原生支援四態深淺色、六套共享強調色、無重新整理持久掛件路由、播客書架與側欄自訂卡片。"
   },
   "accents": ["forest", "ocean", "teal", "amber", "plum", "rose"],
   "supports_dark_mode": true,
   "supports_pjax": true,
+  "page_templates": [
+    {
+      "id": "default",
+      "value": "default",
+      "label": {
+        "zh-CN": "标准版式",
+        "en-US": "Default Layout",
+        "zh-TW": "標準版式"
+      }
+    },
+    {
+      "id": "wide",
+      "value": "wide",
+      "label": {
+        "zh-CN": "宽幅展示",
+        "en-US": "Wide Showcase",
+        "zh-TW": "寬幅展示"
+      }
+    },
+    {
+      "id": "minimal",
+      "value": "minimal",
+      "label": {
+        "zh-CN": "极简阅读",
+        "en-US": "Minimal Sheet",
+        "zh-TW": "極簡閱讀"
+      }
+    }
+  ],
   "config_schema": [
     {
       "key": "header_nav_items",
       "type": "sortable_list",
       "label": {
         "zh-CN": "顶部导航菜单项与排序",
-        "en-US": "Header Navigation Items & Order"
+        "en-US": "Header Navigation Items & Order",
+        "zh-TW": "頂部導覽選單項目與排序"
       },
       "description": {
         "zh-CN": "选择需要显示的导航项并调整顺序；「自定义导航链接」对应「分发 → 导航与重定向」中的链接，默认排在最后。",
-        "en-US": "Toggle visible header items and reorder them; 'Custom Navigation Links' maps to Distribute -> Navigation and defaults to last."
+        "en-US": "Toggle visible header items and reorder them; 'Custom Navigation Links' maps to Distribute -> Navigation and defaults to last.",
+        "zh-TW": "選擇需要顯示的導覽項目並調整順序；「自訂導覽連結」對應「分發 → 導覽與重新導向」中的連結，預設排在最後。"
       },
       "default": ["home", "archives", "tags", "categories", "series", "books", "links", "follows", "dynamic", "custom"],
       "options": [
-        { "value": "home", "label": { "zh-CN": "首页 (/)", "en-US": "Home (/)" } },
-        { "value": "archives", "label": { "zh-CN": "归档 (/archives)", "en-US": "Archives (/archives)" } },
-        { "value": "tags", "label": { "zh-CN": "标签 (/tags)", "en-US": "Tags (/tags)" } },
-        { "value": "categories", "label": { "zh-CN": "分类 (/categories)", "en-US": "Categories (/categories)" } },
-        { "value": "series", "label": { "zh-CN": "专栏 (/series)", "en-US": "Series (/series)" } },
-        { "value": "books", "label": { "zh-CN": "书架 (/books)", "en-US": "Bookshelf (/books)" } },
-        { "value": "links", "label": { "zh-CN": "友链 (/links)", "en-US": "Links (/links)" } },
-        { "value": "follows", "label": { "zh-CN": "订阅 (/follows)", "en-US": "Following (/follows)" } },
-        { "value": "dynamic", "label": { "zh-CN": "动态 (/dynamic)", "en-US": "Stream (/dynamic)" } },
-        { "value": "custom", "label": { "zh-CN": "自定义导航链接", "en-US": "Custom Navigation Links" } }
+        { "value": "home", "label": { "zh-CN": "首页 (/)", "en-US": "Home (/)", "zh-TW": "首頁 (/)" } },
+        { "value": "archives", "label": { "zh-CN": "归档 (/archives)", "en-US": "Archives (/archives)", "zh-TW": "歸檔 (/archives)" } },
+        { "value": "tags", "label": { "zh-CN": "标签 (/tags)", "en-US": "Tags (/tags)", "zh-TW": "標籤 (/tags)" } },
+        { "value": "categories", "label": { "zh-CN": "分类 (/categories)", "en-US": "Categories (/categories)", "zh-TW": "分類 (/categories)" } },
+        { "value": "series", "label": { "zh-CN": "专栏 (/series)", "en-US": "Series (/series)", "zh-TW": "專欄 (/series)" } },
+        { "value": "books", "label": { "zh-CN": "书架 (/books)", "en-US": "Bookshelf (/books)", "zh-TW": "書架 (/books)" } },
+        { "value": "links", "label": { "zh-CN": "友链 (/links)", "en-US": "Links (/links)", "zh-TW": "友鏈 (/links)" } },
+        { "value": "follows", "label": { "zh-CN": "订阅 (/follows)", "en-US": "Following (/follows)", "zh-TW": "訂閱 (/follows)" } },
+        { "value": "dynamic", "label": { "zh-CN": "动态 (/dynamic)", "en-US": "Stream (/dynamic)", "zh-TW": "動態 (/dynamic)" } },
+        { "value": "custom", "label": { "zh-CN": "自定义导航链接", "en-US": "Custom Navigation Links", "zh-TW": "自訂導覽連結" } }
       ]
     },
     {
@@ -45,31 +78,33 @@
       "type": "number",
       "label": {
         "zh-CN": "顶部直显菜单数量上限",
-        "en-US": "Max Primary Top-Bar Links"
+        "en-US": "Max Primary Top-Bar Links",
+        "zh-TW": "頂部直顯選單數量上限"
       },
       "description": {
         "zh-CN": "排在前面的菜单项直接展示在顶部栏，超出部分自动收纳进「更多」菜单（设为较大的数如 20 可全部直显）。",
-        "en-US": "Leading items render directly in the header bar; remaining items fold into the 'More' menu (set e.g. 20 to show all inline)."
+        "en-US": "Leading items render directly in the header bar; remaining items fold into the 'More' menu (set e.g. 20 to show all inline).",
+        "zh-TW": "排在前面的選單項目直接顯示於頂部欄，超出部分自動收納進「更多」選單（設為較大的數如 20 可全部直顯）。"
       },
       "default": 5
     },
     {
       "key": "hero_badge",
       "type": "text",
-      "label": { "zh-CN": "首页顶部铭牌文案", "en-US": "Hero Eyebrow Badge" },
-      "placeholder": { "zh-CN": "留空则不显示，例如：独立写作 · 数字花园", "en-US": "Optional eyebrow text above hero title" },
+      "label": { "zh-CN": "首页顶部铭牌文案", "en-US": "Hero Eyebrow Badge", "zh-TW": "首頁頂部銘牌文案" },
+      "placeholder": { "zh-CN": "留空则不显示，例如：独立写作 · 数字花园", "en-US": "Optional eyebrow text above hero title", "zh-TW": "留空則不顯示，例如：獨立寫作 · 數位花園" },
       "default": ""
     },
     {
       "key": "show_recent_posts",
       "type": "boolean",
-      "label": { "zh-CN": "侧栏显示近期与热门文章列表", "en-US": "Show Recent & Popular Posts in Sidebar" },
+      "label": { "zh-CN": "侧栏显示近期与热门文章列表", "en-US": "Show Recent & Popular Posts in Sidebar", "zh-TW": "側欄顯示近期與熱門文章列表" },
       "default": true
     },
     {
       "key": "show_site_stats",
       "type": "boolean",
-      "label": { "zh-CN": "页脚显示全站统计概览", "en-US": "Show Site Statistics in Footer" },
+      "label": { "zh-CN": "页脚显示全站统计概览", "en-US": "Show Site Statistics in Footer", "zh-TW": "頁尾顯示全站統計概覽" },
       "default": true
     }
   ]

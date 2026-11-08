@@ -61,6 +61,13 @@ func NewClient(cfg Config, safeDialer *security.OutboundSafeDialer) (*Client, er
 		return nil, fmt.Errorf("invalid s3 endpoint %q", cfg.Endpoint)
 	}
 
+	if base := strings.TrimSpace(cfg.PublicBaseURL); base != "" {
+		bu, pErr := url.Parse(base)
+		if pErr != nil || (bu.Scheme != "https" && bu.Scheme != "http") || bu.Host == "" {
+			return nil, fmt.Errorf("invalid s3 public_base_url %q (must be http:// or https://)", base)
+		}
+	}
+
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -97,7 +104,9 @@ func (c *Client) fullKey(objectKey string) string {
 func (c *Client) PublicURL(objectKey string) string {
 	fk := c.fullKey(objectKey)
 	if base := strings.TrimRight(strings.TrimSpace(c.cfg.PublicBaseURL), "/"); base != "" {
-		return base + "/" + escapeS3KeyPath(fk)
+		if bu, err := url.Parse(base); err == nil && (strings.EqualFold(bu.Scheme, "https") || strings.EqualFold(bu.Scheme, "http")) && bu.Host != "" {
+			return base + "/" + escapeS3KeyPath(fk)
+		}
 	}
 	u, _ := url.Parse(c.cfg.Endpoint)
 	if c.cfg.PathStyle {
@@ -139,6 +148,24 @@ func (c *Client) PutBytes(ctx context.Context, objectKey string, data []byte, co
 	return c.PublicURL(objectKey), nil
 }
 
+func adaptivePutStreamTimeout(size int64) time.Duration {
+	const (
+		minTimeout = 90 * time.Second
+		maxTimeout = 30 * time.Minute
+	)
+	if size <= 0 {
+		return minTimeout
+	}
+	calc := 60*time.Second + time.Duration(size/(512*1024))*time.Second
+	if calc < minTimeout {
+		return minTimeout
+	}
+	if calc > maxTimeout {
+		return maxTimeout
+	}
+	return calc
+}
+
 // PutStream uploads a seekable stream without buffering the entire archive in memory.
 func (c *Client) PutStream(ctx context.Context, objectKey string, rs io.ReadSeeker, size int64, contentType string) (string, error) {
 	if _, err := rs.Seek(0, io.SeekStart); err != nil {
@@ -158,7 +185,10 @@ func (c *Client) PutStream(ctx context.Context, objectKey string, rs io.ReadSeek
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, targetURL, rs)
+	uploadCtx, cancel := context.WithTimeout(ctx, adaptivePutStreamTimeout(size))
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(uploadCtx, http.MethodPut, targetURL, rs)
 	if err != nil {
 		return "", err
 	}
@@ -168,7 +198,9 @@ func (c *Client) PutStream(ctx context.Context, objectKey string, rs io.ReadSeek
 	}
 	c.signRequest(req, hostHdr, canonicalURI, payloadHash)
 
-	resp, err := c.httpClient.Do(req)
+	streamClient := *c.httpClient
+	streamClient.Timeout = 0
+	resp, err := streamClient.Do(req)
 	if err != nil {
 		return "", err
 	}

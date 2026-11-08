@@ -93,7 +93,21 @@ function readInitialThemeMode(): string {
   return bootConfig.default_theme || "auto";
 }
 
+export function resolveEffectiveTheme(mode: string): "light" | "dark" {
+  const clean = mode || "auto";
+  if (clean === "dark") return "dark";
+  if (clean === "light") return "light";
+  if (clean === "system") {
+    return typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)")?.matches
+      ? "dark"
+      : "light";
+  }
+  const h = new Date().getHours();
+  return h < 7 || h >= 19 ? "dark" : "light";
+}
+
 export const themeModeSig = signal<string>(readInitialThemeMode());
+export const effectiveDarkSig = signal<boolean>(resolveEffectiveTheme(themeModeSig.value) === "dark");
 export const accentSig = signal<string>(bootConfig.accent || "forest");
 export const storageDriverSig = signal<string>("local");
 
@@ -183,8 +197,10 @@ export function dismissToast() {
 export function applyThemeAttributes(mode: string, accent: string, persistMode = false) {
   const cleanMode = mode || "auto";
   const cleanAccent = accent || "forest";
+  const effective = resolveEffectiveTheme(cleanMode);
   themeModeSig.value = cleanMode;
   accentSig.value = cleanAccent;
+  effectiveDarkSig.value = effective === "dark";
   try {
     if (persistMode) {
       localStorage.setItem("volo_theme_mode", cleanMode);
@@ -194,19 +210,19 @@ export function applyThemeAttributes(mode: string, accent: string, persistMode =
   } catch {
     // Ignore storage errors
   }
-  document.documentElement.setAttribute("data-mode", cleanMode);
-  document.documentElement.setAttribute("data-accent", cleanAccent);
-
-  let dark = false;
-  if (cleanMode === "dark") {
-    dark = true;
-  } else if (cleanMode === "system") {
-    dark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ?? false;
-  } else if (cleanMode === "auto") {
-    const h = new Date().getHours();
-    dark = h < 7 || h >= 19;
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-mode", cleanMode);
+    document.documentElement.setAttribute("data-accent", cleanAccent);
+    document.documentElement.setAttribute("data-theme", effective);
   }
-  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+}
+
+export const applyConsoleAppearance = applyThemeAttributes;
+
+export function toggleEffectiveTheme(): "light" | "dark" {
+  const next = resolveEffectiveTheme(themeModeSig.value) === "dark" ? "light" : "dark";
+  applyThemeAttributes(next, accentSig.value, true);
+  return next;
 }
 
 if (typeof window !== "undefined") {
@@ -221,6 +237,27 @@ if (typeof window !== "undefined") {
       applyThemeAttributes(nextMode, accentSig.value, false);
     }
   });
+  const mql = window.matchMedia?.("(prefers-color-scheme: dark)");
+  const onSchemeChange = () => {
+    if (themeModeSig.value === "system") {
+      applyThemeAttributes("system", accentSig.value, false);
+    }
+  };
+  if (mql) {
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", onSchemeChange);
+    } else if (typeof (mql as any).addListener === "function") {
+      (mql as any).addListener(onSchemeChange);
+    }
+  }
+  window.setInterval(() => {
+    if (themeModeSig.value === "auto") {
+      const next = resolveEffectiveTheme("auto");
+      if ((next === "dark") !== effectiveDarkSig.value) {
+        applyThemeAttributes("auto", accentSig.value, false);
+      }
+    }
+  }, 60_000);
 }
 
 export async function saveGlobalAccent(nextAccent: string): Promise<void> {
@@ -358,12 +395,80 @@ function openDraftDB(): Promise<IDBDatabase> {
   });
 }
 
+export function uploadWithProgress<T = any>(
+  url: string,
+  fd: FormData,
+  onProgress?: (pct: number) => void,
+  method = "POST"
+): Promise<T> {
+  busyCountSig.value = busyCountSig.value + 1;
+  if (onProgress) onProgress(0);
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method.toUpperCase(), url, true);
+    xhr.withCredentials = true;
+    if (csrfTokenSig.value) {
+      xhr.setRequestHeader("X-CSRF-Token", csrfTokenSig.value);
+    }
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && ev.total > 0) {
+          onProgress(Math.min(100, Math.round((ev.loaded / ev.total) * 100)));
+        }
+      };
+    }
+    xhr.onload = () => {
+      busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+      const ct = xhr.getResponseHeader("Content-Type") || "";
+      let payload: any = null;
+      if (ct.includes("application/json")) {
+        try {
+          payload = JSON.parse(xhr.responseText || "null");
+        } catch {
+          payload = null;
+        }
+      } else {
+        payload = xhr.responseText || "";
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (onProgress) onProgress(100);
+        resolve(payload as T);
+      } else {
+        const msg = (payload && typeof payload === "object" && payload.error) || `HTTP ${xhr.status || 0}`;
+        reject(new ApiError(xhr.status || 0, msg, payload));
+      }
+    };
+    xhr.onerror = () => {
+      busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+      reject(new ApiError(0, "Network error"));
+    };
+    xhr.onabort = () => {
+      busyCountSig.value = Math.max(0, busyCountSig.value - 1);
+      reject(new ApiError(0, "Upload aborted"));
+    };
+    xhr.send(fd);
+  });
+}
+
 export interface LocalDraft {
   title: string;
   slug: string;
   summary_md: string;
   content_md: string;
   saved_at: number;
+  category_id?: string;
+  tags_text?: string;
+  tag_ids?: string[];
+  series_id?: string;
+  cover_url?: string;
+  visibility?: string;
+  status?: string;
+  template?: string;
+  is_published?: boolean;
+  show_toc?: boolean;
+  allow_comment?: boolean;
+  lang?: string;
+  translation_group?: string;
 }
 
 export async function saveLocalDraft(key: string, draft: LocalDraft): Promise<void> {

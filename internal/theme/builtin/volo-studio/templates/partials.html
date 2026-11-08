@@ -144,6 +144,7 @@
 {{end}}
 
 {{define "comment_mount"}}
+{{range .Ctx.CommentBeforeWidgets}}{{safeHTML .HTML}}{{end}}
 <section id="volo-comments" class="volo-comments-card"
          data-target-type="{{.TargetType}}"
          data-target-id="{{.TargetID}}"
@@ -197,6 +198,7 @@
          data-l-more-replies="{{if hasPrefix .Ctx.Locale "en"}}Show {count} more replies{{else if eq .Ctx.Locale "zh-TW"}}展開其餘 {count} 條回覆{{else}}展开其余 {count} 条回复{{end}}"
          data-l-net-err="{{t .Ctx.Locale "error.hint_default"}}">
 </section>
+{{range .Ctx.CommentAfterWidgets}}{{safeHTML .HTML}}{{end}}
 {{end}}
 
 {{define "pagination"}}

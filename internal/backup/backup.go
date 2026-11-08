@@ -525,11 +525,26 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 	}
 	defer rc.Close()
 
+	// Discover the target table's canonical schema columns so keys omitted on row 1
+	// are never dropped on subsequent rows and unknown/legacy keys are safely ignored.
+	validCols := make(map[string]string)
+	schemaRows, err := tx.QueryContext(ctx, "SELECT * FROM "+tx.Dialect().QuoteIdent(table)+" WHERE 1=0")
+	if err != nil {
+		return 0, err
+	}
+	tableColNames, colErr := schemaRows.Columns()
+	_ = schemaRows.Close()
+	if colErr != nil {
+		return 0, colErr
+	}
+	for _, colName := range tableColNames {
+		validCols[strings.ToLower(colName)] = colName
+	}
+
 	dec := json.NewDecoder(io.LimitReader(rc, maxSingleEntryBytes))
 	dec.UseNumber()
 
-	var cols []string
-	var insertSQL string
+	stmtSQLCache := make(map[string]string)
 	var count int64
 
 	for {
@@ -548,13 +563,24 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 			patchRedactedAdminRow(row, fallbackAdmins)
 		}
 
-		if len(cols) == 0 {
-			cols = make([]string, 0, len(row))
-			for k := range row {
-				cols = append(cols, k)
+		cols := make([]string, 0, len(row))
+		rowVals := make(map[string]any, len(row))
+		for k, v := range row {
+			if canonicalCol, ok := validCols[strings.ToLower(k)]; ok {
+				if _, dup := rowVals[canonicalCol]; !dup {
+					cols = append(cols, canonicalCol)
+				}
+				rowVals[canonicalCol] = v
 			}
-			sort.Strings(cols)
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		sort.Strings(cols)
 
+		colSig := strings.Join(cols, "\x00")
+		insertSQL, cached := stmtSQLCache[colSig]
+		if !cached {
 			quotedCols := make([]string, len(cols))
 			placeholders := make([]string, len(cols))
 			for i, c := range cols {
@@ -567,11 +593,12 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 				strings.Join(quotedCols, ", "),
 				strings.Join(placeholders, ", "),
 			)
+			stmtSQLCache[colSig] = insertSQL
 		}
 
 		args := make([]any, len(cols))
 		for i, c := range cols {
-			args[i] = coerceJSONValForDB(table, c, row[c], tx.Dialect().Name())
+			args[i] = coerceJSONValForDB(table, c, rowVals[c], tx.Dialect().Name())
 		}
 		if _, err := tx.ExecContext(ctx, insertSQL, args...); err != nil {
 			return count, err
@@ -596,7 +623,7 @@ func patchRedactedAdminRow(row map[string]any, fallbackAdmins []domain.User) {
 
 func coerceJSONValForDB(table string, col string, val any, dialectName string) any {
 	if val == nil {
-		return ""
+		return nil
 	}
 	if isBooleanColumn(table, col) {
 		b := false
@@ -643,6 +670,7 @@ func isBooleanColumn(table string, col string) bool {
 		"media_assets.exif_stripped",
 		"redirects.is_system_legacy",
 		"webhooks.is_enabled",
+		"webhook_deliveries.success",
 		"security_geo_rules.is_enabled",
 		"plugins.is_enabled":
 		return true

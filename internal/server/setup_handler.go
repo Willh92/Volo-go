@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -29,7 +28,61 @@ import (
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
-// isSameOriginRequest enforces browser Same-Origin verification on unauthenticated / public / setup
+func (s *AppServer) isTrustedProxyPeer(r *http.Request) bool {
+	if r == nil || s.deps.Config == nil {
+		return false
+	}
+	policy := s.deps.Config.TrustedProxies
+	remote := strings.TrimSpace(r.RemoteAddr)
+	isUnixPeer := remote == "" || remote == "@" || remote == "unix" || strings.HasPrefix(remote, "/")
+	if isUnixPeer {
+		return policy.TrustUnix
+	}
+	hostStr := remote
+	if h, _, err := net.SplitHostPort(remote); err == nil {
+		hostStr = h
+	}
+	if idx := strings.IndexByte(hostStr, '%'); idx > 0 {
+		hostStr = hostStr[:idx]
+	}
+	peerAddr, err := netip.ParseAddr(strings.Trim(hostStr, "[]"))
+	if err != nil {
+		return false
+	}
+	peerAddr = peerAddr.Unmap()
+	for _, pfx := range policy.Prefixes {
+		if pfx.Contains(peerAddr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *AppServer) effectiveRequestScheme(r *http.Request) string {
+	if r != nil && r.TLS != nil {
+		return "https"
+	}
+	if r != nil && s.isTrustedProxyPeer(r) {
+		if xfp := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xfp != "" {
+			first := strings.ToLower(strings.TrimSpace(strings.Split(xfp, ",")[0]))
+			if first == "https" || first == "http" {
+				return first
+			}
+		}
+	}
+	if s != nil && s.deps.Config != nil {
+		if pubRaw := strings.TrimSpace(s.deps.Config.GetPublicURL()); pubRaw != "" {
+			if u, err := url.Parse(pubRaw); err == nil && (u.Scheme == "https" || u.Scheme == "http") {
+				if r == nil || strings.TrimSpace(r.Host) == "" || strings.EqualFold(strings.TrimSpace(r.Host), strings.TrimSpace(u.Host)) {
+					return strings.ToLower(u.Scheme)
+				}
+			}
+		}
+	}
+	return "http"
+}
+
+// isSameOriginRequest enforces browser Same-Origin verification (both host AND scheme!) on
 // state-changing endpoints while allowing non-browser CLI/API clients that omit Origin/Referer/Sec-Fetch-Site.
 func (s *AppServer) isSameOriginRequest(r *http.Request) bool {
 	sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
@@ -37,13 +90,19 @@ func (s *AppServer) isSameOriginRequest(r *http.Request) bool {
 		return false
 	}
 	reqHost := strings.ToLower(strings.TrimSpace(r.Host))
+	reqScheme := s.effectiveRequestScheme(r)
+
 	pubHost := ""
-	if s.deps.Config != nil && strings.TrimSpace(s.deps.Config.PublicURL) != "" {
-		if u, err := url.Parse(strings.TrimSpace(s.deps.Config.PublicURL)); err == nil {
-			pubHost = strings.ToLower(strings.TrimSpace(u.Host))
+	pubScheme := ""
+	if s.deps.Config != nil {
+		if pubRaw := strings.TrimSpace(s.deps.Config.GetPublicURL()); pubRaw != "" {
+			if u, err := url.Parse(pubRaw); err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.TrimSpace(u.Host) != "" {
+				pubHost = strings.ToLower(strings.TrimSpace(u.Host))
+				pubScheme = strings.ToLower(strings.TrimSpace(u.Scheme))
+			}
 		}
 	}
-	matchesHost := func(raw string) bool {
+	matchesOrigin := func(raw string) bool {
 		if strings.EqualFold(raw, "null") {
 			return false
 		}
@@ -52,13 +111,23 @@ func (s *AppServer) isSameOriginRequest(r *http.Request) bool {
 			return false
 		}
 		h := strings.ToLower(strings.TrimSpace(u.Host))
-		return (reqHost != "" && h == reqHost) || (pubHost != "" && h == pubHost)
+		sch := strings.ToLower(strings.TrimSpace(u.Scheme))
+		if sch != "http" && sch != "https" {
+			return false
+		}
+		if reqHost != "" && h == reqHost && sch == reqScheme {
+			return true
+		}
+		if pubHost != "" && h == pubHost && sch == pubScheme {
+			return true
+		}
+		return false
 	}
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
-		return matchesHost(origin)
+		return matchesOrigin(origin)
 	}
 	if ref := strings.TrimSpace(r.Header.Get("Referer")); ref != "" {
-		return matchesHost(ref)
+		return matchesOrigin(ref)
 	}
 	return true
 }
@@ -94,13 +163,13 @@ func isForbiddenSetupDBPort(port int) bool {
 	}
 }
 
-func validateSetupDBEndpoint(ctx context.Context, host string, port int) error {
+func validateSetupDBEndpoint(ctx context.Context, host string, port int) (netip.Addr, error) {
 	clean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(strings.Trim(host, "[]")), "."))
 	if clean == "" || clean == "metadata" || strings.HasSuffix(clean, ".internal") {
-		return fmt.Errorf("forbidden database hostname %q", host)
+		return netip.Addr{}, fmt.Errorf("forbidden database hostname %q", host)
 	}
 	if isForbiddenSetupDBPort(port) {
-		return fmt.Errorf("forbidden database port %d", port)
+		return netip.Addr{}, fmt.Errorf("forbidden database port %d", port)
 	}
 	checkIP := func(ip netip.Addr) error {
 		u := ip.Unmap()
@@ -115,18 +184,21 @@ func validateSetupDBEndpoint(ctx context.Context, host string, port int) error {
 		return nil
 	}
 	if ip, err := netip.ParseAddr(clean); err == nil {
-		return checkIP(ip)
+		if err := checkIP(ip); err != nil {
+			return netip.Addr{}, err
+		}
+		return ip.Unmap(), nil
 	}
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", clean)
 	if err != nil || len(addrs) == 0 {
-		return fmt.Errorf("cannot resolve database host %q", host)
+		return netip.Addr{}, fmt.Errorf("cannot resolve database host %q", host)
 	}
 	for _, ip := range addrs {
 		if err := checkIP(ip); err != nil {
-			return err
+			return netip.Addr{}, err
 		}
 	}
-	return nil
+	return addrs[0].Unmap(), nil
 }
 
 func extractSetupSQLTargets(driver, dsn string) ([]struct {
@@ -330,11 +402,39 @@ func (s *AppServer) validateAndNormalizeSetupDB(ctx context.Context, rawDriver, 
 		return "", "", err
 	}
 	for _, t := range targets {
-		if err := validateSetupDBEndpoint(ctx, t.host, t.port); err != nil {
+		if _, err := validateSetupDBEndpoint(ctx, t.host, t.port); err != nil {
 			return "", "", err
 		}
 	}
 	return driver, dsn, nil
+}
+
+func pinSetupDSNToValidatedIP(driver, dsn string, validIP netip.Addr, port int) string {
+	if !validIP.IsValid() || port <= 0 {
+		return dsn
+	}
+	ipStr := validIP.String()
+	switch driver {
+	case "mysql":
+		if myCfg, err := mysql.ParseDSN(dsn); err == nil {
+			myCfg.Addr = net.JoinHostPort(ipStr, strconv.Itoa(port))
+			return myCfg.FormatDSN()
+		}
+	case "postgres":
+		lower := strings.ToLower(strings.TrimSpace(dsn))
+		if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
+			if u, err := url.Parse(dsn); err == nil {
+				q := u.Query()
+				q.Set("hostaddr", ipStr)
+				u.RawQuery = q.Encode()
+				return u.String()
+			}
+		}
+		if !strings.Contains(lower, "hostaddr=") {
+			return strings.TrimSpace(dsn) + " hostaddr=" + ipStr
+		}
+	}
+	return dsn
 }
 
 func (s *AppServer) isSameCurrentDB(driver, dsn string, simpleProto bool) bool {
@@ -359,6 +459,36 @@ func (s *AppServer) probeSetupDB(ctx context.Context, driver, dsn string, simple
 	testCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
+	dialDSN := dsn
+	if driver == "postgres" || driver == "mysql" {
+		targets, err := extractSetupSQLTargets(driver, dsn)
+		if err != nil {
+			return "", 0, err
+		}
+		var primaryIP netip.Addr
+		var primaryPort int
+		for i, t := range targets {
+			validIP, vErr := validateSetupDBEndpoint(testCtx, t.host, t.port)
+			if vErr != nil {
+				return "", 0, vErr
+			}
+			if i == 0 {
+				primaryIP = validIP
+				primaryPort = t.port
+			}
+		}
+		if primaryIP.IsValid() && primaryPort > 0 {
+			pinnedAddr := net.JoinHostPort(primaryIP.String(), strconv.Itoa(primaryPort))
+			var d net.Dialer
+			conn, dErr := d.DialContext(testCtx, "tcp", pinnedAddr)
+			if dErr != nil {
+				return "", 0, dErr
+			}
+			_ = conn.Close()
+			dialDSN = pinSetupDSNToValidatedIP(driver, dsn, primaryIP, primaryPort)
+		}
+	}
+
 	existedBefore := true
 	if driver == "sqlite" && dsn != ":memory:" && !strings.HasPrefix(dsn, "file::memory:") {
 		if _, err := os.Stat(dsn); os.IsNotExist(err) {
@@ -376,7 +506,7 @@ func (s *AppServer) probeSetupDB(ctx context.Context, driver, dsn string, simple
 	start := time.Now()
 	probeStore, err := sqlx.Open(testCtx, sqlx.Options{
 		Driver:         driver,
-		DSN:            dsn,
+		DSN:            dialDSN,
 		SimpleProtocol: simpleProto,
 		MaxOpenConns:   2,
 		MaxIdleConns:   1,
@@ -414,9 +544,18 @@ func (s *AppServer) applySetupDatabaseSelection(ctx context.Context, rawDriver, 
 		return nil
 	}
 
+	openDSN := dsn
+	if driver == "postgres" || driver == "mysql" {
+		if targets, tErr := extractSetupSQLTargets(driver, dsn); tErr == nil && len(targets) > 0 {
+			if validIP, vErr := validateSetupDBEndpoint(ctx, targets[0].host, targets[0].port); vErr == nil {
+				openDSN = pinSetupDSNToValidatedIP(driver, dsn, validIP, targets[0].port)
+			}
+		}
+	}
+
 	newStore, err := sqlx.Open(ctx, sqlx.Options{
 		Driver:         driver,
-		DSN:            dsn,
+		DSN:            openDSN,
 		SimpleProtocol: simpleProto,
 		MaxOpenConns:   s.deps.Config.DBMaxOpenConns,
 		MaxIdleConns:   s.deps.Config.DBMaxIdleConns,
@@ -473,7 +612,7 @@ func (s *AppServer) reloadRuntimeAfterDBRestore(ctx context.Context) {
 		_ = s.deps.Themes.Reload()
 	}
 	if s.deps.Plugins != nil {
-		_ = s.deps.Plugins.DiscoverAndStart(ctx)
+		_ = s.deps.Plugins.ReloadAll(ctx)
 	}
 	if s.deps.Content != nil {
 		_ = s.deps.Content.RefreshMediaDimsCache(ctx)
@@ -930,37 +1069,41 @@ func parseSetupBoolField(raw string, fallback bool) bool {
 
 func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Request, allowDBSwap bool) (*etl.ImportReport, bool, string, error) {
 	const maxLegacyBytes = 256 << 20 // 256 MiB streaming cap
-	r.Body = http.MaxBytesReader(w, r.Body, maxLegacyBytes)
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		return nil, false, "", fmt.Errorf("upload parse error: %w", err)
-	}
-	file, hdr, err := r.FormFile("file")
+	spooled, err := streamMultipartSingleFile(w, r, "file", maxLegacyBytes, s.ensureTempDir(), "volo-legacy-", ".zip", ".zip", ".json")
 	if err != nil {
-		return nil, false, "", fmt.Errorf("missing multipart 'file' field")
+		return nil, false, "", err
 	}
-	defer file.Close()
+	tmpPath := spooled.TempPath
+	defer os.Remove(tmpPath)
+
+	formVal := func(key string) string {
+		if spooled.FormFields == nil {
+			return ""
+		}
+		return spooled.FormFields[key]
+	}
 
 	dryRaw := strings.TrimSpace(r.URL.Query().Get("dry_run"))
 	if dryRaw == "" {
-		dryRaw = strings.TrimSpace(r.FormValue("dry_run"))
+		dryRaw = strings.TrimSpace(formVal("dry_run"))
 	}
 	dryRun := strings.EqualFold(dryRaw, "true") || dryRaw == "1"
 
-	rawDriver := strings.TrimSpace(r.FormValue("driver"))
+	rawDriver := strings.TrimSpace(formVal("driver"))
 	if rawDriver == "" {
-		rawDriver = strings.TrimSpace(r.FormValue("db_driver"))
+		rawDriver = strings.TrimSpace(formVal("db_driver"))
 	}
-	rawDSN := strings.TrimSpace(r.FormValue("dsn"))
+	rawDSN := strings.TrimSpace(formVal("dsn"))
 	if rawDSN == "" {
-		rawDSN = strings.TrimSpace(r.FormValue("db_dsn"))
+		rawDSN = strings.TrimSpace(formVal("db_dsn"))
 	}
-	simpleRaw := strings.TrimSpace(r.FormValue("simple_protocol"))
+	simpleRaw := strings.TrimSpace(formVal("simple_protocol"))
 	if simpleRaw == "" {
-		simpleRaw = strings.TrimSpace(r.FormValue("db_simple_protocol"))
+		simpleRaw = strings.TrimSpace(formVal("db_simple_protocol"))
 	}
 	simpleProto := parseSetupBoolField(simpleRaw, s.deps.Config.DBSimpleProtocol)
 
-	newSiteURL := strings.TrimSpace(r.FormValue("new_site_url"))
+	newSiteURL := strings.TrimSpace(formVal("new_site_url"))
 	if newSiteURL != "" {
 		parsedURL, uErr := url.Parse(newSiteURL)
 		if uErr != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || strings.TrimSpace(parsedURL.Host) == "" {
@@ -969,16 +1112,16 @@ func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Requ
 		newSiteURL = strings.TrimRight(newSiteURL, "/")
 	}
 
-	adminUsername := strings.TrimSpace(r.FormValue("admin_username"))
+	adminUsername := strings.TrimSpace(formVal("admin_username"))
 	if adminUsername != "" && (len(adminUsername) < 2 || len(adminUsername) > 48) {
 		return nil, dryRun, "", fmt.Errorf("admin_username must be 2-48 characters")
 	}
-	adminEmail := strings.ToLower(strings.TrimSpace(r.FormValue("admin_email")))
+	adminEmail := strings.ToLower(strings.TrimSpace(formVal("admin_email")))
 	if adminEmail != "" && (!strings.Contains(adminEmail, "@") || len(adminEmail) > 190) {
 		return nil, dryRun, "", fmt.Errorf("valid admin_email is required")
 	}
-	adminDisplayName := strings.TrimSpace(r.FormValue("admin_display_name"))
-	adminPassword := r.FormValue("admin_password")
+	adminDisplayName := strings.TrimSpace(formVal("admin_display_name"))
+	adminPassword := formVal("admin_password")
 	adminPasswordHash := ""
 	if adminPassword != "" {
 		if err := auth.ValidatePasswordPolicy(adminPassword); err != nil {
@@ -1013,41 +1156,24 @@ func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	ext := strings.ToLower(filepath.Ext(hdr.Filename))
-	if ext != ".zip" && ext != ".json" {
-		ext = ".zip"
-	}
-	tmpFile, err := os.CreateTemp(s.ensureTempDir(), "volo-legacy-*"+ext)
-	if err != nil {
-		return nil, dryRun, "", err
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := io.Copy(tmpFile, io.LimitReader(file, maxLegacyBytes)); err != nil {
-		_ = tmpFile.Close()
-		return nil, dryRun, "", err
-	}
-	_ = tmpFile.Close()
-
 	if allowDBSwap && !dryRun {
 		if err := s.applySetupDatabaseSelection(r.Context(), rawDriver, rawDSN, simpleProto); err != nil {
 			return nil, false, "", err
 		}
 	}
 
-	storageMode := strings.ToLower(strings.TrimSpace(r.FormValue("storage_mode")))
+	storageMode := strings.ToLower(strings.TrimSpace(formVal("storage_mode")))
 	opts := etl.ImportOptions{
 		DryRun:            dryRun,
 		TargetUploadDir:   s.deps.Config.UploadDir,
 		AdminPath:         s.deps.Config.AdminPath,
-		OldURLPrefixes:    splitSetupURLPrefixes(r.FormValue("old_site_url")),
+		OldURLPrefixes:    splitSetupURLPrefixes(formVal("old_site_url")),
 		NewSiteURL:        newSiteURL,
-		SiteTitle:         strings.TrimSpace(r.FormValue("site_title")),
-		SiteSubtitle:      strings.TrimSpace(r.FormValue("site_subtitle")),
-		DefaultLocale:     strings.TrimSpace(r.FormValue("default_locale")),
-		TimeZone:          strings.TrimSpace(r.FormValue("timezone")),
-		Accent:            strings.TrimSpace(r.FormValue("accent")),
+		SiteTitle:         strings.TrimSpace(formVal("site_title")),
+		SiteSubtitle:      strings.TrimSpace(formVal("site_subtitle")),
+		DefaultLocale:     strings.TrimSpace(formVal("default_locale")),
+		TimeZone:          strings.TrimSpace(formVal("timezone")),
+		Accent:            strings.TrimSpace(formVal("accent")),
 		ForceLocalStorage: storageMode == "local",
 		AdminUsername:     adminUsername,
 		AdminEmail:        adminEmail,

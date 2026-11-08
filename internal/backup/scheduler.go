@@ -21,12 +21,14 @@ import (
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/s3client"
 	"github.com/Willh92/Volo-go/internal/security"
+	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
-// SchedulerOptions configures the rolling local + remote (S3 / WebDAV) backup scheduler.
+// SchedulerOptions configures the rolling local + remote (S3 / WebDAV / Plugin) backup scheduler.
 type SchedulerOptions struct {
 	Store          *sqlx.Store
 	Settings       *repo.SettingsManager
+	Plugins        *plugin.Manager
 	BackupDir      string
 	UploadDir      string
 	OutboundDialer *security.OutboundSafeDialer
@@ -218,7 +220,8 @@ func (s *Scheduler) uploadArchiveStream(ctx context.Context, cfg domain.BackupSe
 		return "", err
 	}
 
-	switch strings.ToLower(strings.TrimSpace(cfg.RemoteProtocol)) {
+	proto := strings.ToLower(strings.TrimSpace(cfg.RemoteProtocol))
+	switch proto {
 	case "s3":
 		cli, err := s3client.NewClient(s3client.Config{
 			Endpoint:  cfg.S3Endpoint,
@@ -238,8 +241,59 @@ func (s *Scheduler) uploadArchiveStream(ctx context.Context, cfg domain.BackupSe
 		return uploadWebDAVStream(ctx, cfg, sec.WebDAVPassword, f, st.Size(), filename, s.opts.OutboundDialer)
 
 	default:
-		return "", fmt.Errorf("unsupported remote backup protocol %q", cfg.RemoteProtocol)
+		sp, spID, ok := s.resolveBackupStoragePlugin(proto)
+		if !ok {
+			return "", fmt.Errorf("unsupported remote backup protocol %q", cfg.RemoteProtocol)
+		}
+		urlOrKey, err := sp.Put(ctx, "backups/"+filename, f, st.Size(), "application/zip")
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(urlOrKey) != "" {
+			return urlOrKey, nil
+		}
+		return "plugin:" + spID + "/backups/" + filename, nil
 	}
+}
+
+func (s *Scheduler) resolveBackupStoragePlugin(proto string) (plugin.StorageProvider, string, bool) {
+	if s.opts.Plugins == nil {
+		return nil, "", false
+	}
+	reg := s.opts.Plugins.Providers()
+	if reg == nil {
+		return nil, "", false
+	}
+	if strings.HasPrefix(proto, "plugin:") {
+		id := strings.TrimSpace(strings.TrimPrefix(proto, "plugin:"))
+		if sp, ok := reg.StorageByID(id); ok {
+			return sp, id, true
+		}
+		return nil, "", false
+	}
+	if proto == "plugin" {
+		if s.opts.Settings != nil {
+			mediaDriver := strings.TrimSpace(s.opts.Settings.Snapshot().Storage.ActiveDriver)
+			if mediaDriver != "" && mediaDriver != "local" && mediaDriver != "s3" {
+				if sp, ok := reg.StorageByID(mediaDriver); ok {
+					return sp, mediaDriver, true
+				}
+			}
+		}
+		ids := reg.StorageProviderIDs()
+		if len(ids) > 0 {
+			if sp, ok := reg.StorageByID(ids[0]); ok {
+				return sp, ids[0], true
+			}
+		}
+		return nil, "", false
+	}
+	if proto != "" {
+		if sp, ok := reg.StorageByID(proto); ok {
+			return sp, proto, true
+		}
+	}
+	return nil, "", false
 }
 
 func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password string, r io.ReadSeeker, size int64, filename string, safeDialer *security.OutboundSafeDialer) (string, error) {
@@ -273,6 +327,9 @@ func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
 				return errors.New("webdav: stopped after 3 redirects")
+			}
+			if len(via) > 0 && strings.EqualFold(via[len(via)-1].URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+				return errors.New("webdav: refusing insecure https to http scheme downgrade redirect")
 			}
 			if safeDialer != nil {
 				_, vErr := safeDialer.ValidateOutboundURL(req.URL.String())

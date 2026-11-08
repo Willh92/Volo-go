@@ -85,8 +85,9 @@ func (st *storeState) close() error {
 // 2. Multi-statement writes execute inside WithTx with guaranteed rollback on error or panic.
 // 3. Case-insensitive struct column scanning across SQLite, PostgreSQL, MySQL, MariaDB, and TiDB.
 type Store struct {
-	state   atomic.Pointer[storeState]
-	dataRev atomic.Uint64
+	state         atomic.Pointer[storeState]
+	dataRev       atomic.Uint64
+	sqliteWriteMu sync.Mutex
 }
 
 func newStoreFromState(st *storeState) *Store {
@@ -397,6 +398,10 @@ func (s *Store) QueryRowContext(ctx context.Context, query string, args ...any) 
 // and bumps DataRevision so read-side snapshots invalidate immediately.
 func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	st := s.state.Load()
+	if st.dialect != nil && st.dialect.Name() == "sqlite" {
+		s.sqliteWriteMu.Lock()
+		defer s.sqliteWriteMu.Unlock()
+	}
 	res, err := st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 	if err == nil {
 		s.dataRev.Add(1)
@@ -408,6 +413,10 @@ func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql
 // invalidating content/feed/chrome caches.
 func (s *Store) ExecBgContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	st := s.state.Load()
+	if st.dialect != nil && st.dialect.Name() == "sqlite" {
+		s.sqliteWriteMu.Lock()
+		defer s.sqliteWriteMu.Unlock()
+	}
 	return st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 }
 
@@ -445,6 +454,10 @@ func (s *Store) WithBgTx(ctx context.Context, fn func(tx *Tx) error) error {
 
 func (s *Store) runTx(ctx context.Context, bumpRev bool, fn func(tx *Tx) error) (err error) {
 	st := s.state.Load()
+	if st.dialect != nil && st.dialect.Name() == "sqlite" {
+		s.sqliteWriteMu.Lock()
+		defer s.sqliteWriteMu.Unlock()
+	}
 	rawTx, err := st.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlx: begin tx: %w", err)
@@ -582,79 +595,89 @@ func (st *rowScanState) assign(rv reflect.Value, plan []scanColSpec) error {
 // Select executes a query and scans all rows into []T using a precomputed zero-closure column plan
 // with case-insensitive matching against `db:"column_name"` struct tags or lowercase field names.
 func Select[T any](ctx context.Context, q Queryer, query string, args ...any) ([]T, error) {
-	rows, err := q.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	var zero T
-	rt := reflect.TypeOf(zero)
-	if rt == nil || rt.Kind() != reflect.Struct {
+	rt := reflect.TypeFor[T]()
+	if rt.Kind() != reflect.Struct {
 		return nil, errors.New("sqlx.Select requires struct element type T")
 	}
-	plan := buildColumnPlan(rt, cols)
-	state := newRowScanState(len(cols))
-
 	var out []T
-	for rows.Next() {
-		var item T
-		rv := reflect.ValueOf(&item).Elem()
-		if err := rows.Scan(state.bind(rv, plan)...); err != nil {
-			return nil, err
-		}
-		if err := state.assign(rv, plan); err != nil {
-			return nil, err
-		}
-		out = append(out, item)
-	}
-	if err := rows.Err(); err != nil {
+	if err := selectRowsInto(ctx, q, rt, reflect.ValueOf(&out).Elem(), query, args...); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// Get executes a query and scans the first row into T, returning sql.ErrNoRows if empty.
-func Get[T any](ctx context.Context, q Queryer, query string, args ...any) (T, error) {
-	var zero T
+func selectRowsInto(ctx context.Context, q Queryer, rt reflect.Type, sliceVal reflect.Value, query string, args ...any) error {
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+
+	plan := buildColumnPlan(rt, cols)
+	state := newRowScanState(len(cols))
+
+	for rows.Next() {
+		n := sliceVal.Len()
+		sliceVal.Grow(1)
+		sliceVal.SetLen(n + 1)
+		rv := sliceVal.Index(n)
+		if err := rows.Scan(state.bind(rv, plan)...); err != nil {
+			return err
+		}
+		if err := state.assign(rv, plan); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// Get executes a query and scans the first row into T, returning sql.ErrNoRows if empty.
+func Get[T any](ctx context.Context, q Queryer, query string, args ...any) (T, error) {
+	var item T
+	rt := reflect.TypeFor[T]()
+	if rt.Kind() != reflect.Struct {
+		return item, errors.New("sqlx.Get requires struct type T")
+	}
+	if err := getRowInto(ctx, q, rt, reflect.ValueOf(&item).Elem(), query, args...); err != nil {
+		var zero T
 		return zero, err
+	}
+	return item, nil
+}
+
+func getRowInto(ctx context.Context, q Queryer, rt reflect.Type, rv reflect.Value, query string, args ...any) error {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
 	}
 	defer rows.Close()
 
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return zero, err
+			return err
 		}
-		return zero, sql.ErrNoRows
+		return sql.ErrNoRows
 	}
 	cols, err := rows.Columns()
 	if err != nil {
-		return zero, err
+		return err
 	}
 
-	rt := reflect.TypeOf(zero)
-	if rt == nil || rt.Kind() != reflect.Struct {
-		return zero, errors.New("sqlx.Get requires struct type T")
-	}
 	plan := buildColumnPlan(rt, cols)
 	state := newRowScanState(len(cols))
 
-	var item T
-	rv := reflect.ValueOf(&item).Elem()
 	if err := rows.Scan(state.bind(rv, plan)...); err != nil {
-		return zero, err
+		return err
 	}
 	if err := state.assign(rv, plan); err != nil {
-		return zero, err
+		return err
 	}
-	return item, rows.Err()
+	return rows.Err()
 }
 
 var fieldCache sync.Map // map[reflect.Type]map[string][]int

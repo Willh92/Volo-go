@@ -363,6 +363,65 @@ xml_escape() {
     -e "s/'/\&apos;/g"
 }
 
+openrc_escape_dq() {
+  printf "%s" "$1" | sed \
+    -e 's/\\/\\\\/g' \
+    -e 's/"/\\"/g' \
+    -e 's/\$/\\$/g' \
+    -e 's/`/\\`/g'
+}
+
+case "$SERVICE_NAME" in
+  *[!A-Za-z0-9._-]*|"")
+    log_err "Invalid SERVICE_NAME '${SERVICE_NAME}': only [A-Za-z0-9._-] characters are allowed."
+    exit 1
+    ;;
+esac
+
+case "$DATA_DIR_MODE" in
+  [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+  *)
+    log_err "Invalid --data-dir-mode '${DATA_DIR_MODE}': expected octal permissions such as 0750."
+    exit 1
+    ;;
+esac
+
+safe_chown_tree() {
+  OWNER_SPEC="$1"
+  shift
+  for TARGET_P in "$@"; do
+    [ -e "$TARGET_P" ] || continue
+    if [ -L "$TARGET_P" ]; then
+      log_warn "Skipping symlink root during recursive chown: ${TARGET_P}"
+      continue
+    fi
+    chown -RP "$OWNER_SPEC" "$TARGET_P"
+  done
+}
+
+safe_chgrp_tree() {
+  GROUP_SPEC="$1"
+  shift
+  for TARGET_P in "$@"; do
+    [ -e "$TARGET_P" ] || continue
+    if [ -L "$TARGET_P" ]; then
+      log_warn "Skipping symlink root during recursive chgrp: ${TARGET_P}"
+      continue
+    fi
+    chgrp -RP "$GROUP_SPEC" "$TARGET_P"
+  done
+}
+
+safe_chmod_dir() {
+  MODE_SPEC="$1"
+  shift
+  for TARGET_P in "$@"; do
+    if [ -d "$TARGET_P" ] && [ ! -L "$TARGET_P" ]; then
+      chmod "$MODE_SPEC" "$TARGET_P"
+    fi
+  done
+}
+
 is_standard_bin_dir() {
   case "$1" in
     /bin|/sbin|/usr/bin|/usr/sbin|/usr/local/bin|/usr/local/sbin|*/.local/bin|*/bin|*/sbin)
@@ -495,7 +554,10 @@ extract_tar_bundle() {
   TAR_FILE="$1"
   DEST_STAGE="$2"
   mkdir -p "$DEST_STAGE"
-  tar -xzf "$TAR_FILE" -C "$DEST_STAGE"
+  if ! tar --no-same-owner --no-same-permissions -xzf "$TAR_FILE" -C "$DEST_STAGE" 2>/dev/null; then
+    tar -o -xzf "$TAR_FILE" -C "$DEST_STAGE"
+  fi
+  [ ! -L "$DEST_STAGE" ] && chmod -R a-s,go-w "$DEST_STAGE" 2>/dev/null || true
   FOUND_BIN=""
   if [ -f "${DEST_STAGE}/volo" ]; then
     FOUND_BIN="${DEST_STAGE}/volo"
@@ -1020,13 +1082,17 @@ VOLO_LOCALES_DIR=${TARGET_ROOT}/locales"
 
   SECRET_HEX="$(generate_secret_hex)"
   mkdir -p "$(dirname "$TARGET_ENV")"
+  if [ -L "$TARGET_ENV" ]; then
+    log_err "Refusing to write secret env file through symlink: ${TARGET_ENV}"
+    exit 1
+  fi
   OLD_UMASK="$(umask)"
   umask 077
   printf "%s\n" "$ENV_BODY" | sed "s|<generated-256-bit-secret>|${SECRET_HEX}|" > "$TARGET_ENV"
   umask "$OLD_UMASK"
   chmod "$ENV_MODE" "$TARGET_ENV"
   if [ -n "$ENV_OWNER" ]; then
-    chown "$ENV_OWNER" "$TARGET_ENV" 2>/dev/null || true
+    chown -h "$ENV_OWNER" "$TARGET_ENV" 2>/dev/null || chown "$ENV_OWNER" "$TARGET_ENV" 2>/dev/null || true
   fi
 }
 
@@ -1300,11 +1366,11 @@ WantedBy=multi-user.target"
         if [ -n "$UNIX_SOCKET" ]; then
           SOCK_PARENT="$(dirname "$UNIX_SOCKET")"
           mkdir -p "$SOCK_PARENT"
-          chown "${SVC_USER}:${SOCKET_GROUP:-$SVC_GROUP}" "$SOCK_PARENT" 2>/dev/null || true
-          chmod 0755 "$SOCK_PARENT" 2>/dev/null || true
+          [ ! -L "$SOCK_PARENT" ] && chown "${SVC_USER}:${SOCKET_GROUP:-$SVC_GROUP}" "$SOCK_PARENT" 2>/dev/null || true
+          safe_chmod_dir 0755 "$SOCK_PARENT" 2>/dev/null || true
         fi
-        chown -R "${SVC_USER}:${SVC_GROUP}" "$DATA_DIR"
-        chmod "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data"
+        safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "$DATA_DIR"
+        safe_chmod_dir "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data"
         printf "%s\n" "$UNIT_CONTENT" > "$UNIT_FILE"
         chmod 0644 "$UNIT_FILE"
         systemctl daemon-reload
@@ -1322,7 +1388,7 @@ WantedBy=multi-user.target"
         resolve_source_binary
         if [ -d "$DATA_DIR" ]; then
           sync_bundled_extensions "$DATA_DIR"
-          [ "$DRY_RUN" = "0" ] && chown -R "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
+          [ "$DRY_RUN" = "0" ] && safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
         fi
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         if [ "$DRY_RUN" = "1" ]; then
@@ -1379,28 +1445,37 @@ WantedBy=multi-user.target"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0640" "root:${SVC_GROUP}"
 
+        ESC_INSTALL_BIN="$(openrc_escape_dq "$INSTALL_BIN")"
+        ESC_ENV_FILE="$(openrc_escape_dq "$ENV_FILE")"
+        ESC_SVC_USER="$(openrc_escape_dq "$SVC_USER")"
+        ESC_SVC_GROUP="$(openrc_escape_dq "$SVC_GROUP")"
+        ESC_DATA_DIR="$(openrc_escape_dq "$DATA_DIR")"
+        ESC_LOG_FILE="$(openrc_escape_dq "$LOG_FILE")"
+
         OPENRC_SOCK_CHECK=""
         if [ -n "$UNIX_SOCKET" ]; then
           SOCK_PARENT="$(normalize_dir_path "$(dirname "$UNIX_SOCKET")")"
           if [ "$SOCK_PARENT" != "/run/volo" ] && [ "$SOCK_PARENT" != "$DATA_DIR" ]; then
+            ESC_SOCK_GROUP="$(openrc_escape_dq "${SOCKET_GROUP:-$SVC_GROUP}")"
+            ESC_SOCK_PARENT="$(openrc_escape_dq "$SOCK_PARENT")"
             OPENRC_SOCK_CHECK="
-    checkpath --directory --owner \"${SVC_USER}:${SOCKET_GROUP:-$SVC_GROUP}\" --mode 0755 \"${SOCK_PARENT}\""
+    checkpath --directory --owner \"${ESC_SVC_USER}:${ESC_SOCK_GROUP}\" --mode 0755 \"${ESC_SOCK_PARENT}\""
           fi
         fi
 
         OPENRC_CONTENT="#!/sbin/openrc-run
 name=\"Volo-go\"
 description=\"Volo-go Pure-Go Sovereign Blog Engine\"
-command=\"${INSTALL_BIN}\"
-command_args=\"serve --env-file \\\"${ENV_FILE}\\\"\"
-command_user=\"${SVC_USER}:${SVC_GROUP}\"
-directory=\"${DATA_DIR}\"
+command=\"${ESC_INSTALL_BIN}\"
+command_args=\"serve --env-file \\\"${ESC_ENV_FILE}\\\"\"
+command_user=\"${ESC_SVC_USER}:${ESC_SVC_GROUP}\"
+directory=\"${ESC_DATA_DIR}\"
 command_background=\"yes\"
 pidfile=\"/run/volo/volo.pid\"
 stopsig=\"SIGTERM\"
 retry=\"SIGTERM/20/SIGKILL/5\"
-output_log=\"${LOG_FILE}\"
-error_log=\"${LOG_FILE}\"
+output_log=\"${ESC_LOG_FILE}\"
+error_log=\"${ESC_LOG_FILE}\"
 rc_ulimit=\"-n 65536\"
 
 depend() {
@@ -1410,7 +1485,7 @@ depend() {
 
 start_pre() {
     checkpath --directory --owner \"\${command_user}\" --mode 0755 /run/volo /var/log/volo
-    checkpath --directory --owner \"\${command_user}\" --mode ${DATA_DIR_MODE} \"${DATA_DIR}\"${OPENRC_SOCK_CHECK}
+    checkpath --directory --owner \"\${command_user}\" --mode ${DATA_DIR_MODE} \"${ESC_DATA_DIR}\"${OPENRC_SOCK_CHECK}
 }"
         if [ "$DRY_RUN" = "1" ]; then
           printf "[dry-run] write %s:\n%s\n" "$INIT_SCRIPT" "$OPENRC_CONTENT"
@@ -1420,13 +1495,13 @@ start_pre() {
         if [ -n "$UNIX_SOCKET" ]; then
           SOCK_PARENT="$(dirname "$UNIX_SOCKET")"
           mkdir -p "$SOCK_PARENT"
-          chown "${SVC_USER}:${SOCKET_GROUP:-$SVC_GROUP}" "$SOCK_PARENT" 2>/dev/null || true
-          chmod 0755 "$SOCK_PARENT" 2>/dev/null || true
+          [ ! -L "$SOCK_PARENT" ] && chown "${SVC_USER}:${SOCKET_GROUP:-$SVC_GROUP}" "$SOCK_PARENT" 2>/dev/null || true
+          safe_chmod_dir 0755 "$SOCK_PARENT" 2>/dev/null || true
         fi
-        chown -R "${SVC_USER}:${SVC_GROUP}" "$DATA_DIR"
-        chmod "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data"
+        safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "$DATA_DIR"
+        safe_chmod_dir "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data"
         mkdir -p /var/log/volo
-        chown "${SVC_USER}:${SVC_GROUP}" /var/log/volo 2>/dev/null || true
+        [ ! -L /var/log/volo ] && chown "${SVC_USER}:${SVC_GROUP}" /var/log/volo 2>/dev/null || true
         printf "%s\n" "$OPENRC_CONTENT" > "$INIT_SCRIPT"
         chmod 0755 "$INIT_SCRIPT"
         rc-update add "$SERVICE_NAME" default
@@ -1441,7 +1516,7 @@ start_pre() {
         resolve_source_binary
         if [ -d "$DATA_DIR" ]; then
           sync_bundled_extensions "$DATA_DIR"
-          [ "$DRY_RUN" = "0" ] && chown -R "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
+          [ "$DRY_RUN" = "0" ] && safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
         fi
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         if [ "$DRY_RUN" = "1" ]; then
@@ -1620,16 +1695,16 @@ ${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
       if [ -n "$UNIX_SOCKET" ]; then
         SOCK_PARENT="$(dirname "$UNIX_SOCKET")"
         mkdir -p "$SOCK_PARENT"
-        [ -n "$MACOS_OWNER" ] && chown "$MACOS_OWNER" "$SOCK_PARENT" 2>/dev/null || true
-        chmod 0755 "$SOCK_PARENT" 2>/dev/null || true
+        [ -n "$MACOS_OWNER" ] && [ ! -L "$SOCK_PARENT" ] && chown "$MACOS_OWNER" "$SOCK_PARENT" 2>/dev/null || true
+        safe_chmod_dir 0755 "$SOCK_PARENT" 2>/dev/null || true
       fi
       if [ -n "$MACOS_OWNER" ]; then
-        chown -R "$MACOS_OWNER" "$DATA_DIR" "$LOG_DIR"
+        safe_chown_tree "$MACOS_OWNER" "$DATA_DIR" "$LOG_DIR"
       elif [ "$USER_MODE" = "0" ] && [ -n "$SVC_GROUP" ]; then
-        chgrp -R "$SVC_GROUP" "$DATA_DIR" "$LOG_DIR" "$ENV_FILE" 2>/dev/null || true
+        safe_chgrp_tree "$SVC_GROUP" "$DATA_DIR" "$LOG_DIR" "$ENV_FILE" 2>/dev/null || true
       fi
       xattr -d com.apple.quarantine "$INSTALL_BIN" >/dev/null 2>&1 || true
-      chmod "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data" 2>/dev/null || true
+      safe_chmod_dir "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data" 2>/dev/null || true
       printf "%s\n" "$PLIST_CONTENT" > "$PLIST_FILE"
       chmod 0644 "$PLIST_FILE"
       launchctl bootout "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || launchctl unload "$PLIST_FILE" >/dev/null 2>&1 || true
@@ -1651,7 +1726,7 @@ ${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
       if [ -d "$DATA_DIR" ]; then
         sync_bundled_extensions "$DATA_DIR"
         if [ "$DRY_RUN" = "0" ] && [ -n "$MACOS_OWNER" ]; then
-          chown -R "$MACOS_OWNER" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
+          safe_chown_tree "$MACOS_OWNER" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
         fi
       fi
       copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"

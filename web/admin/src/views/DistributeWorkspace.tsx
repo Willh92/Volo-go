@@ -1,5 +1,13 @@
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, currentUserSig, openConfirm, resetConsoleScroll, showToast, storageDriverSig } from "../api";
+import {
+  apiFetch,
+  currentUserSig,
+  effectiveDarkSig,
+  openConfirm,
+  resetConsoleScroll,
+  showToast,
+  storageDriverSig,
+} from "../api";
 import { MediaPickButton } from "../components/MediaLibraryModal";
 import {
   ActionMenu,
@@ -14,6 +22,7 @@ import {
   SwitchToggle,
   TableSkeleton,
   TokenListInput,
+  UploadButton,
   useDebouncedValue,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, t } from "../i18n";
@@ -73,6 +82,7 @@ const EMPTY_WH = {
   chat_id: "",
   secret: "",
   secret_set: false,
+  clear_secret: false,
   events: ["article.published", "comment.created"] as string[],
   is_enabled: true,
 };
@@ -167,6 +177,7 @@ export function DistributeWorkspace({
   onNavigate?: (sec: string) => void;
 }) {
   const isAdmin = currentUserSig.value?.role === "admin";
+  const effectiveDark = effectiveDarkSig.value;
   const localeOptions = availableLocalesSig.value;
   const [sub, setSub] = useState<DistTab>(activeTab);
   const [navSub, setNavSub] = useState<"nav" | "redirects">("nav");
@@ -180,7 +191,7 @@ export function DistributeWorkspace({
   const [navModalOpen, setNavModalOpen] = useState(false);
   const [navForm, setNavForm] = useState({ ...EMPTY_NAV });
 
-  // Redirects (server-paginated)
+  // Redirects (server-paginated + Import/Export)
   const [redirects, setRedirects] = useState<any[]>([]);
   const [redirTotal, setRedirTotal] = useState(0);
   const [redirSearch, setRedirSearch] = useState("");
@@ -191,8 +202,12 @@ export function DistributeWorkspace({
   const [selRedirIds, setSelRedirIds] = useState<string[]>([]);
   const [redirModalOpen, setRedirModalOpen] = useState(false);
   const [redirForm, setRedirForm] = useState({ ...EMPTY_REDIR });
+  const [redirImportOpen, setRedirImportOpen] = useState(false);
+  const [redirImportFormat, setRedirImportFormat] = useState<"csv" | "json">("csv");
+  const [redirImportData, setRedirImportData] = useState("");
+  const [importingRedir, setImportingRedir] = useState(false);
 
-  // Links (server-paginated)
+  // Links (server-paginated + category + single check + batch move category)
   const [links, setLinks] = useState<any[]>([]);
   const [linkTotal, setLinkTotal] = useState(0);
   const [knownLinkCategories, setKnownLinkCategories] = useState<string[]>([]);
@@ -201,29 +216,44 @@ export function DistributeWorkspace({
   const [linkSearch, setLinkSearch] = useState("");
   const debouncedLinkQ = useDebouncedValue(linkSearch, 250);
   const [patrolling, setPatrolling] = useState(false);
+  const [checkingLinkId, setCheckingLinkId] = useState("");
   const [selLinkIds, setSelLinkIds] = useState<string[]>([]);
   const [linkModalOpen, setLinkModalOpen] = useState(false);
   const [linkForm, setLinkForm] = useState({ ...EMPTY_LINK });
+  const [batchCatOpen, setBatchCatOpen] = useState(false);
+  const [batchCatName, setBatchCatName] = useState("");
+  const [movingLinksCat, setMovingLinksCat] = useState(false);
 
-  // Follows + Synced Items Preview (server-paginated)
+  // Follows + Synced Items Preview + OPML Import/Export (server-paginated)
   const [follows, setFollows] = useState<any[]>([]);
   const [followTotal, setFollowTotal] = useState(0);
   const [followSearch, setFollowSearch] = useState("");
   const debouncedFollowQ = useDebouncedValue(followSearch, 250);
   const [followStatusFilter, setFollowStatusFilter] = useState("");
   const [syncingFollows, setSyncingFollows] = useState(false);
+  const [syncingFollowId, setSyncingFollowId] = useState("");
   const [followModalOpen, setFollowModalOpen] = useState(false);
   const [followForm, setFollowForm] = useState({ ...EMPTY_FOLLOW });
   const [followPreviewOpen, setFollowPreviewOpen] = useState(false);
   const [followGroups, setFollowGroups] = useState<any[]>([]);
   const [followPreviewLoading, setFollowPreviewLoading] = useState(false);
+  const [opmlImportOpen, setOpmlImportOpen] = useState(false);
+  const [opmlData, setOpmlData] = useState("");
+  const [importingOpml, setImportingOpml] = useState(false);
 
-  // Webhooks
+  // Webhooks + Deliveries Log Modal
   const [webhooks, setWebhooks] = useState<any[]>([]);
   const [whSearch, setWhSearch] = useState("");
   const [testingWhId, setTestingWhId] = useState("");
   const [whModalOpen, setWhModalOpen] = useState(false);
   const [whForm, setWhForm] = useState({ ...EMPTY_WH });
+  const [whDelivModal, setWhDelivModal] = useState<{
+    webhook: any;
+    items: any[];
+    loading: boolean;
+  } | null>(null);
+  const [expandedDelivId, setExpandedDelivId] = useState<string | null>(null);
+  const [replayingDelivId, setReplayingDelivId] = useState("");
 
   // Feed / SEO / GitHub Showcase
   const [feedCfg, setFeedCfg] = useState<any>(null);
@@ -298,17 +328,23 @@ export function DistributeWorkspace({
     setLoading(true);
     try {
       const sp = new URLSearchParams();
-      sp.set("page", String(linkCatFilter ? 1 : pageIdx));
-      sp.set("per_page", String(linkCatFilter ? 200 : pageSize));
+      sp.set("page", String(pageIdx));
+      sp.set("per_page", String(pageSize));
       if (debouncedLinkQ.trim()) sp.set("q", debouncedLinkQ.trim());
       if (linkHealthFilter) sp.set("health", linkHealthFilter);
-      const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/links?${sp.toString()}`);
+      if (linkCatFilter) sp.set("category", linkCatFilter);
+      const r = await apiFetch<{ items: any[]; total?: number; categories?: string[] }>(
+        `/api/admin/links?${sp.toString()}`
+      );
       const list = r.items || [];
       setLinks(list);
       setLinkTotal(r.total ?? list.length);
-      const cats = list.map((l) => String(l.category_name || "").trim()).filter(Boolean);
-      if (cats.length > 0) {
-        setKnownLinkCategories((prev) => Array.from(new Set([...prev, ...cats])).sort());
+      const itemCats = list.map((l) => String(l.category_name || "").trim()).filter(Boolean);
+      const serverCats = Array.isArray(r.categories)
+        ? r.categories.map((c) => String(c || "").trim()).filter(Boolean)
+        : [];
+      if (itemCats.length > 0 || serverCats.length > 0) {
+        setKnownLinkCategories((prev) => Array.from(new Set([...prev, ...serverCats, ...itemCats])).sort());
       }
     } catch (err: any) {
       showToast(err.message);
@@ -374,19 +410,6 @@ export function DistributeWorkspace({
       setLoading(false);
     }
   };
-
-  // Seed link categories once when entering Friend Links so category dropdown stays complete across filters
-  useEffect(() => {
-    if (sub !== "links") return;
-    apiFetch<{ items: any[] }>("/api/admin/links?per_page=200")
-      .then((r) => {
-        const cats = (r.items || []).map((l) => String(l.category_name || "").trim()).filter(Boolean);
-        if (cats.length > 0) {
-          setKnownLinkCategories((prev) => Array.from(new Set([...prev, ...cats])).sort());
-        }
-      })
-      .catch(() => {});
-  }, [sub]);
 
   // Non-server-paginated tabs & Top Nav load
   useEffect(() => {
@@ -525,11 +548,19 @@ export function DistributeWorkspace({
 
   const saveRedirect = async (e?: Event) => {
     e?.preventDefault();
-    if (!redirForm.source_path.trim() || !redirForm.target_path.trim()) return;
+    const src = redirForm.source_path.trim();
+    const dst = redirForm.target_path.trim();
+    if (!src || !dst) return;
+    const normSrc = src.startsWith("/") ? src.replace(/\/+$/, "") || "/" : src;
+    const normDst = dst.startsWith("/") ? dst.replace(/\/+$/, "") || "/" : dst;
+    if (src === dst || normSrc === normDst) {
+      showToast(t("dist.redir_self_loop"), "err");
+      return;
+    }
     try {
       const payload = {
-        source_path: redirForm.source_path.trim(),
-        target_path: redirForm.target_path.trim(),
+        source_path: src,
+        target_path: dst,
         status_code: Number(redirForm.status_code) || 301,
       };
       if (!redirForm.id) {
@@ -543,6 +574,26 @@ export function DistributeWorkspace({
       void loadRedirects();
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const submitImportRedirects = async (e?: Event) => {
+    e?.preventDefault();
+    if (!redirImportData.trim() || importingRedir) return;
+    setImportingRedir(true);
+    try {
+      const res = await apiFetch<{ imported?: number; count?: number }>("/api/admin/redirects/import", {
+        method: "POST",
+        body: JSON.stringify({ format: redirImportFormat, data: redirImportData }),
+      });
+      setRedirImportOpen(false);
+      setRedirImportData("");
+      showToast(t("dist.redir_imported", { count: res.imported ?? res.count ?? 0 }), "ok");
+      void loadRedirects();
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setImportingRedir(false);
     }
   };
 
@@ -591,6 +642,48 @@ export function DistributeWorkspace({
     }
   };
 
+  const checkSingleLink = async (linkId: string) => {
+    if (checkingLinkId) return;
+    setCheckingLinkId(linkId);
+    try {
+      await apiFetch(`/api/admin/links/${encodeURIComponent(linkId)}/check`, {
+        method: "POST",
+        body: "{}",
+      });
+      showToast(t("common.saved"), "ok");
+      await loadLinks();
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setCheckingLinkId("");
+    }
+  };
+
+  const submitBatchMoveLinkCat = async (e?: Event) => {
+    e?.preventDefault();
+    if (!selLinkIds.length || movingLinksCat) return;
+    setMovingLinksCat(true);
+    try {
+      const cat = batchCatName.trim();
+      await apiFetch("/api/admin/links/batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: selLinkIds, action: "category", category_name: cat }),
+      });
+      if (cat) {
+        setKnownLinkCategories((prev) => Array.from(new Set([...prev, cat])).sort());
+      }
+      setBatchCatOpen(false);
+      setBatchCatName("");
+      setSelLinkIds([]);
+      showToast(t("common.saved"), "ok");
+      void loadLinks();
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setMovingLinksCat(false);
+    }
+  };
+
   const batchDeleteLinks = async () => {
     if (!selLinkIds.length) return;
     if (!(await openConfirm({ message: t("dist.confirm_batch_del_links", { n: selLinkIds.length }), danger: true }))) return;
@@ -633,6 +726,43 @@ export function DistributeWorkspace({
     }
   };
 
+  const syncSingleFollow = async (followId: string) => {
+    if (syncingFollowId) return;
+    setSyncingFollowId(followId);
+    try {
+      const r = await apiFetch<{ synced_items?: number }>(
+        `/api/admin/follows/${encodeURIComponent(followId)}/sync`,
+        { method: "POST", body: "{}" }
+      );
+      showToast(t("dist.follows_synced", { count: r.synced_items ?? 0 }), "ok");
+      await loadFollows();
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setSyncingFollowId("");
+    }
+  };
+
+  const submitImportOpml = async (e?: Event) => {
+    e?.preventDefault();
+    if (!opmlData.trim() || importingOpml) return;
+    setImportingOpml(true);
+    try {
+      const r = await apiFetch<{ imported?: number; count?: number }>("/api/admin/follows/import-opml", {
+        method: "POST",
+        body: JSON.stringify({ opml: opmlData }),
+      });
+      setOpmlImportOpen(false);
+      setOpmlData("");
+      showToast(t("dist.follows_opml_imported", { count: r.imported ?? r.count ?? 0 }), "ok");
+      void loadFollows();
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setImportingOpml(false);
+    }
+  };
+
   const openFollowPreview = async () => {
     setFollowPreviewOpen(true);
     setFollowPreviewLoading(true);
@@ -650,12 +780,13 @@ export function DistributeWorkspace({
     e?.preventDefault();
     if (!whForm.name.trim() || !whForm.url.trim()) return;
     try {
-      const payload = {
+      const payload: Record<string, any> = {
         name: whForm.name.trim(),
         provider: whForm.provider,
         url: whForm.url.trim(),
         chat_id: whForm.chat_id.trim(),
         secret: whForm.secret,
+        clear_secret: Boolean(whForm.clear_secret && !whForm.secret),
         events: whForm.events,
         is_enabled: whForm.is_enabled,
       };
@@ -670,6 +801,37 @@ export function DistributeWorkspace({
       void loadSub();
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const openWebhookDeliveries = async (w: any) => {
+    setExpandedDelivId(null);
+    setWhDelivModal({ webhook: w, items: [], loading: true });
+    try {
+      const r = await apiFetch<{ items?: any[] }>(`/api/admin/webhooks/${encodeURIComponent(w.id)}/deliveries`);
+      setWhDelivModal({ webhook: w, items: r.items || [], loading: false });
+    } catch (err: any) {
+      showToast(err.message, "err");
+      setWhDelivModal((prev) => (prev ? { ...prev, loading: false } : null));
+    }
+  };
+
+  const replayWebhookDelivery = async (wId: string, deliveryId: string) => {
+    if (replayingDelivId) return;
+    setReplayingDelivId(deliveryId);
+    try {
+      await apiFetch(
+        `/api/admin/webhooks/${encodeURIComponent(wId)}/deliveries/${encodeURIComponent(deliveryId)}/replay`,
+        { method: "POST", body: "{}" }
+      );
+      showToast(t("dist.wh_replayed"), "ok");
+      const r = await apiFetch<{ items?: any[] }>(`/api/admin/webhooks/${encodeURIComponent(wId)}/deliveries`);
+      setWhDelivModal((prev) => (prev ? { ...prev, items: r.items || [] } : null));
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setReplayingDelivId("");
     }
   };
 
@@ -767,14 +929,9 @@ export function DistributeWorkspace({
   const redirPageSlice =
     redirects.length > pageSize ? paginateItems(redirects, pageIdx, pageSize).slice : redirects;
 
-  const catFilteredLinks = linkCatFilter
-    ? links.filter((l) => String(l.category_name || "").trim() === linkCatFilter)
-    : links;
-  const effectiveLinkTotal = linkCatFilter ? catFilteredLinks.length : linkTotal;
+  const effectiveLinkTotal = linkTotal;
   const linkPageSlice =
-    linkCatFilter || catFilteredLinks.length > pageSize
-      ? paginateItems(catFilteredLinks, pageIdx, pageSize).slice
-      : catFilteredLinks;
+    links.length > pageSize ? paginateItems(links, pageIdx, pageSize).slice : links;
 
   const followPageSlice =
     follows.length > pageSize ? paginateItems(follows, pageIdx, pageSize).slice : follows;
@@ -983,7 +1140,12 @@ export function DistributeWorkspace({
                                   label: t("common.delete"),
                                   danger: true,
                                   onClick: async () => {
-                                    if (!(await openConfirm({ message: t("dist.confirm_del_nav"), danger: true }))) return;
+                                    const childCount = navItems.filter((c) => c.parent_id === it.id).length;
+                                    const msg =
+                                      childCount > 0
+                                        ? t("dist.confirm_del_nav_parent", { n: childCount })
+                                        : t("dist.confirm_del_nav");
+                                    if (!(await openConfirm({ message: msg, danger: true }))) return;
                                     await apiFetch(`/api/admin/nav/${it.id}`, { method: "DELETE" });
                                     showToast(t("common.deleted"));
                                     void loadNav();
@@ -1153,16 +1315,35 @@ export function DistributeWorkspace({
               <h3 class="volo-card-title">{t("dist.redir_head")}</h3>
               <p class="volo-sec-desc">{t("dist.redir_desc")}</p>
             </div>
-            <button
-              type="button"
-              class="volo-btn volo-btn-primary volo-btn-sm"
-              onClick={() => {
-                setRedirForm({ ...EMPTY_REDIR });
-                setRedirModalOpen(true);
-              }}
-            >
-              + {t("dist.new_redir")}
-            </button>
+            <div class="volo-filter-controls">
+              <a class="volo-btn volo-btn-sm" href="/api/admin/redirects/export?format=csv" download>
+                {t("dist.redir_export_csv")}
+              </a>
+              <a class="volo-btn volo-btn-sm" href="/api/admin/redirects/export?format=json" download>
+                {t("dist.redir_export_json")}
+              </a>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={() => {
+                  setRedirImportFormat("csv");
+                  setRedirImportData("");
+                  setRedirImportOpen(true);
+                }}
+              >
+                {t("dist.redir_import")}
+              </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-btn-sm"
+                onClick={() => {
+                  setRedirForm({ ...EMPTY_REDIR });
+                  setRedirModalOpen(true);
+                }}
+              >
+                + {t("dist.new_redir")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-filter-bar">
@@ -1218,12 +1399,6 @@ export function DistributeWorkspace({
             </div>
           </div>
 
-          <BatchBar count={selRedirIds.length} onClear={() => setSelRedirIds([])}>
-            <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteRedirects()}>
-              {t("common.delete")}
-            </button>
-          </BatchBar>
-
           <MobileSelectAllBar
             checked={redirPageSlice.length > 0 && redirPageSlice.every((r) => selRedirIds.includes(r.id))}
             count={selRedirIds.length}
@@ -1271,70 +1446,90 @@ export function DistributeWorkspace({
                 ) : redirPageSlice.length === 0 ? (
                   <ConsoleEmpty colSpan={6} />
                 ) : (
-                  redirPageSlice.map((r) => (
-                    <tr key={r.id}>
-                      <td class="col-check">
-                        <input
-                          type="checkbox"
-                          checked={selRedirIds.includes(r.id)}
-                          onChange={() => toggleSel(selRedirIds, setSelRedirIds, r.id)}
-                        />
-                      </td>
-                      <td class="col-status" data-label={t("art.status")}>
-                        <div class="volo-cell-meta">
-                          <span class={`volo-status-pill ${r.status_code === 301 ? "ok" : "warn"}`}>
-                            <span class="volo-status-dot" />
-                            {r.status_code}
-                          </span>
-                          {r.is_system_legacy && <span class="volo-mini-tag">{t("dist.redir_legacy")}</span>}
-                        </div>
-                      </td>
-                      <td class="col-fluid" data-label={t("tbl.col_source")}>
-                        <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{r.source_path}</span>
-                      </td>
-                      <td class="col-fluid" data-label={t("tbl.col_target")}>
-                        <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{r.target_path}</span>
-                      </td>
-                      <td class="col-num" data-label={t("tbl.col_hits")}>
-                        <span class="volo-cat-chip">{t("dist.redir_hits", { count: r.hit_count ?? 0 })}</span>
-                      </td>
-                      <td class="col-act" data-label={t("art.actions")}>
-                        <div class="volo-row-actions">
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            onClick={() => {
-                              setRedirForm({
-                                id: r.id,
-                                source_path: r.source_path || "",
-                                target_path: r.target_path || "",
-                                status_code: r.status_code || 301,
-                              });
-                              setRedirModalOpen(true);
-                            }}
+                  redirPageSlice.map((r) => {
+                    const testHref = String(r.source_path || "").startsWith("/")
+                      ? r.source_path
+                      : `/${r.source_path || ""}`;
+                    return (
+                      <tr key={r.id}>
+                        <td class="col-check">
+                          <input
+                            type="checkbox"
+                            checked={selRedirIds.includes(r.id)}
+                            onChange={() => toggleSel(selRedirIds, setSelRedirIds, r.id)}
+                          />
+                        </td>
+                        <td class="col-status" data-label={t("art.status")}>
+                          <div class="volo-cell-meta">
+                            <span class={`volo-status-pill ${r.status_code === 301 ? "ok" : "warn"}`}>
+                              <span class="volo-status-dot" />
+                              {r.status_code}
+                            </span>
+                            {r.is_system_legacy && <span class="volo-mini-tag">{t("dist.redir_legacy")}</span>}
+                          </div>
+                        </td>
+                        <td class="col-fluid" data-label={t("tbl.col_source")}>
+                          <a
+                            href={testHref}
+                            target="_blank"
+                            rel="noreferrer"
+                            class="volo-code-chip"
+                            style={{ overflowWrap: "anywhere" }}
                           >
-                            {t("common.edit")}
-                          </button>
-                          <button
-                            type="button"
-                            class="volo-act-btn danger"
-                            onClick={async () => {
-                              if (!(await openConfirm({ message: t("dist.confirm_del_redir"), danger: true }))) return;
-                              await apiFetch(`/api/admin/redirects/${r.id}`, { method: "DELETE" });
-                              showToast(t("common.deleted"));
-                              void loadRedirects();
-                            }}
-                          >
-                            {t("common.delete")}
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))
+                            {r.source_path} ↗
+                          </a>
+                        </td>
+                        <td class="col-fluid" data-label={t("tbl.col_target")}>
+                          <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{r.target_path}</span>
+                        </td>
+                        <td class="col-num" data-label={t("tbl.col_hits")}>
+                          <span class="volo-cat-chip">{t("dist.redir_hits", { count: r.hit_count ?? 0 })}</span>
+                        </td>
+                        <td class="col-act" data-label={t("art.actions")}>
+                          <div class="volo-row-actions">
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              onClick={() => {
+                                setRedirForm({
+                                  id: r.id,
+                                  source_path: r.source_path || "",
+                                  target_path: r.target_path || "",
+                                  status_code: r.status_code || 301,
+                                });
+                                setRedirModalOpen(true);
+                              }}
+                            >
+                              {t("common.edit")}
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn danger"
+                              onClick={async () => {
+                                if (!(await openConfirm({ message: t("dist.confirm_del_redir"), danger: true }))) return;
+                                await apiFetch(`/api/admin/redirects/${r.id}`, { method: "DELETE" });
+                                showToast(t("common.deleted"));
+                                void loadRedirects();
+                              }}
+                            >
+                              {t("common.delete")}
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
           </div>
+
+          <BatchBar count={selRedirIds.length} onClear={() => setSelRedirIds([])}>
+            <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteRedirects()}>
+              {t("common.delete")}
+            </button>
+          </BatchBar>
+
           <Pagination
             total={redirTotal}
             page={pageIdx}
@@ -1391,6 +1586,72 @@ export function DistributeWorkspace({
                     { value: "301", label: t("dist.redir_301") },
                     { value: "302", label: t("dist.redir_302") },
                   ]}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
+
+          <AnimatedModal
+            open={redirImportOpen}
+            onClose={() => setRedirImportOpen(false)}
+            title={t("dist.redir_import")}
+            subtitle={t("dist.redir_desc")}
+            maxWidth="580px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setRedirImportOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary"
+                  disabled={importingRedir || !redirImportData.trim()}
+                  onClick={() => void submitImportRedirects()}
+                >
+                  {t("dist.redir_import")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void submitImportRedirects(e)} autoComplete="off">
+              <div class="volo-input-row" style={{ marginBottom: "12px", flexWrap: "wrap" }}>
+                <div style={{ flex: "1 1 160px" }}>
+                  <ConsoleSelect
+                    searchable={false}
+                    value={redirImportFormat}
+                    onChange={(v) => setRedirImportFormat((v as "csv" | "json") || "csv")}
+                    options={[
+                      { value: "csv", label: "CSV" },
+                      { value: "json", label: "JSON" },
+                    ]}
+                  />
+                </div>
+                <UploadButton
+                  accept=".csv,.json,.txt"
+                  label={t("dist.redir_upload_file")}
+                  onFile={async (f) => {
+                    const txt = await f.text();
+                    if (/\.json$/i.test(f.name) || txt.trim().startsWith("[")) {
+                      setRedirImportFormat("json");
+                    } else {
+                      setRedirImportFormat("csv");
+                    }
+                    setRedirImportData(txt);
+                  }}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <textarea
+                  class="volo-textarea"
+                  rows={7}
+                  style={{ fontFamily: "var(--volo-mono)", fontSize: "12.5px" }}
+                  placeholder={
+                    redirImportFormat === "json"
+                      ? '[{"source_path":"/old","target_path":"/posts/new","status_code":301}]'
+                      : "/old-path,/posts/new-slug,301"
+                  }
+                  value={redirImportData}
+                  onInput={(e) => setRedirImportData((e.currentTarget as HTMLTextAreaElement).value)}
                 />
               </div>
             </form>
@@ -1484,7 +1745,7 @@ export function DistributeWorkspace({
                 </div>
                 {seoCfg.github_username && (
                   <img
-                    src={`/github-stats/${encodeURIComponent(seoCfg.github_username)}.svg?t=${seoVer}`}
+                    src={`/github-stats/${encodeURIComponent(seoCfg.github_username)}.svg?t=${seoVer}&theme=${effectiveDark ? "dark" : "light"}`}
                     alt={seoCfg.github_username}
                     style={{
                       maxHeight: "74px",
@@ -1694,6 +1955,7 @@ export function DistributeWorkspace({
                 options={[
                   { value: "", label: t("dist.links_health_all") },
                   { value: "ok", label: t("dist.links_ok") },
+                  { value: "redirect", label: t("dist.links_redirect") },
                   { value: "broken", label: t("dist.links_unreachable") },
                   { value: "unchecked", label: t("dist.links_unknown") },
                 ]}
@@ -1723,12 +1985,6 @@ export function DistributeWorkspace({
               />
             </div>
           </div>
-
-          <BatchBar count={selLinkIds.length} onClear={() => setSelLinkIds([])}>
-            <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteLinks()}>
-              {t("common.delete")}
-            </button>
-          </BatchBar>
 
           <MobileSelectAllBar
             checked={linkPageSlice.length > 0 && linkPageSlice.every((l) => selLinkIds.includes(l.id))}
@@ -1788,6 +2044,7 @@ export function DistributeWorkspace({
                         ? t("dist.links_unknown")
                         : t("dist.links_unreachable");
                     const label = l.title || l.name || "";
+                    const errText = String(l.last_error || l.health_error || "").trim();
                     return (
                       <tr key={l.id}>
                         <td class="col-check">
@@ -1817,16 +2074,36 @@ export function DistributeWorkspace({
                           </a>
                         </td>
                         <td class="col-status" data-label={t("tbl.col_health")}>
-                          <div class="volo-cell-meta">
-                            <span class={`volo-status-pill ${pillCls}`}>
-                              <span class="volo-status-dot" />
-                              {statusText}
-                            </span>
-                            {l.latency_ms > 0 && <span class="volo-help">{l.latency_ms}ms</span>}
+                          <div class="volo-cell-main">
+                            <div class="volo-cell-meta">
+                              <span class={`volo-status-pill ${pillCls}`}>
+                                <span class="volo-status-dot" />
+                                {statusText}
+                              </span>
+                              {l.http_code > 0 && <span class="volo-mini-tag">HTTP {l.http_code}</span>}
+                              {l.latency_ms > 0 && <span class="volo-help">{l.latency_ms}ms</span>}
+                            </div>
+                            {errText && (
+                              <span
+                                class="volo-help"
+                                title={errText}
+                                style={{ color: "var(--volo-danger)", fontSize: "11.5px", overflowWrap: "anywhere" }}
+                              >
+                                {errText.length > 42 ? `${errText.slice(0, 42)}…` : errText}
+                              </span>
+                            )}
                           </div>
                         </td>
                         <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              disabled={checkingLinkId === l.id}
+                              onClick={() => void checkSingleLink(l.id)}
+                            >
+                              {t("dist.links_check_one")}
+                            </button>
                             <button
                               type="button"
                               class="volo-act-btn"
@@ -1873,6 +2150,23 @@ export function DistributeWorkspace({
               </tbody>
             </table>
           </div>
+
+          <BatchBar count={selLinkIds.length} onClear={() => setSelLinkIds([])}>
+            <button
+              type="button"
+              class="volo-act-btn"
+              onClick={() => {
+                setBatchCatName("");
+                setBatchCatOpen(true);
+              }}
+            >
+              {t("dist.links_batch_cat")}
+            </button>
+            <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteLinks()}>
+              {t("common.delete")}
+            </button>
+          </BatchBar>
+
           <Pagination
             total={effectiveLinkTotal}
             page={pageIdx}
@@ -1880,6 +2174,54 @@ export function DistributeWorkspace({
             onPageSizeChange={onChangePageSize}
             onChange={setPageIdx}
           />
+
+          <AnimatedModal
+            open={batchCatOpen}
+            onClose={() => setBatchCatOpen(false)}
+            title={t("dist.links_batch_cat")}
+            maxWidth="440px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setBatchCatOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary"
+                  disabled={movingLinksCat}
+                  onClick={() => void submitBatchMoveLinkCat()}
+                >
+                  {t("common.save")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void submitBatchMoveLinkCat(e)} autoComplete="off">
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("dist.lbl_link_cat")}</label>
+                <input
+                  class="volo-input"
+                  placeholder={t("dist.links_cat_ph")}
+                  value={batchCatName}
+                  onInput={(e) => setBatchCatName((e.currentTarget as HTMLInputElement).value)}
+                />
+                {knownLinkCategories.length > 0 && (
+                  <div class="volo-tag-pool" style={{ marginTop: "8px" }}>
+                    {knownLinkCategories.map((c) => (
+                      <button
+                        key={c}
+                        type="button"
+                        class={`volo-chip-btn ${batchCatName === c ? "active" : ""}`}
+                        onClick={() => setBatchCatName(c)}
+                      >
+                        {c}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </form>
+          </AnimatedModal>
 
           <AnimatedModal
             open={linkModalOpen}
@@ -1981,6 +2323,19 @@ export function DistributeWorkspace({
               <p class="volo-sec-desc">{t("dist.follows_desc")}</p>
             </div>
             <div class="volo-filter-controls">
+              <a class="volo-btn volo-btn-sm" href="/api/admin/follows/export.opml" download>
+                {t("dist.follows_export_opml")}
+              </a>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={() => {
+                  setOpmlData("");
+                  setOpmlImportOpen(true);
+                }}
+              >
+                {t("dist.follows_import_opml")}
+              </button>
               <button type="button" class="volo-btn volo-btn-sm" onClick={() => void openFollowPreview()}>
                 {t("dist.follows_preview")}
               </button>
@@ -2106,6 +2461,14 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
+                              disabled={syncingFollowId === f.id}
+                              onClick={() => void syncSingleFollow(f.id)}
+                            >
+                              {t("dist.follows_sync_one")}
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
                               onClick={() => {
                                 setFollowForm({
                                   id: f.id,
@@ -2149,6 +2512,51 @@ export function DistributeWorkspace({
             onPageSizeChange={onChangePageSize}
             onChange={setPageIdx}
           />
+
+          <AnimatedModal
+            open={opmlImportOpen}
+            onClose={() => setOpmlImportOpen(false)}
+            title={t("dist.follows_import_opml")}
+            subtitle={t("dist.follows_desc")}
+            maxWidth="580px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setOpmlImportOpen(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary"
+                  disabled={importingOpml || !opmlData.trim()}
+                  onClick={() => void submitImportOpml()}
+                >
+                  {t("dist.follows_import_opml")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void submitImportOpml(e)} autoComplete="off">
+              <div class="volo-input-row" style={{ marginBottom: "12px" }}>
+                <UploadButton
+                  accept=".opml,.xml,.txt"
+                  label={t("dist.redir_upload_file")}
+                  onFile={async (f) => {
+                    setOpmlData(await f.text());
+                  }}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <textarea
+                  class="volo-textarea"
+                  rows={7}
+                  style={{ fontFamily: "var(--volo-mono)", fontSize: "12.5px" }}
+                  placeholder='<?xml version="1.0" encoding="UTF-8"?><opml version="2.0">...'
+                  value={opmlData}
+                  onInput={(e) => setOpmlData((e.currentTarget as HTMLTextAreaElement).value)}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
 
           <AnimatedModal
             open={followModalOpen}
@@ -2392,6 +2800,13 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
+                              onClick={() => void openWebhookDeliveries(w)}
+                            >
+                              {t("dist.wh_deliveries")}
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
                               disabled={testingWhId === w.id}
                               onClick={async () => {
                                 if (testingWhId) return;
@@ -2424,6 +2839,7 @@ export function DistributeWorkspace({
                                   chat_id: w.chat_id || "",
                                   secret: "",
                                   secret_set: !!item.secret_set,
+                                  clear_secret: false,
                                   events: evList.length > 0 ? evList : ["article.published", "comment.created"],
                                   is_enabled: w.is_enabled !== false,
                                 });
@@ -2529,10 +2945,32 @@ export function DistributeWorkspace({
                     name="webhook_hmac_token"
                     autoComplete="new-password"
                     class="volo-input"
-                    placeholder={whForm.secret_set ? t("sys.keep_blank_ph") : t("dist.wh_secret_ph")}
+                    disabled={whForm.clear_secret}
+                    placeholder={
+                      whForm.clear_secret
+                        ? t("dist.wh_clear_secret")
+                        : whForm.secret_set
+                        ? t("sys.keep_blank_ph")
+                        : t("dist.wh_secret_ph")
+                    }
                     value={whForm.secret}
-                    onInput={(e) => setWhForm({ ...whForm, secret: (e.currentTarget as HTMLInputElement).value })}
+                    onInput={(e) =>
+                      setWhForm({
+                        ...whForm,
+                        secret: (e.currentTarget as HTMLInputElement).value,
+                        clear_secret: false,
+                      })
+                    }
                   />
+                  {whForm.id && whForm.secret_set && !whForm.secret && (
+                    <div style={{ marginTop: "6px" }}>
+                      <SwitchToggle
+                        checked={whForm.clear_secret}
+                        onChange={(v) => setWhForm({ ...whForm, clear_secret: v })}
+                        label={t("dist.wh_clear_secret")}
+                      />
+                    </div>
+                  )}
                 </div>
                 {whForm.provider === "telegram" && (
                   <div class="volo-field">
@@ -2572,6 +3010,92 @@ export function DistributeWorkspace({
                 label={t("tbl.status_active")}
               />
             </form>
+          </AnimatedModal>
+
+          <AnimatedModal
+            open={!!whDelivModal}
+            onClose={() => setWhDelivModal(null)}
+            title={t("dist.wh_deliveries")}
+            subtitle={whDelivModal?.webhook?.name || ""}
+            maxWidth="780px"
+            footer={
+              <button type="button" class="volo-btn volo-btn-primary" onClick={() => setWhDelivModal(null)}>
+                {t("common.close")}
+              </button>
+            }
+          >
+            {whDelivModal?.loading ? (
+              <div class="volo-help">{t("shell.loading")}</div>
+            ) : !whDelivModal?.items?.length ? (
+              <ConsoleEmpty text={t("dist.wh_deliveries_empty")} />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {whDelivModal.items.map((d: any) => {
+                  const isOk = Boolean(d.success) || (d.status_code >= 200 && d.status_code < 400);
+                  const isExp = expandedDelivId === d.id;
+                  return (
+                    <div key={d.id} class="volo-subcard" style={{ margin: 0 }}>
+                      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px", justifyContent: "space-between" }}>
+                        <div class="volo-cell-meta">
+                          <span class={`volo-status-pill ${isOk ? "ok" : "danger"}`}>
+                            <span class="volo-status-dot" />
+                            {d.status_code > 0 ? `HTTP ${d.status_code}` : isOk ? "OK" : "ERR"}
+                          </span>
+                          <span class="volo-code-chip">{d.event || "event"}</span>
+                          {d.duration_ms >= 0 && <span class="volo-help">{d.duration_ms}ms</span>}
+                          <span class="volo-help">{formatDateTime(d.created_at)}</span>
+                        </div>
+                        <div class="volo-row-actions">
+                          <button
+                            type="button"
+                            class="volo-act-btn"
+                            onClick={() => setExpandedDelivId(isExp ? null : d.id)}
+                          >
+                            {isExp ? t("common.close") : t("common.view")}
+                          </button>
+                          <button
+                            type="button"
+                            class="volo-act-btn"
+                            disabled={replayingDelivId === d.id}
+                            onClick={() => void replayWebhookDelivery(whDelivModal.webhook.id, d.id)}
+                          >
+                            {t("dist.wh_replay")}
+                          </button>
+                        </div>
+                      </div>
+                      {d.error_text && (
+                        <div class="volo-help" style={{ color: "var(--volo-danger)", marginTop: "4px", overflowWrap: "anywhere" }}>
+                          {d.error_text}
+                        </div>
+                      )}
+                      {isExp && (
+                        <pre
+                          style={{
+                            marginTop: "8px",
+                            marginBottom: 0,
+                            padding: "10px",
+                            borderRadius: "8px",
+                            background: "var(--volo-raised)",
+                            fontSize: "12px",
+                            maxHeight: "240px",
+                            overflow: "auto",
+                            whiteSpace: "pre-wrap",
+                            overflowWrap: "anywhere",
+                          }}
+                        >
+                          {[
+                            d.payload_json ? `Payload:\n${d.payload_json}` : "",
+                            d.response_body ? `Response:\n${d.response_body}` : "",
+                          ]
+                            .filter(Boolean)
+                            .join("\n\n") || "—"}
+                        </pre>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </AnimatedModal>
         </div>
       )}

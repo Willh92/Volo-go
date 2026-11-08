@@ -111,7 +111,7 @@ func (kv *KVStore) Set(ctx context.Context, key string, value string, ttlSeconds
 		[]string{"value_text", "value_int", "expires_at", "updated_at"},
 	)
 
-	return kv.store.WithTx(ctx, func(tx *sqlx.Tx) error {
+	return kv.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
 		if err := kv.enforceQuotaTx(ctx, tx, k, now); err != nil {
 			return err
 		}
@@ -130,7 +130,7 @@ func (kv *KVStore) IncrBy(ctx context.Context, key string, delta int64, ttlSecon
 	now := kv.nowFn().Unix()
 	var nextVal int64
 
-	err = kv.store.WithTx(ctx, func(tx *sqlx.Tx) error {
+	err = kv.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
 		// Step 1: Attempt single-statement atomic SQL update on a live, non-expired row.
 		// Even on Postgres/MySQL READ COMMITTED, `SET value_int = value_int + ?` acquires a row-level X lock
 		// and evaluates atomically against the latest committed value!
@@ -206,18 +206,18 @@ func (kv *KVStore) IncrBy(ctx context.Context, key string, delta int64, ttlSecon
 	return nextVal, nil
 }
 
-// Delete removes key for this plugin.
+// Delete removes key for this plugin without bumping content dataRev.
 func (kv *KVStore) Delete(ctx context.Context, key string) error {
 	k, err := validateKVKey(key)
 	if err != nil {
 		return err
 	}
-	_, err = kv.store.ExecContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ? AND k = ?`, kv.pluginID, k)
+	_, err = kv.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ? AND k = ?`, kv.pluginID, k)
 	return err
 }
 
-// ListPrefix returns up to limit non-expired entries whose key begins with prefix, ordered by key ASC.
-func (kv *KVStore) ListPrefix(ctx context.Context, prefix string, limit int) ([]KVItem, error) {
+// ListPrefix returns up to limit non-expired entries whose key begins with prefix (and optionally > afterKey), ordered by key ASC.
+func (kv *KVStore) ListPrefix(ctx context.Context, prefix string, limit int, afterKey ...string) ([]KVItem, error) {
 	if limit <= 0 {
 		limit = defaultKVListLimit
 	}
@@ -226,12 +226,19 @@ func (kv *KVStore) ListPrefix(ctx context.Context, prefix string, limit int) ([]
 	}
 	now := kv.nowFn().Unix()
 	p := strings.TrimSpace(prefix)
+	cursor := ""
+	if len(afterKey) > 0 {
+		cursor = strings.TrimSpace(afterKey[0])
+	}
 
 	baseQuery := `SELECT plugin_id, k, value_text, value_int, expires_at, updated_at
 		FROM plugin_kv
 		WHERE plugin_id = ? AND (expires_at = 0 OR expires_at > ?)`
 	args := []any{kv.pluginID, now}
-	if p != "" {
+	if cursor != "" && (p == "" || cursor >= p) {
+		baseQuery += ` AND k > ?`
+		args = append(args, cursor)
+	} else if p != "" {
 		// Use range lower-bound k >= prefix and filter exact prefix in Go to avoid SQL LIKE wildcard ('%' / '_') pitfalls!
 		baseQuery += ` AND k >= ?`
 		args = append(args, p)
@@ -295,9 +302,9 @@ func (kv *KVStore) enforceQuotaTx(ctx context.Context, tx *sqlx.Tx, key string, 
 	return nil
 }
 
-// PurgeExpiredKV deletes all expired keys across all plugins.
+// PurgeExpiredKV deletes all expired keys across all plugins without bumping content dataRev.
 func PurgeExpiredKV(ctx context.Context, store *sqlx.Store, nowUnix int64) (int64, error) {
-	res, err := store.ExecContext(ctx, `DELETE FROM plugin_kv WHERE expires_at > 0 AND expires_at <= ?`, nowUnix)
+	res, err := store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE expires_at > 0 AND expires_at <= ?`, nowUnix)
 	if err != nil {
 		return 0, err
 	}
@@ -305,8 +312,8 @@ func PurgeExpiredKV(ctx context.Context, store *sqlx.Store, nowUnix int64) (int6
 	return n, nil
 }
 
-// ClearPluginKV deletes all stored keys belonging to pluginID.
+// ClearPluginKV deletes all stored keys belonging to pluginID without bumping content dataRev.
 func ClearPluginKV(ctx context.Context, store *sqlx.Store, pluginID string) error {
-	_, err := store.ExecContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, pluginID)
+	_, err := store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, pluginID)
 	return err
 }

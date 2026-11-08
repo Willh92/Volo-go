@@ -61,6 +61,10 @@ if ((-not $Mirror) -and $GitHubProxy) { $Mirror = $GitHubProxy }
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+if ($ServiceName -notmatch '^[A-Za-z0-9._-]{1,64}$') {
+  throw "Invalid ServiceName '$ServiceName': must match ^[A-Za-z0-9._-]{1,64}$."
+}
+
 if (-not $DryRun) {
   $CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
   if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -480,6 +484,22 @@ function Set-DataDirPermissions([string]$TargetDir, [string]$Account, [string]$G
   }
 }
 
+function Set-SecretEnvFilePermissions([string]$TargetFile, [string]$Account) {
+  if ($DryRun) {
+    Write-Host "[dry-run] Restrict secret file NTFS ACLs on $TargetFile (SYSTEM, Administrators, and service account read-only)"
+    return
+  }
+  if (-not (Test-Path -LiteralPath $TargetFile)) {
+    return
+  }
+  & icacls $TargetFile /inheritance:r | Out-Null
+  & icacls $TargetFile /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+  $acctSpec = Resolve-IcaclsPrincipal $Account
+  if ($acctSpec -and ($acctSpec -ne "*S-1-5-18") -and ($acctSpec -ne "*S-1-5-32-544")) {
+    & icacls $TargetFile /grant:r "${acctSpec}:R" | Out-Null
+  }
+}
+
 $Script:HasExplicitInstallDir = $PSBoundParameters.ContainsKey("InstallDir")
 $Script:HasExplicitDataDir = $PSBoundParameters.ContainsKey("DataDir")
 
@@ -495,6 +515,7 @@ try {
         }
         Sync-BundledExtensions -DestRoot $DataDir
       }
+      Set-DataDirPermissions -TargetDir $DataDir -Account $ServiceAccount -Group $PermissionGroup
       Install-BinarySafe -SourceExe $SrcBin -TargetExe $DestBin
 
       if (-not (Test-Path $EnvFile)) {
@@ -526,7 +547,7 @@ try {
           Set-Content -Path $EnvFile -Value $EnvLines -Encoding UTF8
         }
       }
-      Set-DataDirPermissions -TargetDir $DataDir -Account $ServiceAccount -Group $PermissionGroup
+      Set-SecretEnvFilePermissions -TargetFile $EnvFile -Account $ServiceAccount
 
       if ($DryRun) {
         Write-Host "[dry-run] Register and start Windows auto-start service '$ServiceName'"

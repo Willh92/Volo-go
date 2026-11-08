@@ -320,8 +320,9 @@ export function t(key: string, vars?: Record<string, string | number>): string {
   return tFor(localeSig.value, key, vars);
 }
 
-export function formatDateTime(ms?: number): string {
-  if (!ms || ms <= 0) return "—";
+export function formatDateTime(val?: number | string): string {
+  const ms = typeof val === "string" ? Date.parse(val) : val;
+  if (!ms || Number.isNaN(ms) || ms <= 0) return "—";
   const d = new Date(ms);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;

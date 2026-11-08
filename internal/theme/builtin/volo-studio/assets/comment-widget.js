@@ -282,10 +282,11 @@
       });
     }
 
-    function renderItem(c, depth) {
+    function renderItem(c, depth, parentAuthor) {
       var seed = c.avatar_seed || c.id || "guest";
       var av = c.avatar_url || ("/avatars/" + encodeURIComponent(seed) + ".svg");
-      var at = c.reply_to_name ? '<span class="vc-reply-at">@' + esc(c.reply_to_name) + "</span>" : "";
+      var pName = c.reply_to_name || (depth >= 1 ? parentAuthor : "");
+      var at = pName ? '<span class="vc-reply-at">@' + esc(pName) + "</span>" : "";
       var rawURL = c.author_url ? String(c.author_url).trim() : "";
       var who = /^https?:\/\//i.test(rawURL)
         ? '<a href="' + esc(rawURL) + '" rel="nofollow ugc noopener" target="_blank">' + esc(c.author_name) + "</a>"
@@ -315,14 +316,15 @@
       var kids = "";
       if (reps.length) {
         var dNext = (depth || 0) + 1;
-        var mapR = function (arr) { return arr.map(function (r) { return renderItem(r, dNext); }).join(""); };
+        var dAttr = ' data-depth="' + Math.min(dNext, 3) + '"';
+        var mapR = function (arr) { return arr.map(function (r) { return renderItem(r, dNext, c.author_name || ""); }).join(""); };
         if (!depth && reps.length > 3 && !hasDescendant(reps.slice(3), hashCommentID())) {
-          kids = '<div class="vc-replies">' + mapR(reps.slice(0, 3)) +
+          kids = '<div class="vc-replies"' + dAttr + ">" + mapR(reps.slice(0, 3)) +
             '<div class="js-vc-more-box" hidden>' + mapR(reps.slice(3)) + "</div>" +
             '<button type="button" class="vc-more-replies js-vc-show-more">' +
             esc(L.moreReplies.replace("{count}", String(reps.length - 3))) + "</button></div>";
         } else {
-          kids = '<div class="vc-replies">' + mapR(reps) + "</div>";
+          kids = '<div class="vc-replies"' + dAttr + ">" + mapR(reps) + "</div>";
         }
       }
 

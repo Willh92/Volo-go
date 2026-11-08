@@ -11,7 +11,7 @@ import (
 )
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 5
 
 type migrationStep struct {
 	Version     int
@@ -39,6 +39,11 @@ var steps = []migrationStep{
 		Version:     4,
 		Description: "Fix idx_articles_status_pub name collision and add composite sort/filter indexes across articles, comments, media_assets, redirects, and series_articles",
 		Statements:  buildV4QueryIndexes,
+	},
+	{
+		Version:     5,
+		Description: "Add custom template column to pages and bounded webhook_deliveries history table",
+		Statements:  buildV5PageTemplatesAndWebhookDeliveries,
 	},
 }
 
@@ -71,6 +76,29 @@ func buildV4QueryIndexes(_ dialect.Dialect) []string {
 		`CREATE INDEX idx_media_created ON media_assets (created_at)`,
 		`CREATE INDEX idx_redirects_created ON redirects (created_at)`,
 		`CREATE INDEX idx_series_articles_sort ON series_articles (series_id, sort_order)`,
+	}
+}
+
+func buildV5PageTemplatesAndWebhookDeliveries(d dialect.Dialect) []string {
+	t := d.Types()
+	sfx := tableSuffix(d)
+	return []string{
+		fmt.Sprintf(`ALTER TABLE pages ADD COLUMN template%s NOT NULL DEFAULT 'default'`, t.Varchar64),
+		fmt.Sprintf(`ALTER TABLE books ADD COLUMN reading_status%s NOT NULL DEFAULT ''`, t.Varchar32),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS webhook_deliveries (
+			id%s PRIMARY KEY,
+			webhook_id%s NOT NULL,
+			event%s NOT NULL,
+			status_code%s NOT NULL DEFAULT 0,
+			duration_ms%s NOT NULL DEFAULT 0,
+			success%s NOT NULL DEFAULT %s,
+			payload_json%s NOT NULL,
+			response_body%s NOT NULL,
+			error_text%s NOT NULL,
+			created_at%s NOT NULL
+		)%s`, t.Varchar32, t.Varchar32, t.Varchar64, t.Int, t.Int, t.Bool, t.BoolFalseLit,
+			t.Text, t.Text, t.Varchar255, t.BigInt, sfx),
+		`CREATE INDEX idx_webhook_deliveries_hook_created ON webhook_deliveries (webhook_id, created_at)`,
 	}
 }
 
@@ -378,6 +406,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			author_id%s NOT NULL,
 			title%s NOT NULL,
 			slug%s NOT NULL UNIQUE,
+			template%s NOT NULL DEFAULT 'default',
 			content_md%s NOT NULL,
 			is_published%s NOT NULL DEFAULT %s,
 			allow_comment%s NOT NULL DEFAULT %s,
@@ -388,7 +417,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			comment_count%s NOT NULL DEFAULT 0,
 			created_at%s NOT NULL,
 			updated_at%s NOT NULL
-		)%s`, t.Varchar32, t.Varchar32, t.Varchar255, vk, t.LongText,
+		)%s`, t.Varchar32, t.Varchar32, t.Varchar255, vk, t.Varchar64, t.LongText,
 			t.Bool, t.BoolTrueLit, t.Bool, t.BoolTrueLit, t.Bool, t.BoolTrueLit,
 			t.Varchar32, t.Varchar128, t.BigInt, t.Int, t.BigInt, t.BigInt, sfx),
 		`CREATE INDEX idx_pages_trans_group ON pages (translation_group, lang)`,
@@ -441,13 +470,14 @@ func buildV1Schema(d dialect.Dialect) []string {
 			source_url%s NOT NULL,
 			series_id%s NOT NULL,
 			embed_mode%s NOT NULL,
+			reading_status%s NOT NULL DEFAULT '',
 			chapter_count%s NOT NULL DEFAULT 0,
 			synced_at%s NOT NULL DEFAULT 0,
 			sort_order%s NOT NULL DEFAULT 0,
 			created_at%s NOT NULL,
 			updated_at%s NOT NULL
 		)%s`, t.Varchar32, t.Varchar255, vk, t.Text, t.Varchar512, t.Varchar32, t.Varchar512,
-			t.Varchar32, t.Varchar32, t.Int, t.BigInt, t.Int, t.BigInt, t.BigInt, sfx),
+			t.Varchar32, t.Varchar32, t.Varchar32, t.Int, t.BigInt, t.Int, t.BigInt, t.BigInt, sfx),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS book_chapters (
 			id%s PRIMARY KEY,
 			book_id%s NOT NULL,
@@ -602,6 +632,21 @@ func buildV1Schema(d dialect.Dialect) []string {
 		)%s`, t.Varchar32, t.Varchar128, t.Varchar32, t.Varchar512, t.Text, t.Varchar128,
 			t.Text, t.Bool, t.BoolTrueLit, t.Int, t.Varchar255, t.BigInt, t.BigInt, t.BigInt, sfx),
 
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS webhook_deliveries (
+			id%s PRIMARY KEY,
+			webhook_id%s NOT NULL,
+			event%s NOT NULL,
+			status_code%s NOT NULL DEFAULT 0,
+			duration_ms%s NOT NULL DEFAULT 0,
+			success%s NOT NULL DEFAULT %s,
+			payload_json%s NOT NULL,
+			response_body%s NOT NULL,
+			error_text%s NOT NULL,
+			created_at%s NOT NULL
+		)%s`, t.Varchar32, t.Varchar32, t.Varchar64, t.Int, t.Int, t.Bool, t.BoolFalseLit,
+			t.Text, t.Text, t.Varchar255, t.BigInt, sfx),
+		`CREATE INDEX idx_webhook_deliveries_hook_created ON webhook_deliveries (webhook_id, created_at)`,
+
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS analytics_daily (
 			stat_date%s PRIMARY KEY,
 			pv%s NOT NULL DEFAULT 0,
@@ -714,6 +759,7 @@ var CanonicalTables = []string{
 	"media_assets",
 	"redirects",
 	"webhooks",
+	"webhook_deliveries",
 	"analytics_daily",
 	"analytics_top_items",
 	"security_ip_bans",

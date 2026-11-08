@@ -1,12 +1,17 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import {
   apiFetch,
+  clearLocalDraft,
   currentUserSig,
   dirtyEditorSig,
+  loadLocalDraft,
+  LocalDraft,
   openConfirm,
   resetConsoleScroll,
+  saveLocalDraft,
   showToast,
   storageDriverSig,
+  uploadWithProgress,
 } from "../api";
 import { CM6Editor } from "../components/CM6Editor";
 import { MediaAssetRecord, MediaPickButton } from "../components/MediaLibraryModal";
@@ -22,6 +27,7 @@ import {
   SwitchToggle,
   TableSkeleton,
   UploadButton,
+  UploadProgressBar,
   useDebouncedValue,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
@@ -64,6 +70,7 @@ const EMPTY_BOOK = {
   source_url: "",
   series_id: "",
   embed_mode: "iframe",
+  reading_status: "",
   sort_order: 10,
 };
 
@@ -109,6 +116,37 @@ function formatAssetSize(bytes: number): string {
   return `${Math.max(1, Math.round(n / 1024))} KB`;
 }
 
+function summarizeUA(ua?: string): string {
+  if (!ua) return "";
+  const s = String(ua).trim();
+  if (!s) return "";
+  const browser = /Edg\//i.test(s)
+    ? "Edge"
+    : /OPR\/|Opera/i.test(s)
+    ? "Opera"
+    : /Firefox\//i.test(s)
+    ? "Firefox"
+    : /Chrome\//i.test(s) && !/Chromium/i.test(s)
+    ? "Chrome"
+    : /Safari\//i.test(s) && !/Chrome/i.test(s)
+    ? "Safari"
+    : /curl\//i.test(s)
+    ? "curl"
+    : "";
+  const os = /iPhone|iPad|iOS/i.test(s)
+    ? "iOS"
+    : /Android/i.test(s)
+    ? "Android"
+    : /Mac OS X|Macintosh/i.test(s)
+    ? "macOS"
+    : /Windows/i.test(s)
+    ? "Windows"
+    : /Linux/i.test(s)
+    ? "Linux"
+    : "";
+  return [browser, os].filter(Boolean).join(" · ") || s.slice(0, 22);
+}
+
 export function ContentWorkspace({
   activeTab = "categories",
   onNavigate,
@@ -121,18 +159,21 @@ export function ContentWorkspace({
   const isAdmin = currentUserSig.value?.role === "admin";
   const [pageIdx, setPageIdx] = useState(1);
   const [pageSize, setPageSize] = useState(20);
+  const [tagPageSize, setTagPageSize] = useState(80);
   const [mediaPageSize, setMediaPageSize] = useState(24);
   const [subTotal, setSubTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const reqSeqRef = useRef(0);
 
-  // Pages (list + full-width Studio Page Editor)
+  // Pages (list + full-width Studio Page Editor + LocalDraft + Theme Templates)
   const [pages, setPages] = useState<any[]>([]);
   const [pageQuery, setPageQuery] = useState("");
   const [pageStatusFilter, setPageStatusFilter] = useState("");
   const debouncedPageQuery = useDebouncedValue(pageQuery, 250);
   const [pageEditorOpen, setPageEditorOpen] = useState(false);
   const [editPage, setEditPage] = useState<any | null>(null);
+  const [pendingPageDraft, setPendingPageDraft] = useState<LocalDraft | null>(null);
+  const [themePageTemplates, setThemePageTemplates] = useState<Array<{ value: string; label: string }>>([]);
   const [savingPage, setSavingPage] = useState(false);
   const savePageRef = useRef<() => void>(() => {});
 
@@ -143,14 +184,21 @@ export function ContentWorkspace({
   const [catModalOpen, setCatModalOpen] = useState(false);
   const [catForm, setCatForm] = useState({ ...EMPTY_CAT });
 
-  // Tags
+  // Tags (1,000+ scale + Unused filter + Merge modal)
   const [tags, setTags] = useState<any[]>([]);
   const [tagFilter, setTagFilter] = useState("");
   const [tagSort, setTagSort] = useState<"count" | "name">("count");
+  const [tagUnusedOnly, setTagUnusedOnly] = useState(false);
   const debouncedTagFilter = useDebouncedValue(tagFilter, 250);
   const [selTagIds, setSelTagIds] = useState<string[]>([]);
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [tagForm, setTagForm] = useState({ ...EMPTY_TAG });
+  const [mergeSourceTag, setMergeSourceTag] = useState<any | null>(null);
+  const [mergeTargetId, setMergeTargetId] = useState("");
+  const [mergeSearchQ, setMergeSearchQ] = useState("");
+  const debouncedMergeQ = useDebouncedValue(mergeSearchQ, 220);
+  const [mergeCandidates, setMergeCandidates] = useState<any[]>([]);
+  const [mergingTag, setMergingTag] = useState(false);
 
   // Series + Paginated Articles checklist
   const [series, setSeries] = useState<any[]>([]);
@@ -178,8 +226,9 @@ export function ContentWorkspace({
   const [chapQuery, setChapQuery] = useState("");
   const [chapPage, setChapPage] = useState(1);
   const [collapsedChapUids, setCollapsedChapUids] = useState<string[]>([]);
+  const [syncingChaps, setSyncingChaps] = useState(false);
 
-  // Comments
+  // Comments + Custom IP Ban Modal
   const [comments, setComments] = useState<any[]>([]);
   const [cmtStatus, setCmtStatus] = useState("");
   const [cmtStatusCounts, setCmtStatusCounts] = useState<{
@@ -192,29 +241,46 @@ export function ContentWorkspace({
   const debouncedCmtQuery = useDebouncedValue(cmtQuery, 250);
   const [selCmtIds, setSelCmtIds] = useState<string[]>([]);
   const [cmtBox, setCmtBox] = useState<{ id: string; mode: "reply" | "edit"; text: string } | null>(null);
+  const [banIpModal, setBanIpModal] = useState<{
+    commentId?: string;
+    batchIds?: string[];
+    ipLabel?: string;
+  } | null>(null);
+  const [banDurationHrs, setBanDurationHrs] = useState("720");
+  const [banReason, setBanReason] = useState("comment spam");
+  const [banRejectPending, setBanRejectPending] = useState(true);
+  const [banningIp, setBanningIp] = useState(false);
 
-  // Media Library
+  // Media Library (10,000+ scale)
   const [media, setMedia] = useState<MediaAssetRecord[]>([]);
   const [mediaAllTotal, setMediaAllTotal] = useState(0);
+  const [mediaTotalBytes, setMediaTotalBytes] = useState<number | null>(null);
   const [orphanCount, setOrphanCount] = useState(0);
   const [mediaView, setMediaView] = useState<"grid" | "list">("grid");
   const [mediaRefFilter, setMediaRefFilter] = useState<"all" | "orphan" | "used">("all");
   const [mediaKindFilter, setMediaKindFilter] = useState<"all" | "image" | "audio" | "other">("all");
+  const [mediaMonthFilter, setMediaMonthFilter] = useState("");
   const [mediaSort, setMediaSort] = useState<"newest" | "size" | "name">("newest");
   const [mediaQuery, setMediaQuery] = useState("");
   const debouncedMediaQuery = useDebouncedValue(mediaQuery, 250);
   const [selMediaIds, setSelMediaIds] = useState<string[]>([]);
   const [isDraggingMedia, setIsDraggingMedia] = useState(false);
   const [uploadingMedia, setUploadingMedia] = useState(false);
+  const [mediaUploadPct, setMediaUploadPct] = useState<number | null>(null);
   const [reconcilingMedia, setReconcilingMedia] = useState(false);
   const [previewAsset, setPreviewAsset] = useState<MediaAssetRecord | null>(null);
   const [assetMetaForm, setAssetMetaForm] = useState({ original_name: "", alt_text: "" });
   const [savingAssetMeta, setSavingAssetMeta] = useState(false);
+  const [brokenMediaIds, setBrokenMediaIds] = useState<Record<string, boolean>>({});
+
+  const pageDraftKey =
+    pageEditorOpen && editPage ? (editPage.id ? `page:${editPage.id}` : "page:new") : "";
 
   useEffect(() => {
     setSub(activeTab);
     setPageEditorOpen(false);
     setEditPage(null);
+    setPendingPageDraft(null);
     dirtyEditorSig.value = false;
     setPageIdx(1);
     setSelTagIds([]);
@@ -228,6 +294,62 @@ export function ContentWorkspace({
       dirtyEditorSig.value = false;
     };
   }, []);
+
+  // Load active theme's localized_page_templates when in pages tab
+  useEffect(() => {
+    if (sub !== "pages") return;
+    let cancelled = false;
+    apiFetch<{ items?: any[]; active_theme?: string }>(`/api/admin/themes?locale=${encodeURIComponent(localeSig.value)}`)
+      .then((res) => {
+        if (cancelled) return;
+        const list = res.items || [];
+        const active = list.find((th: any) => th.active || th.id === res.active_theme) || list[0];
+        const rawTpls = active?.localized_page_templates || active?.page_templates || [];
+        const parsed: Array<{ value: string; label: string }> = [];
+        if (Array.isArray(rawTpls)) {
+          rawTpls.forEach((tpl: any) => {
+            if (typeof tpl === "string") {
+              parsed.push({ value: tpl, label: tpl });
+            } else if (tpl && (tpl.key || tpl.id || tpl.value || tpl.slug)) {
+              const v = String(tpl.key || tpl.id || tpl.value || tpl.slug);
+              parsed.push({ value: v, label: String(tpl.label || tpl.name || tpl.title || v) });
+            }
+          });
+        } else if (rawTpls && typeof rawTpls === "object") {
+          Object.entries(rawTpls).forEach(([k, v]) => {
+            parsed.push({ value: k, label: String(v || k) });
+          });
+        }
+        setThemePageTemplates(parsed);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sub, localeSig.value]);
+
+  // Auto-save Page LocalDraft every 1.2s (never overwrite unreviewed pendingPageDraft)
+  useEffect(() => {
+    if (!pageEditorOpen || !editPage || !pageDraftKey || pendingPageDraft !== null) return;
+    const timer = window.setTimeout(() => {
+      if (editPage.title || editPage.content_md) {
+        void saveLocalDraft(pageDraftKey, {
+          title: editPage.title || "",
+          slug: editPage.slug || "",
+          summary_md: "",
+          content_md: editPage.content_md || "",
+          template: editPage.template || "default",
+          is_published: editPage.is_published !== false,
+          show_toc: Boolean(editPage.show_toc),
+          allow_comment: editPage.allow_comment !== false,
+          lang: editPage.lang || localeSig.value,
+          translation_group: editPage.translation_group || "",
+          saved_at: Date.now(),
+        });
+      }
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [pageEditorOpen, editPage, pageDraftKey, pendingPageDraft]);
 
   const confirmLeaveDirtyPage = async (): Promise<boolean> => {
     if (!pageEditorOpen || !dirtyEditorSig.value) return true;
@@ -245,6 +367,7 @@ export function ContentWorkspace({
     setSub(k);
     setPageEditorOpen(false);
     setEditPage(null);
+    setPendingPageDraft(null);
     setPageIdx(1);
     setSelTagIds([]);
     setSelCmtIds([]);
@@ -281,12 +404,13 @@ export function ContentWorkspace({
       } else if (sub === "tags") {
         const qs = new URLSearchParams();
         qs.set("page", String(pageIdx));
-        qs.set("per_page", String(pageSize));
+        qs.set("per_page", String(tagPageSize));
         qs.set("sort", tagSort);
+        if (tagUnusedOnly) qs.set("unused", "1");
         if (debouncedTagFilter.trim()) qs.set("q", debouncedTagFilter.trim());
-        const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/tags?${qs.toString()}`);
+        const r = await apiFetch<{ items?: any[]; tags?: any[]; total?: number }>(`/api/admin/tags?${qs.toString()}`);
         if (reqId !== reqSeqRef.current) return;
-        const list = r.items || [];
+        const list = r.items || r.tags || [];
         setTags(list);
         setSubTotal(typeof r.total === "number" ? r.total : list.length);
       } else if (sub === "series") {
@@ -299,11 +423,27 @@ export function ContentWorkspace({
         const list = serRes.items || [];
         setSeries(list);
         setSubTotal(typeof serRes.total === "number" ? serRes.total : list.length);
+        // Seed knownArticlesMap from s.articles returned by GET /api/admin/series
+        const seeded: Record<string, any> = {};
+        list.forEach((s: any) => {
+          if (Array.isArray(s.articles)) {
+            s.articles.forEach((a: any) => {
+              if (a?.id) seeded[a.id] = a;
+            });
+          }
+        });
+        if (Object.keys(seeded).length > 0) {
+          setKnownArticlesMap((prev) => ({ ...prev, ...seeded }));
+        }
       } else if (sub === "books") {
         const qs = new URLSearchParams();
         qs.set("page", String(pageIdx));
         qs.set("per_page", String(pageSize));
         if (debouncedBookQuery.trim()) qs.set("q", debouncedBookQuery.trim());
+        if (bookFilter) {
+          if (bookFilter.startsWith("rs:")) qs.set("reading_status", bookFilter.slice(3));
+          else qs.set("source_type", bookFilter);
+        }
         const [bkRes, serRes] = await Promise.all([
           apiFetch<{ items: any[]; total?: number }>(`/api/admin/books?${qs.toString()}`),
           apiFetch<{ items: any[] }>("/api/admin/series?per_page=200"),
@@ -335,11 +475,20 @@ export function ContentWorkspace({
         qs.set("per_page", String(mediaPageSize));
         qs.set("sort", mediaSort);
         if (mediaKindFilter !== "all") qs.set("mime", mediaKindFilter);
-        if (mediaRefFilter === "orphan") qs.set("orphan_only", "1");
+        if (mediaRefFilter === "orphan") {
+          qs.set("usage", "unused");
+          qs.set("orphan_only", "1");
+        } else if (mediaRefFilter === "used") {
+          qs.set("usage", "used");
+        } else {
+          qs.set("usage", "all");
+        }
+        if (mediaMonthFilter.trim()) qs.set("month", mediaMonthFilter.trim());
         if (debouncedMediaQuery.trim()) qs.set("q", debouncedMediaQuery.trim());
         const r = await apiFetch<{
           items: MediaAssetRecord[];
           total?: number;
+          total_bytes?: number;
           orphan_count?: number;
           storage_driver?: string;
         }>(`/api/admin/media?${qs.toString()}`);
@@ -348,7 +497,12 @@ export function ContentWorkspace({
         const tot = typeof r.total === "number" ? r.total : list.length;
         setMedia(list);
         setSubTotal(tot);
-        if (mediaRefFilter === "all" && mediaKindFilter === "all" && !debouncedMediaQuery.trim()) {
+        if (typeof r.total_bytes === "number") {
+          setMediaTotalBytes(r.total_bytes);
+        } else {
+          setMediaTotalBytes(null);
+        }
+        if (mediaRefFilter === "all" && mediaKindFilter === "all" && !mediaMonthFilter.trim() && !debouncedMediaQuery.trim()) {
           setMediaAllTotal(tot);
         } else if (mediaAllTotal === 0) {
           setMediaAllTotal(tot);
@@ -369,21 +523,43 @@ export function ContentWorkspace({
     sub,
     pageIdx,
     pageSize,
+    tagPageSize,
     mediaPageSize,
     debouncedPageQuery,
     pageStatusFilter,
     debouncedCatQuery,
     debouncedTagFilter,
     tagSort,
+    tagUnusedOnly,
     debouncedSerQuery,
     debouncedBookQuery,
+    bookFilter,
     cmtStatus,
     debouncedCmtQuery,
     mediaRefFilter,
     mediaKindFilter,
+    mediaMonthFilter,
     mediaSort,
     debouncedMediaQuery,
   ]);
+
+  // Tag Merge candidate search
+  useEffect(() => {
+    if (!mergeSourceTag) return;
+    let cancelled = false;
+    const qs = new URLSearchParams({ per_page: "80", sort: "count" });
+    if (debouncedMergeQ.trim()) qs.set("q", debouncedMergeQ.trim());
+    apiFetch<{ items?: any[]; tags?: any[] }>(`/api/admin/tags?${qs.toString()}`)
+      .then((res) => {
+        if (cancelled) return;
+        const list = (res.items || res.tags || []).filter((tg: any) => tg.id !== mergeSourceTag.id);
+        setMergeCandidates(list);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [mergeSourceTag, debouncedMergeQ]);
 
   // Paginated Series Article Picker loader inside Series Modal
   useEffect(() => {
@@ -445,7 +621,7 @@ export function ContentWorkspace({
     dirtyEditorSig.value = true;
   };
 
-  const openNewPageEditor = () => {
+  const openNewPageEditor = async () => {
     dirtyEditorSig.value = false;
     setEditPage({
       title: "",
@@ -460,18 +636,71 @@ export function ContentWorkspace({
     });
     setPageEditorOpen(true);
     resetConsoleScroll();
+    const saved = await loadLocalDraft("page:new");
+    if (saved && (saved.title || saved.content_md)) {
+      setPendingPageDraft(saved);
+    } else {
+      setPendingPageDraft(null);
+    }
   };
 
   const openExistingPageEditor = async (pageId: string) => {
     try {
       const full = await apiFetch<{ page: any }>(`/api/admin/pages/${pageId}`);
       dirtyEditorSig.value = false;
-      setEditPage({ template: "default", ...full.page });
+      const p = full.page;
+      setEditPage({ template: "default", ...p });
       setPageEditorOpen(true);
       resetConsoleScroll();
+      const saved = await loadLocalDraft(`page:${pageId}`);
+      const updatedMs = p?.updated_at ? new Date(p.updated_at).getTime() || Number(p.updated_at) || 0 : 0;
+      if (
+        saved &&
+        saved.saved_at > updatedMs &&
+        (saved.content_md !== (p?.content_md || "") || saved.title !== (p?.title || ""))
+      ) {
+        setPendingPageDraft(saved);
+      } else {
+        setPendingPageDraft(null);
+      }
     } catch (err: any) {
       showToast(err.message);
     }
+  };
+
+  const applyPendingPageDraft = () => {
+    if (!pendingPageDraft) return;
+    setEditPage((prev: any) =>
+      prev
+        ? {
+            ...prev,
+            title: pendingPageDraft.title ?? prev.title,
+            slug: pendingPageDraft.slug ?? prev.slug,
+            content_md: pendingPageDraft.content_md ?? prev.content_md,
+            template: pendingPageDraft.template || prev.template || "default",
+            is_published:
+              typeof pendingPageDraft.is_published === "boolean"
+                ? pendingPageDraft.is_published
+                : prev.is_published,
+            show_toc:
+              typeof pendingPageDraft.show_toc === "boolean" ? pendingPageDraft.show_toc : prev.show_toc,
+            allow_comment:
+              typeof pendingPageDraft.allow_comment === "boolean"
+                ? pendingPageDraft.allow_comment
+                : prev.allow_comment,
+            lang: pendingPageDraft.lang || prev.lang,
+            translation_group: pendingPageDraft.translation_group ?? prev.translation_group,
+          }
+        : prev
+    );
+    dirtyEditorSig.value = true;
+    setPendingPageDraft(null);
+    showToast(t("art.draft_restored"), "ok");
+  };
+
+  const discardPendingPageDraft = () => {
+    if (pageDraftKey) void clearLocalDraft(pageDraftKey);
+    setPendingPageDraft(null);
   };
 
   const closePageEditor = async () => {
@@ -479,6 +708,7 @@ export function ContentWorkspace({
     dirtyEditorSig.value = false;
     setPageEditorOpen(false);
     setEditPage(null);
+    setPendingPageDraft(null);
     resetConsoleScroll();
   };
 
@@ -488,9 +718,11 @@ export function ContentWorkspace({
     if (!String(editPage.title || "").trim()) return;
     setSavingPage(true);
     try {
+      const prevKey = editPage.id ? `page:${editPage.id}` : "page:new";
       const payload = {
         ...editPage,
         title: String(editPage.title || "").trim(),
+        template: editPage.template || "default",
         translation_group: editPage.translation_group || "",
       };
       if (!editPage.id) {
@@ -506,6 +738,8 @@ export function ContentWorkspace({
         });
         if (res?.page) setEditPage({ template: editPage.template || "default", ...res.page });
       }
+      void clearLocalDraft(prevKey);
+      setPendingPageDraft(null);
       dirtyEditorSig.value = false;
       showToast(t("common.saved"));
       void loadSub();
@@ -554,6 +788,7 @@ export function ContentWorkspace({
   const swapCatOrder = async (idx: number, dir: -1 | 1) => {
     const targetIdx = idx + dir;
     if (targetIdx < 0 || targetIdx >= categories.length) return;
+    const baseOffset = Math.max(0, (pageIdx - 1) * pageSize);
     const orders = categories.map((c) => Number(c.sort_order ?? 0));
     const hasTies = new Set(orders).size < categories.length;
     try {
@@ -562,7 +797,7 @@ export function ContentWorkspace({
         [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
         await Promise.all(
           reordered.map((item, i) => {
-            const desired = (i + 1) * 10;
+            const desired = (baseOffset + i + 1) * 10;
             if (Number(item.sort_order) === desired) return Promise.resolve();
             return apiFetch(`/api/admin/categories/${item.id}`, {
               method: "PUT",
@@ -573,8 +808,8 @@ export function ContentWorkspace({
       } else {
         const a = categories[idx];
         const b = categories[targetIdx];
-        const orderA = Number(a.sort_order ?? (idx + 1) * 10);
-        const orderB = Number(b.sort_order ?? (targetIdx + 1) * 10);
+        const orderA = Number(a.sort_order ?? (baseOffset + idx + 1) * 10);
+        const orderB = Number(b.sort_order ?? (baseOffset + targetIdx + 1) * 10);
         await Promise.all([
           apiFetch(`/api/admin/categories/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: orderB }) }),
           apiFetch(`/api/admin/categories/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: orderA }) }),
@@ -602,6 +837,28 @@ export function ContentWorkspace({
       void loadSub();
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const submitMergeTag = async (e?: Event) => {
+    e?.preventDefault();
+    if (!mergeSourceTag || !mergeTargetId || mergeTargetId === mergeSourceTag.id || mergingTag) return;
+    setMergingTag(true);
+    try {
+      await apiFetch("/api/admin/tags/merge", {
+        method: "POST",
+        body: JSON.stringify({ source_id: mergeSourceTag.id, target_id: mergeTargetId }),
+      });
+      setMergeSourceTag(null);
+      setMergeTargetId("");
+      setMergeSearchQ("");
+      setSelTagIds((prev) => prev.filter((id) => id !== mergeSourceTag.id));
+      showToast(t("cnt.tag_merged"), "ok");
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setMergingTag(false);
     }
   };
 
@@ -670,6 +927,17 @@ export function ContentWorkspace({
     setSerForm({ ...serForm, article_ids: next });
   };
 
+  const moveSeriesArticleTo = (fromIdx: number, toIdx: number) => {
+    const total = serForm.article_ids.length;
+    if (total <= 1 || fromIdx < 0 || fromIdx >= total) return;
+    const clamped = Math.max(0, Math.min(total - 1, toIdx));
+    if (clamped === fromIdx) return;
+    const next = [...serForm.article_ids];
+    const [moved] = next.splice(fromIdx, 1);
+    next.splice(clamped, 0, moved);
+    setSerForm({ ...serForm, article_ids: next });
+  };
+
   const saveBook = async (e?: Event) => {
     e?.preventDefault();
     if (!bookForm.title.trim()) return;
@@ -683,6 +951,7 @@ export function ContentWorkspace({
         source_url: bookForm.source_url.trim(),
         series_id: bookForm.series_id,
         embed_mode: bookForm.embed_mode,
+        reading_status: bookForm.reading_status || "",
         sort_order: Number(bookForm.sort_order) || 0,
       };
       if (!bookForm.id) {
@@ -702,6 +971,7 @@ export function ContentWorkspace({
   const swapBookOrder = async (idx: number, dir: -1 | 1) => {
     const targetIdx = idx + dir;
     if (targetIdx < 0 || targetIdx >= books.length) return;
+    const baseOffset = Math.max(0, (pageIdx - 1) * pageSize);
     const orders = books.map((b) => Number(b.sort_order ?? 0));
     const hasTies = new Set(orders).size < books.length;
     try {
@@ -710,7 +980,7 @@ export function ContentWorkspace({
         [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
         await Promise.all(
           reordered.map((item, i) => {
-            const desired = (i + 1) * 10;
+            const desired = (baseOffset + i + 1) * 10;
             if (Number(item.sort_order) === desired) return Promise.resolve();
             return apiFetch(`/api/admin/books/${item.id}`, {
               method: "PUT",
@@ -721,8 +991,8 @@ export function ContentWorkspace({
       } else {
         const a = books[idx];
         const b = books[targetIdx];
-        const orderA = Number(a.sort_order ?? (idx + 1) * 10);
-        const orderB = Number(b.sort_order ?? (targetIdx + 1) * 10);
+        const orderA = Number(a.sort_order ?? (baseOffset + idx + 1) * 10);
+        const orderB = Number(b.sort_order ?? (baseOffset + targetIdx + 1) * 10);
         await Promise.all([
           apiFetch(`/api/admin/books/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: orderB }) }),
           apiFetch(`/api/admin/books/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: orderA }) }),
@@ -757,6 +1027,76 @@ export function ContentWorkspace({
     }
   };
 
+  const syncModalChapters = async () => {
+    if (!chapBook || syncingChaps) return;
+    setSyncingChaps(true);
+    try {
+      const syncRes = await apiFetch<{ chapter_count?: number }>(`/api/admin/books/${chapBook.id}/sync`, {
+        method: "POST",
+        body: "{}",
+      });
+      const res = await apiFetch<{ book: any; chapters: any[] }>(`/api/admin/books/${chapBook.id}`);
+      setChapItems(
+        (res.chapters || []).map((ch: any, idx: number) => ({
+          _uid: nextChapUid(),
+          id: ch.id,
+          title: ch.title || "",
+          url: ch.url || "",
+          depth: Number(ch.depth) || 0,
+          sort_order: idx + 1,
+        }))
+      );
+      showToast(t("cnt.book_synced", { count: syncRes.chapter_count ?? res.chapters?.length ?? 0 }));
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setSyncingChaps(false);
+    }
+  };
+
+  // Move entire chapter subtree (node + contiguous deeper descendants) past adjacent sibling subtree
+  const moveChapterSubtree = (idx: number, dir: -1 | 1) => {
+    setChapItems((prev) => {
+      if (idx < 0 || idx >= prev.length) return prev;
+      const d = Math.max(0, Math.min(3, Number(prev[idx].depth) || 0));
+      let blockEnd = idx + 1;
+      while (blockEnd < prev.length && Math.max(0, Math.min(3, Number(prev[blockEnd].depth) || 0)) > d) {
+        blockEnd++;
+      }
+      if (dir === -1) {
+        if (idx === 0) return prev;
+        let prevStart = idx - 1;
+        while (prevStart > 0 && Math.max(0, Math.min(3, Number(prev[prevStart].depth) || 0)) > d) {
+          const pd = Math.max(0, Math.min(3, Number(prev[prevStart].depth) || 0));
+          if (pd <= d) break;
+          prevStart--;
+        }
+        const prevD = Math.max(0, Math.min(3, Number(prev[prevStart].depth) || 0));
+        if (prevD < d) {
+          // Cannot jump out above parent at lower depth; swap with immediate previous sibling/item
+          prevStart = idx - 1;
+        }
+        const block = prev.slice(idx, blockEnd);
+        const before = prev.slice(0, prevStart);
+        const mid = prev.slice(prevStart, idx);
+        const after = prev.slice(blockEnd);
+        return [...before, ...block, ...mid, ...after];
+      } else {
+        if (blockEnd >= prev.length) return prev;
+        const nextD = Math.max(0, Math.min(3, Number(prev[blockEnd].depth) || 0));
+        if (nextD < d) return prev;
+        let nextEnd = blockEnd + 1;
+        while (nextEnd < prev.length && Math.max(0, Math.min(3, Number(prev[nextEnd].depth) || 0)) > nextD) {
+          nextEnd++;
+        }
+        const block = prev.slice(idx, blockEnd);
+        const nextBlock = prev.slice(blockEnd, nextEnd);
+        return [...prev.slice(0, idx), ...nextBlock, ...block, ...prev.slice(nextEnd)];
+      }
+    });
+  };
+
   const saveChapters = async () => {
     if (!chapBook) return;
     try {
@@ -783,12 +1123,17 @@ export function ContentWorkspace({
 
   const runBatchComments = async (action: "approve" | "reject" | "delete" | "ban_ip") => {
     if (!selCmtIds.length) return;
-    if (action === "delete" || action === "ban_ip") {
-      const msg =
-        action === "ban_ip"
-          ? t("cnt.cmt_confirm_ban_ip")
-          : t("cnt.confirm_batch_del_cmts", { n: selCmtIds.length });
-      if (!(await openConfirm({ message: msg, danger: true }))) return;
+    if (action === "ban_ip") {
+      setBanDurationHrs("720");
+      setBanReason("comment spam");
+      setBanRejectPending(true);
+      setBanIpModal({ batchIds: [...selCmtIds], ipLabel: `${selCmtIds.length}` });
+      return;
+    }
+    if (action === "delete") {
+      if (!(await openConfirm({ message: t("cnt.confirm_batch_del_cmts", { n: selCmtIds.length }), danger: true }))) {
+        return;
+      }
     }
     try {
       await apiFetch("/api/admin/comments/batch", {
@@ -800,6 +1145,73 @@ export function ContentWorkspace({
       void loadSub();
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const submitBanIpModal = async (e?: Event) => {
+    e?.preventDefault();
+    if (!banIpModal || banningIp) return;
+    setBanningIp(true);
+    try {
+      const hrs = Number(banDurationHrs) || 0;
+      const reason = banReason.trim() || "comment spam";
+      if (banIpModal.batchIds && banIpModal.batchIds.length > 0) {
+        await apiFetch("/api/admin/comments/batch", {
+          method: "POST",
+          body: JSON.stringify({
+            ids: banIpModal.batchIds,
+            action: "ban_ip",
+            duration_hours: hrs,
+            expires_hours: hrs,
+            reason,
+            note: reason,
+            reject_pending: banRejectPending,
+          }),
+        });
+        if (banRejectPending) {
+          await apiFetch("/api/admin/comments/batch", {
+            method: "POST",
+            body: JSON.stringify({ ids: banIpModal.batchIds, action: "reject" }),
+          }).catch(() => {});
+        }
+        setSelCmtIds([]);
+      } else if (banIpModal.commentId) {
+        await apiFetch(`/api/admin/comments/${banIpModal.commentId}/ban-ip`, {
+          method: "POST",
+          body: JSON.stringify({
+            duration_hours: hrs,
+            expires_hours: hrs,
+            reason,
+            note: reason,
+            reject_pending: banRejectPending,
+          }),
+        });
+        if (banRejectPending) {
+          const targetRow = comments.find((r) => (r.comment || r).id === banIpModal.commentId);
+          const targetIp = (targetRow?.comment || targetRow)?.client_ip || (targetRow?.comment || targetRow)?.ip_masked;
+          const matchingPendingIds = comments
+            .map((r) => r.comment || r)
+            .filter(
+              (cm) =>
+                cm.id === banIpModal.commentId ||
+                (targetIp && (cm.client_ip === targetIp || cm.ip_masked === targetIp) && cm.status === "pending")
+            )
+            .map((cm) => cm.id);
+          if (matchingPendingIds.length > 0) {
+            await apiFetch("/api/admin/comments/batch", {
+              method: "POST",
+              body: JSON.stringify({ ids: matchingPendingIds, action: "reject" }),
+            }).catch(() => {});
+          }
+        }
+      }
+      setBanIpModal(null);
+      showToast(t("cnt.cmt_ip_banned"), "ok");
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setBanningIp(false);
     }
   };
 
@@ -832,14 +1244,35 @@ export function ContentWorkspace({
     const files = Array.from(fileList);
     if (files.length === 0) return;
     setUploadingMedia(true);
+    setMediaUploadPct(0);
+    const totalBytes = Math.max(1, files.reduce((acc, f) => acc + Math.max(1, f.size), 0));
+    const perFileLoaded = new Array<number>(files.length).fill(0);
+    const updateAggPct = () => {
+      const loaded = perFileLoaded.reduce((a, b) => a + b, 0);
+      setMediaUploadPct(Math.min(100, Math.round((loaded / totalBytes) * 100)));
+    };
     let okCount = 0;
+    let cursor = 0;
+    const workerCount = Math.min(3, files.length);
     try {
-      for (const f of files) {
-        const fd = new FormData();
-        fd.append("file", f);
-        await apiFetch("/api/admin/media/upload", { method: "POST", body: fd });
-        okCount++;
-      }
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          while (cursor < files.length) {
+            const idx = cursor++;
+            const f = files[idx];
+            const fSize = Math.max(1, f.size);
+            const fd = new FormData();
+            fd.append("file", f);
+            await uploadWithProgress("/api/admin/media/upload", fd, (pct) => {
+              perFileLoaded[idx] = (pct / 100) * fSize;
+              updateAggPct();
+            });
+            perFileLoaded[idx] = fSize;
+            updateAggPct();
+            okCount++;
+          }
+        })
+      );
       if (okCount > 0) {
         showToast(okCount > 1 ? t("cnt.media_uploaded_n", { count: okCount }) : t("cnt.media_uploaded"));
         await loadSub();
@@ -849,6 +1282,7 @@ export function ContentWorkspace({
       if (okCount > 0) await loadSub();
     } finally {
       setUploadingMedia(false);
+      setMediaUploadPct(null);
     }
   };
 
@@ -986,32 +1420,28 @@ export function ContentWorkspace({
     setList(list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
   };
 
-  const totalMediaBytes = media.reduce((acc, m) => acc + Number(m.size_bytes || 0), 0);
-  const totalMB = (totalMediaBytes / (1024 * 1024)).toFixed(2);
+  const computedMediaBytes =
+    mediaTotalBytes !== null
+      ? mediaTotalBytes
+      : media.reduce((acc, m) => acc + Number(m.size_bytes || 0), 0);
+  const totalMB = (computedMediaBytes / (1024 * 1024)).toFixed(2);
 
-  // Client-side fallback filtering ONLY for attributes not sent as server params (e.g. mediaRefFilter === "used", bookFilter)
-  const filteredBooks = bookFilter
-    ? books.filter((b) => {
-        if (bookFilter.startsWith("rs:")) return (b.reading_status || "") === bookFilter.slice(3);
-        return (b.source_type || "auto") === bookFilter;
-      })
-    : books;
-
-  const filteredPages = pageStatusFilter
-    ? pages.filter((p) => (pageStatusFilter === "published" ? p.is_published !== false : p.is_published === false))
-    : pages;
-
-  const filteredMedia =
-    mediaRefFilter === "used" ? media.filter((m) => !m.is_orphan) : media;
-
-  const displayPages = filteredPages.length > pageSize ? paginateItems(filteredPages, pageIdx, pageSize).slice : filteredPages;
+  const displayPages = pages.length > pageSize ? paginateItems(pages, pageIdx, pageSize).slice : pages;
   const displayCats = categories.length > pageSize ? paginateItems(categories, pageIdx, pageSize).slice : categories;
-  const displayTags = tags.length > pageSize ? paginateItems(tags, pageIdx, pageSize).slice : tags;
+  const displayTags = tags.length > tagPageSize ? paginateItems(tags, pageIdx, tagPageSize).slice : tags;
   const displaySeries = series.length > pageSize ? paginateItems(series, pageIdx, pageSize).slice : series;
-  const displayBooks = filteredBooks.length > pageSize ? paginateItems(filteredBooks, pageIdx, pageSize).slice : filteredBooks;
+  const displayBooks = books.length > pageSize ? paginateItems(books, pageIdx, pageSize).slice : books;
   const displayComments = comments.length > pageSize ? paginateItems(comments, pageIdx, pageSize).slice : comments;
-  const displayMedia =
-    filteredMedia.length > mediaPageSize ? paginateItems(filteredMedia, pageIdx, mediaPageSize).slice : filteredMedia;
+  const displayMedia = media.length > mediaPageSize ? paginateItems(media, pageIdx, mediaPageSize).slice : media;
+
+  // Build deduplicated Page Template options (builtin + active theme localized_page_templates)
+  const builtinTplValues = new Set(["default", "wide", "minimal"]);
+  const pageTemplateOptions = [
+    { value: "default", label: t("cnt.page_tpl_default") },
+    { value: "wide", label: t("cnt.page_tpl_wide") },
+    { value: "minimal", label: t("cnt.page_tpl_minimal") },
+    ...themePageTemplates.filter((tp) => !builtinTplValues.has(tp.value)),
+  ];
 
   return (
     <div>
@@ -1245,6 +1675,16 @@ export function ContentWorkspace({
               <p class="volo-sec-desc">{t("cnt.tag_desc")}</p>
             </div>
             <div class="volo-filter-controls">
+              <button
+                type="button"
+                class={`volo-filter-pill ${tagUnusedOnly ? "active" : ""}`}
+                onClick={() => {
+                  setTagUnusedOnly((v) => !v);
+                  setPageIdx(1);
+                }}
+              >
+                {t("cnt.tag_unused_only")}
+              </button>
               <ConsoleSelect
                 searchable={false}
                 value={tagSort}
@@ -1283,12 +1723,6 @@ export function ContentWorkspace({
               </button>
             </div>
           </div>
-
-          <BatchBar count={selTagIds.length} onClear={() => setSelTagIds([])}>
-            <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteTags()}>
-              {t("common.delete")}
-            </button>
-          </BatchBar>
 
           <MobileSelectAllBar
             checked={displayTags.length > 0 && displayTags.every((tg) => selTagIds.includes(tg.id))}
@@ -1365,6 +1799,17 @@ export function ContentWorkspace({
                           </button>
                           <button
                             type="button"
+                            class="volo-act-btn"
+                            onClick={() => {
+                              setMergeSourceTag(tg);
+                              setMergeTargetId("");
+                              setMergeSearchQ("");
+                            }}
+                          >
+                            {t("cnt.tag_merge")}
+                          </button>
+                          <button
+                            type="button"
                             class="volo-act-btn danger"
                             onClick={async () => {
                               if (!(await openConfirm({ message: t("cnt.confirm_del_tag"), danger: true }))) return;
@@ -1383,12 +1828,20 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+
+          <BatchBar count={selTagIds.length} onClear={() => setSelTagIds([])}>
+            <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteTags()}>
+              {t("common.delete")}
+            </button>
+          </BatchBar>
+
           <Pagination
             total={subTotal}
             page={pageIdx}
-            pageSize={pageSize}
+            pageSize={tagPageSize}
+            pageSizeOptions={[40, 80, 160]}
             onPageSizeChange={(sz) => {
-              setPageSize(sz);
+              setTagPageSize(sz);
               setPageIdx(1);
             }}
             onChange={setPageIdx}
@@ -1429,6 +1882,56 @@ export function ContentWorkspace({
                   placeholder={t("cnt.cat_slug_ph")}
                   value={tagForm.slug}
                   onInput={(e) => setTagForm({ ...tagForm, slug: (e.currentTarget as HTMLInputElement).value })}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
+
+          <AnimatedModal
+            open={!!mergeSourceTag}
+            onClose={() => setMergeSourceTag(null)}
+            title={t("cnt.tag_merge_title")}
+            subtitle={mergeSourceTag ? t("cnt.tag_merge_desc", { name: mergeSourceTag.name }) : ""}
+            maxWidth="480px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setMergeSourceTag(null)}>
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-primary"
+                  disabled={!mergeTargetId || mergingTag}
+                  onClick={() => void submitMergeTag()}
+                >
+                  {t("cnt.tag_merge")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void submitMergeTag(e)} autoComplete="off">
+              <div class="volo-field">
+                <label>{t("cnt.tag_filter_ph")}</label>
+                <input
+                  class="volo-input"
+                  placeholder={t("cnt.tag_filter_ph")}
+                  value={mergeSearchQ}
+                  onInput={(e) => setMergeSearchQ((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <label>{t("cnt.tag_merge_target")}</label>
+                <ConsoleSelect
+                  value={mergeTargetId}
+                  onChange={setMergeTargetId}
+                  options={[
+                    { value: "", label: t("cnt.tag_merge_target") },
+                    ...mergeCandidates.map((tg) => ({
+                      value: tg.id,
+                      label: `#${tg.name}`,
+                      badge: String(tg.article_count ?? 0),
+                    })),
+                  ]}
                 />
               </div>
             </form>
@@ -1503,7 +2006,11 @@ export function ContentWorkspace({
                       </td>
                       <td class="col-num" data-label={t("cnt.col_articles")}>
                         <span class="volo-cat-chip">
-                          {Array.isArray(s.article_ids) ? s.article_ids.length : (s.article_count ?? 0)}
+                          {Array.isArray(s.article_ids)
+                            ? s.article_ids.length
+                            : Array.isArray(s.articles)
+                            ? s.articles.length
+                            : (s.article_count ?? 0)}
                         </span>
                       </td>
                       <td class="col-act" data-label={t("art.actions")}>
@@ -1515,6 +2022,20 @@ export function ContentWorkspace({
                             type="button"
                             class="volo-act-btn"
                             onClick={() => {
+                              if (Array.isArray(s.articles) && s.articles.length > 0) {
+                                setKnownArticlesMap((prev) => {
+                                  const next = { ...prev };
+                                  s.articles.forEach((a: any) => {
+                                    if (a?.id) next[a.id] = a;
+                                  });
+                                  return next;
+                                });
+                              }
+                              const ids = Array.isArray(s.article_ids)
+                                ? [...s.article_ids]
+                                : Array.isArray(s.articles)
+                                ? s.articles.map((a: any) => a.id)
+                                : [];
                               setSerForm({
                                 id: s.id,
                                 title: s.title || "",
@@ -1522,7 +2043,7 @@ export function ContentWorkspace({
                                 description: s.description || "",
                                 cover_url: s.cover_url || "",
                                 sort_order: s.sort_order ?? 10,
-                                article_ids: Array.isArray(s.article_ids) ? [...s.article_ids] : [],
+                                article_ids: ids,
                               });
                               setSerArtFilter("");
                               setSerArtPage(1);
@@ -1636,7 +2157,7 @@ export function ContentWorkspace({
               </div>
 
               {serForm.article_ids.length > 0 && (
-                <div class="volo-subcard" style={{ maxHeight: "196px", overflowY: "auto" }}>
+                <div class="volo-subcard" style={{ maxHeight: "220px", overflowY: "auto" }}>
                   <div class="volo-subcard-title">
                     <span>
                       {t("cnt.ser_articles_lbl")} ({serForm.article_ids.length})
@@ -1647,9 +2168,27 @@ export function ContentWorkspace({
                     const titleText = art?.title || aid;
                     return (
                       <div key={aid} class="volo-input-row" style={{ marginBottom: "6px", flexWrap: "nowrap" }}>
-                        <span class="volo-code-chip" style={{ flexShrink: 0 }}>
-                          #{idx + 1}
-                        </span>
+                        <input
+                          key={`${aid}-${idx}`}
+                          type="number"
+                          min={1}
+                          max={serForm.article_ids.length}
+                          class="volo-input"
+                          style={{ width: "54px", padding: "3px 6px", fontSize: "12px", textAlign: "center", flexShrink: 0 }}
+                          defaultValue={String(idx + 1)}
+                          aria-label={t("cnt.lbl_sort")}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              const target = Number((e.currentTarget as HTMLInputElement).value) || idx + 1;
+                              moveSeriesArticleTo(idx, target - 1);
+                            }
+                          }}
+                          onBlur={(e) => {
+                            const target = Number((e.currentTarget as HTMLInputElement).value) || idx + 1;
+                            moveSeriesArticleTo(idx, target - 1);
+                          }}
+                        />
                         <span
                           style={{
                             flex: 1,
@@ -1668,6 +2207,15 @@ export function ContentWorkspace({
                             type="button"
                             class="volo-act-btn"
                             disabled={idx === 0}
+                            title={t("cnt.move_top")}
+                            onClick={() => moveSeriesArticleTo(idx, 0)}
+                          >
+                            ⇈
+                          </button>
+                          <button
+                            type="button"
+                            class="volo-act-btn"
+                            disabled={idx === 0}
                             onClick={() => moveSeriesArticle(idx, -1)}
                           >
                             ↑
@@ -1679,6 +2227,15 @@ export function ContentWorkspace({
                             onClick={() => moveSeriesArticle(idx, 1)}
                           >
                             ↓
+                          </button>
+                          <button
+                            type="button"
+                            class="volo-act-btn"
+                            disabled={idx === serForm.article_ids.length - 1}
+                            title={t("cnt.move_bottom")}
+                            onClick={() => moveSeriesArticleTo(idx, serForm.article_ids.length - 1)}
+                          >
+                            ⇊
                           </button>
                           <button
                             type="button"
@@ -1784,13 +2341,9 @@ export function ContentWorkspace({
                 }}
                 options={[
                   { value: "", label: t("art.all") },
-                  ...(books.some((b) => b.reading_status)
-                    ? [
-                        { value: "rs:reading", label: t("cnt.book_rs_reading") },
-                        { value: "rs:finished", label: t("cnt.book_rs_finished") },
-                        { value: "rs:wishlist", label: t("cnt.book_rs_wishlist") },
-                      ]
-                    : []),
+                  { value: "rs:reading", label: t("cnt.book_rs_reading") },
+                  { value: "rs:finished", label: t("cnt.book_rs_finished") },
+                  { value: "rs:wishlist", label: t("cnt.book_rs_wishlist") },
                   { value: "auto", label: t("cnt.book_src_auto") },
                   { value: "gitbook", label: t("cnt.book_src_gitbook") },
                   { value: "mdbook", label: t("cnt.book_src_mdbook") },
@@ -1941,7 +2494,7 @@ export function ContentWorkspace({
             </table>
           </div>
           <Pagination
-            total={bookFilter ? filteredBooks.length : subTotal}
+            total={subTotal}
             page={pageIdx}
             pageSize={pageSize}
             onPageSizeChange={(sz) => {
@@ -2063,6 +2616,19 @@ export function ContentWorkspace({
                     ]}
                   />
                 </div>
+                <div class="volo-field">
+                  <label>{t("art.status")}</label>
+                  <ConsoleSelect
+                    value={bookForm.reading_status || ""}
+                    onChange={(val) => setBookForm({ ...bookForm, reading_status: val })}
+                    options={[
+                      { value: "", label: t("art.all") },
+                      { value: "reading", label: t("cnt.book_rs_reading") },
+                      { value: "finished", label: t("cnt.book_rs_finished") },
+                      { value: "wishlist", label: t("cnt.book_rs_wishlist") },
+                    ]}
+                  />
+                </div>
               </div>
 
               <div class="volo-field">
@@ -2098,7 +2664,7 @@ export function ContentWorkspace({
             <div class="volo-sec-head" style={{ marginBottom: "10px" }}>
               <span class="volo-help">{t("cnt.book_chapters", { count: chapItems.length })}</span>
               <div class="volo-filter-controls">
-                {chapItems.length > 6 && (
+                {chapItems.length > 0 && (
                   <input
                     class="volo-input volo-search-input"
                     placeholder={t("cnt.chap_search_ph")}
@@ -2108,6 +2674,16 @@ export function ContentWorkspace({
                       setChapPage(1);
                     }}
                   />
+                )}
+                {Boolean(chapBook?.source_url || chapBook?.series_id) && (
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-sm"
+                    disabled={syncingChaps}
+                    onClick={() => void syncModalChapters()}
+                  >
+                    {syncingChaps ? t("shell.loading") : t("cnt.book_sync_toc")}
+                  </button>
                 )}
                 <button
                   type="button"
@@ -2278,14 +2854,7 @@ export function ContentWorkspace({
                                 type="button"
                                 class="volo-chap-btn"
                                 disabled={idx === 0}
-                                onClick={() => {
-                                  if (idx === 0) return;
-                                  setChapItems((prev) => {
-                                    const next = [...prev];
-                                    [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
-                                    return next;
-                                  });
-                                }}
+                                onClick={() => moveChapterSubtree(idx, -1)}
                               >
                                 ↑
                               </button>
@@ -2293,14 +2862,7 @@ export function ContentWorkspace({
                                 type="button"
                                 class="volo-chap-btn"
                                 disabled={idx >= chapItems.length - 1}
-                                onClick={() => {
-                                  if (idx >= chapItems.length - 1) return;
-                                  setChapItems((prev) => {
-                                    const next = [...prev];
-                                    [next[idx + 1], next[idx]] = [next[idx], next[idx + 1]];
-                                    return next;
-                                  });
-                                }}
+                                onClick={() => moveChapterSubtree(idx, 1)}
                               >
                                 ↓
                               </button>
@@ -2370,6 +2932,20 @@ export function ContentWorkspace({
                 </div>
               </div>
 
+              {pendingPageDraft && (
+                <div class="volo-draft-banner">
+                  <span>{t("ov.draft_banner", { time: formatDateTime(pendingPageDraft.saved_at) })}</span>
+                  <div class="volo-row-actions">
+                    <button type="button" class="volo-btn volo-btn-primary volo-btn-sm" onClick={applyPendingPageDraft}>
+                      {t("art.draft_restore")}
+                    </button>
+                    <button type="button" class="volo-btn volo-btn-sm" onClick={discardPendingPageDraft}>
+                      {t("art.draft_discard")}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div class="volo-field">
                 <input
                   class="volo-editor-title-input"
@@ -2405,11 +2981,7 @@ export function ContentWorkspace({
                       <ConsoleSelect
                         value={editPage.template || "default"}
                         onChange={(val) => updatePageDraft({ template: val })}
-                        options={[
-                          { value: "default", label: t("cnt.page_tpl_default") },
-                          { value: "wide", label: t("cnt.page_tpl_wide") },
-                          { value: "minimal", label: t("cnt.page_tpl_minimal") },
-                        ]}
+                        options={pageTemplateOptions}
                       />
                     </div>
                     <div class="volo-field">
@@ -2495,7 +3067,11 @@ export function ContentWorkspace({
                       setPageIdx(1);
                     }}
                   />
-                  <button type="button" class="volo-btn volo-btn-primary volo-btn-sm" onClick={openNewPageEditor}>
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-primary volo-btn-sm"
+                    onClick={() => void openNewPageEditor()}
+                  >
                     + {t("cnt.new_page")}
                   </button>
                 </div>
@@ -2524,6 +3100,9 @@ export function ContentWorkspace({
                               <div class="volo-cell-title">{p.title}</div>
                               <div class="volo-cell-meta">
                                 <span class="volo-code-chip">/{p.slug}</span>
+                                {p.template && p.template !== "default" && (
+                                  <span class="volo-mini-tag">{p.template}</span>
+                                )}
                                 <span>{p.lang}</span>
                               </div>
                             </div>
@@ -2576,7 +3155,7 @@ export function ContentWorkspace({
                 </table>
               </div>
               <Pagination
-                total={pageStatusFilter ? filteredPages.length : subTotal}
+                total={subTotal}
                 page={pageIdx}
                 pageSize={pageSize}
                 onPageSizeChange={(sz) => {
@@ -2634,23 +3213,6 @@ export function ContentWorkspace({
               </div>
             </div>
           </div>
-
-          <BatchBar count={selCmtIds.length} onClear={() => setSelCmtIds([])}>
-            <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("approve")}>
-              {t("cnt.cmt_approve")}
-            </button>
-            <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("reject")}>
-              {t("cnt.cmt_reject")}
-            </button>
-            {isAdmin && (
-              <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("ban_ip")}>
-                {t("cnt.cmt_ban_ip")}
-              </button>
-            )}
-            <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("delete")}>
-              {t("common.delete")}
-            </button>
-          </BatchBar>
 
           <MobileSelectAllBar
             checked={
@@ -2713,6 +3275,17 @@ export function ContentWorkspace({
                       (c.target_type === "page"
                         ? `/${encodeURIComponent(row.target_slug || c.target_id)}`
                         : `/posts/${encodeURIComponent(row.target_slug || c.target_id)}`);
+                    const safeAuthorUrl = /^https?:\/\//i.test(String(c.author_url || ""))
+                      ? String(c.author_url)
+                      : "";
+                    const uaSummary = summarizeUA(c.user_agent);
+                    const matchedParent = c.parent_id
+                      ? comments.map((r) => r.comment || r).find((cm) => cm.id === c.parent_id)
+                      : null;
+                    const parentObj = row.parent_comment || matchedParent;
+                    const parentAuthor =
+                      row.parent_author || parentObj?.author_name || (c.parent_id ? `#${String(c.parent_id).slice(0, 6)}` : "");
+                    const parentSnippet = String(row.parent_content || parentObj?.content_md || "").slice(0, 90);
                     const isBoxOpen = cmtBox?.id === c.id;
 
                     return (
@@ -2727,8 +3300,19 @@ export function ContentWorkspace({
                         <td class="col-fluid" data-label={t("cnt.cmt_col_content")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
-                              <span>{c.author_name}</span>
+                              {safeAuthorUrl ? (
+                                <a href={safeAuthorUrl} target="_blank" rel="noopener noreferrer">
+                                  {c.author_name} ↗
+                                </a>
+                              ) : (
+                                <span>{c.author_name}</span>
+                              )}
                               {c.geo_region && <span class="volo-mini-tag">{c.geo_region}</span>}
+                              {uaSummary && (
+                                <span class="volo-mini-tag" title={c.user_agent}>
+                                  {uaSummary}
+                                </span>
+                              )}
                               {(c.client_ip || c.ip_masked) && (
                                 <span class="volo-code-chip">{c.client_ip || c.ip_masked}</span>
                               )}
@@ -2736,6 +3320,12 @@ export function ContentWorkspace({
                                 {t("cnt.cmt_on", { target: targetTitle })} ↗
                               </a>
                             </div>
+                            {parentAuthor && (
+                              <div class="volo-help" style={{ fontSize: "12px", opacity: 0.85 }}>
+                                ↳ {t("cnt.cmt_reply_to", { author: parentAuthor })}
+                                {parentSnippet ? `: “${parentSnippet}${parentSnippet.length >= 90 ? "…" : ""}”` : ""}
+                              </div>
+                            )}
                             <div
                               style={{
                                 whiteSpace: "pre-wrap",
@@ -2850,23 +3440,14 @@ export function ContentWorkspace({
                                   label: t("cnt.cmt_ban_ip"),
                                   hidden: !canBanIp,
                                   danger: true,
-                                  onClick: async () => {
-                                    if (!(await openConfirm({ message: t("cnt.cmt_confirm_ban_ip"), danger: true }))) return;
-                                    try {
-                                      await apiFetch(`/api/admin/comments/${c.id}/ban-ip`, {
-                                        method: "POST",
-                                        body: JSON.stringify({
-                                          duration_hours: 720,
-                                          expires_hours: 720,
-                                          reason: "comment spam",
-                                          note: "comment spam",
-                                        }),
-                                      });
-                                      showToast(t("cnt.cmt_ip_banned"));
-                                      void loadSub();
-                                    } catch (err: any) {
-                                      showToast(err.message);
-                                    }
+                                  onClick: () => {
+                                    setBanDurationHrs("720");
+                                    setBanReason("comment spam");
+                                    setBanRejectPending(true);
+                                    setBanIpModal({
+                                      commentId: c.id,
+                                      ipLabel: c.client_ip || c.ip_masked || c.author_name,
+                                    });
                                   },
                                 },
                                 {
@@ -2890,6 +3471,24 @@ export function ContentWorkspace({
               </tbody>
             </table>
           </div>
+
+          <BatchBar count={selCmtIds.length} onClear={() => setSelCmtIds([])}>
+            <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("approve")}>
+              {t("cnt.cmt_approve")}
+            </button>
+            <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("reject")}>
+              {t("cnt.cmt_reject")}
+            </button>
+            {isAdmin && (
+              <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("ban_ip")}>
+                {t("cnt.cmt_ban_ip")}
+              </button>
+            )}
+            <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("delete")}>
+              {t("common.delete")}
+            </button>
+          </BatchBar>
+
           <Pagination
             total={subTotal}
             page={pageIdx}
@@ -2900,6 +3499,62 @@ export function ContentWorkspace({
             }}
             onChange={setPageIdx}
           />
+
+          <AnimatedModal
+            open={!!banIpModal}
+            onClose={() => setBanIpModal(null)}
+            title={t("cnt.cmt_ban_ip")}
+            subtitle={banIpModal?.ipLabel || ""}
+            maxWidth="460px"
+            footer={
+              <>
+                <button type="button" class="volo-btn" onClick={() => setBanIpModal(null)}>
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-danger"
+                  disabled={banningIp}
+                  onClick={() => void submitBanIpModal()}
+                >
+                  {t("cnt.cmt_ban_ip")}
+                </button>
+              </>
+            }
+          >
+            <form onSubmit={(e) => void submitBanIpModal(e)} autoComplete="off">
+              <div class="volo-field">
+                <label>{t("cnt.cmt_ban_duration")}</label>
+                <ConsoleSelect
+                  searchable={false}
+                  value={banDurationHrs}
+                  onChange={setBanDurationHrs}
+                  options={[
+                    { value: "1", label: t("cnt.cmt_ban_1h") },
+                    { value: "24", label: t("cnt.cmt_ban_24h") },
+                    { value: "168", label: t("cnt.cmt_ban_7d") },
+                    { value: "720", label: t("cnt.cmt_ban_30d") },
+                    { value: "0", label: t("cnt.cmt_ban_perm") },
+                  ]}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("cnt.cmt_ban_reason")}</label>
+                <input
+                  class="volo-input"
+                  value={banReason}
+                  onInput={(e) => setBanReason((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+              <div class="volo-field" style={{ marginBottom: 0 }}>
+                <SwitchToggle
+                  checked={banRejectPending}
+                  onChange={setBanRejectPending}
+                  label={t("cnt.cmt_ban_reject_pending")}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
         </div>
       )}
 
@@ -2989,6 +3644,15 @@ export function ContentWorkspace({
               </div>
             </div>
 
+            {uploadingMedia && mediaUploadPct !== null && (
+              <div style={{ marginBottom: "12px" }}>
+                <UploadProgressBar
+                  progress={mediaUploadPct}
+                  label={t("cnt.media_uploading_pct", { pct: mediaUploadPct })}
+                />
+              </div>
+            )}
+
             <div class="volo-filter-bar">
               <div class="volo-filter-pills">
                 <button
@@ -3024,6 +3688,17 @@ export function ContentWorkspace({
               </div>
 
               <div class="volo-filter-controls">
+                <input
+                  type="month"
+                  class="volo-input"
+                  style={{ width: "auto" }}
+                  aria-label={t("cnt.media_month_lbl")}
+                  value={mediaMonthFilter}
+                  onInput={(e) => {
+                    setMediaMonthFilter((e.currentTarget as HTMLInputElement).value);
+                    setPageIdx(1);
+                  }}
+                />
                 <ConsoleSelect
                   searchable={false}
                   value={mediaSort}
@@ -3064,12 +3739,6 @@ export function ContentWorkspace({
               </div>
             </div>
 
-            <BatchBar count={selMediaIds.length} onClear={() => setSelMediaIds([])}>
-              <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteMedia()}>
-                {t("common.delete")}
-              </button>
-            </BatchBar>
-
             {loading && media.length === 0 ? (
               <div class="volo-table-wrap">
                 <table class="volo-table">
@@ -3081,75 +3750,95 @@ export function ContentWorkspace({
             ) : displayMedia.length === 0 ? (
               <ConsoleEmpty />
             ) : mediaView === "grid" ? (
-              <div class="volo-media-grid">
-                {displayMedia.map((m) => {
-                  const displayName = m.original_name || m.id;
-                  const mime = String(m.mime_type || "");
-                  const isImage = mime.startsWith("image/");
-                  const isAudio = mime.startsWith("audio/");
-                  const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE").toUpperCase();
-                  const isSelected = selMediaIds.includes(m.id);
-                  return (
-                    <div
-                      key={m.id}
-                      class={`volo-media-card ${m.is_orphan ? "is-orphan" : ""} ${isSelected ? "is-selected" : ""}`}
-                    >
-                      <div class="volo-media-thumb" onClick={() => openAssetLightbox(m)}>
-                        <label class="volo-media-select-cb" onClick={(e) => e.stopPropagation()}>
-                          <input
-                            type="checkbox"
-                            checked={isSelected}
-                            onChange={() => toggleSel(selMediaIds, setSelMediaIds, m.id)}
-                          />
-                        </label>
-                        {isImage ? (
-                          <img src={m.public_url} alt={m.alt_text || displayName} loading="lazy" />
-                        ) : isAudio ? (
-                          <div class="volo-media-type-placeholder">
-                            <audio
-                              controls
-                              preload="none"
-                              src={m.public_url}
-                              style={{ width: "90%", height: "32px" }}
-                              onClick={(e) => e.stopPropagation()}
+              <>
+                <MobileSelectAllBar
+                  checked={displayMedia.length > 0 && displayMedia.every((m) => selMediaIds.includes(m.id))}
+                  count={selMediaIds.length}
+                  total={displayMedia.length}
+                  onToggle={(on) => {
+                    const pageIds = displayMedia.map((m) => m.id);
+                    setSelMediaIds(
+                      on
+                        ? Array.from(new Set([...selMediaIds, ...pageIds]))
+                        : selMediaIds.filter((id) => !pageIds.includes(id))
+                    );
+                  }}
+                />
+                <div class="volo-media-grid">
+                  {displayMedia.map((m) => {
+                    const displayName = m.original_name || m.id;
+                    const mime = String(m.mime_type || "");
+                    const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id];
+                    const isAudio = mime.startsWith("audio/");
+                    const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE").toUpperCase();
+                    const isSelected = selMediaIds.includes(m.id);
+                    return (
+                      <div
+                        key={m.id}
+                        class={`volo-media-card ${m.is_orphan ? "is-orphan" : ""} ${isSelected ? "is-selected" : ""}`}
+                      >
+                        <div class="volo-media-thumb" onClick={() => openAssetLightbox(m)}>
+                          <label class="volo-media-select-cb" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleSel(selMediaIds, setSelMediaIds, m.id)}
                             />
-                          </div>
-                        ) : (
-                          <div class="volo-media-type-placeholder">
-                            <span class="volo-code-chip">{extBadge}</span>
-                          </div>
-                        )}
-                        <span class={`volo-media-ref-pill ${m.is_orphan ? "orphan" : "used"}`}>
-                          {m.is_orphan
-                            ? t("cnt.media_badge_orphan")
-                            : t("cnt.media_badge_used", { count: m.ref_count || 1 })}
-                        </span>
-                      </div>
+                          </label>
+                          {isImage ? (
+                            <img
+                              src={m.public_url}
+                              alt={m.alt_text || displayName}
+                              loading="lazy"
+                              onError={() => setBrokenMediaIds((prev) => ({ ...prev, [m.id]: true }))}
+                            />
+                          ) : isAudio ? (
+                            <div class="volo-media-type-placeholder">
+                              <audio
+                                controls
+                                preload="none"
+                                src={m.public_url}
+                                style={{ width: "90%", height: "32px" }}
+                                onClick={(e) => e.stopPropagation()}
+                              />
+                            </div>
+                          ) : (
+                            <div class="volo-media-type-placeholder">
+                              <span class="volo-code-chip">{extBadge}</span>
+                            </div>
+                          )}
+                          <span class={`volo-media-ref-pill ${m.is_orphan ? "orphan" : "used"}`}>
+                            {m.is_orphan
+                              ? t("cnt.media_badge_orphan")
+                              : t("cnt.media_badge_used", { count: m.ref_count || 1 })}
+                          </span>
+                        </div>
 
-                      <div class="volo-media-body">
-                        <div class="volo-media-name" title={displayName}>
-                          {displayName}
-                        </div>
-                        <div class="volo-media-meta">
-                          <span>{m.width > 0 ? `${m.width}×${m.height}` : mime || "file"}</span>
-                          <span>{formatAssetSize(m.size_bytes)}</span>
-                        </div>
-                        <div class="volo-media-actions">
-                          <button type="button" class="volo-act-btn" onClick={() => copyMediaMarkdown(m)}>
-                            {t("cnt.media_copy_md")}
-                          </button>
-                          <button type="button" class="volo-act-btn" onClick={() => copyMediaUrl(m)}>
-                            {t("cnt.media_copy")}
-                          </button>
-                          <button type="button" class="volo-act-btn danger" onClick={() => void handleDeleteMediaItem(m)}>
-                            {t("common.delete")}
-                          </button>
+                        <div class="volo-media-body">
+                          <div class="volo-media-name" title={displayName}>
+                            {displayName}
+                          </div>
+                          <div class="volo-media-meta">
+                            <span>{m.width > 0 ? `${m.width}×${m.height}` : mime || "file"}</span>
+                            <span>{formatAssetSize(m.size_bytes)}</span>
+                          </div>
+                          <div class="volo-media-actions">
+                            <button type="button" class="volo-act-btn" onClick={() => copyMediaMarkdown(m)}>
+                              {t("cnt.media_copy_md")}
+                            </button>
+                            <button type="button" class="volo-act-btn" onClick={() => copyMediaUrl(m)}>
+                              {t("cnt.media_copy")}
+                            </button>
+                            <button type="button" class="volo-act-btn danger" onClick={() => void handleDeleteMediaItem(m)}>
+                              {t("common.delete")}
+                            </button>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              </>
             ) : (
               <>
                 <MobileSelectAllBar
@@ -3276,8 +3965,14 @@ export function ContentWorkspace({
               </>
             )}
 
+            <BatchBar count={selMediaIds.length} onClear={() => setSelMediaIds([])}>
+              <button type="button" class="volo-act-btn danger" onClick={() => void batchDeleteMedia()}>
+                {t("common.delete")}
+              </button>
+            </BatchBar>
+
             <Pagination
-              total={mediaRefFilter === "used" ? filteredMedia.length : subTotal}
+              total={subTotal}
               page={pageIdx}
               pageSize={mediaPageSize}
               pageSizeOptions={[24, 48, 96]}
@@ -3322,8 +4017,12 @@ export function ContentWorkspace({
             {previewAsset && (
               <>
                 <div class="volo-lightbox-img-wrap">
-                  {String(previewAsset.mime_type || "").startsWith("image/") ? (
-                    <img src={previewAsset.public_url} alt={previewAsset.alt_text || previewAsset.original_name} />
+                  {String(previewAsset.mime_type || "").startsWith("image/") && !brokenMediaIds[previewAsset.id] ? (
+                    <img
+                      src={previewAsset.public_url}
+                      alt={previewAsset.alt_text || previewAsset.original_name}
+                      onError={() => setBrokenMediaIds((prev) => ({ ...prev, [previewAsset.id]: true }))}
+                    />
                   ) : String(previewAsset.mime_type || "").startsWith("audio/") ? (
                     <audio controls src={previewAsset.public_url} class="volo-w-full" />
                   ) : (

@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/auth"
@@ -68,10 +69,22 @@ type AppDeps struct {
 	ExtraMuxSetup          func(mux *http.ServeMux)
 }
 
+type backupExportTicket struct {
+	ActorID   string
+	ExpiresAt time.Time
+}
+
 // AppServer serves all public pages, feeds, zero-copy Range media, plugins, and v1 APIs (plus Admin/Setup routes).
 type AppServer struct {
 	deps    AppDeps
 	handler http.Handler
+
+	backupTicketMu sync.Mutex
+	backupTickets  map[string]backupExportTicket
+
+	mediaRefCacheMu      sync.Mutex
+	mediaRefCachedAt     time.Time
+	mediaRefCachedTokens map[string]int
 }
 
 // NewAppServer constructs and wires a complete AppServer instance.
@@ -154,7 +167,7 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 			snap := deps.Settings.Snapshot()
 			pubURL := ""
 			if deps.Config != nil {
-				pubURL = deps.Config.PublicURL
+				pubURL = deps.Config.GetPublicURL()
 			}
 			return map[string]any{
 				"title":          snap.Site.Title,
@@ -167,8 +180,15 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 			}
 		})
 		deps.Plugins.SetRequestInspector(func(r *http.Request) (bool, string) {
-			viewer, _ := s.resolveViewer(r)
+			viewer, sess := s.resolveViewer(r)
 			isAdmin := viewer != nil && viewer.Status == domain.UserStatusActive && viewer.Role == domain.RoleAdmin
+			if isAdmin && isStateChangingHTTPMethod(r.Method) {
+				csrfOK := sess != nil && s.deps.Auth != nil &&
+					s.deps.Auth.VerifyCSRFToken(sess.ID, r.Header.Get("X-CSRF-Token"))
+				if !s.isSameOriginRequest(r) || !csrfOK {
+					isAdmin = false
+				}
+			}
 			var proxies config.TrustedProxiesPolicy
 			if s.deps.Config != nil {
 				proxies = s.deps.Config.TrustedProxies
@@ -210,6 +230,68 @@ func (s *AppServer) Close(ctx context.Context) error {
 	return s.deps.Content.Close(ctx)
 }
 
+func isStateChangingHTTPMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *AppServer) handlePluginMount(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.deps.Plugins == nil || next == nil {
+			http.NotFound(w, r)
+			return
+		}
+		trimmed := strings.TrimPrefix(r.URL.Path, "/plugins/")
+		parts := strings.SplitN(trimmed, "/", 3)
+		if len(parts) < 2 || parts[0] == "" {
+			http.NotFound(w, r)
+			return
+		}
+		pluginID, namespace := parts[0], parts[1]
+		reqToServe := r
+		if namespace == "api" {
+			clonedHdr := r.Header.Clone()
+			modified := false
+			if isStateChangingHTTPMethod(r.Method) {
+				_, sess := s.resolveViewer(r)
+				csrfOK := sess != nil && s.deps.Auth != nil &&
+					s.deps.Auth.VerifyCSRFToken(sess.ID, r.Header.Get("X-CSRF-Token"))
+				if !s.isSameOriginRequest(r) || !csrfOK {
+					// Strip ambient session cookies so unauthenticated third-party webhooks
+					// reach ServeAPI with IsAdmin: false without ambient session elevation.
+					clonedHdr.Del("Cookie")
+					modified = true
+				}
+			}
+			if !s.deps.Plugins.HasPermission(pluginID, "http:raw_headers") && !s.deps.Plugins.HasPermission(pluginID, "raw_headers") {
+				for _, sigHdr := range []string{
+					"X-Hub-Signature-256",
+					"X-Hub-Signature",
+					"X-Signature",
+					"X-Webhook-Signature",
+					"Stripe-Signature",
+					"Authorization",
+				} {
+					if clonedHdr.Get(sigHdr) != "" {
+						clonedHdr.Del(sigHdr)
+						modified = true
+					}
+				}
+			}
+			if modified {
+				reqCopy := r.Clone(r.Context())
+				reqCopy.Header = clonedHdr
+				reqToServe = reqCopy
+			}
+		}
+		next.ServeHTTP(w, reqToServe)
+	})
+}
+
 func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", NewHealthzHandler(s.deps.Store, s.deps.StartedAt))
 	mux.HandleFunc("/favicon.svg", s.handleServeFaviconSVG)
@@ -219,12 +301,13 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/themes/", s.handleServeThemeAsset)
 	mux.HandleFunc("/avatars/", s.handleServeAvatar)
 	if s.deps.Plugins != nil {
-		mux.Handle("/plugins/", s.deps.Plugins.Handler())
+		mux.Handle("/plugins/", s.handlePluginMount(s.deps.Plugins.Handler()))
 	}
 
 	// Machine & AI Distribution Feeds
 	mux.HandleFunc("/rss.xml", s.handleRSS)
 	mux.HandleFunc("/atom.xml", s.handleAtom)
+	mux.HandleFunc("/feed.json", s.handleJSONFeed)
 	mux.HandleFunc("/podcast.xml", s.handlePodcast)
 	mux.HandleFunc("/sitemap.xml", s.handleSitemap)
 	mux.HandleFunc("/robots.txt", s.handleRobotsTxt)
@@ -247,6 +330,8 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/reader/login", s.handleReaderLogin)
 	mux.HandleFunc("/api/v1/reader/logout", s.handleReaderLogout)
 	mux.HandleFunc("/api/v1/reader/claim-guest-comments", s.handleReaderClaimComments)
+	mux.HandleFunc("/api/v1/auth/oidc", s.handleOIDCAuthRoutes)
+	mux.HandleFunc("/api/v1/auth/oidc/", s.handleOIDCAuthRoutes)
 
 	// Legacy Bolo-Solo 301 Canonical Skin Routes & Compatibility Shims
 	mux.HandleFunc("/archives.html", s.permanentRedirectTo("/archives"))
@@ -468,17 +553,56 @@ func (s *AppServer) handleServeAvatar(w http.ResponseWriter, r *http.Request) {
 
 // --- Feeds, Sitemap, Robots, LLMs & Raw Markdown ---
 
+func normalizeTrustedBaseURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n\t ") {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return ""
+	}
+	if strings.ContainsAny(u.Host, `/\@`) {
+		return ""
+	}
+	cleanPath := strings.TrimRight(u.Path, "/")
+	return strings.ToLower(u.Scheme) + "://" + u.Host + cleanPath
+}
+
+func sanitizePublicRequestHost(rawHost string) string {
+	h := strings.TrimSpace(rawHost)
+	if h == "" || len(h) > 255 {
+		return "localhost:8080"
+	}
+	for i := 0; i < len(h); i++ {
+		c := h[i]
+		if c <= 0x20 || c >= 0x7f || c == '/' || c == '\\' || c == '@' || c == '?' || c == '#' {
+			return "localhost:8080"
+		}
+	}
+	return h
+}
+
 func (s *AppServer) publicBaseURL(r *http.Request) string {
-	if s.deps.Config != nil && strings.TrimSpace(s.deps.Config.PublicURL) != "" {
-		return strings.TrimRight(strings.TrimSpace(s.deps.Config.PublicURL), "/")
+	if s.deps.Config != nil {
+		if base := normalizeTrustedBaseURL(s.deps.Config.GetPublicURL()); base != "" {
+			return base
+		}
 	}
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
+	if s.deps.Settings != nil {
+		snap := s.deps.Settings.Snapshot()
+		if snap.Site.CustomVars != nil {
+			for _, key := range []string{"site_url", "public_url", "url"} {
+				if base := normalizeTrustedBaseURL(snap.Site.CustomVars[key]); base != "" {
+					return base
+				}
+			}
+		}
 	}
-	host := r.Host
-	if host == "" {
-		host = "localhost:8080"
+	scheme := s.effectiveRequestScheme(r)
+	host := "localhost:8080"
+	if r != nil {
+		host = sanitizePublicRequestHost(r.Host)
 	}
 	return scheme + "://" + host
 }
@@ -514,6 +638,15 @@ func (s *AppServer) handleRSS(w http.ResponseWriter, r *http.Request) {
 
 func (s *AppServer) handleAtom(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.deps.Content.GetCachedAtom(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
+	if err != nil {
+		http.Error(w, "feed error", http.StatusInternalServerError)
+		return
+	}
+	serveCachedDocument(w, r, doc)
+}
+
+func (s *AppServer) handleJSONFeed(w http.ResponseWriter, r *http.Request) {
+	doc, err := s.deps.Content.GetCachedJSONFeed(r.Context(), s.publicBaseURL(r), s.resolveLocale(r))
 	if err != nil {
 		http.Error(w, "feed error", http.StatusInternalServerError)
 		return
@@ -578,11 +711,12 @@ func (s *AppServer) handleGitHubStatsSVG(w http.ResponseWriter, r *http.Request)
 		http.NotFound(w, r)
 		return
 	}
-	svg := s.deps.Content.BuildGitHubStatsSVG(user)
+	svg := s.deps.Content.BuildGitHubStatsSVGWithTheme(user, r.URL.Query().Get("theme"))
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
+	addVaryHeader(w.Header(), "Accept-Encoding")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(svg)
 }
@@ -900,7 +1034,7 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		updated, err := s.deps.Content.UpdateOwnComment(r.Context(), r, viewer, commentID, body.ContentMD)
-		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, visibility.ErrProtectedForbidden) {
+		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, content.ErrCommentRejected) || errors.Is(err, visibility.ErrProtectedForbidden) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 			return
 		}
@@ -1128,7 +1262,7 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": msg})
 		return
 	}
-	s.setSessionCookie(w, res.RawToken)
+	s.setSessionCookieForRequest(w, r, res.RawToken)
 	writeJSON(w, http.StatusOK, map[string]any{"user": res.User, "csrf_token": res.CSRFToken})
 }
 
@@ -1183,7 +1317,16 @@ func (s *AppServer) handleReaderClaimComments(w http.ResponseWriter, r *http.Req
 }
 
 func (s *AppServer) setSessionCookie(w http.ResponseWriter, rawToken string) {
-	secure := strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.deps.Config.PublicURL)), "https://")
+	s.setSessionCookieForRequest(w, nil, rawToken)
+}
+
+func (s *AppServer) setSessionCookieForRequest(w http.ResponseWriter, r *http.Request, rawToken string) {
+	pubURL := ""
+	if s.deps.Config != nil {
+		pubURL = s.deps.Config.GetPublicURL()
+	}
+	secure := s.effectiveRequestScheme(r) == "https" ||
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(pubURL)), "https://")
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.SessionCookieName,
 		Value:    rawToken,
@@ -1193,6 +1336,14 @@ func (s *AppServer) setSessionCookie(w http.ResponseWriter, rawToken string) {
 		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+func hasActiveUnlockCookie(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ck, err := r.Cookie(guest.UnlockCookieName)
+	return err == nil && strings.TrimSpace(ck.Value) != ""
 }
 
 // --- Public Studio HTML Pages ---
@@ -1307,8 +1458,19 @@ func (s *AppServer) renderStudio(w http.ResponseWriter, r *http.Request, status 
 
 func (s *AppServer) renderStudioFallback(w http.ResponseWriter, r *http.Request, status int, candidates []string, pctx theme.PageContext) {
 	activeTheme := s.deps.Themes.ResolveThemeForRequest(r, pctx.Viewer, pctx.Appearance)
-	if mob := strings.TrimSpace(pctx.Appearance.MobileTheme); mob != "" && mob != "same" && mob != pctx.Appearance.ActiveTheme {
-		appendVaryHeader(w.Header(), "User-Agent", "Sec-CH-UA-Mobile")
+	addVaryHeader(w.Header(), "Accept-Encoding", "Cookie", "Accept-Language")
+	if mob := strings.TrimSpace(pctx.Appearance.MobileTheme); mob != "" && mob != "same" {
+		addVaryHeader(w.Header(), "User-Agent", "Sec-CH-UA-Mobile")
+	}
+	hasQueryPrivate := false
+	if r != nil && r.URL != nil {
+		q := r.URL.Query()
+		hasQueryPrivate = q.Get("st") != "" || q.Get("preview") != "" || q.Get("skin") != "" || q.Get("theme_preview") != ""
+	}
+	if pctx.Viewer != nil || hasQueryPrivate || hasActiveUnlockCookie(r) ||
+		(pctx.Detail.ID != "" && (pctx.Detail.UnlockedViaShare || pctx.Detail.IsPasswordProtected)) ||
+		(pctx.StandalonePage.ID != "" && pctx.StandalonePage.HasLockedSections) {
+		w.Header().Set("Cache-Control", "private, no-store")
 	}
 	if pctx.ThemeID != activeTheme || pctx.ThemeConfig == nil {
 		pctx.ThemeID = activeTheme
@@ -1320,26 +1482,7 @@ func (s *AppServer) renderStudioFallback(w http.ResponseWriter, r *http.Request,
 }
 
 func appendVaryHeader(h http.Header, keys ...string) {
-	cur := h.Get("Vary")
-	existing := make(map[string]bool, 4)
-	for _, part := range strings.Split(cur, ",") {
-		if t := strings.TrimSpace(part); t != "" {
-			existing[strings.ToLower(t)] = true
-		}
-	}
-	var added []string
-	if strings.TrimSpace(cur) != "" {
-		added = append(added, cur)
-	}
-	for _, k := range keys {
-		if !existing[strings.ToLower(k)] {
-			added = append(added, k)
-			existing[strings.ToLower(k)] = true
-		}
-	}
-	if len(added) > 0 {
-		h.Set("Vary", strings.Join(added, ", "))
-	}
+	addVaryHeader(h, keys...)
 }
 
 func (s *AppServer) renderErrorPage(w http.ResponseWriter, r *http.Request, status int, msgKey string) {
@@ -1394,9 +1537,7 @@ func clampPageBounds(page int, total int, perPage int) (clampedPage int, totalPa
 
 func (s *AppServer) siteTimezoneLocation(tz string) *time.Location {
 	if trimmed := strings.TrimSpace(tz); trimmed != "" {
-		if loc, err := time.LoadLocation(trimmed); err == nil {
-			return loc
-		}
+		return theme.LoadSiteLocation(trimmed)
 	}
 	return time.FixedZone("CST", 8*3600)
 }
@@ -1452,9 +1593,6 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
-	if viewer != nil {
-		w.Header().Set("Cache-Control", "private, no-store")
-	}
 	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.IsStandalonePage = true
 	pctx.PageTitle = pgView.Title + " · " + pctx.Site.Title
@@ -1463,8 +1601,32 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 	}
 	pctx.StandalonePage = pgView
 	pctx.Alternates = pgView.Translations
+	pctx.Reactions, _ = s.deps.Content.GetReactionCounts(r.Context(), domain.TargetTypePage, pgView.ID)
+	if s.deps.Plugins != nil {
+		slotCtx := plugin.SlotRenderContext{
+			Locale:      pctx.Locale,
+			Path:        r.URL.Path,
+			ArticleID:   pgView.ID,
+			ArticleSlug: pgView.Slug,
+			ThemeAccent: pctx.Appearance.Accent,
+		}
+		pctx.ArticleBeforeWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotArticleBeforeContent, slotCtx)
+		pctx.ArticleAfterWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotArticleAfterContent, slotCtx)
+		pctx.CommentBeforeWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotCommentBefore, slotCtx)
+		pctx.CommentAfterWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotCommentAfter, slotCtx)
+	}
 	s.recordPageView(r, domain.TargetTypePage, pgView.ID)
-	s.renderStudio(w, r, http.StatusOK, "page.html", pctx)
+
+	tmplName := strings.TrimSpace(pgView.Template)
+	if tmplName == "" {
+		tmplName = "default"
+	}
+	candidates := []string{
+		"page-" + pgView.Slug + ".html",
+		"page-" + tmplName + ".html",
+		"page.html",
+	}
+	s.renderStudioFallback(w, r, http.StatusOK, candidates, pctx)
 }
 
 func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
@@ -1510,6 +1672,9 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 		}
 		shareTok := strings.TrimSpace(r.URL.Query().Get("preview"))
 		if shareTok == "" {
+			shareTok = strings.TrimSpace(r.URL.Query().Get("st"))
+		}
+		if shareTok == "" {
 			shareTok = strings.TrimSpace(r.Header.Get("X-Volo-Share-Token"))
 		}
 		staffOwner := viewer != nil && viewer.Status == domain.UserStatusActive &&
@@ -1518,7 +1683,7 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Cache-Control", "private, no-store")
 		raw = cand
 	}
 	pctx := s.basePageContextWithSession(r, viewer, sess)
@@ -1554,6 +1719,8 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 		}
 		pctx.ArticleBeforeWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotArticleBeforeContent, slotCtx)
 		pctx.ArticleAfterWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotArticleAfterContent, slotCtx)
+		pctx.CommentBeforeWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotCommentBefore, slotCtx)
+		pctx.CommentAfterWidgets = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotCommentAfter, slotCtx)
 	}
 
 	if pctx.Reading.EnableOutdatedNotice && pctx.Reading.OutdatedNoticeDays > 0 && raw.UpdatedAt > 0 {
@@ -2187,6 +2354,7 @@ func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request)
 	pctx := s.basePageContext(r, nil)
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "reader.login_title") + " · " + pctx.Site.Title
 	pctx.NoIndex = true
+	pctx.OIDCProviders = s.listOIDCProviderViews(pctx.Locale, "reader", r.URL.Query().Get("next"))
 	s.renderStudio(w, r, http.StatusOK, "reader_auth.html", pctx)
 }
 
@@ -2246,7 +2414,7 @@ func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Re
 		adminPrefix = "/console"
 	}
 	isSafeTarget := func(cand string) bool {
-		if !strings.HasPrefix(cand, "/") || strings.HasPrefix(cand, "//") || strings.ContainsAny(cand, "\r\n") {
+		if !isSafeRelativeRedirect(cand) {
 			return false
 		}
 		if cand == "/logout" || strings.HasPrefix(cand, "/logout?") || cand == adminPrefix || strings.HasPrefix(cand, adminPrefix+"/") {
@@ -2303,12 +2471,14 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 
 	var svg string
 	switch strings.ToLower(clean) {
-	case "github-icon.png", "github-icon-light.svg", "github-icon.svg":
-		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path fill="#24292f" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></svg>`
+	case "github-icon-light.svg":
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path fill="#f0f6f2" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></svg>`
+	case "github-icon.png", "github-icon.svg":
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><style>path{fill:#24292f}@media (prefers-color-scheme:dark){path{fill:#f0f6f2}}</style><path fill="#24292f" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></svg>`
 	case "admin-panel.svg":
-		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.2" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="9" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="2.2" y="9" width="4.8" height="4.8" rx="1"/><rect x="9" y="9" width="4.8" height="4.8" rx="1"/></svg>`
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><style>svg{stroke:#24292f}@media (prefers-color-scheme:dark){svg{stroke:#f0f6f2}}</style><rect x="2.2" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="9" y="2.2" width="4.8" height="4.8" rx="1"/><rect x="2.2" y="9" width="4.8" height="4.8" rx="1"/><rect x="9" y="9" width="4.8" height="4.8" rx="1"/></svg>`
 	case "admin-logout.svg":
-		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 2.5H3.6A1.4 1.4 0 0 0 2.2 3.9v8.2a1.4 1.4 0 0 0 1.4 1.4h2.6"/><path d="M10.5 11.2 13.8 8l-3.3-3.2"/><path d="M13.8 8H6.2"/></svg>`
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><style>svg{stroke:#24292f}@media (prefers-color-scheme:dark){svg{stroke:#f0f6f2}}</style><path d="M6.2 2.5H3.6A1.4 1.4 0 0 0 2.2 3.9v8.2a1.4 1.4 0 0 0 1.4 1.4h2.6"/><path d="M10.5 11.2 13.8 8l-3.3-3.2"/><path d="M13.8 8H6.2"/></svg>`
 	case "github_repo.jpg", "github_repo.png", "github_repo.svg":
 		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="800" height="450"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0d1513"/><stop offset="55%" stop-color="#14231e"/><stop offset="100%" stop-color="#1d352d"/></linearGradient><pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#5fb399" stroke-opacity="0.08" stroke-width="1"/></pattern></defs><rect width="800" height="450" fill="url(#bg)"/><rect width="800" height="450" fill="url(#grid)"/><g fill="none" stroke="#64c3a6" stroke-opacity="0.22" stroke-width="1.5"><rect x="44" y="38" width="712" height="374" rx="18"/><circle cx="78" cy="68" r="5" fill="#e06c75" stroke="none"/><circle cx="96" cy="68" r="5" fill="#e5c07b" stroke="none"/><circle cx="114" cy="68" r="5" fill="#98c379" stroke="none"/><line x1="44" y1="94" x2="756" y2="94"/></g><g stroke-linecap="round"><line x1="84" y1="142" x2="220" y2="142" stroke="#64c3a6" stroke-opacity="0.65" stroke-width="6"/><line x1="238" y1="142" x2="394" y2="142" stroke="#8ab4f8" stroke-opacity="0.35" stroke-width="6"/><line x1="84" y1="176" x2="462" y2="176" stroke="#d8e6e0" stroke-opacity="0.22" stroke-width="5"/><line x1="84" y1="208" x2="348" y2="208" stroke="#64c3a6" stroke-opacity="0.38" stroke-width="5"/><line x1="366" y1="208" x2="498" y2="208" stroke="#e5c07b" stroke-opacity="0.32" stroke-width="5"/><line x1="84" y1="240" x2="412" y2="240" stroke="#d8e6e0" stroke-opacity="0.16" stroke-width="5"/></g><g transform="translate(556,142) scale(8.8)"><path fill="#e6f2ed" fill-opacity="0.9" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></g><text x="84" y="330" font-family="system-ui,-apple-system,sans-serif" font-size="30" font-weight="700" fill="#eef6f2" letter-spacing="0.4">OPEN SOURCE MATRIX</text><text x="84" y="364" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="15" fill="#8fb5a7">git://github.com · public repositories &amp; craft</text></svg>`
 	default:

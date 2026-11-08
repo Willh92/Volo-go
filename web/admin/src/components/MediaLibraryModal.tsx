@@ -1,7 +1,16 @@
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, showToast, storageDriverSig } from "../api";
+import { apiFetch, showToast, storageDriverSig, uploadWithProgress } from "../api";
 import { t } from "../i18n";
-import { AnimatedModal, ConsoleEmpty, PaginationBar, UploadButton, paginateItems, useDebouncedValue } from "./UIControls";
+import {
+  AnimatedModal,
+  ConsoleEmpty,
+  ConsoleSelect,
+  PaginationBar,
+  UploadButton,
+  UploadProgressBar,
+  paginateItems,
+  useDebouncedValue,
+} from "./UIControls";
 
 export interface MediaAssetRecord {
   id: string;
@@ -41,27 +50,42 @@ export function MediaLibraryModal({
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [reconciling, setReconciling] = useState(false);
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 250);
   const [kindTab, setKindTab] = useState<"all" | "image" | "audio">(filterKind);
+  const [usageTab, setUsageTab] = useState<"all" | "used" | "unused">("all");
+  const [monthFilter, setMonthFilter] = useState("");
+  const [brokenIds, setBrokenIds] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     setKindTab(filterKind);
     setPage(1);
   }, [filterKind, open]);
 
-  const loadAssets = async (targetPage = page, q = debouncedQuery, kind = kindTab) => {
+  const loadAssets = async (
+    targetPage = page,
+    q = debouncedQuery,
+    kind = kindTab,
+    usage = usageTab,
+    month = monthFilter
+  ) => {
     setLoading(true);
     try {
       const params = new URLSearchParams({
-        refs: "0",
+        refs: usage === "all" ? "0" : "1",
         page: String(targetPage),
         per_page: String(MODAL_PAGE_SIZE),
       });
       if (q.trim()) params.set("q", q.trim());
       if (kind === "image") params.set("mime", "image");
       else if (kind === "audio") params.set("mime", "audio");
+      if (usage !== "all") {
+        params.set("usage", usage);
+        if (usage === "unused") params.set("orphan_only", "1");
+      }
+      if (month.trim()) params.set("month", month.trim());
 
       const res = await apiFetch<{
         items: MediaAssetRecord[];
@@ -87,16 +111,16 @@ export function MediaLibraryModal({
 
   useEffect(() => {
     if (open) {
-      void loadAssets(page, debouncedQuery, kindTab);
+      void loadAssets(page, debouncedQuery, kindTab, usageTab, monthFilter);
     }
-  }, [open, page, debouncedQuery, kindTab]);
+  }, [open, page, debouncedQuery, kindTab, usageTab, monthFilter]);
 
   const handleReconcile = async () => {
     setReconciling(true);
     try {
       await apiFetch("/api/admin/media/reconcile", { method: "POST", body: "{}" });
       setPage(1);
-      await loadAssets(1, debouncedQuery, kindTab);
+      await loadAssets(1, debouncedQuery, kindTab, usageTab, monthFilter);
       showToast(t("cnt.media_reconciled"), "ok");
     } catch (err: any) {
       showToast(err.message, "err");
@@ -108,38 +132,62 @@ export function MediaLibraryModal({
   const handleUploadFiles = async (files: File[]) => {
     if (files.length === 0) return;
     setUploading(true);
+    setUploadPct(0);
+    const totalBytes = Math.max(1, files.reduce((acc, f) => acc + Math.max(1, f.size), 0));
+    const perFileLoaded = new Array<number>(files.length).fill(0);
+    const updateAggPct = () => {
+      const loaded = perFileLoaded.reduce((a, b) => a + b, 0);
+      setUploadPct(Math.min(100, Math.round((loaded / totalBytes) * 100)));
+    };
     try {
       let lastPicked: MediaAssetRecord | null = null;
       let uploadedCount = 0;
-      for (const file of files) {
-        const fd = new FormData();
-        fd.append("file", file);
-        const res = await apiFetch<{ asset?: MediaAssetRecord; item?: MediaAssetRecord }>(
-          "/api/admin/media/upload",
-          { method: "POST", body: fd }
-        );
-        const picked = res.asset || res.item;
-        if (picked) {
-          lastPicked = {
-            ...picked,
-            original_name: picked.original_name || picked.orig_filename || file.name,
-          };
-          uploadedCount++;
-        }
-      }
+      let cursor = 0;
+      const workerCount = Math.min(3, files.length);
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          while (cursor < files.length) {
+            const idx = cursor++;
+            const file = files[idx];
+            const fSize = Math.max(1, file.size);
+            const fd = new FormData();
+            fd.append("file", file);
+            const res = await uploadWithProgress<{ asset?: MediaAssetRecord; item?: MediaAssetRecord }>(
+              "/api/admin/media/upload",
+              fd,
+              (pct) => {
+                perFileLoaded[idx] = (pct / 100) * fSize;
+                updateAggPct();
+              }
+            );
+            perFileLoaded[idx] = fSize;
+            updateAggPct();
+            const picked = res.asset || res.item;
+            if (picked) {
+              lastPicked = {
+                ...picked,
+                original_name: picked.original_name || picked.orig_filename || file.name,
+              };
+              uploadedCount++;
+            }
+          }
+        })
+      );
       if (files.length === 1 && lastPicked) {
-        showToast(t("ed.uploaded", { name: lastPicked.original_name }), "ok");
-        onSelect(lastPicked);
+        const chosen = lastPicked as MediaAssetRecord;
+        showToast(t("ed.uploaded", { name: chosen.original_name }), "ok");
+        onSelect(chosen);
         onClose();
       } else if (uploadedCount > 0) {
         showToast(t("cnt.media_uploaded_n", { count: uploadedCount }), "ok");
         setPage(1);
-        await loadAssets(1, debouncedQuery, kindTab);
+        await loadAssets(1, debouncedQuery, kindTab, usageTab, monthFilter);
       }
     } catch (err: any) {
       showToast(err.message, "err");
     } finally {
       setUploading(false);
+      setUploadPct(null);
     }
   };
 
@@ -159,7 +207,7 @@ export function MediaLibraryModal({
       onClose={onClose}
       title={title || t("cnt.media_picker_title")}
       subtitle={t("cnt.media_picker_desc")}
-      maxWidth="840px"
+      maxWidth="860px"
       footer={
         <button type="button" class="volo-btn" onClick={onClose}>
           {t("common.close")}
@@ -194,6 +242,31 @@ export function MediaLibraryModal({
         )}
 
         <div class="volo-filter-controls">
+          <ConsoleSelect
+            searchable={false}
+            style={{ width: "128px" }}
+            value={usageTab}
+            onChange={(v) => {
+              setUsageTab((v as "all" | "used" | "unused") || "all");
+              setPage(1);
+            }}
+            options={[
+              { value: "all", label: t("cnt.media_filter_all") },
+              { value: "used", label: t("cnt.media_filter_used") },
+              { value: "unused", label: t("cnt.media_filter_orphan") },
+            ]}
+          />
+          <input
+            type="month"
+            class="volo-input"
+            style={{ width: "142px" }}
+            aria-label={t("cnt.media_month_lbl")}
+            value={monthFilter}
+            onInput={(e) => {
+              setMonthFilter((e.currentTarget as HTMLInputElement).value);
+              setPage(1);
+            }}
+          />
           <input
             class="volo-input volo-search-input"
             placeholder={t("cnt.media_search_ph")}
@@ -224,6 +297,12 @@ export function MediaLibraryModal({
         </div>
       </div>
 
+      {uploading && uploadPct !== null && (
+        <div style={{ marginBottom: "12px" }}>
+          <UploadProgressBar progress={uploadPct} label={t("cnt.media_uploading_pct", { pct: uploadPct })} />
+        </div>
+      )}
+
       {loading ? (
         <div class="volo-empty-state">{t("shell.loading")}</div>
       ) : displayItems.length === 0 ? (
@@ -234,6 +313,7 @@ export function MediaLibraryModal({
             {displayItems.map((m) => {
               const isImg = (m.mime_type || "").startsWith("image/");
               const isAudio = (m.mime_type || "").startsWith("audio/");
+              const isBroken = Boolean(brokenIds[m.id]);
               return (
                 <button
                   key={m.id}
@@ -245,8 +325,13 @@ export function MediaLibraryModal({
                   }}
                 >
                   <div class="volo-media-picker-thumb">
-                    {isImg ? (
-                      <img src={m.public_url} alt={m.alt_text || m.original_name} loading="lazy" />
+                    {isImg && !isBroken ? (
+                      <img
+                        src={m.public_url}
+                        alt={m.alt_text || m.original_name}
+                        loading="lazy"
+                        onError={() => setBrokenIds((prev) => ({ ...prev, [m.id]: true }))}
+                      />
                     ) : isAudio ? (
                       <div class="volo-media-type-placeholder">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -258,7 +343,7 @@ export function MediaLibraryModal({
                       </div>
                     ) : (
                       <div class="volo-media-type-placeholder">
-                        <span>{(m.mime_type || "FILE").split("/").pop()?.toUpperCase()}</span>
+                        <span>{isBroken ? "IMG" : (m.mime_type || "FILE").split("/").pop()?.toUpperCase()}</span>
                       </div>
                     )}
                     {typeof m.ref_count === "number" && (

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net"
 	"net/url"
 	"path"
 	"regexp"
@@ -24,8 +26,14 @@ const (
 const (
 	HookArticlePublished    = "article.published"
 	HookArticleUpdated      = "article.updated"
+	HookArticleDeleted      = "article.deleted"
+	HookPagePublished       = "page.published"
+	HookPageUpdated         = "page.updated"
+	HookPageDeleted         = "page.deleted"
 	HookCommentBeforeCreate = "comment.before_create"
 	HookCommentCreated      = "comment.created"
+	HookCommentModerated    = "comment.moderated"
+	HookRenderPreMarkdown   = "render.pre_markdown"
 	HookRenderPostHTML      = "render.post_html"
 )
 
@@ -36,6 +44,8 @@ const (
 	SlotPublicSidebar        = "public.sidebar"
 	SlotArticleBeforeContent = "article.before_content"
 	SlotArticleAfterContent  = "article.after_content"
+	SlotCommentBefore        = "comment.before"
+	SlotCommentAfter         = "comment.after"
 	SlotPublicFooter         = "public.footer"
 	SlotEditorQuickInsert    = "editor.quick_insert"
 	SlotAdminDashboardCard   = "admin.dashboard_card"
@@ -45,6 +55,8 @@ const (
 
 var validPluginIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,62}$`)
 var validSemverLooseRe = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+([0-9A-Za-z.-]*)$`)
+var validHookNameRe = regexp.MustCompile(`^[a-z0-9._-]{1,128}$`)
+var validDNSLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 var allowedSlotNames = map[string]bool{
 	SlotPublicHead:           true,
@@ -52,6 +64,8 @@ var allowedSlotNames = map[string]bool{
 	SlotPublicSidebar:        true,
 	SlotArticleBeforeContent: true,
 	SlotArticleAfterContent:  true,
+	SlotCommentBefore:        true,
+	SlotCommentAfter:         true,
 	SlotPublicFooter:         true,
 	SlotEditorQuickInsert:    true,
 	SlotAdminDashboardCard:   true,
@@ -105,16 +119,20 @@ type CronSpec struct {
 
 // ConfigField describes a single field in a plugin's declarative configuration form.
 type ConfigField struct {
-	Key      string            `json:"key"`
-	Type     string            `json:"type"` // string | text | number | boolean | select | url
-	Secret   bool              `json:"secret,omitempty"`
-	Required bool              `json:"required,omitempty"`
-	Default  any               `json:"default,omitempty"`
-	Min      *float64          `json:"min,omitempty"`
-	Max      *float64          `json:"max,omitempty"`
-	Options  []SelectOption    `json:"options,omitempty"`
-	Label    map[string]string `json:"label"`
-	Help     map[string]string `json:"help,omitempty"`
+	Key         string            `json:"key"`
+	Type        string            `json:"type"` // string | text | textarea | number | boolean | select | url | color | image | sortable_list
+	Secret      bool              `json:"secret,omitempty"`
+	Required    bool              `json:"required,omitempty"`
+	Default     any               `json:"default,omitempty"`
+	Min         *float64          `json:"min,omitempty"`
+	Max         *float64          `json:"max,omitempty"`
+	Step        *float64          `json:"step,omitempty"`
+	Options     []SelectOption    `json:"options,omitempty"`
+	Group       map[string]string `json:"group,omitempty"`
+	Label       map[string]string `json:"label"`
+	Placeholder map[string]string `json:"placeholder,omitempty"`
+	Description map[string]string `json:"description,omitempty"`
+	Help        map[string]string `json:"help,omitempty"`
 }
 
 // SelectOption represents an option for a "select" ConfigField.
@@ -181,6 +199,24 @@ func (m *Manifest) Validate() error {
 		}
 	}
 
+	// Validate declared hooks syntax.
+	for i, rawHook := range m.Hooks {
+		h := strings.TrimSpace(rawHook)
+		if h == "" || !validHookNameRe.MatchString(h) {
+			return fmt.Errorf("plugin %q: invalid hook name %q (must match %s)", m.ID, rawHook, validHookNameRe.String())
+		}
+		m.Hooks[i] = h
+	}
+
+	// Validate declared outbound allowed_hosts patterns.
+	for i, rawHost := range m.AllowedHosts {
+		cleanHost, err := validateAllowedHostPattern(rawHost)
+		if err != nil {
+			return fmt.Errorf("plugin %q: invalid allowed_hosts entry %q: %w", m.ID, rawHost, err)
+		}
+		m.AllowedHosts[i] = cleanHost
+	}
+
 	// Validate UI slots and ensure matching slot permissions are declared.
 	for i := range m.UISlots {
 		slot := &m.UISlots[i]
@@ -234,16 +270,32 @@ func (m *Manifest) Validate() error {
 
 	// Validate config schema.
 	seenKeys := make(map[string]bool, len(m.ConfigSchema))
-	for _, f := range m.ConfigSchema {
+	for i := range m.ConfigSchema {
+		f := &m.ConfigSchema[i]
 		k := strings.TrimSpace(f.Key)
 		if k == "" || strings.HasPrefix(k, "__") || seenKeys[k] {
 			return fmt.Errorf("plugin %q: invalid or duplicate config_schema key %q", m.ID, f.Key)
 		}
+		f.Key = k
 		seenKeys[k] = true
+
+		f.Type = strings.ToLower(strings.TrimSpace(f.Type))
 		switch f.Type {
-		case "string", "text", "textarea", "number", "boolean", "select", "url", "color", "image":
+		case "string", "text", "textarea", "number", "boolean", "select", "url", "color", "image", "sortable_list":
 		default:
 			return fmt.Errorf("plugin %q: config field %q has unsupported type %q", m.ID, k, f.Type)
+		}
+		if f.Min != nil && (math.IsNaN(*f.Min) || math.IsInf(*f.Min, 0)) {
+			return fmt.Errorf("plugin %q: config field %q has invalid min bound", m.ID, k)
+		}
+		if f.Max != nil && (math.IsNaN(*f.Max) || math.IsInf(*f.Max, 0)) {
+			return fmt.Errorf("plugin %q: config field %q has invalid max bound", m.ID, k)
+		}
+		if f.Min != nil && f.Max != nil && *f.Min > *f.Max {
+			return fmt.Errorf("plugin %q: config field %q min (%v) exceeds max (%v)", m.ID, k, *f.Min, *f.Max)
+		}
+		if f.Step != nil && (math.IsNaN(*f.Step) || math.IsInf(*f.Step, 0) || *f.Step <= 0) {
+			return fmt.Errorf("plugin %q: config field %q step must be > 0", m.ID, k)
 		}
 		if f.Type == "select" && len(f.Options) == 0 {
 			return fmt.Errorf("plugin %q: select field %q must declare at least one option", m.ID, k)
@@ -255,6 +307,60 @@ func (m *Manifest) Validate() error {
 	return nil
 }
 
+func validateAllowedHostPattern(raw string) (string, error) {
+	h := strings.ToLower(strings.TrimSpace(raw))
+	if h == "" || len(h) > 253 {
+		return "", errors.New("hostname pattern must be 1..253 characters")
+	}
+	if strings.Contains(h, "://") {
+		return "", errors.New("hostname pattern must not contain a URL scheme")
+	}
+	if strings.ContainsAny(h, "/:?#@\\ \t\r\n") {
+		return "", errors.New("hostname pattern must not contain path, port, query, or userinfo")
+	}
+	checkHost := h
+	if strings.HasPrefix(h, "*.") {
+		checkHost = strings.TrimPrefix(h, "*.")
+		if strings.Contains(checkHost, "*") {
+			return "", errors.New("wildcard '*' is only allowed as leading '*.domain.tld'")
+		}
+	} else if strings.Contains(h, "*") {
+		return "", errors.New("wildcard '*' is only allowed as leading '*.domain.tld'")
+	}
+
+	if ip := net.ParseIP(strings.Trim(checkHost, "[]")); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return "", errors.New("loopback, private, or unspecified IP literals are forbidden")
+		}
+		return "", errors.New("IP literals are forbidden in allowed_hosts; specify a valid DNS hostname")
+	}
+	if checkHost == "localhost" || strings.HasSuffix(checkHost, ".localhost") || strings.HasSuffix(checkHost, ".local") {
+		return "", errors.New("loopback or local hostnames are forbidden")
+	}
+
+	labels := strings.Split(checkHost, ".")
+	if len(labels) < 2 {
+		return "", errors.New("hostname must be a qualified domain (e.g. api.example.com or *.example.com)")
+	}
+	for _, lbl := range labels {
+		if !validDNSLabelRe.MatchString(lbl) {
+			return "", fmt.Errorf("invalid DNS label %q", lbl)
+		}
+	}
+	tld := labels[len(labels)-1]
+	allDigits := true
+	for i := 0; i < len(tld); i++ {
+		if tld[i] < '0' || tld[i] > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits || len(tld) < 2 {
+		return "", fmt.Errorf("invalid top-level domain %q", tld)
+	}
+	return h, nil
+}
+
 func validatePermissionToken(perm string) error {
 	p := strings.TrimSpace(perm)
 	switch {
@@ -262,17 +368,20 @@ func validatePermissionToken(perm string) error {
 		return nil
 	case p == "ui:slots" || (strings.HasPrefix(p, "slots:") && allowedSlotNames[strings.TrimPrefix(p, "slots:")]):
 		return nil
-	case p == "hooks:*" || strings.HasPrefix(p, "hooks:"):
-		if len(strings.TrimPrefix(p, "hooks:")) == 0 {
-			return errors.New("empty hooks permission target")
+	case p == "hooks:*":
+		return nil
+	case strings.HasPrefix(p, "hooks:"):
+		target := strings.TrimPrefix(p, "hooks:")
+		if !validHookNameRe.MatchString(target) {
+			return fmt.Errorf("invalid hooks permission target %q", target)
 		}
 		return nil
-	case p == "http:routes" || p == "http:outbound" || p == "net:http":
+	case p == "http:routes" || p == "http:outbound" || p == "net:http" || p == "http:raw_headers" || p == "raw_headers":
 		return nil
 	case strings.HasPrefix(p, "http.outbound:"):
 		host := strings.TrimSpace(strings.TrimPrefix(p, "http.outbound:"))
-		if host == "" || strings.ContainsAny(host, "/:@ ") {
-			return fmt.Errorf("invalid outbound host pattern %q", host)
+		if _, err := validateAllowedHostPattern(host); err != nil {
+			return fmt.Errorf("invalid outbound host pattern %q: %w", host, err)
 		}
 		return nil
 	case p == "cron" || p == "articles:read_protected" || p == "crypto" || p == "site:read" || p == "ratelimit":
@@ -442,7 +551,11 @@ func (m *Manifest) ValidateAndMergeConfig(
 		}
 		if existingPublic != nil {
 			if prev, exists := existingPublic[f.Key]; exists {
-				mergedPublic[f.Key] = prev
+				if cleanPrev, cErr := coerceConfigValue(f, prev); cErr == nil {
+					mergedPublic[f.Key] = cleanPrev
+				} else {
+					mergedPublic[f.Key] = prev
+				}
 				continue
 			}
 		}
@@ -493,12 +606,33 @@ func (m *Manifest) ValidateAndMergeConfig(
 			continue
 		}
 		val, exists := mergedPublic[f.Key]
-		if !exists || val == nil || (f.Type != "boolean" && f.Type != "number" && strings.TrimSpace(fmt.Sprint(val)) == "") {
+		if !exists || val == nil {
+			return nil, nil, fmt.Errorf("plugin %q: required field %q cannot be empty", m.ID, f.Key)
+		}
+		if f.Type == "sortable_list" {
+			if xs, ok := val.([]string); !ok || len(xs) == 0 {
+				return nil, nil, fmt.Errorf("plugin %q: required field %q cannot be empty", m.ID, f.Key)
+			}
+			continue
+		}
+		if f.Type != "boolean" && f.Type != "number" && strings.TrimSpace(fmt.Sprint(val)) == "" {
 			return nil, nil, fmt.Errorf("plugin %q: required field %q cannot be empty", m.ID, f.Key)
 		}
 	}
 
 	return mergedPublic, mergedSecrets, nil
+}
+
+func stripASCIIControlsString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != 0x7f {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 func coerceConfigValue(field ConfigField, raw any) (any, error) {
@@ -507,6 +641,9 @@ func coerceConfigValue(field ConfigField, raw any) (any, error) {
 		s, ok := raw.(string)
 		if !ok {
 			return nil, errors.New("expected string")
+		}
+		if field.Min != nil && float64(len([]rune(s))) < *field.Min {
+			return nil, fmt.Errorf("must be at least %.0f characters", *field.Min)
 		}
 		if field.Max != nil && float64(len([]rune(s))) > *field.Max {
 			return nil, fmt.Errorf("exceeds max length %.0f", *field.Max)
@@ -518,8 +655,8 @@ func coerceConfigValue(field ConfigField, raw any) (any, error) {
 		if !ok {
 			return nil, errors.New("expected color string")
 		}
-		s = strings.TrimSpace(s)
-		if len(s) > 64 || strings.ContainsAny(s, ";<>{}\"\\") {
+		s = strings.TrimSpace(stripASCIIControlsString(s))
+		if len(s) > 64 || strings.ContainsAny(s, ";<>{}\"'\\") {
 			return nil, errors.New("invalid CSS color value")
 		}
 		return s, nil
@@ -529,12 +666,15 @@ func coerceConfigValue(field ConfigField, raw any) (any, error) {
 		if !ok {
 			return nil, errors.New("expected URL string")
 		}
-		s = strings.TrimSpace(s)
+		s = strings.TrimSpace(stripASCIIControlsString(s))
 		if s == "" {
 			return "", nil
 		}
-		// Allow site-relative "/..." or absolute http(s) URLs; strictly block javascript:/data:
-		if strings.HasPrefix(s, "/") && !strings.HasPrefix(s, "//") {
+		// Allow single-slash site-relative "/..." or absolute http(s) URLs; strictly block //, /\, javascript:, data:
+		if strings.HasPrefix(s, "/") {
+			if strings.HasPrefix(s, "//") || strings.HasPrefix(s, "/\\") {
+				return nil, errors.New("protocol-relative URLs are not allowed")
+			}
 			return s, nil
 		}
 		u, err := url.Parse(s)
@@ -568,6 +708,9 @@ func coerceConfigValue(field ConfigField, raw any) (any, error) {
 		default:
 			return nil, errors.New("expected number")
 		}
+		if math.IsNaN(num) || math.IsInf(num, 0) {
+			return nil, errors.New("invalid number")
+		}
 		if field.Min != nil && num < *field.Min {
 			return nil, fmt.Errorf("must be >= %v", *field.Min)
 		}
@@ -587,6 +730,45 @@ func coerceConfigValue(field ConfigField, raw any) (any, error) {
 			}
 		}
 		return nil, fmt.Errorf("value %q is not in allowed options", s)
+
+	case "sortable_list":
+		var rawItems []string
+		switch xs := raw.(type) {
+		case []string:
+			rawItems = append(rawItems, xs...)
+		case []any:
+			rawItems = make([]string, 0, len(xs))
+			for _, item := range xs {
+				s, ok := item.(string)
+				if !ok {
+					return nil, errors.New("sortable_list items must be strings")
+				}
+				rawItems = append(rawItems, s)
+			}
+		default:
+			return nil, errors.New("expected array of strings for sortable_list")
+		}
+		if len(rawItems) > 128 {
+			return nil, errors.New("sortable_list exceeds 128 items")
+		}
+		allowedOpts := make(map[string]bool, len(field.Options))
+		for _, opt := range field.Options {
+			allowedOpts[opt.Value] = true
+		}
+		seen := make(map[string]bool, len(rawItems))
+		out := make([]string, 0, len(rawItems))
+		for _, it := range rawItems {
+			clean := strings.TrimSpace(stripASCIIControlsString(it))
+			if clean == "" || seen[clean] {
+				continue
+			}
+			if len(allowedOpts) > 0 && !allowedOpts[clean] {
+				return nil, fmt.Errorf("value %q is not in allowed options", clean)
+			}
+			seen[clean] = true
+			out = append(out, clean)
+		}
+		return out, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported type %q", field.Type)
