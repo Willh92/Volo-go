@@ -1625,5 +1625,10 @@
   "ed.sc_book_pick": "Pick Single Book to Embed (:::book)…",
   "ed.sync_scroll": "Sync Split Scroll",
   "ed.lock_user_ph": "Visible to signed-in readers…",
+  "ed.record_toggle": "Start / Stop Recording",
+  "ed.record_stop": "Stop & Insert Recording ({time})",
+  "ed.record_started": "Recording started — click microphone again to stop & insert",
+  "ed.record_unsupported": "Microphone recording requires HTTPS or localhost in this browser",
+  "ed.record_denied": "Microphone access denied — please check browser permissions",
   "ui.cmdk_hint": "↑↓ Navigate · Enter Open · Esc Close"
 }

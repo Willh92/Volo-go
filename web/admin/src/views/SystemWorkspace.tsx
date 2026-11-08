@@ -30,6 +30,7 @@ import {
   UploadButton,
   UploadProgressBar,
   useDebouncedValue,
+  useFlipList,
 } from "../components/UIControls";
 import {
   availableLocalesSig,
@@ -320,6 +321,9 @@ export function SystemWorkspace({
   const [geoCircuitEnabled, setGeoCircuitEnabled] = useState<boolean>(true);
   const [geoModalOpen, setGeoModalOpen] = useState(false);
   const [editingGeoId, setEditingGeoId] = useState<string | null>(null);
+  const [movingGeo, setMovingGeo] = useState(false);
+  const geoFlip = useFlipList<HTMLTableSectionElement>();
+  const socialFlip = useFlipList<HTMLDivElement>();
   const [geoForm, setGeoForm] = useState({
     name: "Geo Rule",
     action: "deny",
@@ -744,21 +748,51 @@ export function SystemWorkspace({
   };
 
   const moveGeoRule = async (ruleId: string, delta: -1 | 1) => {
+    if (movingGeo) return;
     const idx = geoRules.findIndex((r) => r.id === ruleId);
     const targetIdx = idx + delta;
     if (idx < 0 || targetIdx < 0 || targetIdx >= geoRules.length) return;
-    const cur = geoRules[idx];
-    const adj = geoRules[targetIdx];
-    let curSort = typeof cur.sort_order === "number" ? cur.sort_order : (idx + 1) * 10;
-    let adjSort = typeof adj.sort_order === "number" ? adj.sort_order : (targetIdx + 1) * 10;
-    if (curSort === adjSort) {
-      adjSort = curSort + delta * 10;
-    }
-    try {
-      await Promise.all([
-        apiFetch(`/api/admin/security/geo-rules/${encodeURIComponent(cur.id)}`, {
-          method: "PUT",
-          body: JSON.stringify({
+
+    const prevRules = geoRules;
+    const orders = geoRules.map((r, i) => (typeof r.sort_order === "number" ? r.sort_order : (i + 1) * 10));
+    const hasTies = new Set(orders).size < geoRules.length;
+    const reordered = [...geoRules];
+    const [moved] = reordered.splice(idx, 1);
+    reordered.splice(targetIdx, 0, moved);
+
+    const updates: Array<{ id: string; body: any }> = [];
+    let nextRules: any[];
+    if (hasTies) {
+      nextRules = reordered.map((r, i) => {
+        const desired = (i + 1) * 10;
+        if (r.sort_order !== desired) {
+          updates.push({
+            id: r.id,
+            body: {
+              name: r.name || "Geo Rule",
+              action: r.action || "deny",
+              countries: r.countries || "",
+              regions: r.regions || "",
+              sort_order: desired,
+              is_enabled: r.is_enabled !== false,
+              on_miss: r.on_miss || "next",
+            },
+          });
+        }
+        return { ...r, sort_order: desired };
+      });
+    } else {
+      const cur = geoRules[idx];
+      const adj = geoRules[targetIdx];
+      const curSort = orders[idx];
+      const adjSort = orders[targetIdx];
+      nextRules = [...reordered];
+      nextRules[idx] = { ...adj, sort_order: curSort };
+      nextRules[targetIdx] = { ...cur, sort_order: adjSort };
+      updates.push(
+        {
+          id: cur.id,
+          body: {
             name: cur.name || "Geo Rule",
             action: cur.action || "deny",
             countries: cur.countries || "",
@@ -766,11 +800,11 @@ export function SystemWorkspace({
             sort_order: adjSort,
             is_enabled: cur.is_enabled !== false,
             on_miss: cur.on_miss || "next",
-          }),
-        }),
-        apiFetch(`/api/admin/security/geo-rules/${encodeURIComponent(adj.id)}`, {
-          method: "PUT",
-          body: JSON.stringify({
+          },
+        },
+        {
+          id: adj.id,
+          body: {
             name: adj.name || "Geo Rule",
             action: adj.action || "deny",
             countries: adj.countries || "",
@@ -778,12 +812,30 @@ export function SystemWorkspace({
             sort_order: curSort,
             is_enabled: adj.is_enabled !== false,
             on_miss: adj.on_miss || "next",
-          }),
-        }),
-      ]);
-      void loadSub();
+          },
+        }
+      );
+    }
+
+    setMovingGeo(true);
+    geoFlip.captureFlip();
+    setGeoRules(nextRules);
+
+    try {
+      await Promise.all(
+        updates.map((u) =>
+          apiFetch(`/api/admin/security/geo-rules/${encodeURIComponent(u.id)}`, {
+            method: "PUT",
+            body: JSON.stringify(u.body),
+          })
+        )
+      );
     } catch (err: any) {
+      setGeoRules(prevRules);
       showToast(err.message);
+      void loadSub();
+    } finally {
+      setMovingGeo(false);
     }
   };
 
@@ -1157,75 +1209,94 @@ export function SystemWorkspace({
                   </div>
                 </div>
               </div>
-              {Array.isArray(domains.site?.social_links) &&
-                domains.site.social_links.map((s: any, idx: number, arr: any[]) => (
-                  <div key={s.id || idx} class="volo-input-row" style={{ marginTop: "6px", flexWrap: "wrap" }}>
-                    <NavIconPreview icon={s.icon || String(s.label || "").toLowerCase()} fallbackLabel={s.label} size={15} />
-                    <strong>{s.label}</strong>
-                    <span
-                      class="volo-help"
-                      style={{ flex: "1 1 140px", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                    >
-                      {s.url}
-                    </span>
-                    <div class="volo-row-actions">
-                      <button
-                        type="button"
-                        class="volo-act-btn"
-                        disabled={idx <= 0}
-                        onClick={() => {
-                          const next = [...arr];
-                          const [moved] = next.splice(idx, 1);
-                          next.splice(idx - 1, 0, moved);
-                          setDomField("site", "social_links", next);
-                          setSocialDirty(true);
-                        }}
-                      >
-                        ↑
-                      </button>
-                      <button
-                        type="button"
-                        class="volo-act-btn"
-                        disabled={idx >= arr.length - 1}
-                        onClick={() => {
-                          const next = [...arr];
-                          const [moved] = next.splice(idx, 1);
-                          next.splice(idx + 1, 0, moved);
-                          setDomField("site", "social_links", next);
-                          setSocialDirty(true);
-                        }}
-                      >
-                        ↓
-                      </button>
-                      <button
-                        type="button"
-                        class="volo-act-btn"
-                        onClick={() => {
-                          setEditingSocialIdx(idx);
-                          setSocialDraft({ label: s.label || "", url: s.url || "" });
-                        }}
-                      >
-                        {t("common.edit")}
-                      </button>
-                      <button
-                        type="button"
-                        class="volo-act-btn danger"
-                        onClick={async () => {
-                          if (!(await openConfirm({ message: t("sys.confirm_del_social", { name: s.label }), danger: true }))) return;
-                          const next = domains.site.social_links.filter((_: any, i: number) => i !== idx);
-                          setDomField("site", "social_links", next);
-                          if (editingSocialIdx === idx) {
-                            setEditingSocialIdx(null);
-                            setSocialDraft({ label: "", url: "" });
-                          }
-                          setSocialDirty(true);
-                        }}
-                      >
-                        {t("common.delete")}
-                      </button>
-                    </div>
+              {Array.isArray(domains.site?.social_links) && domains.site.social_links.length > 0 && (() => {
+                const seenKeys = new Map<string, number>();
+                return (
+                  <div ref={socialFlip.containerRef}>
+                    {domains.site.social_links.map((s: any, idx: number, arr: any[]) => {
+                      const rawBase = String(s.id || `${s.label || ""}::${s.url || ""}`);
+                      const dup = (seenKeys.get(rawBase) || 0) + 1;
+                      seenKeys.set(rawBase, dup);
+                      const flipKey = dup > 1 ? `${rawBase}#${dup}` : rawBase;
+                      return (
+                        <div
+                          key={flipKey}
+                          data-flip-key={flipKey}
+                          class="volo-input-row"
+                          style={{ marginTop: "6px", flexWrap: "wrap" }}
+                        >
+                          <NavIconPreview icon={s.icon || String(s.label || "").toLowerCase()} fallbackLabel={s.label} size={15} />
+                          <strong>{s.label}</strong>
+                          <span
+                            class="volo-help"
+                            style={{ flex: "1 1 140px", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                          >
+                            {s.url}
+                          </span>
+                          <div class="volo-row-actions">
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              disabled={idx <= 0}
+                              onClick={() => {
+                                socialFlip.captureFlip();
+                                const next = [...arr];
+                                const [moved] = next.splice(idx, 1);
+                                next.splice(idx - 1, 0, moved);
+                                setDomField("site", "social_links", next);
+                                setSocialDirty(true);
+                              }}
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              disabled={idx >= arr.length - 1}
+                              onClick={() => {
+                                socialFlip.captureFlip();
+                                const next = [...arr];
+                                const [moved] = next.splice(idx, 1);
+                                next.splice(idx + 1, 0, moved);
+                                setDomField("site", "social_links", next);
+                                setSocialDirty(true);
+                              }}
+                            >
+                              ↓
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              onClick={() => {
+                                setEditingSocialIdx(idx);
+                                setSocialDraft({ label: s.label || "", url: s.url || "" });
+                              }}
+                            >
+                              {t("common.edit")}
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn danger"
+                              onClick={async () => {
+                                if (!(await openConfirm({ message: t("sys.confirm_del_social", { name: s.label }), danger: true }))) return;
+                                const next = domains.site.social_links.filter((_: any, i: number) => i !== idx);
+                                setDomField("site", "social_links", next);
+                                if (editingSocialIdx === idx) {
+                                  setEditingSocialIdx(null);
+                                  setSocialDraft({ label: "", url: "" });
+                                }
+                                setSocialDirty(true);
+                              }}
+                            >
+                              {t("common.delete")}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
-                ))}
+                );
+              })()}
               {socialDirty && (
                 <div class="volo-help" style={{ marginTop: "8px", color: "var(--volo-warn)" }}>
                   {t("sys.social_unsaved_hint")}
@@ -3894,8 +3965,8 @@ export function SystemWorkspace({
                       <th class="col-act col-act-th">{t("art.actions")}</th>
                     </tr>
                   </thead>
-                  <tbody>
-                    {loading ? (
+                  <tbody ref={geoFlip.containerRef}>
+                    {loading && geoRules.length === 0 ? (
                       <TableSkeleton cols={4} rows={4} />
                     ) : geoPaged.slice.length === 0 ? (
                       <ConsoleEmpty colSpan={4} />
@@ -3914,7 +3985,7 @@ export function SystemWorkspace({
                                 ? t("sys.geo_miss_challenge")
                                 : t("sys.geo_deny");
                         return (
-                          <tr key={g.id}>
+                          <tr key={g.id} data-flip-key={g.id}>
                             <td data-label={t("art.status")}>
                               <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "8px" }}>
                                 <SwitchToggle
@@ -3948,7 +4019,7 @@ export function SystemWorkspace({
                                 <button
                                   type="button"
                                   class="volo-act-btn"
-                                  disabled={!canMove || fullIdx <= 0}
+                                  disabled={!canMove || movingGeo || fullIdx <= 0}
                                   title={!canMove ? t("ui.sort_disabled_filtered") : t("cnt.move_up")}
                                   aria-label={t("cnt.move_up")}
                                   onClick={() => void moveGeoRule(g.id, -1)}
@@ -3958,7 +4029,7 @@ export function SystemWorkspace({
                                 <button
                                   type="button"
                                   class="volo-act-btn"
-                                  disabled={!canMove || fullIdx < 0 || fullIdx >= geoRules.length - 1}
+                                  disabled={!canMove || movingGeo || fullIdx < 0 || fullIdx >= geoRules.length - 1}
                                   title={!canMove ? t("ui.sort_disabled_filtered") : t("cnt.move_down")}
                                   aria-label={t("cnt.move_down")}
                                   onClick={() => void moveGeoRule(g.id, 1)}

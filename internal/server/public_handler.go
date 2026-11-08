@@ -433,10 +433,31 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 
 func isInlineSafeUploadExt(ext string) bool {
 	switch strings.ToLower(ext) {
-	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav":
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav", ".weba", ".webm", ".mp4":
 		return true
 	default:
 		return false
+	}
+}
+
+func explicitInlineMediaMIME(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".weba":
+		return "audio/webm"
+	case ".m4a":
+		return "audio/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".ogg":
+		return "audio/ogg"
+	case ".wav":
+		return "audio/wav"
+	case ".webm":
+		return "video/webm"
+	case ".mp4":
+		return "video/mp4"
+	default:
+		return ""
 	}
 }
 
@@ -481,10 +502,13 @@ func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir str
 	w.Header().Set("ETag", etag)
 
 	name := st.Name()
-	if !isInlineSafeUploadExt(filepath.Ext(name)) {
+	ext := filepath.Ext(name)
+	if !isInlineSafeUploadExt(ext) {
 		safeName := contentDispositionSanitizer.Replace(name)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, safeName))
+	} else if mimeHdr := explicitInlineMediaMIME(ext); mimeHdr != "" {
+		w.Header().Set("Content-Type", mimeHdr)
 	}
 
 	// Zero-copy HTTP Range / 206 Partial Content streaming via stdlib http.ServeContent!

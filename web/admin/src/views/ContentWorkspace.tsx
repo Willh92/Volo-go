@@ -32,6 +32,7 @@ import {
   UploadButton,
   UploadProgressBar,
   useDebouncedValue,
+  useFlipList,
   usePointerSortableList,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
@@ -187,6 +188,8 @@ export function ContentWorkspace({
   const debouncedCatQuery = useDebouncedValue(catQuery, 250);
   const [catModalOpen, setCatModalOpen] = useState(false);
   const [catForm, setCatForm] = useState({ ...EMPTY_CAT });
+  const [swappingCat, setSwappingCat] = useState(false);
+  const catFlip = useFlipList<HTMLTableSectionElement>();
 
   // Tags (1,000+ scale + Unused filter + Merge modal)
   const [tags, setTags] = useState<any[]>([]);
@@ -218,6 +221,7 @@ export function ContentWorkspace({
   const [serForm, setSerForm] = useState({ ...EMPTY_SER });
   const [serArtFilter, setSerArtFilter] = useState("");
   const debouncedSerArtFilter = useDebouncedValue(serArtFilter, 250);
+  const serFlip = useFlipList<HTMLDivElement>();
 
   // Books + Manual Chapters tree modal
   const [books, setBooks] = useState<any[]>([]);
@@ -226,6 +230,8 @@ export function ContentWorkspace({
   const debouncedBookQuery = useDebouncedValue(bookQuery, 250);
   const [bookModalOpen, setBookModalOpen] = useState(false);
   const [bookForm, setBookForm] = useState({ ...EMPTY_BOOK });
+  const [swappingBook, setSwappingBook] = useState(false);
+  const bookFlip = useFlipList<HTMLTableSectionElement>();
   const [chapModalOpen, setChapModalOpen] = useState(false);
   const [chapBook, setChapBook] = useState<any | null>(null);
   const [chapItems, setChapItems] = useState<BookChapterDraft[]>([]);
@@ -836,39 +842,132 @@ export function ContentWorkspace({
     }
   };
 
+  const fetchAllForReorder = async (endpoint: string): Promise<any[]> => {
+    const perPage = 200;
+    const first = await apiFetch<{ items: any[]; total?: number }>(`${endpoint}?page=1&per_page=${perPage}`);
+    const all = [...(first.items || [])];
+    const total = typeof first.total === "number" ? first.total : all.length;
+    const maxPages = Math.min(20, Math.ceil(total / perPage));
+    for (let p = 2; p <= maxPages; p++) {
+      const next = await apiFetch<{ items: any[] }>(`${endpoint}?page=${p}&per_page=${perPage}`);
+      if (!next.items?.length) break;
+      all.push(...next.items);
+    }
+    return all;
+  };
+
   const swapCatOrder = async (idx: number, dir: -1 | 1) => {
+    if (swappingCat || catQuery.trim() || idx < 0 || idx >= categories.length) return;
+    const safePage = Math.max(1, pageIdx);
+    const baseOffset = (safePage - 1) * pageSize;
+    const globalIdx = baseOffset + idx;
+    const totalCats = Math.max(subTotal, baseOffset + categories.length);
+    if ((dir === -1 && globalIdx <= 0) || (dir === 1 && globalIdx >= totalCats - 1)) return;
+
     const targetIdx = idx + dir;
-    if (targetIdx < 0 || targetIdx >= categories.length) return;
-    const baseOffset = Math.max(0, (pageIdx - 1) * pageSize);
-    const orders = categories.map((c) => Number(c.sort_order ?? 0));
-    const hasTies = new Set(orders).size < categories.length;
-    try {
+    const prevCats = categories;
+    setSwappingCat(true);
+
+    if (targetIdx >= 0 && targetIdx < categories.length) {
+      const orders = categories.map((c) => Number(c.sort_order ?? 0));
+      const hasTies = new Set(orders).size < categories.length;
+      const reordered = [...categories];
+      [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
+      const updates: Array<{ id: string; body: any }> = [];
+      let nextCats: any[];
       if (hasTies) {
-        const reordered = [...categories];
-        [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
-        await Promise.all(
-          reordered.map((item, i) => {
-            const desired = (baseOffset + i + 1) * 10;
-            if (Number(item.sort_order) === desired) return Promise.resolve();
-            return apiFetch(`/api/admin/categories/${item.id}`, {
-              method: "PUT",
-              body: JSON.stringify({ ...item, sort_order: desired }),
-            });
-          })
-        );
+        nextCats = reordered.map((item, i) => {
+          const desired = (baseOffset + i + 1) * 10;
+          if (Number(item.sort_order) !== desired) {
+            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
+          }
+          return { ...item, sort_order: desired };
+        });
       } else {
         const a = categories[idx];
         const b = categories[targetIdx];
         const orderA = Number(a.sort_order ?? (baseOffset + idx + 1) * 10);
         const orderB = Number(b.sort_order ?? (baseOffset + targetIdx + 1) * 10);
-        await Promise.all([
-          apiFetch(`/api/admin/categories/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: orderB }) }),
-          apiFetch(`/api/admin/categories/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: orderA }) }),
-        ]);
+        nextCats = [...reordered];
+        nextCats[idx] = { ...b, sort_order: orderA };
+        nextCats[targetIdx] = { ...a, sort_order: orderB };
+        updates.push(
+          { id: a.id, body: { ...a, sort_order: orderB } },
+          { id: b.id, body: { ...b, sort_order: orderA } }
+        );
       }
-      void loadSub();
+      catFlip.captureFlip();
+      setCategories(nextCats);
+      try {
+        await Promise.all(
+          updates.map((u) =>
+            apiFetch(`/api/admin/categories/${u.id}`, {
+              method: "PUT",
+              body: JSON.stringify(u.body),
+            })
+          )
+        );
+      } catch (err: any) {
+        setCategories(prevCats);
+        showToast(err.message);
+        void loadSub();
+      } finally {
+        setSwappingCat(false);
+      }
+      return;
+    }
+
+    // Cross-page move across adjacent page boundary
+    try {
+      const all = await fetchAllForReorder("/api/admin/categories");
+      const curItem = categories[idx];
+      const curAllIdx = all.findIndex((x) => x.id === curItem.id);
+      const adjAllIdx = curAllIdx + dir;
+      if (curAllIdx < 0 || adjAllIdx < 0 || adjAllIdx >= all.length) return;
+      const allOrders = all.map((c) => Number(c.sort_order ?? 0));
+      const hasTies = new Set(allOrders).size < all.length;
+      const reorderedAll = [...all];
+      [reorderedAll[curAllIdx], reorderedAll[adjAllIdx]] = [reorderedAll[adjAllIdx], reorderedAll[curAllIdx]];
+      const updates: Array<{ id: string; body: any }> = [];
+      let normalizedAll: any[];
+      if (hasTies) {
+        normalizedAll = reorderedAll.map((item, i) => {
+          const desired = (i + 1) * 10;
+          if (Number(item.sort_order) !== desired) {
+            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
+          }
+          return { ...item, sort_order: desired };
+        });
+      } else {
+        const a = all[curAllIdx];
+        const b = all[adjAllIdx];
+        const orderA = Number(a.sort_order ?? (curAllIdx + 1) * 10);
+        const orderB = Number(b.sort_order ?? (adjAllIdx + 1) * 10);
+        normalizedAll = [...reorderedAll];
+        normalizedAll[curAllIdx] = { ...b, sort_order: orderA };
+        normalizedAll[adjAllIdx] = { ...a, sort_order: orderB };
+        updates.push(
+          { id: a.id, body: { ...a, sort_order: orderB } },
+          { id: b.id, body: { ...b, sort_order: orderA } }
+        );
+      }
+      catFlip.captureFlip();
+      setCategories(normalizedAll.slice(baseOffset, baseOffset + pageSize));
+      setSubTotal(normalizedAll.length);
+      await Promise.all(
+        updates.map((u) =>
+          apiFetch(`/api/admin/categories/${u.id}`, {
+            method: "PUT",
+            body: JSON.stringify(u.body),
+          })
+        )
+      );
     } catch (err: any) {
+      setCategories(prevCats);
       showToast(err.message);
+      void loadSub();
+    } finally {
+      setSwappingCat(false);
     }
   };
 
@@ -973,6 +1072,7 @@ export function ContentWorkspace({
   const moveSeriesArticle = (idx: number, dir: -1 | 1) => {
     const targetIdx = idx + dir;
     if (targetIdx < 0 || targetIdx >= serForm.article_ids.length) return;
+    serFlip.captureFlip();
     const next = [...serForm.article_ids];
     [next[idx], next[targetIdx]] = [next[targetIdx], next[idx]];
     setSerForm({ ...serForm, article_ids: next });
@@ -983,6 +1083,7 @@ export function ContentWorkspace({
     if (total <= 1 || fromIdx < 0 || fromIdx >= total) return;
     const clamped = Math.max(0, Math.min(total - 1, toIdx));
     if (clamped === fromIdx) return;
+    serFlip.captureFlip();
     const next = [...serForm.article_ids];
     const [moved] = next.splice(fromIdx, 1);
     next.splice(clamped, 0, moved);
@@ -1020,38 +1121,117 @@ export function ContentWorkspace({
   };
 
   const swapBookOrder = async (idx: number, dir: -1 | 1) => {
+    if (swappingBook || bookQuery.trim() || bookFilter || idx < 0 || idx >= books.length) return;
+    const safePage = Math.max(1, pageIdx);
+    const baseOffset = (safePage - 1) * pageSize;
+    const globalIdx = baseOffset + idx;
+    const totalBooks = Math.max(subTotal, baseOffset + books.length);
+    if ((dir === -1 && globalIdx <= 0) || (dir === 1 && globalIdx >= totalBooks - 1)) return;
+
     const targetIdx = idx + dir;
-    if (targetIdx < 0 || targetIdx >= books.length) return;
-    const baseOffset = Math.max(0, (pageIdx - 1) * pageSize);
-    const orders = books.map((b) => Number(b.sort_order ?? 0));
-    const hasTies = new Set(orders).size < books.length;
-    try {
+    const prevBooks = books;
+    setSwappingBook(true);
+
+    if (targetIdx >= 0 && targetIdx < books.length) {
+      const orders = books.map((b) => Number(b.sort_order ?? 0));
+      const hasTies = new Set(orders).size < books.length;
+      const reordered = [...books];
+      [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
+      const updates: Array<{ id: string; body: any }> = [];
+      let nextBooks: any[];
       if (hasTies) {
-        const reordered = [...books];
-        [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
-        await Promise.all(
-          reordered.map((item, i) => {
-            const desired = (baseOffset + i + 1) * 10;
-            if (Number(item.sort_order) === desired) return Promise.resolve();
-            return apiFetch(`/api/admin/books/${item.id}`, {
-              method: "PUT",
-              body: JSON.stringify({ ...item, sort_order: desired }),
-            });
-          })
-        );
+        nextBooks = reordered.map((item, i) => {
+          const desired = (baseOffset + i + 1) * 10;
+          if (Number(item.sort_order) !== desired) {
+            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
+          }
+          return { ...item, sort_order: desired };
+        });
       } else {
         const a = books[idx];
         const b = books[targetIdx];
         const orderA = Number(a.sort_order ?? (baseOffset + idx + 1) * 10);
         const orderB = Number(b.sort_order ?? (baseOffset + targetIdx + 1) * 10);
-        await Promise.all([
-          apiFetch(`/api/admin/books/${a.id}`, { method: "PUT", body: JSON.stringify({ ...a, sort_order: orderB }) }),
-          apiFetch(`/api/admin/books/${b.id}`, { method: "PUT", body: JSON.stringify({ ...b, sort_order: orderA }) }),
-        ]);
+        nextBooks = [...reordered];
+        nextBooks[idx] = { ...b, sort_order: orderA };
+        nextBooks[targetIdx] = { ...a, sort_order: orderB };
+        updates.push(
+          { id: a.id, body: { ...a, sort_order: orderB } },
+          { id: b.id, body: { ...b, sort_order: orderA } }
+        );
       }
-      void loadSub();
+      bookFlip.captureFlip();
+      setBooks(nextBooks);
+      try {
+        await Promise.all(
+          updates.map((u) =>
+            apiFetch(`/api/admin/books/${u.id}`, {
+              method: "PUT",
+              body: JSON.stringify(u.body),
+            })
+          )
+        );
+      } catch (err: any) {
+        setBooks(prevBooks);
+        showToast(err.message);
+        void loadSub();
+      } finally {
+        setSwappingBook(false);
+      }
+      return;
+    }
+
+    // Cross-page move across adjacent page boundary
+    try {
+      const all = await fetchAllForReorder("/api/admin/books");
+      const curItem = books[idx];
+      const curAllIdx = all.findIndex((x) => x.id === curItem.id);
+      const adjAllIdx = curAllIdx + dir;
+      if (curAllIdx < 0 || adjAllIdx < 0 || adjAllIdx >= all.length) return;
+      const allOrders = all.map((b) => Number(b.sort_order ?? 0));
+      const hasTies = new Set(allOrders).size < all.length;
+      const reorderedAll = [...all];
+      [reorderedAll[curAllIdx], reorderedAll[adjAllIdx]] = [reorderedAll[adjAllIdx], reorderedAll[curAllIdx]];
+      const updates: Array<{ id: string; body: any }> = [];
+      let normalizedAll: any[];
+      if (hasTies) {
+        normalizedAll = reorderedAll.map((item, i) => {
+          const desired = (i + 1) * 10;
+          if (Number(item.sort_order) !== desired) {
+            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
+          }
+          return { ...item, sort_order: desired };
+        });
+      } else {
+        const a = all[curAllIdx];
+        const b = all[adjAllIdx];
+        const orderA = Number(a.sort_order ?? (curAllIdx + 1) * 10);
+        const orderB = Number(b.sort_order ?? (adjAllIdx + 1) * 10);
+        normalizedAll = [...reorderedAll];
+        normalizedAll[curAllIdx] = { ...b, sort_order: orderA };
+        normalizedAll[adjAllIdx] = { ...a, sort_order: orderB };
+        updates.push(
+          { id: a.id, body: { ...a, sort_order: orderB } },
+          { id: b.id, body: { ...b, sort_order: orderA } }
+        );
+      }
+      bookFlip.captureFlip();
+      setBooks(normalizedAll.slice(baseOffset, baseOffset + pageSize));
+      setSubTotal(normalizedAll.length);
+      await Promise.all(
+        updates.map((u) =>
+          apiFetch(`/api/admin/books/${u.id}`, {
+            method: "PUT",
+            body: JSON.stringify(u.body),
+          })
+        )
+      );
     } catch (err: any) {
+      setBooks(prevBooks);
       showToast(err.message);
+      void loadSub();
+    } finally {
+      setSwappingBook(false);
     }
   };
 
@@ -1106,29 +1286,42 @@ export function ContentWorkspace({
     }
   };
 
+  const clampChapDepth = (v: unknown) => Math.max(0, Math.min(3, Number(v) || 0));
+
+  const canMoveChapUp = (items: BookChapterDraft[], idx: number): boolean => {
+    if (idx <= 0 || idx >= items.length) return false;
+    const d = clampChapDepth(items[idx].depth);
+    return clampChapDepth(items[idx - 1].depth) >= d;
+  };
+
+  const canMoveChapDown = (items: BookChapterDraft[], idx: number): boolean => {
+    if (idx < 0 || idx >= items.length - 1) return false;
+    const d = clampChapDepth(items[idx].depth);
+    let blockEnd = idx + 1;
+    while (blockEnd < items.length && clampChapDepth(items[blockEnd].depth) > d) {
+      blockEnd++;
+    }
+    return blockEnd < items.length && clampChapDepth(items[blockEnd].depth) === d;
+  };
+
   // Move entire chapter subtree (node + contiguous deeper descendants) past adjacent sibling subtree
   const moveChapterSubtree = (idx: number, dir: -1 | 1) => {
+    if (dir === -1 ? !canMoveChapUp(chapItems, idx) : !canMoveChapDown(chapItems, idx)) return;
     chapSortHook.captureFlip();
     setChapItems((prev) => {
       if (idx < 0 || idx >= prev.length) return prev;
-      const d = Math.max(0, Math.min(3, Number(prev[idx].depth) || 0));
+      const d = clampChapDepth(prev[idx].depth);
       let blockEnd = idx + 1;
-      while (blockEnd < prev.length && Math.max(0, Math.min(3, Number(prev[blockEnd].depth) || 0)) > d) {
+      while (blockEnd < prev.length && clampChapDepth(prev[blockEnd].depth) > d) {
         blockEnd++;
       }
       if (dir === -1) {
-        if (idx === 0) return prev;
+        if (!canMoveChapUp(prev, idx)) return prev;
         let prevStart = idx - 1;
-        while (prevStart > 0 && Math.max(0, Math.min(3, Number(prev[prevStart].depth) || 0)) > d) {
-          const pd = Math.max(0, Math.min(3, Number(prev[prevStart].depth) || 0));
-          if (pd <= d) break;
+        while (prevStart > 0 && clampChapDepth(prev[prevStart].depth) > d) {
           prevStart--;
         }
-        const prevD = Math.max(0, Math.min(3, Number(prev[prevStart].depth) || 0));
-        if (prevD < d) {
-          // Cannot jump out above parent at lower depth; swap with immediate previous sibling/item
-          prevStart = idx - 1;
-        }
+        if (clampChapDepth(prev[prevStart].depth) < d) return prev;
         const block = prev.slice(idx, blockEnd);
         const before = prev.slice(0, prevStart);
         const mid = prev.slice(prevStart, idx);
@@ -1136,10 +1329,10 @@ export function ContentWorkspace({
         return [...before, ...block, ...mid, ...after];
       } else {
         if (blockEnd >= prev.length) return prev;
-        const nextD = Math.max(0, Math.min(3, Number(prev[blockEnd].depth) || 0));
-        if (nextD < d) return prev;
+        const nextD = clampChapDepth(prev[blockEnd].depth);
+        if (nextD !== d) return prev;
         let nextEnd = blockEnd + 1;
-        while (nextEnd < prev.length && Math.max(0, Math.min(3, Number(prev[nextEnd].depth) || 0)) > nextD) {
+        while (nextEnd < prev.length && clampChapDepth(prev[nextEnd].depth) > nextD) {
           nextEnd++;
         }
         const block = prev.slice(idx, blockEnd);
@@ -1150,18 +1343,19 @@ export function ContentWorkspace({
   };
 
   const moveChapterToTop = (idx: number) => {
+    if (!canMoveChapUp(chapItems, idx)) return;
     chapSortHook.captureFlip();
     setChapItems((prev) => {
-      if (idx <= 0 || idx >= prev.length) return prev;
-      const d = Math.max(0, Math.min(3, Number(prev[idx].depth) || 0));
+      if (!canMoveChapUp(prev, idx)) return prev;
+      const d = clampChapDepth(prev[idx].depth);
       let blockEnd = idx + 1;
-      while (blockEnd < prev.length && Math.max(0, Math.min(3, Number(prev[blockEnd].depth) || 0)) > d) {
+      while (blockEnd < prev.length && clampChapDepth(prev[blockEnd].depth) > d) {
         blockEnd++;
       }
       let targetPos = 0;
       if (d > 0) {
         let p = idx - 1;
-        while (p >= 0 && Math.max(0, Math.min(3, Number(prev[p].depth) || 0)) >= d) {
+        while (p >= 0 && clampChapDepth(prev[p].depth) >= d) {
           p--;
         }
         targetPos = p + 1;
@@ -1617,7 +1811,7 @@ export function ContentWorkspace({
                   <th class="col-act col-act-th">{t("art.actions")}</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody ref={catFlip.containerRef}>
                 {loading && categories.length === 0 ? (
                   <TableSkeleton cols={4} />
                 ) : displayCats.length === 0 ? (
@@ -1625,8 +1819,12 @@ export function ContentWorkspace({
                 ) : (
                   displayCats.map((c) => {
                     const absIdx = categories.findIndex((x) => x.id === c.id);
+                    const baseOffset = (Math.max(1, pageIdx) - 1) * pageSize;
+                    const globalIdx = absIdx >= 0 ? baseOffset + absIdx : -1;
+                    const totalCats = Math.max(subTotal, baseOffset + categories.length);
+                    const isCatFiltered = Boolean(catQuery.trim());
                     return (
-                      <tr key={c.id}>
+                      <tr key={c.id} data-flip-key={c.id}>
                         <td class="col-fluid" data-label={t("cnt.col_name")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">{c.name}</div>
@@ -1648,8 +1846,8 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={Boolean(catQuery.trim()) || absIdx <= 0}
-                              title={catQuery.trim() ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
+                              disabled={isCatFiltered || swappingCat || absIdx < 0 || globalIdx <= 0}
+                              title={isCatFiltered ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapCatOrder(absIdx, -1)}
                             >
                               ↑
@@ -1657,8 +1855,8 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={Boolean(catQuery.trim()) || absIdx < 0 || absIdx >= categories.length - 1}
-                              title={catQuery.trim() ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
+                              disabled={isCatFiltered || swappingCat || absIdx < 0 || globalIdx >= totalCats - 1}
+                              title={isCatFiltered ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapCatOrder(absIdx, 1)}
                             >
                               ↓
@@ -2285,7 +2483,7 @@ export function ContentWorkspace({
                 const selOffset = (pgSel.safePage - 1) * 15;
                 return (
                   <div style={{ marginBottom: "12px" }}>
-                    <div class="volo-subcard" style={{ maxHeight: "220px", overflowY: "auto" }}>
+                    <div ref={serFlip.containerRef} class="volo-subcard" style={{ maxHeight: "220px", overflowY: "auto" }}>
                       <div class="volo-subcard-title">
                         <span>
                           {t("cnt.ser_articles_lbl")} ({serForm.article_ids.length})
@@ -2296,7 +2494,12 @@ export function ContentWorkspace({
                         const art = knownArticlesMap[aid];
                         const titleText = art?.title || aid;
                         return (
-                          <div key={aid} class="volo-input-row volo-series-sel-row" style={{ marginBottom: "6px", minWidth: 0 }}>
+                          <div
+                            key={aid}
+                            data-flip-key={aid}
+                            class="volo-input-row volo-series-sel-row"
+                            style={{ marginBottom: "6px", minWidth: 0 }}
+                          >
                             <input
                               key={`${aid}-${idx}`}
                               type="number"
@@ -2522,7 +2725,7 @@ export function ContentWorkspace({
                   <th class="col-act col-act-th">{t("art.actions")}</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody ref={bookFlip.containerRef}>
                 {loading && books.length === 0 ? (
                   <TableSkeleton cols={4} />
                 ) : displayBooks.length === 0 ? (
@@ -2530,9 +2733,12 @@ export function ContentWorkspace({
                 ) : (
                   displayBooks.map((b) => {
                     const absIdx = books.findIndex((x) => x.id === b.id);
+                    const baseOffset = (Math.max(1, pageIdx) - 1) * pageSize;
+                    const globalIdx = absIdx >= 0 ? baseOffset + absIdx : -1;
+                    const totalBooks = Math.max(subTotal, baseOffset + books.length);
                     const isBookFiltered = Boolean(bookQuery.trim() || bookFilter);
                     return (
-                      <tr key={b.id}>
+                      <tr key={b.id} data-flip-key={b.id}>
                         <td class="col-fluid" data-label={t("cnt.book_col")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">{b.title}</div>
@@ -2561,7 +2767,7 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={isBookFiltered || absIdx <= 0}
+                              disabled={isBookFiltered || swappingBook || absIdx < 0 || globalIdx <= 0}
                               title={isBookFiltered ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapBookOrder(absIdx, -1)}
                             >
@@ -2570,7 +2776,7 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={isBookFiltered || absIdx < 0 || absIdx >= books.length - 1}
+                              disabled={isBookFiltered || swappingBook || absIdx < 0 || globalIdx >= totalBooks - 1}
                               title={isBookFiltered ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapBookOrder(absIdx, 1)}
                             >
@@ -2876,12 +3082,15 @@ export function ContentWorkspace({
                   <>
                     <div ref={chapSortHook.listRef} class="volo-chap-tree">
                       {pagedRows.slice.map(({ ch, idx, hasChildren, isCollapsed }, sliceIdx) => {
-                        const depth = Math.max(0, Math.min(3, Number(ch.depth) || 0));
+                        const depth = clampChapDepth(ch.depth);
                         const canDrag = !q && pagedRows.slice.length > 1;
+                        const canUp = !q && canMoveChapUp(chapItems, idx);
+                        const canDown = !q && canMoveChapDown(chapItems, idx);
                         const handleProps = chapSortHook.getHandleProps(sliceIdx);
                         return (
                           <div
                             key={ch._uid}
+                            data-flip-key={ch._uid}
                             data-sort-idx={sliceIdx}
                             class={`volo-chap-row volo-chap-indent ${chapSortHook.draggingIdx === sliceIdx ? "is-dragging" : ""} ${chapSortHook.grabbingIdx === sliceIdx ? "is-grabbing" : ""}`}
                             style={{ "--chap-depth": depth } as any}
@@ -3007,7 +3216,7 @@ export function ContentWorkspace({
                               <button
                                 type="button"
                                 class="volo-chap-btn"
-                                disabled={idx === 0}
+                                disabled={!canUp}
                                 title={t("app.move_top")}
                                 aria-label={t("app.move_top")}
                                 onClick={() => moveChapterToTop(idx)}
@@ -3017,7 +3226,7 @@ export function ContentWorkspace({
                               <button
                                 type="button"
                                 class="volo-chap-btn"
-                                disabled={idx === 0}
+                                disabled={!canUp}
                                 title={t("app.move_up")}
                                 onClick={() => moveChapterSubtree(idx, -1)}
                               >
@@ -3026,7 +3235,7 @@ export function ContentWorkspace({
                               <button
                                 type="button"
                                 class="volo-chap-btn"
-                                disabled={idx >= chapItems.length - 1}
+                                disabled={!canDown}
                                 title={t("app.move_down")}
                                 onClick={() => moveChapterSubtree(idx, 1)}
                               >

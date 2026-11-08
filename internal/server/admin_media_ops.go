@@ -60,6 +60,8 @@ func defaultReconcileMIMEType(ext string, sample []byte) string {
 		return "audio/ogg"
 	case ".wav":
 		return "audio/wav"
+	case ".weba":
+		return "audio/webm"
 	case ".mp4":
 		return "video/mp4"
 	case ".webm":

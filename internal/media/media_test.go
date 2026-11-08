@@ -463,6 +463,16 @@ func TestMedia_StreamingNonImageUploadsAndLinearOrphanTokenScanner(t *testing.T)
 		t.Fatalf("unexpected MP4 asset: %+v", mp4Asset)
 	}
 
+	ebmlHeader := []byte{0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81, 0x01}
+	webaPayload := append(ebmlHeader, bytes.Repeat([]byte("W"), 16*1024)...)
+	webaAsset, err := pipe.Upload(ctx, "admin-1", "recording-20261108.weba", "audio/webm", bytes.NewReader(webaPayload))
+	if err != nil {
+		t.Fatalf("WEBA voice recording upload failed: %v", err)
+	}
+	if webaAsset.MIMEType != "audio/webm" || webaAsset.SizeBytes != int64(len(webaPayload)) {
+		t.Fatalf("unexpected WEBA asset: %+v", webaAsset)
+	}
+
 	pdfOrphan, err := pipe.Upload(ctx, "admin-1", "unused.pdf", "application/pdf", strings.NewReader("%PDF-1.7\n%%EOF\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -481,7 +491,7 @@ func TestMedia_StreamingNonImageUploadsAndLinearOrphanTokenScanner(t *testing.T)
 	// 2. Reference mp3Asset via Markdown link with query+fragment and trailing period,
 	//    and mp4Asset via JSON-escaped slash URL in settings; pdfOrphan remains unreferenced.
 	now := time.Now().UnixMilli()
-	mdBody := "Listen to [Episode](" + mp3Asset.PublicURL + "?dl=1#t=30)."
+	mdBody := "Listen to [Episode](" + mp3Asset.PublicURL + "?dl=1#t=30).\n<audio controls preload=\"metadata\" src=\"" + webaAsset.PublicURL + "\"></audio>"
 	_, err = store.ExecContext(ctx,
 		`INSERT INTO articles (id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md, cover_url, status, published_at, scheduled_at, is_pinned, allow_comment, password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes, audio_mime, lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count, created_at, updated_at)
 		 VALUES ('a-tok', 'u1', '', 'T', 's-tok', '', '', ?, '', 'published', ?, 0, 0, 1, '', 0, '', 0, 0, '', 'zh-CN', '', '', 1, 1, 0, 0, ?, ?)`,

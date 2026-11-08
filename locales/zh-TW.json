@@ -1899,5 +1899,10 @@
   "ed.sc_book_pick": "選擇單本書籍嵌入 (:::book)…",
   "ed.sync_scroll": "雙欄同步捲動",
   "ed.lock_user_ph": "此處內容登入讀者可見…",
+  "ed.record_toggle": "開始錄音/結束錄音",
+  "ed.record_stop": "結束錄音並插入 ({time})",
+  "ed.record_started": "正在錄音，再次點擊麥克風結束並上傳插入",
+  "ed.record_unsupported": "目前瀏覽器環境不支援麥克風錄音（需 HTTPS 或 localhost）",
+  "ed.record_denied": "無法存取麥克風，請檢查瀏覽器麥克風權限",
   "ui.cmdk_hint": "↑↓ 選擇 · Enter 開啟 · Esc 關閉"
 }

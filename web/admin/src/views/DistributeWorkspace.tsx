@@ -24,6 +24,7 @@ import {
   TokenListInput,
   UploadButton,
   useDebouncedValue,
+  useFlipList,
 } from "../components/UIControls";
 import { availableLocalesSig, formatDateTime, t } from "../i18n";
 
@@ -190,6 +191,8 @@ export function DistributeWorkspace({
   const [navSearch, setNavSearch] = useState("");
   const [navModalOpen, setNavModalOpen] = useState(false);
   const [navForm, setNavForm] = useState({ ...EMPTY_NAV });
+  const [swappingNav, setSwappingNav] = useState(false);
+  const navFlip = useFlipList<HTMLTableSectionElement>();
 
   // Redirects (server-paginated + Import/Export)
   const [redirects, setRedirects] = useState<any[]>([]);
@@ -501,6 +504,7 @@ export function DistributeWorkspace({
   });
 
   const swapNavOrder = async (itemId: string, dir: -1 | 1) => {
+    if (swappingNav) return;
     const target = sortedRawNav.find((x) => x.id === itemId);
     if (!target) return;
     const parentKey = target.parent_id || "";
@@ -508,41 +512,61 @@ export function DistributeWorkspace({
     const idx = siblings.findIndex((x) => x.id === itemId);
     const targetIdx = idx + dir;
     if (idx < 0 || targetIdx < 0 || targetIdx >= siblings.length) return;
+
+    const prevNav = navItems;
     const hasTies = new Set(siblings.map((s) => Number(s.sort_order ?? 0))).size < siblings.length;
+    const nextOrderById = new Map<string, number>();
+    const updates: Array<{ id: string; body: any }> = [];
+
+    if (hasTies) {
+      const reordered = [...siblings];
+      const [moved] = reordered.splice(idx, 1);
+      reordered.splice(targetIdx, 0, moved);
+      reordered.forEach((s, i) => {
+        const desired = (i + 1) * 10;
+        nextOrderById.set(s.id, desired);
+        if (Number(s.sort_order) !== desired) {
+          updates.push({
+            id: s.id,
+            body: { ...s, sort_order: desired, is_enabled: s.is_enabled !== false },
+          });
+        }
+      });
+    } else {
+      const a = siblings[idx];
+      const b = siblings[targetIdx];
+      const orderA = Number(a.sort_order ?? (idx + 1) * 10);
+      const orderB = Number(b.sort_order ?? (targetIdx + 1) * 10);
+      nextOrderById.set(a.id, orderB);
+      nextOrderById.set(b.id, orderA);
+      updates.push(
+        { id: a.id, body: { ...a, sort_order: orderB, is_enabled: a.is_enabled !== false } },
+        { id: b.id, body: { ...b, sort_order: orderA, is_enabled: b.is_enabled !== false } }
+      );
+    }
+
+    const nextNav = navItems.map((n) =>
+      nextOrderById.has(n.id) ? { ...n, sort_order: nextOrderById.get(n.id)! } : n
+    );
+    setSwappingNav(true);
+    navFlip.captureFlip();
+    setNavItems(nextNav);
+
     try {
-      if (hasTies) {
-        const reordered = [...siblings];
-        const [moved] = reordered.splice(idx, 1);
-        reordered.splice(targetIdx, 0, moved);
-        await Promise.all(
-          reordered.map((s, i) => {
-            const desired = (i + 1) * 10;
-            if (Number(s.sort_order) === desired) return Promise.resolve();
-            return apiFetch(`/api/admin/nav/${s.id}`, {
-              method: "PUT",
-              body: JSON.stringify({ ...s, sort_order: desired, is_enabled: s.is_enabled !== false }),
-            });
+      await Promise.all(
+        updates.map((u) =>
+          apiFetch(`/api/admin/nav/${u.id}`, {
+            method: "PUT",
+            body: JSON.stringify(u.body),
           })
-        );
-      } else {
-        const a = siblings[idx];
-        const b = siblings[targetIdx];
-        const orderA = Number(a.sort_order ?? (idx + 1) * 10);
-        const orderB = Number(b.sort_order ?? (targetIdx + 1) * 10);
-        await Promise.all([
-          apiFetch(`/api/admin/nav/${a.id}`, {
-            method: "PUT",
-            body: JSON.stringify({ ...a, sort_order: orderB, is_enabled: a.is_enabled !== false }),
-          }),
-          apiFetch(`/api/admin/nav/${b.id}`, {
-            method: "PUT",
-            body: JSON.stringify({ ...b, sort_order: orderA, is_enabled: b.is_enabled !== false }),
-          }),
-        ]);
-      }
-      void loadNav();
+        )
+      );
     } catch (err: any) {
+      setNavItems(prevNav);
       showToast(err.message);
+      void loadNav();
+    } finally {
+      setSwappingNav(false);
     }
   };
 
@@ -1063,7 +1087,7 @@ export function DistributeWorkspace({
                   <th class="col-act col-act-th">{t("art.actions")}</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody ref={navFlip.containerRef}>
                 {loading && navItems.length === 0 ? (
                   <TableSkeleton cols={4} />
                 ) : pagedNav.slice.length === 0 ? (
@@ -1077,7 +1101,7 @@ export function DistributeWorkspace({
                       .join(" · ");
                     const searchActive = Boolean(navSearch.trim());
                     return (
-                      <tr key={it.id}>
+                      <tr key={it.id} data-flip-key={it.id}>
                         <td class="col-fluid" data-label={t("cnt.col_name")}>
                           <div class="volo-cell-title" style={isChild ? { paddingLeft: "20px" } : undefined}>
                             {isChild && <span class="volo-help">↳</span>}
@@ -1099,7 +1123,7 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={searchActive || sibIdx <= 0}
+                              disabled={searchActive || swappingNav || sibIdx <= 0}
                               title={searchActive ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapNavOrder(it.id, -1)}
                             >
@@ -1108,7 +1132,7 @@ export function DistributeWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={searchActive || sibIdx < 0 || sibIdx >= sibCount - 1}
+                              disabled={searchActive || swappingNav || sibIdx < 0 || sibIdx >= sibCount - 1}
                               title={searchActive ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapNavOrder(it.id, 1)}
                             >

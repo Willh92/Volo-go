@@ -4880,7 +4880,11 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
     width: min(204px, calc(100vw - 52px));
   }
   .volo-embed-book {
-    flex-direction: column;
+    padding: 12px 14px;
+    gap: 12px;
+  }
+  .volo-embed-book__cover {
+    width: 52px;
   }
 }
 
@@ -5016,6 +5020,22 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
     height: 32px;
     padding: 0;
   }
+}
+
+.volo-prose audio {
+  display: block;
+  width: min(100%, 480px);
+  max-width: 100%;
+  min-width: 0;
+  height: 40px;
+  margin: 12px 0;
+  border-radius: 10px;
+}
+
+.volo-embed-book,
+.volo-book-tile,
+.book-card--clickable {
+  -webkit-tap-highlight-color: transparent;
 }
 
 @media (prefers-reduced-motion: reduce) {

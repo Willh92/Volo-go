@@ -4105,7 +4105,7 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 	}
 	ext := strings.ToLower(filepath.Ext(origName))
 	switch ext {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav", ".mp4", ".webm", ".pdf", ".zip":
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav", ".weba", ".mp4", ".webm", ".pdf", ".zip":
 	case ".svg":
 		return nil, errors.New("raw SVG upload disallowed for XSS safety; use PNG/WebP/JPEG")
 	default:

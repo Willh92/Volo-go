@@ -31,7 +31,12 @@ function minifyEmbeddedPayload(fileName, raw) {
       return Buffer.from(out.code, "utf8");
     }
   } else if (fileName.endsWith(".css")) {
-    const out = transformCSS({ filename: fileName, code: raw, minify: true });
+    const out = transformCSS({
+      filename: fileName,
+      code: raw,
+      minify: true,
+      targets: { safari: 15 << 16, chrome: 100 << 16, firefox: 100 << 16 },
+    });
     if (out && out.code) {
       return Buffer.from(out.code);
     }

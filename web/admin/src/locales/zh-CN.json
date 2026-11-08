@@ -1625,5 +1625,10 @@
   "ed.sc_book_pick": "选择单本书籍嵌入 (:::book)…",
   "ed.sync_scroll": "双栏同步滚动",
   "ed.lock_user_ph": "此处内容登录读者可见…",
+  "ed.record_toggle": "开始录音/结束录音",
+  "ed.record_stop": "结束录音并插入 ({time})",
+  "ed.record_started": "正在录音，再次点击麦克风结束并上传插入",
+  "ed.record_unsupported": "当前浏览器环境不支持麦克风录音（需 HTTPS 或 localhost）",
+  "ed.record_denied": "无法访问麦克风，请检查浏览器麦克风权限",
   "ui.cmdk_hint": "↑↓ 选择 · Enter 打开 · Esc 关闭"
 }

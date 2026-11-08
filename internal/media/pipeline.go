@@ -183,7 +183,7 @@ func (p *Pipeline) HealthCheck(ctx context.Context) error {
 // Upload validates magic bytes, blocks decompression bombs (`<= 24 MP`), normalizes EXIF orientation (`1..8`),
 // strips 100% of EXIF/GPS/camera metadata via clean pixel re-encoding, adaptively encodes pure-Go WebP,
 // extracts intrinsic `width`/`height` for zero-CLS rendering, and persists to Local/S3/Plugin storage.
-func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename string, _ string, r io.Reader) (*domain.MediaAsset, error) {
+func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename string, declaredMIME string, r io.Reader) (*domain.MediaAsset, error) {
 	origBase := filepath.Base(strings.TrimSpace(origFilename))
 	ext := strings.ToLower(filepath.Ext(origBase))
 	if isForbiddenUploadExt(ext) {
@@ -203,6 +203,10 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 	kind, detectedMIME, err := classifyAndVerifyMagic(ext, head)
 	if err != nil {
 		return nil, err
+	}
+	if ext == ".webm" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(declaredMIME)), "audio/") {
+		kind = mediaKindAudio
+		detectedMIME = "audio/webm"
 	}
 
 	maxBytes := p.maxUploadBytes()
@@ -949,6 +953,11 @@ func classifyAndVerifyMagic(ext string, raw []byte) (mediaKind, string, error) {
 			return 0, "", errors.New("file magic bytes do not match MP4 ftyp signature")
 		}
 		return mediaKindVideo, "video/mp4", nil
+	case ".weba":
+		if !bytes.HasPrefix(raw, []byte{0x1A, 0x45, 0xDF, 0xA3}) {
+			return 0, "", errors.New("file magic bytes do not match WebM audio EBML signature")
+		}
+		return mediaKindAudio, "audio/webm", nil
 	case ".webm":
 		if !bytes.HasPrefix(raw, []byte{0x1A, 0x45, 0xDF, 0xA3}) {
 			return 0, "", errors.New("file magic bytes do not match WebM EBML signature")

@@ -1408,36 +1408,57 @@ export function AnimatedModal({
   const [entered, setEntered] = useState(false);
   const [closing, setClosing] = useState(false);
   const [stackDepth, setStackDepth] = useState(0);
+  const backdropRef = useRef<HTMLDivElement | null>(null);
+  const isOpenRef = useRef(false);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
-  useEffect(() => {
+  if (open && !rendered) {
+    setRendered(true);
+  }
+  if (open && closing) {
+    setClosing(false);
+  }
+  if (!open && isOpenRef.current) {
+    isOpenRef.current = false;
+  }
+
+  const activeRender = open || rendered;
+
+  useLayoutEffect(() => {
+    const el = backdropRef.current;
     if (open) {
-      setRendered(true);
-      setClosing(false);
-      let raf2 = 0;
-      const raf1 = window.requestAnimationFrame(() => {
-        raf2 = window.requestAnimationFrame(() => {
-          setEntered(true);
-        });
+      if (!el) return;
+      el.classList.remove("is-closing", "is-open");
+      // Commit initial opacity: 0 & translate3d(0, -10px, 0) before paint,
+      // then activate .is-open on next animation frame so entrance transition always plays.
+      void el.offsetWidth;
+      const raf = window.requestAnimationFrame(() => {
+        isOpenRef.current = true;
+        backdropRef.current?.classList.add("is-open");
+        setEntered(true);
       });
       return () => {
-        window.cancelAnimationFrame(raf1);
-        if (raf2) window.cancelAnimationFrame(raf2);
+        window.cancelAnimationFrame(raf);
       };
     } else if (rendered) {
+      isOpenRef.current = false;
       setEntered(false);
       setClosing(true);
+      if (el) {
+        el.classList.remove("is-open");
+        el.classList.add("is-closing");
+      }
       const timer = window.setTimeout(() => {
         setRendered(false);
         setClosing(false);
-      }, 185);
+      }, 190);
       return () => window.clearTimeout(timer);
     }
-  }, [open]);
+  }, [open, rendered]);
 
   useEffect(() => {
-    if (!rendered) return;
+    if (!activeRender) return;
     const id = ++modalSeq;
     const depth = openModalStack.length;
     openModalStack.push(id);
@@ -1459,22 +1480,29 @@ export function AnimatedModal({
       if (idx >= 0) openModalStack.splice(idx, 1);
       releaseModalScrollLock();
     };
-  }, [rendered]);
+  }, [activeRender]);
 
-  if (!rendered || typeof document === "undefined") return null;
+  if (!activeRender || typeof document === "undefined") return null;
 
   const isSpotlight = variant === "spotlight";
+  const showOpen = open && (entered || isOpenRef.current) && !closing;
 
   return createPortal(
     <div
-      class={`volo-modal-backdrop ${isSpotlight ? "is-spotlight" : ""} ${entered && !closing ? "is-open" : ""} ${closing ? "is-closing" : ""}`}
+      ref={backdropRef}
+      class={`volo-modal-backdrop ${isSpotlight ? "is-spotlight" : ""} ${showOpen ? "is-open" : ""} ${closing ? "is-closing" : ""}`}
       style={{ zIndex: 1000 + stackDepth * 20 }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
-        class={`volo-modal ${isSpotlight ? "volo-modal--spotlight" : ""} ${entered && !closing ? "is-open" : ""} ${closing ? "is-closing" : ""}`}
+        class="volo-modal-scrim"
+        aria-hidden="true"
+        onMouseDown={() => onClose()}
+      />
+      <div
+        class={`volo-modal ${isSpotlight ? "volo-modal--spotlight" : ""}`}
         style={{ maxWidth }}
         role="dialog"
         aria-modal="true"
@@ -2263,6 +2291,79 @@ function findScrollableAncestor(el: HTMLElement | null): HTMLElement | null {
   return (document.scrollingElement as HTMLElement | null) || null;
 }
 
+export function useFlipList<E extends HTMLElement = HTMLElement>() {
+  const containerRef = useRef<E | null>(null);
+  const prevTopsRef = useRef<Map<string, number>>(new Map());
+  const pendingRef = useRef(false);
+
+  const captureFlip = () => {
+    const container = containerRef.current;
+    const map = new Map<string, number>();
+    if (container) {
+      const rows = container.querySelectorAll<HTMLElement>("[data-flip-key]");
+      for (let i = 0; i < rows.length; i++) {
+        const key = rows[i].dataset.flipKey;
+        if (key) {
+          map.set(key, rows[i].getBoundingClientRect().top);
+        }
+      }
+    }
+    prevTopsRef.current = map;
+    pendingRef.current = map.size > 0;
+  };
+
+  useLayoutEffect(() => {
+    if (!pendingRef.current) return;
+    pendingRef.current = false;
+    const prevMap = prevTopsRef.current;
+    prevTopsRef.current = new Map();
+    if (!prevMap.size) return;
+    const container = containerRef.current;
+    if (!container) return;
+    if (typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+    const rows = container.querySelectorAll<HTMLElement>("[data-flip-key]");
+    const movedEls: { el: HTMLElement; dy: number }[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const el = rows[i];
+      const key = el.dataset.flipKey;
+      if (!key) continue;
+      const oldTop = prevMap.get(key);
+      if (oldTop === undefined) continue;
+      const dy = Math.round(oldTop - el.getBoundingClientRect().top);
+      if (Math.abs(dy) > 1) {
+        movedEls.push({ el, dy });
+      }
+    }
+    if (!movedEls.length) return;
+    for (let i = 0; i < movedEls.length; i++) {
+      const { el, dy } = movedEls[i];
+      el.classList.add("is-flip-moving");
+      el.style.transition = "none";
+      el.style.transform = `translate3d(0, ${dy}px, 0)`;
+    }
+    void container.offsetHeight;
+    for (let i = 0; i < movedEls.length; i++) {
+      const { el } = movedEls[i];
+      el.style.transition = "transform 220ms cubic-bezier(0.22, 1, 0.36, 1)";
+      el.style.transform = "translate3d(0, 0, 0)";
+      let done = false;
+      const clear = () => {
+        if (done) return;
+        done = true;
+        el.classList.remove("is-flip-moving");
+        el.style.transition = "";
+        el.style.transform = "";
+      };
+      el.addEventListener("transitionend", clear, { once: true });
+      window.setTimeout(clear, 255);
+    }
+  });
+
+  return { containerRef, captureFlip };
+}
+
 export function usePointerSortableList<T>(
   items: T[],
   onReorder: (next: T[], fromIdx: number, toIdx: number) => void,
@@ -2280,6 +2381,7 @@ export function usePointerSortableList<T>(
   const cleanupRef = useRef<(() => void) | null>(null);
   const settleCleanupRef = useRef<(() => void) | null>(null);
   const prevTopsRef = useRef<Map<HTMLElement, number>>(new Map());
+  const flipPendingRef = useRef(false);
   const draggingIdxRef = useRef<number | null>(null);
   draggingIdxRef.current = draggingIdx;
 
@@ -2293,9 +2395,12 @@ export function usePointerSortableList<T>(
       }
     }
     prevTopsRef.current = map;
+    flipPendingRef.current = map.size > 0;
   };
 
   useLayoutEffect(() => {
+    if (!flipPendingRef.current) return;
+    flipPendingRef.current = false;
     const prevMap = prevTopsRef.current;
     if (!prevMap.size) return;
     prevTopsRef.current = new Map();
@@ -2320,22 +2425,27 @@ export function usePointerSortableList<T>(
     if (!movedEls.length) return;
     for (let i = 0; i < movedEls.length; i++) {
       const { el, dy } = movedEls[i];
+      if (draggingIdxRef.current === null) el.classList.add("is-flip-moving");
       el.style.transition = "none";
       el.style.transform = `translate3d(0, ${dy}px, 0)`;
     }
     void container.offsetHeight;
     for (let i = 0; i < movedEls.length; i++) {
       const { el } = movedEls[i];
-      el.style.transition = "transform 210ms cubic-bezier(0.22, 1, 0.36, 1)";
+      el.style.transition = "transform 220ms cubic-bezier(0.22, 1, 0.36, 1)";
       el.style.transform = "translate3d(0, 0, 0)";
+      let done = false;
       const clear = () => {
+        if (done) return;
+        done = true;
+        el.classList.remove("is-flip-moving");
         el.style.transition = "";
         el.style.transform = "";
       };
       el.addEventListener("transitionend", clear, { once: true });
-      window.setTimeout(clear, 240);
+      window.setTimeout(clear, 255);
     }
-  }, [items]);
+  });
 
   useEffect(() => {
     return () => {
@@ -2359,9 +2469,10 @@ export function usePointerSortableList<T>(
       if (!container || !sourceRow) return;
 
       const initRect = sourceRow.getBoundingClientRect();
-      const initLeft = Math.round(initRect.left);
+      const vpW = typeof window !== "undefined" ? window.innerWidth : 1024;
+      const initWidth = Math.min(Math.round(initRect.width), Math.max(180, vpW - 16));
+      const initLeft = Math.max(8, Math.min(vpW - initWidth - 8, Math.round(initRect.left)));
       const initTop = Math.round(initRect.top);
-      const initWidth = Math.round(initRect.width);
       const initHeight = Math.round(initRect.height);
 
       const startX = e.clientX;
@@ -2465,7 +2576,7 @@ export function usePointerSortableList<T>(
         }
         const clone = liveRow.cloneNode(true) as HTMLElement;
         clone.removeAttribute("data-sort-idx");
-        clone.classList.remove("is-dragging", "is-grabbing");
+        clone.classList.remove("is-dragging", "is-grabbing", "is-flip-moving");
         clone.classList.add("volo-drag-ghost");
         const srcInputs = liveRow.querySelectorAll("input");
         const dstInputs = clone.querySelectorAll("input");

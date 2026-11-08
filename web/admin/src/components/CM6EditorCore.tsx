@@ -11,6 +11,7 @@ import {
   placeholder,
   ViewPlugin,
   ViewUpdate,
+  WidgetType,
 } from "@codemirror/view";
 import {
   addCursorAbove,
@@ -594,6 +595,22 @@ function buildInstantRenderPlugin() {
             }
           }
 
+          // Inline <audio ... src="..."></audio> player on non-cursor lines
+          const audioRe = /<audio\b[^>]*\bsrc=(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>\s*(?:<\/audio>)?/gi;
+          while ((m = audioRe.exec(text)) !== null) {
+            const rawSrc = (m[1] || m[2] || m[3] || "").trim();
+            if (!rawSrc || !/^(?:\/|https?:\/\/)/i.test(rawSrc)) continue;
+            const s = m.index;
+            const e = m.index + m[0].length;
+            if (markFree(s, e)) {
+              ops.push({
+                from: line.from + s,
+                to: line.from + e,
+                deco: Decoration.replace({ widget: new AudioIRWidget(rawSrc) }),
+              });
+            }
+          }
+
           // Markdown Links [label](url) (not images)
           const linkRe = /(?:^|[^!])\[([^\]\n]+)\]\(([^)\n]+)\)/g;
           while ((m = linkRe.exec(text)) !== null) {
@@ -640,6 +657,26 @@ function buildInstantRenderPlugin() {
     },
     { decorations: (v) => v.decorations }
   );
+}
+
+class AudioIRWidget extends WidgetType {
+  constructor(readonly src: string) {
+    super();
+  }
+  eq(other: AudioIRWidget): boolean {
+    return this.src === other.src;
+  }
+  toDOM(): HTMLElement {
+    const el = document.createElement("audio");
+    el.controls = true;
+    el.preload = "metadata";
+    el.src = this.src;
+    el.className = "cm-ir-audio";
+    return el;
+  }
+  ignoreEvent(): boolean {
+    return true;
+  }
 }
 
 function serializeNodeToMarkdown(node: Node): string {
@@ -778,6 +815,11 @@ function serializeNodeToMarkdown(node: Node): string {
       const src = el.getAttribute("src") || "";
       const alt = el.getAttribute("alt") || "";
       return `![${alt}](${src})`;
+    }
+    case "audio": {
+      const src = (el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "").trim();
+      if (!src) return "";
+      return `\n<audio controls preload="metadata" src="${src}"></audio>\n\n`;
     }
     case "hr":
       return `\n---\n\n`;
@@ -1107,8 +1149,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       );
       const url = res.asset.public_url;
       const name = res.asset.orig_filename || "asset";
-      if (res.asset.mime_type?.startsWith("audio/")) {
-        insertSnippet(`\n[${t("ed.audio_label")}: ${name}](${url})\n`);
+      if (res.asset.mime_type?.startsWith("audio/") || file.type?.startsWith("audio/")) {
+        insertSnippet(`\n<audio controls preload="metadata" src="${url}"></audio>\n`);
       } else {
         insertSnippet(`![${name}](${url})`);
       }
@@ -1117,6 +1159,152 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       showToast(err?.message || t("ed.upload_failed"));
     } finally {
       setUploading(false);
+    }
+  };
+
+  const [recording, setRecording] = useState<boolean>(false);
+  const [recordSec, setRecordSec] = useState<number>(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordStreamRef = useRef<MediaStream | null>(null);
+  const recordChunksRef = useRef<BlobPart[]>([]);
+  const recordTimerRef = useRef<number>(0);
+
+  const cleanupRecordingTracks = () => {
+    if (recordTimerRef.current) {
+      window.clearInterval(recordTimerRef.current);
+      recordTimerRef.current = 0;
+    }
+    if (recordStreamRef.current) {
+      recordStreamRef.current.getTracks().forEach((tr) => tr.stop());
+      recordStreamRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.onstop = null;
+          mediaRecorderRef.current.stop();
+        }
+      } catch {
+        /* ignore */
+      }
+      mediaRecorderRef.current = null;
+      cleanupRecordingTracks();
+    };
+  }, []);
+
+  const formatRecordClock = (sec: number): string => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
+
+  const toggleAudioRecording = async () => {
+    setEdTip(null);
+    if (recording && mediaRecorderRef.current) {
+      try {
+        if (mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {
+        setRecording(false);
+        cleanupRecordingTracks();
+      }
+      return;
+    }
+
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof MediaRecorder === "undefined"
+    ) {
+      showToast(t("ed.record_unsupported"));
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const candidates: Array<{ mime: string; blobType: string; ext: string }> = [
+        { mime: "audio/webm;codecs=opus", blobType: "audio/webm", ext: "weba" },
+        { mime: "audio/webm", blobType: "audio/webm", ext: "weba" },
+        { mime: "audio/ogg;codecs=opus", blobType: "audio/ogg", ext: "ogg" },
+        { mime: "audio/mp4", blobType: "audio/mp4", ext: "m4a" },
+      ];
+      const chosen =
+        candidates.find((c) => typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(c.mime)) ||
+        candidates[1];
+
+      const recorder =
+        typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(chosen.mime)
+          ? new MediaRecorder(stream, { mimeType: chosen.mime })
+          : new MediaRecorder(stream);
+
+      recordStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      recordChunksRef.current = [];
+      setRecordSec(0);
+      setRecording(true);
+
+      recordTimerRef.current = window.setInterval(() => {
+        setRecordSec((prev) => prev + 1);
+      }, 1000);
+
+      recorder.ondataavailable = (ev: BlobEvent) => {
+        if (ev.data && ev.data.size > 0) {
+          recordChunksRef.current.push(ev.data);
+        }
+      };
+
+      recorder.onerror = () => {
+        setRecording(false);
+        mediaRecorderRef.current = null;
+        cleanupRecordingTracks();
+      };
+
+      recorder.onstop = () => {
+        const chunks = recordChunksRef.current.slice();
+        recordChunksRef.current = [];
+        setRecording(false);
+        mediaRecorderRef.current = null;
+        cleanupRecordingTracks();
+        if (chunks.length === 0) return;
+        const actualMime = (recorder.mimeType || chosen.blobType).toLowerCase();
+        let ext = chosen.ext;
+        let blobType = chosen.blobType;
+        if (actualMime.includes("ogg")) {
+          ext = "ogg";
+          blobType = "audio/ogg";
+        } else if (actualMime.includes("mp4") || actualMime.includes("aac")) {
+          ext = "m4a";
+          blobType = "audio/mp4";
+        } else {
+          ext = "weba";
+          blobType = "audio/webm";
+        }
+        const now = new Date();
+        const stamp = [
+          now.getFullYear(),
+          String(now.getMonth() + 1).padStart(2, "0"),
+          String(now.getDate()).padStart(2, "0"),
+          "-",
+          String(now.getHours()).padStart(2, "0"),
+          String(now.getMinutes()).padStart(2, "0"),
+          String(now.getSeconds()).padStart(2, "0"),
+        ].join("");
+        const blob = new Blob(chunks, { type: blobType });
+        if (blob.size === 0) return;
+        const file = new File([blob], `recording-${stamp}.${ext}`, { type: blobType });
+        void uploadMediaFile(file);
+      };
+
+      recorder.start(250);
+      showToast(t("ed.record_started"));
+    } catch {
+      cleanupRecordingTracks();
+      setRecording(false);
+      showToast(t("ed.record_denied"));
     }
   };
 
@@ -1557,6 +1745,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
   const handleToolbarPointerOver = (e: PointerEvent) => {
     if (e.pointerType === "touch") return;
+    if (typeof window !== "undefined" && window.matchMedia?.("(hover: none)").matches) return;
     const btn = (e.target as HTMLElement | null)?.closest("[data-tip]") as HTMLElement | null;
     if (!btn) {
       setEdTip(null);
@@ -1839,6 +2028,29 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
               }}
             />
           </div>
+
+          <button
+            type="button"
+            class={`volo-ed-btn ${recording ? "is-recording" : ""}`}
+            data-tip={recording ? t("ed.record_stop", { time: formatRecordClock(recordSec) }) : t("ed.record_toggle")}
+            aria-label={recording ? t("ed.record_stop", { time: formatRecordClock(recordSec) }) : t("ed.record_toggle")}
+            aria-pressed={recording}
+            onClick={() => void toggleAudioRecording()}
+          >
+            {recording ? (
+              <>
+                <span class="volo-ed-rec-dot" aria-hidden="true" />
+                <span>{formatRecordClock(recordSec)}</span>
+              </>
+            ) : (
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="2" width="6" height="12" rx="3" />
+                <path d="M5 10a7 7 0 0 0 14 0" />
+                <line x1="12" y1="17" x2="12" y2="21" />
+                <line x1="8" y1="21" x2="16" y2="21" />
+              </svg>
+            )}
+          </button>
 
           <button
             type="button"
@@ -2360,7 +2572,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
           if (isImg) {
             insertSnippet(`![${name}](${asset.public_url})`);
           } else if (isAudio) {
-            insertSnippet(`[${t("ed.audio_label")}: ${name}](${asset.public_url})`);
+            insertSnippet(`\n<audio controls preload="metadata" src="${asset.public_url}"></audio>\n`);
           } else {
             insertSnippet(`[${name}](${asset.public_url})`);
           }
@@ -2470,7 +2682,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
                         if (isImg) {
                           insertSnippet(`![${name}](${m.public_url})`);
                         } else if (isAudio) {
-                          insertSnippet(`[${t("ed.audio_label")}: ${name}](${m.public_url})`);
+                          insertSnippet(`\n<audio controls preload="metadata" src="${m.public_url}"></audio>\n`);
                         } else {
                           insertSnippet(`[${name}](${m.public_url})`);
                         }
