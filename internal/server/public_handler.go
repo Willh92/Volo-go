@@ -171,6 +171,7 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	}
 
 	s := &AppServer{deps: deps}
+	s.syncConfiguredUploadDir()
 	if deps.Plugins != nil {
 		deps.Plugins.SetSiteInfoFunc(func() map[string]any {
 			snap := deps.Settings.Snapshot()
@@ -490,9 +491,16 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !serveSafeUserStaticFile(w, r, s.deps.Config.UploadDir, cleanRel) {
-		http.NotFound(w, r)
+	activeDir := s.deps.Config.GetUploadDir()
+	if serveSafeUserStaticFile(w, r, activeDir, cleanRel) {
+		return
 	}
+	if defDir := s.deps.Config.GetDefaultUploadDir(); defDir != "" && defDir != activeDir {
+		if serveSafeUserStaticFile(w, r, defDir, cleanRel) {
+			return
+		}
+	}
+	http.NotFound(w, r)
 }
 
 func (s *AppServer) handleServeThemeAsset(w http.ResponseWriter, r *http.Request) {
@@ -1531,10 +1539,15 @@ func (s *AppServer) basePageContextWithSession(r *http.Request, viewer *domain.U
 
 	siteCfg := snap.Site
 	siteCfg.CustomHeadMeta = repo.NormalizeSiteInjectionHTML(siteCfg.CustomHeadMeta)
+	siteCfg.NoticeBoard = repo.NormalizeSiteInjectionHTML(siteCfg.NoticeBoard)
 	if !siteCfg.EnableFooterHTML {
 		siteCfg.FooterText = ""
 	} else if siteCfg.FooterText != "" {
 		siteCfg.FooterText = repo.NormalizeSiteInjectionHTML(siteCfg.FooterText)
+	}
+	localizeUnmodifiedSiteDefaults(&siteCfg, locale)
+	if snap.SEO.MetaDescription == "" || snap.SEO.MetaDescription == "Personal independent blog" {
+		desc = siteCfg.Description
 	}
 
 	return theme.PageContext{
@@ -1991,6 +2004,8 @@ func (s *AppServer) handleCategoryPosts(w http.ResponseWriter, r *http.Request) 
 	})
 	pctx.HeroTitle = catRow.Name
 	pctx.HeroSubtitle = catRow.Description
+	pctx.HeroBackURL = "/categories"
+	pctx.HeroBackLabel = s.deps.Catalog.T(pctx.Locale, "taxonomy.back_categories")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.ArticleCards = cards
 	pctx.Page = page
@@ -2074,6 +2089,8 @@ func (s *AppServer) handleTagPosts(w http.ResponseWriter, r *http.Request) {
 		Locale:   pctx.Locale,
 	})
 	pctx.HeroTitle = "#" + tagRow.Name
+	pctx.HeroBackURL = "/tags"
+	pctx.HeroBackLabel = s.deps.Catalog.T(pctx.Locale, "taxonomy.back_tags")
 	pctx.PageTitle = pctx.HeroTitle + " · " + pctx.Site.Title
 	pctx.ArticleCards = cards
 	pctx.Page = page
@@ -2229,6 +2246,8 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	pctx.HeroTitle = ym
+	pctx.HeroBackURL = "/archives"
+	pctx.HeroBackLabel = s.deps.Catalog.T(pctx.Locale, "taxonomy.back_archives")
 	pctx.PageTitle = ym + " · " + pctx.Site.Title
 	pctx.ArticleCards = cards
 	pctx.Page = page
@@ -2268,6 +2287,8 @@ func (s *AppServer) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
 
 	pctx.HeroTitle = sv.Title
 	pctx.HeroSubtitle = sv.Description
+	pctx.HeroBackURL = "/series"
+	pctx.HeroBackLabel = s.deps.Catalog.T(pctx.Locale, "taxonomy.back_series")
 	pctx.PageTitle = sv.Title + " · " + pctx.Site.Title
 	pctx.ArticleCards = slice
 	pctx.Page = page
@@ -2444,6 +2465,19 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 				pctx.ActiveChapterNeedsMermaid = needsMermaid
 			}
 		}
+	} else if (bk.EmbedMode == "iframe" || bk.EmbedMode == "inline") &&
+		(strings.HasPrefix(strings.TrimSpace(bk.SourceURL), "https://") || strings.HasPrefix(strings.TrimSpace(bk.SourceURL), "http://")) {
+		syntheticRoot := domain.BookChapter{
+			ID:     "root",
+			BookID: bk.ID,
+			Title:  bk.Title,
+			URL:    strings.TrimSpace(bk.SourceURL),
+		}
+		if htmlBody, needsMath, needsMermaid, ok := s.deps.Content.ExtractRemoteBookChapter(r.Context(), bk, syntheticRoot); ok {
+			pctx.ActiveChapterHTML = htmlBody
+			pctx.ActiveChapterNeedsMath = needsMath
+			pctx.ActiveChapterNeedsMermaid = needsMermaid
+		}
 	}
 	if pctx.ActiveChapterHTML == "" && bk.EmbedMode == "iframe" {
 		frameTarget := bk.SourceURL
@@ -2542,34 +2576,93 @@ func (s *AppServer) handleDynamicPage(w http.ResponseWriter, r *http.Request) {
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"dynamic.html", "taxonomies.html"}, pctx)
 }
 
+func localizeUnmodifiedSiteDefaults(siteCfg *domain.SiteSettings, locale string) {
+	if siteCfg == nil {
+		return
+	}
+	loc := strings.ToLower(strings.TrimSpace(locale))
+	isTW := strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant")
+	isEN := strings.HasPrefix(loc, "en")
+
+	switch strings.TrimSpace(siteCfg.Subtitle) {
+	case "记录 · 思考 · 分享", "Record · Reflect · Share", "Independent thoughts & craft", "記錄 · 思考 · 分享":
+		if isEN {
+			siteCfg.Subtitle = "Record · Reflect · Share"
+		} else if isTW {
+			siteCfg.Subtitle = "記錄 · 思考 · 分享"
+		} else {
+			siteCfg.Subtitle = "记录 · 思考 · 分享"
+		}
+	}
+	switch strings.TrimSpace(siteCfg.Description) {
+	case "由 Volo-go 驱动的独立个人博客。", "A fast, sovereign personal blog powered by Volo-go.", "由 Volo-go 驅動的獨立個人部落格。":
+		if isEN {
+			siteCfg.Description = "A fast, sovereign personal blog powered by Volo-go."
+		} else if isTW {
+			siteCfg.Description = "由 Volo-go 驅動的獨立個人部落格。"
+		} else {
+			siteCfg.Description = "由 Volo-go 驱动的独立个人博客。"
+		}
+	}
+	switch strings.TrimSpace(siteCfg.LicenseTemplate) {
+	case "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}",
+		"Originally published by {author} on {site}. Please credit the source: {url}",
+		"本文由 {author} 原創發布於 {site}，轉載請註明原文連結：{url}":
+		if isEN {
+			siteCfg.LicenseTemplate = "Originally published by {author} on {site}. Please credit the source: {url}"
+		} else if isTW {
+			siteCfg.LicenseTemplate = "本文由 {author} 原創發布於 {site}，轉載請註明原文連結：{url}"
+		} else {
+			siteCfg.LicenseTemplate = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
+		}
+	}
+}
+
 func (s *AppServer) localizeReaderAuthError(locale string, code string) string {
 	clean := strings.ToLower(strings.TrimSpace(code))
 	if clean == "" {
 		return ""
 	}
-	isZH := strings.HasPrefix(strings.ToLower(locale), "zh")
+	loc := strings.ToLower(strings.TrimSpace(locale))
+	isTW := strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant")
+	isZH := strings.HasPrefix(loc, "zh")
 	switch clean {
 	case "state":
+		if isTW {
+			return "登入狀態校驗失敗或已過期，請重試。"
+		}
 		if isZH {
 			return "登录状态校验失败或已过期，请重试。"
 		}
 		return "Sign-in state expired or invalid. Please try again."
 	case "disabled":
+		if isTW {
+			return "目前帳號已被停用或暫未開放註冊。"
+		}
 		if isZH {
 			return "当前账号已被禁用或暂未开放注册。"
 		}
 		return "This account is disabled or registration is closed."
 	case "unverified_email":
+		if isTW {
+			return "第三方帳號信箱尚未驗證，無法自動登入。"
+		}
 		if isZH {
 			return "第三方账号邮箱尚未验证，无法自动登录。"
 		}
 		return "Third-party account email is not verified."
 	case "forbidden":
+		if isTW {
+			return "管理員或編輯帳號請透過管理後台登入，不可使用讀者通道。"
+		}
 		if isZH {
 			return "管理员或编辑账号请通过管理后台登录，不可使用读者通道。"
 		}
 		return "Staff accounts must sign in via the admin console."
 	default:
+		if isTW {
+			return "登入失敗，請檢查憑據或稍後重試。"
+		}
 		if isZH {
 			return "登录失败，请检查凭据或稍后重试。"
 		}
@@ -2857,7 +2950,7 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// Serve user-provided static file if placed in uploads/images/ or data/images/ with strict CSP + attachment safety
-	for _, baseDir := range []string{s.deps.Config.UploadDir, s.deps.Config.DataDir} {
+	for _, baseDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir(), s.deps.Config.DataDir} {
 		if strings.TrimSpace(baseDir) == "" {
 			continue
 		}

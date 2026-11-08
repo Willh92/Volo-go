@@ -62,7 +62,7 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes("@lezer")) return "cm6-lezer";
-          if (id.includes("@codemirror")) return "cm6-editor";
+          if (id.includes("@codemirror") || id.includes("CM6EditorCore")) return "cm6-editor";
           return undefined;
         },
       },

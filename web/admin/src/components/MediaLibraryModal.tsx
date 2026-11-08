@@ -3,6 +3,7 @@ import { apiFetch, showToast, storageDriverSig, uploadWithProgress } from "../ap
 import { t } from "../i18n";
 import {
   AnimatedModal,
+  ConsoleDatePicker,
   ConsoleEmpty,
   ConsoleSelect,
   PaginationBar,
@@ -256,14 +257,13 @@ export function MediaLibraryModal({
               { value: "unused", label: t("cnt.media_filter_orphan") },
             ]}
           />
-          <input
-            type="month"
-            class="volo-input"
-            style={{ width: "142px" }}
-            aria-label={t("cnt.media_month_lbl")}
+          <ConsoleDatePicker
+            mode="month"
+            style={{ width: "148px" }}
+            ariaLabel={t("cnt.media_month_lbl")}
             value={monthFilter}
-            onInput={(e) => {
-              setMonthFilter((e.currentTarget as HTMLInputElement).value);
+            onChange={(val) => {
+              setMonthFilter(val);
               setPage(1);
             }}
           />
@@ -314,6 +314,7 @@ export function MediaLibraryModal({
               const isImg = (m.mime_type || "").startsWith("image/");
               const isAudio = (m.mime_type || "").startsWith("audio/");
               const isBroken = Boolean(brokenIds[m.id]);
+              const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
               return (
                 <button
                   key={m.id}
@@ -330,6 +331,8 @@ export function MediaLibraryModal({
                         src={m.public_url}
                         alt={m.alt_text || m.original_name}
                         loading="lazy"
+                        decoding="async"
+                        class={isSmallImg ? "is-small-img" : ""}
                         onError={() => setBrokenIds((prev) => ({ ...prev, [m.id]: true }))}
                       />
                     ) : isAudio ? (
@@ -339,7 +342,7 @@ export function MediaLibraryModal({
                           <circle cx="6" cy="18" r="3" />
                           <circle cx="18" cy="16" r="3" />
                         </svg>
-                        <span>AUDIO</span>
+                        <span>{t("cnt.media_audio_badge")}</span>
                       </div>
                     ) : (
                       <div class="volo-media-type-placeholder">

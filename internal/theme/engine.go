@@ -301,8 +301,10 @@ type PageContext struct {
 	NavMenu         NavMenu
 	NavMenuResolved bool
 
-	HeroTitle    string
-	HeroSubtitle string
+	HeroTitle     string
+	HeroSubtitle  string
+	HeroBackURL   string
+	HeroBackLabel string
 
 	// List & Pagination
 	ArticleCards []visibility.PublicArticleCard

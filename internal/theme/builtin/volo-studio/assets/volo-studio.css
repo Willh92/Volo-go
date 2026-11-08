@@ -679,6 +679,28 @@ html:not([data-mode="light"]):not([data-mode="dark"]):not([data-mode="system"]) 
 }
 .studio-hero-notice > :first-child { margin-top: 0; }
 .studio-hero-notice > :last-child { margin-bottom: 0; }
+.studio-hero__back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 11px;
+  margin-bottom: 8px;
+  border-radius: 999px;
+  font-family: var(--volo-font-sans);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: normal;
+  color: var(--volo-muted);
+  background: var(--volo-surface);
+  border: 1px solid var(--volo-line);
+  text-decoration: none;
+  transition: color 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+}
+.studio-hero__back:hover {
+  color: var(--volo-accent);
+  border-color: var(--volo-accent);
+  background: var(--volo-accent-soft);
+}
 .studio-hero__title { margin: 0 0 4px; font-size: 21px; font-weight: 600; line-height: 1.4; }
 .studio-hero__subtitle { margin: 0; color: var(--volo-muted); font-size: 13px; }
 .studio-hero-graphic { display: block; width: 140px; height: 88px; color: var(--volo-accent); }
@@ -4624,7 +4646,7 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
     min-width: 42px;
     height: 42px;
     padding: 0;
-    border-radius: 12px;
+    border-radius: 999px;
     justify-content: center;
   }
   .studio-fab-btn--toc .studio-fab-btn__text,

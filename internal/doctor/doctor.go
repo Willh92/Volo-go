@@ -326,12 +326,13 @@ func checkWritableDirs(cfg *config.Config) CheckResult {
 			Summary: "nil config",
 		}
 	}
+	uploadDir := cfg.GetUploadDir()
 	targets := []struct {
 		label string
 		dir   string
 	}{
 		{"data", cfg.DataDir},
-		{"uploads", cfg.UploadDir},
+		{"uploads", uploadDir},
 		{"backups", cfg.BackupDir},
 	}
 	for _, t := range targets {
@@ -358,7 +359,7 @@ func checkWritableDirs(cfg *config.Config) CheckResult {
 		_ = os.Remove(probePath)
 	}
 	dData := cleanDisplayPath(cfg.DataDir)
-	dUploads := cleanDisplayPath(cfg.UploadDir)
+	dUploads := cleanDisplayPath(uploadDir)
 	dBackups := cleanDisplayPath(cfg.BackupDir)
 	return CheckResult{
 		Name:   "directories",

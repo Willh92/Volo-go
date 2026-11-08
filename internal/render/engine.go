@@ -287,6 +287,23 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 	}
 }
 
+// RenderTrustedMarkdownHTML converts Admin-owned Markdown and embedded raw HTML/script blocks
+// (such as Site.NoticeBoard, restricted strictly to RoleAdmin) via Goldmark without stripping
+// custom tags, inline styles, iframes, or ad/widget scripts.
+func (e *Engine) RenderTrustedMarkdownHTML(markdownSrc string) string {
+	clean := strings.ReplaceAll(markdownSrc, "\x00", "")
+	clean = strings.ReplaceAll(clean, "\r\n", "\n")
+	clean = strings.TrimSpace(clean)
+	if clean == "" {
+		return ""
+	}
+	var mdBuf bytes.Buffer
+	if err := e.ensureMarkdown().Convert([]byte(clean), &mdBuf); err != nil {
+		return clean
+	}
+	return strings.TrimSpace(mdBuf.String())
+}
+
 type preprocessResult struct {
 	markdown          string
 	replacements      map[string]string

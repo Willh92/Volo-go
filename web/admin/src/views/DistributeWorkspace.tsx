@@ -1840,7 +1840,7 @@ export function DistributeWorkspace({
                               <a href={rp.html_url || `https://github.com/${rp.full_name}`} target="_blank" rel="noreferrer">
                                 {rp.name}
                               </a>
-                              {rp.is_fork && <span class="volo-mini-tag">Fork</span>}
+                              {rp.is_fork && <span class="volo-mini-tag">{t("dist.gh_fork_badge")}</span>}
                             </div>
                             {rp.description && (
                               <div class="volo-cell-meta">

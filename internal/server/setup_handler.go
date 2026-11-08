@@ -648,6 +648,7 @@ func (s *AppServer) reloadRuntimeAfterDBRestore(ctx context.Context) {
 	if s.deps.Settings != nil {
 		_, _ = s.deps.Settings.Reload(ctx)
 	}
+	s.syncConfiguredUploadDir()
 	if s.deps.WAF != nil {
 		_ = s.deps.WAF.ReloadBans(ctx)
 	}
@@ -1129,7 +1130,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 				pageID, adminUser.ID, aboutTitle, aboutBody, true, true, false, locale, now, now)
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
-				 VALUES (?, '', ?, '{"zh-CN":"关于","en-US":"About"}', '/about', ?, '', 10, ?, ?, ?)`,
+				 VALUES (?, '', ?, '{"zh-CN":"关于","zh-TW":"關於","en-US":"About"}', '/about', ?, '', 10, ?, ?, ?)`,
 				id.Next(), aboutTitle, false, true, now, now)
 		}
 		return nil
@@ -1346,7 +1347,7 @@ func (s *AppServer) executeLegacyImport(ctx context.Context, prep *preparedLegac
 
 	opts := etl.ImportOptions{
 		DryRun:            prep.dryRun,
-		TargetUploadDir:   s.deps.Config.UploadDir,
+		TargetUploadDir:   s.deps.Config.GetUploadDir(),
 		AdminPath:         s.deps.Config.AdminPath,
 		OldURLPrefixes:    prep.oldURLPrefixes,
 		NewSiteURL:        prep.newSiteURL,
@@ -1779,7 +1780,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 
 	opts := etl.ImportOptions{
 		DryRun:            dryRun,
-		TargetUploadDir:   s.deps.Config.UploadDir,
+		TargetUploadDir:   s.deps.Config.GetUploadDir(),
 		AdminPath:         s.deps.Config.AdminPath,
 		OldURLPrefixes:    splitSetupURLPrefixes(req.OldSiteURL),
 		NewSiteURL:        newSiteURL,

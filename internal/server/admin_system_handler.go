@@ -2624,10 +2624,18 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 				storageDrivers = ids
 			}
 		}
+		defaultUploadDir := ""
+		effectiveUploadDir := ""
+		if s.deps.Config != nil {
+			defaultUploadDir = s.deps.Config.GetDefaultUploadDir()
+			effectiveUploadDir = s.deps.Config.GetUploadDir()
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"domains":         result,
-			"versions":        versions,
-			"storage_drivers": storageDrivers,
+			"domains":              result,
+			"versions":             versions,
+			"storage_drivers":      storageDrivers,
+			"default_upload_dir":   defaultUploadDir,
+			"effective_upload_dir": effectiveUploadDir,
 		})
 		return
 	}
@@ -2668,13 +2676,22 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			SecretKey string                  `json:"s3_secret_key"`
 		}
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req)
+		if req.Settings != nil && s.deps.Config != nil {
+			drv := strings.ToLower(strings.TrimSpace(req.Settings.ActiveDriver))
+			if drv == "" || drv == "local" {
+				if _, vErr := s.deps.Config.ValidateCustomUploadDir(req.Settings.LocalDir); vErr != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": vErr.Error()})
+					return
+				}
+			}
+		}
 		if s.deps.Media != nil {
 			if err := s.deps.Media.TestStorage(r.Context(), req.Settings, req.SecretKey); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
-		} else {
-			if err := os.MkdirAll(s.deps.Config.UploadDir, 0o750); err != nil {
+		} else if s.deps.Config != nil {
+			if err := os.MkdirAll(s.deps.Config.GetUploadDir(), 0o750); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
@@ -2709,6 +2726,21 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		delete(patchMap, "expected_version")
+		if rest == domain.SettingsDomainStorage && s.deps.Config != nil {
+			if rawLocalDir, hasLocalDir := patchMap["local_dir"]; hasLocalDir {
+				dirStr, ok := rawLocalDir.(string)
+				if !ok {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "local_dir must be a string"})
+					return
+				}
+				normDir, vErr := s.deps.Config.ValidateCustomUploadDir(dirStr)
+				if vErr != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": vErr.Error()})
+					return
+				}
+				patchMap["local_dir"] = normDir
+			}
+		}
 		cleanPatch, _ := json.Marshal(patchMap)
 		expectedVer := parseVersionHeader(r, meta.ExpectedVersion)
 
@@ -2721,6 +2753,9 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": pErr.Error()})
 			return
 		}
+		if rest == domain.SettingsDomainStorage {
+			s.syncConfiguredUploadDir()
+		}
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "settings.patch", "settings", rest, map[string]any{"version": ver})
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
@@ -2728,6 +2763,33 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// syncConfiguredUploadDir applies the persisted `storage.local_dir` setting (validated against
+// workspace containment boundaries) to Config, Media pipeline, and BackupScheduler at runtime.
+func (s *AppServer) syncConfiguredUploadDir() {
+	if s == nil || s.deps.Config == nil {
+		return
+	}
+	rawDir := ""
+	if s.deps.Settings != nil {
+		rawDir = strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalDir)
+	}
+	if rawDir == "" {
+		s.deps.Config.SetUploadDir("")
+	} else if validDir, err := s.deps.Config.ValidateCustomUploadDir(rawDir); err == nil && validDir != "" {
+		_ = os.MkdirAll(validDir, 0o750)
+		s.deps.Config.SetUploadDir(validDir)
+	} else {
+		s.deps.Config.SetUploadDir("")
+	}
+	effective := s.deps.Config.GetUploadDir()
+	if setter, ok := s.deps.Media.(interface{ SetUploadDir(string) }); ok {
+		setter.SetUploadDir(effective)
+	}
+	if s.deps.BackupScheduler != nil {
+		s.deps.BackupScheduler.SetUploadDir(effective)
 	}
 }
 
@@ -3190,7 +3252,7 @@ func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Reque
 	s.recordAuditLog(r, actor, "backup.export", "system", filename, map[string]any{"include_media": withMedia})
 	_, _ = backup.Create(r.Context(), s.deps.Store, w, backup.CreateOptions{
 		IncludeMedia: withMedia,
-		UploadDir:    s.deps.Config.UploadDir,
+		UploadDir:    s.deps.Config.GetUploadDir(),
 	})
 }
 
@@ -3242,7 +3304,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 					Settings:       s.deps.Settings,
 					Plugins:        s.deps.Plugins,
 					BackupDir:      backupDir,
-					UploadDir:      s.deps.Config.UploadDir,
+					UploadDir:      s.deps.Config.GetUploadDir(),
 					OutboundDialer: s.deps.OutboundDialer,
 				})
 			}
@@ -3295,7 +3357,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		if isLegacyArchiveFile(fullPath) {
 			rep, lErr := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, fullPath, etl.ImportOptions{
 				DryRun:          dryRun,
-				TargetUploadDir: s.deps.Config.UploadDir,
+				TargetUploadDir: s.deps.Config.GetUploadDir(),
 				AdminPath:       s.deps.Config.AdminPath,
 			})
 			if lErr != nil {
@@ -3314,7 +3376,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 
 		sum, rErr := backup.RestoreFromFile(r.Context(), s.deps.Store, fullPath, backup.RestoreOptions{
 			DryRun:    dryRun,
-			UploadDir: s.deps.Config.UploadDir,
+			UploadDir: s.deps.Config.GetUploadDir(),
 		})
 		if rErr != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": rErr.Error()})
@@ -3413,7 +3475,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 	if isLegacyArchiveFile(tmpPath) {
 		rep, lErr := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, etl.ImportOptions{
 			DryRun:          dryRun,
-			TargetUploadDir: s.deps.Config.UploadDir,
+			TargetUploadDir: s.deps.Config.GetUploadDir(),
 			AdminPath:       s.deps.Config.AdminPath,
 		})
 		if lErr != nil {
@@ -3432,7 +3494,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 
 	sum, err := backup.RestoreFromFile(r.Context(), s.deps.Store, tmpPath, backup.RestoreOptions{
 		DryRun:    dryRun,
-		UploadDir: s.deps.Config.UploadDir,
+		UploadDir: s.deps.Config.GetUploadDir(),
 	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})

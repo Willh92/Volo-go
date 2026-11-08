@@ -102,13 +102,14 @@ type Config struct {
 	ShutdownTimeout   time.Duration
 	DefaultLocale     string
 
-	DataDir    string
-	UploadDir  string
-	BackupDir  string
-	GeoIPDir   string
-	ThemesDir  string
-	PluginsDir string
-	LocalesDir string
+	DataDir          string
+	UploadDir        string
+	DefaultUploadDir string
+	BackupDir        string
+	GeoIPDir         string
+	ThemesDir        string
+	PluginsDir       string
+	LocalesDir       string
 
 	DBDriver         string // sqlite | postgres | mysql
 	DBDSN            string
@@ -116,6 +117,122 @@ type Config struct {
 	DBMaxOpenConns   int
 	DBMaxIdleConns   int
 	DBConnLifetime   time.Duration
+}
+
+// GetUploadDir returns the active local media upload directory in a thread-safe manner.
+func (c *Config) GetUploadDir() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.UploadDir) != "" {
+		return c.UploadDir
+	}
+	return c.DefaultUploadDir
+}
+
+// GetDefaultUploadDir returns the bootstrap default local upload directory resolved at startup.
+func (c *Config) GetDefaultUploadDir() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.DefaultUploadDir) != "" {
+		return c.DefaultUploadDir
+	}
+	return c.UploadDir
+}
+
+// SetUploadDir updates the active local upload directory (or resets to DefaultUploadDir when empty) under a write lock.
+func (c *Config) SetUploadDir(dir string) {
+	if c == nil {
+		return
+	}
+	clean := strings.TrimSpace(dir)
+	c.mu.Lock()
+	if c.DefaultUploadDir == "" && c.UploadDir != "" {
+		c.DefaultUploadDir = c.UploadDir
+	}
+	if clean == "" {
+		c.UploadDir = c.DefaultUploadDir
+	} else {
+		c.UploadDir = filepath.Clean(clean)
+	}
+	c.mu.Unlock()
+}
+
+// ValidateCustomUploadDir ensures a custom local media directory does not traverse "..", point to a
+// filesystem/system root, or encompass sensitive workspace directories (working dir, DataDir/volo.db, BackupDir, ThemesDir, PluginsDir).
+func (c *Config) ValidateCustomUploadDir(rawDir string) (string, error) {
+	trimmed := strings.TrimSpace(rawDir)
+	if trimmed == "" {
+		return "", nil
+	}
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] <= 0x1F || trimmed[i] == 0x7F {
+			return "", errors.New("config: local_dir contains control characters")
+		}
+	}
+	normSlash := strings.ReplaceAll(trimmed, `\`, "/")
+	for _, seg := range strings.Split(normSlash, "/") {
+		if seg == ".." {
+			return "", errors.New("config: local_dir must not contain '..' segments")
+		}
+	}
+	cleaned := filepath.Clean(trimmed)
+	if cleaned == "." || cleaned == ".." || cleaned == "/" || cleaned == `\` {
+		return "", errors.New("config: local_dir must point to a dedicated media directory")
+	}
+	absTarget, err := filepath.Abs(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("config: invalid local_dir: %w", err)
+	}
+	if filepath.Dir(absTarget) == absTarget {
+		return "", errors.New("config: local_dir cannot be filesystem root")
+	}
+	lowTarget := strings.ToLower(filepath.ToSlash(absTarget))
+	for _, sysRoot := range []string{
+		"/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/run", "/var/run",
+		"c:/windows", "c:/program files", "c:/program files (x86)",
+	} {
+		if lowTarget == sysRoot || strings.HasPrefix(lowTarget, sysRoot+"/") {
+			return "", fmt.Errorf("config: local_dir cannot target system directory %q", sysRoot)
+		}
+	}
+
+	var protected []string
+	if wd, wdErr := os.Getwd(); wdErr == nil && wd != "" {
+		protected = append(protected, wd)
+	}
+	if c != nil {
+		c.mu.RLock()
+		protected = append(protected, c.DataDir, c.BackupDir, c.ThemesDir, c.PluginsDir, c.GeoIPDir, c.LocalesDir)
+		c.mu.RUnlock()
+	}
+	targetCmp := filepath.Clean(absTarget)
+	if os.PathSeparator == '\\' {
+		targetCmp = strings.ToLower(targetCmp)
+	}
+	for _, p := range protected {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		pAbs, aErr := filepath.Abs(p)
+		if aErr != nil {
+			continue
+		}
+		pCmp := filepath.Clean(pAbs)
+		if os.PathSeparator == '\\' {
+			pCmp = strings.ToLower(pCmp)
+		}
+		// Reject if custom upload dir equals a protected dir OR contains a protected dir inside it!
+		if targetCmp == pCmp || strings.HasPrefix(pCmp, targetCmp+string(filepath.Separator)) {
+			return "", fmt.Errorf("config: local_dir cannot equal or enclose protected directory %q", p)
+		}
+	}
+	return cleaned, nil
 }
 
 // GetPublicURL returns the current canonical public URL in a thread-safe manner.
@@ -144,8 +261,10 @@ func (c *Config) SetPublicURL(u string) {
 	}
 	c.mu.Lock()
 	c.PublicURL = clean
-	if origin != "" || clean == "" {
-		c.PublicOrigin = origin
+	if origin != "" || clean != "" {
+		if origin != "" || clean == "" {
+			c.PublicOrigin = origin
+		}
 	}
 	c.mu.Unlock()
 }
@@ -382,6 +501,7 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 		DefaultLocale:     locale,
 		DataDir:           dataDir,
 		UploadDir:         uploadDir,
+		DefaultUploadDir:  uploadDir,
 		BackupDir:         backupDir,
 		GeoIPDir:          geoIPDir,
 		ThemesDir:         themesDir,

@@ -20,6 +20,7 @@ import {
   AnimatedModal,
   BatchBar,
   computePortalMenuStyle,
+  ConsoleDatePicker,
   ConsoleEmpty,
   ConsoleSelect,
   MobileSelectAllBar,
@@ -30,7 +31,14 @@ import {
   UploadButton,
   useDebouncedValue,
 } from "../components/UIControls";
-import { availableLocalesSig, formatDateTime, localeSig, t } from "../i18n";
+import {
+  availableLocalesSig,
+  formatDateTime,
+  localeSig,
+  localizeAuditAction,
+  localizeAuditResource,
+  t,
+} from "../i18n";
 
 export type OverviewSection = "dashboard" | "editor" | "articles" | "drafts";
 
@@ -275,72 +283,88 @@ function buildHunkChunks(lines: DiffLine[], expanded: Record<string, boolean>, c
   return chunks;
 }
 
-function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: number }> }) {
+function MonthlyArticlesChart({
+  items,
+  isHistory = false,
+}: {
+  items: Array<{ month: string; count: number }>;
+  isHistory?: boolean;
+}) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const series = items.length > 0 ? items : buildFallbackMonths(12);
   const W = 320;
-  const H = 160;
-  const padL = 38;
-  const padR = 14;
-  const padT = 14;
+  const H = 164;
+  const padL = 36;
+  const padR = 12;
+  const padT = 16;
   const padB = 28;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
   const maxVal = Math.max(2, ...series.map((d) => Number(d.count || 0)));
   const yMax = Math.ceil(maxVal / 2) * 2;
-  const n = series.length;
+  const n = Math.max(1, series.length);
+  const slotW = plotW / n;
+  const barW = Math.max(2.5, Math.min(18, slotW * (n > 24 ? 0.72 : 0.62)));
 
-  const pts: ChartPoint[] = series.map((d, idx) => ({
-    x: padL + (n <= 1 ? plotW / 2 : (idx / (n - 1)) * plotW),
-    y: padT + plotH - (Number(d.count || 0) / yMax) * plotH,
-  }));
-  const line = buildSmoothCurve(pts);
-  const area =
-    pts.length > 0
-      ? `${line} L ${pts[pts.length - 1].x.toFixed(1)} ${(padT + plotH).toFixed(1)} L ${pts[0].x.toFixed(1)} ${(padT + plotH).toFixed(1)} Z`
-      : "";
+  const years = new Set(series.map((d) => String(d.month || "").slice(0, 4)).filter(Boolean));
+  const multiYear = isHistory || years.size > 1;
+  const maxLabels = multiYear ? 4 : 5;
+  const labelIndices = new Set<number>();
+  if (n <= maxLabels) {
+    for (let i = 0; i < n; i++) labelIndices.add(i);
+  } else {
+    labelIndices.add(0);
+    labelIndices.add(n - 1);
+    for (let k = 1; k < maxLabels - 1; k++) {
+      labelIndices.add(Math.round((k * (n - 1)) / (maxLabels - 1)));
+    }
+  }
+
+  const pickBarIndex = (svg: SVGSVGElement, clientX: number): number | null => {
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return null;
+    const svgX = ((clientX - rect.left) / rect.width) * W;
+    const raw = Math.floor((svgX - padL) / slotW);
+    return Math.max(0, Math.min(n - 1, raw));
+  };
 
   const active = hoverIdx !== null && series[hoverIdx] ? series[hoverIdx] : null;
-  const activePt = hoverIdx !== null && pts[hoverIdx] ? pts[hoverIdx] : null;
+  const activeCx = hoverIdx !== null && series[hoverIdx] ? padL + slotW * (hoverIdx + 0.5) : null;
 
   const onTouch = (e: TouchEvent) => {
     const touch = e.touches?.[0];
     if (!touch) return;
-    const idx = pickSvgIndex(e.currentTarget as SVGSVGElement, touch.clientX, n, W, padL, plotW);
+    const idx = pickBarIndex(e.currentTarget as SVGSVGElement, touch.clientX);
     if (idx !== null) setHoverIdx(idx);
   };
 
   return (
     <div class="volo-chart-stage" style={{ flex: 1, display: "flex", alignItems: "center" }}>
-      {active && activePt && (
+      {active && activeCx !== null && (
         <div
           class="volo-chart-tooltip"
           style={{
-            left: activePt.x > W * 0.62 ? "auto" : `${Math.max(6, (activePt.x / W) * 100)}%`,
-            right: activePt.x > W * 0.62 ? `${Math.max(6, ((W - activePt.x) / W) * 100)}%` : "auto",
+            left: activeCx > W * 0.62 ? "auto" : `${Math.max(6, (activeCx / W) * 100)}%`,
+            right: activeCx > W * 0.62 ? `${Math.max(6, ((W - activeCx) / W) * 100)}%` : "auto",
           }}
         >
           <div style={{ fontWeight: 650 }}>{active.month}</div>
-          <div>{t("ov.published")}: {Number(active.count || 0).toLocaleString()}</div>
+          <div>
+            {t("ov.published")}: {Number(active.count || 0).toLocaleString()}
+          </div>
         </div>
       )}
       <svg
         viewBox={`0 0 ${W} ${H}`}
         style={{ width: "100%", height: "auto", display: "block", touchAction: "pan-y" }}
         onMouseMove={(e) => {
-          const idx = pickSvgIndex(e.currentTarget as SVGSVGElement, e.clientX, n, W, padL, plotW);
+          const idx = pickBarIndex(e.currentTarget as SVGSVGElement, e.clientX);
           if (idx !== null) setHoverIdx(idx);
         }}
         onMouseLeave={() => setHoverIdx(null)}
         onTouchStart={onTouch}
         onTouchMove={onTouch}
       >
-        <defs>
-          <linearGradient id="voloMonthlyGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="var(--volo-accent)" stop-opacity="0.24" />
-            <stop offset="100%" stop-color="var(--volo-accent)" stop-opacity="0.02" />
-          </linearGradient>
-        </defs>
         {[0, 0.5, 1].map((ratio, idx) => {
           const y = padT + plotH - ratio * plotH;
           const val = Math.round(ratio * yMax);
@@ -354,42 +378,68 @@ function MonthlyArticlesChart({ items }: { items: Array<{ month: string; count: 
                 stroke="var(--volo-line)"
                 stroke-dasharray={ratio === 0 ? undefined : "3 3"}
               />
-              <text x={padL - 5} y={y + 3.5} text-anchor="end" font-size="11" fill="var(--volo-muted)">
+              <text x={padL - 5} y={y + 3.5} text-anchor="end" font-size="10.5" fill="var(--volo-muted)">
                 {formatCompactNum(val)}
               </text>
             </g>
           );
         })}
-        {area && <path d={area} fill="url(#voloMonthlyGrad)" />}
-        {line && <path d={line} fill="none" stroke="var(--volo-accent)" stroke-width="2.2" stroke-linecap="round" />}
-        {activePt && (
-          <line
-            x1={activePt.x}
-            y1={padT}
-            x2={activePt.x}
-            y2={padT + plotH}
-            stroke="var(--volo-accent)"
-            stroke-dasharray="3 3"
-            stroke-opacity="0.55"
+        {hoverIdx !== null && series[hoverIdx] && (
+          <rect
+            x={padL + slotW * hoverIdx}
+            y={padT}
+            width={slotW}
+            height={plotH}
+            rx="3"
+            fill="var(--volo-accent)"
+            fill-opacity="0.08"
           />
         )}
         {series.map((d, idx) => {
-          const p = pts[idx];
-          const showLbl = idx === 0 || idx === Math.floor(n / 2) || idx === n - 1;
+          const val = Number(d.count || 0);
+          const cx = padL + slotW * (idx + 0.5);
+          const rawH = (val / yMax) * plotH;
+          const barH = val > 0 ? Math.max(2.5, rawH) : 1.5;
+          const barY = padT + plotH - barH;
           const isHover = hoverIdx === idx;
+          const showLbl = labelIndices.has(idx);
+          const anchor =
+            n > maxLabels && idx === 0 ? "start" : n > maxLabels && idx === n - 1 ? "end" : "middle";
+          const lblX =
+            anchor === "start" ? Math.max(padL, cx - barW / 2) : anchor === "end" ? Math.min(W - padR, cx + barW / 2) : cx;
+          const lblText = multiYear ? String(d.month) : String(d.month).slice(2);
           return (
-            <g key={d.month}>
-              <circle
-                cx={p.x}
-                cy={p.y}
-                r={isHover ? 4.4 : 2.6}
-                fill="var(--volo-surface)"
-                stroke="var(--volo-accent)"
-                stroke-width={isHover ? 2.4 : 1.8}
+            <g key={`${d.month}-${idx}`}>
+              <rect
+                x={cx - barW / 2}
+                y={barY}
+                width={barW}
+                height={barH}
+                rx={Math.min(3, barW / 2)}
+                fill={val > 0 ? "var(--volo-accent)" : "var(--volo-line)"}
+                fill-opacity={val > 0 ? (isHover ? "1" : "0.82") : "0.65"}
               />
+              {val > 0 && (n <= 16 || isHover) && (
+                <text
+                  x={cx}
+                  y={Math.max(10.5, barY - 3.5)}
+                  text-anchor="middle"
+                  font-size="9.5"
+                  font-weight="600"
+                  fill={isHover ? "var(--volo-accent)" : "var(--volo-muted)"}
+                >
+                  {formatCompactNum(val)}
+                </text>
+              )}
               {showLbl && (
-                <text x={p.x} y={H - 6} text-anchor="middle" font-size="11" fill="var(--volo-muted)">
-                  {String(d.month).slice(2)}
+                <text
+                  x={lblX}
+                  y={H - 6}
+                  text-anchor={anchor}
+                  font-size={multiYear ? "9.5" : "10.5"}
+                  fill="var(--volo-muted)"
+                >
+                  {lblText}
                 </text>
               )}
             </g>
@@ -405,14 +455,18 @@ function DonutChart({
   emptyText,
   prefix = "",
 }: {
-  items: Array<{ name: string; count: number }>;
+  items: Array<{ name: string; count?: number; article_count?: number }>;
   emptyText: string;
   prefix?: string;
 }) {
-  const allPositive = [...(items || [])]
-    .filter((it) => Number(it.count || 0) > 0)
-    .sort((a, b) => Number(b.count || 0) - Number(a.count || 0));
-  const total = allPositive.reduce((acc, it) => acc + Number(it.count || 0), 0);
+  const allPositive = (items || [])
+    .map((it) => ({
+      name: it.name,
+      count: Number(it.count ?? it.article_count ?? 0),
+    }))
+    .filter((it) => it.count > 0)
+    .sort((a, b) => b.count - a.count);
+  const total = allPositive.reduce((acc, it) => acc + it.count, 0);
 
   if (allPositive.length === 0 || total <= 0) {
     return (
@@ -428,7 +482,7 @@ function DonutChart({
           ...allPositive.slice(0, 5),
           {
             name: t("ov.chart_others"),
-            count: allPositive.slice(5).reduce((acc, it) => acc + Number(it.count || 0), 0),
+            count: allPositive.slice(5).reduce((acc, it) => acc + it.count, 0),
             isOthers: true,
           },
         ]
@@ -524,6 +578,7 @@ export function OverviewWorkspace({
 
   const [overview, setOverview] = useState<any>(null);
   const [trendDays, setTrendDays] = useState<7 | 30>(7);
+  const [monthlyRangeMode, setMonthlyRangeMode] = useState<"auto" | "12m" | "history">("auto");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const chartStageRef = useRef<HTMLDivElement | null>(null);
   const [articles, setArticles] = useState<any[]>([]);
@@ -1675,13 +1730,13 @@ export function OverviewWorkspace({
                       {status === "scheduled" && (
                         <div class="volo-field">
                           <label>{t("art.scheduled_at")}</label>
-                          <input
-                            type="datetime-local"
-                            class="volo-input"
-                            required
+                          <ConsoleDatePicker
+                            mode="datetime"
+                            clearable={false}
+                            ariaLabel={t("art.scheduled_at")}
                             value={scheduledAtStr}
-                            onInput={(e) => {
-                              setScheduledAtStr((e.currentTarget as HTMLInputElement).value);
+                            onChange={(val) => {
+                              setScheduledAtStr(val);
                               dirtyEditorSig.value = true;
                             }}
                           />
@@ -1773,12 +1828,13 @@ export function OverviewWorkspace({
                       )}
                       <div class="volo-field">
                         <label>{t("art.published_at")}</label>
-                        <input
-                          type="datetime-local"
-                          class="volo-input"
+                        <ConsoleDatePicker
+                          mode="datetime"
+                          clearable={true}
+                          ariaLabel={t("art.published_at")}
                           value={publishedAtStr}
-                          onInput={(e) => {
-                            setPublishedAtStr((e.currentTarget as HTMLInputElement).value);
+                          onChange={(val) => {
+                            setPublishedAtStr(val);
                             dirtyEditorSig.value = true;
                           }}
                         />
@@ -3173,10 +3229,49 @@ export function OverviewWorkspace({
           </div>
         </div>
         <div class="volo-grid-3">
-          <div class="volo-mini-chart-card">
-            <h4 class="volo-mini-chart-title">{t("ov.chart_monthly")}</h4>
-            <MonthlyArticlesChart items={overview?.monthly_articles || []} />
-          </div>
+          {(() => {
+            const monthly12: Array<{ month: string; count: number }> = overview?.monthly_articles || [];
+            const monthlyHist: Array<{ month: string; count: number }> = overview?.monthly_history || [];
+            const hasHist = monthlyHist.length > 0;
+            const recent12Sum = monthly12.reduce((acc, x) => acc + Number(x.count || 0), 0);
+            const hasOutside12m = monthlyHist.some((h) => !monthly12.some((m) => m.month === h.month));
+            const effectiveMode: "12m" | "history" = !hasHist
+              ? "12m"
+              : monthlyRangeMode === "auto"
+                ? hasOutside12m || recent12Sum === 0
+                  ? "history"
+                  : "12m"
+                : monthlyRangeMode;
+            return (
+              <div class="volo-mini-chart-card">
+                <div class="volo-mini-chart-head">
+                  <h4 class="volo-mini-chart-title" style={{ margin: 0 }}>{t("ov.chart_monthly")}</h4>
+                  {hasHist && (
+                    <div class="volo-chart-toggle">
+                      <button
+                        type="button"
+                        class={`volo-chart-toggle-btn ${effectiveMode === "history" ? "is-active" : ""}`}
+                        onClick={() => setMonthlyRangeMode("history")}
+                      >
+                        {t("ov.monthly_history")}
+                      </button>
+                      <button
+                        type="button"
+                        class={`volo-chart-toggle-btn ${effectiveMode === "12m" ? "is-active" : ""}`}
+                        onClick={() => setMonthlyRangeMode("12m")}
+                      >
+                        {t("ov.monthly_12m")}
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <MonthlyArticlesChart
+                  items={effectiveMode === "history" ? monthlyHist : monthly12}
+                  isHistory={effectiveMode === "history"}
+                />
+              </div>
+            );
+          })()}
           <div class="volo-mini-chart-card">
             <h4 class="volo-mini-chart-title">{t("ov.chart_categories")}</h4>
             <DonutChart items={overview?.category_usage || []} emptyText={t("ov.chart_empty")} />
@@ -3239,10 +3334,12 @@ export function OverviewWorkspace({
               {recentLogs.slice(0, 6).map((lg: any) => (
                 <div key={lg.id} class="volo-rank-row">
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}>
-                    <span class="volo-code-chip">{lg.action}</span>
+                    <span class="volo-code-chip" title={lg.action}>
+                      {localizeAuditAction(lg.action)}
+                    </span>
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "13px" }}>
                       <strong>{lg.actor_name || "-"}</strong>
-                      {lg.resource_type ? ` · ${lg.resource_type}` : ""}
+                      {lg.resource_type ? ` · ${localizeAuditResource(lg.resource_type)}` : ""}
                     </span>
                   </div>
                   <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", fontSize: "11.5px", whiteSpace: "nowrap" }}>

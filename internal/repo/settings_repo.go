@@ -86,6 +86,7 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 		if s.Site.LicenseTemplate == "本文由 {author} 原创发布于 {title}，转载请注明原文链接：{url}" {
 			s.Site.LicenseTemplate = "本文由 {author} 原创发布于 {site}，转载请注明原文链接：{url}"
 		}
+		s.Site.NoticeBoard = NormalizeSiteInjectionHTML(s.Site.NoticeBoard)
 		s.Site.CustomHeadMeta = NormalizeSiteInjectionHTML(s.Site.CustomHeadMeta)
 		s.Site.FooterText = NormalizeSiteInjectionHTML(s.Site.FooterText)
 		if s.Site.FaviconURL != "" {
@@ -580,6 +581,7 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		}
 		v.CustomHeadMeta = NormalizeSiteInjectionHTML(v.CustomHeadMeta)
 		v.FooterText = NormalizeSiteInjectionHTML(v.FooterText)
+		v.NoticeBoard = NormalizeSiteInjectionHTML(v.NoticeBoard)
 		if v.CustomVars == nil {
 			v.CustomVars = map[string]string{}
 		}
@@ -635,6 +637,20 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if !isValidStorageDriverID(v.ActiveDriver) {
 			return nil, fmt.Errorf("settings: invalid storage.active_driver %q", v.ActiveDriver)
 		}
+		v.LocalDir = strings.TrimSpace(StripASCIIControls(v.LocalDir))
+		if strings.Contains(v.LocalDir, "..") {
+			return nil, fmt.Errorf("settings: invalid storage.local_dir %q", v.LocalDir)
+		}
+		cleanKeyPrefix := strings.Trim(strings.ReplaceAll(strings.TrimSpace(StripASCIIControls(v.LocalKeyPrefix)), "\\", "/"), "/")
+		if strings.Contains(cleanKeyPrefix, "..") || len(cleanKeyPrefix) > 120 {
+			return nil, fmt.Errorf("settings: invalid storage.local_key_prefix %q", v.LocalKeyPrefix)
+		}
+		for _, r := range cleanKeyPrefix {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '/' || r == '-' || r == '_' || r == '.') {
+				return nil, fmt.Errorf("settings: invalid character in storage.local_key_prefix %q", v.LocalKeyPrefix)
+			}
+		}
+		v.LocalKeyPrefix = cleanKeyPrefix
 		v.S3SecretKeySet = false
 		return json.Marshal(v)
 	case domain.SettingsDomainNotifications:

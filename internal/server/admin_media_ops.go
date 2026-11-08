@@ -83,10 +83,10 @@ func defaultReconcileMIMEType(ext string, sample []byte) string {
 // and registers untracked valid media files in `media_assets`, normalizing EXIF orientation & stripping
 // image metadata on disk via `media.NormalizeLocalImageBytes` and returning the number of newly imported rows.
 func (s *AppServer) reconcileLocalUploads(ctx context.Context) int {
-	if s.deps.Config == nil || strings.TrimSpace(s.deps.Config.UploadDir) == "" {
+	if s.deps.Config == nil || strings.TrimSpace(s.deps.Config.GetUploadDir()) == "" {
 		return 0
 	}
-	rootAbs, err := filepath.Abs(s.deps.Config.UploadDir)
+	rootAbs, err := filepath.Abs(s.deps.Config.GetUploadDir())
 	if err != nil {
 		return 0
 	}
@@ -573,8 +573,13 @@ func (s *AppServer) scanOrCleanOrphans(ctx context.Context, deleteOrphans bool) 
 		if refCounts[i] == 0 {
 			orphans = append(orphans, a)
 			if deleteOrphans {
-				if a.StorageDriver == "local" && a.ObjectKey != "" && s.deps.Config != nil && s.deps.Config.UploadDir != "" {
-					_ = safeUnlinkLocalAsset(s.deps.Config.UploadDir, a.ObjectKey)
+				if a.StorageDriver == "local" && a.ObjectKey != "" && s.deps.Config != nil {
+					if curDir := s.deps.Config.GetUploadDir(); curDir != "" {
+						_ = safeUnlinkLocalAsset(curDir, a.ObjectKey)
+						if defDir := s.deps.Config.GetDefaultUploadDir(); defDir != "" && defDir != curDir {
+							_ = safeUnlinkLocalAsset(defDir, a.ObjectKey)
+						}
+					}
 				}
 				_, _ = s.deps.Store.ExecContext(ctx, `DELETE FROM media_assets WHERE id = ?`, a.ID)
 				freed += a.SizeBytes

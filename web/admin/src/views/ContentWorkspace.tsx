@@ -19,6 +19,7 @@ import {
   ActionMenu,
   AnimatedModal,
   BatchBar,
+  ConsoleDatePicker,
   ConsoleEmpty,
   ConsoleSelect,
   MobileSelectAllBar,
@@ -3169,10 +3170,15 @@ export function ContentWorkspace({
                               <div class="volo-cell-title">{p.title}</div>
                               <div class="volo-cell-meta">
                                 <span class="volo-code-chip">/{p.slug}</span>
-                                {p.template && p.template !== "default" && (
-                                  <span class="volo-mini-tag">{p.template}</span>
-                                )}
-                                <span>{p.lang}</span>
+                                <span class="volo-mini-tag">
+                                  {!p.template || p.template === "default"
+                                    ? t("cnt.tpl_default")
+                                    : pageTemplateOptions.find((o) => o.value === p.template)?.label || p.template}
+                                </span>
+                                <span>
+                                  {availableLocalesSig.value.find((l) => l.code === p.lang)?.name ||
+                                    (p.lang === "zh-TW" ? "繁體中文" : p.lang)}
+                                </span>
                               </div>
                             </div>
                           </td>
@@ -3757,14 +3763,12 @@ export function ContentWorkspace({
               </div>
 
               <div class="volo-filter-controls">
-                <input
-                  type="month"
-                  class="volo-input"
-                  style={{ width: "auto" }}
-                  aria-label={t("cnt.media_month_lbl")}
+                <ConsoleDatePicker
+                  mode="month"
+                  ariaLabel={t("cnt.media_month_lbl")}
                   value={mediaMonthFilter}
-                  onInput={(e) => {
-                    setMediaMonthFilter((e.currentTarget as HTMLInputElement).value);
+                  onChange={(val) => {
+                    setMediaMonthFilter(val);
                     setPageIdx(1);
                   }}
                 />
@@ -3839,6 +3843,7 @@ export function ContentWorkspace({
                     const mime = String(m.mime_type || "");
                     const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id];
                     const isAudio = mime.startsWith("audio/");
+                    const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
                     const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE").toUpperCase();
                     const isSelected = selMediaIds.includes(m.id);
                     return (
@@ -3859,6 +3864,8 @@ export function ContentWorkspace({
                               src={m.public_url}
                               alt={m.alt_text || displayName}
                               loading="lazy"
+                              decoding="async"
+                              class={isSmallImg ? "is-small-img" : ""}
                               onError={() => setBrokenMediaIds((prev) => ({ ...prev, [m.id]: true }))}
                             />
                           ) : isAudio ? (
@@ -3955,6 +3962,18 @@ export function ContentWorkspace({
                       {displayMedia.map((m) => {
                         const displayName = m.original_name || m.id;
                         const mime = String(m.mime_type || "");
+                        const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id];
+                        const isAudio = mime.startsWith("audio/");
+                        const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
+                        const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE")
+                          .toUpperCase()
+                          .slice(0, 5);
+                        const driverLabel =
+                          m.storage_driver === "local"
+                            ? t("cnt.driver_local_short")
+                            : m.storage_driver === "s3"
+                              ? "S3"
+                              : m.storage_driver;
                         return (
                           <tr key={m.id}>
                             <td class="col-check">
@@ -3965,20 +3984,57 @@ export function ContentWorkspace({
                               />
                             </td>
                             <td class="col-fluid" data-label={t("cnt.media_col_asset")}>
-                              <div class="volo-cell-main" style={{ minWidth: 0 }}>
-                                <div class="volo-cell-title" style={{ minWidth: 0 }}>
-                                  <button
-                                    type="button"
-                                    class="volo-act-btn"
-                                    style={{ minWidth: 0, maxWidth: "100%", overflowWrap: "anywhere", textAlign: "left" }}
-                                    onClick={() => openAssetLightbox(m)}
-                                  >
-                                    {displayName}
-                                  </button>
-                                  {m.storage_driver && <span class="volo-mini-tag">{m.storage_driver}</span>}
-                                </div>
-                                <div class="volo-cell-meta" style={{ minWidth: 0 }}>
-                                  <span class="volo-code-chip is-wrap">{m.public_url}</span>
+                              <div class="volo-media-list-asset">
+                                <button
+                                  type="button"
+                                  class="volo-media-list-thumb"
+                                  onClick={() => openAssetLightbox(m)}
+                                  aria-label={displayName}
+                                >
+                                  {isImage ? (
+                                    <img
+                                      src={m.public_url}
+                                      alt={m.alt_text || displayName}
+                                      loading="lazy"
+                                      decoding="async"
+                                      class={isSmallImg ? "is-small-img" : ""}
+                                      onError={() => setBrokenMediaIds((prev) => ({ ...prev, [m.id]: true }))}
+                                    />
+                                  ) : isAudio ? (
+                                    <svg
+                                      width="18"
+                                      height="18"
+                                      viewBox="0 0 24 24"
+                                      fill="none"
+                                      stroke="currentColor"
+                                      stroke-width="1.9"
+                                      stroke-linecap="round"
+                                      stroke-linejoin="round"
+                                      aria-hidden="true"
+                                    >
+                                      <path d="M9 18V5l12-2v13" />
+                                      <circle cx="6" cy="18" r="3" />
+                                      <circle cx="18" cy="16" r="3" />
+                                    </svg>
+                                  ) : (
+                                    <span class="volo-media-list-ext">{extBadge}</span>
+                                  )}
+                                </button>
+                                <div class="volo-cell-main" style={{ minWidth: 0 }}>
+                                  <div class="volo-cell-title" style={{ minWidth: 0 }}>
+                                    <button
+                                      type="button"
+                                      class="volo-act-btn"
+                                      style={{ minWidth: 0, maxWidth: "100%", overflowWrap: "anywhere", textAlign: "left" }}
+                                      onClick={() => openAssetLightbox(m)}
+                                    >
+                                      {displayName}
+                                    </button>
+                                    {driverLabel && <span class="volo-mini-tag">{driverLabel}</span>}
+                                  </div>
+                                  <div class="volo-cell-meta" style={{ minWidth: 0 }}>
+                                    <span class="volo-code-chip is-wrap">{m.public_url}</span>
+                                  </div>
                                 </div>
                               </div>
                             </td>

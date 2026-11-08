@@ -863,7 +863,7 @@ func TestRound2_LifecycleHooks_AdminOps_MediaEXIF_WebhooksReplay_And_BackupTicke
 
 	// Unused tags should contain tagTarget (0 articles), not tagSource (1 article)
 	_, unusedRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/tags?unused=1&q=Go", nil, adminCookies, nil)
-	if !strings.Contains(string(unusedRaw), tagTarget.ID) || strings.Contains(string(unusedRaw), tagSource.ID) {
+	if !strings.Contains(string(unusedRaw), `"id":"`+tagTarget.ID+`"`) || strings.Contains(string(unusedRaw), `"id":"`+tagSource.ID+`"`) {
 		t.Fatalf("unexpected unused=1 tags response: %s", string(unusedRaw))
 	}
 

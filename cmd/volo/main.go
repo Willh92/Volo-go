@@ -255,6 +255,42 @@ func openMigratedStore(ctx context.Context, cfg *config.Config) (*sqlx.Store, er
 	return store, nil
 }
 
+func applyPersistedUploadDir(ctx context.Context, cfg *config.Config, store *sqlx.Store, settingsMgr *repo.SettingsManager, fs *flag.FlagSet) {
+	if cfg == nil {
+		return
+	}
+	if fs != nil {
+		uploadFlagSet := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "upload-dir" {
+				uploadFlagSet = true
+			}
+		})
+		if uploadFlagSet {
+			return
+		}
+	}
+	if strings.TrimSpace(os.Getenv("VOLO_UPLOAD_DIR")) != "" {
+		return
+	}
+	mgr := settingsMgr
+	if mgr == nil && store != nil {
+		mgr = repo.NewSettingsManager(store, cfg.KeyRing, cfg.DefaultLocale)
+		_, _ = mgr.Reload(ctx)
+	}
+	if mgr == nil {
+		return
+	}
+	rawDir := strings.TrimSpace(mgr.Snapshot().Storage.LocalDir)
+	if rawDir == "" {
+		return
+	}
+	if validDir, err := cfg.ValidateCustomUploadDir(rawDir); err == nil && validDir != "" {
+		_ = os.MkdirAll(validDir, 0o750)
+		cfg.SetUploadDir(validDir)
+	}
+}
+
 func pruneExpiredMaintenance(ctx context.Context, store *sqlx.Store, pluginMgr *plugin.Manager) {
 	if pluginMgr != nil {
 		if _, err := pluginMgr.PurgeExpiredKV(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -295,7 +331,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 
-	for _, dir := range []string{cfg.DataDir, cfg.UploadDir, cfg.BackupDir} {
+	for _, dir := range []string{cfg.DataDir, cfg.GetUploadDir(), cfg.BackupDir} {
 		if mkErr := os.MkdirAll(dir, 0o750); mkErr != nil {
 			fmt.Fprintf(stderr, "volo serve: directory init failed (%s): %v\n", dir, mkErr)
 			return 1
@@ -321,6 +357,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "volo serve: settings load failed: %v\n", err)
 		return 1
 	}
+	applyPersistedUploadDir(ctx, cfg, store, settingsMgr, fs)
 
 	pluginMgr := plugin.NewManager(plugin.ManagerOptions{
 		Store:      store,
@@ -340,7 +377,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	mediaPipe := media.NewPipeline(media.PipelineOptions{
 		Store:          store,
 		Settings:       settingsMgr,
-		UploadDir:      cfg.UploadDir,
+		UploadDir:      cfg.GetUploadDir(),
 		OutboundDialer: outboundDialer,
 		Plugins:        pluginMgr,
 	})
@@ -367,7 +404,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		Settings:       settingsMgr,
 		Plugins:        pluginMgr,
 		BackupDir:      cfg.BackupDir,
-		UploadDir:      cfg.UploadDir,
+		UploadDir:      cfg.GetUploadDir(),
 		OutboundDialer: outboundDialer,
 		Logger:         logging.TeeWriter(stderr, logging.Default()),
 	})
@@ -680,6 +717,7 @@ func cmdBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 			return 1
 		}
 		defer store.Close()
+		applyPersistedUploadDir(ctx, cfg, store, nil, fs)
 
 		dest := strings.TrimSpace(*outPath)
 		if dest == "" {
@@ -687,7 +725,7 @@ func cmdBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 		}
 		manifest, err := backup.CreateToFile(ctx, store, dest, backup.CreateOptions{
 			IncludeMedia: *withMedia,
-			UploadDir:    cfg.UploadDir,
+			UploadDir:    cfg.GetUploadDir(),
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "volo backup create: %v\n", err)
@@ -727,10 +765,11 @@ func cmdBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 			return 1
 		}
 		defer store.Close()
+		applyPersistedUploadDir(ctx, cfg, store, nil, fs)
 
 		sum, err := backup.RestoreFromFile(ctx, store, posPath, backup.RestoreOptions{
 			DryRun:    *dryRun,
-			UploadDir: cfg.UploadDir,
+			UploadDir: cfg.GetUploadDir(),
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "volo backup restore: %v\n", err)
@@ -781,6 +820,7 @@ func cmdImportLegacy(ctx context.Context, args []string, stdout io.Writer, stder
 
 	settingsMgr := repo.NewSettingsManager(store, cfg.KeyRing, cfg.DefaultLocale)
 	_, _ = settingsMgr.Reload(ctx)
+	applyPersistedUploadDir(ctx, cfg, store, settingsMgr, fs)
 
 	var oldPrefixes []string
 	for _, p := range strings.FieldsFunc(*oldSiteURL, func(r rune) bool {
@@ -793,7 +833,7 @@ func cmdImportLegacy(ctx context.Context, args []string, stdout io.Writer, stder
 
 	rep, err := etl.ImportLegacyArchive(ctx, store, settingsMgr, cfg.KeyRing, posPath, etl.ImportOptions{
 		DryRun:            *dryRun,
-		TargetUploadDir:   cfg.UploadDir,
+		TargetUploadDir:   cfg.GetUploadDir(),
 		AdminPath:         cfg.AdminPath,
 		OldURLPrefixes:    oldPrefixes,
 		NewSiteURL:        strings.TrimSpace(*newSiteURL),
@@ -829,6 +869,7 @@ func cmdDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 		return 1
 	}
 	defer store.Close()
+	applyPersistedUploadDir(ctx, cfg, store, nil, fs)
 
 	rep := doctor.Run(ctx, cfg, store)
 	if *asJSON {

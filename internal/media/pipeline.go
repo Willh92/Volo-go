@@ -71,11 +71,13 @@ type PipelineOptions struct {
 
 // Pipeline implements both `server.MediaProcessor` and `plugin.StorageProvider`.
 type Pipeline struct {
-	store          *sqlx.Store
-	settings       *repo.SettingsManager
-	uploadDir      string
-	outboundDialer *security.OutboundSafeDialer
-	plugins        *plugin.Manager
+	store            *sqlx.Store
+	settings         *repo.SettingsManager
+	dirMu            sync.RWMutex
+	uploadDir        string
+	defaultUploadDir string
+	outboundDialer   *security.OutboundSafeDialer
+	plugins          *plugin.Manager
 
 	dimsMu        sync.RWMutex
 	onDimsUpdated func(publicURL string, width, height int)
@@ -84,13 +86,54 @@ type Pipeline struct {
 // NewPipeline creates a privacy-first media pipeline.
 func NewPipeline(opts PipelineOptions) *Pipeline {
 	return &Pipeline{
-		store:          opts.Store,
-		settings:       opts.Settings,
-		uploadDir:      opts.UploadDir,
-		outboundDialer: opts.OutboundDialer,
-		plugins:        opts.Plugins,
-		onDimsUpdated:  opts.OnDimsUpdated,
+		store:            opts.Store,
+		settings:         opts.Settings,
+		uploadDir:        opts.UploadDir,
+		defaultUploadDir: opts.UploadDir,
+		outboundDialer:   opts.OutboundDialer,
+		plugins:          opts.Plugins,
+		onDimsUpdated:    opts.OnDimsUpdated,
 	}
+}
+
+// GetUploadDir returns the active local upload directory in a thread-safe manner.
+func (p *Pipeline) GetUploadDir() string {
+	if p == nil {
+		return ""
+	}
+	p.dirMu.RLock()
+	defer p.dirMu.RUnlock()
+	if strings.TrimSpace(p.uploadDir) != "" {
+		return p.uploadDir
+	}
+	return p.defaultUploadDir
+}
+
+// SetUploadDir updates the active local upload directory (or resets to defaultUploadDir when empty).
+func (p *Pipeline) SetUploadDir(dir string) {
+	if p == nil {
+		return
+	}
+	clean := strings.TrimSpace(dir)
+	p.dirMu.Lock()
+	if clean == "" {
+		p.uploadDir = p.defaultUploadDir
+	} else {
+		p.uploadDir = filepath.Clean(clean)
+	}
+	p.dirMu.Unlock()
+}
+
+func (p *Pipeline) qualifyObjectKey(baseKey string) string {
+	cfg := p.storageSettings()
+	driver := strings.ToLower(strings.TrimSpace(cfg.ActiveDriver))
+	if driver == "" || driver == "local" {
+		pfx := strings.Trim(strings.TrimSpace(cfg.LocalKeyPrefix), "/")
+		if pfx != "" && !strings.Contains(pfx, "..") && !strings.Contains(pfx, `\`) {
+			return pfx + "/" + strings.TrimLeft(baseKey, "/")
+		}
+	}
+	return baseKey
 }
 
 // SetOnDimsUpdated registers or updates the callback invoked when an uploaded image's intrinsic dimensions are recorded.
@@ -317,7 +360,7 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 			return nil, err
 		}
 
-		objectKey := fmt.Sprintf("%s/%s%s", now.Format("2006/01"), strings.ToLower(id.Next()), finalExt)
+		objectKey := p.qualifyObjectKey(fmt.Sprintf("%s/%s%s", now.Format("2006/01"), strings.ToLower(id.Next()), finalExt))
 		driverUsed, publicURL, err = p.storeRawObject(ctx, objectKey, finalBytes, finalMIME)
 		if err != nil {
 			return nil, err
@@ -369,7 +412,7 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 		}
 	}()
 
-	objectKey := fmt.Sprintf("%s/%s%s", now.Format("2006/01"), strings.ToLower(id.Next()), finalExt)
+	objectKey := p.qualifyObjectKey(fmt.Sprintf("%s/%s%s", now.Format("2006/01"), strings.ToLower(id.Next()), finalExt))
 	driverUsed, publicURL, err = p.storeStreamObject(ctx, objectKey, &tmpFile, &tmpPath, written, finalMIME)
 	if err != nil {
 		return nil, err
@@ -439,8 +482,12 @@ func (p *Pipeline) deleteAssetRecord(ctx context.Context, asset domain.MediaAsse
 		}
 	case "local", "":
 		if asset.ObjectKey != "" {
-			if err := safeDeleteLocalUpload(p.uploadDir, asset.ObjectKey); err != nil {
+			curDir := p.GetUploadDir()
+			if err := safeDeleteLocalUpload(curDir, asset.ObjectKey); err != nil {
 				return err
+			}
+			if p.defaultUploadDir != "" && p.defaultUploadDir != curDir {
+				_ = safeDeleteLocalUpload(p.defaultUploadDir, asset.ObjectKey)
 			}
 		}
 	default:
@@ -461,10 +508,11 @@ func (p *Pipeline) TestStorage(ctx context.Context, override *domain.StorageSett
 	driver := strings.ToLower(strings.TrimSpace(cfg.ActiveDriver))
 	switch driver {
 	case "", "local":
-		if err := os.MkdirAll(p.uploadDir, 0o750); err != nil {
+		targetDir := p.GetUploadDir()
+		if err := os.MkdirAll(targetDir, 0o750); err != nil {
 			return err
 		}
-		tmp, err := os.CreateTemp(p.uploadDir, ".volo-probe-*")
+		tmp, err := os.CreateTemp(targetDir, ".volo-probe-*")
 		if err != nil {
 			return err
 		}
@@ -666,7 +714,8 @@ func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []
 	if cleanRel == "." || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
 		return "", "", errors.New("invalid local object key")
 	}
-	dest := filepath.Join(p.uploadDir, cleanRel)
+	curUploadDir := p.GetUploadDir()
+	dest := filepath.Join(curUploadDir, cleanRel)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 		return "", "", err
 	}
@@ -678,8 +727,9 @@ func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []
 
 func (p *Pipeline) spoolToTempFile(r io.Reader, maxBytes int64) (*os.File, string, int64, string, error) {
 	tempDir := ""
-	if p.uploadDir != "" && os.MkdirAll(p.uploadDir, 0o750) == nil {
-		tempDir = p.uploadDir
+	curUploadDir := p.GetUploadDir()
+	if curUploadDir != "" && os.MkdirAll(curUploadDir, 0o750) == nil {
+		tempDir = curUploadDir
 	}
 	tmp, err := os.CreateTemp(tempDir, ".volo-upload-*")
 	if err != nil && tempDir != "" {
@@ -750,7 +800,7 @@ func (p *Pipeline) storeStreamObject(ctx context.Context, objectKey string, tmpF
 	if cleanRel == "." || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
 		return "", "", errors.New("invalid local object key")
 	}
-	dest := filepath.Join(p.uploadDir, cleanRel)
+	dest := filepath.Join(p.GetUploadDir(), cleanRel)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 		return "", "", err
 	}

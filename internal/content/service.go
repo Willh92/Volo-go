@@ -977,11 +977,25 @@ func (s *Service) ListPublicNavItems(ctx context.Context, locale string) ([]Publ
 		out := make([]PublicNavNode, 0, len(list))
 		for _, it := range list {
 			title := it.Title
+			hasExplicit := false
 			if strings.TrimSpace(it.I18nTitlesJSON) != "" {
 				var m map[string]string
 				if json.Unmarshal([]byte(it.I18nTitlesJSON), &m) == nil {
-					if locTitle := plugin.ResolveLocalized(m, locale); locTitle != "" {
+					if locTitle := lookupExactOrLangTitle(m, locale); locTitle != "" {
 						title = locTitle
+						hasExplicit = true
+					}
+				}
+			}
+			if !hasExplicit {
+				if inferred := inferBuiltinNavItemTitle(it.Title, it.URL, locale); inferred != "" {
+					title = inferred
+				} else if strings.TrimSpace(it.I18nTitlesJSON) != "" {
+					var m map[string]string
+					if json.Unmarshal([]byte(it.I18nTitlesJSON), &m) == nil {
+						if locTitle := plugin.ResolveLocalized(m, locale); locTitle != "" {
+							title = locTitle
+						}
 					}
 				}
 			}
@@ -997,6 +1011,83 @@ func (s *Service) ListPublicNavItems(ctx context.Context, locale string) ([]Publ
 		return out
 	}
 	return build(""), nil
+}
+
+func lookupExactOrLangTitle(m map[string]string, locale string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	loc := strings.TrimSpace(locale)
+	if v := strings.TrimSpace(m[loc]); v != "" {
+		return v
+	}
+	for k, v := range m {
+		if strings.EqualFold(strings.TrimSpace(k), loc) && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(loc), "en") {
+		if v := strings.TrimSpace(m["en-US"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(m["en"]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+var commonCustomNavLocales = map[string][3]string{
+	// key -> {zh-CN, zh-TW, en-US}
+	"关于":     {"关于", "關於", "About"},
+	"关于我":    {"关于我", "關於我", "About"},
+	"关于本站":   {"关于本站", "關於本站", "About"},
+	"about":  {"关于", "關於", "About"},
+	"我的开源":   {"我的开源", "我的開源", "Open Source"},
+	"开源":     {"开源", "開源", "Open Source"},
+	"开源项目":   {"开源项目", "開源專案", "Open Source"},
+	"友链":     {"友链", "友鏈", "Links"},
+	"友情链接":   {"友情链接", "友情連結", "Links"},
+	"留言":     {"留言", "留言", "Guestbook"},
+	"留言板":    {"留言板", "留言板", "Guestbook"},
+	"书单":     {"书单", "書單", "Bookshelf"},
+	"书架":     {"书架", "書架", "Bookshelf"},
+	"读书":     {"读书", "讀書", "Reading"},
+	"相册":     {"相册", "相冊", "Gallery"},
+	"订阅":     {"订阅", "訂閱", "Subscribe"},
+	"动态":     {"动态", "動態", "Stream"},
+	"归档":     {"归档", "歸檔", "Archives"},
+	"分类":     {"分类", "分類", "Categories"},
+	"标签":     {"标签", "標籤", "Tags"},
+	"专题":     {"专题", "專題", "Series"},
+	"作品":     {"作品", "作品", "Projects"},
+	"项目":     {"项目", "專案", "Projects"},
+}
+
+func inferBuiltinNavItemTitle(rawTitle, rawURL, locale string) string {
+	key := strings.ToLower(strings.TrimSpace(rawTitle))
+	entry, ok := commonCustomNavLocales[key]
+	if !ok {
+		cleanPath := strings.Trim(strings.ToLower(strings.TrimSpace(rawURL)), "/")
+		switch cleanPath {
+		case "about":
+			entry, ok = commonCustomNavLocales["关于"]
+		case "posts/my-github-repos", "my-github-repos", "github":
+			entry, ok = commonCustomNavLocales["我的开源"]
+		}
+	}
+	if !ok {
+		return ""
+	}
+	loc := strings.ToLower(strings.TrimSpace(locale))
+	switch {
+	case strings.HasPrefix(loc, "en"):
+		return entry[2]
+	case strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant"):
+		return entry[1]
+	default:
+		return entry[0]
+	}
 }
 
 // ListCategoriesWithCounts returns categories ordered by sort_order with published article counts.

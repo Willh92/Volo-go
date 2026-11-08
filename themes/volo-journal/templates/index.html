@@ -33,6 +33,7 @@
     {{else}}
       <section class="studio-hero studio-hero--simple studio-page-head">
         <div class="studio-hero-copy">
+          {{if .HeroBackURL}}<a class="studio-hero__back" href="{{.HeroBackURL}}"><span aria-hidden="true">←</span><span>{{.HeroBackLabel}}</span></a>{{end}}
           <h2 class="studio-hero__title">{{.HeroTitle}}</h2>
           {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
         </div>

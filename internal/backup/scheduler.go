@@ -67,6 +67,26 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 	}
 }
 
+// GetUploadDir returns the active media upload directory for backup archiving.
+func (s *Scheduler) GetUploadDir() string {
+	if s == nil {
+		return ""
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.opts.UploadDir
+}
+
+// SetUploadDir updates the active media upload directory dynamically when storage settings change.
+func (s *Scheduler) SetUploadDir(dir string) {
+	if s == nil {
+		return
+	}
+	s.stateMu.Lock()
+	s.opts.UploadDir = strings.TrimSpace(dir)
+	s.stateMu.Unlock()
+}
+
 // Start launches the background check loop until ctx is canceled or Close is called.
 func (s *Scheduler) Start(ctx context.Context) {
 	if s == nil {
@@ -180,7 +200,7 @@ func (s *Scheduler) runCycle(ctx context.Context) (*RunResult, error) {
 
 	if _, err := CreateToFile(ctx, s.opts.Store, localPath, CreateOptions{
 		IncludeMedia: cfg.IncludeMediaInAuto,
-		UploadDir:    s.opts.UploadDir,
+		UploadDir:    s.GetUploadDir(),
 	}); err != nil {
 		return nil, err
 	}

@@ -218,7 +218,7 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 			if clean == "" {
 				return ""
 			}
-			return template.HTML(render.Default().Render(clean, render.Options{Mode: render.RenderModeWeb}).HTML)
+			return template.HTML(render.Default().RenderTrustedMarkdownHTML(clean))
 		},
 		"linkifyLicense": func(licenseText string, canonicalURL string) template.HTML {
 			clean := strings.TrimSpace(licenseText)

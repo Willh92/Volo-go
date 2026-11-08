@@ -385,6 +385,654 @@ export function ConsoleSelect({
   );
 }
 
+const DP_MONTH_KEYS = [
+  "dp.m1",
+  "dp.m2",
+  "dp.m3",
+  "dp.m4",
+  "dp.m5",
+  "dp.m6",
+  "dp.m7",
+  "dp.m8",
+  "dp.m9",
+  "dp.m10",
+  "dp.m11",
+  "dp.m12",
+];
+const DP_WEEK_KEYS = ["dp.w0", "dp.w1", "dp.w2", "dp.w3", "dp.w4", "dp.w5", "dp.w6"];
+
+function pad2(n: number): string {
+  return String(Math.max(0, Math.floor(n))).padStart(2, "0");
+}
+
+function parseDatePickerValue(raw: string, mode: "month" | "datetime") {
+  const s = String(raw || "").trim();
+  if (mode === "month") {
+    const m = /^(\d{4})-(\d{2})/.exec(s);
+    if (m) {
+      const y = Number(m[1]);
+      const mo = Math.min(12, Math.max(1, Number(m[2])));
+      return { valid: true, y, m: mo, d: 1, hh: 0, mm: 0 };
+    }
+  } else {
+    const dt = /^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2}))?/.exec(s);
+    if (dt) {
+      const y = Number(dt[1]);
+      const mo = Math.min(12, Math.max(1, Number(dt[2])));
+      const maxD = new Date(y, mo, 0).getDate();
+      const d = Math.min(maxD, Math.max(1, Number(dt[3])));
+      const hh = dt[4] !== undefined ? Math.min(23, Math.max(0, Number(dt[4]))) : 0;
+      const mm = dt[5] !== undefined ? Math.min(59, Math.max(0, Number(dt[5]))) : 0;
+      return { valid: true, y, m: mo, d, hh, mm };
+    }
+  }
+  const now = new Date();
+  return {
+    valid: false,
+    y: now.getFullYear(),
+    m: now.getMonth() + 1,
+    d: now.getDate(),
+    hh: now.getHours(),
+    mm: now.getMinutes(),
+  };
+}
+
+export interface ConsoleDatePickerProps {
+  value: string;
+  onChange: (val: string) => void;
+  mode?: "month" | "datetime";
+  placeholder?: string;
+  clearable?: boolean;
+  disabled?: boolean;
+  className?: string;
+  style?: CSSProperties;
+  ariaLabel?: string;
+}
+
+export function ConsoleDatePicker({
+  value,
+  onChange,
+  mode = "datetime",
+  placeholder,
+  clearable = true,
+  disabled = false,
+  className = "",
+  style,
+  ariaLabel,
+}: ConsoleDatePickerProps) {
+  const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [flipUp, setFlipUp] = useState(false);
+  const [popStyle, setPopStyle] = useState<CSSProperties>({});
+
+  const parsed = parseDatePickerValue(value, mode);
+  const [viewYear, setViewYear] = useState(parsed.y);
+  const [viewMonth, setViewMonth] = useState(parsed.m);
+  const [draftDate, setDraftDate] = useState(`${parsed.y}-${pad2(parsed.m)}-${pad2(parsed.d)}`);
+  const [draftHour, setDraftHour] = useState(parsed.hh);
+  const [draftMinute, setDraftMinute] = useState(parsed.mm);
+  const [hourInput, setHourInput] = useState(pad2(parsed.hh));
+  const [minInput, setMinInput] = useState(pad2(parsed.mm));
+
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | undefined>(undefined);
+
+  const syncFromProp = () => {
+    const p = parseDatePickerValue(value, mode);
+    setViewYear(p.y);
+    setViewMonth(p.m);
+    setDraftDate(`${p.y}-${pad2(p.m)}-${pad2(p.d)}`);
+    setDraftHour(p.hh);
+    setDraftMinute(p.mm);
+    setHourInput(pad2(p.hh));
+    setMinInput(pad2(p.mm));
+  };
+
+  const updatePosition = () => {
+    const el = btnRef.current || wrapRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const vvTop = vv?.offsetTop ?? 0;
+    const vpH = vv?.height ?? window.innerHeight;
+    if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
+      setOpen(false);
+      setClosing(false);
+      return;
+    }
+    const isMonth = mode === "month";
+    const estH = popRef.current?.offsetHeight || (isMonth ? 252 : 368);
+    const pos = computePortalMenuStyle(rect, {
+      minW: isMonth ? 252 : 288,
+      maxW: isMonth ? 276 : 308,
+      maxH: isMonth ? 330 : 430,
+      estH,
+    });
+    setPopStyle({
+      ...pos.style,
+      width: pos.style.minWidth,
+      zIndex: 10050,
+    });
+    setFlipUp(pos.flipUp);
+  };
+
+  const closeAnimated = () => {
+    if (!open || closing) return;
+    setClosing(true);
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = window.setTimeout(() => {
+      setOpen(false);
+      setClosing(false);
+    }, 130);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    updatePosition();
+    const raf = window.requestAnimationFrame(updatePosition);
+    const onDocDown = (ev: MouseEvent) => {
+      const target = ev.target as Node;
+      if (wrapRef.current?.contains(target) || popRef.current?.contains(target)) return;
+      closeAnimated();
+    };
+    const onEsc = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        ev.stopPropagation();
+        closeAnimated();
+      }
+    };
+    const onRelayout = (ev: Event) => {
+      if (ev.type === "scroll" && popRef.current && ev.target instanceof Node && popRef.current.contains(ev.target)) {
+        return;
+      }
+      updatePosition();
+    };
+    const vv = window.visualViewport;
+    document.addEventListener("mousedown", onDocDown);
+    document.addEventListener("keydown", onEsc, true);
+    window.addEventListener("resize", onRelayout);
+    window.addEventListener("scroll", onRelayout, true);
+    vv?.addEventListener("resize", onRelayout);
+    vv?.addEventListener("scroll", onRelayout);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      document.removeEventListener("mousedown", onDocDown);
+      document.removeEventListener("keydown", onEsc, true);
+      window.removeEventListener("resize", onRelayout);
+      window.removeEventListener("scroll", onRelayout, true);
+      vv?.removeEventListener("resize", onRelayout);
+      vv?.removeEventListener("scroll", onRelayout);
+    };
+  }, [open, closing, mode]);
+
+  const toggleOpen = () => {
+    if (disabled) return;
+    if (open && !closing) {
+      closeAnimated();
+      return;
+    }
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    syncFromProp();
+    setClosing(false);
+    updatePosition();
+    setOpen(true);
+  };
+
+  const shiftMonth = (delta: number) => {
+    const d = new Date(viewYear, viewMonth - 1 + delta, 1);
+    setViewYear(d.getFullYear());
+    setViewMonth(d.getMonth() + 1);
+  };
+
+  const setClampedHour = (h: number) => {
+    const next = ((h % 24) + 24) % 24;
+    setDraftHour(next);
+    setHourInput(pad2(next));
+  };
+
+  const setClampedMin = (m: number) => {
+    const next = ((m % 60) + 60) % 60;
+    setDraftMinute(next);
+    setMinInput(pad2(next));
+  };
+
+  const commitDatetime = (overrideDate?: string, overrideH?: number, overrideM?: number) => {
+    const dt = overrideDate ?? draftDate;
+    const rawH = Number.isFinite(Number(hourInput)) ? Math.min(23, Math.max(0, Number(hourInput))) : draftHour;
+    const rawM = Number.isFinite(Number(minInput)) ? Math.min(59, Math.max(0, Number(minInput))) : draftMinute;
+    const hh = overrideH !== undefined ? overrideH : rawH;
+    const mm = overrideM !== undefined ? overrideM : rawM;
+    onChange(`${dt}T${pad2(hh)}:${pad2(mm)}`);
+    closeAnimated();
+  };
+
+  const now = new Date();
+  const nowY = now.getFullYear();
+  const nowM = now.getMonth() + 1;
+  const nowD = now.getDate();
+  const todayYmd = `${nowY}-${pad2(nowM)}-${pad2(nowD)}`;
+  const curYm = `${nowY}-${pad2(nowM)}`;
+
+  const formattedText = parsed.valid
+    ? mode === "month"
+      ? `${parsed.y}-${pad2(parsed.m)}`
+      : `${parsed.y}-${pad2(parsed.m)}-${pad2(parsed.d)} ${pad2(parsed.hh)}:${pad2(parsed.mm)}`
+    : "";
+  const placeholderText =
+    placeholder || (mode === "month" ? t("dp.placeholder_month") : t("dp.placeholder_datetime"));
+
+  const firstDow = new Date(viewYear, viewMonth - 1, 1).getDay();
+  const dayCells =
+    mode === "datetime"
+      ? Array.from({ length: 42 }, (_, i) => {
+          const cellDate = new Date(viewYear, viewMonth - 1, i - firstDow + 1);
+          const cy = cellDate.getFullYear();
+          const cm = cellDate.getMonth() + 1;
+          const cd = cellDate.getDate();
+          const ymd = `${cy}-${pad2(cm)}-${pad2(cd)}`;
+          return { cy, cm, cd, ymd, outside: cm !== viewMonth };
+        })
+      : [];
+
+  const portalPop =
+    open && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            ref={popRef}
+            class={`volo-cselect-menu is-portal volo-datepicker-pop ${flipUp ? "flip-up" : ""} ${closing ? "is-closing" : ""}`}
+            style={popStyle}
+            role="dialog"
+            aria-label={ariaLabel || placeholderText}
+          >
+            {mode === "month" ? (
+              <>
+                <div class="volo-dp-head">
+                  <button
+                    type="button"
+                    class="volo-dp-nav-btn"
+                    onClick={() => setViewYear((y) => y - 1)}
+                    aria-label="-1Y"
+                  >
+                    ‹
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-dp-title-btn"
+                    onClick={() => setViewYear(nowY)}
+                  >
+                    {t("dp.year_fmt", { year: viewYear })}
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-dp-nav-btn"
+                    onClick={() => setViewYear((y) => y + 1)}
+                    aria-label="+1Y"
+                  >
+                    ›
+                  </button>
+                </div>
+
+                <div class="volo-dp-month-grid">
+                  {DP_MONTH_KEYS.map((mk, idx) => {
+                    const mNum = idx + 1;
+                    const ym = `${viewYear}-${pad2(mNum)}`;
+                    const isSelected = parsed.valid && parsed.y === viewYear && parsed.m === mNum;
+                    const isThisMonth = ym === curYm;
+                    return (
+                      <button
+                        key={mk}
+                        type="button"
+                        class={`volo-dp-month-cell ${isSelected ? "is-selected" : ""} ${isThisMonth ? "is-today" : ""}`}
+                        onClick={() => {
+                          onChange(ym);
+                          closeAnimated();
+                        }}
+                      >
+                        {t(mk)}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div class="volo-dp-foot">
+                  <button
+                    type="button"
+                    class="volo-dp-foot-link"
+                    onClick={() => {
+                      onChange(curYm);
+                      closeAnimated();
+                    }}
+                  >
+                    {t("dp.this_month")}
+                  </button>
+                  {clearable && (
+                    <button
+                      type="button"
+                      class="volo-dp-foot-link is-muted"
+                      onClick={() => {
+                        onChange("");
+                        closeAnimated();
+                      }}
+                    >
+                      {t("dp.clear")}
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                <div class="volo-dp-head">
+                  <div class="volo-dp-nav-grp">
+                    <button
+                      type="button"
+                      class="volo-dp-nav-btn"
+                      onClick={() => setViewYear((y) => y - 1)}
+                      aria-label="-1Y"
+                    >
+                      «
+                    </button>
+                    <button
+                      type="button"
+                      class="volo-dp-nav-btn"
+                      onClick={() => shiftMonth(-1)}
+                      aria-label="-1M"
+                    >
+                      ‹
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    class="volo-dp-title-btn"
+                    onClick={() => {
+                      setViewYear(nowY);
+                      setViewMonth(nowM);
+                    }}
+                  >
+                    {t("dp.ym_fmt", { year: viewYear, month: t(DP_MONTH_KEYS[viewMonth - 1]) })}
+                  </button>
+                  <div class="volo-dp-nav-grp">
+                    <button
+                      type="button"
+                      class="volo-dp-nav-btn"
+                      onClick={() => shiftMonth(1)}
+                      aria-label="+1M"
+                    >
+                      ›
+                    </button>
+                    <button
+                      type="button"
+                      class="volo-dp-nav-btn"
+                      onClick={() => setViewYear((y) => y + 1)}
+                      aria-label="+1Y"
+                    >
+                      »
+                    </button>
+                  </div>
+                </div>
+
+                <div class="volo-dp-week-row">
+                  {DP_WEEK_KEYS.map((wk) => (
+                    <span key={wk} class="volo-dp-week-lbl">
+                      {t(wk)}
+                    </span>
+                  ))}
+                </div>
+
+                <div class="volo-dp-day-grid">
+                  {dayCells.map((cell) => {
+                    const isSelected = cell.ymd === draftDate;
+                    const isToday = cell.ymd === todayYmd;
+                    return (
+                      <button
+                        key={cell.ymd}
+                        type="button"
+                        class={`volo-dp-day-cell ${cell.outside ? "is-outside" : ""} ${isToday ? "is-today" : ""} ${isSelected ? "is-selected" : ""}`}
+                        onClick={() => {
+                          setDraftDate(cell.ymd);
+                          if (cell.outside) {
+                            setViewYear(cell.cy);
+                            setViewMonth(cell.cm);
+                          }
+                        }}
+                        onDblClick={() => commitDatetime(cell.ymd)}
+                      >
+                        {cell.cd}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div class="volo-dp-time-bar">
+                  <span class="volo-dp-time-label">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="12" cy="12" r="9" />
+                      <polyline points="12 7 12 12 15.5 14" />
+                    </svg>
+                    {t("dp.time_lbl")}
+                  </span>
+                  <div class="volo-dp-time-controls">
+                    <div
+                      class="volo-dp-stepper"
+                      onWheel={(e) => {
+                        e.preventDefault();
+                        setClampedHour(draftHour + (e.deltaY < 0 ? 1 : -1));
+                      }}
+                    >
+                      <button type="button" class="volo-dp-step-btn" onClick={() => setClampedHour(draftHour - 1)} tabIndex={-1}>
+                        ‹
+                      </button>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={2}
+                        class="volo-dp-time-in"
+                        aria-label="HH"
+                        value={hourInput}
+                        onInput={(e) => {
+                          const raw = (e.currentTarget as HTMLInputElement).value.replace(/\D/g, "").slice(0, 2);
+                          setHourInput(raw);
+                          if (raw !== "") {
+                            const n = Math.min(23, Math.max(0, Number(raw)));
+                            setDraftHour(n);
+                          }
+                        }}
+                        onBlur={() => setClampedHour(hourInput === "" ? draftHour : Math.min(23, Math.max(0, Number(hourInput))))}
+                        onKeyDown={(e) => {
+                          if (e.key === "ArrowUp") {
+                            e.preventDefault();
+                            setClampedHour(draftHour + 1);
+                          } else if (e.key === "ArrowDown") {
+                            e.preventDefault();
+                            setClampedHour(draftHour - 1);
+                          } else if (e.key === "Enter") {
+                            e.preventDefault();
+                            commitDatetime();
+                          }
+                        }}
+                      />
+                      <button type="button" class="volo-dp-step-btn" onClick={() => setClampedHour(draftHour + 1)} tabIndex={-1}>
+                        ›
+                      </button>
+                    </div>
+                    <span class="volo-dp-time-sep">:</span>
+                    <div
+                      class="volo-dp-stepper"
+                      onWheel={(e) => {
+                        e.preventDefault();
+                        setClampedMin(draftMinute + (e.deltaY < 0 ? 1 : -1));
+                      }}
+                    >
+                      <button type="button" class="volo-dp-step-btn" onClick={() => setClampedMin(draftMinute - 1)} tabIndex={-1}>
+                        ‹
+                      </button>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={2}
+                        class="volo-dp-time-in"
+                        aria-label="MM"
+                        value={minInput}
+                        onInput={(e) => {
+                          const raw = (e.currentTarget as HTMLInputElement).value.replace(/\D/g, "").slice(0, 2);
+                          setMinInput(raw);
+                          if (raw !== "") {
+                            const n = Math.min(59, Math.max(0, Number(raw)));
+                            setDraftMinute(n);
+                          }
+                        }}
+                        onBlur={() => setClampedMin(minInput === "" ? draftMinute : Math.min(59, Math.max(0, Number(minInput))))}
+                        onKeyDown={(e) => {
+                          if (e.key === "ArrowUp") {
+                            e.preventDefault();
+                            setClampedMin(draftMinute + 1);
+                          } else if (e.key === "ArrowDown") {
+                            e.preventDefault();
+                            setClampedMin(draftMinute - 1);
+                          } else if (e.key === "Enter") {
+                            e.preventDefault();
+                            commitDatetime();
+                          }
+                        }}
+                      />
+                      <button type="button" class="volo-dp-step-btn" onClick={() => setClampedMin(draftMinute + 1)} tabIndex={-1}>
+                        ›
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="volo-dp-foot">
+                  <div class="volo-dp-foot-left">
+                    <button
+                      type="button"
+                      class="volo-dp-foot-link"
+                      onClick={() => {
+                        const cur = new Date();
+                        const ymd = `${cur.getFullYear()}-${pad2(cur.getMonth() + 1)}-${pad2(cur.getDate())}`;
+                        commitDatetime(ymd, cur.getHours(), cur.getMinutes());
+                      }}
+                    >
+                      {t("dp.now")}
+                    </button>
+                    {clearable && (
+                      <button
+                        type="button"
+                        class="volo-dp-foot-link is-muted"
+                        onClick={() => {
+                          onChange("");
+                          closeAnimated();
+                        }}
+                      >
+                        {t("dp.clear")}
+                      </button>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-primary volo-btn-sm volo-dp-ok-btn"
+                    onClick={() => commitDatetime()}
+                  >
+                    {t("common.confirm")}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>,
+          document.body
+        )
+      : null;
+
+  return (
+    <div
+      ref={wrapRef}
+      class={`volo-cselect volo-datepicker ${open && !closing ? "is-open" : ""} ${disabled ? "is-disabled" : ""} ${className}`.trim()}
+      style={style}
+    >
+      <button
+        ref={btnRef}
+        type="button"
+        class="volo-cselect-btn volo-datepicker-btn"
+        disabled={disabled}
+        aria-label={ariaLabel}
+        aria-haspopup="dialog"
+        aria-expanded={open && !closing}
+        onClick={toggleOpen}
+        onKeyDown={(e) => {
+          if (!disabled && (e.key === "Enter" || e.key === " " || e.key === "ArrowDown")) {
+            e.preventDefault();
+            toggleOpen();
+          }
+        }}
+      >
+        <span class="volo-dp-trigger-main">
+          <svg
+            class="volo-dp-cal-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.85"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="3" y="4.5" width="18" height="16.5" rx="2.5" />
+            <line x1="16" y1="2.5" x2="16" y2="6.5" />
+            <line x1="8" y1="2.5" x2="8" y2="6.5" />
+            <line x1="3" y1="9.5" x2="21" y2="9.5" />
+          </svg>
+          <span class={`volo-cselect-label ${formattedText ? "volo-dp-val" : "volo-dp-placeholder"}`}>
+            {formattedText || placeholderText}
+          </span>
+        </span>
+        <span class="volo-dp-trigger-right">
+          {clearable && Boolean(formattedText) && !disabled && (
+            <span
+              role="button"
+              tabIndex={0}
+              class="volo-dp-clear"
+              title={t("dp.clear")}
+              aria-label={t("dp.clear")}
+              onClick={(e) => {
+                e.stopPropagation();
+                onChange("");
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onChange("");
+                }
+              }}
+            >
+              ×
+            </span>
+          )}
+          <svg
+            class="volo-cselect-chev"
+            viewBox="0 0 20 20"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.9"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <polyline points="5.5 7.5 10 12.5 14.5 7.5" />
+          </svg>
+        </span>
+      </button>
+      {portalPop}
+    </div>
+  );
+}
+
 export interface ActionMenuItem {
   label: string;
   onClick?: () => void;
@@ -1494,7 +2142,7 @@ export function TokenListInput({
             <span>{item}</span>
             <button
               type="button"
-              aria-label="Remove"
+              aria-label={t("common.delete")}
               onClick={(e) => {
                 e.stopPropagation();
                 onChange(safeValues.filter((_, i) => i !== idx));

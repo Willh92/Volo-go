@@ -256,7 +256,7 @@
       <div>
         <span>© {{if .Year}}{{.Year}} {{end}}{{.Site.Title}}</span>{{block "footer_extra" .}}{{end}}
       </div>
-      <span>Made with <a href="https://github.com/Willh92/Volo-go" target="_blank" rel="noopener noreferrer" data-no-pjax>Volo</a> · {{block "footer_edition" .}}Studio{{end}}</span>
+      <span>{{t .Locale "footer.powered_prefix"}} <a href="https://github.com/Willh92/Volo-go" target="_blank" rel="noopener noreferrer" data-no-pjax>Volo</a>{{if (t .Locale "footer.powered_suffix")}} {{t .Locale "footer.powered_suffix"}}{{end}} · {{block "footer_edition" .}}Studio{{end}}</span>
     </div>
     {{if and .Site.EnableFooterHTML .Site.FooterText}}
       <div class="studio-footer-content">{{safeHTML .Site.FooterText}}</div>

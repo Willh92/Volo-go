@@ -29,7 +29,14 @@ import {
   UploadProgressBar,
   useDebouncedValue,
 } from "../components/UIControls";
-import { availableLocalesSig, formatDateTime, t } from "../i18n";
+import {
+  availableLocalesSig,
+  formatDateTime,
+  localizeAuditAction,
+  localizeAuditResource,
+  localizeBackupTable,
+  t,
+} from "../i18n";
 
 export type SysTab =
   | "settings_site"
@@ -266,6 +273,7 @@ export function SystemWorkspace({
   const [versions, setVersions] = useState<Record<string, number>>({});
   const [savingDomain, setSavingDomain] = useState<string>("");
   const [storageDrivers, setStorageDrivers] = useState<any[]>([]);
+  const [defaultUploadDir, setDefaultUploadDir] = useState<string>("./uploads");
   const [smtpPwd, setSmtpPwd] = useState("");
   const [testMailTo, setTestMailTo] = useState("");
   const [s3Secret, setS3Secret] = useState("");
@@ -498,6 +506,7 @@ export function SystemWorkspace({
         setVersions(res.versions || {});
         setSocialDirty(false);
         setEditingSocialIdx(null);
+        if (res.default_upload_dir) setDefaultUploadDir(res.default_upload_dir);
         if (Array.isArray(res.storage_drivers)) setStorageDrivers(res.storage_drivers);
         if (res.domains?.storage) storageDriverSig.value = res.domains.storage.active_driver || "local";
       } else if (sub === "waf" && isAdmin) {
@@ -519,6 +528,7 @@ export function SystemWorkspace({
         setGeoCircuitEnabled(g.geo_access_circuit_enabled !== false);
         setDomains(st.domains || {});
         setVersions(st.versions || {});
+        if (st.default_upload_dir) setDefaultUploadDir(st.default_upload_dir);
         if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       } else if (sub === "backup" && isAdmin) {
         const fetchLocalSnaps = async () => {
@@ -545,6 +555,7 @@ export function SystemWorkspace({
         setDomains(st.domains || {});
         setVersions(st.versions || {});
         setLocalBackups(lb.items || []);
+        if (st.default_upload_dir) setDefaultUploadDir(st.default_upload_dir);
         if (Array.isArray(st.storage_drivers)) setStorageDrivers(st.storage_drivers);
         if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       }
@@ -782,12 +793,12 @@ export function SystemWorkspace({
       const id = typeof d === "string" ? d : d?.id || d?.value;
       const label = typeof d === "string" ? d : d?.label || d?.name || id;
       if (id && !opts.some((o) => o.value === id)) {
-        opts.push({ value: id, label, badge: "plugin" });
+        opts.push({ value: id, label, badge: t("sys.plugin_driver_badge") });
       }
     }
     const cur = domains?.storage?.active_driver || "";
     if (cur && !opts.some((o) => o.value === cur)) {
-      opts.push({ value: cur, label: cur, badge: "plugin" });
+      opts.push({ value: cur, label: cur, badge: t("sys.plugin_driver_badge") });
     }
     return opts;
   })();
@@ -806,7 +817,7 @@ export function SystemWorkspace({
       { value: "all", label: t("art.all") },
       ...Array.from(set)
         .sort()
-        .map((a) => ({ value: a, label: a })),
+        .map((a) => ({ value: a, label: localizeAuditAction(a) })),
     ];
   })();
 
@@ -983,6 +994,7 @@ export function SystemWorkspace({
                 value={domains.site?.notice_board || ""}
                 onInput={(e) => setDomField("site", "notice_board", (e.currentTarget as HTMLTextAreaElement).value)}
               />
+              <span class="volo-help">{t("sys.notice_board_hint")}</span>
             </div>
 
             <div class="volo-check-grid">
@@ -1524,6 +1536,38 @@ export function SystemWorkspace({
                 label={t("sys.adaptive_webp")}
               />
             </div>
+
+            {(!domains.storage?.active_driver || domains.storage?.active_driver === "local") && (
+              <div class="volo-subcard">
+                <div class="volo-subcard-title">{t("sys.local_sub_title")}</div>
+                <div class="volo-grid-2">
+                  <div class="volo-field">
+                    <label>{t("sys.local_dir")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_local_dir"
+                      autoComplete="off"
+                      placeholder={defaultUploadDir || "./uploads"}
+                      value={domains.storage?.local_dir || ""}
+                      onInput={(e) => setDomField("storage", "local_dir", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                    <span class="volo-help">{t("sys.local_dir_hint", { dir: defaultUploadDir || "./uploads" })}</span>
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("sys.local_key_prefix")}</label>
+                    <input
+                      class="volo-input"
+                      name="storage_local_key_prefix"
+                      autoComplete="off"
+                      placeholder="media / blog"
+                      value={domains.storage?.local_key_prefix || ""}
+                      onInput={(e) => setDomField("storage", "local_key_prefix", (e.currentTarget as HTMLInputElement).value)}
+                    />
+                    <span class="volo-help">{t("sys.local_key_prefix_hint")}</span>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {domains.storage?.active_driver === "s3" && (
               <div class="volo-subcard">
@@ -3860,7 +3904,11 @@ export function SystemWorkspace({
                                   <span class="volo-status-dot" />
                                   {actLabel}
                                 </span>
-                                {g.on_miss && g.on_miss !== "next" && <span class="volo-mini-tag">miss:{g.on_miss}</span>}
+                                {g.on_miss && g.on_miss !== "next" && (
+                                  <span class="volo-mini-tag">
+                                    {geoMissOptions.find((o) => o.value === g.on_miss)?.label || g.on_miss}
+                                  </span>
+                                )}
                               </div>
                             </td>
                             <td class="col-fluid" data-label={t("tbl.col_scope")}>
@@ -4319,7 +4367,7 @@ export function SystemWorkspace({
                       {(
                         [
                           ["articles", legacyReport.articles],
-                          ["revisions", legacyReport.revisions],
+                          ["article_revisions", legacyReport.revisions],
                           ["categories", legacyReport.categories],
                           ["tags", legacyReport.tags],
                           ["comments", legacyReport.comments],
@@ -4335,19 +4383,19 @@ export function SystemWorkspace({
                         .filter(([, n]) => typeof n === "number")
                         .map(([k, n]) => (
                           <span key={k} class="volo-mini-tag">
-                            {k}: {n}
+                            {localizeBackupTable(k)}: {n}
                           </span>
                         ))}
                     </div>
                     {Array.isArray(legacyReport.category_conflicts) && legacyReport.category_conflicts.length > 0 && (
                       <div class="volo-help" style={{ marginTop: "6px" }}>
-                        <strong>Conflicts ({legacyReport.category_conflicts.length}):</strong>{" "}
+                        <strong>{t("sys.legacy_conflicts", { count: legacyReport.category_conflicts.length })}:</strong>{" "}
                         {legacyReport.category_conflicts.slice(0, 10).join("; ")}
                       </div>
                     )}
                     {Array.isArray(legacyReport.warnings) && legacyReport.warnings.length > 0 && (
                       <div class="volo-help" style={{ marginTop: "6px", color: "var(--volo-warn)" }}>
-                        <strong>Warnings ({legacyReport.warnings.length}):</strong>{" "}
+                        <strong>{t("sys.legacy_warnings", { count: legacyReport.warnings.length })}:</strong>{" "}
                         {legacyReport.warnings.slice(0, 10).join("; ")}
                       </div>
                     )}
@@ -4982,12 +5030,15 @@ export function SystemWorkspace({
                           <span class="volo-cat-chip">{l.actor_name}</span>
                         </td>
                         <td class="col-cat" data-label={t("sys.audit_col_action")}>
-                          <span class="volo-mini-tag">{l.action}</span>
+                          <span class="volo-mini-tag" title={l.action}>
+                            {localizeAuditAction(l.action)}
+                          </span>
                         </td>
                         <td class="col-fluid" data-label={t("sys.audit_col_res")} style={{ minWidth: 0 }}>
                           <div class="volo-input-row" style={{ flexWrap: "wrap", minWidth: 0 }}>
-                            <span class="volo-code-chip is-wrap">
-                              {l.resource_type}:{l.resource_id}
+                            <span class="volo-code-chip is-wrap" title={`${l.resource_type}:${l.resource_id}`}>
+                              {localizeAuditResource(l.resource_type)}
+                              {l.resource_id ? ` · ${l.resource_id}` : ""}
                             </span>
                             {l.client_ip && <span class="volo-code-chip">{l.client_ip}</span>}
                             {prettyDetail && (

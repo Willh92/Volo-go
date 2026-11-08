@@ -327,3 +327,178 @@ export function formatDateTime(val?: number | string): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+const BACKUP_TABLE_KEYS: Record<string, string> = {
+  settings: "bak.tbl.settings",
+  users: "bak.tbl.users",
+  user_credentials: "bak.tbl.user_credentials",
+  user_sessions: "bak.tbl.user_sessions",
+  api_tokens: "bak.tbl.api_tokens",
+  categories: "bak.tbl.categories",
+  tags: "bak.tbl.tags",
+  articles: "bak.tbl.articles",
+  article_tags: "bak.tbl.article_tags",
+  article_revisions: "bak.tbl.revisions",
+  revisions: "bak.tbl.revisions",
+  article_backlinks: "bak.tbl.article_backlinks",
+  pages: "bak.tbl.pages",
+  nav_items: "bak.tbl.nav_items",
+  series: "bak.tbl.series",
+  series_articles: "bak.tbl.series_articles",
+  books: "bak.tbl.books",
+  book_chapters: "bak.tbl.book_chapters",
+  comments: "bak.tbl.comments",
+  reactions: "bak.tbl.reactions",
+  links: "bak.tbl.links",
+  follows: "bak.tbl.follows",
+  follow_items: "bak.tbl.follow_items",
+  media_assets: "bak.tbl.media_assets",
+  redirects: "bak.tbl.redirects",
+  webhooks: "bak.tbl.webhooks",
+  webhook_deliveries: "bak.tbl.webhook_deliveries",
+  analytics_daily: "bak.tbl.analytics_daily",
+  analytics_top_items: "bak.tbl.analytics_top_items",
+  security_ip_bans: "bak.tbl.security_ip_bans",
+  security_geo_rules: "bak.tbl.security_geo_rules",
+  audit_logs: "bak.tbl.audit_logs",
+  plugins: "bak.tbl.plugins",
+  plugin_kv: "bak.tbl.plugin_kv",
+};
+
+export function localizeBackupTable(name?: string): string {
+  const raw = String(name || "").trim();
+  if (!raw) return "";
+  const key = BACKUP_TABLE_KEYS[raw.toLowerCase()];
+  return key ? t(key) : raw;
+}
+
+const AUDIT_RESOURCE_KEYS: Record<string, string> = {
+  article: "audit.res.article",
+  page: "audit.res.page",
+  category: "audit.res.category",
+  tag: "audit.res.tag",
+  series: "audit.res.series",
+  book: "audit.res.book",
+  comment: "audit.res.comment",
+  media_asset: "audit.res.media",
+  media: "audit.res.media",
+  user: "audit.res.user",
+  user_session: "audit.res.session",
+  user_credential: "audit.res.credential",
+  api_token: "audit.res.api_token",
+  settings: "audit.res.settings",
+  system: "audit.res.system",
+  theme: "audit.res.theme",
+  plugin: "audit.res.plugin",
+  locale: "audit.res.locale",
+  ip_ban: "audit.res.ip_ban",
+  geo_rule: "audit.res.geo_rule",
+  link: "audit.res.link",
+  follow: "audit.res.follow",
+  nav_item: "audit.res.nav",
+  nav: "audit.res.nav",
+  redirect: "audit.res.redirect",
+  webhook: "audit.res.webhook",
+};
+
+export function localizeAuditResource(res?: string): string {
+  const raw = String(res || "").trim();
+  if (!raw) return "";
+  const key = AUDIT_RESOURCE_KEYS[raw.toLowerCase()];
+  return key ? t(key) : raw;
+}
+
+const AUDIT_ACTION_KEYS: Record<string, string> = {
+  "auth.login": "audit.act.auth_login",
+  "auth.login_2fa": "audit.act.auth_login_2fa",
+  "auth.login_passkey": "audit.act.auth_login_passkey",
+  "auth.login_oidc": "audit.act.auth_login_oidc",
+  "auth.logout": "audit.act.auth_logout",
+  "auth.password_change": "audit.act.auth_pwd_change",
+  "reader.register_oidc": "audit.act.reader_reg_oidc",
+  "settings.patch": "audit.act.settings_patch",
+  "article.create": "audit.act.article_create",
+  "article.update": "audit.act.article_update",
+  "article.save": "audit.act.article_save",
+  "article.delete": "audit.act.article_delete",
+  "article.pin": "audit.act.article_pin",
+  "article.batch": "audit.act.article_batch",
+  "article.batch_import": "audit.act.article_import",
+  "page.create": "audit.act.page_create",
+  "page.update": "audit.act.page_update",
+  "page.delete": "audit.act.page_delete",
+  "tags.cleanup": "audit.act.tags_cleanup",
+  "tags.merge": "audit.act.tags_merge",
+  "tag.batch_delete": "audit.act.tag_batch_del",
+  "comment.moderate": "audit.act.comment_mod",
+  "comment.delete": "audit.act.comment_del",
+  "comment.batch": "audit.act.comment_batch",
+  "media.upload": "audit.act.media_upload",
+  "media.delete": "audit.act.media_delete",
+  "media.batch_delete": "audit.act.media_batch_del",
+  "media.reconcile": "audit.act.media_reconcile",
+  "media.orphans_clean": "audit.act.media_clean",
+  "backup.export": "audit.act.backup_export",
+  "backup.export_ticket": "audit.act.backup_ticket",
+  "backup.restore": "audit.act.backup_restore",
+  "backup.restore_legacy": "audit.act.backup_restore_leg",
+  "backup.import_legacy": "audit.act.backup_import_leg",
+  "backup.local_snapshot": "audit.act.backup_snap",
+  "backup.local_restore": "audit.act.backup_snap_res",
+  "backup.local_delete": "audit.act.backup_snap_del",
+  "user.create": "audit.act.user_create",
+  "user.update": "audit.act.user_update",
+  "user.delete": "audit.act.user_delete",
+  "plugin.install": "audit.act.plugin_install",
+  "plugin.update": "audit.act.plugin_update",
+  "plugin.enable": "audit.act.plugin_enable",
+  "plugin.disable": "audit.act.plugin_disable",
+  "plugin.reload": "audit.act.plugin_reload",
+  "plugin.clear_kv": "audit.act.plugin_clear_kv",
+  "plugin.config_patch": "audit.act.plugin_cfg",
+  "plugin.uninstall": "audit.act.plugin_uninstall",
+  "theme.activate": "audit.act.theme_activate",
+  "theme.install": "audit.act.theme_install",
+  "theme.export": "audit.act.theme_export",
+  "theme.config": "audit.act.theme_config",
+  "theme.uninstall": "audit.act.theme_uninstall",
+  "locale.install": "audit.act.locale_install",
+  "locale.install_zip": "audit.act.locale_zip",
+  "locale.delete": "audit.act.locale_delete",
+  "security.ban": "audit.act.sec_ban",
+  "security.ip_ban_add": "audit.act.sec_ban",
+  "security.unban": "audit.act.sec_unban",
+  "security.ip_ban_remove": "audit.act.sec_unban",
+  "security.ip_ban_batch_delete": "audit.act.sec_ban_batch",
+  "security.comment_ip_ban": "audit.act.sec_cmt_ban",
+  "security.geo_rule_add": "audit.act.sec_geo_add",
+  "security.geo_rule_update": "audit.act.sec_geo_upd",
+  "security.totp_enroll": "audit.act.sec_totp_on",
+  "security.totp_disable": "audit.act.sec_totp_off",
+  "security.passkey_register": "audit.act.sec_pk_add",
+  "security.passkey_delete": "audit.act.sec_pk_del",
+  "security.session_revoke": "audit.act.sec_sess_rev",
+  "security.sessions_revoke_others": "audit.act.sec_sess_all",
+  "security.api_token_create": "audit.act.sec_tok_add",
+  "security.api_token_revoke": "audit.act.sec_tok_rev",
+  "security.oidc_link": "audit.act.sec_oidc_link",
+  "security.oidc_unlink": "audit.act.sec_oidc_unlink",
+  "security.rotate_share_secret": "audit.act.sec_rot_share",
+  "link.batch": "audit.act.link_batch",
+  "link.check": "audit.act.link_check",
+  "follow.import_opml": "audit.act.follow_opml",
+  "follow.sync_single": "audit.act.follow_sync",
+  "redirect.import": "audit.act.redir_import",
+  "redirect.batch_delete": "audit.act.redir_batch_del",
+  "webhook.replay": "audit.act.webhook_replay",
+  "github.publish_showcase": "audit.act.gh_publish",
+  "system.clear_runtime_logs": "audit.act.sys_clear_logs",
+};
+
+export function localizeAuditAction(act?: string): string {
+  const raw = String(act || "").trim();
+  if (!raw) return "";
+  const key = AUDIT_ACTION_KEYS[raw.toLowerCase()];
+  return key ? t(key) : raw;
+}
+

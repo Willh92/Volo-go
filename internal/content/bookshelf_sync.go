@@ -265,7 +265,17 @@ func (s *Service) crawlRemoteBookTOC(ctx context.Context, bk domain.Book) ([]dom
 		return parseSummaryMarkdownTOC(bk.ID, body, finalBase), nil
 	}
 
-	summaryCandidate := resolveRelativeURL(baseURL, "SUMMARY.md")
+	summaryBase := *baseURL
+	if !strings.HasSuffix(summaryBase.Path, "/") {
+		lastSeg := summaryBase.Path
+		if slash := strings.LastIndexByte(lastSeg, '/'); slash >= 0 {
+			lastSeg = lastSeg[slash+1:]
+		}
+		if lastSeg == "" || !strings.Contains(lastSeg, ".") {
+			summaryBase.Path += "/"
+		}
+	}
+	summaryCandidate := resolveRelativeURL(&summaryBase, "SUMMARY.md")
 	if mdBody, finalBase, sErr := fetchBoundedText(ctx, client, summaryCandidate); sErr == nil && strings.Contains(mdBody, "](") {
 		parsed := parseSummaryMarkdownTOC(bk.ID, mdBody, finalBase)
 		if len(parsed) > 0 {
@@ -277,6 +287,9 @@ func (s *Service) crawlRemoteBookTOC(ctx context.Context, bk domain.Book) ([]dom
 	htmlBody, finalBase, err := fetchBoundedText(ctx, client, baseURL.String())
 	if err != nil {
 		return nil, err
+	}
+	if finalBase == nil {
+		finalBase = &summaryBase
 	}
 	parsed := parseHTMLSidebarTOC(bk.ID, htmlBody, finalBase)
 	if len(parsed) == 0 {
@@ -290,7 +303,8 @@ func fetchBoundedText(ctx context.Context, client *http.Client, targetURL string
 	if err != nil {
 		return "", nil, err
 	}
-	req.Header.Set("User-Agent", "Volo-go-BookshelfSync/1.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; VoloBookshelf/1.0; +https://github.com/Willh92/Volo-go)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/markdown,text/plain;q=0.9,*/*;q=0.8")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", nil, err
@@ -374,6 +388,101 @@ var (
 )
 
 func parseHTMLSidebarTOC(bookID string, htmlDoc string, baseURL *url.URL) []domain.BookChapter {
+	if doc, err := nethtml.Parse(strings.NewReader(htmlDoc)); err == nil && doc != nil {
+		var navRoots []*nethtml.Node
+		var findNav func(n *nethtml.Node)
+		findNav = func(n *nethtml.Node) {
+			if n == nil {
+				return
+			}
+			if n.Type == nethtml.ElementNode {
+				tag := strings.ToLower(n.Data)
+				cls := getNodeAttr(n, "class")
+				idVal := strings.ToLower(getNodeAttr(n, "id"))
+				if hasAnyClassToken(cls, "book-summary", "VPSidebar", "md-sidebar--primary", "wy-menu", "sidebar-links") ||
+					idVal == "sidebar" || tag == "nav" || tag == "aside" {
+					navRoots = append(navRoots, n)
+					return
+				}
+			}
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				findNav(c)
+			}
+		}
+		findNav(doc)
+		if len(navRoots) == 0 {
+			navRoots = []*nethtml.Node{doc}
+		}
+
+		seen := make(map[string]bool)
+		stackByDepth := make(map[int]string)
+		var out []domain.BookChapter
+		var walkTOC func(n *nethtml.Node, listDepth int)
+		walkTOC = func(n *nethtml.Node, listDepth int) {
+			if n == nil || len(out) >= 400 {
+				return
+			}
+			nextDepth := listDepth
+			if n.Type == nethtml.ElementNode {
+				tag := strings.ToLower(n.Data)
+				cls := getNodeAttr(n, "class")
+				if hasAnyClassToken(cls, "gitbook-link", "divider") {
+					return
+				}
+				if tag == "ul" || tag == "ol" {
+					nextDepth = listDepth + 1
+				} else if tag == "a" {
+					rawHref := strings.TrimSpace(getNodeAttr(n, "href"))
+					if idx := strings.IndexByte(rawHref, '#'); idx == 0 {
+						rawHref = ""
+					}
+					title := strings.TrimSpace(extractNodeText(n))
+					if title != "" && rawHref != "" && !isDangerousHrefScheme(rawHref) {
+						resolved := resolveRelativeURL(baseURL, rawHref)
+						if isSafeSameHostChapterURL(resolved, baseURL) && !seen[resolved] {
+							seen[resolved] = true
+							depth := listDepth - 1
+							if depth < 0 {
+								depth = 0
+							}
+							if depth > 4 {
+								depth = 4
+							}
+							parentID := ""
+							for d := depth - 1; d >= 0; d-- {
+								if pid, ok := stackByDepth[d]; ok {
+									parentID = pid
+									break
+								}
+							}
+							chID := id.NextPrefixed("ch")
+							stackByDepth[depth] = chID
+							out = append(out, domain.BookChapter{
+								ID:        chID,
+								BookID:    bookID,
+								ParentID:  parentID,
+								Title:     title,
+								URL:       resolved,
+								Depth:     depth,
+								SortOrder: len(out) + 1,
+							})
+						}
+					}
+					return
+				}
+			}
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				walkTOC(c, nextDepth)
+			}
+		}
+		for _, r := range navRoots {
+			walkTOC(r, 0)
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+
 	searchScope := htmlDoc
 	if navMatches := navSectionRe.FindAllStringSubmatch(htmlDoc, -1); len(navMatches) > 0 {
 		var joined strings.Builder
@@ -647,7 +756,7 @@ func selectBookProseContainer(doc *nethtml.Node) *nethtml.Node {
 				bodyNode = n
 			}
 			// Do not descend into obvious navigation/sidebar containers when hunting for main prose
-			if isBookChromeContainer(tag, idVal, cls) {
+			if isBookChromeContainer(tag, idVal, cls, false) {
 				return
 			}
 			if hasAnyClassToken(cls,
@@ -688,13 +797,21 @@ func selectBookProseContainer(doc *nethtml.Node) *nethtml.Node {
 	return nil
 }
 
-func isBookChromeContainer(tag, idLower, cls string) bool {
+func isBookChromeContainer(tag, idLower, cls string, insideProse bool) bool {
 	switch tag {
-	case "nav", "aside", "header", "footer", "script", "style", "noscript", "iframe", "form":
+	case "nav", "header", "footer", "script", "style", "noscript", "iframe", "form":
 		return true
+	case "aside":
+		if !insideProse {
+			return true
+		}
+		if idLower == "sidebar" || idLower == "page-toc" || idLower == "toc" || idLower == "table-of-contents" ||
+			hasAnyClassToken(cls, "sidebar", "toc", "table-of-contents", "book-summary", "VPDocAside", "md-sidebar", "sphinxsidebar", "wy-nav-side") {
+			return true
+		}
 	}
 	switch idLower {
-	case "sidebar", "book-search-input", "book-search-results", "menu-bar", "page-toc", "toc", "table-of-contents":
+	case "sidebar", "book-search-input", "menu-bar", "page-toc", "toc", "table-of-contents":
 		return true
 	}
 	return hasAnyClassToken(cls,
@@ -703,6 +820,7 @@ func isBookChromeContainer(tag, idLower, cls string) bool {
 		"VPNav", "VPDocFooter", "edit-link", "page-edit", "page-nav", "pagination-nav",
 		"toc", "table-of-contents", "md-sidebar", "sphinxsidebar", "wy-nav-side",
 		"rst-versions", "rst-footer-buttons", "breadcrumbs", "wy-breadcrumbs", "search-results",
+		"gitbook-link",
 	)
 }
 
@@ -717,7 +835,7 @@ func pruneBookChromeNodes(root *nethtml.Node) {
 				nameRaw := getNodeAttr(c, "name")
 				cls := getNodeAttr(c, "class")
 
-				if isBookChromeContainer(tag, strings.ToLower(idRaw), cls) || hasNodeAttr(c, "hidden") {
+				if isBookChromeContainer(tag, strings.ToLower(idRaw), cls, true) || hasNodeAttr(c, "hidden") {
 					n.RemoveChild(c)
 					c = next
 					continue

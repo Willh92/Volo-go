@@ -846,18 +846,19 @@ func (st *rowScanState) assign(rv reflect.Value, plan []scanColSpec) error {
 // Select executes a query and scans all rows into []T using a precomputed zero-closure column plan
 // with case-insensitive matching against `db:"column_name"` struct tags or lowercase field names.
 func Select[T any](ctx context.Context, q Queryer, query string, args ...any) ([]T, error) {
-	rt := reflect.TypeFor[T]()
-	if rt.Kind() != reflect.Struct {
-		return nil, errors.New("sqlx.Select requires struct element type T")
-	}
 	var out []T
-	if err := selectRowsInto(ctx, q, rt, reflect.ValueOf(&out).Elem(), query, args...); err != nil {
+	if err := selectRowsInto(ctx, q, &out, query, args...); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func selectRowsInto(ctx context.Context, q Queryer, rt reflect.Type, sliceVal reflect.Value, query string, args ...any) error {
+func selectRowsInto(ctx context.Context, q Queryer, slicePtr any, query string, args ...any) error {
+	sliceVal := reflect.ValueOf(slicePtr).Elem()
+	rt := sliceVal.Type().Elem()
+	if rt.Kind() != reflect.Struct {
+		return errors.New("sqlx.Select requires struct element type T")
+	}
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -890,18 +891,16 @@ func selectRowsInto(ctx context.Context, q Queryer, rt reflect.Type, sliceVal re
 // Get executes a query and scans the first row into T, returning sql.ErrNoRows if empty.
 func Get[T any](ctx context.Context, q Queryer, query string, args ...any) (T, error) {
 	var item T
-	rt := reflect.TypeFor[T]()
-	if rt.Kind() != reflect.Struct {
-		return item, errors.New("sqlx.Get requires struct type T")
-	}
-	if err := getRowInto(ctx, q, rt, reflect.ValueOf(&item).Elem(), query, args...); err != nil {
-		var zero T
-		return zero, err
-	}
-	return item, nil
+	err := getRowInto(ctx, q, &item, query, args...)
+	return item, err
 }
 
-func getRowInto(ctx context.Context, q Queryer, rt reflect.Type, rv reflect.Value, query string, args ...any) error {
+func getRowInto(ctx context.Context, q Queryer, itemPtr any, query string, args ...any) error {
+	rv := reflect.ValueOf(itemPtr).Elem()
+	rt := rv.Type()
+	if rt.Kind() != reflect.Struct {
+		return errors.New("sqlx.Get requires struct type T")
+	}
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -923,9 +922,11 @@ func getRowInto(ctx context.Context, q Queryer, rt reflect.Type, rv reflect.Valu
 	state := newRowScanState(len(cols))
 
 	if err := rows.Scan(state.bind(rv, plan)...); err != nil {
+		rv.SetZero()
 		return err
 	}
 	if err := state.assign(rv, plan); err != nil {
+		rv.SetZero()
 		return err
 	}
 	return rows.Err()

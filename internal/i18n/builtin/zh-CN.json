@@ -240,5 +240,11 @@
   "reader.err_password_policy": "密码长度不足或不符合安全要求",
   "reader.err_verify_code": "邮箱验证码不正确或已过期",
   "reader.err_code_cooldown": "验证码发送过于频繁，请等待 60 秒后再试",
-  "reader.err_account_exists": "该用户名或电子邮箱已被注册"
+  "reader.err_account_exists": "该用户名或电子邮箱已被注册",
+  "taxonomy.back_tags": "返回全部标签",
+  "taxonomy.back_categories": "返回全部分类",
+  "taxonomy.back_series": "返回全部专题",
+  "taxonomy.back_archives": "返回全部归档",
+  "footer.powered_prefix": "由",
+  "footer.powered_suffix": "驱动"
 }

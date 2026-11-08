@@ -97,3 +97,90 @@ func TestExtractAndRewriteBookHTML_StripsBuiltInTOCAndRewritesLinks(t *testing.T
 		t.Fatal("expected pure client-side empty SPA shell to fall back (ok=false)")
 	}
 }
+
+func TestGitBook3SearchResultsWrapperAndNestedSidebarTOC(t *testing.T) {
+	baseURL, err := url.Parse("https://book.willh.cn/go/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Real-world GitBook 3 layout (`gitbook-plugin-search` / `search-pro`) wraps `.markdown-section`
+	// inside `<div id="book-search-results"><div class="search-noresults">...</div><div class="search-results">...</div></div>`.
+	gitbook3Doc := `<!DOCTYPE html>
+<html lang="zh-hans">
+<body>
+  <div class="book with-summary">
+    <div class="book-summary">
+      <div id="book-search-input" role="search"><input type="text" placeholder="输入并搜索"></div>
+      <nav role="navigation">
+        <ul class="summary">
+          <li class="chapter active" data-level="1.1" data-path="./">
+            <a href="./">前言</a>
+          </li>
+          <li class="chapter" data-level="1.2" data-path="ebook/01.0.html">
+            <a href="ebook/01.0.html">第一部分：学习 Go 语言</a>
+            <ul class="articles">
+              <li class="chapter" data-level="1.2.1" data-path="ebook/01.1.html">
+                <a href="ebook/01.1.html">1.1 起源与发展</a>
+              </li>
+            </ul>
+          </li>
+          <li class="divider"></li>
+          <li><a href="https://www.gitbook.com" target="blank" class="gitbook-link">本书使用 GitBook 发布</a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="book-body">
+      <div class="body-inner">
+        <div class="page-wrapper" tabindex="-1" role="main">
+          <div class="page-inner">
+            <div id="book-search-results">
+              <div class="search-noresults">
+                <section class="normal markdown-section">
+                  <h1 id="go-语言入门指南">Go 语言入门指南</h1>
+                  <p>《The Way to Go》中文译本，全面介绍 Go 语言核心特性与并发编程模型，点击<a href="ebook/01.1.html#origin">1.1 起源与发展</a>开始阅读。</p>
+                </section>
+              </div>
+              <div class="search-results">
+                <div class="has-results"><h1 class="search-results-title">search overlay chrome</h1></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>`
+
+	toc := parseHTMLSidebarTOC("bk_go", gitbook3Doc, baseURL)
+	if len(toc) != 3 {
+		t.Fatalf("expected 3 chapters from GitBook 3 sidebar (excluding gitbook-link/divider), got %d: %+v", len(toc), toc)
+	}
+	if toc[0].Depth != 0 || toc[1].Depth != 0 || toc[2].Depth != 1 || toc[2].ParentID != toc[1].ID {
+		t.Fatalf("expected nested <ul class=\"articles\"> to produce Depth=1 child under chapter 2, got %+v", toc)
+	}
+
+	bk := BookDetailView{
+		Book: domain.Book{
+			ID:        "bk_go",
+			Slug:      "the-way-to-go",
+			Title:     "Go 语言入门指南",
+			SourceURL: "https://book.willh.cn/go/",
+			EmbedMode: "inline",
+		},
+		FlatChapters: toc,
+	}
+
+	htmlOut, ok := extractAndRewriteBookHTML(gitbook3Doc, baseURL, bk, toc[0], render.Default())
+	if !ok {
+		t.Fatal("expected GitBook 3 #book-search-results > .search-noresults > section.markdown-section to extract cleanly")
+	}
+	if strings.Contains(htmlOut, "本书使用 GitBook 发布") || strings.Contains(htmlOut, "search overlay chrome") || strings.Contains(htmlOut, "第一部分：学习 Go 语言") {
+		t.Fatalf("expected built-in GitBook sidebar and .search-results overlay stripped, got:\n%s", htmlOut)
+	}
+	if !strings.Contains(htmlOut, `href="/books/the-way-to-go?ch=`+toc[2].ID+`#origin"`) {
+		t.Fatalf("expected relative chapter link ebook/01.1.html#origin rewritten to Volo reader chapter URL, got:\n%s", htmlOut)
+	}
+}
+

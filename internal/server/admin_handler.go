@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1122,20 +1123,11 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		dashCards = []plugin.RenderedSlot{}
 	}
 
-	// 12-month published article trend (dialect-agnostic Go bucketing)
+	// Published article trend: full historical active months + 12-month window (dialect-agnostic Go bucketing)
 	type monthBucket struct {
 		Month string `json:"month"`
 		Count int    `json:"count"`
 	}
-	monthKeys := make([]string, 0, 12)
-	monthCounts := make(map[string]int, 12)
-	curMonthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	for i := 11; i >= 0; i-- {
-		m := curMonthStart.AddDate(0, -i, 0).Format("2006-01")
-		monthKeys = append(monthKeys, m)
-		monthCounts[m] = 0
-	}
-	earliestMS := curMonthStart.AddDate(0, -11, 0).UnixMilli()
 	type artDateRow struct {
 		PublishedAt int64 `db:"published_at"`
 		CreatedAt   int64 `db:"created_at"`
@@ -1143,28 +1135,54 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 	var artDates []artDateRow
 	if isAdmin {
 		artDates, _ = sqlx.Select[artDateRow](r.Context(), s.deps.Store,
-			`SELECT published_at, created_at FROM articles WHERE status = 'published' AND (published_at >= ? OR created_at >= ?)`,
-			earliestMS, earliestMS)
+			`SELECT published_at, created_at FROM articles WHERE status = 'published'`)
 	} else {
 		artDates, _ = sqlx.Select[artDateRow](r.Context(), s.deps.Store,
-			`SELECT published_at, created_at FROM articles WHERE author_id = ? AND status = 'published' AND (published_at >= ? OR created_at >= ?)`,
-			actor.ID, earliestMS, earliestMS)
+			`SELECT published_at, created_at FROM articles WHERE author_id = ? AND status = 'published'`,
+			actor.ID)
 	}
+	allMonthCounts := make(map[string]int)
+	var latestPostMS int64
 	for _, ad := range artDates {
 		ts := ad.PublishedAt
 		if ts <= 0 {
 			ts = ad.CreatedAt
 		}
 		if ts > 0 {
-			ym := time.UnixMilli(ts).In(now.Location()).Format("2006-01")
-			if _, ok := monthCounts[ym]; ok {
-				monthCounts[ym]++
+			if ts > latestPostMS {
+				latestPostMS = ts
 			}
+			ym := time.UnixMilli(ts).In(now.Location()).Format("2006-01")
+			allMonthCounts[ym]++
 		}
 	}
+	histKeys := make([]string, 0, len(allMonthCounts))
+	for ym, cnt := range allMonthCounts {
+		if cnt > 0 {
+			histKeys = append(histKeys, ym)
+		}
+	}
+	sort.Strings(histKeys)
+	monthlyHistory := make([]monthBucket, 0, len(histKeys))
+	for _, ym := range histKeys {
+		monthlyHistory = append(monthlyHistory, monthBucket{Month: ym, Count: allMonthCounts[ym]})
+	}
+
+	curMonthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	anchorMonthStart := curMonthStart
+	trailingTotal := 0
+	for i := 11; i >= 0; i-- {
+		m := curMonthStart.AddDate(0, -i, 0).Format("2006-01")
+		trailingTotal += allMonthCounts[m]
+	}
+	if trailingTotal == 0 && latestPostMS > 0 {
+		lt := time.UnixMilli(latestPostMS).In(now.Location())
+		anchorMonthStart = time.Date(lt.Year(), lt.Month(), 1, 0, 0, 0, 0, now.Location())
+	}
 	monthlyArticles := make([]monthBucket, 0, 12)
-	for _, m := range monthKeys {
-		monthlyArticles = append(monthlyArticles, monthBucket{Month: m, Count: monthCounts[m]})
+	for i := 11; i >= 0; i-- {
+		m := anchorMonthStart.AddDate(0, -i, 0).Format("2006-01")
+		monthlyArticles = append(monthlyArticles, monthBucket{Month: m, Count: allMonthCounts[m]})
 	}
 
 	catUsage, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
@@ -1244,6 +1262,7 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		"top_articles":     topPosts,
 		"top_referers":     topReferers,
 		"monthly_articles": monthlyArticles,
+		"monthly_history":  monthlyHistory,
 		"category_usage":   catUsage,
 		"top_tags":         topTags,
 		"notice_board":     snap.Site.NoticeBoard,
@@ -3838,8 +3857,12 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 					affected++
 				}
 			} else {
-				if asset.StorageDriver == "local" && asset.ObjectKey != "" {
-					safeUnlinkLocalAsset(s.deps.Config.UploadDir, asset.ObjectKey)
+				if asset.StorageDriver == "local" && asset.ObjectKey != "" && s.deps.Config != nil {
+					curDir := s.deps.Config.GetUploadDir()
+					_ = safeUnlinkLocalAsset(curDir, asset.ObjectKey)
+					if defDir := s.deps.Config.GetDefaultUploadDir(); defDir != "" && defDir != curDir {
+						_ = safeUnlinkLocalAsset(defDir, asset.ObjectKey)
+					}
 				}
 				if _, dErr := s.deps.Store.ExecContext(r.Context(), `DELETE FROM media_assets WHERE id = ?`, asset.ID); dErr == nil {
 					affected++
@@ -3977,8 +4000,12 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 				return
 			}
 		} else {
-			if asset.StorageDriver == "local" && asset.ObjectKey != "" {
-				safeUnlinkLocalAsset(s.deps.Config.UploadDir, asset.ObjectKey)
+			if asset.StorageDriver == "local" && asset.ObjectKey != "" && s.deps.Config != nil {
+				curDir := s.deps.Config.GetUploadDir()
+				_ = safeUnlinkLocalAsset(curDir, asset.ObjectKey)
+				if defDir := s.deps.Config.GetDefaultUploadDir(); defDir != "" && defDir != curDir {
+					_ = safeUnlinkLocalAsset(defDir, asset.ObjectKey)
+				}
 			}
 			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM media_assets WHERE id = ?`, rest)
 		}
@@ -4030,7 +4057,12 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 
 	now := time.Now()
 	relKey := fmt.Sprintf("%s/%s%s", now.UTC().Format("2006/01"), strings.ToLower(id.Next()), ext)
-	dest := filepath.Join(s.deps.Config.UploadDir, filepath.FromSlash(relKey))
+	if s.deps.Settings != nil {
+		if pfx := strings.Trim(strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalKeyPrefix), "/"); pfx != "" {
+			relKey = pfx + "/" + relKey
+		}
+	}
+	dest := filepath.Join(s.deps.Config.GetUploadDir(), filepath.FromSlash(relKey))
 	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 		return nil, err
 	}

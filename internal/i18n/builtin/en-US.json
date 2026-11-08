@@ -240,5 +240,11 @@
   "reader.err_password_policy": "Password does not meet minimum security requirements.",
   "reader.err_verify_code": "Verification code is invalid or expired.",
   "reader.err_code_cooldown": "Please wait 60 seconds before requesting another code.",
-  "reader.err_account_exists": "That username or email is already registered."
+  "reader.err_account_exists": "That username or email is already registered.",
+  "taxonomy.back_tags": "All Tags",
+  "taxonomy.back_categories": "All Categories",
+  "taxonomy.back_series": "All Series",
+  "taxonomy.back_archives": "All Archives",
+  "footer.powered_prefix": "Powered by",
+  "footer.powered_suffix": "Engine"
 }

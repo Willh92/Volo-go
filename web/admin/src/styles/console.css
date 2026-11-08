@@ -4210,8 +4210,9 @@ html[data-theme="dark"] .volo-auth-story {
 }
 
 /* 4. Visual Media Library Grid (`console-media-grid`) & Picker Modal */
-.volo-media-dropzone {
-  border: 1.5px dashed var(--volo-line);
+.volo-media-dropzone,
+.volo-card.volo-media-dropzone:not(.is-dragging) {
+  border: 1px solid var(--volo-line);
   transition: border-color 0.16s ease, background 0.16s ease;
 }
 
@@ -4220,23 +4221,28 @@ html[data-theme="dark"] .volo-auth-story {
   padding: 2px;
 }
 
-.volo-media-dropzone.is-dragging {
-  border-color: var(--volo-accent);
+.volo-media-dropzone.is-dragging,
+.volo-card.volo-media-dropzone.is-dragging {
+  border: 1.5px dashed var(--volo-accent);
   background: var(--volo-accent-soft);
 }
 
 .volo-media-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
+  gap: 10px;
   padding: 4px;
   margin: -4px;
+}
+
+.volo-modal .volo-media-grid {
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
 }
 
 .volo-media-card {
   position: relative;
   border: 1px solid var(--volo-line);
-  border-radius: 12px;
+  border-radius: 11px;
   background: var(--volo-surface);
   background-clip: padding-box;
   display: flex;
@@ -4279,7 +4285,7 @@ html[data-theme="dark"] .volo-auth-story {
   aspect-ratio: 16 / 10;
   background: var(--volo-raised);
   border-bottom: 1px solid var(--volo-line);
-  border-radius: 11px 11px 0 0;
+  border-radius: 10px 10px 0 0;
   overflow: hidden;
   isolation: isolate;
   display: flex;
@@ -4293,12 +4299,73 @@ html[data-theme="dark"] .volo-auth-story {
   height: 100%;
   object-fit: cover;
   display: block;
-  border-radius: 11px 11px 0 0;
+  border-radius: 10px 10px 0 0;
   transition: transform 0.24s ease;
 }
 
-.volo-media-card:hover .volo-media-thumb img {
+.volo-media-thumb img.is-small-img,
+.volo-media-picker-thumb img.is-small-img {
+  object-fit: scale-down;
+  padding: 8px;
+}
+
+.volo-media-card:hover .volo-media-thumb img:not(.is-small-img) {
   transform: scale(1.03);
+}
+
+.volo-media-list-asset {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.volo-media-list-thumb {
+  appearance: none;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  padding: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  color: var(--volo-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.volo-media-list-thumb:hover {
+  border-color: var(--volo-accent);
+  color: var(--volo-accent);
+}
+
+.volo-media-list-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.volo-media-list-thumb img.is-small-img {
+  object-fit: scale-down;
+  padding: 4px;
+}
+
+.volo-media-list-ext {
+  font-family: var(--volo-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  padding: 0 3px;
+  max-width: 40px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .volo-media-type-placeholder {
@@ -4306,22 +4373,22 @@ html[data-theme="dark"] .volo-auth-story {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: 5px;
   color: var(--volo-muted);
   font-family: var(--volo-mono);
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 700;
-  padding: 12px;
+  padding: 8px;
   width: 100%;
 }
 
 .volo-media-ref-pill {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  padding: 2.5px 8px;
+  top: 6px;
+  right: 6px;
+  padding: 2px 6.5px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 650;
   backdrop-filter: blur(6px);
 }
@@ -4336,16 +4403,18 @@ html[data-theme="dark"] .volo-auth-story {
   color: #ffffff;
 }
 
-.volo-media-body {
-  padding: 11px 12px 12px;
+.volo-media-body,
+.volo-media-card-body {
+  padding: 8px 10px 9px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   flex: 1;
+  min-width: 0;
 }
 
 .volo-media-name {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 620;
   color: var(--volo-text);
   overflow: hidden;
@@ -4355,27 +4424,35 @@ html[data-theme="dark"] .volo-auth-story {
 
 .volo-media-meta {
   font-family: var(--volo-mono);
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--volo-muted);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
+  gap: 4px;
 }
 
-.volo-media-actions {
+.volo-media-actions,
+.volo-media-card-foot {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 5px;
-  padding-top: 6px;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-top: 5px;
   margin-top: auto;
   border-top: 1px solid var(--volo-line);
 }
 
+.volo-media-actions .volo-act-btn {
+  padding: 2px 6px;
+  font-size: 11px;
+  min-height: 22px;
+}
+
 .volo-media-picker-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 10px;
   max-height: 440px;
   overflow-y: auto;
@@ -4729,15 +4806,15 @@ html[data-theme="dark"] .volo-auth-story {
 
 /* Command Palette Trigger & List */
 .volo-cmdk-trigger {
-  height: 36px;
-  padding: 0 11px;
+  height: 34px;
+  padding: 0 6px 0 11px;
   border-radius: 999px;
   border: 1px solid var(--volo-line);
   background: var(--volo-raised);
   color: var(--volo-muted);
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   font-size: 12.5px;
   cursor: pointer;
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
@@ -4750,12 +4827,33 @@ html[data-theme="dark"] .volo-auth-story {
 }
 
 .volo-cmdk-trigger kbd {
-  font-family: var(--volo-mono);
-  font-size: 10.5px;
-  padding: 1px 5px;
-  border-radius: 5px;
-  border: 1px solid var(--volo-line);
-  background: var(--volo-surface);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-family: var(--volo-font);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  color: var(--volo-muted);
+  background: color-mix(in srgb, var(--volo-text) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--volo-line) 75%, transparent);
+  box-shadow: none;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+[data-theme="dark"] .volo-cmdk-trigger kbd {
+  background: color-mix(in srgb, var(--volo-text) 8%, transparent);
+  border-color: color-mix(in srgb, var(--volo-line) 85%, transparent);
+}
+
+.volo-cmdk-trigger:hover kbd {
+  color: var(--volo-accent);
+  background: var(--volo-accent-soft);
+  border-color: color-mix(in srgb, var(--volo-accent) 28%, transparent);
 }
 
 .volo-cmdk-search {
@@ -5524,5 +5622,466 @@ html[data-theme="dark"] .volo-auth-story {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Theme-Native Calendar & Month Picker (`ConsoleDatePicker`) */
+.volo-datepicker .volo-datepicker-btn {
+  height: 36px;
+  min-height: 36px;
+  padding: 0 10px;
+  border-radius: var(--volo-radius-sm);
+  gap: 8px;
+}
+
+.volo-dp-trigger-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+}
+
+.volo-dp-cal-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--volo-muted);
+  flex-shrink: 0;
+  transition: color 0.15s ease;
+}
+
+.volo-datepicker.is-open .volo-dp-cal-icon {
+  color: var(--volo-accent);
+}
+
+.volo-dp-val {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: var(--volo-text);
+}
+
+.volo-dp-placeholder {
+  font-size: 13px;
+  color: var(--volo-muted);
+}
+
+.volo-dp-trigger-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.volo-dp-clear {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--volo-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.volo-dp-clear:hover {
+  background: color-mix(in srgb, var(--volo-text) 10%, transparent);
+  color: var(--volo-text);
+}
+
+.volo-cselect-menu.volo-datepicker-pop {
+  z-index: 10050;
+  padding: 10px 11px;
+  gap: 8px;
+  border-radius: 12px;
+  box-shadow: var(--volo-shadow-pop);
+  overflow-y: auto;
+}
+
+.volo-dp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.volo-dp-nav-grp {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.volo-dp-nav-btn {
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--volo-muted);
+  font-size: 15px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.volo-dp-nav-btn:hover {
+  background: var(--volo-raised);
+  border-color: var(--volo-line);
+  color: var(--volo-text);
+}
+
+.volo-dp-title-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--volo-text);
+  font-size: 13px;
+  font-weight: 680;
+  padding: 4px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.volo-dp-title-btn:hover {
+  background: var(--volo-accent-soft);
+  color: var(--volo-accent);
+}
+
+.volo-dp-month-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.volo-dp-month-cell {
+  appearance: none;
+  height: 34px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--volo-text);
+  font-size: 12.5px;
+  font-weight: 540;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.volo-dp-month-cell:hover:not(.is-selected) {
+  background: var(--volo-raised);
+  border-color: var(--volo-line);
+}
+
+.volo-dp-month-cell.is-today:not(.is-selected) {
+  border-color: var(--volo-accent);
+  color: var(--volo-accent);
+  font-weight: 650;
+}
+
+.volo-dp-month-cell.is-selected {
+  background: var(--volo-btn-bg);
+  border-color: var(--volo-btn-bg);
+  color: #ffffff;
+  font-weight: 650;
+}
+
+.volo-dp-week-row {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 2px;
+  text-align: center;
+}
+
+.volo-dp-week-lbl {
+  font-size: 11px;
+  font-weight: 620;
+  color: var(--volo-muted);
+  padding: 2px 0;
+}
+
+.volo-dp-day-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 2px;
+}
+
+.volo-dp-day-cell {
+  appearance: none;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--volo-text);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.13s ease, color 0.13s ease, border-color 0.13s ease;
+}
+
+.volo-dp-day-cell.is-outside {
+  color: color-mix(in srgb, var(--volo-muted) 55%, transparent);
+}
+
+.volo-dp-day-cell:hover:not(.is-selected) {
+  background: var(--volo-raised);
+  border-color: var(--volo-line);
+}
+
+.volo-dp-day-cell.is-today:not(.is-selected) {
+  border-color: var(--volo-accent);
+  color: var(--volo-accent);
+  font-weight: 680;
+}
+
+.volo-dp-day-cell.is-selected {
+  background: var(--volo-btn-bg);
+  border-color: var(--volo-btn-bg);
+  color: #ffffff;
+  font-weight: 680;
+}
+
+.volo-dp-time-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--volo-line);
+}
+
+.volo-dp-time-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 560;
+  color: var(--volo-muted);
+}
+
+.volo-dp-time-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.volo-dp-stepper {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  overflow: hidden;
+}
+
+.volo-dp-stepper:focus-within {
+  border-color: var(--volo-accent);
+  background: var(--volo-surface);
+}
+
+.volo-dp-step-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--volo-muted);
+  width: 20px;
+  height: 100%;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.volo-dp-step-btn:hover {
+  background: var(--volo-accent-soft);
+  color: var(--volo-accent);
+}
+
+.volo-dp-time-in {
+  width: 28px;
+  height: 100%;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--volo-text);
+  font-family: var(--volo-mono);
+  font-size: 12.5px;
+  font-weight: 650;
+  text-align: center;
+  padding: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.volo-dp-time-sep {
+  font-family: var(--volo-mono);
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--volo-muted);
+}
+
+.volo-dp-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--volo-line);
+}
+
+.volo-dp-foot-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.volo-dp-foot-link {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--volo-accent);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.volo-dp-foot-link:hover {
+  background: var(--volo-accent-soft);
+}
+
+.volo-dp-foot-link.is-muted {
+  color: var(--volo-muted);
+}
+
+.volo-dp-foot-link.is-muted:hover {
+  background: var(--volo-raised);
+  color: var(--volo-text);
+}
+
+.volo-dp-ok-btn {
+  height: 27px;
+  min-height: 27px;
+  padding: 0 11px;
+  font-size: 12px;
+  border-radius: 7px;
+}
+
+/* Monthly Archive Chart Header & Compact 2-Pill Toggle */
+.volo-mini-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.volo-mini-chart-head .volo-mini-chart-title {
+  margin: 0;
+}
+
+.volo-chart-toggle {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 999px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-surface);
+  gap: 2px;
+}
+
+.volo-chart-toggle-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--volo-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  height: 21px;
+  padding: 0 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.volo-chart-toggle-btn:hover {
+  color: var(--volo-text);
+}
+
+.volo-chart-toggle-btn.active {
+  background: var(--volo-accent-soft);
+  color: var(--volo-accent);
+}
+
+@media (max-width: 768px) {
+  .volo-cmdk-trigger {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    gap: 0;
+    justify-content: center;
+  }
+}
+
+@media (max-width: 760px) {
+  .volo-media-grid,
+  .volo-modal .volo-media-grid,
+  .volo-media-picker-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .volo-media-thumb,
+  .volo-media-picker-thumb {
+    aspect-ratio: 4 / 3;
+  }
+
+  .volo-media-body,
+  .volo-media-card-body {
+    padding: 6px 8px 7px;
+    gap: 3px;
+  }
+
+  .volo-media-name {
+    font-size: 11.5px;
+  }
+
+  .volo-media-meta {
+    font-size: 10px;
+  }
+
+  .volo-media-actions .volo-act-btn {
+    padding: 1px 5px;
+    font-size: 10.5px;
+    min-height: 20px;
+  }
+}
+
+@media (max-width: 480px) {
+  .volo-media-grid,
+  .volo-modal .volo-media-grid,
+  .volo-media-picker-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+}
+
 
 

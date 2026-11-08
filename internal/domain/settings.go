@@ -114,19 +114,21 @@ type SEOSettings struct {
 
 // StorageSettings ("storage" domain). Secrets are stored exclusively in SecretCiphertext!
 type StorageSettings struct {
-	ActiveDriver       string `json:"active_driver"` // local | s3
-	MaxUploadMB        int    `json:"max_upload_mb"`
-	StripEXIF          bool   `json:"strip_exif"`
-	AdaptiveWebP       bool   `json:"adaptive_webp"`
-	ImageQuality       int    `json:"image_quality"`
-	S3Endpoint         string `json:"s3_endpoint"`
-	S3Region           string `json:"s3_region"`
-	S3Bucket           string `json:"s3_bucket"`
-	S3AccessKey        string `json:"s3_access_key"`
-	S3PublicBaseURL    string `json:"s3_public_base_url"`
-	S3KeyPrefix        string `json:"s3_key_prefix"`
-	S3PathStyle        bool   `json:"s3_path_style"`
-	S3SecretKeySet     bool   `json:"s3_secret_key_set"`
+	ActiveDriver    string `json:"active_driver"` // local | s3
+	LocalDir        string `json:"local_dir"`
+	LocalKeyPrefix  string `json:"local_key_prefix"`
+	MaxUploadMB     int    `json:"max_upload_mb"`
+	StripEXIF       bool   `json:"strip_exif"`
+	AdaptiveWebP    bool   `json:"adaptive_webp"`
+	ImageQuality    int    `json:"image_quality"`
+	S3Endpoint      string `json:"s3_endpoint"`
+	S3Region        string `json:"s3_region"`
+	S3Bucket        string `json:"s3_bucket"`
+	S3AccessKey     string `json:"s3_access_key"`
+	S3PublicBaseURL string `json:"s3_public_base_url"`
+	S3KeyPrefix     string `json:"s3_key_prefix"`
+	S3PathStyle     bool   `json:"s3_path_style"`
+	S3SecretKeySet  bool   `json:"s3_secret_key_set"`
 }
 
 // StorageSecrets is encrypted via AES-256-GCM into settings.secret_ciphertext for domain="storage".

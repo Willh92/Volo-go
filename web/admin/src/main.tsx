@@ -894,7 +894,7 @@ function App() {
             <button
               type="button"
               class="volo-cmdk-trigger"
-              title={`${t("ui.cmdk_title")} (Ctrl/Cmd+K)`}
+              title={`${t("ui.cmdk_title")} (${typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent) ? "⌘K" : "Ctrl+K"})`}
               onClick={() => setCmdkOpen(true)}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -902,7 +902,9 @@ function App() {
                 <line x1="20.5" y1="20.5" x2="16.4" y2="16.4" />
               </svg>
               <span class="volo-pill-label">{t("ui.cmdk_btn")}</span>
-              <kbd class="volo-pill-label">⌘K</kbd>
+              <kbd class="volo-pill-label volo-cmdk-kbd">
+                {typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent) ? "⌘K" : "Ctrl K"}
+              </kbd>
             </button>
 
             {/* Unified Appearance Popover (4 Modes + Admin-Persisted Accent Swatches) */}

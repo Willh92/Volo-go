@@ -215,15 +215,15 @@ export function AboutHelpWorkspace({
               <div class="volo-repo-stats">
                 <div class="volo-repo-stat">
                   <strong>{info?.repo?.stars ?? 0}</strong>
-                  <span>Stars</span>
+                  <span>{t("about.stat_stars")}</span>
                 </div>
                 <div class="volo-repo-stat">
                   <strong>{info?.repo?.forks ?? 0}</strong>
-                  <span>Forks</span>
+                  <span>{t("about.stat_forks")}</span>
                 </div>
                 <div class="volo-repo-stat">
                   <strong>{info?.repo?.open_issues ?? 0}</strong>
-                  <span>Issues</span>
+                  <span>{t("about.stat_issues")}</span>
                 </div>
               </div>
 
