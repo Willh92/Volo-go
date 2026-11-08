@@ -250,20 +250,16 @@ func (c *Config) ValidateCustomGeoIPPath(rawPath string) (string, error) {
 		}
 	}
 
-	// If an existing entry on disk is a file (not a directory), require a .mmdb or .xdb extension.
+	// Pure lexical extension check (zero filesystem syscalls on user-supplied path strings;
+	// symlink and regular-file verification is enforced at load time in GeoEngine.LoadDatabases via os.Lstat).
 	lowBase := strings.ToLower(filepath.Base(cleaned))
 	hasDBExt := strings.HasSuffix(lowBase, ".mmdb") || strings.HasSuffix(lowBase, ".xdb")
-	if st, stErr := os.Lstat(absTarget); stErr == nil {
-		if st.Mode()&os.ModeSymlink != 0 {
-			return "", errors.New("config: geoip_dir cannot be a symbolic link")
-		}
-		if !st.IsDir() && !hasDBExt {
-			return "", errors.New("config: geoip_dir file target must end with .mmdb or .xdb")
-		}
-	} else if ext := strings.ToLower(filepath.Ext(lowBase)); ext != "" && !hasDBExt {
-		// Reject obvious non-GeoIP file extensions such as .db, .env, .json, .key
+	if ext := strings.ToLower(filepath.Ext(lowBase)); ext != "" && !hasDBExt {
 		switch ext {
-		case ".db", ".sqlite", ".sqlite3", ".env", ".key", ".pem", ".json", ".zip", ".sql", ".log":
+		case ".db", ".sqlite", ".sqlite3", ".env", ".key", ".pem", ".crt", ".pub",
+			".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg",
+			".zip", ".tar", ".gz", ".sql", ".log", ".txt", ".md", ".csv",
+			".sh", ".bat", ".ps1", ".exe", ".html", ".js", ".css":
 			return "", errors.New("config: geoip_dir file target must end with .mmdb or .xdb")
 		}
 	}

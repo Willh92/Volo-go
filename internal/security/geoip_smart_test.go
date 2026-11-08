@@ -375,4 +375,19 @@ func TestGeoEngineDualIPv4AndIPv6XDBSlotsAndHotReload(t *testing.T) {
 	if len(eng.Status().ActiveFiles) != 0 {
 		t.Fatalf("expected 0 active files after reloading empty directory, got %+v", eng.Status())
 	}
+
+	// Reject symlinks and extensionless regular files via os.Lstat at load time
+	symPath := filepath.Join(t.TempDir(), "geo-symlink")
+	if err := os.Symlink(singleDir, symPath); err == nil {
+		if err := eng.LoadDatabases(symPath); err == nil {
+			t.Fatalf("expected symlink GeoIP path %q to be rejected by LoadDatabases", symPath)
+		}
+	}
+	rawFile := filepath.Join(t.TempDir(), "rawfile")
+	if err := os.WriteFile(rawFile, []byte("plain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.LoadDatabases(rawFile); err == nil {
+		t.Fatalf("expected non-DB regular file %q to be rejected by LoadDatabases", rawFile)
+	}
 }

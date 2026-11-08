@@ -172,13 +172,16 @@ func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 		return nil
 	}
 
-	info, stErr := os.Stat(cleanPath)
+	info, stErr := os.Lstat(cleanPath)
 	if stErr != nil {
 		if os.IsNotExist(stErr) {
 			g.swapDatabases(cleanPath, nil, nil, nil, nil, nil)
 			return nil
 		}
 		return stErr
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("geoip: path cannot be a symbolic link")
 	}
 
 	type fileTarget struct {
@@ -187,7 +190,12 @@ func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 	}
 	var targets []fileTarget
 	if !info.IsDir() {
-		targets = append(targets, fileTarget{name: filepath.Base(cleanPath), path: cleanPath})
+		baseName := filepath.Base(cleanPath)
+		lowBase := strings.ToLower(baseName)
+		if !strings.HasSuffix(lowBase, ".mmdb") && !strings.HasSuffix(lowBase, ".xdb") {
+			return errors.New("geoip: file target must end with .mmdb or .xdb")
+		}
+		targets = append(targets, fileTarget{name: baseName, path: cleanPath})
 	} else {
 		entries, err := os.ReadDir(cleanPath)
 		if err != nil {
@@ -198,11 +206,11 @@ func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 			return err
 		}
 		for _, e := range entries {
-			if e.IsDir() {
+			if e.IsDir() || e.Type()&os.ModeSymlink != 0 {
 				continue
 			}
 			full := filepath.Join(cleanPath, e.Name())
-			if st, sErr := os.Stat(full); sErr != nil || st.IsDir() {
+			if st, sErr := os.Lstat(full); sErr != nil || st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
 				continue
 			}
 			targets = append(targets, fileTarget{

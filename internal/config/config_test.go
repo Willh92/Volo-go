@@ -312,12 +312,8 @@ func TestValidateCustomGeoIPPathAndRuntimeSetGeoIPDir(t *testing.T) {
 		t.Fatalf("GetGeoIPDir after reset = %q, want %q", got, defGeo)
 	}
 
-	// Reject traversal, OS roots, dataDir enclosure, upload overlap, bad extensions, and symlinks
-	symPath := filepath.Join(tmpDir, "geo-link")
-	_ = os.MkdirAll(customDir, 0o750)
-	_ = os.Symlink(customDir, symPath)
+	// Reject traversal, OS roots, dataDir enclosure, upload overlap, and non-GeoIP file extensions
 	txtFile := filepath.Join(tmpDir, "notes.txt")
-	_ = os.WriteFile(txtFile, []byte("hello"), 0o600)
 
 	for _, bad := range []string{
 		"../outside",
@@ -329,7 +325,6 @@ func TestValidateCustomGeoIPPathAndRuntimeSetGeoIPDir(t *testing.T) {
 		filepath.Join(uploadDir, "geo"),
 		filepath.Join(tmpDir, "volo.db"),
 		txtFile,
-		symPath,
 	} {
 		if _, err := cfg.ValidateCustomGeoIPPath(bad); err == nil {
 			t.Fatalf("expected unsafe GeoIP path %q to be rejected", bad)
