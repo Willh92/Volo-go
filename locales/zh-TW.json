@@ -1886,5 +1886,18 @@
   "sys.waf_reason_rate_abuse": "高頻請求速率濫用",
   "sys.waf_reason_login_fail": "多次登入認證失敗",
   "sys.waf_reason_two_factor_fail": "多次兩步驗證失敗",
-  "sys.waf_reason_unlock_fail": "多次加密內容解鎖失敗"
+  "sys.waf_reason_unlock_fail": "多次加密內容解鎖失敗",
+  "ed.text_color": "文字顏色與螢光醒目提示",
+  "ed.color_clear": "清除顏色樣式",
+  "ed.color_mark": "螢光醒目提示 (<mark>)",
+  "ed.underline": "底線 (<u>)",
+  "ed.callout": "插入提示卡片 ([!NOTE])",
+  "ed.sc_lock_user": "插入「註冊使用者可見」隱藏內容區塊",
+  "ed.sc_lock_pwd": "插入「局部密碼保護」隱藏內容區塊",
+  "ed.sc_bookshelf": "插入「線上書架」內嵌閱讀器短代碼",
+  "ed.sc_bookshelf_all": "嵌入全部線上書架 (:::bookshelf)",
+  "ed.sc_book_pick": "選擇單本書籍嵌入 (:::book)…",
+  "ed.sync_scroll": "雙欄同步捲動",
+  "ed.lock_user_ph": "此處內容登入讀者可見…",
+  "ui.cmdk_hint": "↑↓ 選擇 · Enter 開啟 · Esc 關閉"
 }

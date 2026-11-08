@@ -1172,6 +1172,8 @@
         badge.href = saved.url;
         badge.textContent = saved.chapterTitle ? base + " · " + saved.chapterTitle : base;
         badge.hidden = false;
+        var foot = badge.closest(".book-card__foot");
+        if (foot) foot.hidden = false;
       }
     });
 

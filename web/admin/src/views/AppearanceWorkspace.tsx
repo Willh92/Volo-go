@@ -159,7 +159,7 @@ function SortableFixedOptsField({
   onChange: (key: string, next: any) => void;
 }) {
   const optMap = new Map(allOpts.map((o) => [o.value, o.label]));
-  const { listRef, draggingIdx, getHandleProps } = usePointerSortableList(
+  const { listRef, draggingIdx, grabbingIdx, captureFlip, getHandleProps } = usePointerSortableList(
     enabledKeys,
     (next) => onChange(fieldKey, next),
     enabledKeys.length > 1
@@ -168,6 +168,7 @@ function SortableFixedOptsField({
   const moveItem = (idx: number, delta: number) => {
     const target = idx + delta;
     if (target < 0 || target >= enabledKeys.length) return;
+    captureFlip();
     const next = [...enabledKeys];
     const [picked] = next.splice(idx, 1);
     next.splice(target, 0, picked);
@@ -176,6 +177,7 @@ function SortableFixedOptsField({
 
   const moveToTop = (idx: number) => {
     if (idx <= 0 || idx >= enabledKeys.length) return;
+    captureFlip();
     const next = [...enabledKeys];
     const [picked] = next.splice(idx, 1);
     next.unshift(picked);
@@ -196,7 +198,7 @@ function SortableFixedOptsField({
             <div
               key={k}
               data-sort-idx={idx}
-              class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""}`}
+              class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""} ${grabbingIdx === idx ? "is-grabbing" : ""}`}
             >
               <div class="volo-sortable-main">
                 <span
@@ -313,7 +315,7 @@ function SortableFreeItemsField({
   setFreeItemDraft: (v: string) => void;
   onChange: (key: string, next: any) => void;
 }) {
-  const { listRef, draggingIdx, getHandleProps } = usePointerSortableList(
+  const { listRef, draggingIdx, grabbingIdx, captureFlip, getHandleProps } = usePointerSortableList(
     items,
     (next) => onChange(fieldKey, next),
     items.length > 1
@@ -322,6 +324,7 @@ function SortableFreeItemsField({
   const moveFree = (idx: number, delta: number) => {
     const target = idx + delta;
     if (target < 0 || target >= items.length) return;
+    captureFlip();
     const next = [...items];
     const [picked] = next.splice(idx, 1);
     next.splice(target, 0, picked);
@@ -330,6 +333,7 @@ function SortableFreeItemsField({
 
   const moveFreeTop = (idx: number) => {
     if (idx <= 0 || idx >= items.length) return;
+    captureFlip();
     const next = [...items];
     const [picked] = next.splice(idx, 1);
     next.unshift(picked);
@@ -374,9 +378,9 @@ function SortableFreeItemsField({
             const handleProps = getHandleProps(idx);
             return (
               <div
-                key={`${item}-${idx}`}
+                key={item}
                 data-sort-idx={idx}
-                class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""}`}
+                class={`volo-sortable-row ${draggingIdx === idx ? "is-dragging" : ""} ${grabbingIdx === idx ? "is-grabbing" : ""}`}
               >
                 <div class="volo-sortable-main">
                   <span

@@ -164,9 +164,9 @@ func TestLegacyBookshelfDirectivesAndWideTable(t *testing.T) {
 		t.Fatalf("raw :::bookshelf::: directive leaked into HTML: %s", outShelf.HTML)
 	}
 	if !strings.Contains(outShelf.HTML, `class="volo-embed-bookshelf"`) ||
-		!strings.Contains(outShelf.HTML, `/books/the-way-to-go`) ||
+		!strings.Contains(outShelf.HTML, `<a class="volo-book-tile" href="/books/the-way-to-go"`) ||
 		!strings.Contains(outShelf.HTML, `42 章`) ||
-		!strings.Contains(outShelf.HTML, `开始阅读 →`) ||
+		strings.Contains(outShelf.HTML, `开始阅读`) ||
 		!strings.Contains(outShelf.HTML, `volo-embed-book__cover--fallback`) {
 		t.Fatalf("unexpected bookshelf HTML: %s", outShelf.HTML)
 	}
@@ -190,8 +190,8 @@ func TestLegacyBookshelfDirectivesAndWideTable(t *testing.T) {
 	if strings.Contains(outBook.HTML, ":::book") {
 		t.Fatalf("raw :::book directive leaked into HTML: %s", outBook.HTML)
 	}
-	if !strings.Contains(outBook.HTML, "42 chapters") || !strings.Contains(outBook.HTML, "Read →") {
-		t.Fatalf("expected localized chapter badge & CTA in book card: %s", outBook.HTML)
+	if !strings.Contains(outBook.HTML, "42 chapters") || !strings.Contains(outBook.HTML, `<a class="volo-embed-book" href="/books/the-way-to-go"`) {
+		t.Fatalf("expected localized chapter badge & full-card anchor in book card: %s", outBook.HTML)
 	}
 
 	// 3. Wide 20-column GFM table wraps cleanly in `.volo-table-scroll`
@@ -207,6 +207,16 @@ func TestLegacyBookshelfDirectivesAndWideTable(t *testing.T) {
 	outTbl := eng.Render(wideTableMD, Options{Mode: RenderModeWeb})
 	if !strings.Contains(outTbl.HTML, `<div class="volo-table-scroll"><table>`) {
 		t.Fatalf("expected wide table wrapped in .volo-table-scroll, got: %s", outTbl.HTML)
+	}
+
+	// 4. Hard line breaks (<br>), literal `--flag` double-hyphens, and `<font color=#ff0000>` preservation
+	techMD := "> 最新的PHP版本，需要使用参数--with-libzip系统库，并且版本需要>=1.11，[libzip官网](https://libzip.org/)\n> <font  color=#ff0000> 注意libzip编译需要cmake如果没有要先安装cmake</font>\n> libzip安装如下：\n\n安装完成之后，执行配置：\n<font color=#ff0000>注意--prefix参数为安装位置，这里为/usr/php</font>"
+	outTech := eng.Render(techMD, Options{Mode: RenderModeWeb})
+	if !strings.Contains(outTech.HTML, "--with-libzip") || !strings.Contains(outTech.HTML, "--prefix") || strings.Contains(outTech.HTML, "&ndash;") || strings.Contains(outTech.HTML, "–") {
+		t.Fatalf("expected literal --with-libzip and --prefix without en-dash mutation, got: %s", outTech.HTML)
+	}
+	if !strings.Contains(outTech.HTML, `<font color="#ff0000">`) || strings.Count(outTech.HTML, "<br") < 3 {
+		t.Fatalf("expected <font color=\"#ff0000\"> and hard-wrap <br> tags preserved, got: %s", outTech.HTML)
 	}
 }
 

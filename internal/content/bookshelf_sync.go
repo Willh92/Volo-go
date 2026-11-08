@@ -124,6 +124,16 @@ func buildChapterTree(flat []domain.BookChapter) []BookChapterNode {
 	return walk("")
 }
 
+// LookupBookCard resolves a BookCardInfo by slug or ID for Markdown :::book directives.
+func (s *Service) LookupBookCard(ctx context.Context, slug string) (render.BookCardInfo, bool) {
+	return s.lookupBookCard(ctx, slug)
+}
+
+// ListBookCards lists all books as BookCardInfo items for Markdown :::bookshelf directives.
+func (s *Service) ListBookCards(ctx context.Context) []render.BookCardInfo {
+	return s.listBookCards(ctx)
+}
+
 func (s *Service) lookupBookCard(ctx context.Context, slug string) (render.BookCardInfo, bool) {
 	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE slug = ? OR id = ?`, slug, slug)
 	if err != nil {

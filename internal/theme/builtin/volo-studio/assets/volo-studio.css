@@ -2214,22 +2214,33 @@ table.volo-github-repos-table td:nth-child(5) {
 .volo-unlock-form { display: inline-flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; justify-content: center; max-width: 100%; }
 .volo-unlock-err { width: 100%; color: var(--volo-danger); font-size: 0.86rem; }
 
-/* Embedded :::book and :::bookshelf Directives */
-.volo-embed-book {
+/* Embedded :::book and :::bookshelf Directives (Full-Card Clickable) */
+.volo-embed-book,
+.volo-prose a.volo-embed-book {
   margin: 1.3em 0;
-  padding: 16px 18px;
+  padding: 15px 18px;
   border: 1px solid var(--volo-line);
   border-radius: 12px;
   background: var(--volo-raised);
+  color: var(--volo-text);
+  text-decoration: none !important;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 16px;
   min-width: 0;
-  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+  cursor: pointer;
+  transition: border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease, background-color 0.16s ease;
 }
-.volo-embed-book:hover {
-  border-color: color-mix(in srgb, var(--volo-accent) 45%, var(--volo-line));
+.volo-embed-book:hover,
+.volo-prose a.volo-embed-book:hover {
+  border-color: color-mix(in srgb, var(--volo-accent) 48%, var(--volo-line));
+  transform: translate3d(0, -2px, 0);
   box-shadow: var(--volo-shadow);
+}
+.volo-embed-book:focus-visible,
+.volo-book-tile:focus-visible {
+  outline: 2px solid var(--volo-accent);
+  outline-offset: 2px;
 }
 .volo-embed-book__cover-link {
   display: block;
@@ -2238,7 +2249,7 @@ table.volo-github-repos-table td:nth-child(5) {
 }
 .volo-embed-book__cover,
 .volo-prose .volo-embed-book__cover {
-  width: 68px;
+  width: 64px;
   height: auto;
   aspect-ratio: 3 / 4;
   margin: 0;
@@ -2277,7 +2288,7 @@ table.volo-github-repos-table td:nth-child(5) {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
 }
 .volo-embed-book__head {
   display: flex;
@@ -2294,9 +2305,9 @@ table.volo-github-repos-table td:nth-child(5) {
   overflow-wrap: anywhere;
   transition: color 0.15s ease;
 }
-.volo-embed-book__title:hover {
+.volo-embed-book:hover .volo-embed-book__title,
+.volo-book-tile:hover .volo-embed-book__title {
   color: var(--volo-accent);
-  text-decoration: none;
 }
 .volo-embed-book__chapters {
   display: inline-flex;
@@ -2320,19 +2331,19 @@ table.volo-github-repos-table td:nth-child(5) {
   -webkit-line-clamp: 2;
   overflow: hidden;
 }
-.volo-embed-book__foot {
-  margin-top: 2px;
+.volo-embed-book__arrow {
+  flex-shrink: 0;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--volo-muted);
+  opacity: 0.65;
+  transition: color 0.16s ease, opacity 0.16s ease, transform 0.16s ease;
 }
-.volo-embed-book__cta {
-  display: inline-flex;
-  align-items: center;
-  font-size: 0.82rem;
-  font-weight: 600;
+.volo-embed-book:hover .volo-embed-book__arrow,
+.volo-book-tile:hover .volo-embed-book__arrow {
   color: var(--volo-accent);
-  text-decoration: none;
-}
-.volo-embed-book__cta:hover {
-  text-decoration: underline;
+  opacity: 1;
+  transform: translate3d(3px, 0, 0);
 }
 .volo-embed-bookshelf {
   margin: 1.4em 0;
@@ -2353,24 +2364,29 @@ table.volo-github-repos-table td:nth-child(5) {
   color: var(--volo-muted);
   font-size: 0.9rem;
 }
-.volo-book-tile {
-  padding: 15px 16px;
+.volo-book-tile,
+.volo-prose a.volo-book-tile {
+  padding: 14px 16px;
   border: 1px solid var(--volo-line);
   border-radius: 12px;
   background: var(--volo-raised);
+  color: var(--volo-text);
+  text-decoration: none !important;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 14px;
   min-width: 0;
-  transition: border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
+  cursor: pointer;
+  transition: border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease, background-color 0.16s ease;
 }
-.volo-book-tile:hover {
-  border-color: color-mix(in srgb, var(--volo-accent) 45%, var(--volo-line));
-  transform: translateY(-2px);
+.volo-book-tile:hover,
+.volo-prose a.volo-book-tile:hover {
+  border-color: color-mix(in srgb, var(--volo-accent) 48%, var(--volo-line));
+  transform: translate3d(0, -2px, 0);
   box-shadow: var(--volo-shadow);
 }
 .volo-book-tile .volo-embed-book__cover {
-  width: 58px;
+  width: 56px;
 }
 
 .volo-input {
@@ -3151,9 +3167,21 @@ button.volo-audio-ts:hover,
   font-size: 0.82rem;
   color: var(--volo-muted);
 }
+.book-card--clickable {
+  position: relative;
+  cursor: pointer;
+}
 .book-card__title { margin: 0; font-size: 1.08rem; line-height: 1.45; overflow-wrap: anywhere; }
 .book-card__title a { color: var(--volo-text); }
-.book-card__title a:hover { color: var(--volo-accent); }
+.book-card__title a:hover,
+.book-card--clickable:hover .book-card__title a { color: var(--volo-accent); }
+.book-card__main-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+}
 .book-card__foot {
   margin-top: auto;
   padding-top: 8px;
@@ -3163,6 +3191,8 @@ button.volo-audio-ts:hover,
   gap: 8px;
 }
 .studio-resume-badge {
+  position: relative;
+  z-index: 2;
   display: inline-flex;
   align-items: center;
   height: 36px;

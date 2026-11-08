@@ -1108,6 +1108,7 @@ export function ContentWorkspace({
 
   // Move entire chapter subtree (node + contiguous deeper descendants) past adjacent sibling subtree
   const moveChapterSubtree = (idx: number, dir: -1 | 1) => {
+    chapSortHook.captureFlip();
     setChapItems((prev) => {
       if (idx < 0 || idx >= prev.length) return prev;
       const d = Math.max(0, Math.min(3, Number(prev[idx].depth) || 0));
@@ -1149,6 +1150,7 @@ export function ContentWorkspace({
   };
 
   const moveChapterToTop = (idx: number) => {
+    chapSortHook.captureFlip();
     setChapItems((prev) => {
       if (idx <= 0 || idx >= prev.length) return prev;
       const d = Math.max(0, Math.min(3, Number(prev[idx].depth) || 0));
@@ -2881,7 +2883,7 @@ export function ContentWorkspace({
                           <div
                             key={ch._uid}
                             data-sort-idx={sliceIdx}
-                            class={`volo-chap-row volo-chap-indent ${chapSortHook.draggingIdx === sliceIdx ? "is-dragging" : ""}`}
+                            class={`volo-chap-row volo-chap-indent ${chapSortHook.draggingIdx === sliceIdx ? "is-dragging" : ""} ${chapSortHook.grabbingIdx === sliceIdx ? "is-grabbing" : ""}`}
                             style={{ "--chap-depth": depth } as any}
                           >
                             {canDrag && (
@@ -3172,7 +3174,7 @@ export function ContentWorkspace({
                       />
                     </div>
                   </div>
-                  <div class="volo-check-grid" style={{ marginBottom: 0 }}>
+                  <div class="volo-check-row-end">
                     <SwitchToggle
                       checked={editPage.is_published !== false}
                       onChange={(v) => updatePageDraft({ is_published: v })}

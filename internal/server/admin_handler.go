@@ -1448,6 +1448,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			writeErrJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
+		ctx := r.Context()
 		out := render.Default().Render(req.ContentMD, render.Options{
 			Mode:                render.RenderModeWeb,
 			Locale:              s.deps.Catalog.Match(req.Locale, actor.PreferredLocale),
@@ -1455,6 +1456,8 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			AuthorOrShareBypass: true,
 			IsReaderLoggedIn:    true,
 			ShowLineNumbers:     s.deps.Settings.Snapshot().Reading.ShowCodeLineNumbers,
+			LookupBook:          func(bSlug string) (render.BookCardInfo, bool) { return s.deps.Content.LookupBookCard(ctx, bSlug) },
+			ListBooks:           func() []render.BookCardInfo { return s.deps.Content.ListBookCards(ctx) },
 			LookupMediaDims:     s.deps.Content.LookupMediaDims,
 		})
 		writeJSON(w, http.StatusOK, map[string]any{"html": out.HTML, "toc": out.TOC})

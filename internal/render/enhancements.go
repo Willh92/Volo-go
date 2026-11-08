@@ -20,7 +20,7 @@ var (
 	tdFullRe          = regexp.MustCompile(`(?is)<td(\b[^>]*)>(.*?)</td>`)
 	anchorTagOpenRe   = regexp.MustCompile(`(?i)<a\b([^>]*)>`)
 	ghStatsImgPlainRe = regexp.MustCompile(`(?is)(<p>\s*)(<img\b[^>]*\bsrc="([^"]*/github-stats/([a-zA-Z0-9-]+)\.svg)"[^>]*>)(\s*</p>)`)
-	ghAlertMarkerRe   = regexp.MustCompile(`(?is)^\s*<p>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]*</p>\s*|(?:[ \t]*<br\s*/?>|\s*\n|[ \t]+))`)
+	ghAlertMarkerRe   = regexp.MustCompile(`(?is)^\s*<p>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]*</p>\s*|(?:[ \t]*<br\s*/?>\s*|\s*\n|[ \t]+))`)
 )
 
 // assignReadableHeadingIDs ensures every <h1>..<h6> carries a unique, readable, CJK-friendly `id`

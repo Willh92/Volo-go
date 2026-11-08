@@ -18,23 +18,22 @@
     {{if .Books}}
       <div class="bookshelf-grid js-book-filter-grid">
         {{range .Books}}
-          <article class="book-card" data-book-card="{{.Slug}}" data-book-filter="{{lower .Title}} {{lower .Slug}} {{lower .Description}}">
+          <article class="book-card book-card--clickable" data-book-card="{{.Slug}}" data-book-filter="{{lower .Title}} {{lower .Slug}} {{lower .Description}}">
             {{if .CoverURL}}
-              <a class="book-card__cover" href="/books/{{.Slug}}" tabindex="-1" aria-hidden="true">
+              <div class="book-card__cover">
                 <img src="{{.CoverURL}}" alt="{{.Title}}" loading="lazy" width="240" height="320" data-cover-img="1">
                 <span class="studio-cover-fallback" hidden>{{coverSVG .Slug false}}</span>
-              </a>
+              </div>
             {{else}}
-              <a class="book-card__cover" href="/books/{{.Slug}}" tabindex="-1" aria-hidden="true">{{coverSVG .Slug false}}</a>
+              <div class="book-card__cover" aria-hidden="true">{{coverSVG .Slug false}}</div>
             {{end}}
             <div class="book-card__meta">
               <span class="volo-badge">{{.SourceType}}</span>
               <span>{{t $.Locale "bookshelf.chapters" (dict "count" .ChapterCount)}}</span>
             </div>
-            <h2 class="book-card__title"><a href="/books/{{.Slug}}">{{.Title}}</a></h2>
+            <h2 class="book-card__title"><a class="book-card__main-link" href="/books/{{.Slug}}">{{.Title}}</a></h2>
             {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
-            <div class="book-card__foot">
-              <a class="studio-icon-btn" href="/books/{{.Slug}}">{{t $.Locale "bookshelf.open_reader"}}</a>
+            <div class="book-card__foot" hidden>
               <a class="studio-resume-badge js-book-resume" href="/books/{{.Slug}}" hidden data-label="{{t $.Locale "bookshelf.continue_reading"}}">{{t $.Locale "bookshelf.continue_reading"}} →</a>
             </div>
           </article>

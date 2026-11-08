@@ -1908,7 +1908,7 @@ export function OverviewWorkspace({
                         />
                       </div>
                     </div>
-                    <div class="volo-check-grid" style={{ marginBottom: 0 }}>
+                    <div class="volo-check-row-end">
                       <SwitchToggle
                         checked={isPinned}
                         onChange={(v) => {

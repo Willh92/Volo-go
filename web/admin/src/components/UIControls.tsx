@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { createPortal } from "preact/compat";
 import type { CSSProperties, ComponentChildren } from "preact";
 import { confirmSig, resolveConfirm } from "../api";
@@ -1389,6 +1389,7 @@ export interface AnimatedModalProps {
   title: string;
   subtitle?: string;
   maxWidth?: string;
+  variant?: "default" | "spotlight";
   children: ComponentChildren;
   footer?: ComponentChildren;
 }
@@ -1399,10 +1400,12 @@ export function AnimatedModal({
   title,
   subtitle,
   maxWidth = "640px",
+  variant = "default",
   children,
   footer,
 }: AnimatedModalProps) {
   const [rendered, setRendered] = useState(open);
+  const [entered, setEntered] = useState(false);
   const [closing, setClosing] = useState(false);
   const [stackDepth, setStackDepth] = useState(0);
   const onCloseRef = useRef(onClose);
@@ -1412,12 +1415,23 @@ export function AnimatedModal({
     if (open) {
       setRendered(true);
       setClosing(false);
+      let raf2 = 0;
+      const raf1 = window.requestAnimationFrame(() => {
+        raf2 = window.requestAnimationFrame(() => {
+          setEntered(true);
+        });
+      });
+      return () => {
+        window.cancelAnimationFrame(raf1);
+        if (raf2) window.cancelAnimationFrame(raf2);
+      };
     } else if (rendered) {
+      setEntered(false);
       setClosing(true);
       const timer = window.setTimeout(() => {
         setRendered(false);
         setClosing(false);
-      }, 170);
+      }, 185);
       return () => window.clearTimeout(timer);
     }
   }, [open]);
@@ -1449,38 +1463,43 @@ export function AnimatedModal({
 
   if (!rendered || typeof document === "undefined") return null;
 
+  const isSpotlight = variant === "spotlight";
+
   return createPortal(
     <div
-      class={`volo-modal-backdrop ${closing ? "is-closing" : ""}`}
+      class={`volo-modal-backdrop ${isSpotlight ? "is-spotlight" : ""} ${entered && !closing ? "is-open" : ""} ${closing ? "is-closing" : ""}`}
       style={{ zIndex: 1000 + stackDepth * 20 }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
-        class={`volo-modal ${closing ? "is-closing" : ""}`}
+        class={`volo-modal ${isSpotlight ? "volo-modal--spotlight" : ""} ${entered && !closing ? "is-open" : ""} ${closing ? "is-closing" : ""}`}
         style={{ maxWidth }}
         role="dialog"
         aria-modal="true"
+        aria-label={isSpotlight ? title : undefined}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div class="volo-modal-head">
-          <div style={{ minWidth: 0 }}>
-            <h3 class="volo-card-title" style={{ fontSize: "16.5px" }}>{title}</h3>
-            {subtitle && <p class="volo-sec-desc" style={{ marginTop: "3px" }}>{subtitle}</p>}
+        {!isSpotlight && (
+          <div class="volo-modal-head">
+            <div style={{ minWidth: 0 }}>
+              <h3 class="volo-card-title" style={{ fontSize: "16.5px" }}>{title}</h3>
+              {subtitle && <p class="volo-sec-desc" style={{ marginTop: "3px" }}>{subtitle}</p>}
+            </div>
+            <button
+              type="button"
+              class="volo-modal-close"
+              aria-label={t("common.close")}
+              title={t("common.close")}
+              onClick={onClose}
+            >
+              ×
+            </button>
           </div>
-          <button
-            type="button"
-            class="volo-modal-close"
-            aria-label={t("common.close")}
-            title={t("common.close")}
-            onClick={onClose}
-          >
-            ×
-          </button>
-        </div>
-        <div class="volo-modal-body">{children}</div>
-        {footer && <div class="volo-form-actions">{footer}</div>}
+        )}
+        {isSpotlight ? children : <div class="volo-modal-body">{children}</div>}
+        {!isSpotlight && footer && <div class="volo-form-actions">{footer}</div>}
       </div>
     </div>,
     document.body
@@ -2251,6 +2270,7 @@ export function usePointerSortableList<T>(
 ) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
+  const [grabbingIdx, setGrabbingIdx] = useState<number | null>(null);
   const itemsRef = useRef(items);
   itemsRef.current = items;
   const onReorderRef = useRef(onReorder);
@@ -2258,10 +2278,69 @@ export function usePointerSortableList<T>(
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
   const cleanupRef = useRef<(() => void) | null>(null);
+  const settleCleanupRef = useRef<(() => void) | null>(null);
+  const prevTopsRef = useRef<Map<HTMLElement, number>>(new Map());
+  const draggingIdxRef = useRef<number | null>(null);
+  draggingIdxRef.current = draggingIdx;
+
+  const captureFlip = () => {
+    const container = listRef.current;
+    const map = new Map<HTMLElement, number>();
+    if (container) {
+      const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx]");
+      for (let i = 0; i < rows.length; i++) {
+        map.set(rows[i], rows[i].getBoundingClientRect().top);
+      }
+    }
+    prevTopsRef.current = map;
+  };
+
+  useLayoutEffect(() => {
+    const prevMap = prevTopsRef.current;
+    if (!prevMap.size) return;
+    prevTopsRef.current = new Map();
+    const container = listRef.current;
+    if (!container) return;
+    if (typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+    const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx]");
+    const movedEls: { el: HTMLElement; dy: number }[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const el = rows[i];
+      const rIdx = Number(el.dataset.sortIdx);
+      if (draggingIdxRef.current !== null && rIdx === draggingIdxRef.current) continue;
+      const oldTop = prevMap.get(el);
+      if (oldTop === undefined) continue;
+      const dy = Math.round(oldTop - el.getBoundingClientRect().top);
+      if (Math.abs(dy) > 1) {
+        movedEls.push({ el, dy });
+      }
+    }
+    if (!movedEls.length) return;
+    for (let i = 0; i < movedEls.length; i++) {
+      const { el, dy } = movedEls[i];
+      el.style.transition = "none";
+      el.style.transform = `translate3d(0, ${dy}px, 0)`;
+    }
+    void container.offsetHeight;
+    for (let i = 0; i < movedEls.length; i++) {
+      const { el } = movedEls[i];
+      el.style.transition = "transform 210ms cubic-bezier(0.22, 1, 0.36, 1)";
+      el.style.transform = "translate3d(0, 0, 0)";
+      const clear = () => {
+        el.style.transition = "";
+        el.style.transform = "";
+      };
+      el.addEventListener("transitionend", clear, { once: true });
+      window.setTimeout(clear, 240);
+    }
+  }, [items]);
 
   useEffect(() => {
     return () => {
       cleanupRef.current?.();
+      settleCleanupRef.current?.();
     };
   }, []);
 
@@ -2269,46 +2348,80 @@ export function usePointerSortableList<T>(
     onPointerDown: (e: PointerEvent) => {
       if (!enabledRef.current || itemsRef.current.length < 2) return;
       if (e.pointerType === "mouse" && e.button !== 0) return;
+      const targetNode = e.target as HTMLElement | null;
+      if (targetNode?.closest("button, input, textarea, select, a, .volo-switch")) return;
 
       cleanupRef.current?.();
+      settleCleanupRef.current?.();
 
+      const container = listRef.current;
+      const sourceRow = container?.querySelector<HTMLElement>(`[data-sort-idx="${idx}"]`) ?? null;
+      if (!container || !sourceRow) return;
+
+      const initRect = sourceRow.getBoundingClientRect();
+      const initLeft = Math.round(initRect.left);
+      const initTop = Math.round(initRect.top);
+      const initWidth = Math.round(initRect.width);
+      const initHeight = Math.round(initRect.height);
+
+      const startX = e.clientX;
       const startY = e.clientY;
+      let lastClientX = e.clientX;
       let lastClientY = e.clientY;
       const pointerId = e.pointerId;
       const handleEl = e.currentTarget as HTMLElement | null;
       let curIdx = idx;
       let active = false;
       let rafId = 0;
-      const scrollEl = findScrollableAncestor(listRef.current);
+      let liftTimer = 0;
+      let ghostEl: HTMLElement | null = null;
+      const scrollEl = findScrollableAncestor(container);
 
-      const checkSwap = (clientY: number) => {
-        const container = listRef.current;
-        if (!container) return;
-        const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx]");
+      setGrabbingIdx(idx);
+      document.body.classList.add("volo-is-sorting");
+
+      const updateGhostTransform = () => {
+        if (!ghostEl) return;
+        const dx = Math.round(Math.max(-10, Math.min(10, (lastClientX - startX) * 0.12)));
+        const dy = Math.round(lastClientY - startY - 2);
+        ghostEl.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
+      };
+
+      const checkSwap = () => {
+        const listEl = listRef.current;
+        if (!listEl) return;
+        const rows = listEl.querySelectorAll<HTMLElement>("[data-sort-idx]");
         if (!rows.length) return;
+
+        const listRect = listEl.getBoundingClientRect();
+        const ghostCenterY = initTop + (lastClientY - startY) + initHeight / 2;
 
         let targetIdx = curIdx;
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
           const rIdx = Number(row.dataset.sortIdx);
           if (!Number.isFinite(rIdx) || rIdx === curIdx) continue;
-          const rect = row.getBoundingClientRect();
-          const mid = rect.top + rect.height / 2;
-          if (rIdx < curIdx && clientY < mid) {
+          // Use layout offsetTop/offsetHeight so active FLIP transforms never cause swap oscillation
+          const layoutTop = listRect.top + (row.offsetTop - listEl.offsetTop);
+          const mid = layoutTop + row.offsetHeight / 2;
+          if (rIdx < curIdx && ghostCenterY < mid) {
             targetIdx = Math.min(targetIdx, rIdx);
-          } else if (rIdx > curIdx && clientY > mid) {
+          } else if (rIdx > curIdx && ghostCenterY > mid) {
             targetIdx = Math.max(targetIdx, rIdx);
           }
         }
 
         if (targetIdx !== curIdx && targetIdx >= 0 && targetIdx < itemsRef.current.length) {
+          captureFlip();
           const next = [...itemsRef.current];
           const [moved] = next.splice(curIdx, 1);
           next.splice(targetIdx, 0, moved);
           const prevIdx = curIdx;
           itemsRef.current = next;
           curIdx = targetIdx;
+          draggingIdxRef.current = targetIdx;
           setDraggingIdx(targetIdx);
+          setGrabbingIdx(targetIdx);
           onReorderRef.current(next, prevIdx, targetIdx);
         }
       };
@@ -2330,14 +2443,62 @@ export function usePointerSortableList<T>(
             const before = scrollEl.scrollTop;
             scrollEl.scrollTop += delta;
             if (scrollEl.scrollTop !== before) {
-              checkSwap(lastClientY);
+              checkSwap();
             }
           }
         }
         rafId = window.requestAnimationFrame(stepAutoScroll);
       };
 
+      const activateDrag = () => {
+        if (active) return;
+        if (liftTimer) {
+          window.clearTimeout(liftTimer);
+          liftTimer = 0;
+        }
+        const liveRow = listRef.current?.querySelector<HTMLElement>(`[data-sort-idx="${curIdx}"]`) ?? sourceRow;
+        active = true;
+        if (handleEl) {
+          try {
+            handleEl.setPointerCapture(pointerId);
+          } catch {}
+        }
+        const clone = liveRow.cloneNode(true) as HTMLElement;
+        clone.removeAttribute("data-sort-idx");
+        clone.classList.remove("is-dragging", "is-grabbing");
+        clone.classList.add("volo-drag-ghost");
+        const srcInputs = liveRow.querySelectorAll("input");
+        const dstInputs = clone.querySelectorAll("input");
+        for (let k = 0; k < srcInputs.length && k < dstInputs.length; k++) {
+          dstInputs[k].value = srcInputs[k].value;
+        }
+        clone.style.position = "fixed";
+        clone.style.left = `${initLeft}px`;
+        clone.style.top = `${initTop}px`;
+        clone.style.width = `${initWidth}px`;
+        clone.style.height = `${initHeight}px`;
+        clone.style.margin = "0";
+        clone.style.zIndex = "10000";
+        clone.style.pointerEvents = "none";
+        clone.style.boxSizing = "border-box";
+        document.body.appendChild(clone);
+        ghostEl = clone;
+        updateGhostTransform();
+
+        draggingIdxRef.current = curIdx;
+        setDraggingIdx(curIdx);
+        rafId = window.requestAnimationFrame(stepAutoScroll);
+      };
+
+      liftTimer = window.setTimeout(() => {
+        activateDrag();
+      }, 115);
+
       const finish = () => {
+        if (liftTimer) {
+          window.clearTimeout(liftTimer);
+          liftTimer = 0;
+        }
         if (rafId) {
           window.cancelAnimationFrame(rafId);
           rafId = 0;
@@ -2346,6 +2507,7 @@ export function usePointerSortableList<T>(
         window.removeEventListener("pointerup", finish);
         window.removeEventListener("pointercancel", finish);
         document.body.classList.remove("volo-is-sorting");
+        setGrabbingIdx(null);
         if (active && handleEl) {
           try {
             if (handleEl.hasPointerCapture?.(pointerId)) {
@@ -2353,28 +2515,58 @@ export function usePointerSortableList<T>(
             }
           } catch {}
         }
+        const wasActive = active;
         active = false;
         cleanupRef.current = null;
-        setDraggingIdx(null);
+
+        const ghost = ghostEl;
+        ghostEl = null;
+        const reduced =
+          typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+        const slotEl = wasActive
+          ? listRef.current?.querySelector<HTMLElement>(`[data-sort-idx="${curIdx}"]`) ?? null
+          : null;
+
+        if (ghost && slotEl && !reduced) {
+          const slotRect = slotEl.getBoundingClientRect();
+          const settleDx = Math.round(slotRect.left - initLeft);
+          const settleDy = Math.round(slotRect.top - initTop);
+          ghost.classList.add("is-settling");
+          ghost.style.transition =
+            "transform 165ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 165ms ease, border-color 165ms ease";
+          ghost.style.transform = `translate3d(${settleDx}px, ${settleDy}px, 0)`;
+
+          let settled = false;
+          const finalizeDrop = () => {
+            if (settled) return;
+            settled = true;
+            ghost.remove();
+            if (settleCleanupRef.current === finalizeDrop) {
+              settleCleanupRef.current = null;
+            }
+            draggingIdxRef.current = null;
+            setDraggingIdx(null);
+          };
+          settleCleanupRef.current = finalizeDrop;
+          window.setTimeout(finalizeDrop, 170);
+        } else {
+          ghost?.remove();
+          draggingIdxRef.current = null;
+          setDraggingIdx(null);
+        }
       };
 
       const onMove = (ev: PointerEvent) => {
         if (ev.pointerId !== pointerId) return;
+        lastClientX = ev.clientX;
         lastClientY = ev.clientY;
         if (!active) {
-          if (Math.abs(ev.clientY - startY) < 4) return;
-          active = true;
-          document.body.classList.add("volo-is-sorting");
-          if (handleEl) {
-            try {
-              handleEl.setPointerCapture(pointerId);
-            } catch {}
-          }
-          setDraggingIdx(curIdx);
-          rafId = window.requestAnimationFrame(stepAutoScroll);
+          if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 3) return;
+          activateDrag();
         }
         if (ev.cancelable) ev.preventDefault();
-        checkSwap(ev.clientY);
+        updateGhostTransform();
+        checkSwap();
       };
 
       cleanupRef.current = finish;
@@ -2384,6 +2576,6 @@ export function usePointerSortableList<T>(
     },
   });
 
-  return { listRef, draggingIdx, getHandleProps };
+  return { listRef, draggingIdx, grabbingIdx, captureFlip, getHandleProps };
 }
 

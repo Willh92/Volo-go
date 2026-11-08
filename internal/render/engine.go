@@ -94,6 +94,9 @@ var (
 	inputCheckboxTypeRe = regexp.MustCompile(`^checkbox$`)
 	safeMediaSrcAttrRe  = regexp.MustCompile(`^(?:https?://[^\s"'<>]+|/[^/\s"'<>\\][^\s"'<>]*)$`)
 	chromaCommentClsRe  = regexp.MustCompile(`^(chroma|line|cl|ln|lnt|lntable|lntd|hl|[a-z]{1,3})$`)
+	safeFontColorRe     = regexp.MustCompile(`^(?i)\s*(?:#[0-9a-f]{3,8}|[a-z]{2,24}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))\s*;?\s*$`)
+	safeFontSizeRe      = regexp.MustCompile(`^[+-]?[1-7]$`)
+	safeInlineStyleRe   = regexp.MustCompile(`^(?i)\s*(?:(?:color|background-color|font-size|font-weight|font-style|text-align|text-decoration)\s*:\s*(?:#[0-9a-f]{3,8}|[a-z0-9.% -]{1,32}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))\s*;?\s*)+$`)
 )
 
 // Default returns a shared singleton Engine.
@@ -116,13 +119,13 @@ func (e *Engine) ensureMarkdown() goldmark.Markdown {
 				extension.GFM,
 				extension.Footnote,
 				extension.DefinitionList,
-				extension.Typographer,
 			),
 			goldmark.WithParserOptions(
 				parser.WithAutoHeadingID(),
 			),
 			goldmark.WithRendererOptions(
-				gmhtml.WithUnsafe(), // Raw HTML is strictly filtered by bluemonday policy right after rendering
+				gmhtml.WithUnsafe(),    // Raw HTML is strictly filtered by bluemonday policy right after rendering
+				gmhtml.WithHardWraps(), // Preserve single-newline soft line breaks (<br>) across paragraphs and blockquotes
 			),
 		)
 	})
@@ -136,6 +139,9 @@ func (e *Engine) ensureCommentMarkdown() goldmark.Markdown {
 				extension.Table,
 				extension.Strikethrough,
 				extension.Linkify,
+			),
+			goldmark.WithRendererOptions(
+				gmhtml.WithHardWraps(),
 			),
 		)
 	})
@@ -160,7 +166,10 @@ func buildSanitizerPolicy() *bluemonday.Policy {
 	p := bluemonday.UGCPolicy()
 	p.AllowAttrs("id", "class", "tabindex", "aria-label", "aria-hidden", "role", "title").Globally()
 	p.AllowAttrs("data-lang", "data-lock-type", "data-article-id", "data-audio-seek", "data-book-slug", "data-github-profile", "data-callout").Globally()
-	p.AllowElements("figure", "figcaption", "section", "aside", "details", "summary", "mark", "kbd", "abbr", "button", "audio", "source", "input")
+	p.AllowElements("figure", "figcaption", "section", "aside", "details", "summary", "mark", "kbd", "abbr", "button", "audio", "source", "input", "font", "u", "s", "center")
+	p.AllowAttrs("color").Matching(safeFontColorRe).OnElements("font")
+	p.AllowAttrs("size").Matching(safeFontSizeRe).OnElements("font")
+	p.AllowAttrs("style").Matching(safeInlineStyleRe).OnElements("span", "font", "p", "div", "mark", "strong", "em", "b", "i", "u", "s", "td", "th")
 	p.AllowAttrs("type").OnElements("button", "source")
 	p.AllowAttrs("type").Matching(inputCheckboxTypeRe).OnElements("input")
 	p.AllowAttrs("checked", "disabled").OnElements("input")
@@ -798,13 +807,6 @@ func formatBookChapterBadge(count int, locale string) string {
 	return fmt.Sprintf("%d 章", count)
 }
 
-func formatBookReadCTA(locale string) string {
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(locale)), "en") {
-		return "Read →"
-	}
-	return "开始阅读 →"
-}
-
 func bookMonogram(title string) string {
 	for _, r := range strings.TrimSpace(title) {
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {
@@ -815,31 +817,28 @@ func bookMonogram(title string) string {
 }
 
 func writeBookCardInner(b *strings.Builder, info BookCardInfo, locale string) {
-	bookHref := "/books/" + url.PathEscape(info.Slug)
 	if cover := strings.TrimSpace(info.CoverURL); cover != "" && isSafeImageSrc(cover) {
-		b.WriteString(`<a class="volo-embed-book__cover-link" href="` + bookHref + `" tabindex="-1" aria-hidden="true">`)
+		b.WriteString(`<span class="volo-embed-book__cover-link" aria-hidden="true">`)
 		b.WriteString(`<img class="volo-embed-book__cover" src="` + html.EscapeString(cover) + `" alt="` + html.EscapeString(info.Title) + `" loading="lazy" decoding="async">`)
-		b.WriteString(`</a>`)
+		b.WriteString(`</span>`)
 	} else {
-		b.WriteString(`<a class="volo-embed-book__cover volo-embed-book__cover--fallback" href="` + bookHref + `" tabindex="-1" aria-hidden="true">`)
+		b.WriteString(`<span class="volo-embed-book__cover volo-embed-book__cover--fallback" aria-hidden="true">`)
 		b.WriteString(`<span class="volo-embed-book__spine"></span>`)
 		b.WriteString(`<span class="volo-embed-book__monogram">` + html.EscapeString(bookMonogram(info.Title)) + `</span>`)
-		b.WriteString(`</a>`)
+		b.WriteString(`</span>`)
 	}
-	b.WriteString(`<div class="volo-embed-book__body">`)
-	b.WriteString(`<div class="volo-embed-book__head">`)
-	b.WriteString(`<a class="volo-embed-book__title" href="` + bookHref + `"><strong>` + html.EscapeString(info.Title) + `</strong></a>`)
+	b.WriteString(`<span class="volo-embed-book__body">`)
+	b.WriteString(`<span class="volo-embed-book__head">`)
+	b.WriteString(`<span class="volo-embed-book__title"><strong>` + html.EscapeString(info.Title) + `</strong></span>`)
 	if info.ChapterCount > 0 {
 		b.WriteString(`<span class="volo-embed-book__chapters">` + html.EscapeString(formatBookChapterBadge(info.ChapterCount, locale)) + `</span>`)
 	}
-	b.WriteString(`</div>`)
+	b.WriteString(`</span>`)
 	if desc := strings.TrimSpace(info.Description); desc != "" {
-		b.WriteString(`<p class="volo-embed-book__desc">` + html.EscapeString(desc) + `</p>`)
+		b.WriteString(`<span class="volo-embed-book__desc">` + html.EscapeString(desc) + `</span>`)
 	}
-	b.WriteString(`<div class="volo-embed-book__foot">`)
-	b.WriteString(`<a class="volo-embed-book__cta" href="` + bookHref + `">` + html.EscapeString(formatBookReadCTA(locale)) + `</a>`)
-	b.WriteString(`</div>`)
-	b.WriteString(`</div>`)
+	b.WriteString(`</span>`)
+	b.WriteString(`<span class="volo-embed-book__arrow" aria-hidden="true">→</span>`)
 }
 
 func renderBookCard(slug string, opts Options) string {
@@ -853,10 +852,11 @@ func renderBookCard(slug string, opts Options) string {
 			info = found
 		}
 	}
+	bookHref := "/books/" + url.PathEscape(info.Slug)
 	var b strings.Builder
-	b.WriteString(`<section class="volo-embed-book" data-book-slug="` + html.EscapeString(info.Slug) + `">`)
+	b.WriteString(`<a class="volo-embed-book" href="` + bookHref + `" data-book-slug="` + html.EscapeString(info.Slug) + `">`)
 	writeBookCardInner(&b, info, opts.Locale)
-	b.WriteString(`</section>`)
+	b.WriteString(`</a>`)
 	return b.String()
 }
 
@@ -875,9 +875,10 @@ func renderBookshelfGrid(opts Options) string {
 	var b strings.Builder
 	b.WriteString(`<section class="volo-embed-bookshelf">`)
 	for _, bk := range books {
-		b.WriteString(`<article class="volo-book-tile" data-book-slug="` + html.EscapeString(bk.Slug) + `">`)
+		bookHref := "/books/" + url.PathEscape(bk.Slug)
+		b.WriteString(`<a class="volo-book-tile" href="` + bookHref + `" data-book-slug="` + html.EscapeString(bk.Slug) + `">`)
 		writeBookCardInner(&b, bk, opts.Locale)
-		b.WriteString(`</article>`)
+		b.WriteString(`</a>`)
 	}
 	b.WriteString(`</section>`)
 	return b.String()

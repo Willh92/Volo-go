@@ -274,64 +274,189 @@ const pasteURLAsLinkExt = EditorView.domEventHandlers({
   },
 });
 
+const SAFE_IR_COLOR_RE = /^(?:#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,20}|rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\))$/;
+
 function buildInstantRenderPlugin() {
   const hideDeco = Decoration.replace({});
   const buildDecos = (view: EditorView): DecorationSet => {
     const builder = new RangeSetBuilder<Decoration>();
     const state = view.state;
+    if (view.visibleRanges.length === 0) return builder.finish();
+
     const activeLine = state.doc.lineAt(state.selection.main.head).number;
     let inFence = false;
+    let scannedLine = 0;
+
+    const advanceFenceTo = (targetExclusiveLine: number) => {
+      for (let ln = scannedLine + 1; ln < targetExclusiveLine; ln++) {
+        if (/^\s*```/.test(state.doc.line(ln).text)) {
+          inFence = !inFence;
+        }
+      }
+      if (targetExclusiveLine - 1 > scannedLine) {
+        scannedLine = targetExclusiveLine - 1;
+      }
+    };
 
     for (const { from, to } of view.visibleRanges) {
       let pos = from;
       while (pos <= to) {
         const line = state.doc.lineAt(pos);
+        if (line.number <= scannedLine) {
+          pos = line.to + 1;
+          continue;
+        }
+        advanceFenceTo(line.number);
+        scannedLine = line.number;
+
         const text = line.text;
         const isCursorLine = line.number === activeLine;
 
-        if (/^\s*```/.test(text)) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-fence" }));
+        const fenceMatch = /^(\s*```)([\w+-]*)(.*)$/.exec(text);
+        if (fenceMatch) {
+          const opening = !inFence;
+          builder.add(
+            line.from,
+            line.from,
+            Decoration.line({ class: opening ? "cm-ir-fence cm-ir-fence-open" : "cm-ir-fence cm-ir-fence-close" })
+          );
+          if (!isCursorLine && text.length > 0) {
+            const ticksLen = fenceMatch[1].length;
+            const langLen = fenceMatch[2].length;
+            if (opening && langLen > 0) {
+              builder.add(line.from, line.from + ticksLen, hideDeco);
+              builder.add(
+                line.from + ticksLen,
+                line.from + ticksLen + langLen,
+                Decoration.mark({ class: "cm-ir-fence-lang" })
+              );
+            } else {
+              builder.add(line.from, line.to, Decoration.mark({ class: "cm-ir-fence-muted" }));
+            }
+          }
           inFence = !inFence;
           pos = line.to + 1;
           continue;
         }
 
         if (inFence) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-codeblock-line" }));
+          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-codeblock-line chroma" }));
+          if (text.length > 0 && text.length < 1200) {
+            interface CodeTok {
+              s: number;
+              e: number;
+              cls: string;
+            }
+            const toks: CodeTok[] = [];
+            const used = new Uint8Array(text.length);
+            const claim = (s: number, e: number, cls: string) => {
+              if (s >= e) return;
+              for (let i = s; i < e; i++) if (used[i]) return;
+              for (let i = s; i < e; i++) used[i] = 1;
+              toks.push({ s, e, cls });
+            };
+            let cm: RegExpExecArray | null;
+            const cmtRe = /(?:^|\s)(#.*$|\/\/.*$)/g;
+            while ((cm = cmtRe.exec(text)) !== null) {
+              const idx = cm.index + (cm[0].length - cm[1].length);
+              claim(idx, idx + cm[1].length, "c1");
+            }
+            const strRe = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g;
+            while ((cm = strRe.exec(text)) !== null) {
+              claim(cm.index, cm.index + cm[0].length, "s2");
+            }
+            const flagRe = /(?:^|\s)(--?[a-zA-Z][\w-]*)/g;
+            while ((cm = flagRe.exec(text)) !== null) {
+              const idx = cm.index + (cm[0].length - cm[1].length);
+              claim(idx, idx + cm[1].length, "na");
+            }
+            const kwRe = /\b(?:sudo|apt|apt-get|yum|dnf|apk|cd|mkdir|tar|wget|curl|make|export|return|func|const|let|var|if|else|for|import|from|package|type|struct)\b/g;
+            while ((cm = kwRe.exec(text)) !== null) {
+              claim(cm.index, cm.index + cm[0].length, "k");
+            }
+            const numRe = /\b\d+(?:\.\d+)?\b/g;
+            while ((cm = numRe.exec(text)) !== null) {
+              claim(cm.index, cm.index + cm[0].length, "mi");
+            }
+            toks.sort((a, b) => a.s - b.s);
+            for (const tk of toks) {
+              builder.add(line.from + tk.s, line.from + tk.e, Decoration.mark({ class: tk.cls }));
+            }
+          }
           pos = line.to + 1;
           continue;
         }
 
-        // Headings (# .. ######)
+        interface SpanOp {
+          from: number;
+          to: number;
+          deco: Decoration;
+        }
+        const ops: SpanOp[] = [];
+        const occupied = new Uint8Array(Math.min(text.length, 2400));
+        const markFree = (s: number, e: number) => {
+          if (s < 0 || e > occupied.length || s >= e) return false;
+          for (let i = s; i < e; i++) if (occupied[i]) return false;
+          for (let i = s; i < e; i++) occupied[i] = 1;
+          return true;
+        };
+
+        // Line-level block decorations (must be emitted at line.from BEFORE inline ops)
         const hm = /^(#{1,6})\s+/.exec(text);
+        const qm = /^(\s*>\s?)(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*)?/i.exec(text);
+        const dm = /^\s*:::(?:bookshelf|book|lock)?.*$/.exec(text);
+        const hrm = /^\s*(?:---|\*\*\*|___)\s*$/.exec(text);
+
         if (hm) {
           const lvl = hm[1].length;
           builder.add(line.from, line.from, Decoration.line({ class: `cm-ir-h cm-ir-h${lvl}` }));
-          if (!isCursorLine) {
-            builder.add(line.from, line.from + hm[0].length, hideDeco);
+          if (!isCursorLine && markFree(0, hm[0].length)) {
+            ops.push({ from: line.from, to: line.from + hm[0].length, deco: hideDeco });
           }
-        } else if (/^\s*>\s?/.test(text)) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-quote" }));
-        } else if (/^\s*(?:---|\*\*\*|___)\s*$/.test(text)) {
+        } else if (qm) {
+          const alertKind = qm[2] ? qm[2].toLowerCase() : "";
+          builder.add(
+            line.from,
+            line.from,
+            Decoration.line({ class: alertKind ? `cm-ir-quote cm-ir-callout cm-ir-callout-${alertKind}` : "cm-ir-quote" })
+          );
+          if (!isCursorLine && markFree(0, qm[1].length)) {
+            ops.push({ from: line.from, to: line.from + qm[1].length, deco: hideDeco });
+            if (qm[2] && markFree(qm[1].length, qm[0].length)) {
+              ops.push({
+                from: line.from + qm[1].length,
+                to: line.from + qm[0].length,
+                deco: Decoration.mark({ class: "cm-ir-callout-tag" }),
+              });
+            }
+          }
+        } else if (dm) {
+          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-directive" }));
+        } else if (hrm) {
           builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-hr" }));
+          if (!isCursorLine && markFree(0, text.length)) {
+            ops.push({ from: line.from, to: line.to, deco: Decoration.mark({ class: "cm-ir-fence-muted" }) });
+          }
         }
 
         // Inline decorations on non-cursor lines (sorted strictly by position)
-        if (!isCursorLine && text.length > 0 && text.length < 2000) {
-          interface SpanOp {
-            from: number;
-            to: number;
-            deco: Decoration;
+        if (!isCursorLine && text.length > 0 && text.length <= 2400) {
+          // Task checkbox (- [ ] / - [x])
+          const tm = /^(\s*[-*+]\s+)(\[[ xX]\])(\s+)/.exec(text);
+          if (tm) {
+            const boxStart = tm[1].length;
+            const boxEnd = boxStart + tm[2].length;
+            if (markFree(boxStart, boxEnd)) {
+              const checked = /x/i.test(tm[2]);
+              ops.push({
+                from: line.from + boxStart,
+                to: line.from + boxEnd,
+                deco: Decoration.mark({ class: checked ? "cm-ir-task is-checked" : "cm-ir-task" }),
+              });
+            }
           }
-          const ops: SpanOp[] = [];
-          const occupied = new Uint8Array(text.length);
-          const markFree = (s: number, e: number) => {
-            for (let i = s; i < e; i++) if (occupied[i]) return false;
-            for (let i = s; i < e; i++) occupied[i] = 1;
-            return true;
-          };
 
-          // Inline code `...`
+          // Inline code `...` (claim first so raw tags/flags inside backticks stay literal)
           const codeRe = /`([^`\n]+)`/g;
           let m: RegExpExecArray | null;
           while ((m = codeRe.exec(text)) !== null) {
@@ -345,6 +470,78 @@ function buildInstantRenderPlugin() {
                 deco: Decoration.mark({ class: "cm-ir-inline-code" }),
               });
               ops.push({ from: line.from + e - 1, to: line.from + e, deco: hideDeco });
+            }
+          }
+
+          // Legacy & toolbar <font color="...">...</font> (supports unquoted #hex and multi-spaces)
+          const fontRe = /(<font\s+[^>]*?color\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'>]+))[^>]*>)([^<\n]+)(<\/font>)/gi;
+          while ((m = fontRe.exec(text)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            const rawColor = (m[2] || m[3] || m[4] || "").trim();
+            if (SAFE_IR_COLOR_RE.test(rawColor) && markFree(s, e)) {
+              const openEnd = s + m[1].length;
+              const closeStart = e - m[6].length;
+              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
+              ops.push({
+                from: line.from + openEnd,
+                to: line.from + closeStart,
+                deco: Decoration.mark({ attributes: { style: `color: ${rawColor};` } }),
+              });
+              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
+            }
+          }
+
+          // Inline <span style="color: ...">...</span>
+          const spanRe = /(<span\s+style\s*=\s*(?:"([^"]+)"|'([^']+)')\s*>)([^<\n]+)(<\/span>)/gi;
+          while ((m = spanRe.exec(text)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            const rawStyle = (m[2] || m[3] || "").trim();
+            const colorMatch = /^\s*color\s*:\s*([^;]+)\s*;?\s*$/i.exec(rawStyle);
+            const safeColor = colorMatch ? colorMatch[1].trim() : "";
+            if (safeColor && SAFE_IR_COLOR_RE.test(safeColor) && markFree(s, e)) {
+              const openEnd = s + m[1].length;
+              const closeStart = e - m[5].length;
+              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
+              ops.push({
+                from: line.from + openEnd,
+                to: line.from + closeStart,
+                deco: Decoration.mark({ attributes: { style: `color: ${safeColor};` } }),
+              });
+              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
+            }
+          }
+
+          // Highlight <mark>...</mark>
+          const markRe = /(<mark>)([^<\n]+)(<\/mark>)/gi;
+          while ((m = markRe.exec(text)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            if (markFree(s, e)) {
+              ops.push({ from: line.from + s, to: line.from + s + 6, deco: hideDeco });
+              ops.push({
+                from: line.from + s + 6,
+                to: line.from + e - 7,
+                deco: Decoration.mark({ class: "cm-ir-mark" }),
+              });
+              ops.push({ from: line.from + e - 7, to: line.from + e, deco: hideDeco });
+            }
+          }
+
+          // Underline <u>...</u>
+          const uRe = /(<u>)([^<\n]+)(<\/u>)/gi;
+          while ((m = uRe.exec(text)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            if (markFree(s, e)) {
+              ops.push({ from: line.from + s, to: line.from + s + 3, deco: hideDeco });
+              ops.push({
+                from: line.from + s + 3,
+                to: line.from + e - 4,
+                deco: Decoration.mark({ class: "cm-ir-underline" }),
+              });
+              ops.push({ from: line.from + e - 4, to: line.from + e, deco: hideDeco });
             }
           }
 
@@ -489,6 +686,24 @@ function serializeNodeToMarkdown(node: Node): string {
     case "s":
     case "strike":
       return `~~${inner()}~~`;
+    case "u":
+      return `<u>${inner()}</u>`;
+    case "mark":
+      return `<mark>${inner()}</mark>`;
+    case "font": {
+      const col = (el.getAttribute("color") || el.style?.color || "").trim();
+      if (col && SAFE_IR_COLOR_RE.test(col)) {
+        return `<font color="${col}">${inner()}</font>`;
+      }
+      return inner();
+    }
+    case "span": {
+      const col = (el.style?.color || "").trim();
+      if (col && SAFE_IR_COLOR_RE.test(col)) {
+        return `<font color="${col}">${inner()}</font>`;
+      }
+      return inner();
+    }
     case "figure": {
       if (el.classList.contains("volo-codeblock") || el.hasAttribute("data-lang")) {
         const codeEl = el.querySelector("code");
@@ -604,10 +819,31 @@ interface OutlineItem {
   line: number;
 }
 
+const EDITOR_SWATCHES = [
+  { color: "#ff0000", label: "#FF0000" },
+  { color: "#ea580c", label: "#EA580C" },
+  { color: "#ca8a04", label: "#CA8A04" },
+  { color: "#16a34a", label: "#16A34A" },
+  { color: "#2563eb", label: "#2563EB" },
+  { color: "#7c3aed", label: "#7C3AED" },
+  { color: "#64748b", label: "#64748B" },
+] as const;
+
+const EDITOR_CALLOUTS = [
+  { kind: "NOTE", color: "#2563eb" },
+  { kind: "TIP", color: "#16a34a" },
+  { kind: "IMPORTANT", color: "#7c3aed" },
+  { kind: "WARNING", color: "#ca8a04" },
+  { kind: "CAUTION", color: "#dc2626" },
+] as const;
+
+type ToolbarPopKind = "" | "heading" | "color" | "callout" | "media" | "book";
+
 export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM6EditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const wysiwygRef = useRef<HTMLDivElement | null>(null);
+  const previewRef = useRef<HTMLDivElement | null>(null);
   const phCompartment = useRef(new Compartment());
   const modeCompartment = useRef(new Compartment());
   const onChangeRef = useRef(onChange);
@@ -620,20 +856,24 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     const saved = localStorage.getItem("volo_editor_mode");
     return saved === "wysiwyg" || saved === "sv" || saved === "ir" ? saved : "ir";
   });
+  const [syncScroll, setSyncScroll] = useState<boolean>(() => {
+    return localStorage.getItem("volo_editor_sync_scroll") !== "0";
+  });
+  const syncScrollRef = useRef(syncScroll);
+  syncScrollRef.current = syncScroll;
+  const scrollDriverRef = useRef<{ source: "cm" | "pv" | null; timer: number }>({ source: null, timer: 0 });
+
   const [previewHTML, setPreviewHTML] = useState<string>("");
   const [uploading, setUploading] = useState<boolean>(false);
   const [fullscreen, setFullscreen] = useState<boolean>(false);
   const [showOutline, setShowOutline] = useState<boolean>(false);
   const [mobilePane, setMobilePane] = useState<"write" | "preview" | "outline">("write");
-  const [headingOpen, setHeadingOpen] = useState<boolean>(false);
-  const [headingStyle, setHeadingStyle] = useState<CSSProperties>({});
-  const headingBtnRef = useRef<HTMLButtonElement | null>(null);
-  const headingMenuRef = useRef<HTMLDivElement | null>(null);
 
-  const [mediaMenuOpen, setMediaMenuOpen] = useState<boolean>(false);
-  const [mediaStyle, setMediaStyle] = useState<CSSProperties>({});
-  const mediaBtnRef = useRef<HTMLButtonElement | null>(null);
-  const mediaMenuRef = useRef<HTMLDivElement | null>(null);
+  const [activePop, setActivePop] = useState<ToolbarPopKind>("");
+  const [popStyle, setPopStyle] = useState<CSSProperties>({});
+  const popBtnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const popMenuRef = useRef<HTMLDivElement | null>(null);
+  const [edTip, setEdTip] = useState<{ text: string; x: number; y: number; below: boolean } | null>(null);
 
   const [mediaModalOpen, setMediaModalOpen] = useState<boolean>(false);
   const [dynQuickInserts, setDynQuickInserts] = useState<CM6EditorProps["quickInserts"]>([]);
@@ -665,6 +905,11 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
   const [lockPwd, setLockPwd] = useState<string>("");
   const [lockHint, setLockHint] = useState<string>("");
   const [lockBody, setLockBody] = useState<string>("");
+
+  const togglePop = (kind: Exclude<ToolbarPopKind, "">) => {
+    setEdTip(null);
+    setActivePop((prev) => (prev === kind ? "" : kind));
+  };
 
   const switchMode = (next: EditorMode) => {
     if (next === "wysiwyg" && mode !== "wysiwyg" && /(?:^|\n):::(?:lock|book|bookshelf)\b/.test(value || "")) {
@@ -718,6 +963,16 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     };
   }, [value]);
 
+  const getSelectedText = (): string => {
+    if (mode === "wysiwyg") {
+      return window.getSelection()?.toString() || "";
+    }
+    const view = viewRef.current;
+    if (!view) return "";
+    const sel = view.state.selection.main;
+    return sel.empty ? "" : view.state.sliceDoc(sel.from, sel.to);
+  };
+
   const insertSnippet = (snippet: string) => {
     if (mode === "wysiwyg") {
       const next = `${value}${value.endsWith("\n") || !value ? "" : "\n"}${snippet}`;
@@ -740,7 +995,9 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       if (before === "**") document.execCommand("bold");
       else if (before === "*") document.execCommand("italic");
       else if (before === "~~") document.execCommand("strikeThrough");
-      else document.execCommand("insertHTML", false, `<code>${fallback}</code>`);
+      else if (before === "<u>") document.execCommand("underline");
+      else if (before === "<mark>") document.execCommand("insertHTML", false, `<mark>${getSelectedText() || fallback}</mark>`);
+      else document.execCommand("insertHTML", false, `<code>${getSelectedText() || fallback}</code>`);
       onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
       return;
     }
@@ -753,6 +1010,61 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       changes: { from: sel.from, to: sel.to, insert },
       selection: { anchor: sel.from + before.length, head: sel.from + before.length + selected.length },
     });
+    view.focus();
+  };
+
+  const applyColorStyle = (color: string) => {
+    if (mode === "wysiwyg" && wysiwygRef.current) {
+      wysiwygRef.current.focus();
+      document.execCommand("foreColor", false, color);
+      onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
+      return;
+    }
+    const view = viewRef.current;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    const rawSel = view.state.sliceDoc(sel.from, sel.to);
+    const unwrapped = (rawSel || "text").replace(/^<(?:font|span)\b[^>]*>([\s\S]*?)<\/(?:font|span)>$/i, "$1");
+    const before = `<font color="${color}">`;
+    const after = `</font>`;
+    const insert = `${before}${unwrapped}${after}`;
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert },
+      selection: { anchor: sel.from + before.length, head: sel.from + before.length + unwrapped.length },
+    });
+    view.focus();
+  };
+
+  const clearInlineStyle = () => {
+    if (mode === "wysiwyg" && wysiwygRef.current) {
+      wysiwygRef.current.focus();
+      document.execCommand("removeFormat");
+      onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
+      return;
+    }
+    const view = viewRef.current;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    const stripTags = (s: string) =>
+      s
+        .replace(/<\/?(?:font|mark|u)\b[^>]*>/gi, "")
+        .replace(/<span\s+style\s*=\s*(?:"[^"]*"|'[^']*')\s*>([\s\S]*?)<\/span>/gi, "$1");
+    if (!sel.empty) {
+      const cleaned = stripTags(view.state.sliceDoc(sel.from, sel.to));
+      view.dispatch({
+        changes: { from: sel.from, to: sel.to, insert: cleaned },
+        selection: { anchor: sel.from, head: sel.from + cleaned.length },
+      });
+    } else {
+      const line = view.state.doc.lineAt(sel.head);
+      const cleaned = stripTags(line.text);
+      if (cleaned !== line.text) {
+        view.dispatch({
+          changes: { from: line.from, to: line.to, insert: cleaned },
+          selection: { anchor: Math.min(line.from + cleaned.length, sel.head) },
+        });
+      }
+    }
     view.focus();
   };
 
@@ -874,6 +1186,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
         },
       },
       {
+        key: "Mod-u",
+        run: () => {
+          wrapSelection("<u>", "</u>", "text");
+          return true;
+        },
+      },
+      {
         key: "Mod-k",
         run: () => {
           wrapSelection("[", "](https://)", t("ed.link_text_ph"));
@@ -977,6 +1296,120 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     };
   }, [value, mode, curLocale]);
 
+  // Bidirectional heading-anchored + proportional scroll sync in Split Preview (`mode === "sv"`)
+  useEffect(() => {
+    if (mode !== "sv") return;
+    const view = viewRef.current;
+    const cmScroller = view?.scrollDOM;
+    const pvPane = previewRef.current;
+    if (!view || !cmScroller || !pvPane) return;
+
+    interface ScrollAnchor {
+      cm: number;
+      pv: number;
+    }
+
+    const computeAnchors = (): ScrollAnchor[] | null => {
+      const cmMax = Math.max(0, cmScroller.scrollHeight - cmScroller.clientHeight);
+      const pvMax = Math.max(0, pvPane.scrollHeight - pvPane.clientHeight);
+      if (cmMax <= 0 && pvMax <= 0) return null;
+      const anchors: ScrollAnchor[] = [{ cm: 0, pv: 0 }];
+
+      const mdOffsets: number[] = [];
+      let fenced = false;
+      for (let ln = 1; ln <= view.state.doc.lines; ln++) {
+        const lineObj = view.state.doc.line(ln);
+        if (/^\s*```/.test(lineObj.text)) {
+          fenced = !fenced;
+          continue;
+        }
+        if (!fenced && /^#{1,6}\s+\S/.test(lineObj.text)) {
+          mdOffsets.push(lineObj.from);
+        }
+      }
+
+      const pvHeads = pvPane.querySelectorAll<HTMLElement>(
+        ":scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6"
+      );
+      if (mdOffsets.length > 0 && mdOffsets.length === pvHeads.length && cmMax > 0 && pvMax > 0) {
+        const paneTop = pvPane.getBoundingClientRect().top;
+        for (let i = 0; i < mdOffsets.length; i++) {
+          const cmY = Math.min(cmMax, Math.max(0, view.lineBlockAt(mdOffsets[i]).top - 8));
+          const pvY = Math.min(pvMax, Math.max(0, pvHeads[i].getBoundingClientRect().top - paneTop + pvPane.scrollTop - 8));
+          const prev = anchors[anchors.length - 1];
+          if (cmY >= prev.cm && pvY >= prev.pv && (cmY > prev.cm || pvY > prev.pv)) {
+            anchors.push({ cm: cmY, pv: pvY });
+          }
+        }
+      }
+
+      const last = anchors[anchors.length - 1];
+      anchors.push({ cm: Math.max(last.cm, cmMax), pv: Math.max(last.pv, pvMax) });
+      return anchors;
+    };
+
+    const interpolate = (val: number, anchors: ScrollAnchor[], fromK: "cm" | "pv", toK: "cm" | "pv"): number => {
+      const end = anchors[anchors.length - 1];
+      if (end[fromK] <= 0 || val <= 1) return 0;
+      if (val >= end[fromK] - 1) return end[toK];
+      for (let i = 0; i < anchors.length - 1; i++) {
+        const a = anchors[i];
+        const b = anchors[i + 1];
+        if (val <= b[fromK]) {
+          const span = b[fromK] - a[fromK];
+          const ratio = span > 0 ? (val - a[fromK]) / span : 0;
+          return a[toK] + ratio * (b[toK] - a[toK]);
+        }
+      }
+      return end[toK];
+    };
+
+    const lockDriver = (src: "cm" | "pv") => {
+      scrollDriverRef.current.source = src;
+      if (scrollDriverRef.current.timer) {
+        window.clearTimeout(scrollDriverRef.current.timer);
+      }
+      scrollDriverRef.current.timer = window.setTimeout(() => {
+        scrollDriverRef.current.source = null;
+        scrollDriverRef.current.timer = 0;
+      }, 110);
+    };
+
+    const syncCmToPv = () => {
+      if (!syncScrollRef.current) return;
+      if (scrollDriverRef.current.source === "pv") return;
+      const anchors = computeAnchors();
+      if (!anchors) return;
+      const nextTop = interpolate(cmScroller.scrollTop, anchors, "cm", "pv");
+      if (Math.abs(pvPane.scrollTop - nextTop) >= 1) {
+        lockDriver("cm");
+        pvPane.scrollTop = nextTop;
+      }
+    };
+
+    const syncPvToCm = () => {
+      if (!syncScrollRef.current) return;
+      if (scrollDriverRef.current.source === "cm") return;
+      const anchors = computeAnchors();
+      if (!anchors) return;
+      const nextTop = interpolate(pvPane.scrollTop, anchors, "pv", "cm");
+      if (Math.abs(cmScroller.scrollTop - nextTop) >= 1) {
+        lockDriver("pv");
+        cmScroller.scrollTop = nextTop;
+      }
+    };
+
+    cmScroller.addEventListener("scroll", syncCmToPv, { passive: true });
+    pvPane.addEventListener("scroll", syncPvToCm, { passive: true });
+    const rafId = window.requestAnimationFrame(syncCmToPv);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      cmScroller.removeEventListener("scroll", syncCmToPv);
+      pvPane.removeEventListener("scroll", syncPvToCm);
+    };
+  }, [mode, previewHTML, syncScroll]);
+
   useEffect(() => {
     if (!fullscreen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -993,29 +1426,42 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     return () => document.removeEventListener("keydown", onKey);
   }, [fullscreen]);
 
+  // Unified portal popover positioning for Heading / Color / Callout / Media / Bookshelf menus
   useEffect(() => {
-    if (!headingOpen) return;
+    if (!activePop) return;
     const updatePos = () => {
-      if (!headingBtnRef.current) return;
-      const rect = headingBtnRef.current.getBoundingClientRect();
+      const btn = popBtnRefs.current[activePop];
+      if (!btn) return;
+      const rect = btn.getBoundingClientRect();
       const vv = window.visualViewport;
       const vvTop = vv?.offsetTop ?? 0;
       const vpH = vv?.height ?? window.innerHeight;
       if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
-        setHeadingOpen(false);
+        setActivePop("");
         return;
       }
-      const estH = headingMenuRef.current?.offsetHeight || 228;
-      setHeadingStyle(computePortalMenuStyle(rect, { minW: 112, maxW: 180, maxH: 260, estH, align: "left" }).style);
+      const dims =
+        activePop === "heading"
+          ? { minW: 112, maxW: 180, maxH: 260, estH: 228 }
+          : activePop === "color"
+          ? { minW: 224, maxW: 260, maxH: 260, estH: 176 }
+          : activePop === "callout"
+          ? { minW: 196, maxW: 240, maxH: 250, estH: 200 }
+          : activePop === "book"
+          ? { minW: 236, maxW: 290, maxH: 180, estH: 112 }
+          : { minW: 184, maxW: 260, maxH: 200, estH: 120 };
+      const estH = popMenuRef.current?.offsetHeight || dims.estH;
+      setPopStyle(computePortalMenuStyle(rect, { ...dims, estH, align: "left" }).style);
     };
     updatePos();
     const onDocDown = (e: MouseEvent) => {
       const target = e.target as Node;
-      if (headingBtnRef.current?.contains(target) || headingMenuRef.current?.contains(target)) return;
-      setHeadingOpen(false);
+      const btn = popBtnRefs.current[activePop];
+      if (btn?.contains(target) || popMenuRef.current?.contains(target)) return;
+      setActivePop("");
     };
     const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setHeadingOpen(false);
+      if (e.key === "Escape") setActivePop("");
     };
     const vv = window.visualViewport;
     document.addEventListener("mousedown", onDocDown);
@@ -1032,48 +1478,18 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
       vv?.removeEventListener("resize", updatePos);
       vv?.removeEventListener("scroll", updatePos);
     };
-  }, [headingOpen]);
+  }, [activePop]);
 
   useEffect(() => {
-    if (!mediaMenuOpen) return;
-    const updatePos = () => {
-      if (!mediaBtnRef.current) return;
-      const rect = mediaBtnRef.current.getBoundingClientRect();
-      const vv = window.visualViewport;
-      const vvTop = vv?.offsetTop ?? 0;
-      const vpH = vv?.height ?? window.innerHeight;
-      if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
-        setMediaMenuOpen(false);
-        return;
-      }
-      const estH = mediaMenuRef.current?.offsetHeight || 120;
-      setMediaStyle(computePortalMenuStyle(rect, { minW: 180, maxW: 260, maxH: 200, estH, align: "left" }).style);
-    };
-    updatePos();
-    const onDocDown = (e: MouseEvent) => {
-      const target = e.target as Node;
-      if (mediaBtnRef.current?.contains(target) || mediaMenuRef.current?.contains(target)) return;
-      setMediaMenuOpen(false);
-    };
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMediaMenuOpen(false);
-    };
-    const vv = window.visualViewport;
-    document.addEventListener("mousedown", onDocDown);
-    document.addEventListener("keydown", onEsc);
-    window.addEventListener("resize", updatePos);
-    window.addEventListener("scroll", updatePos, true);
-    vv?.addEventListener("resize", updatePos);
-    vv?.addEventListener("scroll", updatePos);
+    if (!edTip) return;
+    const dismiss = () => setEdTip(null);
+    window.addEventListener("scroll", dismiss, true);
+    window.addEventListener("resize", dismiss);
     return () => {
-      document.removeEventListener("mousedown", onDocDown);
-      document.removeEventListener("keydown", onEsc);
-      window.removeEventListener("resize", updatePos);
-      window.removeEventListener("scroll", updatePos, true);
-      vv?.removeEventListener("resize", updatePos);
-      vv?.removeEventListener("scroll", updatePos);
+      window.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("resize", dismiss);
     };
-  }, [mediaMenuOpen]);
+  }, [edTip]);
 
   // Load Quick Insert data dynamically with server-side search & pagination
   useEffect(() => {
@@ -1139,17 +1555,43 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     view.focus();
   };
 
+  const handleToolbarPointerOver = (e: PointerEvent) => {
+    if (e.pointerType === "touch") return;
+    const btn = (e.target as HTMLElement | null)?.closest("[data-tip]") as HTMLElement | null;
+    if (!btn) {
+      setEdTip(null);
+      return;
+    }
+    const text = btn.getAttribute("data-tip") || "";
+    if (!text) {
+      setEdTip(null);
+      return;
+    }
+    const r = btn.getBoundingClientRect();
+    const below = r.top < 46;
+    const x = Math.max(16, Math.min(window.innerWidth - 16, Math.round(r.left + r.width / 2)));
+    const y = below ? Math.round(r.bottom + 8) : Math.round(r.top - 8);
+    setEdTip({ text, x, y, below });
+  };
+
   const mergedQuickInserts = quickInserts.length > 0 ? quickInserts : dynQuickInserts || [];
 
   return (
     <div class={`volo-studio-editor ${fullscreen ? "is-fullscreen" : ""}`}>
       {/* Top Sticky Rich Icon Toolbar */}
-      <div class="volo-ed-toolbar">
+      <div
+        class="volo-ed-toolbar"
+        onPointerOver={handleToolbarPointerOver as any}
+        onPointerLeave={() => setEdTip(null)}
+        onPointerDown={() => setEdTip(null)}
+      >
         <div class="volo-ed-tools">
+          {/* Group 1: Undo / Redo */}
           <button
             type="button"
             class="volo-ed-btn"
-            title={t("ed.undo")}
+            data-tip={t("ed.undo")}
+            aria-label={t("ed.undo")}
             onClick={() => {
               if (mode === "wysiwyg") document.execCommand("undo");
               else if (viewRef.current) undo(viewRef.current);
@@ -1163,7 +1605,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
           <button
             type="button"
             class="volo-ed-btn"
-            title={t("ed.redo")}
+            data-tip={t("ed.redo")}
+            aria-label={t("ed.redo")}
             onClick={() => {
               if (mode === "wysiwyg") document.execCommand("redo");
               else if (viewRef.current) redo(viewRef.current);
@@ -1177,67 +1620,87 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
           <span class="volo-ed-sep" />
 
-          {/* Heading H1-H6 Popover (Portal-rendered to escape mobile overflow-x clipping) */}
+          {/* Group 2: Heading, Typography & Color/Highlight */}
           <div class="volo-pop-wrap">
             <button
-              ref={headingBtnRef}
-              type="button"
-              class={`volo-ed-btn ${headingOpen ? "active" : ""}`}
-              title={t("ed.heading")}
-              onClick={() => {
-                setMediaMenuOpen(false);
-                setHeadingOpen((p) => !p);
+              ref={(el) => {
+                popBtnRefs.current.heading = el;
               }}
+              type="button"
+              class={`volo-ed-btn ${activePop === "heading" ? "active" : ""}`}
+              data-tip={t("ed.heading")}
+              aria-label={t("ed.heading")}
+              onClick={() => togglePop("heading")}
             >
               <span style={{ fontWeight: 750, fontSize: "12.5px" }}>H▾</span>
             </button>
-            {headingOpen &&
-              typeof document !== "undefined" &&
-              createPortal(
-                <div
-                  ref={headingMenuRef}
-                  class="volo-cselect-menu is-portal volo-ed-pop"
-                  style={headingStyle}
-                >
-                  {[1, 2, 3, 4, 5, 6].map((lvl) => (
-                    <button
-                      key={lvl}
-                      type="button"
-                      class="volo-cselect-item"
-                      onClick={() => {
-                        prefixCurrentLine(`${"#".repeat(lvl)} `);
-                        setHeadingOpen(false);
-                      }}
-                    >
-                      <span style={{ fontWeight: 700, fontSize: `${Math.max(12, 17 - lvl)}px` }}>H{lvl}</span>
-                    </button>
-                  ))}
-                </div>,
-                document.body
-              )}
           </div>
 
-          <button type="button" class="volo-ed-btn" title={t("ed.bold")} onClick={() => wrapSelection("**", "**", "bold")}>
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.bold")}
+            aria-label={t("ed.bold")}
+            onClick={() => wrapSelection("**", "**", "bold")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
               <path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z" />
               <path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z" />
             </svg>
           </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.italic")} onClick={() => wrapSelection("*", "*", "italic")}>
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.italic")}
+            aria-label={t("ed.italic")}
+            onClick={() => wrapSelection("*", "*", "italic")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <line x1="19" y1="4" x2="10" y2="4" />
               <line x1="14" y1="20" x2="5" y2="20" />
               <line x1="15" y1="4" x2="9" y2="20" />
             </svg>
           </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.strike")} onClick={() => wrapSelection("~~", "~~", "text")}>
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.strike")}
+            aria-label={t("ed.strike")}
+            onClick={() => wrapSelection("~~", "~~", "text")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <path d="M16 4H9a3 3 0 0 0-2.83 4" />
               <path d="M14 12a4 4 0 0 1 0 8H6" />
               <line x1="4" y1="12" x2="20" y2="12" />
             </svg>
           </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.code")} onClick={() => wrapSelection("`", "`", "code")}>
+
+          {/* Text Color, Highlight (<mark>) & Underline (<u>) Popover */}
+          <div class="volo-pop-wrap">
+            <button
+              ref={(el) => {
+                popBtnRefs.current.color = el;
+              }}
+              type="button"
+              class={`volo-ed-btn ${activePop === "color" ? "active" : ""}`}
+              data-tip={t("ed.text_color")}
+              aria-label={t("ed.text_color")}
+              onClick={() => togglePop("color")}
+            >
+              <span class="volo-ed-color-glyph">
+                <span>A</span>
+                <i />
+              </span>
+            </button>
+          </div>
+
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.code")}
+            aria-label={t("ed.code")}
+            onClick={() => wrapSelection("`", "`", "code")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="16 18 22 12 16 6" />
               <polyline points="8 6 2 12 8 18" />
@@ -1246,13 +1709,46 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
           <span class="volo-ed-sep" />
 
-          <button type="button" class="volo-ed-btn" title={t("ed.quote")} onClick={() => prefixCurrentLine("> ")}>
+          {/* Group 3: Quote, Callout, Bullet / Ordered / Task Lists */}
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.quote")}
+            aria-label={t("ed.quote")}
+            onClick={() => prefixCurrentLine("> ")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2 1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z" />
               <path d="M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z" />
             </svg>
           </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.ul")} onClick={() => prefixCurrentLine("- ")}>
+
+          <div class="volo-pop-wrap">
+            <button
+              ref={(el) => {
+                popBtnRefs.current.callout = el;
+              }}
+              type="button"
+              class={`volo-ed-btn ${activePop === "callout" ? "active" : ""}`}
+              data-tip={t("ed.callout")}
+              aria-label={t("ed.callout")}
+              onClick={() => togglePop("callout")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <line x1="12" y1="8" x2="12" y2="12" />
+                <line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+            </button>
+          </div>
+
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.ul")}
+            aria-label={t("ed.ul")}
+            onClick={() => prefixCurrentLine("- ")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <line x1="8" y1="6" x2="21" y2="6" />
               <line x1="8" y1="12" x2="21" y2="12" />
@@ -1262,7 +1758,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
               <circle cx="4" cy="18" r="1" fill="currentColor" />
             </svg>
           </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.ol")} onClick={() => prefixCurrentLine("1. ")}>
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.ol")}
+            aria-label={t("ed.ol")}
+            onClick={() => prefixCurrentLine("1. ")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <line x1="10" y1="6" x2="21" y2="6" />
               <line x1="10" y1="12" x2="21" y2="12" />
@@ -1272,7 +1774,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
               <path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1" />
             </svg>
           </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.task")} onClick={() => prefixCurrentLine("- [ ] ")}>
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.task")}
+            aria-label={t("ed.task")}
+            onClick={() => prefixCurrentLine("- [ ] ")}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <rect x="3" y="5" width="6" height="6" rx="1.2" />
               <path d="m3 17 2 2 4-4" />
@@ -1283,50 +1791,30 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
           <span class="volo-ed-sep" />
 
-          <button type="button" class="volo-ed-btn" title={t("ed.link")} onClick={() => wrapSelection("[", "](https://)", t("ed.link_text_ph"))}>
+          {/* Group 4: Link, Media, Table, Code Block, Divider */}
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.link")}
+            aria-label={t("ed.link")}
+            onClick={() => wrapSelection("[", "](https://)", t("ed.link_text_ph"))}
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
               <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
               <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
             </svg>
           </button>
-          <button
-            type="button"
-            class="volo-ed-btn"
-            title={t("ed.table")}
-            onClick={() => insertSnippet(`\n${t("ed.table_tpl")}\n`)}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <line x1="3" y1="9" x2="21" y2="9" />
-              <line x1="3" y1="15" x2="21" y2="15" />
-              <line x1="9" y1="3" x2="9" y2="21" />
-              <line x1="15" y1="3" x2="15" y2="21" />
-            </svg>
-          </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.code_block")} onClick={() => insertSnippet("\n```go\n\n```\n")}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="4" width="18" height="16" rx="2" />
-              <polyline points="8 10 11 12.5 8 15" />
-              <line x1="13" y1="15" x2="16" y2="15" />
-            </svg>
-          </button>
-          <button type="button" class="volo-ed-btn" title={t("ed.hr")} onClick={() => insertSnippet("\n---\n")}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
-              <line x1="4" y1="12" x2="20" y2="12" />
-            </svg>
-          </button>
 
-          {/* Upload Media / Insert from Media Library (Portal-rendered to escape mobile overflow-x clipping) */}
           <div class="volo-pop-wrap">
             <button
-              ref={mediaBtnRef}
-              type="button"
-              class={`volo-ed-btn ${mediaMenuOpen ? "active" : ""}`}
-              title={uploading ? t("ed.uploading") : t("ed.upload_media")}
-              onClick={() => {
-                setHeadingOpen(false);
-                setMediaMenuOpen((v) => !v);
+              ref={(el) => {
+                popBtnRefs.current.media = el;
               }}
+              type="button"
+              class={`volo-ed-btn ${activePop === "media" ? "active" : ""}`}
+              data-tip={uploading ? t("ed.uploading") : t("ed.upload_media")}
+              aria-label={uploading ? t("ed.uploading") : t("ed.upload_media")}
+              onClick={() => togglePop("media")}
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="3" y="3" width="18" height="18" rx="2" />
@@ -1350,44 +1838,117 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
                 })();
               }}
             />
-            {mediaMenuOpen &&
-              typeof document !== "undefined" &&
-              createPortal(
-                <div
-                  ref={mediaMenuRef}
-                  class="volo-cselect-menu is-portal volo-ed-pop volo-ed-media-pop"
-                  style={mediaStyle}
-                >
-                  <button
-                    type="button"
-                    class="volo-cselect-item"
-                    onClick={() => {
-                      setMediaMenuOpen(false);
-                      fileInputRef.current?.click();
-                    }}
-                  >
-                    <span class="volo-cselect-item-text">{t("ed.upload_local_file")}</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-cselect-item"
-                    onClick={() => {
-                      setMediaMenuOpen(false);
-                      setMediaModalOpen(true);
-                    }}
-                  >
-                    <span class="volo-cselect-item-text">{t("ed.insert_from_library")}</span>
-                  </button>
-                </div>,
-                document.body
-              )}
+          </div>
+
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.table")}
+            aria-label={t("ed.table")}
+            onClick={() => insertSnippet(`\n${t("ed.table_tpl")}\n`)}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <line x1="3" y1="9" x2="21" y2="9" />
+              <line x1="3" y1="15" x2="21" y2="15" />
+              <line x1="9" y1="3" x2="9" y2="21" />
+              <line x1="15" y1="3" x2="15" y2="21" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.code_block")}
+            aria-label={t("ed.code_block")}
+            onClick={() => insertSnippet("\n```bash\n\n```\n")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <polyline points="8 10 11 12.5 8 15" />
+              <line x1="13" y1="15" x2="16" y2="15" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.hr")}
+            aria-label={t("ed.hr")}
+            onClick={() => insertSnippet("\n---\n")}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+              <line x1="4" y1="12" x2="20" y2="12" />
+            </svg>
+          </button>
+
+          <span class="volo-ed-sep" />
+
+          {/* Group 5: Volo Extension Shortcuts (Reader Lock, Password Lock, Embedded Bookshelf, Quick Insert Hub) */}
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.sc_lock_user")}
+            aria-label={t("ed.sc_lock_user")}
+            onClick={() => {
+              const sel = getSelectedText().trim();
+              if (sel) {
+                wrapSelection(`\n:::lock type="user"\n`, `\n:::\n`, sel);
+              } else {
+                insertSnippet(`\n:::lock type="user"\n${t("ed.lock_user_ph")}\n:::\n`);
+              }
+            }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <rect x="15" y="13" width="7" height="6" rx="1.2" />
+              <path d="M17 13v-1.5a1.5 1.5 0 0 1 3 0V13" />
+            </svg>
+          </button>
+
+          <button
+            type="button"
+            class="volo-ed-btn"
+            data-tip={t("ed.sc_lock_pwd")}
+            aria-label={t("ed.sc_lock_pwd")}
+            onClick={() => {
+              const sel = getSelectedText().trim();
+              if (sel) setLockBody(sel);
+              setLockMode("pwd");
+              setQiTab("lock");
+              setQiOpen(true);
+            }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="11" width="14" height="10" rx="2" />
+              <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+              <circle cx="12" cy="16" r="1" fill="currentColor" />
+            </svg>
+          </button>
+
+          <div class="volo-pop-wrap">
+            <button
+              ref={(el) => {
+                popBtnRefs.current.book = el;
+              }}
+              type="button"
+              class={`volo-ed-btn ${activePop === "book" ? "active" : ""}`}
+              data-tip={t("ed.sc_bookshelf")}
+              aria-label={t("ed.sc_bookshelf")}
+              onClick={() => togglePop("book")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 4h6a4 4 0 0 1 4 4v13a3 3 0 0 0-3-3H2z" />
+                <path d="M22 4h-6a4 4 0 0 0-4 4v13a3 3 0 0 1 3-3h7z" />
+              </svg>
+            </button>
           </div>
 
           {/* Quick Insert + Modal Trigger */}
           <button
             type="button"
             class="volo-ed-btn volo-ed-btn-accent"
-            title={t("ed.quick_insert")}
+            data-tip={t("ed.quick_insert")}
+            aria-label={t("ed.quick_insert")}
             onClick={() => setQiOpen(true)}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
@@ -1408,7 +1969,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
           ))}
         </div>
 
-        {/* Right Controls: Outline + 3-Mode Switcher + Fullscreen */}
+        {/* Right Controls: 3-Mode Switcher + Sync Scroll (in sv) + Outline + Fullscreen */}
         <div class="volo-ed-right">
           <div class="volo-ed-modes" role="tablist">
             <button
@@ -1440,10 +2001,34 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
             </button>
           </div>
 
+          {mode === "sv" && (
+            <button
+              type="button"
+              class={`volo-ed-btn ${syncScroll ? "active" : ""}`}
+              data-tip={t("ed.sync_scroll")}
+              aria-label={t("ed.sync_scroll")}
+              onClick={() =>
+                setSyncScroll((prev) => {
+                  const next = !prev;
+                  localStorage.setItem("volo_editor_sync_scroll", next ? "1" : "0");
+                  return next;
+                })
+              }
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m7 7 3-3 3 3" />
+                <path d="M10 4v11" />
+                <path d="m17 17-3 3-3-3" />
+                <path d="M14 20V9" />
+              </svg>
+            </button>
+          )}
+
           <button
             type="button"
             class={`volo-ed-btn ${showOutline ? "active" : ""}`}
-            title={t("ed.outline")}
+            data-tip={t("ed.outline")}
+            aria-label={t("ed.outline")}
             onClick={() =>
               setShowOutline((v) => {
                 const next = !v;
@@ -1473,7 +2058,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
           <button
             type="button"
             class={`volo-ed-btn ${fullscreen ? "active" : ""}`}
-            title={fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen")}
+            data-tip={fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen")}
+            aria-label={fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen")}
             onClick={() => setFullscreen((v) => !v)}
           >
             {fullscreen ? (
@@ -1494,6 +2080,172 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
           </button>
         </div>
       </div>
+
+      {/* Portal Popovers for Heading / Color / Callout / Media / Bookshelf */}
+      {activePop &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div ref={popMenuRef} class="volo-cselect-menu is-portal volo-ed-pop" style={popStyle}>
+            {activePop === "heading" &&
+              [1, 2, 3, 4, 5, 6].map((lvl) => (
+                <button
+                  key={lvl}
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    prefixCurrentLine(`${"#".repeat(lvl)} `);
+                    setActivePop("");
+                  }}
+                >
+                  <span style={{ fontWeight: 700, fontSize: `${Math.max(12, 17 - lvl)}px` }}>H{lvl}</span>
+                </button>
+              ))}
+
+            {activePop === "color" && (
+              <div class="volo-color-pop">
+                <div class="volo-color-swatches">
+                  {EDITOR_SWATCHES.map((sw) => (
+                    <button
+                      key={sw.color}
+                      type="button"
+                      class="volo-color-swatch"
+                      title={sw.label}
+                      style={{ background: sw.color }}
+                      onClick={() => {
+                        applyColorStyle(sw.color);
+                        setActivePop("");
+                      }}
+                    />
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    wrapSelection("<mark>", "</mark>", "text");
+                    setActivePop("");
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{t("ed.color_mark")}</span>
+                </button>
+                <button
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    wrapSelection("<u>", "</u>", "text");
+                    setActivePop("");
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{t("ed.underline")}</span>
+                </button>
+                <button
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    clearInlineStyle();
+                    setActivePop("");
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{t("ed.color_clear")}</span>
+                </button>
+              </div>
+            )}
+
+            {activePop === "callout" &&
+              EDITOR_CALLOUTS.map((co) => (
+                <button
+                  key={co.kind}
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    const sel = getSelectedText().trim() || "...";
+                    insertSnippet(`\n> [!${co.kind}]\n> ${sel.replace(/\n/g, "\n> ")}\n`);
+                    setActivePop("");
+                  }}
+                >
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "7px",
+                      fontWeight: 650,
+                      fontSize: "12.5px",
+                    }}
+                  >
+                    <i style={{ width: "8px", height: "8px", borderRadius: "999px", background: co.color, display: "inline-block" }} />
+                    [!{co.kind}]
+                  </span>
+                </button>
+              ))}
+
+            {activePop === "media" && (
+              <>
+                <button
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    setActivePop("");
+                    fileInputRef.current?.click();
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{t("ed.upload_local_file")}</span>
+                </button>
+                <button
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    setActivePop("");
+                    setMediaModalOpen(true);
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{t("ed.insert_from_library")}</span>
+                </button>
+              </>
+            )}
+
+            {activePop === "book" && (
+              <>
+                <button
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    setActivePop("");
+                    insertSnippet("\n:::bookshelf\n:::\n");
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{t("ed.sc_bookshelf_all")}</span>
+                </button>
+                <button
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    setActivePop("");
+                    setQiTab("books");
+                    setQiOpen(true);
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{t("ed.sc_book_pick")}</span>
+                </button>
+              </>
+            )}
+          </div>,
+          document.body
+        )}
+
+      {/* Instant Dark Floating Tooltip Bubble */}
+      {edTip &&
+        !activePop &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            class={`volo-ed-tooltip ${edTip.below ? "is-below" : ""}`}
+            style={{ left: `${edTip.x}px`, top: `${edTip.y}px` }}
+            role="tooltip"
+          >
+            {edTip.text}
+          </div>,
+          document.body
+        )}
 
       {/* Mobile Segmented Pane Bar when Split View or Outline is active */}
       {(mode === "sv" || showOutline) && (
@@ -1555,6 +2307,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
         {/* Split Live Preview Pane */}
         {mode === "sv" && (
           <div
+            ref={previewRef}
             class="volo-preview-pane"
             dangerouslySetInnerHTML={{
               __html: previewHTML || `<p style="color:var(--volo-muted)">${t("ed.live_preview_empty")}</p>`,
@@ -1818,12 +2571,13 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
                             if (!v.includes("'")) return `${k}='${v}'`;
                             return `${k}="${v.replace(/"/g, "'")}"`;
                           };
-                          const safeTitle = String(b.title || b.slug || "").replace(/[\[\]\r\n]/g, "");
-                          const body = b.description || `[${safeTitle}](/books/${b.slug})`;
-                          const slugAttr = b.slug ? ` ${fmtAttr("slug", b.slug)}` : "";
-                          insertSnippet(
-                            `\n:::book${slugAttr} ${fmtAttr("title", b.title)} ${fmtAttr("status", b.reading_status || "reading")}\n${body}\n:::\n`
-                          );
+                          if (b.slug) {
+                            insertSnippet(`\n:::book ${fmtAttr("slug", b.slug)}\n:::\n`);
+                          } else {
+                            insertSnippet(
+                              `\n:::book ${fmtAttr("title", b.title)} ${fmtAttr("status", b.reading_status || "reading")}\n:::\n`
+                            );
+                          }
                           setQiOpen(false);
                         }}
                       >

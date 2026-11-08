@@ -1612,5 +1612,18 @@
   "sys.waf_reason_rate_abuse": "高频请求速率滥用",
   "sys.waf_reason_login_fail": "多次登录认证失败",
   "sys.waf_reason_two_factor_fail": "多次两步验证失败",
-  "sys.waf_reason_unlock_fail": "多次加密内容解锁失败"
+  "sys.waf_reason_unlock_fail": "多次加密内容解锁失败",
+  "ed.text_color": "文字颜色与荧光高亮",
+  "ed.color_clear": "清除颜色样式",
+  "ed.color_mark": "荧光高亮 (<mark>)",
+  "ed.underline": "下划线 (<u>)",
+  "ed.callout": "插入提示卡片 ([!NOTE])",
+  "ed.sc_lock_user": "插入「注册用户可见」隐藏内容块",
+  "ed.sc_lock_pwd": "插入「局部密码保护」隐藏内容块",
+  "ed.sc_bookshelf": "插入「在线书架」内嵌阅读器短代码",
+  "ed.sc_bookshelf_all": "嵌入全部在线书架 (:::bookshelf)",
+  "ed.sc_book_pick": "选择单本书籍嵌入 (:::book)…",
+  "ed.sync_scroll": "双栏同步滚动",
+  "ed.lock_user_ph": "此处内容登录读者可见…",
+  "ui.cmdk_hint": "↑↓ 选择 · Enter 打开 · Esc 关闭"
 }

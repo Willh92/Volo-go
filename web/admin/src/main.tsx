@@ -448,17 +448,37 @@ function CommandPalette({
     activeEl?.scrollIntoView({ block: "nearest" });
   }, [idx, open]);
 
+  const isMac =
+    typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
+
   return (
     <AnimatedModal
       open={open}
       onClose={onClose}
       title={t("ui.cmdk_title")}
-      maxWidth="560px"
+      maxWidth="620px"
+      variant="spotlight"
     >
-      <div class="volo-cmdk-search">
+      <div class="volo-cmdk-head">
+        <svg
+          viewBox="0 0 24 24"
+          width="17"
+          height="17"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <circle cx="10.5" cy="10.5" r="6.5" />
+          <path d="m15.5 15.5 4.5 4.5" />
+        </svg>
         <input
           ref={inputRef}
-          class="volo-input"
+          class="volo-cmdk-input"
+          type="search"
+          autoComplete="off"
           placeholder={t("ui.cmdk_ph")}
           value={q}
           onInput={(e) => setQ((e.currentTarget as HTMLInputElement).value)}
@@ -477,6 +497,9 @@ function CommandPalette({
             }
           }}
         />
+        <button type="button" class="volo-cmdk-esc" onClick={onClose}>
+          ESC
+        </button>
       </div>
       <div ref={listRef} class="volo-cmdk-list">
         {items.length === 0 ? (
@@ -498,6 +521,10 @@ function CommandPalette({
             </button>
           ))
         )}
+      </div>
+      <div class="volo-cmdk-foot">
+        <span>{t("ui.cmdk_hint")}</span>
+        <span class="volo-cmdk-foot-kbd">{isMac ? "⌘K" : "Ctrl+K"}</span>
       </div>
     </AnimatedModal>
   );

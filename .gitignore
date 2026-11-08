@@ -3,6 +3,7 @@
 /volo
 /volo.exe
 /*.zip
+/*.tar.gz
 *.test
 *.out
 coverage.txt

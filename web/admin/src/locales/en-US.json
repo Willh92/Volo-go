@@ -1612,5 +1612,18 @@
   "sys.waf_reason_rate_abuse": "High-frequency rate abuse",
   "sys.waf_reason_login_fail": "Repeated login failures",
   "sys.waf_reason_two_factor_fail": "Repeated 2FA failures",
-  "sys.waf_reason_unlock_fail": "Repeated content unlock failures"
+  "sys.waf_reason_unlock_fail": "Repeated content unlock failures",
+  "ed.text_color": "Text Color & Highlight",
+  "ed.color_clear": "Clear Color Style",
+  "ed.color_mark": "Highlight (<mark>)",
+  "ed.underline": "Underline (<u>)",
+  "ed.callout": "Insert Callout ([!NOTE])",
+  "ed.sc_lock_user": "Insert Logged-In Reader Hidden Block",
+  "ed.sc_lock_pwd": "Insert Password-Protected Hidden Block",
+  "ed.sc_bookshelf": "Insert Embedded Bookshelf Shortcode",
+  "ed.sc_bookshelf_all": "Embed Full Bookshelf (:::bookshelf)",
+  "ed.sc_book_pick": "Pick Single Book to Embed (:::book)…",
+  "ed.sync_scroll": "Sync Split Scroll",
+  "ed.lock_user_ph": "Visible to signed-in readers…",
+  "ui.cmdk_hint": "↑↓ Navigate · Enter Open · Esc Close"
 }
