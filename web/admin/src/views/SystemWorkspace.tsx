@@ -3673,29 +3673,16 @@ export function SystemWorkspace({
                   />
                 </div>
               </div>
-              <div class="volo-grid-2">
-                <div class="volo-field">
-                  <label>{t("sys.dyn_login_path")}</label>
-                  <input
-                    class="volo-input"
-                    name="sec_custom_entry_route"
-                    autoComplete="off"
-                    placeholder="/secret-entry"
-                    value={domains.security?.dynamic_login_path || ""}
-                    onInput={(e) => setDomField("security", "dynamic_login_path", (e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("sys.geo_dir_label")}</label>
-                  <input
-                    class="volo-input"
-                    name="sec_geoip_dir_path"
-                    autoComplete="off"
-                    placeholder={defaultGeoIPDir || "./data/geoip"}
-                    value={domains.security?.geoip_dir || ""}
-                    onInput={(e) => setDomField("security", "geoip_dir", (e.currentTarget as HTMLInputElement).value)}
-                  />
-                </div>
+              <div class="volo-field">
+                <label>{t("sys.dyn_login_path")}</label>
+                <input
+                  class="volo-input"
+                  name="sec_custom_entry_route"
+                  autoComplete="off"
+                  placeholder="/secret-entry"
+                  value={domains.security?.dynamic_login_path || ""}
+                  onInput={(e) => setDomField("security", "dynamic_login_path", (e.currentTarget as HTMLInputElement).value)}
+                />
               </div>
               <div class="volo-form-actions">
                 <button
@@ -4069,12 +4056,12 @@ export function SystemWorkspace({
                   </div>
                 </div>
                 <div class="volo-field" style={{ marginBottom: 0 }}>
-                  <label>{t("sys.geo_dir_label")}</label>
                   <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "8px" }}>
                     <input
                       class="volo-input"
                       style={{ flex: "1 1 260px" }}
                       name="geo_rules_db_path_cfg"
+                      aria-label={t("sys.geo_db_sub_title")}
                       autoComplete="off"
                       placeholder={defaultGeoIPDir || "./data/geoip"}
                       value={domains?.security?.geoip_dir || ""}

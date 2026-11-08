@@ -12,7 +12,7 @@ import {
   StaffUser,
   toggleEffectiveTheme,
 } from "../api";
-import { CloseIcon, LocalePopover, SwitchToggle } from "../components/UIControls";
+import { CloseIcon, LocalePopover, SvgIcon, SwitchToggle } from "../components/UIControls";
 import { availableLocalesSig, ensureLocaleLoaded, localeSig, normalizeLocale, t } from "../i18n";
 
 interface OidcProviderItem {
@@ -230,14 +230,14 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
             onClick={() => toggleEffectiveTheme()}
           >
             {isDark ? (
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <SvgIcon size={15}>
                 <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" />
-              </svg>
+              </SvgIcon>
             ) : (
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <SvgIcon size={15}>
                 <circle cx="12" cy="12" r="4.5" />
                 <path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6" />
-              </svg>
+              </SvgIcon>
             )}
           </button>
           <LocalePopover
@@ -317,10 +317,10 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                     <label>{t("auth.ident")}</label>
                     <div class="volo-auth-input-wrap">
                       <span class="volo-auth-input-icon">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                        <SvgIcon size={16} sw={1.85}>
                           <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
                           <circle cx="12" cy="7" r="4" />
-                        </svg>
+                        </SvgIcon>
                       </span>
                       <input
                         ref={(el) => {
@@ -347,10 +347,10 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                     <label>{t("auth.password")}</label>
                     <div class="volo-auth-input-wrap">
                       <span class="volo-auth-input-icon">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                        <SvgIcon size={16} sw={1.85}>
                           <rect x="3" y="11" width="18" height="11" rx="2" />
                           <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                        </svg>
+                        </SvgIcon>
                       </span>
                       <input
                         ref={(el) => {
@@ -378,16 +378,16 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                         onClick={() => setShowPwd((v) => !v)}
                       >
                         {showPwd ? (
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                          <SvgIcon size={16} sw={1.85}>
                             <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
                             <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
                             <line x1="1" y1="1" x2="23" y2="23" />
-                          </svg>
+                          </SvgIcon>
                         ) : (
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                          <SvgIcon size={16} sw={1.85}>
                             <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                             <circle cx="12" cy="12" r="3" />
-                          </svg>
+                          </SvgIcon>
                         )}
                       </button>
                     </div>
@@ -408,11 +408,11 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                       disabled={busy}
                       onClick={handlePasskeyLogin}
                     >
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                      <SvgIcon size={15} sw={1.85}>
                         <circle cx="7.5" cy="15.5" r="5.5" />
                         <path d="m21 2-9.6 9.6" />
                         <path d="m15.5 7.5 3 3L22 7l-3-3" />
-                      </svg>
+                      </SvgIcon>
                       <span>{t("auth.passkey")}</span>
                     </button>
                     {oidcProviders.map((p) => (
@@ -422,11 +422,11 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                         class="volo-btn volo-sso-btn"
                         style={{ width: "100%", minHeight: "40px" }}
                       >
-                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                        <SvgIcon size={15} sw={1.85}>
                           <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
                           <polyline points="10 17 15 12 10 7" />
                           <line x1="15" y1="12" x2="3" y2="12" />
-                        </svg>
+                        </SvgIcon>
                         <span>{t("auth.sso_continue", { provider: p.display_name || p.name })}</span>
                       </a>
                     ))}
@@ -438,9 +438,9 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
                     <label>{t("auth.totp_code")}</label>
                     <div class="volo-auth-input-wrap">
                       <span class="volo-auth-input-icon">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">
+                        <SvgIcon size={16} sw={1.85}>
                           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                        </svg>
+                        </SvgIcon>
                       </span>
                       <input
                         ref={(el) => {
@@ -486,10 +486,10 @@ export function LoginView({ initialChallengeToken = "", initialOidcError = "" }:
             </div>
 
             <div class="volo-auth-card-foot">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <SvgIcon size={14}>
                 <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                 <polyline points="9 12 11 14 15 10" />
-              </svg>
+              </SvgIcon>
               <span>{t("auth.staff_only_tip")}</span>
             </div>
           </section>

@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
 )
 
 func mmdbEncodeUint64(v uint64) []byte {
@@ -167,11 +165,11 @@ type syntheticXDBEntry struct {
 	region string
 }
 
-// buildSyntheticXDB creates a valid Structure 3.0 ip2region .xdb binary (IPv4 or IPv6)
-// that passes xdb.VerifyFromFile, LoadHeaderFromFile, LoadVectorIndexFromFile, and Search.
+// buildSyntheticXDB creates a valid Structure 3.0 (or 2.0 for IPv4 when structVer == xdbStructure20) ip2region .xdb binary
+// that passes header/pointer verification, 512 KiB vector index loading, and binary-search segment lookup.
 func buildSyntheticXDB(ipVer int, createdAt uint32, entries []syntheticXDBEntry) []byte {
-	const headerLen = xdb.HeaderInfoLength
-	const vecLen = xdb.VectorIndexRows * xdb.VectorIndexCols * xdb.VectorIndexSize
+	const headerLen = xdbHeaderLen
+	const vecLen = xdbVecTotalBytes
 
 	vec := make([]byte, vecLen)
 	var payload bytes.Buffer
@@ -191,7 +189,7 @@ func buildSyntheticXDB(ipVer int, createdAt uint32, entries []syntheticXDBEntry)
 
 		u := ent.addr.Unmap()
 		var il0, il1 int
-		if ipVer == xdb.IPv4VersionNo {
+		if ipVer == xdbIPv4Ver {
 			a4 := u.As4()
 			il0, il1 = int(a4[0]), int(a4[1])
 			// xdb IPv4 segment index stores IP bytes in little-endian order (4+4+2+4 = 14 bytes).
@@ -210,14 +208,14 @@ func buildSyntheticXDB(ipVer int, createdAt uint32, entries []syntheticXDBEntry)
 		binary.LittleEndian.PutUint32(tail[2:6], dataPtr)
 		payload.Write(tail[:])
 
-		vecOff := il0*xdb.VectorIndexCols*xdb.VectorIndexSize + il1*xdb.VectorIndexSize
+		vecOff := il0*xdbVecCols*xdbVecCell + il1*xdbVecCell
 		binary.LittleEndian.PutUint32(vec[vecOff:vecOff+4], segPtr)
 		binary.LittleEndian.PutUint32(vec[vecOff+4:vecOff+8], segPtr)
 	}
 
 	hdr := make([]byte, headerLen)
-	binary.LittleEndian.PutUint16(hdr[0:2], xdb.Structure30)
-	binary.LittleEndian.PutUint16(hdr[2:4], uint16(xdb.VectorIndexPolicy))
+	binary.LittleEndian.PutUint16(hdr[0:2], xdbStructure30)
+	binary.LittleEndian.PutUint16(hdr[2:4], 1) // VectorIndexPolicy
 	binary.LittleEndian.PutUint32(hdr[4:8], createdAt)
 	binary.LittleEndian.PutUint32(hdr[8:12], firstSegPtr)
 	binary.LittleEndian.PutUint32(hdr[12:16], lastSegPtr)
@@ -276,14 +274,17 @@ func TestGeoEngineSmartMultiMMDBSelectionAndASNExclusion(t *testing.T) {
 func TestGeoEngineDualIPv4AndIPv6XDBSlotsAndHotReload(t *testing.T) {
 	dir := t.TempDir()
 
-	v4Old := buildSyntheticXDB(xdb.IPv4VersionNo, 100, []syntheticXDBEntry{
+	v4Old := buildSyntheticXDB(xdbIPv4Ver, 100, []syntheticXDBEntry{
 		{addr: netip.MustParseAddr("114.114.114.114"), region: "中国|0|旧省份|旧城市|电信"},
 	})
-	v4New := buildSyntheticXDB(xdb.IPv4VersionNo, 250, []syntheticXDBEntry{
+	// Verify legacy Structure 2.0 IPv4 header compatibility as well
+	binary.LittleEndian.PutUint16(v4Old[0:2], xdbStructure20)
+
+	v4New := buildSyntheticXDB(xdbIPv4Ver, 250, []syntheticXDBEntry{
 		{addr: netip.MustParseAddr("114.114.114.114"), region: "中国|0|江苏省|南京市|电信"},
 		{addr: netip.MustParseAddr("1.1.1.1"), region: "AU|0|New South Wales|Sydney|Cloudflare"},
 	})
-	v6DB := buildSyntheticXDB(xdb.IPv6VersionNo, 300, []syntheticXDBEntry{
+	v6DB := buildSyntheticXDB(xdbIPv6Ver, 300, []syntheticXDBEntry{
 		{addr: netip.MustParseAddr("2400:3200::1"), region: "中国|0|浙江省|杭州市|阿里"},
 		{addr: netip.MustParseAddr("2000::1"), region: "JP|0|Tokyo|Chiyoda|NTT"},
 	})

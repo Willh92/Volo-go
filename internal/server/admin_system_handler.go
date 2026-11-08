@@ -56,7 +56,7 @@ func (s *AppServer) recordAuditLog(r *http.Request, actor *domain.User, action s
 	if s.deps.Store == nil || actor == nil {
 		return
 	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	detJSON := "{}"
 	if detail != nil {
 		if b, err := json.Marshal(detail); err == nil {
@@ -136,7 +136,7 @@ func (s *AppServer) consumeBackupExportTicket(r *http.Request, rawTicket string)
 	if viewer == nil || sess == nil || sess.ID == "" || viewer.Status != domain.UserStatusActive || viewer.Role != domain.RoleAdmin {
 		return nil, false
 	}
-	ipBucket := security.RateLimitBucketKey(security.ResolveClientIP(r, s.deps.Config.TrustedProxies))
+	ipBucket := security.RateLimitBucketKey(s.clientIP(r))
 	if ipBucket == "" {
 		return nil, false
 	}
@@ -376,8 +376,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		var total int
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM audit_logs WHERE `+whereSQL, args...).Scan(&total)
 		baseSQL := `SELECT * FROM audit_logs WHERE ` + whereSQL + ` ORDER BY created_at DESC`
-		qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-		fullArgs := append(append([]any{}, args...), pageArgs...)
+		qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 		rows, _ := sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store, qSQL, fullArgs...)
 		if rows == nil {
 			rows = []domain.AuditLog{}
@@ -408,16 +407,13 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			CurrentPassword string `json:"current_password"`
 			IncludeMedia    bool   `json:"include_media"`
 		}
-		if r.Body != nil {
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
-				return
-			}
+		if !decodeOptJSONBody(w, r, 4096, &req) {
+			return
 		}
 		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
 			return
 		}
-		ipBucket := security.RateLimitBucketKey(security.ResolveClientIP(r, s.deps.Config.TrustedProxies))
+		ipBucket := security.RateLimitBucketKey(s.clientIP(r))
 		tok, err := s.mintBackupExportTicket(actor.ID, sess.ID, ipBucket)
 		if err != nil {
 			writeErrJSON(w, http.StatusInternalServerError, err.Error())
@@ -522,11 +518,8 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 		var req struct {
 			CurrentPassword string `json:"current_password"`
 		}
-		if r.Body != nil {
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
-				return
-			}
+		if !decodeOptJSONBody(w, r, 4096, &req) {
+			return
 		}
 		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
 			return
@@ -562,8 +555,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			writeJSON(w, http.StatusOK, map[string]any{"items": rows, "nav_items": rows, "total": len(rows)})
 		case http.MethodPost:
 			var in domain.NavItem
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 16384, &in) {
 				return
 			}
 			in.ID = id.Next()
@@ -613,8 +605,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 	switch r.Method {
 	case http.MethodPut:
 		var in domain.NavItem
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &in) {
 			return
 		}
 		title := strings.TrimSpace(in.Title)
@@ -679,8 +670,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			IDs          []string `json:"ids"`
 			CategoryName string   `json:"category_name"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(req.Action))
@@ -759,8 +749,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			var total int
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM links WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM links WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Link{}
@@ -783,8 +772,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			})
 		case http.MethodPost:
 			var in domain.Link
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 16384, &in) {
 				return
 			}
 			in.ID = id.Next()
@@ -840,8 +828,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 	switch r.Method {
 	case http.MethodPut:
 		var in domain.Link
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &in) {
 			return
 		}
 		title := strings.TrimSpace(in.Title)
@@ -1126,8 +1113,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			var total int
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM follows WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM follows WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Follow{}
@@ -1142,8 +1128,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			})
 		case http.MethodPost:
 			var in domain.Follow
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 16384, &in) {
 				return
 			}
 			in.ID = id.Next()
@@ -1225,8 +1210,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 	switch r.Method {
 	case http.MethodPut:
 		var in domain.Follow
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &in) {
 			return
 		}
 		title := strings.TrimSpace(in.Title)
@@ -1578,8 +1562,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			Action string   `json:"action"`
 			IDs    []string `json:"ids"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
@@ -1652,8 +1635,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			var total int
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM redirects WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM redirects WHERE ` + whereSQL + ` ORDER BY ` + orderClause
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.RedirectRule{}
@@ -1668,8 +1650,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			})
 		case http.MethodPost:
 			var in domain.RedirectRule
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 8192, &in) {
 				return
 			}
 			src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
@@ -1706,8 +1687,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 	switch r.Method {
 	case http.MethodPut:
 		var in domain.RedirectRule
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 8192, &in) {
 			return
 		}
 		src, srcOK := normalizeRedirectSourcePath(in.SourcePath)
@@ -1924,8 +1904,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 				Secret string   `json:"secret"`
 				Events []string `json:"events"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 16384, &in) {
 				return
 			}
 			in.ID = id.Next()
@@ -2038,8 +2017,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 			ClearSecret bool     `json:"clear_secret"`
 			Events      []string `json:"events"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &in) {
 			return
 		}
 		secCipher := wh.SecretCiphertext
@@ -2382,8 +2360,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			ThemeID string `json:"theme_id"`
 			Target  string `json:"target"` // desktop (default) | mobile | both
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 4096, &req) {
 			return
 		}
 		target := strings.ToLower(strings.TrimSpace(req.Target))
@@ -2490,8 +2467,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			return
 		}
 		var cfgPatch map[string]any
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&cfgPatch); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &cfgPatch) {
 			return
 		}
 		if nested, ok := cfgPatch["values"].(map[string]any); ok && len(cfgPatch) == 1 {
@@ -2625,8 +2601,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 				Messages  map[string]string `json:"messages"`
 				Overwrite *bool             `json:"overwrite"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 4<<20, &req) {
 				return
 			}
 			raw, _ := json.Marshal(req.Messages)
@@ -2863,8 +2838,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared, "deleted": cleared})
 		case parts[1] == "config" && r.Method == http.MethodPatch:
 			var patch map[string]any
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&patch); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 65536, &patch) {
 				return
 			}
 			sum, err := s.deps.Plugins.UpdateConfig(r.Context(), pid, patch, locale)
@@ -2926,20 +2900,12 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 				storageDrivers = ids
 			}
 		}
-		defaultUploadDir := ""
-		effectiveUploadDir := ""
-		defaultGeoIPDir := ""
-		effectiveGeoIPDir := ""
+		defaultUploadDir, effectiveUploadDir := "", ""
 		if s.deps.Config != nil {
 			defaultUploadDir = s.deps.Config.GetDefaultUploadDir()
 			effectiveUploadDir = s.deps.Config.GetUploadDir()
-			defaultGeoIPDir = s.deps.Config.GetDefaultGeoIPDir()
-			effectiveGeoIPDir = s.deps.Config.GetGeoIPDir()
 		}
-		var geoStatus security.GeoDBStatus
-		if s.deps.Geo != nil {
-			geoStatus = s.deps.Geo.Status()
-		}
+		_, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"domains":              result,
 			"versions":             versions,
@@ -2959,8 +2925,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			Settings *domain.NotificationsSettings `json:"settings"`
 			Password string                        `json:"smtp_password"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &req) {
 			return
 		}
 		to := strings.TrimSpace(req.ToEmail)
@@ -3095,21 +3060,15 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 		if rest == domain.SettingsDomainSecurity {
 			if hasGeoIPDirPatch || s.deps.Settings.Snapshot().Security.GeoIPDir != prevSec.GeoIPDir {
 				if lErr := s.syncConfiguredGeoIPDir(); lErr != nil {
-					rbBytes, _ := json.Marshal(prevSec)
-					_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
-					_ = s.syncConfiguredGeoIPDir()
+					s.rollbackSecuritySettings(r, prevSec, true)
 					writeErrJSON(w, http.StatusBadRequest, lErr.Error())
 					return
 				}
 			}
 			if s.deps.Config != nil && s.deps.Geo != nil && s.deps.Config.GeoAccessEnabled {
-				clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+				clientIP := s.clientIP(r)
 				if !s.deps.Geo.Allows(clientIP) {
-					rbBytes, _ := json.Marshal(prevSec)
-					_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
-					if hasGeoIPDirPatch || prevSec.GeoIPDir != "" {
-						_ = s.syncConfiguredGeoIPDir()
-					}
+					s.rollbackSecuritySettings(r, prevSec, hasGeoIPDirPatch || prevSec.GeoIPDir != "")
 					writeErrJSON(w, http.StatusBadRequest, "refusing security policy or GeoIP configuration that would immediately lock out your current IP")
 					return
 				}
@@ -3120,17 +3079,38 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
 		resp := map[string]any{"domain": rest, "value": val, "version": ver}
 		if rest == domain.SettingsDomainSecurity {
-			if s.deps.Config != nil {
-				resp["effective_geoip_dir"] = s.deps.Config.GetGeoIPDir()
-			}
-			if s.deps.Geo != nil {
-				resp["geoip_status"] = s.deps.Geo.Status()
-			}
+			_, _, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
+			resp["effective_geoip_dir"] = effectiveGeoIPDir
+			resp["geoip_status"] = geoStatus
 		}
 		writeJSON(w, http.StatusOK, resp)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *AppServer) geoIPMeta() (configuredDir, defaultDir, effectiveDir string, status security.GeoDBStatus) {
+	if s.deps.Config != nil {
+		defaultDir = s.deps.Config.GetDefaultGeoIPDir()
+		effectiveDir = s.deps.Config.GetGeoIPDir()
+	}
+	if s.deps.Settings != nil {
+		configuredDir = s.deps.Settings.Snapshot().Security.GeoIPDir
+	}
+	if s.deps.Geo != nil {
+		status = s.deps.Geo.Status()
+	}
+	return
+}
+
+func (s *AppServer) rollbackSecuritySettings(r *http.Request, prev domain.SecuritySettings, resyncGeo bool) {
+	if s.deps.Settings != nil {
+		rbBytes, _ := json.Marshal(prev)
+		_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
+	}
+	if resyncGeo {
+		_ = s.syncConfiguredGeoIPDir()
 	}
 }
 
@@ -3212,8 +3192,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			baseSQL := `SELECT id, username, email, display_name, avatar_url, bio, website_url, role, status, email_verified_at, preferred_locale, created_at, updated_at
 				 FROM users WHERE ` + whereSQL + `
 				 ORDER BY CASE WHEN role = 'admin' THEN 0 WHEN role = 'editor' THEN 1 ELSE 2 END, created_at DESC`
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, _ := sqlx.Select[domain.User](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.User{}
@@ -3236,8 +3215,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				Password        string `json:"password"`
 				PreferredLocale string `json:"preferred_locale"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 16384, &req) {
 				return
 			}
 			if err := auth.ValidatePasswordPolicy(req.Password); err != nil {
@@ -3304,8 +3282,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			Password        string  `json:"password"`
 			CurrentPassword string  `json:"current_password"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 8192, &req) {
 			return
 		}
 		u, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, rest)
@@ -3389,8 +3366,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			Action string   `json:"action"`
 			IDs    []string `json:"ids"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
@@ -3453,8 +3429,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			var total int
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM security_ip_bans WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM security_ip_bans WHERE ` + whereSQL + ` ORDER BY created_at DESC`
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, _ := sqlx.Select[domain.SecurityIPBan](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.SecurityIPBan{}
@@ -3474,15 +3449,14 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 				Note         string `json:"note"`
 				ExpiresHours int    `json:"expires_hours"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 8192, &req) {
 				return
 			}
 			var expMS int64
 			if req.ExpiresHours > 0 {
 				expMS = time.Now().Add(time.Duration(req.ExpiresHours) * time.Hour).UnixMilli()
 			}
-			clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+			clientIP := s.clientIP(r)
 			rec, err := s.deps.WAF.AddManualBan(r.Context(), req.CIDR, req.Note, expMS, clientIP)
 			if err != nil {
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
@@ -3541,11 +3515,8 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 		var req struct {
 			GeoIPDir *string `json:"geoip_dir"`
 		}
-		if r.Body != nil {
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
-				return
-			}
+		if !decodeOptJSONBody(w, r, 8192, &req) {
+			return
 		}
 		var prevSec domain.SecuritySettings
 		if s.deps.Settings != nil {
@@ -3574,10 +3545,8 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 		}
 
 		if lErr := s.syncConfiguredGeoIPDir(); lErr != nil {
-			if req.GeoIPDir != nil && s.deps.Settings != nil {
-				rbBytes, _ := json.Marshal(prevSec)
-				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
-				_ = s.syncConfiguredGeoIPDir()
+			if req.GeoIPDir != nil {
+				s.rollbackSecuritySettings(r, prevSec, true)
 			}
 			writeErrJSON(w, http.StatusBadRequest, lErr.Error())
 			return
@@ -3586,30 +3555,15 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
 		}
 		if req.GeoIPDir != nil && s.deps.Config != nil && s.deps.Geo != nil && s.deps.Config.GeoAccessEnabled {
-			clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+			clientIP := s.clientIP(r)
 			if !s.deps.Geo.Allows(clientIP) {
-				rbBytes, _ := json.Marshal(prevSec)
-				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
-				_ = s.syncConfiguredGeoIPDir()
+				s.rollbackSecuritySettings(r, prevSec, true)
 				writeErrJSON(w, http.StatusBadRequest, "refusing GeoIP database path that would immediately lock out your current IP")
 				return
 			}
 		}
 
-		defaultGeoIPDir := ""
-		effectiveGeoIPDir := ""
-		if s.deps.Config != nil {
-			defaultGeoIPDir = s.deps.Config.GetDefaultGeoIPDir()
-			effectiveGeoIPDir = s.deps.Config.GetGeoIPDir()
-		}
-		configuredGeoIPDir := ""
-		if s.deps.Settings != nil {
-			configuredGeoIPDir = s.deps.Settings.Snapshot().Security.GeoIPDir
-		}
-		var geoStatus security.GeoDBStatus
-		if s.deps.Geo != nil {
-			geoStatus = s.deps.Geo.Status()
-		}
+		configuredGeoIPDir, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
 		s.recordAuditLog(r, actor, "security.geoip_reload", "settings", "security", map[string]any{
 			"path":         effectiveGeoIPDir,
 			"active_files": geoStatus.ActiveFiles,
@@ -3633,20 +3587,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			if rows == nil {
 				rows = []domain.SecurityGeoRule{}
 			}
-			defaultGeoIPDir := ""
-			effectiveGeoIPDir := ""
-			if s.deps.Config != nil {
-				defaultGeoIPDir = s.deps.Config.GetDefaultGeoIPDir()
-				effectiveGeoIPDir = s.deps.Config.GetGeoIPDir()
-			}
-			configuredGeoIPDir := ""
-			if s.deps.Settings != nil {
-				configuredGeoIPDir = s.deps.Settings.Snapshot().Security.GeoIPDir
-			}
-			var geoStatus security.GeoDBStatus
-			if s.deps.Geo != nil {
-				geoStatus = s.deps.Geo.Status()
-			}
+			configuredGeoIPDir, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"items":                      rows,
 				"geo_access_circuit_enabled": s.deps.Config != nil && s.deps.Config.GeoAccessEnabled,
@@ -3657,8 +3598,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			})
 		case http.MethodPost:
 			var in domain.SecurityGeoRule
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 16384, &in) {
 				return
 			}
 			in.ID = id.Next()
@@ -3676,7 +3616,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 			_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-			clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+			clientIP := s.clientIP(r)
 			if s.deps.Config.GeoAccessEnabled && !s.deps.Geo.Allows(clientIP) {
 				_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM security_geo_rules WHERE id = ?`, in.ID)
 				_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
@@ -3699,8 +3639,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		var in domain.SecurityGeoRule
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &in) {
 			return
 		}
 		in.Name = strings.TrimSpace(in.Name)
@@ -3714,7 +3653,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
-		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		clientIP := s.clientIP(r)
 		if s.deps.Config.GeoAccessEnabled && !s.deps.Geo.Allows(clientIP) {
 			_, _ = s.deps.Store.ExecContext(r.Context(),
 				`UPDATE security_geo_rules SET name = ?, is_enabled = ?, action = ?, on_miss = ?, countries = ?, regions = ?, sort_order = ?, updated_at = ? WHERE id = ?`,

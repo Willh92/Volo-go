@@ -375,14 +375,10 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 // --- Staff Login, TOTP 2FA, Passkey Ceremonies, Sessions & API Tokens ---
 
 func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("admin:login", clientIP, 12, 5*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
@@ -392,8 +388,7 @@ func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Ident    string `json:"ident"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 8192, &req) {
 		return
 	}
 	geo := ""
@@ -433,14 +428,10 @@ func (s *AppServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("admin:2fa", clientIP, 10, 5*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
@@ -450,8 +441,7 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 		Code           string `json:"code"`
 		RememberDevice bool   `json:"remember_device"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 8192, &req) {
 		return
 	}
 	geo := ""
@@ -484,14 +474,10 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *AppServer) handleAdminPasskeyLoginBegin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("admin:passkey:begin", clientIP, 15, 5*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
@@ -505,14 +491,10 @@ func (s *AppServer) handleAdminPasskeyLoginBegin(w http.ResponseWriter, r *http.
 }
 
 func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("admin:passkey:finish", clientIP, 12, 5*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited"))
 		return
@@ -524,8 +506,7 @@ func (s *AppServer) handleAdminPasskeyLoginFinish(w http.ResponseWriter, r *http
 		AuthenticatorData string `json:"authenticator_data"`
 		Signature         string `json:"signature"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 32768, &req) {
 		return
 	}
 	cdBytes, err1 := base64.RawURLEncoding.DecodeString(req.ClientDataJSON)
@@ -626,8 +607,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			CurrentPassword string  `json:"current_password"`
 			NewPassword     string  `json:"new_password"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &req) {
 			return
 		}
 		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
@@ -796,8 +776,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			Code            string `json:"code"`
 			CurrentPassword string `json:"current_password"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 8192, &req) {
 			return
 		}
 		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
@@ -866,8 +845,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			AttestationObject string `json:"attestation_object"`
 			CurrentPassword   string `json:"current_password"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
@@ -906,11 +884,8 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		var req struct {
 			CurrentPassword string `json:"current_password"`
 		}
-		if r.Body != nil {
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
-				return
-			}
+		if !decodeOptJSONBody(w, r, 4096, &req) {
+			return
 		}
 		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
 			return
@@ -981,8 +956,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			ExpiresIn       int      `json:"expires_in_days"`
 			CurrentPassword string   `json:"current_password"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 8192, &req) {
 			return
 		}
 		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
@@ -1444,8 +1418,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			ContentMD string `json:"content_md"`
 			Locale    string `json:"locale"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 4<<20, &req) {
 			return
 		}
 		ctx := r.Context()
@@ -1475,8 +1448,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			IDs        []string `json:"ids"`
 			CategoryID string   `json:"category_id"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(req.Action))
@@ -1697,8 +1669,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				        lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count,
 				        created_at, updated_at
 				 FROM articles WHERE ` + whereSQL + ` ORDER BY ` + orderClause
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, err := sqlx.Select[domain.RawArticle](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if err != nil {
 				writeErrJSON(w, http.StatusInternalServerError, err.Error())
@@ -1941,8 +1912,7 @@ func articleHookPayloadFromRaw(raw domain.RawArticle) plugin.ArticleHookPayload 
 
 func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, actor *domain.User, existingID string) {
 	var in adminArticlePayload
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&in); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 8<<20, &in) {
 		return
 	}
 	title := strings.TrimSpace(in.Title)
@@ -2328,8 +2298,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM pages WHERE `+whereSQL, args...).Scan(&total)
 
 			baseSQL := `SELECT * FROM pages WHERE ` + whereSQL + ` ORDER BY updated_at DESC`
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, _ := sqlx.Select[domain.Page](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Page{}
@@ -2345,8 +2314,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 
 		case http.MethodPost:
 			var in domain.Page
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 4<<20, &in) {
 				return
 			}
 			in.Title = strings.TrimSpace(in.Title)
@@ -2401,8 +2369,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 		writeJSON(w, http.StatusOK, map[string]any{"page": pg})
 	case http.MethodPut:
 		var in domain.Page
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 4<<20, &in) {
 			return
 		}
 		wasPublished := pg.IsPublished
@@ -2486,13 +2453,11 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 				"page_size":  perPage,
 			})
 		case http.MethodPost:
-			if err := auth.RequireAdmin(actor); err != nil {
-				writeErrJSON(w, http.StatusForbidden, err.Error())
+			if !requireAdminJSON(w, actor) {
 				return
 			}
 			var in domain.Category
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 16384, &in) {
 				return
 			}
 			in.Name = strings.TrimSpace(in.Name)
@@ -2531,13 +2496,11 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 
 	switch r.Method {
 	case http.MethodPut:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		var in domain.Category
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &in) {
 			return
 		}
 		cleanIcon, ok := sanitizeAdminIconField(in.Icon)
@@ -2560,8 +2523,7 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 		}
 		writeOKJSON(w)
 	case http.MethodDelete:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -2578,8 +2540,7 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "cleanup" && r.Method == http.MethodPost {
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		res, err := s.deps.Store.ExecContext(r.Context(),
@@ -2595,8 +2556,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		return
 	}
 	if rest == "merge" && r.Method == http.MethodPost {
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		var req struct {
@@ -2604,8 +2564,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			SourceIDs []string `json:"source_ids"`
 			TargetID  string   `json:"target_id"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		targetID := strings.TrimSpace(req.TargetID)
@@ -2723,8 +2682,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 				WHERE ` + whereSQL + `
 				GROUP BY t.id, t.name, t.slug, t.created_at
 				ORDER BY ` + orderSQL
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 
 			type adminTagRow struct {
 				ID           string `db:"id" json:"id"`
@@ -2746,13 +2704,11 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 				"page_size": perPage,
 			})
 		case http.MethodPost:
-			if err := auth.RequireAdmin(actor); err != nil {
-				writeErrJSON(w, http.StatusForbidden, err.Error())
+			if !requireAdminJSON(w, actor) {
 				return
 			}
 			var in domain.Tag
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 8192, &in) {
 				return
 			}
 			in.Name = strings.TrimSpace(in.Name)
@@ -2779,16 +2735,14 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		return
 	}
 	if rest == "batch" && r.Method == http.MethodPost {
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		var req struct {
 			Action string   `json:"action"`
 			IDs    []string `json:"ids"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
@@ -2824,13 +2778,11 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 	}
 	switch r.Method {
 	case http.MethodPut:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		var in domain.Tag
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 8192, &in) {
 			return
 		}
 		name := strings.TrimSpace(in.Name)
@@ -2849,8 +2801,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		}
 		writeOKJSON(w)
 	case http.MethodDelete:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -2881,8 +2832,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			var total int
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM series WHERE `+where, args...).Scan(&total)
 			baseSQL := `SELECT * FROM series WHERE ` + where + ` ORDER BY sort_order ASC, created_at DESC`
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			rows, _ := sqlx.Select[domain.Series](r.Context(), s.deps.Store, qSQL, fullArgs...)
 
 			type seriesArticleSummary struct {
@@ -2961,16 +2911,14 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 				"page_size": perPage,
 			})
 		case http.MethodPost:
-			if err := auth.RequireAdmin(actor); err != nil {
-				writeErrJSON(w, http.StatusForbidden, err.Error())
+			if !requireAdminJSON(w, actor) {
 				return
 			}
 			var in struct {
 				domain.Series
 				ArticleIDs []string `json:"article_ids"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 32768, &in) {
 				return
 			}
 			in.Title = strings.TrimSpace(in.Title)
@@ -3024,16 +2972,14 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 
 	switch r.Method {
 	case http.MethodPut:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		var in struct {
 			domain.Series
 			ArticleIDs []string `json:"article_ids"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 32768, &in) {
 			return
 		}
 		cleanCov := ""
@@ -3073,8 +3019,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 		s.invalidateMediaRefCache()
 		writeOKJSON(w)
 	case http.MethodDelete:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -3165,8 +3110,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM books WHERE `+whereSQL, args...).Scan(&total)
 
 			baseSQL := `SELECT * FROM books WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
-			qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-			fullArgs := append(append([]any{}, args...), pageArgs...)
+			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			paged, _ := sqlx.Select[domain.Book](r.Context(), s.deps.Store, qSQL, fullArgs...)
 			if paged == nil {
 				paged = []domain.Book{}
@@ -3180,16 +3124,14 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				"page_size": perPage,
 			})
 		case http.MethodPost:
-			if err := auth.RequireAdmin(actor); err != nil {
-				writeErrJSON(w, http.StatusForbidden, err.Error())
+			if !requireAdminJSON(w, actor) {
 				return
 			}
 			var in struct {
 				domain.Book
 				Chapters []domain.BookChapter `json:"chapters"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&in); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+			if !decodeJSONBody(w, r, 256*1024, &in) {
 				return
 			}
 			in.Title = strings.TrimSpace(in.Title)
@@ -3255,8 +3197,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 	parts := strings.Split(rest, "/")
 	bookID := parts[0]
 	if len(parts) == 2 && parts[1] == "sync" && r.Method == http.MethodPost {
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		cnt, err := s.deps.Content.SyncBookTOC(r.Context(), bookID)
@@ -3280,16 +3221,14 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 		writeJSON(w, http.StatusOK, map[string]any{"book": bk, "chapters": chs})
 
 	case http.MethodPut:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		var in struct {
 			domain.Book
 			Chapters []domain.BookChapter `json:"chapters"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&in); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 256*1024, &in) {
 			return
 		}
 		if err := sanitizeBookURLs(&in.Book, in.Chapters); err != nil {
@@ -3336,8 +3275,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 		writeOKJSON(w)
 
 	case http.MethodDelete:
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -3473,8 +3411,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) `+joinSQL+` WHERE `+whereSQL, args...).Scan(&total)
 
 		baseSQL := `SELECT c.* ` + joinSQL + ` WHERE ` + whereSQL + ` ORDER BY c.created_at DESC`
-		qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
-		fullArgs := append(append([]any{}, args...), pageArgs...)
+		qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 		rows, err := sqlx.Select[domain.Comment](r.Context(), s.deps.Store, qSQL, fullArgs...)
 		if err != nil {
 			writeErrJSON(w, http.StatusInternalServerError, err.Error())
@@ -3571,8 +3508,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			Note         string   `json:"note"`
 			ExpiresHours int      `json:"expires_hours"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(req.Action))
@@ -3586,8 +3522,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		case "delete":
 			action = "delete"
 		case "ban_ip", "ban-ip":
-			if err := auth.RequireAdmin(actor); err != nil {
-				writeErrJSON(w, http.StatusForbidden, err.Error())
+			if !requireAdminJSON(w, actor) {
 				return
 			}
 			action = "ban_ip"
@@ -3614,7 +3549,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			comments = append(comments, cmt)
 		}
 		now := time.Now().UnixMilli()
-		callerIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		callerIP := s.clientIP(r)
 		affected := 0
 		type targetPair struct {
 			tType string
@@ -3700,7 +3635,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			writeErrJSON(w, http.StatusBadRequest, "content_md required")
 			return
 		}
-		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		clientIP := s.clientIP(r)
 		in := s.commentInputFromStaff(actor, cmt, req.ContentMD, clientIP.String())
 		view, _, cErr := s.deps.Content.CreateComment(r.Context(), w, r, actor, in)
 		if cErr != nil {
@@ -3728,8 +3663,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if len(parts) == 2 && parts[1] == "ban-ip" && r.Method == http.MethodPost {
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		targetIP := strings.TrimSpace(cmt.ClientIP)
@@ -3752,7 +3686,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		if req.ExpiresHours > 0 {
 			expMS = time.Now().Add(time.Duration(req.ExpiresHours) * time.Hour).UnixMilli()
 		}
-		callerIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		callerIP := s.clientIP(r)
 		rec, bErr := s.deps.WAF.AddManualBan(r.Context(), targetIP, note, expMS, callerIP)
 		if bErr != nil {
 			writeErrJSON(w, http.StatusBadRequest, bErr.Error())
@@ -3778,8 +3712,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			Status    *string `json:"status"`
 			ContentMD *string `json:"content_md"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 32768, &req) {
 			return
 		}
 		if req.Status == nil && req.ContentMD == nil {
@@ -3884,8 +3817,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	}
 
 	if rest == "reconcile" && r.Method == http.MethodPost {
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		imported := s.reconcileLocalUploads(r.Context())
@@ -3903,8 +3835,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			Action string   `json:"action"`
 			IDs    []string `json:"ids"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
 		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
@@ -3993,8 +3924,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	}
 
 	if rest == "orphans" && r.Method == http.MethodPost {
-		if err := auth.RequireAdmin(actor); err != nil {
-			writeErrJSON(w, http.StatusForbidden, err.Error())
+		if !requireAdminJSON(w, actor) {
 			return
 		}
 		clean := r.URL.Query().Get("delete") == "1" || r.URL.Query().Get("delete") == "true"
@@ -4032,8 +3962,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			OriginalName *string `json:"original_name"`
 			AltText      *string `json:"alt_text"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		if !decodeJSONBody(w, r, 16384, &req) {
 			return
 		}
 		if req.OriginalName != nil {

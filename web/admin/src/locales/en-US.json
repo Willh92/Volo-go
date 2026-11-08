@@ -1641,7 +1641,6 @@
   "audit.act.sec_geo_reload": "Reload GeoIP Databases",
   "sys.doc_geoip_unusable_warn": "No usable regional GeoIP database in {dir} (ignored: {skipped})",
   "sys.geo_db_sub_title": "Offline GeoIP Database Path & Hot-Reload",
-  "sys.geo_dir_label": "Offline GeoIP Directory or File Path (optional)",
   "sys.geo_dir_hint": "Leave blank to use default ({dir}); accepts a directory (auto-ranks MMDB + dual IPv4/IPv6 XDB) or a direct .mmdb / .xdb file path, hot-reloading immediately without server restart.",
   "sys.geo_save_path_btn": "Save Path & Hot-Reload",
   "sys.geo_reload_btn": "Hot-Reload Databases",

@@ -1916,7 +1916,6 @@
   "audit.act.sec_geo_reload": "重載離線 GeoIP 資料庫",
   "sys.doc_geoip_unusable_warn": "路徑 {dir} 中未找到可用的國家/地區 GeoIP 資料庫（已忽略：{skipped}）",
   "sys.geo_db_sub_title": "離線位址庫路徑與熱重載",
-  "sys.geo_dir_label": "離線 GeoIP 資料庫目錄或檔案路徑（選填）",
   "sys.geo_dir_hint": "留空使用預設路徑（{dir}）；支援填寫目錄（自動擇優掛載 MMDB + IPv4/IPv6 XDB）或直接指定單個 .mmdb / .xdb 檔案，儲存或點擊熱重載立即生效，無需重啟服務。",
   "sys.geo_save_path_btn": "儲存路徑並熱重載",
   "sys.geo_reload_btn": "熱重載離線庫",

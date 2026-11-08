@@ -239,14 +239,14 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	})
 	voloObj.setVal("on", nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 		if wrapper.hooksFrozen {
-			return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", "volo.on can only be called during top-level module initialization")}
+			return rt.throwValErr("TypeError", "volo.on can only be called during top-level module initialization")
 		}
 		if len(args) < 2 {
-			return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", "volo.on requires (hookName, handlerFn)")}
+			return rt.throwValErr("TypeError", "volo.on requires (hookName, handlerFn)")
 		}
 		hookName := strings.TrimSpace(args[0].toString())
 		if hookName == "" || args[1].kind != valFunc || args[1].fn == nil {
-			return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", "volo.on requires a non-empty hook name and function handler")}
+			return rt.throwValErr("TypeError", "volo.on requires a non-empty hook name and function handler")
 		}
 		wrapper.hookHandlers[hookName] = append(wrapper.hookHandlers[hookName], args[1].fn)
 		return jsUndefinedVal, nil

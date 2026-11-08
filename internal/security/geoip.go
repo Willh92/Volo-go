@@ -10,8 +10,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
-
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/repo"
@@ -37,11 +35,9 @@ type GeoDBStatus struct {
 // ordered allow/deny rule evaluation, self-lockout protection, and atomic hot-reload support.
 type GeoEngine struct {
 	mu          sync.RWMutex
-	xdbV4Mu     sync.Mutex
-	xdbV6Mu     sync.Mutex
 	mmdbReader  *mmdbReader
-	xdbV4       *xdb.Searcher
-	xdbV6       *xdb.Searcher
+	xdbV4       *xdbReader
+	xdbV6       *xdbReader
 	status      GeoDBStatus
 	rules       []domain.SecurityGeoRule
 	settingsMgr *repo.SettingsManager
@@ -105,7 +101,7 @@ type mmdbCandidate struct {
 
 type xdbCandidate struct {
 	name      string
-	searcher  *xdb.Searcher
+	reader    *xdbReader
 	createdAt uint32
 }
 
@@ -168,7 +164,7 @@ func formatActiveXDBLabel(name, verLabel string) string {
 
 // LoadDatabases scans geoIPPath (either a directory or a direct *.mmdb / *.xdb file) and atomically hot-swaps readers:
 //   - MMDB: ignores non-geographic DBs (such as ASN) and selects the highest-precision / newest DB (GeoIP2-City > GeoLite2-City > Country).
-//   - ip2region XDB: mounts independent IPv4 and IPv6 searchers simultaneously (caching only ~512 KiB vector index per file).
+//   - ip2region XDB: mounts independent IPv4 and IPv6 readers simultaneously (caching only ~512 KiB vector index per file).
 func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 	cleanPath := strings.TrimSpace(geoIPPath)
 	if cleanPath == "" {
@@ -259,55 +255,36 @@ func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 			}
 
 		case strings.HasSuffix(low, ".xdb"):
-			if vErr := xdb.VerifyFromFile(t.path); vErr != nil {
-				skipped = append(skipped, fmt.Sprintf("%s (invalid)", t.name))
-				continue
-			}
-			hdr, hErr := xdb.LoadHeaderFromFile(t.path)
-			if hErr != nil {
-				skipped = append(skipped, fmt.Sprintf("%s (invalid)", t.name))
-				continue
-			}
-			ver, verErr := xdb.VersionFromHeader(hdr)
-			if verErr != nil || (ver.Id != xdb.IPv4VersionNo && ver.Id != xdb.IPv6VersionNo) {
-				skipped = append(skipped, fmt.Sprintf("%s (unsupported)", t.name))
-				continue
-			}
-			vIndex, idxErr := xdb.LoadVectorIndexFromFile(t.path)
-			if idxErr != nil {
-				skipped = append(skipped, fmt.Sprintf("%s (invalid)", t.name))
-				continue
-			}
-			s, sErr := xdb.NewWithVectorIndex(ver, t.path, vIndex)
-			if sErr != nil {
+			xr, xErr := openXDBFile(t.path)
+			if xErr != nil {
 				skipped = append(skipped, fmt.Sprintf("%s (invalid)", t.name))
 				continue
 			}
 			cand := &xdbCandidate{
 				name:      t.name,
-				searcher:  s,
-				createdAt: hdr.CreatedAt,
+				reader:    xr,
+				createdAt: xr.createdAt,
 			}
-			if ver.Id == xdb.IPv4VersionNo {
+			if xr.ipVersion == xdbIPv4Ver {
 				if bestXDB4 == nil || cand.createdAt > bestXDB4.createdAt {
 					if bestXDB4 != nil {
-						bestXDB4.searcher.Close()
+						_ = bestXDB4.reader.Close()
 						skipped = append(skipped, fmt.Sprintf("%s (superseded)", bestXDB4.name))
 					}
 					bestXDB4 = cand
 				} else {
-					s.Close()
+					_ = xr.Close()
 					skipped = append(skipped, fmt.Sprintf("%s (superseded)", t.name))
 				}
 			} else {
 				if bestXDB6 == nil || cand.createdAt > bestXDB6.createdAt {
 					if bestXDB6 != nil {
-						bestXDB6.searcher.Close()
+						_ = bestXDB6.reader.Close()
 						skipped = append(skipped, fmt.Sprintf("%s (superseded)", bestXDB6.name))
 					}
 					bestXDB6 = cand
 				} else {
-					s.Close()
+					_ = xr.Close()
 					skipped = append(skipped, fmt.Sprintf("%s (superseded)", t.name))
 				}
 			}
@@ -316,18 +293,18 @@ func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 
 	active := make([]string, 0, 3)
 	var newMMDB *mmdbReader
-	var newXDB4 *xdb.Searcher
-	var newXDB6 *xdb.Searcher
+	var newXDB4 *xdbReader
+	var newXDB6 *xdbReader
 	if bestMMDB != nil {
 		newMMDB = bestMMDB.reader
 		active = append(active, formatActiveMMDBLabel(bestMMDB.name, bestMMDB.reader.databaseType))
 	}
 	if bestXDB4 != nil {
-		newXDB4 = bestXDB4.searcher
+		newXDB4 = bestXDB4.reader
 		active = append(active, formatActiveXDBLabel(bestXDB4.name, "IPv4"))
 	}
 	if bestXDB6 != nil {
-		newXDB6 = bestXDB6.searcher
+		newXDB6 = bestXDB6.reader
 		active = append(active, formatActiveXDBLabel(bestXDB6.name, "IPv6"))
 	}
 
@@ -335,13 +312,17 @@ func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 	return nil
 }
 
-func (g *GeoEngine) swapDatabases(path string, newMMDB *mmdbReader, newXDB4, newXDB6 *xdb.Searcher, active, skipped []string) {
+func (g *GeoEngine) swapDatabases(path string, newMMDB *mmdbReader, newXDB4, newXDB6 *xdbReader, active, skipped []string) {
 	if active == nil {
 		active = []string{}
 	}
 	g.mu.Lock()
 	oldMMDB := g.mmdbReader
+	oldXDB4 := g.xdbV4
+	oldXDB6 := g.xdbV6
 	g.mmdbReader = newMMDB
+	g.xdbV4 = newXDB4
+	g.xdbV6 = newXDB6
 	g.status = GeoDBStatus{
 		Path:         path,
 		ActiveFiles:  active,
@@ -349,24 +330,14 @@ func (g *GeoEngine) swapDatabases(path string, newMMDB *mmdbReader, newXDB4, new
 	}
 	g.mu.Unlock()
 
-	g.xdbV4Mu.Lock()
-	oldXDB4 := g.xdbV4
-	g.xdbV4 = newXDB4
-	g.xdbV4Mu.Unlock()
-
-	g.xdbV6Mu.Lock()
-	oldXDB6 := g.xdbV6
-	g.xdbV6 = newXDB6
-	g.xdbV6Mu.Unlock()
-
 	if oldMMDB != nil {
 		_ = oldMMDB.Close()
 	}
 	if oldXDB4 != nil {
-		oldXDB4.Close()
+		_ = oldXDB4.Close()
 	}
 	if oldXDB6 != nil {
-		oldXDB6.Close()
+		_ = oldXDB6.Close()
 	}
 }
 
@@ -457,27 +428,17 @@ func (g *GeoEngine) Lookup(addr netip.Addr) (GeoLocation, bool) {
 			}
 		}
 	}
-	g.mu.RUnlock()
 
 	// Cascade into ip2region XDB (IPv4 or IPv6 slot) for fine-grained province/city precision.
-	// Searcher.Search mutates internal ioCount and seeks its underlying file descriptor, so serialize per slot.
+	// xdbReader.lookup uses stateless io.ReaderAt (pread), so RLock allows full concurrency.
 	var raw string
 	var xErr error
-	if u.Is4() {
-		a4 := u.As4()
-		g.xdbV4Mu.Lock()
-		if g.xdbV4 != nil {
-			raw, xErr = g.xdbV4.Search(a4[:])
-		}
-		g.xdbV4Mu.Unlock()
-	} else if u.Is6() {
-		a16 := u.As16()
-		g.xdbV6Mu.Lock()
-		if g.xdbV6 != nil {
-			raw, xErr = g.xdbV6.Search(a16[:])
-		}
-		g.xdbV6Mu.Unlock()
+	if u.Is4() && g.xdbV4 != nil {
+		raw, xErr = g.xdbV4.lookup(u)
+	} else if u.Is6() && g.xdbV6 != nil {
+		raw, xErr = g.xdbV6.lookup(u)
 	}
+	g.mu.RUnlock()
 
 	if xErr == nil && raw != "" {
 		// Standard 5-segment format: Country|Region|Province|City|ISP
@@ -643,7 +604,7 @@ func cleanXDBSeg(s string) string {
 	if s == "0" {
 		return ""
 	}
-	return fmt.Sprint(s)
+	return s
 }
 
 func isASCIIAlpha(b byte) bool {

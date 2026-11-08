@@ -34,7 +34,7 @@ import {
   t,
 } from "./i18n";
 import { BrandLogo } from "./components/BrandLogo";
-import { AnimatedModal, CloseIcon, GlobalConfirmModal, LocalePopover, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
+import { AnimatedModal, CloseIcon, GlobalConfirmModal, LocalePopover, SvgIcon, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
 import { SetupWizard } from "./views/SetupWizard";
 import { LoginView, formatOidcError } from "./views/LoginView";
 import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
@@ -195,80 +195,80 @@ function NavIcon({ name }: { name: string }) {
   switch (name) {
     case "home":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <path d="M3 10.5L12 3l9 7.5" />
           <path d="M5.5 9.5V20h13V9.5" />
-        </svg>
+        </SvgIcon>
       );
     case "posts":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <path d="M12 20h9" />
           <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
-        </svg>
+        </SvgIcon>
       );
     case "comments":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-        </svg>
+        </SvgIcon>
       );
     case "content":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-        </svg>
+        </SvgIcon>
       );
     case "distribute":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <path d="M4 11a9 9 0 0 1 9 9" />
           <path d="M4 4a16 16 0 0 1 16 16" />
           <circle cx="5" cy="19" r="1.5" fill="currentColor" />
-        </svg>
+        </SvgIcon>
       );
     case "appearance":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <circle cx="13.5" cy="6.5" r=".8" fill="currentColor" />
           <circle cx="17.5" cy="10.5" r=".8" fill="currentColor" />
           <circle cx="8.5" cy="7.5" r=".8" fill="currentColor" />
           <circle cx="6.5" cy="12.5" r=".8" fill="currentColor" />
           <path d="M12 2a10 10 0 1 0 0 20 2.5 2.5 0 0 0 2.5-2.5c0-.6-.2-1.1-.6-1.5-.4-.4-.6-.9-.6-1.5A2.5 2.5 0 0 1 15.8 14H17a5 5 0 0 0 5-5c0-3.9-4.5-7-10-7z" />
-        </svg>
+        </SvgIcon>
       );
     case "settings":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <line x1="4" y1="6" x2="20" y2="6" />
           <line x1="4" y1="12" x2="20" y2="12" />
           <line x1="4" y1="18" x2="20" y2="18" />
           <circle cx="9" cy="6" r="2" fill="var(--volo-nav)" />
           <circle cx="15" cy="12" r="2" fill="var(--volo-nav)" />
           <circle cx="10" cy="18" r="2" fill="var(--volo-nav)" />
-        </svg>
+        </SvgIcon>
       );
     case "info":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <circle cx="12" cy="12" r="9.5" />
           <line x1="12" y1="16" x2="12" y2="11.5" />
           <circle cx="12" cy="8" r="0.8" fill="currentColor" />
-        </svg>
+        </SvgIcon>
       );
     case "help":
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <circle cx="12" cy="12" r="9.5" />
           <path d="M9.4 9.2a2.7 2.7 0 0 1 5.1 1c0 1.7-2.5 2.2-2.5 3.6" />
           <circle cx="12" cy="17.2" r="0.8" fill="currentColor" />
-        </svg>
+        </SvgIcon>
       );
     default:
       return (
-        <svg class="volo-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-        </svg>
+        </SvgIcon>
       );
   }
 }
@@ -287,21 +287,21 @@ function ToastBanner() {
     >
       <span class="volo-toast-icon" aria-hidden="true">
         {cur.kind === "err" ? (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <SvgIcon size={14} sw={2.5}>
             <circle cx="12" cy="12" r="9.5" />
             <line x1="12" y1="8" x2="12" y2="12.5" />
             <circle cx="12" cy="16.2" r="0.9" fill="currentColor" stroke="none" />
-          </svg>
+          </SvgIcon>
         ) : cur.kind === "warn" ? (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <SvgIcon size={14} sw={2.5}>
             <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
             <line x1="12" y1="9.2" x2="12" y2="13.5" />
             <circle cx="12" cy="17" r="0.9" fill="currentColor" stroke="none" />
-          </svg>
+          </SvgIcon>
         ) : (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+          <SvgIcon size={14} sw={2.6}>
             <polyline points="20 6 9 17 4 12" />
-          </svg>
+          </SvgIcon>
         )}
       </span>
       <span class="volo-toast-text">{cur.text}</span>
@@ -460,20 +460,10 @@ function CommandPalette({
       variant="spotlight"
     >
       <div class="volo-cmdk-head">
-        <svg
-          viewBox="0 0 24 24"
-          width="17"
-          height="17"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.8"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-        >
+        <SvgIcon size={17} sw={1.8}>
           <circle cx="10.5" cy="10.5" r="6.5" />
           <path d="m15.5 15.5 4.5 4.5" />
-        </svg>
+        </SvgIcon>
         <input
           ref={inputRef}
           class="volo-cmdk-input"
@@ -971,11 +961,11 @@ function App() {
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
               aria-label={t("shell.console_title")}
             >
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <SvgIcon size={17} sw={2}>
                 <line x1="4" y1="7" x2="20" y2="7" />
                 <line x1="4" y1="12" x2="20" y2="12" />
                 <line x1="4" y1="17" x2="20" y2="17" />
-              </svg>
+              </SvgIcon>
             </button>
             <div style={{ minWidth: 0 }}>
               <div class="volo-eyebrow">{t("shell.eyebrow")}</div>
@@ -991,10 +981,10 @@ function App() {
               title={`${t("ui.cmdk_title")} (${typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent) ? "⌘K" : "Ctrl+K"})`}
               onClick={() => setCmdkOpen(true)}
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <SvgIcon size={14} sw={2}>
                 <circle cx="11" cy="11" r="7.5" />
                 <line x1="20.5" y1="20.5" x2="16.4" y2="16.4" />
-              </svg>
+              </SvgIcon>
               <span class="volo-pill-label">{t("ui.cmdk_btn")}</span>
               <kbd class="volo-pill-label volo-cmdk-kbd">
                 {typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent) ? "⌘K" : "Ctrl K"}
@@ -1012,14 +1002,14 @@ function App() {
                 onClick={toggleAppearance}
               >
                 {isDark ? (
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <SvgIcon size={15}>
                     <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" />
-                  </svg>
+                  </SvgIcon>
                 ) : (
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <SvgIcon size={15}>
                     <circle cx="12" cy="12" r="4.5" />
                     <path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6" />
-                  </svg>
+                  </SvgIcon>
                 )}
                 <span class="volo-swatch-dot" style={{ background: activeSwatch, width: "12px", height: "12px" }} />
               </button>
@@ -1043,13 +1033,13 @@ function App() {
                         >
                           <span class="volo-mode-icon" aria-hidden="true">
                             {m === "auto" ? (
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+                              <SvgIcon size={14}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></SvgIcon>
                             ) : m === "system" ? (
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+                              <SvgIcon size={14}><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></SvgIcon>
                             ) : m === "light" ? (
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6"/></svg>
+                              <SvgIcon size={14}><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.2M12 19.8V22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2 12h2.2M19.8 12H22M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6"/></SvgIcon>
                             ) : (
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+                              <SvgIcon size={14}><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></SvgIcon>
                             )}
                           </span>
                           <span class="volo-mode-copy">
@@ -1149,11 +1139,11 @@ function App() {
                 csrfTokenSig.value = "";
               }}
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <SvgIcon size={16}>
                 <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
                 <polyline points="16 17 21 12 16 7" />
                 <line x1="21" y1="12" x2="9" y2="12" />
-              </svg>
+              </SvgIcon>
             </button>
           </div>
         </header>

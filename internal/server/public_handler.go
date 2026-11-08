@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -814,6 +816,61 @@ func writeOKJSON(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("{\"ok\":true}\n"))
 }
 
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) bool {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes)).Decode(dst); err != nil {
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		return false
+	}
+	return true
+}
+
+func decodeOptJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) bool {
+	if r.Body == nil {
+		return true
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes)).Decode(dst); err != nil && !errors.Is(err, io.EOF) {
+		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+		return false
+	}
+	return true
+}
+
+func requireAdminJSON(w http.ResponseWriter, actor *domain.User) bool {
+	if err := auth.RequireAdmin(actor); err != nil {
+		writeErrJSON(w, http.StatusForbidden, err.Error())
+		return false
+	}
+	return true
+}
+
+func (s *AppServer) clientIP(r *http.Request) netip.Addr {
+	return security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+}
+
+func (s *AppServer) requireSameOriginPost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return false
+	}
+	return s.requireSameOrigin(w, r)
+}
+
+func (s *AppServer) requireSetupUnlocked(w http.ResponseWriter, r *http.Request) bool {
+	if !s.isSetupUnlocked(r.Context()) {
+		http.NotFound(w, r)
+		return false
+	}
+	return true
+}
+
+func (s *AppServer) paginateQuery(baseSQL string, args []any, page, perPage int) (string, []any) {
+	qSQL, pageArgs := s.deps.Store.Dialect().PaginateSQL(baseSQL, perPage, (page-1)*perPage)
+	out := make([]any, 0, len(args)+len(pageArgs))
+	out = append(out, args...)
+	out = append(out, pageArgs...)
+	return qSQL, out
+}
+
 func (s *AppServer) handlePublicI18nAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -925,7 +982,7 @@ func (s *AppServer) handleSearchAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	locale := s.resolveLocale(r)
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("public_search", clientIP, 60, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
@@ -966,7 +1023,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	}
 	locale := s.resolveLocale(r)
 	targetID := strings.TrimSpace(parts[0])
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("unlock:"+targetID, clientIP, 10, 5*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
@@ -1120,7 +1177,7 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			return
 		}
 		locale := s.resolveLocale(r)
-		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		clientIP := s.clientIP(r)
 		if !s.deps.WAF.AllowRate("comment_post", clientIP, 12, time.Minute) {
 			writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 			return
@@ -1251,15 +1308,11 @@ func (s *AppServer) isPubliclyReactableTarget(ctx context.Context, targetType st
 }
 
 func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.requireSameOrigin(w, r) {
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
 	locale := s.resolveLocale(r)
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("public_reactions", clientIP, 40, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
@@ -1302,11 +1355,7 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 // --- Isolated Reader Auth & One-Click Historical Guest Comment Claim ---
 
 func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.requireSameOrigin(w, r) {
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
 	locale := s.resolveLocale(r)
@@ -1314,7 +1363,7 @@ func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request)
 		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "reader.err_reg_disabled"))
 		return
 	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("reader_code", clientIP, 5, 10*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
@@ -1351,11 +1400,7 @@ func sanitizeReaderNextTarget(raw string) string {
 }
 
 func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.requireSameOrigin(w, r) {
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
 	locale := s.resolveLocale(r)
@@ -1363,7 +1408,7 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "reader.err_reg_disabled"))
 		return
 	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("reader_register", clientIP, 8, 10*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
@@ -1405,15 +1450,11 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.requireSameOrigin(w, r) {
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
 	locale := s.resolveLocale(r)
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("reader_login", clientIP, 10, 5*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
@@ -1449,11 +1490,7 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.requireSameOrigin(w, r) {
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
 	viewer, sess := s.resolveViewer(r)
@@ -1473,11 +1510,7 @@ func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleReaderClaimComments(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.requireSameOrigin(w, r) {
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
 	locale := s.resolveLocale(r)
@@ -2023,7 +2056,7 @@ func (s *AppServer) recordPageView(r *http.Request, targetType string, targetID 
 	if gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
 		actorFP = gp.GuestIDHash
 	} else {
-		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		clientIP := s.clientIP(r)
 		actorFP = guest.ComputeEnvFPHash(s.deps.Config.KeyRing, clientIP.String()+"|"+r.UserAgent())
 	}
 	refHost := ""
@@ -2565,7 +2598,7 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 						http.Error(w, "403 Forbidden", http.StatusForbidden)
 						return
 					}
-					clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+					clientIP := s.clientIP(r)
 					if !s.deps.WAF.AllowRate("article_unlock", clientIP, 12, 5*time.Minute) {
 						pctx.BookUnlockError = s.deps.Catalog.T(pctx.Locale, "error.rate_limited")
 					} else {
@@ -2852,7 +2885,7 @@ func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request)
 		if formNext := sanitizeReaderNextTarget(r.FormValue("next")); formNext != "" {
 			safeNext = formNext
 		}
-		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		clientIP := s.clientIP(r)
 		var geo string
 		if loc, ok := s.deps.Geo.Lookup(clientIP); ok {
 			geo = loc.Region

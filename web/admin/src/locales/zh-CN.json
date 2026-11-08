@@ -1641,7 +1641,6 @@
   "audit.act.sec_geo_reload": "重载离线 GeoIP 库",
   "sys.doc_geoip_unusable_warn": "路径 {dir} 中未找到可用的国家/地区 GeoIP 库（已忽略：{skipped}）",
   "sys.geo_db_sub_title": "离线地址库路径与热重载",
-  "sys.geo_dir_label": "离线 GeoIP 库目录或文件路径（选填）",
   "sys.geo_dir_hint": "留空使用默认路径（{dir}）；支持填写目录（自动择优挂载 MMDB + IPv4/IPv6 XDB）或直接指定单个 .mmdb / .xdb 文件，保存或点击热重载立即生效，无需重启服务。",
   "sys.geo_save_path_btn": "保存路径并热重载",
   "sys.geo_reload_btn": "热重载离线库",

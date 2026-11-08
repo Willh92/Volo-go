@@ -21,7 +21,6 @@ Binary distributions and container images of `Volo-go` incorporate the following
 | `github.com/microcosm-cc/bluemonday` | BSD-3-Clause | Strict HTML allowlist sanitizer (XSS defense) | https://github.com/microcosm-cc/bluemonday |
 | `github.com/dop251/goja` | MIT | Pure-Go ECMAScript 5.1+ embedded plugin VM | https://github.com/dop251/goja |
 | `github.com/Gen2Brain/webp` / `github.com/HugoSmits86/nativewebp` | MIT | Pure-Go WebP encoder/decoder | https://github.com/HugoSmits86/nativewebp |
-| `github.com/lionsoul2014/ip2region/binding/golang` | Apache-2.0 | Offline `ip2region.xdb` vector-indexed reader | https://github.com/lionsoul2014/ip2region |
 | `golang.org/x/crypto` | BSD-3-Clause | `Argon2id` & `PBKDF2` cryptographic primitives | https://cs.opensource.google/go/x/crypto |
 | `golang.org/x/image` | BSD-3-Clause | Pure-Go image decoding & scaling | https://cs.opensource.google/go/x/image |
 | `golang.org/x/net` | BSD-3-Clause | HTML5 tokenizer & network utilities | https://cs.opensource.google/go/x/net |

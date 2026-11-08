@@ -24,7 +24,6 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/etl"
-	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
@@ -696,8 +695,7 @@ func (s *AppServer) registerSetupRoutes(mux *http.ServeMux) {
 }
 
 func (s *AppServer) handleSetupSPA(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 	snap := s.deps.Settings.Snapshot()
@@ -714,8 +712,7 @@ func (s *AppServer) handleSetupSPA(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -735,18 +732,13 @@ func (s *AppServer) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("setup:testdb", clientIP, 15, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -757,15 +749,13 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 		DSN            string `json:"dsn"`
 		SimpleProtocol bool   `json:"simple_protocol"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 16384, &req) {
 		return
 	}
 
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 
@@ -804,18 +794,13 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("setup:configdb", clientIP, 10, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -826,15 +811,13 @@ func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Reques
 		DSN            string `json:"dsn"`
 		SimpleProtocol *bool  `json:"simple_protocol"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 16384, &req) {
 		return
 	}
 
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 
@@ -854,18 +837,13 @@ func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("setup:import", clientIP, 15, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -881,8 +859,7 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 
@@ -944,18 +921,13 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("setup:complete", clientIP, 10, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -979,8 +951,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		AdminDisplayName string `json:"admin_display_name"`
 		AdminPassword    string `json:"admin_password"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 32768, &req) {
 		return
 	}
 
@@ -1006,8 +977,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 
@@ -1561,18 +1531,13 @@ func isSameSetupAndSourceDB(targetDriver, targetDSN, sourceDriver, sourceDSN str
 }
 
 func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("setup:testlegacydb", clientIP, 15, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -1584,8 +1549,7 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 		SourceSimpleProtocol bool   `json:"source_simple_protocol"`
 		SourceTablePrefix    string `json:"source_table_prefix"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 16384, &req) {
 		return
 	}
 	pfx, err := validateSourceTablePrefix(req.SourceTablePrefix)
@@ -1596,8 +1560,7 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 
@@ -1633,18 +1596,13 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request) {
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !s.requireSameOriginPost(w, r) {
 		return
 	}
-	if !s.requireSameOrigin(w, r) {
-		return
-	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("setup:migratedb", clientIP, 10, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -1675,8 +1633,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		AdminPassword        string `json:"admin_password"`
 		DryRun               bool   `json:"dry_run"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSONBody(w, r, 32768, &req) {
 		return
 	}
 
@@ -1726,8 +1683,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
-	if !s.isSetupUnlocked(r.Context()) {
-		http.NotFound(w, r)
+	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
 

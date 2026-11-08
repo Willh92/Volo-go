@@ -6,7 +6,6 @@ require (
 	github.com/HugoSmits86/nativewebp v1.3.0
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/jackc/pgx/v5 v5.12.0
-	github.com/lionsoul2014/ip2region/binding/golang v0.0.0-20261028042204-6a276cc7c4f9
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/yuin/goldmark v1.8.7
 	golang.org/x/crypto v0.58.0

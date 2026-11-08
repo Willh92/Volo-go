@@ -35,7 +35,7 @@ function compactLocalesPlugin(): Plugin {
       const codes = tables.map((t) => t.code);
       let prevKey = "";
       const packedKeys = keys.map((k) => {
-        if (k.includes("\t")) throw new Error(`Locale key must not contain TAB: ${k}`);
+        if (k.includes("~")) throw new Error(`Locale key must not contain ~: ${k}`);
         let shared = 0;
         while (shared < prevKey.length && shared < k.length && prevKey[shared] === k[shared] && shared < 35) {
           shared++;
@@ -47,10 +47,10 @@ function compactLocalesPlugin(): Plugin {
       const columns = tables.map((t, ti) =>
         keys.map((k, ki) => {
           const v = t.dict[k] ?? "";
-          if (v.includes("\t") || v === "\x01") {
-            throw new Error(`Locale value must not contain TAB or SOH: ${k}`);
+          if (v.includes("~") || v === "^") {
+            throw new Error(`Locale value must not contain ~ or equal ^: ${k}`);
           }
-          if (ti > 0 && v !== "" && v === baseCol[ki]) return "\x01";
+          if (ti > 0 && v !== "" && v === baseCol[ki]) return "^";
           return v;
         }),
       );
@@ -58,11 +58,11 @@ function compactLocalesPlugin(): Plugin {
       return (
         `export const codes = ${JSON.stringify(codes)};\n` +
         `let _p = "";\n` +
-        `export const keys = ${JSON.stringify(packedKeys.join("\t"))}.split("\\t").map((s) => (_p = _p.slice(0, parseInt(s[0], 36)) + s.slice(1)));\n` +
-        `const _c0 = ${JSON.stringify((columns[0] || []).join("\t"))}.split("\\t");\n` +
+        `export const keys = ${JSON.stringify(packedKeys.join("~"))}.split("~").map((s) => (_p = _p.slice(0, parseInt(s[0], 36)) + s.slice(1)));\n` +
+        `const _c0 = ${JSON.stringify((columns[0] || []).join("~"))}.split("~");\n` +
         `export const columns = [_c0,${columns
           .slice(1)
-          .map((c) => `${JSON.stringify(c.join("\t"))}.split("\\t").map((v,i)=>v==="\\x01"?_c0[i]:v)`)
+          .map((c) => `${JSON.stringify(c.join("~"))}.split("~").map((v,i)=>v==="^"?_c0[i]:v)`)
           .join(",")}];\n`
       );
     },
