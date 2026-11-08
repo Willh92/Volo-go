@@ -1039,7 +1039,7 @@
   "ui.confirm_title": "Confirm Action",
   "ui.confirm_ok": "Confirm",
   "ui.cmdk_title": "Quick Jump & Commands",
-  "ui.cmdk_ph": "Search sections, posts, or actions…",
+  "ui.cmdk_ph": "Search modules, posts, or actions…",
   "ui.cmdk_btn": "Search",
   "ui.unsaved_title": "Unsaved Changes",
   "ui.unsaved_msg": "You have unsaved changes in the editor. Leave and discard them?",

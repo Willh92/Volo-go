@@ -10,8 +10,8 @@
     {{if or .Books .TagQuery}}
       <div class="studio-tax-toolbar">
         <form class="studio-tax-search" method="get" action="/books">
-          <input class="volo-input studio-tax-search__input js-book-filter-input" type="search" name="q" value="{{.TagQuery}}" placeholder="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}" autocomplete="off">
-          <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{t .Locale "nav.search_placeholder"}}">↵</button>
+          <input class="volo-input studio-tax-search__input js-book-filter-input" type="search" name="q" value="{{.TagQuery}}" placeholder="{{t .Locale "bookshelf.search_placeholder"}}" aria-label="{{t .Locale "bookshelf.search_placeholder"}}" autocomplete="off">
+          <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{t .Locale "bookshelf.search_placeholder"}}">↵</button>
         </form>
       </div>
     {{end}}

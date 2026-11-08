@@ -12,7 +12,7 @@
   "nav.links": "Links",
   "nav.follows": "Following",
   "nav.more": "More",
-  "nav.search_placeholder": "Search titles, tags, or public content… (Ctrl + K)",
+  "nav.search_placeholder": "Search titles, tags, or content…",
   "nav.admin_console": "Console",
   "nav.login": "Sign In",
   "nav.logout": "Sign Out",
@@ -58,6 +58,7 @@
   "podcast.subscribe_rss": "Podcast RSS",
 
   "bookshelf.title": "Bookshelf",
+  "bookshelf.search_placeholder": "Search books, slugs, or descriptions…",
   "bookshelf.open_reader": "Open Reader",
   "bookshelf.chapters": "{count} chapters",
   "bookshelf.prev_chapter": "Previous Chapter",

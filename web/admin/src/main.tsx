@@ -477,7 +477,9 @@ function CommandPalette({
         <input
           ref={inputRef}
           class="volo-cmdk-input"
-          type="search"
+          type="text"
+          inputMode="search"
+          enterKeyHint="go"
           autoComplete="off"
           placeholder={t("ui.cmdk_ph")}
           value={q}
@@ -497,6 +499,19 @@ function CommandPalette({
             }
           }}
         />
+        {q && (
+          <button
+            type="button"
+            class="volo-cmdk-clear"
+            aria-label={t("ui.batch_clear")}
+            onClick={() => {
+              setQ("");
+              inputRef.current?.focus();
+            }}
+          >
+            ×
+          </button>
+        )}
         <button type="button" class="volo-cmdk-esc" onClick={onClose}>
           ESC
         </button>

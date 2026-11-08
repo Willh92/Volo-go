@@ -1039,7 +1039,7 @@
   "ui.confirm_title": "请确认操作",
   "ui.confirm_ok": "确认执行",
   "ui.cmdk_title": "快速跳转与命令",
-  "ui.cmdk_ph": "输入模块名称、文章标题或快捷操作…",
+  "ui.cmdk_ph": "搜索模块、文章或快捷操作…",
   "ui.cmdk_btn": "搜索",
   "ui.unsaved_title": "未保存的内容更改",
   "ui.unsaved_msg": "当前编辑器有尚未保存的内容，确定离开并丢弃未保存更改吗？",

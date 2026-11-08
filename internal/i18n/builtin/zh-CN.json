@@ -12,7 +12,7 @@
   "nav.links": "友链",
   "nav.follows": "订阅",
   "nav.more": "更多",
-  "nav.search_placeholder": "搜索文章标题、标签或公开正文… (Ctrl + K)",
+  "nav.search_placeholder": "搜索文章标题、标签或正文…",
   "nav.admin_console": "管理后台",
   "nav.login": "读者登录",
   "nav.logout": "退出登录",
@@ -58,6 +58,7 @@
   "podcast.subscribe_rss": "订阅播客 RSS",
 
   "bookshelf.title": "在线书架",
+  "bookshelf.search_placeholder": "搜索书名、别名或简介…",
   "bookshelf.open_reader": "展开站内阅读",
   "bookshelf.chapters": "共 {count} 节",
   "bookshelf.prev_chapter": "上一节",
