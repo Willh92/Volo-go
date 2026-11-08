@@ -97,7 +97,10 @@ func (s *AppServer) resolveBackupDir() string {
 	return "backups"
 }
 
-func (s *AppServer) mintBackupExportTicket(actorID string) (string, error) {
+func (s *AppServer) mintBackupExportTicket(userID string, sessionID string, ipBucket string) (string, error) {
+	if strings.TrimSpace(userID) == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(ipBucket) == "" {
+		return "", errors.New("interactive admin session required for backup ticket")
+	}
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", err
@@ -115,15 +118,25 @@ func (s *AppServer) mintBackupExportTicket(actorID string) (string, error) {
 		}
 	}
 	s.backupTickets[tok] = backupExportTicket{
-		ActorID:   actorID,
+		UserID:    userID,
+		SessionID: sessionID,
+		IPBucket:  ipBucket,
 		ExpiresAt: now.Add(60 * time.Second),
 	}
 	return tok, nil
 }
 
-func (s *AppServer) consumeBackupExportTicket(ctx context.Context, rawTicket string) (*domain.User, bool) {
+func (s *AppServer) consumeBackupExportTicket(r *http.Request, rawTicket string) (*domain.User, bool) {
 	tok := strings.TrimSpace(rawTicket)
 	if len(tok) != 64 || s.deps.Store == nil {
+		return nil, false
+	}
+	viewer, sess := s.resolveViewer(r)
+	if viewer == nil || sess == nil || sess.ID == "" || viewer.Status != domain.UserStatusActive || viewer.Role != domain.RoleAdmin {
+		return nil, false
+	}
+	ipBucket := security.RateLimitBucketKey(security.ResolveClientIP(r, s.deps.Config.TrustedProxies))
+	if ipBucket == "" {
 		return nil, false
 	}
 	now := time.Now()
@@ -138,12 +151,15 @@ func (s *AppServer) consumeBackupExportTicket(ctx context.Context, rawTicket str
 		delete(s.backupTickets, tok)
 	}
 	s.backupTicketMu.Unlock()
-	if !exists || now.After(entry.ExpiresAt) || entry.ActorID == "" {
+	if !exists || now.After(entry.ExpiresAt) {
 		return nil, false
 	}
-	u, err := sqlx.Get[domain.User](ctx, s.deps.Store,
+	if entry.UserID != viewer.ID || entry.SessionID != sess.ID || entry.IPBucket != ipBucket {
+		return nil, false
+	}
+	u, err := sqlx.Get[domain.User](r.Context(), s.deps.Store,
 		`SELECT * FROM users WHERE id = ? AND status = ? AND role = ?`,
-		entry.ActorID, domain.UserStatusActive, domain.RoleAdmin)
+		entry.UserID, domain.UserStatusActive, domain.RoleAdmin)
 	if err != nil {
 		return nil, false
 	}
@@ -185,13 +201,13 @@ func sanitizeRedirectTargetURL(raw string) (string, bool) {
 // SECURITY RED-LINE: All System, Settings, Appearance/Plugins, Users, WAF/GeoIP, and Backup routes
 // require `RoleAdmin` (`Editor` physically receives `403 Forbidden`)!
 func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Request, sub string) {
-	if sub == "backup/export" || sub == "backups/export" {
+	if sub == "backup/export" || sub == "backups/export" || sub == "backup/download" || sub == "backups/download" {
 		if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
 			if r.Method != http.MethodGet && r.Method != http.MethodPost {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
-			actor, ok := s.consumeBackupExportTicket(r.Context(), ticket)
+			actor, ok := s.consumeBackupExportTicket(r, ticket)
 			if !ok {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired backup export ticket"})
 				return
@@ -207,7 +223,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	actor, _, ok := s.authenticateAdminRequest(w, r, "", true)
+	actor, sess, ok := s.authenticateAdminRequest(w, r, "", true)
 	if !ok {
 		return
 	}
@@ -383,17 +399,40 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		})
 
 	case (sub == "backup/ticket" || sub == "backups/ticket") && r.Method == http.MethodPost:
-		tok, err := s.mintBackupExportTicket(actor.ID)
+		if sess == nil || sess.ID == "" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			return
+		}
+		var req struct {
+			CurrentPassword string `json:"current_password"`
+			IncludeMedia    bool   `json:"include_media"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				return
+			}
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
+			return
+		}
+		ipBucket := security.RateLimitBucketKey(security.ResolveClientIP(r, s.deps.Config.TrustedProxies))
+		tok, err := s.mintBackupExportTicket(actor.ID, sess.ID, ipBucket)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		s.recordAuditLog(r, actor, "backup.export_ticket", "system", "ticket", nil)
+		mediaQuery := ""
+		if req.IncludeMedia {
+			mediaQuery = "&media=1"
+		}
+		s.recordAuditLog(r, actor, "backup.export_ticket", "system", "ticket", map[string]any{"include_media": req.IncludeMedia})
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"ticket":     tok,
-			"expires_in": 60,
-			"export_url": "/api/admin/backups/export?ticket=" + tok,
+			"ok":           true,
+			"ticket":       tok,
+			"expires_in":   60,
+			"export_url":   "/api/admin/backups/export?ticket=" + tok + mediaQuery,
+			"download_url": "/api/admin/backups/download?ticket=" + tok + mediaQuery,
 		})
 
 	case sub == "backup/local" || strings.HasPrefix(sub, "backup/local/"):
@@ -413,9 +452,9 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		}
 		if !dryRun {
 			if newSiteURL != "" {
-				s.deps.Config.PublicURL = strings.TrimRight(newSiteURL, "/")
+				s.deps.Config.SetPublicURL(strings.TrimRight(newSiteURL, "/"))
 				if s.deps.WAF != nil {
-					s.deps.WAF.SetPublicURL(s.deps.Config.PublicURL)
+					s.deps.WAF.SetPublicURL(s.deps.Config.GetPublicURL())
 				}
 			}
 			s.reloadRuntimeAfterDBRestore(r.Context())
@@ -430,6 +469,84 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request, actor *domain.User, sess *domain.UserSession, rest string) {
+	rest = strings.TrimPrefix(rest, "/")
+	if rest == "" {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		type oidcLinkDTO struct {
+			ID           string `db:"id" json:"id"`
+			Name         string `db:"name" json:"name"`
+			CredentialID string `db:"credential_id" json:"credential_id"`
+			CreatedAt    int64  `db:"created_at" json:"created_at"`
+			LastUsedAt   int64  `db:"last_used_at" json:"last_used_at"`
+		}
+		rows, _ := sqlx.Select[oidcLinkDTO](r.Context(), s.deps.Store,
+			`SELECT id, name, credential_id, created_at, last_used_at
+			 FROM user_credentials WHERE user_id = ? AND kind = 'oidc' ORDER BY created_at DESC`,
+			actor.ID)
+		if rows == nil {
+			rows = []oidcLinkDTO{}
+		}
+		providers := make([]map[string]string, 0)
+		if s.deps.Plugins != nil {
+			loc := s.resolveLocale(r)
+			for _, p := range s.deps.Plugins.Providers().OIDCProviders() {
+				disp := strings.TrimSpace(p.DisplayName(loc))
+				if disp == "" {
+					disp = p.Name()
+				}
+				providers = append(providers, map[string]string{
+					"name":         p.Name(),
+					"display_name": disp,
+				})
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":     rows,
+			"providers": providers,
+		})
+		return
+	}
+
+	if r.Method == http.MethodDelete {
+		if sess == nil || sess.ID == "" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			return
+		}
+		var req struct {
+			CurrentPassword string `json:"current_password"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				return
+			}
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
+			return
+		}
+		res, err := s.deps.Store.ExecContext(r.Context(),
+			`DELETE FROM user_credentials WHERE id = ? AND user_id = ? AND kind = 'oidc'`,
+			rest, actor.ID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "oidc link not found"})
+			return
+		}
+		s.recordAuditLog(r, actor, "security.oidc_unlink", "user_credential", rest, nil)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+
+	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *domain.User, rest string) {
@@ -449,6 +566,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 				return
 			}
 			in.ID = id.Next()
+			in.ParentID = strings.TrimSpace(in.ParentID)
 			in.Title = strings.TrimSpace(in.Title)
 			cleanURL, urlOK := repo.SanitizeAllowedURL(in.URL, true)
 			if in.Title == "" || !urlOK || cleanURL == "" {
@@ -465,6 +583,14 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			if strings.TrimSpace(in.I18nTitlesJSON) == "" {
 				in.I18nTitlesJSON = "{}"
 			}
+			if in.SortOrder <= 0 {
+				_ = s.deps.Store.QueryRowContext(r.Context(),
+					`SELECT COALESCE(MAX(sort_order), 0) + 1 FROM nav_items WHERE parent_id = ?`,
+					in.ParentID).Scan(&in.SortOrder)
+				if in.SortOrder <= 0 {
+					in.SortOrder = 1
+				}
+			}
 			now := time.Now().UnixMilli()
 			in.CreatedAt = now
 			in.UpdatedAt = now
@@ -476,6 +602,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
+			s.invalidateMediaRefCache()
 			writeJSON(w, http.StatusCreated, map[string]any{"item": in})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -2722,6 +2849,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			Role            *string `json:"role"`
 			Status          *string `json:"status"`
 			Password        string  `json:"password"`
+			CurrentPassword string  `json:"current_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -2735,6 +2863,12 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		if rest == actor.ID && ((req.Status != nil && *req.Status != domain.UserStatusActive) || (req.Role != nil && *req.Role != domain.RoleAdmin)) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot demote or disable your own admin account"})
 			return
+		}
+		emailChanged := req.Email != nil && strings.TrimSpace(*req.Email) != "" && !strings.EqualFold(strings.TrimSpace(*req.Email), u.Email)
+		if rest == actor.ID && (emailChanged || req.Password != "") {
+			if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
+				return
+			}
 		}
 		if req.DisplayName != nil && strings.TrimSpace(*req.DisplayName) != "" {
 			u.DisplayName = strings.TrimSpace(*req.DisplayName)
@@ -2768,7 +2902,15 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		}
 		if u.Status == domain.UserStatusDisabled || req.Password != "" {
 			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM user_sessions WHERE user_id = ?`, rest)
+			_ = s.deps.Auth.RevokeUserAPITokens(r.Context(), rest)
 		}
+		s.recordAuditLog(r, actor, "user.update", "user", rest, map[string]any{
+			"role":             u.Role,
+			"status":           u.Status,
+			"self":             rest == actor.ID,
+			"email_changed":    emailChanged,
+			"password_changed": req.Password != "",
+		})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case http.MethodDelete:
@@ -2779,6 +2921,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			_, err := tx.ExecContext(r.Context(), `DELETE FROM users WHERE id = ?`, rest)
 			return err
 		})
+		s.recordAuditLog(r, actor, "user.delete", "user", rest, nil)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	default:
@@ -3039,7 +3182,8 @@ func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	withMedia := r.URL.Query().Get("media") == "1" || r.URL.Query().Get("media") == "true"
+	withMedia := r.URL.Query().Get("media") == "1" || r.URL.Query().Get("media") == "true" ||
+		r.URL.Query().Get("include_media") == "1" || r.URL.Query().Get("include_media") == "true"
 	filename := fmt.Sprintf("volo-backup-%s.zip", time.Now().UTC().Format("20060102-150405"))
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
@@ -3091,13 +3235,17 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, map[string]any{"items": s.listLocalBackups(backupDir)})
 		case http.MethodPost:
-			sched := backup.NewScheduler(backup.SchedulerOptions{
-				Store:          s.deps.Store,
-				Settings:       s.deps.Settings,
-				BackupDir:      backupDir,
-				UploadDir:      s.deps.Config.UploadDir,
-				OutboundDialer: s.deps.OutboundDialer,
-			})
+			sched := s.deps.BackupScheduler
+			if sched == nil {
+				sched = backup.NewScheduler(backup.SchedulerOptions{
+					Store:          s.deps.Store,
+					Settings:       s.deps.Settings,
+					Plugins:        s.deps.Plugins,
+					BackupDir:      backupDir,
+					UploadDir:      s.deps.Config.UploadDir,
+					OutboundDialer: s.deps.OutboundDialer,
+				})
+			}
 			res, err := sched.RunOnce(r.Context())
 			if err != nil && (res == nil || res.LocalPath == "") {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -3253,6 +3401,15 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 		dryRunRaw = strings.TrimSpace(r.URL.Query().Get("dry_run"))
 	}
 	dryRun, _ := strconv.ParseBool(dryRunRaw)
+	if !dryRun {
+		curPwd := uploaded.FormFields["current_password"]
+		if strings.TrimSpace(curPwd) == "" {
+			curPwd = r.URL.Query().Get("current_password")
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, curPwd) {
+			return
+		}
+	}
 	if isLegacyArchiveFile(tmpPath) {
 		rep, lErr := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, etl.ImportOptions{
 			DryRun:          dryRun,

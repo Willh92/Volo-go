@@ -20,6 +20,7 @@ import {
   resetConsoleScroll,
   resumeToast,
   saveGlobalAccent,
+  showToast,
   themeModeSig,
   toastSig,
   toggleEffectiveTheme,
@@ -35,7 +36,7 @@ import {
 import { BrandLogo } from "./components/BrandLogo";
 import { AnimatedModal, GlobalConfirmModal, LocalePopover, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
 import { SetupWizard } from "./views/SetupWizard";
-import { LoginView } from "./views/LoginView";
+import { LoginView, formatOidcError } from "./views/LoginView";
 import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
 import { ContentSubTab, ContentWorkspace } from "./views/ContentWorkspace";
 import { DistTab, DistributeWorkspace } from "./views/DistributeWorkspace";
@@ -392,9 +393,21 @@ function CommandPalette({
         title: p.title,
         sub: `/posts/${p.slug}`,
         run: () => {
-          sessionStorage.setItem("volo_jump_article_id", p.id);
-          onNavigate("editor");
-          window.dispatchEvent(new CustomEvent("volo:edit-article", { detail: p.id }));
+          void (async () => {
+            if (dirtyEditorSig.value) {
+              const ok = await openConfirm({
+                title: t("ui.unsaved_title"),
+                message: t("ui.unsaved_msg"),
+                confirmText: t("ui.unsaved_leave"),
+                danger: true,
+              });
+              if (!ok) return;
+              dirtyEditorSig.value = false;
+            }
+            sessionStorage.setItem("volo_jump_article_id", p.id);
+            onNavigate("editor");
+            window.dispatchEvent(new CustomEvent("volo:edit-article", { detail: p.id }));
+          })();
         },
       });
     }
@@ -503,6 +516,21 @@ function App() {
       ...(p ? { [p]: true } : {}),
     };
   });
+  const [bootAuthParams] = useState<{ challengeToken: string; oidcError: string }>(() => {
+    if (typeof window === "undefined") return { challengeToken: "", oidcError: "" };
+    const params = new URLSearchParams(window.location.search);
+    const ct = (params.get("challenge_token") || "").trim();
+    const oe = (params.get("oidc_error") || "").trim();
+    if (ct || oe) {
+      params.delete("challenge_token");
+      params.delete("oidc_error");
+      const qs = params.toString();
+      const cleanUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`;
+      window.history.replaceState({}, "", cleanUrl);
+    }
+    return { challengeToken: ct, oidcError: oe };
+  });
+  const oidcBindToastShownRef = useRef(false);
   const [appearanceOpen, setAppearanceOpen] = useState<boolean>(false);
   const [appearanceClosing, setAppearanceClosing] = useState<boolean>(false);
   const [appearanceStyle, setAppearanceStyle] = useState<CSSProperties>({});
@@ -528,7 +556,8 @@ function App() {
   const updateAppearancePos = () => {
     if (!appBtnRef.current) return;
     const rect = appBtnRef.current.getBoundingClientRect();
-    setAppearanceStyle(computePortalMenuStyle(rect, { minW: 256, maxW: 300, maxH: 380, align: "right" }).style);
+    const estH = appMenuRef.current?.offsetHeight || 236;
+    setAppearanceStyle(computePortalMenuStyle(rect, { minW: 256, maxW: 300, maxH: 380, estH, align: "right" }).style);
   };
 
   const closeAppearanceAnimated = () => {
@@ -587,6 +616,13 @@ function App() {
       refreshMe().finally(() => setReady(true));
     }
   }, []);
+
+  useEffect(() => {
+    if (ready && user && bootAuthParams.oidcError && !oidcBindToastShownRef.current) {
+      oidcBindToastShownRef.current = true;
+      showToast(formatOidcError(bootAuthParams.oidcError), "err");
+    }
+  }, [ready, user, bootAuthParams.oidcError]);
 
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -668,15 +704,20 @@ function App() {
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") closeAppearanceAnimated();
     };
+    const vv = window.visualViewport;
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
     window.addEventListener("resize", updateAppearancePos);
     window.addEventListener("scroll", updateAppearancePos, true);
+    vv?.addEventListener("resize", updateAppearancePos);
+    vv?.addEventListener("scroll", updateAppearancePos);
     return () => {
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener("resize", updateAppearancePos);
       window.removeEventListener("scroll", updateAppearancePos, true);
+      vv?.removeEventListener("resize", updateAppearancePos);
+      vv?.removeEventListener("scroll", updateAppearancePos);
     };
   }, [appearanceOpen, appearanceClosing]);
 
@@ -717,7 +758,10 @@ function App() {
     return (
       <>
         <div class={`volo-top-progress ${isBusy ? "is-busy" : ""}`} />
-        <LoginView />
+        <LoginView
+          initialChallengeToken={bootAuthParams.challengeToken}
+          initialOidcError={bootAuthParams.oidcError}
+        />
         <GlobalConfirmModal />
         <ToastBanner />
       </>
@@ -994,6 +1038,16 @@ function App() {
               class="volo-icon-btn"
               title={t("nav.logout")}
               onClick={async () => {
+                if (dirtyEditorSig.value) {
+                  const ok = await openConfirm({
+                    title: t("ui.unsaved_title"),
+                    message: t("ui.unsaved_msg"),
+                    confirmText: t("ui.unsaved_leave"),
+                    danger: true,
+                  });
+                  if (!ok) return;
+                  dirtyEditorSig.value = false;
+                }
                 await apiFetch("/api/admin/auth/logout", { method: "POST", body: "{}" }).catch(() => {});
                 currentUserSig.value = null;
                 csrfTokenSig.value = "";

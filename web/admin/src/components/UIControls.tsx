@@ -16,52 +16,47 @@ export function useDebouncedValue<T>(value: T, delay = 250): T {
 
 export function computePortalMenuStyle(
   anchorRect: DOMRect,
-  opts?: { minW?: number; maxW?: number; maxH?: number; align?: "left" | "right" }
+  opts?: { minW?: number; maxW?: number; maxH?: number; estH?: number; align?: "left" | "right" }
 ): { style: CSSProperties; flipUp: boolean } {
   const vv = typeof window !== "undefined" ? window.visualViewport : null;
-  const vw = vv?.width || (typeof window !== "undefined" ? window.innerWidth : 1024);
-  const vh = vv?.height || (typeof window !== "undefined" ? window.innerHeight : 768);
+  const vvTop = vv?.offsetTop ?? 0;
+  const vvLeft = vv?.offsetLeft ?? 0;
+  const vpW = vv?.width ?? (typeof window !== "undefined" ? window.innerWidth : 1024);
+  const vpH = vv?.height ?? (typeof window !== "undefined" ? window.innerHeight : 768);
   const margin = 8;
   const prefMaxW = opts?.maxW ?? 340;
   const prefMaxH = opts?.maxH ?? 268;
-  const maxAllowedW = Math.max(136, Math.min(prefMaxW, vw - margin * 2));
+  const maxAllowedW = Math.max(136, Math.min(prefMaxW, vpW - margin * 2));
   const minW = Math.min(maxAllowedW, Math.max(opts?.minW ?? 164, Math.round(anchorRect.width)));
 
-  const spaceBelow = vh - anchorRect.bottom - margin;
-  const spaceAbove = anchorRect.top - margin;
-  const flipUp = spaceBelow < 220 && spaceAbove > spaceBelow;
-  const availH = Math.max(96, Math.min(prefMaxH, (flipUp ? spaceAbove : spaceBelow) - 6));
+  const spaceBelow = vvTop + vpH - anchorRect.bottom - margin;
+  const spaceAbove = anchorRect.top - vvTop - margin;
+  const flipUp = spaceBelow < Math.min(220, prefMaxH) && spaceAbove > spaceBelow;
+  const availH = Math.max(96, (flipUp ? spaceAbove : spaceBelow) - 4);
+  const actualMaxH = Math.min(prefMaxH, availH);
+  const openUpH = opts?.estH ? Math.min(actualMaxH, Math.max(44, opts.estH)) : actualMaxH;
 
   const preferRight =
     opts?.align === "right" ||
-    (anchorRect.left + minW > vw - margin && anchorRect.right > vw / 2);
+    (anchorRect.left + minW > vvLeft + vpW - margin && anchorRect.right > vvLeft + vpW / 2);
+
+  const leftPx = preferRight
+    ? Math.max(vvLeft + margin, Math.min(vvLeft + vpW - margin - minW, Math.round(anchorRect.right - minW)))
+    : Math.max(vvLeft + margin, Math.min(vvLeft + vpW - margin - minW, Math.round(anchorRect.left)));
+
+  const topPx = flipUp
+    ? Math.max(vvTop + margin, Math.round(anchorRect.top - openUpH - 4))
+    : Math.max(vvTop + margin, Math.round(anchorRect.bottom + 4));
 
   const style: CSSProperties = {
     position: "fixed",
+    top: `${topPx}px`,
+    left: `${leftPx}px`,
     minWidth: `${minW}px`,
-    maxHeight: `${availH}px`,
+    maxWidth: `${Math.max(minW, Math.min(maxAllowedW, vvLeft + vpW - margin - leftPx))}px`,
+    maxHeight: `${actualMaxH}px`,
     zIndex: 2200,
   };
-
-  if (preferRight) {
-    const rightPx = Math.max(margin, Math.min(vw - margin - minW, Math.round(vw - anchorRect.right)));
-    style.right = `${rightPx}px`;
-    style.left = "auto";
-    style.maxWidth = `${Math.max(minW, Math.min(maxAllowedW, vw - margin - rightPx))}px`;
-  } else {
-    const leftPx = Math.max(margin, Math.min(vw - margin - minW, Math.round(anchorRect.left)));
-    style.left = `${leftPx}px`;
-    style.right = "auto";
-    style.maxWidth = `${Math.max(minW, Math.min(maxAllowedW, vw - margin - leftPx))}px`;
-  }
-
-  if (flipUp) {
-    style.bottom = `${Math.max(margin, Math.round(vh - anchorRect.top + 5))}px`;
-    style.top = "auto";
-  } else {
-    style.top = `${Math.max(margin, Math.round(anchorRect.bottom + 5))}px`;
-    style.bottom = "auto";
-  }
 
   return { style, flipUp };
 }
@@ -76,6 +71,8 @@ export interface ConsoleSelectProps {
   value: string;
   options: SelectOption[];
   onChange: (nextValue: string) => void;
+  fallbackLabel?: string;
+  onSearch?: (query: string) => void | Promise<void>;
   style?: CSSProperties;
   className?: string;
   disabled?: boolean;
@@ -88,6 +85,8 @@ export function ConsoleSelect({
   value,
   options,
   onChange,
+  fallbackLabel,
+  onSearch,
   style,
   className = "",
   disabled = false,
@@ -106,9 +105,16 @@ export function ConsoleSelect({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const closeTimerRef = useRef<number | undefined>(undefined);
+  const onSearchRef = useRef(onSearch);
+  onSearchRef.current = onSearch;
 
-  const isSearchable = searchable ?? options.length > 10;
-  const selected = options.find((o) => o.value === value) || options[0];
+  const isSearchable = searchable ?? (Boolean(onSearch) || options.length > 10);
+  const selected = options.find((o) => o.value === value) ?? null;
+  const displayLabel = selected
+    ? selected.label
+    : value === ""
+    ? fallbackLabel || ""
+    : fallbackLabel || String(value);
 
   const filteredOptions =
     isSearchable && searchQ.trim()
@@ -126,16 +132,21 @@ export function ConsoleSelect({
     const el = btnRef.current || wrapRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    const vh = window.visualViewport?.height || window.innerHeight;
-    if (rect.bottom < 0 || rect.top > vh + 40) {
+    const vv = window.visualViewport;
+    const vvTop = vv?.offsetTop ?? 0;
+    const vpH = vv?.height ?? window.innerHeight;
+    if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
       setOpen(false);
       setClosing(false);
       return;
     }
+    const estRows = Math.max(1, filteredOptions.length);
+    const estH = menuRef.current?.offsetHeight || estRows * 35 + (isSearchable ? 50 : 12);
     const pos = computePortalMenuStyle(rect, {
       minW: 164,
       maxW: 340,
       maxH: isSearchable ? 300 : 264,
+      estH,
       align,
     });
     setMenuStyle(pos.style);
@@ -158,6 +169,19 @@ export function ConsoleSelect({
       if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (!open || !onSearchRef.current) return;
+    const q = searchQ.trim();
+    const timer = window.setTimeout(() => {
+      void onSearchRef.current?.(q);
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [open, searchQ]);
+
+  useEffect(() => {
+    if (open) updateMenuPosition();
+  }, [open, filteredOptions.length, isSearchable]);
 
   useEffect(() => {
     if (!open) return;
@@ -343,7 +367,7 @@ export function ConsoleSelect({
         onClick={toggleOpen}
         onKeyDown={handleKeyDown}
       >
-        <span class="volo-cselect-label">{selected ? selected.label : value}</span>
+        <span class="volo-cselect-label">{displayLabel}</span>
         <svg
           class="volo-cselect-chev"
           viewBox="0 0 20 20"
@@ -391,13 +415,16 @@ export function ActionMenu({
   const updatePos = () => {
     if (!btnRef.current) return;
     const rect = btnRef.current.getBoundingClientRect();
-    const vh = window.visualViewport?.height || window.innerHeight;
-    if (rect.bottom < 0 || rect.top > vh + 40) {
+    const vv = window.visualViewport;
+    const vvTop = vv?.offsetTop ?? 0;
+    const vpH = vv?.height ?? window.innerHeight;
+    if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
       setOpen(false);
       setClosing(false);
       return;
     }
-    const pos = computePortalMenuStyle(rect, { minW: 152, maxW: 260, maxH: 280, align: "right" });
+    const estH = menuRef.current?.offsetHeight || visibleItems.length * 36 + 12;
+    const pos = computePortalMenuStyle(rect, { minW: 152, maxW: 260, maxH: 280, estH, align: "right" });
     setMenuStyle(pos.style);
     setFlipUp(pos.flipUp);
   };
@@ -546,7 +573,8 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
     const el = btnRef.current || wrapRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    const pos = computePortalMenuStyle(rect, { minW: 196, maxW: 280, maxH: 280, align: "right" });
+    const estH = menuRef.current?.offsetHeight || Math.max(1, locales.length) * 36 + 12;
+    const pos = computePortalMenuStyle(rect, { minW: 196, maxW: 280, maxH: 280, estH, align: "right" });
     setMenuStyle(pos.style);
     setFlipUp(pos.flipUp);
   };

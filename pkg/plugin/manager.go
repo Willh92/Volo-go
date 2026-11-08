@@ -636,7 +636,7 @@ func (m *Manager) syncRecordWithDB(
 	)
 
 	var pubCfg map[string]any
-	secretCfg := make(map[string]string)
+	var secretCfg map[string]string
 
 	if errors.Is(err, sql.ErrNoRows) {
 		defPub, defSec, _ := manifest.ValidateAndMergeConfig(nil, nil, nil)
@@ -1346,7 +1346,8 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 		if invoked {
 			m.recordSuccess(ctx, mp)
 		}
-		if hookName == HookRenderPreMarkdown && !cur.IsPasswordProtected && !cur.HasContentLock {
+		hasLock := cur.HasContentLock || strings.Contains(cur.ContentMD, ":::lock") || strings.Contains(cur.SummaryMD, ":::lock")
+		if hookName == HookRenderPreMarkdown && !cur.IsPasswordProtected && !hasLock {
 			switch out := res.(type) {
 			case map[string]any:
 				if nextMD, sOk := out["content_md"].(string); sOk && nextMD != "" {
@@ -1362,7 +1363,7 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 				}
 			}
 		}
-		if hookName == HookRenderPostHTML && !cur.IsPasswordProtected && !cur.HasContentLock {
+		if hookName == HookRenderPostHTML && !cur.IsPasswordProtected && !hasLock {
 			if outMap, ok := res.(map[string]any); ok {
 				if nextHTML, sOk := outMap["html"].(string); sOk && nextHTML != "" {
 					cur.HTML = nextHTML
@@ -1376,7 +1377,21 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 }
 
 // DispatchHook dispatches a generic domain hook (e.g., comment.before_create, comment.created).
+// If payload is ArticleHookPayload or *ArticleHookPayload, it automatically enforces 10th Privacy Surface sanitization.
 func (m *Manager) DispatchHook(ctx context.Context, hookName string, payload any) (any, error) {
+	switch v := payload.(type) {
+	case ArticleHookPayload:
+		out := m.DispatchArticleHook(ctx, hookName, v)
+		return sanitizeArticleHookPayload(out), nil
+	case *ArticleHookPayload:
+		if v == nil {
+			return (*ArticleHookPayload)(nil), nil
+		}
+		out := m.DispatchArticleHook(ctx, hookName, *v)
+		sanitized := sanitizeArticleHookPayload(out)
+		return &sanitized, nil
+	}
+
 	active := m.snapshotEnabledPlugins()
 	cur := payload
 	for _, mp := range active {
@@ -2031,6 +2046,8 @@ func (m *Manager) snapshotEnabledPlugins() []*managedPlugin {
 	return out
 }
 
+var _ OIDCAdvancedProvider = (*gojaOIDCAdapter)(nil)
+
 type gojaOIDCAdapter struct {
 	manager      *Manager
 	mp           *managedPlugin
@@ -2103,6 +2120,13 @@ func (a *gojaOIDCAdapter) DisplayName(locale string) string {
 }
 
 func (a *gojaOIDCAdapter) AuthCodeURL(state string, redirectURI string) (string, error) {
+	return a.AuthCodeURLWithParams(OIDCAuthParams{
+		State:       state,
+		RedirectURI: redirectURI,
+	})
+}
+
+func (a *gojaOIDCAdapter) AuthCodeURLWithParams(params OIDCAuthParams) (string, error) {
 	a.mp.mu.Lock()
 	rt := a.mp.gojaRT
 	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
@@ -2114,7 +2138,18 @@ func (a *gojaOIDCAdapter) AuthCodeURL(state string, redirectURI string) (string,
 	ctx, cancel := context.WithTimeout(context.Background(), a.manager.routeTimeout)
 	defer cancel()
 
-	res, found, err := rt.invoke(ctx, a.manager.routeTimeout, "oidcAuthURL", state, redirectURI)
+	opts := make(map[string]any, 3)
+	if params.Nonce != "" {
+		opts["nonce"] = params.Nonce
+	}
+	if params.CodeChallenge != "" {
+		opts["code_challenge"] = params.CodeChallenge
+	}
+	if params.CodeChallengeMethod != "" {
+		opts["code_challenge_method"] = params.CodeChallengeMethod
+	}
+
+	res, found, err := rt.invoke(ctx, a.manager.routeTimeout, "oidcAuthURL", params.State, params.RedirectURI, opts)
 	if err != nil {
 		a.manager.recordFailure(ctx, a.mp, "provider:oidc:auth_url", err)
 		return "", err
@@ -2137,10 +2172,38 @@ func (a *gojaOIDCAdapter) AuthCodeURL(state string, redirectURI string) (string,
 	if rawURL == "" || uErr != nil || (uParsed.Scheme != "https" && uParsed.Scheme != "http") || uParsed.Host == "" {
 		return "", errors.New("oidcAuthURL must return a valid http/https authorization URL")
 	}
+
+	q := uParsed.Query()
+	mutated := false
+	if params.Nonce != "" && !q.Has("nonce") {
+		q.Set("nonce", params.Nonce)
+		mutated = true
+	}
+	if params.CodeChallenge != "" {
+		if !q.Has("code_challenge") {
+			q.Set("code_challenge", params.CodeChallenge)
+			mutated = true
+		}
+		if params.CodeChallengeMethod != "" && !q.Has("code_challenge_method") {
+			q.Set("code_challenge_method", params.CodeChallengeMethod)
+			mutated = true
+		}
+	}
+	if mutated {
+		uParsed.RawQuery = q.Encode()
+		return uParsed.String(), nil
+	}
 	return rawURL, nil
 }
 
 func (a *gojaOIDCAdapter) Exchange(ctx context.Context, code string, redirectURI string) (OIDCIdentity, error) {
+	return a.ExchangeWithParams(ctx, OIDCExchangeParams{
+		Code:        code,
+		RedirectURI: redirectURI,
+	})
+}
+
+func (a *gojaOIDCAdapter) ExchangeWithParams(ctx context.Context, params OIDCExchangeParams) (OIDCIdentity, error) {
 	a.mp.mu.Lock()
 	rt := a.mp.gojaRT
 	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
@@ -2153,7 +2216,16 @@ func (a *gojaOIDCAdapter) Exchange(ctx context.Context, code string, redirectURI
 	if timeout < 8*time.Second {
 		timeout = 8 * time.Second
 	}
-	res, found, err := rt.invoke(ctx, timeout, "oidcExchange", code, redirectURI)
+
+	opts := make(map[string]any, 2)
+	if params.Nonce != "" {
+		opts["nonce"] = params.Nonce
+	}
+	if params.CodeVerifier != "" {
+		opts["code_verifier"] = params.CodeVerifier
+	}
+
+	res, found, err := rt.invoke(ctx, timeout, "oidcExchange", params.Code, params.RedirectURI, opts)
 	if err != nil {
 		a.manager.recordFailure(ctx, a.mp, "provider:oidc:exchange", err)
 		return OIDCIdentity{}, err
@@ -2184,6 +2256,18 @@ func (a *gojaOIDCAdapter) Exchange(ctx context.Context, code string, redirectURI
 	email, _ := m["email"].(string)
 	email = strings.ToLower(strings.TrimSpace(email))
 
+	emailVerified := false
+	if rawVer, hasVer := m["email_verified"]; hasVer && rawVer != nil {
+		emailVerified = parseOIDCBool(rawVer)
+	} else if rawVer, hasVer := m["verified"]; hasVer && rawVer != nil {
+		emailVerified = parseOIDCBool(rawVer)
+	}
+
+	nonce := ""
+	if nStr, sOk := m["nonce"].(string); sOk {
+		nonce = strings.TrimSpace(nStr)
+	}
+
 	disp := ""
 	for _, k := range []string{"display_name", "name", "preferred_username"} {
 		if s, sOk := m[k].(string); sOk && strings.TrimSpace(s) != "" {
@@ -2206,12 +2290,33 @@ func (a *gojaOIDCAdapter) Exchange(ctx context.Context, code string, redirectURI
 		}
 	}
 	return OIDCIdentity{
-		Provider:    prov,
-		Subject:     sub,
-		Email:       email,
-		DisplayName: disp,
-		AvatarURL:   avatar,
+		Provider:      prov,
+		Subject:       sub,
+		Email:         email,
+		EmailVerified: emailVerified,
+		Nonce:         nonce,
+		DisplayName:   disp,
+		AvatarURL:     avatar,
 	}, nil
+}
+
+func parseOIDCBool(v any) bool {
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		return strings.EqualFold(strings.TrimSpace(val), "true")
+	case int:
+		return val == 1
+	case int64:
+		return val == 1
+	case float64:
+		return val == 1
+	case json.Number:
+		return val.String() == "1"
+	default:
+		return false
+	}
 }
 
 type gojaAntiSpamAdapter struct {
@@ -2281,6 +2386,9 @@ func (a *gojaNotifierAdapter) Send(ctx context.Context, event NotificationEvent)
 	}
 	_, found, err := rt.invoke(ctx, timeout, "sendNotification", event)
 	if !found && err == nil {
+		_, found, err = rt.invoke(ctx, timeout, "notifySend", event)
+	}
+	if !found && err == nil {
 		_, found, err = rt.invoke(ctx, timeout, "onNotify", event)
 	}
 	if err != nil {
@@ -2288,7 +2396,7 @@ func (a *gojaNotifierAdapter) Send(ctx context.Context, event NotificationEvent)
 		return err
 	}
 	if !found {
-		return errors.New("sendNotification function not exported")
+		return errors.New("sendNotification or notifySend function not exported")
 	}
 	a.manager.recordSuccess(ctx, a.mp)
 	return nil
@@ -2405,6 +2513,10 @@ func RedactArticleForPlugin(in ArticleHookPayload, trustedProtected bool) Articl
 	if trustedProtected {
 		return in
 	}
+	return sanitizeArticleHookPayload(in)
+}
+
+func sanitizeArticleHookPayload(in ArticleHookPayload) ArticleHookPayload {
 	out := in
 	if in.IsPasswordProtected {
 		out.SummaryMD = ""
@@ -2416,8 +2528,9 @@ func RedactArticleForPlugin(in ArticleHookPayload, trustedProtected bool) Articl
 		return out
 	}
 	if in.HasContentLock || strings.Contains(in.ContentMD, ":::lock") || strings.Contains(in.SummaryMD, ":::lock") || strings.Contains(in.HTML, ":::lock") {
-		out.SummaryMD = StripLockedMarkdownBlocks(in.SummaryMD)
-		out.ContentMD = StripLockedMarkdownBlocks(in.ContentMD)
+		out.HasContentLock = true
+		out.SummaryMD = stripAllLockBlocks(in.SummaryMD)
+		out.ContentMD = stripAllLockBlocks(in.ContentMD)
 		out.HTML = ""
 	}
 	return out
@@ -2426,6 +2539,10 @@ func RedactArticleForPlugin(in ArticleHookPayload, trustedProtected bool) Articl
 // StripLockedMarkdownBlocks removes all `:::lock ... :::` blocks outside fenced code blocks (` ``` ` / `~~~`).
 // If an opening `:::lock` has no matching closing `:::`, it FAILS CLOSED to EOF so locked content never leaks!
 func StripLockedMarkdownBlocks(src string) string {
+	return stripAllLockBlocks(src)
+}
+
+func stripAllLockBlocks(src string) string {
 	if !strings.Contains(src, ":::lock") {
 		return src
 	}
@@ -2436,44 +2553,97 @@ func StripLockedMarkdownBlocks(src string) string {
 	inFence := false
 	var fenceChar byte
 	fenceLen := 0
-	inLock := false
+	fenceQuoteDepth := 0
+	lockNestDepth := 0
 
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+		rest, quoteDepth, ok := stripBlockquoteAndIndent(line)
+		if inFence && quoteDepth < fenceQuoteDepth {
+			inFence = false
+			fenceChar = 0
+			fenceLen = 0
+			fenceQuoteDepth = 0
+		}
 
-		// Track fenced code blocks so literal `:::lock` examples inside code blocks are never misinterpreted.
-		if ch, n, ok := parseCodeFenceMarker(trimmed); ok {
+		if ok {
+			if ch, n, fenceOK := parseCodeFenceMarker(rest); fenceOK {
+				if !inFence {
+					if ch != '`' || !strings.ContainsRune(rest[n:], '`') {
+						inFence = true
+						fenceChar = ch
+						fenceLen = n
+						fenceQuoteDepth = quoteDepth
+						if lockNestDepth == 0 {
+							out = append(out, line)
+						}
+						continue
+					}
+				} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
+					inFence = false
+					fenceChar = 0
+					fenceLen = 0
+					fenceQuoteDepth = 0
+					if lockNestDepth == 0 {
+						out = append(out, line)
+					}
+					continue
+				}
+			}
+
 			if !inFence {
-				inFence = true
-				fenceChar = ch
-				fenceLen = n
-			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(trimmed[n:]) == "" {
-				inFence = false
-				fenceChar = 0
-				fenceLen = 0
-			}
-			if !inLock {
-				out = append(out, line)
-			}
-			continue
-		}
-
-		if !inFence {
-			if !inLock && isLockOpenDirective(trimmed) {
-				inLock = true
-				continue
-			}
-			if inLock && trimmed == ":::" {
-				inLock = false
-				continue
+				if lockNestDepth == 0 {
+					if isLockOpenDirective(rest) {
+						lockNestDepth = 1
+						continue
+					}
+				} else {
+					if rest == ":::" {
+						lockNestDepth--
+						continue
+					}
+					if isInnerDirectiveOpen(rest) {
+						lockNestDepth++
+						continue
+					}
+				}
 			}
 		}
 
-		if !inLock {
+		if lockNestDepth == 0 {
 			out = append(out, line)
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// stripBlockquoteAndIndent strips zero or more CommonMark `>` blockquote prefixes
+// (each with `<= 3` leading spaces and an optional space after `>`) and then checks
+// that the remaining block indentation is at most 3 spaces (`<= 3`, no leading tab).
+func stripBlockquoteAndIndent(line string) (rest string, quoteDepth int, ok bool) {
+	s := line
+	for {
+		spaces := 0
+		for spaces < len(s) && s[spaces] == ' ' {
+			spaces++
+		}
+		if spaces <= 3 && spaces < len(s) && s[spaces] == '>' {
+			quoteDepth++
+			s = s[spaces+1:]
+			if len(s) > 0 && s[0] == ' ' {
+				s = s[1:]
+			}
+			continue
+		}
+		break
+	}
+	indent := 0
+	for indent < len(s) && s[indent] == ' ' {
+		indent++
+	}
+	if indent > 3 || (indent < len(s) && s[indent] == '\t') {
+		return "", quoteDepth, false
+	}
+	return strings.TrimRight(s[indent:], " \t\r"), quoteDepth, true
 }
 
 func parseCodeFenceMarker(trimmed string) (byte, int, bool) {
@@ -2499,7 +2669,38 @@ func isLockOpenDirective(trimmed string) bool {
 		return false
 	}
 	rest := trimmed[len(":::lock"):]
-	return rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '['
+	if rest == "" || rest == ":::" {
+		return true
+	}
+	return rest[0] == ' ' || rest[0] == '\t' || rest[0] == '[' || rest[0] == '{'
+}
+
+func isInnerDirectiveOpen(trimmed string) bool {
+	if !strings.HasPrefix(trimmed, ":::") || len(trimmed) <= 3 {
+		return false
+	}
+	c := trimmed[3]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+		return false
+	}
+	end := 3
+	for end < len(trimmed) {
+		ch := trimmed[end]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' {
+			end++
+		} else {
+			break
+		}
+	}
+	name := trimmed[3:end]
+	tail := trimmed[end:]
+	if tail != "" && tail != ":::" && tail[0] != ' ' && tail[0] != '\t' && tail[0] != '[' && tail[0] != '{' {
+		return false
+	}
+	if name != "lock" && strings.HasSuffix(tail, ":::") {
+		return false
+	}
+	return true
 }
 
 func sanitizeZipEntryPath(raw string) (string, error) {

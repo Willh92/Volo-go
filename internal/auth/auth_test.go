@@ -527,3 +527,84 @@ func TestRenderQRCodeSVGAndMatrixInvariants(t *testing.T) {
 		}
 	}
 }
+
+func TestCompleteStaffPrimaryLoginAndRevokeUserAPITokens(t *testing.T) {
+	ctx := context.Background()
+	svc, store, _ := setupAuthTestService(t)
+	now := time.Now().UnixMilli()
+
+	pw, _ := HashPassword("StaffOIDC2026!")
+	_, err := store.ExecContext(ctx,
+		`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
+		 VALUES
+		 ('u_staff', 'staffsso', 'staff@example.com', 'Staff SSO', '', '', '', 'admin', ?, '', 'active', ?, 'en-US', ?, ?),
+		 ('u_reader', 'readersso', 'reader@example.com', 'Reader SSO', '', '', '', 'reader', ?, '', 'active', ?, 'en-US', ?, ?),
+		 ('u_disabled', 'disadmin', 'dis@example.com', 'Disabled Admin', '', '', '', 'admin', ?, '', 'disabled', ?, 'en-US', ?, ?)`,
+		pw, now, now, now,
+		pw, now, now, now,
+		pw, now, now, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ip := netip.MustParseAddr("203.0.113.42")
+	ua := "VoloTestBrowser/1.0"
+
+	// Non-staff or disabled accounts must be rejected by CompleteStaffPrimaryLogin
+	readerRow, _ := sqlx.Get[domain.User](ctx, store, `SELECT * FROM users WHERE id = 'u_reader'`)
+	if _, err := svc.CompleteStaffPrimaryLogin(ctx, readerRow, ip, "", ua, ""); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden for reader in CompleteStaffPrimaryLogin, got %v", err)
+	}
+	disabledRow, _ := sqlx.Get[domain.User](ctx, store, `SELECT * FROM users WHERE id = 'u_disabled'`)
+	if _, err := svc.CompleteStaffPrimaryLogin(ctx, disabledRow, ip, "", ua, ""); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden for disabled staff in CompleteStaffPrimaryLogin, got %v", err)
+	}
+
+	// Without TOTP -> mints session directly
+	staffRow, _ := sqlx.Get[domain.User](ctx, store, `SELECT * FROM users WHERE id = 'u_staff'`)
+	resNo2FA, err := svc.CompleteStaffPrimaryLogin(ctx, staffRow, ip, "US", ua, "")
+	if err != nil || resNo2FA.Requires2FA || resNo2FA.Session == nil || resNo2FA.RawToken == "" {
+		t.Fatalf("expected immediate session when TOTP is not enrolled, got %+v (%v)", resNo2FA, err)
+	}
+
+	// Enroll TOTP -> CompleteStaffPrimaryLogin MUST issue ChallengeToken unless valid trusted2FACookie is supplied
+	secret, _ := GenerateTOTPSecret()
+	otp, _ := ComputeTOTPCode(secret, time.Now())
+	recCodes, err := svc.EnrollTOTP(ctx, "u_staff", secret, otp)
+	if err != nil {
+		t.Fatalf("EnrollTOTP: %v", err)
+	}
+	resWith2FA, err := svc.CompleteStaffPrimaryLogin(ctx, staffRow, ip, "US", ua, "")
+	if err != nil || !resWith2FA.Requires2FA || resWith2FA.ChallengeToken == "" || resWith2FA.Session != nil {
+		t.Fatalf("expected ChallengeToken when TOTP is enabled and no trusted cookie is present, got %+v (%v)", resWith2FA, err)
+	}
+	_, trustCookie, err := svc.CompleteStaff2FA(ctx, resWith2FA.ChallengeToken, recCodes[0], true, ip, "US", ua)
+	if err != nil || trustCookie == "" {
+		t.Fatalf("CompleteStaff2FA failed: %v", err)
+	}
+	resTrusted, err := svc.CompleteStaffPrimaryLogin(ctx, staffRow, ip, "US", ua, trustCookie)
+	if err != nil || resTrusted.Requires2FA || resTrusted.Session == nil {
+		t.Fatalf("expected valid trusted2FACookie to bypass 2FA challenge, got %+v (%v)", resTrusted, err)
+	}
+
+	// Mint API tokens and verify RevokeUserAPITokens revokes all tokens for the user
+	_, pat1, err := svc.CreateAPIToken(ctx, &staffRow, "CLI-1", []string{ScopeArticlesRead}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pat2, err := svc.CreateAPIToken(ctx, &staffRow, "CLI-2", []string{ScopeMediaWrite}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RevokeUserAPITokens(ctx, "u_staff"); err != nil {
+		t.Fatalf("RevokeUserAPITokens: %v", err)
+	}
+	if _, _, err := svc.AuthenticateAPIToken(ctx, pat1, ScopeArticlesRead); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected pat1 revoked (ErrUnauthorized), got %v", err)
+	}
+	if _, _, err := svc.AuthenticateAPIToken(ctx, pat2, ScopeMediaWrite); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected pat2 revoked (ErrUnauthorized), got %v", err)
+	}
+}
+

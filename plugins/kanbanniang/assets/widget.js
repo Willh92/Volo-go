@@ -145,6 +145,30 @@
     collapseTimer = setTimeout(function () {
       collapseBubble(bubble);
     }, 5000);
+    syncMobileOffset();
+  }
+
+  function syncMobileOffset() {
+    var root = document.getElementById("volo-kanbanniang-root");
+    if (!root) return;
+    var pos = root.getAttribute("data-position") || (root.classList.contains("volo-kbn-right") ? "right" : "left");
+    var fab = document.querySelector(".book-mobile-toc-fab");
+    var fabOnScreen = !!(
+      fab &&
+      !fab.hidden &&
+      (window.innerWidth || 1024) <= 900 &&
+      pos !== "right" &&
+      window.getComputedStyle(fab).display !== "none"
+    );
+    root.classList.toggle("is-book-fab-offset", fabOnScreen);
+    var podcastOpen =
+      document.documentElement.getAttribute("data-podcast-open") === "1" ||
+      (document.body && document.body.classList.contains("has-podcast-mini"));
+    if (fabOnScreen && !podcastOpen) {
+      root.style.bottom = "calc(68px + env(safe-area-inset-bottom, 0px))";
+    } else {
+      root.style.removeProperty("bottom");
+    }
   }
 
   function onAfterNavigate() {
@@ -172,15 +196,19 @@
     if (document.querySelector("[data-book-reader]")) {
       collapseBubble(bubble);
     }
+    syncMobileOffset();
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", mount);
+    document.addEventListener("DOMContentLoaded", mount, { once: true });
   } else {
     mount();
   }
-  window.addEventListener("volo:pjax:after", onAfterNavigate);
-  document.addEventListener("volo:pjax:after", onAfterNavigate);
-  window.addEventListener("volo:after-navigate", onAfterNavigate);
-  document.addEventListener("volo:page-load", onAfterNavigate);
+  if (!window.__voloKanbanniangPJAXBound) {
+    window.__voloKanbanniangPJAXBound = true;
+    document.addEventListener("volo:pjax:after", onAfterNavigate);
+    document.addEventListener("volo:page-load", onAfterNavigate);
+    window.addEventListener("scroll", syncMobileOffset, { passive: true });
+    window.addEventListener("resize", syncMobileOffset, { passive: true });
+  }
 })();

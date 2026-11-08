@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -134,70 +135,176 @@ func (s *Service) authorizeCommentTarget(
 	}
 }
 
-func (s *Service) buildTargetCommentTree(
-	ctx context.Context,
-	r *http.Request,
-	viewer *domain.User,
-	targetType string,
-	targetID string,
-) ([]PublicCommentView, int, error) {
-	tType := strings.TrimSpace(targetType)
-	tID := strings.TrimSpace(targetID)
-	postAuthorID, err := s.authorizeCommentTarget(ctx, r, viewer, tType, tID)
-	if err != nil {
-		return nil, 0, err
-	}
+const publicCommentSelectCols = `id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash, author_name, author_url, avatar_url, ip_masked, CASE WHEN client_ip <> '' THEN 1 ELSE 0 END AS has_client_ip, geo_region, content_md, status, created_at, updated_at`
 
-	var callerGuestHash string
+type publicCommentRow struct {
+	ID          string `db:"id"`
+	ParentID    string `db:"parent_id"`
+	ReplyToName string `db:"reply_to_name"`
+	UserID      string `db:"user_id"`
+	GuestIDHash string `db:"guest_id_hash"`
+	EnvFPHash   string `db:"env_fp_hash"`
+	AuthorName  string `db:"author_name"`
+	AuthorURL   string `db:"author_url"`
+	AvatarURL   string `db:"avatar_url"`
+	IPMasked    string `db:"ip_masked"`
+	HasClientIP int    `db:"has_client_ip"`
+	GeoRegion   string `db:"geo_region"`
+	ContentMD   string `db:"content_md"`
+	Status      string `db:"status"`
+	CreatedAt   int64  `db:"created_at"`
+	UpdatedAt   int64  `db:"updated_at"`
+}
+
+func (r publicCommentRow) toDomainComment() domain.Comment {
+	cIP := ""
+	if r.HasClientIP != 0 {
+		cIP = "present"
+	}
+	return domain.Comment{
+		ID:          r.ID,
+		ParentID:    r.ParentID,
+		ReplyToName: r.ReplyToName,
+		UserID:      r.UserID,
+		GuestIDHash: r.GuestIDHash,
+		EnvFPHash:   r.EnvFPHash,
+		AuthorName:  r.AuthorName,
+		AuthorURL:   r.AuthorURL,
+		AvatarURL:   r.AvatarURL,
+		ClientIP:    cIP,
+		IPMasked:    r.IPMasked,
+		GeoRegion:   r.GeoRegion,
+		ContentMD:   r.ContentMD,
+		Status:      r.Status,
+		CreatedAt:   r.CreatedAt,
+		UpdatedAt:   r.UpdatedAt,
+	}
+}
+
+func (s *Service) resolveCommentViewerIdentity(r *http.Request, viewer *domain.User) (isAdmin bool, callerUserID string, callerGuestHash string) {
+	if viewer != nil && viewer.Status == domain.UserStatusActive {
+		callerUserID = viewer.ID
+		isAdmin = viewer.Role == domain.RoleAdmin
+	}
 	if r != nil && s.passports != nil {
 		if gp, ok := s.passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
 			callerGuestHash = gp.GuestIDHash
 		}
 	}
-	callerUserID := ""
-	if viewer != nil && viewer.Status == domain.UserStatusActive {
-		callerUserID = viewer.ID
+	return isAdmin, callerUserID, callerGuestHash
+}
+
+func buildCommentVisibilityWhere(tType, tID string, isAdmin bool, callerUserID, callerGuestHash string, nowMS int64) (string, []any) {
+	where := `target_type = ? AND target_id = ? AND is_deleted = ?`
+	args := []any{tType, tID, false}
+	if !isAdmin {
+		visOr := []string{`status = ?`}
+		args = append(args, domain.CommentStatusApproved)
+		if callerUserID != "" {
+			visOr = append(visOr, `user_id = ?`)
+			args = append(args, callerUserID)
+		}
+		if callerGuestHash != "" {
+			visOr = append(visOr, `(guest_id_hash = ? AND created_at >= ?)`)
+			args = append(args, callerGuestHash, nowMS-GuestEditWindow.Milliseconds())
+		}
+		where += ` AND (` + strings.Join(visOr, " OR ") + `)`
+	}
+	return where, args
+}
+
+func (s *Service) hydrateRootThreadsReplies(
+	ctx context.Context,
+	visWhere string,
+	visArgs []any,
+	rootRows []publicCommentRow,
+	postAuthorID string,
+	isAdmin bool,
+	callerUserID string,
+	callerGuestHash string,
+	nowMS int64,
+	viewer *domain.User,
+) ([]PublicCommentView, error) {
+	if len(rootRows) == 0 {
+		return []PublicCommentView{}, nil
+	}
+	roots := make([]PublicCommentView, len(rootRows))
+	rootIdxForID := make(map[string]int, len(rootRows)*2)
+	frontier := make([]string, 0, len(rootRows))
+
+	for i, rr := range rootRows {
+		dc := rr.toDomainComment()
+		isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
+		roots[i] = s.toPublicCommentView(dc, postAuthorID, isOwn || isAdmin, viewer)
+		rootIdxForID[rr.ID] = i
+		frontier = append(frontier, rr.ID)
 	}
 
-	rows, err := sqlx.Select[domain.Comment](
-		ctx, s.store,
-		`SELECT * FROM comments
-		 WHERE target_type = ? AND target_id = ? AND is_deleted = ?
-		 ORDER BY created_at ASC, id ASC`,
-		tType, tID, false,
-	)
-	if err != nil {
-		return nil, 0, err
+	repliesByRoot := make([][]publicCommentRow, len(rootRows))
+	multiDepth := false
+
+	for depth := 0; depth < 8 && len(frontier) > 0; depth++ {
+		if depth > 0 {
+			multiDepth = true
+		}
+		var nextFrontier []string
+		const batchSize = 250
+		for start := 0; start < len(frontier); start += batchSize {
+			end := start + batchSize
+			if end > len(frontier) {
+				end = len(frontier)
+			}
+			chunk := frontier[start:end]
+			placeholders := make([]string, len(chunk))
+			qArgs := make([]any, 0, len(visArgs)+len(chunk))
+			qArgs = append(qArgs, visArgs...)
+			for i, pid := range chunk {
+				placeholders[i] = "?"
+				qArgs = append(qArgs, pid)
+			}
+			replySQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere +
+				` AND parent_id IN (` + strings.Join(placeholders, ",") + `) ORDER BY created_at ASC, id ASC`
+			repRows, err := sqlx.Select[publicCommentRow](ctx, s.store, replySQL, qArgs...)
+			if err != nil {
+				return nil, err
+			}
+			for _, rep := range repRows {
+				rIdx, ok := rootIdxForID[strings.TrimSpace(rep.ParentID)]
+				if !ok {
+					continue
+				}
+				if _, seen := rootIdxForID[rep.ID]; seen {
+					continue
+				}
+				rootIdxForID[rep.ID] = rIdx
+				repliesByRoot[rIdx] = append(repliesByRoot[rIdx], rep)
+				nextFrontier = append(nextFrontier, rep.ID)
+			}
+		}
+		frontier = nextFrontier
 	}
 
-	nowMS := time.Now().UnixMilli()
-	roots := make([]PublicCommentView, 0)
-	rootIdxByID := make(map[string]int)
-	totalComments := 0
-
-	for _, c := range rows {
-		isAdmin := viewer != nil && viewer.Role == domain.RoleAdmin && viewer.Status == domain.UserStatusActive
-		isOwn := canModifyComment(c, callerUserID, callerGuestHash, nowMS)
-		if c.Status != domain.CommentStatusApproved && !isOwn && !isAdmin {
+	for rIdx, repList := range repliesByRoot {
+		if len(repList) == 0 {
 			continue
 		}
-		totalComments++
-		view := s.toPublicCommentView(c, postAuthorID, isOwn || isAdmin, viewer)
-		if strings.TrimSpace(c.ParentID) == "" {
-			rootIdxByID[c.ID] = len(roots)
-			roots = append(roots, view)
-		} else if idx, exists := rootIdxByID[c.ParentID]; exists {
-			roots[idx].Replies = append(roots[idx].Replies, view)
-		} else {
-			// Flatten deeper replies onto top level with @ReplyToName preserved (clean 2-level design).
-			roots = append(roots, view)
+		if multiDepth && len(repList) > 1 {
+			sort.Slice(repList, func(i, j int) bool {
+				if repList[i].CreatedAt != repList[j].CreatedAt {
+					return repList[i].CreatedAt < repList[j].CreatedAt
+				}
+				return repList[i].ID < repList[j].ID
+			})
 		}
+		views := make([]PublicCommentView, 0, len(repList))
+		for _, rep := range repList {
+			dc := rep.toDomainComment()
+			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
+			views = append(views, s.toPublicCommentView(dc, postAuthorID, isOwn || isAdmin, viewer))
+		}
+		roots[rIdx].Replies = views
 	}
-	// Top-level comments sort newest-first (DESC) while replies inside each thread stay chronological (ASC).
-	for i, j := 0, len(roots)-1; i < j; i, j = i+1, j-1 {
-		roots[i], roots[j] = roots[j], roots[i]
-	}
-	return roots, totalComments, nil
+	return roots, nil
 }
 
 // ListTargetComments returns the nested 2-level public comment tree for an article or standalone page.
@@ -209,8 +316,22 @@ func (s *Service) ListTargetComments(
 	targetType string,
 	targetID string,
 ) ([]PublicCommentView, error) {
-	roots, _, err := s.buildTargetCommentTree(ctx, r, viewer, targetType, targetID)
-	return roots, err
+	tType := strings.TrimSpace(targetType)
+	tID := strings.TrimSpace(targetID)
+	postAuthorID, err := s.authorizeCommentTarget(ctx, r, viewer, tType, tID)
+	if err != nil {
+		return nil, err
+	}
+	isAdmin, callerUserID, callerGuestHash := s.resolveCommentViewerIdentity(r, viewer)
+	nowMS := time.Now().UnixMilli()
+	visWhere, visArgs := buildCommentVisibilityWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
+
+	rootSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere + ` AND parent_id = '' ORDER BY created_at DESC, id DESC`
+	rootRows, err := sqlx.Select[publicCommentRow](ctx, s.store, rootSQL, visArgs...)
+	if err != nil {
+		return nil, err
+	}
+	return s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer)
 }
 
 // ListTargetCommentsPage returns a paginated slice of root comment threads (newest-first, with replies intact).
@@ -225,7 +346,9 @@ func (s *Service) ListTargetCommentsPage(
 	perPage int,
 	focusCommentID string,
 ) (PaginatedCommentsResult, error) {
-	roots, totalComments, err := s.buildTargetCommentTree(ctx, r, viewer, targetType, targetID)
+	tType := strings.TrimSpace(targetType)
+	tID := strings.TrimSpace(targetID)
+	postAuthorID, err := s.authorizeCommentTarget(ctx, r, viewer, tType, tID)
 	if err != nil {
 		return PaginatedCommentsResult{}, err
 	}
@@ -235,26 +358,81 @@ func (s *Service) ListTargetCommentsPage(
 	if perPage > 100 {
 		perPage = 100
 	}
-	totalRoots := len(roots)
-	totalPages := 1
-	if totalRoots > 0 {
-		totalPages = (totalRoots + perPage - 1) / perPage
+
+	isAdmin, callerUserID, callerGuestHash := s.resolveCommentViewerIdentity(r, viewer)
+	nowMS := time.Now().UnixMilli()
+	visWhere, visArgs := buildCommentVisibilityWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
+
+	var totalComments, totalRoots int
+	if err := s.store.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN parent_id = '' THEN 1 ELSE 0 END), 0) FROM comments WHERE `+visWhere,
+		visArgs...,
+	).Scan(&totalComments, &totalRoots); err != nil {
+		return PaginatedCommentsResult{}, err
+	}
+
+	if totalComments == 0 {
+		return PaginatedCommentsResult{
+			Comments:      []PublicCommentView{},
+			Page:          1,
+			PerPage:       perPage,
+			TotalRoots:    0,
+			TotalComments: 0,
+			TotalPages:    1,
+			HasMore:       false,
+		}, nil
+	}
+
+	rootPredicate := ` AND parent_id = ''`
+	if totalRoots == 0 {
+		// Rare fallback when all root ancestors were soft-deleted leaving orphaned replies.
+		totalRoots = totalComments
+		rootPredicate = ``
+	}
+
+	totalPages := (totalRoots + perPage - 1) / perPage
+	if totalPages < 1 {
+		totalPages = 1
 	}
 
 	if focusID := strings.TrimSpace(focusCommentID); focusID != "" {
-		for i, root := range roots {
-			matched := root.ID == focusID
-			if !matched {
-				for _, rep := range root.Replies {
-					if rep.ID == focusID {
-						matched = true
-						break
-					}
-				}
-			}
-			if matched {
-				page = (i / perPage) + 1
+		type ancestorRow struct {
+			ID        string `db:"id"`
+			ParentID  string `db:"parent_id"`
+			CreatedAt int64  `db:"created_at"`
+		}
+		curID := focusID
+		var rootID string
+		var rootCreatedAt int64
+		for hop := 0; hop < 8 && curID != ""; hop++ {
+			aArgs := make([]any, 0, 1+len(visArgs))
+			aArgs = append(aArgs, curID)
+			aArgs = append(aArgs, visArgs...)
+			anc, aErr := sqlx.Get[ancestorRow](
+				ctx, s.store,
+				`SELECT id, parent_id, created_at FROM comments WHERE id = ? AND `+visWhere,
+				aArgs...,
+			)
+			if aErr != nil {
 				break
+			}
+			if rootPredicate == `` || strings.TrimSpace(anc.ParentID) == "" {
+				rootID = anc.ID
+				rootCreatedAt = anc.CreatedAt
+				break
+			}
+			curID = strings.TrimSpace(anc.ParentID)
+		}
+		if rootID != "" {
+			var rankBefore int
+			rankArgs := make([]any, 0, len(visArgs)+3)
+			rankArgs = append(rankArgs, visArgs...)
+			rankArgs = append(rankArgs, rootCreatedAt, rootCreatedAt, rootID)
+			rankSQL := `SELECT COUNT(*) FROM comments WHERE ` + visWhere + rootPredicate +
+				` AND (created_at > ? OR (created_at = ? AND id > ?))`
+			if rErr := s.store.QueryRowContext(ctx, rankSQL, rankArgs...).Scan(&rankBefore); rErr == nil {
+				page = (rankBefore / perPage) + 1
 			}
 		}
 	}
@@ -266,16 +444,31 @@ func (s *Service) ListTargetCommentsPage(
 		page = totalPages
 	}
 
+	offset := (page - 1) * perPage
+	rootBaseSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere + rootPredicate + ` ORDER BY created_at DESC, id DESC`
+	rootPageSQL, pageArgs := s.store.Dialect().PaginateSQL(rootBaseSQL, perPage, offset)
+	rootArgs := make([]any, 0, len(visArgs)+len(pageArgs))
+	rootArgs = append(rootArgs, visArgs...)
+	rootArgs = append(rootArgs, pageArgs...)
+
+	rootRows, err := sqlx.Select[publicCommentRow](ctx, s.store, rootPageSQL, rootArgs...)
+	if err != nil {
+		return PaginatedCommentsResult{}, err
+	}
+
 	var slice []PublicCommentView
-	if totalRoots == 0 {
-		slice = []PublicCommentView{}
-	} else {
-		start := (page - 1) * perPage
-		end := start + perPage
-		if end > totalRoots {
-			end = totalRoots
+	if rootPredicate == `` {
+		slice = make([]PublicCommentView, 0, len(rootRows))
+		for _, rr := range rootRows {
+			dc := rr.toDomainComment()
+			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
+			slice = append(slice, s.toPublicCommentView(dc, postAuthorID, isOwn || isAdmin, viewer))
 		}
-		slice = roots[start:end]
+	} else {
+		slice, err = s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer)
+		if err != nil {
+			return PaginatedCommentsResult{}, err
+		}
 	}
 
 	return PaginatedCommentsResult{
@@ -370,7 +563,7 @@ func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int
 	}
 	out := make([]RecentCommentItem, 0, len(rows))
 	for _, r := range rows {
-		rendered := s.renderer.Render(r.ContentMD, render.Options{Mode: render.RenderModeWeb})
+		plain := render.ExtractPlainTextFromHTML(s.renderer.RenderComment(r.ContentMD))
 		targetURL := visibility.ArticlePath(r.TargetSlug) + "#comment-" + r.ID
 		if r.TargetType == domain.TargetTypePage {
 			targetURL = "/" + r.TargetSlug + "#comment-" + r.ID
@@ -378,7 +571,7 @@ func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int
 		out = append(out, RecentCommentItem{
 			ID:          r.ID,
 			AuthorName:  r.AuthorName,
-			Excerpt:     truncateForSummary(rendered.PlainText, 64),
+			Excerpt:     truncateForSummary(plain, 64),
 			TargetTitle: r.TargetTitle,
 			TargetURL:   targetURL,
 			CreatedAt:   r.CreatedAt,
@@ -910,28 +1103,51 @@ func canModifyComment(c domain.Comment, callerUserID string, callerGuestHash str
 	return false
 }
 
+const maxCommentHTMLGenEntries = 2048
+
+func (s *Service) putCommentHTMLCacheLocked(key string, html string) {
+	if s.commentHTMLCurr == nil {
+		s.commentHTMLCurr = make(map[string]string, 256)
+	}
+	if _, exists := s.commentHTMLCurr[key]; !exists && len(s.commentHTMLCurr) >= maxCommentHTMLGenEntries {
+		s.commentHTMLPrev = s.commentHTMLCurr
+		s.commentHTMLCurr = make(map[string]string, 256)
+	}
+	s.commentHTMLCurr[key] = html
+}
+
 func (s *Service) renderCommentMarkdownHTML(c domain.Comment) string {
 	if c.ID != "" {
 		cacheKey := c.ID + ":" + strconv.FormatInt(c.UpdatedAt, 10)
 		s.commentHTMLMu.RLock()
-		if cached, ok := s.commentHTML[cacheKey]; ok {
+		if cached, ok := s.commentHTMLCurr[cacheKey]; ok {
 			s.commentHTMLMu.RUnlock()
 			return cached
 		}
+		_, inPrev := s.commentHTMLPrev[cacheKey]
 		s.commentHTMLMu.RUnlock()
 
-		html := s.renderer.Render(c.ContentMD, render.Options{Mode: render.RenderModeWeb}).HTML
-		s.commentHTMLMu.Lock()
-		if s.commentHTML == nil {
-			s.commentHTML = make(map[string]string, 256)
-		} else if len(s.commentHTML) >= 4096 {
-			clear(s.commentHTML)
+		if inPrev {
+			s.commentHTMLMu.Lock()
+			if cached, ok := s.commentHTMLCurr[cacheKey]; ok {
+				s.commentHTMLMu.Unlock()
+				return cached
+			}
+			if cached, ok := s.commentHTMLPrev[cacheKey]; ok {
+				s.putCommentHTMLCacheLocked(cacheKey, cached)
+				s.commentHTMLMu.Unlock()
+				return cached
+			}
+			s.commentHTMLMu.Unlock()
 		}
-		s.commentHTML[cacheKey] = html
+
+		html := s.renderer.RenderComment(c.ContentMD)
+		s.commentHTMLMu.Lock()
+		s.putCommentHTMLCacheLocked(cacheKey, html)
 		s.commentHTMLMu.Unlock()
 		return html
 	}
-	return s.renderer.Render(c.ContentMD, render.Options{Mode: render.RenderModeWeb}).HTML
+	return s.renderer.RenderComment(c.ContentMD)
 }
 
 func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, canEdit bool, viewer *domain.User) PublicCommentView {

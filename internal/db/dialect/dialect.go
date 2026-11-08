@@ -30,6 +30,7 @@ type Dialect interface {
 	Name() string
 	Rebind(query string) string
 	UpsertSQL(table string, cols []string, conflictCols []string, updateCols []string) string
+	UpsertIncrementSQL(table string, cols []string, conflictCols []string, incCols []string, overwriteCols []string) string
 	PaginateSQL(baseQuery string, limit int, offset int) (string, []any)
 	Types() TypeMap
 	QuoteIdent(ident string) string
@@ -95,6 +96,9 @@ func (sqliteDialect) Types() TypeMap {
 }
 func (d sqliteDialect) UpsertSQL(table string, cols []string, conflictCols []string, updateCols []string) string {
 	return buildConflictUpsert(d, table, cols, conflictCols, updateCols)
+}
+func (d sqliteDialect) UpsertIncrementSQL(table string, cols []string, conflictCols []string, incCols []string, overwriteCols []string) string {
+	return buildConflictUpsertIncrement(d, table, cols, conflictCols, incCols, overwriteCols)
 }
 func (d sqliteDialect) PaginateSQL(baseQuery string, limit int, offset int) (string, []any) {
 	return strings.TrimRight(strings.TrimSpace(baseQuery), ";") + " LIMIT ? OFFSET ?", []any{limit, offset}
@@ -299,6 +303,9 @@ func matchPGDollarQuoteTag(s string) (string, bool) {
 func (d postgresDialect) UpsertSQL(table string, cols []string, conflictCols []string, updateCols []string) string {
 	return buildConflictUpsert(d, table, cols, conflictCols, updateCols)
 }
+func (d postgresDialect) UpsertIncrementSQL(table string, cols []string, conflictCols []string, incCols []string, overwriteCols []string) string {
+	return buildConflictUpsertIncrement(d, table, cols, conflictCols, incCols, overwriteCols)
+}
 func (d postgresDialect) PaginateSQL(baseQuery string, limit int, offset int) (string, []any) {
 	q := strings.TrimRight(strings.TrimSpace(baseQuery), ";") + " LIMIT ? OFFSET ?"
 	return d.Rebind(q), []any{limit, offset}
@@ -362,6 +369,39 @@ func (d mysqlDialect) UpsertSQL(table string, cols []string, conflictCols []stri
 	return base + " ON DUPLICATE KEY UPDATE " + strings.Join(updates, ", ")
 }
 
+func (d mysqlDialect) UpsertIncrementSQL(table string, cols []string, conflictCols []string, incCols []string, overwriteCols []string) string {
+	quotedCols := make([]string, len(cols))
+	placeholders := make([]string, len(cols))
+	for i, c := range cols {
+		quotedCols[i] = d.QuoteIdent(c)
+		placeholders[i] = "?"
+	}
+	base := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES (%s)",
+		d.QuoteIdent(table),
+		strings.Join(quotedCols, ", "),
+		strings.Join(placeholders, ", "),
+	)
+	if len(incCols) == 0 && len(overwriteCols) == 0 {
+		anchor := cols[0]
+		if len(conflictCols) > 0 {
+			anchor = conflictCols[0]
+		}
+		qAnchor := d.QuoteIdent(anchor)
+		return base + fmt.Sprintf(" ON DUPLICATE KEY UPDATE %s = %s", qAnchor, qAnchor)
+	}
+	updates := make([]string, 0, len(incCols)+len(overwriteCols))
+	for _, c := range incCols {
+		qc := d.QuoteIdent(c)
+		updates = append(updates, fmt.Sprintf("%s = %s + VALUES(%s)", qc, qc, qc))
+	}
+	for _, c := range overwriteCols {
+		qc := d.QuoteIdent(c)
+		updates = append(updates, fmt.Sprintf("%s = VALUES(%s)", qc, qc))
+	}
+	return base + " ON DUPLICATE KEY UPDATE " + strings.Join(updates, ", ")
+}
+
 func buildConflictUpsert(d Dialect, table string, cols []string, conflictCols []string, updateCols []string) string {
 	quotedCols := make([]string, len(cols))
 	placeholders := make([]string, len(cols))
@@ -391,4 +431,38 @@ func buildConflictUpsert(d Dialect, table string, cols []string, conflictCols []
 	}
 	sql := base + " DO UPDATE SET " + strings.Join(updates, ", ")
 	return d.Rebind(sql)
+}
+
+func buildConflictUpsertIncrement(d Dialect, table string, cols []string, conflictCols []string, incCols []string, overwriteCols []string) string {
+	qTable := d.QuoteIdent(table)
+	quotedCols := make([]string, len(cols))
+	placeholders := make([]string, len(cols))
+	for i, c := range cols {
+		quotedCols[i] = d.QuoteIdent(c)
+		placeholders[i] = "?"
+	}
+	quotedConflicts := make([]string, len(conflictCols))
+	for i, c := range conflictCols {
+		quotedConflicts[i] = d.QuoteIdent(c)
+	}
+	base := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s)",
+		qTable,
+		strings.Join(quotedCols, ", "),
+		strings.Join(placeholders, ", "),
+		strings.Join(quotedConflicts, ", "),
+	)
+	if len(incCols) == 0 && len(overwriteCols) == 0 {
+		return d.Rebind(base + " DO NOTHING")
+	}
+	updates := make([]string, 0, len(incCols)+len(overwriteCols))
+	for _, c := range incCols {
+		qc := d.QuoteIdent(c)
+		updates = append(updates, fmt.Sprintf("%s = %s.%s + EXCLUDED.%s", qc, qTable, qc, qc))
+	}
+	for _, c := range overwriteCols {
+		qc := d.QuoteIdent(c)
+		updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", qc, qc))
+	}
+	return d.Rebind(base + " DO UPDATE SET " + strings.Join(updates, ", "))
 }

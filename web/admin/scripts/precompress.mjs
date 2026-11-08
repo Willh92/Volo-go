@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 
@@ -23,14 +23,13 @@ function deterministicGzip(raw) {
 }
 
 function walkAdminDist(dir) {
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name);
-    const st = statSync(full);
-    if (st.isDirectory()) {
+  for (const ent of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, ent.name);
+    if (ent.isDirectory()) {
       walkAdminDist(full);
       continue;
     }
-    if (full.endsWith(".js") || full.endsWith(".css")) {
+    if (ent.isFile() && (full.endsWith(".js") || full.endsWith(".css"))) {
       const raw = readFileSync(full);
       writeFileSync(`${full}.gz`, deterministicGzip(raw));
       unlinkSync(full);
@@ -39,19 +38,24 @@ function walkAdminDist(dir) {
 }
 
 function precompressFlatDir(srcDir, outDir, suffix = "") {
-  if (!existsSync(srcDir)) {
-    return;
+  let entries;
+  try {
+    entries = readdirSync(srcDir, { withFileTypes: true });
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return;
+    }
+    throw err;
   }
   rmSync(outDir, { recursive: true, force: true });
   mkdirSync(outDir, { recursive: true });
-  for (const name of readdirSync(srcDir)) {
-    if (name.startsWith(".")) continue;
-    if (suffix && !name.endsWith(suffix)) continue;
-    const full = join(srcDir, name);
-    const st = statSync(full);
-    if (!st.isFile()) continue;
+  for (const ent of entries) {
+    if (ent.name.startsWith(".")) continue;
+    if (suffix && !ent.name.endsWith(suffix)) continue;
+    if (!ent.isFile()) continue;
+    const full = join(srcDir, ent.name);
     const raw = readFileSync(full);
-    writeFileSync(join(outDir, `${name}.gz`), deterministicGzip(raw));
+    writeFileSync(join(outDir, `${ent.name}.gz`), deterministicGzip(raw));
   }
 }
 

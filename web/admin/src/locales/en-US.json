@@ -2,7 +2,6 @@
   "meta.code": "en-US",
   "meta.name": "English",
   "meta.dir": "ltr",
-
   "shell.console_title": "Volo Studio Console",
   "shell.brand_sub": "Write & Manage",
   "shell.eyebrow": "WORKSPACE",
@@ -28,7 +27,6 @@
   "ws.distribute": "Distribute & Connect",
   "ws.appearance": "Appearance & Extensions",
   "ws.system": "System & Security",
-
   "nav.caption": "CONTENT & SITE",
   "nav.home": "Overview",
   "nav.group_posts": "Articles",
@@ -64,7 +62,6 @@
   "nav.audit": "Audit Logs",
   "nav.view_site": "Open Public Blog",
   "nav.logout": "Sign Out",
-
   "auth.sign_in": "Sign in to Studio Console",
   "auth.ident": "Username or Email",
   "auth.password": "Password",
@@ -74,13 +71,12 @@
   "auth.totp_code": "6-digit TOTP or Recovery Code",
   "auth.remember_2fa": "Trust this browser for 30 days",
   "auth.verify": "Verify & Continue",
-
   "setup.title": "Initialize Volo-go Sovereign Blog",
   "setup.subtitle": "Pure-Go Single Binary · Multi-Dialect SQL · Clean Architecture",
   "setup.step1": "1. Database Connection Check",
   "setup.step2": "Fresh Setup",
   "setup.step3": "3. Sovereign Admin Account",
-  "setup.legacy_tab": "1-Click Legacy Archive ETL",
+  "setup.legacy_tab": "1-Click Legacy Migration",
   "setup.dialect": "Database Dialect",
   "setup.dialect_sqlite": "SQLite (Pure-Go WAL)",
   "setup.dialect_postgres": "PostgreSQL / Supabase / Neon / CockroachDB",
@@ -106,7 +102,6 @@
   "setup.import_btn": "Stream & Normalize Legacy Backup (.zip / .json)",
   "setup.importing": "Streaming ETL…",
   "setup.legacy_done": "Legacy backup normalized & imported!",
-
   "ed.loading": "Loading Markdown Studio…",
   "ed.placeholder": "Write in Markdown… Drag & drop or paste images directly.",
   "ed.h2": "H2",
@@ -127,7 +122,6 @@
   "ed.hide_preview": "Hide Split Preview",
   "ed.show_preview": "Show Split Preview",
   "ed.live_preview_empty": "Live preview…",
-
   "ov.eyebrow": "YOUR WRITING SPACE",
   "ov.welcome_title": "A calm home for every thought worth keeping.",
   "ov.welcome_desc": "Focused long-form writing, direct taxonomy, and zero-PII data sovereignty — pick up right where you left off.",
@@ -160,7 +154,6 @@
   "ov.top_referers": "Top 10 Referrer Domains",
   "ov.top_referers_empty": "No external referrer domains recorded in this period",
   "ov.hits_unit": "{hits} views",
-
   "art.list": "Manage Articles",
   "art.new": "Write Post",
   "art.import_md": "Batch Import .md / .zip",
@@ -214,7 +207,6 @@
   "art.restore_draft": "Restore",
   "art.discard_draft": "Discard",
   "art.confirm_delete": "Delete this article permanently?",
-
   "cnt.pages": "Standalone Pages",
   "cnt.page_desc": "Standalone Markdown pages decoupled from top navigation and the article timeline (e.g. About, Resume, Now).",
   "cnt.categories": "Categories",
@@ -298,7 +290,6 @@
   "cnt.media_copy": "Copy URL",
   "cnt.media_copy_md": "Copy MD",
   "cnt.media_copied": "Copied to clipboard",
-
   "dist.nav_redirects": "Nav & Redirects",
   "dist.nav": "Navigation Menu",
   "dist.links": "Friend Links",
@@ -393,7 +384,6 @@
   "dist.save_seo": "Save SEO Settings",
   "dist.sync_gh": "Sync GitHub Repos",
   "dist.synced_gh": "Synced {count} public GitHub repositories",
-
   "app.themes": "Theme Skins",
   "app.locales": "Language Packs",
   "app.plugins": "Plugin Center",
@@ -468,7 +458,6 @@
   "app.secret_sealed_hint": "Encrypted (leave blank to keep)",
   "app.logs_title": "Plugin Logs: {id}",
   "app.logs_empty": "No log entries.",
-
   "sys.settings_site": "Site & Reading",
   "sys.settings_io": "Storage & Mail",
   "sys.settings": "Site Settings",
@@ -689,7 +678,6 @@
   "sys.audit_col_actor": "Actor",
   "sys.audit_col_action": "Action",
   "sys.audit_col_res": "Resource & Masked IP",
-
   "tbl.pinned": "Pinned",
   "tbl.protected": "Locked",
   "tbl.locked_block": "Partial Lock",
@@ -708,14 +696,12 @@
   "tbl.status_active": "Active",
   "tbl.status_disabled": "Disabled",
   "tbl.empty": "No records yet",
-
   "nav.github": "Open-Source Showcase",
   "shell.appearance_title": "Appearance & Accent",
   "shell.lang_title": "Switch Language",
   "ui.pg_summary": "{total} total · Page {page} of {pages}",
   "ui.pg_prev": "Previous",
   "ui.pg_next": "Next",
-
   "ed.mode_ir": "Live Render",
   "ed.mode_wysiwyg": "Visual",
   "ed.mode_sv": "Split Preview",
@@ -749,7 +735,6 @@
   "ed.qi_lock_hint_lbl": "Locked Hint",
   "ed.qi_lock_body_lbl": "Protected Content",
   "ed.qi_search_art": "Search articles…",
-
   "art.scheduled_at": "Scheduled Publish Time",
   "art.published_at": "Custom Publish Time (Optional)",
   "art.audio_duration": "Audio Duration (sec)",
@@ -762,7 +747,6 @@
   "art.unpin_action": "Unpin",
   "art.diff_btn": "Diff",
   "art.diff_title": "Revision Diff vs Current Content",
-
   "cnt.lbl_cat_name": "Category Name",
   "cnt.lbl_slug": "URL Slug",
   "cnt.lbl_desc": "Description",
@@ -782,7 +766,6 @@
   "cnt.lbl_page_locale": "Page Locale",
   "cnt.lbl_page_group": "Translation Group ID",
   "cnt.media_total_stat": "{count} files · {mb} MB total",
-
   "dist.lbl_nav_label": "Display Label",
   "dist.lbl_nav_url": "Target URL",
   "dist.lbl_nav_zh": "Simplified Chinese Label",
@@ -827,7 +810,6 @@
   "dist.gh_col_lang": "Language",
   "dist.gh_col_metrics": "Stars / Forks",
   "dist.gh_empty": "No repositories synced yet. Enter your GitHub username above and click Sync.",
-
   "sys.lbl_site_title": "Site Title",
   "sys.lbl_site_sub": "Site Subtitle",
   "sys.lbl_logo_url": "Brand Logo URL",
@@ -877,7 +859,6 @@
   "sys.bak_local_created": "Created local backup snapshot: {name}",
   "sys.bak_col_file": "Snapshot Filename",
   "sys.bak_download": "Download",
-
   "common.save": "Save Changes",
   "common.cancel": "Cancel",
   "common.close": "Close",
@@ -889,13 +870,10 @@
   "common.create": "Create",
   "common.refresh": "Refresh",
   "common.saved": "Saved & hot-reloaded",
-
   "nav.about": "About",
   "nav.help": "Help Guide",
-
   "ed.upload_local_file": "Upload Local File",
   "ed.insert_from_library": "Insert from Media Library",
-
   "cnt.media_picker_title": "Select from Media Library",
   "cnt.media_picker_desc": "Click any asset card to insert immediately, or upload a new file right here.",
   "cnt.media_type_all": "All Types",
@@ -905,11 +883,9 @@
   "cnt.media_orphan_short": "Orphan",
   "cnt.media_used_short": "In Use",
   "cnt.media_pick_btn": "Library",
-
   "art.title_ph": "Enter article title…",
   "art.tag_input_more": "Add another tag…",
   "art.toggle_tag_pool": "Pick existing tags ({count})",
-
   "ov.data_head": "Content Structure & Publishing Cadence",
   "ov.data_sub": "12-month publishing output, category share, and top tag distribution",
   "ov.chart_monthly": "Monthly Articles Published",
@@ -923,7 +899,6 @@
   "ov.recent_logs_head": "Recent Audit Logs",
   "ov.recent_logs_empty": "No recent audit log entries.",
   "ov.view_all_logs": "All Logs",
-
   "auth.back_blog": "Back to Blog",
   "auth.story_eyebrow": "A SPACE FOR YOUR WORDS",
   "auth.story_title_1": "Capture thoughts,",
@@ -942,7 +917,6 @@
   "auth.back_login": "Back to password login",
   "auth.staff_only_tip": "Restricted to site administrators and editors. Protected by Passkey & TOTP 2FA.",
   "auth.oss_motto": "Independent Publishing · Open Web",
-
   "about.refreshed_toast": "Refreshed project & release info",
   "about.hero_sub": "Pure-Go single-binary personal blog & digital garden engine",
   "about.cur_version": "Current Version",
@@ -964,7 +938,6 @@
   "about.credits_head": "Philosophy & License",
   "about.credits_body": "Volo-go focuses on single-binary simplicity, strict security boundaries, zero-PII analytics, and refined editorial typography under the Apache-2.0 license.",
   "about.open_help_btn": "Open Help Guide",
-
   "help.head": "Help & Quick Reference",
   "help.sub": "Search extended Markdown directives, editor shortcuts, CLI operations, and security practices.",
   "help.search_ph": "Filter directives, shortcuts, or ops commands…",
@@ -996,7 +969,6 @@
   "help.sec_item_waf": "Built-in rate limiting, anti-self-lockout IP/CIDR bans, and offline GeoIP rules.",
   "help.sec_item_pat": "Issue scoped, revocable Personal Access Tokens for automation.",
   "help.sec_item_privacy": "Daily rotating-salt SHA-256 PV/UV counters with zero tracking cookies.",
-
   "cnt.new_cat": "New Category",
   "cnt.edit_cat": "Edit Category",
   "cnt.new_tag": "New Tag",
@@ -1031,7 +1003,6 @@
   "cnt.media_confirm_del": "Permanently delete this media asset?",
   "cnt.media_clean_confirm_desc": "Permanently delete {count} unreferenced orphan files (freeing {size})?",
   "cnt.media_open_new": "Open in New Tab",
-
   "dist.new_nav": "New Nav Item",
   "dist.edit_nav": "Edit Nav Item",
   "dist.new_redir": "New Redirect",
@@ -1044,7 +1015,6 @@
   "dist.edit_follow": "Edit Feed",
   "dist.new_wh": "New Webhook",
   "dist.edit_wh": "Edit Webhook",
-
   "sys.lbl_avatar_url": "Avatar Image",
   "sys.avatar_url_ph": "Avatar image URL, or upload / pick from library",
   "sys.upload_img_btn": "Upload Image",
@@ -1063,7 +1033,6 @@
   "sys.pk_modal_title": "Register Passkey",
   "sys.pk_register_btn": "Verify & Register",
   "sys.pat_modal_title": "Generate Personal API Token",
-
   "ui.batch_label": "Batch actions",
   "ui.batch_selected": "{n} selected",
   "ui.batch_clear": "Clear",
@@ -1075,19 +1044,15 @@
   "ui.unsaved_title": "Unsaved Changes",
   "ui.unsaved_msg": "You have unsaved changes in the editor. Leave and discard them?",
   "ui.unsaved_leave": "Discard & Leave",
-
   "cnt.media_scan_btn": "Scan Disk",
   "cnt.media_reconciled": "Local media directory reconciled",
-
   "ed.link_text_ph": "Link text",
   "ed.table_tpl": "| Col 1 | Col 2 | Col 3 |\n| --- | --- | --- |\n| Cell | Cell | Cell |",
   "ed.mob_write": "Write",
   "ed.mob_preview": "Preview",
-
   "sys.import_dryrun_lbl": "Dry-run check only (do not write to database)",
   "sys.import_dryrun_ok": "Dry-run succeeded, review report below",
   "help.sc_item_save": "Save immediately inside post or page editor",
-
   "setup.leg_adjust_head": "2. URL Replacement & Site Overrides (Optional)",
   "setup.leg_adjust_hint": "Automatically converts legacy .html permalinks, nav links, book TOCs, and /image asset paths, normalizing encodings for the selected database dialect.",
   "setup.leg_old_url": "Old Site / Asset URL Prefix (comma-separated)",
@@ -1104,7 +1069,6 @@
   "setup.leg_admin_email": "New Admin Email",
   "setup.leg_admin_pwd": "Reset Password (min 6 chars)",
   "setup.leg_keep_ph": "Blank keeps backup value",
-
   "ov.hide_inspector": "Hide Inspector",
   "ov.show_inspector": "Show Inspector",
   "ov.save_draft": "Save Draft",
@@ -1121,13 +1085,11 @@
   "ov.batch_done": "Updated {n} article(s)",
   "ov.batch_move_cat": "Move Category…",
   "ov.select_all": "Select all on page",
-
   "app.reset_defaults": "Reset to Defaults",
   "app.confirm_reset_cfg": "Reset form values to schema defaults? (Click Save to apply)",
   "app.plugin_reload": "Reload",
   "app.plugin_reloaded": "Plugin reloaded",
   "app.clear_saved_secret": "Clear saved secret",
-
   "cnt.clean_orphans": "Clean Orphans",
   "cnt.cmt_search_ph": "Search author, content, target, or IP…",
   "cnt.confirm_batch_del_cmts": "Permanently delete {n} selected comment(s)? This cannot be undone.",
@@ -1149,7 +1111,6 @@
   "cnt.page_tpl_default": "Standard Layout",
   "cnt.page_tpl_minimal": "Minimal Clean Layout",
   "cnt.page_tpl_wide": "Wide Canvas Layout",
-
   "dist.confirm_batch_del_links": "Delete {n} selected friend link(s)?",
   "dist.confirm_batch_del_redir": "Delete {n} selected redirect rule(s)?",
   "dist.confirm_del_follow": "Remove this feed subscription and its synced items?",
@@ -1160,7 +1121,6 @@
   "dist.feed_verify_bar": "Live Endpoint Verification",
   "dist.follows_preview": "Preview Synced Items",
   "dist.wh_last_err": "Error",
-
   "sys.asset_cdn_hint": "Template: <prefix>/themes/<theme>/assets/<file>?v=<hash>. Leave blank for current origin, or set a pull-CDN origin (https://static.example.com) or local prefix (/cdn-assets)",
   "sys.asset_cdn_prefix": "Site Theme Asset CDN Prefix (Optional)",
   "sys.vendor_cdn_hint": "Template: <prefix>/<pkg>@<ver>/dist/... (backend-unified with automatic multi-mirror fallback). Pick a public npm CDN or enter a self-hosted prefix (/uploads/vendor)",
@@ -1185,17 +1145,14 @@
   "sys.legacy_preview_badge": "Dry-Run Report (No DB Writes)",
   "sys.reauth_pwd_ph": "Enter current password to confirm",
   "sys.reauth_pwd_required": "Please enter your current password to change email/password or disable 2FA",
-
   "nav.logs": "Runtime Logs",
   "mode.auto_desc": "Light 07:00–19:00, dark overnight",
   "mode.system_desc": "Match OS color scheme",
   "mode.light_desc": "Always use warm paper light",
   "mode.dark_desc": "Always use charcoal dark",
-
   "ui.token_count": "{count} items",
   "ui.token_clear": "Clear",
   "ui.token_placeholder": "Press Enter or comma to add, paste supported…",
-
   "app.theme_mobile_badge": "Mobile Active",
   "app.theme_activate_mobile": "Set Mobile Theme",
   "app.mobile_follow_desktop": "Follow Desktop Theme",
@@ -1205,9 +1162,7 @@
   "app.nav_slot_more": "More Menu",
   "app.move_up": "Move Up",
   "app.move_down": "Move Down",
-
   "dist.nav_theme_order": "Header Menu Items & Order",
-
   "sys.enable_license_notice": "Show Article License Notice",
   "sys.license_vars_hint": "Variables: {site} {author} {title} {url} {date}",
   "sys.enable_footer_html": "Enable Custom Footer HTML",
@@ -1221,14 +1176,12 @@
   "sys.logs_clear": "Clear Buffer",
   "sys.logs_clear_confirm": "Clear all entries in the in-memory runtime log buffer?",
   "sys.logs_empty": "No matching runtime log entries",
-
   "common.open": "Expand",
   "ui.select_search_ph": "Filter options…",
   "ui.more_actions": "More actions",
   "ui.select_all_page": "Select all on page",
   "ui.pg_total": "Total {total}",
   "ui.pg_per_page": "{n} / page",
-
   "ov.chart_others": "Others",
   "art.search_ph": "Search title or slug…",
   "art.vis_all": "All Visibility",
@@ -1241,9 +1194,7 @@
   "art.tag_pool_search_ph": "Filter tags…",
   "art.tag_sort_popular": "Popular",
   "art.tag_sort_az": "A–Z",
-
   "ed.qi_search_books": "Search bookshelf titles or authors…",
-
   "cnt.cat_name": "Category Name",
   "cnt.series_title": "Series Title",
   "cnt.tag_sort_count": "Sort: Article Count",
@@ -1256,7 +1207,6 @@
   "cnt.media_sort_size": "Sort: Largest",
   "cnt.media_sort_name": "Sort: File Name",
   "cnt.media_uploaded_n": "Uploaded {count} media files!",
-
   "dist.nav_search_ph": "Filter menu label or URL…",
   "dist.lbl_nav_parent": "Parent Menu Item",
   "dist.nav_parent_none": "— Top-Level Item —",
@@ -1273,7 +1223,6 @@
   "dist.follows_status_err": "Sync Error",
   "dist.wh_search_ph": "Filter channel name or URL…",
   "dist.seo_gh_hint": "Manage GitHub repository sync, showcase selection, and stats cards under Open Source Showcase.",
-
   "sys.social_unsaved_hint": "Remember to click Save Site Identity below to persist social link changes.",
   "sys.totp_copy_secret": "Copy Secret",
   "sys.sess_kick_others": "Sign Out Other Devices",
@@ -1293,7 +1242,6 @@
   "sys.confirm_batch_unban": "Remove {n} selected IP/CIDR ban(s)?",
   "sys.geo_search_ph": "Filter rule name, ISO country, or region…",
   "sys.backup_exporting": "Exporting…",
-
   "app.cfg_export_json": "Export JSON",
   "app.cfg_import_invalid": "Import failed: invalid JSON object",
   "app.cfg_import_json": "Import JSON",
@@ -1362,5 +1310,38 @@
   "setup.confirm_password": "Confirm Password",
   "setup.pwd_mismatch": "Passwords do not match",
   "sys.geo_miss_block": "Block Request (Block)",
-  "sys.logs_autoscroll": "Auto-scroll"
+  "sys.logs_autoscroll": "Auto-scroll",
+  "auth.oidc_err_already_linked": "This SSO identity is already linked to another account.",
+  "auth.oidc_err_disabled": "Single sign-on is unavailable or this account is disabled.",
+  "auth.oidc_err_forbidden": "Your SSO identity does not have permission to sign in here.",
+  "auth.oidc_err_generic": "Single sign-on failed ({reason}).",
+  "auth.oidc_err_state": "The SSO session expired or state check failed. Please try again.",
+  "auth.oidc_err_unlinked": "No staff account is linked to this SSO identity yet. Sign in with your password first and bind it under System → Security.",
+  "sys.clear_saved_secret": "Clear saved secret",
+  "sys.clear_secret_confirm": "Clear the saved secret immediately?",
+  "sys.oidc_col_account": "Provider / Identity",
+  "sys.oidc_confirm_unlink": "Unlink SSO account \"{name}\"?",
+  "sys.oidc_empty": "No external SSO accounts linked yet",
+  "sys.oidc_link_btn": "Link {provider}",
+  "sys.oidc_links_desc": "Bind external OIDC identities to sign in to the Admin Console with single sign-on.",
+  "sys.oidc_links_title": "Linked SSO Accounts",
+  "sys.oidc_unlink_btn": "Unlink",
+  "sys.stepup_backup_desc": "Confirm your current password to generate a full backup download ticket.",
+  "sys.stepup_pwd_required": "Please enter your current password to confirm this action.",
+  "ui.sort_disabled_filtered": "Clear search or status filters before reordering items.",
+  "setup.leg_mode_archive": "Upload Archive (.zip / .json)",
+  "setup.leg_mode_db": "Direct Old DB Migration",
+  "setup.leg_db_desc": "Connect directly to an existing Solo / Bolo / Volo-solo or Volo-go database in read-only streaming mode. Automatically detects table prefixes, articles, taxonomy, comments, and 301 permalinks and migrates straight into the new target database without modifying the old DB.",
+  "setup.leg_target_db_head": "1A. Target New Database (Destination)",
+  "setup.leg_source_db_head": "1B. Legacy Source Database (Read-Only Source)",
+  "setup.leg_source_dsn": "Source Database DSN",
+  "setup.leg_source_dsn_sqlite_ph": "./data/legacy.db",
+  "setup.leg_source_prefix": "Legacy Table Prefix (Optional)",
+  "setup.leg_source_prefix_ph": "Auto-detect if blank (e.g. b3_solo_, solo_, or native)",
+  "setup.leg_test_source_db": "Inspect Source DB",
+  "setup.leg_source_ok": "Detected {schema} ({dialect} · {articles} posts · {comments} comments · {users} users, {ms} ms)",
+  "setup.leg_source_dsn_req": "Please enter the legacy source database DSN",
+  "setup.leg_db_migrate_btn": "Migrate Directly from Source DB to New DB",
+  "setup.leg_db_dryrun_btn": "Run Direct DB Migration Dry-Run (No Writes)",
+  "setup.leg_db_migrating": "Streaming from source database…"
 }

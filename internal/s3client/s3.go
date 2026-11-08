@@ -7,16 +7,26 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/security"
+)
+
+var (
+	validS3EndpointRe  = regexp.MustCompile(`^https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?(/[A-Za-z0-9._/-]*)?$`)
+	validS3BucketRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	validS3KeyPrefixRe = regexp.MustCompile(`^[A-Za-z0-9._/-]*$`)
 )
 
 // Config holds S3 / Cloudflare R2 / MinIO connection settings for pure-Go AWS SigV4 requests.
@@ -46,6 +56,7 @@ func NewClient(cfg Config, safeDialer *security.OutboundSafeDialer) (*Client, er
 	cfg.Bucket = strings.TrimSpace(cfg.Bucket)
 	cfg.AccessKey = strings.TrimSpace(cfg.AccessKey)
 	cfg.SecretKey = strings.TrimSpace(cfg.SecretKey)
+	cfg.KeyPrefix = strings.TrimSpace(cfg.KeyPrefix)
 	cfg.Region = strings.TrimSpace(cfg.Region)
 	if cfg.Region == "" {
 		cfg.Region = "auto"
@@ -53,17 +64,31 @@ func NewClient(cfg Config, safeDialer *security.OutboundSafeDialer) (*Client, er
 	if cfg.Endpoint == "" || cfg.Bucket == "" || cfg.AccessKey == "" || cfg.SecretKey == "" {
 		return nil, errors.New("s3 endpoint, bucket, access_key, and secret_key are required")
 	}
+	if !validS3BucketRe.MatchString(cfg.Bucket) {
+		return nil, fmt.Errorf("invalid s3 bucket name %q", cfg.Bucket)
+	}
+	if !validS3KeyPrefixRe.MatchString(cfg.KeyPrefix) || strings.Contains(cfg.KeyPrefix, "..") {
+		return nil, fmt.Errorf("invalid s3 key_prefix %q", cfg.KeyPrefix)
+	}
 	if !strings.HasPrefix(cfg.Endpoint, "http://") && !strings.HasPrefix(cfg.Endpoint, "https://") {
 		cfg.Endpoint = "https://" + cfg.Endpoint
 	}
-	u, err := url.Parse(cfg.Endpoint)
-	if err != nil || u.Host == "" {
+	if !validS3EndpointRe.MatchString(cfg.Endpoint) {
 		return nil, fmt.Errorf("invalid s3 endpoint %q", cfg.Endpoint)
 	}
+	u, err := url.Parse(cfg.Endpoint)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid s3 endpoint %q", cfg.Endpoint)
+	}
+	cfg.Endpoint = (&url.URL{
+		Scheme: u.Scheme,
+		Host:   u.Host,
+		Path:   strings.TrimRight(u.Path, "/"),
+	}).String()
 
 	if base := strings.TrimSpace(cfg.PublicBaseURL); base != "" {
 		bu, pErr := url.Parse(base)
-		if pErr != nil || (bu.Scheme != "https" && bu.Scheme != "http") || bu.Host == "" {
+		if pErr != nil || (bu.Scheme != "https" && bu.Scheme != "http") || bu.Host == "" || bu.User != nil {
 			return nil, fmt.Errorf("invalid s3 public_base_url %q (must be http:// or https://)", base)
 		}
 	}
@@ -77,6 +102,25 @@ func NewClient(cfg Config, safeDialer *security.OutboundSafeDialer) (*Client, er
 	}
 	if safeDialer != nil {
 		tr.DialContext = safeDialer.DialContext
+	} else {
+		baseDialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, sErr := net.SplitHostPort(addr)
+			if sErr != nil {
+				return nil, sErr
+			}
+			ips, rErr := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			if rErr != nil || len(ips) == 0 {
+				return nil, fmt.Errorf("s3 resolve %q failed: %w", host, rErr)
+			}
+			for _, ip := range ips {
+				ip = ip.Unmap()
+				if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || netip.MustParsePrefix("169.254.0.0/16").Contains(ip) {
+					return nil, fmt.Errorf("s3 SSRF guard: link-local/metadata IP %s blocked", ip)
+				}
+			}
+			return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0].Unmap().String(), port))
+		}
 	}
 	return &Client{
 		cfg: cfg,
@@ -238,6 +282,106 @@ func (c *Client) DeleteObject(ctx context.Context, objectKey string) error {
 	return nil
 }
 
+const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// ObjectInfo summarizes a single S3 object returned by ListObjects.
+type ObjectInfo struct {
+	Key          string
+	LastModified time.Time
+	Size         int64
+}
+
+// ListObjects lists objects matching prefix using S3 ListObjectsV2 (`GET ?list-type=2`),
+// returning keys relative to Config.KeyPrefix so they pass directly to DeleteObject.
+func (c *Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	targetURL, hostHdr, canonicalURI, err := c.buildObjectTarget("")
+	if err != nil {
+		return nil, err
+	}
+	searchPrefix := c.fullKey(prefix)
+	pfxTrim := strings.Trim(c.cfg.KeyPrefix, "/")
+
+	type xmlContent struct {
+		Key          string `xml:"Key"`
+		LastModified string `xml:"LastModified"`
+		Size         int64  `xml:"Size"`
+	}
+	type listBucketResult struct {
+		IsTruncated           bool         `xml:"IsTruncated"`
+		NextContinuationToken string       `xml:"NextContinuationToken"`
+		Contents              []xmlContent `xml:"Contents"`
+	}
+
+	var out []ObjectInfo
+	contToken := ""
+	for page := 0; page < 20; page++ {
+		q := url.Values{}
+		q.Set("list-type", "2")
+		q.Set("max-keys", "1000")
+		if searchPrefix != "" {
+			q.Set("prefix", searchPrefix)
+		}
+		if contToken != "" {
+			q.Set("continuation-token", contToken)
+		}
+		reqURL := targetURL + "?" + canonicalEncodeValues(q)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.signRequest(req, hostHdr, canonicalURI, emptyPayloadSHA256)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("s3 LIST status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		var parsed listBucketResult
+		if err := xml.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("s3 LIST parse XML: %w", err)
+		}
+		for _, item := range parsed.Contents {
+			relKey := strings.TrimLeft(item.Key, "/")
+			if pfxTrim != "" {
+				if strings.HasPrefix(relKey, pfxTrim+"/") {
+					relKey = strings.TrimPrefix(relKey, pfxTrim+"/")
+				} else if relKey == pfxTrim {
+					continue
+				}
+			}
+			if relKey == "" {
+				continue
+			}
+			var modTime time.Time
+			if ts := strings.TrimSpace(item.LastModified); ts != "" {
+				if t, pErr := time.Parse(time.RFC3339Nano, ts); pErr == nil {
+					modTime = t.UTC()
+				} else if t, pErr := time.Parse(time.RFC3339, ts); pErr == nil {
+					modTime = t.UTC()
+				}
+			}
+			out = append(out, ObjectInfo{
+				Key:          relKey,
+				LastModified: modTime,
+				Size:         item.Size,
+			})
+		}
+		if !parsed.IsTruncated || strings.TrimSpace(parsed.NextContinuationToken) == "" {
+			break
+		}
+		contToken = strings.TrimSpace(parsed.NextContinuationToken)
+	}
+	return out, nil
+}
+
 // HealthCheck verifies bucket write/delete connectivity.
 func (c *Client) HealthCheck(ctx context.Context) error {
 	probeKey := ".volo-healthcheck-probe"
@@ -273,8 +417,13 @@ func (c *Client) buildObjectTarget(fullKey string) (targetURL string, hostHdr st
 		}
 	}
 	targetURL = u.Scheme + "://" + hostHdr + canonicalURI
+	if !validS3TargetURLRe.MatchString(targetURL) {
+		return "", "", "", fmt.Errorf("invalid s3 target url")
+	}
 	return targetURL, hostHdr, canonicalURI, nil
 }
+
+var validS3TargetURLRe = regexp.MustCompile(`^https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?(/[^\s?#]*)?$`)
 
 func (c *Client) signRequest(req *http.Request, hostHdr string, canonicalURI string, payloadHash string) {
 	now := c.nowFn().UTC()
@@ -310,10 +459,15 @@ func (c *Client) signRequest(req *http.Request, hostHdr string, canonicalURI str
 	}
 	signedHeaders := strings.Join(keys, ";")
 
+	canonQuery := ""
+	if req.URL != nil && req.URL.RawQuery != "" {
+		canonQuery = canonicalQueryString(req.URL.RawQuery)
+	}
+
 	canonicalReq := strings.Join([]string{
 		req.Method,
 		canonicalURI,
-		"",
+		canonQuery,
 		canonHeaders.String(),
 		signedHeaders,
 		payloadHash,
@@ -338,6 +492,80 @@ func (c *Client) signRequest(req *http.Request, hostHdr string, canonicalURI str
 	req.Header.Set("Authorization", authHeader)
 }
 
+func awsURIQueryEscape(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	const upperhex = "0123456789ABCDEF"
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == '~' {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('%')
+			b.WriteByte(upperhex[c>>4])
+			b.WriteByte(upperhex[c&0x0F])
+		}
+	}
+	return b.String()
+}
+
+func canonicalEncodeValues(vals url.Values) string {
+	type kv struct{ k, v string }
+	pairs := make([]kv, 0, len(vals))
+	for k, vs := range vals {
+		ek := awsURIQueryEscape(k)
+		if len(vs) == 0 {
+			pairs = append(pairs, kv{k: ek, v: ""})
+			continue
+		}
+		for _, v := range vs {
+			pairs = append(pairs, kv{k: ek, v: awsURIQueryEscape(v)})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].k != pairs[j].k {
+			return pairs[i].k < pairs[j].k
+		}
+		return pairs[i].v < pairs[j].v
+	})
+	parts := make([]string, len(pairs))
+	for i, p := range pairs {
+		parts[i] = p.k + "=" + p.v
+	}
+	return strings.Join(parts, "&")
+}
+
+func canonicalQueryString(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	if vals, err := url.ParseQuery(rawQuery); err == nil {
+		return canonicalEncodeValues(vals)
+	}
+	vals := url.Values{}
+	for _, seg := range strings.Split(rawQuery, "&") {
+		if seg == "" {
+			continue
+		}
+		k, v, hasEq := strings.Cut(seg, "=")
+		uk, errK := url.QueryUnescape(k)
+		if errK != nil {
+			uk = k
+		}
+		uv := ""
+		if hasEq {
+			if decV, errV := url.QueryUnescape(v); errV == nil {
+				uv = decV
+			} else {
+				uv = v
+			}
+		}
+		vals.Add(uk, uv)
+	}
+	return canonicalEncodeValues(vals)
+}
+
 func deriveSigV4Key(secret, dateStamp, region, service string) []byte {
 	kDate := hmacSHA256([]byte("AWS4"+secret), dateStamp)
 	kRegion := hmacSHA256(kDate, region)
@@ -356,7 +584,11 @@ func hmacSHA256Hex(key []byte, data string) string {
 }
 
 func escapeS3KeyPath(key string) string {
-	parts := strings.Split(strings.TrimLeft(key, "/"), "/")
+	trimmed := strings.TrimLeft(key, "/")
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(trimmed, "/")
 	for i, p := range parts {
 		parts[i] = strings.ReplaceAll(url.PathEscape(p), "+", "%20")
 	}

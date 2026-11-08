@@ -337,16 +337,23 @@ type PageContext struct {
 	ArchiveYears           []ArchiveYearStat
 	ArchiveGroups          []ArchiveYearGroup
 	SeriesList             []domain.Series
-	Books                  []domain.Book
-	BookDetail             content.BookDetailView
-	ActiveChapter          *domain.BookChapter
-	ActiveChapterHTML      string
-	ActiveChapterNeedsMath bool
-	PrevChapter            *domain.BookChapter
-	NextChapter            *domain.BookChapter
-	LinksByCategory        map[string][]domain.Link
-	LinkGroups             []LinkCategoryGroup
-	FollowGroups           []content.FollowGroup
+	Books                     []domain.Book
+	BookDetail                content.BookDetailView
+	ActiveChapter             *domain.BookChapter
+	ActiveChapterHTML         string
+	ActiveChapterNeedsMath    bool
+	ActiveChapterNeedsMermaid bool
+	PrevChapter               *domain.BookChapter
+	NextChapter               *domain.BookChapter
+	ReaderNextURL             string
+	ReaderAuthError           string
+	BookLocked                bool
+	BookUnlockError           string
+	BookArticleID             string
+	BookArticleSlug           string
+	LinksByCategory           map[string][]domain.Link
+	LinkGroups                []LinkCategoryGroup
+	FollowGroups              []content.FollowGroup
 
 	// Sidebar & Global Lists
 	SidebarCategories  []content.CategoryWithCount
@@ -506,6 +513,10 @@ func (e *Engine) inspectThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 	}
 	collectPages(fallbackFS, false)
 	collectPages(fsys, true)
+	if !hasOwnPage["index.html"] && hasOwnPage["home.html"] {
+		pageNames["index.html"] = struct{}{}
+		hasOwnPage["index.html"] = true
+	}
 	if len(pageNames) == 0 {
 		return nil, fmt.Errorf("theme %s: no page templates found", mf.ID)
 	}
@@ -548,7 +559,7 @@ func walkThemeTemplates(srcFS fs.FS, visit func(rel string)) {
 	})
 }
 
-func readThemeTemplateFile(srcFS fs.FS, rel string) ([]byte, error) {
+func readThemeTemplateFileExact(srcFS fs.FS, rel string) ([]byte, error) {
 	if srcFS == nil {
 		return nil, fs.ErrNotExist
 	}
@@ -565,6 +576,19 @@ func readThemeTemplateFile(srcFS fs.FS, rel string) ([]byte, error) {
 	}
 	defer gr.Close()
 	return io.ReadAll(io.LimitReader(gr, maxExternalAssetSingleBytes))
+}
+
+func readThemeTemplateFile(srcFS fs.FS, rel string) ([]byte, error) {
+	b, err := readThemeTemplateFileExact(srcFS, rel)
+	if err == nil {
+		return b, nil
+	}
+	if rel == "index.html" {
+		if hb, hErr := readThemeTemplateFileExact(srcFS, "home.html"); hErr == nil {
+			return hb, nil
+		}
+	}
+	return nil, err
 }
 
 const (
@@ -849,15 +873,22 @@ func (e *Engine) List() []Manifest {
 
 func defaultPageTemplateOptions() []ConfigOption {
 	return []ConfigOption{
-		{Value: "default", Label: map[string]string{"zh-CN": "默认排版", "en-US": "Default"}},
-		{Value: "wide", Label: map[string]string{"zh-CN": "宽屏画布", "en-US": "Wide Canvas"}},
-		{Value: "minimal", Label: map[string]string{"zh-CN": "极简阅读", "en-US": "Minimal"}},
+		{Value: "default", Label: map[string]string{"zh-CN": "标准版式", "en-US": "Default Layout", "zh-TW": "標準版式"}},
+		{Value: "wide", Label: map[string]string{"zh-CN": "宽幅展示", "en-US": "Wide Showcase", "zh-TW": "寬幅展示"}},
+		{Value: "minimal", Label: map[string]string{"zh-CN": "极简阅读", "en-US": "Minimal Sheet", "zh-TW": "極簡閱讀"}},
 	}
 }
 
 // ListLocalized returns all loaded themes with locale-resolved names, descriptions, preview URLs, and config schemas.
 func (e *Engine) ListLocalized(locale string) []LocalizedTheme {
 	manifests := e.List()
+	var builtinPageTpls []ConfigOption
+	for _, m := range manifests {
+		if m.ID == DefaultThemeID && len(m.PageTemplates) > 0 {
+			builtinPageTpls = m.PageTemplates
+			break
+		}
+	}
 	out := make([]LocalizedTheme, 0, len(manifests))
 	for _, mf := range manifests {
 		dispName := pickLocalizedMapValue(mf.Name, locale, mf.ID)
@@ -888,7 +919,12 @@ func (e *Engine) ListLocalized(locale string) []LocalizedTheme {
 		}
 		rawPageTpls := mf.PageTemplates
 		if len(rawPageTpls) == 0 {
-			rawPageTpls = defaultPageTemplateOptions()
+			if len(builtinPageTpls) > 0 {
+				rawPageTpls = builtinPageTpls
+			} else {
+				rawPageTpls = defaultPageTemplateOptions()
+			}
+			mf.PageTemplates = rawPageTpls
 		}
 		locPageTpls := make([]LocalizedConfigOption, 0, len(rawPageTpls))
 		for _, pt := range rawPageTpls {
@@ -946,19 +982,11 @@ func (e *Engine) ResolveThemeConfig(themeID string, saved map[string]map[string]
 	return out
 }
 
-// IsMobileRequest detects mobile phone user-agents and Client Hints (`Sec-CH-UA-Mobile: ?1`),
-// while allowing staff preview overrides via `?device=mobile` or `?device=desktop`.
+// IsMobileRequest detects mobile phone user-agents and Client Hints (`Sec-CH-UA-Mobile: ?1`).
+// Query parameters (`?device=`) are intentionally ignored here so unauthenticated requests cannot spoof device detection.
 func IsMobileRequest(r *http.Request) bool {
 	if r == nil {
 		return false
-	}
-	if dev := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("device"))); dev != "" {
-		if dev == "mobile" || dev == "phone" {
-			return true
-		}
-		if dev == "desktop" || dev == "pc" {
-			return false
-		}
 	}
 	if strings.TrimSpace(r.Header.Get("Sec-CH-UA-Mobile")) == "?1" {
 		return true
@@ -996,11 +1024,12 @@ func (e *Engine) ResolveActiveTheme(r *http.Request, viewer *domain.User, config
 	return DefaultThemeID
 }
 
-// ResolveThemeForRequest resolves the active theme taking into account staff preview params,
+// ResolveThemeForRequest resolves the active theme taking into account staff preview params (`?skin`, `?theme_preview`, `?device`),
 // separate MobileTheme configuration on mobile requests, and desktop ActiveTheme fallback.
 func (e *Engine) ResolveThemeForRequest(r *http.Request, viewer *domain.User, app domain.AppearanceSettings) string {
-	if r != nil && viewer != nil && viewer.Status == domain.UserStatusActive &&
-		(viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor) {
+	isStaff := r != nil && viewer != nil && viewer.Status == domain.UserStatusActive &&
+		(viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor)
+	if isStaff {
 		q := r.URL.Query()
 		for _, param := range []string{"skin", "theme_preview"} {
 			if candidate := strings.TrimSpace(q.Get(param)); candidate != "" && e.Has(candidate) {
@@ -1008,7 +1037,16 @@ func (e *Engine) ResolveThemeForRequest(r *http.Request, viewer *domain.User, ap
 			}
 		}
 	}
-	if mob := strings.TrimSpace(app.MobileTheme); mob != "" && mob != "same" && IsMobileRequest(r) && e.Has(mob) {
+	isMobile := IsMobileRequest(r)
+	if isStaff {
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("device"))) {
+		case "mobile", "phone":
+			isMobile = true
+		case "desktop", "pc":
+			isMobile = false
+		}
+	}
+	if mob := strings.TrimSpace(app.MobileTheme); mob != "" && mob != "same" && isMobile && e.Has(mob) {
 		return mob
 	}
 	return e.ResolveActiveTheme(r, viewer, app.ActiveTheme)
@@ -1042,6 +1080,10 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 	for _, cand := range candidates {
 		if th.hasOwnPage[cand] {
 			selected = cand
+			break
+		}
+		if cand == "index.html" && th.hasOwnPage["home.html"] {
+			selected = "home.html"
 			break
 		}
 	}
@@ -1142,7 +1184,7 @@ func (e *Engine) prependVendorHeadSlot(data *PageContext) {
 	var sb strings.Builder
 	needsVendor := data.Detail.NeedsMath || data.Detail.NeedsMermaid ||
 		data.StandalonePage.NeedsMath || data.StandalonePage.NeedsMermaid ||
-		data.ActiveChapterNeedsMath
+		data.ActiveChapterNeedsMath || data.ActiveChapterNeedsMermaid
 	if needsVendor {
 		if origin := extractOriginForPreconnect(primary); origin != "" {
 			sb.WriteString(`<link rel="preconnect" href="`)

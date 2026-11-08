@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/netip"
 	"net/smtp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,7 @@ type MailMessage struct {
 type Mailer struct {
 	dialTimeout time.Duration
 	resolver    func(ctx context.Context, host string) ([]netip.Addr, error)
+	dialFn      func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // NewMailer constructs a strict-TLS SMTP Mailer.
@@ -100,6 +102,10 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 	}
 
 	dialer := &net.Dialer{Timeout: m.dialTimeout}
+	dialRaw := dialer.DialContext
+	if m.dialFn != nil {
+		dialRaw = m.dialFn
+	}
 
 	tlsCfg := &tls.Config{
 		ServerName:         host,
@@ -110,12 +116,26 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 	var client *smtp.Client
 	switch secMode {
 	case "tls":
-		resolvedIP, rErr := m.resolvePublicOnlyAddr(ctx, host)
+		resolvedIPs, rErr := m.resolvePublicOnlyAddrs(ctx, host)
 		if rErr != nil {
 			return rErr
 		}
-		pinnedAddr := net.JoinHostPort(resolvedIP.String(), strconv.Itoa(port))
-		conn, dErr := tls.DialWithDialer(dialer, "tcp", pinnedAddr, tlsCfg)
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsCfg}
+		conn, dErr := dialPinnedTargets(ctx, resolvedIPs, port, func(dCtx context.Context, pinnedAddr string) (net.Conn, error) {
+			if m.dialFn == nil {
+				return tlsDialer.DialContext(dCtx, "tcp", pinnedAddr)
+			}
+			rawConn, err := m.dialFn(dCtx, "tcp", pinnedAddr)
+			if err != nil {
+				return nil, err
+			}
+			tlsConn := tls.Client(rawConn, tlsCfg)
+			if err := tlsConn.HandshakeContext(dCtx); err != nil {
+				_ = rawConn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		})
 		if dErr != nil {
 			return fmt.Errorf("notify: smtp implicit TLS dial failed: %w", dErr)
 		}
@@ -132,12 +152,13 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 		client = c
 
 	case "starttls":
-		resolvedIP, rErr := m.resolvePublicOnlyAddr(ctx, host)
+		resolvedIPs, rErr := m.resolvePublicOnlyAddrs(ctx, host)
 		if rErr != nil {
 			return rErr
 		}
-		pinnedAddr := net.JoinHostPort(resolvedIP.String(), strconv.Itoa(port))
-		conn, dErr := dialer.DialContext(ctx, "tcp", pinnedAddr)
+		conn, dErr := dialPinnedTargets(ctx, resolvedIPs, port, func(dCtx context.Context, pinnedAddr string) (net.Conn, error) {
+			return dialRaw(dCtx, "tcp", pinnedAddr)
+		})
 		if dErr != nil {
 			return fmt.Errorf("notify: smtp dial failed: %w", dErr)
 		}
@@ -163,11 +184,13 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 
 	case "plain_internal":
 		// Enforce loopback / RFC1918 internal-network-only boundary!
-		resolvedIP, rErr := m.resolveInternalOnlyAddr(ctx, host)
+		resolvedIPs, rErr := m.resolveInternalOnlyAddrs(ctx, host)
 		if rErr != nil {
 			return rErr
 		}
-		conn, dErr := dialer.DialContext(ctx, "tcp", net.JoinHostPort(resolvedIP.String(), strconv.Itoa(port)))
+		conn, dErr := dialPinnedTargets(ctx, resolvedIPs, port, func(dCtx context.Context, pinnedAddr string) (net.Conn, error) {
+			return dialRaw(dCtx, "tcp", pinnedAddr)
+		})
 		if dErr != nil {
 			return fmt.Errorf("notify: internal smtp dial failed: %w", dErr)
 		}
@@ -215,34 +238,89 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 	return client.Quit()
 }
 
-func (m *Mailer) resolvePublicOnlyAddr(ctx context.Context, host string) (netip.Addr, error) {
-	clean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	if clean == "localhost" || strings.HasSuffix(clean, ".localhost") || strings.HasSuffix(clean, ".internal") {
-		return netip.Addr{}, fmt.Errorf("notify: %s SMTP mode refuses internal host %q", "tls/starttls", host)
-	}
-	ips, err := m.resolver(ctx, host)
-	if err != nil || len(ips) == 0 {
-		return netip.Addr{}, fmt.Errorf("notify: cannot resolve SMTP host %q", host)
-	}
-	for _, ip := range ips {
-		if !security.IsPublicRoutableIP(ip) {
-			return netip.Addr{}, fmt.Errorf("notify: tls/starttls SMTP mode refuses non-public IP %s", ip.String())
+func orderAddrsIPv4First(ips []netip.Addr) []netip.Addr {
+	out := make([]netip.Addr, 0, len(ips))
+	seen := make(map[netip.Addr]bool, len(ips))
+	for _, raw := range ips {
+		ip := raw.Unmap()
+		if !ip.IsValid() || seen[ip] {
+			continue
 		}
+		seen[ip] = true
+		out = append(out, ip)
 	}
-	return ips[0], nil
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Is4() && !out[j].Is4()
+	})
+	return out
 }
 
-func (m *Mailer) resolveInternalOnlyAddr(ctx context.Context, host string) (netip.Addr, error) {
-	ips, err := m.resolver(ctx, host)
-	if err != nil || len(ips) == 0 {
-		return netip.Addr{}, fmt.Errorf("notify: cannot resolve internal SMTP host %q", host)
+func dialPinnedTargets(
+	ctx context.Context,
+	addrs []netip.Addr,
+	port int,
+	dialFn func(ctx context.Context, pinnedAddr string) (net.Conn, error),
+) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	for _, ip := range ips {
-		if !ip.IsLoopback() && !ip.IsPrivate() {
-			return netip.Addr{}, fmt.Errorf("notify: plain_internal SMTP mode refuses public IP %s (use tls or starttls)", ip.String())
+	portStr := strconv.Itoa(port)
+	var lastErr error
+	for _, ip := range addrs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err := dialFn(ctx, net.JoinHostPort(ip.String(), portStr))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, lastErr
 		}
 	}
-	return ips[0], nil
+	if lastErr == nil {
+		lastErr = errors.New("no resolved target addresses")
+	}
+	return nil, lastErr
+}
+
+func (m *Mailer) resolvePublicOnlyAddrs(ctx context.Context, host string) ([]netip.Addr, error) {
+	clean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if clean == "localhost" || strings.HasSuffix(clean, ".localhost") || strings.HasSuffix(clean, ".internal") {
+		return nil, fmt.Errorf("notify: %s SMTP mode refuses internal host %q", "tls/starttls", host)
+	}
+	ips, err := m.resolver(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("notify: cannot resolve SMTP host %q", host)
+	}
+	ordered := orderAddrsIPv4First(ips)
+	if len(ordered) == 0 {
+		return nil, fmt.Errorf("notify: cannot resolve SMTP host %q", host)
+	}
+	for _, ip := range ordered {
+		if !security.IsPublicRoutableIP(ip) {
+			return nil, fmt.Errorf("notify: tls/starttls SMTP mode refuses non-public IP %s", ip.String())
+		}
+	}
+	return ordered, nil
+}
+
+func (m *Mailer) resolveInternalOnlyAddrs(ctx context.Context, host string) ([]netip.Addr, error) {
+	ips, err := m.resolver(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("notify: cannot resolve internal SMTP host %q", host)
+	}
+	ordered := orderAddrsIPv4First(ips)
+	if len(ordered) == 0 {
+		return nil, fmt.Errorf("notify: cannot resolve internal SMTP host %q", host)
+	}
+	for _, ip := range ordered {
+		if !ip.IsLoopback() && !ip.IsPrivate() {
+			return nil, fmt.Errorf("notify: plain_internal SMTP mode refuses public IP %s (use tls or starttls)", ip.String())
+		}
+	}
+	return ordered, nil
 }
 
 func sanitizeHeaderToken(s string) string {

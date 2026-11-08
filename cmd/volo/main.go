@@ -64,6 +64,8 @@ func runCLI(ctx context.Context, args []string, stdout io.Writer, stderr io.Writ
 		return cmdServe(ctx, args[1:], stdout, stderr)
 	case "admin":
 		return cmdAdmin(ctx, args[1:], stdout, stderr)
+	case "passwd":
+		return cmdAdmin(ctx, append([]string{"reset-password"}, args[1:]...), stdout, stderr)
 	case "backup":
 		return cmdBackup(ctx, args[1:], stdout, stderr)
 	case "import-legacy":
@@ -359,6 +361,17 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		_ = notifier.Close(shutCtx)
 	}()
 
+	// Singleton rolling local + S3/WebDAV/plugin backup scheduler shared with Admin API
+	backupSched := backup.NewScheduler(backup.SchedulerOptions{
+		Store:          store,
+		Settings:       settingsMgr,
+		Plugins:        pluginMgr,
+		BackupDir:      cfg.BackupDir,
+		UploadDir:      cfg.UploadDir,
+		OutboundDialer: outboundDialer,
+		Logger:         logging.TeeWriter(stderr, logging.Default()),
+	})
+
 	startedAt := time.Now()
 	appSrv, err := server.NewAppServer(server.AppDeps{
 		Config:               cfg,
@@ -368,6 +381,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		OutboundDialer:       outboundDialer,
 		Plugins:              pluginMgr,
 		Media:                mediaPipe,
+		BackupScheduler:      backupSched,
 		StartedAt:            startedAt,
 		Version:              Version,
 		SendVerificationMail: notifier.SendVerificationCode,
@@ -403,16 +417,6 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	// Background rolling local + S3/WebDAV/plugin backup scheduler
-	backupSched := backup.NewScheduler(backup.SchedulerOptions{
-		Store:          store,
-		Settings:       settingsMgr,
-		Plugins:        pluginMgr,
-		BackupDir:      cfg.BackupDir,
-		UploadDir:      cfg.UploadDir,
-		OutboundDialer: outboundDialer,
-		Logger:         logging.TeeWriter(stderr, logging.Default()),
-	})
 	backupSched.Start(ctx)
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -562,6 +566,9 @@ func cmdAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 			if _, sErr := tx.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ?`, u.ID); sErr != nil {
 				return sErr
 			}
+			if _, tErr := tx.ExecContext(ctx, `DELETE FROM api_tokens WHERE user_id = ?`, u.ID); tErr != nil {
+				return tErr
+			}
 			_, aErr := tx.ExecContext(ctx,
 				`INSERT INTO audit_logs (id, actor_id, actor_name, action, resource_type, resource_id, client_ip, detail_json, created_at)
 				 VALUES (?, ?, 'cli', 'admin.reset_password', 'user', ?, 'local-cli', '{}', ?)`,
@@ -572,7 +579,7 @@ func cmdAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 			fmt.Fprintf(stderr, "volo admin reset-password: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "Password reset complete for user %q (id=%s); all active sessions revoked.\n", targetUser.Username, targetUser.ID)
+		fmt.Fprintf(stdout, "Password reset complete for user %q (id=%s); all active sessions and API tokens revoked.\n", targetUser.Username, targetUser.ID)
 		if generated {
 			fmt.Fprintf(stdout, "Generated temporary password: %s\n", rawPass)
 		}

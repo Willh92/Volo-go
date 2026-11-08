@@ -57,7 +57,8 @@ func (s *AppServer) resolveCustomFaviconRedirect() string {
 		return ""
 	}
 	lower := strings.ToLower(fav)
-	if strings.HasPrefix(fav, "/") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+	if (strings.HasPrefix(fav, "/") && !strings.HasPrefix(fav, "//") && !strings.HasPrefix(fav, `/\`)) ||
+		strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		return fav
 	}
 	return ""

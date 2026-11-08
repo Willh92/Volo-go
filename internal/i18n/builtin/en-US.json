@@ -216,5 +216,12 @@
   "error.search_site": "Search Site",
   "studio.close": "Close",
   "studio.lightbox_label": "Image Preview",
-  "studio.lightbox_close": "Close Preview"
+  "studio.lightbox_close": "Close Preview",
+  "sidebar.view_all": "View all",
+  "bookshelf.filter_chapters": "Filter chapters…",
+  "studio.filter_placeholder": "Filter by keyword…",
+  "studio.filter_empty": "No matching items",
+  "studio.clear_filter": "Clear",
+  "reader.no_account_cta": "New reader? Create an account",
+  "reader.has_account_cta": "Already have an account? Sign in"
 }

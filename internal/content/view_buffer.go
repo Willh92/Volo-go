@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -27,13 +28,14 @@ type topItemBucketKey struct {
 type viewAnalyticsBuffer struct {
 	store *sqlx.Store
 
-	mu           sync.RWMutex
-	dirty        bool
-	articleViews map[string]int64
-	pageViews    map[string]int64
-	redirectHits map[string]int64
-	daily        map[string]dailyTrafficDelta
-	topItems     map[topItemBucketKey]int64
+	mu                       sync.RWMutex
+	dirty                    bool
+	articleViews             map[string]int64
+	pageViews                map[string]int64
+	redirectHits             map[string]int64
+	daily                    map[string]dailyTrafficDelta
+	topItems                 map[topItemBucketKey]int64
+	totalPendingArticleViews atomic.Int64
 
 	loopOnce sync.Once
 	stopCh   chan struct{}
@@ -90,6 +92,7 @@ func (b *viewAnalyticsBuffer) RecordView(targetType string, targetID string, sta
 	b.dirty = true
 	if targetType == domain.TargetTypeArticle && targetID != "" {
 		b.articleViews[targetID]++
+		b.totalPendingArticleViews.Add(1)
 		if len(b.topItems) < 8192 {
 			b.topItems[topItemBucketKey{statDate: statDate, kind: "article", itemKey: targetID}]++
 		}
@@ -134,6 +137,16 @@ func (b *viewAnalyticsBuffer) PendingArticleViews(articleID string) int64 {
 	return n
 }
 
+func (b *viewAnalyticsBuffer) TotalPendingArticleViews() int64 {
+	if b == nil {
+		return 0
+	}
+	if n := b.totalPendingArticleViews.Load(); n > 0 {
+		return n
+	}
+	return 0
+}
+
 func (b *viewAnalyticsBuffer) PendingPageViews(pageID string) int64 {
 	if b == nil || pageID == "" {
 		return 0
@@ -160,6 +173,16 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 	redSnap := b.redirectHits
 	dailySnap := b.daily
 	topSnap := b.topItems
+
+	var drainedArtViews int64
+	for _, v := range artSnap {
+		if v > 0 {
+			drainedArtViews += v
+		}
+	}
+	if drainedArtViews > 0 {
+		b.totalPendingArticleViews.Add(-drainedArtViews)
+	}
 
 	b.articleViews = make(map[string]int64)
 	b.pageViews = make(map[string]int64)
@@ -203,34 +226,19 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 				return e
 			}
 		}
+		upsertDaily := tx.Dialect().UpsertIncrementSQL(
+			"analytics_daily",
+			[]string{"stat_date", "pv", "uv", "updated_at"},
+			[]string{"stat_date"},
+			[]string{"pv", "uv"},
+			[]string{"updated_at"},
+		)
 		for statDate, d := range dailySnap {
 			if d.pv <= 0 && d.uv <= 0 {
 				continue
 			}
-			res, e := tx.ExecContext(
-				ctx,
-				`UPDATE analytics_daily SET pv = pv + ?, uv = uv + ?, updated_at = ? WHERE stat_date = ?`,
-				d.pv, d.uv, now, statDate,
-			)
-			if e != nil {
+			if _, e := tx.ExecContext(ctx, upsertDaily, statDate, d.pv, d.uv, now); e != nil {
 				return e
-			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				upsert := tx.Dialect().UpsertSQL(
-					"analytics_daily",
-					[]string{"stat_date", "pv", "uv", "updated_at"},
-					[]string{"stat_date"},
-					[]string{"updated_at"},
-				)
-				if _, iErr := tx.ExecContext(ctx, upsert, statDate, d.pv, d.uv, now); iErr != nil {
-					if _, uErr := tx.ExecContext(
-						ctx,
-						`UPDATE analytics_daily SET pv = pv + ?, uv = uv + ?, updated_at = ? WHERE stat_date = ?`,
-						d.pv, d.uv, now, statDate,
-					); uErr != nil {
-						return iErr
-					}
-				}
 			}
 		}
 		return nil
@@ -239,10 +247,17 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 		const maxFailedRestoreKeys = 4096
 		// Restore deltas (bounded to maxFailedRestoreKeys) so transient lock/IO errors neither drop counts nor grow unbounded.
 		b.mu.Lock()
+		var restoredArtViews int64
 		for k, v := range artSnap {
 			if _, ok := b.articleViews[k]; ok || len(b.articleViews) < maxFailedRestoreKeys {
 				b.articleViews[k] += v
+				if v > 0 {
+					restoredArtViews += v
+				}
 			}
+		}
+		if restoredArtViews > 0 {
+			b.totalPendingArticleViews.Add(restoredArtViews)
 		}
 		for k, v := range pageSnap {
 			if _, ok := b.pageViews[k]; ok || len(b.pageViews) < maxFailedRestoreKeys {
@@ -286,6 +301,7 @@ func (b *viewAnalyticsBuffer) Reset() {
 	b.daily = make(map[string]dailyTrafficDelta)
 	b.topItems = make(map[topItemBucketKey]int64)
 	b.dirty = false
+	b.totalPendingArticleViews.Store(0)
 	b.mu.Unlock()
 }
 
@@ -321,32 +337,13 @@ func (b *viewAnalyticsBuffer) Close(ctx context.Context) error {
 }
 
 func upsertDailyTopItemDeltaTx(ctx context.Context, tx *sqlx.Tx, statDate string, kind string, itemKey string, delta int64) error {
-	res, err := tx.ExecContext(
-		ctx,
-		`UPDATE analytics_top_items SET hits = hits + ? WHERE stat_date = ? AND kind = ? AND item_key = ?`,
-		delta, statDate, kind, itemKey,
-	)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		return nil
-	}
-	upsert := tx.Dialect().UpsertSQL(
+	upsert := tx.Dialect().UpsertIncrementSQL(
 		"analytics_top_items",
 		[]string{"stat_date", "kind", "item_key", "hits"},
 		[]string{"stat_date", "kind", "item_key"},
-		[]string{},
+		[]string{"hits"},
+		nil,
 	)
-	if _, iErr := tx.ExecContext(ctx, upsert, statDate, kind, itemKey, delta); iErr != nil {
-		_, uErr := tx.ExecContext(
-			ctx,
-			`UPDATE analytics_top_items SET hits = hits + ? WHERE stat_date = ? AND kind = ? AND item_key = ?`,
-			delta, statDate, kind, itemKey,
-		)
-		if uErr != nil {
-			return iErr
-		}
-	}
-	return nil
+	_, err := tx.ExecContext(ctx, upsert, statDate, kind, itemKey, delta)
+	return err
 }

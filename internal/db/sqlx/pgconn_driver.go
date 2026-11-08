@@ -2,6 +2,7 @@ package sqlx
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
 	"errors"
@@ -38,8 +39,47 @@ type pgConnConnector struct {
 
 type pgConnDriver struct{}
 
+func parsePGConnConfig(dsn string, defaultSimple bool) (*pgconn.Config, bool, error) {
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return nil, false, err
+	}
+	simple := defaultSimple
+	for k, v := range cfg.RuntimeParams {
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "prefer_simple_protocol":
+			val := strings.ToLower(strings.TrimSpace(v))
+			if val == "true" || val == "1" {
+				simple = true
+			} else if val == "false" || val == "0" {
+				simple = defaultSimple
+			}
+			delete(cfg.RuntimeParams, k)
+		case "default_query_exec_mode":
+			if strings.EqualFold(strings.TrimSpace(v), "simple_protocol") {
+				simple = true
+			}
+			delete(cfg.RuntimeParams, k)
+		}
+	}
+	return cfg, simple, nil
+}
+
+func wrapPGErr(conn *pgconn.PgConn, ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return err
+	}
+	if (ctx == nil || ctx.Err() == nil) && (conn == nil || conn.IsClosed() || pgconn.SafeToRetry(err)) {
+		return fmt.Errorf("%w: %v", driver.ErrBadConn, err)
+	}
+	return err
+}
+
 func (d pgConnDriver) Open(name string) (driver.Conn, error) {
-	cfg, err := pgconn.ParseConfig(name)
+	cfg, simpleProto, err := parsePGConnConfig(name, false)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +89,7 @@ func (d pgConnDriver) Open(name string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &pgDriverConn{conn: c}, nil
+	return &pgDriverConn{conn: c, simpleProtocol: simpleProto}, nil
 }
 
 func (c *pgConnConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -89,13 +129,41 @@ func (c *pgDriverConn) Begin() (driver.Tx, error) {
 	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-func (c *pgDriverConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	beginSQL := "BEGIN"
+func buildPGBeginSQL(opts driver.TxOptions) (string, error) {
+	var iso string
+	switch sql.IsolationLevel(opts.Isolation) {
+	case sql.LevelDefault:
+	case sql.LevelReadUncommitted:
+		iso = "ISOLATION LEVEL READ UNCOMMITTED"
+	case sql.LevelReadCommitted:
+		iso = "ISOLATION LEVEL READ COMMITTED"
+	case sql.LevelRepeatableRead, sql.LevelSnapshot:
+		iso = "ISOLATION LEVEL REPEATABLE READ"
+	case sql.LevelSerializable:
+		iso = "ISOLATION LEVEL SERIALIZABLE"
+	default:
+		return "", fmt.Errorf("sqlx: unsupported postgres isolation level %v", sql.IsolationLevel(opts.Isolation))
+	}
+	if iso == "" {
+		if opts.ReadOnly {
+			return "BEGIN READ ONLY", nil
+		}
+		return "BEGIN", nil
+	}
+	accessMode := "READ WRITE"
 	if opts.ReadOnly {
-		beginSQL = "BEGIN READ ONLY"
+		accessMode = "READ ONLY"
+	}
+	return "BEGIN " + iso + " " + accessMode, nil
+}
+
+func (c *pgDriverConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	beginSQL, err := buildPGBeginSQL(opts)
+	if err != nil {
+		return nil, err
 	}
 	if _, err := c.ExecContext(ctx, beginSQL, nil); err != nil {
-		return nil, err
+		return nil, wrapPGErr(c.conn, ctx, err)
 	}
 	return &pgDriverTx{conn: c}, nil
 }
@@ -104,7 +172,7 @@ func (c *pgDriverConn) Ping(ctx context.Context) error {
 	if c.conn == nil || c.conn.IsClosed() {
 		return driver.ErrBadConn
 	}
-	return c.conn.Ping(ctx)
+	return wrapPGErr(c.conn, ctx, c.conn.Ping(ctx))
 }
 
 func (c *pgDriverConn) IsValid() bool {
@@ -145,7 +213,7 @@ func (c *pgDriverConn) ExecContext(ctx context.Context, query string, args []dri
 		mrr := c.conn.Exec(ctx, sqlText)
 		results, err := mrr.ReadAll()
 		if err != nil {
-			return nil, err
+			return nil, wrapPGErr(c.conn, ctx, err)
 		}
 		var rowsAffected int64
 		if len(results) > 0 {
@@ -161,7 +229,7 @@ func (c *pgDriverConn) ExecContext(ctx context.Context, query string, args []dri
 	rr := c.conn.ExecParams(ctx, query, params, nil, nil, nil)
 	tag, err := rr.Close()
 	if err != nil {
-		return nil, err
+		return nil, wrapPGErr(c.conn, ctx, err)
 	}
 	return driver.RowsAffected(tag.RowsAffected()), nil
 }
@@ -190,12 +258,12 @@ func (c *pgDriverConn) QueryContext(ctx context.Context, query string, args []dr
 			tag, cErr := rr.Close()
 			if cErr != nil {
 				_ = mrr.Close()
-				return nil, cErr
+				return nil, wrapPGErr(c.conn, ctx, cErr)
 			}
 			_ = tag
 		}
 		if err := mrr.Close(); err != nil {
-			return nil, err
+			return nil, wrapPGErr(c.conn, ctx, err)
 		}
 		return &pgRows{closed: true}, nil
 	}
@@ -209,7 +277,7 @@ func (c *pgDriverConn) QueryContext(ctx context.Context, query string, args []dr
 	if len(fields) == 0 {
 		tag, err := rr.Close()
 		if err != nil {
-			return nil, err
+			return nil, wrapPGErr(c.conn, ctx, err)
 		}
 		return &pgRows{closed: true, commandTag: tag}, nil
 	}
@@ -374,6 +442,9 @@ func encodePGParams(args []driver.NamedValue) ([][]byte, error) {
 			hex.Encode(buf[2:], v)
 			out[i] = buf
 		case string:
+			if strings.IndexByte(v, 0) >= 0 {
+				return nil, errors.New("sqlx: NUL byte forbidden in postgres string parameter")
+			}
 			out[i] = []byte(v)
 		case time.Time:
 			out[i] = []byte(v.UTC().Format(time.RFC3339Nano))
@@ -419,48 +490,61 @@ func decodePGTextValue(oid uint32, raw []byte) (driver.Value, error) {
 	}
 }
 
+func formatSimpleLiteral(val driver.Value) (string, error) {
+	if val == nil {
+		return "NULL", nil
+	}
+	switch v := val.(type) {
+	case int64:
+		if v < 0 {
+			return "(" + strconv.FormatInt(v, 10) + ")", nil
+		}
+		return strconv.FormatInt(v, 10), nil
+	case float64:
+		switch {
+		case math.IsNaN(v):
+			return "'NaN'::float8", nil
+		case math.IsInf(v, 1):
+			return "'Infinity'::float8", nil
+		case math.IsInf(v, -1):
+			return "'-Infinity'::float8", nil
+		default:
+			s := strconv.FormatFloat(v, 'g', -1, 64)
+			if v < 0 || strings.HasPrefix(s, "-") {
+				return "(" + s + ")", nil
+			}
+			return s, nil
+		}
+	case bool:
+		if v {
+			return "TRUE", nil
+		}
+		return "FALSE", nil
+	case []byte:
+		return `'\x` + hex.EncodeToString(v) + `'::bytea`, nil
+	case string:
+		if strings.IndexByte(v, 0) >= 0 {
+			return "", errors.New("sqlx: NUL byte forbidden in postgres string literal")
+		}
+		return "'" + strings.ReplaceAll(v, "'", "''") + "'", nil
+	case time.Time:
+		return "'" + v.UTC().Format(time.RFC3339Nano) + "'", nil
+	default:
+		return "", fmt.Errorf("sqlx: unsupported simple-protocol arg %T", val)
+	}
+}
+
 func interpolateSimpleSQL(query string, args []driver.NamedValue) (string, error) {
 	if len(args) == 0 {
 		return query, nil
 	}
 	lit := make([]string, len(args))
 	for i, a := range args {
-		if a.Value == nil {
-			lit[i] = "NULL"
-			continue
+		formatted, err := formatSimpleLiteral(a.Value)
+		if err != nil {
+			return "", err
 		}
-		switch v := a.Value.(type) {
-		case int64:
-			lit[i] = strconv.FormatInt(v, 10)
-		case float64:
-			switch {
-			case math.IsNaN(v):
-				lit[i] = "'NaN'::float8"
-			case math.IsInf(v, 1):
-				lit[i] = "'Infinity'::float8"
-			case math.IsInf(v, -1):
-				lit[i] = "'-Infinity'::float8"
-			default:
-				lit[i] = strconv.FormatFloat(v, 'g', -1, 64)
-			}
-		case bool:
-			if v {
-				lit[i] = "TRUE"
-			} else {
-				lit[i] = "FALSE"
-			}
-		case []byte:
-			lit[i] = `'\x` + hex.EncodeToString(v) + `'::bytea`
-		case string:
-			if strings.IndexByte(v, 0) >= 0 {
-				return "", errors.New("sqlx: NUL byte forbidden in postgres string literal")
-			}
-			lit[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'"
-		case time.Time:
-			lit[i] = "'" + v.UTC().Format(time.RFC3339Nano) + "'"
-		default:
-			return "", fmt.Errorf("sqlx: unsupported simple-protocol arg %T", a.Value)
-		}
+		lit[i] = formatted
 	}
 
 	var b strings.Builder

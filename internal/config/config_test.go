@@ -222,3 +222,46 @@ func TestAADHelpersOpenStringFallbackAndThreadSafeConfig(t *testing.T) {
 		t.Fatalf("unexpected GetDBSpec: drv=%q dsn=%q simple=%v", drv, dsn, simple)
 	}
 }
+
+func TestListenSocketAutoTrustUnixUnlessExplicitEmpty(t *testing.T) {
+	tmpDir := t.TempDir()
+	missingEnv := filepath.Join(tmpDir, "missing.env")
+
+	// 1. Default TCP listen without "unix" in VOLO_TRUSTED_PROXIES -> TrustUnix=false
+	cfgTCP, err := LoadWithEnviron(CLIOverrides{
+		EnvFile: missingEnv,
+		DataDir: &tmpDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf("TCP LoadWithEnviron: %v", err)
+	}
+	if cfgTCP.TrustedProxies.TrustUnix {
+		t.Fatal("expected TrustUnix=false for default TCP listener")
+	}
+
+	// 2. VOLO_LISTEN_SOCKET set + default VOLO_TRUSTED_PROXIES -> TrustUnix=true automatically
+	sockPath := filepath.Join(tmpDir, "volo.sock")
+	cfgSockDefault, err := LoadWithEnviron(CLIOverrides{
+		EnvFile: missingEnv,
+		DataDir: &tmpDir,
+	}, []string{"VOLO_LISTEN_SOCKET=" + sockPath})
+	if err != nil {
+		t.Fatalf("socket default LoadWithEnviron: %v", err)
+	}
+	if !cfgSockDefault.TrustedProxies.TrustUnix {
+		t.Fatal("expected TrustUnix=true automatically when VOLO_LISTEN_SOCKET is non-empty")
+	}
+
+	// 3. VOLO_LISTEN_SOCKET set + explicit VOLO_TRUSTED_PROXIES="" -> TrustUnix=false
+	cfgSockOptOut, err := LoadWithEnviron(CLIOverrides{
+		EnvFile: missingEnv,
+		DataDir: &tmpDir,
+	}, []string{"VOLO_LISTEN_SOCKET=" + sockPath, "VOLO_TRUSTED_PROXIES="})
+	if err != nil {
+		t.Fatalf("socket opt-out LoadWithEnviron: %v", err)
+	}
+	if cfgSockOptOut.TrustedProxies.TrustUnix {
+		t.Fatal("expected TrustUnix=false when VOLO_TRUSTED_PROXIES is explicitly set to empty")
+	}
+}
+

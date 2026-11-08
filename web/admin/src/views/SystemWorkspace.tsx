@@ -245,6 +245,12 @@ export function SystemWorkspace({
   const [pkModalOpen, setPkModalOpen] = useState(false);
   const [pkName, setPkName] = useState(() => t("sys.pk_default_name"));
   const [pkCurrPwd, setPkCurrPwd] = useState("");
+  const [delPkTarget, setDelPkTarget] = useState<{ id: string; name: string } | null>(null);
+  const [delPkPwd, setDelPkPwd] = useState("");
+  const [oidcLinks, setOidcLinks] = useState<Array<{ id: string; name: string; credential_id: string; created_at: number }>>([]);
+  const [oidcProviders, setOidcProviders] = useState<Array<{ name: string; display_name?: string }>>([]);
+  const [unlinkOidcTarget, setUnlinkOidcTarget] = useState<{ id: string; name: string } | null>(null);
+  const [unlinkOidcPwd, setUnlinkOidcPwd] = useState("");
   const [sessions, setSessions] = useState<any[]>([]);
   const [revokingOthers, setRevokingOthers] = useState(false);
   const [tokens, setTokens] = useState<any[]>([]);
@@ -252,6 +258,7 @@ export function SystemWorkspace({
   const [patName, setPatName] = useState("Obsidian CLI");
   const [patScopes, setPatScopes] = useState<string[]>(["articles:read", "articles:write", "media:write"]);
   const [patExpiresDays, setPatExpiresDays] = useState<number>(90);
+  const [patCurrPwd, setPatCurrPwd] = useState("");
   const [issuedPAT, setIssuedPAT] = useState<string>("");
 
   // Atomic Domain Settings state
@@ -276,6 +283,7 @@ export function SystemWorkspace({
   const debouncedUserQ = useDebouncedValue(userQuery, 250);
   const [userModalOpen, setUserModalOpen] = useState(false);
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [origUserEmail, setOrigUserEmail] = useState<string>("");
   const [userForm, setUserForm] = useState({
     username: "",
     email: "",
@@ -283,6 +291,7 @@ export function SystemWorkspace({
     role: "editor",
     status: "active",
     password: "",
+    current_password: "",
   });
 
   // WAF IP Bans (server-paginated) + GeoIP
@@ -313,7 +322,10 @@ export function SystemWorkspace({
   // Backup & Doctor
   const [includeMediaExport, setIncludeMediaExport] = useState<boolean>(true);
   const [exportingBackup, setExportingBackup] = useState<boolean>(false);
+  const [exportBakOpen, setExportBakOpen] = useState<boolean>(false);
+  const [exportBakPwd, setExportBakPwd] = useState<string>("");
   const [dryRunRestore, setDryRunRestore] = useState<boolean>(false);
+  const [restoreCurrPwd, setRestoreCurrPwd] = useState<string>("");
   const [legacyDryRun, setLegacyDryRun] = useState<boolean>(true);
   const [legacyBusy, setLegacyBusy] = useState<boolean>(false);
   const [legacyProgress, setLegacyProgress] = useState<number | null>(null);
@@ -454,11 +466,15 @@ export function SystemWorkspace({
     setLoading(true);
     try {
       if (sub === "account") {
-        const [me, pks, sess, tks] = await Promise.all([
+        const [me, pks, sess, tks, oidc] = await Promise.all([
           apiFetch<any>("/api/admin/me"),
           apiFetch<{ items: any[] }>("/api/admin/security/passkeys?per_page=100"),
           apiFetch<{ items: any[] }>("/api/admin/security/sessions?per_page=100"),
           apiFetch<{ items: any[] }>("/api/admin/security/tokens?per_page=100"),
+          apiFetch<{ items?: any[]; providers?: any[] }>("/api/admin/security/oidc-links").catch(() => ({
+            items: [],
+            providers: [],
+          })),
         ]);
         setMeInfo(me);
         if (me.storage_driver) storageDriverSig.value = me.storage_driver;
@@ -474,6 +490,8 @@ export function SystemWorkspace({
         setPasskeys(pks.items || []);
         setSessions(sess.items || []);
         setTokens(tks.items || []);
+        setOidcLinks(Array.isArray(oidc.items) ? oidc.items : []);
+        setOidcProviders(Array.isArray(oidc.providers) ? oidc.providers : []);
       } else if ((sub === "settings_site" || sub === "settings_io") && isAdmin) {
         const res = await apiFetch<any>("/api/admin/settings");
         setDomains(res.domains || {});
@@ -575,8 +593,8 @@ export function SystemWorkspace({
     logViewerRef.current.scrollTop = logViewerRef.current.scrollHeight;
   }, [sub, runtimeLogs, autoScrollLogs]);
 
-  const patchDomain = async (domainName: string, bodyObj: Record<string, any>) => {
-    if (savingDomain) return;
+  const patchDomain = async (domainName: string, bodyObj: Record<string, any>): Promise<boolean> => {
+    if (savingDomain) return false;
     setSavingDomain(domainName);
     try {
       const ver = versions[domainName] ?? 0;
@@ -594,11 +612,19 @@ export function SystemWorkspace({
         setEditingSocialIdx(null);
       }
       showToast(t("common.saved"));
+      return true;
     } catch (err: any) {
       showToast(err.message);
+      return false;
     } finally {
       setSavingDomain("");
     }
+  };
+
+  const clearDomainSecret = async (domainName: string, secretKey: string) => {
+    if (savingDomain) return;
+    if (!(await openConfirm({ message: t("sys.clear_secret_confirm"), danger: true }))) return;
+    await patchDomain(domainName, { clear_secrets: [secretKey] });
   };
 
   const uploadImageAsset = async (file: File, onUploaded: (url: string) => void) => {
@@ -1026,7 +1052,7 @@ export function SystemWorkspace({
                   <button
                     key={p.label}
                     type="button"
-                    class="volo-preset-chip"
+                    class="volo-chip-btn"
                     onClick={() => setSocialDraft((prev) => ({ label: p.label, url: prev.url || p.urlHint }))}
                   >
                     {p.label}
@@ -1440,12 +1466,12 @@ export function SystemWorkspace({
           <form
             class="volo-card"
             autoComplete="off"
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
               const body: any = { ...(domains.storage || {}) };
               if (s3Secret) body.s3_secret_key = s3Secret;
-              void patchDomain("storage", body);
-              setS3Secret("");
+              const ok = await patchDomain("storage", body);
+              if (ok) setS3Secret("");
             }}
           >
             <div class="volo-sec-head">
@@ -1544,16 +1570,30 @@ export function SystemWorkspace({
                     />
                   </div>
                   <div class="volo-field">
-                    <label>
-                      {t("sys.lbl_s3_sk")}{" "}
-                      {domains.storage?.s3_secret_key_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                    <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                      <span>
+                        {t("sys.lbl_s3_sk")}{" "}
+                        {Boolean(domains.storage?.s3_secret_key_set || domains.storage?.has_s3_secret_key) && (
+                          <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>
+                        )}
+                      </span>
+                      {Boolean(domains.storage?.s3_secret_key_set || domains.storage?.has_s3_secret_key) && (
+                        <button
+                          type="button"
+                          class="volo-act-btn danger"
+                          disabled={!!savingDomain}
+                          onClick={() => void clearDomainSecret("storage", "s3_secret_key")}
+                        >
+                          {t("sys.clear_saved_secret")}
+                        </button>
+                      )}
                     </label>
                     <input
                       type="password"
                       class="volo-input"
                       name="s3_sealed_secret"
                       autoComplete="new-password"
-                      placeholder={domains.storage?.s3_secret_key_set ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
+                      placeholder={Boolean(domains.storage?.s3_secret_key_set || domains.storage?.has_s3_secret_key) ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
                       value={s3Secret}
                       onInput={(e) => setS3Secret((e.currentTarget as HTMLInputElement).value)}
                     />
@@ -1617,12 +1657,12 @@ export function SystemWorkspace({
           <form
             class="volo-card"
             autoComplete="off"
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
               const body: any = { ...(domains.notifications || {}) };
               if (smtpPwd) body.smtp_password = smtpPwd;
-              void patchDomain("notifications", body);
-              setSmtpPwd("");
+              const ok = await patchDomain("notifications", body);
+              if (ok) setSmtpPwd("");
             }}
           >
             <div class="volo-sec-head">
@@ -1708,9 +1748,23 @@ export function SystemWorkspace({
                       />
                     </div>
                     <div class="volo-field">
-                      <label>
-                        {t("sys.smtp_pwd")}{" "}
-                        {domains.notifications?.smtp_password_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                      <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                        <span>
+                          {t("sys.smtp_pwd")}{" "}
+                          {Boolean(domains.notifications?.smtp_password_set || domains.notifications?.has_smtp_password) && (
+                            <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>
+                          )}
+                        </span>
+                        {Boolean(domains.notifications?.smtp_password_set || domains.notifications?.has_smtp_password) && (
+                          <button
+                            type="button"
+                            class="volo-act-btn danger"
+                            disabled={!!savingDomain}
+                            onClick={() => void clearDomainSecret("notifications", "smtp_password")}
+                          >
+                            {t("sys.clear_saved_secret")}
+                          </button>
+                        )}
                       </label>
                       <input
                         type="password"
@@ -1795,7 +1849,7 @@ export function SystemWorkspace({
 
       {sub === "account" && (
         <div>
-          <div class="volo-seg-bar" style={{ marginBottom: "16px" }}>
+          <div class="volo-seg" style={{ marginBottom: "16px" }}>
             <button
               type="button"
               class={`volo-seg-btn ${accSub === "profile" ? "active" : ""}`}
@@ -2251,14 +2305,9 @@ export function SystemWorkspace({
                                   <button
                                     type="button"
                                     class="volo-act-btn danger"
-                                    onClick={async () => {
-                                      if (!(await openConfirm({ message: t("sys.confirm_del_pk", { name: pk.name }), danger: true }))) return;
-                                      try {
-                                        await apiFetch(`/api/admin/security/passkeys/${pk.id}`, { method: "DELETE" });
-                                        void loadSub();
-                                      } catch (err: any) {
-                                        showToast(err.message);
-                                      }
+                                    onClick={() => {
+                                      setDelPkPwd("");
+                                      setDelPkTarget({ id: pk.id, name: pk.name || pk.id });
                                     }}
                                   >
                                     {t("common.delete")}
@@ -2277,6 +2326,81 @@ export function SystemWorkspace({
                     pageSize={10}
                     onChange={setPkPage}
                   />
+                </div>
+
+                <div class="volo-card">
+                  <div class="volo-sec-head">
+                    <div class="volo-sec-copy">
+                      <h3 class="volo-card-title">{t("sys.oidc_links_title")}</h3>
+                      <p class="volo-sec-desc">{t("sys.oidc_links_desc")}</p>
+                    </div>
+                    {oidcProviders.length > 0 && (
+                      <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "6px" }}>
+                        {oidcProviders.map((p) => (
+                          <a
+                            key={p.name}
+                            class="volo-btn volo-btn-sm"
+                            href={`/api/v1/auth/oidc/${encodeURIComponent(p.name)}/start?target=bind`}
+                          >
+                            + {t("sys.oidc_link_btn", { provider: p.display_name || p.name })}
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {oidcLinks.length === 0 ? (
+                    <div class="volo-help" style={{ padding: "8px 0" }}>
+                      {t("sys.oidc_empty")}
+                    </div>
+                  ) : (
+                    <div class="volo-table-wrap">
+                      <table class="volo-table volo-table-compact">
+                        <thead>
+                          <tr>
+                            <th class="col-fluid">{t("sys.oidc_col_account")}</th>
+                            <th class="col-date">{t("sys.col_created")}</th>
+                            <th class="col-act col-act-th">{t("art.actions")}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {oidcLinks.map((lk) => (
+                            <tr key={lk.id}>
+                              <td class="col-fluid" data-label={t("sys.oidc_col_account")} style={{ minWidth: 0 }}>
+                                <div class="volo-cell-main" style={{ minWidth: 0 }}>
+                                  <div class="volo-cell-title" style={{ minWidth: 0 }}>
+                                    <span class="volo-wrap-anywhere">{lk.name}</span>
+                                  </div>
+                                  {lk.credential_id && (
+                                    <div class="volo-cell-meta" style={{ minWidth: 0 }}>
+                                      <span class="volo-code-chip is-wrap">{lk.credential_id}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                              <td class="col-date" data-label={t("sys.col_created")}>
+                                {formatDateTime(lk.created_at)}
+                              </td>
+                              <td class="col-act" data-label={t("art.actions")}>
+                                <div class="volo-row-actions">
+                                  <button
+                                    type="button"
+                                    class="volo-act-btn danger"
+                                    onClick={() => {
+                                      setUnlinkOidcPwd("");
+                                      setUnlinkOidcTarget({ id: lk.id, name: lk.name || lk.credential_id || lk.id });
+                                    }}
+                                  >
+                                    {t("sys.oidc_unlink_btn")}
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -2299,6 +2423,7 @@ export function SystemWorkspace({
                         setPatName("Obsidian CLI");
                         setPatScopes(["articles:read", "articles:write", "media:write"]);
                         setPatExpiresDays(90);
+                        setPatCurrPwd("");
                         setPatModalOpen(true);
                       }}
                     >
@@ -2454,51 +2579,54 @@ export function SystemWorkspace({
                         ) : sessPaged.slice.length === 0 ? (
                           <ConsoleEmpty colSpan={2} />
                         ) : (
-                          sessPaged.slice.map((s) => (
-                            <tr key={s.id}>
-                              <td class="col-fluid" data-label={t("sys.sess_col_device")}>
-                                <div class="volo-cell-main">
-                                  <div class="volo-cell-title">
-                                    <span class="volo-code-chip">{s.client_ip || s.ip_masked}</span>
-                                    {s.geo_region && <span class="volo-mini-tag">{s.geo_region}</span>}
-                                    <span class="volo-mini-tag" title={s.user_agent || ""}>
-                                      {summarizeUA(s.user_agent)}
-                                    </span>
-                                    {s.id === meInfo?.session_id && (
-                                      <span class="volo-status-pill ok">
-                                        <span class="volo-status-dot" />
-                                        {t("sys.sess_current")}
+                          sessPaged.slice.map((s) => {
+                            const isCurrentSess = s.id === meInfo?.session_id;
+                            return (
+                              <tr key={s.id}>
+                                <td class="col-fluid" data-label={t("sys.sess_col_device")}>
+                                  <div class="volo-cell-main">
+                                    <div class="volo-cell-title">
+                                      <span class="volo-code-chip">{s.client_ip || s.ip_masked}</span>
+                                      {s.geo_region && <span class="volo-mini-tag">{s.geo_region}</span>}
+                                      <span class="volo-mini-tag" title={s.user_agent || ""}>
+                                        {summarizeUA(s.user_agent)}
                                       </span>
+                                      {isCurrentSess && (
+                                        <span class="volo-status-pill ok">
+                                          <span class="volo-status-dot" />
+                                          {t("sys.sess_current")}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div class="volo-cell-meta">
+                                      <span title={s.user_agent || ""}>{formatDateTime(s.last_seen_at)}</span>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td class={`col-act ${isCurrentSess ? "is-empty-act" : ""}`.trim()} data-label={t("art.actions")}>
+                                  <div class="volo-row-actions">
+                                    {!isCurrentSess && (
+                                      <button
+                                        type="button"
+                                        class="volo-act-btn danger"
+                                        onClick={async () => {
+                                          if (!(await openConfirm({ message: t("sys.confirm_kick_sess"), danger: true }))) return;
+                                          try {
+                                            await apiFetch(`/api/admin/security/sessions/${s.id}`, { method: "DELETE" });
+                                            void loadSub();
+                                          } catch (err: any) {
+                                            showToast(err.message);
+                                          }
+                                        }}
+                                      >
+                                        {t("sys.sess_kick")}
+                                      </button>
                                     )}
                                   </div>
-                                  <div class="volo-cell-meta">
-                                    <span title={s.user_agent || ""}>{formatDateTime(s.last_seen_at)}</span>
-                                  </div>
-                                </div>
-                              </td>
-                              <td class="col-act" data-label={t("art.actions")}>
-                                <div class="volo-row-actions">
-                                  {s.id !== meInfo?.session_id && (
-                                    <button
-                                      type="button"
-                                      class="volo-act-btn danger"
-                                      onClick={async () => {
-                                        if (!(await openConfirm({ message: t("sys.confirm_kick_sess"), danger: true }))) return;
-                                        try {
-                                          await apiFetch(`/api/admin/security/sessions/${s.id}`, { method: "DELETE" });
-                                          void loadSub();
-                                        } catch (err: any) {
-                                          showToast(err.message);
-                                        }
-                                      }}
-                                    >
-                                      {t("sys.sess_kick")}
-                                    </button>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          ))
+                                </td>
+                              </tr>
+                            );
+                          })
                         )}
                       </tbody>
                     </table>
@@ -2543,24 +2671,9 @@ export function SystemWorkspace({
                         {t("common.cancel")}
                       </button>
                       <button
-                        type="button"
+                        type="submit"
+                        form="volo-pat-create-form"
                         class="volo-btn volo-btn-primary"
-                        onClick={async () => {
-                          try {
-                            const res = await apiFetch<{ plaintext_token: string }>("/api/admin/security/tokens", {
-                              method: "POST",
-                              body: JSON.stringify({
-                                name: patName,
-                                scopes: patScopes,
-                                expires_in_days: patExpiresDays,
-                              }),
-                            });
-                            setIssuedPAT(res.plaintext_token);
-                            void loadSub();
-                          } catch (err: any) {
-                            showToast(err.message);
-                          }
-                        }}
                       >
                         {t("sys.pat_generate")}
                       </button>
@@ -2575,9 +2688,14 @@ export function SystemWorkspace({
                   </div>
                 ) : (
                   <form
+                    id="volo-pat-create-form"
                     autoComplete="off"
                     onSubmit={async (e) => {
                       e.preventDefault();
+                      if (!patCurrPwd.trim()) {
+                        showToast(t("sys.stepup_pwd_required"), "err");
+                        return;
+                      }
                       try {
                         const res = await apiFetch<{ plaintext_token: string }>("/api/admin/security/tokens", {
                           method: "POST",
@@ -2585,8 +2703,10 @@ export function SystemWorkspace({
                             name: patName,
                             scopes: patScopes,
                             expires_in_days: patExpiresDays,
+                            current_password: patCurrPwd,
                           }),
                         });
+                        setPatCurrPwd("");
                         setIssuedPAT(res.plaintext_token);
                         void loadSub();
                       } catch (err: any) {
@@ -2634,11 +2754,158 @@ export function SystemWorkspace({
                         ))}
                       </div>
                     </div>
+                    <div class="volo-field">
+                      <label>{t("sys.cur_pwd")} *</label>
+                      <input
+                        type="password"
+                        class="volo-input"
+                        required
+                        name="pat_stepup_password"
+                        autoComplete="current-password"
+                        placeholder={t("sys.reauth_pwd_ph")}
+                        value={patCurrPwd}
+                        onInput={(e) => setPatCurrPwd((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
                   </form>
                 )}
               </AnimatedModal>
             </>
           )}
+
+          <AnimatedModal
+            open={Boolean(delPkTarget)}
+            onClose={() => {
+              setDelPkTarget(null);
+              setDelPkPwd("");
+            }}
+            title={t("common.delete")}
+            subtitle={delPkTarget ? t("sys.confirm_del_pk", { name: delPkTarget.name }) : ""}
+            maxWidth="440px"
+            footer={
+              <>
+                <button
+                  type="button"
+                  class="volo-btn"
+                  onClick={() => {
+                    setDelPkTarget(null);
+                    setDelPkPwd("");
+                  }}
+                >
+                  {t("common.cancel")}
+                </button>
+                <button type="submit" form="volo-del-pk-form" class="volo-btn volo-btn-danger">
+                  {t("common.delete")}
+                </button>
+              </>
+            }
+          >
+            <form
+              id="volo-del-pk-form"
+              autoComplete="off"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!delPkTarget) return;
+                if (!delPkPwd.trim()) {
+                  showToast(t("sys.stepup_pwd_required"), "err");
+                  return;
+                }
+                try {
+                  await apiFetch(`/api/admin/security/passkeys/${encodeURIComponent(delPkTarget.id)}`, {
+                    method: "DELETE",
+                    body: JSON.stringify({ current_password: delPkPwd }),
+                  });
+                  setDelPkTarget(null);
+                  setDelPkPwd("");
+                  showToast(t("common.deleted"));
+                  void loadSub();
+                } catch (err: any) {
+                  showToast(err.message);
+                }
+              }}
+            >
+              <div class="volo-field">
+                <label>{t("sys.cur_pwd")} *</label>
+                <input
+                  type="password"
+                  class="volo-input"
+                  required
+                  name="del_pk_stepup_password"
+                  autoComplete="current-password"
+                  placeholder={t("sys.reauth_pwd_ph")}
+                  value={delPkPwd}
+                  onInput={(e) => setDelPkPwd((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
+
+          <AnimatedModal
+            open={Boolean(unlinkOidcTarget)}
+            onClose={() => {
+              setUnlinkOidcTarget(null);
+              setUnlinkOidcPwd("");
+            }}
+            title={t("sys.oidc_unlink_btn")}
+            subtitle={unlinkOidcTarget ? t("sys.oidc_confirm_unlink", { name: unlinkOidcTarget.name }) : ""}
+            maxWidth="440px"
+            footer={
+              <>
+                <button
+                  type="button"
+                  class="volo-btn"
+                  onClick={() => {
+                    setUnlinkOidcTarget(null);
+                    setUnlinkOidcPwd("");
+                  }}
+                >
+                  {t("common.cancel")}
+                </button>
+                <button type="submit" form="volo-unlink-oidc-form" class="volo-btn volo-btn-danger">
+                  {t("sys.oidc_unlink_btn")}
+                </button>
+              </>
+            }
+          >
+            <form
+              id="volo-unlink-oidc-form"
+              autoComplete="off"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!unlinkOidcTarget) return;
+                if (!unlinkOidcPwd.trim()) {
+                  showToast(t("sys.stepup_pwd_required"), "err");
+                  return;
+                }
+                try {
+                  await apiFetch(`/api/admin/security/oidc-links/${encodeURIComponent(unlinkOidcTarget.id)}`, {
+                    method: "DELETE",
+                    body: JSON.stringify({ current_password: unlinkOidcPwd }),
+                  });
+                  setUnlinkOidcTarget(null);
+                  setUnlinkOidcPwd("");
+                  showToast(t("common.deleted"));
+                  void loadSub();
+                } catch (err: any) {
+                  showToast(err.message);
+                }
+              }}
+            >
+              <div class="volo-field">
+                <label>{t("sys.cur_pwd")} *</label>
+                <input
+                  type="password"
+                  class="volo-input"
+                  required
+                  name="unlink_oidc_stepup_password"
+                  autoComplete="current-password"
+                  placeholder={t("sys.reauth_pwd_ph")}
+                  value={unlinkOidcPwd}
+                  onInput={(e) => setUnlinkOidcPwd((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+            </form>
+          </AnimatedModal>
 
           <AnimatedModal
             open={pkModalOpen}
@@ -2703,6 +2970,7 @@ export function SystemWorkspace({
               class="volo-btn volo-btn-primary volo-btn-sm"
               onClick={() => {
                 setEditingUserId(null);
+                setOrigUserEmail("");
                 setUserForm({
                   username: "",
                   email: "",
@@ -2710,6 +2978,7 @@ export function SystemWorkspace({
                   role: "editor",
                   status: "active",
                   password: "",
+                  current_password: "",
                 });
                 setUserModalOpen(true);
               }}
@@ -2787,7 +3056,7 @@ export function SystemWorkspace({
                           {isSelf ? (
                             <span class="volo-cat-chip">{renderRoleLabel(u.role)}</span>
                           ) : (
-                            <div style={{ maxWidth: "180px" }}>
+                            <div class="volo-role-select-wrap">
                               <ConsoleSelect
                                 searchable={false}
                                 value={u.role}
@@ -2828,6 +3097,7 @@ export function SystemWorkspace({
                               class="volo-act-btn"
                               onClick={() => {
                                 setEditingUserId(u.id);
+                                setOrigUserEmail(u.email || "");
                                 setUserForm({
                                   username: u.username || "",
                                   email: u.email || "",
@@ -2835,6 +3105,7 @@ export function SystemWorkspace({
                                   role: u.role || "editor",
                                   status: u.status || "active",
                                   password: "",
+                                  current_password: "",
                                 });
                                 setUserModalOpen(true);
                               }}
@@ -2928,6 +3199,13 @@ export function SystemWorkspace({
                 try {
                   if (editingUserId) {
                     const isSelfEdit = editingUserId === currentUserSig.value?.id;
+                    const selfNeedsStepUp =
+                      isSelfEdit &&
+                      (userForm.email.trim().toLowerCase() !== origUserEmail.trim().toLowerCase() || Boolean(userForm.password.trim()));
+                    if (selfNeedsStepUp && !userForm.current_password.trim()) {
+                      showToast(t("sys.reauth_pwd_required"), "err");
+                      return;
+                    }
                     const body: Record<string, any> = {
                       display_name: userForm.display_name,
                       email: userForm.email,
@@ -2935,6 +3213,7 @@ export function SystemWorkspace({
                       status: userForm.status,
                     };
                     if (userForm.password.trim()) body.password = userForm.password;
+                    if (selfNeedsStepUp) body.current_password = userForm.current_password;
                     await apiFetch(`/api/admin/users/${editingUserId}`, {
                       method: "PATCH",
                       body: JSON.stringify(body),
@@ -3058,6 +3337,26 @@ export function SystemWorkspace({
                   onInput={(e) => setUserForm({ ...userForm, password: (e.currentTarget as HTMLInputElement).value })}
                 />
               </div>
+
+              {Boolean(
+                editingUserId &&
+                  editingUserId === currentUserSig.value?.id &&
+                  (userForm.email.trim().toLowerCase() !== origUserEmail.trim().toLowerCase() || Boolean(userForm.password.trim()))
+              ) && (
+                <div class="volo-field">
+                  <label>{t("sys.cur_pwd")} *</label>
+                  <input
+                    type="password"
+                    class="volo-input"
+                    required
+                    name="member_self_stepup_password"
+                    autoComplete="current-password"
+                    placeholder={t("sys.reauth_pwd_ph")}
+                    value={userForm.current_password}
+                    onInput={(e) => setUserForm({ ...userForm, current_password: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+              )}
             </form>
           </AnimatedModal>
         </div>
@@ -3065,7 +3364,7 @@ export function SystemWorkspace({
 
       {sub === "waf" && isAdmin && (
         <div>
-          <div class="volo-seg-bar" style={{ marginBottom: "16px" }}>
+          <div class="volo-seg" style={{ marginBottom: "16px" }}>
             <button
               type="button"
               class={`volo-seg-btn ${wafSub === "policy" ? "active" : ""}`}
@@ -3578,7 +3877,7 @@ export function SystemWorkspace({
                                   type="button"
                                   class="volo-act-btn"
                                   disabled={!canMove || fullIdx <= 0}
-                                  title={t("cnt.move_up")}
+                                  title={!canMove ? t("ui.sort_disabled_filtered") : t("cnt.move_up")}
                                   aria-label={t("cnt.move_up")}
                                   onClick={() => void moveGeoRule(g.id, -1)}
                                 >
@@ -3588,7 +3887,7 @@ export function SystemWorkspace({
                                   type="button"
                                   class="volo-act-btn"
                                   disabled={!canMove || fullIdx < 0 || fullIdx >= geoRules.length - 1}
-                                  title={t("cnt.move_down")}
+                                  title={!canMove ? t("ui.sort_disabled_filtered") : t("cnt.move_down")}
                                   aria-label={t("cnt.move_down")}
                                   onClick={() => void moveGeoRule(g.id, 1)}
                                 >
@@ -3794,6 +4093,20 @@ export function SystemWorkspace({
                     label={t("sys.backup_dry_run")}
                   />
                 </div>
+                {!dryRunRestore && (
+                  <div class="volo-field" style={{ marginTop: "10px", marginBottom: "8px" }}>
+                    <label>{t("sys.cur_pwd")} *</label>
+                    <input
+                      type="password"
+                      class="volo-input"
+                      name="backup_restore_stepup_password"
+                      autoComplete="current-password"
+                      placeholder={t("sys.reauth_pwd_ph")}
+                      value={restoreCurrPwd}
+                      onInput={(e) => setRestoreCurrPwd((e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                )}
                 <UploadProgressBar progress={restoreProgress} label={t("sys.backup_restore")} />
                 <div class="volo-form-actions">
                   <UploadButton
@@ -3802,14 +4115,24 @@ export function SystemWorkspace({
                     busy={restoreBusy}
                     label={t("sys.backup_restore")}
                     onFile={async (f) => {
-                      if (!dryRunRestore && !(await openConfirm({ message: t("sys.confirm_restore"), danger: true }))) return;
+                      if (!dryRunRestore) {
+                        if (!restoreCurrPwd.trim()) {
+                          showToast(t("sys.stepup_pwd_required"), "err");
+                          return;
+                        }
+                        if (!(await openConfirm({ message: t("sys.confirm_restore"), danger: true }))) return;
+                      }
                       setRestoreBusy(true);
                       setRestoreProgress(0);
                       try {
                         const fd = new FormData();
                         fd.append("file", f);
                         fd.append("dry_run", dryRunRestore ? "true" : "false");
+                        if (!dryRunRestore) {
+                          fd.append("current_password", restoreCurrPwd);
+                        }
                         await uploadWithProgress("/api/admin/backups/restore", fd, setRestoreProgress);
+                        if (!dryRunRestore) setRestoreCurrPwd("");
                         showToast(dryRunRestore ? t("sys.backup_dry_ok") : t("sys.backup_restored"));
                         void loadSub();
                       } catch (err: any) {
@@ -3824,44 +4147,113 @@ export function SystemWorkspace({
                     type="button"
                     class="volo-btn volo-btn-primary"
                     disabled={exportingBackup}
-                    onClick={async () => {
+                    onClick={() => {
                       if (exportingBackup) return;
-                      setExportingBackup(true);
-                      try {
-                        const res = await apiFetch<{
-                          ticket: string;
-                          export_url?: string;
-                          download_url?: string;
-                        }>("/api/admin/backups/ticket", {
-                          method: "POST",
-                          body: JSON.stringify({ include_media: includeMediaExport }),
-                        });
-                        const baseUrl =
-                          res.download_url ||
-                          res.export_url ||
-                          `/api/admin/backups/export?ticket=${encodeURIComponent(res.ticket)}`;
-                        const sep = baseUrl.includes("?") ? "&" : "?";
-                        const dlUrl = baseUrl.includes("media=")
-                          ? baseUrl
-                          : `${baseUrl}${sep}media=${includeMediaExport ? 1 : 0}`;
-                        const a = document.createElement("a");
-                        a.href = dlUrl;
-                        a.download = "";
-                        a.style.display = "none";
-                        document.body.appendChild(a);
-                        a.click();
-                        a.remove();
-                      } catch (err: any) {
-                        showToast(err?.message || t("sys.backup_export_err"), "err");
-                      } finally {
-                        setExportingBackup(false);
-                      }
+                      setExportBakPwd("");
+                      setExportBakOpen(true);
                     }}
                   >
                     {exportingBackup ? t("sys.backup_exporting") : t("sys.backup_export")}
                   </button>
                 </div>
               </div>
+
+              <AnimatedModal
+                open={exportBakOpen}
+                onClose={() => {
+                  if (exportingBackup) return;
+                  setExportBakOpen(false);
+                  setExportBakPwd("");
+                }}
+                title={t("sys.backup_export")}
+                subtitle={t("sys.stepup_backup_desc")}
+                maxWidth="440px"
+                footer={
+                  <>
+                    <button
+                      type="button"
+                      class="volo-btn"
+                      disabled={exportingBackup}
+                      onClick={() => {
+                        setExportBakOpen(false);
+                        setExportBakPwd("");
+                      }}
+                    >
+                      {t("common.cancel")}
+                    </button>
+                    <button
+                      type="submit"
+                      form="volo-backup-export-form"
+                      class="volo-btn volo-btn-primary"
+                      disabled={exportingBackup}
+                    >
+                      {exportingBackup ? t("sys.backup_exporting") : t("sys.backup_export")}
+                    </button>
+                  </>
+                }
+              >
+                <form
+                  id="volo-backup-export-form"
+                  autoComplete="off"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (exportingBackup) return;
+                    if (!exportBakPwd.trim()) {
+                      showToast(t("sys.stepup_pwd_required"), "err");
+                      return;
+                    }
+                    setExportingBackup(true);
+                    try {
+                      const res = await apiFetch<{
+                        ticket: string;
+                        export_url?: string;
+                        download_url?: string;
+                      }>("/api/admin/backups/ticket", {
+                        method: "POST",
+                        body: JSON.stringify({
+                          include_media: includeMediaExport,
+                          current_password: exportBakPwd,
+                        }),
+                      });
+                      const baseUrl =
+                        res.download_url ||
+                        res.export_url ||
+                        `/api/admin/backups/export?ticket=${encodeURIComponent(res.ticket)}`;
+                      const sep = baseUrl.includes("?") ? "&" : "?";
+                      const dlUrl = baseUrl.includes("media=")
+                        ? baseUrl
+                        : `${baseUrl}${sep}media=${includeMediaExport ? 1 : 0}`;
+                      const a = document.createElement("a");
+                      a.href = dlUrl;
+                      a.download = "";
+                      a.style.display = "none";
+                      document.body.appendChild(a);
+                      a.click();
+                      a.remove();
+                      setExportBakOpen(false);
+                      setExportBakPwd("");
+                    } catch (err: any) {
+                      showToast(err?.message || t("sys.backup_export_err"), "err");
+                    } finally {
+                      setExportingBackup(false);
+                    }
+                  }}
+                >
+                  <div class="volo-field">
+                    <label>{t("sys.cur_pwd")} *</label>
+                    <input
+                      type="password"
+                      class="volo-input"
+                      required
+                      name="backup_export_stepup_password"
+                      autoComplete="current-password"
+                      placeholder={t("sys.reauth_pwd_ph")}
+                      value={exportBakPwd}
+                      onInput={(e) => setExportBakPwd((e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
+                </form>
+              </AnimatedModal>
 
               <div class="volo-subcard">
                 <div class="volo-subcard-title">{t("sys.backup_legacy")}</div>
@@ -3965,14 +4357,16 @@ export function SystemWorkspace({
               <form
                 class="volo-card"
                 autoComplete="off"
-                onSubmit={(e) => {
+                onSubmit={async (e) => {
                   e.preventDefault();
                   const body: any = { ...(domains.backup || {}) };
                   if (bakWebdavPwd) body.webdav_password = bakWebdavPwd;
                   if (bakS3Secret) body.s3_secret_key = bakS3Secret;
-                  void patchDomain("backup", body);
-                  setBakWebdavPwd("");
-                  setBakS3Secret("");
+                  const ok = await patchDomain("backup", body);
+                  if (ok) {
+                    setBakWebdavPwd("");
+                    setBakS3Secret("");
+                  }
                 }}
               >
                 <div class="volo-sec-head">
@@ -4077,16 +4471,30 @@ export function SystemWorkspace({
                             />
                           </div>
                           <div class="volo-field">
-                            <label>
-                              {t("sys.lbl_webdav_pwd")}{" "}
-                              {domains.backup?.webdav_password_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                            <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                              <span>
+                                {t("sys.lbl_webdav_pwd")}{" "}
+                                {Boolean(domains.backup?.webdav_password_set || domains.backup?.has_webdav_password) && (
+                                  <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>
+                                )}
+                              </span>
+                              {Boolean(domains.backup?.webdav_password_set || domains.backup?.has_webdav_password) && (
+                                <button
+                                  type="button"
+                                  class="volo-act-btn danger"
+                                  disabled={!!savingDomain}
+                                  onClick={() => void clearDomainSecret("backup", "webdav_password")}
+                                >
+                                  {t("sys.clear_saved_secret")}
+                                </button>
+                              )}
                             </label>
                             <input
                               type="password"
                               class="volo-input"
                               name="bak_webdav_sealed_secret"
                               autoComplete="new-password"
-                              placeholder={domains.backup?.webdav_password_set ? t("sys.s3_sk_sealed_ph") : t("sys.webdav_pwd_ph")}
+                              placeholder={Boolean(domains.backup?.webdav_password_set || domains.backup?.has_webdav_password) ? t("sys.s3_sk_sealed_ph") : t("sys.webdav_pwd_ph")}
                               value={bakWebdavPwd}
                               onInput={(e) => setBakWebdavPwd((e.currentTarget as HTMLInputElement).value)}
                             />
@@ -4132,16 +4540,30 @@ export function SystemWorkspace({
                             />
                           </div>
                           <div class="volo-field">
-                            <label>
-                              {t("sys.lbl_s3_sk")}{" "}
-                              {domains.backup?.s3_secret_key_set && <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>}
+                            <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                              <span>
+                                {t("sys.lbl_s3_sk")}{" "}
+                                {Boolean(domains.backup?.s3_secret_key_set || domains.backup?.has_s3_secret_key) && (
+                                  <span class="volo-badge volo-badge-ok">{t("sys.sealed")}</span>
+                                )}
+                              </span>
+                              {Boolean(domains.backup?.s3_secret_key_set || domains.backup?.has_s3_secret_key) && (
+                                <button
+                                  type="button"
+                                  class="volo-act-btn danger"
+                                  disabled={!!savingDomain}
+                                  onClick={() => void clearDomainSecret("backup", "s3_secret_key")}
+                                >
+                                  {t("sys.clear_saved_secret")}
+                                </button>
+                              )}
                             </label>
                             <input
                               type="password"
                               class="volo-input"
                               name="bak_s3_sealed_secret"
                               autoComplete="new-password"
-                              placeholder={domains.backup?.s3_secret_key_set ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
+                              placeholder={Boolean(domains.backup?.s3_secret_key_set || domains.backup?.has_s3_secret_key) ? t("sys.s3_sk_sealed_ph") : t("sys.s3_sk_ph")}
                               value={bakS3Secret}
                               onInput={(e) => setBakS3Secret((e.currentTarget as HTMLInputElement).value)}
                             />
@@ -4448,7 +4870,7 @@ export function SystemWorkspace({
 
           <div ref={logViewerRef} class="volo-log-viewer">
             {runtimeLogs.length === 0 ? (
-              <div style={{ color: "var(--volo-muted)", padding: "18px 8px", textAlign: "center" }}>{t("sys.logs_empty")}</div>
+              <div class="volo-log-empty">{t("sys.logs_empty")}</div>
             ) : (
               runtimeLogs.map((l) => {
                 const lv = String(l.level || "INFO");
@@ -4542,9 +4964,9 @@ export function SystemWorkspace({
                         <td class="col-cat" data-label={t("sys.audit_col_action")}>
                           <span class="volo-mini-tag">{l.action}</span>
                         </td>
-                        <td class="col-fluid" data-label={t("sys.audit_col_res")}>
-                          <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
-                            <span>
+                        <td class="col-fluid" data-label={t("sys.audit_col_res")} style={{ minWidth: 0 }}>
+                          <div class="volo-input-row" style={{ flexWrap: "wrap", minWidth: 0 }}>
+                            <span class="volo-code-chip is-wrap">
                               {l.resource_type}:{l.resource_id}
                             </span>
                             {l.client_ip && <span class="volo-code-chip">{l.client_ip}</span>}

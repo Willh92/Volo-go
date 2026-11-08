@@ -78,15 +78,22 @@ type Output struct {
 
 // Engine is a thread-safe, zero-CGO Markdown rendering pipeline powered by goldmark + chroma/v2 + bluemonday.
 type Engine struct {
-	mdOnce    sync.Once
-	md        goldmark.Markdown
-	sanOnce   sync.Once
-	sanitizer *bluemonday.Policy
+	mdOnce         sync.Once
+	md             goldmark.Markdown
+	sanOnce        sync.Once
+	sanitizer      *bluemonday.Policy
+	commentMDOnce  sync.Once
+	commentMD      goldmark.Markdown
+	commentSanOnce sync.Once
+	commentSan     *bluemonday.Policy
 }
 
 var (
-	defaultEngineOnce sync.Once
-	defaultEngineInst *Engine
+	defaultEngineOnce   sync.Once
+	defaultEngineInst   *Engine
+	inputCheckboxTypeRe = regexp.MustCompile(`^checkbox$`)
+	safeMediaSrcAttrRe  = regexp.MustCompile(`^(?:https?://[^\s"'<>]+|/[^/\s"'<>\\][^\s"'<>]*)$`)
+	chromaCommentClsRe  = regexp.MustCompile(`^(chroma|line|cl|ln|lnt|lntable|lntd|hl|[a-z]{1,3})$`)
 )
 
 // Default returns a shared singleton Engine.
@@ -122,6 +129,19 @@ func (e *Engine) ensureMarkdown() goldmark.Markdown {
 	return e.md
 }
 
+func (e *Engine) ensureCommentMarkdown() goldmark.Markdown {
+	e.commentMDOnce.Do(func() {
+		e.commentMD = goldmark.New(
+			goldmark.WithExtensions(
+				extension.Table,
+				extension.Strikethrough,
+				extension.Linkify,
+			),
+		)
+	})
+	return e.commentMD
+}
+
 func (e *Engine) ensureSanitizer() *bluemonday.Policy {
 	e.sanOnce.Do(func() {
 		e.sanitizer = buildSanitizerPolicy()
@@ -129,16 +149,24 @@ func (e *Engine) ensureSanitizer() *bluemonday.Policy {
 	return e.sanitizer
 }
 
+func (e *Engine) ensureCommentSanitizer() *bluemonday.Policy {
+	e.commentSanOnce.Do(func() {
+		e.commentSan = buildCommentSanitizerPolicy()
+	})
+	return e.commentSan
+}
+
 func buildSanitizerPolicy() *bluemonday.Policy {
 	p := bluemonday.UGCPolicy()
 	p.AllowAttrs("id", "class", "tabindex", "aria-label", "aria-hidden", "role", "title").Globally()
-	p.AllowAttrs("data-lang", "data-lock-type", "data-article-id", "data-audio-seek", "data-book-slug", "data-github-profile").Globally()
-	p.AllowElements("figure", "figcaption", "section", "aside", "details", "summary", "mark", "kbd", "abbr", "button", "audio", "source")
-	p.AllowAttrs("type").OnElements("button", "input")
+	p.AllowAttrs("data-lang", "data-lock-type", "data-article-id", "data-audio-seek", "data-book-slug", "data-github-profile", "data-callout").Globally()
+	p.AllowElements("figure", "figcaption", "section", "aside", "details", "summary", "mark", "kbd", "abbr", "button", "audio", "source", "input")
+	p.AllowAttrs("type").OnElements("button", "source")
+	p.AllowAttrs("type").Matching(inputCheckboxTypeRe).OnElements("input")
 	p.AllowAttrs("checked", "disabled").OnElements("input")
 	p.AllowAttrs("open").OnElements("details")
-	p.AllowAttrs("controls", "preload", "src").OnElements("audio", "source")
-	p.AllowAttrs("type").OnElements("source")
+	p.AllowAttrs("controls", "preload").OnElements("audio", "source")
+	p.AllowAttrs("src").Matching(safeMediaSrcAttrRe).OnElements("audio", "source")
 	p.AllowAttrs("width", "height", "loading", "decoding", "src", "alt", "title").OnElements("img")
 	p.AllowAttrs("href", "title", "target", "rel").OnElements("a")
 	p.RequireNoFollowOnLinks(false)
@@ -146,9 +174,55 @@ func buildSanitizerPolicy() *bluemonday.Policy {
 	return p
 }
 
+var (
+	commentListStartRe  = regexp.MustCompile(`^[0-9]+$`)
+	commentTableAlignRe = regexp.MustCompile(`^(?i)(left|right|center|justify)$`)
+)
+
+func buildCommentSanitizerPolicy() *bluemonday.Policy {
+	p := bluemonday.NewPolicy()
+	p.AllowStandardURLs()
+	p.AllowElements(
+		"p", "br", "hr", "blockquote",
+		"ul", "ol", "li", "dl", "dt", "dd",
+		"h1", "h2", "h3", "h4", "h5", "h6",
+		"strong", "b", "em", "i", "del", "s", "strike", "ins", "sub", "sup", "kbd", "q", "cite", "abbr",
+		"pre", "code", "span",
+		"table", "thead", "tbody", "tfoot", "tr", "th", "td",
+	)
+	p.AllowAttrs("title").OnElements("abbr")
+	p.AllowAttrs("start").Matching(commentListStartRe).OnElements("ol")
+	p.AllowAttrs("align").Matching(commentTableAlignRe).OnElements("th", "td")
+	p.AllowAttrs("href", "title").OnElements("a")
+	p.RequireNoFollowOnLinks(true)
+	p.RequireNoReferrerOnLinks(true)
+	p.AddTargetBlankToFullyQualifiedLinks(true)
+	p.AllowImages()
+	p.AllowAttrs("class").Matching(chromaCommentClsRe).OnElements("pre", "code", "span", "table", "tbody", "tr", "td")
+	return p
+}
+
 // SanitizeHTML passes an HTML fragment directly through the engine's strict bluemonday XSS policy.
 func (e *Engine) SanitizeHTML(rawHTML string) string {
 	return e.ensureSanitizer().Sanitize(rawHTML)
+}
+
+// RenderComment renders untrusted visitor/reader comment Markdown into strictly sanitized HTML
+// WITHOUT raw HTML passthrough, WITHOUT footnotes (preventing #fn:1 collisions), and WITHOUT
+// id, input, button, audio, source, tabindex, or data-* attributes.
+func (e *Engine) RenderComment(markdown string) string {
+	if strings.TrimSpace(markdown) == "" {
+		return ""
+	}
+	mdClean, codeSlots := preprocessCommentCodeBlocks(markdown)
+	var rawBuf bytes.Buffer
+	_ = e.ensureCommentMarkdown().Convert([]byte(mdClean), &rawBuf)
+	rendered := rawBuf.String()
+	for token, fragment := range codeSlots {
+		rendered = strings.ReplaceAll(rendered, "<p>"+token+"</p>", fragment)
+		rendered = strings.ReplaceAll(rendered, token, fragment)
+	}
+	return e.ensureCommentSanitizer().Sanitize(rendered)
 }
 
 // Render transforms Markdown into sanitized, zero-JS syntax-highlighted HTML while strictly
@@ -165,9 +239,15 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 
 	// Replace placeholders (Chroma code blocks, Mermaid diagrams, Lock cards, Book cards) before sanitization.
 	for token, fragment := range prep.replacements {
+		slot := `<div data-volo-slot="` + token + `"></div>`
+		rendered = strings.ReplaceAll(rendered, "<p>"+slot+"</p>", fragment)
+		rendered = strings.ReplaceAll(rendered, slot, fragment)
 		rendered = strings.ReplaceAll(rendered, "<p>"+token+"</p>", fragment)
 		rendered = strings.ReplaceAll(rendered, token, fragment)
 	}
+
+	// Transform GitHub-flavored Alerts (> [!NOTE], > [!TIP], > [!IMPORTANT], > [!WARNING], > [!CAUTION]) into .volo-callout blocks.
+	rendered = transformGitHubAlerts(rendered, opts.Locale)
 
 	// Enhance <img> tags with intrinsic dimensions & lazy decoding and capture FirstImageURL from unlocked content.
 	var firstImg string
@@ -218,6 +298,52 @@ type preprocessResult struct {
 
 var attrPairRe = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'\]:]+))`)
 
+func preprocessCommentCodeBlocks(src string) (string, map[string]string) {
+	normalized := strings.ReplaceAll(src, "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+	slots := make(map[string]string)
+	outLines := make([]string, 0, len(lines))
+	seq := 0
+
+	for i := 0; i < len(lines); {
+		line := lines[i]
+		if prefix, rest, ok := parseBlockLinePrefix(line); ok {
+			if ch, fenceLen, fOk := parseFenceStart(rest); fOk {
+				info := strings.TrimSpace(rest[fenceLen:])
+				lang := strings.Fields(info)
+				langName := ""
+				if len(lang) > 0 {
+					langName = strings.ToLower(lang[0])
+				}
+				i++
+				var codeLines []string
+				for i < len(lines) {
+					if _, closeRest, cLineOk := parseBlockLinePrefix(lines[i]); cLineOk {
+						if cCh, cLen, cOk := parseFenceStart(closeRest); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(closeRest[cLen:]) == "" {
+							i++
+							break
+						}
+					}
+					codeLines = append(codeLines, stripBlockPrefix(lines[i], prefix))
+					i++
+				}
+				seq++
+				tok := fmt.Sprintf("VOLOCMTCODE%dX%dEND", len(src), seq)
+				slots[tok] = highlightCommentCodeChroma(strings.Join(codeLines, "\n"), langName)
+				if prefix == "" {
+					outLines = append(outLines, "", tok, "")
+				} else {
+					outLines = append(outLines, prefix+tok)
+				}
+				continue
+			}
+		}
+		outLines = append(outLines, line)
+		i++
+	}
+	return strings.Join(outLines, "\n"), slots
+}
+
 func preprocessDirectives(src string, opts Options) preprocessResult {
 	normalized := strings.ReplaceAll(src, "\r\n", "\n")
 	lines := strings.Split(normalized, "\n")
@@ -231,170 +357,205 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 		seq++
 		return fmt.Sprintf("VOLOPLACEHOLDER%s%dEND", kind, seq)
 	}
+	emitSlot := func(prefix, tok string) {
+		slot := `<div data-volo-slot="` + tok + `"></div>`
+		if prefix == "" {
+			outLines = append(outLines, "", slot, "")
+		} else {
+			outLines = append(outLines, prefix+slot)
+		}
+	}
 
 	i := 0
 	for i < len(lines) {
 		line := lines[i]
-		trimmed := strings.TrimSpace(line)
+		prefix, rest, lineOk := parseBlockLinePrefix(line)
 
-		// 1. Fenced code block (` ```lang ` or `~~~lang`): highlight via Chroma or emit Mermaid container!
-		if ch, fenceLen, ok := parseFenceStart(trimmed); ok {
-			info := strings.TrimSpace(trimmed[fenceLen:])
-			lang := strings.Fields(info)
-			langName := ""
-			if len(lang) > 0 {
-				langName = strings.ToLower(lang[0])
-			}
-			i++
-			var codeLines []string
-			for i < len(lines) {
-				closeTrim := strings.TrimSpace(lines[i])
-				if cCh, cLen, cOk := parseFenceStart(closeTrim); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(closeTrim[cLen:]) == "" {
-					i++
-					break
+		if lineOk {
+			// 1. Fenced code block (` ```lang ` or `~~~lang`): highlight via Chroma or emit Mermaid container!
+			if ch, fenceLen, ok := parseFenceStart(rest); ok {
+				info := strings.TrimSpace(rest[fenceLen:])
+				lang := strings.Fields(info)
+				langName := ""
+				if len(lang) > 0 {
+					langName = strings.ToLower(lang[0])
 				}
-				codeLines = append(codeLines, lines[i])
 				i++
-			}
-			codeBody := strings.Join(codeLines, "\n")
-			tok := nextToken("CODE")
-			if langName == "mermaid" {
-				res.needsMermaid = true
-				res.replacements[tok] = `<pre class="mermaid">` + html.EscapeString(codeBody) + `</pre>`
-			} else {
-				res.replacements[tok] = highlightCodeChroma(codeBody, langName, opts.ShowLineNumbers)
-			}
-			outLines = append(outLines, "", tok, "")
-			continue
-		}
-
-		// 2. `:::lock [type="pwd|user"] [pwd="..."] [hint="..."]` — FAIL-CLOSED if unclosed at EOF!
-		if isDirectivePrefix(trimmed, ":::lock") {
-			res.hasLock = true
-			attrs := parseDirectiveAttrs(trimmed[len(":::lock"):])
-			lockType := strings.ToLower(strings.TrimSpace(attrs["type"]))
-			if lockType == "" {
-				lockType = "pwd"
-			}
-			blockPwd := strings.TrimSpace(attrs["pwd"])
-			if blockPwd == "" {
-				blockPwd = strings.TrimSpace(attrs["password"])
-			}
-			hint := strings.TrimSpace(attrs["hint"])
-			i++
-
-			var innerLines []string
-			inInnerFence := false
-			var innerFenceCh byte
-			innerFenceLen := 0
-
-			for i < len(lines) {
-				cur := lines[i]
-				curTrim := strings.TrimSpace(cur)
-				if fCh, fLen, fOk := parseFenceStart(curTrim); fOk {
-					if !inInnerFence {
-						inInnerFence = true
-						innerFenceCh = fCh
-						innerFenceLen = fLen
-					} else if fCh == innerFenceCh && fLen >= innerFenceLen && strings.TrimSpace(curTrim[fLen:]) == "" {
-						inInnerFence = false
+				var codeLines []string
+				for i < len(lines) {
+					if _, closeRest, cLineOk := parseBlockLinePrefix(lines[i]); cLineOk {
+						if cCh, cLen, cOk := parseFenceStart(closeRest); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(closeRest[cLen:]) == "" {
+							i++
+							break
+						}
 					}
-					innerLines = append(innerLines, cur)
+					codeLines = append(codeLines, stripBlockPrefix(lines[i], prefix))
 					i++
-					continue
 				}
-				if !inInnerFence && curTrim == ":::" {
-					i++
-					break
+				codeBody := strings.Join(codeLines, "\n")
+				tok := nextToken("CODE")
+				if langName == "mermaid" {
+					res.needsMermaid = true
+					res.replacements[tok] = `<pre class="mermaid">` + html.EscapeString(codeBody) + `</pre>`
+				} else {
+					res.replacements[tok] = highlightCodeChroma(codeBody, langName, opts.ShowLineNumbers)
 				}
-				innerLines = append(innerLines, cur)
-				i++
+				emitSlot(prefix, tok)
+				continue
 			}
 
-			canView := false
-			if opts.Mode == RenderModeWeb {
-				if opts.AuthorOrShareBypass {
-					canView = true
-				} else if lockType == "user" {
-					canView = opts.IsReaderLoggedIn
-				} else if blockPwd != "" {
-					if opts.UnlockedPasswords != nil {
-						canView = opts.UnlockedPasswords[blockPwd]
+			// 2. `:::lock [type="pwd|user"] [pwd="..."] [hint="..."]` — FAIL-CLOSED if unclosed at EOF!
+			if isDirectivePrefix(rest, ":::lock") {
+				res.hasLock = true
+				attrs := parseDirectiveAttrs(rest[len(":::lock"):])
+				lockType := strings.ToLower(strings.TrimSpace(attrs["type"]))
+				if lockType == "" {
+					lockType = "pwd"
+				}
+				blockPwd := strings.TrimSpace(attrs["pwd"])
+				if blockPwd == "" {
+					blockPwd = strings.TrimSpace(attrs["password"])
+				}
+				hint := strings.TrimSpace(attrs["hint"])
+				i++
+
+				var innerLines []string
+				inInnerFence := false
+				var innerFenceCh byte
+				innerFenceLen := 0
+				lockNestDepth := 0
+
+				for i < len(lines) {
+					cur := lines[i]
+					if _, curRest, curOk := parseBlockLinePrefix(cur); curOk {
+						if fCh, fLen, fOk := parseFenceStart(curRest); fOk {
+							if !inInnerFence {
+								inInnerFence = true
+								innerFenceCh = fCh
+								innerFenceLen = fLen
+							} else if fCh == innerFenceCh && fLen >= innerFenceLen && strings.TrimSpace(curRest[fLen:]) == "" {
+								inInnerFence = false
+							}
+							innerLines = append(innerLines, stripBlockPrefix(cur, prefix))
+							i++
+							continue
+						}
+						if !inInnerFence {
+							if curRest == ":::" {
+								if lockNestDepth > 0 {
+									lockNestDepth--
+									innerLines = append(innerLines, stripBlockPrefix(cur, prefix))
+									i++
+									continue
+								}
+								i++
+								break
+							}
+							if isOpeningBlockDirective(curRest) {
+								lockNestDepth++
+							}
+						}
+					}
+					innerLines = append(innerLines, stripBlockPrefix(cur, prefix))
+					i++
+				}
+
+				canView := false
+				if opts.Mode == RenderModeWeb {
+					if opts.AuthorOrShareBypass {
+						canView = true
+					} else if lockType == "user" {
+						canView = opts.IsReaderLoggedIn
+					} else if blockPwd != "" {
+						if opts.UnlockedPasswords != nil {
+							canView = opts.UnlockedPasswords[blockPwd]
+						} else {
+							canView = opts.Unlocked
+						}
 					} else {
 						canView = opts.Unlocked
 					}
+				}
+
+				if canView {
+					seq++
+					lockPrefix := "INNER" + strconv.Itoa(seq)
+					innerPrep := preprocessDirectives(strings.Join(innerLines, "\n"), opts)
+					for k, v := range innerPrep.replacements {
+						res.replacements[lockPrefix+k] = v
+						innerPrep.markdown = strings.ReplaceAll(innerPrep.markdown, k, lockPrefix+k)
+					}
+					if innerPrep.hasLock {
+						res.hasLock = true
+					}
+					if innerPrep.hasUnresolvedLock {
+						res.hasUnresolvedLock = true
+					}
+					if innerPrep.needsMath {
+						res.needsMath = true
+					}
+					if innerPrep.needsMermaid {
+						res.needsMermaid = true
+					}
+					openDiv := `<div class="volo-lock-block volo-lock-block--unlocked" data-lock-type="` + html.EscapeString(lockType) + `">`
+					if prefix == "" {
+						outLines = append(outLines, openDiv, "", innerPrep.markdown, "", `</div>`)
+					} else {
+						outLines = append(outLines, prefix+openDiv, prefix)
+						for _, il := range strings.Split(innerPrep.markdown, "\n") {
+							outLines = append(outLines, prefix+il)
+						}
+						outLines = append(outLines, prefix, prefix+`</div>`)
+					}
 				} else {
-					canView = opts.Unlocked
-				}
-			}
-
-			if canView {
-				seq++
-				lockPrefix := "INNER" + strconv.Itoa(seq)
-				outLines = append(outLines, `<div class="volo-lock-block volo-lock-block--unlocked" data-lock-type="`+html.EscapeString(lockType)+`">`, "")
-				innerPrep := preprocessDirectives(strings.Join(innerLines, "\n"), opts)
-				for k, v := range innerPrep.replacements {
-					res.replacements[lockPrefix+k] = v
-					innerPrep.markdown = strings.ReplaceAll(innerPrep.markdown, k, lockPrefix+k)
-				}
-				if innerPrep.hasLock {
-					res.hasLock = true
-				}
-				if innerPrep.hasUnresolvedLock {
+					// Locked! Inner lines are completely discarded before AST parsing — zero chance of leakage!
 					res.hasUnresolvedLock = true
+					tok := nextToken("LOCK")
+					res.replacements[tok] = renderLockedPlaceholder(lockType, hint, opts)
+					emitSlot(prefix, tok)
 				}
-				if innerPrep.needsMath {
-					res.needsMath = true
-				}
-				if innerPrep.needsMermaid {
-					res.needsMermaid = true
-				}
-				outLines = append(outLines, innerPrep.markdown, "", `</div>`)
-			} else {
-				// Locked! Inner lines are completely discarded before AST parsing — zero chance of leakage!
-				res.hasUnresolvedLock = true
-				tok := nextToken("LOCK")
-				res.replacements[tok] = renderLockedPlaceholder(lockType, hint, opts)
-				outLines = append(outLines, "", tok, "")
+				continue
 			}
-			continue
-		}
 
-		// 3. `:::book id="..."` / `:::book slug="..."` / `:::book id="...":::`
-		if isDirectivePrefix(trimmed, ":::book") && !isDirectivePrefix(trimmed, ":::bookshelf") {
-			rawArgs := trimmed[len(":::book"):]
-			hasInlineClose := strings.HasSuffix(strings.TrimSpace(rawArgs), ":::")
-			attrs := parseDirectiveAttrs(rawArgs)
-			slug := attrs["slug"]
-			if slug == "" {
-				slug = attrs["id"]
-			}
-			if slug == "" {
-				slug = attrs["book"]
-			}
-			i++
-			// Consume optional closing `:::` only if block-style (multi-line) was used
-			if !hasInlineClose && i < len(lines) && strings.TrimSpace(lines[i]) == ":::" {
+			// 3. `:::book id="..."` / `:::book slug="..."` / `:::book id="...":::`
+			if isDirectivePrefix(rest, ":::book") && !isDirectivePrefix(rest, ":::bookshelf") {
+				rawArgs := rest[len(":::book"):]
+				hasInlineClose := strings.HasSuffix(strings.TrimSpace(rawArgs), ":::")
+				attrs := parseDirectiveAttrs(rawArgs)
+				slug := attrs["slug"]
+				if slug == "" {
+					slug = attrs["id"]
+				}
+				if slug == "" {
+					slug = attrs["book"]
+				}
 				i++
+				if !hasInlineClose && i < len(lines) {
+					if _, nextRest, nextOk := parseBlockLinePrefix(lines[i]); nextOk && nextRest == ":::" {
+						i++
+					}
+				}
+				tok := nextToken("BOOK")
+				res.replacements[tok] = renderBookCard(slug, opts)
+				emitSlot(prefix, tok)
+				continue
 			}
-			tok := nextToken("BOOK")
-			res.replacements[tok] = renderBookCard(slug, opts)
-			outLines = append(outLines, "", tok, "")
-			continue
-		}
 
-		// 4. `:::bookshelf` / `:::bookshelf:::`
-		if isDirectivePrefix(trimmed, ":::bookshelf") {
-			rawArgs := trimmed[len(":::bookshelf"):]
-			hasInlineClose := strings.HasSuffix(strings.TrimSpace(rawArgs), ":::")
-			i++
-			if !hasInlineClose && i < len(lines) && strings.TrimSpace(lines[i]) == ":::" {
+			// 4. `:::bookshelf` / `:::bookshelf:::`
+			if isDirectivePrefix(rest, ":::bookshelf") {
+				rawArgs := rest[len(":::bookshelf"):]
+				hasInlineClose := strings.HasSuffix(strings.TrimSpace(rawArgs), ":::")
 				i++
+				if !hasInlineClose && i < len(lines) {
+					if _, nextRest, nextOk := parseBlockLinePrefix(lines[i]); nextOk && nextRest == ":::" {
+						i++
+					}
+				}
+				tok := nextToken("BOOKSHELF")
+				res.replacements[tok] = renderBookshelfGrid(opts)
+				emitSlot(prefix, tok)
+				continue
 			}
-			tok := nextToken("BOOKSHELF")
-			res.replacements[tok] = renderBookshelfGrid(opts)
-			outLines = append(outLines, "", tok, "")
-			continue
 		}
 
 		// Detect math expressions outside fenced code blocks (`$$...$$`, `\[...\]`, `\(...\)`, or `$...$`).
@@ -409,6 +570,77 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 
 	res.markdown = strings.Join(outLines, "\n")
 	return res
+}
+
+// parseBlockLinePrefix strips optional CommonMark `>` blockquote prefixes (each preceded by 0..3 spaces)
+// and verifies the remaining line has at most 0..3 leading spaces (NOT a 4-space/tab indented code block).
+func parseBlockLinePrefix(line string) (prefix string, rest string, ok bool) {
+	pos := 0
+	for pos < len(line) {
+		sp := 0
+		for sp < 4 && pos+sp < len(line) && line[pos+sp] == ' ' {
+			sp++
+		}
+		if sp <= 3 && pos+sp < len(line) && line[pos+sp] == '>' {
+			pos += sp + 1
+			if pos < len(line) && line[pos] == ' ' {
+				pos++
+			}
+			continue
+		}
+		break
+	}
+	sp := 0
+	for pos+sp < len(line) && line[pos+sp] == ' ' {
+		sp++
+		if sp >= 4 {
+			return "", "", false
+		}
+	}
+	if pos+sp < len(line) && line[pos+sp] == '\t' {
+		return "", "", false
+	}
+	pos += sp
+	return line[:pos], strings.TrimRight(line[pos:], " \t\r"), true
+}
+
+// stripBlockPrefix removes matching blockquote `>` markers and up to the opening line's leading spaces.
+func stripBlockPrefix(line, fencePrefix string) string {
+	if fencePrefix == "" {
+		return line
+	}
+	hasQuote := strings.Contains(fencePrefix, ">")
+	pos := 0
+	if hasQuote {
+		quotesWanted := strings.Count(fencePrefix, ">")
+		quotesSeen := 0
+		for quotesSeen < quotesWanted && pos < len(line) {
+			sp := 0
+			for sp < 4 && pos+sp < len(line) && line[pos+sp] == ' ' {
+				sp++
+			}
+			if sp <= 3 && pos+sp < len(line) && line[pos+sp] == '>' {
+				pos += sp + 1
+				if pos < len(line) && line[pos] == ' ' {
+					pos++
+				}
+				quotesSeen++
+				continue
+			}
+			break
+		}
+	}
+	trailSpaces := 0
+	for i := len(fencePrefix) - 1; i >= 0 && fencePrefix[i] == ' '; i-- {
+		if hasQuote && i > 0 && fencePrefix[i-1] == '>' {
+			break
+		}
+		trailSpaces++
+	}
+	for removed := 0; removed < trailSpaces && pos < len(line) && line[pos] == ' '; removed++ {
+		pos++
+	}
+	return line[pos:]
 }
 
 func parseFenceStart(trimmed string) (byte, int, bool) {
@@ -426,7 +658,24 @@ func parseFenceStart(trimmed string) (byte, int, bool) {
 	if n < 3 {
 		return 0, 0, false
 	}
+	if ch == '`' && strings.IndexByte(trimmed[n:], '`') >= 0 {
+		return 0, 0, false
+	}
 	return ch, n, true
+}
+
+func isOpeningBlockDirective(rest string) bool {
+	if !strings.HasPrefix(rest, ":::") || len(rest) <= 3 {
+		return false
+	}
+	c := rest[3]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	if strings.HasSuffix(strings.TrimSpace(rest[3:]), ":::") {
+		return false
+	}
+	return true
 }
 
 func isDirectivePrefix(trimmed string, directive string) bool {
@@ -624,17 +873,22 @@ var (
 )
 
 func enhanceImages(htmlSrc string, lookupDims func(string) (int, int, bool), firstImg *string) string {
+	proseImgCount := 0
 	return imgTagRe.ReplaceAllStringFunc(htmlSrc, func(tag string) string {
 		m := imgSrcRe.FindStringSubmatch(tag)
 		if len(m) < 2 {
 			return tag
 		}
 		src := html.UnescapeString(m[1])
-		if firstImg != nil && *firstImg == "" && isSafeImageSrc(src) {
+		isEmbedCover := strings.Contains(tag, "volo-embed-book__cover")
+		if !isEmbedCover {
+			proseImgCount++
+		}
+		if firstImg != nil && *firstImg == "" && !isEmbedCover && isSafeImageSrc(src) {
 			*firstImg = src
 		}
 		var attrs strings.Builder
-		if !strings.Contains(tag, "loading=") {
+		if !strings.Contains(tag, "loading=") && (isEmbedCover || proseImgCount > 1) {
 			attrs.WriteString(` loading="lazy"`)
 		}
 		if !strings.Contains(tag, "decoding=") {
@@ -874,6 +1128,12 @@ func ExtractOutboundPostSlugs(rawMarkdown string) []string {
 	return slugs
 }
 
+// StripLockedMarkdownBlocks is an alias for StripAllLockBlocks, removing all `:::lock ... :::` blocks
+// outside fenced code blocks while honoring CommonMark indentation, blockquotes, and nested directives.
+func StripLockedMarkdownBlocks(src string) string {
+	return StripAllLockBlocks(src)
+}
+
 // StripAllLockBlocks removes all `:::lock ... :::` blocks outside fenced code blocks,
 // failing closed to EOF if an opening `:::lock` is unclosed.
 func StripAllLockBlocks(src string) string {
@@ -888,30 +1148,43 @@ func StripAllLockBlocks(src string) string {
 	var fenceChar byte
 	fenceLen := 0
 	inLock := false
+	lockNestDepth := 0
 
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if ch, n, ok := parseFenceStart(trimmed); ok {
+		if _, rest, lineOk := parseBlockLinePrefix(line); lineOk {
+			if ch, n, ok := parseFenceStart(rest); ok {
+				if !inFence {
+					inFence = true
+					fenceChar = ch
+					fenceLen = n
+				} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
+					inFence = false
+				}
+				if !inLock {
+					out = append(out, line)
+				}
+				continue
+			}
 			if !inFence {
-				inFence = true
-				fenceChar = ch
-				fenceLen = n
-			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(trimmed[n:]) == "" {
-				inFence = false
-			}
-			if !inLock {
-				out = append(out, line)
-			}
-			continue
-		}
-		if !inFence {
-			if !inLock && isDirectivePrefix(trimmed, ":::lock") {
-				inLock = true
-				continue
-			}
-			if inLock && trimmed == ":::" {
-				inLock = false
-				continue
+				if !inLock && isDirectivePrefix(rest, ":::lock") {
+					inLock = true
+					lockNestDepth = 0
+					continue
+				}
+				if inLock {
+					if rest == ":::" {
+						if lockNestDepth > 0 {
+							lockNestDepth--
+							continue
+						}
+						inLock = false
+						continue
+					}
+					if isOpeningBlockDirective(rest) {
+						lockNestDepth++
+					}
+					continue
+				}
 			}
 		}
 		if !inLock {
@@ -930,16 +1203,17 @@ func StripAllCodeAndLockBlocks(src string) string {
 	var fenceChar byte
 	fenceLen := 0
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if ch, n, ok := parseFenceStart(trimmed); ok {
-			if !inFence {
-				inFence = true
-				fenceChar = ch
-				fenceLen = n
-			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(trimmed[n:]) == "" {
-				inFence = false
+		if _, rest, lineOk := parseBlockLinePrefix(line); lineOk {
+			if ch, n, ok := parseFenceStart(rest); ok {
+				if !inFence {
+					inFence = true
+					fenceChar = ch
+					fenceLen = n
+				} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
+					inFence = false
+				}
+				continue
 			}
-			continue
 		}
 		if !inFence {
 			out = append(out, stripInlineCodeSpans(line))
@@ -958,19 +1232,22 @@ func ExtractAllLockPasswords(src string) []string {
 	var out []string
 	seen := make(map[string]struct{})
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if ch, n, ok := parseFenceStart(trimmed); ok {
+		_, rest, lineOk := parseBlockLinePrefix(line)
+		if !lineOk {
+			continue
+		}
+		if ch, n, ok := parseFenceStart(rest); ok {
 			if !inFence {
 				inFence = true
 				fenceChar = ch
 				fenceLen = n
-			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(trimmed[n:]) == "" {
+			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
 				inFence = false
 			}
 			continue
 		}
-		if !inFence && isDirectivePrefix(trimmed, ":::lock") {
-			attrs := parseDirectiveAttrs(trimmed[len(":::lock"):])
+		if !inFence && isDirectivePrefix(rest, ":::lock") {
+			attrs := parseDirectiveAttrs(rest[len(":::lock"):])
 			p := strings.TrimSpace(attrs["pwd"])
 			if p == "" {
 				p = strings.TrimSpace(attrs["password"])
@@ -1003,18 +1280,21 @@ func ContainsLockDirective(src string) bool {
 	var fenceChar byte
 	fenceLen := 0
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if ch, n, ok := parseFenceStart(trimmed); ok {
+		_, rest, lineOk := parseBlockLinePrefix(line)
+		if !lineOk {
+			continue
+		}
+		if ch, n, ok := parseFenceStart(rest); ok {
 			if !inFence {
 				inFence = true
 				fenceChar = ch
 				fenceLen = n
-			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(trimmed[n:]) == "" {
+			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
 				inFence = false
 			}
 			continue
 		}
-		if !inFence && isDirectivePrefix(trimmed, ":::lock") {
+		if !inFence && isDirectivePrefix(rest, ":::lock") {
 			return true
 		}
 	}

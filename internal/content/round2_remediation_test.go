@@ -3,6 +3,7 @@ package content
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -324,3 +325,176 @@ func TestComments_CreateSpamAllow_HookRejectReason_And_UpdateOwnCommentAntiSpam(
 		t.Fatalf("expected Template='wide' and HookRenderPreMarkdown transformation, got tpl=%q html=%s", pgView.Template, pgView.HTML)
 	}
 }
+
+func TestContentRound3_SQLCommentPagination_TwoGenCache_PendingViews_And_BoundedTags(t *testing.T) {
+	ctx, store, _, _, svc := setupContentTestEnv(t)
+	now := time.Now().UnixMilli()
+
+	// Seed admin, reader, and 25 published articles (oldest art_old_0 is outside top-20 recentCards!).
+	if _, err := store.ExecContext(ctx, `INSERT INTO users (
+		id, username, email, display_name, avatar_url, bio, website_url,
+		role, password_hash, legacy_hash, status, preferred_locale, created_at, updated_at
+	) VALUES
+		('u_adm', 'adm', 'adm@example.com', 'Admin', '', '', '', 'admin', 'x', '', 'active', 'en', ?, ?),
+		('u_rdr', 'rdr', 'rdr@example.com', 'Reader', '', '', '', 'reader', 'x', '', 'active', 'en', ?, ?)`,
+		now, now, now, now); err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+
+	for i := 0; i < 25; i++ {
+		aid := fmt.Sprintf("art_%02d", i)
+		slug := fmt.Sprintf("post-%02d", i)
+		pubAt := now + int64(i)*1000
+		if _, err := store.ExecContext(ctx, `INSERT INTO articles (
+			id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md,
+			cover_url, status, published_at, allow_comment, password_ciphertext,
+			audio_url, audio_mime, lang, translation_group, license_override, created_at, updated_at
+		) VALUES (?, 'u_adm', '', ?, ?, '', 'sum', 'body', '', 'published', ?, ?, '', '', '', 'en', '', '', ?, ?)`,
+			aid, slug, slug, pubAt, true, pubAt, pubAt); err != nil {
+			t.Fatalf("seed article %s: %v", aid, err)
+		}
+	}
+
+	// Seed 210 tags (> maxCachedChromeTags=200), attaching tag_hot to 3 articles.
+	for i := 0; i < 210; i++ {
+		tid := fmt.Sprintf("tag_%03d", i)
+		name := fmt.Sprintf("Tag-%03d", i)
+		slug := fmt.Sprintf("tag-%03d", i)
+		if _, err := store.ExecContext(ctx, `INSERT INTO tags (id, name, slug, created_at) VALUES (?, ?, ?, ?)`, tid, name, slug, now); err != nil {
+			t.Fatalf("seed tag: %v", err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := store.ExecContext(ctx, `INSERT INTO article_tags (article_id, tag_id) VALUES (?, 'tag_205')`, fmt.Sprintf("art_%02d", i)); err != nil {
+			t.Fatalf("seed article_tags: %v", err)
+		}
+	}
+
+	// Verify >200 tags: Stats.TagCount is exact (210), popular tags hit bounded cache, and full ListTagsWithCounts(0) returns all 210.
+	extras := svc.GetPublicChromeExtras(ctx, "en", 6)
+	if extras.Stats.TagCount != 210 {
+		t.Fatalf("expected exact Stats.TagCount=210, got %d", extras.Stats.TagCount)
+	}
+	top5, err := svc.ListTagsWithCounts(ctx, 5)
+	if err != nil || len(top5) != 5 || top5[0].ID != "tag_205" || top5[0].ArticleCount != 3 {
+		t.Fatalf("unexpected top5 tags: %+v (err=%v)", top5, err)
+	}
+	allTags, err := svc.ListTagsWithCounts(ctx, 0)
+	if err != nil || len(allTags) != 210 {
+		t.Fatalf("expected all 210 tags when limit=0, got %d (err=%v)", len(allTags), err)
+	}
+
+	// Record views on oldest article art_00 (NOT in recentCards top-20!) and verify TotalPendingArticleViews() updates Stats.ViewCount!
+	svc.RecordView(ctx, domain.TargetTypeArticle, "art_00", "visitor-1", "news.ycombinator.com")
+	svc.RecordView(ctx, domain.TargetTypeArticle, "art_00", "visitor-1", "news.ycombinator.com")
+	extrasAfter := svc.GetPublicChromeExtras(ctx, "en", 6)
+	if extrasAfter.Stats.ViewCount != extras.Stats.ViewCount+2 {
+		t.Fatalf("expected Stats.ViewCount to include pending views on older article (+2), before=%d after=%d", extras.Stats.ViewCount, extrasAfter.Stats.ViewCount)
+	}
+	if err := svc.FlushAnalytics(ctx); err != nil {
+		t.Fatalf("FlushAnalytics: %v", err)
+	}
+
+	// Seed 5 approved root comments + 2 replies on oldest root_0 + 1 pending comment owned by u_rdr on art_00.
+	for i := 0; i < 5; i++ {
+		cid := fmt.Sprintf("root_%d", i)
+		ts := now + int64(i)*100
+		md := fmt.Sprintf("Root %d <div id=\"volo-lightbox\">spoof</div> <input type=\"password\"> text[^1]\n\n[^1]: fn", i)
+		if _, err := store.ExecContext(ctx, `INSERT INTO comments (
+			id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash,
+			author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale,
+			client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at
+		) VALUES (?, 'article', 'art_00', '', '', '', '', '', 'Guest', '', '', 'enc_secret', 'en', '203.0.113.9', '203.0.113.0/24', '', ?, 'approved', ?, ?, ?)`,
+			cid, md, false, ts, ts); err != nil {
+			t.Fatalf("seed root comment: %v", err)
+		}
+	}
+	for rIdx, rid := range []string{"rep_early", "rep_late"} {
+		ts := now + 10 + int64(rIdx)*20
+		if _, err := store.ExecContext(ctx, `INSERT INTO comments (
+			id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash,
+			author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale,
+			client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at
+		) VALUES (?, 'article', 'art_00', 'root_0', 'Guest', '', '', '', 'Replier', '', '', '', 'en', '', '', '', ?, 'approved', ?, ?, ?)`,
+			rid, "Reply "+rid, false, ts, ts); err != nil {
+			t.Fatalf("seed reply: %v", err)
+		}
+	}
+	if _, err := store.ExecContext(ctx, `INSERT INTO comments (
+		id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash,
+		author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale,
+		client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at
+	) VALUES ('root_pending_own', 'article', 'art_00', '', '', 'u_rdr', '', '', 'Reader', '', '', '', 'en', '', '', '', 'Pending own comment', 'pending', ?, ?, ?)`,
+		false, now+900, now+900); err != nil {
+		t.Fatalf("seed pending own comment: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/comments", nil)
+	// Anonymous viewer sees 5 roots (7 total comments), page 1 perPage=2 has root_4, root_3.
+	anonPage1, err := svc.ListTargetCommentsPage(ctx, req, nil, domain.TargetTypeArticle, "art_00", 1, 2, "")
+	if err != nil {
+		t.Fatalf("ListTargetCommentsPage (anon p1): %v", err)
+	}
+	if anonPage1.TotalRoots != 5 || anonPage1.TotalComments != 7 || anonPage1.TotalPages != 3 {
+		t.Fatalf("unexpected anon counts: %+v", anonPage1)
+	}
+	if len(anonPage1.Comments) != 2 || anonPage1.Comments[0].ID != "root_4" || anonPage1.Comments[1].ID != "root_3" {
+		t.Fatalf("expected newest-first roots [root_4, root_3], got %+v", anonPage1.Comments)
+	}
+	// Verify RenderComment stripped <div id="volo-lightbox">, <input>, and footnote IDs!
+	cHTML := anonPage1.Comments[0].ContentHTML
+	if strings.Contains(cHTML, "volo-lightbox") || strings.Contains(cHTML, "<input") || strings.Contains(cHTML, "fn:1") {
+		t.Fatalf("expected comment HTML sanitizer to neutralize raw HTML & footnote IDs, got: %s", cHTML)
+	}
+
+	// focusCommentID="rep_late" (attached to oldest root_0) jumps automatically to Page 3 and preserves chronological replies!
+	focused, err := svc.ListTargetCommentsPage(ctx, req, nil, domain.TargetTypeArticle, "art_00", 1, 2, "rep_late")
+	if err != nil {
+		t.Fatalf("ListTargetCommentsPage (focus): %v", err)
+	}
+	if focused.Page != 3 || len(focused.Comments) != 1 || focused.Comments[0].ID != "root_0" {
+		t.Fatalf("expected focusCommentID=rep_late to jump to page 3 [root_0], got page=%d comments=%+v", focused.Page, focused.Comments)
+	}
+	if len(focused.Comments[0].Replies) != 2 || focused.Comments[0].Replies[0].ID != "rep_early" || focused.Comments[0].Replies[1].ID != "rep_late" {
+		t.Fatalf("expected chronological replies [rep_early, rep_late], got %+v", focused.Comments[0].Replies)
+	}
+
+	// Authenticated owner u_rdr sees their own pending comment at top (TotalRoots=6, TotalComments=8).
+	rdr := &domain.User{ID: "u_rdr", Role: domain.RoleReader, Status: domain.UserStatusActive}
+	rdrPage1, err := svc.ListTargetCommentsPage(ctx, req, rdr, domain.TargetTypeArticle, "art_00", 1, 2, "")
+	if err != nil {
+		t.Fatalf("ListTargetCommentsPage (owner): %v", err)
+	}
+	if rdrPage1.TotalRoots != 6 || rdrPage1.TotalComments != 8 || rdrPage1.Comments[0].ID != "root_pending_own" || !rdrPage1.Comments[0].CanEdit {
+		t.Fatalf("expected owner to see pending own comment with CanEdit=true, got %+v", rdrPage1)
+	}
+
+	// Active admin sees CanBanIP=true (derived via SQL has_client_ip without selecting client_ip!).
+	adm := &domain.User{ID: "u_adm", Role: domain.RoleAdmin, Status: domain.UserStatusActive}
+	admPage1, err := svc.ListTargetCommentsPage(ctx, req, adm, domain.TargetTypeArticle, "art_00", 1, 2, "")
+	if err != nil || !admPage1.Comments[1].CanBanIP || !admPage1.Comments[1].CanModerate {
+		t.Fatalf("expected admin CanBanIP & CanModerate on root_4, got %+v (err=%v)", admPage1, err)
+	}
+
+	// Verify two-generation commentHTML cache rotation (> maxCommentHTMLGenEntries=2048).
+	_ = svc.renderCommentMarkdownHTML(domain.Comment{ID: "hot_cmt", UpdatedAt: 1, ContentMD: "**hot**"})
+	for i := 0; i < maxCommentHTMLGenEntries+50; i++ {
+		_ = svc.renderCommentMarkdownHTML(domain.Comment{
+			ID:        fmt.Sprintf("gen_%d", i),
+			UpdatedAt: 1,
+			ContentMD: "item",
+		})
+	}
+	// Promote hot_cmt from Prev -> Curr, then trigger one more generation rotation.
+	if got := svc.renderCommentMarkdownHTML(domain.Comment{ID: "hot_cmt", UpdatedAt: 1, ContentMD: "**hot**"}); !strings.Contains(got, "<strong>hot</strong>") {
+		t.Fatalf("unexpected hot_cmt HTML: %s", got)
+	}
+	svc.commentHTMLMu.RLock()
+	totalCached := len(svc.commentHTMLCurr) + len(svc.commentHTMLPrev)
+	_, hotInCurr := svc.commentHTMLCurr["hot_cmt:1"]
+	svc.commentHTMLMu.RUnlock()
+	if !hotInCurr || totalCached > 2*maxCommentHTMLGenEntries {
+		t.Fatalf("expected hot_cmt promoted to Curr and totalCached <= %d, got hotInCurr=%v total=%d", 2*maxCommentHTMLGenEntries, hotInCurr, totalCached)
+	}
+}
+

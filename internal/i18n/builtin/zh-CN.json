@@ -216,5 +216,12 @@
   "error.search_site": "搜索全站",
   "studio.close": "关闭",
   "studio.lightbox_label": "图片预览",
-  "studio.lightbox_close": "关闭预览"
+  "studio.lightbox_close": "关闭预览",
+  "sidebar.view_all": "查看全部",
+  "bookshelf.filter_chapters": "筛选章节…",
+  "studio.filter_placeholder": "输入关键词快速筛选…",
+  "studio.filter_empty": "没有匹配的筛选项",
+  "studio.clear_filter": "清空",
+  "reader.no_account_cta": "还没有读者账号？前往注册",
+  "reader.has_account_cta": "已有读者账号？返回登录"
 }

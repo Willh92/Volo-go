@@ -1,13 +1,10 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"image"
 	"io"
 	"io/fs"
 	"mime"
@@ -22,6 +19,7 @@ import (
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
@@ -35,147 +33,55 @@ type MediaAssetView struct {
 
 func isSupportedReconcileExt(ext string) bool {
 	switch strings.ToLower(ext) {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav", ".pdf", ".zip":
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav", ".mp4", ".webm", ".pdf", ".zip":
 		return true
 	default:
 		return false
 	}
 }
 
-// stripImageMetadataBytes losslessly strips EXIF/XMP/IPTC/text metadata chunks from JPEG, PNG, and WebP
-// byte slices without re-encoding pixel data. Returns (cleanedBytes, true) when metadata was removed.
-func stripImageMetadataBytes(raw []byte, ext string) ([]byte, bool) {
-	if len(raw) < 12 {
-		return raw, false
+func defaultReconcileMIMEType(ext string, sample []byte) string {
+	switch strings.ToLower(ext) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".avif":
+		return "image/avif"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".m4a":
+		return "audio/mp4"
+	case ".ogg":
+		return "audio/ogg"
+	case ".wav":
+		return "audio/wav"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".pdf":
+		return "application/pdf"
+	case ".zip":
+		return "application/zip"
 	}
-	// JPEG: SOI 0xFF 0xD8
-	if raw[0] == 0xFF && raw[1] == 0xD8 {
-		out := make([]byte, 0, len(raw))
-		out = append(out, 0xFF, 0xD8)
-		pos := 2
-		removed := false
-		for pos < len(raw) {
-			if raw[pos] != 0xFF {
-				return raw, false
-			}
-			for pos < len(raw) && raw[pos] == 0xFF {
-				pos++
-			}
-			if pos >= len(raw) {
-				break
-			}
-			marker := raw[pos]
-			pos++
-			if marker == 0x00 {
-				return raw, false
-			}
-			if marker == 0xD9 { // EOI
-				out = append(out, 0xFF, 0xD9)
-				return out, removed
-			}
-			if marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7) {
-				out = append(out, 0xFF, marker)
-				continue
-			}
-			if pos+2 > len(raw) {
-				return raw, false
-			}
-			segLen := int(binary.BigEndian.Uint16(raw[pos : pos+2]))
-			if segLen < 2 || pos+segLen > len(raw) {
-				return raw, false
-			}
-			if marker == 0xDA { // SOS: copy header + entropy-coded scan stream to EOF
-				out = append(out, 0xFF, marker)
-				out = append(out, raw[pos:]...)
-				return out, removed
-			}
-			payload := raw[pos+2 : pos+segLen]
-			isICC := marker == 0xE2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00"))
-			if !isICC && (marker == 0xFE || (marker >= 0xE1 && marker <= 0xEF)) {
-				removed = true
-				pos += segLen
-				continue
-			}
-			out = append(out, 0xFF, marker)
-			out = append(out, raw[pos:pos+segLen]...)
-			pos += segLen
-		}
-		return out, removed
+	mt := mime.TypeByExtension(ext)
+	if mt == "" && len(sample) > 0 {
+		mt = http.DetectContentType(sample)
 	}
-
-	// PNG: \x89PNG\r\n\x1a\n
-	if bytes.Equal(raw[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
-		out := make([]byte, 0, len(raw))
-		out = append(out, raw[:8]...)
-		pos := 8
-		removed := false
-		for pos+12 <= len(raw) {
-			cLen := int(binary.BigEndian.Uint32(raw[pos : pos+4]))
-			if cLen < 0 || pos+12+cLen > len(raw) {
-				return raw, false
-			}
-			cType := string(raw[pos+4 : pos+8])
-			totalChunk := 12 + cLen
-			if cType == "eXIf" || cType == "tEXt" || cType == "zTXt" || cType == "iTXt" {
-				removed = true
-			} else {
-				out = append(out, raw[pos:pos+totalChunk]...)
-			}
-			pos += totalChunk
-			if cType == "IEND" {
-				break
-			}
-		}
-		return out, removed
+	if idx := strings.IndexByte(mt, ';'); idx > 0 {
+		mt = strings.TrimSpace(mt[:idx])
 	}
-
-	// WebP: RIFF....WEBP
-	if string(raw[0:4]) == "RIFF" && string(raw[8:12]) == "WEBP" {
-		out := make([]byte, 12, len(raw))
-		copy(out, raw[:12])
-		pos := 12
-		removed := false
-		for pos+8 <= len(raw) {
-			fourCC := string(raw[pos : pos+4])
-			cSize := int(binary.LittleEndian.Uint32(raw[pos+4 : pos+8]))
-			if cSize < 0 {
-				return raw, false
-			}
-			padded := cSize
-			if padded%2 == 1 {
-				padded++
-			}
-			if pos+8+padded > len(raw) {
-				if pos+8+cSize == len(raw) {
-					padded = cSize
-				} else {
-					return raw, false
-				}
-			}
-			if fourCC == "EXIF" || fourCC == "XMP " {
-				removed = true
-			} else {
-				out = append(out, raw[pos:pos+8+padded]...)
-			}
-			pos += 8 + padded
-		}
-		if removed {
-			if len(out) >= 24 && string(out[12:16]) == "VP8X" {
-				out[20] &^= 0x0C // clear EXIF (0x08) and XMP (0x04) feature flags
-			}
-			binary.LittleEndian.PutUint32(out[4:8], uint32(len(out)-8))
-			return out, true
-		}
-		return raw, false
-	}
-
-	_ = ext
-	return raw, false
+	return strings.ToLower(strings.TrimSpace(mt))
 }
 
 // reconcileLocalUploads scans UploadDir on explicit operator request (`POST /api/admin/media/reconcile`)
-// and registers untracked valid media files in `media_assets`, stripping image EXIF/metadata on disk and
-// returning the number of newly imported rows.
+// and registers untracked valid media files in `media_assets`, normalizing EXIF orientation & stripping
+// image metadata on disk via `media.NormalizeLocalImageBytes` and returning the number of newly imported rows.
 func (s *AppServer) reconcileLocalUploads(ctx context.Context) int {
 	if s.deps.Config == nil || strings.TrimSpace(s.deps.Config.UploadDir) == "" {
 		return 0
@@ -248,57 +154,61 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) int {
 		}
 
 		fileSize := info.Size()
-		exifStripped := false
-		isStripCandidate := ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp"
-		if isStripCandidate && fileSize <= (32<<20) {
-			if rawBytes, rErr := os.ReadFile(fullPath); rErr == nil {
-				if cleaned, changed := stripImageMetadataBytes(rawBytes, ext); changed {
-					tmpPath := fullPath + ".volostrip." + strings.ToLower(id.Next())
-					if wErr := os.WriteFile(tmpPath, cleaned, info.Mode().Perm()); wErr == nil {
-						if renErr := os.Rename(tmpPath, fullPath); renErr == nil {
-							fileSize = int64(len(cleaned))
-							exifStripped = true
-						} else {
-							_ = os.Remove(tmpPath)
-						}
+		var (
+			mimeType     string
+			width        int
+			height       int
+			sumHex       string
+			exifStripped bool
+		)
+
+		isRasterImage := ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".gif"
+		if isRasterImage {
+			if fileSize > (32 << 20) {
+				return nil
+			}
+			rawBytes, rErr := os.ReadFile(fullPath)
+			if rErr != nil {
+				return nil
+			}
+			cleanBytes, normMIME, w, h, changed, nErr := media.NormalizeLocalImageBytes(rawBytes, ext)
+			if nErr != nil {
+				return nil
+			}
+			mimeType = strings.ToLower(strings.TrimSpace(normMIME))
+			width, height = w, h
+			exifStripped = ext != ".gif"
+			finalBytes := rawBytes
+			if changed && len(cleanBytes) > 0 {
+				tmpPath := fullPath + ".volostrip." + strings.ToLower(id.Next())
+				if wErr := os.WriteFile(tmpPath, cleanBytes, info.Mode().Perm()); wErr == nil {
+					if renErr := os.Rename(tmpPath, fullPath); renErr == nil {
+						finalBytes = cleanBytes
+					} else {
+						_ = os.Remove(tmpPath)
 					}
-				} else {
-					exifStripped = true
 				}
 			}
-		}
-
-		f, oErr := os.Open(fullPath)
-		if oErr != nil {
-			return nil
-		}
-
-		var head [512]byte
-		n, _ := io.ReadFull(f, head[:])
-		mimeType := mime.TypeByExtension(ext)
-		if mimeType == "" && n > 0 {
-			mimeType = http.DetectContentType(head[:n])
-		}
-		if idx := strings.IndexByte(mimeType, ';'); idx > 0 {
-			mimeType = strings.TrimSpace(mimeType[:idx])
-		}
-
-		var width, height int
-		if strings.HasPrefix(mimeType, "image/") {
-			_, _ = f.Seek(0, io.SeekStart)
-			if cfg, _, dErr := image.DecodeConfig(f); dErr == nil {
-				width, height = cfg.Width, cfg.Height
+			fileSize = int64(len(finalBytes))
+			sum := sha256.Sum256(finalBytes)
+			sumHex = hex.EncodeToString(sum[:])
+		} else {
+			f, oErr := os.Open(fullPath)
+			if oErr != nil {
+				return nil
 			}
+			var head [512]byte
+			n, _ := io.ReadFull(f, head[:])
+			mimeType = defaultReconcileMIMEType(ext, head[:n])
+			_, _ = f.Seek(0, io.SeekStart)
+			hasher := sha256.New()
+			written, _ := io.Copy(hasher, f)
+			_ = f.Close()
+			if written > 0 {
+				fileSize = written
+			}
+			sumHex = hex.EncodeToString(hasher.Sum(nil))
 		}
-
-		_, _ = f.Seek(0, io.SeekStart)
-		hasher := sha256.New()
-		written, _ := io.Copy(hasher, f)
-		_ = f.Close()
-		if written > 0 {
-			fileSize = written
-		}
-		sumHex := hex.EncodeToString(hasher.Sum(nil))
 
 		createdAt := info.ModTime().UnixMilli()
 		if createdAt <= 0 {
@@ -320,201 +230,53 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) int {
 	return imported
 }
 
-type sqlNullString struct {
-	val string
-}
-
-func (ns *sqlNullString) Scan(src any) error {
-	switch v := src.(type) {
-	case nil:
-		ns.val = ""
-	case string:
-		ns.val = v
-	case []byte:
-		ns.val = string(v)
-	default:
-		ns.val = ""
-	}
-	return nil
-}
-
-func isMediaRefDelim(b byte) bool {
-	switch b {
-	case ' ', '\t', '\n', '\r', '"', '\'', '(', ')', '<', '>', '[', ']', '{', '}', ',', ';', '?', '#', '|', '`':
-		return true
-	default:
-		return false
-	}
-}
-
 func (s *AppServer) invalidateMediaRefCache() {
 	if s == nil {
 		return
 	}
 	s.mediaRefCacheMu.Lock()
-	s.mediaRefCachedAt = time.Time{}
+	s.mediaRefCachedRev = 0
 	s.mediaRefCachedTokens = nil
+	s.mediaRefOrphanCounts = nil
 	s.mediaRefCacheMu.Unlock()
 }
 
-// collectReferencedMediaTokensCached scans all 12 content & configuration tables for media URL/key tokens
-// and caches per-token row reference counts for 10 seconds (invalidated immediately on mutations).
+// collectReferencedMediaTokensCached scans all 14 content, navigation, chapter, redirect, comment,
+// setting, and plugin tables via `media.CollectReferencedTokenCounts`, caching token counts keyed by
+// `store.DataRevision()` so paginated media views never rescan unchanged tables.
 func (s *AppServer) collectReferencedMediaTokensCached(ctx context.Context) map[string]int {
 	if s == nil || s.deps.Store == nil {
 		return map[string]int{}
 	}
+	curRev := s.deps.Store.DataRevision()
 	s.mediaRefCacheMu.Lock()
-	if s.mediaRefCachedTokens != nil && time.Since(s.mediaRefCachedAt) < 10*time.Second {
+	if s.mediaRefCachedTokens != nil && curRev > 0 && s.mediaRefCachedRev == curRev {
 		cached := s.mediaRefCachedTokens
 		s.mediaRefCacheMu.Unlock()
 		return cached
 	}
 	s.mediaRefCacheMu.Unlock()
 
-	tokenCounts := make(map[string]int, 256)
-	rowSeen := make(map[string]struct{}, 16)
-
-	recordKey := func(k string) {
-		if k == "" || len(k) > 512 {
-			return
-		}
-		if _, exists := rowSeen[k]; !exists {
-			rowSeen[k] = struct{}{}
-			tokenCounts[k]++
-		}
+	tokenCounts, err := media.CollectReferencedTokenCounts(ctx, s.deps.Store)
+	if err != nil || tokenCounts == nil {
+		tokenCounts = map[string]int{}
 	}
-
-	collectToken := func(tok string) {
-		if tok == "" {
-			return
-		}
-		if strings.Contains(tok, "/") || strings.Contains(tok, ".") {
-			recordKey(tok)
-			trimmed := strings.TrimLeft(tok, "/")
-			if trimmed != "" {
-				recordKey(trimmed)
-			}
-		}
-		if uIdx := strings.Index(tok, "/uploads/"); uIdx >= 0 {
-			subPub := tok[uIdx:]
-			recordKey(subPub)
-			subKey := subPub[len("/uploads/"):]
-			if subKey != "" {
-				recordKey(subKey)
-			}
-		} else if strings.HasPrefix(tok, "http://") || strings.HasPrefix(tok, "https://") {
-			if schemeEnd := strings.Index(tok, "://"); schemeEnd > 0 {
-				rest := tok[schemeEnd+3:]
-				if slash := strings.IndexByte(rest, '/'); slash >= 0 && slash+1 < len(rest) {
-					recordKey(rest[slash+1:])
-				}
-			}
-		}
-	}
-
-	scanColumn := func(raw string) {
-		if raw == "" {
-			return
-		}
-		str := raw
-		if strings.Contains(str, `\/`) {
-			str = strings.ReplaceAll(str, `\/`, "/")
-		}
-		collectToken(strings.TrimSpace(str))
-		n := len(str)
-		start := -1
-		for i := 0; i < n; i++ {
-			if isMediaRefDelim(str[i]) {
-				if start >= 0 {
-					if i-start >= 3 {
-						collectToken(str[start:i])
-					}
-					start = -1
-				}
-			} else if start < 0 {
-				start = i
-			}
-		}
-		if start >= 0 && n-start >= 3 {
-			collectToken(str[start:n])
-		}
-	}
-
-	scanQuery := func(q string, args ...any) {
-		rows, err := s.deps.Store.QueryContext(ctx, q, args...)
-		if err != nil {
-			return
-		}
-		defer rows.Close()
-		cols, err := rows.Columns()
-		if err != nil || len(cols) == 0 {
-			return
-		}
-		vals := make([]sqlNullString, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		for rows.Next() {
-			for i := range vals {
-				vals[i].val = ""
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				continue
-			}
-			clear(rowSeen)
-			for _, col := range vals {
-				scanColumn(col.val)
-			}
-		}
-	}
-
-	scanQuery(`SELECT content_md, summary_md, cover_url, audio_url FROM articles`)
-	scanQuery(`SELECT content_md, summary_md FROM article_revisions`)
-	scanQuery(`SELECT content_md FROM pages`)
-	scanQuery(`SELECT cover_url, description FROM series`)
-	scanQuery(`SELECT cover_url, description FROM books`)
-	scanQuery(`SELECT icon_url, description FROM links`)
-	scanQuery(`SELECT avatar_url, bio FROM users`)
-	scanQuery(`SELECT content_md, avatar_url FROM comments WHERE is_deleted = ?`, false)
-	scanQuery(`SELECT value_json FROM settings`)
-	scanQuery(`SELECT config_json FROM plugins`)
-	scanQuery(`SELECT icon_url, description FROM follows`)
-	scanQuery(`SELECT icon FROM nav_items`)
 
 	s.mediaRefCacheMu.Lock()
-	s.mediaRefCachedAt = time.Now()
+	if s.mediaRefCachedRev != curRev {
+		s.mediaRefOrphanCounts = make(map[string]int)
+	}
+	s.mediaRefCachedRev = curRev
 	s.mediaRefCachedTokens = tokenCounts
 	s.mediaRefCacheMu.Unlock()
 	return tokenCounts
 }
 
-func assetRefCountFromTokens(tokenCounts map[string]int, a domain.MediaAsset) int {
-	pub := strings.TrimSpace(a.PublicURL)
-	obj := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
-	rc := 0
-	if pub != "" {
-		if c := tokenCounts[pub]; c > rc {
-			rc = c
-		}
-	}
-	if obj != "" {
-		if c := tokenCounts[obj]; c > rc {
-			rc = c
-		}
-	}
-	return rc
-}
-
-// countAssetsReferencesStreaming computes reference counts across all content & configuration tables,
-// utilizing the 10-second token cache for standard assets and falling back to a direct row scan only
-// if an asset path contains whitespace characters.
-func (s *AppServer) countAssetsReferencesStreaming(ctx context.Context, assets []domain.MediaAsset) []int {
+func (s *AppServer) countAssetsReferences(ctx context.Context, assets []domain.MediaAsset) []int {
 	counts := make([]int, len(assets))
-	if len(assets) == 0 {
+	if len(assets) == 0 || s == nil || s.deps.Store == nil {
 		return counts
 	}
-
 	hasWhitespaceKey := false
 	for _, a := range assets {
 		if strings.ContainsAny(strings.TrimSpace(a.PublicURL), " \t") || strings.ContainsAny(strings.TrimSpace(a.ObjectKey), " \t") {
@@ -525,170 +287,74 @@ func (s *AppServer) countAssetsReferencesStreaming(ctx context.Context, assets [
 	if !hasWhitespaceKey {
 		tokenCounts := s.collectReferencedMediaTokensCached(ctx)
 		for i, a := range assets {
-			counts[i] = assetRefCountFromTokens(tokenCounts, a)
+			counts[i] = media.AssetRefCountFromTokens(tokenCounts, a)
 		}
 		return counts
 	}
-
-	byPubURL := make(map[string][]int, len(assets))
-	byObjKey := make(map[string][]int, len(assets))
-	type spaceNeedle struct {
-		idx    int
-		pubURL string
-		objKey string
+	byKey, err := media.CountAssetReferences(ctx, s.deps.Store, assets)
+	if err != nil {
+		return counts
 	}
-	var spaceAssets []spaceNeedle
-
 	for i, a := range assets {
-		pub := strings.TrimSpace(a.PublicURL)
-		obj := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
-		if pub != "" {
-			byPubURL[pub] = append(byPubURL[pub], i)
+		mk := strings.TrimSpace(a.ID)
+		if mk == "" {
+			mk = strings.TrimSpace(a.PublicURL)
 		}
-		if obj != "" {
-			byObjKey[obj] = append(byObjKey[obj], i)
+		if mk == "" {
+			mk = strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
 		}
-		if strings.ContainsAny(pub, " \t") || strings.ContainsAny(obj, " \t") {
-			spaceAssets = append(spaceAssets, spaceNeedle{idx: i, pubURL: pub, objKey: obj})
-		}
+		counts[i] = byKey[mk]
 	}
-
-	rowSeen := make([]uint32, len(assets))
-	var rowGen uint32
-
-	markIndices := func(idxs []int) {
-		for _, idx := range idxs {
-			if rowSeen[idx] != rowGen {
-				rowSeen[idx] = rowGen
-				counts[idx]++
-			}
-		}
-	}
-
-	matchToken := func(tok string) {
-		if tok == "" {
-			return
-		}
-		if idxs, ok := byPubURL[tok]; ok {
-			markIndices(idxs)
-		}
-		trimmed := strings.TrimLeft(tok, "/")
-		if trimmed != "" {
-			if idxs, ok := byObjKey[trimmed]; ok {
-				markIndices(idxs)
-			}
-		}
-		if uIdx := strings.Index(tok, "/uploads/"); uIdx >= 0 {
-			subPub := tok[uIdx:]
-			if idxs, ok := byPubURL[subPub]; ok {
-				markIndices(idxs)
-			}
-			subKey := subPub[len("/uploads/"):]
-			if subKey != "" {
-				if idxs, ok := byObjKey[subKey]; ok {
-					markIndices(idxs)
-				}
-			}
-		} else if strings.HasPrefix(tok, "http://") || strings.HasPrefix(tok, "https://") {
-			if schemeEnd := strings.Index(tok, "://"); schemeEnd > 0 {
-				rest := tok[schemeEnd+3:]
-				if slash := strings.IndexByte(rest, '/'); slash >= 0 && slash+1 < len(rest) {
-					pathKey := rest[slash+1:]
-					if idxs, ok := byObjKey[pathKey]; ok {
-						markIndices(idxs)
-					}
-				}
-			}
-		}
-	}
-
-	scanColumn := func(raw string) {
-		if raw == "" {
-			return
-		}
-		str := raw
-		if strings.Contains(str, `\/`) {
-			str = strings.ReplaceAll(str, `\/`, "/")
-		}
-		whole := strings.TrimSpace(str)
-		matchToken(whole)
-
-		n := len(str)
-		start := -1
-		for i := 0; i < n; i++ {
-			if isMediaRefDelim(str[i]) {
-				if start >= 0 {
-					if i-start >= 3 {
-						matchToken(str[start:i])
-					}
-					start = -1
-				}
-			} else if start < 0 {
-				start = i
-			}
-		}
-		if start >= 0 && n-start >= 3 {
-			matchToken(str[start:n])
-		}
-
-		for _, sp := range spaceAssets {
-			if rowSeen[sp.idx] == rowGen {
-				continue
-			}
-			if (sp.pubURL != "" && strings.Contains(str, sp.pubURL)) ||
-				(sp.objKey != "" && strings.Contains(str, sp.objKey)) {
-				rowSeen[sp.idx] = rowGen
-				counts[sp.idx]++
-			}
-		}
-	}
-
-	scanQuery := func(q string, args ...any) {
-		rows, err := s.deps.Store.QueryContext(ctx, q, args...)
-		if err != nil {
-			return
-		}
-		defer rows.Close()
-		cols, err := rows.Columns()
-		if err != nil || len(cols) == 0 {
-			return
-		}
-		vals := make([]sqlNullString, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		for rows.Next() {
-			for i := range vals {
-				vals[i].val = ""
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				continue
-			}
-			rowGen++
-			if rowGen == 0 {
-				clear(rowSeen)
-				rowGen = 1
-			}
-			for _, col := range vals {
-				scanColumn(col.val)
-			}
-		}
-	}
-
-	scanQuery(`SELECT content_md, summary_md, cover_url, audio_url FROM articles`)
-	scanQuery(`SELECT content_md, summary_md FROM article_revisions`)
-	scanQuery(`SELECT content_md FROM pages`)
-	scanQuery(`SELECT cover_url, description FROM series`)
-	scanQuery(`SELECT cover_url, description FROM books`)
-	scanQuery(`SELECT icon_url, description FROM links`)
-	scanQuery(`SELECT avatar_url, bio FROM users`)
-	scanQuery(`SELECT content_md, avatar_url FROM comments WHERE is_deleted = ?`, false)
-	scanQuery(`SELECT value_json FROM settings`)
-	scanQuery(`SELECT config_json FROM plugins`)
-	scanQuery(`SELECT icon_url, description FROM follows`)
-	scanQuery(`SELECT icon FROM nav_items`)
 	return counts
+}
+
+func (s *AppServer) cachedOrComputeOrphanCount(
+	ctx context.Context,
+	whereSQL string,
+	args []any,
+	cacheScopeKey string,
+	canCache bool,
+) int {
+	tokenCounts := s.collectReferencedMediaTokensCached(ctx)
+	curRev := s.deps.Store.DataRevision()
+	if canCache && curRev > 0 {
+		s.mediaRefCacheMu.Lock()
+		if s.mediaRefCachedRev == curRev && s.mediaRefOrphanCounts != nil {
+			if cnt, ok := s.mediaRefOrphanCounts[cacheScopeKey]; ok {
+				s.mediaRefCacheMu.Unlock()
+				return cnt
+			}
+		}
+		s.mediaRefCacheMu.Unlock()
+	}
+
+	keyRows, _ := sqlx.Select[struct {
+		StorageDriver string `db:"storage_driver"`
+		ObjectKey     string `db:"object_key"`
+		PublicURL     string `db:"public_url"`
+	}](ctx, s.deps.Store, `SELECT storage_driver, object_key, public_url FROM media_assets WHERE `+whereSQL, args...)
+	orphanCnt := 0
+	for _, kr := range keyRows {
+		if media.AssetRefCountFromTokens(tokenCounts, domain.MediaAsset{
+			StorageDriver: kr.StorageDriver,
+			ObjectKey:     kr.ObjectKey,
+			PublicURL:     kr.PublicURL,
+		}) == 0 {
+			orphanCnt++
+		}
+	}
+
+	if canCache && curRev > 0 {
+		s.mediaRefCacheMu.Lock()
+		if s.mediaRefCachedRev == curRev {
+			if s.mediaRefOrphanCounts == nil {
+				s.mediaRefOrphanCounts = make(map[string]int)
+			}
+			s.mediaRefOrphanCounts[cacheScopeKey] = orphanCnt
+		}
+		s.mediaRefCacheMu.Unlock()
+	}
+	return orphanCnt
 }
 
 func (s *AppServer) mediaTimeLocation() *time.Location {
@@ -700,6 +366,7 @@ func (s *AppServer) mediaTimeLocation() *time.Location {
 
 func (s *AppServer) queryAdminMediaPage(
 	ctx context.Context,
+	actor *domain.User,
 	qStr string,
 	mimeFilter string,
 	monthFilter string,
@@ -709,7 +376,7 @@ func (s *AppServer) queryAdminMediaPage(
 	sortBy string,
 	page int,
 	perPage int,
-) ([]MediaAssetView, int, int, int64) {
+) ([]MediaAssetView, int, int, int, int64) {
 	if page < 1 {
 		page = 1
 	}
@@ -722,9 +389,22 @@ func (s *AppServer) queryAdminMediaPage(
 
 	where := []string{"1=1"}
 	var args []any
+	scopeKey := "global"
 
+	var allTotal int
+	if actor != nil && actor.Role != domain.RoleAdmin {
+		where = append(where, "uploader_id = ?")
+		args = append(args, actor.ID)
+		scopeKey = "uploader:" + actor.ID
+		_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE uploader_id = ?`, actor.ID).Scan(&allTotal)
+	} else {
+		_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets`).Scan(&allTotal)
+	}
+
+	hasExtraFilters := false
 	qStr = strings.TrimSpace(qStr)
 	if qStr != "" {
+		hasExtraFilters = true
 		pat := "%" + escapeLikePattern(qStr) + "%"
 		where = append(where, "(LOWER(original_name) LIKE LOWER(?) ESCAPE '!' OR LOWER(object_key) LIKE LOWER(?) ESCAPE '!' OR LOWER(public_url) LIKE LOWER(?) ESCAPE '!' OR LOWER(alt_text) LIKE LOWER(?) ESCAPE '!')")
 		args = append(args, pat, pat, pat, pat)
@@ -732,15 +412,18 @@ func (s *AppServer) queryAdminMediaPage(
 
 	mf := strings.ToLower(strings.TrimSpace(mimeFilter))
 	if mf != "" && mf != "all" {
+		hasExtraFilters = true
 		switch mf {
 		case "image", "images":
-			where = append(where, "LOWER(mime_type) LIKE 'image/%'")
+			where = append(where, "mime_type LIKE 'image/%'")
 		case "audio":
-			where = append(where, "LOWER(mime_type) LIKE 'audio/%'")
+			where = append(where, "mime_type LIKE 'audio/%'")
+		case "video", "videos":
+			where = append(where, "mime_type LIKE 'video/%'")
 		case "other", "file", "files":
-			where = append(where, "(LOWER(mime_type) NOT LIKE 'image/%' AND LOWER(mime_type) NOT LIKE 'audio/%')")
+			where = append(where, "(mime_type NOT LIKE 'image/%' AND mime_type NOT LIKE 'audio/%' AND mime_type NOT LIKE 'video/%')")
 		default:
-			where = append(where, "LOWER(mime_type) LIKE LOWER(?) ESCAPE '!'")
+			where = append(where, "mime_type LIKE ? ESCAPE '!'")
 			args = append(args, escapeLikePattern(mf)+"%")
 		}
 	}
@@ -748,6 +431,7 @@ func (s *AppServer) queryAdminMediaPage(
 	monthClean := strings.TrimSpace(monthFilter)
 	if len(monthClean) == 7 && monthClean[4] == '-' {
 		if tStart, err := time.ParseInLocation("2006-01", monthClean, s.mediaTimeLocation()); err == nil {
+			hasExtraFilters = true
 			tEnd := tStart.AddDate(0, 1, 0)
 			where = append(where, "(created_at >= ? AND created_at < ?)")
 			args = append(args, tStart.UnixMilli(), tEnd.UnixMilli())
@@ -774,9 +458,9 @@ func (s *AppServer) queryAdminMediaPage(
 		rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store,
 			`SELECT * FROM media_assets WHERE `+whereSQL+` ORDER BY `+orderClause, args...)
 		if len(rows) == 0 {
-			return []MediaAssetView{}, 0, 0, 0
+			return []MediaAssetView{}, 0, allTotal, 0, 0
 		}
-		refCounts := s.countAssetsReferencesStreaming(ctx, rows)
+		refCounts := s.countAssetsReferences(ctx, rows)
 		filtered := make([]MediaAssetView, 0, len(rows))
 		orphanCnt := 0
 		var totalBytes int64
@@ -799,13 +483,13 @@ func (s *AppServer) queryAdminMediaPage(
 		total := len(filtered)
 		start := (page - 1) * perPage
 		if start >= total {
-			return []MediaAssetView{}, total, orphanCnt, totalBytes
+			return []MediaAssetView{}, total, allTotal, orphanCnt, totalBytes
 		}
 		end := start + perPage
 		if end > total {
 			end = total
 		}
-		return filtered[start:end], total, orphanCnt, totalBytes
+		return filtered[start:end], total, allTotal, orphanCnt, totalBytes
 	}
 
 	var total int
@@ -813,7 +497,7 @@ func (s *AppServer) queryAdminMediaPage(
 	_ = s.deps.Store.QueryRowContext(ctx,
 		`SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM media_assets WHERE `+whereSQL, args...).Scan(&total, &totalBytes)
 	if total == 0 {
-		return []MediaAssetView{}, 0, 0, 0
+		return []MediaAssetView{}, 0, allTotal, 0, 0
 	}
 
 	offset := (page - 1) * perPage
@@ -829,23 +513,13 @@ func (s *AppServer) queryAdminMediaPage(
 	var refCounts []int
 	if withRefs {
 		if len(rows) > 0 {
-			refCounts = s.countAssetsReferencesStreaming(ctx, rows)
+			refCounts = s.countAssetsReferences(ctx, rows)
 		}
-		// Compute total orphan count across matching rows via lightweight key projection + cached token map
-		tokenCounts := s.collectReferencedMediaTokensCached(ctx)
-		keyRows, _ := sqlx.Select[struct {
-			ObjectKey string `db:"object_key"`
-			PublicURL string `db:"public_url"`
-		}](ctx, s.deps.Store, `SELECT object_key, public_url FROM media_assets WHERE `+whereSQL, args...)
-		for _, kr := range keyRows {
-			if assetRefCountFromTokens(tokenCounts, domain.MediaAsset{ObjectKey: kr.ObjectKey, PublicURL: kr.PublicURL}) == 0 {
-				orphanCnt++
-			}
-		}
+		orphanCnt = s.cachedOrComputeOrphanCount(ctx, whereSQL, args, scopeKey, !hasExtraFilters)
 	}
 
 	if len(rows) == 0 {
-		return []MediaAssetView{}, total, orphanCnt, totalBytes
+		return []MediaAssetView{}, total, allTotal, orphanCnt, totalBytes
 	}
 
 	out := make([]MediaAssetView, 0, len(rows))
@@ -862,11 +536,11 @@ func (s *AppServer) queryAdminMediaPage(
 			IsOrphan:   isOrp,
 		})
 	}
-	return out, total, orphanCnt, totalBytes
+	return out, total, allTotal, orphanCnt, totalBytes
 }
 
 func (s *AppServer) listMediaWithRefs(ctx context.Context, limit int) ([]MediaAssetView, int) {
-	items, _, orphanCnt, _ := s.queryAdminMediaPage(ctx, "", "", "", "all", false, true, "newest", 1, limit)
+	items, _, _, orphanCnt, _ := s.queryAdminMediaPage(ctx, nil, "", "", "", "all", false, true, "newest", 1, limit)
 	return items, orphanCnt
 }
 
@@ -892,7 +566,7 @@ func (s *AppServer) scanOrCleanOrphans(ctx context.Context, deleteOrphans bool) 
 	if err != nil {
 		return nil, 0, err
 	}
-	refCounts := s.countAssetsReferencesStreaming(ctx, rows)
+	refCounts := s.countAssetsReferences(ctx, rows)
 	orphans := make([]domain.MediaAsset, 0)
 	var freed int64
 	for i, a := range rows {

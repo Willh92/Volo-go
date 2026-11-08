@@ -40,11 +40,30 @@ type NotifierProvider interface {
 
 // OIDCIdentity holds a verified external identity returned by an OIDCProvider.
 type OIDCIdentity struct {
-	Provider    string `json:"provider"`
-	Subject     string `json:"subject"`
-	Email       string `json:"email"`
-	DisplayName string `json:"display_name"`
-	AvatarURL   string `json:"avatar_url"`
+	Provider      string `json:"provider"`
+	Subject       string `json:"subject"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	Nonce         string `json:"nonce,omitempty"`
+	DisplayName   string `json:"display_name"`
+	AvatarURL     string `json:"avatar_url"`
+}
+
+// OIDCAuthParams carries authorization URL parameters including OIDC nonce and PKCE S256 challenge.
+type OIDCAuthParams struct {
+	State               string `json:"state"`
+	RedirectURI         string `json:"redirect_uri"`
+	Nonce               string `json:"nonce,omitempty"`
+	CodeChallenge       string `json:"code_challenge,omitempty"`
+	CodeChallengeMethod string `json:"code_challenge_method,omitempty"`
+}
+
+// OIDCExchangeParams carries authorization code exchange parameters including OIDC nonce and PKCE verifier.
+type OIDCExchangeParams struct {
+	Code         string `json:"code"`
+	RedirectURI  string `json:"redirect_uri"`
+	Nonce        string `json:"nonce,omitempty"`
+	CodeVerifier string `json:"code_verifier,omitempty"`
 }
 
 // OIDCProvider allows trusted plugins to register external single-sign-on providers.
@@ -53,6 +72,13 @@ type OIDCProvider interface {
 	DisplayName(locale string) string
 	AuthCodeURL(state string, redirectURI string) (string, error)
 	Exchange(ctx context.Context, code string, redirectURI string) (OIDCIdentity, error)
+}
+
+// OIDCAdvancedProvider extends OIDCProvider with OIDC nonce and PKCE S256 parameter forwarding.
+type OIDCAdvancedProvider interface {
+	OIDCProvider
+	AuthCodeURLWithParams(params OIDCAuthParams) (string, error)
+	ExchangeWithParams(ctx context.Context, params OIDCExchangeParams) (OIDCIdentity, error)
 }
 
 // CommentCheckInput contains sanitized comment attributes evaluated by AntiSpamProvider.

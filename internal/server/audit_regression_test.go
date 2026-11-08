@@ -347,9 +347,10 @@ func TestAudit_AdminSecurity_Pagination_PasswordPreservation_And_BgAuditLog(t *t
 
 	// 3. Issue a read-only PAT (`articles:read` ONLY) -> MUST redact `"password"` on GET /api/admin/articles/{id} AND reject PATCH /api/admin/me!
 	patResp, patCreatedRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/tokens", map[string]any{
-		"name":            "readonly-pat",
-		"scopes":          []string{"articles:read"},
-		"expires_in_days": 30,
+		"name":             "readonly-pat",
+		"scopes":           []string{"articles:read"},
+		"expires_in_days":  30,
+		"current_password": "Str0ng!Pass#2026",
 	}, adminCookies, adminHdrs)
 	if patResp.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /api/admin/security/tokens = %d %s", patResp.StatusCode, string(patCreatedRaw))

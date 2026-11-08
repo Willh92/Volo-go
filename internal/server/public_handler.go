@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -21,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/auth"
+	"github.com/Willh92/Volo-go/internal/backup"
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/content"
 	"github.com/Willh92/Volo-go/internal/db/dialect"
@@ -44,21 +43,22 @@ type CommentEventNotifier func(ctx context.Context, comment content.PublicCommen
 
 // AppDeps bundles all runtime dependencies for the unified Volo-go HTTP server.
 type AppDeps struct {
-	Config         *config.Config
-	Store          *sqlx.Store
-	Settings       *repo.SettingsManager
-	Catalog        *i18n.Catalog
-	Auth           *auth.Service
-	Passports      *guest.PassportManager
-	PoW            *guest.PoWVerifier
-	Geo            *security.GeoEngine
-	WAF            *security.WAFEngine
-	OutboundDialer *security.OutboundSafeDialer
-	Plugins        *plugin.Manager
-	Content        *content.Service
-	Themes         *theme.Engine
-	StartedAt      time.Time
-	Version        string
+	Config          *config.Config
+	Store           *sqlx.Store
+	Settings        *repo.SettingsManager
+	Catalog         *i18n.Catalog
+	Auth            *auth.Service
+	Passports       *guest.PassportManager
+	PoW             *guest.PoWVerifier
+	Geo             *security.GeoEngine
+	WAF             *security.WAFEngine
+	OutboundDialer  *security.OutboundSafeDialer
+	Plugins         *plugin.Manager
+	Content         *content.Service
+	Themes          *theme.Engine
+	BackupScheduler *backup.Scheduler
+	StartedAt       time.Time
+	Version         string
 
 	SendVerificationMail   VerificationMailSender
 	NotifyCommentCreated   CommentEventNotifier
@@ -70,7 +70,9 @@ type AppDeps struct {
 }
 
 type backupExportTicket struct {
-	ActorID   string
+	UserID    string
+	SessionID string
+	IPBucket  string
 	ExpiresAt time.Time
 }
 
@@ -79,12 +81,15 @@ type AppServer struct {
 	deps    AppDeps
 	handler http.Handler
 
+	setupMu sync.Mutex
+
 	backupTicketMu sync.Mutex
 	backupTickets  map[string]backupExportTicket
 
 	mediaRefCacheMu      sync.Mutex
-	mediaRefCachedAt     time.Time
+	mediaRefCachedRev    uint64
 	mediaRefCachedTokens map[string]int
+	mediaRefOrphanCounts map[string]int
 }
 
 // NewAppServer constructs and wires a complete AppServer instance.
@@ -106,14 +111,18 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		deps.Settings = repo.NewSettingsManager(deps.Store, deps.Config.KeyRing, deps.Config.DefaultLocale)
 		_, _ = deps.Settings.Reload(context.Background())
 	}
+	pubURL := ""
+	if deps.Config != nil {
+		pubURL = deps.Config.GetPublicURL()
+	}
 	if deps.Passports == nil {
-		deps.Passports = guest.NewPassportManager(deps.Config.KeyRing, deps.Config.PublicURL)
+		deps.Passports = guest.NewPassportManager(deps.Config.KeyRing, pubURL)
 	}
 	if deps.PoW == nil {
 		deps.PoW = guest.NewPoWVerifier(deps.Config.KeyRing)
 	}
 	if deps.Auth == nil {
-		deps.Auth = auth.NewService(deps.Store, deps.Config.KeyRing, deps.Settings, deps.Config.PublicURL)
+		deps.Auth = auth.NewService(deps.Store, deps.Config.KeyRing, deps.Settings, pubURL)
 	}
 	if deps.Geo == nil {
 		deps.Geo = security.NewGeoEngine(deps.Config.GeoIPDir, deps.Settings)
@@ -123,7 +132,7 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		deps.WAF = security.NewWAFEngine(deps.Config, deps.Store, deps.Settings, deps.Geo)
 		_ = deps.WAF.ReloadBans(context.Background())
 	} else if deps.Config != nil {
-		deps.WAF.SetPublicURL(deps.Config.PublicURL)
+		deps.WAF.SetPublicURL(pubURL)
 	}
 	if deps.Themes == nil {
 		th, err := theme.NewEngine(deps.Catalog, deps.Config.ThemesDir)
@@ -365,6 +374,7 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/follows", s.handleFollowsPage)
 	mux.HandleFunc("/dynamic", s.handleDynamicPage)
 	mux.HandleFunc("/reader/login", s.handleReaderAuthPage)
+	mux.HandleFunc("/reader/register", s.handleReaderAuthPage)
 	mux.HandleFunc("/", s.handleRootOrStandalonePage)
 }
 
@@ -633,6 +643,7 @@ func (s *AppServer) handleRSS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "feed error", http.StatusInternalServerError)
 		return
 	}
+	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
 	serveCachedDocument(w, r, doc)
 }
 
@@ -642,6 +653,7 @@ func (s *AppServer) handleAtom(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "feed error", http.StatusInternalServerError)
 		return
 	}
+	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
 	serveCachedDocument(w, r, doc)
 }
 
@@ -651,6 +663,7 @@ func (s *AppServer) handleJSONFeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "feed error", http.StatusInternalServerError)
 		return
 	}
+	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
 	serveCachedDocument(w, r, doc)
 }
 
@@ -664,6 +677,7 @@ func (s *AppServer) handlePodcast(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "podcast feed error", http.StatusInternalServerError)
 		return
 	}
+	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
 	serveCachedDocument(w, r, doc)
 }
 
@@ -734,6 +748,7 @@ func (s *AppServer) handlePublicI18nAPI(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
 	snap := s.deps.Settings.Snapshot()
 	requested := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/i18n"), "/")
 	requested = strings.TrimSuffix(requested, ".json")
@@ -835,11 +850,9 @@ func verifyPageInlinePassword(contentMD string, candidate string) (string, bool)
 	if c == "" {
 		return "", false
 	}
-	candSum := sha256.Sum256([]byte(c))
 	var matched string
 	for _, inlinePwd := range render.ExtractAllLockPasswords(contentMD) {
-		iSum := sha256.Sum256([]byte(inlinePwd))
-		if subtle.ConstantTimeCompare(iSum[:], candSum[:]) == 1 && matched == "" {
+		if visibility.EqualLockPassword(inlinePwd, c, "page") && matched == "" {
 			matched = inlinePwd
 		}
 	}
@@ -935,6 +948,20 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 	switch r.Method {
 	case http.MethodGet:
 		q := r.URL.Query()
+		addVaryHeader(w.Header(), "Cookie", guest.PassportHeaderName, "X-Volo-Unlock-State", "X-Volo-Share-Token")
+		ckHdr := r.Header.Get("Cookie")
+		hasAuthOrGuestCreds := viewer != nil ||
+			q.Get("st") != "" ||
+			q.Get("preview") != "" ||
+			strings.TrimSpace(r.Header.Get(guest.PassportHeaderName)) != "" ||
+			strings.TrimSpace(r.Header.Get("X-Volo-Unlock-State")) != "" ||
+			strings.TrimSpace(r.Header.Get("X-Volo-Share-Token")) != "" ||
+			strings.Contains(ckHdr, auth.SessionCookieName) ||
+			strings.Contains(ckHdr, guest.PassportCookieName) ||
+			strings.Contains(ckHdr, guest.UnlockCookieName)
+		if hasAuthOrGuestCreds {
+			w.Header().Set("Cache-Control", "private, no-store")
+		}
 		tType := q.Get("target_type")
 		tID := q.Get("target_id")
 		page := parsePageParam(r)
@@ -1183,6 +1210,19 @@ func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]string{"message": s.deps.Catalog.T(locale, "reader.code_sent")})
 }
 
+func sanitizeReaderNextTarget(raw string) string {
+	cand := strings.TrimSpace(raw)
+	if !isSafeRelativeRedirect(cand) {
+		return ""
+	}
+	if cand == "/reader/login" || strings.HasPrefix(cand, "/reader/login?") ||
+		cand == "/reader/register" || strings.HasPrefix(cand, "/reader/register?") ||
+		cand == "/logout" || strings.HasPrefix(cand, "/logout?") {
+		return ""
+	}
+	return cand
+}
+
 func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1205,6 +1245,7 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 		Email    string `json:"email"`
 		Password string `json:"password"`
 		Code     string `json:"code"`
+		Next     string `json:"next"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -1216,15 +1257,24 @@ func (s *AppServer) handleReaderRegister(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if s.deps.Passports != nil {
+		if gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
+			_, _ = s.deps.Auth.ClaimGuestComments(r.Context(), u, gp)
+		}
+	}
 	var geo string
 	if loc, ok := s.deps.Geo.Lookup(clientIP); ok {
 		geo = loc.Region
 	}
 	_, rawTok, err := s.deps.Auth.CreateSession(r.Context(), u.ID, clientIP, geo, r.UserAgent(), 0)
 	if err == nil {
-		s.setSessionCookie(w, rawTok)
+		s.setSessionCookieForRequest(w, r, rawTok)
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"user": u})
+	resp := map[string]any{"user": u}
+	if safeNext := sanitizeReaderNextTarget(req.Next); safeNext != "" {
+		resp["next"] = safeNext
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
@@ -1243,6 +1293,7 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Ident    string `json:"ident"`
 		Password string `json:"password"`
+		Next     string `json:"next"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -1263,7 +1314,11 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
-	writeJSON(w, http.StatusOK, map[string]any{"user": res.User, "csrf_token": res.CSRFToken})
+	resp := map[string]any{"user": res.User, "csrf_token": res.CSRFToken}
+	if safeNext := sanitizeReaderNextTarget(req.Next); safeNext != "" {
+		resp["next"] = safeNext
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
@@ -1284,6 +1339,7 @@ func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   s.isCookieSecureForRequest(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -1320,20 +1376,23 @@ func (s *AppServer) setSessionCookie(w http.ResponseWriter, rawToken string) {
 	s.setSessionCookieForRequest(w, nil, rawToken)
 }
 
-func (s *AppServer) setSessionCookieForRequest(w http.ResponseWriter, r *http.Request, rawToken string) {
+func (s *AppServer) isCookieSecureForRequest(r *http.Request) bool {
 	pubURL := ""
 	if s.deps.Config != nil {
 		pubURL = s.deps.Config.GetPublicURL()
 	}
-	secure := s.effectiveRequestScheme(r) == "https" ||
+	return s.effectiveRequestScheme(r) == "https" ||
 		strings.HasPrefix(strings.ToLower(strings.TrimSpace(pubURL)), "https://")
+}
+
+func (s *AppServer) setSessionCookieForRequest(w http.ResponseWriter, r *http.Request, rawToken string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.SessionCookieName,
 		Value:    rawToken,
 		Path:     "/",
 		MaxAge:   int(auth.SessionTTL / time.Second),
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   s.isCookieSecureForRequest(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -1341,6 +1400,9 @@ func (s *AppServer) setSessionCookieForRequest(w http.ResponseWriter, r *http.Re
 func hasActiveUnlockCookie(r *http.Request) bool {
 	if r == nil {
 		return false
+	}
+	if strings.TrimSpace(r.Header.Get("X-Volo-Unlock-State")) != "" {
+		return true
 	}
 	ck, err := r.Cookie(guest.UnlockCookieName)
 	return err == nil && strings.TrimSpace(ck.Value) != ""
@@ -1359,7 +1421,7 @@ func (s *AppServer) basePageContextWithSession(r *http.Request, viewer *domain.U
 	cats, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
 	tags, _ := s.deps.Content.ListTagsWithCounts(r.Context(), snap.Reading.PopularTagsCount)
 	var recentComments []content.RecentCommentItem
-	if r.URL.Path == "/" && viewer != nil && viewer.Role == domain.RoleAdmin && viewer.Status == domain.UserStatusActive {
+	if snap.Reading.RecentCommentsCount > 0 && r.URL.Path != "/dynamic" {
 		recentComments, _ = s.deps.Content.ListRecentPublicComments(r.Context(), snap.Reading.RecentCommentsCount)
 	}
 	extras := s.deps.Content.GetPublicChromeExtras(r.Context(), locale, 6)
@@ -1465,10 +1527,10 @@ func (s *AppServer) renderStudioFallback(w http.ResponseWriter, r *http.Request,
 	hasQueryPrivate := false
 	if r != nil && r.URL != nil {
 		q := r.URL.Query()
-		hasQueryPrivate = q.Get("st") != "" || q.Get("preview") != "" || q.Get("skin") != "" || q.Get("theme_preview") != ""
+		hasQueryPrivate = q.Get("st") != "" || q.Get("preview") != "" || q.Get("skin") != "" || q.Get("theme_preview") != "" || q.Get("device") != "" || strings.TrimSpace(r.Header.Get("X-Volo-Share-Token")) != ""
 	}
-	if pctx.Viewer != nil || hasQueryPrivate || hasActiveUnlockCookie(r) ||
-		(pctx.Detail.ID != "" && (pctx.Detail.UnlockedViaShare || pctx.Detail.IsPasswordProtected)) ||
+	if pctx.Viewer != nil || hasQueryPrivate || hasActiveUnlockCookie(r) || pctx.BookLocked ||
+		(pctx.Detail.ID != "" && (pctx.Detail.UnlockedViaShare || pctx.Detail.IsPasswordProtected || pctx.Detail.RequiresPassword)) ||
 		(pctx.StandalonePage.ID != "" && pctx.StandalonePage.HasLockedSections) {
 		w.Header().Set("Cache-Control", "private, no-store")
 	}
@@ -1593,6 +1655,9 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
+	if pgView.HasLockedSections {
+		w.Header().Set("Cache-Control", "private, no-store")
+	}
 	pctx := s.basePageContextWithSession(r, viewer, sess)
 	pctx.IsStandalonePage = true
 	pctx.PageTitle = pgView.Title + " · " + pctx.Site.Title
@@ -1685,6 +1750,9 @@ func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Cache-Control", "private, no-store")
 		raw = cand
+	}
+	if raw.HasContentLock || strings.TrimSpace(raw.PasswordCiphertext) != "" || render.ContainsLockDirective(raw.ContentMD) || render.ContainsLockDirective(raw.SummaryMD) {
+		w.Header().Set("Cache-Control", "private, no-store")
 	}
 	pctx := s.basePageContextWithSession(r, viewer, sess)
 	detail, prev, next, backlinks, err := s.deps.Content.RenderArticleDetail(
@@ -2255,15 +2323,53 @@ func (s *AppServer) handleBookReader(w http.ResponseWriter, r *http.Request) {
 	if pctx.ActiveChapter != nil {
 		if postSlug := s.extractLocalPostSlugFromChapterURL(r, pctx.ActiveChapter.URL); postSlug != "" {
 			if raw, gErr := s.deps.Content.GetPublishedRawArticleBySlug(r.Context(), postSlug); gErr == nil {
+				if r.Method == http.MethodPost {
+					if !s.isSameOriginRequest(r) {
+						http.Error(w, "403 Forbidden", http.StatusForbidden)
+						return
+					}
+					clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+					if !s.deps.WAF.AllowRate("article_unlock", clientIP, 12, 5*time.Minute) {
+						pctx.BookUnlockError = s.deps.Catalog.T(pctx.Locale, "error.rate_limited")
+					} else {
+						r.Body = http.MaxBytesReader(w, r.Body, 8192)
+						_ = r.ParseForm()
+						pwd := r.FormValue("password")
+						if matched, ok := s.deps.Content.Guard().VerifyArticlePassword(raw, pwd); ok {
+							gp, _ := s.deps.Passports.ResolveOrHeal(w, r, true)
+							entryKey := s.deps.Content.Guard().UnlockEntryKey(raw, matched)
+							_, _ = s.deps.Passports.GrantArticleUnlock(w, r, gp.GuestID, entryKey, matched)
+							visibility.ApplyNoIndexPrivateHeaders(w)
+							selfTarget := "/books"
+							if reqURI := r.URL.RequestURI(); isLocalUrl(reqURI) {
+								selfTarget = reqURI
+							}
+							http.Redirect(w, r, selfTarget, http.StatusSeeOther)
+							return
+						}
+						s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+						pctx.BookUnlockError = s.deps.Catalog.T(pctx.Locale, "article.unlock_wrong_pwd")
+					}
+					w.Header().Set("Cache-Control", "private, no-store")
+				}
+				if raw.HasContentLock || strings.TrimSpace(raw.PasswordCiphertext) != "" || render.ContainsLockDirective(raw.ContentMD) || render.ContainsLockDirective(raw.SummaryMD) {
+					w.Header().Set("Cache-Control", "private, no-store")
+				}
 				if detail, _, _, _, rErr := s.deps.Content.RenderArticleDetail(
 					r.Context(), w, r, raw, viewer, pctx.Locale, s.publicBaseURL(r),
 				); rErr == nil {
 					if detail.IsPasswordProtected || detail.RequiresPassword || detail.UnlockedViaShare {
 						pctx.NoIndex = true
+						w.Header().Set("Cache-Control", "private, no-store")
 					}
-					if !detail.RequiresPassword {
+					if detail.RequiresPassword {
+						pctx.BookLocked = true
+						pctx.BookArticleID = raw.ID
+						pctx.BookArticleSlug = raw.Slug
+					} else {
 						pctx.ActiveChapterHTML = detail.HTML
 						pctx.ActiveChapterNeedsMath = detail.NeedsMath
+						pctx.ActiveChapterNeedsMermaid = detail.NeedsMermaid
 					}
 				}
 			}
@@ -2345,20 +2451,151 @@ func (s *AppServer) handleDynamicPage(w http.ResponseWriter, r *http.Request) {
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"dynamic.html", "taxonomies.html"}, pctx)
 }
 
+func (s *AppServer) localizeReaderAuthError(locale string, code string) string {
+	clean := strings.ToLower(strings.TrimSpace(code))
+	if clean == "" {
+		return ""
+	}
+	isZH := strings.HasPrefix(strings.ToLower(locale), "zh")
+	switch clean {
+	case "state":
+		if isZH {
+			return "登录状态校验失败或已过期，请重试。"
+		}
+		return "Sign-in state expired or invalid. Please try again."
+	case "disabled":
+		if isZH {
+			return "当前账号已被禁用或暂未开放注册。"
+		}
+		return "This account is disabled or registration is closed."
+	case "unverified_email":
+		if isZH {
+			return "第三方账号邮箱尚未验证，无法自动登录。"
+		}
+		return "Third-party account email is not verified."
+	case "forbidden":
+		if isZH {
+			return "管理员或编辑账号请通过管理后台登录，不可使用读者通道。"
+		}
+		return "Staff accounts must sign in via the admin console."
+	default:
+		if isZH {
+			return "登录失败，请检查凭据或稍后重试。"
+		}
+		return "Sign-in failed. Please verify your credentials and try again."
+	}
+}
+
 func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request) {
-	viewer, _ := s.resolveViewer(r)
-	if viewer != nil {
-		http.Redirect(w, r, "/", http.StatusFound)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	safeNext := sanitizeReaderNextTarget(r.URL.Query().Get("next"))
+	viewer, _ := s.resolveViewer(r)
+	if viewer != nil {
+		dest := "/"
+		if safeNext != "" {
+			dest = safeNext
+		}
+		http.Redirect(w, r, dest, http.StatusFound)
+		return
+	}
+
+	status := http.StatusOK
+	authErrMsg := ""
+
+	if r.Method == http.MethodPost {
+		if !s.isSameOriginRequest(r) {
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 8192)
+		_ = r.ParseForm()
+		if formNext := sanitizeReaderNextTarget(r.FormValue("next")); formNext != "" {
+			safeNext = formNext
+		}
+		clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+		var geo string
+		if loc, ok := s.deps.Geo.Lookup(clientIP); ok {
+			geo = loc.Region
+		}
+		locale := s.resolveLocale(r)
+
+		if r.URL.Path == "/reader/register" {
+			if !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
+				status = http.StatusForbidden
+				authErrMsg = s.localizeReaderAuthError(locale, "disabled")
+			} else if !s.deps.WAF.AllowRate("reader_register", clientIP, 8, 10*time.Minute) {
+				status = http.StatusTooManyRequests
+				authErrMsg = s.deps.Catalog.T(locale, "error.rate_limited")
+			} else {
+				u, regErr := s.deps.Auth.RegisterReader(r.Context(), r.FormValue("username"), r.FormValue("email"), r.FormValue("password"), r.FormValue("code"), locale)
+				if regErr != nil {
+					status = http.StatusBadRequest
+					authErrMsg = regErr.Error()
+				} else {
+					if s.deps.Passports != nil {
+						if gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
+							_, _ = s.deps.Auth.ClaimGuestComments(r.Context(), u, gp)
+						}
+					}
+					if _, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), u.ID, clientIP, geo, r.UserAgent(), 0); sErr == nil {
+						s.setSessionCookieForRequest(w, r, rawTok)
+					}
+					dest := "/"
+					if safeNext != "" {
+						dest = safeNext
+					}
+					http.Redirect(w, r, dest, http.StatusSeeOther)
+					return
+				}
+			}
+		} else {
+			if !s.deps.WAF.AllowRate("reader_login", clientIP, 10, 5*time.Minute) {
+				status = http.StatusTooManyRequests
+				authErrMsg = s.deps.Catalog.T(locale, "error.rate_limited")
+			} else {
+				res, lErr := s.deps.Auth.LoginReader(r.Context(), r.FormValue("ident"), r.FormValue("password"), clientIP, geo, r.UserAgent())
+				if lErr != nil {
+					s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
+					status = http.StatusUnauthorized
+					authErrMsg = lErr.Error()
+					if errors.Is(lErr, auth.ErrForbidden) {
+						authErrMsg = auth.ErrInvalidCredentials.Error()
+					}
+				} else {
+					s.setSessionCookieForRequest(w, r, res.RawToken)
+					dest := "/"
+					if safeNext != "" {
+						dest = safeNext
+					}
+					http.Redirect(w, r, dest, http.StatusSeeOther)
+					return
+				}
+			}
+		}
+	}
+
 	pctx := s.basePageContext(r, nil)
 	pctx.PageTitle = s.deps.Catalog.T(pctx.Locale, "reader.login_title") + " · " + pctx.Site.Title
 	pctx.NoIndex = true
-	pctx.OIDCProviders = s.listOIDCProviderViews(pctx.Locale, "reader", r.URL.Query().Get("next"))
-	s.renderStudio(w, r, http.StatusOK, "reader_auth.html", pctx)
+	pctx.ReaderNextURL = safeNext
+	if authErrMsg != "" {
+		pctx.ReaderAuthError = authErrMsg
+	} else if qErr := r.URL.Query().Get("error"); qErr != "" {
+		pctx.ReaderAuthError = s.localizeReaderAuthError(pctx.Locale, qErr)
+	}
+	pctx.OIDCProviders = s.listOIDCProviderViews(pctx.Locale, "reader", safeNext)
+	w.Header().Set("Cache-Control", "private, no-store")
+	s.renderStudio(w, r, status, "reader_auth.html", pctx)
 }
 
 func (s *AppServer) handleLegacyAdminRedirect(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Config != nil && s.deps.Config.IsCustomAdminPath {
+		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
+		return
+	}
 	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
 	if adminPrefix == "/" {
 		adminPrefix = "/console"
@@ -2393,12 +2630,23 @@ func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Re
 	if viewer != nil && sess != nil {
 		_ = s.deps.Auth.RevokeSession(r.Context(), viewer, sess.ID)
 	}
+	secure := s.isCookieSecureForRequest(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.SessionCookieName,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "__volo_2fa_trust",
+		Value:    "",
+		Path:     "/api",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	http.SetCookie(w, &http.Cookie{
@@ -2407,6 +2655,7 @@ func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Re
 		Path:     "/api/admin/auth",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteStrictMode,
 	})
 	adminPrefix := "/" + strings.Trim(strings.TrimSpace(s.deps.Config.AdminPath), "/")
@@ -2433,7 +2682,11 @@ func (s *AppServer) handlePublicLogoutRedirect(w http.ResponseWriter, r *http.Re
 			}
 		}
 	}
-	http.Redirect(w, r, dest, http.StatusSeeOther)
+	if isLocalUrl(dest) {
+		http.Redirect(w, r, dest, http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *AppServer) handlePublicGitHubShowcaseRoute(w http.ResponseWriter, r *http.Request) {

@@ -11,17 +11,361 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 )
 
-// ScanOrphans inspects ALL 9 reference scopes across the database before marking any MediaAsset as orphaned:
-//  1. articles (content_md, summary_md, cover_url, audio_url)
-//  2. article_revisions (content_md, summary_md)
-//  3. pages (content_md, cover_url)
-//  4. series (cover_url, description)
-//  5. books (cover_url, description)
-//  6. links (logo_url)
-//  7. users (avatar_url, bio)
-//  8. comments (content_md, avatar_url)
-//  9. settings (value_json across site/seo/feed/podcast) + plugins_state (config_json)
-//
+type mediaRefScope struct {
+	query string
+	args  []any
+}
+
+func mediaReferenceScopes() []mediaRefScope {
+	return []mediaRefScope{
+		{query: `SELECT content_md, summary_md, cover_url, audio_url FROM articles`},
+		{query: `SELECT content_md, summary_md FROM article_revisions`},
+		{query: `SELECT content_md FROM pages`},
+		{query: `SELECT cover_url, description FROM series`},
+		{query: `SELECT cover_url, description, source_url FROM books`},
+		{query: `SELECT url FROM book_chapters`},
+		{query: `SELECT icon_url, url, description FROM links`},
+		{query: `SELECT avatar_url, bio FROM users`},
+		{query: `SELECT avatar_url, content_md FROM comments WHERE is_deleted = ?`, args: []any{false}},
+		{query: `SELECT value_json FROM settings`},
+		{query: `SELECT config_json FROM plugins`},
+		{query: `SELECT icon_url, description FROM follows`},
+		{query: `SELECT icon, url FROM nav_items`},
+		{query: `SELECT target_path FROM redirects`},
+	}
+}
+
+type orphanNullString struct {
+	val string
+}
+
+func (ns *orphanNullString) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		ns.val = ""
+	case string:
+		ns.val = v
+	case []byte:
+		ns.val = string(v)
+	default:
+		ns.val = ""
+	}
+	return nil
+}
+
+// AssetCandidateKeys returns normalized URL, path, and object_key lookup keys for a MediaAsset.
+func AssetCandidateKeys(a domain.MediaAsset) []string {
+	var keys []string
+	add := func(k string) {
+		if k == "" {
+			return
+		}
+		for _, existing := range keys {
+			if existing == k {
+				return
+			}
+		}
+		keys = append(keys, k)
+	}
+	pubURL := strings.TrimSpace(a.PublicURL)
+	objKey := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
+	if pubURL != "" {
+		cleanPub := stripQueryAndFragment(pubURL)
+		add(pubURL)
+		add(cleanPub)
+		if pathPart := extractURLPath(cleanPub); pathPart != "" {
+			add(pathPart)
+			add(strings.TrimLeft(pathPart, "/"))
+		}
+	}
+	if objKey != "" {
+		add(objKey)
+		add("/uploads/" + objKey)
+		add("uploads/" + objKey)
+	}
+	return keys
+}
+
+func emitNormalizedTokensFromBlob(blob string, emit func(string)) {
+	if blob == "" {
+		return
+	}
+	if strings.Index(blob, `\/`) >= 0 {
+		blob = strings.ReplaceAll(blob, `\/`, "/")
+	}
+	emitExpanded := func(raw string) {
+		if raw == "" {
+			return
+		}
+		tok := trimTokenPunctuation(raw)
+		if tok == "" {
+			return
+		}
+		emit(tok)
+
+		clean := stripQueryAndFragment(tok)
+		if clean != tok {
+			emit(clean)
+			clean = trimTokenPunctuation(clean)
+			emit(clean)
+		}
+		if pathPart := extractURLPath(clean); pathPart != "" {
+			emit(pathPart)
+			emit(strings.TrimLeft(pathPart, "/"))
+			if tail := lastThreeSlashSegments(pathPart); tail != "" {
+				emit(tail)
+			}
+		} else {
+			emit(strings.TrimLeft(clean, "/"))
+			if tail := lastThreeSlashSegments(clean); tail != "" {
+				emit(tail)
+			}
+		}
+		if upIdx := strings.Index(clean, "/uploads/"); upIdx >= 0 {
+			sub := clean[upIdx:]
+			emit(sub)
+			emit(strings.TrimLeft(sub, "/"))
+		}
+	}
+
+	if trimmedWhole := strings.TrimSpace(blob); trimmedWhole != "" && !strings.ContainsAny(trimmedWhole, " \t\r\n") {
+		emitExpanded(trimmedWhole)
+	}
+	start := -1
+	for i := 0; i < len(blob); i++ {
+		if isOrphanTokenDelimiter(blob[i]) {
+			if start >= 0 {
+				emitTokenAndParenSubtokens(blob[start:i], emitExpanded)
+				start = -1
+			}
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		emitTokenAndParenSubtokens(blob[start:], emitExpanded)
+	}
+}
+
+func streamAllReferenceRows(ctx context.Context, store *sqlx.Store, onRow func(cols []orphanNullString) bool) error {
+	if store == nil {
+		return nil
+	}
+	for _, sc := range mediaReferenceScopes() {
+		stopEarly := false
+		err := func() error {
+			rows, qErr := store.QueryContext(ctx, sc.query, sc.args...)
+			if qErr != nil {
+				return qErr
+			}
+			defer rows.Close()
+			colNames, cErr := rows.Columns()
+			if cErr != nil {
+				return cErr
+			}
+			vals := make([]orphanNullString, len(colNames))
+			ptrs := make([]any, len(colNames))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			for rows.Next() {
+				for i := range vals {
+					vals[i].val = ""
+				}
+				if err := rows.Scan(ptrs...); err != nil {
+					continue
+				}
+				if !onRow(vals) {
+					stopEarly = true
+					return nil
+				}
+			}
+			return rows.Err()
+		}()
+		if err != nil {
+			return err
+		}
+		if stopEarly {
+			return nil
+		}
+	}
+	return nil
+}
+
+// CollectReferencedTokenCounts scans all content, navigation, chapter, redirect, comment, setting,
+// and plugin tables and returns per-token referencing-row counts.
+func CollectReferencedTokenCounts(ctx context.Context, store *sqlx.Store) (map[string]int, error) {
+	counts := make(map[string]int, 256)
+	rowSeen := make(map[string]struct{}, 32)
+	err := streamAllReferenceRows(ctx, store, func(cols []orphanNullString) bool {
+		clear(rowSeen)
+		for _, col := range cols {
+			if col.val == "" {
+				continue
+			}
+			emitNormalizedTokensFromBlob(col.val, func(k string) {
+				if k == "" || len(k) > 512 {
+					return
+				}
+				if _, seen := rowSeen[k]; !seen {
+					rowSeen[k] = struct{}{}
+					counts[k]++
+				}
+			})
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return counts, nil
+}
+
+// CollectAllReferencedURLTokens scans all content, navigation, chapter, redirect, comment, setting,
+// and plugin tables and returns the set of normalized referenced URL/path/key tokens.
+func CollectAllReferencedURLTokens(ctx context.Context, store *sqlx.Store) (map[string]struct{}, error) {
+	tokens := make(map[string]struct{}, 256)
+	err := streamAllReferenceRows(ctx, store, func(cols []orphanNullString) bool {
+		for _, col := range cols {
+			if col.val == "" {
+				continue
+			}
+			emitNormalizedTokensFromBlob(col.val, func(k string) {
+				if k != "" && len(k) <= 512 {
+					tokens[k] = struct{}{}
+				}
+			})
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return tokens, nil
+}
+
+// AssetRefCountFromTokens computes the referencing row count for an asset from a token-count map.
+func AssetRefCountFromTokens(tokenCounts map[string]int, a domain.MediaAsset) int {
+	if len(tokenCounts) == 0 {
+		return 0
+	}
+	best := 0
+	for _, k := range AssetCandidateKeys(a) {
+		if c := tokenCounts[k]; c > best {
+			best = c
+		}
+	}
+	return best
+}
+
+// CountAssetReferences computes exact per-asset referencing row counts (keyed by asset.ID, or
+// PublicURL/ObjectKey fallback when ID is empty) across all 14 database tables in a single streaming pass.
+func CountAssetReferences(ctx context.Context, store *sqlx.Store, assets []domain.MediaAsset) (map[string]int, error) {
+	counts := make(map[string]int, len(assets))
+	if len(assets) == 0 || store == nil {
+		return counts, nil
+	}
+
+	candidateToIdxs := make(map[string][]int, len(assets)*3)
+	type spaceNeedle struct {
+		idx  int
+		keys []string
+	}
+	var spaceAssets []spaceNeedle
+
+	assetMapKey := func(a domain.MediaAsset) string {
+		if id := strings.TrimSpace(a.ID); id != "" {
+			return id
+		}
+		if pub := strings.TrimSpace(a.PublicURL); pub != "" {
+			return pub
+		}
+		return strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
+	}
+
+	for i, a := range assets {
+		if mk := assetMapKey(a); mk != "" {
+			counts[mk] = 0
+		}
+		keys := AssetCandidateKeys(a)
+		hasSpace := false
+		for _, k := range keys {
+			candidateToIdxs[k] = append(candidateToIdxs[k], i)
+			if strings.ContainsAny(k, " \t") {
+				hasSpace = true
+			}
+		}
+		if hasSpace {
+			spaceAssets = append(spaceAssets, spaceNeedle{idx: i, keys: keys})
+		}
+	}
+	if len(candidateToIdxs) == 0 {
+		return counts, nil
+	}
+
+	idxCounts := make([]int, len(assets))
+	rowSeenGen := make([]uint32, len(assets))
+	var rowGen uint32
+
+	markIdx := func(idx int) {
+		if rowSeenGen[idx] != rowGen {
+			rowSeenGen[idx] = rowGen
+			idxCounts[idx]++
+		}
+	}
+
+	err := streamAllReferenceRows(ctx, store, func(cols []orphanNullString) bool {
+		rowGen++
+		if rowGen == 0 {
+			clear(rowSeenGen)
+			rowGen = 1
+		}
+		for _, col := range cols {
+			if col.val == "" {
+				continue
+			}
+			emitNormalizedTokensFromBlob(col.val, func(k string) {
+				if idxs, ok := candidateToIdxs[k]; ok {
+					for _, idx := range idxs {
+						markIdx(idx)
+					}
+				}
+			})
+			if len(spaceAssets) > 0 {
+				norm := col.val
+				if strings.Index(norm, `\/`) >= 0 {
+					norm = strings.ReplaceAll(norm, `\/`, "/")
+				}
+				for _, sp := range spaceAssets {
+					if rowSeenGen[sp.idx] == rowGen {
+						continue
+					}
+					for _, k := range sp.keys {
+						if k != "" && strings.Contains(norm, k) {
+							markIdx(sp.idx)
+							break
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for i, a := range assets {
+		if mk := assetMapKey(a); mk != "" {
+			counts[mk] = idxCounts[i]
+		}
+	}
+	return counts, nil
+}
+
+// ScanOrphans inspects ALL 14 reference scopes across the database before marking any MediaAsset as orphaned.
 // When deleteOrphans is true, orphaned assets are safely deleted (with `filepath.EvalSymlinks`
 // containment enforcement for local files so no path outside UploadDir can ever be unlinked).
 func (p *Pipeline) ScanOrphans(ctx context.Context, deleteOrphans bool) ([]domain.MediaAsset, error) {
@@ -60,187 +404,49 @@ func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []do
 	matchedKeys := make(map[string]bool)
 	remaining := 0
 
-	addCandidate := func(key string, idx int) {
-		if key == "" {
-			return
-		}
-		list := candidateToIdxs[key]
-		for _, existing := range list {
-			if existing == idx {
-				return
-			}
-		}
-		candidateToIdxs[key] = append(list, idx)
-	}
-
 	for i, a := range assets {
-		pubURL := strings.TrimSpace(a.PublicURL)
-		objKey := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
-		if pubURL == "" && objKey == "" {
+		keys := AssetCandidateKeys(a)
+		if len(keys) == 0 {
 			continue
 		}
 		remaining++
-		if pubURL != "" {
-			cleanPub := stripQueryAndFragment(pubURL)
-			addCandidate(pubURL, i)
-			addCandidate(cleanPub, i)
-			if pathPart := extractURLPath(cleanPub); pathPart != "" {
-				addCandidate(pathPart, i)
-				addCandidate(strings.TrimLeft(pathPart, "/"), i)
-			}
-		}
-		if objKey != "" {
-			addCandidate(objKey, i)
-			addCandidate("/uploads/"+objKey, i)
-			addCandidate("uploads/"+objKey, i)
+		for _, k := range keys {
+			candidateToIdxs[k] = append(candidateToIdxs[k], i)
 		}
 	}
 	if remaining == 0 {
 		return referenced, nil
 	}
 
-	markKey := func(k string) {
-		if k == "" || matchedKeys[k] {
-			return
-		}
-		idxs, ok := candidateToIdxs[k]
-		if !ok {
-			return
-		}
-		matchedKeys[k] = true
-		for _, idx := range idxs {
-			if !referenced[idx] {
-				referenced[idx] = true
-				remaining--
+	err := streamAllReferenceRows(ctx, p.store, func(cols []orphanNullString) bool {
+		for _, col := range cols {
+			if col.val == "" {
+				continue
 			}
-		}
-	}
-
-	checkToken := func(raw string) {
-		if raw == "" || remaining == 0 {
-			return
-		}
-		if strings.Index(raw, `\/`) >= 0 {
-			raw = strings.ReplaceAll(raw, `\/`, "/")
-		}
-		tok := trimTokenPunctuation(raw)
-		if tok == "" {
-			return
-		}
-		markKey(tok)
-
-		clean := stripQueryAndFragment(tok)
-		if clean != tok {
-			markKey(clean)
-			clean = trimTokenPunctuation(clean)
-			markKey(clean)
-		}
-		if pathPart := extractURLPath(clean); pathPart != "" {
-			markKey(pathPart)
-			markKey(strings.TrimLeft(pathPart, "/"))
-			if tail := lastThreeSlashSegments(pathPart); tail != "" {
-				markKey(tail)
-			}
-		} else {
-			markKey(strings.TrimLeft(clean, "/"))
-			if tail := lastThreeSlashSegments(clean); tail != "" {
-				markKey(tail)
-			}
-		}
-		if upIdx := strings.Index(clean, "/uploads/"); upIdx > 0 {
-			sub := clean[upIdx:]
-			markKey(sub)
-			markKey(strings.TrimLeft(sub, "/"))
-		}
-	}
-
-	// Single linear pass per text blob: split candidate URL/path/key tokens without O(N_assets) substring scans.
-	matchBlob := func(blob string) {
-		if blob == "" || remaining == 0 {
-			return
-		}
-		start := -1
-		for i := 0; i < len(blob); i++ {
-			if isOrphanTokenDelimiter(blob[i]) {
-				if start >= 0 {
-					emitTokenAndParenSubtokens(blob[start:i], checkToken)
-					if remaining == 0 {
-						return
+			emitNormalizedTokensFromBlob(col.val, func(k string) {
+				if k == "" || matchedKeys[k] {
+					return
+				}
+				idxs, ok := candidateToIdxs[k]
+				if !ok {
+					return
+				}
+				matchedKeys[k] = true
+				for _, idx := range idxs {
+					if !referenced[idx] {
+						referenced[idx] = true
+						remaining--
 					}
-					start = -1
 				}
-				continue
-			}
-			if start < 0 {
-				start = i
-			}
-		}
-		if start >= 0 && remaining > 0 {
-			emitTokenAndParenSubtokens(blob[start:], checkToken)
-		}
-	}
-
-	scanScope := func(q string, args ...any) error {
-		if remaining == 0 {
-			return nil
-		}
-		rows, err := p.store.QueryContext(ctx, q, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		cols, err := rows.Columns()
-		if err != nil {
-			return err
-		}
-		strVals := make([]string, len(cols))
-		scanPtrs := make([]any, len(cols))
-		for i := range strVals {
-			scanPtrs[i] = &strVals[i]
-		}
-		for rows.Next() {
-			for i := range strVals {
-				strVals[i] = ""
-			}
-			if err := rows.Scan(scanPtrs...); err != nil {
-				continue
-			}
-			for _, v := range strVals {
-				if v != "" {
-					matchBlob(v)
-				}
-			}
+			})
 			if remaining == 0 {
-				return nil
+				return false
 			}
 		}
-		return rows.Err()
-	}
-
-	scopes := []struct {
-		query string
-		args  []any
-	}{
-		{query: `SELECT content_md, summary_md, cover_url, audio_url FROM articles`},
-		{query: `SELECT content_md, summary_md FROM article_revisions`},
-		{query: `SELECT content_md FROM pages`},
-		{query: `SELECT cover_url, description FROM series`},
-		{query: `SELECT cover_url, description FROM books`},
-		{query: `SELECT icon_url, description FROM links`},
-		{query: `SELECT avatar_url, bio FROM users`},
-		{query: `SELECT content_md, avatar_url FROM comments WHERE is_deleted = ?`, args: []any{false}},
-		{query: `SELECT value_json FROM settings`},
-		{query: `SELECT config_json FROM plugins`},
-		{query: `SELECT icon_url, description FROM follows`},
-		{query: `SELECT icon FROM nav_items`},
-	}
-	for _, sc := range scopes {
-		if remaining == 0 {
-			break
-		}
-		if err := scanScope(sc.query, sc.args...); err != nil {
-			return nil, err
-		}
+		return remaining > 0
+	})
+	if err != nil {
+		return nil, err
 	}
 	return referenced, nil
 }

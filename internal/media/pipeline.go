@@ -233,6 +233,23 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 
 			if !isAnimatedGIF {
 				orient := ReadEXIFOrientation(raw)
+				if detectedMIME == "image/webp" && orient == 1 {
+					stripped, sErr := StripWebPMetadataLossless(raw)
+					raw = nil
+					if sErr != nil {
+						return fmt.Errorf("webp metadata strip failed: %w", sErr)
+					}
+					if ContainsEXIFOrGPS(stripped) {
+						return errors.New("privacy invariant violation: residual metadata detected after webp container strip")
+					}
+					width, height = cfg.Width, cfg.Height
+					finalBytes = stripped
+					finalExt = ".webp"
+					finalMIME = "image/webp"
+					exifStripped = true
+					return nil
+				}
+
 				img, _, decErr := image.Decode(bytes.NewReader(raw))
 				raw = nil // Release compressed upload buffer before pixel transforms & WebP encoding.
 				if decErr != nil {
@@ -250,8 +267,8 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 
 				// Always re-encode fresh pixel buffers so 100% of EXIF GPS, camera serials, thumbnails, and XMP are stripped!
 				var baselineBuf bytes.Buffer
-				baselineExt := ext
-				baselineMIME := detectedMIME
+				var baselineExt string
+				var baselineMIME string
 				switch formatName {
 				case "png", "gif":
 					enc := png.Encoder{CompressionLevel: png.DefaultCompression}
@@ -587,6 +604,32 @@ func inspectGIFStreamLimits(raw []byte) error {
 	return nil
 }
 
+func sanitizeLogToken(s string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '/' || r == '.' || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, s)
+	if len(cleaned) > 128 {
+		return cleaned[:128]
+	}
+	return cleaned
+}
+
+func classifyPluginStorageErr(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "plugin_put_failed"
+	}
+}
+
 func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []byte, contentType string) (string, string, error) {
 	cfg := p.storageSettings()
 	driver := strings.ToLower(strings.TrimSpace(cfg.ActiveDriver))
@@ -603,9 +646,9 @@ func (p *Pipeline) storeRawObject(ctx context.Context, objectKey string, data []
 				}
 				return driver, cleanURL, nil
 			}
-			slog.Warn("storage plugin Put failed; falling back to local disk storage", "driver", driver, "object_key", objectKey, "err", err)
+			slog.Warn("storage plugin Put failed; falling back to local disk storage", "driver", sanitizeLogToken(driver), "object_key", sanitizeLogToken(objectKey), "reason", classifyPluginStorageErr(err))
 		} else {
-			slog.Warn("storage plugin unavailable or detached; falling back to local disk storage", "driver", driver, "object_key", objectKey)
+			slog.Warn("storage plugin unavailable or detached; falling back to local disk storage", "driver", sanitizeLogToken(driver), "object_key", sanitizeLogToken(objectKey))
 		}
 	}
 
@@ -684,9 +727,9 @@ func (p *Pipeline) storeStreamObject(ctx context.Context, objectKey string, tmpF
 				}
 				return driver, cleanURL, nil
 			}
-			slog.Warn("storage plugin Put failed; falling back to local disk storage", "driver", driver, "object_key", objectKey, "err", err)
+			slog.Warn("storage plugin Put failed; falling back to local disk storage", "driver", sanitizeLogToken(driver), "object_key", sanitizeLogToken(objectKey), "reason", classifyPluginStorageErr(err))
 		} else {
-			slog.Warn("storage plugin unavailable or detached; falling back to local disk storage", "driver", driver, "object_key", objectKey)
+			slog.Warn("storage plugin unavailable or detached; falling back to local disk storage", "driver", sanitizeLogToken(driver), "object_key", sanitizeLogToken(objectKey))
 		}
 	}
 

@@ -127,10 +127,11 @@ func ImportLegacyArchive(
 		report.TargetDialect = store.Dialect().Name()
 	}
 
-	mediaCandidates, extractedImages, err := collectBundledMediaCandidates(inputPath, opts.LegacyMediaDir, report)
+	mediaCandidates, extractedImages, closeMediaArchive, err := collectBundledMediaCandidates(inputPath, opts.LegacyMediaDir, report)
 	if err != nil {
 		return nil, err
 	}
+	defer closeMediaArchive()
 
 	// -------------------------------------------------------------------------
 	// Pass 1: Stream metadata, relational index maps, article permalink map, and chunked option rows
@@ -164,16 +165,20 @@ func ImportLegacyArchive(
 	// Pass 2: Stream articles, revisions, comments, pages->nav_items, links, follows, and bundled media
 	// directly into normalized tables inside an atomic transaction!
 	// -------------------------------------------------------------------------
+	var createdMediaFiles []string
 	err = store.WithTx(ctx, func(tx *sqlx.Tx) error {
 		if err := insertPass1EntitiesTx(ctx, tx, pass1State, decomposed, existingAdmins, report); err != nil {
 			return err
 		}
-		if err := persistBundledMediaTx(ctx, tx, mediaCandidates, opts.TargetUploadDir, pass1State.defaultAdminID, report); err != nil {
+		if err := persistBundledMediaTx(ctx, tx, mediaCandidates, opts.TargetUploadDir, pass1State.defaultAdminID, report, &createdMediaFiles); err != nil {
 			return err
 		}
 		return streamPass2IntoTx(ctx, tx, openStream, pass1State, decomposed.seriesArticles, keyRing, opts, rewriter, report)
 	})
 	if err != nil {
+		for _, p := range createdMediaFiles {
+			_ = os.Remove(p)
+		}
 		return nil, err
 	}
 	report.URLsRewritten = rewriter.count
@@ -478,7 +483,7 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), opt
 				st.catIDMap[origCID] = cid
 				uri := strings.Trim(strings.TrimSpace(strVal(raw["categoryURI"])), "/")
 				slug := dedupSlug(slugify(firstNonEmpty(uri, title, cid)), usedCatSlugs)
-				order := int(int64Val(raw["categoryOrder"]))
+				order := intVal(raw["categoryOrder"])
 				now := parseMillisFallback(cid)
 
 				st.categories = append(st.categories, domain.Category{
@@ -853,6 +858,9 @@ func decomposeOptions(
 	if v := strings.TrimSpace(opts.SiteTitle); v != "" {
 		out.settings.Site.Title = cleanUTF8(v)
 	}
+	if strings.TrimSpace(out.settings.Site.Title) == "" {
+		out.settings.Site.Title = "Volo Studio"
+	}
 	if v := strings.TrimSpace(opts.SiteSubtitle); v != "" {
 		out.settings.Site.Subtitle = cleanUTF8(v)
 	}
@@ -863,6 +871,41 @@ func decomposeOptions(
 	}
 	if v := strings.TrimSpace(opts.TimeZone); v != "" {
 		out.settings.Site.TimeZone = cleanUTF8(v)
+	}
+
+	// Pre-sanitize FaviconURL, LogoURL, and SocialLinks so PatchDomain("site") cannot fail post-commit.
+	if rawFav := strings.TrimSpace(out.settings.Site.FaviconURL); rawFav != "" {
+		if cleanFav, ok := sanitizeLegacySiteURL(rawFav, false); ok {
+			out.settings.Site.FaviconURL = cleanFav
+		} else {
+			out.settings.Site.FaviconURL = ""
+			if report != nil {
+				report.Warnings = append(report.Warnings, fmt.Sprintf("cleared invalid legacy faviconURL %q", rawFav))
+			}
+		}
+	}
+	if rawLogo := strings.TrimSpace(out.settings.Site.LogoURL); rawLogo != "" {
+		if cleanLogo, ok := sanitizeLegacySiteURL(rawLogo, false); ok {
+			out.settings.Site.LogoURL = cleanLogo
+		} else {
+			out.settings.Site.LogoURL = ""
+			if report != nil {
+				report.Warnings = append(report.Warnings, fmt.Sprintf("cleared invalid legacy logoURL %q", rawLogo))
+			}
+		}
+	}
+	if len(out.settings.Site.SocialLinks) > 0 {
+		validLinks := make([]domain.SocialLink, 0, len(out.settings.Site.SocialLinks))
+		for _, sl := range out.settings.Site.SocialLinks {
+			rewritten := rewriter.rewriteURL(sl.URL)
+			if cleanU, ok := sanitizeLegacySiteURL(rewritten, true); ok && cleanU != "" {
+				sl.URL = cleanU
+				validLinks = append(validLinks, sl)
+			} else if report != nil && strings.TrimSpace(sl.URL) != "" {
+				report.Warnings = append(report.Warnings, fmt.Sprintf("dropped invalid social link %q (%q)", sl.Label, sl.URL))
+			}
+		}
+		out.settings.Site.SocialLinks = validLinks
 	}
 
 	// Skin fallback -> pure volo-studio + accent inheritance
@@ -1076,7 +1119,7 @@ func decomposeOptions(
 
 	// 9c. voloDailyStats -> analytics_daily & analytics_top_items
 	if statsRaw, ok := st.reassembleOptionDoc("voloDailyStats", report); ok && statsRaw != "" {
-		out.analyticsDaily, out.analyticsTop = parseLegacyAnalytics(statsRaw)
+		out.analyticsDaily, out.analyticsTop = parseLegacyAnalytics(statsRaw, st)
 		report.AnalyticsDays = len(out.analyticsDaily)
 	}
 
@@ -1103,10 +1146,15 @@ func insertPass1EntitiesTx(
 ) error {
 	// Clear target tables in reverse FK dependency order for clean idempotent import
 	tablesToClear := []string{
-		"analytics_top_items", "analytics_daily", "webhooks", "security_geo_rules", "security_ip_bans",
-		"media_assets", "redirects", "follows", "links", "comments", "book_chapters", "books",
-		"series_articles", "series", "nav_items", "article_backlinks", "article_revisions",
-		"article_tags", "articles", "tags", "categories", "users",
+		"analytics_top_items", "analytics_daily",
+		"webhook_deliveries", "webhooks",
+		"security_geo_rules", "security_ip_bans",
+		"reactions", "media_assets", "redirects",
+		"follow_items", "follows", "links", "comments",
+		"book_chapters", "books",
+		"series_articles", "series", "nav_items",
+		"article_backlinks", "article_revisions", "article_tags", "articles",
+		"pages", "tags", "categories", "users",
 	}
 	for _, tbl := range tablesToClear {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+tx.Dialect().QuoteIdent(tbl)); err != nil {
@@ -1221,7 +1269,7 @@ func insertPass1EntitiesTx(
 	for _, top := range dec.analyticsTop {
 		sd := truncRunes(top.StatDate, 32)
 		kd := truncRunes(top.Kind, 32)
-		ik := truncRunes(top.ItemKey, 190)
+		ik := truncRunes(top.ItemKey, 512)
 		tk := sd + "|" + kd + "|" + ik
 		if seenTopKeys[tk] {
 			continue
@@ -1324,6 +1372,8 @@ func streamPass2IntoTx(
 	usedFollowIDs := make(map[string]bool)
 	var pendingRevs []deferredRevision
 
+	upsertArtTagSQL := tx.Dialect().UpsertSQL("article_tags", []string{"article_id", "tag_id"}, []string{"article_id", "tag_id"}, nil)
+
 	defaultLocale := i18n.NormalizeLocale(firstNonEmpty(opts.DefaultLocale, st.options["localeString"].Value))
 	if defaultLocale == "" {
 		defaultLocale = "zh-CN"
@@ -1402,7 +1452,7 @@ func streamPass2IntoTx(
 				if sErr != nil {
 					return sErr
 				}
-				hasLock := strings.Contains(contentMD, ":::lock")
+				hasLock := containsLockDirectiveETL(contentMD)
 				words, mins := estimateReadingStats(contentMD)
 
 				audioURL := rewriter.rewriteURL(strings.TrimSpace(strVal(raw["articleAudioURL"])))
@@ -1427,12 +1477,12 @@ func streamPass2IntoTx(
 						view_count, comment_count, created_at, updated_at
 					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)`,
 					truncRunes(aid, 32), truncRunes(authorID, 32), truncRunes(catID, 32),
-					truncRunes(title, 255), slug, truncRunes(origPermalink, 190), summaryMD, contentMD,
+					truncRunes(title, 255), slug, truncRunes(origPermalink, 512), summaryMD, contentMD,
 					truncRunes(coverURL, 512), truncRunes(status, 32), publishedAt, schedAt,
 					boolVal(raw["articlePutTop"]), boolValDefault(raw["articleCommentable"], true),
-					pwdCipher, hasLock, truncRunes(audioURL, 512), int(int64Val(raw["articleAudioDuration"])), int64Val(raw["articleAudioSize"]),
+					pwdCipher, hasLock, truncRunes(audioURL, 512), intVal(raw["articleAudioDuration"]), int64Val(raw["articleAudioSize"]),
 					truncRunes(audioMime, 64), truncRunes(defaultLocale, 32), words, mins,
-					int64Val(raw["articleViewCount"]), int(int64Val(raw["articleCommentCount"])), createdAt, updatedAt,
+					int64Val(raw["articleViewCount"]), intVal(raw["articleCommentCount"]), createdAt, updatedAt,
 				); err != nil {
 					return fmt.Errorf("etl: insert article %s: %w", aid, err)
 				}
@@ -1444,19 +1494,23 @@ func streamPass2IntoTx(
 				for _, tid := range st.artTagsMap[aid] {
 					if st.tagIDSet[tid] && !boundTags[tid] {
 						boundTags[tid] = true
-						_, _ = tx.ExecContext(ctx, `INSERT INTO article_tags (article_id, tag_id) VALUES (?, ?)`, truncRunes(aid, 32), truncRunes(tid, 32))
+						if _, err := tx.ExecContext(ctx, upsertArtTagSQL, truncRunes(aid, 32), truncRunes(tid, 32)); err != nil {
+							return fmt.Errorf("etl: bind article_tag (%s, %s): %w", aid, tid, err)
+						}
 					}
 				}
 				for _, rawTagName := range strings.Split(strVal(raw["articleTags"]), ",") {
 					tName := strings.TrimSpace(rawTagName)
 					if tid, ok := st.tagByName[strings.ToLower(tName)]; ok && !boundTags[tid] {
 						boundTags[tid] = true
-						_, _ = tx.ExecContext(ctx, `INSERT INTO article_tags (article_id, tag_id) VALUES (?, ?)`, truncRunes(aid, 32), truncRunes(tid, 32))
+						if _, err := tx.ExecContext(ctx, upsertArtTagSQL, truncRunes(aid, 32), truncRunes(tid, 32)); err != nil {
+							return fmt.Errorf("etl: bind article_tag (%s, %s): %w", aid, tid, err)
+						}
 					}
 				}
 
 				// Register 301 Redirect Guardian for historical permalink (including .html)!
-				if origPermalink != "" && origPermalink != modernPath && !usedRedirects[origPermalink] && utf8.RuneCountInString(origPermalink) <= 190 {
+				if origPermalink != "" && origPermalink != modernPath && !usedRedirects[origPermalink] && utf8.RuneCountInString(origPermalink) <= 512 {
 					usedRedirects[origPermalink] = true
 					if _, err := tx.ExecContext(ctx,
 						`INSERT INTO redirects (id, source_path, target_path, status_code, is_system_legacy, hit_count, created_at)
@@ -1522,7 +1576,7 @@ func streamPass2IntoTx(
 					`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
 					 VALUES (?, '', ?, '{}', ?, ?, ?, ?, ?, ?, ?)`,
 					truncRunes(nid, 32), truncRunes(title, 128), truncRunes(targetURL, 512),
-					newTab, truncRunes(icon, 255), int(int64Val(raw["pageOrder"])), true, ts, ts,
+					newTab, truncRunes(icon, 255), intVal(raw["pageOrder"]), true, ts, ts,
 				); err != nil {
 					return fmt.Errorf("etl: insert nav_item %s: %w", nid, err)
 				}
@@ -1643,7 +1697,7 @@ func streamPass2IntoTx(
 					 VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)`,
 					truncRunes(lid, 32), truncRunes(firstNonEmpty(strVal(raw["linkTitle"]), addr), 255),
 					truncRunes(addr, 512), desc, truncRunes(icon, 512),
-					int(int64Val(raw["linkOrder"])), truncRunes(hStatus, 32), code, lh.LatencyMS,
+					intVal(raw["linkOrder"]), truncRunes(hStatus, 32), code, lh.LatencyMS,
 					truncRunes(lh.Error, 255), lh.CheckedAt, ts, ts,
 				); err != nil {
 					return fmt.Errorf("etl: insert link %s: %w", lid, err)
@@ -1678,7 +1732,7 @@ func streamPass2IntoTx(
 					 VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, ?)`,
 					truncRunes(fid, 32), truncRunes(firstNonEmpty(strVal(raw["followTitle"]), addr), 255),
 					truncRunes(addr, 512), truncRunes(addr, 512), desc, truncRunes(icon, 512),
-					int(int64Val(raw["followOrder"])), ts, ts,
+					intVal(raw["followOrder"]), ts, ts,
 				); err != nil {
 					return fmt.Errorf("etl: insert follow %s: %w", fid, err)
 				}
@@ -1808,7 +1862,7 @@ func countPass2Entities(
 				origPermalink := normalizeLegacyPath(strVal(raw["articlePermalink"]))
 				slug := st.articleSlugMap[aid]
 				modernPath := "/posts/" + slug
-				if origPermalink != "" && slug != "" && origPermalink != modernPath && !usedRedirects[origPermalink] && utf8.RuneCountInString(origPermalink) <= 190 {
+				if origPermalink != "" && slug != "" && origPermalink != modernPath && !usedRedirects[origPermalink] && utf8.RuneCountInString(origPermalink) <= 512 {
 					usedRedirects[origPermalink] = true
 					report.RedirectsCreated++
 				}
@@ -2068,7 +2122,7 @@ func parseLegacyBooksAndTOCs(raw string, st *pass1Data, report *ImportReport) ([
 	return booksOut, chapsOut
 }
 
-func parseLegacyAnalytics(raw string) ([]domain.AnalyticsDaily, []domain.AnalyticsTopItem) {
+func parseLegacyAnalytics(raw string, st *pass1Data) ([]domain.AnalyticsDaily, []domain.AnalyticsTopItem) {
 	var doc struct {
 		UpdatedAt int64 `json:"updatedAt"`
 		Days      map[string]struct {
@@ -2102,15 +2156,43 @@ func parseLegacyAnalytics(raw string) ([]domain.AnalyticsDaily, []domain.Analyti
 			UV:        bucket.UV,
 			UpdatedAt: ts,
 		})
+		artHits := make(map[string]int64, len(bucket.Articles))
 		for aid, hits := range bucket.Articles {
-			if aid != "" && hits > 0 {
-				topOut = append(topOut, domain.AnalyticsTopItem{StatDate: d, Kind: "article", ItemKey: aid, Hits: hits})
+			aid = strings.TrimSpace(aid)
+			if aid == "" || hits <= 0 {
+				continue
 			}
+			if st != nil {
+				if resolved := st.resolveArticleID(aid); resolved != "" {
+					aid = resolved
+				}
+			}
+			artHits[truncRunes(aid, 512)] += hits
 		}
+		artKeys := make([]string, 0, len(artHits))
+		for k := range artHits {
+			artKeys = append(artKeys, k)
+		}
+		sort.Strings(artKeys)
+		for _, k := range artKeys {
+			topOut = append(topOut, domain.AnalyticsTopItem{StatDate: d, Kind: "article", ItemKey: k, Hits: artHits[k]})
+		}
+
+		refHits := make(map[string]int64, len(bucket.Referers))
 		for ref, hits := range bucket.Referers {
-			if ref != "" && hits > 0 {
-				topOut = append(topOut, domain.AnalyticsTopItem{StatDate: d, Kind: "referer", ItemKey: ref, Hits: hits})
+			ref = strings.TrimSpace(ref)
+			if ref == "" || hits <= 0 {
+				continue
 			}
+			refHits[truncRunes(ref, 512)] += hits
+		}
+		refKeys := make([]string, 0, len(refHits))
+		for k := range refHits {
+			refKeys = append(refKeys, k)
+		}
+		sort.Strings(refKeys)
+		for _, k := range refKeys {
+			topOut = append(topOut, domain.AnalyticsTopItem{StatDate: d, Kind: "referer", ItemKey: k, Hits: refHits[k]})
 		}
 	}
 	return dailyOut, topOut
@@ -2333,7 +2415,8 @@ func convertDynamicSocialLinks(raw string) []domain.SocialLink {
 			continue
 		}
 		u := v
-		if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
+		lowV := strings.ToLower(v)
+		if !strings.HasPrefix(lowV, "http://") && !strings.HasPrefix(lowV, "https://") && !strings.Contains(v, ":") && !strings.HasPrefix(v, "/") {
 			u = fmt.Sprintf(sp.urlTpl, strings.TrimPrefix(v, "@"))
 		}
 		out = append(out, domain.SocialLink{
@@ -2691,20 +2774,164 @@ func dedupEmail(base string, used map[string]bool) string {
 	return candidate
 }
 
-func estimateReadingStats(md string) (words int, minutes int) {
-	inLock := false
-	for _, line := range strings.Split(md, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, ":::lock") {
-			inLock = true
-			continue
+func stripETLBlockquoteAndIndent(line string) (rest string, ok bool) {
+	s := strings.TrimRight(line, "\r")
+	for {
+		spaces := 0
+		i := 0
+		for i < len(s) && spaces < 3 {
+			if s[i] == ' ' {
+				spaces++
+				i++
+			} else {
+				break
+			}
 		}
-		if inLock {
-			if trimmed == ":::" {
-				inLock = false
+		if i < len(s) && s[i] == '>' {
+			s = s[i+1:]
+			if len(s) > 0 && s[0] == ' ' {
+				s = s[1:]
+			} else if len(s) > 0 && s[0] == '\t' {
+				s = s[1:]
 			}
 			continue
 		}
+		if i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			return "", false
+		}
+		return s[i:], true
+	}
+}
+
+func parseETLFenceOpen(rest string) (ch byte, length int, ok bool) {
+	if len(rest) < 3 || (rest[0] != '`' && rest[0] != '~') {
+		return 0, 0, false
+	}
+	c := rest[0]
+	n := 0
+	for n < len(rest) && rest[n] == c {
+		n++
+	}
+	if n < 3 {
+		return 0, 0, false
+	}
+	if c == '`' && strings.IndexByte(rest[n:], '`') >= 0 {
+		return 0, 0, false
+	}
+	return c, n, true
+}
+
+func isETLFenceClose(rest string, ch byte, minLen int) bool {
+	if len(rest) < minLen || rest[0] != ch {
+		return false
+	}
+	n := 0
+	for n < len(rest) && rest[n] == ch {
+		n++
+	}
+	if n < minLen {
+		return false
+	}
+	return strings.TrimRight(rest[n:], " \t") == ""
+}
+
+func isETLDirectiveOpen(rest string) (name string, ok bool) {
+	if !strings.HasPrefix(rest, ":::") {
+		return "", false
+	}
+	tail := strings.TrimSpace(rest[3:])
+	if tail == "" {
+		return "", false
+	}
+	fields := strings.Fields(tail)
+	return strings.ToLower(fields[0]), true
+}
+
+func isETLDirectiveClose(rest string) bool {
+	return strings.HasPrefix(rest, ":::") && strings.TrimRight(rest[3:], " \t") == ""
+}
+
+func containsLockDirectiveETL(md string) bool {
+	var fenceChar byte
+	var fenceLen int
+	for _, line := range strings.Split(md, "\n") {
+		rest, ok := stripETLBlockquoteAndIndent(line)
+		if !ok {
+			continue
+		}
+		if fenceChar != 0 {
+			if isETLFenceClose(rest, fenceChar, fenceLen) {
+				fenceChar = 0
+				fenceLen = 0
+			}
+			continue
+		}
+		if fc, fl, isFence := parseETLFenceOpen(rest); isFence {
+			fenceChar = fc
+			fenceLen = fl
+			continue
+		}
+		if name, isDir := isETLDirectiveOpen(rest); isDir && name == "lock" {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeLegacySiteURL(raw string, allowMailto bool) (string, bool) {
+	cleaned := strings.TrimSpace(repo.StripASCIIControls(raw))
+	if cleaned == "" {
+		return "", true
+	}
+	if strings.HasPrefix(cleaned, "//") && len(cleaned) > 2 && cleaned[2] != '/' {
+		cleaned = "https:" + cleaned
+	} else if !strings.Contains(cleaned, ":") && !strings.HasPrefix(cleaned, "/") && !strings.HasPrefix(cleaned, "#") {
+		cleaned = "/" + cleaned
+	}
+	return repo.SanitizeAllowedURL(cleaned, allowMailto)
+}
+
+func estimateReadingStats(md string) (words int, minutes int) {
+	inLock := false
+	lockNestDepth := 0
+	var fenceChar byte
+	var fenceLen int
+	for _, line := range strings.Split(md, "\n") {
+		if rest, ok := stripETLBlockquoteAndIndent(line); ok {
+			if fenceChar != 0 {
+				if isETLFenceClose(rest, fenceChar, fenceLen) {
+					fenceChar = 0
+					fenceLen = 0
+				}
+				if inLock {
+					continue
+				}
+			} else if fc, fl, isFence := parseETLFenceOpen(rest); isFence {
+				fenceChar = fc
+				fenceLen = fl
+				if inLock {
+					continue
+				}
+			} else if inLock {
+				if isETLDirectiveClose(rest) {
+					if lockNestDepth > 0 {
+						lockNestDepth--
+					} else {
+						inLock = false
+					}
+				} else if _, isDir := isETLDirectiveOpen(rest); isDir {
+					lockNestDepth++
+				}
+				continue
+			} else if name, isDir := isETLDirectiveOpen(rest); isDir && name == "lock" {
+				inLock = true
+				lockNestDepth = 0
+				continue
+			}
+		} else if inLock {
+			continue
+		}
+
 		inWord := false
 		for _, r := range line {
 			if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) {
@@ -2910,7 +3137,16 @@ func int64Val(v any) int64 {
 	}
 }
 
-func intVal(v any) int { return int(int64Val(v)) }
+func intVal(v any) int {
+	n := int64Val(v)
+	if n < -2147483648 {
+		return -2147483648
+	}
+	if n > 2147483647 {
+		return 2147483647
+	}
+	return int(n)
+}
 
 func boolVal(v any) bool { return boolValDefault(v, false) }
 

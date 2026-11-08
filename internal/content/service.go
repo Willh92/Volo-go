@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,8 +163,9 @@ type Service struct {
 	uvDate    string
 	uvVisited map[uint64]struct{}
 
-	commentHTMLMu sync.RWMutex
-	commentHTML   map[string]string
+	commentHTMLMu   sync.RWMutex
+	commentHTMLCurr map[string]string
+	commentHTMLPrev map[string]string
 
 	mediaMu   sync.RWMutex
 	mediaDims map[string][2]int
@@ -192,22 +192,23 @@ func NewService(opts ServiceOptions) *Service {
 		dialer = &security.OutboundSafeDialer{Timeout: 10 * time.Second}
 	}
 	return &Service{
-		store:       opts.Store,
-		keys:        opts.Keys,
-		settings:    opts.Settings,
-		passports:   opts.Passports,
-		pow:         opts.PoW,
-		guard:       guard,
-		search:      searchIdx,
-		renderer:    rnd,
-		plugins:     opts.Plugins,
-		catalog:     opts.Catalog,
-		dialer:      dialer,
-		views:       newViewAnalyticsBuffer(opts.Store),
-		caches:      newServiceCacheState(),
-		uvVisited:   make(map[uint64]struct{}),
-		commentHTML: make(map[string]string, 256),
-		mediaDims:   make(map[string][2]int),
+		store:           opts.Store,
+		keys:            opts.Keys,
+		settings:        opts.Settings,
+		passports:       opts.Passports,
+		pow:             opts.PoW,
+		guard:           guard,
+		search:          searchIdx,
+		renderer:        rnd,
+		plugins:         opts.Plugins,
+		catalog:         opts.Catalog,
+		dialer:          dialer,
+		views:           newViewAnalyticsBuffer(opts.Store),
+		caches:          newServiceCacheState(),
+		uvVisited:       make(map[uint64]struct{}),
+		commentHTMLCurr: make(map[string]string, 256),
+		commentHTMLPrev: make(map[string]string),
+		mediaDims:       make(map[string][2]int),
 	}
 }
 
@@ -246,7 +247,8 @@ func (s *Service) ResetAnalyticsBuffer() {
 	clear(s.uvVisited)
 	s.uvMu.Unlock()
 	s.commentHTMLMu.Lock()
-	clear(s.commentHTML)
+	clear(s.commentHTMLCurr)
+	clear(s.commentHTMLPrev)
 	s.commentHTMLMu.Unlock()
 	s.PurgeRuntimeCaches()
 }
@@ -267,12 +269,15 @@ func (s *Service) WarmCaches(ctx context.Context) error {
 	return s.search.Rebuild(ctx)
 }
 
-// RefreshMediaDimsCache caches (width, height) of known media_assets so rendered <img> tags get zero-CLS dimensions.
+const maxCachedMediaDims = 5000
+
+// RefreshMediaDimsCache caches (width, height) of recent media_assets (bounded to 5000) so rendered <img> tags get zero-CLS dimensions.
 func (s *Service) RefreshMediaDimsCache(ctx context.Context) error {
-	assets, err := sqlx.Select[domain.MediaAsset](
-		ctx, s.store,
-		`SELECT public_url, width, height FROM media_assets WHERE width > 0 AND height > 0`,
+	q, pageArgs := s.store.Dialect().PaginateSQL(
+		`SELECT public_url, width, height FROM media_assets WHERE width > 0 AND height > 0 ORDER BY created_at DESC`,
+		maxCachedMediaDims, 0,
 	)
+	assets, err := sqlx.Select[domain.MediaAsset](ctx, s.store, q, pageArgs...)
 	if err != nil {
 		return err
 	}
@@ -1036,6 +1041,9 @@ func (s *Service) ListTagsWithCounts(ctx context.Context, limit int) ([]TagWithC
 	if err != nil {
 		return nil, err
 	}
+	if (limit <= 0 || limit > maxCachedChromeTags) && len(snap.tags) >= maxCachedChromeTags {
+		return s.queryTagsWithCountsLimited(ctx, limit)
+	}
 	src := snap.tags
 	if limit > 0 && len(src) > limit {
 		src = src[:limit]
@@ -1045,41 +1053,48 @@ func (s *Service) ListTagsWithCounts(ctx context.Context, limit int) ([]TagWithC
 	return out, nil
 }
 
-func (s *Service) queryAllTagsWithCounts(ctx context.Context) ([]TagWithCount, error) {
-	tags, err := sqlx.Select[domain.Tag](ctx, s.store, `SELECT * FROM tags ORDER BY name ASC`)
+func (s *Service) queryTagsWithCountsLimited(ctx context.Context, limit int) ([]TagWithCount, error) {
+	type tagCountRow struct {
+		ID           string `db:"id"`
+		Name         string `db:"name"`
+		Slug         string `db:"slug"`
+		CreatedAt    int64  `db:"created_at"`
+		ArticleCount int    `db:"article_count"`
+	}
+	baseSQL := `
+		SELECT t.id, t.name, t.slug, t.created_at, COALESCE(cnts.cnt, 0) AS article_count
+		FROM tags t
+		LEFT JOIN (
+			SELECT atg.tag_id AS tag_id, COUNT(*) AS cnt
+			FROM article_tags atg
+			INNER JOIN articles a ON a.id = atg.article_id
+			WHERE a.status = ?
+			GROUP BY atg.tag_id
+		) cnts ON cnts.tag_id = t.id
+		ORDER BY COALESCE(cnts.cnt, 0) DESC, t.name ASC`
+	args := []any{domain.ArticleStatusPublished}
+	q := baseSQL
+	if limit > 0 {
+		var pageArgs []any
+		q, pageArgs = s.store.Dialect().PaginateSQL(baseSQL, limit, 0)
+		args = append(args, pageArgs...)
+	}
+	rows, err := sqlx.Select[tagCountRow](ctx, s.store, q, args...)
 	if err != nil {
 		return nil, err
 	}
-	type countRow struct {
-		TagID string `db:"tag_id"`
-		Cnt   int    `db:"cnt"`
-	}
-	counts, _ := sqlx.Select[countRow](
-		ctx, s.store,
-		`SELECT at.tag_id AS tag_id, COUNT(*) AS cnt
-		 FROM article_tags at
-		 INNER JOIN articles a ON a.id = at.article_id
-		 WHERE a.status = ?
-		 GROUP BY at.tag_id`,
-		domain.ArticleStatusPublished,
-	)
-	cntMap := make(map[string]int, len(counts))
-	for _, c := range counts {
-		cntMap[c.TagID] = c.Cnt
-	}
-	out := make([]TagWithCount, 0, len(tags))
-	for _, t := range tags {
+	out := make([]TagWithCount, 0, len(rows))
+	for _, r := range rows {
 		out = append(out, TagWithCount{
-			Tag:          t,
-			ArticleCount: cntMap[t.ID],
+			Tag: domain.Tag{
+				ID:        r.ID,
+				Name:      r.Name,
+				Slug:      r.Slug,
+				CreatedAt: r.CreatedAt,
+			},
+			ArticleCount: r.ArticleCount,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].ArticleCount != out[j].ArticleCount {
-			return out[i].ArticleCount > out[j].ArticleCount
-		}
-		return out[i].Name < out[j].Name
-	})
 	return out, nil
 }
 
@@ -1410,8 +1425,8 @@ func (s *Service) queryPublicAuthors(ctx context.Context) (PublicAuthorProfile, 
 	return owner, authors, byID
 }
 
-func (s *Service) queryPublicSiteStats(ctx context.Context, catCount int, tagCount int) PublicSiteStats {
-	var artCnt, cmtCnt, serCnt, bookCnt int
+func (s *Service) queryPublicSiteStats(ctx context.Context, catCount int) PublicSiteStats {
+	var artCnt, cmtCnt, tagCnt, serCnt, bookCnt int
 	var artViews, pageViews, minPubAt int64
 	_ = s.store.QueryRowContext(
 		ctx,
@@ -1428,6 +1443,7 @@ func (s *Service) queryPublicSiteStats(ctx context.Context, catCount int, tagCou
 		`SELECT COUNT(*) FROM comments WHERE status = ? AND is_deleted = ?`,
 		domain.CommentStatusApproved, false,
 	).Scan(&cmtCnt)
+	_ = s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM tags`).Scan(&tagCnt)
 	_ = s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM series`).Scan(&serCnt)
 	_ = s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM books`).Scan(&bookCnt)
 
@@ -1443,7 +1459,7 @@ func (s *Service) queryPublicSiteStats(ctx context.Context, catCount int, tagCou
 		CommentCount:  cmtCnt,
 		ViewCount:     artViews + pageViews,
 		CategoryCount: catCount,
-		TagCount:      tagCount,
+		TagCount:      tagCnt,
 		SeriesCount:   serCnt,
 		BookCount:     bookCnt,
 		UptimeDays:    uptimeDays,
@@ -1486,9 +1502,7 @@ func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, side
 	copy(archivesCopy, snap.archiveBuckets)
 
 	stats := snap.stats
-	for _, c := range snap.recentCards {
-		stats.ViewCount += s.views.PendingArticleViews(c.ID)
-	}
+	stats.ViewCount += s.views.TotalPendingArticleViews()
 
 	return PublicChromeExtras{
 		Owner:              snap.owner,

@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -311,24 +314,27 @@ func (m *mockOIDCProvider) Exchange(_ context.Context, code string, _ string) (p
 	switch code {
 	case "admin-ok":
 		return plugin.OIDCIdentity{
-			Provider:    m.name,
-			Subject:     "sub_admin",
-			Email:       "CAPTAIN@Example.com",
-			DisplayName: "Captain OIDC",
+			Provider:      m.name,
+			Subject:       "sub_admin",
+			Email:         "CAPTAIN@Example.com",
+			EmailVerified: true,
+			DisplayName:   "Captain OIDC",
 		}, nil
 	case "stranger":
 		return plugin.OIDCIdentity{
-			Provider:    m.name,
-			Subject:     "sub_stranger",
-			Email:       "stranger@example.com",
-			DisplayName: "Stranger",
+			Provider:      m.name,
+			Subject:       "sub_stranger",
+			Email:         "stranger@example.com",
+			EmailVerified: true,
+			DisplayName:   "Stranger",
 		}, nil
 	default:
 		return plugin.OIDCIdentity{
-			Provider:    m.name,
-			Subject:     "sub_reader_1",
-			Email:       "sso-reader@example.com",
-			DisplayName: "SSO Reader",
+			Provider:      m.name,
+			Subject:       "sub_reader_1",
+			Email:         "sso-reader@example.com",
+			EmailVerified: true,
+			DisplayName:   "SSO Reader",
 		}, nil
 	}
 }
@@ -709,19 +715,37 @@ func TestRound2_CacheControl_Vary_Feeds_And_OIDCSSO(t *testing.T) {
 		t.Fatalf("expected auto-provisioned verified reader user, got err=%v user=%+v", err, readerUser)
 	}
 
-	// Admin SSO flow: unknown email -> 403; matching active staff email -> 302 with session cookie
+	// Admin SSO flow: unlinked OIDC subject -> 302 ?oidc_error=unlinked (even when email matches!); explicit target=bind links credential -> 302 login
 	admStart1, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=admin&next=/console", nil, nil, nil)
 	admURL1, _ := url.Parse(admStart1.Header.Get("Location"))
 	admCB1, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/callback?code=stranger&state="+url.QueryEscape(admURL1.Query().Get("state")), nil, admStart1.Cookies(), nil)
-	if admCB1.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected 403 for unmatched admin OIDC email, got %d", admCB1.StatusCode)
+	if admCB1.StatusCode != http.StatusFound || admCB1.Header.Get("Location") != "/console?oidc_error=unlinked" {
+		t.Fatalf("expected 302 /console?oidc_error=unlinked for unlinked stranger OIDC, got %d loc=%q", admCB1.StatusCode, admCB1.Header.Get("Location"))
+	}
+
+	admUnlinkedStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=admin&next=/console", nil, nil, nil)
+	admUnlinkedURL, _ := url.Parse(admUnlinkedStart.Header.Get("Location"))
+	admUnlinkedCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/callback?code=admin-ok&state="+url.QueryEscape(admUnlinkedURL.Query().Get("state")), nil, admUnlinkedStart.Cookies(), nil)
+	if admUnlinkedCB.StatusCode != http.StatusFound || admUnlinkedCB.Header.Get("Location") != "/console?oidc_error=unlinked" {
+		t.Fatalf("expected 302 /console?oidc_error=unlinked when staff email matches without explicit bind, got %d loc=%q", admUnlinkedCB.StatusCode, admUnlinkedCB.Header.Get("Location"))
+	}
+
+	bindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=bind", nil, adminCookies, nil)
+	if bindStart.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 from OIDC target=bind start, got %d", bindStart.StatusCode)
+	}
+	bindURL, _ := url.Parse(bindStart.Header.Get("Location"))
+	bindCookies := append(append([]*http.Cookie{}, adminCookies...), bindStart.Cookies()...)
+	bindCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/callback?code=admin-ok&state="+url.QueryEscape(bindURL.Query().Get("state")), nil, bindCookies, nil)
+	if bindCB.StatusCode != http.StatusFound || bindCB.Header.Get("Location") != "/console" {
+		t.Fatalf("expected 302 to /console after OIDC credential bind, got %d loc=%q", bindCB.StatusCode, bindCB.Header.Get("Location"))
 	}
 
 	admStart2, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=admin&next=/console", nil, nil, nil)
 	admURL2, _ := url.Parse(admStart2.Header.Get("Location"))
 	admCB2, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/callback?code=admin-ok&state="+url.QueryEscape(admURL2.Query().Get("state")), nil, admStart2.Cookies(), nil)
 	if admCB2.StatusCode != http.StatusFound || admCB2.Header.Get("Location") != "/console" {
-		t.Fatalf("expected 302 to /console for matched admin OIDC email, got %d loc=%q", admCB2.StatusCode, admCB2.Header.Get("Location"))
+		t.Fatalf("expected 302 to /console for bound admin OIDC credential, got %d loc=%q", admCB2.StatusCode, admCB2.Header.Get("Location"))
 	}
 	meResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/me", nil, admCB2.Cookies(), nil)
 	if meResp.StatusCode != http.StatusOK {
@@ -968,13 +992,20 @@ func TestRound2_LifecycleHooks_AdminOps_MediaEXIF_WebhooksReplay_And_BackupTicke
 	jpegSubdir := filepath.Join(env.uploadDir, "2026", "11")
 	_ = os.MkdirAll(jpegSubdir, 0o755)
 	jpegPath := filepath.Join(jpegSubdir, "gps-leak.jpg")
-	// Construct valid JPEG: SOI (FF D8) + APP1 Exif marker (FF E1 + len + "Exif\x00\x00SECRET_GPS_COORDS") + EOI (FF D9)
+	// Construct valid 1x1 JPEG with spliced APP1 Exif marker (FF E1 + len + "Exif\x00\x00SECRET_GPS_COORDS...")
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.SetRGBA(0, 0, color.RGBA{R: 10, G: 20, B: 30, A: 255})
+	var baseJPG bytes.Buffer
+	if err := jpeg.Encode(&baseJPG, img, nil); err != nil {
+		t.Fatalf("jpeg.Encode: %v", err)
+	}
 	exifPayload := []byte("Exif\x00\x00SECRET_GPS_COORDS_35.6895_139.6917")
 	segLen := len(exifPayload) + 2
 	var rawJPEG bytes.Buffer
-	rawJPEG.Write([]byte{0xFF, 0xD8, 0xFF, 0xE1, byte(segLen >> 8), byte(segLen & 0xFF)})
+	rawJPEG.Write(baseJPG.Bytes()[:2]) // SOI (FF D8)
+	rawJPEG.Write([]byte{0xFF, 0xE1, byte(segLen >> 8), byte(segLen & 0xFF)})
 	rawJPEG.Write(exifPayload)
-	rawJPEG.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0x00, 0xFF, 0xD9}) // minimal SOS + EOI
+	rawJPEG.Write(baseJPG.Bytes()[2:])
 	if err := os.WriteFile(jpegPath, rawJPEG.Bytes(), 0o640); err != nil {
 		t.Fatalf("write test jpeg: %v", err)
 	}
@@ -1028,8 +1059,10 @@ func TestRound2_LifecycleHooks_AdminOps_MediaEXIF_WebhooksReplay_And_BackupTicke
 		t.Fatalf("POST security/geo-rules (on_miss=challenge) = %d %s", geoResp.StatusCode, string(geoRaw))
 	}
 
-	// Backup single-use 60s download ticket
-	tkResp, tkRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/backups/ticket", map[string]any{}, adminCookies, adminHdrs)
+	// Backup single-use 60s download ticket (requires step-up current_password + bound session & IP bucket)
+	tkResp, tkRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/backups/ticket", map[string]any{
+		"current_password": "Str0ng!Pass#2026",
+	}, adminCookies, adminHdrs)
 	if tkResp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /api/admin/backups/ticket = %d %s", tkResp.StatusCode, string(tkRaw))
 	}
@@ -1040,15 +1073,19 @@ func TestRound2_LifecycleHooks_AdminOps_MediaEXIF_WebhooksReplay_And_BackupTicke
 	if tk.Ticket == "" {
 		t.Fatalf("expected non-empty ticket, got %s", string(tkRaw))
 	}
-	// Ticket works WITHOUT session cookies once, then is atomically consumed (401 on reuse)!
-	bk1Resp, bk1Bytes := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/backups/export?ticket="+url.QueryEscape(tk.Ticket), nil, nil, nil)
+	// Unauthenticated download attempt is rejected (bound to active session), then bound session succeeds once and is consumed!
+	bkNoSess, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/backups/export?ticket="+url.QueryEscape(tk.Ticket), nil, nil, nil)
+	if bkNoSess.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthenticated backup ticket download to return 401, got %d", bkNoSess.StatusCode)
+	}
+	bk1Resp, bk1Bytes := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/backups/export?ticket="+url.QueryEscape(tk.Ticket), nil, adminCookies, nil)
 	if bk1Resp.StatusCode != http.StatusOK {
 		t.Fatalf("first GET /api/admin/backups/export?ticket=... = %d %s", bk1Resp.StatusCode, string(bk1Bytes))
 	}
 	if _, zErr := zip.NewReader(bytes.NewReader(bk1Bytes), int64(len(bk1Bytes))); zErr != nil {
 		t.Fatalf("backup export zip invalid: %v", zErr)
 	}
-	bk2Resp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/backups/export?ticket="+url.QueryEscape(tk.Ticket), nil, nil, nil)
+	bk2Resp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/backups/export?ticket="+url.QueryEscape(tk.Ticket), nil, adminCookies, nil)
 	if bk2Resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected second reuse of single-use backup ticket to return 401, got %d", bk2Resp.StatusCode)
 	}

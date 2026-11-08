@@ -1,8 +1,12 @@
 {{define "content"}}
+{{if .ReaderAuthError}}
+  <div class="volo-banner volo-banner--err reader-auth-banner" role="alert">{{.ReaderAuthError}}</div>
+{{end}}
 <div class="reader-auth-grid {{if not .Reading.AllowReaderRegister}}reader-auth-grid--single{{end}}">
-  <section class="studio-article reader-auth-card">
+  <section id="reader-login-card" class="studio-article reader-auth-card{{if ne .CurrentPath "/reader/register"}} is-active-card{{end}}">
     <h2 class="reader-auth-card__title">{{t .Locale "nav.login"}}</h2>
-    <form id="volo-reader-login-form" class="reader-auth-form">
+    <form id="volo-reader-login-form" class="reader-auth-form" method="post" action="/reader/login">
+      <input type="hidden" name="next" value="{{.ReaderNextURL}}">
       <div class="reader-auth-field">
         <label class="reader-auth-label" for="volo-reader-ident">{{t .Locale "reader.ident_placeholder"}}</label>
         <input id="volo-reader-ident" class="volo-input" name="ident" required autocomplete="username" placeholder="{{t .Locale "reader.ident_placeholder"}}">
@@ -20,19 +24,29 @@
       </div>
       <div class="reader-oidc-list">
         {{range .OIDCProviders}}
-          <a class="studio-btn-ghost reader-oidc-btn" href="{{.StartURL}}" data-no-pjax>
+          {{$oidcHref := .StartURL}}
+          {{if and $.ReaderNextURL (not (contains $oidcHref "next="))}}
+            {{if contains $oidcHref "?"}}{{$oidcHref = printf "%s&next=%s" $oidcHref (urlquery $.ReaderNextURL)}}{{else}}{{$oidcHref = printf "%s?next=%s" $oidcHref (urlquery $.ReaderNextURL)}}{{end}}
+          {{end}}
+          <a class="studio-btn-ghost reader-oidc-btn" href="{{$oidcHref}}" data-no-pjax>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Zm0 5a3 3 0 1 1-3 3 3 3 0 0 1 3-3Zm0 12.2a7.2 7.2 0 0 1-5.8-2.9c.1-1.9 3.9-3 5.8-3s5.7 1.1 5.8 3a7.2 7.2 0 0 1-5.8 2.9Z"/></svg>
             <span>{{coalesce .DisplayName .Name}}</span>
           </a>
         {{end}}
       </div>
     {{end}}
+    {{if .Reading.AllowReaderRegister}}
+      <p class="reader-auth-switch">
+        <a href="/reader/register{{if .ReaderNextURL}}?next={{urlquery .ReaderNextURL}}{{end}}">{{t .Locale "reader.no_account_cta"}} →</a>
+      </p>
+    {{end}}
   </section>
 
   {{if .Reading.AllowReaderRegister}}
-    <section class="studio-article reader-auth-card">
+    <section id="reader-register-card" class="studio-article reader-auth-card{{if eq .CurrentPath "/reader/register"}} is-active-card{{end}}">
       <h2 class="reader-auth-card__title">{{t .Locale "reader.register_tab"}}</h2>
-      <form id="volo-reader-reg-form" class="reader-auth-form" autocomplete="off">
+      <form id="volo-reader-reg-form" class="reader-auth-form" method="post" action="/reader/register" autocomplete="off">
+        <input type="hidden" name="next" value="{{.ReaderNextURL}}">
         <div class="reader-auth-field">
           <label class="reader-auth-label" for="volo-reg-username">{{t .Locale "reader.username_placeholder"}}</label>
           <input id="volo-reg-username" class="volo-input" name="username" required minlength="2" maxlength="48" autocomplete="off" placeholder="{{t .Locale "reader.username_placeholder"}}">
@@ -55,6 +69,9 @@
         <div class="js-auth-msg reader-auth-msg reader-auth-msg--info"></div>
         <button class="volo-btn" type="submit">{{t .Locale "reader.register_tab"}}</button>
       </form>
+      <p class="reader-auth-switch">
+        <a href="/reader/login{{if .ReaderNextURL}}?next={{urlquery .ReaderNextURL}}{{end}}">← {{t .Locale "reader.has_account_cta"}}</a>
+      </p>
     </section>
   {{end}}
 </div>

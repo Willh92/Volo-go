@@ -33,9 +33,9 @@ import (
 )
 
 const (
-	maxLegacyZipEntries     = 10000
-	maxSingleLegacyMediaB   = 64 << 20  // 64 MiB per bundled media file
-	maxTotalLegacyMediaB    = 512 << 20 // 512 MiB total unpacked media budget
+	maxLegacyZipEntries   = 250_000
+	maxSingleLegacyMediaB = 64 << 20  // 64 MiB per bundled media file
+	maxTotalLegacyMediaB  = 512 << 20 // 512 MiB total unpacked media budget
 )
 
 var (
@@ -93,10 +93,11 @@ type bundledMediaCandidate struct {
 	open       func() (io.ReadCloser, error)
 }
 
-func collectBundledMediaCandidates(inputPath string, legacyMediaDir string, report *ImportReport) ([]bundledMediaCandidate, map[string]string, error) {
+func collectBundledMediaCandidates(inputPath string, legacyMediaDir string, report *ImportReport) ([]bundledMediaCandidate, map[string]string, func(), error) {
 	var list []bundledMediaCandidate
 	extractedImages := make(map[string]string)
 	seenRel := make(map[string]bool)
+	closeFn := func() {}
 
 	addCandidate := func(prefixKind, relRaw string, openFn func() (io.ReadCloser, error)) {
 		rel := strings.TrimLeft(strings.TrimSpace(filepath.ToSlash(relRaw)), "/")
@@ -138,12 +139,15 @@ func collectBundledMediaCandidates(inputPath string, legacyMediaDir string, repo
 	if !strings.HasSuffix(strings.ToLower(inputPath), ".json") {
 		f, err := os.Open(inputPath)
 		if err == nil {
+			keepOpen := false
 			if st, sErr := f.Stat(); sErr == nil {
 				if zr, zErr := zip.NewReader(f, st.Size()); zErr == nil {
 					if len(zr.File) > maxLegacyZipEntries {
 						_ = f.Close()
-						return nil, nil, fmt.Errorf("etl: archive entry count %d exceeds %d safety limit", len(zr.File), maxLegacyZipEntries)
+						return nil, nil, closeFn, fmt.Errorf("etl: archive entry count %d exceeds %d safety limit", len(zr.File), maxLegacyZipEntries)
 					}
+					keepOpen = true
+					closeFn = func() { _ = f.Close() }
 					for _, zf := range zr.File {
 						if zf.FileInfo().IsDir() {
 							continue
@@ -168,40 +172,16 @@ func collectBundledMediaCandidates(inputPath string, legacyMediaDir string, repo
 						default:
 							continue
 						}
-						entryPath := inputPath
-						entryName := zf.Name
+						zfItem := zf
 						addCandidate(prefixKind, rest, func() (io.ReadCloser, error) {
-							zfFile, oErr := os.Open(entryPath)
-							if oErr != nil {
-								return nil, oErr
-							}
-							zStat, oErr := zfFile.Stat()
-							if oErr != nil {
-								_ = zfFile.Close()
-								return nil, oErr
-							}
-							zReader, oErr := zip.NewReader(zfFile, zStat.Size())
-							if oErr != nil {
-								_ = zfFile.Close()
-								return nil, oErr
-							}
-							for _, item := range zReader.File {
-								if item.Name == entryName {
-									rc, rErr := item.Open()
-									if rErr != nil {
-										_ = zfFile.Close()
-										return nil, rErr
-									}
-									return &chainedReadCloser{Reader: rc, closers: []io.Closer{rc, zfFile}}, nil
-								}
-							}
-							_ = zfFile.Close()
-							return nil, os.ErrNotExist
+							return zfItem.Open()
 						})
 					}
 				}
 			}
-			_ = f.Close()
+			if !keepOpen {
+				_ = f.Close()
+			}
 		}
 	}
 
@@ -227,22 +207,7 @@ func collectBundledMediaCandidates(inputPath string, legacyMediaDir string, repo
 		}
 	}
 
-	return list, extractedImages, nil
-}
-
-type chainedReadCloser struct {
-	io.Reader
-	closers []io.Closer
-}
-
-func (c *chainedReadCloser) Close() error {
-	var firstErr error
-	for _, cl := range c.closers {
-		if err := cl.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	return list, extractedImages, closeFn, nil
 }
 
 func persistBundledMediaTx(
@@ -252,6 +217,7 @@ func persistBundledMediaTx(
 	targetUploadDir string,
 	uploaderID string,
 	report *ImportReport,
+	createdFiles *[]string,
 ) error {
 	if len(candidates) == 0 {
 		return nil
@@ -270,6 +236,7 @@ func persistBundledMediaTx(
 
 	var totalWritten int64
 	nowMs := time.Now().UnixMilli()
+	buf := make([]byte, 32*1024)
 
 	for _, cand := range candidates {
 		select {
@@ -285,9 +252,6 @@ func persistBundledMediaTx(
 		if relErr != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(os.PathSeparator)) {
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(destPath), 0o750); err != nil {
-			return err
-		}
 
 		rc, err := cand.open()
 		if err != nil {
@@ -297,6 +261,51 @@ func persistBundledMediaTx(
 			continue
 		}
 
+		// Pre-sniff up to 512 bytes BEFORE touching disk so disguised SVG/HTML/XML/JS payloads never create files!
+		var headBuf [512]byte
+		headN := 0
+		var preReadErr error
+		for headN < len(headBuf) {
+			n, rErr := rc.Read(headBuf[headN:])
+			headN += n
+			if rErr == io.EOF {
+				break
+			}
+			if rErr != nil {
+				preReadErr = rErr
+				break
+			}
+		}
+		if preReadErr != nil {
+			_ = rc.Close()
+			return fmt.Errorf("etl: read media header %q: %w", cand.relKey, preReadErr)
+		}
+
+		headSlice := headBuf[:headN]
+		mimeType := inferLegacyMediaMIME(cand.origName, headSlice)
+		sniffMIME := ""
+		if headN > 0 {
+			sniffMIME = http.DetectContentType(headSlice)
+		}
+		if isForbiddenMediaMIME(mimeType) || isForbiddenMediaMIME(sniffMIME) || hasDisguisedActiveMarkup(headSlice) {
+			_ = rc.Close()
+			if report != nil {
+				badMIME := sniffMIME
+				if badMIME == "" || !isForbiddenMediaMIME(badMIME) {
+					badMIME = mimeType
+				}
+				report.Warnings = append(report.Warnings, fmt.Sprintf("skipped media %q with active MIME/markup (%s)", cand.relKey, badMIME))
+			}
+			continue
+		}
+
+		_, statErr := os.Lstat(destPath)
+		existedBefore := statErr == nil
+
+		if err := os.MkdirAll(filepath.Dir(destPath), 0o750); err != nil {
+			_ = rc.Close()
+			return err
+		}
 		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
 		if err != nil {
 			_ = rc.Close()
@@ -304,22 +313,26 @@ func persistBundledMediaTx(
 		}
 
 		hasher := sha256.New()
-		var headBuf [512]byte
-		headN := 0
-		buf := make([]byte, 32*1024)
 		var written int64
 		var copyErr error
-		for {
+		if headN > 0 {
+			written = int64(headN)
+			if written > maxSingleLegacyMediaB || totalWritten+written > maxTotalLegacyMediaB {
+				copyErr = errors.New("bundled media size budget exceeded")
+			} else {
+				_, _ = hasher.Write(headSlice)
+				if _, wErr := outFile.Write(headSlice); wErr != nil {
+					copyErr = wErr
+				}
+			}
+		}
+		for copyErr == nil {
 			n, rErr := rc.Read(buf)
 			if n > 0 {
 				written += int64(n)
 				if written > maxSingleLegacyMediaB || totalWritten+written > maxTotalLegacyMediaB {
 					copyErr = errors.New("bundled media size budget exceeded")
 					break
-				}
-				if headN < len(headBuf) {
-					copied := copy(headBuf[headN:], buf[:n])
-					headN += copied
 				}
 				_, _ = hasher.Write(buf[:n])
 				if _, wErr := outFile.Write(buf[:n]); wErr != nil {
@@ -339,19 +352,15 @@ func persistBundledMediaTx(
 		_ = rc.Close()
 
 		if copyErr != nil {
-			_ = os.Remove(destPath)
+			if !existedBefore {
+				_ = os.Remove(destPath)
+			}
 			return fmt.Errorf("etl: extract media %q: %w", cand.relKey, copyErr)
 		}
-		totalWritten += written
-
-		mimeType := inferLegacyMediaMIME(cand.origName, headBuf[:headN])
-		if isForbiddenMediaMIME(mimeType) {
-			_ = os.Remove(destPath)
-			if report != nil {
-				report.Warnings = append(report.Warnings, fmt.Sprintf("skipped media %q with active MIME %q", cand.relKey, mimeType))
-			}
-			continue
+		if !existedBefore && createdFiles != nil {
+			*createdFiles = append(*createdFiles, destPath)
 		}
+		totalWritten += written
 
 		var width, height int
 		if strings.HasPrefix(mimeType, "image/") {
@@ -416,7 +425,25 @@ func isForbiddenMediaMIME(ct string) bool {
 	return strings.Contains(low, "svg") ||
 		strings.Contains(low, "text/html") ||
 		strings.Contains(low, "xhtml") ||
+		strings.Contains(low, "xml") ||
 		strings.Contains(low, "javascript")
+}
+
+func hasDisguisedActiveMarkup(head []byte) bool {
+	if len(head) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(strings.TrimPrefix(string(head), "\xEF\xBB\xBF"))
+	low := strings.ToLower(trimmed)
+	if strings.HasPrefix(low, "<svg") ||
+		strings.HasPrefix(low, "<?xml") ||
+		strings.HasPrefix(low, "<!doctype html") ||
+		strings.HasPrefix(low, "<html") ||
+		strings.HasPrefix(low, "<script") ||
+		strings.HasPrefix(low, "<iframe") {
+		return true
+	}
+	return strings.Contains(low, "<svg") || strings.Contains(low, "<script")
 }
 
 // urlRewriter rewrites legacy site origins, CDN prefixes, .html permalinks, and /image/* paths

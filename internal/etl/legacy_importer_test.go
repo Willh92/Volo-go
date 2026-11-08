@@ -756,3 +756,231 @@ func TestImportLegacyArchiveURLRewriteMediaExtractAndOverrides(t *testing.T) {
 		t.Fatalf("expected admin avatar URL rewritten to .../uploads/banner.png, got %q", admin.AvatarURL)
 	}
 }
+
+func TestETLRound3_DisguisedMarkup_RollbackCleanup_FKSafeClear_AnalyticsMapping_And_NestedLock(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	uploadDir := filepath.Join(tmp, "uploads")
+	if err := os.MkdirAll(uploadDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(tmp, "round3-etl.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatal(err)
+	}
+
+	kr, _, err := config.LoadOrInitKeyRing(strings.Repeat("e", 64), tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settingsMgr := repo.NewSettingsManager(store, kr, "zh-CN")
+	_, _ = settingsMgr.Reload(ctx)
+
+	// 1. Rollback cleanup test: `"links": {"bad":"object"}` passes Pass 1 (skipJSONValue)
+	//    and fails inside streamPass2IntoTx AFTER persistBundledMediaTx wrote `rollback-pic.png`!
+	failZip := filepath.Join(tmp, "fail-pass2.zip")
+	var failBuf bytes.Buffer
+	fzw := zip.NewWriter(&failBuf)
+	wData, _ := fzw.Create("data.json")
+	_, _ = wData.Write([]byte(`{
+		"users": [{"oId":"default","userName":"admin","userEmail":"a@example.com","userRole":"adminRole"}],
+		"links": {"not":"an-array"}
+	}`))
+	wImg, _ := fzw.Create("image/sub/rollback-pic.png")
+	_, _ = wImg.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13})
+	_ = fzw.Close()
+	if err := os.WriteFile(failZip, failBuf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportLegacyArchive(ctx, store, settingsMgr, kr, failZip, ImportOptions{TargetUploadDir: uploadDir}); err == nil {
+		t.Fatal("expected Pass 2 malformed links object to fail ImportLegacyArchive")
+	}
+	if _, statErr := os.Stat(filepath.Join(uploadDir, "sub", "rollback-pic.png")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected rollback-pic.png to be unlinked after failed transaction, statErr=%v", statErr)
+	}
+
+	// 2. Seed existing FK child rows across webhook_deliveries, follow_items, reactions, and pages
+	//    to prove `tablesToClear` deletes them in FK-safe reverse order!
+	now := int64(1730900000000)
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
+		 VALUES ('u_old', 'old', 'old@example.com', 'Old', '', '', '', 'admin', 'h', '', 'active', 0, 'zh-CN', ?, ?)`, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO pages (id, author_id, title, slug, template, content_md, is_published, allow_comment, show_toc, lang, translation_group, view_count, comment_count, created_at, updated_at)
+		 VALUES ('pg_old', 'u_old', 'About', 'about', 'default', 'hi', 1, 1, 0, 'zh-CN', '', 0, 0, ?, ?)`, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO webhooks (id, name, provider, url, secret_ciphertext, chat_id, events_json, is_enabled, last_status_code, last_error, last_triggered_at, created_at, updated_at)
+		 VALUES ('wh_old', 'Old Hook', 'custom', 'https://example.com/hook', '', '', '[]', 1, 200, '', 0, ?, ?)`, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO webhook_deliveries (id, webhook_id, event, status_code, duration_ms, success, payload_json, response_body, error_text, created_at)
+		 VALUES ('whd_old', 'wh_old', 'comment.created', 200, 10, 1, '{}', 'ok', '', ?)`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO follows (id, title, site_url, feed_url, description, icon_url, sort_order, last_synced_at, sync_error, created_at, updated_at)
+		 VALUES ('fl_old', 'Feed', 'https://example.com', 'https://example.com/rss', '', '', 0, 0, '', ?, ?)`, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO follow_items (id, follow_id, guid_hash, title, url, summary, author_name, published_at)
+		 VALUES ('fli_old', 'fl_old', 'g1', 'Item', 'https://example.com/1', '', '', ?)`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO reactions (target_type, target_id, actor_hash, kind, created_at) VALUES ('article', 'a_old', 'fp_1', 'heart', ?)`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Full Round 3 archive:
+	//    - UUID > 32-char article oId mapped consistently into analytics_top_items
+	//    - Duplicate tag_articles + articleTags binding via UpsertSQL
+	//    - Disguised `<svg onload=...>` named `evil-disguised.png` & `<html><script>` named `evil.jpg` rejected pre-disk
+	//    - Unsafe `faviconURL: "javascript:alert(1)"` sanitized without failing PatchDomain("site")
+	//    - Nested `:::tip` inside `:::lock` excluded from word_count, while `:::lock` inside ```markdown does NOT set has_content_lock!
+	const longUUIDArtID = "550e8400-e29b-41d4-a716-999999999999"
+	statsJSON := `{"updatedAt":1730900000000,"days":{"2026-11-08":{"pv":42,"uv":10,"articles":{"` + longUUIDArtID + `":19},"referers":{"https://news.ycombinator.com":7}}}}`
+	longPermalink := "/archive/2026/11/08/" + strings.Repeat("deep-legacy-segment-", 12) + "post.html"
+
+	doc := map[string]any{
+		"options": []map[string]any{
+			{"oId": "blogTitle", "optionValue": "Round 3 ETL"},
+			{"oId": "faviconURL", "optionValue": "javascript:alert(1)"},
+			{"oId": "usite", "optionValue": `{"github":"https://github.com/Willh92","weibo":"javascript:evil()"}`},
+			{"oId": "voloDailyStats", "optionValue": statsJSON},
+		},
+		"users": []map[string]any{
+			{"oId": "default", "userName": "will", "userEmail": "will@example.com", "userRole": "adminRole"},
+		},
+		"tags": []map[string]any{
+			{"oId": "tag_go", "tagTitle": "Golang"},
+		},
+		"tag_articles": []map[string]any{
+			{"tag_oId": "tag_go", "article_oId": longUUIDArtID},
+			{"tag_oId": "tag_go", "article_oId": longUUIDArtID},
+		},
+		"articles": []map[string]any{
+			{
+				"oId":              longUUIDArtID,
+				"articleTitle":     "Nested Lock Post",
+				"articleAbstract":  "Summary",
+				"articleContent":   "alpha beta\n:::lock\nsecretOne\n:::tip\nsecretTwo\n:::\nsecretThree\n:::\ngamma",
+				"articleTags":      "Golang,Golang",
+				"articleAuthorId":  "default",
+				"articlePermalink": longPermalink,
+				"articleStatus":    0,
+				"articleCreated":   now,
+				"articleUpdated":   now,
+			},
+			{
+				"oId":              "art_fenced_lock",
+				"articleTitle":     "Code Fence Example",
+				"articleAbstract":  "Summary",
+				"articleContent":   "```markdown\n:::lock\nnot locked\n:::\n```\n    :::lock\n    indented code\n    :::\nplain words",
+				"articleAuthorId":  "default",
+				"articlePermalink": "/fenced-example.html",
+				"articleStatus":    0,
+				"articleCreated":   now,
+				"articleUpdated":   now,
+			},
+		},
+	}
+	docRaw, _ := json.Marshal(doc)
+
+	okZip := filepath.Join(tmp, "round3-ok.zip")
+	var okBuf bytes.Buffer
+	ozw := zip.NewWriter(&okBuf)
+	addEntry := func(name string, b []byte) {
+		w, _ := ozw.Create(name)
+		_, _ = w.Write(b)
+	}
+	addEntry("data.json", docRaw)
+	addEntry("image/disguised/evil-disguised.png", []byte("<?xml version=\"1.0\"?><svg onload=\"alert(1)\"></svg>"))
+	addEntry("image/disguised2/evil-html.jpg", []byte("<!DOCTYPE html><html><body><script>alert(1)</script></body></html>"))
+	addEntry("image/safe/clean.png", []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13})
+	_ = ozw.Close()
+	if err := os.WriteFile(okZip, okBuf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := ImportLegacyArchive(ctx, store, settingsMgr, kr, okZip, ImportOptions{TargetUploadDir: uploadDir})
+	if err != nil {
+		t.Fatalf("Round 3 ImportLegacyArchive failed: %v", err)
+	}
+	if rep.MediaFiles != 1 {
+		t.Fatalf("expected only 1 valid PNG extracted (2 disguised markup files skipped), got MediaFiles=%d warnings=%v", rep.MediaFiles, rep.Warnings)
+	}
+	// Neither disguised file NOR its parent directory should have been created on disk!
+	if _, err := os.Stat(filepath.Join(uploadDir, "disguised")); !os.IsNotExist(err) {
+		t.Fatalf("expected disguised SVG directory never created on disk, stat=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(uploadDir, "disguised2")); !os.IsNotExist(err) {
+		t.Fatalf("expected disguised HTML directory never created on disk, stat=%v", err)
+	}
+
+	// Verify old pages/reactions/follow_items/webhook_deliveries were cleared!
+	for _, tbl := range []string{"pages", "reactions", "follow_items", "webhook_deliveries"} {
+		var cnt int64
+		cErr := store.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+tbl).Scan(&cnt)
+		if cErr != nil || cnt != 0 {
+			t.Fatalf("expected table %s cleared to 0 rows, got cnt=%d err=%v", tbl, cnt, cErr)
+		}
+	}
+
+	// Verify >190-rune permalink redirect succeeded (512 width) and analytics_top_items mapped longUUIDArtID -> actual articles.id!
+	lockedArt, err := sqlx.Get[domain.RawArticle](ctx, store, `SELECT * FROM articles WHERE slug != 'fenced-example'`)
+	if err != nil {
+		t.Fatalf("load lockedArt: %v", err)
+	}
+	if !lockedArt.HasContentLock || lockedArt.WordCount != 3 {
+		t.Fatalf("expected HasContentLock=true and WordCount=3 ('alpha beta' + 'gamma', excluding entire nested :::lock), got lock=%v words=%d", lockedArt.HasContentLock, lockedArt.WordCount)
+	}
+	topHit, err := sqlx.Get[domain.AnalyticsTopItem](ctx, store, `SELECT * FROM analytics_top_items WHERE kind = 'article'`)
+	if err != nil {
+		t.Fatalf("load analytics_top_items article row: %v", err)
+	}
+	if topHit.ItemKey != lockedArt.ID || topHit.Hits != 19 {
+		t.Fatalf("expected analytics_top_items.item_key mapped to %q (hits=19), got %+v", lockedArt.ID, topHit)
+	}
+	var redirCount int64
+	_ = store.QueryRowContext(ctx, `SELECT COUNT(*) FROM redirects WHERE source_path = ?`, longPermalink).Scan(&redirCount)
+	if redirCount != 1 {
+		t.Fatalf("expected >190-char historical permalink redirect stored under V6 VARCHAR(512), got %d", redirCount)
+	}
+
+	// Verify fenced/4-space indented :::lock did NOT set has_content_lock!
+	fencedArt, err := sqlx.Get[domain.RawArticle](ctx, store, `SELECT * FROM articles WHERE id = 'art_fenced_lock'`)
+	if err != nil {
+		t.Fatalf("load fencedArt: %v", err)
+	}
+	if fencedArt.HasContentLock {
+		t.Fatalf("expected HasContentLock=false when :::lock only appears inside fenced/4-space code blocks!")
+	}
+
+	// Verify unsafe faviconURL was cleared to "" while valid GitHub social link survived
+	snap := settingsMgr.Snapshot()
+	if snap.Site.FaviconURL != "" || len(snap.Site.SocialLinks) != 1 || snap.Site.SocialLinks[0].Icon != "github" {
+		t.Fatalf("unexpected sanitized Site settings: favicon=%q social=%+v", snap.Site.FaviconURL, snap.Site.SocialLinks)
+	}
+}
+

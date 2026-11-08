@@ -30,11 +30,23 @@ export interface StaffUser {
   preferred_locale: string;
 }
 
+export function sanitizeAdminPath(raw?: string): string {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed || !/^\/[A-Za-z0-9/_-]+$/.test(trimmed) || trimmed.startsWith("//")) {
+    return "/console";
+  }
+  return trimmed;
+}
+
 export function readBootConfig(): BootConfig {
   const el = document.getElementById("volo-boot-config");
   if (el && el.textContent) {
     try {
-      return JSON.parse(el.textContent) as BootConfig;
+      const parsed = JSON.parse(el.textContent) as BootConfig;
+      return {
+        ...parsed,
+        admin_path: sanitizeAdminPath(parsed.admin_path),
+      };
     } catch {
       // Fallback below
     }

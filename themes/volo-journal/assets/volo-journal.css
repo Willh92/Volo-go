@@ -22,6 +22,9 @@ html[data-volo-skin="volo-journal"] .volo-prose :is(
   .volo-embed-book,
   .volo-book-tile,
   .volo-banner,
+  .volo-callout__title,
+  .volo-callout-title,
+  .volo-callout-header,
   .vc-meta,
   .vc-actions,
   .vc-act-btn
@@ -32,11 +35,32 @@ html[data-volo-skin="volo-journal"] .volo-prose :is(
 
 html[data-volo-skin="volo-journal"] .volo-prose code,
 html[data-volo-skin="volo-journal"] .volo-prose pre,
+html[data-volo-skin="volo-journal"] .volo-prose kbd,
 html[data-volo-skin="volo-journal"] .volo-code-lang,
 html[data-volo-skin="volo-journal"] .volo-audio-ts,
-html[data-volo-skin="volo-journal"] .volo-ts-seek {
+html[data-volo-skin="volo-journal"] .volo-ts-seek,
+html[data-volo-skin="volo-journal"] .chroma .ln,
+html[data-volo-skin="volo-journal"] .chroma .lnt {
   font-family: var(--volo-font-mono);
   letter-spacing: 0;
+}
+
+html[data-volo-skin="volo-journal"] .chroma .ln,
+html[data-volo-skin="volo-journal"] .chroma .lnt {
+  user-select: none;
+  -webkit-user-select: none;
+  padding-right: 0.85em;
+  opacity: 0.55;
+}
+
+html[data-volo-skin="volo-journal"] .volo-prose .volo-callout {
+  font-style: normal;
+}
+
+html[data-volo-skin="volo-journal"] :is(.vc-btn-danger, .volo-btn--danger) {
+  background: var(--volo-danger-solid, #b42318);
+  border-color: var(--volo-danger-solid, #b42318);
+  color: var(--volo-on-danger, #ffffff);
 }
 
 /* Unified 1180px Shell Alignment across Header, Main, Masthead & Footer */

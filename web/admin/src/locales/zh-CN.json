@@ -2,7 +2,6 @@
   "meta.code": "zh-CN",
   "meta.name": "简体中文",
   "meta.dir": "ltr",
-
   "shell.console_title": "Volo 管理工作台",
   "shell.brand_sub": "创作与管理",
   "shell.eyebrow": "创作工作台",
@@ -28,7 +27,6 @@
   "ws.distribute": "分发与连接",
   "ws.appearance": "外观与扩展",
   "ws.system": "系统与安全",
-
   "nav.caption": "内容与站点",
   "nav.home": "首页",
   "nav.group_posts": "文章",
@@ -64,7 +62,6 @@
   "nav.audit": "审计日志",
   "nav.view_site": "访问前台站点",
   "nav.logout": "退出登录",
-
   "auth.sign_in": "登录管理工作台",
   "auth.ident": "用户名或邮箱",
   "auth.password": "登录密码",
@@ -74,13 +71,12 @@
   "auth.totp_code": "输入 6 位动态验证码或恢复码",
   "auth.remember_2fa": "信任当前浏览器 30 天",
   "auth.verify": "验证并进入",
-
   "setup.title": "初始化 Volo-go 独立博客",
   "setup.subtitle": "纯 Go 单二进制 · 多数据库方言 · 零历史包袱",
   "setup.step1": "1. 数据库连接校验",
   "setup.step2": "全新建站配置",
   "setup.step3": "3. 创建站长主权账户",
-  "setup.legacy_tab": "从旧版备份包一键迁移",
+  "setup.legacy_tab": "从旧版数据一键迁移",
   "setup.dialect": "数据库方言",
   "setup.dialect_sqlite": "SQLite（纯 Go 内嵌 WAL 模式）",
   "setup.dialect_postgres": "PostgreSQL / Supabase / Neon / CockroachDB",
@@ -106,7 +102,6 @@
   "setup.import_btn": "选择旧版备份并流式迁移 (.zip / .json)",
   "setup.importing": "正在流式清洗导入…",
   "setup.legacy_done": "旧版备份已清洗规范化并导入成功！",
-
   "ed.loading": "正在加载 Markdown 创作台…",
   "ed.placeholder": "使用 Markdown 沉浸写作… 支持直接粘贴剪贴板图片或拖拽上传图片/音频。",
   "ed.h2": "二级标题",
@@ -127,7 +122,6 @@
   "ed.hide_preview": "隐藏分栏预览",
   "ed.show_preview": "开启分栏预览",
   "ed.live_preview_empty": "实时渲染预览区…",
-
   "ov.eyebrow": "你的写作空间",
   "ov.welcome_title": "让每一次表达，都有归处。",
   "ov.welcome_desc": "专注长文创作、直接分类体系与零隐私数据主权，随时从这里开始今天的记录。",
@@ -160,7 +154,6 @@
   "ov.top_referers": "外部来源域名 Top 10",
   "ov.top_referers_empty": "当前统计区间暂无外部来源域名记录",
   "ov.hits_unit": "{hits} 次",
-
   "art.list": "文章管理",
   "art.new": "撰写新文章",
   "art.import_md": "批量导入 .md / .zip",
@@ -214,7 +207,6 @@
   "art.restore_draft": "恢复草稿",
   "art.discard_draft": "丢弃",
   "art.confirm_delete": "确认永久删除这篇文章吗？该操作不可撤销。",
-
   "cnt.pages": "独立页面",
   "cnt.page_desc": "独立 Markdown 页面与顶部导航、文章时间流解耦，适合「关于」「简历」「作品集」等常驻页。",
   "cnt.categories": "分类管理",
@@ -298,7 +290,6 @@
   "cnt.media_copy": "复制链接",
   "cnt.media_copy_md": "复制 MD",
   "cnt.media_copied": "已复制到剪贴板",
-
   "dist.nav_redirects": "导航与重定向",
   "dist.nav": "顶部导航菜单",
   "dist.links": "友情链接",
@@ -393,7 +384,6 @@
   "dist.save_seo": "保存 SEO 配置",
   "dist.sync_gh": "同步 GitHub 仓库",
   "dist.synced_gh": "已同步 {count} 个 GitHub 公开仓库",
-
   "app.themes": "主题皮肤",
   "app.locales": "语言包扩展",
   "app.plugins": "插件中心",
@@ -468,7 +458,6 @@
   "app.secret_sealed_hint": "已加密封存（留空保持不变）",
   "app.logs_title": "插件运行日志：{id}",
   "app.logs_empty": "暂无运行日志记录。",
-
   "sys.settings_site": "站点与阅读偏好",
   "sys.settings_io": "存储与通知",
   "sys.settings": "站点设置",
@@ -689,7 +678,6 @@
   "sys.audit_col_actor": "操作者",
   "sys.audit_col_action": "动作",
   "sys.audit_col_res": "目标资源与脱敏 IP",
-
   "tbl.pinned": "置顶",
   "tbl.protected": "口令",
   "tbl.locked_block": "含加密段",
@@ -708,14 +696,12 @@
   "tbl.status_active": "正常启用",
   "tbl.status_disabled": "已停用",
   "tbl.empty": "暂无数据记录",
-
   "nav.github": "开源作品展示",
   "shell.appearance_title": "外观与主题色",
   "shell.lang_title": "切换界面语言",
   "ui.pg_summary": "共 {total} 条 · 第 {page} / {pages} 页",
   "ui.pg_prev": "上一页",
   "ui.pg_next": "下一页",
-
   "ed.mode_ir": "即时渲染",
   "ed.mode_wysiwyg": "所见即所得",
   "ed.mode_sv": "分屏预览",
@@ -749,7 +735,6 @@
   "ed.qi_lock_hint_lbl": "未解锁提示语",
   "ed.qi_lock_body_lbl": "受保护隐藏内容",
   "ed.qi_search_art": "搜索站内文章标题…",
-
   "art.scheduled_at": "定时发布时间",
   "art.published_at": "自定义发布时间（选填）",
   "art.audio_duration": "音频时长（秒）",
@@ -762,7 +747,6 @@
   "art.unpin_action": "取消置顶",
   "art.diff_btn": "对比当前",
   "art.diff_title": "版本差异对比（对比当前编辑器正文）",
-
   "cnt.lbl_cat_name": "分类名称",
   "cnt.lbl_slug": "URL 路径别名 (Slug)",
   "cnt.lbl_desc": "简短描述",
@@ -782,7 +766,6 @@
   "cnt.lbl_page_locale": "页面语种",
   "cnt.lbl_page_group": "多语言互译组 ID",
   "cnt.media_total_stat": "共 {count} 个文件 · 总计 {mb} MB",
-
   "dist.lbl_nav_label": "默认显示名称",
   "dist.lbl_nav_url": "跳转链接地址",
   "dist.lbl_nav_zh": "简体中文名称（选填）",
@@ -827,7 +810,6 @@
   "dist.gh_col_lang": "主要语言",
   "dist.gh_col_metrics": "Stars / Forks",
   "dist.gh_empty": "尚未同步仓库。在上方填写 GitHub 用户名并点击「同步 GitHub 仓库」即可拉取列表。",
-
   "sys.lbl_site_title": "站点主标题",
   "sys.lbl_site_sub": "站点副标题",
   "sys.lbl_logo_url": "品牌 Logo 图片地址",
@@ -877,7 +859,6 @@
   "sys.bak_local_created": "已生成本地备份快照：{name}",
   "sys.bak_col_file": "归档文件名",
   "sys.bak_download": "下载",
-
   "common.save": "保存更改",
   "common.cancel": "取消",
   "common.close": "关闭",
@@ -889,13 +870,10 @@
   "common.create": "新建",
   "common.refresh": "刷新",
   "common.saved": "已保存并即时热生效",
-
   "nav.about": "关于",
   "nav.help": "使用帮助",
-
   "ed.upload_local_file": "上传本地文件",
   "ed.insert_from_library": "从媒体库中插入",
-
   "cnt.media_picker_title": "从媒体图库中选择",
   "cnt.media_picker_desc": "点击任意媒体卡片即可立即选用，也可直接上传新文件并自动插入。",
   "cnt.media_type_all": "全部类型",
@@ -905,11 +883,9 @@
   "cnt.media_orphan_short": "未引用",
   "cnt.media_used_short": "使用中",
   "cnt.media_pick_btn": "媒体库",
-
   "art.title_ph": "输入文章标题…",
   "art.tag_input_more": "继续添加标签…",
   "art.toggle_tag_pool": "选择已有标签 ({count})",
-
   "ov.data_head": "内容结构与创作统计",
   "ov.data_sub": "实时汇总近 12 个月发布节奏、分类占比与高频标签分布",
   "ov.chart_monthly": "每月文章数量统计",
@@ -923,7 +899,6 @@
   "ov.recent_logs_head": "近期日志",
   "ov.recent_logs_empty": "暂无近期审计日志记录。",
   "ov.view_all_logs": "全部日志",
-
   "auth.back_blog": "返回博客",
   "auth.story_eyebrow": "A SPACE FOR YOUR WORDS",
   "auth.story_title_1": "记录思考，",
@@ -942,7 +917,6 @@
   "auth.back_login": "返回账号密码登录",
   "auth.staff_only_tip": "仅限站点管理员与内容协作者登录，会话受硬件通行密钥与双因素保护。",
   "auth.oss_motto": "独立创作 · 开放互联",
-
   "about.refreshed_toast": "已刷新项目与版本状态",
   "about.hero_sub": "纯 Go 单二进制独立个人博客与数字花园引擎",
   "about.cur_version": "当前版本",
@@ -964,7 +938,6 @@
   "about.credits_head": "设计理念与致谢",
   "about.credits_body": "Volo-go 以单文件极简部署、严格安全边界、全链路零隐私分析及优雅阅读排版为核心目标，采用 Apache-2.0 开源许可协议发布。",
   "about.open_help_btn": "浏览使用指南",
-
   "help.head": "使用帮助与速查手册",
   "help.sub": "快速检索扩展 Markdown 语法、工作室快捷键、运维命令与安全最佳实践。",
   "help.search_ph": "搜索语法指令、快捷键或运维说明…",
@@ -996,7 +969,6 @@
   "help.sec_item_waf": "内置速率限制、带防自锁保护的 IP/CIDR 封禁及离线地区访问规则。",
   "help.sec_item_pat": "支持签发按权限域隔离、可随时吊销的个人访问令牌。",
   "help.sec_item_privacy": "采用每日自动轮换盐哈希统计 PV/UV，绝不写入第三方追踪 Cookie。",
-
   "cnt.new_cat": "新建分类",
   "cnt.edit_cat": "编辑分类",
   "cnt.new_tag": "新建标签",
@@ -1031,7 +1003,6 @@
   "cnt.media_confirm_del": "确认永久删除该媒体文件吗？若已被文章引用将无法加载。",
   "cnt.media_clean_confirm_desc": "即将永久清理 {count} 个未被引用的孤儿媒体文件（预计释放 {size}），确认继续吗？",
   "cnt.media_open_new": "新窗口打开",
-
   "dist.new_nav": "新建导航项",
   "dist.edit_nav": "编辑导航项",
   "dist.new_redir": "新建重定向",
@@ -1044,7 +1015,6 @@
   "dist.edit_follow": "编辑订阅源",
   "dist.new_wh": "新建推送通道",
   "dist.edit_wh": "编辑推送通道",
-
   "sys.lbl_avatar_url": "个人头像图片",
   "sys.avatar_url_ph": "输入头像图片 URL，或从本地上传 / 图库选择",
   "sys.upload_img_btn": "上传图片",
@@ -1063,7 +1033,6 @@
   "sys.pk_modal_title": "注册 Passkey 通行密钥",
   "sys.pk_register_btn": "开始验证并绑定",
   "sys.pat_modal_title": "生成个人 API 令牌",
-
   "ui.batch_label": "批量操作",
   "ui.batch_selected": "已选 {n} 项",
   "ui.batch_clear": "取消选择",
@@ -1075,19 +1044,15 @@
   "ui.unsaved_title": "未保存的内容更改",
   "ui.unsaved_msg": "当前编辑器有尚未保存的内容，确定离开并丢弃未保存更改吗？",
   "ui.unsaved_leave": "放弃并离开",
-
   "cnt.media_scan_btn": "扫描本地目录",
   "cnt.media_reconciled": "本地媒体目录扫描同步完成",
-
   "ed.link_text_ph": "链接文字",
   "ed.table_tpl": "| 列 1 | 列 2 | 列 3 |\n| --- | --- | --- |\n| 内容 | 内容 | 内容 |",
   "ed.mob_write": "编辑",
   "ed.mob_preview": "预览",
-
   "sys.import_dryrun_lbl": "仅预检归档（Dry-Run，不写入数据库）",
   "sys.import_dryrun_ok": "归档预检通过，请查看下方解析报告",
   "help.sc_item_save": "在文章或独立页面编辑器中立即保存",
-
   "setup.leg_adjust_head": "2. 内容域名替换与站点参数调整（选填）",
   "setup.leg_adjust_hint": "自动将旧版 .html 固定链接、导航、书架目录及 /image 资源路径转换为新版格式，并适配目标数据库方言编码。",
   "setup.leg_old_url": "旧站点 / 旧图床前缀（多个用逗号分隔）",
@@ -1104,7 +1069,6 @@
   "setup.leg_admin_email": "新管理员邮箱",
   "setup.leg_admin_pwd": "重置登录密码（至少 6 位）",
   "setup.leg_keep_ph": "留空保留原备份值",
-
   "ov.hide_inspector": "收起属性栏",
   "ov.show_inspector": "展开属性栏",
   "ov.save_draft": "保存草稿",
@@ -1121,13 +1085,11 @@
   "ov.batch_done": "已批量处理 {n} 篇文章",
   "ov.batch_move_cat": "移至分类…",
   "ov.select_all": "全选本页",
-
   "app.reset_defaults": "恢复默认",
   "app.confirm_reset_cfg": "确认将该表单恢复为默认配置吗？（点击保存后生效）",
   "app.plugin_reload": "重载",
   "app.plugin_reloaded": "插件已热重载",
   "app.clear_saved_secret": "清除已保存密钥",
-
   "cnt.clean_orphans": "清理孤儿资源",
   "cnt.cmt_search_ph": "搜索昵称、内容、目标或 IP…",
   "cnt.confirm_batch_del_cmts": "确定批量永久删除选中的 {n} 条评论吗？此操作不可撤销。",
@@ -1149,7 +1111,6 @@
   "cnt.page_tpl_default": "标准阅读布局",
   "cnt.page_tpl_minimal": "极简无干扰布局",
   "cnt.page_tpl_wide": "宽幅画布布局",
-
   "dist.confirm_batch_del_links": "确定批量删除选中的 {n} 个友链吗？",
   "dist.confirm_batch_del_redir": "确定批量删除选中的 {n} 条重定向规则吗？",
   "dist.confirm_del_follow": "确定取消订阅并移除已同步的聚合条目吗？",
@@ -1160,7 +1121,6 @@
   "dist.feed_verify_bar": "在线端点快速核验",
   "dist.follows_preview": "预览已同步动态",
   "dist.wh_last_err": "异常",
-
   "sys.asset_cdn_hint": "模板：<prefix>/themes/<theme>/assets/<file>?v=<hash>。留空走当前域名；可填外部回源 CDN（如 https://static.example.com）或本地路径前缀（如 /cdn-assets）",
   "sys.asset_cdn_prefix": "本站主题静态资源前缀（可选）",
   "sys.vendor_cdn_hint": "模板：<prefix>/<pkg>@<ver>/dist/...（后端统一注入并自动多源容灾）。可一键选公共 npm CDN，或填自建目录（如 /uploads/vendor）",
@@ -1185,17 +1145,14 @@
   "sys.legacy_preview_badge": "预演报告（未写入数据库）",
   "sys.reauth_pwd_ph": "输入当前登录密码以确认敏感操作",
   "sys.reauth_pwd_required": "修改邮箱、密码或关闭两步验证前，请先输入当前登录密码",
-
   "nav.logs": "运行日志",
   "mode.auto_desc": "07:00–19:00 浅色，其余深色",
   "mode.system_desc": "自动同步操作系统外观",
   "mode.light_desc": "始终使用温润纸感浅色",
   "mode.dark_desc": "始终使用静谧炭灰深色",
-
   "ui.token_count": "已添加 {count} 项",
   "ui.token_clear": "清空",
   "ui.token_placeholder": "输入后按回车或逗号添加，支持批量粘贴…",
-
   "app.theme_mobile_badge": "手机端启用",
   "app.theme_activate_mobile": "设为手机主题",
   "app.mobile_follow_desktop": "跟随桌面主题",
@@ -1205,9 +1162,7 @@
   "app.nav_slot_more": "更多菜单",
   "app.move_up": "上移",
   "app.move_down": "下移",
-
   "dist.nav_theme_order": "顶部菜单显示与排序",
-
   "sys.enable_license_notice": "展示文章底部版权声明",
   "sys.license_vars_hint": "支持占位变量：{site} {author} {title} {url} {date}",
   "sys.enable_footer_html": "启用页脚备案与自定义 HTML",
@@ -1221,14 +1176,12 @@
   "sys.logs_clear": "清空缓冲",
   "sys.logs_clear_confirm": "确定清空当前内存中的运行日志缓冲区吗？",
   "sys.logs_empty": "暂无匹配的运行日志记录",
-
   "common.open": "展开",
   "ui.select_search_ph": "筛选选项…",
   "ui.more_actions": "更多操作",
   "ui.select_all_page": "全选本页",
   "ui.pg_total": "共 {total} 项",
   "ui.pg_per_page": "{n} 条/页",
-
   "ov.chart_others": "其他",
   "art.search_ph": "搜索标题或路径别名…",
   "art.vis_all": "全部可见性",
@@ -1241,9 +1194,7 @@
   "art.tag_pool_search_ph": "筛选已有标签…",
   "art.tag_sort_popular": "最常使用",
   "art.tag_sort_az": "A–Z",
-
   "ed.qi_search_books": "搜索书名或作者…",
-
   "cnt.cat_name": "分类名称",
   "cnt.series_title": "专栏名称",
   "cnt.tag_sort_count": "排序：关联文章数",
@@ -1256,7 +1207,6 @@
   "cnt.media_sort_size": "排序：体积最大",
   "cnt.media_sort_name": "排序：文件名",
   "cnt.media_uploaded_n": "已成功上传 {count} 个媒体文件！",
-
   "dist.nav_search_ph": "筛选导航名称或链接…",
   "dist.lbl_nav_parent": "上级父菜单",
   "dist.nav_parent_none": "— 顶级菜单项 —",
@@ -1273,7 +1223,6 @@
   "dist.follows_status_err": "同步异常",
   "dist.wh_search_ph": "筛选通道名称或地址…",
   "dist.seo_gh_hint": "在「开源作品展示」标签页统一配置 GitHub 用户名、仓库同步、精选勾选与统计卡片。",
-
   "sys.social_unsaved_hint": "修改社交链接后，请点击下方「保存站点身份配置」以持久化生效。",
   "sys.totp_copy_secret": "复制密钥",
   "sys.sess_kick_others": "下线其他设备",
@@ -1293,7 +1242,6 @@
   "sys.confirm_batch_unban": "确定批量解封选中的 {n} 条 IP/CIDR 规则吗？",
   "sys.geo_search_ph": "筛选规则名称、国家代码或地区…",
   "sys.backup_exporting": "正在导出…",
-
   "app.cfg_export_json": "导出配置 JSON",
   "app.cfg_import_invalid": "导入失败：JSON 格式无效，需为键值对象",
   "app.cfg_import_json": "导入配置 JSON",
@@ -1362,5 +1310,38 @@
   "setup.confirm_password": "确认密码",
   "setup.pwd_mismatch": "两次输入的管理员密码不一致",
   "sys.geo_miss_block": "直接阻断 (Block)",
-  "sys.logs_autoscroll": "自动滚动到底部"
+  "sys.logs_autoscroll": "自动滚动到底部",
+  "auth.oidc_err_already_linked": "该单点登录身份已绑定至其他账号。",
+  "auth.oidc_err_disabled": "单点登录未启用，或当前账号已被禁用。",
+  "auth.oidc_err_forbidden": "该单点登录身份无权登录管理后台。",
+  "auth.oidc_err_generic": "单点登录失败（{reason}）。",
+  "auth.oidc_err_state": "单点登录会话已过期或状态校验失败，请重试。",
+  "auth.oidc_err_unlinked": "该单点登录身份尚未绑定管理账号，请先使用密码登录后在「系统 → 安全认证」中完成绑定。",
+  "sys.clear_saved_secret": "清除已保存密钥",
+  "sys.clear_secret_confirm": "确定立即清除已保存的密钥吗？",
+  "sys.oidc_col_account": "提供商 / 绑定标识",
+  "sys.oidc_confirm_unlink": "确定解除绑定单点登录账号「{name}」吗？",
+  "sys.oidc_empty": "暂未绑定外部单点登录账号",
+  "sys.oidc_link_btn": "绑定 {provider}",
+  "sys.oidc_links_desc": "绑定外部 OIDC 身份提供商账号，以便通过单点登录进入管理控制台。",
+  "sys.oidc_links_title": "已绑定的单点登录账号",
+  "sys.oidc_unlink_btn": "解绑",
+  "sys.stepup_backup_desc": "请输入当前登录密码以签发完整备份下载凭据。",
+  "sys.stepup_pwd_required": "请输入当前登录密码以完成安全确认。",
+  "ui.sort_disabled_filtered": "请先清空搜索或状态筛选条件后再调整排序。",
+  "setup.leg_mode_archive": "上传备份归档 (.zip / .json)",
+  "setup.leg_mode_db": "直连旧数据库迁移",
+  "setup.leg_db_desc": "直接填写旧版 Solo / Bolo / Volo-solo 或已有 Volo-go 数据库连接串，以只读流式方式自动识别表前缀、文章、分类标签、评论与 301 历史固定链接并迁移至新目标数据库，全程不修改旧库数据。",
+  "setup.leg_target_db_head": "1A. 新目标数据库配置（迁入库）",
+  "setup.leg_source_db_head": "1B. 旧源数据库连接信息（只读迁出库）",
+  "setup.leg_source_dsn": "旧数据库 DSN 连接串",
+  "setup.leg_source_dsn_sqlite_ph": "./data/legacy.db",
+  "setup.leg_source_prefix": "旧库表前缀（选填）",
+  "setup.leg_source_prefix_ph": "留空自动探测（如 b3_solo_、solo_ 或原生表）",
+  "setup.leg_test_source_db": "检测旧库与数据量",
+  "setup.leg_source_ok": "已识别 {schema}（{dialect} · 文章 {articles} · 评论 {comments} · 用户 {users}，{ms} ms）",
+  "setup.leg_source_dsn_req": "请先填写旧源数据库 DSN 连接串",
+  "setup.leg_db_migrate_btn": "直连旧数据库并迁移到新库",
+  "setup.leg_db_dryrun_btn": "预演直连迁移校验（Dry-Run 不写库）",
+  "setup.leg_db_migrating": "正在从旧数据库流式直连迁移…"
 }

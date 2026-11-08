@@ -2,6 +2,7 @@ package guest
 
 import (
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -278,11 +279,12 @@ func (pm *PassportManager) readUnlockBundle(r *http.Request, expectedGuestID str
 }
 
 func (pm *PassportManager) computeUnlockMAC(guestID string, articleID string, pwdPlain string, expSec int64) string {
-	pwdHash := sha256.Sum256([]byte(pwdPlain))
 	key := pm.keyRing.GuestPassportKey()
-	mac := hmac.New(sha256.New, key[:])
-	fmt.Fprintf(mac, "volo-unlock:v1:%s:%s:%x:%d", guestID, articleID, pwdHash[:], expSec)
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:16])
+	salt := make([]byte, 0, len(key)+len(guestID)+len(articleID)+48)
+	salt = append(salt, key[:]...)
+	salt = fmt.Appendf(salt, ":volo-unlock:v2:%d:%s:%d:%s:%d", len(guestID), guestID, len(articleID), articleID, expSec)
+	dk, _ := pbkdf2.Key(sha256.New, pwdPlain, salt, 4096, 16)
+	return base64.RawURLEncoding.EncodeToString(dk)
 }
 
 func isSafeTokenIdent(s string) bool {

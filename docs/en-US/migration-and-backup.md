@@ -35,9 +35,16 @@ Legacy backups carry historical schema debt (sharded 10KB key-value JSON strings
 ./volo import-legacy /path/to/legacy-backup.zip
 ```
 
-#### Option B: Via Setup Wizard or Admin Console
+#### Option B: Direct Old-DB Connection in Setup Wizard (Zero Manual Export)
 
-- **Fresh Install**: Open `/setup` in your browser and drop your legacy `.zip` archive into the final step of the onboarding wizard;
+- **Fresh Install**: Open `/setup` in your browser and select **1-Click Legacy Migration -> Direct Old DB Migration**:
+  1. Configure your new destination database (`SQLite` / `PostgreSQL` / `MySQL`) in `1A` and enter your legacy source database DSN (`Solo` / `Bolo` / `Volo-solo` or an existing `Volo-go` database) in `1B`;
+  2. Click **Inspect Source DB** — Volo-go connects strictly read-only, auto-detects the schema and table prefix (such as `b3_solo_`, `solo_`, or native Volo-go tables), and reports post, comment, and user counts;
+  3. Optionally run a **Dry-Run** validation first, then stream-migrate directly into the new database with full `301` historical permalink preservation and zero writes to the old database.
+
+#### Option C: Upload Archive via Setup Wizard or Admin Console
+
+- **Fresh Install**: Open `/setup`, choose **Upload Archive (.zip / .json)**, and select your legacy `.zip` or `.json` archive;
 - **Existing Instance**: Upload the archive under **Console -> System & Security -> Backup & Migration -> Legacy Import** to inspect the live transformation summary.
 
 ---

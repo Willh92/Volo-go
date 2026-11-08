@@ -30,10 +30,17 @@
   --volo-syn-num: #245f7d;
   --volo-syn-fn: #5f3d7a;
   --volo-syn-cm: #596c62;
+  --volo-syn-cmt: #596c62;
   --volo-syn-ty: #25686c;
+  --volo-syn-type: #25686c;
+  --volo-syn-attr: #245f7d;
+  --volo-syn-del: #b4362f;
+  --volo-syn-ins: #1b6b43;
   --volo-chart-uv: #2563eb;
+  --volo-chart-uv-on-dark: #93c5fd;
   --volo-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --volo-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --volo-font-mono: var(--volo-mono);
 }
 
 /* 6-Accent Studio Palette (Synchronized with public volo-studio) */
@@ -113,8 +120,14 @@
   --volo-syn-num: #8cc2dd;
   --volo-syn-fn: #c6aad8;
   --volo-syn-cm: #8c9f95;
+  --volo-syn-cmt: #8c9f95;
   --volo-syn-ty: #88c7c9;
+  --volo-syn-type: #88c7c9;
+  --volo-syn-attr: #8cc2dd;
+  --volo-syn-del: #ec929d;
+  --volo-syn-ins: #7fd1a3;
   --volo-chart-uv: #60a5fa;
+  --volo-chart-uv-on-dark: #93c5fd;
 }
 [data-theme="dark"][data-accent="ocean"] {
   --volo-accent: #a2c5dd;
@@ -261,6 +274,7 @@ a {
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
   min-height: 100vh;
+  min-height: 100dvh;
 }
 
 .volo-rail {
@@ -271,6 +285,7 @@ a {
   position: sticky;
   top: 0;
   height: 100vh;
+  height: 100dvh;
   overflow-y: auto;
   border-right: 1px solid rgba(255, 255, 255, 0.06);
   scrollbar-width: thin;
@@ -1535,6 +1550,7 @@ input[type="checkbox"] {
 /* Setup & Auth Centered Card */
 .volo-center-stage {
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1727,6 +1743,18 @@ input[type="checkbox"] {
   padding-bottom: 12px;
   border-bottom: 1px solid var(--volo-line);
   flex-shrink: 0;
+}
+
+.volo-modal-head > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.volo-modal-head .volo-card-title,
+.volo-modal-head .volo-sec-desc {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .volo-modal-close {
@@ -2155,6 +2183,7 @@ input[type="checkbox"] {
 }
 
 .volo-log-viewer {
+  color-scheme: dark;
   background: #1b2021;
   color: #d6dfda;
   border: 1px solid #3c4945;
@@ -2165,6 +2194,45 @@ input[type="checkbox"] {
   font-family: var(--volo-mono);
   font-size: 12px;
   line-height: 1.62;
+  scrollbar-width: thin;
+  scrollbar-color: #3d484b #1b2021;
+}
+
+.volo-log-viewer::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.volo-log-viewer::-webkit-scrollbar-track {
+  background: #1b2021;
+}
+
+.volo-log-viewer::-webkit-scrollbar-thumb {
+  background: #3d484b;
+  border-radius: 999px;
+}
+
+.volo-log-viewer .volo-log-empty {
+  color: #9fb0ad;
+  padding: 18px 8px;
+  text-align: center;
+}
+
+.volo-log-viewer .volo-log-chip {
+  background: #273032;
+  color: #d7e0de;
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.volo-log-viewer .volo-log-chip b {
+  color: #f0f5f4;
+}
+
+.volo-log-viewer .volo-log-chip.active,
+.volo-log-viewer .volo-log-chip:focus-visible {
+  border-color: #6bc4a6;
+  box-shadow: 0 0 0 2px rgba(107, 196, 166, 0.36);
+  outline: none;
 }
 
 .volo-log-row {
@@ -2595,6 +2663,7 @@ input[type="checkbox"] {
 .volo-studio-editor.is-fullscreen .volo-preview-pane,
 .volo-studio-editor.is-fullscreen .volo-wysiwyg-surface {
   height: calc(100vh - 84px);
+  height: calc(100dvh - 84px);
 }
 
 .volo-studio-editor .volo-cm-host.is-ir-mode .cm-editor {
@@ -2776,34 +2845,34 @@ input[type="checkbox"] {
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) :is(.chroma .k, .chroma .kc, .chroma .kd, .chroma .kn, .chroma .kp, .chroma .kr, .chroma .ow) {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) :is(.k, .kc, .kd, .kn, .kp, .kr, .ow) {
   color: var(--volo-syn-kw);
   font-weight: 600;
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) :is(.chroma .kt, .chroma .nc, .chroma .nn, .chroma .ni, .chroma .ne) {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) :is(.kt, .nc, .nn, .ni, .ne) {
   color: var(--volo-syn-type);
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) :is(.chroma .nf, .chroma .fm, .chroma .nb, .chroma .bp) {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) :is(.nf, .fm, .nb, .bp) {
   color: var(--volo-syn-fn);
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) :is(.chroma .s, .chroma .sa, .chroma .sb, .chroma .sc, .chroma .dl, .chroma .sd, .chroma .s2, .chroma .se, .chroma .sh, .chroma .si, .chroma .sx, .chroma .sr, .chroma .s1, .chroma .ss) {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) :is(.s, .sa, .sb, .sc, .dl, .sd, .s2, .se, .sh, .si, .sx, .sr, .s1, .ss) {
   color: var(--volo-syn-str);
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) :is(.chroma .m, .chroma .mb, .chroma .mf, .chroma .mh, .chroma .mi, .chroma .il, .chroma .mo) {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) :is(.m, .mb, .mf, .mh, .mi, .il, .mo) {
   color: var(--volo-syn-num);
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) :is(.chroma .c, .chroma .ch, .chroma .cm, .chroma .c1, .chroma .cs, .chroma .cp, .chroma .cpf) {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) :is(.c, .ch, .cm, .c1, .cs, .cp, .cpf) {
   color: var(--volo-syn-cmt);
   font-style: italic;
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) :is(.chroma .na, .chroma .nt, .chroma .nv, .chroma .vc, .chroma .vg, .chroma .vi, .chroma .vm, .chroma .nd) {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) :is(.na, .nt, .nv, .vc, .vg, .vi, .vm, .nd) {
   color: var(--volo-syn-attr);
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) .chroma .gd {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) .gd {
   color: var(--volo-syn-del);
   background: color-mix(in srgb, var(--volo-syn-del) 12%, transparent);
 }
-:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose) .chroma .gi {
+:is(:is(.volo-wysiwyg-surface, .volo-preview-pane, .volo-preview-prose, .volo-cm-host, .volo-css-cm-host) .chroma, .volo-cm-host.chroma, .volo-css-cm-host.chroma) .gi {
   color: var(--volo-syn-ins);
   background: color-mix(in srgb, var(--volo-syn-ins) 12%, transparent);
 }
@@ -3468,6 +3537,7 @@ input[type="checkbox"] {
 /* 1. Legacy Two-Column Login Page (`start.ftl` + `account.scss` parity) */
 .volo-auth-page {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   grid-template-rows: auto 1fr auto;
   background: var(--volo-bg);
@@ -5086,6 +5156,110 @@ html[data-theme="dark"] .volo-auth-story {
   border-radius: 8px;
   border: 1px solid var(--volo-line);
   background: var(--volo-surface);
+}
+
+.volo-mono {
+  font-family: var(--volo-font-mono);
+}
+
+.volo-skel-line {
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--volo-raised) 25%, var(--volo-line) 50%, var(--volo-raised) 75%);
+  background-size: 200% 100%;
+  animation: volo-shimmer 1.2s ease-in-out infinite;
+}
+
+.volo-draft-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: var(--volo-radius-sm);
+  border: 1px solid color-mix(in srgb, var(--volo-warn) 42%, var(--volo-line));
+  background: color-mix(in srgb, var(--volo-warn) 10%, var(--volo-surface));
+  color: var(--volo-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.volo-draft-banner > span {
+  min-width: 0;
+  flex: 1 1 220px;
+  overflow-wrap: anywhere;
+}
+
+.volo-wrap-anywhere,
+.volo-inspector-title,
+.volo-about-kv span,
+.volo-media-name,
+.volo-media-picker-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.volo-code-chip.is-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 100%;
+}
+
+.volo-role-select-wrap {
+  max-width: 180px;
+}
+
+.volo-plugin-status-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+}
+
+.volo-chap-indent {
+  padding-left: calc(8px + var(--chap-depth, 0) * 20px);
+}
+
+@media (max-width: 768px) {
+  .volo-table .volo-skel-tr:nth-child(n + 4) {
+    display: none !important;
+  }
+
+  .volo-table .volo-skel-tr {
+    padding: 8px 12px !important;
+    gap: 6px !important;
+  }
+
+  .volo-table .volo-skel-tr td {
+    min-height: 0 !important;
+    padding: 2px 0 !important;
+  }
+
+  .volo-table .volo-skel-tr td::before {
+    display: none !important;
+  }
+
+  .volo-table td.is-empty-act {
+    display: none !important;
+  }
+
+  .volo-role-select-wrap {
+    max-width: 100%;
+    width: 100%;
+  }
+
+  .volo-plugin-status-stack {
+    align-items: flex-end;
+    text-align: right;
+  }
+}
+
+@media (max-width: 600px) {
+  .volo-chap-indent {
+    padding-left: min(calc(8px + var(--chap-depth, 0) * 10px), 34px);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -18,10 +18,25 @@
 
     {{if eq .TaxonomyKind "categories"}}
       {{if .Categories}}
-        <div class="studio-article studio-card-pad">
+        <div class="studio-article studio-card-pad" data-collection-root="categories">
+          <div class="studio-collection-toolbar studio-collection-toolbar--inline">
+            <div class="studio-collection-search-wrap">
+              <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.categories"}}" autocomplete="off">
+              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{len .Categories}}">{{len .Categories}}</span>
+            </div>
+            {{if gt (len .Categories) 1}}
+              <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.categories"}}">
+                {{range $i, $c := .Categories}}
+                  {{if lt $i 18}}
+                    <a class="studio-jump-pill" href="#cat-card-{{$c.Slug}}">{{$c.Name}} <small>{{$c.ArticleCount}}</small></a>
+                  {{end}}
+                {{end}}
+              </nav>
+            {{end}}
+          </div>
           <div class="bookshelf-grid">
             {{range .Categories}}
-              <a class="book-card studio-tax-card" href="/categories/{{.Slug}}">
+              <a id="cat-card-{{.Slug}}" class="book-card studio-tax-card" href="/categories/{{.Slug}}" data-collection-item="{{lower .Name}} {{lower .Slug}} {{lower .Description}}">
                 <div class="studio-tax-card__head">
                   <strong>{{.Name}}</strong>
                   <span class="volo-badge">{{.ArticleCount}}</span>
@@ -30,22 +45,30 @@
               </a>
             {{end}}
           </div>
+          <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
         </div>
       {{else}}
         {{template "empty_state" (dict "Title" (t .Locale "studio.empty_categories_title") "Desc" (t .Locale "studio.empty_categories_desc"))}}
       {{end}}
     {{else if eq .TaxonomyKind "tags"}}
       {{if or .Tags .TagQuery}}
+        {{$shownTagLen := len .Tags}}
+        {{$totalTagLen := $shownTagLen}}
+        {{if gt .Pagination.TotalItems $totalTagLen}}{{$totalTagLen = .Pagination.TotalItems}}{{end}}
         <div class="studio-article studio-card-pad">
           <div class="studio-tax-toolbar">
             <form class="studio-tax-search" method="get" action="/tags">
               {{if .TagSort}}<input type="hidden" name="sort" value="{{.TagSort}}">{{end}}
               <input class="volo-input studio-tax-search__input js-tag-filter-input" type="search" name="q" value="{{.TagQuery}}" placeholder="{{if hasPrefix .Locale "en"}}Filter tags…{{else if eq .Locale "zh-TW"}}篩選標籤…{{else}}筛选标签…{{end}}" aria-label="{{t .Locale "nav.tags"}}" autocomplete="off">
+              <a class="studio-icon-btn studio-tag-clear js-tag-filter-clear" href="/tags{{if .TagSort}}?sort={{urlquery .TagSort}}{{end}}" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}">✕ <span>{{t .Locale "studio.clear_filter"}}</span></a>
             </form>
-            <div class="studio-tax-sort" role="group" aria-label="Sort">
-              {{$isNameSort := eq .TagSort "name"}}
-              <a class="studio-sort-pill {{if not $isNameSort}}is-active{{end}}" href="/tags?sort=popular{{if .TagQuery}}&q={{urlquery .TagQuery}}{{end}}">{{if hasPrefix .Locale "en"}}Popular{{else if eq .Locale "zh-TW"}}熱門{{else}}热门{{end}}</a>
-              <a class="studio-sort-pill {{if $isNameSort}}is-active{{end}}" href="/tags?sort=name{{if .TagQuery}}&q={{urlquery .TagQuery}}{{end}}">A–Z</a>
+            <div class="studio-tax-toolbar__right">
+              <span class="volo-badge studio-tag-count js-tag-filter-count" data-page-count="{{$shownTagLen}}" data-total-count="{{$totalTagLen}}">{{if and (gt $totalTagLen $shownTagLen) (not .TagQuery)}}{{$shownTagLen}} / {{$totalTagLen}}{{else}}{{$shownTagLen}}{{end}}</span>
+              <div class="studio-tax-sort" role="group" aria-label="Sort">
+                {{$isNameSort := eq .TagSort "name"}}
+                <a class="studio-sort-pill {{if not $isNameSort}}is-active{{end}}" href="/tags?sort=popular{{if .TagQuery}}&q={{urlquery .TagQuery}}{{end}}">{{if hasPrefix .Locale "en"}}Popular{{else if eq .Locale "zh-TW"}}熱門{{else}}热门{{end}}</a>
+                <a class="studio-sort-pill {{if $isNameSort}}is-active{{end}}" href="/tags?sort=name{{if .TagQuery}}&q={{urlquery .TagQuery}}{{end}}">A–Z</a>
+              </div>
             </div>
           </div>
           {{if .Tags}}
@@ -123,15 +146,31 @@
       {{end}}
     {{else if eq .TaxonomyKind "series"}}
       {{if .SeriesList}}
-        <div class="studio-article studio-card-pad">
+        <div class="studio-article studio-card-pad" data-collection-root="series">
+          <div class="studio-collection-toolbar studio-collection-toolbar--inline">
+            <div class="studio-collection-search-wrap">
+              <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{.HeroTitle}}" autocomplete="off">
+              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{len .SeriesList}}">{{len .SeriesList}}</span>
+            </div>
+            {{if gt (len .SeriesList) 1}}
+              <nav class="studio-jump-pills" aria-label="{{.HeroTitle}}">
+                {{range $i, $s := .SeriesList}}
+                  {{if lt $i 18}}
+                    <a class="studio-jump-pill" href="#series-card-{{$s.Slug}}">{{$s.Title}}</a>
+                  {{end}}
+                {{end}}
+              </nav>
+            {{end}}
+          </div>
           <div class="bookshelf-grid">
             {{range .SeriesList}}
-              <a class="book-card studio-tax-card" href="/series/{{.Slug}}">
+              <a id="series-card-{{.Slug}}" class="book-card studio-tax-card" href="/series/{{.Slug}}" data-collection-item="{{lower .Title}} {{lower .Slug}} {{lower .Description}}">
                 <strong>{{.Title}}</strong>
                 {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
               </a>
             {{end}}
           </div>
+          <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
         </div>
       {{else}}
         {{template "empty_state" (dict "Title" (t .Locale "studio.empty_series_title") "Desc" (t .Locale "studio.empty_series_desc"))}}

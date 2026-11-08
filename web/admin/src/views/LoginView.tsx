@@ -21,17 +21,57 @@ interface OidcProviderItem {
   start_url: string;
 }
 
-export function LoginView() {
+export function formatOidcError(rawError: string): string {
+  const code = String(rawError || "").trim();
+  if (!code) return "";
+  const low = code.toLowerCase();
+  if (low.includes("unlinked") || low.includes("not_linked") || low.includes("no_account")) {
+    return t("auth.oidc_err_unlinked");
+  }
+  if (low.includes("already_linked") || low.includes("conflict")) {
+    return t("auth.oidc_err_already_linked");
+  }
+  if (low.includes("disabled") || low.includes("banned")) {
+    return t("auth.oidc_err_disabled");
+  }
+  if (low.includes("state") || low.includes("expired")) {
+    return t("auth.oidc_err_state");
+  }
+  if (low.includes("forbidden") || low.includes("not_staff") || low.includes("role")) {
+    return t("auth.oidc_err_forbidden");
+  }
+  return t("auth.oidc_err_generic", { reason: code });
+}
+
+export interface LoginViewProps {
+  initialChallengeToken?: string;
+  initialOidcError?: string;
+}
+
+export function LoginView({ initialChallengeToken = "", initialOidcError = "" }: LoginViewProps = {}) {
   const locales = availableLocalesSig.value;
   const isDark = effectiveDarkSig.value;
   const [ident, setIdent] = useState("");
   const [password, setPassword] = useState("");
   const [showPwd, setShowPwd] = useState(false);
-  const [challengeToken, setChallengeToken] = useState("");
+  const [challengeToken, setChallengeToken] = useState(() => initialChallengeToken.trim());
+  const [oidcErrorCode, setOidcErrorCode] = useState(() => initialOidcError.trim());
   const [totpCode, setTotpCode] = useState("");
   const [rememberDevice, setRememberDevice] = useState(true);
   const [busy, setBusy] = useState(false);
   const [oidcProviders, setOidcProviders] = useState<OidcProviderItem[]>([]);
+
+  useEffect(() => {
+    if (initialChallengeToken.trim()) {
+      setChallengeToken(initialChallengeToken.trim());
+    }
+  }, [initialChallengeToken]);
+
+  useEffect(() => {
+    if (initialOidcError.trim()) {
+      setOidcErrorCode(initialOidcError.trim());
+    }
+  }, [initialOidcError]);
 
   useEffect(() => {
     const nextPath = bootConfig.admin_path || window.location.pathname || "/console";
@@ -48,6 +88,7 @@ export function LoginView() {
 
   const handlePasswordSubmit = async (e: Event) => {
     e.preventDefault();
+    setOidcErrorCode("");
     setBusy(true);
     try {
       const res = await apiFetch<{
@@ -222,6 +263,28 @@ export function LoginView() {
 
               <h2>{t("auth.welcome_title")}</h2>
               <p class="volo-auth-sub">{t("auth.welcome_sub")}</p>
+
+              {oidcErrorCode && (
+                <div
+                  role="alert"
+                  class="volo-draft-banner"
+                  style={{
+                    borderColor: "color-mix(in srgb, var(--volo-danger) 48%, var(--volo-line))",
+                    background: "color-mix(in srgb, var(--volo-danger) 10%, var(--volo-surface))",
+                    color: "var(--volo-danger)",
+                    marginBottom: "14px",
+                  }}
+                >
+                  <span>{formatOidcError(oidcErrorCode)}</span>
+                  <button
+                    type="button"
+                    class="volo-act-btn"
+                    onClick={() => setOidcErrorCode("")}
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
 
               {!challengeToken ? (
                 <form onSubmit={handlePasswordSubmit} autoComplete="off" data-form-type="other">

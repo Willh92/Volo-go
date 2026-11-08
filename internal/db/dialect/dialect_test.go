@@ -141,3 +141,47 @@ func TestDialect_PaginateSQLAndNormalizePage(t *testing.T) {
 		t.Fatalf("mysql PaginateSQL = %q", qMY)
 	}
 }
+
+func TestDialect_UpsertIncrementSQLAcrossThreeDialects(t *testing.T) {
+	sq, _ := dialect.For("sqlite")
+	pg, _ := dialect.For("postgres")
+	my, _ := dialect.For("mysql")
+
+	cols := []string{"stat_date", "pv", "uv", "updated_at"}
+	conflict := []string{"stat_date"}
+	incCols := []string{"pv", "uv"}
+	ovCols := []string{"updated_at"}
+
+	wantSQ := `INSERT INTO "analytics_daily" ("stat_date", "pv", "uv", "updated_at") VALUES (?, ?, ?, ?) ON CONFLICT ("stat_date") DO UPDATE SET "pv" = "analytics_daily"."pv" + EXCLUDED."pv", "uv" = "analytics_daily"."uv" + EXCLUDED."uv", "updated_at" = EXCLUDED."updated_at"`
+	if got := sq.UpsertIncrementSQL("analytics_daily", cols, conflict, incCols, ovCols); got != wantSQ {
+		t.Fatalf("sqlite UpsertIncrementSQL mismatch:\ngot:  %s\nwant: %s", got, wantSQ)
+	}
+
+	wantPG := `INSERT INTO "analytics_daily" ("stat_date", "pv", "uv", "updated_at") VALUES ($1, $2, $3, $4) ON CONFLICT ("stat_date") DO UPDATE SET "pv" = "analytics_daily"."pv" + EXCLUDED."pv", "uv" = "analytics_daily"."uv" + EXCLUDED."uv", "updated_at" = EXCLUDED."updated_at"`
+	if got := pg.UpsertIncrementSQL("analytics_daily", cols, conflict, incCols, ovCols); got != wantPG {
+		t.Fatalf("postgres UpsertIncrementSQL mismatch:\ngot:  %s\nwant: %s", got, wantPG)
+	}
+
+	wantMY := "INSERT INTO `analytics_daily` (`stat_date`, `pv`, `uv`, `updated_at`) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE `pv` = `pv` + VALUES(`pv`), `uv` = `uv` + VALUES(`uv`), `updated_at` = VALUES(`updated_at`)"
+	if got := my.UpsertIncrementSQL("analytics_daily", cols, conflict, incCols, ovCols); got != wantMY {
+		t.Fatalf("mysql UpsertIncrementSQL mismatch:\ngot:  %s\nwant: %s", got, wantMY)
+	}
+
+	// Increment-only (nil overwriteCols)
+	topCols := []string{"stat_date", "kind", "item_key", "hits"}
+	topConflict := []string{"stat_date", "kind", "item_key"}
+	pgTop := pg.UpsertIncrementSQL("analytics_top_items", topCols, topConflict, []string{"hits"}, nil)
+	wantPGTop := `INSERT INTO "analytics_top_items" ("stat_date", "kind", "item_key", "hits") VALUES ($1, $2, $3, $4) ON CONFLICT ("stat_date", "kind", "item_key") DO UPDATE SET "hits" = "analytics_top_items"."hits" + EXCLUDED."hits"`
+	if pgTop != wantPGTop {
+		t.Fatalf("postgres top items UpsertIncrementSQL mismatch:\ngot:  %s\nwant: %s", pgTop, wantPGTop)
+	}
+
+	// No-op fallback when both incCols and overwriteCols are empty
+	if got := sq.UpsertIncrementSQL("article_tags", []string{"article_id", "tag_id"}, []string{"article_id", "tag_id"}, nil, nil); !strings.Contains(got, "DO NOTHING") {
+		t.Fatalf("expected sqlite DO NOTHING fallback, got: %s", got)
+	}
+	if got := my.UpsertIncrementSQL("article_tags", []string{"article_id", "tag_id"}, []string{"article_id", "tag_id"}, nil, nil); !strings.Contains(got, "ON DUPLICATE KEY UPDATE `article_id` = `article_id`") {
+		t.Fatalf("expected mysql anchor fallback, got: %s", got)
+	}
+}
+

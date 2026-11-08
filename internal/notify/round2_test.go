@@ -1,9 +1,13 @@
 package notify
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -140,5 +144,258 @@ func TestDispatcher_WebhookDeliveriesAuditNoDataRevBumpMetaAndBoundedQueue(t *te
 	sent, err := disp.TriggerTestNotifiers(ctx, "en-US")
 	if err != nil || sent != 1 {
 		t.Fatalf("expected TriggerTestNotifiers sent=1 err=nil, got sent=%d err=%v", sent, err)
+	}
+}
+
+func TestMailerRound3_MultiIPFallback_MixedIPFailClosed_IPv4First_And_TLSCtxCancel(t *testing.T) {
+	// 1. Direct unit check on orderAddrsIPv4First: unmaps IPv4-in-IPv6, deduplicates, and orders IPv4 ahead of IPv6.
+	ordered := orderAddrsIPv4First([]netip.Addr{
+		netip.MustParseAddr("2001:db8::1"),
+		netip.MustParseAddr("203.0.113.10"),
+		netip.MustParseAddr("::ffff:203.0.113.10"),
+		netip.MustParseAddr("203.0.113.11"),
+	})
+	if len(ordered) != 3 ||
+		ordered[0].String() != "203.0.113.10" ||
+		ordered[1].String() != "203.0.113.11" ||
+		ordered[2].String() != "2001:db8::1" {
+		t.Fatalf("unexpected orderAddrsIPv4First result: %v", ordered)
+	}
+
+	// 2. Mixed public + private DNS answer MUST fail closed before dialing in both tls and starttls modes!
+	// Put globally routable 8.8.8.8 FIRST and RFC1918 192.168.1.5 SECOND so index-0-only checks would have missed it.
+	for _, secMode := range []string{"tls", "starttls"} {
+		m := NewMailer()
+		m.resolver = func(_ context.Context, _ string) ([]netip.Addr, error) {
+			return []netip.Addr{
+				netip.MustParseAddr("8.8.8.8"),
+				netip.MustParseAddr("192.168.1.5"),
+			}, nil
+		}
+		dialed := false
+		m.dialFn = func(_ context.Context, _, _ string) (net.Conn, error) {
+			dialed = true
+			return nil, errors.New("unexpected dial")
+		}
+		err := m.Send(context.Background(), domain.NotificationsSettings{
+			SMTPEnabled:   true,
+			SMTPHost:      "mixed.smtp.example",
+			SMTPPort:      465,
+			SMTPSecurity:  secMode,
+			SMTPFromEmail: "noreply@example.com",
+		}, "", MailMessage{
+			To:       "reader@example.com",
+			Subject:  "Mixed DNS test",
+			TextBody: "Hello",
+		})
+		if err == nil || !strings.Contains(err.Error(), "192.168.1.5") || !strings.Contains(err.Error(), "refuses non-public IP") {
+			t.Fatalf("mode %s: expected fail-closed non-public IP rejection for 192.168.1.5, got %v", secMode, err)
+		}
+		if dialed {
+			t.Fatalf("mode %s: dialFn must not be invoked when DNS contains mixed non-public IP", secMode)
+		}
+	}
+
+	// 3. Mixed loopback + public DNS answer MUST fail closed before dialing in plain_internal mode!
+	{
+		m := NewMailer()
+		m.resolver = func(_ context.Context, _ string) ([]netip.Addr, error) {
+			return []netip.Addr{
+				netip.MustParseAddr("127.0.0.1"),
+				netip.MustParseAddr("1.1.1.1"),
+			}, nil
+		}
+		dialed := false
+		m.dialFn = func(_ context.Context, _, _ string) (net.Conn, error) {
+			dialed = true
+			return nil, errors.New("unexpected dial")
+		}
+		err := m.Send(context.Background(), domain.NotificationsSettings{
+			SMTPEnabled:   true,
+			SMTPHost:      "internal-mixed.local",
+			SMTPPort:      25,
+			SMTPSecurity:  "plain_internal",
+			SMTPFromEmail: "noreply@example.com",
+		}, "", MailMessage{
+			To:       "reader@example.com",
+			Subject:  "Mixed internal DNS test",
+			TextBody: "Hello",
+		})
+		if err == nil || !strings.Contains(err.Error(), "1.1.1.1") || !strings.Contains(err.Error(), "refuses public IP") {
+			t.Fatalf("plain_internal: expected fail-closed public IP rejection for 1.1.1.1, got %v", err)
+		}
+		if dialed {
+			t.Fatalf("plain_internal: dialFn must not be invoked when DNS contains mixed public IP")
+		}
+	}
+
+	// 4. Multi-IP fallback + IPv4-first preference:
+	// DNS returns [::1, 127.0.0.2, 127.0.0.1]; 127.0.0.2 is tried ahead of ::1, fails, and falls back to 127.0.0.1!
+	{
+		m := NewMailer()
+		m.resolver = func(_ context.Context, _ string) ([]netip.Addr, error) {
+			return []netip.Addr{
+				netip.MustParseAddr("::1"),
+				netip.MustParseAddr("127.0.0.2"),
+				netip.MustParseAddr("127.0.0.1"),
+			}, nil
+		}
+		var (
+			mu       sync.Mutex
+			attempts []string
+			gotMIME  strings.Builder
+		)
+		m.dialFn = func(_ context.Context, _, addr string) (net.Conn, error) {
+			mu.Lock()
+			attempts = append(attempts, addr)
+			mu.Unlock()
+			if addr == "127.0.0.2:2525" {
+				return nil, errors.New("connection refused on primary IPv4")
+			}
+			if addr != "127.0.0.1:2525" {
+				return nil, errors.New("unexpected address " + addr)
+			}
+			clientConn, serverConn := net.Pipe()
+			go func() {
+				defer serverConn.Close()
+				_, _ = serverConn.Write([]byte("220 relay.internal ESMTP ready\r\n"))
+				br := bufio.NewReader(serverConn)
+				inData := false
+				for {
+					line, rErr := br.ReadString('\n')
+					if rErr != nil {
+						return
+					}
+					if inData {
+						if strings.TrimRight(line, "\r\n") == "." {
+							inData = false
+							_, _ = serverConn.Write([]byte("250 2.0.0 Queued\r\n"))
+							continue
+						}
+						mu.Lock()
+						gotMIME.WriteString(line)
+						mu.Unlock()
+						continue
+					}
+					upper := strings.ToUpper(strings.TrimSpace(line))
+					switch {
+					case strings.HasPrefix(upper, "EHLO"), strings.HasPrefix(upper, "HELO"):
+						_, _ = serverConn.Write([]byte("250-relay.internal\r\n250 8BITMIME\r\n"))
+					case strings.HasPrefix(upper, "MAIL FROM:"):
+						_, _ = serverConn.Write([]byte("250 2.1.0 OK\r\n"))
+					case strings.HasPrefix(upper, "RCPT TO:"):
+						_, _ = serverConn.Write([]byte("250 2.1.5 OK\r\n"))
+					case upper == "DATA":
+						inData = true
+						_, _ = serverConn.Write([]byte("354 End data with <CR><LF>.<CR><LF>\r\n"))
+					case upper == "QUIT":
+						_, _ = serverConn.Write([]byte("221 2.0.0 Bye\r\n"))
+						return
+					default:
+						_, _ = serverConn.Write([]byte("250 OK\r\n"))
+					}
+				}
+			}()
+			return clientConn, nil
+		}
+
+		err := m.Send(context.Background(), domain.NotificationsSettings{
+			SMTPEnabled:   true,
+			SMTPHost:      "relay.internal",
+			SMTPPort:      2525,
+			SMTPSecurity:  "plain_internal",
+			SMTPFromEmail: "noreply@example.com",
+			SMTPFromName:  "Volo Notify",
+		}, "", MailMessage{
+			To:       "admin@example.com",
+			Subject:  "Fallback Delivery",
+			TextBody: "Delivered on secondary IPv4!",
+		})
+		if err != nil {
+			t.Fatalf("expected multi-IP fallback SMTP send to succeed, got %v", err)
+		}
+		mu.Lock()
+		gotAttempts := append([]string(nil), attempts...)
+		mimeStr := gotMIME.String()
+		mu.Unlock()
+		if len(gotAttempts) != 2 || gotAttempts[0] != "127.0.0.2:2525" || gotAttempts[1] != "127.0.0.1:2525" {
+			t.Fatalf("expected IPv4-first fallback attempts [127.0.0.2:2525 127.0.0.1:2525], got %v", gotAttempts)
+		}
+		if !strings.Contains(mimeStr, "Delivered on secondary IPv4!") {
+			t.Fatalf("expected delivered MIME body on secondary IPv4, got %q", mimeStr)
+		}
+	}
+
+	// 5. Context cancellation in implicit "tls" mode aborts immediately without hanging on dialTimeout!
+	{
+		m := NewMailer()
+		m.dialTimeout = 10 * time.Second
+		m.resolver = func(_ context.Context, _ string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		}
+
+		// 5a. Pre-canceled context before dial
+		preCtx, preCancel := context.WithCancel(context.Background())
+		preCancel()
+		start := time.Now()
+		err := m.Send(preCtx, domain.NotificationsSettings{
+			SMTPEnabled:   true,
+			SMTPHost:      "smtp.example.com",
+			SMTPPort:      465,
+			SMTPSecurity:  "tls",
+			SMTPFromEmail: "noreply@example.com",
+		}, "", MailMessage{
+			To:       "reader@example.com",
+			Subject:  "Pre-canceled",
+			TextBody: "Should abort immediately",
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled on pre-canceled tls Send, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("pre-canceled tls Send took too long: %v", elapsed)
+		}
+
+		// 5b. Context timeout during stalled TLS handshake
+		var peerConn net.Conn
+		defer func() {
+			if peerConn != nil {
+				_ = peerConn.Close()
+			}
+		}()
+		m.dialFn = func(_ context.Context, _, _ string) (net.Conn, error) {
+			cConn, sConn := net.Pipe()
+			// Drain client hello bytes asynchronously while keeping server side silent so net.Pipe Write doesn't block without TLS reply.
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					if _, rErr := sConn.Read(buf); rErr != nil {
+						return
+					}
+				}
+			}()
+			peerConn = sConn
+			return cConn, nil
+		}
+		hsCtx, hsCancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+		defer hsCancel()
+		start = time.Now()
+		err = m.Send(hsCtx, domain.NotificationsSettings{
+			SMTPEnabled:   true,
+			SMTPHost:      "smtp.example.com",
+			SMTPPort:      465,
+			SMTPSecurity:  "tls",
+			SMTPFromEmail: "noreply@example.com",
+		}, "", MailMessage{
+			To:       "reader@example.com",
+			Subject:  "Stalled TLS Handshake",
+			TextBody: "Should honor context deadline",
+		})
+		if !errors.Is(err, context.DeadlineExceeded) && (err == nil || !strings.Contains(err.Error(), "i/o timeout") && !strings.Contains(err.Error(), "context deadline exceeded")) {
+			t.Fatalf("expected context deadline / timeout on stalled TLS handshake, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("stalled TLS handshake ignored context deadline (%v)", elapsed)
+		}
 	}
 }

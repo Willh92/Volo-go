@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,37 +22,43 @@ import (
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/pkg/id"
+	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
 const (
 	oidcStateCookieName = "__volo_oidc_state"
-	oidcStateAAD        = "oidc.state.v1"
+	oidcStateAAD        = "oidc.state.v2"
 	oidcStateTTL        = 10 * time.Minute
 )
 
-var oidcUsernameSanitizeRe = regexp.MustCompile(`[^a-z0-9_-]+`)
+var (
+	oidcUsernameSanitizeRe = regexp.MustCompile(`[^a-z0-9_-]+`)
+	safeRelativeRedirectRe = regexp.MustCompile(`^/[A-Za-z0-9/_~.%?=&+#:-]*$`)
+)
 
 type oidcSealedState struct {
-	Nonce     string `json:"nonce"`
-	Provider  string `json:"provider"`
-	Target    string `json:"target"`
-	Next      string `json:"next"`
-	ExpiresAt int64  `json:"expires_at"`
+	State        string `json:"state"`
+	OIDCNonce    string `json:"oidc_nonce"`
+	CodeVerifier string `json:"code_verifier"`
+	Provider     string `json:"provider"`
+	Target       string `json:"target"`
+	Next         string `json:"next"`
+	BindUserID   string `json:"bind_user_id,omitempty"`
+	ExpiresAt    int64  `json:"expires_at"`
 }
 
-func isSafeRelativeRedirect(cand string) bool {
-	if cand == "" {
+func isLocalUrl(cand string) bool {
+	if cand == "" || len(cand) > 2048 {
 		return false
 	}
 	if !strings.HasPrefix(cand, "/") || strings.HasPrefix(cand, "//") || strings.HasPrefix(cand, `/\`) {
 		return false
 	}
-	for i := 0; i < len(cand); i++ {
-		if cand[i] <= 0x1F || cand[i] == 0x7F {
-			return false
-		}
-	}
-	return true
+	return safeRelativeRedirectRe.MatchString(cand)
+}
+
+func isSafeRelativeRedirect(cand string) bool {
+	return isLocalUrl(cand)
 }
 
 func (s *AppServer) adminMountPath() string {
@@ -63,12 +72,82 @@ func (s *AppServer) adminMountPath() string {
 	return adminPrefix
 }
 
+func (s *AppServer) oidcCallbackURL(r *http.Request, providerName string) string {
+	base := ""
+	if s.deps.Config != nil {
+		base = normalizeTrustedBaseURL(s.deps.Config.GetPublicURL())
+	}
+	if base == "" {
+		base = s.publicBaseURL(r)
+	}
+	return base + "/api/v1/auth/oidc/" + url.PathEscape(providerName) + "/callback"
+}
+
+func (s *AppServer) redirectOIDCError(w http.ResponseWriter, r *http.Request, target, next, code string) {
+	if code == "" {
+		code = "state"
+	}
+	if target == "admin" || target == "bind" {
+		http.Redirect(w, r, s.adminMountPath()+"?oidc_error="+url.QueryEscape(code), http.StatusFound)
+		return
+	}
+	q := url.Values{}
+	q.Set("error", code)
+	if trimmed := strings.TrimSpace(next); isSafeRelativeRedirect(trimmed) && trimmed != "/" && trimmed != "/reader/login" && trimmed != "/reader/register" {
+		q.Set("next", trimmed)
+	}
+	http.Redirect(w, r, "/reader/login?"+q.Encode(), http.StatusFound)
+}
+
+func (s *AppServer) inferOIDCFallbackTarget(r *http.Request) string {
+	if r != nil {
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("target"))) {
+		case "admin", "bind":
+			return "admin"
+		}
+		if viewer, _ := s.resolveViewer(r); viewer != nil && (viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor) {
+			return "admin"
+		}
+	}
+	return "reader"
+}
+
+func formatOIDCCredentialName(providerName, normEmail, subject string) string {
+	label := strings.TrimSpace(normEmail)
+	if label == "" {
+		label = strings.TrimSpace(subject)
+	}
+	name := strings.TrimSpace(providerName) + " (" + label + ")"
+	if runes := []rune(name); len(runes) > 120 {
+		name = string(runes[:120])
+	}
+	return name
+}
+
+func (s *AppServer) insertOIDCCredential(ctx context.Context, userID, credKey, credName string, now int64) (string, error) {
+	credID := id.Next()
+	_, err := s.deps.Store.ExecContext(ctx,
+		`INSERT INTO user_credentials (
+			id, user_id, kind, name, credential_id, public_key_spki,
+			cose_alg, sign_count, secret_ciphertext, meta_json, last_used_at, created_at
+		) VALUES (?, ?, 'oidc', ?, ?, '', 0, 0, '', '{}', ?, ?)`,
+		credID, userID, credName, credKey, now, now,
+	)
+	if err != nil {
+		return "", err
+	}
+	return credID, nil
+}
+
 func (s *AppServer) buildOIDCStartURL(providerName, target, next string) string {
 	u := "/api/v1/auth/oidc/" + url.PathEscape(providerName) + "/start"
 	q := url.Values{}
-	if target == "admin" {
+	switch target {
+	case "admin":
 		q.Set("target", "admin")
-	} else {
+	case "bind":
+		q.Set("target", "bind")
+	default:
 		q.Set("target", "reader")
 	}
 	if isSafeRelativeRedirect(next) {
@@ -85,7 +164,7 @@ func (s *AppServer) listOIDCProviderViews(locale, target, next string) []theme.O
 		return []theme.OIDCProviderView{}
 	}
 	normTarget := strings.ToLower(strings.TrimSpace(target))
-	if normTarget != "admin" {
+	if normTarget != "admin" && normTarget != "bind" {
 		normTarget = "reader"
 	}
 	safeNext := ""
@@ -123,8 +202,8 @@ func (s *AppServer) handleOIDCAuthRoutes(w http.ResponseWriter, r *http.Request)
 	sub := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/auth/oidc"), "/")
 	if sub == "providers" {
 		rawTarget := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("target")))
-		if rawTarget != "" && rawTarget != "admin" && rawTarget != "reader" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target must be admin or reader"})
+		if rawTarget != "" && rawTarget != "admin" && rawTarget != "reader" && rawTarget != "bind" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target must be admin, reader, or bind"})
 			return
 		}
 		if rawTarget == "" {
@@ -168,12 +247,6 @@ func (s *AppServer) handleOIDCStart(w http.ResponseWriter, r *http.Request, prov
 		http.NotFound(w, r)
 		return
 	}
-	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
-	if s.deps.WAF != nil && !s.deps.WAF.AllowRate("oidc_start", clientIP, 20, 5*time.Minute) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.rate_limited")})
-		return
-	}
-
 	p, ok := s.deps.Plugins.Providers().OIDC(providerName)
 	if !ok || p == nil {
 		http.NotFound(w, r)
@@ -184,57 +257,106 @@ func (s *AppServer) handleOIDCStart(w http.ResponseWriter, r *http.Request, prov
 	if target == "" {
 		target = "reader"
 	}
-	if target != "admin" && target != "reader" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target must be admin or reader"})
+	if target != "admin" && target != "reader" && target != "bind" {
+		s.redirectOIDCError(w, r, "reader", "", "state")
 		return
 	}
 
 	rawNext := strings.TrimSpace(r.URL.Query().Get("next"))
 	if rawNext != "" && !isSafeRelativeRedirect(rawNext) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid next redirect path"})
+		s.redirectOIDCError(w, r, target, "", "invalid_redirect")
 		return
 	}
+
+	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+	if s.deps.WAF != nil && !s.deps.WAF.AllowRate("oidc_start", clientIP, 20, 5*time.Minute) {
+		s.redirectOIDCError(w, r, target, rawNext, "rate_limited")
+		return
+	}
+
+	bindUserID := ""
+	if target == "bind" {
+		actor, sess := s.resolveViewer(r)
+		if actor == nil || sess == nil || actor.Status != domain.UserStatusActive || (actor.Role != domain.RoleAdmin && actor.Role != domain.RoleEditor) {
+			s.redirectOIDCError(w, r, "bind", "", "forbidden")
+			return
+		}
+		bindUserID = actor.ID
+	}
+
 	if rawNext == "" {
-		if target == "admin" {
+		if target == "admin" || target == "bind" {
 			rawNext = s.adminMountPath()
 		} else {
 			rawNext = "/"
 		}
 	}
 
-	var nonceBytes [24]byte
-	if _, err := rand.Read(nonceBytes[:]); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate state nonce"})
+	var (
+		stateBytes    [24]byte
+		nonceBytes    [16]byte
+		verifierBytes [32]byte
+	)
+	if _, err := rand.Read(stateBytes[:]); err != nil {
+		s.redirectOIDCError(w, r, target, rawNext, "state")
 		return
 	}
-	nonce := hex.EncodeToString(nonceBytes[:])
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		s.redirectOIDCError(w, r, target, rawNext, "state")
+		return
+	}
+	if _, err := rand.Read(verifierBytes[:]); err != nil {
+		s.redirectOIDCError(w, r, target, rawNext, "state")
+		return
+	}
+
+	stateHex := hex.EncodeToString(stateBytes[:])
+	oidcNonce := hex.EncodeToString(nonceBytes[:])
+	codeVerifier := base64.RawURLEncoding.EncodeToString(verifierBytes[:])
+	challengeSum := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(challengeSum[:])
+
 	stateObj := oidcSealedState{
-		Nonce:     nonce,
-		Provider:  providerName,
-		Target:    target,
-		Next:      rawNext,
-		ExpiresAt: time.Now().Add(oidcStateTTL).UnixMilli(),
+		State:        stateHex,
+		OIDCNonce:    oidcNonce,
+		CodeVerifier: codeVerifier,
+		Provider:     providerName,
+		Target:       target,
+		Next:         rawNext,
+		BindUserID:   bindUserID,
+		ExpiresAt:    time.Now().Add(oidcStateTTL).UnixMilli(),
 	}
 	rawStateJSON, err := json.Marshal(stateObj)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode state"})
+		s.redirectOIDCError(w, r, target, rawNext, "state")
 		return
 	}
 	sealedState, err := s.deps.Config.KeyRing.SealString(string(rawStateJSON), oidcStateAAD)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to seal state"})
+		s.redirectOIDCError(w, r, target, rawNext, "state")
 		return
 	}
 
-	callbackURL := s.publicBaseURL(r) + "/api/v1/auth/oidc/" + url.PathEscape(providerName) + "/callback"
-	authURL, err := p.AuthCodeURL(nonce, callbackURL)
+	callbackURL := s.oidcCallbackURL(r, providerName)
+	var authURL string
+	if adv, ok := p.(plugin.OIDCAdvancedProvider); ok {
+		authURL, err = adv.AuthCodeURLWithParams(plugin.OIDCAuthParams{
+			State:               stateHex,
+			RedirectURI:         callbackURL,
+			Nonce:               oidcNonce,
+			CodeChallenge:       codeChallenge,
+			CodeChallengeMethod: "S256",
+		})
+	} else {
+		authURL, err = p.AuthCodeURL(stateHex, callbackURL)
+	}
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "oidc provider error"})
+		s.redirectOIDCError(w, r, target, rawNext, "provider_error")
 		return
 	}
 	parsedAuth, uErr := url.Parse(strings.TrimSpace(authURL))
 	if uErr != nil || (parsedAuth.Scheme != "https" && parsedAuth.Scheme != "http") || strings.TrimSpace(parsedAuth.Host) == "" {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid authorization URL returned by provider"})
+		s.redirectOIDCError(w, r, target, rawNext, "provider_error")
 		return
 	}
 
@@ -272,119 +394,277 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 
+	fallbackTarget := s.inferOIDCFallbackTarget(r)
 	stateCookie, err := r.Cookie(oidcStateCookieName)
 	if err != nil || strings.TrimSpace(stateCookie.Value) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing oidc state cookie"})
+		s.redirectOIDCError(w, r, fallbackTarget, "", "state")
 		return
 	}
 	plainState, err := s.deps.Config.KeyRing.OpenString(stateCookie.Value, oidcStateAAD)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid oidc state cookie"})
+		s.redirectOIDCError(w, r, fallbackTarget, "", "state")
 		return
 	}
 	var st oidcSealedState
 	if err := json.Unmarshal([]byte(plainState), &st); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed oidc state"})
+		s.redirectOIDCError(w, r, fallbackTarget, "", "state")
 		return
 	}
-	if time.Now().UnixMilli() > st.ExpiresAt || st.Provider != providerName || st.Nonce == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "oidc state expired or mismatched"})
+	if st.Target != "admin" && st.Target != "reader" && st.Target != "bind" {
+		s.redirectOIDCError(w, r, fallbackTarget, "", "state")
+		return
+	}
+	if time.Now().UnixMilli() > st.ExpiresAt || st.Provider != providerName || st.State == "" || st.OIDCNonce == "" || st.CodeVerifier == "" {
+		s.redirectOIDCError(w, r, st.Target, st.Next, "state")
 		return
 	}
 
 	queryState := strings.TrimSpace(r.URL.Query().Get("state"))
-	if queryState == "" || subtle.ConstantTimeCompare([]byte(queryState), []byte(st.Nonce)) != 1 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "oidc state verification failed"})
+	if queryState == "" || subtle.ConstantTimeCompare([]byte(queryState), []byte(st.State)) != 1 {
+		s.redirectOIDCError(w, r, st.Target, st.Next, "state")
+		return
+	}
+	if idpErr := strings.TrimSpace(r.URL.Query().Get("error")); idpErr != "" {
+		s.redirectOIDCError(w, r, st.Target, st.Next, "provider_error")
 		return
 	}
 	code := strings.TrimSpace(r.URL.Query().Get("code"))
 	if code == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing authorization code"})
+		s.redirectOIDCError(w, r, st.Target, st.Next, "state")
 		return
 	}
 
-	callbackURL := s.publicBaseURL(r) + "/api/v1/auth/oidc/" + url.PathEscape(providerName) + "/callback"
-	ident, err := p.Exchange(r.Context(), code, callbackURL)
+	callbackURL := s.oidcCallbackURL(r, providerName)
+	var ident plugin.OIDCIdentity
+	if adv, ok := p.(plugin.OIDCAdvancedProvider); ok {
+		ident, err = adv.ExchangeWithParams(r.Context(), plugin.OIDCExchangeParams{
+			Code:         code,
+			RedirectURI:  callbackURL,
+			Nonce:        st.OIDCNonce,
+			CodeVerifier: st.CodeVerifier,
+		})
+	} else {
+		ident, err = p.Exchange(r.Context(), code, callbackURL)
+	}
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "oidc code exchange failed"})
+		s.redirectOIDCError(w, r, st.Target, st.Next, "exchange_failed")
+		return
+	}
+	if ident.Nonce != "" && subtle.ConstantTimeCompare([]byte(ident.Nonce), []byte(st.OIDCNonce)) != 1 {
+		s.redirectOIDCError(w, r, st.Target, st.Next, "state")
 		return
 	}
 
-	normEmail := strings.ToLower(strings.TrimSpace(ident.Email))
-	if normEmail == "" || !strings.Contains(normEmail, "@") || len(normEmail) > 190 {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "verified email is required from oidc provider"})
+	sub := strings.TrimSpace(ident.Subject)
+	if sub == "" {
+		s.redirectOIDCError(w, r, st.Target, st.Next, "invalid_identity")
 		return
+	}
+	credKey := providerName + ":" + sub
+	normEmail := strings.ToLower(strings.TrimSpace(ident.Email))
+	if normEmail != "" && (!strings.Contains(normEmail, "@") || len(normEmail) > 190) {
+		normEmail = ""
 	}
 
 	dest := st.Next
 	if !isSafeRelativeRedirect(dest) {
-		if st.Target == "admin" {
+		if st.Target == "admin" || st.Target == "bind" {
 			dest = s.adminMountPath()
 		} else {
 			dest = "/"
 		}
 	}
 
-	var matchedUser domain.User
-	switch st.Target {
-	case "admin":
-		u, qErr := sqlx.Get[domain.User](
-			r.Context(), s.deps.Store,
-			`SELECT * FROM users WHERE LOWER(email) = ? AND status = ? AND role IN (?, ?)`,
-			normEmail, domain.UserStatusActive, domain.RoleAdmin, domain.RoleEditor,
-		)
-		if qErr != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "no active admin or editor account matches this identity"})
-			return
-		}
-		matchedUser = u
-
-	case "reader":
-		u, qErr := sqlx.Get[domain.User](
-			r.Context(), s.deps.Store,
-			`SELECT * FROM users WHERE LOWER(email) = ?`,
-			normEmail,
-		)
-		if qErr == nil {
-			if u.Status != domain.UserStatusActive {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "account is disabled"})
-				return
-			}
-			matchedUser = u
-		} else if errors.Is(qErr, sql.ErrNoRows) {
-			created, cErr := s.createOIDCReaderUser(r, normEmail, ident.DisplayName, ident.AvatarURL)
-			if cErr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to provision reader account"})
-				return
-			}
-			matchedUser = created
-		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "database lookup failed"})
-			return
-		}
-
-	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid oidc target"})
-		return
-	}
-
 	clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
 	var geo string
 	if s.deps.Geo != nil {
-		if loc, gOk := s.deps.Geo.Lookup(clientIP); gOk {
+		if st.Target == "admin" || st.Target == "bind" {
+			geo = s.deps.Geo.LookupDisplay(clientIP)
+		} else if loc, gOk := s.deps.Geo.Lookup(clientIP); gOk {
 			geo = loc.Region
 		}
 	}
-	_, rawTok, err := s.deps.Auth.CreateSession(r.Context(), matchedUser.ID, clientIP, geo, r.UserAgent(), 0)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create session"})
+	now := time.Now().UnixMilli()
+
+	switch st.Target {
+	case "bind":
+		actor, sess := s.resolveViewer(r)
+		if actor == nil || sess == nil || st.BindUserID == "" || actor.ID != st.BindUserID {
+			s.redirectOIDCError(w, r, "bind", st.Next, "state")
+			return
+		}
+		if actor.Status != domain.UserStatusActive {
+			s.redirectOIDCError(w, r, "bind", st.Next, "disabled")
+			return
+		}
+		if actor.Role != domain.RoleAdmin && actor.Role != domain.RoleEditor {
+			s.redirectOIDCError(w, r, "bind", st.Next, "forbidden")
+			return
+		}
+		existing, qErr := sqlx.Get[domain.UserCredential](
+			r.Context(), s.deps.Store,
+			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
+			credKey,
+		)
+		if qErr == nil {
+			if existing.UserID != actor.ID {
+				s.redirectOIDCError(w, r, "bind", st.Next, "already_linked")
+				return
+			}
+			_, _ = s.deps.Store.ExecContext(r.Context(),
+				`UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now, existing.ID)
+			http.Redirect(w, r, s.adminMountPath(), http.StatusFound)
+			return
+		}
+		if !errors.Is(qErr, sql.ErrNoRows) {
+			s.redirectOIDCError(w, r, "bind", st.Next, "bind_failed")
+			return
+		}
+
+		credName := formatOIDCCredentialName(providerName, normEmail, sub)
+		credID, insErr := s.insertOIDCCredential(r.Context(), actor.ID, credKey, credName, now)
+		if insErr != nil {
+			s.redirectOIDCError(w, r, "bind", st.Next, "already_linked")
+			return
+		}
+		s.recordAuditLog(r, actor, "security.oidc_link", "user_credential", credID, map[string]any{
+			"provider":      providerName,
+			"credential_id": credKey,
+		})
+		http.Redirect(w, r, s.adminMountPath(), http.StatusFound)
+		return
+
+	case "admin":
+		cred, qErr := sqlx.Get[domain.UserCredential](
+			r.Context(), s.deps.Store,
+			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
+			credKey,
+		)
+		if qErr != nil {
+			s.redirectOIDCError(w, r, "admin", st.Next, "unlinked")
+			return
+		}
+		u, uErr := sqlx.Get[domain.User](
+			r.Context(), s.deps.Store,
+			`SELECT * FROM users WHERE id = ?`,
+			cred.UserID,
+		)
+		if uErr != nil {
+			s.redirectOIDCError(w, r, "admin", st.Next, "unlinked")
+			return
+		}
+		if u.Status != domain.UserStatusActive {
+			s.redirectOIDCError(w, r, "admin", st.Next, "disabled")
+			return
+		}
+		if u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor {
+			s.redirectOIDCError(w, r, "admin", st.Next, "forbidden")
+			return
+		}
+		if strings.TrimSpace(ident.Email) != "" && !ident.EmailVerified {
+			s.redirectOIDCError(w, r, "admin", st.Next, "forbidden")
+			return
+		}
+
+		_, _ = s.deps.Store.ExecContext(r.Context(),
+			`UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now, cred.ID)
+
+		trusted2FA := ""
+		if c, cErr := r.Cookie(trusted2FACookieName); cErr == nil {
+			trusted2FA = c.Value
+		}
+		res, lErr := s.deps.Auth.CompleteStaffPrimaryLogin(r.Context(), u, clientIP, geo, r.UserAgent(), trusted2FA)
+		if lErr != nil {
+			s.redirectOIDCError(w, r, "admin", st.Next, "forbidden")
+			return
+		}
+		if res.Requires2FA {
+			http.Redirect(w, r, s.adminMountPath()+"?challenge_token="+url.QueryEscape(res.ChallengeToken), http.StatusFound)
+			return
+		}
+		s.setSessionCookieForRequest(w, r, res.RawToken)
+		s.recordAuditLog(r, &u, "auth.login_oidc", "user", u.ID, map[string]any{"provider": providerName})
+		http.Redirect(w, r, dest, http.StatusFound)
+		return
+
+	case "reader":
+		if !ident.EmailVerified || normEmail == "" {
+			s.redirectOIDCError(w, r, "reader", st.Next, "unverified_email")
+			return
+		}
+
+		var matchedUser domain.User
+		if cred, qErr := sqlx.Get[domain.UserCredential](
+			r.Context(), s.deps.Store,
+			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
+			credKey,
+		); qErr == nil {
+			u, uErr := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, cred.UserID)
+			if uErr != nil {
+				s.redirectOIDCError(w, r, "reader", st.Next, "state")
+				return
+			}
+			if u.Role != domain.RoleReader {
+				s.redirectOIDCError(w, r, "reader", st.Next, "forbidden")
+				return
+			}
+			if u.Status != domain.UserStatusActive {
+				s.redirectOIDCError(w, r, "reader", st.Next, "disabled")
+				return
+			}
+			_, _ = s.deps.Store.ExecContext(r.Context(),
+				`UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now, cred.ID)
+			matchedUser = u
+		} else if errors.Is(qErr, sql.ErrNoRows) {
+			u, uErr := sqlx.Get[domain.User](
+				r.Context(), s.deps.Store,
+				`SELECT * FROM users WHERE LOWER(email) = ?`,
+				normEmail,
+			)
+			if uErr == nil {
+				if u.Role != domain.RoleReader {
+					s.redirectOIDCError(w, r, "reader", st.Next, "forbidden")
+					return
+				}
+				if u.Status != domain.UserStatusActive {
+					s.redirectOIDCError(w, r, "reader", st.Next, "disabled")
+					return
+				}
+				credName := formatOIDCCredentialName(providerName, normEmail, sub)
+				_, _ = s.insertOIDCCredential(r.Context(), u.ID, credKey, credName, now)
+				matchedUser = u
+			} else if errors.Is(uErr, sql.ErrNoRows) {
+				created, cErr := s.createOIDCReaderUser(r, normEmail, ident.DisplayName, ident.AvatarURL, providerName, credKey)
+				if cErr != nil {
+					s.redirectOIDCError(w, r, "reader", st.Next, "register_failed")
+					return
+				}
+				matchedUser = created
+			} else {
+				s.redirectOIDCError(w, r, "reader", st.Next, "server_error")
+				return
+			}
+		} else {
+			s.redirectOIDCError(w, r, "reader", st.Next, "server_error")
+			return
+		}
+
+		_, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), matchedUser.ID, clientIP, geo, r.UserAgent(), 0)
+		if sErr != nil {
+			s.redirectOIDCError(w, r, "reader", st.Next, "server_error")
+			return
+		}
+		s.setSessionCookieForRequest(w, r, rawTok)
+		http.Redirect(w, r, dest, http.StatusFound)
+		return
+
+	default:
+		s.redirectOIDCError(w, r, "reader", "", "state")
 		return
 	}
-	s.setSessionCookieForRequest(w, r, rawTok)
-	http.Redirect(w, r, dest, http.StatusFound)
 }
 
-func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName, avatarURL string) (domain.User, error) {
+func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName, avatarURL, providerName, credKey string) (domain.User, error) {
 	now := time.Now().UnixMilli()
 	localPart := normEmail
 	if at := strings.IndexByte(normEmail, '@'); at > 0 {
@@ -433,18 +713,44 @@ func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	_, err := s.deps.Store.ExecContext(
-		r.Context(),
-		`INSERT INTO users (
-			id, username, email, display_name, avatar_url, bio, website_url,
-			role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		user.ID, user.Username, user.Email, user.DisplayName, user.AvatarURL, user.Bio, user.WebsiteURL,
-		user.Role, user.PasswordHash, user.LegacyHash, user.Status, user.EmailVerifiedAt, user.PreferredLocale,
-		user.CreatedAt, user.UpdatedAt,
-	)
+	credID := id.Next()
+	credName := formatOIDCCredentialName(providerName, normEmail, normEmail)
+	err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+		if _, iErr := tx.ExecContext(
+			r.Context(),
+			`INSERT INTO users (
+				id, username, email, display_name, avatar_url, bio, website_url,
+				role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			user.ID, user.Username, user.Email, user.DisplayName, user.AvatarURL, user.Bio, user.WebsiteURL,
+			user.Role, user.PasswordHash, user.LegacyHash, user.Status, user.EmailVerifiedAt, user.PreferredLocale,
+			user.CreatedAt, user.UpdatedAt,
+		); iErr != nil {
+			return iErr
+		}
+		if credKey != "" {
+			if _, cErr := tx.ExecContext(
+				r.Context(),
+				`INSERT INTO user_credentials (
+					id, user_id, kind, name, credential_id, public_key_spki,
+					cose_alg, sign_count, secret_ciphertext, meta_json, last_used_at, created_at
+				) VALUES (?, ?, 'oidc', ?, ?, '', 0, 0, '', '{}', ?, ?)`,
+				credID, user.ID, credName, credKey, now, now,
+			); cErr != nil {
+				return cErr
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return domain.User{}, err
 	}
+
+	if s.deps.Passports != nil && s.deps.Auth != nil {
+		if gp, ok := s.deps.Passports.ResolveOrHeal(nil, r, false); ok && gp != nil {
+			_, _ = s.deps.Auth.ClaimGuestComments(r.Context(), &user, gp)
+		}
+	}
+	s.recordAuditLog(r, &user, "reader.register_oidc", "user", user.ID, map[string]any{"provider": providerName})
 	return user, nil
 }

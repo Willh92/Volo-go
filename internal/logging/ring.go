@@ -153,17 +153,25 @@ func (rb *RingBuffer) List(levelFilter string, query string, limit int) []Entry 
 		lvl = ""
 	}
 	q := strings.ToLower(strings.TrimSpace(query))
-	if limit <= 0 || limit > len(rb.entries) {
-		limit = len(rb.entries)
+	const maxRingListCap = 4096
+	if limit <= 0 || limit > maxRingListCap {
+		limit = maxRingListCap
 	}
 
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 
-	if rb.count == 0 {
+	if rb.count == 0 || len(rb.entries) == 0 {
 		return []Entry{}
 	}
-	out := make([]Entry, 0, min(rb.count, limit))
+	if limit > len(rb.entries) {
+		limit = len(rb.entries)
+	}
+	initCap := len(rb.entries)
+	if initCap > 64 {
+		initCap = 64
+	}
+	out := make([]Entry, 0, initCap)
 	capN := len(rb.entries)
 	for i := 0; i < rb.count; i++ {
 		idx := (rb.head - 1 - i + capN) % capN

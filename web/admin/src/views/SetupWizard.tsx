@@ -7,6 +7,7 @@ import {
   csrfTokenSig,
   currentUserSig,
   effectiveDarkSig,
+  sanitizeAdminPath,
   showToast,
   themeModeSig,
   toggleEffectiveTheme,
@@ -65,11 +66,20 @@ export function SetupWizard() {
   }, []);
 
   const [tab, setTab] = useState<"fresh" | "legacy">("fresh");
+  const [legacySourceMode, setLegacySourceMode] = useState<"archive" | "db">("archive");
   const [driver, setDriver] = useState<string>("sqlite");
   const [dsn, setDsn] = useState<string>("");
   const [simpleProto, setSimpleProto] = useState<boolean>(false);
   const [dbPingMsg, setDbPingMsg] = useState<string>("");
   const [dbPingErr, setDbPingErr] = useState<boolean>(false);
+
+  // Source legacy DB state for direct DB-to-DB migration
+  const [sourceDriver, setSourceDriver] = useState<string>("mysql");
+  const [sourceDsn, setSourceDsn] = useState<string>("");
+  const [sourceSimpleProto, setSourceSimpleProto] = useState<boolean>(false);
+  const [sourceTablePrefix, setSourceTablePrefix] = useState<string>("");
+  const [sourcePingMsg, setSourcePingMsg] = useState<string>("");
+  const [sourcePingErr, setSourcePingErr] = useState<boolean>(false);
 
   const [siteTitle, setSiteTitle] = useState<string>(() => tFor(initLoc, "setup.default_site_title"));
   const [siteSubtitle, setSiteSubtitle] = useState<string>(() => tFor(initLoc, "setup.default_site_subtitle"));
@@ -184,7 +194,7 @@ export function SetupWizard() {
           admin_password: password,
         }),
       });
-      window.location.href = res.admin_path || bootConfig.admin_path || "/console";
+      window.location.assign(sanitizeAdminPath(res.admin_path || bootConfig.admin_path));
     } catch (err: any) {
       showToast(err.message, "err");
     } finally {
@@ -222,9 +232,9 @@ export function SetupWizard() {
       if (res.user) currentUserSig.value = res.user;
       if (res.csrf_token) csrfTokenSig.value = res.csrf_token;
       showToast(t("setup.legacy_done"), "ok");
-      const nextUrl = res.admin_path || bootConfig.admin_path || "/console";
+      const nextUrl = sanitizeAdminPath(res.admin_path || bootConfig.admin_path);
       window.setTimeout(() => {
-        window.location.href = nextUrl;
+        window.location.assign(nextUrl);
       }, 1100);
     } catch (err: any) {
       showToast(err.message, "err");
@@ -234,9 +244,110 @@ export function SetupWizard() {
     }
   };
 
+  const testSourceDB = async () => {
+    if (!sourceDsn.trim()) {
+      setSourcePingErr(true);
+      setSourcePingMsg(t("setup.leg_source_dsn_req"));
+      return;
+    }
+    setBusy(true);
+    setSourcePingMsg("");
+    try {
+      const res = await apiFetch<{
+        dialect: string;
+        schema_kind: string;
+        table_prefix: string;
+        articles: number;
+        comments: number;
+        users: number;
+        latency_ms: number;
+      }>("/api/setup/test-legacy-db", {
+        method: "POST",
+        body: JSON.stringify({
+          source_driver: sourceDriver,
+          source_dsn: sourceDsn.trim(),
+          source_simple_protocol: sourceSimpleProto,
+          source_table_prefix: sourceTablePrefix.trim(),
+        }),
+      });
+      setSourcePingErr(false);
+      const schemaLabel =
+        res.schema_kind === "volo"
+          ? "Volo-go"
+          : res.table_prefix
+          ? `Solo/Bolo (${res.table_prefix}*)`
+          : "Solo/Bolo";
+      setSourcePingMsg(
+        t("setup.leg_source_ok", {
+          schema: schemaLabel,
+          dialect: res.dialect,
+          articles: res.articles,
+          comments: res.comments,
+          users: res.users,
+          ms: res.latency_ms,
+        }),
+      );
+    } catch (err: any) {
+      setSourcePingErr(true);
+      setSourcePingMsg(t("setup.db_err", { msg: err.message }));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleLegacyDBMigrate = async () => {
+    if (!sourceDsn.trim()) {
+      showToast(t("setup.leg_source_dsn_req"), "err");
+      return;
+    }
+    setBusy(true);
+    try {
+      const url = dryRun ? "/api/setup/migrate-db?dry_run=1" : "/api/setup/migrate-db";
+      const res = await apiFetch<any>(url, {
+        method: "POST",
+        body: JSON.stringify({
+          driver,
+          dsn,
+          simple_protocol: simpleProto,
+          source_driver: sourceDriver,
+          source_dsn: sourceDsn.trim(),
+          source_simple_protocol: sourceSimpleProto,
+          source_table_prefix: sourceTablePrefix.trim(),
+          old_site_url: oldSiteUrl.trim(),
+          new_site_url: newSiteUrl.trim(),
+          site_title: legSiteTitle.trim(),
+          site_subtitle: legSiteSubtitle.trim(),
+          timezone: legTimezone.trim(),
+          storage_mode: storageMode,
+          admin_username: legAdminUser.trim(),
+          admin_email: legAdminEmail.trim(),
+          admin_password: legAdminPwd,
+        }),
+      });
+      setEtlResult(res.report || res);
+      if (dryRun) {
+        showToast(t("sys.import_dryrun_ok"), "ok");
+        return;
+      }
+      if (res.user) currentUserSig.value = res.user;
+      if (res.csrf_token) csrfTokenSig.value = res.csrf_token;
+      showToast(t("setup.legacy_done"), "ok");
+      const nextUrl = sanitizeAdminPath(res.admin_path || bootConfig.admin_path);
+      window.setTimeout(() => {
+        window.location.assign(nextUrl);
+      }, 1100);
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const dbSelectorCard = (
     <div class="volo-subcard" style={{ marginTop: 0 }}>
-      <div class="volo-subcard-title">{t("setup.step1")}</div>
+      <div class="volo-subcard-title">
+        {tab === "legacy" && legacySourceMode === "db" ? t("setup.leg_target_db_head") : t("setup.step1")}
+      </div>
       <div class="volo-grid-2">
         <div class="volo-field">
           <label>{t("setup.dialect")}</label>
@@ -280,7 +391,7 @@ export function SetupWizard() {
           />
         </div>
       )}
-      <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px" }}>
+      <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px", flexWrap: "wrap", gap: "8px" }}>
         {dbPingMsg && (
           <span class={`volo-badge ${dbPingErr ? "volo-badge-danger" : "volo-badge-ok"}`} style={{ marginRight: "auto" }}>
             {dbPingMsg}
@@ -288,6 +399,87 @@ export function SetupWizard() {
         )}
         <button type="button" class="volo-btn volo-btn-sm" disabled={busy} onClick={testDB}>
           {t("setup.test_db")}
+        </button>
+      </div>
+    </div>
+  );
+
+  const sourceDbSelectorCard = (
+    <div class="volo-subcard">
+      <div class="volo-subcard-title">{t("setup.leg_source_db_head")}</div>
+      <div class="volo-grid-2">
+        <div class="volo-field">
+          <label>{t("setup.dialect")}</label>
+          <ConsoleSelect
+            value={sourceDriver}
+            onChange={(v) => {
+              setSourceDriver(v);
+              setSourcePingMsg("");
+            }}
+            options={[
+              { value: "mysql", label: t("setup.dialect_mysql") },
+              { value: "postgres", label: t("setup.dialect_postgres") },
+              { value: "sqlite", label: t("setup.dialect_sqlite") },
+            ]}
+          />
+        </div>
+        <div class="volo-field">
+          <label>{t("setup.leg_source_dsn")}</label>
+          <input
+            class="volo-input"
+            name="setup_source_db_dsn_str"
+            autoComplete="off"
+            value={sourceDsn}
+            onInput={(e) => {
+              setSourceDsn((e.currentTarget as HTMLInputElement).value);
+              if (sourcePingErr) setSourcePingMsg("");
+            }}
+            placeholder={
+              sourceDriver === "sqlite"
+                ? t("setup.leg_source_dsn_sqlite_ph")
+                : sourceDriver === "postgres"
+                ? "postgres://user:pass@host:5432/solo?sslmode=disable"
+                : "user:pass@tcp(host:3306)/solo"
+            }
+          />
+        </div>
+      </div>
+      <div class="volo-grid-2">
+        <div class="volo-field">
+          <label>{t("setup.leg_source_prefix")}</label>
+          <input
+            class="volo-input"
+            name="setup_source_db_prefix"
+            autoComplete="off"
+            value={sourceTablePrefix}
+            onInput={(e) => {
+              setSourceTablePrefix((e.currentTarget as HTMLInputElement).value);
+              setSourcePingMsg("");
+            }}
+            placeholder={t("setup.leg_source_prefix_ph")}
+          />
+        </div>
+        {sourceDriver === "postgres" && (
+          <div class="volo-field" style={{ display: "flex", alignItems: "flex-end", paddingBottom: "6px" }}>
+            <SwitchToggle
+              checked={sourceSimpleProto}
+              onChange={setSourceSimpleProto}
+              label={t("setup.simple_proto")}
+            />
+          </div>
+        )}
+      </div>
+      <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px", flexWrap: "wrap", gap: "8px" }}>
+        {sourcePingMsg && (
+          <span
+            class={`volo-badge ${sourcePingErr ? "volo-badge-danger" : "volo-badge-ok"}`}
+            style={{ marginRight: "auto", whiteSpace: "normal", wordBreak: "break-word" }}
+          >
+            {sourcePingMsg}
+          </span>
+        )}
+        <button type="button" class="volo-btn volo-btn-sm" disabled={busy} onClick={testSourceDB}>
+          {t("setup.leg_test_source_db")}
         </button>
       </div>
     </div>
@@ -517,11 +709,36 @@ export function SetupWizard() {
           </form>
         ) : (
           <div>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px" }}>
+              <button
+                type="button"
+                class={`volo-btn volo-btn-sm ${legacySourceMode === "archive" ? "volo-btn-primary" : ""}`}
+                disabled={busy}
+                onClick={() => {
+                  setLegacySourceMode("archive");
+                  setEtlResult(null);
+                }}
+              >
+                {t("setup.leg_mode_archive")}
+              </button>
+              <button
+                type="button"
+                class={`volo-btn volo-btn-sm ${legacySourceMode === "db" ? "volo-btn-primary" : ""}`}
+                disabled={busy}
+                onClick={() => {
+                  setLegacySourceMode("db");
+                  setEtlResult(null);
+                }}
+              >
+                {t("setup.leg_mode_db")}
+              </button>
+            </div>
             <p class="volo-help" style={{ marginBottom: "12px" }}>
-              {t("setup.legacy_desc")}
+              {legacySourceMode === "db" ? t("setup.leg_db_desc") : t("setup.legacy_desc")}
             </p>
 
             {dbSelectorCard}
+            {legacySourceMode === "db" && sourceDbSelectorCard}
 
             <div class="volo-subcard">
               <div class="volo-subcard-title">{t("setup.leg_adjust_head")}</div>
@@ -669,17 +886,34 @@ export function SetupWizard() {
                 label={t("sys.import_dryrun_lbl")}
               />
             </div>
-            <UploadButton
-              accept=".zip,.json"
-              busy={busy}
-              busyLabel={t("setup.importing")}
-              label={t("setup.import_btn")}
-              primary
-              small={false}
-              className="volo-w-full"
-              onFile={(f) => void handleLegacyUpload(f)}
-            />
-            <UploadProgressBar progress={uploadPct} label={uploadName} />
+            {legacySourceMode === "archive" ? (
+              <>
+                <UploadButton
+                  accept=".zip,.json"
+                  busy={busy}
+                  busyLabel={t("setup.importing")}
+                  label={t("setup.import_btn")}
+                  primary
+                  small={false}
+                  className="volo-w-full"
+                  onFile={(f) => void handleLegacyUpload(f)}
+                />
+                <UploadProgressBar progress={uploadPct} label={uploadName} />
+              </>
+            ) : (
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary volo-w-full"
+                disabled={busy}
+                onClick={() => void handleLegacyDBMigrate()}
+              >
+                {busy
+                  ? t("setup.leg_db_migrating")
+                  : dryRun
+                  ? t("setup.leg_db_dryrun_btn")
+                  : t("setup.leg_db_migrate_btn")}
+              </button>
+            )}
             {etlResult && (
               <pre class="volo-subcard" style={{ marginTop: "14px", fontSize: "12px", overflowX: "auto" }}>
                 {JSON.stringify(etlResult, null, 2)}

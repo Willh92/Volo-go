@@ -209,9 +209,17 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		"idx_comments_target_del_created",
 		"idx_comments_del_status_created",
 		"idx_comments_del_created",
-		"idx_media_created",
+		"idx_media_assets_created",
 		"idx_redirects_created",
 		"idx_series_articles_sort",
+		// V6 scale composite indexes
+		"idx_comments_target_root_created",
+		"idx_books_sort_created",
+		"idx_books_status_sort_created",
+		"idx_pages_updated",
+		"idx_media_mime_created",
+		"idx_media_size_created",
+		"idx_webhook_deliveries_hook_created_id",
 	}
 
 	rows, err := sqlx.Select[struct {
@@ -229,4 +237,37 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 			t.Fatalf("expected index %q missing after migrate.Up", idx)
 		}
 	}
+	if present["idx_media_created"] {
+		t.Fatalf("duplicate index idx_media_created should have been dropped in V6")
+	}
+
+	// Verify V6 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
+	var maxVer int
+	if err := store.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
+		t.Fatal(err)
+	}
+	if maxVer != 6 || CurrentSchemaVersion != 6 {
+		t.Fatalf("expected schema version 6, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
+	}
+	if err := execIdempotentAddColumn(ctx, store, `ALTER TABLE media_assets ADD COLUMN alt_text TEXT NOT NULL DEFAULT ''`); err != nil {
+		t.Fatalf("execIdempotentAddColumn on existing column failed: %v", err)
+	}
+
+	// Verify V6 Postgres & MySQL key-widening statements and V1 VARCHAR(512) widths
+	pgD, _ := dialect.For("postgres")
+	myD, _ := dialect.For("mysql")
+	pgV6 := strings.Join(buildV6ScaleIndexesAndKeyWidths(pgD), "\n")
+	myV6 := strings.Join(buildV6ScaleIndexesAndKeyWidths(myD), "\n")
+	for _, col := range []string{"credential_id", "legacy_permalink", "source_path", "item_key"} {
+		if !strings.Contains(pgV6, "ALTER COLUMN "+col+" TYPE VARCHAR(512)") {
+			t.Fatalf("postgres V6 missing VARCHAR(512) widening for %s:\n%s", col, pgV6)
+		}
+		if !strings.Contains(myV6, "MODIFY COLUMN "+col+" VARCHAR(512) NOT NULL DEFAULT ''") {
+			t.Fatalf("mysql V6 missing VARCHAR(512) MODIFY COLUMN for %s:\n%s", col, myV6)
+		}
+	}
+	if !strings.Contains(myV6, "DROP INDEX idx_media_created ON media_assets") {
+		t.Fatalf("mysql V6 missing DROP INDEX idx_media_created ON media_assets")
+	}
 }
+

@@ -646,19 +646,8 @@ download_release_bundle() {
         FALLBACK_OK="1"
       fi
     fi
-    # Fallback 2: rolling preview release when latest is not yet published
-    if [ "$FALLBACK_OK" = "0" ] && [ "$PRIMARY_TARGET" = "latest" ] && [ "$PINNED" = "0" ]; then
-      log_warn "No stable 'latest' release found; falling back to rolling 'preview' release..."
-      PRIMARY_TARGET="preview"
-      BASE_URL="$(build_release_base_url "preview")"
-      DOWNLOADED_ASSET="$STABLE_ASSET"
-      DL_ARC="${TMP_DOWNLOAD_DIR}/${DOWNLOADED_ASSET}"
-      if fetch_url "${BASE_URL}/${DOWNLOADED_ASSET}" "$DL_ARC" "0"; then
-        FALLBACK_OK="1"
-      fi
-    fi
     if [ "$FALLBACK_OK" = "0" ]; then
-      log_err "Failed to download release archive for ${TARGET_OS}/${TARGET_ARCH} from ${GITHUB_REPO}."
+      log_err "Failed to download stable release archive for ${TARGET_OS}/${TARGET_ARCH} from ${GITHUB_REPO} (pass '--channel preview' or '--version preview' to install the rolling preview build)."
       exit 1
     fi
   fi

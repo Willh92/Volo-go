@@ -2,7 +2,12 @@
 {{define "skin_name"}}volo-journal{{end}}
 {{define "head_extra"}}  <link rel="stylesheet" href="{{assetURL .ThemeID "volo-journal.css"}}">
 {{end}}
-{{define "brand_extra"}}{{default (default (t .Locale "studio.brand_tagline") .Site.Subtitle) (themeCfg .ThemeConfig "journal_motto" "")}}{{end}}
+{{define "brand_extra"}}{{coalesce (themeCfg .ThemeConfig "journal_motto" "") .Site.Subtitle}}{{end}}
+{{define "header_widgets"}}{{if .HeaderWidgets}}
+    <div class="studio-container studio-header-widgets">
+      {{range .HeaderWidgets}}{{safeHTML .HTML}}{{end}}
+    </div>
+  {{end}}{{end}}
 {{define "footer_extra"}}{{template "journal_colophon" .}}{{end}}
 {{define "footer_edition"}}Journal{{end}}
 {{define "footer_stats"}}{{end}}

@@ -17,21 +17,19 @@
 {{end}}
 
 <div class="studio-layout journal-home-layout">
-  <div class="studio-feed">
+  <div class="studio-feed journal-feed">
     {{if .IsHome}}
-      {{if themeCfgBool .ThemeConfig "show_recent_posts" true}}
-        <div class="studio-section-heading">
-          <h2>{{t .Locale "studio.latest_updates"}}</h2>
-        </div>
-        <div class="studio-posts">
-          {{range .ArticleCards}}
-            {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
-          {{else}}
-            {{template "empty_state" (dict "Title" (t .Locale "studio.empty_title") "Desc" (t .Locale "studio.empty_desc"))}}
-          {{end}}
-        </div>
-        {{template "pagination" .}}
-      {{end}}
+      <div class="studio-section-heading">
+        <h2>{{t .Locale "studio.latest_updates"}}</h2>
+      </div>
+      <div class="studio-posts">
+        {{range .ArticleCards}}
+          {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
+        {{else}}
+          {{template "empty_state" (dict "Title" (t .Locale "studio.empty_title") "Desc" (t .Locale "studio.empty_desc"))}}
+        {{end}}
+      </div>
+      {{template "pagination" .}}
     {{else}}
       <section class="studio-hero studio-hero--simple studio-page-head">
         <div class="studio-hero-copy">

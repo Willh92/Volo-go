@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
-	"github.com/oschwald/maxminddb-golang/v2"
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
@@ -32,7 +31,7 @@ type LookupFunc func(addr netip.Addr) (GeoLocation, bool)
 type GeoEngine struct {
 	mu          sync.RWMutex
 	xdbMu       sync.Mutex
-	mmdbReader  *maxminddb.Reader
+	mmdbReader  *mmdbReader
 	xdbSearcher *xdb.Searcher
 	rules       []domain.SecurityGeoRule
 	settingsMgr *repo.SettingsManager
@@ -67,7 +66,7 @@ func (g *GeoEngine) LoadDatabases(geoIPDir string) error {
 		return err
 	}
 
-	var newMMDB *maxminddb.Reader
+	var newMMDB *mmdbReader
 	var newXDB *xdb.Searcher
 
 	for _, e := range entries {
@@ -77,7 +76,7 @@ func (g *GeoEngine) LoadDatabases(geoIPDir string) error {
 		fullPath := filepath.Join(geoIPDir, e.Name())
 		low := strings.ToLower(e.Name())
 		if strings.HasSuffix(low, ".mmdb") && newMMDB == nil {
-			if r, oErr := maxminddb.Open(fullPath); oErr == nil {
+			if r, oErr := openMMDBFile(fullPath); oErr == nil {
 				newMMDB = r
 			}
 		} else if strings.HasSuffix(low, ".xdb") && newXDB == nil {
@@ -186,36 +185,28 @@ func (g *GeoEngine) Lookup(addr netip.Addr) (GeoLocation, bool) {
 	var found bool
 
 	if g.mmdbReader != nil {
-		var rec struct {
-			Country struct {
-				ISOCode string            `maxminddb:"iso_code"`
-				Names   map[string]string `maxminddb:"names"`
-			} `maxminddb:"country"`
-			Subdivisions []struct {
-				Names map[string]string `maxminddb:"names"`
-			} `maxminddb:"subdivisions"`
-			City struct {
-				Names map[string]string `maxminddb:"names"`
-			} `maxminddb:"city"`
-		}
-		if err := g.mmdbReader.Lookup(u).Decode(&rec); err == nil && rec.Country.ISOCode != "" {
-			out.CountryISO = strings.ToUpper(rec.Country.ISOCode)
-			var parts []string
-			if len(rec.Subdivisions) > 0 {
-				if n := firstMapVal(rec.Subdivisions[0].Names, "zh-CN", "en"); n != "" {
+		if rec, ok, err := g.mmdbReader.lookupGeo(u); err == nil && ok {
+			iso := strings.TrimSpace(rec.CountryISO)
+			if iso == "" {
+				iso = strings.TrimSpace(rec.RegCountryISO)
+			}
+			if iso != "" {
+				out.CountryISO = strings.ToUpper(iso)
+				var parts []string
+				if n := firstGeoStr(rec.SubdivisionZH, rec.SubdivisionEN); n != "" {
 					parts = append(parts, n)
 				}
-			}
-			if cName := firstMapVal(rec.City.Names, "zh-CN", "en"); cName != "" {
-				parts = append(parts, cName)
-			}
-			if len(parts) == 0 {
-				if cn := firstMapVal(rec.Country.Names, "zh-CN", "en"); cn != "" {
-					parts = append(parts, cn)
+				if cName := firstGeoStr(rec.CityZH, rec.CityEN); cName != "" {
+					parts = append(parts, cName)
 				}
+				if len(parts) == 0 {
+					if cn := firstGeoStr(rec.CountryZH, rec.CountryEN, rec.RegCountryZH, rec.RegCountryEN); cn != "" {
+						parts = append(parts, cn)
+					}
+				}
+				out.Region = strings.Join(parts, "·")
+				found = true
 			}
-			out.Region = strings.Join(parts, "·")
-			found = true
 		}
 	}
 	g.mu.RUnlock()
@@ -375,10 +366,10 @@ func matchesGeoRule(loc GeoLocation, rule domain.SecurityGeoRule) bool {
 	return false
 }
 
-func firstMapVal(m map[string]string, keys ...string) string {
-	for _, k := range keys {
-		if v := strings.TrimSpace(m[k]); v != "" {
-			return v
+func firstGeoStr(vals ...string) string {
+	for _, v := range vals {
+		if t := strings.TrimSpace(v); t != "" {
+			return t
 		}
 	}
 	return ""

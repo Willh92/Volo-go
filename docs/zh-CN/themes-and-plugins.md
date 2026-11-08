@@ -16,9 +16,10 @@
 :root {
   --volo-bg: #faf9f5;
   --volo-surface: #ffffff;
+  --volo-raised: #f3f1eb;
   --volo-text: #1c1e1b;
   --volo-muted: #5f665e;
-  --volo-border: rgba(28, 30, 27, 0.10);
+  --volo-line: rgba(28, 30, 27, 0.10);
   --volo-accent: #1f5c48;        /* 随后台外观设置动态切换 */
   --volo-accent-soft: rgba(31, 92, 72, 0.10);
   --volo-font-sans: system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
@@ -38,8 +39,10 @@ themes/my-editorial/
 │   ├── theme.css           # 主题样式（通过 /themes/my-editorial/assets/theme.css 零拷贝预压缩分发）
 │   └── theme.js            # 可选增强脚本
 └── templates/              # 可选覆盖模板（未提供的页面自动安全回退至宿主标准视图）
+    ├── layout.html
     ├── index.html
-    └── post.html
+    ├── article.html
+    └── page.html
 ```
 
 `theme.json` 规范示例：
@@ -137,6 +140,9 @@ plugins/hello-callout/
   },
   "permissions": [
     "kv",
+    "site:read",
+    "crypto",
+    "ratelimit",
     "hooks:render.pre_markdown",
     "hooks:render.post_html",
     "slots:article.after_content",
@@ -188,56 +194,68 @@ plugins/hello-callout/
 ### 2.3 标准权限（Permissions）、钩子（Hooks）、插槽（UI Slots）与扩展 Provider
 
 1. **权限白名单令牌**：
-   - **存储**：`kv`（读写）、`kv:read`（只读 `plugin_kv`，单插件默认配额上限保护，且后台 KV 写入采用非缓存失效通道，不抖动主站文章/RSS 缓存）；
-   - **领域钩子**：
+   - **存储**：`kv` / `kv:rw`（读写）、`kv:read`（只读 `plugin_kv`，单插件默认配额上限保护，且后台 KV 写入采用非缓存失效通道，不抖动主站文章/RSS 缓存）；
+   - **宿主能力门控**：
+     - `crypto`：解锁 `volo.crypto`（`sha256`、`hmacSha256`、`randomUUID`）；
+     - `site:read`：解锁 `volo.site.info()` 读取站点只读元信息；
+     - `ratelimit`：解锁 `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)` 滑动窗口限流器（声明 `http:routes` 时亦自动开放）；
+     - `cron`：允许声明 `cron` 周期后台任务；
+   - **领域钩子**（支持 `hooks:*` 或细粒度令牌）：
      - 文章生命周期：`hooks:article.published`、`hooks:article.updated`、`hooks:article.deleted`；
      - 独立页面生命周期：`hooks:page.published`、`hooks:page.updated`、`hooks:page.deleted`；
      - 评论治理：`hooks:comment.before_create`、`hooks:comment.created`、`hooks:comment.moderated`；
-     - 渲染管线：`hooks:render.pre_markdown`（在非加密文章进入 Markdown 解析器前改写 `content_md`）与 `hooks:render.post_html`（对渲染后的 HTML 做后处理并二次净化）；
-   - **界面插槽**：`slots:public.head`、`slots:public.header`、`slots:article.before_content`、`slots:article.after_content`、`slots:comment.before`、`slots:comment.after`、`slots:public.footer`、`slots:editor.quick_insert`、`slots:admin.dashboard_card`；
+     - 渲染管线：`hooks:render.pre_markdown`（在非加密且不含 `:::lock` 的文章进入 Markdown 解析器前改写 `content_md`）与 `hooks:render.post_html`（对渲染后的 HTML 做后处理并二次净化）；
+   - **界面插槽**（支持 `ui:slots` 或按插槽授权）：`slots:public.head`、`slots:public.header`、`slots:public.sidebar`、`slots:article.before_content`、`slots:article.after_content`、`slots:comment.before`、`slots:comment.after`、`slots:public.footer`、`slots:editor.quick_insert`、`slots:admin.dashboard_card`；
    - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*` 自定义公开路由）、`http:raw_headers`（按需透传 `x-hub-signature-256`、`x-signature`、`stripe-signature`、`authorization` 等安全验签请求头）、`http.outbound:<hostname>` / `allowed_hosts`（显式域名或 `*.domain.tld` 白名单 + `OutboundSafeDialer` 防 SSRF）；
    - **核心扩展 Provider**：
-     - `provider:storage`：当 `main.js` 实现 `storagePut(relKey, contentType, bodyBase64)` 与 `storageDelete(relKey)`（及可选 `storageHealthCheck()`）时自动注册外部媒体/备份对象存储驱动（`StorageProvider`）；返回的公开 URL 经安全校验，若插件熔断或不可用则自动降级回本地磁盘不中断上传；
-     - `provider:oidc`：当 `main.js` 实现 `oidcAuthURL(state, redirectURI)` 与 `oidcExchange(code, redirectURI)`（及可选 `oidcProviderInfo()` 返回 `{ id, display_name }`）时自动注册第三方读者联合登录驱动（`OIDCProvider`）；
-     - `provider:notifier`：注册自定义通知渠道（`notifySend(event)`），与邮件和 Webhook 并行分发；
-     - `provider:captcha`：注册自定义人机验证器（`captchaRenderWidget(locale)` + `captchaVerify(token, clientIP)`）；
-   - **高敏读取**：`articles:read_protected`（未显式声明此权限并经管理员知情启用的插件，绝不会收到密码保护文章或未解锁 `:::lock` 内容）。
+     - `provider:storage`：当 `main.js` 实现 `storagePut(objectKey, bodyBase64, contentType)`（返回公开 URL 字符串或 `{ url }`）与可选 `storageDelete(objectKey)`、`storageHealthCheck()` 时自动注册外部媒体/备份对象存储驱动（`StorageProvider`）；若插件熔断或不可用则自动降级回本地磁盘不中断上传；
+     - `provider:oidc`：当 `main.js` 实现 `oidcAuthURL(state, redirectURI, opts)`（`opts` 含 `{ nonce, code_challenge, code_challenge_method }`，若返回的有效 `http`/`https` URL 尚未附带 `nonce` 或 `code_challenge`，宿主会自动补齐查询参数；2 参数旧签名保持 100% 兼容）与 `oidcExchange(code, redirectURI, opts)`（`opts` 含 `{ nonce, code_verifier }`，返回 `{ subject, email, email_verified, nonce, display_name, avatar_url }`，其中 `email_verified` 缺省严格默认为 `false`），以及可选 `oidcProviderInfo()`（返回 `{ id, display_name }`）时自动注册第三方联合登录驱动（`OIDCProvider` / `OIDCAdvancedProvider`）；
+     - `provider:notifier`：注册自定义通知渠道，支持导出 `sendNotification(event)` 或 `notifySend(event)`，与邮件和 Webhook 并行分发；
+     - `provider:antispam`：当 `main.js` 实现 `checkSpam(input)`（返回 `{ action: "allow" | "moderate" | "reject", reason, score }`）时自动注册评论反垃圾审查驱动（`AntiSpamProvider`）；
+   - **高敏读取**：`articles:read_protected`（未显式声明此权限的 JS 插件，即使调用方直接触发 `DispatchHook` 或 `DispatchArticleHook`，宿主也会自动清空密码保护文章正文并按 CommonMark 嵌套规则物理剥离所有 `:::lock ... :::` 内容块）。
 
 2. **沙箱熔断、资源护栏与 XSS 隔离红线**：
    - 每次 JS Hook / Slot 执行受严格指令步数预算、墙钟超时、循环引用深度上限（`Export` / `JSON.stringify`）及 `4 MiB` 字符串体积上限保护；连续异常或超时自动打开**熔断器（`CircuitOpen`）**旁路该插件；
+   - `volo.on(hookName, handlerFn)` 仅允许在模块顶层初始化阶段调用，初始化完成后自动冻结，防止请求期误调导致监听器泄漏；
    - `render.post_html` 与后台仪表盘卡片 `admin.dashboard_card` 输出均经过严格白名单 HTML 净化（剥离 `<script>`、`<iframe>`、`on*` 事件属性与 `javascript:`/`data:` 协议）；
    - 插件 CSS 变量必须使用 `--volo-plugin-<id>-*` 命名空间，包裹容器自动带 `.volo-plugin-scope[data-plugin="<id>"]` 以避免污染宿主排版。
 
-### 2.4 沙箱 SDK（`volo.*`）与 `main.js` 编写示例
+### 2.4 沙箱 SDK（`volo.*`）、ES6 标准库与 `main.js` 编写示例
 
-- `volo.on(hookName, handlerFn)`（或全局 `function onHook(hookName, payload)`）：订阅已声明的领域/渲染钩子；
+内置零外部依赖 JS 虚拟机原生支持现代 **ES6+ 语法与标准库**：
+- **语法特性**：函数级 `var` 提升、块级 `let`/`const`、`for (let ...)` 每轮独立闭包绑定、模板字符串 `${...}`、可选链（`obj?.prop`、`obj?.[expr]`、`fn?.(args)`）、空值合并 `??`、箭头函数（词法 `this`）、默认参数与剩余参数 `(...args)`、数组/调用/对象展开 `...x`、对象属性简写与方法简写 `{ a, method() {} }`、以及数组与对象解构赋值（`const { a, b: renamed = 1 } = obj`、`const [x, y = 2] = arr`）；
+- **标准内置对象**：符合 RFC 3986 的 `encodeURIComponent` / `decodeURIComponent`、`Number`（`isNaN`、`isFinite`、`isInteger`、`parseInt`、`parseFloat`、`toFixed`、`toString(radix)`）、`Array`（`from`、`isArray`、`concat`、`map`、`filter`、`reduce`、`find`、`findIndex`、`some`、`every`、`sort`、`reverse`、`shift`、`unshift`、`splice`、`flat`、`flatMap`）、`Object`（`keys`、`values`、`entries`、`fromEntries`、`assign`、`hasOwn`、`Object.prototype.hasOwnProperty`）、`String`（`fromCharCode`、`padStart`、`padEnd`、`trimStart`、`trimEnd`、`lastIndexOf`、支持 `RegExp` 与回调函数的 `replace` / `replaceAll`）、`Function.prototype.{call, apply, bind}`、`RegExp`、`Date`、`JSON`、`Math` 及 `btoa` / `atob`。
+
+宿主桥接对象 `volo`（别名 `ctx`）：
+- `volo.on(hookName, handlerFn)`（顶层初始化期注册，或导出全局 `function onHook(hookName, payload)`）：订阅已声明的领域/渲染钩子；
 - `volo.escapeHTML(str)`：对不可信文本做 HTML 实体转义，防止动态插槽拼接引入 XSS；
 - `volo.config.get(key)` / `volo.config.all()`：读取校验后的插件配置（含沙箱内自动解密的 `secret` 字段）；
-- `volo.kv.get(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?)` / `volo.kv.list(prefix, limit?, afterKey?)`：命名空间隔离 KV 存储，支持传入第 3 个参数 `afterKey` 进行游标翻页；
-- `volo.http.fetch(url, options?)`：受白名单与 `OutboundSafeDialer` 保护的出站 HTTP 请求；
-- `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`：结构化插件日志。
+- `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`：需声明 `kv` / `kv:read` 权限，支持 `afterKey` 游标翻页；
+- `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`：需声明 `crypto` 权限；
+- `volo.site.info()`：需声明 `site:read` 权限，返回站点名称、URL、默认语言等只读摘要；
+- `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)`：需声明 `ratelimit` 或 `http:routes` 权限；
+- `volo.http.fetch(url, options?)`：受 `allowed_hosts` / `http.outbound:<host>` 白名单与 `OutboundSafeDialer` 保护的出站 HTTP 请求；
+- `volo.i18n.t(locale, key, vars?)` 与 `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`：多语言翻译与结构化插件日志。
 
 ```javascript
-// 通过 volo.on(...) 订阅 Markdown 预处理与 HTML 后处理钩子
-volo.on("render.pre_markdown", function (article) {
-  return {
-    content_md: article.content_md.replace(/\[toc\]/gi, "## 目录\n")
-  };
-});
+// 通过 volo.on(...) 在顶层初始化阶段订阅 Markdown 预处理与 HTML 后处理钩子
+volo.on("render.pre_markdown", (article) => ({
+  content_md: article.content_md.replace(/\[toc\]/gi, () => "## 目录\n")
+}));
 
-volo.on("render.post_html", function (payload) {
-  volo.kv.incr("rendered_count", 1);
-  return { html: payload.html };
+volo.on("render.post_html", ({ html }) => {
+  volo.kv.incr("rendered_count", 1, 0);
+  return { html };
 });
 
 // 使用 afterKey 游标翻页遍历插件 KV
 function listAllBadges() {
-  var out = [];
-  var cursor = "";
+  const out = [];
+  let cursor = "";
   while (true) {
-    var batch = volo.kv.list("badge:", 100, cursor);
-    if (!batch || batch.length === 0) break;
-    out = out.concat(batch);
+    const batch = volo.kv.list("badge:", 100, cursor);
+    if (!batch?.length) break;
+    out.push(...batch);
     cursor = batch[batch.length - 1].key;
     if (batch.length < 100) break;
   }
@@ -247,8 +265,8 @@ function listAllBadges() {
 // 使用 volo.escapeHTML 安全渲染动态 UI 插槽
 function renderSlot(slotName, ctx) {
   if (slotName === "article.after_content") {
-    var msg = volo.config.get("banner_text") || "感谢阅读！";
-    return '<aside class="callout-box">' + volo.escapeHTML(String(msg)) + "</aside>";
+    const msg = volo.config.get("banner_text") || "感谢阅读！";
+    return `<aside class="callout-box">${volo.escapeHTML(String(msg))}</aside>`;
   }
   return "";
 }

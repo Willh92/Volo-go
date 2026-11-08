@@ -4,6 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -470,7 +473,13 @@ func TestPillarsSecurityHeadersAuthHardeningPublic404sBookReaderAndAdminBatchEnd
 	}
 
 	// Media reconcile + PATCH alt_text/original_name + batch delete
-	if err := os.WriteFile(filepath.Join(env.cfg.UploadDir, "reconcile-sample.png"), []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, 0o640); err != nil {
+	var samplePNG bytes.Buffer
+	sampleImg := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	sampleImg.SetRGBA(0, 0, color.RGBA{R: 12, G: 140, B: 120, A: 255})
+	if err := png.Encode(&samplePNG, sampleImg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(env.cfg.UploadDir, "reconcile-sample.png"), samplePNG.Bytes(), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	recResp, recBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/media/reconcile", map[string]any{}, adminCookies, csrfHdr)

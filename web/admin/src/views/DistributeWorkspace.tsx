@@ -1100,7 +1100,7 @@ export function DistributeWorkspace({
                               type="button"
                               class="volo-act-btn"
                               disabled={searchActive || sibIdx <= 0}
-                              title={t("cnt.lbl_sort")}
+                              title={searchActive ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapNavOrder(it.id, -1)}
                             >
                               ↑
@@ -1109,7 +1109,7 @@ export function DistributeWorkspace({
                               type="button"
                               class="volo-act-btn"
                               disabled={searchActive || sibIdx < 0 || sibIdx >= sibCount - 1}
-                              title={t("cnt.lbl_sort")}
+                              title={searchActive ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapNavOrder(it.id, 1)}
                             >
                               ↓
@@ -1468,19 +1468,18 @@ export function DistributeWorkspace({
                             {r.is_system_legacy && <span class="volo-mini-tag">{t("dist.redir_legacy")}</span>}
                           </div>
                         </td>
-                        <td class="col-fluid" data-label={t("tbl.col_source")}>
+                        <td class="col-fluid" data-label={t("tbl.col_source")} style={{ minWidth: 0 }}>
                           <a
                             href={testHref}
                             target="_blank"
                             rel="noreferrer"
-                            class="volo-code-chip"
-                            style={{ overflowWrap: "anywhere" }}
+                            class="volo-code-chip is-wrap"
                           >
                             {r.source_path} ↗
                           </a>
                         </td>
-                        <td class="col-fluid" data-label={t("tbl.col_target")}>
-                          <span class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>{r.target_path}</span>
+                        <td class="col-fluid" data-label={t("tbl.col_target")} style={{ minWidth: 0 }}>
+                          <span class="volo-code-chip is-wrap">{r.target_path}</span>
                         </td>
                         <td class="col-num" data-label={t("tbl.col_hits")}>
                           <span class="volo-cat-chip">{t("dist.redir_hits", { count: r.hit_count ?? 0 })}</span>
@@ -2054,27 +2053,27 @@ export function DistributeWorkspace({
                             onChange={() => toggleSel(selLinkIds, setSelLinkIds, l.id)}
                           />
                         </td>
-                        <td class="col-fluid" data-label={t("cnt.col_name")}>
-                          <div class="volo-cell-main">
-                            <div class="volo-cell-title">
+                        <td class="col-fluid" data-label={t("cnt.col_name")} style={{ minWidth: 0 }}>
+                          <div class="volo-cell-main" style={{ minWidth: 0 }}>
+                            <div class="volo-cell-title" style={{ minWidth: 0 }}>
                               <NavIconPreview icon={l.icon_url} fallbackLabel={label} />
-                              <span>{label}</span>
+                              <span class="volo-wrap-anywhere">{label}</span>
                               {l.category_name && <span class="volo-mini-tag">{l.category_name}</span>}
                             </div>
                             {l.description && (
-                              <div class="volo-cell-meta">
-                                <span>{l.description}</span>
+                              <div class="volo-cell-meta" style={{ minWidth: 0 }}>
+                                <span class="volo-wrap-anywhere">{l.description}</span>
                               </div>
                             )}
                           </div>
                         </td>
-                        <td class="col-fluid" data-label={t("tbl.col_url")}>
-                          <a href={l.url} target="_blank" rel="noreferrer" class="volo-code-chip" style={{ overflowWrap: "anywhere" }}>
+                        <td class="col-fluid" data-label={t("tbl.col_url")} style={{ minWidth: 0 }}>
+                          <a href={l.url} target="_blank" rel="noreferrer" class="volo-code-chip is-wrap">
                             {l.url}
                           </a>
                         </td>
-                        <td class="col-status" data-label={t("tbl.col_health")}>
-                          <div class="volo-cell-main">
+                        <td class="col-status" data-label={t("tbl.col_health")} style={{ minWidth: 0 }}>
+                          <div class="volo-cell-main" style={{ minWidth: 0 }}>
                             <div class="volo-cell-meta">
                               <span class={`volo-status-pill ${pillCls}`}>
                                 <span class="volo-status-dot" />
@@ -2085,9 +2084,9 @@ export function DistributeWorkspace({
                             </div>
                             {errText && (
                               <span
-                                class="volo-help"
+                                class="volo-help volo-wrap-anywhere"
                                 title={errText}
-                                style={{ color: "var(--volo-danger)", fontSize: "11.5px", overflowWrap: "anywhere" }}
+                                style={{ color: "var(--volo-danger)", fontSize: "11.5px", minWidth: 0 }}
                               >
                                 {errText.length > 42 ? `${errText.slice(0, 42)}…` : errText}
                               </span>
@@ -3340,11 +3339,13 @@ export function DistributeWorkspace({
                     <button
                       type="button"
                       class="volo-act-btn"
-                      disabled={pushingIndexNow}
+                      disabled={pushingIndexNow || savingSeo}
                       onClick={async () => {
-                        if (pushingIndexNow) return;
+                        if (pushingIndexNow || savingSeo) return;
                         setPushingIndexNow(true);
                         try {
+                          const ok = await saveSeoSettings(true);
+                          if (!ok) return;
                           const r = await apiFetch<{ pushed_urls: number }>("/api/admin/seo/indexnow-push", {
                             method: "POST",
                             body: "{}",

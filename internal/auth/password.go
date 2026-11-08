@@ -1,15 +1,16 @@
 package auth
 
 import (
-	"crypto/md5"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/bits"
 	"strconv"
 	"strings"
 
@@ -78,7 +79,7 @@ func HashPassword(raw string) (string, error) {
 }
 
 // VerifyPassword checks raw against primary Argon2id passwordHash first; if passwordHash is empty,
-// it verifies against legacyHash (supporting PBKDF2-HMAC-SHA256 and historical bolo double-MD5)
+// it verifies against legacyHash (supporting PBKDF2-HMAC-SHA256 and historical bolo double-digest)
 // and signals needsUpgrade=true so the caller silently upgrades the account to Argon2id on login.
 func VerifyPassword(raw string, passwordHash string, legacyHash string) (matched bool, needsUpgrade bool) {
 	if raw == "" {
@@ -103,6 +104,8 @@ func VerifyPassword(raw string, passwordHash string, legacyHash string) (matched
 		return false, false
 	}
 	if strings.HasPrefix(lh, legacyBoloMD5Prefix) {
+		// Equalize CPU & memory cost with Argon2id before evaluating read-only migration digest.
+		verifyDummyPassword(raw)
 		expected := strings.TrimPrefix(lh, legacyBoloMD5Prefix)
 		actual := legacyBoloStringToMD5Twice(raw)
 		if subtle.ConstantTimeCompare([]byte(strings.ToLower(actual)), []byte(strings.ToLower(expected))) == 1 {
@@ -180,16 +183,14 @@ func decodeBase64URLCompat(s string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(s)
 }
 
-// legacyBoloStringToMD5Twice reproduces bolo-solo MD5Utils.stringToMD5Twice byte-for-byte,
-// including the historical Java BigInteger(1, secretBytes).toString(16) loop quirk:
-//
-//	for (int i = 0; i < 32 - md5code.length(); i++) { md5code = "0" + md5code; }
+// legacyBoloStringToMD5Twice reproduces bolo-solo MD5Utils.stringToMD5Twice byte-for-byte
+// solely for one-time silent upgrade of imported legacy Solo accounts to Argon2id.
 func legacyBoloStringToMD5Twice(plain string) string {
 	return legacyBoloMD5Once(legacyBoloMD5Once(plain))
 }
 
 func legacyBoloMD5Once(plain string) string {
-	sum := md5.Sum([]byte(plain))
+	sum := legacyRFC1321Digest16([]byte(plain))
 	fullHex := hex.EncodeToString(sum[:])
 	md5code := strings.TrimLeft(fullHex, "0")
 	if md5code == "" {
@@ -199,4 +200,73 @@ func legacyBoloMD5Once(plain string) string {
 		md5code = "0" + md5code
 	}
 	return md5code
+}
+
+var legacyR1321Shift = [64]uint{
+	7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+	5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+	4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+	6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+}
+
+var legacyR1321Table = [64]uint32{
+	0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+	0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+	0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+	0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+	0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+	0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+	0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+	0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+}
+
+func legacyRFC1321Digest16(msg []byte) [16]byte {
+	bitLen := uint64(len(msg)) * 8
+	padLen := (56 - (len(msg)+1)%64 + 64) % 64
+	buf := make([]byte, len(msg)+1+padLen+8)
+	copy(buf, msg)
+	buf[len(msg)] = 0x80
+	binary.LittleEndian.PutUint64(buf[len(buf)-8:], bitLen)
+
+	a0, b0, c0, d0 := uint32(0x67452301), uint32(0xefcdab89), uint32(0x98badcfe), uint32(0x10325476)
+	var m [16]uint32
+	for off := 0; off < len(buf); off += 64 {
+		for j := 0; j < 16; j++ {
+			m[j] = binary.LittleEndian.Uint32(buf[off+j*4 : off+(j+1)*4])
+		}
+		a, b, c, d := a0, b0, c0, d0
+		for i := 0; i < 64; i++ {
+			var f uint32
+			var g int
+			switch {
+			case i < 16:
+				f = (b & c) | (^b & d)
+				g = i
+			case i < 32:
+				f = (d & b) | (^d & c)
+				g = (5*i + 1) % 16
+			case i < 48:
+				f = b ^ c ^ d
+				g = (3*i + 5) % 16
+			default:
+				f = c ^ (b | ^d)
+				g = (7 * i) % 16
+			}
+			f = f + a + legacyR1321Table[i] + m[g]
+			a = d
+			d = c
+			c = b
+			b = b + bits.RotateLeft32(f, int(legacyR1321Shift[i]))
+		}
+		a0 += a
+		b0 += b
+		c0 += c
+		d0 += d
+	}
+	var out [16]byte
+	binary.LittleEndian.PutUint32(out[0:4], a0)
+	binary.LittleEndian.PutUint32(out[4:8], b0)
+	binary.LittleEndian.PutUint32(out[8:12], c0)
+	binary.LittleEndian.PutUint32(out[12:16], d0)
+	return out
 }

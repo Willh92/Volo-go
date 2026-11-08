@@ -25,6 +25,7 @@ const (
 	tokSemi
 	tokComma
 	tokDot
+	tokEllipsis // ...
 	tokOptChain // ?.
 	tokColon
 	tokQuestion
@@ -272,7 +273,7 @@ func tokenizeJS(src string) ([]jsToken, error) {
 			continue
 		}
 
-		// Template literal `...${expr}...` desugared into ("a" + String(expr) + "b")
+		// Template literal `...${expr}...` desugared into ("a" + (expr) + "b")
 		if ch == '`' {
 			i++
 			emit(tokLParen, "(")
@@ -291,52 +292,66 @@ func tokenizeJS(src string) ([]jsToken, error) {
 				c := src[i]
 				if c == '\\' && i+1 < n {
 					i++
-					switch src[i] {
+					esc := src[i]
+					i++
+					switch esc {
 					case 'n':
 						sb.WriteByte('\n')
 					case 'r':
 						sb.WriteByte('\r')
 					case 't':
 						sb.WriteByte('\t')
+					case '0':
+						sb.WriteByte(0)
+					case 'x':
+						if i+2 <= n {
+							if v, err := strconv.ParseUint(src[i:i+2], 16, 8); err == nil {
+								sb.WriteByte(byte(v))
+								i += 2
+								continue
+							}
+						}
+						sb.WriteByte('x')
+					case 'u':
+						if i+4 <= n {
+							if v, err := strconv.ParseUint(src[i:i+4], 16, 16); err == nil {
+								sb.WriteRune(rune(v))
+								i += 4
+								continue
+							}
+						}
+						sb.WriteByte('u')
+					case '\n':
+						line++
 					default:
-						sb.WriteByte(src[i])
+						sb.WriteByte(esc)
 					}
-					i++
 					continue
 				}
 				if c == '$' && i+1 < n && src[i+1] == '{' {
 					flushStr()
 					i += 2
-					depth := 1
 					exprStart := i
-					for i < n && depth > 0 {
-						if src[i] == '{' {
-							depth++
-						} else if src[i] == '}' {
-							depth--
-							if depth == 0 {
-								break
-							}
-						} else if src[i] == '\n' {
-							line++
-						}
-						i++
-					}
-					if depth != 0 {
-						return nil, fmt.Errorf("line %d: unterminated template interpolation", line)
-					}
-					subToks, err := tokenizeJS(src[exprStart:i])
+					endIdx, err := scanTemplateExprEnd(src, exprStart, &line)
 					if err != nil {
 						return nil, err
 					}
-					i++ // skip '}'
+					subToks, err := tokenizeJS(src[exprStart:endIdx])
+					if err != nil {
+						return nil, err
+					}
+					i = endIdx + 1 // skip '}'
 					emit(tokPlus, "+")
-					emit(tokIdent, "String")
 					emit(tokLParen, "(")
+					hasSubTok := false
 					for _, st := range subToks {
 						if st.kind != tokEOF {
 							toks = append(toks, st)
+							hasSubTok = true
 						}
+					}
+					if !hasSubTok {
+						return nil, fmt.Errorf("line %d: empty template interpolation", line)
 					}
 					emit(tokRParen, ")")
 					continue
@@ -423,6 +438,32 @@ func tokenizeJS(src string) ([]jsToken, error) {
 				sawNL = false
 				continue
 			}
+			if ch == '0' && i+1 < n && (src[i+1] == 'b' || src[i+1] == 'B') {
+				i += 2
+				for i < n && (src[i] == '0' || src[i] == '1') {
+					i++
+				}
+				v, err := strconv.ParseUint(src[start+2:i], 2, 64)
+				if err != nil {
+					return nil, fmt.Errorf("line %d: invalid binary literal", line)
+				}
+				toks = append(toks, jsToken{kind: tokNumber, lit: src[start:i], num: float64(v), line: line, newline: sawNL})
+				sawNL = false
+				continue
+			}
+			if ch == '0' && i+1 < n && (src[i+1] == 'o' || src[i+1] == 'O') {
+				i += 2
+				for i < n && (src[i] >= '0' && src[i] <= '7') {
+					i++
+				}
+				v, err := strconv.ParseUint(src[start+2:i], 8, 64)
+				if err != nil {
+					return nil, fmt.Errorf("line %d: invalid octal literal", line)
+				}
+				toks = append(toks, jsToken{kind: tokNumber, lit: src[start:i], num: float64(v), line: line, newline: sawNL})
+				sawNL = false
+				continue
+			}
 			for i < n && src[i] >= '0' && src[i] <= '9' {
 				i++
 			}
@@ -473,6 +514,9 @@ func tokenizeJS(src string) ([]jsToken, error) {
 		// Multi-char operators
 		rem := src[i:]
 		switch {
+		case strings.HasPrefix(rem, "..."):
+			emit(tokEllipsis, "...")
+			i += 3
 		case strings.HasPrefix(rem, "==="):
 			emit(tokStrictEq, "===")
 			i += 3
@@ -485,7 +529,7 @@ func tokenizeJS(src string) ([]jsToken, error) {
 		case strings.HasPrefix(rem, "=>"):
 			emit(tokArrow, "=>")
 			i += 2
-		case strings.HasPrefix(rem, "?."):
+		case strings.HasPrefix(rem, "?.") && (len(rem) == 2 || rem[2] < '0' || rem[2] > '9'):
 			emit(tokOptChain, "?.")
 			i += 2
 		case strings.HasPrefix(rem, "??"):
@@ -596,6 +640,229 @@ func tokenizeJS(src string) ([]jsToken, error) {
 	return toks, nil
 }
 
+func scanTemplateExprEnd(src string, start int, line *int) (int, error) {
+	n := len(src)
+	i := start
+	depth := 1
+	prevSig := byte('{')
+	prevTwo := ""
+	lastIdent := ""
+
+	for i < n && depth > 0 {
+		ch := src[i]
+		if ch == ' ' || ch == '\t' || ch == '\r' {
+			i++
+			continue
+		}
+		if ch == '\n' {
+			*line++
+			i++
+			continue
+		}
+		// Line comment
+		if ch == '/' && i+1 < n && src[i+1] == '/' {
+			i += 2
+			for i < n && src[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		// Block comment
+		if ch == '/' && i+1 < n && src[i+1] == '*' {
+			i += 2
+			closed := false
+			for i+1 < n {
+				if src[i] == '\n' {
+					*line++
+				}
+				if src[i] == '*' && src[i+1] == '/' {
+					i += 2
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return 0, fmt.Errorf("line %d: unterminated block comment in template literal", *line)
+			}
+			continue
+		}
+		// Quoted string literal
+		if ch == '\'' || ch == '"' {
+			quote := ch
+			i++
+			closed := false
+			for i < n {
+				if src[i] == '\\' {
+					i++
+					if i < n {
+						if src[i] == '\n' {
+							*line++
+						}
+						i++
+					}
+					continue
+				}
+				if src[i] == quote {
+					i++
+					closed = true
+					break
+				}
+				if src[i] == '\n' {
+					return 0, fmt.Errorf("line %d: unterminated string literal in template", *line)
+				}
+				i++
+			}
+			if !closed {
+				return 0, fmt.Errorf("line %d: unterminated string literal in template", *line)
+			}
+			prevSig = quote
+			prevTwo = ""
+			lastIdent = ""
+			continue
+		}
+		// Nested template literal
+		if ch == '`' {
+			nextPos, err := skipNestedTemplate(src, i+1, line)
+			if err != nil {
+				return 0, err
+			}
+			i = nextPos
+			prevSig = '`'
+			prevTwo = ""
+			lastIdent = ""
+			continue
+		}
+		// Regex literal inside ${...}
+		if ch == '/' && prevTwo != "++" && prevTwo != "--" && canPrecedeRegexInScan(prevSig, lastIdent) {
+			i++
+			inClass := false
+			closed := false
+			for i < n {
+				c := src[i]
+				if c == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if c == '[' {
+					inClass = true
+				} else if c == ']' {
+					inClass = false
+				} else if c == '/' && !inClass {
+					i++
+					closed = true
+					break
+				} else if c == '\n' {
+					return 0, fmt.Errorf("line %d: unterminated regex literal in template", *line)
+				}
+				i++
+			}
+			if !closed {
+				return 0, fmt.Errorf("line %d: unterminated regex literal in template", *line)
+			}
+			for i < n && src[i] >= 'a' && src[i] <= 'z' {
+				i++
+			}
+			prevSig = '/'
+			prevTwo = ""
+			lastIdent = ""
+			continue
+		}
+		if ch == '{' {
+			depth++
+			prevSig = '{'
+			prevTwo = ""
+			lastIdent = ""
+			i++
+			continue
+		}
+		if ch == '}' {
+			depth--
+			if depth == 0 {
+				return i, nil
+			}
+			prevSig = '}'
+			prevTwo = ""
+			lastIdent = ""
+			i++
+			continue
+		}
+		if ch == '$' || ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+			idStart := i
+			i++
+			for i < n {
+				c := src[i]
+				if c == '$' || c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+					i++
+				} else {
+					break
+				}
+			}
+			lastIdent = src[idStart:i]
+			prevSig = 'a'
+			prevTwo = ""
+			continue
+		}
+		if (ch == '+' || ch == '-') && prevSig == ch {
+			prevTwo = string([]byte{ch, ch})
+		} else {
+			prevTwo = ""
+		}
+		prevSig = ch
+		lastIdent = ""
+		i++
+	}
+	return 0, fmt.Errorf("line %d: unterminated template interpolation", *line)
+}
+
+func skipNestedTemplate(src string, start int, line *int) (int, error) {
+	n := len(src)
+	i := start
+	for i < n {
+		c := src[i]
+		if c == '\\' && i+1 < n {
+			if src[i+1] == '\n' {
+				*line++
+			}
+			i += 2
+			continue
+		}
+		if c == '$' && i+1 < n && src[i+1] == '{' {
+			endIdx, err := scanTemplateExprEnd(src, i+2, line)
+			if err != nil {
+				return 0, err
+			}
+			i = endIdx + 1
+			continue
+		}
+		if c == '`' {
+			return i + 1, nil
+		}
+		if c == '\n' {
+			*line++
+		}
+		i++
+	}
+	return 0, fmt.Errorf("line %d: unterminated template literal", *line)
+}
+
+func canPrecedeRegexInScan(prevSig byte, lastIdent string) bool {
+	if prevSig == 'a' {
+		switch lastIdent {
+		case "return", "typeof", "void", "delete", "throw", "case", "in", "of", "instanceof", "new":
+			return true
+		default:
+			return false
+		}
+	}
+	switch prevSig {
+	case '(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '~', '^', '+', '-', '*', '%', '<', '>':
+		return true
+	default:
+		return false
+	}
+}
+
 // --- AST Definitions ---
 
 type jsProgram struct {
@@ -605,6 +872,39 @@ type jsProgram struct {
 
 type jsStmt interface{ stmtNode() }
 type jsExpr interface{ exprNode() }
+type jsPattern interface{ patNode() }
+
+type patIdent struct {
+	name string
+}
+type patArrayElem struct {
+	pat        jsPattern // nil = elision/hole
+	defaultVal jsExpr
+	rest       bool
+}
+type patArray struct {
+	elems []patArrayElem
+}
+type patObjectProp struct {
+	key         string
+	computedKey jsExpr
+	target      jsPattern
+	defaultVal  jsExpr
+	rest        bool
+}
+type patObject struct {
+	props []patObjectProp
+}
+
+func (*patIdent) patNode()  {}
+func (*patArray) patNode()  {}
+func (*patObject) patNode() {}
+
+type jsParam struct {
+	pat        jsPattern
+	defaultVal jsExpr
+	rest       bool
+}
 
 type stmtBlock struct{ stmts []jsStmt }
 type stmtVarDecl struct {
@@ -612,12 +912,12 @@ type stmtVarDecl struct {
 	decls []varDeclarator
 }
 type varDeclarator struct {
-	name string
+	pat  jsPattern
 	init jsExpr
 }
 type stmtFuncDecl struct {
 	name   string
-	params []string
+	params []jsParam
 	body   []jsStmt
 }
 type stmtReturn struct{ value jsExpr }
@@ -642,7 +942,9 @@ type stmtFor struct {
 }
 type stmtForInOf struct {
 	isOf    bool
-	varName string
+	varKind jsTokKind // tokVar, tokLet, tokConst, or 0 for bare LHS
+	pat     jsPattern
+	lhs     jsExpr
 	right   jsExpr
 	body    jsStmt
 }
@@ -659,7 +961,7 @@ type stmtContinue struct{}
 type stmtThrow struct{ value jsExpr }
 type stmtTry struct {
 	block     []jsStmt
-	catchName string
+	catchPat  jsPattern
 	hasCatch  bool
 	handler   []jsStmt
 	finalizer []jsStmt
@@ -692,15 +994,21 @@ type exprNull struct{}
 type exprUndefined struct{}
 type exprThis struct{}
 type exprRegex struct{ pattern, flags string }
+type exprParen struct{ inner jsExpr }
+type exprSpread struct{ arg jsExpr }
+type exprHole struct{}
 type exprArray struct{ elems []jsExpr }
 type exprObject struct{ props []objProp }
 type objProp struct {
-	key string
-	val jsExpr
+	key         string
+	computedKey jsExpr
+	val         jsExpr
+	defaultVal  jsExpr // CoverInitializedName `{ a = 1 }` for destructuring assignment
+	spread      bool
 }
 type exprFunc struct {
 	name   string
-	params []string
+	params []jsParam
 	body   []jsStmt
 	arrow  bool
 }
@@ -732,9 +1040,10 @@ type exprMember struct {
 	optional bool
 }
 type exprCall struct {
-	callee jsExpr
-	args   []jsExpr
-	isNew  bool
+	callee   jsExpr
+	args     []jsExpr
+	isNew    bool
+	optional bool
 }
 type exprSeq struct{ exprs []jsExpr }
 
@@ -746,6 +1055,9 @@ func (*exprNull) exprNode()      {}
 func (*exprUndefined) exprNode() {}
 func (*exprThis) exprNode()      {}
 func (*exprRegex) exprNode()     {}
+func (*exprParen) exprNode()     {}
+func (*exprSpread) exprNode()    {}
+func (*exprHole) exprNode()      {}
 func (*exprArray) exprNode()     {}
 func (*exprObject) exprNode()    {}
 func (*exprFunc) exprNode()      {}
@@ -965,11 +1277,175 @@ func (p *jsParser) parseBlock() ([]jsStmt, error) {
 	return stmts, nil
 }
 
+func isIdentifierNameToken(t jsToken) bool {
+	if t.kind == tokIdent {
+		return true
+	}
+	return t.kind >= tokVar && t.kind <= tokThis
+}
+
+func (p *jsParser) parseBindingPattern() (jsPattern, error) {
+	switch p.cur().kind {
+	case tokIdent:
+		return &patIdent{name: p.next().lit}, nil
+	case tokLBrack:
+		return p.parseArrayPattern()
+	case tokLBrace:
+		return p.parseObjectPattern()
+	default:
+		t := p.cur()
+		return nil, fmt.Errorf("line %d: expected binding identifier or destructuring pattern, got %q", t.line, t.lit)
+	}
+}
+
+func (p *jsParser) parseArrayPattern() (*patArray, error) {
+	if _, err := p.expect(tokLBrack); err != nil {
+		return nil, err
+	}
+	var elems []patArrayElem
+	for p.cur().kind != tokRBrack && p.cur().kind != tokEOF {
+		if p.cur().kind == tokComma {
+			elems = append(elems, patArrayElem{pat: nil})
+			p.next()
+			continue
+		}
+		if p.cur().kind == tokEllipsis {
+			p.next()
+			restPat, err := p.parseBindingPattern()
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, patArrayElem{pat: restPat, rest: true})
+			if p.cur().kind == tokComma {
+				p.next()
+			}
+			break
+		}
+		subPat, err := p.parseBindingPattern()
+		if err != nil {
+			return nil, err
+		}
+		var defExpr jsExpr
+		if p.cur().kind == tokAssign {
+			p.next()
+			defExpr, err = p.parseAssignExpr()
+			if err != nil {
+				return nil, err
+			}
+		}
+		elems = append(elems, patArrayElem{pat: subPat, defaultVal: defExpr})
+		if p.cur().kind == tokComma {
+			p.next()
+		} else {
+			break
+		}
+	}
+	if _, err := p.expect(tokRBrack); err != nil {
+		return nil, err
+	}
+	return &patArray{elems: elems}, nil
+}
+
+func (p *jsParser) parseObjectPattern() (*patObject, error) {
+	if _, err := p.expect(tokLBrace); err != nil {
+		return nil, err
+	}
+	var props []patObjectProp
+	for p.cur().kind != tokRBrace && p.cur().kind != tokEOF {
+		if p.cur().kind == tokEllipsis {
+			p.next()
+			restTarget, err := p.parseBindingPattern()
+			if err != nil {
+				return nil, err
+			}
+			props = append(props, patObjectProp{target: restTarget, rest: true})
+			if p.cur().kind == tokComma {
+				p.next()
+			}
+			break
+		}
+
+		var key string
+		var compKey jsExpr
+		isShorthandCand := false
+		if p.cur().kind == tokLBrack {
+			p.next()
+			var err error
+			compKey, err = p.parseAssignExpr()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tokRBrack); err != nil {
+				return nil, err
+			}
+		} else {
+			kt := p.next()
+			if kt.kind == tokIdent {
+				key = kt.lit
+				isShorthandCand = true
+			} else if isIdentifierNameToken(kt) || kt.kind == tokString {
+				key = kt.lit
+			} else if kt.kind == tokNumber {
+				key = strconv.FormatFloat(kt.num, 'f', -1, 64)
+			} else {
+				return nil, fmt.Errorf("line %d: invalid destructuring property key %q", kt.line, kt.lit)
+			}
+		}
+
+		var targetPat jsPattern
+		var defExpr jsExpr
+		if p.cur().kind == tokColon {
+			p.next()
+			var err error
+			targetPat, err = p.parseBindingPattern()
+			if err != nil {
+				return nil, err
+			}
+			if p.cur().kind == tokAssign {
+				p.next()
+				defExpr, err = p.parseAssignExpr()
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			if !isShorthandCand || compKey != nil {
+				return nil, fmt.Errorf("line %d: expected ':' in object destructuring pattern", p.cur().line)
+			}
+			targetPat = &patIdent{name: key}
+			if p.cur().kind == tokAssign {
+				p.next()
+				var err error
+				defExpr, err = p.parseAssignExpr()
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		props = append(props, patObjectProp{
+			key:         key,
+			computedKey: compKey,
+			target:      targetPat,
+			defaultVal:  defExpr,
+		})
+		if p.cur().kind == tokComma {
+			p.next()
+		} else {
+			break
+		}
+	}
+	if _, err := p.expect(tokRBrace); err != nil {
+		return nil, err
+	}
+	return &patObject{props: props}, nil
+}
+
 func (p *jsParser) parseVarDecl() (*stmtVarDecl, error) {
 	kind := p.next().kind
 	var decls []varDeclarator
 	for {
-		id, err := p.expect(tokIdent)
+		pat, err := p.parseBindingPattern()
 		if err != nil {
 			return nil, err
 		}
@@ -980,8 +1456,10 @@ func (p *jsParser) parseVarDecl() (*stmtVarDecl, error) {
 			if err != nil {
 				return nil, err
 			}
+		} else if _, isIdent := pat.(*patIdent); !isIdent {
+			return nil, fmt.Errorf("line %d: missing initializer in destructuring declaration", p.cur().line)
 		}
-		decls = append(decls, varDeclarator{name: id.lit, init: initExpr})
+		decls = append(decls, varDeclarator{pat: pat, init: initExpr})
 		if p.cur().kind != tokComma {
 			break
 		}
@@ -1007,17 +1485,37 @@ func (p *jsParser) parseFuncDecl() (*stmtFuncDecl, error) {
 	return &stmtFuncDecl{name: id.lit, params: params, body: body}, nil
 }
 
-func (p *jsParser) parseParamList() ([]string, error) {
+func (p *jsParser) parseParamList() ([]jsParam, error) {
 	if _, err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
-	var params []string
+	var params []jsParam
 	for p.cur().kind != tokRParen && p.cur().kind != tokEOF {
-		id, err := p.expect(tokIdent)
+		if p.cur().kind == tokEllipsis {
+			p.next()
+			restPat, err := p.parseBindingPattern()
+			if err != nil {
+				return nil, err
+			}
+			params = append(params, jsParam{pat: restPat, rest: true})
+			if p.cur().kind == tokComma {
+				p.next()
+			}
+			break
+		}
+		pat, err := p.parseBindingPattern()
 		if err != nil {
 			return nil, err
 		}
-		params = append(params, id.lit)
+		var defExpr jsExpr
+		if p.cur().kind == tokAssign {
+			p.next()
+			defExpr, err = p.parseAssignExpr()
+			if err != nil {
+				return nil, err
+			}
+		}
+		params = append(params, jsParam{pat: pat, defaultVal: defExpr})
 		if p.cur().kind == tokComma {
 			p.next()
 		} else {
@@ -1035,28 +1533,43 @@ func (p *jsParser) parseForStmt() (jsStmt, error) {
 	if _, err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
-	// Check for `for (var/let/const x in/of expr)` or `for (x in/of expr)`
 	save := p.pos
 	if p.cur().kind == tokVar || p.cur().kind == tokLet || p.cur().kind == tokConst {
-		p.next()
+		vk := p.next().kind
+		if pat, pErr := p.parseBindingPattern(); pErr == nil && (p.cur().kind == tokIn || p.cur().kind == tokOf) {
+			isOf := p.next().kind == tokOf
+			right, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tokRParen); err != nil {
+				return nil, err
+			}
+			body, err := p.parseStmt()
+			if err != nil {
+				return nil, err
+			}
+			return &stmtForInOf{isOf: isOf, varKind: vk, pat: pat, right: right, body: body}, nil
+		}
+		p.pos = save
+	} else if p.cur().kind != tokSemi {
+		if lhs, lErr := p.parsePostfixExpr(); lErr == nil && (p.cur().kind == tokIn || p.cur().kind == tokOf) {
+			isOf := p.next().kind == tokOf
+			right, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tokRParen); err != nil {
+				return nil, err
+			}
+			body, err := p.parseStmt()
+			if err != nil {
+				return nil, err
+			}
+			return &stmtForInOf{isOf: isOf, lhs: lhs, right: right, body: body}, nil
+		}
+		p.pos = save
 	}
-	if p.cur().kind == tokIdent && (p.peek(1).kind == tokIn || p.peek(1).kind == tokOf) {
-		varName := p.next().lit
-		isOf := p.next().kind == tokOf
-		right, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		if _, err := p.expect(tokRParen); err != nil {
-			return nil, err
-		}
-		body, err := p.parseStmt()
-		if err != nil {
-			return nil, err
-		}
-		return &stmtForInOf{isOf: isOf, varName: varName, right: right, body: body}, nil
-	}
-	p.pos = save
 
 	var initSt jsStmt
 	if p.cur().kind != tokSemi {
@@ -1169,11 +1682,11 @@ func (p *jsParser) parseTryStmt() (jsStmt, error) {
 		st.hasCatch = true
 		if p.cur().kind == tokLParen {
 			p.next()
-			id, err := p.expect(tokIdent)
+			pat, err := p.parseBindingPattern()
 			if err != nil {
 				return nil, err
 			}
-			st.catchName = id.lit
+			st.catchPat = pat
 			if _, err := p.expect(tokRParen); err != nil {
 				return nil, err
 			}
@@ -1217,13 +1730,20 @@ func (p *jsParser) parseExpr() (jsExpr, error) {
 
 func (p *jsParser) parseAssignExpr() (jsExpr, error) {
 	// Single-param arrow function `x => ...`
-	if p.cur().kind == tokIdent && p.peek(1).kind == tokArrow {
+	if p.cur().kind == tokIdent && p.peek(1).kind == tokArrow && !p.peek(1).newline {
 		param := p.next().lit
 		p.next() // '=>'
-		return p.parseArrowBody([]string{param})
+		return p.parseArrowBody([]jsParam{{pat: &patIdent{name: param}}})
 	}
-	// Parenthesized arrow function `(a, b) => ...` or `() => ...`
-	if params, ok := p.tryArrowParams(); ok {
+	// Parenthesized arrow function `(a = 1, { b }, ...rest) => ...` or `() => ...`
+	if p.isParenArrow() {
+		params, err := p.parseParamList()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tokArrow); err != nil {
+			return nil, err
+		}
 		return p.parseArrowBody(params)
 	}
 
@@ -1243,36 +1763,33 @@ func (p *jsParser) parseAssignExpr() (jsExpr, error) {
 	return left, nil
 }
 
-func (p *jsParser) tryArrowParams() ([]string, bool) {
+func (p *jsParser) isParenArrow() bool {
 	if p.cur().kind != tokLParen {
-		return nil, false
+		return false
 	}
-	save := p.pos
-	p.next() // '('
-	var params []string
-	for p.cur().kind != tokRParen {
-		if p.cur().kind != tokIdent {
-			p.pos = save
-			return nil, false
+	depth := 0
+	for idx := p.pos; idx < len(p.toks); idx++ {
+		tk := p.toks[idx].kind
+		if tk == tokEOF {
+			return false
 		}
-		params = append(params, p.next().lit)
-		if p.cur().kind == tokComma {
-			p.next()
-		} else if p.cur().kind != tokRParen {
-			p.pos = save
-			return nil, false
+		if tk == tokLParen || tk == tokLBrack || tk == tokLBrace {
+			depth++
+		} else if tk == tokRParen || tk == tokRBrack || tk == tokRBrace {
+			depth--
+			if depth == 0 {
+				if tk != tokRParen {
+					return false
+				}
+				nextIdx := idx + 1
+				return nextIdx < len(p.toks) && p.toks[nextIdx].kind == tokArrow && !p.toks[nextIdx].newline
+			}
 		}
 	}
-	p.next() // ')'
-	if p.cur().kind != tokArrow {
-		p.pos = save
-		return nil, false
-	}
-	p.next() // '=>'
-	return params, true
+	return false
 }
 
-func (p *jsParser) parseArrowBody(params []string) (jsExpr, error) {
+func (p *jsParser) parseArrowBody(params []jsParam) (jsExpr, error) {
 	if p.cur().kind == tokLBrace {
 		body, err := p.parseBlock()
 		if err != nil {
@@ -1400,13 +1917,32 @@ func (p *jsParser) parseMemberExpr() (jsExpr, error) {
 	}
 	for {
 		switch p.cur().kind {
-		case tokDot, tokOptChain:
-			opt := p.next().kind == tokOptChain
+		case tokDot:
+			p.next()
 			propTok := p.next()
-			if propTok.lit == "" {
+			if !isIdentifierNameToken(propTok) {
 				return nil, fmt.Errorf("line %d: expected property name", propTok.line)
 			}
-			base = &exprMember{obj: base, prop: propTok.lit, optional: opt}
+			base = &exprMember{obj: base, prop: propTok.lit}
+		case tokOptChain:
+			p.next()
+			if p.cur().kind == tokLBrack {
+				p.next()
+				idx, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.expect(tokRBrack); err != nil {
+					return nil, err
+				}
+				base = &exprMember{obj: base, index: idx, computed: true, optional: true}
+			} else {
+				propTok := p.next()
+				if !isIdentifierNameToken(propTok) {
+					return nil, fmt.Errorf("line %d: expected property name", propTok.line)
+				}
+				base = &exprMember{obj: base, prop: propTok.lit, optional: true}
+			}
 		case tokLBrack:
 			p.next()
 			idx, err := p.parseExpr()
@@ -1434,13 +1970,38 @@ func (p *jsParser) parsePostfixExpr() (jsExpr, error) {
 func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
 	for {
 		switch p.cur().kind {
-		case tokDot, tokOptChain:
-			opt := p.next().kind == tokOptChain
+		case tokDot:
+			p.next()
 			propTok := p.next()
-			if propTok.lit == "" {
+			if !isIdentifierNameToken(propTok) {
 				return nil, fmt.Errorf("line %d: expected property name", propTok.line)
 			}
-			base = &exprMember{obj: base, prop: propTok.lit, optional: opt}
+			base = &exprMember{obj: base, prop: propTok.lit}
+		case tokOptChain:
+			p.next()
+			if p.cur().kind == tokLBrack {
+				p.next()
+				idx, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.expect(tokRBrack); err != nil {
+					return nil, err
+				}
+				base = &exprMember{obj: base, index: idx, computed: true, optional: true}
+			} else if p.cur().kind == tokLParen {
+				args, err := p.parseArgList()
+				if err != nil {
+					return nil, err
+				}
+				base = &exprCall{callee: base, args: args, optional: true}
+			} else {
+				propTok := p.next()
+				if !isIdentifierNameToken(propTok) {
+					return nil, fmt.Errorf("line %d: expected property name", propTok.line)
+				}
+				base = &exprMember{obj: base, prop: propTok.lit, optional: true}
+			}
 		case tokLBrack:
 			p.next()
 			idx, err := p.parseExpr()
@@ -1475,11 +2036,20 @@ func (p *jsParser) parseArgList() ([]jsExpr, error) {
 	}
 	var args []jsExpr
 	for p.cur().kind != tokRParen && p.cur().kind != tokEOF {
-		a, err := p.parseAssignExpr()
-		if err != nil {
-			return nil, err
+		if p.cur().kind == tokEllipsis {
+			p.next()
+			spArg, err := p.parseAssignExpr()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, &exprSpread{arg: spArg})
+		} else {
+			a, err := p.parseAssignExpr()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, a)
 		}
-		args = append(args, a)
 		if p.cur().kind == tokComma {
 			p.next()
 		} else {
@@ -1531,21 +2101,30 @@ func (p *jsParser) parsePrimaryExpr() (jsExpr, error) {
 		if _, err := p.expect(tokRParen); err != nil {
 			return nil, err
 		}
-		return ex, nil
+		return &exprParen{inner: ex}, nil
 	case tokLBrack:
 		p.next()
 		var elems []jsExpr
 		for p.cur().kind != tokRBrack && p.cur().kind != tokEOF {
 			if p.cur().kind == tokComma {
-				elems = append(elems, &exprUndefined{})
+				elems = append(elems, &exprHole{})
 				p.next()
 				continue
 			}
-			el, err := p.parseAssignExpr()
-			if err != nil {
-				return nil, err
+			if p.cur().kind == tokEllipsis {
+				p.next()
+				sp, err := p.parseAssignExpr()
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, &exprSpread{arg: sp})
+			} else {
+				el, err := p.parseAssignExpr()
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, el)
 			}
-			elems = append(elems, el)
 			if p.cur().kind == tokComma {
 				p.next()
 			} else {
@@ -1560,14 +2139,71 @@ func (p *jsParser) parsePrimaryExpr() (jsExpr, error) {
 		p.next()
 		var props []objProp
 		for p.cur().kind != tokRBrace && p.cur().kind != tokEOF {
-			kt := p.next()
-			key := kt.lit
-			if kt.kind == tokNumber {
-				key = strconv.FormatFloat(kt.num, 'f', -1, 64)
+			if p.cur().kind == tokEllipsis {
+				p.next()
+				spVal, err := p.parseAssignExpr()
+				if err != nil {
+					return nil, err
+				}
+				props = append(props, objProp{spread: true, val: spVal})
+				if p.cur().kind == tokComma {
+					p.next()
+				} else {
+					break
+				}
+				continue
 			}
-			if key == "" && kt.kind != tokString {
+			if p.cur().kind == tokLBrack {
+				p.next()
+				compKey, err := p.parseAssignExpr()
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.expect(tokRBrack); err != nil {
+					return nil, err
+				}
+				if p.cur().kind == tokLParen {
+					params, err := p.parseParamList()
+					if err != nil {
+						return nil, err
+					}
+					body, err := p.parseBlock()
+					if err != nil {
+						return nil, err
+					}
+					props = append(props, objProp{computedKey: compKey, val: &exprFunc{params: params, body: body}})
+				} else {
+					if _, err := p.expect(tokColon); err != nil {
+						return nil, err
+					}
+					val, err := p.parseAssignExpr()
+					if err != nil {
+						return nil, err
+					}
+					props = append(props, objProp{computedKey: compKey, val: val})
+				}
+				if p.cur().kind == tokComma {
+					p.next()
+				} else {
+					break
+				}
+				continue
+			}
+
+			kt := p.next()
+			var key string
+			isIdentShorthand := false
+			if kt.kind == tokIdent {
+				key = kt.lit
+				isIdentShorthand = true
+			} else if isIdentifierNameToken(kt) || kt.kind == tokString {
+				key = kt.lit
+			} else if kt.kind == tokNumber {
+				key = strconv.FormatFloat(kt.num, 'f', -1, 64)
+			} else {
 				return nil, fmt.Errorf("line %d: invalid object property key", kt.line)
 			}
+
 			if p.cur().kind == tokColon {
 				p.next()
 				val, err := p.parseAssignExpr()
@@ -1575,9 +2211,30 @@ func (p *jsParser) parsePrimaryExpr() (jsExpr, error) {
 					return nil, err
 				}
 				props = append(props, objProp{key: key, val: val})
-			} else {
+			} else if p.cur().kind == tokLParen {
+				// ES6 concise method `{ method(a = 1) { ... } }`
+				params, err := p.parseParamList()
+				if err != nil {
+					return nil, err
+				}
+				body, err := p.parseBlock()
+				if err != nil {
+					return nil, err
+				}
+				props = append(props, objProp{key: key, val: &exprFunc{name: key, params: params, body: body}})
+			} else if isIdentShorthand && p.cur().kind == tokAssign {
+				// CoverInitializedName `{ a = 1 }` for destructuring assignment `({ a = 1 } = obj)`
+				p.next()
+				defExpr, err := p.parseAssignExpr()
+				if err != nil {
+					return nil, err
+				}
+				props = append(props, objProp{key: key, val: &exprIdent{name: key}, defaultVal: defExpr})
+			} else if isIdentShorthand {
 				// ES6 property shorthand `{ key }`
 				props = append(props, objProp{key: key, val: &exprIdent{name: key}})
+			} else {
+				return nil, fmt.Errorf("line %d: expected ':' after property key %q", kt.line, key)
 			}
 			if p.cur().kind == tokComma {
 				p.next()

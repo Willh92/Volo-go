@@ -67,3 +67,79 @@ func TestExternalLocaleOverlayAndRequestNegotiation(t *testing.T) {
 		t.Fatalf("expected siteDefault zh-CN when allowSwitch=false, got %q", loc)
 	}
 }
+
+func TestPacksCompletionPctAgainstDefaultLocale(t *testing.T) {
+	// 1. Real catalog: both symmetric built-in packs reach 100% naturally, while a tiny external pack reflects real coverage.
+	extDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(extDir, "fr-FR.json"), []byte(`{"meta.name":"Français","nav.home":"Accueil"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cat, err := NewCatalog("zh-CN", extDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byCode := make(map[string]LocalePackSummary)
+	for _, p := range cat.Packs() {
+		byCode[p.Code] = p
+	}
+	if byCode["zh-CN"].CompletionPct != 100 || byCode["en-US"].CompletionPct != 100 {
+		t.Fatalf("expected symmetric built-in packs at 100%%, got zh-CN=%d%% en-US=%d%%",
+			byCode["zh-CN"].CompletionPct, byCode["en-US"].CompletionPct)
+	}
+	if byCode["fr-FR"].CompletionPct <= 0 || byCode["fr-FR"].CompletionPct >= 20 {
+		t.Fatalf("expected partial external fr-FR CompletionPct in (0,20), got %d%%", byCode["fr-FR"].CompletionPct)
+	}
+
+	// 2. Synthetic catalog: an incomplete built-in pack MUST NOT be artificially clamped to 100%,
+	// and an external override supplying missing keys raises CompletionPct accurately against defaultLocale!
+	syn := &Catalog{
+		defaultLocale: "zh-CN",
+		builtin: map[string]map[string]string{
+			"zh-CN": {
+				"meta.code": "zh-CN",
+				"meta.name": "简体中文",
+				"meta.dir":  "ltr",
+				"k1":        "一",
+				"k2":        "二",
+				"k3":        "三",
+				"k4":        "四",
+				"k5":        "五",
+				"k6":        "六",
+				"k7":        "七",
+			},
+			"en-US": {
+				"meta.code": "en-US",
+				"meta.name": "English",
+				"meta.dir":  "ltr",
+				"k1":        "One",
+				"k2":        "Two",
+				"k3":        "   ", // blank should not count as translated
+			},
+		},
+		custom: map[string]map[string]string{
+			"ja-JP": {
+				"meta.code": "ja-JP",
+				"meta.name": "日本語",
+				"meta.dir":  "ltr",
+				"k1":        "いち",
+				"k2":        "に",
+			},
+		},
+		order: []string{"en-US", "ja-JP", "zh-CN"},
+	}
+	synByCode := make(map[string]LocalePackSummary)
+	for _, p := range syn.Packs() {
+		synByCode[p.Code] = p
+	}
+	// Reference defaultLocale zh-CN has 10 keys.
+	// en-US covers 5 non-blank keys (meta.code, meta.name, meta.dir, k1, k2) -> 50% (NOT hardcoded 100%!).
+	if synByCode["zh-CN"].CompletionPct != 100 {
+		t.Fatalf("expected defaultLocale zh-CN CompletionPct=100, got %d", synByCode["zh-CN"].CompletionPct)
+	}
+	if synByCode["en-US"].CompletionPct != 50 {
+		t.Fatalf("expected incomplete built-in en-US CompletionPct=50, got %d", synByCode["en-US"].CompletionPct)
+	}
+	if synByCode["ja-JP"].CompletionPct != 50 {
+		t.Fatalf("expected partial external ja-JP CompletionPct=50, got %d", synByCode["ja-JP"].CompletionPct)
+	}
+}

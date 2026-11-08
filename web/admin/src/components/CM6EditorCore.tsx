@@ -326,7 +326,9 @@ function serializeNodeToMarkdown(node: Node): string {
       const rows = Array.from(el.querySelectorAll("tr"));
       if (rows.length === 0) return "";
       const matrix = rows.map((tr) =>
-        Array.from(tr.querySelectorAll("th,td")).map((cell) => (cell.textContent || "").trim().replace(/\|/g, "\\|"))
+        Array.from(tr.querySelectorAll("th,td")).map((cell) =>
+          (cell.textContent || "").trim().replace(/\\/g, "\\\\").replace(/\|/g, "\\|")
+        )
       );
       const cols = Math.max(1, ...matrix.map((r) => r.length));
       const padRow = (r: string[]) => {
@@ -753,11 +755,15 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     const updatePos = () => {
       if (!headingBtnRef.current) return;
       const rect = headingBtnRef.current.getBoundingClientRect();
-      if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) {
+      const vv = window.visualViewport;
+      const vvTop = vv?.offsetTop ?? 0;
+      const vpH = vv?.height ?? window.innerHeight;
+      if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
         setHeadingOpen(false);
         return;
       }
-      setHeadingStyle(computePortalMenuStyle(rect, { minW: 112, maxW: 180, maxH: 260, align: "left" }).style);
+      const estH = headingMenuRef.current?.offsetHeight || 228;
+      setHeadingStyle(computePortalMenuStyle(rect, { minW: 112, maxW: 180, maxH: 260, estH, align: "left" }).style);
     };
     updatePos();
     const onDocDown = (e: MouseEvent) => {
@@ -768,15 +774,20 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") setHeadingOpen(false);
     };
+    const vv = window.visualViewport;
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
     window.addEventListener("resize", updatePos);
     window.addEventListener("scroll", updatePos, true);
+    vv?.addEventListener("resize", updatePos);
+    vv?.addEventListener("scroll", updatePos);
     return () => {
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener("resize", updatePos);
       window.removeEventListener("scroll", updatePos, true);
+      vv?.removeEventListener("resize", updatePos);
+      vv?.removeEventListener("scroll", updatePos);
     };
   }, [headingOpen]);
 
@@ -785,11 +796,15 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     const updatePos = () => {
       if (!mediaBtnRef.current) return;
       const rect = mediaBtnRef.current.getBoundingClientRect();
-      if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) {
+      const vv = window.visualViewport;
+      const vvTop = vv?.offsetTop ?? 0;
+      const vpH = vv?.height ?? window.innerHeight;
+      if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
         setMediaMenuOpen(false);
         return;
       }
-      setMediaStyle(computePortalMenuStyle(rect, { minW: 180, maxW: 260, maxH: 200, align: "left" }).style);
+      const estH = mediaMenuRef.current?.offsetHeight || 120;
+      setMediaStyle(computePortalMenuStyle(rect, { minW: 180, maxW: 260, maxH: 200, estH, align: "left" }).style);
     };
     updatePos();
     const onDocDown = (e: MouseEvent) => {
@@ -800,15 +815,20 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") setMediaMenuOpen(false);
     };
+    const vv = window.visualViewport;
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onEsc);
     window.addEventListener("resize", updatePos);
     window.addEventListener("scroll", updatePos, true);
+    vv?.addEventListener("resize", updatePos);
+    vv?.addEventListener("scroll", updatePos);
     return () => {
       document.removeEventListener("mousedown", onDocDown);
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener("resize", updatePos);
       window.removeEventListener("scroll", updatePos, true);
+      vv?.removeEventListener("resize", updatePos);
+      vv?.removeEventListener("scroll", updatePos);
     };
   }, [mediaMenuOpen]);
 
@@ -1367,10 +1387,16 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
                 type="button"
                 class="volo-btn volo-btn-primary"
                 onClick={() => {
+                  const fmtAttr = (k: string, raw: unknown) => {
+                    const v = String(raw ?? "").replace(/[\r\n]+/g, " ").trim();
+                    if (!v.includes('"')) return `${k}="${v}"`;
+                    if (!v.includes("'")) return `${k}='${v}'`;
+                    return `${k}="${v.replace(/"/g, "'")}"`;
+                  };
                   const attr =
                     lockMode === "user"
-                      ? `type="user"${lockHint ? ` hint="${lockHint}"` : ""}`
-                      : `pwd="${lockPwd || "123456"}"${lockHint ? ` hint="${lockHint}"` : ""}`;
+                      ? `type="user"${lockHint.trim() ? ` ${fmtAttr("hint", lockHint)}` : ""}`
+                      : `${fmtAttr("pwd", lockPwd || "123456")}${lockHint.trim() ? ` ${fmtAttr("hint", lockHint)}` : ""}`;
                   insertSnippet(`\n:::lock ${attr}\n${lockBody || "..."}\n:::\n`);
                   setQiOpen(false);
                 }}
@@ -1543,8 +1569,18 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
                         class="volo-btn volo-btn-sm"
                         style={{ flexShrink: 0 }}
                         onClick={() => {
-                          const body = b.description || `[${b.title}](/books/${b.slug})`;
-                          insertSnippet(`\n:::book title="${b.title}" status="${b.reading_status || "reading"}"\n${body}\n:::\n`);
+                          const fmtAttr = (k: string, raw: unknown) => {
+                            const v = String(raw ?? "").replace(/[\r\n]+/g, " ").trim();
+                            if (!v.includes('"')) return `${k}="${v}"`;
+                            if (!v.includes("'")) return `${k}='${v}'`;
+                            return `${k}="${v.replace(/"/g, "'")}"`;
+                          };
+                          const safeTitle = String(b.title || b.slug || "").replace(/[\[\]\r\n]/g, "");
+                          const body = b.description || `[${safeTitle}](/books/${b.slug})`;
+                          const slugAttr = b.slug ? ` ${fmtAttr("slug", b.slug)}` : "";
+                          insertSnippet(
+                            `\n:::book${slugAttr} ${fmtAttr("title", b.title)} ${fmtAttr("status", b.reading_status || "reading")}\n${body}\n:::\n`
+                          );
                           setQiOpen(false);
                         }}
                       >

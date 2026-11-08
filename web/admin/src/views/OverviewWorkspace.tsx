@@ -561,6 +561,7 @@ export function OverviewWorkspace({
   const [title, setTitle] = useState("");
   const [slug, setSlug] = useState("");
   const [categoryID, setCategoryID] = useState("");
+  const [editingCategoryName, setEditingCategoryName] = useState("");
   const [tagsText, setTagsText] = useState("");
   const [tagDraft, setTagDraft] = useState("");
   const [tagPoolOpen, setTagPoolOpen] = useState(false);
@@ -626,6 +627,7 @@ export function OverviewWorkspace({
     setTitle("");
     setSlug("");
     setCategoryID(catList[0]?.id || "");
+    setEditingCategoryName(catList[0]?.name || "");
     setTagsText("");
     setTagDraft("");
     setTagPoolOpen(false);
@@ -685,6 +687,48 @@ export function OverviewWorkspace({
     setAllTags(tagItems);
     setTotalTagCount(typeof tgs.total === "number" ? tgs.total : tagItems.length);
     return catItems;
+  };
+
+  const searchRemoteCategories = async (q: string) => {
+    const trimmed = q.trim();
+    if (!trimmed) return;
+    const res = await apiFetch<{ items?: any[] }>(
+      `/api/admin/categories?q=${encodeURIComponent(trimmed)}&per_page=50`
+    ).catch(() => ({ items: [] as any[] }));
+    const incoming = res.items || [];
+    if (incoming.length === 0) return;
+    setCategories((prev) => {
+      const seen = new Set(prev.map((c: any) => c.id));
+      const merged = [...prev];
+      for (const c of incoming) {
+        if (c?.id && !seen.has(c.id)) {
+          seen.add(c.id);
+          merged.push(c);
+        }
+      }
+      return merged;
+    });
+  };
+
+  const searchRemoteTags = async (q: string) => {
+    const trimmed = q.trim();
+    if (!trimmed) return;
+    const res = await apiFetch<{ items?: any[]; tags?: any[] }>(
+      `/api/admin/tags?q=${encodeURIComponent(trimmed)}&sort=count&per_page=50`
+    ).catch(() => ({ items: [] as any[], tags: [] as any[] }));
+    const incoming = res.items || res.tags || [];
+    if (incoming.length === 0) return;
+    setAllTags((prev) => {
+      const seen = new Set(prev.map((tg: any) => tg.id));
+      const merged = [...prev];
+      for (const tg of incoming) {
+        if (tg?.id && !seen.has(tg.id)) {
+          seen.add(tg.id);
+          merged.push(tg);
+        }
+      }
+      return merged;
+    });
   };
 
   const loadArticlesPage = async (opts?: {
@@ -760,6 +804,7 @@ export function OverviewWorkspace({
       setTitle(a.title || "");
       setSlug(a.slug || "");
       setCategoryID(a.category_id || "");
+      setEditingCategoryName(String((a as any)?.category_name || (data as any)?.category_name || ""));
       setTagsText((data.tags || []).join(", "));
       setTagDraft("");
       setTagPoolOpen(false);
@@ -843,7 +888,13 @@ export function OverviewWorkspace({
     } else {
       void loadOverview(trendDays);
     }
-  }, [section, curLocale]);
+  }, [section]);
+
+  useEffect(() => {
+    if (section === "dashboard") {
+      void loadOverview(trendDays);
+    }
+  }, [curLocale]);
 
   useEffect(() => {
     setHoverIdx(null);
@@ -886,9 +937,24 @@ export function OverviewWorkspace({
       return;
     }
     let cancelled = false;
-    apiFetch<{ items: any[] }>(`/api/admin/tags?q=${encodeURIComponent(activeQ)}&sort=count&per_page=80`)
+    apiFetch<{ items?: any[]; tags?: any[] }>(`/api/admin/tags?q=${encodeURIComponent(activeQ)}&sort=count&per_page=50`)
       .then((res) => {
-        if (!cancelled) setRemoteTags(res.items || []);
+        if (cancelled) return;
+        const list = res.items || res.tags || [];
+        setRemoteTags(list);
+        if (list.length > 0) {
+          setAllTags((prev) => {
+            const seen = new Set(prev.map((tg: any) => tg.id));
+            const merged = [...prev];
+            for (const tg of list) {
+              if (tg?.id && !seen.has(tg.id)) {
+                seen.add(tg.id);
+                merged.push(tg);
+              }
+            }
+            return merged;
+          });
+        }
       })
       .catch(() => {});
     return () => {
@@ -902,11 +968,15 @@ export function OverviewWorkspace({
     const updatePos = () => {
       if (!tagBoxRef.current) return;
       const rect = tagBoxRef.current.getBoundingClientRect();
-      if (rect.bottom < 0 || rect.top > window.innerHeight) {
+      const vv = window.visualViewport;
+      const vvTop = vv?.offsetTop ?? 0;
+      const vpH = vv?.height ?? window.innerHeight;
+      if (rect.bottom < vvTop - 40 || rect.top > vvTop + vpH + 40) {
         setTagSuggestOpen(false);
         return;
       }
-      const pos = computePortalMenuStyle(rect, { minW: 220, maxW: 360, maxH: 260, align: "left" });
+      const estH = tagSuggestRef.current?.offsetHeight || 196;
+      const pos = computePortalMenuStyle(rect, { minW: 220, maxW: 360, maxH: 260, estH, align: "left" });
       setTagSuggestStyle(pos.style);
     };
     updatePos();
@@ -915,12 +985,17 @@ export function OverviewWorkspace({
       if (tagBoxRef.current?.contains(target) || tagSuggestRef.current?.contains(target)) return;
       setTagSuggestOpen(false);
     };
+    const vv = window.visualViewport;
     window.addEventListener("resize", updatePos);
     window.addEventListener("scroll", updatePos, true);
+    vv?.addEventListener("resize", updatePos);
+    vv?.addEventListener("scroll", updatePos);
     document.addEventListener("mousedown", onDocDown);
     return () => {
       window.removeEventListener("resize", updatePos);
       window.removeEventListener("scroll", updatePos, true);
+      vv?.removeEventListener("resize", updatePos);
+      vv?.removeEventListener("scroll", updatePos);
       document.removeEventListener("mousedown", onDocDown);
     };
   }, [tagSuggestOpen, tagDraft]);
@@ -1643,8 +1718,12 @@ export function OverviewWorkspace({
                         </div>
                         <ConsoleSelect
                           value={categoryID}
+                          fallbackLabel={editingCategoryName || undefined}
+                          onSearch={searchRemoteCategories}
                           onChange={(v) => {
                             setCategoryID(v);
+                            const found = categories.find((c) => c.id === v);
+                            setEditingCategoryName(found ? found.name : "");
                             dirtyEditorSig.value = true;
                           }}
                           options={[
@@ -2399,6 +2478,7 @@ export function OverviewWorkspace({
             <ConsoleSelect
               style={{ width: "148px" }}
               value={catFilter}
+              onSearch={searchRemoteCategories}
               onChange={(v) => {
                 setCatFilter(v);
                 setArtPage(1);
@@ -2411,6 +2491,7 @@ export function OverviewWorkspace({
             <ConsoleSelect
               style={{ width: "144px" }}
               value={tagFilter}
+              onSearch={searchRemoteTags}
               onChange={(v) => {
                 setTagFilter(v);
                 setArtPage(1);
@@ -2519,7 +2600,7 @@ export function OverviewWorkspace({
               ) : (
                 displayArts.map((row) => {
                   const a = row.article;
-                  const catLabel = catNameMap[a.category_id];
+                  const catLabel = catNameMap[a.category_id] || (a as any).category_name || (row as any).category_name;
                   const isChecked = selectedIds.includes(a.id);
                   return (
                     <tr key={a.id}>
@@ -2642,6 +2723,7 @@ export function OverviewWorkspace({
           <ConsoleSelect
             style={{ width: "148px" }}
             value={batchCatId}
+            onSearch={searchRemoteCategories}
             onChange={(val) => {
               if (val === "__prompt__") return;
               setBatchCatId(val);
@@ -2895,7 +2977,7 @@ export function OverviewWorkspace({
                 <div style={{ fontWeight: 650, marginBottom: "2px" }}>{activeTrend.stat_date}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                   <span>PV: <strong>{Number(activeTrend.pv || 0).toLocaleString()}</strong></span>
-                  <span style={{ color: "var(--volo-chart-uv)" }}>UV: <strong>{Number(activeTrend.uv || 0).toLocaleString()}</strong></span>
+                  <span style={{ color: "var(--volo-chart-uv-on-dark)" }}>UV: <strong>{Number(activeTrend.uv || 0).toLocaleString()}</strong></span>
                 </div>
               </div>
             )}

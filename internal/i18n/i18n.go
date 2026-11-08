@@ -375,10 +375,14 @@ func (c *Catalog) Packs() []LocalePackSummary {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	refCount := len(c.builtin["zh-CN"])
-	if len(c.builtin["en-US"]) > refCount {
-		refCount = len(c.builtin["en-US"])
+	refTbl := c.builtin[c.defaultLocale]
+	if len(refTbl) == 0 {
+		refTbl = c.builtin["en-US"]
 	}
+	if len(refTbl) == 0 {
+		refTbl = c.builtin["zh-CN"]
+	}
+	refCount := len(refTbl)
 	if refCount == 0 {
 		refCount = 1
 	}
@@ -396,13 +400,13 @@ func (c *Catalog) Packs() []LocalePackSummary {
 		}
 
 		covered := 0
-		for k := range c.builtin["en-US"] {
+		for k := range refTbl {
 			if val, ok := c.lookupLocked(code, k); ok && strings.TrimSpace(val) != "" {
 				covered++
 			}
 		}
 		pct := (covered * 100) / refCount
-		if isBuiltin || pct > 100 {
+		if pct > 100 {
 			pct = 100
 		}
 

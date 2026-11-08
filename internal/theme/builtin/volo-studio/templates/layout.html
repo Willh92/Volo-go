@@ -1,9 +1,11 @@
-{{define "layout"}}<!DOCTYPE html>
+{{define "layout"}}{{$needsMath := or (and (not .Detail.RequiresPassword) .Detail.NeedsMath) .StandalonePage.NeedsMath (and (not .BookLocked) .ActiveChapterNeedsMath)}}{{$needsMermaid := or (and (not .Detail.RequiresPassword) .Detail.NeedsMermaid) .StandalonePage.NeedsMermaid (and (not .BookLocked) .ActiveChapterNeedsMermaid)}}{{$loginNext := ""}}{{if and .CurrentPath (ne .CurrentPath "/reader/login") (ne .CurrentPath "/reader/register")}}{{if .RawQuery}}{{$loginNext = printf "%s?%s" .CurrentPath .RawQuery}}{{else}}{{$loginNext = .CurrentPath}}{{end}}{{else if .ReaderNextURL}}{{$loginNext = .ReaderNextURL}}{{end}}{{$readerLoginHref := "/reader/login"}}{{if $loginNext}}{{$readerLoginHref = printf "/reader/login?next=%s" (urlquery $loginNext)}}{{end}}<!DOCTYPE html>
 <html lang="{{.Locale}}" dir="{{.TextDir}}"
       data-volo-skin="{{block "skin_name" .}}studio{{end}}"
       data-default-mode="{{.Appearance.DefaultMode}}"
       data-accent="{{.Appearance.Accent}}"
       data-pjax="{{if .EnablePJAX}}true{{else}}false{{end}}"
+      {{if $needsMath}}data-needs-math="1"{{end}}
+      {{if $needsMermaid}}data-needs-mermaid="1"{{end}}
       data-i18n-copy="{{t .Locale "article.copy_code"}}"
       data-i18n-copied="{{t .Locale "article.copied_code"}}">
 <head>
@@ -11,6 +13,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.PageTitle}}</title>
   <meta name="description" content="{{.MetaDescription}}">
+  {{if .SEO.MetaKeywords}}<meta name="keywords" content="{{.SEO.MetaKeywords}}">{{end}}
   {{if .NoIndex}}<meta name="robots" content="noindex, nofollow">{{end}}
   {{if .CanonicalURL}}<link rel="canonical" href="{{.CanonicalURL}}">{{end}}
   {{range .Alternates}}<link rel="alternate" hreflang="{{.Lang}}" href="{{.URL}}">
@@ -61,8 +64,8 @@
           <span class="studio-brand__mark" aria-hidden="true">V.</span>
         {{end}}
         <span class="studio-brand-copy">
-          <span class="studio-brand__title">{{.Site.Title}}</span>
-          <small>{{block "brand_extra" .}}{{default (t .Locale "studio.brand_tagline") .Site.Subtitle}}{{end}}</small>
+          <span class="studio-brand__title studio-brand-title">{{.Site.Title}}</span>
+          <small class="studio-brand-subtitle">{{block "brand_extra" .}}{{default (t .Locale "studio.brand_tagline") .Site.Subtitle}}{{end}}</small>
         </span>
       </a>
 
@@ -102,14 +105,14 @@
                 {{end}}
               {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
                 {{if .NavMenu.Overflow}}<div class="volo-appearance__divider studio-only-mobile"></div>{{end}}
-                <a class="studio-nav-more__item studio-only-mobile" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}} role="menuitem"><svg class="studio-nav-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span>{{t .Locale "nav.login"}}</span></a>
+                <a class="studio-nav-more__item studio-only-mobile js-header-reader-login" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}{{$readerLoginHref}}{{end}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{else}}data-reader-login="1"{{end}} role="menuitem"><svg class="studio-nav-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span>{{t .Locale "nav.login"}}</span></a>
               {{end}}
             </div>
           </div>
         {{end}}
       </nav>
 
-      <div class="studio-actions">
+      <div class="studio-actions studio-header-actions">
         {{if .Reading.EnableInstantSearch}}
           <button type="button" id="volo-search-btn" class="studio-icon-btn studio-icon-btn--square" title="{{t .Locale "nav.search_placeholder"}}" aria-label="{{t .Locale "nav.search_placeholder"}}">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>
@@ -217,18 +220,18 @@
             </form>
           {{end}}
         {{else if or .Reading.AllowReaderRegister .Site.ShowAdminLoginEntry}}
-          <a class="studio-icon-btn studio-auth-btn" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}/reader/login{{end}}" title="{{t .Locale "nav.login"}}" aria-label="{{t .Locale "nav.login"}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{end}}>
+          <a class="studio-icon-btn studio-auth-btn js-header-reader-login" href="{{if .Site.ShowAdminLoginEntry}}{{.AdminPath}}{{else}}{{$readerLoginHref}}{{end}}" title="{{t .Locale "nav.login"}}" aria-label="{{t .Locale "nav.login"}}" {{if .Site.ShowAdminLoginEntry}}data-no-pjax{{else}}data-reader-login="1"{{end}}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg><span class="studio-auth-btn__label">{{t .Locale "nav.login"}}</span>
           </a>
         {{end}}
       </div>
     </div>
   </header>
-  {{if .HeaderWidgets}}
+  {{block "header_widgets" .}}{{if .HeaderWidgets}}
     <div class="studio-container studio-header-widgets">
       {{range .HeaderWidgets}}{{safeHTML .HTML}}{{end}}
     </div>
-  {{end}}
+  {{end}}{{end}}
 
   <main id="studio-main" class="studio-container">
     {{template "content" .}}
@@ -265,7 +268,7 @@
     </div>
   </footer>
 
-  {{$hasMobileTOC := or (and .IsArticle (not .Detail.RequiresPassword) (gt (len .Detail.TOC) 0)) (and .IsStandalonePage .StandalonePage.ShowTOC (gt (len .StandalonePage.TOC) 0))}}
+  {{$hasMobileTOC := or (and .IsArticle (not .Detail.RequiresPassword) (gt (len .Detail.TOC) 0)) (and .IsStandalonePage .StandalonePage.ShowTOC (gt (len .StandalonePage.TOC) 0) (ne (default "default" .StandalonePage.Template) "minimal"))}}
   <div class="studio-fab-dock" aria-label="Quick actions">
     <button id="volo-mobile-toc-btn" class="studio-fab-btn studio-fab-btn--toc" type="button" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" aria-expanded="false" {{if not $hasMobileTOC}}hidden{{end}}>
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>

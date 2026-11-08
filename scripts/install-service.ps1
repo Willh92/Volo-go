@@ -316,17 +316,10 @@ function Download-ReleaseBundle {
         $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
       }
     } catch {}
-    if (-not $ok) {
-      Write-Host "[Volo] No stable 'latest' release found; falling back to 'preview' release..." -ForegroundColor Yellow
-      $baseUrl = Get-ReleaseBaseUrl "preview"
-      $assetName = $stableAsset
-      $dlZip = Join-Path $tmpDir $assetName
-      $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
-    }
   }
 
   if (-not $ok) {
-    throw "Failed to download release archive for windows/$Arch from $Repo."
+    throw "Failed to download stable release archive for windows/$Arch from $Repo (pass '-Channel preview' or '-Version preview' to install the rolling preview build)."
   }
 
   if (-not $NoVerify) {

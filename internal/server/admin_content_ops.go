@@ -151,11 +151,27 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 		slug = s.ensureUniqueArticleSlug(r.Context(), slug, "")
 		words, mins := computeReadingMetrics(fm.BodyMD)
 
+		var cleanCover string
+		if rawCover := strings.TrimSpace(fm.Cover); rawCover != "" {
+			if u, ok := sanitizeRedirectTargetURL(rawCover); ok {
+				cleanCover = u
+			}
+		}
+
 		var savedRaw domain.RawArticle
 		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
-			catID, cErr := s.resolveOrCreateCategoryTx(r.Context(), tx, fm.Category, now)
-			if cErr != nil {
-				return cErr
+			var catID string
+			if actor.Role == domain.RoleAdmin {
+				var cErr error
+				catID, cErr = s.resolveOrCreateCategoryTx(r.Context(), tx, fm.Category, now)
+				if cErr != nil {
+					return cErr
+				}
+			} else if cleanCat := strings.TrimSpace(fm.Category); cleanCat != "" {
+				catSlug := sanitizeSlug(cleanCat)
+				if cat, gErr := sqlx.Get[domain.Category](r.Context(), tx, `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) OR slug = ?`, cleanCat, catSlug); gErr == nil {
+					catID = cat.ID
+				}
 			}
 			savedRaw = domain.RawArticle{
 				ID:             id.Next(),
@@ -165,7 +181,7 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 				Slug:           slug,
 				SummaryMD:      fm.Summary,
 				ContentMD:      fm.BodyMD,
-				CoverURL:       fm.Cover,
+				CoverURL:       cleanCover,
 				Status:         status,
 				PublishedAt:    pubAt,
 				AllowComment:   true,
@@ -203,7 +219,7 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 		if savedRaw.Status == domain.ArticleStatusPublished {
 			s.deps.Content.SearchIndex().Upsert(savedRaw)
 			if s.deps.Plugins != nil {
-				_, _ = s.deps.Plugins.DispatchHook(r.Context(), plugin.HookArticlePublished, articleHookPayloadFromRaw(savedRaw))
+				s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticlePublished, articleHookPayloadFromRaw(savedRaw))
 			}
 			if s.deps.NotifyArticlePublished != nil {
 				s.deps.NotifyArticlePublished(r.Context(), savedRaw)
@@ -1152,7 +1168,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		if wasPublished {
 			hookName = plugin.HookArticleUpdated
 		}
-		_, _ = s.deps.Plugins.DispatchHook(ctx, hookName, articleHookPayloadFromRaw(cur))
+		s.deps.Plugins.DispatchArticleHook(ctx, hookName, articleHookPayloadFromRaw(cur))
 	}
 	if !wasPublished && s.deps.NotifyArticlePublished != nil {
 		s.deps.NotifyArticlePublished(ctx, cur)

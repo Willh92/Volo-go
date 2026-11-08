@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	anyHeadingTagRe   = regexp.MustCompile(`(?is)<h([1-4])(\b[^>]*)>(.*?)</h[1-4]>`)
+	anyHeadingTagRe   = regexp.MustCompile(`(?is)<h([1-6])(\b[^>]*)>(.*?)</h[1-6]>`)
 	existingIDAttrRe  = regexp.MustCompile(`(?i)\s*\bid="([^"]*)"`)
 	genericHeadingRe  = regexp.MustCompile(`(?i)^heading(?:-\d+)?$`)
 	headingSlugClean  = regexp.MustCompile(`[^\p{L}\p{N}_-]+`)
@@ -20,9 +20,10 @@ var (
 	tdFullRe          = regexp.MustCompile(`(?is)<td(\b[^>]*)>(.*?)</td>`)
 	anchorTagOpenRe   = regexp.MustCompile(`(?i)<a\b([^>]*)>`)
 	ghStatsImgPlainRe = regexp.MustCompile(`(?is)(<p>\s*)(<img\b[^>]*\bsrc="([^"]*/github-stats/([a-zA-Z0-9-]+)\.svg)"[^>]*>)(\s*</p>)`)
+	ghAlertMarkerRe   = regexp.MustCompile(`(?is)^\s*<p>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]*</p>\s*|(?:[ \t]*<br\s*/?>|\s*\n|[ \t]+))`)
 )
 
-// assignReadableHeadingIDs ensures every <h1>..<h4> carries a unique, readable, CJK-friendly `id`
+// assignReadableHeadingIDs ensures every <h1>..<h6> carries a unique, readable, CJK-friendly `id`
 // so TOC links (`#中文标题` or `#architecture-overview`) scroll smoothly without generic `heading-1` collisions.
 func assignReadableHeadingIDs(safeHTML string) string {
 	if !strings.Contains(safeHTML, "<h") && !strings.Contains(safeHTML, "<H") {
@@ -230,3 +231,121 @@ func transformGitHubReposTable(tbl string) string {
 
 	return `<div class="volo-github-repos-wrap">` + openTag + prefix + transformedRows + `</div>`
 }
+
+func alertDefaultTitle(kindLower string, locale string) string {
+	isZH := strings.HasPrefix(strings.ToLower(strings.TrimSpace(locale)), "zh")
+	switch kindLower {
+	case "note":
+		if isZH {
+			return "说明"
+		}
+		return "Note"
+	case "tip":
+		if isZH {
+			return "提示"
+		}
+		return "Tip"
+	case "important":
+		if isZH {
+			return "重要"
+		}
+		return "Important"
+	case "warning":
+		if isZH {
+			return "警告"
+		}
+		return "Warning"
+	case "caution":
+		if isZH {
+			return "注意"
+		}
+		return "Caution"
+	default:
+		return "Note"
+	}
+}
+
+// transformGitHubAlerts converts GitHub-flavored alert blockquotes (`> [!NOTE]`, `> [!TIP]`,
+// `> [!IMPORTANT]`, `> [!WARNING]`, `> [!CAUTION]`) into semantic `.volo-callout` blocks,
+// safely handling nested blockquotes from innermost to outermost.
+func transformGitHubAlerts(rendered string, locale string) string {
+	if !strings.Contains(rendered, "[!") || !strings.Contains(rendered, "<blockquote") {
+		return rendered
+	}
+	out := rendered
+	for pass := 0; pass < 8; pass++ {
+		changed := false
+		var b strings.Builder
+		pos := 0
+		for pos < len(out) {
+			openRel := strings.Index(out[pos:], "<blockquote>")
+			if openRel < 0 {
+				b.WriteString(out[pos:])
+				break
+			}
+			openIdx := pos + openRel
+			innerStart := openIdx + len("<blockquote>")
+			// Find the matching </blockquote> for this <blockquote>
+			depth := 1
+			scan := innerStart
+			closeIdx := -1
+			for scan < len(out) {
+				nextOpen := strings.Index(out[scan:], "<blockquote>")
+				nextClose := strings.Index(out[scan:], "</blockquote>")
+				if nextClose < 0 {
+					break
+				}
+				if nextOpen >= 0 && nextOpen < nextClose {
+					depth++
+					scan += nextOpen + len("<blockquote>")
+				} else {
+					depth--
+					if depth == 0 {
+						closeIdx = scan + nextClose
+						break
+					}
+					scan += nextClose + len("</blockquote>")
+				}
+			}
+			if closeIdx < 0 {
+				b.WriteString(out[pos:])
+				break
+			}
+			innerHTML := out[innerStart:closeIdx]
+			if m := ghAlertMarkerRe.FindStringSubmatchIndex(innerHTML); m != nil {
+				kindLower := strings.ToLower(innerHTML[m[2]:m[3]])
+				matchedPrefix := innerHTML[m[0]:m[1]]
+				rest := innerHTML[m[1]:]
+				var bodyHTML string
+				if strings.HasSuffix(strings.TrimSpace(matchedPrefix), "</p>") {
+					bodyHTML = strings.TrimSpace(rest)
+				} else {
+					bodyHTML = "<p>" + strings.TrimLeft(rest, " \t\r\n")
+				}
+				role := "note"
+				if kindLower == "warning" || kindLower == "caution" {
+					role = "alert"
+				}
+				title := alertDefaultTitle(kindLower, locale)
+				b.WriteString(out[pos:openIdx])
+				b.WriteString(`<aside class="volo-callout volo-callout--` + kindLower + `" data-callout="` + kindLower + `" role="` + role + `">`)
+				b.WriteString(`<p class="volo-callout__title">` + html.EscapeString(title) + `</p>`)
+				if bodyHTML != "" && bodyHTML != "<p></p>" {
+					b.WriteString(`<div class="volo-callout__body">` + bodyHTML + `</div>`)
+				}
+				b.WriteString(`</aside>`)
+				pos = closeIdx + len("</blockquote>")
+				changed = true
+				continue
+			}
+			b.WriteString(out[pos : openIdx+len("<blockquote>")])
+			pos = innerStart
+		}
+		out = b.String()
+		if !changed || !strings.Contains(out, "[!") {
+			break
+		}
+	}
+	return out
+}
+

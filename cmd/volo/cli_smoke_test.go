@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Willh92/Volo-go/internal/db/sqlx"
 )
 
 func buildMinimalLegacyZip(t *testing.T, zipPath string) {
@@ -197,3 +199,96 @@ func TestM6_CLIUnixSocketHealthcheckAndAdminOps(t *testing.T) {
 		t.Fatalf("volo serve graceful shutdown exited %d: %s", exitCode, serveErr.String())
 	}
 }
+
+func TestRound3_CLIResetPasswordAndPasswdRevokeAPITokensAndSessions(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "data")
+	uploadDir := filepath.Join(tmp, "uploads")
+	backupDir := filepath.Join(tmp, "backups")
+	commonArgs := []string{
+		"--data-dir", dataDir,
+		"--upload-dir", uploadDir,
+		"--backup-dir", backupDir,
+		"--secret-key", "0123456789abcdef0123456789abcdef-cli-r3-secret",
+	}
+
+	execCLI := func(args ...string) (int, string, string) {
+		var outBuf, errBuf bytes.Buffer
+		code := runCLI(ctx, args, &outBuf, &errBuf)
+		return code, outBuf.String(), errBuf.String()
+	}
+
+	legacyZip := filepath.Join(tmp, "legacy.zip")
+	buildMinimalLegacyZip(t, legacyZip)
+	if code, _, errStr := execCLI(append([]string{"import-legacy", legacyZip}, commonArgs...)...); code != 0 {
+		t.Fatalf("import-legacy failed: %d %s", code, errStr)
+	}
+
+	dbPath := filepath.Join(dataDir, "volo.db")
+	seedCreds := func(tag string) string {
+		store, err := sqlx.Open(ctx, sqlx.Options{Driver: "sqlite", DSN: dbPath})
+		if err != nil {
+			t.Fatalf("sqlx.Open: %v", err)
+		}
+		defer store.Close()
+
+		var uid string
+		if err := store.QueryRowContext(ctx, `SELECT id FROM users WHERE username = 'cliadmin'`).Scan(&uid); err != nil {
+			t.Fatalf("lookup cliadmin: %v", err)
+		}
+		now := time.Now().UnixMilli()
+		if _, err := store.ExecContext(ctx, `INSERT INTO user_sessions (
+			id, user_id, token_hash, ip_masked, geo_region, user_agent, totp_verified_until, expires_at, last_seen_at, created_at
+		) VALUES (?, ?, ?, '127.0.0.0/24', '', 'cli-test', 0, ?, ?, ?)`,
+			"sess_"+tag, uid, "hash_sess_"+tag, now+86400000, now, now); err != nil {
+			t.Fatalf("insert user_session: %v", err)
+		}
+		if _, err := store.ExecContext(ctx, `INSERT INTO api_tokens (
+			id, user_id, name, token_prefix, token_hash, scopes_json, last_used_at, expires_at, created_at
+		) VALUES (?, ?, 'CLI Token', 'volo_pat_', ?, '["articles:write"]', 0, 0, ?)`,
+			"pat_"+tag, uid, "hash_pat_"+tag, now); err != nil {
+			t.Fatalf("insert api_token: %v", err)
+		}
+		// Seed a bystander token for another user to verify scoping
+		_, _ = store.ExecContext(ctx, `INSERT INTO api_tokens (
+			id, user_id, name, token_prefix, token_hash, scopes_json, last_used_at, expires_at, created_at
+		) VALUES ('pat_other', 'u_other_99', 'Other Token', 'volo_pat_', 'hash_pat_other', '["articles:read"]', 0, 0, ?)`, now)
+		return uid
+	}
+
+	countCreds := func(uid string) (int, int, int) {
+		store, err := sqlx.Open(ctx, sqlx.Options{Driver: "sqlite", DSN: dbPath})
+		if err != nil {
+			t.Fatalf("sqlx.Open: %v", err)
+		}
+		defer store.Close()
+		var sessCnt, patCnt, otherPatCnt int
+		_ = store.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_sessions WHERE user_id = ?`, uid).Scan(&sessCnt)
+		_ = store.QueryRowContext(ctx, `SELECT COUNT(*) FROM api_tokens WHERE user_id = ?`, uid).Scan(&patCnt)
+		_ = store.QueryRowContext(ctx, `SELECT COUNT(*) FROM api_tokens WHERE user_id = 'u_other_99'`).Scan(&otherPatCnt)
+		return sessCnt, patCnt, otherPatCnt
+	}
+
+	uid := seedCreds("r1")
+	code, out, errStr := execCLI(append([]string{"admin", "reset-password", "--user", "cliadmin", "--password", "R3!StrongPass#2026"}, commonArgs...)...)
+	if code != 0 || !strings.Contains(out, "active sessions and API tokens revoked") {
+		t.Fatalf("admin reset-password failed: code=%d out=%q err=%q", code, out, errStr)
+	}
+	sessCnt, patCnt, otherPatCnt := countCreds(uid)
+	if sessCnt != 0 || patCnt != 0 || otherPatCnt != 1 {
+		t.Fatalf("expected sess=0 pat=0 otherPat=1 after admin reset-password, got sess=%d pat=%d otherPat=%d", sessCnt, patCnt, otherPatCnt)
+	}
+
+	// Verify top-level `volo passwd` alias also revokes sessions + api_tokens and generates a strong password when --password is omitted
+	_ = seedCreds("r2")
+	code, out, errStr = execCLI(append([]string{"passwd", "--user", "cliadmin@example.com"}, commonArgs...)...)
+	if code != 0 || !strings.Contains(out, "Generated temporary password:") {
+		t.Fatalf("volo passwd alias failed: code=%d out=%q err=%q", code, out, errStr)
+	}
+	sessCnt, patCnt, otherPatCnt = countCreds(uid)
+	if sessCnt != 0 || patCnt != 0 || otherPatCnt != 1 {
+		t.Fatalf("expected sess=0 pat=0 otherPat=1 after volo passwd, got sess=%d pat=%d otherPat=%d", sessCnt, patCnt, otherPatCnt)
+	}
+}
+

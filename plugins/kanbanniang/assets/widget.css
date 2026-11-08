@@ -141,6 +141,14 @@ body.has-podcast-mini .volo-kbn-dock[data-position="right"] {
   }
 }
 
+@media (max-width: 900px) {
+  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-left,
+  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-dock[data-position="left"],
+  .volo-kbn-dock.is-book-fab-offset:not([data-position="right"]) {
+    bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+  }
+}
+
 @media (max-width: 760px) {
   .volo-kbn-hide-mobile {
     display: none !important;
@@ -149,6 +157,11 @@ body.has-podcast-mini .volo-kbn-dock[data-position="right"] {
   .volo-kbn-dock[data-position="left"] {
     left: 14px;
     bottom: max(16px, calc(env(safe-area-inset-bottom) + 12px));
+  }
+  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-left,
+  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-dock[data-position="left"],
+  .volo-kbn-dock.is-book-fab-offset:not([data-position="right"]) {
+    bottom: calc(68px + env(safe-area-inset-bottom, 0px));
   }
   .volo-kbn-right,
   .volo-kbn-dock[data-position="right"] {

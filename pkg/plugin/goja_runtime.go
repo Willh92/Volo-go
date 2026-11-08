@@ -39,12 +39,14 @@ type pooledVM struct {
 	vm           *jsRuntime
 	exports      *jsObject
 	hookHandlers map[string][]*jsFunc
+	hooksFrozen  bool
 	reqCtx       context.Context
 }
 
 type pluginRateBucket struct {
-	windowMin int64
-	count     int
+	windowID    int64
+	expiresUnix int64
+	count       int
 }
 
 type gojaPluginRuntime struct {
@@ -236,6 +238,9 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 		return html.EscapeString(raw)
 	})
 	voloObj.setVal("on", nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if wrapper.hooksFrozen {
+			return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", "volo.on can only be called during top-level module initialization")}
+		}
 		if len(args) < 2 {
 			return jsUndefinedVal, &jsThrownError{val: rt.newErrorVal("TypeError", "volo.on requires (hookName, handlerFn)")}
 		}
@@ -277,63 +282,73 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	})
 	voloObj.Set("i18n", i18nBridge)
 
-	cryptoBridge := vm.NewObject()
-	cryptoBridge.Set("sha256", func(input string) string {
-		sum := sha256.Sum256([]byte(input))
-		return hex.EncodeToString(sum[:])
-	})
-	cryptoBridge.Set("hmacSha256", func(secret string, msg string) string {
-		mac := hmac.New(sha256.New, []byte(secret))
-		_, _ = mac.Write([]byte(msg))
-		return hex.EncodeToString(mac.Sum(nil))
-	})
-	cryptoBridge.Set("randomUUID", func() (string, error) {
-		var b [16]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			return "", err
-		}
-		b[6] = (b[6] & 0x0f) | 0x40
-		b[8] = (b[8] & 0x3f) | 0x80
-		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
-	})
-	voloObj.Set("crypto", cryptoBridge)
+	if r.manifest.HasPermission("crypto") {
+		cryptoBridge := vm.NewObject()
+		cryptoBridge.Set("sha256", func(input string) string {
+			sum := sha256.Sum256([]byte(input))
+			return hex.EncodeToString(sum[:])
+		})
+		cryptoBridge.Set("hmacSha256", func(secret string, msg string) string {
+			mac := hmac.New(sha256.New, []byte(secret))
+			_, _ = mac.Write([]byte(msg))
+			return hex.EncodeToString(mac.Sum(nil))
+		})
+		cryptoBridge.Set("randomUUID", func() (string, error) {
+			var b [16]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				return "", err
+			}
+			b[6] = (b[6] & 0x0f) | 0x40
+			b[8] = (b[8] & 0x3f) | 0x80
+			return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+		})
+		voloObj.Set("crypto", cryptoBridge)
+	}
 
-	siteBridge := vm.NewObject()
-	siteBridge.Set("info", func() map[string]any {
-		if r.getSiteInfo == nil {
-			return map[string]any{}
-		}
-		info := r.getSiteInfo()
-		if info == nil {
-			return map[string]any{}
-		}
-		out := make(map[string]any, len(info))
-		for k, v := range info {
-			out[k] = v
-		}
-		return out
-	})
-	voloObj.Set("site", siteBridge)
+	if r.manifest.HasPermission("site:read") {
+		siteBridge := vm.NewObject()
+		siteBridge.Set("info", func() map[string]any {
+			if r.getSiteInfo == nil {
+				return map[string]any{}
+			}
+			info := r.getSiteInfo()
+			if info == nil {
+				return map[string]any{}
+			}
+			out := make(map[string]any, len(info))
+			for k, v := range info {
+				out[k] = v
+			}
+			return out
+		})
+		voloObj.Set("site", siteBridge)
+	}
 
-	rlNative := func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) < 2 {
+	if r.manifest.HasPermission("ratelimit") || r.manifest.HasPermission("http:routes") {
+		rlNative := func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if len(args) < 2 {
+				return jsFalseVal, nil
+			}
+			windowSec := 60
+			if len(args) >= 3 && args[2].kind != valUndefined && args[2].kind != valNull {
+				windowSec = int(args[2].toNumber())
+			}
+			if r.checkRateLimit(args[0].toString(), int(args[1].toNumber()), windowSec) {
+				return jsTrueVal, nil
+			}
 			return jsFalseVal, nil
 		}
-		if r.checkRateLimit(args[0].toString(), int(args[1].toNumber())) {
-			return jsTrueVal, nil
-		}
-		return jsFalseVal, nil
-	}
-	voloObj.setVal("rateLimit", jsValue{
-		kind: valFunc,
-		fn: &jsFunc{
-			name:   "rateLimit",
-			native: rlNative,
-			props: map[string]jsValue{
-				"allow": nativeVal(rlNative),
+		voloObj.setVal("rateLimit", jsValue{
+			kind: valFunc,
+			fn: &jsFunc{
+				name:   "rateLimit",
+				native: rlNative,
+				props: map[string]jsValue{
+					"allow": nativeVal(rlNative),
+				},
 			},
-		},
-	})
+		})
+	}
 
 	// Capability 1: plugin_kv (ONLY injected if manifest declares kv / kv:rw / kv:read).
 	if r.manifest.CanReadKV() && r.kv != nil {
@@ -411,6 +426,7 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	if _, runErr := vm.RunProgram(r.program); runErr != nil {
 		return nil, normalizeJSError(r.manifest.ID, "init", runErr)
 	}
+	wrapper.hooksFrozen = true
 
 	modVal := moduleObj.get("exports")
 	if modVal.kind == valObject && modVal.obj != nil {
@@ -677,9 +693,15 @@ func normalizeJSError(pluginID string, stage string, err error) error {
 	return fmt.Errorf("plugin %q (%s): %w", pluginID, stage, err)
 }
 
-func (r *gojaPluginRuntime) checkRateLimit(key string, maxPerMinute int) bool {
-	if maxPerMinute <= 0 {
+func (r *gojaPluginRuntime) checkRateLimit(key string, maxCount int, windowSec int) bool {
+	if maxCount <= 0 {
 		return false
+	}
+	if windowSec <= 0 {
+		windowSec = 60
+	}
+	if windowSec > 86400 {
+		windowSec = 86400
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -688,14 +710,16 @@ func (r *gojaPluginRuntime) checkRateLimit(key string, maxPerMinute int) bool {
 	if len(key) > 256 {
 		key = key[:256]
 	}
-	nowMin := time.Now().Unix() / 60
+	nowUnix := time.Now().Unix()
+	winSec := int64(windowSec)
+	windowID := nowUnix / winSec
 
 	r.rateMu.Lock()
 	defer r.rateMu.Unlock()
 
 	if len(r.rateBuckets) >= maxPluginRateLimitKeys {
 		for k, b := range r.rateBuckets {
-			if b.windowMin < nowMin {
+			if b.expiresUnix <= nowUnix {
 				delete(r.rateBuckets, k)
 			}
 		}
@@ -708,10 +732,14 @@ func (r *gojaPluginRuntime) checkRateLimit(key string, maxPerMinute int) bool {
 	}
 
 	b := r.rateBuckets[key]
-	if b.windowMin != nowMin {
-		b = pluginRateBucket{windowMin: nowMin, count: 0}
+	if b.windowID != windowID || b.expiresUnix <= nowUnix {
+		b = pluginRateBucket{
+			windowID:    windowID,
+			expiresUnix: (windowID + 1) * winSec,
+			count:       0,
+		}
 	}
-	if b.count >= maxPerMinute {
+	if b.count >= maxCount {
 		r.rateBuckets[key] = b
 		return false
 	}

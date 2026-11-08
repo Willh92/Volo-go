@@ -15,8 +15,11 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/db/migrate"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -25,7 +28,7 @@ import (
 
 const (
 	BackupFormatVersion  = "volo-backup-v1"
-	maxRestoreZipEntries = 10000
+	maxRestoreZipEntries = 250_000
 	maxSingleEntryBytes  = 512 * 1024 * 1024  // 512 MiB per stream guard against zip bombs
 	maxTotalRestoreBytes = 2048 * 1024 * 1024 // 2 GiB total unpacked cap
 	restoreBatchSize     = 200
@@ -83,11 +86,12 @@ func CreateToFile(ctx context.Context, store *sqlx.Store, outputZipPath string, 
 	if err := os.MkdirAll(filepath.Dir(outputZipPath), 0o750); err != nil {
 		return nil, fmt.Errorf("backup: mkdir parent: %w", err)
 	}
-	tmpPath := fmt.Sprintf("%s.tmp.%d", outputZipPath, os.Getpid())
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.CreateTemp(filepath.Dir(outputZipPath), ".volo-backup-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("backup: create temp archive: %w", err)
 	}
+	tmpPath := f.Name()
+	_ = f.Chmod(0o600)
 	manifest, err := Create(ctx, store, f, opts)
 	if err != nil {
 		_ = f.Close()
@@ -423,6 +427,18 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		expectedMap[fd.Path] = fd
 	}
 
+	// Fail closed if the ZIP archive contains ANY undeclared table or media stream missing from manifest.json!
+	for clean, zf := range fileIndex {
+		if clean == "manifest.json" || zf == nil || zf.FileInfo().IsDir() {
+			continue
+		}
+		if strings.HasPrefix(clean, "tables/") || strings.HasPrefix(clean, "uploads/") || strings.HasPrefix(clean, "media/") {
+			if _, declared := expectedMap[clean]; !declared {
+				return nil, fmt.Errorf("backup: unsigned extra archive entry %q missing from manifest.json", clean)
+			}
+		}
+	}
+
 	summary := &RestoreSummary{
 		SourceDialect: manifest.SourceDialect,
 		Tables:        make(map[string]int64, len(migrate.CanonicalTables)),
@@ -458,8 +474,11 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 
 		for _, tbl := range migrate.CanonicalTables {
 			entryName := "tables/" + tbl + ".ndjson"
+			if _, verified := expectedMap[entryName]; !verified {
+				continue
+			}
 			zf, exists := fileIndex[entryName]
-			if !exists {
+			if !exists || zf == nil || zf.FileInfo().IsDir() {
 				continue
 			}
 			n, insErr := streamNDJSONIntoTable(ctx, tx, tbl, zf, existingAdmins)
@@ -488,6 +507,10 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 			if !strings.HasPrefix(fd.Path, "uploads/") {
 				continue
 			}
+			zf := fileIndex[fd.Path]
+			if zf == nil || zf.FileInfo().IsDir() {
+				continue
+			}
 			rel := strings.TrimPrefix(fd.Path, "uploads/")
 			target := filepath.Join(realUploadRoot, filepath.FromSlash(rel))
 			if !strings.HasPrefix(target, realUploadRoot+string(os.PathSeparator)) {
@@ -496,7 +519,7 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 				return nil, err
 			}
-			rc, err := fileIndex[fd.Path].Open()
+			rc, err := zf.Open()
 			if err != nil {
 				return nil, err
 			}
@@ -545,6 +568,11 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 	dec.UseNumber()
 
 	stmtSQLCache := make(map[string]string)
+	isMySQL := tx.Dialect().Name() == "mysql"
+	var mysqlUniqueSeen map[string]map[string]bool
+	if isMySQL && len(mysqlUniqueColumnsForTable(table)) > 0 {
+		mysqlUniqueSeen = make(map[string]map[string]bool)
+	}
 	var count int64
 
 	for {
@@ -561,6 +589,9 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 
 		if table == "users" {
 			patchRedactedAdminRow(row, fallbackAdmins)
+		}
+		if mysqlUniqueSeen != nil {
+			disambiguateMySQLUniqueRow(table, row, mysqlUniqueSeen)
 		}
 
 		cols := make([]string, 0, len(row))
@@ -606,6 +637,157 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 		count++
 	}
 	return count, nil
+}
+
+func mysqlUniqueColumnsForTable(table string) []string {
+	switch table {
+	case "tags":
+		return []string{"name", "slug"}
+	case "redirects":
+		return []string{"source_path"}
+	case "users":
+		return []string{"username", "email"}
+	case "categories", "articles", "pages", "series", "books":
+		return []string{"slug"}
+	default:
+		return nil
+	}
+}
+
+func mysqlMaxColRunes(table string, col string) int {
+	switch table + "." + col {
+	case "users.username":
+		return 64
+	case "tags.name", "tags.slug", "categories.slug":
+		return 128
+	case "redirects.source_path":
+		return 512
+	default:
+		return 190
+	}
+}
+
+func truncateRunesForMySQL(s string, maxRunes int) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:maxRunes])
+}
+
+// mysqlUnicodeCIFoldKey approximates MySQL `utf8mb4_unicode_ci` (UCA case + accent + ligature + PAD SPACE folding)
+// in pure Go stdlib so case/accent-colliding keys from SQLite/Postgres are deterministically disambiguated.
+func mysqlUnicodeCIFoldKey(s string) string {
+	s = strings.TrimRight(s, " ")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
+		if r >= 0xFF01 && r <= 0xFF5E {
+			r -= 0xFEE0
+		}
+		r = unicode.ToLower(r)
+		switch r {
+		case 'à', 'á', 'â', 'ã', 'ä', 'å', 'ā', 'ă', 'ą':
+			b.WriteByte('a')
+		case 'æ':
+			b.WriteString("ae")
+		case 'ç', 'ć', 'ĉ', 'ċ', 'č':
+			b.WriteByte('c')
+		case 'ď', 'đ', 'ð':
+			b.WriteByte('d')
+		case 'è', 'é', 'ê', 'ë', 'ē', 'ĕ', 'ė', 'ę', 'ě':
+			b.WriteByte('e')
+		case 'ĝ', 'ğ', 'ġ', 'ģ':
+			b.WriteByte('g')
+		case 'ĥ', 'ħ':
+			b.WriteByte('h')
+		case 'ì', 'í', 'î', 'ĩ', 'ï', 'ī', 'ĭ', 'į', 'ı':
+			b.WriteByte('i')
+		case 'ĵ':
+			b.WriteByte('j')
+		case 'ķ':
+			b.WriteByte('k')
+		case 'ĺ', 'ļ', 'ľ', 'ŀ', 'ł':
+			b.WriteByte('l')
+		case 'ñ', 'ń', 'ņ', 'ň':
+			b.WriteByte('n')
+		case 'ò', 'ó', 'ô', 'õ', 'ö', 'ø', 'ō', 'ŏ', 'ő':
+			b.WriteByte('o')
+		case 'œ':
+			b.WriteString("oe")
+		case 'ŕ', 'ŗ', 'ř':
+			b.WriteByte('r')
+		case 'ś', 'ŝ', 'ş', 'š', 'ſ':
+			b.WriteByte('s')
+		case 'ß':
+			b.WriteString("ss")
+		case 'ţ', 'ť', 'ŧ':
+			b.WriteByte('t')
+		case 'ù', 'ú', 'û', 'ũ', 'ü', 'ū', 'ŭ', 'ů', 'ű', 'ų':
+			b.WriteByte('u')
+		case 'ŵ':
+			b.WriteByte('w')
+		case 'ý', 'ÿ', 'ŷ':
+			b.WriteByte('y')
+		case 'ź', 'ż', 'ž':
+			b.WriteByte('z')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func disambiguateMySQLUniqueRow(table string, row map[string]any, seen map[string]map[string]bool) {
+	for _, col := range mysqlUniqueColumnsForTable(table) {
+		rawVal, ok := row[col]
+		if !ok || rawVal == nil {
+			continue
+		}
+		str, ok := rawVal.(string)
+		if !ok {
+			continue
+		}
+		colSeen := seen[col]
+		if colSeen == nil {
+			colSeen = make(map[string]bool)
+			seen[col] = colSeen
+		}
+		maxRunes := mysqlMaxColRunes(table, col)
+		candidate := truncateRunesForMySQL(str, maxRunes)
+		fold := mysqlUnicodeCIFoldKey(candidate)
+		if !colSeen[fold] {
+			colSeen[fold] = true
+			if candidate != str {
+				row[col] = candidate
+			}
+			continue
+		}
+		base := strings.TrimRight(str, " ")
+		for n := 2; ; n++ {
+			suffix := "-" + strconv.Itoa(n)
+			switch {
+			case col == "email" && strings.Contains(base, "@"):
+				local, dom, _ := strings.Cut(base, "@")
+				tag := "+" + strconv.Itoa(n) + "@" + dom
+				candidate = truncateRunesForMySQL(local, maxRunes-utf8.RuneCountInString(tag)) + tag
+			case col == "name":
+				tag := " (" + strconv.Itoa(n) + ")"
+				candidate = truncateRunesForMySQL(base, maxRunes-utf8.RuneCountInString(tag)) + tag
+			default:
+				candidate = truncateRunesForMySQL(base, maxRunes-utf8.RuneCountInString(suffix)) + suffix
+			}
+			fold = mysqlUnicodeCIFoldKey(candidate)
+			if !colSeen[fold] {
+				colSeen[fold] = true
+				row[col] = candidate
+				break
+			}
+		}
+	}
 }
 
 func patchRedactedAdminRow(row map[string]any, fallbackAdmins []domain.User) {

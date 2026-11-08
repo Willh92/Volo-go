@@ -1,8 +1,9 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import {
   accentSig,
   apiFetch,
   applyThemeAttributes,
+  dirtyEditorSig,
   openConfirm,
   resetConsoleScroll,
   showToast,
@@ -671,7 +672,9 @@ export function AppearanceWorkspace({
   const [locPacks, setLocPacks] = useState<any[]>([]);
   const [localesDir, setLocalesDir] = useState<string>("");
   const [defaultLocale, setDefaultLocale] = useState<string>("zh-CN");
+  const [siteVer, setSiteVer] = useState<number>(0);
   const [locPage, setLocPage] = useState<number>(1);
+  const draftCssRef = useRef<string | null>(null);
 
   const [plugins, setPlugins] = useState<any[]>([]);
   const [pluginPage, setPluginPage] = useState<number>(1);
@@ -682,9 +685,21 @@ export function AppearanceWorkspace({
   const [logsModalOpen, setLogsModalOpen] = useState<boolean>(false);
 
   useEffect(() => {
+    if (activeTab !== "themes" && draftCssRef.current !== null && !dirtyEditorSig.value) {
+      draftCssRef.current = null;
+    }
     setSub(activeTab);
     resetConsoleScroll();
   }, [activeTab]);
+
+  useEffect(() => {
+    return () => {
+      if (draftCssRef.current !== null) {
+        draftCssRef.current = null;
+        dirtyEditorSig.value = false;
+      }
+    };
+  }, []);
 
   const loadData = async (silent = false) => {
     if (!silent) setLoading(true);
@@ -697,18 +712,27 @@ export function AppearanceWorkspace({
           apiFetch<any>("/api/admin/settings"),
         ]);
         setThemes(th.themes || th.items || []);
-        setAppCfg({ ...(th.appearance || {}), ...(st.domains?.appearance || {}) });
+        const nextApp = { ...(th.appearance || {}), ...(st.domains?.appearance || {}) };
+        if (draftCssRef.current !== null) {
+          nextApp.custom_css = draftCssRef.current;
+        }
+        setAppCfg(nextApp);
         setAppVer(st.versions?.appearance || 0);
       } else if (sub === "locales") {
-        const res = await apiFetch<{
-          locales_dir?: string;
-          default_locale?: string;
-          items?: any[];
-          locales?: any[];
-        }>("/api/admin/locales");
+        const [res, siteRes] = await Promise.all([
+          apiFetch<{
+            locales_dir?: string;
+            default_locale?: string;
+            site_version?: number;
+            items?: any[];
+            locales?: any[];
+          }>("/api/admin/locales"),
+          apiFetch<{ version?: number }>("/api/admin/settings/site").catch(() => ({ version: 0 })),
+        ]);
         setLocPacks(res.items || []);
         setLocalesDir(res.locales_dir || "./locales");
         setDefaultLocale(res.default_locale || "zh-CN");
+        setSiteVer(typeof res.site_version === "number" && res.site_version > 0 ? res.site_version : siteRes.version || 0);
         if (res.locales) {
           syncExternalLocales(res.locales);
         }
@@ -736,7 +760,13 @@ export function AppearanceWorkspace({
         method: "POST",
         body: JSON.stringify({ theme_id: themeID, target }),
       });
-      if (res?.appearance) setAppCfg(res.appearance);
+      if (res?.appearance) {
+        setAppCfg(
+          draftCssRef.current !== null
+            ? { ...res.appearance, custom_css: draftCssRef.current }
+            : res.appearance,
+        );
+      }
       if (typeof res?.version === "number") setAppVer(res.version);
       showToast(t("common.saved"), "ok");
     } catch (err: any) {
@@ -1055,7 +1085,6 @@ export function AppearanceWorkspace({
                     class={`volo-btn volo-btn-sm ${(appCfg.accent || accentSig.value) === ac.id ? "volo-btn-primary" : ""}`}
                     onClick={() => {
                       setAppCfg({ ...appCfg, accent: ac.id });
-                      applyThemeAttributes(themeModeSig.value, ac.id, false);
                     }}
                   >
                     <span class="volo-swatch-dot" style={{ background: ac.swatch, width: "11px", height: "11px" }} />
@@ -1069,7 +1098,13 @@ export function AppearanceWorkspace({
               <label>{t("app.custom_css")}</label>
               <CM6CssEditor
                 value={appCfg.custom_css || ""}
-                onChange={(css) => setAppCfg({ ...appCfg, custom_css: css })}
+                onChange={(css) => {
+                  if (css !== (appCfg.custom_css || "")) {
+                    draftCssRef.current = css;
+                    dirtyEditorSig.value = true;
+                  }
+                  setAppCfg({ ...appCfg, custom_css: css });
+                }}
               />
             </div>
 
@@ -1098,14 +1133,15 @@ export function AppearanceWorkspace({
                 onClick={async () => {
                   try {
                     const nextAccent = appCfg.accent || accentSig.value || "forest";
-                    const nextMode = appCfg.default_mode || "auto";
                     const res = await apiFetch<any>("/api/admin/settings/appearance", {
                       method: "PATCH",
                       body: JSON.stringify({ expected_version: appVer, ...appCfg, accent: nextAccent }),
                     });
+                    draftCssRef.current = null;
+                    dirtyEditorSig.value = false;
                     setAppCfg(res.value || { ...appCfg, accent: nextAccent });
                     setAppVer(res.version);
-                    applyThemeAttributes(nextMode, nextAccent, true);
+                    applyThemeAttributes(themeModeSig.value, nextAccent, false);
                     showToast(t("common.saved"), "ok");
                   } catch (err: any) {
                     showToast(err.message, "err");
@@ -1143,12 +1179,13 @@ export function AppearanceWorkspace({
                   try {
                     const fd = new FormData();
                     fd.append("file", f);
-                    const res = await apiFetch<{ items?: any[]; locales?: any[] }>("/api/admin/locales/install", {
+                    const res = await apiFetch<{ items?: any[]; locales?: any[]; site_version?: number }>("/api/admin/locales/install", {
                       method: "POST",
                       body: fd,
                     });
                     if (res.locales) syncExternalLocales(res.locales);
                     if (res.items) setLocPacks(res.items);
+                    if (typeof res.site_version === "number" && res.site_version > 0) setSiteVer(res.site_version);
                     await ensureLocaleLoaded(localeSig.value, true);
                     showToast(t("app.loc_installed"), "ok");
                   } catch (err: any) {
@@ -1163,12 +1200,13 @@ export function AppearanceWorkspace({
                 class="volo-btn volo-btn-sm"
                 onClick={async () => {
                   try {
-                    const res = await apiFetch<{ items?: any[]; locales?: any[] }>("/api/admin/locales/reload", {
+                    const res = await apiFetch<{ items?: any[]; locales?: any[]; site_version?: number }>("/api/admin/locales/reload", {
                       method: "POST",
                       body: "{}",
                     });
                     if (res.locales) syncExternalLocales(res.locales);
                     if (res.items) setLocPacks(res.items);
+                    if (typeof res.site_version === "number" && res.site_version > 0) setSiteVer(res.site_version);
                     await ensureLocaleLoaded(localeSig.value, true);
                     showToast(t("app.loc_reloaded"), "ok");
                   } catch (err: any) {
@@ -1281,10 +1319,14 @@ export function AppearanceWorkspace({
                                   hidden: isDef,
                                   onClick: async () => {
                                     try {
-                                      await apiFetch("/api/admin/settings/site", {
+                                      const saved = await apiFetch<{ version?: number }>("/api/admin/settings/site", {
                                         method: "PATCH",
-                                        body: JSON.stringify({ default_locale: p.code }),
+                                        body: JSON.stringify({
+                                          ...(siteVer > 0 ? { expected_version: siteVer } : {}),
+                                          default_locale: p.code,
+                                        }),
                                       });
+                                      if (typeof saved?.version === "number") setSiteVer(saved.version);
                                       setDefaultLocale(p.code);
                                       showToast(t("common.saved"), "ok");
                                     } catch (err: any) {
@@ -1451,7 +1493,7 @@ export function AppearanceWorkspace({
                           </span>
                         </td>
                         <td class="col-status" data-label={t("art.status")}>
-                          <div style={{ display: "flex", flexDirection: "column", gap: "6px", alignItems: "flex-start" }}>
+                          <div class="volo-plugin-status-stack">
                             <SwitchToggle
                               checked={Boolean(p.is_enabled)}
                               label={p.is_enabled ? t("app.enabled") : t("app.disabled")}

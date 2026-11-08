@@ -661,9 +661,10 @@ func TestM5_AtomicSettingsPatchSecretMaskingRBACAndRevisions(t *testing.T) {
 
 	// 4. Scoped API Token (`volo_pat_...`): stateless Bearer auth without CSRF, strict scope enforcement
 	patResp, patRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/tokens", map[string]any{
-		"name":            "Obsidian Reader",
-		"scopes":          []string{"articles:read"},
-		"expires_in_days": 30,
+		"name":             "Obsidian Reader",
+		"scopes":           []string{"articles:read"},
+		"expires_in_days":  30,
+		"current_password": "Admin!Password#2026",
 	}, adminCookies, adminCSRF)
 	if patResp.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /api/admin/security/tokens = %d %s", patResp.StatusCode, string(patRaw))

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -255,6 +256,26 @@ func (s *Service) LoginStaff(
 			u.PasswordHash = newHash
 			u.LegacyHash = ""
 		}
+	}
+
+	return s.CompleteStaffPrimaryLogin(ctx, u, clientIP, geoRegion, userAgent, trusted2FACookie)
+}
+
+// CompleteStaffPrimaryLogin enforces active staff role/status and Step-2 TOTP 2FA identically
+// for both password-based staff login and bound staff OIDC SSO login.
+func (s *Service) CompleteStaffPrimaryLogin(
+	ctx context.Context,
+	u domain.User,
+	clientIP netip.Addr,
+	geoRegion string,
+	userAgent string,
+	trusted2FACookie string,
+) (*LoginResult, error) {
+	if u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor {
+		return nil, ErrForbidden
+	}
+	if u.Status != domain.UserStatusActive {
+		return nil, ErrForbidden
 	}
 
 	totpSecretCipher, hasTOTP, err := s.activeTOTPSecretCiphertext(ctx, u.ID)
@@ -1016,6 +1037,15 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 	return &clean, &rec, nil
 }
 
+// RevokeUserAPITokens deletes all Personal Access Tokens belonging to userID.
+func (s *Service) RevokeUserAPITokens(ctx context.Context, userID string) error {
+	if strings.TrimSpace(userID) == "" {
+		return nil
+	}
+	_, err := s.store.ExecContext(ctx, `DELETE FROM api_tokens WHERE user_id = ?`, userID)
+	return err
+}
+
 // --- Internal helpers ---
 
 func (s *Service) findUserByIdent(ctx context.Context, ident string) (domain.User, error) {
@@ -1047,13 +1077,12 @@ func (s *Service) userHasTOTPEnabled(ctx context.Context, userID string) (bool, 
 }
 
 func credentialBindingDigest(pwHash string, totpSecretCiphertext string) string {
-	h := sha256.New()
-	h.Write([]byte("volo-2fabind:v2:"))
-	h.Write([]byte(pwHash))
-	h.Write([]byte{0})
-	h.Write([]byte(totpSecretCiphertext))
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum[:12])
+	salt := []byte("volo-2fabind:v2:" + totpSecretCiphertext)
+	dk, err := pbkdf2.Key(sha256.New, pwHash, salt, 1024, 12)
+	if err != nil {
+		return ""
+	}
+	return hex.EncodeToString(dk)
 }
 
 func (s *Service) mintTrusted2FATicket(userID string, passwordHash string, totpSecretCiphertext string, userAgent string, expiresAtMS int64) (string, error) {

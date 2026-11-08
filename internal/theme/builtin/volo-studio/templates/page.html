@@ -19,8 +19,16 @@
         </div>
       {{end}}
       {{range .ArticleBeforeWidgets}}{{safeHTML .HTML}}{{end}}
+      {{if $showPageTOC}}
+        <div class="studio-mobile-toc-bar">
+          <button type="button" class="studio-mobile-toc-bar__btn js-mobile-toc-trigger" aria-controls="volo-toc-drawer" aria-expanded="false">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
+            <span>{{t .Locale "article.toc_title"}}</span>
+          </button>
+        </div>
+      {{end}}
       <div class="volo-prose">
-        {{safeHTML .StandalonePage.HTML}}
+        {{proseHTML .StandalonePage.HTML (coalesce .CurrentPath (printf "/%s" .StandalonePage.Slug)) .RawQuery}}
       </div>
       {{range .ArticleAfterWidgets}}{{safeHTML .HTML}}{{end}}
     </article>
@@ -34,14 +42,14 @@
     {{$minLvl := 6}}{{range .StandalonePage.TOC}}{{if lt .Level $minLvl}}{{$minLvl = .Level}}{{end}}{{end}}
     <aside id="volo-toc-slot" class="studio-toc-slot" aria-label="{{t .Locale "article.toc_title"}}">
       <section id="volo-toc-card" class="sidebar-card studio-toc volo-toc-card">
-        <button type="button" id="volo-toc-toggle" class="volo-toc-head" aria-expanded="true" aria-label="{{t .Locale "article.toc_title"}}">
+        <button type="button" id="volo-toc-toggle" class="volo-toc-head" aria-expanded="true" aria-controls="volo-toc-aside" aria-label="{{t .Locale "article.toc_title"}}">
           <svg class="volo-toc-head__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3 6h.01M3 12h.01M3 18h.01" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span class="volo-toc-head__title">{{t .Locale "article.toc_title"}}</span>
           <svg class="volo-toc-head__chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 14 4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
-        <div id="volo-toc-body" class="volo-toc-body">
+        <div id="volo-toc-aside" class="volo-toc-body" aria-hidden="false">
           <div class="volo-toc-body__inner">
-            <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
+            <nav id="volo-toc-list" class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
               {{range .StandalonePage.TOC}}
                 {{$depth := sub .Level $minLvl}}{{if lt $depth 0}}{{$depth = 0}}{{end}}{{if gt $depth 4}}{{$depth = 4}}{{end}}
                 <a class="volo-toc-link{{if gt $depth 0}} is-sub{{end}}" data-toc-id="{{.ID}}" href="#{{.ID}}" title="{{.Text}}" style="padding-left:{{add 12 (mul $depth 12)}}px"><span class="volo-toc-label">{{.Text}}</span></a>

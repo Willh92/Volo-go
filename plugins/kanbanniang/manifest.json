@@ -18,6 +18,7 @@
   },
   "permissions": [
     "kv",
+    "ratelimit",
     "slots:public.footer",
     "slots:admin.dashboard_card",
     "http:routes"

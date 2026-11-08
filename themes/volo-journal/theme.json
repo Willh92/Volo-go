@@ -123,9 +123,14 @@
       "key": "show_recent_posts",
       "type": "boolean",
       "label": {
-        "zh-CN": "显示近期与热门文章列表",
-        "en-US": "Show Recent & Popular Posts",
-        "zh-TW": "顯示近期與熱門文章列表"
+        "zh-CN": "显示底部近期与热门文章卡片",
+        "en-US": "Show Sidebar Recent & Popular Cards",
+        "zh-TW": "顯示底部近期與熱門文章卡片"
+      },
+      "description": {
+        "zh-CN": "控制页面底部辅助栏中的最新文章与浏览最多卡片，不影响首页主文章列表。",
+        "en-US": "Toggles the supplementary Recent Posts & Most Viewed cards below the main column without hiding the main journal feed.",
+        "zh-TW": "控制頁面底部輔助欄中的最新文章與瀏覽最多卡片，不影響首頁主文章列表。"
       },
       "default": true
     },

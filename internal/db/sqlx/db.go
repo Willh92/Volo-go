@@ -17,11 +17,12 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/jackc/pgx/v5/pgconn"
 	_ "modernc.org/sqlite"
 
 	"github.com/Willh92/Volo-go/internal/db/dialect"
 )
+
+var sqliteMemSeq atomic.Uint64
 
 // Queryer is implemented by both *Store (read-only path) and *Tx (transactional path).
 type Queryer interface {
@@ -52,6 +53,7 @@ type storeState struct {
 	readDB      *sql.DB
 	splitPools  bool
 	sqliteInMem bool
+	readOnly    bool
 	closeOnce   sync.Once
 }
 
@@ -61,7 +63,7 @@ func (st *storeState) close() error {
 	}
 	var firstErr error
 	st.closeOnce.Do(func() {
-		if st.dialect != nil && st.dialect.Name() == "sqlite" && !st.sqliteInMem && st.writeDB != nil {
+		if st.dialect != nil && st.dialect.Name() == "sqlite" && !st.sqliteInMem && !st.readOnly && st.writeDB != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_, _ = st.writeDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 			cancel()
@@ -85,13 +87,50 @@ func (st *storeState) close() error {
 // 2. Multi-statement writes execute inside WithTx with guaranteed rollback on error or panic.
 // 3. Case-insensitive struct column scanning across SQLite, PostgreSQL, MySQL, MariaDB, and TiDB.
 type Store struct {
-	state         atomic.Pointer[storeState]
-	dataRev       atomic.Uint64
-	sqliteWriteMu sync.Mutex
+	state          atomic.Pointer[storeState]
+	dataRev        atomic.Uint64
+	sqliteWriteSem chan struct{}
+	semOnce        sync.Once
+}
+
+func (s *Store) writeSem() chan struct{} {
+	s.semOnce.Do(func() {
+		if s.sqliteWriteSem == nil {
+			s.sqliteWriteSem = make(chan struct{}, 1)
+		}
+	})
+	return s.sqliteWriteSem
+}
+
+func (s *Store) acquireWriteLock(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sem := s.writeSem()
+	select {
+	case sem <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-sem
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Store) releaseWriteLock() {
+	<-s.writeSem()
 }
 
 func newStoreFromState(st *storeState) *Store {
-	s := &Store{}
+	s := &Store{
+		sqliteWriteSem: make(chan struct{}, 1),
+	}
+	s.writeSem()
 	s.state.Store(st)
 	s.dataRev.Store(1)
 	return s
@@ -122,14 +161,107 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	return st, nil
 }
 
+// OpenReadOnly initializes a read-only database pool for inspecting or migrating an existing source database.
+func OpenReadOnly(ctx context.Context, opts Options) (*Store, error) {
+	d, err := dialect.For(opts.Driver)
+	if err != nil {
+		return nil, err
+	}
+	if opts.MaxOpenConns <= 0 {
+		opts.MaxOpenConns = 2
+	}
+	if opts.MaxIdleConns <= 0 {
+		opts.MaxIdleConns = 1
+	}
+	var st *Store
+	switch d.Name() {
+	case "sqlite":
+		st, err = openSQLiteReadOnly(ctx, d, opts)
+	case "postgres":
+		st, err = openPostgres(ctx, d, opts)
+	case "mysql":
+		st, err = openMySQL(ctx, d, opts)
+	default:
+		return nil, fmt.Errorf("sqlx: unsupported dialect %q", d.Name())
+	}
+	if err != nil {
+		return nil, err
+	}
+	if s := st.state.Load(); s != nil {
+		s.readOnly = true
+	}
+	st.dataRev.Store(1)
+	return st, nil
+}
+
+func openSQLiteReadOnly(ctx context.Context, d dialect.Dialect, opts Options) (*Store, error) {
+	dsn := strings.TrimSpace(opts.DSN)
+	if dsn == "" {
+		return nil, errors.New("sqlx: sqlite DSN is required for read-only source")
+	}
+	isMem := dsn == ":memory:" || strings.Contains(dsn, "mode=memory") || strings.HasPrefix(dsn, "file::memory:")
+	var uri string
+	if isMem {
+		uri = buildSQLiteURI(dsn, true, true)
+	} else {
+		pathPart := strings.TrimPrefix(dsn, "file:")
+		if idx := strings.IndexByte(pathPart, '?'); idx >= 0 {
+			pathPart = pathPart[:idx]
+		}
+		if strings.Contains(pathPart, "..") {
+			return nil, errors.New("sqlx: sqlite path must not contain '..' traversal")
+		}
+		cleanPath := filepath.Clean(pathPart)
+		info, err := os.Stat(cleanPath)
+		if err != nil {
+			return nil, fmt.Errorf("sqlx: source sqlite file not accessible: %w", err)
+		}
+		if info.IsDir() {
+			return nil, errors.New("sqlx: source sqlite path points to a directory")
+		}
+		q := url.Values{}
+		q.Set("mode", "ro")
+		q.Add("_pragma", "query_only(ON)")
+		q.Add("_pragma", "busy_timeout(5000)")
+		q.Add("_pragma", "cache_size(-1024)")
+		uri = "file:" + cleanPath + "?" + q.Encode()
+	}
+	rdb, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return nil, fmt.Errorf("sqlx: open read-only sqlite: %w", err)
+	}
+	rdb.SetMaxOpenConns(2)
+	rdb.SetMaxIdleConns(1)
+	rdb.SetConnMaxIdleTime(30 * time.Second)
+	if err := rdb.PingContext(ctx); err != nil {
+		_ = rdb.Close()
+		return nil, fmt.Errorf("sqlx: ping read-only sqlite: %w", err)
+	}
+	return newStoreFromState(&storeState{
+		dialect:     d,
+		writeDB:     rdb,
+		readDB:      rdb,
+		splitPools:  false,
+		sqliteInMem: isMem,
+		readOnly:    true,
+	}), nil
+}
+
 func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, error) {
 	dsn := strings.TrimSpace(opts.DSN)
-	isMem := dsn == ":memory:" || strings.Contains(dsn, "mode=memory")
+	if dsn == ":memory:" {
+		dsn = fmt.Sprintf("file:volo_mem_%d?mode=memory&cache=shared", sqliteMemSeq.Add(1))
+	}
+	isMem := strings.Contains(dsn, "mode=memory") || strings.HasPrefix(dsn, "file::memory:")
+	isSharedMem := isMem && strings.Contains(dsn, "cache=shared")
 
 	if !isMem {
 		cleanPath := strings.TrimPrefix(dsn, "file:")
 		if idx := strings.IndexByte(cleanPath, '?'); idx >= 0 {
 			cleanPath = cleanPath[:idx]
+		}
+		if strings.Contains(cleanPath, "..") {
+			return nil, errors.New("sqlx: sqlite path must not contain '..' traversal")
 		}
 		if dir := filepath.Dir(cleanPath); dir != "" && dir != "." {
 			if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -143,9 +275,10 @@ func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, e
 	if err != nil {
 		return nil, fmt.Errorf("sqlx: open sqlite writer: %w", err)
 	}
-	// Single writer eliminates SQLITE_BUSY write lock contention completely.
+	// Single writer eliminates SQLITE_BUSY write lock contention and holds named shared-memory DB alive until Close().
 	wdb.SetMaxOpenConns(1)
 	wdb.SetMaxIdleConns(1)
+	wdb.SetConnMaxIdleTime(0)
 	wdb.SetConnMaxLifetime(0)
 
 	if err := wdb.PingContext(ctx); err != nil {
@@ -153,7 +286,7 @@ func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, e
 		return nil, fmt.Errorf("sqlx: ping sqlite writer: %w", err)
 	}
 
-	if isMem {
+	if isMem && !isSharedMem {
 		return newStoreFromState(&storeState{
 			dialect:     d,
 			writeDB:     wdb,
@@ -163,7 +296,7 @@ func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, e
 		}), nil
 	}
 
-	readURI := buildSQLiteURI(dsn, true, false)
+	readURI := buildSQLiteURI(dsn, true, isMem)
 	rdb, err := sql.Open("sqlite", readURI)
 	if err != nil {
 		_ = wdb.Close()
@@ -182,22 +315,29 @@ func openSQLite(ctx context.Context, d dialect.Dialect, opts Options) (*Store, e
 	}
 
 	return newStoreFromState(&storeState{
-		dialect:    d,
-		writeDB:    wdb,
-		readDB:     rdb,
-		splitPools: true,
+		dialect:     d,
+		writeDB:     wdb,
+		readDB:      rdb,
+		splitPools:  true,
+		sqliteInMem: isMem,
 	}), nil
 }
 
 func buildSQLiteURI(raw string, readOnly bool, isMem bool) string {
 	if isMem {
-		if strings.Contains(raw, "?") {
-			return raw + "&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+		base := raw
+		if base == ":memory:" {
+			base = "file::memory:?cache=shared"
 		}
-		if raw == ":memory:" {
-			return "file::memory:?cache=shared&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+		sep := "?"
+		if strings.Contains(base, "?") {
+			sep = "&"
 		}
-		return raw + "?_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+		suffix := "_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+		if readOnly {
+			suffix += "&_pragma=query_only(ON)&_pragma=read_uncommitted(ON)"
+		}
+		return base + sep + suffix
 	}
 
 	pathPart := strings.TrimPrefix(raw, "file:")
@@ -229,13 +369,13 @@ func openPostgres(ctx context.Context, d dialect.Dialect, opts Options) (*Store,
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("sqlx: VOLO_DB_DSN is required for postgres driver")
 	}
-	cfg, err := pgconn.ParseConfig(opts.DSN)
+	cfg, simpleProto, err := parsePGConnConfig(opts.DSN, opts.SimpleProtocol)
 	if err != nil {
 		return nil, fmt.Errorf("sqlx: parse postgres DSN: %w", err)
 	}
 	db := sql.OpenDB(&pgConnConnector{
 		cfg:            cfg,
-		simpleProtocol: opts.SimpleProtocol,
+		simpleProtocol: simpleProto,
 	})
 	applyPoolSettings(db, opts)
 	if err := db.PingContext(ctx); err != nil {
@@ -399,8 +539,10 @@ func (s *Store) QueryRowContext(ctx context.Context, query string, args ...any) 
 func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	st := s.state.Load()
 	if st.dialect != nil && st.dialect.Name() == "sqlite" {
-		s.sqliteWriteMu.Lock()
-		defer s.sqliteWriteMu.Unlock()
+		if err := s.acquireWriteLock(ctx); err != nil {
+			return nil, err
+		}
+		defer s.releaseWriteLock()
 	}
 	res, err := st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 	if err == nil {
@@ -414,8 +556,10 @@ func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql
 func (s *Store) ExecBgContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	st := s.state.Load()
 	if st.dialect != nil && st.dialect.Name() == "sqlite" {
-		s.sqliteWriteMu.Lock()
-		defer s.sqliteWriteMu.Unlock()
+		if err := s.acquireWriteLock(ctx); err != nil {
+			return nil, err
+		}
+		defer s.releaseWriteLock()
 	}
 	return st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 }
@@ -455,8 +599,10 @@ func (s *Store) WithBgTx(ctx context.Context, fn func(tx *Tx) error) error {
 func (s *Store) runTx(ctx context.Context, bumpRev bool, fn func(tx *Tx) error) (err error) {
 	st := s.state.Load()
 	if st.dialect != nil && st.dialect.Name() == "sqlite" {
-		s.sqliteWriteMu.Lock()
-		defer s.sqliteWriteMu.Unlock()
+		if err := s.acquireWriteLock(ctx); err != nil {
+			return err
+		}
+		defer s.releaseWriteLock()
 	}
 	rawTx, err := st.writeDB.BeginTx(ctx, nil)
 	if err != nil {
@@ -493,12 +639,62 @@ const (
 	scanColBool
 	scanColString
 	scanColInt
+	scanColUint
+	scanColFloat
+	scanColTime
 	scanColDirect
 )
+
+var timeStructType = reflect.TypeFor[time.Time]()
 
 type scanColSpec struct {
 	kind       scanColKind
 	fieldIndex []int
+}
+
+type nullTimeScanner struct {
+	nt sql.NullTime
+}
+
+func (s *nullTimeScanner) Scan(value any) error {
+	if value == nil {
+		s.nt = sql.NullTime{}
+		return nil
+	}
+	switch v := value.(type) {
+	case time.Time:
+		s.nt = sql.NullTime{Time: v, Valid: true}
+		return nil
+	case []byte:
+		return s.parseString(string(v))
+	case string:
+		return s.parseString(v)
+	default:
+		return s.nt.Scan(value)
+	}
+}
+
+func (s *nullTimeScanner) parseString(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		s.nt = sql.NullTime{}
+		return nil
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05.999999999+00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02",
+	} {
+		if tm, err := time.Parse(layout, trimmed); err == nil {
+			s.nt = sql.NullTime{Time: tm, Valid: true}
+			return nil
+		}
+	}
+	return fmt.Errorf("sqlx: cannot parse %q into time.Time", raw)
 }
 
 type rowScanState struct {
@@ -506,6 +702,9 @@ type rowScanState struct {
 	bools   []any
 	strs    []sql.NullString
 	ints    []sql.NullInt64
+	uints   []any
+	floats  []sql.NullFloat64
+	times   []nullTimeScanner
 	discard any
 }
 
@@ -518,14 +717,22 @@ func buildColumnPlan(rt reflect.Type, cols []string) []scanColSpec {
 			plan[i] = scanColSpec{kind: scanColDiscard}
 			continue
 		}
-		fk := rt.FieldByIndex(fIdx).Type.Kind()
-		switch fk {
+		ft := rt.FieldByIndex(fIdx).Type
+		if ft == timeStructType {
+			plan[i] = scanColSpec{kind: scanColTime, fieldIndex: fIdx}
+			continue
+		}
+		switch ft.Kind() {
 		case reflect.Bool:
 			plan[i] = scanColSpec{kind: scanColBool, fieldIndex: fIdx}
 		case reflect.String:
 			plan[i] = scanColSpec{kind: scanColString, fieldIndex: fIdx}
-		case reflect.Int, reflect.Int64, reflect.Int32:
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			plan[i] = scanColSpec{kind: scanColInt, fieldIndex: fIdx}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			plan[i] = scanColSpec{kind: scanColUint, fieldIndex: fIdx}
+		case reflect.Float32, reflect.Float64:
+			plan[i] = scanColSpec{kind: scanColFloat, fieldIndex: fIdx}
 		default:
 			plan[i] = scanColSpec{kind: scanColDirect, fieldIndex: fIdx}
 		}
@@ -539,6 +746,9 @@ func newRowScanState(n int) *rowScanState {
 		bools:   make([]any, n),
 		strs:    make([]sql.NullString, n),
 		ints:    make([]sql.NullInt64, n),
+		uints:   make([]any, n),
+		floats:  make([]sql.NullFloat64, n),
+		times:   make([]nullTimeScanner, n),
 	}
 }
 
@@ -557,6 +767,15 @@ func (st *rowScanState) bind(rv reflect.Value, plan []scanColSpec) []any {
 		case scanColInt:
 			st.ints[i] = sql.NullInt64{}
 			st.targets[i] = &st.ints[i]
+		case scanColUint:
+			st.uints[i] = nil
+			st.targets[i] = &st.uints[i]
+		case scanColFloat:
+			st.floats[i] = sql.NullFloat64{}
+			st.targets[i] = &st.floats[i]
+		case scanColTime:
+			st.times[i] = nullTimeScanner{}
+			st.targets[i] = &st.times[i]
 		case scanColDirect:
 			st.targets[i] = rv.FieldByIndex(sp.fieldIndex).Addr().Interface()
 		}
@@ -583,9 +802,41 @@ func (st *rowScanState) assign(rv reflect.Value, plan []scanColSpec) error {
 		case scanColInt:
 			fv := rv.FieldByIndex(sp.fieldIndex)
 			if st.ints[i].Valid {
-				fv.SetInt(st.ints[i].Int64)
+				v := st.ints[i].Int64
+				if fv.OverflowInt(v) {
+					return fmt.Errorf("sqlx: integer %d overflows %s", v, fv.Type())
+				}
+				fv.SetInt(v)
 			} else {
 				fv.SetInt(0)
+			}
+		case scanColUint:
+			fv := rv.FieldByIndex(sp.fieldIndex)
+			u, err := coerceUint64(st.uints[i])
+			if err != nil {
+				return err
+			}
+			if fv.OverflowUint(u) {
+				return fmt.Errorf("sqlx: unsigned integer %d overflows %s", u, fv.Type())
+			}
+			fv.SetUint(u)
+		case scanColFloat:
+			fv := rv.FieldByIndex(sp.fieldIndex)
+			if st.floats[i].Valid {
+				v := st.floats[i].Float64
+				if fv.OverflowFloat(v) {
+					return fmt.Errorf("sqlx: float %g overflows %s", v, fv.Type())
+				}
+				fv.SetFloat(v)
+			} else {
+				fv.SetFloat(0)
+			}
+		case scanColTime:
+			fv := rv.FieldByIndex(sp.fieldIndex)
+			if st.times[i].nt.Valid {
+				fv.Set(reflect.ValueOf(st.times[i].nt.Time))
+			} else {
+				fv.Set(reflect.Zero(timeStructType))
 			}
 		}
 	}
@@ -742,3 +993,42 @@ func coerceBoolString(s string) (bool, error) {
 		return n != 0, nil
 	}
 }
+
+func coerceUint64(v any) (uint64, error) {
+	switch x := v.(type) {
+	case nil:
+		return 0, nil
+	case uint64:
+		return x, nil
+	case int64:
+		if x < 0 {
+			return 0, fmt.Errorf("sqlx: negative integer %d cannot scan into uint", x)
+		}
+		return uint64(x), nil
+	case int:
+		if x < 0 {
+			return 0, fmt.Errorf("sqlx: negative integer %d cannot scan into uint", x)
+		}
+		return uint64(x), nil
+	case float64:
+		if x < 0 {
+			return 0, fmt.Errorf("sqlx: negative float %g cannot scan into uint", x)
+		}
+		return uint64(x), nil
+	case []byte:
+		s := strings.TrimSpace(string(x))
+		if s == "" {
+			return 0, nil
+		}
+		return strconv.ParseUint(s, 10, 64)
+	case string:
+		s := strings.TrimSpace(x)
+		if s == "" {
+			return 0, nil
+		}
+		return strconv.ParseUint(s, 10, 64)
+	default:
+		return 0, fmt.Errorf("sqlx: cannot scan %T into uint", v)
+	}
+}
+

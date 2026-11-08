@@ -16,9 +16,10 @@ Both built-in `volo-studio` and the external reference theme [`themes/volo-journ
 :root {
   --volo-bg: #faf9f5;
   --volo-surface: #ffffff;
+  --volo-raised: #f3f1eb;
   --volo-text: #1c1e1b;
   --volo-muted: #5f665e;
-  --volo-border: rgba(28, 30, 27, 0.10);
+  --volo-line: rgba(28, 30, 27, 0.10);
   --volo-accent: #1f5c48;        /* Dynamically driven by Console Appearance settings */
   --volo-accent-soft: rgba(31, 92, 72, 0.10);
   --volo-font-sans: system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
@@ -38,8 +39,10 @@ themes/my-editorial/
 │   ├── theme.css           # Served zero-copy at /themes/my-editorial/assets/theme.css
 │   └── theme.js            # Optional progressive enhancement script
 └── templates/              # Optional template overrides (missing views safely fall back to host defaults)
+    ├── layout.html
     ├── index.html
-    └── post.html
+    ├── article.html
+    └── page.html
 ```
 
 Example `theme.json`:
@@ -137,6 +140,9 @@ Both `theme.json` and `manifest.json` share a unified `config_schema` type syste
   },
   "permissions": [
     "kv",
+    "site:read",
+    "crypto",
+    "ratelimit",
     "hooks:render.pre_markdown",
     "hooks:render.post_html",
     "slots:article.after_content",
@@ -188,56 +194,68 @@ Both `theme.json` and `manifest.json` share a unified `config_schema` type syste
 ### 2.3 Permissions, Domain Hooks, UI Slots & Provider Adapters
 
 1. **Permission Tokens**:
-   - **Scoped Storage**: `kv` (read/write), `kv:read` (read-only `plugin_kv` with per-plugin quota enforcement and background non-cache-invalidating writes);
-   - **Domain Hooks**:
+   - **Scoped Storage**: `kv` / `kv:rw` (read/write), `kv:read` (read-only `plugin_kv` with per-plugin quota enforcement and background non-cache-invalidating writes);
+   - **Host Capability Gates**:
+     - `crypto`: Unlocks `volo.crypto` (`sha256`, `hmacSha256`, `randomUUID`);
+     - `site:read`: Unlocks `volo.site.info()` for read-only site metadata;
+     - `ratelimit`: Unlocks `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)` sliding-window rate limiting (also enabled automatically when `http:routes` is declared);
+     - `cron`: Permits scheduled background jobs declared in `manifest.json` `cron`;
+   - **Domain Hooks** (`hooks:*` or fine-grained tokens):
      - Articles: `hooks:article.published`, `hooks:article.updated`, `hooks:article.deleted`;
      - Pages: `hooks:page.published`, `hooks:page.updated`, `hooks:page.deleted`;
      - Comments: `hooks:comment.before_create`, `hooks:comment.created`, `hooks:comment.moderated`;
-     - Rendering Pipeline: `hooks:render.pre_markdown` (transforms `content_md` on unlocked articles prior to Markdown parsing) and `hooks:render.post_html` (transforms rendered HTML prior to XSS sanitization);
-   - **UI Slots**: `slots:public.head`, `slots:public.header`, `slots:article.before_content`, `slots:article.after_content`, `slots:comment.before`, `slots:comment.after`, `slots:public.footer`, `slots:editor.quick_insert`, `slots:admin.dashboard_card`;
+     - Rendering Pipeline: `hooks:render.pre_markdown` (transforms `content_md` on unlocked articles without `:::lock` blocks prior to Markdown parsing) and `hooks:render.post_html` (transforms rendered HTML prior to XSS sanitization);
+   - **UI Slots** (`ui:slots` or per-slot tokens): `slots:public.head`, `slots:public.header`, `slots:public.sidebar`, `slots:article.before_content`, `slots:article.after_content`, `slots:comment.before`, `slots:comment.after`, `slots:public.footer`, `slots:editor.quick_insert`, `slots:admin.dashboard_card`;
    - **HTTP & Networking**: `http:routes` (custom `/plugins/<id>/api/*` endpoints), `http:raw_headers` (exposes safe webhook verification headers such as `x-hub-signature-256`, `x-signature`, `stripe-signature`, `authorization`), `http.outbound:<hostname>` / `allowed_hosts` (explicit hostname or `*.domain.tld` allowlist enforced with `OutboundSafeDialer` SSRF protection);
    - **Extension Providers**:
-     - `provider:storage`: Registers an external media/backup `StorageProvider` when `main.js` defines `storagePut(relKey, contentType, bodyBase64)` and `storageDelete(relKey)` (plus optional `storageHealthCheck()`). Public URLs returned by `storagePut` are sanitized, and uploads gracefully fall back to local disk if an external provider is unavailable;
-     - `provider:oidc`: Registers a third-party `OIDCProvider` for federated reader sign-in when `main.js` defines `oidcAuthURL(state, redirectURI)` and `oidcExchange(code, redirectURI)` (plus optional `oidcProviderInfo()` returning `{ id, display_name }`);
-     - `provider:notifier`: Registers a `NotifierProvider` (`notifySend(event)`) invoked alongside SMTP and outbound webhooks;
-     - `provider:captcha`: Registers a `CaptchaProvider` (`captchaRenderWidget(locale)` + `captchaVerify(token, clientIP)`);
-   - **Protected Content Opt-In**: `articles:read_protected` (without this explicit permission, password-protected posts and `:::lock` blocks are redacted before reaching the plugin).
+     - `provider:storage`: Registers an external media/backup `StorageProvider` when `main.js` defines `storagePut(objectKey, bodyBase64, contentType)` (returning a public URL string or `{ url }`), plus optional `storageDelete(objectKey)` and `storageHealthCheck()`. Uploads gracefully fall back to local disk if an external provider is unavailable;
+     - `provider:oidc`: Registers a third-party `OIDCProvider` / `OIDCAdvancedProvider` for federated sign-in when `main.js` defines `oidcAuthURL(state, redirectURI, opts)` (`opts`: `{ nonce, code_challenge, code_challenge_method }`; missing `nonce` or `code_challenge` query parameters are automatically appended to valid `http`/`https` URLs, and 2-argument JS functions remain 100% compatible) and `oidcExchange(code, redirectURI, opts)` (`opts`: `{ nonce, code_verifier }`, returning `{ subject, email, email_verified, nonce, display_name, avatar_url }` with `email_verified` strictly defaulting to `false` when absent), plus optional `oidcProviderInfo()` returning `{ id, display_name }`;
+     - `provider:notifier`: Registers a `NotifierProvider` invoking `sendNotification(event)` or `notifySend(event)` alongside SMTP and outbound webhooks;
+     - `provider:antispam`: Registers a comment `AntiSpamProvider` when `main.js` defines `checkSpam(input)` returning `{ action: "allow" | "moderate" | "reject", reason, score }`;
+   - **Protected Content Opt-In**: `articles:read_protected` (without this explicit permission, password-protected article payloads and CommonMark-nested `:::lock ... :::` blocks are automatically stripped by both `DispatchHook` and `DispatchArticleHook` before reaching any JS plugin).
 
 2. **Circuit Breakers, Resource Caps, XSS Sanitization & CSS Scoping**:
    - Every sandbox invocation runs under strict step budgets, wall-clock timeouts, cycle/depth caps (`Export` / `JSON.stringify`), and a `4 MiB` string allocation ceiling; repeated failures trip the plugin's **Circuit Breaker (`CircuitOpen`)** so a misbehaving plugin never stalls reader traffic;
+   - `volo.on(hookName, handlerFn)` is frozen once top-level module evaluation completes, rejecting request-time registrations so listeners can never leak across requests;
    - Both `render.post_html` and `admin.dashboard_card` outputs are sanitized against `<script>`, `<iframe>`, `on*` event attributes, and `javascript:`/`data:` URLs;
    - Plugin CSS custom properties must use `--volo-plugin-<id>-*` inside `.volo-plugin-scope[data-plugin="<id>"]`.
 
-### 2.4 Sandbox SDK (`volo.*`) & `main.js` Example
+### 2.4 Sandbox SDK (`volo.*`), ES6 Stdlib & `main.js` Example
 
-- `volo.on(hookName, handlerFn)` (or global `function onHook(hookName, payload)`): Subscribe to declared hooks;
+The zero-dependency embedded JS VM natively supports modern **ES6+ syntax and standard library built-ins**:
+- **Language Semantics & ES6 Syntax**: Function/module-root `var` hoisting, block-scoped `let`/`const`, per-iteration `for (let ...)` closure bindings, template literals `${...}`, optional chaining (`obj?.prop`, `obj?.[expr]`, `fn?.(args)`), nullish coalescing `??`, arrow functions (lexical `this`), default & rest parameters `(...args)`, array/call/object spread `...x`, object property & method shorthand `{ a, method() {} }`, and array/object destructuring (`const { a, b: renamed = 1 } = obj`, `const [x, y = 2] = arr`);
+- **Built-in Standard Library**: RFC 3986 `encodeURIComponent` / `decodeURIComponent`, `Number` (`isNaN`, `isFinite`, `isInteger`, `parseInt`, `parseFloat`, `toFixed`, `toString(radix)`), `Array` (`from`, `isArray`, `concat`, `map`, `filter`, `reduce`, `find`, `findIndex`, `some`, `every`, `sort`, `reverse`, `shift`, `unshift`, `splice`, `flat`, `flatMap`), `Object` (`keys`, `values`, `entries`, `fromEntries`, `assign`, `hasOwn`, `Object.prototype.hasOwnProperty`), `String` (`fromCharCode`, `padStart`, `padEnd`, `trimStart`, `trimEnd`, `lastIndexOf`, and `replace` / `replaceAll` with both `RegExp` and callback replacer functions), `Function.prototype.{call, apply, bind}`, `RegExp`, `Date`, `JSON`, `Math`, and `btoa` / `atob`.
+
+Host capability bridge `volo` (alias `ctx`):
+- `volo.on(hookName, handlerFn)` (registered during top-level initialization, or via global `function onHook(hookName, payload)`): Subscribe to declared hooks;
 - `volo.escapeHTML(str)`: Safely escape untrusted strings before interpolating into slot HTML;
 - `volo.config.get(key)` / `volo.config.all()`: Read validated plugin configuration (including decrypted secrets inside the sandbox);
-- `volo.kv.get(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?)` / `volo.kv.list(prefix, limit?, afterKey?)`: Scoped KV storage with cursor pagination via `afterKey`;
+- `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`: Scoped KV storage (requires `kv` / `kv:read`) with cursor pagination via `afterKey`;
+- `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`: Cryptographic helpers (requires `crypto`);
+- `volo.site.info()`: Read-only site metadata snapshot (requires `site:read`);
+- `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)`: Sliding-window rate limiter (requires `ratelimit` or `http:routes`);
 - `volo.http.fetch(url, options?)`: SSRF-guarded outbound HTTP client restricted to declared `http.outbound:<host>` / `allowed_hosts`;
-- `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`: Structured plugin diagnostics.
+- `volo.i18n.t(locale, key, vars?)` and `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`: Localization lookup and structured plugin diagnostics.
 
 ```javascript
-// Subscribe to pre-Markdown and post-HTML hooks via volo.on(...)
-volo.on("render.pre_markdown", function (article) {
-  return {
-    content_md: article.content_md.replace(/\[toc\]/gi, "## Table of Contents\n")
-  };
-});
+// Subscribe to pre-Markdown and post-HTML hooks at top-level module init
+volo.on("render.pre_markdown", (article) => ({
+  content_md: article.content_md.replace(/\[toc\]/gi, () => "## Table of Contents\n")
+}));
 
-volo.on("render.post_html", function (payload) {
-  volo.kv.incr("rendered_count", 1);
-  return { html: payload.html };
+volo.on("render.post_html", ({ html }) => {
+  volo.kv.incr("rendered_count", 1, 0);
+  return { html };
 });
 
 // Cursor pagination over plugin KV keys
 function listAllBadges() {
-  var out = [];
-  var cursor = "";
+  const out = [];
+  let cursor = "";
   while (true) {
-    var batch = volo.kv.list("badge:", 100, cursor);
-    if (!batch || batch.length === 0) break;
-    out = out.concat(batch);
+    const batch = volo.kv.list("badge:", 100, cursor);
+    if (!batch?.length) break;
+    out.push(...batch);
     cursor = batch[batch.length - 1].key;
     if (batch.length < 100) break;
   }
@@ -247,8 +265,8 @@ function listAllBadges() {
 // Render a dynamic UI slot safely with volo.escapeHTML
 function renderSlot(slotName, ctx) {
   if (slotName === "article.after_content") {
-    var msg = volo.config.get("banner_text") || "Thanks for reading!";
-    return '<aside class="callout-box">' + volo.escapeHTML(String(msg)) + "</aside>";
+    const msg = volo.config.get("banner_text") || "Thanks for reading!";
+    return `<aside class="callout-box">${volo.escapeHTML(String(msg))}</aside>`;
   }
   return "";
 }

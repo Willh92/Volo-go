@@ -10,53 +10,83 @@
     {{$okLabel := "正常"}}{{$brokenLabel := "连接异常"}}
     {{if hasPrefix .Locale "en"}}{{$okLabel = "Healthy"}}{{$brokenLabel = "Unreachable"}}{{else if eq .Locale "zh-TW"}}{{$okLabel = "正常"}}{{$brokenLabel = "連線異常"}}{{end}}
     {{if .LinkGroups}}
-      {{range .LinkGroups}}
-        <section class="studio-article studio-card-pad">
-          <h2 class="studio-card-title">{{.Category}}</h2>
-          <div class="bookshelf-grid">
-            {{range .Items}}
-              <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax>
-                <div class="studio-link-card__head">
-                  <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
-                  <div class="studio-link-card__meta">
-                    <strong>{{.Title}}</strong>
-                    {{if eq .HealthStatus "broken"}}
-                      <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
-                    {{else}}
-                      <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
-                    {{end}}
-                  </div>
-                </div>
-                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
-              </a>
-            {{end}}
+      <div class="studio-stack" data-collection-root="links">
+        <div class="studio-article studio-card-pad studio-collection-toolbar">
+          <div class="studio-collection-search-wrap">
+            <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.links"}}" autocomplete="off">
           </div>
-        </section>
-      {{end}}
+          {{if gt (len .LinkGroups) 1}}
+            <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
+              {{range $i, $g := .LinkGroups}}
+                <a class="studio-jump-pill" href="#link-group-{{$i}}">{{$g.Category}} <small>{{len $g.Items}}</small></a>
+              {{end}}
+            </nav>
+          {{end}}
+        </div>
+        {{range $i, $g := .LinkGroups}}
+          <section id="link-group-{{$i}}" class="studio-article studio-card-pad" data-collection-group>
+            <h2 class="studio-card-title">{{$g.Category}}</h2>
+            <div class="bookshelf-grid">
+              {{range $g.Items}}
+                <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax data-collection-item="{{lower .Title}} {{lower .Description}} {{lower $g.Category}}">
+                  <div class="studio-link-card__head">
+                    <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
+                    <div class="studio-link-card__meta">
+                      <strong>{{.Title}}</strong>
+                      {{if eq .HealthStatus "broken"}}
+                        <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
+                      {{else}}
+                        <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
+                      {{end}}
+                    </div>
+                  </div>
+                  {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+                </a>
+              {{end}}
+            </div>
+          </section>
+        {{end}}
+        <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+      </div>
     {{else if .LinksByCategory}}
-      {{range $cat, $items := .LinksByCategory}}
-        <section class="studio-article studio-card-pad">
-          <h2 class="studio-card-title">{{$cat}}</h2>
-          <div class="bookshelf-grid">
-            {{range $items}}
-              <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax>
-                <div class="studio-link-card__head">
-                  <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
-                  <div class="studio-link-card__meta">
-                    <strong>{{.Title}}</strong>
-                    {{if eq .HealthStatus "broken"}}
-                      <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
-                    {{else}}
-                      <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
-                    {{end}}
-                  </div>
-                </div>
-                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
-              </a>
-            {{end}}
+      <div class="studio-stack" data-collection-root="links">
+        <div class="studio-article studio-card-pad studio-collection-toolbar">
+          <div class="studio-collection-search-wrap">
+            <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.links"}}" autocomplete="off">
           </div>
-        </section>
-      {{end}}
+          {{if gt (len .LinksByCategory) 1}}
+            <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
+              {{range $cat, $items := .LinksByCategory}}
+                <a class="studio-jump-pill" href="#link-cat-{{urlquery $cat}}">{{$cat}} <small>{{len $items}}</small></a>
+              {{end}}
+            </nav>
+          {{end}}
+        </div>
+        {{range $cat, $items := .LinksByCategory}}
+          <section id="link-cat-{{urlquery $cat}}" class="studio-article studio-card-pad" data-collection-group>
+            <h2 class="studio-card-title">{{$cat}}</h2>
+            <div class="bookshelf-grid">
+              {{range $items}}
+                <a class="book-card studio-link-card" href="{{.URL}}" target="_blank" rel="noopener" data-no-pjax data-collection-item="{{lower .Title}} {{lower .Description}} {{lower $cat}}">
+                  <div class="studio-link-card__head">
+                    <img class="studio-link-icon" src="{{if .IconURL}}{{.IconURL}}{{else}}/avatars/{{.ID}}.svg{{end}}" data-avatar-seed="{{.ID}}" alt="{{.Title}}" width="40" height="40" loading="lazy">
+                    <div class="studio-link-card__meta">
+                      <strong>{{.Title}}</strong>
+                      {{if eq .HealthStatus "broken"}}
+                        <div class="studio-link-card__status studio-link-status--broken" title="{{$brokenLabel}}" aria-label="{{$brokenLabel}}">⚠</div>
+                      {{else}}
+                        <div class="studio-link-card__status studio-link-status--ok" title="{{$okLabel}}" aria-label="{{$okLabel}}">●</div>
+                      {{end}}
+                    </div>
+                  </div>
+                  {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+                </a>
+              {{end}}
+            </div>
+          </section>
+        {{end}}
+        <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+      </div>
     {{else}}
       {{template "empty_state" (dict "Title" (t .Locale "studio.empty_links_title") "Desc" (t .Locale "studio.empty_links_desc"))}}
     {{end}}

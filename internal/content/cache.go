@@ -20,6 +20,7 @@ import (
 const (
 	maxFeedCacheBytes   = 2 * 1024 * 1024 // <= 2 MiB ceiling for pre-compressed RSS/Atom/Podcast/Sitemap/LLMs artifacts
 	maxCachedRecentCmts = 20
+	maxCachedChromeTags = 200
 )
 
 var tzLocationCache sync.Map // map[string]*time.Location
@@ -203,14 +204,14 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 	for _, c := range cats {
 		catsByID[c.ID] = c.Category
 	}
-	tags, err := s.queryAllTagsWithCounts(ctx)
+	tags, err := s.queryTagsWithCountsLimited(ctx, maxCachedChromeTags)
 	if err != nil {
 		return nil, err
 	}
 	recentCmts, _ := s.queryRecentPublicComments(ctx, maxCachedRecentCmts)
 	archiveBuckets, _ := s.queryArchiveMonths(ctx)
 	owner, authors, authorsByID := s.queryPublicAuthors(ctx)
-	stats := s.queryPublicSiteStats(ctx, len(cats), len(tags))
+	stats := s.queryPublicSiteStats(ctx, len(cats))
 
 	recentSQL, recentArgs := s.store.Dialect().PaginateSQL(
 		`SELECT * FROM articles WHERE status = ? ORDER BY published_at DESC`, maxCachedRecentCmts, 0,

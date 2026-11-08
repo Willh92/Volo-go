@@ -294,10 +294,13 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 		return nil, err
 	}
 
-	trustedRaw, _ := resolveStr(cli.TrustedProxies, "VOLO_TRUSTED_PROXIES", "127.0.0.1,::1")
+	trustedRaw, trustedExplicit := resolveStr(cli.TrustedProxies, "VOLO_TRUSTED_PROXIES", "127.0.0.1,::1")
 	trustedPolicy, err := ParseTrustedProxies(trustedRaw)
 	if err != nil {
 		return nil, err
+	}
+	if socketSpec != nil && !(trustedExplicit && trustedRaw == "") {
+		trustedPolicy.TrustUnix = true
 	}
 
 	adminPathRaw, _ := resolveStr(cli.AdminPath, "VOLO_ADMIN_PATH", DefaultAdminPath)

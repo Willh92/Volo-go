@@ -58,6 +58,21 @@ func highlightCodeChroma(code string, lang string, withLineNumbers bool) string 
 	return `<figure class="volo-codeblock"` + langAttr + `><pre class="chroma"><code>` + inner.String() + `</code></pre></figure>`
 }
 
+func highlightCommentCodeChroma(code string, lang string) string {
+	codeLexerOnce.Do(initCodeLexers)
+
+	key := strings.ToLower(strings.TrimSpace(lang))
+	if fields := strings.Fields(key); len(fields) > 0 {
+		key = fields[0]
+	}
+	lx := codeLexers[key]
+
+	var inner strings.Builder
+	inner.Grow(len(code) + len(code)/2)
+	tokenizeInto(&inner, code, lx)
+	return `<pre class="chroma"><code>` + inner.String() + `</code></pre>`
+}
+
 func tokenizeInto(out *strings.Builder, src string, lx *codeLexer) {
 	if lx == nil || len(src) == 0 {
 		out.WriteString(html.EscapeString(src))
@@ -215,6 +230,15 @@ func initCodeLexers() {
 		{`#{1,6}\s[^\n]*`, "gh"},
 		{`[^\n]+|\n`, ""},
 	})
+	mdLex := compileRuleList([][2]string{
+		{`#{1,6}\s[^\n]*`, "gh"},
+		{"```[^\\n]*|`[^`\\n]+`", "sb"},
+		{`\*\*[^*\n]+\*\*|__[^_\n]+__`, "gs"},
+		{`!?\[[^\]\n]*\]\([^)\n]*\)`, "nt"},
+		{`>\s?`, "k"},
+		{`(?:[-*+]|\d+\.)\s`, "k"},
+		{"[^\\n`*_\\[\\]#>+-]+|.|\\n", ""},
+	})
 
 	codeLexers = map[string]*codeLexer{}
 	register := func(lx *codeLexer, aliases ...string) {
@@ -232,5 +256,6 @@ func initCodeLexers() {
 	register(dataLex, "json", "jsonc", "yaml", "yml", "toml", "ini", "env", "dotenv", "conf")
 	register(htmlLex, "html", "htm", "xml", "svg", "vue", "svelte")
 	register(cssLex, "css", "scss", "sass", "less")
-	register(diffLex, "diff", "patch", "md", "markdown")
+	register(diffLex, "diff", "patch")
+	register(mdLex, "md", "markdown")
 }

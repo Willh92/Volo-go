@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -42,8 +43,11 @@ func LoadOrInitKeyRing(explicitSecret string, dataDir string) (*KeyRing, string,
 		if len(trimmed) < 16 {
 			return nil, "", errors.New("config: VOLO_SECRET_KEY must be at least 16 characters long")
 		}
-		sum := sha256.Sum256([]byte("volo-master-explicit:" + trimmed))
-		master = sum[:]
+		dk, err := pbkdf2.Key(sha256.New, trimmed, []byte("volo-master-explicit:v1"), 10_000, 32)
+		if err != nil {
+			return nil, "", fmt.Errorf("config: derive master key: %w", err)
+		}
+		master = dk
 		source = "env"
 	} else {
 		if err := os.MkdirAll(dataDir, 0o750); err != nil {

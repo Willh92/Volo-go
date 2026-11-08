@@ -195,6 +195,7 @@ export function ContentWorkspace({
   const [tagForm, setTagForm] = useState({ ...EMPTY_TAG });
   const [mergeSourceTag, setMergeSourceTag] = useState<any | null>(null);
   const [mergeTargetId, setMergeTargetId] = useState("");
+  const [mergeTargetName, setMergeTargetName] = useState("");
   const [mergeSearchQ, setMergeSearchQ] = useState("");
   const debouncedMergeQ = useDebouncedValue(mergeSearchQ, 220);
   const [mergeCandidates, setMergeCandidates] = useState<any[]>([]);
@@ -206,6 +207,7 @@ export function ContentWorkspace({
   const debouncedSerQuery = useDebouncedValue(serQuery, 250);
   const [knownArticlesMap, setKnownArticlesMap] = useState<Record<string, any>>({});
   const [serPickerArticles, setSerPickerArticles] = useState<any[]>([]);
+  const [serSelPage, setSerSelPage] = useState(1);
   const [serArtPage, setSerArtPage] = useState(1);
   const [serArtTotal, setSerArtTotal] = useState(0);
   const [serModalOpen, setSerModalOpen] = useState(false);
@@ -488,6 +490,7 @@ export function ContentWorkspace({
         const r = await apiFetch<{
           items: MediaAssetRecord[];
           total?: number;
+          all_total?: number;
           total_bytes?: number;
           orphan_count?: number;
           storage_driver?: string;
@@ -502,10 +505,17 @@ export function ContentWorkspace({
         } else {
           setMediaTotalBytes(null);
         }
-        if (mediaRefFilter === "all" && mediaKindFilter === "all" && !mediaMonthFilter.trim() && !debouncedMediaQuery.trim()) {
-          setMediaAllTotal(tot);
+        if (typeof r.all_total === "number") {
+          setMediaAllTotal(r.all_total);
+        } else if (
+          mediaRefFilter === "all" &&
+          mediaKindFilter === "all" &&
+          !mediaMonthFilter.trim() &&
+          !debouncedMediaQuery.trim()
+        ) {
+          setMediaAllTotal(r.all_total ?? tot);
         } else if (mediaAllTotal === 0) {
-          setMediaAllTotal(tot);
+          setMediaAllTotal(r.all_total ?? tot);
         }
         setOrphanCount(r.orphan_count ?? list.filter((x) => x.is_orphan).length);
         storageDriverSig.value = r.storage_driver || "local";
@@ -543,11 +553,34 @@ export function ContentWorkspace({
     debouncedMediaQuery,
   ]);
 
+  const searchMergeTargetTags = async (q: string) => {
+    if (!mergeSourceTag) return;
+    const qs = new URLSearchParams({ per_page: "50", sort: "count" });
+    if (q.trim()) qs.set("q", q.trim());
+    const res = await apiFetch<{ items?: any[]; tags?: any[] }>(`/api/admin/tags?${qs.toString()}`).catch(() => ({
+      items: [] as any[],
+      tags: [] as any[],
+    }));
+    const list = (res.items || res.tags || []).filter((tg: any) => tg.id !== mergeSourceTag.id);
+    if (list.length === 0) return;
+    setMergeCandidates((prev) => {
+      const seen = new Set(prev.map((tg: any) => tg.id));
+      const merged = [...prev];
+      for (const tg of list) {
+        if (tg?.id && !seen.has(tg.id)) {
+          seen.add(tg.id);
+          merged.push(tg);
+        }
+      }
+      return merged;
+    });
+  };
+
   // Tag Merge candidate search
   useEffect(() => {
     if (!mergeSourceTag) return;
     let cancelled = false;
-    const qs = new URLSearchParams({ per_page: "80", sort: "count" });
+    const qs = new URLSearchParams({ per_page: "50", sort: "count" });
     if (debouncedMergeQ.trim()) qs.set("q", debouncedMergeQ.trim());
     apiFetch<{ items?: any[]; tags?: any[] }>(`/api/admin/tags?${qs.toString()}`)
       .then((res) => {
@@ -589,14 +622,28 @@ export function ContentWorkspace({
     };
   }, [serModalOpen, serArtPage, debouncedSerArtFilter]);
 
-  // Hydrate titles for any already-selected Series article IDs not yet in knownArticlesMap
+  // Lazily hydrate missing Series modal articles for current 15-items/page slice whenever page or article IDs change
+  const serArticleIdsKey = serForm.article_ids.join(",");
   useEffect(() => {
     if (!serModalOpen || serForm.article_ids.length === 0) return;
-    const missing = serForm.article_ids.filter((id) => !knownArticlesMap[id]);
+    const SER_HYDRATE_PAGE_SIZE = 15;
+    const totalSelPages = Math.max(1, Math.ceil(serForm.article_ids.length / SER_HYDRATE_PAGE_SIZE));
+    const safeSelPage = Math.min(Math.max(1, serSelPage), totalSelPages);
+    const selSlice = serForm.article_ids.slice(
+      (safeSelPage - 1) * SER_HYDRATE_PAGE_SIZE,
+      safeSelPage * SER_HYDRATE_PAGE_SIZE
+    );
+    const safeArtPage = Math.max(1, serArtPage);
+    const artPageSlice = serForm.article_ids.slice(
+      (safeArtPage - 1) * SER_HYDRATE_PAGE_SIZE,
+      safeArtPage * SER_HYDRATE_PAGE_SIZE
+    );
+    const targetIds = Array.from(new Set([...selSlice, ...artPageSlice]));
+    const missing = targetIds.filter((id) => !knownArticlesMap[id]);
     if (missing.length === 0) return;
     let cancelled = false;
     Promise.all(
-      missing.slice(0, 30).map((id) =>
+      missing.map((id) =>
         apiFetch<any>(`/api/admin/articles/${encodeURIComponent(id)}`)
           .then((r) => r?.article || r)
           .catch(() => null)
@@ -614,7 +661,7 @@ export function ContentWorkspace({
     return () => {
       cancelled = true;
     };
-  }, [serModalOpen, serForm.article_ids.length]);
+  }, [serModalOpen, serSelPage, serArtPage, serArticleIdsKey]);
 
   const updatePageDraft = (patch: Record<string, any>) => {
     setEditPage((prev: any) => (prev ? { ...prev, ...patch } : prev));
@@ -1533,8 +1580,8 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={absIdx <= 0}
-                              title={t("cnt.lbl_sort")}
+                              disabled={Boolean(catQuery.trim()) || absIdx <= 0}
+                              title={catQuery.trim() ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapCatOrder(absIdx, -1)}
                             >
                               ↑
@@ -1542,8 +1589,8 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={absIdx < 0 || absIdx >= categories.length - 1}
-                              title={t("cnt.lbl_sort")}
+                              disabled={Boolean(catQuery.trim()) || absIdx < 0 || absIdx >= categories.length - 1}
+                              title={catQuery.trim() ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapCatOrder(absIdx, 1)}
                             >
                               ↓
@@ -1803,6 +1850,7 @@ export function ContentWorkspace({
                             onClick={() => {
                               setMergeSourceTag(tg);
                               setMergeTargetId("");
+                              setMergeTargetName("");
                               setMergeSearchQ("");
                             }}
                           >
@@ -1923,7 +1971,13 @@ export function ContentWorkspace({
                 <label>{t("cnt.tag_merge_target")}</label>
                 <ConsoleSelect
                   value={mergeTargetId}
-                  onChange={setMergeTargetId}
+                  fallbackLabel={mergeTargetName || undefined}
+                  onSearch={searchMergeTargetTags}
+                  onChange={(v) => {
+                    setMergeTargetId(v);
+                    const found = mergeCandidates.find((tg) => tg.id === v);
+                    setMergeTargetName(found ? `#${found.name}` : "");
+                  }}
                   options={[
                     { value: "", label: t("cnt.tag_merge_target") },
                     ...mergeCandidates.map((tg) => ({
@@ -1964,6 +2018,7 @@ export function ContentWorkspace({
                   const maxSort = series.reduce((mx, s) => Math.max(mx, Number(s.sort_order || 0)), 0);
                   setSerForm({ ...EMPTY_SER, sort_order: maxSort + 10 });
                   setSerArtFilter("");
+                  setSerSelPage(1);
                   setSerArtPage(1);
                   setSerModalOpen(true);
                 }}
@@ -1992,17 +2047,17 @@ export function ContentWorkspace({
                   displaySeries.map((s) => (
                     <tr key={s.id}>
                       <td class="col-fluid" data-label={t("cnt.col_name")}>
-                        <div class="volo-cell-main">
-                          <div class="volo-cell-title">{s.title}</div>
+                        <div class="volo-cell-main" style={{ minWidth: 0 }}>
+                          <div class="volo-cell-title" style={{ minWidth: 0, overflowWrap: "anywhere" }}>{s.title}</div>
                           {s.description && (
-                            <div class="volo-cell-meta">
-                              <span>{s.description}</span>
+                            <div class="volo-cell-meta" style={{ minWidth: 0 }}>
+                              <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{s.description}</span>
                             </div>
                           )}
                         </div>
                       </td>
                       <td class="col-cat" data-label={t("cnt.col_slug")}>
-                        <span class="volo-code-chip">/series/{s.slug}</span>
+                        <span class="volo-code-chip is-wrap">/series/{s.slug}</span>
                       </td>
                       <td class="col-num" data-label={t("cnt.col_articles")}>
                         <span class="volo-cat-chip">
@@ -2046,6 +2101,7 @@ export function ContentWorkspace({
                                 article_ids: ids,
                               });
                               setSerArtFilter("");
+                              setSerSelPage(1);
                               setSerArtPage(1);
                               setSerModalOpen(true);
                             }}
@@ -2156,105 +2212,116 @@ export function ContentWorkspace({
                 />
               </div>
 
-              {serForm.article_ids.length > 0 && (
-                <div class="volo-subcard" style={{ maxHeight: "220px", overflowY: "auto" }}>
-                  <div class="volo-subcard-title">
-                    <span>
-                      {t("cnt.ser_articles_lbl")} ({serForm.article_ids.length})
-                    </span>
-                  </div>
-                  {serForm.article_ids.map((aid, idx) => {
-                    const art = knownArticlesMap[aid];
-                    const titleText = art?.title || aid;
-                    return (
-                      <div key={aid} class="volo-input-row" style={{ marginBottom: "6px", flexWrap: "nowrap" }}>
-                        <input
-                          key={`${aid}-${idx}`}
-                          type="number"
-                          min={1}
-                          max={serForm.article_ids.length}
-                          class="volo-input"
-                          style={{ width: "54px", padding: "3px 6px", fontSize: "12px", textAlign: "center", flexShrink: 0 }}
-                          defaultValue={String(idx + 1)}
-                          aria-label={t("cnt.lbl_sort")}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              e.preventDefault();
-                              const target = Number((e.currentTarget as HTMLInputElement).value) || idx + 1;
-                              moveSeriesArticleTo(idx, target - 1);
-                            }
-                          }}
-                          onBlur={(e) => {
-                            const target = Number((e.currentTarget as HTMLInputElement).value) || idx + 1;
-                            moveSeriesArticleTo(idx, target - 1);
-                          }}
-                        />
-                        <span
-                          style={{
-                            flex: 1,
-                            minWidth: 0,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                            fontSize: "13px",
-                          }}
-                          title={titleText}
-                        >
-                          {titleText}
+              {serForm.article_ids.length > 0 && (() => {
+                const pgSel = paginateItems(serForm.article_ids, serSelPage, 15);
+                const selOffset = (pgSel.safePage - 1) * 15;
+                return (
+                  <div style={{ marginBottom: "12px" }}>
+                    <div class="volo-subcard" style={{ maxHeight: "220px", overflowY: "auto" }}>
+                      <div class="volo-subcard-title">
+                        <span>
+                          {t("cnt.ser_articles_lbl")} ({serForm.article_ids.length})
                         </span>
-                        <div class="volo-row-actions" style={{ flexShrink: 0 }}>
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            disabled={idx === 0}
-                            title={t("cnt.move_top")}
-                            onClick={() => moveSeriesArticleTo(idx, 0)}
-                          >
-                            ⇈
-                          </button>
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            disabled={idx === 0}
-                            onClick={() => moveSeriesArticle(idx, -1)}
-                          >
-                            ↑
-                          </button>
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            disabled={idx === serForm.article_ids.length - 1}
-                            onClick={() => moveSeriesArticle(idx, 1)}
-                          >
-                            ↓
-                          </button>
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            disabled={idx === serForm.article_ids.length - 1}
-                            title={t("cnt.move_bottom")}
-                            onClick={() => moveSeriesArticleTo(idx, serForm.article_ids.length - 1)}
-                          >
-                            ⇊
-                          </button>
-                          <button
-                            type="button"
-                            class="volo-act-btn danger"
-                            onClick={() =>
-                              setSerForm({
-                                ...serForm,
-                                article_ids: serForm.article_ids.filter((id) => id !== aid),
-                              })
-                            }
-                          >
-                            ×
-                          </button>
-                        </div>
                       </div>
-                    );
-                  })}
-                </div>
-              )}
+                      {pgSel.slice.map((aid, localIdx) => {
+                        const idx = selOffset + localIdx;
+                        const art = knownArticlesMap[aid];
+                        const titleText = art?.title || aid;
+                        return (
+                          <div key={aid} class="volo-input-row" style={{ marginBottom: "6px", flexWrap: "nowrap", minWidth: 0 }}>
+                            <input
+                              key={`${aid}-${idx}`}
+                              type="number"
+                              min={1}
+                              max={serForm.article_ids.length}
+                              class="volo-input"
+                              style={{ width: "54px", padding: "3px 6px", fontSize: "12px", textAlign: "center", flexShrink: 0 }}
+                              defaultValue={String(idx + 1)}
+                              aria-label={t("cnt.lbl_sort")}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  const target = Number((e.currentTarget as HTMLInputElement).value) || idx + 1;
+                                  moveSeriesArticleTo(idx, target - 1);
+                                }
+                              }}
+                              onBlur={(e) => {
+                                const target = Number((e.currentTarget as HTMLInputElement).value) || idx + 1;
+                                moveSeriesArticleTo(idx, target - 1);
+                              }}
+                            />
+                            <span
+                              style={{
+                                flex: 1,
+                                minWidth: 0,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                                overflowWrap: "anywhere",
+                                fontSize: "13px",
+                              }}
+                              title={titleText}
+                            >
+                              {titleText}
+                            </span>
+                            <div class="volo-row-actions" style={{ flexShrink: 0 }}>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                disabled={idx === 0}
+                                title={t("cnt.move_top")}
+                                onClick={() => moveSeriesArticleTo(idx, 0)}
+                              >
+                                ⇈
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                disabled={idx === 0}
+                                onClick={() => moveSeriesArticle(idx, -1)}
+                              >
+                                ↑
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                disabled={idx === serForm.article_ids.length - 1}
+                                onClick={() => moveSeriesArticle(idx, 1)}
+                              >
+                                ↓
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                disabled={idx === serForm.article_ids.length - 1}
+                                title={t("cnt.move_bottom")}
+                                onClick={() => moveSeriesArticleTo(idx, serForm.article_ids.length - 1)}
+                              >
+                                ⇊
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn danger"
+                                onClick={() =>
+                                  setSerForm({
+                                    ...serForm,
+                                    article_ids: serForm.article_ids.filter((id) => id !== aid),
+                                  })
+                                }
+                              >
+                                ×
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {serForm.article_ids.length > 15 && (
+                      <Pagination total={serForm.article_ids.length} page={pgSel.safePage} pageSize={15} onChange={setSerSelPage} />
+                    )}
+                  </div>
+                );
+              })()}
 
               <div class="volo-field">
                 <div class="volo-sec-head">
@@ -2281,7 +2348,7 @@ export function ContentWorkspace({
                         <label
                           key={art.id}
                           class="volo-check-item"
-                          style={{ justifyContent: "space-between", gap: "8px" }}
+                          style={{ justifyContent: "space-between", gap: "8px", minWidth: 0 }}
                         >
                           <span class="volo-cell-title" style={{ minWidth: 0, flex: 1 }}>
                             <input
@@ -2303,12 +2370,13 @@ export function ContentWorkspace({
                                 overflow: "hidden",
                                 textOverflow: "ellipsis",
                                 whiteSpace: "nowrap",
+                                overflowWrap: "anywhere",
                               }}
                             >
                               {art.title || art.slug}
                             </span>
                           </span>
-                          <span class="volo-code-chip" style={{ flexShrink: 0 }}>
+                          <span class="volo-code-chip" style={{ flexShrink: 0, maxWidth: "42%", overflow: "hidden", textOverflow: "ellipsis" }}>
                             /{art.slug}
                           </span>
                         </label>
@@ -2393,6 +2461,7 @@ export function ContentWorkspace({
                 ) : (
                   displayBooks.map((b) => {
                     const absIdx = books.findIndex((x) => x.id === b.id);
+                    const isBookFiltered = Boolean(bookQuery.trim() || bookFilter);
                     return (
                       <tr key={b.id}>
                         <td class="col-fluid" data-label={t("cnt.book_col")}>
@@ -2421,8 +2490,8 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={absIdx <= 0}
-                              title={t("cnt.lbl_sort")}
+                              disabled={isBookFiltered || absIdx <= 0}
+                              title={isBookFiltered ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapBookOrder(absIdx, -1)}
                             >
                               ↑
@@ -2430,8 +2499,8 @@ export function ContentWorkspace({
                             <button
                               type="button"
                               class="volo-act-btn"
-                              disabled={absIdx < 0 || absIdx >= books.length - 1}
-                              title={t("cnt.lbl_sort")}
+                              disabled={isBookFiltered || absIdx < 0 || absIdx >= books.length - 1}
+                              title={isBookFiltered ? t("ui.sort_disabled_filtered") : t("cnt.lbl_sort")}
                               onClick={() => void swapBookOrder(absIdx, 1)}
                             >
                               ↓
@@ -2739,8 +2808,8 @@ export function ContentWorkspace({
                         return (
                           <div
                             key={ch._uid}
-                            class="volo-chap-row"
-                            style={{ paddingLeft: `${8 + depth * 20}px` }}
+                            class="volo-chap-row volo-chap-indent"
+                            style={{ "--chap-depth": depth } as any}
                           >
                             {hasChildren ? (
                               <button
@@ -3896,15 +3965,20 @@ export function ContentWorkspace({
                               />
                             </td>
                             <td class="col-fluid" data-label={t("cnt.media_col_asset")}>
-                              <div class="volo-cell-main">
-                                <div class="volo-cell-title">
-                                  <button type="button" class="volo-act-btn" onClick={() => openAssetLightbox(m)}>
+                              <div class="volo-cell-main" style={{ minWidth: 0 }}>
+                                <div class="volo-cell-title" style={{ minWidth: 0 }}>
+                                  <button
+                                    type="button"
+                                    class="volo-act-btn"
+                                    style={{ minWidth: 0, maxWidth: "100%", overflowWrap: "anywhere", textAlign: "left" }}
+                                    onClick={() => openAssetLightbox(m)}
+                                  >
                                     {displayName}
                                   </button>
                                   {m.storage_driver && <span class="volo-mini-tag">{m.storage_driver}</span>}
                                 </div>
-                                <div class="volo-cell-meta">
-                                  <span class="volo-code-chip">{m.public_url}</span>
+                                <div class="volo-cell-meta" style={{ minWidth: 0 }}>
+                                  <span class="volo-code-chip is-wrap">{m.public_url}</span>
                                 </div>
                               </div>
                             </td>
@@ -4026,9 +4100,11 @@ export function ContentWorkspace({
                   ) : String(previewAsset.mime_type || "").startsWith("audio/") ? (
                     <audio controls src={previewAsset.public_url} class="volo-w-full" />
                   ) : (
-                    <div class="volo-media-type-placeholder">
+                    <div class="volo-media-type-placeholder" style={{ minWidth: 0, padding: "12px" }}>
                       <span class="volo-code-chip">{previewAsset.mime_type || "FILE"}</span>
-                      <span>{previewAsset.original_name}</span>
+                      <span style={{ minWidth: 0, maxWidth: "100%", overflowWrap: "anywhere", textAlign: "center" }}>
+                        {previewAsset.original_name}
+                      </span>
                     </div>
                   )}
                 </div>

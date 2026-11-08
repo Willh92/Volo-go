@@ -144,6 +144,9 @@ func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest
 		}
 	}
 
+	if err := ensureStagedHomeFallbackAlias(stageDir); err != nil {
+		return Manifest{}, fmt.Errorf("theme: prepare home template alias: %w", err)
+	}
 	subFS, err := fs.Sub(builtinThemeFS, "builtin/volo-studio")
 	if err != nil {
 		return Manifest{}, err
@@ -226,6 +229,31 @@ func normalizeZipEntry(raw string) string {
 		return ""
 	}
 	return cleaned
+}
+
+// ensureStagedHomeFallbackAlias validates `templates/home.html` when `templates/index.html` is omitted
+// so external theme archives using `home.html` as their homepage alias pass staged verification cleanly.
+func ensureStagedHomeFallbackAlias(stageDir string) error {
+	indexPath := filepath.Join(stageDir, "templates", "index.html")
+	indexGzPath := filepath.Join(stageDir, "templates_gz", "index.html.gz")
+	if _, err := os.Stat(indexPath); err == nil {
+		return nil
+	}
+	if _, err := os.Stat(indexGzPath); err == nil {
+		return nil
+	}
+	homePath := filepath.Join(stageDir, "templates", "home.html")
+	st, err := os.Lstat(homePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return errors.New("theme: templates/home.html must be a regular file")
+	}
+	return nil
 }
 
 // ExportZip streams the specified built-in or external theme package as a standard `.zip` archive.

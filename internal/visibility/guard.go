@@ -2,7 +2,7 @@ package visibility
 
 import (
 	"context"
-	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -197,11 +197,24 @@ func openKeyRingWithFallback(kr *config.KeyRing, ciphertext string, primaryAAD s
 	return "", err
 }
 
+const lockKDFRounds = 4096
+
+// EqualLockPassword compares two lock passcodes in constant time using salted PBKDF2-HMAC-SHA256 stretching.
+func EqualLockPassword(a string, b string, domainSalt string) bool {
+	salt := []byte("volo-lock-cmp:v2:" + domainSalt)
+	ka, errA := pbkdf2.Key(sha256.New, a, salt, lockKDFRounds, 32)
+	kb, errB := pbkdf2.Key(sha256.New, b, salt, lockKDFRounds, 32)
+	if errA != nil || errB != nil || len(ka) != 32 || len(kb) != 32 {
+		return false
+	}
+	return subtle.ConstantTimeCompare(ka, kb) == 1
+}
+
 // InlineUnlockKey returns a lock-scoped passport entry key so multiple inline `:::lock pwd="..."` blocks
 // on the same article or page can be unlocked independently without overwriting each other in GuestPassport.
 func InlineUnlockKey(targetID string, pwd string) string {
-	sum := sha256.Sum256([]byte(pwd))
-	return targetID + "#" + hex.EncodeToString(sum[:6])
+	dk, _ := pbkdf2.Key(sha256.New, pwd, []byte("volo-inline-lock:v2:"+targetID), lockKDFRounds, 6)
+	return targetID + "#" + hex.EncodeToString(dk)
 }
 
 // IsAuthorOrAdmin reports whether viewer is an active Admin or the active Editor who authored raw.
@@ -254,9 +267,7 @@ func (g *Guard) EffectiveUnlockPassword(raw domain.RawArticle) (plain string, is
 // `raw.ID` when unlocking the whole-article password, or `InlineUnlockKey(raw.ID, matchedPwd)` for an inline lock block.
 func (g *Guard) UnlockEntryKey(raw domain.RawArticle, matchedPwd string) string {
 	if wholePwd, whole := g.DecryptArticlePassword(raw); whole && !strings.HasPrefix(wholePwd, "\x00") {
-		h1 := sha256.Sum256([]byte(wholePwd))
-		h2 := sha256.Sum256([]byte(matchedPwd))
-		if subtle.ConstantTimeCompare(h1[:], h2[:]) == 1 {
+		if EqualLockPassword(wholePwd, matchedPwd, "article:"+raw.ID) {
 			return raw.ID
 		}
 	}
@@ -270,18 +281,20 @@ func (g *Guard) VerifyArticlePassword(raw domain.RawArticle, candidate string) (
 	if c == "" {
 		return "", false
 	}
-	candSum := sha256.Sum256([]byte(c))
+	salt := []byte("volo-lock-cmp:v2:article:" + raw.ID)
+	candKey, err := pbkdf2.Key(sha256.New, c, salt, lockKDFRounds, 32)
+	if err != nil || len(candKey) != 32 {
+		return "", false
+	}
 
 	var matched string
 	if wholePwd, whole := g.DecryptArticlePassword(raw); whole && !strings.HasPrefix(wholePwd, "\x00") {
-		wSum := sha256.Sum256([]byte(wholePwd))
-		if subtle.ConstantTimeCompare(wSum[:], candSum[:]) == 1 {
+		if wKey, wErr := pbkdf2.Key(sha256.New, wholePwd, salt, lockKDFRounds, 32); wErr == nil && subtle.ConstantTimeCompare(wKey, candKey) == 1 {
 			matched = wholePwd
 		}
 	}
 	for _, inlinePwd := range render.ExtractAllLockPasswords(raw.ContentMD) {
-		iSum := sha256.Sum256([]byte(inlinePwd))
-		if subtle.ConstantTimeCompare(iSum[:], candSum[:]) == 1 && matched == "" {
+		if iKey, iErr := pbkdf2.Key(sha256.New, inlinePwd, salt, lockKDFRounds, 32); iErr == nil && subtle.ConstantTimeCompare(iKey, candKey) == 1 && matched == "" {
 			matched = inlinePwd
 		}
 	}
@@ -317,7 +330,7 @@ func (g *Guard) ResolveInlineUnlockedPasswords(r *http.Request, targetID string,
 // --- Timed Passwordless ShareToken (`?preview=<exp>.<sig>`) ---
 
 // IssueShareToken generates a stateless, time-limited preview token bound to BOTH articleID
-// and SHA-256(current_article_password) plus the rotatable ShareTokenSecret.
+// and PBKDF2-HMAC-SHA256(current_article_password) plus the rotatable ShareTokenSecret.
 func (g *Guard) IssueShareToken(ctx context.Context, raw domain.RawArticle, ttl time.Duration) (string, int64, error) {
 	plainPwd, isWhole, _ := g.EffectiveUnlockPassword(raw)
 	if !isWhole && !raw.HasContentLock && !render.ContainsLockDirective(raw.ContentMD) {
@@ -370,10 +383,11 @@ func (g *Guard) VerifyShareToken(ctx context.Context, raw domain.RawArticle, tok
 
 func (g *Guard) computeShareMAC(rotSecret string, articleID string, exp int64, plainPwd string) string {
 	seed := g.keys.ShareTokenKey()
-	pwdDigest := sha256.Sum256([]byte(plainPwd))
-	mac := hmac.New(sha256.New, seed[:])
-	fmt.Fprintf(mac, "volo-share:v1:%s:%s:%d:%x", rotSecret, articleID, exp, pwdDigest[:])
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:24])
+	salt := make([]byte, 0, len(seed)+len(rotSecret)+len(articleID)+48)
+	salt = append(salt, seed[:]...)
+	salt = fmt.Appendf(salt, ":volo-share:v2:%d:%s:%d:%s:%d", len(rotSecret), rotSecret, len(articleID), articleID, exp)
+	dk, _ := pbkdf2.Key(sha256.New, plainPwd, salt, lockKDFRounds, 24)
+	return base64.RawURLEncoding.EncodeToString(dk)
 }
 
 // UnlockStatus describes how/whether the current HTTP request has unlocked a protected article.

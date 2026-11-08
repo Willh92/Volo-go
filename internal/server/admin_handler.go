@@ -26,6 +26,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/auth"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
@@ -197,8 +198,10 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		if sess != nil {
 			_ = s.deps.Auth.RevokeSession(r.Context(), actor, sess.ID)
 		}
-		http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
-		http.SetCookie(w, &http.Cookie{Name: trusted2FACookieName, Value: "", Path: "/api/admin/auth", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		sec := s.isCookieSecureForRequest(r)
+		http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: sec, SameSite: http.SameSiteLaxMode})
+		http.SetCookie(w, &http.Cookie{Name: trusted2FACookieName, Value: "", Path: "/api", MaxAge: -1, HttpOnly: true, Secure: sec, SameSite: http.SameSiteLaxMode})
+		http.SetCookie(w, &http.Cookie{Name: trusted2FACookieName, Value: "", Path: "/api/admin/auth", MaxAge: -1, HttpOnly: true, Secure: sec, SameSite: http.SameSiteLaxMode})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case sub == "me":
@@ -310,6 +313,7 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 
 	case strings.HasPrefix(sub, "security/totp") ||
 		strings.HasPrefix(sub, "security/passkeys") ||
+		strings.HasPrefix(sub, "security/oidc-links") ||
 		strings.HasPrefix(sub, "security/sessions") ||
 		strings.HasPrefix(sub, "security/tokens"):
 		actor, sess, ok := s.authenticateAdminRequest(w, r, "", false)
@@ -417,18 +421,13 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
 	if trustCookie != "" {
-		pubURL := ""
-		if s.deps.Config != nil {
-			pubURL = s.deps.Config.GetPublicURL()
-		}
-		secure := s.effectiveRequestScheme(r) == "https" || strings.HasPrefix(strings.ToLower(strings.TrimSpace(pubURL)), "https://")
 		http.SetCookie(w, &http.Cookie{
 			Name:     trusted2FACookieName,
 			Value:    trustCookie,
-			Path:     "/api/admin/auth",
+			Path:     "/api",
 			MaxAge:   s.deps.Settings.Snapshot().Security.TOTPRememberDays * 86400,
 			HttpOnly: true,
-			Secure:   secure,
+			Secure:   s.isCookieSecureForRequest(r),
 			SameSite: http.SameSiteLaxMode,
 		})
 	}
@@ -642,6 +641,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 				curSessID = sess.ID
 			}
 			_ = s.deps.Auth.RevokeOtherSessions(r.Context(), fullUser.ID, curSessID)
+			_ = s.deps.Auth.RevokeUserAPITokens(r.Context(), fullUser.ID)
 		}
 		fullUser.PasswordHash = ""
 		fullUser.LegacyHash = ""
@@ -651,8 +651,58 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
+func (s *AppServer) stepUpErrorMessage(r *http.Request, missing bool) string {
+	loc := strings.ToLower(s.resolveLocale(r))
+	if missing {
+		if s.deps.Catalog != nil {
+			if msg := s.deps.Catalog.T(s.resolveLocale(r), "sys.stepup_pwd_required"); msg != "" && msg != "sys.stepup_pwd_required" {
+				return msg
+			}
+		}
+		if strings.HasPrefix(loc, "zh-tw") || strings.HasPrefix(loc, "zh-hk") {
+			return "請輸入目前登入密碼以完成安全確認 (current_password is required)"
+		}
+		if strings.HasPrefix(loc, "zh") {
+			return "请输入当前登录密码以完成安全确认 (current_password is required)"
+		}
+		return "current_password is required"
+	}
+	if strings.HasPrefix(loc, "zh-tw") || strings.HasPrefix(loc, "zh-hk") {
+		return "目前登入密碼不正確 (current_password is incorrect)"
+	}
+	if strings.HasPrefix(loc, "zh") {
+		return "当前登录密码不正确 (current_password is incorrect)"
+	}
+	return "current_password is incorrect"
+}
+
+func (s *AppServer) verifyStepUpPassword(w http.ResponseWriter, r *http.Request, actorID string, candidate string) bool {
+	pwd := candidate
+	if strings.TrimSpace(pwd) == "" {
+		pwd = r.Header.Get("X-Volo-Current-Password")
+	}
+	if strings.TrimSpace(pwd) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": s.stepUpErrorMessage(r, true)})
+		return false
+	}
+	fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actorID)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.stepUpErrorMessage(r, false)})
+		return false
+	}
+	ok, _ := auth.VerifyPassword(pwd, fullUser.PasswordHash, fullUser.LegacyHash)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": s.stepUpErrorMessage(r, false)})
+		return false
+	}
+	return true
+}
+
 func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Request, actor *domain.User, sess *domain.UserSession, sub string) {
 	switch {
+	case sub == "oidc-links" || strings.HasPrefix(sub, "oidc-links/"):
+		s.handleAdminOIDCLinks(w, r, actor, sess, strings.TrimPrefix(sub, "oidc-links"))
+
 	case sub == "totp/setup" && r.Method == http.MethodPost:
 		secret, err := auth.GenerateTOTPSecret()
 		if err != nil {
@@ -772,9 +822,26 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusCreated, map[string]any{"passkey": cred})
 
 	case strings.HasPrefix(sub, "passkeys/") && r.Method == http.MethodDelete:
+		if sess == nil || sess.ID == "" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			return
+		}
+		var req struct {
+			CurrentPassword string `json:"current_password"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				return
+			}
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
+			return
+		}
 		pkID := strings.TrimPrefix(sub, "passkeys/")
 		_, _ = s.deps.Store.ExecContext(r.Context(),
 			`DELETE FROM user_credentials WHERE id = ? AND user_id = ? AND kind = 'passkey'`, pkID, actor.ID)
+		s.recordAuditLog(r, actor, "security.passkey_delete", "user_credential", pkID, nil)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case sub == "sessions" && r.Method == http.MethodGet:
@@ -827,13 +894,21 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusOK, map[string]any{"items": rows})
 
 	case sub == "tokens" && r.Method == http.MethodPost:
+		if sess == nil || sess.ID == "" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden")})
+			return
+		}
 		var req struct {
-			Name      string   `json:"name"`
-			Scopes    []string `json:"scopes"`
-			ExpiresIn int      `json:"expires_in_days"`
+			Name            string   `json:"name"`
+			Scopes          []string `json:"scopes"`
+			ExpiresIn       int      `json:"expires_in_days"`
+			CurrentPassword string   `json:"current_password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
 			return
 		}
 		var expMS int64
@@ -1532,6 +1607,11 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
 			}
+			catRows, _ := sqlx.Select[domain.Category](r.Context(), s.deps.Store, `SELECT id, name FROM categories`)
+			catNames := make(map[string]string, len(catRows))
+			for _, c := range catRows {
+				catNames[c.ID] = c.Name
+			}
 			items := make([]map[string]any, 0, len(rows))
 			for _, row := range rows {
 				hasArticlePwd := strings.TrimSpace(row.PasswordCiphertext) != ""
@@ -1539,6 +1619,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				row.PasswordCiphertext = ""
 				items = append(items, map[string]any{
 					"article":               row,
+					"category_name":         catNames[row.CategoryID],
 					"is_password_protected": hasPwd,
 					"has_password":          hasArticlePwd,
 				})
@@ -1685,6 +1766,10 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			}
 			var seriesID string
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT series_id FROM series_articles WHERE article_id = ? LIMIT 1`, artID).Scan(&seriesID)
+			var catName string
+			if raw.CategoryID != "" {
+				_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT name FROM categories WHERE id = ?`, raw.CategoryID).Scan(&catName)
+			}
 			plainPwd, hasPwd := s.deps.Content.Guard().DecryptArticlePassword(raw)
 			if strings.HasPrefix(plainPwd, "\x00") {
 				plainPwd = ""
@@ -1698,6 +1783,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			raw.PasswordCiphertext = ""
 			writeJSON(w, http.StatusOK, map[string]any{
 				"article":               raw,
+				"category_name":         catName,
 				"tags":                  tags,
 				"series_id":             seriesID,
 				"is_password_protected": hasPwd,
@@ -2453,38 +2539,40 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		}
 		merged := 0
 		reboundArticles := 0
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(sourceIDs)), ",")
+		srcArgs := make([]any, len(sourceIDs))
+		for i, v := range sourceIDs {
+			srcArgs[i] = v
+		}
 		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
-			for _, srcID := range sourceIDs {
-				links, lErr := sqlx.Select[struct {
-					ArticleID string `db:"article_id"`
-				}](r.Context(), tx, `SELECT article_id FROM article_tags WHERE tag_id = ?`, srcID)
-				if lErr != nil {
-					return lErr
-				}
-				for _, lk := range links {
-					var existing int
-					_ = tx.QueryRowContext(r.Context(),
-						`SELECT COUNT(*) FROM article_tags WHERE article_id = ? AND tag_id = ?`,
-						lk.ArticleID, targetID).Scan(&existing)
-					if existing == 0 {
-						if _, iErr := tx.ExecContext(r.Context(),
-							`INSERT INTO article_tags (article_id, tag_id) VALUES (?, ?)`,
-							lk.ArticleID, targetID); iErr != nil {
-							return iErr
-						}
-						reboundArticles++
-					}
-				}
-				if _, dErr := tx.ExecContext(r.Context(), `DELETE FROM article_tags WHERE tag_id = ?`, srcID); dErr != nil {
-					return dErr
-				}
-				res, dErr := tx.ExecContext(r.Context(), `DELETE FROM tags WHERE id = ?`, srcID)
-				if dErr != nil {
-					return dErr
-				}
-				if n, _ := res.RowsAffected(); n > 0 {
-					merged += int(n)
-				}
+			insSQL := `INSERT INTO article_tags (article_id, tag_id)
+				SELECT DISTINCT at.article_id, t.id FROM article_tags at
+				INNER JOIN tags t ON t.id = ?
+				WHERE at.tag_id IN (` + ph + `)
+				ON CONFLICT (article_id, tag_id) DO NOTHING`
+			if s.deps.Store.Dialect().Name() == "mysql" {
+				insSQL = `INSERT IGNORE INTO article_tags (article_id, tag_id)
+					SELECT DISTINCT at.article_id, t.id FROM article_tags at
+					INNER JOIN tags t ON t.id = ?
+					WHERE at.tag_id IN (` + ph + `)`
+			}
+			insArgs := append([]any{targetID}, srcArgs...)
+			insRes, iErr := tx.ExecContext(r.Context(), insSQL, insArgs...)
+			if iErr != nil {
+				return iErr
+			}
+			if n, _ := insRes.RowsAffected(); n > 0 {
+				reboundArticles = int(n)
+			}
+			if _, dErr := tx.ExecContext(r.Context(), `DELETE FROM article_tags WHERE tag_id IN (`+ph+`)`, srcArgs...); dErr != nil {
+				return dErr
+			}
+			delRes, dErr := tx.ExecContext(r.Context(), `DELETE FROM tags WHERE id IN (`+ph+`)`, srcArgs...)
+			if dErr != nil {
+				return dErr
+			}
+			if n, _ := delRes.RowsAffected(); n > 0 {
+				merged = int(n)
 			}
 			return nil
 		})
@@ -2957,15 +3045,15 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				args = append(args, pat, pat, pat)
 			}
 			if sourceType != "" && sourceType != "all" {
-				where = append(where, "LOWER(source_type) = ?")
+				where = append(where, "source_type = ?")
 				args = append(args, sourceType)
 			}
 			if embedMode != "" && embedMode != "all" {
-				where = append(where, "LOWER(embed_mode) = ?")
+				where = append(where, "embed_mode = ?")
 				args = append(args, embedMode)
 			}
 			if readingStatus != "" && readingStatus != "all" {
-				where = append(where, "LOWER(reading_status) = ?")
+				where = append(where, "reading_status = ?")
 				args = append(args, readingStatus)
 			}
 			switch statusFilter {
@@ -3021,9 +3109,11 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			if in.Slug == "" {
 				in.Slug = sanitizeSlug(in.Title)
 			}
+			in.SourceType = strings.ToLower(strings.TrimSpace(in.SourceType))
 			if in.SourceType == "" {
 				in.SourceType = "auto"
 			}
+			in.EmbedMode = strings.ToLower(strings.TrimSpace(in.EmbedMode))
 			if in.EmbedMode == "" {
 				in.EmbedMode = "link"
 			}
@@ -3033,6 +3123,12 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			in.UpdatedAt = now
 			in.ChapterCount = len(in.Chapters)
 			err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+				if in.SortOrder <= 0 {
+					_ = tx.QueryRowContext(r.Context(), `SELECT COALESCE(MAX(sort_order), 0) + 1 FROM books`).Scan(&in.SortOrder)
+					if in.SortOrder <= 0 {
+						in.SortOrder = 1
+					}
+				}
 				if _, iErr := tx.ExecContext(r.Context(),
 					`INSERT INTO books (id, title, slug, description, cover_url, source_type, source_url, series_id, embed_mode, reading_status, chapter_count, synced_at, sort_order, created_at, updated_at)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
@@ -3108,12 +3204,20 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 		if slug == "" && title != "" {
 			slug = sanitizeSlug(title)
 		}
+		sourceType := strings.ToLower(strings.TrimSpace(in.SourceType))
+		if sourceType == "" {
+			sourceType = "auto"
+		}
+		embedMode := strings.ToLower(strings.TrimSpace(in.EmbedMode))
+		if embedMode == "" {
+			embedMode = "link"
+		}
 		readingStatus := strings.ToLower(strings.TrimSpace(in.ReadingStatus))
 		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
 			if _, uErr := tx.ExecContext(r.Context(),
 				`UPDATE books SET title = ?, slug = ?, description = ?, cover_url = ?, source_type = ?, source_url = ?, series_id = ?, embed_mode = ?, reading_status = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
-				title, slug, in.Description, in.CoverURL, in.SourceType, in.SourceURL,
-				in.SeriesID, in.EmbedMode, readingStatus, in.SortOrder, time.Now().UnixMilli(), bookID); uErr != nil {
+				title, slug, in.Description, in.CoverURL, sourceType, in.SourceURL,
+				in.SeriesID, embedMode, readingStatus, in.SortOrder, time.Now().UnixMilli(), bookID); uErr != nil {
 				return uErr
 			}
 			if in.Chapters != nil {
@@ -3662,7 +3766,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		withRefs := r.URL.Query().Get("refs") != "0" && !strings.EqualFold(r.URL.Query().Get("refs"), "false")
 		sortBy := r.URL.Query().Get("sort")
 
-		items, total, orphanCnt, totalBytes := s.queryAdminMediaPage(r.Context(), q, mimeFilter, monthFilter, usage, orphanOnly, withRefs, sortBy, page, perPage)
+		items, total, allTotal, orphanCnt, totalBytes := s.queryAdminMediaPage(r.Context(), actor, q, mimeFilter, monthFilter, usage, orphanOnly, withRefs, sortBy, page, perPage)
 		drv := strings.TrimSpace(s.deps.Settings.Snapshot().Storage.ActiveDriver)
 		if drv == "" {
 			drv = "local"
@@ -3674,6 +3778,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			"total_bytes":    totalBytes,
 			"storage_driver": drv,
 			"total":          total,
+			"all_total":      allTotal,
 			"page":           page,
 			"per_page":       perPage,
 			"page_size":      perPage,
@@ -3893,26 +3998,31 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 	if len(raw) == 0 {
 		return nil, errors.New("empty upload")
 	}
-	sniff := http.DetectContentType(raw[:minInt(512, len(raw))])
 	ext := strings.ToLower(filepath.Ext(origName))
 	switch ext {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp3", ".m4a", ".ogg", ".wav", ".pdf", ".zip":
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav", ".mp4", ".webm", ".pdf", ".zip":
 	case ".svg":
 		return nil, errors.New("raw SVG upload disallowed for XSS safety; use PNG/WebP/JPEG")
 	default:
 		return nil, fmt.Errorf("unsupported file extension %q", ext)
 	}
 
+	mimeType := defaultReconcileMIMEType(ext, raw[:minInt(512, len(raw))])
 	exifStripped := false
-	if strippedBytes, stripped := stripImageMetadataBytes(raw, ext); stripped {
-		raw = strippedBytes
-		exifStripped = true
-	} else if ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" {
-		exifStripped = true
-	}
-
 	var width, height int
-	if strings.HasPrefix(sniff, "image/") {
+
+	if ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".gif" {
+		cleanBytes, normMIME, w, h, changed, nErr := media.NormalizeLocalImageBytes(raw, ext)
+		if nErr != nil {
+			return nil, nErr
+		}
+		if changed && len(cleanBytes) > 0 {
+			raw = cleanBytes
+		}
+		mimeType = strings.ToLower(strings.TrimSpace(normMIME))
+		width, height = w, h
+		exifStripped = ext != ".gif"
+	} else if strings.HasPrefix(mimeType, "image/") {
 		if cfg, _, iErr := image.DecodeConfig(strings.NewReader(string(raw))); iErr == nil {
 			width, height = cfg.Width, cfg.Height
 		}
@@ -3935,7 +4045,7 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 		PublicURL:     "/uploads/" + relKey,
 		OriginalName:  filepath.Base(origName),
 		AltText:       "",
-		MIMEType:      sniff,
+		MIMEType:      mimeType,
 		SizeBytes:     int64(len(raw)),
 		Width:         width,
 		Height:        height,

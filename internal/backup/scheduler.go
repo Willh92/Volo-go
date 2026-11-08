@@ -1,8 +1,10 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -37,10 +39,11 @@ type SchedulerOptions struct {
 
 // RunResult summarizes a single rolling backup execution cycle.
 type RunResult struct {
-	LocalPath      string
-	PrunedCount    int
-	RemoteUploaded bool
-	RemoteTarget   string
+	LocalPath         string
+	PrunedCount       int
+	RemoteUploaded    bool
+	RemoteTarget      string
+	RemotePrunedCount int
 }
 
 // Scheduler executes periodic streaming local backups, enforces `LocalKeepCount` retention,
@@ -205,6 +208,11 @@ func (s *Scheduler) runCycle(ctx context.Context) (*RunResult, error) {
 		}
 		res.RemoteUploaded = true
 		res.RemoteTarget = target
+		rPruned, pErr := s.pruneRemoteAutoBackups(ctx, cfg, sec, keep)
+		res.RemotePrunedCount = rPruned
+		if pErr != nil && s.opts.Logger != nil {
+			fmt.Fprintf(s.opts.Logger, "volo backup scheduler: remote prune warning: %v\n", pErr)
+		}
 	}
 	return res, nil
 }
@@ -296,18 +304,18 @@ func (s *Scheduler) resolveBackupStoragePlugin(proto string) (plugin.StorageProv
 	return nil, "", false
 }
 
-func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password string, r io.ReadSeeker, size int64, filename string, safeDialer *security.OutboundSafeDialer) (string, error) {
-	base := strings.TrimSpace(cfg.WebDAVURL)
+func newWebDAVClient(rawBase string, safeDialer *security.OutboundSafeDialer, timeout time.Duration) (*url.URL, *http.Client, error) {
+	base := strings.TrimSpace(rawBase)
 	if base == "" {
-		return "", errors.New("webdav_url is required")
+		return nil, nil, errors.New("webdav_url is required")
 	}
 	u, err := url.Parse(base)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return "", fmt.Errorf("invalid webdav_url %q", base)
+		return nil, nil, fmt.Errorf("invalid webdav_url %q", base)
 	}
 	if safeDialer != nil {
 		if _, err := safeDialer.ValidateOutboundURL(u.String()); err != nil {
-			return "", err
+			return nil, nil, err
 		}
 	}
 
@@ -323,7 +331,7 @@ func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password
 	}
 	client := &http.Client{
 		Transport: tr,
-		Timeout:   10 * time.Minute,
+		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
 				return errors.New("webdav: stopped after 3 redirects")
@@ -337,6 +345,14 @@ func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password
 			}
 			return nil
 		},
+	}
+	return u, client, nil
+}
+
+func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password string, r io.ReadSeeker, size int64, filename string, safeDialer *security.OutboundSafeDialer) (string, error) {
+	u, client, err := newWebDAVClient(cfg.WebDAVURL, safeDialer, 10*time.Minute)
+	if err != nil {
+		return "", err
 	}
 
 	dirRel := strings.Trim(cfg.WebDAVDir, "/")
@@ -386,6 +402,226 @@ func uploadWebDAVStream(ctx context.Context, cfg domain.BackupSettings, password
 	return putURL.String(), nil
 }
 
+func isAutoBackupZipName(name string) bool {
+	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return false
+	}
+	return (strings.HasPrefix(name, "volo-auto-") || strings.HasPrefix(name, "volo-auto-backup-")) && strings.HasSuffix(name, ".zip")
+}
+
+func (s *Scheduler) pruneRemoteAutoBackups(ctx context.Context, cfg domain.BackupSettings, sec domain.BackupSecrets, keepCount int) (int, error) {
+	if keepCount <= 0 {
+		keepCount = 7
+	}
+	proto := strings.ToLower(strings.TrimSpace(cfg.RemoteProtocol))
+	switch proto {
+	case "s3":
+		cli, err := s3client.NewClient(s3client.Config{
+			Endpoint:  cfg.S3Endpoint,
+			Region:    cfg.S3Region,
+			Bucket:    cfg.S3Bucket,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: sec.S3SecretKey,
+			KeyPrefix: cfg.S3Prefix,
+			PathStyle: cfg.S3PathStyle,
+		}, s.opts.OutboundDialer)
+		if err != nil {
+			return 0, err
+		}
+		objs, err := cli.ListObjects(ctx, "volo-auto-")
+		if err != nil {
+			return 0, err
+		}
+		var autos []s3client.ObjectInfo
+		for _, obj := range objs {
+			if isAutoBackupZipName(obj.Key) {
+				autos = append(autos, obj)
+			}
+		}
+		if len(autos) <= keepCount {
+			return 0, nil
+		}
+		sort.Slice(autos, func(i, j int) bool {
+			if !autos[i].LastModified.Equal(autos[j].LastModified) && !autos[i].LastModified.IsZero() && !autos[j].LastModified.IsZero() {
+				return autos[i].LastModified.After(autos[j].LastModified)
+			}
+			return autos[i].Key > autos[j].Key
+		})
+		pruned := 0
+		var firstErr error
+		for _, old := range autos[keepCount:] {
+			if dErr := cli.DeleteObject(ctx, old.Key); dErr != nil {
+				firstErr = errors.Join(firstErr, dErr)
+			} else {
+				pruned++
+			}
+		}
+		return pruned, firstErr
+
+	case "webdav":
+		return pruneWebDAVAutoBackups(ctx, cfg, sec.WebDAVPassword, keepCount, s.opts.OutboundDialer)
+
+	default:
+		return 0, nil
+	}
+}
+
+func pruneWebDAVAutoBackups(ctx context.Context, cfg domain.BackupSettings, password string, keepCount int, safeDialer *security.OutboundSafeDialer) (int, error) {
+	u, client, err := newWebDAVClient(cfg.WebDAVURL, safeDialer, 60*time.Second)
+	if err != nil {
+		return 0, err
+	}
+	dirRel := strings.Trim(cfg.WebDAVDir, "/")
+	colURL := *u
+	if dirRel != "" {
+		colURL.Path = strings.TrimRight(path.Join(u.Path, dirRel), "/") + "/"
+	} else {
+		colURL.Path = strings.TrimRight(u.Path, "/") + "/"
+	}
+
+	const propfindXML = `<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/></d:prop></d:propfind>`
+	req, err := http.NewRequestWithContext(ctx, "PROPFIND", colURL.String(), bytes.NewReader([]byte(propfindXML)))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Depth", "1")
+	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
+	if cfg.WebDAVUser != "" {
+		req.SetBasicAuth(cfg.WebDAVUser, password)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return 0, readErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("webdav PROPFIND status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	type davProp struct {
+		LastModified string `xml:"getlastmodified"`
+	}
+	type davPropStat struct {
+		Prop davProp `xml:"prop"`
+	}
+	type davResponse struct {
+		Href      string        `xml:"href"`
+		PropStats []davPropStat `xml:"propstat"`
+		Direct    davProp       `xml:"prop"`
+	}
+	type davMultistatus struct {
+		Responses []davResponse `xml:"response"`
+	}
+
+	var ms davMultistatus
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		return 0, fmt.Errorf("webdav PROPFIND parse XML: %w", err)
+	}
+
+	type davBackupEntry struct {
+		name    string
+		modTime time.Time
+	}
+	colClean := path.Clean(strings.TrimRight(colURL.Path, "/"))
+	if colClean == "." {
+		colClean = "/"
+	}
+	seen := make(map[string]bool)
+	var autos []davBackupEntry
+	for _, r := range ms.Responses {
+		rawHref := strings.TrimSpace(r.Href)
+		if rawHref == "" {
+			continue
+		}
+		hrefPath := rawHref
+		if pu, pErr := url.Parse(rawHref); pErr == nil && pu.Path != "" {
+			hrefPath = pu.Path
+		}
+		if strings.HasSuffix(hrefPath, "/") {
+			continue
+		}
+		var base string
+		if strings.HasPrefix(hrefPath, "/") {
+			parentClean := path.Clean(path.Dir(hrefPath))
+			if parentClean != colClean && !strings.HasSuffix(parentClean, colClean) {
+				continue
+			}
+			base = path.Base(hrefPath)
+		} else {
+			if strings.Contains(hrefPath, "/") {
+				continue
+			}
+			base = hrefPath
+		}
+		if !isAutoBackupZipName(base) || seen[base] {
+			continue
+		}
+		seen[base] = true
+
+		rawMod := strings.TrimSpace(r.Direct.LastModified)
+		for _, ps := range r.PropStats {
+			if m := strings.TrimSpace(ps.Prop.LastModified); m != "" {
+				rawMod = m
+				break
+			}
+		}
+		var modTime time.Time
+		if rawMod != "" {
+			if t, tErr := http.ParseTime(rawMod); tErr == nil {
+				modTime = t.UTC()
+			} else if t, tErr := time.Parse(time.RFC1123Z, rawMod); tErr == nil {
+				modTime = t.UTC()
+			} else if t, tErr := time.Parse(time.RFC3339, rawMod); tErr == nil {
+				modTime = t.UTC()
+			}
+		}
+		autos = append(autos, davBackupEntry{name: base, modTime: modTime})
+	}
+
+	if len(autos) <= keepCount {
+		return 0, nil
+	}
+	sort.Slice(autos, func(i, j int) bool {
+		if !autos[i].modTime.Equal(autos[j].modTime) && !autos[i].modTime.IsZero() && !autos[j].modTime.IsZero() {
+			return autos[i].modTime.After(autos[j].modTime)
+		}
+		return autos[i].name > autos[j].name
+	})
+
+	pruned := 0
+	var firstErr error
+	for _, old := range autos[keepCount:] {
+		delURL := *u
+		delURL.Path = path.Join(colURL.Path, old.name)
+		delReq, reqErr := http.NewRequestWithContext(ctx, http.MethodDelete, delURL.String(), nil)
+		if reqErr != nil {
+			firstErr = errors.Join(firstErr, reqErr)
+			continue
+		}
+		if cfg.WebDAVUser != "" {
+			delReq.SetBasicAuth(cfg.WebDAVUser, password)
+		}
+		delResp, doErr := client.Do(delReq)
+		if doErr != nil {
+			firstErr = errors.Join(firstErr, doErr)
+			continue
+		}
+		delMsg, _ := io.ReadAll(io.LimitReader(delResp.Body, 512))
+		_ = delResp.Body.Close()
+		if delResp.StatusCode == http.StatusOK || delResp.StatusCode == http.StatusAccepted || delResp.StatusCode == http.StatusNoContent || delResp.StatusCode == http.StatusNotFound {
+			pruned++
+		} else {
+			firstErr = errors.Join(firstErr, fmt.Errorf("webdav DELETE %q status %d: %s", old.name, delResp.StatusCode, strings.TrimSpace(string(delMsg))))
+		}
+	}
+	return pruned, firstErr
+}
+
 func pruneAutoBackups(backupDir string, keepCount int) (int, error) {
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
@@ -397,7 +633,7 @@ func pruneAutoBackups(backupDir string, keepCount int) (int, error) {
 			continue
 		}
 		name := e.Name()
-		if strings.HasPrefix(name, "volo-auto-") && strings.HasSuffix(name, ".zip") {
+		if isAutoBackupZipName(name) {
 			autos = append(autos, name)
 		}
 	}

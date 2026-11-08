@@ -11,7 +11,7 @@ import (
 )
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 5
+const CurrentSchemaVersion = 6
 
 type migrationStep struct {
 	Version     int
@@ -44,6 +44,11 @@ var steps = []migrationStep{
 		Version:     5,
 		Description: "Add custom template column to pages and bounded webhook_deliveries history table",
 		Statements:  buildV5PageTemplatesAndWebhookDeliveries,
+	},
+	{
+		Version:     6,
+		Description: "Drop duplicate media index, add v6 scale composite indexes, and widen long lookup keys to VARCHAR(512)",
+		Statements:  buildV6ScaleIndexesAndKeyWidths,
 	},
 }
 
@@ -102,6 +107,41 @@ func buildV5PageTemplatesAndWebhookDeliveries(d dialect.Dialect) []string {
 	}
 }
 
+func buildV6ScaleIndexesAndKeyWidths(d dialect.Dialect) []string {
+	stmts := make([]string, 0, 12)
+	if d.Name() == "mysql" {
+		stmts = append(stmts, `DROP INDEX idx_media_created ON media_assets`)
+	} else {
+		stmts = append(stmts, `DROP INDEX IF EXISTS idx_media_created`)
+	}
+	stmts = append(stmts,
+		`CREATE INDEX idx_comments_target_root_created ON comments (target_type, target_id, is_deleted, parent_id, created_at, id)`,
+		`CREATE INDEX idx_books_sort_created ON books (sort_order, created_at)`,
+		`CREATE INDEX idx_books_status_sort_created ON books (reading_status, sort_order, created_at)`,
+		`CREATE INDEX idx_pages_updated ON pages (updated_at)`,
+		`CREATE INDEX idx_media_mime_created ON media_assets (mime_type, created_at)`,
+		`CREATE INDEX idx_media_size_created ON media_assets (size_bytes, created_at)`,
+		`CREATE INDEX idx_webhook_deliveries_hook_created_id ON webhook_deliveries (webhook_id, created_at, id)`,
+	)
+	switch d.Name() {
+	case "postgres":
+		stmts = append(stmts,
+			`ALTER TABLE user_credentials ALTER COLUMN credential_id TYPE VARCHAR(512)`,
+			`ALTER TABLE articles ALTER COLUMN legacy_permalink TYPE VARCHAR(512)`,
+			`ALTER TABLE redirects ALTER COLUMN source_path TYPE VARCHAR(512)`,
+			`ALTER TABLE analytics_top_items ALTER COLUMN item_key TYPE VARCHAR(512)`,
+		)
+	case "mysql":
+		stmts = append(stmts,
+			`ALTER TABLE user_credentials MODIFY COLUMN credential_id VARCHAR(512) NOT NULL DEFAULT ''`,
+			`ALTER TABLE articles MODIFY COLUMN legacy_permalink VARCHAR(512) NOT NULL DEFAULT ''`,
+			`ALTER TABLE redirects MODIFY COLUMN source_path VARCHAR(512) NOT NULL DEFAULT ''`,
+			`ALTER TABLE analytics_top_items MODIFY COLUMN item_key VARCHAR(512) NOT NULL DEFAULT ''`,
+		)
+	}
+	return stmts
+}
+
 // Up idempotently applies all pending schema migrations across SQLite, PostgreSQL, and MySQL.
 func Up(ctx context.Context, store *sqlx.Store) error {
 	d := store.Dialect()
@@ -139,6 +179,12 @@ func Up(ctx context.Context, store *sqlx.Store) error {
 				strings.HasPrefix(upper, "CREATE UNIQUE INDEX ") {
 				if err := execIdempotentIndex(ctx, store, stmt); err != nil {
 					return fmt.Errorf("migrate v%d index failed (%s): %w", step.Version, stmt, err)
+				}
+				continue
+			}
+			if strings.HasPrefix(upper, "DROP INDEX ") {
+				if err := execIdempotentDropIndex(ctx, store, stmt); err != nil {
+					return fmt.Errorf("migrate v%d drop index failed (%s): %w", step.Version, stmt, err)
 				}
 				continue
 			}
@@ -182,7 +228,93 @@ func execIdempotentIndex(ctx context.Context, store *sqlx.Store, stmt string) er
 	return err
 }
 
+func execIdempotentDropIndex(ctx context.Context, store *sqlx.Store, stmt string) error {
+	_, err := store.ExecContext(ctx, stmt)
+	if err == nil {
+		return nil
+	}
+	low := strings.ToLower(err.Error())
+	if strings.Contains(err.Error(), "1091") ||
+		strings.Contains(low, "check that column/key exists") ||
+		strings.Contains(low, "can't drop") ||
+		strings.Contains(low, "does not exist") ||
+		strings.Contains(low, "no such index") {
+		return nil
+	}
+	return err
+}
+
+func parseAlterAddColumnTarget(stmt string) (table string, col string, ok bool) {
+	fields := strings.Fields(stmt)
+	if len(fields) < 6 || !strings.EqualFold(fields[0], "ALTER") || !strings.EqualFold(fields[1], "TABLE") {
+		return "", "", false
+	}
+	idx := 2
+	if idx+1 < len(fields) && strings.EqualFold(fields[idx], "IF") && strings.EqualFold(fields[idx+1], "EXISTS") {
+		idx += 2
+	}
+	if idx >= len(fields) {
+		return "", "", false
+	}
+	table = strings.Trim(fields[idx], "`\"")
+	idx++
+	if idx >= len(fields) || !strings.EqualFold(fields[idx], "ADD") {
+		return "", "", false
+	}
+	idx++
+	if idx < len(fields) && strings.EqualFold(fields[idx], "COLUMN") {
+		idx++
+	}
+	if idx+2 < len(fields) && strings.EqualFold(fields[idx], "IF") && strings.EqualFold(fields[idx+1], "NOT") && strings.EqualFold(fields[idx+2], "EXISTS") {
+		idx += 3
+	}
+	if idx >= len(fields) {
+		return "", "", false
+	}
+	col = strings.Trim(fields[idx], "`\"")
+	return table, col, table != "" && col != ""
+}
+
+func columnExists(ctx context.Context, store *sqlx.Store, table string, col string) (bool, error) {
+	switch store.Dialect().Name() {
+	case "sqlite":
+		rows, err := sqlx.Select[struct {
+			Name string `db:"name"`
+		}](ctx, store, fmt.Sprintf("PRAGMA table_info(%s)", store.Dialect().QuoteIdent(table)))
+		if err != nil {
+			return false, err
+		}
+		for _, r := range rows {
+			if strings.EqualFold(r.Name, col) {
+				return true, nil
+			}
+		}
+		return false, nil
+	case "postgres":
+		var cnt int
+		err := store.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = CURRENT_SCHEMA() AND LOWER(table_name) = LOWER(?) AND LOWER(column_name) = LOWER(?)`,
+			table, col,
+		).Scan(&cnt)
+		return cnt > 0, err
+	case "mysql":
+		var cnt int
+		err := store.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND LOWER(table_name) = LOWER(?) AND LOWER(column_name) = LOWER(?)`,
+			table, col,
+		).Scan(&cnt)
+		return cnt > 0, err
+	default:
+		return false, nil
+	}
+}
+
 func execIdempotentAddColumn(ctx context.Context, store *sqlx.Store, stmt string) error {
+	if table, col, ok := parseAlterAddColumnTarget(stmt); ok {
+		if exists, err := columnExists(ctx, store, table, col); err == nil && exists {
+			return nil
+		}
+	}
 	_, err := store.ExecContext(ctx, stmt)
 	if err == nil {
 		return nil
@@ -212,9 +344,17 @@ func varcharKey(d dialect.Dialect) string {
 	return " VARCHAR(191)"
 }
 
+func varcharLongKey(d dialect.Dialect) string {
+	if d.Name() == "sqlite" {
+		return " TEXT"
+	}
+	return " VARCHAR(512)"
+}
+
 func buildV1Schema(d dialect.Dialect) []string {
 	t := d.Types()
 	vk := varcharKey(d)
+	vlk := varcharLongKey(d)
 	sfx := tableSuffix(d)
 
 	return []string{
@@ -254,7 +394,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			user_id%s NOT NULL,
 			kind%s NOT NULL,
 			name%s NOT NULL,
-			credential_id%s NOT NULL,
+			credential_id%s NOT NULL DEFAULT '',
 			public_key_spki%s NOT NULL,
 			cose_alg%s NOT NULL DEFAULT 0,
 			sign_count%s NOT NULL DEFAULT 0,
@@ -262,7 +402,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			meta_json%s NOT NULL,
 			last_used_at%s NOT NULL DEFAULT 0,
 			created_at%s NOT NULL
-		)%s`, t.Varchar32, t.Varchar32, t.Varchar32, t.Varchar128, vk, t.Text,
+		)%s`, t.Varchar32, t.Varchar32, t.Varchar32, t.Varchar128, vlk, t.Text,
 			t.Int, t.BigInt, t.Text, t.Text, t.BigInt, t.BigInt, sfx),
 		`CREATE INDEX idx_user_credentials_user_kind ON user_credentials (user_id, kind)`,
 		`CREATE INDEX idx_user_credentials_cred_id ON user_credentials (credential_id)`,
@@ -326,7 +466,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			category_id%s NOT NULL,
 			title%s NOT NULL,
 			slug%s NOT NULL UNIQUE,
-			legacy_permalink%s NOT NULL,
+			legacy_permalink%s NOT NULL DEFAULT '',
 			summary_md%s NOT NULL,
 			content_md%s NOT NULL,
 			cover_url%s NOT NULL,
@@ -351,7 +491,7 @@ func buildV1Schema(d dialect.Dialect) []string {
 			created_at%s NOT NULL,
 			updated_at%s NOT NULL
 		)%s`,
-			t.Varchar32, t.Varchar32, t.Varchar32, t.Varchar255, vk, vk,
+			t.Varchar32, t.Varchar32, t.Varchar32, t.Varchar255, vk, vlk,
 			t.Text, t.LongText, t.Varchar512, t.Varchar32, t.BigInt, t.BigInt,
 			t.Bool, t.BoolFalseLit, t.Bool, t.BoolTrueLit,
 			t.Text, t.Bool, t.BoolFalseLit,
@@ -600,18 +740,17 @@ func buildV1Schema(d dialect.Dialect) []string {
 		)%s`, t.Varchar32, t.Varchar32, vk, t.Varchar512, t.Varchar255, t.Varchar512, t.Varchar64,
 			t.BigInt, t.Int, t.Int, t.Varchar64, t.Bool, t.BoolTrueLit, t.Varchar32, t.BigInt, sfx),
 		`CREATE INDEX idx_media_assets_created ON media_assets (created_at)`,
-		`CREATE INDEX idx_media_created ON media_assets (created_at)`,
 
 		// 20. 301/302 Redirects & Legacy Permalink Guardian
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS redirects (
 			id%s PRIMARY KEY,
-			source_path%s NOT NULL UNIQUE,
+			source_path%s NOT NULL DEFAULT '' UNIQUE,
 			target_path%s NOT NULL,
 			status_code%s NOT NULL DEFAULT 301,
 			is_system_legacy%s NOT NULL DEFAULT %s,
 			hit_count%s NOT NULL DEFAULT 0,
 			created_at%s NOT NULL
-		)%s`, t.Varchar32, vk, t.Varchar512, t.Int, t.Bool, t.BoolFalseLit, t.BigInt, t.BigInt, sfx),
+		)%s`, t.Varchar32, vlk, t.Varchar512, t.Int, t.Bool, t.BoolFalseLit, t.BigInt, t.BigInt, sfx),
 		`CREATE INDEX idx_redirects_created ON redirects (created_at)`,
 
 		// 21. Webhooks, Zero-PII Daily Analytics, Security Rules & Audit Logs
@@ -657,10 +796,10 @@ func buildV1Schema(d dialect.Dialect) []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS analytics_top_items (
 			stat_date%s NOT NULL,
 			kind%s NOT NULL,
-			item_key%s NOT NULL,
+			item_key%s NOT NULL DEFAULT '',
 			hits%s NOT NULL DEFAULT 0,
 			PRIMARY KEY (stat_date, kind, item_key)
-		)%s`, t.Varchar32, t.Varchar32, vk, t.BigInt, sfx),
+		)%s`, t.Varchar32, t.Varchar32, vlk, t.BigInt, sfx),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS security_ip_bans (
 			id%s PRIMARY KEY,

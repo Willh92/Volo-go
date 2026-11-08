@@ -9,7 +9,7 @@
 
   <div class="book-reader-toc-backdrop js-book-toc-backdrop" hidden></div>
 
-  <aside class="sidebar-card book-reader-toc" aria-label="{{.BookDetail.Title}}">
+  <aside class="sidebar-card book-reader-toc book-sidebar" aria-label="{{.BookDetail.Title}}">
     <div class="book-reader-toc__top">
       <a class="book-reader-back" href="/books">← {{t .Locale "bookshelf.title"}}</a>
       <button type="button" class="studio-icon-btn studio-icon-btn--square book-reader-toc__collapse js-book-toggle-toc"
@@ -24,26 +24,35 @@
     <div class="book-reader-toc__count">
       {{t .Locale "bookshelf.chapters" (dict "count" (len .BookDetail.FlatChapters))}}
     </div>
+    {{if gt (len .BookDetail.FlatChapters) 8}}
+      <div class="book-chap-filter">
+        <input type="search" class="volo-input book-chap-filter__input js-book-chap-filter" placeholder="{{t .Locale "bookshelf.filter_chapters"}}" aria-label="{{t .Locale "bookshelf.filter_chapters"}}" autocomplete="off">
+      </div>
+    {{end}}
     <nav class="book-reader-toc__nav" aria-label="{{.BookDetail.Title}}">
       {{range .BookDetail.FlatChapters}}
         {{$d := .Depth}}{{if lt $d 0}}{{$d = 0}}{{end}}{{if gt $d 4}}{{$d = 4}}{{end}}
+        {{$isAct := and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}
         {{if hasPrefix .URL "/"}}
-          <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
+          <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
         {{else if .URL}}
           {{if or (eq $.BookDetail.EmbedMode "iframe") (eq $.BookDetail.EmbedMode "inline")}}
-            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link {{if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}is-active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
+            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
           {{else}}
-            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}} ↗</a>
+            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link book-chap-link" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}} ↗</a>
           {{end}}
         {{else}}
           <span class="book-reader-toc__group" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</span>
         {{end}}
       {{end}}
     </nav>
+    <p class="studio-muted-empty book-chap-empty js-book-chap-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
   </aside>
 
+  {{$bookCurPath := coalesce .CurrentPath (printf "/books/%s" .BookDetail.Slug)}}
   <article class="studio-article book-reader-main{{if $isExternalIframe}} book-reader-main--frame{{end}}"
-           {{if .ActiveChapterNeedsMath}}data-needs-math="1"{{end}}>
+           {{if and (not .BookLocked) .ActiveChapterNeedsMath}}data-needs-math="1"{{end}}
+           {{if and (not .BookLocked) .ActiveChapterNeedsMermaid}}data-needs-mermaid="1"{{end}}>
     <div class="book-reader-bar book-reader-toolbar">
       <div class="book-reader-bar__left">
         <button type="button" class="studio-icon-btn book-reader-toolbar__btn js-book-toggle-toc"
@@ -78,10 +87,29 @@
       </div>
     </div>
 
-    {{if .ActiveChapter}}
+    {{if and .BookLocked (or (ne .BookArticleSlug "") (ne .BookArticleID ""))}}
+      <h1 class="studio-article__title">{{if .ActiveChapter}}{{.ActiveChapter.Title}}{{else}}{{.BookDetail.Title}}{{end}}</h1>
+      <div class="volo-lock-card book-unlock-card">
+        <div class="volo-lock-card__icon" aria-hidden="true">🔒</div>
+        <strong>{{t .Locale "article.protected_title"}}</strong>
+        <p class="volo-lock-card__desc">{{t .Locale "article.unlock_prompt"}}</p>
+        <form class="volo-unlock-form{{if .BookArticleID}} js-volo-unlock-form{{end}}"
+              method="post"
+              action="{{$bookCurPath}}{{if .RawQuery}}?{{.RawQuery}}{{end}}"
+              {{if .BookArticleID}}data-article-id="{{.BookArticleID}}"{{end}}>
+          {{if .BookArticleSlug}}<input type="hidden" name="article_slug" value="{{.BookArticleSlug}}">{{end}}
+          <input class="volo-input" type="password" name="password" required autocomplete="new-password" placeholder="••••••">
+          <button class="volo-btn" type="submit">{{t .Locale "article.unlock_button"}}</button>
+          <div class="js-unlock-msg volo-unlock-err"{{if not .BookUnlockError}} hidden{{end}}>{{default (t .Locale "article.unlock_wrong_pwd") .BookUnlockError}}</div>
+        </form>
+        {{if .BookArticleSlug}}
+          <p class="book-unlock-card__foot"><a class="studio-meta-link" href="/posts/{{.BookArticleSlug}}">/posts/{{.BookArticleSlug}} ↗</a></p>
+        {{end}}
+      </div>
+    {{else if .ActiveChapter}}
       {{if .ActiveChapterHTML}}
         <h1 class="studio-article__title">{{.ActiveChapter.Title}}</h1>
-        <div class="volo-prose book-reader-prose">{{safeHTML .ActiveChapterHTML}}</div>
+        <div class="volo-prose book-reader-prose">{{proseHTML .ActiveChapterHTML $bookCurPath .RawQuery}}</div>
       {{else if and (eq .BookDetail.EmbedMode "iframe") $isExternalChapter}}
         <div class="book-reader-frame-wrap is-loading">
           <div class="book-reader-spinner" aria-hidden="true"></div>
@@ -101,7 +129,7 @@
     {{else}}
       <h1 class="studio-article__title">{{.BookDetail.Title}}</h1>
       {{if .ActiveChapterHTML}}
-        <div class="volo-prose book-reader-prose">{{safeHTML .ActiveChapterHTML}}</div>
+        <div class="volo-prose book-reader-prose">{{proseHTML .ActiveChapterHTML $bookCurPath .RawQuery}}</div>
       {{else}}
         {{if .BookDetail.Description}}<p class="book-reader-desc">{{.BookDetail.Description}}</p>{{end}}
         {{if .BookDetail.SourceURL}}
@@ -113,7 +141,7 @@
     {{if or .PrevChapter .NextChapter}}
       <div class="volo-neighbors studio-neighbors book-reader-neighbors">
         {{if .PrevChapter}}
-          {{$prevHref := printf "/books/%s?ch=%d" .BookDetail.Slug .PrevChapter.ID}}
+          {{$prevHref := printf "/books/%s?ch=%s" .BookDetail.Slug .PrevChapter.ID}}
           {{$prevExt := false}}
           {{if hasPrefix .PrevChapter.URL "/"}}
             {{$prevHref = .PrevChapter.URL}}
@@ -126,7 +154,7 @@
           </a>
         {{end}}
         {{if .NextChapter}}
-          {{$nextHref := printf "/books/%s?ch=%d" .BookDetail.Slug .NextChapter.ID}}
+          {{$nextHref := printf "/books/%s?ch=%s" .BookDetail.Slug .NextChapter.ID}}
           {{$nextExt := false}}
           {{if hasPrefix .NextChapter.URL "/"}}
             {{$nextHref = .NextChapter.URL}}
@@ -142,7 +170,7 @@
     {{end}}
   </article>
 
-  <button type="button" class="studio-fab-btn book-reader-fab-toc js-book-mobile-toc" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" hidden>
+  <button type="button" class="studio-fab-btn book-reader-fab-toc book-mobile-toc-fab js-book-mobile-toc" title="{{t .Locale "article.toc_title"}}" aria-label="{{t .Locale "article.toc_title"}}" hidden>
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
     <span class="studio-fab-btn__text">{{t .Locale "article.toc_title"}}</span>
   </button>

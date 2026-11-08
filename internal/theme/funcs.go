@@ -201,6 +201,18 @@ func (e *Engine) templateFuncMap(themeID string, assets map[string]cachedAsset, 
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
 		},
+		"proseHTML": func(raw string, currentPath string, rawQuery ...string) template.HTML {
+			p := strings.TrimSpace(currentPath)
+			if p != "" && strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") && !strings.Contains(p, `\`) && p != "/reader/login" && p != "/reader/register" {
+				if len(rawQuery) > 0 && strings.TrimSpace(rawQuery[0]) != "" && !strings.Contains(p, "?") {
+					p = p + "?" + strings.TrimSpace(rawQuery[0])
+				}
+				if strings.Contains(raw, `href="/reader/login"`) {
+					raw = strings.ReplaceAll(raw, `href="/reader/login"`, `href="/reader/login?next=`+url.QueryEscape(p)+`"`)
+				}
+			}
+			return template.HTML(raw)
+		},
 		"renderNotice": func(raw string) template.HTML {
 			clean := strings.TrimSpace(raw)
 			if clean == "" {

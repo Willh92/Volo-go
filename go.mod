@@ -8,7 +8,6 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/lionsoul2014/ip2region/binding/golang v0.0.0-20261028042204-6a276cc7c4f9
 	github.com/microcosm-cc/bluemonday v1.0.27
-	github.com/oschwald/maxminddb-golang/v2 v2.9.0
 	github.com/yuin/goldmark v1.8.7
 	golang.org/x/crypto v0.58.0
 	golang.org/x/image v0.47.0
@@ -27,6 +26,7 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	modernc.org/libc v1.79.0 // indirect

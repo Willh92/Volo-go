@@ -21,6 +21,25 @@
     <section class="sidebar-card">{{safeHTML .HTML}}</section>
   {{end}}
 
+  {{if .SidebarCategories}}
+    {{$catLen := len .SidebarCategories}}
+    <section class="sidebar-card studio-sidebar-cats">
+      <h3 class="sidebar-card__title">{{t .Locale "sidebar.categories"}}</h3>
+      <div class="studio-side-links studio-side-cats">
+        {{range $i, $c := .SidebarCategories}}
+          {{if lt $i 12}}
+            <a href="/categories/{{$c.Slug}}"><span>{{$c.Name}}</span><span class="studio-side-count">{{$c.ArticleCount}}</span></a>
+          {{end}}
+        {{end}}
+      </div>
+      {{if gt $catLen 12}}
+        <div class="studio-side-more">
+          <a class="studio-side-more__link" href="/categories">{{t .Locale "sidebar.view_all"}} →</a>
+        </div>
+      {{end}}
+    </section>
+  {{end}}
+
   {{if .SidebarTags}}
     <section class="sidebar-card">
       <h3 class="sidebar-card__title">{{t .Locale "sidebar.tags"}}</h3>
@@ -144,18 +163,26 @@
 {{end}}
 
 {{define "comment_mount"}}
+{{$commentMode := default "all" .Ctx.Reading.CommentAccessMode}}
+{{$commentCount := .CommentCount}}
+{{if or (ne $commentMode "off") (gt $commentCount 0)}}
 {{range .Ctx.CommentBeforeWidgets}}{{safeHTML .HTML}}{{end}}
 <section id="volo-comments" class="volo-comments-card"
          data-target-type="{{.TargetType}}"
          data-target-id="{{.TargetID}}"
-         data-access-mode="{{.Ctx.Reading.CommentAccessMode}}"
+         data-access-mode="{{$commentMode}}"
+         data-comment-mode="{{$commentMode}}"
          data-is-logged="{{if .Ctx.Viewer}}true{{else}}false{{end}}"
          data-viewer-id="{{if .Ctx.Viewer}}{{.Ctx.Viewer.ID}}{{end}}"
          data-viewer-name="{{if .Ctx.Viewer}}{{coalesce .Ctx.Viewer.DisplayName .Ctx.Viewer.Username}}{{end}}"
          data-viewer-role="{{if .Ctx.Viewer}}{{.Ctx.Viewer.Role}}{{end}}"
          data-viewer-avatar="{{if .Ctx.Viewer}}{{.Ctx.Viewer.AvatarURL}}{{end}}"
          data-csrf-token="{{.Ctx.ViewerCSRFToken}}"
-         data-l-title="{{t .Ctx.Locale "comment.section_title" (dict "count" .CommentCount)}}"
+         data-l-title="{{t .Ctx.Locale "comment.section_title" (dict "count" $commentCount)}}"
+         data-l-closed="{{t .Ctx.Locale "comment.closed_notice"}}"
+         data-l-login="{{t .Ctx.Locale "nav.login"}}"
+         data-l-copy="{{t .Ctx.Locale "article.copy_code"}}"
+         data-l-copied="{{t .Ctx.Locale "article.copied_code"}}"
          data-l-trigger="{{t .Ctx.Locale "comment.trigger_prompt"}}"
          data-l-nick="{{t .Ctx.Locale "comment.nickname"}}"
          data-l-email="{{t .Ctx.Locale "comment.email_private"}}"
@@ -199,6 +226,7 @@
          data-l-net-err="{{t .Ctx.Locale "error.hint_default"}}">
 </section>
 {{range .Ctx.CommentAfterWidgets}}{{safeHTML .HTML}}{{end}}
+{{end}}
 {{end}}
 
 {{define "pagination"}}

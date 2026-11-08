@@ -206,13 +206,16 @@ func eligibleForPublicDynamicGzip(r *http.Request, adminPath string) bool {
 	if r.Header.Get("Range") != "" || r.Header.Get("Upgrade") != "" || r.Header.Get("Authorization") != "" {
 		return false
 	}
-	// BREACH defense: never compress responses for authenticated sessions, unlocked content cookies, or ShareToken previews.
+	// BREACH defense: never compress responses for authenticated sessions, unlocked content cookies/headers, or ShareToken previews.
 	if ck := r.Header.Get("Cookie"); ck != "" {
 		if strings.Contains(ck, auth.SessionCookieName) || strings.Contains(ck, guest.UnlockCookieName) {
 			return false
 		}
 	}
-	if q := r.URL.Query(); q.Get("preview") != "" || q.Get("st") != "" {
+	if r.Header.Get("X-Volo-Unlock-State") != "" || r.Header.Get("X-Volo-Share-Token") != "" {
+		return false
+	}
+	if q := r.URL.Query(); q.Get("preview") != "" || q.Get("st") != "" || q.Get("device") != "" || q.Get("skin") != "" || q.Get("theme_preview") != "" {
 		return false
 	}
 
