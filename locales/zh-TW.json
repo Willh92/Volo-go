@@ -1905,5 +1905,16 @@
   "ed.record_started": "正在錄音，再次點擊麥克風結束並上傳插入",
   "ed.record_unsupported": "目前瀏覽器環境不支援麥克風錄音（需 HTTPS 或 localhost）",
   "ed.record_denied": "無法存取麥克風，請檢查瀏覽器麥克風權限",
-  "ui.cmdk_hint": "↑↓ 選擇 · Enter 開啟 · Esc 關閉"
+  "ui.cmdk_hint": "↑↓ 選擇 · Enter 開啟 · Esc 關閉",
+  "audit.act.sec_geo_reload": "重載離線 GeoIP 資料庫",
+  "sys.doc_geoip_unusable_warn": "路徑 {dir} 中未找到可用的國家/地區 GeoIP 資料庫（已忽略：{skipped}）",
+  "sys.geo_db_sub_title": "離線位址庫路徑與熱重載",
+  "sys.geo_dir_label": "離線 GeoIP 資料庫目錄或檔案路徑（選填）",
+  "sys.geo_dir_hint": "留空使用預設路徑（{dir}）；支援填寫目錄（自動擇優掛載 MMDB + IPv4/IPv6 XDB）或直接指定單個 .mmdb / .xdb 檔案，儲存或點擊熱重載立即生效，無需重啟服務。",
+  "sys.geo_save_path_btn": "儲存路徑並熱重載",
+  "sys.geo_reload_btn": "熱重載離線庫",
+  "sys.geo_reloaded_toast": "離線 GeoIP 資料庫已熱重載生效（目前掛載 {count} 個庫）",
+  "sys.geo_status_active": "已掛載生效：",
+  "sys.geo_status_empty": "目前路徑（{path}）未偵測到離線庫檔案",
+  "sys.geo_status_skipped": "已自動忽略：{files}"
 }

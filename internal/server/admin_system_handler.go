@@ -2928,9 +2928,17 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 		}
 		defaultUploadDir := ""
 		effectiveUploadDir := ""
+		defaultGeoIPDir := ""
+		effectiveGeoIPDir := ""
 		if s.deps.Config != nil {
 			defaultUploadDir = s.deps.Config.GetDefaultUploadDir()
 			effectiveUploadDir = s.deps.Config.GetUploadDir()
+			defaultGeoIPDir = s.deps.Config.GetDefaultGeoIPDir()
+			effectiveGeoIPDir = s.deps.Config.GetGeoIPDir()
+		}
+		var geoStatus security.GeoDBStatus
+		if s.deps.Geo != nil {
+			geoStatus = s.deps.Geo.Status()
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"domains":              result,
@@ -2938,6 +2946,9 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			"storage_drivers":      storageDrivers,
 			"default_upload_dir":   defaultUploadDir,
 			"effective_upload_dir": effectiveUploadDir,
+			"default_geoip_dir":    defaultGeoIPDir,
+			"effective_geoip_dir":  effectiveGeoIPDir,
+			"geoip_status":         geoStatus,
 		})
 		return
 	}
@@ -3043,6 +3054,29 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 				patchMap["local_dir"] = normDir
 			}
 		}
+		var prevSec domain.SecuritySettings
+		hasGeoIPDirPatch := false
+		if rest == domain.SettingsDomainSecurity {
+			if s.deps.Settings != nil {
+				prevSec = s.deps.Settings.Snapshot().Security
+			}
+			if rawGeoDir, hasGeoDir := patchMap["geoip_dir"]; hasGeoDir {
+				hasGeoIPDirPatch = true
+				dirStr, ok := rawGeoDir.(string)
+				if !ok {
+					writeErrJSON(w, http.StatusBadRequest, "geoip_dir must be a string")
+					return
+				}
+				if s.deps.Config != nil {
+					normDir, vErr := s.deps.Config.ValidateCustomGeoIPPath(dirStr)
+					if vErr != nil {
+						writeErrJSON(w, http.StatusBadRequest, vErr.Error())
+						return
+					}
+					patchMap["geoip_dir"] = normDir
+				}
+			}
+		}
 		cleanPatch, _ := json.Marshal(patchMap)
 		expectedVer := parseVersionHeader(r, meta.ExpectedVersion)
 
@@ -3058,10 +3092,42 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 		if rest == domain.SettingsDomainStorage {
 			s.syncConfiguredUploadDir()
 		}
+		if rest == domain.SettingsDomainSecurity {
+			if hasGeoIPDirPatch || s.deps.Settings.Snapshot().Security.GeoIPDir != prevSec.GeoIPDir {
+				if lErr := s.syncConfiguredGeoIPDir(); lErr != nil {
+					rbBytes, _ := json.Marshal(prevSec)
+					_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
+					_ = s.syncConfiguredGeoIPDir()
+					writeErrJSON(w, http.StatusBadRequest, lErr.Error())
+					return
+				}
+			}
+			if s.deps.Config != nil && s.deps.Geo != nil && s.deps.Config.GeoAccessEnabled {
+				clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+				if !s.deps.Geo.Allows(clientIP) {
+					rbBytes, _ := json.Marshal(prevSec)
+					_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
+					if hasGeoIPDirPatch || prevSec.GeoIPDir != "" {
+						_ = s.syncConfiguredGeoIPDir()
+					}
+					writeErrJSON(w, http.StatusBadRequest, "refusing security policy or GeoIP configuration that would immediately lock out your current IP")
+					return
+				}
+			}
+		}
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "settings.patch", "settings", rest, map[string]any{"version": ver})
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
-		writeJSON(w, http.StatusOK, map[string]any{"domain": rest, "value": val, "version": ver})
+		resp := map[string]any{"domain": rest, "value": val, "version": ver}
+		if rest == domain.SettingsDomainSecurity {
+			if s.deps.Config != nil {
+				resp["effective_geoip_dir"] = s.deps.Config.GetGeoIPDir()
+			}
+			if s.deps.Geo != nil {
+				resp["geoip_status"] = s.deps.Geo.Status()
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3093,6 +3159,29 @@ func (s *AppServer) syncConfiguredUploadDir() {
 	if s.deps.BackupScheduler != nil {
 		s.deps.BackupScheduler.SetUploadDir(effective)
 	}
+}
+
+// syncConfiguredGeoIPDir applies the persisted `security.geoip_dir` setting (validated against
+// workspace containment boundaries) to Config and atomically hot-reloads GeoEngine offline databases.
+func (s *AppServer) syncConfiguredGeoIPDir() error {
+	if s == nil || s.deps.Config == nil {
+		return nil
+	}
+	rawPath := ""
+	if s.deps.Settings != nil {
+		rawPath = strings.TrimSpace(s.deps.Settings.Snapshot().Security.GeoIPDir)
+	}
+	if rawPath == "" {
+		s.deps.Config.SetGeoIPDir("")
+	} else if validPath, err := s.deps.Config.ValidateCustomGeoIPPath(rawPath); err == nil && validPath != "" {
+		s.deps.Config.SetGeoIPDir(validPath)
+	} else {
+		s.deps.Config.SetGeoIPDir("")
+	}
+	if s.deps.Geo != nil {
+		return s.deps.Geo.LoadDatabases(s.deps.Config.GetGeoIPDir())
+	}
+	return nil
 }
 
 func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
@@ -3448,6 +3537,94 @@ func normalizeGeoOnMiss(raw string) string {
 
 func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if rest == "reload" && r.Method == http.MethodPost {
+		var req struct {
+			GeoIPDir *string `json:"geoip_dir"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+				writeErrJSON(w, http.StatusBadRequest, "invalid json")
+				return
+			}
+		}
+		var prevSec domain.SecuritySettings
+		if s.deps.Settings != nil {
+			prevSec = s.deps.Settings.Snapshot().Security
+		}
+		var secVer int64
+		if req.GeoIPDir != nil && s.deps.Settings != nil {
+			normDir := strings.TrimSpace(*req.GeoIPDir)
+			if s.deps.Config != nil {
+				validDir, vErr := s.deps.Config.ValidateCustomGeoIPPath(normDir)
+				if vErr != nil {
+					writeErrJSON(w, http.StatusBadRequest, vErr.Error())
+					return
+				}
+				normDir = validDir
+			}
+			patchBytes, _ := json.Marshal(map[string]any{"geoip_dir": normDir})
+			_, ver, pErr := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, patchBytes, 0)
+			if pErr != nil {
+				writeErrJSON(w, http.StatusBadRequest, pErr.Error())
+				return
+			}
+			secVer = ver
+		} else if s.deps.Settings != nil {
+			_, secVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainSecurity)
+		}
+
+		if lErr := s.syncConfiguredGeoIPDir(); lErr != nil {
+			if req.GeoIPDir != nil && s.deps.Settings != nil {
+				rbBytes, _ := json.Marshal(prevSec)
+				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
+				_ = s.syncConfiguredGeoIPDir()
+			}
+			writeErrJSON(w, http.StatusBadRequest, lErr.Error())
+			return
+		}
+		if s.deps.Geo != nil {
+			_ = s.deps.Geo.ReloadRules(r.Context(), s.deps.Store)
+		}
+		if req.GeoIPDir != nil && s.deps.Config != nil && s.deps.Geo != nil && s.deps.Config.GeoAccessEnabled {
+			clientIP := security.ResolveClientIP(r, s.deps.Config.TrustedProxies)
+			if !s.deps.Geo.Allows(clientIP) {
+				rbBytes, _ := json.Marshal(prevSec)
+				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
+				_ = s.syncConfiguredGeoIPDir()
+				writeErrJSON(w, http.StatusBadRequest, "refusing GeoIP database path that would immediately lock out your current IP")
+				return
+			}
+		}
+
+		defaultGeoIPDir := ""
+		effectiveGeoIPDir := ""
+		if s.deps.Config != nil {
+			defaultGeoIPDir = s.deps.Config.GetDefaultGeoIPDir()
+			effectiveGeoIPDir = s.deps.Config.GetGeoIPDir()
+		}
+		configuredGeoIPDir := ""
+		if s.deps.Settings != nil {
+			configuredGeoIPDir = s.deps.Settings.Snapshot().Security.GeoIPDir
+		}
+		var geoStatus security.GeoDBStatus
+		if s.deps.Geo != nil {
+			geoStatus = s.deps.Geo.Status()
+		}
+		s.recordAuditLog(r, actor, "security.geoip_reload", "settings", "security", map[string]any{
+			"path":         effectiveGeoIPDir,
+			"active_files": geoStatus.ActiveFiles,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":                  true,
+			"geoip_dir":           configuredGeoIPDir,
+			"default_geoip_dir":   defaultGeoIPDir,
+			"effective_geoip_dir": effectiveGeoIPDir,
+			"geoip_status":        geoStatus,
+			"version":             secVer,
+		})
+		return
+	}
+
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
@@ -3456,9 +3633,27 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			if rows == nil {
 				rows = []domain.SecurityGeoRule{}
 			}
+			defaultGeoIPDir := ""
+			effectiveGeoIPDir := ""
+			if s.deps.Config != nil {
+				defaultGeoIPDir = s.deps.Config.GetDefaultGeoIPDir()
+				effectiveGeoIPDir = s.deps.Config.GetGeoIPDir()
+			}
+			configuredGeoIPDir := ""
+			if s.deps.Settings != nil {
+				configuredGeoIPDir = s.deps.Settings.Snapshot().Security.GeoIPDir
+			}
+			var geoStatus security.GeoDBStatus
+			if s.deps.Geo != nil {
+				geoStatus = s.deps.Geo.Status()
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"items":                      rows,
-				"geo_access_circuit_enabled": s.deps.Config.GeoAccessEnabled,
+				"geo_access_circuit_enabled": s.deps.Config != nil && s.deps.Config.GeoAccessEnabled,
+				"geoip_dir":                  configuredGeoIPDir,
+				"default_geoip_dir":          defaultGeoIPDir,
+				"effective_geoip_dir":        effectiveGeoIPDir,
+				"geoip_status":               geoStatus,
 			})
 		case http.MethodPost:
 			var in domain.SecurityGeoRule

@@ -291,6 +291,38 @@ func applyPersistedUploadDir(ctx context.Context, cfg *config.Config, store *sql
 	}
 }
 
+func applyPersistedGeoIPDir(ctx context.Context, cfg *config.Config, store *sqlx.Store, settingsMgr *repo.SettingsManager, fs *flag.FlagSet) {
+	if cfg == nil {
+		return
+	}
+	if fs != nil {
+		geoFlagSet := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "geoip-dir" {
+				geoFlagSet = true
+			}
+		})
+		if geoFlagSet {
+			return
+		}
+	}
+	mgr := settingsMgr
+	if mgr == nil && store != nil {
+		mgr = repo.NewSettingsManager(store, cfg.KeyRing, cfg.DefaultLocale)
+		_, _ = mgr.Reload(ctx)
+	}
+	if mgr == nil {
+		return
+	}
+	rawDir := strings.TrimSpace(mgr.Snapshot().Security.GeoIPDir)
+	if rawDir == "" {
+		return
+	}
+	if validDir, err := cfg.ValidateCustomGeoIPPath(rawDir); err == nil && validDir != "" {
+		cfg.SetGeoIPDir(validDir)
+	}
+}
+
 func pruneExpiredMaintenance(ctx context.Context, store *sqlx.Store, pluginMgr *plugin.Manager) {
 	if pluginMgr != nil {
 		if _, err := pluginMgr.PurgeExpiredKV(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -358,6 +390,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 	applyPersistedUploadDir(ctx, cfg, store, settingsMgr, fs)
+	applyPersistedGeoIPDir(ctx, cfg, store, settingsMgr, fs)
 
 	pluginMgr := plugin.NewManager(plugin.ManagerOptions{
 		Store:      store,
@@ -870,6 +903,7 @@ func cmdDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 	}
 	defer store.Close()
 	applyPersistedUploadDir(ctx, cfg, store, nil, fs)
+	applyPersistedGeoIPDir(ctx, cfg, store, nil, fs)
 
 	rep := doctor.Run(ctx, cfg, store)
 	if *asJSON {

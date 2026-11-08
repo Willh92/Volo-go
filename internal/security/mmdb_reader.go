@@ -42,6 +42,8 @@ type mmdbReader struct {
 	nodeCount        uint32
 	recordSize       uint16 // 24, 28, or 32
 	ipVersion        uint16 // 4 or 6
+	databaseType     string
+	buildEpoch       uint64
 	nodeByteSize     int64
 	searchTreeSize   int64
 	dataSectionStart int64
@@ -176,6 +178,20 @@ func (r *mmdbReader) parseMetadata(metaBytes []byte) error {
 				return fmt.Errorf("mmdb: unsupported ip_version %d", v)
 			}
 			r.ipVersion = uint16(v)
+			off = afterVal
+		case "database_type":
+			v, afterVal, err := cur.readStringValue(afterKey, 0)
+			if err != nil {
+				return err
+			}
+			r.databaseType = v
+			off = afterVal
+		case "build_epoch":
+			v, afterVal, err := cur.readUintValue(afterKey, 0)
+			if err != nil {
+				return err
+			}
+			r.buildEpoch = v
 			off = afterVal
 		default:
 			afterVal, err := cur.skipValue(afterKey, 0)

@@ -319,6 +319,14 @@ export function SystemWorkspace({
   const [geoRules, setGeoRules] = useState<any[]>([]);
   const [geoQuery, setGeoQuery] = useState("");
   const [geoCircuitEnabled, setGeoCircuitEnabled] = useState<boolean>(true);
+  const [defaultGeoIPDir, setDefaultGeoIPDir] = useState<string>("./data/geoip");
+  const [effectiveGeoIPDir, setEffectiveGeoIPDir] = useState<string>("./data/geoip");
+  const [geoDBStatus, setGeoDBStatus] = useState<{
+    path?: string;
+    active_files?: string[];
+    skipped_files?: string[];
+  } | null>(null);
+  const [reloadingGeo, setReloadingGeo] = useState<boolean>(false);
   const [geoModalOpen, setGeoModalOpen] = useState(false);
   const [editingGeoId, setEditingGeoId] = useState<string | null>(null);
   const [movingGeo, setMovingGeo] = useState(false);
@@ -514,6 +522,9 @@ export function SystemWorkspace({
         setSocialDirty(false);
         setEditingSocialIdx(null);
         if (res.default_upload_dir) setDefaultUploadDir(res.default_upload_dir);
+        if (res.default_geoip_dir) setDefaultGeoIPDir(res.default_geoip_dir);
+        if (res.effective_geoip_dir) setEffectiveGeoIPDir(res.effective_geoip_dir);
+        if (res.geoip_status) setGeoDBStatus(res.geoip_status);
         if (Array.isArray(res.storage_drivers)) setStorageDrivers(res.storage_drivers);
         if (res.domains?.storage) storageDriverSig.value = res.domains.storage.active_driver || "local";
       } else if (sub === "waf" && isAdmin) {
@@ -525,7 +536,13 @@ export function SystemWorkspace({
         if (debouncedBanQ.trim()) banSp.set("q", debouncedBanQ.trim());
         const [b, g, st] = await Promise.all([
           apiFetch<{ items: any[]; total?: number }>(`/api/admin/security/ip-bans?${banSp.toString()}`),
-          apiFetch<{ items: any[]; geo_access_circuit_enabled?: boolean }>("/api/admin/security/geo-rules?per_page=200"),
+          apiFetch<{
+            items: any[];
+            geo_access_circuit_enabled?: boolean;
+            default_geoip_dir?: string;
+            effective_geoip_dir?: string;
+            geoip_status?: { path?: string; active_files?: string[]; skipped_files?: string[] };
+          }>("/api/admin/security/geo-rules?per_page=200"),
           apiFetch<any>("/api/admin/settings"),
         ]);
         const bList = b.items || [];
@@ -536,6 +553,15 @@ export function SystemWorkspace({
         setDomains(st.domains || {});
         setVersions(st.versions || {});
         if (st.default_upload_dir) setDefaultUploadDir(st.default_upload_dir);
+        if (g.default_geoip_dir || st.default_geoip_dir) {
+          setDefaultGeoIPDir(g.default_geoip_dir || st.default_geoip_dir);
+        }
+        if (g.effective_geoip_dir || st.effective_geoip_dir) {
+          setEffectiveGeoIPDir(g.effective_geoip_dir || st.effective_geoip_dir);
+        }
+        if (g.geoip_status || st.geoip_status) {
+          setGeoDBStatus(g.geoip_status || st.geoip_status);
+        }
         if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       } else if (sub === "backup" && isAdmin) {
         const fetchLocalSnaps = async () => {
@@ -563,6 +589,9 @@ export function SystemWorkspace({
         setVersions(st.versions || {});
         setLocalBackups(lb.items || []);
         if (st.default_upload_dir) setDefaultUploadDir(st.default_upload_dir);
+        if (st.default_geoip_dir) setDefaultGeoIPDir(st.default_geoip_dir);
+        if (st.effective_geoip_dir) setEffectiveGeoIPDir(st.effective_geoip_dir);
+        if (st.geoip_status) setGeoDBStatus(st.geoip_status);
         if (Array.isArray(st.storage_drivers)) setStorageDrivers(st.storage_drivers);
         if (st.domains?.storage) storageDriverSig.value = st.domains.storage.active_driver || "local";
       }
@@ -630,6 +659,8 @@ export function SystemWorkspace({
         setEditingSocialIdx(null);
       }
       if (domainName === "security") {
+        if (res.effective_geoip_dir) setEffectiveGeoIPDir(res.effective_geoip_dir);
+        if (res.geoip_status) setGeoDBStatus(res.geoip_status);
         const rawDyn = String(res.value?.dynamic_login_path || "").trim();
         const fallbackMount = sanitizeAdminPath(bootConfig.base_admin_path || "/console");
         const nextMount = rawDyn ? sanitizeAdminPath(rawDyn) : fallbackMount;
@@ -650,6 +681,46 @@ export function SystemWorkspace({
       return false;
     } finally {
       setSavingDomain("");
+    }
+  };
+
+  const reloadGeoDatabases = async (savePathFirst = false) => {
+    if (reloadingGeo || savingDomain) return;
+    setReloadingGeo(true);
+    try {
+      const body: Record<string, any> = {};
+      if (savePathFirst) {
+        body.geoip_dir = String(domains?.security?.geoip_dir || "").trim();
+      }
+      const res = await apiFetch<{
+        ok: boolean;
+        geoip_dir?: string;
+        default_geoip_dir?: string;
+        effective_geoip_dir?: string;
+        geoip_status?: { path?: string; active_files?: string[]; skipped_files?: string[] };
+        version?: number;
+      }>("/api/admin/security/geo-rules/reload", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      if (res.default_geoip_dir) setDefaultGeoIPDir(res.default_geoip_dir);
+      if (res.effective_geoip_dir) setEffectiveGeoIPDir(res.effective_geoip_dir);
+      if (res.geoip_status) setGeoDBStatus(res.geoip_status);
+      if (savePathFirst && typeof res.geoip_dir === "string") {
+        setDomains((prev) => ({
+          ...(prev || {}),
+          security: { ...(prev?.security || {}), geoip_dir: res.geoip_dir },
+        }));
+        if (typeof res.version === "number" && res.version > 0) {
+          setVersions((prev) => ({ ...prev, security: res.version! }));
+        }
+      }
+      const count = Array.isArray(res.geoip_status?.active_files) ? res.geoip_status!.active_files!.length : 0;
+      showToast(t("sys.geo_reloaded_toast", { count }));
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setReloadingGeo(false);
     }
   };
 
@@ -3600,16 +3671,29 @@ export function SystemWorkspace({
                   />
                 </div>
               </div>
-              <div class="volo-field">
-                <label>{t("sys.dyn_login_path")}</label>
-                <input
-                  class="volo-input"
-                  name="sec_custom_entry_route"
-                  autoComplete="off"
-                  placeholder="/secret-entry"
-                  value={domains.security?.dynamic_login_path || ""}
-                  onInput={(e) => setDomField("security", "dynamic_login_path", (e.currentTarget as HTMLInputElement).value)}
-                />
+              <div class="volo-grid-2">
+                <div class="volo-field">
+                  <label>{t("sys.dyn_login_path")}</label>
+                  <input
+                    class="volo-input"
+                    name="sec_custom_entry_route"
+                    autoComplete="off"
+                    placeholder="/secret-entry"
+                    value={domains.security?.dynamic_login_path || ""}
+                    onInput={(e) => setDomField("security", "dynamic_login_path", (e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("sys.geo_dir_label")}</label>
+                  <input
+                    class="volo-input"
+                    name="sec_geoip_dir_path"
+                    autoComplete="off"
+                    placeholder={defaultGeoIPDir || "./data/geoip"}
+                    value={domains.security?.geoip_dir || ""}
+                    onInput={(e) => setDomField("security", "geoip_dir", (e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
               </div>
               <div class="volo-form-actions">
                 <button
@@ -3940,6 +4024,83 @@ export function SystemWorkspace({
                   {t("sys.geo_circuit_off")}
                 </div>
               )}
+              <div class="volo-subcard" style={{ marginBottom: "14px" }}>
+                <div
+                  class="volo-input-row"
+                  style={{ justifyContent: "space-between", flexWrap: "wrap", gap: "8px", marginBottom: "8px" }}
+                >
+                  <div class="volo-subcard-title" style={{ marginBottom: 0 }}>
+                    {t("sys.geo_db_sub_title")}
+                  </div>
+                  <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "6px" }}>
+                    {Array.isArray(geoDBStatus?.active_files) && geoDBStatus!.active_files!.length > 0 ? (
+                      <>
+                        <span class="volo-status-pill ok">
+                          <span class="volo-status-dot" />
+                          {t("sys.geo_status_active")}
+                        </span>
+                        {geoDBStatus!.active_files!.map((f) => (
+                          <span key={f} class="volo-code-chip">
+                            {f}
+                          </span>
+                        ))}
+                      </>
+                    ) : (
+                      <span class="volo-help">
+                        {t("sys.geo_status_empty", {
+                          path: effectiveGeoIPDir || defaultGeoIPDir || "./data/geoip",
+                        })}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div class="volo-field" style={{ marginBottom: 0 }}>
+                  <label>{t("sys.geo_dir_label")}</label>
+                  <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "8px" }}>
+                    <input
+                      class="volo-input"
+                      style={{ flex: "1 1 260px" }}
+                      name="geo_rules_db_path_cfg"
+                      autoComplete="off"
+                      placeholder={defaultGeoIPDir || "./data/geoip"}
+                      value={domains?.security?.geoip_dir || ""}
+                      onInput={(e) =>
+                        setDomField("security", "geoip_dir", (e.currentTarget as HTMLInputElement).value)
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void reloadGeoDatabases(true);
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-primary volo-btn-sm"
+                      disabled={reloadingGeo || !!savingDomain}
+                      onClick={() => void reloadGeoDatabases(true)}
+                    >
+                      {t("sys.geo_save_path_btn")}
+                    </button>
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-sm"
+                      disabled={reloadingGeo || !!savingDomain}
+                      onClick={() => void reloadGeoDatabases(false)}
+                    >
+                      {t("sys.geo_reload_btn")}
+                    </button>
+                  </div>
+                  <span class="volo-help">
+                    {t("sys.geo_dir_hint", { dir: defaultGeoIPDir || "./data/geoip" })}
+                  </span>
+                  {Array.isArray(geoDBStatus?.skipped_files) && geoDBStatus!.skipped_files!.length > 0 && (
+                    <span class="volo-help" style={{ color: "var(--volo-warn)" }}>
+                      {t("sys.geo_status_skipped", { files: geoDBStatus!.skipped_files!.join(", ") })}
+                    </span>
+                  )}
+                </div>
+              </div>
               <div class="volo-filter-bar">
                 <div class="volo-filter-controls">
                   <input

@@ -475,6 +475,7 @@ const AUDIT_ACTION_KEYS: Record<string, string> = {
   "security.comment_ip_ban": "audit.act.sec_cmt_ban",
   "security.geo_rule_add": "audit.act.sec_geo_add",
   "security.geo_rule_update": "audit.act.sec_geo_upd",
+  "security.geoip_reload": "audit.act.sec_geo_reload",
   "security.totp_enroll": "audit.act.sec_totp_on",
   "security.totp_disable": "audit.act.sec_totp_off",
   "security.passkey_register": "audit.act.sec_pk_add",

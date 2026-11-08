@@ -107,6 +107,7 @@ type Config struct {
 	DefaultUploadDir string
 	BackupDir        string
 	GeoIPDir         string
+	DefaultGeoIPDir  string
 	ThemesDir        string
 	PluginsDir       string
 	LocalesDir       string
@@ -163,6 +164,162 @@ func (c *Config) SetUploadDir(dir string) {
 	c.mu.Unlock()
 }
 
+// GetGeoIPDir returns the active offline GeoIP directory or database file path in a thread-safe manner.
+func (c *Config) GetGeoIPDir() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.GeoIPDir) != "" {
+		return c.GeoIPDir
+	}
+	return c.DefaultGeoIPDir
+}
+
+// GetDefaultGeoIPDir returns the bootstrap default GeoIP directory resolved at startup.
+func (c *Config) GetDefaultGeoIPDir() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if strings.TrimSpace(c.DefaultGeoIPDir) != "" {
+		return c.DefaultGeoIPDir
+	}
+	return c.GeoIPDir
+}
+
+// SetGeoIPDir updates the active GeoIP directory/path (or resets to DefaultGeoIPDir when empty) under a write lock.
+func (c *Config) SetGeoIPDir(dir string) {
+	if c == nil {
+		return
+	}
+	clean := strings.TrimSpace(dir)
+	c.mu.Lock()
+	if c.DefaultGeoIPDir == "" && c.GeoIPDir != "" {
+		c.DefaultGeoIPDir = c.GeoIPDir
+	}
+	if clean == "" {
+		c.GeoIPDir = c.DefaultGeoIPDir
+	} else {
+		c.GeoIPDir = filepath.Clean(clean)
+	}
+	c.mu.Unlock()
+}
+
+// ValidateCustomGeoIPPath ensures a custom GeoIP directory or .mmdb/.xdb file path does not traverse "..",
+// target sensitive OS roots, or overlap with public upload/protected workspace directories.
+func (c *Config) ValidateCustomGeoIPPath(rawPath string) (string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return "", nil
+	}
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] <= 0x1F || trimmed[i] == 0x7F {
+			return "", errors.New("config: geoip_dir contains control characters")
+		}
+	}
+	normSlash := strings.ReplaceAll(trimmed, `\`, "/")
+	for _, seg := range strings.Split(normSlash, "/") {
+		if seg == ".." {
+			return "", errors.New("config: geoip_dir must not contain '..' segments")
+		}
+	}
+	cleaned := filepath.Clean(trimmed)
+	if cleaned == "." || cleaned == ".." || cleaned == "/" || cleaned == `\` {
+		return "", errors.New("config: geoip_dir must point to a dedicated GeoIP directory or .mmdb/.xdb file")
+	}
+	absTarget, err := filepath.Abs(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("config: invalid geoip_dir: %w", err)
+	}
+	if filepath.Dir(absTarget) == absTarget {
+		return "", errors.New("config: geoip_dir cannot be filesystem root")
+	}
+	lowTarget := strings.ToLower(filepath.ToSlash(absTarget))
+	allowedSysGeoShare := lowTarget == "/usr/share/geoip" || strings.HasPrefix(lowTarget, "/usr/share/geoip/")
+	if !allowedSysGeoShare {
+		for _, sysRoot := range []string{
+			"/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/run", "/var/run",
+			"c:/windows", "c:/program files", "c:/program files (x86)",
+		} {
+			if lowTarget == sysRoot || strings.HasPrefix(lowTarget, sysRoot+"/") {
+				return "", fmt.Errorf("config: geoip_dir cannot target system directory %q", sysRoot)
+			}
+		}
+	}
+
+	// If an existing entry on disk is a file (not a directory), require a .mmdb or .xdb extension.
+	lowBase := strings.ToLower(filepath.Base(cleaned))
+	hasDBExt := strings.HasSuffix(lowBase, ".mmdb") || strings.HasSuffix(lowBase, ".xdb")
+	if st, stErr := os.Lstat(absTarget); stErr == nil {
+		if st.Mode()&os.ModeSymlink != 0 {
+			return "", errors.New("config: geoip_dir cannot be a symbolic link")
+		}
+		if !st.IsDir() && !hasDBExt {
+			return "", errors.New("config: geoip_dir file target must end with .mmdb or .xdb")
+		}
+	} else if ext := strings.ToLower(filepath.Ext(lowBase)); ext != "" && !hasDBExt {
+		// Reject obvious non-GeoIP file extensions such as .db, .env, .json, .key
+		switch ext {
+		case ".db", ".sqlite", ".sqlite3", ".env", ".key", ".pem", ".json", ".zip", ".sql", ".log":
+			return "", errors.New("config: geoip_dir file target must end with .mmdb or .xdb")
+		}
+	}
+
+	var protected []string
+	var uploadDirs []string
+	if wd, wdErr := os.Getwd(); wdErr == nil && wd != "" {
+		protected = append(protected, wd)
+	}
+	if c != nil {
+		c.mu.RLock()
+		protected = append(protected, c.DataDir, c.BackupDir, c.ThemesDir, c.PluginsDir, c.LocalesDir)
+		uploadDirs = append(uploadDirs, c.UploadDir, c.DefaultUploadDir)
+		c.mu.RUnlock()
+	}
+	targetCmp := filepath.Clean(absTarget)
+	if os.PathSeparator == '\\' {
+		targetCmp = strings.ToLower(targetCmp)
+	}
+	sep := string(filepath.Separator)
+	for _, p := range protected {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		pAbs, aErr := filepath.Abs(p)
+		if aErr != nil {
+			continue
+		}
+		pCmp := filepath.Clean(pAbs)
+		if os.PathSeparator == '\\' {
+			pCmp = strings.ToLower(pCmp)
+		}
+		if targetCmp == pCmp || strings.HasPrefix(pCmp, targetCmp+sep) {
+			return "", fmt.Errorf("config: geoip_dir cannot equal or enclose protected directory %q", p)
+		}
+	}
+	for _, u := range uploadDirs {
+		if strings.TrimSpace(u) == "" {
+			continue
+		}
+		uAbs, aErr := filepath.Abs(u)
+		if aErr != nil {
+			continue
+		}
+		uCmp := filepath.Clean(uAbs)
+		if os.PathSeparator == '\\' {
+			uCmp = strings.ToLower(uCmp)
+		}
+		// Never place GeoIP databases inside or enclosing the public media upload directory!
+		if targetCmp == uCmp || strings.HasPrefix(uCmp, targetCmp+sep) || strings.HasPrefix(targetCmp, uCmp+sep) {
+			return "", fmt.Errorf("config: geoip_dir cannot overlap with upload directory %q", u)
+		}
+	}
+	return cleaned, nil
+}
+
 // ValidateCustomUploadDir ensures a custom local media directory does not traverse "..", point to a
 // filesystem/system root, or encompass sensitive workspace directories (working dir, DataDir/volo.db, BackupDir, ThemesDir, PluginsDir).
 func (c *Config) ValidateCustomUploadDir(rawDir string) (string, error) {
@@ -208,7 +365,7 @@ func (c *Config) ValidateCustomUploadDir(rawDir string) (string, error) {
 	}
 	if c != nil {
 		c.mu.RLock()
-		protected = append(protected, c.DataDir, c.BackupDir, c.ThemesDir, c.PluginsDir, c.GeoIPDir, c.LocalesDir)
+		protected = append(protected, c.DataDir, c.BackupDir, c.ThemesDir, c.PluginsDir, c.GeoIPDir, c.DefaultGeoIPDir, c.LocalesDir)
 		c.mu.RUnlock()
 	}
 	targetCmp := filepath.Clean(absTarget)
@@ -504,6 +661,7 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 		DefaultUploadDir:  uploadDir,
 		BackupDir:         backupDir,
 		GeoIPDir:          geoIPDir,
+		DefaultGeoIPDir:   geoIPDir,
 		ThemesDir:         themesDir,
 		PluginsDir:        pluginsDir,
 		LocalesDir:        localesDir,

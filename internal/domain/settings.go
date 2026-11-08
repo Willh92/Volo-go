@@ -165,6 +165,7 @@ type SecuritySettings struct {
 	GeoPolicyActive      bool   `json:"geo_policy_active"`
 	GeoDefaultAction     string `json:"geo_default_action"` // allow | deny
 	GeoUnknownAction     string `json:"geo_unknown_action"` // allow | deny
+	GeoIPDir             string `json:"geoip_dir"`
 	TOTPRequiredScope    string `json:"totp_required_scope"` // off | admin | staff
 	TOTPRememberDays     int    `json:"totp_remember_days"`
 	TOTPWindowSteps      int    `json:"totp_window_steps"`
