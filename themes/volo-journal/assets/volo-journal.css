@@ -49,7 +49,7 @@ html[data-volo-skin="volo-journal"] .chroma .ln,
 html[data-volo-skin="volo-journal"] .chroma .lnt {
   user-select: none;
   -webkit-user-select: none;
-  padding-right: 0.85em;
+  padding-right: 12px;
   opacity: 0.55;
 }
 

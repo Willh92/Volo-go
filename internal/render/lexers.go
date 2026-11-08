@@ -22,6 +22,11 @@ var (
 	codeLexers    map[string]*codeLexer
 )
 
+// HighlightCodeHTML renders source code into Volo's canonical Chroma-compatible HTML block.
+func HighlightCodeHTML(code string, lang string, withLineNumbers bool) string {
+	return highlightCodeChroma(code, lang, withLineNumbers)
+}
+
 func highlightCodeChroma(code string, lang string, withLineNumbers bool) string {
 	codeLexerOnce.Do(initCodeLexers)
 
@@ -249,7 +254,7 @@ func initCodeLexers() {
 	register(goLex, "go", "golang")
 	register(tsLex, "ts", "typescript", "tsx", "js", "javascript", "jsx", "mjs", "cjs")
 	register(rsLex, "rs", "rust")
-	register(cFamLex, "c", "h", "cpp", "c++", "cc", "hpp", "java", "kotlin", "kt", "csharp", "cs", "swift", "php")
+	register(cFamLex, "c", "h", "cpp", "c++", "cc", "hpp", "java", "kotlin", "kt", "csharp", "cs", "swift", "php", "dart")
 	register(pyLex, "py", "python", "python3")
 	register(shLex, "sh", "bash", "zsh", "shell", "console", "dockerfile", "docker", "nginx")
 	register(sqlLex, "sql", "sqlite", "postgres", "postgresql", "pgsql", "mysql")

@@ -514,8 +514,9 @@
       var fig = pre.closest("[data-lang]");
       var lang = (fig && fig.getAttribute("data-lang")) || pre.getAttribute("data-lang") || "";
       var code = pre.querySelector("code");
-      if (!lang && code && code.className) {
-        var m = code.className.match(/language-([a-zA-Z0-9_+-]+)/);
+      if (!lang) {
+        var clsSrc = ((code && code.className) || "") + " " + (pre.className || "");
+        var m = clsSrc.match(/(?:language|lang)-([a-zA-Z0-9_+#-]+)/);
         if (m) lang = m[1];
       }
 
@@ -533,7 +534,7 @@
       btn.addEventListener("click", function () {
         var srcNode = code || pre;
         var clone = srcNode.cloneNode(true);
-        clone.querySelectorAll(".ln, .lnt").forEach(function (n) { n.remove(); });
+        clone.querySelectorAll(".ln, .lnt, .line-number, .line-numbers-rows").forEach(function (n) { n.remove(); });
         copyTextToClipboard(clone.textContent || "").then(function () {
           btn.textContent = copiedLabel;
           setTimeout(function () { btn.textContent = copyLabel; }, 1500);

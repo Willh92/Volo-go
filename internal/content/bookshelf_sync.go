@@ -707,6 +707,7 @@ func extractAndRewriteBookHTML(
 	}
 
 	pruneBookChromeNodes(root)
+	normalizeBookCodeBlocks(root)
 	stripDuplicateLeadingH1(root, activeCh.Title)
 
 	if countVisibleRunes(root, 32) < 20 && !hasBookMediaElement(root) {

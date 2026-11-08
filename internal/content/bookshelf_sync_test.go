@@ -184,3 +184,105 @@ func TestGitBook3SearchResultsWrapperAndNestedSidebarTOC(t *testing.T) {
 	}
 }
 
+func TestExtractAndRewriteBookHTML_NormalizesCodeBlockLineNumbers(t *testing.T) {
+	baseURL, err := url.Parse("https://book.willh.cn/chapter2/flutter_widget_intro.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bk := BookDetailView{
+		Book: domain.Book{
+			ID:        "bk_flutter",
+			Slug:      "flutter-in-action-2",
+			Title:     "Flutter实战·第二版",
+			SourceURL: "https://book.willh.cn/",
+			EmbedMode: "inline",
+		},
+		FlatChapters: []domain.BookChapter{
+			{ID: "ch_2_2", BookID: "bk_flutter", Title: "2.2 Widget 简介", URL: "https://book.willh.cn/chapter2/flutter_widget_intro.html"},
+		},
+	}
+
+	doc := `<!DOCTYPE html>
+<html><body>
+<main class="page">
+  <div class="theme-default-content">
+    <h1 id="_2-2-widget-简介"><a href="#_2-2-widget-简介" class="header-anchor">#</a> 2.2 Widget 简介</h1>
+    <h2 id="_2-2-2-widget-接口"><a href="#_2-2-2-widget-接口" class="header-anchor">#</a> 2.2.2 Widget 接口</h2>
+    <p>在 Flutter 中，Widget 的核心声明如下：</p>
+    <div class="language-dart line-numbers-mode"><pre class="language-dart"><code><span class="token metadata symbol">@immutable</span> <span class="token comment">// 不可变的</span>
+<span class="token keyword">abstract</span> <span class="token keyword">class</span> <span class="token class-name">Widget</span> <span class="token keyword">extends</span> <span class="token class-name">DiagnosticableTree</span> <span class="token punctuation">{</span>
+  <span class="token comment">/* multi-line
+   * doc comment */</span>
+  <span class="token keyword">const</span> <span class="token class-name">Widget</span><span class="token punctuation">(</span><span class="token punctuation">{</span> <span class="token keyword">this</span><span class="token punctuation">.</span>key <span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> <div class="line-numbers-wrapper"><span class="line-number">1</span><br><span class="line-number">2</span><br><span class="line-number">3</span><br><span class="line-number">4</span><br><span class="line-number">5</span><br><span class="line-number">6</span><br></div></div>
+
+    <div class="language-ts vp-adaptive-theme line-numbers-mode">
+      <button title="Copy Code" class="copy"></button>
+      <span class="lang">ts</span>
+      <pre class="shiki"><code><span class="line"><span class="token keyword">const</span> a = <span class="token number">1</span>;</span>
+<span class="line highlighted"><span class="token keyword">const</span> b = <span class="token number">2</span>;</span></code></pre>
+      <div class="line-numbers-wrapper" aria-hidden="true"><span class="line-number">1</span><br><span class="line-number">2</span><br></div>
+    </div>
+
+    <figure class="highlight dart">
+      <table><tbody><tr>
+        <td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td>
+        <td class="code"><pre><span class="line"><span class="keyword">void</span> main() {</span><br><span class="line">  print(<span class="string">'ok'</span>);</span><br></pre></td>
+      </tr></tbody></table>
+    </figure>
+
+    <pre class="line-numbers language-go"><code class="language-go">package main
+func main() {}
+<span aria-hidden="true" class="line-numbers-rows"><span></span><span></span></span></code></pre>
+  </div>
+</main>
+</body></html>`
+
+	htmlOut, ok := extractAndRewriteBookHTML(doc, baseURL, bk, bk.FlatChapters[0], render.Default())
+	if !ok {
+		t.Fatal("expected extractAndRewriteBookHTML to succeed")
+	}
+
+	// 1. External VuePress/VitePress/Prism/Hexo gutter wrappers and layout tables must be completely gone.
+	for _, forbidden := range []string{
+		"line-numbers-wrapper",
+		"line-numbers-rows",
+		`class="line-number"`,
+		`class="gutter"`,
+		"<table",
+		`class="copy"`,
+	} {
+		if strings.Contains(htmlOut, forbidden) {
+			t.Fatalf("expected %q to be stripped/normalized, got:\n%s", forbidden, htmlOut)
+		}
+	}
+
+	// 2. VuePress Dart block must become a 6-line canonical Chroma figure with Prism tokens intact.
+	if !strings.Contains(htmlOut, `<figure class="volo-codeblock" data-lang="dart"><pre class="chroma"><code>`) {
+		t.Fatalf("expected canonical volo-codeblock figure with data-lang=dart, got:\n%s", htmlOut)
+	}
+	if !strings.Contains(htmlOut, `<span class="ln">6</span>`) || strings.Contains(htmlOut, `<span class="ln">7</span>`) {
+		t.Fatalf("expected exactly 6 line numbers on VuePress Dart block (trailing newline trimmed), got:\n%s", htmlOut)
+	}
+	if !strings.Contains(htmlOut, `<span class="token metadata symbol">@immutable</span>`) {
+		t.Fatalf("expected Prism token classes preserved inside .cl, got:\n%s", htmlOut)
+	}
+	// Multi-line comment across lines 3 and 4 must close and reopen cleanly inside each .cl.
+	if !strings.Contains(htmlOut, `<span class="ln">3</span><span class="cl">  <span class="token comment">/* multi-line</span>`) ||
+		!strings.Contains(htmlOut, `<span class="ln">4</span><span class="cl"><span class="token comment">   * doc comment */</span>`) {
+		t.Fatalf("expected multi-line comment span balanced across lines 3 and 4, got:\n%s", htmlOut)
+	}
+
+	// 3. VitePress/Shiki block must have 2 lines (not 3 or 4 from inter-line \n) and preserve highlighted line `.hl`.
+	if !strings.Contains(htmlOut, `data-lang="ts"`) || !strings.Contains(htmlOut, `<span class="line hl"><span class="ln">2</span>`) {
+		t.Fatalf("expected VitePress/Shiki block normalized with data-lang=ts and .line.hl on line 2, got:\n%s", htmlOut)
+	}
+
+	// 4. Plain Prism Go block without existing token spans must be syntax-highlighted by Volo's Go lexer with 2 line numbers.
+	if !strings.Contains(htmlOut, `data-lang="go"`) || !strings.Contains(htmlOut, `<span class="k">package</span>`) {
+		t.Fatalf("expected plain Go block highlighted via Volo lexer with data-lang=go, got:\n%s", htmlOut)
+	}
+}
+
+
