@@ -633,8 +633,21 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
 		}
+		locale := s.resolveLocale(r)
+		maskedIP := security.MaskIP(s.clientIP(r))
 		if req.DisplayName != nil && strings.TrimSpace(*req.DisplayName) != "" {
-			fullUser.DisplayName = strings.TrimSpace(*req.DisplayName)
+			nextDisp := strings.TrimSpace(repo.StripASCIIControls(*req.DisplayName))
+			if runes := []rune(nextDisp); len(runes) < 2 || len(runes) > 64 {
+				writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "reader.err_username_len"))
+				return
+			}
+			if actor.Role == domain.RoleEditor && s.deps.Auth != nil {
+				if nErr := s.deps.Auth.ValidateNickname(r.Context(), nextDisp, fullUser.Email, maskedIP, fullUser.ID, locale, "editor_profile"); nErr != nil {
+					writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, nErr))
+					return
+				}
+			}
+			fullUser.DisplayName = nextDisp
 		}
 		if req.Email != nil {
 			nextEmail := strings.ToLower(strings.TrimSpace(*req.Email))
@@ -652,7 +665,50 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			}
 		}
 		if req.Bio != nil {
-			fullUser.Bio = strings.TrimSpace(*req.Bio)
+			nextBio := strings.TrimSpace(repo.StripASCIIControls(*req.Bio))
+			if len([]rune(nextBio)) > 500 {
+				writeErrJSON(w, http.StatusBadRequest, "bio must not exceed 500 characters")
+				return
+			}
+			if actor.Role == domain.RoleEditor && nextBio != "" && s.deps.Plugins != nil {
+				if p := s.deps.Plugins.Providers(); p != nil {
+					verdict := p.EvaluateComment(r.Context(), plugin.CommentCheckInput{
+						TargetType: "profile_bio",
+						TargetID:   fullUser.ID,
+						AuthorName: fullUser.DisplayName,
+						AuthorURL:  fullUser.WebsiteURL,
+						ContentMD:  nextBio,
+						IPMasked:   maskedIP,
+						IsGuest:    false,
+						Locale:     locale,
+					})
+					if verdict.Action == plugin.SpamActionReject || verdict.Action == plugin.SpamActionModerate {
+						msg := strings.TrimSpace(repo.StripASCIIControls(verdict.Reason))
+						if msg == "" {
+							msg = s.deps.Catalog.T(locale, "comment.err_antispam")
+						}
+						writeErrJSON(w, http.StatusBadRequest, msg)
+						return
+					}
+				}
+				if _, hErr := s.deps.Plugins.DispatchHook(r.Context(), plugin.HookUserBeforeUpdateProfile, map[string]any{
+					"user_id":          fullUser.ID,
+					"username":         fullUser.Username,
+					"display_name":     fullUser.DisplayName,
+					"bio":              nextBio,
+					"email":            fullUser.Email,
+					"client_ip_masked": maskedIP,
+					"locale":           locale,
+					"source":           "editor_profile_bio",
+				}); hErr != nil {
+					var rej *plugin.HookRejectedError
+					if errors.As(hErr, &rej) {
+						writeHookRejectedJSON(w, rej)
+						return
+					}
+				}
+			}
+			fullUser.Bio = nextBio
 		}
 		if req.WebsiteURL != nil {
 			rawWeb := strings.TrimSpace(*req.WebsiteURL)
@@ -2367,6 +2423,33 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 	cur.ReadingMinutes = mins
 	cur.UpdatedAt = now
 
+	if s.deps.Plugins != nil {
+		hookOut, hErr := s.deps.Plugins.DispatchArticleHookWithError(r.Context(), plugin.HookArticleBeforeSave, articleHookPayloadFromRaw(cur))
+		if hErr != nil {
+			var rej *plugin.HookRejectedError
+			if errors.As(hErr, &rej) {
+				writeHookRejectedJSON(w, rej)
+				return
+			}
+		} else {
+			if nextTitle := strings.TrimSpace(hookOut.Title); nextTitle != "" && nextTitle != cur.Title {
+				cur.Title = nextTitle
+				if in.Slug == "" && isCreate {
+					cur.Slug = s.ensureUniqueArticleSlug(r.Context(), sanitizeSlug(cur.Title), cur.ID)
+				}
+			}
+			if hookOut.SummaryMD != cur.SummaryMD {
+				cur.SummaryMD = hookOut.SummaryMD
+			}
+			if hookOut.ContentMD != cur.ContentMD {
+				cur.ContentMD = hookOut.ContentMD
+				cur.HasContentLock = render.ContainsLockDirective(cur.ContentMD)
+				cur.WordCount, cur.ReadingMinutes = computeReadingMetrics(cur.ContentMD)
+			}
+			oldContentChanged = !isCreate && (prevSnapshot.Title != cur.Title || prevSnapshot.ContentMD != cur.ContentMD || prevSnapshot.SummaryMD != cur.SummaryMD)
+		}
+	}
+
 	err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
 		if oldContentChanged {
 			_ = s.appendArticleRevisionTx(r.Context(), tx, prevSnapshot, actor.DisplayName, in.RevisionNote)
@@ -2572,6 +2655,39 @@ func sanitizePageTemplateName(raw string) string {
 	return clean
 }
 
+func (s *AppServer) dispatchPageBeforeSaveHook(ctx context.Context, pg *domain.Page, isCreate bool) *plugin.HookRejectedError {
+	if s.deps.Plugins == nil || pg == nil {
+		return nil
+	}
+	res, err := s.deps.Plugins.DispatchHook(ctx, plugin.HookPageBeforeSave, map[string]any{
+		"id":           pg.ID,
+		"author_id":    pg.AuthorID,
+		"title":        pg.Title,
+		"slug":         pg.Slug,
+		"template":     pg.Template,
+		"content_md":   pg.ContentMD,
+		"lang":         pg.Lang,
+		"is_published": pg.IsPublished,
+		"is_create":    isCreate,
+	})
+	if err != nil {
+		var rej *plugin.HookRejectedError
+		if errors.As(err, &rej) {
+			return rej
+		}
+		return nil
+	}
+	if outMap, ok := res.(map[string]any); ok {
+		if nextTitle, sOk := outMap["title"].(string); sOk && strings.TrimSpace(nextTitle) != "" {
+			pg.Title = strings.TrimSpace(nextTitle)
+		}
+		if nextMD, sOk := outMap["content_md"].(string); sOk {
+			pg.ContentMD = nextMD
+		}
+	}
+	return nil
+}
+
 func (s *AppServer) dispatchPageLifecycleHook(ctx context.Context, hookName string, pg domain.Page, status string) {
 	if s.deps.Plugins == nil {
 		return
@@ -2645,6 +2761,7 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			}
 			in.ID = id.Next()
 			in.AuthorID = actor.ID
+			rawSlug := in.Slug
 			in.Slug = sanitizeSlug(in.Slug)
 			if in.Slug == "" {
 				in.Slug = sanitizeSlug(in.Title)
@@ -2652,6 +2769,13 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			in.Template = sanitizePageTemplateName(in.Template)
 			if in.Lang == "" {
 				in.Lang = s.deps.Settings.Snapshot().Site.DefaultLocale
+			}
+			if rej := s.dispatchPageBeforeSaveHook(r.Context(), &in, true); rej != nil {
+				writeHookRejectedJSON(w, rej)
+				return
+			}
+			if rawSlug == "" {
+				in.Slug = sanitizeSlug(in.Title)
 			}
 			now := time.Now().UnixMilli()
 			in.CreatedAt = now
@@ -2708,11 +2832,29 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 		} else {
 			tmpl = sanitizePageTemplateName(tmpl)
 		}
+		lang := strings.TrimSpace(in.Lang)
+		if lang == "" {
+			lang = pg.Lang
+		}
+		candidate := pg
+		candidate.Title = strings.TrimSpace(in.Title)
+		candidate.Slug = slug
+		candidate.Template = tmpl
+		candidate.ContentMD = in.ContentMD
+		candidate.IsPublished = in.IsPublished
+		candidate.AllowComment = in.AllowComment
+		candidate.ShowTOC = in.ShowTOC
+		candidate.Lang = lang
+		candidate.TranslationGroup = strings.TrimSpace(in.TranslationGroup)
+		if rej := s.dispatchPageBeforeSaveHook(r.Context(), &candidate, false); rej != nil {
+			writeHookRejectedJSON(w, rej)
+			return
+		}
 		now := time.Now().UnixMilli()
 		_, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE pages SET title = ?, slug = ?, template = ?, content_md = ?, is_published = ?, allow_comment = ?, show_toc = ?, lang = ?, translation_group = ?, updated_at = ? WHERE id = ?`,
-			strings.TrimSpace(in.Title), slug, tmpl, in.ContentMD, in.IsPublished, in.AllowComment, in.ShowTOC,
-			strings.TrimSpace(in.Lang), strings.TrimSpace(in.TranslationGroup), now, pg.ID)
+			candidate.Title, candidate.Slug, candidate.Template, candidate.ContentMD, candidate.IsPublished, candidate.AllowComment, candidate.ShowTOC,
+			candidate.Lang, candidate.TranslationGroup, now, pg.ID)
 		if writeBadErr(w, err) {
 			return
 		}
@@ -4396,7 +4538,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		return
 	}
 
-	if rest == "upload" && r.Method == http.MethodPost {
+	if (rest == "upload" || rest == "") && r.Method == http.MethodPost {
 		maxMB := s.deps.Settings.Snapshot().Storage.MaxUploadMB
 		if maxMB <= 0 {
 			maxMB = 25
@@ -4414,11 +4556,34 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		}
 		defer file.Close()
 
+		uploadFilename := hdr.Filename
+		uploadContentType := hdr.Header.Get("Content-Type")
+		if s.deps.Plugins != nil {
+			res, hErr := s.deps.Plugins.DispatchHook(r.Context(), plugin.HookMediaBeforeUpload, map[string]any{
+				"uploader_id":   actor.ID,
+				"uploader_role": actor.Role,
+				"filename":      uploadFilename,
+				"content_type":  uploadContentType,
+				"size_bytes":    hdr.Size,
+			})
+			if hErr != nil {
+				var rej *plugin.HookRejectedError
+				if errors.As(hErr, &rej) {
+					writeHookRejectedJSON(w, rej)
+					return
+				}
+			} else if outMap, ok := res.(map[string]any); ok {
+				if nextName, sOk := outMap["filename"].(string); sOk && strings.TrimSpace(nextName) != "" {
+					uploadFilename = strings.TrimSpace(nextName)
+				}
+			}
+		}
+
 		var asset *domain.MediaAsset
 		if s.deps.Media != nil {
-			asset, err = s.deps.Media.Upload(r.Context(), actor.ID, hdr.Filename, hdr.Header.Get("Content-Type"), file)
+			asset, err = s.deps.Media.Upload(r.Context(), actor.ID, uploadFilename, uploadContentType, file)
 		} else {
-			asset, err = s.saveFallbackLocalMedia(r.Context(), actor.ID, hdr.Filename, file, maxBytes)
+			asset, err = s.saveFallbackLocalMedia(r.Context(), actor.ID, uploadFilename, file, maxBytes)
 		}
 		if writeBadErr(w, err) {
 			return

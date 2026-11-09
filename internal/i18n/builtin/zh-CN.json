@@ -259,6 +259,7 @@
   "reader.err_invalid_credentials": "用户名/邮箱或密码不正确",
   "reader.err_invalid_email": "请输入有效的电子邮箱地址",
   "reader.err_username_len": "用户名长度需为 2～48 个字符",
+  "reader.err_username_sensitive": "昵称包含不适合使用的词语，请更换后再试",
   "reader.err_password_policy": "密码长度不足或不符合安全要求",
   "reader.err_verify_code": "邮箱验证码不正确或已过期",
   "reader.err_code_cooldown": "验证码发送过于频繁，请等待 60 秒后再试",

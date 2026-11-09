@@ -37,7 +37,7 @@
 | `VOLO_SECRET_KEY` | `--secret-key` | *(自动生成)* | 主密钥（建议 `>= 32` 字符高熵随机串；留空时自动生成 `0600` 权限 `${VOLO_DATA_DIR}/.secret.key`） |
 | `VOLO_DB_DRIVER` | `--db-driver` | *(留空读取 `db.json`，回退 `sqlite`)* | 数据库驱动：`sqlite`、`postgres`、`mysql`（建议留空以保留 `/setup` 向导的 `data/db.json` 选择） |
 | `VOLO_DB_DSN` | `--db-dsn` | `${VOLO_DATA_DIR}/volo.db` | 数据库连接串（SQLite 文件路径、PostgreSQL URI 或 MySQL DSN） |
-| `VOLO_DB_SIMPLE_PROTOCOL` | `--db-simple-protocol` | `false` | 为 PostgreSQL 事务连接池（Supabase / PgBouncer）开启 `pgx` Simple Query 协议 |
+| `VOLO_DB_SIMPLE_PROTOCOL` | `--db-simple-protocol` | `false` | 为 PostgreSQL 事务连接池（Supabase / PgBouncer）开启纯 Go `pgwire` Simple Query 协议 |
 | `VOLO_DB_MAX_OPEN_CONNS` | — | `25` | 最大打开数据库连接数（有效范围 `1`–`500`；SQLite 写池恒定自动锁定为 `1`） |
 | `VOLO_DB_MAX_IDLE_CONNS` | — | `5` | 最大空闲数据库连接数（有效范围 `0`–`500`） |
 | `VOLO_DB_CONN_MAX_LIFETIME_SEC` | — | `1800` | 数据库连接最大存活秒数（有效范围 `10`–`86400`） |

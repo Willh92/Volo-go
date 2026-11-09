@@ -1,0 +1,434 @@
+{
+  "id": "sensitive-words",
+  "version": "1.1.0",
+  "min_host_version": "0.1.0",
+  "runtime": "goja",
+  "entry": "main.js",
+  "priority": 20,
+  "author": "Volo Studio",
+  "homepage": "https://github.com/Willh92/Volo-go",
+  "name": {
+    "zh-CN": "敏感词与昵称卫士 (Sensitive Words)",
+    "en-US": "Sensitive Word & Nickname Guard",
+    "zh-TW": "敏感詞與暱稱衛士 (Sensitive Words)",
+    "ja-JP": "NGワード・なりすまし防止ガード (Sensitive Words)"
+  },
+  "description": {
+    "zh-CN": "内置转换清洗后的 houbb/sensitive-word 6.4 万级分类词库，基于宿主 16B/状态零 GC 指针 BFS-CSR Aho-Corasick 自动机，统一防护评论正文、读者注册昵称、OIDC 昵称与访客昵称，支持繁简归一、防拆分叠字混淆及在线自动转换更新。",
+    "en-US": "Ships 64k+ categorized houbb/sensitive-word entries powered by a native 16-byte/state zero-GC-pointer BFS-CSR Aho-Corasick engine covering comments, reader registration, OIDC handles, and guest nicknames with Traditional-Simplified folding, anti-obfuscation, and online conversion sync.",
+    "zh-TW": "內建轉換清洗後的 houbb/sensitive-word 6.4 萬級分類詞庫，基於宿主 16B/狀態零 GC 指標 BFS-CSR Aho-Corasick 自動機，統一防護評論正文、讀者註冊暱稱、OIDC 暱稱與訪客暱稱，支援繁簡歸一、防拆分疊字混淆及線上自動轉換更新。",
+    "ja-JP": "クレンジング済みの houbb/sensitive-word 6.4万語カテゴリ別辞書を内蔵し、ホストの 16B/状態・GCポインタゼロ BFS-CSR Aho-Corasick エンジンによりコメント本文・読者登録名・OIDC表示名・ゲスト名を一括保護します。繁簡統合、記号分割・Zalgo・数式フォント偽装対策、オンライン自動同期に対応。"
+  },
+  "permissions": [
+    "provider:antispam",
+    "kv",
+    "cron",
+    "http:outbound",
+    "http:routes",
+    "slots:admin.dashboard_card"
+  ],
+  "allowed_hosts": [
+    "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "cdn.jsdelivr.net",
+    "fastly.jsdelivr.net",
+    "gcore.jsdelivr.net"
+  ],
+  "ui_slots": [
+    {
+      "slot": "admin.dashboard_card",
+      "dynamic": true
+    }
+  ],
+  "config_schema": [
+    {
+      "key": "action",
+      "type": "select",
+      "default": "reject",
+      "options": [
+        {
+          "value": "reject",
+          "label": {
+            "zh-CN": "直接拦截并提示修改 (Reject)",
+            "en-US": "Reject Immediately",
+            "zh-TW": "直接攔截並提示修改 (Reject)",
+            "ja-JP": "即時拒否して修正を促す (Reject)"
+          }
+        },
+        {
+          "value": "moderate",
+          "label": {
+            "zh-CN": "转入待审核队列 (Moderate)",
+            "en-US": "Hold in Moderation Queue",
+            "zh-TW": "轉入待審核佇列 (Moderate)",
+            "ja-JP": "承認待ちキューに保留 (Moderate)"
+          }
+        }
+      ],
+      "group": {
+        "zh-CN": "拦截策略",
+        "en-US": "Interception Policy",
+        "zh-TW": "攔截策略",
+        "ja-JP": "ブロックポリシー"
+      },
+      "label": {
+        "zh-CN": "评论命中处理动作",
+        "en-US": "Comment Match Action",
+        "zh-TW": "評論命中處理動作",
+        "ja-JP": "コメント検出時の処理"
+      },
+      "description": {
+        "zh-CN": "评论命中敏感词时的默认动作；注册昵称命中时始终直接拦截。",
+        "en-US": "Action when a comment matches; registration nicknames are always rejected immediately on match.",
+        "zh-TW": "評論命中敏感詞時的預設動作；註冊暱稱命中時始終直接攔截。",
+        "ja-JP": "コメントがNGワードに一致した際の動作。登録ニックネームの一致時は常に即時拒否されます。"
+      }
+    },
+    {
+      "key": "custom_reject_message",
+      "type": "string",
+      "default": "",
+      "group": {
+        "zh-CN": "拦截策略",
+        "en-US": "Interception Policy",
+        "zh-TW": "攔截策略",
+        "ja-JP": "ブロックポリシー"
+      },
+      "label": {
+        "zh-CN": "自定义评论拦截提示语",
+        "en-US": "Custom Comment Reject Message",
+        "zh-TW": "自訂評論攔截提示語",
+        "ja-JP": "カスタムコメント拒否メッセージ"
+      },
+      "placeholder": {
+        "zh-CN": "留空则按访客语言返回默认友好提示",
+        "en-US": "Leave blank to use localized default message",
+        "zh-TW": "留空則按訪客語言返回預設友好提示",
+        "ja-JP": "空欄の場合は訪問者の言語に応じた標準メッセージを表示"
+      }
+    },
+    {
+      "key": "check_nickname",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "昵称防护",
+        "en-US": "Nickname Guard",
+        "zh-TW": "暱稱防護",
+        "ja-JP": "ニックネーム保護"
+      },
+      "label": {
+        "zh-CN": "同步拦截敏感与冒充昵称",
+        "en-US": "Guard Registration & Comment Nicknames",
+        "zh-TW": "同步攔截敏感與冒充暱稱",
+        "ja-JP": "NG・なりすましニックネームを保護"
+      },
+      "description": {
+        "zh-CN": "对读者注册用户名、OIDC 自动注册昵称及访客评论昵称同步执行敏感词与保留昵称校验。",
+        "en-US": "Screen reader registration usernames, OIDC display names, and guest comment nicknames against sensitive words and reserved handles.",
+        "zh-TW": "對讀者註冊使用者名稱、OIDC 自動註冊暱稱及訪客評論暱稱同步執行敏感詞與保留暱稱校驗。",
+        "ja-JP": "読者登録ユーザー名、OIDC表示名、ゲストコメントのニックネームをNGワードおよび予約名と照合します。"
+      }
+    },
+    {
+      "key": "custom_nickname_message",
+      "type": "string",
+      "default": "",
+      "group": {
+        "zh-CN": "昵称防护",
+        "en-US": "Nickname Guard",
+        "zh-TW": "暱稱防護",
+        "ja-JP": "ニックネーム保護"
+      },
+      "label": {
+        "zh-CN": "自定义昵称拦截提示语",
+        "en-US": "Custom Nickname Reject Message",
+        "zh-TW": "自訂暱稱攔截提示語",
+        "ja-JP": "カスタムニックネーム拒否メッセージ"
+      },
+      "placeholder": {
+        "zh-CN": "留空则按语言返回默认昵称不可用提示",
+        "en-US": "Leave blank to use localized default nickname message",
+        "zh-TW": "留空則按語言返回預設暱稱不可用提示",
+        "ja-JP": "空欄の場合は言語別の標準メッセージを表示"
+      }
+    },
+    {
+      "key": "reserved_nicknames",
+      "type": "textarea",
+      "default": "管理员\n系统管理员\n官方客服\n网站管理员\n站长\n博主\nsuperadmin\nwebmaster",
+      "group": {
+        "zh-CN": "昵称防护",
+        "en-US": "Nickname Guard",
+        "zh-TW": "暱稱防護",
+        "ja-JP": "ニックネーム保護"
+      },
+      "label": {
+        "zh-CN": "防冒充保留昵称（仅限昵称）",
+        "en-US": "Reserved Anti-Impersonation Nicknames",
+        "zh-TW": "防冒充保留暱稱（僅限暱稱）",
+        "ja-JP": "なりすまし防止予約名（ニックネーム専用）"
+      },
+      "description": {
+        "zh-CN": "每行一个词，仅拦截读者注册与访客评论昵称，不影响评论正文中正常提及“博主/站长”。",
+        "en-US": "One per line. Checked only against non-staff nicknames so normal comments mentioning 'admin' or 'author' are never blocked.",
+        "zh-TW": "每行一個詞，僅攔截讀者註冊與訪客評論暱稱，不影響評論正文中正常提及「版主/站長」。",
+        "ja-JP": "1行に1語。非スタッフのニックネームのみを検査し、コメント本文中の「管理者」「著者」などの通常の言及は妨げません。"
+      }
+    },
+    {
+      "key": "cat_politics",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "内置分类词库 (houbb)",
+        "en-US": "Categorized Dictionaries (houbb)",
+        "zh-TW": "內建分類詞庫 (houbb)",
+        "ja-JP": "内蔵カテゴリ別辞書 (houbb)"
+      },
+      "label": {
+        "zh-CN": "政治高危词库 (Tag 0)",
+        "en-US": "Political Sensitive Terms (Tag 0)",
+        "zh-TW": "政治高危詞庫 (Tag 0)",
+        "ja-JP": "政治的センシティブ語句 (Tag 0)"
+      }
+    },
+    {
+      "key": "cat_narcotics",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "内置分类词库 (houbb)",
+        "en-US": "Categorized Dictionaries (houbb)",
+        "zh-TW": "內建分類詞庫 (houbb)",
+        "ja-JP": "内蔵カテゴリ別辞書 (houbb)"
+      },
+      "label": {
+        "zh-CN": "毒品与违禁品词库 (Tag 1)",
+        "en-US": "Narcotics & Contraband (Tag 1)",
+        "zh-TW": "毒品與違禁品詞庫 (Tag 1)",
+        "ja-JP": "違法薬物・禁制品語句 (Tag 1)"
+      }
+    },
+    {
+      "key": "cat_porn",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "内置分类词库 (houbb)",
+        "en-US": "Categorized Dictionaries (houbb)",
+        "zh-TW": "內建分類詞庫 (houbb)",
+        "ja-JP": "内蔵カテゴリ別辞書 (houbb)"
+      },
+      "label": {
+        "zh-CN": "色情低俗与招嫖词库 (Tag 2)",
+        "en-US": "Adult & Solicitation Spam (Tag 2)",
+        "zh-TW": "色情低俗與招嫖詞庫 (Tag 2)",
+        "ja-JP": "アダルト・勧誘スパム語句 (Tag 2)"
+      }
+    },
+    {
+      "key": "cat_gambling",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "内置分类词库 (houbb)",
+        "en-US": "Categorized Dictionaries (houbb)",
+        "zh-TW": "內建分類詞庫 (houbb)",
+        "ja-JP": "内蔵カテゴリ別辞書 (houbb)"
+      },
+      "label": {
+        "zh-CN": "赌博博彩与杀猪盘词库 (Tag 3)",
+        "en-US": "Gambling & Pig-Butchering Scams (Tag 3)",
+        "zh-TW": "賭博博彩與殺豬盤詞庫 (Tag 3)",
+        "ja-JP": "違法ギャンブル・投資詐欺語句 (Tag 3)"
+      }
+    },
+    {
+      "key": "cat_crime",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "内置分类词库 (houbb)",
+        "en-US": "Categorized Dictionaries (houbb)",
+        "zh-TW": "內建分類詞庫 (houbb)",
+        "ja-JP": "内蔵カテゴリ別辞書 (houbb)"
+      },
+      "label": {
+        "zh-CN": "违法犯罪与黑灰产引流词库 (Tag 4)",
+        "en-US": "Illicit Crime & Black-Hat Ads (Tag 4)",
+        "zh-TW": "違法犯罪與黑灰產引流詞庫 (Tag 4)",
+        "ja-JP": "犯罪・不正誘導スパム語句 (Tag 4)"
+      }
+    },
+    {
+      "key": "cat_general",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "内置分类词库 (houbb)",
+        "en-US": "Categorized Dictionaries (houbb)",
+        "zh-TW": "內建分類詞庫 (houbb)",
+        "ja-JP": "内蔵カテゴリ別辞書 (houbb)"
+      },
+      "label": {
+        "zh-CN": "综合辱骂与通用敏感词库",
+        "en-US": "General Profanity & Untagged Terms",
+        "zh-TW": "綜合辱罵與通用敏感詞庫",
+        "ja-JP": "罵倒語・一般NGワード"
+      }
+    },
+    {
+      "key": "ignore_separators",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "防绕过引擎",
+        "en-US": "Anti-Obfuscation",
+        "zh-TW": "防繞過引擎",
+        "ja-JP": "回避防止エンジン"
+      },
+      "label": {
+        "zh-CN": "穿透标点/空格拆分混淆",
+        "en-US": "Pierce Punctuation & Space Splitting",
+        "zh-TW": "穿透標點/空格拆分混淆",
+        "ja-JP": "記号・空白による文字分割を貫通"
+      },
+      "description": {
+        "zh-CN": "开启后自动识别中间夹杂星号、空格、句点等干扰符的变体（如“傻*逼”、“加.微.信”）。",
+        "en-US": "Detects CJK terms split by spaces, asterisks, dots, or symbols while preserving strict ASCII word boundaries.",
+        "zh-TW": "開啟後自動識別中間夾雜星號、空格、句點等干擾符的變體（如「傻*逼」、「加.微.信」）。",
+        "ja-JP": "アスタリスクや空白・句読点で分割された語句を検出しつつ、英数字の単語境界は厳密に保護します。"
+      }
+    },
+    {
+      "key": "ignore_repeat",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "防绕过引擎",
+        "en-US": "Anti-Obfuscation",
+        "zh-TW": "防繞過引擎",
+        "ja-JP": "回避防止エンジン"
+      },
+      "label": {
+        "zh-CN": "折叠叠字重复绕过",
+        "en-US": "Collapse Repeated CJK Characters",
+        "zh-TW": "折疊疊字重複繞過",
+        "ja-JP": "連続する重複文字の引き伸ばしを圧縮"
+      },
+      "description": {
+        "zh-CN": "开启后自动识别拉长叠字绕过（如“傻傻傻逼逼”），且不影响英文单词与数字。",
+        "en-US": "Collapses repeated CJK runs (e.g. elongated slurs) without affecting English words or numbers.",
+        "zh-TW": "開啟後自動識別拉長疊字繞過（如「傻傻傻逼逼」），且不影響英文單字與數字。",
+        "ja-JP": "英単語や数値を損なうことなく、引き伸ばされた重複文字によるフィルタ回避を検出します。"
+      }
+    },
+    {
+      "key": "custom_deny",
+      "type": "textarea",
+      "default": "",
+      "group": {
+        "zh-CN": "自定义词表",
+        "en-US": "Custom Rules",
+        "zh-TW": "自訂詞表",
+        "ja-JP": "カスタム辞書"
+      },
+      "label": {
+        "zh-CN": "自定义补充敏感词",
+        "en-US": "Custom Blocked Words",
+        "zh-TW": "自訂補充敏感詞",
+        "ja-JP": "カスタム追加NGワード"
+      },
+      "placeholder": {
+        "zh-CN": "每行一个词，# 开头为注释，! 开头为白名单豁免词",
+        "en-US": "One word per line (# for comments, !prefix for allowlist)",
+        "zh-TW": "每行一個詞，# 開頭為註解，! 開頭為白名單豁免詞",
+        "ja-JP": "1行に1語（# はコメント、! 先頭は許可リスト）"
+      }
+    },
+    {
+      "key": "custom_allow",
+      "type": "textarea",
+      "default": "",
+      "group": {
+        "zh-CN": "自定义词表",
+        "en-US": "Custom Rules",
+        "zh-TW": "自訂詞表",
+        "ja-JP": "カスタム辞書"
+      },
+      "label": {
+        "zh-CN": "自定义白名单豁免词",
+        "en-US": "Custom Allowlist Phrases",
+        "zh-TW": "自訂白名單豁免詞",
+        "ja-JP": "カスタム許可フレーズ（ホワイトリスト）"
+      },
+      "placeholder": {
+        "zh-CN": "每行一个正常短语（例如：傻瓜相机）",
+        "en-US": "One safe phrase per line",
+        "zh-TW": "每行一個正常短語（例如：傻瓜相機）",
+        "ja-JP": "1行に1つの安全な語句を入力"
+      }
+    },
+    {
+      "key": "auto_update",
+      "type": "boolean",
+      "default": false,
+      "group": {
+        "zh-CN": "自动更新词库",
+        "en-US": "Auto-Update Sync",
+        "zh-TW": "自動更新詞庫",
+        "ja-JP": "辞書の自動同期"
+      },
+      "label": {
+        "zh-CN": "开启远程词库自动转换更新",
+        "en-US": "Enable Online Dictionary Auto-Sync",
+        "zh-TW": "開啟遠端詞庫自動轉換更新",
+        "ja-JP": "リモート辞書の自動変換・同期を有効化"
+      },
+      "description": {
+        "zh-CN": "开启后通过宿主统一 Cron 注册中心定期拉取 houbb/sensitive-word-data（或自定义源），在 Go 原生层流式清洗控制字符与误伤词、挂载分类标签并 Gzip 压缩入库；关闭时零唤醒开销。",
+        "en-US": "Periodically fetches houbb/sensitive-word-data (or a custom feed) via the host's unified CronRegistry, sanitizing, tagging, and gzip-storing natively in Go; zero idle wakeups when off.",
+        "zh-TW": "開啟後透過宿主統一 Cron 註冊中心定期拉取 houbb/sensitive-word-data（或自訂源），在 Go 原生層串流清洗控制字元與誤傷詞、掛載分類標籤並 Gzip 壓縮入庫；關閉時零喚醒開銷。",
+        "ja-JP": "有効時はホスト統合 CronRegistry 経由で houbb/sensitive-word-data（または任意URL）を定期取得し、Goネイティブ層でストリーム洗浄・タグ付け・Gzip圧縮保存を行います。無効時は待機オーバーヘッドゼロ。"
+      }
+    },
+    {
+      "key": "update_url",
+      "type": "url",
+      "default": "https://raw.githubusercontent.com/houbb/sensitive-word-data/main/src/main/resources/sensitive_word_dict.txt",
+      "group": {
+        "zh-CN": "自动更新词库",
+        "en-US": "Auto-Update Sync",
+        "zh-TW": "自動更新詞庫",
+        "ja-JP": "辞書の自動同期"
+      },
+      "label": {
+        "zh-CN": "远程词库源地址 (支持 houbb 原始格式)",
+        "en-US": "Remote Dictionary URL (houbb / Text / JSON)",
+        "zh-TW": "遠端詞庫源地址 (支援 houbb 原始格式)",
+        "ja-JP": "リモート辞書URL（houbb / テキスト / JSON形式）"
+      }
+    },
+    {
+      "key": "update_interval_hours",
+      "type": "number",
+      "default": 24,
+      "min": 1,
+      "max": 720,
+      "step": 1,
+      "group": {
+        "zh-CN": "自动更新词库",
+        "en-US": "Auto-Update Sync",
+        "zh-TW": "自動更新詞庫",
+        "ja-JP": "辞書の自動同期"
+      },
+      "label": {
+        "zh-CN": "自动同步间隔（小时）",
+        "en-US": "Sync Interval (Hours)",
+        "zh-TW": "自動同步間隔（小時）",
+        "ja-JP": "自動同期間隔（時間）"
+      }
+    }
+  ]
+}

@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -26,6 +27,8 @@ import (
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
+	"github.com/Willh92/Volo-go/pkg/plugin"
+	"github.com/Willh92/Volo-go/pkg/wordfilter"
 )
 
 const (
@@ -47,6 +50,7 @@ var (
 	ErrForbidden          = errors.New("auth: insufficient permissions")
 	ErrVerificationCode   = errors.New("auth: invalid or expired email verification code")
 	ErrCodeCooldown       = errors.New("auth: verification code resend cooldown active, please wait 60 seconds")
+	ErrNicknameRejected   = errors.New("auth: nickname contains restricted or reserved words")
 )
 
 const (
@@ -86,6 +90,11 @@ type LoginResult struct {
 	CSRFToken      string              `json:"csrf_token,omitempty"`
 }
 
+type cachedNicknameFilter struct {
+	settingsRev uint64
+	matcher     *wordfilter.Matcher
+}
+
 // Service manages Sovereign Accounts (admin / editor / reader), RBAC isolation, silent Argon2id
 // password upgrades, TOTP + Recovery Codes, WebAuthn Passkeys, kickable device sessions,
 // fine-grained API tokens, and one-click guest comment claiming.
@@ -93,6 +102,8 @@ type Service struct {
 	store       *sqlx.Store
 	keyRing     *config.KeyRing
 	settingsMgr *repo.SettingsManager
+	plugins     atomic.Pointer[plugin.Manager]
+	kwFilter    atomic.Pointer[cachedNicknameFilter]
 	pubMu       sync.RWMutex
 	publicURL   string
 	replayGuard *TOTPReplayGuard
@@ -129,6 +140,106 @@ func NewService(store *sqlx.Store, keyRing *config.KeyRing, settingsMgr *repo.Se
 		replayGuard:  NewTOTPReplayGuard(),
 		pendingCodes: make(map[string]*pendingEmailCode),
 	}
+}
+
+// SetPlugins attaches the Plugin Manager so registration, OIDC provisioning, and profile updates
+// enforce active AntiSpamProvider nickname screening and pre-action `user.before_*` hooks.
+func (s *Service) SetPlugins(pm *plugin.Manager) {
+	if s == nil {
+		return
+	}
+	s.plugins.Store(pm)
+}
+
+func (s *Service) matchesHostBlockedNickname(nickname string) bool {
+	if s == nil || s.settingsMgr == nil {
+		return false
+	}
+	snap := s.settingsMgr.Snapshot()
+	if !snap.Reading.BuiltinSpamFilter || len(snap.Reading.BlockedKeywords) == 0 {
+		return false
+	}
+	rev := s.settingsMgr.Revision()
+	cur := s.kwFilter.Load()
+	if cur == nil || cur.settingsRev != rev {
+		compiled := &cachedNicknameFilter{
+			settingsRev: rev,
+			matcher: wordfilter.Compile(wordfilter.Options{
+				Deny:             snap.Reading.BlockedKeywords,
+				Allow:            snap.Reading.AllowedKeywords,
+				IgnoreSeparators: true,
+				IgnoreRepeat:     true,
+			}),
+		}
+		if rev > 0 {
+			s.kwFilter.Store(compiled)
+		}
+		cur = compiled
+	}
+	return cur.matcher != nil && cur.matcher.WordCount() > 0 && cur.matcher.Contains(nickname)
+}
+
+// ValidateNickname screens a candidate username/display name against the union of:
+//  1. Host built-in `reading.blocked_keywords` (excluding `allowed_keywords`),
+//  2. All active `provider:antispam` plugins in priority order (`EvaluateNickname`), and
+//  3. Priority-chained `user.before_register` / `user.before_update_profile` pre-action hooks.
+func (s *Service) ValidateNickname(
+	ctx context.Context,
+	nickname string,
+	email string,
+	ipMasked string,
+	geoRegion string,
+	locale string,
+	source string,
+) error {
+	clean := strings.TrimSpace(nickname)
+	if clean == "" {
+		return nil
+	}
+	hostBlocked := s.matchesHostBlockedNickname(clean)
+	if pm := s.plugins.Load(); pm != nil {
+		verdict := pm.Providers().EvaluateNickname(ctx, plugin.NicknameCheckInput{
+			Nickname:  clean,
+			Email:     strings.TrimSpace(email),
+			IPMasked:  ipMasked,
+			GeoRegion: geoRegion,
+			Locale:    locale,
+			Source:    source,
+		})
+		if verdict.Action == plugin.SpamActionReject || verdict.Action == plugin.SpamActionModerate {
+			if reason := strings.TrimSpace(verdict.Reason); reason != "" {
+				return fmt.Errorf("%w: %s", ErrNicknameRejected, reason)
+			}
+			return ErrNicknameRejected
+		}
+
+		hookName := plugin.HookUserBeforeRegister
+		if source == "reader_profile" || source == "editor_profile" {
+			hookName = plugin.HookUserBeforeUpdateProfile
+		}
+		if _, hookErr := pm.DispatchHook(ctx, hookName, map[string]any{
+			"username":     clean,
+			"display_name": clean,
+			"nickname":     clean,
+			"email":        strings.TrimSpace(email),
+			"ip_masked":    ipMasked,
+			"geo_region":   geoRegion,
+			"locale":       locale,
+			"source":       source,
+		}); hookErr != nil {
+			var rej *plugin.HookRejectedError
+			if errors.As(hookErr, &rej) {
+				if reason := strings.TrimSpace(rej.Reason); reason != "" {
+					return fmt.Errorf("%w: %s", ErrNicknameRejected, reason)
+				}
+				return ErrNicknameRejected
+			}
+		}
+	}
+	if hostBlocked {
+		return ErrNicknameRejected
+	}
+	return nil
 }
 
 // SetPublicURL dynamically updates the canonical public URL used by auth ceremonies.
@@ -700,6 +811,9 @@ func (s *Service) RegisterReader(
 	normEmail := strings.ToLower(strings.TrimSpace(email))
 	uname := strings.TrimSpace(username)
 	if err := ValidateUsername(uname); err != nil {
+		return nil, err
+	}
+	if err := s.ValidateNickname(ctx, uname, normEmail, "", "", preferredLocale, "reader_register"); err != nil {
 		return nil, err
 	}
 	if err := ValidatePasswordPolicy(rawPassword); err != nil {

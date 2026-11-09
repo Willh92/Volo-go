@@ -113,23 +113,26 @@ The Admin Console features a custom CodeMirror 6 **3-Mode Studio Editor** combin
 
 ## 3. Capability-Sandboxed Plugin Development (`manifest.json` + Pure-Go ES6 JSVM)
 
-`Volo-go` never hardcodes plugin names in core host code. Built-in capabilities and external plugins (such as [`plugins/kanbanniang`](../../plugins/kanbanniang/)) share one declarative capability-gated sandbox architecture.
+`Volo-go` never hardcodes plugin names in core host code. Built-in capabilities and external plugins (such as [`plugins/kanbanniang`](../../plugins/kanbanniang/) and [`plugins/sensitive-words`](../../plugins/sensitive-words/)) share one declarative capability-gated sandbox and priority-ordered chain protocol.
 
-### 3.1 Plugin Directory Layout, `.zip` Export & In-Place Upgrade
+### 3.1 Plugin Directory Layout, Data Isolation & 5-Stage Lifecycle
 
 ```text
 plugins/hello-callout/
-├── manifest.json           # Permissions, UI slots, hooks, cron & config_schema
+├── manifest.json           # Permissions, priority, UI slots, hooks, cron & config_schema
 ├── main.js                 # Pure-Go embedded ES6 JSVM entry script
-└── assets/                 # Optional static assets (served at /plugins/hello-callout/assets/*)
+├── dicts/                  # Optional read-only dictionary files confined inside pluginDir
+└── assets/                 # Optional static assets (served via os.OpenInRoot at /plugins/<id>/assets/*)
     ├── widget.css
     └── widget.js
 ```
 
-- **Hot Install & In-Place Upgrade (`overwrite=true`)**: Drop a folder into `./plugins/` and click **Rescan Plugins**, or upload a `.zip` via the Admin UI / `POST /api/admin/plugins/install?overwrite=true` for zero-downtime installation or in-place upgrades — **in-place upgrades automatically preserve existing `config_json` and encrypted `secret_ciphertext` secrets**.
-- **Clean `.zip` Export**: Export any installed plugin via the Admin UI or `GET /api/admin/plugins/{id}/export` into a clean `.zip` archive (stripping runtime temp files and never exporting encrypted secret ciphertexts).
+- **Physical Data Isolation & Clean Uninstall**:
+  - Persistent state is isolated per `(plugin_id, key)` in `plugin_kv` (`<= 256 KiB` per value, `<= 2,000` keys default quota), with secrets sealed in `plugins.secret_ciphertext`; plugins can read relative files inside their own folder only and can never write to the host filesystem.
+  - **5-Stage Lifecycle**: `onInstall()` (fresh install or in-place ZIP upgrade) -> `onEnable()` -> `onConfigChange(newCfg)` (hot-applied immediately without restarting the VM) -> `onDisable()` (unregisters all dynamic cron jobs and providers) -> `onUninstall()` (invoked best-effort before transactionally wiping `plugin_kv`, `plugins`, and `./plugins/<id>` on disk).
+- **Hot Install, In-Place Upgrade (`overwrite=true`) & Clean `.zip` Export**: Upload via `POST /api/admin/plugins/install?overwrite=true` to hot-upgrade while preserving `config_json`, custom `priority`, and encrypted `secret_ciphertext` secrets, or export via `GET /api/admin/plugins/{id}/export` without leaking secret ciphertexts.
 
-### 3.2 `manifest.json`, `type: "secret"` Encrypted Fields & Unified `config_schema`
+### 3.2 `manifest.json`, `priority` Chain Ordering & `type: "secret"` Encrypted Fields
 
 `theme.json` and `manifest.json` share the unified `config_schema` field types:
 - `string` / `text` (single-line text), `textarea` (multi-line text)
@@ -148,6 +151,7 @@ plugins/hello-callout/
   "min_host_version": "0.1.0",
   "runtime": "goja",
   "entry": "main.js",
+  "priority": 50,
   "author": "Volo Developer",
   "homepage": "https://example.com",
   "name": {
@@ -160,11 +164,13 @@ plugins/hello-callout/
   },
   "permissions": [
     "kv",
+    "cron",
     "render",
     "site:read",
     "crypto",
     "ratelimit",
     "federation",
+    "hooks:comment.before_create",
     "hooks:render.pre_markdown",
     "hooks:render.post_html",
     "slots:article.after_content",
@@ -172,7 +178,10 @@ plugins/hello-callout/
     "http.outbound:api.github.com"
   ],
   "allowed_hosts": ["api.github.com"],
-  "hooks": ["render.pre_markdown", "render.post_html"],
+  "hooks": ["comment.before_create", "render.pre_markdown", "render.post_html"],
+  "cron": [
+    { "name": "sync_status", "interval_seconds": 3600, "handler": "onSyncCron" }
+  ],
   "ui_slots": [
     {
       "slot": "article.after_content",
@@ -202,83 +211,83 @@ plugins/hello-callout/
 }
 ```
 
+> **Plugin Priority (`priority`) & Deterministic Chain Ordering**: Every plugin has an execution `priority` (`-1000..10000`, default `100`, official `sensitive-words` defaults to `20`; **smaller numbers execute earlier**, breaking ties deterministically by `id`). Admins can reorder plugins with one click (`↑` / `↓` / Move-Top via `POST /api/admin/plugins/reorder`) or click `#1 · P20` to set an exact integer (`PATCH /api/admin/plugins/{id}/priority`). This order governs **all domain and `before_*` interception hooks, UI slot concatenation, render cache digests, and same-type `ProviderRegistry` chains** (`antispam`, `notifier`, `federation`, `oidc`, `storage`).
+
 > **Encrypted-at-Rest `type: "secret"` Guarantee**: Fields declared with `"type": "secret"` (or `"secret": true`) are encrypted at rest via the host `KeyRing` using `AES-256-GCM` (`plugins.secret_ciphertext` bound to `AAD = plugins.secret_ciphertext:<plugin_id>`). Admin APIs return only boolean masks (`secret_keys_set`) and never echo plaintext secrets; pass `"__VOLO_CLEAR_SECRET__"` to explicitly clear a stored secret.
 
-### 3.3 Permissions, Custom Directives, Automatic Federation & Extension Providers
+### 3.3 Unified Pre-Action Chained Interception (`before_*` Hooks) & Host Keyword Merge Semantics
+
+1. **Unified Interceptable Hooks (`IsInterceptableHook`)**:
+   All `before_*` hooks (including custom `*.before_*` hooks) execute in priority order with **chained payload transformation and short-circuit rejection**:
+   - Comments: `comment.before_create`, `comment.before_update` (if a hook mutates `content_md`, the host automatically re-runs spam/word-filter checks so hook rewrites cannot bypass moderation);
+   - Users & Nicknames: `user.before_register` (covers email OTP preflight, reader registration, and first-time OIDC auto-provisioning), `user.before_update_profile` (covers reader nickname edits and staff profile saves);
+   - Content & Media: `article.before_save`, `page.before_save`, `media.before_upload`.
+
+2. **Four Standard Interception Forms (Zero False Circuit-Breaker Trips)**:
+   Returning or throwing any of the following inside a `before_*` hook immediately short-circuits downstream plugins and returns a localized rejection (`HookRejectedError` — **counted as an intentional policy block, never incrementing `failure_count` or tripping `CIRCUIT_OPEN`**):
+   - Recommended: `return volo.reject("Blocked keyword detected", "SENSITIVE_WORD")` or `throw volo.reject("Blocked keyword detected", "SENSITIVE_WORD")`;
+   - Structured object: `return { allow: false, reason: "Policy violation", code: "POLICY_BLOCK" }` or `return { action: "reject", reason: "..." }` (or `{ reject: true, reason: "..." }`);
+   - Boolean shorthand: `return false`;
+   - **Non-Destructive Partial Payload Merge & Monotonic Moderation**: Returning a plain object (e.g. `return { content_md: cleaned }`) shallow-merges keys into the payload for the next plugin in the chain; setting `{ status: "pending" }` (or `{ action: "moderate" }`) on comments ratchets monotonically so lower-priority plugins cannot accidentally downgrade moderation back to `approved`.
+
+3. **Official `sensitive-words` Plugin & Additive Merge/Union with Host Settings**:
+   - **Intra-Plugin Lexicon Merge**: Compiles `houbb_base.txt.gz` (`281 KiB` prefix/tag delta-compressed dictionary with 6 category toggles), built-in technical `allowlist.txt`, optional SSRF-safe remote wordlist sync, `custom_deny`, `custom_allow` (longest-span allowlist override priority), and `reserved_nicknames` into a single native Double-Array Aho-Corasick automaton.
+   - **Host `reading.blocked_keywords` / `allowed_keywords` Union**:
+     - **Nicknames & Profiles**: Enforces a strict **union** across host `reading.blocked_keywords`, all enabled `provider:antispam` plugins (`checkNickname`), and `user.before_*` hooks — any match rejects the nickname;
+     - **Comments**: Smart moderation evaluates host `reading.blocked_keywords` first (marking matches `pending`), then runs `provider:antispam` plugins in priority order — non-matching plugins return `"pass"` so host `pending` decisions are preserved, while matches escalate to `reject`, mask-and-allow, or `moderate`.
+
+### 3.4 Permissions, Scheduled `CronRegistry` & Extension Providers
 
 1. **Permission Allowlist Tokens**:
-   - **Scoped Storage**: `kv` / `kv:rw` (read/write), `kv:read` (read-only `plugin_kv` with per-plugin quota enforcement and non-invalidating background writes that never thrash public page/RSS caches);
-   - **Host Capability Gates**:
-     - `crypto`: unlocks `volo.crypto` (`sha256`, `hmacSha256`, `randomUUID`);
-     - `site:read`: unlocks `volo.site.info()` read-only site metadata;
-     - `ratelimit`: unlocks `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)` sliding-window limiters (also granted automatically with `http:routes`);
-     - `cron`: allows background `cron` schedules;
-   - **Custom Markdown Directives (`render` + `volo.registerDirective`)**:
-     - With `"render"` (or `"hooks:render.*"` / `"hooks:render.directive"`) permission, call `volo.registerDirective(name, handlerFn)` during top-level module initialization to transform custom `:::name {key="val"} ... :::` fenced directives;
-     - Receives `{ name, attrs, body }` and sanitizes returned HTML through host `bluemonday` allowlists;
-     - **Reserved `:::lock` Protection**: Built-in `:::lock` blocks are physically reserved by the host and can never be intercepted by plugins; repeated directive timeouts or errors trip the circuit breaker (`CIRCUIT_OPEN`);
-   - **Automatic Federation Dispatch (`federation` / `provider:federation`)**:
-     - Declare `"federation"` (or `"federation:*"` / `"provider:federation"`) and call `volo.registerFederation({ publish(ev), deliver(ev) })` to receive automatic asynchronous dispatches whenever public articles are **published or updated** (`DispatchFederationArticle`, drained gracefully on shutdown) — ideal for ActivityPub, Webmention, AT Protocol, or cross-site syndication plugins;
-     - **10th Privacy Surface Guarantee**: Password-protected bodies are redacted (`ev.omitted_protected = true`) and partial `:::lock ... :::` blocks are physically stripped before reaching federation handlers;
-   - **Domain Hooks** (`hooks:*` or granular tokens):
-     - Articles: `hooks:article.published`, `hooks:article.updated`, `hooks:article.deleted`;
-     - Pages: `hooks:page.published`, `hooks:page.updated`, `hooks:page.deleted`;
-     - Comments: `hooks:comment.before_create`, `hooks:comment.created`, `hooks:comment.moderated`;
-     - Render pipeline: `hooks:render.pre_markdown` (transforms `content_md` on unlocked posts without `:::lock`) and `hooks:render.post_html` (post-processes rendered HTML with secondary sanitization);
-   - **UI Slots** (`ui:slots` or per-slot tokens): `slots:public.head`, `slots:public.header`, `slots:public.sidebar`, `slots:article.before_content`, `slots:article.after_content`, `slots:comment.before`, `slots:comment.after`, `slots:public.footer`, `slots:editor.quick_insert`, `slots:admin.dashboard_card`;
-   - **Network & Custom Routes**: `http:routes` (mounts `/plugins/<id>/api/*`), `http:raw_headers` (opt-in signature headers such as `x-hub-signature-256`, `x-signature`, `stripe-signature`, `authorization`), `http.outbound:<hostname>` / `allowed_hosts` (explicit domain or `*.domain.tld` allowlist + SSRF-safe `OutboundSafeDialer`);
-   - **Core Extension Providers**:
-     - `provider:storage`: export `storagePut(objectKey, bodyBase64, contentType)` plus optional `storageDelete(objectKey)` and `storageHealthCheck()` to register external media/backup object storage with automatic local-disk fallback;
-     - `provider:oidc`: export `oidcAuthURL(state, redirectURI, opts)` and `oidcExchange(code, redirectURI, opts)` (with PKCE + `nonce` replay verification and `email_verified` defaulting strictly to `false`) plus optional `oidcProviderInfo()` for federated SSO;
-     - `provider:notifier`: export `sendNotification(event)` or `notifySend(event)` for custom notification channels;
-     - `provider:antispam`: export `checkSpam(input)` returning `{ action: "allow" | "moderate" | "reject", reason, score }` for comment moderation;
-   - **Sensitive Content Gate**: `articles:read_protected` (without this explicit permission, password-protected bodies are blanked and `:::lock ... :::` blocks are stripped across every hook surface).
+   - **Storage & Host Capabilities**: `kv` / `kv:rw`, `kv:read`, `crypto` (`sha256`, `hmacSha256`, `randomUUID`), `site:read` (`volo.site.info()`), `ratelimit` (`volo.rateLimit`), and `cron` (unlocks `manifest.json` `"cron"` schedules plus dynamic `volo.cron.register/unregister/list`, up to 16 jobs per plugin, `>= 5s` interval, with one-click **Run Cron Now** in the Admin UI);
+   - **Custom Markdown Directives (`render` + `volo.registerDirective`)**: Transforms custom `:::name {key="val"} ... :::` blocks and sanitizes output via the host single-pass HTML5 AST sanitizer; built-in `:::lock` remains physically reserved by the host;
+   - **Automatic Federation Dispatch (`federation` / `provider:federation`)**: Asynchronous priority-ordered `publish(ev)` / `deliver(ev)` dispatch on public article publish/update with 100% redaction of locked posts and `:::lock` blocks;
+   - **Domain Hooks** (`hooks:*`, `hooks:<domain>.*` wildcards, or granular tokens):
+     - Pre-action interception hooks: `hooks:comment.before_create`, `hooks:comment.before_update`, `hooks:user.before_register`, `hooks:user.before_update_profile`, `hooks:article.before_save`, `hooks:page.before_save`, `hooks:media.before_upload`;
+     - Post-action & render hooks: `hooks:article.{published,updated,deleted}`, `hooks:page.{published,updated,deleted}`, `hooks:comment.{created,moderated}`, `hooks:render.{pre_markdown,post_html}`;
+   - **UI Slots** (`ui:slots` or `slots:*`): `public.head`, `public.header`, `public.sidebar`, `article.before_content`, `article.after_content`, `comment.before`, `comment.after`, `public.footer`, `editor.quick_insert`, `admin.dashboard_card`;
+   - **Network & Custom Routes**: `http:routes` (`/plugins/<id>/api/*`), `http:raw_headers`, `http.outbound:<hostname>` / `allowed_hosts` (enforced with `OutboundSafeDialer`);
+   - **Core Extension Providers** (chained deterministically in ascending `priority` order):
+     - `provider:storage`: `storagePut` / `storageDelete` / `storageHealthCheck` (with automatic local-disk fallback);
+     - `provider:oidc`: `oidcAuthURL` / `oidcExchange` / `oidcProviderInfo` (PKCE + `nonce` replay protection);
+     - `provider:notifier`: `sendNotification(event)` / `notifySend(event)`;
+     - `provider:antispam`: `checkSpam(input)` (`{ action: "pass" | "allow" | "moderate" | "reject", reason, score }`) and optional `checkNickname(input)` (`{ allow: boolean, reason }`);
+   - **Sensitive Content Gate**: `articles:read_protected`.
 
 2. **Circuit Breakers, Resource Guardrails & Host Security Integration**:
-   - Every JS Hook, Directive, Federation task, and UI Slot runs under strict instruction step budgets, wall-clock timeouts, cycle-depth limits, and `4 MiB` string caps; consecutive failures automatically trip the **circuit breaker (`CIRCUIT_OPEN`)**;
-   - `volo.on(...)`, `volo.registerDirective(...)`, and `volo.registerFederation(...)` are permitted only during top-level module initialization and frozen afterward;
-   - Scope plugin CSS custom properties under `--volo-plugin-<id>-*` inside `.volo-plugin-scope[data-plugin="<id>"]`;
-   - For host-level **Dynamic Stealth Admin Path hot-reload (`security.admin_path`)** and **Multi-Database GeoIP Access Control (`GeoLite2-City/Country/ASN.mmdb` + `ip2region` XDB)** details, see [`SECURITY.md`](../../SECURITY.md).
+   - Every JS Hook, Directive, Cron job, Federation task, and UI Slot runs under instruction step budgets, wall-clock timeouts, cycle-depth limits, and `4 MiB` string caps; consecutive runtime errors or timeouts automatically trip `CIRCUIT_OPEN`;
+   - See [`SECURITY.md`](../../SECURITY.md) for host-level **Dynamic Stealth Admin Path (`security.admin_path`)** and **Multi-DB GeoIP** details.
 
-### 3.4 Sandbox SDK (`volo.*`), ES6 Standard Library & Complete `main.js` Example
-
-The zero-CGO pure-Go JS VM natively supports modern **ES6+ syntax and builtins** (`let`/`const`, template literals, optional chaining `?.`, nullish coalescing `??`, arrow functions, spread/rest and destructuring, plus standard `Array`/`Object`/`String`/`Number`/`RegExp`/`Date`/`JSON`/`Math`, `encodeURIComponent`, and `btoa`/`atob`).
+### 3.5 Sandbox SDK (`volo.*`), Native `wordFilter` Engine & `main.js` Example
 
 Host bridge object `volo` (alias `ctx`):
-- `volo.on(hookName, handlerFn)`: subscribe to domain/render hooks at module init;
-- `volo.registerDirective(name, handlerFn)`: register custom `:::name ... :::` Markdown directives at module init (requires `render`);
-- `volo.registerFederation({ publish(ev), deliver(ev) })`: register asynchronous federation handlers for article publish/update events at module init (requires `federation`);
-- `volo.escapeHTML(str)`: HTML-entity escaping helper;
-- `volo.config.get(key)` / `volo.config.all()`: validated plugin settings (with `type: "secret"` fields transparently decrypted inside the sandbox);
-- `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`: plugin-scoped KV store;
-- `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`: cryptographic helpers;
-- `volo.site.info()`, `volo.rateLimit(key, max, windowSec?)`, `volo.http.fetch(url, options?)`, `volo.i18n.t(locale, key, vars?)`, and `volo.log.{info,warn,error}(msg)`.
+- `volo.on(hookName, handlerFn)` / `volo.reject(reason, code?)`: subscribe to domain/`before_*` hooks and emit structured policy rejections;
+- `volo.wordFilter.compile({ deny, allow, normalize, maxRepeat })` / `volo.wordFilter.loadHoubbDict(relGzPath, opts)`: compile zero-CGO CSR/Double-Array Aho-Corasick matchers exposing `.match(text)`, `.contains(text)`, `.censor(text, maskRune?)`, and `.stats()`;
+- `volo.cron.register(name, intervalSec, handlerName, immediate?)` / `volo.cron.unregister(name)` / `volo.cron.list()`: dynamic scheduled jobs (requires `cron`);
+- `volo.registerDirective(name, handlerFn)` / `volo.registerFederation({ publish(ev), deliver(ev) })`;
+- `volo.escapeHTML(str)`, `volo.config.{get,all}()`, `volo.kv.{get,getInt,set,del,incr,list}(...)`, `volo.crypto.{sha256,hmacSha256,randomUUID}()`, `volo.site.info()`, `volo.rateLimit(...)`, `volo.http.fetch(...)`, `volo.i18n.t(...)`, and `volo.log.{info,warn,error}(msg)`.
 
 ```javascript
-// 1. Register :::callout-box {type="tip"} ... ::: custom Markdown directive
-volo.registerDirective("callout-box", (ctx) => {
-  const kind = ctx.attrs?.type || "note";
-  return `<div class="callout callout-${volo.escapeHTML(kind)}">${volo.escapeHTML(ctx.body)}</div>`;
-});
+let matcher = null;
 
-// 2. Register automatic federation publish/update handlers (:::lock & protected posts redacted)
-volo.registerFederation({
-  publish(ev) {
-    if (ev.omitted_protected) return;
-    volo.kv.set(`fed:${ev.id}`, JSON.stringify({ action: ev.action, title: ev.title }), 86400);
-  },
-  deliver(ev) {
-    volo.log.info(`federation deliver: ${ev.id}`);
+function rebuildMatcher() {
+  const customDeny = String(volo.config.get("blocked_words") || "").split("\n");
+  matcher = volo.wordFilter.compile({ deny: customDeny, allow: ["GoLang"], normalize: true });
+}
+
+function onEnable() { rebuildMatcher(); }
+function onConfigChange() { rebuildMatcher(); }
+function onUninstall() { matcher = null; }
+
+// Chained pre-action interception: short-circuit via volo.reject (no circuit-breaker trip) or mutate payload
+volo.on("comment.before_create", (payload) => {
+  if (matcher && matcher.contains(payload.content_md || "")) {
+    return volo.reject("Comment contains restricted terms", "WORD_BLOCKED");
   }
+  return { content_md: String(payload.content_md || "").trim() };
 });
 
-// 3. Subscribe to render hooks and render dynamic UI slots safely
-volo.on("render.post_html", ({ html }) => {
-  volo.kv.incr("rendered_count", 1, 0);
-  return { html };
-});
-
-function renderSlot(slotName, ctx) {
+function renderSlot(slotName) {
   if (slotName === "article.after_content") {
     const msg = volo.config.get("banner_text") || "Thanks for reading!";
     return `<aside class="callout-box">${volo.escapeHTML(String(msg))}</aside>`;

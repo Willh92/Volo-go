@@ -113,23 +113,26 @@ themes/my-editorial/
 
 ## 3. 安全沙箱插件开发（`manifest.json` + 纯 Go ES6 JSVM）
 
-`Volo-go` 彻底摒弃“在核心代码硬编码判断特定插件名”的做法。所有内置能力与外部目录插件（如 [`plugins/kanbanniang`](../../plugins/kanbanniang/)）统一遵守声明式权限沙箱协议。
+`Volo-go` 彻底摒弃“在核心代码硬编码判断特定插件名”的做法。所有内置能力与外部目录插件（如 [`plugins/kanbanniang`](../../plugins/kanbanniang/) 与 [`plugins/sensitive-words`](../../plugins/sensitive-words/)）统一遵守声明式权限沙箱与优先级链式协议。
 
-### 3.1 插件目录结构、`.zip` 导出与原位覆盖升级
+### 3.1 插件目录结构、数据物理隔离与 5 阶段生命周期
 
 ```text
 plugins/hello-callout/
-├── manifest.json           # 权限、插槽、钩子、定时任务与配置表单 Schema
+├── manifest.json           # 权限、优先级(priority)、插槽、钩子、定时任务与配置 Schema
 ├── main.js                 # 纯 Go 内嵌 ES6 JSVM 沙箱入口脚本
-└── assets/                 # 可选静态资源（通过 /plugins/hello-callout/assets/* 分发）
+├── dicts/                  # 可选静态词典文件（仅可读本插件根目录内相对路径）
+└── assets/                 # 可选静态资源（通过 os.OpenInRoot 安全分发至 /plugins/<id>/assets/*）
     ├── widget.css
     └── widget.js
 ```
 
-- **热安装与原位升级（`overwrite=true`）**：管理员既可将目录放入 `./plugins/` 点击 **「重新扫描插件」**，也可通过后台或 `POST /api/admin/plugins/install?overwrite=true` 上传 `.zip` 包完成零停机安装或原位覆盖升级——**原位升级时自动保留已有 `config_json` 与加密的 `secret_ciphertext` 密钥**，无需重复录入 API Token。
-- **纯净 `.zip` 导出**：通过后台按钮或 `GET /api/admin/plugins/{id}/export` 可随时将已安装插件导出为干净的 `.zip` 归档包（自动剔除运行态临时文件，且绝不导出数据库中的加密密钥密文）。
+- **数据隔离与卸载彻底清理**：
+  - 数据库存储按 `(plugin_id, key)` 在 `plugin_kv` 物理隔离（单键 `<= 256 KiB`、单插件默认 `<= 2,000` 条配额），加密配置密封于 `plugins.secret_ciphertext`；插件仅可只读访问自身根目录内文件，禁止写宿主文件系统。
+  - **完整 5 阶段生命周期**：`onInstall()`（首次安装或原位升级后） -> `onEnable()`（启用加载） -> `onConfigChange(newCfg)`（后台保存配置即时热响应，无需重启 VM） -> `onDisable()`（停用并注销该插件全部动态定时任务与 Provider） -> `onUninstall()`（卸载前最佳努力执行收尾，随后宿主在事务内彻底清除该插件的 `plugin_kv`、`plugins` 记录及 `./plugins/<id>` 目录）。
+- **热安装、原位升级（`overwrite=true`）与纯净 `.zip` 导出**：支持上传 `.zip` 包完成零停机安装或原位覆盖升级（自动保留已有 `config_json`、自定义优先级与 `secret_ciphertext` 加密密钥），并支持 `GET /api/admin/plugins/{id}/export` 导出不含任何机密密文的纯净 `.zip` 包。
 
-### 3.2 `manifest.json` 完整字段、`type: "secret"` 加密配置与统一 `config_schema`
+### 3.2 `manifest.json` 完整字段、`priority` 链式优先级与 `type: "secret"` 加密配置
 
 `theme.json` 与 `manifest.json` 共享一致的 `config_schema` 控件类型体系：
 - `string` / `text`（单行文本）、`textarea`（多行文本）
@@ -148,6 +151,7 @@ plugins/hello-callout/
   "min_host_version": "0.1.0",
   "runtime": "goja",
   "entry": "main.js",
+  "priority": 50,
   "author": "Volo Developer",
   "homepage": "https://example.com",
   "name": {
@@ -160,11 +164,13 @@ plugins/hello-callout/
   },
   "permissions": [
     "kv",
+    "cron",
     "render",
     "site:read",
     "crypto",
     "ratelimit",
     "federation",
+    "hooks:comment.before_create",
     "hooks:render.pre_markdown",
     "hooks:render.post_html",
     "slots:article.after_content",
@@ -172,7 +178,10 @@ plugins/hello-callout/
     "http.outbound:api.github.com"
   ],
   "allowed_hosts": ["api.github.com"],
-  "hooks": ["render.pre_markdown", "render.post_html"],
+  "hooks": ["comment.before_create", "render.pre_markdown", "render.post_html"],
+  "cron": [
+    { "name": "sync_status", "interval_seconds": 3600, "handler": "onSyncCron" }
+  ],
   "ui_slots": [
     {
       "slot": "article.after_content",
@@ -202,83 +211,83 @@ plugins/hello-callout/
 }
 ```
 
+> **插件中心链式优先级（`priority`）与一键排序**：每个插件拥有执行优先级 `priority`（范围 `-1000..10000`，默认 `100`，官方 `sensitive-words` 默认为 `20`；**数值越小越先执行**，相同数值按插件 `id` 字典序确定性兜底）。管理员可在后台「插件中心」直接点击 **`↑` / `↓` / 置顶**（`POST /api/admin/plugins/reorder`）或点击 `#1 · P20` 徽章精确修改数值（`PATCH /api/admin/plugins/{id}/priority`）。该顺序同时决定**所有领域/前置拦截钩子、前台 UI 插槽拼接顺序、渲染缓存指纹以及同类型扩展 Provider 链（如多个 `provider:antispam`、`provider:notifier`、`provider:federation`、`provider:oidc`、`provider:storage`）的执行先后**。
+
 > **`type: "secret"` 密钥落盘加密保证**：`config_schema` 中声明 `"type": "secret"`（或 `"secret": true`）的字段在写入数据库时自动使用宿主 `KeyRing` 进行 `AES-256-GCM` 独立列加密（`plugins.secret_ciphertext`，绑定 `AAD = plugins.secret_ciphertext:<plugin_id>`）。后台管理 API 仅返回布尔掩码映射 `secret_keys_set`，绝不回显明文；若需清空已保存密钥，可传入哨兵值 `"__VOLO_CLEAR_SECRET__"`。
 
-### 3.3 标准权限（Permissions）、自定义指令、自动联邦分发与扩展 Provider
+### 3.3 统一前置链式拦截协议（`before_*` Hooks）与宿主屏蔽词并集关系
+
+1. **统一前置拦截钩子清单（`IsInterceptableHook`）**：
+   所有 `before_*` 前置钩子（含自定义 `*.before_*`）原生支持按插件优先级顺序**链式改写载荷与短路拦截**：
+   - 评论治理：`comment.before_create`、`comment.before_update`（若钩子改写了 `content_md`，宿主会自动重跑反垃圾与敏感词二次复检，杜绝后置绕过）；
+   - 用户与昵称治理：`user.before_register`（覆盖邮箱验证码预检、读者注册与 OIDC 首次自动建号）、`user.before_update_profile`（覆盖读者昵称修改与协作者个人资料保存）；
+   - 内容与媒体治理：`article.before_save`、`page.before_save`、`media.before_upload`。
+
+2. **4 种标准拦截返回语义（业务拦截绝不误触熔断器）**：
+   在前置钩子中，任一插件返回或抛出以下结构均会立即短路后续插件并向客户端返回本地化业务提示（返回 `HookRejectedError`，**计为正常业务拦截，绝不累加 `failure_count` 或触发 `CIRCUIT_OPEN` 熔断**）：
+   - 推荐写法：`return volo.reject("包含违禁词汇", "SENSITIVE_WORD")` 或直接 `throw volo.reject("包含违禁词汇", "SENSITIVE_WORD")`；
+   - 对象写法：`return { allow: false, reason: "禁止发布", code: "POLICY_BLOCK" }` 或 `return { action: "reject", reason: "..." }`（或 `{ reject: true, reason: "..." }`）；
+   - 极简布尔：`return false`；
+   - **非破坏式局部载荷合并与单向待审升级**：返回普通对象（如 `return { content_md: cleaned }`）时，宿主将其与当前载荷做局部键合并并继续传递给下一优先级插件；评论钩子若设 `{ status: "pending" }`（或 `{ action: "moderate" }`），待审状态在链路上单向保留，不会被后续低优先级插件意外冲掉。
+
+3. **官方 `sensitive-words` 插件与宿主后台配置的合并（并集叠加）关系**：
+   - **插件内部词库合并**：`houbb_base.txt.gz`（`281 KiB` 前缀/标签差分压缩，支持政治/涉枪涉暴/涉黄/毒品赌博/广告导流/脏话辱骂 6 大分类独立开关） + 内置技术词汇白名单 `allowlist.txt` + 可选远程词库自动同步 + 后台自定义拦截词 `custom_deny` + 自定义白名单 `custom_allow`（白名单最长区间覆盖优先） + 保留昵称 `reserved_nicknames` 统一编译为原生双数组 Aho-Corasick 自动机。
+   - **与宿主后台设置（`reading.blocked_keywords` / `allowed_keywords`）并集叠加**：
+     - **昵称与账号链路**：对宿主 `reading.blocked_keywords`、全部已启用 `provider:antispam` 插件（`checkNickname`）及 `user.before_*` 钩子严格取**并集**，任一侧命中即拦截；
+     - **评论链路**：智能审核先执行宿主 `reading.blocked_keywords`（命中置为 `pending` 待审），随后按优先级依次执行 `provider:antispam` 链——插件未命中时返回 `"pass"` 完整保留宿主的 `pending` 判定，命中时则按插件策略升级为直接拦截（`reject`）、打码放行或转人工审核（`moderate`）。
+
+### 3.4 标准权限（Permissions）、定时任务调度器与扩展 Provider
 
 1. **权限白名单令牌**：
-   - **存储**：`kv` / `kv:rw`（读写）、`kv:read`（只读 `plugin_kv`，单插件默认配额上限保护，且后台 KV 写入采用独立通道，不抖动主站文章/RSS 页面缓存）；
-   - **宿主能力门控**：
-     - `crypto`：解锁 `volo.crypto`（`sha256`、`hmacSha256`、`randomUUID`）；
-     - `site:read`：解锁 `volo.site.info()` 读取站点只读元信息；
-     - `ratelimit`：解锁 `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)` 滑动窗口限流器（声明 `http:routes` 时亦自动开放）；
-     - `cron`：允许声明 `cron` 周期后台任务；
-   - **自定义 Markdown 指令扩展（`render` + `volo.registerDirective`）**：
-     - 声明 `"render"`（或 `"hooks:render.*"` / `"hooks:render.directive"`）权限后，插件可在模块顶层初始化阶段调用 `volo.registerDirective(name, handlerFn)` 注册自定义 `:::name {key="val"} ... :::` 块级指令；
-     - 宿主传入 `{ name, attrs, body }` 上下文并对返回的 HTML 自动执行 `bluemonday` 白名单净化；
-     - **系统保留指令红线**：内置局部加密指令 `:::lock` 由宿主物理保留，任何插件均无法劫持或读取未解锁的 `:::lock` 块内容；连续超时或抛错会自动触发插件熔断器（`CIRCUIT_OPEN`）；
-   - **自动联邦网络异步分发（`federation` / `provider:federation`）**：
-     - 声明 `"federation"`（或 `"federation:*"` / `"provider:federation"`）权限并调用 `volo.registerFederation({ publish(ev), deliver(ev) })` 后，每当公开文章**发布或更新**时，宿主会在后台异步触发联邦投递（`DispatchFederationArticle`，停机时优雅等待在途任务排空），方便构建 ActivityPub、Webmention、AT Protocol 或跨站同步桥接插件；
-     - **第十道隐私防线保证**：密码保护文章正文自动脱敏并标记 `ev.omitted_protected = true`，正文内嵌的所有 `:::lock ... :::` 局部加密块在进入联邦插件前已被物理剥离，确保零私密内容外泄；
-   - **领域钩子**（支持 `hooks:*` 或细粒度令牌）：
-     - 文章生命周期：`hooks:article.published`、`hooks:article.updated`、`hooks:article.deleted`；
-     - 独立页面生命周期：`hooks:page.published`、`hooks:page.updated`、`hooks:page.deleted`；
-     - 评论治理：`hooks:comment.before_create`、`hooks:comment.created`、`hooks:comment.moderated`；
-     - 渲染管线：`hooks:render.pre_markdown`（在非加密且不含 `:::lock` 的文章进入 Markdown 解析器前改写 `content_md`）与 `hooks:render.post_html`（对渲染后的 HTML 做后处理并二次净化）；
-   - **界面插槽**（支持 `ui:slots` 或按插槽授权）：`slots:public.head`、`slots:public.header`、`slots:public.sidebar`、`slots:article.before_content`、`slots:article.after_content`、`slots:comment.before`、`slots:comment.after`、`slots:public.footer`、`slots:editor.quick_insert`、`slots:admin.dashboard_card`；
-   - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*` 自定义公开路由）、`http:raw_headers`（按需透传 `x-hub-signature-256`、`x-signature`、`stripe-signature`、`authorization` 等安全验签请求头）、`http.outbound:<hostname>` / `allowed_hosts`（显式域名或 `*.domain.tld` 白名单 + `OutboundSafeDialer` 防 SSRF）；
-   - **核心扩展 Provider**：
-     - `provider:storage`：实现 `storagePut(objectKey, bodyBase64, contentType)` 与可选 `storageDelete(objectKey)`、`storageHealthCheck()` 注册外部对象存储驱动（熔断时自动降级本地磁盘）；
-     - `provider:oidc`：实现 `oidcAuthURL(state, redirectURI, opts)` 与 `oidcExchange(code, redirectURI, opts)`（含 PKCE + `nonce` 防重放校验，`email_verified` 默认 `false`）及可选 `oidcProviderInfo()` 注册第三方联合登录驱动；
-     - `provider:notifier`：实现 `sendNotification(event)` 或 `notifySend(event)` 注册自定义通知渠道；
-     - `provider:antispam`：实现 `checkSpam(input)`（返回 `{ action: "allow" | "moderate" | "reject", reason, score }`）注册评论反垃圾审查驱动；
-   - **高敏读取**：`articles:read_protected`（未显式声明此权限的插件，宿主自动清空密码保护文章正文并按嵌套规则剥离所有 `:::lock ... :::` 内容块）。
+   - **存储与基础能力**：`kv` / `kv:rw`、`kv:read`、`crypto`（`sha256` / `hmacSha256` / `randomUUID`）、`site:read`（`volo.site.info()`）、`ratelimit`（`volo.rateLimit`）、`cron`（解锁 `manifest.json` `"cron"` 与运行时动态 `volo.cron.register/unregister/list`，单插件上限 16 个任务、最小间隔 5 秒，支持后台一键「立即执行定时任务」）；
+   - **自定义 Markdown 指令扩展（`render` + `volo.registerDirective`）**：声明 `"render"` 权限后可注册 `:::name {key="val"} ... :::` 块级指令，输出自动经宿主单趟 HTML5 AST 白名单净化器清洗；内置 `:::lock` 由宿主物理保留，禁止插件劫持；
+   - **自动联邦网络异步分发（`federation` / `provider:federation`）**：声明 `"federation"` 并调用 `volo.registerFederation({ publish(ev), deliver(ev) })`，公开文章发布/更新时异步按插件优先级投递，密码文章与 `:::lock` 块 100% 物理剥离；
+   - **领域钩子**（支持 `hooks:*`、`hooks:<domain>.*` 通配符或细粒度令牌）：
+     - 前置拦截钩子：`hooks:comment.before_create`、`hooks:comment.before_update`、`hooks:user.before_register`、`hooks:user.before_update_profile`、`hooks:article.before_save`、`hooks:page.before_save`、`hooks:media.before_upload`；
+     - 后置通知与渲染钩子：`hooks:article.{published,updated,deleted}`、`hooks:page.{published,updated,deleted}`、`hooks:comment.{created,moderated}`、`hooks:render.{pre_markdown,post_html}`；
+   - **界面插槽**（`ui:slots` 或 `slots:*`）：`public.head`、`public.header`、`public.sidebar`、`article.before_content`、`article.after_content`、`comment.before`、`comment.after`、`public.footer`、`editor.quick_insert`、`admin.dashboard_card`；
+   - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*`）、`http:raw_headers`、`http.outbound:<hostname>` / `allowed_hosts`（配合 `OutboundSafeDialer` 防 SSRF）；
+   - **核心扩展 Provider**（多个同类型插件严格按 `priority` 升序链式执行）：
+     - `provider:storage`：`storagePut` / `storageDelete` / `storageHealthCheck`（自动降级本地磁盘）；
+     - `provider:oidc`：`oidcAuthURL` / `oidcExchange` / `oidcProviderInfo`（PKCE + `nonce` 校验）；
+     - `provider:notifier`：`sendNotification(event)` / `notifySend(event)`；
+     - `provider:antispam`：`checkSpam(input)`（返回 `{ action: "pass" | "allow" | "moderate" | "reject", reason, score }`）与可选 `checkNickname(input)`（返回 `{ allow: boolean, reason }`）；
+   - **高敏读取**：`articles:read_protected`。
 
 2. **沙箱熔断、资源护栏与宿主安全联动**：
-   - 每次 JS Hook / Directive / Federation / Slot 执行均受指令步数预算、墙钟超时、循环引用深度上限及 `4 MiB` 字符串体积上限保护；连续异常或超时自动打开**熔断器（`CIRCUIT_OPEN`）**；
-   - `volo.on(...)`、`volo.registerDirective(...)` 与 `volo.registerFederation(...)` 仅允许在模块顶层初始化阶段调用，初始化完成后自动冻结；
-   - 插件 CSS 变量建议使用 `--volo-plugin-<id>-*` 命名空间，包裹容器自动带 `.volo-plugin-scope[data-plugin="<id>"]`；
-   - 关于宿主级 **动态隐身后台路径热更新（`security.admin_path`）** 与 **多库共存 GeoIP 访问控制引擎（`GeoLite2-City/Country/ASN.mmdb` + `ip2region` XDB）** 的详细安全机制，请参阅 [`SECURITY.md`](../../SECURITY.md)。
+   - 每次 JS Hook / Directive / Cron / Federation / Slot 执行均受指令步数预算、墙钟超时、循环引用深度上限及 `4 MiB` 字符串体积上限保护；非业务抛错或超时连续达到阈值自动打开**熔断器（`CIRCUIT_OPEN`）**；
+   - 关于宿主级 **动态隐身后台路径热更新（`security.admin_path`）** 与 **多库共存 GeoIP 访问控制引擎** 的详细安全机制，请参阅 [`SECURITY.md`](../../SECURITY.md)。
 
-### 3.4 沙箱 SDK（`volo.*`）、ES6 标准库与 `main.js` 完整示例
-
-内置零外部依赖 JS 虚拟机原生支持现代 **ES6+ 语法与标准库**（`let`/`const`、模板字符串、可选链 `?.`、空值合并 `??`、箭头函数、展开与解构赋值，以及标准 `Array`/`Object`/`String`/`Number`/`RegExp`/`Date`/`JSON`/`Math`、`encodeURIComponent`、`btoa`/`atob`）。
+### 3.5 沙箱 SDK（`volo.*`）、原生 `wordFilter` 引擎与 `main.js` 示例
 
 宿主桥接对象 `volo`（别名 `ctx`）：
-- `volo.on(hookName, handlerFn)`：顶层初始化期订阅领域/渲染钩子；
-- `volo.registerDirective(name, handlerFn)`：顶层初始化期注册自定义 `:::name ... :::` Markdown 指令（需 `render` 权限）；
-- `volo.registerFederation({ publish(ev), deliver(ev) })`：顶层初始化期注册文章发布/更新联邦分发处理器（需 `federation` 权限）；
-- `volo.escapeHTML(str)`：HTML 实体转义；
-- `volo.config.get(key)` / `volo.config.all()`：读取校验后的插件配置（含沙箱内自动透明解密的 `type: "secret"` 字段）；
-- `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`：插件命名空间 KV 存储；
-- `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`：加密哈希与随机 UUID；
-- `volo.site.info()`、`volo.rateLimit(key, max, windowSec?)`、`volo.http.fetch(url, options?)`、`volo.i18n.t(locale, key, vars?)` 与 `volo.log.{info,warn,error}(msg)`。
+- `volo.on(hookName, handlerFn)` / `volo.reject(reason, code?)`：订阅领域/前置拦截钩子与返回结构化业务拦截；
+- `volo.wordFilter.compile({ deny, allow, normalize, maxRepeat })` / `volo.wordFilter.loadHoubbDict(relGzPath, opts)`：编译原生零 CGO 双数组 Aho-Corasick 词库匹配器，返回实例支持 `.match(text)`、`.contains(text)`、`.censor(text, maskRune?)` 与 `.stats()`；
+- `volo.cron.register(name, intervalSec, handlerName, immediate?)` / `volo.cron.unregister(name)` / `volo.cron.list()`：动态定时任务管理（需 `cron` 权限）；
+- `volo.registerDirective(name, handlerFn)` / `volo.registerFederation({ publish(ev), deliver(ev) })`；
+- `volo.escapeHTML(str)`、`volo.config.{get,all}()`、`volo.kv.{get,getInt,set,del,incr,list}(...)`、`volo.crypto.{sha256,hmacSha256,randomUUID}()`、`volo.site.info()`、`volo.rateLimit(...)`、`volo.http.fetch(...)`、`volo.i18n.t(...)` 与 `volo.log.{info,warn,error}(msg)`。
 
 ```javascript
-// 1. 注册 :::callout-box {type="tip"} ... ::: 自定义 Markdown 容器指令
-volo.registerDirective("callout-box", (ctx) => {
-  const kind = ctx.attrs?.type || "note";
-  return `<div class="callout callout-${volo.escapeHTML(kind)}">${volo.escapeHTML(ctx.body)}</div>`;
-});
+let matcher = null;
 
-// 2. 注册自动联邦发布/更新处理器（自动剥离 :::lock 与加密正文）
-volo.registerFederation({
-  publish(ev) {
-    if (ev.omitted_protected) return;
-    volo.kv.set(`fed:${ev.id}`, JSON.stringify({ action: ev.action, title: ev.title }), 86400);
-  },
-  deliver(ev) {
-    volo.log.info(`federation deliver: ${ev.id}`);
+function rebuildMatcher() {
+  const customDeny = String(volo.config.get("blocked_words") || "").split("\n");
+  matcher = volo.wordFilter.compile({ deny: customDeny, allow: ["Go语言"], normalize: true });
+}
+
+function onEnable() { rebuildMatcher(); }
+function onConfigChange() { rebuildMatcher(); }
+function onUninstall() { matcher = null; }
+
+// 前置链式拦截钩子：命中时通过 volo.reject 短路拦截（不触发熔断器），否则局部改写载荷继续传递
+volo.on("comment.before_create", (payload) => {
+  if (matcher && matcher.contains(payload.content_md || "")) {
+    return volo.reject("评论包含受限词汇，请修改后重试", "WORD_BLOCKED");
   }
+  return { content_md: String(payload.content_md || "").trim() };
 });
 
-// 3. 订阅渲染钩子与安全渲染 UI 插槽
-volo.on("render.post_html", ({ html }) => {
-  volo.kv.incr("rendered_count", 1, 0);
-  return { html };
-});
-
-function renderSlot(slotName, ctx) {
+function renderSlot(slotName) {
   if (slotName === "article.after_content") {
     const msg = volo.config.get("banner_text") || "感谢阅读！";
     return `<aside class="callout-box">${volo.escapeHTML(String(msg))}</aside>`;

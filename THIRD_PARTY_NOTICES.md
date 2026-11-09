@@ -39,7 +39,7 @@ Binary distributions and container images of `Volo-go` incorporate the following
 | `github.com/remyoudompheng/bigfft` | BSD-3-Clause | Arbitrary-precision arithmetic (`modernc.org/sqlite`) | https://github.com/remyoudompheng/bigfft |
 | `golang.org/x/sys` | BSD-3-Clause | Low-level OS syscall primitives | https://cs.opensource.google/go/x/sys |
 
-> **Note on Built-in Subsystems & Test-Only Packages**: The pure-Go PostgreSQL v3 wire driver (`internal/db/sqlx`), single-pass HTML5 AST allowlist sanitizer & server-side lexical syntax highlighter (`internal/render`), MaxMind MMDB / ip2region XDB decoders (`internal/security`), and the embedded ES6 plugin VM (`pkg/plugin`) are first-party pure-Go implementations under Apache-2.0. `github.com/stretchr/testify` (MIT) in `go.mod` is used exclusively in `_test.go` suites and is not linked into production binaries.
+> **Note on Built-in Subsystems & Test-Only Packages**: The pure-Go PostgreSQL v3 wire driver (`internal/db/sqlx`), single-pass HTML5 AST allowlist sanitizer & server-side lexical syntax highlighter (`internal/render`), MaxMind MMDB / ip2region XDB decoders (`internal/security`), BFS-CSR Aho-Corasick word-filter engine (`pkg/wordfilter`), and the embedded ES6 plugin VM (`pkg/plugin`) are first-party pure-Go implementations under Apache-2.0. `github.com/stretchr/testify` (MIT) in `go.mod` is used exclusively in `_test.go` suites and is not linked into production binaries.
 
 ---
 
@@ -66,3 +66,12 @@ Pages containing LaTeX math expressions or Mermaid diagrams dynamically load the
 | :--- | :--- | :--- | :--- |
 | `KaTeX` (`katex@0.16.11`) | MIT | Client-side LaTeX math typesetting | https://github.com/KaTeX/KaTeX |
 | `Mermaid` (`mermaid@10`) | MIT | Client-side declarative diagram & flowchart rendering | https://github.com/mermaid-js/mermaid |
+
+---
+
+## 5. Linguistic Tables & Official Plugin Datasets / 语言映射表与官方插件词表数据
+
+| Dataset / 数据集 | License / 许可证 | Purpose / 用途 | Upstream / 来源 |
+| :--- | :--- | :--- | :--- |
+| `houbb/sensitive-word` & `houbb/sensitive-word-data` | Apache-2.0 | Sanitized & categorized base dictionary in `plugins/sensitive-words` | https://github.com/houbb/sensitive-word |
+| `BYVoid/OpenCC` (`TSCharacters.txt` via `houbb/opencc4j`) | Apache-2.0 | Static BMP Traditional-to-Simplified Hanzi folding table in `pkg/wordfilter` | https://github.com/BYVoid/OpenCC |

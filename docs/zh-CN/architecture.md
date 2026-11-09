@@ -33,12 +33,12 @@
 │  • Auth & RBAC (Argon2id / Passkey / TOTP / 会话管理 / API Token)       │
 │  • GuestPassport & PoW (三端自愈签名通行证 + env_fp + SHA-256 PoW)      │
 │  • Media Pipeline (<=64MP 防炸弹 / EXIF 摆正与剥离 / WebP / SigV4 S3)   │
-│  • Plugin Manager (自研纯 Go ES6 池化沙箱 + 指令扩展 + 联邦分发/熔断)   │
+│  • Plugin Manager (自研纯 Go ES6 池化沙箱 + 优先级链式拦截 + 定时/熔断) │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                  多方言 SQL 与版本感知存储引擎 (`sqlx`)                  │
-│  • Dialect: SQLite (modernc WAL 读写分离) | PostgreSQL (pgx/v5) | MySQL │
+│  • Dialect: SQLite (modernc WAL 读写分离) | PostgreSQL (pgwire) | MySQL │
 │  • 零闭包列映射计划 + Postgres Rebind 缓存 + 原子 DataRevision 失效总线  │
 │  • Write-Behind View Buffer (内存增量实时叠加 + 2s/停机确定性批量刷盘)   │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -46,9 +46,9 @@
 
 ---
 
-## 2. 正规化数据模型（`v6` Schema：33 张业务数据表 + 9 大设置域）
+## 2. 正规化数据模型（`v7` Schema：33 张业务数据表 + 9 大设置域）
 
-`Volo-go` 彻底摒弃了传统博客“利用键值表分片硬塞业务大 JSON”与“文章必须经由标签间接绑定分类”的反范式包袱，建立清晰的正规化关系模型（位于 `internal/db/migrate/schema.go`，当前 Schema 版本 **`v6`**，由 `schema_migrations` 跟踪 `v1`–`v6` 幂等演进，`CanonicalTables` 共包含 **33 张业务数据表**）：
+`Volo-go` 彻底摒弃了传统博客“利用键值表分片硬塞业务大 JSON”与“文章必须经由标签间接绑定分类”的反范式包袱，建立清晰的正规化关系模型（位于 `internal/db/migrate/schema.go`，当前 Schema 版本 **`v7`**，由 `schema_migrations` 跟踪 `v1`–`v7` 幂等演进，`CanonicalTables` 共包含 **33 张业务数据表**）：
 
 | 领域 | 数据表（共 33 张业务表 + `schema_migrations`） | 设计要点 |
 | :--- | :--- | :--- |
@@ -100,7 +100,7 @@
 7. **Sitemap（含自动分片）与 IndexNow**：密码文章绝不写入 `/sitemap.xml` 或任何 `/sitemap-N.xml` 分片，绝不触发 IndexNow 主动推送，且详情页自动注入 `noindex, nofollow, noarchive` 与 `Cache-Control: private, no-store`；
 8. **双向链接 (`[[slug]]`)**：加密文章不建立出站引用记录，也不在目标文章底部反向链接中展示；
 9. **`/llms.txt` 与 `.md` 原始端点**：语料索引完全排除密码文章，未携有效解锁凭证请求 `.md` 返回 `403`；
-10. **插件钩子与联邦分发隔离**：未声明高敏权限的插件与自动 `federation` 分发永远收不到加密文章载荷或嵌套 `:::lock` 块，且 `render.post_html` 与自定义指令输出二次经过 `bluemonday` 严格清洗防 XSS。
+10. **插件钩子与联邦分发隔离**：未声明高敏权限的插件与自动 `federation` 分发永远收不到加密文章载荷或嵌套 `:::lock` 块，且 `render.post_html` 与自定义指令输出二次经过单遍 HTML5 AST 安全清洗器（`internal/markdown/sanitize.go`）严格清洗防 XSS。
 
 ---
 

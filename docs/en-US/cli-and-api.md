@@ -26,12 +26,12 @@ Every subcommand honors the unified configuration hierarchy (`CLI Flags > OS VOL
 | `--themes-dir` / `--plugins-dir` / `--locales-dir` | `VOLO_THEMES_DIR` / `VOLO_PLUGINS_DIR` / `VOLO_LOCALES_DIR` | External hot-mountable themes, plugins, and locale packs directories |
 | `--db-driver <sqlite\|postgres\|mysql>` | `VOLO_DB_DRIVER` | Database driver (when unset, loads the `/setup` wizard's sealed `${VOLO_DATA_DIR}/db.json` if present) |
 | `--db-dsn <dsn>` | `VOLO_DB_DSN` | Database DSN (defaults to `${VOLO_DATA_DIR}/volo.db` on SQLite when empty) |
-| `--db-simple-protocol` | `VOLO_DB_SIMPLE_PROTOCOL` | Enable PostgreSQL `pgx` simple query protocol for transaction poolers (Supabase / PgBouncer) |
+| `--db-simple-protocol` | `VOLO_DB_SIMPLE_PROTOCOL` | Enable PostgreSQL pure-Go `pgwire` simple query protocol for transaction poolers (Supabase / PgBouncer) |
 | `--shutdown-timeout <sec>` | `VOLO_SHUTDOWN_TIMEOUT_SEC` | Graceful shutdown drain timeout in seconds (`1`–`120`, default `15`) |
 
 ### 1.1 `volo serve` (Default Command)
 
-Starts the HTTP or Unix Domain Socket server, runs idempotent schema migrations (`v6`), warms the full-text search index and public chrome snapshots, starts the scheduled-article publisher and backup scheduler, and traps `SIGINT` / `SIGTERM` for graceful connection draining and deterministic analytics flushing.
+Starts the HTTP or Unix Domain Socket server, runs idempotent schema migrations (`v7`), warms the full-text search index and public chrome snapshots, starts the scheduled-article publisher, plugin Cron scheduler, and backup scheduler, and traps `SIGINT` / `SIGTERM` for graceful connection draining and deterministic analytics flushing.
 
 ```bash
 # Zero-config startup (binds 0.0.0.0:8080 and initializes ./data/volo.db)
@@ -201,7 +201,7 @@ Successful `201 Created` response returning both the full `asset` record and a t
 }
 ```
 
-### 2.4 Category/Bookshelf Batch Reordering & Plugin Archive Export
+### 2.4 Category/Bookshelf Batch Reordering, Plugin Chain Priority & Cron Endpoints
 
 - **`POST /api/admin/categories/reorder`** & **`POST /api/admin/books/reorder`**: Atomically update `sort_order` in a single transaction according to the submitted ID array:
   ```bash
@@ -210,6 +210,8 @@ Successful `201 Created` response returning both the full `asset` record and a t
     -H "Content-Type: application/json" \
     -d '{"ids": ["0196ed8c01", "0196ed8c02", "0196ed8c03"]}'
   ```
+- **`POST /api/admin/plugins/reorder`** & **`PATCH /api/admin/plugins/{id}/priority`** (requires interactive admin session): Reorder the plugin execution chain or set an exact numeric `priority` (`-10000`–`10000`; lower numbers run earlier across all `before_*` interceptable hooks, lifecycle events, UI slots, and same-type `Provider` chains).
+- **`GET /api/admin/plugins/cron`** & **`POST /api/admin/plugins/{id}/trigger-cron`** (requires interactive admin session): Inspect live `CronRegistry` background job metrics (last duration, next run timestamp, recent errors) or trigger a task immediately.
 - **`GET /api/admin/plugins/{id}/export`** (requires interactive admin session): Exports an installed plugin directory as a clean `.zip` package (stripping runtime temp files and never bundling database `secret_ciphertext` values), paired with `POST /api/admin/plugins/install?overwrite=true` for in-place upgrades that preserve existing configuration and encrypted secrets.
 
 ---
@@ -228,6 +230,7 @@ Successful `201 Created` response returning both the full `asset` record and a t
 | `/api/v1/i18n/{locale}` | `GET` | Resolved public locale bundle merged with custom overrides (`ETag` negotiated) |
 | `/api/v1/pow/challenge` | `GET` | Self-hosted `HMAC + SHA-256` Proof-of-Work challenge issuer |
 | `/api/v1/guest/passport` | `GET` / `POST` | Issue or self-heal the 3-tier signed Guest Passport (`__volo_gp`) |
+| `/api/v1/reader/profile` | `PATCH` | Self-service display name, avatar, and bio updates for signed-in readers (validated through the union of host blocked keywords, `provider:antispam` plugins, and `user.before_update_profile` chained interception) |
 | `/api/v1/articles/{id}/unlock` | `POST` | Verify a post or standalone page (`page:<id>`) password and issue a scoped unlock cookie |
-| `/api/v1/comments` | `GET` / `POST` | Fetch paginated threaded comments or submit a PoW-verified comment |
+| `/api/v1/comments` | `GET` / `POST` | Fetch paginated threaded comments or submit a PoW-verified, antispam-screened comment |
 | `/api/v1/reactions` | `POST` | Lightweight emoji reactions on articles and comments |

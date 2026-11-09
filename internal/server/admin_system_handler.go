@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -1519,10 +1518,7 @@ func parseRedirectImportCandidates(formatHint string, rawData []byte) ([]redirec
 		return env.Redirects, nil
 	}
 
-	cr := csv.NewReader(bytes.NewReader(trimmed))
-	cr.FieldsPerRecord = -1
-	cr.TrimLeadingSpace = true
-	records, err := cr.ReadAll()
+	records, err := parseSimpleCSV(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("invalid redirect CSV: %w", err)
 	}
@@ -1554,6 +1550,114 @@ func parseRedirectImportCandidates(formatHint string, rawData []byte) ([]redirec
 	return out, nil
 }
 
+func parseSimpleCSV(data []byte) ([][]string, error) {
+	var records [][]string
+	var rec []string
+	var field strings.Builder
+	i, n := 0, len(data)
+	fieldStart := true
+	inQuotes := false
+
+	for i < n {
+		b := data[i]
+		if inQuotes {
+			if b == '"' {
+				if i+1 < n && data[i+1] == '"' {
+					field.WriteByte('"')
+					i += 2
+					continue
+				}
+				inQuotes = false
+				i++
+				for i < n && (data[i] == ' ' || data[i] == '\t') {
+					i++
+				}
+				if i < n && data[i] != ',' && data[i] != '\r' && data[i] != '\n' {
+					return nil, errors.New("extraneous character after closing quote")
+				}
+				continue
+			}
+			if b == '\r' && i+1 < n && data[i+1] == '\n' {
+				field.WriteByte('\n')
+				i += 2
+				continue
+			}
+			field.WriteByte(b)
+			i++
+			continue
+		}
+
+		if fieldStart && (b == ' ' || b == '\t') {
+			i++
+			continue
+		}
+		if fieldStart && b == '"' {
+			inQuotes = true
+			fieldStart = false
+			i++
+			continue
+		}
+		if b == ',' {
+			rec = append(rec, field.String())
+			field.Reset()
+			fieldStart = true
+			i++
+			continue
+		}
+		if b == '\r' || b == '\n' {
+			if b == '\r' && i+1 < n && data[i+1] == '\n' {
+				i += 2
+			} else {
+				i++
+			}
+			if len(rec) > 0 || field.Len() > 0 || !fieldStart {
+				rec = append(rec, field.String())
+				records = append(records, rec)
+				rec = nil
+				field.Reset()
+			}
+			fieldStart = true
+			continue
+		}
+		if b == '"' {
+			return nil, errors.New("bare quote in non-quoted CSV field")
+		}
+		fieldStart = false
+		field.WriteByte(b)
+		i++
+	}
+	if inQuotes {
+		return nil, errors.New("unterminated quoted CSV field")
+	}
+	if len(rec) > 0 || field.Len() > 0 || !fieldStart {
+		rec = append(rec, field.String())
+		records = append(records, rec)
+	}
+	return records, nil
+}
+
+func appendCSVRecord(buf *bytes.Buffer, fields ...string) {
+	for i, f := range fields {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if strings.ContainsAny(f, ",\"\r\n") {
+			buf.WriteByte('"')
+			for j := 0; j < len(f); j++ {
+				if f[j] == '"' {
+					buf.WriteString(`""`)
+				} else {
+					buf.WriteByte(f[j])
+				}
+			}
+			buf.WriteByte('"')
+		} else {
+			buf.WriteString(f)
+		}
+	}
+	buf.WriteByte('\n')
+}
+
 func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "export" && r.Method == http.MethodGet {
@@ -1565,12 +1669,10 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 		format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 		if format == "csv" {
 			var buf bytes.Buffer
-			cw := csv.NewWriter(&buf)
-			_ = cw.Write([]string{"source_path", "target_path", "status_code"})
+			appendCSVRecord(&buf, "source_path", "target_path", "status_code")
 			for _, row := range rows {
-				_ = cw.Write([]string{row.SourcePath, row.TargetPath, strconv.Itoa(row.StatusCode)})
+				appendCSVRecord(&buf, row.SourcePath, row.TargetPath, strconv.Itoa(row.StatusCode))
 			}
-			cw.Flush()
 			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 			w.Header().Set("Content-Disposition", `attachment; filename="volo-redirects.csv"`)
 			_, _ = w.Write(buf.Bytes())
@@ -2954,7 +3056,44 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 
 	if rest == "" && r.Method == http.MethodGet {
 		list := s.deps.Plugins.List(locale)
-		writeJSON(w, http.StatusOK, map[string]any{"items": list, "plugins": list})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":     list,
+			"plugins":   list,
+			"cron_jobs": s.deps.Plugins.CronJobs(),
+		})
+		return
+	}
+
+	if rest == "cron" && r.Method == http.MethodGet {
+		jobs := s.deps.Plugins.CronJobs()
+		writeJSON(w, http.StatusOK, map[string]any{"items": jobs, "cron_jobs": jobs})
+		return
+	}
+
+	if rest == "reorder" && r.Method == http.MethodPost {
+		var req struct {
+			OrderedIDs []string `json:"ordered_ids"`
+			IDs        []string `json:"ids"`
+		}
+		if !decodeJSONBody(w, r, 65536, &req) {
+			return
+		}
+		ids := req.OrderedIDs
+		if len(ids) == 0 {
+			ids = req.IDs
+		}
+		list, err := s.deps.Plugins.Reorder(r.Context(), ids, locale)
+		if writeBadErr(w, err) {
+			return
+		}
+		s.invalidateMediaRefCache()
+		s.recordAuditLog(r, actor, "plugin.reorder", "plugin", "chain", map[string]any{"count": len(ids)})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":        true,
+			"items":     list,
+			"plugins":   list,
+			"cron_jobs": s.deps.Plugins.CronJobs(),
+		})
 		return
 	}
 
@@ -2963,7 +3102,12 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		list := s.deps.Plugins.List(locale)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": list, "plugins": list})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":        true,
+			"items":     list,
+			"plugins":   list,
+			"cron_jobs": s.deps.Plugins.CronJobs(),
+		})
 		return
 	}
 
@@ -3069,9 +3213,43 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			s.invalidateMediaRefCache()
 			s.recordAuditLog(r, actor, "plugin.config_patch", "plugin", pid, nil)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
+		case parts[1] == "priority" && (r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodPut):
+			var req struct {
+				Priority int `json:"priority"`
+			}
+			if !decodeJSONBody(w, r, 4096, &req) {
+				return
+			}
+			sum, err := s.deps.Plugins.SetPriority(r.Context(), pid, req.Priority, locale)
+			if writeBadErr(w, err) {
+				return
+			}
+			s.invalidateMediaRefCache()
+			s.recordAuditLog(r, actor, "plugin.priority", "plugin", pid, map[string]any{"priority": sum.Priority})
+			list := s.deps.Plugins.List(locale)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum, "items": list, "plugins": list})
 		case parts[1] == "logs" && r.Method == http.MethodGet:
 			entries, _ := s.deps.Plugins.Logger().Tail(pid, 100)
 			writeJSON(w, http.StatusOK, map[string]any{"items": entries})
+		case parts[1] == "cron" && r.Method == http.MethodGet:
+			jobs := s.deps.Plugins.PluginCronJobs(pid)
+			writeJSON(w, http.StatusOK, map[string]any{"items": jobs, "cron_jobs": jobs})
+		case (parts[1] == "cron" || parts[1] == "trigger-cron") && r.Method == http.MethodPost:
+			jobName := strings.TrimSpace(r.URL.Query().Get("name"))
+			if jobName == "" && r.ContentLength != 0 {
+				var body struct {
+					Name string `json:"name"`
+				}
+				_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body)
+				jobName = strings.TrimSpace(body.Name)
+			}
+			triggered := s.deps.Plugins.TriggerCronJob(pid, jobName)
+			s.recordAuditLog(r, actor, "plugin.cron_trigger", "plugin", pid, map[string]any{"name": jobName, "triggered": triggered})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":        true,
+				"triggered": triggered,
+				"cron_jobs": s.deps.Plugins.PluginCronJobs(pid),
+			})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}

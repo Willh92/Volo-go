@@ -1,0 +1,45 @@
+# Volo-go Official Sensitive Dictionary: Safe Allowlist (Span-Safe Exemptions)
+# Includes upstream houbb/sensitive-word-data allowlist plus editorial/technical safe phrases.
+# Any matched sensitive span fully covered by an allowlisted phrase is exempted without
+# blinding adjacent or overlapping violations (e.g., "曹操孟德" passes while "曹操他妈" blocks).
+
+生日快乐
+曹操
+幸运
+幸运儿
+17年前
+1条
+1梯两户
+1比1
+年检
+幸存
+恶搞
+游戏机
+2b铅笔
+gemma-2b
+qwen-2b
+傻瓜相机
+傻瓜式操作
+傻瓜式部署
+傻瓜式安装
+傻瓜教程
+傻白甜
+草泥马玩偶
+羊驼草泥马
+增值税发票抬头
+电子发票报销
+普通发票开具
+办证大厅
+政务服务办证
+压力测试工具
+性能压力测试
+高并发压力测试
+聊天记录备份迁移
+微信官方备份
+企业微信机器人
+微信小程序开发
+黄色预警信号
+黄色高亮标记
+成人礼仪式
+成人高等教育
+成人高考报名

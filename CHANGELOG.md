@@ -4,13 +4,35 @@ All notable changes to `Volo-go` are documented in this file. Format follows [Ke
 
 ---
 
+## [1.0.0-rc6] - 2026-11-09
+
+### Added / 新增特性
+- **Unified Pre-Action Chained Interception & Deterministic Plugin Priority Ordering**:
+  - **Unified `before_*` Interception Protocol**: All pre-action hooks (`comment.before_create`, `comment.before_update`, `user.before_register`, `user.before_update_profile`, `article.before_save`, `page.before_save`, `media.before_upload`, and custom `*.before_*` hooks) share a single chained pipeline supporting `volo.reject(reason, code)` (`return` or `throw` without tripping the circuit breaker), `{ allow: false, reason, code }`, `{ action: "reject", reason }`, `return false`, non-destructive partial payload mutation, and monotonic `status: "pending"` moderation ratcheting.
+  - **Plugin Priority & Chain Sorting**: Every plugin carries an execution `priority` (`manifest.json` `"priority"`, default `100`, range `-1000..10000`; smaller runs earlier, ties broken by `id`) persisted in `plugins.config_json`. Controls deterministic execution order across **all hooks, UI slots, render cache digests, and same-type `ProviderRegistry` chains** (`antispam`, `notifier`, `federation`, `oidc`, `storage`), with one-click `↑` / `↓` / Move-Top reordering (`POST /api/admin/plugins/reorder`) and numeric priority editing (`PATCH /api/admin/plugins/{id}/priority`) in the Admin Plugin Center.
+- **5-Stage Plugin Lifecycle & Min-Heap `CronRegistry`**:
+  - Full 5-stage lifecycle callbacks (`onInstall` -> `onEnable` -> `onConfigChange` -> `onDisable` -> `onUninstall`) across JS and compiled Go plugins, with `Uninstall` invoking `onUninstall()` best-effort before wiping `plugin_kv`, `plugins`, and `./plugins/<id>` on disk.
+  - Built-in min-heap `CronRegistry` (`pkg/plugin/scheduler.go`) supporting declarative `manifest.json` `"cron"` jobs and dynamic `volo.cron.register(name, intervalSec, handlerName, immediate?)` / `unregister` / `list`, bounded worker concurrency, panic recovery, status badges, and one-click manual execution (`POST /api/admin/plugins/{id}/trigger-cron`).
+- **Native CSR/Double-Array Aho-Corasick `pkg/wordfilter` & Official `sensitive-words` Plugin**:
+  - Zero-CGO `pkg/wordfilter` (`volo.wordFilter` SDK) featuring 32-bit CSR / Double-Array Aho-Corasick matching (`O(N)` zero-heap hot-path scanning), 4-pass full-text anti-obfuscation normalization (Simplified/Traditional folding, fullwidth/halfwidth, Zalgo combining-mark stripping, Mathematical/Enclosed/Cyrillic/Greek homoglyph folding, zero-width/separator stripping, and character deduplication), and longest-span `allow` overrides.
+  - Official `./plugins/sensitive-words` plugin (`priority: 20`) bundling a compact `281 KiB` prefix/tag delta-compressed lexicon (`houbb_base.txt.gz`, 6 category toggles), `allowlist.txt`, SSRF-safe remote wordlist sync + ETag cache, and `DELETE /plugins/sensitive-words/api/remote-cache`.
+  - **Strict Union/Merge with Host Settings**: Works additively with host `reading.blocked_keywords` / `allowed_keywords` across reader email OTP preflight (`POST /api/v1/reader/send-code`), registration, OIDC auto-provisioning, reader/editor profile updates (`PATCH /api/v1/reader/profile`, `PUT /api/admin/me`), and comment creation/editing (including `author_url` and post-hook `content_md` re-screening).
+- **Schema `v7`, Step-Up Security & Complete `zh-TW` / `ja-JP` Language Packs**:
+  - Schema `v7` migration, interactive Step-Up password verification for backup exports and OIDC account linking, and complete external `./locales/zh-TW.json` and `./locales/ja-JP.json` packs.
+
+### Changed & Fixed / 优化与安全加固
+- **Zero-Bloat Pure-Go Drivers & Single-Pass HTML5 AST Sanitizer**: Replaced `pgx/v5` with a first-party pure-Go PostgreSQL v3 wire driver (`internal/db/pgwire`, supporting SCRAM-SHA-256, TLS, Extended & Simple Query protocols) and replaced `bluemonday` with a single-pass `golang.org/x/net/html` AST sanitizer (`internal/render/htmlsanitize.go`), cutting binary size to **`~17.3 MiB`** (`< 20 MiB` budget) and downloadable archives to **`< 8 MiB`**.
+- **Sandbox & File-Serving Hardening**: Confined external theme and plugin static assets with `os.OpenInRoot` against symlink escapes, closed default-URL outbound allowlist bypasses on remote wordlist sync, and added `hooks:<domain>.*` wildcard permission token validation.
+
+---
+
 ## [1.0.0] - 2026-11-08
 
 ### Added / 新增特性
 - **Pure-Go Single-Binary Engine & 6-Target Static Matrix (`CGO_ENABLED=0`)**:
   - Cross-platform static single binary (`< 20 MiB` on `linux/amd64` & `arm64`, `< 21 MiB` across all **6 supported release targets**: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`) built with Go `1.27.3` (`GOEXPERIMENT=nojsonv2`), `< 35 MiB` live `VmRSS` (measured `25.17 MiB`), lock-free CAS monotonic ID generator, TCP & Unix Domain Socket listeners (`--socket-mode` / `--socket-group` / `VOLO_SOCKET_MODE` / `VOLO_SOCKET_GROUP`), graceful `SIGTERM` shutdown (`VOLO_SHUTDOWN_TIMEOUT_SEC`), `/healthz` (`{"status","database","uptime_sec"}`), and native Distroless `volo healthcheck`.
   - Multi-layer configuration hierarchy (`CLI Flags > OS VOLO_* Env > .env > Admin DB Settings > Built-in Defaults`), leaving `VOLO_DB_DRIVER` unset by default so the `/setup` wizard's `AES-256-GCM` sealed `data/db.json` (`SQLite` / `PostgreSQL` / `MySQL`) persists across container and service restarts, plus `HKDF-SHA256` subkey derivation.
-  - Unified pure-Go `Dialect` layer supporting **SQLite WAL** (`modernc.org/sqlite` with physically separated writer & `query_only=ON` reader pools and bounded `4 MiB` page cache), **PostgreSQL** (`pgx/v5`, including `--db-simple-protocol` / `VOLO_DB_SIMPLE_PROTOCOL` for PgBouncer/Supabase poolers), and **MySQL 8+ / MariaDB / TiDB**, backed by idempotent schema migrations (`v1`–`v6`).
+  - Unified pure-Go `Dialect` layer supporting **SQLite WAL** (`modernc.org/sqlite` with physically separated writer & `query_only=ON` reader pools and bounded `4 MiB` page cache), **PostgreSQL** (pure-Go PGv3 wire driver `pgwire`, including `--db-simple-protocol` / `VOLO_DB_SIMPLE_PROTOCOL` for PgBouncer/Supabase poolers), and **MySQL 8+ / MariaDB / TiDB**, backed by idempotent schema migrations (`v1`–`v7`).
 - **Normalized Schema (`v6`), Scale APIs & Streaming Migration / Backup**:
   - **33 normalized data tables** (+ `schema_migrations`) across **9 atomic hot-reload settings domains** (`site`, `reading`, `feed`, `seo`, `storage`, `appearance`, `notifications`, `security`, `backup`): direct `articles.category_id`, standalone Markdown `pages` (with custom `template`) and hierarchical `nav_items`, `series`, `books` (`POST /api/admin/{categories,books}/reorder`), `webhook_deliveries` bounded history, `analytics_daily` / `analytics_top_items`, `redirects`, and `plugin_kv`.
   - Automatic `/sitemap.xml` `<sitemapindex>` sharding when public URLs exceed `10,000` entries (`/sitemap-1.xml`, `/sitemap-2.xml`, …) and paginated two-stage `/api/v1/search?q=...&page=...` endpoint.

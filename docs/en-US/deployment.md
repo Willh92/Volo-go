@@ -37,7 +37,7 @@
 | `VOLO_SECRET_KEY` | `--secret-key` | *(auto-generated)* | Master secret (`>= 32` high-entropy chars recommended; auto-generates `0600` `${VOLO_DATA_DIR}/.secret.key` if empty) |
 | `VOLO_DB_DRIVER` | `--db-driver` | *(unset -> `db.json`, fallback `sqlite`)* | Database driver: `sqlite`, `postgres`, or `mysql` (leave unset to preserve `/setup` wizard's `data/db.json`) |
 | `VOLO_DB_DSN` | `--db-dsn` | `${VOLO_DATA_DIR}/volo.db` | Database connection string (SQLite path, PostgreSQL URI, or MySQL DSN) |
-| `VOLO_DB_SIMPLE_PROTOCOL` | `--db-simple-protocol` | `false` | Enable PostgreSQL `pgx` simple query protocol for transaction poolers (Supabase / PgBouncer) |
+| `VOLO_DB_SIMPLE_PROTOCOL` | `--db-simple-protocol` | `false` | Enable PostgreSQL pure-Go `pgwire` simple query protocol for transaction poolers (Supabase / PgBouncer) |
 | `VOLO_DB_MAX_OPEN_CONNS` | — | `25` | Max open DB connections (`1`–`500`; SQLite writer pool is pinned to `1`) |
 | `VOLO_DB_MAX_IDLE_CONNS` | — | `5` | Max idle DB connections (`0`–`500`) |
 | `VOLO_DB_CONN_MAX_LIFETIME_SEC` | — | `1800` | Max DB connection lifetime in seconds (`10`–`86400`) |

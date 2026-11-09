@@ -19,6 +19,7 @@ import (
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/pkg/id"
@@ -777,6 +778,8 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 
 func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName, avatarURL, providerName, credKey string) (domain.User, error) {
 	now := time.Now().UnixMilli()
+	locale := s.resolveLocale(r)
+	maskedIP := security.MaskIP(s.clientIP(r))
 	localPart := normEmail
 	if at := strings.IndexByte(normEmail, '@'); at > 0 {
 		localPart = normEmail[:at]
@@ -788,16 +791,42 @@ func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName
 	if len(baseUsername) > 24 {
 		baseUsername = baseUsername[:24]
 	}
-	var suffixBytes [4]byte
-	_, _ = rand.Read(suffixBytes[:])
-	username := baseUsername + "_" + hex.EncodeToString(suffixBytes[:])
-
-	disp := strings.TrimSpace(displayName)
-	if disp == "" {
-		disp = localPart
+	if s.deps.Auth != nil && s.deps.Auth.ValidateNickname(r.Context(), baseUsername, normEmail, maskedIP, "", locale, "oidc_register") != nil {
+		baseUsername = "reader"
 	}
-	if len([]rune(disp)) > 64 {
-		disp = string([]rune(disp)[:64])
+	var username string
+	var lastNickErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		var suffixBytes [4]byte
+		_, _ = rand.Read(suffixBytes[:])
+		cand := baseUsername + "_" + hex.EncodeToString(suffixBytes[:])
+		if s.deps.Auth == nil {
+			username = cand
+			lastNickErr = nil
+			break
+		}
+		if nErr := s.deps.Auth.ValidateNickname(r.Context(), cand, normEmail, maskedIP, "", locale, "oidc_register"); nErr == nil {
+			username = cand
+			lastNickErr = nil
+			break
+		} else {
+			lastNickErr = nErr
+			baseUsername = "reader"
+		}
+	}
+	if lastNickErr != nil {
+		return domain.User{}, lastNickErr
+	}
+
+	disp := strings.TrimSpace(repo.StripASCIIControls(displayName))
+	if disp == "" {
+		disp = strings.TrimSpace(repo.StripASCIIControls(localPart))
+	}
+	if runes := []rune(disp); len(runes) > 48 {
+		disp = string(runes[:48])
+	}
+	if len([]rune(disp)) < 2 || (s.deps.Auth != nil && disp != username && s.deps.Auth.ValidateNickname(r.Context(), disp, normEmail, maskedIP, "", locale, "oidc_register") != nil) {
+		disp = username
 	}
 
 	cleanAvatar := ""

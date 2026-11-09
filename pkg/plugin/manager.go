@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,10 +53,14 @@ type SecretSealer interface {
 	Open(ciphertext string) (string, error)
 }
 
-// HookRejectedError signals an intentional business-rule rejection returned by a pre-action hook (e.g. comment.before_create).
+const reservedPluginPriorityKey = "__volo_priority__"
+
+// HookRejectedError signals an intentional business-rule rejection returned by a pre-action hook (`before_*`).
 type HookRejectedError struct {
 	PluginID string
+	Hook     string
 	Reason   string
+	Code     string
 }
 
 func (e *HookRejectedError) Error() string {
@@ -166,11 +171,33 @@ func (BaseBuiltinPlugin) ServeAPI(context.Context, APIRequest) (APIResponse, err
 func (BaseBuiltinPlugin) RunCron(context.Context, string) error { return nil }
 func (BaseBuiltinPlugin) AllowProtectedArticles() bool          { return false }
 
+// ConfigChangeListener is an optional interface that BuiltinPlugin implementations may implement
+// to react immediately when plugin configuration is updated at runtime (e.g. rescheduling cron tasks).
+type ConfigChangeListener interface {
+	OnConfigChange(ctx context.Context, cfg map[string]any) error
+}
+
+// UninstallListener is an optional interface for BuiltinPlugin implementations mirroring JS onUninstall().
+type UninstallListener interface {
+	OnUninstall(ctx context.Context) error
+}
+
+func safeCallBuiltin(pluginID string, stage string, fn func() error) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("plugin %q: panic in %s: %v", pluginID, stage, rec)
+		}
+	}()
+	return fn()
+}
+
 // HostContext exposes capability-scoped host services to a BuiltinPlugin.
 type HostContext struct {
 	PluginID     string
 	KV           *KVStore
 	Providers    *ProviderRegistry
+	cron         *CronRegistry
+	hasCronPerm  bool
 	logger       *PluginLogger
 	hostI18n     *i18n.Catalog
 	getConfig    func() map[string]any
@@ -202,29 +229,56 @@ func (h *HostContext) T(locale, key string, vars ...map[string]any) string {
 func (h *HostContext) NewHTTPClient(timeout time.Duration) *http.Client {
 	return h.dialer.NewHTTPClient(timeout)
 }
+func (h *HostContext) RegisterCron(spec CronSpec, immediate bool) error {
+	if !h.hasCronPerm || h.cron == nil {
+		return errors.New("plugin: cron permission is not declared")
+	}
+	return h.cron.RegisterJob(h.PluginID, spec, CronSourceDynamic, immediate)
+}
+func (h *HostContext) UnregisterCron(name string) bool {
+	if !h.hasCronPerm || h.cron == nil {
+		return false
+	}
+	return h.cron.UnregisterJob(h.PluginID, name)
+}
+func (h *HostContext) TriggerCron(name string) int {
+	if !h.hasCronPerm || h.cron == nil {
+		return 0
+	}
+	return h.cron.Trigger(h.PluginID, name)
+}
+func (h *HostContext) CronJobs() []CronJobSnapshot {
+	if h.cron == nil {
+		return []CronJobSnapshot{}
+	}
+	return h.cron.ListJobs(h.PluginID)
+}
 
 // PluginSummary is the safe, secret-masked view returned to Admin REST APIs.
 type PluginSummary struct {
-	ID            string          `json:"id"`
-	Kind          string          `json:"kind"` // builtin | external
-	Runtime       string          `json:"runtime"`
-	Version       string          `json:"version"`
-	Name          string          `json:"name"`
-	Description   string          `json:"description"`
-	Author        string          `json:"author,omitempty"`
-	Homepage      string          `json:"homepage,omitempty"`
-	IsEnabled     bool            `json:"is_enabled"`
-	CircuitState  string          `json:"circuit_state"`
-	FailureCount  int             `json:"failure_count"`
-	LastError     string          `json:"last_error,omitempty"`
-	Permissions   []string        `json:"permissions"`
-	AllowedHosts  []string        `json:"allowed_hosts"`
-	ConfigSchema  []ConfigField   `json:"config_schema"`
-	PublicConfig  map[string]any  `json:"public_config"`
-	Config        map[string]any  `json:"config,omitempty"`
-	SecretKeysSet map[string]bool `json:"secret_keys_set"`
-	InstalledAt   int64           `json:"installed_at"`
-	UpdatedAt     int64           `json:"updated_at"`
+	ID            string            `json:"id"`
+	Kind          string            `json:"kind"` // builtin | external
+	Runtime       string            `json:"runtime"`
+	Version       string            `json:"version"`
+	Priority      int               `json:"priority"`
+	Name          string            `json:"name"`
+	Description   string            `json:"description"`
+	Author        string            `json:"author,omitempty"`
+	Homepage      string            `json:"homepage,omitempty"`
+	IsEnabled     bool              `json:"is_enabled"`
+	CircuitState  string            `json:"circuit_state"`
+	FailureCount  int               `json:"failure_count"`
+	LastError     string            `json:"last_error,omitempty"`
+	Permissions   []string          `json:"permissions"`
+	Hooks         []string          `json:"hooks,omitempty"`
+	AllowedHosts  []string          `json:"allowed_hosts"`
+	ConfigSchema  []ConfigField     `json:"config_schema"`
+	PublicConfig  map[string]any    `json:"public_config"`
+	Config        map[string]any    `json:"config,omitempty"`
+	SecretKeysSet map[string]bool   `json:"secret_keys_set"`
+	CronJobs      []CronJobSnapshot `json:"cron_jobs,omitempty"`
+	InstalledAt   int64             `json:"installed_at"`
+	UpdatedAt     int64             `json:"updated_at"`
 }
 
 // EditorQuickInsertView describes a localized quick-insert button for CodeMirror 6.
@@ -254,26 +308,84 @@ type ManagerOptions struct {
 }
 
 type managedPlugin struct {
-	mu           sync.Mutex
-	manifest     Manifest
-	kind         string // "builtin" | "external"
-	pluginDir    string
-	builtin      BuiltinPlugin
-	gojaRT       *gojaPluginRuntime
-	kv           *KVStore
-	enabled      bool
-	circuitState string
-	failureCount int
-	lastError    string
-	installedAt  int64
-	updatedAt    int64
+	mu             sync.Mutex
+	manifest       Manifest
+	kind           string // "builtin" | "external"
+	pluginDir      string
+	builtin        BuiltinPlugin
+	gojaRT         *gojaPluginRuntime
+	kv             *KVStore
+	enabled        bool
+	priority       int
+	customPriority bool
+	prioritySnap   atomic.Int64
+	circuitState   string
+	failureCount   int
+	lastError      string
+	installedAt    int64
+	updatedAt      int64
 
 	publicConfig  map[string]any
 	secretConfig  map[string]string
 	mergedCfgSnap atomic.Pointer[map[string]any]
+}
 
-	cronCancel context.CancelFunc
-	cronWG     sync.WaitGroup
+func (mp *managedPlugin) setPriorityLocked(p int, custom bool) {
+	clamped := ClampPluginPriority(p)
+	mp.priority = clamped
+	mp.customPriority = custom
+	mp.prioritySnap.Store(int64(clamped))
+}
+
+func (mp *managedPlugin) getPriority() int {
+	return int(mp.prioritySnap.Load())
+}
+
+func parsePriorityInt(raw any) (int, bool) {
+	switch v := raw.(type) {
+	case int:
+		return ClampPluginPriority(v), true
+	case int64:
+		return ClampPluginPriority(int(v)), true
+	case float64:
+		return ClampPluginPriority(int(v)), true
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return ClampPluginPriority(int(n)), true
+		}
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return ClampPluginPriority(n), true
+		}
+	}
+	return 0, false
+}
+
+func extractPluginPriorityFromMap(rawMap map[string]any, defPriority int) (int, bool) {
+	if rawMap == nil {
+		return ClampPluginPriority(defPriority), false
+	}
+	raw, exists := rawMap[reservedPluginPriorityKey]
+	delete(rawMap, reservedPluginPriorityKey)
+	if !exists {
+		return ClampPluginPriority(defPriority), false
+	}
+	if p, ok := parsePriorityInt(raw); ok {
+		return p, true
+	}
+	return ClampPluginPriority(defPriority), false
+}
+
+func marshalPluginConfigJSON(pubCfg map[string]any, priority int, custom bool) ([]byte, error) {
+	if !custom {
+		return json.Marshal(pubCfg)
+	}
+	withMeta := make(map[string]any, len(pubCfg)+1)
+	for k, v := range pubCfg {
+		withMeta[k] = v
+	}
+	withMeta[reservedPluginPriorityKey] = ClampPluginPriority(priority)
+	return json.Marshal(withMeta)
 }
 
 func (mp *managedPlugin) rebuildConfigSnapshot() {
@@ -296,7 +408,7 @@ func (mp *managedPlugin) getConfigMap() map[string]any {
 }
 
 // Manager orchestrates built-in and external goja plugins, persistent plugin_kv, capability sandboxes,
-// automatic circuit breaking, .zip hot installation, cron scheduling, and /plugins/<id>/* HTTP serving.
+// automatic circuit breaking, .zip hot installation, unified cron scheduling, and /plugins/<id>/* HTTP serving.
 type Manager struct {
 	mu                    sync.RWMutex
 	store                 *sqlx.Store
@@ -307,6 +419,7 @@ type Manager struct {
 	logger                *PluginLogger
 	catalog               *i18n.Catalog
 	providers             *ProviderRegistry
+	cron                  *CronRegistry
 	hookTimeout           time.Duration
 	routeTimeout          time.Duration
 	cronTimeout           time.Duration
@@ -352,7 +465,7 @@ func NewManager(opts ManagerOptions) *Manager {
 	if sealer == nil && opts.Keys != nil {
 		sealer = normalizeSealer(opts.Keys.SecretBox())
 	}
-	return &Manager{
+	mgr := &Manager{
 		store:                 opts.Store,
 		keys:                  opts.Keys,
 		sealer:                sealer,
@@ -369,6 +482,15 @@ func NewManager(opts ManagerOptions) *Manager {
 		allowLoopbackForTests: opts.AllowLoopbackForTests,
 		plugins:               make(map[string]*managedPlugin),
 	}
+	mgr.cron = newCronRegistry(defaultMaxCronConcurrency, mgr.effectiveCronUnit, mgr.executeScheduledCron)
+	return mgr
+}
+
+func (m *Manager) effectiveCronUnit() time.Duration {
+	if m != nil && m.cronBaseUnit > 0 {
+		return m.cronBaseUnit
+	}
+	return time.Second
 }
 
 func normalizeSealer(s SecretSealer) SecretSealer {
@@ -419,6 +541,30 @@ func (m *Manager) unsealSecretValue(val string) string {
 
 func (m *Manager) Providers() *ProviderRegistry { return m.providers }
 func (m *Manager) Logger() *PluginLogger        { return m.logger }
+
+// CronJobs returns snapshots of all active scheduled plugin tasks in the unified CronRegistry.
+func (m *Manager) CronJobs() []CronJobSnapshot {
+	if m == nil || m.cron == nil {
+		return []CronJobSnapshot{}
+	}
+	return m.cron.ListJobs("")
+}
+
+// PluginCronJobs returns snapshots of scheduled tasks registered by pluginID.
+func (m *Manager) PluginCronJobs(pluginID string) []CronJobSnapshot {
+	if m == nil || m.cron == nil {
+		return []CronJobSnapshot{}
+	}
+	return m.cron.ListJobs(pluginID)
+}
+
+// TriggerCronJob schedules one job (or all jobs of pluginID when name == "") for immediate execution.
+func (m *Manager) TriggerCronJob(pluginID string, name string) int {
+	if m == nil || m.cron == nil {
+		return 0
+	}
+	return m.cron.Trigger(pluginID, name)
+}
 
 // SetSiteInfoFunc registers a host callback returning sanitized site metadata for volo.site.info().
 func (m *Manager) SetSiteInfoFunc(fn func() map[string]any) {
@@ -598,12 +744,19 @@ func (m *Manager) ClearPluginKV(ctx context.Context, pluginID string) (int64, er
 	if !validPluginIDRe.MatchString(idClean) {
 		return 0, fmt.Errorf("plugin: invalid plugin id %q", pluginID)
 	}
-	if _, ok := m.getPlugin(idClean); !ok {
+	mp, ok := m.getPlugin(idClean)
+	if !ok {
 		return 0, fmt.Errorf("plugin %q not found", idClean)
 	}
 	res, err := m.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, idClean)
 	if err != nil {
 		return 0, err
+	}
+	mp.mu.Lock()
+	rt := mp.gojaRT
+	mp.mu.Unlock()
+	if rt != nil {
+		rt.clearWordMatchers()
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
@@ -707,6 +860,8 @@ func (m *Manager) syncRecordWithDB(
 
 	var pubCfg map[string]any
 	var secretCfg map[string]string
+	effPriority := manifest.DefaultPriority()
+	hasCustomPriority := false
 
 	if errors.Is(err, sql.ErrNoRows) {
 		defPub, defSec, _ := manifest.ValidateAndMergeConfig(nil, nil, nil)
@@ -721,7 +876,7 @@ func (m *Manager) syncRecordWithDB(
 		}
 		pubCfg = defPub
 		secretCfg = defSec
-		cfgBytes, _ := json.Marshal(pubCfg)
+		cfgBytes, _ := marshalPluginConfigJSON(pubCfg, effPriority, false)
 		secCipher, sErr := m.sealSecrets(manifest.ID, secretCfg)
 		if sErr != nil {
 			return nil, sErr
@@ -758,6 +913,7 @@ func (m *Manager) syncRecordWithDB(
 	} else {
 		var rawPub map[string]any
 		_ = json.Unmarshal([]byte(existing.ConfigJSON), &rawPub)
+		effPriority, hasCustomPriority = extractPluginPriorityFromMap(rawPub, manifest.DefaultPriority())
 		openedSec := m.openSecretsLenient(manifest.ID, existing.SecretCiphertext)
 		defPub, defSec, vErr := manifest.ValidateAndMergeConfig(nil, rawPub, openedSec)
 		if vErr == nil {
@@ -808,7 +964,11 @@ func (m *Manager) syncRecordWithDB(
 		publicConfig: pubCfg,
 		secretConfig: secretCfg,
 	}
+	mp.setPriorityLocked(effPriority, hasCustomPriority)
 	mp.rebuildConfigSnapshot()
+	if m.providers != nil {
+		m.providers.SetPluginPriority(manifest.ID, effPriority)
+	}
 	return mp, nil
 }
 
@@ -859,33 +1019,32 @@ func (m *Manager) openSecretsLenient(pluginID string, ciphertext string) map[str
 }
 
 func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error {
-	mp.mu.Lock()
-	prevCancel := mp.cronCancel
-	mp.cronCancel = nil
-	mp.mu.Unlock()
-
-	if prevCancel != nil {
-		prevCancel()
+	if m.cron != nil {
+		m.cron.UnregisterPlugin(mp.manifest.ID, true)
 	}
-	mp.cronWG.Wait()
 
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	if mp.cronCancel != nil {
-		mp.cronCancel()
-		mp.cronCancel = nil
-	}
 	m.providers.DetachPlugin(mp.manifest.ID)
+	hasCronPerm := mp.manifest.HasPermission("cron")
+	if hasCronPerm && m.cron != nil {
+		m.cron.BeginPlugin(mp.manifest.ID)
+	}
 
 	if mp.manifest.Runtime == RuntimeBuiltin {
 		if mp.builtin == nil {
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			return fmt.Errorf("plugin %q: missing builtin implementation", mp.manifest.ID)
 		}
 		hostCtx := &HostContext{
 			PluginID:     mp.manifest.ID,
 			KV:           mp.kv,
 			Providers:    m.providers,
+			cron:         m.cron,
+			hasCronPerm:  hasCronPerm,
 			logger:       m.logger,
 			hostI18n:     m.catalog,
 			getConfig:    mp.getConfigMap,
@@ -897,8 +1056,13 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 				AllowLoopbackForTests: m.allowLoopbackForTests,
 			},
 		}
-		if err := mp.builtin.OnEnable(ctx, hostCtx); err != nil {
+		if err := safeCallBuiltin(mp.manifest.ID, "OnEnable", func() error {
+			return mp.builtin.OnEnable(ctx, hostCtx)
+		}); err != nil {
 			m.providers.DetachPlugin(mp.manifest.ID)
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			return err
 		}
 	} else {
@@ -906,6 +1070,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			manifest:              mp.manifest,
 			pluginDir:             mp.pluginDir,
 			kv:                    mp.kv,
+			cron:                  m.cron,
 			logger:                m.logger,
 			hostI18n:              m.catalog,
 			getConfig:             mp.getConfigMap,
@@ -915,6 +1080,9 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		})
 		if err != nil {
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			return err
 		}
 		mp.gojaRT = rt
@@ -922,6 +1090,10 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 		// Optional JS lifecycle hook onEnable().
 		if _, _, err := rt.invoke(ctx, m.hookTimeout, "onEnable"); err != nil {
 			mp.gojaRT = nil
+			rt.closeRuntime()
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			return err
 		}
 
@@ -956,7 +1128,13 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 		}
 	}
 
-	m.startCronLocked(mp)
+	if hasCronPerm && m.cron != nil {
+		for _, spec := range mp.manifest.Cron {
+			if !m.cron.HasJob(mp.manifest.ID, spec.Name) {
+				_ = m.cron.RegisterJob(mp.manifest.ID, spec, CronSourceManifest, false)
+			}
+		}
+	}
 	m.logger.Write(mp.manifest.ID, "info", "lifecycle", "plugin enabled v"+mp.manifest.Version)
 	return nil
 }
@@ -966,17 +1144,9 @@ func (m *Manager) deactivateRuntime(ctx context.Context, mp *managedPlugin) {
 }
 
 func (m *Manager) deactivateRuntimeOpts(ctx context.Context, mp *managedPlugin, waitCron bool) {
-	mp.mu.Lock()
-	cancel := mp.cronCancel
-	mp.cronCancel = nil
-	mp.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	// Never call mp.cronWG.Wait() while holding mp.mu.Lock() or from inside a cron goroutine itself!
-	if waitCron {
-		mp.cronWG.Wait()
+	// Never pass wait=true from inside a cron worker goroutine of the same plugin!
+	if m.cron != nil {
+		m.cron.UnregisterPlugin(mp.manifest.ID, waitCron)
 	}
 
 	mp.mu.Lock()
@@ -988,52 +1158,30 @@ func (m *Manager) deactivateRuntimeOpts(ctx context.Context, mp *managedPlugin, 
 	mp.mu.Unlock()
 
 	if runtimeKind == RuntimeBuiltin && builtin != nil {
-		_ = builtin.OnDisable(ctx)
+		_ = safeCallBuiltin(mp.manifest.ID, "OnDisable", func() error {
+			return builtin.OnDisable(ctx)
+		})
 	} else if rt != nil {
 		_, _, _ = rt.invoke(ctx, m.hookTimeout, "onDisable")
+		rt.closeRuntime()
 	}
 	m.logger.Write(mp.manifest.ID, "info", "lifecycle", "plugin disabled")
 }
 
-func (m *Manager) startCronLocked(mp *managedPlugin) {
-	if len(mp.manifest.Cron) == 0 || !mp.manifest.HasPermission("cron") {
-		return
+func (m *Manager) executeScheduledCron(parentCtx context.Context, pluginID string, jobName string, handler string) error {
+	mp, ok := m.getPlugin(pluginID)
+	if !ok {
+		return nil
 	}
-	cronCtx, cancel := context.WithCancel(context.Background())
-	mp.cronCancel = cancel
-	unit := m.cronBaseUnit
-	if unit <= 0 {
-		unit = time.Second
+	runCtx, runCancel := context.WithTimeout(parentCtx, m.cronTimeout)
+	err := m.runSingleCron(runCtx, mp, handler)
+	runCancel()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.recordFailureWithOrigin(context.Background(), mp, "cron:"+jobName, err, true)
+	} else if err == nil {
+		m.recordSuccess(context.Background(), mp)
 	}
-
-	for _, spec := range mp.manifest.Cron {
-		job := spec
-		interval := time.Duration(job.IntervalSeconds) * unit
-		if interval <= 0 {
-			interval = time.Second
-		}
-		mp.cronWG.Add(1)
-		go func() {
-			defer mp.cronWG.Done()
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-cronCtx.Done():
-					return
-				case <-ticker.C:
-					runCtx, runCancel := context.WithTimeout(cronCtx, m.cronTimeout)
-					err := m.runSingleCron(runCtx, mp, job.Handler)
-					runCancel()
-					if err != nil && !errors.Is(err, context.Canceled) {
-						m.recordFailureWithOrigin(context.Background(), mp, "cron:"+job.Name, err, true)
-					} else if err == nil {
-						m.recordSuccess(context.Background(), mp)
-					}
-				}
-			}
-		}()
-	}
+	return err
 }
 
 func (m *Manager) runSingleCron(ctx context.Context, mp *managedPlugin, handler string) error {
@@ -1048,7 +1196,9 @@ func (m *Manager) runSingleCron(ctx context.Context, mp *managedPlugin, handler 
 		return nil
 	}
 	if runtimeKind == RuntimeBuiltin && bp != nil {
-		return bp.RunCron(ctx, handler)
+		return safeCallBuiltin(mp.manifest.ID, "RunCron:"+handler, func() error {
+			return bp.RunCron(ctx, handler)
+		})
 	}
 	if rt != nil {
 		_, _, err := rt.invoke(ctx, m.cronTimeout, handler)
@@ -1139,15 +1289,30 @@ func (m *Manager) ResetCircuit(ctx context.Context, pluginID string) error {
 }
 
 // UpdateConfig validates a partial/full config patch against ConfigSchema, seals secret fields with AES-256-GCM,
-// persists to DB, and atomically refreshes the live in-memory config snapshot without restarting VMs.
+// persists to DB, atomically refreshes the live in-memory config snapshot without restarting VMs, and notifies
+// optional onConfigChange(cfg) hooks (e.g. to reschedule dynamic cron jobs).
 func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[string]any, locale string) (PluginSummary, error) {
 	mp, ok := m.getPlugin(pluginID)
 	if !ok {
 		return PluginSummary{}, fmt.Errorf("plugin: %q not found", pluginID)
 	}
 
+	cleanPatch := make(map[string]any, len(patch))
+	var patchPriority int
+	hasPatchPriority := false
+	for k, v := range patch {
+		if k == reservedPluginPriorityKey {
+			if p, pOk := parsePriorityInt(v); pOk {
+				patchPriority = p
+				hasPatchPriority = true
+			}
+			continue
+		}
+		cleanPatch[k] = v
+	}
+
 	mp.mu.Lock()
-	nextPub, nextSec, err := mp.manifest.ValidateAndMergeConfig(patch, mp.publicConfig, mp.secretConfig)
+	nextPub, nextSec, err := mp.manifest.ValidateAndMergeConfig(cleanPatch, mp.publicConfig, mp.secretConfig)
 	if err != nil {
 		mp.mu.Unlock()
 		return PluginSummary{}, err
@@ -1157,7 +1322,7 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 			if v == "" {
 				continue
 			}
-			rawPatch, inPatch := patch[k]
+			rawPatch, inPatch := cleanPatch[k]
 			rawStr, isStr := rawPatch.(string)
 			needsSeal := false
 			if inPatch && isStr && rawStr != SecretMaskSentinel && rawStr != mp.secretConfig[k] {
@@ -1175,7 +1340,13 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 			}
 		}
 	}
-	cfgBytes, err := json.Marshal(nextPub)
+	nextPriority := mp.priority
+	nextCustomPrio := mp.customPriority
+	if hasPatchPriority {
+		nextPriority = patchPriority
+		nextCustomPrio = true
+	}
+	cfgBytes, err := marshalPluginConfigJSON(nextPub, nextPriority, nextCustomPrio)
 	if err != nil {
 		mp.mu.Unlock()
 		return PluginSummary{}, err
@@ -1188,9 +1359,19 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 	now := time.Now().Unix()
 	mp.publicConfig = nextPub
 	mp.secretConfig = nextSec
+	mp.setPriorityLocked(nextPriority, nextCustomPrio)
 	mp.updatedAt = now
 	mp.rebuildConfigSnapshot()
+	isActive := mp.enabled && mp.circuitState == CircuitClosed
+	runtimeKind := mp.manifest.Runtime
+	bp := mp.builtin
+	rt := mp.gojaRT
+	cfgSnap := mp.getConfigMap()
 	mp.mu.Unlock()
+
+	if hasPatchPriority && m.providers != nil {
+		m.providers.SetPluginPriority(pluginID, nextPriority)
+	}
 
 	if _, err := m.store.ExecContext(
 		ctx,
@@ -1198,6 +1379,34 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 		string(cfgBytes), secCipher, now, pluginID,
 	); err != nil {
 		return PluginSummary{}, err
+	}
+
+	if isActive {
+		cfgCopy := make(map[string]any, len(cfgSnap))
+		for k, v := range cfgSnap {
+			if s, ok := v.(string); ok && strings.HasPrefix(s, "v1:") {
+				cfgCopy[k] = m.unsealSecretValue(s)
+			} else {
+				cfgCopy[k] = v
+			}
+		}
+		if runtimeKind == RuntimeBuiltin && bp != nil {
+			if listener, lOk := bp.(ConfigChangeListener); lOk {
+				if cErr := safeCallBuiltin(pluginID, "OnConfigChange", func() error {
+					return listener.OnConfigChange(ctx, cfgCopy)
+				}); cErr != nil {
+					m.recordFailure(ctx, mp, "config_change", cErr)
+				} else {
+					m.recordSuccess(ctx, mp)
+				}
+			}
+		} else if rt != nil && rt.hasCallable("onConfigChange") {
+			if _, _, cErr := rt.invoke(ctx, m.hookTimeout, "onConfigChange", cfgCopy); cErr != nil {
+				m.recordFailure(ctx, mp, "config_change", cErr)
+			} else {
+				m.recordSuccess(ctx, mp)
+			}
+		}
 	}
 
 	m.logger.Write(pluginID, "info", "config", "configuration hot-reloaded")
@@ -1654,9 +1863,11 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 		return PluginSummary{}, err
 	}
 
-	// Check existing plugin conflict.
+	// Check existing plugin conflict and capture previous version for onInstall lifecycle hook.
 	targetDir := filepath.Join(m.pluginsDir, manifest.ID)
 	existingMP, exists := m.getPlugin(manifest.ID)
+	prevVersion := ""
+	isUpgrade := false
 	if exists {
 		if existingMP.kind == "builtin" {
 			return PluginSummary{}, fmt.Errorf("plugin %q conflicts with a built-in plugin", manifest.ID)
@@ -1664,9 +1875,17 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 		if !overwrite {
 			return PluginSummary{}, fmt.Errorf("plugin %q is already installed (set overwrite=true to upgrade)", manifest.ID)
 		}
+		prevVersion = existingMP.manifest.Version
+		isUpgrade = true
 		_ = m.Disable(ctx, manifest.ID)
-	} else if _, statErr := os.Stat(targetDir); statErr == nil && !overwrite {
-		return PluginSummary{}, fmt.Errorf("plugin directory %q already exists", manifest.ID)
+	} else {
+		if _, statErr := os.Stat(targetDir); statErr == nil && !overwrite {
+			return PluginSummary{}, fmt.Errorf("plugin directory %q already exists", manifest.ID)
+		}
+		if dbRec, dbErr := sqlx.Get[domain.PluginRecord](ctx, m.store, `SELECT version FROM plugins WHERE id = ?`, manifest.ID); dbErr == nil && dbRec.Version != "" {
+			prevVersion = dbRec.Version
+			isUpgrade = true
+		}
 	}
 
 	backupDir := filepath.Join(m.pluginsDir, ".backup-"+manifest.ID+"-"+id.Next())
@@ -1695,6 +1914,32 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
 
+	// Optional bounded onInstall({ previous_version, version, is_upgrade }) lifecycle hook on fresh install or version upgrade.
+	if !isUpgrade || prevVersion != manifest.Version {
+		if installRT, rtErr := newGojaPluginRuntime(gojaRuntimeOptions{
+			manifest:              mp.manifest,
+			pluginDir:             mp.pluginDir,
+			kv:                    mp.kv,
+			cron:                  m.cron,
+			logger:                m.logger,
+			hostI18n:              m.catalog,
+			getConfig:             mp.getConfigMap,
+			unsealSecret:          m.unsealSecretValue,
+			getSiteInfo:           m.getSiteInfo,
+			customResolver:        m.customResolver,
+			allowLoopbackForTests: m.allowLoopbackForTests,
+		}); rtErr == nil {
+			if installRT.hasCallable("onInstall") {
+				_, _, _ = installRT.invoke(ctx, m.hookTimeout, "onInstall", map[string]any{
+					"previous_version": prevVersion,
+					"version":          manifest.Version,
+					"is_upgrade":       isUpgrade,
+				})
+			}
+			installRT.closeRuntime()
+		}
+	}
+
 	m.logger.Write(manifest.ID, "info", "install", "installed external plugin v"+manifest.Version)
 	return m.toSummary(mp, locale), nil
 }
@@ -1711,11 +1956,18 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 	_ = m.Disable(ctx, pluginID)
 
 	// Best-effort bounded onUninstall() lifecycle hook before deleting plugin_kv, config, and directory.
-	if mp.manifest.Runtime != RuntimeBuiltin && mp.pluginDir != "" {
+	if mp.manifest.Runtime == RuntimeBuiltin && mp.builtin != nil {
+		if listener, lOk := mp.builtin.(UninstallListener); lOk {
+			_ = safeCallBuiltin(pluginID, "OnUninstall", func() error {
+				return listener.OnUninstall(ctx)
+			})
+		}
+	} else if mp.manifest.Runtime != RuntimeBuiltin && mp.pluginDir != "" {
 		if tempRT, rtErr := newGojaPluginRuntime(gojaRuntimeOptions{
 			manifest:              mp.manifest,
 			pluginDir:             mp.pluginDir,
 			kv:                    mp.kv,
+			cron:                  m.cron,
 			logger:                m.logger,
 			hostI18n:              m.catalog,
 			getConfig:             mp.getConfigMap,
@@ -1725,7 +1977,11 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		}); rtErr == nil {
 			_, _, _ = tempRT.invoke(ctx, m.hookTimeout, "onUninstall")
+			tempRT.closeRuntime()
 		}
+	}
+	if m.cron != nil {
+		m.cron.UnregisterPlugin(pluginID, true)
 	}
 
 	m.mu.Lock()
@@ -1751,19 +2007,145 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 	return nil
 }
 
-// List returns secret-masked summaries of all registered plugins in deterministic ID order.
-func (m *Manager) List(locale string) []PluginSummary {
-	m.mu.RLock()
-	ids := make([]string, 0, len(m.plugins))
-	for k := range m.plugins {
-		ids = append(ids, k)
+// SetPriority updates a single plugin's execution priority (smaller value runs earlier in chains),
+// immediately re-sorting all active hook/slot/provider chains and persisting the order.
+func (m *Manager) SetPriority(ctx context.Context, pluginID string, priority int, locale string) (PluginSummary, error) {
+	mp, ok := m.getPlugin(pluginID)
+	if !ok {
+		return PluginSummary{}, fmt.Errorf("plugin: %q not found", pluginID)
 	}
-	sort.Strings(ids)
-	mps := make([]*managedPlugin, 0, len(ids))
-	for _, k := range ids {
-		mps = append(mps, m.plugins[k])
+	clamped := ClampPluginPriority(priority)
+	now := time.Now().Unix()
+
+	mp.mu.Lock()
+	cfgBytes, err := marshalPluginConfigJSON(mp.publicConfig, clamped, true)
+	if err != nil {
+		mp.mu.Unlock()
+		return PluginSummary{}, err
+	}
+	mp.setPriorityLocked(clamped, true)
+	mp.updatedAt = now
+	mp.mu.Unlock()
+
+	if m.providers != nil {
+		m.providers.SetPluginPriority(pluginID, clamped)
+	}
+	if _, err := m.store.ExecContext(
+		ctx,
+		`UPDATE plugins SET config_json = ?, updated_at = ? WHERE id = ?`,
+		string(cfgBytes), now, pluginID,
+	); err != nil {
+		return PluginSummary{}, err
+	}
+	return m.toSummary(mp, locale), nil
+}
+
+// Reorder assigns spaced execution priorities (10, 20, 30, ...) according to orderedIDs,
+// preserving relative order for any registered plugins omitted from orderedIDs.
+func (m *Manager) Reorder(ctx context.Context, orderedIDs []string, locale string) ([]PluginSummary, error) {
+	m.mu.RLock()
+	existing := make([]*managedPlugin, 0, len(m.plugins))
+	byID := make(map[string]*managedPlugin, len(m.plugins))
+	for id, mp := range m.plugins {
+		existing = append(existing, mp)
+		byID[id] = mp
 	}
 	m.mu.RUnlock()
+
+	sortManagedPluginsByPriority(existing)
+
+	seen := make(map[string]bool, len(existing))
+	finalOrder := make([]*managedPlugin, 0, len(existing))
+	for _, rawID := range orderedIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" || seen[id] {
+			continue
+		}
+		mp, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("plugin: %q not found", id)
+		}
+		seen[id] = true
+		finalOrder = append(finalOrder, mp)
+	}
+	for _, mp := range existing {
+		if !seen[mp.manifest.ID] {
+			finalOrder = append(finalOrder, mp)
+		}
+	}
+
+	type pendingWrite struct {
+		id       string
+		mp       *managedPlugin
+		priority int
+		cfgJSON  string
+	}
+	now := time.Now().Unix()
+	writes := make([]pendingWrite, 0, len(finalOrder))
+	for idx, mp := range finalOrder {
+		prio := ClampPluginPriority((idx + 1) * 10)
+		mp.mu.Lock()
+		cfgBytes, err := marshalPluginConfigJSON(mp.publicConfig, prio, true)
+		mp.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		writes = append(writes, pendingWrite{
+			id:       mp.manifest.ID,
+			mp:       mp,
+			priority: prio,
+			cfgJSON:  string(cfgBytes),
+		})
+	}
+
+	if err := m.store.WithTx(ctx, func(tx *sqlx.Tx) error {
+		for _, w := range writes {
+			if _, err := tx.ExecContext(
+				ctx,
+				`UPDATE plugins SET config_json = ?, updated_at = ? WHERE id = ?`,
+				w.cfgJSON, now, w.id,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	for _, w := range writes {
+		w.mp.mu.Lock()
+		w.mp.setPriorityLocked(w.priority, true)
+		w.mp.updatedAt = now
+		w.mp.mu.Unlock()
+		if m.providers != nil {
+			m.providers.SetPluginPriority(w.id, w.priority)
+		}
+	}
+	return m.List(locale), nil
+}
+
+func sortManagedPluginsByPriority(mps []*managedPlugin) {
+	sort.Slice(mps, func(i, j int) bool {
+		pi := mps[i].getPriority()
+		pj := mps[j].getPriority()
+		if pi != pj {
+			return pi < pj
+		}
+		return mps[i].manifest.ID < mps[j].manifest.ID
+	})
+}
+
+// List returns secret-masked summaries of all registered plugins sorted by execution priority (then ID).
+func (m *Manager) List(locale string) []PluginSummary {
+	m.mu.RLock()
+	mps := make([]*managedPlugin, 0, len(m.plugins))
+	for _, mp := range m.plugins {
+		mps = append(mps, mp)
+	}
+	m.mu.RUnlock()
+
+	sortManagedPluginsByPriority(mps)
 
 	out := make([]PluginSummary, 0, len(mps))
 	for _, mp := range mps {
@@ -1782,6 +2164,11 @@ func (m *Manager) Get(pluginID string, locale string) (PluginSummary, bool) {
 }
 
 func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
+	cronJobs := m.PluginCronJobs(mp.manifest.ID)
+	if len(cronJobs) == 0 {
+		cronJobs = nil
+	}
+
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
@@ -1796,11 +2183,18 @@ func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
 		}
 	}
 	redactedCfg := buildRedactedConfigLocked(mp)
+	effectiveHosts := computeEffectiveOutboundHosts(mp.manifest, mp.getConfigMap(), func(v any) any {
+		if s, ok := v.(string); ok && strings.HasPrefix(s, "v1:") {
+			return m.unsealSecretValue(s)
+		}
+		return v
+	}, m.allowLoopbackForTests)
 	return PluginSummary{
 		ID:            mp.manifest.ID,
 		Kind:          mp.kind,
 		Runtime:       mp.manifest.Runtime,
 		Version:       mp.manifest.Version,
+		Priority:      mp.priority,
 		Name:          ResolveLocalized(mp.manifest.Name, locale),
 		Description:   ResolveLocalized(mp.manifest.Description, locale),
 		Author:        mp.manifest.Author,
@@ -1810,18 +2204,20 @@ func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
 		FailureCount:  mp.failureCount,
 		LastError:     mp.lastError,
 		Permissions:   append([]string(nil), mp.manifest.Permissions...),
-		AllowedHosts:  mp.manifest.EffectiveAllowedHosts(),
+		Hooks:         append([]string(nil), mp.manifest.Hooks...),
+		AllowedHosts:  effectiveHosts,
 		ConfigSchema:  mp.manifest.ConfigSchema,
 		PublicConfig:  pubCopy,
 		Config:        redactedCfg,
 		SecretKeysSet: secSet,
+		CronJobs:      cronJobs,
 		InstalledAt:   mp.installedAt,
 		UpdatedAt:     mp.updatedAt,
 	}
 }
 
 // RenderHooksStateHash computes a fast SHA-256 hex digest over all currently enabled plugins
-// with render capability (ID, version, circuit state, and config hash).
+// with render capability (priority order, ID, version, circuit state, and config hash).
 // Returns "" when zero render plugins are enabled so callers can bypass cache key expansion.
 func (m *Manager) RenderHooksStateHash() string {
 	if m == nil {
@@ -1839,9 +2235,7 @@ func (m *Manager) RenderHooksStateHash() string {
 	if len(candidates) == 0 {
 		return ""
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].manifest.ID < candidates[j].manifest.ID
-	})
+	sortManagedPluginsByPriority(candidates)
 
 	h := sha256.New()
 	enabledCount := 0
@@ -1852,6 +2246,7 @@ func (m *Manager) RenderHooksStateHash() string {
 			continue
 		}
 		enabledCount++
+		prio := mp.priority
 		pubBytes, _ := json.Marshal(mp.publicConfig)
 		secKeys := make([]string, 0, len(mp.secretConfig))
 		for k := range mp.secretConfig {
@@ -1869,6 +2264,8 @@ func (m *Manager) RenderHooksStateHash() string {
 		circuit := mp.circuitState
 		mp.mu.Unlock()
 
+		_, _ = h.Write([]byte(strconv.Itoa(prio)))
+		_, _ = h.Write([]byte{'|'})
 		_, _ = h.Write([]byte(mp.manifest.ID))
 		_, _ = h.Write([]byte{'|'})
 		_, _ = h.Write([]byte(mp.manifest.Version))
@@ -2064,8 +2461,17 @@ func (m *Manager) DispatchFederationArticle(ctx context.Context, action string, 
 // DispatchArticleHook safely dispatches an article lifecycle/render hook across enabled plugins,
 // strictly redacting password-protected articles and stripping `:::lock` blocks (10th Privacy Surface).
 func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw ArticleHookPayload) ArticleHookPayload {
+	out, _ := m.DispatchArticleHookWithError(ctx, hookName, raw)
+	return out
+}
+
+// DispatchArticleHookWithError dispatches an article hook in priority order, enforcing 10th Privacy Surface
+// redaction and supporting chained short-circuit interception (`*HookRejectedError`) on `before_*` hooks
+// such as `article.before_save`.
+func (m *Manager) DispatchArticleHookWithError(ctx context.Context, hookName string, raw ArticleHookPayload) (ArticleHookPayload, error) {
 	active := m.snapshotEnabledPlugins()
 	cur := raw
+	interceptable := IsInterceptableHook(hookName)
 
 	for _, mp := range active {
 		if !mp.manifest.CanUseHook(hookName) {
@@ -2082,16 +2488,38 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 
 		res, invoked, err := m.invokeHook(ctx, mp, hookName, safePayload)
 		if err != nil {
+			var rej *HookRejectedError
+			if interceptable && errors.As(err, &rej) {
+				if rej.PluginID == "" {
+					rej.PluginID = mp.manifest.ID
+				}
+				if rej.Hook == "" {
+					rej.Hook = hookName
+				}
+				m.recordSuccess(ctx, mp)
+				return cur, rej
+			}
 			m.recordFailure(ctx, mp, "hook:"+hookName, err)
 			continue
 		}
 		if invoked {
 			m.recordSuccess(ctx, mp)
+			if interceptable {
+				if rej, rejected := extractHookRejection(mp.manifest.ID, hookName, res); rejected {
+					return cur, rej
+				}
+			}
 		}
 		hasLock := cur.HasContentLock || strings.Contains(cur.ContentMD, ":::lock") || strings.Contains(cur.SummaryMD, ":::lock")
-		if hookName == HookRenderPreMarkdown && !cur.IsPasswordProtected && !hasLock {
+		allowPlaintextMut := (!cur.IsPasswordProtected && !hasLock) || trustedProtected
+		if (hookName == HookRenderPreMarkdown || hookName == HookArticleBeforeSave) && allowPlaintextMut {
 			switch out := res.(type) {
 			case map[string]any:
+				if hookName == HookArticleBeforeSave {
+					if nextTitle, sOk := out["title"].(string); sOk && strings.TrimSpace(nextTitle) != "" {
+						cur.Title = nextTitle
+					}
+				}
 				if nextMD, sOk := out["content_md"].(string); sOk && nextMD != "" {
 					cur.ContentMD = nextMD
 				}
@@ -2099,6 +2527,9 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 					cur.SummaryMD = nextSummary
 				}
 			case ArticleHookPayload:
+				if hookName == HookArticleBeforeSave && strings.TrimSpace(out.Title) != "" {
+					cur.Title = out.Title
+				}
 				if out.ContentMD != "" {
 					cur.ContentMD = out.ContentMD
 				}
@@ -2107,6 +2538,9 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 				}
 			case *ArticleHookPayload:
 				if out != nil {
+					if hookName == HookArticleBeforeSave && strings.TrimSpace(out.Title) != "" {
+						cur.Title = out.Title
+					}
 					if out.ContentMD != "" {
 						cur.ContentMD = out.ContentMD
 					}
@@ -2115,7 +2549,7 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 					}
 				}
 			case string:
-				if out != "" {
+				if out != "" && hookName == HookRenderPreMarkdown {
 					cur.ContentMD = out
 				}
 			}
@@ -2141,35 +2575,53 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 			}
 		}
 	}
-	return cur
+	return cur, nil
 }
 
-// DispatchHook dispatches a generic domain hook (e.g., comment.before_create, comment.created).
-// If payload is ArticleHookPayload or *ArticleHookPayload, it automatically enforces 10th Privacy Surface sanitization.
+// DispatchHook dispatches a generic domain hook in plugin priority order.
+// Pre-action hooks (`IsInterceptableHook(hookName) == true`, e.g. `comment.before_create`,
+// `comment.before_update`, `user.before_register`, `user.before_update_profile`, `article.before_save`,
+// `page.before_save`, `media.before_upload`) uniformly support chained short-circuit interception
+// (`volo.reject`, `{allow:false}`, `{reject:true}`, `{action:"reject"}`, `return false`) and
+// non-destructive partial map payload chaining across multiple plugins.
 func (m *Manager) DispatchHook(ctx context.Context, hookName string, payload any) (any, error) {
 	switch v := payload.(type) {
 	case ArticleHookPayload:
-		out := m.DispatchArticleHook(ctx, hookName, v)
-		return sanitizeArticleHookPayload(out), nil
+		out, err := m.DispatchArticleHookWithError(ctx, hookName, v)
+		if IsInterceptableHook(hookName) {
+			return out, err
+		}
+		return sanitizeArticleHookPayload(out), err
 	case *ArticleHookPayload:
 		if v == nil {
 			return (*ArticleHookPayload)(nil), nil
 		}
-		out := m.DispatchArticleHook(ctx, hookName, *v)
+		out, err := m.DispatchArticleHookWithError(ctx, hookName, *v)
+		if IsInterceptableHook(hookName) {
+			return &out, err
+		}
 		sanitized := sanitizeArticleHookPayload(out)
-		return &sanitized, nil
+		return &sanitized, err
 	}
 
+	interceptable := IsInterceptableHook(hookName)
 	active := m.snapshotEnabledPlugins()
 	cur := payload
 	for _, mp := range active {
 		if !mp.manifest.CanUseHook(hookName) {
 			continue
 		}
-		res, invoked, err := m.invokeHook(ctx, mp, hookName, cur)
+		callPayload := cloneHookPayloadInput(cur)
+		res, invoked, err := m.invokeHook(ctx, mp, hookName, callPayload)
 		if err != nil {
 			var rej *HookRejectedError
-			if errors.As(err, &rej) {
+			if interceptable && errors.As(err, &rej) {
+				if rej.PluginID == "" {
+					rej.PluginID = mp.manifest.ID
+				}
+				if rej.Hook == "" {
+					rej.Hook = hookName
+				}
 				m.recordSuccess(ctx, mp)
 				return cur, rej
 			}
@@ -2178,27 +2630,118 @@ func (m *Manager) DispatchHook(ctx context.Context, hookName string, payload any
 		}
 		if invoked {
 			m.recordSuccess(ctx, mp)
-			if hookName == HookCommentBeforeCreate {
-				if allowVal, isBool := res.(bool); isBool && !allowVal {
-					return cur, &HookRejectedError{PluginID: mp.manifest.ID, Reason: "comment rejected by plugin"}
-				}
-				if resMap, isMap := res.(map[string]any); isMap {
-					if allowVal, hasAllow := resMap["allow"].(bool); hasAllow && !allowVal {
-						reason, _ := resMap["reason"].(string)
-						return cur, &HookRejectedError{PluginID: mp.manifest.ID, Reason: reason}
-					}
-					if rejVal, hasRej := resMap["reject"].(bool); hasRej && rejVal {
-						reason, _ := resMap["reason"].(string)
-						return cur, &HookRejectedError{PluginID: mp.manifest.ID, Reason: reason}
-					}
+			if interceptable {
+				if rej, rejected := extractHookRejection(mp.manifest.ID, hookName, res); rejected {
+					return cur, rej
 				}
 			}
-			if res != nil {
-				cur = res
-			}
+			cur = mergeHookPayloadResult(cur, res)
 		}
 	}
 	return cur, nil
+}
+
+func cloneHookPayloadInput(in any) any {
+	m, ok := in.(map[string]any)
+	if !ok || m == nil {
+		return in
+	}
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func extractHookRejection(pluginID string, hookName string, res any) (*HookRejectedError, bool) {
+	if res == nil {
+		return nil, false
+	}
+	if allowVal, isBool := res.(bool); isBool {
+		if !allowVal {
+			return &HookRejectedError{
+				PluginID: pluginID,
+				Hook:     hookName,
+				Reason:   defaultHookRejectReason(hookName),
+			}, true
+		}
+		return nil, false
+	}
+	resMap, isMap := res.(map[string]any)
+	if !isMap {
+		return nil, false
+	}
+	reason, _ := resMap["reason"].(string)
+	reason = strings.TrimSpace(reason)
+	code, _ := resMap["code"].(string)
+	code = strings.TrimSpace(code)
+
+	if v, ok := resMap["__volo_rejected__"].(bool); ok && v {
+		return &HookRejectedError{PluginID: pluginID, Hook: hookName, Reason: reason, Code: code}, true
+	}
+	if allowVal, hasAllow := resMap["allow"].(bool); hasAllow && !allowVal {
+		return &HookRejectedError{PluginID: pluginID, Hook: hookName, Reason: reason, Code: code}, true
+	}
+	if rejVal, hasRej := resMap["reject"].(bool); hasRej && rejVal {
+		return &HookRejectedError{PluginID: pluginID, Hook: hookName, Reason: reason, Code: code}, true
+	}
+	if actStr, hasAct := resMap["action"].(string); hasAct && strings.EqualFold(strings.TrimSpace(actStr), "reject") {
+		return &HookRejectedError{PluginID: pluginID, Hook: hookName, Reason: reason, Code: code}, true
+	}
+	return nil, false
+}
+
+func defaultHookRejectReason(hookName string) string {
+	if strings.HasPrefix(hookName, "comment.") {
+		return "comment rejected by plugin"
+	}
+	return "action rejected by plugin"
+}
+
+func mergeHookPayloadResult(cur any, res any) any {
+	if res == nil {
+		return cur
+	}
+	if b, isBool := res.(bool); isBool && b {
+		return cur
+	}
+	curMap, curIsMap := cur.(map[string]any)
+	resMap, resIsMap := res.(map[string]any)
+	if !curIsMap || !resIsMap {
+		return res
+	}
+	next := make(map[string]any, len(curMap)+len(resMap))
+	pendingRatcheted := false
+	for k, v := range curMap {
+		next[k] = v
+		if k == "status" {
+			if s, ok := v.(string); ok && strings.EqualFold(strings.TrimSpace(s), "pending") {
+				pendingRatcheted = true
+			}
+		}
+	}
+	if actStr, ok := resMap["action"].(string); ok && strings.EqualFold(strings.TrimSpace(actStr), "moderate") {
+		pendingRatcheted = true
+	}
+	if modVal, ok := resMap["moderate"].(bool); ok && modVal {
+		pendingRatcheted = true
+	}
+	for k, v := range resMap {
+		switch k {
+		case "allow", "reject", "action", "moderate", "reason", "code", "__volo_rejected__":
+			continue
+		case "status":
+			if pendingRatcheted {
+				next["status"] = "pending"
+				continue
+			}
+		}
+		next[k] = v
+	}
+	if pendingRatcheted {
+		next["status"] = "pending"
+	}
+	return next
 }
 
 func (m *Manager) invokeHook(ctx context.Context, mp *managedPlugin, hookName string, payload any) (any, bool, error) {
@@ -2815,6 +3358,9 @@ func (m *Manager) Close(ctx context.Context) error {
 	for _, mp := range list {
 		m.deactivateRuntime(ctx, mp)
 	}
+	if m.cron != nil {
+		m.cron.Close()
+	}
 	return nil
 }
 
@@ -2842,9 +3388,7 @@ func (m *Manager) snapshotEnabledPlugins() []*managedPlugin {
 			out = append(out, mp)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].manifest.ID < out[j].manifest.ID
-	})
+	sortManagedPluginsByPriority(out)
 	return out
 }
 
@@ -3121,6 +3665,8 @@ func parseOIDCBool(v any) bool {
 	}
 }
 
+var _ NicknameAntiSpamProvider = (*gojaAntiSpamAdapter)(nil)
+
 type gojaAntiSpamAdapter struct {
 	manager *Manager
 	mp      *managedPlugin
@@ -3146,10 +3692,44 @@ func (a *gojaAntiSpamAdapter) CheckComment(ctx context.Context, input CommentChe
 		return SpamVerdict{}, errors.New("checkSpam function not exported")
 	}
 	a.manager.recordSuccess(ctx, a.mp)
+	return parseSpamVerdictResult(res), nil
+}
 
+func (a *gojaAntiSpamAdapter) CheckNickname(ctx context.Context, input NicknameCheckInput) (SpamVerdict, error) {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return SpamVerdict{}, errors.New("plugin antispam inactive")
+	}
+	res, found, err := rt.invoke(ctx, a.manager.hookTimeout, "checkNickname", input)
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:antispam", err)
+		return SpamVerdict{}, err
+	}
+	if found {
+		a.manager.recordSuccess(ctx, a.mp)
+		return parseSpamVerdictResult(res), nil
+	}
+	// Seamless fallback for AntiSpamProvider plugins that only export checkSpam(input).
+	return a.CheckComment(ctx, CommentCheckInput{
+		TargetType: "nickname",
+		TargetID:   input.Source,
+		AuthorName: input.Nickname,
+		ContentMD:  input.Nickname,
+		IPMasked:   input.IPMasked,
+		GeoRegion:  input.GeoRegion,
+		Locale:     input.Locale,
+		IsGuest:    true,
+	})
+}
+
+func parseSpamVerdictResult(res any) SpamVerdict {
 	if m, ok := res.(map[string]any); ok {
-		verdict := SpamVerdict{Action: SpamActionAllow}
-		if act, sOk := m["action"].(string); sOk {
+		verdict := SpamVerdict{Action: SpamActionPass}
+		if act, sOk := m["action"].(string); sOk && strings.TrimSpace(act) != "" {
 			verdict.Action = strings.ToLower(strings.TrimSpace(act))
 		}
 		if reason, sOk := m["reason"].(string); sOk {
@@ -3161,9 +3741,9 @@ func (a *gojaAntiSpamAdapter) CheckComment(ctx context.Context, input CommentChe
 		case int64:
 			verdict.Score = float64(sc)
 		}
-		return verdict, nil
+		return verdict
 	}
-	return SpamVerdict{Action: SpamActionAllow}, nil
+	return SpamVerdict{Action: SpamActionPass}
 }
 
 type gojaNotifierAdapter struct {

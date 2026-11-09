@@ -28,6 +28,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
+	"github.com/Willh92/Volo-go/pkg/wordfilter"
 )
 
 // CategoryWithCount pairs a Category with its published public article count.
@@ -194,6 +195,12 @@ type Service struct {
 
 	onArticlePublished atomic.Pointer[func(context.Context, domain.RawArticle)]
 	renderCacheSaltFn  atomic.Pointer[func() string]
+	kwFilter           atomic.Pointer[cachedKeywordFilter]
+}
+
+type cachedKeywordFilter struct {
+	rev     uint64
+	matcher *wordfilter.Matcher
 }
 
 // NewService constructs a Content Service.

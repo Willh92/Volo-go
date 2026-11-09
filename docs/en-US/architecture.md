@@ -33,12 +33,12 @@
 │  • Auth & RBAC (Argon2id / Passkey / TOTP / Device Sessions / PATs)     │
 │  • GuestPassport & PoW (3-Tier Self-Healing Passport + SHA-256 PoW)     │
 │  • Media Pipeline (<=64MP Bomb Guard / EXIF Strip / WebP / SigV4 S3)    │
-│  • Plugin Manager (Pure-Go ES6 VM Pool + Directives + Federation/CB)    │
+│  • Plugin Manager (Pure-Go ES6 VM Pool + Priority Chains + Cron/CB)    │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │              Multi-Dialect SQL & Revision-Tracked Store (`sqlx`)        │
-│  • Dialect: SQLite (modernc WAL Read/Write Split) | PG (pgx/v5) | MySQL │
+│  • Dialect: SQLite (modernc WAL Read/Write Split) | PG (pgwire) | MySQL │
 │  • Zero-Closure Scan Plans + PG Rebind Cache + Atomic DataRevision Bus  │
 │  • Write-Behind View Buffer (Real-Time Overlay + 2s/Shutdown Flush)     │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -46,9 +46,9 @@
 
 ---
 
-## 2. Normalized Relational Schema (`v6`: 33 Data Tables + 9 Settings Domains)
+## 2. Normalized Relational Schema (`v7`: 33 Data Tables + 9 Settings Domains)
 
-`Volo-go` replaces fragmented key-value JSON blobs and indirect tag-derived categorization with a normalized relational schema (`internal/db/migrate/schema.go`, current schema version **`v6`**, tracked via `schema_migrations` across idempotent steps `v1`–`v6`, with **33 normalized data tables** in `CanonicalTables`):
+`Volo-go` replaces fragmented key-value JSON blobs and indirect tag-derived categorization with a normalized relational schema (`internal/db/migrate/schema.go`, current schema version **`v7`**, tracked via `schema_migrations` across idempotent steps `v1`–`v7`, with **33 normalized data tables** in `CanonicalTables`):
 
 | Domain | Tables (33 Data Tables + `schema_migrations`) | Key Design Choices |
 | :--- | :--- | :--- |
@@ -100,7 +100,7 @@ Password-protected posts (`password_ciphertext`) and partial encrypted blocks (`
 7. **Sitemap (Including Sharded Indexes) & IndexNow**: Password-protected posts are omitted from `/sitemap.xml` and any `/sitemap-N.xml` shards, excluded from IndexNow pings, and served with `noindex, nofollow, noarchive` + `Cache-Control: private, no-store`;
 8. **Bidirectional Backlinks (`[[slug]]`)**: Locked posts neither emit outbound backlinks nor appear in target post backlink lists;
 9. **`/llms.txt` & `.md` Raw Endpoints**: Excluded from LLM corpus indexes, and unauthenticated `.md` requests return `403`;
-10. **Plugin Hooks & Federation Dispatch**: Plugins without explicit `articles:read_protected` permission and automatic `federation` dispatches never receive protected payloads or nested `:::lock` content, and `render.post_html` / custom directive outputs are re-sanitized through `bluemonday`.
+10. **Plugin Hooks & Federation Dispatch**: Plugins without explicit `articles:read_protected` permission and automatic `federation` dispatches never receive protected payloads or nested `:::lock` content, and `render.post_html` / custom directive outputs are re-sanitized through the single-pass HTML5 AST sanitizer (`internal/markdown/sanitize.go`).
 
 ---
 

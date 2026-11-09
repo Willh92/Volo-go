@@ -118,4 +118,31 @@ function walkAdminDist(dir) {
   }
 }
 
-walkAdminDist(distDir);
+function syncBuiltinEmbeddedAssets() {
+  const pairs = [
+    [
+      new URL("../../../internal/i18n/builtin/zh-CN.json", import.meta.url).pathname,
+      new URL("../../../internal/i18n/builtin_gz/zh-CN.json.gz", import.meta.url).pathname,
+      "zh-CN.json",
+    ],
+    [
+      new URL("../../../internal/i18n/builtin/en-US.json", import.meta.url).pathname,
+      new URL("../../../internal/i18n/builtin_gz/en-US.json.gz", import.meta.url).pathname,
+      "en-US.json",
+    ],
+    [
+      new URL("../../../internal/theme/builtin/volo-studio/assets/volo-studio.js", import.meta.url).pathname,
+      new URL("../../../internal/theme/builtin/volo-studio/assets_gz/volo-studio.js.gz", import.meta.url).pathname,
+      "volo-studio.js",
+    ],
+  ];
+  for (const [src, dst, name] of pairs) {
+    const raw = minifyEmbeddedPayload(name, readFileSync(src));
+    writeFileSync(dst, deterministicGzip(raw));
+  }
+}
+
+if (!process.argv.includes("--embedded-only")) {
+  walkAdminDist(distDir);
+}
+syncBuiltinEmbeddedAssets();

@@ -26,12 +26,12 @@
 | `--themes-dir` / `--plugins-dir` / `--locales-dir` | `VOLO_THEMES_DIR` / `VOLO_PLUGINS_DIR` / `VOLO_LOCALES_DIR` | 外部主题、插件与语言包热挂载目录 |
 | `--db-driver <sqlite\|postgres\|mysql>` | `VOLO_DB_DRIVER` | 数据库驱动（留空则优先读取 `/setup` 向导加密持久化的 `${VOLO_DATA_DIR}/db.json`） |
 | `--db-dsn <dsn>` | `VOLO_DB_DSN` | 数据库连接串（SQLite 留空默认 `${VOLO_DATA_DIR}/volo.db`） |
-| `--db-simple-protocol` | `VOLO_DB_SIMPLE_PROTOCOL` | 为 PostgreSQL 事务池（Supabase / PgBouncer）启用 `pgx` Simple Query 协议 |
+| `--db-simple-protocol` | `VOLO_DB_SIMPLE_PROTOCOL` | 为 PostgreSQL 事务池（Supabase / PgBouncer）启用纯 Go `pgwire` Simple Query 协议 |
 | `--shutdown-timeout <sec>` | `VOLO_SHUTDOWN_TIMEOUT_SEC` | 优雅停机排空超时秒数（范围 `1`–`120`，默认 `15`） |
 
 ### 1.1 `volo serve`（默认命令）
 
-启动 HTTP 或 Unix Domain Socket 服务，自动执行幂等数据库 Schema 迁移（`v6`）、预热全文检索索引与只读元数据快照，启动定时文章发布器与滚动备份调度器，并监听 `SIGINT` / `SIGTERM` 执行优雅停机（排空在途请求 + 确定性刷盘异步阅读计数）。
+启动 HTTP 或 Unix Domain Socket 服务，自动执行幂等数据库 Schema 迁移（`v7`）、预热全文检索索引与只读元数据快照，启动定时文章发布器、插件 Cron 调度器与滚动备份调度器，并监听 `SIGINT` / `SIGTERM` 执行优雅停机（排空在途请求 + 确定性刷盘异步阅读计数）。
 
 ```bash
 # 零配置启动（默认监听 0.0.0.0:8080，自动初始化 ./data/volo.db）
@@ -201,7 +201,7 @@ curl -X POST "${VOLO_URL}/api/admin/media/upload" \
 }
 ```
 
-### 2.4 分类/书架批量重排与插件打包导出管理接口
+### 2.4 分类/书架批量重排、插件链式优先级编排与定时调度管理接口
 
 除常规 CRUD 外，管理端提供以下高频编排与生态分发接口：
 
@@ -212,6 +212,8 @@ curl -X POST "${VOLO_URL}/api/admin/media/upload" \
     -H "Content-Type: application/json" \
     -d '{"ids": ["0196ed8c01", "0196ed8c02", "0196ed8c03"]}'
   ```
+- **`POST /api/admin/plugins/reorder`** 与 **`PATCH /api/admin/plugins/{id}/priority`**（需交互式管理员会话）：编排插件链式执行顺序或精确设置单个插件的 `priority` 数值（范围 `-10000`–`10000`，数值越小越先执行，决定所有 `before_*` 拦截钩子、生命周期事件、UI 插槽及同类型 `Provider` 的确定性执行顺序）。
+- **`GET /api/admin/plugins/cron`** 与 **`POST /api/admin/plugins/{id}/trigger-cron`**（需交互式管理员会话）：查看各插件后台 `CronRegistry` 定时任务运行统计（上次执行耗时、下次触发时间、最近错误）或立即异步手动触发指定任务。
 - **`GET /api/admin/plugins/{id}/export`**（需交互式管理员会话）：将已安装插件目录打包导出为纯净 `.zip` 归档（自动剔除运行态临时文件与数据库内的 `secret_ciphertext` 机密值，安全用于跨站迁移或二次分发），配套 `POST /api/admin/plugins/install?overwrite=true` 支持保留配置与机密字段的原地热升级。
 
 ---
@@ -230,6 +232,7 @@ curl -X POST "${VOLO_URL}/api/admin/media/upload" \
 | `/api/v1/i18n/{locale}` | `GET` | 获取合并自定义覆盖词条后的前端多语言字典包（支持 `ETag` 缓存协商） |
 | `/api/v1/pow/challenge` | `GET` | 获取无第三方依赖的 `HMAC + SHA-256` 工作量证明挑战令牌 |
 | `/api/v1/guest/passport` | `GET` / `POST` | 签发或自愈刷新三端持久游客签名通行证（`__volo_gp`） |
+| `/api/v1/reader/profile` | `PATCH` | 已登录读者自助更新显示昵称、头像与个人简介（自动经过宿主屏蔽词表、`provider:antispam` 插件与 `user.before_update_profile` 链式拦截校验） |
 | `/api/v1/articles/{id}/unlock` | `POST` | 校验文章或独立页面（`page:<id>`）阅读口令并下发限定作用域的解锁凭证 |
-| `/api/v1/comments` | `GET` / `POST` | 分页查询文章/页面评论树或提交经 PoW 校验的新评论 |
+| `/api/v1/comments` | `GET` / `POST` | 分页查询文章/页面评论树或提交经 PoW 校验与反垃圾链式审查的新评论 |
 | `/api/v1/reactions` | `POST` | 文章与评论轻量表情互动计数 |

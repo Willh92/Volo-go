@@ -24,19 +24,56 @@ const (
 
 // Standard domain hooks.
 const (
-	HookArticlePublished    = "article.published"
-	HookArticleUpdated      = "article.updated"
-	HookArticleDeleted      = "article.deleted"
-	HookPagePublished       = "page.published"
-	HookPageUpdated         = "page.updated"
-	HookPageDeleted         = "page.deleted"
-	HookCommentBeforeCreate = "comment.before_create"
-	HookCommentCreated      = "comment.created"
-	HookCommentModerated    = "comment.moderated"
-	HookRenderPreMarkdown   = "render.pre_markdown"
-	HookRenderPostHTML      = "render.post_html"
-	HookRenderDirective     = "render.directive"
+	// Pre-action chained interception hooks (before_*): support short-circuit rejection and non-destructive payload chaining.
+	HookArticleBeforeSave       = "article.before_save"
+	HookPageBeforeSave          = "page.before_save"
+	HookCommentBeforeCreate     = "comment.before_create"
+	HookCommentBeforeUpdate     = "comment.before_update"
+	HookUserBeforeRegister      = "user.before_register"
+	HookUserBeforeUpdateProfile = "user.before_update_profile"
+	HookMediaBeforeUpload       = "media.before_upload"
+
+	// Post-action lifecycle notification hooks: broadcast after host commit.
+	HookArticlePublished = "article.published"
+	HookArticleUpdated   = "article.updated"
+	HookArticleDeleted   = "article.deleted"
+	HookPagePublished    = "page.published"
+	HookPageUpdated      = "page.updated"
+	HookPageDeleted      = "page.deleted"
+	HookCommentCreated   = "comment.created"
+	HookCommentModerated = "comment.moderated"
+
+	// Render pipeline transformation hooks.
+	HookRenderPreMarkdown = "render.pre_markdown"
+	HookRenderPostHTML    = "render.post_html"
+	HookRenderDirective   = "render.directive"
+
+	// Plugin execution priority bounds (smaller priority value runs earlier in chains; ties break by plugin ID).
+	DefaultPluginPriority = 100
+	MinPluginPriority     = -10000
+	MaxPluginPriority     = 10000
 )
+
+// ClampPluginPriority bounds p into [MinPluginPriority, MaxPluginPriority].
+func ClampPluginPriority(p int) int {
+	if p < MinPluginPriority {
+		return MinPluginPriority
+	}
+	if p > MaxPluginPriority {
+		return MaxPluginPriority
+	}
+	return p
+}
+
+// IsInterceptableHook reports whether hookName is a pre-action gatekeeping hook (`*.before_*` or `before.*`)
+// eligible for unified chained short-circuit interception (`volo.reject`, `{allow:false}`, `{reject:true}`, `return false`).
+func IsInterceptableHook(hookName string) bool {
+	h := strings.ToLower(strings.TrimSpace(hookName))
+	if h == "" {
+		return false
+	}
+	return strings.Contains(h, ".before_") || strings.HasPrefix(h, "before.") || strings.HasPrefix(h, "before_")
+}
 
 // Standard UI slots.
 const (
@@ -81,6 +118,7 @@ type Manifest struct {
 	MinHostVersion string            `json:"min_host_version,omitempty"`
 	Runtime        string            `json:"runtime"`
 	Entry          string            `json:"entry,omitempty"`
+	Priority       *int              `json:"priority,omitempty"`
 	Author         string            `json:"author,omitempty"`
 	Homepage       string            `json:"homepage,omitempty"`
 	Name           map[string]string `json:"name"`
@@ -91,6 +129,14 @@ type Manifest struct {
 	UISlots        []SlotSpec        `json:"ui_slots,omitempty"`
 	Cron           []CronSpec        `json:"cron,omitempty"`
 	ConfigSchema   []ConfigField     `json:"config_schema,omitempty"`
+}
+
+// DefaultPriority returns the manifest's declared priority clamped to bounds, or DefaultPluginPriority (100).
+func (m *Manifest) DefaultPriority() int {
+	if m == nil || m.Priority == nil {
+		return DefaultPluginPriority
+	}
+	return ClampPluginPriority(*m.Priority)
 }
 
 // SlotSpec declares a UI injection slot registration.
@@ -197,6 +243,10 @@ func (m *Manifest) Validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return fmt.Errorf("plugin %q: homepage must use http or https", m.ID)
 		}
+	}
+	if m.Priority != nil {
+		clamped := ClampPluginPriority(*m.Priority)
+		m.Priority = &clamped
 	}
 
 	// Validate permissions syntax.
@@ -382,6 +432,12 @@ func validatePermissionToken(perm string) error {
 		return nil
 	case strings.HasPrefix(p, "hooks:"):
 		target := strings.TrimPrefix(p, "hooks:")
+		if strings.HasSuffix(target, ".*") {
+			prefix := strings.TrimSuffix(target, ".*")
+			if prefix != "" && !strings.Contains(prefix, ".") && validHookNameRe.MatchString(prefix) {
+				return nil
+			}
+		}
 		if !validHookNameRe.MatchString(target) {
 			return fmt.Errorf("invalid hooks permission target %q", target)
 		}
@@ -444,10 +500,29 @@ func (m *Manifest) CanWriteKV() bool {
 	return m.HasPermission("kv") || m.HasPermission("kv:rw")
 }
 
-// CanUseHook reports whether the plugin may subscribe to hookName.
+// CanUseHook reports whether the plugin is permitted to handle hookName AND (when m.Hooks is non-empty)
+// explicitly subscribed to hookName in its manifest.
 func (m *Manifest) CanUseHook(hookName string) bool {
+	if len(m.Hooks) > 0 {
+		subscribed := false
+		for _, h := range m.Hooks {
+			if strings.TrimSpace(h) == hookName {
+				subscribed = true
+				break
+			}
+		}
+		if !subscribed {
+			return false
+		}
+	}
 	if m.HasPermission("hooks:*") || m.HasPermission("hooks:"+hookName) {
 		return true
+	}
+	if dot := strings.IndexByte(hookName, '.'); dot > 0 {
+		domainPrefix := hookName[:dot]
+		if m.HasPermission("hooks:" + domainPrefix + ".*") {
+			return true
+		}
 	}
 	if strings.HasPrefix(hookName, "render.") {
 		if m.HasPermission("render") || m.HasPermission("render:*") || m.HasPermission("hooks:render.*") {

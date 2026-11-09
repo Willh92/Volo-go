@@ -28,7 +28,7 @@ COPY --from=admin-builder /src/internal/adminui/dist ./internal/adminui/dist
 RUN CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -buildvcs=false -trimpath \
     -gcflags="all=-l" \
-    -ldflags="-s -w -X main.Version=${VERSION}" \
+    -ldflags="-s -w -funcalign=8 -X main.Version=${VERSION}" \
     -o /out/volo ./cmd/volo
 
 # Prepare non-root runtime directory skeleton (uid:gid 65532:65532 for distroless:nonroot)
@@ -41,6 +41,7 @@ RUN mkdir -p \
       /volo-root/locales && \
     cp ./LICENSE ./THIRD_PARTY_NOTICES.md /volo-root/ && \
     cp -r ./plugins/kanbanniang /volo-root/plugins/kanbanniang && \
+    cp -r ./plugins/sensitive-words /volo-root/plugins/sensitive-words && \
     cp -r ./themes/volo-journal /volo-root/themes/volo-journal && \
     cp ./locales/*.json /volo-root/locales/ && \
     chown -R 65532:65532 /volo-root

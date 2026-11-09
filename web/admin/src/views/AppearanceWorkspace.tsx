@@ -943,6 +943,11 @@ export function AppearanceWorkspace({
   const draftCssRef = useRef<string | null>(null);
 
   const [plugins, setPlugins] = useState<any[]>([]);
+  const [pluginCronJobs, setPluginCronJobs] = useState<any[]>([]);
+  const [reorderingPlugin, setReorderingPlugin] = useState<boolean>(false);
+  const [prioModal, setPrioModal] = useState<{ id: string; name: string } | null>(null);
+  const [prioModalOpen, setPrioModalOpen] = useState<boolean>(false);
+  const [prioValue, setPrioValue] = useState<string>("100");
   const [pluginQuery, setPluginQuery] = useState<string>("");
   const [pluginPage, setPluginPage] = useState<number>(1);
   const [cfgModal, setCfgModal] = useState<any | null>(null);
@@ -952,6 +957,49 @@ export function AppearanceWorkspace({
   const [logsModalOpen, setLogsModalOpen] = useState<boolean>(false);
   const [logLevelFilter, setLogLevelFilter] = useState<string>("");
   const [logTextFilter, setLogTextFilter] = useState<string>("");
+
+  const formatCronInterval = (secRaw: any): string => {
+    const sec = Math.max(1, Number(secRaw || 0));
+    if (sec % 86400 === 0) return `${sec / 86400}d`;
+    if (sec % 3600 === 0) return `${sec / 3600}h`;
+    if (sec % 60 === 0) return `${sec / 60}m`;
+    return `${sec}s`;
+  };
+
+  const openPriorityEditor = (p: any) => {
+    const curPrio = typeof p?.priority === "number" ? p.priority : 100;
+    setPrioModal({ id: String(p.id), name: resolveSchemaText(p.name) || String(p.id) });
+    setPrioValue(String(curPrio));
+    setPrioModalOpen(true);
+  };
+
+  const movePluginOrder = async (pluginID: string, delta: number) => {
+    if (reorderingPlugin || pluginQuery.trim() !== "") return;
+    const idx = plugins.findIndex((item) => item.id === pluginID);
+    const targetIdx = idx + delta;
+    if (idx < 0 || targetIdx < 0 || targetIdx >= plugins.length) return;
+    const next = [...plugins];
+    const [moved] = next.splice(idx, 1);
+    next.splice(targetIdx, 0, moved);
+    setReorderingPlugin(true);
+    try {
+      const res = await apiFetch<{ items?: any[]; cron_jobs?: any[] }>(
+        `/api/admin/plugins/reorder?locale=${encodeURIComponent(localeSig.value)}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ ordered_ids: next.map((item) => String(item.id)) }),
+        },
+      );
+      if (Array.isArray(res?.items)) setPlugins(res.items);
+      else setPlugins(next);
+      if (Array.isArray(res?.cron_jobs)) setPluginCronJobs(res.cron_jobs);
+      showToast(t("app.plugin_reordered"), "ok");
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setReorderingPlugin(false);
+    }
+  };
 
   const isAlreadyExistsConflict = (err: any): boolean => {
     if (err?.status === 409) return true;
@@ -1012,10 +1060,11 @@ export function AppearanceWorkspace({
           syncExternalLocales(res.locales);
         }
       } else {
-        const pl = await apiFetch<{ items: any[] }>(
+        const pl = await apiFetch<{ items: any[]; cron_jobs?: any[] }>(
           `/api/admin/plugins?locale=${encodeURIComponent(localeSig.value)}`,
         );
         setPlugins(pl.items || []);
+        setPluginCronJobs(pl.cron_jobs || []);
       }
     } catch (err: any) {
       showToast(err.message, "err");
@@ -1753,20 +1802,21 @@ export function AppearanceWorkspace({
                 class="volo-btn volo-btn-sm"
                 onClick={async () => {
                   try {
-                    let res: { items?: any[] } | null = null;
+                    let res: { items?: any[]; cron_jobs?: any[] } | null = null;
                     try {
-                      res = await apiFetch<{ items?: any[] }>(
+                      res = await apiFetch<{ items?: any[]; cron_jobs?: any[] }>(
                         `/api/admin/plugins/discover?locale=${encodeURIComponent(localeSig.value)}`,
                         { method: "POST", body: "{}" },
                       );
                     } catch {
-                      res = await apiFetch<{ items?: any[] }>(
+                      res = await apiFetch<{ items?: any[]; cron_jobs?: any[] }>(
                         `/api/admin/plugins/reload?locale=${encodeURIComponent(localeSig.value)}`,
                         { method: "POST", body: "{}" },
                       );
                     }
                     if (Array.isArray(res?.items)) setPlugins(res!.items);
                     else void loadData(true);
+                    if (Array.isArray(res?.cron_jobs)) setPluginCronJobs(res!.cron_jobs);
                     showToast(t("app.plugins_discovered"), "ok");
                   } catch (err: any) {
                     showToast(err.message, "err");
@@ -1827,6 +1877,7 @@ export function AppearanceWorkspace({
               <thead>
                 <tr>
                   <th class="col-fluid">{t("app.plugin_col_info")}</th>
+                  <th class="col-cat">{t("app.plugin_col_chain")}</th>
                   <th class="col-cat">{t("app.plugin_col_runtime")}</th>
                   <th class="col-status">{t("art.status")}</th>
                   <th class="col-act col-act-th">{t("art.actions")}</th>
@@ -1834,14 +1885,20 @@ export function AppearanceWorkspace({
               </thead>
               <tbody>
                 {loading ? (
-                  <TableSkeleton cols={4} />
+                  <TableSkeleton cols={5} />
                 ) : filteredPlugins.length === 0 ? (
-                  <ConsoleEmpty colSpan={4} text={t("app.plugins_empty")} />
+                  <ConsoleEmpty colSpan={5} text={t("app.plugins_empty")} />
                 ) : (
                   pagedPlugins.slice.map((p) => {
                     const pSchema: any[] = p.localized_schema || p.config_schema || [];
                     const isCircuitOpen = p.circuit_state === "open" || p.circuit_state === "CIRCUIT_OPEN";
                     const isBuiltinPlugin = Boolean(p.is_builtin || p.builtin || p.kind === "builtin");
+                    const chainIdx = plugins.findIndex((item) => item.id === p.id);
+                    const priorityNum = typeof p.priority === "number" ? p.priority : 100;
+                    const rowCronJobs: any[] =
+                      Array.isArray(p.cron_jobs) && p.cron_jobs.length > 0
+                        ? p.cron_jobs
+                        : pluginCronJobs.filter((j) => j?.plugin_id === p.id);
                     return (
                       <tr key={p.id}>
                         <td class="col-fluid" data-label={t("app.plugin_col_info")}>
@@ -1852,6 +1909,28 @@ export function AppearanceWorkspace({
                             </div>
                             {resolveSchemaText(p.description) && (
                               <div class="volo-cell-meta"><span>{resolveSchemaText(p.description)}</span></div>
+                            )}
+                            {rowCronJobs.length > 0 && (
+                              <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "4px" }}>
+                                {rowCronJobs.map((job) => (
+                                  <span
+                                    key={job.name}
+                                    class="volo-code-chip"
+                                    title={job.last_error ? `${job.name}: ${job.last_error}` : job.handler || job.name}
+                                    style={
+                                      job.last_error
+                                        ? { borderColor: "var(--volo-danger)", color: "var(--volo-danger)" }
+                                        : undefined
+                                    }
+                                  >
+                                    {t("app.plugin_cron_badge", {
+                                      name: String(job.name || "cron"),
+                                      interval: formatCronInterval(job.interval_seconds),
+                                      runs: Number(job.run_count || 0),
+                                    })}
+                                  </span>
+                                ))}
+                              </div>
                             )}
                             {p.last_error && (
                               <div
@@ -1864,6 +1943,58 @@ export function AppearanceWorkspace({
                               >
                                 {t("app.last_error", { err: p.last_error })}
                               </div>
+                            )}
+                          </div>
+                        </td>
+                        <td class="col-cat" data-label={t("app.plugin_col_chain")}>
+                          <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              title={t("app.plugin_chain_hint")}
+                              onClick={() => openPriorityEditor(p)}
+                              style={{ fontVariantNumeric: "tabular-nums" }}
+                            >
+                              #{chainIdx >= 0 ? chainIdx + 1 : 1} · P{priorityNum}
+                            </button>
+                            {!pluginNeedle && plugins.length > 1 && (
+                              <>
+                                <button
+                                  type="button"
+                                  class="volo-act-btn"
+                                  title={t("app.move_up")}
+                                  aria-label={t("app.move_up")}
+                                  disabled={reorderingPlugin || chainIdx <= 0}
+                                  onClick={() => void movePluginOrder(p.id, -1)}
+                                  style={{ padding: "2px 6px", minWidth: "24px" }}
+                                >
+                                  ↑
+                                </button>
+                                <button
+                                  type="button"
+                                  class="volo-act-btn"
+                                  title={t("app.move_down")}
+                                  aria-label={t("app.move_down")}
+                                  disabled={reorderingPlugin || chainIdx < 0 || chainIdx >= plugins.length - 1}
+                                  onClick={() => void movePluginOrder(p.id, 1)}
+                                  style={{ padding: "2px 6px", minWidth: "24px" }}
+                                >
+                                  ↓
+                                </button>
+                                {chainIdx > 1 && (
+                                  <button
+                                    type="button"
+                                    class="volo-act-btn"
+                                    title={t("app.move_top")}
+                                    aria-label={t("app.move_top")}
+                                    disabled={reorderingPlugin}
+                                    onClick={() => void movePluginOrder(p.id, -chainIdx)}
+                                    style={{ padding: "2px 6px", minWidth: "24px" }}
+                                  >
+                                    <MoveTopIcon />
+                                  </button>
+                                )}
+                              </>
                             )}
                           </div>
                         </td>
@@ -1943,6 +2074,29 @@ export function AppearanceWorkspace({
                             )}
                             <ActionMenu
                               items={[
+                                {
+                                  label: t("app.plugin_set_priority"),
+                                  onClick: () => openPriorityEditor(p),
+                                },
+                                {
+                                  label: t("app.plugin_trigger_cron"),
+                                  hidden: !(Boolean(p.is_enabled) && rowCronJobs.length > 0),
+                                  onClick: async () => {
+                                    try {
+                                      const res = await apiFetch<{ triggered?: number; cron_jobs?: any[] }>(
+                                        `/api/admin/plugins/${encodeURIComponent(p.id)}/trigger-cron`,
+                                        { method: "POST", body: "{}" },
+                                      );
+                                      showToast(
+                                        t("app.plugin_cron_triggered", { count: Number(res?.triggered || rowCronJobs.length || 1) }),
+                                        "ok",
+                                      );
+                                      void loadData(true);
+                                    } catch (err: any) {
+                                      showToast(err.message, "err");
+                                    }
+                                  },
+                                },
                                 {
                                   label: t("app.reset_circuit"),
                                   hidden: !isCircuitOpen,
@@ -2169,6 +2323,65 @@ export function AppearanceWorkspace({
           secretKeysSet={cfgModal?.secret_keys_set}
           namePrefix="plugin_cfg"
         />
+      </AnimatedModal>
+
+      <AnimatedModal
+        open={prioModalOpen}
+        onClose={() => setPrioModalOpen(false)}
+        title={t("app.plugin_prio_title", { name: prioModal?.name || "" })}
+        maxWidth="440px"
+        footer={
+          <>
+            <button type="button" class="volo-btn" onClick={() => setPrioModalOpen(false)}>
+              {t("common.cancel")}
+            </button>
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary"
+              onClick={async () => {
+                if (!prioModal) return;
+                const parsed = Math.round(Number(prioValue));
+                if (!Number.isFinite(parsed) || parsed < -1000 || parsed > 10000) {
+                  showToast(`${t("app.plugin_prio_label")} (-1000 .. 10000)`, "err");
+                  return;
+                }
+                try {
+                  const res = await apiFetch<{ items?: any[] }>(
+                    `/api/admin/plugins/${encodeURIComponent(prioModal.id)}/priority?locale=${encodeURIComponent(localeSig.value)}`,
+                    {
+                      method: "PATCH",
+                      body: JSON.stringify({ priority: parsed }),
+                    },
+                  );
+                  if (Array.isArray(res?.items)) setPlugins(res.items);
+                  else void loadData(true);
+                  setPrioModalOpen(false);
+                  showToast(t("app.plugin_prio_saved"), "ok");
+                } catch (err: any) {
+                  showToast(err.message, "err");
+                }
+              }}
+            >
+              {t("common.save")}
+            </button>
+          </>
+        }
+      >
+        <div class="volo-field" style={{ marginBottom: 0 }}>
+          <label>{t("app.plugin_prio_label")}</label>
+          <input
+            type="number"
+            class="volo-input"
+            min={-1000}
+            max={10000}
+            step={1}
+            value={prioValue}
+            onInput={(e) => setPrioValue((e.currentTarget as HTMLInputElement).value)}
+          />
+          <div class="volo-help" style={{ marginTop: "8px" }}>
+            {t("app.plugin_chain_hint")}
+          </div>
+        </div>
       </AnimatedModal>
 
       <AnimatedModal

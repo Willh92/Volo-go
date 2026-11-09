@@ -24,6 +24,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
+	"github.com/Willh92/Volo-go/pkg/wordfilter"
 )
 
 const GuestEditWindow = 30 * time.Minute
@@ -755,13 +756,15 @@ func (s *Service) CreateComment(
 	}
 
 	// Offline keyword filter + hot-swappable plugin AntiSpamProvider!
+	isStaffCaller := viewer != nil && viewer.Status == domain.UserStatusActive &&
+		(viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor)
 	status := domain.CommentStatusApproved
-	if viewer == nil || (viewer.Role != domain.RoleAdmin && viewer.Role != domain.RoleEditor) {
+	if !isStaffCaller {
 		switch snap.Reading.CommentModerationMode {
 		case domain.CommentModerationAll:
 			status = domain.CommentStatusPending
 		case domain.CommentModerationSmart:
-			if snap.Reading.BuiltinSpamFilter && containsBlockedKeyword(contentMD, authorName, snap.Reading.BlockedKeywords, snap.Reading.AllowedKeywords) {
+			if s.matchesBuiltinCommentFilter(snap, contentMD, authorName, authorURL) {
 				status = domain.CommentStatusPending
 			}
 		}
@@ -826,6 +829,7 @@ func (s *Service) CreateComment(
 	}
 
 	if s.plugins != nil {
+		preHookMD := record.ContentMD
 		hookOut, hookErr := s.plugins.DispatchHook(ctx, plugin.HookCommentBeforeCreate, map[string]any{
 			"id":          record.ID,
 			"target_type": record.TargetType,
@@ -851,6 +855,33 @@ func (s *Service) CreateComment(
 				record.ContentMD = trimmedNext
 			}
 			if nextStatus, sOk := resMap["status"].(string); sOk && nextStatus == domain.CommentStatusPending {
+				record.Status = domain.CommentStatusPending
+			}
+		}
+		// Re-screen mutated content_md so no pre-action hook transformation can smuggle blocked words!
+		if !isStaffCaller && record.ContentMD != preHookMD {
+			if snap.Reading.CommentModerationMode == domain.CommentModerationSmart &&
+				s.matchesBuiltinCommentFilter(snap, record.ContentMD, record.AuthorName, record.AuthorURL) {
+				record.Status = domain.CommentStatusPending
+			}
+			reVerdict := s.plugins.Providers().EvaluateComment(ctx, plugin.CommentCheckInput{
+				TargetType: record.TargetType,
+				TargetID:   record.TargetID,
+				AuthorName: record.AuthorName,
+				AuthorURL:  record.AuthorURL,
+				ContentMD:  record.ContentMD,
+				IPMasked:   record.IPMasked,
+				GeoRegion:  record.GeoRegion,
+				Locale:     in.Locale,
+				IsGuest:    !isLoggedUser,
+			})
+			if reVerdict.Action == plugin.SpamActionReject {
+				if reason := strings.TrimSpace(reVerdict.Reason); reason != "" {
+					return PublicCommentView{}, "", fmt.Errorf("%w: %s", ErrCommentRejected, reason)
+				}
+				return PublicCommentView{}, "", ErrCommentRejected
+			}
+			if reVerdict.Action == plugin.SpamActionModerate {
 				record.Status = domain.CommentStatusPending
 			}
 		}
@@ -941,12 +972,19 @@ func (s *Service) UpdateOwnComment(
 	nextStatus := existing.Status
 	if !isStaff {
 		snap := s.settings.Snapshot()
+		evalLocale := strings.TrimSpace(existing.NotifyLocale)
+		if evalLocale == "" {
+			evalLocale = snap.Site.DefaultLocale
+		}
 		keywordTriggered := false
-		if snap.Reading.CommentModerationMode == domain.CommentModerationAll {
+		switch snap.Reading.CommentModerationMode {
+		case domain.CommentModerationAll:
 			nextStatus = domain.CommentStatusPending
-		} else if containsBlockedKeyword(trimmed, existing.AuthorName, snap.Reading.BlockedKeywords, snap.Reading.AllowedKeywords) {
-			nextStatus = domain.CommentStatusPending
-			keywordTriggered = true
+		case domain.CommentModerationSmart:
+			if s.matchesBuiltinCommentFilter(snap, trimmed, existing.AuthorName, existing.AuthorURL) {
+				nextStatus = domain.CommentStatusPending
+				keywordTriggered = true
+			}
 		}
 
 		if s.plugins != nil {
@@ -958,7 +996,7 @@ func (s *Service) UpdateOwnComment(
 				ContentMD:  trimmed,
 				IPMasked:   existing.IPMasked,
 				GeoRegion:  existing.GeoRegion,
-				Locale:     existing.NotifyLocale,
+				Locale:     evalLocale,
 				IsGuest:    strings.TrimSpace(existing.UserID) == "",
 			})
 			if verdict.Action == plugin.SpamActionReject {
@@ -973,32 +1011,62 @@ func (s *Service) UpdateOwnComment(
 				nextStatus = existing.Status
 			}
 
-			hookOut, hookErr := s.plugins.DispatchHook(ctx, plugin.HookCommentBeforeCreate, map[string]any{
-				"id":          existing.ID,
-				"target_type": existing.TargetType,
-				"target_id":   existing.TargetID,
-				"author_name": existing.AuthorName,
-				"content_md":  trimmed,
-				"status":      nextStatus,
-				"is_edit":     true,
-			})
-			if hookErr != nil {
-				var rej *plugin.HookRejectedError
-				if errors.As(hookErr, &rej) {
-					if reason := strings.TrimSpace(rej.Reason); reason != "" {
+			preHookTrimmed := trimmed
+			for _, hookName := range []string{plugin.HookCommentBeforeUpdate, plugin.HookCommentBeforeCreate} {
+				hookOut, hookErr := s.plugins.DispatchHook(ctx, hookName, map[string]any{
+					"id":          existing.ID,
+					"target_type": existing.TargetType,
+					"target_id":   existing.TargetID,
+					"author_name": existing.AuthorName,
+					"content_md":  trimmed,
+					"status":      nextStatus,
+					"is_edit":     true,
+				})
+				if hookErr != nil {
+					var rej *plugin.HookRejectedError
+					if errors.As(hookErr, &rej) {
+						if reason := strings.TrimSpace(rej.Reason); reason != "" {
+							return PublicCommentView{}, fmt.Errorf("%w: %s", ErrCommentRejected, reason)
+						}
+						return PublicCommentView{}, ErrCommentRejected
+					}
+				} else if resMap, ok := hookOut.(map[string]any); ok {
+					if nextMD, sOk := resMap["content_md"].(string); sOk {
+						trimmedNext := strings.TrimSpace(nextMD)
+						if trimmedNext == "" || len([]rune(trimmedNext)) > 4000 {
+							return PublicCommentView{}, ErrCommentRejected
+						}
+						trimmed = trimmedNext
+					}
+					if hs, sOk := resMap["status"].(string); sOk && hs == domain.CommentStatusPending {
+						nextStatus = domain.CommentStatusPending
+					}
+				}
+			}
+
+			if trimmed != preHookTrimmed {
+				if snap.Reading.CommentModerationMode == domain.CommentModerationSmart &&
+					s.matchesBuiltinCommentFilter(snap, trimmed, existing.AuthorName, existing.AuthorURL) {
+					nextStatus = domain.CommentStatusPending
+				}
+				reVerdict := s.plugins.Providers().EvaluateComment(ctx, plugin.CommentCheckInput{
+					TargetType: existing.TargetType,
+					TargetID:   existing.TargetID,
+					AuthorName: existing.AuthorName,
+					AuthorURL:  existing.AuthorURL,
+					ContentMD:  trimmed,
+					IPMasked:   existing.IPMasked,
+					GeoRegion:  existing.GeoRegion,
+					Locale:     evalLocale,
+					IsGuest:    strings.TrimSpace(existing.UserID) == "",
+				})
+				if reVerdict.Action == plugin.SpamActionReject {
+					if reason := strings.TrimSpace(reVerdict.Reason); reason != "" {
 						return PublicCommentView{}, fmt.Errorf("%w: %s", ErrCommentRejected, reason)
 					}
 					return PublicCommentView{}, ErrCommentRejected
 				}
-			} else if resMap, ok := hookOut.(map[string]any); ok {
-				if nextMD, sOk := resMap["content_md"].(string); sOk {
-					trimmedNext := strings.TrimSpace(nextMD)
-					if trimmedNext == "" || len([]rune(trimmedNext)) > 4000 {
-						return PublicCommentView{}, ErrCommentRejected
-					}
-					trimmed = trimmedNext
-				}
-				if hs, sOk := resMap["status"].(string); sOk && hs == domain.CommentStatusPending {
+				if reVerdict.Action == plugin.SpamActionModerate {
 					nextStatus = domain.CommentStatusPending
 				}
 			}
@@ -1283,23 +1351,55 @@ func sanitizeCommentAuthorURL(raw string) (string, bool) {
 	return u.String(), true
 }
 
-func containsBlockedKeyword(content string, author string, blocked []string, allowed []string) bool {
-	haystack := strings.ToLower(content + " " + author)
-	for _, allow := range allowed {
-		a := strings.ToLower(strings.TrimSpace(allow))
-		if a != "" {
-			haystack = strings.ReplaceAll(haystack, a, "")
-		}
+func (s *Service) matchesBuiltinCommentFilter(snap domain.SettingsSnapshot, content string, author string, authorURL string) bool {
+	if !snap.Reading.BuiltinSpamFilter {
+		return false
 	}
-	for _, kw := range blocked {
-		k := strings.ToLower(strings.TrimSpace(kw))
-		if k != "" && strings.Contains(haystack, k) {
-			return true
-		}
-	}
-	// Built-in heuristic: > 4 external http(s) links in a single guest comment triggers moderation.
-	if strings.Count(haystack, "http://")+strings.Count(haystack, "https://") > 4 {
+	// Built-in heuristic: > 4 external http(s) links in a single comment triggers moderation.
+	if countExternalLinksLower(content) > 4 {
 		return true
 	}
-	return false
+	m := s.getOrBuildKeywordMatcher(snap)
+	if m == nil || m.WordCount() == 0 {
+		return false
+	}
+	return m.Contains(content) ||
+		(strings.TrimSpace(author) != "" && m.Contains(author)) ||
+		(strings.TrimSpace(authorURL) != "" && m.Contains(authorURL))
+}
+
+func (s *Service) getOrBuildKeywordMatcher(snap domain.SettingsSnapshot) *wordfilter.Matcher {
+	var rev uint64
+	if s.settings != nil {
+		rev = s.settings.Revision()
+	}
+	if rev > 0 {
+		if cached := s.kwFilter.Load(); cached != nil && cached.rev == rev {
+			return cached.matcher
+		}
+	}
+	var m *wordfilter.Matcher
+	if len(snap.Reading.BlockedKeywords) > 0 {
+		m = wordfilter.Compile(wordfilter.Options{
+			Deny:             snap.Reading.BlockedKeywords,
+			Allow:            snap.Reading.AllowedKeywords,
+			IgnoreSeparators: true,
+			IgnoreRepeat:     true,
+		})
+	}
+	if rev > 0 {
+		s.kwFilter.Store(&cachedKeywordFilter{
+			rev:     rev,
+			matcher: m,
+		})
+	}
+	return m
+}
+
+func countExternalLinksLower(s string) int {
+	if len(s) < len("http://") {
+		return 0
+	}
+	low := strings.ToLower(s)
+	return strings.Count(low, "http://") + strings.Count(low, "https://")
 }

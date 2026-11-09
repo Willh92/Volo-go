@@ -312,6 +312,45 @@ func PurgeExpiredKV(ctx context.Context, store *sqlx.Store, nowUnix int64) (int6
 	return n, nil
 }
 
+// DeletePrefix deletes all keys belonging to this plugin whose key begins with prefix
+// without bumping content dataRev. Requires a non-empty prefix (use ClearPluginKV to wipe all keys).
+func (kv *KVStore) DeletePrefix(ctx context.Context, prefix string) (int64, error) {
+	p := strings.TrimSpace(prefix)
+	if p == "" {
+		return 0, errors.New("plugin_kv: deletePrefix requires a non-empty prefix")
+	}
+	if len(p) > MaxKVKeyBytes {
+		return 0, fmt.Errorf("plugin_kv: prefix exceeds %d bytes", MaxKVKeyBytes)
+	}
+	if strings.ContainsRune(p, '\x00') {
+		return 0, errors.New("plugin_kv: prefix cannot contain NUL byte")
+	}
+	res, err := kv.store.ExecBgContext(
+		ctx,
+		`DELETE FROM plugin_kv WHERE plugin_id = ? AND k LIKE ? ESCAPE '\'`,
+		kv.pluginID,
+		escapeLikePrefix(p)+"%",
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+func escapeLikePrefix(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '%' || c == '_' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // ClearPluginKV deletes all stored keys belonging to pluginID without bumping content dataRev.
 func ClearPluginKV(ctx context.Context, store *sqlx.Store, pluginID string) error {
 	_, err := store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, pluginID)

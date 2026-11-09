@@ -9,6 +9,8 @@ import (
 
 // Anti-spam verdict actions.
 const (
+	// SpamActionPass indicates no verdict override from the provider (defer to host moderation/keyword rules).
+	SpamActionPass     = "pass"
 	SpamActionAllow    = "allow"
 	SpamActionModerate = "moderate"
 	SpamActionReject   = "reject"
@@ -94,9 +96,19 @@ type CommentCheckInput struct {
 	IsGuest    bool   `json:"is_guest"`
 }
 
+// NicknameCheckInput contains candidate account/profile nickname attributes evaluated during registration or OIDC provisioning.
+type NicknameCheckInput struct {
+	Nickname  string `json:"nickname"`
+	Email     string `json:"email,omitempty"`
+	IPMasked  string `json:"ip_masked,omitempty"`
+	GeoRegion string `json:"geo_region,omitempty"`
+	Locale    string `json:"locale"`
+	Source    string `json:"source"`
+}
+
 // SpamVerdict is returned by AntiSpamProvider implementations.
 type SpamVerdict struct {
-	Action string  `json:"action"` // allow | moderate | reject
+	Action string  `json:"action"` // pass | allow | moderate | reject
 	Score  float64 `json:"score"`
 	Reason string  `json:"reason,omitempty"`
 }
@@ -108,6 +120,13 @@ type AntiSpamProvider interface {
 	CheckComment(ctx context.Context, input CommentCheckInput) (SpamVerdict, error)
 }
 
+// NicknameAntiSpamProvider is an optional extension implemented by AntiSpamProvider plugins
+// that screen candidate registration/profile nicknames (`checkNickname(input)` in JS).
+type NicknameAntiSpamProvider interface {
+	AntiSpamProvider
+	CheckNickname(ctx context.Context, input NicknameCheckInput) (SpamVerdict, error)
+}
+
 // FederationProvider allows plugins with federation capability to publish/deliver article lifecycle events.
 type FederationProvider interface {
 	Name() string
@@ -116,6 +135,7 @@ type FederationProvider interface {
 
 type providerEntry[T any] struct {
 	pluginID string
+	priority int
 	provider T
 }
 
@@ -124,8 +144,9 @@ type providerEntry[T any] struct {
 type ProviderRegistry struct {
 	mu sync.RWMutex
 
-	defaultStorage  StorageProvider
-	defaultAntiSpam AntiSpamProvider
+	defaultStorage   StorageProvider
+	defaultAntiSpam  AntiSpamProvider
+	pluginPriorities map[string]int
 
 	storageList    []providerEntry[StorageProvider]
 	notifierList   []providerEntry[NotifierProvider]
@@ -140,9 +161,77 @@ func NewProviderRegistry(defaultStorage StorageProvider, defaultAntiSpam AntiSpa
 		defaultAntiSpam = noopAntiSpamProvider{}
 	}
 	return &ProviderRegistry{
-		defaultStorage:  defaultStorage,
-		defaultAntiSpam: defaultAntiSpam,
-		oidcMap:         make(map[string]providerEntry[OIDCProvider]),
+		defaultStorage:   defaultStorage,
+		defaultAntiSpam:  defaultAntiSpam,
+		pluginPriorities: make(map[string]int),
+		oidcMap:          make(map[string]providerEntry[OIDCProvider]),
+	}
+}
+
+func (r *ProviderRegistry) priorityForLocked(pluginID string) int {
+	if r.pluginPriorities != nil {
+		if p, ok := r.pluginPriorities[pluginID]; ok {
+			return p
+		}
+	}
+	return DefaultPluginPriority
+}
+
+func sortProviderChain[T any](list []providerEntry[T]) {
+	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].priority != list[j].priority {
+			return list[i].priority < list[j].priority
+		}
+		return list[i].pluginID < list[j].pluginID
+	})
+}
+
+func sortStorageEntries(list []providerEntry[StorageProvider]) {
+	// ActiveStorage selects list[len-1]: put lowest priority value (highest priority) at the tail,
+	// preserving registration order on equal priority.
+	sort.SliceStable(list, func(i, j int) bool {
+		return list[i].priority > list[j].priority
+	})
+}
+
+// SetPluginPriority updates a plugin's execution priority and re-sorts all active provider chains.
+func (r *ProviderRegistry) SetPluginPriority(pluginID string, priority int) {
+	p := ClampPluginPriority(priority)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pluginPriorities == nil {
+		r.pluginPriorities = make(map[string]int)
+	}
+	r.pluginPriorities[pluginID] = p
+	for i := range r.storageList {
+		if r.storageList[i].pluginID == pluginID {
+			r.storageList[i].priority = p
+		}
+	}
+	sortStorageEntries(r.storageList)
+	for i := range r.notifierList {
+		if r.notifierList[i].pluginID == pluginID {
+			r.notifierList[i].priority = p
+		}
+	}
+	sortProviderChain(r.notifierList)
+	for i := range r.antiSpamList {
+		if r.antiSpamList[i].pluginID == pluginID {
+			r.antiSpamList[i].priority = p
+		}
+	}
+	sortProviderChain(r.antiSpamList)
+	for i := range r.federationList {
+		if r.federationList[i].pluginID == pluginID {
+			r.federationList[i].priority = p
+		}
+	}
+	sortProviderChain(r.federationList)
+	for name, ent := range r.oidcMap {
+		if ent.pluginID == pluginID {
+			ent.priority = p
+			r.oidcMap[name] = ent
+		}
 	}
 }
 
@@ -166,7 +255,12 @@ func (r *ProviderRegistry) RegisterStorage(pluginID string, p StorageProvider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.storageList = removeEntries(r.storageList, pluginID)
-	r.storageList = append(r.storageList, providerEntry[StorageProvider]{pluginID: pluginID, provider: p})
+	r.storageList = append(r.storageList, providerEntry[StorageProvider]{
+		pluginID: pluginID,
+		priority: r.priorityForLocked(pluginID),
+		provider: p,
+	})
+	sortStorageEntries(r.storageList)
 }
 
 // RegisterNotifier binds a NotifierProvider owned by pluginID.
@@ -177,7 +271,12 @@ func (r *ProviderRegistry) RegisterNotifier(pluginID string, p NotifierProvider)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.notifierList = removeEntries(r.notifierList, pluginID)
-	r.notifierList = append(r.notifierList, providerEntry[NotifierProvider]{pluginID: pluginID, provider: p})
+	r.notifierList = append(r.notifierList, providerEntry[NotifierProvider]{
+		pluginID: pluginID,
+		priority: r.priorityForLocked(pluginID),
+		provider: p,
+	})
+	sortProviderChain(r.notifierList)
 }
 
 // RegisterOIDC binds an OIDCProvider owned by pluginID.
@@ -187,7 +286,11 @@ func (r *ProviderRegistry) RegisterOIDC(pluginID string, p OIDCProvider) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.oidcMap[p.Name()] = providerEntry[OIDCProvider]{pluginID: pluginID, provider: p}
+	r.oidcMap[p.Name()] = providerEntry[OIDCProvider]{
+		pluginID: pluginID,
+		priority: r.priorityForLocked(pluginID),
+		provider: p,
+	}
 }
 
 // RegisterAntiSpam binds an AntiSpamProvider owned by pluginID.
@@ -198,7 +301,12 @@ func (r *ProviderRegistry) RegisterAntiSpam(pluginID string, p AntiSpamProvider)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.antiSpamList = removeEntries(r.antiSpamList, pluginID)
-	r.antiSpamList = append(r.antiSpamList, providerEntry[AntiSpamProvider]{pluginID: pluginID, provider: p})
+	r.antiSpamList = append(r.antiSpamList, providerEntry[AntiSpamProvider]{
+		pluginID: pluginID,
+		priority: r.priorityForLocked(pluginID),
+		provider: p,
+	})
+	sortProviderChain(r.antiSpamList)
 }
 
 // RegisterFederation binds a FederationProvider owned by pluginID.
@@ -209,7 +317,12 @@ func (r *ProviderRegistry) RegisterFederation(pluginID string, p FederationProvi
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.federationList = removeEntries(r.federationList, pluginID)
-	r.federationList = append(r.federationList, providerEntry[FederationProvider]{pluginID: pluginID, provider: p})
+	r.federationList = append(r.federationList, providerEntry[FederationProvider]{
+		pluginID: pluginID,
+		priority: r.priorityForLocked(pluginID),
+		provider: p,
+	})
+	sortProviderChain(r.federationList)
 }
 
 // DetachPlugin removes all providers registered by pluginID (invoked on disable, uninstall, or circuit trip).
@@ -291,7 +404,7 @@ func (r *ProviderRegistry) OIDC(name string) (OIDCProvider, bool) {
 	return ent.provider, ok
 }
 
-// OIDCProviders returns all active OIDCProviders sorted deterministically by provider name.
+// OIDCProviders returns all active OIDCProviders sorted deterministically by plugin priority then provider name.
 func (r *ProviderRegistry) OIDCProviders() []OIDCProvider {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -299,7 +412,14 @@ func (r *ProviderRegistry) OIDCProviders() []OIDCProvider {
 	for name := range r.oidcMap {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		pi := r.oidcMap[names[i]].priority
+		pj := r.oidcMap[names[j]].priority
+		if pi != pj {
+			return pi < pj
+		}
+		return names[i] < names[j]
+	})
 	out := make([]OIDCProvider, 0, len(names))
 	for _, name := range names {
 		out = append(out, r.oidcMap[name].provider)
@@ -307,30 +427,140 @@ func (r *ProviderRegistry) OIDCProviders() []OIDCProvider {
 	return out
 }
 
-// EvaluateComment runs the active plugin AntiSpamProvider (if any); if none is active or if the
-// plugin provider errors, it seamlessly falls back to defaultAntiSpam so comments never break.
+func antiSpamActionRank(action string) int {
+	switch action {
+	case SpamActionReject:
+		return 3
+	case SpamActionModerate:
+		return 2
+	case SpamActionAllow:
+		return 1
+	case SpamActionPass:
+		return 0
+	default:
+		return -1
+	}
+}
+
+func mergeSpamVerdict(cur SpamVerdict, hasCur bool, cand SpamVerdict) (SpamVerdict, bool) {
+	rank := antiSpamActionRank(cand.Action)
+	if rank < 0 {
+		return cur, hasCur
+	}
+	if !hasCur || rank > antiSpamActionRank(cur.Action) {
+		if cand.Score < cur.Score {
+			cand.Score = cur.Score
+		}
+		if cand.Reason == "" {
+			cand.Reason = cur.Reason
+		}
+		return cand, true
+	}
+	if cand.Score > cur.Score {
+		cur.Score = cand.Score
+	}
+	if cur.Reason == "" && cand.Reason != "" && rank == antiSpamActionRank(cur.Action) {
+		cur.Reason = cand.Reason
+	}
+	return cur, true
+}
+
+// EvaluateComment runs all active plugin AntiSpamProviders in registration order (short-circuiting on
+// reject and ratcheting moderate > allow > pass); if none are active or all error, falls back to defaultAntiSpam.
 func (r *ProviderRegistry) EvaluateComment(ctx context.Context, input CommentCheckInput) SpamVerdict {
 	r.mu.RLock()
-	var active AntiSpamProvider
-	if n := len(r.antiSpamList); n > 0 {
-		active = r.antiSpamList[n-1].provider
+	active := make([]AntiSpamProvider, len(r.antiSpamList))
+	for i, ent := range r.antiSpamList {
+		active[i] = ent.provider
 	}
 	fallback := r.defaultAntiSpam
 	r.mu.RUnlock()
 
-	if active != nil {
-		verdict, err := active.CheckComment(ctx, input)
-		if err == nil && (verdict.Action == SpamActionAllow || verdict.Action == SpamActionModerate || verdict.Action == SpamActionReject) {
+	var merged SpamVerdict
+	hasVerdict := false
+	for _, p := range active {
+		if p == nil {
+			continue
+		}
+		verdict, err := p.CheckComment(ctx, input)
+		if err != nil {
+			continue
+		}
+		if verdict.Action == SpamActionReject {
 			return verdict
 		}
+		merged, hasVerdict = mergeSpamVerdict(merged, hasVerdict, verdict)
+	}
+	if hasVerdict {
+		return merged
 	}
 	if fallback != nil {
 		verdict, err := fallback.CheckComment(ctx, input)
-		if err == nil {
+		if err == nil && antiSpamActionRank(verdict.Action) >= 0 {
 			return verdict
 		}
 	}
-	return SpamVerdict{Action: SpamActionAllow}
+	return SpamVerdict{Action: SpamActionPass}
+}
+
+// EvaluateNickname screens a candidate account/profile nickname across all active AntiSpamProviders
+// (preferring NicknameAntiSpamProvider.CheckNickname when implemented, or falling back to CheckComment).
+func (r *ProviderRegistry) EvaluateNickname(ctx context.Context, input NicknameCheckInput) SpamVerdict {
+	r.mu.RLock()
+	active := make([]AntiSpamProvider, len(r.antiSpamList))
+	for i, ent := range r.antiSpamList {
+		active[i] = ent.provider
+	}
+	fallback := r.defaultAntiSpam
+	r.mu.RUnlock()
+
+	evalOne := func(p AntiSpamProvider) (SpamVerdict, bool) {
+		if p == nil {
+			return SpamVerdict{}, false
+		}
+		var (
+			verdict SpamVerdict
+			err     error
+		)
+		if np, ok := p.(NicknameAntiSpamProvider); ok {
+			verdict, err = np.CheckNickname(ctx, input)
+		} else {
+			verdict, err = p.CheckComment(ctx, CommentCheckInput{
+				TargetType: "nickname",
+				TargetID:   input.Source,
+				AuthorName: input.Nickname,
+				ContentMD:  input.Nickname,
+				IPMasked:   input.IPMasked,
+				GeoRegion:  input.GeoRegion,
+				Locale:     input.Locale,
+				IsGuest:    true,
+			})
+		}
+		if err == nil && antiSpamActionRank(verdict.Action) >= 0 {
+			return verdict, true
+		}
+		return SpamVerdict{}, false
+	}
+
+	var merged SpamVerdict
+	hasVerdict := false
+	for _, p := range active {
+		v, ok := evalOne(p)
+		if !ok {
+			continue
+		}
+		if v.Action == SpamActionReject {
+			return v
+		}
+		merged, hasVerdict = mergeSpamVerdict(merged, hasVerdict, v)
+	}
+	if hasVerdict {
+		return merged
+	}
+	if v, ok := evalOne(fallback); ok {
+		return v
+	}
+	return SpamVerdict{Action: SpamActionPass}
 }
 
 func removeEntries[T any](in []providerEntry[T], pluginID string) []providerEntry[T] {
@@ -351,5 +581,5 @@ type noopAntiSpamProvider struct{}
 
 func (noopAntiSpamProvider) Name() string { return "builtin-default" }
 func (noopAntiSpamProvider) CheckComment(_ context.Context, _ CommentCheckInput) (SpamVerdict, error) {
-	return SpamVerdict{Action: SpamActionAllow}, nil
+	return SpamVerdict{Action: SpamActionPass}, nil
 }

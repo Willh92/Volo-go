@@ -1804,12 +1804,13 @@
     if (sendBtn && regForm) {
       sendBtn.addEventListener("click", function () {
         var emailInput = regForm.querySelector("input[name='email']");
+        var userInput = regForm.querySelector("input[name='username']");
         var statusEl = regForm.querySelector(".js-auth-msg");
         if (!emailInput || !emailInput.value) return;
         fetch("/api/v1/reader/send-code", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: emailInput.value })
+          body: JSON.stringify({ email: emailInput.value, username: userInput ? userInput.value : "" })
         }).then(function (r) {
           return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d }; });
         }).then(function (res) {

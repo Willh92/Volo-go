@@ -259,6 +259,7 @@
   "reader.err_invalid_credentials": "Invalid username/email or password.",
   "reader.err_invalid_email": "Please enter a valid email address.",
   "reader.err_username_len": "Username must be between 2 and 48 characters.",
+  "reader.err_username_sensitive": "This nickname contains restricted or reserved words. Please choose another.",
   "reader.err_password_policy": "Password does not meet minimum security requirements.",
   "reader.err_verify_code": "Verification code is invalid or expired.",
   "reader.err_code_cooldown": "Please wait 60 seconds before requesting another code.",

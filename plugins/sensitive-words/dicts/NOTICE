@@ -1,0 +1,14 @@
+Third-Party Dictionary Attribution Notice
+=========================================
+
+`houbb_base.txt.gz` and baseline allowlist entries in `allowlist.txt` are converted
+and sanitized from:
+  - https://github.com/houbb/sensitive-word (Apache License 2.0)
+  - https://github.com/houbb/sensitive-word-data (Apache License 2.0)
+
+Traditional-to-Simplified Chinese character normalization tables in the host
+`pkg/wordfilter` engine are derived from:
+  - https://github.com/BYVoid/OpenCC / https://github.com/houbb/opencc4j (Apache License 2.0)
+
+Licensed under the Apache License, Version 2.0:
+  http://www.apache.org/licenses/LICENSE-2.0

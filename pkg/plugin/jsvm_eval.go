@@ -2034,7 +2034,7 @@ func hasOwnPropValue(target jsValue, prop string) bool {
 func newHasOwnPropertyFn() jsValue {
 	return nativeVal(func(r *jsRuntime, thisVal jsValue, args []jsValue) (jsValue, error) {
 		if thisVal.kind == valUndefined || thisVal.kind == valNull {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
+			return r.throwValErr("TypeError", "Cannot convert undefined or null to object")
 		}
 		k := ""
 		if len(args) > 0 {
@@ -2331,25 +2331,22 @@ func stringProperty(s string, prop string) jsValue {
 		return jsValue{kind: valNumber, num: float64(utf8.RuneCountInString(s))}
 	}
 	switch prop {
-	case "toLowerCase":
+	case "toLowerCase", "toUpperCase", "trim", "trimStart", "trimLeft", "trimEnd", "trimRight":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-			return jsValue{kind: valString, str: strings.ToLower(s)}, nil
-		})
-	case "toUpperCase":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-			return jsValue{kind: valString, str: strings.ToUpper(s)}, nil
-		})
-	case "trim":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-			return jsValue{kind: valString, str: strings.TrimSpace(s)}, nil
-		})
-	case "trimStart", "trimLeft":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-			return jsValue{kind: valString, str: strings.TrimLeftFunc(s, unicode.IsSpace)}, nil
-		})
-	case "trimEnd", "trimRight":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-			return jsValue{kind: valString, str: strings.TrimRightFunc(s, unicode.IsSpace)}, nil
+			var out string
+			switch prop {
+			case "toLowerCase":
+				out = strings.ToLower(s)
+			case "toUpperCase":
+				out = strings.ToUpper(s)
+			case "trim":
+				out = strings.TrimSpace(s)
+			case "trimStart", "trimLeft":
+				out = strings.TrimLeftFunc(s, unicode.IsSpace)
+			default:
+				out = strings.TrimRightFunc(s, unicode.IsSpace)
+			}
+			return jsValue{kind: valString, str: out}, nil
 		})
 	case "padStart", "padEnd":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -2408,20 +2405,12 @@ func stringProperty(s string, prop string) jsValue {
 			sub := args[0].toString()
 			if len(args) >= 2 && args[1].kind != valUndefined {
 				sRunes := []rune(s)
-				subRunes := []rune(sub)
-				pos := int(math.Trunc(args[1].toNumber()))
-				if pos < 0 {
-					pos = 0
-				}
-				if pos > len(sRunes) {
-					pos = len(sRunes)
-				}
+				pos := min(max(0, int(math.Trunc(args[1].toNumber()))), len(sRunes))
 				tail := string(sRunes[pos:])
 				byteIdx := strings.Index(tail, sub)
 				if byteIdx < 0 {
 					return jsValue{kind: valNumber, num: -1}, nil
 				}
-				_ = subRunes
 				return jsValue{kind: valNumber, num: float64(pos + utf8.RuneCountInString(tail[:byteIdx]))}, nil
 			}
 			byteIdx := strings.Index(s, sub)
@@ -2442,15 +2431,10 @@ func stringProperty(s string, prop string) jsValue {
 			if len(args) >= 2 && args[1].kind != valUndefined {
 				pf := args[1].toNumber()
 				if !math.IsNaN(pf) {
-					if pf < 0 {
-						maxPos = 0
-					} else if int(math.Trunc(pf)) < maxPos {
-						maxPos = int(math.Trunc(pf))
-					}
+					maxPos = min(maxPos, max(0, int(math.Trunc(pf))))
 				}
 			}
-			startIdx := min(maxPos, len(sRunes)-len(subRunes))
-			for i := startIdx; i >= 0; i-- {
+			for i := min(maxPos, len(sRunes)-len(subRunes)); i >= 0; i-- {
 				matched := true
 				for j := 0; j < len(subRunes); j++ {
 					if sRunes[i+j] != subRunes[j] {
@@ -2464,33 +2448,26 @@ func stringProperty(s string, prop string) jsValue {
 			}
 			return jsValue{kind: valNumber, num: -1}, nil
 		})
-	case "includes":
+	case "includes", "startsWith", "endsWith":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			if len(args) == 0 {
 				return jsFalseVal, nil
 			}
-			return boolVal(strings.Contains(s, args[0].toString())), nil
-		})
-	case "startsWith":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 {
-				return jsFalseVal, nil
+			sub := args[0].toString()
+			switch prop {
+			case "includes":
+				return boolVal(strings.Contains(s, sub)), nil
+			case "startsWith":
+				return boolVal(strings.HasPrefix(s, sub)), nil
+			default:
+				return boolVal(strings.HasSuffix(s, sub)), nil
 			}
-			return boolVal(strings.HasPrefix(s, args[0].toString())), nil
-		})
-	case "endsWith":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 {
-				return jsFalseVal, nil
-			}
-			return boolVal(strings.HasSuffix(s, args[0].toString())), nil
 		})
 	case "slice", "substring":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			runes := []rune(s)
 			l := len(runes)
-			start := 0
-			end := l
+			start, end := 0, l
 			if len(args) >= 1 && args[0].kind != valUndefined {
 				start = int(args[0].toNumber())
 				if start < 0 {
@@ -2499,8 +2476,7 @@ func stringProperty(s string, prop string) jsValue {
 					} else {
 						start = 0
 					}
-				}
-				if start > l {
+				} else if start > l {
 					start = l
 				}
 			}
@@ -2512,8 +2488,7 @@ func stringProperty(s string, prop string) jsValue {
 					} else {
 						end = 0
 					}
-				}
-				if end > l {
+				} else if end > l {
 					end = l
 				}
 			}
@@ -2526,33 +2501,21 @@ func stringProperty(s string, prop string) jsValue {
 			}
 			return jsValue{kind: valString, str: string(runes[start:end])}, nil
 		})
-	case "charAt":
+	case "charAt", "charCodeAt":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			idx := 0
 			if len(args) > 0 {
 				idx = int(args[0].toNumber())
 			}
-			if idx < 0 {
-				return jsValue{kind: valString, str: ""}, nil
-			}
 			runes := []rune(s)
-			if idx >= len(runes) {
-				return jsValue{kind: valString, str: ""}, nil
-			}
-			return jsValue{kind: valString, str: string(runes[idx])}, nil
-		})
-	case "charCodeAt":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			idx := 0
-			if len(args) > 0 {
-				idx = int(args[0].toNumber())
-			}
-			if idx < 0 {
+			if idx < 0 || idx >= len(runes) {
+				if prop == "charAt" {
+					return jsValue{kind: valString, str: ""}, nil
+				}
 				return jsValue{kind: valNumber, num: math.NaN()}, nil
 			}
-			runes := []rune(s)
-			if idx >= len(runes) {
-				return jsValue{kind: valNumber, num: math.NaN()}, nil
+			if prop == "charAt" {
+				return jsValue{kind: valString, str: string(runes[idx])}, nil
 			}
 			return jsValue{kind: valNumber, num: float64(runes[idx])}, nil
 		})
@@ -2642,13 +2605,11 @@ func stringProperty(s string, prop string) jsValue {
 			}
 			if prop == "replaceAll" {
 				if pat == "" {
-					projected := int64(len(s)) + (int64(utf8.RuneCountInString(s))+1)*int64(len(repl))
-					if projected > maxJSStringBytes {
+					if int64(len(s))+(int64(utf8.RuneCountInString(s))+1)*int64(len(repl)) > maxJSStringBytes {
 						return rt.throwStrLenErr()
 					}
 				} else if cnt := strings.Count(s, pat); cnt > 0 {
-					projected := int64(len(s)) + int64(cnt)*(int64(len(repl))-int64(len(pat)))
-					if projected > maxJSStringBytes {
+					if int64(len(s))+int64(cnt)*(int64(len(repl))-int64(len(pat))) > maxJSStringBytes {
 						return rt.throwStrLenErr()
 					}
 				}
@@ -2669,21 +2630,12 @@ func stringProperty(s string, prop string) jsValue {
 				return jsNullVal, nil
 			}
 			rx := args[0].re
+			var sub []string
 			if rx.global {
-				matches := rx.re.FindAllString(s, maxJSArrayLen+1)
-				if matches == nil {
-					return jsNullVal, nil
-				}
-				if len(matches) > maxJSArrayLen {
-					return rt.throwValErr("RangeError", "Invalid array length")
-				}
-				items := make([]jsValue, len(matches))
-				for i, m := range matches {
-					items[i] = jsValue{kind: valString, str: m}
-				}
-				return jsValue{kind: valArray, arr: &jsArray{items: items}}, nil
+				sub = rx.re.FindAllString(s, maxJSArrayLen+1)
+			} else {
+				sub = rx.re.FindStringSubmatch(s)
 			}
-			sub := rx.re.FindStringSubmatch(s)
 			if sub == nil {
 				return jsNullVal, nil
 			}
@@ -2903,20 +2855,16 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 			arr.items = append(arr.items, args...)
 			return jsValue{kind: valNumber, num: float64(len(arr.items))}, nil
 		})
-	case "pop":
+	case "pop", "shift":
 		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
 			if len(arr.items) == 0 {
 				return jsUndefinedVal, nil
 			}
-			last := arr.items[len(arr.items)-1]
-			arr.items[len(arr.items)-1] = jsUndefinedVal
-			arr.items = arr.items[:len(arr.items)-1]
-			return last, nil
-		})
-	case "shift":
-		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-			if len(arr.items) == 0 {
-				return jsUndefinedVal, nil
+			if prop == "pop" {
+				last := arr.items[len(arr.items)-1]
+				arr.items[len(arr.items)-1] = jsUndefinedVal
+				arr.items = arr.items[:len(arr.items)-1]
+				return last, nil
 			}
 			first := arr.items[0]
 			copy(arr.items, arr.items[1:])
@@ -2989,23 +2937,20 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				}
 			}
 			var sortErr error
-			if cmpFn == nil {
-				sort.SliceStable(defined, func(i, j int) bool {
+			sort.SliceStable(defined, func(i, j int) bool {
+				if cmpFn == nil {
 					return defined[i].toString() < defined[j].toString()
-				})
-			} else {
-				sort.SliceStable(defined, func(i, j int) bool {
-					if sortErr != nil {
-						return false
-					}
-					res, err := rt.callFunc(cmpFn, jsUndefinedVal, []jsValue{defined[i], defined[j]})
-					if err != nil {
-						sortErr = err
-						return false
-					}
-					return res.toNumber() < 0
-				})
-			}
+				}
+				if sortErr != nil {
+					return false
+				}
+				res, err := rt.callFunc(cmpFn, jsUndefinedVal, []jsValue{defined[i], defined[j]})
+				if err != nil {
+					sortErr = err
+					return false
+				}
+				return res.toNumber() < 0
+			})
 			if sortErr != nil {
 				return jsUndefinedVal, sortErr
 			}
@@ -3032,9 +2977,7 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				df := args[1].toNumber()
 				if math.IsNaN(df) || df <= 0 {
 					delCount = 0
-				} else if math.IsInf(df, 1) || int(math.Trunc(df)) > l-start {
-					delCount = l - start
-				} else {
+				} else if !math.IsInf(df, 1) && int(math.Trunc(df)) <= l-start {
 					delCount = int(math.Trunc(df))
 				}
 			}
@@ -3069,41 +3012,8 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				}
 			}
 			out := make([]jsValue, 0, len(arr.items))
-			seen := map[*jsArray]bool{arr: true}
-			if err := flattenJSArray(rt, arr.items, depth, &out, seen); err != nil {
+			if err := flattenJSArray(rt, arr.items, depth, &out, map[*jsArray]bool{arr: true}); err != nil {
 				return jsUndefinedVal, err
-			}
-			return jsValue{kind: valArray, arr: &jsArray{items: out}}, nil
-		})
-	case "flatMap":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
-				return rt.throwValErr("TypeError", "callback must be a function")
-			}
-			thisArg := jsUndefinedVal
-			if len(args) >= 2 {
-				thisArg = args[1]
-			}
-			var out []jsValue
-			for i, it := range arr.items {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				v, err := rt.callFunc(args[0].fn, thisArg, []jsValue{it, {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-				if v.kind == valArray && v.arr != nil {
-					if len(out)+len(v.arr.items) > maxJSArrayLen {
-						return rt.throwValErr("RangeError", "Invalid array length")
-					}
-					out = append(out, v.arr.items...)
-				} else {
-					if len(out)+1 > maxJSArrayLen {
-						return rt.throwValErr("RangeError", "Invalid array length")
-					}
-					out = append(out, v)
-				}
 			}
 			return jsValue{kind: valArray, arr: &jsArray{items: out}}, nil
 		})
@@ -3128,10 +3038,8 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 			if len(arr.items) == 0 {
 				return jsValue{kind: valString, str: ""}, nil
 			}
-			if len(arr.items) > 1 && len(sep) > 0 {
-				if int64(len(arr.items)-1)*int64(len(sep)) > maxJSStringBytes {
-					return rt.throwStrLenErr()
-				}
+			if len(arr.items) > 1 && len(sep) > 0 && int64(len(arr.items)-1)*int64(len(sep)) > maxJSStringBytes {
+				return rt.throwStrLenErr()
 			}
 			var b strings.Builder
 			seenArr := map[*jsArray]bool{arr: true}
@@ -3140,15 +3048,11 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				if err := rt.checkInterrupt(); err != nil {
 					return jsUndefinedVal, err
 				}
-				if i > 0 && len(sep) > 0 {
-					if !appendBoundedString(&b, sep) {
-						return rt.throwStrLenErr()
-					}
+				if i > 0 && len(sep) > 0 && !appendBoundedString(&b, sep) {
+					return rt.throwStrLenErr()
 				}
-				if it.kind != valUndefined && it.kind != valNull {
-					if !it.writeToString(&b, seenArr, nil, 1, &nodes) {
-						return rt.throwStrLenErr()
-					}
+				if it.kind != valUndefined && it.kind != valNull && !it.writeToString(&b, seenArr, nil, 1, &nodes) {
+					return rt.throwStrLenErr()
 				}
 			}
 			return jsValue{kind: valString, str: b.String()}, nil
@@ -3161,8 +3065,7 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				start = int(args[0].toNumber())
 				if start < 0 {
 					start = max(0, l+start)
-				}
-				if start > l {
+				} else if start > l {
 					start = l
 				}
 			}
@@ -3170,21 +3073,22 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				end = int(args[1].toNumber())
 				if end < 0 {
 					end = max(0, l+end)
-				}
-				if end > l {
+				} else if end > l {
 					end = l
 				}
 			}
-			if end < start {
-				end = start
-			}
+			end = max(start, end)
 			cp := make([]jsValue, end-start)
 			copy(cp, arr.items[start:end])
 			return jsValue{kind: valArray, arr: &jsArray{items: cp}}, nil
 		})
-	case "indexOf":
+	case "indexOf", "includes":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			asBool := prop == "includes"
 			if len(args) == 0 {
+				if asBool {
+					return jsFalseVal, nil
+				}
 				return jsValue{kind: valNumber, num: -1}, nil
 			}
 			start := 0
@@ -3198,215 +3102,41 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				if err := rt.checkInterrupt(); err != nil {
 					return jsUndefinedVal, err
 				}
-				if jsStrictEqual(arr.items[i], args[0]) {
+				it := arr.items[i]
+				if jsStrictEqual(it, args[0]) || (asBool && it.kind == valNumber && args[0].kind == valNumber && math.IsNaN(it.num) && math.IsNaN(args[0].num)) {
+					if asBool {
+						return jsTrueVal, nil
+					}
 					return jsValue{kind: valNumber, num: float64(i)}, nil
 				}
 			}
-			return jsValue{kind: valNumber, num: -1}, nil
-		})
-	case "includes":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 {
+			if asBool {
 				return jsFalseVal, nil
 			}
-			start := 0
-			if len(args) >= 2 && args[1].kind != valUndefined {
-				start = int(math.Trunc(args[1].toNumber()))
-				if start < 0 {
-					start = max(0, len(arr.items)+start)
-				}
-			}
-			for i := start; i < len(arr.items); i++ {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				it := arr.items[i]
-				if jsStrictEqual(it, args[0]) || (it.kind == valNumber && args[0].kind == valNumber && math.IsNaN(it.num) && math.IsNaN(args[0].num)) {
-					return jsTrueVal, nil
-				}
-			}
-			return jsFalseVal, nil
-		})
-	case "find":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
-				return rt.throwValErr("TypeError", "predicate must be a function")
-			}
-			thisArg := jsUndefinedVal
-			if len(args) >= 2 {
-				thisArg = args[1]
-			}
-			for i, it := range arr.items {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				v, err := rt.callFunc(args[0].fn, thisArg, []jsValue{it, {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-				if v.toBool() {
-					return it, nil
-				}
-			}
-			return jsUndefinedVal, nil
-		})
-	case "findIndex":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
-				return rt.throwValErr("TypeError", "predicate must be a function")
-			}
-			thisArg := jsUndefinedVal
-			if len(args) >= 2 {
-				thisArg = args[1]
-			}
-			for i, it := range arr.items {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				v, err := rt.callFunc(args[0].fn, thisArg, []jsValue{it, {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-				if v.toBool() {
-					return jsValue{kind: valNumber, num: float64(i)}, nil
-				}
-			}
 			return jsValue{kind: valNumber, num: -1}, nil
 		})
-	case "some":
+	case "find", "findIndex", "some", "every", "map", "filter", "forEach", "flatMap":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
-				return rt.throwValErr("TypeError", "predicate must be a function")
-			}
-			thisArg := jsUndefinedVal
-			if len(args) >= 2 {
-				thisArg = args[1]
-			}
-			for i, it := range arr.items {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
+				switch prop {
+				case "map", "filter":
+					return jsValue{kind: valArray, arr: &jsArray{}}, nil
+				case "forEach":
+					return jsUndefinedVal, nil
+				case "flatMap":
+					return rt.throwValErr("TypeError", "callback must be a function")
+				default:
+					return rt.throwValErr("TypeError", "predicate must be a function")
 				}
-				v, err := rt.callFunc(args[0].fn, thisArg, []jsValue{it, {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-				if v.toBool() {
-					return jsTrueVal, nil
-				}
-			}
-			return jsFalseVal, nil
-		})
-	case "every":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
-				return rt.throwValErr("TypeError", "predicate must be a function")
-			}
-			thisArg := jsUndefinedVal
-			if len(args) >= 2 {
-				thisArg = args[1]
-			}
-			for i, it := range arr.items {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				v, err := rt.callFunc(args[0].fn, thisArg, []jsValue{it, {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-				if !v.toBool() {
-					return jsFalseVal, nil
-				}
-			}
-			return jsTrueVal, nil
-		})
-	case "reduce":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
-				return rt.throwValErr("TypeError", "reducer must be a function")
-			}
-			var acc jsValue
-			startIdx := 0
-			if len(args) >= 2 {
-				acc = args[1]
-			} else {
-				if len(arr.items) == 0 {
-					return rt.throwValErr("TypeError", "Reduce of empty array with no initial value")
-				}
-				acc = arr.items[0]
-				startIdx = 1
-			}
-			for i := startIdx; i < len(arr.items); i++ {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				var err error
-				acc, err = rt.callFunc(args[0].fn, jsUndefinedVal, []jsValue{acc, arr.items[i], {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-			}
-			return acc, nil
-		})
-	case "reduceRight":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
-				return rt.throwValErr("TypeError", "reducer must be a function")
-			}
-			var acc jsValue
-			startIdx := len(arr.items) - 1
-			if len(args) >= 2 {
-				acc = args[1]
-			} else {
-				if len(arr.items) == 0 {
-					return rt.throwValErr("TypeError", "Reduce of empty array with no initial value")
-				}
-				acc = arr.items[len(arr.items)-1]
-				startIdx = len(arr.items) - 2
-			}
-			for i := startIdx; i >= 0; i-- {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				var err error
-				acc, err = rt.callFunc(args[0].fn, jsUndefinedVal, []jsValue{acc, arr.items[i], {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-			}
-			return acc, nil
-		})
-	case "map":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc {
-				return jsValue{kind: valArray, arr: &jsArray{}}, nil
-			}
-			thisArg := jsUndefinedVal
-			if len(args) >= 2 {
-				thisArg = args[1]
-			}
-			out := make([]jsValue, len(arr.items))
-			for i, it := range arr.items {
-				if err := rt.checkInterrupt(); err != nil {
-					return jsUndefinedVal, err
-				}
-				v, err := rt.callFunc(args[0].fn, thisArg, []jsValue{it, {kind: valNumber, num: float64(i)}, arrVal})
-				if err != nil {
-					return jsUndefinedVal, err
-				}
-				out[i] = v
-			}
-			return jsValue{kind: valArray, arr: &jsArray{items: out}}, nil
-		})
-	case "filter":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc {
-				return jsValue{kind: valArray, arr: &jsArray{}}, nil
 			}
 			thisArg := jsUndefinedVal
 			if len(args) >= 2 {
 				thisArg = args[1]
 			}
 			var out []jsValue
+			if prop == "map" {
+				out = make([]jsValue, len(arr.items))
+			}
 			for i, it := range arr.items {
 				if err := rt.checkInterrupt(); err != nil {
 					return jsUndefinedVal, err
@@ -3415,30 +3145,87 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 				if err != nil {
 					return jsUndefinedVal, err
 				}
-				if v.toBool() {
-					out = append(out, it)
+				switch prop {
+				case "find":
+					if v.toBool() {
+						return it, nil
+					}
+				case "findIndex":
+					if v.toBool() {
+						return jsValue{kind: valNumber, num: float64(i)}, nil
+					}
+				case "some":
+					if v.toBool() {
+						return jsTrueVal, nil
+					}
+				case "every":
+					if !v.toBool() {
+						return jsFalseVal, nil
+					}
+				case "map":
+					out[i] = v
+				case "filter":
+					if v.toBool() {
+						out = append(out, it)
+					}
+				case "flatMap":
+					if v.kind == valArray && v.arr != nil {
+						if len(out)+len(v.arr.items) > maxJSArrayLen {
+							return rt.throwValErr("RangeError", "Invalid array length")
+						}
+						out = append(out, v.arr.items...)
+					} else {
+						if len(out)+1 > maxJSArrayLen {
+							return rt.throwValErr("RangeError", "Invalid array length")
+						}
+						out = append(out, v)
+					}
 				}
 			}
-			return jsValue{kind: valArray, arr: &jsArray{items: out}}, nil
-		})
-	case "forEach":
-		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valFunc {
+			switch prop {
+			case "find", "forEach":
 				return jsUndefinedVal, nil
+			case "findIndex":
+				return jsValue{kind: valNumber, num: -1}, nil
+			case "some":
+				return jsFalseVal, nil
+			case "every":
+				return jsTrueVal, nil
+			default:
+				return jsValue{kind: valArray, arr: &jsArray{items: out}}, nil
 			}
-			thisArg := jsUndefinedVal
+		})
+	case "reduce", "reduceRight":
+		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if len(args) == 0 || args[0].kind != valFunc || args[0].fn == nil {
+				return rt.throwValErr("TypeError", "reducer must be a function")
+			}
+			right := prop == "reduceRight"
+			var acc jsValue
+			startIdx, step := 0, 1
+			if right {
+				startIdx, step = len(arr.items)-1, -1
+			}
 			if len(args) >= 2 {
-				thisArg = args[1]
+				acc = args[1]
+			} else {
+				if len(arr.items) == 0 {
+					return rt.throwValErr("TypeError", "Reduce of empty array with no initial value")
+				}
+				acc = arr.items[startIdx]
+				startIdx += step
 			}
-			for i, it := range arr.items {
+			for i := startIdx; i >= 0 && i < len(arr.items); i += step {
 				if err := rt.checkInterrupt(); err != nil {
 					return jsUndefinedVal, err
 				}
-				if _, err := rt.callFunc(args[0].fn, thisArg, []jsValue{it, {kind: valNumber, num: float64(i)}, arrVal}); err != nil {
+				var err error
+				acc, err = rt.callFunc(args[0].fn, jsUndefinedVal, []jsValue{acc, arr.items[i], {kind: valNumber, num: float64(i)}, arrVal})
+				if err != nil {
 					return jsUndefinedVal, err
 				}
 			}
-			return jsUndefinedVal, nil
+			return acc, nil
 		})
 	}
 	return jsUndefinedVal
@@ -3733,7 +3520,7 @@ func (rt *jsRuntime) installBuiltins() {
 			}
 			s, ok := args[0].toStringChecked()
 			if !ok {
-				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
+				return r.throwStrLenErr()
 			}
 			return jsValue{kind: valString, str: s}, nil
 		},
@@ -3743,20 +3530,18 @@ func (rt *jsRuntime) installBuiltins() {
 					return jsValue{kind: valString, str: ""}, nil
 				}
 				if len(args) > maxJSStringBytes {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
+					return r.throwStrLenErr()
 				}
 				units := make([]uint16, len(args))
 				for i, a := range args {
 					n := a.toNumber()
-					if math.IsNaN(n) || math.IsInf(n, 0) {
-						units[i] = 0
-					} else {
+					if !math.IsNaN(n) && !math.IsInf(n, 0) {
 						units[i] = uint16(uint32(int64(math.Trunc(n))))
 					}
 				}
 				out := string(utf16.Decode(units))
 				if len(out) > maxJSStringBytes {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
+					return r.throwStrLenErr()
 				}
 				return jsValue{kind: valString, str: out}, nil
 			}),
@@ -3806,20 +3591,14 @@ func (rt *jsRuntime) installBuiltins() {
 	rt.global.define("Number", jsValue{kind: valFunc, fn: numCtor}, false)
 
 	rt.global.define("Boolean", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsFalseVal, nil
-		}
-		return boolVal(args[0].toBool()), nil
+		return boolVal(len(args) > 0 && args[0].toBool()), nil
 	}), false)
 
 	rt.global.define("parseInt", parseIntFn, false)
 	rt.global.define("parseFloat", parseFloatFn, false)
 
 	rt.global.define("isNaN", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsTrueVal, nil
-		}
-		return boolVal(math.IsNaN(args[0].toNumber())), nil
+		return boolVal(len(args) == 0 || math.IsNaN(args[0].toNumber())), nil
 	}), false)
 
 	rt.global.define("isFinite", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -3830,37 +3609,40 @@ func (rt *jsRuntime) installBuiltins() {
 		return boolVal(!math.IsNaN(n) && !math.IsInf(n, 0)), nil
 	}), false)
 
+	uriArgStr := func(r *jsRuntime, args []jsValue) (string, error) {
+		if len(args) == 0 {
+			return "undefined", nil
+		}
+		raw, ok := args[0].toStringChecked()
+		if !ok {
+			_, err := r.throwStrLenErr()
+			return "", err
+		}
+		return raw, nil
+	}
 	rt.global.define("encodeURIComponent", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		raw := "undefined"
-		if len(args) > 0 {
-			var ok bool
-			raw, ok = args[0].toStringChecked()
-			if !ok {
-				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
-			}
+		raw, err := uriArgStr(r, args)
+		if err != nil {
+			return jsUndefinedVal, err
 		}
 		escaped, tooLong, badURI := encodeURIComponentRFC3986(raw)
 		if badURI {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("URIError", "URI malformed")}
+			return r.throwValErr("URIError", "URI malformed")
 		}
 		if tooLong {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
+			return r.throwStrLenErr()
 		}
 		return jsValue{kind: valString, str: escaped}, nil
 	}), false)
 
 	rt.global.define("decodeURIComponent", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		raw := "undefined"
-		if len(args) > 0 {
-			var ok bool
-			raw, ok = args[0].toStringChecked()
-			if !ok {
-				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid string length")}
-			}
+		raw, err := uriArgStr(r, args)
+		if err != nil {
+			return jsUndefinedVal, err
 		}
 		decoded, ok := decodeURIComponentRFC3986(raw)
 		if !ok {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("URIError", "URI malformed")}
+			return r.throwValErr("URIError", "URI malformed")
 		}
 		return jsValue{kind: valString, str: decoded}, nil
 	}), false)
@@ -3903,17 +3685,17 @@ func (rt *jsRuntime) installBuiltins() {
 			if errKind == "interrupt" {
 				return jsUndefinedVal, &jsInterruptedError{cause: r.interrupted.Load()}
 			}
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal(errKind, errMsg)}
+			return r.throwValErr(errKind, errMsg)
 		}
 		return jsValue{kind: valString, str: out}, nil
 	}))
 	jsonObj.setVal("parse", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 		if len(args) == 0 {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("SyntaxError", "Unexpected end of JSON input")}
+			return r.throwValErr("SyntaxError", "Unexpected end of JSON input")
 		}
 		var raw any
 		if err := json.Unmarshal([]byte(args[0].toString()), &raw); err != nil {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("SyntaxError", err.Error())}
+			return r.throwValErr("SyntaxError", err.Error())
 		}
 		return r.ToValue(raw), nil
 	}))
@@ -3923,109 +3705,80 @@ func (rt *jsRuntime) installBuiltins() {
 	mathObj := rt.NewObject()
 	mathObj.setVal("PI", jsValue{kind: valNumber, num: math.Pi})
 	mathObj.setVal("E", jsValue{kind: valNumber, num: math.E})
-	mathObj.setVal("floor", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: math.Floor(args[0].toNumber())}, nil
-	}))
-	mathObj.setVal("ceil", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: math.Ceil(args[0].toNumber())}, nil
-	}))
-	mathObj.setVal("round", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: math.Round(args[0].toNumber())}, nil
-	}))
-	mathObj.setVal("trunc", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: math.Trunc(args[0].toNumber())}, nil
-	}))
-	mathObj.setVal("abs", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: math.Abs(args[0].toNumber())}, nil
-	}))
+	unaryMathFn := func(fn func(float64) float64) jsValue {
+		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if len(args) == 0 {
+				return jsValue{kind: valNumber, num: math.NaN()}, nil
+			}
+			return jsValue{kind: valNumber, num: fn(args[0].toNumber())}, nil
+		})
+	}
+	mathObj.setVal("floor", unaryMathFn(math.Floor))
+	mathObj.setVal("ceil", unaryMathFn(math.Ceil))
+	mathObj.setVal("round", unaryMathFn(math.Round))
+	mathObj.setVal("trunc", unaryMathFn(math.Trunc))
+	mathObj.setVal("abs", unaryMathFn(math.Abs))
+	mathObj.setVal("sqrt", unaryMathFn(math.Sqrt))
 	mathObj.setVal("pow", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 		if len(args) < 2 {
 			return jsValue{kind: valNumber, num: math.NaN()}, nil
 		}
 		return jsValue{kind: valNumber, num: math.Pow(args[0].toNumber(), args[1].toNumber())}, nil
 	}))
-	mathObj.setVal("sqrt", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: math.Sqrt(args[0].toNumber())}, nil
-	}))
 	mathObj.setVal("random", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
 		return jsValue{kind: valNumber, num: rand.Float64()}, nil
 	}))
-	mathObj.setVal("max", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.Inf(-1)}, nil
-		}
-		m := args[0].toNumber()
-		if math.IsNaN(m) {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		for _, a := range args[1:] {
-			v := a.toNumber()
-			if math.IsNaN(v) {
+	minMaxMathFn := func(isMax bool) jsValue {
+		return nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if len(args) == 0 {
+				if isMax {
+					return jsValue{kind: valNumber, num: math.Inf(-1)}, nil
+				}
+				return jsValue{kind: valNumber, num: math.Inf(1)}, nil
+			}
+			m := args[0].toNumber()
+			if math.IsNaN(m) {
 				return jsValue{kind: valNumber, num: math.NaN()}, nil
 			}
-			if v > m {
-				m = v
+			for _, a := range args[1:] {
+				v := a.toNumber()
+				if math.IsNaN(v) {
+					return jsValue{kind: valNumber, num: math.NaN()}, nil
+				}
+				if (isMax && v > m) || (!isMax && v < m) {
+					m = v
+				}
 			}
-		}
-		return jsValue{kind: valNumber, num: m}, nil
-	}))
-	mathObj.setVal("min", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		if len(args) == 0 {
-			return jsValue{kind: valNumber, num: math.Inf(1)}, nil
-		}
-		m := args[0].toNumber()
-		if math.IsNaN(m) {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		for _, a := range args[1:] {
-			v := a.toNumber()
-			if math.IsNaN(v) {
-				return jsValue{kind: valNumber, num: math.NaN()}, nil
-			}
-			if v < m {
-				m = v
-			}
-		}
-		return jsValue{kind: valNumber, num: m}, nil
-	}))
+			return jsValue{kind: valNumber, num: m}, nil
+		})
+	}
+	mathObj.setVal("max", minMaxMathFn(true))
+	mathObj.setVal("min", minMaxMathFn(false))
 	rt.global.define("Math", jsValue{kind: valObject, obj: mathObj}, false)
 
 	// Constructible/callable Array & Array static helpers
+	arrLenErr := func(r *jsRuntime) (jsValue, error) {
+		return r.throwValErr("RangeError", "Invalid array length")
+	}
+	nullObjErr := func(r *jsRuntime) (jsValue, error) {
+		return r.throwValErr("TypeError", "Cannot convert undefined or null to object")
+	}
 	arrCtor := &jsFunc{
 		name: "Array",
 		native: func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			if len(args) == 1 && args[0].kind == valNumber {
 				nf := args[0].num
 				if math.IsNaN(nf) || math.IsInf(nf, 0) || nf < 0 || math.Trunc(nf) != nf || nf > maxJSArrayLen {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
+					return arrLenErr(r)
 				}
-				n := int(nf)
-				items := make([]jsValue, n)
+				items := make([]jsValue, int(nf))
 				for i := range items {
 					items[i] = jsUndefinedVal
 				}
 				return jsValue{kind: valArray, arr: &jsArray{items: items}}, nil
 			}
 			if len(args) > maxJSArrayLen {
-				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
+				return arrLenErr(r)
 			}
 			items := make([]jsValue, len(args))
 			copy(items, args)
@@ -4037,7 +3790,7 @@ func (rt *jsRuntime) installBuiltins() {
 			}),
 			"of": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				if len(args) > maxJSArrayLen {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
+					return arrLenErr(r)
 				}
 				items := make([]jsValue, len(args))
 				copy(items, args)
@@ -4045,12 +3798,12 @@ func (rt *jsRuntime) installBuiltins() {
 			}),
 			"from": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
+					return nullObjErr(r)
 				}
 				var mapFn *jsFunc
 				if len(args) >= 2 && args[1].kind != valUndefined {
 					if args[1].kind != valFunc || args[1].fn == nil {
-						return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "mapFn is not a function")}
+						return r.throwValErr("TypeError", "mapFn is not a function")
 					}
 					mapFn = args[1].fn
 				}
@@ -4064,7 +3817,7 @@ func (rt *jsRuntime) installBuiltins() {
 				case valArray:
 					if src.arr != nil {
 						if len(src.arr.items) > maxJSArrayLen {
-							return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
+							return arrLenErr(r)
 						}
 						rawItems = make([]jsValue, len(src.arr.items))
 						copy(rawItems, src.arr.items)
@@ -4072,7 +3825,7 @@ func (rt *jsRuntime) installBuiltins() {
 				case valString:
 					n := utf8.RuneCountInString(src.str)
 					if n > maxJSArrayLen {
-						return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
+						return arrLenErr(r)
 					}
 					rawItems = make([]jsValue, 0, n)
 					for _, rn := range src.str {
@@ -4085,7 +3838,7 @@ func (rt *jsRuntime) installBuiltins() {
 							nf := lv.toNumber()
 							if !math.IsNaN(nf) && nf > 0 {
 								if math.IsInf(nf, 1) || nf > maxJSArrayLen {
-									return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
+									return arrLenErr(r)
 								}
 								n := int(math.Trunc(nf))
 								rawItems = make([]jsValue, n)
@@ -4123,6 +3876,84 @@ func (rt *jsRuntime) installBuiltins() {
 	objProto := rt.NewObject()
 	objProto.setVal("hasOwnProperty", newHasOwnPropertyFn())
 
+	objectIterFn := func(mode uint8) jsValue {
+		// mode: 0=keys, 1=values, 2=entries
+		return nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
+				return nullObjErr(r)
+			}
+			var out []jsValue
+			makePair := func(k string, v jsValue) jsValue {
+				return jsValue{kind: valArray, arr: &jsArray{items: []jsValue{{kind: valString, str: k}, v}}}
+			}
+			switch args[0].kind {
+			case valObject:
+				if args[0].obj != nil {
+					ks := sortedObjectKeys(args[0].obj)
+					if len(ks) > maxJSArrayLen {
+						return arrLenErr(r)
+					}
+					out = make([]jsValue, len(ks))
+					for i, k := range ks {
+						switch mode {
+						case 0:
+							out[i] = jsValue{kind: valString, str: k}
+						case 1:
+							out[i] = args[0].obj.props[k]
+						default:
+							out[i] = makePair(k, args[0].obj.props[k])
+						}
+					}
+				}
+			case valArray:
+				if args[0].arr != nil {
+					items := args[0].arr.items
+					out = make([]jsValue, len(items))
+					if mode == 1 {
+						copy(out, items)
+					} else {
+						for i, it := range items {
+							ks := strconv.Itoa(i)
+							if mode == 0 {
+								out[i] = jsValue{kind: valString, str: ks}
+							} else {
+								out[i] = makePair(ks, it)
+							}
+						}
+					}
+				}
+			case valString:
+				if mode == 0 {
+					n := utf8.RuneCountInString(args[0].str)
+					if n > maxJSArrayLen {
+						return arrLenErr(r)
+					}
+					out = make([]jsValue, n)
+					for i := 0; i < n; i++ {
+						out[i] = jsValue{kind: valString, str: strconv.Itoa(i)}
+					}
+				} else {
+					items, err := r.spreadIterValues(args[0])
+					if err != nil {
+						return jsUndefinedVal, err
+					}
+					if mode == 1 {
+						out = items
+					} else {
+						out = make([]jsValue, len(items))
+						for i, it := range items {
+							out[i] = makePair(strconv.Itoa(i), it)
+						}
+					}
+				}
+			}
+			if out == nil {
+				out = []jsValue{}
+			}
+			return jsValue{kind: valArray, arr: &jsArray{items: out}}, nil
+		})
+	}
+
 	objCtor := &jsFunc{
 		name: "Object",
 		native: func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -4138,122 +3969,12 @@ func (rt *jsRuntime) installBuiltins() {
 		},
 		props: map[string]jsValue{
 			"prototype": {kind: valObject, obj: objProto},
-			"keys": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
-				}
-				var keys []jsValue
-				switch args[0].kind {
-				case valObject:
-					if args[0].obj != nil {
-						for _, k := range sortedObjectKeys(args[0].obj) {
-							keys = append(keys, jsValue{kind: valString, str: k})
-						}
-					}
-				case valArray:
-					if args[0].arr != nil {
-						keys = make([]jsValue, len(args[0].arr.items))
-						for i := range args[0].arr.items {
-							keys[i] = jsValue{kind: valString, str: strconv.Itoa(i)}
-						}
-					}
-				case valString:
-					n := utf8.RuneCountInString(args[0].str)
-					if n > maxJSArrayLen {
-						return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
-					}
-					keys = make([]jsValue, n)
-					for i := 0; i < n; i++ {
-						keys[i] = jsValue{kind: valString, str: strconv.Itoa(i)}
-					}
-				}
-				if keys == nil {
-					keys = []jsValue{}
-				}
-				return jsValue{kind: valArray, arr: &jsArray{items: keys}}, nil
-			}),
-			"values": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
-				}
-				var vals []jsValue
-				switch args[0].kind {
-				case valObject:
-					if args[0].obj != nil {
-						ks := sortedObjectKeys(args[0].obj)
-						vals = make([]jsValue, len(ks))
-						for i, k := range ks {
-							vals[i] = args[0].obj.props[k]
-						}
-					}
-				case valArray:
-					if args[0].arr != nil {
-						vals = make([]jsValue, len(args[0].arr.items))
-						copy(vals, args[0].arr.items)
-					}
-				case valString:
-					items, err := r.spreadIterValues(args[0])
-					if err != nil {
-						return jsUndefinedVal, err
-					}
-					vals = items
-				}
-				if vals == nil {
-					vals = []jsValue{}
-				}
-				return jsValue{kind: valArray, arr: &jsArray{items: vals}}, nil
-			}),
-			"entries": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
-				}
-				var pairs []jsValue
-				switch args[0].kind {
-				case valObject:
-					if args[0].obj != nil {
-						ks := sortedObjectKeys(args[0].obj)
-						if len(ks) > maxJSArrayLen {
-							return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid array length")}
-						}
-						pairs = make([]jsValue, len(ks))
-						for i, k := range ks {
-							pairs[i] = jsValue{
-								kind: valArray,
-								arr:  &jsArray{items: []jsValue{{kind: valString, str: k}, args[0].obj.props[k]}},
-							}
-						}
-					}
-				case valArray:
-					if args[0].arr != nil {
-						pairs = make([]jsValue, len(args[0].arr.items))
-						for i, it := range args[0].arr.items {
-							pairs[i] = jsValue{
-								kind: valArray,
-								arr:  &jsArray{items: []jsValue{{kind: valString, str: strconv.Itoa(i)}, it}},
-							}
-						}
-					}
-				case valString:
-					items, err := r.spreadIterValues(args[0])
-					if err != nil {
-						return jsUndefinedVal, err
-					}
-					pairs = make([]jsValue, len(items))
-					for i, it := range items {
-						pairs[i] = jsValue{
-							kind: valArray,
-							arr:  &jsArray{items: []jsValue{{kind: valString, str: strconv.Itoa(i)}, it}},
-						}
-					}
-				}
-				if pairs == nil {
-					pairs = []jsValue{}
-				}
-				return jsValue{kind: valArray, arr: &jsArray{items: pairs}}, nil
-			}),
+			"keys":      objectIterFn(0),
+			"values":    objectIterFn(1),
+			"entries":   objectIterFn(2),
 			"fromEntries": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
+					return nullObjErr(r)
 				}
 				items, err := r.spreadIterValues(args[0])
 				if err != nil {
@@ -4266,18 +3987,16 @@ func (rt *jsRuntime) installBuiltins() {
 					}
 					switch entry.kind {
 					case valArray, valObject:
-						k := r.getProperty(entry, "0").toString()
-						v := r.getProperty(entry, "1")
-						out.setVal(k, v)
+						out.setVal(r.getProperty(entry, "0").toString(), r.getProperty(entry, "1"))
 					default:
-						return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Iterator value is not an entry object")}
+						return r.throwValErr("TypeError", "Iterator value is not an entry object")
 					}
 				}
 				return jsValue{kind: valObject, obj: out}, nil
 			}),
 			"hasOwn": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
+					return nullObjErr(r)
 				}
 				k := ""
 				if len(args) >= 2 {
@@ -4287,7 +4006,7 @@ func (rt *jsRuntime) installBuiltins() {
 			}),
 			"assign": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
-					return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("TypeError", "Cannot convert undefined or null to object")}
+					return nullObjErr(r)
 				}
 				dst := args[0]
 				if dst.kind == valObject && dst.obj != nil {
@@ -4314,7 +4033,7 @@ func (rt *jsRuntime) installBuiltins() {
 		buf := make([]byte, 0, len(s))
 		for _, rn := range s {
 			if rn > 255 {
-				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("InvalidCharacterError", "btoa input contains characters outside Latin1 range")}
+				return r.throwValErr("InvalidCharacterError", "btoa input contains characters outside Latin1 range")
 			}
 			buf = append(buf, byte(rn))
 		}
@@ -4331,7 +4050,6 @@ func (rt *jsRuntime) installBuiltins() {
 		for i := 0; i < len(s); i++ {
 			switch s[i] {
 			case ' ', '\t', '\n', '\r', '\f':
-				continue
 			default:
 				clean.WriteByte(s[i])
 			}
@@ -4341,7 +4059,7 @@ func (rt *jsRuntime) installBuiltins() {
 		if err != nil {
 			decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(encoded, "="))
 			if err != nil {
-				return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("InvalidCharacterError", "atob input is not valid base64")}
+				return r.throwValErr("InvalidCharacterError", "atob input is not valid base64")
 			}
 		}
 		runes := make([]rune, len(decoded))
@@ -4358,8 +4076,7 @@ func (rt *jsRuntime) installBuiltins() {
 			if thisVal.kind == valUndefined {
 				return jsValue{kind: valString, str: time.Now().UTC().Format(time.RFC1123)}, nil
 			}
-			ms := parseJSDateArgs(args)
-			return newJSDateVal(r, ms), nil
+			return newJSDateVal(r, parseJSDateArgs(args)), nil
 		},
 		props: map[string]jsValue{
 			"now": nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
@@ -4416,8 +4133,7 @@ func parseJSDateArgs(args []jsValue) float64 {
 	if len(args) > 6 {
 		msec = int(args[6].toNumber())
 	}
-	t := time.Date(year, time.Month(month), day, hour, min, sec, msec*int(time.Millisecond), time.UTC)
-	return float64(t.UnixMilli())
+	return float64(time.Date(year, time.Month(month), day, hour, min, sec, msec*int(time.Millisecond), time.UTC).UnixMilli())
 }
 
 func parseJSDateString(raw string) float64 {
@@ -4425,7 +4141,7 @@ func parseJSDateString(raw string) float64 {
 	if s == "" {
 		return math.NaN()
 	}
-	layouts := []string{
+	for _, layout := range []string{
 		time.RFC3339Nano,
 		time.RFC3339,
 		"2006-01-02T15:04:05",
@@ -4436,8 +4152,7 @@ func parseJSDateString(raw string) float64 {
 		time.RFC822Z,
 		time.RFC822,
 		time.ANSIC,
-	}
-	for _, layout := range layouts {
+	} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return float64(t.UnixMilli())
 		}
@@ -4445,11 +4160,11 @@ func parseJSDateString(raw string) float64 {
 	return math.NaN()
 }
 
-func newJSDateVal(rt *jsRuntime, epochMs float64) jsValue {
+func newJSDateVal(_ *jsRuntime, epochMs float64) jsValue {
 	d := &jsObject{
 		isDate:  true,
 		epochMs: epochMs,
-		props:   make(map[string]jsValue, 14),
+		props:   make(map[string]jsValue, 18),
 	}
 	validTime := func() (time.Time, bool) {
 		if math.IsNaN(d.epochMs) || math.IsInf(d.epochMs, 0) {
@@ -4457,14 +4172,13 @@ func newJSDateVal(rt *jsRuntime, epochMs float64) jsValue {
 		}
 		return time.UnixMilli(int64(d.epochMs)).UTC(), true
 	}
-	isoFn := nativeVal(func(r *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+	d.setVal("toISOString", nativeVal(func(r *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
 		t, ok := validTime()
 		if !ok {
-			return jsUndefinedVal, &jsThrownError{val: r.newErrorVal("RangeError", "Invalid time value")}
+			return r.throwValErr("RangeError", "Invalid time value")
 		}
 		return jsValue{kind: valString, str: t.Format("2006-01-02T15:04:05.000Z")}, nil
-	})
-	d.setVal("toISOString", isoFn)
+	}))
 	d.setVal("toJSON", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
 		t, ok := validTime()
 		if !ok {
@@ -4486,61 +4200,42 @@ func newJSDateVal(rt *jsRuntime, epochMs float64) jsValue {
 	})
 	d.setVal("toUTCString", utcStrFn)
 	d.setVal("toString", utcStrFn)
-	yearFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		t, ok := validTime()
-		if !ok {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: float64(t.Year())}, nil
-	})
-	d.setVal("getFullYear", yearFn)
-	d.setVal("getUTCFullYear", yearFn)
-	monthFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		t, ok := validTime()
-		if !ok {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: float64(t.Month() - 1)}, nil
-	})
-	d.setVal("getMonth", monthFn)
-	d.setVal("getUTCMonth", monthFn)
-	dayFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		t, ok := validTime()
-		if !ok {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: float64(t.Day())}, nil
-	})
-	d.setVal("getDate", dayFn)
-	d.setVal("getUTCDate", dayFn)
-	hourFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		t, ok := validTime()
-		if !ok {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: float64(t.Hour())}, nil
-	})
-	d.setVal("getHours", hourFn)
-	d.setVal("getUTCHours", hourFn)
-	minFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		t, ok := validTime()
-		if !ok {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: float64(t.Minute())}, nil
-	})
-	d.setVal("getMinutes", minFn)
-	d.setVal("getUTCMinutes", minFn)
-	secFn := nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		t, ok := validTime()
-		if !ok {
-			return jsValue{kind: valNumber, num: math.NaN()}, nil
-		}
-		return jsValue{kind: valNumber, num: float64(t.Second())}, nil
-	})
-	d.setVal("getSeconds", secFn)
-	d.setVal("getUTCSeconds", secFn)
-	_ = rt
+	datePartFn := func(part uint8) jsValue {
+		return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+			t, ok := validTime()
+			if !ok {
+				return jsValue{kind: valNumber, num: math.NaN()}, nil
+			}
+			var v int
+			switch part {
+			case 0:
+				v = t.Year()
+			case 1:
+				v = int(t.Month()) - 1
+			case 2:
+				v = t.Day()
+			case 3:
+				v = t.Hour()
+			case 4:
+				v = t.Minute()
+			default:
+				v = t.Second()
+			}
+			return jsValue{kind: valNumber, num: float64(v)}, nil
+		})
+	}
+	for i, names := range [][2]string{
+		{"getFullYear", "getUTCFullYear"},
+		{"getMonth", "getUTCMonth"},
+		{"getDate", "getUTCDate"},
+		{"getHours", "getUTCHours"},
+		{"getMinutes", "getUTCMinutes"},
+		{"getSeconds", "getUTCSeconds"},
+	} {
+		fn := datePartFn(uint8(i))
+		d.setVal(names[0], fn)
+		d.setVal(names[1], fn)
+	}
 	return jsValue{kind: valObject, obj: d}
 }
 

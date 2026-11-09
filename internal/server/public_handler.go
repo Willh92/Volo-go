@@ -198,6 +198,9 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	}
 	s.syncConfiguredUploadDir()
 	if deps.Plugins != nil {
+		if deps.Auth != nil {
+			deps.Auth.SetPlugins(deps.Plugins)
+		}
 		if deps.Config != nil && deps.Config.KeyRing != nil {
 			deps.Plugins.SetSecretSealer(deps.Config.KeyRing.SecretBox())
 		}
@@ -428,6 +431,7 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/reader/register", s.handleReaderRegister)
 	mux.HandleFunc("/api/v1/reader/login", s.handleReaderLogin)
 	mux.HandleFunc("/api/v1/reader/logout", s.handleReaderLogout)
+	mux.HandleFunc("/api/v1/reader/profile", s.handleReaderProfile)
 	mux.HandleFunc("/api/v1/reader/claim-guest-comments", s.handleReaderClaimComments)
 	mux.HandleFunc("/api/v1/auth/oidc", s.handleOIDCAuthRoutes)
 	mux.HandleFunc("/api/v1/auth/oidc/", s.handleOIDCAuthRoutes)
@@ -1601,11 +1605,18 @@ func (s *AppServer) handleReaderSendCode(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Username string `json:"username"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
 		return
+	}
+	if candUser := strings.TrimSpace(req.Username); candUser != "" && s.deps.Auth != nil {
+		if nErr := s.deps.Auth.ValidateNickname(r.Context(), candUser, req.Email, security.MaskIP(clientIP), "", locale, "send_code_preflight"); nErr != nil {
+			writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, nErr))
+			return
+		}
 	}
 	code, err := s.deps.Auth.IssueReaderVerificationCode(req.Email)
 	if err != nil {
@@ -1745,6 +1756,67 @@ func (s *AppServer) handleReaderLogout(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeOKJSON(w)
+}
+
+func (s *AppServer) handleReaderProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "PATCH, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	locale := s.resolveLocale(r)
+	if !s.isSameOriginRequest(r) {
+		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "error.forbidden"))
+		return
+	}
+	viewer, sess := s.resolveViewer(r)
+	if viewer == nil || viewer.Status != domain.UserStatusActive {
+		writeErrJSON(w, http.StatusUnauthorized, s.deps.Catalog.T(locale, "error.unauthorized"))
+		return
+	}
+	if !s.requirePublicSessionCSRF(w, r, sess, false) {
+		return
+	}
+	if viewer.Role != domain.RoleReader {
+		writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "error.forbidden"))
+		return
+	}
+	clientIP := s.clientIP(r)
+	if s.deps.WAF != nil && !s.deps.WAF.AllowRate("reader_profile", clientIP, 15, 5*time.Minute) {
+		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
+		return
+	}
+	var req struct {
+		DisplayName string `json:"display_name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+		return
+	}
+	disp := strings.TrimSpace(repo.StripASCIIControls(req.DisplayName))
+	if runeLen := len([]rune(disp)); runeLen < 2 || runeLen > 48 {
+		writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "reader.err_username_len"))
+		return
+	}
+	if s.deps.Auth != nil {
+		if nErr := s.deps.Auth.ValidateNickname(r.Context(), disp, viewer.Email, security.MaskIP(clientIP), viewer.ID, locale, "reader_profile"); nErr != nil {
+			writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, nErr))
+			return
+		}
+	}
+	now := time.Now().UnixMilli()
+	if _, err := s.deps.Store.ExecContext(r.Context(),
+		`UPDATE users SET display_name = ?, updated_at = ? WHERE id = ?`,
+		disp, now, viewer.ID); err != nil {
+		writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
+		return
+	}
+	updated := *viewer
+	updated.DisplayName = disp
+	updated.UpdatedAt = now
+	updated.PasswordHash = ""
+	updated.LegacyHash = ""
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": updated})
 }
 
 func (s *AppServer) handleReaderClaimComments(w http.ResponseWriter, r *http.Request) {
@@ -3404,7 +3476,17 @@ func (s *AppServer) localizePublicError(locale string, err error) string {
 		return cat.T(locale, "comment.err_edit_forbidden")
 	case errors.Is(err, guest.ErrPoWInvalid), errors.Is(err, guest.ErrPoWReplayed):
 		return cat.T(locale, "comment.err_pow")
-	case errors.Is(err, content.ErrCommentRejected), errors.Is(err, guest.ErrHoneypotTriggered):
+	case errors.Is(err, guest.ErrHoneypotTriggered):
+		return cat.T(locale, "comment.err_antispam")
+	case errors.Is(err, auth.ErrNicknameRejected):
+		if custom := extractPolicyRejectReason(err, auth.ErrNicknameRejected); custom != "" {
+			return custom
+		}
+		return cat.T(locale, "reader.err_username_sensitive")
+	case errors.Is(err, content.ErrCommentRejected):
+		if custom := extractPolicyRejectReason(err, content.ErrCommentRejected); custom != "" {
+			return custom
+		}
 		return cat.T(locale, "comment.err_antispam")
 	}
 
@@ -3431,6 +3513,50 @@ func (s *AppServer) localizePublicError(locale string, err error) string {
 	default:
 		return cat.T(locale, "error.hint_default")
 	}
+}
+
+func extractPolicyRejectReason(err error, sentinel error) string {
+	if err == nil || sentinel == nil {
+		return ""
+	}
+	prefix := sentinel.Error() + ":"
+	msg := err.Error()
+	idx := strings.Index(msg, prefix)
+	if idx < 0 {
+		return ""
+	}
+	reason := strings.TrimSpace(repo.StripASCIIControls(msg[idx+len(prefix):]))
+	if reason == "" {
+		return ""
+	}
+	if runes := []rune(reason); len(runes) > 200 {
+		reason = string(runes[:200])
+	}
+	return reason
+}
+
+func writeHookRejectedJSON(w http.ResponseWriter, rej *plugin.HookRejectedError) {
+	msg := "request rejected by plugin"
+	code := ""
+	pluginID := ""
+	if rej != nil {
+		pluginID = rej.PluginID
+		code = strings.TrimSpace(repo.StripASCIIControls(rej.Code))
+		if r := strings.TrimSpace(repo.StripASCIIControls(rej.Error())); r != "" {
+			if runes := []rune(r); len(runes) > 240 {
+				r = string(runes[:240])
+			}
+			msg = r
+		}
+	}
+	resp := map[string]any{"error": msg}
+	if code != "" {
+		resp["code"] = code
+	}
+	if pluginID != "" {
+		resp["plugin"] = pluginID
+	}
+	writeJSON(w, http.StatusBadRequest, resp)
 }
 
 func (s *AppServer) handleLegacyAdminRedirect(w http.ResponseWriter, r *http.Request) {
