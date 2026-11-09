@@ -80,7 +80,7 @@ External themes never need custom database tables. Declare `page_templates` (sel
 }
 ```
 
-Supported `config_schema` field types: `string` / `text`, `textarea`, `url`, `image`, `color`, `boolean`, `number` (with optional `min`/`max`/`step`), `select`, and `sortable_list` (toggleable, reorderable multi-item lists such as `header_nav_items`).
+Supported `config_schema` field types: `string` / `text`, `textarea`, `url`, `image`, `color`, `boolean`, `number` (with optional `min`/`max`/`step`), `select`, `sortable_list` (toggleable, reorderable multi-item lists such as `header_nav_items`), and `tag_list` (capsule-tag string lists with search and bulk-edit mode).
 
 Reading theme settings, custom site variables, and list styles in templates:
 - Theme string setting: `{{themeCfg .ThemeConfig "hero_notice" ""}}`

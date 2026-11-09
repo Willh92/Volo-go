@@ -143,6 +143,7 @@ plugins/hello-callout/
 - `url`, `image` (sanitized automatically against `javascript:` / `data:` URI injection)
 - `color` (`#rgb` / `#rrggbb` color picker)
 - `sortable_list` (toggleable, drag-sortable option list)
+- `tag_list` (alias `token_list`: capsule-tag list stored as `string[]` and backward-compatible with newline/comma-delimited strings; includes progressive DOM reveal for multi-thousand-word lists, live search filter, and one-click Bulk Edit / Tag View toggle)
 
 ```json
 {
@@ -211,7 +212,7 @@ plugins/hello-callout/
 }
 ```
 
-> **Plugin Priority (`priority`) & Deterministic Chain Ordering**: Every plugin has an execution `priority` (`-1000..10000`, default `100`, official `sensitive-words` defaults to `20`; **smaller numbers execute earlier**, breaking ties deterministically by `id`). Admins can reorder plugins with one click (`↑` / `↓` / Move-Top via `POST /api/admin/plugins/reorder`) or click `#1 · P20` to set an exact integer (`PATCH /api/admin/plugins/{id}/priority`). This order governs **all domain and `before_*` interception hooks, UI slot concatenation, render cache digests, and same-type `ProviderRegistry` chains** (`antispam`, `notifier`, `federation`, `oidc`, `storage`).
+> **Plugin Priority (`priority`) & Deterministic Chain Ordering**: Every plugin has an execution `priority` (`-1000..10000`, default `100`, official `sensitive-words` defaults to `20`; **smaller numbers execute earlier**, breaking ties deterministically by `id`). Admins can reorder plugins with one click (`↑` / `↓` / Move-Top via `POST /api/admin/plugins/reorder`, animated with the unified FLIP row transition) or click `#1 · P20` to set an exact integer (`PATCH /api/admin/plugins/{id}/priority`). This order governs **all domain and `before_*` interception hooks, UI slot concatenation, render cache digests, and same-type `ProviderRegistry` chains** (`antispam`, `notifier`, `federation`, `oidc`, `storage`).
 
 > **Encrypted-at-Rest `type: "secret"` Guarantee**: Fields declared with `"type": "secret"` (or `"secret": true`) are encrypted at rest via the host `KeyRing` using `AES-256-GCM` (`plugins.secret_ciphertext` bound to `AAD = plugins.secret_ciphertext:<plugin_id>`). Admin APIs return only boolean masks (`secret_keys_set`) and never echo plaintext secrets; pass `"__VOLO_CLEAR_SECRET__"` to explicitly clear a stored secret.
 
@@ -230,11 +231,14 @@ plugins/hello-callout/
    - Boolean shorthand: `return false`;
    - **Non-Destructive Partial Payload Merge & Monotonic Moderation**: Returning a plain object (e.g. `return { content_md: cleaned }`) shallow-merges keys into the payload for the next plugin in the chain; setting `{ status: "pending" }` (or `{ action: "moderate" }`) on comments ratchets monotonically so lower-priority plugins cannot accidentally downgrade moderation back to `approved`.
 
-3. **Official `sensitive-words` Plugin & Additive Merge/Union with Host Settings**:
-   - **Intra-Plugin Lexicon Merge**: Compiles `houbb_base.txt.gz` (`281 KiB` prefix/tag delta-compressed dictionary with 6 category toggles), built-in technical `allowlist.txt`, optional SSRF-safe remote wordlist sync, `custom_deny`, `custom_allow` (longest-span allowlist override priority), and `reserved_nicknames` into a single native Double-Array Aho-Corasick automaton.
+3. **Official `sensitive-words` Plugin, Host Settings Union & Non-Destructive `*` Masking for Existing Content**:
+   - **Intra-Plugin Lexicon Merge**: Compiles `houbb_base.txt.gz` (`281 KiB` prefix/tag delta-compressed dictionary with 6 category toggles), built-in technical `allowlist.txt`, optional SSRF-safe remote wordlist sync, capsule-tag `custom_deny` / `custom_allow` (longest-span allowlist override priority), and `reserved_nicknames` into a single native Double-Array Aho-Corasick automaton.
    - **Host `reading.blocked_keywords` / `allowed_keywords` Union**:
      - **Nicknames & Profiles**: Enforces a strict **union** across host `reading.blocked_keywords`, all enabled `provider:antispam` plugins (`checkNickname`), and `user.before_*` hooks — any match rejects the nickname;
      - **Comments**: Smart moderation evaluates host `reading.blocked_keywords` first (marking matches `pending`), then runs `provider:antispam` plugins in priority order — non-matching plugins return `"pass"` so host `pending` decisions are preserved, while matches escalate to `reject`, mask-and-allow, or `moderate`.
+   - **Non-Destructive `*` Display Masking for Historical Content (`mask_existing` + `volo.wordFilter.setSanitizer`)**:
+     - When word filtering is active (`mask_existing: true` by default in `sensitive-words`, and/or host `builtin_spam_filter` + `blocked_keywords`), pre-existing historical comments, guest impersonator handles, and recent-comment feeds/excerpts are automatically masked with `*` in pure Go with zero per-comment JS VM overhead, instant state-hash cache invalidation, and zero destructive database mutations;
+     - HTML-aware masking preserves all HTML tags, attributes (`<a href>`, `<img src>`), and entities while piercing inline split-tag evasions (`傻<strong>逼</strong>` -> `*<strong>*</strong>`); genuine staff/author display names are exempted from `reserved_nicknames` masking, and pre-existing registered readers whose legacy display names contain newly-reserved substrings have their public display names masked without being locked out from posting clean comments.
 
 ### 3.4 Permissions, Scheduled `CronRegistry` & Extension Providers
 

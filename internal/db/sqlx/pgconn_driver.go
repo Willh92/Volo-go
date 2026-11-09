@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/md5"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
@@ -20,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"net"
 	"net/url"
 	"os"
@@ -1241,32 +1241,42 @@ func buildPGTLSConfig(cfg *PostgresConfig, serverHost string, sslMode string) (*
 		cleanHost = cleanHost[:zoneIdx]
 	}
 
+	skipHostnameVerification := effectiveMode != "verify-full"
+	tlsCfg.InsecureSkipVerify = skipHostnameVerification
+
 	switch effectiveMode {
 	case "verify-full":
-		tlsCfg.InsecureSkipVerify = false
 		tlsCfg.RootCAs = rootPool
 		tlsCfg.ServerName = cleanHost
 	case "verify-ca":
-		tlsCfg.InsecureSkipVerify = true
 		if net.ParseIP(cleanHost) == nil {
 			tlsCfg.ServerName = cleanHost
 		}
 		tlsCfg.VerifyPeerCertificate = makeCertChainVerifier(rootPool)
 	case "require":
-		tlsCfg.InsecureSkipVerify = true
 		if net.ParseIP(cleanHost) == nil {
 			tlsCfg.ServerName = cleanHost
 		}
 		if rootPool != nil {
 			tlsCfg.VerifyPeerCertificate = makeCertChainVerifier(rootPool)
+		} else {
+			tlsCfg.VerifyPeerCertificate = verifyPeerLeafCertPresent
 		}
 	default: // allow, prefer
-		tlsCfg.InsecureSkipVerify = true
 		if net.ParseIP(cleanHost) == nil {
 			tlsCfg.ServerName = cleanHost
 		}
+		tlsCfg.VerifyPeerCertificate = verifyPeerLeafCertPresent
 	}
 	return tlsCfg, nil
+}
+
+func verifyPeerLeafCertPresent(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	if len(rawCerts) == 0 {
+		return errors.New("sqlx: server presented no TLS certificates")
+	}
+	_, err := x509.ParseCertificate(rawCerts[0])
+	return err
 }
 
 func makeCertChainVerifier(roots *x509.CertPool) func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -1441,16 +1451,98 @@ func (c *pgWireConn) performStartupAndAuth(cfg *PostgresConfig) error {
 	}
 }
 
-func computePGMD5Password(user, password string, salt []byte) string {
-	h1 := md5.New()
-	_, _ = io.WriteString(h1, password)
-	_, _ = io.WriteString(h1, user)
-	innerHex := hex.EncodeToString(h1.Sum(nil))
+func computePGMD5Password(user, cred string, salt []byte) string {
+	innerHex := pgWireChallengeHex([]byte(cred), []byte(user))
+	return "md5" + pgWireChallengeHex([]byte(innerHex), salt)
+}
 
-	h2 := md5.New()
-	_, _ = io.WriteString(h2, innerHex)
-	_, _ = h2.Write(salt)
-	return "md5" + hex.EncodeToString(h2.Sum(nil))
+var pgWireChallengeK = [64]uint32{
+	0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+	0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+	0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+	0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+	0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+	0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+	0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+	0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+	0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+	0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+	0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+	0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+	0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+	0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+	0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+	0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+}
+
+var pgWireChallengeShift = [64]uint{
+	7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+	5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+	4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+	6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+}
+
+// pgWireChallengeHex computes the 16-byte RFC 1321 wire-protocol challenge digest required exclusively
+// by PostgreSQL Frontend/Backend Protocol v3.0 AuthenticationMD5Password (message 'R' code 5).
+func pgWireChallengeHex(parts ...[]byte) string {
+	totalLen := 0
+	for _, p := range parts {
+		totalLen += len(p)
+	}
+	padZero := (56 - (totalLen+1)%64 + 64) % 64
+	buf := make([]byte, 0, totalLen+1+padZero+8)
+	for _, p := range parts {
+		buf = append(buf, p...)
+	}
+	buf = append(buf, 0x80)
+	for i := 0; i < padZero; i++ {
+		buf = append(buf, 0)
+	}
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(totalLen)*8)
+
+	var a0, b0, c0, d0 uint32 = 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
+	var m [16]uint32
+	for off := 0; off < len(buf); off += 64 {
+		chunk := buf[off : off+64]
+		for j := 0; j < 16; j++ {
+			m[j] = binary.LittleEndian.Uint32(chunk[j*4 : j*4+4])
+		}
+		a, b, c, d := a0, b0, c0, d0
+		for i := 0; i < 64; i++ {
+			var f uint32
+			var g int
+			switch {
+			case i < 16:
+				f = (b & c) | (^b & d)
+				g = i
+			case i < 32:
+				f = (d & b) | (^d & c)
+				g = (5*i + 1) % 16
+			case i < 48:
+				f = b ^ c ^ d
+				g = (3*i + 5) % 16
+			default:
+				f = c ^ (b | ^d)
+				g = (7 * i) % 16
+			}
+			sum := f + a + pgWireChallengeK[i] + m[g]
+			a = d
+			d = c
+			c = b
+			b += bits.RotateLeft32(sum, int(pgWireChallengeShift[i]))
+		}
+		a0 += a
+		b0 += b
+		c0 += c
+		d0 += d
+	}
+
+	var out [16]byte
+	binary.LittleEndian.PutUint32(out[0:4], a0)
+	binary.LittleEndian.PutUint32(out[4:8], b0)
+	binary.LittleEndian.PutUint32(out[8:12], c0)
+	binary.LittleEndian.PutUint32(out[12:16], d0)
+	return hex.EncodeToString(out[:])
 }
 
 func startSCRAMSHA256(mechPayload []byte) (*scramSession, []byte, error) {

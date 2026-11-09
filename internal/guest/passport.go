@@ -79,19 +79,15 @@ func (pm *PassportManager) SetSecureRequestFunc(fn func(*http.Request) bool) {
 }
 
 func (pm *PassportManager) isSecureForRequest(r *http.Request) bool {
+	tlsActive := r != nil && r.TLS != nil
 	if pm == nil {
-		return r != nil && r.TLS != nil
+		return tlsActive
 	}
-	if pm.secureCookie.Load() {
+	if pm.secureCookie.Load() || tlsActive {
 		return true
 	}
-	if r != nil && r.TLS != nil {
-		return true
-	}
-	if ptr := pm.secureRequestFn.Load(); ptr != nil && *ptr != nil && r != nil {
-		return (*ptr)(r)
-	}
-	return false
+	ptr := pm.secureRequestFn.Load()
+	return ptr != nil && *ptr != nil && r != nil && (*ptr)(r)
 }
 
 // HashGuestID computes the irreversible SHA-256 storage identifier for comments.guest_id_hash.
@@ -183,11 +179,7 @@ func (pm *PassportManager) ResolveOrHeal(w http.ResponseWriter, r *http.Request,
 
 // IssueCookie writes the HttpOnly GuestPassport cookie using the manager's configured Secure flag.
 func (pm *PassportManager) IssueCookie(w http.ResponseWriter, gp GuestPassport) {
-	secure := false
-	if pm != nil {
-		secure = pm.secureCookie.Load()
-	}
-	pm.IssueCookieWithSecure(w, gp, secure)
+	pm.IssueCookieWithSecure(w, gp, pm != nil && pm.secureCookie.Load())
 }
 
 // IssueCookieWithSecure writes the HttpOnly GuestPassport cookie with an explicit per-request Secure flag.
@@ -234,11 +226,7 @@ type unlockBundle struct {
 
 // WriteUnlockCookie writes the HttpOnly persistent unlock cookie using the manager's configured Secure flag.
 func (pm *PassportManager) WriteUnlockCookie(w http.ResponseWriter, rawValue string) {
-	secure := false
-	if pm != nil {
-		secure = pm.secureCookie.Load()
-	}
-	pm.WriteUnlockCookieWithSecure(w, rawValue, secure)
+	pm.WriteUnlockCookieWithSecure(w, rawValue, pm != nil && pm.secureCookie.Load())
 }
 
 // WriteUnlockCookieWithSecure writes the HttpOnly persistent unlock cookie with an explicit per-request Secure flag.

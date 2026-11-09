@@ -4698,6 +4698,73 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
+func canonicalAllowedUploadExt(origName string) (string, error) {
+	rawExt := strings.ToLower(filepath.Ext(filepath.Base(origName)))
+	switch rawExt {
+	case ".png":
+		return ".png", nil
+	case ".jpg":
+		return ".jpg", nil
+	case ".jpeg":
+		return ".jpeg", nil
+	case ".gif":
+		return ".gif", nil
+	case ".webp":
+		return ".webp", nil
+	case ".avif":
+		return ".avif", nil
+	case ".mp3":
+		return ".mp3", nil
+	case ".m4a":
+		return ".m4a", nil
+	case ".ogg":
+		return ".ogg", nil
+	case ".wav":
+		return ".wav", nil
+	case ".weba":
+		return ".weba", nil
+	case ".mp4":
+		return ".mp4", nil
+	case ".webm":
+		return ".webm", nil
+	case ".pdf":
+		return ".pdf", nil
+	case ".zip":
+		return ".zip", nil
+	case ".svg":
+		return "", errors.New("raw SVG upload disallowed for XSS safety; use PNG/WebP/JPEG")
+	default:
+		return "", fmt.Errorf("unsupported file extension %q", rawExt)
+	}
+}
+
+func sanitizeLocalUploadPrefix(raw string) string {
+	trimmed := strings.Trim(strings.TrimSpace(raw), "/\\")
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(strings.ReplaceAll(trimmed, "\\", "/"), "/")
+	cleanParts := make([]string, 0, len(parts))
+	for _, seg := range parts {
+		seg = strings.TrimSpace(seg)
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		valid := true
+		for i := 0; i < len(seg); i++ {
+			ch := seg[i]
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.') {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			cleanParts = append(cleanParts, seg)
+		}
+	}
+	return strings.Join(cleanParts, "/")
+}
+
 func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID string, origName string, r io.Reader, maxBytes int64) (*domain.MediaAsset, error) {
 	raw, err := readBoundedStream(r, maxBytes)
 	if err != nil {
@@ -4706,13 +4773,9 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 	if len(raw) == 0 {
 		return nil, errors.New("empty upload")
 	}
-	ext := strings.ToLower(filepath.Ext(origName))
-	switch ext {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".mp3", ".m4a", ".ogg", ".wav", ".weba", ".mp4", ".webm", ".pdf", ".zip":
-	case ".svg":
-		return nil, errors.New("raw SVG upload disallowed for XSS safety; use PNG/WebP/JPEG")
-	default:
-		return nil, fmt.Errorf("unsupported file extension %q", ext)
+	ext, err := canonicalAllowedUploadExt(origName)
+	if err != nil {
+		return nil, err
 	}
 
 	mimeType := defaultReconcileMIMEType(ext, raw[:minInt(512, len(raw))])
@@ -4739,11 +4802,15 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 	now := time.Now()
 	relKey := fmt.Sprintf("%s/%s%s", now.UTC().Format("2006/01"), strings.ToLower(id.Next()), ext)
 	if s.deps.Settings != nil {
-		if pfx := strings.Trim(strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalKeyPrefix), "/"); pfx != "" {
+		if pfx := sanitizeLocalUploadPrefix(s.deps.Settings.Snapshot().Storage.LocalKeyPrefix); pfx != "" {
 			relKey = pfx + "/" + relKey
 		}
 	}
-	dest := filepath.Join(s.deps.Config.GetUploadDir(), filepath.FromSlash(relKey))
+	baseDir := filepath.Clean(s.deps.Config.GetUploadDir())
+	dest := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(relKey)))
+	if !strings.HasPrefix(dest, baseDir+string(filepath.Separator)) {
+		return nil, errors.New("upload destination escapes configured upload directory")
+	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 		return nil, err
 	}

@@ -66,9 +66,13 @@ function minifyEmbeddedPayload(fileName, raw) {
     }
   } else if (fileName.endsWith(".html")) {
     let html = raw.toString("utf8");
-    html = html.replace(/<!--(?!VOLO_BOOT-->)[\s\S]*?-->/g, "");
-    html = html.replace(/<style>([\s\S]*?)<\/style>/g, (full, css) => {
-      if (css.includes("{{")) return full;
+    let prevHtml;
+    do {
+      prevHtml = html;
+      html = html.replace(/<!--(?!VOLO_BOOT-->)[\s\S]*?-->/g, "");
+    } while (html !== prevHtml);
+    html = html.replace(/<style\b[^>]*>([\s\S]*?)<\/style\b[^>]*>/gi, (full, css) => {
+      if (!/^<style>/i.test(full) || css.includes("{{")) return full;
       try {
         const out = transformCSS({
           filename: `${fileName}.css`,
@@ -82,8 +86,8 @@ function minifyEmbeddedPayload(fileName, raw) {
       } catch {}
       return full;
     });
-    html = html.replace(/<script>([\s\S]*?)<\/script>/g, (full, js) => {
-      if (js.includes("{{") || !js.trim()) return full;
+    html = html.replace(/<script\b[^>]*>([\s\S]*?)<\/script\b[^>]*>/gi, (full, js) => {
+      if (!/^<script>/i.test(full) || js.includes("{{") || !js.trim()) return full;
       try {
         const out = minifySync(`${fileName}.js`, js);
         if (out && typeof out.code === "string" && (!out.errors || out.errors.length === 0)) {

@@ -2277,6 +2277,34 @@ function releaseModalScrollLock() {
   }
 }
 
+function parseTokenBatch(raw: string, uppercase: boolean): string[] {
+  const isMultiline = raw.includes("\n") || raw.includes("\r");
+  const lines = isMultiline ? raw.split(/\r?\n/) : [raw];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (!trimmedLine) continue;
+    if (isMultiline && (trimmedLine.startsWith("#") || trimmedLine.startsWith("//"))) {
+      continue;
+    }
+    const parts = trimmedLine.split(/[,，;；]+/);
+    for (const part of parts) {
+      const tok = uppercase ? part.trim().toUpperCase() : part.trim();
+      if (!tok) continue;
+      const key = uppercase ? tok.toUpperCase() : tok;
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(tok);
+      }
+    }
+  }
+  return out;
+}
+
+const TOKEN_INITIAL_CAP = 120;
+const TOKEN_REVEAL_STEP = 200;
+
 export function TokenListInput({
   values,
   onChange,
@@ -2289,18 +2317,19 @@ export function TokenListInput({
   uppercase?: boolean;
 }) {
   const [draft, setDraft] = useState("");
+  const [filterQuery, setFilterQuery] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(TOKEN_INITIAL_CAP);
+  const [bulkMode, setBulkMode] = useState(false);
+  const [bulkText, setBulkText] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const safeValues = Array.isArray(values) ? values.filter(Boolean) : [];
 
   const commitTokens = (raw: string) => {
-    const parts = raw
-      .split(/[,，;；\r\n]+/)
-      .map((s) => (uppercase ? s.trim().toUpperCase() : s.trim()))
-      .filter(Boolean);
-    if (parts.length === 0) return;
+    const incoming = parseTokenBatch(raw, uppercase);
+    if (incoming.length === 0) return;
     const seen = new Set(safeValues.map((v) => (uppercase ? v.toUpperCase() : v)));
     const next = [...safeValues];
-    for (const p of parts) {
+    for (const p of incoming) {
       const key = uppercase ? p.toUpperCase() : p;
       if (!seen.has(key)) {
         seen.add(key);
@@ -2310,81 +2339,197 @@ export function TokenListInput({
     onChange(next);
   };
 
+  const toggleBulkMode = () => {
+    if (!bulkMode) {
+      if (draft.trim()) {
+        const merged = parseTokenBatch(`${safeValues.join("\n")}\n${draft}`, uppercase);
+        onChange(merged);
+        setDraft("");
+        setBulkText(merged.join("\n"));
+      } else {
+        setBulkText(safeValues.join("\n"));
+      }
+      setBulkMode(true);
+    } else {
+      const parsed = parseTokenBatch(bulkText, uppercase);
+      onChange(parsed);
+      setBulkText("");
+      setBulkMode(false);
+      setVisibleLimit(TOKEN_INITIAL_CAP);
+    }
+  };
+
+  const qLower = filterQuery.trim().toLowerCase();
+  const indexedItems: Array<{ item: string; origIdx: number }> = [];
+  for (let i = 0; i < safeValues.length; i++) {
+    const item = safeValues[i];
+    if (!qLower || item.toLowerCase().includes(qLower)) {
+      indexedItems.push({ item, origIdx: i });
+    }
+  }
+  const visibleItems = indexedItems.slice(0, visibleLimit);
+  const hiddenCount = Math.max(0, indexedItems.length - visibleItems.length);
+
   return (
-    <div>
-      {safeValues.length > 0 && (
+    <div class="volo-token-wrap">
+      {(safeValues.length > 0 || bulkMode) && (
         <div class="volo-token-head">
-          <span>{t("ui.token_count", { count: safeValues.length })}</span>
-          <button
-            type="button"
-            class="volo-act-btn danger"
-            onClick={() => onChange([])}
-          >
-            {t("ui.token_clear")}
-          </button>
-        </div>
-      )}
-      <div
-        class="volo-tag-capsule-box volo-token-box"
-        onClick={() => inputRef.current?.focus()}
-      >
-        {safeValues.map((item, idx) => (
-          <span key={`${item}-${idx}`} class="volo-tag-pill">
-            <span>{item}</span>
+          <span class="volo-token-stat">
+            {!bulkMode && qLower
+              ? t("ui.token_filter_count", { matched: indexedItems.length, count: safeValues.length })
+              : t("ui.token_count", { count: safeValues.length })}
+          </span>
+          <div class="volo-token-tools">
+            {!bulkMode && safeValues.length > 12 && (
+              <input
+                type="search"
+                class="volo-token-filter"
+                value={filterQuery}
+                placeholder={t("ui.token_filter_ph")}
+                onInput={(e) => {
+                  setFilterQuery((e.currentTarget as HTMLInputElement).value);
+                  setVisibleLimit(TOKEN_INITIAL_CAP);
+                }}
+              />
+            )}
             <button
               type="button"
-              aria-label={t("common.delete")}
+              class="volo-act-btn"
+              onClick={toggleBulkMode}
+            >
+              {t(bulkMode ? "ui.token_tag_view" : "ui.token_bulk_edit")}
+            </button>
+            {safeValues.length > 0 && (
+              <button
+                type="button"
+                class="volo-act-btn danger"
+                onClick={() => {
+                  onChange([]);
+                  setBulkText("");
+                  setFilterQuery("");
+                  setVisibleLimit(TOKEN_INITIAL_CAP);
+                }}
+              >
+                {t("ui.token_clear")}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {bulkMode ? (
+        <div>
+          <textarea
+            class="volo-textarea volo-token-bulk-area"
+            rows={6}
+            value={bulkText}
+            placeholder={placeholder || t("ui.token_placeholder")}
+            onInput={(e) => {
+              const raw = (e.currentTarget as HTMLTextAreaElement).value;
+              setBulkText(raw);
+              onChange(parseTokenBatch(raw, uppercase));
+            }}
+          />
+          <div class="volo-help" style={{ marginTop: "4px", marginBottom: 0 }}>
+            {t("ui.token_bulk_hint")}
+          </div>
+        </div>
+      ) : (
+        <div
+          class="volo-tag-capsule-box volo-token-box"
+          onClick={() => inputRef.current?.focus()}
+        >
+          {qLower && indexedItems.length === 0 && (
+            <span class="volo-token-empty">{t("ui.token_filter_empty")}</span>
+          )}
+          {visibleItems.map(({ item, origIdx }) => (
+            <span key={`${item}-${origIdx}`} class="volo-tag-pill">
+              <span>{item}</span>
+              <button
+                type="button"
+                aria-label={t("common.delete")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onChange(safeValues.filter((_, i) => i !== origIdx));
+                }}
+              >
+                <CloseIcon size={12} />
+              </button>
+            </span>
+          ))}
+          {hiddenCount > 0 && (
+            <button
+              type="button"
+              class="volo-tag-more-btn"
               onClick={(e) => {
                 e.stopPropagation();
-                onChange(safeValues.filter((_, i) => i !== idx));
+                setVisibleLimit((prev) => prev + TOKEN_REVEAL_STEP);
               }}
             >
-              <CloseIcon size={12} />
+              {t("ui.token_more", { count: hiddenCount })}
             </button>
-          </span>
-        ))}
-        <input
-          ref={inputRef}
-          type="text"
-          class="volo-tag-inline-input"
-          value={draft}
-          placeholder={placeholder || t("ui.token_placeholder")}
-          onInput={(e) => {
-            const val = (e.currentTarget as HTMLInputElement).value;
-            if (/[,，;；\n]/.test(val)) {
-              commitTokens(val);
-              setDraft("");
-            } else {
-              setDraft(val);
-            }
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              if (draft.trim()) {
+          )}
+          <input
+            ref={inputRef}
+            type="text"
+            class="volo-tag-inline-input"
+            value={draft}
+            placeholder={safeValues.length === 0 ? placeholder || t("ui.token_placeholder") : "+"}
+            onInput={(e) => {
+              const val = (e.currentTarget as HTMLInputElement).value;
+              if (/[,，;；\n]/.test(val)) {
+                commitTokens(val);
+                setDraft("");
+              } else {
+                setDraft(val);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                if (draft.trim()) {
+                  e.preventDefault();
+                  commitTokens(draft);
+                  setDraft("");
+                }
+              } else if (
+                e.key === "Backspace" &&
+                !draft &&
+                !qLower &&
+                hiddenCount === 0 &&
+                safeValues.length > 0
+              ) {
+                onChange(safeValues.slice(0, -1));
+              }
+            }}
+            onPaste={(e) => {
+              const text = e.clipboardData?.getData("text") || "";
+              if (/[,，;；\r\n]/.test(text)) {
                 e.preventDefault();
+                commitTokens(text);
+                setDraft("");
+              }
+            }}
+            onBlur={() => {
+              if (draft.trim()) {
                 commitTokens(draft);
                 setDraft("");
               }
-            } else if (e.key === "Backspace" && !draft && safeValues.length > 0) {
-              onChange(safeValues.slice(0, -1));
-            }
-          }}
-          onPaste={(e) => {
-            const text = e.clipboardData?.getData("text") || "";
-            if (/[,，;；\r\n]/.test(text)) {
-              e.preventDefault();
-              commitTokens(text);
-              setDraft("");
-            }
-          }}
-          onBlur={() => {
-            if (draft.trim()) {
-              commitTokens(draft);
-              setDraft("");
-            }
-          }}
-        />
-      </div>
+            }}
+          />
+          {safeValues.length === 0 && (
+            <button
+              type="button"
+              class="volo-token-empty-bulk"
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleBulkMode();
+              }}
+            >
+              {t("ui.token_bulk_edit")}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

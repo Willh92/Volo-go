@@ -506,16 +506,38 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 			p != "/assets/favicon.svg" &&
 			p != "/healthz" {
 			if target, code, ok := s.deps.Content.ResolveRedirect(r.Context(), p); ok {
-				dest := target
-				if r.URL.RawQuery != "" && !strings.Contains(dest, "?") {
-					dest += "?" + r.URL.RawQuery
+				if dest, valid := sanitizeResolvedRedirectTarget(target, r.URL.RawQuery); valid {
+					http.Redirect(w, r, dest, code)
+					return
 				}
-				http.Redirect(w, r, dest, code)
-				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func sanitizeResolvedRedirectTarget(target string, rawQuery string) (string, bool) {
+	dest := strings.TrimSpace(target)
+	if dest == "" || strings.ContainsAny(dest, "\r\n\x00") {
+		return "", false
+	}
+	if strings.HasPrefix(dest, "/") {
+		if strings.HasPrefix(dest, "//") || strings.HasPrefix(dest, "/\\") {
+			return "", false
+		}
+		if rawQuery != "" && !strings.Contains(dest, "?") {
+			dest += "?" + rawQuery
+		}
+		return dest, true
+	}
+	u, err := url.Parse(dest)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return "", false
+	}
+	if rawQuery != "" && u.RawQuery == "" {
+		u.RawQuery = rawQuery
+	}
+	return u.String(), true
 }
 
 // --- Zero-Copy Media Range Serving & Theme Assets ---
@@ -1992,7 +2014,7 @@ func (s *AppServer) basePageContextWithSession(r *http.Request, viewer *domain.U
 		Feed:               snap.Feed,
 		SEO:                snap.SEO,
 		Appearance:         snap.Appearance,
-		Viewer:             viewer,
+		Viewer:             s.deps.Content.MaskViewerForPublicDisplay(r.Context(), viewer),
 		ViewerCSRFToken:    viewerCSRF,
 		Owner:              extras.Owner,
 		Authors:            extras.Authors,

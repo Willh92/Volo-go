@@ -477,16 +477,16 @@ func TestContentRound3_SQLCommentPagination_TwoGenCache_PendingViews_And_Bounded
 	}
 
 	// Verify two-generation commentHTML cache rotation (> maxCommentHTMLGenEntries=2048).
-	_ = svc.renderCommentMarkdownHTML(domain.Comment{ID: "hot_cmt", UpdatedAt: 1, ContentMD: "**hot**"})
+	_ = svc.renderCommentMarkdownHTML(ctx, domain.SettingsSnapshot{}, domain.Comment{ID: "hot_cmt", UpdatedAt: 1, ContentMD: "**hot**"})
 	for i := 0; i < maxCommentHTMLGenEntries+50; i++ {
-		_ = svc.renderCommentMarkdownHTML(domain.Comment{
+		_ = svc.renderCommentMarkdownHTML(ctx, domain.SettingsSnapshot{}, domain.Comment{
 			ID:        fmt.Sprintf("gen_%d", i),
 			UpdatedAt: 1,
 			ContentMD: "item",
 		})
 	}
 	// Promote hot_cmt from Prev -> Curr, then trigger one more generation rotation.
-	if got := svc.renderCommentMarkdownHTML(domain.Comment{ID: "hot_cmt", UpdatedAt: 1, ContentMD: "**hot**"}); !strings.Contains(got, "<strong>hot</strong>") {
+	if got := svc.renderCommentMarkdownHTML(ctx, domain.SettingsSnapshot{}, domain.Comment{ID: "hot_cmt", UpdatedAt: 1, ContentMD: "**hot**"}); !strings.Contains(got, "<strong>hot</strong>") {
 		t.Fatalf("unexpected hot_cmt HTML: %s", got)
 	}
 	svc.commentHTMLMu.RLock()

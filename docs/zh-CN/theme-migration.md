@@ -80,7 +80,7 @@
 }
 ```
 
-支持的 `config_schema` 字段类型：`string` / `text`、`textarea`、`url`、`image`、`color`、`boolean`、`number`（支持 `min`/`max`/`step`）、`select`、`sortable_list`（可勾选显隐并上下拖拽排序的多选列表，如 `header_nav_items`）。
+支持的 `config_schema` 字段类型：`string` / `text`、`textarea`、`url`、`image`、`color`、`boolean`、`number`（支持 `min`/`max`/`step`）、`select`、`sortable_list`（可勾选显隐并上下拖拽排序的多选列表，如 `header_nav_items`）、`tag_list`（胶囊标签词组列表，支持检索与批量编辑模式）。
 
 在模板中读取主题配置、自定义站点变量与列表模式：
 - 主题字符串配置：`{{themeCfg .ThemeConfig "hero_notice" ""}}`

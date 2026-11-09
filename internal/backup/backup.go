@@ -558,7 +558,7 @@ func sanitizeBackupZipEntryName(raw string, isDir bool) (string, error) {
 	if raw == "" || strings.ContainsRune(raw, 0) || strings.ContainsRune(raw, '\\') || strings.ContainsRune(raw, ':') {
 		return "", fmt.Errorf("backup: unsafe archive entry path %q rejected", raw)
 	}
-	if strings.HasPrefix(raw, "/") {
+	if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "/\\") {
 		return "", fmt.Errorf("backup: absolute archive entry path %q rejected", raw)
 	}
 	trimmed := raw

@@ -837,3 +837,112 @@ func TestUnifiedChainedInterception_And_PluginPriorityReordering(t *testing.T) {
 	}
 }
 
+func TestSensitiveWordsPlugin_MaskExistingAndTagListSchema(t *testing.T) {
+	ctx := context.Background()
+	store, kr, cat, tmpDir := openTestPluginEnv(t)
+
+	pluginsDir := filepath.Join(tmpDir, "plugins")
+	srcPluginDir := filepath.Join("..", "..", "plugins", "sensitive-words")
+	copyDirRecursive(t, srcPluginDir, filepath.Join(pluginsDir, "sensitive-words"))
+
+	mgr := NewManager(ManagerOptions{
+		Store:      store,
+		Keys:       kr,
+		PluginsDir: pluginsDir,
+		DataDir:    filepath.Join(tmpDir, "data"),
+		Catalog:    cat,
+	})
+	t.Cleanup(func() { _ = mgr.Close(ctx) })
+
+	if err := mgr.DiscoverAndStart(ctx); err != nil {
+		t.Fatalf("DiscoverAndStart: %v", err)
+	}
+	if err := mgr.Enable(ctx, "sensitive-words"); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+
+	sum, ok := mgr.Get("sensitive-words", "zh-CN")
+	if !ok {
+		t.Fatalf("expected sensitive-words summary")
+	}
+	tagListFields := map[string]bool{}
+	for _, f := range sum.ConfigSchema {
+		if f.Type == "tag_list" {
+			tagListFields[f.Key] = true
+		}
+	}
+	for _, expectedKey := range []string{"reserved_nicknames", "custom_deny", "custom_allow"} {
+		if !tagListFields[expectedKey] {
+			t.Fatalf("expected %s to use config_schema type tag_list, got %+v", expectedKey, sum.ConfigSchema)
+		}
+	}
+
+	// SanitizerStateHash must be non-empty immediately upon Enable (even before lazy 64k compile).
+	hashIdle := mgr.Providers().SanitizerStateHash()
+	if hashIdle == "" {
+		t.Fatalf("expected non-empty SanitizerStateHash immediately after Enable")
+	}
+
+	// First MaskCommentHTML call lazily warms native CSR matchers without tripping circuit breaker.
+	rawHTML := `<p>真是个傻<strong>逼</strong>，看<a href="https://example.com/傻逼?a=1&amp;b=2" title="傻逼">傻瓜相机</a> &amp; 2B铅笔</p>`
+	maskedHTML := mgr.Providers().MaskCommentHTML(ctx, rawHTML)
+	wantHTML := `<p>真是个*<strong>*</strong>，看<a href="https://example.com/傻逼?a=1&amp;b=2" title="傻逼">傻瓜相机</a> &amp; 2B铅笔</p>`
+	if maskedHTML != wantHTML {
+		t.Fatalf("MaskCommentHTML mismatch:\n got: %s\nwant: %s", maskedHTML, wantHTML)
+	}
+
+	// Non-staff impersonator/profane handles are masked, while genuine staff/author handles are preserved intact.
+	if got := mgr.Providers().MaskNickname(ctx, "系统管理员", false); got != "*****" {
+		t.Fatalf("expected guest impersonator nickname masked to *****, got %q", got)
+	}
+	if got := mgr.Providers().MaskNickname(ctx, "傻逼青年", false); got != "**青年" {
+		t.Fatalf("expected profane guest/reader nickname masked to **青年, got %q", got)
+	}
+	if got := mgr.Providers().MaskNickname(ctx, "系统管理员", true); got != "系统管理员" {
+		t.Fatalf("expected genuine staff nickname preserved, got %q", got)
+	}
+	if got := mgr.Providers().MaskNickname(ctx, "站长", true); got != "站长" {
+		t.Fatalf("expected genuine author/staff title preserved, got %q", got)
+	}
+
+	afterWarm, _ := mgr.Get("sensitive-words", "zh-CN")
+	if afterWarm.FailureCount != 0 || afterWarm.CircuitState != CircuitClosed {
+		t.Fatalf("expected 0 failures after lazy sanitizer warmup, got failures=%d circuit=%s", afterWarm.FailureCount, afterWarm.CircuitState)
+	}
+
+	// Update tag_list config (accepting both []any array and legacy newline string) and verify instant hash & mask update.
+	if _, err := mgr.UpdateConfig(ctx, "sensitive-words", map[string]any{
+		"custom_deny":   []any{"机密代号X", "内部暗语"},
+		"custom_allow":  "机密代号X公开版\n# comment line",
+		"mask_existing": true,
+	}, "zh-CN"); err != nil {
+		t.Fatalf("UpdateConfig(tag_list): %v", err)
+	}
+	hashAfterCfg := mgr.Providers().SanitizerStateHash()
+	if hashAfterCfg == "" || hashAfterCfg == hashIdle {
+		t.Fatalf("expected SanitizerStateHash to rotate after UpdateConfig (%q vs %q)", hashIdle, hashAfterCfg)
+	}
+	if got := mgr.Providers().MaskCommentText(ctx, "泄露机密代号X，但机密代号X公开版合规"); got != "泄露*****，但机密代号X公开版合规" {
+		t.Fatalf("unexpected custom tag_list MaskCommentText output: %q", got)
+	}
+
+	// Toggling mask_existing=false leaves historical text unmasked while still blocking new sensitive comments.
+	if _, err := mgr.UpdateConfig(ctx, "sensitive-words", map[string]any{
+		"mask_existing": false,
+	}, "zh-CN"); err != nil {
+		t.Fatalf("UpdateConfig(mask_existing=false): %v", err)
+	}
+	if got := mgr.Providers().MaskCommentHTML(ctx, `<p>傻逼</p>`); got != `<p>傻逼</p>` {
+		t.Fatalf("expected unmasked HTML when mask_existing=false, got %q", got)
+	}
+	verdict := mgr.Providers().EvaluateComment(ctx, CommentCheckInput{
+		AuthorName: "读者",
+		ContentMD:  "傻逼",
+		IsGuest:    true,
+	})
+	if verdict.Action != SpamActionReject {
+		t.Fatalf("expected new sensitive comment still rejected when mask_existing=false, got %+v", verdict)
+	}
+}
+
+

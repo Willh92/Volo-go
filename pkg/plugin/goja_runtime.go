@@ -75,6 +75,15 @@ type pluginRateBucket struct {
 	count       int
 }
 
+type runtimeSanitizerConfig struct {
+	initialized   bool
+	forWordRev    int64
+	enabled       bool
+	contentSig    string
+	nicknameSig   string
+	checkNickname bool
+}
+
 type gojaPluginRuntime struct {
 	manifest              Manifest
 	pluginDir             string
@@ -97,11 +106,13 @@ type gojaPluginRuntime struct {
 	httpHostsKey  string
 	httpClientPtr *http.Client
 
-	wordCompileMu sync.Mutex
-	wordMu        sync.RWMutex
-	wordMatchers  map[string]*wordfilter.Matcher
-	wordOrder     []string
-	wordRev       atomic.Int64
+	sanitizerWarmMu sync.Mutex
+	wordCompileMu   sync.Mutex
+	wordMu          sync.RWMutex
+	wordMatchers    map[string]*wordfilter.Matcher
+	wordOrder       []string
+	sanitizerCfg    runtimeSanitizerConfig
+	wordRev         atomic.Int64
 
 	rateMu      sync.Mutex
 	rateBuckets map[string]pluginRateBucket
@@ -580,7 +591,7 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 		return jsValue{kind: valNumber, num: float64(r.wordRev.Load())}, nil
 	}))
 	wfBridge.setVal("bumpRevision", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
-		return jsValue{kind: valNumber, num: float64(r.wordRev.Add(1))}, nil
+		return jsValue{kind: valNumber, num: float64(r.bumpWordRevision())}, nil
 	}))
 	wfBridge.setVal("has", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 		if len(args) < 1 {
@@ -642,6 +653,31 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 			},
 		}, nil
 	}))
+	wfBridge.setVal("maskText", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if len(args) < 2 {
+			return jsValue{kind: valString}, nil
+		}
+		raw := args[1].toString()
+		m := r.lookupWordMatcher(args[0].toString())
+		if m == nil {
+			return jsValue{kind: valString, str: raw}, nil
+		}
+		return jsValue{kind: valString, str: m.MaskText(raw)}, nil
+	}))
+	wfBridge.setVal("maskHTML", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+		if len(args) < 2 {
+			return jsValue{kind: valString}, nil
+		}
+		raw := args[1].toString()
+		m := r.lookupWordMatcher(args[0].toString())
+		if m == nil {
+			return jsValue{kind: valString, str: raw}, nil
+		}
+		return jsValue{kind: valString, str: m.MaskHTML(raw)}, nil
+	}))
+	wfBridge.Set("setSanitizer", func(spec map[string]any) {
+		r.setSanitizerConfig(spec)
+	})
 	wfBridge.setVal("clear", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
 		return jsValue{kind: valNumber, num: float64(r.clearWordMatchers())}, nil
 	}))
@@ -1330,8 +1366,148 @@ func (r *gojaPluginRuntime) clearWordMatchers() int64 {
 	r.wordMu.Lock()
 	clear(r.wordMatchers)
 	r.wordOrder = r.wordOrder[:0]
+	r.sanitizerCfg = runtimeSanitizerConfig{}
+	nextRev := r.wordRev.Add(1)
 	r.wordMu.Unlock()
-	return r.wordRev.Add(1)
+	return nextRev
+}
+
+func (r *gojaPluginRuntime) bumpWordRevision() int64 {
+	r.wordMu.Lock()
+	r.sanitizerCfg.initialized = false
+	nextRev := r.wordRev.Add(1)
+	r.wordMu.Unlock()
+	return nextRev
+}
+
+func (r *gojaPluginRuntime) setSanitizerConfig(spec map[string]any) {
+	if r == nil {
+		return
+	}
+	var cfg runtimeSanitizerConfig
+	cfg.initialized = true
+	if spec != nil {
+		cfg.enabled, _ = spec["enabled"].(bool)
+		if cs, ok := spec["content_sig"].(string); ok {
+			cfg.contentSig = strings.TrimSpace(cs)
+		}
+		if ns, ok := spec["nickname_sig"].(string); ok {
+			cfg.nicknameSig = strings.TrimSpace(ns)
+		}
+		cfg.checkNickname, _ = spec["check_nickname"].(bool)
+	}
+	r.wordMu.Lock()
+	cfg.forWordRev = r.wordRev.Load()
+	r.sanitizerCfg = cfg
+	r.wordMu.Unlock()
+}
+
+func (r *gojaPluginRuntime) readReadySanitizerMatchers(needNickname bool) (*wordfilter.Matcher, *wordfilter.Matcher, bool) {
+	curRev := r.wordRev.Load()
+	r.wordMu.RLock()
+	sc := r.sanitizerCfg
+	if !sc.initialized || sc.forWordRev != curRev {
+		r.wordMu.RUnlock()
+		return nil, nil, false
+	}
+	if !sc.enabled {
+		r.wordMu.RUnlock()
+		return nil, nil, true
+	}
+	var contentMatcher, nickMatcher *wordfilter.Matcher
+	if sc.contentSig != "" {
+		contentMatcher = r.wordMatchers[sc.contentSig]
+		if contentMatcher == nil {
+			r.wordMu.RUnlock()
+			return nil, nil, false
+		}
+	}
+	if needNickname && sc.checkNickname && sc.nicknameSig != "" {
+		nickMatcher = r.wordMatchers[sc.nicknameSig]
+		if nickMatcher == nil {
+			r.wordMu.RUnlock()
+			return nil, nil, false
+		}
+	}
+	r.wordMu.RUnlock()
+	return contentMatcher, nickMatcher, true
+}
+
+func (r *gojaPluginRuntime) ensureSanitizerMatchers(ctx context.Context, needNickname bool) (*wordfilter.Matcher, *wordfilter.Matcher) {
+	if r == nil {
+		return nil, nil
+	}
+	if cm, nm, ok := r.readReadySanitizerMatchers(needNickname); ok {
+		return cm, nm
+	}
+
+	r.sanitizerWarmMu.Lock()
+	defer r.sanitizerWarmMu.Unlock()
+
+	if cm, nm, ok := r.readReadySanitizerMatchers(needNickname); ok {
+		return cm, nm
+	}
+
+	if !r.hasCallable("ensureSanitizer") {
+		r.wordMu.Lock()
+		r.sanitizerCfg = runtimeSanitizerConfig{
+			initialized: true,
+			forWordRev:  r.wordRev.Load(),
+			enabled:     false,
+		}
+		r.wordMu.Unlock()
+		return nil, nil
+	}
+
+	warmCtx := context.Background()
+	if ctx != nil {
+		warmCtx = context.WithoutCancel(ctx)
+	}
+	if _, _, err := r.invoke(warmCtx, 4*time.Second, "ensureSanitizer"); err != nil {
+		if r.logger != nil {
+			r.logger.Write(r.manifest.ID, "warn", "sanitizer", "lazy sanitizer warmup failed: "+err.Error())
+		}
+		return nil, nil
+	}
+	cm, nm, _ := r.readReadySanitizerMatchers(needNickname)
+	return cm, nm
+}
+
+func (r *gojaPluginRuntime) maskSanitizerHTML(ctx context.Context, htmlStr string) string {
+	if r == nil || strings.TrimSpace(htmlStr) == "" {
+		return htmlStr
+	}
+	cm, _ := r.ensureSanitizerMatchers(ctx, false)
+	if cm == nil {
+		return htmlStr
+	}
+	return cm.MaskHTML(htmlStr)
+}
+
+func (r *gojaPluginRuntime) maskSanitizerText(ctx context.Context, text string) string {
+	if r == nil || strings.TrimSpace(text) == "" {
+		return text
+	}
+	cm, _ := r.ensureSanitizerMatchers(ctx, false)
+	if cm == nil {
+		return text
+	}
+	return cm.MaskText(text)
+}
+
+func (r *gojaPluginRuntime) maskSanitizerNickname(ctx context.Context, nickname string, isStaffOrAuthor bool) string {
+	if r == nil || isStaffOrAuthor || strings.TrimSpace(nickname) == "" {
+		return nickname
+	}
+	cm, nm := r.ensureSanitizerMatchers(ctx, true)
+	out := nickname
+	if cm != nil {
+		out = cm.MaskText(out)
+	}
+	if nm != nil {
+		out = nm.MaskText(out)
+	}
+	return out
 }
 
 func (r *gojaPluginRuntime) closeRuntime() {

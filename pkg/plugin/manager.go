@@ -328,6 +328,7 @@ type managedPlugin struct {
 	publicConfig  map[string]any
 	secretConfig  map[string]string
 	mergedCfgSnap atomic.Pointer[map[string]any]
+	cfgRev        atomic.Uint64
 }
 
 func (mp *managedPlugin) setPriorityLocked(p int, custom bool) {
@@ -397,6 +398,7 @@ func (mp *managedPlugin) rebuildConfigSnapshot() {
 		combined[k] = v
 	}
 	mp.mergedCfgSnap.Store(&combined)
+	mp.cfgRev.Add(1)
 }
 
 func (mp *managedPlugin) getConfigMap() map[string]any {
@@ -3665,7 +3667,10 @@ func parseOIDCBool(v any) bool {
 	}
 }
 
-var _ NicknameAntiSpamProvider = (*gojaAntiSpamAdapter)(nil)
+var (
+	_ NicknameAntiSpamProvider = (*gojaAntiSpamAdapter)(nil)
+	_ ContentSanitizerProvider = (*gojaAntiSpamAdapter)(nil)
+)
 
 type gojaAntiSpamAdapter struct {
 	manager *Manager
@@ -3673,6 +3678,52 @@ type gojaAntiSpamAdapter struct {
 }
 
 func (a *gojaAntiSpamAdapter) Name() string { return "plugin:" + a.mp.manifest.ID }
+
+func (a *gojaAntiSpamAdapter) activeRuntime() *gojaPluginRuntime {
+	if a == nil || a.mp == nil {
+		return nil
+	}
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+	if !enabled {
+		return nil
+	}
+	return rt
+}
+
+func (a *gojaAntiSpamAdapter) SanitizerStateToken() string {
+	rt := a.activeRuntime()
+	if rt == nil {
+		return ""
+	}
+	return strconv.FormatUint(a.mp.cfgRev.Load(), 36) + ":" + strconv.FormatInt(rt.wordRev.Load(), 36)
+}
+
+func (a *gojaAntiSpamAdapter) MaskHTML(ctx context.Context, htmlStr string) string {
+	rt := a.activeRuntime()
+	if rt == nil {
+		return htmlStr
+	}
+	return rt.maskSanitizerHTML(ctx, htmlStr)
+}
+
+func (a *gojaAntiSpamAdapter) MaskText(ctx context.Context, text string) string {
+	rt := a.activeRuntime()
+	if rt == nil {
+		return text
+	}
+	return rt.maskSanitizerText(ctx, text)
+}
+
+func (a *gojaAntiSpamAdapter) MaskNickname(ctx context.Context, nickname string, isStaffOrAuthor bool) string {
+	rt := a.activeRuntime()
+	if rt == nil {
+		return nickname
+	}
+	return rt.maskSanitizerNickname(ctx, nickname, isStaffOrAuthor)
+}
 
 func (a *gojaAntiSpamAdapter) CheckComment(ctx context.Context, input CommentCheckInput) (SpamVerdict, error) {
 	a.mp.mu.Lock()

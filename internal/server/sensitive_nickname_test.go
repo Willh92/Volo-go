@@ -688,3 +688,352 @@ volo.on("article.before_save", function(p) {
 		t.Fatalf("expected 200 triggered=1 on trigger-cron, got %d (%s)", cCode, cBody)
 	}
 }
+
+func TestExistingSensitiveCommentsAndNicknames_MaskedOnDisplayWithoutAnomaly(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	dataDir := filepath.Join(tmp, "data")
+	uploadDir := filepath.Join(tmp, "uploads")
+	pluginsDir := filepath.Join(tmp, "plugins")
+	themesDir := filepath.Join(tmp, "themes")
+	for _, d := range []string{dataDir, uploadDir, pluginsDir, themesDir} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	copyPluginTreeForServerTest(
+		t,
+		filepath.Join("..", "..", "plugins", "sensitive-words"),
+		filepath.Join(pluginsDir, "sensitive-words"),
+	)
+
+	secret := "0123456789abcdef0123456789abcdef-mask-existing-e2e"
+	pubURL := "https://blog.example.com"
+	cfg, err := config.Load(config.CLIOverrides{
+		SecretKey:  &secret,
+		PublicURL:  &pubURL,
+		DataDir:    &dataDir,
+		UploadDir:  &uploadDir,
+		PluginsDir: &pluginsDir,
+		ThemesDir:  &themesDir,
+	})
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(dataDir, "volo-mask-existing.db"),
+	})
+	if err != nil {
+		t.Fatalf("sqlx.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatalf("migrate.Up: %v", err)
+	}
+
+	cat, err := i18n.NewCatalog("zh-CN", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settingsMgr := repo.NewSettingsManager(store, cfg.KeyRing, "zh-CN")
+	if _, err := settingsMgr.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := settingsMgr.PatchDomain(ctx, "reading", []byte(`{"builtin_spam_filter":false,"pow_difficulty_bits":4}`), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	pluginMgr := plugin.NewManager(plugin.ManagerOptions{
+		Store:      store,
+		Keys:       cfg.KeyRing,
+		PluginsDir: pluginsDir,
+		DataDir:    dataDir,
+		Catalog:    cat,
+	})
+	// Start with sensitive-words DISABLED so historical comments & caches warm with raw text first!
+	if err := pluginMgr.DiscoverAndStart(ctx); err != nil {
+		t.Fatalf("DiscoverAndStart: %v", err)
+	}
+	t.Cleanup(func() { _ = pluginMgr.Close(ctx) })
+
+	passports := guest.NewPassportManager(cfg.KeyRing, cfg.PublicURL)
+	pow := guest.NewPoWVerifier(cfg.KeyRing)
+	rnd := render.Default()
+	grd := visibility.NewGuard(cfg.KeyRing, settingsMgr, passports, cat, rnd)
+	srch := visibility.NewSearchIndex(store, rnd, 64*1024)
+	cnt := content.NewService(content.ServiceOptions{
+		Store:     store,
+		Keys:      cfg.KeyRing,
+		Settings:  settingsMgr,
+		Passports: passports,
+		PoW:       pow,
+		Guard:     grd,
+		Search:    srch,
+		Renderer:  rnd,
+		Plugins:   pluginMgr,
+		Catalog:   cat,
+	})
+
+	if _, _, err := settingsMgr.PatchDomain(ctx, "reading", []byte(`{"allow_reader_register":true,"pow_difficulty_bits":4}`), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var lastCode atomic.Value
+	appSrv, err := server.NewAppServer(server.AppDeps{
+		Config:    cfg,
+		Store:     store,
+		Settings:  settingsMgr,
+		Catalog:   cat,
+		Passports: passports,
+		PoW:       pow,
+		Plugins:   pluginMgr,
+		Content:   cnt,
+		SendVerificationMail: func(_ context.Context, _ string, code string, _ string) error {
+			lastCode.Store(code)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAppServer: %v", err)
+	}
+	t.Cleanup(func() { _ = appSrv.Close(ctx) })
+	ts := httptest.NewServer(appSrv.Handler())
+	t.Cleanup(ts.Close)
+
+	now := time.Now().UnixMilli()
+	// 1. Real admin user whose official DisplayName is "站长"
+	if _, err := store.ExecContext(ctx,
+		`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
+		 VALUES ('u_admin', 'admin', 'admin@example.com', '站长', '', '', '', 'admin', 'x', '', 'active', ?, 'zh-CN', ?, ?)`,
+		now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// 2. Pre-existing registered reader ("野生博主阿强") created BEFORE sensitive-words is enabled!
+	postJSON := func(path string, payload any) (*http.Response, string) {
+		rawB, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, bytes.NewReader(rawB))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", pubURL)
+		resp, dErr := http.DefaultClient.Do(req)
+		if dErr != nil {
+			t.Fatal(dErr)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, string(b)
+	}
+	if scResp, scBody := postJSON("/api/v1/reader/send-code", map[string]string{
+		"email":    "legacy@example.com",
+		"username": "野生博主阿强",
+	}); scResp.StatusCode != http.StatusOK {
+		t.Fatalf("send-code before plugin enable failed: %d (%s)", scResp.StatusCode, scBody)
+	}
+	verifyCode, _ := lastCode.Load().(string)
+	regResp, regBody := postJSON("/api/v1/reader/register", map[string]string{
+		"username": "野生博主阿强",
+		"email":    "legacy@example.com",
+		"password": "LegacyReaderPassword!123",
+		"code":     verifyCode,
+	})
+	if regResp.StatusCode != http.StatusCreated {
+		t.Fatalf("register legacy reader before plugin enable failed: %d (%s)", regResp.StatusCode, regBody)
+	}
+	readerCookies := regResp.Cookies()
+	var regInfo struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	_ = json.Unmarshal([]byte(regBody), &regInfo)
+
+	if _, err := store.ExecContext(ctx,
+		`INSERT INTO categories (id, name, slug, description, icon, sort_order, created_at, updated_at)
+		 VALUES ('cat_1', 'Tech', 'tech', '', '', 1, ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx,
+		`INSERT INTO articles (
+			id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md,
+			cover_url, status, is_pinned, allow_comment, password_ciphertext, has_content_lock,
+			audio_url, audio_duration_sec, audio_size_bytes, audio_mime,
+			lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count,
+			published_at, created_at, updated_at
+		) VALUES ('art_hist', 'u_admin', 'cat_1', 'History Post', 'history-post', '', 'sum', 'body', '', 'published', 0, 1, '', 0,
+		          '', 0, 0, '', 'zh-CN', '', '', 10, 1, 0, 2, ?, ?, ?)`,
+		now, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Historical guest comment containing sensitive words, cross-tag split word, safe URL containing keyword, allowlisted word, and guest impersonator handle "站长"
+	rawGuestMD := `历史遗留傻逼言论，傻**逼**跨标签，还有[傻瓜相机](https://example.com/傻逼?x=1&y=2)推荐`
+	if _, err := store.ExecContext(ctx,
+		`INSERT INTO comments (
+			id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash,
+			author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale,
+			client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at
+		) VALUES ('c_guest_hist', 'article', 'art_hist', '', '', '', 'gh_1', '',
+		          '站长', '', '', '', 'zh-CN',
+		          '1.2.3.4', '1.2.3.*', '', ?, 'approved', 0, ?, ?)`,
+		rawGuestMD, now-2000, now-2000); err != nil {
+		t.Fatal(err)
+	}
+	// Historical genuine admin comment with author_name "站长"
+	if _, err := store.ExecContext(ctx,
+		`INSERT INTO comments (
+			id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash,
+			author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale,
+			client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at
+		) VALUES ('c_admin_hist', 'article', 'art_hist', '', '', 'u_admin', '', '',
+		          '站长', '', '', '', 'zh-CN',
+		          '1.2.3.4', '1.2.3.*', '', '我是真正的站长，感谢大家阅读！', 'approved', 0, ?, ?)`,
+		now-1000, now-1000); err != nil {
+		t.Fatal(err)
+	}
+
+	fetchComments := func() []content.PublicCommentView {
+		resp, gErr := http.Get(ts.URL + "/api/v1/comments?target_type=article&target_id=art_hist")
+		if gErr != nil {
+			t.Fatal(gErr)
+		}
+		defer resp.Body.Close()
+		var out content.PaginatedCommentsResult
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode comments: %v", err)
+		}
+		return out.Comments
+	}
+
+	findComment := func(items []content.PublicCommentView, wantID string) content.PublicCommentView {
+		for _, it := range items {
+			if it.ID == wantID {
+				return it
+			}
+		}
+		t.Fatalf("comment %q not found in %+v", wantID, items)
+		return content.PublicCommentView{}
+	}
+
+	// Step A: Before enabling sensitive-words, warm both commentHTML cache and RecentComments chrome cache.
+	beforeItems := fetchComments()
+	beforeGuest := findComment(beforeItems, "c_guest_hist")
+	if !strings.Contains(beforeGuest.ContentHTML, "傻逼") || beforeGuest.AuthorName != "站长" {
+		t.Fatalf("expected raw unmasked historical comment before enabling plugin, got %+v", beforeGuest)
+	}
+	recentBefore, err := cnt.ListRecentPublicComments(ctx, 10)
+	if err != nil || len(recentBefore) < 2 || !strings.Contains(recentBefore[1].Excerpt, "傻逼") {
+		t.Fatalf("expected raw recent excerpt before enabling plugin (err=%v), got %+v", err, recentBefore)
+	}
+
+	// Step B: Enable sensitive-words at runtime -> caches must immediately invalidate and mask with * without corrupting HTML or real admin handle!
+	if err := pluginMgr.Enable(ctx, "sensitive-words"); err != nil {
+		t.Fatalf("Enable(sensitive-words): %v", err)
+	}
+	afterItems := fetchComments()
+	guestView := findComment(afterItems, "c_guest_hist")
+	adminView := findComment(afterItems, "c_admin_hist")
+
+	if guestView.AuthorName != "**" {
+		t.Fatalf("expected guest impersonator nickname '站长' masked to '**', got %q", guestView.AuthorName)
+	}
+	if strings.Contains(guestView.ContentHTML, "遗留傻逼") || strings.Contains(guestView.ContentHTML, "傻<strong>逼</strong>") {
+		t.Fatalf("expected historical sensitive words & split-tag words masked in HTML, got %q", guestView.ContentHTML)
+	}
+	if !strings.Contains(guestView.ContentHTML, "遗留**言论") || !strings.Contains(guestView.ContentHTML, "*<strong>*</strong>") {
+		t.Fatalf("expected ** and *<strong>*</strong> in masked HTML, got %q", guestView.ContentHTML)
+	}
+	if !strings.Contains(guestView.ContentHTML, `href="https://example.com/傻逼?x=1&amp;y=2"`) &&
+		!strings.Contains(guestView.ContentHTML, `href="https://example.com/%E5%82%BB%E9%80%BC?x=1&amp;y=2"`) {
+		t.Fatalf("expected <a href> URL attribute preserved without corruption, got %q", guestView.ContentHTML)
+	}
+	if !strings.Contains(guestView.ContentHTML, ">傻瓜相机</a>") {
+		t.Fatalf("expected allowlisted phrase '傻瓜相机' preserved intact, got %q", guestView.ContentHTML)
+	}
+	if adminView.AuthorName != "站长" || !adminView.IsAuthor {
+		t.Fatalf("expected genuine admin/author display name '站长' NOT masked, got author=%q is_author=%v", adminView.AuthorName, adminView.IsAuthor)
+	}
+
+	// Recent comments feed must also reflect masked guest nickname & masked excerpt immediately!
+	recentAfter, err := cnt.ListRecentPublicComments(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentPublicComments after enable: %v", err)
+	}
+	var guestRecent *content.RecentCommentItem
+	for i := range recentAfter {
+		if recentAfter[i].ID == "c_guest_hist" {
+			guestRecent = &recentAfter[i]
+			break
+		}
+	}
+	if guestRecent == nil || guestRecent.AuthorName != "**" || strings.Contains(guestRecent.Excerpt, "傻逼") || !strings.Contains(guestRecent.Excerpt, "遗留**言论") {
+		t.Fatalf("expected recent comment feed masked immediately, got %+v", guestRecent)
+	}
+
+	// Verify non-destructive storage: SQLite row still holds original raw text.
+	var storedMD, storedAuthor string
+	if err := store.QueryRowContext(ctx, `SELECT content_md, author_name FROM comments WHERE id = 'c_guest_hist'`).Scan(&storedMD, &storedAuthor); err != nil {
+		t.Fatal(err)
+	}
+	if storedMD != rawGuestMD || storedAuthor != "站长" {
+		t.Fatalf("expected database row untouched, got md=%q author=%q", storedMD, storedAuthor)
+	}
+
+	// Step C: Pre-existing registered reader ("野生博主阿强") can post a clean comment without lockout, and displayed author_name masks "博主" -> "**"!
+	postReaderComment := func(md string) (*http.Response, string) {
+		rawBody, _ := json.Marshal(map[string]any{
+			"target_type": "article",
+			"target_id":   "art_hist",
+			"content_md":  md,
+		})
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/comments", bytes.NewReader(rawBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", pubURL)
+		req.Header.Set("X-CSRF-Token", regInfo.CSRFToken)
+		for _, ck := range readerCookies {
+			req.AddCookie(ck)
+		}
+		resp, dErr := http.DefaultClient.Do(req)
+		if dErr != nil {
+			t.Fatal(dErr)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, string(b)
+	}
+
+	okResp, okBody := postReaderComment("感谢站长的精彩文章，收获很大！")
+	if okResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected pre-existing registered reader clean comment to succeed (201), got %d (%s)", okResp.StatusCode, okBody)
+	}
+	var createdWrap struct {
+		Comment content.PublicCommentView `json:"comment"`
+	}
+	_ = json.Unmarshal([]byte(okBody), &createdWrap)
+	if createdWrap.Comment.AuthorName != "野生**阿强" {
+		t.Fatalf("expected pre-existing reader restricted substring masked to '野生**阿强', got %q", createdWrap.Comment.AuthorName)
+	}
+
+	badResp, _ := postReaderComment("这里发一句傻逼试试")
+	if badResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected pre-existing reader sensitive comment body still rejected (403), got %d", badResp.StatusCode)
+	}
+
+	// Step D: Disable plugin & verify built-in host keyword filter also masks existing content when enabled, and restores raw display when both are off.
+	if err := pluginMgr.Disable(ctx, "sensitive-words"); err != nil {
+		t.Fatalf("Disable(sensitive-words): %v", err)
+	}
+	restoredGuest := findComment(fetchComments(), "c_guest_hist")
+	if !strings.Contains(restoredGuest.ContentHTML, "遗留傻逼言论") || restoredGuest.AuthorName != "站长" {
+		t.Fatalf("expected original unmasked display restored when plugin disabled, got %+v", restoredGuest)
+	}
+
+	if _, _, err := settingsMgr.PatchDomain(ctx, "reading", []byte(`{"builtin_spam_filter":true,"blocked_keywords":["遗留傻逼"]}`), 0); err != nil {
+		t.Fatal(err)
+	}
+	hostMaskedGuest := findComment(fetchComments(), "c_guest_hist")
+	if !strings.Contains(hostMaskedGuest.ContentHTML, "****言论") {
+		t.Fatalf("expected host builtin_spam_filter blocked_keywords to mask existing comment HTML, got %q", hostMaskedGuest.ContentHTML)
+	}
+}
+

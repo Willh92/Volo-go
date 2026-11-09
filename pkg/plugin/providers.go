@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -125,6 +127,17 @@ type AntiSpamProvider interface {
 type NicknameAntiSpamProvider interface {
 	AntiSpamProvider
 	CheckNickname(ctx context.Context, input NicknameCheckInput) (SpamVerdict, error)
+}
+
+// ContentSanitizerProvider is an optional extension implemented by AntiSpamProvider plugins
+// to non-destructively mask sensitive words in existing/displayed HTML, plain text, and nicknames
+// with '*' without mutating persisted database rows.
+type ContentSanitizerProvider interface {
+	AntiSpamProvider
+	MaskHTML(ctx context.Context, htmlStr string) string
+	MaskText(ctx context.Context, text string) string
+	MaskNickname(ctx context.Context, nickname string, isStaffOrAuthor bool) string
+	SanitizerStateToken() string
 }
 
 // FederationProvider allows plugins with federation capability to publish/deliver article lifecycle events.
@@ -561,6 +574,120 @@ func (r *ProviderRegistry) EvaluateNickname(ctx context.Context, input NicknameC
 		return v
 	}
 	return SpamVerdict{Action: SpamActionPass}
+}
+
+func (r *ProviderRegistry) activeSanitizers() []providerEntry[ContentSanitizerProvider] {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.antiSpamList) == 0 {
+		return nil
+	}
+	var out []providerEntry[ContentSanitizerProvider]
+	for _, ent := range r.antiSpamList {
+		if sp, ok := ent.provider.(ContentSanitizerProvider); ok && sp != nil {
+			out = append(out, providerEntry[ContentSanitizerProvider]{
+				pluginID: ent.pluginID,
+				priority: ent.priority,
+				provider: sp,
+			})
+		}
+	}
+	return out
+}
+
+// SanitizerStateHash returns a fast cache-coherence token reflecting all active ContentSanitizerProviders,
+// their execution priority order, and their dictionary/configuration revisions.
+func (r *ProviderRegistry) SanitizerStateHash() string {
+	list := r.activeSanitizers()
+	if len(list) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, ent := range list {
+		tok := safeSanitizerCall("", ent.provider.SanitizerStateToken)
+		if tok == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(ent.pluginID)
+		b.WriteByte('#')
+		b.WriteString(strconv.Itoa(ent.priority))
+		b.WriteByte(':')
+		b.WriteString(tok)
+	}
+	return b.String()
+}
+
+// MaskCommentHTML runs all active ContentSanitizerProviders in priority order over rendered comment HTML.
+func (r *ProviderRegistry) MaskCommentHTML(ctx context.Context, htmlStr string) string {
+	if r == nil || strings.TrimSpace(htmlStr) == "" {
+		return htmlStr
+	}
+	list := r.activeSanitizers()
+	if len(list) == 0 {
+		return htmlStr
+	}
+	cur := htmlStr
+	for _, ent := range list {
+		sp := ent.provider
+		cur = safeSanitizerCall(cur, func() string {
+			return sp.MaskHTML(ctx, cur)
+		})
+	}
+	return cur
+}
+
+// MaskCommentText runs all active ContentSanitizerProviders in priority order over plain text.
+func (r *ProviderRegistry) MaskCommentText(ctx context.Context, text string) string {
+	if r == nil || strings.TrimSpace(text) == "" {
+		return text
+	}
+	list := r.activeSanitizers()
+	if len(list) == 0 {
+		return text
+	}
+	cur := text
+	for _, ent := range list {
+		sp := ent.provider
+		cur = safeSanitizerCall(cur, func() string {
+			return sp.MaskText(ctx, cur)
+		})
+	}
+	return cur
+}
+
+// MaskNickname runs all active ContentSanitizerProviders in priority order over a displayed nickname.
+func (r *ProviderRegistry) MaskNickname(ctx context.Context, nickname string, isStaffOrAuthor bool) string {
+	if r == nil || strings.TrimSpace(nickname) == "" {
+		return nickname
+	}
+	list := r.activeSanitizers()
+	if len(list) == 0 {
+		return nickname
+	}
+	cur := nickname
+	for _, ent := range list {
+		sp := ent.provider
+		cur = safeSanitizerCall(cur, func() string {
+			return sp.MaskNickname(ctx, cur, isStaffOrAuthor)
+		})
+	}
+	return cur
+}
+
+func safeSanitizerCall(fallback string, fn func() string) (out string) {
+	out = fallback
+	defer func() {
+		if recover() != nil {
+			out = fallback
+		}
+	}()
+	return fn()
 }
 
 func removeEntries[T any](in []providerEntry[T], pluginID string) []providerEntry[T] {

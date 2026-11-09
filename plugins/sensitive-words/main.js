@@ -1,7 +1,15 @@
 var DEFAULT_UPDATE_URL =
   "https://raw.githubusercontent.com/houbb/sensitive-word-data/main/src/main/resources/sensitive_word_dict.txt";
-var DEFAULT_RESERVED_NICKNAMES =
-  "管理员\n系统管理员\n官方客服\n网站管理员\n站长\n博主\nsuperadmin\nwebmaster";
+var DEFAULT_RESERVED_NICKNAMES = [
+  "管理员",
+  "系统管理员",
+  "官方客服",
+  "网站管理员",
+  "站长",
+  "博主",
+  "superadmin",
+  "webmaster",
+];
 var CRON_JOB_NAME = "sync_dict";
 var REMOTE_KV_PREFIX = "remote";
 var BUNDLED_HOUBB_ASSET = "dicts/houbb_base.txt.gz";
@@ -18,14 +26,38 @@ function escapeHTML(s) {
     .replace(/>/g, "&gt;");
 }
 
-function fnv1aHex(str) {
+function fnv1aStep(h, str) {
   var s = String(str || "");
-  var h = 0x811c9dc5;
   for (var i = 0; i < s.length; i++) {
     h = h ^ s.charCodeAt(i);
     h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
   }
-  return h.toString(16);
+  return h;
+}
+
+function hashWordList(val) {
+  var h = 0x811c9dc5;
+  if (Array.isArray(val)) {
+    for (var i = 0; i < val.length; i++) {
+      if (i > 0) {
+        h = h ^ 10;
+        h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+      }
+      h = fnv1aStep(h, val[i]);
+    }
+    return h.toString(16);
+  }
+  return fnv1aStep(h, val).toString(16);
+}
+
+function normalizeWordList(rawVal, fallbackList) {
+  if (rawVal === undefined || rawVal === null) {
+    return fallbackList;
+  }
+  if (Array.isArray(rawVal)) {
+    return rawVal;
+  }
+  return String(rawVal || "");
 }
 
 function safeConfig(overrideCfg) {
@@ -41,14 +73,12 @@ function safeConfig(overrideCfg) {
   var updateUrl = String(
     raw.update_url === undefined ? DEFAULT_UPDATE_URL : raw.update_url || ""
   ).trim();
-  var reserved =
-    raw.reserved_nicknames === undefined
-      ? DEFAULT_RESERVED_NICKNAMES
-      : String(raw.reserved_nicknames || "");
+  var reserved = normalizeWordList(raw.reserved_nicknames, DEFAULT_RESERVED_NICKNAMES);
 
   return {
     action: act,
     customRejectMessage: String(raw.custom_reject_message || "").trim().slice(0, 200),
+    maskExisting: raw.mask_existing !== false,
     checkNickname: raw.check_nickname !== false,
     customNicknameMessage: String(raw.custom_nickname_message || "").trim().slice(0, 200),
     reservedNicknames: reserved,
@@ -60,8 +90,8 @@ function safeConfig(overrideCfg) {
     catGeneral: raw.cat_general !== false,
     ignoreSeparators: raw.ignore_separators !== false,
     ignoreRepeat: raw.ignore_repeat !== false,
-    customDeny: String(raw.custom_deny || ""),
-    customAllow: String(raw.custom_allow || ""),
+    customDeny: normalizeWordList(raw.custom_deny, []),
+    customAllow: normalizeWordList(raw.custom_allow, []),
     autoUpdate: raw.auto_update === true,
     updateUrl: updateUrl,
     updateIntervalHours: hours,
@@ -126,10 +156,10 @@ function buildSignatures(cfg) {
     (cfg.catGeneral ? "1" : "0") +
     (cfg.ignoreSeparators ? "1" : "0") +
     (cfg.ignoreRepeat ? "1" : "0");
-  var allowHash = fnv1aHex(cfg.customAllow);
+  var allowHash = hashWordList(cfg.customAllow);
   return {
     commentSig:
-      "c:" + rev + ":" + flags + ":" + fnv1aHex(cfg.customDeny) + ":" + allowHash,
+      "c:" + rev + ":" + flags + ":" + hashWordList(cfg.customDeny) + ":" + allowHash,
     reservedSig:
       "r:" +
       rev +
@@ -137,10 +167,31 @@ function buildSignatures(cfg) {
       (cfg.ignoreSeparators ? "1" : "0") +
       (cfg.ignoreRepeat ? "1" : "0") +
       ":" +
-      fnv1aHex(cfg.reservedNicknames) +
+      hashWordList(cfg.reservedNicknames) +
       ":" +
       allowHash,
   };
+}
+
+function syncNativeSanitizer(cfg, sigs) {
+  if (!volo.wordFilter || typeof volo.wordFilter.setSanitizer !== "function") {
+    return;
+  }
+  if (!cfg.maskExisting) {
+    volo.wordFilter.setSanitizer({
+      enabled: false,
+      content_sig: "",
+      nickname_sig: "",
+      check_nickname: false,
+    });
+    return;
+  }
+  volo.wordFilter.setSanitizer({
+    enabled: true,
+    content_sig: sigs.commentSig,
+    nickname_sig: cfg.checkNickname ? sigs.reservedSig : "",
+    check_nickname: cfg.checkNickname,
+  });
 }
 
 // ensureCompiled lazily builds the shared Go-native 16B/state BFS-CSR Aho-Corasick automatons
@@ -150,6 +201,7 @@ function ensureCompiled(cfg) {
   var needComment = !volo.wordFilter.has(sigs.commentSig);
   var needReserved = cfg.checkNickname && !volo.wordFilter.has(sigs.reservedSig);
   if (!needComment && !needReserved) {
+    syncNativeSanitizer(cfg, sigs);
     return sigs;
   }
 
@@ -175,16 +227,30 @@ function ensureCompiled(cfg) {
   }
 
   if (needReserved) {
+    var reservedGroup = Array.isArray(cfg.reservedNicknames)
+      ? { category: "impersonation", words: cfg.reservedNicknames }
+      : { category: "impersonation", text: cfg.reservedNicknames };
     volo.wordFilter.compile(sigs.reservedSig, {
       ignore_separators: cfg.ignoreSeparators,
       ignore_repeat: cfg.ignoreRepeat,
       allow_assets: [BUNDLED_ALLOW_ASSET],
-      groups: [{ category: "impersonation", text: cfg.reservedNicknames }],
+      groups: [reservedGroup],
       allow: cfg.customAllow,
     });
   }
 
+  syncNativeSanitizer(cfg, sigs);
   return sigs;
+}
+
+function ensureSanitizer() {
+  var cfg = safeConfig();
+  if (!cfg.maskExisting) {
+    syncNativeSanitizer(cfg, { commentSig: "", reservedSig: "" });
+    return { enabled: false };
+  }
+  var sigs = ensureCompiled(cfg);
+  return { enabled: true, content_sig: sigs.commentSig };
 }
 
 function matchTextFast(sig, text) {
@@ -223,8 +289,10 @@ function checkSpam(input) {
   var sigs = ensureCompiled(cfg);
   var locale = (input && input.locale) || "zh-CN";
   var isNicknameTarget = input && String(input.target_type || "") === "nickname";
+  var shouldScreenAuthorName =
+    isNicknameTarget || !input || input.is_guest === undefined || Boolean(input.is_guest);
 
-  if (cfg.checkNickname && input && input.author_name) {
+  if (cfg.checkNickname && shouldScreenAuthorName && input && input.author_name) {
     if (matchNickname(sigs, input.author_name)) {
       recordIntercept(true);
       return {
@@ -525,6 +593,7 @@ function onRequest(req) {
       ok: true,
       compiled: Boolean(mainStats.compiled),
       action: cfg.action,
+      mask_existing: cfg.maskExisting,
       check_nickname: cfg.checkNickname,
       auto_update: cfg.autoUpdate,
       word_count: Number(mainStats.word_count || 0),
@@ -573,6 +642,7 @@ module.exports = {
   onUninstall: onUninstall,
   onConfigChange: onConfigChange,
   onCronSync: onCronSync,
+  ensureSanitizer: ensureSanitizer,
   checkSpam: checkSpam,
   checkNickname: checkNickname,
   renderSlot: renderSlot,

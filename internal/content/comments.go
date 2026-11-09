@@ -240,7 +240,7 @@ func (s *Service) hydrateRootThreadsReplies(
 	for i, rr := range rootRows {
 		dc := rr.toDomainComment()
 		isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
-		roots[i] = s.toPublicCommentView(dc, postAuthorID, isOwn || isAdmin, viewer)
+		roots[i] = s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer)
 		rootIdxForID[rr.ID] = i
 		frontier = append(frontier, rr.ID)
 	}
@@ -315,7 +315,7 @@ func (s *Service) hydrateRootThreadsReplies(
 		for _, rep := range repList {
 			dc := rep.toDomainComment()
 			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
-			views = append(views, s.toPublicCommentView(dc, postAuthorID, isOwn || isAdmin, viewer))
+			views = append(views, s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer))
 		}
 		roots[rIdx].Replies = views
 	}
@@ -489,7 +489,7 @@ func (s *Service) ListTargetCommentsPage(
 		for _, rr := range rootRows {
 			dc := rr.toDomainComment()
 			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
-			slice = append(slice, s.toPublicCommentView(dc, postAuthorID, isOwn || isAdmin, viewer))
+			slice = append(slice, s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer))
 		}
 	} else {
 		slice, err = s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer)
@@ -584,20 +584,25 @@ func (s *Service) queryRecentPublicComments(ctx context.Context, limit int) ([]R
 
 func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int, offset int) ([]RecentCommentItem, error) {
 	type joinedRecent struct {
-		ID          string `db:"id"`
-		AuthorName  string `db:"author_name"`
-		ContentMD   string `db:"content_md"`
-		TargetTitle string `db:"target_title"`
-		TargetSlug  string `db:"target_slug"`
-		TargetType  string `db:"target_type"`
-		CreatedAt   int64  `db:"created_at"`
+		ID             string `db:"id"`
+		UserID         string `db:"user_id"`
+		UserRole       string `db:"user_role"`
+		AuthorName     string `db:"author_name"`
+		ContentMD      string `db:"content_md"`
+		TargetTitle    string `db:"target_title"`
+		TargetSlug     string `db:"target_slug"`
+		TargetAuthorID string `db:"target_author_id"`
+		TargetType     string `db:"target_type"`
+		CreatedAt      int64  `db:"created_at"`
 	}
 	baseSQL := `
-		SELECT c.id, c.author_name, c.content_md,
+		SELECT c.id, c.user_id, COALESCE(u.role, '') AS user_role, c.author_name, c.content_md,
 		       COALESCE(a.title, p.title, '') AS target_title,
 		       COALESCE(a.slug, p.slug, '') AS target_slug,
+		       COALESCE(a.author_id, p.author_id, '') AS target_author_id,
 		       c.target_type, c.created_at
 		FROM comments c
+		LEFT JOIN users u ON c.user_id <> '' AND u.id = c.user_id
 		LEFT JOIN articles a ON c.target_type = 'article' AND a.id = c.target_id
 		LEFT JOIN pages p ON c.target_type = 'page' AND p.id = c.target_id
 		WHERE c.status = ? AND c.is_deleted = ?
@@ -612,16 +617,25 @@ func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int
 	if err != nil {
 		return nil, err
 	}
+	var snap domain.SettingsSnapshot
+	if s.settings != nil {
+		snap = s.settings.Snapshot()
+	}
 	out := make([]RecentCommentItem, 0, len(rows))
 	for _, r := range rows {
-		plain := render.ExtractPlainTextFromHTML(s.renderer.RenderComment(r.ContentMD))
+		renderedHTML := s.maskCommentHTML(ctx, snap, s.renderer.RenderComment(r.ContentMD))
+		plain := render.ExtractPlainTextFromHTML(renderedHTML)
+		isStaffOrAuthor := r.UserID != "" &&
+			(r.UserRole == domain.RoleAdmin || r.UserRole == domain.RoleEditor ||
+				(r.TargetAuthorID != "" && r.UserID == r.TargetAuthorID))
+		maskedAuthor := s.maskDisplayNickname(ctx, snap, r.AuthorName, isStaffOrAuthor)
 		targetURL := visibility.ArticlePath(r.TargetSlug) + "#comment-" + r.ID
 		if r.TargetType == domain.TargetTypePage {
 			targetURL = "/" + r.TargetSlug + "#comment-" + r.ID
 		}
 		out = append(out, RecentCommentItem{
 			ID:          r.ID,
-			AuthorName:  r.AuthorName,
+			AuthorName:  maskedAuthor,
 			Excerpt:     truncateForSummary(plain, 64),
 			TargetTitle: r.TargetTitle,
 			TargetURL:   targetURL,
@@ -699,6 +713,13 @@ func (s *Service) CreateComment(
 		authorName = viewer.DisplayName
 		if authorName == "" {
 			authorName = viewer.Username
+		}
+		isStaffUser := viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor
+		if !isStaffUser {
+			authorName = s.maskDisplayNickname(ctx, snap, authorName, false)
+			if strings.TrimSpace(authorName) == "" {
+				authorName = "*"
+			}
 		}
 		if cleanURL, ok := sanitizeCommentAuthorURL(viewer.WebsiteURL); ok {
 			authorURL = cleanURL
@@ -922,7 +943,7 @@ func (s *Service) CreateComment(
 		})
 	}
 
-	return s.toPublicCommentView(record, postAuthorID, true, viewer), passportToken, nil
+	return s.toPublicCommentViewCtx(ctx, record, postAuthorID, true, viewer), passportToken, nil
 }
 
 // UpdateOwnComment edits a comment ONLY if caller owns it via authenticated UserID OR valid
@@ -976,12 +997,16 @@ func (s *Service) UpdateOwnComment(
 		if evalLocale == "" {
 			evalLocale = snap.Site.DefaultLocale
 		}
+		evalAuthorName := existing.AuthorName
+		if strings.TrimSpace(existing.UserID) != "" {
+			evalAuthorName = s.maskDisplayNickname(ctx, snap, evalAuthorName, false)
+		}
 		keywordTriggered := false
 		switch snap.Reading.CommentModerationMode {
 		case domain.CommentModerationAll:
 			nextStatus = domain.CommentStatusPending
 		case domain.CommentModerationSmart:
-			if s.matchesBuiltinCommentFilter(snap, trimmed, existing.AuthorName, existing.AuthorURL) {
+			if s.matchesBuiltinCommentFilter(snap, trimmed, evalAuthorName, existing.AuthorURL) {
 				nextStatus = domain.CommentStatusPending
 				keywordTriggered = true
 			}
@@ -991,7 +1016,7 @@ func (s *Service) UpdateOwnComment(
 			verdict := s.plugins.Providers().EvaluateComment(ctx, plugin.CommentCheckInput{
 				TargetType: existing.TargetType,
 				TargetID:   existing.TargetID,
-				AuthorName: existing.AuthorName,
+				AuthorName: evalAuthorName,
 				AuthorURL:  existing.AuthorURL,
 				ContentMD:  trimmed,
 				IPMasked:   existing.IPMasked,
@@ -1017,7 +1042,7 @@ func (s *Service) UpdateOwnComment(
 					"id":          existing.ID,
 					"target_type": existing.TargetType,
 					"target_id":   existing.TargetID,
-					"author_name": existing.AuthorName,
+					"author_name": evalAuthorName,
 					"content_md":  trimmed,
 					"status":      nextStatus,
 					"is_edit":     true,
@@ -1046,13 +1071,13 @@ func (s *Service) UpdateOwnComment(
 
 			if trimmed != preHookTrimmed {
 				if snap.Reading.CommentModerationMode == domain.CommentModerationSmart &&
-					s.matchesBuiltinCommentFilter(snap, trimmed, existing.AuthorName, existing.AuthorURL) {
+					s.matchesBuiltinCommentFilter(snap, trimmed, evalAuthorName, existing.AuthorURL) {
 					nextStatus = domain.CommentStatusPending
 				}
 				reVerdict := s.plugins.Providers().EvaluateComment(ctx, plugin.CommentCheckInput{
 					TargetType: existing.TargetType,
 					TargetID:   existing.TargetID,
-					AuthorName: existing.AuthorName,
+					AuthorName: evalAuthorName,
 					AuthorURL:  existing.AuthorURL,
 					ContentMD:  trimmed,
 					IPMasked:   existing.IPMasked,
@@ -1088,7 +1113,7 @@ func (s *Service) UpdateOwnComment(
 	}); err != nil {
 		return PublicCommentView{}, err
 	}
-	return s.toPublicCommentView(existing, postAuthorID, true, viewer), nil
+	return s.toPublicCommentViewCtx(ctx, existing, postAuthorID, true, viewer), nil
 }
 
 // DeleteOwnComment soft-deletes a comment ONLY if caller owns it via authenticated UserID OR valid
@@ -1237,9 +1262,84 @@ func (s *Service) putCommentHTMLCacheLocked(key string, html string) {
 	s.commentHTMLCurr[key] = html
 }
 
-func (s *Service) renderCommentMarkdownHTML(c domain.Comment) string {
+func (s *Service) commentFilterStateKey(snap domain.SettingsSnapshot) string {
+	var hostPart string
+	if snap.Reading.BuiltinSpamFilter && len(snap.Reading.BlockedKeywords) > 0 && s.settings != nil {
+		hostPart = strconv.FormatUint(s.settings.Revision(), 36)
+	}
+	var plugPart string
+	if s.plugins != nil {
+		plugPart = s.plugins.Providers().SanitizerStateHash()
+	}
+	if hostPart == "" && plugPart == "" {
+		return ""
+	}
+	return hostPart + "|" + plugPart
+}
+
+func (s *Service) maskCommentHTML(ctx context.Context, snap domain.SettingsSnapshot, htmlStr string) string {
+	if strings.TrimSpace(htmlStr) == "" {
+		return htmlStr
+	}
+	out := htmlStr
+	if snap.Reading.BuiltinSpamFilter && len(snap.Reading.BlockedKeywords) > 0 {
+		if m := s.getOrBuildKeywordMatcher(snap); m != nil && m.WordCount() > 0 {
+			out = m.MaskHTML(out)
+		}
+	}
+	if s.plugins != nil {
+		out = s.plugins.Providers().MaskCommentHTML(ctx, out)
+	}
+	return out
+}
+
+func (s *Service) maskDisplayNickname(ctx context.Context, snap domain.SettingsSnapshot, name string, isStaffOrAuthor bool) string {
+	if strings.TrimSpace(name) == "" {
+		return name
+	}
+	out := name
+	if !isStaffOrAuthor && snap.Reading.BuiltinSpamFilter && len(snap.Reading.BlockedKeywords) > 0 {
+		if m := s.getOrBuildKeywordMatcher(snap); m != nil && m.WordCount() > 0 {
+			out = m.MaskText(out)
+		}
+	}
+	if s.plugins != nil {
+		out = s.plugins.Providers().MaskNickname(ctx, out, isStaffOrAuthor)
+	}
+	return out
+}
+
+// MaskViewerForPublicDisplay returns a shallow copy of a non-staff reader viewer with DisplayName/Username
+// masked against active sensitive-word rules so public templates never render raw restricted handles.
+func (s *Service) MaskViewerForPublicDisplay(ctx context.Context, viewer *domain.User) *domain.User {
+	if s == nil || viewer == nil || viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor {
+		return viewer
+	}
+	var snap domain.SettingsSnapshot
+	if s.settings != nil {
+		snap = s.settings.Snapshot()
+	}
+	if s.commentFilterStateKey(snap) == "" {
+		return viewer
+	}
+	maskedDisp := s.maskDisplayNickname(ctx, snap, viewer.DisplayName, false)
+	maskedUser := s.maskDisplayNickname(ctx, snap, viewer.Username, false)
+	if maskedDisp == viewer.DisplayName && maskedUser == viewer.Username {
+		return viewer
+	}
+	cp := *viewer
+	cp.DisplayName = maskedDisp
+	cp.Username = maskedUser
+	return &cp
+}
+
+func (s *Service) renderCommentMarkdownHTML(ctx context.Context, snap domain.SettingsSnapshot, c domain.Comment) string {
+	filterKey := s.commentFilterStateKey(snap)
 	if c.ID != "" {
 		cacheKey := c.ID + ":" + strconv.FormatInt(c.UpdatedAt, 10)
+		if filterKey != "" {
+			cacheKey += ":" + filterKey
+		}
 		s.commentHTMLMu.RLock()
 		if cached, ok := s.commentHTMLCurr[cacheKey]; ok {
 			s.commentHTMLMu.RUnlock()
@@ -1262,17 +1362,32 @@ func (s *Service) renderCommentMarkdownHTML(c domain.Comment) string {
 			s.commentHTMLMu.Unlock()
 		}
 
-		html := s.renderer.RenderComment(c.ContentMD)
+		htmlOut := s.renderer.RenderComment(c.ContentMD)
+		if filterKey != "" {
+			htmlOut = s.maskCommentHTML(ctx, snap, htmlOut)
+		}
 		s.commentHTMLMu.Lock()
-		s.putCommentHTMLCacheLocked(cacheKey, html)
+		s.putCommentHTMLCacheLocked(cacheKey, htmlOut)
 		s.commentHTMLMu.Unlock()
-		return html
+		return htmlOut
 	}
-	return s.renderer.RenderComment(c.ContentMD)
+	htmlOut := s.renderer.RenderComment(c.ContentMD)
+	if filterKey != "" {
+		htmlOut = s.maskCommentHTML(ctx, snap, htmlOut)
+	}
+	return htmlOut
 }
 
 func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, canEdit bool, viewer *domain.User) PublicCommentView {
-	renderedHTML := s.renderCommentMarkdownHTML(c)
+	return s.toPublicCommentViewCtx(context.Background(), c, postAuthorID, canEdit, viewer)
+}
+
+func (s *Service) toPublicCommentViewCtx(ctx context.Context, c domain.Comment, postAuthorID string, canEdit bool, viewer *domain.User) PublicCommentView {
+	var settingsSnap domain.SettingsSnapshot
+	if s.settings != nil {
+		settingsSnap = s.settings.Snapshot()
+	}
+	renderedHTML := s.renderCommentMarkdownHTML(ctx, settingsSnap, c)
 	seed := strings.TrimSpace(c.UserID)
 	if seed == "" && len(c.GuestIDHash) >= 16 {
 		seed = c.GuestIDHash[:16]
@@ -1284,10 +1399,40 @@ func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, can
 		seed = c.ID
 	}
 	ownerID := ""
-	if snap := s.caches.chrome.Load(); snap != nil {
-		ownerID = snap.owner.ID
+	isStaffCommenter := false
+	replyTargetIsStaff := false
+	chromeSnap := s.caches.chrome.Load()
+	if chromeSnap == nil && (c.UserID != "" || c.ReplyToName != "") {
+		chromeSnap, _ = s.getChromeSnapshot(ctx)
+	}
+	if chromeSnap != nil {
+		ownerID = chromeSnap.owner.ID
+		if c.UserID != "" && len(chromeSnap.authorsByID) > 0 {
+			_, isStaffCommenter = chromeSnap.authorsByID[c.UserID]
+		}
+		if c.ReplyToName != "" {
+			if chromeSnap.owner.DisplayName != "" && c.ReplyToName == chromeSnap.owner.DisplayName {
+				replyTargetIsStaff = true
+			} else {
+				for _, au := range chromeSnap.authors {
+					if au.DisplayName != "" && c.ReplyToName == au.DisplayName {
+						replyTargetIsStaff = true
+						break
+					}
+				}
+			}
+		}
+	}
+	if !isStaffCommenter && viewer != nil && c.UserID != "" && viewer.ID == c.UserID &&
+		(viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor) {
+		isStaffCommenter = true
 	}
 	isAuthor := c.UserID != "" && ((postAuthorID != "" && c.UserID == postAuthorID) || (ownerID != "" && c.UserID == ownerID))
+	isStaffOrAuthor := isAuthor || isStaffCommenter
+
+	authorName := s.maskDisplayNickname(ctx, settingsSnap, c.AuthorName, isStaffOrAuthor)
+	replyToName := s.maskDisplayNickname(ctx, settingsSnap, c.ReplyToName, replyTargetIsStaff)
+
 	avatarURL := strings.TrimSpace(c.AvatarURL)
 	if avatarURL == "" {
 		avatarURL = "/avatars/" + seed + ".svg"
@@ -1295,8 +1440,8 @@ func (s *Service) toPublicCommentView(c domain.Comment, postAuthorID string, can
 	view := PublicCommentView{
 		ID:          c.ID,
 		ParentID:    c.ParentID,
-		ReplyToName: c.ReplyToName,
-		AuthorName:  c.AuthorName,
+		ReplyToName: replyToName,
+		AuthorName:  authorName,
 		AuthorURL:   c.AuthorURL,
 		AvatarURL:   avatarURL,
 		AvatarSeed:  seed,

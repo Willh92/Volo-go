@@ -1584,7 +1584,10 @@ func validateThemeConfigSchema(schema []ConfigField) ([]ConfigField, error) {
 			ft = "text"
 		}
 		switch ft {
-		case "text", "string", "secret", "textarea", "url", "color", "image", "boolean", "number", "select", "sortable_list":
+		case "text", "string", "secret", "textarea", "url", "color", "image", "boolean", "number", "select", "sortable_list", "tag_list", "token_list":
+			if ft == "token_list" {
+				ft = "tag_list"
+			}
 		default:
 			return nil, fmt.Errorf("theme.json config_schema[%q] unsupported type %q", f.Key, f.Type)
 		}

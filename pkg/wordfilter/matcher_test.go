@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -369,3 +370,109 @@ func BenchmarkMatcher_64kWords_ScanClean4K(b *testing.B) {
 		}
 	}
 }
+
+func TestMaskText_Comprehensive(t *testing.T) {
+	var nilMatcher *Matcher
+	if got := nilMatcher.MaskText("原样返回"); got != "原样返回" {
+		t.Fatalf("nil matcher mutated text: %q", got)
+	}
+
+	m := Compile(Options{
+		Deny:             []string{"傻逼", "傻瓜", "赌博平台", "管理员", "系统管理员", "admin", "ass", "bad word"},
+		Allow:            []string{"傻瓜相机", "傻瓜式"},
+		IgnoreSeparators: true,
+		IgnoreRepeat:     true,
+	})
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "clean", in: "正常的技术文章讨论，class 与 pass 不受影响", want: "正常的技术文章讨论，class 与 pass 不受影响"},
+		{name: "direct_cjk", in: "这个人真是傻逼行为", want: "这个人真是**行为"},
+		{name: "traditional_hanzi", in: "遠離賭博平台詐騙", want: "遠離****詐騙"},
+		{name: "separator_piercing", in: "别发傻*逼和赌·博·平·台", want: "别发***和*******"},
+		{name: "whitespace_preserved", in: "加 赌 博 平 台\n还有 bad word", want: "加 * * * *\n还有 *** ****"},
+		{name: "repeat_collapsing", in: "傻傻傻逼逼", want: "*****"},
+		{name: "allowlist_preserved", in: "买了傻瓜相机，但不是傻瓜", want: "买了傻瓜相机，但不是**"},
+		{name: "overlapping_longest", in: "冒充系统管理员或管理员", want: "冒充*****或***"},
+		{name: "ascii_boundaries", in: "classic pass vs bad ass and ADMIN!", want: "classic pass vs bad *** and *****!"},
+		{name: "homoglyph_and_math_bold", in: "伪装 аdmin 与 𝐚𝐝𝐦𝐢𝐧 账号", want: "伪装 ***** 与 ***** 账号"},
+		{name: "zero_width_and_zalgo", in: "测试傻\u200b逼与傻\u0300\u0301逼\u0302结束", want: "测试**与**结束"},
+		{name: "emoji_and_nfd_preserved", in: "❤️😊傻逼👍 café\u0301", want: "❤️😊**👍 café\u0301"},
+	}
+
+	for _, tc := range cases {
+		got := m.MaskText(tc.in)
+		if !utf8.ValidString(got) {
+			t.Fatalf("[%s] invalid UTF-8 output: %q", tc.name, got)
+		}
+		if got != tc.want {
+			t.Errorf("[%s] MaskText(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestMaskHTML_ComprehensiveAndSafety(t *testing.T) {
+	m := Compile(Options{
+		Deny:             []string{"傻逼", "傻瓜", "赌博", "porn", "ass"},
+		Allow:            []string{"傻瓜相机"},
+		IgnoreSeparators: true,
+		IgnoreRepeat:     true,
+	})
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "clean_html_fast_path",
+			in:   `<p class="ass-card">Hello &amp; welcome to <a href="https://example.com/porn-filter?x=1&amp;y=2">傻瓜相机评测</a>!</p>`,
+			want: `<p class="ass-card">Hello &amp; welcome to <a href="https://example.com/porn-filter?x=1&amp;y=2">傻瓜相机评测</a>!</p>`,
+		},
+		{
+			name: "preserves_tags_and_attributes_masks_text",
+			in:   `<p class="ass"><a href="https://example.com/porn" title="a > b">点击赌博</a> &amp; 傻逼</p>`,
+			want: `<p class="ass"><a href="https://example.com/porn" title="a > b">点击**</a> &amp; **</p>`,
+		},
+		{
+			name: "cross_inline_tags_split_word",
+			in:   `<p>这种傻<strong>逼</strong>和<em>赌</em><code>博</code>都该过滤</p>`,
+			want: `<p>这种*<strong>*</strong>和<em>*</em><code>*</code>都该过滤</p>`,
+		},
+		{
+			name: "html_entities_and_xss_escaped_text",
+			in:   `<p>&lt;script&gt;alert(1)&lt;/script&gt; &#20667;&#36924; &amp; Tom</p>`,
+			want: `<p>&lt;script&gt;alert(1)&lt;/script&gt; ** &amp; Tom</p>`,
+		},
+		{
+			name: "double_escaped_entities_roundtrip",
+			in:   `<p>&amp;lt;img src=x onerror=alert(1)&amp;gt; 傻逼</p>`,
+			want: `<p>&amp;lt;img src=x onerror=alert(1)&amp;gt; **</p>`,
+		},
+		{
+			name: "non_tag_angle_brackets_and_malformed_markup",
+			in:   `<p>1 &lt; 2 and 3 < 4 傻逼 <unclosed</p>`,
+			want: `<p>1 &lt; 2 and 3 &lt; 4 ** &lt;unclosed</p>`,
+		},
+		{
+			name: "block_boundaries_preserve_ascii_words",
+			in:   `<p>cl</p><p>ass</p><p>p</p><p>ass</p>`,
+			want: `<p>cl</p><p>***</p><p>p</p><p>***</p>`,
+		},
+	}
+
+	for _, tc := range cases {
+		got := m.MaskHTML(tc.in)
+		if !utf8.ValidString(got) {
+			t.Fatalf("[%s] invalid UTF-8 HTML output: %q", tc.name, got)
+		}
+		if got != tc.want {
+			t.Errorf("[%s] MaskHTML(%q)\n got: %s\nwant: %s", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+

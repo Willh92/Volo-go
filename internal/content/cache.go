@@ -41,6 +41,7 @@ type redirectTableSnapshot struct {
 type publicChromeSnapshot struct {
 	dataRev            uint64
 	settingsRev        uint64
+	sanitizerHash      string
 	rawNavItems        []domain.NavItem
 	categories         []CategoryWithCount
 	catsByID           map[string]domain.Category
@@ -198,7 +199,14 @@ func (s *Service) currentRevisions() (dataRev uint64, settingsRev uint64) {
 	return dataRev, settingsRev
 }
 
-// PurgeRuntimeCaches clears in-memory redirect, chrome, feed, article HTML, and visibility render caches.
+func (s *Service) currentSanitizerHash() string {
+	if s == nil || s.plugins == nil {
+		return ""
+	}
+	return s.plugins.Providers().SanitizerStateHash()
+}
+
+// PurgeRuntimeCaches clears in-memory redirect, chrome, feed, article HTML, comment HTML, and visibility render caches.
 func (s *Service) PurgeRuntimeCaches() {
 	if s == nil {
 		return
@@ -219,6 +227,10 @@ func (s *Service) PurgeRuntimeCaches() {
 		s.caches.articleHTMLUsed = 0
 		s.caches.articleHTMLMu.Unlock()
 	}
+	s.commentHTMLMu.Lock()
+	clear(s.commentHTMLCurr)
+	clear(s.commentHTMLPrev)
+	s.commentHTMLMu.Unlock()
 	if s.guard != nil {
 		s.guard.PurgeCache()
 	}
@@ -285,7 +297,8 @@ func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapsh
 
 func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot, error) {
 	dRev, sRev := s.currentRevisions()
-	if snap := s.caches.chrome.Load(); snap != nil && snap.dataRev == dRev && snap.settingsRev == sRev {
+	sanHash := s.currentSanitizerHash()
+	if snap := s.caches.chrome.Load(); snap != nil && snap.dataRev == dRev && snap.settingsRev == sRev && snap.sanitizerHash == sanHash {
 		return snap, nil
 	}
 
@@ -293,7 +306,8 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 	defer s.caches.chromeMu.Unlock()
 
 	dRev, sRev = s.currentRevisions()
-	if snap := s.caches.chrome.Load(); snap != nil && snap.dataRev == dRev && snap.settingsRev == sRev {
+	sanHash = s.currentSanitizerHash()
+	if snap := s.caches.chrome.Load(); snap != nil && snap.dataRev == dRev && snap.settingsRev == sRev && snap.sanitizerHash == sanHash {
 		return snap, nil
 	}
 
@@ -383,6 +397,7 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 	next := &publicChromeSnapshot{
 		dataRev:            dRev,
 		settingsRev:        sRev,
+		sanitizerHash:      s.currentSanitizerHash(),
 		rawNavItems:        navRows,
 		categories:         cats,
 		catsByID:           catsByID,

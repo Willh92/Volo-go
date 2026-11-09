@@ -30,7 +30,9 @@ import {
   PlusIcon,
   SwitchToggle,
   TableSkeleton,
+  TokenListInput,
   UploadButton,
+  useFlipList,
   usePointerSortableList,
 } from "../components/UIControls";
 import { MediaPickButton } from "../components/MediaLibraryModal";
@@ -95,6 +97,37 @@ function isSecretSchemaField(f: any): boolean {
   return Boolean(f?.secret || f?.type === "secret" || f?.type === "password");
 }
 
+function isTagListSchemaField(f: any): boolean {
+  return f?.type === "tag_list" || f?.type === "token_list";
+}
+
+function coerceTagListValue(raw: any): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const pushTok = (s: string) => {
+    const trimmed = s.trim();
+    if (!trimmed || seen.has(trimmed)) return;
+    seen.add(trimmed);
+    out.push(trimmed);
+  };
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (item !== null && item !== undefined) pushTok(String(item));
+    }
+    return out;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine || trimmedLine.startsWith("#") || trimmedLine.startsWith("//")) continue;
+      for (const seg of trimmedLine.split(/[,，;；]+/)) {
+        pushTok(seg);
+      }
+    }
+  }
+  return out;
+}
+
 function getSchemaFieldGroup(f: any): string {
   return (
     resolveSchemaText(f?.localized_group) ||
@@ -109,6 +142,8 @@ function buildSchemaDefaults(schema: any[]): Record<string, any> {
     if (!f?.key) continue;
     if (isSecretSchemaField(f)) {
       out[f.key] = "";
+    } else if (isTagListSchemaField(f)) {
+      out[f.key] = coerceTagListValue(f.default);
     } else if (Array.isArray(f.default)) {
       out[f.key] = [...f.default];
     } else if (f.default !== undefined) {
@@ -145,6 +180,10 @@ function validateSchemaRequired(
     const val = values[f.key] !== undefined ? values[f.key] : f.default;
     if (f.type === "sortable_list") {
       if (!Array.isArray(val) || val.length === 0) {
+        return t("app.cfg_required_missing", { field: label });
+      }
+    } else if (isTagListSchemaField(f)) {
+      if (coerceTagListValue(val).length === 0) {
         return t("app.cfg_required_missing", { field: label });
       }
     } else if (f.type === "number") {
@@ -222,7 +261,11 @@ function SortableFixedOptsField({
         {reqMark}
       </label>
       {description && <div class="volo-help">{description}</div>}
-      <div ref={listRef} class="volo-sortable-list" style={{ maxHeight: "280px", overflowY: "auto" }}>
+      <div
+        ref={listRef}
+        class="volo-sortable-list"
+        style={{ maxHeight: "280px", overflowY: "auto", margin: "4px -4px 0", padding: "2px 4px" }}
+      >
         {enabledKeys.map((k, idx) => {
           const handleProps = getHandleProps(idx);
           return (
@@ -512,6 +555,24 @@ function SchemaFieldControl({
           onChange={(next) => onChange(f.key, next)}
           label={`${label}${reqMark}`}
           hint={desc}
+        />
+      </div>
+    );
+  }
+
+  if (isTagListSchemaField(f)) {
+    const rawCur = values[f.key] !== undefined ? values[f.key] : f.default;
+    return (
+      <div class="volo-field">
+        <label>
+          {label}
+          {reqMark}
+        </label>
+        {desc && <div class="volo-help">{desc}</div>}
+        <TokenListInput
+          values={coerceTagListValue(rawCur)}
+          onChange={(next) => onChange(f.key, next)}
+          placeholder={ph}
         />
       </div>
     );
@@ -833,8 +894,9 @@ function SchemaConfigPanel({
                 }
                 const patch: Record<string, any> = {};
                 for (const [k, v] of Object.entries(parsed as Record<string, any>)) {
-                  if (allowed.has(k) && v !== CLEAR_SECRET_SENTINEL) {
-                    patch[k] = v;
+                  const fDef = allowed.get(k);
+                  if (fDef && v !== CLEAR_SECRET_SENTINEL) {
+                    patch[k] = isTagListSchemaField(fDef) ? coerceTagListValue(v) : v;
                   }
                 }
                 onMergeValues(patch);
@@ -945,6 +1007,7 @@ export function AppearanceWorkspace({
   const [plugins, setPlugins] = useState<any[]>([]);
   const [pluginCronJobs, setPluginCronJobs] = useState<any[]>([]);
   const [reorderingPlugin, setReorderingPlugin] = useState<boolean>(false);
+  const pluginFlip = useFlipList<HTMLTableSectionElement>();
   const [prioModal, setPrioModal] = useState<{ id: string; name: string } | null>(null);
   const [prioModalOpen, setPrioModalOpen] = useState<boolean>(false);
   const [prioValue, setPrioValue] = useState<string>("100");
@@ -978,10 +1041,13 @@ export function AppearanceWorkspace({
     const idx = plugins.findIndex((item) => item.id === pluginID);
     const targetIdx = idx + delta;
     if (idx < 0 || targetIdx < 0 || targetIdx >= plugins.length) return;
+    const prevPlugins = plugins;
     const next = [...plugins];
     const [moved] = next.splice(idx, 1);
     next.splice(targetIdx, 0, moved);
     setReorderingPlugin(true);
+    pluginFlip.captureFlip();
+    setPlugins(next);
     try {
       const res = await apiFetch<{ items?: any[]; cron_jobs?: any[] }>(
         `/api/admin/plugins/reorder?locale=${encodeURIComponent(localeSig.value)}`,
@@ -991,11 +1057,12 @@ export function AppearanceWorkspace({
         },
       );
       if (Array.isArray(res?.items)) setPlugins(res.items);
-      else setPlugins(next);
       if (Array.isArray(res?.cron_jobs)) setPluginCronJobs(res.cron_jobs);
-      showToast(t("app.plugin_reordered"), "ok");
     } catch (err: any) {
+      pluginFlip.captureFlip();
+      setPlugins(prevPlugins);
       showToast(err.message, "err");
+      void loadData(true);
     } finally {
       setReorderingPlugin(false);
     }
@@ -1877,13 +1944,13 @@ export function AppearanceWorkspace({
               <thead>
                 <tr>
                   <th class="col-fluid">{t("app.plugin_col_info")}</th>
-                  <th class="col-cat">{t("app.plugin_col_chain")}</th>
+                  <th class="col-chain">{t("app.plugin_col_chain")}</th>
                   <th class="col-cat">{t("app.plugin_col_runtime")}</th>
                   <th class="col-status">{t("art.status")}</th>
                   <th class="col-act col-act-th">{t("art.actions")}</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody ref={pluginFlip.containerRef}>
                 {loading ? (
                   <TableSkeleton cols={5} />
                 ) : filteredPlugins.length === 0 ? (
@@ -1895,12 +1962,13 @@ export function AppearanceWorkspace({
                     const isBuiltinPlugin = Boolean(p.is_builtin || p.builtin || p.kind === "builtin");
                     const chainIdx = plugins.findIndex((item) => item.id === p.id);
                     const priorityNum = typeof p.priority === "number" ? p.priority : 100;
+                    const isFiltered = Boolean(pluginNeedle);
                     const rowCronJobs: any[] =
                       Array.isArray(p.cron_jobs) && p.cron_jobs.length > 0
                         ? p.cron_jobs
                         : pluginCronJobs.filter((j) => j?.plugin_id === p.id);
                     return (
-                      <tr key={p.id}>
+                      <tr key={p.id} data-flip-key={p.id}>
                         <td class="col-fluid" data-label={t("app.plugin_col_info")}>
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
@@ -1946,56 +2014,36 @@ export function AppearanceWorkspace({
                             )}
                           </div>
                         </td>
-                        <td class="col-cat" data-label={t("app.plugin_col_chain")}>
-                          <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
+                        <td class="col-chain" data-label={t("app.plugin_col_chain")}>
+                          <div class="volo-chain-ctrl">
                             <button
                               type="button"
-                              class="volo-act-btn"
+                              class="volo-act-btn volo-prio-btn"
                               title={t("app.plugin_chain_hint")}
                               onClick={() => openPriorityEditor(p)}
-                              style={{ fontVariantNumeric: "tabular-nums" }}
                             >
                               #{chainIdx >= 0 ? chainIdx + 1 : 1} · P{priorityNum}
                             </button>
-                            {!pluginNeedle && plugins.length > 1 && (
-                              <>
-                                <button
-                                  type="button"
-                                  class="volo-act-btn"
-                                  title={t("app.move_up")}
-                                  aria-label={t("app.move_up")}
-                                  disabled={reorderingPlugin || chainIdx <= 0}
-                                  onClick={() => void movePluginOrder(p.id, -1)}
-                                  style={{ padding: "2px 6px", minWidth: "24px" }}
-                                >
-                                  ↑
-                                </button>
-                                <button
-                                  type="button"
-                                  class="volo-act-btn"
-                                  title={t("app.move_down")}
-                                  aria-label={t("app.move_down")}
-                                  disabled={reorderingPlugin || chainIdx < 0 || chainIdx >= plugins.length - 1}
-                                  onClick={() => void movePluginOrder(p.id, 1)}
-                                  style={{ padding: "2px 6px", minWidth: "24px" }}
-                                >
-                                  ↓
-                                </button>
-                                {chainIdx > 1 && (
-                                  <button
-                                    type="button"
-                                    class="volo-act-btn"
-                                    title={t("app.move_top")}
-                                    aria-label={t("app.move_top")}
-                                    disabled={reorderingPlugin}
-                                    onClick={() => void movePluginOrder(p.id, -chainIdx)}
-                                    style={{ padding: "2px 6px", minWidth: "24px" }}
-                                  >
-                                    <MoveTopIcon />
-                                  </button>
-                                )}
-                              </>
-                            )}
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              title={isFiltered ? t("ui.sort_disabled_filtered") : t("app.move_up")}
+                              aria-label={t("app.move_up")}
+                              disabled={isFiltered || reorderingPlugin || chainIdx <= 0}
+                              onClick={() => void movePluginOrder(p.id, -1)}
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              class="volo-act-btn"
+                              title={isFiltered ? t("ui.sort_disabled_filtered") : t("app.move_down")}
+                              aria-label={t("app.move_down")}
+                              disabled={isFiltered || reorderingPlugin || chainIdx < 0 || chainIdx >= plugins.length - 1}
+                              onClick={() => void movePluginOrder(p.id, 1)}
+                            >
+                              ↓
+                            </button>
                           </div>
                         </td>
                         <td class="col-cat" data-label={t("app.plugin_col_runtime")}>
@@ -2063,20 +2111,32 @@ export function AppearanceWorkspace({
                             >
                               {t("app.logs")}
                             </button>
-                            {!isBuiltinPlugin && (
-                              <a
-                                class="volo-act-btn"
-                                href={`/api/admin/plugins/${encodeURIComponent(p.id)}/export`}
-                                download={`${p.id}.zip`}
-                              >
-                                {t("app.plugin_export_zip")}
-                              </a>
-                            )}
                             <ActionMenu
                               items={[
                                 {
                                   label: t("app.plugin_set_priority"),
                                   onClick: () => openPriorityEditor(p),
+                                },
+                                {
+                                  label: t("app.move_top"),
+                                  hidden: isFiltered || chainIdx <= 0 || plugins.length < 2,
+                                  onClick: () => {
+                                    if (!reorderingPlugin && chainIdx > 0) {
+                                      void movePluginOrder(p.id, -chainIdx);
+                                    }
+                                  },
+                                },
+                                {
+                                  label: t("app.plugin_export_zip"),
+                                  hidden: isBuiltinPlugin,
+                                  onClick: () => {
+                                    const a = document.createElement("a");
+                                    a.href = `/api/admin/plugins/${encodeURIComponent(p.id)}/export`;
+                                    a.download = `${p.id}.zip`;
+                                    document.body.appendChild(a);
+                                    a.click();
+                                    a.remove();
+                                  },
                                 },
                                 {
                                   label: t("app.plugin_trigger_cron"),
@@ -2353,8 +2413,12 @@ export function AppearanceWorkspace({
                       body: JSON.stringify({ priority: parsed }),
                     },
                   );
-                  if (Array.isArray(res?.items)) setPlugins(res.items);
-                  else void loadData(true);
+                  if (Array.isArray(res?.items)) {
+                    pluginFlip.captureFlip();
+                    setPlugins(res.items);
+                  } else {
+                    void loadData(true);
+                  }
                   setPrioModalOpen(false);
                   showToast(t("app.plugin_prio_saved"), "ok");
                 } catch (err: any) {

@@ -168,7 +168,7 @@ type CronSpec struct {
 // ConfigField describes a single field in a plugin's declarative configuration form.
 type ConfigField struct {
 	Key         string            `json:"key"`
-	Type        string            `json:"type"` // string | text | textarea | secret | number | boolean | select | url | color | image | sortable_list
+	Type        string            `json:"type"` // string | text | textarea | secret | number | boolean | select | url | color | image | sortable_list | tag_list
 	Secret      bool              `json:"secret,omitempty"`
 	Required    bool              `json:"required,omitempty"`
 	Default     any               `json:"default,omitempty"`
@@ -338,9 +338,11 @@ func (m *Manifest) Validate() error {
 
 		f.Type = strings.ToLower(strings.TrimSpace(f.Type))
 		switch f.Type {
-		case "string", "text", "textarea", "secret", "number", "boolean", "select", "url", "color", "image", "sortable_list":
+		case "string", "text", "textarea", "secret", "number", "boolean", "select", "url", "color", "image", "sortable_list", "tag_list", "token_list":
 			if f.Type == "secret" {
 				f.Secret = true
+			} else if f.Type == "token_list" {
+				f.Type = "tag_list"
 			}
 		default:
 			return fmt.Errorf("plugin %q: config field %q has unsupported type %q", m.ID, k, f.Type)
@@ -736,7 +738,7 @@ func (m *Manifest) ValidateAndMergeConfig(
 		if !exists || val == nil {
 			return nil, nil, fmt.Errorf("plugin %q: required field %q cannot be empty", m.ID, f.Key)
 		}
-		if f.Type == "sortable_list" {
+		if f.Type == "sortable_list" || f.Type == "tag_list" {
 			if xs, ok := val.([]string); !ok || len(xs) == 0 {
 				return nil, nil, fmt.Errorf("plugin %q: required field %q cannot be empty", m.ID, f.Key)
 			}
@@ -760,6 +762,31 @@ func stripASCIIControlsString(s string) string {
 		}
 	}
 	return b.String()
+}
+
+func splitLegacyTagListString(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	lines := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	})
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" || strings.HasPrefix(trimmedLine, "#") || strings.HasPrefix(trimmedLine, "//") {
+			continue
+		}
+		parts := strings.FieldsFunc(trimmedLine, func(r rune) bool {
+			return r == ',' || r == '，' || r == ';' || r == '；'
+		})
+		for _, p := range parts {
+			if tp := strings.TrimSpace(p); tp != "" {
+				out = append(out, tp)
+			}
+		}
+	}
+	return out
 }
 
 func coerceConfigValue(field ConfigField, raw any) (any, error) {
@@ -894,6 +921,60 @@ func coerceConfigValue(field ConfigField, raw any) (any, error) {
 			}
 			seen[clean] = true
 			out = append(out, clean)
+		}
+		return out, nil
+
+	case "tag_list":
+		maxItems := 20000
+		if field.Max != nil && *field.Max > 0 {
+			maxItems = int(*field.Max)
+		}
+		var rawItems []string
+		switch xs := raw.(type) {
+		case []string:
+			rawItems = xs
+		case []any:
+			rawItems = make([]string, 0, len(xs))
+			for _, item := range xs {
+				s, ok := item.(string)
+				if !ok {
+					return nil, errors.New("tag_list items must be strings")
+				}
+				rawItems = append(rawItems, s)
+			}
+		case string:
+			rawItems = splitLegacyTagListString(xs)
+		default:
+			return nil, errors.New("expected array of strings or delimited text for tag_list")
+		}
+		allowedOpts := make(map[string]bool, len(field.Options))
+		for _, opt := range field.Options {
+			allowedOpts[opt.Value] = true
+		}
+		seen := make(map[string]struct{}, len(rawItems))
+		out := make([]string, 0, len(rawItems))
+		for _, it := range rawItems {
+			clean := strings.TrimSpace(stripASCIIControlsString(it))
+			if clean == "" {
+				continue
+			}
+			if len([]rune(clean)) > 256 {
+				return nil, errors.New("tag_list item exceeds 256 characters")
+			}
+			if _, dup := seen[clean]; dup {
+				continue
+			}
+			if len(allowedOpts) > 0 && !allowedOpts[clean] {
+				return nil, fmt.Errorf("value %q is not in allowed options", clean)
+			}
+			if len(out) >= maxItems {
+				return nil, fmt.Errorf("tag_list exceeds %d items", maxItems)
+			}
+			seen[clean] = struct{}{}
+			out = append(out, clean)
+		}
+		if field.Min != nil && float64(len(out)) < *field.Min {
+			return nil, fmt.Errorf("must contain at least %.0f items", *field.Min)
 		}
 		return out, nil
 

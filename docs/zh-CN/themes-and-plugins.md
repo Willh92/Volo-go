@@ -143,6 +143,7 @@ plugins/hello-callout/
 - `url`、`image`（自动安全净化，拦截 `javascript:` / `data:` 危险协议）
 - `color`（`#rgb` / `#rrggbb` 颜色选择器）
 - `sortable_list`（可勾选显隐并拖拽排序的列表项）
+- `tag_list`（别名 `token_list`：胶囊标签词组编辑器，落盘 `string[]` 并向后兼容换行/逗号分隔字符串；内置海量词条渐进展开、实时检索与一键「批量编辑 / 标签视图」切换）
 
 ```json
 {
@@ -211,7 +212,7 @@ plugins/hello-callout/
 }
 ```
 
-> **插件中心链式优先级（`priority`）与一键排序**：每个插件拥有执行优先级 `priority`（范围 `-1000..10000`，默认 `100`，官方 `sensitive-words` 默认为 `20`；**数值越小越先执行**，相同数值按插件 `id` 字典序确定性兜底）。管理员可在后台「插件中心」直接点击 **`↑` / `↓` / 置顶**（`POST /api/admin/plugins/reorder`）或点击 `#1 · P20` 徽章精确修改数值（`PATCH /api/admin/plugins/{id}/priority`）。该顺序同时决定**所有领域/前置拦截钩子、前台 UI 插槽拼接顺序、渲染缓存指纹以及同类型扩展 Provider 链（如多个 `provider:antispam`、`provider:notifier`、`provider:federation`、`provider:oidc`、`provider:storage`）的执行先后**。
+> **插件中心链式优先级（`priority`）与一键排序**：每个插件拥有执行优先级 `priority`（范围 `-1000..10000`，默认 `100`，官方 `sensitive-words` 默认为 `20`；**数值越小越先执行**，相同数值按插件 `id` 字典序确定性兜底）。管理员可在后台「插件中心」直接点击 **`↑` / `↓` / 移至首位**（`POST /api/admin/plugins/reorder`，共享全站统一的 FLIP 平滑位移动效）或点击 `#1 · P20` 徽章精确修改数值（`PATCH /api/admin/plugins/{id}/priority`）。该顺序同时决定**所有领域/前置拦截钩子、前台 UI 插槽拼接顺序、渲染缓存指纹以及同类型扩展 Provider 链（如多个 `provider:antispam`、`provider:notifier`、`provider:federation`、`provider:oidc`、`provider:storage`）的执行先后**。
 
 > **`type: "secret"` 密钥落盘加密保证**：`config_schema` 中声明 `"type": "secret"`（或 `"secret": true`）的字段在写入数据库时自动使用宿主 `KeyRing` 进行 `AES-256-GCM` 独立列加密（`plugins.secret_ciphertext`，绑定 `AAD = plugins.secret_ciphertext:<plugin_id>`）。后台管理 API 仅返回布尔掩码映射 `secret_keys_set`，绝不回显明文；若需清空已保存密钥，可传入哨兵值 `"__VOLO_CLEAR_SECRET__"`。
 
@@ -230,11 +231,14 @@ plugins/hello-callout/
    - 极简布尔：`return false`；
    - **非破坏式局部载荷合并与单向待审升级**：返回普通对象（如 `return { content_md: cleaned }`）时，宿主将其与当前载荷做局部键合并并继续传递给下一优先级插件；评论钩子若设 `{ status: "pending" }`（或 `{ action: "moderate" }`），待审状态在链路上单向保留，不会被后续低优先级插件意外冲掉。
 
-3. **官方 `sensitive-words` 插件与宿主后台配置的合并（并集叠加）关系**：
-   - **插件内部词库合并**：`houbb_base.txt.gz`（`281 KiB` 前缀/标签差分压缩，支持政治/涉枪涉暴/涉黄/毒品赌博/广告导流/脏话辱骂 6 大分类独立开关） + 内置技术词汇白名单 `allowlist.txt` + 可选远程词库自动同步 + 后台自定义拦截词 `custom_deny` + 自定义白名单 `custom_allow`（白名单最长区间覆盖优先） + 保留昵称 `reserved_nicknames` 统一编译为原生双数组 Aho-Corasick 自动机。
+3. **官方 `sensitive-words` 插件、宿主配置并集与存量内容非破坏式 `*` 脱敏**：
+   - **插件内部词库合并**：`houbb_base.txt.gz`（`281 KiB` 前缀/标签差分压缩，支持政治/涉枪涉暴/涉黄/毒品赌博/广告导流/脏话辱骂 6 大分类独立开关） + 内置技术词汇白名单 `allowlist.txt` + 可选远程词库自动同步 + 后台胶囊标签词库 `custom_deny` / `custom_allow`（白名单最长区间覆盖优先） + `reserved_nicknames` 统一编译为原生双数组 Aho-Corasick 自动机。
    - **与宿主后台设置（`reading.blocked_keywords` / `allowed_keywords`）并集叠加**：
      - **昵称与账号链路**：对宿主 `reading.blocked_keywords`、全部已启用 `provider:antispam` 插件（`checkNickname`）及 `user.before_*` 钩子严格取**并集**，任一侧命中即拦截；
      - **评论链路**：智能审核先执行宿主 `reading.blocked_keywords`（命中置为 `pending` 待审），随后按优先级依次执行 `provider:antispam` 链——插件未命中时返回 `"pass"` 完整保留宿主的 `pending` 判定，命中时则按插件策略升级为直接拦截（`reject`）、打码放行或转人工审核（`moderate`）。
+   - **已存在存量内容的非破坏式 `*` 实时脱敏（`mask_existing` + `volo.wordFilter.setSanitizer`）**：
+     - 开启敏感词过滤（插件 `mask_existing: true` 默认开启，或宿主启用 `builtin_spam_filter` + `blocked_keywords`）后，已入库的历史评论正文、访客冒充昵称及侧边栏/动态页最新评论摘要均在 Go 原生渲染层自动执行零 JS VM 开销的 **`*` 打码脱敏**，且支持状态指纹驱动的缓存即时刷新与随时无损还原（绝不破坏数据库原始记录）；
+     - HTML 感知脱敏严格保护 `<a href>`、`<img src>` 等标签属性与 HTML 实体不被误伤，同时精准穿透行内标签拆分（如 `傻<strong>逼</strong>` -> `*<strong>*</strong>`）与分隔符变形；真实管理员/编辑/文章作者的官方署名（如“站长”、“博主”）受身份豁免不被 `reserved_nicknames` 误打码，历史已注册读者的存量受限昵称亦仅在展示层脱敏而不会阻断其正常发表合规评论。
 
 ### 3.4 标准权限（Permissions）、定时任务调度器与扩展 Provider
 

@@ -438,10 +438,29 @@ const DEFAULT_VENDOR_CDN_BASES = [
   "https://fastly.jsdelivr.net/npm",
   "https://unpkg.com",
 ];
+function normalizeVendorCDNBase(raw: string): string | null {
+  const trimmed = raw.trim().replace(/[<>"'`\s]+/g, "").replace(/\/+$/, "");
+  if (!trimmed) return null;
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//") && !trimmed.startsWith("/\\")) {
+    return encodeURI(trimmed);
+  }
+  if (trimmed.startsWith("https://") || trimmed.startsWith("http://")) {
+    try {
+      const u = new URL(trimmed);
+      if (u.protocol === "https:" || u.protocol === "http:") {
+        return encodeURI((u.origin + u.pathname).replace(/\/+$/, ""));
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function getVendorCDNBases(): string[] {
   const out: string[] = [];
-  const custom = (readBootConfig().vendor_cdn_prefix || "").trim().replace(/\/+$/, "");
-  if (custom && /^(?:https?:\/\/|\/[^\s/])/.test(custom)) {
+  const custom = normalizeVendorCDNBase(readBootConfig().vendor_cdn_prefix || "");
+  if (custom) {
     out.push(custom);
   }
   for (const base of DEFAULT_VENDOR_CDN_BASES) {
@@ -2632,7 +2651,7 @@ interface StandaloneEmbedInfo {
 
 function matchStandaloneEmbedVideo(text: string): StandaloneEmbedInfo | null {
   const trimmed = text.trim();
-  if (!trimmed || (!trimmed.includes("bilibili.com") && !trimmed.includes("youtube.com") && !trimmed.includes("youtu.be"))) {
+  if (!trimmed || !trimmed.includes("://")) {
     return null;
   }
   let label = "";
@@ -4295,13 +4314,15 @@ function clipboardHtmlToMarkdown(
 
   // 9. Queue embedded data:image/*;base64 images for automatic local upload
   const pendingUploads: Array<{ placeholder: string; file: File }> = [];
-  const uid = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const randWords = new Uint32Array(1);
+  crypto.getRandomValues(randWords);
+  const batchTag = `${Date.now().toString(36)}${randWords[0].toString(36)}`;
   let imgIdx = 0;
   for (const img of Array.from(body.querySelectorAll<HTMLImageElement>("img[src^='data:image/']"))) {
     const src = img.getAttribute("src") || "";
     const file = dataUrlToFile(src, ++imgIdx);
     if (file && file.size > 0 && file.size <= 15 * 1024 * 1024) {
-      const placeholder = `/__volo_paste_img_${uid}_${imgIdx}__`;
+      const placeholder = `/__volo_paste_img_${batchTag}_${imgIdx}__`;
       img.setAttribute("src", placeholder);
       pendingUploads.push({ placeholder, file });
     } else {
@@ -6904,15 +6925,18 @@ ${rendered}
         )}
 
         {/* Split Live Preview Pane */}
-        {mode === "sv" && (
-          <div
-            ref={previewRef}
-            class="volo-preview-pane"
-            dangerouslySetInnerHTML={{
-              __html: previewHTML || `<p style="color:var(--volo-muted)">${t("ed.live_preview_empty")}</p>`,
-            }}
-          />
-        )}
+        {mode === "sv" &&
+          (previewHTML ? (
+            <div
+              ref={previewRef}
+              class="volo-preview-pane"
+              dangerouslySetInnerHTML={{ __html: previewHTML }}
+            />
+          ) : (
+            <div ref={previewRef} class="volo-preview-pane">
+              <p style={{ color: "var(--volo-muted)" }}>{t("ed.live_preview_empty")}</p>
+            </div>
+          ))}
 
         {/* Optional Collapsible Outline Drawer */}
         {showOutline && (

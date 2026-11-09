@@ -108,6 +108,29 @@
       }
     },
     {
+      "key": "mask_existing",
+      "type": "boolean",
+      "default": true,
+      "group": {
+        "zh-CN": "拦截策略",
+        "en-US": "Interception Policy",
+        "zh-TW": "攔截策略",
+        "ja-JP": "ブロックポリシー"
+      },
+      "label": {
+        "zh-CN": "对已存在内容中的敏感词做 * 脱敏",
+        "en-US": "Mask Existing Sensitive Words with *",
+        "zh-TW": "對已存在內容中的敏感詞做 * 脫敏",
+        "ja-JP": "既存コンテンツ内のNGワードを * でマスク"
+      },
+      "description": {
+        "zh-CN": "开启后，历史评论正文、已有昵称与最新评论摘要中命中的敏感词将在展示层安全替换为“*”，不破坏原数据库记录与 HTML 结构。",
+        "en-US": "Safely replaces sensitive words in existing comments, historical nicknames, and recent comment feeds with '*' at display time without mutating stored records or HTML markup.",
+        "zh-TW": "開啟後，歷史評論正文、既有暱稱與最新評論摘要中命中的敏感詞將在展示層安全替換為「*」，不破壞原資料庫記錄與 HTML 結構。",
+        "ja-JP": "有効時、既存のコメント本文・過去のニックネーム・最新コメント抜粋に含まれるNGワードを表示時に安全に「*」へ置換します（DB原本やHTML構造は保持）。"
+      }
+    },
+    {
       "key": "check_nickname",
       "type": "boolean",
       "default": true,
@@ -155,8 +178,17 @@
     },
     {
       "key": "reserved_nicknames",
-      "type": "textarea",
-      "default": "管理员\n系统管理员\n官方客服\n网站管理员\n站长\n博主\nsuperadmin\nwebmaster",
+      "type": "tag_list",
+      "default": [
+        "管理员",
+        "系统管理员",
+        "官方客服",
+        "网站管理员",
+        "站长",
+        "博主",
+        "superadmin",
+        "webmaster"
+      ],
       "group": {
         "zh-CN": "昵称防护",
         "en-US": "Nickname Guard",
@@ -170,10 +202,16 @@
         "ja-JP": "なりすまし防止予約名（ニックネーム専用）"
       },
       "description": {
-        "zh-CN": "每行一个词，仅拦截读者注册与访客评论昵称，不影响评论正文中正常提及“博主/站长”。",
-        "en-US": "One per line. Checked only against non-staff nicknames so normal comments mentioning 'admin' or 'author' are never blocked.",
-        "zh-TW": "每行一個詞，僅攔截讀者註冊與訪客評論暱稱，不影響評論正文中正常提及「版主/站長」。",
-        "ja-JP": "1行に1語。非スタッフのニックネームのみを検査し、コメント本文中の「管理者」「著者」などの通常の言及は妨げません。"
+        "zh-CN": "仅拦截读者注册与访客评论昵称，不影响评论正文中正常提及“博主/站长”。支持回车、逗号或批量粘贴多行词表。",
+        "en-US": "Checked only against non-staff nicknames so normal comments mentioning 'admin' or 'author' are never blocked. Supports Enter, comma, or multi-line paste.",
+        "zh-TW": "僅攔截讀者註冊與訪客評論暱稱，不影響評論正文中正常提及「版主/站長」。支援 Enter、逗號或批次貼上多行詞表。",
+        "ja-JP": "非スタッフのニックネームのみを検査し、コメント本文中の「管理者」「著者」などの通常の言及は妨げません。Enter・カンマ・複数行の一括貼り付けに対応。"
+      },
+      "placeholder": {
+        "zh-CN": "输入保留昵称后按回车添加，支持批量粘贴…",
+        "en-US": "Add reserved handle and press Enter, or paste list…",
+        "zh-TW": "輸入保留暱稱後按 Enter 新增，支援批次貼上…",
+        "ja-JP": "予約名を入力して Enter で追加（一括貼り付け対応）…"
       }
     },
     {
@@ -326,8 +364,8 @@
     },
     {
       "key": "custom_deny",
-      "type": "textarea",
-      "default": "",
+      "type": "tag_list",
+      "default": [],
       "group": {
         "zh-CN": "自定义词表",
         "en-US": "Custom Rules",
@@ -340,17 +378,23 @@
         "zh-TW": "自訂補充敏感詞",
         "ja-JP": "カスタム追加NGワード"
       },
+      "description": {
+        "zh-CN": "与宿主后台敏感词及内置词库叠加生效，支持回车、逗号或直接粘贴多行词表（! 前缀可标记为豁免词）。",
+        "en-US": "Merged with host blocked keywords and built-in dictionaries. Press Enter/comma or paste multi-line word lists (!prefix marks allowlist).",
+        "zh-TW": "與宿主後台敏感詞及內建詞庫疊加生效，支援 Enter、逗號或直接貼上多行詞表（! 前綴可標記為豁免詞）。",
+        "ja-JP": "ホスト側の禁止語および内蔵辞書と統合されます。Enter・カンマ・複数行貼り付けに対応（! 先頭は許可語扱い）。"
+      },
       "placeholder": {
-        "zh-CN": "每行一个词，# 开头为注释，! 开头为白名单豁免词",
-        "en-US": "One word per line (# for comments, !prefix for allowlist)",
-        "zh-TW": "每行一個詞，# 開頭為註解，! 開頭為白名單豁免詞",
-        "ja-JP": "1行に1語（# はコメント、! 先頭は許可リスト）"
+        "zh-CN": "输入敏感词后按回车或逗号添加，支持批量粘贴…",
+        "en-US": "Add blocked word via Enter/comma, or paste list…",
+        "zh-TW": "輸入敏感詞後按 Enter 或逗號新增，支援批次貼上…",
+        "ja-JP": "NGワードを入力して Enter / カンマで追加（一括貼り付け対応）…"
       }
     },
     {
       "key": "custom_allow",
-      "type": "textarea",
-      "default": "",
+      "type": "tag_list",
+      "default": [],
       "group": {
         "zh-CN": "自定义词表",
         "en-US": "Custom Rules",
@@ -363,11 +407,17 @@
         "zh-TW": "自訂白名單豁免詞",
         "ja-JP": "カスタム許可フレーズ（ホワイトリスト）"
       },
+      "description": {
+        "zh-CN": "命中的安全短语（例如“傻瓜相机”）优先放行，支持回车、逗号或批量粘贴多行词表。",
+        "en-US": "Safe phrases exempted from false-positive matches. Supports Enter, comma, or multi-line paste.",
+        "zh-TW": "命中的安全短語（例如「傻瓜相機」）優先放行，支援 Enter、逗號或批次貼上多行詞表。",
+        "ja-JP": "誤検知を防ぐ安全な語句を優先許可します。Enter・カンマ・複数行の一括貼り付けに対応。"
+      },
       "placeholder": {
-        "zh-CN": "每行一个正常短语（例如：傻瓜相机）",
-        "en-US": "One safe phrase per line",
-        "zh-TW": "每行一個正常短語（例如：傻瓜相機）",
-        "ja-JP": "1行に1つの安全な語句を入力"
+        "zh-CN": "输入豁免短语（如：傻瓜相机）后按回车添加…",
+        "en-US": "Add safe phrase and press Enter, or paste list…",
+        "zh-TW": "輸入豁免短語（如：傻瓜相機）後按 Enter 新增…",
+        "ja-JP": "安全な語句を入力して Enter で追加…"
       }
     },
     {
