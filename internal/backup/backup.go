@@ -45,6 +45,8 @@ func isBlockedRestoreUploadExt(p string) bool {
 
 // FileDigest records integrity & row metrics for a single stream inside manifest.json.
 type FileDigest struct {
+	_ [0]func()
+
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 	Bytes  int64  `json:"bytes"`
@@ -53,6 +55,8 @@ type FileDigest struct {
 
 // Manifest is stored as manifest.json inside every native Volo-go backup ZIP.
 type Manifest struct {
+	_ [0]func()
+
 	Format        string       `json:"format"`
 	SchemaVersion int          `json:"schema_version"`
 	SourceDialect string       `json:"source_dialect"`
@@ -75,6 +79,8 @@ type RestoreOptions struct {
 
 // RestoreSummary reports row counts and media files restored (or validated in DryRun).
 type RestoreSummary struct {
+	_ [0]func()
+
 	SourceDialect string           `json:"source_dialect"`
 	Tables        map[string]int64 `json:"tables"`
 	MediaFiles    int              `json:"media_files"`
@@ -458,10 +464,9 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		}
 		return summary, nil
 	}
-
-	// Preserve existing target admin credentials if the incoming backup has empty password hashes
-	existingAdmins, _ := sqlx.Select[domain.User](ctx, store,
-		`SELECT * FROM users WHERE role = ?`, domain.RoleAdmin)
+	var existingAdmins []domain.// Preserve existing target admin credentials if the incoming backup has empty password hashes
+	User
+	_ = sqlx.SelectInto(ctx, store, &existingAdmins, `SELECT * FROM users WHERE role = ?`, domain.RoleAdmin)
 
 	// Pass 2: Atomic transactional DB restore (reverse delete, forward streaming insert)
 	err = store.WithTx(ctx, func(tx *sqlx.Tx) error {

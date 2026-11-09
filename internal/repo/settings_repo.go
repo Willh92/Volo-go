@@ -60,8 +60,8 @@ func (m *SettingsManager) Revision() uint64 {
 
 // Reload loads all persisted setting domains from the database and swaps the in-memory snapshot atomically.
 func (m *SettingsManager) Reload(ctx context.Context) (domain.SettingsSnapshot, error) {
-	rows, err := sqlx.Select[domain.SettingRecord](ctx, m.store,
-		`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings`)
+	var rows []domain.SettingRecord
+	err := sqlx.SelectInto(ctx, m.store, &rows, `SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings`)
 	if err != nil {
 		return m.Snapshot(), fmt.Errorf("settings: reload query: %w", err)
 	}
@@ -179,8 +179,8 @@ func (m *SettingsManager) GetDomain(ctx context.Context, domainName string) (any
 		return nil, 0, fmt.Errorf("settings: unknown domain %q", domainName)
 	}
 	var ver int64 = 1
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
-		`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domainName)
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec, `SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domainName)
 	if err == nil {
 		ver = rec.Version
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -210,8 +210,8 @@ func (m *SettingsManager) PatchDomain(ctx context.Context, domainName string, pa
 
 	var newVersion int64
 	err := m.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		existing, err := sqlx.Get[domain.SettingRecord](ctx, tx,
-			`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domainName)
+		var existing domain.SettingRecord
+		err := sqlx.GetInto(ctx, tx, &existing, `SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domainName)
 		hasExisting := err == nil
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -351,8 +351,8 @@ func (m *SettingsManager) mergeDomainSecrets(domainName string, patchMap map[str
 
 // GetStorageSecrets decrypts storage credentials for internal runtime use (never exposed via API).
 func (m *SettingsManager) GetStorageSecrets(ctx context.Context) (domain.StorageSecrets, error) {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
-		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainStorage)
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec, `SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainStorage)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.StorageSecrets{}, nil
@@ -364,8 +364,8 @@ func (m *SettingsManager) GetStorageSecrets(ctx context.Context) (domain.Storage
 
 // GetNotificationsSecrets decrypts SMTP credentials for internal mailer use.
 func (m *SettingsManager) GetNotificationsSecrets(ctx context.Context) (domain.NotificationsSecrets, error) {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
-		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainNotifications)
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec, `SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainNotifications)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.NotificationsSecrets{}, nil
@@ -377,8 +377,8 @@ func (m *SettingsManager) GetNotificationsSecrets(ctx context.Context) (domain.N
 
 // GetBackupSecrets decrypts remote cloud backup credentials for internal sync use.
 func (m *SettingsManager) GetBackupSecrets(ctx context.Context) (domain.BackupSecrets, error) {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
-		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainBackup)
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec, `SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainBackup)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.BackupSecrets{}, nil
@@ -390,8 +390,8 @@ func (m *SettingsManager) GetBackupSecrets(ctx context.Context) (domain.BackupSe
 
 // PeekShareTokenSecret reads the current ShareToken HMAC secret from ReadDB with zero write side-effects.
 func (m *SettingsManager) PeekShareTokenSecret(ctx context.Context) string {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
-		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec, `SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
 	if err != nil || rec.SecretCiphertext == "" {
 		return ""
 	}
@@ -431,8 +431,8 @@ func (m *SettingsManager) RotateShareTokenSecret(ctx context.Context) (string, e
 	}
 
 	err = m.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		existing, qErr := sqlx.Get[domain.SettingRecord](ctx, tx,
-			`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
+		var existing domain.SettingRecord
+		qErr := sqlx.GetInto(ctx, tx, &existing, `SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
 		valJSON := ""
 		ver := int64(1)
 		if qErr == nil {

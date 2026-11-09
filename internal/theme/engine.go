@@ -41,6 +41,8 @@ type ConfigOption struct {
 
 // ConfigField defines a declarative per-theme configuration item in `theme.json`.
 type ConfigField struct {
+	_ [0]func()
+
 	Key         string            `json:"key"`
 	Type        string            `json:"type"` // "text" | "string" | "textarea" | "url" | "color" | "image" | "boolean" | "number" | "select" | "sortable_list"
 	Group       map[string]string `json:"group,omitempty"`
@@ -57,6 +59,8 @@ type ConfigField struct {
 
 // Manifest describes a built-in or external theme (`theme.json`).
 type Manifest struct {
+	_ [0]func()
+
 	ID               string            `json:"id"`
 	Name             map[string]string `json:"name"`
 	Version          string            `json:"version"`
@@ -81,6 +85,8 @@ type LocalizedConfigOption struct {
 
 // LocalizedConfigField holds a locale-resolved theme configuration field for Admin UI.
 type LocalizedConfigField struct {
+	_ [0]func()
+
 	Key         string                  `json:"key"`
 	Type        string                  `json:"type"`
 	Group       string                  `json:"group,omitempty"`
@@ -97,6 +103,8 @@ type LocalizedConfigField struct {
 
 // LocalizedTheme extends Manifest with locale-resolved labels and preview endpoint URL.
 type LocalizedTheme struct {
+	_ [0]func()
+
 	Manifest
 	DisplayName            string                  `json:"display_name"`
 	DisplayDescription     string                  `json:"display_description"`
@@ -107,6 +115,8 @@ type LocalizedTheme struct {
 
 // OIDCProviderView describes an active OIDC SSO provider button on login views.
 type OIDCProviderView struct {
+	_ [0]func()
+
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
 	StartURL    string `json:"start_url"`
@@ -114,6 +124,8 @@ type OIDCProviderView struct {
 
 // PaginationView provides windowed page numbers and navigation pointers for templates.
 type PaginationView struct {
+	_ [0]func()
+
 	CurrentPage int   `json:"current_page"`
 	TotalPages  int   `json:"total_pages"`
 	PageSize    int   `json:"page_size"`
@@ -180,6 +192,8 @@ func BuildPagination(currentPage, totalPages, pageSize, totalItems, windowSize i
 
 // SeriesEpisodeItem represents one episode row inside an ArticleSeriesContext.
 type SeriesEpisodeItem struct {
+	_ [0]func()
+
 	ID        string
 	Slug      string
 	Title     string
@@ -189,6 +203,8 @@ type SeriesEpisodeItem struct {
 
 // ArticleSeriesContext describes the current article's position inside a Series.
 type ArticleSeriesContext struct {
+	_ [0]func()
+
 	Series       domain.Series
 	Index        int
 	Total        int
@@ -199,6 +215,8 @@ type ArticleSeriesContext struct {
 
 // ArchivePostEntry holds one compact post row for the paginated /archives page.
 type ArchivePostEntry struct {
+	_ [0]func()
+
 	Slug         string
 	Title        string
 	CategoryName string
@@ -210,6 +228,8 @@ type ArchivePostEntry struct {
 
 // ArchiveMonthGroup groups archive posts under a YYYY-MM bucket.
 type ArchiveMonthGroup struct {
+	_ [0]func()
+
 	YearMonth string
 	Month     string
 	Count     int
@@ -218,6 +238,8 @@ type ArchiveMonthGroup struct {
 
 // ArchiveYearGroup groups archive month buckets under a calendar year.
 type ArchiveYearGroup struct {
+	_ [0]func()
+
 	Year   string
 	Count  int
 	Months []ArchiveMonthGroup
@@ -236,6 +258,8 @@ type LinkCategoryGroup struct {
 }
 
 type cachedAsset struct {
+	_ [0]func()
+
 	raw         []byte
 	gzipped     []byte
 	contentType string
@@ -244,6 +268,8 @@ type cachedAsset struct {
 }
 
 type loadedTheme struct {
+	_ [0]func()
+
 	manifest   Manifest
 	fsys       fs.FS
 	fallbackFS fs.FS
@@ -265,6 +291,8 @@ type loadedTheme struct {
 
 // PageContext holds all data passed into theme templates.
 type PageContext struct {
+	_ [0]func()
+
 	ThemeID         string
 	ThemeConfig     map[string]any
 	EnablePJAX      bool
@@ -329,16 +357,16 @@ type PageContext struct {
 	StandalonePage   content.PublicPageView
 
 	// Taxonomies, Books, Links, Follows
-	TaxonomyKind           string
-	Categories             []content.CategoryWithCount
-	Tags                   []content.TagWithCount
-	TagQuery               string
-	TagSort                string
-	ArchiveBuckets         []content.ArchiveMonth
-	SelectedArchiveYear    string
-	ArchiveYears           []ArchiveYearStat
-	ArchiveGroups          []ArchiveYearGroup
-	SeriesList             []domain.Series
+	TaxonomyKind              string
+	Categories                []content.CategoryWithCount
+	Tags                      []content.TagWithCount
+	TagQuery                  string
+	TagSort                   string
+	ArchiveBuckets            []content.ArchiveMonth
+	SelectedArchiveYear       string
+	ArchiveYears              []ArchiveYearStat
+	ArchiveGroups             []ArchiveYearGroup
+	SeriesList                []domain.Series
 	Books                     []domain.Book
 	BookDetail                content.BookDetailView
 	ActiveChapter             *domain.BookChapter
@@ -384,6 +412,8 @@ type PageContext struct {
 
 // Engine manages embedded `volo-studio` and hot-reloadable external `./themes/<id>` packages.
 type Engine struct {
+	_ [0]func()
+
 	catalog        *i18n.Catalog
 	themesDir      string
 	cdnPrefixFn    func() string

@@ -471,7 +471,8 @@ func (p *Pipeline) resolvePluginStorage(driver string) plugin.StorageProvider {
 
 // Delete removes a MediaAsset by ID from both backing storage and `media_assets`.
 func (p *Pipeline) Delete(ctx context.Context, assetID string) error {
-	asset, err := sqlx.Get[domain.MediaAsset](ctx, p.store, `SELECT * FROM media_assets WHERE id = ?`, strings.TrimSpace(assetID))
+	var asset domain.MediaAsset
+	err := sqlx.GetInto(ctx, p.store, &asset, `SELECT * FROM media_assets WHERE id = ?`, strings.TrimSpace(assetID))
 	if err != nil {
 		return err
 	}

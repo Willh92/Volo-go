@@ -27,6 +27,8 @@ const DefaultNavPrimaryCount = 5
 
 // NavLink represents a single resolved navigation link ready for theme templates.
 type NavLink struct {
+	_ [0]func()
+
 	Key          string `json:"key"`
 	Title        string `json:"title"`
 	URL          string `json:"url"`
@@ -39,6 +41,8 @@ type NavLink struct {
 // NavMenu provides theme templates with ordered, visibility-filtered navigation links
 // split into Primary (top-bar) and Overflow ("More" dropdown) slices, plus flat Items.
 type NavMenu struct {
+	_ [0]func()
+
 	Items          []NavLink `json:"items"`
 	Primary        []NavLink `json:"primary"`
 	Overflow       []NavLink `json:"overflow"`
@@ -46,6 +50,8 @@ type NavMenu struct {
 }
 
 type builtinNavSpec struct {
+	_ [0]func()
+
 	url       string
 	i18nKey   string
 	fallback  string
@@ -238,6 +244,8 @@ func (e *Engine) ResolveNavMenu(data PageContext) NavMenu {
 	}
 
 	type resolvedCustom struct {
+		_ [0]func()
+
 		id           string
 		title        string
 		url          string

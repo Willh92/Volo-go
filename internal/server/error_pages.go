@@ -301,6 +301,8 @@ func (s *AppServer) renderLightweightErrorPage(w http.ResponseWriter, r *http.Re
 }
 
 type customErrorInterceptWriter struct {
+	_ [0]func()
+
 	http.ResponseWriter
 	status      int
 	intercepted bool

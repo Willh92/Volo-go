@@ -21,6 +21,8 @@ import (
 // ListenerHandle wraps either a TCP net.Listener or a hardened POSIX Unix Domain Socket listener
 // along with deterministic lock/socket cleanup on graceful shutdown.
 type ListenerHandle struct {
+	_ [0]func()
+
 	NetListener net.Listener
 	Network     string // "tcp" | "unix"
 	Address     string
@@ -143,6 +145,8 @@ func openUnixSocketListener(spec *config.ListenSocketSpec) (*ListenerHandle, err
 
 // HealthResponse is the public, zero-secret readiness/liveness payload returned by GET /healthz.
 type HealthResponse struct {
+	_ [0]func()
+
 	Status    string `json:"status"`
 	Database  string `json:"database"`
 	UptimeSec int64  `json:"uptime_sec"`

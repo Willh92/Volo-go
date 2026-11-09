@@ -28,6 +28,8 @@ import (
 
 // SchedulerOptions configures the rolling local + remote (S3 / WebDAV / Plugin) backup scheduler.
 type SchedulerOptions struct {
+	_ [0]func()
+
 	Store          *sqlx.Store
 	Settings       *repo.SettingsManager
 	Plugins        *plugin.Manager
@@ -39,6 +41,8 @@ type SchedulerOptions struct {
 
 // RunResult summarizes a single rolling backup execution cycle.
 type RunResult struct {
+	_ [0]func()
+
 	LocalPath         string
 	PrunedCount       int
 	RemoteUploaded    bool
@@ -49,6 +53,8 @@ type RunResult struct {
 // Scheduler executes periodic streaming local backups, enforces `LocalKeepCount` retention,
 // and streams archives to S3 (SigV4) or WebDAV without buffering whole ZIPs in RAM.
 type Scheduler struct {
+	_ [0]func()
+
 	opts    SchedulerOptions
 	mu      sync.Mutex
 	lastRun time.Time
@@ -530,6 +536,8 @@ func pruneWebDAVAutoBackups(ctx context.Context, cfg domain.BackupSettings, pass
 		Prop davProp `xml:"prop"`
 	}
 	type davResponse struct {
+		_ [0]func()
+
 		Href      string        `xml:"href"`
 		PropStats []davPropStat `xml:"propstat"`
 		Direct    davProp       `xml:"prop"`
@@ -544,6 +552,8 @@ func pruneWebDAVAutoBackups(ctx context.Context, cfg domain.BackupSettings, pass
 	}
 
 	type davBackupEntry struct {
+		_ [0]func()
+
 		name    string
 		modTime time.Time
 	}

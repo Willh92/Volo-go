@@ -42,6 +42,8 @@ var commonScannerPrefixes = []string{
 }
 
 type strikeBucket struct {
+	_ [0]func()
+
 	score       int
 	occurrences int
 	windowStart time.Time
@@ -58,6 +60,8 @@ type rateWindow struct {
 // 3. Automated scanner trap & 404 path enumeration detection.
 // 4. Sliding-window rate limiting keyed by /32 IPv4 and /64 IPv6 subnet buckets.
 type WAFEngine struct {
+	_ [0]func()
+
 	cfg         *config.Config
 	store       *sqlx.Store
 	settingsMgr *repo.SettingsManager
@@ -236,8 +240,8 @@ func (w *WAFEngine) ReloadBans(ctx context.Context) error {
 		return nil
 	}
 	now := time.Now().UnixMilli()
-	rows, err := sqlx.Select[domain.SecurityIPBan](ctx, w.store,
-		`SELECT * FROM security_ip_bans WHERE expires_at = 0 OR expires_at > ? ORDER BY created_at DESC`, now)
+	var rows []domain.SecurityIPBan
+	err := sqlx.SelectInto(ctx, w.store, &rows, `SELECT * FROM security_ip_bans WHERE expires_at = 0 OR expires_at > ? ORDER BY created_at DESC`, now)
 	if err != nil {
 		return err
 	}

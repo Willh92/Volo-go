@@ -246,6 +246,8 @@ func eligibleForPublicDynamicGzip(r *http.Request, adminPath string) bool {
 }
 
 type dynamicGzipResponseWriter struct {
+	_ [0]func()
+
 	http.ResponseWriter
 	statusCode  int
 	wroteHeader bool

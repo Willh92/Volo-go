@@ -24,6 +24,8 @@ import (
 
 // WebhookEvent represents a normalized event delivered to multi-platform Webhook channels.
 type WebhookEvent struct {
+	_ [0]func()
+
 	Event     string         `json:"event"` // comment.created | article.published | webhook.test
 	SiteTitle string         `json:"site_title"`
 	Title     string         `json:"title"`
@@ -51,6 +53,8 @@ func NewWebhookSender(dialer *security.OutboundSafeDialer) *WebhookSender {
 
 // WebhookDeliveryOutcome captures full telemetry from a single outbound webhook HTTP attempt.
 type WebhookDeliveryOutcome struct {
+	_ [0]func()
+
 	StatusCode   int
 	DurationMS   int
 	PayloadJSON  string

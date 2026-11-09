@@ -49,6 +49,8 @@ var (
 
 // ImportOptions configures streaming legacy bolo-solo archive ETL, URL/domain rewriting, and setup overrides.
 type ImportOptions struct {
+	_ [0]func()
+
 	DryRun            bool
 	LegacyMediaDir    string // Optional path to legacy ./image directory to register/copy
 	TargetUploadDir   string
@@ -69,6 +71,8 @@ type ImportOptions struct {
 
 // ImportReport summarizes everything migrated, normalized, rewritten, and any multi-category conflicts or warnings.
 type ImportReport struct {
+	_ [0]func()
+
 	SourceVersion     string   `json:"source_version"`
 	DryRun            bool     `json:"dry_run"`
 	TargetDialect     string   `json:"target_dialect,omitempty"`
@@ -94,12 +98,16 @@ type ImportReport struct {
 }
 
 type legacyOptionRow struct {
+	_ [0]func()
+
 	OID      string
 	Category string
 	Value    string
 }
 
 type legacyCategoryMeta struct {
+	_ [0]func()
+
 	ID    string
 	Order int
 	Name  string
@@ -157,9 +165,8 @@ func ImportLegacyArchive(
 		report.URLsRewritten = rewriter.count
 		return report, nil
 	}
-
-	existingAdmins, _ := sqlx.Select[domain.User](ctx, store,
-		`SELECT * FROM users WHERE role = ?`, domain.RoleAdmin)
+	var existingAdmins []domain.User
+	_ = sqlx.SelectInto(ctx, store, &existingAdmins, `SELECT * FROM users WHERE role = ?`, domain.RoleAdmin)
 
 	// -------------------------------------------------------------------------
 	// Pass 2: Stream articles, revisions, comments, pages->nav_items, links, follows, and bundled media
@@ -267,6 +274,8 @@ func stripBOMReadCloser(rc io.ReadCloser) io.ReadCloser {
 }
 
 type pass1Data struct {
+	_ [0]func()
+
 	options             map[string]legacyOptionRow
 	chunks              map[string]string
 	users               []domain.User
@@ -301,6 +310,8 @@ func (st *pass1Data) resolveArticleID(rawID string) string {
 }
 
 type legacyLinkHealthItem struct {
+	_ [0]func()
+
 	OK        bool   `json:"ok"`
 	Status    string `json:"status"`
 	HTTPCode  int    `json:"httpCode"`
@@ -740,6 +751,8 @@ func (st *pass1Data) reassembleOptionDoc(rootID string, report *ImportReport) (s
 		return root.Value, true
 	}
 	var manifest struct {
+		_ [0]func()
+
 		Storage    string `json:"storage"`
 		Generation string `json:"generation"`
 		Count      int    `json:"count"`
@@ -778,6 +791,8 @@ func (st *pass1Data) reassembleOptionDoc(rootID string, report *ImportReport) (s
 }
 
 type decomposedState struct {
+	_ [0]func()
+
 	settings       domain.SettingsSnapshot
 	storageSecret  string
 	smtpSecret     string
@@ -1329,6 +1344,8 @@ func insertPass1EntitiesTx(
 }
 
 type deferredRevision struct {
+	_ [0]func()
+
 	id         string
 	articleID  string
 	title      string
@@ -1774,9 +1791,7 @@ func streamPass2IntoTx(
 	var existingSeriesRows []struct {
 		ID string `db:"id"`
 	}
-	existingSeriesRows, _ = sqlx.Select[struct {
-		ID string `db:"id"`
-	}](ctx, tx, `SELECT id FROM series`)
+	_ = sqlx.SelectInto(ctx, tx, &existingSeriesRows, `SELECT id FROM series`)
 	validSeries := make(map[string]bool, len(existingSeriesRows))
 	for _, r := range existingSeriesRows {
 		validSeries[r.ID] = true
@@ -2032,6 +2047,8 @@ func parseLegacySeries(raw string) ([]domain.Series, []domain.SeriesArticle) {
 }
 
 type legacyTocNode struct {
+	_ [0]func()
+
 	Title    string          `json:"title"`
 	URL      string          `json:"url"`
 	Children []legacyTocNode `json:"children"`
@@ -2124,6 +2141,8 @@ func parseLegacyBooksAndTOCs(raw string, st *pass1Data, report *ImportReport) ([
 
 func parseLegacyAnalytics(raw string, st *pass1Data) ([]domain.AnalyticsDaily, []domain.AnalyticsTopItem) {
 	var doc struct {
+		_ [0]func()
+
 		UpdatedAt int64 `json:"updatedAt"`
 		Days      map[string]struct {
 			PV       int64            `json:"pv"`
@@ -2302,6 +2321,8 @@ func parseLegacyIPBans(raw string) []domain.SecurityIPBan {
 
 func parseLegacyGeoAccess(raw string, sec *domain.SecuritySettings) []domain.SecurityGeoRule {
 	var doc struct {
+		_ [0]func()
+
 		Version       int    `json:"version"`
 		Active        bool   `json:"active"`
 		Mode          string `json:"mode"` // legacy v1
@@ -2526,6 +2547,8 @@ func parseLegacySMTP(getOpt func(string) string, nt *domain.NotificationsSetting
 
 func parseLegacyRemoteBackup(raw string, bk *domain.BackupSettings, sec *domain.BackupSecrets) {
 	var doc struct {
+		_ [0]func()
+
 		Enabled        bool   `json:"enabled"`
 		Protocol       string `json:"protocol"`
 		WebDAVURL      string `json:"webdavUrl"`
@@ -2564,6 +2587,8 @@ func parseLegacyGitHubRepos(ghRaw string, dispRaw string, seo *domain.SEOSetting
 	hiddenSet := make(map[string]bool)
 	if dispRaw != "" {
 		var disp struct {
+			_ [0]func()
+
 			IncludeForks bool     `json:"includeForks"`
 			Hidden       []string `json:"hidden"`
 		}
@@ -2578,6 +2603,8 @@ func parseLegacyGitHubRepos(ghRaw string, dispRaw string, seo *domain.SEOSetting
 	}
 
 	type rawRepo struct {
+		_ [0]func()
+
 		Name        string `json:"githubrepoName"`
 		FullName    string `json:"githubrepoFullName"`
 		Description string `json:"githubrepoDescription"`
@@ -2596,6 +2623,8 @@ func parseLegacyGitHubRepos(ghRaw string, dispRaw string, seo *domain.SEOSetting
 		_ = json.Unmarshal([]byte(trimmed), &list)
 	} else {
 		var wrapper struct {
+			_ [0]func()
+
 			Username     string    `json:"username"`
 			UpdatedAt    int64     `json:"updatedAt"`
 			Repositories []rawRepo `json:"repositories"`

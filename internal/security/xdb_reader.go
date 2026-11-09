@@ -28,6 +28,8 @@ const (
 // xdbReader is a pure-Go, lock-free, io.ReaderAt-backed ip2region v2.0/v3.0 (IPv4 & IPv6) reader.
 // Only the 512 KiB vector index is retained in memory; segment and region reads use stateless pread/ReadAt.
 type xdbReader struct {
+	_ [0]func()
+
 	ra        io.ReaderAt
 	closer    io.Closer
 	fileSize  int64

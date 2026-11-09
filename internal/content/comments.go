@@ -24,6 +24,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
+	"github.com/Willh92/Volo-go/pkg/wordfilter"
 )
 
 const GuestEditWindow = 30 * time.Minute
@@ -37,6 +38,8 @@ var (
 
 // PublicCommentView is the zero-PII comment model exposed to visitors and comment-widget.js.
 type PublicCommentView struct {
+	_ [0]func()
+
 	ID          string              `json:"id"`
 	ParentID    string              `json:"parent_id,omitempty"`
 	ReplyToName string              `json:"reply_to_name,omitempty"`
@@ -59,6 +62,8 @@ type PublicCommentView struct {
 
 // PaginatedCommentsResult holds a paginated slice of top-level comment threads (with full replies per thread).
 type PaginatedCommentsResult struct {
+	_ [0]func()
+
 	Comments      []PublicCommentView `json:"comments"`
 	Page          int                 `json:"page"`
 	PerPage       int                 `json:"per_page"`
@@ -70,6 +75,8 @@ type PaginatedCommentsResult struct {
 
 // RecentCommentItem is displayed in the volo-studio sidebar and /dynamic page (strictly excluding protected/unpublished targets!).
 type RecentCommentItem struct {
+	_ [0]func()
+
 	ID          string `json:"id"`
 	AuthorName  string `json:"author_name"`
 	Excerpt     string `json:"excerpt"`
@@ -80,6 +87,8 @@ type RecentCommentItem struct {
 
 // CreateCommentInput carries user/guest comment submission fields.
 type CreateCommentInput struct {
+	_ [0]func()
+
 	TargetType   string `json:"target_type"` // article | page
 	TargetID     string `json:"target_id"`
 	ParentID     string `json:"parent_id"`
@@ -120,7 +129,8 @@ func (s *Service) authorizeCommentTarget(
 		}
 		return raw.AuthorID, nil
 	case domain.TargetTypePage:
-		pg, err := sqlx.Get[domain.Page](ctx, s.store, `SELECT id, author_id, is_published FROM pages WHERE id = ?`, tID)
+		var pg domain.Page
+		err := sqlx.GetInto(ctx, s.store, &pg, `SELECT id, author_id, is_published FROM pages WHERE id = ?`, tID)
 		if err != nil {
 			return "", err
 		}
@@ -138,6 +148,8 @@ func (s *Service) authorizeCommentTarget(
 const publicCommentSelectCols = `id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash, author_name, author_url, avatar_url, ip_masked, CASE WHEN client_ip <> '' THEN 1 ELSE 0 END AS has_client_ip, geo_region, content_md, status, created_at, updated_at`
 
 type publicCommentRow struct {
+	_ [0]func()
+
 	ID          string `db:"id"`
 	ParentID    string `db:"parent_id"`
 	ReplyToName string `db:"reply_to_name"`
@@ -264,7 +276,8 @@ func (s *Service) hydrateRootThreadsReplies(
 			}
 			replySQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere +
 				` AND parent_id IN (` + strings.Join(placeholders, ",") + `) ORDER BY created_at ASC, id ASC`
-			repRows, err := sqlx.Select[publicCommentRow](ctx, s.store, replySQL, qArgs...)
+			var repRows []publicCommentRow
+			err := sqlx.SelectInto(ctx, s.store, &repRows, replySQL, qArgs...)
 			if err != nil {
 				return nil, err
 			}
@@ -327,7 +340,8 @@ func (s *Service) ListTargetComments(
 	visWhere, visArgs := buildCommentVisibilityWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
 
 	rootSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere + ` AND parent_id = '' ORDER BY created_at DESC, id DESC`
-	rootRows, err := sqlx.Select[publicCommentRow](ctx, s.store, rootSQL, visArgs...)
+	var rootRows []publicCommentRow
+	err = sqlx.SelectInto(ctx, s.store, &rootRows, rootSQL, visArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -398,6 +412,8 @@ func (s *Service) ListTargetCommentsPage(
 
 	if focusID := strings.TrimSpace(focusCommentID); focusID != "" {
 		type ancestorRow struct {
+			_ [0]func()
+
 			ID        string `db:"id"`
 			ParentID  string `db:"parent_id"`
 			CreatedAt int64  `db:"created_at"`
@@ -409,11 +425,10 @@ func (s *Service) ListTargetCommentsPage(
 			aArgs := make([]any, 0, 1+len(visArgs))
 			aArgs = append(aArgs, curID)
 			aArgs = append(aArgs, visArgs...)
-			anc, aErr := sqlx.Get[ancestorRow](
-				ctx, s.store,
-				`SELECT id, parent_id, created_at FROM comments WHERE id = ? AND `+visWhere,
-				aArgs...,
-			)
+			var anc ancestorRow
+			aErr := sqlx.GetInto(ctx, s.store, &anc, `SELECT id, parent_id, created_at FROM comments WHERE id = ? AND `+visWhere,
+				aArgs...)
+
 			if aErr != nil {
 				break
 			}
@@ -450,8 +465,8 @@ func (s *Service) ListTargetCommentsPage(
 	rootArgs := make([]any, 0, len(visArgs)+len(pageArgs))
 	rootArgs = append(rootArgs, visArgs...)
 	rootArgs = append(rootArgs, pageArgs...)
-
-	rootRows, err := sqlx.Select[publicCommentRow](ctx, s.store, rootPageSQL, rootArgs...)
+	var rootRows []publicCommentRow
+	err = sqlx.SelectInto(ctx, s.store, &rootRows, rootPageSQL, rootArgs...)
 	if err != nil {
 		return PaginatedCommentsResult{}, err
 	}
@@ -533,6 +548,8 @@ func (s *Service) queryRecentPublicComments(ctx context.Context, limit int) ([]R
 
 func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int, offset int) ([]RecentCommentItem, error) {
 	type joinedRecent struct {
+		_ [0]func()
+
 		ID          string `db:"id"`
 		AuthorName  string `db:"author_name"`
 		ContentMD   string `db:"content_md"`
@@ -554,10 +571,10 @@ func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int
 		    OR (c.target_type = 'page' AND p.is_published = ?))
 		ORDER BY c.created_at DESC`
 	q, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
-	rows, err := sqlx.Select[joinedRecent](
-		ctx, s.store, q,
-		append([]any{domain.CommentStatusApproved, false, domain.ArticleStatusPublished, true}, pageArgs...)...,
-	)
+	var rows []joinedRecent
+	err := sqlx.SelectInto(ctx, s.store, &rows, q,
+		append([]any{domain.CommentStatusApproved, false, domain.ArticleStatusPublished, true}, pageArgs...)...)
+
 	if err != nil {
 		return nil, err
 	}
@@ -616,7 +633,8 @@ func (s *Service) CreateComment(
 		}
 		postAuthorID = raw.AuthorID
 	case domain.TargetTypePage:
-		pg, err := sqlx.Get[domain.Page](ctx, s.store, `SELECT * FROM pages WHERE id = ?`, tID)
+		var pg domain.Page
+		err := sqlx.GetInto(ctx, s.store, &pg, `SELECT * FROM pages WHERE id = ?`, tID)
 		if err != nil || !pg.IsPublished {
 			return PublicCommentView{}, "", sql.ErrNoRows
 		}
@@ -683,11 +701,10 @@ func (s *Service) CreateComment(
 	parentID := strings.TrimSpace(in.ParentID)
 	replyToName := ""
 	if parentID != "" {
-		parent, pErr := sqlx.Get[domain.Comment](
-			ctx, s.store,
-			`SELECT id, parent_id, author_name, target_type, target_id, is_deleted FROM comments WHERE id = ?`,
-			parentID,
-		)
+		var parent domain.Comment
+		pErr := sqlx.GetInto(ctx, s.store, &parent, `SELECT id, parent_id, author_name, target_type, target_id, is_deleted FROM comments WHERE id = ?`,
+			parentID)
+
 		if pErr != nil || parent.IsDeleted || parent.TargetType != tType || parent.TargetID != tID {
 			return PublicCommentView{}, "", errors.New("comments: parent comment not found")
 		}
@@ -710,7 +727,7 @@ func (s *Service) CreateComment(
 		case domain.CommentModerationAll:
 			status = domain.CommentStatusPending
 		case domain.CommentModerationSmart:
-			if containsBlockedKeyword(contentMD, authorName, snap.Reading.BlockedKeywords, snap.Reading.AllowedKeywords) {
+			if s.matchesBuiltinCommentFilter(snap, contentMD, authorName) {
 				status = domain.CommentStatusPending
 			}
 		}
@@ -856,8 +873,8 @@ func (s *Service) UpdateOwnComment(
 	if trimmed == "" || len([]rune(trimmed)) > 4000 {
 		return PublicCommentView{}, errors.New("comments: content length must be between 1 and 4000 characters")
 	}
-
-	existing, err := sqlx.Get[domain.Comment](ctx, s.store, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
+	var existing domain.Comment
+	err := sqlx.GetInto(ctx, s.store, &existing, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
 	if err != nil {
 		return PublicCommentView{}, err
 	}
@@ -890,11 +907,14 @@ func (s *Service) UpdateOwnComment(
 	if !isStaff {
 		snap := s.settings.Snapshot()
 		keywordTriggered := false
-		if snap.Reading.CommentModerationMode == domain.CommentModerationAll {
+		switch snap.Reading.CommentModerationMode {
+		case domain.CommentModerationAll:
 			nextStatus = domain.CommentStatusPending
-		} else if containsBlockedKeyword(trimmed, existing.AuthorName, snap.Reading.BlockedKeywords, snap.Reading.AllowedKeywords) {
-			nextStatus = domain.CommentStatusPending
-			keywordTriggered = true
+		case domain.CommentModerationSmart:
+			if s.matchesBuiltinCommentFilter(snap, trimmed, existing.AuthorName) {
+				nextStatus = domain.CommentStatusPending
+				keywordTriggered = true
+			}
 		}
 
 		if s.plugins != nil {
@@ -974,7 +994,8 @@ func (s *Service) UpdateOwnComment(
 // DeleteOwnComment soft-deletes a comment ONLY if caller owns it via authenticated UserID OR valid
 // signed GuestPassport within 30 minutes (or is admin). NEVER accepts unsigned `env_fp`!
 func (s *Service) DeleteOwnComment(ctx context.Context, r *http.Request, viewer *domain.User, commentID string) error {
-	existing, err := sqlx.Get[domain.Comment](ctx, s.store, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
+	var existing domain.Comment
+	err := sqlx.GetInto(ctx, s.store, &existing, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
 	if err != nil {
 		return err
 	}
@@ -1055,14 +1076,15 @@ func (s *Service) ToggleReaction(ctx context.Context, targetType string, targetI
 // GetReactionCounts returns reaction counts grouped by kind.
 func (s *Service) GetReactionCounts(ctx context.Context, targetType string, targetID string) (map[string]int, error) {
 	type row struct {
+		_ [0]func()
+
 		Kind string `db:"kind"`
 		Cnt  int    `db:"cnt"`
 	}
-	rows, err := sqlx.Select[row](
-		ctx, s.store,
-		`SELECT kind, COUNT(*) AS cnt FROM reactions WHERE target_type = ? AND target_id = ? GROUP BY kind`,
-		targetType, targetID,
-	)
+	var rows []row
+	err := sqlx.SelectInto(ctx, s.store, &rows, `SELECT kind, COUNT(*) AS cnt FROM reactions WHERE target_type = ? AND target_id = ? GROUP BY kind`,
+		targetType, targetID)
+
 	if err != nil {
 		return nil, err
 	}
@@ -1230,23 +1252,52 @@ func sanitizeCommentAuthorURL(raw string) (string, bool) {
 	return u.String(), true
 }
 
-func containsBlockedKeyword(content string, author string, blocked []string, allowed []string) bool {
-	haystack := strings.ToLower(content + " " + author)
-	for _, allow := range allowed {
-		a := strings.ToLower(strings.TrimSpace(allow))
-		if a != "" {
-			haystack = strings.ReplaceAll(haystack, a, "")
-		}
+func (s *Service) matchesBuiltinCommentFilter(snap domain.SettingsSnapshot, content string, author string) bool {
+	if !snap.Reading.BuiltinSpamFilter {
+		return false
 	}
-	for _, kw := range blocked {
-		k := strings.ToLower(strings.TrimSpace(kw))
-		if k != "" && strings.Contains(haystack, k) {
-			return true
-		}
-	}
-	// Built-in heuristic: > 4 external http(s) links in a single guest comment triggers moderation.
-	if strings.Count(haystack, "http://")+strings.Count(haystack, "https://") > 4 {
+	// Built-in heuristic: > 4 external http(s) links in a single comment triggers moderation.
+	if countExternalLinksLower(content) > 4 {
 		return true
 	}
-	return false
+	m := s.getOrBuildKeywordMatcher(snap)
+	if m == nil || m.WordCount() == 0 {
+		return false
+	}
+	return m.Contains(content) || (strings.TrimSpace(author) != "" && m.Contains(author))
+}
+
+func (s *Service) getOrBuildKeywordMatcher(snap domain.SettingsSnapshot) *wordfilter.Matcher {
+	var rev uint64
+	if s.settings != nil {
+		rev = s.settings.Revision()
+	}
+	if rev > 0 {
+		if cached := s.kwFilter.Load(); cached != nil && cached.rev == rev {
+			return cached.matcher
+		}
+	}
+	var m *wordfilter.Matcher
+	if len(snap.Reading.BlockedKeywords) > 0 {
+		m = wordfilter.Compile(wordfilter.Options{
+			Deny:             snap.Reading.BlockedKeywords,
+			Allow:            snap.Reading.AllowedKeywords,
+			IgnoreSeparators: true,
+		})
+	}
+	if rev > 0 {
+		s.kwFilter.Store(&cachedKeywordFilter{
+			rev:     rev,
+			matcher: m,
+		})
+	}
+	return m
+}
+
+func countExternalLinksLower(s string) int {
+	if len(s) < len("http://") {
+		return 0
+	}
+	low := strings.ToLower(s)
+	return strings.Count(low, "http://") + strings.Count(low, "https://")
 }

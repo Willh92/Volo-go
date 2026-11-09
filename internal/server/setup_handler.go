@@ -720,15 +720,7 @@ func (s *AppServer) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := s.deps.Settings.Snapshot()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"initialized":       false,
-		"current_driver":    s.deps.Store.Dialect().Name(),
-		"default_locale":    snap.Site.DefaultLocale,
-		"supported_locales": s.deps.Catalog.Locales(),
-		"admin_path":        s.deps.Config.AdminPath,
-		"timezone":          snap.Site.TimeZone,
-		"accent":            snap.Appearance.Accent,
-	})
+	writeJSONKV(w, http.StatusOK, "initialized", false, "current_driver", s.deps.Store.Dialect().Name(), "default_locale", snap.Site.DefaultLocale, "supported_locales", s.deps.Catalog.Locales(), "admin_path", s.deps.Config.AdminPath, "timezone", snap.Site.TimeZone, "accent", snap.Appearance.Accent)
 }
 
 func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
@@ -745,6 +737,8 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
+		_ [0]func()
+
 		Driver         string `json:"driver"`
 		DSN            string `json:"dsn"`
 		SimpleProtocol bool   `json:"simple_protocol"`
@@ -771,26 +765,16 @@ func (s *AppServer) handleSetupTestDB(w http.ResponseWriter, r *http.Request) {
 
 	driver, dsn, err := s.validateAndNormalizeSetupDB(r.Context(), rawDriver, rawDSN)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"ok":    false,
-			"error": err.Error(),
-		})
+		writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 		return
 	}
 
 	dialectName, latencyMS, err := s.probeSetupDB(r.Context(), driver, dsn, req.SimpleProtocol)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"ok":    false,
-			"error": err.Error(),
-		})
+		writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":         true,
-		"dialect":    dialectName,
-		"latency_ms": latencyMS,
-	})
+	writeJSONKV(w, http.StatusOK, "ok", true, "dialect", dialectName, "latency_ms", latencyMS)
 }
 
 func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Request) {
@@ -807,6 +791,8 @@ func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Reques
 	}
 
 	var req struct {
+		_ [0]func()
+
 		Driver         string `json:"driver"`
 		DSN            string `json:"dsn"`
 		SimpleProtocol *bool  `json:"simple_protocol"`
@@ -827,13 +813,10 @@ func (s *AppServer) handleSetupConfigureDB(w http.ResponseWriter, r *http.Reques
 		simpleProto = *req.SimpleProtocol
 	}
 	if err := s.applySetupDatabaseSelection(r.Context(), req.Driver, req.DSN, simpleProto); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"dialect": s.deps.Store.Dialect().Name(),
-	})
+	writeJSONKV(w, http.StatusOK, "ok", true, "dialect", s.deps.Store.Dialect().Name())
 }
 
 func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Request) {
@@ -873,13 +856,7 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 		if rep != nil && rep.TargetDialect != "" {
 			targetDialect = rep.TargetDialect
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":             true,
-			"dry_run":        true,
-			"report":         rep,
-			"admin_path":     s.deps.Config.AdminPath,
-			"target_dialect": targetDialect,
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "dry_run", true, "report", rep, "admin_path", s.deps.Config.AdminPath, "target_dialect", targetDialect)
 		return
 	}
 
@@ -894,26 +871,24 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
 	s.reloadRuntimeAfterDBRestore(r.Context())
 
-	resp := map[string]any{
-		"ok":             true,
-		"report":         rep,
-		"admin_path":     s.deps.Config.AdminPath,
-		"target_dialect": s.deps.Store.Dialect().Name(),
-	}
-	// Automatically sign in the primary imported administrator so entering /console works seamlessly!
-	if adminUser, qErr := sqlx.Get[domain.User](r.Context(), s.deps.Store,
-		`SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
-		domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
-		geo := ""
-		if s.deps.Geo != nil {
-			geo = s.deps.Geo.LookupDisplay(clientIP)
-		}
-		if sess, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), adminUser.ID, clientIP, geo, r.UserAgent(), 0); sErr == nil {
-			s.setSessionCookieForRequest(w, r, rawTok)
-			adminUser.PasswordHash = ""
-			adminUser.LegacyHash = ""
-			resp["user"] = adminUser
-			resp["csrf_token"] = s.deps.Auth.ComputeCSRFToken(sess.ID)
+	resp := kvMap("ok", true, "report", rep, "admin_path", s.deps.Config.AdminPath, "target_dialect", s.deps.Store.Dialect().Name())
+	{
+		var
+		// Automatically sign in the primary imported administrator so entering /console works seamlessly!
+		adminUser domain.User
+		if qErr := sqlx.GetInto(r.Context(), s.deps.Store, &adminUser, `SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
+			domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
+			geo := ""
+			if s.deps.Geo != nil {
+				geo = s.deps.Geo.LookupDisplay(clientIP)
+			}
+			if sess, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), adminUser.ID, clientIP, geo, r.UserAgent(), 0); sErr == nil {
+				s.setSessionCookieForRequest(w, r, rawTok)
+				adminUser.PasswordHash = ""
+				adminUser.LegacyHash = ""
+				resp["user"] = adminUser
+				resp["csrf_token"] = s.deps.Auth.ComputeCSRFToken(sess.ID)
+			}
 		}
 	}
 
@@ -934,6 +909,8 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req struct {
+		_ [0]func()
+
 		Driver           string `json:"driver"`
 		DBDriver         string `json:"db_driver"`
 		DSN              string `json:"dsn"`
@@ -1111,17 +1088,10 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	sitePatch, _ := json.Marshal(map[string]any{
-		"initialized":    true,
-		"title":          siteTitle,
-		"subtitle":       siteSubtitle,
-		"description":    strings.TrimSpace(req.SiteDescription),
-		"default_locale": locale,
-		"timezone":       tz,
-	})
+	sitePatch, _ := json.Marshal(kvMap("initialized", true, "title", siteTitle, "subtitle", siteSubtitle, "description", strings.TrimSpace(req.SiteDescription), "default_locale", locale, "timezone", tz))
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, sitePatch, 0)
 
-	appPatch, _ := json.Marshal(map[string]any{"accent": accent})
+	appPatch, _ := json.Marshal(kvMap("accent", accent))
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, appPatch, 0)
 	_ = s.deps.Content.WarmCaches(r.Context())
 
@@ -1137,13 +1107,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	s.setSessionCookieForRequest(w, r, rawTok)
 	adminUser.PasswordHash = ""
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":             true,
-		"admin_path":     s.deps.Config.AdminPath,
-		"target_dialect": s.deps.Store.Dialect().Name(),
-		"user":           adminUser,
-		"csrf_token":     s.deps.Auth.ComputeCSRFToken(sess.ID),
-	})
+	writeJSONKV(w, http.StatusOK, "ok", true, "admin_path", s.deps.Config.AdminPath, "target_dialect", s.deps.Store.Dialect().Name(), "user", adminUser, "csrf_token", s.deps.Auth.ComputeCSRFToken(sess.ID))
 }
 
 func splitSetupURLPrefixes(raw string) []string {
@@ -1172,6 +1136,8 @@ func parseSetupBoolField(raw string, fallback bool) bool {
 }
 
 type preparedLegacyImport struct {
+	_ [0]func()
+
 	tmpPath           string
 	dryRun            bool
 	rawDriver         string
@@ -1544,6 +1510,8 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 	}
 
 	var req struct {
+		_ [0]func()
+
 		SourceDriver         string `json:"source_driver"`
 		SourceDSN            string `json:"source_dsn"`
 		SourceSimpleProtocol bool   `json:"source_simple_protocol"`
@@ -1554,7 +1522,7 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 	}
 	pfx, err := validateSourceTablePrefix(req.SourceTablePrefix)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 		return
 	}
 
@@ -1570,29 +1538,18 @@ func (s *AppServer) handleSetupTestLegacyDB(w http.ResponseWriter, r *http.Reque
 	start := time.Now()
 	srcStore, _, _, err := s.validateAndOpenSourceDBReadOnly(testCtx, req.SourceDriver, req.SourceDSN, req.SourceSimpleProtocol)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 		return
 	}
 	defer srcStore.Close()
 
 	insp, err := etl.InspectSourceDatabase(testCtx, srcStore, pfx)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":           true,
-		"dialect":      insp.Dialect,
-		"schema_kind":  insp.SchemaKind,
-		"table_prefix": insp.TablePrefix,
-		"articles":     insp.Articles,
-		"comments":     insp.Comments,
-		"users":        insp.Users,
-		"categories":   insp.Categories,
-		"tags":         insp.Tags,
-		"latency_ms":   time.Since(start).Milliseconds(),
-	})
+	writeJSONKV(w, http.StatusOK, "ok", true, "dialect", insp.Dialect, "schema_kind", insp.SchemaKind, "table_prefix", insp.TablePrefix, "articles", insp.Articles, "comments", insp.Comments, "users", insp.Users, "categories", insp.Categories, "tags", insp.Tags, "latency_ms", time.Since(start).Milliseconds())
 }
 
 func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request) {
@@ -1609,6 +1566,8 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	}
 
 	var req struct {
+		_ [0]func()
+
 		Driver               string `json:"driver"`
 		DBDriver             string `json:"db_driver"`
 		DSN                  string `json:"dsn"`
@@ -1773,14 +1732,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		if rep != nil {
 			rep.TargetDialect = prevalidatedDialect
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":             true,
-			"dry_run":        true,
-			"report":         rep,
-			"source":         insp,
-			"admin_path":     s.deps.Config.AdminPath,
-			"target_dialect": prevalidatedDialect,
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "dry_run", true, "report", rep, "source", insp, "admin_path", s.deps.Config.AdminPath, "target_dialect", prevalidatedDialect)
 		return
 	}
 
@@ -1805,26 +1757,22 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
 	s.reloadRuntimeAfterDBRestore(r.Context())
 
-	resp := map[string]any{
-		"ok":             true,
-		"report":         rep,
-		"source":         insp,
-		"admin_path":     s.deps.Config.AdminPath,
-		"target_dialect": s.deps.Store.Dialect().Name(),
-	}
-	if adminUser, qErr := sqlx.Get[domain.User](r.Context(), s.deps.Store,
-		`SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
-		domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
-		geo := ""
-		if s.deps.Geo != nil {
-			geo = s.deps.Geo.LookupDisplay(clientIP)
-		}
-		if sess, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), adminUser.ID, clientIP, geo, r.UserAgent(), 0); sErr == nil {
-			s.setSessionCookieForRequest(w, r, rawTok)
-			adminUser.PasswordHash = ""
-			adminUser.LegacyHash = ""
-			resp["user"] = adminUser
-			resp["csrf_token"] = s.deps.Auth.ComputeCSRFToken(sess.ID)
+	resp := kvMap("ok", true, "report", rep, "source", insp, "admin_path", s.deps.Config.AdminPath, "target_dialect", s.deps.Store.Dialect().Name())
+	{
+		var adminUser domain.User
+		if qErr := sqlx.GetInto(r.Context(), s.deps.Store, &adminUser, `SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
+			domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
+			geo := ""
+			if s.deps.Geo != nil {
+				geo = s.deps.Geo.LookupDisplay(clientIP)
+			}
+			if sess, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), adminUser.ID, clientIP, geo, r.UserAgent(), 0); sErr == nil {
+				s.setSessionCookieForRequest(w, r, rawTok)
+				adminUser.PasswordHash = ""
+				adminUser.LegacyHash = ""
+				resp["user"] = adminUser
+				resp["csrf_token"] = s.deps.Auth.ComputeCSRFToken(sess.ID)
+			}
 		}
 	}
 

@@ -27,6 +27,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
+	"github.com/Willh92/Volo-go/pkg/wordfilter"
 )
 
 // CategoryWithCount pairs a Category with its published public article count.
@@ -49,6 +50,8 @@ type ArchiveMonth struct {
 
 // PublicNavNode represents a localized top-bar navigation item (and optional children).
 type PublicNavNode struct {
+	_ [0]func()
+
 	ID           string          `json:"id"`
 	Title        string          `json:"title"`
 	URL          string          `json:"url"`
@@ -59,6 +62,8 @@ type PublicNavNode struct {
 
 // PublicPageView is the rendered standalone Markdown page model (`/{slug}`).
 type PublicPageView struct {
+	_ [0]func()
+
 	ID                string                            `json:"id"`
 	Title             string                            `json:"title"`
 	Slug              string                            `json:"slug"`
@@ -94,6 +99,8 @@ type FollowGroup struct {
 
 // PublicAuthorProfile exposes strictly non-sensitive author/owner metadata for theme headers, sidebars, and bylines.
 type PublicAuthorProfile struct {
+	_ [0]func()
+
 	ID           string `json:"id"`
 	Username     string `json:"username"`
 	DisplayName  string `json:"display_name"`
@@ -106,6 +113,8 @@ type PublicAuthorProfile struct {
 
 // PublicSiteStats holds site-wide counters for theme footers, sidebars, and activity pages.
 type PublicSiteStats struct {
+	_ [0]func()
+
 	ArticleCount  int   `json:"article_count"`
 	CommentCount  int   `json:"comment_count"`
 	ViewCount     int64 `json:"view_count"`
@@ -118,6 +127,8 @@ type PublicSiteStats struct {
 
 // PublicChromeExtras bundles cached site owner, staff authors, site stats, archive buckets, and sidebar article lists.
 type PublicChromeExtras struct {
+	_ [0]func()
+
 	Owner              PublicAuthorProfile
 	Authors            []PublicAuthorProfile
 	Stats              PublicSiteStats
@@ -129,6 +140,8 @@ type PublicChromeExtras struct {
 
 // ServiceOptions configures the Content Service.
 type ServiceOptions struct {
+	_ [0]func()
+
 	Store          *sqlx.Store
 	Keys           *config.KeyRing
 	Settings       *repo.SettingsManager
@@ -144,6 +157,8 @@ type ServiceOptions struct {
 
 // Service coordinates public & editorial content, books, feeds, comments, backlinks, and zero-PII analytics.
 type Service struct {
+	_ [0]func()
+
 	store     *sqlx.Store
 	keys      *config.KeyRing
 	settings  *repo.SettingsManager
@@ -173,7 +188,14 @@ type Service struct {
 	bookChapterMu    sync.Mutex
 	bookChapterCache map[string]cachedBookChapter
 
+	kwFilter atomic.Pointer[cachedKeywordFilter]
+
 	onArticlePublished atomic.Pointer[func(context.Context, domain.RawArticle)]
+}
+
+type cachedKeywordFilter struct {
+	rev     uint64
+	matcher *wordfilter.Matcher
 }
 
 // NewService constructs a Content Service.
@@ -280,7 +302,8 @@ func (s *Service) RefreshMediaDimsCache(ctx context.Context) error {
 		`SELECT public_url, width, height FROM media_assets WHERE width > 0 AND height > 0 ORDER BY created_at DESC`,
 		maxCachedMediaDims, 0,
 	)
-	assets, err := sqlx.Select[domain.MediaAsset](ctx, s.store, q, pageArgs...)
+	var assets []domain.MediaAsset
+	err := sqlx.SelectInto(ctx, s.store, &assets, q, pageArgs...)
 	if err != nil {
 		return err
 	}
@@ -344,11 +367,10 @@ func (s *Service) LookupMediaDims(src string) (int, int, bool) {
 // PublishDueScheduled promotes any scheduled articles whose scheduled_at <= nowMs to published.
 func (s *Service) PublishDueScheduled(ctx context.Context) (int, error) {
 	now := time.Now().UnixMilli()
-	due, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT * FROM articles WHERE status = ? AND scheduled_at > 0 AND scheduled_at <= ?`,
-		domain.ArticleStatusScheduled, now,
-	)
+	var due []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &due, `SELECT * FROM articles WHERE status = ? AND scheduled_at > 0 AND scheduled_at <= ?`,
+		domain.ArticleStatusScheduled, now)
+
 	if err != nil || len(due) == 0 {
 		return 0, err
 	}
@@ -422,6 +444,8 @@ func (s *Service) ResolveRedirect(ctx context.Context, reqPath string) (target s
 
 // ArticleListFilter specifies filtering and pagination for ListPublicCards.
 type ArticleListFilter struct {
+	_ [0]func()
+
 	Page         int
 	PageSize     int
 	CategorySlug string
@@ -439,7 +463,8 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 	args := []any{domain.ArticleStatusPublished}
 
 	if slug := strings.TrimSpace(f.CategorySlug); slug != "" {
-		cat, err := sqlx.Get[domain.Category](ctx, s.store, `SELECT id FROM categories WHERE slug = ?`, slug)
+		var cat domain.Category
+		err := sqlx.GetInto(ctx, s.store, &cat, `SELECT id FROM categories WHERE slug = ?`, slug)
 		if errors.Is(err, sql.ErrNoRows) {
 			return []visibility.PublicArticleCard{}, 0, nil
 		}
@@ -451,7 +476,8 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 	}
 
 	if tagSlug := strings.TrimSpace(f.TagSlug); tagSlug != "" {
-		tag, err := sqlx.Get[domain.Tag](ctx, s.store, `SELECT id FROM tags WHERE slug = ?`, tagSlug)
+		var tag domain.Tag
+		err := sqlx.GetInto(ctx, s.store, &tag, `SELECT id FROM tags WHERE slug = ?`, tagSlug)
 		if errors.Is(err, sql.ErrNoRows) {
 			return []visibility.PublicArticleCard{}, 0, nil
 		}
@@ -483,8 +509,8 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 	baseSQL := "SELECT a.* FROM articles a WHERE " + whereClause + " ORDER BY a.is_pinned DESC, a.published_at DESC"
 	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
 	queryArgs := append(append([]any{}, args...), pageArgs...)
-
-	raws, err := sqlx.Select[domain.RawArticle](ctx, s.store, pageSQL, queryArgs...)
+	var raws []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &raws, pageSQL, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -530,28 +556,42 @@ func (s *Service) hydrateCards(ctx context.Context, raws []domain.RawArticle, lo
 
 // GetPublishedRawArticleBySlug fetches a published RawArticle by slug.
 func (s *Service) GetPublishedRawArticleBySlug(ctx context.Context, slug string) (domain.RawArticle, error) {
-	return sqlx.Get[domain.RawArticle](
-		ctx, s.store,
-		`SELECT * FROM articles WHERE slug = ? AND status = ?`,
-		strings.TrimSpace(slug), domain.ArticleStatusPublished,
-	)
+	{
+		var _sqlxOut domain.RawArticle
+		_sqlxErr := sqlx.GetInto(ctx, s.store, &_sqlxOut, `SELECT * FROM articles WHERE slug = ? AND status = ?`,
+			strings.TrimSpace(slug), domain.ArticleStatusPublished)
+		return _sqlxOut,
+
+			// GetRawArticleBySlugAnyStatus fetches a RawArticle regardless of publication status (used only when gated by Staff ownership or valid ShareToken).
+			_sqlxErr
+	}
+
 }
 
-// GetRawArticleBySlugAnyStatus fetches a RawArticle regardless of publication status (used only when gated by Staff ownership or valid ShareToken).
 func (s *Service) GetRawArticleBySlugAnyStatus(ctx context.Context, slug string) (domain.RawArticle, error) {
-	return sqlx.Get[domain.RawArticle](
-		ctx, s.store,
-		`SELECT * FROM articles WHERE slug = ?`,
-		strings.TrimSpace(slug),
-	)
+	{
+		var _sqlxOut domain.RawArticle
+		_sqlxErr := sqlx.GetInto(ctx, s.store, &_sqlxOut, `SELECT * FROM articles WHERE slug = ?`,
+			strings.TrimSpace(slug))
+		return _sqlxOut,
+
+			// GetRawArticleByID fetches a RawArticle by ID.
+			_sqlxErr
+	}
+
 }
 
-// GetRawArticleByID fetches a RawArticle by ID.
 func (s *Service) GetRawArticleByID(ctx context.Context, articleID string) (domain.RawArticle, error) {
-	return sqlx.Get[domain.RawArticle](ctx, s.store, `SELECT * FROM articles WHERE id = ?`, strings.TrimSpace(articleID))
+	{
+		var _sqlxOut domain.RawArticle
+		_sqlxErr := sqlx.GetInto(ctx, s.store, &_sqlxOut, `SELECT * FROM articles WHERE id = ?`, strings.TrimSpace(articleID))
+		return _sqlxOut,
+
+			// RenderArticleDetail builds the full sanitized PublicArticleView + Prev/Next neighbors + public inbound backlinks.
+			_sqlxErr
+	}
 }
 
-// RenderArticleDetail builds the full sanitized PublicArticleView + Prev/Next neighbors + public inbound backlinks.
 func (s *Service) RenderArticleDetail(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -574,17 +614,20 @@ func (s *Service) RenderArticleDetail(
 		}
 	}
 	if authorName == "" {
-		if u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT display_name, username, avatar_url, bio, website_url FROM users WHERE id = ?`, raw.AuthorID); err == nil {
-			authorName = u.DisplayName
-			if authorName == "" {
-				authorName = u.Username
+		{
+			var u domain.User
+			if err := sqlx.GetInto(ctx, s.store, &u, `SELECT display_name, username, avatar_url, bio, website_url FROM users WHERE id = ?`, raw.AuthorID); err == nil {
+				authorName = u.DisplayName
+				if authorName == "" {
+					authorName = u.Username
+				}
+				authorAvatar = u.AvatarURL
+				if authorAvatar == "" && u.Username != "" {
+					authorAvatar = "/avatars/" + u.Username
+				}
+				authorBio = u.Bio
+				authorWeb = u.WebsiteURL
 			}
-			authorAvatar = u.AvatarURL
-			if authorAvatar == "" && u.Username != "" {
-				authorAvatar = "/avatars/" + u.Username
-			}
-			authorBio = u.Bio
-			authorWeb = u.WebsiteURL
 		}
 	}
 	if authorName == "" {
@@ -600,8 +643,11 @@ func (s *Service) RenderArticleDetail(
 			}
 		}
 		if catPtr == nil {
-			if c, err := sqlx.Get[domain.Category](ctx, s.store, `SELECT * FROM categories WHERE id = ?`, raw.CategoryID); err == nil {
-				catPtr = &c
+			{
+				var c domain.Category
+				if err := sqlx.GetInto(ctx, s.store, &c, `SELECT * FROM categories WHERE id = ?`, raw.CategoryID); err == nil {
+					catPtr = &c
+				}
 			}
 		}
 	}
@@ -686,10 +732,10 @@ func (s *Service) getNeighbors(ctx context.Context, cur domain.RawArticle) (prev
 		 ORDER BY published_at DESC, id DESC`,
 		1, 0,
 	)
-	olderRows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store, olderSQL,
-		append([]any{domain.ArticleStatusPublished, cur.PublishedAt, cur.PublishedAt, cur.ID}, olderArgs...)...,
-	)
+	var olderRows []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &olderRows, olderSQL,
+		append([]any{domain.ArticleStatusPublished, cur.PublishedAt, cur.PublishedAt, cur.ID}, olderArgs...)...)
+
 	if err == nil && len(olderRows) > 0 {
 		n := s.guard.ToNeighbor(olderRows[0])
 		prev = &n
@@ -702,10 +748,10 @@ func (s *Service) getNeighbors(ctx context.Context, cur domain.RawArticle) (prev
 		 ORDER BY published_at ASC, id ASC`,
 		1, 0,
 	)
-	newerRows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store, newerSQL,
-		append([]any{domain.ArticleStatusPublished, cur.PublishedAt, cur.PublishedAt, cur.ID}, newerArgs...)...,
-	)
+	var newerRows []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.store, &newerRows, newerSQL,
+		append([]any{domain.ArticleStatusPublished, cur.PublishedAt, cur.PublishedAt, cur.ID}, newerArgs...)...)
+
 	if err == nil && len(newerRows) > 0 {
 		n := s.guard.ToNeighbor(newerRows[0])
 		next = &n
@@ -720,15 +766,14 @@ func (s *Service) ListInboundBacklinks(ctx context.Context, target domain.RawArt
 	if !s.guard.IsPublicIndexable(target) {
 		return nil
 	}
-	rows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT a.id, a.title, a.slug, a.published_at, a.password_ciphertext
+	var rows []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &rows, `SELECT a.id, a.title, a.slug, a.published_at, a.password_ciphertext
 		 FROM article_backlinks b
 		 INNER JOIN articles a ON a.id = b.source_article_id
 		 WHERE b.target_article_id = ? AND a.status = ? AND a.password_ciphertext = ''
 		 ORDER BY a.published_at DESC`,
-		target.ID, domain.ArticleStatusPublished,
-	)
+		target.ID, domain.ArticleStatusPublished)
+
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
@@ -765,7 +810,8 @@ func (s *Service) ReindexArticleBacklinksTx(ctx context.Context, tx *sqlx.Tx, so
 		if slug == source.Slug {
 			continue
 		}
-		target, err := sqlx.Get[domain.RawArticle](ctx, tx, `SELECT id, password_ciphertext FROM articles WHERE slug = ?`, slug)
+		var target domain.RawArticle
+		err := sqlx.GetInto(ctx, tx, &target, `SELECT id, password_ciphertext FROM articles WHERE slug = ?`, slug)
 		if err != nil || target.ID == "" || target.ID == source.ID || strings.TrimSpace(target.PasswordCiphertext) != "" {
 			continue
 		}
@@ -781,14 +827,13 @@ func (s *Service) listArticleTranslations(ctx context.Context, cur domain.RawArt
 	if grp == "" {
 		return nil
 	}
-	rows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT title, slug, lang, password_ciphertext
+	var rows []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &rows, `SELECT title, slug, lang, password_ciphertext
 		 FROM articles
 		 WHERE translation_group = ? AND status = ? AND id <> ?
 		 ORDER BY lang ASC`,
-		grp, domain.ArticleStatusPublished, cur.ID,
-	)
+		grp, domain.ArticleStatusPublished, cur.ID)
+
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
@@ -823,11 +868,10 @@ func (s *Service) GetPublicPageBySlugForViewer(
 	locale string,
 	viewer *domain.User,
 ) (PublicPageView, error) {
-	p, err := sqlx.Get[domain.Page](
-		ctx, s.store,
-		`SELECT * FROM pages WHERE slug = ? AND is_published = ?`,
-		strings.TrimSpace(slug), true,
-	)
+	var p domain.Page
+	err := sqlx.GetInto(ctx, s.store, &p, `SELECT * FROM pages WHERE slug = ? AND is_published = ?`,
+		strings.TrimSpace(slug), true)
+
 	if err != nil {
 		return PublicPageView{}, err
 	}
@@ -908,11 +952,10 @@ func (s *Service) GetPublicPageBySlugForViewer(
 
 	var alts []visibility.TranslationAlternate
 	if strings.TrimSpace(p.TranslationGroup) != "" {
-		peers, pErr := sqlx.Select[domain.Page](
-			ctx, s.store,
-			`SELECT title, slug, lang FROM pages WHERE translation_group = ? AND is_published = ? AND id <> ? ORDER BY lang ASC`,
-			p.TranslationGroup, true, p.ID,
-		)
+		var peers []domain.Page
+		pErr := sqlx.SelectInto(ctx, s.store, &peers, `SELECT title, slug, lang FROM pages WHERE translation_group = ? AND is_published = ? AND id <> ? ORDER BY lang ASC`,
+			p.TranslationGroup, true, p.ID)
+
 		if pErr == nil {
 			for _, pr := range peers {
 				alts = append(alts, visibility.TranslationAlternate{
@@ -1037,43 +1080,56 @@ func lookupExactOrLangTitle(m map[string]string, locale string) string {
 	return ""
 }
 
-var commonCustomNavLocales = map[string][3]string{
-	// key -> {zh-CN, zh-TW, en-US}
-	"关于":     {"关于", "關於", "About"},
-	"关于我":    {"关于我", "關於我", "About"},
-	"关于本站":   {"关于本站", "關於本站", "About"},
-	"about":  {"关于", "關於", "About"},
-	"我的开源":   {"我的开源", "我的開源", "Open Source"},
-	"开源":     {"开源", "開源", "Open Source"},
-	"开源项目":   {"开源项目", "開源專案", "Open Source"},
-	"友链":     {"友链", "友鏈", "Links"},
-	"友情链接":   {"友情链接", "友情連結", "Links"},
-	"留言":     {"留言", "留言", "Guestbook"},
-	"留言板":    {"留言板", "留言板", "Guestbook"},
-	"书单":     {"书单", "書單", "Bookshelf"},
-	"书架":     {"书架", "書架", "Bookshelf"},
-	"读书":     {"读书", "讀書", "Reading"},
-	"相册":     {"相册", "相冊", "Gallery"},
-	"订阅":     {"订阅", "訂閱", "Subscribe"},
-	"动态":     {"动态", "動態", "Stream"},
-	"归档":     {"归档", "歸檔", "Archives"},
-	"分类":     {"分类", "分類", "Categories"},
-	"标签":     {"标签", "標籤", "Tags"},
-	"专题":     {"专题", "專題", "Series"},
-	"作品":     {"作品", "作品", "Projects"},
-	"项目":     {"项目", "專案", "Projects"},
+type customNavLocaleRow struct {
+	key    string
+	titles [3]string // {zh-CN, zh-TW, en-US}
+}
+
+var commonCustomNavLocales = [...]customNavLocaleRow{
+	{"关于", [3]string{"关于", "關於", "About"}},
+	{"关于我", [3]string{"关于我", "關於我", "About"}},
+	{"关于本站", [3]string{"关于本站", "關於本站", "About"}},
+	{"about", [3]string{"关于", "關於", "About"}},
+	{"我的开源", [3]string{"我的开源", "我的開源", "Open Source"}},
+	{"开源", [3]string{"开源", "開源", "Open Source"}},
+	{"开源项目", [3]string{"开源项目", "開源專案", "Open Source"}},
+	{"友链", [3]string{"友链", "友鏈", "Links"}},
+	{"友情链接", [3]string{"友情链接", "友情連結", "Links"}},
+	{"留言", [3]string{"留言", "留言", "Guestbook"}},
+	{"留言板", [3]string{"留言板", "留言板", "Guestbook"}},
+	{"书单", [3]string{"书单", "書單", "Bookshelf"}},
+	{"书架", [3]string{"书架", "書架", "Bookshelf"}},
+	{"读书", [3]string{"读书", "讀書", "Reading"}},
+	{"相册", [3]string{"相册", "相冊", "Gallery"}},
+	{"订阅", [3]string{"订阅", "訂閱", "Subscribe"}},
+	{"动态", [3]string{"动态", "動態", "Stream"}},
+	{"归档", [3]string{"归档", "歸檔", "Archives"}},
+	{"分类", [3]string{"分类", "分類", "Categories"}},
+	{"标签", [3]string{"标签", "標籤", "Tags"}},
+	{"专题", [3]string{"专题", "專題", "Series"}},
+	{"作品", [3]string{"作品", "作品", "Projects"}},
+	{"项目", [3]string{"项目", "專案", "Projects"}},
+}
+
+func lookupCustomNavLocale(key string) ([3]string, bool) {
+	for i := range commonCustomNavLocales {
+		if commonCustomNavLocales[i].key == key {
+			return commonCustomNavLocales[i].titles, true
+		}
+	}
+	return [3]string{}, false
 }
 
 func inferBuiltinNavItemTitle(rawTitle, rawURL, locale string) string {
 	key := strings.ToLower(strings.TrimSpace(rawTitle))
-	entry, ok := commonCustomNavLocales[key]
+	entry, ok := lookupCustomNavLocale(key)
 	if !ok {
 		cleanPath := strings.Trim(strings.ToLower(strings.TrimSpace(rawURL)), "/")
 		switch cleanPath {
 		case "about":
-			entry, ok = commonCustomNavLocales["关于"]
+			entry, ok = lookupCustomNavLocale("关于")
 		case "posts/my-github-repos", "my-github-repos", "github":
-			entry, ok = commonCustomNavLocales["我的开源"]
+			entry, ok = lookupCustomNavLocale("我的开源")
 		}
 	}
 	if !ok {
@@ -1102,19 +1158,21 @@ func (s *Service) ListCategoriesWithCounts(ctx context.Context) ([]CategoryWithC
 }
 
 func (s *Service) queryCategoriesWithCounts(ctx context.Context) ([]CategoryWithCount, error) {
-	cats, err := sqlx.Select[domain.Category](ctx, s.store, `SELECT * FROM categories ORDER BY sort_order ASC, created_at ASC`)
+	var cats []domain.Category
+	err := sqlx.SelectInto(ctx, s.store, &cats, `SELECT * FROM categories ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
 	type countRow struct {
+		_ [0]func()
+
 		CategoryID string `db:"category_id"`
 		Cnt        int    `db:"cnt"`
 	}
-	counts, _ := sqlx.Select[countRow](
-		ctx, s.store,
-		`SELECT category_id, COUNT(*) AS cnt FROM articles WHERE status = ? AND category_id <> '' GROUP BY category_id`,
-		domain.ArticleStatusPublished,
-	)
+	var counts []countRow
+	_ = sqlx.SelectInto(ctx, s.store, &counts, `SELECT category_id, COUNT(*) AS cnt FROM articles WHERE status = ? AND category_id <> '' GROUP BY category_id`,
+		domain.ArticleStatusPublished)
+
 	cntMap := make(map[string]int, len(counts))
 	for _, c := range counts {
 		cntMap[c.CategoryID] = c.Cnt
@@ -1149,6 +1207,8 @@ func (s *Service) ListTagsWithCounts(ctx context.Context, limit int) ([]TagWithC
 
 func (s *Service) queryTagsWithCountsLimited(ctx context.Context, limit int) ([]TagWithCount, error) {
 	type tagCountRow struct {
+		_ [0]func()
+
 		ID           string `db:"id"`
 		Name         string `db:"name"`
 		Slug         string `db:"slug"`
@@ -1173,7 +1233,8 @@ func (s *Service) queryTagsWithCountsLimited(ctx context.Context, limit int) ([]
 		q, pageArgs = s.store.Dialect().PaginateSQL(baseSQL, limit, 0)
 		args = append(args, pageArgs...)
 	}
-	rows, err := sqlx.Select[tagCountRow](ctx, s.store, q, args...)
+	var rows []tagCountRow
+	err := sqlx.SelectInto(ctx, s.store, &rows, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1208,11 +1269,10 @@ func (s *Service) queryArchiveMonths(ctx context.Context) ([]ArchiveMonth, error
 	type pubRow struct {
 		PublishedAt int64 `db:"published_at"`
 	}
-	rows, err := sqlx.Select[pubRow](
-		ctx, s.store,
-		`SELECT CASE WHEN published_at > 0 THEN published_at ELSE created_at END AS published_at FROM articles WHERE status = ? ORDER BY published_at DESC`,
-		domain.ArticleStatusPublished,
-	)
+	var rows []pubRow
+	err := sqlx.SelectInto(ctx, s.store, &rows, `SELECT CASE WHEN published_at > 0 THEN published_at ELSE created_at END AS published_at FROM articles WHERE status = ? ORDER BY published_at DESC`,
+		domain.ArticleStatusPublished)
+
 	if err != nil {
 		return nil, err
 	}
@@ -1235,23 +1295,29 @@ func (s *Service) queryArchiveMonths(ctx context.Context) ([]ArchiveMonth, error
 
 // ListSeries returns all Series ordered by sort_order.
 func (s *Service) ListSeries(ctx context.Context) ([]domain.Series, error) {
-	return sqlx.Select[domain.Series](ctx, s.store, `SELECT * FROM series ORDER BY sort_order ASC, created_at DESC`)
+	{
+		var _sqlxOut []domain.Series
+		_sqlxErr := sqlx.SelectInto(ctx, s.store, &_sqlxOut, `SELECT * FROM series ORDER BY sort_order ASC, created_at DESC`)
+		return _sqlxOut,
+
+			// GetSeriesBySlug returns a Series and its ordered, Guard-redacted PublicArticleCards.
+			_sqlxErr
+	}
 }
 
-// GetSeriesBySlug returns a Series and its ordered, Guard-redacted PublicArticleCards.
 func (s *Service) GetSeriesBySlug(ctx context.Context, slug string, locale string) (SeriesView, error) {
-	ser, err := sqlx.Get[domain.Series](ctx, s.store, `SELECT * FROM series WHERE slug = ?`, strings.TrimSpace(slug))
+	var ser domain.Series
+	err := sqlx.GetInto(ctx, s.store, &ser, `SELECT * FROM series WHERE slug = ?`, strings.TrimSpace(slug))
 	if err != nil {
 		return SeriesView{}, err
 	}
-	raws, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT a.* FROM series_articles sa
+	var raws []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.store, &raws, `SELECT a.* FROM series_articles sa
 		 INNER JOIN articles a ON a.id = sa.article_id
 		 WHERE sa.series_id = ? AND a.status = ?
 		 ORDER BY sa.sort_order ASC, a.published_at ASC`,
-		ser.ID, domain.ArticleStatusPublished,
-	)
+		ser.ID, domain.ArticleStatusPublished)
+
 	if err != nil {
 		return SeriesView{}, err
 	}
@@ -1264,12 +1330,19 @@ func (s *Service) GetSeriesBySlug(ctx context.Context, slug string, locale strin
 
 // ListLinks returns friend links ordered by sort_order.
 func (s *Service) ListLinks(ctx context.Context) ([]domain.Link, error) {
-	return sqlx.Select[domain.Link](ctx, s.store, `SELECT * FROM links ORDER BY sort_order ASC, created_at ASC`)
+	{
+		var _sqlxOut []domain.Link
+		_sqlxErr := sqlx.SelectInto(ctx, s.store, &_sqlxOut, `SELECT * FROM links ORDER BY sort_order ASC, created_at ASC`)
+		return _sqlxOut,
+
+			// ListFollowsWithItems returns RSS Follow subscriptions and their latest items using 2 bounded batch queries.
+			_sqlxErr
+	}
 }
 
-// ListFollowsWithItems returns RSS Follow subscriptions and their latest items using 2 bounded batch queries.
 func (s *Service) ListFollowsWithItems(ctx context.Context, itemsPerFollow int) ([]FollowGroup, error) {
-	follows, err := sqlx.Select[domain.Follow](ctx, s.store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
+	var follows []domain.Follow
+	err := sqlx.SelectInto(ctx, s.store, &follows, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil || len(follows) == 0 {
 		return []FollowGroup{}, err
 	}
@@ -1290,7 +1363,8 @@ func (s *Service) ListFollowsWithItemsPage(ctx context.Context, page int, perPag
 		`SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`,
 		limit, offset,
 	)
-	follows, err := sqlx.Select[domain.Follow](ctx, s.store, pageSQL, pageArgs...)
+	var follows []domain.Follow
+	err := sqlx.SelectInto(ctx, s.store, &follows, pageSQL, pageArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1314,7 +1388,8 @@ func (s *Service) hydrateFollowGroups(ctx context.Context, follows []domain.Foll
 		`SELECT * FROM follow_items WHERE follow_id IN (%s) ORDER BY published_at DESC`,
 		strings.Join(placeholders, ","),
 	)
-	allItems, _ := sqlx.Select[domain.FollowItem](ctx, s.store, q, args...)
+	var allItems []domain.FollowItem
+	_ = sqlx.SelectInto(ctx, s.store, &allItems, q, args...)
 	byFollow := make(map[string][]domain.FollowItem, len(follows))
 	for _, it := range allItems {
 		if len(byFollow[it.FollowID]) < itemsPerFollow {
@@ -1379,6 +1454,8 @@ func (s *Service) loadTagsForArticles(ctx context.Context, raws []domain.RawArti
 		args[i] = r.ID
 	}
 	type joinedTag struct {
+		_ [0]func()
+
 		ArticleID string `db:"article_id"`
 		ID        string `db:"id"`
 		Name      string `db:"name"`
@@ -1393,7 +1470,8 @@ func (s *Service) loadTagsForArticles(ctx context.Context, raws []domain.RawArti
 		 ORDER BY t.name ASC`,
 		strings.Join(placeholders, ","),
 	)
-	rows, err := sqlx.Select[joinedTag](ctx, s.store, q, args...)
+	var rows []joinedTag
+	err := sqlx.SelectInto(ctx, s.store, &rows, q, args...)
 	if err != nil {
 		return out, err
 	}
@@ -1448,23 +1526,23 @@ func truncateForSummary(s string, maxRunes int) string {
 }
 
 func (s *Service) queryPublicAuthors(ctx context.Context) (PublicAuthorProfile, []PublicAuthorProfile, map[string]PublicAuthorProfile) {
-	rows, _ := sqlx.Select[domain.User](
-		ctx, s.store,
-		`SELECT id, username, display_name, avatar_url, bio, website_url, role
+	var rows []domain.User
+	_ = sqlx.SelectInto(ctx, s.store, &rows, `SELECT id, username, display_name, avatar_url, bio, website_url, role
 		 FROM users
 		 WHERE status = ? AND (role = ? OR role = ?)
 		 ORDER BY created_at ASC`,
-		domain.UserStatusActive, domain.RoleAdmin, domain.RoleEditor,
-	)
+		domain.UserStatusActive, domain.RoleAdmin, domain.RoleEditor)
+
 	type authorCnt struct {
+		_ [0]func()
+
 		AuthorID string `db:"author_id"`
 		Cnt      int    `db:"cnt"`
 	}
-	cntRows, _ := sqlx.Select[authorCnt](
-		ctx, s.store,
-		`SELECT author_id, COUNT(*) AS cnt FROM articles WHERE status = ? GROUP BY author_id`,
-		domain.ArticleStatusPublished,
-	)
+	var cntRows []authorCnt
+	_ = sqlx.SelectInto(ctx, s.store, &cntRows, `SELECT author_id, COUNT(*) AS cnt FROM articles WHERE status = ? GROUP BY author_id`,
+		domain.ArticleStatusPublished)
+
 	cntMap := make(map[string]int, len(cntRows))
 	for _, c := range cntRows {
 		cntMap[c.AuthorID] = c.Cnt
@@ -1618,14 +1696,15 @@ func (s *Service) ListRelatedArticles(ctx context.Context, cur domain.RawArticle
 		 ORDER BY a.published_at DESC`,
 		limit, 0,
 	)
-	if byTag, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store, tagSQL,
-		append([]any{cur.ID, cur.ID, domain.ArticleStatusPublished}, tagArgs...)...,
-	); err == nil {
-		for _, r := range byTag {
-			if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
-				seen[r.ID] = true
-				collected = append(collected, r)
+	{
+		var byTag []domain.RawArticle
+		if err := sqlx.SelectInto(ctx, s.store, &byTag, tagSQL,
+			append([]any{cur.ID, cur.ID, domain.ArticleStatusPublished}, tagArgs...)...); err == nil {
+			for _, r := range byTag {
+				if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
+					seen[r.ID] = true
+					collected = append(collected, r)
+				}
 			}
 		}
 	}
@@ -1638,17 +1717,18 @@ func (s *Service) ListRelatedArticles(ctx context.Context, cur domain.RawArticle
 			 ORDER BY published_at DESC`,
 			rem+4, 0,
 		)
-		if byCat, err := sqlx.Select[domain.RawArticle](
-			ctx, s.store, catSQL,
-			append([]any{cur.CategoryID, cur.ID, domain.ArticleStatusPublished}, catArgs...)...,
-		); err == nil {
-			for _, r := range byCat {
-				if len(collected) >= limit {
-					break
-				}
-				if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
-					seen[r.ID] = true
-					collected = append(collected, r)
+		{
+			var byCat []domain.RawArticle
+			if err := sqlx.SelectInto(ctx, s.store, &byCat, catSQL,
+				append([]any{cur.CategoryID, cur.ID, domain.ArticleStatusPublished}, catArgs...)...); err == nil {
+				for _, r := range byCat {
+					if len(collected) >= limit {
+						break
+					}
+					if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
+						seen[r.ID] = true
+						collected = append(collected, r)
+					}
 				}
 			}
 		}

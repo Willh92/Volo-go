@@ -91,6 +91,8 @@ func consumePasskeyChallengeOnce(purpose string, challengeB64 string, envExpires
 }
 
 type passkeyChallengeEnvelope struct {
+	_ [0]func()
+
 	ChallengeB64 string `json:"c"`
 	UserID       string `json:"u"`
 	Purpose      string `json:"p"` // "register" | "login"
@@ -102,6 +104,8 @@ type passkeyChallengeEnvelope struct {
 // PasskeyBeginResult contains both the browser PublicKeyCredentialCreationOptions/RequestOptions challenge
 // and the server-sealed state token to submit back on completion.
 type PasskeyBeginResult struct {
+	_ [0]func()
+
 	ChallengeB64URL        string            `json:"challenge"`
 	RPID                   string            `json:"rp_id"`
 	Origin                 string            `json:"origin"`
@@ -113,6 +117,8 @@ type PasskeyBeginResult struct {
 
 // VerifiedPasskeyRegistration holds validated credential material ready to persist in user_credentials.
 type VerifiedPasskeyRegistration struct {
+	_ [0]func()
+
 	CredentialIDB64URL string
 	PublicKeySPKIB64   string
 	COSEAlg            int
@@ -341,6 +347,8 @@ func verifyClientDataJSON(raw []byte, expectedType string, expectedChallengeB64 
 		return ErrPasskeyVerifyFailed
 	}
 	var cd struct {
+		_ [0]func()
+
 		Type        string `json:"type"`
 		Challenge   string `json:"challenge"`
 		Origin      string `json:"origin"`

@@ -14,11 +14,11 @@ import (
 )
 
 const (
-	MaxKVKeyBytes       = 191
-	MaxKVValueBytes     = 64 * 1024 // 64 KiB per value
-	MaxKVKeysPerPlugin  = 1000
-	maxKVListLimit      = 200
-	defaultKVListLimit  = 50
+	MaxKVKeyBytes      = 191
+	MaxKVValueBytes    = 64 * 1024 // 64 KiB per value
+	MaxKVKeysPerPlugin = 1000
+	maxKVListLimit     = 200
+	defaultKVListLimit = 50
 )
 
 // KVItem represents a key-value entry returned by ListPrefix.
@@ -68,14 +68,13 @@ func (kv *KVStore) Get(ctx context.Context, key string) (string, bool, error) {
 		return "", false, err
 	}
 	now := kv.nowFn().Unix()
-	row, err := sqlx.Get[domain.PluginKV](
-		ctx,
-		kv.store,
-		`SELECT plugin_id, k, value_text, value_int, expires_at, updated_at
+	var row domain.PluginKV
+	err = sqlx.GetInto(ctx,
+		kv.store, &row, `SELECT plugin_id, k, value_text, value_int, expires_at, updated_at
 		 FROM plugin_kv
 		 WHERE plugin_id = ? AND k = ?`,
-		kv.pluginID, k,
-	)
+		kv.pluginID, k)
+
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -246,8 +245,8 @@ func (kv *KVStore) ListPrefix(ctx context.Context, prefix string, limit int, aft
 	baseQuery += ` ORDER BY k ASC`
 	paginated, pageArgs := kv.store.Dialect().PaginateSQL(baseQuery, limit, 0)
 	args = append(args, pageArgs...)
-
-	rows, err := sqlx.Select[domain.PluginKV](ctx, kv.store, paginated, args...)
+	var rows []domain.PluginKV
+	err := sqlx.SelectInto(ctx, kv.store, &rows, paginated, args...)
 	if err != nil {
 		return nil, err
 	}

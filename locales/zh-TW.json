@@ -1603,6 +1603,7 @@
   "reader.err_invalid_credentials": "使用者名稱/信箱或密碼不正確",
   "reader.err_invalid_email": "請輸入有效的電子信箱地址",
   "reader.err_username_len": "使用者名稱長度需為 2～48 個字元",
+  "reader.err_username_sensitive": "暱稱包含不適合使用的詞語，請更換後再試",
   "reader.err_password_policy": "密碼長度不足或不符合安全要求",
   "reader.err_verify_code": "信箱驗證碼不正確或已過期",
   "reader.err_code_cooldown": "驗證碼發送過於頻繁，請等待 60 秒後再試",

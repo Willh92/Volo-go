@@ -47,6 +47,8 @@ type markdownImportDoc struct {
 }
 
 type parsedFrontmatter struct {
+	_ [0]func()
+
 	Title    string
 	Slug     string
 	DateMS   int64
@@ -169,8 +171,11 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 				}
 			} else if cleanCat := strings.TrimSpace(fm.Category); cleanCat != "" {
 				catSlug := sanitizeSlug(cleanCat)
-				if cat, gErr := sqlx.Get[domain.Category](r.Context(), tx, `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) OR slug = ?`, cleanCat, catSlug); gErr == nil {
-					catID = cat.ID
+				{
+					var cat domain.Category
+					if gErr := sqlx.GetInto(r.Context(), tx, &cat, `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) OR slug = ?`, cleanCat, catSlug); gErr == nil {
+						catID = cat.ID
+					}
 				}
 			}
 			savedRaw = domain.RawArticle{
@@ -229,11 +234,8 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 	}
 
 	s.invalidateMediaRefCache()
-	s.recordAuditLog(r, actor, "article.batch_import", "article", fmt.Sprintf("count=%d", len(importedSlugs)), map[string]any{"slugs": importedSlugs})
-	writeJSON(w, http.StatusOK, map[string]any{
-		"imported_count": len(importedSlugs),
-		"slugs":          importedSlugs,
-	})
+	s.auditKV(r, actor, "article.batch_import", "article", fmt.Sprintf("count=%d", len(importedSlugs)), "slugs", importedSlugs)
+	writeJSONKV(w, http.StatusOK, "imported_count", len(importedSlugs), "slugs", importedSlugs)
 }
 
 func extractMarkdownDocsFromZipBytes(zipData []byte, maxTotalBytes int64, maxFiles int) ([]markdownImportDoc, int64, error) {
@@ -557,7 +559,8 @@ func (s *AppServer) checkSingleFriendLinkWithClient(ctx context.Context, client 
 }
 
 func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
-	links, err := sqlx.Select[domain.Link](ctx, s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
+	var links []domain.Link
+	err := sqlx.SelectInto(ctx, s.deps.Store, &links, `SELECT * FROM links ORDER BY sort_order ASC`)
 	if err != nil {
 		return 0, err
 	}
@@ -585,6 +588,8 @@ func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
 // --- Follow RSS / Atom Reader Sync (SSRF-Safe) ---
 
 type parsedFeedEntry struct {
+	_ [0]func()
+
 	GUID      string
 	Title     string
 	URL       string
@@ -677,9 +682,10 @@ func (s *AppServer) syncSingleFollowFeedWithClient(ctx context.Context, client *
 	pruneArgs := make([]any, 0, 1+len(prunePageArgs))
 	pruneArgs = append(pruneArgs, fw.ID)
 	pruneArgs = append(pruneArgs, prunePageArgs...)
-	staleRows, _ := sqlx.Select[struct {
+	var staleRows []struct {
 		ID string `db:"id"`
-	}](ctx, s.deps.Store, pruneSQL, pruneArgs...)
+	}
+	_ = sqlx.SelectInto(ctx, s.deps.Store, &staleRows, pruneSQL, pruneArgs...)
 	if len(staleRows) > 0 {
 		ph := make([]string, len(staleRows))
 		delArgs := make([]any, len(staleRows))
@@ -698,7 +704,8 @@ func (s *AppServer) syncSingleFollowFeedWithClient(ctx context.Context, client *
 }
 
 func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
-	follows, err := sqlx.Select[domain.Follow](ctx, s.deps.Store, `SELECT * FROM follows ORDER BY sort_order ASC`)
+	var follows []domain.Follow
+	err := sqlx.SelectInto(ctx, s.deps.Store, &follows, `SELECT * FROM follows ORDER BY sort_order ASC`)
 	if err != nil {
 		return 0, err
 	}
@@ -734,6 +741,8 @@ func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
 
 func parseRSSOrAtomFeed(raw []byte) ([]parsedFeedEntry, error) {
 	type rssItem struct {
+		_ [0]func()
+
 		Title       string `xml:"title"`
 		Link        string `xml:"link"`
 		GUID        string `xml:"guid"`
@@ -772,10 +781,14 @@ func parseRSSOrAtomFeed(raw []byte) ([]parsedFeedEntry, error) {
 	}
 
 	type atomLink struct {
+		_ [0]func()
+
 		Href string `xml:"href,attr"`
 		Rel  string `xml:"rel,attr"`
 	}
 	type atomEntry struct {
+		_ [0]func()
+
 		ID      string     `xml:"id"`
 		Title   string     `xml:"title"`
 		Links   []atomLink `xml:"link"`
@@ -863,6 +876,8 @@ func (s *AppServer) refreshGitHubRepositories(ctx context.Context, usernameOverr
 	}
 
 	type ghRawRepo struct {
+		_ [0]func()
+
 		Name            string `json:"name"`
 		FullName        string `json:"full_name"`
 		Description     string `json:"description"`
@@ -952,11 +967,7 @@ func (s *AppServer) refreshGitHubRepositories(ctx context.Context, usernameOverr
 		return strings.ToLower(items[i].FullName) < strings.ToLower(items[j].FullName)
 	})
 
-	patchBytes, _ := json.Marshal(map[string]any{
-		"github_username":  uname,
-		"github_repos":     items,
-		"github_synced_at": time.Now().UnixMilli(),
-	})
+	patchBytes, _ := json.Marshal(kvMap("github_username", uname, "github_repos", items, "github_synced_at", time.Now().UnixMilli()))
 	_, _, err := s.deps.Settings.PatchDomain(ctx, domain.SettingsDomainSEO, patchBytes, 0)
 	return items, err
 }
@@ -1068,9 +1079,8 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 	contentStr := md.String()
 	words, mins := computeReadingMetrics(contentStr)
 	now := time.Now().UnixMilli()
-
-	existing, err := sqlx.Get[domain.RawArticle](ctx, s.deps.Store,
-		`SELECT * FROM articles WHERE slug IN ('github', 'my-github-repos') OR legacy_permalink IN ('/my-github-repos', '/github') ORDER BY updated_at DESC LIMIT 1`)
+	var existing domain.RawArticle
+	err := sqlx.GetInto(ctx, s.deps.Store, &existing, `SELECT * FROM articles WHERE slug IN ('github', 'my-github-repos') OR legacy_permalink IN ('/my-github-repos', '/github') ORDER BY updated_at DESC LIMIT 1`)
 	isCreate := err != nil || existing.ID == ""
 	wasPublished := !isCreate && existing.Status == domain.ArticleStatusPublished
 
@@ -1185,10 +1195,9 @@ func (s *AppServer) pushIndexNowURLs(ctx context.Context, baseURL string) (int, 
 	if err != nil || parsedBase.Host == "" {
 		return 0, errors.New("valid public base URL required for IndexNow")
 	}
-
-	// Strictly exclude password-protected posts from IndexNow submission!
-	rows, err := sqlx.Select[domain.RawArticle](ctx, s.deps.Store,
-		`SELECT slug FROM articles WHERE status = ? AND password_ciphertext = '' ORDER BY updated_at DESC LIMIT 50`,
+	var rows []domain.// Strictly exclude password-protected posts from IndexNow submission!
+	RawArticle
+	err = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT slug FROM articles WHERE status = ? AND password_ciphertext = '' ORDER BY updated_at DESC LIMIT 50`,
 		domain.ArticleStatusPublished)
 	if err != nil {
 		return 0, err
@@ -1199,12 +1208,7 @@ func (s *AppServer) pushIndexNowURLs(ctx context.Context, baseURL string) (int, 
 		urls = append(urls, strings.TrimRight(baseURL, "/")+visibility.ArticlePath(r.Slug))
 	}
 
-	payload, _ := json.Marshal(map[string]any{
-		"host":        parsedBase.Hostname(),
-		"key":         seo.IndexNowKey,
-		"keyLocation": strings.TrimRight(baseURL, "/") + "/" + seo.IndexNowKey + ".txt",
-		"urlList":     urls,
-	})
+	payload, _ := json.Marshal(kvMap("host", parsedBase.Hostname(), "key", seo.IndexNowKey, "keyLocation", strings.TrimRight(baseURL, "/")+"/"+seo.IndexNowKey+".txt", "urlList", urls))
 	client := s.deps.OutboundDialer.NewHTTPClient(8 * time.Second)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.indexnow.org/indexnow", bytes.NewReader(payload))
 	if err != nil {

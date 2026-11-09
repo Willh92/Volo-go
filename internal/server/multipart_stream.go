@@ -15,6 +15,8 @@ const (
 )
 
 type streamedMultipartFile struct {
+	_ [0]func()
+
 	TempPath     string
 	OrigFilename string
 	SizeBytes    int64
@@ -22,6 +24,8 @@ type streamedMultipartFile struct {
 }
 
 type inMemoryMultipartFile struct {
+	_ [0]func()
+
 	FieldName string
 	Filename  string
 	Data      []byte

@@ -4,6 +4,8 @@ import "strings"
 
 // SocialLink represents an item in the dynamic social profile links list (replacing legacy fixed 21 usite* fields).
 type SocialLink struct {
+	_ [0]func()
+
 	ID    string `json:"id"`
 	Label string `json:"label"`
 	Icon  string `json:"icon"`
@@ -12,6 +14,8 @@ type SocialLink struct {
 
 // SiteSettings ("site" domain).
 type SiteSettings struct {
+	_ [0]func()
+
 	Initialized         bool              `json:"initialized"`
 	Title               string            `json:"title"`
 	Subtitle            string            `json:"subtitle"`
@@ -34,6 +38,8 @@ type SiteSettings struct {
 
 // ReadingSettings ("reading" domain).
 type ReadingSettings struct {
+	_ [0]func()
+
 	ListStyle             string   `json:"list_style"` // summary | title_only | full
 	PostsPerPage          int      `json:"posts_per_page"`
 	RecentPostsCount      int      `json:"recent_posts_count"`
@@ -59,6 +65,8 @@ type ReadingSettings struct {
 
 // PodcastChannelConfig holds full Apple/Spotify iTunes Podcast metadata inside "feed" domain.
 type PodcastChannelConfig struct {
+	_ [0]func()
+
 	Enabled       bool   `json:"enabled"`
 	Title         string `json:"title"`
 	Subtitle      string `json:"subtitle"`
@@ -76,15 +84,19 @@ type PodcastChannelConfig struct {
 
 // FeedSettings ("feed" domain).
 type FeedSettings struct {
-	OutputMode            string               `json:"output_mode"` // summary | full
-	ItemCount             int                  `json:"item_count"`
-	EnableLLMSTxt         bool                 `json:"enable_llms_txt"`
-	EnableRawMarkdown     bool                 `json:"enable_raw_markdown"`
-	Podcast               PodcastChannelConfig `json:"podcast"`
+	_ [0]func()
+
+	OutputMode        string               `json:"output_mode"` // summary | full
+	ItemCount         int                  `json:"item_count"`
+	EnableLLMSTxt     bool                 `json:"enable_llms_txt"`
+	EnableRawMarkdown bool                 `json:"enable_raw_markdown"`
+	Podcast           PodcastChannelConfig `json:"podcast"`
 }
 
 // GitHubRepoItem represents a cached public GitHub repository for showcase & /github-stats/{user}.svg.
 type GitHubRepoItem struct {
+	_ [0]func()
+
 	Name        string `json:"name"`
 	FullName    string `json:"full_name"`
 	Description string `json:"description"`
@@ -100,6 +112,8 @@ type GitHubRepoItem struct {
 
 // SEOSettings ("seo" domain).
 type SEOSettings struct {
+	_ [0]func()
+
 	MetaKeywords       string           `json:"meta_keywords"`
 	MetaDescription    string           `json:"meta_description"`
 	DefaultOGImageURL  string           `json:"default_og_image_url"`
@@ -114,6 +128,8 @@ type SEOSettings struct {
 
 // StorageSettings ("storage" domain). Secrets are stored exclusively in SecretCiphertext!
 type StorageSettings struct {
+	_ [0]func()
+
 	ActiveDriver    string `json:"active_driver"` // local | s3
 	LocalDir        string `json:"local_dir"`
 	LocalKeyPrefix  string `json:"local_key_prefix"`
@@ -138,6 +154,8 @@ type StorageSecrets struct {
 
 // NotificationsSettings ("notifications" domain). Secrets are stored in SecretCiphertext!
 type NotificationsSettings struct {
+	_ [0]func()
+
 	SMTPEnabled          bool   `json:"smtp_enabled"`
 	SMTPHost             string `json:"smtp_host"`
 	SMTPPort             int    `json:"smtp_port"`
@@ -158,18 +176,20 @@ type NotificationsSecrets struct {
 
 // SecuritySettings ("security" domain).
 type SecuritySettings struct {
-	RiskControlEnabled   bool   `json:"risk_control_enabled"`
-	WAFEnabled           bool   `json:"waf_enabled"`
-	WAFWindowSeconds     int    `json:"waf_window_seconds"`
-	WAFMaxRequests       int    `json:"waf_max_requests"`
-	GeoPolicyActive      bool   `json:"geo_policy_active"`
-	GeoDefaultAction     string `json:"geo_default_action"` // allow | deny
-	GeoUnknownAction     string `json:"geo_unknown_action"` // allow | deny
-	GeoIPDir             string `json:"geoip_dir"`
-	TOTPRequiredScope    string `json:"totp_required_scope"` // off | admin | staff
-	TOTPRememberDays     int    `json:"totp_remember_days"`
-	TOTPWindowSteps      int    `json:"totp_window_steps"`
-	DynamicLoginPath     string `json:"dynamic_login_path"`
+	_ [0]func()
+
+	RiskControlEnabled bool   `json:"risk_control_enabled"`
+	WAFEnabled         bool   `json:"waf_enabled"`
+	WAFWindowSeconds   int    `json:"waf_window_seconds"`
+	WAFMaxRequests     int    `json:"waf_max_requests"`
+	GeoPolicyActive    bool   `json:"geo_policy_active"`
+	GeoDefaultAction   string `json:"geo_default_action"` // allow | deny
+	GeoUnknownAction   string `json:"geo_unknown_action"` // allow | deny
+	GeoIPDir           string `json:"geoip_dir"`
+	TOTPRequiredScope  string `json:"totp_required_scope"` // off | admin | staff
+	TOTPRememberDays   int    `json:"totp_remember_days"`
+	TOTPWindowSteps    int    `json:"totp_window_steps"`
+	DynamicLoginPath   string `json:"dynamic_login_path"`
 }
 
 // SecuritySecrets is encrypted via AES-256-GCM into settings.secret_ciphertext for domain="security".
@@ -179,6 +199,8 @@ type SecuritySecrets struct {
 
 // AppearanceSettings ("appearance" domain).
 type AppearanceSettings struct {
+	_ [0]func()
+
 	ActiveTheme  string                    `json:"active_theme"`            // volo-studio or external theme id
 	MobileTheme  string                    `json:"mobile_theme,omitempty"`  // optional separate theme id for mobile devices
 	Accent       string                    `json:"accent"`                  // forest | ocean | teal | amber | plum | rose
@@ -189,23 +211,25 @@ type AppearanceSettings struct {
 
 // BackupSettings ("backup" domain).
 type BackupSettings struct {
-	LocalAutoEnabled  bool   `json:"local_auto_enabled"`
-	LocalIntervalHrs  int    `json:"local_interval_hours"`
-	LocalKeepCount    int    `json:"local_keep_count"`
-	IncludeMediaInAuto bool  `json:"include_media_in_auto"`
-	RemoteEnabled     bool   `json:"remote_enabled"`
-	RemoteProtocol    string `json:"remote_protocol"` // s3 | webdav
-	WebDAVURL         string `json:"webdav_url"`
-	WebDAVUser        string `json:"webdav_user"`
-	WebDAVDir         string `json:"webdav_dir"`
-	WebDAVPasswordSet bool   `json:"webdav_password_set"`
-	S3Endpoint        string `json:"s3_endpoint"`
-	S3Region          string `json:"s3_region"`
-	S3Bucket          string `json:"s3_bucket"`
-	S3AccessKey       string `json:"s3_access_key"`
-	S3Prefix          string `json:"s3_prefix"`
-	S3PathStyle       bool   `json:"s3_path_style"`
-	S3SecretKeySet    bool   `json:"s3_secret_key_set"`
+	_ [0]func()
+
+	LocalAutoEnabled   bool   `json:"local_auto_enabled"`
+	LocalIntervalHrs   int    `json:"local_interval_hours"`
+	LocalKeepCount     int    `json:"local_keep_count"`
+	IncludeMediaInAuto bool   `json:"include_media_in_auto"`
+	RemoteEnabled      bool   `json:"remote_enabled"`
+	RemoteProtocol     string `json:"remote_protocol"` // s3 | webdav
+	WebDAVURL          string `json:"webdav_url"`
+	WebDAVUser         string `json:"webdav_user"`
+	WebDAVDir          string `json:"webdav_dir"`
+	WebDAVPasswordSet  bool   `json:"webdav_password_set"`
+	S3Endpoint         string `json:"s3_endpoint"`
+	S3Region           string `json:"s3_region"`
+	S3Bucket           string `json:"s3_bucket"`
+	S3AccessKey        string `json:"s3_access_key"`
+	S3Prefix           string `json:"s3_prefix"`
+	S3PathStyle        bool   `json:"s3_path_style"`
+	S3SecretKeySet     bool   `json:"s3_secret_key_set"`
 }
 
 // BackupSecrets is encrypted via AES-256-GCM into settings.secret_ciphertext for domain="backup".
@@ -216,6 +240,8 @@ type BackupSecrets struct {
 
 // SettingsSnapshot is an immutable hot-reloaded in-memory snapshot of all domain settings.
 type SettingsSnapshot struct {
+	_ [0]func()
+
 	Site          SiteSettings          `json:"site"`
 	Reading       ReadingSettings       `json:"reading"`
 	Feed          FeedSettings          `json:"feed"`

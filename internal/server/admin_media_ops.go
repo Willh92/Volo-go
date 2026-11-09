@@ -26,6 +26,8 @@ import (
 
 // MediaAssetView enriches MediaAsset with live reference counts and orphan status for the Admin Media Library.
 type MediaAssetView struct {
+	_ [0]func()
+
 	domain.MediaAsset
 	RefCount int  `json:"ref_count"`
 	IsOrphan bool `json:"is_orphan"`
@@ -98,10 +100,11 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) int {
 	}
 
 	existingKeys := make(map[string]struct{})
-	rows, err := sqlx.Select[struct {
+	var rows []struct {
 		ObjectKey string `db:"object_key"`
 		PublicURL string `db:"public_url"`
-	}](ctx, s.deps.Store, `SELECT object_key, public_url FROM media_assets`)
+	}
+	err = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT object_key, public_url FROM media_assets`)
 	if err == nil {
 		for _, r := range rows {
 			k := strings.TrimLeft(strings.TrimSpace(r.ObjectKey), "/")
@@ -329,12 +332,12 @@ func (s *AppServer) cachedOrComputeOrphanCount(
 		}
 		s.mediaRefCacheMu.Unlock()
 	}
-
-	keyRows, _ := sqlx.Select[struct {
+	var keyRows []struct {
 		StorageDriver string `db:"storage_driver"`
 		ObjectKey     string `db:"object_key"`
 		PublicURL     string `db:"public_url"`
-	}](ctx, s.deps.Store, `SELECT storage_driver, object_key, public_url FROM media_assets WHERE `+whereSQL, args...)
+	}
+	_ = sqlx.SelectInto(ctx, s.deps.Store, &keyRows, `SELECT storage_driver, object_key, public_url FROM media_assets WHERE `+whereSQL, args...)
 	orphanCnt := 0
 	for _, kr := range keyRows {
 		if media.AssetRefCountFromTokens(tokenCounts, domain.MediaAsset{
@@ -457,8 +460,8 @@ func (s *AppServer) queryAdminMediaPage(
 	}
 
 	if usage == "unused" || usage == "orphan" || usage == "used" {
-		rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store,
-			`SELECT * FROM media_assets WHERE `+whereSQL+` ORDER BY `+orderClause, args...)
+		var rows []domain.MediaAsset
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT * FROM media_assets WHERE `+whereSQL+` ORDER BY `+orderClause, args...)
 		if len(rows) == 0 {
 			return []MediaAssetView{}, 0, allTotal, 0, 0
 		}
@@ -508,8 +511,8 @@ func (s *AppServer) queryAdminMediaPage(
 	fullArgs := make([]any, 0, len(args)+len(pageArgs))
 	fullArgs = append(fullArgs, args...)
 	fullArgs = append(fullArgs, pageArgs...)
-
-	rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store, paginatedSQL, fullArgs...)
+	var rows []domain.MediaAsset
+	_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, paginatedSQL, fullArgs...)
 
 	orphanCnt := 0
 	var refCounts []int
@@ -563,8 +566,8 @@ func (s *AppServer) scanOrCleanOrphans(ctx context.Context, deleteOrphans bool) 
 		}
 		return orphans, freed, nil
 	}
-
-	rows, err := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store, `SELECT * FROM media_assets ORDER BY created_at DESC`)
+	var rows []domain.MediaAsset
+	err := sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT * FROM media_assets ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -727,6 +730,8 @@ func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.R
 				req.Header.Set("User-Agent", "Volo-go/"+ver)
 				if resp, rErr := cli.Do(req); rErr == nil {
 					var meta struct {
+						_ [0]func()
+
 						StargazersCount int    `json:"stargazers_count"`
 						ForksCount      int    `json:"forks_count"`
 						HTMLURL         string `json:"html_url"`
@@ -745,6 +750,8 @@ func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.R
 				relReq.Header.Set("User-Agent", "Volo-go/"+ver)
 				if resp, rErr := cli.Do(relReq); rErr == nil {
 					var rel struct {
+						_ [0]func()
+
 						TagName string `json:"tag_name"`
 					}
 					if resp.StatusCode == http.StatusOK && json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&rel) == nil && strings.TrimSpace(rel.TagName) != "" {
@@ -772,20 +779,5 @@ func (s *AppServer) handleAdminAboutProjectInfo(w http.ResponseWriter, r *http.R
 	}
 	hasUpdate := latestTag != "" && CompareSemVer(latestTag, ver) > 0
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"project_name":   "Volo-go",
-		"version":        ver,
-		"latest_version": latestTag,
-		"has_update":     hasUpdate,
-		"go_version":     runtime.Version(),
-		"os_arch":        runtime.GOOS + "/" + runtime.GOARCH,
-		"db_dialect":     s.deps.Store.Dialect().Name(),
-		"repo_url":       repoURL,
-		"issues_url":     repoURL + "/issues",
-		"releases_url":   repoURL + "/releases",
-		"license":        "Apache-2.0",
-		"stars":          stars,
-		"forks":          forks,
-		"live_fetched":   liveOK,
-	})
+	writeJSONKV(w, http.StatusOK, "project_name", "Volo-go", "version", ver, "latest_version", latestTag, "has_update", hasUpdate, "go_version", runtime.Version(), "os_arch", runtime.GOOS+"/"+runtime.GOARCH, "db_dialect", s.deps.Store.Dialect().Name(), "repo_url", repoURL, "issues_url", repoURL+"/issues", "releases_url", repoURL+"/releases", "license", "Apache-2.0", "stars", stars, "forks", forks, "live_fetched", liveOK)
 }

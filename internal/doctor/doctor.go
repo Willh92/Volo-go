@@ -236,8 +236,8 @@ func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.
 
 	// Verify existing encrypted secrets in settings table can be opened with active KeyRing
 	if store != nil {
-		rows, qErr := sqlx.Select[domain.SettingRecord](ctx, store,
-			`SELECT domain, secret_ciphertext FROM settings WHERE secret_ciphertext <> ''`)
+		var rows []domain.SettingRecord
+		qErr := sqlx.SelectInto(ctx, store, &rows, `SELECT domain, secret_ciphertext FROM settings WHERE secret_ciphertext <> ''`)
 		if qErr == nil {
 			for _, r := range rows {
 				if _, oErr := cfg.KeyRing.OpenString(r.SecretCiphertext, "settings:"+r.Domain); oErr != nil {
@@ -284,10 +284,10 @@ func checkDatabase(ctx context.Context, store *sqlx.Store) CheckResult {
 	}
 	latency := time.Since(start)
 	dName := store.Dialect().Name()
-
-	verRows, err := sqlx.Select[struct {
+	var verRows []struct {
 		Version int `db:"version"`
-	}](ctx, store, `SELECT version FROM schema_migrations ORDER BY version DESC`)
+	}
+	err := sqlx.SelectInto(ctx, store, &verRows, `SELECT version FROM schema_migrations ORDER BY version DESC`)
 	if err != nil || len(verRows) == 0 {
 		latStr := latency.Round(100 * time.Microsecond).String()
 		return CheckResult{

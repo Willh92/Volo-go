@@ -74,6 +74,8 @@ var allowedSlotNames = map[string]bool{
 // Manifest defines the declarative metadata, permission sandbox, UI slots, cron schedules,
 // and localized configuration JSON Schema of a Volo-go plugin (manifest.json).
 type Manifest struct {
+	_ [0]func()
+
 	ID             string            `json:"id"`
 	Version        string            `json:"version"`
 	MinHostVersion string            `json:"min_host_version,omitempty"`
@@ -93,6 +95,8 @@ type Manifest struct {
 
 // SlotSpec declares a UI injection slot registration.
 type SlotSpec struct {
+	_ [0]func()
+
 	Slot        string             `json:"slot"`
 	Persist     bool               `json:"persist,omitempty"` // Survives PJAX navigation outside #pjax via data-volo-persist
 	HTML        string             `json:"html,omitempty"`
@@ -104,6 +108,8 @@ type SlotSpec struct {
 
 // QuickInsertAction describes an extensible toolbar snippet in the CodeMirror 6 editor drawer.
 type QuickInsertAction struct {
+	_ [0]func()
+
 	ID       string            `json:"id"`
 	Label    map[string]string `json:"label"`
 	Icon     string            `json:"icon,omitempty"`
@@ -112,6 +118,8 @@ type QuickInsertAction struct {
 
 // CronSpec declares a managed periodic background callback.
 type CronSpec struct {
+	_ [0]func()
+
 	Name            string `json:"name"`
 	IntervalSeconds int    `json:"interval_seconds"`
 	Handler         string `json:"handler"`
@@ -119,6 +127,8 @@ type CronSpec struct {
 
 // ConfigField describes a single field in a plugin's declarative configuration form.
 type ConfigField struct {
+	_ [0]func()
+
 	Key         string            `json:"key"`
 	Type        string            `json:"type"` // string | text | textarea | number | boolean | select | url | color | image | sortable_list
 	Secret      bool              `json:"secret,omitempty"`

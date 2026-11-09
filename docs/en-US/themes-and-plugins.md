@@ -95,7 +95,7 @@ Themes can optionally declare selectable standalone page layouts in `theme.json`
 
 ## 2. Sandboxed Plugin Development (`manifest.json` + `goja`)
 
-`Volo-go` has zero hardcoded plugin names in host code. Every plugin — including [`plugins/kanbanniang`](../../plugins/kanbanniang/) — runs through the declarative `pkg/plugin` permission sandbox.
+`Volo-go` has zero hardcoded plugin names in host code. Every plugin — including [`plugins/kanbanniang`](../../plugins/kanbanniang/) and [`plugins/sensitive-words`](../../plugins/sensitive-words/) — runs through the declarative `pkg/plugin` permission sandbox.
 
 ### 2.1 Directory Layout & `.zip` Hot-Installation
 
@@ -199,24 +199,24 @@ Both `theme.json` and `manifest.json` share a unified `config_schema` type syste
      - `crypto`: Unlocks `volo.crypto` (`sha256`, `hmacSha256`, `randomUUID`);
      - `site:read`: Unlocks `volo.site.info()` for read-only site metadata;
      - `ratelimit`: Unlocks `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)` sliding-window rate limiting (also enabled automatically when `http:routes` is declared);
-     - `cron`: Permits scheduled background jobs declared in `manifest.json` `cron`;
+     - `cron`: Connects the plugin to the host's **unified min-heap scheduled task registry (`CronRegistry`)** via static `manifest.json` `cron` entries or dynamic `volo.cron` registration (zero idle timer wakeups when no jobs are registered, non-reentrant coalesced execution);
    - **Domain Hooks** (`hooks:*` or fine-grained tokens):
      - Articles: `hooks:article.published`, `hooks:article.updated`, `hooks:article.deleted`;
      - Pages: `hooks:page.published`, `hooks:page.updated`, `hooks:page.deleted`;
      - Comments: `hooks:comment.before_create`, `hooks:comment.created`, `hooks:comment.moderated`;
      - Rendering Pipeline: `hooks:render.pre_markdown` (transforms `content_md` on unlocked articles without `:::lock` blocks prior to Markdown parsing) and `hooks:render.post_html` (transforms rendered HTML prior to XSS sanitization);
    - **UI Slots** (`ui:slots` or per-slot tokens): `slots:public.head`, `slots:public.header`, `slots:public.sidebar`, `slots:article.before_content`, `slots:article.after_content`, `slots:comment.before`, `slots:comment.after`, `slots:public.footer`, `slots:editor.quick_insert`, `slots:admin.dashboard_card`;
-   - **HTTP & Networking**: `http:routes` (custom `/plugins/<id>/api/*` endpoints), `http:raw_headers` (exposes safe webhook verification headers such as `x-hub-signature-256`, `x-signature`, `stripe-signature`, `authorization`), `http.outbound:<hostname>` / `allowed_hosts` (explicit hostname or `*.domain.tld` allowlist enforced with `OutboundSafeDialer` SSRF protection);
+   - **HTTP & Networking**: `http:routes` (custom `/plugins/<id>/api/*` endpoints), `http:raw_headers` (exposes safe webhook verification headers such as `x-hub-signature-256`, `x-signature`, `stripe-signature`, `authorization`), `http:outbound` + `http.outbound:<hostname>` / `allowed_hosts` (explicit hostname allowlist or validated `type: "url"` config target hostnames enforced with `OutboundSafeDialer` SSRF protection);
    - **Extension Providers**:
      - `provider:storage`: Registers an external media/backup `StorageProvider` when `main.js` defines `storagePut(objectKey, bodyBase64, contentType)` (returning a public URL string or `{ url }`), plus optional `storageDelete(objectKey)` and `storageHealthCheck()`. Uploads gracefully fall back to local disk if an external provider is unavailable;
      - `provider:oidc`: Registers a third-party `OIDCProvider` / `OIDCAdvancedProvider` for federated sign-in when `main.js` defines `oidcAuthURL(state, redirectURI, opts)` (`opts`: `{ nonce, code_challenge, code_challenge_method }`; missing `nonce` or `code_challenge` query parameters are automatically appended to valid `http`/`https` URLs, and 2-argument JS functions remain 100% compatible) and `oidcExchange(code, redirectURI, opts)` (`opts`: `{ nonce, code_verifier }`, returning `{ subject, email, email_verified, nonce, display_name, avatar_url }` with `email_verified` strictly defaulting to `false` when absent), plus optional `oidcProviderInfo()` returning `{ id, display_name }`;
      - `provider:notifier`: Registers a `NotifierProvider` invoking `sendNotification(event)` or `notifySend(event)` alongside SMTP and outbound webhooks;
-     - `provider:antispam`: Registers a comment `AntiSpamProvider` when `main.js` defines `checkSpam(input)` returning `{ action: "allow" | "moderate" | "reject", reason, score }`;
+     - `provider:antispam`: Registers a comment & nickname `AntiSpamProvider` / `NicknameAntiSpamProvider` when `main.js` defines `checkSpam(input)` (returning `{ action: "pass" | "allow" | "moderate" | "reject", reason, score }`) and optional `checkNickname(input)`, uniformly screening **comment bodies, guest/reader comment nicknames, reader email registration (including send-code preflight without consuming verification codes on rejection), and OIDC auto-provisioned handles**; the official [`plugins/sensitive-words`](../../plugins/sensitive-words/) plugin bundles a sanitized 64k+ categorized `houbb/sensitive-word` dictionary compiled into a 16-byte/state zero-GC-pointer BFS-CSR Aho-Corasick automaton with Traditional-to-Simplified folding, anti-obfuscation piercing, span-safe allowlists, and online feed conversion;
    - **Protected Content Opt-In**: `articles:read_protected` (without this explicit permission, password-protected article payloads and CommonMark-nested `:::lock ... :::` blocks are automatically stripped by both `DispatchHook` and `DispatchArticleHook` before reaching any JS plugin).
 
 2. **Circuit Breakers, Resource Caps, XSS Sanitization & CSS Scoping**:
    - Every sandbox invocation runs under strict step budgets, wall-clock timeouts, cycle/depth caps (`Export` / `JSON.stringify`), and a `4 MiB` string allocation ceiling; repeated failures trip the plugin's **Circuit Breaker (`CircuitOpen`)** so a misbehaving plugin never stalls reader traffic;
-   - `volo.on(hookName, handlerFn)` is frozen once top-level module evaluation completes, rejecting request-time registrations so listeners can never leak across requests;
+   - `volo.on(hookName, handlerFn)` is frozen once top-level module evaluation completes, rejecting request-time registrations so listeners can never leak across requests; exporting optional `onConfigChange(newCfg)` allows zero-restart hot-reloading of cached matchers and scheduled tasks when configuration is updated;
    - Both `render.post_html` and `admin.dashboard_card` outputs are sanitized against `<script>`, `<iframe>`, `on*` event attributes, and `javascript:`/`data:` URLs;
    - Plugin CSS custom properties must use `--volo-plugin-<id>-*` inside `.volo-plugin-scope[data-plugin="<id>"]`.
 
@@ -231,10 +231,13 @@ Host capability bridge `volo` (alias `ctx`):
 - `volo.escapeHTML(str)`: Safely escape untrusted strings before interpolating into slot HTML;
 - `volo.config.get(key)` / `volo.config.all()`: Read validated plugin configuration (including decrypted secrets inside the sandbox);
 - `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`: Scoped KV storage (requires `kv` / `kv:read`) with cursor pagination via `afterKey`;
+- `volo.assets.readText(relPath)`: Read-only access to bundled text or `.gz` files confined strictly inside the plugin directory (symlink-escape safe, `4 MiB` cap);
+- `volo.wordFilter.{compile, match, contains, has, stats, clear, revision, syncRemote}`: Cross-VM shared Go-native 16B/state zero-GC-pointer BFS-CSR Aho-Corasick word filter supporting direct streaming compilation of bundled `.gz` dictionaries and online conversion of upstream `houbb` feeds without allocating large JS strings;
+- `volo.cron.{register, unregister, trigger, list}`: Dynamic periodic task management backed by the unified `CronRegistry` (requires `cron`);
 - `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`: Cryptographic helpers (requires `crypto`);
 - `volo.site.info()`: Read-only site metadata snapshot (requires `site:read`);
 - `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)`: Sliding-window rate limiter (requires `ratelimit` or `http:routes`);
-- `volo.http.fetch(url, options?)`: SSRF-guarded outbound HTTP client restricted to declared `http.outbound:<host>` / `allowed_hosts`;
+- `volo.http.fetch(url, options?)`: SSRF-guarded outbound HTTP client restricted to declared `http.outbound:<host>` / `allowed_hosts` / `type: "url"` targets;
 - `volo.i18n.t(locale, key, vars?)` and `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`: Localization lookup and structured plugin diagnostics.
 
 ```javascript

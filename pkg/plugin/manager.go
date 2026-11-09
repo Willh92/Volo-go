@@ -58,6 +58,8 @@ func (e *HookRejectedError) Error() string {
 
 // APIRequest represents a sanitized HTTP request routed to /plugins/<id>/api/*.
 type APIRequest struct {
+	_ [0]func()
+
 	Method         string            `json:"method"`
 	Path           string            `json:"path"`
 	Query          map[string]string `json:"query"`
@@ -70,6 +72,8 @@ type APIRequest struct {
 
 // APIResponse represents a plugin's HTTP response from /plugins/<id>/api/*.
 type APIResponse struct {
+	_ [0]func()
+
 	Status      int               `json:"status"`
 	ContentType string            `json:"content_type"`
 	Headers     map[string]string `json:"headers,omitempty"`
@@ -78,6 +82,8 @@ type APIResponse struct {
 
 // SlotRenderContext carries sanitized page metadata into UI slot renderers.
 type SlotRenderContext struct {
+	_ [0]func()
+
 	Locale      string `json:"locale"`
 	Path        string `json:"path"`
 	ArticleID   string `json:"article_id,omitempty"`
@@ -87,6 +93,8 @@ type SlotRenderContext struct {
 
 // RenderedSlot represents a single rendered UI injection fragment.
 type RenderedSlot struct {
+	_ [0]func()
+
 	PluginID string `json:"plugin_id"`
 	Slot     string `json:"slot"`
 	Persist  bool   `json:"persist"`
@@ -96,6 +104,8 @@ type RenderedSlot struct {
 // ArticleHookPayload carries article event data to plugin hooks.
 // Untrusted/external plugins ALWAYS receive a redacted copy via RedactArticleForPlugin.
 type ArticleHookPayload struct {
+	_ [0]func()
+
 	ID                  string `json:"id"`
 	Title               string `json:"title"`
 	Slug                string `json:"slug"`
@@ -113,6 +123,8 @@ type ArticleHookPayload struct {
 
 // PageHookPayload carries standalone page lifecycle event data to plugin hooks.
 type PageHookPayload struct {
+	_ [0]func()
+
 	ID       string `json:"id"`
 	Title    string `json:"title"`
 	Slug     string `json:"slug"`
@@ -122,6 +134,8 @@ type PageHookPayload struct {
 
 // CommentModeratedHookPayload carries comment moderation status transitions to plugin hooks.
 type CommentModeratedHookPayload struct {
+	_ [0]func()
+
 	ID         string `json:"id"`
 	TargetType string `json:"target_type"`
 	TargetID   string `json:"target_id"`
@@ -157,15 +171,25 @@ func (BaseBuiltinPlugin) ServeAPI(context.Context, APIRequest) (APIResponse, err
 func (BaseBuiltinPlugin) RunCron(context.Context, string) error { return nil }
 func (BaseBuiltinPlugin) AllowProtectedArticles() bool          { return false }
 
+// ConfigChangeListener is an optional interface that BuiltinPlugin implementations may implement
+// to react immediately when plugin configuration is updated at runtime (e.g. rescheduling cron tasks).
+type ConfigChangeListener interface {
+	OnConfigChange(ctx context.Context, cfg map[string]any) error
+}
+
 // HostContext exposes capability-scoped host services to a BuiltinPlugin.
 type HostContext struct {
-	PluginID  string
-	KV        *KVStore
-	Providers *ProviderRegistry
-	logger    *PluginLogger
-	hostI18n  *i18n.Catalog
-	getConfig func() map[string]any
-	dialer    *security.OutboundSafeDialer
+	_ [0]func()
+
+	PluginID    string
+	KV          *KVStore
+	Providers   *ProviderRegistry
+	cron        *CronRegistry
+	hasCronPerm bool
+	logger      *PluginLogger
+	hostI18n    *i18n.Catalog
+	getConfig   func() map[string]any
+	dialer      *security.OutboundSafeDialer
 }
 
 func (h *HostContext) Config() map[string]any {
@@ -188,32 +212,61 @@ func (h *HostContext) T(locale, key string, vars ...map[string]any) string {
 func (h *HostContext) NewHTTPClient(timeout time.Duration) *http.Client {
 	return h.dialer.NewHTTPClient(timeout)
 }
+func (h *HostContext) RegisterCron(spec CronSpec, immediate bool) error {
+	if !h.hasCronPerm || h.cron == nil {
+		return errors.New("plugin: cron permission is not declared")
+	}
+	return h.cron.RegisterJob(h.PluginID, spec, CronSourceDynamic, immediate)
+}
+func (h *HostContext) UnregisterCron(name string) bool {
+	if !h.hasCronPerm || h.cron == nil {
+		return false
+	}
+	return h.cron.UnregisterJob(h.PluginID, name)
+}
+func (h *HostContext) TriggerCron(name string) int {
+	if !h.hasCronPerm || h.cron == nil {
+		return 0
+	}
+	return h.cron.Trigger(h.PluginID, name)
+}
+func (h *HostContext) CronJobs() []CronJobSnapshot {
+	if h.cron == nil {
+		return []CronJobSnapshot{}
+	}
+	return h.cron.ListJobs(h.PluginID)
+}
 
 // PluginSummary is the safe, secret-masked view returned to Admin REST APIs.
 type PluginSummary struct {
-	ID            string          `json:"id"`
-	Kind          string          `json:"kind"` // builtin | external
-	Runtime       string          `json:"runtime"`
-	Version       string          `json:"version"`
-	Name          string          `json:"name"`
-	Description   string          `json:"description"`
-	Author        string          `json:"author,omitempty"`
-	Homepage      string          `json:"homepage,omitempty"`
-	IsEnabled     bool            `json:"is_enabled"`
-	CircuitState  string          `json:"circuit_state"`
-	FailureCount  int             `json:"failure_count"`
-	LastError     string          `json:"last_error,omitempty"`
-	Permissions   []string        `json:"permissions"`
-	AllowedHosts  []string        `json:"allowed_hosts"`
-	ConfigSchema  []ConfigField   `json:"config_schema"`
-	PublicConfig  map[string]any  `json:"public_config"`
-	SecretKeysSet map[string]bool `json:"secret_keys_set"`
-	InstalledAt   int64           `json:"installed_at"`
-	UpdatedAt     int64           `json:"updated_at"`
+	_ [0]func()
+
+	ID            string            `json:"id"`
+	Kind          string            `json:"kind"` // builtin | external
+	Runtime       string            `json:"runtime"`
+	Version       string            `json:"version"`
+	Name          string            `json:"name"`
+	Description   string            `json:"description"`
+	Author        string            `json:"author,omitempty"`
+	Homepage      string            `json:"homepage,omitempty"`
+	IsEnabled     bool              `json:"is_enabled"`
+	CircuitState  string            `json:"circuit_state"`
+	FailureCount  int               `json:"failure_count"`
+	LastError     string            `json:"last_error,omitempty"`
+	Permissions   []string          `json:"permissions"`
+	AllowedHosts  []string          `json:"allowed_hosts"`
+	ConfigSchema  []ConfigField     `json:"config_schema"`
+	PublicConfig  map[string]any    `json:"public_config"`
+	SecretKeysSet map[string]bool   `json:"secret_keys_set"`
+	CronJobs      []CronJobSnapshot `json:"cron_jobs,omitempty"`
+	InstalledAt   int64             `json:"installed_at"`
+	UpdatedAt     int64             `json:"updated_at"`
 }
 
 // EditorQuickInsertView describes a localized quick-insert button for CodeMirror 6.
 type EditorQuickInsertView struct {
+	_ [0]func()
+
 	PluginID string `json:"plugin_id"`
 	ID       string `json:"id"`
 	Label    string `json:"label"`
@@ -223,6 +276,8 @@ type EditorQuickInsertView struct {
 
 // ManagerOptions configures the Plugin Manager.
 type ManagerOptions struct {
+	_ [0]func()
+
 	Store                 *sqlx.Store
 	Keys                  *config.KeyRing
 	PluginsDir            string
@@ -238,6 +293,8 @@ type ManagerOptions struct {
 }
 
 type managedPlugin struct {
+	_ [0]func()
+
 	mu           sync.Mutex
 	manifest     Manifest
 	kind         string // "builtin" | "external"
@@ -255,9 +312,6 @@ type managedPlugin struct {
 	publicConfig  map[string]any
 	secretConfig  map[string]string
 	mergedCfgSnap atomic.Pointer[map[string]any]
-
-	cronCancel context.CancelFunc
-	cronWG     sync.WaitGroup
 }
 
 func (mp *managedPlugin) rebuildConfigSnapshot() {
@@ -280,8 +334,10 @@ func (mp *managedPlugin) getConfigMap() map[string]any {
 }
 
 // Manager orchestrates built-in and external goja plugins, persistent plugin_kv, capability sandboxes,
-// automatic circuit breaking, .zip hot installation, cron scheduling, and /plugins/<id>/* HTTP serving.
+// automatic circuit breaking, .zip hot installation, unified cron scheduling, and /plugins/<id>/* HTTP serving.
 type Manager struct {
+	_ [0]func()
+
 	mu                    sync.RWMutex
 	store                 *sqlx.Store
 	keys                  *config.KeyRing
@@ -289,6 +345,7 @@ type Manager struct {
 	logger                *PluginLogger
 	catalog               *i18n.Catalog
 	providers             *ProviderRegistry
+	cron                  *CronRegistry
 	hookTimeout           time.Duration
 	routeTimeout          time.Duration
 	cronTimeout           time.Duration
@@ -329,7 +386,7 @@ func NewManager(opts ManagerOptions) *Manager {
 	if opts.PluginsDir != "" {
 		_ = os.MkdirAll(opts.PluginsDir, 0o750)
 	}
-	return &Manager{
+	mgr := &Manager{
 		store:                 opts.Store,
 		keys:                  opts.Keys,
 		pluginsDir:            opts.PluginsDir,
@@ -345,10 +402,43 @@ func NewManager(opts ManagerOptions) *Manager {
 		allowLoopbackForTests: opts.AllowLoopbackForTests,
 		plugins:               make(map[string]*managedPlugin),
 	}
+	mgr.cron = newCronRegistry(defaultMaxCronConcurrency, mgr.effectiveCronUnit, mgr.executeScheduledCron)
+	return mgr
+}
+
+func (m *Manager) effectiveCronUnit() time.Duration {
+	if m != nil && m.cronBaseUnit > 0 {
+		return m.cronBaseUnit
+	}
+	return time.Second
 }
 
 func (m *Manager) Providers() *ProviderRegistry { return m.providers }
 func (m *Manager) Logger() *PluginLogger        { return m.logger }
+
+// CronJobs returns snapshots of all active scheduled plugin tasks in the unified CronRegistry.
+func (m *Manager) CronJobs() []CronJobSnapshot {
+	if m == nil || m.cron == nil {
+		return []CronJobSnapshot{}
+	}
+	return m.cron.ListJobs("")
+}
+
+// PluginCronJobs returns snapshots of scheduled tasks registered by pluginID.
+func (m *Manager) PluginCronJobs(pluginID string) []CronJobSnapshot {
+	if m == nil || m.cron == nil {
+		return []CronJobSnapshot{}
+	}
+	return m.cron.ListJobs(pluginID)
+}
+
+// TriggerCronJob schedules one job (or all jobs of pluginID when name == "") for immediate execution.
+func (m *Manager) TriggerCronJob(pluginID string, name string) int {
+	if m == nil || m.cron == nil {
+		return 0
+	}
+	return m.cron.Trigger(pluginID, name)
+}
 
 // SetSiteInfoFunc registers a host callback returning sanitized site metadata for volo.site.info().
 func (m *Manager) SetSiteInfoFunc(fn func() map[string]any) {
@@ -528,12 +618,19 @@ func (m *Manager) ClearPluginKV(ctx context.Context, pluginID string) (int64, er
 	if !validPluginIDRe.MatchString(idClean) {
 		return 0, fmt.Errorf("plugin: invalid plugin id %q", pluginID)
 	}
-	if _, ok := m.getPlugin(idClean); !ok {
+	mp, ok := m.getPlugin(idClean)
+	if !ok {
 		return 0, fmt.Errorf("plugin %q not found", idClean)
 	}
 	res, err := m.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, idClean)
 	if err != nil {
 		return 0, err
+	}
+	mp.mu.Lock()
+	rt := mp.gojaRT
+	mp.mu.Unlock()
+	if rt != nil {
+		rt.clearWordMatchers()
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
@@ -627,13 +724,11 @@ func (m *Manager) syncRecordWithDB(
 	builtin BuiltinPlugin,
 ) (*managedPlugin, error) {
 	now := time.Now().Unix()
-	existing, err := sqlx.Get[domain.PluginRecord](
-		ctx,
-		m.store,
-		`SELECT id, kind, version, is_enabled, config_json, secret_ciphertext, circuit_state, failure_count, last_error, installed_at, updated_at
+	var existing domain.PluginRecord
+	err := sqlx.GetInto(ctx,
+		m.store, &existing, `SELECT id, kind, version, is_enabled, config_json, secret_ciphertext, circuit_state, failure_count, last_error, installed_at, updated_at
 		 FROM plugins WHERE id = ?`,
-		manifest.ID,
-	)
+		manifest.ID)
 
 	var pubCfg map[string]any
 	var secretCfg map[string]string
@@ -750,36 +845,35 @@ func (m *Manager) openSecretsLenient(pluginID string, ciphertext string) map[str
 }
 
 func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error {
-	mp.mu.Lock()
-	prevCancel := mp.cronCancel
-	mp.cronCancel = nil
-	mp.mu.Unlock()
-
-	if prevCancel != nil {
-		prevCancel()
+	if m.cron != nil {
+		m.cron.UnregisterPlugin(mp.manifest.ID, true)
 	}
-	mp.cronWG.Wait()
 
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	if mp.cronCancel != nil {
-		mp.cronCancel()
-		mp.cronCancel = nil
-	}
 	m.providers.DetachPlugin(mp.manifest.ID)
+	hasCronPerm := mp.manifest.HasPermission("cron")
+	if hasCronPerm && m.cron != nil {
+		m.cron.BeginPlugin(mp.manifest.ID)
+	}
 
 	if mp.manifest.Runtime == RuntimeBuiltin {
 		if mp.builtin == nil {
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			return fmt.Errorf("plugin %q: missing builtin implementation", mp.manifest.ID)
 		}
 		hostCtx := &HostContext{
-			PluginID:  mp.manifest.ID,
-			KV:        mp.kv,
-			Providers: m.providers,
-			logger:    m.logger,
-			hostI18n:  m.catalog,
-			getConfig: mp.getConfigMap,
+			PluginID:    mp.manifest.ID,
+			KV:          mp.kv,
+			Providers:   m.providers,
+			cron:        m.cron,
+			hasCronPerm: hasCronPerm,
+			logger:      m.logger,
+			hostI18n:    m.catalog,
+			getConfig:   mp.getConfigMap,
 			dialer: &security.OutboundSafeDialer{
 				AllowedHosts:          mp.manifest.EffectiveAllowedHosts(),
 				Timeout:               5 * time.Second,
@@ -788,6 +882,9 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			},
 		}
 		if err := mp.builtin.OnEnable(ctx, hostCtx); err != nil {
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			m.providers.DetachPlugin(mp.manifest.ID)
 			return err
 		}
@@ -796,6 +893,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			manifest:              mp.manifest,
 			pluginDir:             mp.pluginDir,
 			kv:                    mp.kv,
+			cron:                  m.cron,
 			logger:                m.logger,
 			hostI18n:              m.catalog,
 			getConfig:             mp.getConfigMap,
@@ -804,6 +902,9 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		})
 		if err != nil {
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			return err
 		}
 		mp.gojaRT = rt
@@ -811,6 +912,9 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 		// Optional JS lifecycle hook onEnable().
 		if _, _, err := rt.invoke(ctx, m.hookTimeout, "onEnable"); err != nil {
 			mp.gojaRT = nil
+			if hasCronPerm && m.cron != nil {
+				m.cron.UnregisterPlugin(mp.manifest.ID, true)
+			}
 			return err
 		}
 
@@ -839,7 +943,13 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 		}
 	}
 
-	m.startCronLocked(mp)
+	if hasCronPerm && m.cron != nil {
+		for _, spec := range mp.manifest.Cron {
+			if !m.cron.HasJob(mp.manifest.ID, spec.Name) {
+				_ = m.cron.RegisterJob(mp.manifest.ID, spec, CronSourceManifest, false)
+			}
+		}
+	}
 	m.logger.Write(mp.manifest.ID, "info", "lifecycle", "plugin enabled v"+mp.manifest.Version)
 	return nil
 }
@@ -849,17 +959,9 @@ func (m *Manager) deactivateRuntime(ctx context.Context, mp *managedPlugin) {
 }
 
 func (m *Manager) deactivateRuntimeOpts(ctx context.Context, mp *managedPlugin, waitCron bool) {
-	mp.mu.Lock()
-	cancel := mp.cronCancel
-	mp.cronCancel = nil
-	mp.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	// Never call mp.cronWG.Wait() while holding mp.mu.Lock() or from inside a cron goroutine itself!
-	if waitCron {
-		mp.cronWG.Wait()
+	// Never pass wait=true from inside a cron worker goroutine of the same plugin!
+	if m.cron != nil {
+		m.cron.UnregisterPlugin(mp.manifest.ID, waitCron)
 	}
 
 	mp.mu.Lock()
@@ -878,45 +980,20 @@ func (m *Manager) deactivateRuntimeOpts(ctx context.Context, mp *managedPlugin, 
 	m.logger.Write(mp.manifest.ID, "info", "lifecycle", "plugin disabled")
 }
 
-func (m *Manager) startCronLocked(mp *managedPlugin) {
-	if len(mp.manifest.Cron) == 0 || !mp.manifest.HasPermission("cron") {
-		return
+func (m *Manager) executeScheduledCron(parentCtx context.Context, pluginID string, jobName string, handler string) error {
+	mp, ok := m.getPlugin(pluginID)
+	if !ok {
+		return nil
 	}
-	cronCtx, cancel := context.WithCancel(context.Background())
-	mp.cronCancel = cancel
-	unit := m.cronBaseUnit
-	if unit <= 0 {
-		unit = time.Second
+	runCtx, runCancel := context.WithTimeout(parentCtx, m.cronTimeout)
+	err := m.runSingleCron(runCtx, mp, handler)
+	runCancel()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.recordFailureWithOrigin(context.Background(), mp, "cron:"+jobName, err, true)
+	} else if err == nil {
+		m.recordSuccess(context.Background(), mp)
 	}
-
-	for _, spec := range mp.manifest.Cron {
-		job := spec
-		interval := time.Duration(job.IntervalSeconds) * unit
-		if interval <= 0 {
-			interval = time.Second
-		}
-		mp.cronWG.Add(1)
-		go func() {
-			defer mp.cronWG.Done()
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-cronCtx.Done():
-					return
-				case <-ticker.C:
-					runCtx, runCancel := context.WithTimeout(cronCtx, m.cronTimeout)
-					err := m.runSingleCron(runCtx, mp, job.Handler)
-					runCancel()
-					if err != nil && !errors.Is(err, context.Canceled) {
-						m.recordFailureWithOrigin(context.Background(), mp, "cron:"+job.Name, err, true)
-					} else if err == nil {
-						m.recordSuccess(context.Background(), mp)
-					}
-				}
-			}
-		}()
-	}
+	return err
 }
 
 func (m *Manager) runSingleCron(ctx context.Context, mp *managedPlugin, handler string) error {
@@ -1022,7 +1099,8 @@ func (m *Manager) ResetCircuit(ctx context.Context, pluginID string) error {
 }
 
 // UpdateConfig validates a partial/full config patch against ConfigSchema, seals secret fields with AES-256-GCM,
-// persists to DB, and atomically refreshes the live in-memory config snapshot without restarting VMs.
+// persists to DB, atomically refreshes the live in-memory config snapshot without restarting VMs, and notifies
+// optional onConfigChange(cfg) hooks (e.g. to reschedule dynamic cron jobs).
 func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[string]any, locale string) (PluginSummary, error) {
 	mp, ok := m.getPlugin(pluginID)
 	if !ok {
@@ -1050,6 +1128,11 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 	mp.secretConfig = nextSec
 	mp.updatedAt = now
 	mp.rebuildConfigSnapshot()
+	isActive := mp.enabled && mp.circuitState == CircuitClosed
+	runtimeKind := mp.manifest.Runtime
+	bp := mp.builtin
+	rt := mp.gojaRT
+	cfgSnap := mp.getConfigMap()
 	mp.mu.Unlock()
 
 	if _, err := m.store.ExecContext(
@@ -1058,6 +1141,28 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 		string(cfgBytes), secCipher, now, pluginID,
 	); err != nil {
 		return PluginSummary{}, err
+	}
+
+	if isActive {
+		cfgCopy := make(map[string]any, len(cfgSnap))
+		for k, v := range cfgSnap {
+			cfgCopy[k] = v
+		}
+		if runtimeKind == RuntimeBuiltin && bp != nil {
+			if listener, lOk := bp.(ConfigChangeListener); lOk {
+				if cErr := listener.OnConfigChange(ctx, cfgCopy); cErr != nil {
+					m.recordFailure(ctx, mp, "config_change", cErr)
+				} else {
+					m.recordSuccess(ctx, mp)
+				}
+			}
+		} else if rt != nil && rt.hasCallable("onConfigChange") {
+			if _, _, cErr := rt.invoke(ctx, m.hookTimeout, "onConfigChange", cfgCopy); cErr != nil {
+				m.recordFailure(ctx, mp, "config_change", cErr)
+			} else {
+				m.recordSuccess(ctx, mp)
+			}
+		}
 	}
 
 	m.logger.Write(pluginID, "info", "config", "configuration hot-reloaded")
@@ -1283,6 +1388,11 @@ func (m *Manager) Get(pluginID string, locale string) (PluginSummary, bool) {
 }
 
 func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
+	cronJobs := m.PluginCronJobs(mp.manifest.ID)
+	if len(cronJobs) == 0 {
+		cronJobs = nil
+	}
+
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
@@ -1314,6 +1424,7 @@ func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
 		ConfigSchema:  mp.manifest.ConfigSchema,
 		PublicConfig:  pubCopy,
 		SecretKeysSet: secSet,
+		CronJobs:      cronJobs,
 		InstalledAt:   mp.installedAt,
 		UpdatedAt:     mp.updatedAt,
 	}
@@ -2013,6 +2124,9 @@ func (m *Manager) Close(ctx context.Context) error {
 	for _, mp := range list {
 		m.deactivateRuntime(ctx, mp)
 	}
+	if m.cron != nil {
+		m.cron.Close()
+	}
 	return nil
 }
 
@@ -2049,6 +2163,8 @@ func (m *Manager) snapshotEnabledPlugins() []*managedPlugin {
 var _ OIDCAdvancedProvider = (*gojaOIDCAdapter)(nil)
 
 type gojaOIDCAdapter struct {
+	_ [0]func()
+
 	manager      *Manager
 	mp           *managedPlugin
 	provName     string
@@ -2344,10 +2460,44 @@ func (a *gojaAntiSpamAdapter) CheckComment(ctx context.Context, input CommentChe
 		return SpamVerdict{}, errors.New("checkSpam function not exported")
 	}
 	a.manager.recordSuccess(ctx, a.mp)
+	return parseSpamVerdictResult(res), nil
+}
 
+func (a *gojaAntiSpamAdapter) CheckNickname(ctx context.Context, input NicknameCheckInput) (SpamVerdict, error) {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return SpamVerdict{}, errors.New("plugin antispam inactive")
+	}
+	res, found, err := rt.invoke(ctx, a.manager.hookTimeout, "checkNickname", input)
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "provider:antispam", err)
+		return SpamVerdict{}, err
+	}
+	if found {
+		a.manager.recordSuccess(ctx, a.mp)
+		return parseSpamVerdictResult(res), nil
+	}
+	// Seamless fallback for AntiSpamProvider plugins that only export checkSpam(input).
+	return a.CheckComment(ctx, CommentCheckInput{
+		TargetType: "nickname",
+		TargetID:   input.Source,
+		AuthorName: input.Nickname,
+		ContentMD:  input.Nickname,
+		IPMasked:   input.IPMasked,
+		GeoRegion:  input.GeoRegion,
+		Locale:     input.Locale,
+		IsGuest:    true,
+	})
+}
+
+func parseSpamVerdictResult(res any) SpamVerdict {
 	if m, ok := res.(map[string]any); ok {
-		verdict := SpamVerdict{Action: SpamActionAllow}
-		if act, sOk := m["action"].(string); sOk {
+		verdict := SpamVerdict{Action: SpamActionPass}
+		if act, sOk := m["action"].(string); sOk && strings.TrimSpace(act) != "" {
 			verdict.Action = strings.ToLower(strings.TrimSpace(act))
 		}
 		if reason, sOk := m["reason"].(string); sOk {
@@ -2359,9 +2509,9 @@ func (a *gojaAntiSpamAdapter) CheckComment(ctx context.Context, input CommentChe
 		case int64:
 			verdict.Score = float64(sc)
 		}
-		return verdict, nil
+		return verdict
 	}
-	return SpamVerdict{Action: SpamActionAllow}, nil
+	return SpamVerdict{Action: SpamActionPass}
 }
 
 type gojaNotifierAdapter struct {

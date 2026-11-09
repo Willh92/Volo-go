@@ -29,6 +29,7 @@ coverage.txt
 !/themes/volo-journal/
 /plugins/*
 !/plugins/kanbanniang/
+!/plugins/sensitive-words/
 
 # OS / IDE
 .DS_Store

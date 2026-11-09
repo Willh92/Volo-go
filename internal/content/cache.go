@@ -24,6 +24,8 @@ const (
 )
 
 type redirectEntry struct {
+	_ [0]func()
+
 	id         string // Non-empty for `redirects` table rows (records hit_count); empty for legacy_permalink
 	targetPath string
 	statusCode int
@@ -35,6 +37,8 @@ type redirectTableSnapshot struct {
 }
 
 type publicChromeSnapshot struct {
+	_ [0]func()
+
 	dataRev            uint64
 	settingsRev        uint64
 	rawNavItems        []domain.NavItem
@@ -55,6 +59,8 @@ type publicChromeSnapshot struct {
 // CachedDocument holds a revision-coherent public XML/Markdown distribution document
 // along with its pre-compressed Gzip representation and strong HTTP ETag.
 type CachedDocument struct {
+	_ [0]func()
+
 	Raw         []byte
 	Gzip        []byte
 	ETag        string
@@ -62,6 +68,8 @@ type CachedDocument struct {
 }
 
 type feedCacheEntry struct {
+	_ [0]func()
+
 	dataRev     uint64
 	settingsRev uint64
 	doc         CachedDocument
@@ -69,6 +77,8 @@ type feedCacheEntry struct {
 }
 
 type serviceCacheState struct {
+	_ [0]func()
+
 	redirects atomic.Pointer[redirectTableSnapshot]
 
 	chromeMu sync.Mutex
@@ -118,19 +128,16 @@ func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapsh
 	if snap := s.caches.redirects.Load(); snap != nil && snap.dataRev == curRev {
 		return snap, nil
 	}
+	var rulesRows []domain.RedirectRule
+	err := sqlx.SelectInto(ctx, s.store, &rulesRows, `SELECT id, source_path, target_path, status_code FROM redirects`)
 
-	rulesRows, err := sqlx.Select[domain.RedirectRule](
-		ctx, s.store,
-		`SELECT id, source_path, target_path, status_code FROM redirects`,
-	)
 	if err != nil {
 		return nil, err
 	}
-	legacyArts, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT slug, legacy_permalink FROM articles WHERE legacy_permalink <> '' AND status = ?`,
-		domain.ArticleStatusPublished,
-	)
+	var legacyArts []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.store, &legacyArts, `SELECT slug, legacy_permalink FROM articles WHERE legacy_permalink <> '' AND status = ?`,
+		domain.ArticleStatusPublished)
+
 	if err != nil {
 		return nil, err
 	}
@@ -185,12 +192,10 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 	if snap := s.caches.chrome.Load(); snap != nil && snap.dataRev == dRev && snap.settingsRev == sRev {
 		return snap, nil
 	}
+	var navRows []domain.NavItem
+	err := sqlx.SelectInto(ctx, s.store, &navRows, `SELECT * FROM nav_items WHERE is_enabled = ? ORDER BY sort_order ASC, created_at ASC`,
+		true)
 
-	navRows, err := sqlx.Select[domain.NavItem](
-		ctx, s.store,
-		`SELECT * FROM nav_items WHERE is_enabled = ? ORDER BY sort_order ASC, created_at ASC`,
-		true,
-	)
 	if err != nil {
 		return nil, err
 	}
@@ -214,17 +219,20 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 	recentSQL, recentArgs := s.store.Dialect().PaginateSQL(
 		`SELECT * FROM articles WHERE status = ? ORDER BY published_at DESC`, maxCachedRecentCmts, 0,
 	)
-	recentRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, recentSQL, append([]any{domain.ArticleStatusPublished}, recentArgs...)...)
+	var recentRaw []domain.RawArticle
+	_ = sqlx.SelectInto(ctx, s.store, &recentRaw, recentSQL, append([]any{domain.ArticleStatusPublished}, recentArgs...)...)
 
 	viewedSQL, viewedArgs := s.store.Dialect().PaginateSQL(
 		`SELECT * FROM articles WHERE status = ? ORDER BY view_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
 	)
-	mostViewedRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, viewedSQL, append([]any{domain.ArticleStatusPublished}, viewedArgs...)...)
+	var mostViewedRaw []domain.RawArticle
+	_ = sqlx.SelectInto(ctx, s.store, &mostViewedRaw, viewedSQL, append([]any{domain.ArticleStatusPublished}, viewedArgs...)...)
 
 	cmtedSQL, cmtedArgs := s.store.Dialect().PaginateSQL(
 		`SELECT * FROM articles WHERE status = ? ORDER BY comment_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
 	)
-	mostCommentedRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, cmtedSQL, append([]any{domain.ArticleStatusPublished}, cmtedArgs...)...)
+	var mostCommentedRaw []domain.RawArticle
+	_ = sqlx.SelectInto(ctx, s.store, &mostCommentedRaw, cmtedSQL, append([]any{domain.ArticleStatusPublished}, cmtedArgs...)...)
 
 	seenArt := make(map[string]struct{}, len(recentRaw)+len(mostViewedRaw)+len(mostCommentedRaw))
 	uniqueRaw := make([]domain.RawArticle, 0, len(recentRaw)+len(mostViewedRaw)+len(mostCommentedRaw))

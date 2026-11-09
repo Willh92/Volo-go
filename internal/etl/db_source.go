@@ -144,6 +144,8 @@ var legacyTimestampCanonKeys = map[string]bool{
 
 // SourceDBInspection describes an existing database discovered during Setup Wizard connectivity testing or direct migration.
 type SourceDBInspection struct {
+	_ [0]func()
+
 	Dialect       string            `json:"dialect"`
 	SchemaKind    string            `json:"schema_kind"` // "solo" or "volo"
 	TablePrefix   string            `json:"table_prefix"`
@@ -467,6 +469,8 @@ func StreamLegacyDBToJSON(ctx context.Context, store *sqlx.Store, insp *SourceDB
 }
 
 type countingLimitWriter struct {
+	_ [0]func()
+
 	w       *bufio.Writer
 	written int64
 	limit   int64
@@ -926,9 +930,8 @@ func applyPostNativeMigrationOverrides(
 		strings.TrimSpace(opts.AdminPasswordHash) == "" {
 		return nil
 	}
-
-	admins, err := sqlx.Select[domain.User](ctx, targetStore,
-		`SELECT * FROM users WHERE role = ? ORDER BY created_at ASC LIMIT 1`, domain.RoleAdmin)
+	var admins []domain.User
+	err := sqlx.SelectInto(ctx, targetStore, &admins, `SELECT * FROM users WHERE role = ? ORDER BY created_at ASC LIMIT 1`, domain.RoleAdmin)
 	if err != nil || len(admins) == 0 {
 		return err
 	}

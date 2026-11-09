@@ -26,6 +26,8 @@ import (
 
 // BookChapterNode represents a node in the hierarchical chapter tree of a Book.
 type BookChapterNode struct {
+	_ [0]func()
+
 	ID        string            `json:"id"`
 	Title     string            `json:"title"`
 	URL       string            `json:"url"`
@@ -36,6 +38,8 @@ type BookChapterNode struct {
 
 // BookDetailView pairs a Book with its nested chapter tree and flat ordered chapter list (for Prev/Next reader navigation).
 type BookDetailView struct {
+	_ [0]func()
+
 	domain.Book
 	Tree         []BookChapterNode    `json:"tree"`
 	FlatChapters []domain.BookChapter `json:"flat_chapters"`
@@ -43,15 +47,19 @@ type BookDetailView struct {
 
 // ListBooks returns all books ordered by sort_order ASC, created_at DESC with live chapter counts.
 func (s *Service) ListBooks(ctx context.Context) ([]domain.Book, error) {
-	books, err := sqlx.Select[domain.Book](ctx, s.store, `SELECT * FROM books ORDER BY sort_order ASC, created_at DESC`)
+	var books []domain.Book
+	err := sqlx.SelectInto(ctx, s.store, &books, `SELECT * FROM books ORDER BY sort_order ASC, created_at DESC`)
 	if err != nil || len(books) == 0 {
 		return books, err
 	}
 	type cntRow struct {
+		_ [0]func()
+
 		BookID string `db:"book_id"`
 		Cnt    int    `db:"cnt"`
 	}
-	counts, cErr := sqlx.Select[cntRow](ctx, s.store, `SELECT book_id, COUNT(*) AS cnt FROM book_chapters GROUP BY book_id`)
+	var counts []cntRow
+	cErr := sqlx.SelectInto(ctx, s.store, &counts, `SELECT book_id, COUNT(*) AS cnt FROM book_chapters GROUP BY book_id`)
 	if cErr == nil {
 		cntMap := make(map[string]int, len(counts))
 		for _, c := range counts {
@@ -72,15 +80,15 @@ func (s *Service) ListBooks(ctx context.Context) ([]domain.Book, error) {
 
 // GetBookBySlug loads a Book and reconstructs its hierarchical chapter tree + flat reader sequence.
 func (s *Service) GetBookBySlug(ctx context.Context, slug string) (BookDetailView, error) {
-	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE slug = ?`, strings.TrimSpace(slug))
+	var bk domain.Book
+	err := sqlx.GetInto(ctx, s.store, &bk, `SELECT * FROM books WHERE slug = ?`, strings.TrimSpace(slug))
 	if err != nil {
 		return BookDetailView{}, err
 	}
-	chapters, err := sqlx.Select[domain.BookChapter](
-		ctx, s.store,
-		`SELECT * FROM book_chapters WHERE book_id = ? ORDER BY sort_order ASC`,
-		bk.ID,
-	)
+	var chapters []domain.BookChapter
+	err = sqlx.SelectInto(ctx, s.store, &chapters, `SELECT * FROM book_chapters WHERE book_id = ? ORDER BY sort_order ASC`,
+		bk.ID)
+
 	if err != nil {
 		return BookDetailView{}, err
 	}
@@ -135,7 +143,8 @@ func (s *Service) ListBookCards(ctx context.Context) []render.BookCardInfo {
 }
 
 func (s *Service) lookupBookCard(ctx context.Context, slug string) (render.BookCardInfo, bool) {
-	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE slug = ? OR id = ?`, slug, slug)
+	var bk domain.Book
+	err := sqlx.GetInto(ctx, s.store, &bk, `SELECT * FROM books WHERE slug = ? OR id = ?`, slug, slug)
 	if err != nil {
 		return render.BookCardInfo{}, false
 	}
@@ -178,7 +187,8 @@ func (s *Service) listBookCards(ctx context.Context) []render.BookCardInfo {
 // - `series`: populates chapters from local published, non-protected articles in `series_articles`
 // - `gitbook` / `mdbook` / `vuepress` / `auto`: crawls remote SUMMARY.md or sidebar HTML via SSRF-safe OutboundSafeDialer
 func (s *Service) SyncBookTOC(ctx context.Context, bookID string) (int, error) {
-	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE id = ?`, strings.TrimSpace(bookID))
+	var bk domain.Book
+	err := sqlx.GetInto(ctx, s.store, &bk, `SELECT * FROM books WHERE id = ?`, strings.TrimSpace(bookID))
 	if err != nil {
 		return 0, err
 	}
@@ -195,15 +205,14 @@ func (s *Service) SyncBookTOC(ctx context.Context, bookID string) (int, error) {
 		if strings.TrimSpace(bk.SeriesID) == "" {
 			return 0, errors.New("bookshelf: series_id is required when source_type='series'")
 		}
-		arts, sErr := sqlx.Select[domain.RawArticle](
-			ctx, s.store,
-			`SELECT a.id, a.title, a.slug, a.password_ciphertext
+		var arts []domain.RawArticle
+		sErr := sqlx.SelectInto(ctx, s.store, &arts, `SELECT a.id, a.title, a.slug, a.password_ciphertext
 			 FROM series_articles sa
 			 INNER JOIN articles a ON a.id = sa.article_id
 			 WHERE sa.series_id = ? AND a.status = ? AND a.password_ciphertext = ''
 			 ORDER BY sa.sort_order ASC, a.published_at ASC`,
-			bk.SeriesID, domain.ArticleStatusPublished,
-		)
+			bk.SeriesID, domain.ArticleStatusPublished)
+
 		if sErr != nil {
 			return 0, sErr
 		}
@@ -591,6 +600,8 @@ const (
 )
 
 type cachedBookChapter struct {
+	_ [0]func()
+
 	bookID       string
 	html         string
 	needsMath    bool

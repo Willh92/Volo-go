@@ -24,6 +24,8 @@ import (
 
 // MailMessage represents an outbound email payload.
 type MailMessage struct {
+	_ [0]func()
+
 	To       string
 	Subject  string
 	TextBody string
@@ -34,6 +36,8 @@ type MailMessage struct {
 // SECURITY RED-LINE: `InsecureSkipVerify` is NEVER enabled. Plaintext SMTP (`plain_internal`)
 // is physically restricted to loopback or private RFC1918 network addresses!
 type Mailer struct {
+	_ [0]func()
+
 	dialTimeout time.Duration
 	resolver    func(ctx context.Context, host string) ([]netip.Addr, error)
 	dialFn      func(ctx context.Context, network, addr string) (net.Conn, error)

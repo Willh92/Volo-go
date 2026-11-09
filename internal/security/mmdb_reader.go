@@ -20,22 +20,26 @@ const (
 )
 
 type mmdbGeoRecord struct {
-	CountryISO      string
-	CountryZH       string
-	CountryEN       string
-	SubdivisionZH   string
-	SubdivisionEN   string
-	CityZH          string
-	CityEN          string
-	RegCountryISO   string
-	RegCountryZH    string
-	RegCountryEN    string
+	_ [0]func()
+
+	CountryISO    string
+	CountryZH     string
+	CountryEN     string
+	SubdivisionZH string
+	SubdivisionEN string
+	CityZH        string
+	CityEN        string
+	RegCountryISO string
+	RegCountryZH  string
+	RegCountryEN  string
 }
 
 // mmdbReader is a zero-mmap, zero-reflection, thread-safe MaxMind DB v2.0 binary reader
 // backed by io.ReaderAt (*os.File.ReadAt) so multi-megabyte GeoLite2 files never inflate VmRSS
 // or hold Windows file-mapping locks across hot-reloads.
 type mmdbReader struct {
+	_ [0]func()
+
 	ra               io.ReaderAt
 	closer           io.Closer
 	fileSize         int64
@@ -122,9 +126,9 @@ func (r *mmdbReader) Close() error {
 func (r *mmdbReader) parseMetadata(metaBytes []byte) error {
 	br := bytes.NewReader(metaBytes)
 	cur := mmdbCursor{
-		ra:       br,
-		limit:    int64(len(metaBytes)),
-		baseOff:  0,
+		ra:      br,
+		limit:   int64(len(metaBytes)),
+		baseOff: 0,
 	}
 	typeNum, mapLen, nextOff, err := cur.readControl(0, 0)
 	if err != nil {
@@ -298,6 +302,8 @@ func (r *mmdbReader) lookupGeo(addr netip.Addr) (mmdbGeoRecord, bool, error) {
 }
 
 type mmdbCursor struct {
+	_ [0]func()
+
 	ra      io.ReaderAt
 	limit   int64
 	baseOff int64

@@ -8,6 +8,8 @@ import (
 
 // qrVersionSpec defines ISO/IEC 18004 ECC Level L parameters for QR Code Versions 1–10.
 type qrVersionSpec struct {
+	_ [0]func()
+
 	version      int
 	ecPerBlock   int
 	group1Blocks int

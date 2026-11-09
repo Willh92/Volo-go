@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -67,6 +66,10 @@ func (s *AppServer) recordAuditLog(r *http.Request, actor *domain.User, action s
 		`INSERT INTO audit_logs (id, actor_id, actor_name, action, resource_type, resource_id, client_ip, detail_json, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id.Next(), actor.ID, actor.Username, action, resourceType, resourceID, security.MaskIP(clientIP), detJSON, time.Now().UnixMilli())
+}
+
+func (s *AppServer) auditKV(r *http.Request, actor *domain.User, action string, resourceType string, resourceID string, kv ...any) {
+	s.recordAuditLog(r, actor, action, resourceType, resourceID, kvMap(kv...))
 }
 
 func parseAdminPageParams(r *http.Request, defaultPerPage, maxPerPage int) (int, int) {
@@ -158,8 +161,8 @@ func (s *AppServer) consumeBackupExportTicket(r *http.Request, rawTicket string)
 	if entry.UserID != viewer.ID || entry.SessionID != sess.ID || entry.IPBucket != ipBucket {
 		return nil, false
 	}
-	u, err := sqlx.Get[domain.User](r.Context(), s.deps.Store,
-		`SELECT * FROM users WHERE id = ? AND status = ? AND role = ?`,
+	var u domain.User
+	err := sqlx.GetInto(r.Context(), s.deps.Store, &u, `SELECT * FROM users WHERE id = ? AND status = ? AND role = ?`,
 		entry.UserID, domain.UserStatusActive, domain.RoleAdmin)
 	if err != nil {
 		return nil, false
@@ -247,13 +250,15 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case sub == "seo/github-sync" && r.Method == http.MethodPost:
 		var req struct {
+			_ [0]func()
+
 			Username       string `json:"username"`
 			IncludeForks   *bool  `json:"include_forks"`
 			PublishArticle bool   `json:"publish_article"`
 		}
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
 		if req.IncludeForks != nil {
-			patchForks, _ := json.Marshal(map[string]any{"github_include_forks": *req.IncludeForks})
+			patchForks, _ := json.Marshal(kvMap("github_include_forks", *req.IncludeForks))
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSEO, patchForks, 0)
 		}
 		repos, err := s.refreshGitHubRepositories(r.Context(), req.Username)
@@ -261,10 +266,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		resp := map[string]any{
-			"repos":            repos,
-			"github_synced_at": s.deps.Settings.Snapshot().SEO.GitHubSyncedAt,
-		}
+		resp := kvMap("repos", repos, "github_synced_at", s.deps.Settings.Snapshot().SEO.GitHubSyncedAt)
 		if req.PublishArticle {
 			if art, pErr := s.publishGitHubShowcaseArticle(r.Context(), actor); pErr == nil && art != nil {
 				resp["article_slug"] = art.Slug
@@ -279,13 +281,8 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		s.recordAuditLog(r, actor, "github.publish_showcase", "article", art.ID, map[string]any{"slug": art.Slug})
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":           true,
-			"article_id":   art.ID,
-			"article_slug": art.Slug,
-			"article_url":  "/posts/" + art.Slug,
-		})
+		s.auditKV(r, actor, "github.publish_showcase", "article", art.ID, "slug", art.Slug)
+		writeJSONKV(w, http.StatusOK, "ok", true, "article_id", art.ID, "article_slug", art.Slug, "article_url", "/posts/"+art.Slug)
 
 	case sub == "seo/indexnow-push" && r.Method == http.MethodPost:
 		n, err := s.pushIndexNowURLs(r.Context(), s.publicBaseURL(r))
@@ -293,7 +290,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"pushed_urls": n})
+		writeJSONKV(w, http.StatusOK, "pushed_urls", n)
 
 	case sub == "themes" || strings.HasPrefix(sub, "themes/"):
 		s.handleAdminThemes(w, r, actor, strings.TrimPrefix(sub, "themes"))
@@ -340,17 +337,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		}
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":            items,
-			"total":            logging.Default().Count(),
-			"capacity":         logging.DefaultMaxEntries,
-			"goroutines":       runtime.NumGoroutine(),
-			"heap_alloc_bytes": ms.HeapAlloc,
-			"sys_bytes":        ms.Sys,
-			"uptime_sec":       int64(time.Since(s.deps.StartedAt).Seconds()),
-			"go_version":       runtime.Version(),
-			"version":          s.deps.Version,
-		})
+		writeJSONKV(w, http.StatusOK, "items", items, "total", logging.Default().Count(), "capacity", logging.DefaultMaxEntries, "goroutines", runtime.NumGoroutine(), "heap_alloc_bytes", ms.HeapAlloc, "sys_bytes", ms.Sys, "uptime_sec", int64(time.Since(s.deps.StartedAt).Seconds()), "go_version", runtime.Version(), "version", s.deps.Version)
 
 	case sub == "runtime-logs" && r.Method == http.MethodDelete:
 		logging.Default().Clear()
@@ -377,26 +364,20 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM audit_logs WHERE `+whereSQL, args...).Scan(&total)
 		baseSQL := `SELECT * FROM audit_logs WHERE ` + whereSQL + ` ORDER BY created_at DESC`
 		qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-		rows, _ := sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store, qSQL, fullArgs...)
+		var rows []domain.AuditLog
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 		if rows == nil {
 			rows = []domain.AuditLog{}
 		}
-		actionRows, _ := sqlx.Select[struct {
+		var actionRows []struct {
 			Action string `db:"action"`
-		}](r.Context(), s.deps.Store, `SELECT DISTINCT action FROM audit_logs WHERE action <> '' ORDER BY action ASC`)
+		}
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &actionRows, `SELECT DISTINCT action FROM audit_logs WHERE action <> '' ORDER BY action ASC`)
 		actions := make([]string, 0, len(actionRows))
 		for _, ar := range actionRows {
 			actions = append(actions, ar.Action)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":     rows,
-			"logs":      rows,
-			"actions":   actions,
-			"total":     total,
-			"page":      page,
-			"per_page":  perPage,
-			"page_size": perPage,
-		})
+		writeJSONKV(w, http.StatusOK, "items", rows, "logs", rows, "actions", actions, "total", total, "page", page, "per_page", perPage, "page_size", perPage)
 
 	case (sub == "backup/ticket" || sub == "backups/ticket") && r.Method == http.MethodPost:
 		if sess == nil || sess.ID == "" {
@@ -404,6 +385,8 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		var req struct {
+			_ [0]func()
+
 			CurrentPassword string `json:"current_password"`
 			IncludeMedia    bool   `json:"include_media"`
 		}
@@ -423,14 +406,8 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		if req.IncludeMedia {
 			mediaQuery = "&media=1"
 		}
-		s.recordAuditLog(r, actor, "backup.export_ticket", "system", "ticket", map[string]any{"include_media": req.IncludeMedia})
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":           true,
-			"ticket":       tok,
-			"expires_in":   60,
-			"export_url":   "/api/admin/backups/export?ticket=" + tok + mediaQuery,
-			"download_url": "/api/admin/backups/download?ticket=" + tok + mediaQuery,
-		})
+		s.auditKV(r, actor, "backup.export_ticket", "system", "ticket", "include_media", req.IncludeMedia)
+		writeJSONKV(w, http.StatusOK, "ok", true, "ticket", tok, "expires_in", 60, "export_url", "/api/admin/backups/export?ticket="+tok+mediaQuery, "download_url", "/api/admin/backups/download?ticket="+tok+mediaQuery)
 
 	case sub == "backup/local" || strings.HasPrefix(sub, "backup/local/"):
 		s.handleAdminLocalBackups(w, r, actor, strings.TrimPrefix(sub, "backup/local"))
@@ -457,7 +434,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			s.reloadRuntimeAfterDBRestore(r.Context())
 			s.recordAuditLog(r, actor, "backup.import_legacy", "system", "etl", nil)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "report": rep})
+		writeJSONKV(w, http.StatusOK, "ok", true, "dry_run", dryRun, "report", rep)
 
 	case sub == "doctor" && r.Method == http.MethodGet:
 		rep := doctor.Run(r.Context(), s.deps.Config, s.deps.Store)
@@ -476,14 +453,16 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		type oidcLinkDTO struct {
+			_ [0]func()
+
 			ID           string `db:"id" json:"id"`
 			Name         string `db:"name" json:"name"`
 			CredentialID string `db:"credential_id" json:"credential_id"`
 			CreatedAt    int64  `db:"created_at" json:"created_at"`
 			LastUsedAt   int64  `db:"last_used_at" json:"last_used_at"`
 		}
-		rows, _ := sqlx.Select[oidcLinkDTO](r.Context(), s.deps.Store,
-			`SELECT id, name, credential_id, created_at, last_used_at
+		var rows []oidcLinkDTO
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT id, name, credential_id, created_at, last_used_at
 			 FROM user_credentials WHERE user_id = ? AND kind = 'oidc' ORDER BY created_at DESC`,
 			actor.ID)
 		if rows == nil {
@@ -503,10 +482,7 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 				})
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":     rows,
-			"providers": providers,
-		})
+		writeJSONKV(w, http.StatusOK, "items", rows, "providers", providers)
 		return
 	}
 
@@ -516,6 +492,8 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		var req struct {
+			_ [0]func()
+
 			CurrentPassword string `json:"current_password"`
 		}
 		if !decodeOptJSONBody(w, r, 4096, &req) {
@@ -548,11 +526,12 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.NavItem](r.Context(), s.deps.Store, `SELECT * FROM nav_items ORDER BY sort_order ASC, created_at ASC`)
+			var rows []domain.NavItem
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM nav_items ORDER BY sort_order ASC, created_at ASC`)
 			if rows == nil {
 				rows = []domain.NavItem{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": rows, "nav_items": rows, "total": len(rows)})
+			writeJSONKV(w, http.StatusOK, "items", rows, "nav_items", rows, "total", len(rows))
 		case http.MethodPost:
 			var in domain.NavItem
 			if !decodeJSONBody(w, r, 16384, &in) {
@@ -596,7 +575,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 				return
 			}
 			s.invalidateMediaRefCache()
-			writeJSON(w, http.StatusCreated, map[string]any{"item": in})
+			writeJSONKV(w, http.StatusCreated, "item", in)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -632,9 +611,10 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 		}
 		writeOKJSON(w)
 	case http.MethodDelete:
-		delRows, _ := sqlx.Select[struct {
+		var delRows []struct {
 			ID string `db:"id"`
-		}](r.Context(), s.deps.Store, `SELECT id FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
+		}
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &delRows, `SELECT id FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
 		if len(delRows) > 0 {
 			delIDs := make([]string, 0, len(delRows))
@@ -660,12 +640,15 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
-		writeJSON(w, http.StatusOK, map[string]any{"checked": n, "items": rows, "links": rows})
+		var rows []domain.Link
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM links ORDER BY sort_order ASC`)
+		writeJSONKV(w, http.StatusOK, "checked", n, "items", rows, "links", rows)
 		return
 	}
 	if rest == "batch" && r.Method == http.MethodPost {
 		var req struct {
+			_ [0]func()
+
 			Action       string   `json:"action"`
 			IDs          []string `json:"ids"`
 			CategoryName string   `json:"category_name"`
@@ -713,8 +696,8 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 		if action == "delete" {
 			s.invalidateMediaRefCache()
 		}
-		s.recordAuditLog(r, actor, "link.batch", "link", action, map[string]any{"action": action, "affected": affected})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		s.auditKV(r, actor, "link.batch", "link", action, "action", action, "affected", affected)
+		writeJSONKV(w, http.StatusOK, "ok", true, "affected", affected)
 		return
 	}
 	if rest == "" {
@@ -750,26 +733,20 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM links WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM links WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.Link
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Link{}
 			}
-			catRows, _ := sqlx.Select[struct {
+			var catRows []struct {
 				CategoryName string `db:"category_name"`
-			}](r.Context(), s.deps.Store, `SELECT DISTINCT category_name FROM links WHERE TRIM(category_name) <> '' ORDER BY category_name ASC`)
+			}
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &catRows, `SELECT DISTINCT category_name FROM links WHERE TRIM(category_name) <> '' ORDER BY category_name ASC`)
 			categories := make([]string, 0, len(catRows))
 			for _, cr := range catRows {
 				categories = append(categories, cr.CategoryName)
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":      rows,
-				"links":      rows,
-				"categories": categories,
-				"total":      total,
-				"page":       page,
-				"per_page":   perPage,
-				"page_size":  perPage,
-			})
+			writeJSONKV(w, http.StatusOK, "items", rows, "links", rows, "categories", categories, "total", total, "page", page, "per_page", perPage, "page_size", perPage)
 		case http.MethodPost:
 			var in domain.Link
 			if !decodeJSONBody(w, r, 16384, &in) {
@@ -805,7 +782,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 				return
 			}
 			s.invalidateMediaRefCache()
-			writeJSON(w, http.StatusCreated, map[string]any{"link": in})
+			writeJSONKV(w, http.StatusCreated, "link", in)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -814,14 +791,15 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 
 	parts := strings.Split(rest, "/")
 	if len(parts) == 2 && parts[1] == "check" && r.Method == http.MethodPost {
-		lk, err := sqlx.Get[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links WHERE id = ?`, strings.TrimSpace(parts[0]))
+		var lk domain.Link
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &lk, `SELECT * FROM links WHERE id = ?`, strings.TrimSpace(parts[0]))
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "link not found")
 			return
 		}
 		updated := s.checkSingleFriendLink(r.Context(), lk)
-		s.recordAuditLog(r, actor, "link.check", "link", lk.ID, map[string]any{"health_status": updated.HealthStatus, "http_code": updated.HTTPCode})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "link": updated, "item": updated})
+		s.auditKV(r, actor, "link.check", "link", lk.ID, "health_status", updated.HealthStatus, "http_code", updated.HTTPCode)
+		writeJSONKV(w, http.StatusOK, "ok", true, "link", updated, "item", updated)
 		return
 	}
 
@@ -865,6 +843,8 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 }
 
 type opmlDocument struct {
+	_ [0]func()
+
 	XMLName xml.Name    `xml:"opml"`
 	Version string      `xml:"version,attr"`
 	Head    opmlHead    `xml:"head"`
@@ -881,6 +861,8 @@ type opmlBodyDoc struct {
 }
 
 type opmlOutline struct {
+	_ [0]func()
+
 	Text         string        `xml:"text,attr,omitempty"`
 	Title        string        `xml:"title,attr,omitempty"`
 	Type         string        `xml:"type,attr,omitempty"`
@@ -914,7 +896,8 @@ func flattenOPMLOutlines(in []opmlOutline, dst *[]opmlOutline) {
 func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if (rest == "export.opml" || rest == "export" || rest == "opml") && r.Method == http.MethodGet {
-		rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
+		var rows []domain.Follow
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
 		siteTitle := "Volo Subscriptions"
 		if s.deps.Settings != nil && strings.TrimSpace(s.deps.Settings.Snapshot().Site.Title) != "" {
 			siteTitle = strings.TrimSpace(s.deps.Settings.Snapshot().Site.Title) + " Subscriptions"
@@ -975,6 +958,8 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			trimmed := bytes.TrimSpace(bodyBytes)
 			if len(trimmed) > 0 && trimmed[0] == '{' {
 				var jReq struct {
+					_ [0]func()
+
 					OPML string `json:"opml"`
 					Data string `json:"data"`
 				}
@@ -1002,10 +987,10 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		}
 		var flat []opmlOutline
 		flattenOPMLOutlines(doc.Body.Outlines, &flat)
-
-		existing, _ := sqlx.Select[struct {
+		var existing []struct {
 			FeedURL string `db:"feed_url"`
-		}](r.Context(), s.deps.Store, `SELECT feed_url FROM follows`)
+		}
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &existing, `SELECT feed_url FROM follows`)
 		seen := make(map[string]struct{}, len(existing)+len(flat))
 		for _, ex := range existing {
 			seen[strings.ToLower(strings.TrimSpace(ex.FeedURL))] = struct{}{}
@@ -1061,13 +1046,8 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			return nil
 		})
 		s.invalidateMediaRefCache()
-		s.recordAuditLog(r, actor, "follow.import_opml", "follow", "opml", map[string]any{"imported": imported, "skipped": skipped})
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":       true,
-			"imported": imported,
-			"count":    imported,
-			"skipped":  skipped,
-		})
+		s.auditKV(r, actor, "follow.import_opml", "follow", "opml", "imported", imported, "skipped", skipped)
+		writeJSONKV(w, http.StatusOK, "ok", true, "imported", imported, "count", imported, "skipped", skipped)
 		return
 	}
 
@@ -1077,7 +1057,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"synced_items": n})
+		writeJSONKV(w, http.StatusOK, "synced_items", n)
 		return
 	}
 	if rest == "items" && r.Method == http.MethodGet {
@@ -1085,7 +1065,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		if groups == nil {
 			groups = []content.FollowGroup{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+		writeJSONKV(w, http.StatusOK, "groups", groups)
 		return
 	}
 	if rest == "" {
@@ -1114,18 +1094,12 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM follows WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM follows WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.Follow
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Follow{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     rows,
-				"follows":   rows,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writeJSONKV(w, http.StatusOK, "items", rows, "follows", rows, "total", total, "page", page, "per_page", perPage, "page_size", perPage)
 		case http.MethodPost:
 			var in domain.Follow
 			if !decodeJSONBody(w, r, 16384, &in) {
@@ -1171,7 +1145,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 				return
 			}
 			s.invalidateMediaRefCache()
-			writeJSON(w, http.StatusCreated, map[string]any{"follow": in})
+			writeJSONKV(w, http.StatusCreated, "follow", in)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -1180,7 +1154,8 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 
 	parts := strings.Split(rest, "/")
 	if len(parts) == 2 && parts[1] == "sync" && r.Method == http.MethodPost {
-		fw, err := sqlx.Get[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows WHERE id = ?`, strings.TrimSpace(parts[0]))
+		var fw domain.Follow
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &fw, `SELECT * FROM follows WHERE id = ?`, strings.TrimSpace(parts[0]))
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "follow subscription not found")
 			return
@@ -1189,21 +1164,12 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		if cnt > 0 && s.deps.Content != nil {
 			s.deps.Content.WarmCaches(r.Context())
 		}
-		s.recordAuditLog(r, actor, "follow.sync_single", "follow", fw.ID, map[string]any{"synced_items": cnt})
+		s.auditKV(r, actor, "follow.sync_single", "follow", fw.ID, "synced_items", cnt)
 		if syncErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":           false,
-				"synced_items": cnt,
-				"follow":       updated,
-				"error":        syncErr.Error(),
-			})
+			writeJSONKV(w, http.StatusBadRequest, "ok", false, "synced_items", cnt, "follow", updated, "error", syncErr.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":           true,
-			"synced_items": cnt,
-			"follow":       updated,
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "synced_items", cnt, "follow", updated)
 		return
 	}
 
@@ -1334,6 +1300,8 @@ func (s *AppServer) isRedirectSelfLoop(r *http.Request, srcPath, dstTarget strin
 }
 
 type redirectImportCandidate struct {
+	_ [0]func()
+
 	SourcePath string `json:"source_path"`
 	TargetPath string `json:"target_path"`
 	StatusCode int    `json:"status_code"`
@@ -1354,6 +1322,8 @@ func parseRedirectImportCandidates(formatHint string, rawData []byte) ([]redirec
 			return arr, nil
 		}
 		var env struct {
+			_ [0]func()
+
 			Format    string                    `json:"format"`
 			Data      string                    `json:"data"`
 			Items     []redirectImportCandidate `json:"items"`
@@ -1379,10 +1349,7 @@ func parseRedirectImportCandidates(formatHint string, rawData []byte) ([]redirec
 		return env.Redirects, nil
 	}
 
-	cr := csv.NewReader(bytes.NewReader(trimmed))
-	cr.FieldsPerRecord = -1
-	cr.TrimLeadingSpace = true
-	records, err := cr.ReadAll()
+	records, err := parseSimpleCSV(string(trimmed))
 	if err != nil {
 		return nil, fmt.Errorf("invalid redirect CSV: %w", err)
 	}
@@ -1414,33 +1381,105 @@ func parseRedirectImportCandidates(formatHint string, rawData []byte) ([]redirec
 	return out, nil
 }
 
+func parseSimpleCSV(src string) ([][]string, error) {
+	var rows [][]string
+	var row []string
+	var field strings.Builder
+	inQuotes := false
+	fieldStarted := false
+	for i := 0; i < len(src); i++ {
+		ch := src[i]
+		if inQuotes {
+			if ch == '"' {
+				if i+1 < len(src) && src[i+1] == '"' {
+					field.WriteByte('"')
+					i++
+				} else {
+					inQuotes = false
+				}
+			} else {
+				field.WriteByte(ch)
+			}
+			continue
+		}
+		if !fieldStarted && (ch == ' ' || ch == '\t') {
+			continue
+		}
+		switch ch {
+		case '"':
+			if fieldStarted {
+				return nil, errors.New("bare quote in non-quoted field")
+			}
+			inQuotes = true
+			fieldStarted = true
+		case ',':
+			row = append(row, field.String())
+			field.Reset()
+			fieldStarted = false
+		case '\r', '\n':
+			if ch == '\r' && i+1 < len(src) && src[i+1] == '\n' {
+				i++
+			}
+			if len(row) > 0 || fieldStarted || field.Len() > 0 {
+				row = append(row, field.String())
+				rows = append(rows, row)
+				row = nil
+			}
+			field.Reset()
+			fieldStarted = false
+		default:
+			field.WriteByte(ch)
+			fieldStarted = true
+		}
+	}
+	if inQuotes {
+		return nil, errors.New("unterminated quoted field")
+	}
+	if len(row) > 0 || fieldStarted || field.Len() > 0 {
+		row = append(row, field.String())
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+func appendCSVRecord(buf *bytes.Buffer, cols ...string) {
+	for i, c := range cols {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if strings.ContainsAny(c, ",\"\r\n") {
+			buf.WriteByte('"')
+			buf.WriteString(strings.ReplaceAll(c, "\"", "\"\""))
+			buf.WriteByte('"')
+		} else {
+			buf.WriteString(c)
+		}
+	}
+	buf.WriteByte('\n')
+}
+
 func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "export" && r.Method == http.MethodGet {
-		rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, `SELECT * FROM redirects ORDER BY created_at DESC`)
+		var rows []domain.RedirectRule
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM redirects ORDER BY created_at DESC`)
 		if rows == nil {
 			rows = []domain.RedirectRule{}
 		}
 		format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 		if format == "csv" {
 			var buf bytes.Buffer
-			cw := csv.NewWriter(&buf)
-			_ = cw.Write([]string{"source_path", "target_path", "status_code"})
+			appendCSVRecord(&buf, "source_path", "target_path", "status_code")
 			for _, row := range rows {
-				_ = cw.Write([]string{row.SourcePath, row.TargetPath, strconv.Itoa(row.StatusCode)})
+				appendCSVRecord(&buf, row.SourcePath, row.TargetPath, strconv.Itoa(row.StatusCode))
 			}
-			cw.Flush()
 			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 			w.Header().Set("Content-Disposition", `attachment; filename="volo-redirects.csv"`)
 			_, _ = w.Write(buf.Bytes())
 			return
 		}
 		w.Header().Set("Content-Disposition", `attachment; filename="volo-redirects.json"`)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":     rows,
-			"redirects": rows,
-			"total":     len(rows),
-		})
+		writeJSONKV(w, http.StatusOK, "items", rows, "redirects", rows, "total", len(rows))
 		return
 	}
 
@@ -1537,28 +1576,21 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			if selfLoops > 0 {
 				errMsg = "redirect target cannot point to source_path (self-loop)"
 			}
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error":    errMsg,
-				"imported": 0,
-				"skipped":  skipped,
-			})
+			writeJSONKV(w, http.StatusBadRequest, "error", errMsg, "imported", 0, "skipped", skipped)
 			return
 		}
 		if s.deps.Content != nil {
 			s.deps.Content.WarmCaches(r.Context())
 		}
-		s.recordAuditLog(r, actor, "redirect.import", "redirect", "import", map[string]any{"imported": imported, "skipped": skipped})
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":       true,
-			"imported": imported,
-			"count":    imported,
-			"skipped":  skipped,
-		})
+		s.auditKV(r, actor, "redirect.import", "redirect", "import", "imported", imported, "skipped", skipped)
+		writeJSONKV(w, http.StatusOK, "ok", true, "imported", imported, "count", imported, "skipped", skipped)
 		return
 	}
 
 	if rest == "batch" && r.Method == http.MethodPost {
 		var req struct {
+			_ [0]func()
+
 			Action string   `json:"action"`
 			IDs    []string `json:"ids"`
 		}
@@ -1594,8 +1626,8 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 		if s.deps.Content != nil {
 			s.deps.Content.WarmCaches(r.Context())
 		}
-		s.recordAuditLog(r, actor, "redirect.batch_delete", "redirect", "batch", map[string]any{"affected": affected})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		s.auditKV(r, actor, "redirect.batch_delete", "redirect", "batch", "affected", affected)
+		writeJSONKV(w, http.StatusOK, "ok", true, "affected", affected)
 		return
 	}
 	if rest == "" {
@@ -1636,18 +1668,12 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM redirects WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM redirects WHERE ` + whereSQL + ` ORDER BY ` + orderClause
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.RedirectRule
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.RedirectRule{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     rows,
-				"redirects": rows,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writeJSONKV(w, http.StatusOK, "items", rows, "redirects", rows, "total", total, "page", page, "per_page", perPage, "page_size", perPage)
 		case http.MethodPost:
 			var in domain.RedirectRule
 			if !decodeJSONBody(w, r, 8192, &in) {
@@ -1678,7 +1704,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			if s.deps.Content != nil {
 				s.deps.Content.WarmCaches(r.Context())
 			}
-			writeJSON(w, http.StatusCreated, map[string]any{"redirect": in})
+			writeJSONKV(w, http.StatusCreated, "redirect", in)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -1889,17 +1915,20 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.Webhook](r.Context(), s.deps.Store, `SELECT * FROM webhooks ORDER BY created_at DESC`)
+			var rows []domain.Webhook
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM webhooks ORDER BY created_at DESC`)
 			out := make([]map[string]any, 0, len(rows))
 			for _, wh := range rows {
 				hasSec := wh.SecretCiphertext != ""
 				wh.SecretCiphertext = ""
-				out = append(out, map[string]any{"webhook": wh, "secret_set": hasSec})
+				out = append(out, kvMap("webhook", wh, "secret_set", hasSec))
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": out})
+			writeJSONKV(w, http.StatusOK, "items", out)
 
 		case http.MethodPost:
 			var in struct {
+				_ [0]func()
+
 				domain.Webhook
 				Secret string   `json:"secret"`
 				Events []string `json:"events"`
@@ -1942,7 +1971,7 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			writeJSON(w, http.StatusCreated, map[string]any{"webhook": in.Webhook, "secret_set": secCipher != ""})
+			writeJSONKV(w, http.StatusCreated, "webhook", in.Webhook, "secret_set", secCipher != "")
 
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1952,47 +1981,35 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 
 	parts := strings.Split(rest, "/")
 	whID := parts[0]
-	wh, err := sqlx.Get[domain.Webhook](r.Context(), s.deps.Store, `SELECT * FROM webhooks WHERE id = ?`, whID)
+	var wh domain.Webhook
+	err := sqlx.GetInto(r.Context(), s.deps.Store, &wh, `SELECT * FROM webhooks WHERE id = ?`, whID)
 	if err != nil {
 		writeErrJSON(w, http.StatusNotFound, "webhook not found")
 		return
 	}
 	if len(parts) == 2 && parts[1] == "deliveries" && r.Method == http.MethodGet {
-		rows, _ := sqlx.Select[domain.WebhookDelivery](r.Context(), s.deps.Store,
-			`SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC, id DESC LIMIT 100`, wh.ID)
+		var rows []domain.WebhookDelivery
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC, id DESC LIMIT 100`, wh.ID)
 		if rows == nil {
 			rows = []domain.WebhookDelivery{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items":      rows,
-			"deliveries": rows,
-			"total":      len(rows),
-		})
+		writeJSONKV(w, http.StatusOK, "items", rows, "deliveries", rows, "total", len(rows))
 		return
 	}
 	if len(parts) == 4 && parts[1] == "deliveries" && parts[3] == "replay" && r.Method == http.MethodPost {
-		orig, dErr := sqlx.Get[domain.WebhookDelivery](r.Context(), s.deps.Store,
-			`SELECT * FROM webhook_deliveries WHERE id = ? AND webhook_id = ?`, strings.TrimSpace(parts[2]), wh.ID)
+		var orig domain.WebhookDelivery
+		dErr := sqlx.GetInto(r.Context(), s.deps.Store, &orig, `SELECT * FROM webhook_deliveries WHERE id = ? AND webhook_id = ?`, strings.TrimSpace(parts[2]), wh.ID)
 		if dErr != nil {
 			writeErrJSON(w, http.StatusNotFound, "webhook delivery not found")
 			return
 		}
 		newDeliv, rErr := s.replayWebhookDelivery(r.Context(), wh, orig)
-		s.recordAuditLog(r, actor, "webhook.replay", "webhook", wh.ID, map[string]any{"delivery_id": orig.ID, "new_delivery_id": newDeliv.ID, "status_code": newDeliv.StatusCode})
+		s.auditKV(r, actor, "webhook.replay", "webhook", wh.ID, "delivery_id", orig.ID, "new_delivery_id", newDeliv.ID, "status_code", newDeliv.StatusCode)
 		if rErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":          false,
-				"status_code": newDeliv.StatusCode,
-				"delivery":    newDeliv,
-				"error":       rErr.Error(),
-			})
+			writeJSONKV(w, http.StatusBadRequest, "ok", false, "status_code", newDeliv.StatusCode, "delivery", newDeliv, "error", rErr.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":          true,
-			"status_code": newDeliv.StatusCode,
-			"delivery":    newDeliv,
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "status_code", newDeliv.StatusCode, "delivery", newDeliv)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "test" && r.Method == http.MethodPost {
@@ -2002,16 +2019,18 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 		}
 		code, tErr := s.deps.TestWebhook(r.Context(), wh, actor.PreferredLocale)
 		if tErr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "status_code": code, "error": tErr.Error()})
+			writeJSONKV(w, http.StatusBadRequest, "ok", false, "status_code", code, "error", tErr.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status_code": code})
+		writeJSONKV(w, http.StatusOK, "ok", true, "status_code", code)
 		return
 	}
 
 	switch r.Method {
 	case http.MethodPut:
 		var in struct {
+			_ [0]func()
+
 			domain.Webhook
 			Secret      string   `json:"secret"`
 			ClearSecret bool     `json:"clear_secret"`
@@ -2310,7 +2329,7 @@ func (s *AppServer) pruneDeletedNavFromThemeConfigs(ctx context.Context, deleted
 	if !changed {
 		return
 	}
-	patchBytes, err := json.Marshal(map[string]any{"theme_configs": nextConfigs})
+	patchBytes, err := json.Marshal(kvMap("theme_configs", nextConfigs))
 	if err == nil {
 		_, _, _ = s.deps.Settings.PatchDomain(ctx, domain.SettingsDomainAppearance, patchBytes, 0)
 	}
@@ -2329,12 +2348,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	if rest == "" && r.Method == http.MethodGet {
 		snap := s.deps.Settings.Snapshot()
 		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"active_theme": normApp.ActiveTheme,
-			"mobile_theme": normApp.MobileTheme,
-			"appearance":   normApp,
-			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		writeJSONKV(w, http.StatusOK, "active_theme", normApp.ActiveTheme, "mobile_theme", normApp.MobileTheme, "appearance", normApp, "themes", s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)))
 		return
 	}
 
@@ -2345,18 +2359,14 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		}
 		snap := s.deps.Settings.Snapshot()
 		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":           true,
-			"active_theme": normApp.ActiveTheme,
-			"mobile_theme": normApp.MobileTheme,
-			"appearance":   normApp,
-			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "active_theme", normApp.ActiveTheme, "mobile_theme", normApp.MobileTheme, "appearance", normApp, "themes", s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)))
 		return
 	}
 
 	if rest == "activate" && r.Method == http.MethodPost {
 		var req struct {
+			_ [0]func()
+
 			ThemeID string `json:"theme_id"`
 			Target  string `json:"target"` // desktop (default) | mobile | both
 		}
@@ -2400,8 +2410,8 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			writeErrJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		s.recordAuditLog(r, actor, "theme.activate", "theme", tid, map[string]any{"target": target})
-		writeJSON(w, http.StatusOK, map[string]any{"appearance": val, "version": ver})
+		s.auditKV(r, actor, "theme.activate", "theme", tid, "target", target)
+		writeJSONKV(w, http.StatusOK, "appearance", val, "version", ver)
 		return
 	}
 
@@ -2434,11 +2444,8 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
 			return
 		}
-		s.recordAuditLog(r, actor, "theme.install", "theme", mf.ID, map[string]any{"version": mf.Version})
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"theme":  mf,
-			"themes": s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		s.auditKV(r, actor, "theme.install", "theme", mf.ID, "version", mf.Version)
+		writeJSONKV(w, http.StatusCreated, "theme", mf, "themes", s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)))
 		return
 	}
 
@@ -2494,7 +2501,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			nextConfigs[k] = copied
 		}
 		nextConfigs[themeID] = cfgPatch
-		patchBytes, _ := json.Marshal(map[string]any{"theme_configs": nextConfigs})
+		patchBytes, _ := json.Marshal(kvMap("theme_configs", nextConfigs))
 		val, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 		if err != nil {
 			writeErrJSON(w, http.StatusBadRequest, err.Error())
@@ -2505,7 +2512,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		outApp := s.deps.Settings.Snapshot().Appearance
 		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, outApp)
 		_ = val
-		writeJSON(w, http.StatusOK, map[string]any{"appearance": normApp, "version": ver})
+		writeJSONKV(w, http.StatusOK, "appearance", normApp, "version", ver)
 		return
 	}
 
@@ -2530,13 +2537,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
 		nextApp := s.deps.Settings.Snapshot().Appearance
 		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, nextApp)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":           true,
-			"active_theme": normApp.ActiveTheme,
-			"mobile_theme": normApp.MobileTheme,
-			"appearance":   normApp,
-			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "active_theme", normApp.ActiveTheme, "mobile_theme", normApp.MobileTheme, "appearance", normApp, "themes", s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)))
 		return
 	}
 
@@ -2567,13 +2568,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 
 	if rest == "" && r.Method == http.MethodGet {
 		snap := s.deps.Settings.Snapshot()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"locales_dir":         extDir,
-			"default_locale":      snap.Site.DefaultLocale,
-			"allow_locale_switch": snap.Site.AllowLocaleSwitch,
-			"items":               s.deps.Catalog.Packs(),
-			"locales":             s.deps.Catalog.Locales(),
-		})
+		writeJSONKV(w, http.StatusOK, "locales_dir", extDir, "default_locale", snap.Site.DefaultLocale, "allow_locale_switch", snap.Site.AllowLocaleSwitch, "items", s.deps.Catalog.Packs(), "locales", s.deps.Catalog.Locales())
 		return
 	}
 
@@ -2585,11 +2580,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		if s.deps.Themes != nil {
 			_ = s.deps.Themes.Reload()
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"items":   s.deps.Catalog.Packs(),
-			"locales": s.deps.Catalog.Locales(),
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "items", s.deps.Catalog.Packs(), "locales", s.deps.Catalog.Locales())
 		return
 	}
 
@@ -2597,6 +2588,8 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		ct := strings.ToLower(r.Header.Get("Content-Type"))
 		if strings.HasPrefix(ct, "application/json") {
 			var req struct {
+				_ [0]func()
+
 				Code      string            `json:"code"`
 				Messages  map[string]string `json:"messages"`
 				Overwrite *bool             `json:"overwrite"`
@@ -2615,11 +2608,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 				_ = s.deps.Themes.Reload()
 			}
 			s.recordAuditLog(r, actor, "locale.install", "locale", sum.Code, nil)
-			writeJSON(w, http.StatusCreated, map[string]any{
-				"pack":    sum,
-				"items":   s.deps.Catalog.Packs(),
-				"locales": s.deps.Catalog.Locales(),
-			})
+			writeJSONKV(w, http.StatusCreated, "pack", sum, "items", s.deps.Catalog.Packs(), "locales", s.deps.Catalog.Locales())
 			return
 		}
 
@@ -2654,12 +2643,8 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			if s.deps.Themes != nil {
 				_ = s.deps.Themes.Reload()
 			}
-			s.recordAuditLog(r, actor, "locale.install_zip", "locale", installed[0].Code, map[string]any{"count": len(installed)})
-			writeJSON(w, http.StatusCreated, map[string]any{
-				"installed": installed,
-				"items":     s.deps.Catalog.Packs(),
-				"locales":   s.deps.Catalog.Locales(),
-			})
+			s.auditKV(r, actor, "locale.install_zip", "locale", installed[0].Code, "count", len(installed))
+			writeJSONKV(w, http.StatusCreated, "installed", installed, "items", s.deps.Catalog.Packs(), "locales", s.deps.Catalog.Locales())
 			return
 		}
 
@@ -2681,11 +2666,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			_ = s.deps.Themes.Reload()
 		}
 		s.recordAuditLog(r, actor, "locale.install", "locale", sum.Code, nil)
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"pack":    sum,
-			"items":   s.deps.Catalog.Packs(),
-			"locales": s.deps.Catalog.Locales(),
-		})
+		writeJSONKV(w, http.StatusCreated, "pack", sum, "items", s.deps.Catalog.Packs(), "locales", s.deps.Catalog.Locales())
 		return
 	}
 
@@ -2714,15 +2695,11 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		}
 		snap := s.deps.Settings.Snapshot()
 		if !s.deps.Catalog.Has(snap.Site.DefaultLocale) {
-			patch, _ := json.Marshal(map[string]any{"default_locale": "zh-CN"})
+			patch, _ := json.Marshal(kvMap("default_locale", "zh-CN"))
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, patch, 0)
 		}
 		s.recordAuditLog(r, actor, "locale.delete", "locale", code, nil)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"items":   s.deps.Catalog.Packs(),
-			"locales": s.deps.Catalog.Locales(),
-		})
+		writeJSONKV(w, http.StatusOK, "ok", true, "items", s.deps.Catalog.Packs(), "locales", s.deps.Catalog.Locales())
 		return
 	}
 
@@ -2731,7 +2708,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 
 func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	if s.deps.Plugins == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+		writeJSONKV(w, http.StatusOK, "items", []any{})
 		return
 	}
 	locale := strings.TrimSpace(r.URL.Query().Get("locale"))
@@ -2745,7 +2722,13 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 
 	if rest == "" && r.Method == http.MethodGet {
 		list := s.deps.Plugins.List(locale)
-		writeJSON(w, http.StatusOK, map[string]any{"items": list, "plugins": list})
+		writeJSONKV(w, http.StatusOK, "items", list, "plugins", list, "cron_jobs", s.deps.Plugins.CronJobs())
+		return
+	}
+
+	if rest == "cron" && r.Method == http.MethodGet {
+		jobs := s.deps.Plugins.CronJobs()
+		writeJSONKV(w, http.StatusOK, "items", jobs, "cron_jobs", jobs)
 		return
 	}
 
@@ -2755,7 +2738,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		list := s.deps.Plugins.List(locale)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": list, "plugins": list})
+		writeJSONKV(w, http.StatusOK, "ok", true, "items", list, "plugins", list)
 		return
 	}
 
@@ -2788,8 +2771,8 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
 			return
 		}
-		s.recordAuditLog(r, actor, "plugin.install", "plugin", sum.ID, map[string]any{"version": sum.Version})
-		writeJSON(w, http.StatusCreated, map[string]any{"plugin": sum})
+		s.auditKV(r, actor, "plugin.install", "plugin", sum.ID, "version", sum.Version)
+		writeJSONKV(w, http.StatusCreated, "plugin", sum)
 		return
 	}
 
@@ -2804,7 +2787,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			}
 			s.recordAuditLog(r, actor, "plugin.enable", "plugin", pid, nil)
 			sum, _ := s.deps.Plugins.Get(pid, locale)
-			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
+			writeJSONKV(w, http.StatusOK, "plugin", sum)
 		case parts[1] == "disable" && r.Method == http.MethodPost:
 			if err := s.deps.Plugins.Disable(r.Context(), pid); err != nil {
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
@@ -2812,7 +2795,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			}
 			s.recordAuditLog(r, actor, "plugin.disable", "plugin", pid, nil)
 			sum, _ := s.deps.Plugins.Get(pid, locale)
-			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
+			writeJSONKV(w, http.StatusOK, "plugin", sum)
 		case parts[1] == "reload" && r.Method == http.MethodPost:
 			sum, err := s.deps.Plugins.ReloadPlugin(r.Context(), pid, locale)
 			if err != nil {
@@ -2820,22 +2803,22 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.reload", "plugin", pid, nil)
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum})
+			writeJSONKV(w, http.StatusOK, "ok", true, "plugin", sum)
 		case parts[1] == "reset-circuit" && r.Method == http.MethodPost:
 			if err := s.deps.Plugins.ResetCircuit(r.Context(), pid); err != nil {
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			sum, _ := s.deps.Plugins.Get(pid, locale)
-			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
+			writeJSONKV(w, http.StatusOK, "plugin", sum)
 		case parts[1] == "kv" && r.Method == http.MethodDelete:
 			cleared, err := s.deps.Plugins.ClearPluginKV(r.Context(), pid)
 			if err != nil {
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			s.recordAuditLog(r, actor, "plugin.clear_kv", "plugin", pid, map[string]any{"cleared": cleared})
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared, "deleted": cleared})
+			s.auditKV(r, actor, "plugin.clear_kv", "plugin", pid, "cleared", cleared)
+			writeJSONKV(w, http.StatusOK, "ok", true, "cleared", cleared, "deleted", cleared)
 		case parts[1] == "config" && r.Method == http.MethodPatch:
 			var patch map[string]any
 			if !decodeJSONBody(w, r, 65536, &patch) {
@@ -2848,10 +2831,27 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			}
 			s.invalidateMediaRefCache()
 			s.recordAuditLog(r, actor, "plugin.config_patch", "plugin", pid, nil)
-			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
+			writeJSONKV(w, http.StatusOK, "plugin", sum)
 		case parts[1] == "logs" && r.Method == http.MethodGet:
 			entries, _ := s.deps.Plugins.Logger().Tail(pid, 100)
-			writeJSON(w, http.StatusOK, map[string]any{"items": entries})
+			writeJSONKV(w, http.StatusOK, "items", entries)
+		case parts[1] == "cron" && r.Method == http.MethodGet:
+			jobs := s.deps.Plugins.PluginCronJobs(pid)
+			writeJSONKV(w, http.StatusOK, "items", jobs, "cron_jobs", jobs)
+		case (parts[1] == "cron" || parts[1] == "trigger-cron") && r.Method == http.MethodPost:
+			jobName := strings.TrimSpace(r.URL.Query().Get("name"))
+			if jobName == "" && r.ContentLength > 0 {
+				var body struct {
+					_ [0]func()
+
+					Name string `json:"name"`
+				}
+				_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body)
+				jobName = strings.TrimSpace(body.Name)
+			}
+			triggered := s.deps.Plugins.TriggerCronJob(pid, jobName)
+			s.auditKV(r, actor, "plugin.cron_trigger", "plugin", pid, "name", jobName, "triggered", triggered)
+			writeJSONKV(w, http.StatusOK, "ok", true, "triggered", triggered)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -2906,21 +2906,14 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			effectiveUploadDir = s.deps.Config.GetUploadDir()
 		}
 		_, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"domains":              result,
-			"versions":             versions,
-			"storage_drivers":      storageDrivers,
-			"default_upload_dir":   defaultUploadDir,
-			"effective_upload_dir": effectiveUploadDir,
-			"default_geoip_dir":    defaultGeoIPDir,
-			"effective_geoip_dir":  effectiveGeoIPDir,
-			"geoip_status":         geoStatus,
-		})
+		writeJSONKV(w, http.StatusOK, "domains", result, "versions", versions, "storage_drivers", storageDrivers, "default_upload_dir", defaultUploadDir, "effective_upload_dir", effectiveUploadDir, "default_geoip_dir", defaultGeoIPDir, "effective_geoip_dir", effectiveGeoIPDir, "geoip_status", geoStatus)
 		return
 	}
 
 	if rest == "notifications/test-smtp" && r.Method == http.MethodPost {
 		var req struct {
+			_ [0]func()
+
 			ToEmail  string                        `json:"to_email"`
 			Settings *domain.NotificationsSettings `json:"settings"`
 			Password string                        `json:"smtp_password"`
@@ -2941,15 +2934,17 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		if err := s.deps.TestSMTP(r.Context(), cfg, req.Password, to, actor.PreferredLocale); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "to": to})
+		writeJSONKV(w, http.StatusOK, "ok", true, "to", to)
 		return
 	}
 
 	if rest == "storage/test" && r.Method == http.MethodPost {
 		var req struct {
+			_ [0]func()
+
 			Settings  *domain.StorageSettings `json:"settings"`
 			SecretKey string                  `json:"s3_secret_key"`
 		}
@@ -2958,19 +2953,19 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			drv := strings.ToLower(strings.TrimSpace(req.Settings.ActiveDriver))
 			if drv == "" || drv == "local" {
 				if _, vErr := s.deps.Config.ValidateCustomUploadDir(req.Settings.LocalDir); vErr != nil {
-					writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": vErr.Error()})
+					writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", vErr.Error())
 					return
 				}
 			}
 		}
 		if s.deps.Media != nil {
 			if err := s.deps.Media.TestStorage(r.Context(), req.Settings, req.SecretKey); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+				writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 				return
 			}
 		} else if s.deps.Config != nil {
 			if err := os.MkdirAll(s.deps.Config.GetUploadDir(), 0o750); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+				writeJSONKV(w, http.StatusBadRequest, "ok", false, "error", err.Error())
 				return
 			}
 		}
@@ -2986,7 +2981,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
-		writeJSON(w, http.StatusOK, map[string]any{"domain": rest, "value": val, "version": ver})
+		writeJSONKV(w, http.StatusOK, "domain", rest, "value", val, "version", ver)
 
 	case http.MethodPatch:
 		rawBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256*1024))
@@ -2995,6 +2990,8 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		var meta struct {
+			_ [0]func()
+
 			ExpectedVersion int64 `json:"expected_version"`
 		}
 		_ = json.Unmarshal(rawBytes, &meta)
@@ -3075,9 +3072,9 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 		s.invalidateMediaRefCache()
-		s.recordAuditLog(r, actor, "settings.patch", "settings", rest, map[string]any{"version": ver})
+		s.auditKV(r, actor, "settings.patch", "settings", rest, "version", ver)
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
-		resp := map[string]any{"domain": rest, "value": val, "version": ver}
+		resp := kvMap("domain", rest, "value", val, "version", ver)
 		if rest == domain.SettingsDomainSecurity {
 			_, _, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
 			resp["effective_geoip_dir"] = effectiveGeoIPDir
@@ -3193,21 +3190,17 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				 FROM users WHERE ` + whereSQL + `
 				 ORDER BY CASE WHEN role = 'admin' THEN 0 WHEN role = 'editor' THEN 1 ELSE 2 END, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.User](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.User
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.User{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     rows,
-				"users":     rows,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writeJSONKV(w, http.StatusOK, "items", rows, "users", rows, "total", total, "page", page, "per_page", perPage, "page_size", perPage)
 
 		case http.MethodPost:
 			var req struct {
+				_ [0]func()
+
 				Username        string `json:"username"`
 				Email           string `json:"email"`
 				DisplayName     string `json:"display_name"`
@@ -3258,8 +3251,8 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			s.recordAuditLog(r, actor, "user.create", "user", u.ID, map[string]any{"role": u.Role, "username": u.Username})
-			writeJSON(w, http.StatusCreated, map[string]any{"user": u})
+			s.auditKV(r, actor, "user.create", "user", u.ID, "role", u.Role, "username", u.Username)
+			writeJSONKV(w, http.StatusCreated, "user", u)
 
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3274,6 +3267,8 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 	switch r.Method {
 	case http.MethodPatch:
 		var req struct {
+			_ [0]func()
+
 			DisplayName     *string `json:"display_name"`
 			Email           *string `json:"email"`
 			PreferredLocale *string `json:"preferred_locale"`
@@ -3285,7 +3280,8 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		if !decodeJSONBody(w, r, 8192, &req) {
 			return
 		}
-		u, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, rest)
+		var u domain.User
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &u, `SELECT * FROM users WHERE id = ?`, rest)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
@@ -3334,13 +3330,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM user_sessions WHERE user_id = ?`, rest)
 			_ = s.deps.Auth.RevokeUserAPITokens(r.Context(), rest)
 		}
-		s.recordAuditLog(r, actor, "user.update", "user", rest, map[string]any{
-			"role":             u.Role,
-			"status":           u.Status,
-			"self":             rest == actor.ID,
-			"email_changed":    emailChanged,
-			"password_changed": req.Password != "",
-		})
+		s.auditKV(r, actor, "user.update", "user", rest, "role", u.Role, "status", u.Status, "self", rest == actor.ID, "email_changed", emailChanged, "password_changed", req.Password != "")
 		writeOKJSON(w)
 
 	case http.MethodDelete:
@@ -3363,6 +3353,8 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "batch" && r.Method == http.MethodPost {
 		var req struct {
+			_ [0]func()
+
 			Action string   `json:"action"`
 			IDs    []string `json:"ids"`
 		}
@@ -3398,8 +3390,8 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 		if s.deps.WAF != nil {
 			_ = s.deps.WAF.ReloadBans(r.Context())
 		}
-		s.recordAuditLog(r, actor, "security.ip_ban_batch_delete", "ip_ban", "batch", map[string]any{"affected": affected})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		s.auditKV(r, actor, "security.ip_ban_batch_delete", "ip_ban", "batch", "affected", affected)
+		writeJSONKV(w, http.StatusOK, "ok", true, "affected", affected)
 		return
 	}
 	if rest == "" {
@@ -3430,21 +3422,17 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM security_ip_bans WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM security_ip_bans WHERE ` + whereSQL + ` ORDER BY created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.SecurityIPBan](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.SecurityIPBan
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.SecurityIPBan{}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     rows,
-				"bans":      rows,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
-			})
+			writeJSONKV(w, http.StatusOK, "items", rows, "bans", rows, "total", total, "page", page, "per_page", perPage, "page_size", perPage)
 
 		case http.MethodPost:
 			var req struct {
+				_ [0]func()
+
 				CIDR         string `json:"cidr"`
 				Note         string `json:"note"`
 				ExpiresHours int    `json:"expires_hours"`
@@ -3462,8 +3450,8 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			s.recordAuditLog(r, actor, "security.ip_ban_add", "ip_ban", rec.ID, map[string]any{"cidr": rec.CIDR})
-			writeJSON(w, http.StatusCreated, map[string]any{"ban": rec})
+			s.auditKV(r, actor, "security.ip_ban_add", "ip_ban", rec.ID, "cidr", rec.CIDR)
+			writeJSONKV(w, http.StatusCreated, "ban", rec)
 
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3513,6 +3501,8 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "reload" && r.Method == http.MethodPost {
 		var req struct {
+			_ [0]func()
+
 			GeoIPDir *string `json:"geoip_dir"`
 		}
 		if !decodeOptJSONBody(w, r, 8192, &req) {
@@ -3533,7 +3523,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 				}
 				normDir = validDir
 			}
-			patchBytes, _ := json.Marshal(map[string]any{"geoip_dir": normDir})
+			patchBytes, _ := json.Marshal(kvMap("geoip_dir", normDir))
 			_, ver, pErr := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, patchBytes, 0)
 			if pErr != nil {
 				writeErrJSON(w, http.StatusBadRequest, pErr.Error())
@@ -3564,38 +3554,21 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 		}
 
 		configuredGeoIPDir, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
-		s.recordAuditLog(r, actor, "security.geoip_reload", "settings", "security", map[string]any{
-			"path":         effectiveGeoIPDir,
-			"active_files": geoStatus.ActiveFiles,
-		})
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":                  true,
-			"geoip_dir":           configuredGeoIPDir,
-			"default_geoip_dir":   defaultGeoIPDir,
-			"effective_geoip_dir": effectiveGeoIPDir,
-			"geoip_status":        geoStatus,
-			"version":             secVer,
-		})
+		s.auditKV(r, actor, "security.geoip_reload", "settings", "security", "path", effectiveGeoIPDir, "active_files", geoStatus.ActiveFiles)
+		writeJSONKV(w, http.StatusOK, "ok", true, "geoip_dir", configuredGeoIPDir, "default_geoip_dir", defaultGeoIPDir, "effective_geoip_dir", effectiveGeoIPDir, "geoip_status", geoStatus, "version", secVer)
 		return
 	}
 
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.SecurityGeoRule](r.Context(), s.deps.Store,
-				`SELECT * FROM security_geo_rules ORDER BY sort_order ASC, created_at ASC`)
+			var rows []domain.SecurityGeoRule
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM security_geo_rules ORDER BY sort_order ASC, created_at ASC`)
 			if rows == nil {
 				rows = []domain.SecurityGeoRule{}
 			}
 			configuredGeoIPDir, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
-			writeJSON(w, http.StatusOK, map[string]any{
-				"items":                      rows,
-				"geo_access_circuit_enabled": s.deps.Config != nil && s.deps.Config.GeoAccessEnabled,
-				"geoip_dir":                  configuredGeoIPDir,
-				"default_geoip_dir":          defaultGeoIPDir,
-				"effective_geoip_dir":        effectiveGeoIPDir,
-				"geoip_status":               geoStatus,
-			})
+			writeJSONKV(w, http.StatusOK, "items", rows, "geo_access_circuit_enabled", s.deps.Config != nil && s.deps.Config.GeoAccessEnabled, "geoip_dir", configuredGeoIPDir, "default_geoip_dir", defaultGeoIPDir, "effective_geoip_dir", effectiveGeoIPDir, "geoip_status", geoStatus)
 		case http.MethodPost:
 			var in domain.SecurityGeoRule
 			if !decodeJSONBody(w, r, 16384, &in) {
@@ -3624,7 +3597,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 			s.recordAuditLog(r, actor, "security.geo_rule_add", "geo_rule", in.ID, nil)
-			writeJSON(w, http.StatusCreated, map[string]any{"rule": in})
+			writeJSONKV(w, http.StatusCreated, "rule", in)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -3633,7 +3606,8 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 
 	switch r.Method {
 	case http.MethodPut:
-		prev, pErr := sqlx.Get[domain.SecurityGeoRule](r.Context(), s.deps.Store, `SELECT * FROM security_geo_rules WHERE id = ?`, rest)
+		var prev domain.SecurityGeoRule
+		pErr := sqlx.GetInto(r.Context(), s.deps.Store, &prev, `SELECT * FROM security_geo_rules WHERE id = ?`, rest)
 		if pErr != nil {
 			writeErrJSON(w, http.StatusNotFound, "geo rule not found")
 			return
@@ -3685,7 +3659,7 @@ func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Reque
 	filename := fmt.Sprintf("volo-backup-%s.zip", time.Now().UTC().Format("20060102-150405"))
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	s.recordAuditLog(r, actor, "backup.export", "system", filename, map[string]any{"include_media": withMedia})
+	s.auditKV(r, actor, "backup.export", "system", filename, "include_media", withMedia)
 	_, _ = backup.Create(r.Context(), s.deps.Store, w, backup.CreateOptions{
 		IncludeMedia: withMedia,
 		UploadDir:    s.deps.Config.GetUploadDir(),
@@ -3693,6 +3667,8 @@ func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Reque
 }
 
 type localBackupItem struct {
+	_ [0]func()
+
 	Name      string `json:"name"`
 	SizeBytes int64  `json:"size_bytes"`
 	CreatedAt int64  `json:"created_at"`
@@ -3731,7 +3707,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, http.StatusOK, map[string]any{"items": s.listLocalBackups(backupDir)})
+			writeJSONKV(w, http.StatusOK, "items", s.listLocalBackups(backupDir))
 		case http.MethodPost:
 			sched := s.deps.BackupScheduler
 			if sched == nil {
@@ -3754,14 +3730,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 				warn = err.Error()
 			}
 			s.recordAuditLog(r, actor, "backup.local_snapshot", "system", filepath.Base(res.LocalPath), nil)
-			writeJSON(w, http.StatusOK, map[string]any{
-				"ok":              true,
-				"file":            filepath.Base(res.LocalPath),
-				"pruned_count":    res.PrunedCount,
-				"remote_uploaded": res.RemoteUploaded,
-				"remote_warning":  warn,
-				"items":           s.listLocalBackups(backupDir),
-			})
+			writeJSONKV(w, http.StatusOK, "ok", true, "file", filepath.Base(res.LocalPath), "pruned_count", res.PrunedCount, "remote_uploaded", res.RemoteUploaded, "remote_warning", warn, "items", s.listLocalBackups(backupDir))
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -3784,6 +3753,8 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		dryRun, _ := strconv.ParseBool(r.URL.Query().Get("dry_run"))
 		if !dryRun && r.ContentLength > 0 {
 			var bodyReq struct {
+				_ [0]func()
+
 				DryRun bool `json:"dry_run"`
 			}
 			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&bodyReq) == nil && bodyReq.DryRun {
@@ -3804,9 +3775,9 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 				_, _ = s.deps.Settings.Reload(r.Context())
 				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
 				s.reloadRuntimeAfterDBRestore(r.Context())
-				s.recordAuditLog(r, actor, "backup.local_restore", "system", base, map[string]any{"legacy": true})
+				s.auditKV(r, actor, "backup.local_restore", "system", base, "legacy", true)
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "legacy": true, "report": rep})
+			writeJSONKV(w, http.StatusOK, "ok", true, "dry_run", dryRun, "legacy", true, "report", rep)
 			return
 		}
 
@@ -3822,7 +3793,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			s.reloadRuntimeAfterDBRestore(r.Context())
 			s.recordAuditLog(r, actor, "backup.local_restore", "system", base, nil)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "summary": sum})
+		writeJSONKV(w, http.StatusOK, "ok", true, "dry_run", dryRun, "summary", sum)
 		return
 	}
 
@@ -3855,7 +3826,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		s.recordAuditLog(r, actor, "backup.local_delete", "system", base, nil)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": s.listLocalBackups(backupDir)})
+		writeJSONKV(w, http.StatusOK, "ok", true, "items", s.listLocalBackups(backupDir))
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -3924,7 +3895,7 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 			s.reloadRuntimeAfterDBRestore(r.Context())
 			s.recordAuditLog(r, actor, "backup.restore_legacy", "system", "legacy", nil)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "legacy": true, "report": rep})
+		writeJSONKV(w, http.StatusOK, "ok", true, "legacy", true, "report", rep)
 		return
 	}
 
@@ -3940,5 +3911,5 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 		s.reloadRuntimeAfterDBRestore(r.Context())
 		s.recordAuditLog(r, actor, "backup.restore", "system", "native", nil)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": sum})
+	writeJSONKV(w, http.StatusOK, "ok", true, "summary", sum)
 }

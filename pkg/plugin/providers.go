@@ -9,6 +9,8 @@ import (
 
 // Anti-spam verdict actions.
 const (
+	// SpamActionPass indicates no verdict override from the provider (defer to host moderation/keyword rules).
+	SpamActionPass     = "pass"
 	SpamActionAllow    = "allow"
 	SpamActionModerate = "moderate"
 	SpamActionReject   = "reject"
@@ -24,6 +26,8 @@ type StorageProvider interface {
 
 // NotificationEvent represents an outbound event dispatched through NotifierProvider implementations.
 type NotificationEvent struct {
+	_ [0]func()
+
 	Event   string            `json:"event"`
 	Locale  string            `json:"locale"`
 	Title   string            `json:"title"`
@@ -40,6 +44,8 @@ type NotifierProvider interface {
 
 // OIDCIdentity holds a verified external identity returned by an OIDCProvider.
 type OIDCIdentity struct {
+	_ [0]func()
+
 	Provider      string `json:"provider"`
 	Subject       string `json:"subject"`
 	Email         string `json:"email"`
@@ -51,6 +57,8 @@ type OIDCIdentity struct {
 
 // OIDCAuthParams carries authorization URL parameters including OIDC nonce and PKCE S256 challenge.
 type OIDCAuthParams struct {
+	_ [0]func()
+
 	State               string `json:"state"`
 	RedirectURI         string `json:"redirect_uri"`
 	Nonce               string `json:"nonce,omitempty"`
@@ -60,6 +68,8 @@ type OIDCAuthParams struct {
 
 // OIDCExchangeParams carries authorization code exchange parameters including OIDC nonce and PKCE verifier.
 type OIDCExchangeParams struct {
+	_ [0]func()
+
 	Code         string `json:"code"`
 	RedirectURI  string `json:"redirect_uri"`
 	Nonce        string `json:"nonce,omitempty"`
@@ -83,6 +93,8 @@ type OIDCAdvancedProvider interface {
 
 // CommentCheckInput contains sanitized comment attributes evaluated by AntiSpamProvider.
 type CommentCheckInput struct {
+	_ [0]func()
+
 	TargetType string `json:"target_type"`
 	TargetID   string `json:"target_id"`
 	AuthorName string `json:"author_name"`
@@ -94,9 +106,23 @@ type CommentCheckInput struct {
 	IsGuest    bool   `json:"is_guest"`
 }
 
+// NicknameCheckInput contains candidate account/profile nickname attributes evaluated during registration or OIDC provisioning.
+type NicknameCheckInput struct {
+	_ [0]func()
+
+	Nickname  string `json:"nickname"`
+	Email     string `json:"email,omitempty"`
+	IPMasked  string `json:"ip_masked,omitempty"`
+	GeoRegion string `json:"geo_region,omitempty"`
+	Locale    string `json:"locale"`
+	Source    string `json:"source"`
+}
+
 // SpamVerdict is returned by AntiSpamProvider implementations.
 type SpamVerdict struct {
-	Action string  `json:"action"` // allow | moderate | reject
+	_ [0]func()
+
+	Action string  `json:"action"` // pass | allow | moderate | reject
 	Score  float64 `json:"score"`
 	Reason string  `json:"reason,omitempty"`
 }
@@ -108,6 +134,13 @@ type AntiSpamProvider interface {
 	CheckComment(ctx context.Context, input CommentCheckInput) (SpamVerdict, error)
 }
 
+// NicknameAntiSpamProvider is an optional extension implemented by AntiSpamProvider plugins
+// that screen candidate registration/profile nicknames (`checkNickname(input)` in JS).
+type NicknameAntiSpamProvider interface {
+	AntiSpamProvider
+	CheckNickname(ctx context.Context, input NicknameCheckInput) (SpamVerdict, error)
+}
+
 type providerEntry[T any] struct {
 	pluginID string
 	provider T
@@ -116,6 +149,8 @@ type providerEntry[T any] struct {
 // ProviderRegistry coordinates hot-swappable plugin providers with automatic fallback to built-in
 // host providers whenever a plugin is disabled, uninstalled, or circuit-broken.
 type ProviderRegistry struct {
+	_ [0]func()
+
 	mu sync.RWMutex
 
 	defaultStorage  StorageProvider
@@ -290,7 +325,7 @@ func (r *ProviderRegistry) EvaluateComment(ctx context.Context, input CommentChe
 
 	if active != nil {
 		verdict, err := active.CheckComment(ctx, input)
-		if err == nil && (verdict.Action == SpamActionAllow || verdict.Action == SpamActionModerate || verdict.Action == SpamActionReject) {
+		if err == nil && (verdict.Action == SpamActionPass || verdict.Action == SpamActionAllow || verdict.Action == SpamActionModerate || verdict.Action == SpamActionReject) {
 			return verdict
 		}
 	}
@@ -300,7 +335,55 @@ func (r *ProviderRegistry) EvaluateComment(ctx context.Context, input CommentChe
 			return verdict
 		}
 	}
-	return SpamVerdict{Action: SpamActionAllow}
+	return SpamVerdict{Action: SpamActionPass}
+}
+
+// EvaluateNickname screens a candidate account/profile nickname through the active AntiSpamProvider
+// (preferring NicknameAntiSpamProvider.CheckNickname when implemented, or falling back to CheckComment).
+func (r *ProviderRegistry) EvaluateNickname(ctx context.Context, input NicknameCheckInput) SpamVerdict {
+	r.mu.RLock()
+	var active AntiSpamProvider
+	if n := len(r.antiSpamList); n > 0 {
+		active = r.antiSpamList[n-1].provider
+	}
+	fallback := r.defaultAntiSpam
+	r.mu.RUnlock()
+
+	evalOne := func(p AntiSpamProvider) (SpamVerdict, bool) {
+		if p == nil {
+			return SpamVerdict{}, false
+		}
+		var (
+			verdict SpamVerdict
+			err     error
+		)
+		if np, ok := p.(NicknameAntiSpamProvider); ok {
+			verdict, err = np.CheckNickname(ctx, input)
+		} else {
+			verdict, err = p.CheckComment(ctx, CommentCheckInput{
+				TargetType: "nickname",
+				TargetID:   input.Source,
+				AuthorName: input.Nickname,
+				ContentMD:  input.Nickname,
+				IPMasked:   input.IPMasked,
+				GeoRegion:  input.GeoRegion,
+				Locale:     input.Locale,
+				IsGuest:    true,
+			})
+		}
+		if err == nil && (verdict.Action == SpamActionPass || verdict.Action == SpamActionAllow || verdict.Action == SpamActionModerate || verdict.Action == SpamActionReject) {
+			return verdict, true
+		}
+		return SpamVerdict{}, false
+	}
+
+	if v, ok := evalOne(active); ok {
+		return v
+	}
+	if v, ok := evalOne(fallback); ok {
+		return v
+	}
+	return SpamVerdict{Action: SpamActionPass}
 }
 
 func removeEntries[T any](in []providerEntry[T], pluginID string) []providerEntry[T] {
@@ -321,5 +404,5 @@ type noopAntiSpamProvider struct{}
 
 func (noopAntiSpamProvider) Name() string { return "builtin-default" }
 func (noopAntiSpamProvider) CheckComment(_ context.Context, _ CommentCheckInput) (SpamVerdict, error) {
-	return SpamVerdict{Action: SpamActionAllow}, nil
+	return SpamVerdict{Action: SpamActionPass}, nil
 }

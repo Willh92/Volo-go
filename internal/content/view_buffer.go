@@ -26,6 +26,8 @@ type topItemBucketKey struct {
 // SQLite transactions by coalescing view_count, redirect hit_count, analytics_daily, and analytics_top_items
 // increments in memory and flushing them in a single batched transaction every 2s and on graceful shutdown.
 type viewAnalyticsBuffer struct {
+	_ [0]func()
+
 	store *sqlx.Store
 
 	mu                       sync.RWMutex

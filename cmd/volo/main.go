@@ -617,8 +617,8 @@ func cmdAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 
 		var targetUser domain.User
 		err = store.WithTx(ctx, func(tx *sqlx.Tx) error {
-			u, qErr := sqlx.Get[domain.User](ctx, tx,
-				`SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
+			var u domain.User
+			qErr := sqlx.GetInto(ctx, tx, &u, `SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
 				ident, ident)
 			if qErr != nil {
 				if errors.Is(qErr, sql.ErrNoRows) {
@@ -685,8 +685,8 @@ func cmdAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		var removedCount int64
 		var targetUser domain.User
 		err = store.WithTx(ctx, func(tx *sqlx.Tx) error {
-			u, qErr := sqlx.Get[domain.User](ctx, tx,
-				`SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
+			var u domain.User
+			qErr := sqlx.GetInto(ctx, tx, &u, `SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
 				ident, ident)
 			if qErr != nil {
 				if errors.Is(qErr, sql.ErrNoRows) {

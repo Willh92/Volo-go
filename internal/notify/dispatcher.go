@@ -39,6 +39,8 @@ type asyncNotifyJob struct {
 
 // Dispatcher coordinates SMTP email notifications, multi-platform Webhooks, and NotifierProvider plugins.
 type Dispatcher struct {
+	_ [0]func()
+
 	store    *sqlx.Store
 	keys     *config.KeyRing
 	settings *repo.SettingsManager
@@ -59,6 +61,8 @@ type Dispatcher struct {
 
 // DispatcherOptions configures a unified Notification Dispatcher.
 type DispatcherOptions struct {
+	_ [0]func()
+
 	Store          *sqlx.Store
 	Keys           *config.KeyRing
 	Settings       *repo.SettingsManager
@@ -367,8 +371,8 @@ func (d *Dispatcher) dispatchCommentNotifications(ctx context.Context, view cont
 
 	// 3. Notify parent commenter if comment is approved and parent opted into encrypted email alerts
 	if snap.Notifications.NotifyReplyByEmail && view.Status == domain.CommentStatusApproved && in.ParentID != "" {
-		parent, pErr := sqlx.Get[domain.Comment](ctx, d.store,
-			`SELECT id, user_id, notify_email_ciphertext, notify_locale, is_deleted FROM comments WHERE id = ?`, in.ParentID)
+		var parent domain.Comment
+		pErr := sqlx.GetInto(ctx, d.store, &parent, `SELECT id, user_id, notify_email_ciphertext, notify_locale, is_deleted FROM comments WHERE id = ?`, in.ParentID)
 		if pErr == nil && !parent.IsDeleted {
 			recipientEmail := d.decryptCommentNotifyEmail(ctx, parent)
 			if recipientEmail != "" {
@@ -442,8 +446,8 @@ func (d *Dispatcher) BroadcastWebhookEvent(ctx context.Context, ev WebhookEvent)
 	if d.store == nil {
 		return
 	}
-
-	hooks, err := sqlx.Select[domain.Webhook](ctx, d.store, `SELECT * FROM webhooks WHERE is_enabled = ?`, true)
+	var hooks []domain.Webhook
+	err := sqlx.SelectInto(ctx, d.store, &hooks, `SELECT * FROM webhooks WHERE is_enabled = ?`, true)
 	if err != nil {
 		return
 	}
@@ -490,16 +494,19 @@ func (d *Dispatcher) decryptCommentNotifyEmail(ctx context.Context, c domain.Com
 		}
 	}
 	if c.UserID != "" {
-		if u, err := sqlx.Get[domain.User](ctx, d.store, `SELECT email FROM users WHERE id = ? AND status = ?`, c.UserID, domain.UserStatusActive); err == nil {
-			return strings.TrimSpace(u.Email)
+		{
+			var u domain.User
+			if err := sqlx.GetInto(ctx, d.store, &u, `SELECT email FROM users WHERE id = ? AND status = ?`, c.UserID, domain.UserStatusActive); err == nil {
+				return strings.TrimSpace(u.Email)
+			}
 		}
 	}
 	return ""
 }
 
 func (d *Dispatcher) lookupPrimaryAdminEmail(ctx context.Context) string {
-	u, err := sqlx.Get[domain.User](ctx, d.store,
-		`SELECT email FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
+	var u domain.User
+	err := sqlx.GetInto(ctx, d.store, &u, `SELECT email FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
 		domain.RoleAdmin, domain.UserStatusActive)
 	if err != nil {
 		return ""
@@ -509,13 +516,15 @@ func (d *Dispatcher) lookupPrimaryAdminEmail(ctx context.Context) string {
 
 func (d *Dispatcher) resolveTargetTitleAndPath(ctx context.Context, targetType, targetID string) (string, string) {
 	if targetType == domain.TargetTypePage {
-		pg, err := sqlx.Get[domain.Page](ctx, d.store, `SELECT title, slug FROM pages WHERE id = ?`, targetID)
+		var pg domain.Page
+		err := sqlx.GetInto(ctx, d.store, &pg, `SELECT title, slug FROM pages WHERE id = ?`, targetID)
 		if err == nil {
 			return pg.Title, "/" + pg.Slug
 		}
 		return "Page", "/"
 	}
-	art, err := sqlx.Get[domain.RawArticle](ctx, d.store, `SELECT title, slug FROM articles WHERE id = ?`, targetID)
+	var art domain.RawArticle
+	err := sqlx.GetInto(ctx, d.store, &art, `SELECT title, slug FROM articles WHERE id = ?`, targetID)
 	if err == nil {
 		return art.Title, visibility.ArticlePath(art.Slug)
 	}

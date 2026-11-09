@@ -48,6 +48,8 @@ type ResolverFunc func(ctx context.Context, host string) ([]netip.Addr, error)
 // OutboundSafeDialer enforces connection-level SSRF protection with DNS-pinning (zero TOCTOU rebinding)
 // and optional host allowlists (for sandboxed external plugins).
 type OutboundSafeDialer struct {
+	_ [0]func()
+
 	AllowedHosts          []string
 	Timeout               time.Duration
 	Resolver              ResolverFunc

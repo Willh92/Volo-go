@@ -88,6 +88,8 @@ func hasDotDotSegment(slashPath string) bool {
 }
 
 type bundledMediaCandidate struct {
+	_ [0]func()
+
 	relKey     string // normalized slash path under uploads/, e.g. "2023/05/demo.png"
 	legacyPath string // e.g. "/image/2023/05/demo.png" or "/images/foo.png"
 	origName   string
@@ -450,6 +452,8 @@ func hasDisguisedActiveMarkup(head []byte) bool {
 // urlRewriter rewrites legacy site origins, CDN prefixes, .html permalinks, and /image/* paths
 // across structured URLs and Markdown/HTML bodies while counting total URLs rewritten.
 type urlRewriter struct {
+	_ [0]func()
+
 	adminPath       string
 	newSiteURL      string
 	oldPrefixes     []string

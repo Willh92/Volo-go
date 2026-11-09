@@ -95,7 +95,7 @@ themes/my-editorial/
 
 ## 2. 安全沙箱插件开发（`manifest.json` + `goja`）
 
-`Volo-go` 彻底摒弃“在核心代码硬编码判断特定插件名”的做法。所有内置能力与外部目录插件（如 [`plugins/kanbanniang`](../../plugins/kanbanniang/)）统一遵守声明式权限沙箱协议。
+`Volo-go` 彻底摒弃“在核心代码硬编码判断特定插件名”的做法。所有内置能力与外部目录插件（如 [`plugins/kanbanniang`](../../plugins/kanbanniang/)、[`plugins/sensitive-words`](../../plugins/sensitive-words/)）统一遵守声明式权限沙箱协议。
 
 ### 2.1 插件目录结构与 `.zip` 热插拔
 
@@ -199,24 +199,24 @@ plugins/hello-callout/
      - `crypto`：解锁 `volo.crypto`（`sha256`、`hmacSha256`、`randomUUID`）；
      - `site:read`：解锁 `volo.site.info()` 读取站点只读元信息；
      - `ratelimit`：解锁 `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)` 滑动窗口限流器（声明 `http:routes` 时亦自动开放）；
-     - `cron`：允许声明 `cron` 周期后台任务；
+     - `cron`：接入宿主**统一最小堆定时调度中心（`CronRegistry`）**，支持在 `manifest.json` 静态声明或通过 `volo.cron` 动态注册/注销周期任务（零任务时零后台空转唤醒，同任务非重入合并执行）；
    - **领域钩子**（支持 `hooks:*` 或细粒度令牌）：
      - 文章生命周期：`hooks:article.published`、`hooks:article.updated`、`hooks:article.deleted`；
      - 独立页面生命周期：`hooks:page.published`、`hooks:page.updated`、`hooks:page.deleted`；
      - 评论治理：`hooks:comment.before_create`、`hooks:comment.created`、`hooks:comment.moderated`；
      - 渲染管线：`hooks:render.pre_markdown`（在非加密且不含 `:::lock` 的文章进入 Markdown 解析器前改写 `content_md`）与 `hooks:render.post_html`（对渲染后的 HTML 做后处理并二次净化）；
    - **界面插槽**（支持 `ui:slots` 或按插槽授权）：`slots:public.head`、`slots:public.header`、`slots:public.sidebar`、`slots:article.before_content`、`slots:article.after_content`、`slots:comment.before`、`slots:comment.after`、`slots:public.footer`、`slots:editor.quick_insert`、`slots:admin.dashboard_card`；
-   - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*` 自定义公开路由）、`http:raw_headers`（按需透传 `x-hub-signature-256`、`x-signature`、`stripe-signature`、`authorization` 等安全验签请求头）、`http.outbound:<hostname>` / `allowed_hosts`（显式域名或 `*.domain.tld` 白名单 + `OutboundSafeDialer` 防 SSRF）；
+   - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*` 自定义公开路由）、`http:raw_headers`（按需透传 `x-hub-signature-256`、`x-signature`、`stripe-signature`、`authorization` 等安全验签请求头）、`http:outbound` + `http.outbound:<hostname>` / `allowed_hosts`（显式域名白名单或插件 `config_schema` 中校验通过的 `type: "url"` 目标域名 + `OutboundSafeDialer` 防 SSRF）；
    - **核心扩展 Provider**：
      - `provider:storage`：当 `main.js` 实现 `storagePut(objectKey, bodyBase64, contentType)`（返回公开 URL 字符串或 `{ url }`）与可选 `storageDelete(objectKey)`、`storageHealthCheck()` 时自动注册外部媒体/备份对象存储驱动（`StorageProvider`）；若插件熔断或不可用则自动降级回本地磁盘不中断上传；
      - `provider:oidc`：当 `main.js` 实现 `oidcAuthURL(state, redirectURI, opts)`（`opts` 含 `{ nonce, code_challenge, code_challenge_method }`，若返回的有效 `http`/`https` URL 尚未附带 `nonce` 或 `code_challenge`，宿主会自动补齐查询参数；2 参数旧签名保持 100% 兼容）与 `oidcExchange(code, redirectURI, opts)`（`opts` 含 `{ nonce, code_verifier }`，返回 `{ subject, email, email_verified, nonce, display_name, avatar_url }`，其中 `email_verified` 缺省严格默认为 `false`），以及可选 `oidcProviderInfo()`（返回 `{ id, display_name }`）时自动注册第三方联合登录驱动（`OIDCProvider` / `OIDCAdvancedProvider`）；
      - `provider:notifier`：注册自定义通知渠道，支持导出 `sendNotification(event)` 或 `notifySend(event)`，与邮件和 Webhook 并行分发；
-     - `provider:antispam`：当 `main.js` 实现 `checkSpam(input)`（返回 `{ action: "allow" | "moderate" | "reject", reason, score }`）时自动注册评论反垃圾审查驱动（`AntiSpamProvider`）；
+     - `provider:antispam`：当 `main.js` 实现 `checkSpam(input)`（返回 `{ action: "pass" | "allow" | "moderate" | "reject", reason, score }`）与可选 `checkNickname(input)` 时自动注册评论与昵称审查驱动（`AntiSpamProvider` / `NicknameAntiSpamProvider`），统一覆盖**评论正文、访客/读者评论昵称、读者邮箱注册（含发码预检且拦截不消耗验证码）及 OIDC 首次自动建号昵称**；官方插件 [`plugins/sensitive-words`](../../plugins/sensitive-words/) 基于 `houbb/sensitive-word` 6.4 万+ 分类词库与 16 字节零 GC 指针 BFS-CSR Aho-Corasick 自动机实现简繁折叠、分隔符/叠字反混淆、区间安全白名单与在线转换热更新；
    - **高敏读取**：`articles:read_protected`（未显式声明此权限的 JS 插件，即使调用方直接触发 `DispatchHook` 或 `DispatchArticleHook`，宿主也会自动清空密码保护文章正文并按 CommonMark 嵌套规则物理剥离所有 `:::lock ... :::` 内容块）。
 
 2. **沙箱熔断、资源护栏与 XSS 隔离红线**：
    - 每次 JS Hook / Slot 执行受严格指令步数预算、墙钟超时、循环引用深度上限（`Export` / `JSON.stringify`）及 `4 MiB` 字符串体积上限保护；连续异常或超时自动打开**熔断器（`CircuitOpen`）**旁路该插件；
-   - `volo.on(hookName, handlerFn)` 仅允许在模块顶层初始化阶段调用，初始化完成后自动冻结，防止请求期误调导致监听器泄漏；
+   - `volo.on(hookName, handlerFn)` 仅允许在模块顶层初始化阶段调用，初始化完成后自动冻结，防止请求期误调导致监听器泄漏；导出可选 `onConfigChange(newCfg)` 可在后台修改配置时零重启热刷新内存缓存与定时任务；
    - `render.post_html` 与后台仪表盘卡片 `admin.dashboard_card` 输出均经过严格白名单 HTML 净化（剥离 `<script>`、`<iframe>`、`on*` 事件属性与 `javascript:`/`data:` 协议）；
    - 插件 CSS 变量必须使用 `--volo-plugin-<id>-*` 命名空间，包裹容器自动带 `.volo-plugin-scope[data-plugin="<id>"]` 以避免污染宿主排版。
 
@@ -231,10 +231,13 @@ plugins/hello-callout/
 - `volo.escapeHTML(str)`：对不可信文本做 HTML 实体转义，防止动态插槽拼接引入 XSS；
 - `volo.config.get(key)` / `volo.config.all()`：读取校验后的插件配置（含沙箱内自动解密的 `secret` 字段）；
 - `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`：需声明 `kv` / `kv:read` 权限，支持 `afterKey` 游标翻页；
+- `volo.assets.readText(relPath)`：只读读取受限于插件目录内的随包文本或 `.gz` 压缩文件（防符号链接越界，上限 `4 MiB`）；
+- `volo.wordFilter.{compile, match, contains, has, stats, clear, revision, syncRemote}`：跨 VM 池共享的 Go 原生 16B/状态零 GC 指针 BFS-CSR Aho-Corasick 词库引擎，支持直接流式编译随包 `.gz` 词表与在线同步转换上游 `houbb` 词库而无需在 JS 堆分配大字符串；
+- `volo.cron.{register, unregister, trigger, list}`：需声明 `cron` 权限，在统一 `CronRegistry` 中按需动态注册、注销、手动触发或查询周期任务；
 - `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`：需声明 `crypto` 权限；
 - `volo.site.info()`：需声明 `site:read` 权限，返回站点名称、URL、默认语言等只读摘要；
 - `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)`：需声明 `ratelimit` 或 `http:routes` 权限；
-- `volo.http.fetch(url, options?)`：受 `allowed_hosts` / `http.outbound:<host>` 白名单与 `OutboundSafeDialer` 保护的出站 HTTP 请求；
+- `volo.http.fetch(url, options?)`：受 `allowed_hosts` / `http.outbound:<host>` / `type: "url"` 白名单与 `OutboundSafeDialer` 保护的出站 HTTP 请求；
 - `volo.i18n.t(locale, key, vars?)` 与 `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`：多语言翻译与结构化插件日志。
 
 ```javascript

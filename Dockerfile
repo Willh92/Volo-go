@@ -41,6 +41,7 @@ RUN mkdir -p \
       /volo-root/locales && \
     cp ./LICENSE ./THIRD_PARTY_NOTICES.md /volo-root/ && \
     cp -r ./plugins/kanbanniang /volo-root/plugins/kanbanniang && \
+    cp -r ./plugins/sensitive-words /volo-root/plugins/sensitive-words && \
     cp -r ./themes/volo-journal /volo-root/themes/volo-journal && \
     cp ./locales/*.json /volo-root/locales/ && \
     chown -R 65532:65532 /volo-root

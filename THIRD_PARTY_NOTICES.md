@@ -40,3 +40,13 @@ Binary distributions and container images of `Volo-go` incorporate the following
 | `@codemirror/view` | MIT | CodeMirror 6 DOM viewport engine | https://github.com/codemirror/view |
 | `@codemirror/commands` | MIT | CodeMirror 6 editing commands & history | https://github.com/codemirror/commands |
 | `@codemirror/lang-markdown` & `@lezer/markdown` | MIT | Incremental Markdown grammar & parser | https://github.com/codemirror/lang-markdown |
+
+---
+
+## 3. Linguistic Tables & Official Plugin Datasets / 语言映射表与官方插件词表数据
+
+| Dataset / 数据集 | License / 许可证 | Purpose / 用途 | Upstream / 来源 |
+| :--- | :--- | :--- | :--- |
+| `houbb/sensitive-word` & `houbb/sensitive-word-data` | Apache-2.0 | Sanitized & categorized base dictionary in `plugins/sensitive-words` | https://github.com/houbb/sensitive-word |
+| `BYVoid/OpenCC` (`TSCharacters.txt` via `houbb/opencc4j`) | Apache-2.0 | Static BMP Traditional-to-Simplified Hanzi folding table in `pkg/wordfilter` | https://github.com/BYVoid/OpenCC |
+

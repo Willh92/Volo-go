@@ -26,6 +26,8 @@ type LookupFunc func(addr netip.Addr) (GeoLocation, bool)
 
 // GeoDBStatus describes the currently mounted offline GeoIP databases and any skipped files.
 type GeoDBStatus struct {
+	_ [0]func()
+
 	Path         string   `json:"path"`
 	ActiveFiles  []string `json:"active_files"`
 	SkippedFiles []string `json:"skipped_files,omitempty"`
@@ -34,6 +36,8 @@ type GeoDBStatus struct {
 // GeoEngine provides zero-external-API offline IP geolocation using MaxMind MMDB + ip2region XDB (IPv4 & IPv6) cascade,
 // ordered allow/deny rule evaluation, self-lockout protection, and atomic hot-reload support.
 type GeoEngine struct {
+	_ [0]func()
+
 	mu          sync.RWMutex
 	mmdbReader  *mmdbReader
 	xdbV4       *xdbReader
@@ -92,6 +96,8 @@ func InspectGeoIPPath(geoIPPath string) (GeoDBStatus, error) {
 }
 
 type mmdbCandidate struct {
+	_ [0]func()
+
 	name       string
 	reader     *mmdbReader
 	tierRank   int
@@ -100,6 +106,8 @@ type mmdbCandidate struct {
 }
 
 type xdbCandidate struct {
+	_ [0]func()
+
 	name      string
 	reader    *xdbReader
 	createdAt uint32
@@ -185,6 +193,8 @@ func (g *GeoEngine) LoadDatabases(geoIPPath string) error {
 	}
 
 	type fileTarget struct {
+		_ [0]func()
+
 		name string
 		path string
 	}
@@ -361,8 +371,8 @@ func (g *GeoEngine) ReloadRules(ctx context.Context, store *sqlx.Store) error {
 	if store == nil {
 		return nil
 	}
-	rows, err := sqlx.Select[domain.SecurityGeoRule](ctx, store,
-		`SELECT * FROM security_geo_rules ORDER BY sort_order ASC, id ASC`)
+	var rows []domain.SecurityGeoRule
+	err := sqlx.SelectInto(ctx, store, &rows, `SELECT * FROM security_geo_rules ORDER BY sort_order ASC, id ASC`)
 	if err != nil {
 		return err
 	}
@@ -618,4 +628,3 @@ func cleanXDBSeg(s string) string {
 func isASCIIAlpha(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
-

@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/config"
@@ -25,6 +26,8 @@ import (
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
+	"github.com/Willh92/Volo-go/pkg/plugin"
+	"github.com/Willh92/Volo-go/pkg/wordfilter"
 )
 
 const (
@@ -46,6 +49,7 @@ var (
 	ErrForbidden          = errors.New("auth: insufficient permissions")
 	ErrVerificationCode   = errors.New("auth: invalid or expired email verification code")
 	ErrCodeCooldown       = errors.New("auth: verification code resend cooldown active, please wait 60 seconds")
+	ErrNicknameRejected   = errors.New("auth: nickname rejected by content policy")
 )
 
 const (
@@ -68,6 +72,8 @@ type pendingCodeCandidate struct {
 }
 
 type pendingEmailCode struct {
+	_ [0]func()
+
 	emailHash    string
 	codes        []pendingCodeCandidate
 	lastIssuedAt time.Time
@@ -77,6 +83,8 @@ type pendingEmailCode struct {
 
 // LoginResult describes the outcome of staff login (either immediate session or 2FA challenge).
 type LoginResult struct {
+	_ [0]func()
+
 	Requires2FA    bool                `json:"requires_2fa"`
 	ChallengeToken string              `json:"challenge_token,omitempty"`
 	User           *domain.User        `json:"user,omitempty"`
@@ -85,13 +93,22 @@ type LoginResult struct {
 	CSRFToken      string              `json:"csrf_token,omitempty"`
 }
 
+type cachedNicknameFilter struct {
+	settingsRev uint64
+	matcher     *wordfilter.Matcher
+}
+
 // Service manages Sovereign Accounts (admin / editor / reader), RBAC isolation, silent Argon2id
 // password upgrades, TOTP + Recovery Codes, WebAuthn Passkeys, kickable device sessions,
 // fine-grained API tokens, and one-click guest comment claiming.
 type Service struct {
+	_ [0]func()
+
 	store       *sqlx.Store
 	keyRing     *config.KeyRing
 	settingsMgr *repo.SettingsManager
+	plugins     atomic.Pointer[plugin.Manager]
+	kwFilter    atomic.Pointer[cachedNicknameFilter]
 	pubMu       sync.RWMutex
 	publicURL   string
 	replayGuard *TOTPReplayGuard
@@ -128,6 +145,83 @@ func NewService(store *sqlx.Store, keyRing *config.KeyRing, settingsMgr *repo.Se
 		replayGuard:  NewTOTPReplayGuard(),
 		pendingCodes: make(map[string]*pendingEmailCode),
 	}
+}
+
+// SetPlugins attaches the hot-swappable plugin Manager so reader registration and OIDC provisioning
+// screen candidate nicknames through active AntiSpamProvider plugins (such as sensitive-words).
+func (s *Service) SetPlugins(pm *plugin.Manager) {
+	if s == nil {
+		return
+	}
+	s.plugins.Store(pm)
+}
+
+func (s *Service) matchesHostBlockedNickname(nickname string) bool {
+	if s == nil || s.settingsMgr == nil {
+		return false
+	}
+	snap := s.settingsMgr.Snapshot()
+	if !snap.Reading.BuiltinSpamFilter || len(snap.Reading.BlockedKeywords) == 0 {
+		return false
+	}
+	rev := s.settingsMgr.Revision()
+	cur := s.kwFilter.Load()
+	if cur == nil || cur.settingsRev != rev {
+		compiled := &cachedNicknameFilter{
+			settingsRev: rev,
+			matcher: wordfilter.Compile(wordfilter.Options{
+				Deny:             snap.Reading.BlockedKeywords,
+				Allow:            snap.Reading.AllowedKeywords,
+				IgnoreSeparators: true,
+			}),
+		}
+		if rev > 0 {
+			s.kwFilter.Store(compiled)
+		}
+		cur = compiled
+	}
+	return cur.matcher != nil && cur.matcher.WordCount() > 0 && cur.matcher.Contains(nickname)
+}
+
+// ValidateNickname checks a candidate reader username/display name against both the host's built-in
+// BlockedKeywords automaton and any active AntiSpamProvider plugin before an account is created.
+func (s *Service) ValidateNickname(
+	ctx context.Context,
+	nickname string,
+	email string,
+	ipMasked string,
+	geoRegion string,
+	locale string,
+	source string,
+) error {
+	clean := strings.TrimSpace(nickname)
+	if clean == "" {
+		return nil
+	}
+	hostBlocked := s.matchesHostBlockedNickname(clean)
+	if pm := s.plugins.Load(); pm != nil {
+		verdict := pm.Providers().EvaluateNickname(ctx, plugin.NicknameCheckInput{
+			Nickname:  clean,
+			Email:     strings.TrimSpace(email),
+			IPMasked:  ipMasked,
+			GeoRegion: geoRegion,
+			Locale:    locale,
+			Source:    source,
+		})
+		switch verdict.Action {
+		case plugin.SpamActionReject, plugin.SpamActionModerate:
+			if reason := strings.TrimSpace(verdict.Reason); reason != "" {
+				return fmt.Errorf("%w: %s", ErrNicknameRejected, reason)
+			}
+			return ErrNicknameRejected
+		case plugin.SpamActionAllow:
+			return nil
+		}
+	}
+	if hostBlocked {
+		return ErrNicknameRejected
+	}
+	return nil
 }
 
 // SetPublicURL dynamically updates the canonical public URL used by auth ceremonies.
@@ -324,14 +418,13 @@ func (s *Service) CompleteStaff2FA(
 	if err != nil {
 		return nil, "", err
 	}
-
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, claims.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, claims.UserID)
 	if err != nil || u.Status != domain.UserStatusActive {
 		return nil, "", ErrUnauthorized
 	}
-
-	totpCred, err := sqlx.Get[domain.UserCredential](ctx, s.store,
-		`SELECT * FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, u.ID)
+	var totpCred domain.UserCredential
+	err = sqlx.GetInto(ctx, s.store, &totpCred, `SELECT * FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, u.ID)
 	if err != nil {
 		return nil, "", ErrTOTPInvalid
 	}
@@ -363,8 +456,8 @@ func (s *Service) CompleteStaff2FA(
 		// Attempt single-use Recovery Code consumption inside a transaction
 		consumed := false
 		_ = s.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-			rcRow, qErr := sqlx.Get[domain.UserCredential](ctx, tx,
-				`SELECT * FROM user_credentials WHERE user_id = ? AND kind = 'recovery_codes'`, u.ID)
+			var rcRow domain.UserCredential
+			qErr := sqlx.GetInto(ctx, tx, &rcRow, `SELECT * FROM user_credentials WHERE user_id = ? AND kind = 'recovery_codes'`, u.ID)
 			if qErr != nil {
 				return qErr
 			}
@@ -505,8 +598,8 @@ func (s *Service) LoginWithPasskey(
 	geoRegion string,
 	userAgent string,
 ) (*LoginResult, error) {
-	cred, err := sqlx.Get[domain.UserCredential](ctx, s.store,
-		`SELECT * FROM user_credentials WHERE kind = 'passkey' AND credential_id = ?`,
+	var cred domain.UserCredential
+	err := sqlx.GetInto(ctx, s.store, &cred, `SELECT * FROM user_credentials WHERE kind = 'passkey' AND credential_id = ?`,
 		strings.TrimSpace(credentialIDB64URL))
 	if err != nil {
 		return nil, ErrPasskeyVerifyFailed
@@ -525,8 +618,8 @@ func (s *Service) LoginWithPasskey(
 	if err != nil {
 		return nil, err
 	}
-
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, cred.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, cred.UserID)
 	if err != nil || u.Status != domain.UserStatusActive || (u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor) {
 		return nil, ErrForbidden
 	}
@@ -655,6 +748,9 @@ func (s *Service) RegisterReader(
 	uname := strings.TrimSpace(username)
 	if len(uname) < 2 || len(uname) > 48 {
 		return nil, errors.New("auth: username must be 2-48 characters")
+	}
+	if err := s.ValidateNickname(ctx, uname, normEmail, "", "", preferredLocale, "reader_register"); err != nil {
+		return nil, err
 	}
 	if err := ValidatePasswordPolicy(rawPassword); err != nil {
 		return nil, err
@@ -841,13 +937,13 @@ func (s *Service) AuthenticateSession(ctx context.Context, rawToken string) (*do
 	}
 	tokHash := hashOpaqueToken(trimmed)
 	now := time.Now().UnixMilli()
-
-	sess, err := sqlx.Get[domain.UserSession](ctx, s.store,
-		`SELECT * FROM user_sessions WHERE token_hash = ? AND expires_at > ?`, tokHash, now)
+	var sess domain.UserSession
+	err := sqlx.GetInto(ctx, s.store, &sess, `SELECT * FROM user_sessions WHERE token_hash = ? AND expires_at > ?`, tokHash, now)
 	if err != nil {
 		return nil, nil, ErrUnauthorized
 	}
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, sess.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, sess.UserID)
 	if err != nil || u.Status != domain.UserStatusActive {
 		return nil, nil, ErrUnauthorized
 	}
@@ -860,8 +956,8 @@ func (s *Service) AuthenticateSession(ctx context.Context, rawToken string) (*do
 }
 
 func (s *Service) ListUserSessions(ctx context.Context, userID string) ([]domain.UserSession, error) {
-	rows, err := sqlx.Select[domain.UserSession](ctx, s.store,
-		`SELECT id, user_id, '' AS token_hash, ip_masked, geo_region, user_agent, totp_verified_until, expires_at, last_seen_at, created_at
+	var rows []domain.UserSession
+	err := sqlx.SelectInto(ctx, s.store, &rows, `SELECT id, user_id, '' AS token_hash, ip_masked, geo_region, user_agent, totp_verified_until, expires_at, last_seen_at, created_at
 		 FROM user_sessions WHERE user_id = ? AND expires_at > ? ORDER BY last_seen_at DESC`,
 		userID, time.Now().UnixMilli())
 	return rows, err
@@ -994,8 +1090,8 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 		return nil, nil, ErrUnauthorized
 	}
 	tokHash := hashOpaqueToken(trimmed)
-	rec, err := sqlx.Get[domain.APIToken](ctx, s.store,
-		`SELECT * FROM api_tokens WHERE token_hash = ?`, tokHash)
+	var rec domain.APIToken
+	err := sqlx.GetInto(ctx, s.store, &rec, `SELECT * FROM api_tokens WHERE token_hash = ?`, tokHash)
 	if err != nil {
 		return nil, nil, ErrUnauthorized
 	}
@@ -1020,8 +1116,8 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 			return nil, nil, ErrForbidden
 		}
 	}
-
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, rec.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, rec.UserID)
 	if err != nil || u.Status != domain.UserStatusActive {
 		return nil, nil, ErrUnauthorized
 	}
@@ -1053,15 +1149,19 @@ func (s *Service) findUserByIdent(ctx context.Context, ident string) (domain.Use
 	if clean == "" {
 		return domain.User{}, sql.ErrNoRows
 	}
-	return sqlx.Get[domain.User](ctx, s.store,
-		`SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
-		clean, clean)
+	{
+		var _sqlxOut domain.User
+		_sqlxErr := sqlx.GetInto(ctx, s.store, &_sqlxOut, `SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
+			clean, clean)
+		return _sqlxOut, _sqlxErr
+	}
 }
 
 func (s *Service) activeTOTPSecretCiphertext(ctx context.Context, userID string) (string, bool, error) {
-	rows, err := sqlx.Select[struct {
+	var rows []struct {
 		SecretCiphertext string `db:"secret_ciphertext"`
-	}](ctx, s.store, `SELECT secret_ciphertext FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, userID)
+	}
+	err := sqlx.SelectInto(ctx, s.store, &rows, `SELECT secret_ciphertext FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, userID)
 	if err != nil {
 		return "", false, err
 	}

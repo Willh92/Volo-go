@@ -49,6 +49,8 @@ const (
 )
 
 type SettingRecord struct {
+	_ [0]func()
+
 	Domain           string `db:"domain" json:"domain"`
 	ValueJSON        string `db:"value_json" json:"value_json"`
 	SecretCiphertext string `db:"secret_ciphertext" json:"secret_ciphertext,omitempty"`
@@ -57,6 +59,8 @@ type SettingRecord struct {
 }
 
 type User struct {
+	_ [0]func()
+
 	ID              string `db:"id" json:"id"`
 	Username        string `db:"username" json:"username"`
 	Email           string `db:"email" json:"email"`
@@ -75,6 +79,8 @@ type User struct {
 }
 
 type UserCredential struct {
+	_ [0]func()
+
 	ID               string `db:"id" json:"id"`
 	UserID           string `db:"user_id" json:"user_id"`
 	Kind             string `db:"kind" json:"kind"` // passkey | totp | recovery_codes
@@ -90,6 +96,8 @@ type UserCredential struct {
 }
 
 type UserSession struct {
+	_ [0]func()
+
 	ID                string `db:"id" json:"id"`
 	UserID            string `db:"user_id" json:"user_id"`
 	TokenHash         string `db:"token_hash" json:"token_hash,omitempty"`
@@ -103,6 +111,8 @@ type UserSession struct {
 }
 
 type APIToken struct {
+	_ [0]func()
+
 	ID          string `db:"id" json:"id"`
 	UserID      string `db:"user_id" json:"user_id"`
 	Name        string `db:"name" json:"name"`
@@ -115,6 +125,8 @@ type APIToken struct {
 }
 
 type Category struct {
+	_ [0]func()
+
 	ID          string `db:"id" json:"id"`
 	Name        string `db:"name" json:"name"`
 	Slug        string `db:"slug" json:"slug"`
@@ -126,6 +138,8 @@ type Category struct {
 }
 
 type Tag struct {
+	_ [0]func()
+
 	ID        string `db:"id" json:"id"`
 	Name      string `db:"name" json:"name"`
 	Slug      string `db:"slug" json:"slug"`
@@ -140,6 +154,8 @@ type ArticleTag struct {
 // RawArticle represents the full database record before visibility redaction.
 // Public endpoints MUST convert RawArticle through visibility.Guard into PublicArticle.
 type RawArticle struct {
+	_ [0]func()
+
 	ID                 string `db:"id" json:"id"`
 	AuthorID           string `db:"author_id" json:"author_id"`
 	CategoryID         string `db:"category_id" json:"category_id"`
@@ -172,6 +188,8 @@ type RawArticle struct {
 }
 
 type ArticleRevision struct {
+	_ [0]func()
+
 	ID         string `db:"id" json:"id"`
 	ArticleID  string `db:"article_id" json:"article_id"`
 	Title      string `db:"title" json:"title"`
@@ -183,12 +201,16 @@ type ArticleRevision struct {
 }
 
 type ArticleBacklink struct {
+	_ [0]func()
+
 	SourceArticleID string `db:"source_article_id" json:"source_article_id"`
 	TargetArticleID string `db:"target_article_id" json:"target_article_id"`
 	UpdatedAt       int64  `db:"updated_at" json:"updated_at"`
 }
 
 type Page struct {
+	_ [0]func()
+
 	ID               string `db:"id" json:"id"`
 	AuthorID         string `db:"author_id" json:"author_id"`
 	Title            string `db:"title" json:"title"`
@@ -207,6 +229,8 @@ type Page struct {
 }
 
 type NavItem struct {
+	_ [0]func()
+
 	ID             string `db:"id" json:"id"`
 	ParentID       string `db:"parent_id" json:"parent_id"`
 	Title          string `db:"title" json:"title"`
@@ -221,6 +245,8 @@ type NavItem struct {
 }
 
 type Series struct {
+	_ [0]func()
+
 	ID          string `db:"id" json:"id"`
 	Title       string `db:"title" json:"title"`
 	Slug        string `db:"slug" json:"slug"`
@@ -232,12 +258,16 @@ type Series struct {
 }
 
 type SeriesArticle struct {
+	_ [0]func()
+
 	SeriesID  string `db:"series_id" json:"series_id"`
 	ArticleID string `db:"article_id" json:"article_id"`
 	SortOrder int    `db:"sort_order" json:"sort_order"`
 }
 
 type Book struct {
+	_ [0]func()
+
 	ID            string `db:"id" json:"id"`
 	Title         string `db:"title" json:"title"`
 	Slug          string `db:"slug" json:"slug"`
@@ -256,6 +286,8 @@ type Book struct {
 }
 
 type BookChapter struct {
+	_ [0]func()
+
 	ID        string `db:"id" json:"id"`
 	BookID    string `db:"book_id" json:"book_id"`
 	ParentID  string `db:"parent_id" json:"parent_id"`
@@ -266,6 +298,8 @@ type BookChapter struct {
 }
 
 type Comment struct {
+	_ [0]func()
+
 	ID                    string `db:"id" json:"id"`
 	TargetType            string `db:"target_type" json:"target_type"` // article | page
 	TargetID              string `db:"target_id" json:"target_id"`
@@ -290,6 +324,8 @@ type Comment struct {
 }
 
 type Reaction struct {
+	_ [0]func()
+
 	TargetType string `db:"target_type" json:"target_type"`
 	TargetID   string `db:"target_id" json:"target_id"`
 	ActorHash  string `db:"actor_hash" json:"actor_hash"`
@@ -298,6 +334,8 @@ type Reaction struct {
 }
 
 type Link struct {
+	_ [0]func()
+
 	ID            string `db:"id" json:"id"`
 	Title         string `db:"title" json:"title"`
 	URL           string `db:"url" json:"url"`
@@ -315,6 +353,8 @@ type Link struct {
 }
 
 type Follow struct {
+	_ [0]func()
+
 	ID           string `db:"id" json:"id"`
 	Title        string `db:"title" json:"title"`
 	SiteURL      string `db:"site_url" json:"site_url"`
@@ -329,6 +369,8 @@ type Follow struct {
 }
 
 type FollowItem struct {
+	_ [0]func()
+
 	ID          string `db:"id" json:"id"`
 	FollowID    string `db:"follow_id" json:"follow_id"`
 	GUIDHash    string `db:"guid_hash" json:"guid_hash"`
@@ -340,6 +382,8 @@ type FollowItem struct {
 }
 
 type MediaAsset struct {
+	_ [0]func()
+
 	ID            string `db:"id" json:"id"`
 	StorageDriver string `db:"storage_driver" json:"storage_driver"` // local | s3
 	ObjectKey     string `db:"object_key" json:"object_key"`
@@ -357,6 +401,8 @@ type MediaAsset struct {
 }
 
 type RedirectRule struct {
+	_ [0]func()
+
 	ID             string `db:"id" json:"id"`
 	SourcePath     string `db:"source_path" json:"source_path"`
 	TargetPath     string `db:"target_path" json:"target_path"`
@@ -367,6 +413,8 @@ type RedirectRule struct {
 }
 
 type Webhook struct {
+	_ [0]func()
+
 	ID               string `db:"id" json:"id"`
 	Name             string `db:"name" json:"name"`
 	Provider         string `db:"provider" json:"provider"` // feishu | wecom | dingtalk | bark | telegram | custom
@@ -383,6 +431,8 @@ type Webhook struct {
 }
 
 type WebhookDelivery struct {
+	_ [0]func()
+
 	ID           string `db:"id" json:"id"`
 	WebhookID    string `db:"webhook_id" json:"webhook_id"`
 	Event        string `db:"event" json:"event"`
@@ -396,6 +446,8 @@ type WebhookDelivery struct {
 }
 
 type AnalyticsDaily struct {
+	_ [0]func()
+
 	StatDate  string `db:"stat_date" json:"stat_date"` // YYYY-MM-DD
 	PV        int64  `db:"pv" json:"pv"`
 	UV        int64  `db:"uv" json:"uv"`
@@ -403,6 +455,8 @@ type AnalyticsDaily struct {
 }
 
 type AnalyticsTopItem struct {
+	_ [0]func()
+
 	StatDate string `db:"stat_date" json:"stat_date"`
 	Kind     string `db:"kind" json:"kind"` // article | referer
 	ItemKey  string `db:"item_key" json:"item_key"`
@@ -410,6 +464,8 @@ type AnalyticsTopItem struct {
 }
 
 type SecurityIPBan struct {
+	_ [0]func()
+
 	ID          string `db:"id" json:"id"`
 	CIDR        string `db:"cidr" json:"cidr"`
 	Source      string `db:"source" json:"source"` // manual | auto
@@ -423,6 +479,8 @@ type SecurityIPBan struct {
 }
 
 type SecurityGeoRule struct {
+	_ [0]func()
+
 	ID        string `db:"id" json:"id"`
 	Name      string `db:"name" json:"name"`
 	IsEnabled bool   `db:"is_enabled" json:"is_enabled"`
@@ -436,6 +494,8 @@ type SecurityGeoRule struct {
 }
 
 type AuditLog struct {
+	_ [0]func()
+
 	ID           string `db:"id" json:"id"`
 	ActorID      string `db:"actor_id" json:"actor_id"`
 	ActorName    string `db:"actor_name" json:"actor_name"`
@@ -448,6 +508,8 @@ type AuditLog struct {
 }
 
 type PluginRecord struct {
+	_ [0]func()
+
 	ID               string `db:"id" json:"id"`
 	Kind             string `db:"kind" json:"kind"` // builtin | external
 	Version          string `db:"version" json:"version"`
@@ -462,6 +524,8 @@ type PluginRecord struct {
 }
 
 type PluginKV struct {
+	_ [0]func()
+
 	PluginID  string `db:"plugin_id" json:"plugin_id"`
 	Key       string `db:"k" json:"k"`
 	ValueText string `db:"value_text" json:"value_text"`

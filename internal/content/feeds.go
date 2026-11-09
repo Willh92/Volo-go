@@ -36,7 +36,8 @@ func (s *Service) collectPublicFeedItems(ctx context.Context, publicBaseURL stri
 		`SELECT * FROM articles WHERE `+where+` ORDER BY published_at DESC`,
 		maxItems, 0,
 	)
-	raws, err := sqlx.Select[domain.RawArticle](ctx, s.store, q, append(args, pageArgs...)...)
+	var raws []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &raws, q, append(args, pageArgs...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -59,11 +60,10 @@ func (s *Service) collectPublicFeedItems(ctx context.Context, publicBaseURL stri
 		for i := range authorIDs {
 			ph[i] = "?"
 		}
-		users, _ := sqlx.Select[domain.User](
-			ctx, s.store,
-			`SELECT id, display_name, username FROM users WHERE id IN (`+strings.Join(ph, ",")+`)`,
-			authorIDs...,
-		)
+		var users []domain.User
+		_ = sqlx.SelectInto(ctx, s.store, &users, `SELECT id, display_name, username FROM users WHERE id IN (`+strings.Join(ph, ",")+`)`,
+			authorIDs...)
+
 		for _, u := range users {
 			name := u.DisplayName
 			if name == "" {
@@ -183,6 +183,8 @@ func (s *Service) BuildJSONFeed(ctx context.Context, publicBaseURL string, local
 		Name string `json:"name,omitempty"`
 	}
 	type jsonItem struct {
+		_ [0]func()
+
 		ID            string       `json:"id"`
 		URL           string       `json:"url"`
 		Title         string       `json:"title"`
@@ -397,23 +399,20 @@ func (s *Service) BuildPodcastXML(ctx context.Context, publicBaseURL string, loc
 // while strictly excluding all password-protected articles (Surface 7).
 func (s *Service) BuildSitemapXML(ctx context.Context, publicBaseURL string) ([]byte, error) {
 	base := strings.TrimRight(publicBaseURL, "/")
-
-	arts, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT id, slug, lang, translation_group, published_at, updated_at, status, password_ciphertext
+	var arts []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &arts, `SELECT id, slug, lang, translation_group, published_at, updated_at, status, password_ciphertext
 		 FROM articles
 		 WHERE status = ? AND password_ciphertext = ''
 		 ORDER BY published_at DESC`,
-		domain.ArticleStatusPublished,
-	)
+		domain.ArticleStatusPublished)
+
 	if err != nil {
 		return nil, err
 	}
-	pages, err := sqlx.Select[domain.Page](
-		ctx, s.store,
-		`SELECT id, slug, lang, translation_group, updated_at FROM pages WHERE is_published = ? ORDER BY slug ASC`,
-		true,
-	)
+	var pages []domain.Page
+	err = sqlx.SelectInto(ctx, s.store, &pages, `SELECT id, slug, lang, translation_group, updated_at FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+		true)
+
 	if err != nil {
 		return nil, err
 	}
@@ -512,18 +511,15 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 			 ORDER BY is_pinned DESC, published_at DESC`,
 			1000, 0,
 		)
-		arts, err = sqlx.Select[domain.RawArticle](
-			ctx, s.store, artSQL,
-			append([]any{domain.ArticleStatusPublished}, artArgs...)...,
-		)
+		err = sqlx.SelectInto(ctx, s.store, &arts, artSQL,
+			append([]any{domain.ArticleStatusPublished}, artArgs...)...)
+
 		if err != nil {
 			return nil, err
 		}
-		pages, _ = sqlx.Select[domain.Page](
-			ctx, s.store,
-			`SELECT id, title, slug FROM pages WHERE is_published = ? ORDER BY slug ASC`,
-			true,
-		)
+		_ = sqlx.SelectInto(ctx, s.store, &pages, `SELECT id, title, slug FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+			true)
+
 	} else {
 		artSQL, artArgs := s.store.Dialect().PaginateSQL(
 			`SELECT * FROM articles
@@ -531,18 +527,15 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 			 ORDER BY is_pinned DESC, published_at DESC`,
 			200, 0,
 		)
-		arts, err = sqlx.Select[domain.RawArticle](
-			ctx, s.store, artSQL,
-			append([]any{domain.ArticleStatusPublished}, artArgs...)...,
-		)
+		err = sqlx.SelectInto(ctx, s.store, &arts, artSQL,
+			append([]any{domain.ArticleStatusPublished}, artArgs...)...)
+
 		if err != nil {
 			return nil, err
 		}
-		pages, _ = sqlx.Select[domain.Page](
-			ctx, s.store,
-			`SELECT * FROM pages WHERE is_published = ? ORDER BY slug ASC`,
-			true,
-		)
+		_ = sqlx.SelectInto(ctx, s.store, &pages, `SELECT * FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+			true)
+
 	}
 
 	var b strings.Builder

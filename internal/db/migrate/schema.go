@@ -184,10 +184,10 @@ func Up(ctx context.Context, store *sqlx.Store) error {
 	if _, err := store.ExecContext(ctx, bootDDL); err != nil {
 		return fmt.Errorf("migrate: create schema_migrations: %w", err)
 	}
-
-	appliedRows, err := sqlx.Select[struct {
+	var appliedRows []struct {
 		Version int `db:"version"`
-	}](ctx, store, "SELECT version FROM schema_migrations ORDER BY version ASC")
+	}
+	err := sqlx.SelectInto(ctx, store, &appliedRows, "SELECT version FROM schema_migrations ORDER BY version ASC")
 	if err != nil {
 		return fmt.Errorf("migrate: query applied migrations: %w", err)
 	}
@@ -306,9 +306,10 @@ func parseAlterAddColumnTarget(stmt string) (table string, col string, ok bool) 
 func columnExists(ctx context.Context, store *sqlx.Store, table string, col string) (bool, error) {
 	switch store.Dialect().Name() {
 	case "sqlite":
-		rows, err := sqlx.Select[struct {
+		var rows []struct {
 			Name string `db:"name"`
-		}](ctx, store, fmt.Sprintf("PRAGMA table_info(%s)", store.Dialect().QuoteIdent(table)))
+		}
+		err := sqlx.SelectInto(ctx, store, &rows, fmt.Sprintf("PRAGMA table_info(%s)", store.Dialect().QuoteIdent(table)))
 		if err != nil {
 			return false, err
 		}

@@ -36,6 +36,8 @@ var (
 )
 
 type oidcSealedState struct {
+	_ [0]func()
+
 	State        string `json:"state"`
 	OIDCNonce    string `json:"oidc_nonce"`
 	CodeVerifier string `json:"code_verifier"`
@@ -208,7 +210,7 @@ func (s *AppServer) handleOIDCAuthRoutes(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		views := s.listOIDCProviderViews(s.resolveLocale(r), rawTarget, rawNext)
-		writeJSON(w, http.StatusOK, map[string]any{"providers": views})
+		writeJSONKV(w, http.StatusOK, "providers", views)
 		return
 	}
 
@@ -494,11 +496,10 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 			s.redirectOIDCError(w, r, "bind", st.Next, "forbidden")
 			return
 		}
-		existing, qErr := sqlx.Get[domain.UserCredential](
-			r.Context(), s.deps.Store,
-			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
-			credKey,
-		)
+		var existing domain.UserCredential
+		qErr := sqlx.GetInto(r.Context(), s.deps.Store, &existing, `SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
+			credKey)
+
 		if qErr == nil {
 			if existing.UserID != actor.ID {
 				s.redirectOIDCError(w, r, "bind", st.Next, "already_linked")
@@ -520,28 +521,23 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 			s.redirectOIDCError(w, r, "bind", st.Next, "already_linked")
 			return
 		}
-		s.recordAuditLog(r, actor, "security.oidc_link", "user_credential", credID, map[string]any{
-			"provider":      providerName,
-			"credential_id": credKey,
-		})
+		s.auditKV(r, actor, "security.oidc_link", "user_credential", credID, "provider", providerName, "credential_id", credKey)
 		http.Redirect(w, r, s.adminMountPath(), http.StatusFound)
 		return
 
 	case "admin":
-		cred, qErr := sqlx.Get[domain.UserCredential](
-			r.Context(), s.deps.Store,
-			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
-			credKey,
-		)
+		var cred domain.UserCredential
+		qErr := sqlx.GetInto(r.Context(), s.deps.Store, &cred, `SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
+			credKey)
+
 		if qErr != nil {
 			s.redirectOIDCError(w, r, "admin", st.Next, "unlinked")
 			return
 		}
-		u, uErr := sqlx.Get[domain.User](
-			r.Context(), s.deps.Store,
-			`SELECT * FROM users WHERE id = ?`,
-			cred.UserID,
-		)
+		var u domain.User
+		uErr := sqlx.GetInto(r.Context(), s.deps.Store, &u, `SELECT * FROM users WHERE id = ?`,
+			cred.UserID)
+
 		if uErr != nil {
 			s.redirectOIDCError(w, r, "admin", st.Next, "unlinked")
 			return
@@ -576,7 +572,7 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 			return
 		}
 		s.setSessionCookieForRequest(w, r, res.RawToken)
-		s.recordAuditLog(r, &u, "auth.login_oidc", "user", u.ID, map[string]any{"provider": providerName})
+		s.auditKV(r, &u, "auth.login_oidc", "user", u.ID, "provider", providerName)
 		http.Redirect(w, r, dest, http.StatusFound)
 		return
 
@@ -587,34 +583,16 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 		}
 
 		var matchedUser domain.User
-		if cred, qErr := sqlx.Get[domain.UserCredential](
-			r.Context(), s.deps.Store,
-			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
-			credKey,
-		); qErr == nil {
-			u, uErr := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, cred.UserID)
-			if uErr != nil {
-				s.redirectOIDCError(w, r, "reader", st.Next, "state")
-				return
-			}
-			if u.Role != domain.RoleReader {
-				s.redirectOIDCError(w, r, "reader", st.Next, "forbidden")
-				return
-			}
-			if u.Status != domain.UserStatusActive {
-				s.redirectOIDCError(w, r, "reader", st.Next, "disabled")
-				return
-			}
-			_, _ = s.deps.Store.ExecContext(r.Context(),
-				`UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now, cred.ID)
-			matchedUser = u
-		} else if errors.Is(qErr, sql.ErrNoRows) {
-			u, uErr := sqlx.Get[domain.User](
-				r.Context(), s.deps.Store,
-				`SELECT * FROM users WHERE LOWER(email) = ?`,
-				normEmail,
-			)
-			if uErr == nil {
+		{
+			var cred domain.UserCredential
+			if qErr := sqlx.GetInto(r.Context(), s.deps.Store, &cred, `SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
+				credKey); qErr == nil {
+				var u domain.User
+				uErr := sqlx.GetInto(r.Context(), s.deps.Store, &u, `SELECT * FROM users WHERE id = ?`, cred.UserID)
+				if uErr != nil {
+					s.redirectOIDCError(w, r, "reader", st.Next, "state")
+					return
+				}
 				if u.Role != domain.RoleReader {
 					s.redirectOIDCError(w, r, "reader", st.Next, "forbidden")
 					return
@@ -623,23 +601,41 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 					s.redirectOIDCError(w, r, "reader", st.Next, "disabled")
 					return
 				}
-				credName := formatOIDCCredentialName(providerName, normEmail, sub)
-				_, _ = s.insertOIDCCredential(r.Context(), u.ID, credKey, credName, now)
+				_, _ = s.deps.Store.ExecContext(r.Context(),
+					`UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now, cred.ID)
 				matchedUser = u
-			} else if errors.Is(uErr, sql.ErrNoRows) {
-				created, cErr := s.createOIDCReaderUser(r, normEmail, ident.DisplayName, ident.AvatarURL, providerName, credKey)
-				if cErr != nil {
-					s.redirectOIDCError(w, r, "reader", st.Next, "register_failed")
+			} else if errors.Is(qErr, sql.ErrNoRows) {
+				var u domain.User
+				uErr := sqlx.GetInto(r.Context(), s.deps.Store, &u, `SELECT * FROM users WHERE LOWER(email) = ?`,
+					normEmail)
+
+				if uErr == nil {
+					if u.Role != domain.RoleReader {
+						s.redirectOIDCError(w, r, "reader", st.Next, "forbidden")
+						return
+					}
+					if u.Status != domain.UserStatusActive {
+						s.redirectOIDCError(w, r, "reader", st.Next, "disabled")
+						return
+					}
+					credName := formatOIDCCredentialName(providerName, normEmail, sub)
+					_, _ = s.insertOIDCCredential(r.Context(), u.ID, credKey, credName, now)
+					matchedUser = u
+				} else if errors.Is(uErr, sql.ErrNoRows) {
+					created, cErr := s.createOIDCReaderUser(r, normEmail, ident.DisplayName, ident.AvatarURL, providerName, credKey)
+					if cErr != nil {
+						s.redirectOIDCError(w, r, "reader", st.Next, "register_failed")
+						return
+					}
+					matchedUser = created
+				} else {
+					s.redirectOIDCError(w, r, "reader", st.Next, "server_error")
 					return
 				}
-				matchedUser = created
 			} else {
 				s.redirectOIDCError(w, r, "reader", st.Next, "server_error")
 				return
 			}
-		} else {
-			s.redirectOIDCError(w, r, "reader", st.Next, "server_error")
-			return
 		}
 
 		_, rawTok, sErr := s.deps.Auth.CreateSession(r.Context(), matchedUser.ID, clientIP, geo, r.UserAgent(), 0)
@@ -663,12 +659,16 @@ func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName
 	if at := strings.IndexByte(normEmail, '@'); at > 0 {
 		localPart = normEmail[:at]
 	}
+	locale := s.resolveLocale(r)
 	baseUsername := strings.Trim(oidcUsernameSanitizeRe.ReplaceAllString(strings.ToLower(localPart), "_"), "_-")
 	if len(baseUsername) < 3 {
 		baseUsername = "reader"
 	}
 	if len(baseUsername) > 24 {
 		baseUsername = baseUsername[:24]
+	}
+	if s.deps.Auth != nil && s.deps.Auth.ValidateNickname(r.Context(), baseUsername, normEmail, "", "", locale, "oidc_register") != nil {
+		baseUsername = "reader"
 	}
 	var suffixBytes [4]byte
 	_, _ = rand.Read(suffixBytes[:])
@@ -680,6 +680,9 @@ func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName
 	}
 	if len([]rune(disp)) > 64 {
 		disp = string([]rune(disp)[:64])
+	}
+	if s.deps.Auth != nil && s.deps.Auth.ValidateNickname(r.Context(), disp, normEmail, "", "", locale, "oidc_register") != nil {
+		disp = username
 	}
 
 	cleanAvatar := ""
@@ -744,6 +747,6 @@ func (s *AppServer) createOIDCReaderUser(r *http.Request, normEmail, displayName
 			_, _ = s.deps.Auth.ClaimGuestComments(r.Context(), &user, gp)
 		}
 	}
-	s.recordAuditLog(r, &user, "reader.register_oidc", "user", user.ID, map[string]any{"provider": providerName})
+	s.auditKV(r, &user, "reader.register_oidc", "user", user.ID, "provider", providerName)
 	return user, nil
 }

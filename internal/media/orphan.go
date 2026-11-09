@@ -369,7 +369,8 @@ func CountAssetReferences(ctx context.Context, store *sqlx.Store, assets []domai
 // When deleteOrphans is true, orphaned assets are safely deleted (with `filepath.EvalSymlinks`
 // containment enforcement for local files so no path outside UploadDir can ever be unlinked).
 func (p *Pipeline) ScanOrphans(ctx context.Context, deleteOrphans bool) ([]domain.MediaAsset, error) {
-	assets, err := sqlx.Select[domain.MediaAsset](ctx, p.store, `SELECT * FROM media_assets ORDER BY created_at DESC`)
+	var assets []domain.MediaAsset
+	err := sqlx.SelectInto(ctx, p.store, &assets, `SELECT * FROM media_assets ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}

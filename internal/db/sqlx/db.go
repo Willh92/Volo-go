@@ -847,10 +847,21 @@ func (st *rowScanState) assign(rv reflect.Value, plan []scanColSpec) error {
 // with case-insensitive matching against `db:"column_name"` struct tags or lowercase field names.
 func Select[T any](ctx context.Context, q Queryer, query string, args ...any) ([]T, error) {
 	var out []T
-	if err := selectRowsInto(ctx, q, &out, query, args...); err != nil {
+	if err := SelectInto(ctx, q, &out, query, args...); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// SelectInto executes a query and scans all rows into *slicePtr (where slicePtr is *[]T).
+func SelectInto(ctx context.Context, q Queryer, slicePtr any, query string, args ...any) error {
+	if err := selectRowsInto(ctx, q, slicePtr, query, args...); err != nil {
+		if rv := reflect.ValueOf(slicePtr); rv.Kind() == reflect.Pointer && !rv.IsNil() {
+			rv.Elem().SetZero()
+		}
+		return err
+	}
+	return nil
 }
 
 func selectRowsInto(ctx context.Context, q Queryer, slicePtr any, query string, args ...any) error {
@@ -859,6 +870,7 @@ func selectRowsInto(ctx context.Context, q Queryer, slicePtr any, query string, 
 	if rt.Kind() != reflect.Struct {
 		return errors.New("sqlx.Select requires struct element type T")
 	}
+	sliceVal.SetZero()
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -891,8 +903,13 @@ func selectRowsInto(ctx context.Context, q Queryer, slicePtr any, query string, 
 // Get executes a query and scans the first row into T, returning sql.ErrNoRows if empty.
 func Get[T any](ctx context.Context, q Queryer, query string, args ...any) (T, error) {
 	var item T
-	err := getRowInto(ctx, q, &item, query, args...)
+	err := GetInto(ctx, q, &item, query, args...)
 	return item, err
+}
+
+// GetInto executes a query and scans the first row into *itemPtr (where itemPtr is *T), returning sql.ErrNoRows if empty.
+func GetInto(ctx context.Context, q Queryer, itemPtr any, query string, args ...any) error {
+	return getRowInto(ctx, q, itemPtr, query, args...)
 }
 
 func getRowInto(ctx context.Context, q Queryer, itemPtr any, query string, args ...any) error {
@@ -901,6 +918,7 @@ func getRowInto(ctx context.Context, q Queryer, itemPtr any, query string, args 
 	if rt.Kind() != reflect.Struct {
 		return errors.New("sqlx.Get requires struct type T")
 	}
+	rv.SetZero()
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
