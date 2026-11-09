@@ -132,8 +132,8 @@ func TestMediaPipeline_Image25MiBCapAndPluginStorageFallback(t *testing.T) {
 	if _, err := settings.Reload(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Configure global MaxUploadMB = 512 MiB and ActiveDriver = "ext-broken-storage"
-	if _, _, err := settings.PatchDomain(ctx, domain.SettingsDomainStorage, []byte(`{"max_upload_mb":512,"active_driver":"ext-broken-storage"}`), 0); err != nil {
+	// Configure global MaxUploadMB = 30 MiB and ActiveDriver = "ext-broken-storage"
+	if _, _, err := settings.PatchDomain(ctx, domain.SettingsDomainStorage, []byte(`{"max_upload_mb":30,"active_driver":"ext-broken-storage"}`), 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -167,10 +167,10 @@ func TestMediaPipeline_Image25MiBCapAndPluginStorageFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Upload > 25 MiB padded PNG stream -> MUST be rejected by maxImageUploadBytes (25 MiB) despite MaxUploadMB=512!
-	oversized := io.MultiReader(bytes.NewReader(pngBuf.Bytes()), io.LimitReader(zeroReader{}, maxImageUploadBytes+4096))
+	// Upload > 30 MiB padded PNG stream -> MUST be rejected by max(25 MiB, configuredMaxBytes=30 MiB)!
+	oversized := io.MultiReader(bytes.NewReader(pngBuf.Bytes()), io.LimitReader(zeroReader{}, (30<<20)+4096))
 	if _, err := pipe.Upload(ctx, "u1", "huge.png", "image/png", oversized); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
-		t.Fatalf("expected >25 MiB raster image upload to be rejected, got %v", err)
+		t.Fatalf("expected >30 MiB raster image upload to be rejected, got %v", err)
 	}
 
 	// Unsafe javascript: URL from plugin StorageProvider MUST be rejected!
@@ -500,4 +500,3 @@ func TestMediaRound3_UnifiedOrphanScopesNavChaptersRedirectsComments(t *testing.
 		t.Fatalf("expected only soft-deleted comment asset %q to be orphaned, got %+v", aCmtDel.ID, orphans)
 	}
 }
-

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +48,21 @@ type ArchiveMonth struct {
 	Count     int    `json:"count"`
 }
 
+// ArchiveYear groups published article counts by calendar year YYYY (strictly excluding standalone pages).
+type ArchiveYear struct {
+	Year  string `json:"year"` // YYYY
+	Count int    `json:"count"`
+}
+
+// ArchiveStats holds revision-coherent total, calendar-year (YYYY), and calendar-month (YYYY-MM) published post counts.
+type ArchiveStats struct {
+	TotalArticles int            `json:"total_articles"`
+	Years         []ArchiveYear  `json:"years"`
+	Months        []ArchiveMonth `json:"months"`
+	YearCounts    map[string]int `json:"year_counts"`
+	MonthCounts   map[string]int `json:"month_counts"`
+}
+
 // PublicNavNode represents a localized top-bar navigation item (and optional children).
 type PublicNavNode struct {
 	ID           string          `json:"id"`
@@ -80,10 +96,11 @@ type PublicPageView struct {
 	HasLockedSections bool                              `json:"has_locked_sections,omitempty"`
 }
 
-// SeriesView pairs a Series with its ordered public article cards.
+// SeriesView pairs a Series with its ordered public article cards and total published episode count.
 type SeriesView struct {
 	domain.Series
-	Articles []visibility.PublicArticleCard `json:"articles"`
+	Articles      []visibility.PublicArticleCard `json:"articles"`
+	TotalArticles int                            `json:"total_articles"`
 }
 
 // FollowGroup pairs an RSS Follow source with its recent items.
@@ -122,6 +139,7 @@ type PublicChromeExtras struct {
 	Authors            []PublicAuthorProfile
 	Stats              PublicSiteStats
 	ArchiveBuckets     []ArchiveMonth
+	ArchiveYearBuckets []ArchiveYear
 	RecentPosts        []visibility.PublicArticleCard
 	MostViewedPosts    []visibility.PublicArticleCard
 	MostCommentedPosts []visibility.PublicArticleCard
@@ -167,13 +185,15 @@ type Service struct {
 	commentHTMLCurr map[string]string
 	commentHTMLPrev map[string]string
 
-	mediaMu   sync.RWMutex
-	mediaDims map[string][2]int
+	mediaMu      sync.RWMutex
+	mediaDims    map[string][2]int
+	mediaDimsRev atomic.Uint64
 
 	bookChapterMu    sync.Mutex
 	bookChapterCache map[string]cachedBookChapter
 
 	onArticlePublished atomic.Pointer[func(context.Context, domain.RawArticle)]
+	renderCacheSaltFn  atomic.Pointer[func() string]
 }
 
 // NewService constructs a Content Service.
@@ -194,7 +214,7 @@ func NewService(opts ServiceOptions) *Service {
 	if dialer == nil {
 		dialer = &security.OutboundSafeDialer{Timeout: 10 * time.Second}
 	}
-	return &Service{
+	srv := &Service{
 		store:           opts.Store,
 		keys:            opts.Keys,
 		settings:        opts.Settings,
@@ -213,6 +233,13 @@ func NewService(opts ServiceOptions) *Service {
 		commentHTMLPrev: make(map[string]string),
 		mediaDims:       make(map[string][2]int),
 	}
+	if opts.Plugins != nil {
+		srv.SetRenderCacheSaltFunc(opts.Plugins.RenderHooksStateHash)
+		guard.SetCustomDirectiveFunc(func(name string, attrs map[string]string, body string) (string, bool) {
+			return opts.Plugins.DispatchRenderDirective(context.Background(), name, attrs, body)
+		})
+	}
+	return srv
 }
 
 func (s *Service) Guard() *visibility.Guard             { return s.guard }
@@ -226,6 +253,32 @@ func (s *Service) SetArticlePublishedCallback(fn func(context.Context, domain.Ra
 		return
 	}
 	s.onArticlePublished.Store(&fn)
+}
+
+// SetRenderCacheSaltFunc registers a dynamic digest callback mixed into articleHTMLCache and Guard render cache keys,
+// keeping articleHTMLCache active even when plugin render hooks are enabled.
+func (s *Service) SetRenderCacheSaltFunc(fn func() string) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.renderCacheSaltFn.Store(nil)
+	} else {
+		s.renderCacheSaltFn.Store(&fn)
+	}
+	if s.guard != nil {
+		s.guard.SetRenderCacheSaltFunc(fn)
+	}
+}
+
+func (s *Service) renderCacheSalt() string {
+	if s == nil {
+		return ""
+	}
+	if ptr := s.renderCacheSaltFn.Load(); ptr != nil && *ptr != nil {
+		return (*ptr)()
+	}
+	return ""
 }
 
 // FlushAnalytics flushes all buffered view_count, redirect hit_count, and analytics_daily deltas to the database.
@@ -280,7 +333,8 @@ func (s *Service) RefreshMediaDimsCache(ctx context.Context) error {
 		`SELECT public_url, width, height FROM media_assets WHERE width > 0 AND height > 0 ORDER BY created_at DESC`,
 		maxCachedMediaDims, 0,
 	)
-	assets, err := sqlx.Select[domain.MediaAsset](ctx, s.store, q, pageArgs...)
+	var assets []domain.MediaAsset
+	err := sqlx.SelectInto(ctx, s.store, &assets, q, pageArgs...)
 	if err != nil {
 		return err
 	}
@@ -302,8 +356,11 @@ func (s *Service) RefreshMediaDimsCache(ctx context.Context) error {
 	}
 	s.mediaDims = next
 	s.mediaMu.Unlock()
-	if changed && s.guard != nil {
-		s.guard.PurgeCache()
+	if changed {
+		s.mediaDimsRev.Add(1)
+		if s.guard != nil {
+			s.guard.PurgeCache()
+		}
 	}
 	return nil
 }
@@ -325,8 +382,11 @@ func (s *Service) PutMediaDims(publicURL string, width int, height int) {
 		s.mediaDims[u] = next
 	}
 	s.mediaMu.Unlock()
-	if changed && s.guard != nil {
-		s.guard.PurgeCache()
+	if changed {
+		s.mediaDimsRev.Add(1)
+		if s.guard != nil {
+			s.guard.PurgeCache()
+		}
 	}
 }
 
@@ -344,8 +404,8 @@ func (s *Service) LookupMediaDims(src string) (int, int, bool) {
 // PublishDueScheduled promotes any scheduled articles whose scheduled_at <= nowMs to published.
 func (s *Service) PublishDueScheduled(ctx context.Context) (int, error) {
 	now := time.Now().UnixMilli()
-	due, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
+	var due []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &due,
 		`SELECT * FROM articles WHERE status = ? AND scheduled_at > 0 AND scheduled_at <= ?`,
 		domain.ArticleStatusScheduled, now,
 	)
@@ -422,12 +482,40 @@ func (s *Service) ResolveRedirect(ctx context.Context, reqPath string) (target s
 
 // ArticleListFilter specifies filtering and pagination for ListPublicCards.
 type ArticleListFilter struct {
-	Page         int
-	PageSize     int
-	CategorySlug string
-	TagSlug      string
-	YearMonth    string // YYYY-MM
-	Locale       string
+	Page            int
+	PageSize        int
+	CategorySlug    string
+	TagSlug         string
+	YearMonth       string // YYYY-MM
+	Locale          string
+	IncludeFullHTML bool
+	Request         *http.Request
+	Viewer          *domain.User
+}
+
+// articleCardSelectColumns projects all RawArticle metadata columns while skipping multi-MB content_md
+// whenever summary_md, cover_url, word_count, and reading_minutes are already present (or when password-protected).
+func articleCardSelectColumns(alias string) string {
+	p := ""
+	if strings.TrimSpace(alias) != "" {
+		p = strings.TrimSpace(alias) + "."
+	}
+	return fmt.Sprintf(
+		`%sid, %sauthor_id, %scategory_id, %stitle, %sslug, %slegacy_permalink, `+
+			`%ssummary_md, `+
+			`CASE WHEN %spassword_ciphertext <> '' OR (TRIM(%ssummary_md) <> '' AND TRIM(%scover_url) <> '' AND %sword_count > 0 AND %sreading_minutes > 0) THEN '' ELSE %scontent_md END AS content_md, `+
+			`%scover_url, %sstatus, %spublished_at, %sscheduled_at, %sis_pinned, %sallow_comment, `+
+			`%spassword_ciphertext, %shas_content_lock, %saudio_url, %saudio_duration_sec, `+
+			`%saudio_size_bytes, %saudio_mime, %slang, %stranslation_group, %slicense_override, `+
+			`%sword_count, %sreading_minutes, %sview_count, %scomment_count, %screated_at, %supdated_at`,
+		p, p, p, p, p, p,
+		p,
+		p, p, p, p, p, p,
+		p, p, p, p, p, p,
+		p, p, p, p,
+		p, p, p, p, p,
+		p, p, p, p, p, p,
+	)
 }
 
 // ListPublicCards queries published articles, enriches categories/tags in bulk, and passes every row
@@ -439,7 +527,8 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 	args := []any{domain.ArticleStatusPublished}
 
 	if slug := strings.TrimSpace(f.CategorySlug); slug != "" {
-		cat, err := sqlx.Get[domain.Category](ctx, s.store, `SELECT id FROM categories WHERE slug = ?`, slug)
+		var cat domain.Category
+		err := sqlx.GetInto(ctx, s.store, &cat, `SELECT id FROM categories WHERE slug = ?`, slug)
 		if errors.Is(err, sql.ErrNoRows) {
 			return []visibility.PublicArticleCard{}, 0, nil
 		}
@@ -451,7 +540,8 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 	}
 
 	if tagSlug := strings.TrimSpace(f.TagSlug); tagSlug != "" {
-		tag, err := sqlx.Get[domain.Tag](ctx, s.store, `SELECT id FROM tags WHERE slug = ?`, tagSlug)
+		var tag domain.Tag
+		err := sqlx.GetInto(ctx, s.store, &tag, `SELECT id FROM tags WHERE slug = ?`, tagSlug)
 		if errors.Is(err, sql.ErrNoRows) {
 			return []visibility.PublicArticleCard{}, 0, nil
 		}
@@ -467,8 +557,8 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 		if !ok {
 			return []visibility.PublicArticleCard{}, 0, nil
 		}
-		where = append(where, "(CASE WHEN a.published_at > 0 THEN a.published_at ELSE a.created_at END) >= ? AND (CASE WHEN a.published_at > 0 THEN a.published_at ELSE a.created_at END) < ?")
-		args = append(args, startMS, endMS)
+		where = append(where, "((a.published_at >= ? AND a.published_at < ?) OR (a.published_at <= 0 AND a.created_at >= ? AND a.created_at < ?))")
+		args = append(args, startMS, endMS, startMS, endMS)
 	}
 
 	whereClause := strings.Join(where, " AND ")
@@ -480,16 +570,73 @@ func (s *Service) ListPublicCards(ctx context.Context, f ArticleListFilter) ([]v
 		return []visibility.PublicArticleCard{}, 0, nil
 	}
 
-	baseSQL := "SELECT a.* FROM articles a WHERE " + whereClause + " ORDER BY a.is_pinned DESC, a.published_at DESC"
+	selectCols := articleCardSelectColumns("a")
+	if f.IncludeFullHTML {
+		selectCols = "a.*"
+	}
+	baseSQL := "SELECT " + selectCols + " FROM articles a WHERE " + whereClause + " ORDER BY a.is_pinned DESC, a.published_at DESC"
 	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
 	queryArgs := append(append([]any{}, args...), pageArgs...)
 
-	raws, err := sqlx.Select[domain.RawArticle](ctx, s.store, pageSQL, queryArgs...)
+	var raws []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &raws, pageSQL, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
 	cards, err := s.hydrateCards(ctx, raws, f.Locale)
-	return cards, total, err
+	if err != nil {
+		return nil, 0, err
+	}
+	if f.IncludeFullHTML && s.guard != nil {
+		for i := range cards {
+			s.PopulateCardFullHTML(ctx, f.Request, f.Viewer, raws[i], &cards[i])
+		}
+	}
+	return cards, total, nil
+}
+
+// PopulateCardFullHTML renders sanitized FullHTML into card ONLY when raw is unlocked and free of content locks.
+func (s *Service) PopulateCardFullHTML(ctx context.Context, r *http.Request, viewer *domain.User, raw domain.RawArticle, card *visibility.PublicArticleCard) {
+	if s == nil || s.guard == nil || card == nil {
+		return
+	}
+	rawForRender := raw
+	if s.plugins != nil && strings.TrimSpace(raw.PasswordCiphertext) == "" && !raw.HasContentLock &&
+		!render.ContainsLockDirective(raw.ContentMD) && !render.ContainsLockDirective(raw.SummaryMD) {
+		preRes := s.plugins.DispatchArticleHook(ctx, plugin.HookRenderPreMarkdown, plugin.ArticleHookPayload{
+			ID:                  raw.ID,
+			Title:               raw.Title,
+			Slug:                raw.Slug,
+			Lang:                raw.Lang,
+			Status:              string(raw.Status),
+			SummaryMD:           raw.SummaryMD,
+			ContentMD:           raw.ContentMD,
+			IsPasswordProtected: false,
+			HasContentLock:      false,
+		})
+		if preRes.ContentMD != "" {
+			rawForRender.ContentMD = preRes.ContentMD
+		}
+		if preRes.SummaryMD != "" {
+			rawForRender.SummaryMD = preRes.SummaryMD
+		}
+	}
+	s.guard.PopulateCardFullHTML(ctx, r, viewer, rawForRender, card)
+	if s.plugins != nil && card.FullHTML != "" && !card.IsPasswordProtected && !card.HasContentLock {
+		hookRes := s.plugins.DispatchArticleHook(ctx, plugin.HookRenderPostHTML, plugin.ArticleHookPayload{
+			ID:                  raw.ID,
+			Title:               raw.Title,
+			Slug:                raw.Slug,
+			Lang:                raw.Lang,
+			Status:              string(raw.Status),
+			HTML:                card.FullHTML,
+			IsPasswordProtected: false,
+			HasContentLock:      false,
+		})
+		if hookRes.HTML != "" {
+			card.FullHTML = s.SanitizeHTMLFragment(hookRes.HTML)
+		}
+	}
 }
 
 func (s *Service) hydrateCards(ctx context.Context, raws []domain.RawArticle, locale string) ([]visibility.PublicArticleCard, error) {
@@ -551,6 +698,32 @@ func (s *Service) GetRawArticleByID(ctx context.Context, articleID string) (doma
 	return sqlx.Get[domain.RawArticle](ctx, s.store, `SELECT * FROM articles WHERE id = ?`, strings.TrimSpace(articleID))
 }
 
+func (s *Service) buildArticleHTMLCacheKey(raw domain.RawArticle, locale string, publicBaseURL string, authorName string, showLineNumbers bool, enableLicense bool, salt string) string {
+	dRev, sRev := s.currentRevisions()
+	mRev := s.mediaDimsRev.Load()
+	h := sha256.New()
+	_, _ = h.Write([]byte(raw.Title))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(raw.SummaryMD))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(raw.ContentMD))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(raw.CoverURL))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(raw.AudioURL))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(raw.LicenseOverride))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(authorName))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(publicBaseURL))
+	digest := hex.EncodeToString(h.Sum(nil)[:12])
+	return fmt.Sprintf(
+		"arthtml|%s|%d|d=%d|s=%d|m=%d|%s|loc=%s|ln=%t|lic=%t|salt=%s",
+		raw.ID, raw.UpdatedAt, dRev, sRev, mRev, digest, locale, showLineNumbers, enableLicense, salt,
+	)
+}
+
 // RenderArticleDetail builds the full sanitized PublicArticleView + Prev/Next neighbors + public inbound backlinks.
 func (s *Service) RenderArticleDetail(
 	ctx context.Context,
@@ -609,6 +782,70 @@ func (s *Service) RenderArticleDetail(
 	alts := s.listArticleTranslations(ctx, raw)
 	raw.ViewCount += s.views.PendingArticleViews(raw.ID)
 
+	_, isWholeProt := s.guard.DecryptArticlePassword(raw)
+	hasShareTok := r != nil && (strings.TrimSpace(r.URL.Query().Get("preview")) != "" || strings.TrimSpace(r.Header.Get("X-Volo-Share-Token")) != "")
+	hasAnyLock := isWholeProt || strings.TrimSpace(raw.PasswordCiphertext) != "" || raw.HasContentLock ||
+		render.ContainsLockDirective(raw.ContentMD) || render.ContainsLockDirective(raw.SummaryMD)
+	hasSaltFn := s.renderCacheSaltFn.Load() != nil
+	canCacheArticleHTML := s.caches != nil &&
+		raw.Status == domain.ArticleStatusPublished &&
+		!hasAnyLock &&
+		!hasShareTok &&
+		!strings.Contains(raw.ContentMD, ":::book") &&
+		(s.plugins == nil || hasSaltFn)
+
+	var detailKey string
+	if canCacheArticleHTML {
+		salt := s.renderCacheSalt()
+		detailKey = s.buildArticleHTMLCacheKey(raw, locale, publicBaseURL, authorName, snap.Reading.ShowCodeLineNumbers, snap.Site.EnableLicenseNotice, salt)
+		if cached, ok := s.caches.getArticleHTML(detailKey); ok {
+			view := visibility.PublicArticleView{
+				ID:               raw.ID,
+				AuthorID:         raw.AuthorID,
+				AuthorName:       authorName,
+				AuthorAvatarURL:  authorAvatar,
+				AuthorBio:        authorBio,
+				AuthorWebsiteURL: authorWeb,
+				CategoryID:       raw.CategoryID,
+				Tags:             tagsMap[raw.ID],
+				Title:            raw.Title,
+				Slug:             raw.Slug,
+				URL:              visibility.ArticlePath(raw.Slug),
+				Summary:          cached.summary,
+				HTML:             cached.html,
+				CoverURL:         cached.coverURL,
+				OGImageURL:       cached.ogImageURL,
+				IsPinned:         raw.IsPinned,
+				HasUpdated:       raw.PublishedAt > 0 && raw.UpdatedAt > raw.PublishedAt+60_000,
+				AllowComment:     raw.AllowComment,
+				AudioURL:         raw.AudioURL,
+				AudioDurationSec: raw.AudioDurationSec,
+				AudioSizeBytes:   raw.AudioSizeBytes,
+				AudioMIME:        raw.AudioMIME,
+				Lang:             raw.Lang,
+				TranslationGroup: raw.TranslationGroup,
+				Translations:     alts,
+				LicenseText:      cached.licenseText,
+				TOC:              cached.toc,
+				WordCount:        cached.wordCount,
+				ReadingMinutes:   cached.readingMinutes,
+				ViewCount:        raw.ViewCount,
+				CommentCount:     raw.CommentCount,
+				PublishedAt:      raw.PublishedAt,
+				UpdatedAt:        raw.UpdatedAt,
+				NeedsMath:        cached.needsMath,
+				NeedsMermaid:     cached.needsMermaid,
+			}
+			if catPtr != nil {
+				view.CategoryName = catPtr.Name
+				view.CategorySlug = catPtr.Slug
+			}
+			prev, next := s.getNeighbors(ctx, raw)
+			backlinks := s.ListInboundBacklinks(ctx, raw)
+			return view, prev, next, backlinks, nil
+		}
+	}
+
 	rawForRender := raw
 	if s.plugins != nil && strings.TrimSpace(raw.PasswordCiphertext) == "" && !raw.HasContentLock && !render.ContainsLockDirective(raw.ContentMD) {
 		preRes := s.plugins.DispatchArticleHook(ctx, plugin.HookRenderPreMarkdown, plugin.ArticleHookPayload{
@@ -630,6 +867,13 @@ func (s *Service) RenderArticleDetail(
 		}
 	}
 
+	var customDirective func(string, map[string]string, string) (string, bool)
+	if s.plugins != nil {
+		customDirective = func(name string, attrs map[string]string, body string) (string, bool) {
+			return s.plugins.DispatchRenderDirective(ctx, name, attrs, body)
+		}
+	}
+
 	view := s.guard.ToDetail(w, r, rawForRender, viewer, visibility.DetailRenderDeps{
 		Locale:               locale,
 		AuthorName:           authorName,
@@ -648,6 +892,7 @@ func (s *Service) RenderArticleDetail(
 		LookupBook:           func(bSlug string) (render.BookCardInfo, bool) { return s.lookupBookCard(ctx, bSlug) },
 		ListBooks:            func() []render.BookCardInfo { return s.listBookCards(ctx) },
 		LookupMediaDims:      s.LookupMediaDims,
+		CustomDirective:      customDirective,
 	})
 
 	// Surface 10: Only run `render.post_html` plugin hook when the article is public & free of locks!
@@ -668,6 +913,22 @@ func (s *Service) RenderArticleDetail(
 		}
 	}
 
+	if canCacheArticleHTML && detailKey != "" && !view.IsPasswordProtected && !view.RequiresPassword && !view.HasContentLock && !view.HasLockedSections {
+		s.caches.putArticleHTML(cachedArticleDetail{
+			key:            detailKey,
+			html:           view.HTML,
+			summary:        view.Summary,
+			coverURL:       view.CoverURL,
+			ogImageURL:     view.OGImageURL,
+			licenseText:    view.LicenseText,
+			toc:            view.TOC,
+			wordCount:      view.WordCount,
+			readingMinutes: view.ReadingMinutes,
+			needsMath:      view.NeedsMath,
+			needsMermaid:   view.NeedsMermaid,
+		})
+	}
+
 	prev, next := s.getNeighbors(ctx, raw)
 	backlinks := s.ListInboundBacklinks(ctx, raw)
 	return view, prev, next, backlinks, nil
@@ -686,8 +947,8 @@ func (s *Service) getNeighbors(ctx context.Context, cur domain.RawArticle) (prev
 		 ORDER BY published_at DESC, id DESC`,
 		1, 0,
 	)
-	olderRows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store, olderSQL,
+	var olderRows []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &olderRows, olderSQL,
 		append([]any{domain.ArticleStatusPublished, cur.PublishedAt, cur.PublishedAt, cur.ID}, olderArgs...)...,
 	)
 	if err == nil && len(olderRows) > 0 {
@@ -702,8 +963,8 @@ func (s *Service) getNeighbors(ctx context.Context, cur domain.RawArticle) (prev
 		 ORDER BY published_at ASC, id ASC`,
 		1, 0,
 	)
-	newerRows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store, newerSQL,
+	var newerRows []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.store, &newerRows, newerSQL,
 		append([]any{domain.ArticleStatusPublished, cur.PublishedAt, cur.PublishedAt, cur.ID}, newerArgs...)...,
 	)
 	if err == nil && len(newerRows) > 0 {
@@ -713,21 +974,22 @@ func (s *Service) getNeighbors(ctx context.Context, cur domain.RawArticle) (prev
 	return prev, next
 }
 
-// ListInboundBacklinks enforces Surface 8:
+// ListInboundBacklinks enforces Surface 8 (bounded to 50 rows):
 // - Password-protected target articles expose ZERO backlinks publicly.
 // - Password-protected source articles NEVER appear as backlink sources.
 func (s *Service) ListInboundBacklinks(ctx context.Context, target domain.RawArticle) []visibility.PublicNeighbor {
 	if !s.guard.IsPublicIndexable(target) {
 		return nil
 	}
-	rows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT a.id, a.title, a.slug, a.published_at, a.password_ciphertext
+	baseSQL := `SELECT a.id, a.title, a.slug, a.status, a.published_at, a.password_ciphertext
 		 FROM article_backlinks b
 		 INNER JOIN articles a ON a.id = b.source_article_id
 		 WHERE b.target_article_id = ? AND a.status = ? AND a.password_ciphertext = ''
-		 ORDER BY a.published_at DESC`,
-		target.ID, domain.ArticleStatusPublished,
+		 ORDER BY a.published_at DESC`
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, 50, 0)
+	var rows []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &rows, pageSQL,
+		append([]any{target.ID, domain.ArticleStatusPublished}, pageArgs...)...,
 	)
 	if err != nil || len(rows) == 0 {
 		return nil
@@ -765,7 +1027,8 @@ func (s *Service) ReindexArticleBacklinksTx(ctx context.Context, tx *sqlx.Tx, so
 		if slug == source.Slug {
 			continue
 		}
-		target, err := sqlx.Get[domain.RawArticle](ctx, tx, `SELECT id, password_ciphertext FROM articles WHERE slug = ?`, slug)
+		var target domain.RawArticle
+		err := sqlx.GetInto(ctx, tx, &target, `SELECT id, password_ciphertext FROM articles WHERE slug = ?`, slug)
 		if err != nil || target.ID == "" || target.ID == source.ID || strings.TrimSpace(target.PasswordCiphertext) != "" {
 			continue
 		}
@@ -781,8 +1044,8 @@ func (s *Service) listArticleTranslations(ctx context.Context, cur domain.RawArt
 	if grp == "" {
 		return nil
 	}
-	rows, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
+	var rows []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &rows,
 		`SELECT title, slug, lang, password_ciphertext
 		 FROM articles
 		 WHERE translation_group = ? AND status = ? AND id <> ?
@@ -823,8 +1086,8 @@ func (s *Service) GetPublicPageBySlugForViewer(
 	locale string,
 	viewer *domain.User,
 ) (PublicPageView, error) {
-	p, err := sqlx.Get[domain.Page](
-		ctx, s.store,
+	var p domain.Page
+	err := sqlx.GetInto(ctx, s.store, &p,
 		`SELECT * FROM pages WHERE slug = ? AND is_published = ?`,
 		strings.TrimSpace(slug), true,
 	)
@@ -870,6 +1133,13 @@ func (s *Service) GetPublicPageBySlugForViewer(
 		}
 	}
 
+	var pageCustomDirective func(string, map[string]string, string) (string, bool)
+	if s.plugins != nil {
+		pageCustomDirective = func(name string, attrs map[string]string, body string) (string, bool) {
+			return s.plugins.DispatchRenderDirective(ctx, name, attrs, body)
+		}
+	}
+
 	rendered := s.renderer.Render(contentMD, render.Options{
 		Mode:                render.RenderModeWeb,
 		Locale:              locale,
@@ -881,6 +1151,7 @@ func (s *Service) GetPublicPageBySlugForViewer(
 		LookupBook:          func(bSlug string) (render.BookCardInfo, bool) { return s.lookupBookCard(ctx, bSlug) },
 		ListBooks:           func() []render.BookCardInfo { return s.listBookCards(ctx) },
 		LookupMediaDims:     s.LookupMediaDims,
+		CustomDirective:     pageCustomDirective,
 	})
 
 	htmlOut := rendered.HTML
@@ -908,8 +1179,8 @@ func (s *Service) GetPublicPageBySlugForViewer(
 
 	var alts []visibility.TranslationAlternate
 	if strings.TrimSpace(p.TranslationGroup) != "" {
-		peers, pErr := sqlx.Select[domain.Page](
-			ctx, s.store,
+		var peers []domain.Page
+		pErr := sqlx.SelectInto(ctx, s.store, &peers,
 			`SELECT title, slug, lang FROM pages WHERE translation_group = ? AND is_published = ? AND id <> ? ORDER BY lang ASC`,
 			p.TranslationGroup, true, p.ID,
 		)
@@ -1026,42 +1297,70 @@ func lookupExactOrLangTitle(m map[string]string, locale string) string {
 			return strings.TrimSpace(v)
 		}
 	}
-	if strings.HasPrefix(strings.ToLower(loc), "en") {
+	locLower := strings.ToLower(loc)
+	switch {
+	case strings.HasPrefix(locLower, "en"):
 		if v := strings.TrimSpace(m["en-US"]); v != "" {
 			return v
 		}
 		if v := strings.TrimSpace(m["en"]); v != "" {
 			return v
 		}
+	case strings.HasPrefix(locLower, "ja"):
+		if v := strings.TrimSpace(m["ja-JP"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(m["ja"]); v != "" {
+			return v
+		}
+	case strings.Contains(locLower, "tw") || strings.Contains(locLower, "hk") || strings.Contains(locLower, "hant"):
+		if v := strings.TrimSpace(m["zh-TW"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(m["zh-HK"]); v != "" {
+			return v
+		}
+	case strings.HasPrefix(locLower, "zh"):
+		if v := strings.TrimSpace(m["zh-CN"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(m["zh"]); v != "" {
+			return v
+		}
 	}
 	return ""
 }
 
-var commonCustomNavLocales = map[string][3]string{
-	// key -> {zh-CN, zh-TW, en-US}
-	"关于":     {"关于", "關於", "About"},
-	"关于我":    {"关于我", "關於我", "About"},
-	"关于本站":   {"关于本站", "關於本站", "About"},
-	"about":  {"关于", "關於", "About"},
-	"我的开源":   {"我的开源", "我的開源", "Open Source"},
-	"开源":     {"开源", "開源", "Open Source"},
-	"开源项目":   {"开源项目", "開源專案", "Open Source"},
-	"友链":     {"友链", "友鏈", "Links"},
-	"友情链接":   {"友情链接", "友情連結", "Links"},
-	"留言":     {"留言", "留言", "Guestbook"},
-	"留言板":    {"留言板", "留言板", "Guestbook"},
-	"书单":     {"书单", "書單", "Bookshelf"},
-	"书架":     {"书架", "書架", "Bookshelf"},
-	"读书":     {"读书", "讀書", "Reading"},
-	"相册":     {"相册", "相冊", "Gallery"},
-	"订阅":     {"订阅", "訂閱", "Subscribe"},
-	"动态":     {"动态", "動態", "Stream"},
-	"归档":     {"归档", "歸檔", "Archives"},
-	"分类":     {"分类", "分類", "Categories"},
-	"标签":     {"标签", "標籤", "Tags"},
-	"专题":     {"专题", "專題", "Series"},
-	"作品":     {"作品", "作品", "Projects"},
-	"项目":     {"项目", "專案", "Projects"},
+var commonCustomNavLocales = map[string][4]string{
+	// key -> {zh-CN, zh-TW, en-US, ja-JP}
+	"关于":      {"关于", "關於", "About", "概要"},
+	"關於":      {"关于", "關於", "About", "概要"},
+	"概要":      {"关于", "關於", "About", "概要"},
+	"关于我":     {"关于我", "關於我", "About", "概要"},
+	"关于本站":    {"关于本站", "關於本站", "About", "概要"},
+	"about":   {"关于", "關於", "About", "概要"},
+	"我的开源":    {"我的开源", "我的開源", "Open Source", "オープンソース"},
+	"我的開源":    {"我的开源", "我的開源", "Open Source", "オープンソース"},
+	"オープンソース": {"我的开源", "我的開源", "Open Source", "オープンソース"},
+	"open source": {"我的开源", "我的開源", "Open Source", "オープンソース"},
+	"开源":      {"开源", "開源", "Open Source", "オープンソース"},
+	"开源项目":    {"开源项目", "開源專案", "Open Source", "オープンソース"},
+	"友链":      {"友链", "友鏈", "Links", "リンク"},
+	"友情链接":    {"友情链接", "友情連結", "Links", "リンク"},
+	"留言":      {"留言", "留言", "Guestbook", "ゲストブック"},
+	"留言板":     {"留言板", "留言板", "Guestbook", "ゲストブック"},
+	"书单":      {"书单", "書單", "Bookshelf", "本棚"},
+	"书架":      {"书架", "書架", "Bookshelf", "本棚"},
+	"读书":      {"读书", "讀書", "Reading", "読書"},
+	"相册":      {"相册", "相冊", "Gallery", "ギャラリー"},
+	"订阅":      {"订阅", "訂閱", "Subscribe", "購読"},
+	"动态":      {"动态", "動態", "Stream", "ストリーム"},
+	"归档":      {"归档", "歸檔", "Archives", "アーカイブ"},
+	"分类":      {"分类", "分類", "Categories", "カテゴリー"},
+	"标签":      {"标签", "標籤", "Tags", "タグ"},
+	"专题":      {"专题", "專題", "Series", "シリーズ"},
+	"作品":      {"作品", "作品", "Projects", "プロジェクト"},
+	"项目":      {"项目", "專案", "Projects", "プロジェクト"},
 }
 
 func inferBuiltinNavItemTitle(rawTitle, rawURL, locale string) string {
@@ -1074,6 +1373,22 @@ func inferBuiltinNavItemTitle(rawTitle, rawURL, locale string) string {
 			entry, ok = commonCustomNavLocales["关于"]
 		case "posts/my-github-repos", "my-github-repos", "github":
 			entry, ok = commonCustomNavLocales["我的开源"]
+		case "archives":
+			entry, ok = commonCustomNavLocales["归档"]
+		case "links":
+			entry, ok = commonCustomNavLocales["友链"]
+		case "bookshelf":
+			entry, ok = commonCustomNavLocales["书架"]
+		case "follows":
+			entry, ok = commonCustomNavLocales["订阅"]
+		case "dynamic":
+			entry, ok = commonCustomNavLocales["动态"]
+		case "categories":
+			entry, ok = commonCustomNavLocales["分类"]
+		case "tags":
+			entry, ok = commonCustomNavLocales["标签"]
+		case "series":
+			entry, ok = commonCustomNavLocales["专题"]
 		}
 	}
 	if !ok {
@@ -1083,6 +1398,8 @@ func inferBuiltinNavItemTitle(rawTitle, rawURL, locale string) string {
 	switch {
 	case strings.HasPrefix(loc, "en"):
 		return entry[2]
+	case strings.HasPrefix(loc, "ja"):
+		return entry[3]
 	case strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant"):
 		return entry[1]
 	default:
@@ -1101,8 +1418,64 @@ func (s *Service) ListCategoriesWithCounts(ctx context.Context) ([]CategoryWithC
 	return out, nil
 }
 
+// ListCategoriesWithCountsPage returns a SQL-paginated slice of categories ordered by sort_order with published article counts.
+func (s *Service) ListCategoriesWithCountsPage(ctx context.Context, page, perPage int) ([]CategoryWithCount, int, error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 24, 200)
+	var total int
+	if err := s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM categories`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []CategoryWithCount{}, 0, nil
+	}
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(
+		`SELECT * FROM categories ORDER BY sort_order ASC, created_at ASC`,
+		limit, offset,
+	)
+	var cats []domain.Category
+	err := sqlx.SelectInto(ctx, s.store, &cats, pageSQL, pageArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(cats) == 0 {
+		return []CategoryWithCount{}, total, nil
+	}
+
+	placeholders := make([]string, len(cats))
+	cntArgs := make([]any, 0, len(cats)+1)
+	cntArgs = append(cntArgs, domain.ArticleStatusPublished)
+	for i, c := range cats {
+		placeholders[i] = "?"
+		cntArgs = append(cntArgs, c.ID)
+	}
+	type countRow struct {
+		CategoryID string `db:"category_id"`
+		Cnt        int    `db:"cnt"`
+	}
+	cntSQL := fmt.Sprintf(
+		`SELECT category_id, COUNT(*) AS cnt FROM articles WHERE status = ? AND category_id IN (%s) GROUP BY category_id`,
+		strings.Join(placeholders, ","),
+	)
+	var counts []countRow
+	_ = sqlx.SelectInto(ctx, s.store, &counts, cntSQL, cntArgs...)
+	cntMap := make(map[string]int, len(counts))
+	for _, c := range counts {
+		cntMap[c.CategoryID] = c.Cnt
+	}
+
+	out := make([]CategoryWithCount, 0, len(cats))
+	for _, c := range cats {
+		out = append(out, CategoryWithCount{
+			Category:     c,
+			ArticleCount: cntMap[c.ID],
+		})
+	}
+	return out, total, nil
+}
+
 func (s *Service) queryCategoriesWithCounts(ctx context.Context) ([]CategoryWithCount, error) {
-	cats, err := sqlx.Select[domain.Category](ctx, s.store, `SELECT * FROM categories ORDER BY sort_order ASC, created_at ASC`)
+	var cats []domain.Category
+	err := sqlx.SelectInto(ctx, s.store, &cats, `SELECT * FROM categories ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1110,8 +1483,8 @@ func (s *Service) queryCategoriesWithCounts(ctx context.Context) ([]CategoryWith
 		CategoryID string `db:"category_id"`
 		Cnt        int    `db:"cnt"`
 	}
-	counts, _ := sqlx.Select[countRow](
-		ctx, s.store,
+	var counts []countRow
+	_ = sqlx.SelectInto(ctx, s.store, &counts,
 		`SELECT category_id, COUNT(*) AS cnt FROM articles WHERE status = ? AND category_id <> '' GROUP BY category_id`,
 		domain.ArticleStatusPublished,
 	)
@@ -1147,6 +1520,71 @@ func (s *Service) ListTagsWithCounts(ctx context.Context, limit int) ([]TagWithC
 	return out, nil
 }
 
+// ListTagsWithCountsPage filters tags by optional query q (name or slug LIKE) and paginates in SQL.
+func (s *Service) ListTagsWithCountsPage(ctx context.Context, q string, page, perPage int) ([]TagWithCount, int, error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 60, 200)
+	cleanQ := strings.TrimSpace(q)
+
+	var whereSQL string
+	var whereArgs []any
+	if cleanQ != "" {
+		pat := "%" + strings.ToLower(cleanQ) + "%"
+		whereSQL = " WHERE LOWER(t.name) LIKE ? OR LOWER(t.slug) LIKE ?"
+		whereArgs = []any{pat, pat}
+	}
+
+	var total int
+	if err := s.store.QueryRowContext(ctx, "SELECT COUNT(*) FROM tags t"+whereSQL, whereArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []TagWithCount{}, 0, nil
+	}
+
+	type tagCountRow struct {
+		ID           string `db:"id"`
+		Name         string `db:"name"`
+		Slug         string `db:"slug"`
+		CreatedAt    int64  `db:"created_at"`
+		ArticleCount int    `db:"article_count"`
+	}
+	baseSQL := `
+		SELECT t.id, t.name, t.slug, t.created_at, COALESCE(cnts.cnt, 0) AS article_count
+		FROM tags t
+		LEFT JOIN (
+			SELECT atg.tag_id AS tag_id, COUNT(*) AS cnt
+			FROM article_tags atg
+			INNER JOIN articles a ON a.id = atg.article_id
+			WHERE a.status = ?
+			GROUP BY atg.tag_id
+		) cnts ON cnts.tag_id = t.id` + whereSQL + `
+		ORDER BY COALESCE(cnts.cnt, 0) DESC, t.name ASC`
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
+	args := make([]any, 0, 1+len(whereArgs)+len(pageArgs))
+	args = append(args, domain.ArticleStatusPublished)
+	args = append(args, whereArgs...)
+	args = append(args, pageArgs...)
+
+	var rows []tagCountRow
+	err := sqlx.SelectInto(ctx, s.store, &rows, pageSQL, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := make([]TagWithCount, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, TagWithCount{
+			Tag: domain.Tag{
+				ID:        r.ID,
+				Name:      r.Name,
+				Slug:      r.Slug,
+				CreatedAt: r.CreatedAt,
+			},
+			ArticleCount: r.ArticleCount,
+		})
+	}
+	return out, total, nil
+}
+
 func (s *Service) queryTagsWithCountsLimited(ctx context.Context, limit int) ([]TagWithCount, error) {
 	type tagCountRow struct {
 		ID           string `db:"id"`
@@ -1173,7 +1611,8 @@ func (s *Service) queryTagsWithCountsLimited(ctx context.Context, limit int) ([]
 		q, pageArgs = s.store.Dialect().PaginateSQL(baseSQL, limit, 0)
 		args = append(args, pageArgs...)
 	}
-	rows, err := sqlx.Select[tagCountRow](ctx, s.store, q, args...)
+	var rows []tagCountRow
+	err := sqlx.SelectInto(ctx, s.store, &rows, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1192,6 +1631,28 @@ func (s *Service) queryTagsWithCountsLimited(ctx context.Context, limit int) ([]
 	return out, nil
 }
 
+func cloneArchiveStats(src ArchiveStats) ArchiveStats {
+	years := make([]ArchiveYear, len(src.Years))
+	copy(years, src.Years)
+	months := make([]ArchiveMonth, len(src.Months))
+	copy(months, src.Months)
+	yearCounts := make(map[string]int, len(src.YearCounts))
+	for k, v := range src.YearCounts {
+		yearCounts[k] = v
+	}
+	monthCounts := make(map[string]int, len(src.MonthCounts))
+	for k, v := range src.MonthCounts {
+		monthCounts[k] = v
+	}
+	return ArchiveStats{
+		TotalArticles: src.TotalArticles,
+		Years:         years,
+		Months:        months,
+		YearCounts:    yearCounts,
+		MonthCounts:   monthCounts,
+	}
+}
+
 // ListArchiveMonths returns cached YYYY-MM archive buckets computed from `articles.published_at`
 // (replacing legacy `archivedate` tables and strictly excluding Standalone Pages!).
 func (s *Service) ListArchiveMonths(ctx context.Context) ([]ArchiveMonth, error) {
@@ -1204,33 +1665,106 @@ func (s *Service) ListArchiveMonths(ctx context.Context) ([]ArchiveMonth, error)
 	return out, nil
 }
 
+// ArchiveMonthStats returns revision-coherent total, calendar-year (YYYY), and calendar-month (YYYY-MM) counts
+// for published articles in siteTZ (or the configured site timezone when siteTZ is empty).
+func (s *Service) ArchiveMonthStats(ctx context.Context, siteTZ string) (ArchiveStats, error) {
+	var loc *time.Location
+	if trimmed := strings.TrimSpace(siteTZ); trimmed != "" {
+		loc = domain.ResolveSiteLocation(trimmed)
+	} else {
+		loc = s.siteLocation()
+	}
+
+	if snap, err := s.getChromeSnapshot(ctx); err == nil && snap != nil && snap.archiveTZ == loc.String() {
+		return cloneArchiveStats(snap.archiveStats), nil
+	}
+
+	dRev := uint64(0)
+	if s.store != nil {
+		dRev = s.store.DataRevision()
+	}
+	tzKey := loc.String()
+	if s.caches != nil {
+		s.caches.archiveTZMu.RLock()
+		if hit, ok := s.caches.archiveByTZ[tzKey]; ok && hit.dataRev == dRev {
+			s.caches.archiveTZMu.RUnlock()
+			return cloneArchiveStats(hit.stats), nil
+		}
+		s.caches.archiveTZMu.RUnlock()
+	}
+
+	stats, err := s.queryArchiveStatsForLocation(ctx, loc)
+	if err != nil {
+		return ArchiveStats{}, err
+	}
+	if s.caches != nil {
+		s.caches.archiveTZMu.Lock()
+		if len(s.caches.archiveByTZ) >= 16 {
+			clear(s.caches.archiveByTZ)
+		}
+		s.caches.archiveByTZ[tzKey] = tzArchiveCacheEntry{
+			dataRev: dRev,
+			stats:   stats,
+		}
+		s.caches.archiveTZMu.Unlock()
+	}
+	return cloneArchiveStats(stats), nil
+}
+
 func (s *Service) queryArchiveMonths(ctx context.Context) ([]ArchiveMonth, error) {
+	stats, err := s.queryArchiveStatsForLocation(ctx, s.siteLocation())
+	if err != nil {
+		return nil, err
+	}
+	return stats.Months, nil
+}
+
+func (s *Service) queryArchiveStatsForLocation(ctx context.Context, loc *time.Location) (ArchiveStats, error) {
+	if loc == nil {
+		loc = s.siteLocation()
+	}
 	type pubRow struct {
 		PublishedAt int64 `db:"published_at"`
 	}
-	rows, err := sqlx.Select[pubRow](
-		ctx, s.store,
+	var rows []pubRow
+	err := sqlx.SelectInto(ctx, s.store, &rows,
 		`SELECT CASE WHEN published_at > 0 THEN published_at ELSE created_at END AS published_at FROM articles WHERE status = ? ORDER BY published_at DESC`,
 		domain.ArticleStatusPublished,
 	)
 	if err != nil {
-		return nil, err
+		return ArchiveStats{}, err
 	}
-	loc := s.siteLocation()
-	counts := make(map[string]int)
-	var order []string
+	yearCounts := make(map[string]int)
+	monthCounts := make(map[string]int)
+	var yearOrder []string
+	var monthOrder []string
 	for _, r := range rows {
 		ym := time.UnixMilli(r.PublishedAt).In(loc).Format("2006-01")
-		if counts[ym] == 0 {
-			order = append(order, ym)
+		yr := ym[:4]
+		if yearCounts[yr] == 0 {
+			yearOrder = append(yearOrder, yr)
 		}
-		counts[ym]++
+		yearCounts[yr]++
+		if monthCounts[ym] == 0 {
+			monthOrder = append(monthOrder, ym)
+		}
+		monthCounts[ym]++
 	}
-	out := make([]ArchiveMonth, 0, len(order))
-	for _, ym := range order {
-		out = append(out, ArchiveMonth{YearMonth: ym, Count: counts[ym]})
+	years := make([]ArchiveYear, 0, len(yearOrder))
+	for _, yr := range yearOrder {
+		years = append(years, ArchiveYear{Year: yr, Count: yearCounts[yr]})
 	}
-	return out, nil
+	months := make([]ArchiveMonth, 0, len(monthOrder))
+	for _, ym := range monthOrder {
+		months = append(months, ArchiveMonth{YearMonth: ym, Count: monthCounts[ym]})
+	}
+	return ArchiveStats{
+		TotalArticles: len(rows),
+		Years:         years,
+		Months:        months,
+		YearCounts:    yearCounts,
+		MonthCounts:   monthCounts,
+	}, nil
 }
 
 // ListSeries returns all Series ordered by sort_order.
@@ -1238,15 +1772,49 @@ func (s *Service) ListSeries(ctx context.Context) ([]domain.Series, error) {
 	return sqlx.Select[domain.Series](ctx, s.store, `SELECT * FROM series ORDER BY sort_order ASC, created_at DESC`)
 }
 
+// ListSeriesPage filters Series by optional query q and paginates in SQL.
+func (s *Service) ListSeriesPage(ctx context.Context, q string, page, perPage int) ([]domain.Series, int, error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 18, 100)
+	cleanQ := strings.TrimSpace(q)
+
+	var whereSQL string
+	var whereArgs []any
+	if cleanQ != "" {
+		pat := "%" + strings.ToLower(cleanQ) + "%"
+		whereSQL = " WHERE LOWER(title) LIKE ? OR LOWER(slug) LIKE ? OR LOWER(description) LIKE ?"
+		whereArgs = []any{pat, pat, pat}
+	}
+
+	var total int
+	if err := s.store.QueryRowContext(ctx, "SELECT COUNT(*) FROM series"+whereSQL, whereArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []domain.Series{}, 0, nil
+	}
+
+	baseSQL := "SELECT * FROM series" + whereSQL + " ORDER BY sort_order ASC, created_at DESC"
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
+	queryArgs := append(append([]any{}, whereArgs...), pageArgs...)
+
+	var items []domain.Series
+	err := sqlx.SelectInto(ctx, s.store, &items, pageSQL, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
 // GetSeriesBySlug returns a Series and its ordered, Guard-redacted PublicArticleCards.
 func (s *Service) GetSeriesBySlug(ctx context.Context, slug string, locale string) (SeriesView, error) {
-	ser, err := sqlx.Get[domain.Series](ctx, s.store, `SELECT * FROM series WHERE slug = ?`, strings.TrimSpace(slug))
+	var ser domain.Series
+	err := sqlx.GetInto(ctx, s.store, &ser, `SELECT * FROM series WHERE slug = ?`, strings.TrimSpace(slug))
 	if err != nil {
 		return SeriesView{}, err
 	}
-	raws, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT a.* FROM series_articles sa
+	var raws []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.store, &raws,
+		`SELECT `+articleCardSelectColumns("a")+` FROM series_articles sa
 		 INNER JOIN articles a ON a.id = sa.article_id
 		 WHERE sa.series_id = ? AND a.status = ?
 		 ORDER BY sa.sort_order ASC, a.published_at ASC`,
@@ -1259,7 +1827,65 @@ func (s *Service) GetSeriesBySlug(ctx context.Context, slug string, locale strin
 	if err != nil {
 		return SeriesView{}, err
 	}
-	return SeriesView{Series: ser, Articles: cards}, nil
+	return SeriesView{Series: ser, Articles: cards, TotalArticles: len(cards)}, nil
+}
+
+// GetSeriesBySlugPage returns a Series, total published episode count, and a SQL-paginated slice of Guard-redacted episode cards,
+// projecting card columns so multi-MB content_md bodies are never loaded unnecessarily.
+func (s *Service) GetSeriesBySlugPage(ctx context.Context, slug string, page, perPage int, locale ...string) (SeriesView, error) {
+	var ser domain.Series
+	err := sqlx.GetInto(ctx, s.store, &ser, `SELECT * FROM series WHERE slug = ?`, strings.TrimSpace(slug))
+	if err != nil {
+		return SeriesView{}, err
+	}
+	var total int
+	if err := s.store.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM series_articles sa
+		 INNER JOIN articles a ON a.id = sa.article_id
+		 WHERE sa.series_id = ? AND a.status = ?`,
+		ser.ID, domain.ArticleStatusPublished,
+	).Scan(&total); err != nil {
+		return SeriesView{}, err
+	}
+	if total == 0 {
+		return SeriesView{Series: ser, Articles: []visibility.PublicArticleCard{}, TotalArticles: 0}, nil
+	}
+
+	limit, offset := dialect.NormalizePage(page, perPage, 20, 100)
+	baseSQL := `SELECT ` + articleCardSelectColumns("a") + ` FROM series_articles sa
+		 INNER JOIN articles a ON a.id = sa.article_id
+		 WHERE sa.series_id = ? AND a.status = ?
+		 ORDER BY sa.sort_order ASC, a.published_at ASC`
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
+	queryArgs := append([]any{ser.ID, domain.ArticleStatusPublished}, pageArgs...)
+
+	var raws []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.store, &raws, pageSQL, queryArgs...)
+	if err != nil {
+		return SeriesView{}, err
+	}
+	loc := ""
+	if len(locale) > 0 {
+		loc = strings.TrimSpace(locale[0])
+	}
+	if loc == "" {
+		loc = s.defaultLocale()
+	}
+	cards, err := s.hydrateCards(ctx, raws, loc)
+	if err != nil {
+		return SeriesView{}, err
+	}
+	return SeriesView{Series: ser, Articles: cards, TotalArticles: total}, nil
+}
+
+func (s *Service) defaultLocale() string {
+	if s.settings != nil {
+		if loc := strings.TrimSpace(s.settings.Snapshot().Site.DefaultLocale); loc != "" {
+			return loc
+		}
+	}
+	return "zh-CN"
 }
 
 // ListLinks returns friend links ordered by sort_order.
@@ -1267,9 +1893,57 @@ func (s *Service) ListLinks(ctx context.Context) ([]domain.Link, error) {
 	return sqlx.Select[domain.Link](ctx, s.store, `SELECT * FROM links ORDER BY sort_order ASC, created_at ASC`)
 }
 
+// ListPublicLinksPage returns distinct ordered link categories (for jump pills) and a SQL-paginated slice of links.
+func (s *Service) ListPublicLinksPage(ctx context.Context, category string, page, perPage int) (items []domain.Link, categories []string, total int, err error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 36, 200)
+
+	type catRow struct {
+		CategoryName string `db:"category_name"`
+	}
+	var catRows []catRow
+	err = sqlx.SelectInto(ctx, s.store, &catRows,
+		`SELECT TRIM(category_name) AS category_name FROM links WHERE TRIM(category_name) <> '' GROUP BY TRIM(category_name) ORDER BY MIN(sort_order) ASC, TRIM(category_name) ASC`,
+	)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	categories = make([]string, 0, len(catRows))
+	for _, r := range catRows {
+		if r.CategoryName != "" {
+			categories = append(categories, r.CategoryName)
+		}
+	}
+
+	cleanCat := strings.TrimSpace(category)
+	var whereSQL string
+	var whereArgs []any
+	if cleanCat != "" {
+		whereSQL = " WHERE TRIM(category_name) = ?"
+		whereArgs = []any{cleanCat}
+	}
+
+	if err := s.store.QueryRowContext(ctx, "SELECT COUNT(*) FROM links"+whereSQL, whereArgs...).Scan(&total); err != nil {
+		return nil, nil, 0, err
+	}
+	if total == 0 {
+		return []domain.Link{}, categories, 0, nil
+	}
+
+	baseSQL := "SELECT * FROM links" + whereSQL + " ORDER BY sort_order ASC, created_at ASC"
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
+	queryArgs := append(append([]any{}, whereArgs...), pageArgs...)
+
+	err = sqlx.SelectInto(ctx, s.store, &items, pageSQL, queryArgs...)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return items, categories, total, nil
+}
+
 // ListFollowsWithItems returns RSS Follow subscriptions and their latest items using 2 bounded batch queries.
 func (s *Service) ListFollowsWithItems(ctx context.Context, itemsPerFollow int) ([]FollowGroup, error) {
-	follows, err := sqlx.Select[domain.Follow](ctx, s.store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
+	var follows []domain.Follow
+	err := sqlx.SelectInto(ctx, s.store, &follows, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil || len(follows) == 0 {
 		return []FollowGroup{}, err
 	}
@@ -1290,7 +1964,8 @@ func (s *Service) ListFollowsWithItemsPage(ctx context.Context, page int, perPag
 		`SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`,
 		limit, offset,
 	)
-	follows, err := sqlx.Select[domain.Follow](ctx, s.store, pageSQL, pageArgs...)
+	var follows []domain.Follow
+	err := sqlx.SelectInto(ctx, s.store, &follows, pageSQL, pageArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1314,7 +1989,8 @@ func (s *Service) hydrateFollowGroups(ctx context.Context, follows []domain.Foll
 		`SELECT * FROM follow_items WHERE follow_id IN (%s) ORDER BY published_at DESC`,
 		strings.Join(placeholders, ","),
 	)
-	allItems, _ := sqlx.Select[domain.FollowItem](ctx, s.store, q, args...)
+	var allItems []domain.FollowItem
+	_ = sqlx.SelectInto(ctx, s.store, &allItems, q, args...)
 	byFollow := make(map[string][]domain.FollowItem, len(follows))
 	for _, it := range allItems {
 		if len(byFollow[it.FollowID]) < itemsPerFollow {
@@ -1330,8 +2006,42 @@ func (s *Service) hydrateFollowGroups(ctx context.Context, follows []domain.Foll
 
 // RecordView coalesces view_count and zero-PII daily PV/UV + top referer/article counters
 // into the non-blocking write-behind analytics buffer, eliminating per-GET SQLite write-lock contention.
-func (s *Service) RecordView(_ context.Context, targetType string, targetID string, actorFPHash string, refererHost string) {
-	today := time.Now().In(s.siteLocation()).Format("2006-01-02")
+func (s *Service) RecordView(ctx context.Context, targetType string, targetID string, actorFPHash string, refererHost string) {
+	s.RecordViewWithGeo(ctx, targetType, targetID, actorFPHash, refererHost, "")
+}
+
+// RecordViewWithGeo coalesces view_count, zero-PII daily PV/UV, validated top referer host, and optional country code
+// (`kind = 'country'`) into the non-blocking write-behind analytics buffer.
+func (s *Service) RecordViewWithGeo(
+	_ context.Context,
+	targetType string,
+	targetID string,
+	actorFPHash string,
+	refererHost string,
+	countryCode string,
+	siteTZ ...string,
+) {
+	if s == nil || s.views == nil {
+		return
+	}
+	var tzOverride string
+	if len(siteTZ) > 0 {
+		tzOverride = strings.TrimSpace(siteTZ[0])
+	} else if targetType != "" && targetType != domain.TargetTypeArticle && targetType != domain.TargetTypePage {
+		// Support 6-arg shorthand (ctx, articleID, visitorHash, refererHost, countryCode, siteTZ).
+		tzOverride = strings.TrimSpace(countryCode)
+		countryCode = refererHost
+		refererHost = actorFPHash
+		actorFPHash = targetID
+		targetID = targetType
+		targetType = domain.TargetTypeArticle
+	}
+
+	loc := s.siteLocation()
+	if tzOverride != "" {
+		loc = domain.ResolveSiteLocation(tzOverride)
+	}
+	today := time.Now().In(loc).Format("2006-01-02")
 
 	isNewUV := false
 	if actorFPHash != "" {
@@ -1356,7 +2066,27 @@ func (s *Service) RecordView(_ context.Context, targetType string, targetID stri
 		uvDelta = 1
 	}
 
-	s.views.RecordView(targetType, targetID, today, uvDelta, refererHost)
+	s.views.RecordViewWithGeo(targetType, targetID, today, uvDelta, refererHost, countryCode)
+}
+
+// PruneAnalyticsTopItems deletes `analytics_top_items` rows (`kind IN ('referer', 'country')`)
+// whose stat_date is older than keepDays (defaulting to 180 days when keepDays <= 0).
+func (s *Service) PruneAnalyticsTopItems(ctx context.Context, keepDays int) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	if keepDays <= 0 {
+		keepDays = 180
+	}
+	cutoff := time.Now().In(s.siteLocation()).AddDate(0, 0, -keepDays).Format("2006-01-02")
+	return s.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
+		_, err := tx.ExecContext(
+			ctx,
+			`DELETE FROM analytics_top_items WHERE kind IN ('referer', 'country') AND stat_date < ?`,
+			cutoff,
+		)
+		return err
+	})
 }
 
 func (s *Service) loadCategoriesMap(ctx context.Context) (map[string]domain.Category, error) {
@@ -1393,7 +2123,8 @@ func (s *Service) loadTagsForArticles(ctx context.Context, raws []domain.RawArti
 		 ORDER BY t.name ASC`,
 		strings.Join(placeholders, ","),
 	)
-	rows, err := sqlx.Select[joinedTag](ctx, s.store, q, args...)
+	var rows []joinedTag
+	err := sqlx.SelectInto(ctx, s.store, &rows, q, args...)
 	if err != nil {
 		return out, err
 	}
@@ -1448,8 +2179,8 @@ func truncateForSummary(s string, maxRunes int) string {
 }
 
 func (s *Service) queryPublicAuthors(ctx context.Context) (PublicAuthorProfile, []PublicAuthorProfile, map[string]PublicAuthorProfile) {
-	rows, _ := sqlx.Select[domain.User](
-		ctx, s.store,
+	var rows []domain.User
+	_ = sqlx.SelectInto(ctx, s.store, &rows,
 		`SELECT id, username, display_name, avatar_url, bio, website_url, role
 		 FROM users
 		 WHERE status = ? AND (role = ? OR role = ?)
@@ -1460,8 +2191,8 @@ func (s *Service) queryPublicAuthors(ctx context.Context) (PublicAuthorProfile, 
 		AuthorID string `db:"author_id"`
 		Cnt      int    `db:"cnt"`
 	}
-	cntRows, _ := sqlx.Select[authorCnt](
-		ctx, s.store,
+	var cntRows []authorCnt
+	_ = sqlx.SelectInto(ctx, s.store, &cntRows,
 		`SELECT author_id, COUNT(*) AS cnt FROM articles WHERE status = ? GROUP BY author_id`,
 		domain.ArticleStatusPublished,
 	)
@@ -1583,6 +2314,8 @@ func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, side
 	copy(authorsCopy, snap.authors)
 	archivesCopy := make([]ArchiveMonth, len(snap.archiveBuckets))
 	copy(archivesCopy, snap.archiveBuckets)
+	archiveYearsCopy := make([]ArchiveYear, len(snap.archiveStats.Years))
+	copy(archiveYearsCopy, snap.archiveStats.Years)
 
 	stats := snap.stats
 	stats.ViewCount += s.views.TotalPendingArticleViews()
@@ -1592,6 +2325,7 @@ func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, side
 		Authors:            authorsCopy,
 		Stats:              stats,
 		ArchiveBuckets:     archivesCopy,
+		ArchiveYearBuckets: archiveYearsCopy,
 		RecentPosts:        recentCards,
 		MostViewedPosts:    viewedCards,
 		MostCommentedPosts: cmtedCards,
@@ -1610,17 +2344,22 @@ func (s *Service) ListRelatedArticles(ctx context.Context, cur domain.RawArticle
 	seen := map[string]bool{cur.ID: true}
 	var collected []domain.RawArticle
 
+	cardColsA := articleCardSelectColumns("a")
 	tagSQL, tagArgs := s.store.Dialect().PaginateSQL(
-		`SELECT DISTINCT a.* FROM articles a
-		 INNER JOIN article_tags at1 ON at1.article_id = a.id
-		 INNER JOIN article_tags at2 ON at2.tag_id = at1.tag_id
-		 WHERE at2.article_id = ? AND a.id <> ? AND a.status = ? AND a.password_ciphertext = ''
+		`SELECT `+cardColsA+` FROM articles a
+		 WHERE a.id <> ? AND a.status = ? AND a.password_ciphertext = ''
+		   AND EXISTS (
+		     SELECT 1 FROM article_tags at1
+		     INNER JOIN article_tags at2 ON at2.tag_id = at1.tag_id
+		     WHERE at2.article_id = ? AND at1.article_id = a.id
+		   )
 		 ORDER BY a.published_at DESC`,
 		limit, 0,
 	)
-	if byTag, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store, tagSQL,
-		append([]any{cur.ID, cur.ID, domain.ArticleStatusPublished}, tagArgs...)...,
+	var byTag []domain.RawArticle
+	if err := sqlx.SelectInto(
+		ctx, s.store, &byTag, tagSQL,
+		append([]any{cur.ID, domain.ArticleStatusPublished, cur.ID}, tagArgs...)...,
 	); err == nil {
 		for _, r := range byTag {
 			if !seen[r.ID] && s.guard.IsPublicIndexable(r) {
@@ -1633,13 +2372,14 @@ func (s *Service) ListRelatedArticles(ctx context.Context, cur domain.RawArticle
 	if len(collected) < limit && strings.TrimSpace(cur.CategoryID) != "" {
 		rem := limit - len(collected)
 		catSQL, catArgs := s.store.Dialect().PaginateSQL(
-			`SELECT * FROM articles
+			`SELECT `+articleCardSelectColumns("")+` FROM articles
 			 WHERE category_id = ? AND id <> ? AND status = ? AND password_ciphertext = ''
 			 ORDER BY published_at DESC`,
 			rem+4, 0,
 		)
-		if byCat, err := sqlx.Select[domain.RawArticle](
-			ctx, s.store, catSQL,
+		var byCat []domain.RawArticle
+		if err := sqlx.SelectInto(
+			ctx, s.store, &byCat, catSQL,
 			append([]any{cur.CategoryID, cur.ID, domain.ArticleStatusPublished}, catArgs...)...,
 		); err == nil {
 			for _, r := range byCat {
@@ -1677,6 +2417,9 @@ func (s *Service) ListRandomArticles(ctx context.Context, excludeID string, loca
 			if !seen[c.ID] && !c.IsPasswordProtected {
 				seen[c.ID] = true
 				c.ViewCount += s.views.PendingArticleViews(c.ID)
+				if c.IsPasswordProtected {
+					c.Summary = s.guard.ProtectedNotice(locale)
+				}
 				pool = append(pool, c)
 			}
 		}

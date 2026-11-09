@@ -227,10 +227,7 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 	now := time.Now().UTC()
 
 	if kind == mediaKindImage {
-		imgMaxBytes := maxBytes
-		if imgMaxBytes > maxImageUploadBytes {
-			imgMaxBytes = maxImageUploadBytes
-		}
+		imgMaxBytes := max(int64(maxImageUploadBytes), maxBytes)
 		raw, rErr := readBounded(fullReader, imgMaxBytes)
 		if rErr != nil {
 			return nil, rErr
@@ -280,7 +277,34 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 
 			if !isAnimatedGIF {
 				orient := ReadEXIFOrientation(raw)
-				if detectedMIME == "image/webp" && orient == 1 {
+				if !stCfg.StripEXIF && orient == 1 && (!stCfg.AdaptiveWebP || formatName == "webp") &&
+					(formatName == "jpeg" || formatName == "png" || formatName == "webp") {
+					img, _, decErr := image.Decode(bytes.NewReader(raw))
+					if decErr != nil {
+						raw = nil
+						return fmt.Errorf("image decode failed: %w", decErr)
+					}
+					b := img.Bounds()
+					width, height = b.Dx(), b.Dy()
+					img = nil
+					finalBytes = raw
+					raw = nil
+					switch formatName {
+					case "png":
+						finalExt = ".png"
+						finalMIME = "image/png"
+					case "webp":
+						finalExt = ".webp"
+						finalMIME = "image/webp"
+					default:
+						finalExt = ".jpg"
+						finalMIME = "image/jpeg"
+					}
+					exifStripped = false
+					return nil
+				}
+
+				if stCfg.StripEXIF && detectedMIME == "image/webp" && orient == 1 {
 					stripped, sErr := StripWebPMetadataLossless(raw)
 					raw = nil
 					if sErr != nil {
@@ -308,11 +332,11 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 				width, height = b.Dx(), b.Dy()
 
 				quality := stCfg.ImageQuality
-				if quality < 40 || quality > 100 {
+				if quality < 1 || quality > 100 {
 					quality = 85
 				}
 
-				// Always re-encode fresh pixel buffers so 100% of EXIF GPS, camera serials, thumbnails, and XMP are stripped!
+				// Re-encode clean pixel buffers when stripping EXIF, normalizing orientation, or adapting formats.
 				var baselineBuf bytes.Buffer
 				var baselineExt string
 				var baselineMIME string
@@ -353,10 +377,10 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 				}
 				upright = nil
 
-				if ContainsEXIFOrGPS(finalBytes) {
+				if stCfg.StripEXIF && ContainsEXIFOrGPS(finalBytes) {
 					return errors.New("privacy invariant violation: residual metadata detected after pixel re-encode")
 				}
-				exifStripped = true
+				exifStripped = stCfg.StripEXIF
 			}
 			return nil
 		}()
@@ -471,7 +495,8 @@ func (p *Pipeline) resolvePluginStorage(driver string) plugin.StorageProvider {
 
 // Delete removes a MediaAsset by ID from both backing storage and `media_assets`.
 func (p *Pipeline) Delete(ctx context.Context, assetID string) error {
-	asset, err := sqlx.Get[domain.MediaAsset](ctx, p.store, `SELECT * FROM media_assets WHERE id = ?`, strings.TrimSpace(assetID))
+	var asset domain.MediaAsset
+	err := sqlx.GetInto(ctx, p.store, &asset, `SELECT * FROM media_assets WHERE id = ?`, strings.TrimSpace(assetID))
 	if err != nil {
 		return err
 	}
@@ -873,7 +898,7 @@ func (p *Pipeline) storageSettings() domain.StorageSettings {
 	}
 	return domain.StorageSettings{
 		ActiveDriver: "local",
-		MaxUploadMB:  25,
+		MaxUploadMB:  50,
 		StripEXIF:    true,
 		AdaptiveWebP: true,
 		ImageQuality: 85,
@@ -883,10 +908,10 @@ func (p *Pipeline) storageSettings() domain.StorageSettings {
 func (p *Pipeline) maxUploadBytes() int64 {
 	mb := p.storageSettings().MaxUploadMB
 	if mb <= 0 {
-		mb = 25
+		mb = 50
 	}
-	if mb > 512 {
-		mb = 512
+	if mb > 2048 {
+		mb = 2048
 	}
 	return int64(mb) << 20
 }

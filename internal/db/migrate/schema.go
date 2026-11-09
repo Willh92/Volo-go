@@ -39,7 +39,7 @@ func loadV1SchemaTemplate() string {
 }
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 6
+const CurrentSchemaVersion = 7
 
 type migrationStep struct {
 	Version     int
@@ -77,6 +77,11 @@ var steps = []migrationStep{
 		Version:     6,
 		Description: "Drop duplicate media index, add v6 scale composite indexes, and widen long lookup keys to VARCHAR(512)",
 		Statements:  buildV6ScaleIndexesAndKeyWidths,
+	},
+	{
+		Version:     7,
+		Description: "Backfill zero published_at on published articles and add media uploader and audit log composite indexes",
+		Statements:  buildV7ArticlePublishedAtAndAuditMediaIndexes,
 	},
 }
 
@@ -170,6 +175,15 @@ func buildV6ScaleIndexesAndKeyWidths(d dialect.Dialect) []string {
 	return stmts
 }
 
+func buildV7ArticlePublishedAtAndAuditMediaIndexes(_ dialect.Dialect) []string {
+	return []string{
+		`UPDATE articles SET published_at = created_at WHERE status = 'published' AND published_at <= 0`,
+		`CREATE INDEX idx_media_uploader_created ON media_assets (uploader_id, created_at)`,
+		`CREATE INDEX idx_audit_actor_created ON audit_logs (actor_id, created_at)`,
+		`CREATE INDEX idx_audit_action_created ON audit_logs (action, created_at)`,
+	}
+}
+
 // Up idempotently applies all pending schema migrations across SQLite, PostgreSQL, and MySQL.
 func Up(ctx context.Context, store *sqlx.Store) error {
 	d := store.Dialect()
@@ -185,9 +199,10 @@ func Up(ctx context.Context, store *sqlx.Store) error {
 		return fmt.Errorf("migrate: create schema_migrations: %w", err)
 	}
 
-	appliedRows, err := sqlx.Select[struct {
+	var appliedRows []struct {
 		Version int `db:"version"`
-	}](ctx, store, "SELECT version FROM schema_migrations ORDER BY version ASC")
+	}
+	err := sqlx.SelectInto(ctx, store, &appliedRows, "SELECT version FROM schema_migrations ORDER BY version ASC")
 	if err != nil {
 		return fmt.Errorf("migrate: query applied migrations: %w", err)
 	}
@@ -306,9 +321,10 @@ func parseAlterAddColumnTarget(stmt string) (table string, col string, ok bool) 
 func columnExists(ctx context.Context, store *sqlx.Store, table string, col string) (bool, error) {
 	switch store.Dialect().Name() {
 	case "sqlite":
-		rows, err := sqlx.Select[struct {
+		var rows []struct {
 			Name string `db:"name"`
-		}](ctx, store, fmt.Sprintf("PRAGMA table_info(%s)", store.Dialect().QuoteIdent(table)))
+		}
+		err := sqlx.SelectInto(ctx, store, &rows, fmt.Sprintf("PRAGMA table_info(%s)", store.Dialect().QuoteIdent(table)))
 		if err != nil {
 			return false, err
 		}

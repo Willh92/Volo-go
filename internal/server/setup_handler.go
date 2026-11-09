@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Willh92/Volo-go/internal/adminui"
 	"github.com/Willh92/Volo-go/internal/auth"
@@ -24,6 +23,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/etl"
+	"github.com/Willh92/Volo-go/internal/i18n"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
@@ -265,7 +265,7 @@ func extractSetupSQLTargets(driver, dsn string) ([]struct {
 
 	switch driver {
 	case "postgres":
-		pgCfg, err := pgconn.ParseConfig(dsn)
+		pgCfg, err := sqlx.ParsePostgresConfig(dsn)
 		if err != nil {
 			return nil, fmt.Errorf("invalid postgres DSN: %w", err)
 		}
@@ -695,6 +695,7 @@ func (s *AppServer) registerSetupRoutes(mux *http.ServeMux) {
 }
 
 func (s *AppServer) handleSetupSPA(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
@@ -715,8 +716,7 @@ func (s *AppServer) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSetupUnlocked(w, r) {
 		return
 	}
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 	snap := s.deps.Settings.Snapshot()
@@ -851,8 +851,7 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 
 	// Spool the multipart upload BEFORE acquiring s.setupMu so slow clients cannot block concurrent wizard calls.
 	prep, err := s.spoolLegacyImportUpload(w, r)
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, err) {
 		return
 	}
 	defer os.Remove(prep.tmpPath)
@@ -864,8 +863,7 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 	}
 
 	rep, err := s.executeLegacyImport(r.Context(), prep, true)
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, err) {
 		return
 	}
 	if prep.dryRun {
@@ -891,7 +889,23 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	_, _ = s.deps.Settings.Reload(r.Context())
-	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
+	setupSitePatch := map[string]any{"initialized": true}
+	if prep.newSiteURL != "" {
+		cleanURL := normalizeTrustedBaseURL(prep.newSiteURL)
+		if cleanURL != "" {
+			cv := make(map[string]string)
+			for k, v := range s.deps.Settings.Snapshot().Site.CustomVars {
+				cv[k] = v
+			}
+			if strings.TrimSpace(cv["public_url"]) == "" {
+				cv["public_url"] = cleanURL
+				setupSitePatch["custom_vars"] = cv
+			}
+		}
+	}
+	if patchBytes, mErr := json.Marshal(setupSitePatch); mErr == nil {
+		_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, patchBytes, 0)
+	}
 	s.reloadRuntimeAfterDBRestore(r.Context())
 
 	resp := map[string]any{
@@ -901,7 +915,8 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 		"target_dialect": s.deps.Store.Dialect().Name(),
 	}
 	// Automatically sign in the primary imported administrator so entering /console works seamlessly!
-	if adminUser, qErr := sqlx.Get[domain.User](r.Context(), s.deps.Store,
+	var adminUser domain.User
+	if qErr := sqlx.GetInto(r.Context(), s.deps.Store, &adminUser,
 		`SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
 		domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
 		geo := ""
@@ -943,6 +958,8 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		SiteTitle        string `json:"site_title"`
 		SiteSubtitle     string `json:"site_subtitle"`
 		SiteDescription  string `json:"site_description"`
+		PublicURL        string `json:"public_url"`
+		SiteURL          string `json:"site_url"`
 		DefaultLocale    string `json:"default_locale"`
 		TimeZone         string `json:"timezone"`
 		Accent           string `json:"accent"`
@@ -957,17 +974,27 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 
 	uname := strings.TrimSpace(req.AdminUsername)
 	email := strings.ToLower(strings.TrimSpace(req.AdminEmail))
-	if len(uname) < 2 || len(uname) > 48 {
-		writeErrJSON(w, http.StatusBadRequest, "admin_username must be 2-48 characters")
+	if writeBadErr(w, auth.ValidateUsername(uname)) {
 		return
 	}
 	if !strings.Contains(email, "@") || len(email) > 190 {
 		writeErrJSON(w, http.StatusBadRequest, "valid admin_email is required")
 		return
 	}
-	if err := auth.ValidatePasswordPolicy(req.AdminPassword); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, auth.ValidatePasswordPolicy(req.AdminPassword)) {
 		return
+	}
+	rawPubURL := strings.TrimSpace(req.PublicURL)
+	if rawPubURL == "" {
+		rawPubURL = strings.TrimSpace(req.SiteURL)
+	}
+	normPublicURL := ""
+	if rawPubURL != "" {
+		normPublicURL = normalizeTrustedBaseURL(rawPubURL)
+		if normPublicURL == "" {
+			writeErrJSON(w, http.StatusBadRequest, "public_url must be a valid http(s):// URL")
+			return
+		}
 	}
 	pwHash, err := auth.HashPassword(req.AdminPassword)
 	if err != nil {
@@ -996,30 +1023,52 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 	} else if req.DBSimpleProtocol != nil {
 		chosenSimpleProto = *req.DBSimpleProtocol
 	}
-	if err := s.applySetupDatabaseSelection(r.Context(), chosenDriver, chosenDSN, chosenSimpleProto); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, s.applySetupDatabaseSelection(r.Context(), chosenDriver, chosenDSN, chosenSimpleProto)) {
 		return
 	}
 
-	locale := s.deps.Catalog.Match(req.DefaultLocale, "")
-	isZH := strings.HasPrefix(strings.ToLower(locale), "zh")
+	locale := i18n.NormalizeLocale(req.DefaultLocale)
+	if strings.EqualFold(locale, "ja") {
+		locale = "ja-JP"
+	}
+	if locale == "" {
+		locale = s.deps.Catalog.Match("", "")
+	} else if matched := s.deps.Catalog.Match(locale, ""); matched != "" &&
+		strings.EqualFold(strings.Split(matched, "-")[0], strings.Split(locale, "-")[0]) &&
+		!strings.EqualFold(locale, "zh-TW") && !strings.EqualFold(locale, "zh-HK") && !strings.HasPrefix(strings.ToLower(locale), "zh-hant") {
+		locale = matched
+	}
+	locLower := strings.ToLower(strings.TrimSpace(locale))
+	isTW := strings.Contains(locLower, "tw") || strings.Contains(locLower, "hk") || strings.Contains(locLower, "hant")
+	isJA := strings.HasPrefix(locLower, "ja")
+	isZH := strings.HasPrefix(locLower, "zh") && !isTW
 	displayName := strings.TrimSpace(req.AdminDisplayName)
 	if displayName == "" {
 		displayName = uname
 	}
 	siteTitle := strings.TrimSpace(req.SiteTitle)
 	if siteTitle == "" {
-		if isZH {
+		switch {
+		case isTW:
+			siteTitle = "Volo 隨筆"
+		case isZH:
 			siteTitle = "Volo 随笔"
-		} else {
+		case isJA:
+			siteTitle = "Volo ノート"
+		default:
 			siteTitle = "Volo Blog"
 		}
 	}
 	siteSubtitle := strings.TrimSpace(req.SiteSubtitle)
 	if siteSubtitle == "" {
-		if isZH {
+		switch {
+		case isTW:
+			siteSubtitle = "記錄 · 思考 · 分享"
+		case isZH:
 			siteSubtitle = "记录 · 思考 · 分享"
-		} else {
+		case isJA:
+			siteSubtitle = "記録 · 思索 · 共有"
+		default:
 			siteSubtitle = "Independent thoughts & craft"
 		}
 	}
@@ -1076,9 +1125,16 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 			catID := id.Next()
 			catName := "Notes"
 			catDesc := "Essays & engineering notes"
-			if isZH {
+			switch {
+			case isTW:
+				catName = "隨筆"
+				catDesc = "獨立思考與工程手記"
+			case isZH:
 				catName = "随笔"
 				catDesc = "独立思考与工程手记"
+			case isJA:
+				catName = "ノート"
+				catDesc = "思考とエンジニアリングの記録"
 			}
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO categories (id, name, slug, description, icon, sort_order, created_at, updated_at)
@@ -1091,9 +1147,16 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 			pageID := id.Next()
 			aboutTitle := "About"
 			aboutBody := "# About\n\nWelcome to **" + siteTitle + "**, powered by Volo-go."
-			if isZH {
+			switch {
+			case isTW:
+				aboutTitle = "關於"
+				aboutBody = "# 關於\n\n歡迎來到 **" + siteTitle + "**，本站由純 Go 單執行檔獨立部落格引擎 Volo-go 驅動。"
+			case isZH:
 				aboutTitle = "关于"
 				aboutBody = "# 关于\n\n欢迎来到 **" + siteTitle + "**，本站由纯 Go 单文件独立博客引擎 Volo-go 驱动。"
+			case isJA:
+				aboutTitle = "概要"
+				aboutBody = "# 概要\n\n**" + siteTitle + "** へようこそ。このサイトはシングルバイナリ Go ブログエンジン Volo-go で構築されています。"
 			}
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO pages (id, author_id, title, slug, content_md, is_published, allow_comment, show_toc, lang, translation_group, view_count, comment_count, created_at, updated_at)
@@ -1101,7 +1164,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 				pageID, adminUser.ID, aboutTitle, aboutBody, true, true, false, locale, now, now)
 			_, _ = tx.ExecContext(r.Context(),
 				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
-				 VALUES (?, '', ?, '{"zh-CN":"关于","zh-TW":"關於","en-US":"About"}', '/about', ?, '', 10, ?, ?, ?)`,
+				 VALUES (?, '', ?, '{"zh-CN":"关于","zh-TW":"關於","en-US":"About","ja-JP":"概要"}', '/about', ?, '', 10, ?, ?, ?)`,
 				id.Next(), aboutTitle, false, true, now, now)
 		}
 		return nil
@@ -1111,14 +1174,22 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	sitePatch, _ := json.Marshal(map[string]any{
+	sitePatchMap := map[string]any{
 		"initialized":    true,
 		"title":          siteTitle,
 		"subtitle":       siteSubtitle,
 		"description":    strings.TrimSpace(req.SiteDescription),
 		"default_locale": locale,
 		"timezone":       tz,
-	})
+	}
+	if normPublicURL != "" {
+		sitePatchMap["custom_vars"] = map[string]string{"public_url": normPublicURL}
+		s.deps.Config.SetPublicURL(normPublicURL)
+		if s.deps.WAF != nil {
+			s.deps.WAF.SetPublicURL(normPublicURL)
+		}
+	}
+	sitePatch, _ := json.Marshal(sitePatchMap)
 	_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, sitePatch, 0)
 
 	appPatch, _ := json.Marshal(map[string]any{"accent": accent})
@@ -1130,8 +1201,7 @@ func (s *AppServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) 
 		geo = s.deps.Geo.LookupDisplay(clientIP)
 	}
 	sess, rawTok, err := s.deps.Auth.CreateSession(r.Context(), adminUser.ID, clientIP, geo, r.UserAgent(), 0)
-	if err != nil {
-		writeErrJSON(w, http.StatusInternalServerError, err.Error())
+	if writeServerErr(w, err) {
 		return
 	}
 	s.setSessionCookieForRequest(w, r, rawTok)
@@ -1189,6 +1259,7 @@ type preparedLegacyImport struct {
 	adminEmail        string
 	adminDisplayName  string
 	adminPasswordHash string
+	currentPassword   string
 }
 
 func (s *AppServer) spoolLegacyImportUpload(w http.ResponseWriter, r *http.Request) (*preparedLegacyImport, error) {
@@ -1242,8 +1313,10 @@ func (s *AppServer) spoolLegacyImportUpload(w http.ResponseWriter, r *http.Reque
 	}
 
 	adminUsername := strings.TrimSpace(formVal("admin_username"))
-	if adminUsername != "" && (len(adminUsername) < 2 || len(adminUsername) > 48) {
-		return nil, fmt.Errorf("admin_username must be 2-48 characters")
+	if adminUsername != "" {
+		if err := auth.ValidateUsername(adminUsername); err != nil {
+			return nil, err
+		}
 	}
 	adminEmail := strings.ToLower(strings.TrimSpace(formVal("admin_email")))
 	if adminEmail != "" && (!strings.Contains(adminEmail, "@") || len(adminEmail) > 190) {
@@ -1261,6 +1334,13 @@ func (s *AppServer) spoolLegacyImportUpload(w http.ResponseWriter, r *http.Reque
 			return nil, fmt.Errorf("password hashing failed")
 		}
 		adminPasswordHash = h
+	}
+	currentPassword := formVal("current_password")
+	if currentPassword == "" {
+		currentPassword = r.Header.Get("X-Volo-Current-Password")
+	}
+	if currentPassword == "" {
+		currentPassword = r.URL.Query().Get("current_password")
 	}
 
 	storageMode := strings.ToLower(strings.TrimSpace(formVal("storage_mode")))
@@ -1283,6 +1363,7 @@ func (s *AppServer) spoolLegacyImportUpload(w http.ResponseWriter, r *http.Reque
 		adminEmail:        adminEmail,
 		adminDisplayName:  adminDisplayName,
 		adminPasswordHash: adminPasswordHash,
+		currentPassword:   currentPassword,
 	}, nil
 }
 
@@ -1328,10 +1409,11 @@ func (s *AppServer) executeLegacyImport(ctx context.Context, prep *preparedLegac
 		TimeZone:          prep.timeZone,
 		Accent:            prep.accent,
 		ForceLocalStorage: prep.forceLocalStorage,
-		AdminUsername:     prep.adminUsername,
-		AdminEmail:        prep.adminEmail,
-		AdminDisplayName:  prep.adminDisplayName,
-		AdminPasswordHash: prep.adminPasswordHash,
+		AdminUsername:          prep.adminUsername,
+		AdminEmail:             prep.adminEmail,
+		AdminDisplayName:       prep.adminDisplayName,
+		AdminPasswordHash:      prep.adminPasswordHash,
+		PreserveExistingAdmins: !allowDBSwap,
 	}
 
 	rep, err := etl.ImportLegacyArchive(ctx, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, prep.tmpPath, opts)
@@ -1350,6 +1432,15 @@ func (s *AppServer) streamLegacyImportUpload(w http.ResponseWriter, r *http.Requ
 		return nil, false, "", err
 	}
 	defer os.Remove(prep.tmpPath)
+	if !allowDBSwap {
+		prep.rawDriver = ""
+		prep.rawDSN = ""
+		prep.adminUsername = ""
+		prep.adminEmail = ""
+		prep.adminDisplayName = ""
+		prep.adminPasswordHash = ""
+		prep.newSiteURL = ""
+	}
 	rep, err := s.executeLegacyImport(r.Context(), prep, allowDBSwap)
 	if err != nil {
 		return nil, prep.dryRun, "", err
@@ -1491,9 +1582,9 @@ func isSameSetupAndSourceDB(targetDriver, targetDSN, sourceDriver, sourceDSN str
 		return tClean == sClean
 
 	case "postgres":
-		tCfg, err1 := pgconn.ParseConfig(targetDSN)
-		sCfg, err2 := pgconn.ParseConfig(sourceDSN)
-		if err1 == nil && err2 == nil {
+		tCfg, err1 := sqlx.ParsePostgresConfig(targetDSN)
+		sCfg, err2 := sqlx.ParsePostgresConfig(sourceDSN)
+		if err1 == nil && err2 == nil && tCfg != nil && sCfg != nil {
 			tPort := int(tCfg.Port)
 			if tPort <= 0 {
 				tPort = 5432
@@ -1641,8 +1732,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	dryRun := req.DryRun || strings.EqualFold(dryRaw, "true") || dryRaw == "1"
 
 	pfx, err := validateSourceTablePrefix(req.SourceTablePrefix)
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, err) {
 		return
 	}
 
@@ -1657,8 +1747,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	}
 
 	adminUsername := strings.TrimSpace(req.AdminUsername)
-	if adminUsername != "" && (len(adminUsername) < 2 || len(adminUsername) > 48) {
-		writeErrJSON(w, http.StatusBadRequest, "admin_username must be 2-48 characters")
+	if adminUsername != "" && writeBadErr(w, auth.ValidateUsername(adminUsername)) {
 		return
 	}
 	adminEmail := strings.ToLower(strings.TrimSpace(req.AdminEmail))
@@ -1669,8 +1758,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 	adminDisplayName := strings.TrimSpace(req.AdminDisplayName)
 	adminPasswordHash := ""
 	if req.AdminPassword != "" {
-		if err := auth.ValidatePasswordPolicy(req.AdminPassword); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, auth.ValidatePasswordPolicy(req.AdminPassword)) {
 			return
 		}
 		h, hErr := auth.HashPassword(req.AdminPassword)
@@ -1712,14 +1800,12 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		effRawDSN = cfgDSN
 	}
 	normTargetDriver, normTargetDSN, err := s.validateAndNormalizeSetupDB(r.Context(), effRawDriver, effRawDSN)
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, err) {
 		return
 	}
 
 	srcStore, normSrcDriver, normSrcDSN, err := s.validateAndOpenSourceDBReadOnly(r.Context(), req.SourceDriver, req.SourceDSN, req.SourceSimpleProtocol)
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, err) {
 		return
 	}
 	defer srcStore.Close()
@@ -1766,8 +1852,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		rep, insp, err := etl.ImportSourceDatabase(r.Context(), srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		if rep != nil {
@@ -1784,14 +1869,12 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := s.applySetupDatabaseSelection(r.Context(), chosenDriver, chosenDSN, targetSimple); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, s.applySetupDatabaseSelection(r.Context(), chosenDriver, chosenDSN, targetSimple)) {
 		return
 	}
 
 	rep, insp, err := etl.ImportSourceDatabase(r.Context(), srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, err) {
 		return
 	}
 

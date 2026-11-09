@@ -3,6 +3,7 @@ package content
 import (
 	"bytes"
 	"compress/gzip"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,13 +15,16 @@ import (
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/visibility"
 )
 
 const (
-	maxFeedCacheBytes   = 2 * 1024 * 1024 // <= 2 MiB ceiling for pre-compressed RSS/Atom/Podcast/Sitemap/LLMs artifacts
-	maxCachedRecentCmts = 20
-	maxCachedChromeTags = 200
+	maxFeedCacheBytes        = 8 << 20 // 8 MiB ceiling so /llms-full.txt up to 2 MiB + gzip can be cached safely
+	maxFeedCacheEntries      = 24
+	maxArticleHTMLCacheBytes = 2 << 20
+	maxCachedRecentCmts      = 20
+	maxCachedChromeTags      = 200
 )
 
 type redirectEntry struct {
@@ -43,6 +47,8 @@ type publicChromeSnapshot struct {
 	tags               []TagWithCount
 	recentCmts         []RecentCommentItem
 	archiveBuckets     []ArchiveMonth
+	archiveTZ          string
+	archiveStats       ArchiveStats
 	owner              PublicAuthorProfile
 	authors            []PublicAuthorProfile
 	authorsByID        map[string]PublicAuthorProfile
@@ -64,8 +70,29 @@ type CachedDocument struct {
 type feedCacheEntry struct {
 	dataRev     uint64
 	settingsRev uint64
+	seq         uint64
 	doc         CachedDocument
 	cost        int
+}
+
+type tzArchiveCacheEntry struct {
+	dataRev uint64
+	stats   ArchiveStats
+}
+
+type cachedArticleDetail struct {
+	key            string
+	cost           int
+	html           string
+	summary        string
+	coverURL       string
+	ogImageURL     string
+	licenseText    string
+	toc            []render.TOCItem
+	wordCount      int
+	readingMinutes int
+	needsMath      bool
+	needsMermaid   bool
 }
 
 type serviceCacheState struct {
@@ -74,14 +101,90 @@ type serviceCacheState struct {
 	chromeMu sync.Mutex
 	chrome   atomic.Pointer[publicChromeSnapshot]
 
+	archiveTZMu sync.RWMutex
+	archiveByTZ map[string]tzArchiveCacheEntry
+
 	feedMu   sync.RWMutex
 	feedDocs map[string]feedCacheEntry
 	feedUsed int
+	feedSeq  uint64
+
+	articleHTMLMu    sync.Mutex
+	articleHTMLLL    *list.List
+	articleHTMLItems map[string]*list.Element
+	articleHTMLUsed  int
 }
 
 func newServiceCacheState() *serviceCacheState {
 	return &serviceCacheState{
-		feedDocs: make(map[string]feedCacheEntry, 12),
+		archiveByTZ:      make(map[string]tzArchiveCacheEntry, 4),
+		feedDocs:         make(map[string]feedCacheEntry, 12),
+		articleHTMLLL:    list.New(),
+		articleHTMLItems: make(map[string]*list.Element, 128),
+	}
+}
+
+func (c *serviceCacheState) getArticleHTML(key string) (cachedArticleDetail, bool) {
+	if c == nil {
+		return cachedArticleDetail{}, false
+	}
+	c.articleHTMLMu.Lock()
+	defer c.articleHTMLMu.Unlock()
+	if el, ok := c.articleHTMLItems[key]; ok {
+		c.articleHTMLLL.MoveToFront(el)
+		val := el.Value.(*cachedArticleDetail)
+		out := *val
+		if len(val.toc) > 0 {
+			out.toc = append([]render.TOCItem(nil), val.toc...)
+		}
+		return out, true
+	}
+	return cachedArticleDetail{}, false
+}
+
+func (c *serviceCacheState) putArticleHTML(entry cachedArticleDetail) {
+	if c == nil {
+		return
+	}
+	tocBytes := 0
+	for _, t := range entry.toc {
+		tocBytes += len(t.ID) + len(t.Text) + 24
+	}
+	cost := len(entry.key) + len(entry.html) + len(entry.summary) + len(entry.coverURL) + len(entry.ogImageURL) + len(entry.licenseText) + tocBytes + 160
+	if cost <= 0 || cost > maxArticleHTMLCacheBytes/4 {
+		return
+	}
+	cp := entry
+	cp.cost = cost
+	if len(entry.toc) > 0 {
+		cp.toc = append([]render.TOCItem(nil), entry.toc...)
+	}
+
+	c.articleHTMLMu.Lock()
+	defer c.articleHTMLMu.Unlock()
+	if existing, ok := c.articleHTMLItems[cp.key]; ok {
+		old := existing.Value.(*cachedArticleDetail)
+		c.articleHTMLUsed -= old.cost
+		existing.Value = &cp
+		c.articleHTMLUsed += cp.cost
+		c.articleHTMLLL.MoveToFront(existing)
+	} else {
+		el := c.articleHTMLLL.PushFront(&cp)
+		c.articleHTMLItems[cp.key] = el
+		c.articleHTMLUsed += cp.cost
+	}
+	for c.articleHTMLUsed > maxArticleHTMLCacheBytes && c.articleHTMLLL.Len() > 0 {
+		back := c.articleHTMLLL.Back()
+		if back == nil {
+			break
+		}
+		ev := back.Value.(*cachedArticleDetail)
+		delete(c.articleHTMLItems, ev.key)
+		c.articleHTMLLL.Remove(back)
+		c.articleHTMLUsed -= ev.cost
+		if c.articleHTMLUsed < 0 {
+			c.articleHTMLUsed = 0
+		}
 	}
 }
 
@@ -95,7 +198,7 @@ func (s *Service) currentRevisions() (dataRev uint64, settingsRev uint64) {
 	return dataRev, settingsRev
 }
 
-// PurgeRuntimeCaches clears in-memory redirect, chrome, feed, and visibility render caches.
+// PurgeRuntimeCaches clears in-memory redirect, chrome, feed, article HTML, and visibility render caches.
 func (s *Service) PurgeRuntimeCaches() {
 	if s == nil {
 		return
@@ -103,10 +206,18 @@ func (s *Service) PurgeRuntimeCaches() {
 	if s.caches != nil {
 		s.caches.redirects.Store(nil)
 		s.caches.chrome.Store(nil)
+		s.caches.archiveTZMu.Lock()
+		clear(s.caches.archiveByTZ)
+		s.caches.archiveTZMu.Unlock()
 		s.caches.feedMu.Lock()
 		clear(s.caches.feedDocs)
 		s.caches.feedUsed = 0
 		s.caches.feedMu.Unlock()
+		s.caches.articleHTMLMu.Lock()
+		s.caches.articleHTMLLL.Init()
+		clear(s.caches.articleHTMLItems)
+		s.caches.articleHTMLUsed = 0
+		s.caches.articleHTMLMu.Unlock()
 	}
 	if s.guard != nil {
 		s.guard.PurgeCache()
@@ -119,15 +230,15 @@ func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapsh
 		return snap, nil
 	}
 
-	rulesRows, err := sqlx.Select[domain.RedirectRule](
-		ctx, s.store,
+	var rulesRows []domain.RedirectRule
+	err := sqlx.SelectInto(ctx, s.store, &rulesRows,
 		`SELECT id, source_path, target_path, status_code FROM redirects`,
 	)
 	if err != nil {
 		return nil, err
 	}
-	legacyArts, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
+	var legacyArts []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.store, &legacyArts,
 		`SELECT slug, legacy_permalink FROM articles WHERE legacy_permalink <> '' AND status = ?`,
 		domain.ArticleStatusPublished,
 	)
@@ -186,8 +297,8 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 		return snap, nil
 	}
 
-	navRows, err := sqlx.Select[domain.NavItem](
-		ctx, s.store,
+	var navRows []domain.NavItem
+	err := sqlx.SelectInto(ctx, s.store, &navRows,
 		`SELECT * FROM nav_items WHERE is_enabled = ? ORDER BY sort_order ASC, created_at ASC`,
 		true,
 	)
@@ -207,24 +318,29 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 		return nil, err
 	}
 	recentCmts, _ := s.queryRecentPublicComments(ctx, maxCachedRecentCmts)
-	archiveBuckets, _ := s.queryArchiveMonths(ctx)
+	siteLoc := s.siteLocation()
+	archiveStats, _ := s.queryArchiveStatsForLocation(ctx, siteLoc)
 	owner, authors, authorsByID := s.queryPublicAuthors(ctx)
 	stats := s.queryPublicSiteStats(ctx, len(cats))
 
+	cardCols := articleCardSelectColumns("")
 	recentSQL, recentArgs := s.store.Dialect().PaginateSQL(
-		`SELECT * FROM articles WHERE status = ? ORDER BY published_at DESC`, maxCachedRecentCmts, 0,
+		`SELECT `+cardCols+` FROM articles WHERE status = ? ORDER BY published_at DESC`, maxCachedRecentCmts, 0,
 	)
-	recentRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, recentSQL, append([]any{domain.ArticleStatusPublished}, recentArgs...)...)
+	var recentRaw []domain.RawArticle
+	_ = sqlx.SelectInto(ctx, s.store, &recentRaw, recentSQL, append([]any{domain.ArticleStatusPublished}, recentArgs...)...)
 
 	viewedSQL, viewedArgs := s.store.Dialect().PaginateSQL(
-		`SELECT * FROM articles WHERE status = ? ORDER BY view_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
+		`SELECT `+cardCols+` FROM articles WHERE status = ? ORDER BY view_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
 	)
-	mostViewedRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, viewedSQL, append([]any{domain.ArticleStatusPublished}, viewedArgs...)...)
+	var mostViewedRaw []domain.RawArticle
+	_ = sqlx.SelectInto(ctx, s.store, &mostViewedRaw, viewedSQL, append([]any{domain.ArticleStatusPublished}, viewedArgs...)...)
 
 	cmtedSQL, cmtedArgs := s.store.Dialect().PaginateSQL(
-		`SELECT * FROM articles WHERE status = ? ORDER BY comment_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
+		`SELECT `+cardCols+` FROM articles WHERE status = ? ORDER BY comment_count DESC, published_at DESC`, maxCachedRecentCmts, 0,
 	)
-	mostCommentedRaw, _ := sqlx.Select[domain.RawArticle](ctx, s.store, cmtedSQL, append([]any{domain.ArticleStatusPublished}, cmtedArgs...)...)
+	var mostCommentedRaw []domain.RawArticle
+	_ = sqlx.SelectInto(ctx, s.store, &mostCommentedRaw, cmtedSQL, append([]any{domain.ArticleStatusPublished}, cmtedArgs...)...)
 
 	seenArt := make(map[string]struct{}, len(recentRaw)+len(mostViewedRaw)+len(mostCommentedRaw))
 	uniqueRaw := make([]domain.RawArticle, 0, len(recentRaw)+len(mostViewedRaw)+len(mostCommentedRaw))
@@ -272,7 +388,9 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 		catsByID:           catsByID,
 		tags:               tags,
 		recentCmts:         recentCmts,
-		archiveBuckets:     archiveBuckets,
+		archiveBuckets:     archiveStats.Months,
+		archiveTZ:          siteLoc.String(),
+		archiveStats:       archiveStats,
 		owner:              owner,
 		authors:            authors,
 		authorsByID:        authorsByID,
@@ -329,23 +447,46 @@ func (s *Service) getOrBuildCachedDoc(
 	cost := len(cacheKey) + len(raw) + len(gzBytes) + 64
 	if cost <= maxFeedCacheBytes/2 {
 		s.caches.feedMu.Lock()
-		// Evict stale-revision entries first, or reset if budget exceeded.
+		// Evict stale-revision entries first.
 		for k, v := range s.caches.feedDocs {
 			if v.dataRev != dRev || v.settingsRev != sRev {
 				s.caches.feedUsed -= v.cost
 				delete(s.caches.feedDocs, k)
 			}
 		}
-		if s.caches.feedUsed+cost > maxFeedCacheBytes || len(s.caches.feedDocs) >= 24 {
-			clear(s.caches.feedDocs)
-			s.caches.feedUsed = 0
-		}
 		if prev, exists := s.caches.feedDocs[cacheKey]; exists {
 			s.caches.feedUsed -= prev.cost
+			delete(s.caches.feedDocs, cacheKey)
 		}
+		if s.caches.feedUsed < 0 {
+			s.caches.feedUsed = 0
+		}
+		// Single-entry eviction: delete one oldest entry at a time instead of wiping all cached feeds.
+		for len(s.caches.feedDocs) >= maxFeedCacheEntries || (len(s.caches.feedDocs) > 0 && s.caches.feedUsed+cost > maxFeedCacheBytes) {
+			var evictKey string
+			var evictSeq uint64
+			first := true
+			for k, v := range s.caches.feedDocs {
+				if first || v.seq < evictSeq || (v.seq == evictSeq && k < evictKey) {
+					evictKey = k
+					evictSeq = v.seq
+					first = false
+				}
+			}
+			if first {
+				break
+			}
+			s.caches.feedUsed -= s.caches.feedDocs[evictKey].cost
+			if s.caches.feedUsed < 0 {
+				s.caches.feedUsed = 0
+			}
+			delete(s.caches.feedDocs, evictKey)
+		}
+		s.caches.feedSeq++
 		s.caches.feedDocs[cacheKey] = feedCacheEntry{
 			dataRev:     dRev,
 			settingsRev: sRev,
+			seq:         s.caches.feedSeq,
 			doc:         doc,
 			cost:        cost,
 		}

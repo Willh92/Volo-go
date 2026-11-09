@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -33,7 +34,40 @@ const (
 var (
 	oidcUsernameSanitizeRe = regexp.MustCompile(`[^a-z0-9_-]+`)
 	safeRelativeRedirectRe = regexp.MustCompile(`^/[A-Za-z0-9/_~.%?=&+#:-]*$`)
+
+	oidcUsedStatesMu sync.Mutex
+	oidcUsedStates   = make(map[string]int64)
 )
+
+func consumeOIDCStateOnce(stateHex string, expiresAt int64) bool {
+	if stateHex == "" {
+		return false
+	}
+	now := time.Now().UnixMilli()
+	oidcUsedStatesMu.Lock()
+	defer oidcUsedStatesMu.Unlock()
+	if len(oidcUsedStates) > 1024 {
+		for k, exp := range oidcUsedStates {
+			if exp <= now {
+				delete(oidcUsedStates, k)
+			}
+		}
+	}
+	if len(oidcUsedStates) >= 8192 {
+		// Evict oldest expired/arbitrary entries if flooded
+		for k := range oidcUsedStates {
+			delete(oidcUsedStates, k)
+			if len(oidcUsedStates) < 4096 {
+				break
+			}
+		}
+	}
+	if exp, exists := oidcUsedStates[stateHex]; exists && exp > now {
+		return false
+	}
+	oidcUsedStates[stateHex] = expiresAt
+	return true
+}
 
 type oidcSealedState struct {
 	State        string `json:"state"`
@@ -235,6 +269,71 @@ func (s *AppServer) handleOIDCAuthRoutes(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+type oidcBindTicket struct {
+	UserID       string
+	SessionID    string
+	ProviderName string
+	ExpiresAt    time.Time
+}
+
+func (s *AppServer) mintOIDCBindTicket(userID, sessionID, providerName string) (string, error) {
+	uid := strings.TrimSpace(userID)
+	sid := strings.TrimSpace(sessionID)
+	prov := strings.ToLower(strings.TrimSpace(providerName))
+	if uid == "" || sid == "" || prov == "" {
+		return "", errors.New("interactive staff session and provider are required")
+	}
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	tok := hex.EncodeToString(raw[:])
+	now := time.Now()
+	s.oidcBindTicketMu.Lock()
+	defer s.oidcBindTicketMu.Unlock()
+	if s.oidcBindTickets == nil {
+		s.oidcBindTickets = make(map[string]oidcBindTicket)
+	}
+	for k, v := range s.oidcBindTickets {
+		if now.After(v.ExpiresAt) {
+			delete(s.oidcBindTickets, k)
+		}
+	}
+	s.oidcBindTickets[tok] = oidcBindTicket{
+		UserID:       uid,
+		SessionID:    sid,
+		ProviderName: prov,
+		ExpiresAt:    now.Add(60 * time.Second),
+	}
+	return tok, nil
+}
+
+func (s *AppServer) consumeOIDCBindTicket(userID, sessionID, providerName, rawTicket string) bool {
+	tok := strings.TrimSpace(rawTicket)
+	uid := strings.TrimSpace(userID)
+	sid := strings.TrimSpace(sessionID)
+	prov := strings.ToLower(strings.TrimSpace(providerName))
+	if len(tok) != 64 || uid == "" || sid == "" || prov == "" {
+		return false
+	}
+	now := time.Now()
+	s.oidcBindTicketMu.Lock()
+	for k, v := range s.oidcBindTickets {
+		if now.After(v.ExpiresAt) {
+			delete(s.oidcBindTickets, k)
+		}
+	}
+	entry, exists := s.oidcBindTickets[tok]
+	if exists {
+		delete(s.oidcBindTickets, tok)
+	}
+	s.oidcBindTicketMu.Unlock()
+	if !exists || now.After(entry.ExpiresAt) {
+		return false
+	}
+	return entry.UserID == uid && entry.SessionID == sid && entry.ProviderName == prov
+}
+
 func (s *AppServer) handleOIDCStart(w http.ResponseWriter, r *http.Request, providerName string) {
 	if s.deps.Plugins == nil || s.deps.Config == nil || s.deps.Config.KeyRing == nil {
 		http.NotFound(w, r)
@@ -272,6 +371,10 @@ func (s *AppServer) handleOIDCStart(w http.ResponseWriter, r *http.Request, prov
 		actor, sess := s.resolveViewer(r)
 		if actor == nil || sess == nil || actor.Status != domain.UserStatusActive || (actor.Role != domain.RoleAdmin && actor.Role != domain.RoleEditor) {
 			s.redirectOIDCError(w, r, "bind", "", "forbidden")
+			return
+		}
+		if !s.consumeOIDCBindTicket(actor.ID, sess.ID, p.Name(), r.URL.Query().Get("bind_ticket")) {
+			writeErrJSON(w, http.StatusForbidden, "step-up bind_ticket required for OIDC identity binding")
 			return
 		}
 		bindUserID = actor.ID
@@ -417,6 +520,10 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 		s.redirectOIDCError(w, r, st.Target, st.Next, "state")
 		return
 	}
+	if !consumeOIDCStateOnce(st.State, st.ExpiresAt) {
+		s.redirectOIDCError(w, r, st.Target, st.Next, "state")
+		return
+	}
 	if idpErr := strings.TrimSpace(r.URL.Query().Get("error")); idpErr != "" {
 		s.redirectOIDCError(w, r, st.Target, st.Next, "provider_error")
 		return
@@ -429,7 +536,8 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 
 	callbackURL := s.oidcCallbackURL(r, providerName)
 	var ident plugin.OIDCIdentity
-	if adv, ok := p.(plugin.OIDCAdvancedProvider); ok {
+	adv, isAdvanced := p.(plugin.OIDCAdvancedProvider)
+	if isAdvanced {
 		ident, err = adv.ExchangeWithParams(r.Context(), plugin.OIDCExchangeParams{
 			Code:         code,
 			RedirectURI:  callbackURL,
@@ -443,7 +551,12 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 		s.redirectOIDCError(w, r, st.Target, st.Next, "exchange_failed")
 		return
 	}
-	if ident.Nonce != "" && subtle.ConstantTimeCompare([]byte(ident.Nonce), []byte(st.OIDCNonce)) != 1 {
+	if isAdvanced {
+		if strings.TrimSpace(ident.Nonce) == "" || subtle.ConstantTimeCompare([]byte(ident.Nonce), []byte(st.OIDCNonce)) != 1 {
+			s.redirectOIDCError(w, r, st.Target, st.Next, "state")
+			return
+		}
+	} else if ident.Nonce != "" && subtle.ConstantTimeCompare([]byte(ident.Nonce), []byte(st.OIDCNonce)) != 1 {
 		s.redirectOIDCError(w, r, st.Target, st.Next, "state")
 		return
 	}
@@ -494,8 +607,8 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 			s.redirectOIDCError(w, r, "bind", st.Next, "forbidden")
 			return
 		}
-		existing, qErr := sqlx.Get[domain.UserCredential](
-			r.Context(), s.deps.Store,
+		var existing domain.UserCredential
+		qErr := sqlx.GetInto(r.Context(), s.deps.Store, &existing,
 			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
 			credKey,
 		)
@@ -528,8 +641,8 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 		return
 
 	case "admin":
-		cred, qErr := sqlx.Get[domain.UserCredential](
-			r.Context(), s.deps.Store,
+		var cred domain.UserCredential
+		qErr := sqlx.GetInto(r.Context(), s.deps.Store, &cred,
 			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
 			credKey,
 		)
@@ -537,8 +650,8 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 			s.redirectOIDCError(w, r, "admin", st.Next, "unlinked")
 			return
 		}
-		u, uErr := sqlx.Get[domain.User](
-			r.Context(), s.deps.Store,
+		var u domain.User
+		uErr := sqlx.GetInto(r.Context(), s.deps.Store, &u,
 			`SELECT * FROM users WHERE id = ?`,
 			cred.UserID,
 		)
@@ -592,7 +705,8 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
 			credKey,
 		); qErr == nil {
-			u, uErr := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, cred.UserID)
+			var u domain.User
+			uErr := sqlx.GetInto(r.Context(), s.deps.Store, &u, `SELECT * FROM users WHERE id = ?`, cred.UserID)
 			if uErr != nil {
 				s.redirectOIDCError(w, r, "reader", st.Next, "state")
 				return
@@ -609,8 +723,8 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 				`UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now, cred.ID)
 			matchedUser = u
 		} else if errors.Is(qErr, sql.ErrNoRows) {
-			u, uErr := sqlx.Get[domain.User](
-				r.Context(), s.deps.Store,
+			var u domain.User
+			uErr := sqlx.GetInto(r.Context(), s.deps.Store, &u,
 				`SELECT * FROM users WHERE LOWER(email) = ?`,
 				normEmail,
 			)
@@ -627,6 +741,10 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 				_, _ = s.insertOIDCCredential(r.Context(), u.ID, credKey, credName, now)
 				matchedUser = u
 			} else if errors.Is(uErr, sql.ErrNoRows) {
+				if s.deps.Settings == nil || !s.deps.Settings.Snapshot().Reading.AllowReaderRegister {
+					s.redirectOIDCError(w, r, "reader", st.Next, "registration_disabled")
+					return
+				}
 				created, cErr := s.createOIDCReaderUser(r, normEmail, ident.DisplayName, ident.AvatarURL, providerName, credKey)
 				if cErr != nil {
 					s.redirectOIDCError(w, r, "reader", st.Next, "register_failed")

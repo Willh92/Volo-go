@@ -4,14 +4,16 @@
 var win = window, doc = document, encU = encodeURIComponent;
 var LS_KEY = "volo_gp_v1", PROF_KEY = "volo.comment.profile.v1", IDB_NAME = "volo_identity", IDB_STORE = "kv";
 function byId(i) { return doc.getElementById(i); }
+function ga(n, k) { return (n && n.getAttribute(k)) || ""; }
+function onEv(n, e, f, c) { if (n) n.addEventListener(e, f, c); }
 if (!win.__voloAvatarErrBound) {
 win.__voloAvatarErrBound = true;
-doc.addEventListener("error", function (ev) {
+onEv(doc, "error", function (ev) {
 var img = ev.target;
 if (!img || img.tagName !== "IMG" || !img.hasAttribute("data-avatar-seed") || img.dataset.fallbackApplied === "1") return;
-var fb = "/avatars/" + encU(img.getAttribute("data-avatar-seed") || "guest") + ".svg";
+var fb = "/avatars/" + encU(ga(img, "data-avatar-seed") || "guest") + ".svg";
 img.dataset.fallbackApplied = "1";
-if ((img.getAttribute("src") || "") !== fb) img.src = fb;
+if (ga(img, "src") !== fb) img.src = fb;
 }, true);
 }
 function idbOp(mode, fn) {
@@ -20,7 +22,12 @@ if (!win.indexedDB) return res("");
 var r = indexedDB.open(IDB_NAME, 1);
 r.onupgradeneeded = function () { r.result.createObjectStore(IDB_STORE); };
 r.onsuccess = function () {
-try { fn(r.result.transaction(IDB_STORE, mode).objectStore(IDB_STORE), res); } catch (_) { res(""); }
+var db = r.result, cls = function () { try { db.close(); } catch (_) {} };
+try {
+var tx = db.transaction(IDB_STORE, mode);
+tx.oncomplete = cls; tx.onerror = cls; tx.onabort = cls;
+fn(tx.objectStore(IDB_STORE), res);
+} catch (_) { cls(); res(""); }
 };
 r.onerror = function () { res(""); };
 });
@@ -147,19 +154,20 @@ doc.body.appendChild(t); t.select(); doc.execCommand("copy"); t.remove(); ok();
 }
 function mount() {
 var el = byId("volo-comments");
-if (!el || el.getAttribute("data-mounted") === "1") return;
+if (!el || ga(el, "data-mounted") === "1") return;
 el.setAttribute("data-mounted", "1");
 var rootEl = doc.documentElement, q = function (s) { return el.querySelector(s); };
-var attr = function (k, d) { return el.getAttribute(k) || d || ""; };
+var attr = function (k, d) { return ga(el, k) || d || ""; };
 var dL = function (k, d) { return attr("data-l-" + k, d); };
 var tType = attr("data-target-type", "article"), tID = attr("data-target-id");
 var isLogged = attr("data-is-logged") === "true";
 var viewerID = attr("data-viewer-id"), viewerName = attr("data-viewer-name", "Reader"), viewerRole = attr("data-viewer-role");
 var vAvatar = attr("data-viewer-avatar") || ("/avatars/" + encU(viewerID || viewerName) + ".svg");
-var csrfToken = attr("data-csrf-token");
+var metaCSRF = doc.querySelector('meta[name="csrf-token"]');
+var csrfToken = attr("data-csrf-token") || ga(metaCSRF, "content");
 var mode = attr("data-comment-mode") || attr("data-access-mode", "all");
-var copyLbl = dL("copy", rootEl.getAttribute("data-i18n-copy") || "Copy");
-var copiedLbl = dL("copied", rootEl.getAttribute("data-i18n-copied") || "Copied");
+var copyLbl = dL("copy", ga(rootEl, "data-i18n-copy") || "Copy");
+var copiedLbl = dL("copied", ga(rootEl, "data-i18n-copied") || "Copied");
 var netErrLbl = dL("net-err", "Request failed");
 var gpToken = "", repID = "", repName = "", editingID = "", banID = "", banHours = 0, claimedDone = false;
 var curPage = 1, totPages = 1;
@@ -170,10 +178,10 @@ var h = { "Content-Type": "application/json" };
 if (gpToken) h["X-Volo-Guest-Passport"] = gpToken;
 if (win.__voloEnvFP) h["X-Volo-Env-FP"] = win.__voloEnvFP();
 if (withCSRF && csrfToken) h["X-CSRF-Token"] = csrfToken;
-var o = { method: method || "GET", headers: h };
+var o = { method: method || "GET", headers: h, credentials: "same-origin" };
 if (body) o.body = JSON.stringify(body);
 return fetch(url, o).then(function (r) {
-return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d || {} }; });
+return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d || {}, focus_found: d ? d.focus_found : undefined }; });
 });
 }
 function countTree(items) {
@@ -215,7 +223,7 @@ kids = (!depth && reps.length > 3 && !hasDesc(reps.slice(3), hashCID()))
 '</div><button type="button" class="vc-more-replies js-vc-show-more">' + esc(dL("more-replies", "+{count}").replace("{count}", "" + (reps.length - 3))) + "</button></div>"
 : '<div class="vc-replies"' + dAttr + ">" + mapR(reps) + "</div>";
 }
-var bodyHTML = decCode(c.content_html || "", copyLbl);
+var bodyHTML = decCode(c.content_html || "", copyLbl).replace(/<table(\b[^>]*)>([\s\S]*?)<\/table>/gi, '<div class="volo-table-scroll"><table$1>$2</table></div>');
 if (at) bodyHTML = /^\s*<p(?:\s[^>]*)?>/i.test(bodyHTML) ? bodyHTML.replace(/^(\s*<p(?:\s[^>]*)?>)/i, "$1" + at + " ") : at + " " + bodyHTML;
 return '<div class="vc-item" id="comment-' + cid + '">' +
 '<img class="vc-avatar" src="' + esc(av) + '" data-avatar-seed="' + esc(seed) + '" alt="" width="38" height="38" loading="lazy">' +
@@ -225,7 +233,7 @@ return '<div class="vc-item" id="comment-' + cid + '">' +
 "<span>· " + fmtTime(c.created_at) + "</span>" +
 (c.geo_region ? '<span class="vc-geo">' + esc(c.geo_region) + "</span>" : "") +
 (c.ip_masked ? '<span class="vc-ip-badge">' + esc(c.ip_masked) + "</span>" : "") +
-'</div><div class="vc-content volo-prose">' + bodyHTML + "</div>" +
+'</div><div class="vc-content vc-item-body volo-prose">' + bodyHTML + "</div>" +
 (acts.length ? '<div class="vc-actions">' + acts.join("") + "</div>" : "") + "</div>" + kids + "</div>";
 }
 function showBanner(txt, isErr) {
@@ -265,7 +273,7 @@ var pager = totPages > 1
 box.innerHTML = (arr.length ? arr.map(function (c) { return renderItem(c, 0); }).join("") : (mode === "off" ? "" : '<div class="vc-empty">' + esc(dL("empty", "")) + "</div>")) + pager;
 if (sBan && sBan.classList.contains("volo-banner--err")) showBanner("", false);
 if (seekID) {
-if (!byId("comment-" + seekID) && curPage < totPages && seekSteps < 20) {
+if (res && res.focus_found !== false && d.focus_found !== false && !byId("comment-" + seekID) && curPage < totPages && seekSteps < 20) {
 seekSteps++; refreshList(curPage + 1, true); return;
 }
 seekID = "";
@@ -328,6 +336,19 @@ var drawer = q(".js-vc-drawer"), bdrop = q(".js-vc-backdrop"), form = q(".js-vc-
 var cntEl = q(".js-vc-cnt"), ctxPill = q(".js-vc-ctx"), ctxText = q(".js-vc-ctx-text"), subBtn = q(".js-vc-submit"), msgEl = q(".js-vc-msg"), banModal = q(".js-vc-ban-modal");
 sBan = q(".js-vc-status");
 var syncLock = function () { if (win.__voloSyncScrollLock) win.__voloSyncScrollLock(); };
+var syncVV = function () {
+var vv = win.visualViewport;
+if (!drawer || drawer.hidden || !vv) return;
+var kb = Math.max(0, (win.innerHeight || rootEl.clientHeight || 0) - vv.height - vv.offsetTop);
+drawer.style.bottom = kb > 0 ? Math.round(kb) + "px" : "";
+drawer.style.maxHeight = Math.max(180, Math.round(vv.height - 16)) + "px";
+};
+var bindVV = function (on) {
+var vv = win.visualViewport;
+if (!vv) return;
+["resize", "scroll"].forEach(function (e) { vv[on ? "addEventListener" : "removeEventListener"](e, syncVV); });
+if (on) syncVV(); else if (drawer) drawer.style.bottom = drawer.style.maxHeight = "";
+};
 var submitLbl = dL("submit", "Post"), saveLbl = dL("save", "Save");
 refreshList(1, false);
 function cfTap(btn) {
@@ -366,9 +387,10 @@ if (open) {
 pair.forEach(function (n) { n.hidden = false; n.classList.remove("is-closing"); });
 void drawer.offsetWidth;
 pair.forEach(function (n) { n.classList.add("is-open"); });
-syncLock(); setTab("write");
-setTimeout(function () { if (ta) ta.focus(); }, 30);
+bindVV(true); syncLock(); setTab("write");
+setTimeout(function () { if (ta) ta.focus(); syncVV(); }, 30);
 } else {
+bindVV(false);
 pair.forEach(function (n) { n.classList.remove("is-open"); n.classList.add("is-closing"); });
 syncLock();
 setTimeout(function () { pair.forEach(function (n) { n.classList.remove("is-closing"); n.hidden = true; }); syncLock(); }, 200);
@@ -403,7 +425,7 @@ return;
 }
 subBtn.disabled = true; setFormErr("");
 if (editingID) {
-jReq("/api/v1/comments/" + encU(editingID), "PATCH", { content_md: content }, false).then(function (res) {
+jReq("/api/v1/comments/" + encU(editingID), "PATCH", { content_md: content }, Boolean(csrfToken)).then(function (res) {
 if (!res.ok) { setFormErr(res.d.error || netErrLbl); return; }
 editingID = ""; ta.value = ""; ta.dispatchEvent(new Event("input")); togDrw(false); refreshList(curPage, false);
 }).catch(function () { setFormErr(netErrLbl); }).finally(function () { subBtn.disabled = false; syncCtxUI(); });
@@ -414,7 +436,7 @@ var nameVal = String(fd.get("author_name") || "").trim(), emailVal = String(fd.g
 jReq("/api/v1/comments", "POST", {
 target_type: tType, target_id: tID, parent_id: repID, author_name: nameVal, notify_email: emailVal, author_url: urlVal,
 content_md: content, website_hp: fd.get("website_hp") || "", pow_challenge: chal, pow_solution: sol, env_fp: win.__voloEnvFP ? win.__voloEnvFP() : ""
-}, false).then(function (res) {
+}, Boolean(csrfToken)).then(function (res) {
 if (!res.ok) { setFormErr(res.d.error || netErrLbl); return; }
 if (res.d.passport_token) { gpToken = res.d.passport_token; savePassport(gpToken); }
 if (!isLogged && nameVal) {
@@ -464,36 +486,36 @@ return;
 }
 var pBtn = cl(".js-vc-page");
 if (pBtn) {
-if (!pBtn.disabled) { refreshList(+pBtn.getAttribute("data-page") || 1, false); if (win.__voloScrollToEl) win.__voloScrollToEl(el, false); }
+if (!pBtn.disabled) { refreshList(+ga(pBtn, "data-page") || 1, false); if (win.__voloScrollToEl) win.__voloScrollToEl(el, false); }
 return;
 }
 var smBtn = cl(".js-vc-show-more");
 if (smBtn) { if (smBtn.previousElementSibling) smBtn.previousElementSibling.hidden = false; smBtn.remove(); return; }
 var mdBtn = cl("[data-md-act]");
-if (mdBtn && ta) { setTab("write"); mdTool(ta, mdBtn.getAttribute("data-md-act")); return; }
+if (mdBtn && ta) { setTab("write"); mdTool(ta, ga(mdBtn, "data-md-act")); return; }
 var tabBtn = cl("[data-vc-tab]");
-if (tabBtn) { setTab(tabBtn.getAttribute("data-vc-tab")); return; }
+if (tabBtn) { setTab(ga(tabBtn, "data-vc-tab")); return; }
 var rBtn = cl(".js-vc-reply");
-if (rBtn) { editingID = ""; repID = rBtn.getAttribute("data-id") || ""; repName = rBtn.getAttribute("data-name") || ""; syncCtxUI(); togDrw(true); return; }
+if (rBtn) { editingID = ""; repID = ga(rBtn, "data-id"); repName = ga(rBtn, "data-name"); syncCtxUI(); togDrw(true); return; }
 var eBtn = cl(".js-vc-edit");
-if (eBtn && ta) { repID = repName = ""; editingID = eBtn.getAttribute("data-id") || ""; ta.value = eBtn.getAttribute("data-md") || ""; ta.dispatchEvent(new Event("input")); syncCtxUI(); togDrw(true); return; }
+if (eBtn && ta) { repID = repName = ""; editingID = ga(eBtn, "data-id"); ta.value = ga(eBtn, "data-md"); ta.dispatchEvent(new Event("input")); syncCtxUI(); togDrw(true); return; }
 var dBtn = cl(".js-vc-del");
-if (dBtn) { if (cfTap(dBtn)) actReq("/api/v1/comments/" + encU(dBtn.getAttribute("data-id")), "DELETE", null, false, refreshCur); return; }
+if (dBtn) { if (cfTap(dBtn)) actReq("/api/v1/comments/" + encU(ga(dBtn, "data-id")), "DELETE", null, Boolean(csrfToken), refreshCur); return; }
 var apBtn = cl(".js-vc-mod-approve");
-if (apBtn) { actReq("/api/admin/comments/" + encU(apBtn.getAttribute("data-id")), "PATCH", { status: "approved" }, true, refreshCur); return; }
+if (apBtn) { actReq("/api/admin/comments/" + encU(ga(apBtn, "data-id")), "PATCH", { status: "approved" }, true, refreshCur); return; }
 var mdDel = cl(".js-vc-mod-del");
-if (mdDel) { if (cfTap(mdDel)) actReq("/api/admin/comments/" + encU(mdDel.getAttribute("data-id")), "DELETE", null, true, refreshCur); return; }
+if (mdDel) { if (cfTap(mdDel)) actReq("/api/admin/comments/" + encU(ga(mdDel, "data-id")), "DELETE", null, true, refreshCur); return; }
 var banBtn = cl(".js-vc-mod-ban");
 if (banBtn && banModal) {
-banID = banBtn.getAttribute("data-id") || "";
-var ip = banBtn.getAttribute("data-ip") || "", bt = banModal.querySelector(".js-vc-ban-title"), bn = banModal.querySelector(".js-vc-ban-note");
+banID = ga(banBtn, "data-id");
+var ip = ga(banBtn, "data-ip"), bt = banModal.querySelector(".js-vc-ban-title"), bn = banModal.querySelector(".js-vc-ban-note");
 if (bt) bt.textContent = dL("ban-title", "Ban IP") + (ip ? " (" + ip + ")" : "");
 if (bn) bn.value = "";
 banModal.hidden = false; syncLock(); return;
 }
 var durBtn = cl(".vc-dur-btn");
 if (durBtn && banModal) {
-banHours = +durBtn.getAttribute("data-hours") || 0;
+banHours = +ga(durBtn, "data-hours") || 0;
 banModal.querySelectorAll(".vc-dur-btn").forEach(function (b) { b.classList.toggle("is-active", b === durBtn); });
 return;
 }
@@ -508,7 +530,7 @@ return;
 }
 var cBtn = cl(".js-vc-claim");
 if (cBtn && !claimedDone) {
-actReq("/api/v1/reader/claim-guest-comments", "POST", null, false, function (d) {
+actReq("/api/v1/reader/claim-guest-comments", "POST", null, Boolean(csrfToken), function (d) {
 claimedDone = true; cBtn.disabled = true; gpToken = ""; clearPassport();
 cBtn.textContent = d.message || "OK";
 setTimeout(function () { cBtn.hidden = true; }, 1800);
@@ -518,7 +540,7 @@ refreshCur();
 });
 });
 }
-doc.addEventListener("keydown", function (ev) {
+onEv(doc, "keydown", function (ev) {
 if (ev.key === "Escape") { var cur = byId("volo-comments"); if (cur && cur._closeOverlays) cur._closeOverlays(); }
 });
 function focusHash() {
@@ -542,7 +564,7 @@ clearTimeout(node._hlT); node._hlT = setTimeout(function () { node.classList.rem
 if (win.__voloScrollToEl) win.__voloScrollToEl(node, isCmt);
 else node.scrollIntoView({ behavior: "smooth", block: "center" });
 }
-win.addEventListener("hashchange", focusHash);
+onEv(win, "hashchange", focusHash);
 win.VoloCommentWidget = { mount: mount };
-if (doc.readyState === "loading") doc.addEventListener("DOMContentLoaded", mount); else mount();
+if (doc.readyState === "loading") onEv(doc, "DOMContentLoaded", mount); else mount();
 })();

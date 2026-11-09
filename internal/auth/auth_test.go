@@ -607,4 +607,3 @@ func TestCompleteStaffPrimaryLoginAndRevokeUserAPITokens(t *testing.T) {
 		t.Fatalf("expected pat2 revoked (ErrUnauthorized), got %v", err)
 	}
 }
-

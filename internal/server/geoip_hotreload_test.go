@@ -16,6 +16,7 @@ import (
 // buildTestServerMMDB builds a minimal 1-node IPv4 MMDB v2 binary where:
 //   - first bit 0 (e.g. 8.8.8.8) -> US
 //   - first bit 1 (e.g. 223.5.5.5) -> CN
+//
 // or, when dbType == "GeoLite2-ASN", stores non-geographic ASN metadata only.
 func buildTestServerMMDB(dbType string) []byte {
 	encStr := func(s string) []byte {

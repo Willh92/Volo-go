@@ -983,4 +983,3 @@ func TestETLRound3_DisguisedMarkup_RollbackCleanup_FKSafeClear_AnalyticsMapping_
 		t.Fatalf("unexpected sanitized Site settings: favicon=%q social=%+v", snap.Site.FaviconURL, snap.Site.SocialLinks)
 	}
 }
-

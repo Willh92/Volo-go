@@ -76,11 +76,11 @@ type PodcastChannelConfig struct {
 
 // FeedSettings ("feed" domain).
 type FeedSettings struct {
-	OutputMode            string               `json:"output_mode"` // summary | full
-	ItemCount             int                  `json:"item_count"`
-	EnableLLMSTxt         bool                 `json:"enable_llms_txt"`
-	EnableRawMarkdown     bool                 `json:"enable_raw_markdown"`
-	Podcast               PodcastChannelConfig `json:"podcast"`
+	OutputMode        string               `json:"output_mode"` // summary | full
+	ItemCount         int                  `json:"item_count"`
+	EnableLLMSTxt     bool                 `json:"enable_llms_txt"`
+	EnableRawMarkdown bool                 `json:"enable_raw_markdown"`
+	Podcast           PodcastChannelConfig `json:"podcast"`
 }
 
 // GitHubRepoItem represents a cached public GitHub repository for showcase & /github-stats/{user}.svg.
@@ -158,18 +158,18 @@ type NotificationsSecrets struct {
 
 // SecuritySettings ("security" domain).
 type SecuritySettings struct {
-	RiskControlEnabled   bool   `json:"risk_control_enabled"`
-	WAFEnabled           bool   `json:"waf_enabled"`
-	WAFWindowSeconds     int    `json:"waf_window_seconds"`
-	WAFMaxRequests       int    `json:"waf_max_requests"`
-	GeoPolicyActive      bool   `json:"geo_policy_active"`
-	GeoDefaultAction     string `json:"geo_default_action"` // allow | deny
-	GeoUnknownAction     string `json:"geo_unknown_action"` // allow | deny
-	GeoIPDir             string `json:"geoip_dir"`
-	TOTPRequiredScope    string `json:"totp_required_scope"` // off | admin | staff
-	TOTPRememberDays     int    `json:"totp_remember_days"`
-	TOTPWindowSteps      int    `json:"totp_window_steps"`
-	DynamicLoginPath     string `json:"dynamic_login_path"`
+	RiskControlEnabled bool   `json:"risk_control_enabled"`
+	WAFEnabled         bool   `json:"waf_enabled"`
+	WAFWindowSeconds   int    `json:"waf_window_seconds"`
+	WAFMaxRequests     int    `json:"waf_max_requests"`
+	GeoPolicyActive    bool   `json:"geo_policy_active"`
+	GeoDefaultAction   string `json:"geo_default_action"` // allow | deny
+	GeoUnknownAction   string `json:"geo_unknown_action"` // allow | deny
+	GeoIPDir           string `json:"geoip_dir"`
+	TOTPRequiredScope  string `json:"totp_required_scope"` // off | admin | staff
+	TOTPRememberDays   int    `json:"totp_remember_days"`
+	TOTPWindowSteps    int    `json:"totp_window_steps"`
+	DynamicLoginPath   string `json:"dynamic_login_path"`
 }
 
 // SecuritySecrets is encrypted via AES-256-GCM into settings.secret_ciphertext for domain="security".
@@ -189,23 +189,23 @@ type AppearanceSettings struct {
 
 // BackupSettings ("backup" domain).
 type BackupSettings struct {
-	LocalAutoEnabled  bool   `json:"local_auto_enabled"`
-	LocalIntervalHrs  int    `json:"local_interval_hours"`
-	LocalKeepCount    int    `json:"local_keep_count"`
-	IncludeMediaInAuto bool  `json:"include_media_in_auto"`
-	RemoteEnabled     bool   `json:"remote_enabled"`
-	RemoteProtocol    string `json:"remote_protocol"` // s3 | webdav
-	WebDAVURL         string `json:"webdav_url"`
-	WebDAVUser        string `json:"webdav_user"`
-	WebDAVDir         string `json:"webdav_dir"`
-	WebDAVPasswordSet bool   `json:"webdav_password_set"`
-	S3Endpoint        string `json:"s3_endpoint"`
-	S3Region          string `json:"s3_region"`
-	S3Bucket          string `json:"s3_bucket"`
-	S3AccessKey       string `json:"s3_access_key"`
-	S3Prefix          string `json:"s3_prefix"`
-	S3PathStyle       bool   `json:"s3_path_style"`
-	S3SecretKeySet    bool   `json:"s3_secret_key_set"`
+	LocalAutoEnabled   bool   `json:"local_auto_enabled"`
+	LocalIntervalHrs   int    `json:"local_interval_hours"`
+	LocalKeepCount     int    `json:"local_keep_count"`
+	IncludeMediaInAuto bool   `json:"include_media_in_auto"`
+	RemoteEnabled      bool   `json:"remote_enabled"`
+	RemoteProtocol     string `json:"remote_protocol"` // s3 | webdav
+	WebDAVURL          string `json:"webdav_url"`
+	WebDAVUser         string `json:"webdav_user"`
+	WebDAVDir          string `json:"webdav_dir"`
+	WebDAVPasswordSet  bool   `json:"webdav_password_set"`
+	S3Endpoint         string `json:"s3_endpoint"`
+	S3Region           string `json:"s3_region"`
+	S3Bucket           string `json:"s3_bucket"`
+	S3AccessKey        string `json:"s3_access_key"`
+	S3Prefix           string `json:"s3_prefix"`
+	S3PathStyle        bool   `json:"s3_path_style"`
+	S3SecretKeySet     bool   `json:"s3_secret_key_set"`
 }
 
 // BackupSecrets is encrypted via AES-256-GCM into settings.secret_ciphertext for domain="backup".

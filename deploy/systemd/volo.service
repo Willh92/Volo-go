@@ -10,7 +10,7 @@ User=volo
 Group=volo
 WorkingDirectory=/var/lib/volo
 EnvironmentFile=-/etc/volo/volo.env
-ExecStart=/usr/local/bin/volo serve
+ExecStart=/usr/local/bin/volo serve --env-file /etc/volo/volo.env
 KillSignal=SIGTERM
 TimeoutStopSec=20
 Restart=on-failure
@@ -24,6 +24,13 @@ RuntimeDirectoryMode=0755
 LimitNOFILE=65536
 
 # Systemd sandboxing & privilege hardening
+# Note: When configuring custom directories outside /var/lib/volo (e.g. VOLO_UPLOAD_DIR,
+# VOLO_BACKUP_DIR, VOLO_GEOIP_DIR, VOLO_THEMES_DIR, or VOLO_PLUGINS_DIR), grant write
+# access via a drop-in override (`sudo systemctl edit volo`):
+#   [Service]
+#   ReadWritePaths=/custom/uploads /custom/geoip
+# If custom paths reside under /home/... (blocked by ProtectHome=true), also add:
+#   ProtectHome=read-only
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

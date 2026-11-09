@@ -83,16 +83,22 @@ func (s *AppServer) handleAdminSPA(w http.ResponseWriter, r *http.Request) {
 
 func (s *AppServer) serveAdminSPAAt(w http.ResponseWriter, r *http.Request, mountPrefix string) {
 	snap := s.deps.Settings.Snapshot()
+	customVendor := strings.TrimRight(strings.TrimSpace(snap.Reading.VendorCDNPrefix), "/")
+	switch customVendor {
+	case "https://cdn.jsdelivr.net/npm", "https://fastly.jsdelivr.net/npm", "https://unpkg.com":
+		customVendor = ""
+	}
 	adminui.Default().ServeMount(w, r, mountPrefix, adminui.BootConfig{
-		Mode:          "console",
-		AdminPath:     mountPrefix,
-		BaseAdminPath: s.staticAdminPrefix(),
-		PublicURL:     s.publicBaseURL(r),
-		DefaultLocale: snap.Site.DefaultLocale,
-		Accent:        snap.Appearance.Accent,
-		DefaultTheme:  snap.Appearance.DefaultMode,
-		SiteTitle:     snap.Site.Title,
-		Locales:       s.deps.Catalog.Locales(),
+		Mode:            "console",
+		AdminPath:       mountPrefix,
+		BaseAdminPath:   s.staticAdminPrefix(),
+		PublicURL:       s.publicBaseURL(r),
+		DefaultLocale:   snap.Site.DefaultLocale,
+		Accent:          snap.Appearance.Accent,
+		DefaultTheme:    snap.Appearance.DefaultMode,
+		SiteTitle:       snap.Site.Title,
+		VendorCDNPrefix: customVendor,
+		Locales:         s.deps.Catalog.Locales(),
 	})
 }
 
@@ -232,8 +238,7 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case sub == "auth/logout":
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+		if !requireMethod(w, r, http.MethodPost) {
 			return
 		}
 		actor, sess, ok := s.authenticateAdminRequest(w, r, "", false)
@@ -287,6 +292,13 @@ func (s *AppServer) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			items = []plugin.EditorQuickInsertView{}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": items, "quick_inserts": items})
+
+	case sub == "render/preview" && r.Method == http.MethodPost:
+		actor, _, ok := s.authenticateAdminRequest(w, r, auth.ScopeArticlesRead, false)
+		if !ok {
+			return
+		}
+		s.handleAdminRenderPreview(w, r, actor)
 
 	case sub == "articles" || strings.HasPrefix(sub, "articles/"):
 		patScope := auth.ScopeArticlesWrite
@@ -578,16 +590,21 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, actor.ID).Scan(&totpCnt)
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM user_credentials WHERE user_id = ? AND kind = 'passkey'`, actor.ID).Scan(&pkCnt)
 		snap := s.deps.Settings.Snapshot()
+		appView := snap.Appearance
+		if s.deps.Themes != nil && len(appView.ThemeConfigs) > 0 {
+			appView.ThemeConfigs = s.deps.Themes.RedactAllThemeConfigs(appView.ThemeConfigs)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"user":           actor,
-			"session_id":     sessID,
-			"csrf_token":     csrf,
-			"totp_enabled":   totpCnt > 0,
-			"passkeys":       pkCnt,
-			"site":           snap.Site,
-			"appearance":     snap.Appearance,
-			"storage_driver": snap.Storage.ActiveDriver,
-			"locales":        s.deps.Catalog.Locales(),
+			"user":                     actor,
+			"session_id":               sessID,
+			"csrf_token":               csrf,
+			"totp_enabled":             totpCnt > 0,
+			"totp_enrollment_required": !s.isStaffTOTPCompliant(r.Context(), actor),
+			"passkeys":                 pkCnt,
+			"site":                     snap.Site,
+			"appearance":               appView,
+			"storage_driver":           snap.Storage.ActiveDriver,
+			"locales":                  s.deps.Catalog.Locales(),
 		})
 		return
 	}
@@ -610,7 +627,8 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		if !decodeJSONBody(w, r, 16384, &req) {
 			return
 		}
-		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
+		var fullUser domain.User
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
@@ -671,13 +689,11 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 				writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
 				return
 			}
-			if err := auth.ValidatePasswordPolicy(req.NewPassword); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, auth.ValidatePasswordPolicy(req.NewPassword)) {
 				return
 			}
 			newHash, err := auth.HashPassword(req.NewPassword)
-			if err != nil {
-				writeErrJSON(w, http.StatusInternalServerError, err.Error())
+			if writeServerErr(w, err) {
 				return
 			}
 			fullUser.PasswordHash = newHash
@@ -688,8 +704,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			`UPDATE users SET display_name = ?, email = ?, bio = ?, website_url = ?, avatar_url = ?, preferred_locale = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
 			fullUser.DisplayName, fullUser.Email, fullUser.Bio, fullUser.WebsiteURL, fullUser.AvatarURL, fullUser.PreferredLocale,
 			fullUser.PasswordHash, fullUser.LegacyHash, fullUser.UpdatedAt, fullUser.ID)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		if req.NewPassword != "" {
@@ -742,7 +757,8 @@ func (s *AppServer) verifyStepUpPassword(w http.ResponseWriter, r *http.Request,
 		writeErrJSON(w, http.StatusBadRequest, s.stepUpErrorMessage(r, true))
 		return false
 	}
-	fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actorID)
+	var fullUser domain.User
+	err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actorID)
 	if err != nil {
 		writeErrJSON(w, http.StatusUnauthorized, s.stepUpErrorMessage(r, false))
 		return false
@@ -762,8 +778,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 
 	case sub == "totp/setup" && r.Method == http.MethodPost:
 		secret, err := auth.GenerateTOTPSecret()
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		uri := auth.BuildOTPAuthURI(s.deps.Settings.Snapshot().Site.Title, actor.Username, secret)
@@ -779,7 +794,8 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		if !decodeJSONBody(w, r, 8192, &req) {
 			return
 		}
-		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
+		var fullUser domain.User
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
@@ -793,8 +809,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			return
 		}
 		codes, err := s.deps.Auth.EnrollTOTP(r.Context(), actor.ID, req.Secret, req.Code)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.recordAuditLog(r, actor, "security.totp_enroll", "user", actor.ID, nil)
@@ -805,7 +820,8 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			CurrentPassword string `json:"current_password"`
 		}
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
-		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
+		var fullUser domain.User
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
@@ -821,18 +837,29 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		writeOKJSON(w)
 
 	case sub == "passkeys" && r.Method == http.MethodGet:
-		rows, _ := sqlx.Select[domain.UserCredential](r.Context(), s.deps.Store,
-			`SELECT id, user_id, kind, name, credential_id, cose_alg, sign_count, last_used_at, created_at
-			 FROM user_credentials WHERE user_id = ? AND kind = 'passkey' ORDER BY created_at DESC`, actor.ID)
+		page, perPage := parseAdminPageParams(r, 20, 100)
+		var total int
+		_ = s.deps.Store.QueryRowContext(r.Context(),
+			`SELECT COUNT(*) FROM user_credentials WHERE user_id = ? AND kind = 'passkey'`, actor.ID).Scan(&total)
+		baseSQL := `SELECT id, user_id, kind, name, credential_id, cose_alg, sign_count, last_used_at, created_at
+			 FROM user_credentials WHERE user_id = ? AND kind = 'passkey' ORDER BY created_at DESC`
+		qSQL, fullArgs := s.paginateQuery(baseSQL, []any{actor.ID}, page, perPage)
+		var rows []domain.UserCredential
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 		if rows == nil {
 			rows = []domain.UserCredential{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":     rows,
+			"total":     total,
+			"page":      page,
+			"per_page":  perPage,
+			"page_size": perPage,
+		})
 
 	case sub == "passkeys/begin" && r.Method == http.MethodPost:
 		res, err := auth.BeginPasskeyCeremony(s.deps.Config.KeyRing, actor.ID, "register", s.publicBaseURL(r))
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		writeJSON(w, http.StatusOK, res)
@@ -848,7 +875,8 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
-		fullUser, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, actor.ID)
+		var fullUser domain.User
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actor.ID)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
@@ -868,8 +896,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			return
 		}
 		cred, err := s.deps.Auth.RegisterPasskey(r.Context(), actor.ID, req.Name, req.StateToken, cdBytes, attBytes)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		cred.PublicKeySPKI = ""
@@ -897,15 +924,33 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		writeOKJSON(w)
 
 	case sub == "sessions" && r.Method == http.MethodGet:
+		page, perPage := parseAdminPageParams(r, 20, 100)
 		rows, _ := s.deps.Auth.ListUserSessions(r.Context(), actor.ID)
 		if rows == nil {
 			rows = []domain.UserSession{}
 		}
+		total := len(rows)
+		start := (page - 1) * perPage
+		if start > total {
+			start = total
+		}
+		end := start + perPage
+		if end > total {
+			end = total
+		}
+		paged := rows[start:end]
 		curID := ""
 		if sess != nil {
 			curID = sess.ID
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": rows, "current_session_id": curID})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":              paged,
+			"current_session_id": curID,
+			"total":              total,
+			"page":               page,
+			"per_page":           perPage,
+			"page_size":          perPage,
+		})
 
 	case sub == "sessions" && r.Method == http.MethodDelete:
 		var (
@@ -919,8 +964,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			res, err = s.deps.Store.ExecContext(r.Context(),
 				`DELETE FROM user_sessions WHERE user_id = ?`, actor.ID)
 		}
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		revoked, _ := res.RowsAffected()
@@ -937,13 +981,25 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		writeOKJSON(w)
 
 	case sub == "tokens" && r.Method == http.MethodGet:
-		rows, _ := sqlx.Select[domain.APIToken](r.Context(), s.deps.Store,
-			`SELECT id, user_id, name, token_prefix, scopes_json, last_used_at, expires_at, created_at
-			 FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC`, actor.ID)
+		page, perPage := parseAdminPageParams(r, 20, 100)
+		var total int
+		_ = s.deps.Store.QueryRowContext(r.Context(),
+			`SELECT COUNT(*) FROM api_tokens WHERE user_id = ?`, actor.ID).Scan(&total)
+		baseSQL := `SELECT id, user_id, name, token_prefix, scopes_json, last_used_at, expires_at, created_at
+			 FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC`
+		qSQL, fullArgs := s.paginateQuery(baseSQL, []any{actor.ID}, page, perPage)
+		var rows []domain.APIToken
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 		if rows == nil {
 			rows = []domain.APIToken{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":     rows,
+			"total":     total,
+			"page":      page,
+			"per_page":  perPage,
+			"page_size": perPage,
+		})
 
 	case sub == "tokens" && r.Method == http.MethodPost:
 		if sess == nil || sess.ID == "" {
@@ -971,8 +1027,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 			writeErrJSON(w, http.StatusForbidden, err.Error())
 			return
 		}
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.recordAuditLog(r, actor, "security.api_token_create", "api_token", rec.ID, map[string]any{"scopes": req.Scopes})
@@ -991,51 +1046,354 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 
 // --- Workspace 1: Overview Dashboard & Unified Articles + Revisions + Live Preview ---
 
-func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, actor *domain.User) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+type overviewKPIs struct {
+	pubCnt     int
+	draftCnt   int
+	schedCnt   int
+	protCnt    int
+	pageCnt    int
+	cmtPending int
+	mediaCnt   int
+	totalViews int64
+}
+
+type overviewTopArticleView struct {
+	ItemKey string `json:"item_key"`
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Slug    string `json:"slug"`
+	Hits    int64  `json:"hits"`
+}
+
+type overviewRecentCommentView struct {
+	domain.Comment
+	TargetTitle string `json:"target_title"`
+	TargetSlug  string `json:"target_slug"`
+}
+
+type overviewMonthBucket struct {
+	Month string `json:"month"`
+	Count int    `json:"count"`
+}
+
+func (s *AppServer) queryOverviewKPIs(ctx context.Context, actor *domain.User) overviewKPIs {
+	var k overviewKPIs
+	if actor.Role == domain.RoleAdmin {
+		_ = s.deps.Store.QueryRowContext(ctx,
+			`SELECT
+				COALESCE(SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN status = 'draft' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN status = 'scheduled' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN password_ciphertext <> '' OR has_content_lock = ? THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(view_count), 0)
+			 FROM articles`, true).Scan(&k.pubCnt, &k.draftCnt, &k.schedCnt, &k.protCnt, &k.totalViews)
+		_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM pages`).Scan(&k.pageCnt)
+		_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM comments WHERE status = 'pending' AND is_deleted = ?`, false).Scan(&k.cmtPending)
+		_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets`).Scan(&k.mediaCnt)
+		return k
 	}
-	if s.deps.Content != nil {
-		_ = s.deps.Content.FlushAnalytics(r.Context())
+	_ = s.deps.Store.QueryRowContext(ctx,
+		`SELECT
+			COALESCE(SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'draft' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'scheduled' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN password_ciphertext <> '' OR has_content_lock = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(view_count), 0)
+		 FROM articles WHERE author_id = ?`, true, actor.ID).Scan(&k.pubCnt, &k.draftCnt, &k.schedCnt, &k.protCnt, &k.totalViews)
+	_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM pages WHERE author_id = ?`, actor.ID).Scan(&k.pageCnt)
+	_ = s.deps.Store.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comments c
+		 LEFT JOIN articles a ON c.target_type = 'article' AND c.target_id = a.id
+		 LEFT JOIN pages p ON c.target_type = 'page' AND c.target_id = p.id
+		 WHERE c.is_deleted = ? AND c.status = 'pending' AND (a.author_id = ? OR p.author_id = ?)`,
+		false, actor.ID, actor.ID).Scan(&k.cmtPending)
+	_ = s.deps.Store.QueryRowContext(ctx, `SELECT COUNT(*) FROM media_assets WHERE uploader_id = ?`, actor.ID).Scan(&k.mediaCnt)
+	return k
+}
+
+func (s *AppServer) queryOverviewTopPosts(ctx context.Context, actor *domain.User, cutoffDate string) []overviewTopArticleView {
+	if actor.Role == domain.RoleAdmin {
+		var rawTopPosts []struct {
+			ItemKey string `db:"item_key"`
+			Hits    int64  `db:"hits"`
+		}
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rawTopPosts,
+			`SELECT item_key, SUM(hits) AS hits FROM analytics_top_items
+			 WHERE stat_date >= ? AND kind = 'article' GROUP BY item_key ORDER BY hits DESC LIMIT 10`, cutoffDate)
+		if len(rawTopPosts) == 0 {
+			return []overviewTopArticleView{}
+		}
+		ph := strings.Repeat("?,", len(rawTopPosts)-1) + "?"
+		args := make([]any, 0, len(rawTopPosts)*2)
+		for _, tp := range rawTopPosts {
+			args = append(args, tp.ItemKey)
+		}
+		for _, tp := range rawTopPosts {
+			args = append(args, tp.ItemKey)
+		}
+		type artMeta struct {
+			ID    string `db:"id"`
+			Title string `db:"title"`
+			Slug  string `db:"slug"`
+		}
+		var metas []artMeta
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &metas,
+			`SELECT id, title, slug FROM articles WHERE id IN (`+ph+`) OR slug IN (`+ph+`)`, args...)
+		byID := make(map[string]artMeta, len(metas))
+		bySlug := make(map[string]artMeta, len(metas))
+		for _, m := range metas {
+			byID[m.ID] = m
+			if m.Slug != "" {
+				bySlug[m.Slug] = m
+			}
+		}
+		topPosts := make([]overviewTopArticleView, 0, len(rawTopPosts))
+		for _, tp := range rawTopPosts {
+			m, ok := byID[tp.ItemKey]
+			if !ok {
+				m = bySlug[tp.ItemKey]
+			}
+			artID := m.ID
+			if artID == "" {
+				artID = tp.ItemKey
+			}
+			title := m.Title
+			if title == "" {
+				title = tp.ItemKey
+			}
+			topPosts = append(topPosts, overviewTopArticleView{
+				ItemKey: tp.ItemKey,
+				ID:      artID,
+				Title:   title,
+				Slug:    m.Slug,
+				Hits:    tp.Hits,
+			})
+		}
+		return topPosts
 	}
+
+	var rawTopPosts []struct {
+		ID    string `db:"id"`
+		Title string `db:"title"`
+		Slug  string `db:"slug"`
+		Hits  int64  `db:"hits"`
+	}
+	_ = sqlx.SelectInto(ctx, s.deps.Store, &rawTopPosts,
+		`SELECT a.id, a.title, a.slug, SUM(t.hits) AS hits
+		 FROM analytics_top_items t
+		 INNER JOIN articles a ON (a.id = t.item_key OR a.slug = t.item_key)
+		 WHERE t.stat_date >= ? AND t.kind = 'article' AND a.author_id = ?
+		 GROUP BY a.id, a.title, a.slug
+		 ORDER BY hits DESC LIMIT 10`, cutoffDate, actor.ID)
+	topPosts := make([]overviewTopArticleView, 0, len(rawTopPosts))
+	for _, tp := range rawTopPosts {
+		topPosts = append(topPosts, overviewTopArticleView{
+			ItemKey: tp.ID,
+			ID:      tp.ID,
+			Title:   tp.Title,
+			Slug:    tp.Slug,
+			Hits:    tp.Hits,
+		})
+	}
+	if len(topPosts) == 0 {
+		var fallbackTop []struct {
+			ID        string `db:"id"`
+			Title     string `db:"title"`
+			Slug      string `db:"slug"`
+			ViewCount int64  `db:"view_count"`
+		}
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &fallbackTop,
+			`SELECT id, title, slug, view_count FROM articles WHERE author_id = ? AND view_count > 0 ORDER BY view_count DESC LIMIT 10`, actor.ID)
+		for _, tp := range fallbackTop {
+			topPosts = append(topPosts, overviewTopArticleView{
+				ItemKey: tp.ID,
+				ID:      tp.ID,
+				Title:   tp.Title,
+				Slug:    tp.Slug,
+				Hits:    tp.ViewCount,
+			})
+		}
+	}
+	if topPosts == nil {
+		topPosts = []overviewTopArticleView{}
+	}
+	return topPosts
+}
+
+func (s *AppServer) queryOverviewRecentComments(ctx context.Context, actor *domain.User) []overviewRecentCommentView {
 	isAdmin := actor.Role == domain.RoleAdmin
-	var pubCnt, draftCnt, schedCnt, protCnt, pageCnt, cmtPending, mediaCnt int
-	var totalViews int64
+	var rawRecentComments []domain.Comment
 	if isAdmin {
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'published'`).Scan(&pubCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'draft'`).Scan(&draftCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE status = 'scheduled'`).Scan(&schedCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE password_ciphertext <> '' OR has_content_lock = ?`, true).Scan(&protCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(view_count), 0) FROM articles`).Scan(&totalViews)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM pages`).Scan(&pageCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM comments WHERE status = 'pending' AND is_deleted = ?`, false).Scan(&cmtPending)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM media_assets`).Scan(&mediaCnt)
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rawRecentComments,
+			`SELECT * FROM comments WHERE is_deleted = ? ORDER BY created_at DESC LIMIT 8`, false)
 	} else {
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE author_id = ? AND status = 'published'`, actor.ID).Scan(&pubCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE author_id = ? AND status = 'draft'`, actor.ID).Scan(&draftCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE author_id = ? AND status = 'scheduled'`, actor.ID).Scan(&schedCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM articles WHERE author_id = ? AND (password_ciphertext <> '' OR has_content_lock = ?)`, actor.ID, true).Scan(&protCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(view_count), 0) FROM articles WHERE author_id = ?`, actor.ID).Scan(&totalViews)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM pages WHERE author_id = ?`, actor.ID).Scan(&pageCnt)
-		_ = s.deps.Store.QueryRowContext(r.Context(),
-			`SELECT COUNT(*) FROM comments c
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rawRecentComments,
+			`SELECT c.* FROM comments c
 			 LEFT JOIN articles a ON c.target_type = 'article' AND c.target_id = a.id
 			 LEFT JOIN pages p ON c.target_type = 'page' AND c.target_id = p.id
-			 WHERE c.is_deleted = ? AND c.status = 'pending' AND (a.author_id = ? OR p.author_id = ?)`,
-			false, actor.ID, actor.ID).Scan(&cmtPending)
-		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM media_assets WHERE uploader_id = ?`, actor.ID).Scan(&mediaCnt)
+			 WHERE c.is_deleted = ? AND (a.author_id = ? OR p.author_id = ?)
+			 ORDER BY c.created_at DESC LIMIT 8`,
+			false, actor.ID, actor.ID)
 	}
+	if len(rawRecentComments) == 0 {
+		return []overviewRecentCommentView{}
+	}
+
+	type targetMeta struct {
+		ID    string `db:"id"`
+		Title string `db:"title"`
+		Slug  string `db:"slug"`
+	}
+	artIDSet := make(map[string]struct{})
+	pageIDSet := make(map[string]struct{})
+	var artArgs, pageArgs []any
+	for _, rc := range rawRecentComments {
+		if rc.TargetID == "" {
+			continue
+		}
+		if rc.TargetType == domain.TargetTypePage {
+			if _, ok := pageIDSet[rc.TargetID]; !ok {
+				pageIDSet[rc.TargetID] = struct{}{}
+				pageArgs = append(pageArgs, rc.TargetID)
+			}
+		} else {
+			if _, ok := artIDSet[rc.TargetID]; !ok {
+				artIDSet[rc.TargetID] = struct{}{}
+				artArgs = append(artArgs, rc.TargetID)
+			}
+		}
+	}
+	artMetas := make(map[string]targetMeta, len(artArgs))
+	if len(artArgs) > 0 {
+		ph := strings.Repeat("?,", len(artArgs)-1) + "?"
+		var rows []targetMeta
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT id, title, slug FROM articles WHERE id IN (`+ph+`)`, artArgs...)
+		for _, m := range rows {
+			artMetas[m.ID] = m
+		}
+	}
+	pageMetas := make(map[string]targetMeta, len(pageArgs))
+	if len(pageArgs) > 0 {
+		ph := strings.Repeat("?,", len(pageArgs)-1) + "?"
+		var rows []targetMeta
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT id, title, slug FROM pages WHERE id IN (`+ph+`)`, pageArgs...)
+		for _, m := range rows {
+			pageMetas[m.ID] = m
+		}
+	}
+
+	recentComments := make([]overviewRecentCommentView, 0, len(rawRecentComments))
+	for _, rc := range rawRecentComments {
+		ownerID := actor.ID
+		if isAdmin {
+			ownerID = ""
+		}
+		scrubbed, sErr := authorizeAndScrubAdminComment(actor, rc, ownerID)
+		if sErr != nil {
+			continue
+		}
+		var m targetMeta
+		if rc.TargetType == domain.TargetTypePage {
+			m = pageMetas[rc.TargetID]
+		} else {
+			m = artMetas[rc.TargetID]
+		}
+		recentComments = append(recentComments, overviewRecentCommentView{
+			Comment:     scrubbed,
+			TargetTitle: m.Title,
+			TargetSlug:  m.Slug,
+		})
+	}
+	return recentComments
+}
+
+func (s *AppServer) queryOverviewMonthlyBuckets(ctx context.Context, actor *domain.User, tz string, siteLoc *time.Location, now time.Time) ([]overviewMonthBucket, []overviewMonthBucket) {
+	isAdmin := actor.Role == domain.RoleAdmin
+	allMonthCounts := make(map[string]int)
+	if isAdmin && s.deps.Content != nil {
+		if stats, err := s.deps.Content.ArchiveMonthStats(ctx, tz); err == nil && stats.MonthCounts != nil {
+			allMonthCounts = stats.MonthCounts
+		}
+	} else {
+		type artDateRow struct {
+			PublishedAt int64 `db:"published_at"`
+			CreatedAt   int64 `db:"created_at"`
+		}
+		var artDates []artDateRow
+		if isAdmin {
+			_ = sqlx.SelectInto(ctx, s.deps.Store, &artDates,
+				`SELECT published_at, created_at FROM articles WHERE status = 'published'`)
+		} else {
+			_ = sqlx.SelectInto(ctx, s.deps.Store, &artDates,
+				`SELECT published_at, created_at FROM articles WHERE author_id = ? AND status = 'published'`,
+				actor.ID)
+		}
+		for _, ad := range artDates {
+			ts := ad.PublishedAt
+			if ts <= 0 {
+				ts = ad.CreatedAt
+			}
+			if ts > 0 {
+				ym := time.UnixMilli(ts).In(siteLoc).Format("2006-01")
+				allMonthCounts[ym]++
+			}
+		}
+	}
+	histKeys := make([]string, 0, len(allMonthCounts))
+	for ym, cnt := range allMonthCounts {
+		if cnt > 0 {
+			histKeys = append(histKeys, ym)
+		}
+	}
+	sort.Strings(histKeys)
+	monthlyHistory := make([]overviewMonthBucket, 0, len(histKeys))
+	for _, ym := range histKeys {
+		monthlyHistory = append(monthlyHistory, overviewMonthBucket{Month: ym, Count: allMonthCounts[ym]})
+	}
+
+	curMonthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, siteLoc)
+	anchorMonthStart := curMonthStart
+	trailingTotal := 0
+	for i := 11; i >= 0; i-- {
+		m := curMonthStart.AddDate(0, -i, 0).Format("2006-01")
+		trailingTotal += allMonthCounts[m]
+	}
+	if trailingTotal == 0 && len(histKeys) > 0 {
+		if lt, pErr := time.ParseInLocation("2006-01", histKeys[len(histKeys)-1], siteLoc); pErr == nil {
+			anchorMonthStart = time.Date(lt.Year(), lt.Month(), 1, 0, 0, 0, 0, siteLoc)
+		}
+	}
+	monthlyArticles := make([]overviewMonthBucket, 0, 12)
+	for i := 11; i >= 0; i-- {
+		m := anchorMonthStart.AddDate(0, -i, 0).Format("2006-01")
+		monthlyArticles = append(monthlyArticles, overviewMonthBucket{Month: m, Count: allMonthCounts[m]})
+	}
+	return monthlyArticles, monthlyHistory
+}
+
+func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, actor *domain.User) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	ctx := r.Context()
+	if s.deps.Content != nil {
+		_ = s.deps.Content.FlushAnalytics(ctx)
+	}
+	isAdmin := actor.Role == domain.RoleAdmin
+	kpis := s.queryOverviewKPIs(ctx, actor)
+
+	snap := s.deps.Settings.Snapshot()
+	siteLoc := s.siteTimezoneLocation(snap.Site.TimeZone)
 
 	windowDays := 30
 	if rawDays, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("days"))); err == nil && rawDays == 7 {
 		windowDays = 7
 	}
-	now := time.Now()
+	now := time.Now().In(siteLoc)
 	cutoffDate := now.AddDate(0, 0, -(windowDays - 1)).Format("2006-01-02")
 	var trend []domain.AnalyticsDaily
 	if isAdmin {
-		trend, _ = sqlx.Select[domain.AnalyticsDaily](r.Context(), s.deps.Store,
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &trend,
 			`SELECT * FROM analytics_daily WHERE stat_date >= ? ORDER BY stat_date ASC`, cutoffDate)
 	}
 	if trend == nil {
@@ -1055,104 +1413,32 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	type topArticleView struct {
-		ItemKey string `json:"item_key"`
-		ID      string `json:"id"`
-		Title   string `json:"title"`
-		Slug    string `json:"slug"`
-		Hits    int64  `json:"hits"`
-	}
-	var topPosts []topArticleView
-	if isAdmin {
-		rawTopPosts, _ := sqlx.Select[struct {
-			ItemKey string `db:"item_key" json:"item_key"`
-			Hits    int64  `db:"hits" json:"hits"`
-		}](r.Context(), s.deps.Store,
-			`SELECT item_key, SUM(hits) AS hits FROM analytics_top_items
-			 WHERE stat_date >= ? AND kind = 'article' GROUP BY item_key ORDER BY hits DESC LIMIT 10`, cutoffDate)
-		topPosts = make([]topArticleView, 0, len(rawTopPosts))
-		for _, tp := range rawTopPosts {
-			var artID, title, slug string
-			_ = s.deps.Store.QueryRowContext(r.Context(),
-				`SELECT id, title, slug FROM articles WHERE id = ? OR slug = ? LIMIT 1`, tp.ItemKey, tp.ItemKey).Scan(&artID, &title, &slug)
-			if artID == "" {
-				artID = tp.ItemKey
-			}
-			if title == "" {
-				title = tp.ItemKey
-			}
-			topPosts = append(topPosts, topArticleView{
-				ItemKey: tp.ItemKey,
-				ID:      artID,
-				Title:   title,
-				Slug:    slug,
-				Hits:    tp.Hits,
-			})
-		}
-	} else {
-		rawTopPosts, _ := sqlx.Select[struct {
-			ID    string `db:"id"`
-			Title string `db:"title"`
-			Slug  string `db:"slug"`
-			Hits  int64  `db:"hits"`
-		}](r.Context(), s.deps.Store,
-			`SELECT a.id, a.title, a.slug, SUM(t.hits) AS hits
-			 FROM analytics_top_items t
-			 INNER JOIN articles a ON (a.id = t.item_key OR a.slug = t.item_key)
-			 WHERE t.stat_date >= ? AND t.kind = 'article' AND a.author_id = ?
-			 GROUP BY a.id, a.title, a.slug
-			 ORDER BY hits DESC LIMIT 10`, cutoffDate, actor.ID)
-		topPosts = make([]topArticleView, 0, len(rawTopPosts))
-		for _, tp := range rawTopPosts {
-			topPosts = append(topPosts, topArticleView{
-				ItemKey: tp.ID,
-				ID:      tp.ID,
-				Title:   tp.Title,
-				Slug:    tp.Slug,
-				Hits:    tp.Hits,
-			})
-		}
-		if len(topPosts) == 0 {
-			fallbackTop, _ := sqlx.Select[struct {
-				ID        string `db:"id"`
-				Title     string `db:"title"`
-				Slug      string `db:"slug"`
-				ViewCount int64  `db:"view_count"`
-			}](r.Context(), s.deps.Store,
-				`SELECT id, title, slug, view_count FROM articles WHERE author_id = ? AND view_count > 0 ORDER BY view_count DESC LIMIT 10`, actor.ID)
-			for _, tp := range fallbackTop {
-				topPosts = append(topPosts, topArticleView{
-					ItemKey: tp.ID,
-					ID:      tp.ID,
-					Title:   tp.Title,
-					Slug:    tp.Slug,
-					Hits:    tp.ViewCount,
-				})
-			}
-		}
-	}
-	if topPosts == nil {
-		topPosts = []topArticleView{}
-	}
+	topPosts := s.queryOverviewTopPosts(ctx, actor, cutoffDate)
 
 	type topRefererView struct {
 		ItemKey string `db:"item_key" json:"item_key"`
 		Hits    int64  `db:"hits" json:"hits"`
 	}
 	var topReferers []topRefererView
+	var topCountries []topRefererView
 	if isAdmin {
-		topReferers, _ = sqlx.Select[topRefererView](r.Context(), s.deps.Store,
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &topReferers,
 			`SELECT item_key, SUM(hits) AS hits FROM analytics_top_items
 			 WHERE stat_date >= ? AND kind = 'referer' GROUP BY item_key ORDER BY hits DESC LIMIT 10`, cutoffDate)
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &topCountries,
+			`SELECT item_key, SUM(hits) AS hits FROM analytics_top_items
+			 WHERE stat_date >= ? AND kind = 'country' GROUP BY item_key ORDER BY hits DESC LIMIT 10`, cutoffDate)
 	}
 	if topReferers == nil {
 		topReferers = []topRefererView{}
+	}
+	if topCountries == nil {
+		topCountries = []topRefererView{}
 	}
 
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
-	snap := s.deps.Settings.Snapshot()
 	locale := actor.PreferredLocale
 	if locale == "" {
 		locale = snap.Site.DefaultLocale
@@ -1161,7 +1447,7 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 	var dashCards []plugin.RenderedSlot
 	if s.deps.Plugins != nil {
 		quickInserts = s.deps.Plugins.EditorQuickInserts(locale)
-		dashCards = s.deps.Plugins.RenderSlots(r.Context(), plugin.SlotAdminDashboardCard, plugin.SlotRenderContext{
+		dashCards = s.deps.Plugins.RenderSlots(ctx, plugin.SlotAdminDashboardCard, plugin.SlotRenderContext{
 			Locale: locale,
 			Path:   r.URL.Path,
 		})
@@ -1173,118 +1459,17 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 		dashCards = []plugin.RenderedSlot{}
 	}
 
-	// Published article trend: full historical active months + 12-month window (dialect-agnostic Go bucketing)
-	type monthBucket struct {
-		Month string `json:"month"`
-		Count int    `json:"count"`
-	}
-	type artDateRow struct {
-		PublishedAt int64 `db:"published_at"`
-		CreatedAt   int64 `db:"created_at"`
-	}
-	var artDates []artDateRow
-	if isAdmin {
-		artDates, _ = sqlx.Select[artDateRow](r.Context(), s.deps.Store,
-			`SELECT published_at, created_at FROM articles WHERE status = 'published'`)
-	} else {
-		artDates, _ = sqlx.Select[artDateRow](r.Context(), s.deps.Store,
-			`SELECT published_at, created_at FROM articles WHERE author_id = ? AND status = 'published'`,
-			actor.ID)
-	}
-	allMonthCounts := make(map[string]int)
-	var latestPostMS int64
-	for _, ad := range artDates {
-		ts := ad.PublishedAt
-		if ts <= 0 {
-			ts = ad.CreatedAt
-		}
-		if ts > 0 {
-			if ts > latestPostMS {
-				latestPostMS = ts
-			}
-			ym := time.UnixMilli(ts).In(now.Location()).Format("2006-01")
-			allMonthCounts[ym]++
-		}
-	}
-	histKeys := make([]string, 0, len(allMonthCounts))
-	for ym, cnt := range allMonthCounts {
-		if cnt > 0 {
-			histKeys = append(histKeys, ym)
-		}
-	}
-	sort.Strings(histKeys)
-	monthlyHistory := make([]monthBucket, 0, len(histKeys))
-	for _, ym := range histKeys {
-		monthlyHistory = append(monthlyHistory, monthBucket{Month: ym, Count: allMonthCounts[ym]})
-	}
-
-	curMonthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	anchorMonthStart := curMonthStart
-	trailingTotal := 0
-	for i := 11; i >= 0; i-- {
-		m := curMonthStart.AddDate(0, -i, 0).Format("2006-01")
-		trailingTotal += allMonthCounts[m]
-	}
-	if trailingTotal == 0 && latestPostMS > 0 {
-		lt := time.UnixMilli(latestPostMS).In(now.Location())
-		anchorMonthStart = time.Date(lt.Year(), lt.Month(), 1, 0, 0, 0, 0, now.Location())
-	}
-	monthlyArticles := make([]monthBucket, 0, 12)
-	for i := 11; i >= 0; i-- {
-		m := anchorMonthStart.AddDate(0, -i, 0).Format("2006-01")
-		monthlyArticles = append(monthlyArticles, monthBucket{Month: m, Count: allMonthCounts[m]})
-	}
-
-	catUsage, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
-	topTags, _ := s.deps.Content.ListTagsWithCounts(r.Context(), 5)
-
-	type recentCommentView struct {
-		domain.Comment
-		TargetTitle string `json:"target_title"`
-		TargetSlug  string `json:"target_slug"`
-	}
-	var rawRecentComments []domain.Comment
-	if isAdmin {
-		rawRecentComments, _ = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
-			`SELECT * FROM comments WHERE is_deleted = ? ORDER BY created_at DESC LIMIT 8`, false)
-	} else {
-		rawRecentComments, _ = sqlx.Select[domain.Comment](r.Context(), s.deps.Store,
-			`SELECT c.* FROM comments c
-			 LEFT JOIN articles a ON c.target_type = 'article' AND c.target_id = a.id
-			 LEFT JOIN pages p ON c.target_type = 'page' AND c.target_id = p.id
-			 WHERE c.is_deleted = ? AND (a.author_id = ? OR p.author_id = ?)
-			 ORDER BY c.created_at DESC LIMIT 8`,
-			false, actor.ID, actor.ID)
-	}
-	recentComments := make([]recentCommentView, 0, len(rawRecentComments))
-	for _, rc := range rawRecentComments {
-		ownerID := actor.ID
-		if isAdmin {
-			ownerID = ""
-		}
-		scrubbed, sErr := authorizeAndScrubAdminComment(actor, rc, ownerID)
-		if sErr != nil {
-			continue
-		}
-		var tTitle, tSlug string
-		if rc.TargetType == domain.TargetTypePage {
-			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT title, slug FROM pages WHERE id = ?`, rc.TargetID).Scan(&tTitle, &tSlug)
-		} else {
-			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT title, slug FROM articles WHERE id = ?`, rc.TargetID).Scan(&tTitle, &tSlug)
-		}
-		recentComments = append(recentComments, recentCommentView{
-			Comment:     scrubbed,
-			TargetTitle: tTitle,
-			TargetSlug:  tSlug,
-		})
-	}
+	monthlyArticles, monthlyHistory := s.queryOverviewMonthlyBuckets(ctx, actor, snap.Site.TimeZone, siteLoc, now)
+	catUsage, _ := s.deps.Content.ListCategoriesWithCounts(ctx)
+	topTags, _ := s.deps.Content.ListTagsWithCounts(ctx, 5)
+	recentComments := s.queryOverviewRecentComments(ctx, actor)
 
 	var recentLogs []domain.AuditLog
 	if isAdmin {
-		recentLogs, _ = sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store,
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &recentLogs,
 			`SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 8`)
 	} else {
-		recentLogs, _ = sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store,
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &recentLogs,
 			`SELECT * FROM audit_logs WHERE actor_id = ? ORDER BY created_at DESC LIMIT 8`, actor.ID)
 		for i := range recentLogs {
 			recentLogs[i].ClientIP = ""
@@ -1296,21 +1481,22 @@ func (s *AppServer) handleAdminOverview(w http.ResponseWriter, r *http.Request, 
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts": map[string]int{
-			"published":        pubCnt,
-			"drafts":           draftCnt,
-			"scheduled":        schedCnt,
-			"protected":        protCnt,
-			"pages":            pageCnt,
-			"pending_comments": cmtPending,
-			"media":            mediaCnt,
-			"views":            int(totalViews),
+			"published":        kpis.pubCnt,
+			"drafts":           kpis.draftCnt,
+			"scheduled":        kpis.schedCnt,
+			"protected":        kpis.protCnt,
+			"pages":            kpis.pageCnt,
+			"pending_comments": kpis.cmtPending,
+			"media":            kpis.mediaCnt,
+			"views":            int(kpis.totalViews),
 		},
-		"total_views":      totalViews,
+		"total_views":      kpis.totalViews,
 		"window_days":      windowDays,
 		"analytics_daily":  trend,
 		"analytics_series": series,
 		"top_articles":     topPosts,
 		"top_referers":     topReferers,
+		"top_countries":    topCountries,
 		"monthly_articles": monthlyArticles,
 		"monthly_history":  monthlyHistory,
 		"category_usage":   catUsage,
@@ -1410,30 +1596,252 @@ func (s *AppServer) validateLegacyPermalink(ctx context.Context, rawLegacy strin
 	return clean, nil
 }
 
+func (s *AppServer) handleAdminRenderPreview(w http.ResponseWriter, r *http.Request, actor *domain.User) {
+	var req struct {
+		ContentMD          string `json:"content_md"`
+		Markdown           string `json:"markdown"`
+		Locale             string `json:"locale"`
+		PreserveDirectives bool   `json:"preserve_directives"`
+	}
+	if !decodeJSONBody(w, r, 4<<20, &req) {
+		return
+	}
+	if req.ContentMD == "" && req.Markdown != "" {
+		req.ContentMD = req.Markdown
+	}
+	ctx := r.Context()
+	resolvedLoc := s.deps.Catalog.Match(req.Locale, actor.PreferredLocale)
+	contentMD := req.ContentMD
+	if !req.PreserveDirectives && s.deps.Plugins != nil {
+		preMD := s.deps.Plugins.DispatchRenderPreMarkdown(ctx, plugin.ArticleHookPayload{
+			ContentMD:           contentMD,
+			Lang:                resolvedLoc,
+			Status:              domain.ArticleStatusDraft,
+			IsPasswordProtected: false,
+			HasContentLock:      false,
+		})
+		if preMD != "" {
+			contentMD = preMD
+		}
+	}
+	var customDirective func(string, map[string]string, string) (string, bool)
+	if !req.PreserveDirectives && s.deps.Plugins != nil {
+		customDirective = func(name string, attrs map[string]string, body string) (string, bool) {
+			return s.deps.Plugins.DispatchRenderDirective(ctx, name, attrs, body)
+		}
+	}
+	out := render.Default().Render(contentMD, render.Options{
+		Mode:                render.RenderModeWeb,
+		Locale:              resolvedLoc,
+		Unlocked:            true,
+		AuthorOrShareBypass: true,
+		IsReaderLoggedIn:    true,
+		ShowLineNumbers:     s.deps.Settings.Snapshot().Reading.ShowCodeLineNumbers,
+		PreserveDirectives:  req.PreserveDirectives,
+		LookupBook:          func(bSlug string) (render.BookCardInfo, bool) { return s.deps.Content.LookupBookCard(ctx, bSlug) },
+		ListBooks:           func() []render.BookCardInfo { return s.deps.Content.ListBookCards(ctx) },
+		LookupMediaDims:     s.deps.Content.LookupMediaDims,
+		CustomDirective:     customDirective,
+	})
+	if !req.PreserveDirectives && s.deps.Plugins != nil && out.HTML != "" && !render.ContainsLockDirective(contentMD) {
+		postHTML := s.deps.Plugins.DispatchRenderPostHTML(ctx, plugin.ArticleHookPayload{
+			ContentMD:           contentMD,
+			HTML:                out.HTML,
+			Lang:                resolvedLoc,
+			Status:              domain.ArticleStatusDraft,
+			IsPasswordProtected: false,
+			HasContentLock:      false,
+		})
+		if postHTML != "" && s.deps.Content != nil {
+			out.HTML = s.deps.Content.SanitizeHTMLFragment(postHTML)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"html":          out.HTML,
+		"toc":           out.TOC,
+		"needs_math":    out.NeedsMath,
+		"needs_mermaid": out.NeedsMermaid,
+		"has_audio":     strings.Contains(out.HTML, "<audio"),
+	})
+}
+
+func (s *AppServer) handleAdminArticlesBatch(w http.ResponseWriter, r *http.Request, actor *domain.User) {
+	var req struct {
+		Action     string   `json:"action"`
+		IDs        []string `json:"ids"`
+		CategoryID string   `json:"category_id"`
+	}
+	if !decodeJSONBody(w, r, 65536, &req) {
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	switch action {
+	case "publish", "draft", "delete", "category", "pin", "unpin":
+	default:
+		writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
+		return
+	}
+	ids := dedupCleanIDs(req.IDs, 200)
+	if len(ids) == 0 {
+		writeErrJSON(w, http.StatusBadRequest, "ids required")
+		return
+	}
+
+	ctx := r.Context()
+	ph := strings.Repeat("?,", len(ids)-1) + "?"
+	idArgs := make([]any, len(ids))
+	for i, aid := range ids {
+		idArgs[i] = aid
+	}
+	var fetched []domain.RawArticle
+	if err := sqlx.SelectInto(ctx, s.deps.Store, &fetched, `SELECT * FROM articles WHERE id IN (`+ph+`)`, idArgs...); writeServerErr(w, err) {
+		return
+	}
+	byID := make(map[string]domain.RawArticle, len(fetched))
+	for _, raw := range fetched {
+		byID[raw.ID] = raw
+	}
+	articles := make([]domain.RawArticle, 0, len(fetched))
+	for _, aid := range ids {
+		raw, ok := byID[aid]
+		if !ok {
+			continue
+		}
+		if !auth.CanManageArticle(actor, raw.AuthorID) {
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
+			return
+		}
+		articles = append(articles, raw)
+	}
+
+	type batchEffect struct {
+		raw          domain.RawArticle
+		wasPublished bool
+	}
+	effects := make([]batchEffect, 0, len(articles))
+	now := time.Now().UnixMilli()
+	catID := strings.TrimSpace(req.CategoryID)
+
+	if len(articles) > 0 {
+		txErr := s.deps.Store.WithTx(ctx, func(tx *sqlx.Tx) error {
+			for _, raw := range articles {
+				wasPublished := raw.Status == domain.ArticleStatusPublished
+				switch action {
+				case "publish":
+					pubAt := raw.PublishedAt
+					if pubAt <= 0 {
+						pubAt = now
+					}
+					if _, uErr := tx.ExecContext(ctx,
+						`UPDATE articles SET status = ?, published_at = ?, updated_at = ? WHERE id = ?`,
+						domain.ArticleStatusPublished, pubAt, now, raw.ID); uErr != nil {
+						return uErr
+					}
+					raw.Status = domain.ArticleStatusPublished
+					raw.PublishedAt = pubAt
+					raw.UpdatedAt = now
+					effects = append(effects, batchEffect{raw: raw, wasPublished: wasPublished})
+				case "draft":
+					if _, uErr := tx.ExecContext(ctx,
+						`UPDATE articles SET status = ?, updated_at = ? WHERE id = ?`,
+						domain.ArticleStatusDraft, now, raw.ID); uErr != nil {
+						return uErr
+					}
+					raw.Status = domain.ArticleStatusDraft
+					raw.UpdatedAt = now
+					effects = append(effects, batchEffect{raw: raw, wasPublished: wasPublished})
+				case "category":
+					if _, uErr := tx.ExecContext(ctx,
+						`UPDATE articles SET category_id = ?, updated_at = ? WHERE id = ?`,
+						catID, now, raw.ID); uErr != nil {
+						return uErr
+					}
+					raw.CategoryID = catID
+					raw.UpdatedAt = now
+					effects = append(effects, batchEffect{raw: raw, wasPublished: wasPublished})
+				case "pin", "unpin":
+					pinned := action == "pin"
+					if _, uErr := tx.ExecContext(ctx,
+						`UPDATE articles SET is_pinned = ?, updated_at = ? WHERE id = ?`,
+						pinned, now, raw.ID); uErr != nil {
+						return uErr
+					}
+					raw.IsPinned = pinned
+					raw.UpdatedAt = now
+					effects = append(effects, batchEffect{raw: raw, wasPublished: wasPublished})
+				case "delete":
+					_, _ = tx.ExecContext(ctx, `DELETE FROM article_tags WHERE article_id = ?`, raw.ID)
+					_, _ = tx.ExecContext(ctx, `DELETE FROM series_articles WHERE article_id = ?`, raw.ID)
+					_, _ = tx.ExecContext(ctx, `DELETE FROM article_revisions WHERE article_id = ?`, raw.ID)
+					_, _ = tx.ExecContext(ctx, `DELETE FROM article_backlinks WHERE source_article_id = ? OR target_article_id = ?`, raw.ID, raw.ID)
+					s.deleteTargetCommentsAndReactionsTx(ctx, tx, domain.TargetTypeArticle, raw.ID)
+					if _, dErr := tx.ExecContext(ctx, `DELETE FROM articles WHERE id = ?`, raw.ID); dErr != nil {
+						return dErr
+					}
+					effects = append(effects, batchEffect{raw: raw, wasPublished: wasPublished})
+				}
+			}
+			return nil
+		})
+		if writeServerErr(w, txErr) {
+			return
+		}
+	}
+
+	affected := len(effects)
+	for _, eff := range effects {
+		raw := eff.raw
+		switch action {
+		case "publish":
+			s.deps.Content.SearchIndex().Upsert(raw)
+			if !eff.wasPublished {
+				if s.deps.Plugins != nil {
+					s.deps.Plugins.DispatchArticleHook(ctx, plugin.HookArticlePublished, articleHookPayloadFromRaw(raw))
+				}
+				s.dispatchFederationForArticle(ctx, "publish", raw)
+				if s.deps.NotifyArticlePublished != nil {
+					s.deps.NotifyArticlePublished(ctx, raw)
+				}
+			} else {
+				if s.deps.Plugins != nil {
+					s.deps.Plugins.DispatchArticleHook(ctx, plugin.HookArticleUpdated, articleHookPayloadFromRaw(raw))
+				}
+				s.dispatchFederationForArticle(ctx, "update", raw)
+			}
+		case "draft":
+			s.deps.Content.SearchIndex().Remove(raw.ID)
+			if eff.wasPublished && s.deps.Plugins != nil {
+				s.deps.Plugins.DispatchArticleHook(ctx, plugin.HookArticleDeleted, articleHookPayloadFromRaw(raw))
+			}
+		case "category", "pin", "unpin":
+			if raw.Status == domain.ArticleStatusPublished {
+				s.deps.Content.SearchIndex().Upsert(raw)
+				if s.deps.Plugins != nil {
+					s.deps.Plugins.DispatchArticleHook(ctx, plugin.HookArticleUpdated, articleHookPayloadFromRaw(raw))
+				}
+				s.dispatchFederationForArticle(ctx, "update", raw)
+			}
+		case "delete":
+			s.deps.Content.SearchIndex().Remove(raw.ID)
+			if s.deps.Plugins != nil {
+				deletedCopy := raw
+				deletedCopy.Status = "deleted"
+				s.deps.Plugins.DispatchArticleHook(ctx, plugin.HookArticleDeleted, articleHookPayloadFromRaw(deletedCopy))
+			}
+		}
+	}
+	if affected > 0 {
+		s.invalidateMediaRefCache()
+	}
+	s.recordAuditLog(r, actor, "article.batch", "article", action, map[string]any{"action": action, "affected": affected})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+}
+
 func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 
 	if rest == "preview" && r.Method == http.MethodPost {
-		var req struct {
-			ContentMD string `json:"content_md"`
-			Locale    string `json:"locale"`
-		}
-		if !decodeJSONBody(w, r, 4<<20, &req) {
-			return
-		}
-		ctx := r.Context()
-		out := render.Default().Render(req.ContentMD, render.Options{
-			Mode:                render.RenderModeWeb,
-			Locale:              s.deps.Catalog.Match(req.Locale, actor.PreferredLocale),
-			Unlocked:            true,
-			AuthorOrShareBypass: true,
-			IsReaderLoggedIn:    true,
-			ShowLineNumbers:     s.deps.Settings.Snapshot().Reading.ShowCodeLineNumbers,
-			LookupBook:          func(bSlug string) (render.BookCardInfo, bool) { return s.deps.Content.LookupBookCard(ctx, bSlug) },
-			ListBooks:           func() []render.BookCardInfo { return s.deps.Content.ListBookCards(ctx) },
-			LookupMediaDims:     s.deps.Content.LookupMediaDims,
-		})
-		writeJSON(w, http.StatusOK, map[string]any{"html": out.HTML, "toc": out.TOC})
+		s.handleAdminRenderPreview(w, r, actor)
 		return
 	}
 
@@ -1443,136 +1851,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if rest == "batch" && r.Method == http.MethodPost {
-		var req struct {
-			Action     string   `json:"action"`
-			IDs        []string `json:"ids"`
-			CategoryID string   `json:"category_id"`
-		}
-		if !decodeJSONBody(w, r, 65536, &req) {
-			return
-		}
-		action := strings.ToLower(strings.TrimSpace(req.Action))
-		switch action {
-		case "publish", "draft", "delete", "category", "pin", "unpin":
-		default:
-			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
-			return
-		}
-		ids := dedupCleanIDs(req.IDs, 200)
-		if len(ids) == 0 {
-			writeErrJSON(w, http.StatusBadRequest, "ids required")
-			return
-		}
-		articles := make([]domain.RawArticle, 0, len(ids))
-		for _, aid := range ids {
-			raw, gErr := s.deps.Content.GetRawArticleByID(r.Context(), aid)
-			if gErr != nil {
-				continue
-			}
-			if !auth.CanManageArticle(actor, raw.AuthorID) {
-				writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
-				return
-			}
-			articles = append(articles, raw)
-		}
-		now := time.Now().UnixMilli()
-		affected := 0
-		catID := strings.TrimSpace(req.CategoryID)
-		for _, raw := range articles {
-			switch action {
-			case "publish":
-				wasPublished := raw.Status == domain.ArticleStatusPublished
-				pubAt := raw.PublishedAt
-				if pubAt <= 0 {
-					pubAt = now
-				}
-				if _, uErr := s.deps.Store.ExecContext(r.Context(),
-					`UPDATE articles SET status = ?, published_at = ?, updated_at = ? WHERE id = ?`,
-					domain.ArticleStatusPublished, pubAt, now, raw.ID); uErr == nil {
-					raw.Status = domain.ArticleStatusPublished
-					raw.PublishedAt = pubAt
-					raw.UpdatedAt = now
-					s.deps.Content.SearchIndex().Upsert(raw)
-					if !wasPublished {
-						if s.deps.Plugins != nil {
-							s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticlePublished, articleHookPayloadFromRaw(raw))
-						}
-						if s.deps.NotifyArticlePublished != nil {
-							s.deps.NotifyArticlePublished(r.Context(), raw)
-						}
-					} else if s.deps.Plugins != nil {
-						s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleUpdated, articleHookPayloadFromRaw(raw))
-					}
-					affected++
-				}
-			case "draft":
-				wasPublished := raw.Status == domain.ArticleStatusPublished
-				if _, uErr := s.deps.Store.ExecContext(r.Context(),
-					`UPDATE articles SET status = ?, updated_at = ? WHERE id = ?`,
-					domain.ArticleStatusDraft, now, raw.ID); uErr == nil {
-					raw.Status = domain.ArticleStatusDraft
-					raw.UpdatedAt = now
-					s.deps.Content.SearchIndex().Remove(raw.ID)
-					if wasPublished && s.deps.Plugins != nil {
-						s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleDeleted, articleHookPayloadFromRaw(raw))
-					}
-					affected++
-				}
-			case "category":
-				if _, uErr := s.deps.Store.ExecContext(r.Context(),
-					`UPDATE articles SET category_id = ?, updated_at = ? WHERE id = ?`,
-					catID, now, raw.ID); uErr == nil {
-					raw.CategoryID = catID
-					raw.UpdatedAt = now
-					if raw.Status == domain.ArticleStatusPublished {
-						s.deps.Content.SearchIndex().Upsert(raw)
-						if s.deps.Plugins != nil {
-							s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleUpdated, articleHookPayloadFromRaw(raw))
-						}
-					}
-					affected++
-				}
-			case "pin", "unpin":
-				pinned := action == "pin"
-				if _, uErr := s.deps.Store.ExecContext(r.Context(),
-					`UPDATE articles SET is_pinned = ?, updated_at = ? WHERE id = ?`,
-					pinned, now, raw.ID); uErr == nil {
-					raw.IsPinned = pinned
-					raw.UpdatedAt = now
-					if raw.Status == domain.ArticleStatusPublished {
-						s.deps.Content.SearchIndex().Upsert(raw)
-						if s.deps.Plugins != nil {
-							s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleUpdated, articleHookPayloadFromRaw(raw))
-						}
-					}
-					affected++
-				}
-			case "delete":
-				dErr := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
-					_, _ = tx.ExecContext(r.Context(), `DELETE FROM article_tags WHERE article_id = ?`, raw.ID)
-					_, _ = tx.ExecContext(r.Context(), `DELETE FROM series_articles WHERE article_id = ?`, raw.ID)
-					_, _ = tx.ExecContext(r.Context(), `DELETE FROM article_revisions WHERE article_id = ?`, raw.ID)
-					_, _ = tx.ExecContext(r.Context(), `DELETE FROM article_backlinks WHERE source_article_id = ? OR target_article_id = ?`, raw.ID, raw.ID)
-					s.deleteTargetCommentsAndReactionsTx(r.Context(), tx, domain.TargetTypeArticle, raw.ID)
-					_, err := tx.ExecContext(r.Context(), `DELETE FROM articles WHERE id = ?`, raw.ID)
-					return err
-				})
-				if dErr == nil {
-					s.deps.Content.SearchIndex().Remove(raw.ID)
-					if s.deps.Plugins != nil {
-						deletedCopy := raw
-						deletedCopy.Status = "deleted"
-						s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleDeleted, articleHookPayloadFromRaw(deletedCopy))
-					}
-					affected++
-				}
-			}
-		}
-		if affected > 0 {
-			s.invalidateMediaRefCache()
-		}
-		s.recordAuditLog(r, actor, "article.batch", "article", action, map[string]any{"action": action, "affected": affected})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		s.handleAdminArticlesBatch(w, r, actor)
 		return
 	}
 
@@ -1670,12 +1949,13 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				        created_at, updated_at
 				 FROM articles WHERE ` + whereSQL + ` ORDER BY ` + orderClause
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, err := sqlx.Select[domain.RawArticle](r.Context(), s.deps.Store, qSQL, fullArgs...)
-			if err != nil {
-				writeErrJSON(w, http.StatusInternalServerError, err.Error())
+			var rows []domain.RawArticle
+			err := sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
+			if writeServerErr(w, err) {
 				return
 			}
-			catRows, _ := sqlx.Select[domain.Category](r.Context(), s.deps.Store, `SELECT id, name FROM categories`)
+			var catRows []domain.Category
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &catRows, `SELECT id, name FROM categories`)
 			catNames := make(map[string]string, len(catRows))
 			for _, c := range catRows {
 				catNames[c.ID] = c.Name
@@ -1724,18 +2004,47 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if len(parts) == 2 && parts[1] == "revisions" && r.Method == http.MethodGet {
-		revs, _ := sqlx.Select[domain.ArticleRevision](r.Context(), s.deps.Store,
-			`SELECT * FROM article_revisions WHERE article_id = ? ORDER BY created_at DESC LIMIT 20`, artID)
+		page, perPage := parseAdminPageParams(r, 20, 100)
+		var total int
+		_ = s.deps.Store.QueryRowContext(r.Context(),
+			`SELECT COUNT(*) FROM article_revisions WHERE article_id = ?`, artID).Scan(&total)
+		summaryOnly := r.URL.Query().Get("summary") == "1" || strings.EqualFold(r.URL.Query().Get("summary"), "true")
+		baseSQL := `SELECT id, article_id, title, summary_md, content_md, author_name, note, created_at FROM article_revisions WHERE article_id = ? ORDER BY created_at DESC`
+		if summaryOnly {
+			baseSQL = `SELECT id, article_id, title, summary_md, '' AS content_md, author_name, note, created_at FROM article_revisions WHERE article_id = ? ORDER BY created_at DESC`
+		}
+		qSQL, fullArgs := s.paginateQuery(baseSQL, []any{artID}, page, perPage)
+		var revs []domain.ArticleRevision
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &revs, qSQL, fullArgs...)
 		if revs == nil {
 			revs = []domain.ArticleRevision{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": revs})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":     revs,
+			"total":     total,
+			"page":      page,
+			"per_page":  perPage,
+			"page_size": perPage,
+		})
+		return
+	}
+
+	if len(parts) == 3 && parts[1] == "revisions" && r.Method == http.MethodGet {
+		revID := parts[2]
+		var rev domain.ArticleRevision
+		if rErr := sqlx.GetInto(r.Context(), s.deps.Store, &rev,
+			`SELECT * FROM article_revisions WHERE id = ? AND article_id = ?`, revID, artID); rErr != nil {
+			writeErrJSON(w, http.StatusNotFound, "revision not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"revision": rev})
 		return
 	}
 
 	if len(parts) == 4 && parts[1] == "revisions" && parts[3] == "restore" && r.Method == http.MethodPost {
 		revID := parts[2]
-		rev, rErr := sqlx.Get[domain.ArticleRevision](r.Context(), s.deps.Store,
+		var rev domain.ArticleRevision
+		rErr := sqlx.GetInto(r.Context(), s.deps.Store, &rev,
 			`SELECT * FROM article_revisions WHERE id = ? AND article_id = ?`, revID, artID)
 		if rErr != nil {
 			writeErrJSON(w, http.StatusNotFound, "revision not found")
@@ -1760,8 +2069,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			}
 			return s.deps.Content.ReindexArticleBacklinksTx(r.Context(), tx, raw)
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -1770,6 +2078,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			if s.deps.Plugins != nil {
 				s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleUpdated, articleHookPayloadFromRaw(raw))
 			}
+			s.dispatchFederationForArticle(r.Context(), "update", raw)
 		}
 		raw.PasswordCiphertext = ""
 		writeJSON(w, http.StatusOK, map[string]any{"article": raw})
@@ -1812,11 +2121,13 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		raw.IsPinned = nextPinned
+		raw.UpdatedAt = now
 		if raw.Status == domain.ArticleStatusPublished {
 			s.deps.Content.SearchIndex().Upsert(raw)
 			if s.deps.Plugins != nil {
 				s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleUpdated, articleHookPayloadFromRaw(raw))
 			}
+			s.dispatchFederationForArticle(r.Context(), "update", raw)
 		}
 		s.recordAuditLog(r, actor, "article.pin", "article", raw.ID, map[string]any{"is_pinned": nextPinned})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "is_pinned": nextPinned})
@@ -1826,7 +2137,8 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodGet:
-			tagRows, _ := sqlx.Select[domain.Tag](r.Context(), s.deps.Store,
+			var tagRows []domain.Tag
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &tagRows,
 				`SELECT t.* FROM tags t INNER JOIN article_tags at ON at.tag_id = t.id WHERE at.article_id = ? ORDER BY t.name ASC`, artID)
 			tags := make([]string, 0, len(tagRows))
 			for _, tg := range tagRows {
@@ -1872,8 +2184,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 				_, dErr := tx.ExecContext(r.Context(), `DELETE FROM articles WHERE id = ?`, artID)
 				return dErr
 			})
-			if err != nil {
-				writeErrJSON(w, http.StatusInternalServerError, err.Error())
+			if writeServerErr(w, err) {
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -2108,8 +2419,7 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 		}
 		return s.deps.Content.ReindexArticleBacklinksTx(r.Context(), tx, cur)
 	})
-	if err != nil {
-		writeErrJSON(w, http.StatusInternalServerError, err.Error())
+	if writeServerErr(w, err) {
 		return
 	}
 
@@ -2128,6 +2438,13 @@ func (s *AppServer) saveAdminArticle(w http.ResponseWriter, r *http.Request, act
 			s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleUpdated, articleHookPayloadFromRaw(cur))
 		case cur.Status != domain.ArticleStatusPublished && wasPublished:
 			s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticleDeleted, articleHookPayloadFromRaw(cur))
+		}
+	}
+	if cur.Status == domain.ArticleStatusPublished {
+		if !wasPublished {
+			s.dispatchFederationForArticle(r.Context(), "publish", cur)
+		} else {
+			s.dispatchFederationForArticle(r.Context(), "update", cur)
 		}
 	}
 	if cur.Status == domain.ArticleStatusPublished && !wasPublished && s.deps.NotifyArticlePublished != nil {
@@ -2157,11 +2474,12 @@ func (s *AppServer) appendArticleRevisionTx(ctx context.Context, tx *sqlx.Tx, ar
 	); err != nil {
 		return err
 	}
-	oldRows, err := sqlx.Select[struct {
+	var oldRows []struct {
 		ID string `db:"id"`
-	}](ctx, tx, `SELECT id FROM article_revisions WHERE article_id = ? ORDER BY created_at DESC`, art.ID)
-	if err == nil && len(oldRows) > 20 {
-		for _, r := range oldRows[20:] {
+	}
+	err := sqlx.SelectInto(ctx, tx, &oldRows, `SELECT id FROM article_revisions WHERE article_id = ? ORDER BY created_at DESC`, art.ID)
+	if err == nil && len(oldRows) > 50 {
+		for _, r := range oldRows[50:] {
 			_, _ = tx.ExecContext(ctx, `DELETE FROM article_revisions WHERE id = ?`, r.ID)
 		}
 	}
@@ -2187,7 +2505,8 @@ func (s *AppServer) resolveOrCreateCategoryTx(ctx context.Context, tx *sqlx.Tx, 
 		return "", nil
 	}
 	slug := sanitizeSlug(clean)
-	cat, err := sqlx.Get[domain.Category](ctx, tx, `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) OR slug = ?`, clean, slug)
+	var cat domain.Category
+	err := sqlx.GetInto(ctx, tx, &cat, `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) OR slug = ?`, clean, slug)
 	if err == nil {
 		return cat.ID, nil
 	}
@@ -2214,7 +2533,8 @@ func (s *AppServer) bindArticleTagsByNamesTx(ctx context.Context, tx *sqlx.Tx, a
 		}
 		seen[low] = true
 		tSlug := sanitizeSlug(tName)
-		tg, err := sqlx.Get[domain.Tag](ctx, tx, `SELECT id FROM tags WHERE LOWER(name) = LOWER(?) OR slug = ?`, tName, tSlug)
+		var tg domain.Tag
+		err := sqlx.GetInto(ctx, tx, &tg, `SELECT id FROM tags WHERE LOWER(name) = LOWER(?) OR slug = ?`, tName, tSlug)
 		tagID := tg.ID
 		if err != nil {
 			tagID = id.Next()
@@ -2297,9 +2617,10 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			var total int
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM pages WHERE `+whereSQL, args...).Scan(&total)
 
-			baseSQL := `SELECT * FROM pages WHERE ` + whereSQL + ` ORDER BY updated_at DESC`
+			baseSQL := `SELECT id, author_id, title, slug, template, '' AS content_md, is_published, allow_comment, show_toc, lang, translation_group, view_count, comment_count, created_at, updated_at FROM pages WHERE ` + whereSQL + ` ORDER BY updated_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.Page](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.Page
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Page{}
 			}
@@ -2345,6 +2666,9 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			}
 			s.invalidateMediaRefCache()
 			if in.IsPublished {
+				if s.deps.Content != nil && s.deps.Content.SearchIndex() != nil {
+					s.deps.Content.SearchIndex().UpsertPage(in)
+				}
 				s.dispatchPageLifecycleHook(r.Context(), plugin.HookPagePublished, in, "published")
 			}
 			writeJSON(w, http.StatusCreated, map[string]any{"page": in})
@@ -2355,7 +2679,8 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 		return
 	}
 
-	pg, err := sqlx.Get[domain.Page](r.Context(), s.deps.Store, `SELECT * FROM pages WHERE id = ?`, rest)
+	var pg domain.Page
+	err := sqlx.GetInto(r.Context(), s.deps.Store, &pg, `SELECT * FROM pages WHERE id = ?`, rest)
 	if err != nil {
 		writeErrJSON(w, http.StatusNotFound, "page not found")
 		return
@@ -2388,12 +2713,18 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			`UPDATE pages SET title = ?, slug = ?, template = ?, content_md = ?, is_published = ?, allow_comment = ?, show_toc = ?, lang = ?, translation_group = ?, updated_at = ? WHERE id = ?`,
 			strings.TrimSpace(in.Title), slug, tmpl, in.ContentMD, in.IsPublished, in.AllowComment, in.ShowTOC,
 			strings.TrimSpace(in.Lang), strings.TrimSpace(in.TranslationGroup), now, pg.ID)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.invalidateMediaRefCache()
-		pg, _ = sqlx.Get[domain.Page](r.Context(), s.deps.Store, `SELECT * FROM pages WHERE id = ?`, pg.ID)
+		_ = sqlx.GetInto(r.Context(), s.deps.Store, &pg, `SELECT * FROM pages WHERE id = ?`, pg.ID)
+		if s.deps.Content != nil && s.deps.Content.SearchIndex() != nil {
+			if pg.IsPublished {
+				s.deps.Content.SearchIndex().UpsertPage(pg)
+			} else {
+				s.deps.Content.SearchIndex().RemovePage(pg.ID)
+			}
+		}
 		if !wasPublished && pg.IsPublished {
 			s.dispatchPageLifecycleHook(r.Context(), plugin.HookPagePublished, pg, "published")
 		} else if wasPublished && pg.IsPublished {
@@ -2409,6 +2740,9 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 			return dErr
 		})
 		s.invalidateMediaRefCache()
+		if s.deps.Content != nil && s.deps.Content.SearchIndex() != nil {
+			s.deps.Content.SearchIndex().RemovePage(pg.ID)
+		}
 		s.dispatchPageLifecycleHook(r.Context(), plugin.HookPageDeleted, pg, "deleted")
 		writeOKJSON(w)
 	default:
@@ -2418,6 +2752,44 @@ func (s *AppServer) handleAdminPages(w http.ResponseWriter, r *http.Request, act
 
 func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if rest == "reorder" && r.Method == http.MethodPost {
+		if !requireAdminJSON(w, actor) {
+			return
+		}
+		var req struct {
+			OrderedIDs []string `json:"ordered_ids"`
+			IDs        []string `json:"ids"`
+		}
+		if !decodeJSONBody(w, r, 65536, &req) {
+			return
+		}
+		rawIDs := req.OrderedIDs
+		if len(rawIDs) == 0 {
+			rawIDs = req.IDs
+		}
+		ids := dedupCleanIDs(rawIDs, 500)
+		if len(ids) == 0 {
+			writeErrJSON(w, http.StatusBadRequest, "ordered_ids required")
+			return
+		}
+		now := time.Now().UnixMilli()
+		if err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			for idx, cid := range ids {
+				if _, uErr := tx.ExecContext(r.Context(),
+					`UPDATE categories SET sort_order = ?, updated_at = ? WHERE id = ?`,
+					idx+1, now, cid); uErr != nil {
+					return uErr
+				}
+			}
+			return nil
+		}); err != nil {
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.recordAuditLog(r, actor, "category.reorder", "category", "reorder", map[string]any{"count": len(ids)})
+		writeOKJSON(w)
+		return
+	}
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
@@ -2517,8 +2889,7 @@ func (s *AppServer) handleAdminCategories(w http.ResponseWriter, r *http.Request
 			`UPDATE categories SET name = ?, slug = ?, description = ?, icon = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
 			name, slug, strings.TrimSpace(in.Description), cleanIcon,
 			in.SortOrder, time.Now().UnixMilli(), rest)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		writeOKJSON(w)
@@ -2545,8 +2916,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 		}
 		res, err := s.deps.Store.ExecContext(r.Context(),
 			`DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM article_tags)`)
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		deleted, _ := res.RowsAffected()
@@ -2632,8 +3002,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.recordAuditLog(r, actor, "tags.merge", "tag", targetID, map[string]any{
@@ -2691,7 +3060,8 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 				CreatedAt    int64  `db:"created_at" json:"created_at"`
 				ArticleCount int    `db:"article_count" json:"article_count"`
 			}
-			paged, _ := sqlx.Select[adminTagRow](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var paged []adminTagRow
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &paged, qSQL, fullArgs...)
 			if paged == nil {
 				paged = []adminTagRow{}
 			}
@@ -2768,8 +3138,7 @@ func (s *AppServer) handleAdminTags(w http.ResponseWriter, r *http.Request, acto
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.recordAuditLog(r, actor, "tag.batch_delete", "tag", "batch", map[string]any{"affected": affected})
@@ -2833,7 +3202,8 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM series WHERE `+where, args...).Scan(&total)
 			baseSQL := `SELECT * FROM series WHERE ` + where + ` ORDER BY sort_order ASC, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.Series](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.Series
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 
 			type seriesArticleSummary struct {
 				ID        string `db:"id" json:"id"`
@@ -2851,15 +3221,15 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 					placeholders[i] = "?"
 					relArgs[i] = sr.ID
 				}
-				rels, _ := sqlx.Select[struct {
+				var rels []struct {
 					SeriesID  string `db:"series_id"`
 					ArticleID string `db:"article_id"`
 					SortOrder int    `db:"sort_order"`
 					Title     string `db:"title"`
 					Slug      string `db:"slug"`
 					Status    string `db:"status"`
-				}](
-					r.Context(), s.deps.Store,
+				}
+				_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rels,
 					`SELECT sa.series_id, sa.article_id, sa.sort_order,
 					        COALESCE(a.title, '') AS title, COALESCE(a.slug, '') AS slug, COALESCE(a.status, '') AS status
 					 FROM series_articles sa
@@ -2958,8 +3328,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 				}
 				return nil
 			})
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -3012,8 +3381,7 @@ func (s *AppServer) handleAdminSeries(w http.ResponseWriter, r *http.Request, ac
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -3069,6 +3437,44 @@ func sanitizeBookURLs(book *domain.Book, chapters []domain.BookChapter) error {
 
 func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if rest == "reorder" && r.Method == http.MethodPost {
+		if !requireAdminJSON(w, actor) {
+			return
+		}
+		var req struct {
+			OrderedIDs []string `json:"ordered_ids"`
+			IDs        []string `json:"ids"`
+		}
+		if !decodeJSONBody(w, r, 65536, &req) {
+			return
+		}
+		rawIDs := req.OrderedIDs
+		if len(rawIDs) == 0 {
+			rawIDs = req.IDs
+		}
+		ids := dedupCleanIDs(rawIDs, 500)
+		if len(ids) == 0 {
+			writeErrJSON(w, http.StatusBadRequest, "ordered_ids required")
+			return
+		}
+		now := time.Now().UnixMilli()
+		if err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			for idx, bid := range ids {
+				if _, uErr := tx.ExecContext(r.Context(),
+					`UPDATE books SET sort_order = ?, updated_at = ? WHERE id = ?`,
+					idx+1, now, bid); uErr != nil {
+					return uErr
+				}
+			}
+			return nil
+		}); err != nil {
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.recordAuditLog(r, actor, "book.reorder", "book", "reorder", map[string]any{"count": len(ids)})
+		writeOKJSON(w)
+		return
+	}
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
@@ -3111,7 +3517,8 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 
 			baseSQL := `SELECT * FROM books WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			paged, _ := sqlx.Select[domain.Book](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var paged []domain.Book
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &paged, qSQL, fullArgs...)
 			if paged == nil {
 				paged = []domain.Book{}
 			}
@@ -3131,7 +3538,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				domain.Book
 				Chapters []domain.BookChapter `json:"chapters"`
 			}
-			if !decodeJSONBody(w, r, 256*1024, &in) {
+			if !decodeJSONBody(w, r, 2<<20, &in) {
 				return
 			}
 			in.Title = strings.TrimSpace(in.Title)
@@ -3139,8 +3546,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				writeErrJSON(w, http.StatusBadRequest, "title is required")
 				return
 			}
-			if err := sanitizeBookURLs(&in.Book, in.Chapters); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, sanitizeBookURLs(&in.Book, in.Chapters)) {
 				return
 			}
 			in.ID = id.Next()
@@ -3177,13 +3583,12 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				}
 				for idx, ch := range in.Chapters {
 					_, _ = tx.ExecContext(r.Context(),
-						`INSERT INTO book_chapters (id, book_id, parent_id, title, url, depth, sort_order) VALUES (?, ?, '', ?, ?, ?, ?)`,
-						id.Next(), in.ID, strings.TrimSpace(ch.Title), ch.URL, ch.Depth, idx+1)
+						`INSERT INTO book_chapters (id, book_id, parent_id, title, url, depth, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+						id.Next(), in.ID, strings.TrimSpace(ch.ParentID), strings.TrimSpace(ch.Title), ch.URL, ch.Depth, idx+1)
 				}
 				return nil
 			})
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -3201,8 +3606,7 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			return
 		}
 		cnt, err := s.deps.Content.SyncBookTOC(r.Context(), bookID)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"chapter_count": cnt})
@@ -3211,12 +3615,14 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 
 	switch r.Method {
 	case http.MethodGet:
-		bk, err := sqlx.Get[domain.Book](r.Context(), s.deps.Store, `SELECT * FROM books WHERE id = ?`, bookID)
+		var bk domain.Book
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &bk, `SELECT * FROM books WHERE id = ?`, bookID)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "book not found")
 			return
 		}
-		chs, _ := sqlx.Select[domain.BookChapter](r.Context(), s.deps.Store,
+		var chs []domain.BookChapter
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &chs,
 			`SELECT * FROM book_chapters WHERE book_id = ? ORDER BY sort_order ASC`, bookID)
 		writeJSON(w, http.StatusOK, map[string]any{"book": bk, "chapters": chs})
 
@@ -3228,11 +3634,10 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 			domain.Book
 			Chapters []domain.BookChapter `json:"chapters"`
 		}
-		if !decodeJSONBody(w, r, 256*1024, &in) {
+		if !decodeJSONBody(w, r, 2<<20, &in) {
 			return
 		}
-		if err := sanitizeBookURLs(&in.Book, in.Chapters); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, sanitizeBookURLs(&in.Book, in.Chapters)) {
 			return
 		}
 		title := strings.TrimSpace(in.Title)
@@ -3260,15 +3665,14 @@ func (s *AppServer) handleAdminBooks(w http.ResponseWriter, r *http.Request, act
 				_, _ = tx.ExecContext(r.Context(), `DELETE FROM book_chapters WHERE book_id = ?`, bookID)
 				for idx, ch := range in.Chapters {
 					_, _ = tx.ExecContext(r.Context(),
-						`INSERT INTO book_chapters (id, book_id, parent_id, title, url, depth, sort_order) VALUES (?, ?, '', ?, ?, ?, ?)`,
-						id.Next(), bookID, strings.TrimSpace(ch.Title), ch.URL, ch.Depth, idx+1)
+						`INSERT INTO book_chapters (id, book_id, parent_id, title, url, depth, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+						id.Next(), bookID, strings.TrimSpace(ch.ParentID), strings.TrimSpace(ch.Title), ch.URL, ch.Depth, idx+1)
 				}
 				_, _ = tx.ExecContext(r.Context(), `UPDATE books SET chapter_count = ? WHERE id = ?`, len(in.Chapters), bookID)
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -3337,8 +3741,7 @@ func (s *AppServer) dispatchCommentModeratedHook(ctx context.Context, cmt domain
 func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "" {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+		if !requireMethod(w, r, http.MethodGet) {
 			return
 		}
 		page, perPage := parseAdminPageParams(r, 50, 250)
@@ -3412,9 +3815,9 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 
 		baseSQL := `SELECT c.* ` + joinSQL + ` WHERE ` + whereSQL + ` ORDER BY c.created_at DESC`
 		qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-		rows, err := sqlx.Select[domain.Comment](r.Context(), s.deps.Store, qSQL, fullArgs...)
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		var rows []domain.Comment
+		err := sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
+		if writeServerErr(w, err) {
 			return
 		}
 
@@ -3441,23 +3844,25 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 		if len(artIDs) > 0 {
-			aRows, _ := sqlx.Select[struct {
+			var aRows []struct {
 				ID       string `db:"id"`
 				AuthorID string `db:"author_id"`
 				Title    string `db:"title"`
 				Slug     string `db:"slug"`
-			}](r.Context(), s.deps.Store, `SELECT id, author_id, title, slug FROM articles WHERE id IN (`+strings.Join(artPH, ",")+`)`, artIDs...)
+			}
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &aRows, `SELECT id, author_id, title, slug FROM articles WHERE id IN (`+strings.Join(artPH, ",")+`)`, artIDs...)
 			for _, ar := range aRows {
 				artMeta[ar.ID] = targetMeta{AuthorID: ar.AuthorID, Title: ar.Title, Slug: ar.Slug}
 			}
 		}
 		if len(pageIDs) > 0 {
-			pRows, _ := sqlx.Select[struct {
+			var pRows []struct {
 				ID       string `db:"id"`
 				AuthorID string `db:"author_id"`
 				Title    string `db:"title"`
 				Slug     string `db:"slug"`
-			}](r.Context(), s.deps.Store, `SELECT id, author_id, title, slug FROM pages WHERE id IN (`+strings.Join(pagePH, ",")+`)`, pageIDs...)
+			}
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &pRows, `SELECT id, author_id, title, slug FROM pages WHERE id IN (`+strings.Join(pagePH, ",")+`)`, pageIDs...)
 			for _, pr := range pRows {
 				pageMeta[pr.ID] = targetMeta{AuthorID: pr.AuthorID, Title: pr.Title, Slug: pr.Slug}
 			}
@@ -3502,121 +3907,14 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if rest == "batch" && r.Method == http.MethodPost {
-		var req struct {
-			Action       string   `json:"action"`
-			IDs          []string `json:"ids"`
-			Note         string   `json:"note"`
-			ExpiresHours int      `json:"expires_hours"`
-		}
-		if !decodeJSONBody(w, r, 65536, &req) {
-			return
-		}
-		action := strings.ToLower(strings.TrimSpace(req.Action))
-		switch action {
-		case "approve", "approved":
-			action = "approve"
-		case "reject", "rejected":
-			action = "reject"
-		case "pending":
-			action = "pending"
-		case "delete":
-			action = "delete"
-		case "ban_ip", "ban-ip":
-			if !requireAdminJSON(w, actor) {
-				return
-			}
-			action = "ban_ip"
-		default:
-			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
-			return
-		}
-		ids := dedupCleanIDs(req.IDs, 200)
-		if len(ids) == 0 {
-			writeErrJSON(w, http.StatusBadRequest, "ids required")
-			return
-		}
-		comments := make([]domain.Comment, 0, len(ids))
-		for _, cid := range ids {
-			cmt, gErr := sqlx.Get[domain.Comment](r.Context(), s.deps.Store, `SELECT * FROM comments WHERE id = ?`, cid)
-			if gErr != nil {
-				continue
-			}
-			targetAuthorID := s.lookupCommentTargetAuthorID(r.Context(), cmt.TargetType, cmt.TargetID)
-			if _, authErr := authorizeAndScrubAdminComment(actor, cmt, targetAuthorID); authErr != nil {
-				writeErrJSON(w, http.StatusForbidden, authErr.Error())
-				return
-			}
-			comments = append(comments, cmt)
-		}
-		now := time.Now().UnixMilli()
-		callerIP := s.clientIP(r)
-		affected := 0
-		type targetPair struct {
-			tType string
-			tID   string
-		}
-		recountSet := make(map[targetPair]struct{})
-		for _, cmt := range comments {
-			var uErr error
-			nextModStatus := ""
-			switch action {
-			case "approve":
-				nextModStatus = domain.CommentStatusApproved
-				_, uErr = s.deps.Store.ExecContext(r.Context(),
-					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
-					domain.CommentStatusApproved, now, cmt.ID)
-			case "reject":
-				nextModStatus = domain.CommentStatusRejected
-				_, uErr = s.deps.Store.ExecContext(r.Context(),
-					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
-					domain.CommentStatusRejected, now, cmt.ID)
-			case "pending":
-				nextModStatus = domain.CommentStatusPending
-				_, uErr = s.deps.Store.ExecContext(r.Context(),
-					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
-					domain.CommentStatusPending, now, cmt.ID)
-			case "delete":
-				_, uErr = s.deps.Store.ExecContext(r.Context(),
-					`UPDATE comments SET is_deleted = ?, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
-					true, now, cmt.ID)
-			case "ban_ip":
-				targetIP := strings.TrimSpace(cmt.ClientIP)
-				if targetIP != "" && s.deps.WAF != nil {
-					note := strings.TrimSpace(req.Note)
-					if note == "" {
-						note = "comment batch moderation (" + cmt.AuthorName + ")"
-					}
-					hours := req.ExpiresHours
-					if hours <= 0 {
-						hours = 30 * 24
-					}
-					expMS := time.Now().Add(time.Duration(hours) * time.Hour).UnixMilli()
-					_, _ = s.deps.WAF.AddManualBan(r.Context(), targetIP, note, expMS, callerIP)
-				}
-				nextModStatus = domain.CommentStatusRejected
-				_, uErr = s.deps.Store.ExecContext(r.Context(),
-					`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
-					domain.CommentStatusRejected, now, cmt.ID)
-			}
-			if uErr == nil {
-				affected++
-				recountSet[targetPair{tType: cmt.TargetType, tID: cmt.TargetID}] = struct{}{}
-				if nextModStatus != "" && nextModStatus != cmt.Status {
-					s.dispatchCommentModeratedHook(r.Context(), cmt, nextModStatus)
-				}
-			}
-		}
-		for tp := range recountSet {
-			s.recountTargetComments(r.Context(), tp.tType, tp.tID)
-		}
-		s.recordAuditLog(r, actor, "comment.batch", "comment", action, map[string]any{"action": action, "affected": affected})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		s.handleAdminCommentsBatch(w, r, actor)
 		return
 	}
 
 	parts := strings.Split(rest, "/")
 	cmtID := parts[0]
-	cmt, err := sqlx.Get[domain.Comment](r.Context(), s.deps.Store, `SELECT * FROM comments WHERE id = ?`, cmtID)
+	var cmt domain.Comment
+	err := sqlx.GetInto(r.Context(), s.deps.Store, &cmt, `SELECT * FROM comments WHERE id = ?`, cmtID)
 	if err != nil {
 		writeErrJSON(w, http.StatusNotFound, "comment not found")
 		return
@@ -3745,8 +4043,7 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		_, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE comments SET status = ?, content_md = ?, updated_at = ? WHERE id = ?`,
 			nextStatus, nextContent, time.Now().UnixMilli(), cmtID)
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
@@ -3765,6 +4062,217 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *AppServer) handleAdminCommentsBatch(w http.ResponseWriter, r *http.Request, actor *domain.User) {
+	var req struct {
+		Action       string   `json:"action"`
+		IDs          []string `json:"ids"`
+		Note         string   `json:"note"`
+		ExpiresHours int      `json:"expires_hours"`
+	}
+	if !decodeJSONBody(w, r, 65536, &req) {
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	switch action {
+	case "approve", "approved":
+		action = "approve"
+	case "reject", "rejected":
+		action = "reject"
+	case "pending":
+		action = "pending"
+	case "delete":
+		action = "delete"
+	case "ban_ip", "ban-ip":
+		if !requireAdminJSON(w, actor) {
+			return
+		}
+		action = "ban_ip"
+	default:
+		writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
+		return
+	}
+	ids := dedupCleanIDs(req.IDs, 200)
+	if len(ids) == 0 {
+		writeErrJSON(w, http.StatusBadRequest, "ids required")
+		return
+	}
+
+	ctx := r.Context()
+	ph := strings.Repeat("?,", len(ids)-1) + "?"
+	idArgs := make([]any, len(ids))
+	for i, cid := range ids {
+		idArgs[i] = cid
+	}
+	var fetched []domain.Comment
+	if err := sqlx.SelectInto(ctx, s.deps.Store, &fetched, `SELECT * FROM comments WHERE id IN (`+ph+`)`, idArgs...); writeServerErr(w, err) {
+		return
+	}
+	byID := make(map[string]domain.Comment, len(fetched))
+	artIDSet := make(map[string]struct{})
+	pageIDSet := make(map[string]struct{})
+	var artArgs, pageArgs []any
+	for _, cmt := range fetched {
+		byID[cmt.ID] = cmt
+		if cmt.TargetID == "" {
+			continue
+		}
+		if cmt.TargetType == domain.TargetTypePage {
+			if _, ok := pageIDSet[cmt.TargetID]; !ok {
+				pageIDSet[cmt.TargetID] = struct{}{}
+				pageArgs = append(pageArgs, cmt.TargetID)
+			}
+		} else if cmt.TargetType == domain.TargetTypeArticle {
+			if _, ok := artIDSet[cmt.TargetID]; !ok {
+				artIDSet[cmt.TargetID] = struct{}{}
+				artArgs = append(artArgs, cmt.TargetID)
+			}
+		}
+	}
+
+	type targetOwnerRow struct {
+		ID       string `db:"id"`
+		AuthorID string `db:"author_id"`
+	}
+	artOwners := make(map[string]string, len(artArgs))
+	if len(artArgs) > 0 {
+		tph := strings.Repeat("?,", len(artArgs)-1) + "?"
+		var rows []targetOwnerRow
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT id, author_id FROM articles WHERE id IN (`+tph+`)`, artArgs...)
+		for _, row := range rows {
+			artOwners[row.ID] = row.AuthorID
+		}
+	}
+	pageOwners := make(map[string]string, len(pageArgs))
+	if len(pageArgs) > 0 {
+		tph := strings.Repeat("?,", len(pageArgs)-1) + "?"
+		var rows []targetOwnerRow
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT id, author_id FROM pages WHERE id IN (`+tph+`)`, pageArgs...)
+		for _, row := range rows {
+			pageOwners[row.ID] = row.AuthorID
+		}
+	}
+
+	comments := make([]domain.Comment, 0, len(fetched))
+	for _, cid := range ids {
+		cmt, ok := byID[cid]
+		if !ok {
+			continue
+		}
+		var targetAuthorID string
+		if cmt.TargetType == domain.TargetTypePage {
+			targetAuthorID = pageOwners[cmt.TargetID]
+		} else if cmt.TargetType == domain.TargetTypeArticle {
+			targetAuthorID = artOwners[cmt.TargetID]
+		}
+		if _, authErr := authorizeAndScrubAdminComment(actor, cmt, targetAuthorID); authErr != nil {
+			writeErrJSON(w, http.StatusForbidden, authErr.Error())
+			return
+		}
+		comments = append(comments, cmt)
+	}
+
+	now := time.Now().UnixMilli()
+	callerIP := s.clientIP(r)
+	if action == "ban_ip" && s.deps.WAF != nil {
+		hours := req.ExpiresHours
+		if hours <= 0 {
+			hours = 30 * 24
+		}
+		expMS := time.Now().Add(time.Duration(hours) * time.Hour).UnixMilli()
+		for _, cmt := range comments {
+			targetIP := strings.TrimSpace(cmt.ClientIP)
+			if targetIP == "" {
+				continue
+			}
+			note := strings.TrimSpace(req.Note)
+			if note == "" {
+				note = "comment batch moderation (" + cmt.AuthorName + ")"
+			}
+			_, _ = s.deps.WAF.AddManualBan(ctx, targetIP, note, expMS, callerIP)
+		}
+	}
+
+	type modHookItem struct {
+		cmt        domain.Comment
+		nextStatus string
+	}
+	type targetPair struct {
+		tType string
+		tID   string
+	}
+	recountSet := make(map[targetPair]struct{})
+	var hooks []modHookItem
+	affected := 0
+
+	if len(comments) > 0 {
+		txErr := s.deps.Store.WithTx(ctx, func(tx *sqlx.Tx) error {
+			for _, cmt := range comments {
+				var uErr error
+				nextModStatus := ""
+				switch action {
+				case "approve":
+					nextModStatus = domain.CommentStatusApproved
+					_, uErr = tx.ExecContext(ctx,
+						`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+						domain.CommentStatusApproved, now, cmt.ID)
+				case "reject", "ban_ip":
+					nextModStatus = domain.CommentStatusRejected
+					_, uErr = tx.ExecContext(ctx,
+						`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+						domain.CommentStatusRejected, now, cmt.ID)
+				case "pending":
+					nextModStatus = domain.CommentStatusPending
+					_, uErr = tx.ExecContext(ctx,
+						`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
+						domain.CommentStatusPending, now, cmt.ID)
+				case "delete":
+					_, uErr = tx.ExecContext(ctx,
+						`UPDATE comments SET is_deleted = ?, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
+						true, now, cmt.ID)
+				}
+				if uErr != nil {
+					return uErr
+				}
+				affected++
+				recountSet[targetPair{tType: cmt.TargetType, tID: cmt.TargetID}] = struct{}{}
+				if nextModStatus != "" && nextModStatus != cmt.Status {
+					hooks = append(hooks, modHookItem{cmt: cmt, nextStatus: nextModStatus})
+				}
+			}
+			for tp := range recountSet {
+				if rErr := s.recountTargetCommentsTx(ctx, tx, tp.tType, tp.tID); rErr != nil {
+					return rErr
+				}
+			}
+			return nil
+		})
+		if writeServerErr(w, txErr) {
+			return
+		}
+	}
+
+	for _, h := range hooks {
+		s.dispatchCommentModeratedHook(ctx, h.cmt, h.nextStatus)
+	}
+	s.recordAuditLog(r, actor, "comment.batch", "comment", action, map[string]any{"action": action, "affected": affected})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+}
+
+func (s *AppServer) recountTargetCommentsTx(ctx context.Context, tx *sqlx.Tx, targetType, targetID string) error {
+	var cnt int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comments WHERE target_type = ? AND target_id = ? AND status = 'approved' AND is_deleted = ?`,
+		targetType, targetID, false).Scan(&cnt); err != nil {
+		return err
+	}
+	if targetType == domain.TargetTypePage {
+		_, err := tx.ExecContext(ctx, `UPDATE pages SET comment_count = ? WHERE id = ?`, cnt, targetID)
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE articles SET comment_count = ? WHERE id = ?`, cnt, targetID)
+	return err
 }
 
 func (s *AppServer) recountTargetComments(ctx context.Context, targetType, targetID string) {
@@ -3849,7 +4357,8 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		}
 		assets := make([]domain.MediaAsset, 0, len(ids))
 		for _, mid := range ids {
-			asset, gErr := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, mid)
+			var asset domain.MediaAsset
+			gErr := sqlx.GetInto(r.Context(), s.deps.Store, &asset, `SELECT * FROM media_assets WHERE id = ?`, mid)
 			if gErr != nil {
 				continue
 			}
@@ -3911,8 +4420,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		} else {
 			asset, err = s.saveFallbackLocalMedia(r.Context(), actor.ID, hdr.Filename, file, maxBytes)
 		}
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		if asset != nil && asset.Width > 0 && asset.Height > 0 {
@@ -3929,8 +4437,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		}
 		clean := r.URL.Query().Get("delete") == "1" || r.URL.Query().Get("delete") == "true"
 		orphans, freed, err := s.scanOrCleanOrphans(r.Context(), clean)
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		deletedCnt := 0
@@ -3949,7 +4456,8 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	}
 
 	if rest != "" && r.Method == http.MethodPatch {
-		asset, err := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, rest)
+		var asset domain.MediaAsset
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &asset, `SELECT * FROM media_assets WHERE id = ?`, rest)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "asset not found")
 			return
@@ -3992,7 +4500,8 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	}
 
 	if rest != "" && r.Method == http.MethodDelete {
-		asset, err := sqlx.Get[domain.MediaAsset](r.Context(), s.deps.Store, `SELECT * FROM media_assets WHERE id = ?`, rest)
+		var asset domain.MediaAsset
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &asset, `SELECT * FROM media_assets WHERE id = ?`, rest)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "asset not found")
 			return

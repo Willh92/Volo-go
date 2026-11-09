@@ -55,6 +55,7 @@ func bootstrapAuthenticatedAdmin(t *testing.T, env *m5Env) ([]*http.Cookie, map[
 
 func TestFollowUp_CustomLocalUploadDirFallbackAndContainment(t *testing.T) {
 	env := setupM5TestEnv(t, "/console")
+	env.cfg.UploadDirPinned = false
 	// Wire full media.Pipeline as well to exercise dynamic SetUploadDir + LocalKeyPrefix
 	pipe := media.NewPipeline(media.PipelineOptions{
 		Store:     env.store,
@@ -560,15 +561,15 @@ func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
 
 	cookies, headers := bootstrapAuthenticatedAdmin(t, env)
 
-	// 1. Custom HTML error.html rendered across public 404, scanner trap (/.env), and post-setup /setup
+	// 1. Custom standalone frameless error.html rendered across public 404, scanner trap (/.env), and post-setup /setup
 	for _, p := range []string{"/missing-page-xyz", "/.env", "/setup"} {
 		resp, raw := doJSONReq(t, http.MethodGet, env.ts.URL+p, nil, nil, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("GET %s = %d, want 404", p, resp.StatusCode)
 		}
 		bodyStr := string(raw)
-		if !strings.Contains(bodyStr, "studio-error-card") || !strings.Contains(bodyStr, ">404<") {
-			t.Fatalf("GET %s expected custom error.html with studio-error-card and 404 badge, got: %.240s", p, bodyStr)
+		if !strings.Contains(bodyStr, "volo-err-shell") || !strings.Contains(bodyStr, "err-card") || !strings.Contains(bodyStr, ">404<") || strings.Contains(bodyStr, "studio-header") {
+			t.Fatalf("GET %s expected standalone frameless error.html with volo-err-shell, err-card, and 404 code, got: %.240s", p, bodyStr)
 		}
 	}
 
@@ -580,11 +581,11 @@ func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
 		t.Fatalf("PATCH dynamic_login_path=vault failed: %d %s", secResp.StatusCode, string(secRaw))
 	}
 	cloakResp, cloakRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/console", nil, nil, nil)
-	if cloakResp.StatusCode != http.StatusNotFound || !strings.Contains(string(cloakRaw), "studio-error-card") {
-		t.Fatalf("GET /console when cloaked expected 404 custom error.html, got %d: %.200s", cloakResp.StatusCode, string(cloakRaw))
+	if cloakResp.StatusCode != http.StatusNotFound || !strings.Contains(string(cloakRaw), "volo-err-shell") {
+		t.Fatalf("GET /console when cloaked expected 404 standalone error.html, got %d: %.200s", cloakResp.StatusCode, string(cloakRaw))
 	}
 
-	// 3. External theme (volo-journal) 404 must render custom error page with volo-journal skin
+	// 3. External theme (volo-journal) 404 must render standalone custom error page with volo-journal skin
 	appResp, appRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/appearance", map[string]any{
 		"active_theme": "volo-journal",
 	}, cookies, headers)
@@ -593,7 +594,7 @@ func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
 	}
 	jResp, jRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/journal-missing-route", nil, nil, nil)
 	jStr := string(jRaw)
-	if jResp.StatusCode != http.StatusNotFound || !strings.Contains(jStr, `data-volo-skin="volo-journal"`) || !strings.Contains(jStr, "studio-error-card") {
+	if jResp.StatusCode != http.StatusNotFound || !strings.Contains(jStr, `data-volo-skin="volo-journal"`) || !strings.Contains(jStr, "volo-err-shell") {
 		t.Fatalf("GET /journal-missing-route expected 404 volo-journal custom error page, got %d: %.240s", jResp.StatusCode, jStr)
 	}
 
@@ -615,7 +616,7 @@ func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
 			t.Fatalf("GET %s = %d, want %d", apiCase.path, aResp.StatusCode, apiCase.wantStatus)
 		}
 		ct := strings.ToLower(aResp.Header.Get("Content-Type"))
-		if !strings.Contains(ct, "application/json") || strings.Contains(string(aRaw), "studio-error-card") {
+		if !strings.Contains(ct, "application/json") || strings.Contains(string(aRaw), "volo-err-shell") {
 			t.Fatalf("GET %s expected JSON error (got Content-Type=%q, body=%.160s)", apiCase.path, ct, string(aRaw))
 		}
 	}
@@ -644,11 +645,11 @@ func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
 	}
 	banPageResp, banPageRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, extHeaders)
 	banPageStr := string(banPageRaw)
-	if banPageResp.StatusCode != http.StatusForbidden || !strings.Contains(banPageStr, "studio-error-card") || !strings.Contains(banPageStr, ">403<") {
-		t.Fatalf("banned external IP GET / expected 403 custom error.html, got %d: %.240s", banPageResp.StatusCode, banPageStr)
+	if banPageResp.StatusCode != http.StatusForbidden || !strings.Contains(banPageStr, "volo-err-shell") || !strings.Contains(banPageStr, ">403<") {
+		t.Fatalf("banned external IP GET / expected 403 standalone error.html, got %d: %.240s", banPageResp.StatusCode, banPageStr)
 	}
 	banAPIResp, banAPIRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/site", nil, nil, extHeaders)
-	if banAPIResp.StatusCode != http.StatusForbidden || !strings.Contains(strings.ToLower(banAPIResp.Header.Get("Content-Type")), "application/json") || strings.Contains(string(banAPIRaw), "studio-error-card") {
+	if banAPIResp.StatusCode != http.StatusForbidden || !strings.Contains(strings.ToLower(banAPIResp.Header.Get("Content-Type")), "application/json") || strings.Contains(string(banAPIRaw), "volo-err-shell") {
 		t.Fatalf("banned external IP GET /api/v1/site expected 403 JSON, got %d (%s)", banAPIResp.StatusCode, string(banAPIRaw))
 	}
 
@@ -673,8 +674,8 @@ func TestCustomErrorPagesAnd404RiskControl(t *testing.T) {
 		rResp, rRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, rateExtHeaders)
 		if rResp.StatusCode == http.StatusTooManyRequests {
 			rStr := string(rRaw)
-			if !strings.Contains(rStr, "studio-error-card") || !strings.Contains(rStr, ">429<") {
-				t.Fatalf("WAF 429 page expected studio-error-card and 429 badge, got: %.240s", rStr)
+			if !strings.Contains(rStr, "volo-err-shell") || !strings.Contains(rStr, ">429<") {
+				t.Fatalf("WAF 429 page expected volo-err-shell and 429 badge, got: %.240s", rStr)
 			}
 			got429 = true
 			break
@@ -742,4 +743,3 @@ func TestFollowUp_PermissionsPolicyLegacyImageShimAndIPBanReasonSearch(t *testin
 		t.Fatalf("expected reason_code search to find 198.51.100.201/32, got %d: %s", qResp.StatusCode, string(qRaw))
 	}
 }
-

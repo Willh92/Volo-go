@@ -28,7 +28,7 @@
                 </div>
               {{end}}
             {{else}}
-              <p class="studio-muted-empty studio-follow-empty">{{if hasPrefix $.Locale "en"}}No feed updates yet.{{else if eq $.Locale "zh-TW"}}暫無訂閱動態{{else}}暂无订阅动态{{end}}</p>
+              <p class="studio-muted-empty studio-follow-empty">{{t $.Locale "follows.no_updates"}}</p>
             {{end}}
           </div>
         </section>

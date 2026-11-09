@@ -1,9 +1,13 @@
 .git
 .github
 data
-dist
+dist/
 volo
 volo.exe
+*.tar.gz
+*.zip
+*.bak
+.DS_Store
 *.db
 *.db-shm
 *.db-wal

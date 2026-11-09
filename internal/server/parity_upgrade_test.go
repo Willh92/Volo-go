@@ -234,9 +234,9 @@ func TestParityUpgrades_Password6_BrandIcon_Locales_Themes_Analytics(t *testing.
 	_ = json.Unmarshal(catBody, &createdCat)
 
 	artResp, artBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/articles", map[string]any{
-		"title":        "Protected Architecture Note",
-		"slug":         "protected-arch-note",
-		"content_md":   "Confidential design details.",
+		"title":       "Protected Architecture Note",
+		"slug":        "protected-arch-note",
+		"content_md":  "Confidential design details.",
 		"status":      "published",
 		"category_id": createdCat.Category.ID,
 		"password":    "secret",
@@ -503,4 +503,3 @@ func TestUXAndAdminModalCRUDParity(t *testing.T) {
 		t.Fatalf("GET /logout?redirect=/archives expected 303 -> /archives, got %d -> %q", logoutResp.StatusCode, logoutResp.Header.Get("Location"))
 	}
 }
-

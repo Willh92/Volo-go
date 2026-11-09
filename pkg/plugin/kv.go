@@ -15,7 +15,7 @@ import (
 
 const (
 	MaxKVKeyBytes       = 191
-	MaxKVValueBytes     = 64 * 1024 // 64 KiB per value
+	MaxKVValueBytes     = 512 * 1024 // 512 KiB per value (supports lexicon/dictionary payloads)
 	MaxKVKeysPerPlugin  = 1000
 	maxKVListLimit      = 200
 	defaultKVListLimit  = 50

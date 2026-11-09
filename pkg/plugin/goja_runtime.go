@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/i18n"
@@ -28,6 +29,7 @@ const (
 	defaultVMStackLimit     = 512
 	defaultVMPoolCap        = 4
 	defaultVMMaxConcurrency = 8
+	maxPooledVMUses         = 1000
 	maxPluginFetchBodyBytes = 1 << 20 // 1 MiB cap on outbound HTTP responses
 	maxPluginRateLimitKeys  = 2048
 )
@@ -36,11 +38,15 @@ const (
 var ErrExecutionTimeout = errors.New("plugin: execution interrupted due to timeout")
 
 type pooledVM struct {
-	vm           *jsRuntime
-	exports      *jsObject
-	hookHandlers map[string][]*jsFunc
-	hooksFrozen  bool
-	reqCtx       context.Context
+	vm                *jsRuntime
+	exports           *jsObject
+	hookHandlers      map[string][]*jsFunc
+	directiveHandlers map[string]*jsFunc
+	federationPublish *jsFunc
+	federationDeliver *jsFunc
+	hooksFrozen       bool
+	uses              int
+	reqCtx            context.Context
 }
 
 type pluginRateBucket struct {
@@ -50,16 +56,19 @@ type pluginRateBucket struct {
 }
 
 type gojaPluginRuntime struct {
-	manifest    Manifest
-	pluginDir   string
-	program     *jsProgram
-	localI18n   map[string]map[string]string
-	kv          *KVStore
-	logger      *PluginLogger
-	hostI18n    *i18n.Catalog
-	getConfig   func() map[string]any
-	getSiteInfo func() map[string]any
-	httpClient  *http.Client
+	manifest     Manifest
+	pluginDir    string
+	program      *jsProgram
+	localI18n    map[string]map[string]string
+	kv           *KVStore
+	logger       *PluginLogger
+	hostI18n     *i18n.Catalog
+	getConfig    func() map[string]any
+	unsealSecret func(string) string
+	getSiteInfo  func() map[string]any
+	httpClient   *http.Client
+
+	vmCreatedCount atomic.Uint64
 
 	rateMu      sync.Mutex
 	rateBuckets map[string]pluginRateBucket
@@ -75,6 +84,7 @@ type gojaRuntimeOptions struct {
 	logger                *PluginLogger
 	hostI18n              *i18n.Catalog
 	getConfig             func() map[string]any
+	unsealSecret          func(string) string
 	getSiteInfo           func() map[string]any
 	customResolver        security.ResolverFunc
 	allowLoopbackForTests bool
@@ -117,19 +127,20 @@ func newGojaPluginRuntime(opts gojaRuntimeOptions) (*gojaPluginRuntime, error) {
 	}
 
 	rt := &gojaPluginRuntime{
-		manifest:    opts.manifest,
-		pluginDir:   realPluginDir,
-		program:     prog,
-		localI18n:   localDicts,
-		kv:          opts.kv,
-		logger:      opts.logger,
-		hostI18n:    opts.hostI18n,
-		getConfig:   opts.getConfig,
-		getSiteInfo: opts.getSiteInfo,
-		httpClient:  httpClient,
-		rateBuckets: make(map[string]pluginRateBucket),
-		pool:        make(chan *pooledVM, defaultVMPoolCap),
-		sem:         make(chan struct{}, defaultVMMaxConcurrency),
+		manifest:     opts.manifest,
+		pluginDir:    realPluginDir,
+		program:      prog,
+		localI18n:    localDicts,
+		kv:           opts.kv,
+		logger:       opts.logger,
+		hostI18n:     opts.hostI18n,
+		getConfig:    opts.getConfig,
+		unsealSecret: opts.unsealSecret,
+		getSiteInfo:  opts.getSiteInfo,
+		httpClient:   httpClient,
+		rateBuckets:  make(map[string]pluginRateBucket),
+		pool:         make(chan *pooledVM, defaultVMPoolCap),
+		sem:          make(chan struct{}, defaultVMMaxConcurrency),
 	}
 
 	// Smoke-initialize one VM immediately so top-level runtime errors or infinite loops fail on load.
@@ -196,13 +207,22 @@ func applyPlaceholders(tmpl string, vars map[string]any) string {
 	return strings.NewReplacer(pairs...).Replace(tmpl)
 }
 
+func (r *gojaPluginRuntime) resolveRuntimeConfigValue(v any) any {
+	if s, ok := v.(string); ok && strings.HasPrefix(s, "v1:") && r.unsealSecret != nil {
+		return r.unsealSecret(s)
+	}
+	return v
+}
+
 func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
+	r.vmCreatedCount.Add(1)
 	vm := newJSRuntime()
 	vm.SetMaxCallStackSize(defaultVMStackLimit)
 
 	wrapper := &pooledVM{
-		vm:           vm,
-		hookHandlers: make(map[string][]*jsFunc),
+		vm:                vm,
+		hookHandlers:      make(map[string][]*jsFunc),
+		directiveHandlers: make(map[string]*jsFunc),
 	}
 
 	// Inject safe console object wired to isolated JSONL plugin logger.
@@ -252,19 +272,66 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 		return jsUndefinedVal, nil
 	}))
 
+	if r.manifest.HasRenderCapability() {
+		voloObj.setVal("registerDirective", nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if wrapper.hooksFrozen {
+				return rt.throwValErr("TypeError", "volo.registerDirective can only be called during top-level module initialization")
+			}
+			if len(args) < 2 {
+				return rt.throwValErr("TypeError", "volo.registerDirective requires (name, handlerFn)")
+			}
+			dirName := strings.ToLower(strings.TrimSpace(args[0].toString()))
+			if dirName == "" || dirName == "lock" || args[1].kind != valFunc || args[1].fn == nil {
+				return rt.throwValErr("TypeError", "volo.registerDirective requires a valid directive name and function handler")
+			}
+			wrapper.directiveHandlers[dirName] = args[1].fn
+			return jsUndefinedVal, nil
+		}))
+	}
+
+	if r.manifest.HasFederationCapability() {
+		regFedFn := nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if wrapper.hooksFrozen {
+				return rt.throwValErr("TypeError", "volo.registerFederation can only be called during top-level module initialization")
+			}
+			if len(args) < 1 {
+				return rt.throwValErr("TypeError", "volo.registerFederation requires a provider object or function")
+			}
+			if args[0].kind == valFunc && args[0].fn != nil {
+				wrapper.federationPublish = args[0].fn
+				wrapper.federationDeliver = args[0].fn
+				return jsUndefinedVal, nil
+			}
+			if args[0].kind == valObject && args[0].obj != nil {
+				if pub := args[0].obj.get("publish"); pub.kind == valFunc && pub.fn != nil {
+					wrapper.federationPublish = pub.fn
+				}
+				if deliv := args[0].obj.get("deliver"); deliv.kind == valFunc && deliv.fn != nil {
+					wrapper.federationDeliver = deliv.fn
+				}
+				if wrapper.federationPublish == nil && wrapper.federationDeliver == nil {
+					return rt.throwValErr("TypeError", "federation provider must define publish or deliver function")
+				}
+				return jsUndefinedVal, nil
+			}
+			return rt.throwValErr("TypeError", "volo.registerFederation requires a provider object or function")
+		})
+		voloObj.setVal("registerFederation", regFedFn)
+	}
+
 	cfgObj := vm.NewObject()
 	cfgObj.Set("get", func(key string) any {
 		cfg := r.getConfig()
 		if cfg == nil {
 			return nil
 		}
-		return cfg[key]
+		return r.resolveRuntimeConfigValue(cfg[key])
 	})
 	cfgObj.Set("all", func() map[string]any {
 		cfg := r.getConfig()
 		out := make(map[string]any, len(cfg))
 		for k, v := range cfg {
-			out[k] = v
+			out[k] = r.resolveRuntimeConfigValue(v)
 		}
 		return out
 	})
@@ -395,8 +462,44 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 				}
 				return r.kv.IncrBy(wrapper.activeCtx(), key, delta, ttlSec)
 			})
+			kvBridge.Set("clear", func() (bool, error) {
+				if cErr := ClearPluginKV(wrapper.activeCtx(), r.kv.store, r.manifest.ID); cErr != nil {
+					return false, cErr
+				}
+				return true, nil
+			})
 		}
 		voloObj.Set("kv", kvBridge)
+	}
+
+	// Sandboxed read-only package asset reader (strictly confined to r.pluginDir, <= 2 MiB, e.g. lexicon dictionaries).
+	if r.pluginDir != "" {
+		readTextFn := func(relPath string) (string, error) {
+			raw, rErr := r.readPluginAsset(relPath)
+			if rErr != nil {
+				return "", rErr
+			}
+			return string(raw), nil
+		}
+		assetsBridge := vm.NewObject()
+		assetsBridge.Set("readText", readTextFn)
+		assetsBridge.Set("readJSON", func(relPath string) (any, error) {
+			raw, rErr := r.readPluginAsset(relPath)
+			if rErr != nil {
+				return nil, rErr
+			}
+			var parsed any
+			if uErr := json.Unmarshal(raw, &parsed); uErr != nil {
+				return nil, fmt.Errorf("plugin asset %q: invalid JSON: %w", relPath, uErr)
+			}
+			return parsed, nil
+		})
+		assetsBridge.Set("exists", func(relPath string) bool {
+			_, rErr := r.resolvePluginAssetPath(relPath)
+			return rErr == nil
+		})
+		voloObj.Set("readAsset", readTextFn)
+		voloObj.Set("assets", assetsBridge)
 	}
 
 	// Capability 2: Outbound SSRF-safe HTTP client (ONLY injected if allowed_hosts / http.outbound:<host> declared).
@@ -524,19 +627,23 @@ func (r *gojaPluginRuntime) hasCallable(fnName string) bool {
 		pvm = created
 	}
 	defer func() {
-		select {
-		case r.pool <- pvm:
-		default:
+		if pvm.uses < maxPooledVMUses {
+			select {
+			case r.pool <- pvm:
+			default:
+			}
 		}
 	}()
 	_, ok := resolveCallable(pvm.vm, pvm.exports, fnName)
 	return ok
 }
 
-// invoke borrows or creates a sandboxed JS VM, calls fnName (from module.exports or global scope,
-// plus registered volo.on(hookName, fn) listeners when fnName == "onHook") under strict timeout +
-// stack limit + panic recovery, and recycles the VM only if healthy.
-func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, fnName string, args ...any) (out any, found bool, err error) {
+func (r *gojaPluginRuntime) withPooledVM(
+	ctx context.Context,
+	timeout time.Duration,
+	stage string,
+	run func(pvm *pooledVM) (out any, found bool, tainted bool, callErr error),
+) (out any, found bool, err error) {
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
@@ -557,15 +664,16 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 		}
 		pvm = created
 	}
+	pvm.uses++
 
 	tainted := false
 	defer func() {
 		if rec := recover(); rec != nil {
 			tainted = true
-			err = fmt.Errorf("plugin %q: panic in %s: %v", r.manifest.ID, fnName, rec)
+			err = fmt.Errorf("plugin %q: panic in %s: %v", r.manifest.ID, stage, rec)
 		}
 		pvm.reqCtx = nil
-		if !tainted && err == nil {
+		if !tainted && err == nil && pvm.uses < maxPooledVMUses {
 			select {
 			case r.pool <- pvm:
 			default:
@@ -576,24 +684,6 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 	vm := pvm.vm
 	vm.ClearInterrupt()
 	pvm.reqCtx = ctx
-
-	callable, ok := resolveCallable(vm, pvm.exports, fnName)
-	var extraHookHandlers []*jsFunc
-	var hookName string
-	if fnName == "onHook" && len(args) >= 1 {
-		if hn, hOk := args[0].(string); hOk && hn != "" && len(pvm.hookHandlers) > 0 {
-			hookName = hn
-			if hs := pvm.hookHandlers[hn]; len(hs) > 0 {
-				extraHookHandlers = append(extraHookHandlers, hs...)
-			}
-			if star := pvm.hookHandlers["*"]; len(star) > 0 {
-				extraHookHandlers = append(extraHookHandlers, star...)
-			}
-		}
-	}
-	if !ok && len(extraHookHandlers) == 0 {
-		return nil, false, nil
-	}
 
 	var intMu sync.Mutex
 	finished := false
@@ -626,47 +716,287 @@ func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, f
 		close(done)
 	}()
 
-	var lastRes = jsUndefinedVal
-	var curPayloadVal = jsUndefinedVal
-	if len(args) >= 2 {
-		curPayloadVal = vm.ToValue(args[1])
-	}
+	out, found, tainted, err = run(pvm)
+	return out, found, err
+}
 
-	if ok {
-		jsArgs := make([]jsValue, len(args))
-		for i, a := range args {
-			jsArgs[i] = vm.ToValue(a)
+// invoke borrows or creates a sandboxed JS VM, calls fnName (from module.exports or global scope,
+// plus registered volo.on(hookName, fn) listeners when fnName == "onHook") under strict timeout +
+// stack limit + panic recovery, and recycles the VM only if healthy and uses < 1000.
+func (r *gojaPluginRuntime) invoke(ctx context.Context, timeout time.Duration, fnName string, args ...any) (out any, found bool, err error) {
+	return r.withPooledVM(ctx, timeout, fnName, func(pvm *pooledVM) (any, bool, bool, error) {
+		vm := pvm.vm
+		callable, ok := resolveCallable(vm, pvm.exports, fnName)
+		var extraHookHandlers []*jsFunc
+		var hookName string
+		if fnName == "onHook" && len(args) >= 1 {
+			if hn, hOk := args[0].(string); hOk && hn != "" {
+				hookName = hn
+				if pvm.exports != nil {
+					if hooksVal := pvm.exports.get("hooks"); hooksVal.kind == valObject && hooksVal.obj != nil {
+						if hFn := hooksVal.obj.get(hn); hFn.kind == valFunc && hFn.fn != nil {
+							extraHookHandlers = append(extraHookHandlers, hFn.fn)
+						}
+					}
+				}
+				if len(pvm.hookHandlers) > 0 {
+					if hs := pvm.hookHandlers[hn]; len(hs) > 0 {
+						extraHookHandlers = append(extraHookHandlers, hs...)
+					}
+					if star := pvm.hookHandlers["*"]; len(star) > 0 {
+						extraHookHandlers = append(extraHookHandlers, star...)
+					}
+				}
+			}
 		}
-		res, callErr := vm.callFunc(callable, jsUndefinedVal, jsArgs)
-		if callErr != nil {
-			tainted = true
-			return nil, true, normalizeJSError(r.manifest.ID, fnName, callErr)
+		if !ok && len(extraHookHandlers) == 0 {
+			return nil, false, false, nil
 		}
-		if res.kind != valUndefined && res.kind != valNull {
-			lastRes = res
-			if fnName == "onHook" {
+
+		var lastRes = jsUndefinedVal
+		var curPayloadVal = jsUndefinedVal
+		if len(args) >= 2 {
+			curPayloadVal = vm.ToValue(args[1])
+		}
+
+		if ok {
+			jsArgs := make([]jsValue, len(args))
+			for i, a := range args {
+				jsArgs[i] = vm.ToValue(a)
+			}
+			res, callErr := vm.callFunc(callable, jsUndefinedVal, jsArgs)
+			if callErr != nil {
+				return nil, true, true, normalizeJSError(r.manifest.ID, fnName, callErr)
+			}
+			if res.kind != valUndefined && res.kind != valNull {
+				lastRes = res
+				if fnName == "onHook" {
+					curPayloadVal = res
+				}
+			}
+		}
+
+		for _, handlerFn := range extraHookHandlers {
+			hArgs := []jsValue{curPayloadVal, {kind: valString, str: hookName}}
+			res, callErr := vm.callFunc(handlerFn, jsUndefinedVal, hArgs)
+			if callErr != nil {
+				return nil, true, true, normalizeJSError(r.manifest.ID, fnName+":"+hookName, callErr)
+			}
+			if res.kind != valUndefined && res.kind != valNull {
+				lastRes = res
 				curPayloadVal = res
 			}
 		}
-	}
 
-	for _, handlerFn := range extraHookHandlers {
-		hArgs := []jsValue{curPayloadVal, {kind: valString, str: hookName}}
-		res, callErr := vm.callFunc(handlerFn, jsUndefinedVal, hArgs)
-		if callErr != nil {
-			tainted = true
-			return nil, true, normalizeJSError(r.manifest.ID, fnName+":"+hookName, callErr)
+		if lastRes.kind == valUndefined || lastRes.kind == valNull {
+			return nil, true, false, nil
 		}
-		if res.kind != valUndefined && res.kind != valNull {
-			lastRes = res
-			curPayloadVal = res
-		}
-	}
+		return lastRes.Export(), true, false, nil
+	})
+}
 
-	if lastRes.kind == valUndefined || lastRes.kind == valNull {
-		return nil, true, nil
+// invokeDirective invokes a registered custom markdown directive handler (`volo.registerDirective` or `hooks["render.directive"]`).
+func (r *gojaPluginRuntime) invokeDirective(
+	ctx context.Context,
+	timeout time.Duration,
+	name string,
+	attrs map[string]string,
+	body string,
+) (string, bool, error) {
+	normName := strings.ToLower(strings.TrimSpace(name))
+	if normName == "" || normName == "lock" {
+		return "", false, nil
 	}
-	return lastRes.Export(), true, nil
+	raw, found, err := r.withPooledVM(ctx, timeout, "directive:"+normName, func(pvm *pooledVM) (any, bool, bool, error) {
+		vm := pvm.vm
+		var handlers []*jsFunc
+		if fn := pvm.directiveHandlers[normName]; fn != nil {
+			handlers = append(handlers, fn)
+		}
+		if len(handlers) == 0 && pvm.exports != nil {
+			if dirObj := pvm.exports.get("directives"); dirObj.kind == valObject && dirObj.obj != nil {
+				if fnVal := dirObj.obj.get(normName); fnVal.kind == valFunc && fnVal.fn != nil {
+					handlers = append(handlers, fnVal.fn)
+				}
+			}
+			if hooksObj := pvm.exports.get("hooks"); hooksObj.kind == valObject && hooksObj.obj != nil {
+				if fnVal := hooksObj.obj.get(HookRenderDirective); fnVal.kind == valFunc && fnVal.fn != nil {
+					handlers = append(handlers, fnVal.fn)
+				}
+			}
+		}
+		if len(handlers) == 0 {
+			if hs := pvm.hookHandlers[HookRenderDirective]; len(hs) > 0 {
+				handlers = append(handlers, hs...)
+			}
+		}
+		var onHookFn *jsFunc
+		if len(handlers) == 0 {
+			if fn, ok := resolveCallable(vm, pvm.exports, "renderDirective"); ok {
+				handlers = append(handlers, fn)
+			} else if fn, ok := resolveCallable(vm, pvm.exports, "onHook"); ok {
+				onHookFn = fn
+			}
+		}
+		if len(handlers) == 0 && onHookFn == nil {
+			return nil, false, false, nil
+		}
+
+		attrsCopy := make(map[string]string, len(attrs))
+		for k, v := range attrs {
+			attrsCopy[k] = v
+		}
+		ctxArg := vm.ToValue(map[string]any{
+			"name":  normName,
+			"attrs": attrsCopy,
+			"body":  body,
+		})
+
+		if onHookFn != nil {
+			res, callErr := vm.callFunc(onHookFn, jsUndefinedVal, []jsValue{{kind: valString, str: HookRenderDirective}, ctxArg})
+			if callErr != nil {
+				return nil, true, true, normalizeJSError(r.manifest.ID, "directive:"+normName, callErr)
+			}
+			if res.kind == valUndefined || res.kind == valNull {
+				return nil, false, false, nil
+			}
+			return res.Export(), true, false, nil
+		}
+
+		for _, fn := range handlers {
+			res, callErr := vm.callFunc(fn, jsUndefinedVal, []jsValue{ctxArg})
+			if callErr != nil {
+				return nil, true, true, normalizeJSError(r.manifest.ID, "directive:"+normName, callErr)
+			}
+			if res.kind != valUndefined && res.kind != valNull {
+				return res.Export(), true, false, nil
+			}
+		}
+		return nil, false, false, nil
+	})
+	if err != nil {
+		return "", false, err
+	}
+	if !found || raw == nil {
+		return "", false, nil
+	}
+	switch v := raw.(type) {
+	case string:
+		return v, true, nil
+	case map[string]any:
+		if h, ok := v["html"].(string); ok {
+			return h, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// invokeFederation invokes a federation provider's publish / deliver handler under strict timeout and panic recovery.
+func (r *gojaPluginRuntime) invokeFederation(
+	ctx context.Context,
+	timeout time.Duration,
+	action string,
+	articlePayload map[string]any,
+) (any, bool, error) {
+	normAction := strings.ToLower(strings.TrimSpace(action))
+	if normAction == "" {
+		normAction = "publish"
+	}
+	return r.withPooledVM(ctx, timeout, "federation:"+normAction, func(pvm *pooledVM) (any, bool, bool, error) {
+		vm := pvm.vm
+		var targetFn *jsFunc
+		wantDeliver := normAction == "deliver"
+
+		if wantDeliver {
+			targetFn = pvm.federationDeliver
+			if targetFn == nil {
+				targetFn = pvm.federationPublish
+			}
+		} else {
+			targetFn = pvm.federationPublish
+			if targetFn == nil {
+				targetFn = pvm.federationDeliver
+			}
+		}
+
+		if targetFn == nil && pvm.exports != nil {
+			if fedObj := pvm.exports.get("federation"); fedObj.kind == valObject && fedObj.obj != nil {
+				primary, secondary := "publish", "deliver"
+				if wantDeliver {
+					primary, secondary = "deliver", "publish"
+				}
+				if fnVal := fedObj.obj.get(primary); fnVal.kind == valFunc && fnVal.fn != nil {
+					targetFn = fnVal.fn
+				} else if fnVal := fedObj.obj.get(secondary); fnVal.kind == valFunc && fnVal.fn != nil {
+					targetFn = fnVal.fn
+				}
+			}
+		}
+		if targetFn == nil {
+			candidates := []string{"publish", "deliver", "federationPublish", "federationDeliver", "publishFederation", "deliverFederation"}
+			if wantDeliver {
+				candidates = []string{"deliver", "publish", "federationDeliver", "federationPublish", "deliverFederation", "publishFederation"}
+			}
+			for _, cand := range candidates {
+				if fn, ok := resolveCallable(vm, pvm.exports, cand); ok {
+					targetFn = fn
+					break
+				}
+			}
+		}
+		if targetFn == nil && pvm.exports != nil {
+			if hooksObj := pvm.exports.get("hooks"); hooksObj.kind == valObject && hooksObj.obj != nil {
+				for _, hk := range []string{"federation." + normAction, "federation.publish", "federation.deliver"} {
+					if fnVal := hooksObj.obj.get(hk); fnVal.kind == valFunc && fnVal.fn != nil {
+						targetFn = fnVal.fn
+						break
+					}
+				}
+			}
+		}
+		if targetFn == nil && len(pvm.hookHandlers) > 0 {
+			for _, hk := range []string{"federation." + normAction, "federation.publish", "federation.deliver", "federation.*"} {
+				if hs := pvm.hookHandlers[hk]; len(hs) > 0 {
+					targetFn = hs[0]
+					break
+				}
+			}
+		}
+
+		ev := make(map[string]any, len(articlePayload)+2)
+		for k, v := range articlePayload {
+			ev[k] = v
+		}
+		ev["action"] = normAction
+		if _, hasArticle := ev["article"]; !hasArticle {
+			ev["article"] = articlePayload
+		}
+		jsEv := vm.ToValue(ev)
+		jsAct := jsValue{kind: valString, str: normAction}
+
+		if targetFn != nil {
+			res, callErr := vm.callFunc(targetFn, jsUndefinedVal, []jsValue{jsEv, jsAct})
+			if callErr != nil {
+				return nil, true, true, normalizeJSError(r.manifest.ID, "federation:"+normAction, callErr)
+			}
+			if res.kind == valUndefined || res.kind == valNull {
+				return nil, true, false, nil
+			}
+			return res.Export(), true, false, nil
+		}
+
+		if onHookFn, ok := resolveCallable(vm, pvm.exports, "onHook"); ok {
+			res, callErr := vm.callFunc(onHookFn, jsUndefinedVal, []jsValue{{kind: valString, str: "federation." + normAction}, jsEv})
+			if callErr != nil {
+				return nil, true, true, normalizeJSError(r.manifest.ID, "federation:"+normAction, callErr)
+			}
+			if res.kind == valUndefined || res.kind == valNull {
+				return nil, true, false, nil
+			}
+			return res.Export(), true, false, nil
+		}
+		return nil, false, false, nil
+	})
 }
 
 func resolveCallable(vm *jsRuntime, exports *jsObject, fnName string) (*jsFunc, bool) {
@@ -746,6 +1076,58 @@ func (r *gojaPluginRuntime) checkRateLimit(key string, maxCount int, windowSec i
 	b.count++
 	r.rateBuckets[key] = b
 	return true
+}
+
+const maxPluginAssetReadBytes = 2 << 20 // 2 MiB cap for bundled lexicon/asset files
+
+func (r *gojaPluginRuntime) resolvePluginAssetPath(relPath string) (string, error) {
+	cleanRel := strings.TrimSpace(relPath)
+	if cleanRel == "" || strings.ContainsRune(cleanRel, '\x00') {
+		return "", errors.New("plugin asset: empty or invalid path")
+	}
+	slashPath := filepath.FromSlash(strings.TrimPrefix(cleanRel, "./"))
+	if filepath.IsAbs(slashPath) || strings.HasPrefix(slashPath, "..") {
+		return "", fmt.Errorf("plugin asset %q: path escapes plugin directory", relPath)
+	}
+	joined := filepath.Join(r.pluginDir, slashPath)
+	realTarget, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		return "", fmt.Errorf("plugin asset %q: %w", relPath, err)
+	}
+	if realTarget == r.pluginDir || !isSubPath(r.pluginDir, realTarget) {
+		return "", fmt.Errorf("plugin asset %q: path escapes plugin directory", relPath)
+	}
+	st, err := os.Stat(realTarget)
+	if err != nil {
+		return "", fmt.Errorf("plugin asset %q: %w", relPath, err)
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("plugin asset %q: not a regular file", relPath)
+	}
+	if st.Size() > maxPluginAssetReadBytes {
+		return "", fmt.Errorf("plugin asset %q: exceeds %d byte limit", relPath, maxPluginAssetReadBytes)
+	}
+	return realTarget, nil
+}
+
+func (r *gojaPluginRuntime) readPluginAsset(relPath string) ([]byte, error) {
+	realTarget, err := r.resolvePluginAssetPath(relPath)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(realTarget)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxPluginAssetReadBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxPluginAssetReadBytes {
+		return nil, fmt.Errorf("plugin asset %q: exceeds %d byte limit", relPath, maxPluginAssetReadBytes)
+	}
+	return raw, nil
 }
 
 func isSubPath(rootReal string, targetReal string) bool {

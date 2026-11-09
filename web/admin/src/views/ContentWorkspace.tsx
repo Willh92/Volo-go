@@ -171,6 +171,9 @@ export function ContentWorkspace({
   const [subTotal, setSubTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const reqSeqRef = useRef(0);
+  const pageLoadSeqRef = useRef(0);
+  const chapLoadSeqRef = useRef(0);
+  const savingPageRef = useRef(false);
 
   // Pages (list + full-width Studio Page Editor + LocalDraft + Theme Templates)
   const [pages, setPages] = useState<any[]>([]);
@@ -232,6 +235,8 @@ export function ContentWorkspace({
   const debouncedBookQuery = useDebouncedValue(bookQuery, 250);
   const [bookModalOpen, setBookModalOpen] = useState(false);
   const [bookForm, setBookForm] = useState({ ...EMPTY_BOOK });
+  const [bookSeriesOpts, setBookSeriesOpts] = useState<any[] | null>(null);
+  const [seriesLabels, setSeriesLabels] = useState<Record<string, string>>({});
   const [swappingBook, setSwappingBook] = useState(false);
   const bookFlip = useFlipList<HTMLTableSectionElement>();
   const [chapModalOpen, setChapModalOpen] = useState(false);
@@ -313,11 +318,14 @@ export function ContentWorkspace({
   useEffect(() => {
     if (sub !== "pages") return;
     let cancelled = false;
-    apiFetch<{ items?: any[]; active_theme?: string }>(`/api/admin/themes?locale=${encodeURIComponent(localeSig.value)}`)
+    apiFetch<{ themes?: any[]; items?: any[]; active_theme?: string; appearance?: { active_theme?: string } }>(
+      `/api/admin/themes?locale=${encodeURIComponent(localeSig.value)}`,
+    )
       .then((res) => {
         if (cancelled) return;
-        const list = res.items || [];
-        const active = list.find((th: any) => th.active || th.id === res.active_theme) || list[0];
+        const list = res.themes || res.items || [];
+        const activeId = res.appearance?.active_theme || res.active_theme;
+        const active = list.find((th: any) => th.active || th.id === activeId) || list[0];
         const rawTpls = active?.localized_page_templates || active?.page_templates || [];
         const parsed: Array<{ value: string; label: string }> = [];
         if (Array.isArray(rawTpls)) {
@@ -681,6 +689,7 @@ export function ContentWorkspace({
   };
 
   const openNewPageEditor = async () => {
+    const seq = ++pageLoadSeqRef.current;
     dirtyEditorSig.value = false;
     setEditPage({
       title: "",
@@ -696,6 +705,7 @@ export function ContentWorkspace({
     setPageEditorOpen(true);
     resetConsoleScroll();
     const saved = await loadLocalDraft("page:new");
+    if (seq !== pageLoadSeqRef.current) return;
     if (saved && (saved.title || saved.content_md)) {
       setPendingPageDraft(saved);
     } else {
@@ -704,14 +714,17 @@ export function ContentWorkspace({
   };
 
   const openExistingPageEditor = async (pageId: string) => {
+    const seq = ++pageLoadSeqRef.current;
     try {
       const full = await apiFetch<{ page: any }>(`/api/admin/pages/${pageId}`);
+      if (seq !== pageLoadSeqRef.current) return;
       dirtyEditorSig.value = false;
       const p = full.page;
       setEditPage({ template: "default", ...p });
       setPageEditorOpen(true);
       resetConsoleScroll();
       const saved = await loadLocalDraft(`page:${pageId}`);
+      if (seq !== pageLoadSeqRef.current) return;
       const updatedMs = p?.updated_at ? new Date(p.updated_at).getTime() || Number(p.updated_at) || 0 : 0;
       if (
         saved &&
@@ -723,7 +736,7 @@ export function ContentWorkspace({
         setPendingPageDraft(null);
       }
     } catch (err: any) {
-      showToast(err.message);
+      if (seq === pageLoadSeqRef.current) showToast(err.message);
     }
   };
 
@@ -764,6 +777,7 @@ export function ContentWorkspace({
 
   const closePageEditor = async () => {
     if (!(await confirmLeaveDirtyPage())) return;
+    ++pageLoadSeqRef.current;
     dirtyEditorSig.value = false;
     setPageEditorOpen(false);
     setEditPage(null);
@@ -773,8 +787,9 @@ export function ContentWorkspace({
 
   const savePage = async (e?: Event) => {
     e?.preventDefault();
-    if (!editPage || savingPage) return;
+    if (!editPage || savingPage || savingPageRef.current) return;
     if (!String(editPage.title || "").trim()) return;
+    savingPageRef.current = true;
     setSavingPage(true);
     try {
       const prevKey = editPage.id ? `page:${editPage.id}` : "page:new";
@@ -805,6 +820,7 @@ export function ContentWorkspace({
     } catch (err: any) {
       showToast(err.message);
     } finally {
+      savingPageRef.current = false;
       setSavingPage(false);
     }
   };
@@ -870,45 +886,17 @@ export function ContentWorkspace({
     const prevCats = categories;
     setSwappingCat(true);
 
-    if (targetIdx >= 0 && targetIdx < categories.length) {
-      const orders = categories.map((c) => Number(c.sort_order ?? 0));
-      const hasTies = new Set(orders).size < categories.length;
+    if (targetIdx >= 0 && targetIdx < categories.length && totalCats <= categories.length) {
       const reordered = [...categories];
       [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
-      const updates: Array<{ id: string; body: any }> = [];
-      let nextCats: any[];
-      if (hasTies) {
-        nextCats = reordered.map((item, i) => {
-          const desired = (baseOffset + i + 1) * 10;
-          if (Number(item.sort_order) !== desired) {
-            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
-          }
-          return { ...item, sort_order: desired };
-        });
-      } else {
-        const a = categories[idx];
-        const b = categories[targetIdx];
-        const orderA = Number(a.sort_order ?? (baseOffset + idx + 1) * 10);
-        const orderB = Number(b.sort_order ?? (baseOffset + targetIdx + 1) * 10);
-        nextCats = [...reordered];
-        nextCats[idx] = { ...b, sort_order: orderA };
-        nextCats[targetIdx] = { ...a, sort_order: orderB };
-        updates.push(
-          { id: a.id, body: { ...a, sort_order: orderB } },
-          { id: b.id, body: { ...b, sort_order: orderA } }
-        );
-      }
+      const nextCats = reordered.map((item, i) => ({ ...item, sort_order: (i + 1) * 10 }));
       catFlip.captureFlip();
       setCategories(nextCats);
       try {
-        await Promise.all(
-          updates.map((u) =>
-            apiFetch(`/api/admin/categories/${u.id}`, {
-              method: "PUT",
-              body: JSON.stringify(u.body),
-            })
-          )
-        );
+        await apiFetch("/api/admin/categories/reorder", {
+          method: "POST",
+          body: JSON.stringify({ ordered_ids: nextCats.map((x) => x.id) }),
+        });
       } catch (err: any) {
         setCategories(prevCats);
         showToast(err.message);
@@ -919,51 +907,23 @@ export function ContentWorkspace({
       return;
     }
 
-    // Cross-page move across adjacent page boundary
+    // Multi-page or cross-page move: reorder complete list atomically
     try {
       const all = await fetchAllForReorder("/api/admin/categories");
       const curItem = categories[idx];
       const curAllIdx = all.findIndex((x) => x.id === curItem.id);
       const adjAllIdx = curAllIdx + dir;
       if (curAllIdx < 0 || adjAllIdx < 0 || adjAllIdx >= all.length) return;
-      const allOrders = all.map((c) => Number(c.sort_order ?? 0));
-      const hasTies = new Set(allOrders).size < all.length;
       const reorderedAll = [...all];
       [reorderedAll[curAllIdx], reorderedAll[adjAllIdx]] = [reorderedAll[adjAllIdx], reorderedAll[curAllIdx]];
-      const updates: Array<{ id: string; body: any }> = [];
-      let normalizedAll: any[];
-      if (hasTies) {
-        normalizedAll = reorderedAll.map((item, i) => {
-          const desired = (i + 1) * 10;
-          if (Number(item.sort_order) !== desired) {
-            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
-          }
-          return { ...item, sort_order: desired };
-        });
-      } else {
-        const a = all[curAllIdx];
-        const b = all[adjAllIdx];
-        const orderA = Number(a.sort_order ?? (curAllIdx + 1) * 10);
-        const orderB = Number(b.sort_order ?? (adjAllIdx + 1) * 10);
-        normalizedAll = [...reorderedAll];
-        normalizedAll[curAllIdx] = { ...b, sort_order: orderA };
-        normalizedAll[adjAllIdx] = { ...a, sort_order: orderB };
-        updates.push(
-          { id: a.id, body: { ...a, sort_order: orderB } },
-          { id: b.id, body: { ...b, sort_order: orderA } }
-        );
-      }
+      const normalizedAll = reorderedAll.map((item, i) => ({ ...item, sort_order: (i + 1) * 10 }));
       catFlip.captureFlip();
       setCategories(normalizedAll.slice(baseOffset, baseOffset + pageSize));
       setSubTotal(normalizedAll.length);
-      await Promise.all(
-        updates.map((u) =>
-          apiFetch(`/api/admin/categories/${u.id}`, {
-            method: "PUT",
-            body: JSON.stringify(u.body),
-          })
-        )
-      );
+      await apiFetch("/api/admin/categories/reorder", {
+        method: "POST",
+        body: JSON.stringify({ ordered_ids: normalizedAll.map((x) => x.id) }),
+      });
     } catch (err: any) {
       setCategories(prevCats);
       showToast(err.message);
@@ -1134,45 +1094,17 @@ export function ContentWorkspace({
     const prevBooks = books;
     setSwappingBook(true);
 
-    if (targetIdx >= 0 && targetIdx < books.length) {
-      const orders = books.map((b) => Number(b.sort_order ?? 0));
-      const hasTies = new Set(orders).size < books.length;
+    if (targetIdx >= 0 && targetIdx < books.length && totalBooks <= books.length) {
       const reordered = [...books];
       [reordered[idx], reordered[targetIdx]] = [reordered[targetIdx], reordered[idx]];
-      const updates: Array<{ id: string; body: any }> = [];
-      let nextBooks: any[];
-      if (hasTies) {
-        nextBooks = reordered.map((item, i) => {
-          const desired = (baseOffset + i + 1) * 10;
-          if (Number(item.sort_order) !== desired) {
-            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
-          }
-          return { ...item, sort_order: desired };
-        });
-      } else {
-        const a = books[idx];
-        const b = books[targetIdx];
-        const orderA = Number(a.sort_order ?? (baseOffset + idx + 1) * 10);
-        const orderB = Number(b.sort_order ?? (baseOffset + targetIdx + 1) * 10);
-        nextBooks = [...reordered];
-        nextBooks[idx] = { ...b, sort_order: orderA };
-        nextBooks[targetIdx] = { ...a, sort_order: orderB };
-        updates.push(
-          { id: a.id, body: { ...a, sort_order: orderB } },
-          { id: b.id, body: { ...b, sort_order: orderA } }
-        );
-      }
+      const nextBooks = reordered.map((item, i) => ({ ...item, sort_order: (i + 1) * 10 }));
       bookFlip.captureFlip();
       setBooks(nextBooks);
       try {
-        await Promise.all(
-          updates.map((u) =>
-            apiFetch(`/api/admin/books/${u.id}`, {
-              method: "PUT",
-              body: JSON.stringify(u.body),
-            })
-          )
-        );
+        await apiFetch("/api/admin/books/reorder", {
+          method: "POST",
+          body: JSON.stringify({ ordered_ids: nextBooks.map((x) => x.id) }),
+        });
       } catch (err: any) {
         setBooks(prevBooks);
         showToast(err.message);
@@ -1183,51 +1115,23 @@ export function ContentWorkspace({
       return;
     }
 
-    // Cross-page move across adjacent page boundary
+    // Multi-page or cross-page move: reorder complete list atomically
     try {
       const all = await fetchAllForReorder("/api/admin/books");
       const curItem = books[idx];
       const curAllIdx = all.findIndex((x) => x.id === curItem.id);
       const adjAllIdx = curAllIdx + dir;
       if (curAllIdx < 0 || adjAllIdx < 0 || adjAllIdx >= all.length) return;
-      const allOrders = all.map((b) => Number(b.sort_order ?? 0));
-      const hasTies = new Set(allOrders).size < all.length;
       const reorderedAll = [...all];
       [reorderedAll[curAllIdx], reorderedAll[adjAllIdx]] = [reorderedAll[adjAllIdx], reorderedAll[curAllIdx]];
-      const updates: Array<{ id: string; body: any }> = [];
-      let normalizedAll: any[];
-      if (hasTies) {
-        normalizedAll = reorderedAll.map((item, i) => {
-          const desired = (i + 1) * 10;
-          if (Number(item.sort_order) !== desired) {
-            updates.push({ id: item.id, body: { ...item, sort_order: desired } });
-          }
-          return { ...item, sort_order: desired };
-        });
-      } else {
-        const a = all[curAllIdx];
-        const b = all[adjAllIdx];
-        const orderA = Number(a.sort_order ?? (curAllIdx + 1) * 10);
-        const orderB = Number(b.sort_order ?? (adjAllIdx + 1) * 10);
-        normalizedAll = [...reorderedAll];
-        normalizedAll[curAllIdx] = { ...b, sort_order: orderA };
-        normalizedAll[adjAllIdx] = { ...a, sort_order: orderB };
-        updates.push(
-          { id: a.id, body: { ...a, sort_order: orderB } },
-          { id: b.id, body: { ...b, sort_order: orderA } }
-        );
-      }
+      const normalizedAll = reorderedAll.map((item, i) => ({ ...item, sort_order: (i + 1) * 10 }));
       bookFlip.captureFlip();
       setBooks(normalizedAll.slice(baseOffset, baseOffset + pageSize));
       setSubTotal(normalizedAll.length);
-      await Promise.all(
-        updates.map((u) =>
-          apiFetch(`/api/admin/books/${u.id}`, {
-            method: "PUT",
-            body: JSON.stringify(u.body),
-          })
-        )
-      );
+      await apiFetch("/api/admin/books/reorder", {
+        method: "POST",
+        body: JSON.stringify({ ordered_ids: normalizedAll.map((x) => x.id) }),
+      });
     } catch (err: any) {
       setBooks(prevBooks);
       showToast(err.message);
@@ -1237,9 +1141,44 @@ export function ContentWorkspace({
     }
   };
 
+  useEffect(() => {
+    if (series.length === 0) return;
+    setSeriesLabels((prev) => {
+      const next = { ...prev };
+      for (const s of series) {
+        if (s?.id && s.title) next[s.id] = s.title;
+      }
+      return next;
+    });
+  }, [series]);
+
+  useEffect(() => {
+    if (!bookModalOpen) {
+      setBookSeriesOpts(null);
+      return;
+    }
+    const sid = bookForm.series_id;
+    if (!sid || seriesLabels[sid] || series.some((s) => s.id === sid)) return;
+    let cancelled = false;
+    apiFetch<any>(`/api/admin/series/${encodeURIComponent(sid)}`)
+      .then((res) => {
+        if (cancelled) return;
+        const item = res?.series || res;
+        if (item?.id && item.title) {
+          setSeriesLabels((prev) => ({ ...prev, [item.id]: item.title }));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [bookModalOpen, bookForm.series_id]);
+
   const openManageChapters = async (book: any) => {
+    const seq = ++chapLoadSeqRef.current;
     try {
       const res = await apiFetch<{ book: any; chapters: any[] }>(`/api/admin/books/${book.id}`);
+      if (seq !== chapLoadSeqRef.current) return;
       setChapBook(res.book || book);
       setChapQuery("");
       setChapPage(1);
@@ -1256,12 +1195,13 @@ export function ContentWorkspace({
       );
       setChapModalOpen(true);
     } catch (err: any) {
-      showToast(err.message);
+      if (seq === chapLoadSeqRef.current) showToast(err.message);
     }
   };
 
   const syncModalChapters = async () => {
     if (!chapBook || syncingChaps) return;
+    const seq = ++chapLoadSeqRef.current;
     setSyncingChaps(true);
     try {
       const syncRes = await apiFetch<{ chapter_count?: number }>(`/api/admin/books/${chapBook.id}/sync`, {
@@ -1269,6 +1209,7 @@ export function ContentWorkspace({
         body: "{}",
       });
       const res = await apiFetch<{ book: any; chapters: any[] }>(`/api/admin/books/${chapBook.id}`);
+      if (seq !== chapLoadSeqRef.current) return;
       setChapItems(
         (res.chapters || []).map((ch: any, idx: number) => ({
           _uid: nextChapUid(),
@@ -1282,7 +1223,7 @@ export function ContentWorkspace({
       showToast(t("cnt.book_synced", { count: syncRes.chapter_count ?? res.chapters?.length ?? 0 }));
       void loadSub();
     } catch (err: any) {
-      showToast(err.message);
+      if (seq === chapLoadSeqRef.current) showToast(err.message);
     } finally {
       setSyncingChaps(false);
     }
@@ -2500,7 +2441,7 @@ export function ContentWorkspace({
                             key={aid}
                             data-flip-key={aid}
                             class="volo-input-row volo-series-sel-row"
-                            style={{ marginBottom: "6px", minWidth: 0 }}
+                            style={{ marginBottom: "6px", minWidth: 0, flexWrap: "wrap" }}
                           >
                             <input
                               key={`${aid}-${idx}`}
@@ -2508,7 +2449,7 @@ export function ContentWorkspace({
                               min={1}
                               max={serForm.article_ids.length}
                               class="volo-input"
-                              style={{ width: "54px", padding: "3px 6px", fontSize: "12px", textAlign: "center", flexShrink: 0 }}
+                              style={{ width: "54px", padding: "3px 6px", textAlign: "center", flexShrink: 0 }}
                               defaultValue={String(idx + 1)}
                               aria-label={t("cnt.lbl_sort")}
                               onKeyDown={(e) => {
@@ -2526,7 +2467,7 @@ export function ContentWorkspace({
                             <span
                               class="volo-series-sel-title"
                               style={{
-                                flex: 1,
+                                flex: "1 1 160px",
                                 minWidth: 0,
                                 overflow: "hidden",
                                 textOverflow: "ellipsis",
@@ -2936,10 +2877,51 @@ export function ContentWorkspace({
                     <ConsoleSelect
                       value={bookForm.series_id}
                       onChange={(val) => setBookForm({ ...bookForm, series_id: val })}
-                      options={[
-                        { value: "", label: t("art.series_none") },
-                        ...series.map((s) => ({ value: s.id, label: s.title })),
-                      ]}
+                      fallbackLabel={
+                        bookForm.series_id
+                          ? seriesLabels[bookForm.series_id] ||
+                            (bookForm as any).series_title ||
+                            bookForm.series_id
+                          : t("art.series_none")
+                      }
+                      onSearch={async (q) => {
+                        try {
+                          const qs = new URLSearchParams({ per_page: "100" });
+                          if (q) qs.set("q", q);
+                          const res = await apiFetch<{ items?: any[]; series?: any[] }>(`/api/admin/series?${qs.toString()}`);
+                          const items = res.items || res.series || [];
+                          setBookSeriesOpts(items);
+                          if (items.length > 0) {
+                            setSeriesLabels((prev) => {
+                              const next = { ...prev };
+                              for (const s of items) {
+                                if (s?.id && s.title) next[s.id] = s.title;
+                              }
+                              return next;
+                            });
+                          }
+                        } catch {}
+                      }}
+                      options={(() => {
+                        const base = bookSeriesOpts ?? series;
+                        const opts = [
+                          { value: "", label: t("art.series_none") },
+                          ...base.map((s) => ({ value: s.id, label: s.title })),
+                        ];
+                        if (
+                          bookForm.series_id &&
+                          !opts.some((o) => o.value === bookForm.series_id)
+                        ) {
+                          opts.push({
+                            value: bookForm.series_id,
+                            label:
+                              seriesLabels[bookForm.series_id] ||
+                              (bookForm as any).series_title ||
+                              bookForm.series_id,
+                          });
+                        }
+                        return opts;
+                      })()}
                     />
                   </div>
                 ) : (
@@ -3043,7 +3025,7 @@ export function ContentWorkspace({
                     ];
                     setChapItems(next);
                     setChapQuery("");
-                    setChapPage(Math.max(1, Math.ceil(next.length / 80)));
+                    setChapPage(next.length > 80 ? Math.max(1, Math.ceil(next.length / 100)) : 1);
                   }}
                 >
                   <PlusIcon size={14} /> {t("cnt.chap_add")}
@@ -3075,7 +3057,8 @@ export function ContentWorkspace({
                   visibleRows.push({ ch, idx: i, hasChildren, isCollapsed });
                 }
 
-                const pagedRows = paginateItems(visibleRows, chapPage, 80);
+                const useChapPaging = chapItems.length > 80;
+                const pagedRows = paginateItems(visibleRows, useChapPaging ? chapPage : 1, useChapPaging ? 100 : Math.max(100, visibleRows.length));
                 chapSliceUidsRef.current = pagedRows.slice.map((r) => r.ch._uid);
 
                 return visibleRows.length === 0 ? (
@@ -3262,12 +3245,14 @@ export function ContentWorkspace({
                         );
                       })}
                     </div>
-                    <Pagination
-                      total={visibleRows.length}
-                      page={pagedRows.safePage}
-                      pageSize={80}
-                      onChange={setChapPage}
-                    />
+                    {useChapPaging && (
+                      <Pagination
+                        total={visibleRows.length}
+                        page={pagedRows.safePage}
+                        pageSize={100}
+                        onChange={setChapPage}
+                      />
+                    )}
                   </>
                 );
               })()

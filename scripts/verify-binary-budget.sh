@@ -26,7 +26,7 @@ echo "[1/4] Building pure-Go static binary (CGO_ENABLED=0)..."
   cd "${ROOT_DIR}"
   CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 go build -buildvcs=false -trimpath \
     -gcflags="all=-l" \
-    -ldflags="-s -w -X main.Version=v1.0.0-verify" \
+    -ldflags="-s -w -funcalign=8 -X main.Version=v1.0.0-verify" \
     -o "${BIN_PATH}" ./cmd/volo
 )
 

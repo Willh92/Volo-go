@@ -10,6 +10,23 @@ function compactLocalesPlugin(): Plugin {
   const resolvedId = "\0" + virtualId;
   const localesDir = join(__dirname, "src", "locales");
 
+  function readLocaleCatalogs() {
+    const files = readdirSync(localesDir)
+      .filter((f) => f.endsWith(".json"))
+      .sort();
+    const keySet = new Set<string>();
+    const items = files.map((f) => {
+      const raw = JSON.parse(readFileSync(join(localesDir, f), "utf8")) as Record<string, string>;
+      for (const k of Object.keys(raw)) keySet.add(k);
+      const code = raw["meta.code"] || f.replace(/\.json$/i, "");
+      const name = raw["meta.name"] || code;
+      const dir = raw["meta.dir"] || "ltr";
+      return { code, name, dir, raw };
+    });
+    const keys = Array.from(keySet).sort();
+    return { items, keys };
+  }
+
   return {
     name: "volo-compact-locales",
     resolveId(id) {
@@ -18,21 +35,8 @@ function compactLocalesPlugin(): Plugin {
     },
     load(id) {
       if (id !== resolvedId) return null;
-      const files = readdirSync(localesDir)
-        .filter((f) => f.endsWith(".json"))
-        .sort();
-      const tables: Array<{ code: string; dict: Record<string, string> }> = [];
-      const keySet = new Set<string>();
-
-      for (const f of files) {
-        const raw = JSON.parse(readFileSync(join(localesDir, f), "utf8")) as Record<string, string>;
-        const code = raw["meta.code"] || f.replace(/\.json$/i, "");
-        tables.push({ code, dict: raw });
-        for (const k of Object.keys(raw)) keySet.add(k);
-      }
-
-      const keys = Array.from(keySet).sort();
-      const codes = tables.map((t) => t.code);
+      const { items, keys } = readLocaleCatalogs();
+      const metas = items.map(({ code, name, dir }) => ({ code, name, dir }));
       let prevKey = "";
       const packedKeys = keys.map((k) => {
         if (k.includes("~")) throw new Error(`Locale key must not contain ~: ${k}`);
@@ -43,28 +47,35 @@ function compactLocalesPlugin(): Plugin {
         prevKey = k;
         return shared.toString(36) + k.slice(shared);
       });
-      const baseCol = tables[0] ? keys.map((k) => tables[0].dict[k] ?? "") : [];
-      const columns = tables.map((t, ti) =>
-        keys.map((k, ki) => {
-          const v = t.dict[k] ?? "";
-          if (v.includes("~") || v === "^") {
-            throw new Error(`Locale value must not contain ~ or equal ^: ${k}`);
-          }
-          if (ti > 0 && v !== "" && v === baseCol[ki]) return "^";
-          return v;
-        }),
-      );
-
       return (
-        `export const codes = ${JSON.stringify(codes)};\n` +
+        `export const builtinLocales = ${JSON.stringify(metas)};\n` +
         `let _p = "";\n` +
-        `export const keys = ${JSON.stringify(packedKeys.join("~"))}.split("~").map((s) => (_p = _p.slice(0, parseInt(s[0], 36)) + s.slice(1)));\n` +
-        `const _c0 = ${JSON.stringify((columns[0] || []).join("~"))}.split("~");\n` +
-        `export const columns = [_c0,${columns
-          .slice(1)
-          .map((c) => `${JSON.stringify(c.join("~"))}.split("~").map((v,i)=>v==="^"?_c0[i]:v)`)
-          .join(",")}];\n`
+        `export const keys = ${JSON.stringify(packedKeys.join("~"))}.split("~").map((s) => (_p = _p.slice(0, parseInt(s[0], 36)) + s.slice(1)));\n`
       );
+    },
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url || "").split("?")[0];
+        const m = /\/i18n\/([a-zA-Z0-9_-]+)\.json$/.exec(url);
+        if (!m) return next();
+        const { items, keys } = readLocaleCatalogs();
+        const found = items.find((it) => it.code === m[1]);
+        if (!found) return next();
+        const col = keys.map((k) => found.raw[k] ?? "");
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(JSON.stringify(col));
+      });
+    },
+    generateBundle() {
+      const { items, keys } = readLocaleCatalogs();
+      for (const { code, raw } of items) {
+        const col = keys.map((k) => raw[k] ?? "");
+        this.emitFile({
+          type: "asset",
+          fileName: `i18n/${code}.json`,
+          source: JSON.stringify(col),
+        });
+      }
     },
   };
 }
@@ -132,6 +143,16 @@ export function syntaxTree() {
 export default defineConfig({
   base: "./",
   plugins: [compactLocalesPlugin(), lightweightCM6LanguageShimPlugin()],
+  css: {
+    transformer: "lightningcss",
+    lightningcss: {
+      targets: {
+        safari: (17 << 16) | (5 << 8),
+        chrome: 124 << 16,
+        firefox: 125 << 16,
+      },
+    },
+  },
   oxc: {
     jsx: {
       runtime: "classic",
@@ -148,5 +169,11 @@ export default defineConfig({
     cssCodeSplit: false,
     modulePreload: false,
     chunkSizeWarningLimit: 1000,
+    rolldownOptions: {
+      output: {
+        entryFileNames: "assets/index-[hash].js",
+        chunkFileNames: "assets/editor-[hash].js",
+      },
+    },
   },
 });

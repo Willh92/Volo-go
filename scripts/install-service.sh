@@ -36,6 +36,7 @@ INSTALL_BIN_EXPLICIT="0"
 HOST_ADDR="127.0.0.1"
 PORT="8080"
 LISTEN_ADDR_EXPLICIT=""
+HOST_PORT_EXPLICIT="0"
 UNIX_SOCKET=""
 UNIX_SOCKET_PERM="0660"
 SOCKET_GROUP=""
@@ -58,6 +59,8 @@ INIT_OVERRIDE="auto"
 TARGET_OS_OVERRIDE="auto"
 DRY_RUN="0"
 PURGE_DATA="0"
+SKIP_BACKUP="0"
+NO_START="0"
 
 GITHUB_REPO="${VOLO_REPO:-Willh92/Volo-go}"
 RELEASE_VERSION="${VOLO_VERSION:-}"
@@ -102,7 +105,7 @@ Usage:
 
 Commands:
   install      Install binary (local or auto-downloaded from GitHub Releases), register service, and start (default)
-  upgrade      Download latest/specified release from GitHub, verify SHA-256, and restart service (alias: update)
+  upgrade      Backup DB, download/verify release, smoke-test, replace binary, healthcheck, and auto-rollback on failure (alias: update)
   uninstall    Stop and remove auto-start service registration (preserves data directory unless --purge-data)
   start        Start the Volo-go service
   stop         Stop the Volo-go service
@@ -120,11 +123,13 @@ Options:
   --mirror <url>                  GitHub download mirror prefix (e.g. https://ghfast.top)
   --repo <owner/repo>             GitHub repository for release downloads (default: Willh92/Volo-go)
   --no-verify                     Skip SHA256SUMS.txt verification when downloading from GitHub
+  --skip-backup                   Skip pre-upgrade database backup during 'upgrade'
+  --no-start                      Do not start/restart service or poll healthcheck after install/upgrade
   --host <addr>                   TCP listen host address (default: 127.0.0.1)
   --port <port>                   TCP listen HTTP port (default: 8080)
   --listen-addr <host:port>       Explicit TCP listen address (overrides --host/--port)
   --unix-socket <path>            Listen on Unix domain socket instead of TCP (e.g. /run/volo/volo.sock)
-  --unix-socket-perm <octal>      Octal permissions for Unix domain socket (default: 0660)
+  --socket-mode <octal>           Octal permissions for Unix domain socket (default: 0660; alias: --unix-socket-perm)
   --socket-group <group>          Group ownership for Unix socket access (e.g. www-data or nginx)
   --public-url <url>              Canonical public URL written on initial .env creation (default: http://localhost:8080)
   --admin-path <prefix>           Stealth admin console path written on initial .env creation (default: /console)
@@ -182,12 +187,14 @@ while [ "$#" -gt 0 ]; do
     --repo) require_arg "$@"; GITHUB_REPO="$2"; shift 2 ;;
     --repo=*) GITHUB_REPO="${1#*=}"; shift 1 ;;
     --no-verify|--skip-verify) SKIP_VERIFY="1"; shift 1 ;;
-    --host) require_arg "$@"; HOST_ADDR="$2"; shift 2 ;;
-    --host=*) HOST_ADDR="${1#*=}"; shift 1 ;;
-    --port) require_arg "$@"; PORT="$2"; shift 2 ;;
-    --port=*) PORT="${1#*=}"; shift 1 ;;
-    --listen-addr) require_arg "$@"; LISTEN_ADDR_EXPLICIT="$2"; shift 2 ;;
-    --listen-addr=*) LISTEN_ADDR_EXPLICIT="${1#*=}"; shift 1 ;;
+    --skip-backup|--no-backup) SKIP_BACKUP="1"; shift 1 ;;
+    --no-start) NO_START="1"; shift 1 ;;
+    --host) require_arg "$@"; HOST_ADDR="$2"; HOST_PORT_EXPLICIT="1"; shift 2 ;;
+    --host=*) HOST_ADDR="${1#*=}"; HOST_PORT_EXPLICIT="1"; shift 1 ;;
+    --port) require_arg "$@"; PORT="$2"; HOST_PORT_EXPLICIT="1"; shift 2 ;;
+    --port=*) PORT="${1#*=}"; HOST_PORT_EXPLICIT="1"; shift 1 ;;
+    --listen-addr) require_arg "$@"; LISTEN_ADDR_EXPLICIT="$2"; HOST_PORT_EXPLICIT="1"; shift 2 ;;
+    --listen-addr=*) LISTEN_ADDR_EXPLICIT="${1#*=}"; HOST_PORT_EXPLICIT="1"; shift 1 ;;
     --unix-socket|--listen-socket) require_arg "$@"; UNIX_SOCKET="$2"; shift 2 ;;
     --unix-socket=*|--listen-socket=*) UNIX_SOCKET="${1#*=}"; shift 1 ;;
     --unix-socket-perm|--socket-mode) require_arg "$@"; UNIX_SOCKET_PERM="$2"; shift 2 ;;
@@ -463,42 +470,270 @@ copy_binary_safe() {
   fi
 }
 
-sync_bundled_extensions() {
+read_env_var() {
+  EF_PATH="$1"
+  EF_KEY="$2"
+  [ -z "$EF_PATH" ] && return 0
+  [ ! -f "$EF_PATH" ] && return 0
+  awk -v k="$EF_KEY" '
+    /^[ \t]*#/ { next }
+    {
+      line = $0
+      sub(/^[ \t]*(export[ \t]+)?/, "", line)
+      eq = index(line, "=")
+      if (eq > 0) {
+        key = substr(line, 1, eq - 1)
+        sub(/[ \t]+$/, "", key)
+        if (key == k) {
+          val = substr(line, eq + 1)
+          sub(/^[ \t]+/, "", val)
+          sub(/[ \t\r]+$/, "", val)
+          if ((substr(val, 1, 1) == "\"" && substr(val, length(val), 1) == "\"") ||
+              (substr(val, 1, 1) == "\047" && substr(val, length(val), 1) == "\047")) {
+            val = substr(val, 2, length(val) - 2)
+          }
+          result = val
+        }
+      }
+    }
+    END { if (result != "") printf "%s", result }
+  ' "$EF_PATH"
+}
+
+resolve_extension_dirs() {
+  EXT_ROOT="$1"
+  EXT_ENV="${2:-}"
+  RESOLVED_THEMES_DIR=""
+  RESOLVED_PLUGINS_DIR=""
+  RESOLVED_LOCALES_DIR=""
+  if [ -n "$EXT_ENV" ] && [ -f "$EXT_ENV" ]; then
+    RESOLVED_THEMES_DIR="$(read_env_var "$EXT_ENV" "VOLO_THEMES_DIR")"
+    RESOLVED_PLUGINS_DIR="$(read_env_var "$EXT_ENV" "VOLO_PLUGINS_DIR")"
+    RESOLVED_LOCALES_DIR="$(read_env_var "$EXT_ENV" "VOLO_LOCALES_DIR")"
+  fi
+  if [ -z "$RESOLVED_THEMES_DIR" ]; then RESOLVED_THEMES_DIR="${EXT_ROOT}/themes"; fi
+  if [ -z "$RESOLVED_PLUGINS_DIR" ]; then RESOLVED_PLUGINS_DIR="${EXT_ROOT}/plugins"; fi
+  if [ -z "$RESOLVED_LOCALES_DIR" ]; then RESOLVED_LOCALES_DIR="${EXT_ROOT}/locales"; fi
+  return 0
+}
+
+sync_extensions() {
   DEST_ROOT="$1"
+  ENV_REF="${2:-}"
   [ -z "$RESOLVED_BUNDLE_DIR" ] && return 0
   [ ! -d "$RESOLVED_BUNDLE_DIR" ] && return 0
 
+  resolve_extension_dirs "$DEST_ROOT" "$ENV_REF"
+
   for kind in plugins themes; do
+    if [ "$kind" = "plugins" ]; then
+      DEST_KIND_DIR="$RESOLVED_PLUGINS_DIR"
+    else
+      DEST_KIND_DIR="$RESOLVED_THEMES_DIR"
+    fi
     if [ -d "${RESOLVED_BUNDLE_DIR}/${kind}" ]; then
+      SRC_KIND_ABS="$(normalize_dir_path "${RESOLVED_BUNDLE_DIR}/${kind}")"
+      DST_KIND_ABS="$(normalize_dir_path "$DEST_KIND_DIR")"
+      [ "$SRC_KIND_ABS" = "$DST_KIND_ABS" ] && continue
       for item in "${RESOLVED_BUNDLE_DIR}/${kind}"/*; do
         [ -e "$item" ] || continue
         name="$(basename "$item")"
-        if [ ! -e "${DEST_ROOT}/${kind}/${name}" ]; then
-          if [ "$DRY_RUN" = "1" ]; then
-            printf "[dry-run] cp -R %s %s/%s/%s\n" "$item" "$DEST_ROOT" "$kind" "$name"
-          else
-            mkdir -p "${DEST_ROOT}/${kind}"
-            cp -R "$item" "${DEST_ROOT}/${kind}/${name}"
-          fi
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] sync official %s/%s -> %s/%s (preserving custom extensions)\n" "$kind" "$name" "$DEST_KIND_DIR" "$name"
+        else
+          mkdir -p "$DEST_KIND_DIR"
+          STAGE_EXT="${DEST_KIND_DIR}/.${name}.sync.$$"
+          rm -rf "$STAGE_EXT"
+          cp -R "$item" "$STAGE_EXT"
+          chmod -R a+rX "$STAGE_EXT" 2>/dev/null || true
+          rm -rf "${DEST_KIND_DIR}/${name}"
+          mv -f "$STAGE_EXT" "${DEST_KIND_DIR}/${name}"
         fi
       done
     fi
   done
 
   if [ -d "${RESOLVED_BUNDLE_DIR}/locales" ]; then
-    for loc in "${RESOLVED_BUNDLE_DIR}/locales"/*.json; do
-      [ -f "$loc" ] || continue
-      name="$(basename "$loc")"
-      if [ ! -f "${DEST_ROOT}/locales/${name}" ]; then
+    SRC_LOC_ABS="$(normalize_dir_path "${RESOLVED_BUNDLE_DIR}/locales")"
+    DST_LOC_ABS="$(normalize_dir_path "$RESOLVED_LOCALES_DIR")"
+    if [ "$SRC_LOC_ABS" != "$DST_LOC_ABS" ]; then
+      for loc in "${RESOLVED_BUNDLE_DIR}/locales"/*.json; do
+        [ -f "$loc" ] || continue
+        name="$(basename "$loc")"
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] cp %s %s/locales/%s\n" "$loc" "$DEST_ROOT" "$name"
+          printf "[dry-run] sync official locales/%s -> %s/%s\n" "$name" "$RESOLVED_LOCALES_DIR" "$name"
         else
-          mkdir -p "${DEST_ROOT}/locales"
-          cp "$loc" "${DEST_ROOT}/locales/${name}"
+          mkdir -p "$RESOLVED_LOCALES_DIR"
+          STAGE_LOC="${RESOLVED_LOCALES_DIR}/.${name}.sync.$$"
+          cp -f "$loc" "$STAGE_LOC"
+          chmod 0644 "$STAGE_LOC" 2>/dev/null || true
+          mv -f "$STAGE_LOC" "${RESOLVED_LOCALES_DIR}/${name}"
         fi
-      fi
-    done
+      done
+    fi
   fi
+}
+
+sync_bundled_extensions() {
+  sync_extensions "$@"
+}
+
+smoke_test_binary() {
+  CAND_BIN="$1"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf "[dry-run] smoke-test binary: '%s' version >/dev/null\n" "$CAND_BIN"
+    return 0
+  fi
+  if [ ! -f "$CAND_BIN" ]; then
+    log_err "Candidate binary not found: ${CAND_BIN}"
+    exit 1
+  fi
+  if [ "$(uname -s | tr '[:upper:]' '[:lower:]')" = "$TARGET_OS" ]; then
+    if [ ! -x "$CAND_BIN" ]; then
+      chmod 0755 "$CAND_BIN" 2>/dev/null || true
+    fi
+    if [ "$TARGET_OS" = "darwin" ]; then
+      xattr -d com.apple.quarantine "$CAND_BIN" >/dev/null 2>&1 || true
+    fi
+    if ! "$CAND_BIN" version >/dev/null 2>&1; then
+      log_err "Candidate binary failed smoke-test ('${CAND_BIN} version'); aborting before modifying live binary."
+      exit 1
+    fi
+  fi
+}
+
+perform_pre_upgrade_backup() {
+  LIVE_BIN="$1"
+  ROOT_DATA_DIR="$2"
+  CFG_ENV_FILE="$3"
+  CHOWN_SPEC="$4"
+
+  if [ "$SKIP_BACKUP" = "1" ]; then
+    log_info "Skipping pre-upgrade database backup (--skip-backup specified)."
+    return 0
+  fi
+
+  EFF_DATA_DIR=""
+  EFF_BACKUP_DIR=""
+  CFG_DB_DSN=""
+  if [ -n "$CFG_ENV_FILE" ] && [ -f "$CFG_ENV_FILE" ]; then
+    EFF_DATA_DIR="$(read_env_var "$CFG_ENV_FILE" "VOLO_DATA_DIR")"
+    EFF_BACKUP_DIR="$(read_env_var "$CFG_ENV_FILE" "VOLO_BACKUP_DIR")"
+    CFG_DB_DSN="$(read_env_var "$CFG_ENV_FILE" "VOLO_DB_DSN")"
+  fi
+  if [ -z "$EFF_DATA_DIR" ]; then
+    if [ -d "${ROOT_DATA_DIR}/data" ] || [ "$DRY_RUN" = "1" ]; then
+      EFF_DATA_DIR="${ROOT_DATA_DIR}/data"
+    else
+      EFF_DATA_DIR="$ROOT_DATA_DIR"
+    fi
+  fi
+  [ -z "$EFF_BACKUP_DIR" ] && EFF_BACKUP_DIR="${EFF_DATA_DIR}/backups"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    printf "[dry-run] pre-upgrade backup: '%s' backup create --data-dir '%s' --backup-dir '%s'\n" "$LIVE_BIN" "$EFF_DATA_DIR" "$EFF_BACKUP_DIR"
+    return 0
+  fi
+
+  if [ ! -x "$LIVE_BIN" ]; then
+    log_info "No existing executable at ${LIVE_BIN}; skipping pre-upgrade backup."
+    return 0
+  fi
+
+  if [ ! -f "${EFF_DATA_DIR}/volo.db" ] && [ ! -f "${EFF_DATA_DIR}/db.json" ] && [ -z "$CFG_DB_DSN" ]; then
+    log_info "Database in ${EFF_DATA_DIR} is not initialized yet; skipping pre-upgrade backup."
+    return 0
+  fi
+
+  mkdir -p "$EFF_BACKUP_DIR" 2>/dev/null || true
+  log_info "Creating pre-upgrade database backup in ${EFF_BACKUP_DIR}..."
+  BACKUP_RC="0"
+  if [ -n "$CFG_ENV_FILE" ] && [ -f "$CFG_ENV_FILE" ]; then
+    "$LIVE_BIN" backup create --env-file "$CFG_ENV_FILE" --data-dir "$EFF_DATA_DIR" --backup-dir "$EFF_BACKUP_DIR" >/dev/null 2>&1 || BACKUP_RC="$?"
+  else
+    "$LIVE_BIN" backup create --data-dir "$EFF_DATA_DIR" --backup-dir "$EFF_BACKUP_DIR" >/dev/null 2>&1 || BACKUP_RC="$?"
+  fi
+  if [ "$BACKUP_RC" = "0" ]; then
+    if [ -n "$CHOWN_SPEC" ]; then
+      safe_chown_tree "$CHOWN_SPEC" "$EFF_BACKUP_DIR" 2>/dev/null || true
+    fi
+    log_ok "Pre-upgrade backup saved in ${EFF_BACKUP_DIR}"
+  else
+    log_warn "Pre-upgrade backup returned exit code ${BACKUP_RC} (database may be uninitialized or unreachable); preserving existing data and continuing."
+  fi
+}
+
+backup_live_binary() {
+  LIVE_BIN="$1"
+  HAD_PREV_BIN="0"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf "[dry-run] backup live binary: cp -pf '%s' '%s.bak'\n" "$LIVE_BIN" "$LIVE_BIN"
+    return 0
+  fi
+  if [ -f "$LIVE_BIN" ]; then
+    cp -pf "$LIVE_BIN" "${LIVE_BIN}.bak" 2>/dev/null || cp -f "$LIVE_BIN" "${LIVE_BIN}.bak"
+    chmod 0755 "${LIVE_BIN}.bak" 2>/dev/null || true
+    HAD_PREV_BIN="1"
+  fi
+}
+
+normalize_probe_addr() {
+  RAW_LISTEN="$1"
+  case "$RAW_LISTEN" in
+    :*)           printf "127.0.0.1%s" "$RAW_LISTEN" ;;
+    0.0.0.0:*)    printf "127.0.0.1:%s" "${RAW_LISTEN#0.0.0.0:}" ;;
+    \[::\]:*)     printf "127.0.0.1:%s" "${RAW_LISTEN#\[::\]:}" ;;
+    :::*)         printf "127.0.0.1:%s" "${RAW_LISTEN#:::}" ;;
+    \*:*)         printf "127.0.0.1:%s" "${RAW_LISTEN#\*:}" ;;
+    "")           printf "127.0.0.1:8080" ;;
+    *)            printf "%s" "$RAW_LISTEN" ;;
+  esac
+}
+
+poll_service_healthcheck() {
+  LIVE_BIN="$1"
+  CFG_ENV_FILE="$2"
+
+  ACTIVE_SOCK="$UNIX_SOCKET"
+  if [ -z "$ACTIVE_SOCK" ] && [ -n "$CFG_ENV_FILE" ] && [ -f "$CFG_ENV_FILE" ]; then
+    ACTIVE_SOCK="$(read_env_var "$CFG_ENV_FILE" "VOLO_LISTEN_SOCKET")"
+  fi
+  ACTIVE_SOCK="${ACTIVE_SOCK%,*}"
+
+  CFG_LISTEN=""
+  if [ "$HOST_PORT_EXPLICIT" = "1" ]; then
+    CFG_LISTEN="$LISTEN_ADDR"
+  elif [ -n "$CFG_ENV_FILE" ] && [ -f "$CFG_ENV_FILE" ]; then
+    CFG_LISTEN="$(read_env_var "$CFG_ENV_FILE" "VOLO_LISTEN_ADDR")"
+  fi
+  [ -z "$CFG_LISTEN" ] && CFG_LISTEN="$LISTEN_ADDR"
+  PROBE_HOST_PORT="$(normalize_probe_addr "$CFG_LISTEN")"
+  HC_URL="http://${PROBE_HOST_PORT}/healthz"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    if [ -n "$ACTIVE_SOCK" ]; then
+      printf "[dry-run] poll '%s' healthcheck --listen-socket '%s' (up to 15s; auto-rollback %s.bak on failure)\n" "$LIVE_BIN" "$ACTIVE_SOCK" "$LIVE_BIN"
+    else
+      printf "[dry-run] poll '%s' healthcheck --url '%s' (up to 15s; auto-rollback %s.bak on failure)\n" "$LIVE_BIN" "$HC_URL" "$LIVE_BIN"
+    fi
+    return 0
+  fi
+
+  ATTEMPT=1
+  while [ "$ATTEMPT" -le 15 ]; do
+    if [ -n "$ACTIVE_SOCK" ]; then
+      if (HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" NO_PROXY="*" no_proxy="*" "$LIVE_BIN" healthcheck --listen-socket "$ACTIVE_SOCK" >/dev/null 2>&1); then
+        return 0
+      fi
+    else
+      if (HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" NO_PROXY="*" no_proxy="*" "$LIVE_BIN" healthcheck --url "$HC_URL" >/dev/null 2>&1); then
+        return 0
+      fi
+    fi
+    sleep 1
+    ATTEMPT=$((ATTEMPT + 1))
+  done
+  return 1
 }
 
 build_release_base_url() {
@@ -586,10 +821,25 @@ resolve_latest_tag_fallback() {
   TAG_URL="https://github.com/${GITHUB_REPO}/releases/latest"
   [ -n "$GITHUB_MIRROR" ] && TAG_URL="${GITHUB_MIRROR%/}/${TAG_URL}"
   if command -v curl >/dev/null 2>&1; then
-    EFF_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$TAG_URL" 2>/dev/null || true)"
+    LOC_HDR="$(curl -fsSI --connect-timeout 10 "$TAG_URL" 2>/dev/null | awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2; exit }' || true)"
+    case "$LOC_HDR" in
+      */releases/tag/*)
+        printf "%s" "${LOC_HDR##*/releases/tag/}" | sed 's/[?#].*$//'
+        return 0
+        ;;
+    esac
+    EFF_URL="$(curl -fsSL --connect-timeout 10 -o /dev/null -w '%{url_effective}' "$TAG_URL" 2>/dev/null || true)"
     case "$EFF_URL" in
       */releases/tag/*)
         printf "%s" "${EFF_URL##*/releases/tag/}" | sed 's/[?#].*$//'
+        return 0
+        ;;
+    esac
+  elif command -v wget >/dev/null 2>&1; then
+    LOC_HDR="$(wget -S --spider --max-redirect=0 --timeout=10 "$TAG_URL" 2>&1 | awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2; exit }' || true)"
+    case "$LOC_HDR" in
+      */releases/tag/*)
+        printf "%s" "${LOC_HDR##*/releases/tag/}" | sed 's/[?#].*$//'
         return 0
         ;;
     esac
@@ -597,18 +847,95 @@ resolve_latest_tag_fallback() {
   printf ""
 }
 
+resolve_preview_release_tag() {
+  API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=10"
+  RAW_JSON=""
+  if command -v curl >/dev/null 2>&1; then
+    RAW_JSON="$(curl -fsSL --connect-timeout 10 -H "Accept: application/vnd.github+json" -H "User-Agent: Volo-go-Installer" "$API_URL" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    RAW_JSON="$(wget -qO- --timeout=10 --header="Accept: application/vnd.github+json" --header="User-Agent: Volo-go-Installer" "$API_URL" 2>/dev/null || true)"
+  fi
+  [ -z "$RAW_JSON" ] && return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    PARSED_TAG="$(printf "%s" "$RAW_JSON" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, list):
+        for rel in data:
+            if isinstance(rel, dict) and not rel.get("draft") and rel.get("tag_name"):
+                print(rel["tag_name"])
+                break
+except Exception:
+    pass
+' 2>/dev/null || true)"
+    if [ -n "$PARSED_TAG" ]; then
+      printf "%s" "$PARSED_TAG"
+      return 0
+    fi
+  fi
+
+  printf "%s" "$RAW_JSON" | awk '
+    BEGIN { in_str = 0; esc = 0; depth = 0; cur_str = ""; last_key = ""; tag = ""; draft = "false"; expect_val = 0 }
+    {
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (in_str) {
+          if (esc) { cur_str = cur_str c; esc = 0 }
+          else if (c == "\\") { esc = 1 }
+          else if (c == "\"") {
+            in_str = 0
+            if (depth == 1) {
+              if (expect_val) {
+                if (last_key == "tag_name" && tag == "") tag = cur_str
+                expect_val = 0
+              } else {
+                last_key = cur_str
+              }
+            }
+            cur_str = ""
+          } else {
+            cur_str = cur_str c
+          }
+        } else {
+          if (c == "\"") { in_str = 1; cur_str = "" }
+          else if (c == "{") {
+            depth++
+            if (depth == 1) { tag = ""; draft = "false"; last_key = ""; expect_val = 0 }
+          } else if (c == "}") {
+            if (depth == 1) {
+              if (tag != "" && draft != "true") { print tag; exit }
+            }
+            depth--
+          } else if (c == ":" && depth == 1) {
+            expect_val = 1
+          } else if (c == "," && depth == 1) {
+            expect_val = 0
+          } else if (depth == 1 && expect_val && last_key == "draft") {
+            if (substr($0, i, 4) == "true") { draft = "true"; expect_val = 0 }
+            else if (substr($0, i, 5) == "false") { draft = "false"; expect_val = 0 }
+          }
+        }
+      }
+    }
+  '
+}
+
 download_release_bundle() {
   PINNED="0"
+  WANT_PREVIEW="0"
   if [ -n "$RELEASE_VERSION" ]; then
     case "$RELEASE_VERSION" in
       latest)  PRIMARY_TARGET="latest" ;;
-      preview) PRIMARY_TARGET="preview"; PINNED="1" ;;
+      preview) PRIMARY_TARGET="preview"; WANT_PREVIEW="1" ;;
       v*|V*)   PRIMARY_TARGET="v${RELEASE_VERSION#[vV]}"; PINNED="1" ;;
       *)       PRIMARY_TARGET="v${RELEASE_VERSION}"; PINNED="1" ;;
     esac
   else
     case "$RELEASE_CHANNEL" in
-      preview)     PRIMARY_TARGET="preview"; PINNED="1" ;;
+      preview)     PRIMARY_TARGET="preview"; WANT_PREVIEW="1" ;;
       release|"")  PRIMARY_TARGET="latest" ;;
       *)
         log_err "Invalid --channel '${RELEASE_CHANNEL}' (expected 'release' or 'preview')"
@@ -619,9 +946,25 @@ download_release_bundle() {
 
   STABLE_ASSET="volo-${TARGET_OS}-${TARGET_ARCH}.tar.gz"
   if [ "$DRY_RUN" = "1" ]; then
+    if [ "$WANT_PREVIEW" = "1" ]; then
+      printf "[dry-run] query /repos/%s/releases?per_page=10 for newest release/prerelease (fallback: latest)\n" "$GITHUB_REPO"
+    fi
     printf "[dry-run] download %s from %s (%s) + verify SHA256SUMS.txt\n" "$STABLE_ASSET" "$GITHUB_REPO" "$PRIMARY_TARGET"
     RESOLVED_BIN_PATH="/tmp/volo-dry-run-bin"
     return 0
+  fi
+
+  if [ "$WANT_PREVIEW" = "1" ]; then
+    PREVIEW_TAG="$(resolve_preview_release_tag)"
+    if [ -n "$PREVIEW_TAG" ]; then
+      log_info "Preview channel resolved to newest release tag: ${PREVIEW_TAG}"
+      PRIMARY_TARGET="$PREVIEW_TAG"
+      PINNED="1"
+    else
+      log_info "No preview/prerelease tag returned from /releases?per_page=10 (or API rate-limited); falling back cleanly to 'latest'."
+      PRIMARY_TARGET="latest"
+      PINNED="0"
+    fi
   fi
 
   TMP_DOWNLOAD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/volo-dl.XXXXXX")"
@@ -647,7 +990,7 @@ download_release_bundle() {
       fi
     fi
     if [ "$FALLBACK_OK" = "0" ]; then
-      log_err "Failed to download stable release archive for ${TARGET_OS}/${TARGET_ARCH} from ${GITHUB_REPO} (pass '--channel preview' or '--version preview' to install the rolling preview build)."
+      log_err "Failed to download release archive for ${TARGET_OS}/${TARGET_ARCH} from ${GITHUB_REPO} (${PRIMARY_TARGET})."
       exit 1
     fi
   fi
@@ -683,13 +1026,7 @@ download_release_bundle() {
   fi
 
   extract_tar_bundle "$DL_ARC" "${TMP_DOWNLOAD_DIR}/extracted"
-
-  if [ "$(uname -s | tr '[:upper:]' '[:lower:]')" = "$TARGET_OS" ]; then
-    if ! "$RESOLVED_BIN_PATH" version >/dev/null 2>&1; then
-      log_err "Downloaded binary failed preflight check ('${RESOLVED_BIN_PATH} version'); refusing to overwrite running service."
-      exit 1
-    fi
-  fi
+  smoke_test_binary "$RESOLVED_BIN_PATH"
 }
 
 resolve_source_binary() {
@@ -700,7 +1037,7 @@ resolve_source_binary() {
     fi
     RESOLVED_BIN_PATH="$BIN_SRC"
     CAND_ROOT="$(CDPATH= cd -- "$(dirname "$BIN_SRC")" 2>/dev/null && pwd || pwd)"
-    if [ -d "${CAND_ROOT}/themes" ] || [ -d "${CAND_ROOT}/locales" ]; then
+    if [ -d "${CAND_ROOT}/themes" ] || [ -d "${CAND_ROOT}/plugins" ] || [ -d "${CAND_ROOT}/locales" ]; then
       RESOLVED_BUNDLE_DIR="$CAND_ROOT"
     elif [ -d "${SCRIPT_DIR}/../themes" ]; then
       RESOLVED_BUNDLE_DIR="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -709,6 +1046,11 @@ resolve_source_binary() {
   fi
 
   if [ -n "$ARCHIVE_SRC" ]; then
+    if [ "$DRY_RUN" = "1" ] && [ ! -f "$ARCHIVE_SRC" ]; then
+      printf "[dry-run] extract archive '%s'\n" "$ARCHIVE_SRC"
+      RESOLVED_BIN_PATH="/tmp/volo-dry-run-arc-bin"
+      return
+    fi
     if [ ! -f "$ARCHIVE_SRC" ]; then
       log_err "Specified archive not found: $ARCHIVE_SRC"
       exit 1
@@ -737,7 +1079,7 @@ resolve_source_binary() {
       log_info "Using local binary: ${cand}"
       RESOLVED_BIN_PATH="$cand"
       CAND_ROOT="$(CDPATH= cd -- "$(dirname "$cand")" 2>/dev/null && pwd || pwd)"
-      if [ -d "${CAND_ROOT}/themes" ] || [ -d "${CAND_ROOT}/locales" ]; then
+      if [ -d "${CAND_ROOT}/themes" ] || [ -d "${CAND_ROOT}/plugins" ] || [ -d "${CAND_ROOT}/locales" ]; then
         RESOLVED_BUNDLE_DIR="$CAND_ROOT"
       elif [ -d "${SCRIPT_DIR}/../themes" ]; then
         RESOLVED_BUNDLE_DIR="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -849,9 +1191,10 @@ recover_systemd_unit_config() {
     fi
     if [ "$GROUP_EXPLICIT" = "0" ]; then
       EXISTING_G="$(extract_systemd_field "$U_FILE" "Group")"
-      [ -n "$EXISTING_G" ] && SVC_GROUP="$EXISTING_G"
+      if [ -n "$EXISTING_G" ]; then SVC_GROUP="$EXISTING_G"; fi
     fi
   fi
+  return 0
 }
 
 extract_openrc_env_file() {
@@ -904,11 +1247,12 @@ recover_openrc_config() {
       *:*)
         if [ "$GROUP_EXPLICIT" = "0" ]; then
           PARSED_G="${EXISTING_CU#*:}"
-          [ -n "$PARSED_G" ] && SVC_GROUP="$PARSED_G"
+          if [ -n "$PARSED_G" ]; then SVC_GROUP="$PARSED_G"; fi
         fi
         ;;
     esac
   fi
+  return 0
 }
 
 xml_unescape() {
@@ -963,7 +1307,8 @@ extract_macos_plist_prog_arg() {
       if (in_arr && /<\/array>/) { exit }
     }
   ')"
-  [ -n "$RAW_OUT" ] && xml_unescape "$RAW_OUT"
+  if [ -n "$RAW_OUT" ]; then xml_unescape "$RAW_OUT"; fi
+  return 0
 }
 
 extract_macos_plist_key_string() {
@@ -984,7 +1329,8 @@ extract_macos_plist_key_string() {
       }
     }
   ')"
-  [ -n "$RAW_OUT" ] && xml_unescape "$RAW_OUT"
+  if [ -n "$RAW_OUT" ]; then xml_unescape "$RAW_OUT"; fi
+  return 0
 }
 
 recover_macos_plist_config() {
@@ -1009,9 +1355,10 @@ recover_macos_plist_config() {
     fi
     if [ "$GROUP_EXPLICIT" = "0" ]; then
       EXISTING_G="$(extract_macos_plist_key_string "$P_FILE" "GroupName")"
-      [ -n "$EXISTING_G" ] && SVC_GROUP="$EXISTING_G"
+      if [ -n "$EXISTING_G" ]; then SVC_GROUP="$EXISTING_G"; fi
     fi
   fi
+  return 0
 }
 
 systemd_escape_dq() {
@@ -1037,9 +1384,16 @@ write_volo_env_if_missing() {
   fi
 
   if [ -n "$UNIX_SOCKET" ]; then
-    SOCKET_ENV_LINE="VOLO_LISTEN_SOCKET=${UNIX_SOCKET},${UNIX_SOCKET_PERM}"
+    SOCKET_ENV_LINE="VOLO_LISTEN_SOCKET=${UNIX_SOCKET},${UNIX_SOCKET_PERM}
+VOLO_SOCKET_MODE=${UNIX_SOCKET_PERM}"
+    if [ -n "$SOCKET_GROUP" ]; then
+      SOCKET_ENV_LINE="${SOCKET_ENV_LINE}
+VOLO_SOCKET_GROUP=${SOCKET_GROUP}"
+    fi
   else
-    SOCKET_ENV_LINE="# VOLO_LISTEN_SOCKET=/run/volo/volo.sock,0660"
+    SOCKET_ENV_LINE="# VOLO_LISTEN_SOCKET=/run/volo/volo.sock
+# VOLO_SOCKET_MODE=0660
+# VOLO_SOCKET_GROUP=www-data"
   fi
 
   ENV_BODY="# Generated by Volo-go install-service.sh
@@ -1088,8 +1442,9 @@ VOLO_LOCALES_DIR=${TARGET_ROOT}/locales"
 ensure_linux_role_and_group() {
   TARGET_U="$1"
   TARGET_G="$2"
+  SOCK_G="${3:-}"
   if [ "$DRY_RUN" = "1" ]; then
-    printf "[dry-run] ensure system group '%s' and user '%s'\n" "$TARGET_G" "$TARGET_U"
+    printf "[dry-run] ensure system group '%s' and user '%s'%s\n" "$TARGET_G" "$TARGET_U" "${SOCK_G:+ (socket group: $SOCK_G)}"
     return 0
   fi
   if ! grep -q "^${TARGET_G}:" /etc/group 2>/dev/null; then
@@ -1107,6 +1462,17 @@ ensure_linux_role_and_group() {
         || useradd -r -g "$TARGET_G" -s /bin/false "$TARGET_U"
     elif command -v adduser >/dev/null 2>&1; then
       adduser -S -D -H -G "$TARGET_G" -s /sbin/nologin "$TARGET_U"
+    fi
+  fi
+  if [ -n "$SOCK_G" ] && [ "$SOCK_G" != "$TARGET_G" ]; then
+    if grep -q "^${SOCK_G}:" /etc/group 2>/dev/null; then
+      if command -v usermod >/dev/null 2>&1; then
+        usermod -aG "$SOCK_G" "$TARGET_U" 2>/dev/null || true
+      elif command -v addgroup >/dev/null 2>&1; then
+        addgroup "$TARGET_U" "$SOCK_G" 2>/dev/null || true
+      fi
+    else
+      log_warn "Socket group '${SOCK_G}' does not exist in /etc/group yet; ensure '${SOCK_G}' exists before starting."
     fi
   fi
 }
@@ -1131,7 +1497,7 @@ prepare_work_dirs() {
 # ==============================================================================
 run_linux() {
   [ -z "$SVC_USER" ] && SVC_USER="volo"
-  [ -z "$SVC_GROUP" ] && SVC_GROUP="${SOCKET_GROUP:-$SVC_USER}"
+  [ -z "$SVC_GROUP" ] && SVC_GROUP="$SVC_USER"
 
   if [ "$INIT_OVERRIDE" != "auto" ]; then
     INIT_SYS="$INIT_OVERRIDE"
@@ -1149,7 +1515,7 @@ run_linux() {
   LISTEN_DISPLAY="http://${LISTEN_ADDR}"
   PRIVATE_TMP_VAL="true"
   if [ -n "$UNIX_SOCKET" ]; then
-    LISTEN_DISPLAY="unix:${UNIX_SOCKET} (perm ${UNIX_SOCKET_PERM})"
+    LISTEN_DISPLAY="unix:${UNIX_SOCKET} (perm ${UNIX_SOCKET_PERM}${SOCKET_GROUP:+, group $SOCKET_GROUP})"
     case "$UNIX_SOCKET" in
       /tmp/*|/var/tmp/*) PRIVATE_TMP_VAL="false" ;;
     esac
@@ -1173,8 +1539,9 @@ run_linux() {
     case "$ACTION" in
       install)
         resolve_source_binary
+        smoke_test_binary "$RESOLVED_BIN_PATH"
         prepare_work_dirs "$DATA_DIR"
-        sync_bundled_extensions "$DATA_DIR"
+        sync_extensions "$DATA_DIR" "$ENV_FILE"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0600" ""
 
@@ -1198,6 +1565,11 @@ LimitNOFILE=65535
 WantedBy=default.target"
         if [ "$DRY_RUN" = "1" ]; then
           printf "[dry-run] write %s:\n%s\n" "$UNIT_FILE" "$UNIT_CONTENT"
+          if [ "$NO_START" = "1" ]; then
+            printf "[dry-run] systemctl --user daemon-reload && systemctl --user enable %s.service (--no-start)\n" "$SERVICE_NAME"
+          else
+            printf "[dry-run] systemctl --user daemon-reload && systemctl --user enable --now %s.service\n" "$SERVICE_NAME"
+          fi
           return 0
         fi
         mkdir -p "$UNIT_DIR"
@@ -1205,8 +1577,12 @@ WantedBy=default.target"
         printf "%s\n" "$UNIT_CONTENT" > "$UNIT_FILE"
         systemctl --user daemon-reload
         systemctl --user enable "${SERVICE_NAME}.service"
-        systemctl --user restart "${SERVICE_NAME}.service"
-        log_ok "Installed & started user systemd service: ${SERVICE_NAME}.service"
+        if [ "$NO_START" = "1" ]; then
+          log_ok "Installed user systemd service: ${SERVICE_NAME}.service (--no-start set)"
+        else
+          systemctl --user restart "${SERVICE_NAME}.service"
+          log_ok "Installed & started user systemd service: ${SERVICE_NAME}.service"
+        fi
         log_info "Binary   : ${INSTALL_BIN}"
         log_info "Config   : ${ENV_FILE}"
         log_info "Data Dir : ${DATA_DIR}"
@@ -1215,16 +1591,40 @@ WantedBy=default.target"
       upgrade)
         recover_systemd_unit_config "$UNIT_FILE"
         resolve_source_binary
-        [ -d "$DATA_DIR" ] && sync_bundled_extensions "$DATA_DIR"
+        smoke_test_binary "$RESOLVED_BIN_PATH"
+        perform_pre_upgrade_backup "$INSTALL_BIN" "$DATA_DIR" "$ENV_FILE" ""
+        backup_live_binary "$INSTALL_BIN"
+        sync_extensions "$DATA_DIR" "$ENV_FILE"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] systemctl --user daemon-reload && systemctl --user restart %s.service\n" "$SERVICE_NAME"
+          if [ "$NO_START" = "1" ]; then
+            printf "[dry-run] systemctl --user daemon-reload (--no-start)\n"
+          else
+            printf "[dry-run] systemctl --user daemon-reload && systemctl --user restart %s.service\n" "$SERVICE_NAME"
+            poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"
+          fi
           return 0
         fi
         if [ -f "$UNIT_FILE" ]; then
           systemctl --user daemon-reload
-          systemctl --user restart "${SERVICE_NAME}.service"
-          log_ok "Upgraded & restarted user service (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+          if [ "$NO_START" = "1" ]; then
+            log_ok "Upgraded user binary at ${INSTALL_BIN} (--no-start set; service restart skipped)."
+          else
+            RESTART_OK="1"
+            systemctl --user restart "${SERVICE_NAME}.service" || RESTART_OK="0"
+            if [ "$RESTART_OK" = "0" ] || ! poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"; then
+              log_err "Upgrade healthcheck failed for user service ${SERVICE_NAME}.service!"
+              journalctl --user -u "${SERVICE_NAME}.service" -n 20 --no-pager >&2 2>/dev/null || true
+              if [ "$HAD_PREV_BIN" = "1" ] && [ -f "${INSTALL_BIN}.bak" ]; then
+                log_warn "Rolling back ${INSTALL_BIN}.bak -> ${INSTALL_BIN} and restarting previous version..."
+                copy_binary_safe "${INSTALL_BIN}.bak" "$INSTALL_BIN"
+                systemctl --user restart "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+                log_err "Rolled back ${INSTALL_BIN} to previous version after failed upgrade healthcheck."
+              fi
+              exit 1
+            fi
+            log_ok "Upgraded, verified /healthz & restarted user service (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+          fi
         else
           log_ok "Upgraded binary at ${INSTALL_BIN}"
         fi
@@ -1235,14 +1635,14 @@ WantedBy=default.target"
           validate_safe_purge_dir "$DATA_DIR"
         fi
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] systemctl --user disable --now %s.service && rm -f '%s' '%s'\n" "$SERVICE_NAME" "$UNIT_FILE" "$INSTALL_BIN"
+          printf "[dry-run] systemctl --user disable --now %s.service && rm -f '%s' '%s' '%s.bak'\n" "$SERVICE_NAME" "$UNIT_FILE" "$INSTALL_BIN" "$INSTALL_BIN"
           if [ "$PURGE_DATA" = "1" ]; then
             printf "[dry-run] rm -rf '%s' && rm -f '%s'\n" "$DATA_DIR" "$ENV_FILE"
           fi
           return 0
         fi
         systemctl --user disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
-        rm -f "$UNIT_FILE" "$INSTALL_BIN"
+        rm -f "$UNIT_FILE" "$INSTALL_BIN" "${INSTALL_BIN}.bak"
         systemctl --user daemon-reload >/dev/null 2>&1 || true
         if [ "$PURGE_DATA" = "1" ]; then
           rm -rf "$DATA_DIR"
@@ -1253,9 +1653,17 @@ WantedBy=default.target"
         fi
         ;;
       start|stop|restart|status)
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] systemctl --user %s %s.service\n" "$ACTION" "$SERVICE_NAME"
+          return 0
+        fi
         systemctl --user "$ACTION" "${SERVICE_NAME}.service"
         ;;
       logs)
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] journalctl --user -u %s.service -f -n 100\n" "$SERVICE_NAME"
+          return 0
+        fi
         journalctl --user -u "${SERVICE_NAME}.service" -f -n 100
         ;;
     esac
@@ -1283,21 +1691,33 @@ WantedBy=default.target"
     case "$ACTION" in
       install)
         resolve_source_binary
-        ensure_linux_role_and_group "$SVC_USER" "$SVC_GROUP"
+        smoke_test_binary "$RESOLVED_BIN_PATH"
+        ensure_linux_role_and_group "$SVC_USER" "$SVC_GROUP" "$SOCKET_GROUP"
         prepare_work_dirs "$DATA_DIR"
-        sync_bundled_extensions "$DATA_DIR"
+        sync_extensions "$DATA_DIR" "$ENV_FILE"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0640" "root:${SVC_GROUP}"
 
-        SUPP_BLOCK=""
+        SUPP_LIST=""
         if [ -n "$SUPP_GROUPS" ]; then
-          SUPP_SPACED="$(printf "%s" "$SUPP_GROUPS" | tr ',' ' ')"
-          SUPP_BLOCK="SupplementaryGroups=${SUPP_SPACED}
-"
-        elif [ -n "$SOCKET_GROUP" ] && [ "$SOCKET_GROUP" != "$SVC_GROUP" ]; then
-          SUPP_BLOCK="SupplementaryGroups=${SOCKET_GROUP}
+          SUPP_LIST="$(printf "%s" "$SUPP_GROUPS" | tr ',' ' ')"
+        fi
+        if [ -n "$SOCKET_GROUP" ] && [ "$SOCKET_GROUP" != "$SVC_GROUP" ]; then
+          case " ${SUPP_LIST} " in
+            *" ${SOCKET_GROUP} "*) ;;
+            *) SUPP_LIST="${SUPP_LIST:+${SUPP_LIST} }${SOCKET_GROUP}" ;;
+          esac
+        fi
+        SUPP_BLOCK=""
+        if [ -n "$SUPP_LIST" ]; then
+          SUPP_BLOCK="SupplementaryGroups=${SUPP_LIST}
 "
         fi
+
+        PROTECT_HOME_VAL="true"
+        case "$DATA_DIR" in
+          /home/*|/root/*) PROTECT_HOME_VAL="read-only" ;;
+        esac
 
         RW_PATHS="$(format_systemd_arg "$DATA_DIR") /run/volo"
         EXEC_PRE_BLOCK=""
@@ -1333,7 +1753,7 @@ LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=${PRIVATE_TMP_VAL}
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=${PROTECT_HOME_VAL}
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
@@ -1348,7 +1768,11 @@ WantedBy=multi-user.target"
         if [ "$DRY_RUN" = "1" ]; then
           printf "[dry-run] chown -R %s:%s %s && chmod %s %s\n" "$SVC_USER" "$SVC_GROUP" "$DATA_DIR" "$DATA_DIR_MODE" "$DATA_DIR"
           printf "[dry-run] write %s:\n%s\n" "$UNIT_FILE" "$UNIT_CONTENT"
-          printf "[dry-run] systemctl daemon-reload && systemctl enable --now %s.service\n" "$SERVICE_NAME"
+          if [ "$NO_START" = "1" ]; then
+            printf "[dry-run] systemctl daemon-reload && systemctl enable %s.service (--no-start)\n" "$SERVICE_NAME"
+          else
+            printf "[dry-run] systemctl daemon-reload && systemctl enable --now %s.service\n" "$SERVICE_NAME"
+          fi
           return 0
         fi
 
@@ -1364,30 +1788,59 @@ WantedBy=multi-user.target"
         chmod 0644 "$UNIT_FILE"
         systemctl daemon-reload
         systemctl enable "${SERVICE_NAME}.service"
-        systemctl restart "${SERVICE_NAME}.service"
-        log_ok "Volo-go systemd service installed and started!"
+        if [ "$NO_START" = "1" ]; then
+          log_ok "Volo-go systemd service installed (--no-start set; not started)!"
+        else
+          systemctl restart "${SERVICE_NAME}.service"
+          log_ok "Volo-go systemd service installed and started!"
+        fi
         log_info "Binary   : ${INSTALL_BIN}"
         log_info "Config   : ${ENV_FILE}"
-        log_info "Role     : User=${SVC_USER}, Group=${SVC_GROUP}"
+        log_info "Role     : User=${SVC_USER}, Group=${SVC_GROUP}${SOCKET_GROUP:+, SocketGroup=${SOCKET_GROUP}}"
         log_info "Data Dir : ${DATA_DIR} (mode ${DATA_DIR_MODE})"
         log_info "Listen   : ${LISTEN_DISPLAY}"
         ;;
       upgrade)
         recover_systemd_unit_config "$UNIT_FILE"
         resolve_source_binary
-        if [ -d "$DATA_DIR" ]; then
-          sync_bundled_extensions "$DATA_DIR"
-          [ "$DRY_RUN" = "0" ] && safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
+        smoke_test_binary "$RESOLVED_BIN_PATH"
+        perform_pre_upgrade_backup "$INSTALL_BIN" "$DATA_DIR" "$ENV_FILE" "${SVC_USER}:${SVC_GROUP}"
+        backup_live_binary "$INSTALL_BIN"
+        resolve_extension_dirs "$DATA_DIR" "$ENV_FILE"
+        sync_extensions "$DATA_DIR" "$ENV_FILE"
+        if [ "$DRY_RUN" = "0" ]; then
+          safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "$RESOLVED_PLUGINS_DIR" "$RESOLVED_THEMES_DIR" "$RESOLVED_LOCALES_DIR" 2>/dev/null || true
         fi
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] systemctl daemon-reload && systemctl restart %s.service\n" "$SERVICE_NAME"
+          if [ "$NO_START" = "1" ]; then
+            printf "[dry-run] systemctl daemon-reload (--no-start)\n"
+          else
+            printf "[dry-run] systemctl daemon-reload && systemctl restart %s.service\n" "$SERVICE_NAME"
+            poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"
+          fi
           return 0
         fi
         if [ -f "$UNIT_FILE" ]; then
           systemctl daemon-reload
-          systemctl restart "${SERVICE_NAME}.service"
-          log_ok "Upgraded & restarted ${SERVICE_NAME}.service (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+          if [ "$NO_START" = "1" ]; then
+            log_ok "Upgraded binary at ${INSTALL_BIN} (--no-start set; service restart skipped)."
+          else
+            RESTART_OK="1"
+            systemctl restart "${SERVICE_NAME}.service" || RESTART_OK="0"
+            if [ "$RESTART_OK" = "0" ] || ! poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"; then
+              log_err "Upgrade verification failed: ${SERVICE_NAME}.service failed to start or pass /healthz within 15s!"
+              journalctl -u "${SERVICE_NAME}.service" -n 25 --no-pager >&2 2>/dev/null || true
+              if [ "$HAD_PREV_BIN" = "1" ] && [ -f "${INSTALL_BIN}.bak" ]; then
+                log_warn "Rolling back ${INSTALL_BIN}.bak -> ${INSTALL_BIN} and restarting previous version..."
+                copy_binary_safe "${INSTALL_BIN}.bak" "$INSTALL_BIN"
+                systemctl restart "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+                log_err "Rolled back ${INSTALL_BIN} to previous version and restarted ${SERVICE_NAME}.service."
+              fi
+              exit 1
+            fi
+            log_ok "Upgraded, verified /healthz & restarted ${SERVICE_NAME}.service (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+          fi
         else
           log_ok "Upgraded binary at ${INSTALL_BIN} (service unit not yet registered; run 'install' to register)."
         fi
@@ -1398,14 +1851,14 @@ WantedBy=multi-user.target"
           validate_safe_purge_dir "$DATA_DIR"
         fi
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] systemctl disable --now %s.service && rm -f '%s' '%s'\n" "$SERVICE_NAME" "$UNIT_FILE" "$INSTALL_BIN"
+          printf "[dry-run] systemctl disable --now %s.service && rm -f '%s' '%s' '%s.bak'\n" "$SERVICE_NAME" "$UNIT_FILE" "$INSTALL_BIN" "$INSTALL_BIN"
           if [ "$PURGE_DATA" = "1" ]; then
             printf "[dry-run] rm -rf '%s' && safe_remove_env_file '%s'\n" "$DATA_DIR" "$ENV_FILE"
           fi
           return 0
         fi
         systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
-        rm -f "$UNIT_FILE" "$INSTALL_BIN"
+        rm -f "$UNIT_FILE" "$INSTALL_BIN" "${INSTALL_BIN}.bak"
         systemctl daemon-reload >/dev/null 2>&1 || true
         if [ "$PURGE_DATA" = "1" ]; then
           rm -rf "$DATA_DIR"
@@ -1416,9 +1869,17 @@ WantedBy=multi-user.target"
         fi
         ;;
       start|stop|restart|status)
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] systemctl %s %s.service\n" "$ACTION" "$SERVICE_NAME"
+          return 0
+        fi
         systemctl "$ACTION" "${SERVICE_NAME}.service"
         ;;
       logs)
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] journalctl -u %s.service -f -n 100\n" "$SERVICE_NAME"
+          return 0
+        fi
         journalctl -u "${SERVICE_NAME}.service" -f -n 100
         ;;
     esac
@@ -1428,9 +1889,10 @@ WantedBy=multi-user.target"
     case "$ACTION" in
       install)
         resolve_source_binary
-        ensure_linux_role_and_group "$SVC_USER" "$SVC_GROUP"
+        smoke_test_binary "$RESOLVED_BIN_PATH"
+        ensure_linux_role_and_group "$SVC_USER" "$SVC_GROUP" "$SOCKET_GROUP"
         prepare_work_dirs "$DATA_DIR"
-        sync_bundled_extensions "$DATA_DIR"
+        sync_extensions "$DATA_DIR" "$ENV_FILE"
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0640" "root:${SVC_GROUP}"
 
@@ -1448,13 +1910,18 @@ WantedBy=multi-user.target"
             ESC_SOCK_GROUP="$(openrc_escape_dq "${SOCKET_GROUP:-$SVC_GROUP}")"
             ESC_SOCK_PARENT="$(openrc_escape_dq "$SOCK_PARENT")"
             OPENRC_SOCK_CHECK="
-    checkpath --directory --owner \"${ESC_SVC_USER}:${ESC_SOCK_GROUP}\" --mode 0755 \"${ESC_SOCK_PARENT}\""
+    checkpath -d -m 0755 -o \"${ESC_SVC_USER}:${ESC_SOCK_GROUP}\" \"${ESC_SOCK_PARENT}\""
           fi
         fi
 
         OPENRC_CONTENT="#!/sbin/openrc-run
 name=\"Volo-go\"
 description=\"Volo-go Pure-Go Sovereign Blog Engine\"
+
+set -a
+if [ -f \"${ESC_ENV_FILE}\" ]; then . \"${ESC_ENV_FILE}\"; fi
+set +a
+
 command=\"${ESC_INSTALL_BIN}\"
 command_args=\"serve --env-file \\\"${ESC_ENV_FILE}\\\"\"
 command_user=\"${ESC_SVC_USER}:${ESC_SVC_GROUP}\"
@@ -1473,12 +1940,16 @@ depend() {
 }
 
 start_pre() {
-    checkpath --directory --owner \"\${command_user}\" --mode 0755 /run/volo /var/log/volo
-    checkpath --directory --owner \"\${command_user}\" --mode ${DATA_DIR_MODE} \"${ESC_DATA_DIR}\"${OPENRC_SOCK_CHECK}
+    checkpath -d -m 0755 -o \"\${command_user}\" /run/volo /var/log/volo
+    checkpath -d -m ${DATA_DIR_MODE} -o \"\${command_user}\" \"${ESC_DATA_DIR}\"${OPENRC_SOCK_CHECK}
 }"
         if [ "$DRY_RUN" = "1" ]; then
           printf "[dry-run] write %s:\n%s\n" "$INIT_SCRIPT" "$OPENRC_CONTENT"
-          printf "[dry-run] rc-update add %s default && rc-service %s restart\n" "$SERVICE_NAME" "$SERVICE_NAME"
+          if [ "$NO_START" = "1" ]; then
+            printf "[dry-run] rc-update add %s default (--no-start)\n" "$SERVICE_NAME"
+          else
+            printf "[dry-run] rc-update add %s default && rc-service %s restart\n" "$SERVICE_NAME" "$SERVICE_NAME"
+          fi
           return 0
         fi
         if [ -n "$UNIX_SOCKET" ]; then
@@ -1494,8 +1965,12 @@ start_pre() {
         printf "%s\n" "$OPENRC_CONTENT" > "$INIT_SCRIPT"
         chmod 0755 "$INIT_SCRIPT"
         rc-update add "$SERVICE_NAME" default
-        rc-service "$SERVICE_NAME" restart || rc-service "$SERVICE_NAME" start
-        log_ok "Volo-go OpenRC service installed and started!"
+        if [ "$NO_START" = "1" ]; then
+          log_ok "Volo-go OpenRC service installed (--no-start set; not started)!"
+        else
+          rc-service "$SERVICE_NAME" restart || rc-service "$SERVICE_NAME" start
+          log_ok "Volo-go OpenRC service installed and started!"
+        fi
         log_info "Binary   : ${INSTALL_BIN}"
         log_info "Config   : ${ENV_FILE}"
         log_info "Listen   : ${LISTEN_DISPLAY}"
@@ -1503,18 +1978,43 @@ start_pre() {
       upgrade)
         recover_openrc_config "$INIT_SCRIPT"
         resolve_source_binary
-        if [ -d "$DATA_DIR" ]; then
-          sync_bundled_extensions "$DATA_DIR"
-          [ "$DRY_RUN" = "0" ] && safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
+        smoke_test_binary "$RESOLVED_BIN_PATH"
+        perform_pre_upgrade_backup "$INSTALL_BIN" "$DATA_DIR" "$ENV_FILE" "${SVC_USER}:${SVC_GROUP}"
+        backup_live_binary "$INSTALL_BIN"
+        resolve_extension_dirs "$DATA_DIR" "$ENV_FILE"
+        sync_extensions "$DATA_DIR" "$ENV_FILE"
+        if [ "$DRY_RUN" = "0" ]; then
+          safe_chown_tree "${SVC_USER}:${SVC_GROUP}" "$RESOLVED_PLUGINS_DIR" "$RESOLVED_THEMES_DIR" "$RESOLVED_LOCALES_DIR" 2>/dev/null || true
         fi
         copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] rc-service %s restart\n" "$SERVICE_NAME"
+          if [ "$NO_START" = "1" ]; then
+            printf "[dry-run] skip OpenRC restart (--no-start)\n"
+          else
+            printf "[dry-run] rc-service %s restart\n" "$SERVICE_NAME"
+            poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"
+          fi
           return 0
         fi
         if [ -f "$INIT_SCRIPT" ]; then
-          rc-service "$SERVICE_NAME" restart || rc-service "$SERVICE_NAME" start
-          log_ok "Upgraded & restarted OpenRC service (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+          if [ "$NO_START" = "1" ]; then
+            log_ok "Upgraded binary at ${INSTALL_BIN} (--no-start set; service restart skipped)."
+          else
+            RESTART_OK="1"
+            (rc-service "$SERVICE_NAME" restart || rc-service "$SERVICE_NAME" start) || RESTART_OK="0"
+            if [ "$RESTART_OK" = "0" ] || ! poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"; then
+              log_err "Upgrade verification failed: OpenRC service ${SERVICE_NAME} failed to start or pass /healthz within 15s!"
+              [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" >&2 2>/dev/null || true
+              if [ "$HAD_PREV_BIN" = "1" ] && [ -f "${INSTALL_BIN}.bak" ]; then
+                log_warn "Rolling back ${INSTALL_BIN}.bak -> ${INSTALL_BIN} and restarting previous version..."
+                copy_binary_safe "${INSTALL_BIN}.bak" "$INSTALL_BIN"
+                (rc-service "$SERVICE_NAME" restart || rc-service "$SERVICE_NAME" start) >/dev/null 2>&1 || true
+                log_err "Rolled back ${INSTALL_BIN} to previous version and restarted OpenRC service."
+              fi
+              exit 1
+            fi
+            log_ok "Upgraded, verified /healthz & restarted OpenRC service (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+          fi
         else
           log_ok "Upgraded binary at ${INSTALL_BIN}"
         fi
@@ -1525,7 +2025,7 @@ start_pre() {
           validate_safe_purge_dir "$DATA_DIR"
         fi
         if [ "$DRY_RUN" = "1" ]; then
-          printf "[dry-run] rc-service %s stop && rc-update del %s default && rm -f '%s' '%s'\n" "$SERVICE_NAME" "$SERVICE_NAME" "$INIT_SCRIPT" "$INSTALL_BIN"
+          printf "[dry-run] rc-service %s stop && rc-update del %s default && rm -f '%s' '%s' '%s.bak'\n" "$SERVICE_NAME" "$SERVICE_NAME" "$INIT_SCRIPT" "$INSTALL_BIN" "$INSTALL_BIN"
           if [ "$PURGE_DATA" = "1" ]; then
             printf "[dry-run] rm -rf '%s' && safe_remove_env_file '%s'\n" "$DATA_DIR" "$ENV_FILE"
           fi
@@ -1533,7 +2033,7 @@ start_pre() {
         fi
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
-        rm -f "$INIT_SCRIPT" "$INSTALL_BIN"
+        rm -f "$INIT_SCRIPT" "$INSTALL_BIN" "${INSTALL_BIN}.bak"
         if [ "$PURGE_DATA" = "1" ]; then
           rm -rf "$DATA_DIR"
           safe_remove_env_file "$ENV_FILE"
@@ -1543,9 +2043,17 @@ start_pre() {
         fi
         ;;
       start|stop|restart|status)
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] rc-service %s %s\n" "$SERVICE_NAME" "$ACTION"
+          return 0
+        fi
         rc-service "$SERVICE_NAME" "$ACTION"
         ;;
       logs)
+        if [ "$DRY_RUN" = "1" ]; then
+          printf "[dry-run] tail -n 100 -f '%s'\n" "$LOG_FILE"
+          return 0
+        fi
         tail -n 100 -f "$LOG_FILE"
         ;;
     esac
@@ -1565,6 +2073,20 @@ compute_macos_owner() {
   else
     printf ""
   fi
+}
+
+restart_macos_launchd() {
+  DOM="$1"
+  LBL="$2"
+  PF="$3"
+  if launchctl kickstart -k "${DOM}/${LBL}" >/dev/null 2>&1; then
+    return 0
+  fi
+  if launchctl bootstrap "$DOM" "$PF" >/dev/null 2>&1 || launchctl load -w "$PF" >/dev/null 2>&1; then
+    launchctl kickstart -k "${DOM}/${LBL}" >/dev/null 2>&1 || true
+    return 0
+  fi
+  return 1
 }
 
 run_macos() {
@@ -1604,8 +2126,9 @@ run_macos() {
   case "$ACTION" in
     install)
       resolve_source_binary
+      smoke_test_binary "$RESOLVED_BIN_PATH"
       prepare_work_dirs "$DATA_DIR"
-      sync_bundled_extensions "$DATA_DIR"
+      sync_extensions "$DATA_DIR" "$ENV_FILE"
       copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
       MACOS_OWNER="$(compute_macos_owner)"
       write_volo_env_if_missing "$ENV_FILE" "$DATA_DIR" "0600" "$MACOS_OWNER"
@@ -1676,7 +2199,11 @@ ${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
           printf "[dry-run] chgrp -R %s '%s' '%s' '%s'\n" "$SVC_GROUP" "$DATA_DIR" "$LOG_DIR" "$ENV_FILE"
         fi
         printf "[dry-run] write %s:\n%s\n" "$PLIST_FILE" "$PLIST_CONTENT"
-        printf "[dry-run] launchctl bootstrap %s '%s'\n" "$DOMAIN_TARGET" "$PLIST_FILE"
+        if [ "$NO_START" = "1" ]; then
+          printf "[dry-run] skip launchctl bootstrap (--no-start)\n"
+        else
+          printf "[dry-run] launchctl bootstrap %s '%s'\n" "$DOMAIN_TARGET" "$PLIST_FILE"
+        fi
         return 0
       fi
 
@@ -1696,12 +2223,16 @@ ${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
       safe_chmod_dir "$DATA_DIR_MODE" "$DATA_DIR" "${DATA_DIR}/data" 2>/dev/null || true
       printf "%s\n" "$PLIST_CONTENT" > "$PLIST_FILE"
       chmod 0644 "$PLIST_FILE"
-      launchctl bootout "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || launchctl unload "$PLIST_FILE" >/dev/null 2>&1 || true
-      if ! launchctl bootstrap "$DOMAIN_TARGET" "$PLIST_FILE" >/dev/null 2>&1; then
-        launchctl load -w "$PLIST_FILE"
+      if [ "$NO_START" = "1" ]; then
+        log_ok "Volo-go macOS launchd plist written (${MACOS_LABEL}; --no-start set)!"
+      else
+        launchctl bootout "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || launchctl unload "$PLIST_FILE" >/dev/null 2>&1 || true
+        if ! launchctl bootstrap "$DOMAIN_TARGET" "$PLIST_FILE" >/dev/null 2>&1; then
+          launchctl load -w "$PLIST_FILE"
+        fi
+        launchctl kickstart -k "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || true
+        log_ok "Volo-go macOS launchd service (${MACOS_LABEL}) installed & started!"
       fi
-      launchctl kickstart -k "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || true
-      log_ok "Volo-go macOS launchd service (${MACOS_LABEL}) installed & started!"
       log_info "Plist    : ${PLIST_FILE}"
       log_info "Binary   : ${INSTALL_BIN}"
       log_info "Config   : ${ENV_FILE}"
@@ -1712,21 +2243,45 @@ ${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
       recover_macos_plist_config "$PLIST_FILE"
       MACOS_OWNER="$(compute_macos_owner)"
       resolve_source_binary
-      if [ -d "$DATA_DIR" ]; then
-        sync_bundled_extensions "$DATA_DIR"
-        if [ "$DRY_RUN" = "0" ] && [ -n "$MACOS_OWNER" ]; then
-          safe_chown_tree "$MACOS_OWNER" "${DATA_DIR}/plugins" "${DATA_DIR}/themes" "${DATA_DIR}/locales" 2>/dev/null || true
-        fi
+      smoke_test_binary "$RESOLVED_BIN_PATH"
+      perform_pre_upgrade_backup "$INSTALL_BIN" "$DATA_DIR" "$ENV_FILE" "$MACOS_OWNER"
+      backup_live_binary "$INSTALL_BIN"
+      resolve_extension_dirs "$DATA_DIR" "$ENV_FILE"
+      sync_extensions "$DATA_DIR" "$ENV_FILE"
+      if [ "$DRY_RUN" = "0" ] && [ -n "$MACOS_OWNER" ]; then
+        safe_chown_tree "$MACOS_OWNER" "$RESOLVED_PLUGINS_DIR" "$RESOLVED_THEMES_DIR" "$RESOLVED_LOCALES_DIR" 2>/dev/null || true
       fi
       copy_binary_safe "$RESOLVED_BIN_PATH" "$INSTALL_BIN"
       if [ "$DRY_RUN" = "1" ]; then
-        printf "[dry-run] launchctl kickstart -k %s/%s\n" "$DOMAIN_TARGET" "$MACOS_LABEL"
+        if [ "$NO_START" = "1" ]; then
+          printf "[dry-run] skip launchctl kickstart (--no-start)\n"
+        else
+          printf "[dry-run] launchctl kickstart -k %s/%s\n" "$DOMAIN_TARGET" "$MACOS_LABEL"
+          poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"
+        fi
         return 0
       fi
       xattr -d com.apple.quarantine "$INSTALL_BIN" >/dev/null 2>&1 || true
       if [ -f "$PLIST_FILE" ]; then
-        launchctl kickstart -k "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || true
-        log_ok "Upgraded & restarted ${MACOS_LABEL} (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+        if [ "$NO_START" = "1" ]; then
+          log_ok "Upgraded binary at ${INSTALL_BIN} (--no-start set; service restart skipped)."
+        else
+          RESTART_OK="1"
+          restart_macos_launchd "$DOMAIN_TARGET" "$MACOS_LABEL" "$PLIST_FILE" || RESTART_OK="0"
+          if [ "$RESTART_OK" = "0" ] || ! poll_service_healthcheck "$INSTALL_BIN" "$ENV_FILE"; then
+            log_err "Upgrade verification failed: ${MACOS_LABEL} failed to start or pass /healthz within 15s!"
+            [ -f "$ERR_LOG" ] && tail -n 25 "$ERR_LOG" >&2 2>/dev/null || true
+            if [ "$HAD_PREV_BIN" = "1" ] && [ -f "${INSTALL_BIN}.bak" ]; then
+              log_warn "Rolling back ${INSTALL_BIN}.bak -> ${INSTALL_BIN} and restarting previous version..."
+              copy_binary_safe "${INSTALL_BIN}.bak" "$INSTALL_BIN"
+              xattr -d com.apple.quarantine "$INSTALL_BIN" >/dev/null 2>&1 || true
+              restart_macos_launchd "$DOMAIN_TARGET" "$MACOS_LABEL" "$PLIST_FILE" || true
+              log_err "Rolled back ${INSTALL_BIN} to previous version and restarted ${MACOS_LABEL}."
+            fi
+            exit 1
+          fi
+          log_ok "Upgraded, verified /healthz & restarted ${MACOS_LABEL} (${INSTALL_BIN}): $("$INSTALL_BIN" version 2>/dev/null || printf "OK")"
+        fi
       else
         log_ok "Upgraded binary at ${INSTALL_BIN}"
       fi
@@ -1738,14 +2293,14 @@ ${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
         validate_safe_purge_dir "$LOG_DIR"
       fi
       if [ "$DRY_RUN" = "1" ]; then
-        printf "[dry-run] launchctl bootout %s/%s && rm -f '%s' '%s'\n" "$DOMAIN_TARGET" "$MACOS_LABEL" "$PLIST_FILE" "$INSTALL_BIN"
+        printf "[dry-run] launchctl bootout %s/%s && rm -f '%s' '%s' '%s.bak'\n" "$DOMAIN_TARGET" "$MACOS_LABEL" "$PLIST_FILE" "$INSTALL_BIN" "$INSTALL_BIN"
         if [ "$PURGE_DATA" = "1" ]; then
           printf "[dry-run] rm -rf '%s' '%s' && safe_remove_env_file '%s'\n" "$DATA_DIR" "$LOG_DIR" "$ENV_FILE"
         fi
         return 0
       fi
       launchctl bootout "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || launchctl unload -w "$PLIST_FILE" >/dev/null 2>&1 || true
-      rm -f "$PLIST_FILE" "$INSTALL_BIN"
+      rm -f "$PLIST_FILE" "$INSTALL_BIN" "${INSTALL_BIN}.bak"
       if [ "$PURGE_DATA" = "1" ]; then
         rm -rf "$DATA_DIR" "$LOG_DIR"
         safe_remove_env_file "$ENV_FILE"
@@ -1755,21 +2310,41 @@ ${ROLE_PLIST_BLOCK}  <key>ProgramArguments</key>
       fi
       ;;
     start)
+      if [ "$DRY_RUN" = "1" ]; then
+        printf "[dry-run] launchctl kickstart %s/%s\n" "$DOMAIN_TARGET" "$MACOS_LABEL"
+        return 0
+      fi
       launchctl kickstart "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || launchctl start "$MACOS_LABEL"
       log_ok "Started ${MACOS_LABEL}"
       ;;
     stop)
+      if [ "$DRY_RUN" = "1" ]; then
+        printf "[dry-run] launchctl kill SIGTERM %s/%s\n" "$DOMAIN_TARGET" "$MACOS_LABEL"
+        return 0
+      fi
       launchctl kill SIGTERM "${DOMAIN_TARGET}/${MACOS_LABEL}" >/dev/null 2>&1 || launchctl stop "$MACOS_LABEL"
       log_ok "Stopped ${MACOS_LABEL}"
       ;;
     restart)
+      if [ "$DRY_RUN" = "1" ]; then
+        printf "[dry-run] launchctl kickstart -k %s/%s\n" "$DOMAIN_TARGET" "$MACOS_LABEL"
+        return 0
+      fi
       launchctl kickstart -k "${DOMAIN_TARGET}/${MACOS_LABEL}"
       log_ok "Restarted ${MACOS_LABEL}"
       ;;
     status)
+      if [ "$DRY_RUN" = "1" ]; then
+        printf "[dry-run] launchctl print %s/%s\n" "$DOMAIN_TARGET" "$MACOS_LABEL"
+        return 0
+      fi
       launchctl print "${DOMAIN_TARGET}/${MACOS_LABEL}" || launchctl list | grep "$MACOS_LABEL" || log_warn "Service ${MACOS_LABEL} is not loaded."
       ;;
     logs)
+      if [ "$DRY_RUN" = "1" ]; then
+        printf "[dry-run] tail -n 100 -f '%s' '%s'\n" "$OUT_LOG" "$ERR_LOG"
+        return 0
+      fi
       mkdir -p "$LOG_DIR"
       touch "$OUT_LOG" "$ERR_LOG"
       tail -n 100 -f "$OUT_LOG" "$ERR_LOG"

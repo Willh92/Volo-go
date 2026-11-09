@@ -527,7 +527,9 @@ func TestPillarsSecurityHeadersAuthHardeningPublic404sBookReaderAndAdminBatchEnd
 	if dryRestResp.StatusCode != http.StatusOK || !bytes.Contains(dryRestBody, []byte(`"dry_run":true`)) {
 		t.Fatalf("dry-run local backup restore failed: %d %s", dryRestResp.StatusCode, string(dryRestBody))
 	}
-	liveRestResp, liveRestBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/backup/local/"+snapRes.File+"/restore", map[string]any{}, adminCookies, csrfHdr)
+	liveRestResp, liveRestBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/backup/local/"+snapRes.File+"/restore", map[string]any{
+		"current_password": "InitialPass99!",
+	}, adminCookies, csrfHdr)
 	if liveRestResp.StatusCode != http.StatusOK {
 		t.Fatalf("live local backup restore failed: %d %s", liveRestResp.StatusCode, string(liveRestBody))
 	}
@@ -781,5 +783,3 @@ func TestVoloSoloUIPolish_CommentsDesc_Bookshelf_Templates(t *testing.T) {
 		t.Fatalf("GET /api/admin/runtime-logs?format=text = %d", rtTxtResp.StatusCode)
 	}
 }
-
-

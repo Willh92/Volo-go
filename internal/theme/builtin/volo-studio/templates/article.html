@@ -137,7 +137,7 @@
               <button type="button" class="tag-chip studio-tags-more-btn js-foot-tags-toggle"
                       aria-expanded="false"
                       data-more-label="+{{sub $tagLen 12}}"
-                      data-less-label="{{if hasPrefix .Locale "en"}}Show less{{else if eq .Locale "zh-TW"}}收起{{else}}收起{{end}}">+{{sub $tagLen 12}}</button>
+                      data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $tagLen 12}}</button>
             {{end}}
           </div>
         {{end}}

@@ -8,35 +8,61 @@ Binary distributions and container images of `Volo-go` incorporate the following
 
 ---
 
-## 1. Go Runtime & Backend Dependencies / Go 后端依赖
+## 1. Direct Go Runtime Dependencies (`go.mod`) / Go 后端直接依赖
 
-| Module / 模块 | License / 许可证 | Purpose / 用途 |Upstream / 来源 |
-| :--- | :--- | :--- | :--- |
-| `modernc.org/sqlite` | BSD-3-Clause | Pure-Go (`CGO_ENABLED=0`) SQLite engine | https://gitlab.com/cznic/sqlite |
-| `github.com/jackc/pgx/v5` | MIT | PostgreSQL / Supabase / Neon / CockroachDB driver | https://github.com/jackc/pgx |
-| `github.com/go-sql-driver/mysql` | MPL-2.0 | MySQL 8+ / MariaDB / TiDB pure-Go driver (unmodified module) | https://github.com/go-sql-driver/mysql |
-| `github.com/yuin/goldmark` | MIT | CommonMark + GFM Markdown AST parser & renderer | https://github.com/yuin/goldmark |
-| `github.com/yuin/goldmark-highlighting/v2` | MIT | Goldmark syntax highlighting integration | https://github.com/yuin/goldmark-highlighting |
-| `github.com/alecthomas/chroma/v2` | MIT | Server-side lexical syntax highlighter | https://github.com/alecthomas/chroma |
-| `github.com/microcosm-cc/bluemonday` | BSD-3-Clause | Strict HTML allowlist sanitizer (XSS defense) | https://github.com/microcosm-cc/bluemonday |
-| `github.com/dop251/goja` | MIT | Pure-Go ECMAScript 5.1+ embedded plugin VM | https://github.com/dop251/goja |
-| `github.com/Gen2Brain/webp` / `github.com/HugoSmits86/nativewebp` | MIT | Pure-Go WebP encoder/decoder | https://github.com/HugoSmits86/nativewebp |
-| `golang.org/x/crypto` | BSD-3-Clause | `Argon2id` & `PBKDF2` cryptographic primitives | https://cs.opensource.google/go/x/crypto |
-| `golang.org/x/image` | BSD-3-Clause | Pure-Go image decoding & scaling | https://cs.opensource.google/go/x/image |
-| `golang.org/x/net` | BSD-3-Clause | HTML5 tokenizer & network utilities | https://cs.opensource.google/go/x/net |
-| `golang.org/x/text` | BSD-3-Clause | Unicode & language tag normalization | https://cs.opensource.google/go/x/text |
+| Module / 模块 | Version / 版本 | License / 许可证 | Purpose / 用途 | Upstream / 来源 |
+| :--- | :--- | :--- | :--- | :--- |
+| `modernc.org/sqlite` | `v1.61.1` | BSD-3-Clause | Pure-Go (`CGO_ENABLED=0`) SQLite WAL engine | https://gitlab.com/cznic/sqlite |
+| `github.com/go-sql-driver/mysql` | `v1.10.1` | MPL-2.0 | Pure-Go MySQL 8+ / MariaDB / TiDB driver (unmodified module) | https://github.com/go-sql-driver/mysql |
+| `github.com/yuin/goldmark` | `v1.8.7` | MIT | CommonMark + GFM Markdown AST parser & renderer | https://github.com/yuin/goldmark |
+| `github.com/HugoSmits86/nativewebp` | `v1.3.0` | MIT | Pure-Go WebP image encoder | https://github.com/HugoSmits86/nativewebp |
+| `golang.org/x/crypto` | `v0.58.0` | BSD-3-Clause | `Argon2id`, `HKDF`, & cryptographic primitives | https://cs.opensource.google/go/x/crypto |
+| `golang.org/x/image` | `v0.47.0` | BSD-3-Clause | Pure-Go WebP/BMP/TIFF decoding & image scaling | https://cs.opensource.google/go/x/image |
+| `golang.org/x/net` | `v0.62.0` | BSD-3-Clause | HTML5 tokenizer, AST allowlist sanitizer & network utilities | https://cs.opensource.google/go/x/net |
 
 > **MPL-2.0 Notice (`github.com/go-sql-driver/mysql`)**: `Volo-go` links the unmodified upstream `github.com/go-sql-driver/mysql` module via standard Go module imports. Source code for `github.com/go-sql-driver/mysql` is available at https://github.com/go-sql-driver/mysql under the Mozilla Public License 2.0.
 
 ---
 
-## 2. Embedded Admin Console Dependencies / 内嵌管理台前端依赖
+## 2. Indirect Go Runtime Dependencies (`go.mod`) / Go 后端传递运行时依赖
+
+| Module / 模块 | License / 许可证 | Transitive Consumer / 归属能力 | Upstream / 来源 |
+| :--- | :--- | :--- | :--- |
+| `filippo.io/edwards25519` | BSD-3-Clause | MySQL `caching_sha2_password` / Ed25519 authentication (`go-sql-driver/mysql`) | https://github.com/FiloSottile/edwards25519 |
+| `modernc.org/libc` | BSD-3-Clause | Pure-Go C standard library runtime (`modernc.org/sqlite`) | https://gitlab.com/cznic/libc |
+| `modernc.org/mathutil` | BSD-3-Clause | Pure-Go math utilities (`modernc.org/sqlite`) | https://gitlab.com/cznic/mathutil |
+| `modernc.org/memory` | BSD-3-Clause | Arena memory allocator (`modernc.org/sqlite`) | https://gitlab.com/cznic/memory |
+| `github.com/dustin/go-humanize` | MIT | Numeric formatting utilities (`modernc.org/sqlite`) | https://github.com/dustin/go-humanize |
+| `github.com/google/uuid` | BSD-3-Clause | UUID utilities (`modernc.org/sqlite`) | https://github.com/google/uuid |
+| `github.com/mattn/go-isatty` | MIT | Terminal detection (`modernc.org/sqlite`) | https://github.com/mattn/go-isatty |
+| `github.com/ncruces/go-strftime` | MIT | `strftime` formatting (`modernc.org/sqlite`) | https://github.com/ncruces/go-strftime |
+| `github.com/remyoudompheng/bigfft` | BSD-3-Clause | Arbitrary-precision arithmetic (`modernc.org/sqlite`) | https://github.com/remyoudompheng/bigfft |
+| `golang.org/x/sys` | BSD-3-Clause | Low-level OS syscall primitives | https://cs.opensource.google/go/x/sys |
+
+> **Note on Built-in Subsystems & Test-Only Packages**: The pure-Go PostgreSQL v3 wire driver (`internal/db/sqlx`), single-pass HTML5 AST allowlist sanitizer & server-side lexical syntax highlighter (`internal/render`), MaxMind MMDB / ip2region XDB decoders (`internal/security`), and the embedded ES6 plugin VM (`pkg/plugin`) are first-party pure-Go implementations under Apache-2.0. `github.com/stretchr/testify` (MIT) in `go.mod` is used exclusively in `_test.go` suites and is not linked into production binaries.
+
+---
+
+## 3. Embedded Admin Console Dependencies (`web/admin/package.json`) / 内嵌管理台前端依赖
 
 | Package / 包名 | License / 许可证 | Purpose / 用途 | Upstream / 来源 |
 | :--- | :--- | :--- | :--- |
-| `preact` | MIT | Lightweight 3 KB UI runtime | https://github.com/preactjs/preact |
+| `preact` | MIT | Lightweight UI component runtime | https://github.com/preactjs/preact |
 | `@preact/signals` | MIT | Fine-grained reactive state management | https://github.com/preactjs/signals |
 | `@codemirror/state` | MIT | CodeMirror 6 immutable editor state | https://github.com/codemirror/state |
-| `@codemirror/view` | MIT | CodeMirror 6 DOM viewport engine | https://github.com/codemirror/view |
-| `@codemirror/commands` | MIT | CodeMirror 6 editing commands & history | https://github.com/codemirror/commands |
-| `@codemirror/lang-markdown` & `@lezer/markdown` | MIT | Incremental Markdown grammar & parser | https://github.com/codemirror/lang-markdown |
+| `@codemirror/view` | MIT | CodeMirror 6 DOM viewport engine (powers `IR` / `WYSIWYG` / `SV` Studio Editor) | https://github.com/codemirror/view |
+| `@codemirror/commands` | MIT | CodeMirror 6 editing commands & undo/redo history | https://github.com/codemirror/commands |
+
+> **Frontend Build Toolchain (`devDependencies`, not shipped in runtime binary)**: `typescript` (Apache-2.0, https://github.com/microsoft/TypeScript) and `vite` (MIT, https://github.com/vitejs/vite).
+
+---
+
+## 4. On-Demand Browser Runtime Libraries (Lazy CDN) / 按需懒加载前端渲染库
+
+Pages containing LaTeX math expressions or Mermaid diagrams dynamically load the following client-side libraries on demand (configurable or self-hostable via `reading.vendor_cdn_prefix`; zero network requests on pages without math/diagrams):
+仅当页面包含 LaTeX 数学公式或 Mermaid 图表时，浏览器才会按需异步加载以下前端渲染库（可通过 `reading.vendor_cdn_prefix` 切换自建镜像源；普通文章页零外部请求）：
+
+| Library / 组件 | License / 许可证 | Purpose / 用途 | Upstream / 来源 |
+| :--- | :--- | :--- | :--- |
+| `KaTeX` (`katex@0.16.11`) | MIT | Client-side LaTeX math typesetting | https://github.com/KaTeX/KaTeX |
+| `Mermaid` (`mermaid@10`) | MIT | Client-side declarative diagram & flowchart rendering | https://github.com/mermaid-js/mermaid |

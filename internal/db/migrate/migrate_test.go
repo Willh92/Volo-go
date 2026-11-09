@@ -220,6 +220,10 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		"idx_media_mime_created",
 		"idx_media_size_created",
 		"idx_webhook_deliveries_hook_created_id",
+		// V7 media uploader & audit log composite indexes
+		"idx_media_uploader_created",
+		"idx_audit_actor_created",
+		"idx_audit_action_created",
 	}
 
 	rows, err := sqlx.Select[struct {
@@ -241,16 +245,49 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		t.Fatalf("duplicate index idx_media_created should have been dropped in V6")
 	}
 
-	// Verify V6 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
+	// Verify V7 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
 	var maxVer int
 	if err := store.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 6 || CurrentSchemaVersion != 6 {
-		t.Fatalf("expected schema version 6, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
+	if maxVer != 7 || CurrentSchemaVersion != 7 {
+		t.Fatalf("expected schema version 7, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
 	}
 	if err := execIdempotentAddColumn(ctx, store, `ALTER TABLE media_assets ADD COLUMN alt_text TEXT NOT NULL DEFAULT ''`); err != nil {
 		t.Fatalf("execIdempotentAddColumn on existing column failed: %v", err)
+	}
+
+	// Verify V7 published_at backfill only updates published articles with published_at <= 0
+	const insertArticleSQL = `INSERT INTO articles (
+		id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md,
+		cover_url, status, published_at, scheduled_at, is_pinned, allow_comment,
+		password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes,
+		audio_mime, lang, translation_group, license_override, word_count, reading_minutes,
+		view_count, comment_count, created_at, updated_at
+	) VALUES (?, 'u1', '', ?, ?, '', '', '', '', ?, ?, 0, 0, 1, '', 0, '', 0, 0, '', 'en', '', '', 0, 0, 0, 0, ?, ?)`
+
+	if _, err := store.ExecContext(ctx, insertArticleSQL, "art_pub_zero", "Published Zero", "pub-zero", "published", int64(0), int64(1700000001000), int64(1700000001000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, insertArticleSQL, "art_pub_keep", "Published Keep", "pub-keep", "published", int64(1700000009000), int64(1700000001000), int64(1700000001000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, insertArticleSQL, "art_draft_zero", "Draft Zero", "draft-zero", "draft", int64(0), int64(1700000001000), int64(1700000001000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 7`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Up(ctx, store); err != nil {
+		t.Fatalf("re-applying V7 migration failed: %v", err)
+	}
+
+	var pubZero, pubKeep, draftZero int64
+	_ = store.QueryRowContext(ctx, `SELECT published_at FROM articles WHERE id = 'art_pub_zero'`).Scan(&pubZero)
+	_ = store.QueryRowContext(ctx, `SELECT published_at FROM articles WHERE id = 'art_pub_keep'`).Scan(&pubKeep)
+	_ = store.QueryRowContext(ctx, `SELECT published_at FROM articles WHERE id = 'art_draft_zero'`).Scan(&draftZero)
+	if pubZero != 1700000001000 || pubKeep != 1700000009000 || draftZero != 0 {
+		t.Fatalf("unexpected V7 published_at backfill: pubZero=%d pubKeep=%d draftZero=%d", pubZero, pubKeep, draftZero)
 	}
 
 	// Verify V6 Postgres & MySQL key-widening statements and V1 VARCHAR(512) widths
@@ -270,4 +307,3 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		t.Fatalf("mysql V6 missing DROP INDEX idx_media_created ON media_assets")
 	}
 }
-

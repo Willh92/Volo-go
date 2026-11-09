@@ -89,7 +89,14 @@ func TestPoWChallengeReplayHoneypotEnvFPAndAvatarSVG(t *testing.T) {
 	if err := pow.Verify(ch.Challenge, sol, "bot-filled-website"); !errors.Is(err, ErrHoneypotTriggered) {
 		t.Fatalf("expected ErrHoneypotTriggered, got %v", err)
 	}
-	if err := pow.Verify(ch.Challenge, "invalid-nonce", ""); !errors.Is(err, ErrPoWInvalid) {
+	badNonce := "invalid-nonce"
+	if sol == "0" {
+		// SolveForTest starts at 0 and increments; if sol > "0", "0" is guaranteed to have failed!
+		badNonce = "guaranteed-wrong-" + sol
+	} else {
+		badNonce = "0"
+	}
+	if err := pow.Verify(ch.Challenge, badNonce, ""); !errors.Is(err, ErrPoWInvalid) {
 		t.Fatalf("expected ErrPoWInvalid on wrong solution, got %v", err)
 	}
 	if err := pow.Verify(ch.Challenge, sol, ""); err != nil {

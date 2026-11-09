@@ -1,26 +1,699 @@
-{{define "content"}}
-<section class="studio-article studio-error-card">
-  <div class="studio-error-card__visual" aria-hidden="true">
-    <svg viewBox="0 0 120 88" width="96" height="70" fill="none">
-      <circle cx="60" cy="44" r="34" fill="var(--volo-accent-soft)"/>
-      <path d="M40 58c8-18 24-28 42-28-2 18-14 32-32 34-4 .4-7.4-.6-10-6Z" stroke="var(--volo-accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M38 60c10-8 21-15 34-21" stroke="var(--volo-accent)" stroke-width="1.8" stroke-linecap="round"/>
-      <circle cx="84" cy="24" r="3" fill="var(--volo-accent)"/>
-    </svg>
-  </div>
-  <span class="volo-badge studio-error-card__code">{{if .StatusCode}}{{.StatusCode}}{{else}}404{{end}}</span>
-  <h1 class="studio-error-card__title">{{coalesce .ErrorMessage (t .Locale "error.default_title")}}</h1>
-  <p class="studio-error-card__hint">
-    {{if eq .StatusCode 404}}{{t .Locale "error.hint_404"}}{{else if eq .StatusCode 403}}{{t .Locale "error.hint_403"}}{{else if eq .StatusCode 429}}{{t .Locale "error.hint_429"}}{{else}}{{t .Locale "error.hint_default"}}{{end}}
-  </p>
-  <div class="studio-error-card__actions">
-    <a class="volo-btn" href="/">{{t .Locale "error.back_home"}}</a>
-    {{if .Reading.EnableInstantSearch}}
-      <button type="button" class="studio-icon-btn studio-error-card__search" data-open-search>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>
-        <span>{{t .Locale "error.search_site"}}</span>
+{{define "layout"}}{{$code := 404}}{{if .StatusCode}}{{$code = .StatusCode}}{{end}}{{$statusTitle := t .Locale "error.default_title"}}{{if eq $code 404}}{{$statusTitle = t .Locale "error.title_404"}}{{else if eq $code 403}}{{$statusTitle = t .Locale "error.title_403"}}{{else if eq $code 401}}{{$statusTitle = t .Locale "error.title_401"}}{{else if eq $code 400}}{{$statusTitle = t .Locale "error.title_400"}}{{else if eq $code 429}}{{$statusTitle = t .Locale "error.title_429"}}{{else if eq $code 500}}{{$statusTitle = t .Locale "error.title_500"}}{{else if eq $code 503}}{{$statusTitle = t .Locale "error.title_503"}}{{end}}{{$rawMsg := trim .ErrorMessage}}{{$isStockMsg := or (eq $rawMsg "") (eq $rawMsg (t .Locale "error.not_found")) (eq $rawMsg (t .Locale "error.forbidden")) (eq $rawMsg (t .Locale "error.unauthorized")) (eq $rawMsg (t .Locale "error.rate_limited")) (eq $rawMsg (t .Locale "error.bad_request")) (eq $rawMsg (t .Locale "error.server_busy")) (eq $rawMsg (t .Locale "error.default_title")) (eq $rawMsg "Not Found") (eq $rawMsg "404 Not Found") (eq $rawMsg "Forbidden") (eq $rawMsg "Unauthorized") (eq $rawMsg "Bad Request") (eq $rawMsg "Too Many Requests") (eq $rawMsg "Internal Server Error") (eq $rawMsg "Service Unavailable")}}{{$headline := $statusTitle}}{{if not $isStockMsg}}{{$headline = $rawMsg}}{{end}}{{$hint1 := t .Locale "error.hint_default_line1"}}{{$hint2 := t .Locale "error.hint_default_line2"}}{{if eq $code 404}}{{$hint1 = t .Locale "error.hint_404_line1"}}{{$hint2 = t .Locale "error.hint_404_line2"}}{{else if or (eq $code 403) (eq $code 401)}}{{$hint1 = t .Locale "error.hint_403_line1"}}{{$hint2 = t .Locale "error.hint_403_line2"}}{{else if eq $code 429}}{{$hint1 = t .Locale "error.hint_429_line1"}}{{$hint2 = t .Locale "error.hint_429_line2"}}{{end}}{{$siteTitle := default "Volo" .Site.Title}}{{$brandImg := coalesce .Site.LogoURL .Site.FaviconURL}}<!doctype html>
+<html lang="{{default "zh-CN" .Locale}}" dir="{{default "ltr" .TextDir}}"
+      data-volo-skin="{{block "skin_name" .}}{{default "volo-studio" .ThemeID}}{{end}}"
+      data-default-mode="{{default "auto" .Appearance.DefaultMode}}"
+      data-accent="{{default "forest" .Appearance.Accent}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{if .PageTitle}}{{.PageTitle}}{{else}}{{$code}} · {{$headline}} — {{$siteTitle}}{{end}}</title>
+  {{if .Site.FaviconURL}}<link rel="icon" href="{{.Site.FaviconURL}}">{{else}}<link rel="icon" type="image/svg+xml" href="/favicon.svg">{{end}}
+  <link rel="alternate icon" sizes="32x32" href="/favicon.ico">
+  <script>
+    (function(){
+      var m = "";
+      try { m = localStorage.getItem("volo_theme_mode") || ""; } catch(_){}
+      if (!m) m = document.documentElement.getAttribute("data-default-mode") || "auto";
+      var eff = m;
+      if (m === "system") eff = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+      else if (m !== "light" && m !== "dark") { var d = new Date(), mins = d.getHours() * 60 + d.getMinutes(); eff = (mins >= 390 && mins < 1140) ? "light" : "dark"; }
+      document.documentElement.setAttribute("data-mode", m);
+      document.documentElement.setAttribute("data-theme", eff);
+    })();
+  </script>
+  <style>
+    :root, [data-theme="light"] {
+      color-scheme: light;
+      --volo-bg: #f6f7f3;
+      --volo-surface: #ffffff;
+      --volo-raised: #f0f3ee;
+      --volo-text: #293d36;
+      --volo-muted: #60756a;
+      --volo-line: #dfe6de;
+      --volo-shadow: 0 12px 36px rgba(23, 63, 59, 0.055);
+      --volo-accent: #246b51;
+      --volo-button: #246b51;
+      --volo-button-hover: #1b5741;
+      --volo-accent-soft: rgba(36, 107, 81, 0.1);
+      --volo-accent-contrast: #f4f8f5;
+      --volo-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --volo-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    }
+    html[data-theme="dark"], [data-theme="dark"] {
+      color-scheme: dark;
+      --volo-bg: #1b2021;
+      --volo-surface: #242b2c;
+      --volo-raised: #2b3434;
+      --volo-text: #d6dfda;
+      --volo-muted: #a1b1a8;
+      --volo-line: #3c4945;
+      --volo-shadow: 0 16px 42px rgba(0, 0, 0, 0.32);
+      --volo-accent: #9bcab1;
+      --volo-button: #476e59;
+      --volo-button-hover: #527c65;
+      --volo-accent-soft: rgba(155, 202, 177, 0.15);
+      --volo-accent-contrast: #f5f8f5;
+    }
+    [data-accent="forest"] { --volo-accent: #246b51; --volo-button: #246b51; --volo-button-hover: #1b5741; --volo-accent-soft: rgba(36, 107, 81, 0.1); }
+    [data-theme="dark"][data-accent="forest"] { --volo-accent: #9bcab1; --volo-button: #476e59; --volo-button-hover: #527c65; --volo-accent-soft: rgba(155, 202, 177, 0.15); }
+    [data-accent="ocean"] { --volo-accent: #2d6583; --volo-button: #2d6583; --volo-button-hover: #23516b; --volo-accent-soft: rgba(45, 101, 131, 0.11); }
+    [data-theme="dark"][data-accent="ocean"] { --volo-accent: #a2c5dd; --volo-button: #476b85; --volo-button-hover: #527c94; --volo-accent-soft: rgba(162, 197, 221, 0.15); }
+    [data-accent="teal"] { --volo-accent: #286c70; --volo-button: #286c70; --volo-button-hover: #20575a; --volo-accent-soft: rgba(40, 108, 112, 0.11); }
+    [data-theme="dark"][data-accent="teal"] { --volo-accent: #9acbcc; --volo-button: #416e71; --volo-button-hover: #4c7e80; --volo-accent-soft: rgba(154, 203, 204, 0.15); }
+    [data-accent="amber"] { --volo-accent: #855c27; --volo-button: #855c27; --volo-button-hover: #6e4a20; --volo-accent-soft: rgba(133, 92, 39, 0.11); }
+    [data-theme="dark"][data-accent="amber"] { --volo-accent: #d6bd91; --volo-button: #795f3c; --volo-button-hover: #886d48; --volo-accent-soft: rgba(214, 189, 145, 0.15); }
+    [data-accent="plum"] { --volo-accent: #70517d; --volo-button: #70517d; --volo-button-hover: #5a4167; --volo-accent-soft: rgba(112, 81, 125, 0.11); }
+    [data-theme="dark"][data-accent="plum"] { --volo-accent: #c8b5d7; --volo-button: #6d567d; --volo-button-hover: #7d658d; --volo-accent-soft: rgba(200, 181, 215, 0.15); }
+    [data-accent="rose"] { --volo-accent: #87525f; --volo-button: #87525f; --volo-button-hover: #714450; --volo-accent-soft: rgba(135, 82, 95, 0.11); }
+    [data-theme="dark"][data-accent="rose"] { --volo-accent: #d6b1bd; --volo-button: #7d5865; --volo-button-hover: #8d6572; --volo-accent-soft: rgba(214, 177, 189, 0.15); }
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html { -webkit-text-size-adjust: 100%; }
+    body.volo-err-shell {
+      margin: 0;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      background: var(--volo-bg);
+      color: var(--volo-text);
+      font: 14px/1.7 var(--volo-font-sans);
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+    a { color: inherit; text-decoration: none; }
+    button, input { font: inherit; color: inherit; }
+    .err-topbar {
+      width: 100%;
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 20px clamp(16px, 4.5vw, 60px);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .err-brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .err-brand__mark,
+    .err-brand__img {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      flex-shrink: 0;
+    }
+    .err-brand__mark {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--volo-button);
+      color: var(--volo-accent-contrast);
+      font-weight: 800;
+      font-size: 16px;
+      letter-spacing: -0.03em;
+    }
+    .err-brand__img {
+      object-fit: cover;
+      border: 1px solid var(--volo-line);
+      background: var(--volo-surface);
+    }
+    .err-brand__title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--volo-text);
+      letter-spacing: -0.01em;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .err-topbar__right {
+      display: inline-flex;
+      align-items: center;
+      gap: 14px;
+      flex-shrink: 0;
+    }
+    .err-top-home {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 13px;
+      color: var(--volo-muted);
+      padding: 6px 8px;
+      border-radius: 8px;
+      transition: color 0.16s ease, background-color 0.16s ease;
+    }
+    .err-top-home:hover {
+      color: var(--volo-text);
+      background: color-mix(in srgb, var(--volo-text) 5%, transparent);
+    }
+    .err-theme-btn {
+      width: 36px;
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--volo-muted);
+      cursor: pointer;
+      transition: color 0.16s ease, background-color 0.16s ease, border-color 0.16s ease;
+    }
+    .err-theme-btn:hover {
+      color: var(--volo-text);
+      background: var(--volo-surface);
+      border-color: var(--volo-line);
+    }
+    .err-theme-btn svg {
+      width: 17px;
+      height: 17px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.75;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    html[data-theme="dark"] .err-icon-sun { display: none; }
+    html:not([data-theme="dark"]) .err-icon-moon { display: none; }
+
+    .err-stage {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px clamp(16px, 4vw, 32px) 32px;
+    }
+    .err-card {
+      width: 100%;
+      max-width: 760px;
+      background: var(--volo-surface);
+      border: 1px solid var(--volo-line);
+      border-radius: 20px;
+      padding: 52px 56px;
+      box-shadow: var(--volo-shadow);
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: 44px;
+      align-items: center;
+    }
+    .err-visual {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      user-select: none;
+    }
+    .err-code {
+      font-size: clamp(56px, 7vw, 80px);
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -0.04em;
+      color: var(--volo-accent);
+      font-variant-numeric: tabular-nums;
+    }
+    .err-divider {
+      margin-top: 22px;
+      width: 100%;
+      max-width: 196px;
+      height: 30px;
+      color: color-mix(in srgb, var(--volo-accent) 32%, var(--volo-line));
+    }
+    .err-body {
+      min-width: 0;
+    }
+    .err-eyebrow {
+      font: 600 12px/1.4 var(--volo-font-mono);
+      letter-spacing: 0.08em;
+      color: var(--volo-muted);
+      margin: 0 0 10px;
+    }
+    .err-title {
+      margin: 0 0 16px;
+      font-size: clamp(22px, 3vw, 28px);
+      font-weight: 750;
+      line-height: 1.3;
+      letter-spacing: -0.02em;
+      color: var(--volo-text);
+      overflow-wrap: break-word;
+    }
+    .err-hint-primary {
+      margin: 0 0 8px;
+      font-size: 15px;
+      line-height: 1.65;
+      color: color-mix(in srgb, var(--volo-text) 88%, var(--volo-muted));
+    }
+    .err-hint-secondary {
+      margin: 0;
+      font-size: 13.5px;
+      line-height: 1.65;
+      color: var(--volo-muted);
+    }
+    .err-actions {
+      margin-top: 26px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+    }
+    .err-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      height: 42px;
+      padding: 0 20px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, transform 0.12s ease;
+    }
+    .err-btn:active { transform: translateY(1px); }
+    .err-btn--primary {
+      background: var(--volo-button);
+      color: var(--volo-accent-contrast);
+      border: 1px solid transparent;
+    }
+    .err-btn--primary:hover {
+      background: var(--volo-button-hover);
+    }
+    .err-btn--outline {
+      background: var(--volo-surface);
+      color: var(--volo-text);
+      border: 1px solid var(--volo-line);
+      font-weight: 500;
+    }
+    .err-btn--outline:hover {
+      background: var(--volo-raised);
+      border-color: color-mix(in srgb, var(--volo-accent) 35%, var(--volo-line));
+    }
+    .err-arrow {
+      font-size: 12px;
+      opacity: 0.85;
+    }
+
+    .err-colophon {
+      width: 100%;
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 12px clamp(16px, 4.5vw, 60px) 22px;
+      font-size: 12px;
+      color: var(--volo-muted);
+    }
+    .err-colophon strong {
+      font-weight: 600;
+      color: var(--volo-text);
+    }
+
+    /* Inline Lightweight Search Modal */
+    .err-search-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      background: rgba(15, 23, 20, 0.42);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: min(12vh, 88px) 16px 24px;
+    }
+    .err-search-dialog {
+      width: 100%;
+      max-width: 580px;
+      background: var(--volo-surface);
+      border: 1px solid var(--volo-line);
+      border-radius: 16px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      max-height: min(74dvh, 540px);
+    }
+    .err-search-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--volo-line);
+    }
+    .err-search-head svg {
+      width: 18px;
+      height: 18px;
+      color: var(--volo-muted);
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.8;
+      flex-shrink: 0;
+    }
+    .err-search-input {
+      flex: 1;
+      min-width: 0;
+      border: 0;
+      outline: none;
+      background: transparent;
+      font-size: 16px;
+      line-height: 1.4;
+      color: var(--volo-text);
+    }
+    .err-search-input::placeholder { color: var(--volo-muted); opacity: 0.8; }
+    .err-search-esc {
+      border: 1px solid var(--volo-line);
+      background: var(--volo-raised);
+      color: var(--volo-muted);
+      border-radius: 6px;
+      padding: 2px 8px;
+      font: 600 11px/1.5 var(--volo-font-mono);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .err-search-results {
+      overflow-y: auto;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .err-search-results:empty { display: none; }
+    .err-search-hit {
+      display: block;
+      padding: 10px 12px;
+      border-radius: 10px;
+      color: var(--volo-text);
+      transition: background-color 0.14s ease;
+    }
+    .err-search-hit:hover,
+    .err-search-hit.is-active {
+      background: var(--volo-accent-soft);
+    }
+    .err-search-hit strong {
+      display: block;
+      font-size: 14px;
+      font-weight: 650;
+      line-height: 1.4;
+    }
+    .err-search-hit__snip {
+      margin-top: 3px;
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: var(--volo-muted);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .err-search-hit mark {
+      background: color-mix(in srgb, var(--volo-accent) 22%, transparent);
+      color: inherit;
+      border-radius: 3px;
+      padding: 0 2px;
+    }
+    .err-search-empty {
+      padding: 26px 16px;
+      text-align: center;
+      font-size: 13.5px;
+      color: var(--volo-muted);
+    }
+    .err-search-more {
+      margin: 4px 6px 6px;
+      padding: 8px 14px;
+      border-radius: 9px;
+      border: 1px solid var(--volo-line);
+      background: var(--volo-raised);
+      color: var(--volo-text);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: center;
+    }
+    .err-search-more:hover {
+      border-color: color-mix(in srgb, var(--volo-accent) 35%, var(--volo-line));
+    }
+
+    @media (max-width: 640px) {
+      .err-card {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 24px;
+        padding: 32px 24px;
+      }
+      .err-visual {
+        align-items: flex-start;
+        text-align: left;
+      }
+      .err-divider {
+        max-width: 168px;
+        margin-top: 14px;
+      }
+    }
+    @media (max-width: 380px) {
+      .err-topbar { padding: 14px 14px; }
+      .err-top-home span:first-child { display: none; }
+      .err-card { padding: 26px 18px; border-radius: 16px; }
+      .err-actions .err-btn { flex: 1 1 auto; }
+    }
+  </style>
+</head>
+<body class="volo-err-shell">
+  <div class="err-topbar" role="navigation" aria-label="{{$siteTitle}}">
+    <a class="err-brand" href="/">
+      {{if $brandImg}}
+        <img class="err-brand__img" src="{{$brandImg}}" alt="" width="36" height="36" id="volo-err-brand-img">
+        <span class="err-brand__mark" id="volo-err-brand-fallback" hidden aria-hidden="true">V.</span>
+      {{else}}
+        <span class="err-brand__mark" aria-hidden="true">V.</span>
+      {{end}}
+      <span class="err-brand__title">{{$siteTitle}}</span>
+    </a>
+    <div class="err-topbar__right">
+      <a class="err-top-home" href="/">
+        <span>{{t .Locale "error.back_home_top"}}</span>
+        <span class="err-arrow" aria-hidden="true">↗</span>
+      </a>
+      <button type="button" class="err-theme-btn" id="volo-err-theme-toggle"
+              aria-label="{{t .Locale "appearance.dark"}} / {{t .Locale "appearance.light"}}"
+              title="{{t .Locale "appearance.dark"}} / {{t .Locale "appearance.light"}}">
+        <svg class="err-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2"/>
+          <path d="M12 2.5v2.2M12 19.3v2.2M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6"/>
+        </svg>
+        <svg class="err-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M20.2 14.8A8.2 8.2 0 0 1 9.2 3.8a8.3 8.3 0 1 0 11 11Z"/>
+        </svg>
       </button>
-    {{end}}
+    </div>
   </div>
-</section>
-{{end}}
+
+  <main class="err-stage">
+    <section class="err-card" aria-labelledby="volo-err-heading">
+      <div class="err-visual" aria-hidden="true">
+        <div class="err-code">{{$code}}</div>
+        <svg class="err-divider" viewBox="0 0 192 32" fill="none" aria-hidden="true">
+          <line x1="6" y1="16" x2="64" y2="16" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>
+          <polygon points="64,16 78,4 114,4 128,16 114,28 78,28" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+          <circle cx="96" cy="16" r="4.5" stroke="currentColor" stroke-width="1.35"/>
+          <line x1="128" y1="16" x2="186" y2="16" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="err-body">
+        <div class="err-eyebrow">HTTP {{$code}}</div>
+        <h1 class="err-title" id="volo-err-heading">{{$headline}}</h1>
+        <p class="err-hint-primary">{{$hint1}}</p>
+        <p class="err-hint-secondary">{{$hint2}}</p>
+        <div class="err-actions">
+          <a class="err-btn err-btn--primary" href="/">
+            <span>{{t .Locale "error.back_home"}}</span>
+            <span class="err-arrow" aria-hidden="true">↗</span>
+          </a>
+          {{if .Reading.EnableInstantSearch}}
+            <button type="button" class="err-btn err-btn--outline" id="volo-err-search-open" data-open-search>
+              {{t .Locale "error.search_posts"}}
+            </button>
+          {{end}}
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="err-colophon">Powered by <strong>Volo</strong></div>
+
+  {{if .Reading.EnableInstantSearch}}
+    <div class="err-search-backdrop" id="volo-err-search-modal" role="dialog" aria-modal="true"
+         aria-label="{{t .Locale "error.search_posts"}}"
+         data-empty="{{t .Locale "search.empty"}}"
+         data-load-more="{{t .Locale "search.load_more"}}" hidden>
+      <div class="err-search-dialog">
+        <div class="err-search-head">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>
+          <input type="search" class="err-search-input" id="volo-err-search-input"
+                 placeholder="{{t .Locale "nav.search_placeholder"}}" autocomplete="off">
+          <button type="button" class="err-search-esc" id="volo-err-search-close">ESC</button>
+        </div>
+        <div class="err-search-results" id="volo-err-search-results" role="listbox"></div>
+      </div>
+    </div>
+  {{end}}
+
+  <script>
+    (function(){
+      var root = document.documentElement;
+      var brandImg = document.getElementById("volo-err-brand-img");
+      var brandFallback = document.getElementById("volo-err-brand-fallback");
+      if (brandImg && brandFallback) {
+        var onImgFail = function() { brandImg.hidden = true; brandFallback.hidden = false; };
+        brandImg.addEventListener("error", onImgFail);
+        if (brandImg.complete && brandImg.naturalWidth === 0) onImgFail();
+      }
+
+      var toggleBtn = document.getElementById("volo-err-theme-toggle");
+      if (toggleBtn) {
+        toggleBtn.addEventListener("click", function(){
+          var cur = root.getAttribute("data-theme") === "dark" ? "dark" : "light";
+          var next = cur === "dark" ? "light" : "dark";
+          root.setAttribute("data-mode", next);
+          root.setAttribute("data-theme", next);
+          try { localStorage.setItem("volo_theme_mode", next); } catch(_){}
+        });
+      }
+
+      var modal = document.getElementById("volo-err-search-modal");
+      var openBtn = document.getElementById("volo-err-search-open");
+      var closeBtn = document.getElementById("volo-err-search-close");
+      var input = document.getElementById("volo-err-search-input");
+      var list = document.getElementById("volo-err-search-results");
+      if (!modal || !input || !list) return;
+
+      var activeIdx = -1;
+      var timer = null;
+      var curQuery = "";
+      var curPage = 1;
+      var loadedCount = 0;
+
+      function esc(s) {
+        return String(s || "").replace(/[&<>"']/g, function(c) {
+          return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+        });
+      }
+      function hi(txt, q) {
+        var safe = esc(txt);
+        var terms = String(q || "").trim().split(/\s+/).filter(Boolean).map(function(t){
+          return esc(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        });
+        if (!terms.length) return safe;
+        try { return safe.replace(new RegExp("(" + terms.join("|") + ")", "gi"), "<mark>$1</mark>"); }
+        catch(_) { return safe; }
+      }
+      function openModal() {
+        modal.hidden = false;
+        setTimeout(function(){ input.focus(); input.select(); }, 20);
+      }
+      function closeModal() {
+        modal.hidden = true;
+      }
+      function syncActive() {
+        var hits = list.querySelectorAll(".err-search-hit");
+        hits.forEach(function(el, i){
+          var on = i === activeIdx;
+          el.classList.toggle("is-active", on);
+          if (on) el.scrollIntoView({ block: "nearest" });
+        });
+      }
+      function renderHits(hits, q, append, hasMore) {
+        var oldMore = list.querySelector(".err-search-more");
+        if (oldMore) oldMore.remove();
+        if (!append) {
+          list.innerHTML = "";
+          loadedCount = 0;
+          activeIdx = -1;
+        }
+        if (!hits.length && !append) {
+          list.innerHTML = '<div class="err-search-empty">' + esc(modal.getAttribute("data-empty") || "No matching posts found") + '</div>';
+          return;
+        }
+        hits.forEach(function(h){
+          if (!h || !h.url) return;
+          if (append && list.querySelector('.err-search-hit[href="' + esc(encodeURI(h.url)) + '"]')) return;
+          var a = document.createElement("a");
+          a.className = "err-search-hit" + (!append && loadedCount === 0 ? " is-active" : "");
+          a.setAttribute("role", "option");
+          a.href = encodeURI(h.url);
+          a.innerHTML = "<strong>" + hi(h.title || "", q) + "</strong>" +
+            (h.snippet ? '<div class="err-search-hit__snip">' + hi(h.snippet, q) + "</div>" : "");
+          list.appendChild(a);
+          loadedCount++;
+        });
+        if (!append && loadedCount > 0) activeIdx = 0;
+        if (hasMore) {
+          var moreBtn = document.createElement("button");
+          moreBtn.type = "button";
+          moreBtn.className = "err-search-more";
+          moreBtn.textContent = modal.getAttribute("data-load-more") || "Load more";
+          moreBtn.addEventListener("click", function(){
+            fetchSearch(q, true);
+          });
+          list.appendChild(moreBtn);
+        }
+      }
+      function fetchSearch(q, append) {
+        if (!q) { list.innerHTML = ""; activeIdx = -1; return; }
+        var nextPage = append ? (curPage + 1) : 1;
+        var nextOffset = append ? loadedCount : 0;
+        var url = "/api/v1/search?q=" + encodeURIComponent(q) + (append ? ("&page=" + nextPage + "&offset=" + nextOffset) : "");
+        fetch(url)
+          .then(function(r){ return r.json(); })
+          .then(function(d){
+            if (q !== curQuery) return;
+            curPage = nextPage;
+            renderHits((d && d.hits) || [], q, append, Boolean(d && d.has_more));
+          })
+          .catch(function(){});
+      }
+
+      if (openBtn) openBtn.addEventListener("click", openModal);
+      if (closeBtn) closeBtn.addEventListener("click", closeModal);
+      modal.addEventListener("click", function(ev){ if (ev.target === modal) closeModal(); });
+      input.addEventListener("input", function(){
+        clearTimeout(timer);
+        var q = input.value.trim();
+        curQuery = q;
+        if (!q) { list.innerHTML = ""; activeIdx = -1; return; }
+        timer = setTimeout(function(){ fetchSearch(q, false); }, 150);
+      });
+      document.addEventListener("keydown", function(ev){
+        if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
+          ev.preventDefault();
+          if (modal.hidden) openModal(); else closeModal();
+          return;
+        }
+        if (ev.key === "Escape" && !modal.hidden) {
+          ev.preventDefault();
+          closeModal();
+          return;
+        }
+        if (!modal.hidden) {
+          var hits = list.querySelectorAll(".err-search-hit");
+          if (!hits.length) return;
+          if (ev.key === "ArrowDown") {
+            ev.preventDefault();
+            activeIdx = (activeIdx + 1) % hits.length;
+            syncActive();
+          } else if (ev.key === "ArrowUp") {
+            ev.preventDefault();
+            activeIdx = (activeIdx - 1 + hits.length) % hits.length;
+            syncActive();
+          } else if (ev.key === "Enter" && document.activeElement === input) {
+            var chosen = hits[activeIdx >= 0 ? activeIdx : 0];
+            if (chosen && chosen.href) {
+              ev.preventDefault();
+              window.location.href = chosen.href;
+            }
+          }
+        }
+      });
+    })();
+  </script>
+</body>
+</html>{{end}}{{define "content"}}{{end}}

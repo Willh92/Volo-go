@@ -4,16 +4,22 @@
 name="Volo-go"
 description="Volo-go Pure-Go Sovereign Blog Engine"
 
+set -a
+# shellcheck disable=SC1091
+if [ -f /etc/volo/volo.env ]; then . /etc/volo/volo.env; fi
+set +a
+
 command="/usr/local/bin/volo"
-command_args="serve"
+command_args="serve --env-file /etc/volo/volo.env"
 command_user="${VOLO_USER:-volo}:${VOLO_GROUP:-volo}"
 command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
+pidfile="/run/volo/volo.pid"
 directory="/var/lib/volo"
 output_log="/var/log/volo/volo.log"
 error_log="/var/log/volo/volo.err"
 stopsig="SIGTERM"
 retry="SIGTERM/20/SIGKILL/5"
+rc_ulimit="-n 65536"
 
 depend() {
     need net
@@ -21,12 +27,6 @@ depend() {
 }
 
 start_pre() {
-    checkpath --directory --owner "${command_user}" --mode 0750 /var/lib/volo /var/log/volo
-    checkpath --directory --owner "${command_user}" --mode 0755 /run/volo
-    if [ -r /etc/volo/volo.env ]; then
-        set -a
-        # shellcheck disable=SC1091
-        . /etc/volo/volo.env
-        set +a
-    fi
+    checkpath -d -m 0755 -o "${command_user}" /run/volo
+    checkpath -d -m 0750 -o "${command_user}" /var/lib/volo /var/log/volo
 }

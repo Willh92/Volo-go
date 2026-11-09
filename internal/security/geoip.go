@@ -361,7 +361,8 @@ func (g *GeoEngine) ReloadRules(ctx context.Context, store *sqlx.Store) error {
 	if store == nil {
 		return nil
 	}
-	rows, err := sqlx.Select[domain.SecurityGeoRule](ctx, store,
+	var rows []domain.SecurityGeoRule
+	err := sqlx.SelectInto(ctx, store, &rows,
 		`SELECT * FROM security_geo_rules ORDER BY sort_order ASC, id ASC`)
 	if err != nil {
 		return err
@@ -497,6 +498,7 @@ func (g *GeoEngine) Allows(addr netip.Addr) bool {
 	}
 
 	defaultPolicy := "allow"
+	unknownPolicy := "allow"
 	if g.settingsMgr != nil {
 		sec := g.settingsMgr.Snapshot().Security
 		if !sec.GeoPolicyActive {
@@ -505,41 +507,65 @@ func (g *GeoEngine) Allows(addr netip.Addr) bool {
 		if strings.EqualFold(sec.GeoDefaultAction, "deny") {
 			defaultPolicy = "deny"
 		}
+		if strings.EqualFold(sec.GeoUnknownAction, "deny") {
+			unknownPolicy = "deny"
+		}
 	}
 
 	g.mu.RLock()
 	rules := g.rules
 	g.mu.RUnlock()
 
-	return g.evaluateRules(u, rules, defaultPolicy)
+	return g.evaluateRules(u, rules, defaultPolicy, unknownPolicy)
 }
 
 // ValidateRulesAgainstAdminIP prevents an administrator from saving a GeoIP configuration
 // that would immediately lock out their own current IP address!
 func (g *GeoEngine) ValidateRulesAgainstAdminIP(rules []domain.SecurityGeoRule, defaultPolicy string, adminAddr netip.Addr) error {
+	unknownPolicy := "allow"
+	if g.settingsMgr != nil && strings.EqualFold(g.settingsMgr.Snapshot().Security.GeoUnknownAction, "deny") {
+		unknownPolicy = "deny"
+	}
+	return g.ValidateRulesWithUnknownAgainstAdminIP(rules, defaultPolicy, unknownPolicy, adminAddr)
+}
+
+// ValidateRulesWithUnknownAgainstAdminIP prevents an administrator from saving a GeoIP rule set,
+// default policy, or unknown-IP policy that would immediately lock out their own current IP address.
+func (g *GeoEngine) ValidateRulesWithUnknownAgainstAdminIP(rules []domain.SecurityGeoRule, defaultPolicy, unknownPolicy string, adminAddr netip.Addr) error {
 	if !adminAddr.IsValid() || adminAddr.Unmap().IsLoopback() || adminAddr.Unmap().IsPrivate() {
 		return nil
 	}
-	if !g.evaluateRules(adminAddr.Unmap(), rules, defaultPolicy) {
+	normDefault := "allow"
+	if strings.EqualFold(defaultPolicy, "deny") {
+		normDefault = "deny"
+	}
+	normUnknown := "allow"
+	if strings.EqualFold(unknownPolicy, "deny") {
+		normUnknown = "deny"
+	}
+	if !g.evaluateRules(adminAddr.Unmap(), rules, normDefault, normUnknown) {
 		return errors.New("security: refusing GeoIP rule update because it would lock out your current administrator IP")
 	}
 	return nil
 }
 
-func (g *GeoEngine) evaluateRules(addr netip.Addr, rules []domain.SecurityGeoRule, defaultPolicy string) bool {
+func (g *GeoEngine) evaluateRules(addr netip.Addr, rules []domain.SecurityGeoRule, defaultPolicy, unknownPolicy string) bool {
 	enabledCount := 0
 	for _, r := range rules {
 		if r.IsEnabled {
 			enabledCount++
 		}
 	}
-	if enabledCount == 0 {
-		return defaultPolicy != "deny"
+	if enabledCount == 0 && strings.EqualFold(defaultPolicy, unknownPolicy) {
+		return !strings.EqualFold(defaultPolicy, "deny")
 	}
 
 	loc, ok := g.Lookup(addr)
 	if !ok {
-		return defaultPolicy != "deny"
+		return !strings.EqualFold(unknownPolicy, "deny")
+	}
+	if enabledCount == 0 {
+		return !strings.EqualFold(defaultPolicy, "deny")
 	}
 
 	for _, rule := range rules {
@@ -558,7 +584,7 @@ func (g *GeoEngine) evaluateRules(addr netip.Addr, rules []domain.SecurityGeoRul
 			// "next" -> continue evaluating chain
 		}
 	}
-	return defaultPolicy != "deny"
+	return !strings.EqualFold(defaultPolicy, "deny")
 }
 
 func matchesGeoRule(loc GeoLocation, rule domain.SecurityGeoRule) bool {
@@ -618,4 +644,3 @@ func cleanXDBSeg(s string) string {
 func isASCIIAlpha(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
-

@@ -787,7 +787,7 @@ func migrateNativeVoloDatabase(
 		MediaFiles:       summary.MediaFiles,
 		AnalyticsDays:    clampInt64ToInt(summary.Tables["analytics_daily"]),
 		Webhooks:         clampInt64ToInt(summary.Tables["webhooks"]),
-		RedirectsCreated: clampInt64ToInt(summary.Tables["url_redirects"]),
+		RedirectsCreated: clampInt64ToInt(summary.Tables["redirects"]),
 	}
 	if opts.DryRun {
 		return rep, nil
@@ -927,7 +927,8 @@ func applyPostNativeMigrationOverrides(
 		return nil
 	}
 
-	admins, err := sqlx.Select[domain.User](ctx, targetStore,
+	var admins []domain.User
+	err := sqlx.SelectInto(ctx, targetStore, &admins,
 		`SELECT * FROM users WHERE role = ? ORDER BY created_at ASC LIMIT 1`, domain.RoleAdmin)
 	if err != nil || len(admins) == 0 {
 		return err

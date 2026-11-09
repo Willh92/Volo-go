@@ -71,9 +71,10 @@ type WAFEngine struct {
 	errorHandler     func(w http.ResponseWriter, r *http.Request, status int, msgKey string)
 	staffBypassCheck func(r *http.Request) bool
 
-	rateMu  sync.Mutex
-	strikes map[string]*strikeBucket
-	rates   map[string]*rateWindow
+	rateMu    sync.Mutex
+	strikes   map[string]*strikeBucket
+	rates     map[string]*rateWindow
+	authRates map[string]*rateWindow
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -82,6 +83,7 @@ type WAFEngine struct {
 const (
 	maxWAFStrikes    = 4096
 	maxWAFRates      = 8192
+	maxWAFAuthRates  = 4096
 	maxWAFActiveBans = 16384
 	wafSweepInterval = time.Minute
 )
@@ -101,6 +103,7 @@ func NewWAFEngine(cfg *config.Config, store *sqlx.Store, settingsMgr *repo.Setti
 		banReasons:  make(map[netip.Prefix]string),
 		strikes:     make(map[string]*strikeBucket),
 		rates:       make(map[string]*rateWindow),
+		authRates:   make(map[string]*rateWindow),
 		stopCh:      make(chan struct{}),
 	}
 	go w.sweepLoop()
@@ -166,6 +169,11 @@ func (w *WAFEngine) sweep(now time.Time) {
 	for k, v := range w.rates {
 		if now.After(v.windowReset) {
 			delete(w.rates, k)
+		}
+	}
+	for k, v := range w.authRates {
+		if now.After(v.windowReset) {
+			delete(w.authRates, k)
 		}
 	}
 	w.rateMu.Unlock()
@@ -236,7 +244,8 @@ func (w *WAFEngine) ReloadBans(ctx context.Context) error {
 		return nil
 	}
 	now := time.Now().UnixMilli()
-	rows, err := sqlx.Select[domain.SecurityIPBan](ctx, w.store,
+	var rows []domain.SecurityIPBan
+	err := sqlx.SelectInto(ctx, w.store, &rows,
 		`SELECT * FROM security_ip_bans WHERE expires_at = 0 OR expires_at > ? ORDER BY created_at DESC`, now)
 	if err != nil {
 		return err
@@ -621,33 +630,61 @@ func (w *WAFEngine) effectiveAdminPath() (string, bool) {
 	return base, base != config.DefaultAdminPath
 }
 
-// AllowRate enforces a fixed-window rate limit keyed by (scope + /32 IPv4 or /64 IPv6 bucket).
+func isAuthRateScope(scope string) bool {
+	s := strings.ToLower(strings.TrimSpace(scope))
+	return strings.HasPrefix(s, "admin:") ||
+		strings.HasPrefix(s, "login") ||
+		strings.HasPrefix(s, "2fa") ||
+		strings.HasPrefix(s, "reader_login") ||
+		strings.HasPrefix(s, "reader_code")
+}
+
+// AllowRate enforces a fixed-window rate limit keyed by (scope + /32 IPv4 or /64 IPv6 bucket),
+// isolating authentication scopes from high-cardinality public scopes so scanner/unlock churn
+// can never evict brute-force counters.
 func (w *WAFEngine) AllowRate(scope string, clientAddr netip.Addr, limit int, window time.Duration) bool {
 	if limit <= 0 {
 		return true
 	}
 	key := scope + "|" + RateLimitBucketKey(clientAddr)
 	now := time.Now()
+	authScope := isAuthRateScope(scope)
 
 	w.rateMu.Lock()
 	defer w.rateMu.Unlock()
-	rw, exists := w.rates[key]
+
+	var buckets map[string]*rateWindow
+	maxBuckets := maxWAFRates
+	if authScope {
+		if w.authRates == nil {
+			w.authRates = make(map[string]*rateWindow)
+		}
+		buckets = w.authRates
+		maxBuckets = maxWAFAuthRates
+	} else {
+		if w.rates == nil {
+			w.rates = make(map[string]*rateWindow)
+		}
+		buckets = w.rates
+	}
+
+	rw, exists := buckets[key]
 	if !exists || now.After(rw.windowReset) {
-		if !exists && len(w.rates) >= maxWAFRates {
+		if !exists && len(buckets) >= maxBuckets {
 			// Bounded GC sweep of expired windows + hard cap eviction so RAM stays tiny under DDoS
-			for k, v := range w.rates {
+			for k, v := range buckets {
 				if now.After(v.windowReset) {
-					delete(w.rates, k)
+					delete(buckets, k)
 				}
 			}
-			for k := range w.rates {
-				if len(w.rates) < maxWAFRates {
+			for k := range buckets {
+				if len(buckets) < maxBuckets {
 					break
 				}
-				delete(w.rates, k)
+				delete(buckets, k)
 			}
 		}
-		w.rates[key] = &rateWindow{count: 1, windowReset: now.Add(window)}
+		buckets[key] = &rateWindow{count: 1, windowReset: now.Add(window)}
 		return true
 	}
 	if rw.count >= limit {

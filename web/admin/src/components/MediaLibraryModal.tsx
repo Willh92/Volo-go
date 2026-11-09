@@ -200,7 +200,7 @@ export function MediaLibraryModal({
       ? "image/*"
       : filterKind === "audio"
       ? "audio/*"
-      : "image/*,audio/*";
+      : "image/*,audio/*,video/*";
 
   return (
     <AnimatedModal

@@ -33,6 +33,8 @@ type SchedulerOptions struct {
 	Plugins        *plugin.Manager
 	BackupDir      string
 	UploadDir      string
+	PluginsDir     string
+	ThemesDir      string
 	OutboundDialer *security.OutboundSafeDialer
 	Logger         io.Writer
 }
@@ -85,6 +87,26 @@ func (s *Scheduler) SetUploadDir(dir string) {
 	s.stateMu.Lock()
 	s.opts.UploadDir = strings.TrimSpace(dir)
 	s.stateMu.Unlock()
+}
+
+// GetPluginsDir returns the external plugins directory configured on the scheduler.
+func (s *Scheduler) GetPluginsDir() string {
+	if s == nil {
+		return ""
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.opts.PluginsDir
+}
+
+// GetThemesDir returns the external themes directory configured on the scheduler.
+func (s *Scheduler) GetThemesDir() string {
+	if s == nil {
+		return ""
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.opts.ThemesDir
 }
 
 // Start launches the background check loop until ctx is canceled or Close is called.
@@ -201,6 +223,8 @@ func (s *Scheduler) runCycle(ctx context.Context) (*RunResult, error) {
 	if _, err := CreateToFile(ctx, s.opts.Store, localPath, CreateOptions{
 		IncludeMedia: cfg.IncludeMediaInAuto,
 		UploadDir:    s.GetUploadDir(),
+		PluginsDir:   s.GetPluginsDir(),
+		ThemesDir:    s.GetThemesDir(),
 	}); err != nil {
 		return nil, err
 	}

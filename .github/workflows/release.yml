@@ -64,6 +64,10 @@ jobs:
             goarch: amd64
             ext: ".exe"
             archive: zip
+          - goos: windows
+            goarch: arm64
+            ext: ".exe"
+            archive: zip
 
     steps:
       - name: Checkout repository
@@ -88,18 +92,21 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
+          VOLO_BUDGET_BIN_MB: ${{ vars.VOLO_BUDGET_BIN_MB }}
         run: |
+          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-21}"
+          MAX_BIN_BYTES=$((BUDGET_BIN_MB * 1024 * 1024))
           STAGE="volo-${VERSION}-${GOOS}-${GOARCH}"
           mkdir -p "dist/${STAGE}/scripts"
           go build -buildvcs=false -trimpath \
             -gcflags="all=-l" \
-            -ldflags="-s -w -X main.Version=${VERSION}" \
+            -ldflags="-s -w -funcalign=8 -X main.Version=${VERSION}" \
             -o "dist/${STAGE}/volo${{ matrix.ext }}" \
             ./cmd/volo
 
           BIN_BYTES=$(wc -c < "dist/${STAGE}/volo${{ matrix.ext }}" | tr -d ' ')
-          if [ "${BIN_BYTES}" -ge 20971520 ]; then
-            echo "Binary exceeds 20 MiB budget (${BIN_BYTES} bytes)" >&2
+          if [ "${BIN_BYTES}" -ge "${MAX_BIN_BYTES}" ]; then
+            echo "Binary exceeds ${BUDGET_BIN_MB} MiB budget (${BIN_BYTES} >= ${MAX_BIN_BYTES} bytes)" >&2
             exit 1
           fi
 

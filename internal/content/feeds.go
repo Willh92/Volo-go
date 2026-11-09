@@ -36,7 +36,8 @@ func (s *Service) collectPublicFeedItems(ctx context.Context, publicBaseURL stri
 		`SELECT * FROM articles WHERE `+where+` ORDER BY published_at DESC`,
 		maxItems, 0,
 	)
-	raws, err := sqlx.Select[domain.RawArticle](ctx, s.store, q, append(args, pageArgs...)...)
+	var raws []domain.RawArticle
+	err := sqlx.SelectInto(ctx, s.store, &raws, q, append(args, pageArgs...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -59,8 +60,8 @@ func (s *Service) collectPublicFeedItems(ctx context.Context, publicBaseURL stri
 		for i := range authorIDs {
 			ph[i] = "?"
 		}
-		users, _ := sqlx.Select[domain.User](
-			ctx, s.store,
+		var users []domain.User
+		_ = sqlx.SelectInto(ctx, s.store, &users,
 			`SELECT id, display_name, username FROM users WHERE id IN (`+strings.Join(ph, ",")+`)`,
 			authorIDs...,
 		)
@@ -232,11 +233,20 @@ func (s *Service) GetCachedPodcast(ctx context.Context, publicBaseURL string, lo
 	})
 }
 
-// GetCachedSitemap returns a revision-coherent, pre-compressed Sitemap XML document with strong ETag.
+// GetCachedSitemap returns a revision-coherent, pre-compressed Sitemap XML (or sitemapindex) document with strong ETag.
 func (s *Service) GetCachedSitemap(ctx context.Context, publicBaseURL string) (CachedDocument, error) {
-	key := "sitemap|" + strings.TrimRight(publicBaseURL, "/")
+	return s.GetCachedSitemapShard(ctx, publicBaseURL, 0)
+}
+
+// GetCachedSitemapShard returns a revision-coherent, pre-compressed Sitemap XML or numbered shard document with strong ETag.
+func (s *Service) GetCachedSitemapShard(ctx context.Context, publicBaseURL string, shard int) (CachedDocument, error) {
+	base := strings.TrimRight(publicBaseURL, "/")
+	key := "sitemap|" + base
+	if shard >= 1 {
+		key = fmt.Sprintf("sitemap|%s|shard=%d", base, shard)
+	}
 	return s.getOrBuildCachedDoc(ctx, key, "application/xml; charset=utf-8", func(c context.Context) ([]byte, error) {
-		return s.BuildSitemapXML(c, publicBaseURL)
+		return s.BuildSitemapShardXML(c, publicBaseURL, shard)
 	})
 }
 
@@ -393,53 +403,164 @@ func (s *Service) BuildPodcastXML(ctx context.Context, publicBaseURL string, loc
 	return b.Bytes(), nil
 }
 
-// BuildSitemapXML generates `/sitemap.xml` with multilingual `xhtml:link rel="alternate" hreflang`
-// while strictly excluding all password-protected articles (Surface 7).
+// SitemapShardSize caps the maximum published articles + standalone pages per sitemap shard before emitting a <sitemapindex>.
+const SitemapShardSize = 10000
+
+// BuildSitemapXML generates `/sitemap.xml` (or a Sitemap 0.9 `<sitemapindex>` when total items > SitemapShardSize)
+// with multilingual `xhtml:link rel="alternate" hreflang` while strictly excluding all password-protected articles (Surface 7).
 func (s *Service) BuildSitemapXML(ctx context.Context, publicBaseURL string) ([]byte, error) {
+	return s.BuildSitemapShardXML(ctx, publicBaseURL, 0)
+}
+
+// BuildSitemapShardXML generates either `/sitemap.xml` (shard <= 0: `<urlset>` when total <= SitemapShardSize,
+// `<sitemapindex>` pointing to `/sitemap-1.xml` .. `/sitemap-{N}.xml` when total > SitemapShardSize)
+// or an individual `/sitemap-{shard}.xml` `<urlset>` (shard >= 1) bounded by SQL LIMIT/OFFSET.
+func (s *Service) BuildSitemapShardXML(ctx context.Context, publicBaseURL string, shard int) ([]byte, error) {
 	base := strings.TrimRight(publicBaseURL, "/")
 
-	arts, err := sqlx.Select[domain.RawArticle](
-		ctx, s.store,
-		`SELECT id, slug, lang, translation_group, published_at, updated_at, status, password_ciphertext
-		 FROM articles
-		 WHERE status = ? AND password_ciphertext = ''
-		 ORDER BY published_at DESC`,
+	var artTotal, pageTotal int
+	if err := s.store.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM articles WHERE status = ? AND password_ciphertext = ''`,
 		domain.ArticleStatusPublished,
-	)
-	if err != nil {
+	).Scan(&artTotal); err != nil {
 		return nil, err
 	}
-	pages, err := sqlx.Select[domain.Page](
-		ctx, s.store,
-		`SELECT id, slug, lang, translation_group, updated_at FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+	if err := s.store.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM pages WHERE is_published = ?`,
 		true,
-	)
-	if err != nil {
+	).Scan(&pageTotal); err != nil {
 		return nil, err
+	}
+	total := artTotal + pageTotal
+
+	if shard <= 0 && total > SitemapShardSize {
+		numShards := (total + SitemapShardSize - 1) / SitemapShardSize
+		var maxArtUpd, maxPageUpd int64
+		_ = s.store.QueryRowContext(
+			ctx,
+			`SELECT COALESCE(MAX(CASE WHEN updated_at > 0 THEN updated_at ELSE published_at END), 0)
+			 FROM articles WHERE status = ? AND password_ciphertext = ''`,
+			domain.ArticleStatusPublished,
+		).Scan(&maxArtUpd)
+		_ = s.store.QueryRowContext(
+			ctx,
+			`SELECT COALESCE(MAX(updated_at), 0) FROM pages WHERE is_published = ?`,
+			true,
+		).Scan(&maxPageUpd)
+		maxUpd := maxArtUpd
+		if maxPageUpd > maxUpd {
+			maxUpd = maxPageUpd
+		}
+		lastmod := ""
+		if maxUpd > 0 {
+			lastmod = time.UnixMilli(maxUpd).UTC().Format("2006-01-02")
+		}
+
+		var b bytes.Buffer
+		b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
+		b.WriteString(`<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` + "\n")
+		for i := 1; i <= numShards; i++ {
+			b.WriteString("  <sitemap>\n")
+			writeXMLTag(&b, "    ", "loc", fmt.Sprintf("%s/sitemap-%d.xml", base, i))
+			if lastmod != "" {
+				writeXMLTag(&b, "    ", "lastmod", lastmod)
+			}
+			b.WriteString("  </sitemap>\n")
+		}
+		b.WriteString("</sitemapindex>\n")
+		return b.Bytes(), nil
 	}
 
-	artGroups := make(map[string][]domain.RawArticle)
-	for _, a := range arts {
-		if s.guard.IsPublicIndexable(a) && strings.TrimSpace(a.TranslationGroup) != "" {
-			artGroups[a.TranslationGroup] = append(artGroups[a.TranslationGroup], a)
+	var (
+		arts                 []domain.RawArticle
+		pages                []domain.Page
+		includeStructuralNav bool
+	)
+
+	if shard <= 0 {
+		includeStructuralNav = true
+		var err error
+		err = sqlx.SelectInto(ctx, s.store, &arts,
+			`SELECT id, slug, lang, translation_group, published_at, updated_at, status, password_ciphertext
+			 FROM articles
+			 WHERE status = ? AND password_ciphertext = ''
+			 ORDER BY published_at DESC`,
+			domain.ArticleStatusPublished,
+		)
+		if err != nil {
+			return nil, err
+		}
+		err = sqlx.SelectInto(ctx, s.store, &pages,
+			`SELECT id, slug, lang, translation_group, updated_at FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+			true,
+		)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		includeStructuralNav = shard == 1
+		offset := (shard - 1) * SitemapShardSize
+		rem := SitemapShardSize
+
+		if offset < artTotal {
+			artLimit := rem
+			if offset+artLimit > artTotal {
+				artLimit = artTotal - offset
+			}
+			artSQL, artArgs := s.store.Dialect().PaginateSQL(
+				`SELECT id, slug, lang, translation_group, published_at, updated_at, status, password_ciphertext
+				 FROM articles
+				 WHERE status = ? AND password_ciphertext = ''
+				 ORDER BY published_at DESC`,
+				artLimit, offset,
+			)
+			var err error
+			err = sqlx.SelectInto(ctx, s.store, &arts, artSQL,
+				append([]any{domain.ArticleStatusPublished}, artArgs...)...,
+			)
+			if err != nil {
+				return nil, err
+			}
+			rem -= artLimit
+		}
+
+		if rem > 0 && pageTotal > 0 {
+			pageOffset := 0
+			if offset > artTotal {
+				pageOffset = offset - artTotal
+			}
+			if pageOffset < pageTotal {
+				pgSQL, pgArgs := s.store.Dialect().PaginateSQL(
+					`SELECT id, slug, lang, translation_group, updated_at FROM pages WHERE is_published = ? ORDER BY slug ASC`,
+					rem, pageOffset,
+				)
+				var err error
+				err = sqlx.SelectInto(ctx, s.store, &pages, pgSQL,
+					append([]any{true}, pgArgs...)...,
+				)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
-	pageGroups := make(map[string][]domain.Page)
-	for _, p := range pages {
-		if strings.TrimSpace(p.TranslationGroup) != "" {
-			pageGroups[p.TranslationGroup] = append(pageGroups[p.TranslationGroup], p)
-		}
-	}
+
+	artGroups := s.resolveSitemapArticleGroups(ctx, arts, shard > 0)
+	pageGroups := s.resolveSitemapPageGroups(ctx, pages, shard > 0)
 
 	var b bytes.Buffer
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	b.WriteString(`<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">` + "\n")
 
-	// Home & structural index routes
-	for _, route := range []string{"/", "/archives", "/categories", "/tags", "/series", "/books"} {
-		b.WriteString("  <url>\n")
-		writeXMLTag(&b, "    ", "loc", base+route)
-		b.WriteString("  </url>\n")
+	if includeStructuralNav {
+		// Home & structural index routes
+		for _, route := range []string{"/", "/archives", "/categories", "/tags", "/series", "/books"} {
+			b.WriteString("  <url>\n")
+			writeXMLTag(&b, "    ", "loc", base+route)
+			b.WriteString("  </url>\n")
+		}
 	}
 
 	for _, a := range arts {
@@ -491,6 +612,113 @@ func (s *Service) BuildSitemapXML(ctx context.Context, publicBaseURL string) ([]
 	return b.Bytes(), nil
 }
 
+func (s *Service) resolveSitemapArticleGroups(ctx context.Context, arts []domain.RawArticle, fetchCrossShard bool) map[string][]domain.RawArticle {
+	groups := make(map[string][]domain.RawArticle)
+	if !fetchCrossShard {
+		for _, a := range arts {
+			if s.guard.IsPublicIndexable(a) && strings.TrimSpace(a.TranslationGroup) != "" {
+				groups[a.TranslationGroup] = append(groups[a.TranslationGroup], a)
+			}
+		}
+		return groups
+	}
+	seen := make(map[string]struct{})
+	var groupNames []string
+	for _, a := range arts {
+		g := strings.TrimSpace(a.TranslationGroup)
+		if g != "" && s.guard.IsPublicIndexable(a) {
+			if _, ok := seen[g]; !ok {
+				seen[g] = struct{}{}
+				groupNames = append(groupNames, g)
+			}
+		}
+	}
+	const batch = 200
+	for start := 0; start < len(groupNames); start += batch {
+		end := start + batch
+		if end > len(groupNames) {
+			end = len(groupNames)
+		}
+		chunk := groupNames[start:end]
+		ph := make([]string, len(chunk))
+		qArgs := make([]any, 0, 1+len(chunk))
+		qArgs = append(qArgs, domain.ArticleStatusPublished)
+		for i, g := range chunk {
+			ph[i] = "?"
+			qArgs = append(qArgs, g)
+		}
+		var peers []domain.RawArticle
+		err := sqlx.SelectInto(ctx, s.store, &peers,
+			`SELECT id, slug, lang, translation_group, status, password_ciphertext
+			 FROM articles
+			 WHERE status = ? AND password_ciphertext = '' AND translation_group IN (`+strings.Join(ph, ",")+`)
+			 ORDER BY published_at DESC`,
+			qArgs...,
+		)
+		if err == nil {
+			for _, pr := range peers {
+				if s.guard.IsPublicIndexable(pr) && strings.TrimSpace(pr.TranslationGroup) != "" {
+					groups[pr.TranslationGroup] = append(groups[pr.TranslationGroup], pr)
+				}
+			}
+		}
+	}
+	return groups
+}
+
+func (s *Service) resolveSitemapPageGroups(ctx context.Context, pages []domain.Page, fetchCrossShard bool) map[string][]domain.Page {
+	groups := make(map[string][]domain.Page)
+	if !fetchCrossShard {
+		for _, p := range pages {
+			if strings.TrimSpace(p.TranslationGroup) != "" {
+				groups[p.TranslationGroup] = append(groups[p.TranslationGroup], p)
+			}
+		}
+		return groups
+	}
+	seen := make(map[string]struct{})
+	var groupNames []string
+	for _, p := range pages {
+		g := strings.TrimSpace(p.TranslationGroup)
+		if g != "" {
+			if _, ok := seen[g]; !ok {
+				seen[g] = struct{}{}
+				groupNames = append(groupNames, g)
+			}
+		}
+	}
+	const batch = 200
+	for start := 0; start < len(groupNames); start += batch {
+		end := start + batch
+		if end > len(groupNames) {
+			end = len(groupNames)
+		}
+		chunk := groupNames[start:end]
+		ph := make([]string, len(chunk))
+		qArgs := make([]any, 0, 1+len(chunk))
+		qArgs = append(qArgs, true)
+		for i, g := range chunk {
+			ph[i] = "?"
+			qArgs = append(qArgs, g)
+		}
+		var peers []domain.Page
+		err := sqlx.SelectInto(ctx, s.store, &peers,
+			`SELECT id, slug, lang, translation_group FROM pages
+			 WHERE is_published = ? AND translation_group IN (`+strings.Join(ph, ",")+`)
+			 ORDER BY slug ASC`,
+			qArgs...,
+		)
+		if err == nil {
+			for _, pr := range peers {
+				if strings.TrimSpace(pr.TranslationGroup) != "" {
+					groups[pr.TranslationGroup] = append(groups[pr.TranslationGroup], pr)
+				}
+			}
+		}
+	}
+	return groups
+}
+
 // BuildLLMSTxt generates `/llms.txt` (index) or `/llms-full.txt` (concatenated public Markdown)
 // strictly enforcing Surface 9 (password-protected articles 100% excluded, `:::lock` blocks stripped).
 func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full bool) ([]byte, error) {
@@ -512,17 +740,18 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 			 ORDER BY is_pinned DESC, published_at DESC`,
 			1000, 0,
 		)
-		arts, err = sqlx.Select[domain.RawArticle](
-			ctx, s.store, artSQL,
+		err = sqlx.SelectInto(ctx, s.store, &arts, artSQL,
 			append([]any{domain.ArticleStatusPublished}, artArgs...)...,
 		)
 		if err != nil {
 			return nil, err
 		}
-		pages, _ = sqlx.Select[domain.Page](
-			ctx, s.store,
+		pgSQL, pgArgs := s.store.Dialect().PaginateSQL(
 			`SELECT id, title, slug FROM pages WHERE is_published = ? ORDER BY slug ASC`,
-			true,
+			500, 0,
+		)
+		_ = sqlx.SelectInto(ctx, s.store, &pages, pgSQL,
+			append([]any{true}, pgArgs...)...,
 		)
 	} else {
 		artSQL, artArgs := s.store.Dialect().PaginateSQL(
@@ -531,17 +760,18 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 			 ORDER BY is_pinned DESC, published_at DESC`,
 			200, 0,
 		)
-		arts, err = sqlx.Select[domain.RawArticle](
-			ctx, s.store, artSQL,
+		err = sqlx.SelectInto(ctx, s.store, &arts, artSQL,
 			append([]any{domain.ArticleStatusPublished}, artArgs...)...,
 		)
 		if err != nil {
 			return nil, err
 		}
-		pages, _ = sqlx.Select[domain.Page](
-			ctx, s.store,
+		pgSQL, pgArgs := s.store.Dialect().PaginateSQL(
 			`SELECT * FROM pages WHERE is_published = ? ORDER BY slug ASC`,
-			true,
+			100, 0,
+		)
+		_ = sqlx.SelectInto(ctx, s.store, &pages, pgSQL,
+			append([]any{true}, pgArgs...)...,
 		)
 	}
 
@@ -594,7 +824,7 @@ func (s *Service) BuildGitHubStatsSVG(username string) []byte {
 	return s.BuildGitHubStatsSVGWithTheme(username, "auto")
 }
 
-// BuildGitHubStatsSVGWithTheme generates a GitHub stats SVG card supporting "auto" (prefers-color-scheme), "dark", or "light".
+// BuildGitHubStatsSVGWithTheme generates a GitHub stats SVG card supporting "auto"/"" (CSS custom properties + prefers-color-scheme), "dark", or "light".
 func (s *Service) BuildGitHubStatsSVGWithTheme(username string, themeMode string) []byte {
 	snap := s.settings.Snapshot()
 	user := strings.TrimSpace(username)
@@ -618,14 +848,18 @@ func (s *Service) BuildGitHubStatsSVGWithTheme(username string, themeMode string
 	}
 
 	mode := strings.ToLower(strings.TrimSpace(themeMode))
-	lightRules := `.gh-card{fill:#f6f7f3;stroke:#dfe6de}.gh-line{stroke:#dfe6de}.gh-title{fill:#293d36}.gh-label{fill:#60756a}.gh-val{fill:#246b51}`
-	darkRules := `.gh-card{fill:#141b18;stroke:#27352f}.gh-line{stroke:#27352f}.gh-title{fill:#e7efe9}.gh-label{fill:#93a89e}.gh-val{fill:#5ec299}`
-	styleCSS := lightRules + `@media (prefers-color-scheme: dark){` + darkRules + `}`
+	lightVars := `--gh-bg:#f6f7f3;--gh-border:#dfe6de;--gh-title:#293d36;--gh-label:#60756a;--gh-val:#246b51`
+	darkVars := `--gh-bg:#141b18;--gh-border:#27352f;--gh-title:#e7efe9;--gh-label:#93a89e;--gh-val:#5ec299`
+	classRules := `.gh-card{fill:var(--gh-bg);stroke:var(--gh-border)}.gh-line{stroke:var(--gh-border)}.gh-title{fill:var(--gh-title)}.gh-label{fill:var(--gh-label)}.gh-val{fill:var(--gh-val)}`
+
+	var styleCSS string
 	switch mode {
 	case "dark":
-		styleCSS = darkRules
+		styleCSS = `:root{color-scheme:dark;` + darkVars + `}` + classRules
 	case "light":
-		styleCSS = lightRules
+		styleCSS = `:root{color-scheme:light;` + lightVars + `}` + classRules
+	default:
+		styleCSS = `:root{color-scheme:light dark;` + lightVars + `}@media (prefers-color-scheme: dark){:root{` + darkVars + `}}` + classRules
 	}
 
 	svg := fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" width="440" height="148" viewBox="0 0 440 148" role="img" aria-label="GitHub Stats for %s">

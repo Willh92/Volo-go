@@ -17,6 +17,7 @@ import (
 
 	nethtml "golang.org/x/net/html"
 
+	"github.com/Willh92/Volo-go/internal/db/dialect"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
@@ -43,41 +44,98 @@ type BookDetailView struct {
 
 // ListBooks returns all books ordered by sort_order ASC, created_at DESC with live chapter counts.
 func (s *Service) ListBooks(ctx context.Context) ([]domain.Book, error) {
-	books, err := sqlx.Select[domain.Book](ctx, s.store, `SELECT * FROM books ORDER BY sort_order ASC, created_at DESC`)
+	var books []domain.Book
+	err := sqlx.SelectInto(ctx, s.store, &books, `SELECT * FROM books ORDER BY sort_order ASC, created_at DESC`)
 	if err != nil || len(books) == 0 {
 		return books, err
+	}
+	s.populateBookChapterCounts(ctx, books)
+	return books, nil
+}
+
+// ListBooksPage filters books by optional query q and paginates in SQL with live chapter counts for the page slice.
+func (s *Service) ListBooksPage(ctx context.Context, q string, page, perPage int) ([]domain.Book, int, error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 18, 100)
+	cleanQ := strings.TrimSpace(q)
+
+	var whereSQL string
+	var whereArgs []any
+	if cleanQ != "" {
+		pat := "%" + strings.ToLower(cleanQ) + "%"
+		whereSQL = " WHERE LOWER(title) LIKE ? OR LOWER(slug) LIKE ? OR LOWER(description) LIKE ? OR LOWER(source_url) LIKE ?"
+		whereArgs = []any{pat, pat, pat, pat}
+	}
+
+	var total int
+	if err := s.store.QueryRowContext(ctx, "SELECT COUNT(*) FROM books"+whereSQL, whereArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []domain.Book{}, 0, nil
+	}
+
+	baseSQL := "SELECT * FROM books" + whereSQL + " ORDER BY sort_order ASC, created_at DESC"
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
+	queryArgs := append(append([]any{}, whereArgs...), pageArgs...)
+
+	var books []domain.Book
+	err := sqlx.SelectInto(ctx, s.store, &books, pageSQL, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(books) > 0 {
+		s.populateBookChapterCounts(ctx, books)
+	}
+	return books, total, nil
+}
+
+func (s *Service) populateBookChapterCounts(ctx context.Context, books []domain.Book) {
+	if len(books) == 0 {
+		return
+	}
+	placeholders := make([]string, len(books))
+	args := make([]any, len(books))
+	for i, b := range books {
+		placeholders[i] = "?"
+		args[i] = b.ID
 	}
 	type cntRow struct {
 		BookID string `db:"book_id"`
 		Cnt    int    `db:"cnt"`
 	}
-	counts, cErr := sqlx.Select[cntRow](ctx, s.store, `SELECT book_id, COUNT(*) AS cnt FROM book_chapters GROUP BY book_id`)
-	if cErr == nil {
-		cntMap := make(map[string]int, len(counts))
-		for _, c := range counts {
-			cntMap[c.BookID] = c.Cnt
-		}
-		for i := range books {
-			if cnt, ok := cntMap[books[i].ID]; ok {
-				if cnt > 0 || books[i].ChapterCount <= 0 {
-					books[i].ChapterCount = cnt
-				}
-			} else if books[i].SourceType != "external" {
-				books[i].ChapterCount = 0
+	cntSQL := fmt.Sprintf(
+		`SELECT book_id, COUNT(*) AS cnt FROM book_chapters WHERE book_id IN (%s) GROUP BY book_id`,
+		strings.Join(placeholders, ","),
+	)
+	var counts []cntRow
+	cErr := sqlx.SelectInto(ctx, s.store, &counts, cntSQL, args...)
+	if cErr != nil {
+		return
+	}
+	cntMap := make(map[string]int, len(counts))
+	for _, c := range counts {
+		cntMap[c.BookID] = c.Cnt
+	}
+	for i := range books {
+		if cnt, ok := cntMap[books[i].ID]; ok {
+			if cnt > 0 || books[i].ChapterCount <= 0 {
+				books[i].ChapterCount = cnt
 			}
+		} else if books[i].SourceType != "external" {
+			books[i].ChapterCount = 0
 		}
 	}
-	return books, nil
 }
 
 // GetBookBySlug loads a Book and reconstructs its hierarchical chapter tree + flat reader sequence.
 func (s *Service) GetBookBySlug(ctx context.Context, slug string) (BookDetailView, error) {
-	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE slug = ?`, strings.TrimSpace(slug))
+	var bk domain.Book
+	err := sqlx.GetInto(ctx, s.store, &bk, `SELECT * FROM books WHERE slug = ?`, strings.TrimSpace(slug))
 	if err != nil {
 		return BookDetailView{}, err
 	}
-	chapters, err := sqlx.Select[domain.BookChapter](
-		ctx, s.store,
+	var chapters []domain.BookChapter
+	err = sqlx.SelectInto(ctx, s.store, &chapters,
 		`SELECT * FROM book_chapters WHERE book_id = ? ORDER BY sort_order ASC`,
 		bk.ID,
 	)
@@ -135,7 +193,8 @@ func (s *Service) ListBookCards(ctx context.Context) []render.BookCardInfo {
 }
 
 func (s *Service) lookupBookCard(ctx context.Context, slug string) (render.BookCardInfo, bool) {
-	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE slug = ? OR id = ?`, slug, slug)
+	var bk domain.Book
+	err := sqlx.GetInto(ctx, s.store, &bk, `SELECT * FROM books WHERE slug = ? OR id = ?`, slug, slug)
 	if err != nil {
 		return render.BookCardInfo{}, false
 	}
@@ -178,7 +237,8 @@ func (s *Service) listBookCards(ctx context.Context) []render.BookCardInfo {
 // - `series`: populates chapters from local published, non-protected articles in `series_articles`
 // - `gitbook` / `mdbook` / `vuepress` / `auto`: crawls remote SUMMARY.md or sidebar HTML via SSRF-safe OutboundSafeDialer
 func (s *Service) SyncBookTOC(ctx context.Context, bookID string) (int, error) {
-	bk, err := sqlx.Get[domain.Book](ctx, s.store, `SELECT * FROM books WHERE id = ?`, strings.TrimSpace(bookID))
+	var bk domain.Book
+	err := sqlx.GetInto(ctx, s.store, &bk, `SELECT * FROM books WHERE id = ?`, strings.TrimSpace(bookID))
 	if err != nil {
 		return 0, err
 	}
@@ -195,8 +255,8 @@ func (s *Service) SyncBookTOC(ctx context.Context, bookID string) (int, error) {
 		if strings.TrimSpace(bk.SeriesID) == "" {
 			return 0, errors.New("bookshelf: series_id is required when source_type='series'")
 		}
-		arts, sErr := sqlx.Select[domain.RawArticle](
-			ctx, s.store,
+		var arts []domain.RawArticle
+		sErr := sqlx.SelectInto(ctx, s.store, &arts,
 			`SELECT a.id, a.title, a.slug, a.password_ciphertext
 			 FROM series_articles sa
 			 INNER JOIN articles a ON a.id = sa.article_id

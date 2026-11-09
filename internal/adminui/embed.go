@@ -5,16 +5,18 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"embed"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"io/fs"
 	"mime"
 	"net/http"
 	"path"
 	"strings"
 	"sync"
+
 	"github.com/Willh92/Volo-go/internal/i18n"
 )
 
@@ -24,15 +26,16 @@ var distFS embed.FS
 // BootConfig is injected as JSON inside `<script id="volo-boot-config" type="application/json">`
 // so the Admin Console & Setup Wizard SPA immediately knows the custom VOLO_ADMIN_PATH, locale, and Studio accent.
 type BootConfig struct {
-	Mode          string            `json:"mode"` // "console" | "setup"
-	AdminPath     string            `json:"admin_path"`
-	BaseAdminPath string            `json:"base_admin_path,omitempty"`
-	PublicURL     string            `json:"public_url"`
-	DefaultLocale string            `json:"default_locale"`
-	Accent        string            `json:"accent"`
-	DefaultTheme  string            `json:"default_theme"`
-	SiteTitle     string            `json:"site_title"`
-	Locales       []i18n.LocaleInfo `json:"locales,omitempty"`
+	Mode            string            `json:"mode"` // "console" | "setup"
+	AdminPath       string            `json:"admin_path"`
+	BaseAdminPath   string            `json:"base_admin_path,omitempty"`
+	PublicURL       string            `json:"public_url"`
+	DefaultLocale   string            `json:"default_locale"`
+	Accent          string            `json:"accent"`
+	DefaultTheme    string            `json:"default_theme"`
+	SiteTitle       string            `json:"site_title"`
+	VendorCDNPrefix string            `json:"vendor_cdn_prefix,omitempty"`
+	Locales         []i18n.LocaleInfo `json:"locales,omitempty"`
 }
 
 type cachedAsset struct {
@@ -46,8 +49,10 @@ type cachedAsset struct {
 
 // Handler serves the embedded Admin Console & Setup Wizard SPA with pre-compressed Gzip negotiation.
 type Handler struct {
-	indexHTML string
-	assets    map[string]cachedAsset
+	indexHTML   string
+	cspHeader   string
+	assets      map[string]cachedAsset
+	bootLocales map[string]string
 }
 
 var (
@@ -80,12 +85,30 @@ func (h *Handler) TotalGzipBytes() int {
 	return total
 }
 
+func gunzipBytes(gz []byte) ([]byte, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		return nil, err
+	}
+	defer gr.Close()
+	return io.ReadAll(gr)
+}
+
+func sanitizeJSONForScript(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.ReplaceAll(s, "</", `<\/`)
+	s = strings.ReplaceAll(s, "<!--", `\u003c!--`)
+	return s
+}
+
 func newHandler() *Handler {
 	h := &Handler{
-		assets: make(map[string]cachedAsset),
+		assets:      make(map[string]cachedAsset),
+		bootLocales: make(map[string]string),
 	}
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
+		h.cspHeader = buildIndexCSP("")
 		return h
 	}
 	var gzBuf bytes.Buffer
@@ -99,6 +122,16 @@ func newHandler() *Handler {
 			gzBytes, rErr := fs.ReadFile(sub, p)
 			if rErr != nil {
 				return nil
+			}
+			if logical == "index.html" {
+				if rawHTML, uErr := gunzipBytes(gzBytes); uErr == nil {
+					h.indexHTML = string(rawHTML)
+				}
+			} else if strings.HasPrefix(logical, "i18n/") && strings.HasSuffix(logical, ".json") {
+				code := strings.TrimSuffix(strings.TrimPrefix(logical, "i18n/"), ".json")
+				if rawJSON, uErr := gunzipBytes(gzBytes); uErr == nil && code != "" {
+					h.bootLocales[code] = sanitizeJSONForScript(string(rawJSON))
+				}
 			}
 			ct := detectContentType(logical)
 			sumGZ := sha256.Sum256(gzBytes)
@@ -114,9 +147,20 @@ func newHandler() *Handler {
 		if _, exists := h.assets[p]; exists {
 			return nil
 		}
+		if _, statErr := fs.Stat(sub, p+".gz"); statErr == nil {
+			return nil
+		}
 		raw, rErr := fs.ReadFile(sub, p)
 		if rErr != nil {
 			return nil
+		}
+		if p == "index.html" {
+			h.indexHTML = string(raw)
+		} else if strings.HasPrefix(p, "i18n/") && strings.HasSuffix(p, ".json") {
+			code := strings.TrimSuffix(strings.TrimPrefix(p, "i18n/"), ".json")
+			if code != "" {
+				h.bootLocales[code] = sanitizeJSONForScript(string(raw))
+			}
 		}
 		ct := detectContentType(p)
 		sumRaw := sha256.Sum256(raw)
@@ -135,24 +179,86 @@ func newHandler() *Handler {
 				etagGZ = fmt.Sprintf(`"%x-gz"`, sumGZ[:12])
 			}
 		}
+		var retainedRaw []byte
+		if len(gzBytes) == 0 {
+			retainedRaw = raw
+		}
 		h.assets[p] = cachedAsset{
-			raw:         raw,
+			raw:         retainedRaw,
 			gz:          gzBytes,
 			contentType: ct,
 			etagRaw:     etagRaw,
 			etagGZ:      etagGZ,
 			immutable:   strings.HasPrefix(p, "assets/"),
 		}
-		if p == "index.html" {
-			h.indexHTML = string(raw)
-		}
 		return nil
 	})
+	h.cspHeader = buildIndexCSP(h.indexHTML)
 	return h
 }
 
-// ServeMount serves either a static asset under mountPrefix (e.g. `/console/assets/app.js`)
-// or the SPA HTML shell with `<base href="{mountPrefix}/">` and JSON boot config injected!
+func buildIndexCSP(indexHTML string) string {
+	var hashes []string
+	rem := indexHTML
+	for {
+		low := strings.ToLower(rem)
+		start := strings.Index(low, "<script")
+		if start < 0 {
+			break
+		}
+		rem = rem[start:]
+		tagEnd := strings.IndexByte(rem, '>')
+		if tagEnd < 0 {
+			break
+		}
+		openTag := strings.ToLower(rem[:tagEnd+1])
+		afterOpen := rem[tagEnd+1:]
+		closeIdx := strings.Index(strings.ToLower(afterOpen), "</script>")
+		if closeIdx < 0 {
+			break
+		}
+		scriptBody := afterOpen[:closeIdx]
+		rem = afterOpen[closeIdx+len("</script>"):]
+		if strings.Contains(openTag, "src=") || strings.Contains(openTag, "application/json") {
+			continue
+		}
+		if scriptBody == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(scriptBody))
+		hashes = append(hashes, "'sha256-"+base64.StdEncoding.EncodeToString(sum[:])+"'")
+	}
+	scriptSrc := "script-src 'self'"
+	if len(hashes) > 0 {
+		scriptSrc += " " + strings.Join(hashes, " ")
+	}
+	const defaultVendorOrigins = "https://cdn.jsdelivr.net https://fastly.jsdelivr.net https://unpkg.com"
+	return "default-src 'self'; " + scriptSrc + " " + defaultVendorOrigins + "; style-src 'self' 'unsafe-inline' " + defaultVendorOrigins + "; img-src 'self' data: blob: https: http:; media-src 'self' data: blob: https: http:; frame-src 'self' https://player.bilibili.com https://www.youtube-nocookie.com; connect-src 'self' https:; font-src 'self' data: " + defaultVendorOrigins + "; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+}
+
+func extractVendorOrigin(prefix string) string {
+	s := strings.TrimSpace(prefix)
+	var rest string
+	if strings.HasPrefix(s, "https://") {
+		rest = s[len("https://"):]
+		s = "https://"
+	} else if strings.HasPrefix(s, "http://") {
+		rest = s[len("http://"):]
+		s = "http://"
+	} else {
+		return ""
+	}
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		rest = rest[:slash]
+	}
+	if rest == "" || strings.ContainsAny(rest, " \t\r\n;'\"<>\\@?") {
+		return ""
+	}
+	return s + rest
+}
+
+// ServeMount serves either a static asset under mountPrefix (e.g. `/console/assets/app.js`, `/console/i18n/en-US.json`)
+// or the SPA HTML shell with `<base href="{mountPrefix}/">` and JSON boot config + boot locale injected!
 func (h *Handler) ServeMount(w http.ResponseWriter, r *http.Request, mountPrefix string, boot BootConfig) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -162,8 +268,8 @@ func (h *Handler) ServeMount(w http.ResponseWriter, r *http.Request, mountPrefix
 	rel := strings.TrimPrefix(r.URL.Path, cleanMount)
 	rel = strings.TrimPrefix(rel, "/")
 
-	// Serve static bundle files (`assets/*`, `favicon.svg`, etc.)
-	if rel != "" && (strings.HasPrefix(rel, "assets/") || strings.Contains(path.Base(rel), ".")) {
+	// Serve static bundle files (`assets/*`, `i18n/*`, `favicon.svg`, etc.)
+	if rel != "" && (strings.HasPrefix(rel, "assets/") || strings.HasPrefix(rel, "i18n/") || strings.Contains(path.Base(rel), ".")) {
 		cleanRel := path.Clean(rel)
 		item, ok := h.assets[cleanRel]
 		if !ok {
@@ -176,10 +282,17 @@ func (h *Handler) ServeMount(w http.ResponseWriter, r *http.Request, mountPrefix
 
 	// Otherwise serve SPA index.html shell with no-store cache control & strict CSP
 	rendered := h.renderIndexHTML(cleanMount+"/", boot)
+	csp := h.cspHeader
+	if csp == "" {
+		csp = buildIndexCSP(h.indexHTML)
+	}
+	if extraOrigin := extractVendorOrigin(boot.VendorCDNPrefix); extraOrigin != "" && !strings.Contains(csp, extraOrigin) {
+		csp = strings.ReplaceAll(csp, "https://unpkg.com", "https://unpkg.com "+extraOrigin)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Vary", "Accept-Encoding")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; media-src 'self' data: blob: https: http:; connect-src 'self' https:; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", csp)
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
@@ -218,6 +331,16 @@ func (h *Handler) renderIndexHTML(baseHref string, boot BootConfig) []byte {
 		}
 	}
 
+	bootLocaleCode := "en-US"
+	if isZH {
+		bootLocaleCode = "zh-CN"
+	}
+	bootLocaleJSON := h.bootLocales[bootLocaleCode]
+	if bootLocaleJSON == "" && bootLocaleCode != "zh-CN" {
+		bootLocaleCode = "zh-CN"
+		bootLocaleJSON = h.bootLocales[bootLocaleCode]
+	}
+
 	inject := fmt.Sprintf(
 		`<base href="%s">`+"\n"+
 			`<link rel="icon" type="image/svg+xml" href="/favicon.svg">`+"\n"+
@@ -226,6 +349,14 @@ func (h *Handler) renderIndexHTML(baseHref string, boot BootConfig) []byte {
 		html.EscapeString(baseHref),
 		strings.TrimSpace(cfgBuf.String()),
 	)
+	if bootLocaleJSON != "" {
+		inject += fmt.Sprintf(
+			"\n"+`<script id="volo-boot-locale" type="application/json" data-locale="%s">%s</script>`,
+			html.EscapeString(bootLocaleCode),
+			bootLocaleJSON,
+		)
+	}
+
 	tpl := h.indexHTML
 	if tpl == "" {
 		tpl = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>Volo Studio Console</title><!--VOLO_BOOT--></head><body><div id=\"app\"></div></body></html>"
@@ -236,8 +367,6 @@ func (h *Handler) renderIndexHTML(baseHref string, boot BootConfig) []byte {
 	if out == tpl {
 		out = strings.Replace(tpl, "<head>", "<head>\n"+inject, 1)
 	}
-	sum := sha256.Sum256([]byte(out))
-	_ = hex.EncodeToString(sum[:4])
 	return []byte(out)
 }
 
@@ -277,9 +406,7 @@ func serveCachedAsset(w http.ResponseWriter, r *http.Request, item cachedAsset) 
 	if len(item.gz) > 0 {
 		if gr, err := gzip.NewReader(bytes.NewReader(item.gz)); err == nil {
 			defer gr.Close()
-			var out bytes.Buffer
-			_, _ = out.ReadFrom(gr)
-			_, _ = w.Write(out.Bytes())
+			_, _ = io.Copy(w, gr)
 		}
 	}
 }

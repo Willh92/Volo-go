@@ -1,8 +1,8 @@
-# 主题定制与插件开发指南
+# 主题定制、三模态编辑器与插件开发指南
 
-> English version: [Themes & Plugin Development Guide](../en-US/themes-and-plugins.md)
+> English version: [Themes, Studio Editor & Plugin Development Guide](../en-US/themes-and-plugins.md)
 
-`Volo-go` 内置零构建依赖的现代双栏编辑部默认主题 **`volo-studio`**，同时开放清晰、无耦合的 **外部主题目录协议（`./themes/*`）** 与 **安全沙箱插件体系（`./plugins/*`）**，第三方扩展无需重新编译 Go 宿主即可热加载生效。
+`Volo-go` 内置零构建依赖的现代双栏编辑部默认主题 **`volo-studio`** 与三模态创作工作台编辑器，同时开放清晰、无耦合的 **外部主题目录协议（`./themes/*`）** 与 **安全沙箱插件体系（`./plugins/*`）**，第三方扩展无需重新编译 Go 宿主即可热加载生效。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1.1 设计令牌与零冲突样式体系
 
-默认主题 `volo-studio` 与官方外部纸刊主题 [`themes/volo-journal`](../../themes/volo-journal/) 共享一套语义化 CSS 变量令牌（支持亮色/暗色/跟随系统三态无闪烁切换，以及 `forest`、`ocean`、`teal`、`amber`、`plum`、`rose` 6 套无障碍 AA 对比度强调色）：
+默认主题 `volo-studio` 与官方外部纸刊主题 [`themes/volo-journal`](../../themes/volo-journal/) 共享一套语义化 CSS 变量令牌（支持亮色/暗色/柔和暖色/跟随系统无闪烁切换，以及 `forest`、`ocean`、`teal`、`amber`、`plum`、`rose` 6 套无障碍 AA 对比度强调色）：
 
 ```css
 :root {
@@ -28,43 +28,31 @@
 }
 ```
 
-### 1.2 外部主题目录结构（`./themes/<theme-id>/`）
+### 1.2 外部主题目录结构、脚手架 `.zip` 导出与原位覆盖升级
 
-在 `VOLO_THEMES_DIR`（默认 `./themes`）下新建目录即可被管理台 **「外观与主题」** 自动发现并即时切换：
+在 `VOLO_THEMES_DIR`（默认 `./themes`）下新建目录，或在管理工作台（默认 `/console`，支持通过 `security.admin_path` 热切换动态隐身路径）**「外观与扩展 -> 主题皮肤」** 上传 `.zip` 包，即可自动发现并即时切换：
 
 ```text
 themes/my-editorial/
 ├── theme.json              # 主题元信息清单（必填）
+├── preview.svg             # 后台画廊预览缩略图（可选，支持 .svg / .png / .webp）
+├── locales/                # 主题专属多语言词典（可选，通过 {{tt .ThemeID .Locale "key"}} 读取）
+│   ├── zh-CN.json
+│   └── en-US.json
 ├── assets/
-│   ├── theme.css           # 主题样式（通过 /themes/my-editorial/assets/theme.css 零拷贝预压缩分发）
+│   ├── theme.css           # 主题样式（通过 {{assetURL .ThemeID "theme.css"}} 带指纹与预压缩分发）
 │   └── theme.js            # 可选增强脚本
 └── templates/              # 可选覆盖模板（未提供的页面自动安全回退至宿主标准视图）
     ├── layout.html
     ├── index.html
     ├── article.html
-    └── page.html
+    ├── page.html
+    ├── page-wide.html
+    └── error.html
 ```
 
-`theme.json` 规范示例：
-
-```json
-{
-  "id": "my-editorial",
-  "name": {
-    "zh-CN": "极简专栏",
-    "en-US": "Minimal Editorial"
-  },
-  "version": "1.0.0",
-  "author": "Your Name",
-  "description": {
-    "zh-CN": "专注长文阅读的单栏排版主题。",
-    "en-US": "Single-column long-form reading theme."
-  },
-  "accents": ["forest", "ocean", "teal", "amber", "plum", "rose"],
-  "supports_dark_mode": true,
-  "supports_pjax": true
-}
-```
+- **一键纯净脚手架 `.zip` 导出**：管理员可在后台点击任一主题（含内置 `volo-studio`）的 **「导出主题包 (.zip)」**（`GET /api/admin/themes/{id}/export`），直接下载自动剥离临时文件与系统噪音的纯净 Starter `.zip` 包作为二次开发起点。
+- **原位 `.zip` 覆盖升级**：上传主题时支持 `POST /api/admin/themes/install?overwrite=true` 原位热更新现有同 ID 主题文件，同时完整保留站长已保存的 `Appearance.ThemeConfigs[<id>]` 配置项。
 
 ### 1.3 PJAX 跨页常驻岛协议（`data-volo-persist`）
 
@@ -73,47 +61,79 @@ themes/my-editorial/
 ### 1.4 桌面/手机双主题分流与顶部导航编排能力（`sortable_list` + `.NavMenu`）
 
 - **桌面与手机独立主题设置**：管理台 **「外观与扩展 -> 主题皮肤」** 支持为桌面端（`active_theme`）与手机端（`mobile_theme`，留空则跟随桌面主题）分别启用不同主题，服务端按请求设备特征自动分流并输出 `Vary: User-Agent, Sec-CH-UA-Mobile`；管理员可通过 `/?skin=<id>` 与 `/?skin=<id>&device=mobile` 免切换实时预览。
-- **主题级顶部菜单显隐、排序与溢出收纳**：主题可在 `theme.json` 的 `config_schema` 中声明 `"type": "sortable_list"`（如内置 `volo-studio` 与外部 `volo-journal` 的 `header_nav_items` + `header_nav_primary_count`），允许站长自由勾选并拖拽/调整内置栏目（`home`、`archives`、`tags`、`categories`、`series`、`books`、`links`、`follows`、`dynamic`）及自定义导航插槽（`custom`，自动展开后台自定义的导航链接且默认排在末尾）。模板直接读取 `PageContext.NavMenu`（含 `.NavMenu.Primary` 顶栏直出项、`.NavMenu.Overflow` “更多”收纳项与 `.NavMenu.OverflowActive` 高亮态）即可渲染自适应导航栏。
+- **主题级顶部菜单显隐、排序与溢出收纳**：主题可在 `theme.json` 的 `config_schema` 中声明 `"type": "sortable_list"`（如 `header_nav_items` + `header_nav_primary_count`），允许站长自由勾选并拖拽排序内置栏目（`home`、`archives`、`tags`、`categories`、`series`、`books`、`links`、`follows`、`dynamic`）及自定义导航项（`custom`）。模板直接读取 `PageContext.NavMenu`（`.Primary`、`.Overflow`、`.OverflowActive`）即可渲染自适应导航栏。
 
-### 1.5 独立页面可选模板协议（`page_templates`）
+### 1.5 主题高阶扩展能力（`page_templates`、`{{customVar}}`、`Reading.ListStyle` 与无框 `error.html`）
 
-主题可在 `theme.json` 中通过 `"page_templates"` 声明供后台独立页面（Pages）选择的专属排版模板（对应渲染 `templates/page-<id>.html`，切换至不含该模板的主题时自动安全回退至 `templates/page.html`）：
+1. **独立页面可选模板协议（`page_templates`）**：
+   主题可在 `theme.json` 中通过 `"page_templates"` 声明供后台独立页面（Pages）选择的专属排版版式（渲染 `templates/page-<value>.html`，若切换至不含该文件的主题则自动安全回退至 `templates/page.html`）：
+   ```json
+   {
+     "page_templates": [
+       {
+         "id": "default",
+         "value": "default",
+         "label": { "zh-CN": "标准版式", "en-US": "Default Layout" }
+       },
+       {
+         "id": "wide",
+         "value": "wide",
+         "label": { "zh-CN": "宽幅展示", "en-US": "Wide Showcase" }
+       }
+     ]
+   }
+   ```
+2. **自定义站点模板变量（`{{customVar}}` / `Site.CustomVars`）**：
+   站长可在后台 **「站点设置 -> 自定义模板变量」**（`site.custom_vars`）中维护任意键值字典（如备案号、社交链接、横幅口号，亦支持从旧版 Bolo-Solo `customVars` 无损导入），模板中无需修改 `theme.json` 即可直接调用：
+   ```gotmpl
+   {{customVar .Site.CustomVars "icp_number" ""}}
+   ```
+3. **文章列表呈现风格（`Reading.ListStyle`）**：
+   后台 **「阅读与排版」** 支持三种列表呈现模式 `reading.list_style`：`summary`（摘要卡片，默认）、`title_only`（纯标题极简索引）、`full`（时间流直接展开全文）。当设为 `"full"` 时，服务端会为公开 `.ArticleCards` 自动填充安全净化的 `.FullHTML`（密码保护文章与未解锁的 `:::lock ... :::` 内容块仍由 `VisibilityGuard` 严格拦截脱敏，绝不泄露）。
+4. **独立无框全屏 `error.html` 覆写（Standalone Frameless Override）**：
+   即便主题启用 `templates/layout.html` 母版继承，`templates/error.html` 依然可通过重定义 `{{define "layout"}}<!doctype html>...</html>{{end}}{{define "content"}}{{end}}`（或省略 `"content"` 定义直接编写完整 HTML 文档），完全脱离常规顶栏与侧栏框架，渲染沉浸式全屏 `404` / `403` / `429` / `500` 错误画布。
 
-```json
-{
-  "page_templates": [
-    {
-      "id": "wide",
-      "name": { "zh-CN": "宽幅画廊排版", "en-US": "Wide Showcase" },
-      "description": { "zh-CN": "无侧栏全宽画布页面", "en-US": "Full-width layout without sidebar" }
-    }
-  ]
-}
-```
+完整的旧版 FreeMarker (`.ftl`) 皮肤迁移对照表请参阅 [《主题开发与旧版 Bolo-Solo 皮肤迁移指南》](theme-migration.md)。
 
 ---
 
-## 2. 安全沙箱插件开发（`manifest.json` + `goja`）
+## 2. 三模态创作编辑器（3-Mode Studio Editor）
+
+管理工作台内置基于 CodeMirror 6 深度定制的三模态创作编辑器，兼顾纯正 Markdown 掌控力与所见即所得流式体验：
+
+- **IR 即时渲染模式（Instant Rendering）**：光标所在行展开源码微调，离开即原地渲染标题、引用、表格、数学公式与媒体组件；内置**长图加载滚动锚定防抖（Tall-Image Scroll Stabilization）**防止高分辨率图片异步撑开视口导致编辑位跳动，并完整支持反引号 ```` ``` ```` 与波浪线 `~~~` 围栏代码块。
+- **WYSIWYG 富文本往返模式（Rich Round-Trip）**：可视化富文本编辑与无损 Markdown 双向序列化，专为 `<audio>` 与 `<video>` 媒体块注入前后光标着陆区（Cursor Landing Pads），彻底消除嵌入式音视频块首尾无法落光标或删除的痛点。
+- **SV 分屏对照模式（Split View）**：左侧源码编辑与右侧实时排版预览同步滚动对照。
+- **原生多媒体、LaTeX 公式保护与语音速记**：
+  - 原生支持 `<video>` / `<audio>` 上传嵌入与播客外链，拖拽/粘贴图片自动上传；
+  - **LaTeX 数学公式保护**：渲染管线自动保护行内 `$...$` 与块级 `$$...$$` 公式免受 Markdown 下划线 `_` / 星号 `*` 误解析破坏，配合前台按需懒加载 KaTeX 与 Mermaid；
+  - 内置浏览器端**语音录制（Voice Recording）**直传媒体库并一键插入音频播放器标签，且开放 `slots:editor.quick_insert` 供插件注册自定义快捷指令按钮（如一键插入 `:::callout` 容器块）。
+
+---
+
+## 3. 安全沙箱插件开发（`manifest.json` + 纯 Go ES6 JSVM）
 
 `Volo-go` 彻底摒弃“在核心代码硬编码判断特定插件名”的做法。所有内置能力与外部目录插件（如 [`plugins/kanbanniang`](../../plugins/kanbanniang/)）统一遵守声明式权限沙箱协议。
 
-### 2.1 插件目录结构与 `.zip` 热插拔
+### 3.1 插件目录结构、`.zip` 导出与原位覆盖升级
 
 ```text
 plugins/hello-callout/
 ├── manifest.json           # 权限、插槽、钩子、定时任务与配置表单 Schema
-├── main.js                 # 纯 Go 内嵌 JSVM 沙箱入口脚本
+├── main.js                 # 纯 Go 内嵌 ES6 JSVM 沙箱入口脚本
 └── assets/                 # 可选静态资源（通过 /plugins/hello-callout/assets/* 分发）
     ├── widget.css
     └── widget.js
 ```
 
-管理员既可将目录直接放入 `./plugins/`，也可在管理台 **「插件扩展」** 页面直接上传 `.zip` 插件包或点击 **「重新扫描插件」** 零停机热重载、自动根据 `config_schema` 渲染多语言配置表单，并随时热启停或卸载（支持按需一并清理 `plugin_kv` 数据）。
+- **热安装与原位升级（`overwrite=true`）**：管理员既可将目录放入 `./plugins/` 点击 **「重新扫描插件」**，也可通过后台或 `POST /api/admin/plugins/install?overwrite=true` 上传 `.zip` 包完成零停机安装或原位覆盖升级——**原位升级时自动保留已有 `config_json` 与加密的 `secret_ciphertext` 密钥**，无需重复录入 API Token。
+- **纯净 `.zip` 导出**：通过后台按钮或 `GET /api/admin/plugins/{id}/export` 可随时将已安装插件导出为干净的 `.zip` 归档包（自动剔除运行态临时文件，且绝不导出数据库中的加密密钥密文）。
 
-### 2.2 `manifest.json` 完整字段与统一 `config_schema` 规范
+### 3.2 `manifest.json` 完整字段、`type: "secret"` 加密配置与统一 `config_schema`
 
-`theme.json` 与 `manifest.json` 共享完全一致的 `config_schema` 控件类型体系：
+`theme.json` 与 `manifest.json` 共享一致的 `config_schema` 控件类型体系：
 - `string` / `text`（单行文本）、`textarea`（多行文本）
+- `secret`（或任意字符串字段附加 `"secret": true`：密码掩码输入框，落盘 `AES-256-GCM` 强加密）
 - `number`（支持可选 `min`、`max`、`step` 数值范围与步进约束）
 - `boolean`（布尔开关）
 - `select`（下拉选择，配 `options: [{ "value": "...", "label": { ... } }]`）
@@ -124,28 +144,31 @@ plugins/hello-callout/
 ```json
 {
   "id": "hello-callout",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "min_host_version": "0.1.0",
   "runtime": "goja",
   "entry": "main.js",
   "author": "Volo Developer",
   "homepage": "https://example.com",
   "name": {
-    "zh-CN": "文末寄语卡片",
-    "en-US": "Post Callout Card"
+    "zh-CN": "自定义容器与文末寄语",
+    "en-US": "Custom Directive & Callout"
   },
   "description": {
-    "zh-CN": "在文章正文末尾自动注入可配置的定制署名提示。",
-    "en-US": "Appends a customizable callout card after article content."
+    "zh-CN": "注册 :::callout-box 自定义指令并在文章末尾注入定制卡片。",
+    "en-US": "Registers :::callout-box directives and appends a customizable card after articles."
   },
   "permissions": [
     "kv",
+    "render",
     "site:read",
     "crypto",
     "ratelimit",
+    "federation",
     "hooks:render.pre_markdown",
     "hooks:render.post_html",
     "slots:article.after_content",
+    "slots:editor.quick_insert",
     "http.outbound:api.github.com"
   ],
   "allowed_hosts": ["api.github.com"],
@@ -171,35 +194,32 @@ plugins/hello-callout/
       "label": { "zh-CN": "卡片强调色", "en-US": "Accent Color" }
     },
     {
-      "key": "max_items",
-      "type": "number",
-      "default": 5,
-      "min": 1,
-      "max": 20,
-      "step": 1,
-      "label": { "zh-CN": "最大条数", "en-US": "Max Items" }
-    },
-    {
       "key": "api_secret",
-      "type": "string",
-      "secret": true,
+      "type": "secret",
       "label": { "zh-CN": "第三方密钥", "en-US": "API Secret" }
     }
   ]
 }
 ```
 
-> **密钥落盘加密保证**：`config_schema` 中标记 `"secret": true` 的字段在写入数据库时自动使用 `KeyRing` 进行 `AES-256-GCM` 列级加密，且在后台配置接口中自动脱敏为掩码，不会明文回显。
+> **`type: "secret"` 密钥落盘加密保证**：`config_schema` 中声明 `"type": "secret"`（或 `"secret": true`）的字段在写入数据库时自动使用宿主 `KeyRing` 进行 `AES-256-GCM` 独立列加密（`plugins.secret_ciphertext`，绑定 `AAD = plugins.secret_ciphertext:<plugin_id>`）。后台管理 API 仅返回布尔掩码映射 `secret_keys_set`，绝不回显明文；若需清空已保存密钥，可传入哨兵值 `"__VOLO_CLEAR_SECRET__"`。
 
-### 2.3 标准权限（Permissions）、钩子（Hooks）、插槽（UI Slots）与扩展 Provider
+### 3.3 标准权限（Permissions）、自定义指令、自动联邦分发与扩展 Provider
 
 1. **权限白名单令牌**：
-   - **存储**：`kv` / `kv:rw`（读写）、`kv:read`（只读 `plugin_kv`，单插件默认配额上限保护，且后台 KV 写入采用非缓存失效通道，不抖动主站文章/RSS 缓存）；
+   - **存储**：`kv` / `kv:rw`（读写）、`kv:read`（只读 `plugin_kv`，单插件默认配额上限保护，且后台 KV 写入采用独立通道，不抖动主站文章/RSS 页面缓存）；
    - **宿主能力门控**：
      - `crypto`：解锁 `volo.crypto`（`sha256`、`hmacSha256`、`randomUUID`）；
      - `site:read`：解锁 `volo.site.info()` 读取站点只读元信息；
      - `ratelimit`：解锁 `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)` 滑动窗口限流器（声明 `http:routes` 时亦自动开放）；
      - `cron`：允许声明 `cron` 周期后台任务；
+   - **自定义 Markdown 指令扩展（`render` + `volo.registerDirective`）**：
+     - 声明 `"render"`（或 `"hooks:render.*"` / `"hooks:render.directive"`）权限后，插件可在模块顶层初始化阶段调用 `volo.registerDirective(name, handlerFn)` 注册自定义 `:::name {key="val"} ... :::` 块级指令；
+     - 宿主传入 `{ name, attrs, body }` 上下文并对返回的 HTML 自动执行 `bluemonday` 白名单净化；
+     - **系统保留指令红线**：内置局部加密指令 `:::lock` 由宿主物理保留，任何插件均无法劫持或读取未解锁的 `:::lock` 块内容；连续超时或抛错会自动触发插件熔断器（`CIRCUIT_OPEN`）；
+   - **自动联邦网络异步分发（`federation` / `provider:federation`）**：
+     - 声明 `"federation"`（或 `"federation:*"` / `"provider:federation"`）权限并调用 `volo.registerFederation({ publish(ev), deliver(ev) })` 后，每当公开文章**发布或更新**时，宿主会在后台异步触发联邦投递（`DispatchFederationArticle`，停机时优雅等待在途任务排空），方便构建 ActivityPub、Webmention、AT Protocol 或跨站同步桥接插件；
+     - **第十道隐私防线保证**：密码保护文章正文自动脱敏并标记 `ev.omitted_protected = true`，正文内嵌的所有 `:::lock ... :::` 局部加密块在进入联邦插件前已被物理剥离，确保零私密内容外泄；
    - **领域钩子**（支持 `hooks:*` 或细粒度令牌）：
      - 文章生命周期：`hooks:article.published`、`hooks:article.updated`、`hooks:article.deleted`；
      - 独立页面生命周期：`hooks:page.published`、`hooks:page.updated`、`hooks:page.deleted`；
@@ -208,61 +228,56 @@ plugins/hello-callout/
    - **界面插槽**（支持 `ui:slots` 或按插槽授权）：`slots:public.head`、`slots:public.header`、`slots:public.sidebar`、`slots:article.before_content`、`slots:article.after_content`、`slots:comment.before`、`slots:comment.after`、`slots:public.footer`、`slots:editor.quick_insert`、`slots:admin.dashboard_card`；
    - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*` 自定义公开路由）、`http:raw_headers`（按需透传 `x-hub-signature-256`、`x-signature`、`stripe-signature`、`authorization` 等安全验签请求头）、`http.outbound:<hostname>` / `allowed_hosts`（显式域名或 `*.domain.tld` 白名单 + `OutboundSafeDialer` 防 SSRF）；
    - **核心扩展 Provider**：
-     - `provider:storage`：当 `main.js` 实现 `storagePut(objectKey, bodyBase64, contentType)`（返回公开 URL 字符串或 `{ url }`）与可选 `storageDelete(objectKey)`、`storageHealthCheck()` 时自动注册外部媒体/备份对象存储驱动（`StorageProvider`）；若插件熔断或不可用则自动降级回本地磁盘不中断上传；
-     - `provider:oidc`：当 `main.js` 实现 `oidcAuthURL(state, redirectURI, opts)`（`opts` 含 `{ nonce, code_challenge, code_challenge_method }`，若返回的有效 `http`/`https` URL 尚未附带 `nonce` 或 `code_challenge`，宿主会自动补齐查询参数；2 参数旧签名保持 100% 兼容）与 `oidcExchange(code, redirectURI, opts)`（`opts` 含 `{ nonce, code_verifier }`，返回 `{ subject, email, email_verified, nonce, display_name, avatar_url }`，其中 `email_verified` 缺省严格默认为 `false`），以及可选 `oidcProviderInfo()`（返回 `{ id, display_name }`）时自动注册第三方联合登录驱动（`OIDCProvider` / `OIDCAdvancedProvider`）；
-     - `provider:notifier`：注册自定义通知渠道，支持导出 `sendNotification(event)` 或 `notifySend(event)`，与邮件和 Webhook 并行分发；
-     - `provider:antispam`：当 `main.js` 实现 `checkSpam(input)`（返回 `{ action: "allow" | "moderate" | "reject", reason, score }`）时自动注册评论反垃圾审查驱动（`AntiSpamProvider`）；
-   - **高敏读取**：`articles:read_protected`（未显式声明此权限的 JS 插件，即使调用方直接触发 `DispatchHook` 或 `DispatchArticleHook`，宿主也会自动清空密码保护文章正文并按 CommonMark 嵌套规则物理剥离所有 `:::lock ... :::` 内容块）。
+     - `provider:storage`：实现 `storagePut(objectKey, bodyBase64, contentType)` 与可选 `storageDelete(objectKey)`、`storageHealthCheck()` 注册外部对象存储驱动（熔断时自动降级本地磁盘）；
+     - `provider:oidc`：实现 `oidcAuthURL(state, redirectURI, opts)` 与 `oidcExchange(code, redirectURI, opts)`（含 PKCE + `nonce` 防重放校验，`email_verified` 默认 `false`）及可选 `oidcProviderInfo()` 注册第三方联合登录驱动；
+     - `provider:notifier`：实现 `sendNotification(event)` 或 `notifySend(event)` 注册自定义通知渠道；
+     - `provider:antispam`：实现 `checkSpam(input)`（返回 `{ action: "allow" | "moderate" | "reject", reason, score }`）注册评论反垃圾审查驱动；
+   - **高敏读取**：`articles:read_protected`（未显式声明此权限的插件，宿主自动清空密码保护文章正文并按嵌套规则剥离所有 `:::lock ... :::` 内容块）。
 
-2. **沙箱熔断、资源护栏与 XSS 隔离红线**：
-   - 每次 JS Hook / Slot 执行受严格指令步数预算、墙钟超时、循环引用深度上限（`Export` / `JSON.stringify`）及 `4 MiB` 字符串体积上限保护；连续异常或超时自动打开**熔断器（`CircuitOpen`）**旁路该插件；
-   - `volo.on(hookName, handlerFn)` 仅允许在模块顶层初始化阶段调用，初始化完成后自动冻结，防止请求期误调导致监听器泄漏；
-   - `render.post_html` 与后台仪表盘卡片 `admin.dashboard_card` 输出均经过严格白名单 HTML 净化（剥离 `<script>`、`<iframe>`、`on*` 事件属性与 `javascript:`/`data:` 协议）；
-   - 插件 CSS 变量必须使用 `--volo-plugin-<id>-*` 命名空间，包裹容器自动带 `.volo-plugin-scope[data-plugin="<id>"]` 以避免污染宿主排版。
+2. **沙箱熔断、资源护栏与宿主安全联动**：
+   - 每次 JS Hook / Directive / Federation / Slot 执行均受指令步数预算、墙钟超时、循环引用深度上限及 `4 MiB` 字符串体积上限保护；连续异常或超时自动打开**熔断器（`CIRCUIT_OPEN`）**；
+   - `volo.on(...)`、`volo.registerDirective(...)` 与 `volo.registerFederation(...)` 仅允许在模块顶层初始化阶段调用，初始化完成后自动冻结；
+   - 插件 CSS 变量建议使用 `--volo-plugin-<id>-*` 命名空间，包裹容器自动带 `.volo-plugin-scope[data-plugin="<id>"]`；
+   - 关于宿主级 **动态隐身后台路径热更新（`security.admin_path`）** 与 **多库共存 GeoIP 访问控制引擎（`GeoLite2-City/Country/ASN.mmdb` + `ip2region` XDB）** 的详细安全机制，请参阅 [`SECURITY.md`](../../SECURITY.md)。
 
-### 2.4 沙箱 SDK（`volo.*`）、ES6 标准库与 `main.js` 编写示例
+### 3.4 沙箱 SDK（`volo.*`）、ES6 标准库与 `main.js` 完整示例
 
-内置零外部依赖 JS 虚拟机原生支持现代 **ES6+ 语法与标准库**：
-- **语法特性**：函数级 `var` 提升、块级 `let`/`const`、`for (let ...)` 每轮独立闭包绑定、模板字符串 `${...}`、可选链（`obj?.prop`、`obj?.[expr]`、`fn?.(args)`）、空值合并 `??`、箭头函数（词法 `this`）、默认参数与剩余参数 `(...args)`、数组/调用/对象展开 `...x`、对象属性简写与方法简写 `{ a, method() {} }`、以及数组与对象解构赋值（`const { a, b: renamed = 1 } = obj`、`const [x, y = 2] = arr`）；
-- **标准内置对象**：符合 RFC 3986 的 `encodeURIComponent` / `decodeURIComponent`、`Number`（`isNaN`、`isFinite`、`isInteger`、`parseInt`、`parseFloat`、`toFixed`、`toString(radix)`）、`Array`（`from`、`isArray`、`concat`、`map`、`filter`、`reduce`、`find`、`findIndex`、`some`、`every`、`sort`、`reverse`、`shift`、`unshift`、`splice`、`flat`、`flatMap`）、`Object`（`keys`、`values`、`entries`、`fromEntries`、`assign`、`hasOwn`、`Object.prototype.hasOwnProperty`）、`String`（`fromCharCode`、`padStart`、`padEnd`、`trimStart`、`trimEnd`、`lastIndexOf`、支持 `RegExp` 与回调函数的 `replace` / `replaceAll`）、`Function.prototype.{call, apply, bind}`、`RegExp`、`Date`、`JSON`、`Math` 及 `btoa` / `atob`。
+内置零外部依赖 JS 虚拟机原生支持现代 **ES6+ 语法与标准库**（`let`/`const`、模板字符串、可选链 `?.`、空值合并 `??`、箭头函数、展开与解构赋值，以及标准 `Array`/`Object`/`String`/`Number`/`RegExp`/`Date`/`JSON`/`Math`、`encodeURIComponent`、`btoa`/`atob`）。
 
 宿主桥接对象 `volo`（别名 `ctx`）：
-- `volo.on(hookName, handlerFn)`（顶层初始化期注册，或导出全局 `function onHook(hookName, payload)`）：订阅已声明的领域/渲染钩子；
-- `volo.escapeHTML(str)`：对不可信文本做 HTML 实体转义，防止动态插槽拼接引入 XSS；
-- `volo.config.get(key)` / `volo.config.all()`：读取校验后的插件配置（含沙箱内自动解密的 `secret` 字段）；
-- `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`：需声明 `kv` / `kv:read` 权限，支持 `afterKey` 游标翻页；
-- `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`：需声明 `crypto` 权限；
-- `volo.site.info()`：需声明 `site:read` 权限，返回站点名称、URL、默认语言等只读摘要；
-- `volo.rateLimit(key, max, windowSec?)` / `volo.rateLimit.allow(key, max, windowSec?)`：需声明 `ratelimit` 或 `http:routes` 权限；
-- `volo.http.fetch(url, options?)`：受 `allowed_hosts` / `http.outbound:<host>` 白名单与 `OutboundSafeDialer` 保护的出站 HTTP 请求；
-- `volo.i18n.t(locale, key, vars?)` 与 `volo.log.info(msg)` / `volo.log.warn(msg)` / `volo.log.error(msg)`：多语言翻译与结构化插件日志。
+- `volo.on(hookName, handlerFn)`：顶层初始化期订阅领域/渲染钩子；
+- `volo.registerDirective(name, handlerFn)`：顶层初始化期注册自定义 `:::name ... :::` Markdown 指令（需 `render` 权限）；
+- `volo.registerFederation({ publish(ev), deliver(ev) })`：顶层初始化期注册文章发布/更新联邦分发处理器（需 `federation` 权限）；
+- `volo.escapeHTML(str)`：HTML 实体转义；
+- `volo.config.get(key)` / `volo.config.all()`：读取校验后的插件配置（含沙箱内自动透明解密的 `type: "secret"` 字段）；
+- `volo.kv.get(key)` / `volo.kv.getInt(key)` / `volo.kv.set(key, value, ttlSeconds?)` / `volo.kv.del(key)` / `volo.kv.incr(key, delta?, ttlSeconds?)` / `volo.kv.list(prefix, limit?, afterKey?)`：插件命名空间 KV 存储；
+- `volo.crypto.sha256(str)` / `volo.crypto.hmacSha256(secret, msg)` / `volo.crypto.randomUUID()`：加密哈希与随机 UUID；
+- `volo.site.info()`、`volo.rateLimit(key, max, windowSec?)`、`volo.http.fetch(url, options?)`、`volo.i18n.t(locale, key, vars?)` 与 `volo.log.{info,warn,error}(msg)`。
 
 ```javascript
-// 通过 volo.on(...) 在顶层初始化阶段订阅 Markdown 预处理与 HTML 后处理钩子
-volo.on("render.pre_markdown", (article) => ({
-  content_md: article.content_md.replace(/\[toc\]/gi, () => "## 目录\n")
-}));
+// 1. 注册 :::callout-box {type="tip"} ... ::: 自定义 Markdown 容器指令
+volo.registerDirective("callout-box", (ctx) => {
+  const kind = ctx.attrs?.type || "note";
+  return `<div class="callout callout-${volo.escapeHTML(kind)}">${volo.escapeHTML(ctx.body)}</div>`;
+});
 
+// 2. 注册自动联邦发布/更新处理器（自动剥离 :::lock 与加密正文）
+volo.registerFederation({
+  publish(ev) {
+    if (ev.omitted_protected) return;
+    volo.kv.set(`fed:${ev.id}`, JSON.stringify({ action: ev.action, title: ev.title }), 86400);
+  },
+  deliver(ev) {
+    volo.log.info(`federation deliver: ${ev.id}`);
+  }
+});
+
+// 3. 订阅渲染钩子与安全渲染 UI 插槽
 volo.on("render.post_html", ({ html }) => {
   volo.kv.incr("rendered_count", 1, 0);
   return { html };
 });
 
-// 使用 afterKey 游标翻页遍历插件 KV
-function listAllBadges() {
-  const out = [];
-  let cursor = "";
-  while (true) {
-    const batch = volo.kv.list("badge:", 100, cursor);
-    if (!batch?.length) break;
-    out.push(...batch);
-    cursor = batch[batch.length - 1].key;
-    if (batch.length < 100) break;
-  }
-  return out;
-}
-
-// 使用 volo.escapeHTML 安全渲染动态 UI 插槽
 function renderSlot(slotName, ctx) {
   if (slotName === "article.after_content") {
     const msg = volo.config.get("banner_text") || "感谢阅读！";
@@ -274,9 +289,9 @@ function renderSlot(slotName, ctx) {
 
 ---
 
-## 3. 外部 Webhook 通知与 HMAC 验签协议
+## 4. 外部 Webhook 通知与 HMAC 验签协议
 
-除进程内 `goja` 插件外，管理台 **「通知中心 -> Webhooks」** 原生支持向飞书、Telegram、Discord、Slack、Bark、企业微信及任意自定义 HTTP 服务推送 `article.published`、`comment.created` 等事件。
+除进程内插件外，管理台 **「通知中心 -> Webhooks」** 原生支持向飞书、Telegram、Discord、Slack、Bark、企业微信及任意自定义 HTTP 服务推送 `article.published`、`comment.created` 等事件。
 
 当为自定义 Webhook 配置了签名密钥（`Secret`）时，`Volo-go` 会在请求头附带标准 `HMAC-SHA256` 签名供接收端验签防伪造：
 

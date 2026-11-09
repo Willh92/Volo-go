@@ -61,10 +61,11 @@ type ImportOptions struct {
 	TimeZone          string
 	Accent            string
 	ForceLocalStorage bool
-	AdminUsername     string
-	AdminEmail        string
-	AdminDisplayName  string
-	AdminPasswordHash string
+	AdminUsername          string
+	AdminEmail             string
+	AdminDisplayName       string
+	AdminPasswordHash      string
+	PreserveExistingAdmins bool
 }
 
 // ImportReport summarizes everything migrated, normalized, rewritten, and any multi-category conflicts or warnings.
@@ -158,8 +159,17 @@ func ImportLegacyArchive(
 		return report, nil
 	}
 
-	existingAdmins, _ := sqlx.Select[domain.User](ctx, store,
+	var existingAdmins []domain.User
+	_ = sqlx.SelectInto(ctx, store, &existingAdmins,
 		`SELECT * FROM users WHERE role = ?`, domain.RoleAdmin)
+	if opts.PreserveExistingAdmins && len(existingAdmins) > 0 {
+		if len(pass1State.users) == 1 && pass1State.users[0].ID == defaultMappedAdminID && pass1State.users[0].Email == "admin@local.volo" {
+			pass1State.users = nil
+			pass1State.defaultAdminID = existingAdmins[0].ID
+		} else if pass1State.defaultAdminID == "" {
+			pass1State.defaultAdminID = existingAdmins[0].ID
+		}
+	}
 
 	// -------------------------------------------------------------------------
 	// Pass 2: Stream articles, revisions, comments, pages->nav_items, links, follows, and bundled media
@@ -167,7 +177,7 @@ func ImportLegacyArchive(
 	// -------------------------------------------------------------------------
 	var createdMediaFiles []string
 	err = store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		if err := insertPass1EntitiesTx(ctx, tx, pass1State, decomposed, existingAdmins, report); err != nil {
+		if err := insertPass1EntitiesTx(ctx, tx, pass1State, decomposed, existingAdmins, opts.PreserveExistingAdmins, report); err != nil {
 			return err
 		}
 		if err := persistBundledMediaTx(ctx, tx, mediaCandidates, opts.TargetUploadDir, pass1State.defaultAdminID, report, &createdMediaFiles); err != nil {
@@ -828,13 +838,13 @@ func decomposeOptions(
 		out.settings.Site.TimeZone = v
 	}
 	if v := getOpt("noticeBoard"); v != "" {
-		out.settings.Site.NoticeBoard = rewriter.rewriteText(v)
+		out.settings.Site.NoticeBoard = sanitizeLegacySiteInjectionHTML(rewriter.rewriteText(v))
 	}
 	if v := getOpt("footerContent"); v != "" {
-		out.settings.Site.FooterText = rewriter.rewriteText(v)
+		out.settings.Site.FooterText = sanitizeLegacySiteInjectionHTML(rewriter.rewriteText(v))
 	}
-	if v := getOpt("htmlHead"); v != "" {
-		out.settings.Site.CustomHeadMeta = rewriter.rewriteText(v)
+	if v := firstNonEmpty(getOpt("htmlHead"), getOpt("head"), getOpt("blog_custom_head")); v != "" {
+		out.settings.Site.CustomHeadMeta = sanitizeLegacySiteInjectionHTML(rewriter.rewriteText(v))
 	}
 	if v := getOpt("faviconURL"); v != "" && !isLegacyExternalAsset(v) {
 		out.settings.Site.FaviconURL = rewriter.rewriteURL(v)
@@ -1025,7 +1035,7 @@ func decomposeOptions(
 	if v := getOpt("indexNowEnabled"); v != "" {
 		out.settings.SEO.IndexNowEnabled = parseLegacyBool(v, false)
 	}
-	if v := getOpt("indexNowKey"); v != "" {
+	if v := strings.TrimSpace(getOpt("indexNowKey")); isValidLegacyIndexNowKey(v) {
 		out.settings.SEO.IndexNowKey = v
 	}
 	if v := getOpt("myGitHubID"); v != "" {
@@ -1142,6 +1152,7 @@ func insertPass1EntitiesTx(
 	st *pass1Data,
 	dec *decomposedState,
 	existingAdmins []domain.User,
+	preserveExistingAdmins bool,
 	report *ImportReport,
 ) error {
 	// Clear target tables in reverse FK dependency order for clean idempotent import
@@ -1162,15 +1173,63 @@ func insertPass1EntitiesTx(
 		}
 	}
 
+	usedIDs := make(map[string]bool, len(existingAdmins)+len(st.users))
+	usedUsernames := make(map[string]bool, len(existingAdmins)+len(st.users))
+	usedEmails := make(map[string]bool, len(existingAdmins)+len(st.users))
+	if preserveExistingAdmins && len(existingAdmins) > 0 {
+		for _, adm := range existingAdmins {
+			uid := truncRunes(adm.ID, 32)
+			uname := truncRunes(adm.Username, 64)
+			uemail := truncRunes(adm.Email, 190)
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				uid, uname, uemail, truncRunes(adm.DisplayName, 128),
+				truncRunes(adm.AvatarURL, 512), cleanUTF8(adm.Bio), truncRunes(adm.WebsiteURL, 512),
+				domain.RoleAdmin, truncRunes(adm.PasswordHash, 255), truncRunes(adm.LegacyHash, 255),
+				truncRunes(adm.Status, 32), adm.EmailVerifiedAt, truncRunes(adm.PreferredLocale, 32), adm.CreatedAt, adm.UpdatedAt,
+			); err != nil {
+				return fmt.Errorf("etl: preserve existing admin %s: %w", uid, err)
+			}
+			usedIDs[uid] = true
+			usedUsernames[strings.ToLower(uname)] = true
+			usedEmails[strings.ToLower(uemail)] = true
+			report.Users++
+		}
+	}
+
 	for _, u := range st.users {
-		if u.Role == domain.RoleAdmin && u.PasswordHash == "" && u.LegacyHash == "" && len(existingAdmins) > 0 {
+		uid := truncRunes(u.ID, 32)
+		if usedIDs[uid] {
+			continue
+		}
+		if preserveExistingAdmins && len(existingAdmins) > 0 {
+			if u.Role == domain.RoleAdmin {
+				u.Role = domain.RoleEditor
+			}
+			u.PasswordHash = ""
+			u.LegacyHash = ""
+			uname := truncRunes(u.Username, 64)
+			if usedUsernames[strings.ToLower(uname)] {
+				uname = truncRunes(uname+"_legacy_"+uid, 64)
+			}
+			u.Username = uname
+			uemail := truncRunes(u.Email, 190)
+			if usedEmails[strings.ToLower(uemail)] {
+				uemail = truncRunes("legacy+"+uid+"@local.volo", 190)
+			}
+			u.Email = uemail
+		} else if u.Role == domain.RoleAdmin && u.PasswordHash == "" && u.LegacyHash == "" && len(existingAdmins) > 0 {
 			u.PasswordHash = existingAdmins[0].PasswordHash
 			u.LegacyHash = existingAdmins[0].LegacyHash
 		}
+		usedIDs[uid] = true
+		usedUsernames[strings.ToLower(truncRunes(u.Username, 64))] = true
+		usedEmails[strings.ToLower(truncRunes(u.Email, 190))] = true
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			truncRunes(u.ID, 32), truncRunes(u.Username, 64), truncRunes(u.Email, 190), truncRunes(u.DisplayName, 128),
+			uid, truncRunes(u.Username, 64), truncRunes(u.Email, 190), truncRunes(u.DisplayName, 128),
 			truncRunes(u.AvatarURL, 512), cleanUTF8(u.Bio), truncRunes(u.WebsiteURL, 512),
 			truncRunes(u.Role, 32), truncRunes(u.PasswordHash, 255), truncRunes(u.LegacyHash, 255),
 			truncRunes(u.Status, 32), u.EmailVerifiedAt, truncRunes(u.PreferredLocale, 32), u.CreatedAt, u.UpdatedAt,
@@ -1774,9 +1833,7 @@ func streamPass2IntoTx(
 	var existingSeriesRows []struct {
 		ID string `db:"id"`
 	}
-	existingSeriesRows, _ = sqlx.Select[struct {
-		ID string `db:"id"`
-	}](ctx, tx, `SELECT id FROM series`)
+	_ = sqlx.SelectInto(ctx, tx, &existingSeriesRows, `SELECT id FROM series`)
 	validSeries := make(map[string]bool, len(existingSeriesRows))
 	for _, r := range existingSeriesRows {
 		validSeries[r.ID] = true
@@ -3183,3 +3240,44 @@ func structToMap(v any) map[string]any {
 	}
 	return m
 }
+
+func isValidLegacyIndexNowKey(s string) bool {
+	if len(s) < 8 || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	legacyInjScriptBlockRe = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script\s*>`)
+	legacyInjScriptTagRe   = regexp.MustCompile(`(?is)</?script\b[^>]*>`)
+	legacyInjFrameBlockRe  = regexp.MustCompile(`(?is)<(?:iframe|object|embed|applet)\b[^>]*>.*?</(?:iframe|object|embed|applet)\s*>`)
+	legacyInjFrameTagRe    = regexp.MustCompile(`(?is)</?(?:iframe|object|embed|applet)\b[^>]*>`)
+	legacyInjEventAttrRe   = regexp.MustCompile(`(?is)\s+\bon[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"']*)`)
+	legacyInjJSProtoAttrRe = regexp.MustCompile(`(?is)\s+\b(?:href|src|action|formaction|data)\s*=\s*(?:"\s*(?:javascript|vbscript|data\s*:\s*text/html)[^"]*"|'\s*(?:javascript|vbscript|data\s*:\s*text/html)[^']*'|(?:\s*(?:javascript|vbscript|data\s*:\s*text/html)[^\s>"']*))`)
+)
+
+func sanitizeLegacySiteInjectionHTML(raw string) string {
+	cleaned := repo.NormalizeSiteInjectionHTML(raw)
+	for {
+		prev := cleaned
+		cleaned = legacyInjScriptBlockRe.ReplaceAllString(cleaned, "")
+		cleaned = legacyInjScriptTagRe.ReplaceAllString(cleaned, "")
+		cleaned = legacyInjFrameBlockRe.ReplaceAllString(cleaned, "")
+		cleaned = legacyInjFrameTagRe.ReplaceAllString(cleaned, "")
+		cleaned = legacyInjEventAttrRe.ReplaceAllString(cleaned, "")
+		cleaned = legacyInjJSProtoAttrRe.ReplaceAllString(cleaned, "")
+		cleaned = repo.NormalizeSiteInjectionHTML(cleaned)
+		if cleaned == prev {
+			break
+		}
+	}
+	return cleaned
+}
+

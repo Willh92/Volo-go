@@ -24,6 +24,7 @@ import {
   themeModeSig,
   toastSig,
   toggleEffectiveTheme,
+  totpEnrollmentRequiredSig,
 } from "./api";
 import {
   availableLocalesSig,
@@ -35,14 +36,22 @@ import {
 } from "./i18n";
 import { BrandLogo } from "./components/BrandLogo";
 import { AnimatedModal, CloseIcon, GlobalConfirmModal, LocalePopover, SvgIcon, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
-import { SetupWizard } from "./views/SetupWizard";
 import { LoginView, formatOidcError } from "./views/LoginView";
-import { OverviewSection, OverviewWorkspace } from "./views/OverviewWorkspace";
-import { ContentSubTab, ContentWorkspace } from "./views/ContentWorkspace";
-import { DistTab, DistributeWorkspace } from "./views/DistributeWorkspace";
-import { AppearanceWorkspace } from "./views/AppearanceWorkspace";
-import { SysTab, SystemWorkspace } from "./views/SystemWorkspace";
-import { AboutHelpTab, AboutHelpWorkspace } from "./views/AboutHelpWorkspace";
+import type { OverviewSection } from "./views/OverviewWorkspace";
+import type { ContentSubTab } from "./views/ContentWorkspace";
+import type { DistTab } from "./views/DistributeWorkspace";
+import type { SysTab } from "./views/SystemWorkspace";
+import type { AboutHelpTab } from "./views/AboutHelpWorkspace";
+
+import { SetupWizard } from "./views/SetupWizard";
+import {
+  AboutHelpWorkspace,
+  AppearanceWorkspace,
+  ContentWorkspace,
+  DistributeWorkspace,
+  OverviewWorkspace,
+  SystemWorkspace,
+} from "./views/lazyWorkspaces";
 
 type NavSection =
   | OverviewSection
@@ -195,33 +204,33 @@ function NavIcon({ name }: { name: string }) {
   switch (name) {
     case "home":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <path d="M3 10.5L12 3l9 7.5" />
           <path d="M5.5 9.5V20h13V9.5" />
         </SvgIcon>
       );
     case "posts":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <path d="M12 20h9" />
           <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
         </SvgIcon>
       );
     case "comments":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
         </SvgIcon>
       );
     case "content":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
         </SvgIcon>
       );
     case "distribute":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <path d="M4 11a9 9 0 0 1 9 9" />
           <path d="M4 4a16 16 0 0 1 16 16" />
           <circle cx="5" cy="19" r="1.5" fill="currentColor" />
@@ -229,7 +238,7 @@ function NavIcon({ name }: { name: string }) {
       );
     case "appearance":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <circle cx="13.5" cy="6.5" r=".8" fill="currentColor" />
           <circle cx="17.5" cy="10.5" r=".8" fill="currentColor" />
           <circle cx="8.5" cy="7.5" r=".8" fill="currentColor" />
@@ -239,7 +248,7 @@ function NavIcon({ name }: { name: string }) {
       );
     case "settings":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <line x1="4" y1="6" x2="20" y2="6" />
           <line x1="4" y1="12" x2="20" y2="12" />
           <line x1="4" y1="18" x2="20" y2="18" />
@@ -250,7 +259,7 @@ function NavIcon({ name }: { name: string }) {
       );
     case "info":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <circle cx="12" cy="12" r="9.5" />
           <line x1="12" y1="16" x2="12" y2="11.5" />
           <circle cx="12" cy="8" r="0.8" fill="currentColor" />
@@ -258,7 +267,7 @@ function NavIcon({ name }: { name: string }) {
       );
     case "help":
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <circle cx="12" cy="12" r="9.5" />
           <path d="M9.4 9.2a2.7 2.7 0 0 1 5.1 1c0 1.7-2.5 2.2-2.5 3.6" />
           <circle cx="12" cy="17.2" r="0.8" fill="currentColor" />
@@ -266,7 +275,7 @@ function NavIcon({ name }: { name: string }) {
       );
     default:
       return (
-        <SvgIcon cls="volo-nav-icon" size={1.8} sw={1.8}>
+        <SvgIcon cls="volo-nav-icon" sw={1.8}>
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
         </SvgIcon>
       );
@@ -597,10 +606,27 @@ function App() {
   const isDark = effectiveDarkSig.value;
   const curAccent = accentSig.value;
   const isBusy = busyCountSig.value > 0;
+  const totpEnrollReq = totpEnrollmentRequiredSig.value;
 
   useEffect(() => {
     setAvatarErr(false);
   }, [user?.avatar_url]);
+
+  useEffect(() => {
+    if (ready && user && totpEnrollReq && bootConfig.mode !== "setup") {
+      if (sectionRef.current !== "account") {
+        setSection("account");
+        const parent = findParentGroup("account");
+        if (parent) {
+          setOpenGroups((prev) => ({ ...prev, [parent]: true }));
+        }
+        if (typeof window !== "undefined" && window.location.hash !== "#account") {
+          window.history.replaceState(null, "", "#account");
+        }
+        resetConsoleScroll();
+      }
+    }
+  }, [ready, user, totpEnrollReq]);
 
   const updateAppearancePos = () => {
     if (!appBtnRef.current) return;
@@ -1149,7 +1175,33 @@ function App() {
         </header>
 
         <main class="volo-content">
-          <div key={section} class="volo-view-enter">
+          <div
+            key={
+              section === "dashboard" || section === "editor" || section === "articles" || section === "drafts"
+                ? "overview"
+                : section === "comments" ||
+                  section === "categories" ||
+                  section === "tags" ||
+                  section === "series" ||
+                  section === "books" ||
+                  section === "pages" ||
+                  section === "media"
+                ? "content"
+                : section === "nav_redirects" ||
+                  section === "feed_seo" ||
+                  section === "github" ||
+                  section === "links" ||
+                  section === "follows" ||
+                  section === "webhooks"
+                ? "distribute"
+                : section === "themes" || section === "locales" || section === "plugins"
+                ? "appearance"
+                : section === "about" || section === "help"
+                ? "about"
+                : "system"
+            }
+            class="volo-view-enter"
+          >
             {(section === "dashboard" || section === "editor" || section === "articles" || section === "drafts") && (
               <OverviewWorkspace section={section} onNavigate={(s) => void navigateTo(s)} />
             )}

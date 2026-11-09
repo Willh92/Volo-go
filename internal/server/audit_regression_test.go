@@ -523,7 +523,8 @@ func TestAudit_GuestClaimRoleIsolationAndLocalizedPublicErrors(t *testing.T) {
 
 	// 3. Admin calling POST /api/v1/reader/claim-guest-comments must get 403 localized zh-CN error (not raw English)
 	resp, claimAdmRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/v1/reader/claim-guest-comments", nil, adminCookies, map[string]string{
-		"Accept-Language": "zh-CN",
+		"Accept-Language":   "zh-CN",
+		auth.CSRFHeaderName: adminHdrs[auth.CSRFHeaderName],
 	})
 	if resp.StatusCode != http.StatusForbidden || strings.Contains(string(claimAdmRaw), "no verified guest passport") || !strings.Contains(string(claimAdmRaw), "无权") {
 		t.Fatalf("expected 403 localized zh-CN forbidden for admin claim, got %d %s", resp.StatusCode, string(claimAdmRaw))
@@ -534,7 +535,10 @@ func TestAudit_GuestClaimRoleIsolationAndLocalizedPublicErrors(t *testing.T) {
 		"target_type": "article",
 		"target_id":   createdArt.Article.ID,
 		"content_md":  "",
-	}, adminCookies, map[string]string{"Accept-Language": "zh-CN"})
+	}, adminCookies, map[string]string{
+		"Accept-Language":   "zh-CN",
+		auth.CSRFHeaderName: adminHdrs[auth.CSRFHeaderName],
+	})
 	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(badCmtRaw), "评论内容长度") {
 		t.Fatalf("expected localized zh-CN comment length error, got %d %s", resp.StatusCode, string(badCmtRaw))
 	}

@@ -66,6 +66,7 @@ type PaginatedCommentsResult struct {
 	TotalComments int                 `json:"total_comments"`
 	TotalPages    int                 `json:"total_pages"`
 	HasMore       bool                `json:"has_more"`
+	FocusFound    *bool               `json:"focus_found,omitempty"`
 }
 
 // RecentCommentItem is displayed in the volo-studio sidebar and /dynamic page (strictly excluding protected/unpublished targets!).
@@ -120,7 +121,8 @@ func (s *Service) authorizeCommentTarget(
 		}
 		return raw.AuthorID, nil
 	case domain.TargetTypePage:
-		pg, err := sqlx.Get[domain.Page](ctx, s.store, `SELECT id, author_id, is_published FROM pages WHERE id = ?`, tID)
+		var pg domain.Page
+		err := sqlx.GetInto(ctx, s.store, &pg, `SELECT id, author_id, is_published FROM pages WHERE id = ?`, tID)
 		if err != nil {
 			return "", err
 		}
@@ -213,6 +215,8 @@ func buildCommentVisibilityWhere(tType, tID string, isAdmin bool, callerUserID, 
 	return where, args
 }
 
+const maxHydratedRepliesPerBatch = 500
+
 func (s *Service) hydrateRootThreadsReplies(
 	ctx context.Context,
 	visWhere string,
@@ -242,33 +246,42 @@ func (s *Service) hydrateRootThreadsReplies(
 
 	repliesByRoot := make([][]publicCommentRow, len(rootRows))
 	multiDepth := false
+	totalReplies := 0
 
-	for depth := 0; depth < 8 && len(frontier) > 0; depth++ {
+	for depth := 0; depth < 8 && len(frontier) > 0 && totalReplies < maxHydratedRepliesPerBatch; depth++ {
 		if depth > 0 {
 			multiDepth = true
 		}
 		var nextFrontier []string
 		const batchSize = 250
-		for start := 0; start < len(frontier); start += batchSize {
+		for start := 0; start < len(frontier) && totalReplies < maxHydratedRepliesPerBatch; start += batchSize {
 			end := start + batchSize
 			if end > len(frontier) {
 				end = len(frontier)
 			}
 			chunk := frontier[start:end]
+			rem := maxHydratedRepliesPerBatch - totalReplies
 			placeholders := make([]string, len(chunk))
-			qArgs := make([]any, 0, len(visArgs)+len(chunk))
+			qArgs := make([]any, 0, len(visArgs)+len(chunk)+2)
 			qArgs = append(qArgs, visArgs...)
 			for i, pid := range chunk {
 				placeholders[i] = "?"
 				qArgs = append(qArgs, pid)
 			}
-			replySQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere +
+			baseReplySQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere +
 				` AND parent_id IN (` + strings.Join(placeholders, ",") + `) ORDER BY created_at ASC, id ASC`
-			repRows, err := sqlx.Select[publicCommentRow](ctx, s.store, replySQL, qArgs...)
+			replySQL, pageArgs := s.store.Dialect().PaginateSQL(baseReplySQL, rem, 0)
+			qArgs = append(qArgs, pageArgs...)
+
+			var repRows []publicCommentRow
+			err := sqlx.SelectInto(ctx, s.store, &repRows, replySQL, qArgs...)
 			if err != nil {
 				return nil, err
 			}
 			for _, rep := range repRows {
+				if totalReplies >= maxHydratedRepliesPerBatch {
+					break
+				}
 				rIdx, ok := rootIdxForID[strings.TrimSpace(rep.ParentID)]
 				if !ok {
 					continue
@@ -278,6 +291,7 @@ func (s *Service) hydrateRootThreadsReplies(
 				}
 				rootIdxForID[rep.ID] = rIdx
 				repliesByRoot[rIdx] = append(repliesByRoot[rIdx], rep)
+				totalReplies++
 				nextFrontier = append(nextFrontier, rep.ID)
 			}
 		}
@@ -327,7 +341,8 @@ func (s *Service) ListTargetComments(
 	visWhere, visArgs := buildCommentVisibilityWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
 
 	rootSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere + ` AND parent_id = '' ORDER BY created_at DESC, id DESC`
-	rootRows, err := sqlx.Select[publicCommentRow](ctx, s.store, rootSQL, visArgs...)
+	var rootRows []publicCommentRow
+	err = sqlx.SelectInto(ctx, s.store, &rootRows, rootSQL, visArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +350,8 @@ func (s *Service) ListTargetComments(
 }
 
 // ListTargetCommentsPage returns a paginated slice of root comment threads (newest-first, with replies intact).
-// If focusCommentID matches a root or reply, page automatically jumps to the page containing that thread.
+// If focusCommentID matches a root or reply, page automatically jumps to the page containing that thread,
+// and FocusFound signals true/false so frontend widgets never run blind pagination waterfalls.
 func (s *Service) ListTargetCommentsPage(
 	ctx context.Context,
 	r *http.Request,
@@ -348,6 +364,7 @@ func (s *Service) ListTargetCommentsPage(
 ) (PaginatedCommentsResult, error) {
 	tType := strings.TrimSpace(targetType)
 	tID := strings.TrimSpace(targetID)
+	focusID := strings.TrimSpace(focusCommentID)
 	postAuthorID, err := s.authorizeCommentTarget(ctx, r, viewer, tType, tID)
 	if err != nil {
 		return PaginatedCommentsResult{}, err
@@ -373,6 +390,11 @@ func (s *Service) ListTargetCommentsPage(
 	}
 
 	if totalComments == 0 {
+		var focusFound *bool
+		if focusID != "" {
+			f := false
+			focusFound = &f
+		}
 		return PaginatedCommentsResult{
 			Comments:      []PublicCommentView{},
 			Page:          1,
@@ -381,6 +403,7 @@ func (s *Service) ListTargetCommentsPage(
 			TotalComments: 0,
 			TotalPages:    1,
 			HasMore:       false,
+			FocusFound:    focusFound,
 		}, nil
 	}
 
@@ -396,7 +419,8 @@ func (s *Service) ListTargetCommentsPage(
 		totalPages = 1
 	}
 
-	if focusID := strings.TrimSpace(focusCommentID); focusID != "" {
+	focusResolvedRoot := false
+	if focusID != "" {
 		type ancestorRow struct {
 			ID        string `db:"id"`
 			ParentID  string `db:"parent_id"`
@@ -409,8 +433,8 @@ func (s *Service) ListTargetCommentsPage(
 			aArgs := make([]any, 0, 1+len(visArgs))
 			aArgs = append(aArgs, curID)
 			aArgs = append(aArgs, visArgs...)
-			anc, aErr := sqlx.Get[ancestorRow](
-				ctx, s.store,
+			var anc ancestorRow
+			aErr := sqlx.GetInto(ctx, s.store, &anc,
 				`SELECT id, parent_id, created_at FROM comments WHERE id = ? AND `+visWhere,
 				aArgs...,
 			)
@@ -425,6 +449,7 @@ func (s *Service) ListTargetCommentsPage(
 			curID = strings.TrimSpace(anc.ParentID)
 		}
 		if rootID != "" {
+			focusResolvedRoot = true
 			var rankBefore int
 			rankArgs := make([]any, 0, len(visArgs)+3)
 			rankArgs = append(rankArgs, visArgs...)
@@ -451,7 +476,8 @@ func (s *Service) ListTargetCommentsPage(
 	rootArgs = append(rootArgs, visArgs...)
 	rootArgs = append(rootArgs, pageArgs...)
 
-	rootRows, err := sqlx.Select[publicCommentRow](ctx, s.store, rootPageSQL, rootArgs...)
+	var rootRows []publicCommentRow
+	err = sqlx.SelectInto(ctx, s.store, &rootRows, rootPageSQL, rootArgs...)
 	if err != nil {
 		return PaginatedCommentsResult{}, err
 	}
@@ -471,6 +497,29 @@ func (s *Service) ListTargetCommentsPage(
 		}
 	}
 
+	var focusFound *bool
+	if focusID != "" {
+		found := false
+		if focusResolvedRoot {
+			for _, c := range slice {
+				if c.ID == focusID {
+					found = true
+					break
+				}
+				for _, rep := range c.Replies {
+					if rep.ID == focusID {
+						found = true
+						break
+					}
+				}
+				if found {
+					break
+				}
+			}
+		}
+		focusFound = &found
+	}
+
 	return PaginatedCommentsResult{
 		Comments:      slice,
 		Page:          page,
@@ -479,6 +528,7 @@ func (s *Service) ListTargetCommentsPage(
 		TotalComments: totalComments,
 		TotalPages:    totalPages,
 		HasMore:       page < totalPages,
+		FocusFound:    focusFound,
 	}, nil
 }
 
@@ -554,8 +604,8 @@ func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int
 		    OR (c.target_type = 'page' AND p.is_published = ?))
 		ORDER BY c.created_at DESC`
 	q, pageArgs := s.store.Dialect().PaginateSQL(baseSQL, limit, offset)
-	rows, err := sqlx.Select[joinedRecent](
-		ctx, s.store, q,
+	var rows []joinedRecent
+	err := sqlx.SelectInto(ctx, s.store, &rows, q,
 		append([]any{domain.CommentStatusApproved, false, domain.ArticleStatusPublished, true}, pageArgs...)...,
 	)
 	if err != nil {
@@ -616,7 +666,8 @@ func (s *Service) CreateComment(
 		}
 		postAuthorID = raw.AuthorID
 	case domain.TargetTypePage:
-		pg, err := sqlx.Get[domain.Page](ctx, s.store, `SELECT * FROM pages WHERE id = ?`, tID)
+		var pg domain.Page
+		err := sqlx.GetInto(ctx, s.store, &pg, `SELECT * FROM pages WHERE id = ?`, tID)
 		if err != nil || !pg.IsPublished {
 			return PublicCommentView{}, "", sql.ErrNoRows
 		}
@@ -683,8 +734,8 @@ func (s *Service) CreateComment(
 	parentID := strings.TrimSpace(in.ParentID)
 	replyToName := ""
 	if parentID != "" {
-		parent, pErr := sqlx.Get[domain.Comment](
-			ctx, s.store,
+		var parent domain.Comment
+		pErr := sqlx.GetInto(ctx, s.store, &parent,
 			`SELECT id, parent_id, author_name, target_type, target_id, is_deleted FROM comments WHERE id = ?`,
 			parentID,
 		)
@@ -710,7 +761,7 @@ func (s *Service) CreateComment(
 		case domain.CommentModerationAll:
 			status = domain.CommentStatusPending
 		case domain.CommentModerationSmart:
-			if containsBlockedKeyword(contentMD, authorName, snap.Reading.BlockedKeywords, snap.Reading.AllowedKeywords) {
+			if snap.Reading.BuiltinSpamFilter && containsBlockedKeyword(contentMD, authorName, snap.Reading.BlockedKeywords, snap.Reading.AllowedKeywords) {
 				status = domain.CommentStatusPending
 			}
 		}
@@ -857,7 +908,8 @@ func (s *Service) UpdateOwnComment(
 		return PublicCommentView{}, errors.New("comments: content length must be between 1 and 4000 characters")
 	}
 
-	existing, err := sqlx.Get[domain.Comment](ctx, s.store, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
+	var existing domain.Comment
+	err := sqlx.GetInto(ctx, s.store, &existing, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
 	if err != nil {
 		return PublicCommentView{}, err
 	}
@@ -974,7 +1026,8 @@ func (s *Service) UpdateOwnComment(
 // DeleteOwnComment soft-deletes a comment ONLY if caller owns it via authenticated UserID OR valid
 // signed GuestPassport within 30 minutes (or is admin). NEVER accepts unsigned `env_fp`!
 func (s *Service) DeleteOwnComment(ctx context.Context, r *http.Request, viewer *domain.User, commentID string) error {
-	existing, err := sqlx.Get[domain.Comment](ctx, s.store, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
+	var existing domain.Comment
+	err := sqlx.GetInto(ctx, s.store, &existing, `SELECT * FROM comments WHERE id = ? AND is_deleted = ?`, strings.TrimSpace(commentID), false)
 	if err != nil {
 		return err
 	}
@@ -1058,8 +1111,8 @@ func (s *Service) GetReactionCounts(ctx context.Context, targetType string, targ
 		Kind string `db:"kind"`
 		Cnt  int    `db:"cnt"`
 	}
-	rows, err := sqlx.Select[row](
-		ctx, s.store,
+	var rows []row
+	err := sqlx.SelectInto(ctx, s.store, &rows,
 		`SELECT kind, COUNT(*) AS cnt FROM reactions WHERE target_type = ? AND target_id = ? GROUP BY kind`,
 		targetType, targetID,
 	)

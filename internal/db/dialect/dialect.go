@@ -10,18 +10,18 @@ import (
 
 // TypeMap abstracts physical SQL DDL column types across SQLite, PostgreSQL, and MySQL/TiDB.
 type TypeMap struct {
-	Varchar32   string
-	Varchar64   string
-	Varchar128  string
-	Varchar255  string
-	Varchar512  string
-	Text        string
-	LongText    string
-	Int         string
-	BigInt      string
-	Bool        string
-	Blob        string
-	BoolTrueLit string
+	Varchar32    string
+	Varchar64    string
+	Varchar128   string
+	Varchar255   string
+	Varchar512   string
+	Text         string
+	LongText     string
+	Int          string
+	BigInt       string
+	Bool         string
+	Blob         string
+	BoolTrueLit  string
 	BoolFalseLit string
 }
 

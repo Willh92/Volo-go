@@ -20,7 +20,7 @@
     </form>
     {{if .OIDCProviders}}
       <div class="reader-oidc-divider" role="separator">
-        <span>{{if hasPrefix .Locale "en"}}Or continue with{{else if eq .Locale "zh-TW"}}或透過第三方帳號登入{{else}}或使用第三方账号登录{{end}}</span>
+        <span>{{t .Locale "reader.oidc_divider"}}</span>
       </div>
       <div class="reader-oidc-list">
         {{range .OIDCProviders}}

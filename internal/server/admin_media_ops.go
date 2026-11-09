@@ -98,10 +98,11 @@ func (s *AppServer) reconcileLocalUploads(ctx context.Context) int {
 	}
 
 	existingKeys := make(map[string]struct{})
-	rows, err := sqlx.Select[struct {
+	var rows []struct {
 		ObjectKey string `db:"object_key"`
 		PublicURL string `db:"public_url"`
-	}](ctx, s.deps.Store, `SELECT object_key, public_url FROM media_assets`)
+	}
+	err = sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT object_key, public_url FROM media_assets`)
 	if err == nil {
 		for _, r := range rows {
 			k := strings.TrimLeft(strings.TrimSpace(r.ObjectKey), "/")
@@ -238,30 +239,44 @@ func (s *AppServer) invalidateMediaRefCache() {
 	}
 	s.mediaRefCacheMu.Lock()
 	s.mediaRefCachedRev = 0
-	s.mediaRefCachedTokens = nil
+	s.mediaRefCountsByAssetID = nil
 	s.mediaRefOrphanCounts = nil
 	s.mediaRefCacheMu.Unlock()
 }
 
-// collectReferencedMediaTokensCached scans all 14 content, navigation, chapter, redirect, comment,
-// setting, and plugin tables via `media.CollectReferencedTokenCounts`, caching token counts keyed by
-// `store.DataRevision()` so paginated media views never rescan unchanged tables.
-func (s *AppServer) collectReferencedMediaTokensCached(ctx context.Context) map[string]int {
+func mediaAssetRefLookupKey(a domain.MediaAsset) string {
+	mk := strings.TrimSpace(a.ID)
+	if mk == "" {
+		mk = strings.TrimSpace(a.PublicURL)
+	}
+	if mk == "" {
+		mk = strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
+	}
+	return mk
+}
+
+// collectMediaRefCountsCached computes per-asset reference counts via `media.CountAssetReferences`,
+// caching only compact `map[assetID]int` keyed by `store.DataRevision()` so prose tokens are never retained on heap.
+func (s *AppServer) collectMediaRefCountsCached(ctx context.Context) map[string]int {
 	if s == nil || s.deps.Store == nil {
 		return map[string]int{}
 	}
 	curRev := s.deps.Store.DataRevision()
 	s.mediaRefCacheMu.Lock()
-	if s.mediaRefCachedTokens != nil && curRev > 0 && s.mediaRefCachedRev == curRev {
-		cached := s.mediaRefCachedTokens
+	if s.mediaRefCountsByAssetID != nil && curRev > 0 && s.mediaRefCachedRev == curRev {
+		cached := s.mediaRefCountsByAssetID
 		s.mediaRefCacheMu.Unlock()
 		return cached
 	}
 	s.mediaRefCacheMu.Unlock()
 
-	tokenCounts, err := media.CollectReferencedTokenCounts(ctx, s.deps.Store)
-	if err != nil || tokenCounts == nil {
-		tokenCounts = map[string]int{}
+	var allAssets []domain.MediaAsset
+	_ = sqlx.SelectInto(ctx, s.deps.Store, &allAssets,
+		`SELECT id, storage_driver, object_key, public_url FROM media_assets`)
+
+	refCounts, err := media.CountAssetReferences(ctx, s.deps.Store, allAssets)
+	if err != nil || refCounts == nil {
+		refCounts = map[string]int{}
 	}
 
 	s.mediaRefCacheMu.Lock()
@@ -269,9 +284,9 @@ func (s *AppServer) collectReferencedMediaTokensCached(ctx context.Context) map[
 		s.mediaRefOrphanCounts = make(map[string]int)
 	}
 	s.mediaRefCachedRev = curRev
-	s.mediaRefCachedTokens = tokenCounts
+	s.mediaRefCountsByAssetID = refCounts
 	s.mediaRefCacheMu.Unlock()
-	return tokenCounts
+	return refCounts
 }
 
 func (s *AppServer) countAssetsReferences(ctx context.Context, assets []domain.MediaAsset) []int {
@@ -279,33 +294,24 @@ func (s *AppServer) countAssetsReferences(ctx context.Context, assets []domain.M
 	if len(assets) == 0 || s == nil || s.deps.Store == nil {
 		return counts
 	}
-	hasWhitespaceKey := false
-	for _, a := range assets {
-		if strings.ContainsAny(strings.TrimSpace(a.PublicURL), " \t") || strings.ContainsAny(strings.TrimSpace(a.ObjectKey), " \t") {
-			hasWhitespaceKey = true
-			break
-		}
-	}
-	if !hasWhitespaceKey {
-		tokenCounts := s.collectReferencedMediaTokensCached(ctx)
-		for i, a := range assets {
-			counts[i] = media.AssetRefCountFromTokens(tokenCounts, a)
-		}
-		return counts
-	}
-	byKey, err := media.CountAssetReferences(ctx, s.deps.Store, assets)
-	if err != nil {
-		return counts
-	}
+	cachedByKey := s.collectMediaRefCountsCached(ctx)
+	var missing []domain.MediaAsset
+	var missingIdx []int
 	for i, a := range assets {
-		mk := strings.TrimSpace(a.ID)
-		if mk == "" {
-			mk = strings.TrimSpace(a.PublicURL)
+		mk := mediaAssetRefLookupKey(a)
+		if cnt, ok := cachedByKey[mk]; ok {
+			counts[i] = cnt
+		} else {
+			missing = append(missing, a)
+			missingIdx = append(missingIdx, i)
 		}
-		if mk == "" {
-			mk = strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
+	}
+	if len(missing) > 0 {
+		if fallback, err := media.CountAssetReferences(ctx, s.deps.Store, missing); err == nil {
+			for j, idx := range missingIdx {
+				counts[idx] = fallback[mediaAssetRefLookupKey(missing[j])]
+			}
 		}
-		counts[i] = byKey[mk]
 	}
 	return counts
 }
@@ -317,7 +323,7 @@ func (s *AppServer) cachedOrComputeOrphanCount(
 	cacheScopeKey string,
 	canCache bool,
 ) int {
-	tokenCounts := s.collectReferencedMediaTokensCached(ctx)
+	refCounts := s.collectMediaRefCountsCached(ctx)
 	curRev := s.deps.Store.DataRevision()
 	if canCache && curRev > 0 {
 		s.mediaRefCacheMu.Lock()
@@ -330,18 +336,20 @@ func (s *AppServer) cachedOrComputeOrphanCount(
 		s.mediaRefCacheMu.Unlock()
 	}
 
-	keyRows, _ := sqlx.Select[struct {
-		StorageDriver string `db:"storage_driver"`
-		ObjectKey     string `db:"object_key"`
-		PublicURL     string `db:"public_url"`
-	}](ctx, s.deps.Store, `SELECT storage_driver, object_key, public_url FROM media_assets WHERE `+whereSQL, args...)
+	var keyRows []struct {
+		ID        string `db:"id"`
+		ObjectKey string `db:"object_key"`
+		PublicURL string `db:"public_url"`
+	}
+	_ = sqlx.SelectInto(ctx, s.deps.Store, &keyRows, `SELECT id, object_key, public_url FROM media_assets WHERE `+whereSQL, args...)
 	orphanCnt := 0
 	for _, kr := range keyRows {
-		if media.AssetRefCountFromTokens(tokenCounts, domain.MediaAsset{
-			StorageDriver: kr.StorageDriver,
-			ObjectKey:     kr.ObjectKey,
-			PublicURL:     kr.PublicURL,
-		}) == 0 {
+		mk := mediaAssetRefLookupKey(domain.MediaAsset{
+			ID:        kr.ID,
+			ObjectKey: kr.ObjectKey,
+			PublicURL: kr.PublicURL,
+		})
+		if refCounts[mk] == 0 {
 			orphanCnt++
 		}
 	}
@@ -457,32 +465,50 @@ func (s *AppServer) queryAdminMediaPage(
 	}
 
 	if usage == "unused" || usage == "orphan" || usage == "used" {
-		rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store,
-			`SELECT * FROM media_assets WHERE `+whereSQL+` ORDER BY `+orderClause, args...)
-		if len(rows) == 0 {
+		type mediaKeyRow struct {
+			ID            string `db:"id"`
+			StorageDriver string `db:"storage_driver"`
+			ObjectKey     string `db:"object_key"`
+			PublicURL     string `db:"public_url"`
+			SizeBytes     int64  `db:"size_bytes"`
+		}
+		var keyRows []mediaKeyRow
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &keyRows,
+			`SELECT id, storage_driver, object_key, public_url, size_bytes FROM media_assets WHERE `+whereSQL+` ORDER BY `+orderClause, args...)
+		if len(keyRows) == 0 {
 			return []MediaAssetView{}, 0, allTotal, 0, 0
 		}
-		refCounts := s.countAssetsReferences(ctx, rows)
-		filtered := make([]MediaAssetView, 0, len(rows))
+		probeAssets := make([]domain.MediaAsset, len(keyRows))
+		for i, kr := range keyRows {
+			probeAssets[i] = domain.MediaAsset{
+				ID:            kr.ID,
+				StorageDriver: kr.StorageDriver,
+				ObjectKey:     kr.ObjectKey,
+				PublicURL:     kr.PublicURL,
+			}
+		}
+		refCounts := s.countAssetsReferences(ctx, probeAssets)
+		type matchedKey struct {
+			id  string
+			rc  int
+			orp bool
+		}
+		matched := make([]matchedKey, 0, len(keyRows))
 		orphanCnt := 0
 		var totalBytes int64
 		wantUsed := usage == "used"
-		for i, a := range rows {
+		for i, kr := range keyRows {
 			rc := refCounts[i]
 			isOrp := rc == 0
 			if isOrp {
 				orphanCnt++
 			}
 			if (wantUsed && rc > 0) || (!wantUsed && isOrp) {
-				totalBytes += a.SizeBytes
-				filtered = append(filtered, MediaAssetView{
-					MediaAsset: a,
-					RefCount:   rc,
-					IsOrphan:   isOrp,
-				})
+				totalBytes += kr.SizeBytes
+				matched = append(matched, matchedKey{id: kr.ID, rc: rc, orp: isOrp})
 			}
 		}
-		total := len(filtered)
+		total := len(matched)
 		start := (page - 1) * perPage
 		if start >= total {
 			return []MediaAssetView{}, total, allTotal, orphanCnt, totalBytes
@@ -491,7 +517,31 @@ func (s *AppServer) queryAdminMediaPage(
 		if end > total {
 			end = total
 		}
-		return filtered[start:end], total, allTotal, orphanCnt, totalBytes
+		pageMatched := matched[start:end]
+		placeholders := make([]string, len(pageMatched))
+		idArgs := make([]any, len(pageMatched))
+		for i, m := range pageMatched {
+			placeholders[i] = "?"
+			idArgs[i] = m.id
+		}
+		var fullRows []domain.MediaAsset
+		_ = sqlx.SelectInto(ctx, s.deps.Store, &fullRows,
+			`SELECT * FROM media_assets WHERE id IN (`+strings.Join(placeholders, ",")+`)`, idArgs...)
+		byID := make(map[string]domain.MediaAsset, len(fullRows))
+		for _, r := range fullRows {
+			byID[r.ID] = r
+		}
+		out := make([]MediaAssetView, 0, len(pageMatched))
+		for _, m := range pageMatched {
+			if full, ok := byID[m.id]; ok {
+				out = append(out, MediaAssetView{
+					MediaAsset: full,
+					RefCount:   m.rc,
+					IsOrphan:   m.orp,
+				})
+			}
+		}
+		return out, total, allTotal, orphanCnt, totalBytes
 	}
 
 	var total int
@@ -509,7 +559,8 @@ func (s *AppServer) queryAdminMediaPage(
 	fullArgs = append(fullArgs, args...)
 	fullArgs = append(fullArgs, pageArgs...)
 
-	rows, _ := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store, paginatedSQL, fullArgs...)
+	var rows []domain.MediaAsset
+	_ = sqlx.SelectInto(ctx, s.deps.Store, &rows, paginatedSQL, fullArgs...)
 
 	orphanCnt := 0
 	var refCounts []int
@@ -564,7 +615,8 @@ func (s *AppServer) scanOrCleanOrphans(ctx context.Context, deleteOrphans bool) 
 		return orphans, freed, nil
 	}
 
-	rows, err := sqlx.Select[domain.MediaAsset](ctx, s.deps.Store, `SELECT * FROM media_assets ORDER BY created_at DESC`)
+	var rows []domain.MediaAsset
+	err := sqlx.SelectInto(ctx, s.deps.Store, &rows, `SELECT * FROM media_assets ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -5,9 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex, nofollow" />
   <title>Volo Studio Console</title>
+  <!--VOLO_BOOT-->
   <style>
-    html { background: #f6f4ef; color: #19211f; }
-    html[data-theme="dark"] { background: #121616; color: #e7ecea; }
+    html { background: #f6f7f3; color: #19211f; color-scheme: light; }
+    html[data-theme="dark"] { background: #1b2021; color: #e7ecea; color-scheme: dark; }
   </style>
   <script>
     (function () {
@@ -25,8 +26,10 @@
       if (m === "system") {
         eff = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
       } else if (m !== "light" && m !== "dark") {
-        var h = new Date().getHours();
-        eff = h >= 7 && h < 19 ? "light" : "dark";
+        var d = new Date();
+        var mins = d.getHours() * 60 + d.getMinutes();
+        var dark = !(mins >= 390 && mins < 1140);
+        eff = dark ? "dark" : "light";
       }
       var root = document.documentElement;
       root.setAttribute("data-mode", m);

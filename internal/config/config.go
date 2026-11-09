@@ -105,9 +105,11 @@ type Config struct {
 	DataDir          string
 	UploadDir        string
 	DefaultUploadDir string
+	UploadDirPinned  bool
 	BackupDir        string
 	GeoIPDir         string
 	DefaultGeoIPDir  string
+	GeoIPDirPinned   bool
 	ThemesDir        string
 	PluginsDir       string
 	LocalesDir       string
@@ -144,6 +146,16 @@ func (c *Config) GetDefaultUploadDir() string {
 		return c.DefaultUploadDir
 	}
 	return c.UploadDir
+}
+
+// IsUploadDirPinned reports whether UploadDir was explicitly pinned via CLI flag, OS environment, or .env file.
+func (c *Config) IsUploadDirPinned() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.UploadDirPinned
 }
 
 // SetUploadDir updates the active local upload directory (or resets to DefaultUploadDir when empty) under a write lock.
@@ -188,6 +200,16 @@ func (c *Config) GetDefaultGeoIPDir() string {
 		return c.DefaultGeoIPDir
 	}
 	return c.GeoIPDir
+}
+
+// IsGeoIPDirPinned reports whether GeoIPDir was explicitly pinned via CLI flag, OS environment, or .env file.
+func (c *Config) IsGeoIPDirPinned() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.GeoIPDirPinned
 }
 
 // SetGeoIPDir updates the active GeoIP directory/path (or resets to DefaultGeoIPDir when empty) under a write lock.
@@ -536,9 +558,20 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	if dataDir == "" {
 		dataDir = DefaultDataDir
 	}
-	uploadDir, _ := resolveStr(cli.UploadDir, "VOLO_UPLOAD_DIR", filepath.Join(dataDir, "uploads"))
+	uploadDir, uploadDirExplicit := resolveStr(cli.UploadDir, "VOLO_UPLOAD_DIR", filepath.Join(dataDir, "uploads"))
+	uploadDirPinned := cli.UploadDir != nil || (uploadDirExplicit && uploadDir != "")
+	if uploadDir == "" {
+		uploadDir = filepath.Join(dataDir, "uploads")
+	}
 	backupDir, _ := resolveStr(cli.BackupDir, "VOLO_BACKUP_DIR", filepath.Join(dataDir, "backups"))
-	geoIPDir, _ := resolveStr(cli.GeoIPDir, "VOLO_GEOIP_DIR", filepath.Join(dataDir, "geoip"))
+	if backupDir == "" {
+		backupDir = filepath.Join(dataDir, "backups")
+	}
+	geoIPDir, geoIPDirExplicit := resolveStr(cli.GeoIPDir, "VOLO_GEOIP_DIR", filepath.Join(dataDir, "geoip"))
+	geoIPDirPinned := cli.GeoIPDir != nil || (geoIPDirExplicit && geoIPDir != "")
+	if geoIPDir == "" {
+		geoIPDir = filepath.Join(dataDir, "geoip")
+	}
 	themesDir, _ := resolveStr(cli.ThemesDir, "VOLO_THEMES_DIR", "./themes")
 	pluginsDir, _ := resolveStr(cli.PluginsDir, "VOLO_PLUGINS_DIR", "./plugins")
 	localesDir, _ := resolveStr(cli.LocalesDir, "VOLO_LOCALES_DIR", "./locales")
@@ -655,9 +688,11 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 		DataDir:           dataDir,
 		UploadDir:         uploadDir,
 		DefaultUploadDir:  uploadDir,
+		UploadDirPinned:   uploadDirPinned,
 		BackupDir:         backupDir,
 		GeoIPDir:          geoIPDir,
 		DefaultGeoIPDir:   geoIPDir,
+		GeoIPDirPinned:    geoIPDirPinned,
 		ThemesDir:         themesDir,
 		PluginsDir:        pluginsDir,
 		LocalesDir:        localesDir,

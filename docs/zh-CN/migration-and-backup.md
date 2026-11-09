@@ -3,8 +3,8 @@
 > English version: [Legacy Migration & Cross-DB Streaming Backup](../en-US/migration-and-backup.md)
 
 `Volo-go` 提供两条零内存暴涨的流式数据通道：
-1. **历史旧版归档流式清洗导入器（`internal/etl`）**：一键导入早期 `bolo-solo` 导出的 15 表 `.zip` 或 `JSON` 备份包，自动完成反范式结构正规化并 **100% 守护历史 `.html` 固定链接零 404**；
-2. **原生跨数据库流式备份引擎（`internal/backup`）**：采用方言无关的 `volo-backup-v1`（`NDJSON` 行流 + `SHA-256` 清单 + 媒体文件流），支持 **SQLite ⇄ PostgreSQL ⇄ MySQL** 任意方向无损搬家。
+1. **历史旧版归档流式清洗导入器（`internal/etl`）**：一键导入早期 `bolo-solo` / `Solo` 导出的 15 表 `.zip` 或 `JSON` 备份包（或只读直连旧库），自动完成反范式结构正规化并 **100% 守护历史 `.html` 固定链接零 404**；
+2. **原生跨数据库流式备份引擎（`internal/backup`）**：采用方言无关的 `volo-backup-v1`（按外键拓扑排序的 **33 张业务表** `NDJSON` 行流 + `SHA-256` 清单 + 媒体文件流），支持 **SQLite ⇄ PostgreSQL ⇄ MySQL** 任意方向无损搬家。
 
 ---
 
@@ -14,25 +14,28 @@
 
 旧版备份包中存在大量历史包袱（如 10KB 字符串分片表、标签间接推导分类、裸口令哈希与 `.html` 固定链接）。`Volo-go` 的流式解析器（`json.Decoder` 逐条消费，不将大包读入内存）在单次导入事务中自动完成以下转换：
 
-| 旧版历史结构 | `Volo-go` 正规化落库目标 | 迁移行为说明 |
+| 旧版历史结构 | `Volo-go` 正规化落库目标（`v6` Schema） | 迁移行为说明 |
 | :--- | :--- | :--- |
-| 分片键值文档（专题、书架、每日统计、Webhook） | `series`、`series_articles`、`books`、`analytics_daily`、`webhooks` | 自动拼合还原多片 JSON 并拆入具备外键约束的正规关系表 |
+| 分片键值文档（专题、书架、每日统计、Webhook） | `series`、`series_articles`、`books`、`book_chapters`、`analytics_daily`、`webhooks` | 自动拼合还原多片 JSON 并拆入具备外键约束的正规关系表 |
 | `category` + `category_tag` + `tag_article` 间接归类 | `articles.category_id` + `article_tags` | 自动通过文章关联标签反向推导主分类并直接绑定至文章，同时保留全部自由标签 |
-| 扁平混杂 `option` 配置项 | 6 大强类型分域 `settings`（`site`、`appearance`、`reading`、`feed`、`seo`、`notifications`） | 自动映射站点标题、副标题、ICP 备案、社交链接与页脚信息；旧版废弃皮肤自动平滑回退至 `volo-studio` |
+| 扁平混杂 `option` 配置项 | 9 大强类型分域 `settings`（`site`、`reading`、`feed`、`seo`、`storage`、`appearance`、`notifications`、`security`、`backup`） | 自动映射站点标题、副标题、社交链接、页脚信息、自定义变量（`customVars` -> `site.custom_vars`）与列表样式（`articleListStyle` -> `reading.list_style`）；旧版皮肤自动平滑回退至 `volo-studio` |
 | 自定义导航栏与独立链接 | `nav_items` 与 `pages` | 完整保留顶部导航顺序、图标与新窗口属性 |
 | 老文章路径（如 `/articles/2021/05/12/1620812.html`） | `articles.legacy_permalink` + `redirects` | 新系统生成干净 Slug 的同时将原路径写入 `legacy_permalink`；访问旧 `.html` URL 自动触发 `O(1)` 内存路由返回 **`301 Moved Permanently`** 跳转至规范地址，SEO 权重零流失 |
 | 旧版 `PBKDF2` / 历史密码哈希 | `users.legacy_hash` -> `Argon2id` | 导入后老用户无需重置密码，首次成功登录时自动在后台静默升级为 `Argon2id` 并擦除 `legacy_hash` |
 
 ### 1.2 迁移操作步骤（CLI 或 Web 向导二选一）
 
-#### 方式 A：通过 CLI 预检并导入（推荐大体积归档）
+#### 方式 A：通过 CLI 预检并导入（推荐大体积归档与域名切换）
 
 ```bash
-# 第一步：Dry-Run 预检，输出识别到的文章、分类、评论、专题、书架数量，不写数据库
+# 第一步：Dry-Run 预检，输出识别到的文章、分类、评论、专题、书架数量，零数据库写入
 ./volo import-legacy /path/to/legacy-backup.zip --dry-run
 
-# 第二步：正式执行流式清洗入库
-./volo import-legacy /path/to/legacy-backup.zip
+# 第二步：正式执行流式清洗入库（可选重写旧域名绝对链接并强制回退本地存储）
+./volo import-legacy /path/to/legacy-backup.zip \
+  --old-site-url "https://old.example.com,http://old.example.com" \
+  --new-site-url "https://blog.example.com" \
+  --storage-local
 ```
 
 #### 方式 B：通过 Web 初始化向导直连旧数据库一键迁移（无需手工导出归档）
@@ -53,17 +56,17 @@
 
 ### 2.1 归档包内部结构与防炸弹保护
 
-每个原生备份 `.zip` 均由流式写入器生成并附带完整密码学完整性校验：
+每个原生备份 `.zip` 均由流式写入器按 `migrate.CanonicalTables` 拓扑顺序导出全部 **33 张业务数据表**，并附带完整密码学完整性校验：
 
 ```text
-volo-backup-20261107-010000.zip
-├── manifest.json                 # 记录 format、schema_version、source_dialect 及每个流的字节数、行数与 SHA-256
+volo-backup-20261108-010000.zip
+├── manifest.json                 # 记录 format、schema_version (v6)、source_dialect 及每个流的字节数、行数与 SHA-256
 ├── tables/
-│   ├── 01_users.ndjson           # 按外键拓扑顺序排列的数据库无关 NDJSON 行流
-│   ├── 02_categories.ndjson
+│   ├── 01_settings.ndjson        # 按外键依赖顺序排列的 33 张业务表数据库无关 NDJSON 行流
+│   ├── 02_users.ndjson
 │   ├── ...
-│   └── 23_audit_logs.ndjson
-└── media/                        # 可选包含（--with-media=true）的本地上传图片与播客音频流
+│   └── 33_plugin_kv.ndjson
+└── media/                        # 可选包含（--with-media=true）的本地上传图片、音视频与播客媒体流
     └── 2026/11/...
 ```
 
@@ -78,12 +81,12 @@ volo-backup-20261107-010000.zip
 
 ```bash
 # 1. 在原 SQLite 实例上导出完整流式备份包
-./volo backup create --env-file /etc/volo/volo.env --output /tmp/site-full.zip
+./volo backup create --env-file /etc/volo/volo.env --output /tmp/site-full.zip --with-media=true
 
 # 2. 修改目标环境的数据库连接配置（例如切换至 PostgreSQL）
 #    VOLO_DB_DRIVER=postgres
 #    VOLO_DB_DSN=postgres://volo:secret@db.internal:5432/volo?sslmode=verify-full
-#    注意：务必保持两端的 VOLO_SECRET_KEY（或 data/.secret.key）一致，以确保已加密的 S3/SMTP/Webhook 密钥可正常解密！
+#    注意：务必保持两端的 VOLO_SECRET_KEY（或 data/.secret.key）一致，以确保已加密的 S3/SMTP/WebDAV/Webhook/插件机密字段可正常解密！
 
 # 3. 先 Dry-Run 验证归档完整性，再一键流式导入 PostgreSQL
 ./volo backup restore /tmp/site-full.zip --env-file /etc/volo/volo-pg.env --dry-run
@@ -94,6 +97,6 @@ volo-backup-20261107-010000.zip
 
 ## 3. 自动定时备份与异地冷备（S3 / R2 / WebDAV）
 
-在管理台 **「系统与安全 -> 备份与迁移」** 或系统存储配置中：
-1. 开启定时滚动备份策略并设置本地保留份数（超出保留份数的旧归档将自动轮转清理，防止撑爆磁盘）；
-2. 若已配置 **S3 兼容对象存储（Cloudflare R2 / AWS S3 / MinIO）** 或 **WebDAV 远端备份目录**，每次生成的 `.zip` 快照可自动异步流式同步至异地存储，实现真正的 `3-2-1` 容灾保护。
+在管理台 **「系统与安全 -> 备份与迁移」**（对应 `backup` 设置域）中：
+1. 开启本地定时自动滚动备份策略，自定义备份周期、是否包含媒体（`include_media_in_auto`）与本地保留份数（超出保留份数的旧归档自动轮转清理，防止撑爆磁盘）；
+2. 若已配置 **S3 兼容对象存储（Cloudflare R2 / AWS S3 / MinIO）** 或 **WebDAV 远端备份目录**（密码与密钥经 `AES-256-GCM` 密封于 `settings.secret_ciphertext`），每次生成的 `.zip` 快照会自动异步流式同步至异地存储，实现 `3-2-1` 容灾保护。

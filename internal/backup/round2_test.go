@@ -101,8 +101,8 @@ func (s *stubBackupStoragePlugin) Put(_ context.Context, objectKey string, r io.
 	s.mu.Unlock()
 	return "https://plugin-cdn.example.com/" + objectKey, nil
 }
-func (s *stubBackupStoragePlugin) Delete(context.Context, string) error      { return nil }
-func (s *stubBackupStoragePlugin) HealthCheck(context.Context) error         { return nil }
+func (s *stubBackupStoragePlugin) Delete(context.Context, string) error { return nil }
+func (s *stubBackupStoragePlugin) HealthCheck(context.Context) error    { return nil }
 
 func TestWebDAVBlocksHTTPSDowngradeRedirectAndPluginBackupTarget(t *testing.T) {
 	ctx := context.Background()
@@ -427,4 +427,3 @@ func TestBackupRound3_ConcurrentCreate_UnsignedEntryRejection_MySQLUnicodeCI_And
 		t.Fatalf("expected 2 pruned WebDAV auto-backups + 1 manual-keep.zip = 3 entries, got count=%d store=%+v", davCount, davStore)
 	}
 }
-

@@ -337,3 +337,117 @@ func TestValidateCustomGeoIPPathAndRuntimeSetGeoIPDir(t *testing.T) {
 	}
 }
 
+func TestUploadAndGeoIPDirPinnedPrecedence(t *testing.T) {
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "data")
+	missingEnv := filepath.Join(tmpDir, "missing.env")
+
+	// 1. Default: neither pinned
+	cfgDefault, err := LoadWithEnviron(CLIOverrides{
+		EnvFile: missingEnv,
+		DataDir: &dataDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf("default LoadWithEnviron: %v", err)
+	}
+	if cfgDefault.IsUploadDirPinned() || cfgDefault.UploadDirPinned {
+		t.Fatal("expected UploadDirPinned=false by default")
+	}
+	if cfgDefault.IsGeoIPDirPinned() || cfgDefault.GeoIPDirPinned {
+		t.Fatal("expected GeoIPDirPinned=false by default")
+	}
+
+	// 2. .env file sets VOLO_UPLOAD_DIR and VOLO_GEOIP_DIR -> both pinned
+	dotEnvPath := filepath.Join(tmpDir, ".env")
+	dotUpload := filepath.Join(tmpDir, "dotenv-uploads")
+	dotGeo := filepath.Join(tmpDir, "dotenv-geoip")
+	dotBody := "VOLO_UPLOAD_DIR=" + dotUpload + "\nVOLO_GEOIP_DIR=" + dotGeo + "\n"
+	if err := os.WriteFile(dotEnvPath, []byte(dotBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgDotEnv, err := LoadWithEnviron(CLIOverrides{
+		EnvFile: dotEnvPath,
+		DataDir: &dataDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf(".env LoadWithEnviron: %v", err)
+	}
+	if !cfgDotEnv.IsUploadDirPinned() || cfgDotEnv.GetUploadDir() != dotUpload {
+		t.Fatalf("expected .env UploadDir pinned to %q, got pinned=%v dir=%q", dotUpload, cfgDotEnv.IsUploadDirPinned(), cfgDotEnv.GetUploadDir())
+	}
+	if !cfgDotEnv.IsGeoIPDirPinned() || cfgDotEnv.GetGeoIPDir() != dotGeo {
+		t.Fatalf("expected .env GeoIPDir pinned to %q, got pinned=%v dir=%q", dotGeo, cfgDotEnv.IsGeoIPDirPinned(), cfgDotEnv.GetGeoIPDir())
+	}
+
+	// 3. OS ENV overrides .env -> both pinned to OS ENV paths
+	envUpload := filepath.Join(tmpDir, "env-uploads")
+	envGeo := filepath.Join(tmpDir, "env-geoip")
+	cfgOSEnv, err := LoadWithEnviron(CLIOverrides{
+		EnvFile: dotEnvPath,
+		DataDir: &dataDir,
+	}, []string{
+		"VOLO_UPLOAD_DIR=" + envUpload,
+		"VOLO_GEOIP_DIR=" + envGeo,
+	})
+	if err != nil {
+		t.Fatalf("OS ENV LoadWithEnviron: %v", err)
+	}
+	if !cfgOSEnv.IsUploadDirPinned() || cfgOSEnv.GetUploadDir() != envUpload {
+		t.Fatalf("expected OS ENV UploadDir pinned to %q, got pinned=%v dir=%q", envUpload, cfgOSEnv.IsUploadDirPinned(), cfgOSEnv.GetUploadDir())
+	}
+	if !cfgOSEnv.IsGeoIPDirPinned() || cfgOSEnv.GetGeoIPDir() != envGeo {
+		t.Fatalf("expected OS ENV GeoIPDir pinned to %q, got pinned=%v dir=%q", envGeo, cfgOSEnv.IsGeoIPDirPinned(), cfgOSEnv.GetGeoIPDir())
+	}
+
+	// 4. CLI flags override OS ENV and .env -> both pinned to CLI paths
+	cliUpload := filepath.Join(tmpDir, "cli-uploads")
+	cliGeo := filepath.Join(tmpDir, "cli-geoip")
+	cfgCLI, err := LoadWithEnviron(CLIOverrides{
+		EnvFile:   dotEnvPath,
+		DataDir:   &dataDir,
+		UploadDir: &cliUpload,
+		GeoIPDir:  &cliGeo,
+	}, []string{
+		"VOLO_UPLOAD_DIR=" + envUpload,
+		"VOLO_GEOIP_DIR=" + envGeo,
+	})
+	if err != nil {
+		t.Fatalf("CLI LoadWithEnviron: %v", err)
+	}
+	if !cfgCLI.IsUploadDirPinned() || cfgCLI.GetUploadDir() != cliUpload {
+		t.Fatalf("expected CLI UploadDir pinned to %q, got pinned=%v dir=%q", cliUpload, cfgCLI.IsUploadDirPinned(), cfgCLI.GetUploadDir())
+	}
+	if !cfgCLI.IsGeoIPDirPinned() || cfgCLI.GetGeoIPDir() != cliGeo {
+		t.Fatalf("expected CLI GeoIPDir pinned to %q, got pinned=%v dir=%q", cliGeo, cfgCLI.IsGeoIPDirPinned(), cfgCLI.GetGeoIPDir())
+	}
+}
+
+func TestSecretBoxSealAndOpen(t *testing.T) {
+	tmpDir := t.TempDir()
+	kr, _, err := LoadOrInitKeyRing("my-super-strong-volo-secret-key-2026", tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb := kr.SecretBox()
+	if sb == nil {
+		t.Fatal("expected non-nil SecretBox")
+	}
+	ct, err := sb.Seal("plugin-api-secret-value")
+	if err != nil || !strings.HasPrefix(ct, "v1:") {
+		t.Fatalf("expected v1: token, got %q err=%v", ct, err)
+	}
+	pt, err := sb.Open(ct)
+	if err != nil || pt != "plugin-api-secret-value" {
+		t.Fatalf("expected roundtrip secret, got %q err=%v", pt, err)
+	}
+	if empty, err := sb.Seal(""); err != nil || empty != "" {
+		t.Fatalf("expected empty seal, got %q err=%v", empty, err)
+	}
+	if empty, err := sb.Open(""); err != nil || empty != "" {
+		t.Fatalf("expected empty open, got %q err=%v", empty, err)
+	}
+	tampered := ct[:len(ct)-2] + "ZZ"
+	if _, err := sb.Open(tampered); err == nil {
+		t.Fatal("expected tampered SecretBox ciphertext to fail")
+	}
+}

@@ -212,8 +212,7 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 			}
 			return s.deps.Content.ReindexArticleBacklinksTx(r.Context(), tx, savedRaw)
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		if savedRaw.Status == domain.ArticleStatusPublished {
@@ -221,6 +220,7 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 			if s.deps.Plugins != nil {
 				s.deps.Plugins.DispatchArticleHook(r.Context(), plugin.HookArticlePublished, articleHookPayloadFromRaw(savedRaw))
 			}
+			s.dispatchFederationForArticle(r.Context(), "publish", savedRaw)
 			if s.deps.NotifyArticlePublished != nil {
 				s.deps.NotifyArticlePublished(r.Context(), savedRaw)
 			}
@@ -486,7 +486,7 @@ func (s *AppServer) checkSingleFriendLink(ctx context.Context, lk domain.Link) d
 	return s.checkSingleFriendLinkWithClient(ctx, s.newLinkPatrolHTTPClient(), lk)
 }
 
-func (s *AppServer) checkSingleFriendLinkWithClient(ctx context.Context, client *http.Client, lk domain.Link) domain.Link {
+func (s *AppServer) probeSingleFriendLinkHTTP(ctx context.Context, client *http.Client, lk domain.Link) domain.Link {
 	start := time.Now()
 	status := "ok"
 	code := 0
@@ -544,9 +544,6 @@ func (s *AppServer) checkSingleFriendLinkWithClient(ctx context.Context, client 
 		errMsg = errMsg[:240]
 	}
 	now := time.Now().UnixMilli()
-	_, _ = s.deps.Store.ExecContext(ctx,
-		`UPDATE links SET health_status = ?, http_code = ?, latency_ms = ?, health_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?`,
-		status, code, lat, errMsg, now, now, lk.ID)
 	lk.HealthStatus = status
 	lk.HTTPCode = code
 	lk.LatencyMS = lat
@@ -556,8 +553,17 @@ func (s *AppServer) checkSingleFriendLinkWithClient(ctx context.Context, client 
 	return lk
 }
 
+func (s *AppServer) checkSingleFriendLinkWithClient(ctx context.Context, client *http.Client, lk domain.Link) domain.Link {
+	res := s.probeSingleFriendLinkHTTP(ctx, client, lk)
+	_, _ = s.deps.Store.ExecContext(ctx,
+		`UPDATE links SET health_status = ?, http_code = ?, latency_ms = ?, health_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?`,
+		res.HealthStatus, res.HTTPCode, res.LatencyMS, res.HealthError, res.LastCheckedAt, res.UpdatedAt, res.ID)
+	return res
+}
+
 func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
-	links, err := sqlx.Select[domain.Link](ctx, s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
+	var links []domain.Link
+	err := sqlx.SelectInto(ctx, s.deps.Store, &links, `SELECT * FROM links ORDER BY sort_order ASC`)
 	if err != nil {
 		return 0, err
 	}
@@ -566,19 +572,33 @@ func (s *AppServer) patrolAllFriendLinks(ctx context.Context) (int, error) {
 	}
 
 	client := s.newLinkPatrolHTTPClient()
+	results := make([]domain.Link, len(links))
 	sem := make(chan struct{}, 6)
 	var wg sync.WaitGroup
-	for _, lk := range links {
-		lk := lk
+	for i, lk := range links {
+		i, lk := i, lk
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			_ = s.checkSingleFriendLinkWithClient(ctx, client, lk)
+			results[i] = s.probeSingleFriendLinkHTTP(ctx, client, lk)
 		}()
 	}
 	wg.Wait()
+
+	if txErr := s.deps.Store.WithTx(ctx, func(tx *sqlx.Tx) error {
+		for _, res := range results {
+			if _, uErr := tx.ExecContext(ctx,
+				`UPDATE links SET health_status = ?, http_code = ?, latency_ms = ?, health_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?`,
+				res.HealthStatus, res.HTTPCode, res.LatencyMS, res.HealthError, res.LastCheckedAt, res.UpdatedAt, res.ID); uErr != nil {
+				return uErr
+			}
+		}
+		return nil
+	}); txErr != nil {
+		return 0, txErr
+	}
 	return len(links), nil
 }
 
@@ -644,15 +664,18 @@ func (s *AppServer) syncSingleFollowFeedWithClient(ctx context.Context, client *
 		return recordErr(pErr.Error())
 	}
 
-	upsert := s.deps.Store.Dialect().UpsertSQL(
-		"follow_items",
-		[]string{"id", "follow_id", "guid_hash", "title", "url", "summary", "author_name", "published_at"},
-		[]string{"follow_id", "guid_hash"},
-		[]string{"title", "url", "summary", "author_name", "published_at"},
-	)
-	count := 0
+	type preparedFollowItem struct {
+		id       string
+		guidHash string
+		title    string
+		url      string
+		summary  string
+		author   string
+		pub      int64
+	}
+	prepared := make([]preparedFollowItem, 0, min(len(entries), 25))
 	for _, ent := range entries {
-		if count >= 25 {
+		if len(prepared) >= 25 {
 			break
 		}
 		if ent.Title == "" || ent.URL == "" {
@@ -668,37 +691,66 @@ func (s *AppServer) syncSingleFollowFeedWithClient(ctx context.Context, client *
 		if pub <= 0 {
 			pub = now
 		}
-		_, _ = s.deps.Store.ExecContext(ctx, upsert,
-			id.Next(), fw.ID, guidHash, ent.Title, ent.URL, truncateRunes(ent.Summary, 260), ent.Author, pub)
-		count++
+		prepared = append(prepared, preparedFollowItem{
+			id:       id.Next(),
+			guidHash: guidHash,
+			title:    ent.Title,
+			url:      ent.URL,
+			summary:  truncateRunes(ent.Summary, 260),
+			author:   ent.Author,
+			pub:      pub,
+		})
 	}
+
+	upsert := s.deps.Store.Dialect().UpsertSQL(
+		"follow_items",
+		[]string{"id", "follow_id", "guid_hash", "title", "url", "summary", "author_name", "published_at"},
+		[]string{"follow_id", "guid_hash"},
+		[]string{"title", "url", "summary", "author_name", "published_at"},
+	)
 	pruneSQL, prunePageArgs := s.deps.Store.Dialect().PaginateSQL(
 		`SELECT id FROM follow_items WHERE follow_id = ? ORDER BY published_at DESC`, 1000, 30)
 	pruneArgs := make([]any, 0, 1+len(prunePageArgs))
 	pruneArgs = append(pruneArgs, fw.ID)
 	pruneArgs = append(pruneArgs, prunePageArgs...)
-	staleRows, _ := sqlx.Select[struct {
-		ID string `db:"id"`
-	}](ctx, s.deps.Store, pruneSQL, pruneArgs...)
-	if len(staleRows) > 0 {
-		ph := make([]string, len(staleRows))
-		delArgs := make([]any, len(staleRows))
-		for i, sr := range staleRows {
-			ph[i] = "?"
-			delArgs[i] = sr.ID
+
+	if txErr := s.deps.Store.WithTx(ctx, func(tx *sqlx.Tx) error {
+		for _, it := range prepared {
+			if _, uErr := tx.ExecContext(ctx, upsert,
+				it.id, fw.ID, it.guidHash, it.title, it.url, it.summary, it.author, it.pub); uErr != nil {
+				return uErr
+			}
 		}
-		_, _ = s.deps.Store.ExecContext(ctx,
-			`DELETE FROM follow_items WHERE id IN (`+strings.Join(ph, ",")+`)`, delArgs...)
+		var staleRows []struct {
+			ID string `db:"id"`
+		}
+		if qErr := sqlx.SelectInto(ctx, tx, &staleRows, pruneSQL, pruneArgs...); qErr == nil && len(staleRows) > 0 {
+			ph := make([]string, len(staleRows))
+			delArgs := make([]any, len(staleRows))
+			for i, sr := range staleRows {
+				ph[i] = "?"
+				delArgs[i] = sr.ID
+			}
+			if _, dErr := tx.ExecContext(ctx,
+				`DELETE FROM follow_items WHERE id IN (`+strings.Join(ph, ",")+`)`, delArgs...); dErr != nil {
+				return dErr
+			}
+		}
+		_, uErr := tx.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = '', updated_at = ? WHERE id = ?`, now, now, fw.ID)
+		return uErr
+	}); txErr != nil {
+		return recordErr(txErr.Error())
 	}
-	_, _ = s.deps.Store.ExecContext(ctx, `UPDATE follows SET last_synced_at = ?, sync_error = '', updated_at = ? WHERE id = ?`, now, now, fw.ID)
+
 	fw.LastSyncedAt = now
 	fw.SyncError = ""
 	fw.UpdatedAt = now
-	return count, fw, nil
+	return len(prepared), fw, nil
 }
 
 func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
-	follows, err := sqlx.Select[domain.Follow](ctx, s.deps.Store, `SELECT * FROM follows ORDER BY sort_order ASC`)
+	var follows []domain.Follow
+	err := sqlx.SelectInto(ctx, s.deps.Store, &follows, `SELECT * FROM follows ORDER BY sort_order ASC`)
 	if err != nil {
 		return 0, err
 	}
@@ -971,6 +1023,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 
 	locLower := strings.ToLower(strings.TrimSpace(snap.Site.DefaultLocale))
 	isEN := strings.HasPrefix(locLower, "en")
+	isJA := strings.HasPrefix(locLower, "ja")
 	isZHTW := strings.HasPrefix(locLower, "zh-tw") || strings.HasPrefix(locLower, "zh-hk") || strings.HasPrefix(locLower, "zh-hant")
 
 	visible := make([]domain.GitHubRepoItem, 0, len(seo.GitHubRepos))
@@ -1009,6 +1062,16 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		siteBadge = "Website ↗"
 		tagNames = []string{"Open Source", "GitHub"}
 		navTitle = "Open Source"
+	case isJA:
+		artTitle = "GitHub オープンソースプロジェクト一覧"
+		summaryStr = fmt.Sprintf("GitHub (@%s) で公開・メンテナンスしている %d 個のオープンソースリポジトリ（合計 %d Stars）のまとめです。", uname, len(visible), totalStars)
+		introLine = fmt.Sprintf("> GitHub プロフィール：[https://github.com/%s](https://github.com/%s) · 公開リポジトリ **%d** 件（合計 **%d** Stars · **%d** Forks）\n\n",
+			uname, uname, len(visible), totalStars, totalForks)
+		emptyLine = "_表示対象のリポジトリがまだ選択されていません。管理コンソールの「オープンソース展示」で同期・選択してください。_\n"
+		tblHeader = "| リポジトリ | 概要 | Stars | Forks | 言語 |\n"
+		siteBadge = "サイト ↗"
+		tagNames = []string{"オープンソース", "GitHub"}
+		navTitle = "オープンソース"
 	case isZHTW:
 		artTitle = "我在 GitHub 上的開源專案"
 		summaryStr = fmt.Sprintf("彙整我在 GitHub (@%s) 上持續維護的 %d 個開源專案（累計 %d Stars）。", uname, len(visible), totalStars)
@@ -1069,7 +1132,8 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 	words, mins := computeReadingMetrics(contentStr)
 	now := time.Now().UnixMilli()
 
-	existing, err := sqlx.Get[domain.RawArticle](ctx, s.deps.Store,
+	var existing domain.RawArticle
+	err := sqlx.GetInto(ctx, s.deps.Store, &existing,
 		`SELECT * FROM articles WHERE slug IN ('github', 'my-github-repos') OR legacy_permalink IN ('/my-github-repos', '/github') ORDER BY updated_at DESC LIMIT 1`)
 	isCreate := err != nil || existing.ID == ""
 	wasPublished := !isCreate && existing.Status == domain.ArticleStatusPublished
@@ -1152,7 +1216,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		if navCnt == 0 {
 			_, _ = tx.ExecContext(ctx,
 				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
-				 VALUES (?, '', ?, '{"zh-CN":"我的开源","zh-TW":"我的開源","en-US":"Open Source"}', ?, ?, '/images/github-icon-light.svg', 5, ?, ?, ?)`,
+				 VALUES (?, '', ?, '{"zh-CN":"我的开源","zh-TW":"我的開源","en-US":"Open Source","ja-JP":"オープンソース"}', ?, ?, 'github', 5, ?, ?, ?)`,
 				id.Next(), navTitle, targetURL, false, true, now, now)
 		}
 		return s.deps.Content.ReindexArticleBacklinksTx(ctx, tx, cur)
@@ -1170,6 +1234,11 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		}
 		s.deps.Plugins.DispatchArticleHook(ctx, hookName, articleHookPayloadFromRaw(cur))
 	}
+	fedAction := "publish"
+	if wasPublished {
+		fedAction = "update"
+	}
+	s.dispatchFederationForArticle(ctx, fedAction, cur)
 	if !wasPublished && s.deps.NotifyArticlePublished != nil {
 		s.deps.NotifyArticlePublished(ctx, cur)
 	}
@@ -1187,7 +1256,8 @@ func (s *AppServer) pushIndexNowURLs(ctx context.Context, baseURL string) (int, 
 	}
 
 	// Strictly exclude password-protected posts from IndexNow submission!
-	rows, err := sqlx.Select[domain.RawArticle](ctx, s.deps.Store,
+	var rows []domain.RawArticle
+	err = sqlx.SelectInto(ctx, s.deps.Store, &rows,
 		`SELECT slug FROM articles WHERE status = ? AND password_ciphertext = '' ORDER BY updated_at DESC LIMIT 50`,
 		domain.ArticleStatusPublished)
 	if err != nil {

@@ -190,4 +190,3 @@ func hmacSHA256HexForTest(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
-

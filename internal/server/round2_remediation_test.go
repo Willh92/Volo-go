@@ -305,7 +305,7 @@ type mockOIDCProvider struct {
 	name string
 }
 
-func (m *mockOIDCProvider) Name() string               { return m.name }
+func (m *mockOIDCProvider) Name() string                { return m.name }
 func (m *mockOIDCProvider) DisplayName(_ string) string { return "GitHub SSO" }
 func (m *mockOIDCProvider) AuthCodeURL(state string, redirectURI string) (string, error) {
 	return "https://idp.example.com/authorize?state=" + url.QueryEscape(state) + "&redirect_uri=" + url.QueryEscape(redirectURI), nil
@@ -344,11 +344,12 @@ func TestRound2_RBAC_OverviewScoping_And_EditorPageCommentModeration(t *testing.
 
 	// Create an editor account
 	resp, uRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/users", map[string]any{
-		"username":     "editor1",
-		"email":        "editor1@example.com",
-		"display_name": "Editor One",
-		"role":         "editor",
-		"password":     "Ed1t0r!Pass#2026",
+		"username":         "editor1",
+		"email":            "editor1@example.com",
+		"display_name":     "Editor One",
+		"role":             "editor",
+		"password":         "Ed1t0r!Pass#2026",
+		"current_password": "Str0ng!Pass#2026",
 	}, adminCookies, adminHdrs)
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		t.Fatalf("create editor = %d %s", resp.StatusCode, string(uRaw))
@@ -695,7 +696,27 @@ func TestRound2_CacheControl_Vary_Feeds_And_OIDCSSO(t *testing.T) {
 		}
 	}
 
-	// Reader SSO flow: start -> callback -> auto-provisions active reader & redirects to /archives
+	// Reader SSO flow: when allow_reader_register is false (default), reject unknown OIDC reader auto-provisioning
+	disStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=reader&next=/archives", nil, nil, nil)
+	if disStart.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 from OIDC start, got %d", disStart.StatusCode)
+	}
+	disIdpURL, err := url.Parse(disStart.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("parse idp redirect: %v", err)
+	}
+	disCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/callback?code=reader-ok&state="+url.QueryEscape(disIdpURL.Query().Get("state")), nil, disStart.Cookies(), nil)
+	if disCB.StatusCode != http.StatusFound || !strings.Contains(disCB.Header.Get("Location"), "error=registration_disabled") {
+		t.Fatalf("expected registration_disabled when allow_reader_register=false, got %d loc=%q", disCB.StatusCode, disCB.Header.Get("Location"))
+	}
+
+	// Enable allow_reader_register, then start -> callback -> auto-provisions active reader & redirects to /archives
+	rdCfg := env.settings.Snapshot().Reading
+	rdCfg.AllowReaderRegister = true
+	if rResp, rRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/reading", rdCfg, adminCookies, adminHdrs); rResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH reading = %d %s", rResp.StatusCode, string(rRaw))
+	}
+
 	startResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=reader&next=/archives", nil, nil, nil)
 	if startResp.StatusCode != http.StatusFound {
 		t.Fatalf("expected 302 from OIDC start, got %d", startResp.StatusCode)
@@ -730,9 +751,33 @@ func TestRound2_CacheControl_Vary_Feeds_And_OIDCSSO(t *testing.T) {
 		t.Fatalf("expected 302 /console?oidc_error=unlinked when staff email matches without explicit bind, got %d loc=%q", admUnlinkedCB.StatusCode, admUnlinkedCB.Header.Get("Location"))
 	}
 
-	bindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=bind", nil, adminCookies, nil)
+	bareBindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/github/start?target=bind", nil, adminCookies, nil)
+	if bareBindStart.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 from bare OIDC target=bind start without bind_ticket, got %d", bareBindStart.StatusCode)
+	}
+
+	beginBindResp, beginBindRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/oidc-links/begin", map[string]any{
+		"provider":         "github",
+		"current_password": "Str0ng!Pass#2026",
+	}, adminCookies, adminHdrs)
+	if beginBindResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/admin/security/oidc-links/begin = %d %s", beginBindResp.StatusCode, string(beginBindRaw))
+	}
+	var beginBindOut struct {
+		BindTicket  string `json:"bind_ticket"`
+		RedirectURL string `json:"redirect_url"`
+	}
+	if err := json.Unmarshal(beginBindRaw, &beginBindOut); err != nil || beginBindOut.BindTicket == "" || beginBindOut.RedirectURL == "" {
+		t.Fatalf("invalid oidc-links/begin payload: err=%v body=%s", err, string(beginBindRaw))
+	}
+
+	bindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+beginBindOut.RedirectURL, nil, adminCookies, nil)
 	if bindStart.StatusCode != http.StatusFound {
-		t.Fatalf("expected 302 from OIDC target=bind start, got %d", bindStart.StatusCode)
+		t.Fatalf("expected 302 from OIDC target=bind start with bind_ticket, got %d", bindStart.StatusCode)
+	}
+	replayBindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+beginBindOut.RedirectURL, nil, adminCookies, nil)
+	if replayBindStart.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 on replayed OIDC bind_ticket, got %d", replayBindStart.StatusCode)
 	}
 	bindURL, _ := url.Parse(bindStart.Header.Get("Location"))
 	bindCookies := append(append([]*http.Cookie{}, adminCookies...), bindStart.Cookies()...)

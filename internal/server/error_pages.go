@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"html"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -48,7 +50,7 @@ func isActiveStaffUser(u *domain.User) bool {
 
 func (s *AppServer) isStaffRequest(r *http.Request) bool {
 	u, _ := s.resolveViewer(r)
-	return isActiveStaffUser(u)
+	return isActiveStaffUser(u) && s.isStaffTOTPCompliant(r.Context(), u)
 }
 
 func defaultErrorKeyForStatus(status int) string {
@@ -204,7 +206,7 @@ func (s *AppServer) record404ProbeOnce(r *http.Request, viewer *domain.User, for
 		tp = s.deps.Config.TrustedProxies
 	}
 	clientIP := security.ResolveClientIP(r, tp)
-	skipBan := isActiveStaffUser(viewer)
+	skipBan := isActiveStaffUser(viewer) && s.isStaffTOTPCompliant(r.Context(), viewer)
 	if !skipBan && viewer == nil {
 		skipBan = s.isStaffRequest(r)
 	}
@@ -234,29 +236,22 @@ func (s *AppServer) handleWAFError(w http.ResponseWriter, r *http.Request, statu
 		w.WriteHeader(status)
 		return
 	}
-
-	var tp config.TrustedProxiesPolicy
-	if s.deps.Config != nil {
-		tp = s.deps.Config.TrustedProxies
-	}
-	clientIP := security.ResolveClientIP(r, tp)
-	if s.deps.WAF != nil && clientIP.IsValid() && !clientIP.IsLoopback() &&
-		!s.deps.WAF.AllowRate("waf_errhtml", clientIP, 30, time.Minute) {
-		s.renderLightweightErrorPage(w, r, status, msgKey)
-		return
-	}
-	s.renderErrorPage(w, r, status, msgKey)
+	s.renderLightweightErrorPage(w, r, status, msgKey)
 }
 
-// renderLightweightErrorPage renders the active theme's custom error.html purely from in-memory snapshots
-// with zero SQL queries or plugin VM execution, protecting the database under banned-IP floods.
+// renderLightweightErrorPage renders the active theme's standalone frameless error.html purely from in-memory snapshots
+// with zero SQL queries or plugin VM execution, protecting the database under scanner/banned-IP floods.
 func (s *AppServer) renderLightweightErrorPage(w http.ResponseWriter, r *http.Request, status int, msgKey string) {
+	s.renderLightweightErrorPageWithViewer(w, r, nil, status, msgKey)
+}
+
+func (s *AppServer) renderLightweightErrorPageWithViewer(w http.ResponseWriter, r *http.Request, viewer *domain.User, status int, msgKey string) {
 	snap := s.deps.Settings.Snapshot()
 	locale := s.deps.Catalog.ResolveRequest(r, snap.Site.DefaultLocale, snap.Site.AllowLocaleSwitch)
 	activeTheme := theme.DefaultThemeID
 	var resolvedThemeCfg map[string]any
 	if s.deps.Themes != nil {
-		activeTheme = s.deps.Themes.ResolveThemeForRequest(r, nil, snap.Appearance)
+		activeTheme = s.deps.Themes.ResolveThemeForRequest(r, viewer, snap.Appearance)
 		resolvedThemeCfg = s.deps.Themes.ResolveThemeConfig(activeTheme, snap.Appearance.ThemeConfigs)
 	}
 	siteCfg := snap.Site
@@ -274,7 +269,7 @@ func (s *AppServer) renderLightweightErrorPage(w http.ResponseWriter, r *http.Re
 		Locale:          locale,
 		TextDir:         s.deps.Catalog.Dir(locale),
 		Locales:         s.deps.Catalog.Locales(),
-		Year:            time.Now().Year(),
+		Year:            time.Now().In(s.siteTimezoneLocation(snap.Site.TimeZone)).Year(),
 		CurrentPath:     r.URL.Path,
 		RawQuery:        r.URL.RawQuery,
 		BasePath:        r.URL.Path,
@@ -289,14 +284,21 @@ func (s *AppServer) renderLightweightErrorPage(w http.ResponseWriter, r *http.Re
 		Feed:            snap.Feed,
 		SEO:             snap.SEO,
 		Appearance:      snap.Appearance,
+		Viewer:          viewer,
 		StatusCode:      status,
 		ErrorMessage:    s.deps.Catalog.T(locale, msgKey),
 		NoIndex:         true,
 	}
+	addVaryHeader(w.Header(), "Accept-Encoding", "Accept-Language")
 	w.Header().Set("Cache-Control", "no-store")
 	if err := s.deps.Themes.RenderWithFallback(w, status, activeTheme, []string{"error.html"}, pctx); err != nil {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(status)
+		msg := html.EscapeString(pctx.ErrorMessage)
+		if msg == "" {
+			msg = html.EscapeString(http.StatusText(status))
+		}
+		_, _ = fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>%d</title></head><body style=\"font-family:system-ui,sans-serif;padding:48px 24px;max-width:560px;margin:0 auto;color:#222\"><h1 style=\"margin:0 0 8px\">%d</h1><p style=\"margin:0 0 16px;color:#666\">%s</p><a href=\"/\">&larr; Home</a></body></html>", status, status, msg)
 	}
 }
 

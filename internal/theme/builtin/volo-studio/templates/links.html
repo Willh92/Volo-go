@@ -7,18 +7,24 @@
         {{if .HeroSubtitle}}<p class="studio-hero__subtitle">{{.HeroSubtitle}}</p>{{end}}
       </div>
     </section>
-    {{$okLabel := "正常"}}{{$brokenLabel := "连接异常"}}
-    {{if hasPrefix .Locale "en"}}{{$okLabel = "Healthy"}}{{$brokenLabel = "Unreachable"}}{{else if eq .Locale "zh-TW"}}{{$okLabel = "正常"}}{{$brokenLabel = "連線異常"}}{{end}}
+    {{$okLabel := t .Locale "links.status_ok"}}{{$brokenLabel := t .Locale "links.status_broken"}}
     {{if .LinkGroups}}
+      {{$grpLen := len .LinkGroups}}
       <div class="studio-stack" data-collection-root="links">
         <div class="studio-article studio-card-pad studio-collection-toolbar">
           <div class="studio-collection-search-wrap">
             <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.links"}}" autocomplete="off">
           </div>
-          {{if gt (len .LinkGroups) 1}}
+          {{if gt $grpLen 1}}
             <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
               {{range $i, $g := .LinkGroups}}
-                <a class="studio-jump-pill" href="#link-group-{{$i}}">{{$g.Category}} <small>{{len $g.Items}}</small></a>
+                <a class="studio-jump-pill" href="#link-group-{{$i}}"{{if ge $i 18}} data-extra-pill hidden{{end}}>{{$g.Category}} <small>{{len $g.Items}}</small></a>
+              {{end}}
+              {{if gt $grpLen 18}}
+                <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
+                        aria-expanded="false"
+                        data-more-label="+{{sub $grpLen 18}}"
+                        data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $grpLen 18}}</button>
               {{end}}
             </nav>
           {{end}}
@@ -47,17 +53,27 @@
           </section>
         {{end}}
         <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+        {{template "pagination" .}}
       </div>
     {{else if .LinksByCategory}}
+      {{$catLen := len .LinksByCategory}}
       <div class="studio-stack" data-collection-root="links">
         <div class="studio-article studio-card-pad studio-collection-toolbar">
           <div class="studio-collection-search-wrap">
             <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.links"}}" autocomplete="off">
           </div>
-          {{if gt (len .LinksByCategory) 1}}
+          {{if gt $catLen 1}}
             <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.links"}}">
+              {{$catIdx := 0}}
               {{range $cat, $items := .LinksByCategory}}
-                <a class="studio-jump-pill" href="#link-cat-{{urlquery $cat}}">{{$cat}} <small>{{len $items}}</small></a>
+                <a class="studio-jump-pill" href="#link-cat-{{urlquery $cat}}"{{if ge $catIdx 18}} data-extra-pill hidden{{end}}>{{$cat}} <small>{{len $items}}</small></a>
+                {{$catIdx = add $catIdx 1}}
+              {{end}}
+              {{if gt $catLen 18}}
+                <button type="button" class="studio-jump-pill studio-tags-more-btn js-jump-pills-toggle"
+                        aria-expanded="false"
+                        data-more-label="+{{sub $catLen 18}}"
+                        data-less-label="{{t .Locale "studio.show_less"}}">+{{sub $catLen 18}}</button>
               {{end}}
             </nav>
           {{end}}
@@ -86,6 +102,7 @@
           </section>
         {{end}}
         <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+        {{template "pagination" .}}
       </div>
     {{else}}
       {{template "empty_state" (dict "Title" (t .Locale "studio.empty_links_title") "Desc" (t .Locale "studio.empty_links_desc"))}}

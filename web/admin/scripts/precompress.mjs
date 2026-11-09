@@ -1,19 +1,43 @@
-import { mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { transform as transformCSS } from "lightningcss";
 import { minifySync } from "vite";
 
 const distDir = new URL("../../../internal/adminui/dist", import.meta.url).pathname;
-const themeAssetsDir = new URL("../../../internal/theme/builtin/volo-studio/assets", import.meta.url).pathname;
-const themeAssetsGzDir = new URL("../../../internal/theme/builtin/volo-studio/assets_gz", import.meta.url).pathname;
-const themeTemplatesDir = new URL("../../../internal/theme/builtin/volo-studio/templates", import.meta.url).pathname;
-const themeTemplatesGzDir = new URL("../../../internal/theme/builtin/volo-studio/templates_gz", import.meta.url).pathname;
-const i18nBuiltinDir = new URL("../../../internal/i18n/builtin", import.meta.url).pathname;
-const i18nBuiltinGzDir = new URL("../../../internal/i18n/builtin_gz", import.meta.url).pathname;
+const cssTargets = {
+  safari: (17 << 16) | (5 << 8),
+  chrome: 124 << 16,
+  firefox: 125 << 16,
+};
+
+let has7z = false;
+try {
+  execFileSync("7z", ["--help"], { stdio: "ignore" });
+  has7z = true;
+} catch {}
 
 function deterministicGzip(raw) {
-  const gz = gzipSync(raw, { level: 9 });
+  let gz = null;
+  if (has7z && raw.length > 256) {
+    const tmp = mkdtempSync(join(tmpdir(), "volo-gz-"));
+    try {
+      const inPath = join(tmp, "payload");
+      const outPath = join(tmp, "payload.gz");
+      writeFileSync(inPath, raw);
+      execFileSync("7z", ["a", "-tgzip", "-mx=9", "-mfb=258", "-mpass=15", outPath, inPath], { stdio: "ignore" });
+      gz = readFileSync(outPath);
+    } catch {
+      gz = null;
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  if (!gz) {
+    gz = gzipSync(raw, { level: 9 });
+  }
   if (gz.length >= 10 && gz[0] === 0x1f && gz[1] === 0x8b && (gz[3] & 0x02) === 0) {
     gz[4] = 0;
     gz[5] = 0;
@@ -26,7 +50,7 @@ function deterministicGzip(raw) {
 
 function minifyEmbeddedPayload(fileName, raw) {
   if (fileName.endsWith(".js")) {
-    const out = minifySync(fileName, raw.toString("utf8"));
+    const out = minifySync(fileName, raw.toString("utf8"), { mangle: { toplevel: true } });
     if (out && typeof out.code === "string" && (!out.errors || out.errors.length === 0)) {
       return Buffer.from(out.code, "utf8");
     }
@@ -35,18 +59,46 @@ function minifyEmbeddedPayload(fileName, raw) {
       filename: fileName,
       code: raw,
       minify: true,
-      targets: { safari: 15 << 16, chrome: 100 << 16, firefox: 100 << 16 },
+      targets: cssTargets,
     });
     if (out && out.code) {
       return Buffer.from(out.code);
     }
+  } else if (fileName.endsWith(".html")) {
+    let html = raw.toString("utf8");
+    html = html.replace(/<!--(?!VOLO_BOOT-->)[\s\S]*?-->/g, "");
+    html = html.replace(/<style>([\s\S]*?)<\/style>/g, (full, css) => {
+      if (css.includes("{{")) return full;
+      try {
+        const out = transformCSS({
+          filename: `${fileName}.css`,
+          code: Buffer.from(css, "utf8"),
+          minify: true,
+          targets: cssTargets,
+        });
+        if (out && out.code) {
+          return `<style>${Buffer.from(out.code).toString("utf8")}</style>`;
+        }
+      } catch {}
+      return full;
+    });
+    html = html.replace(/<script>([\s\S]*?)<\/script>/g, (full, js) => {
+      if (js.includes("{{") || !js.trim()) return full;
+      try {
+        const out = minifySync(`${fileName}.js`, js);
+        if (out && typeof out.code === "string" && (!out.errors || out.errors.length === 0)) {
+          return `<script>${out.code.trim()}</script>`;
+        }
+      } catch {}
+      return full;
+    });
+    html = html.replace(/\n[ \t]+/g, "\n").replace(/\n{2,}/g, "\n").trim();
+    return Buffer.from(html, "utf8");
   } else if (fileName.endsWith(".json")) {
     return Buffer.from(JSON.stringify(JSON.parse(raw.toString("utf8"))), "utf8");
   }
   return raw;
 }
-
-const themeRootDir = new URL("../../../internal/theme/builtin/volo-studio", import.meta.url).pathname;
 
 function walkAdminDist(dir) {
   for (const ent of readdirSync(dir, { withFileTypes: true })) {
@@ -55,45 +107,15 @@ function walkAdminDist(dir) {
       walkAdminDist(full);
       continue;
     }
-    if (ent.isFile() && (full.endsWith(".js") || full.endsWith(".css"))) {
-      const raw = full.endsWith(".css") ? minifyEmbeddedPayload(ent.name, readFileSync(full)) : readFileSync(full);
+    if (
+      ent.isFile() &&
+      (full.endsWith(".js") || full.endsWith(".css") || full.endsWith(".json") || full.endsWith(".html"))
+    ) {
+      const raw = minifyEmbeddedPayload(ent.name, readFileSync(full));
       writeFileSync(`${full}.gz`, deterministicGzip(raw));
       unlinkSync(full);
     }
   }
 }
 
-function precompressFlatDir(srcDir, outDir, suffix = "") {
-  let entries;
-  try {
-    entries = readdirSync(srcDir, { withFileTypes: true });
-  } catch (err) {
-    if (err && err.code === "ENOENT") {
-      return;
-    }
-    throw err;
-  }
-  rmSync(outDir, { recursive: true, force: true });
-  mkdirSync(outDir, { recursive: true });
-  for (const ent of entries) {
-    if (ent.name.startsWith(".")) continue;
-    if (suffix && !ent.name.endsWith(suffix)) continue;
-    if (!ent.isFile()) continue;
-    const full = join(srcDir, ent.name);
-    const raw = minifyEmbeddedPayload(ent.name, readFileSync(full));
-    writeFileSync(join(outDir, `${ent.name}.gz`), deterministicGzip(raw));
-  }
-}
-
-function precompressSingleFile(dir, fileName) {
-  const full = join(dir, fileName);
-  const raw = minifyEmbeddedPayload(fileName, readFileSync(full));
-  writeFileSync(join(dir, `${fileName}.gz`), deterministicGzip(raw));
-}
-
 walkAdminDist(distDir);
-precompressSingleFile(themeRootDir, "theme.json");
-precompressSingleFile(themeRootDir, "preview.svg");
-precompressFlatDir(themeAssetsDir, themeAssetsGzDir);
-precompressFlatDir(themeTemplatesDir, themeTemplatesGzDir, ".html");
-precompressFlatDir(i18nBuiltinDir, i18nBuiltinGzDir, ".json");

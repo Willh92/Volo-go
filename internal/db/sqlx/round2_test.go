@@ -132,8 +132,8 @@ func TestRound3_ParsePGConnConfigAndBeginTxSQL(t *testing.T) {
 	if !simple1 {
 		t.Fatalf("expected prefer_simple_protocol=true to enable simple protocol")
 	}
-	if _, leaked := cfg1.RuntimeParams["prefer_simple_protocol"]; leaked {
-		t.Fatalf("prefer_simple_protocol leaked into RuntimeParams")
+	if _, leaked := cfg1.Params["prefer_simple_protocol"]; leaked {
+		t.Fatalf("prefer_simple_protocol leaked into Params")
 	}
 
 	cfg2, simple2, err := parsePGConnConfig("host=127.0.0.1 user=u dbname=db default_query_exec_mode=simple_protocol", false)
@@ -143,8 +143,8 @@ func TestRound3_ParsePGConnConfigAndBeginTxSQL(t *testing.T) {
 	if !simple2 {
 		t.Fatalf("expected default_query_exec_mode=simple_protocol to enable simple protocol")
 	}
-	if _, leaked := cfg2.RuntimeParams["default_query_exec_mode"]; leaked {
-		t.Fatalf("default_query_exec_mode leaked into RuntimeParams")
+	if _, leaked := cfg2.Params["default_query_exec_mode"]; leaked {
+		t.Fatalf("default_query_exec_mode leaked into Params")
 	}
 
 	sqlSerRO, err := buildPGBeginSQL(driver.TxOptions{Isolation: driver.IsolationLevel(6), ReadOnly: true}) // sql.LevelSerializable == 6
@@ -260,4 +260,3 @@ func TestRound3_SQLiteInMemoryReadInsideWithTxAndContextCancelSemaphore(t *testi
 	}
 	zeroStore.releaseWriteLock()
 }
-

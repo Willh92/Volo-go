@@ -33,6 +33,7 @@ const (
 	valRegExp
 
 	maxJSArrayLen    = 65536
+	maxJSObjectKeys  = 16384
 	maxJSStringBytes = 4 << 20 // 4 MiB string byte-length cap
 	maxJSExportDepth = 64      // Maximum object/array recursion depth
 	maxJSExportNodes = 50_000  // Maximum visited nodes during export/stringify/toString
@@ -263,6 +264,12 @@ func (rt *jsRuntime) checkInterrupt() error {
 	return nil
 }
 
+type jsLimitError string
+
+func (e jsLimitError) Error() string { return string(e) }
+
+const errJSObjectKeysLimit = jsLimitError("RangeError: maximum object keys (16384) exceeded")
+
 func (rt *jsRuntime) NewObject() *jsObject {
 	return &jsObject{props: make(map[string]jsValue)}
 }
@@ -271,12 +278,18 @@ func (o *jsObject) Set(key string, v any) {
 	if o.props == nil {
 		o.props = make(map[string]jsValue)
 	}
+	if _, exists := o.props[key]; !exists && len(o.props) >= maxJSObjectKeys {
+		panic(errJSObjectKeysLimit)
+	}
 	o.props[key] = goToJSValue(v)
 }
 
 func (o *jsObject) setVal(key string, v jsValue) {
 	if o.props == nil {
 		o.props = make(map[string]jsValue)
+	}
+	if _, exists := o.props[key]; !exists && len(o.props) >= maxJSObjectKeys {
+		panic(errJSObjectKeysLimit)
 	}
 	o.props[key] = v
 }
@@ -300,10 +313,20 @@ func (rt *jsRuntime) Get(name string) jsValue {
 	return v
 }
 
-func (rt *jsRuntime) RunProgram(prog *jsProgram) (jsValue, error) {
+func (rt *jsRuntime) RunProgram(prog *jsProgram) (retVal jsValue, retErr error) {
 	if err := rt.checkInterrupt(); err != nil {
 		return jsUndefinedVal, err
 	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			if limErr, ok := rec.(jsLimitError); ok && rt.stackDepth == 0 {
+				retVal = jsUndefinedVal
+				retErr = limErr
+				return
+			}
+			panic(rec)
+		}
+	}()
 	rt.hoistVarDecls(prog.stmts, rt.global)
 	rt.hoistFuncs(prog.stmts, rt.global)
 	res, err := rt.execStmts(prog.stmts, rt.global, jsUndefinedVal)
@@ -412,7 +435,7 @@ func (rt *jsRuntime) hoistFuncs(stmts []jsStmt, scope *jsScope) {
 	}
 }
 
-func (rt *jsRuntime) callFunc(fn *jsFunc, thisVal jsValue, args []jsValue) (jsValue, error) {
+func (rt *jsRuntime) callFunc(fn *jsFunc, thisVal jsValue, args []jsValue) (retVal jsValue, retErr error) {
 	if err := rt.checkInterrupt(); err != nil {
 		return jsUndefinedVal, err
 	}
@@ -422,8 +445,19 @@ func (rt *jsRuntime) callFunc(fn *jsFunc, thisVal jsValue, args []jsValue) (jsVa
 	if rt.stackDepth >= rt.maxStack {
 		return rt.throwValErr("RangeError", "Maximum call stack size exceeded")
 	}
+	outermost := rt.stackDepth == 0
 	rt.stackDepth++
-	defer func() { rt.stackDepth-- }()
+	defer func() {
+		rt.stackDepth--
+		if rec := recover(); rec != nil {
+			if limErr, ok := rec.(jsLimitError); ok && outermost {
+				retVal = jsUndefinedVal
+				retErr = limErr
+				return
+			}
+			panic(rec)
+		}
+	}()
 
 	if fn.hasBound {
 		thisVal = fn.boundThis
@@ -4541,12 +4575,18 @@ func goToJSValue(v any) jsValue {
 	case string:
 		return jsValue{kind: valString, str: x}
 	case map[string]any:
+		if len(x) > maxJSObjectKeys {
+			panic(errJSObjectKeysLimit)
+		}
 		o := &jsObject{props: make(map[string]jsValue, len(x))}
 		for k, val := range x {
 			o.setVal(k, goToJSValue(val))
 		}
 		return jsValue{kind: valObject, obj: o}
 	case map[string]string:
+		if len(x) > maxJSObjectKeys {
+			panic(errJSObjectKeysLimit)
+		}
 		o := &jsObject{props: make(map[string]jsValue, len(x))}
 		for k, val := range x {
 			o.setVal(k, jsValue{kind: valString, str: val})
@@ -4591,6 +4631,9 @@ func goToJSValue(v any) jsValue {
 		}
 		return jsValue{kind: valArray, arr: &jsArray{items: items}}
 	case reflect.Map:
+		if rv.Len() > maxJSObjectKeys {
+			panic(errJSObjectKeysLimit)
+		}
 		o := &jsObject{props: make(map[string]jsValue, rv.Len())}
 		iter := rv.MapRange()
 		for iter.Next() {

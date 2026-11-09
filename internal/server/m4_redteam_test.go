@@ -31,15 +31,15 @@ import (
 const canarySecret = "CANARY_SECRET_9921"
 
 type m4Env struct {
-	ctx       context.Context
-	cfg       *config.Config
-	store     *sqlx.Store
-	settings  *repo.SettingsManager
-	catalog   *i18n.Catalog
-	plugins   *plugin.Manager
-	app       *server.AppServer
-	ts        *httptest.Server
-	lastCode  string
+	ctx      context.Context
+	cfg      *config.Config
+	store    *sqlx.Store
+	settings *repo.SettingsManager
+	catalog  *i18n.Catalog
+	plugins  *plugin.Manager
+	app      *server.AppServer
+	ts       *httptest.Server
+	lastCode string
 }
 
 func setupM4TestEnv(t *testing.T, searchMaxBytes int) *m4Env {
@@ -670,6 +670,10 @@ func TestLegacyRedirectRangeMediaCommentWidgetBudgetAndGuestSelfHeal(t *testing.
 		t.Fatal(err)
 	}
 	readerCookies := regResp.Cookies()
+	var regOut struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	_ = json.NewDecoder(regResp.Body).Decode(&regOut)
 	regResp.Body.Close()
 	if regResp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected reader registration 201, got %d", regResp.StatusCode)
@@ -679,6 +683,7 @@ func TestLegacyRedirectRangeMediaCommentWidgetBudgetAndGuestSelfHeal(t *testing.
 	for _, ck := range readerCookies {
 		claimReq.AddCookie(ck)
 	}
+	claimReq.Header.Set("X-CSRF-Token", regOut.CSRFToken)
 	claimReq.Header.Set(guest.PassportHeaderName, cCreated.PassportToken)
 	claimResp, err := http.DefaultClient.Do(claimReq)
 	if err != nil {

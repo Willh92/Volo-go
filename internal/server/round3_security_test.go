@@ -46,7 +46,7 @@ type round3AdvancedOIDCProvider struct {
 	lastExchParams plugin.OIDCExchangeParams
 }
 
-func (m *round3AdvancedOIDCProvider) Name() string               { return m.name }
+func (m *round3AdvancedOIDCProvider) Name() string                { return m.name }
 func (m *round3AdvancedOIDCProvider) DisplayName(_ string) string { return "Enterprise OIDC" }
 
 func (m *round3AdvancedOIDCProvider) AuthCodeURL(state string, redirectURI string) (string, error) {
@@ -226,7 +226,24 @@ func TestRound3_OIDC_PKCE_Nonce_Bind_2FA_And_RoleIsolation(t *testing.T) {
 	}
 
 	// 4. Bind OIDC credential to captain, verify GET /api/admin/security/oidc-links, and reject duplicate bind from another staff user
-	bindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/start?target=bind", nil, adminCookies, nil)
+	bareAdminBind, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/start?target=bind", nil, adminCookies, nil)
+	if bareAdminBind.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for bare staff GET ?target=bind without bind_ticket, got %d", bareAdminBind.StatusCode)
+	}
+	beginAdmBindResp, beginAdmBindRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/oidc-links/begin", map[string]any{
+		"provider":         "okta",
+		"current_password": "Str0ng!Pass#2026",
+	}, adminCookies, adminHdrs)
+	if beginAdmBindResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/admin/security/oidc-links/begin = %d %s", beginAdmBindResp.StatusCode, string(beginAdmBindRaw))
+	}
+	var admBeginOut struct {
+		RedirectURL string `json:"redirect_url"`
+	}
+	if err := json.Unmarshal(beginAdmBindRaw, &admBeginOut); err != nil || admBeginOut.RedirectURL == "" {
+		t.Fatalf("invalid oidc-links/begin payload: %v %s", err, string(beginAdmBindRaw))
+	}
+	bindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+admBeginOut.RedirectURL, nil, adminCookies, nil)
 	bindAuthURL, _ := url.Parse(bindStart.Header.Get("Location"))
 	bindCookies := append(append([]*http.Cookie{}, adminCookies...), bindStart.Cookies()...)
 	bindCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/callback?code=admin-sub&state="+url.QueryEscape(bindAuthURL.Query().Get("state")), nil, bindCookies, nil)
@@ -258,19 +275,39 @@ func TestRound3_OIDC_PKCE_Nonce_Bind_2FA_And_RoleIsolation(t *testing.T) {
 
 	// Create editor1 and verify attempting to bind the same okta:sub_captain_1 returns already_linked
 	_, _ = doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/users", map[string]any{
-		"username":     "editor_oidc",
-		"email":        "editor_oidc@example.com",
-		"display_name": "Editor OIDC",
-		"role":         "editor",
-		"password":     "Ed1t0r!Pass#2026",
+		"username":         "editor_oidc",
+		"email":            "editor_oidc@example.com",
+		"display_name":     "Editor OIDC",
+		"role":             "editor",
+		"password":         "Ed1t0r!Pass#2026",
+		"current_password": "Str0ng!Pass#2026",
 	}, adminCookies, adminHdrs)
-	edLogin, _ := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/auth/login", map[string]any{
+	edLogin, edLoginRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/auth/login", map[string]any{
 		"ident":    "editor_oidc",
 		"password": "Ed1t0r!Pass#2026",
 	}, nil, map[string]string{"Origin": env.ts.URL})
 	edCookies := edLogin.Cookies()
+	var edLoginOut struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	_ = json.Unmarshal(edLoginRaw, &edLoginOut)
+	edHdrs := map[string]string{
+		auth.CSRFHeaderName: edLoginOut.CSRFToken,
+		"Origin":            env.ts.URL,
+	}
+	edBeginResp, edBeginRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/oidc-links/begin", map[string]any{
+		"provider":         "okta",
+		"current_password": "Ed1t0r!Pass#2026",
+	}, edCookies, edHdrs)
+	if edBeginResp.StatusCode != http.StatusOK {
+		t.Fatalf("editor POST /api/admin/security/oidc-links/begin = %d %s", edBeginResp.StatusCode, string(edBeginRaw))
+	}
+	var edBeginOut struct {
+		RedirectURL string `json:"redirect_url"`
+	}
+	_ = json.Unmarshal(edBeginRaw, &edBeginOut)
 
-	dupBindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/start?target=bind", nil, edCookies, nil)
+	dupBindStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+edBeginOut.RedirectURL, nil, edCookies, nil)
 	dupBindURL, _ := url.Parse(dupBindStart.Header.Get("Location"))
 	dupCookies := append(append([]*http.Cookie{}, edCookies...), dupBindStart.Cookies()...)
 	dupBindCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/callback?code=admin-sub&state="+url.QueryEscape(dupBindURL.Query().Get("state")), nil, dupCookies, nil)
@@ -404,12 +441,33 @@ func TestRound3_OIDC_PKCE_Nonce_Bind_2FA_And_RoleIsolation(t *testing.T) {
 		t.Fatalf("insert guest comment: %v", err)
 	}
 
+	// Verify OIDC reader auto-registration is blocked while allow_reader_register is false
+	rDisStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/start?target=reader&next=/archives", nil, gpCookies, nil)
+	rDisURL, _ := url.Parse(rDisStart.Header.Get("Location"))
+	disCBCookies := append(append([]*http.Cookie{}, gpCookies...), rDisStart.Cookies()...)
+	rDisCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/callback?code=reader-claim&state="+url.QueryEscape(rDisURL.Query().Get("state")), nil, disCBCookies, nil)
+	if rDisCB.StatusCode != http.StatusFound || !strings.Contains(rDisCB.Header.Get("Location"), "error=registration_disabled") {
+		t.Fatalf("expected error=registration_disabled when allow_reader_register=false, got %d loc=%q", rDisCB.StatusCode, rDisCB.Header.Get("Location"))
+	}
+
+	// Enable allow_reader_register and verify verified OIDC reader auto-provisioning + guest comment claim + state replay burn
+	rdCfg := env.settings.Snapshot().Reading
+	rdCfg.AllowReaderRegister = true
+	if rResp, rRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/reading", rdCfg, adminCookies, adminHdrs); rResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH reading = %d %s", rResp.StatusCode, string(rRaw))
+	}
+
 	rClaimStart, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/start?target=reader&next=/archives", nil, gpCookies, nil)
 	rClaimURL, _ := url.Parse(rClaimStart.Header.Get("Location"))
 	claimCBCookies := append(append([]*http.Cookie{}, gpCookies...), rClaimStart.Cookies()...)
 	rClaimCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/callback?code=reader-claim&state="+url.QueryEscape(rClaimURL.Query().Get("state")), nil, claimCBCookies, nil)
 	if rClaimCB.StatusCode != http.StatusFound || rClaimCB.Header.Get("Location") != "/archives" {
 		t.Fatalf("expected 302 /archives on verified OIDC reader registration, got %d loc=%q", rClaimCB.StatusCode, rClaimCB.Header.Get("Location"))
+	}
+	// Replaying the exact same sealed state cookie + state query must be rejected by single-use state burn
+	rReplayCB, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/auth/oidc/okta/callback?code=reader-claim&state="+url.QueryEscape(rClaimURL.Query().Get("state")), nil, claimCBCookies, nil)
+	if rReplayCB.StatusCode != http.StatusFound || !strings.Contains(rReplayCB.Header.Get("Location"), "error=state") {
+		t.Fatalf("expected replayed OIDC state to fail with error=state, got %d loc=%q", rReplayCB.StatusCode, rReplayCB.Header.Get("Location"))
 	}
 	claimedUser, err := sqlx.Get[domain.User](env.ctx, env.store, `SELECT * FROM users WHERE email = 'claim-reader@example.com'`)
 	if err != nil {
@@ -966,7 +1024,7 @@ func TestRound3_SetupConcurrency_MediaOrphans_EditorRBAC_ScaleDTOs_And_CacheVary
 
 	_, _ = doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/users", map[string]any{
 		"username": "ed_r3", "email": "ed_r3@example.com", "display_name": "Editor R3",
-		"role": "editor", "password": "Ed1t0r!Pass#2026",
+		"role": "editor", "password": "Ed1t0r!Pass#2026", "current_password": "Str0ng!Pass#2026",
 	}, adminCookies, adminHdrs)
 	edLogin, edLoginRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/auth/login", map[string]any{
 		"ident": "ed_r3", "password": "Ed1t0r!Pass#2026",

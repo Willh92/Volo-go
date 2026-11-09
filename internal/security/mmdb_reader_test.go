@@ -149,7 +149,7 @@ func buildSyntheticMMDB(recordSize uint16) []byte {
 				byte(right >> 16), byte(right >> 8), byte(right),
 			}
 		case 28:
-			mid := byte(((left >> 24) & 0x0f) << 4) | byte((right>>24)&0x0f)
+			mid := byte(((left>>24)&0x0f)<<4) | byte((right>>24)&0x0f)
 			return []byte{
 				byte(left >> 16), byte(left >> 8), byte(left),
 				mid,

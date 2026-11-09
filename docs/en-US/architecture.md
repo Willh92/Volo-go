@@ -2,7 +2,7 @@
 
 > 中文版本：[架构设计与性能内幕](../zh-CN/architecture.md)
 
-`Volo-go` is a pure-Go (`CGO_ENABLED=0`) sovereign blog engine engineered from scratch to deliver multi-database dialect portability, a 10-surface zero-leak privacy perimeter, dual-mode plugin sandboxing, and microsecond-class read throughput inside a **`< 20 MiB` static single binary** and **`< 35 MiB` resident memory (`VmRSS`)** envelope.
+`Volo-go` is a pure-Go (`CGO_ENABLED=0`, Go `1.27.3`) sovereign blog engine engineered from scratch to deliver multi-database dialect portability, a 10-surface zero-leak privacy perimeter, first-party pure-Go ES6 plugin sandboxing, and microsecond-class read throughput inside a **`< 20 MiB` static single binary** on `linux/amd64` and `arm64` (`< 21 MiB` across all 6 release targets: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) and **`< 35 MiB` resident memory (`VmRSS`)** envelope.
 
 ---
 
@@ -11,7 +11,8 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                HTTP / Unix Domain Socket Ingress Layer                  │
-│  WAFEngine (CIDR Bans / Scanner Honeypots / Subnet RL / Offline GeoIP)  │
+│  WAFEngine (CIDR Bans / Scanner Honeypots / Subnet RL / Multi-DB GeoIP) │
+│  Dynamic Stealth Admin Gate (Hot-Reload Prefix + Indistinguishable 404) │
 │  RedirectGuardian (O(1) In-Memory Snapshot: Custom Rules + .html 301s)  │
 │  BREACH-Safe Dynamic Gzip (Compresses Public HTML/JSON, Skips Secrets)  │
 └───────────────────────────────┬─────────────────────────────────────────┘
@@ -21,18 +22,18 @@
 ┌───────────────┐     ┌───────────────────┐     ┌──────────────────┐
 │ Public SSR    │     │ Studio Admin SPA  │     │ Machine & AI     │
 │ volo-studio & │     │ Preact + Signals  │     │ RSS/Atom/Podcast │
-│ ./themes/*    │     │ Lazy-Loaded CM6   │     │ Sitemap / llms   │
+│ ./themes/*    │     │ IR/WYSIWYG/SV CM6 │     │ Sharded Sitemap  │
 └───────┬───────┘     └─────────┬─────────┘     └────────┬─────────┘
         └───────────────────────┼────────────────────────┘
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                   Domain Services & Security Perimeter                  │
 │  • ContentVisibilityGuard (10-Surface Redaction + 4 MiB Render LRU)     │
-│  • SearchIndex (8 MiB Two-Stage Index + Zero-Slice UTF-8 Snippets)      │
+│  • SearchIndex (8 MiB Paginated Two-Stage Index + UTF-8 Snippets)       │
 │  • Auth & RBAC (Argon2id / Passkey / TOTP / Device Sessions / PATs)     │
 │  • GuestPassport & PoW (3-Tier Self-Healing Passport + SHA-256 PoW)     │
 │  • Media Pipeline (<=64MP Bomb Guard / EXIF Strip / WebP / SigV4 S3)    │
-│  • Plugin Manager (Pooled goja VMs + HMAC Webhooks + Circuit Breakers)  │
+│  • Plugin Manager (Pure-Go ES6 VM Pool + Directives + Federation/CB)    │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -45,28 +46,43 @@
 
 ---
 
-## 2. Normalized Relational Schema (23 Core Tables)
+## 2. Normalized Relational Schema (`v6`: 33 Data Tables + 9 Settings Domains)
 
-`Volo-go` replaces fragmented key-value JSON blobs and indirect tag-derived categorization with a normalized relational schema (`internal/db/migrate/schema.go`, current schema version `v2`):
+`Volo-go` replaces fragmented key-value JSON blobs and indirect tag-derived categorization with a normalized relational schema (`internal/db/migrate/schema.go`, current schema version **`v6`**, tracked via `schema_migrations` across idempotent steps `v1`–`v6`, with **33 normalized data tables** in `CanonicalTables`):
 
-| Domain | Tables | Key Design Choices |
+| Domain | Tables (33 Data Tables + `schema_migrations`) | Key Design Choices |
 | :--- | :--- | :--- |
-| **Identity & Access** | `users`, `user_credentials`, `user_sessions`, `api_tokens`, `email_verifications` | Physical `admin` / `editor` / `reader` RBAC separation; multi-device named Passkeys & TOTP in dedicated rows; fine-grained scoped PATs |
-| **Content & Taxonomy** | `categories`, `tags`, `articles`, `article_tags`, `article_revisions`, `article_backlinks`, `pages`, `nav_items` | Direct `articles.category_id` foreign binding; standalone Markdown `pages` decoupled from `nav_items` so pages never pollute post feeds or archives |
-| **Series & Bookshelf** | `series`, `series_articles`, `books` | First-class relational tables for ordered multi-part series and cached multi-source book TOCs |
-| **Engagement & Routing** | `comments`, `links`, `follows`, `follow_items`, `redirects` | Comments record `guest_id_hash` + `env_fp_hash` for one-click claiming upon registration; `redirects` + `legacy_permalink` guarantee zero `404`s |
-| **System & Extensions** | `media_assets`, `settings`, `webhooks`, `analytics_daily`, `analytics_top_items`, `plugin_kv`, `security_ip_bans`, `audit_logs` | Optimistic-locked domain `PATCH` settings with column-level `AES-256-GCM` secret sealing; zero-PII daily PV/UV rollups |
+| **System Settings (1)** | `settings` | Hosts all **9 hot-reloadable settings domains** (`site`, `reading`, `feed`, `seo`, `storage`, `appearance`, `notifications`, `security`, `backup`) with optimistic-locked partial `PATCH` and column-level `AES-256-GCM` + AAD secret sealing in `secret_ciphertext` |
+| **Identity & Access (4)** | `users`, `user_credentials`, `user_sessions`, `api_tokens` | Physical `admin` / `editor` / `reader` RBAC separation; multi-device named WebAuthn Passkeys, TOTP, and recovery codes stored in `user_credentials`; fine-grained scoped `volo_pat_*` tokens |
+| **Content & Taxonomy (8)** | `categories`, `tags`, `articles`, `article_tags`, `article_revisions`, `article_backlinks`, `pages`, `nav_items` | Direct `articles.category_id` foreign binding; standalone Markdown `pages` (with custom `template` binding) decoupled from hierarchical `nav_items` so pages never pollute post feeds or archives |
+| **Series & Bookshelf (4)** | `series`, `series_articles`, `books`, `book_chapters` | First-class relational tables for ordered multi-part series, `reading_status`, batch drag-and-drop reordering, and cached multi-source book chapter trees (`book_chapters`) |
+| **Engagement & Syndication (6)** | `comments`, `reactions`, `links`, `follows`, `follow_items`, `redirects` | Comments record `guest_id_hash` + `env_fp_hash` for one-click claiming upon registration; `reactions` store emoji counters; `follows` / `follow_items` aggregate feed subscriptions; `redirects` + `legacy_permalink` guarantee zero `404`s |
+| **Media, Webhooks, Security, Analytics & Plugins (10)** | `media_assets`, `webhooks`, `webhook_deliveries`, `analytics_daily`, `analytics_top_items`, `security_ip_bans`, `security_geo_rules`, `audit_logs`, `plugins`, `plugin_kv` | `media_assets` tracks dimensions, `alt_text`, and `exif_stripped`; `webhook_deliveries` stores bounded delivery history for replay; `security_ip_bans` / `security_geo_rules` power WAF & multi-DB offline GeoIP; `plugins` / `plugin_kv` isolate encrypted plugin secrets and TTL-enabled KV entries |
+
+### All 9 Hot-Reload Settings Domains (`internal/domain/settings.go`)
+
+| Settings Domain | Core Responsibilities & Representative Keys |
+| :--- | :--- |
+| `site` | Title/subtitle, default locale, timezone, notice board, social links, license template, global `custom_vars` map |
+| `reading` | Timeline `list_style` (`summary \| title_only \| full`), pagination counts, PJAX, instant search, comment access & smart moderation, PoW difficulty, asset/vendor CDN prefixes |
+| `feed` | RSS/Atom output mode (`summary \| full`), `/llms.txt` toggle, `.md` raw view toggle, full Apple/Spotify `podcast` channel metadata |
+| `seo` | Meta keywords/description, default OG image, post permalink style, IndexNow key, cached GitHub open-source showcase repos |
+| `storage` | Active driver (`local \| s3`), custom local media directory `local_dir`, max upload MB, EXIF stripping, adaptive WebP quality, S3/R2/MinIO settings & encrypted `s3_secret_key` |
+| `appearance` | Desktop `active_theme`, optional `mobile_theme`, `accent` palette, `default_mode`, site-wide `custom_css`, per-theme `theme_configs` |
+| `notifications` | SMTP server configuration & encrypted `smtp_password`, admin comment alerts, and reader reply email notifications |
+| `security` | Risk control & WAF window limits, offline GeoIP toggle & hot-reloadable `geoip_dir`, `geo_default_action` / `geo_unknown_action`, mandatory TOTP scope, zero-restart stealth path `dynamic_login_path` (`admin_path`), and encrypted `share_token_secret` |
+| `backup` | Scheduled local rolling backup interval/retention/media toggle, remote replication (`s3 \| webdav`), and encrypted `webdav_password` / `s3_secret_key` |
 
 ---
 
 ## 3. Pure-Go Multi-Dialect SQL & SQLite WAL Isolation
 
 1. **Unified Pure-Go Dialect Layer (`internal/db/dialect`)**:
-   - Rebinds `?` placeholders to PostgreSQL `$1..$N` via a bounded lock-free `sync.Map` cache (**`21.8 ns/op`, `0 allocs/op`** on hot queries);
-   - Abstracts portable `UpsertSQL` (`ON CONFLICT DO UPDATE` vs `ON DUPLICATE KEY UPDATE`), `PaginateSQL`, and DDL `TypeMap`.
+   - Rebinds `?` placeholders to PostgreSQL `$1..$N` via a bounded lock-free `sync.Map` cache (**`21.8 ns/op`, `0 allocs/op`** on hot queries) and supports `--db-simple-protocol` (`VOLO_DB_SIMPLE_PROTOCOL`) for PgBouncer / Supabase transaction poolers;
+   - Abstracts portable `UpsertSQL` (`ON CONFLICT DO UPDATE` vs `ON DUPLICATE KEY UPDATE`), `PaginateSQL`, and DDL `TypeMap` (with long lookup keys widened to `VARCHAR(512)` in `v6`).
 2. **Physical SQLite Read/Write Pool Split (`internal/db/sqlx`)**:
    - `WriteDB` runs with `MaxOpenConns=1`, `_txlock=immediate`, and `busy_timeout=5000`, eliminating concurrent writer `SQLITE_BUSY` deadlocks;
-   - `ReadDB` enforces `PRAGMA query_only = ON` and `cache_size = -4096` (`4 MiB` bounded page cache), guaranteeing at the database engine level that read-only queries never mutate disk state.
+   - `ReadDB` enforces `PRAGMA query_only = ON` and `cache_size = -4096` (`4 MiB` bounded page cache), guaranteeing at the database driver level that read-only queries never mutate disk state.
 3. **Zero-Closure Struct Scanning**: Struct column plans are precompiled per `(reflect.Type, Columns)` pair and scanned via preallocated index slices without per-row reflection closures.
 
 ---
@@ -75,27 +91,28 @@
 
 Password-protected posts (`password_ciphertext`) and partial encrypted blocks (`:::lock`) are enforced fail-closed across all **10 outbound surfaces** in `internal/visibility/guard.go`:
 
-1. **Feed Card Excerpts**: Locked posts never auto-excerpt body text;
+1. **Feed Card Excerpts & Full Timelines**: Locked posts never auto-excerpt or render protected body text (even when `reading.list_style = "full"`);
 2. **Hero & OpenGraph Images**: Locked posts never expose cover or inline image URLs, falling back to deterministic local geometric SVG covers;
 3. **Previous / Next Post Links**: Expose minimal title/permalink metadata only — never body previews;
 4. **Comment API & Recent Comments**: `/api/v1/comments` returns `403 Forbidden` until unlocked, and sidebar recent comments exclude locked posts;
-5. **Two-Stage Full-Text Search**: Both the `8 MiB` in-memory index and SQL fallback strip locked posts and `:::lock` blocks prior to indexing/matching;
+5. **Paginated Two-Stage Full-Text Search**: Both the `8 MiB` in-memory index and SQL fallback strip locked posts and `:::lock` blocks prior to indexing/matching;
 6. **RSS / Atom / Podcast Feeds**: Password-protected posts are excluded from syndication XML; partial `:::lock` blocks render localized lock notices;
-7. **Sitemap & IndexNow**: Password-protected posts are omitted from `sitemap.xml`, excluded from IndexNow pings, and served with `noindex, nofollow, noarchive` + `Cache-Control: private, no-store`;
+7. **Sitemap (Including Sharded Indexes) & IndexNow**: Password-protected posts are omitted from `/sitemap.xml` and any `/sitemap-N.xml` shards, excluded from IndexNow pings, and served with `noindex, nofollow, noarchive` + `Cache-Control: private, no-store`;
 8. **Bidirectional Backlinks (`[[slug]]`)**: Locked posts neither emit outbound backlinks nor appear in target post backlink lists;
 9. **`/llms.txt` & `.md` Raw Endpoints**: Excluded from LLM corpus indexes, and unauthenticated `.md` requests return `403`;
-10. **Plugin Hook Redaction**: Plugins without explicit `articles:read_protected` permission never receive protected content, and `render.post_html` output is re-sanitized through `bluemonday`.
+10. **Plugin Hooks & Federation Dispatch**: Plugins without explicit `articles:read_protected` permission and automatic `federation` dispatches never receive protected payloads or nested `:::lock` content, and `render.post_html` / custom directive outputs are re-sanitized through `bluemonday`.
 
 ---
 
-## 5. Zero-Stale Revision-Tracked Caches & Memory Budget
+## 5. Zero-Stale Revision-Tracked Caches, Editor Lazy-Loading & Memory Budget
 
 To achieve microsecond response times within a strict `< 35 MiB` `VmRSS` ceiling without external Redis dependencies, `Volo-go` pairs **`Store.DataRevision()`** with **`SettingsManager.Revision()`**:
 
-- **Instant Invalidation on Every Mutation**: Every foreground `ExecContext` / `WithTx` atomically increments `dataRev`. The O(1) redirect snapshot, public chrome snapshot (navigation tree, categories, tags, recent comments), and pre-compressed RSS/Atom/Podcast/Sitemap/LLMs documents (`CachedDocument`, capped at `2 MiB`) validate `(dataRev, settingsRev)` on read — guaranteeing **zero stale reads** while serving strong `ETag` / `304 Not Modified` responses in microseconds.
+- **Instant Invalidation on Every Mutation**: Every foreground `ExecContext` / `WithTx` atomically increments `dataRev`. The O(1) redirect snapshot, public chrome snapshot (navigation tree, categories, tags, recent comments), and pre-compressed RSS/Atom/Podcast/Sitemap (including `> 10,000` URL sharded `<sitemapindex>`)/LLMs documents (`CachedDocument`, capped at `2 MiB`) validate `(dataRev, settingsRev)` on read — guaranteeing **zero stale reads** while serving strong `ETag` / `304 Not Modified` responses in microseconds.
 - **Write-Behind View Analytics Buffer (`viewAnalyticsBuffer`)**: High-frequency `articles.view_count`, `pages.view_count`, `redirects.hit_count`, and `analytics_daily` increments are coalesced lock-free in memory, overlaid in real time on reads (`PendingArticleViews`), flushed every `2s` via `WithBgTx` (without invalidating content caches), and deterministically drained on `/api/admin/overview` and `SIGTERM` shutdown.
-- **Bounded Resident Memory Allocation (Measured Warm `VmRSS = 28.60 MiB`)**:
-  - Go runtime, HTTP stack, embedded assets & pooled `goja` VMs: `~12 MiB`
+- **Lazy-Loaded 3-Mode Studio Editor**: The initial Admin SPA shell weighs `84.82 KB` gzipped (`< 300 KB` total embedded Gzip); authenticated workspaces and the CodeMirror 6 3-mode editor core (`IR` instant rendering, `WYSIWYG` rich round-trip, `SV` split preview) load asynchronously on demand, and client-side KaTeX/Mermaid libraries load on public pages solely when math or diagram blocks are present.
+- **Bounded Resident Memory Allocation (Measured Warm `VmRSS = 25.17 MiB`)**:
+  - Go runtime, HTTP stack, embedded assets & pooled pure-Go ES6 plugin VMs: `~12 MiB`
   - SQLite WAL page cache (`cache_size = -4096`): `<= 4 MiB`
   - Two-stage full-text search index (`SearchIndex`): `<= 8 MiB`
   - SHA-256 verified Markdown render LRU (`boundedRenderLRU`): `<= 4 MiB`

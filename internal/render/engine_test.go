@@ -220,3 +220,109 @@ func TestLegacyBookshelfDirectivesAndWideTable(t *testing.T) {
 	}
 }
 
+func TestExtendedMarkdownInlineTOCMediaAndSafety(t *testing.T) {
+	eng := NewEngine()
+
+	md := strings.Join([]string{
+		"[TOC]",
+		"",
+		"## 化学与公式",
+		"",
+		"水分子 H~2~O 与面积 x^2^，对比 ~~删除线~~、脚注引用[^1]、路径 `/home/~alice` 与算式 2^3 + 2^4 = 24。",
+		"",
+		"这是 ==单段高亮==，以及 ==跨标签 **加粗** 与 `a == b` 代码高亮==，但普通比较 a == b == c 不应误判。",
+		"",
+		"### 媒体内嵌测试",
+		"",
+		"[演示视频](/uploads/demo.mp4)",
+		"",
+		"[播客音频](https://cdn.example.com/audio/ep01.mp3)",
+		"",
+		"[B站视频](https://www.bilibili.com/video/BV1xx411c7mD)",
+		"",
+		"[YouTube视频](https://youtu.be/dQw4w9WgXcQ)",
+		"",
+		`<iframe src="https://evil.example.com/phish"></iframe>`,
+		"",
+		`[恶意链接](javascript:alert(1)//test.mp4)`,
+		"",
+		"[^1]: 脚注正文说明",
+	}, "\n")
+
+	out := eng.Render(md, Options{Mode: RenderModeWeb, Locale: "zh-CN"})
+
+	// 1. Inline [TOC]
+	if !strings.Contains(out.HTML, `<nav class="volo-inline-toc" data-md-toc="1"`) ||
+		!strings.Contains(out.HTML, `href="#化学与公式"`) ||
+		!strings.Contains(out.HTML, `href="#媒体内嵌测试"`) {
+		t.Fatalf("expected inline TOC rendered with heading anchors, got: %s", out.HTML)
+	}
+
+	// 2. Subscript, Superscript, Strikethrough, Footnotes, and False-Positive Guards
+	if !strings.Contains(out.HTML, "H<sub>2</sub>O") || !strings.Contains(out.HTML, "x<sup>2</sup>") {
+		t.Fatalf("expected H<sub>2</sub>O and x<sup>2</sup>, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, "<del>删除线</del>") {
+		t.Fatalf("expected <del>删除线</del>, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, "2^3 + 2^4 = 24") {
+		t.Fatalf("expected spaced arithmetic 2^3 + 2^4 untouched, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, "a == b == c") {
+		t.Fatalf("expected spaced comparison a == b == c untouched, got: %s", out.HTML)
+	}
+
+	// 3. Highlight ==...== (plain and cross-tag)
+	if !strings.Contains(out.HTML, "<mark>单段高亮</mark>") {
+		t.Fatalf("expected <mark>单段高亮</mark>, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, "<mark>跨标签 <strong>加粗</strong> 与 <code>a == b</code> 代码高亮</mark>") {
+		t.Fatalf("expected cross-tag <mark> preserving inner strong & code, got: %s", out.HTML)
+	}
+
+	// 4. Standalone media players & allowlisted video embeds
+	if !strings.Contains(out.HTML, `<video controls="" preload="metadata" playsinline="" src="/uploads/demo.mp4"></video>`) &&
+		!strings.Contains(out.HTML, `<video controls preload="metadata" playsinline src="/uploads/demo.mp4"></video>`) {
+		t.Fatalf("expected HTML5 <video> player for standalone .mp4 link, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `src="https://cdn.example.com/audio/ep01.mp3"`) || !strings.Contains(out.HTML, "<audio") {
+		t.Fatalf("expected HTML5 <audio> player for standalone .mp3 link, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `src="https://player.bilibili.com/player.html?bvid=BV1xx411c7mD&amp;autoplay=0"`) {
+		t.Fatalf("expected allowlisted Bilibili iframe embed, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `src="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"`) {
+		t.Fatalf("expected allowlisted YouTube privacy-enhanced iframe embed, got: %s", out.HTML)
+	}
+
+	// 5. Security: untrusted iframe & javascript: media link must NEVER emit evil src or script!
+	if strings.Contains(out.HTML, "evil.example.com") || strings.Contains(out.HTML, "javascript:") {
+		t.Fatalf("untrusted iframe or javascript: link leaked through sanitizer: %s", out.HTML)
+	}
+}
+
+func TestCustomAppDeepLinkAnchorSanitization(t *testing.T) {
+	eng := NewEngine()
+	md := strings.Join([]string{
+		`<a href="huanai://open/article?id=99&amp;tab=1">Open App</a>`,
+		`[Obsidian](obsidian://open?vault=Notes)`,
+		`<a href="javascript://%0aalert(1)">EvilJS</a>`,
+		`<a href="j&#x61;vascript://alert(1)">EntityEvilJS</a>`,
+		`<a href="file:///etc/passwd">LocalFile</a>`,
+		`<a href="https://example.com" data-volo-app-href="javascript://evil">SpoofAttr</a>`,
+	}, "\n\n")
+
+	out := eng.Render(md, Options{Mode: RenderModeWeb, Locale: "zh-CN"})
+	if !strings.Contains(out.HTML, `href="huanai://open/article?id=99&amp;tab=1"`) {
+		t.Fatalf("expected huanai:// anchor href preserved, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `href="obsidian://open?vault=Notes"`) {
+		t.Fatalf("expected obsidian:// markdown link preserved, got: %s", out.HTML)
+	}
+	for _, forbidden := range []string{"javascript:", "file:", "data-volo-app-href"} {
+		if strings.Contains(strings.ToLower(out.HTML), forbidden) {
+			t.Fatalf("forbidden scheme/attr %q leaked in output: %s", forbidden, out.HTML)
+		}
+	}
+}
+

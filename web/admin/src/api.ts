@@ -17,6 +17,7 @@ export interface BootConfig {
   accent: string;
   default_theme: string;
   site_title: string;
+  vendor_cdn_prefix?: string;
   locales?: LocaleOption[];
 }
 
@@ -30,6 +31,7 @@ export interface StaffUser {
   website_url: string;
   role: "admin" | "editor" | "reader";
   preferred_locale: string;
+  totp_enrollment_required?: boolean;
 }
 
 export function sanitizeAdminPath(raw?: string): string {
@@ -94,6 +96,7 @@ export interface ConfirmOptions {
 
 export const csrfTokenSig = signal<string>("");
 export const currentUserSig = signal<StaffUser | null>(null);
+export const totpEnrollmentRequiredSig = signal<boolean>(false);
 export const toastSig = signal<ToastItem | null>(null);
 export const confirmSig = signal<(ConfirmOptions & { resolve: (ok: boolean) => void }) | null>(null);
 export const dirtyEditorSig = signal<boolean>(false);
@@ -123,8 +126,10 @@ export function resolveEffectiveTheme(mode: string): "light" | "dark" {
       ? "dark"
       : "light";
   }
-  const h = new Date().getHours();
-  return h < 7 || h >= 19 ? "dark" : "light";
+  const d = new Date();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  const dark = !(mins >= 390 && mins < 1140);
+  return dark ? "dark" : "light";
 }
 
 export const themeModeSig = signal<string>(readInitialThemeMode());
@@ -443,7 +448,7 @@ export async function apiFetch<T = any>(
   if (csrfTokenSig.value && method !== "GET" && method !== "HEAD") {
     headers.set("X-CSRF-Token", csrfTokenSig.value);
   }
-  const trackBusy = !url.endsWith("/articles/preview");
+  const trackBusy = !url.endsWith("/articles/preview") && !url.endsWith("/render/preview");
   if (trackBusy) busyCountSig.value = busyCountSig.value + 1;
   try {
     const res = await fetch(url, {
@@ -475,9 +480,13 @@ export async function refreshMe(): Promise<StaffUser | null> {
       user: StaffUser;
       csrf_token: string;
       storage_driver?: string;
+      totp_enrollment_required?: boolean;
       appearance?: { accent?: string; default_mode?: string };
     }>("/api/admin/me");
     currentUserSig.value = data.user;
+    totpEnrollmentRequiredSig.value = Boolean(
+      data.totp_enrollment_required || data.user?.totp_enrollment_required
+    );
     csrfTokenSig.value = data.csrf_token || "";
     if (data.storage_driver) {
       storageDriverSig.value = data.storage_driver;
@@ -503,6 +512,7 @@ export async function refreshMe(): Promise<StaffUser | null> {
     return data.user;
   } catch {
     currentUserSig.value = null;
+    totpEnrollmentRequiredSig.value = false;
     return null;
   }
 }
@@ -536,7 +546,11 @@ function openDraftDB(): Promise<IDBDatabase> {
         req.result.createObjectStore(DRAFT_STORE);
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => db.close();
+      resolve(db);
+    };
     req.onerror = () => reject(req.error);
   });
 }
@@ -626,8 +640,18 @@ export async function saveLocalDraft(key: string, draft: LocalDraft): Promise<vo
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(DRAFT_STORE, "readwrite");
       tx.objectStore(DRAFT_STORE).put(draft, key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        reject(tx.error);
+      };
+      tx.onabort = () => {
+        db.close();
+        reject(tx.error);
+      };
     });
   } catch {
     // Ignore private-browsing IndexedDB quota restrictions
@@ -640,8 +664,22 @@ export async function loadLocalDraft(key: string): Promise<LocalDraft | null> {
     return await new Promise<LocalDraft | null>((resolve) => {
       const tx = db.transaction(DRAFT_STORE, "readonly");
       const req = tx.objectStore(DRAFT_STORE).get(key);
-      req.onsuccess = () => resolve((req.result as LocalDraft) || null);
-      req.onerror = () => resolve(null);
+      let out: LocalDraft | null = null;
+      req.onsuccess = () => {
+        out = (req.result as LocalDraft) || null;
+      };
+      tx.oncomplete = () => {
+        db.close();
+        resolve(out);
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve(null);
+      };
+      tx.onabort = () => {
+        db.close();
+        resolve(null);
+      };
     });
   } catch {
     return null;
@@ -651,8 +689,22 @@ export async function loadLocalDraft(key: string): Promise<LocalDraft | null> {
 export async function clearLocalDraft(key: string): Promise<void> {
   try {
     const db = await openDraftDB();
-    const tx = db.transaction(DRAFT_STORE, "readwrite");
-    tx.objectStore(DRAFT_STORE).delete(key);
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(DRAFT_STORE, "readwrite");
+      tx.objectStore(DRAFT_STORE).delete(key);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+      tx.onabort = () => {
+        db.close();
+        resolve();
+      };
+    });
   } catch {
     // No-op
   }

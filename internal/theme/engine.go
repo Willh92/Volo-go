@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"text/template/parse"
 
 	"github.com/Willh92/Volo-go/internal/content"
 	"github.com/Willh92/Volo-go/internal/domain"
@@ -31,7 +32,10 @@ import (
 //go:embed builtin/volo-studio/theme.json.gz builtin/volo-studio/preview.svg.gz builtin/volo-studio/templates_gz/* builtin/volo-studio/assets_gz/*
 var builtinThemeFS embed.FS
 
-const DefaultThemeID = "volo-studio"
+const (
+	DefaultThemeID = "volo-studio"
+	SecretMask     = "********"
+)
 
 // ConfigOption defines a selectable item for a `select` theme setting.
 type ConfigOption struct {
@@ -42,7 +46,7 @@ type ConfigOption struct {
 // ConfigField defines a declarative per-theme configuration item in `theme.json`.
 type ConfigField struct {
 	Key         string            `json:"key"`
-	Type        string            `json:"type"` // "text" | "string" | "textarea" | "url" | "color" | "image" | "boolean" | "number" | "select" | "sortable_list"
+	Type        string            `json:"type"` // "text" | "string" | "secret" | "textarea" | "url" | "color" | "image" | "boolean" | "number" | "select" | "sortable_list"
 	Group       map[string]string `json:"group,omitempty"`
 	Label       map[string]string `json:"label"`
 	Description map[string]string `json:"description,omitempty"`
@@ -329,16 +333,16 @@ type PageContext struct {
 	StandalonePage   content.PublicPageView
 
 	// Taxonomies, Books, Links, Follows
-	TaxonomyKind           string
-	Categories             []content.CategoryWithCount
-	Tags                   []content.TagWithCount
-	TagQuery               string
-	TagSort                string
-	ArchiveBuckets         []content.ArchiveMonth
-	SelectedArchiveYear    string
-	ArchiveYears           []ArchiveYearStat
-	ArchiveGroups          []ArchiveYearGroup
-	SeriesList             []domain.Series
+	TaxonomyKind              string
+	Categories                []content.CategoryWithCount
+	Tags                      []content.TagWithCount
+	TagQuery                  string
+	TagSort                   string
+	ArchiveBuckets            []content.ArchiveMonth
+	SelectedArchiveYear       string
+	ArchiveYears              []ArchiveYearStat
+	ArchiveGroups             []ArchiveYearGroup
+	SeriesList                []domain.Series
 	Books                     []domain.Book
 	BookDetail                content.BookDetailView
 	ActiveChapter             *domain.BookChapter
@@ -382,15 +386,29 @@ type PageContext struct {
 	ErrorMessage string
 }
 
+// SecretSealer encrypts and decrypts theme secret config fields at rest.
+type SecretSealer interface {
+	SealString(plaintext string, aad string) (string, error)
+	OpenString(envelope string, aad string) (string, error)
+}
+
 // Engine manages embedded `volo-studio` and hot-reloadable external `./themes/<id>` packages.
 type Engine struct {
 	catalog        *i18n.Catalog
 	themesDir      string
 	cdnPrefixFn    func() string
 	vendorPrefixFn func() string
+	sealer         SecretSealer
 
 	mu     sync.RWMutex
 	themes map[string]*loadedTheme
+}
+
+// SetSecretSealer configures at-rest AES-256-GCM encryption for theme `type: "secret"` fields.
+func (e *Engine) SetSecretSealer(s SecretSealer) {
+	e.mu.Lock()
+	e.sealer = s
+	e.mu.Unlock()
 }
 
 // SetAssetCDNPrefixFunc registers an optional dynamic getter for Reading.AssetCDNPrefix.
@@ -663,11 +681,17 @@ func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 	}
 
 	var gzBuf bytes.Buffer
-	zw, err := gzip.NewWriterLevel(&gzBuf, gzip.BestCompression)
-	if err != nil {
-		th.assets = make(map[string]cachedAsset)
-		th.assetsReady = true
-		return th.assets
+	var zw *gzip.Writer
+	getGzipWriter := func() (*gzip.Writer, bool) {
+		if zw != nil {
+			return zw, true
+		}
+		w, err := gzip.NewWriterLevel(&gzBuf, gzip.BestCompression)
+		if err != nil {
+			return nil, false
+		}
+		zw = w
+		return zw, true
 	}
 
 	enforceBounds := !th.manifest.IsBuiltin
@@ -691,12 +715,19 @@ func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 			if walkErr != nil || d.IsDir() {
 				return nil
 			}
+			rel := strings.TrimPrefix(p, "assets/")
+			if _, exists := assets[rel]; exists {
+				return nil
+			}
 			raw, ok := readBoundedThemeFile(th.fsys, p, enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes)
 			if !ok {
 				return nil
 			}
-			rel := strings.TrimPrefix(p, "assets/")
-			assets[rel] = buildCachedAssetWithWriter(raw, rel, zw, &gzBuf)
+			w, wOK := getGzipWriter()
+			if !wOK {
+				return nil
+			}
+			assets[rel] = buildCachedAssetWithWriter(raw, rel, w, &gzBuf)
 			return nil
 		})
 	}
@@ -710,15 +741,17 @@ func (e *Engine) ensureAssets(th *loadedTheme) map[string]cachedAsset {
 	previewCandidates = append(previewCandidates, "preview.svg", "preview.png", "preview.webp", "preview.jpg", "assets/preview.svg", "assets/preview.png")
 	if th.fsys != nil {
 		for _, cand := range previewCandidates {
-			if rawPrev, ok := readBoundedThemeFile(th.fsys, cand, enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes); ok && len(rawPrev) > 0 {
-				previewAsset = buildCachedAssetWithWriter(rawPrev, cand, zw, &gzBuf)
-				hasPreview = true
-				break
-			}
 			if gzPrev, ok := readBoundedThemeFile(th.fsys, cand+".gz", enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes); ok && len(gzPrev) > 0 {
 				previewAsset = buildPrecompressedAsset(gzPrev, cand)
 				hasPreview = true
 				break
+			}
+			if rawPrev, ok := readBoundedThemeFile(th.fsys, cand, enforceBounds, maxExternalAssetSingleBytes, &totalBytes, maxExternalAssetTotalBytes); ok && len(rawPrev) > 0 {
+				if w, wOK := getGzipWriter(); wOK {
+					previewAsset = buildCachedAssetWithWriter(rawPrev, cand, w, &gzBuf)
+					hasPreview = true
+					break
+				}
 			}
 		}
 	}
@@ -847,7 +880,7 @@ func (e *Engine) getOrCompilePage(th *loadedTheme, defTh *loadedTheme, selected 
 	if th.fsys != nil {
 		rawTpl, rErr = readThemeTemplateFile(th.fsys, selected)
 	}
-	if (th.fsys == nil || rErr != nil) && th.fallbackFS != nil {
+	if (th.fsys == nil || rErr != nil || len(bytes.TrimSpace(rawTpl)) == 0) && th.fallbackFS != nil {
 		rawTpl, rErr = readThemeTemplateFile(th.fallbackFS, selected)
 	}
 	if rErr != nil {
@@ -871,13 +904,14 @@ func (e *Engine) getOrCompilePage(th *loadedTheme, defTh *loadedTheme, selected 
 	return cloned, nil
 }
 
-// List returns all loaded theme manifests sorted with `volo-studio` first.
+// List returns all loaded theme manifests sorted with `volo-studio` first,
+// redacting any non-empty `"secret"` defaults to `SecretMask`.
 func (e *Engine) List() []Manifest {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	out := make([]Manifest, 0, len(e.themes))
 	for _, th := range e.themes {
-		out = append(out, th.manifest)
+		out = append(out, redactManifestSecrets(th.manifest))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ID == DefaultThemeID {
@@ -889,6 +923,41 @@ func (e *Engine) List() []Manifest {
 		return out[i].ID < out[j].ID
 	})
 	return out
+}
+
+func redactManifestSecrets(mf Manifest) Manifest {
+	if len(mf.ConfigSchema) == 0 {
+		return mf
+	}
+	hasSecret := false
+	for _, f := range mf.ConfigSchema {
+		if strings.EqualFold(f.Type, "secret") && isNonEmptySecretValue(f.Default) {
+			hasSecret = true
+			break
+		}
+	}
+	if !hasSecret {
+		return mf
+	}
+	cloned := make([]ConfigField, len(mf.ConfigSchema))
+	copy(cloned, mf.ConfigSchema)
+	for i := range cloned {
+		if strings.EqualFold(cloned[i].Type, "secret") && isNonEmptySecretValue(cloned[i].Default) {
+			cloned[i].Default = SecretMask
+		}
+	}
+	mf.ConfigSchema = cloned
+	return mf
+}
+
+func isNonEmptySecretValue(v any) bool {
+	if v == nil {
+		return false
+	}
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s) != ""
+	}
+	return strings.TrimSpace(fmt.Sprint(v)) != ""
 }
 
 func defaultPageTemplateOptions() []ConfigOption {
@@ -973,7 +1042,12 @@ func (e *Engine) Has(themeID string) bool {
 	return ok
 }
 
-// ResolveThemeConfig merges manifest `config_schema` defaults with persisted `ThemeConfigs[themeID]`.
+func themeConfigSecretAAD(themeID, key string) string {
+	return "theme.config:" + strings.TrimSpace(themeID) + ":" + strings.TrimSpace(key)
+}
+
+// ResolveThemeConfig merges manifest `config_schema` defaults with persisted `ThemeConfigs[themeID]`,
+// decrypting any at-rest `"enc:v1:..."` envelopes for `type: "secret"` fields.
 func (e *Engine) ResolveThemeConfig(themeID string, saved map[string]map[string]any) map[string]any {
 	e.mu.RLock()
 	th, ok := e.themes[themeID]
@@ -984,8 +1058,10 @@ func (e *Engine) ResolveThemeConfig(themeID string, saved map[string]map[string]
 	if th != nil {
 		schema = th.manifest.ConfigSchema
 	}
+	sealer := e.sealer
 	e.mu.RUnlock()
 
+	secrets := e.secretKeySet(themeID)
 	out := make(map[string]any, len(schema)+4)
 	for _, field := range schema {
 		if field.Key != "" && field.Default != nil {
@@ -995,9 +1071,114 @@ func (e *Engine) ResolveThemeConfig(themeID string, saved map[string]map[string]
 	if saved != nil {
 		if perTheme, exists := saved[themeID]; exists {
 			for k, v := range perTheme {
+				if _, isSecret := secrets[k]; isSecret {
+					if s, isStr := v.(string); isStr && strings.HasPrefix(s, "enc:v1:") {
+						if sealer != nil {
+							if pt, err := sealer.OpenString(s, themeConfigSecretAAD(themeID, k)); err == nil {
+								out[k] = pt
+								continue
+							}
+						}
+						out[k] = ""
+						continue
+					}
+				}
 				out[k] = v
 			}
 		}
+	}
+	return out
+}
+
+func (e *Engine) secretKeySet(themeID string) map[string]struct{} {
+	e.mu.RLock()
+	th := e.themes[strings.TrimSpace(themeID)]
+	var schema []ConfigField
+	if th != nil {
+		schema = th.manifest.ConfigSchema
+	}
+	e.mu.RUnlock()
+	if len(schema) == 0 {
+		return nil
+	}
+	var keys map[string]struct{}
+	for _, f := range schema {
+		if strings.EqualFold(f.Type, "secret") && f.Key != "" {
+			if keys == nil {
+				keys = make(map[string]struct{})
+			}
+			keys[f.Key] = struct{}{}
+		}
+	}
+	return keys
+}
+
+// RedactThemeConfig returns a shallow copy of cfg with non-empty `"secret"` fields masked as `"********"`.
+func (e *Engine) RedactThemeConfig(themeID string, cfg map[string]any) map[string]any {
+	if len(cfg) == 0 {
+		return nil
+	}
+	secrets := e.secretKeySet(themeID)
+	out := make(map[string]any, len(cfg))
+	for k, v := range cfg {
+		if _, isSecret := secrets[k]; isSecret && isNonEmptySecretValue(v) {
+			out[k] = SecretMask
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// RedactAllThemeConfigs returns a copy of per-theme configs with `"secret"` fields masked as `"********"`.
+func (e *Engine) RedactAllThemeConfigs(configs map[string]map[string]any) map[string]map[string]any {
+	if len(configs) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]any, len(configs))
+	for id, cfg := range configs {
+		out[id] = e.RedactThemeConfig(id, cfg)
+	}
+	return out
+}
+
+// MergeThemeConfigSecrets preserves existing `"secret"` values when incoming submits `SecretMask` (`"********"`)
+// and seals new plaintext `"secret"` strings with AES-256-GCM when a `SecretSealer` is configured.
+func (e *Engine) MergeThemeConfigSecrets(themeID string, incoming, existing map[string]any) map[string]any {
+	if len(incoming) == 0 {
+		return nil
+	}
+	e.mu.RLock()
+	sealer := e.sealer
+	e.mu.RUnlock()
+
+	secrets := e.secretKeySet(themeID)
+	out := make(map[string]any, len(incoming))
+	for k, v := range incoming {
+		if _, isSecret := secrets[k]; isSecret {
+			if s, ok := v.(string); ok {
+				if s == SecretMask {
+					if existing != nil {
+						if prev, exists := existing[k]; exists {
+							out[k] = prev
+							continue
+						}
+					}
+					continue
+				}
+				if s == "__VOLO_CLEAR_SECRET__" || strings.TrimSpace(s) == "" {
+					out[k] = ""
+					continue
+				}
+				if !strings.HasPrefix(s, "enc:v1:") && sealer != nil {
+					if sealed, err := sealer.SealString(s, themeConfigSecretAAD(themeID, k)); err == nil {
+						out[k] = sealed
+						continue
+					}
+				}
+			}
+		}
+		out[k] = v
 	}
 	return out
 }
@@ -1137,7 +1318,7 @@ func (e *Engine) RenderWithFallback(w http.ResponseWriter, status int, themeID s
 	e.prependVendorHeadSlot(&data)
 
 	entryTemplate := selected
-	if tmpl.Lookup("content") != nil && tmpl.Lookup("layout") != nil {
+	if tmpl.Lookup("layout") != nil && (tmpl.Lookup("content") != nil || hasEmptyTemplateRoot(tmpl.Lookup(selected))) {
 		entryTemplate = "layout"
 	}
 
@@ -1403,7 +1584,7 @@ func validateThemeConfigSchema(schema []ConfigField) ([]ConfigField, error) {
 			ft = "text"
 		}
 		switch ft {
-		case "text", "string", "textarea", "url", "color", "image", "boolean", "number", "select", "sortable_list":
+		case "text", "string", "secret", "textarea", "url", "color", "image", "boolean", "number", "select", "sortable_list":
 		default:
 			return nil, fmt.Errorf("theme.json config_schema[%q] unsupported type %q", f.Key, f.Type)
 		}
@@ -1411,6 +1592,21 @@ func validateThemeConfigSchema(schema []ConfigField) ([]ConfigField, error) {
 		out[i] = f
 	}
 	return out, nil
+}
+
+func hasEmptyTemplateRoot(t *template.Template) bool {
+	if t == nil || t.Tree == nil || t.Tree.Root == nil {
+		return true
+	}
+	for _, node := range t.Tree.Root.Nodes {
+		if txt, ok := node.(*parse.TextNode); ok {
+			if strings.TrimSpace(string(txt.Text)) == "" {
+				continue
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func (e *Engine) validateStagedThemeFS(fsys fs.FS, fallbackFS fs.FS, fallbackTheme *loadedTheme) (Manifest, error) {

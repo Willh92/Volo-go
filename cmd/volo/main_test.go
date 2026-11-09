@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,9 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/doctor"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/repo"
+	"github.com/Willh92/Volo-go/internal/security"
+	"github.com/Willh92/Volo-go/internal/server"
 )
 
 func TestCLISwissArmyKnifeEndToEnd(t *testing.T) {
@@ -200,3 +204,146 @@ func writeMinimalLegacyZip(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+func TestPersistedDirPrecedenceAndGeoCloser(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	dataDir := filepath.Join(tmp, "data")
+	envUploadDir := filepath.Join(tmp, "env-uploads")
+	envGeoDir := filepath.Join(tmp, "env-geoip")
+	dbUploadDir := filepath.Join(tmp, "db-uploads")
+	dbGeoDir := filepath.Join(tmp, "db-geoip")
+	for _, d := range []string{envUploadDir, envGeoDir, dbUploadDir, dbGeoDir} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	envFile := filepath.Join(tmp, "custom.env")
+	envContent := "VOLO_DATA_DIR=" + dataDir + "\nVOLO_UPLOAD_DIR=" + envUploadDir + "\nVOLO_GEOIP_DIR=" + envGeoDir + "\n"
+	if err := os.WriteFile(envFile, []byte(envContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load config with .env pinning VOLO_UPLOAD_DIR and VOLO_GEOIP_DIR.
+	cfgPinned, err := config.LoadWithEnviron(config.CLIOverrides{EnvFile: envFile}, nil)
+	if err != nil {
+		t.Fatalf("LoadWithEnviron(.env): %v", err)
+	}
+	if !cfgPinned.IsUploadDirPinned() || !cfgPinned.IsGeoIPDirPinned() {
+		t.Fatalf("expected UploadDirPinned=true and GeoIPDirPinned=true from .env")
+	}
+
+	store, err := openMigratedStore(ctx, cfgPinned)
+	if err != nil {
+		t.Fatalf("openMigratedStore: %v", err)
+	}
+	defer store.Close()
+
+	settingsMgr := repo.NewSettingsManager(store, cfgPinned.KeyRing, cfgPinned.DefaultLocale)
+	if _, err := settingsMgr.Reload(ctx); err != nil {
+		t.Fatalf("settings Reload: %v", err)
+	}
+	storagePatch, _ := json.Marshal(map[string]any{"local_dir": dbUploadDir})
+	if _, _, err := settingsMgr.PatchDomain(ctx, domain.SettingsDomainStorage, storagePatch, 0); err != nil {
+		t.Fatalf("PatchDomain(storage): %v", err)
+	}
+	securityPatch, _ := json.Marshal(map[string]any{"geoip_dir": dbGeoDir})
+	if _, _, err := settingsMgr.PatchDomain(ctx, domain.SettingsDomainSecurity, securityPatch, 0); err != nil {
+		t.Fatalf("PatchDomain(security): %v", err)
+	}
+
+	fsEmpty := flag.NewFlagSet("test", flag.ContinueOnError)
+	applyPersistedUploadDir(ctx, cfgPinned, store, settingsMgr, fsEmpty)
+	applyPersistedGeoIPDir(ctx, cfgPinned, store, settingsMgr, fsEmpty)
+
+	if cfgPinned.GetUploadDir() != envUploadDir {
+		t.Fatalf(".env VOLO_UPLOAD_DIR was overwritten by DB setting: got %q, want %q", cfgPinned.GetUploadDir(), envUploadDir)
+	}
+	if cfgPinned.GetGeoIPDir() != envGeoDir {
+		t.Fatalf(".env VOLO_GEOIP_DIR was overwritten by DB setting: got %q, want %q", cfgPinned.GetGeoIPDir(), envGeoDir)
+	}
+
+	// Verify unpinned config DOES adopt persisted DB settings when neither CLI, OS ENV, nor .env pins them.
+	cfgUnpinned, err := config.LoadWithEnviron(config.CLIOverrides{
+		EnvFile: filepath.Join(tmp, "nonexistent.env"),
+		DataDir: &dataDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf("LoadWithEnviron(unpinned): %v", err)
+	}
+	if cfgUnpinned.IsUploadDirPinned() || cfgUnpinned.IsGeoIPDirPinned() {
+		t.Fatalf("expected unpinned dirs when only DataDir is overridden")
+	}
+	applyPersistedUploadDir(ctx, cfgUnpinned, store, settingsMgr, fsEmpty)
+	applyPersistedGeoIPDir(ctx, cfgUnpinned, store, settingsMgr, fsEmpty)
+	if cfgUnpinned.GetUploadDir() != dbUploadDir {
+		t.Fatalf("expected unpinned UploadDir to adopt DB setting %q, got %q", dbUploadDir, cfgUnpinned.GetUploadDir())
+	}
+	if cfgUnpinned.GetGeoIPDir() != dbGeoDir {
+		t.Fatalf("expected unpinned GeoIPDir to adopt DB setting %q, got %q", dbGeoDir, cfgUnpinned.GetGeoIPDir())
+	}
+
+	// Verify closeGeoEngineFromDeps closes GeoEngine cleanly without panicking on active or nil Geo.
+	geo := security.NewGeoEngine(dbGeoDir, settingsMgr)
+	closeGeoEngineFromDeps(server.AppDeps{Geo: geo})
+	closeGeoEngineFromDeps(server.AppDeps{})
+}
+
+func TestCLIBackupCreateAndRestoreIncludesPluginsAndThemes(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	srcData := filepath.Join(tmp, "src-data")
+	srcPlugins := filepath.Join(tmp, "src-plugins")
+	srcThemes := filepath.Join(tmp, "src-themes")
+
+	if err := os.MkdirAll(filepath.Join(srcPlugins, "demo-plug"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "demo-plug", "manifest.json"), []byte(`{"id":"demo-plug","version":"1.0.0"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(srcThemes, "demo-theme"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcThemes, "demo-theme", "theme.json"), []byte(`{"id":"demo-theme","version":"1.0.0"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	archiveZip := filepath.Join(tmp, "with-ext.zip")
+	var out, errBuf bytes.Buffer
+	code := runCLI(ctx, []string{
+		"backup", "create",
+		"--data-dir", srcData,
+		"--plugins-dir", srcPlugins,
+		"--themes-dir", srcThemes,
+		"--output", archiveZip,
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("volo backup create failed (code=%d): %s", code, errBuf.String())
+	}
+
+	dstData := filepath.Join(tmp, "dst-data")
+	dstPlugins := filepath.Join(tmp, "dst-plugins")
+	dstThemes := filepath.Join(tmp, "dst-themes")
+	out.Reset()
+	errBuf.Reset()
+	code = runCLI(ctx, []string{
+		"backup", "restore", archiveZip,
+		"--data-dir", dstData,
+		"--plugins-dir", dstPlugins,
+		"--themes-dir", dstThemes,
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("volo backup restore failed (code=%d): %s", code, errBuf.String())
+	}
+	if _, err := os.Stat(filepath.Join(dstPlugins, "demo-plug", "manifest.json")); err != nil {
+		t.Fatalf("expected restored plugin manifest.json: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstThemes, "demo-theme", "theme.json")); err != nil {
+		t.Fatalf("expected restored theme.json: %v", err)
+	}
+}
+

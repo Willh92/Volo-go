@@ -128,18 +128,11 @@ func TestLanguagePackExtensionLifecycleAndZhTWBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twFileRaw, err := os.ReadFile(filepath.Join(repoRoot, "locales", "zh-TW.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var pubZh, admZh, twMap map[string]string
+	var pubZh, admZh map[string]string
 	if err := json.Unmarshal(pubZhRaw, &pubZh); err != nil {
 		t.Fatal(err)
 	}
 	if err := json.Unmarshal(admZhRaw, &admZh); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(twFileRaw, &twMap); err != nil {
 		t.Fatal(err)
 	}
 	expectedTW := make(map[string]string, len(pubZh)+len(admZh))
@@ -158,17 +151,55 @@ func TestLanguagePackExtensionLifecycleAndZhTWBundle(t *testing.T) {
 		}
 		expectedTW[mapped] = v
 	}
+	twFileRaw, err := os.ReadFile(filepath.Join(repoRoot, "locales", "zh-TW.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var twMap map[string]string
+	if err := json.Unmarshal(twFileRaw, &twMap); err != nil {
+		t.Fatal(err)
+	}
 	for k, zhVal := range expectedTW {
 		twVal, ok := twMap[k]
 		if !ok || strings.TrimSpace(twVal) == "" {
-			t.Fatalf("locales/zh-TW.json missing or empty key %q", k)
+			t.Errorf("locales/zh-TW.json missing or empty key %q (zh-CN=%q)", k, zhVal)
+			continue
 		}
 		zhVars := placeholderRe.FindAllString(zhVal, -1)
 		twVars := placeholderRe.FindAllString(twVal, -1)
 		sort.Strings(zhVars)
 		sort.Strings(twVars)
 		if strings.Join(zhVars, ",") != strings.Join(twVars, ",") {
-			t.Fatalf("locales/zh-TW.json placeholder mismatch on %q: zh=%v vs tw=%v", k, zhVars, twVars)
+			t.Errorf("locales/zh-TW.json placeholder mismatch on %q: zh=%v vs tw=%v", k, zhVars, twVars)
+		}
+	}
+
+	if !shippedCat.Has("ja-JP") {
+		t.Fatalf("expected shipped locales/ja-JP.json to register ja-JP")
+	}
+	jaFileRaw, err := os.ReadFile(filepath.Join(repoRoot, "locales", "ja-JP.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jaMap map[string]string
+	if err := json.Unmarshal(jaFileRaw, &jaMap); err != nil {
+		t.Fatal(err)
+	}
+	for k, zhVal := range pubZh {
+		if strings.HasPrefix(k, "meta.") {
+			continue
+		}
+		jaVal, ok := jaMap[k]
+		if !ok || strings.TrimSpace(jaVal) == "" {
+			t.Errorf("locales/ja-JP.json missing or empty public key %q (zh-CN=%q)", k, zhVal)
+			continue
+		}
+		zhVars := placeholderRe.FindAllString(zhVal, -1)
+		jaVars := placeholderRe.FindAllString(jaVal, -1)
+		sort.Strings(zhVars)
+		sort.Strings(jaVars)
+		if strings.Join(zhVars, ",") != strings.Join(jaVars, ",") {
+			t.Errorf("locales/ja-JP.json placeholder mismatch on %q: zh=%v vs ja=%v", k, zhVars, jaVars)
 		}
 	}
 

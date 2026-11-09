@@ -48,7 +48,7 @@ func TestRound3_IsMobileRequest_And_StaffDeviceOverride(t *testing.T) {
 	}
 	for _, id := range []string{"desk-skin", "mob-skin"} {
 		zb := buildTestThemeZip(t, map[string]string{
-			"theme.json": `{"id":"` + id + `","name":{"en":"` + id + `"},"version":"1.0.0","author":"test"}`,
+			"theme.json":           `{"id":"` + id + `","name":{"en":"` + id + `"},"version":"1.0.0","author":"test"}`,
 			"templates/index.html": `{{define "content"}}<div>` + id + `</div>{{end}}`,
 		})
 		if _, err := eng.InstallZip(bytes.NewReader(zb), int64(len(zb)), true); err != nil {
@@ -146,7 +146,7 @@ func TestRound3_ActiveChapterNeedsMermaid_And_ProseHTMLLockLoginNext(t *testing.
 	})
 
 	zb := buildTestThemeZip(t, map[string]string{
-		"theme.json": `{"id":"probe-mermaid","name":{"en":"Probe"},"version":"1.0.0","author":"Volo"}`,
+		"theme.json":                 `{"id":"probe-mermaid","name":{"en":"Probe"},"version":"1.0.0","author":"Volo"}`,
 		"templates/book_reader.html": `{{define "content"}}<div class="probe-prose">{{proseHTML .ActiveChapterHTML .CurrentPath .RawQuery}}</div>{{end}}`,
 	})
 	if _, err := eng.InstallZip(bytes.NewReader(zb), int64(len(zb)), true); err != nil {

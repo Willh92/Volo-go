@@ -198,11 +198,18 @@ func unlockedPasswordsDigest(pwds map[string]bool) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-func cardCacheKey(raw domain.RawArticle, locale string, hasDims bool) string {
-	return fmt.Sprintf("card|%s|%d|%s|%s|d=%t", raw.ID, raw.UpdatedAt, articleDigestHex(raw), locale, hasDims)
+func cardCacheKey(raw domain.RawArticle, locale string, hasDims bool, salt string) string {
+	if salt == "" {
+		return fmt.Sprintf("card|%s|%d|%s|%s|d=%t", raw.ID, raw.UpdatedAt, articleDigestHex(raw), locale, hasDims)
+	}
+	return fmt.Sprintf("card|%s|%d|%s|%s|d=%t|s=%s", raw.ID, raw.UpdatedAt, articleDigestHex(raw), locale, hasDims, salt)
 }
 
-func outputCacheKey(raw domain.RawArticle, mode render.RenderMode, locale string, unlocked bool, bypass bool, pwds map[string]bool, isReader bool, lineNums bool, hasDims bool) string {
-	return fmt.Sprintf("out|%s|%d|%s|%s|%s|u=%t|b=%t|p=%s|r=%t|ln=%t|d=%t",
-		raw.ID, raw.UpdatedAt, articleDigestHex(raw), mode, locale, unlocked, bypass, unlockedPasswordsDigest(pwds), isReader, lineNums, hasDims)
+func outputCacheKey(raw domain.RawArticle, mode render.RenderMode, locale string, unlocked bool, bypass bool, pwds map[string]bool, isReader bool, lineNums bool, hasDims bool, salt string) string {
+	if salt == "" {
+		return fmt.Sprintf("out|%s|%d|%s|%s|%s|u=%t|b=%t|p=%s|r=%t|ln=%t|d=%t",
+			raw.ID, raw.UpdatedAt, articleDigestHex(raw), mode, locale, unlocked, bypass, unlockedPasswordsDigest(pwds), isReader, lineNums, hasDims)
+	}
+	return fmt.Sprintf("out|%s|%d|%s|%s|%s|u=%t|b=%t|p=%s|r=%t|ln=%t|d=%t|s=%s",
+		raw.ID, raw.UpdatedAt, articleDigestHex(raw), mode, locale, unlocked, bypass, unlockedPasswordsDigest(pwds), isReader, lineNums, hasDims, salt)
 }

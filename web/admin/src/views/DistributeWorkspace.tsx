@@ -241,6 +241,8 @@ export function DistributeWorkspace({
   const [followPreviewOpen, setFollowPreviewOpen] = useState(false);
   const [followGroups, setFollowGroups] = useState<any[]>([]);
   const [followPreviewLoading, setFollowPreviewLoading] = useState(false);
+  const [followPreviewQuery, setFollowPreviewQuery] = useState("");
+  const [followPreviewPage, setFollowPreviewPage] = useState(1);
   const [opmlImportOpen, setOpmlImportOpen] = useState(false);
   const [opmlData, setOpmlData] = useState("");
   const [importingOpml, setImportingOpml] = useState(false);
@@ -254,6 +256,9 @@ export function DistributeWorkspace({
   const [whDelivModal, setWhDelivModal] = useState<{
     webhook: any;
     items: any[];
+    total: number;
+    page: number;
+    serverPaged: boolean;
     loading: boolean;
   } | null>(null);
   const [expandedDelivId, setExpandedDelivId] = useState<string | null>(null);
@@ -404,8 +409,9 @@ export function DistributeWorkspace({
         setFeedVer(s.versions?.feed || 0);
         setSeoCfg(s.domains?.seo || {});
         setSeoVer(s.versions?.seo || 0);
-        if (s.domains?.storage?.driver) {
-          storageDriverSig.value = s.domains.storage.driver;
+        const activeStorageDrv = s.domains?.storage?.active_driver || s.domains?.storage?.driver;
+        if (activeStorageDrv) {
+          storageDriverSig.value = activeStorageDrv;
         }
       }
     } catch (err: any) {
@@ -789,6 +795,8 @@ export function DistributeWorkspace({
   };
 
   const openFollowPreview = async () => {
+    setFollowPreviewQuery("");
+    setFollowPreviewPage(1);
     setFollowPreviewOpen(true);
     setFollowPreviewLoading(true);
     try {
@@ -829,12 +837,33 @@ export function DistributeWorkspace({
     }
   };
 
-  const openWebhookDeliveries = async (w: any) => {
+  const openWebhookDeliveries = async (w: any, page = 1) => {
     setExpandedDelivId(null);
-    setWhDelivModal({ webhook: w, items: [], loading: true });
+    setWhDelivModal((prev) => {
+      const sameWh = Boolean(prev && prev.webhook?.id === w.id);
+      return {
+        webhook: w,
+        items: sameWh && prev ? prev.items : [],
+        total: sameWh && prev ? prev.total : 0,
+        page,
+        serverPaged: sameWh && prev ? prev.serverPaged : false,
+        loading: true,
+      };
+    });
     try {
-      const r = await apiFetch<{ items?: any[] }>(`/api/admin/webhooks/${encodeURIComponent(w.id)}/deliveries`);
-      setWhDelivModal({ webhook: w, items: r.items || [], loading: false });
+      const r = await apiFetch<{ items?: any[]; total?: number }>(
+        `/api/admin/webhooks/${encodeURIComponent(w.id)}/deliveries?page=${page}&per_page=20`
+      );
+      const list = r.items || [];
+      const serverPaged = typeof r.total === "number" && list.length <= 20;
+      setWhDelivModal({
+        webhook: w,
+        items: list,
+        total: serverPaged ? Number(r.total) : list.length,
+        page,
+        serverPaged,
+        loading: false,
+      });
     } catch (err: any) {
       showToast(err.message, "err");
       setWhDelivModal((prev) => (prev ? { ...prev, loading: false } : null));
@@ -850,8 +879,22 @@ export function DistributeWorkspace({
         { method: "POST", body: "{}" }
       );
       showToast(t("dist.wh_replayed"), "ok");
-      const r = await apiFetch<{ items?: any[] }>(`/api/admin/webhooks/${encodeURIComponent(wId)}/deliveries`);
-      setWhDelivModal((prev) => (prev ? { ...prev, items: r.items || [] } : null));
+      const curPage = whDelivModal?.page || 1;
+      const r = await apiFetch<{ items?: any[]; total?: number }>(
+        `/api/admin/webhooks/${encodeURIComponent(wId)}/deliveries?page=${curPage}&per_page=20`
+      );
+      const list = r.items || [];
+      const serverPaged = typeof r.total === "number" && list.length <= 20;
+      setWhDelivModal((prev) =>
+        prev
+          ? {
+              ...prev,
+              items: list,
+              total: serverPaged ? Number(r.total) : list.length,
+              serverPaged,
+            }
+          : null
+      );
       void loadSub();
     } catch (err: any) {
       showToast(err.message, "err");
@@ -2230,7 +2273,7 @@ export function DistributeWorkspace({
                   onInput={(e) => setBatchCatName((e.currentTarget as HTMLInputElement).value)}
                 />
                 {knownLinkCategories.length > 0 && (
-                  <div class="volo-tag-pool" style={{ marginTop: "8px" }}>
+                  <div class="volo-tag-pool" style={{ marginTop: "8px", maxHeight: "140px", overflowY: "auto" }}>
                     {knownLinkCategories.map((c) => (
                       <button
                         key={c}
@@ -2688,32 +2731,78 @@ export function DistributeWorkspace({
             ) : followGroups.length === 0 || followGroups.every((g) => !(g.items || []).length && !g.url) ? (
               <ConsoleEmpty />
             ) : (
-              <div>
-                {followGroups.map((g, idx) => {
-                  const fl = g.follow || g;
-                  const entries: any[] = Array.isArray(g.items) ? g.items : g.url ? [g] : [];
-                  if (!entries.length) return null;
-                  return (
-                    <div key={fl.id || idx} class="volo-subcard">
-                      <div class="volo-subcard-title">
-                        <span>{fl.title || fl.feed_url}</span>
-                        <span class="volo-mini-tag">{entries.length}</span>
-                      </div>
-                      {entries.slice(0, 8).map((it: any) => (
-                        <div key={it.id || it.url} class="volo-cell-main" style={{ padding: "6px 0", borderTop: "1px dashed var(--volo-line)" }}>
-                          <div class="volo-cell-title">
-                            <a href={it.url} target="_blank" rel="noreferrer">
-                              {it.title || it.url}
-                            </a>
-                            {it.published_at > 0 && <span class="volo-help">{formatDateTime(it.published_at)}</span>}
-                          </div>
-                          {it.summary && <div class="volo-help">{it.summary}</div>}
-                        </div>
-                      ))}
+              (() => {
+                const q = followPreviewQuery.trim().toLowerCase();
+                const validGroups = followGroups
+                  .map((g) => {
+                    const fl = g.follow || g;
+                    const rawEntries: any[] = Array.isArray(g.items) ? g.items : g.url ? [g] : [];
+                    if (!rawEntries.length) return null;
+                    if (!q) return { fl, entries: rawEntries };
+                    const groupMatches =
+                      String(fl.title || "").toLowerCase().includes(q) ||
+                      String(fl.feed_url || "").toLowerCase().includes(q);
+                    if (groupMatches) return { fl, entries: rawEntries };
+                    const matchedEntries = rawEntries.filter(
+                      (it: any) =>
+                        String(it.title || "").toLowerCase().includes(q) ||
+                        String(it.url || "").toLowerCase().includes(q) ||
+                        String(it.summary || "").toLowerCase().includes(q)
+                    );
+                    return matchedEntries.length > 0 ? { fl, entries: matchedEntries } : null;
+                  })
+                  .filter(Boolean) as { fl: any; entries: any[] }[];
+                const pagedGroups = paginateItems(validGroups, followPreviewPage, 10);
+                return (
+                  <div>
+                    <div class="volo-field" style={{ marginBottom: "12px" }}>
+                      <input
+                        class="volo-input"
+                        autoComplete="off"
+                        placeholder={t("dist.follows_preview_search_ph")}
+                        value={followPreviewQuery}
+                        onInput={(e) => {
+                          setFollowPreviewQuery((e.currentTarget as HTMLInputElement).value);
+                          setFollowPreviewPage(1);
+                        }}
+                      />
                     </div>
-                  );
-                })}
-              </div>
+                    {validGroups.length === 0 ? (
+                      <ConsoleEmpty />
+                    ) : (
+                      <>
+                        {pagedGroups.slice.map(({ fl, entries }, idx) => (
+                          <div key={fl.id || idx} class="volo-subcard">
+                            <div class="volo-subcard-title">
+                              <span>{fl.title || fl.feed_url}</span>
+                              <span class="volo-mini-tag">{entries.length}</span>
+                            </div>
+                            {entries.slice(0, 8).map((it: any) => (
+                              <div key={it.id || it.url} class="volo-cell-main" style={{ padding: "6px 0", borderTop: "1px dashed var(--volo-line)" }}>
+                                <div class="volo-cell-title">
+                                  <a href={it.url} target="_blank" rel="noreferrer">
+                                    {it.title || it.url}
+                                  </a>
+                                  {it.published_at > 0 && <span class="volo-help">{formatDateTime(it.published_at)}</span>}
+                                </div>
+                                {it.summary && <div class="volo-help">{it.summary}</div>}
+                              </div>
+                            ))}
+                          </div>
+                        ))}
+                        {validGroups.length > 10 && (
+                          <Pagination
+                            total={validGroups.length}
+                            page={pagedGroups.safePage}
+                            pageSize={10}
+                            onChange={(p) => setFollowPreviewPage(p)}
+                          />
+                        )}
+                      </>
+                    )}
+                  </div>
+                );
+              })()
             )}
           </AnimatedModal>
         </div>
@@ -3053,72 +3142,94 @@ export function DistributeWorkspace({
             ) : !whDelivModal?.items?.length ? (
               <ConsoleEmpty text={t("dist.wh_deliveries_empty")} />
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                {whDelivModal.items.map((d: any) => {
-                  const isOk = Boolean(d.success) || (d.status_code >= 200 && d.status_code < 400);
-                  const isExp = expandedDelivId === d.id;
-                  return (
-                    <div key={d.id} class="volo-subcard" style={{ margin: 0 }}>
-                      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px", justifyContent: "space-between" }}>
-                        <div class="volo-cell-meta">
-                          <span class={`volo-status-pill ${isOk ? "ok" : "danger"}`}>
-                            <span class="volo-status-dot" />
-                            {d.status_code > 0 ? `HTTP ${d.status_code}` : isOk ? "OK" : "ERR"}
-                          </span>
-                          <span class="volo-code-chip">{d.event || "event"}</span>
-                          {d.duration_ms >= 0 && <span class="volo-help">{d.duration_ms}ms</span>}
-                          <span class="volo-help">{formatDateTime(d.created_at)}</span>
+              (() => {
+                const delivItems = whDelivModal.serverPaged
+                  ? whDelivModal.items
+                  : paginateItems(whDelivModal.items, whDelivModal.page, 20).slice;
+                return (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                    {delivItems.map((d: any) => {
+                      const isOk = Boolean(d.success) || (d.status_code >= 200 && d.status_code < 400);
+                      const isExp = expandedDelivId === d.id;
+                      return (
+                        <div key={d.id} class="volo-subcard" style={{ margin: 0 }}>
+                          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px", justifyContent: "space-between" }}>
+                            <div class="volo-cell-meta">
+                              <span class={`volo-status-pill ${isOk ? "ok" : "danger"}`}>
+                                <span class="volo-status-dot" />
+                                {d.status_code > 0 ? `HTTP ${d.status_code}` : isOk ? "OK" : "ERR"}
+                              </span>
+                              <span class="volo-code-chip">{d.event || "event"}</span>
+                              {d.duration_ms >= 0 && <span class="volo-help">{d.duration_ms}ms</span>}
+                              <span class="volo-help">{formatDateTime(d.created_at)}</span>
+                            </div>
+                            <div class="volo-row-actions">
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={() => setExpandedDelivId(isExp ? null : d.id)}
+                              >
+                                {isExp ? t("common.close") : t("common.view")}
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                disabled={replayingDelivId === d.id}
+                                onClick={() => void replayWebhookDelivery(whDelivModal.webhook.id, d.id)}
+                              >
+                                {t("dist.wh_replay")}
+                              </button>
+                            </div>
+                          </div>
+                          {d.error_text && (
+                            <div class="volo-help" style={{ color: "var(--volo-danger)", marginTop: "4px", overflowWrap: "anywhere" }}>
+                              {d.error_text}
+                            </div>
+                          )}
+                          {isExp && (
+                            <pre
+                              style={{
+                                marginTop: "8px",
+                                marginBottom: 0,
+                                padding: "10px",
+                                borderRadius: "8px",
+                                background: "var(--volo-raised)",
+                                fontSize: "12px",
+                                maxHeight: "240px",
+                                overflow: "auto",
+                                whiteSpace: "pre-wrap",
+                                overflowWrap: "anywhere",
+                              }}
+                            >
+                              {[
+                                d.payload_json ? `Payload:\n${d.payload_json}` : "",
+                                d.response_body ? `Response:\n${d.response_body}` : "",
+                              ]
+                                .filter(Boolean)
+                                .join("\n\n") || "—"}
+                            </pre>
+                          )}
                         </div>
-                        <div class="volo-row-actions">
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            onClick={() => setExpandedDelivId(isExp ? null : d.id)}
-                          >
-                            {isExp ? t("common.close") : t("common.view")}
-                          </button>
-                          <button
-                            type="button"
-                            class="volo-act-btn"
-                            disabled={replayingDelivId === d.id}
-                            onClick={() => void replayWebhookDelivery(whDelivModal.webhook.id, d.id)}
-                          >
-                            {t("dist.wh_replay")}
-                          </button>
-                        </div>
-                      </div>
-                      {d.error_text && (
-                        <div class="volo-help" style={{ color: "var(--volo-danger)", marginTop: "4px", overflowWrap: "anywhere" }}>
-                          {d.error_text}
-                        </div>
-                      )}
-                      {isExp && (
-                        <pre
-                          style={{
-                            marginTop: "8px",
-                            marginBottom: 0,
-                            padding: "10px",
-                            borderRadius: "8px",
-                            background: "var(--volo-raised)",
-                            fontSize: "12px",
-                            maxHeight: "240px",
-                            overflow: "auto",
-                            whiteSpace: "pre-wrap",
-                            overflowWrap: "anywhere",
-                          }}
-                        >
-                          {[
-                            d.payload_json ? `Payload:\n${d.payload_json}` : "",
-                            d.response_body ? `Response:\n${d.response_body}` : "",
-                          ]
-                            .filter(Boolean)
-                            .join("\n\n") || "—"}
-                        </pre>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+                      );
+                    })}
+                    {whDelivModal.total > 20 && (
+                      <Pagination
+                        total={whDelivModal.total}
+                        page={whDelivModal.page}
+                        pageSize={20}
+                        onChange={(nextPage) => {
+                          setExpandedDelivId(null);
+                          if (whDelivModal.serverPaged) {
+                            void openWebhookDeliveries(whDelivModal.webhook, nextPage);
+                          } else {
+                            setWhDelivModal((prev) => (prev ? { ...prev, page: nextPage } : null));
+                          }
+                        }}
+                      />
+                    )}
+                  </div>
+                );
+              })()
             )}
           </AnimatedModal>
         </div>
@@ -3145,112 +3256,167 @@ export function DistributeWorkspace({
             </div>
           </div>
 
-          <div class="volo-grid-2">
-            <div class="volo-card">
-              <div class="volo-sec-head">
-                <div class="volo-sec-copy">
-                  <h3 class="volo-card-title">{t("dist.feed_head")}</h3>
-                  <p class="volo-sec-desc">{t("dist.feed_desc")}</p>
-                </div>
+          <div class="volo-card">
+            <div class="volo-sec-head">
+              <div class="volo-sec-copy">
+                <h3 class="volo-card-title">{t("dist.feed_head")}</h3>
+                <p class="volo-sec-desc">{t("dist.feed_desc")}</p>
               </div>
-              <div class="volo-grid-2">
-                <div class="volo-field">
-                  <label>{t("dist.feed_mode")}</label>
-                  <ConsoleSelect
-                    searchable={false}
-                    value={feedCfg.output_mode || "summary"}
-                    onChange={(val) => setFeedCfg({ ...feedCfg, output_mode: val })}
-                    options={[
-                      { value: "summary", label: t("dist.feed_mode_summary") },
-                      { value: "full", label: t("dist.feed_mode_full") },
-                    ]}
-                  />
-                </div>
-                <div class="volo-field">
-                  <label>{t("dist.feed_count")}</label>
-                  <input
-                    type="number"
-                    class="volo-input"
-                    value={feedCfg.item_count ?? 20}
-                    onInput={(e) => setFeedCfg({ ...feedCfg, item_count: Number((e.currentTarget as HTMLInputElement).value) })}
-                  />
-                </div>
+            </div>
+            <div class="volo-grid-2">
+              <div class="volo-field">
+                <label>{t("dist.feed_mode")}</label>
+                <ConsoleSelect
+                  searchable={false}
+                  value={feedCfg.output_mode || "summary"}
+                  onChange={(val) => setFeedCfg({ ...feedCfg, output_mode: val })}
+                  options={[
+                    { value: "summary", label: t("dist.feed_mode_summary") },
+                    { value: "full", label: t("dist.feed_mode_full") },
+                  ]}
+                />
               </div>
+              <div class="volo-field">
+                <label>{t("dist.feed_count")}</label>
+                <input
+                  type="number"
+                  class="volo-input"
+                  value={feedCfg.item_count ?? 20}
+                  onInput={(e) => setFeedCfg({ ...feedCfg, item_count: Number((e.currentTarget as HTMLInputElement).value) })}
+                />
+              </div>
+            </div>
 
-              <div class="volo-check-grid">
-                <SwitchToggle
-                  checked={!!feedCfg.enable_llms_txt}
-                  onChange={(v) => setFeedCfg({ ...feedCfg, enable_llms_txt: v })}
-                  label={t("dist.feed_llms")}
-                />
-                <SwitchToggle
-                  checked={!!feedCfg.enable_raw_markdown}
-                  onChange={(v) => setFeedCfg({ ...feedCfg, enable_raw_markdown: v })}
-                  label={t("dist.feed_raw_md")}
-                />
-                <SwitchToggle
-                  checked={!!feedCfg.podcast?.enabled}
-                  onChange={(v) => setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), enabled: v } })}
-                  label={t("dist.feed_podcast")}
-                />
-                {!!feedCfg.podcast?.enabled && (
-                  <SwitchToggle
-                    checked={!!feedCfg.podcast?.explicit}
-                    onChange={(v) => setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), explicit: v } })}
-                    label={t("dist.podcast_explicit")}
-                  />
-                )}
-              </div>
-
+            <div class="volo-check-grid">
+              <SwitchToggle
+                checked={!!feedCfg.enable_llms_txt}
+                onChange={(v) => setFeedCfg({ ...feedCfg, enable_llms_txt: v })}
+                label={t("dist.feed_llms")}
+              />
+              <SwitchToggle
+                checked={!!feedCfg.enable_raw_markdown}
+                onChange={(v) => setFeedCfg({ ...feedCfg, enable_raw_markdown: v })}
+                label={t("dist.feed_raw_md")}
+              />
+              <SwitchToggle
+                checked={!!feedCfg.podcast?.enabled}
+                onChange={(v) => setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), enabled: v } })}
+                label={t("dist.feed_podcast")}
+              />
               {!!feedCfg.podcast?.enabled && (
-                <div class="volo-subcard">
-                  <div class="volo-subcard-title">{t("dist.podcast_meta")}</div>
-                  <div class="volo-grid-2">
-                    <div class="volo-field">
-                      <label>{t("dist.lbl_pod_title")}</label>
-                      <input
-                        class="volo-input"
-                        placeholder={t("dist.podcast_title_ph")}
-                        value={feedCfg.podcast?.title || ""}
-                        onInput={(e) =>
-                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), title: (e.currentTarget as HTMLInputElement).value } })
-                        }
-                      />
-                    </div>
-                    <div class="volo-field">
-                      <label>{t("dist.lbl_pod_author")}</label>
-                      <input
-                        class="volo-input"
-                        placeholder={t("dist.podcast_author_ph")}
-                        value={feedCfg.podcast?.author || ""}
-                        onInput={(e) =>
-                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), author: (e.currentTarget as HTMLInputElement).value } })
-                        }
-                      />
-                    </div>
-                    <div class="volo-field">
-                      <label>{t("dist.lbl_pod_email")}</label>
-                      <input
-                        class="volo-input"
-                        placeholder={t("dist.podcast_email_ph")}
-                        value={feedCfg.podcast?.owner_email || ""}
-                        onInput={(e) =>
-                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), owner_email: (e.currentTarget as HTMLInputElement).value } })
-                        }
-                      />
-                    </div>
-                    <div class="volo-field">
-                      <label>{t("dist.lbl_pod_cat")}</label>
-                      <input
-                        class="volo-input"
-                        placeholder={t("dist.podcast_cat_ph")}
-                        value={feedCfg.podcast?.category || ""}
-                        onInput={(e) =>
-                          setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), category: (e.currentTarget as HTMLInputElement).value } })
-                        }
-                      />
-                    </div>
+                <SwitchToggle
+                  checked={!!feedCfg.podcast?.explicit}
+                  onChange={(v) => setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), explicit: v } })}
+                  label={t("dist.podcast_explicit")}
+                />
+              )}
+            </div>
+
+            {!!feedCfg.podcast?.enabled && (
+              <div class="volo-subcard">
+                <div class="volo-subcard-title">{t("dist.podcast_meta")}</div>
+                <div class="volo-grid-3">
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_title")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_title_ph")}
+                      value={feedCfg.podcast?.title || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), title: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
                   </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_subtitle")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_subtitle_ph")}
+                      value={feedCfg.podcast?.subtitle || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), subtitle: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_author")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_author_ph")}
+                      value={feedCfg.podcast?.author || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), author: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_owner")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_owner_ph")}
+                      value={feedCfg.podcast?.owner_name || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), owner_name: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_email")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_email_ph")}
+                      value={feedCfg.podcast?.owner_email || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), owner_email: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_lang")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_lang_ph")}
+                      value={feedCfg.podcast?.language || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), language: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_cat")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_cat_ph")}
+                      value={feedCfg.podcast?.category || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), category: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_subcat")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_subcat_ph")}
+                      value={feedCfg.podcast?.sub_category || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), sub_category: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                  <div class="volo-field">
+                    <label>{t("dist.lbl_pod_copy")}</label>
+                    <input
+                      class="volo-input"
+                      placeholder={t("dist.podcast_copy_ph")}
+                      value={feedCfg.podcast?.copyright || ""}
+                      onInput={(e) =>
+                        setFeedCfg({ ...feedCfg, podcast: { ...(feedCfg.podcast || {}), copyright: (e.currentTarget as HTMLInputElement).value } })
+                      }
+                    />
+                  </div>
+                </div>
+                <div class="volo-grid-2">
                   <div class="volo-field">
                     <label>{t("dist.lbl_pod_cover")}</label>
                     <div class="volo-input-row">
@@ -3289,43 +3455,45 @@ export function DistributeWorkspace({
                     />
                   </div>
                 </div>
-              )}
+              </div>
+            )}
 
-              <div class="volo-form-actions">
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-primary"
-                  disabled={savingFeed}
-                  onClick={async () => {
-                    if (savingFeed) return;
-                    setSavingFeed(true);
-                    try {
-                      const res = await apiFetch<any>("/api/admin/settings/feed", {
-                        method: "PATCH",
-                        body: JSON.stringify({ expected_version: feedVer, ...feedCfg }),
-                      });
-                      setFeedCfg(res.value || feedCfg);
-                      setFeedVer(res.version);
-                      showToast(t("common.saved"));
-                    } catch (err: any) {
-                      showToast(err.message);
-                    } finally {
-                      setSavingFeed(false);
-                    }
-                  }}
-                >
-                  {t("dist.save_feed")}
-                </button>
+            <div class="volo-form-actions">
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary"
+                disabled={savingFeed}
+                onClick={async () => {
+                  if (savingFeed) return;
+                  setSavingFeed(true);
+                  try {
+                    const res = await apiFetch<any>("/api/admin/settings/feed", {
+                      method: "PATCH",
+                      body: JSON.stringify({ expected_version: feedVer, ...feedCfg }),
+                    });
+                    setFeedCfg(res.value || feedCfg);
+                    setFeedVer(res.version);
+                    showToast(t("common.saved"));
+                  } catch (err: any) {
+                    showToast(err.message);
+                  } finally {
+                    setSavingFeed(false);
+                  }
+                }}
+              >
+                {t("dist.save_feed")}
+              </button>
+            </div>
+          </div>
+
+          <div class="volo-card">
+            <div class="volo-sec-head">
+              <div class="volo-sec-copy">
+                <h3 class="volo-card-title">{t("dist.seo_head")}</h3>
+                <p class="volo-sec-desc">{t("dist.seo_sub")}</p>
               </div>
             </div>
-
-            <div class="volo-card">
-              <div class="volo-sec-head">
-                <div class="volo-sec-copy">
-                  <h3 class="volo-card-title">{t("dist.seo_head")}</h3>
-                  <p class="volo-sec-desc">{t("dist.seo_sub")}</p>
-                </div>
-              </div>
+            <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("dist.seo_kw")}</label>
                 <TokenListInput
@@ -3334,15 +3502,6 @@ export function DistributeWorkspace({
                     .map((s) => s.trim())
                     .filter(Boolean)}
                   onChange={(next) => setSeoCfg({ ...seoCfg, meta_keywords: next.join(", ") })}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("dist.seo_desc")}</label>
-                <textarea
-                  class="volo-textarea"
-                  rows={3}
-                  value={seoCfg.meta_description || ""}
-                  onInput={(e) => setSeoCfg({ ...seoCfg, meta_description: (e.currentTarget as HTMLTextAreaElement).value })}
                 />
               </div>
               <div class="volo-field">
@@ -3356,8 +3515,19 @@ export function DistributeWorkspace({
                   <MediaPickButton filterKind="image" onPick={(u) => setSeoCfg({ ...seoCfg, default_og_image_url: u })} />
                 </div>
               </div>
+            </div>
+            <div class="volo-field">
+              <label>{t("dist.seo_desc")}</label>
+              <textarea
+                class="volo-textarea"
+                rows={2}
+                value={seoCfg.meta_description || ""}
+                onInput={(e) => setSeoCfg({ ...seoCfg, meta_description: (e.currentTarget as HTMLTextAreaElement).value })}
+              />
+            </div>
 
-              <div class="volo-subcard">
+            <div class="volo-grid-2">
+              <div class="volo-subcard" style={{ marginBottom: 0 }}>
                 <div class="volo-subcard-title">
                   <span>{t("dist.seo_indexnow_title")}</span>
                   {!!seoCfg.indexnow_enabled && (
@@ -3393,7 +3563,7 @@ export function DistributeWorkspace({
                   label={t("dist.seo_indexnow_on")}
                 />
                 {!!seoCfg.indexnow_enabled && (
-                  <div class="volo-field" style={{ marginTop: "12px" }}>
+                  <div class="volo-field" style={{ marginTop: "12px", marginBottom: 0 }}>
                     <label>{t("dist.seo_indexnow_key")}</label>
                     <div class="volo-input-row">
                       <input
@@ -3409,7 +3579,7 @@ export function DistributeWorkspace({
                 )}
               </div>
 
-              <div class="volo-subcard">
+              <div class="volo-subcard" style={{ marginBottom: 0 }}>
                 <div class="volo-subcard-title">
                   <span>{t("dist.seo_gh_title")}</span>
                   <button type="button" class="volo-act-btn" onClick={() => switchDistSub("github")}>
@@ -3418,17 +3588,17 @@ export function DistributeWorkspace({
                 </div>
                 <div class="volo-help">{t("dist.seo_gh_hint")}</div>
               </div>
+            </div>
 
-              <div class="volo-form-actions">
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-primary"
-                  disabled={savingSeo}
-                  onClick={() => void saveSeoSettings(false)}
-                >
-                  {t("dist.save_seo")}
-                </button>
-              </div>
+            <div class="volo-form-actions">
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary"
+                disabled={savingSeo}
+                onClick={() => void saveSeoSettings(false)}
+              >
+                {t("dist.save_seo")}
+              </button>
             </div>
           </div>
         </div>

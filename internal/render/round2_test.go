@@ -245,4 +245,3 @@ func TestGitHubAlertsCJKH5H6HeroLCPAndMarkdownLexer(t *testing.T) {
 		t.Fatalf("markdown code block `- list item` was mis-highlighted as diff deletion:\n%s", out.HTML)
 	}
 }
-

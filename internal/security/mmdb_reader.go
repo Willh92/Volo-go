@@ -20,16 +20,16 @@ const (
 )
 
 type mmdbGeoRecord struct {
-	CountryISO      string
-	CountryZH       string
-	CountryEN       string
-	SubdivisionZH   string
-	SubdivisionEN   string
-	CityZH          string
-	CityEN          string
-	RegCountryISO   string
-	RegCountryZH    string
-	RegCountryEN    string
+	CountryISO    string
+	CountryZH     string
+	CountryEN     string
+	SubdivisionZH string
+	SubdivisionEN string
+	CityZH        string
+	CityEN        string
+	RegCountryISO string
+	RegCountryZH  string
+	RegCountryEN  string
 }
 
 // mmdbReader is a zero-mmap, zero-reflection, thread-safe MaxMind DB v2.0 binary reader
@@ -122,9 +122,9 @@ func (r *mmdbReader) Close() error {
 func (r *mmdbReader) parseMetadata(metaBytes []byte) error {
 	br := bytes.NewReader(metaBytes)
 	cur := mmdbCursor{
-		ra:       br,
-		limit:    int64(len(metaBytes)),
-		baseOff:  0,
+		ra:      br,
+		limit:   int64(len(metaBytes)),
+		baseOff: 0,
 	}
 	typeNum, mapLen, nextOff, err := cur.readControl(0, 0)
 	if err != nil {

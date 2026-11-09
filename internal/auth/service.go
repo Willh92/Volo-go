@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
@@ -325,12 +326,14 @@ func (s *Service) CompleteStaff2FA(
 		return nil, "", err
 	}
 
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, claims.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, claims.UserID)
 	if err != nil || u.Status != domain.UserStatusActive {
 		return nil, "", ErrUnauthorized
 	}
 
-	totpCred, err := sqlx.Get[domain.UserCredential](ctx, s.store,
+	var totpCred domain.UserCredential
+	err = sqlx.GetInto(ctx, s.store, &totpCred,
 		`SELECT * FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, u.ID)
 	if err != nil {
 		return nil, "", ErrTOTPInvalid
@@ -363,7 +366,8 @@ func (s *Service) CompleteStaff2FA(
 		// Attempt single-use Recovery Code consumption inside a transaction
 		consumed := false
 		_ = s.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-			rcRow, qErr := sqlx.Get[domain.UserCredential](ctx, tx,
+			var rcRow domain.UserCredential
+			qErr := sqlx.GetInto(ctx, tx, &rcRow,
 				`SELECT * FROM user_credentials WHERE user_id = ? AND kind = 'recovery_codes'`, u.ID)
 			if qErr != nil {
 				return qErr
@@ -505,7 +509,8 @@ func (s *Service) LoginWithPasskey(
 	geoRegion string,
 	userAgent string,
 ) (*LoginResult, error) {
-	cred, err := sqlx.Get[domain.UserCredential](ctx, s.store,
+	var cred domain.UserCredential
+	err := sqlx.GetInto(ctx, s.store, &cred,
 		`SELECT * FROM user_credentials WHERE kind = 'passkey' AND credential_id = ?`,
 		strings.TrimSpace(credentialIDB64URL))
 	if err != nil {
@@ -526,7 +531,8 @@ func (s *Service) LoginWithPasskey(
 		return nil, err
 	}
 
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, cred.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, cred.UserID)
 	if err != nil || u.Status != domain.UserStatusActive || (u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor) {
 		return nil, ErrForbidden
 	}
@@ -642,6 +648,46 @@ func (s *Service) issueReaderVerificationCodeAt(email string, now time.Time) (st
 	return code, nil
 }
 
+// ValidateUsername enforces safe username length and forbids '@', '/', '\', whitespace, and control characters.
+func ValidateUsername(username string) error {
+	uname := strings.TrimSpace(username)
+	if len(uname) < 2 || len(uname) > 48 {
+		return errors.New("auth: username must be 2-48 characters")
+	}
+	for _, r := range uname {
+		if r == '@' || r == '/' || r == '\\' || r < 0x20 || r == 0x7f || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return errors.New("auth: username must not contain '@', '/', '\\', whitespace, or control characters")
+		}
+	}
+	return nil
+}
+
+// EnsureUsernameNotMatchingEmail rejects any username that matches an existing user's email address.
+func (s *Service) EnsureUsernameNotMatchingEmail(ctx context.Context, username string, excludeUserID string) error {
+	uname := strings.TrimSpace(username)
+	if uname == "" {
+		return errors.New("auth: username is required")
+	}
+	var existingID string
+	var err error
+	if strings.TrimSpace(excludeUserID) != "" {
+		err = s.store.QueryRowContext(ctx,
+			`SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id <> ? LIMIT 1`,
+			uname, strings.TrimSpace(excludeUserID)).Scan(&existingID)
+	} else {
+		err = s.store.QueryRowContext(ctx,
+			`SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1`,
+			uname).Scan(&existingID)
+	}
+	if err == nil && existingID != "" {
+		return errors.New("auth: username conflicts with an existing email address")
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return nil
+}
+
 // RegisterReader verifies the 6-digit email code and creates an isolated role="reader" account.
 func (s *Service) RegisterReader(
 	ctx context.Context,
@@ -653,8 +699,8 @@ func (s *Service) RegisterReader(
 ) (*domain.User, error) {
 	normEmail := strings.ToLower(strings.TrimSpace(email))
 	uname := strings.TrimSpace(username)
-	if len(uname) < 2 || len(uname) > 48 {
-		return nil, errors.New("auth: username must be 2-48 characters")
+	if err := ValidateUsername(uname); err != nil {
+		return nil, err
 	}
 	if err := ValidatePasswordPolicy(rawPassword); err != nil {
 		return nil, err
@@ -687,6 +733,9 @@ func (s *Service) RegisterReader(
 	delete(s.pendingCodes, key)
 	s.codeMu.Unlock()
 
+	if err := s.EnsureUsernameNotMatchingEmail(ctx, uname, ""); err != nil {
+		return nil, err
+	}
 	pwHash, err := HashPassword(rawPassword)
 	if err != nil {
 		return nil, err
@@ -842,12 +891,14 @@ func (s *Service) AuthenticateSession(ctx context.Context, rawToken string) (*do
 	tokHash := hashOpaqueToken(trimmed)
 	now := time.Now().UnixMilli()
 
-	sess, err := sqlx.Get[domain.UserSession](ctx, s.store,
+	var sess domain.UserSession
+	err := sqlx.GetInto(ctx, s.store, &sess,
 		`SELECT * FROM user_sessions WHERE token_hash = ? AND expires_at > ?`, tokHash, now)
 	if err != nil {
 		return nil, nil, ErrUnauthorized
 	}
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, sess.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, sess.UserID)
 	if err != nil || u.Status != domain.UserStatusActive {
 		return nil, nil, ErrUnauthorized
 	}
@@ -860,7 +911,8 @@ func (s *Service) AuthenticateSession(ctx context.Context, rawToken string) (*do
 }
 
 func (s *Service) ListUserSessions(ctx context.Context, userID string) ([]domain.UserSession, error) {
-	rows, err := sqlx.Select[domain.UserSession](ctx, s.store,
+	var rows []domain.UserSession
+	err := sqlx.SelectInto(ctx, s.store, &rows,
 		`SELECT id, user_id, '' AS token_hash, ip_masked, geo_region, user_agent, totp_verified_until, expires_at, last_seen_at, created_at
 		 FROM user_sessions WHERE user_id = ? AND expires_at > ? ORDER BY last_seen_at DESC`,
 		userID, time.Now().UnixMilli())
@@ -994,7 +1046,8 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 		return nil, nil, ErrUnauthorized
 	}
 	tokHash := hashOpaqueToken(trimmed)
-	rec, err := sqlx.Get[domain.APIToken](ctx, s.store,
+	var rec domain.APIToken
+	err := sqlx.GetInto(ctx, s.store, &rec,
 		`SELECT * FROM api_tokens WHERE token_hash = ?`, tokHash)
 	if err != nil {
 		return nil, nil, ErrUnauthorized
@@ -1007,6 +1060,13 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 	var scopes []string
 	if json.Unmarshal([]byte(rec.ScopesJSON), &scopes) != nil {
 		return nil, nil, ErrForbidden
+	}
+	requiresAdminRole := requiredScope == ScopeBackupRead || strings.EqualFold(requiredScope, "admin")
+	for _, sc := range scopes {
+		if sc == ScopeBackupRead || strings.EqualFold(sc, "admin") {
+			requiresAdminRole = true
+			break
+		}
 	}
 	if requiredScope != "" {
 		hasScope := false
@@ -1021,11 +1081,16 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 		}
 	}
 
-	u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT * FROM users WHERE id = ?`, rec.UserID)
+	var u domain.User
+	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, rec.UserID)
 	if err != nil || u.Status != domain.UserStatusActive {
 		return nil, nil, ErrUnauthorized
 	}
-	if err := RequireStaff(&u); err != nil {
+	if requiresAdminRole {
+		if err := RequireAdmin(&u); err != nil {
+			return nil, nil, err
+		}
+	} else if err := RequireStaff(&u); err != nil {
 		return nil, nil, err
 	}
 	if now-rec.LastUsedAt > 60_000 {
@@ -1053,15 +1118,31 @@ func (s *Service) findUserByIdent(ctx context.Context, ident string) (domain.Use
 	if clean == "" {
 		return domain.User{}, sql.ErrNoRows
 	}
-	return sqlx.Get[domain.User](ctx, s.store,
-		`SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
-		clean, clean)
+	var u domain.User
+	if strings.Contains(clean, "@") {
+		err := sqlx.GetInto(ctx, s.store, &u,
+			`SELECT * FROM users WHERE LOWER(email) = LOWER(?)`,
+			clean)
+		if err == nil {
+			return u, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return domain.User{}, err
+		}
+	}
+	if err := sqlx.GetInto(ctx, s.store, &u,
+		`SELECT * FROM users WHERE LOWER(username) = LOWER(?)`,
+		clean); err != nil {
+		return domain.User{}, err
+	}
+	return u, nil
 }
 
 func (s *Service) activeTOTPSecretCiphertext(ctx context.Context, userID string) (string, bool, error) {
-	rows, err := sqlx.Select[struct {
+	var rows []struct {
 		SecretCiphertext string `db:"secret_ciphertext"`
-	}](ctx, s.store, `SELECT secret_ciphertext FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, userID)
+	}
+	err := sqlx.SelectInto(ctx, s.store, &rows, `SELECT secret_ciphertext FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, userID)
 	if err != nil {
 		return "", false, err
 	}

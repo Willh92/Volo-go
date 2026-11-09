@@ -35,7 +35,7 @@
     {{end}}
     <div class="studio-posts">
       {{range .ArticleCards}}
-        {{template "article_card" (dict "Card" . "Locale" $.Locale)}}
+        {{template "article_card" (dict "Card" . "Locale" $.Locale "ListStyle" $.Reading.ListStyle "Reading" $.Reading)}}
       {{else}}
         {{template "empty_state" (dict "Title" (t .Locale "studio.empty_title") "Desc" (t .Locale "studio.empty_desc"))}}
       {{end}}

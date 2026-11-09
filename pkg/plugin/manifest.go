@@ -35,6 +35,7 @@ const (
 	HookCommentModerated    = "comment.moderated"
 	HookRenderPreMarkdown   = "render.pre_markdown"
 	HookRenderPostHTML      = "render.post_html"
+	HookRenderDirective     = "render.directive"
 )
 
 // Standard UI slots.
@@ -51,6 +52,7 @@ const (
 	SlotAdminDashboardCard   = "admin.dashboard_card"
 
 	ClearSecretSentinel = "__VOLO_CLEAR_SECRET__"
+	SecretMaskSentinel  = "********"
 )
 
 var validPluginIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,62}$`)
@@ -120,7 +122,7 @@ type CronSpec struct {
 // ConfigField describes a single field in a plugin's declarative configuration form.
 type ConfigField struct {
 	Key         string            `json:"key"`
-	Type        string            `json:"type"` // string | text | textarea | number | boolean | select | url | color | image | sortable_list
+	Type        string            `json:"type"` // string | text | textarea | secret | number | boolean | select | url | color | image | sortable_list
 	Secret      bool              `json:"secret,omitempty"`
 	Required    bool              `json:"required,omitempty"`
 	Default     any               `json:"default,omitempty"`
@@ -133,6 +135,11 @@ type ConfigField struct {
 	Placeholder map[string]string `json:"placeholder,omitempty"`
 	Description map[string]string `json:"description,omitempty"`
 	Help        map[string]string `json:"help,omitempty"`
+}
+
+// IsSecret reports whether this config field stores sensitive secret material.
+func (f ConfigField) IsSecret() bool {
+	return f.Secret || strings.EqualFold(strings.TrimSpace(f.Type), "secret")
 }
 
 // SelectOption represents an option for a "select" ConfigField.
@@ -281,7 +288,10 @@ func (m *Manifest) Validate() error {
 
 		f.Type = strings.ToLower(strings.TrimSpace(f.Type))
 		switch f.Type {
-		case "string", "text", "textarea", "number", "boolean", "select", "url", "color", "image", "sortable_list":
+		case "string", "text", "textarea", "secret", "number", "boolean", "select", "url", "color", "image", "sortable_list":
+			if f.Type == "secret" {
+				f.Secret = true
+			}
 		default:
 			return fmt.Errorf("plugin %q: config field %q has unsupported type %q", m.ID, k, f.Type)
 		}
@@ -368,13 +378,17 @@ func validatePermissionToken(perm string) error {
 		return nil
 	case p == "ui:slots" || (strings.HasPrefix(p, "slots:") && allowedSlotNames[strings.TrimPrefix(p, "slots:")]):
 		return nil
-	case p == "hooks:*":
+	case p == "hooks:*" || p == "hooks:render.*":
 		return nil
 	case strings.HasPrefix(p, "hooks:"):
 		target := strings.TrimPrefix(p, "hooks:")
 		if !validHookNameRe.MatchString(target) {
 			return fmt.Errorf("invalid hooks permission target %q", target)
 		}
+		return nil
+	case p == "render" || p == "render:*" || p == "render:directive" || p == "render:directives":
+		return nil
+	case p == "federation" || p == "federation:*" || p == "provider:federation":
 		return nil
 	case p == "http:routes" || p == "http:outbound" || p == "net:http" || p == "http:raw_headers" || p == "raw_headers":
 		return nil
@@ -434,6 +448,43 @@ func (m *Manifest) CanWriteKV() bool {
 func (m *Manifest) CanUseHook(hookName string) bool {
 	if m.HasPermission("hooks:*") || m.HasPermission("hooks:"+hookName) {
 		return true
+	}
+	if strings.HasPrefix(hookName, "render.") {
+		if m.HasPermission("render") || m.HasPermission("render:*") || m.HasPermission("hooks:render.*") {
+			return true
+		}
+		if hookName == HookRenderDirective && (m.HasPermission("render:directive") || m.HasPermission("render:directives")) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasRenderCapability reports whether the plugin declares markdown/HTML/directive render capabilities.
+func (m *Manifest) HasRenderCapability() bool {
+	if m.HasPermission("render") || m.HasPermission("render:*") ||
+		m.HasPermission("render:directive") || m.HasPermission("render:directives") ||
+		m.HasPermission("hooks:render.*") ||
+		m.CanUseHook(HookRenderPreMarkdown) || m.CanUseHook(HookRenderPostHTML) || m.CanUseHook(HookRenderDirective) {
+		return true
+	}
+	for _, h := range m.Hooks {
+		if strings.HasPrefix(strings.TrimSpace(h), "render.") {
+			return true
+		}
+	}
+	return false
+}
+
+// HasFederationCapability reports whether the plugin declares federation delivery/publishing capabilities.
+func (m *Manifest) HasFederationCapability() bool {
+	if m.HasPermission("federation") || m.HasPermission("federation:*") || m.HasPermission("provider:federation") {
+		return true
+	}
+	for _, h := range m.Hooks {
+		if strings.HasPrefix(strings.TrimSpace(h), "federation.") {
+			return true
+		}
 	}
 	return false
 }
@@ -508,8 +559,8 @@ func ResolveLocalized(m map[string]string, locale string) string {
 }
 
 // ValidateAndMergeConfig validates an incoming partial/full config patch against ConfigSchema,
-// preserving existing public fields and existing secrets when secret inputs are omitted/empty
-// (unless listed in incoming["__clear_secrets"]).
+// preserving existing public fields and existing secrets when secret inputs are omitted, empty,
+// or equal to SecretMaskSentinel ("********"), unless listed in incoming["__clear_secrets"].
 func (m *Manifest) ValidateAndMergeConfig(
 	incoming map[string]any,
 	existingPublic map[string]any,
@@ -543,7 +594,7 @@ func (m *Manifest) ValidateAndMergeConfig(
 	schemaByKey := make(map[string]ConfigField, len(m.ConfigSchema))
 	for _, f := range m.ConfigSchema {
 		schemaByKey[f.Key] = f
-		if f.Secret {
+		if f.IsSecret() {
 			if clearSet[f.Key] {
 				delete(mergedSecrets, f.Key)
 			}
@@ -575,14 +626,15 @@ func (m *Manifest) ValidateAndMergeConfig(
 		if !ok {
 			return nil, nil, fmt.Errorf("plugin %q: unknown config key %q", m.ID, k)
 		}
-		if field.Secret {
+		if field.IsSecret() {
 			strVal, sOk := rawVal.(string)
 			if !sOk {
 				return nil, nil, fmt.Errorf("plugin %q: secret field %q must be a string", m.ID, k)
 			}
-			if clearSet[k] || strings.TrimSpace(strVal) == ClearSecretSentinel {
+			trimmed := strings.TrimSpace(strVal)
+			if clearSet[k] || trimmed == ClearSecretSentinel {
 				delete(mergedSecrets, k)
-			} else if strings.TrimSpace(strVal) != "" {
+			} else if strVal != SecretMaskSentinel && trimmed != SecretMaskSentinel && trimmed != "" {
 				mergedSecrets[k] = strVal
 			}
 			continue
@@ -599,7 +651,7 @@ func (m *Manifest) ValidateAndMergeConfig(
 		if !f.Required {
 			continue
 		}
-		if f.Secret {
+		if f.IsSecret() {
 			if strings.TrimSpace(mergedSecrets[f.Key]) == "" {
 				return nil, nil, fmt.Errorf("plugin %q: required secret %q is not set", m.ID, f.Key)
 			}

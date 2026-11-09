@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	maxThemeZipFiles     = 512
-	maxThemeTotalBytes   = 32 << 20 // 32 MiB
-	maxThemeSingleBytes  = 8 << 20  // 8 MiB
+	maxThemeZipFiles    = 512
+	maxThemeTotalBytes  = 32 << 20 // 32 MiB
+	maxThemeSingleBytes = 8 << 20  // 8 MiB
 )
 
 var validThemeIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,62}$`)
@@ -282,40 +282,47 @@ func (e *Engine) ExportZip(w io.Writer, themeID string) error {
 		if strings.HasPrefix(baseName, ".") {
 			return nil
 		}
-		data, rErr := fs.ReadFile(th.fsys, p)
-		if rErr != nil {
-			return rErr
-		}
-		for _, pair := range [][2]string{{"assets_gz/", "assets/"}, {"templates_gz/", "templates/"}} {
+		for _, pair := range [][2]string{
+			{"assets_gz/", "assets/"},
+			{"templates_gz/", "templates/"},
+			{"locales_gz/", "locales/"},
+		} {
 			if strings.HasPrefix(p, pair[0]) && strings.HasSuffix(p, ".gz") {
 				relOut := pair[1] + strings.TrimSuffix(strings.TrimPrefix(p, pair[0]), ".gz")
-				if _, exists := entriesByPath[relOut]; !exists {
-					gr, gErr := gzip.NewReader(bytes.NewReader(data))
-					if gErr == nil {
-						inflated, iErr := io.ReadAll(io.LimitReader(gr, maxThemeSingleBytes))
-						_ = gr.Close()
-						if iErr == nil {
-							entriesByPath[relOut] = inflated
-							return nil
-						}
-					}
+				if _, exists := entriesByPath[relOut]; exists {
+					return nil
 				}
+				data, rErr := fs.ReadFile(th.fsys, p)
+				if rErr != nil {
+					return rErr
+				}
+				inflated, gErr := inflateThemeGzip(data, p)
+				if gErr != nil {
+					return gErr
+				}
+				entriesByPath[relOut] = inflated
 				return nil
 			}
 		}
-		if !strings.Contains(p, "/") && strings.HasSuffix(p, ".gz") {
+		if strings.HasSuffix(p, ".gz") {
 			relOut := strings.TrimSuffix(p, ".gz")
-			if _, exists := entriesByPath[relOut]; !exists {
-				if gr, gErr := gzip.NewReader(bytes.NewReader(data)); gErr == nil {
-					inflated, iErr := io.ReadAll(io.LimitReader(gr, maxThemeSingleBytes))
-					_ = gr.Close()
-					if iErr == nil {
-						entriesByPath[relOut] = inflated
-						return nil
-					}
-				}
+			if _, exists := entriesByPath[relOut]; exists {
+				return nil
 			}
+			data, rErr := fs.ReadFile(th.fsys, p)
+			if rErr != nil {
+				return rErr
+			}
+			inflated, gErr := inflateThemeGzip(data, p)
+			if gErr != nil {
+				return gErr
+			}
+			entriesByPath[relOut] = inflated
 			return nil
+		}
+		data, rErr := fs.ReadFile(th.fsys, p)
+		if rErr != nil {
+			return rErr
 		}
 		entriesByPath[p] = data
 		return nil
@@ -351,4 +358,20 @@ func (e *Engine) ExportZip(w io.Writer, themeID string) error {
 		}
 	}
 	return zw.Close()
+}
+
+func inflateThemeGzip(data []byte, entryPath string) ([]byte, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decompress %s: %w", entryPath, err)
+	}
+	inflated, rErr := io.ReadAll(io.LimitReader(gr, maxThemeSingleBytes+1))
+	_ = gr.Close()
+	if rErr != nil {
+		return nil, fmt.Errorf("read %s: %w", entryPath, rErr)
+	}
+	if len(inflated) > maxThemeSingleBytes {
+		return nil, fmt.Errorf("theme entry %s exceeds %d bytes", entryPath, maxThemeSingleBytes)
+	}
+	return inflated, nil
 }

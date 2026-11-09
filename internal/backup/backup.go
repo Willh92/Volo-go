@@ -27,11 +27,13 @@ import (
 )
 
 const (
-	BackupFormatVersion  = "volo-backup-v1"
-	maxRestoreZipEntries = 250_000
-	maxSingleEntryBytes  = 512 * 1024 * 1024  // 512 MiB per stream guard against zip bombs
-	maxTotalRestoreBytes = 2048 * 1024 * 1024 // 2 GiB total unpacked cap
-	restoreBatchSize     = 200
+	BackupFormatVersion     = "volo-backup-v1"
+	maxRestoreZipEntries    = 250_000
+	maxSingleEntryBytes     = 512 * 1024 * 1024  // 512 MiB per stream guard against zip bombs
+	maxTotalRestoreBytes    = 2048 * 1024 * 1024 // 2 GiB total unpacked cap
+	maxExtensionSingleBytes = 32 * 1024 * 1024   // 32 MiB per extension file
+	maxExtensionTotalBytes  = 256 * 1024 * 1024  // 256 MiB total unpacked extensions cap
+	restoreBatchSize        = 200
 )
 
 func isBlockedRestoreUploadExt(p string) bool {
@@ -53,32 +55,41 @@ type FileDigest struct {
 
 // Manifest is stored as manifest.json inside every native Volo-go backup ZIP.
 type Manifest struct {
-	Format        string       `json:"format"`
-	SchemaVersion int          `json:"schema_version"`
-	SourceDialect string       `json:"source_dialect"`
-	CreatedAt     int64        `json:"created_at"`
-	IncludesMedia bool         `json:"includes_media"`
-	Files         []FileDigest `json:"files"`
+	Format             string       `json:"format"`
+	SchemaVersion      int          `json:"schema_version"`
+	SourceDialect      string       `json:"source_dialect"`
+	CreatedAt          int64        `json:"created_at"`
+	IncludesMedia      bool         `json:"includes_media"`
+	IncludesExtensions bool         `json:"includes_extensions,omitempty"`
+	Files              []FileDigest `json:"files"`
 }
 
 // CreateOptions configures streaming backup creation.
 type CreateOptions struct {
 	IncludeMedia bool
 	UploadDir    string
+	PluginsDir   string
+	ThemesDir    string
 }
 
 // RestoreOptions configures streaming cross-database backup restoration.
 type RestoreOptions struct {
-	DryRun    bool
-	UploadDir string
+	DryRun             bool
+	UploadDir          string
+	PluginsDir         string
+	ThemesDir          string
+	MaxEntries         int
+	MaxSingleFileBytes int64
+	MaxTotalBytes      int64
 }
 
-// RestoreSummary reports row counts and media files restored (or validated in DryRun).
+// RestoreSummary reports row counts, media files, and extension files restored (or validated in DryRun).
 type RestoreSummary struct {
-	SourceDialect string           `json:"source_dialect"`
-	Tables        map[string]int64 `json:"tables"`
-	MediaFiles    int              `json:"media_files"`
-	DryRun        bool             `json:"dry_run"`
+	SourceDialect  string           `json:"source_dialect"`
+	Tables         map[string]int64 `json:"tables"`
+	MediaFiles     int              `json:"media_files"`
+	ExtensionFiles int              `json:"extension_files,omitempty"`
+	DryRun         bool             `json:"dry_run"`
 }
 
 // CreateToFile streams a complete native backup archive directly to outputZipPath via a temporary file.
@@ -148,6 +159,30 @@ func Create(ctx context.Context, store *sqlx.Store, w io.Writer, opts CreateOpti
 			return nil, fmt.Errorf("backup: export media: %w", err)
 		}
 		manifest.Files = append(manifest.Files, mediaDigests...)
+	}
+
+	if strings.TrimSpace(opts.PluginsDir) != "" {
+		pluginDigests, err := streamExtensionsDirToZip(ctx, zw, opts.PluginsDir, "extensions/plugins")
+		if err != nil {
+			_ = zw.Close()
+			return nil, fmt.Errorf("backup: export plugins: %w", err)
+		}
+		if len(pluginDigests) > 0 {
+			manifest.IncludesExtensions = true
+			manifest.Files = append(manifest.Files, pluginDigests...)
+		}
+	}
+
+	if strings.TrimSpace(opts.ThemesDir) != "" {
+		themeDigests, err := streamExtensionsDirToZip(ctx, zw, opts.ThemesDir, "extensions/themes")
+		if err != nil {
+			_ = zw.Close()
+			return nil, fmt.Errorf("backup: export themes: %w", err)
+		}
+		if len(themeDigests) > 0 {
+			manifest.IncludesExtensions = true
+			manifest.Files = append(manifest.Files, themeDigests...)
+		}
 	}
 
 	mWriter, err := zw.CreateHeader(&zip.FileHeader{
@@ -267,6 +302,38 @@ func normalizeSQLValueForJSON(table string, col string, v any) any {
 	}
 }
 
+func shouldSkipBackupTempOrHidden(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" || strings.HasPrefix(lower, ".") {
+		return true
+	}
+	if strings.HasPrefix(lower, ".tmp") || strings.HasPrefix(lower, ".bak") ||
+		strings.HasSuffix(lower, ".tmp") || strings.HasSuffix(lower, ".bak") {
+		return true
+	}
+	return false
+}
+
+func isValidExtensionID(id string) bool {
+	if len(id) == 0 || len(id) > 64 || strings.HasPrefix(id, ".") {
+		return false
+	}
+	if shouldSkipBackupTempOrHidden(id) {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		if i > 0 && (c == '-' || c == '_' || c == '.') {
+			continue
+		}
+		return false
+	}
+	return !strings.Contains(id, "..")
+}
+
 func streamMediaDirToZip(ctx context.Context, zw *zip.Writer, uploadDir string) ([]FileDigest, error) {
 	info, err := os.Lstat(uploadDir)
 	if err != nil {
@@ -288,13 +355,26 @@ func streamMediaDirToZip(ctx context.Context, zw *zip.Writer, uploadDir string) 
 		if walkErr != nil {
 			return walkErr
 		}
-		if d.Type()&os.ModeSymlink != 0 {
+		linfo, sErr := os.Lstat(p)
+		if sErr != nil {
+			return sErr
+		}
+		if linfo.Mode()&os.ModeSymlink != 0 || d.Type()&os.ModeSymlink != 0 {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if d.IsDir() {
+		if p != realRoot && shouldSkipBackupTempOrHidden(filepath.Base(p)) {
+			if linfo.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if linfo.IsDir() {
+			return nil
+		}
+		if !linfo.Mode().IsRegular() {
 			return nil
 		}
 		rel, err := filepath.Rel(realRoot, p)
@@ -351,6 +431,186 @@ func streamMediaDirToZip(ctx context.Context, zw *zip.Writer, uploadDir string) 
 	return digests, nil
 }
 
+func streamExtensionsDirToZip(ctx context.Context, zw *zip.Writer, rootDir string, zipPrefix string) ([]FileDigest, error) {
+	info, err := os.Lstat(rootDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing symlinked extensions directory %q", rootDir)
+	}
+	if !info.IsDir() {
+		return nil, nil
+	}
+	realRoot, err := filepath.EvalSymlinks(rootDir)
+	if err != nil {
+		return nil, err
+	}
+
+	topEntries, err := os.ReadDir(realRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	var relFiles []string
+	for _, top := range topEntries {
+		extID := top.Name()
+		if !isValidExtensionID(extID) {
+			continue
+		}
+		extDir := filepath.Join(realRoot, extID)
+		extInfo, sErr := os.Lstat(extDir)
+		if sErr != nil || extInfo.Mode()&os.ModeSymlink != 0 || !extInfo.IsDir() {
+			continue
+		}
+
+		walkErr := filepath.WalkDir(extDir, func(p string, d fs.DirEntry, wErr error) error {
+			if wErr != nil {
+				return wErr
+			}
+			linfo, lErr := os.Lstat(p)
+			if lErr != nil {
+				return lErr
+			}
+			if linfo.Mode()&os.ModeSymlink != 0 || d.Type()&os.ModeSymlink != 0 {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if p != extDir && shouldSkipBackupTempOrHidden(filepath.Base(p)) {
+				if linfo.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if linfo.IsDir() {
+				return nil
+			}
+			if !linfo.Mode().IsRegular() {
+				return nil
+			}
+			rel, rErr := filepath.Rel(extDir, p)
+			if rErr != nil {
+				return rErr
+			}
+			relSlash := filepath.ToSlash(rel)
+			if strings.HasPrefix(relSlash, ".") || strings.Contains(relSlash, "/.") {
+				return nil
+			}
+			relFiles = append(relFiles, extID+"/"+relSlash)
+			return nil
+		})
+		if walkErr != nil {
+			return nil, walkErr
+		}
+	}
+
+	sort.Strings(relFiles)
+	digests := make([]FileDigest, 0, len(relFiles))
+	buf := make([]byte, 32*1024)
+	for _, rel := range relFiles {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		srcPath := filepath.Join(realRoot, filepath.FromSlash(rel))
+		linfo, lErr := os.Lstat(srcPath)
+		if lErr != nil || linfo.Mode()&os.ModeSymlink != 0 || !linfo.Mode().IsRegular() {
+			continue
+		}
+		f, oErr := os.Open(srcPath)
+		if oErr != nil {
+			return nil, oErr
+		}
+		entryPath := zipPrefix + "/" + rel
+		hdr := &zip.FileHeader{
+			Name:     entryPath,
+			Method:   zip.Deflate,
+			Modified: linfo.ModTime().UTC(),
+		}
+		hdr.SetMode(0o644)
+		zf, cErr := zw.CreateHeader(hdr)
+		if cErr != nil {
+			_ = f.Close()
+			return nil, cErr
+		}
+		hasher := sha256.New()
+		n, copyErr := io.CopyBuffer(io.MultiWriter(zf, hasher), f, buf)
+		_ = f.Close()
+		if copyErr != nil {
+			return nil, copyErr
+		}
+		digests = append(digests, FileDigest{
+			Path:   entryPath,
+			SHA256: hex.EncodeToString(hasher.Sum(nil)),
+			Bytes:  n,
+		})
+	}
+	return digests, nil
+}
+
+func sanitizeBackupZipEntryName(raw string, isDir bool) (string, error) {
+	if raw == "" || strings.ContainsRune(raw, 0) || strings.ContainsRune(raw, '\\') || strings.ContainsRune(raw, ':') {
+		return "", fmt.Errorf("backup: unsafe archive entry path %q rejected", raw)
+	}
+	if strings.HasPrefix(raw, "/") {
+		return "", fmt.Errorf("backup: absolute archive entry path %q rejected", raw)
+	}
+	trimmed := raw
+	if isDir {
+		trimmed = strings.TrimSuffix(trimmed, "/")
+		if trimmed == "" {
+			return ".", nil
+		}
+	} else if strings.HasSuffix(trimmed, "/") {
+		return "", fmt.Errorf("backup: trailing slash on regular entry %q rejected", raw)
+	}
+
+	parts := strings.Split(trimmed, "/")
+	for _, seg := range parts {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", fmt.Errorf("backup: path traversal entry %q rejected", raw)
+		}
+	}
+	clean := path.Clean(trimmed)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("backup: path traversal entry %q rejected", raw)
+	}
+	return clean, nil
+}
+
+func parseExtensionEntryPath(entryPath string) (kind string, extID string, relSlash string, skip bool, err error) {
+	var rest string
+	switch {
+	case strings.HasPrefix(entryPath, "extensions/plugins/"):
+		kind = "plugins"
+		rest = strings.TrimPrefix(entryPath, "extensions/plugins/")
+	case strings.HasPrefix(entryPath, "extensions/themes/"):
+		kind = "themes"
+		rest = strings.TrimPrefix(entryPath, "extensions/themes/")
+	default:
+		return "", "", "", false, fmt.Errorf("backup: invalid extension archive path %q", entryPath)
+	}
+	extID, relSlash, hasSlash := strings.Cut(rest, "/")
+	if !hasSlash || relSlash == "" || !isValidExtensionID(extID) {
+		return "", "", "", false, fmt.Errorf("backup: invalid extension identifier or path in %q", entryPath)
+	}
+	for _, seg := range strings.Split(relSlash, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", "", "", false, fmt.Errorf("backup: unsafe extension path %q", entryPath)
+		}
+		if shouldSkipBackupTempOrHidden(seg) {
+			return kind, extID, relSlash, true, nil
+		}
+	}
+	return kind, extID, relSlash, false, nil
+}
+
 // RestoreFromFile validates and streams a native Volo-go backup ZIP into the target Store
 // inside an atomic database transaction (supporting SQLite <-> PostgreSQL <-> MySQL migration).
 func RestoreFromFile(ctx context.Context, store *sqlx.Store, zipPath string, opts RestoreOptions) (*RestoreSummary, error) {
@@ -374,18 +634,39 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		return nil, fmt.Errorf("backup: invalid zip archive: %w", err)
 	}
 
-	if len(zr.File) > maxRestoreZipEntries {
-		return nil, fmt.Errorf("backup: archive exceeds maximum %d entries", maxRestoreZipEntries)
+	entryCap := maxRestoreZipEntries
+	if opts.MaxEntries > 0 {
+		entryCap = opts.MaxEntries
+	}
+	if len(zr.File) > entryCap {
+		return nil, fmt.Errorf("backup: archive exceeds maximum %d entries", entryCap)
+	}
+
+	singleCap := int64(maxSingleEntryBytes)
+	if opts.MaxSingleFileBytes > 0 {
+		singleCap = opts.MaxSingleFileBytes
+	}
+	totalCap := int64(maxTotalRestoreBytes)
+	if opts.MaxTotalBytes > 0 {
+		totalCap = opts.MaxTotalBytes
 	}
 
 	fileIndex := make(map[string]*zip.File, len(zr.File))
 	for _, zf := range zr.File {
-		clean := path.Clean(strings.TrimPrefix(zf.Name, "/"))
-		if clean == ".." || strings.HasPrefix(clean, "../") {
-			return nil, fmt.Errorf("backup: path traversal entry %q rejected", zf.Name)
+		mode := zf.Mode()
+		isDir := zf.FileInfo().IsDir()
+		if mode&os.ModeSymlink != 0 || (!isDir && !mode.IsRegular()) {
+			return nil, fmt.Errorf("backup: non-regular or symlink entry %q rejected", zf.Name)
 		}
-		if !zf.FileInfo().IsDir() && !zf.Mode().IsRegular() {
-			return nil, fmt.Errorf("backup: non-regular entry %q rejected", zf.Name)
+		clean, cErr := sanitizeBackupZipEntryName(zf.Name, isDir)
+		if cErr != nil {
+			return nil, cErr
+		}
+		if isDir {
+			continue
+		}
+		if _, dup := fileIndex[clean]; dup {
+			return nil, fmt.Errorf("backup: duplicate archive entry %q rejected", zf.Name)
 		}
 		fileIndex[clean] = zf
 	}
@@ -402,24 +683,53 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		return nil, fmt.Errorf("backup: unsupported archive format %q", manifest.Format)
 	}
 
-	// Pass 1: Verify SHA-256 checksums and total byte quota BEFORE touching DB or disk!
+	// Pass 1: Verify SHA-256 checksums, path safety, and byte quotas BEFORE touching DB or disk!
 	var totalBytes int64
+	var extensionBytes int64
 	expectedMap := make(map[string]FileDigest, len(manifest.Files))
 	for _, fd := range manifest.Files {
+		cleanDecl, dErr := sanitizeBackupZipEntryName(fd.Path, false)
+		if dErr != nil || cleanDecl != fd.Path {
+			return nil, fmt.Errorf("backup: invalid manifest file path %q", fd.Path)
+		}
 		if strings.HasPrefix(fd.Path, "uploads/") && isBlockedRestoreUploadExt(fd.Path) {
 			return nil, fmt.Errorf("backup: active script/markup media entry %q rejected", fd.Path)
 		}
+		entryMax := singleCap
+		isExt := strings.HasPrefix(fd.Path, "extensions/")
+		if isExt {
+			if _, _, _, _, eErr := parseExtensionEntryPath(fd.Path); eErr != nil {
+				return nil, eErr
+			}
+			if maxExtensionSingleBytes < entryMax {
+				entryMax = maxExtensionSingleBytes
+			}
+		}
+
 		zf, exists := fileIndex[fd.Path]
 		if !exists {
 			return nil, fmt.Errorf("backup: missing declared entry %q", fd.Path)
 		}
-		actualHash, actualBytes, err := verifyZipEntrySHA256(zf, maxSingleEntryBytes)
+		if zf.UncompressedSize64 > uint64(entryMax) {
+			return nil, fmt.Errorf("backup: entry %q uncompressed header size exceeds limit %d", fd.Path, entryMax)
+		}
+		actualHash, actualBytes, err := verifyZipEntrySHA256(zf, entryMax)
 		if err != nil {
 			return nil, fmt.Errorf("backup: verify %q: %w", fd.Path, err)
 		}
 		totalBytes += actualBytes
-		if totalBytes > maxTotalRestoreBytes {
+		if totalBytes > totalCap {
 			return nil, errors.New("backup: archive exceeds total unpacked safety limit")
+		}
+		if isExt {
+			extensionBytes += actualBytes
+			extTotalCap := int64(maxExtensionTotalBytes)
+			if totalCap < extTotalCap {
+				extTotalCap = totalCap
+			}
+			if extensionBytes > extTotalCap {
+				return nil, errors.New("backup: extension entries exceed unpacked safety limit")
+			}
 		}
 		if !strings.EqualFold(actualHash, fd.SHA256) || actualBytes != fd.Bytes {
 			return nil, fmt.Errorf("backup: integrity check failed for %q (sha256/size mismatch)", fd.Path)
@@ -427,12 +737,13 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		expectedMap[fd.Path] = fd
 	}
 
-	// Fail closed if the ZIP archive contains ANY undeclared table or media stream missing from manifest.json!
+	// Fail closed if the ZIP archive contains ANY undeclared table, media, or extension stream missing from manifest.json!
 	for clean, zf := range fileIndex {
 		if clean == "manifest.json" || zf == nil || zf.FileInfo().IsDir() {
 			continue
 		}
-		if strings.HasPrefix(clean, "tables/") || strings.HasPrefix(clean, "uploads/") || strings.HasPrefix(clean, "media/") {
+		if strings.HasPrefix(clean, "tables/") || strings.HasPrefix(clean, "uploads/") ||
+			strings.HasPrefix(clean, "media/") || strings.HasPrefix(clean, "extensions/") {
 			if _, declared := expectedMap[clean]; !declared {
 				return nil, fmt.Errorf("backup: unsigned extra archive entry %q missing from manifest.json", clean)
 			}
@@ -454,13 +765,18 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		for p := range expectedMap {
 			if strings.HasPrefix(p, "uploads/") {
 				summary.MediaFiles++
+			} else if strings.HasPrefix(p, "extensions/") {
+				if _, _, _, skip, pErr := parseExtensionEntryPath(p); pErr == nil && !skip {
+					summary.ExtensionFiles++
+				}
 			}
 		}
 		return summary, nil
 	}
 
 	// Preserve existing target admin credentials if the incoming backup has empty password hashes
-	existingAdmins, _ := sqlx.Select[domain.User](ctx, store,
+	var existingAdmins []domain.User
+	_ = sqlx.SelectInto(ctx, store, &existingAdmins,
 		`SELECT * FROM users WHERE role = ?`, domain.RoleAdmin)
 
 	// Pass 2: Atomic transactional DB restore (reverse delete, forward streaming insert)
@@ -493,14 +809,13 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		return nil, err
 	}
 
+	var extractedDiskBytes int64
+
 	// Pass 3: Stream media uploads if present and UploadDir provided
 	if manifest.IncludesMedia && strings.TrimSpace(opts.UploadDir) != "" {
-		if err := os.MkdirAll(opts.UploadDir, 0o750); err != nil {
-			return nil, fmt.Errorf("backup: mkdir upload dir: %w", err)
-		}
-		realUploadRoot, err := filepath.EvalSymlinks(opts.UploadDir)
-		if err != nil {
-			return nil, err
+		realUploadRoot, rErr := prepareSafeRestoreDir(opts.UploadDir)
+		if rErr != nil {
+			return nil, fmt.Errorf("backup: prepare upload dir: %w", rErr)
 		}
 		buf := make([]byte, 32*1024)
 		for _, fd := range manifest.Files {
@@ -512,33 +827,186 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 				continue
 			}
 			rel := strings.TrimPrefix(fd.Path, "uploads/")
-			target := filepath.Join(realUploadRoot, filepath.FromSlash(rel))
-			if !strings.HasPrefix(target, realUploadRoot+string(os.PathSeparator)) {
-				return nil, fmt.Errorf("backup: unsafe media path %q", fd.Path)
+			if shouldSkipRelativeRestorePath(rel) {
+				continue
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-				return nil, err
+			n, wErr := extractVerifiedZipFile(realUploadRoot, rel, zf, singleCap, totalCap-extractedDiskBytes, buf)
+			if wErr != nil {
+				return nil, wErr
 			}
-			rc, err := zf.Open()
-			if err != nil {
-				return nil, err
-			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
-			if err != nil {
-				_ = rc.Close()
-				return nil, err
-			}
-			_, copyErr := io.CopyBuffer(out, io.LimitReader(rc, maxSingleEntryBytes), buf)
-			_ = out.Close()
-			_ = rc.Close()
-			if copyErr != nil {
-				return nil, copyErr
-			}
+			extractedDiskBytes += n
 			summary.MediaFiles++
 		}
 	}
 
+	// Pass 4: Stream external plugins and themes if target directories are configured
+	if strings.TrimSpace(opts.PluginsDir) != "" {
+		nFiles, nBytes, pErr := restoreExtensionKind(manifest.Files, fileIndex, "plugins", opts.PluginsDir, singleCap, totalCap-extractedDiskBytes)
+		if pErr != nil {
+			return nil, pErr
+		}
+		extractedDiskBytes += nBytes
+		summary.ExtensionFiles += nFiles
+	}
+	if strings.TrimSpace(opts.ThemesDir) != "" {
+		nFiles, nBytes, tErr := restoreExtensionKind(manifest.Files, fileIndex, "themes", opts.ThemesDir, singleCap, totalCap-extractedDiskBytes)
+		if tErr != nil {
+			return nil, tErr
+		}
+		extractedDiskBytes += nBytes
+		summary.ExtensionFiles += nFiles
+	}
+
 	return summary, nil
+}
+
+func prepareSafeRestoreDir(dir string) (string, error) {
+	if linfo, err := os.Lstat(dir); err == nil && linfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("refusing symlinked restore directory %q", dir)
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(dir)
+}
+
+func shouldSkipRelativeRestorePath(relSlash string) bool {
+	for _, seg := range strings.Split(relSlash, "/") {
+		if shouldSkipBackupTempOrHidden(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureNoSymlinkAncestors(realRoot string, target string) error {
+	rel, err := filepath.Rel(realRoot, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("backup: target %q escapes root %q", target, realRoot)
+	}
+	cur := realRoot
+	for _, seg := range strings.Split(rel, string(os.PathSeparator)) {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("backup: invalid path segment %q", seg)
+		}
+		cur = filepath.Join(cur, seg)
+		if linfo, sErr := os.Lstat(cur); sErr == nil {
+			if linfo.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("backup: refusing to traverse or overwrite symlink %q", cur)
+			}
+		}
+	}
+	return nil
+}
+
+func extractVerifiedZipFile(
+	realRoot string,
+	relSlash string,
+	zf *zip.File,
+	singleLimit int64,
+	remainingTotal int64,
+	buf []byte,
+) (int64, error) {
+	if remainingTotal < 0 {
+		return 0, errors.New("backup: archive exceeds total unpacked safety limit")
+	}
+	target := filepath.Join(realRoot, filepath.FromSlash(relSlash))
+	if !strings.HasPrefix(target, realRoot+string(os.PathSeparator)) {
+		return 0, fmt.Errorf("backup: unsafe target path %q", zf.Name)
+	}
+	if err := ensureNoSymlinkAncestors(realRoot, target); err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+		return 0, err
+	}
+	if err := ensureNoSymlinkAncestors(realRoot, target); err != nil {
+		return 0, err
+	}
+
+	maxAllowed := singleLimit
+	if remainingTotal < maxAllowed {
+		maxAllowed = remainingTotal
+	}
+	rc, err := zf.Open()
+	if err != nil {
+		return 0, err
+	}
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	if err != nil {
+		_ = rc.Close()
+		return 0, err
+	}
+	written, copyErr := io.CopyBuffer(out, io.LimitReader(rc, maxAllowed+1), buf)
+	_ = out.Close()
+	_ = rc.Close()
+	if copyErr != nil {
+		_ = os.Remove(target)
+		return 0, copyErr
+	}
+	if written > maxAllowed {
+		_ = os.Remove(target)
+		return 0, fmt.Errorf("backup: extracted stream %q exceeds unpacked byte cap", zf.Name)
+	}
+	return written, nil
+}
+
+func restoreExtensionKind(
+	files []FileDigest,
+	fileIndex map[string]*zip.File,
+	wantKind string,
+	destDir string,
+	singleCap int64,
+	remainingTotal int64,
+) (int, int64, error) {
+	prefix := "extensions/" + wantKind + "/"
+	hasMatching := false
+	for _, fd := range files {
+		if strings.HasPrefix(fd.Path, prefix) {
+			hasMatching = true
+			break
+		}
+	}
+	if !hasMatching {
+		return 0, 0, nil
+	}
+
+	realDestRoot, err := prepareSafeRestoreDir(destDir)
+	if err != nil {
+		return 0, 0, fmt.Errorf("backup: prepare %s dir: %w", wantKind, err)
+	}
+
+	entryMax := singleCap
+	if maxExtensionSingleBytes < entryMax {
+		entryMax = maxExtensionSingleBytes
+	}
+
+	buf := make([]byte, 32*1024)
+	var restoredCount int
+	var restoredBytes int64
+	for _, fd := range files {
+		if !strings.HasPrefix(fd.Path, prefix) {
+			continue
+		}
+		kind, extID, relSlash, skip, pErr := parseExtensionEntryPath(fd.Path)
+		if pErr != nil {
+			return restoredCount, restoredBytes, pErr
+		}
+		if skip || kind != wantKind {
+			continue
+		}
+		zf := fileIndex[fd.Path]
+		if zf == nil || zf.FileInfo().IsDir() {
+			continue
+		}
+		n, wErr := extractVerifiedZipFile(realDestRoot, extID+"/"+relSlash, zf, entryMax, remainingTotal-restoredBytes, buf)
+		if wErr != nil {
+			return restoredCount, restoredBytes, wErr
+		}
+		restoredBytes += n
+		restoredCount++
+	}
+	return restoredCount, restoredBytes, nil
 }
 
 func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *zip.File, fallbackAdmins []domain.User) (int64, error) {
@@ -567,13 +1035,61 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 	dec := json.NewDecoder(io.LimitReader(rc, maxSingleEntryBytes))
 	dec.UseNumber()
 
-	stmtSQLCache := make(map[string]string)
+	type colMeta struct {
+		headerPrefix string
+		rowTuple     string
+	}
+	metaCache := make(map[string]colMeta)
+	fullBatchSQLCache := make(map[string]string)
 	isMySQL := tx.Dialect().Name() == "mysql"
 	var mysqlUniqueSeen map[string]map[string]bool
 	if isMySQL && len(mysqlUniqueColumnsForTable(table)) > 0 {
 		mysqlUniqueSeen = make(map[string]map[string]bool)
 	}
 	var count int64
+
+	var (
+		pendingCols []string
+		pendingSig  string
+		pendingMeta colMeta
+		pendingArgs []any
+		pendingRows int
+		batchCap    int
+	)
+
+	flushBatch := func() error {
+		if pendingRows == 0 {
+			return nil
+		}
+		var insertSQL string
+		if pendingRows == batchCap {
+			if cached, ok := fullBatchSQLCache[pendingSig]; ok {
+				insertSQL = cached
+			}
+		}
+		if insertSQL == "" {
+			var b strings.Builder
+			b.Grow(len(pendingMeta.headerPrefix) + pendingRows*(len(pendingMeta.rowTuple)+2))
+			b.WriteString(pendingMeta.headerPrefix)
+			for i := 0; i < pendingRows; i++ {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(pendingMeta.rowTuple)
+			}
+			insertSQL = b.String()
+			if pendingRows == batchCap {
+				fullBatchSQLCache[pendingSig] = insertSQL
+			}
+		}
+		if _, err := tx.ExecContext(ctx, insertSQL, pendingArgs...); err != nil {
+			return err
+		}
+		count += int64(pendingRows)
+		pendingArgs = pendingArgs[:0]
+		pendingRows = 0
+		return nil
+	}
 
 	for {
 		var row map[string]any
@@ -610,31 +1126,51 @@ func streamNDJSONIntoTable(ctx context.Context, tx *sqlx.Tx, table string, zf *z
 		sort.Strings(cols)
 
 		colSig := strings.Join(cols, "\x00")
-		insertSQL, cached := stmtSQLCache[colSig]
-		if !cached {
-			quotedCols := make([]string, len(cols))
-			placeholders := make([]string, len(cols))
-			for i, c := range cols {
-				quotedCols[i] = tx.Dialect().QuoteIdent(c)
-				placeholders[i] = "?"
+		if pendingRows > 0 && colSig != pendingSig {
+			if err := flushBatch(); err != nil {
+				return count, err
 			}
-			insertSQL = fmt.Sprintf(
-				"INSERT INTO %s (%s) VALUES (%s)",
-				tx.Dialect().QuoteIdent(table),
-				strings.Join(quotedCols, ", "),
-				strings.Join(placeholders, ", "),
-			)
-			stmtSQLCache[colSig] = insertSQL
+		}
+		if pendingRows == 0 {
+			meta, cached := metaCache[colSig]
+			if !cached {
+				quotedCols := make([]string, len(cols))
+				placeholders := make([]string, len(cols))
+				for i, c := range cols {
+					quotedCols[i] = tx.Dialect().QuoteIdent(c)
+					placeholders[i] = "?"
+				}
+				meta = colMeta{
+					headerPrefix: fmt.Sprintf(
+						"INSERT INTO %s (%s) VALUES ",
+						tx.Dialect().QuoteIdent(table),
+						strings.Join(quotedCols, ", "),
+					),
+					rowTuple: "(" + strings.Join(placeholders, ", ") + ")",
+				}
+				metaCache[colSig] = meta
+			}
+			pendingCols = cols
+			pendingSig = colSig
+			pendingMeta = meta
+			batchCap = min(restoreBatchSize, max(1, 900/len(cols)))
+			if cap(pendingArgs) < batchCap*len(cols) {
+				pendingArgs = make([]any, 0, batchCap*len(cols))
+			}
 		}
 
-		args := make([]any, len(cols))
-		for i, c := range cols {
-			args[i] = coerceJSONValForDB(table, c, rowVals[c], tx.Dialect().Name())
+		for _, c := range pendingCols {
+			pendingArgs = append(pendingArgs, coerceJSONValForDB(table, c, rowVals[c], tx.Dialect().Name()))
 		}
-		if _, err := tx.ExecContext(ctx, insertSQL, args...); err != nil {
-			return count, err
+		pendingRows++
+		if pendingRows >= batchCap {
+			if err := flushBatch(); err != nil {
+				return count, err
+			}
 		}
-		count++
+	}
+	if err := flushBatch(); err != nil {
+		return count, err
 	}
 	return count, nil
 }
@@ -797,10 +1333,43 @@ func patchRedactedAdminRow(row map[string]any, fallbackAdmins []domain.User) {
 	role, _ := row["role"].(string)
 	pw, _ := row["password_hash"].(string)
 	leg, _ := row["legacy_hash"].(string)
-	if role == domain.RoleAdmin && pw == "" && leg == "" {
-		row["password_hash"] = fallbackAdmins[0].PasswordHash
-		row["legacy_hash"] = fallbackAdmins[0].LegacyHash
+	if role != domain.RoleAdmin || pw != "" || leg != "" {
+		return
 	}
+	rowID, _ := row["id"].(string)
+	rowUser, _ := row["username"].(string)
+	rowEmail, _ := row["email"].(string)
+	matched := fallbackAdmins[0]
+	found := false
+	if strings.TrimSpace(rowID) != "" {
+		for _, fb := range fallbackAdmins {
+			if fb.ID == rowID {
+				matched = fb
+				found = true
+				break
+			}
+		}
+	}
+	if !found && strings.TrimSpace(rowUser) != "" {
+		for _, fb := range fallbackAdmins {
+			if strings.EqualFold(strings.TrimSpace(fb.Username), strings.TrimSpace(rowUser)) {
+				matched = fb
+				found = true
+				break
+			}
+		}
+	}
+	if !found && strings.TrimSpace(rowEmail) != "" {
+		for _, fb := range fallbackAdmins {
+			if strings.EqualFold(strings.TrimSpace(fb.Email), strings.TrimSpace(rowEmail)) {
+				matched = fb
+				found = true
+				break
+			}
+		}
+	}
+	row["password_hash"] = matched.PasswordHash
+	row["legacy_hash"] = matched.LegacyHash
 }
 
 func coerceJSONValForDB(table string, col string, val any, dialectName string) any {

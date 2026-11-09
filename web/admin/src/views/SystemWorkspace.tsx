@@ -230,6 +230,7 @@ export function SystemWorkspace({
   const [pkPage, setPkPage] = useState(1);
   const [patPage, setPatPage] = useState(1);
   const [sessPage, setSessPage] = useState(1);
+  const [oidcPage, setOidcPage] = useState(1);
 
   // Account Security state
   const [meInfo, setMeInfo] = useState<any>(null);
@@ -280,6 +281,8 @@ export function SystemWorkspace({
   const [savingDomain, setSavingDomain] = useState<string>("");
   const [storageDrivers, setStorageDrivers] = useState<any[]>([]);
   const [defaultUploadDir, setDefaultUploadDir] = useState<string>("./uploads");
+  const [uploadDirPinned, setUploadDirPinned] = useState(false);
+  const [geoipDirPinned, setGeoipDirPinned] = useState(false);
   const [smtpPwd, setSmtpPwd] = useState("");
   const [testMailTo, setTestMailTo] = useState("");
   const [s3Secret, setS3Secret] = useState("");
@@ -288,6 +291,20 @@ export function SystemWorkspace({
   const [socialDraft, setSocialDraft] = useState({ label: "", url: "" });
   const [editingSocialIdx, setEditingSocialIdx] = useState<number | null>(null);
   const [socialDirty, setSocialDirty] = useState(false);
+  const [socialPage, setSocialPage] = useState(1);
+  const [customVarDraft, setCustomVarDraft] = useState({ key: "", val: "" });
+  const [customVarPage, setCustomVarPage] = useState(1);
+  const [customVarQuery, setCustomVarQuery] = useState("");
+
+  // Reusable Step-Up Password Prompt Modal state
+  const [stepUpModal, setStepUpModal] = useState<{
+    title: string;
+    subtitle?: string;
+    confirmLabel?: string;
+    danger?: boolean;
+  } | null>(null);
+  const [stepUpPwd, setStepUpPwd] = useState("");
+  const stepUpResolverRef = useRef<((pwd: string | null) => void) | null>(null);
 
   // Users (server-paginated)
   const [users, setUsers] = useState<any[]>([]);
@@ -298,6 +315,7 @@ export function SystemWorkspace({
   const [userModalOpen, setUserModalOpen] = useState(false);
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [origUserEmail, setOrigUserEmail] = useState<string>("");
+  const [origUserRole, setOrigUserRole] = useState<string>("");
   const [userForm, setUserForm] = useState({
     username: "",
     email: "",
@@ -493,9 +511,9 @@ export function SystemWorkspace({
       if (sub === "account") {
         const [me, pks, sess, tks, oidc] = await Promise.all([
           apiFetch<any>("/api/admin/me"),
-          apiFetch<{ items: any[] }>("/api/admin/security/passkeys?per_page=100"),
-          apiFetch<{ items: any[] }>("/api/admin/security/sessions?per_page=100"),
-          apiFetch<{ items: any[] }>("/api/admin/security/tokens?per_page=100"),
+          apiFetch<{ items: any[] }>("/api/admin/security/passkeys?per_page=100").catch(() => ({ items: [] })),
+          apiFetch<{ items: any[] }>("/api/admin/security/sessions?per_page=100").catch(() => ({ items: [] })),
+          apiFetch<{ items: any[] }>("/api/admin/security/tokens?per_page=100").catch(() => ({ items: [] })),
           apiFetch<{ items?: any[]; providers?: any[] }>("/api/admin/security/oidc-links").catch(() => ({
             items: [],
             providers: [],
@@ -523,6 +541,8 @@ export function SystemWorkspace({
         setVersions(res.versions || {});
         setSocialDirty(false);
         setEditingSocialIdx(null);
+        setUploadDirPinned(Boolean(res.upload_dir_pinned || res.domains?.storage?.upload_dir_pinned));
+        setGeoipDirPinned(Boolean(res.geoip_dir_pinned || res.domains?.security?.geoip_dir_pinned));
         if (res.default_upload_dir) setDefaultUploadDir(res.default_upload_dir);
         if (res.default_geoip_dir) setDefaultGeoIPDir(res.default_geoip_dir);
         if (res.effective_geoip_dir) setEffectiveGeoIPDir(res.effective_geoip_dir);
@@ -541,6 +561,7 @@ export function SystemWorkspace({
           apiFetch<{
             items: any[];
             geo_access_circuit_enabled?: boolean;
+            geoip_dir_pinned?: boolean;
             default_geoip_dir?: string;
             effective_geoip_dir?: string;
             geoip_status?: { path?: string; active_files?: string[]; skipped_files?: string[] };
@@ -554,6 +575,8 @@ export function SystemWorkspace({
         setGeoCircuitEnabled(g.geo_access_circuit_enabled !== false);
         setDomains(st.domains || {});
         setVersions(st.versions || {});
+        setUploadDirPinned(Boolean(st.upload_dir_pinned || st.domains?.storage?.upload_dir_pinned));
+        setGeoipDirPinned(Boolean(g.geoip_dir_pinned || st.geoip_dir_pinned || st.domains?.security?.geoip_dir_pinned));
         if (st.default_upload_dir) setDefaultUploadDir(st.default_upload_dir);
         if (g.default_geoip_dir || st.default_geoip_dir) {
           setDefaultGeoIPDir(g.default_geoip_dir || st.default_geoip_dir);
@@ -590,6 +613,8 @@ export function SystemWorkspace({
         setDomains(st.domains || {});
         setVersions(st.versions || {});
         setLocalBackups(lb.items || []);
+        setUploadDirPinned(Boolean(st.upload_dir_pinned || st.domains?.storage?.upload_dir_pinned));
+        setGeoipDirPinned(Boolean(st.geoip_dir_pinned || st.domains?.security?.geoip_dir_pinned));
         if (st.default_upload_dir) setDefaultUploadDir(st.default_upload_dir);
         if (st.default_geoip_dir) setDefaultGeoIPDir(st.default_geoip_dir);
         if (st.effective_geoip_dir) setEffectiveGeoIPDir(st.effective_geoip_dir);
@@ -987,7 +1012,32 @@ export function SystemWorkspace({
   const pkPaged = paginateItems(passkeys, pkPage, 10);
   const patPaged = paginateItems(tokens, patPage, 10);
   const sessPaged = paginateItems(sessions, sessPage, 10);
+  const oidcPaged = paginateItems(oidcLinks, oidcPage, 10);
   const otherSessionsCount = sessions.filter((s) => s.id !== meInfo?.session_id).length;
+
+  const closeStepUpModal = (result: string | null) => {
+    const resolve = stepUpResolverRef.current;
+    stepUpResolverRef.current = null;
+    setStepUpModal(null);
+    setStepUpPwd("");
+    if (resolve) resolve(result);
+  };
+
+  const promptStepUpPassword = (opts: {
+    title: string;
+    subtitle?: string;
+    confirmLabel?: string;
+    danger?: boolean;
+  }): Promise<string | null> => {
+    return new Promise((resolve) => {
+      if (stepUpResolverRef.current) {
+        stepUpResolverRef.current(null);
+      }
+      stepUpResolverRef.current = resolve;
+      setStepUpPwd("");
+      setStepUpModal(opts);
+    });
+  };
 
   const geoMissOptions = [
     { value: "next", label: t("sys.geo_miss_next") },
@@ -1022,7 +1072,7 @@ export function SystemWorkspace({
       )}
 
       {sub === "settings_site" && isAdmin && domains && (
-        <div class="volo-grid-2">
+        <>
           {/* Site Identity Domain */}
           <form
             class="volo-card"
@@ -1038,7 +1088,7 @@ export function SystemWorkspace({
                 <p class="volo-sec-desc">{t("sys.dom1_desc")}</p>
               </div>
             </div>
-            <div class="volo-grid-2">
+            <div class="volo-grid-4">
               <div class="volo-field">
                 <label>{t("sys.lbl_site_title")}</label>
                 <input
@@ -1059,57 +1109,6 @@ export function SystemWorkspace({
                   onInput={(e) => setDomField("site", "subtitle", (e.currentTarget as HTMLInputElement).value)}
                 />
               </div>
-            </div>
-            <div class="volo-field">
-              <label>{t("sys.site_desc")}</label>
-              <textarea
-                class="volo-textarea"
-                rows={2}
-                value={domains.site?.description || ""}
-                onInput={(e) => setDomField("site", "description", (e.currentTarget as HTMLTextAreaElement).value)}
-              />
-            </div>
-            <div class="volo-field">
-              <label>{t("sys.lbl_logo_url")}</label>
-              <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
-                <NavIconPreview icon={domains.site?.logo_url} fallbackLabel={domains.site?.title || "V"} />
-                <input
-                  class="volo-input"
-                  style={{ flex: "1 1 180px", minWidth: 0 }}
-                  name="site_brand_logo"
-                  placeholder={t("sys.site_logo_ph")}
-                  value={domains.site?.logo_url || ""}
-                  onInput={(e) => setDomField("site", "logo_url", (e.currentTarget as HTMLInputElement).value)}
-                />
-                <UploadButton
-                  accept="image/*"
-                  label={t("sys.upload_img_btn")}
-                  onFile={(f) => void uploadImageAsset(f, (url) => setDomField("site", "logo_url", url))}
-                />
-                <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "logo_url", url)} />
-              </div>
-            </div>
-            <div class="volo-field">
-              <label>{t("sys.lbl_fav_url")}</label>
-              <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
-                <NavIconPreview icon={domains.site?.favicon_url} fallbackLabel="F" />
-                <input
-                  class="volo-input"
-                  style={{ flex: "1 1 180px", minWidth: 0 }}
-                  name="site_favicon_path"
-                  placeholder={t("sys.site_fav_ph")}
-                  value={domains.site?.favicon_url || ""}
-                  onInput={(e) => setDomField("site", "favicon_url", (e.currentTarget as HTMLInputElement).value)}
-                />
-                <UploadButton
-                  accept="image/*,.ico,.svg"
-                  label={t("sys.upload_img_btn")}
-                  onFile={(f) => void uploadImageAsset(f, (url) => setDomField("site", "favicon_url", url))}
-                />
-                <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "favicon_url", url)} />
-              </div>
-            </div>
-            <div class="volo-grid-2">
               <div class="volo-field">
                 <label>{t("sys.default_locale")}</label>
                 <ConsoleSelect
@@ -1128,15 +1127,100 @@ export function SystemWorkspace({
                 />
               </div>
             </div>
+
             <div class="volo-field">
-              <label>{t("sys.notice_board")}</label>
-              <textarea
-                class="volo-textarea"
-                rows={3}
-                value={domains.site?.notice_board || ""}
-                onInput={(e) => setDomField("site", "notice_board", (e.currentTarget as HTMLTextAreaElement).value)}
+              <label>{t("sys.public_url")}</label>
+              <input
+                type="url"
+                class="volo-input volo-mono"
+                name="site_canonical_public_url"
+                placeholder={t("sys.public_url_ph")}
+                value={domains.site?.public_url ?? domains.site?.custom_vars?.public_url ?? ""}
+                onInput={(e) => {
+                  const val = (e.currentTarget as HTMLInputElement).value;
+                  const trimmed = val.trim();
+                  const nextVars = { ...(domains.site?.custom_vars || {}) };
+                  if (trimmed) {
+                    nextVars.public_url = trimmed;
+                  } else {
+                    delete nextVars.public_url;
+                  }
+                  setDomains((prev: any) => ({
+                    ...prev,
+                    site: {
+                      ...(prev?.site || {}),
+                      public_url: val,
+                      custom_vars: nextVars,
+                    },
+                  }));
+                }}
               />
-              <span class="volo-help">{t("sys.notice_board_hint")}</span>
+              <small class="volo-help">{t("sys.public_url_hint")}</small>
+            </div>
+
+            <div class="volo-grid-2">
+              <div class="volo-field">
+                <label>{t("sys.lbl_logo_url")}</label>
+                <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
+                  <NavIconPreview icon={domains.site?.logo_url} fallbackLabel={domains.site?.title || "V"} />
+                  <input
+                    class="volo-input"
+                    style={{ flex: "1 1 160px", minWidth: 0 }}
+                    name="site_brand_logo"
+                    placeholder={t("sys.site_logo_ph")}
+                    value={domains.site?.logo_url || ""}
+                    onInput={(e) => setDomField("site", "logo_url", (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <UploadButton
+                    accept="image/*"
+                    label={t("sys.upload_img_btn")}
+                    onFile={(f) => void uploadImageAsset(f, (url) => setDomField("site", "logo_url", url))}
+                  />
+                  <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "logo_url", url)} />
+                </div>
+              </div>
+              <div class="volo-field">
+                <label>{t("sys.lbl_fav_url")}</label>
+                <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
+                  <NavIconPreview icon={domains.site?.favicon_url} fallbackLabel="F" />
+                  <input
+                    class="volo-input"
+                    style={{ flex: "1 1 160px", minWidth: 0 }}
+                    name="site_favicon_path"
+                    placeholder={t("sys.site_fav_ph")}
+                    value={domains.site?.favicon_url || ""}
+                    onInput={(e) => setDomField("site", "favicon_url", (e.currentTarget as HTMLInputElement).value)}
+                  />
+                  <UploadButton
+                    accept="image/*,.ico,.svg"
+                    label={t("sys.upload_img_btn")}
+                    onFile={(f) => void uploadImageAsset(f, (url) => setDomField("site", "favicon_url", url))}
+                  />
+                  <MediaPickButton filterKind="image" onPick={(url) => setDomField("site", "favicon_url", url)} />
+                </div>
+              </div>
+            </div>
+
+            <div class="volo-grid-2">
+              <div class="volo-field">
+                <label>{t("sys.site_desc")}</label>
+                <textarea
+                  class="volo-textarea"
+                  rows={2}
+                  value={domains.site?.description || ""}
+                  onInput={(e) => setDomField("site", "description", (e.currentTarget as HTMLTextAreaElement).value)}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("sys.notice_board")}</label>
+                <textarea
+                  class="volo-textarea"
+                  rows={2}
+                  value={domains.site?.notice_board || ""}
+                  onInput={(e) => setDomField("site", "notice_board", (e.currentTarget as HTMLTextAreaElement).value)}
+                />
+                <span class="volo-help">{t("sys.notice_board_hint")}</span>
+              </div>
             </div>
 
             <div class="volo-check-grid">
@@ -1175,48 +1259,52 @@ export function SystemWorkspace({
               </div>
             )}
 
-            <div class="volo-field">
-              <label>{t("sys.custom_head")}</label>
-              <textarea
-                class="volo-textarea volo-mono"
-                rows={4}
-                spellcheck={false}
-                value={domains.site?.custom_head_meta || ""}
-                onInput={(e) => setDomField("site", "custom_head_meta", (e.currentTarget as HTMLTextAreaElement).value)}
-              />
-              <small class="volo-help">{t("sys.custom_head_hint")}</small>
-            </div>
-
-            {domains.site?.enable_footer_html !== false && (
+            <div class={domains.site?.enable_footer_html !== false ? "volo-grid-2" : ""}>
               <div class="volo-field">
-                <label>{t("sys.footer_text")}</label>
+                <label>{t("sys.custom_head")}</label>
                 <textarea
                   class="volo-textarea volo-mono"
-                  rows={4}
+                  rows={3}
                   spellcheck={false}
-                  value={domains.site?.footer_text || ""}
-                  onInput={(e) => setDomField("site", "footer_text", (e.currentTarget as HTMLTextAreaElement).value)}
+                  value={domains.site?.custom_head_meta || ""}
+                  onInput={(e) => setDomField("site", "custom_head_meta", (e.currentTarget as HTMLTextAreaElement).value)}
                 />
-                <small class="volo-help">{t("sys.footer_html_hint")}</small>
+                <small class="volo-help">{t("sys.custom_head_hint")}</small>
               </div>
-            )}
+
+              {domains.site?.enable_footer_html !== false && (
+                <div class="volo-field">
+                  <label>{t("sys.footer_text")}</label>
+                  <textarea
+                    class="volo-textarea volo-mono"
+                    rows={3}
+                    spellcheck={false}
+                    value={domains.site?.footer_text || ""}
+                    onInput={(e) => setDomField("site", "footer_text", (e.currentTarget as HTMLTextAreaElement).value)}
+                  />
+                  <small class="volo-help">{t("sys.footer_html_hint")}</small>
+                </div>
+              )}
+            </div>
 
             <div class="volo-subcard">
-              <div class="volo-subcard-title">{t("sys.social_title")}</div>
-              <div class="volo-input-row" style={{ marginBottom: "10px", flexWrap: "wrap" }}>
-                <span class="volo-help">{t("sys.social_presets")}</span>
-                {SOCIAL_PRESETS.map((p) => (
-                  <button
-                    key={p.label}
-                    type="button"
-                    class="volo-chip-btn"
-                    onClick={() => setSocialDraft((prev) => ({ label: p.label, url: prev.url || p.urlHint }))}
-                  >
-                    {p.label}
-                  </button>
-                ))}
+              <div class="volo-subcard-head">
+                <div class="volo-subcard-title">{t("sys.social_title")}</div>
+                <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "6px" }}>
+                  <span class="volo-help">{t("sys.social_presets")}</span>
+                  {SOCIAL_PRESETS.map((p) => (
+                    <button
+                      key={p.label}
+                      type="button"
+                      class="volo-chip-btn"
+                      onClick={() => setSocialDraft((prev) => ({ label: p.label, url: prev.url || p.urlHint }))}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div class="volo-grid-2">
+              <div class="volo-inline-composer">
                 <div class="volo-field">
                   <label>{t("sys.lbl_social_name")}</label>
                   <input
@@ -1229,145 +1317,156 @@ export function SystemWorkspace({
                 </div>
                 <div class="volo-field">
                   <label>{t("sys.lbl_social_url")}</label>
-                  <div class="volo-input-row" style={{ flexWrap: "wrap" }}>
-                    <input
-                      class="volo-input"
-                      style={{ flex: "1 1 160px", minWidth: 0 }}
-                      name="social_profile_link"
-                      placeholder={t("sys.social_url_ph")}
-                      value={socialDraft.url}
-                      onInput={(e) => setSocialDraft({ ...socialDraft, url: (e.currentTarget as HTMLInputElement).value })}
-                    />
+                  <input
+                    class="volo-input"
+                    name="social_profile_link"
+                    placeholder={t("sys.social_url_ph")}
+                    value={socialDraft.url}
+                    onInput={(e) => setSocialDraft({ ...socialDraft, url: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-inline-composer-actions">
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-sm"
+                    onClick={() => {
+                      if (!socialDraft.label.trim() || !socialDraft.url.trim()) return;
+                      const list = Array.isArray(domains.site?.social_links) ? [...domains.site.social_links] : [];
+                      if (editingSocialIdx !== null && editingSocialIdx >= 0 && editingSocialIdx < list.length) {
+                        list[editingSocialIdx] = {
+                          ...list[editingSocialIdx],
+                          label: socialDraft.label.trim(),
+                          icon: socialDraft.label.trim().toLowerCase(),
+                          url: socialDraft.url.trim(),
+                        };
+                        setEditingSocialIdx(null);
+                      } else {
+                        list.push({
+                          id: `soc-${Date.now()}`,
+                          label: socialDraft.label.trim(),
+                          icon: socialDraft.label.trim().toLowerCase(),
+                          url: socialDraft.url.trim(),
+                        });
+                        setSocialPage(Math.max(1, Math.ceil(list.length / 6)));
+                      }
+                      setDomField("site", "social_links", list);
+                      setSocialDraft({ label: "", url: "" });
+                      setSocialDirty(true);
+                    }}
+                  >
+                    {editingSocialIdx !== null ? t("common.save") : (<><PlusIcon size={14} /> {t("sys.social_add")}</>)}
+                  </button>
+                  {editingSocialIdx !== null && (
                     <button
                       type="button"
                       class="volo-btn volo-btn-sm"
                       onClick={() => {
-                        if (!socialDraft.label.trim() || !socialDraft.url.trim()) return;
-                        const list = Array.isArray(domains.site?.social_links) ? [...domains.site.social_links] : [];
-                        if (editingSocialIdx !== null && editingSocialIdx >= 0 && editingSocialIdx < list.length) {
-                          list[editingSocialIdx] = {
-                            ...list[editingSocialIdx],
-                            label: socialDraft.label.trim(),
-                            icon: socialDraft.label.trim().toLowerCase(),
-                            url: socialDraft.url.trim(),
-                          };
-                          setEditingSocialIdx(null);
-                        } else {
-                          list.push({
-                            id: `soc-${Date.now()}`,
-                            label: socialDraft.label.trim(),
-                            icon: socialDraft.label.trim().toLowerCase(),
-                            url: socialDraft.url.trim(),
-                          });
-                        }
-                        setDomField("site", "social_links", list);
+                        setEditingSocialIdx(null);
                         setSocialDraft({ label: "", url: "" });
-                        setSocialDirty(true);
                       }}
                     >
-                      {editingSocialIdx !== null ? t("common.save") : (<><PlusIcon size={14} /> {t("sys.social_add")}</>)}
+                      {t("common.cancel")}
                     </button>
-                    {editingSocialIdx !== null && (
-                      <button
-                        type="button"
-                        class="volo-btn volo-btn-sm"
-                        onClick={() => {
-                          setEditingSocialIdx(null);
-                          setSocialDraft({ label: "", url: "" });
-                        }}
-                      >
-                        {t("common.cancel")}
-                      </button>
-                    )}
-                  </div>
+                  )}
                 </div>
               </div>
               {Array.isArray(domains.site?.social_links) && domains.site.social_links.length > 0 && (() => {
+                const allSocial: any[] = domains.site.social_links;
+                const pagedSocial = paginateItems(allSocial, socialPage, 6);
+                const pageOffset = (pagedSocial.safePage - 1) * 6;
                 const seenKeys = new Map<string, number>();
                 return (
-                  <div ref={socialFlip.containerRef}>
-                    {domains.site.social_links.map((s: any, idx: number, arr: any[]) => {
-                      const rawBase = String(s.id || `${s.label || ""}::${s.url || ""}`);
-                      const dup = (seenKeys.get(rawBase) || 0) + 1;
-                      seenKeys.set(rawBase, dup);
-                      const flipKey = dup > 1 ? `${rawBase}#${dup}` : rawBase;
-                      return (
-                        <div
-                          key={flipKey}
-                          data-flip-key={flipKey}
-                          class="volo-input-row"
-                          style={{ marginTop: "6px", flexWrap: "wrap" }}
-                        >
-                          <NavIconPreview icon={s.icon || String(s.label || "").toLowerCase()} fallbackLabel={s.label} size={15} />
-                          <strong>{s.label}</strong>
-                          <span
-                            class="volo-help"
-                            style={{ flex: "1 1 140px", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                          >
-                            {s.url}
-                          </span>
-                          <div class="volo-row-actions">
-                            <button
-                              type="button"
-                              class="volo-act-btn"
-                              disabled={idx <= 0}
-                              onClick={() => {
-                                socialFlip.captureFlip();
-                                const next = [...arr];
-                                const [moved] = next.splice(idx, 1);
-                                next.splice(idx - 1, 0, moved);
-                                setDomField("site", "social_links", next);
-                                setSocialDirty(true);
-                              }}
+                  <>
+                    <div ref={socialFlip.containerRef} class="volo-kv-list">
+                      {pagedSocial.slice.map((s: any, relIdx: number) => {
+                        const idx = pageOffset + relIdx;
+                        const rawBase = String(s.id || `${s.label || ""}::${s.url || ""}`);
+                        const dup = (seenKeys.get(rawBase) || 0) + 1;
+                        seenKeys.set(rawBase, dup);
+                        const flipKey = dup > 1 ? `${rawBase}#${dup}` : rawBase;
+                        return (
+                          <div key={flipKey} data-flip-key={flipKey} class="volo-kv-row">
+                            <div class="volo-kv-key">
+                              <NavIconPreview icon={s.icon || String(s.label || "").toLowerCase()} fallbackLabel={s.label} size={15} />
+                              <strong>{s.label}</strong>
+                            </div>
+                            <span
+                              class="volo-help volo-kv-val"
+                              style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                             >
-                              ↑
-                            </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn"
-                              disabled={idx >= arr.length - 1}
-                              onClick={() => {
-                                socialFlip.captureFlip();
-                                const next = [...arr];
-                                const [moved] = next.splice(idx, 1);
-                                next.splice(idx + 1, 0, moved);
-                                setDomField("site", "social_links", next);
-                                setSocialDirty(true);
-                              }}
-                            >
-                              ↓
-                            </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn"
-                              onClick={() => {
-                                setEditingSocialIdx(idx);
-                                setSocialDraft({ label: s.label || "", url: s.url || "" });
-                              }}
-                            >
-                              {t("common.edit")}
-                            </button>
-                            <button
-                              type="button"
-                              class="volo-act-btn danger"
-                              onClick={async () => {
-                                if (!(await openConfirm({ message: t("sys.confirm_del_social", { name: s.label }), danger: true }))) return;
-                                const next = domains.site.social_links.filter((_: any, i: number) => i !== idx);
-                                setDomField("site", "social_links", next);
-                                if (editingSocialIdx === idx) {
-                                  setEditingSocialIdx(null);
-                                  setSocialDraft({ label: "", url: "" });
-                                }
-                                setSocialDirty(true);
-                              }}
-                            >
-                              {t("common.delete")}
-                            </button>
+                              {s.url}
+                            </span>
+                            <div class="volo-row-actions">
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                disabled={idx <= 0}
+                                onClick={() => {
+                                  socialFlip.captureFlip();
+                                  const next = [...allSocial];
+                                  const [moved] = next.splice(idx, 1);
+                                  next.splice(idx - 1, 0, moved);
+                                  setDomField("site", "social_links", next);
+                                  setSocialDirty(true);
+                                }}
+                              >
+                                ↑
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                disabled={idx >= allSocial.length - 1}
+                                onClick={() => {
+                                  socialFlip.captureFlip();
+                                  const next = [...allSocial];
+                                  const [moved] = next.splice(idx, 1);
+                                  next.splice(idx + 1, 0, moved);
+                                  setDomField("site", "social_links", next);
+                                  setSocialDirty(true);
+                                }}
+                              >
+                                ↓
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={() => {
+                                  setEditingSocialIdx(idx);
+                                  setSocialDraft({ label: s.label || "", url: s.url || "" });
+                                }}
+                              >
+                                {t("common.edit")}
+                              </button>
+                              <button
+                                type="button"
+                                class="volo-act-btn danger"
+                                onClick={async () => {
+                                  if (!(await openConfirm({ message: t("sys.confirm_del_social", { name: s.label }), danger: true }))) return;
+                                  const next = allSocial.filter((_: any, i: number) => i !== idx);
+                                  setDomField("site", "social_links", next);
+                                  if (editingSocialIdx === idx) {
+                                    setEditingSocialIdx(null);
+                                    setSocialDraft({ label: "", url: "" });
+                                  }
+                                  setSocialDirty(true);
+                                }}
+                              >
+                                {t("common.delete")}
+                              </button>
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                    {allSocial.length > 6 && (
+                      <Pagination
+                        total={allSocial.length}
+                        page={pagedSocial.safePage}
+                        pageSize={6}
+                        onChange={setSocialPage}
+                      />
+                    )}
+                  </>
                 );
               })()}
               {socialDirty && (
@@ -1375,6 +1474,137 @@ export function SystemWorkspace({
                   {t("sys.social_unsaved_hint")}
                 </div>
               )}
+            </div>
+
+            <div class="volo-subcard">
+              <div class="volo-subcard-head">
+                <div>
+                  <div class="volo-subcard-title">{t("sys.custom_vars_title")}</div>
+                  <div class="volo-help" style={{ marginTop: "2px" }}>
+                    {t("sys.custom_vars_hint")}
+                  </div>
+                </div>
+                <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "8px" }}>
+                  <button
+                    type="button"
+                    class="volo-chip-btn"
+                    onClick={() =>
+                      setCustomVarDraft((prev) => ({
+                        key: "public_url",
+                        val: prev.val || String(domains.site?.custom_vars?.public_url || ""),
+                      }))
+                    }
+                  >
+                    public_url
+                  </button>
+                  {Object.keys(domains.site?.custom_vars || {}).length > 6 && (
+                    <input
+                      type="search"
+                      class="volo-input"
+                      style={{ width: "170px", height: "32px" }}
+                      placeholder={t("common.search") || "Search..."}
+                      value={customVarQuery}
+                      onInput={(e) => {
+                        setCustomVarQuery((e.currentTarget as HTMLInputElement).value);
+                        setCustomVarPage(1);
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
+              <div class="volo-inline-composer">
+                <div class="volo-field">
+                  <input
+                    class="volo-input volo-mono"
+                    name="site_custom_var_key"
+                    autoComplete="off"
+                    placeholder={t("sys.custom_var_key_ph")}
+                    value={customVarDraft.key}
+                    onInput={(e) => setCustomVarDraft({ ...customVarDraft, key: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-field">
+                  <input
+                    class="volo-input"
+                    name="site_custom_var_val"
+                    autoComplete="off"
+                    placeholder={t("sys.custom_var_val_ph")}
+                    value={customVarDraft.val}
+                    onInput={(e) => setCustomVarDraft({ ...customVarDraft, val: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </div>
+                <div class="volo-inline-composer-actions">
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-sm"
+                    onClick={() => {
+                      const k = customVarDraft.key.trim();
+                      if (!k) return;
+                      const nextMap = { ...(domains.site?.custom_vars || {}), [k]: customVarDraft.val };
+                      setDomField("site", "custom_vars", nextMap);
+                      setCustomVarDraft({ key: "", val: "" });
+                      setCustomVarPage(Math.max(1, Math.ceil(Object.keys(nextMap).length / 6)));
+                    }}
+                  >
+                    <PlusIcon size={14} /> {t("sys.custom_var_add")}
+                  </button>
+                </div>
+              </div>
+              {(() => {
+                const rawEntries = Object.entries(domains.site?.custom_vars || {});
+                if (rawEntries.length === 0) return null;
+                const q = customVarQuery.trim().toLowerCase();
+                const filteredEntries = q
+                  ? rawEntries.filter(([k, v]) => k.toLowerCase().includes(q) || String(v ?? "").toLowerCase().includes(q))
+                  : rawEntries;
+                const pagedVars = paginateItems(filteredEntries, customVarPage, 6);
+                return (
+                  <>
+                    <div class="volo-kv-list">
+                      {pagedVars.slice.map(([k, v]) => (
+                        <div key={k} class="volo-kv-row">
+                          <div class="volo-kv-key">
+                            <span class="volo-code-chip is-wrap">{k}</span>
+                          </div>
+                          <input
+                            class="volo-input volo-kv-val"
+                            style={{ minWidth: 0 }}
+                            value={String(v ?? "")}
+                            onInput={(e) => {
+                              const nextVal = (e.currentTarget as HTMLInputElement).value;
+                              setDomField("site", "custom_vars", {
+                                ...(domains.site?.custom_vars || {}),
+                                [k]: nextVal,
+                              });
+                            }}
+                          />
+                          <div class="volo-row-actions">
+                            <button
+                              type="button"
+                              class="volo-act-btn danger"
+                              onClick={() => {
+                                const nextMap = { ...(domains.site?.custom_vars || {}) };
+                                delete nextMap[k];
+                                setDomField("site", "custom_vars", nextMap);
+                              }}
+                            >
+                              {t("common.delete")}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    {filteredEntries.length > 6 && (
+                      <Pagination
+                        total={filteredEntries.length}
+                        page={pagedVars.safePage}
+                        pageSize={6}
+                        onChange={setCustomVarPage}
+                      />
+                    )}
+                  </>
+                );
+              })()}
             </div>
 
             <div class="volo-form-actions">
@@ -1435,7 +1665,7 @@ export function SystemWorkspace({
               )}
             </div>
 
-            <div class="volo-auto-grid">
+            <div class="volo-grid-4">
               <div class="volo-field">
                 <label>{t("sys.sb_hot_posts")}</label>
                 <input
@@ -1606,7 +1836,7 @@ export function SystemWorkspace({
                     />
                   </div>
                   {domains.reading?.builtin_spam_filter !== false && (
-                    <>
+                    <div class="volo-grid-2">
                       <div class="volo-field">
                         <label>{t("sys.blocked_kw")}</label>
                         <TokenListInput
@@ -1621,7 +1851,7 @@ export function SystemWorkspace({
                           onChange={(next) => setDomField("reading", "allowed_keywords", next)}
                         />
                       </div>
-                    </>
+                    </div>
                   )}
                 </>
               )}
@@ -1633,11 +1863,11 @@ export function SystemWorkspace({
               </button>
             </div>
           </form>
-        </div>
+        </>
       )}
 
       {sub === "settings_io" && isAdmin && domains && (
-        <div class="volo-grid-2">
+        <>
           {/* Media Storage Engine Domain */}
           <form
             class="volo-card"
@@ -1708,11 +1938,17 @@ export function SystemWorkspace({
                       class="volo-input"
                       name="storage_local_dir"
                       autoComplete="off"
+                      disabled={uploadDirPinned || Boolean(domains.storage?.upload_dir_pinned)}
                       placeholder={defaultUploadDir || "./uploads"}
                       value={domains.storage?.local_dir || ""}
                       onInput={(e) => setDomField("storage", "local_dir", (e.currentTarget as HTMLInputElement).value)}
                     />
                     <span class="volo-help">{t("sys.local_dir_hint", { dir: defaultUploadDir || "./uploads" })}</span>
+                    {(uploadDirPinned || Boolean(domains.storage?.upload_dir_pinned)) && (
+                      <span class="volo-help" style={{ color: "var(--volo-warn)" }}>
+                        {t("sys.dir_pinned_hint")}
+                      </span>
+                    )}
                   </div>
                   <div class="volo-field">
                     <label>{t("sys.local_key_prefix")}</label>
@@ -2012,7 +2248,7 @@ export function SystemWorkspace({
                 </div>
 
                 <div class="volo-subcard">
-                  <div class="volo-field">
+                  <div class="volo-field" style={{ marginBottom: 0 }}>
                     <label>{t("sys.lbl_test_mail")}</label>
                     <input
                       class="volo-input"
@@ -2052,7 +2288,7 @@ export function SystemWorkspace({
               </button>
             </div>
           </form>
-        </div>
+        </>
       )}
 
       {sub === "account" && (
@@ -2081,7 +2317,7 @@ export function SystemWorkspace({
           </div>
 
           {accSub === "profile" && (
-            <div class="volo-grid-2">
+            <>
               <div class="volo-card">
                 <div class="volo-sec-head">
                   <div class="volo-sec-copy">
@@ -2138,7 +2374,7 @@ export function SystemWorkspace({
                       <div class="volo-input-row" style={{ flex: 1, flexWrap: "wrap" }}>
                         <input
                           class="volo-input"
-                          style={{ flex: "1 1 160px", minWidth: 0 }}
+                          style={{ flex: "1 1 180px", minWidth: 0 }}
                           name="author_avatar_url"
                           autoComplete="off"
                           placeholder={t("sys.avatar_url_ph")}
@@ -2155,7 +2391,7 @@ export function SystemWorkspace({
                     </div>
                   </div>
 
-                  <div class="volo-grid-2">
+                  <div class="volo-grid-3">
                     <div class="volo-field">
                       <label>{t("setup.display_name")}</label>
                       <input
@@ -2177,18 +2413,18 @@ export function SystemWorkspace({
                         onInput={(e) => setProfileForm({ ...profileForm, email: (e.currentTarget as HTMLInputElement).value })}
                       />
                     </div>
-                  </div>
-                  <div class="volo-field">
-                    <label>{t("sys.website_url")}</label>
-                    <input
-                      class="volo-input"
-                      type="url"
-                      name="author_public_blog_url"
-                      autoComplete="url"
-                      placeholder="https://"
-                      value={profileForm.website_url}
-                      onInput={(e) => setProfileForm({ ...profileForm, website_url: (e.currentTarget as HTMLInputElement).value })}
-                    />
+                    <div class="volo-field">
+                      <label>{t("sys.website_url")}</label>
+                      <input
+                        class="volo-input"
+                        type="url"
+                        name="author_public_blog_url"
+                        autoComplete="url"
+                        placeholder="https://"
+                        value={profileForm.website_url}
+                        onInput={(e) => setProfileForm({ ...profileForm, website_url: (e.currentTarget as HTMLInputElement).value })}
+                      />
+                    </div>
                   </div>
                   <div class="volo-field">
                     <label>{t("sys.bio")}</label>
@@ -2238,7 +2474,7 @@ export function SystemWorkspace({
                 </form>
               </div>
 
-              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+              <div class="volo-grid-2">
                 <div class="volo-card">
                   <div class="volo-sec-head">
                     <div class="volo-sec-copy">
@@ -2246,7 +2482,7 @@ export function SystemWorkspace({
                       <p class="volo-sec-desc">{t("sys.totp_desc")}</p>
                     </div>
                   </div>
-                  <div class="volo-subcard">
+                  <div class="volo-subcard" style={{ marginBottom: 0 }}>
                     {meInfo?.totp_enabled ? (
                       <div class="volo-input-row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
                         <span class="volo-status-pill ok">
@@ -2363,6 +2599,7 @@ export function SystemWorkspace({
                                 setTotpEnroll(null);
                                 setTotpCode("");
                                 setTotpCurrPwd("");
+                                void refreshMe();
                                 void loadSub();
                               } catch (err: any) {
                                 showToast(err.message);
@@ -2402,7 +2639,7 @@ export function SystemWorkspace({
                       </div>
                     )}
                     {recoveryCodes && (
-                      <pre class="volo-subcard" style={{ fontSize: "12px", whiteSpace: "pre-wrap" }}>
+                      <pre class="volo-subcard" style={{ fontSize: "12px", whiteSpace: "pre-wrap", marginTop: "10px", marginBottom: 0 }}>
                         {t("sys.recovery_codes_tip")}
                         {"\n"}
                         {recoveryCodes.join("   ")}
@@ -2535,33 +2772,62 @@ export function SystemWorkspace({
                     onChange={setPkPage}
                   />
                 </div>
+              </div>
 
-                <div class="volo-card">
-                  <div class="volo-sec-head">
-                    <div class="volo-sec-copy">
-                      <h3 class="volo-card-title">{t("sys.oidc_links_title")}</h3>
-                      <p class="volo-sec-desc">{t("sys.oidc_links_desc")}</p>
-                    </div>
-                    {oidcProviders.length > 0 && (
-                      <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "6px" }}>
-                        {oidcProviders.map((p) => (
-                          <a
-                            key={p.name}
-                            class="volo-btn volo-btn-sm"
-                            href={`/api/v1/auth/oidc/${encodeURIComponent(p.name)}/start?target=bind`}
-                          >
-                            <PlusIcon size={14} /> {t("sys.oidc_link_btn", { provider: p.display_name || p.name })}
-                          </a>
-                        ))}
-                      </div>
-                    )}
+              <div class="volo-card">
+                <div class="volo-sec-head">
+                  <div class="volo-sec-copy">
+                    <h3 class="volo-card-title">{t("sys.oidc_links_title")}</h3>
+                    <p class="volo-sec-desc">{t("sys.oidc_links_desc")}</p>
                   </div>
-
-                  {oidcLinks.length === 0 ? (
-                    <div class="volo-help" style={{ padding: "8px 0" }}>
-                      {t("sys.oidc_empty")}
+                  {oidcProviders.length > 0 && (
+                    <div class="volo-input-row" style={{ flexWrap: "wrap", gap: "6px" }}>
+                      {oidcProviders.map((p) => (
+                        <button
+                          key={p.name}
+                          type="button"
+                          class="volo-btn volo-btn-sm"
+                          onClick={async () => {
+                            const label = t("sys.oidc_link_btn", { provider: p.display_name || p.name });
+                            const pwd = await promptStepUpPassword({
+                              title: label,
+                              subtitle: t("sys.oidc_links_desc"),
+                              confirmLabel: label,
+                            });
+                            if (!pwd) return;
+                            try {
+                              const res = await apiFetch<{ redirect_url?: string; url?: string }>(
+                                "/api/admin/security/oidc-links/begin",
+                                {
+                                  method: "POST",
+                                  body: JSON.stringify({
+                                    provider: p.name,
+                                    current_password: pwd,
+                                  }),
+                                },
+                              );
+                              const targetUrl = res.redirect_url || res.url;
+                              if (targetUrl) {
+                                window.location.assign(targetUrl);
+                              }
+                            } catch (err: any) {
+                              showToast(err?.message || t("api.err_network"), "err");
+                            }
+                          }}
+                        >
+                          <PlusIcon size={14} /> {t("sys.oidc_link_btn", { provider: p.display_name || p.name })}
+                        </button>
+                      ))}
                     </div>
-                  ) : (
+                  )}
+                </div>
+
+                {oidcLinks.length === 0 ? (
+                  <div class="volo-help" style={{ padding: "8px 0" }}>
+                    {t("sys.oidc_empty")}
+                  </div>
+                ) : (
+                  <>
                     <div class="volo-table-wrap">
                       <table class="volo-table volo-table-compact">
                         <thead>
@@ -2572,7 +2838,7 @@ export function SystemWorkspace({
                           </tr>
                         </thead>
                         <tbody>
-                          {oidcLinks.map((lk) => (
+                          {oidcPaged.slice.map((lk) => (
                             <tr key={lk.id}>
                               <td class="col-fluid" data-label={t("sys.oidc_col_account")} style={{ minWidth: 0 }}>
                                 <div class="volo-cell-main" style={{ minWidth: 0 }}>
@@ -2608,247 +2874,252 @@ export function SystemWorkspace({
                         </tbody>
                       </table>
                     </div>
-                  )}
-                </div>
+                    <Pagination
+                      total={oidcLinks.length}
+                      page={oidcPaged.safePage}
+                      pageSize={10}
+                      onChange={setOidcPage}
+                    />
+                  </>
+                )}
               </div>
-            </div>
+            </>
           )}
 
           {accSub === "sessions" && (
             <>
-              <div class="volo-grid-2">
-                <div class="volo-card">
-                  <div class="volo-sec-head">
-                    <div class="volo-sec-copy">
-                      <h3 class="volo-card-title">{t("sys.pat_head")}</h3>
-                      <p class="volo-sec-desc">{t("sys.pat_desc")}</p>
-                    </div>
+              <div class="volo-card">
+                <div class="volo-sec-head">
+                  <div class="volo-sec-copy">
+                    <h3 class="volo-card-title">{t("sys.sess_head")}</h3>
+                    <p class="volo-sec-desc">{t("sys.sess_desc")}</p>
+                  </div>
+                  {otherSessionsCount > 0 && (
                     <button
                       type="button"
-                      class="volo-btn volo-btn-primary volo-btn-sm"
-                      onClick={() => {
-                        setIssuedPAT("");
-                        setPatName("Obsidian CLI");
-                        setPatScopes(["articles:read", "articles:write", "media:write"]);
-                        setPatExpiresDays(90);
-                        setPatCurrPwd("");
-                        setPatModalOpen(true);
+                      class="volo-btn volo-btn-sm volo-btn-danger"
+                      disabled={revokingOthers}
+                      onClick={async () => {
+                        if (
+                          !(await openConfirm({
+                            message: t("sys.confirm_kick_other_sess", { n: otherSessionsCount }),
+                            danger: true,
+                          }))
+                        ) {
+                          return;
+                        }
+                        setRevokingOthers(true);
+                        try {
+                          await apiFetch("/api/admin/security/sessions", { method: "DELETE" });
+                          showToast(t("sys.sess_kicked_others"));
+                          void loadSub();
+                        } catch (err: any) {
+                          showToast(err.message);
+                        } finally {
+                          setRevokingOthers(false);
+                        }
                       }}
                     >
-                      <PlusIcon size={14} /> {t("sys.pat_generate")}
+                      {t("sys.sess_kick_others")} ({otherSessionsCount})
                     </button>
-                  </div>
-
-                  {issuedPAT && !patModalOpen && (
-                    <div class="volo-subcard volo-input-row" style={{ justifyContent: "space-between", flexWrap: "wrap", wordBreak: "break-all" }}>
-                      <div>
-                        <strong>{t("sys.pat_copy_once")}</strong> <code>{issuedPAT}</code>
-                      </div>
-                      <button
-                        type="button"
-                        class="volo-btn volo-btn-sm"
-                        onClick={() => {
-                          void navigator.clipboard.writeText(issuedPAT);
-                          showToast(t("cnt.media_copied"));
-                        }}
-                      >
-                        {t("cnt.media_copy")}
-                      </button>
-                    </div>
                   )}
-
-                  <div class="volo-table-wrap">
-                    <table class="volo-table volo-table-compact">
-                      <thead>
-                        <tr>
-                          <th class="col-fluid">{t("sys.pat_col_token")}</th>
-                          <th class="col-fluid">{t("sys.pat_col_scopes")}</th>
-                          <th class="col-act col-act-th">{t("art.actions")}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {loading ? (
-                          <TableSkeleton cols={3} rows={3} />
-                        ) : patPaged.slice.length === 0 ? (
-                          <ConsoleEmpty colSpan={3} />
-                        ) : (
-                          patPaged.slice.map((tk) => {
-                            const scList = parseScopes(tk.scopes_json);
-                            return (
-                              <tr key={tk.id}>
-                                <td class="col-fluid" data-label={t("sys.pat_col_token")}>
-                                  <div class="volo-cell-main">
-                                    <div class="volo-cell-title">
-                                      <span>{tk.name}</span>
-                                      <span class="volo-code-chip">{tk.token_prefix}…</span>
-                                    </div>
-                                    <div class="volo-cell-meta" style={{ flexWrap: "wrap" }}>
-                                      <span>
-                                        {tk.last_used_at > 0
-                                          ? t("sys.pat_last_used", { time: formatDateTime(tk.last_used_at) })
-                                          : t("sys.pat_never_used")}
+                </div>
+                <div class="volo-table-wrap">
+                  <table class="volo-table volo-table-compact">
+                    <thead>
+                      <tr>
+                        <th class="col-fluid">{t("sys.sess_col_device")}</th>
+                        <th class="col-date">{t("sys.col_created")}</th>
+                        <th class="col-act col-act-th">{t("art.actions")}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {loading ? (
+                        <TableSkeleton cols={3} rows={4} />
+                      ) : sessPaged.slice.length === 0 ? (
+                        <ConsoleEmpty colSpan={3} />
+                      ) : (
+                        sessPaged.slice.map((s) => {
+                          const isCurrentSess = s.id === meInfo?.session_id;
+                          return (
+                            <tr key={s.id}>
+                              <td class="col-fluid" data-label={t("sys.sess_col_device")}>
+                                <div class="volo-cell-main">
+                                  <div class="volo-cell-title">
+                                    <span class="volo-code-chip is-wrap">{s.client_ip || s.ip_masked}</span>
+                                    {s.geo_region && <span class="volo-mini-tag">{s.geo_region}</span>}
+                                    <span class="volo-mini-tag" title={s.user_agent || ""}>
+                                      {summarizeUA(s.user_agent)}
+                                    </span>
+                                    {isCurrentSess && (
+                                      <span class="volo-status-pill ok">
+                                        <span class="volo-status-dot" />
+                                        {t("sys.sess_current")}
                                       </span>
-                                      <span>
-                                        {tk.expires_at > 0
-                                          ? t("sys.pat_expires", { time: formatDateTime(tk.expires_at) })
-                                          : t("sys.waf_dur_perm")}
-                                      </span>
-                                    </div>
+                                    )}
                                   </div>
-                                </td>
-                                <td class="col-fluid" data-label={t("sys.pat_col_scopes")}>
-                                  <div class="volo-cell-meta" style={{ flexWrap: "wrap", gap: "4px" }}>
-                                    {scList.length > 0 ? scList.map((sc) => (
-                                      <span key={sc} class="volo-mini-tag">{sc}</span>
-                                    )) : <span class="volo-help">—</span>}
-                                  </div>
-                                </td>
-                                <td class="col-act" data-label={t("art.actions")}>
-                                  <div class="volo-row-actions">
+                                </div>
+                              </td>
+                              <td class="col-date" data-label={t("sys.col_created")}>
+                                <span title={s.user_agent || ""}>{formatDateTime(s.last_seen_at)}</span>
+                              </td>
+                              <td class={`col-act ${isCurrentSess ? "is-empty-act" : ""}`.trim()} data-label={t("art.actions")}>
+                                <div class="volo-row-actions">
+                                  {!isCurrentSess && (
                                     <button
                                       type="button"
                                       class="volo-act-btn danger"
                                       onClick={async () => {
-                                        if (!(await openConfirm({ message: t("sys.confirm_revoke_pat", { name: tk.name }), danger: true }))) return;
+                                        if (!(await openConfirm({ message: t("sys.confirm_kick_sess"), danger: true }))) return;
                                         try {
-                                          await apiFetch(`/api/admin/security/tokens/${tk.id}`, { method: "DELETE" });
+                                          await apiFetch(`/api/admin/security/sessions/${s.id}`, { method: "DELETE" });
                                           void loadSub();
                                         } catch (err: any) {
                                           showToast(err.message);
                                         }
                                       }}
                                     >
-                                      {t("sys.pat_revoke")}
+                                      {t("sys.sess_kick")}
                                     </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          })
-                        )}
-                      </tbody>
-                    </table>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                <Pagination
+                  total={sessions.length}
+                  page={sessPaged.safePage}
+                  pageSize={10}
+                  onChange={(p) => {
+                    setSessPage(p);
+                    resetConsoleScroll();
+                  }}
+                />
+              </div>
+
+              <div class="volo-card">
+                <div class="volo-sec-head">
+                  <div class="volo-sec-copy">
+                    <h3 class="volo-card-title">{t("sys.pat_head")}</h3>
+                    <p class="volo-sec-desc">{t("sys.pat_desc")}</p>
                   </div>
-                  <Pagination
-                    total={tokens.length}
-                    page={patPaged.safePage}
-                    pageSize={10}
-                    onChange={setPatPage}
-                  />
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-primary volo-btn-sm"
+                    onClick={() => {
+                      setIssuedPAT("");
+                      setPatName("Obsidian CLI");
+                      setPatScopes(["articles:read", "articles:write", "media:write"]);
+                      setPatExpiresDays(90);
+                      setPatCurrPwd("");
+                      setPatModalOpen(true);
+                    }}
+                  >
+                    <PlusIcon size={14} /> {t("sys.pat_generate")}
+                  </button>
                 </div>
 
-                <div class="volo-card">
-                  <div class="volo-sec-head">
-                    <div class="volo-sec-copy">
-                      <h3 class="volo-card-title">{t("sys.sess_head")}</h3>
-                      <p class="volo-sec-desc">{t("sys.sess_desc")}</p>
+                {issuedPAT && !patModalOpen && (
+                  <div class="volo-subcard volo-input-row" style={{ justifyContent: "space-between", flexWrap: "wrap", wordBreak: "break-all" }}>
+                    <div>
+                      <strong>{t("sys.pat_copy_once")}</strong> <code>{issuedPAT}</code>
                     </div>
-                    {otherSessionsCount > 0 && (
-                      <button
-                        type="button"
-                        class="volo-btn volo-btn-sm volo-btn-danger"
-                        disabled={revokingOthers}
-                        onClick={async () => {
-                          if (
-                            !(await openConfirm({
-                              message: t("sys.confirm_kick_other_sess", { n: otherSessionsCount }),
-                              danger: true,
-                            }))
-                          ) {
-                            return;
-                          }
-                          setRevokingOthers(true);
-                          try {
-                            await apiFetch("/api/admin/security/sessions", { method: "DELETE" });
-                            showToast(t("sys.sess_kicked_others"));
-                            void loadSub();
-                          } catch (err: any) {
-                            showToast(err.message);
-                          } finally {
-                            setRevokingOthers(false);
-                          }
-                        }}
-                      >
-                        {t("sys.sess_kick_others")} ({otherSessionsCount})
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-sm"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(issuedPAT);
+                        showToast(t("cnt.media_copied"));
+                      }}
+                    >
+                      {t("cnt.media_copy")}
+                    </button>
                   </div>
-                  <div class="volo-table-wrap">
-                    <table class="volo-table volo-table-compact">
-                      <thead>
-                        <tr>
-                          <th class="col-fluid">{t("sys.sess_col_device")}</th>
-                          <th class="col-act col-act-th">{t("art.actions")}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {loading ? (
-                          <TableSkeleton cols={2} rows={4} />
-                        ) : sessPaged.slice.length === 0 ? (
-                          <ConsoleEmpty colSpan={2} />
-                        ) : (
-                          sessPaged.slice.map((s) => {
-                            const isCurrentSess = s.id === meInfo?.session_id;
-                            return (
-                              <tr key={s.id}>
-                                <td class="col-fluid" data-label={t("sys.sess_col_device")}>
-                                  <div class="volo-cell-main">
-                                    <div class="volo-cell-title">
-                                      <span class="volo-code-chip">{s.client_ip || s.ip_masked}</span>
-                                      {s.geo_region && <span class="volo-mini-tag">{s.geo_region}</span>}
-                                      <span class="volo-mini-tag" title={s.user_agent || ""}>
-                                        {summarizeUA(s.user_agent)}
-                                      </span>
-                                      {isCurrentSess && (
-                                        <span class="volo-status-pill ok">
-                                          <span class="volo-status-dot" />
-                                          {t("sys.sess_current")}
-                                        </span>
-                                      )}
-                                    </div>
-                                    <div class="volo-cell-meta">
-                                      <span title={s.user_agent || ""}>{formatDateTime(s.last_seen_at)}</span>
-                                    </div>
+                )}
+
+                <div class="volo-table-wrap">
+                  <table class="volo-table volo-table-compact">
+                    <thead>
+                      <tr>
+                        <th class="col-fluid">{t("sys.pat_col_token")}</th>
+                        <th class="col-fluid">{t("sys.pat_col_scopes")}</th>
+                        <th class="col-act col-act-th">{t("art.actions")}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {loading ? (
+                        <TableSkeleton cols={3} rows={3} />
+                      ) : patPaged.slice.length === 0 ? (
+                        <ConsoleEmpty colSpan={3} />
+                      ) : (
+                        patPaged.slice.map((tk) => {
+                          const scList = parseScopes(tk.scopes_json);
+                          return (
+                            <tr key={tk.id}>
+                              <td class="col-fluid" data-label={t("sys.pat_col_token")}>
+                                <div class="volo-cell-main">
+                                  <div class="volo-cell-title">
+                                    <span>{tk.name}</span>
+                                    <span class="volo-code-chip is-wrap">{tk.token_prefix}…</span>
                                   </div>
-                                </td>
-                                <td class={`col-act ${isCurrentSess ? "is-empty-act" : ""}`.trim()} data-label={t("art.actions")}>
-                                  <div class="volo-row-actions">
-                                    {!isCurrentSess && (
-                                      <button
-                                        type="button"
-                                        class="volo-act-btn danger"
-                                        onClick={async () => {
-                                          if (!(await openConfirm({ message: t("sys.confirm_kick_sess"), danger: true }))) return;
-                                          try {
-                                            await apiFetch(`/api/admin/security/sessions/${s.id}`, { method: "DELETE" });
-                                            void loadSub();
-                                          } catch (err: any) {
-                                            showToast(err.message);
-                                          }
-                                        }}
-                                      >
-                                        {t("sys.sess_kick")}
-                                      </button>
-                                    )}
+                                  <div class="volo-cell-meta" style={{ flexWrap: "wrap" }}>
+                                    <span>
+                                      {tk.last_used_at > 0
+                                        ? t("sys.pat_last_used", { time: formatDateTime(tk.last_used_at) })
+                                        : t("sys.pat_never_used")}
+                                    </span>
+                                    <span>
+                                      {tk.expires_at > 0
+                                        ? t("sys.pat_expires", { time: formatDateTime(tk.expires_at) })
+                                        : t("sys.waf_dur_perm")}
+                                    </span>
                                   </div>
-                                </td>
-                              </tr>
-                            );
-                          })
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-                  <Pagination
-                    total={sessions.length}
-                    page={sessPaged.safePage}
-                    pageSize={10}
-                    onChange={(p) => {
-                      setSessPage(p);
-                      resetConsoleScroll();
-                    }}
-                  />
+                                </div>
+                              </td>
+                              <td class="col-fluid" data-label={t("sys.pat_col_scopes")}>
+                                <div class="volo-cell-meta" style={{ flexWrap: "wrap", gap: "4px" }}>
+                                  {scList.length > 0 ? scList.map((sc) => (
+                                    <span key={sc} class="volo-mini-tag">{sc}</span>
+                                  )) : <span class="volo-help">—</span>}
+                                </div>
+                              </td>
+                              <td class="col-act" data-label={t("art.actions")}>
+                                <div class="volo-row-actions">
+                                  <button
+                                    type="button"
+                                    class="volo-act-btn danger"
+                                    onClick={async () => {
+                                      if (!(await openConfirm({ message: t("sys.confirm_revoke_pat", { name: tk.name }), danger: true }))) return;
+                                      try {
+                                        await apiFetch(`/api/admin/security/tokens/${tk.id}`, { method: "DELETE" });
+                                        void loadSub();
+                                      } catch (err: any) {
+                                        showToast(err.message);
+                                      }
+                                    }}
+                                  >
+                                    {t("sys.pat_revoke")}
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
                 </div>
+                <Pagination
+                  total={tokens.length}
+                  page={patPaged.safePage}
+                  pageSize={10}
+                  onChange={setPatPage}
+                />
               </div>
 
               <AnimatedModal
@@ -2952,7 +3223,7 @@ export function SystemWorkspace({
                     <div class="volo-field">
                       <label>{t("sys.lbl_pat_scopes")}</label>
                       <div class="volo-check-grid">
-                        {PAT_SCOPES.map((sc) => (
+                        {PAT_SCOPES.filter((sc) => sc !== "backup:read" || isAdmin).map((sc) => (
                           <SwitchToggle
                             key={sc}
                             checked={patScopes.includes(sc)}
@@ -3179,6 +3450,7 @@ export function SystemWorkspace({
               onClick={() => {
                 setEditingUserId(null);
                 setOrigUserEmail("");
+                setOrigUserRole("");
                 setUserForm({
                   username: "",
                   email: "",
@@ -3251,7 +3523,7 @@ export function SystemWorkspace({
                           <div class="volo-cell-main">
                             <div class="volo-cell-title">
                               <span>{u.display_name || u.username}</span>
-                              <span class="volo-code-chip">@{u.username}</span>
+                              <span class="volo-code-chip is-wrap">@{u.username}</span>
                             </div>
                             {u.email && (
                               <div class="volo-cell-meta">
@@ -3274,10 +3546,17 @@ export function SystemWorkspace({
                                   { value: "reader", label: t("role.reader") },
                                 ]}
                                 onChange={async (nextRole) => {
+                                  if (nextRole === u.role) return;
+                                  const pwd = await promptStepUpPassword({
+                                    title: t("sys.edit_user"),
+                                    subtitle: t("sys.stepup_user_desc"),
+                                    confirmLabel: t("common.save"),
+                                  });
+                                  if (!pwd) return;
                                   try {
                                     await apiFetch(`/api/admin/users/${u.id}`, {
                                       method: "PATCH",
-                                      body: JSON.stringify({ role: nextRole }),
+                                      body: JSON.stringify({ role: nextRole, current_password: pwd }),
                                     });
                                     showToast(t("common.saved"));
                                     void loadUsersList();
@@ -3306,6 +3585,7 @@ export function SystemWorkspace({
                               onClick={() => {
                                 setEditingUserId(u.id);
                                 setOrigUserEmail(u.email || "");
+                                setOrigUserRole(u.role || "editor");
                                 setUserForm({
                                   username: u.username || "",
                                   email: u.email || "",
@@ -3407,10 +3687,11 @@ export function SystemWorkspace({
                 try {
                   if (editingUserId) {
                     const isSelfEdit = editingUserId === currentUserSig.value?.id;
-                    const selfNeedsStepUp =
-                      isSelfEdit &&
-                      (userForm.email.trim().toLowerCase() !== origUserEmail.trim().toLowerCase() || Boolean(userForm.password.trim()));
-                    if (selfNeedsStepUp && !userForm.current_password.trim()) {
+                    const needsStepUp =
+                      userForm.role !== origUserRole ||
+                      userForm.email.trim().toLowerCase() !== origUserEmail.trim().toLowerCase() ||
+                      Boolean(userForm.password.trim());
+                    if (needsStepUp && !userForm.current_password.trim()) {
                       showToast(t("sys.reauth_pwd_required"), "err");
                       return;
                     }
@@ -3421,13 +3702,17 @@ export function SystemWorkspace({
                       status: userForm.status,
                     };
                     if (userForm.password.trim()) body.password = userForm.password;
-                    if (selfNeedsStepUp) body.current_password = userForm.current_password;
+                    if (needsStepUp) body.current_password = userForm.current_password;
                     await apiFetch(`/api/admin/users/${editingUserId}`, {
                       method: "PATCH",
                       body: JSON.stringify(body),
                     });
                     if (isSelfEdit) await refreshMe();
                   } else {
+                    if (!userForm.current_password.trim()) {
+                      showToast(t("sys.reauth_pwd_required"), "err");
+                      return;
+                    }
                     await apiFetch("/api/admin/users", {
                       method: "POST",
                       body: JSON.stringify({
@@ -3436,6 +3721,7 @@ export function SystemWorkspace({
                         email: userForm.email,
                         role: userForm.role,
                         password: userForm.password,
+                        current_password: userForm.current_password,
                       }),
                     });
                   }
@@ -3547,9 +3833,10 @@ export function SystemWorkspace({
               </div>
 
               {Boolean(
-                editingUserId &&
-                  editingUserId === currentUserSig.value?.id &&
-                  (userForm.email.trim().toLowerCase() !== origUserEmail.trim().toLowerCase() || Boolean(userForm.password.trim()))
+                !editingUserId ||
+                  userForm.role !== origUserRole ||
+                  userForm.email.trim().toLowerCase() !== origUserEmail.trim().toLowerCase() ||
+                  Boolean(userForm.password.trim())
               ) && (
                 <div class="volo-field">
                   <label>{t("sys.cur_pwd")} *</label>
@@ -3563,6 +3850,7 @@ export function SystemWorkspace({
                     value={userForm.current_password}
                     onInput={(e) => setUserForm({ ...userForm, current_password: (e.currentTarget as HTMLInputElement).value })}
                   />
+                  <span class="volo-help">{t("sys.stepup_user_desc")}</span>
                 </div>
               )}
             </form>
@@ -3660,6 +3948,34 @@ export function SystemWorkspace({
                     </div>
                   </>
                 )}
+                {!!domains.security?.geo_policy_active && (
+                  <>
+                    <div class="volo-field">
+                      <label>{t("sys.geo_default_action")}</label>
+                      <ConsoleSelect
+                        searchable={false}
+                        value={domains.security?.geo_default_action || "allow"}
+                        options={[
+                          { value: "allow", label: t("sys.geo_allow") },
+                          { value: "deny", label: t("sys.geo_deny") },
+                        ]}
+                        onChange={(v) => setDomField("security", "geo_default_action", v)}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.geo_unknown_action")}</label>
+                      <ConsoleSelect
+                        searchable={false}
+                        value={domains.security?.geo_unknown_action || "allow"}
+                        options={[
+                          { value: "allow", label: t("sys.geo_allow") },
+                          { value: "deny", label: t("sys.geo_deny") },
+                        ]}
+                        onChange={(v) => setDomField("security", "geo_unknown_action", v)}
+                      />
+                    </div>
+                  </>
+                )}
                 <div class="volo-field">
                   <label>{t("sys.totp_scope")}</label>
                   <ConsoleSelect
@@ -3670,6 +3986,28 @@ export function SystemWorkspace({
                       { value: "staff", label: t("sys.totp_scope_staff") },
                     ]}
                     onChange={(v) => setDomField("security", "totp_required_scope", v)}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("sys.totp_remember_days")}</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={365}
+                    class="volo-input"
+                    value={domains.security?.totp_remember_days ?? 30}
+                    onInput={(e) => setDomField("security", "totp_remember_days", Number((e.currentTarget as HTMLInputElement).value))}
+                  />
+                </div>
+                <div class="volo-field">
+                  <label>{t("sys.totp_window_steps")}</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={5}
+                    class="volo-input"
+                    value={domains.security?.totp_window_steps ?? 1}
+                    onInput={(e) => setDomField("security", "totp_window_steps", Number((e.currentTarget as HTMLInputElement).value))}
                   />
                 </div>
               </div>
@@ -3817,7 +4155,7 @@ export function SystemWorkspace({
                             />
                           </td>
                           <td data-label={t("tbl.col_cidr")}>
-                            <span class="volo-code-chip">{b.cidr}</span>
+                            <span class="volo-code-chip is-wrap">{b.cidr}</span>
                           </td>
                           <td class="col-fluid" data-label={t("tbl.col_note")}>
                             <div class="volo-cell-meta">
@@ -4041,7 +4379,7 @@ export function SystemWorkspace({
                           {t("sys.geo_status_active")}
                         </span>
                         {geoDBStatus!.active_files!.map((f) => (
-                          <span key={f} class="volo-code-chip">
+                          <span key={f} class="volo-code-chip is-wrap">
                             {f}
                           </span>
                         ))}
@@ -4063,13 +4401,14 @@ export function SystemWorkspace({
                       name="geo_rules_db_path_cfg"
                       aria-label={t("sys.geo_db_sub_title")}
                       autoComplete="off"
+                      disabled={geoipDirPinned || Boolean(domains?.security?.geoip_dir_pinned)}
                       placeholder={defaultGeoIPDir || "./data/geoip"}
                       value={domains?.security?.geoip_dir || ""}
                       onInput={(e) =>
                         setDomField("security", "geoip_dir", (e.currentTarget as HTMLInputElement).value)
                       }
                       onKeyDown={(e) => {
-                        if (e.key === "Enter") {
+                        if (e.key === "Enter" && !(geoipDirPinned || Boolean(domains?.security?.geoip_dir_pinned))) {
                           e.preventDefault();
                           void reloadGeoDatabases(true);
                         }
@@ -4078,7 +4417,7 @@ export function SystemWorkspace({
                     <button
                       type="button"
                       class="volo-btn volo-btn-primary volo-btn-sm"
-                      disabled={reloadingGeo || !!savingDomain}
+                      disabled={reloadingGeo || !!savingDomain || geoipDirPinned || Boolean(domains?.security?.geoip_dir_pinned)}
                       onClick={() => void reloadGeoDatabases(true)}
                     >
                       {t("sys.geo_save_path_btn")}
@@ -4095,6 +4434,11 @@ export function SystemWorkspace({
                   <span class="volo-help">
                     {t("sys.geo_dir_hint", { dir: defaultGeoIPDir || "./data/geoip" })}
                   </span>
+                  {(geoipDirPinned || Boolean(domains?.security?.geoip_dir_pinned)) && (
+                    <span class="volo-help" style={{ color: "var(--volo-warn)" }}>
+                      {t("sys.dir_pinned_hint")}
+                    </span>
+                  )}
                   {Array.isArray(geoDBStatus?.skipped_files) && geoDBStatus!.skipped_files!.length > 0 && (
                     <span class="volo-help" style={{ color: "var(--volo-warn)" }}>
                       {t("sys.geo_status_skipped", { files: geoDBStatus!.skipped_files!.join(", ") })}
@@ -4559,9 +4903,17 @@ export function SystemWorkspace({
                   </div>
                 </form>
               </AnimatedModal>
+            </div>
+
+            <div class="volo-card">
+              <div class="volo-sec-head">
+                <div class="volo-sec-copy">
+                  <h3 class="volo-card-title">{t("setup.legacy_tab")}</h3>
+                  <p class="volo-sec-desc">{t("setup.legacy_desc")}</p>
+                </div>
+              </div>
 
               <div class="volo-subcard">
-                <div class="volo-subcard-title">{t("sys.backup_legacy")}</div>
                 <div class="volo-check-grid">
                   <SwitchToggle
                     checked={legacyDryRun}
@@ -4570,7 +4922,7 @@ export function SystemWorkspace({
                   />
                 </div>
                 <UploadProgressBar progress={legacyProgress} label={t("setup.importing")} />
-                <div class="volo-form-actions no-border">
+                <div class="volo-form-actions">
                   <UploadButton
                     accept=".zip,.json"
                     small={false}
@@ -4578,13 +4930,26 @@ export function SystemWorkspace({
                     busyLabel={t("setup.importing")}
                     label={t("sys.backup_legacy")}
                     onFile={async (f) => {
-                      if (!legacyDryRun && !(await openConfirm({ message: t("sys.confirm_import_legacy"), danger: true }))) return;
+                      let stepUpPwd = "";
+                      if (!legacyDryRun) {
+                        const entered = await promptStepUpPassword({
+                          title: t("sys.backup_legacy"),
+                          subtitle: t("sys.confirm_import_legacy"),
+                          confirmLabel: t("sys.backup_legacy"),
+                          danger: true,
+                        });
+                        if (!entered) return;
+                        stepUpPwd = entered;
+                      }
                       setLegacyBusy(true);
                       setLegacyProgress(0);
                       try {
                         const fd = new FormData();
                         fd.append("file", f);
                         fd.append("dry_run", legacyDryRun ? "1" : "0");
+                        if (!legacyDryRun && stepUpPwd) {
+                          fd.append("current_password", stepUpPwd);
+                        }
                         const res = await uploadWithProgress<{ report?: any; dry_run?: boolean }>(
                           `/api/admin/backups/import-legacy${legacyDryRun ? "?dry_run=1" : ""}`,
                           fd,
@@ -4657,12 +5022,13 @@ export function SystemWorkspace({
                 )}
               </div>
             </div>
+          </div>
 
-            {domains?.backup && (
-              <form
-                class="volo-card"
-                autoComplete="off"
-                onSubmit={async (e) => {
+          {domains?.backup && (
+            <form
+              class="volo-card"
+              autoComplete="off"
+              onSubmit={async (e) => {
                   e.preventDefault();
                   const body: any = { ...(domains.backup || {}) };
                   if (bakWebdavPwd) body.webdav_password = bakWebdavPwd;
@@ -4834,6 +5200,30 @@ export function SystemWorkspace({
                         </div>
                         <div class="volo-grid-2">
                           <div class="volo-field">
+                            <label>{t("sys.backup_s3_region")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_s3_region"
+                              autoComplete="off"
+                              placeholder={t("sys.s3_region_ph")}
+                              value={domains.backup?.s3_region || ""}
+                              onInput={(e) => setDomField("backup", "s3_region", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                          <div class="volo-field">
+                            <label>{t("sys.backup_s3_prefix")}</label>
+                            <input
+                              class="volo-input"
+                              name="bak_s3_prefix"
+                              autoComplete="off"
+                              placeholder="backups"
+                              value={domains.backup?.s3_prefix || ""}
+                              onInput={(e) => setDomField("backup", "s3_prefix", (e.currentTarget as HTMLInputElement).value)}
+                            />
+                          </div>
+                        </div>
+                        <div class="volo-grid-2">
+                          <div class="volo-field">
                             <label>{t("sys.lbl_s3_ak")}</label>
                             <input
                               class="volo-input"
@@ -4874,6 +5264,13 @@ export function SystemWorkspace({
                             />
                           </div>
                         </div>
+                        <div class="volo-check-grid" style={{ marginTop: "6px" }}>
+                          <SwitchToggle
+                            checked={!!domains.backup?.s3_path_style}
+                            onChange={(v) => setDomField("backup", "s3_path_style", v)}
+                            label={t("sys.backup_s3_path_style")}
+                          />
+                        </div>
                       </div>
                     )}
                   </>
@@ -4885,8 +5282,7 @@ export function SystemWorkspace({
                   </button>
                 </div>
               </form>
-            )}
-          </div>
+          )}
 
           {/* Local Rolling Backup Snapshots */}
           <div class="volo-card">
@@ -4944,7 +5340,7 @@ export function SystemWorkspace({
                     localBakPaged.slice.map((b) => (
                       <tr key={b.name}>
                         <td class="col-fluid" data-label={t("sys.bak_col_file")}>
-                          <span class="volo-code-chip">{b.name}</span>
+                          <span class="volo-code-chip is-wrap">{b.name}</span>
                         </td>
                         <td class="col-cat" data-label={t("cnt.media_col_size")}>
                           <span class="volo-help">{formatBytes(b.size_bytes)}</span>
@@ -4954,30 +5350,69 @@ export function SystemWorkspace({
                         </td>
                         <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
-                            <a
+                            <button
+                              type="button"
                               class="volo-act-btn"
-                              href={`${localBakEndpoint}/${encodeURIComponent(b.name)}`}
-                              download={b.name}
+                              onClick={async () => {
+                                const pwd = await promptStepUpPassword({
+                                  title: t("sys.bak_download"),
+                                  subtitle: t("sys.stepup_snap_dl_desc"),
+                                  confirmLabel: t("sys.bak_download"),
+                                });
+                                if (!pwd) return;
+                                try {
+                                  const res = await apiFetch<{
+                                    ticket: string;
+                                    download_url?: string;
+                                    export_url?: string;
+                                  }>(`${localBakEndpoint}/${encodeURIComponent(b.name)}/ticket`, {
+                                    method: "POST",
+                                    body: JSON.stringify({ current_password: pwd }),
+                                  });
+                                  const dlUrl =
+                                    res.download_url ||
+                                    res.export_url ||
+                                    `${localBakEndpoint}/${encodeURIComponent(b.name)}?ticket=${encodeURIComponent(res.ticket)}`;
+                                  const a = document.createElement("a");
+                                  a.href = dlUrl;
+                                  a.download = b.name;
+                                  a.style.display = "none";
+                                  document.body.appendChild(a);
+                                  a.click();
+                                  a.remove();
+                                } catch (err: any) {
+                                  showToast(err.message, "err");
+                                }
+                              }}
                             >
                               {t("sys.bak_download")}
-                            </a>
+                            </button>
                             <ActionMenu
                               items={[
                                 {
                                   label: t("sys.bak_restore_btn"),
                                   onClick: async () => {
-                                    if (
-                                      !dryRunRestore &&
-                                      !(await openConfirm({ message: t("sys.confirm_restore_snap", { name: b.name }), danger: true }))
-                                    ) {
-                                      return;
+                                    let pwd = "";
+                                    if (!dryRunRestore) {
+                                      const entered = await promptStepUpPassword({
+                                        title: t("sys.bak_restore_btn"),
+                                        subtitle: `${t("sys.confirm_restore_snap", { name: b.name })} — ${t("sys.stepup_snap_restore_desc")}`,
+                                        confirmLabel: t("sys.bak_restore_btn"),
+                                        danger: true,
+                                      });
+                                      if (!entered) return;
+                                      pwd = entered;
                                     }
                                     try {
                                       await apiFetch(
                                         `${localBakEndpoint}/${encodeURIComponent(b.name)}/restore${dryRunRestore ? "?dry_run=1" : ""}`,
                                         {
                                           method: "POST",
-                                          body: JSON.stringify({ dry_run: dryRunRestore }),
+                                          body: JSON.stringify(
+                                            dryRunRestore
+                                              ? { dry_run: true }
+                                              : { dry_run: false, current_password: pwd }
+                                          ),
                                         }
                                       );
                                       showToast(dryRunRestore ? t("sys.backup_dry_ok") : t("sys.backup_restored"));
@@ -5294,7 +5729,7 @@ export function SystemWorkspace({
                               {localizeAuditResource(l.resource_type)}
                               {l.resource_id ? ` · ${l.resource_id}` : ""}
                             </span>
-                            {l.client_ip && <span class="volo-code-chip">{l.client_ip}</span>}
+                            {l.client_ip && <span class="volo-code-chip is-wrap">{l.client_ip}</span>}
                             {prettyDetail && (
                               <button
                                 type="button"
@@ -5311,9 +5746,11 @@ export function SystemWorkspace({
                               style={{
                                 marginTop: "8px",
                                 fontSize: "12px",
+                                maxHeight: "260px",
                                 whiteSpace: "pre-wrap",
                                 overflowWrap: "anywhere",
                                 overflowX: "auto",
+                                overflowY: "auto",
                               }}
                             >
                               {prettyDetail}
@@ -5342,6 +5779,56 @@ export function SystemWorkspace({
           />
         </div>
       )}
+
+      <AnimatedModal
+        open={Boolean(stepUpModal)}
+        onClose={() => closeStepUpModal(null)}
+        title={stepUpModal?.title || t("sys.cur_pwd")}
+        subtitle={stepUpModal?.subtitle || ""}
+        maxWidth="440px"
+        footer={
+          <>
+            <button type="button" class="volo-btn" onClick={() => closeStepUpModal(null)}>
+              {t("common.cancel")}
+            </button>
+            <button
+              type="submit"
+              form="volo-stepup-prompt-form"
+              class={`volo-btn ${stepUpModal?.danger ? "volo-btn-danger" : "volo-btn-primary"}`}
+            >
+              {stepUpModal?.confirmLabel || t("common.confirm")}
+            </button>
+          </>
+        }
+      >
+        <form
+          id="volo-stepup-prompt-form"
+          autoComplete="off"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!stepUpPwd.trim()) {
+              showToast(t("sys.stepup_pwd_required"), "err");
+              return;
+            }
+            closeStepUpModal(stepUpPwd);
+          }}
+        >
+          <div class="volo-field" style={{ marginBottom: 0 }}>
+            <label>{t("sys.cur_pwd")} *</label>
+            <input
+              type="password"
+              class="volo-input"
+              required
+              autoFocus
+              name="stepup_modal_current_password"
+              autoComplete="current-password"
+              placeholder={t("sys.reauth_pwd_ph")}
+              value={stepUpPwd}
+              onInput={(e) => setStepUpPwd((e.currentTarget as HTMLInputElement).value)}
+            />
+          </div>
+        </form>
+      </AnimatedModal>
     </div>
   );
 }

@@ -136,7 +136,7 @@ function validateSchemaRequired(
     const label = resolveSchemaText(f.label) || String(f.key);
     if (isSecretSchemaField(f)) {
       const cur = values[f.key];
-      const hasSaved = Boolean(secretKeysSet?.[f.key]) && cur !== CLEAR_SECRET_SENTINEL;
+      const hasSaved = (Boolean(secretKeysSet?.[f.key]) || cur === "********") && cur !== CLEAR_SECRET_SENTINEL;
       if (!hasSaved && (!cur || cur === CLEAR_SECRET_SENTINEL)) {
         return t("app.cfg_required_missing", { field: label });
       }
@@ -222,7 +222,7 @@ function SortableFixedOptsField({
         {reqMark}
       </label>
       {description && <div class="volo-help">{description}</div>}
-      <div ref={listRef} class="volo-sortable-list">
+      <div ref={listRef} class="volo-sortable-list" style={{ maxHeight: "280px", overflowY: "auto" }}>
         {enabledKeys.map((k, idx) => {
           const handleProps = getHandleProps(idx);
           return (
@@ -495,6 +495,8 @@ function SchemaFieldControl({
   namePrefix: string;
 }) {
   const [freeItemDraft, setFreeItemDraft] = useState("");
+  const [showSecret, setShowSecret] = useState(false);
+  const initialMaskedRef = useRef(values[f.key] === "********");
   const label = resolveSchemaText(f.label) || String(f.key);
   const desc = resolveSchemaText(f.description) || resolveSchemaText(f.help) || undefined;
   const reqMark = f.required ? " *" : "";
@@ -579,7 +581,9 @@ function SchemaFieldControl({
   if (isSecret) {
     const curVal = values[f.key];
     const isClearing = curVal === CLEAR_SECRET_SENTINEL;
-    const isSealed = Boolean(secretKeysSet?.[f.key]);
+    const isMaskedPlaceholder = curVal === "********";
+    const isSealed = Boolean(secretKeysSet?.[f.key]) || initialMaskedRef.current || isMaskedPlaceholder;
+    const displayVal = isClearing || isMaskedPlaceholder ? "" : String(curVal ?? "");
     return (
       <div class="volo-field">
         <label>
@@ -590,20 +594,44 @@ function SchemaFieldControl({
           )}
         </label>
         {desc && <div class="volo-help">{desc}</div>}
-        <input
-          type="password"
-          class="volo-input"
-          name={`${namePrefix}_${f.key}`}
-          autoComplete="new-password"
-          disabled={isClearing}
-          placeholder={isClearing ? t("app.clear_saved_secret") : isSealed ? "••••••••" : ph || "••••••••"}
-          value={isClearing ? "" : String(curVal ?? "")}
-          onInput={(e) => onChange(f.key, (e.currentTarget as HTMLInputElement).value)}
-        />
+        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <input
+            type={(showSecret ? "text" : "password") as "password"}
+            class="volo-input"
+            style={{ flex: 1, minWidth: 0 }}
+            name={`${namePrefix}_${f.key}`}
+            autoComplete="new-password"
+            disabled={isClearing}
+            placeholder={isClearing ? t("app.clear_saved_secret") : isSealed ? "********" : ph || "********"}
+            value={displayVal}
+            onInput={(e) => {
+              const nextVal = (e.currentTarget as HTMLInputElement).value;
+              if (nextVal === "" && initialMaskedRef.current) {
+                onChange(f.key, "********");
+              } else {
+                onChange(f.key, nextVal);
+              }
+            }}
+          />
+          <button
+            type="button"
+            class="volo-btn volo-btn-sm"
+            disabled={isClearing || displayVal === ""}
+            onClick={() => setShowSecret((prev) => !prev)}
+          >
+            {t(showSecret ? "app.secret_hide" : "app.secret_show")}
+          </button>
+        </div>
         <div style={{ marginTop: "6px" }}>
           <SwitchToggle
             checked={isClearing}
-            onChange={(clear) => onChange(f.key, clear ? CLEAR_SECRET_SENTINEL : "")}
+            onChange={(clear) => {
+              setShowSecret(false);
+              onChange(
+                f.key,
+                clear ? CLEAR_SECRET_SENTINEL : initialMaskedRef.current ? "********" : "",
+              );
+            }}
             label={t("app.clear_saved_secret")}
           />
         </div>
@@ -897,6 +925,8 @@ export function AppearanceWorkspace({
   const [uploading, setUploading] = useState<boolean>(false);
 
   const [themes, setThemes] = useState<any[]>([]);
+  const [themeQuery, setThemeQuery] = useState<string>("");
+  const [themePage, setThemePage] = useState<number>(1);
   const [brokenPreviews, setBrokenPreviews] = useState<Record<string, boolean>>({});
   const [appCfg, setAppCfg] = useState<any>(null);
   const [appVer, setAppVer] = useState<number>(0);
@@ -913,12 +943,21 @@ export function AppearanceWorkspace({
   const draftCssRef = useRef<string | null>(null);
 
   const [plugins, setPlugins] = useState<any[]>([]);
+  const [pluginQuery, setPluginQuery] = useState<string>("");
   const [pluginPage, setPluginPage] = useState<number>(1);
   const [cfgModal, setCfgModal] = useState<any | null>(null);
   const [cfgModalOpen, setCfgModalOpen] = useState<boolean>(false);
   const [cfgValues, setCfgValues] = useState<Record<string, any>>({});
   const [logsModal, setLogsModal] = useState<{ id: string; logs: any[] } | null>(null);
   const [logsModalOpen, setLogsModalOpen] = useState<boolean>(false);
+  const [logLevelFilter, setLogLevelFilter] = useState<string>("");
+  const [logTextFilter, setLogTextFilter] = useState<string>("");
+
+  const isAlreadyExistsConflict = (err: any): boolean => {
+    if (err?.status === 409) return true;
+    const raw = String(err?.payload?.error || err?.message || "");
+    return /already exists|conflict/i.test(raw);
+  };
 
   useEffect(() => {
     if (activeTab !== "themes" && draftCssRef.current !== null && !dirtyEditorSig.value) {
@@ -1043,6 +1082,35 @@ export function AppearanceWorkspace({
   const themeSchema: any[] = themeModal?.localized_schema || themeModal?.config_schema || [];
   const pluginSchema: any[] = cfgModal?.localized_schema || cfgModal?.config_schema || [];
 
+  const themeNeedle = themeQuery.trim().toLowerCase();
+  const filteredThemes = themeNeedle
+    ? themes.filter((th) => {
+        const hay = `${th.id || ""} ${th.display_name || ""} ${th.name || ""} ${th.author || ""} ${th.display_description || ""} ${th.description || ""}`.toLowerCase();
+        return hay.includes(themeNeedle);
+      })
+    : themes;
+  const pagedThemes = paginateItems(filteredThemes, themePage, 12);
+
+  const pluginNeedle = pluginQuery.trim().toLowerCase();
+  const filteredPlugins = pluginNeedle
+    ? plugins.filter((p) => {
+        const hay = `${p.id || ""} ${resolveSchemaText(p.name)} ${resolveSchemaText(p.description)} ${p.kind || ""} ${p.runtime || ""}`.toLowerCase();
+        return hay.includes(pluginNeedle);
+      })
+    : plugins;
+  const pagedPlugins = paginateItems(filteredPlugins, pluginPage, 12);
+
+  const filteredLogs = (logsModal?.logs || []).filter((l: any) => {
+    const lvl = String(l?.level || "info").toLowerCase();
+    if (logLevelFilter && lvl !== logLevelFilter.toLowerCase()) return false;
+    const q = logTextFilter.trim().toLowerCase();
+    if (!q) return true;
+    const msg = String(l?.msg ?? l?.message ?? "");
+    const ev = String(l?.event ?? "");
+    const ts = String(l?.ts ?? "");
+    return `${ts} ${lvl} ${ev} ${msg}`.toLowerCase().includes(q);
+  });
+
   return (
     <div>
       <div class="volo-subtabs">
@@ -1070,7 +1138,18 @@ export function AppearanceWorkspace({
                 <h3 class="volo-card-title">{t("app.gallery_head")}</h3>
                 <p class="volo-sec-desc">{t("app.gallery_sub")}</p>
               </div>
-              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                <input
+                  type="search"
+                  class="volo-input"
+                  style={{ width: "210px", maxWidth: "100%" }}
+                  placeholder={t("app.theme_search_ph")}
+                  value={themeQuery}
+                  onInput={(e) => {
+                    setThemeQuery((e.currentTarget as HTMLInputElement).value);
+                    setThemePage(1);
+                  }}
+                />
                 <button
                   type="button"
                   class="volo-btn volo-btn-sm"
@@ -1098,19 +1177,40 @@ export function AppearanceWorkspace({
                   busy={uploading}
                   label={t("app.install_theme_zip")}
                   onFile={async (f) => {
-                    setUploading(true);
-                    try {
+                    const uploadThemeZip = async (overwrite: boolean) => {
                       const fd = new FormData();
                       fd.append("file", f);
-                      await apiFetch(`/api/admin/themes/install?locale=${encodeURIComponent(localeSig.value)}`, {
+                      const qs = `locale=${encodeURIComponent(localeSig.value)}${overwrite ? "&overwrite=true" : ""}`;
+                      await apiFetch(`/api/admin/themes/install?${qs}`, {
                         method: "POST",
                         body: fd,
                       });
+                    };
+                    setUploading(true);
+                    try {
+                      await uploadThemeZip(false);
                       setBrokenPreviews({});
                       showToast(t("app.theme_installed"), "ok");
                       void loadData(true);
                     } catch (err: any) {
-                      showToast(err.message, "err");
+                      if (isAlreadyExistsConflict(err)) {
+                        const ok = await openConfirm({
+                          message: t("app.confirm_overwrite_theme"),
+                          danger: true,
+                        });
+                        if (ok) {
+                          try {
+                            await uploadThemeZip(true);
+                            setBrokenPreviews({});
+                            showToast(t("app.theme_installed"), "ok");
+                            void loadData(true);
+                          } catch (retryErr: any) {
+                            showToast(retryErr.message, "err");
+                          }
+                        }
+                      } else {
+                        showToast(err.message, "err");
+                      }
                     } finally {
                       setUploading(false);
                     }
@@ -1120,7 +1220,7 @@ export function AppearanceWorkspace({
             </div>
 
             <div class="volo-theme-grid">
-              {themes.map((th) => {
+              {pagedThemes.slice.map((th) => {
                 const isBuiltin = Boolean(th.is_builtin || th.builtin);
                 const isActive = (appCfg.active_theme || "volo-studio") === th.id;
                 const isMobileActive = Boolean(
@@ -1272,6 +1372,15 @@ export function AppearanceWorkspace({
                 );
               })}
             </div>
+            <Pagination
+              total={filteredThemes.length}
+              page={pagedThemes.safePage}
+              pageSize={12}
+              onChange={(p) => {
+                setThemePage(p);
+                resetConsoleScroll();
+              }}
+            />
           </div>
 
           <div class="volo-card">
@@ -1627,7 +1736,18 @@ export function AppearanceWorkspace({
               <h3 class="volo-card-title">{t("app.plugins_head")}</h3>
               <p class="volo-sec-desc">{t("app.plugins_desc")}</p>
             </div>
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+              <input
+                type="search"
+                class="volo-input"
+                style={{ width: "210px", maxWidth: "100%" }}
+                placeholder={t("app.plugin_search_ph")}
+                value={pluginQuery}
+                onInput={(e) => {
+                  setPluginQuery((e.currentTarget as HTMLInputElement).value);
+                  setPluginPage(1);
+                }}
+              />
               <button
                 type="button"
                 class="volo-btn volo-btn-sm"
@@ -1662,18 +1782,38 @@ export function AppearanceWorkspace({
                 busy={uploading}
                 label={t("app.install_zip")}
                 onFile={async (f) => {
-                  setUploading(true);
-                  try {
+                  const uploadPluginZip = async (overwrite: boolean) => {
                     const fd = new FormData();
                     fd.append("file", f);
-                    await apiFetch(`/api/admin/plugins/install?locale=${encodeURIComponent(localeSig.value)}`, {
+                    const qs = `locale=${encodeURIComponent(localeSig.value)}${overwrite ? "&overwrite=true" : ""}`;
+                    await apiFetch(`/api/admin/plugins/install?${qs}`, {
                       method: "POST",
                       body: fd,
                     });
+                  };
+                  setUploading(true);
+                  try {
+                    await uploadPluginZip(false);
                     showToast(t("app.installed_toast"), "ok");
                     void loadData(true);
                   } catch (err: any) {
-                    showToast(err.message, "err");
+                    if (isAlreadyExistsConflict(err)) {
+                      const ok = await openConfirm({
+                        message: t("app.confirm_overwrite_plugin"),
+                        danger: true,
+                      });
+                      if (ok) {
+                        try {
+                          await uploadPluginZip(true);
+                          showToast(t("app.installed_toast"), "ok");
+                          void loadData(true);
+                        } catch (retryErr: any) {
+                          showToast(retryErr.message, "err");
+                        }
+                      }
+                    } else {
+                      showToast(err.message, "err");
+                    }
                   } finally {
                     setUploading(false);
                   }
@@ -1695,11 +1835,13 @@ export function AppearanceWorkspace({
               <tbody>
                 {loading ? (
                   <TableSkeleton cols={4} />
-                ) : plugins.length === 0 ? (
+                ) : filteredPlugins.length === 0 ? (
                   <ConsoleEmpty colSpan={4} text={t("app.plugins_empty")} />
                 ) : (
-                  paginateItems(plugins, pluginPage, 12).slice.map((p) => {
+                  pagedPlugins.slice.map((p) => {
                     const pSchema: any[] = p.localized_schema || p.config_schema || [];
+                    const isCircuitOpen = p.circuit_state === "open" || p.circuit_state === "CIRCUIT_OPEN";
+                    const isBuiltinPlugin = Boolean(p.is_builtin || p.builtin || p.kind === "builtin");
                     return (
                       <tr key={p.id}>
                         <td class="col-fluid" data-label={t("app.plugin_col_info")}>
@@ -1747,7 +1889,7 @@ export function AppearanceWorkspace({
                                 }
                               }}
                             />
-                            {p.circuit_state === "CIRCUIT_OPEN" && (
+                            {isCircuitOpen && (
                               <span class="volo-status-pill danger">
                                 <span class="volo-status-dot" />
                                 {t("app.circuit_open", { count: p.failure_count })}
@@ -1779,6 +1921,8 @@ export function AppearanceWorkspace({
                                   const r = await apiFetch<{ items: any[] }>(
                                     `/api/admin/plugins/${encodeURIComponent(p.id)}/logs`,
                                   );
+                                  setLogLevelFilter("");
+                                  setLogTextFilter("");
                                   setLogsModal({ id: p.id, logs: r.items || [] });
                                   setLogsModalOpen(true);
                                 } catch (err: any) {
@@ -1788,11 +1932,20 @@ export function AppearanceWorkspace({
                             >
                               {t("app.logs")}
                             </button>
+                            {!isBuiltinPlugin && (
+                              <a
+                                class="volo-act-btn"
+                                href={`/api/admin/plugins/${encodeURIComponent(p.id)}/export`}
+                                download={`${p.id}.zip`}
+                              >
+                                {t("app.plugin_export_zip")}
+                              </a>
+                            )}
                             <ActionMenu
                               items={[
                                 {
                                   label: t("app.reset_circuit"),
-                                  hidden: p.circuit_state !== "CIRCUIT_OPEN",
+                                  hidden: !isCircuitOpen,
                                   onClick: async () => {
                                     try {
                                       await apiFetch(`/api/admin/plugins/${encodeURIComponent(p.id)}/reset-circuit`, {
@@ -1880,8 +2033,8 @@ export function AppearanceWorkspace({
             </table>
           </div>
           <Pagination
-            total={plugins.length}
-            page={pluginPage}
+            total={filteredPlugins.length}
+            page={pagedPlugins.safePage}
             pageSize={12}
             onChange={(p) => {
               setPluginPage(p);
@@ -2029,6 +2182,28 @@ export function AppearanceWorkspace({
           </button>
         }
       >
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px" }}>
+          <div style={{ width: "140px", maxWidth: "100%" }}>
+            <ConsoleSelect
+              value={logLevelFilter}
+              onChange={(v) => setLogLevelFilter(v)}
+              options={[
+                { value: "", label: "ALL" },
+                { value: "info", label: "INFO" },
+                { value: "warn", label: "WARN" },
+                { value: "error", label: "ERROR" },
+              ]}
+            />
+          </div>
+          <input
+            type="search"
+            class="volo-input"
+            style={{ flex: "1 1 200px", minWidth: 0 }}
+            placeholder={t("app.logs_filter_ph")}
+            value={logTextFilter}
+            onInput={(e) => setLogTextFilter((e.currentTarget as HTMLInputElement).value)}
+          />
+        </div>
         <pre
           style={{
             maxHeight: "360px",
@@ -2042,9 +2217,17 @@ export function AppearanceWorkspace({
             margin: 0,
           }}
         >
-          {!logsModal || logsModal.logs.length === 0
+          {!logsModal || filteredLogs.length === 0
             ? t("app.logs_empty")
-            : logsModal.logs.map((l) => `[${l.level}] ${l.event}: ${l.message}`).join("\n")}
+            : filteredLogs
+                .map((l: any) => {
+                  const ts = l?.ts ? `${String(l.ts)} ` : "";
+                  const lvl = String(l?.level || "info").toUpperCase();
+                  const ev = l?.event ? `${String(l.event)}: ` : "";
+                  const msg = String(l?.msg ?? l?.message ?? "");
+                  return `${ts}[${lvl}] ${ev}${msg}`.trim();
+                })
+                .join("\n")}
         </pre>
       </AnimatedModal>
     </div>

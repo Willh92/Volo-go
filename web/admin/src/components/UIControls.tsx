@@ -1078,7 +1078,7 @@ export function ConsoleDatePicker({
         }}
       >
         <span class="volo-dp-trigger-main">
-          <SvgIcon cls="volo-dp-cal-icon" size={1.85} sw={1.85}>
+          <SvgIcon cls="volo-dp-cal-icon" sw={1.85}>
             <rect x="3" y="4.5" width="18" height="16.5" rx="2.5" />
             <line x1="16" y1="2.5" x2="16" y2="6.5" />
             <line x1="8" y1="2.5" x2="8" y2="6.5" />
@@ -1965,14 +1965,14 @@ export function GlobalConfirmModal() {
       </p>
       {cur?.items && cur.items.length > 0 && (
         <div class="volo-confirm-list">
-          {cur.items.slice(0, 60).map((it, i) => (
+          {cur.items.slice(0, 50).map((it, i) => (
             <div key={i} class="volo-confirm-list-item">
               {it}
             </div>
           ))}
-          {cur.items.length > 60 && (
-            <div class="volo-help" style={{ padding: "4px 6px" }}>
-              +{cur.items.length - 60}…
+          {cur.items.length > 50 && (
+            <div class="volo-confirm-list-item volo-help" style={{ padding: "4px 6px", fontWeight: 600 }}>
+              {t("ui.confirm_more_items", { n: cur.items.length - 50 })}
             </div>
           )}
         </div>

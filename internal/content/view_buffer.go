@@ -22,6 +22,12 @@ type topItemBucketKey struct {
 	itemKey  string
 }
 
+const (
+	maxRefererHostLen      = 253
+	maxBufferedRefererKeys = 512
+	maxBufferedTopItems    = 8192
+)
+
 // viewAnalyticsBuffer decouples high-concurrency public GET requests from synchronous single-writer
 // SQLite transactions by coalescing view_count, redirect hit_count, analytics_daily, and analytics_top_items
 // increments in memory and flushing them in a single batched transaction every 2s and on graceful shutdown.
@@ -35,6 +41,7 @@ type viewAnalyticsBuffer struct {
 	redirectHits             map[string]int64
 	daily                    map[string]dailyTrafficDelta
 	topItems                 map[topItemBucketKey]int64
+	refererKeys              int
 	totalPendingArticleViews atomic.Int64
 
 	loopOnce sync.Once
@@ -55,6 +62,60 @@ func newViewAnalyticsBuffer(store *sqlx.Store) *viewAnalyticsBuffer {
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
 	}
+}
+
+func normalizeRefererHost(raw string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" || len(s) > maxRefererHostLen {
+		return "", false
+	}
+	if s[0] == '.' || s[0] == '-' || s[len(s)-1] == '.' || s[len(s)-1] == '-' {
+		return "", false
+	}
+	labelLen := 0
+	var prev byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		if !isAlphaNum && c != '.' && c != '-' {
+			return "", false
+		}
+		if c == '.' {
+			if prev == '.' || prev == '-' || labelLen == 0 || labelLen > 63 {
+				return "", false
+			}
+			labelLen = 0
+		} else {
+			if c == '-' && prev == '.' {
+				return "", false
+			}
+			labelLen++
+			if labelLen > 63 {
+				return "", false
+			}
+		}
+		prev = c
+	}
+	return s, true
+}
+
+func normalizeCountryCode(raw string) (string, bool) {
+	s := strings.ToUpper(strings.TrimSpace(raw))
+	if len(s) < 2 || len(s) > 3 {
+		return "", false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isUpper := c >= 'A' && c <= 'Z'
+		isDigit := c >= '0' && c <= '9'
+		if !isUpper && !isDigit {
+			return "", false
+		}
+		if i == 0 && !isUpper {
+			return "", false
+		}
+	}
+	return s, true
 }
 
 func (b *viewAnalyticsBuffer) ensureLoop() {
@@ -81,9 +142,16 @@ func (b *viewAnalyticsBuffer) ensureLoop() {
 }
 
 func (b *viewAnalyticsBuffer) RecordView(targetType string, targetID string, statDate string, uvDelta int64, refererHost string) {
+	b.RecordViewWithGeo(targetType, targetID, statDate, uvDelta, refererHost, "")
+}
+
+func (b *viewAnalyticsBuffer) RecordViewWithGeo(targetType string, targetID string, statDate string, uvDelta int64, refererHost string, countryCode string) {
 	if b == nil {
 		return
 	}
+	cleanRef, hasRef := normalizeRefererHost(refererHost)
+	cleanCountry, hasCountry := normalizeCountryCode(countryCode)
+
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
@@ -93,14 +161,27 @@ func (b *viewAnalyticsBuffer) RecordView(targetType string, targetID string, sta
 	if targetType == domain.TargetTypeArticle && targetID != "" {
 		b.articleViews[targetID]++
 		b.totalPendingArticleViews.Add(1)
-		if len(b.topItems) < 8192 {
-			b.topItems[topItemBucketKey{statDate: statDate, kind: "article", itemKey: targetID}]++
+		artKey := topItemBucketKey{statDate: statDate, kind: "article", itemKey: targetID}
+		if _, exists := b.topItems[artKey]; exists || len(b.topItems) < maxBufferedTopItems {
+			b.topItems[artKey]++
 		}
 	} else if targetType == domain.TargetTypePage && targetID != "" {
 		b.pageViews[targetID]++
 	}
-	if cleanRef := strings.ToLower(strings.TrimSpace(refererHost)); cleanRef != "" && len(b.topItems) < 8192 {
-		b.topItems[topItemBucketKey{statDate: statDate, kind: "referer", itemKey: cleanRef}]++
+	if hasRef {
+		refKey := topItemBucketKey{statDate: statDate, kind: "referer", itemKey: cleanRef}
+		if _, exists := b.topItems[refKey]; exists {
+			b.topItems[refKey]++
+		} else if b.refererKeys < maxBufferedRefererKeys && len(b.topItems) < maxBufferedTopItems {
+			b.topItems[refKey] = 1
+			b.refererKeys++
+		}
+	}
+	if hasCountry {
+		geoKey := topItemBucketKey{statDate: statDate, kind: "country", itemKey: cleanCountry}
+		if _, exists := b.topItems[geoKey]; exists || len(b.topItems) < maxBufferedTopItems {
+			b.topItems[geoKey]++
+		}
 	}
 	cur := b.daily[statDate]
 	cur.pv++
@@ -189,6 +270,7 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 	b.redirectHits = make(map[string]int64)
 	b.daily = make(map[string]dailyTrafficDelta)
 	b.topItems = make(map[topItemBucketKey]int64)
+	b.refererKeys = 0
 	b.dirty = false
 	b.mu.Unlock()
 
@@ -278,8 +360,16 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 			}
 		}
 		for k, v := range topSnap {
-			if _, ok := b.topItems[k]; ok || len(b.topItems) < maxFailedRestoreKeys {
+			if _, ok := b.topItems[k]; ok {
 				b.topItems[k] += v
+			} else if len(b.topItems) < maxFailedRestoreKeys {
+				if k.kind == "referer" {
+					if b.refererKeys >= maxBufferedRefererKeys {
+						continue
+					}
+					b.refererKeys++
+				}
+				b.topItems[k] = v
 			}
 		}
 		b.dirty = true
@@ -300,6 +390,7 @@ func (b *viewAnalyticsBuffer) Reset() {
 	b.redirectHits = make(map[string]int64)
 	b.daily = make(map[string]dailyTrafficDelta)
 	b.topItems = make(map[topItemBucketKey]int64)
+	b.refererKeys = 0
 	b.dirty = false
 	b.totalPendingArticleViews.Store(0)
 	b.mu.Unlock()

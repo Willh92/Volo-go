@@ -208,3 +208,168 @@ func createTamperedCopy(t *testing.T, srcZip, dstZip string) {
 		t.Fatal(err)
 	}
 }
+
+func TestExtensionsPluginsAndThemesBackupRestoreAndSecurityCaps(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	srcDB := openTestSQLiteStore(t, filepath.Join(tmp, "ext-src.db"))
+	srcPlugins := filepath.Join(tmp, "src-plugins")
+	srcThemes := filepath.Join(tmp, "src-themes")
+
+	// Seed external plugin with JS, manifest, assets, plus symlink/.tmp*/.bak* that MUST be skipped.
+	if err := os.MkdirAll(filepath.Join(srcPlugins, "callout-ext", "assets"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "callout-ext", "manifest.json"), []byte(`{"id":"callout-ext","version":"1.0.0"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "callout-ext", "main.js"), []byte(`exports.onEnable = function(){};`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "callout-ext", "assets", "icon.svg"), []byte(`<svg></svg>`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "callout-ext", ".tmp-stage"), []byte(`skip-me`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "callout-ext", ".bak-old"), []byte(`skip-me`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "callout-ext", "draft.bak"), []byte(`skip-me`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(tmp, "outside-secret.txt")
+	_ = os.WriteFile(outsideFile, []byte("SECRET_HOST_FILE"), 0o600)
+	_ = os.Symlink(outsideFile, filepath.Join(srcPlugins, "callout-ext", "escape-link.txt"))
+	_ = os.MkdirAll(filepath.Join(srcPlugins, ".tmp-staging-plugin"), 0o750)
+	_ = os.WriteFile(filepath.Join(srcPlugins, ".tmp-staging-plugin", "main.js"), []byte("skip"), 0o640)
+
+	// Seed external theme with HTML template and CSS.
+	if err := os.MkdirAll(filepath.Join(srcThemes, "aurora-pro", "templates"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcThemes, "aurora-pro", "theme.json"), []byte(`{"id":"aurora-pro","version":"2.1.0"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcThemes, "aurora-pro", "templates", "post.html"), []byte(`<article>{{.Title}}</article>`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	zipPath := filepath.Join(tmp, "ext-backup.zip")
+	mf, err := CreateToFile(ctx, srcDB, zipPath, CreateOptions{
+		PluginsDir: srcPlugins,
+		ThemesDir:  srcThemes,
+	})
+	if err != nil {
+		t.Fatalf("CreateToFile with extensions failed: %v", err)
+	}
+	if !mf.IncludesExtensions {
+		t.Fatal("expected manifest.IncludesExtensions = true")
+	}
+
+	seenPaths := make(map[string]bool)
+	for _, fd := range mf.Files {
+		seenPaths[fd.Path] = true
+		if strings.Contains(fd.Path, ".tmp") || strings.Contains(fd.Path, ".bak") || strings.Contains(fd.Path, "escape-link") {
+			t.Fatalf("skipped temp/bak/symlink entry %q leaked into backup manifest", fd.Path)
+		}
+	}
+	for _, want := range []string{
+		"extensions/plugins/callout-ext/manifest.json",
+		"extensions/plugins/callout-ext/main.js",
+		"extensions/plugins/callout-ext/assets/icon.svg",
+		"extensions/themes/aurora-pro/theme.json",
+		"extensions/themes/aurora-pro/templates/post.html",
+	} {
+		if !seenPaths[want] {
+			t.Fatalf("missing expected archive path %q in manifest", want)
+		}
+	}
+
+	// DryRun counts 5 extension files without creating destination directories.
+	dstDB := openTestSQLiteStore(t, filepath.Join(tmp, "ext-dst.db"))
+	dstPlugins := filepath.Join(tmp, "dst-plugins")
+	dstThemes := filepath.Join(tmp, "dst-themes")
+
+	drySum, err := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{
+		DryRun:     true,
+		PluginsDir: dstPlugins,
+		ThemesDir:  dstThemes,
+	})
+	if err != nil {
+		t.Fatalf("DryRun failed: %v", err)
+	}
+	if drySum.ExtensionFiles != 5 {
+		t.Fatalf("expected 5 ExtensionFiles in DryRun, got %d", drySum.ExtensionFiles)
+	}
+	if _, statErr := os.Stat(dstPlugins); !os.IsNotExist(statErr) {
+		t.Fatal("DryRun must not create dstPlugins directory")
+	}
+
+	// Full restore writes both plugins and themes cleanly.
+	sum, err := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{
+		PluginsDir: dstPlugins,
+		ThemesDir:  dstThemes,
+	})
+	if err != nil {
+		t.Fatalf("RestoreFromFile with extensions failed: %v", err)
+	}
+	if sum.ExtensionFiles != 5 {
+		t.Fatalf("expected 5 restored ExtensionFiles, got %d", sum.ExtensionFiles)
+	}
+	gotJS, err := os.ReadFile(filepath.Join(dstPlugins, "callout-ext", "main.js"))
+	if err != nil || string(gotJS) != `exports.onEnable = function(){};` {
+		t.Fatalf("restored plugin main.js mismatch: err=%v body=%q", err, string(gotJS))
+	}
+	gotTpl, err := os.ReadFile(filepath.Join(dstThemes, "aurora-pro", "templates", "post.html"))
+	if err != nil || string(gotTpl) != `<article>{{.Title}}</article>` {
+		t.Fatalf("restored theme post.html mismatch: err=%v body=%q", err, string(gotTpl))
+	}
+
+	// Security Check 1: Mid-path '..' traversal (e.g. extensions/plugins/a/../../evil/main.js) is strictly rejected!
+	for _, badEntry := range []string{
+		"extensions/plugins/a/../../evil/main.js",
+		"extensions/themes/..\\evil\\theme.json",
+	} {
+		var tbuf bytes.Buffer
+		tzw := zip.NewWriter(&tbuf)
+		w, _ := tzw.Create(badEntry)
+		_, _ = w.Write([]byte("evil"))
+		_ = tzw.Close()
+		if _, rErr := Restore(ctx, dstDB, bytes.NewReader(tbuf.Bytes()), int64(tbuf.Len()), RestoreOptions{PluginsDir: dstPlugins}); rErr == nil {
+			t.Fatalf("expected traversal path %q to be rejected", badEntry)
+		}
+	}
+
+	// Security Check 2: Unsigned extension file injected into valid archive is rejected!
+	rawZipBytes, _ := os.ReadFile(zipPath)
+	zr, _ := zip.NewReader(bytes.NewReader(rawZipBytes), int64(len(rawZipBytes)))
+	var unsignedBuf bytes.Buffer
+	uzw := zip.NewWriter(&unsignedBuf)
+	for _, zf := range zr.File {
+		rc, _ := zf.Open()
+		var b bytes.Buffer
+		_, _ = b.ReadFrom(rc)
+		_ = rc.Close()
+		fw, _ := uzw.Create(zf.Name)
+		_, _ = fw.Write(b.Bytes())
+	}
+	rogueW, _ := uzw.Create("extensions/plugins/rogue/main.js")
+	_, _ = rogueW.Write([]byte("evil()"))
+	_ = uzw.Close()
+	if _, uErr := Restore(ctx, dstDB, bytes.NewReader(unsignedBuf.Bytes()), int64(unsignedBuf.Len()), RestoreOptions{PluginsDir: dstPlugins}); uErr == nil || !strings.Contains(uErr.Error(), "unsigned") {
+		t.Fatalf("expected unsigned extension entry error, got %v", uErr)
+	}
+
+	// Security Check 3: Entry-count and uncompressed byte caps enforced!
+	if _, eErr := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{MaxEntries: 3}); eErr == nil || !strings.Contains(eErr.Error(), "entries") {
+		t.Fatalf("expected MaxEntries rejection, got %v", eErr)
+	}
+	if _, bErr := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{MaxTotalBytes: 20}); bErr == nil || !strings.Contains(bErr.Error(), "limit") {
+		t.Fatalf("expected MaxTotalBytes rejection, got %v", bErr)
+	}
+	if _, sErr := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{MaxSingleFileBytes: 10}); sErr == nil || !strings.Contains(sErr.Error(), "limit") {
+		t.Fatalf("expected MaxSingleFileBytes rejection, got %v", sErr)
+	}
+}

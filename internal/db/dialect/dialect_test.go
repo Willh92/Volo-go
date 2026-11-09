@@ -184,4 +184,3 @@ func TestDialect_UpsertIncrementSQLAcrossThreeDialects(t *testing.T) {
 		t.Fatalf("expected mysql anchor fallback, got: %s", got)
 	}
 }
-

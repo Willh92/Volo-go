@@ -497,4 +497,3 @@ func TestContentRound3_SQLCommentPagination_TwoGenCache_PendingViews_And_Bounded
 		t.Fatalf("expected hot_cmt promoted to Curr and totalCached <= %d, got hotInCurr=%v total=%d", 2*maxCommentHTMLGenEntries, hotInCurr, totalCached)
 	}
 }
-

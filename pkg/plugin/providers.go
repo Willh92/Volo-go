@@ -108,6 +108,12 @@ type AntiSpamProvider interface {
 	CheckComment(ctx context.Context, input CommentCheckInput) (SpamVerdict, error)
 }
 
+// FederationProvider allows plugins with federation capability to publish/deliver article lifecycle events.
+type FederationProvider interface {
+	Name() string
+	Publish(ctx context.Context, action string, articlePayload map[string]any) error
+}
+
 type providerEntry[T any] struct {
 	pluginID string
 	provider T
@@ -121,10 +127,11 @@ type ProviderRegistry struct {
 	defaultStorage  StorageProvider
 	defaultAntiSpam AntiSpamProvider
 
-	storageList  []providerEntry[StorageProvider]
-	notifierList []providerEntry[NotifierProvider]
-	oidcMap      map[string]providerEntry[OIDCProvider]
-	antiSpamList []providerEntry[AntiSpamProvider]
+	storageList    []providerEntry[StorageProvider]
+	notifierList   []providerEntry[NotifierProvider]
+	oidcMap        map[string]providerEntry[OIDCProvider]
+	antiSpamList   []providerEntry[AntiSpamProvider]
+	federationList []providerEntry[FederationProvider]
 }
 
 // NewProviderRegistry creates a thread-safe ProviderRegistry with optional built-in defaults.
@@ -194,6 +201,17 @@ func (r *ProviderRegistry) RegisterAntiSpam(pluginID string, p AntiSpamProvider)
 	r.antiSpamList = append(r.antiSpamList, providerEntry[AntiSpamProvider]{pluginID: pluginID, provider: p})
 }
 
+// RegisterFederation binds a FederationProvider owned by pluginID.
+func (r *ProviderRegistry) RegisterFederation(pluginID string, p FederationProvider) {
+	if p == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.federationList = removeEntries(r.federationList, pluginID)
+	r.federationList = append(r.federationList, providerEntry[FederationProvider]{pluginID: pluginID, provider: p})
+}
+
 // DetachPlugin removes all providers registered by pluginID (invoked on disable, uninstall, or circuit trip).
 func (r *ProviderRegistry) DetachPlugin(pluginID string) {
 	r.mu.Lock()
@@ -201,11 +219,23 @@ func (r *ProviderRegistry) DetachPlugin(pluginID string) {
 	r.storageList = removeEntries(r.storageList, pluginID)
 	r.notifierList = removeEntries(r.notifierList, pluginID)
 	r.antiSpamList = removeEntries(r.antiSpamList, pluginID)
+	r.federationList = removeEntries(r.federationList, pluginID)
 	for name, ent := range r.oidcMap {
 		if ent.pluginID == pluginID {
 			delete(r.oidcMap, name)
 		}
 	}
+}
+
+// Federations returns a snapshot of all active plugin FederationProviders.
+func (r *ProviderRegistry) Federations() []FederationProvider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]FederationProvider, len(r.federationList))
+	for i, ent := range r.federationList {
+		out[i] = ent.provider
+	}
+	return out
 }
 
 // ActiveStorage returns the most recently activated plugin StorageProvider, or defaultStorage.

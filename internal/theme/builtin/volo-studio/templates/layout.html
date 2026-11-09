@@ -15,6 +15,7 @@
   <meta name="description" content="{{.MetaDescription}}">
   {{if .SEO.MetaKeywords}}<meta name="keywords" content="{{.SEO.MetaKeywords}}">{{end}}
   {{if .NoIndex}}<meta name="robots" content="noindex, nofollow">{{end}}
+  {{if .ViewerCSRFToken}}<meta name="csrf-token" content="{{.ViewerCSRFToken}}">{{end}}
   {{if .CanonicalURL}}<link rel="canonical" href="{{.CanonicalURL}}">{{end}}
   {{range .Alternates}}<link rel="alternate" hreflang="{{.Lang}}" href="{{.URL}}">
   {{end}}
@@ -97,10 +98,12 @@
                   {{if or (eq .Viewer.Role "admin") (eq .Viewer.Role "editor")}}
                     <a class="studio-nav-more__item studio-only-mobile" href="{{.AdminPath}}" data-no-pjax role="menuitem">{{navIconHTML "admin"}}<span>{{t .Locale "nav.admin_console"}}</span></a>
                     <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                      {{if .ViewerCSRFToken}}<input type="hidden" name="csrf_token" value="{{.ViewerCSRFToken}}">{{end}}
                       <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{t .Locale "nav.logout"}}</span></button>
                     </form>
                   {{else}}
-                    <form method="post" action="/logout" class="studio-inline-form studio-only-mobile" data-no-pjax>
+                    <form method="post" action="/logout" class="studio-inline-form studio-only-mobile js-reader-logout-form" data-no-pjax>
+                      {{if .ViewerCSRFToken}}<input type="hidden" name="csrf_token" value="{{.ViewerCSRFToken}}">{{end}}
                       <button type="submit" class="studio-nav-more__item studio-nav-more__btn" role="menuitem">{{navIconHTML "logout"}}<span>{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span></button>
                     </form>
                   {{end}}
@@ -213,12 +216,14 @@
                 {{navIconHTML "admin"}}<span class="studio-auth-btn__label">{{t .Locale "nav.admin_console"}}</span>
               </a>
               <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+                {{if .ViewerCSRFToken}}<input type="hidden" name="csrf_token" value="{{.ViewerCSRFToken}}">{{end}}
                 <button type="submit" class="studio-icon-btn studio-auth-btn" title="{{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
                   {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{t .Locale "nav.logout"}}</span>
                 </button>
               </form>
             {{else}}
-              <form method="post" action="/logout" class="studio-inline-form" data-no-pjax>
+              <form method="post" action="/logout" class="studio-inline-form js-reader-logout-form" data-no-pjax>
+                {{if .ViewerCSRFToken}}<input type="hidden" name="csrf_token" value="{{.ViewerCSRFToken}}">{{end}}
                 <button id="volo-reader-logout" type="submit" class="studio-icon-btn studio-auth-btn" title="{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}" aria-label="{{t .Locale "nav.logout"}}">
                   {{navIconHTML "logout"}}<span class="studio-auth-btn__label">{{coalesce .Viewer.DisplayName .Viewer.Username}} · {{t .Locale "nav.logout"}}</span>
                 </button>
@@ -285,7 +290,7 @@
     </button>
   </div>
 
-  <div id="volo-search-modal" class="volo-modal" hidden data-empty="{{t .Locale "search.empty"}}" data-all="{{t .Locale "search.all_filter"}}">
+  <div id="volo-search-modal" class="volo-modal" hidden data-empty="{{t .Locale "search.empty"}}" data-all="{{t .Locale "search.all_filter"}}" data-load-more="{{t .Locale "search.load_more"}}">
     <div class="volo-modal__panel" role="dialog" aria-modal="true" aria-label="{{t .Locale "nav.search_placeholder"}}">
       <div class="volo-search-head">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>

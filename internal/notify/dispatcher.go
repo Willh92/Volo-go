@@ -123,7 +123,18 @@ func (d *Dispatcher) getPublicURL() string {
 	d.mu.RLock()
 	u := d.publicURL
 	d.mu.RUnlock()
-	return u
+	if u != "" || d.settings == nil {
+		return u
+	}
+	snap := d.settings.Snapshot()
+	if len(snap.Site.CustomVars) > 0 {
+		for _, key := range []string{"public_url", "site_url", "canonical_url"} {
+			if cand := strings.TrimRight(strings.TrimSpace(snap.Site.CustomVars[key]), "/"); cand != "" {
+				return cand
+			}
+		}
+	}
+	return ""
 }
 
 // Close stops accepting new background notifications and waits for in-flight deliveries to drain
@@ -367,7 +378,8 @@ func (d *Dispatcher) dispatchCommentNotifications(ctx context.Context, view cont
 
 	// 3. Notify parent commenter if comment is approved and parent opted into encrypted email alerts
 	if snap.Notifications.NotifyReplyByEmail && view.Status == domain.CommentStatusApproved && in.ParentID != "" {
-		parent, pErr := sqlx.Get[domain.Comment](ctx, d.store,
+		var parent domain.Comment
+		pErr := sqlx.GetInto(ctx, d.store, &parent,
 			`SELECT id, user_id, notify_email_ciphertext, notify_locale, is_deleted FROM comments WHERE id = ?`, in.ParentID)
 		if pErr == nil && !parent.IsDeleted {
 			recipientEmail := d.decryptCommentNotifyEmail(ctx, parent)
@@ -443,7 +455,8 @@ func (d *Dispatcher) BroadcastWebhookEvent(ctx context.Context, ev WebhookEvent)
 		return
 	}
 
-	hooks, err := sqlx.Select[domain.Webhook](ctx, d.store, `SELECT * FROM webhooks WHERE is_enabled = ?`, true)
+	var hooks []domain.Webhook
+	err := sqlx.SelectInto(ctx, d.store, &hooks, `SELECT * FROM webhooks WHERE is_enabled = ?`, true)
 	if err != nil {
 		return
 	}
@@ -498,7 +511,8 @@ func (d *Dispatcher) decryptCommentNotifyEmail(ctx context.Context, c domain.Com
 }
 
 func (d *Dispatcher) lookupPrimaryAdminEmail(ctx context.Context) string {
-	u, err := sqlx.Get[domain.User](ctx, d.store,
+	var u domain.User
+	err := sqlx.GetInto(ctx, d.store, &u,
 		`SELECT email FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
 		domain.RoleAdmin, domain.UserStatusActive)
 	if err != nil {
@@ -509,13 +523,15 @@ func (d *Dispatcher) lookupPrimaryAdminEmail(ctx context.Context) string {
 
 func (d *Dispatcher) resolveTargetTitleAndPath(ctx context.Context, targetType, targetID string) (string, string) {
 	if targetType == domain.TargetTypePage {
-		pg, err := sqlx.Get[domain.Page](ctx, d.store, `SELECT title, slug FROM pages WHERE id = ?`, targetID)
+		var pg domain.Page
+		err := sqlx.GetInto(ctx, d.store, &pg, `SELECT title, slug FROM pages WHERE id = ?`, targetID)
 		if err == nil {
 			return pg.Title, "/" + pg.Slug
 		}
 		return "Page", "/"
 	}
-	art, err := sqlx.Get[domain.RawArticle](ctx, d.store, `SELECT title, slug FROM articles WHERE id = ?`, targetID)
+	var art domain.RawArticle
+	err := sqlx.GetInto(ctx, d.store, &art, `SELECT title, slug FROM articles WHERE id = ?`, targetID)
 	if err == nil {
 		return art.Title, visibility.ArticlePath(art.Slug)
 	}

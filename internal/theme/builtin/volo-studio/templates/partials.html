@@ -103,16 +103,13 @@
 </aside>
 {{end}}
 
-{{define "article_card"}}
-<article class="article__item">
+{{define "article_card"}}{{$listStyle := default "summary" .ListStyle}}{{if and (not .ListStyle) .Reading}}{{$listStyle = default "summary" .Reading.ListStyle}}{{end}}
+<article class="article__item{{if eq $listStyle "title_only"}} article__item--title-only{{else if and (eq $listStyle "full") .Card.FullHTML}} article__item--full{{end}}">
   <a class="studio-post-cover" href="{{.Card.URL}}" tabindex="-1" aria-hidden="true">
     {{if .Card.IsPasswordProtected}}
       {{coverSVG .Card.Slug true}}
     {{else if .Card.CoverURL}}
       <img src="{{.Card.CoverURL}}" alt="" loading="lazy" decoding="async" width="320" height="214" data-cover-img="1">
-      <span class="studio-cover-fallback" hidden>{{coverSVG .Card.Slug false}}</span>
-    {{else if or (eq .Card.Slug "github") (eq .Card.Slug "my-github-repos")}}
-      <img src="/images/github_repo.jpg" alt="" loading="lazy" decoding="async" width="320" height="214" data-cover-img="1">
       <span class="studio-cover-fallback" hidden>{{coverSVG .Card.Slug false}}</span>
     {{else}}
       {{coverSVG .Card.Slug false}}
@@ -127,7 +124,11 @@
     </span>
   </div>
   <h2 class="article__title"><a rel="bookmark" href="{{.Card.URL}}">{{.Card.Title}}</a></h2>
-  <p class="studio-abstract">{{.Card.Summary}}</p>
+  {{if eq $listStyle "title_only"}}{{else if and (eq $listStyle "full") .Card.FullHTML}}
+    <div class="volo-prose studio-card-full">{{safeHTML .Card.FullHTML}}</div>
+  {{else}}
+    <p class="studio-abstract">{{.Card.Summary}}</p>
+  {{end}}
   <div class="studio-post-foot">
     <span class="studio-post-tags">
       {{if .Card.CategoryName}}
@@ -221,8 +222,8 @@
          data-l-prev="{{t .Ctx.Locale "pagination.prev"}}"
          data-l-next="{{t .Ctx.Locale "pagination.next"}}"
          data-l-page="{{t .Ctx.Locale "pagination.page_info" (dict "page" "{page}" "total" "{total}")}}"
-         data-l-confirm="{{if hasPrefix .Ctx.Locale "en"}}Confirm?{{else if eq .Ctx.Locale "zh-TW"}}確認刪除？{{else}}确认删除？{{end}}"
-         data-l-more-replies="{{if hasPrefix .Ctx.Locale "en"}}Show {count} more replies{{else if eq .Ctx.Locale "zh-TW"}}展開其餘 {count} 條回覆{{else}}展开其余 {count} 条回复{{end}}"
+         data-l-confirm="{{t .Ctx.Locale "comment.confirm_delete"}}"
+         data-l-more-replies="{{t .Ctx.Locale "comment.more_replies" (dict "count" "{count}")}}"
          data-l-net-err="{{t .Ctx.Locale "error.hint_default"}}">
 </section>
 {{range .Ctx.CommentAfterWidgets}}{{safeHTML .HTML}}{{end}}

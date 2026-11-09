@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"io"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -15,7 +16,7 @@ import (
 
 const minDynamicGzipBytes = 1024
 
-var dynamicGzipChan = make(chan *gzip.Writer, 1)
+var dynamicGzipChan = make(chan *gzip.Writer, min(max(8, runtime.GOMAXPROCS(0)*2), 16))
 
 func acquireDynamicGzipWriter(w io.Writer) *gzip.Writer {
 	select {

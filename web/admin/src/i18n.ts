@@ -8,31 +8,33 @@ export interface LocaleOption {
   dir: string;
 }
 
-// Auto-discover all built-in per-language JSON catalogs in `./locales/*.json` at build time.
-// Adding a new built-in language (e.g. `src/locales/zh-TW.json` or `src/locales/ja-JP.json`)
-// requires zero changes to TypeScript code.
-import { codes as bundledCodes, columns as bundledCols, keys as bundledKeys } from "virtual:volo-locales";
+// Auto-discover built-in per-language metadata in `./locales/*.json` at build time.
+// Full built-in JSON catalogs are emitted as standalone `./i18n/{code}.json` assets (with the active
+// boot locale injected synchronously via `<script id="volo-boot-locale">` in `index.html`).
+import { builtinLocales, keys as bundledKeys } from "virtual:volo-locales";
 
 const bundledCatalogs: Record<string, Record<string, string>> = {};
 const catalogs: Record<string, Record<string, string>> = {};
+const builtinLocaleCodes = new Set<string>();
+const pendingBuiltinLoads = new Map<string, Promise<Record<string, string> | undefined>>();
 const initialLocales: LocaleOption[] = [];
 
-for (let ci = 0; ci < bundledCodes.length; ci++) {
-  const col = bundledCols[ci];
-  const table: Record<string, string> = {};
-  for (let ki = 0; ki < bundledKeys.length; ki++) {
-    const val = col[ki];
-    if (val) table[bundledKeys[ki]] = val;
+function unpackLocalePayload(raw: unknown): Record<string, string> | null {
+  if (Array.isArray(raw)) {
+    const table: Record<string, string> = {};
+    const len = Math.min(raw.length, bundledKeys.length);
+    for (let i = 0; i < len; i++) {
+      const v = raw[i];
+      if (typeof v === "string" && v) {
+        table[bundledKeys[i]] = v;
+      }
+    }
+    return table;
   }
-  const code = canonicalizeLocaleTag(table["meta.code"] || bundledCodes[ci]);
-  if (!code) continue;
-  bundledCatalogs[code] = table;
-  catalogs[code] = { ...table };
-  initialLocales.push({
-    code,
-    name: table["meta.name"] || code,
-    dir: table["meta.dir"] || "ltr",
-  });
+  if (raw && typeof raw === "object") {
+    return raw as Record<string, string>;
+  }
+  return null;
 }
 
 function sortLocaleOptions(items: LocaleOption[]): LocaleOption[] {
@@ -44,11 +46,6 @@ function sortLocaleOptions(items: LocaleOption[]): LocaleOption[] {
     return a.code.localeCompare(b.code);
   });
 }
-
-export const availableLocalesSig = signal<LocaleOption[]>(sortLocaleOptions(initialLocales));
-export const localeSig = signal<LocaleCode>("zh-CN");
-const catalogVersionSig = signal<number>(0);
-const loadedRuntimeOverlays = new Set<string>();
 
 export function canonicalizeLocaleTag(raw?: string): string {
   const s = (raw || "").trim().replaceAll("_", "-");
@@ -74,6 +71,78 @@ export function canonicalizeLocaleTag(raw?: string): string {
     return parts[2] ? `${lang}-${script}-${parts[2].toUpperCase()}` : `${lang}-${script}`;
   }
   return `${lang}-${parts[1].toUpperCase()}`;
+}
+
+for (const meta of builtinLocales) {
+  const code = canonicalizeLocaleTag(meta.code);
+  if (!code) continue;
+  builtinLocaleCodes.add(code);
+  initialLocales.push({
+    code,
+    name: meta.name || code,
+    dir: meta.dir || "ltr",
+  });
+}
+
+let bootLocaleCode: LocaleCode = "zh-CN";
+if (typeof document !== "undefined") {
+  try {
+    const el = document.getElementById("volo-boot-locale");
+    if (el && el.textContent) {
+      const table = unpackLocalePayload(JSON.parse(el.textContent));
+      if (table) {
+        const rawCode = el.getAttribute("data-locale") || table["meta.code"] || "zh-CN";
+        const code = canonicalizeLocaleTag(rawCode) || "zh-CN";
+        bundledCatalogs[code] = table;
+        catalogs[code] = { ...table };
+        bootLocaleCode = code;
+      }
+    }
+  } catch {
+    // Ignore malformed boot locale payload; async fallback loader handles recovery.
+  }
+}
+
+export const availableLocalesSig = signal<LocaleOption[]>(sortLocaleOptions(initialLocales));
+export const localeSig = signal<LocaleCode>(bootLocaleCode);
+const catalogVersionSig = signal<number>(0);
+const loadedRuntimeOverlays = new Set<string>();
+
+async function ensureBuiltinCatalog(rawCode: string): Promise<Record<string, string> | undefined> {
+  const code = canonicalizeLocaleTag(rawCode);
+  if (!code || !builtinLocaleCodes.has(code)) {
+    return undefined;
+  }
+  if (bundledCatalogs[code]) {
+    return bundledCatalogs[code];
+  }
+  const existing = pendingBuiltinLoads.get(code);
+  if (existing) {
+    return existing;
+  }
+  const loadPromise = (async () => {
+    try {
+      const baseURI = typeof document !== "undefined" ? document.baseURI : window.location.href;
+      const assetURL = new URL(`i18n/${encodeURIComponent(code)}.json`, baseURI).toString();
+      const res = await fetch(assetURL, { credentials: "same-origin" });
+      if (res.ok) {
+        const table = unpackLocalePayload(await res.json());
+        if (table) {
+          bundledCatalogs[code] = table;
+          catalogs[code] = { ...table, ...(catalogs[code] || {}) };
+          catalogVersionSig.value++;
+          return table;
+        }
+      }
+    } catch {
+      // Offline or synthetic environment without static i18n asset
+    } finally {
+      pendingBuiltinLoads.delete(code);
+    }
+    return bundledCatalogs[code];
+  })();
+  pendingBuiltinLoads.set(code, loadPromise);
+  return loadPromise;
 }
 
 export function normalizeLocale(raw?: string): LocaleCode {
@@ -145,11 +214,18 @@ export function syncExternalLocales(list?: LocaleOption[]) {
   catalogVersionSig.value++;
 }
 
-// ensureLocaleLoaded fetches runtime JSON overrides/packs from `/api/v1/i18n/{code}` when needed
-// (e.g. external `./locales/zh-TW.json` or `ja-JP.json` installed in `VOLO_LOCALES_DIR`).
+// ensureLocaleLoaded fetches lazy built-in catalogs (`./i18n/{code}.json`) and runtime JSON overrides/packs
+// from `/api/v1/i18n/{code}` when needed (e.g. external `./locales/zh-TW.json` or `ja-JP.json`).
 export async function ensureLocaleLoaded(rawCode: string, forceReload = false): Promise<LocaleCode> {
   const code = normalizeLocale(rawCode);
   localeSig.value = code;
+  const isZh = code.toLowerCase().startsWith("zh");
+  const fallbackBuiltinCode = isZh ? "zh-CN" : "en-US";
+  if (builtinLocaleCodes.has(code)) {
+    await ensureBuiltinCatalog(code);
+  } else {
+    await ensureBuiltinCatalog(fallbackBuiltinCode);
+  }
   if (!forceReload && loadedRuntimeOverlays.has(code)) {
     return code;
   }
@@ -165,10 +241,12 @@ export async function ensureLocaleLoaded(rawCode: string, forceReload = false): 
       if (data.locales) {
         registerExternalLocales(data.locales);
       }
-      const isBundled = Boolean(bundledCatalogs[code]);
+      const isBundled = builtinLocaleCodes.has(code);
       const source = isBundled ? data.custom_messages : data.custom_messages || data.messages;
       if (source && typeof source === "object") {
-        const base = bundledCatalogs[code] ? { ...bundledCatalogs[code] } : catalogs[code] || {};
+        const base = bundledCatalogs[code] ? { ...bundledCatalogs[code] } : {};
+        const refBuiltin =
+          bundledCatalogs[fallbackBuiltinCode] || bundledCatalogs["en-US"] || bundledCatalogs["zh-CN"];
         const overlay: Record<string, string> = { ...base };
         for (const [k, v] of Object.entries(source)) {
           if (typeof v !== "string" || !v) continue;
@@ -179,8 +257,8 @@ export async function ensureLocaleLoaded(rawCode: string, forceReload = false): 
             continue;
           } else if (
             base[k] !== undefined ||
-            !bundledCatalogs["en-US"] ||
-            bundledCatalogs["en-US"][k] !== undefined ||
+            !refBuiltin ||
+            refBuiltin[k] !== undefined ||
             k.startsWith("meta.")
           ) {
             overlay[k] = v;
@@ -191,7 +269,7 @@ export async function ensureLocaleLoaded(rawCode: string, forceReload = false): 
       }
     }
   } catch {
-    // Offline or non-overlay environment: bundled JSON catalog remains authoritative.
+    // Offline or non-overlay environment: built-in JSON catalog remains authoritative.
   }
   return code;
 }
@@ -199,6 +277,10 @@ export async function ensureLocaleLoaded(rawCode: string, forceReload = false): 
 // exportFullTemplateJSON merges public/backend keys from `/api/v1/i18n/{baseCode}` with all Admin SPA keys
 // into a single unified starter JSON file for creating new community language packs.
 export async function exportFullTemplateJSON(baseCode: "zh-CN" | "en-US"): Promise<string> {
+  await ensureBuiltinCatalog(baseCode);
+  if (!bundledCatalogs[baseCode]) {
+    await ensureBuiltinCatalog("en-US");
+  }
   const merged: Record<string, string> = {
     "meta.code": baseCode,
     "meta.name": baseCode === "zh-CN" ? "简体中文" : "English",
@@ -219,7 +301,7 @@ export async function exportFullTemplateJSON(baseCode: "zh-CN" | "en-US"): Promi
   } catch {
     // ignore fetch error; export admin keys
   }
-  const adminDict = bundledCatalogs[baseCode] || bundledCatalogs["en-US"] || {};
+  const adminDict = bundledCatalogs[baseCode] || bundledCatalogs["en-US"] || bundledCatalogs["zh-CN"] || {};
   for (const [k, v] of Object.entries(adminDict)) {
     if (k.startsWith("meta.")) continue;
     if (k.startsWith("nav.")) {
@@ -240,10 +322,11 @@ export async function exportFullTemplateJSON(baseCode: "zh-CN" | "en-US"): Promi
   return JSON.stringify(sorted, null, 2) + "\n";
 }
 
-// exportLocalePackJSON fetches `/api/admin/locales/{code}/export` and merges any missing bundled Admin SPA keys
-// so row-level exported language packs always include the full public + admin keyset (~1,380+ keys).
+// exportLocalePackJSON fetches `/api/admin/locales/{code}/export` and merges any missing built-in Admin SPA keys
+// so row-level exported language packs always include the full public + admin keyset (~1,900+ keys).
 export async function exportLocalePackJSON(rawCode: string): Promise<string> {
   const code = canonicalizeLocaleTag(rawCode) || rawCode;
+  await Promise.all([ensureBuiltinCatalog("zh-CN"), ensureBuiltinCatalog("en-US")]);
   const merged: Record<string, string> = {
     "meta.code": code,
     "meta.name": availableLocalesSig.value.find((l) => l.code === code)?.name || code,
@@ -262,15 +345,17 @@ export async function exportLocalePackJSON(rawCode: string): Promise<string> {
       }
     }
   } catch {
-    // Fallback to loaded/bundled catalog below
+    // Fallback to loaded/built-in catalog below
   }
+  const isZh = code.toLowerCase().startsWith("zh");
   const fallbackAdmin =
     bundledCatalogs[code] ||
     catalogs[code] ||
-    (code.startsWith("zh") ? bundledCatalogs["zh-CN"] : bundledCatalogs["en-US"]) ||
+    (isZh ? bundledCatalogs["zh-CN"] : bundledCatalogs["en-US"]) ||
     bundledCatalogs["en-US"] ||
+    bundledCatalogs["zh-CN"] ||
     {};
-  const enAdmin = bundledCatalogs["en-US"] || {};
+  const enAdmin = bundledCatalogs["en-US"] || bundledCatalogs["zh-CN"] || {};
   const allAdminKeys = new Set([...Object.keys(enAdmin), ...Object.keys(fallbackAdmin)]);
   for (const k of allAdminKeys) {
     if (k.startsWith("meta.")) continue;
@@ -303,10 +388,12 @@ export function getLocaleDir(code?: string): string {
 
 export function tFor(locale: string, key: string, vars?: Record<string, string | number>): string {
   void catalogVersionSig.value;
+  const isZh = locale.toLowerCase().startsWith("zh");
   let tpl =
     catalogs[locale]?.[key] ??
-    catalogs["zh-CN"]?.[key] ??
-    catalogs["en-US"]?.[key] ??
+    (isZh
+      ? catalogs["zh-CN"]?.[key] ?? catalogs["en-US"]?.[key]
+      : catalogs["en-US"]?.[key] ?? catalogs["zh-CN"]?.[key]) ??
     key;
   if (vars) {
     for (const [k, v] of Object.entries(vars)) {

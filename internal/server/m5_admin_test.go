@@ -266,7 +266,7 @@ func TestM5_AdminBundleBudgetAndStealthMount(t *testing.T) {
 			t.Fatalf("SPA HTML contains external CDN reference %q", cdn)
 		}
 	}
-	idx := strings.Index(html, "assets/")
+	idx := strings.LastIndex(html, "assets/")
 	if idx < 0 {
 		t.Fatalf("expected hashed assets/ reference in SPA HTML: %s", html)
 	}
@@ -512,11 +512,12 @@ func TestM5_AtomicSettingsPatchSecretMaskingRBACAndRevisions(t *testing.T) {
 
 	// Admin creates an Editor collaborator via POST /api/admin/users
 	edCreateResp, edCreateRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/users", map[string]any{
-		"username":     "collab_editor",
-		"email":        "editor@example.com",
-		"display_name": "Collab Editor",
-		"role":         "editor",
-		"password":     "Editor!Pass#2026",
+		"username":         "collab_editor",
+		"email":            "editor@example.com",
+		"display_name":     "Collab Editor",
+		"role":             "editor",
+		"password":         "Editor!Pass#2026",
+		"current_password": "Admin!Password#2026",
 	}, adminCookies, adminCSRF)
 	if edCreateResp.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /api/admin/users (editor) = %d %s", edCreateResp.StatusCode, string(edCreateRaw))

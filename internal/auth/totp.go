@@ -21,17 +21,17 @@ import (
 )
 
 const (
-	totpPeriodSec       = 30
-	totpDigits          = 6
-	recoveryCodeCount   = 8
-	recoveryAlphabet    = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-	twoFactorTicketTTL  = 5 * time.Minute
+	totpPeriodSec      = 30
+	totpDigits         = 6
+	recoveryCodeCount  = 8
+	recoveryAlphabet   = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+	twoFactorTicketTTL = 5 * time.Minute
 )
 
 var (
-	ErrTOTPInvalid       = errors.New("auth: invalid or expired TOTP verification code")
-	ErrTOTPReplay        = errors.New("auth: TOTP code already used in current time window")
-	ErrTwoFactorExpired  = errors.New("auth: two-factor login challenge expired or invalid")
+	ErrTOTPInvalid      = errors.New("auth: invalid or expired TOTP verification code")
+	ErrTOTPReplay       = errors.New("auth: TOTP code already used in current time window")
+	ErrTwoFactorExpired = errors.New("auth: two-factor login challenge expired or invalid")
 )
 
 // TOTPReplayGuard prevents a valid 6-digit TOTP code from being replayed within the same 30s counter window.

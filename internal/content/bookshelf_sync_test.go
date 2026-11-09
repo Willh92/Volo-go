@@ -284,5 +284,3 @@ func main() {}
 		t.Fatalf("expected plain Go block highlighted via Volo lexer with data-lang=go, got:\n%s", htmlOut)
 	}
 }
-
-

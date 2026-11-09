@@ -256,7 +256,7 @@ func openMigratedStore(ctx context.Context, cfg *config.Config) (*sqlx.Store, er
 }
 
 func applyPersistedUploadDir(ctx context.Context, cfg *config.Config, store *sqlx.Store, settingsMgr *repo.SettingsManager, fs *flag.FlagSet) {
-	if cfg == nil {
+	if cfg == nil || cfg.IsUploadDirPinned() {
 		return
 	}
 	if fs != nil {
@@ -292,7 +292,7 @@ func applyPersistedUploadDir(ctx context.Context, cfg *config.Config, store *sql
 }
 
 func applyPersistedGeoIPDir(ctx context.Context, cfg *config.Config, store *sqlx.Store, settingsMgr *repo.SettingsManager, fs *flag.FlagSet) {
-	if cfg == nil {
+	if cfg == nil || cfg.IsGeoIPDirPinned() {
 		return
 	}
 	if fs != nil {
@@ -305,6 +305,9 @@ func applyPersistedGeoIPDir(ctx context.Context, cfg *config.Config, store *sqlx
 		if geoFlagSet {
 			return
 		}
+	}
+	if strings.TrimSpace(os.Getenv("VOLO_GEOIP_DIR")) != "" {
+		return
 	}
 	mgr := settingsMgr
 	if mgr == nil && store != nil {
@@ -320,6 +323,12 @@ func applyPersistedGeoIPDir(ctx context.Context, cfg *config.Config, store *sqlx
 	}
 	if validDir, err := cfg.ValidateCustomGeoIPPath(rawDir); err == nil && validDir != "" {
 		cfg.SetGeoIPDir(validDir)
+	}
+}
+
+func closeGeoEngineFromDeps(deps server.AppDeps) {
+	if deps.Geo != nil {
+		deps.Geo.Close()
 	}
 }
 
@@ -341,6 +350,12 @@ func pruneExpiredMaintenance(ctx context.Context, store *sqlx.Store, pluginMgr *
 }
 
 func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
+	return runWithServiceSupport(ctx, func(svcCtx context.Context) int {
+		return cmdServeRun(svcCtx, args, stdout, stderr)
+	}, stderr)
+}
+
+func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(96 << 20)
 	}
@@ -393,11 +408,12 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	applyPersistedGeoIPDir(ctx, cfg, store, settingsMgr, fs)
 
 	pluginMgr := plugin.NewManager(plugin.ManagerOptions{
-		Store:      store,
-		Keys:       cfg.KeyRing,
-		PluginsDir: cfg.PluginsDir,
-		DataDir:    cfg.DataDir,
-		Catalog:    catalog,
+		Store:        store,
+		Keys:         cfg.KeyRing,
+		SecretSealer: cfg.KeyRing.SecretBox(),
+		PluginsDir:   cfg.PluginsDir,
+		DataDir:      cfg.DataDir,
+		Catalog:      catalog,
 	})
 	_ = pluginMgr.DiscoverAndStart(ctx)
 	defer func() {
@@ -438,6 +454,8 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		Plugins:        pluginMgr,
 		BackupDir:      cfg.BackupDir,
 		UploadDir:      cfg.GetUploadDir(),
+		PluginsDir:     cfg.PluginsDir,
+		ThemesDir:      cfg.ThemesDir,
 		OutboundDialer: outboundDialer,
 		Logger:         logging.TeeWriter(stderr, logging.Default()),
 	})
@@ -476,6 +494,7 @@ func cmdServe(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		closeGeoEngineFromDeps(appSrv.Deps())
 		_ = appSrv.Close(shutCtx)
 	}()
 
@@ -759,6 +778,8 @@ func cmdBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 		manifest, err := backup.CreateToFile(ctx, store, dest, backup.CreateOptions{
 			IncludeMedia: *withMedia,
 			UploadDir:    cfg.GetUploadDir(),
+			PluginsDir:   cfg.PluginsDir,
+			ThemesDir:    cfg.ThemesDir,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "volo backup create: %v\n", err)
@@ -801,8 +822,10 @@ func cmdBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 		applyPersistedUploadDir(ctx, cfg, store, nil, fs)
 
 		sum, err := backup.RestoreFromFile(ctx, store, posPath, backup.RestoreOptions{
-			DryRun:    *dryRun,
-			UploadDir: cfg.GetUploadDir(),
+			DryRun:     *dryRun,
+			UploadDir:  cfg.GetUploadDir(),
+			PluginsDir: cfg.PluginsDir,
+			ThemesDir:  cfg.ThemesDir,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "volo backup restore: %v\n", err)

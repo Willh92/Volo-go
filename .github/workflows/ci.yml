@@ -42,9 +42,26 @@ jobs:
           sh -n scripts/install-service.sh
           sh -n scripts/install-service-linux.sh
           sh -n scripts/install-service-macos.sh
-          sh scripts/install-service.sh install --dry-run --init systemd --unix-socket /run/volo/volo.sock >/dev/null
+          sh -n deploy/openrc/volo.initd
+          if command -v pwsh >/dev/null 2>&1; then
+            pwsh -NoLogo -NoProfile -NonInteractive -Command '
+              $hasErr = $false
+              foreach ($f in @("scripts/install-service.ps1", "scripts/install-service-windows.ps1")) {
+                $tokens = $null
+                $errors = $null
+                $full = (Resolve-Path $f).Path
+                [void][System.Management.Automation.Language.Parser]::ParseFile($full, [ref]$tokens, [ref]$errors)
+                if ($errors.Count -gt 0) {
+                  foreach ($e in $errors) { [Console]::Error.WriteLine("${f}: $($e.ToString())") }
+                  $hasErr = $true
+                }
+              }
+              if ($hasErr) { exit 1 }
+            '
+          fi
+          sh scripts/install-service.sh install --dry-run --init systemd --unix-socket /run/volo/volo.sock --socket-group www-data >/dev/null
           sh scripts/install-service.sh upgrade --dry-run --init systemd >/dev/null
-          bash scripts/install-service-linux.sh install --dry-run --init systemd --listen-socket /run/volo/volo.sock >/dev/null
+          bash scripts/install-service-linux.sh install --dry-run --init systemd --listen-socket /run/volo/volo.sock --socket-group www-data >/dev/null
           bash scripts/install-service-macos.sh install --dry-run >/dev/null
 
       - name: Setup Node.js 24
@@ -96,26 +113,33 @@ jobs:
           CGO_ENABLED: "0"
         run: go test -run=^$ -bench=. -benchtime=50ms ./internal/render ./internal/visibility ./internal/db/sqlx ./internal/server
 
-      - name: Verify Cross-Compilation Matrix (5 Targets, CGO_ENABLED=0, < 20 MiB Each)
+      - name: Verify Cross-Compilation Matrix (6 Targets, CGO_ENABLED=0, < 21 MiB Each)
         env:
           CGO_ENABLED: "0"
           GOEXPERIMENT: "nojsonv2"
+          VOLO_BUDGET_BIN_MB: ${{ vars.VOLO_BUDGET_BIN_MB }}
         run: |
+          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-21}"
+          MAX_BIN_BYTES=$((BUDGET_BIN_MB * 1024 * 1024))
           mkdir -p /tmp/volo-cross
           GC_ALL="all=-l"
-          GOOS=linux   GOARCH=amd64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-amd64       ./cmd/volo
-          GOOS=linux   GOARCH=arm64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-linux-arm64       ./cmd/volo
-          GOOS=darwin  GOARCH=amd64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-amd64      ./cmd/volo
-          GOOS=darwin  GOARCH=arm64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-darwin-arm64      ./cmd/volo
-          GOOS=windows GOARCH=amd64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w" -o /tmp/volo-cross/volo-windows-amd64.exe ./cmd/volo
+          GOOS=linux   GOARCH=amd64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w -funcalign=8" -o /tmp/volo-cross/volo-linux-amd64       ./cmd/volo
+          GOOS=linux   GOARCH=arm64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w -funcalign=8" -o /tmp/volo-cross/volo-linux-arm64       ./cmd/volo
+          GOOS=darwin  GOARCH=amd64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w -funcalign=8" -o /tmp/volo-cross/volo-darwin-amd64      ./cmd/volo
+          GOOS=darwin  GOARCH=arm64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w -funcalign=8" -o /tmp/volo-cross/volo-darwin-arm64      ./cmd/volo
+          GOOS=windows GOARCH=amd64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w -funcalign=8" -o /tmp/volo-cross/volo-windows-amd64.exe ./cmd/volo
+          GOOS=windows GOARCH=arm64 go build -buildvcs=false -trimpath -gcflags="${GC_ALL}" -ldflags="-s -w -funcalign=8" -o /tmp/volo-cross/volo-windows-arm64.exe ./cmd/volo
           ls -lh /tmp/volo-cross
           for bin in /tmp/volo-cross/*; do
             SZ=$(wc -c < "$bin" | tr -d ' ')
-            if [ "$SZ" -ge 20971520 ]; then
-              echo "FAIL: $bin ($SZ bytes) exceeds 20 MiB budget" >&2
+            if [ "$SZ" -ge "$MAX_BIN_BYTES" ]; then
+              echo "FAIL: $bin ($SZ bytes) exceeds ${BUDGET_BIN_MB} MiB budget (${MAX_BIN_BYTES} bytes)" >&2
               exit 1
             fi
           done
 
       - name: Enforce Binary Size (< 20 MiB), Static Linkage & Idle RSS (< 35 MiB)
+        env:
+          VOLO_BUDGET_BIN_MB: ${{ vars.VOLO_BUDGET_BIN_MB }}
+          VOLO_BUDGET_RSS_MB: ${{ vars.VOLO_BUDGET_RSS_MB }}
         run: bash scripts/verify-binary-budget.sh

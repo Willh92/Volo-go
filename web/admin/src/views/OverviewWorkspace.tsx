@@ -306,7 +306,7 @@ function MonthlyArticlesChart({
   const yMax = Math.ceil(maxVal / 2) * 2;
   const n = Math.max(1, series.length);
   const slotW = plotW / n;
-  const barW = Math.max(2.5, Math.min(18, slotW * (n > 24 ? 0.72 : 0.62)));
+  const barW = Math.min(slotW * 0.72, Math.max(1.2, Math.min(18, slotW * (n > 24 ? 0.72 : 0.62))));
 
   const years = new Set(series.map((d) => String(d.month || "").slice(0, 4)).filter(Boolean));
   const multiYear = isHistory || years.size > 1;
@@ -332,6 +332,12 @@ function MonthlyArticlesChart({
 
   const active = hoverIdx !== null && series[hoverIdx] ? series[hoverIdx] : null;
   const activeCx = hoverIdx !== null && series[hoverIdx] ? padL + slotW * (hoverIdx + 0.5) : null;
+  const activeVal = active ? Number(active.count || 0) : 0;
+  const activeBarH = activeVal > 0 ? Math.max(2.5, (activeVal / yMax) * plotH) : 1.5;
+  const activeBarTopY = padT + plotH - activeBarH;
+  const barTRatio = Math.max(0, Math.min(1, (activeBarTopY - padT) / plotH));
+  const barXPct = activeCx !== null ? (activeCx / W) * 100 : 50;
+  const barYPct = (activeBarTopY / H) * 100;
 
   const onTouch = (e: TouchEvent) => {
     const touch = e.touches?.[0];
@@ -344,21 +350,25 @@ function MonthlyArticlesChart({
     <div class="volo-chart-stage" style={{ flex: 1, display: "flex", alignItems: "center" }}>
       {active && activeCx !== null && (
         <div
-          class="volo-chart-tooltip"
+          class="volo-chart-tooltip volo-chart-tooltip--floating"
           style={{
-            left: activeCx > W * 0.5 ? "auto" : `${Math.max(4, (activeCx / W) * 100)}%`,
-            right: activeCx > W * 0.5 ? `${Math.max(4, ((W - activeCx) / W) * 100)}%` : "auto",
+            left: `${barXPct.toFixed(2)}%`,
+            top: `${barYPct.toFixed(2)}%`,
+            transform: `translate(${barXPct > 52 ? "calc(-100% - 12px)" : "12px"}, -${Math.round(15 + barTRatio * 85)}%)`,
           }}
         >
-          <div style={{ fontWeight: 650 }}>{active.month}</div>
-          <div>
-            {t("ov.published")}: {Number(active.count || 0).toLocaleString()}
+          <div style={{ fontWeight: 650, marginBottom: "1px" }}>{active.month}</div>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+            <span class="volo-tooltip-dot" style={{ background: "var(--volo-accent)" }} />
+            <span>
+              {t("ov.published")}: <strong>{activeVal.toLocaleString()}</strong>
+            </span>
           </div>
         </div>
       )}
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        style={{ width: "100%", height: "auto", display: "block", touchAction: "pan-y" }}
+        style={{ width: "100%", height: "auto", display: "block", touchAction: "pan-y", overflow: "visible" }}
         onMouseMove={(e) => {
           const idx = pickBarIndex(e.currentTarget as SVGSVGElement, e.clientX);
           if (idx !== null) setHoverIdx(idx);
@@ -388,13 +398,15 @@ function MonthlyArticlesChart({
         })}
         {hoverIdx !== null && series[hoverIdx] && (
           <rect
-            x={padL + slotW * hoverIdx}
+            class="volo-bar-slot-hl"
+            x={0}
             y={padT}
             width={slotW}
             height={plotH}
-            rx="3"
+            rx="4"
             fill="var(--volo-accent)"
             fill-opacity="0.08"
+            style={{ transform: `translateX(${(padL + slotW * hoverIdx).toFixed(1)}px)` }}
           />
         )}
         {series.map((d, idx) => {
@@ -404,6 +416,7 @@ function MonthlyArticlesChart({
           const barH = val > 0 ? Math.max(2.5, rawH) : 1.5;
           const barY = padT + plotH - barH;
           const isHover = hoverIdx === idx;
+          const isDim = hoverIdx !== null && !isHover;
           const showLbl = labelIndices.has(idx);
           const anchor =
             n > maxLabels && idx === 0 ? "start" : n > maxLabels && idx === n - 1 ? "end" : "middle";
@@ -413,22 +426,24 @@ function MonthlyArticlesChart({
           return (
             <g key={`${d.month}-${idx}`}>
               <rect
+                class={`volo-bar-rect ${isHover ? "is-hover" : isDim ? "is-dim" : ""}`}
                 x={cx - barW / 2}
                 y={barY}
                 width={barW}
                 height={barH}
-                rx={Math.min(3, barW / 2)}
+                rx={Math.min(3.5, barW / 2)}
                 fill={val > 0 ? "var(--volo-accent)" : "var(--volo-line)"}
-                fill-opacity={val > 0 ? (isHover ? "1" : "0.82") : "0.65"}
+                fill-opacity={val > 0 ? (isHover ? "1" : isDim ? "0.52" : "0.84") : "0.65"}
               />
               {val > 0 && (n <= 16 || isHover) && (
                 <text
                   x={cx}
-                  y={Math.max(10.5, barY - 3.5)}
+                  y={Math.max(10.5, barY - (isHover ? 5.5 : 3.5))}
                   text-anchor="middle"
-                  font-size="9.5"
-                  font-weight="600"
+                  font-size={isHover ? "10" : "9.5"}
+                  font-weight={isHover ? "700" : "600"}
                   fill={isHover ? "var(--volo-accent)" : "var(--volo-muted)"}
+                  style={{ transition: "fill 0.16s ease" }}
                 >
                   {formatCompactNum(val)}
                 </text>
@@ -439,7 +454,8 @@ function MonthlyArticlesChart({
                   y={H - 6}
                   text-anchor={anchor}
                   font-size={multiYear ? "9.5" : "10.5"}
-                  fill="var(--volo-muted)"
+                  font-weight={isHover ? "650" : "400"}
+                  fill={isHover ? "var(--volo-text)" : "var(--volo-muted)"}
                 >
                   {lblText}
                 </text>
@@ -461,6 +477,8 @@ function DonutChart({
   emptyText: string;
   prefix?: string;
 }) {
+  const [hoverState, setHoverState] = useState<{ idx: number; source: "ring" | "legend" } | null>(null);
+
   const allPositive = (items || [])
     .map((it) => ({
       name: it.name,
@@ -491,73 +509,160 @@ function DonutChart({
       : allPositive;
 
   const r = 38;
-  const cx = 52;
-  const cy = 52;
+  const cx = 58;
+  const cy = 58;
   const circ = 2 * Math.PI * r;
   let offsetAcc = 0;
 
+  const computed = segments.map((it, idx) => {
+    const val = Number(it.count || 0);
+    const frac = val / total;
+    const segLen = Math.max(0, frac * circ);
+    const gap = segments.length > 1 ? Math.min(1.2, segLen * 0.18) : 0;
+    const drawLen = Math.max(0.6, segLen - gap);
+    const startOffset = offsetAcc + gap / 2;
+    const midFrac = (offsetAcc + segLen / 2) / circ;
+    offsetAcc += segLen;
+    const theta = midFrac * 2 * Math.PI - Math.PI / 2;
+    const popDist = segments.length > 1 ? 4.8 : 0;
+    const dx = Math.cos(theta) * popDist;
+    const dy = Math.sin(theta) * popDist;
+    const arcX = cx + Math.cos(theta) * (r + 13);
+    const arcY = cy + Math.sin(theta) * (r + 13);
+    const color = DONUT_PALETTE[idx % DONUT_PALETTE.length];
+    const pct = Math.round(frac * 100);
+    const dispName = `${it.isOthers ? "" : prefix}${it.name}`;
+    return { it, idx, val, pct, color, dispName, drawLen, startOffset, theta, dx, dy, arcX, arcY };
+  });
+
+  const hoverIdx = hoverState && computed[hoverState.idx] ? hoverState.idx : null;
+  const activeSeg = hoverIdx !== null ? computed[hoverIdx] : null;
+
   return (
-    <div class="volo-donut-wrap">
-      <svg width="104" height="104" viewBox="0 0 104 104" style={{ flexShrink: 0 }}>
-        <title>{total.toLocaleString()}</title>
-        <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--volo-line)" stroke-width="15" />
-        {segments.map((it, idx) => {
-          const val = Number(it.count || 0);
-          const frac = val / total;
-          const segLen = Math.max(0, frac * circ);
-          const curOffset = offsetAcc;
-          offsetAcc += segLen;
-          const color = DONUT_PALETTE[idx % DONUT_PALETTE.length];
-          const pct = Math.round(frac * 100);
-          const dispName = `${it.isOthers ? "" : prefix}${it.name}`;
-          return (
-            <circle
-              key={`${it.name}-${idx}`}
-              cx={cx}
-              cy={cy}
-              r={r}
-              fill="none"
-              stroke={color}
-              stroke-width="15"
-              stroke-dasharray={`${segLen.toFixed(2)} ${circ.toFixed(2)}`}
-              stroke-dashoffset={(-curOffset).toFixed(2)}
-              transform={`rotate(-90 ${cx} ${cy})`}
-            >
-              <title>{`${dispName}: ${val.toLocaleString()} (${pct}%)`}</title>
-            </circle>
-          );
-        })}
-        <text
-          x={cx}
-          y={cy - 1}
-          text-anchor="middle"
-          font-size={total >= 10000 ? "13.5" : "15"}
-          font-weight="700"
-          fill="var(--volo-text)"
+    <div class="volo-donut-wrap" onMouseLeave={() => setHoverState(null)}>
+      <div class="volo-donut-stage">
+        {activeSeg && hoverState?.source === "ring" && (
+          <div
+            class="volo-chart-tooltip volo-chart-tooltip--floating"
+            style={{
+              left: `${Math.max(8, Math.min(108, activeSeg.arcX)).toFixed(1)}px`,
+              top: `${activeSeg.arcY.toFixed(1)}px`,
+              transform: `translate(${
+                Math.cos(activeSeg.theta) < -0.25 ? "-10%" : Math.cos(activeSeg.theta) > 0.35 ? "-26%" : "-50%"
+              }, ${Math.sin(activeSeg.theta) > 0.08 ? "10px" : "calc(-100% - 10px)"})`,
+            }}
+          >
+            <div style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+              <span class="volo-tooltip-dot" style={{ background: activeSeg.color }} />
+              <strong>{activeSeg.dispName}</strong>
+              <span style={{ opacity: 0.9 }}>
+                {activeSeg.val.toLocaleString()} ({activeSeg.pct}%)
+              </span>
+            </div>
+          </div>
+        )}
+        <svg
+          width="112"
+          height="112"
+          viewBox="0 0 116 116"
+          role="img"
+          aria-label={`${t("ov.chart_total")}: ${total.toLocaleString()}`}
+          style={{ flexShrink: 0, overflow: "visible" }}
         >
-          {formatCompactNum(total)}
-        </text>
-        <text x={cx} y={cy + 14} text-anchor="middle" font-size="11" fill="var(--volo-muted)">
-          {t("ov.chart_total")}
-        </text>
-      </svg>
+          <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--volo-line)" stroke-width="15" stroke-opacity="0.65" />
+          {computed.map((seg) => {
+            const isHover = hoverIdx === seg.idx;
+            const isDim = hoverIdx !== null && !isHover;
+            const popTransform = isHover
+              ? computed.length > 1
+                ? `translate(${seg.dx.toFixed(2)}px, ${seg.dy.toFixed(2)}px)`
+                : "scale(1.045)"
+              : "translate(0px, 0px)";
+            return (
+              <g
+                key={`${seg.it.name}-${seg.idx}`}
+                class={`volo-donut-seg ${isHover ? "is-hover" : isDim ? "is-dim" : ""}`}
+                style={{ transform: popTransform }}
+                onMouseEnter={() => setHoverState({ idx: seg.idx, source: "ring" })}
+                onClick={() =>
+                  setHoverState((prev) => (prev?.idx === seg.idx ? null : { idx: seg.idx, source: "ring" }))
+                }
+              >
+                <circle
+                  class="volo-donut-arc"
+                  cx={cx}
+                  cy={cy}
+                  r={r}
+                  fill="none"
+                  stroke={seg.color}
+                  stroke-width={isHover ? 18.5 : 15}
+                  stroke-dasharray={`${seg.drawLen.toFixed(2)} ${circ.toFixed(2)}`}
+                  stroke-dashoffset={(-seg.startOffset).toFixed(2)}
+                  transform={`rotate(-90 ${cx} ${cy})`}
+                />
+                <circle
+                  cx={cx}
+                  cy={cy}
+                  r={r}
+                  fill="none"
+                  stroke="transparent"
+                  stroke-width="24"
+                  stroke-dasharray={`${seg.drawLen.toFixed(2)} ${circ.toFixed(2)}`}
+                  stroke-dashoffset={(-seg.startOffset).toFixed(2)}
+                  transform={`rotate(-90 ${cx} ${cy})`}
+                />
+              </g>
+            );
+          })}
+          <text
+            x={cx}
+            y={cy - 1}
+            text-anchor="middle"
+            font-size={(activeSeg ? activeSeg.val : total) >= 10000 ? "13.5" : "15.5"}
+            font-weight="750"
+            fill="var(--volo-text)"
+            style={{ pointerEvents: "none" }}
+          >
+            {formatCompactNum(activeSeg ? activeSeg.val : total)}
+          </text>
+          <text
+            x={cx}
+            y={cy + 14}
+            text-anchor="middle"
+            font-size="11"
+            font-weight={activeSeg ? "700" : "400"}
+            fill={activeSeg ? activeSeg.color : "var(--volo-muted)"}
+            style={{ pointerEvents: "none", transition: "fill 0.18s ease" }}
+          >
+            {activeSeg ? `${activeSeg.pct}%` : t("ov.chart_total")}
+          </text>
+        </svg>
+      </div>
 
       <div class="volo-donut-legend">
-        {segments.map((it, idx) => {
-          const val = Number(it.count || 0);
-          const pct = Math.round((val / total) * 100);
-          const color = DONUT_PALETTE[idx % DONUT_PALETTE.length];
-          const dispName = `${it.isOthers ? "" : prefix}${it.name}`;
+        {computed.map((seg) => {
+          const isHover = hoverIdx === seg.idx;
+          const isDim = hoverIdx !== null && !isHover;
           return (
-            <div key={`${it.name}-${idx}`} class="volo-donut-legend-row">
+            <div
+              key={`${seg.it.name}-${seg.idx}`}
+              class={`volo-donut-legend-row ${isHover ? "is-active" : isDim ? "is-dim" : ""}`}
+              onMouseEnter={() => setHoverState({ idx: seg.idx, source: "legend" })}
+              onClick={() =>
+                setHoverState((prev) => (prev?.idx === seg.idx ? null : { idx: seg.idx, source: "legend" }))
+              }
+            >
               <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
-                <span class="volo-donut-dot" style={{ background: color }} />
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={dispName}>
-                  {dispName}
+                <span class="volo-donut-dot" style={{ background: seg.color }} />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {seg.dispName}
                 </span>
               </div>
-              <span class="volo-help" style={{ fontFamily: "var(--volo-mono)", whiteSpace: "nowrap", flexShrink: 0 }} title={val.toLocaleString()}>
-                {formatCompactNum(val)} ({pct}%)
+              <span
+                class="volo-help volo-donut-val"
+                style={{ fontFamily: "var(--volo-mono)", whiteSpace: "nowrap", flexShrink: 0 }}
+              >
+                {formatCompactNum(seg.val)} ({seg.pct}%)
               </span>
             </div>
           );
@@ -580,8 +685,9 @@ export function OverviewWorkspace({
 
   const [overview, setOverview] = useState<any>(null);
   const [trendDays, setTrendDays] = useState<7 | 30>(7);
-  const [monthlyRangeMode, setMonthlyRangeMode] = useState<"auto" | "12m" | "history">("auto");
+  const [monthlyRangeMode, setMonthlyRangeMode] = useState<"auto" | "12m" | "24m" | "history">("auto");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [focusSeries, setFocusSeries] = useState<"pv" | "uv" | null>(null);
   const [isNarrowChart, setIsNarrowChart] = useState<boolean>(() =>
     typeof window !== "undefined" ? window.matchMedia("(max-width: 640px)").matches : false
   );
@@ -653,6 +759,7 @@ export function OverviewWorkspace({
   const [quickCreateSaving, setQuickCreateSaving] = useState(false);
 
   const [seriesID, setSeriesID] = useState("");
+  const [editingSeriesTitle, setEditingSeriesTitle] = useState("");
   const [summaryMD, setSummaryMD] = useState("");
   const [contentMD, setContentMD] = useState("");
   const [coverURL, setCoverURL] = useState("");
@@ -677,18 +784,23 @@ export function OverviewWorkspace({
   const [pendingDraft, setPendingDraft] = useState<LocalDraft | null>(null);
   const [inlineRevs, setInlineRevs] = useState<any[]>([]);
   const [revisions, setRevisions] = useState<any[] | null>(null);
+  const [revPage, setRevPage] = useState<number>(1);
+  const [revTotal, setRevTotal] = useState<number>(0);
   const [diffRevID, setDiffRevID] = useState<string | null>(null);
   const [shareTTL, setShareTTL] = useState<string>("72");
   const [shareURL, setShareURL] = useState<string>("");
 
-  const editingIDRef = useRef<string | null>(null);
+  const editingIDRef = useRef<string | null>(editingID);
+  const editReqSeqRef = useRef(0);
+  const ovReqSeqRef = useRef(0);
+  const savingArticleRef = useRef(false);
   const sectionRef = useRef<OverviewSection>(section);
-  editingIDRef.current = editingID;
   sectionRef.current = section;
 
   const draftKey = editingID === "" ? "article:new" : editingID ? `article:${editingID}` : "";
 
   const startNewArticle = async (catsOverride?: any[]) => {
+    const seq = ++editReqSeqRef.current;
     const catList = catsOverride || categories;
     dirtyEditorSig.value = false;
     editingIDRef.current = "";
@@ -703,6 +815,7 @@ export function OverviewWorkspace({
     setTagPoolQuery("");
     setTagSuggestOpen(false);
     setSeriesID("");
+    setEditingSeriesTitle("");
     setSummaryMD("");
     setContentMD("");
     setCoverURL("");
@@ -723,8 +836,10 @@ export function OverviewWorkspace({
     setPreviewURL("");
     setShareURL("");
     setInlineRevs([]);
+    setRevTotal(0);
     resetConsoleScroll();
     const saved = await loadLocalDraft("article:new");
+    if (seq !== editReqSeqRef.current) return;
     if (saved && (saved.title || saved.content_md)) {
       setPendingDraft(saved);
     } else {
@@ -733,10 +848,11 @@ export function OverviewWorkspace({
   };
 
   const loadOverview = async (days: number) => {
+    const seq = ++ovReqSeqRef.current;
     const ov = await apiFetch<any>(
       `/api/admin/overview?locale=${encodeURIComponent(localeSig.value)}&days=${days}`
     ).catch(() => null);
-    if (ov) setOverview(ov);
+    if (seq === ovReqSeqRef.current && ov) setOverview(ov);
   };
 
   const loadTaxonomies = async () => {
@@ -773,6 +889,27 @@ export function OverviewWorkspace({
         if (c?.id && !seen.has(c.id)) {
           seen.add(c.id);
           merged.push(c);
+        }
+      }
+      return merged;
+    });
+  };
+
+  const searchRemoteSeries = async (q: string) => {
+    const qs = new URLSearchParams({ per_page: "100" });
+    if (q.trim()) qs.set("q", q.trim());
+    const res = await apiFetch<{ items?: any[]; series?: any[] }>(
+      `/api/admin/series?${qs.toString()}`
+    ).catch(() => ({ items: [] as any[], series: [] as any[] }));
+    const incoming = res.items || res.series || [];
+    if (incoming.length === 0) return;
+    setSeriesList((prev) => {
+      const seen = new Set(prev.map((s: any) => s.id));
+      const merged = [...prev];
+      for (const s of incoming) {
+        if (s?.id && !seen.has(s.id)) {
+          seen.add(s.id);
+          merged.push(s);
         }
       }
       return merged;
@@ -861,10 +998,27 @@ export function OverviewWorkspace({
     return cats;
   };
 
+  const fetchInlineRevisionsSummary = (artId: string) => {
+    apiFetch<{ items: any[]; total?: number }>(
+      `/api/admin/articles/${encodeURIComponent(artId)}/revisions?page=1&per_page=4&summary=1`
+    )
+      .then((r) => {
+        const items = r.items || [];
+        setInlineRevs(items.slice(0, 4));
+        setRevTotal(typeof r.total === "number" ? r.total : items.length);
+      })
+      .catch(() => {
+        setInlineRevs([]);
+        setRevTotal(0);
+      });
+  };
+
   const openEditArticle = async (id: string) => {
+    const seq = ++editReqSeqRef.current;
     editingIDRef.current = id;
     try {
       const data = await apiFetch<any>(`/api/admin/articles/${encodeURIComponent(id)}`);
+      if (seq !== editReqSeqRef.current) return;
       const a = data.article;
       const locked = Boolean(data.password || data.is_password_protected);
       dirtyEditorSig.value = false;
@@ -879,7 +1033,21 @@ export function OverviewWorkspace({
       setTagPoolOpen(false);
       setTagPoolQuery("");
       setTagSuggestOpen(false);
-      setSeriesID(data.series_id || "");
+      const nextSeriesId = String(data.series_id || (a as any)?.series_id || "");
+      const initialSeriesTitle = String(data.series_title || (a as any)?.series_title || "");
+      setSeriesID(nextSeriesId);
+      setEditingSeriesTitle(initialSeriesTitle);
+      if (nextSeriesId && !initialSeriesTitle && !seriesList.some((s) => s.id === nextSeriesId)) {
+        apiFetch<any>(`/api/admin/series/${encodeURIComponent(nextSeriesId)}`)
+          .then((sr) => {
+            if (seq !== editReqSeqRef.current) return;
+            const sItem = sr?.series || sr;
+            if (sItem?.id && sItem.title) {
+              setEditingSeriesTitle(String(sItem.title));
+            }
+          })
+          .catch(() => {});
+      }
       setSummaryMD(a.summary_md || "");
       setContentMD(a.content_md || "");
       setCoverURL(a.cover_url || "");
@@ -901,18 +1069,19 @@ export function OverviewWorkspace({
       setPreviewURL(data.preview_url || a.preview_url || "");
       setShareURL("");
       resetConsoleScroll();
-      apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(a.id)}/revisions`)
-        .then((r) => setInlineRevs(r.items || []))
-        .catch(() => setInlineRevs([]));
+      fetchInlineRevisionsSummary(a.id);
       const saved = await loadLocalDraft(`article:${id}`);
+      if (seq !== editReqSeqRef.current) return;
       if (saved && saved.content_md && saved.content_md !== a.content_md) {
         setPendingDraft(saved);
       } else {
         setPendingDraft(null);
       }
     } catch (err: any) {
-      editingIDRef.current = null;
-      showToast(err.message, "err");
+      if (seq === editReqSeqRef.current) {
+        editingIDRef.current = null;
+        showToast(err.message, "err");
+      }
     }
   };
 
@@ -923,6 +1092,7 @@ export function OverviewWorkspace({
     const jumpID = sessionStorage.getItem("volo_jump_article_id");
     if (jumpID) {
       sessionStorage.removeItem("volo_jump_article_id");
+      editingIDRef.current = jumpID;
       void loadTaxonomies();
       void loadOverview(trendDays);
       void openEditArticle(jumpID);
@@ -930,13 +1100,14 @@ export function OverviewWorkspace({
     }
     if (section === "editor") {
       void loadTaxonomies().then((cats) => {
-        if (editingIDRef.current === null) {
+        if (editingIDRef.current === null && sectionRef.current === "editor") {
           void startNewArticle(cats);
         }
       });
       void loadOverview(trendDays);
       return;
     }
+    ++editReqSeqRef.current;
     dirtyEditorSig.value = false;
     editingIDRef.current = null;
     setEditingID(null);
@@ -1123,6 +1294,7 @@ export function OverviewWorkspace({
       if (!ok) return;
       dirtyEditorSig.value = false;
     }
+    ++editReqSeqRef.current;
     editingIDRef.current = null;
     setEditingID(null);
     setTagDraft("");
@@ -1163,10 +1335,12 @@ export function OverviewWorkspace({
   };
 
   const handleSave = async (overrideStatus?: string, stayOpen = false) => {
+    if (savingArticleRef.current) return;
     if (!title.trim()) {
       showToast(t("art.title_ph"), "warn");
       return;
     }
+    savingArticleRef.current = true;
     const nextStatus = overrideStatus || status;
     try {
       const finalTags = parseTagList(tagDraft.trim() ? `${tagsText}, ${tagDraft}` : tagsText);
@@ -1199,15 +1373,18 @@ export function OverviewWorkspace({
         payload.password = "";
       }
 
-      const isCreate = editingID === "" || editingID === null;
+      const activeEditID = editingIDRef.current ?? editingID;
+      const isCreate = activeEditID === "" || activeEditID === null;
       const res = isCreate
         ? await apiFetch<any>("/api/admin/articles", { method: "POST", body: JSON.stringify(payload) })
-        : await apiFetch<any>(`/api/admin/articles/${encodeURIComponent(editingID)}`, {
+        : await apiFetch<any>(`/api/admin/articles/${encodeURIComponent(activeEditID)}`, {
             method: "PUT",
             body: JSON.stringify(payload),
           });
 
       if (draftKey) await clearLocalDraft(draftKey);
+      if (isCreate) await clearLocalDraft("article:new");
+      setPendingDraft(null);
       dirtyEditorSig.value = false;
       if (overrideStatus) setStatus(overrideStatus);
       if (tagDraft.trim()) {
@@ -1225,15 +1402,14 @@ export function OverviewWorkspace({
           if (savedArt.slug) setSlug(savedArt.slug);
           setHasSavedPassword(Boolean(res?.is_password_protected));
           setClearPassword(false);
-          apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(savedArt.id)}/revisions`)
-            .then((rv) => setInlineRevs(rv.items || []))
-            .catch(() => {});
+          fetchInlineRevisionsSummary(savedArt.id);
         }
         void loadArticlesAndTaxonomies();
         void loadOverview(trendDays);
         return;
       }
 
+      ++editReqSeqRef.current;
       editingIDRef.current = null;
       setEditingID(null);
       setTagDraft("");
@@ -1246,6 +1422,8 @@ export function OverviewWorkspace({
       }
     } catch (err: any) {
       showToast(err.message, "err");
+    } finally {
+      savingArticleRef.current = false;
     }
   };
 
@@ -1261,10 +1439,11 @@ export function OverviewWorkspace({
       }
     };
     const onJumpEdit = (ev: Event) => {
-      const id = (ev as CustomEvent).detail || sessionStorage.getItem("volo_jump_article_id");
+      const id = String((ev as CustomEvent).detail || sessionStorage.getItem("volo_jump_article_id") || "");
       if (id) {
         sessionStorage.removeItem("volo_jump_article_id");
-        void openEditRef.current(String(id));
+        editingIDRef.current = id;
+        void openEditRef.current(id);
       }
     };
     window.addEventListener("volo:save", onGlobalSave);
@@ -1291,10 +1470,23 @@ export function OverviewWorkspace({
       return;
     }
     try {
-      const res = await apiFetch<{ html: string }>("/api/admin/articles/preview", {
-        method: "POST",
-        body: JSON.stringify({ content_md: contentMD, locale: lang }),
-      });
+      const bodyStr = JSON.stringify({ content_md: contentMD, locale: lang });
+      let res: { html: string };
+      try {
+        res = await apiFetch<{ html: string }>("/api/admin/render/preview", {
+          method: "POST",
+          body: bodyStr,
+        });
+      } catch (e: any) {
+        if (e?.status === 404) {
+          res = await apiFetch<{ html: string }>("/api/admin/articles/preview", {
+            method: "POST",
+            body: bodyStr,
+          });
+        } else {
+          throw e;
+        }
+      }
       setInlinePreviewHTML(res.html || "");
     } catch (err: any) {
       showToast(err.message, "err");
@@ -1376,17 +1568,42 @@ export function OverviewWorkspace({
     }
   };
 
-  const openRevisions = async (initialDiffId: string | null = null) => {
+  const loadRevisionsPage = async (page = 1, initialDiffId: string | null = null) => {
     if (!editingID) return;
     try {
-      const res = await apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(editingID)}/revisions`);
-      const items = res.items || [];
-      setInlineRevs(items);
+      let res = await apiFetch<{ items: any[]; total?: number }>(
+        `/api/admin/articles/${encodeURIComponent(editingID)}/revisions?page=${page}&per_page=20`
+      );
+      let rawItems = res.items || [];
+      if (initialDiffId && !rawItems.find((x: any) => x.id === initialDiffId && typeof x.content_md === "string" && x.content_md !== "")) {
+        const fullRes = await apiFetch<{ items: any[]; total?: number }>(
+          `/api/admin/articles/${encodeURIComponent(editingID)}/revisions?page=1&per_page=50`
+        ).catch(() => null);
+        if (fullRes?.items) {
+          rawItems = fullRes.items;
+          res = fullRes;
+        }
+      }
+      const hasServerTotal = typeof res.total === "number";
+      const total = hasServerTotal ? Number(res.total) : rawItems.length;
+      const slice =
+        !hasServerTotal && rawItems.length > 20
+          ? paginateItems(rawItems, page, 20).slice
+          : rawItems;
+      if (page === 1) {
+        setInlineRevs(slice.slice(0, 4).map(({ content_md: _cmd, ...summaryItem }: any) => summaryItem));
+      }
+      setRevPage(page);
+      setRevTotal(total);
       setDiffRevID(initialDiffId);
-      setRevisions(items);
+      setRevisions(slice);
     } catch (err: any) {
       showToast(err.message, "err");
     }
+  };
+
+  const openRevisions = async (initialDiffId: string | null = null) => {
+    await loadRevisionsPage(1, initialDiffId);
   };
 
   const restoreRevision = async (revID: string) => {
@@ -1397,15 +1614,16 @@ export function OverviewWorkspace({
         `/api/admin/articles/${encodeURIComponent(editingID)}/revisions/${encodeURIComponent(revID)}/restore`,
         { method: "POST", body: "{}" }
       );
+      if (draftKey) await clearLocalDraft(draftKey);
+      await clearLocalDraft(`article:${editingID}`);
+      setPendingDraft(null);
       setTitle(res.article.title || "");
       setSummaryMD(res.article.summary_md || "");
       setContentMD(res.article.content_md || "");
       dirtyEditorSig.value = false;
       setRevisions(null);
       showToast(t("art.rev_restored"), "ok");
-      apiFetch<{ items: any[] }>(`/api/admin/articles/${encodeURIComponent(editingID)}/revisions`)
-        .then((rv) => setInlineRevs(rv.items || []))
-        .catch(() => {});
+      fetchInlineRevisionsSummary(editingID);
     } catch (err: any) {
       showToast(err.message, "err");
     }
@@ -1610,48 +1828,46 @@ export function OverviewWorkspace({
           </div>
 
           {pendingDraft && (
-            <div class="volo-subcard" style={{ background: "var(--volo-accent-soft)" }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
-                <span>{t("art.draft_recovered")} ({formatDateTime(pendingDraft.saved_at)})</span>
-                <div style={{ display: "flex", gap: "8px" }}>
-                  <button
-                    type="button"
-                    class="volo-btn volo-btn-sm volo-btn-primary"
-                    onClick={() => {
-                      setTitle(pendingDraft.title);
-                      setSlug(pendingDraft.slug);
-                      setSummaryMD(pendingDraft.summary_md);
-                      setContentMD(pendingDraft.content_md);
-                      if (pendingDraft.category_id !== undefined) setCategoryID(pendingDraft.category_id);
-                      if (pendingDraft.tags_text !== undefined) setTagsText(pendingDraft.tags_text);
-                      if (pendingDraft.series_id !== undefined) setSeriesID(pendingDraft.series_id);
-                      if (pendingDraft.cover_url !== undefined) setCoverURL(pendingDraft.cover_url);
-                      if (pendingDraft.visibility === "password" || pendingDraft.visibility === "public") {
-                        setVisibilityMode(pendingDraft.visibility);
-                      }
-                      if (pendingDraft.status) setStatus(pendingDraft.status);
-                      if (typeof pendingDraft.allow_comment === "boolean") setAllowComment(pendingDraft.allow_comment);
-                      if (pendingDraft.lang) setLang(pendingDraft.lang);
-                      if (pendingDraft.translation_group !== undefined) {
-                        setTranslationGroup(pendingDraft.translation_group);
-                      }
-                      dirtyEditorSig.value = true;
-                      setPendingDraft(null);
-                    }}
-                  >
-                    {t("art.restore_draft")}
-                  </button>
-                  <button
-                    type="button"
-                    class="volo-btn volo-btn-sm"
-                    onClick={() => {
-                      if (draftKey) void clearLocalDraft(draftKey);
-                      setPendingDraft(null);
-                    }}
-                  >
-                    {t("art.discard_draft")}
-                  </button>
-                </div>
+            <div class="volo-draft-banner" style={{ marginBottom: "14px" }}>
+              <span>{t("art.draft_recovered")} ({formatDateTime(pendingDraft.saved_at)})</span>
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm volo-btn-primary"
+                  onClick={() => {
+                    setTitle(pendingDraft.title);
+                    setSlug(pendingDraft.slug);
+                    setSummaryMD(pendingDraft.summary_md);
+                    setContentMD(pendingDraft.content_md);
+                    if (pendingDraft.category_id !== undefined) setCategoryID(pendingDraft.category_id);
+                    if (pendingDraft.tags_text !== undefined) setTagsText(pendingDraft.tags_text);
+                    if (pendingDraft.series_id !== undefined) setSeriesID(pendingDraft.series_id);
+                    if (pendingDraft.cover_url !== undefined) setCoverURL(pendingDraft.cover_url);
+                    if (pendingDraft.visibility === "password" || pendingDraft.visibility === "public") {
+                      setVisibilityMode(pendingDraft.visibility);
+                    }
+                    if (pendingDraft.status) setStatus(pendingDraft.status);
+                    if (typeof pendingDraft.allow_comment === "boolean") setAllowComment(pendingDraft.allow_comment);
+                    if (pendingDraft.lang) setLang(pendingDraft.lang);
+                    if (pendingDraft.translation_group !== undefined) {
+                      setTranslationGroup(pendingDraft.translation_group);
+                    }
+                    dirtyEditorSig.value = true;
+                    setPendingDraft(null);
+                  }}
+                >
+                  {t("art.restore_draft")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm"
+                  onClick={() => {
+                    if (draftKey) void clearLocalDraft(draftKey);
+                    setPendingDraft(null);
+                  }}
+                >
+                  {t("art.discard_draft")}
+                </button>
               </div>
             </div>
           )}
@@ -1872,8 +2088,12 @@ export function OverviewWorkspace({
                         </div>
                         <ConsoleSelect
                           value={seriesID}
+                          fallbackLabel={editingSeriesTitle || undefined}
+                          onSearch={searchRemoteSeries}
                           onChange={(v) => {
                             setSeriesID(v);
+                            const found = seriesList.find((s) => s.id === v);
+                            setEditingSeriesTitle(found ? String(found.title || "") : "");
                             dirtyEditorSig.value = true;
                           }}
                           options={[
@@ -2257,7 +2477,7 @@ export function OverviewWorkspace({
                   </button>
                   {!collapsedPanels.revisions && editingID && (
                     <button type="button" class="volo-act-btn" onClick={() => void openRevisions()}>
-                      {t("art.diff_btn")} ({inlineRevs.length})
+                      {t("art.diff_btn")} ({revTotal || inlineRevs.length})
                     </button>
                   )}
                 </div>
@@ -2500,6 +2720,14 @@ export function OverviewWorkspace({
                 </div>
               );
             })
+          )}
+          {revisions && revTotal > 20 && (
+            <Pagination
+              total={revTotal}
+              page={revPage}
+              pageSize={20}
+              onChange={(p) => void loadRevisionsPage(p, diffRevID)}
+            />
           )}
         </AnimatedModal>
       </div>
@@ -2791,7 +3019,7 @@ export function OverviewWorkspace({
             {t("art.unpin_action")}
           </button>
           <ConsoleSelect
-            style={{ width: "148px" }}
+            style={{ width: "148px", maxWidth: "100%", flex: "1 1 132px" }}
             value={batchCatId}
             onSearch={searchRemoteCategories}
             onChange={(val) => {
@@ -2870,12 +3098,19 @@ export function OverviewWorkspace({
   const minTickGap = Math.max(1, Math.floor(xLabelStep * 0.6));
   const topArticles: any[] = overview?.top_articles || [];
   const topReferers: any[] = overview?.top_referers || [];
+  const topCountries: any[] | null = Array.isArray(overview?.top_countries) ? overview.top_countries : null;
   const recentLogs: any[] = overview?.recent_logs || [];
   const noticeBoard: string = overview?.notice_board || "";
   const pendingCommentCount = Number(overview?.counts?.pending_comments ?? 0);
 
   const activeTrend = hoverIdx !== null && rawSeries[hoverIdx] ? rawSeries[hoverIdx] : null;
   const activePvPt = hoverIdx !== null && pvPts[hoverIdx] ? pvPts[hoverIdx] : null;
+  const activeUvPt = hoverIdx !== null && uvPts[hoverIdx] ? uvPts[hoverIdx] : null;
+  const highY = activePvPt ? (activeUvPt ? Math.min(activePvPt.y, activeUvPt.y) : activePvPt.y) : 0;
+  const tRatio = activePvPt ? Math.max(0, Math.min(1, (highY - padT) / Math.max(1, plotH))) : 0;
+  const xPct = activePvPt ? (activePvPt.x / W) * 100 : 0;
+  const yPct = activePvPt ? (highY / H) * 100 : 0;
+  const tipGap = isNarrowChart ? 12 : 16;
 
   const handleTrendTouch = (e: TouchEvent) => {
     const touch = e.touches?.[0];
@@ -3025,11 +3260,19 @@ export function OverviewWorkspace({
 
         <div class="volo-chart-box">
           <div class="volo-chart-legend">
-            <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+            <span
+              class={`volo-chart-legend-item ${focusSeries === "pv" ? "is-active" : focusSeries === "uv" ? "is-dimmed" : ""}`}
+              onMouseEnter={() => setFocusSeries("pv")}
+              onMouseLeave={() => setFocusSeries(null)}
+            >
               <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "var(--volo-accent)" }} />
               {t("ov.legend_pv")}
             </span>
-            <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+            <span
+              class={`volo-chart-legend-item ${focusSeries === "uv" ? "is-active" : focusSeries === "pv" ? "is-dimmed" : ""}`}
+              onMouseEnter={() => setFocusSeries("uv")}
+              onMouseLeave={() => setFocusSeries(null)}
+            >
               <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "var(--volo-chart-uv)" }} />
               {t("ov.legend_uv")}
             </span>
@@ -3038,16 +3281,23 @@ export function OverviewWorkspace({
           <div class="volo-chart-stage" ref={chartStageRef}>
             {activeTrend && activePvPt && (
               <div
-                class="volo-chart-tooltip"
+                class="volo-chart-tooltip volo-chart-tooltip--floating"
                 style={{
-                  left: activePvPt.x > W * 0.5 ? "auto" : `${Math.max(4, (activePvPt.x / W) * 100)}%`,
-                  right: activePvPt.x > W * 0.5 ? `${Math.max(4, ((W - activePvPt.x) / W) * 100)}%` : "auto",
+                  left: `${xPct.toFixed(2)}%`,
+                  top: `${yPct.toFixed(2)}%`,
+                  transform: `translate(${xPct > 50 ? `calc(-100% - ${tipGap}px)` : `${tipGap}px`}, -${Math.round(15 + tRatio * 85)}%)`,
                 }}
               >
-                <div style={{ fontWeight: 650, marginBottom: "2px" }}>{activeTrend.stat_date}</div>
+                <div style={{ fontWeight: 650, marginBottom: "3px" }}>{activeTrend.stat_date}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                  <span>PV: <strong>{Number(activeTrend.pv || 0).toLocaleString()}</strong></span>
-                  <span style={{ color: "var(--volo-chart-uv-on-dark)" }}>UV: <strong>{Number(activeTrend.uv || 0).toLocaleString()}</strong></span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: "5px" }}>
+                    <span class="volo-tooltip-dot" style={{ background: "var(--volo-accent)" }} />
+                    PV: <strong>{Number(activeTrend.pv || 0).toLocaleString()}</strong>
+                  </span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: "5px", color: "var(--volo-chart-uv-on-dark)" }}>
+                    <span class="volo-tooltip-dot" style={{ background: "var(--volo-chart-uv)" }} />
+                    UV: <strong>{Number(activeTrend.uv || 0).toLocaleString()}</strong>
+                  </span>
                 </div>
               </div>
             )}
@@ -3118,21 +3368,63 @@ export function OverviewWorkspace({
                 );
               })}
 
-              {uvArea && <path d={uvArea} fill="url(#voloUvGrad)" />}
-              {pvArea && <path d={pvArea} fill="url(#voloPvGrad)" />}
-              {pvLine && <path d={pvLine} fill="none" stroke="var(--volo-accent)" stroke-width="2.5" stroke-linecap="round" />}
-              {uvLine && <path d={uvLine} fill="none" stroke="var(--volo-chart-uv)" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round" />}
+              {uvArea && (
+                <path
+                  d={uvArea}
+                  fill="url(#voloUvGrad)"
+                  style={{ opacity: focusSeries === "pv" ? 0.25 : 1, transition: "opacity 0.2s ease" }}
+                />
+              )}
+              {pvArea && (
+                <path
+                  d={pvArea}
+                  fill="url(#voloPvGrad)"
+                  style={{ opacity: focusSeries === "uv" ? 0.25 : 1, transition: "opacity 0.2s ease" }}
+                />
+              )}
+              {pvLine && (
+                <path
+                  d={pvLine}
+                  fill="none"
+                  stroke="var(--volo-accent)"
+                  stroke-width={focusSeries === "pv" ? "3.2" : "2.5"}
+                  stroke-linecap="round"
+                  style={{ opacity: focusSeries === "uv" ? 0.28 : 1, transition: "opacity 0.2s ease, stroke-width 0.2s ease" }}
+                />
+              )}
+              {uvLine && (
+                <path
+                  d={uvLine}
+                  fill="none"
+                  stroke="var(--volo-chart-uv)"
+                  stroke-width={focusSeries === "uv" ? "2.8" : "2"}
+                  stroke-dasharray="5 4"
+                  stroke-linecap="round"
+                  style={{ opacity: focusSeries === "pv" ? 0.28 : 1, transition: "opacity 0.2s ease, stroke-width 0.2s ease" }}
+                />
+              )}
 
               {activePvPt && (
-                <line
-                  x1={activePvPt.x}
-                  y1={padT}
-                  x2={activePvPt.x}
-                  y2={padT + plotH}
-                  stroke="var(--volo-accent)"
-                  stroke-dasharray="3 3"
-                  stroke-opacity="0.6"
-                />
+                <g class="volo-trend-cursor" style={{ transform: `translateX(${activePvPt.x.toFixed(1)}px)` }}>
+                  <rect
+                    x={-9}
+                    y={padT}
+                    width={18}
+                    height={plotH}
+                    rx={5}
+                    fill="var(--volo-accent)"
+                    fill-opacity="0.05"
+                  />
+                  <line
+                    x1={0}
+                    y1={padT}
+                    x2={0}
+                    y2={padT + plotH}
+                    stroke="var(--volo-accent)"
+                    stroke-dasharray="3 3"
+                    stroke-opacity="0.65"
+                  />
+                </g>
               )}
 
               {rawSeries.map((d, idx) => {
@@ -3142,21 +3434,45 @@ export function OverviewWorkspace({
                 const isHover = hoverIdx === idx;
                 return (
                   <g key={d.stat_date}>
+                    {isHover && focusSeries !== "pv" && (
+                      <circle
+                        class="volo-chart-halo"
+                        cx={u.x}
+                        cy={u.y}
+                        r={10.5}
+                        fill="var(--volo-chart-uv)"
+                        fill-opacity="0.2"
+                      />
+                    )}
+                    {isHover && focusSeries !== "uv" && (
+                      <circle
+                        class="volo-chart-halo"
+                        cx={p.x}
+                        cy={p.y}
+                        r={12}
+                        fill="var(--volo-accent)"
+                        fill-opacity="0.22"
+                      />
+                    )}
                     <circle
+                      class={`volo-chart-dot ${isHover ? "is-active" : ""}`}
                       cx={u.x}
                       cy={u.y}
-                      r={isHover ? 4.4 : 2.6}
+                      r={isHover ? 4.8 : 2.6}
                       fill="var(--volo-surface)"
                       stroke="var(--volo-chart-uv)"
-                      stroke-width={isHover ? 2.2 : 1.6}
+                      stroke-width={isHover ? 2.4 : 1.6}
+                      style={{ opacity: focusSeries === "pv" ? 0.28 : 1 }}
                     />
                     <circle
+                      class={`volo-chart-dot ${isHover ? "is-active" : ""}`}
                       cx={p.x}
                       cy={p.y}
-                      r={isHover ? 5 : 3.4}
+                      r={isHover ? 5.6 : 3.4}
                       fill="var(--volo-surface)"
                       stroke="var(--volo-accent)"
-                      stroke-width={isHover ? 2.5 : 2}
+                      stroke-width={isHover ? 2.8 : 2}
+                      style={{ opacity: focusSeries === "uv" ? 0.28 : 1 }}
                     />
                     {showLabel && (
                       <text
@@ -3177,8 +3493,8 @@ export function OverviewWorkspace({
           </div>
         </div>
 
-        {/* 2-Column Top 10 Rank Cards */}
-        <div class="volo-grid-2">
+        {/* Top 10 Rank Cards (2 or 3 columns depending on GeoIP top_countries) */}
+        <div class={topCountries !== null ? "volo-grid-3" : "volo-grid-2"}>
           <div class="volo-rank-card">
             <h4 class="volo-card-title" style={{ fontSize: "14px", marginBottom: "10px" }}>{t("ov.top_articles")}</h4>
             {topArticles.length === 0 ? (
@@ -3231,6 +3547,33 @@ export function OverviewWorkspace({
               ))
             )}
           </div>
+
+          {topCountries !== null && (
+            <div class="volo-rank-card">
+              <h4 class="volo-card-title" style={{ fontSize: "14px", marginBottom: "10px" }}>{t("ov.top_countries")}</h4>
+              {topCountries.length === 0 ? (
+                <div class="volo-help" style={{ padding: "12px 0" }}>{t("ov.top_countries_empty")}</div>
+              ) : (
+                topCountries.slice(0, 10).map((it, idx) => {
+                  const code = String(it.country || it.label || it.item_key || "");
+                  const hitsVal = Number(it.hits ?? it.count ?? 0);
+                  return (
+                    <div key={code || idx} class="volo-rank-row">
+                      <div style={{ display: "flex", alignItems: "center", minWidth: 0, gap: "6px" }}>
+                        <span class="volo-rank-idx">{String(idx + 1).padStart(2, "0")}</span>
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--volo-mono)", fontSize: "12.5px" }}>
+                          {code}
+                        </span>
+                      </div>
+                      <span class="volo-badge" title={hitsVal.toLocaleString()}>
+                        {t("ov.hits_unit", { hits: formatCompactNum(hitsVal) })}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -3247,21 +3590,42 @@ export function OverviewWorkspace({
             const monthly12: Array<{ month: string; count: number }> = overview?.monthly_articles || [];
             const monthlyHist: Array<{ month: string; count: number }> = overview?.monthly_history || [];
             const hasHist = monthlyHist.length > 0;
+            const hasOver24 = monthlyHist.length > 24;
+            const monthly24 = hasOver24 ? monthlyHist.slice(-24) : monthlyHist;
             const recent12Sum = monthly12.reduce((acc, x) => acc + Number(x.count || 0), 0);
             const hasOutside12m = monthlyHist.some((h) => !monthly12.some((m) => m.month === h.month));
-            const effectiveMode: "12m" | "history" = !hasHist
+            const effectiveMode: "12m" | "24m" | "history" = !hasHist
               ? "12m"
               : monthlyRangeMode === "auto"
                 ? hasOutside12m || recent12Sum === 0
-                  ? "history"
+                  ? hasOver24
+                    ? "24m"
+                    : "history"
                   : "12m"
-                : monthlyRangeMode;
+                : monthlyRangeMode === "24m" && !hasOver24
+                  ? "history"
+                  : monthlyRangeMode;
+            const chartItems =
+              effectiveMode === "history"
+                ? monthlyHist
+                : effectiveMode === "24m"
+                  ? monthly24
+                  : monthly12;
             return (
               <div class="volo-mini-chart-card">
                 <div class="volo-mini-chart-head">
                   <h4 class="volo-mini-chart-title" style={{ margin: 0 }}>{t("ov.chart_monthly")}</h4>
                   {hasHist && (
                     <div class="volo-chart-toggle">
+                      {hasOver24 && (
+                        <button
+                          type="button"
+                          class={`volo-chart-toggle-btn ${effectiveMode === "24m" ? "is-active" : ""}`}
+                          onClick={() => setMonthlyRangeMode("24m")}
+                        >
+                          {t("ov.monthly_24m")}
+                        </button>
+                      )}
                       <button
                         type="button"
                         class={`volo-chart-toggle-btn ${effectiveMode === "history" ? "is-active" : ""}`}
@@ -3280,8 +3644,8 @@ export function OverviewWorkspace({
                   )}
                 </div>
                 <MonthlyArticlesChart
-                  items={effectiveMode === "history" ? monthlyHist : monthly12}
-                  isHistory={effectiveMode === "history"}
+                  items={chartItems}
+                  isHistory={effectiveMode !== "12m"}
                 />
               </div>
             );
@@ -3298,7 +3662,7 @@ export function OverviewWorkspace({
       </div>
 
       {/* Notice Board & Recent Audit Logs Row */}
-      <div class="volo-grid-2">
+      <div class="volo-grid-2 volo-equal-cards">
         <div class="volo-card">
           <div class="volo-card-head">
             <h3 class="volo-card-title">{t("ov.notice_head")}</h3>

@@ -83,6 +83,14 @@ export function SetupWizard() {
 
   const [siteTitle, setSiteTitle] = useState<string>(() => tFor(initLoc, "setup.default_site_title"));
   const [siteSubtitle, setSiteSubtitle] = useState<string>(() => tFor(initLoc, "setup.default_site_subtitle"));
+  const [publicUrl, setPublicUrl] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    const host = (window.location.hostname || "").toLowerCase();
+    if (!host || host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || host.endsWith(".localhost")) {
+      return "";
+    }
+    return window.location.origin || "";
+  });
   const [siteDesc] = useState<string>("");
   const [timezone, setTimezone] = useState<string>(() => detectedTz || "Asia/Shanghai");
   const [accent, setAccent] = useState<string>(accentSig.value || "forest");
@@ -111,6 +119,17 @@ export function SetupWizard() {
   const [uploadName, setUploadName] = useState<string>("");
   const [dryRun, setDryRun] = useState<boolean>(false);
   const [etlResult, setEtlResult] = useState<any>(null);
+  const [checkingLock, setCheckingLock] = useState<boolean>(true);
+
+  const redirectAfterSetup = (rawTarget?: string) => {
+    const nextUrl = sanitizeAdminPath(rawTarget || bootConfig.admin_path || "/console");
+    try {
+      sessionStorage.setItem("volo_setup_done", nextUrl);
+    } catch {
+      /* ignore */
+    }
+    window.location.replace(nextUrl);
+  };
 
   const tzOptions = useMemo(() => {
     const set = new Set<string>(COMMON_TIMEZONES);
@@ -127,8 +146,40 @@ export function SetupWizard() {
   };
 
   useEffect(() => {
-    apiFetch<any>("/api/setup/status")
-      .then((s) => {
+    let cancelled = false;
+    const verifySetupUnlocked = async () => {
+      let savedTarget = "";
+      try {
+        savedTarget = sessionStorage.getItem("volo_setup_done") || "";
+      } catch {
+        /* ignore */
+      }
+      try {
+        const res = await fetch("/api/setup/status", {
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+        });
+        if (!res.ok) {
+          if (res.status === 404 || res.status === 403 || savedTarget) {
+            window.location.replace(sanitizeAdminPath(savedTarget || bootConfig.admin_path || "/console"));
+            return;
+          }
+          if (!cancelled) setCheckingLock(false);
+          return;
+        }
+        const s = await res.json();
+        if (s?.initialized) {
+          window.location.replace(sanitizeAdminPath(s.admin_path || savedTarget || bootConfig.admin_path || "/console"));
+          return;
+        }
+        try {
+          if (savedTarget) sessionStorage.removeItem("volo_setup_done");
+        } catch {
+          /* ignore */
+        }
+        if (cancelled) return;
         if (s.locales) registerExternalLocales(s.locales);
         if (s.current_driver) setDriver(s.current_driver);
         if (s.default_locale) {
@@ -143,8 +194,30 @@ export function SetupWizard() {
           setAccent(s.accent);
           applyThemeAttributes(themeModeSig.value, s.accent, false);
         }
-      })
-      .catch(() => {});
+        setCheckingLock(false);
+      } catch {
+        if (!cancelled) setCheckingLock(false);
+      }
+    };
+
+    const onPageShow = (ev: PageTransitionEvent) => {
+      if (ev.persisted) {
+        setCheckingLock(true);
+      }
+      void verifySetupUnlocked();
+    };
+    const onPopState = () => {
+      void verifySetupUnlocked();
+    };
+
+    void verifySetupUnlocked();
+    window.addEventListener("pageshow", onPageShow);
+    window.addEventListener("popstate", onPopState);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("pageshow", onPageShow);
+      window.removeEventListener("popstate", onPopState);
+    };
   }, []);
 
   const testDB = async () => {
@@ -189,6 +262,7 @@ export function SetupWizard() {
           site_title: siteTitle,
           site_subtitle: siteSubtitle,
           site_description: siteDesc,
+          public_url: publicUrl.trim(),
           default_locale: localeSig.value,
           timezone,
           accent,
@@ -198,7 +272,7 @@ export function SetupWizard() {
           admin_password: password,
         }),
       });
-      window.location.assign(sanitizeAdminPath(res.admin_path || bootConfig.admin_path));
+      redirectAfterSetup(res.admin_path);
     } catch (err: any) {
       showToast(err.message, "err");
     } finally {
@@ -236,9 +310,8 @@ export function SetupWizard() {
       if (res.user) currentUserSig.value = res.user;
       if (res.csrf_token) csrfTokenSig.value = res.csrf_token;
       showToast(t("setup.legacy_done"), "ok");
-      const nextUrl = sanitizeAdminPath(res.admin_path || bootConfig.admin_path);
       window.setTimeout(() => {
-        window.location.assign(nextUrl);
+        redirectAfterSetup(res.admin_path);
       }, 1100);
     } catch (err: any) {
       showToast(err.message, "err");
@@ -489,6 +562,10 @@ export function SetupWizard() {
     </div>
   );
 
+  if (checkingLock) {
+    return null;
+  }
+
   return (
     <div class="volo-center-stage is-setup">
       <div class="volo-wizard-box">
@@ -567,14 +644,27 @@ export function SetupWizard() {
               </div>
             </div>
 
-            <div class="volo-field">
-              <label>{t("setup.site_subtitle")}</label>
-              <input
-                class="volo-input"
-                name="setup_blog_subtitle"
-                value={siteSubtitle}
-                onInput={(e) => setSiteSubtitle((e.currentTarget as HTMLInputElement).value)}
-              />
+            <div class="volo-grid-2">
+              <div class="volo-field">
+                <label>{t("setup.site_subtitle")}</label>
+                <input
+                  class="volo-input"
+                  name="setup_blog_subtitle"
+                  value={siteSubtitle}
+                  onInput={(e) => setSiteSubtitle((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
+              <div class="volo-field">
+                <label>{t("sys.public_url")}</label>
+                <input
+                  type="url"
+                  class="volo-input volo-mono"
+                  name="setup_public_url"
+                  placeholder={t("sys.public_url_ph")}
+                  value={publicUrl}
+                  onInput={(e) => setPublicUrl((e.currentTarget as HTMLInputElement).value)}
+                />
+              </div>
             </div>
 
             <div class="volo-field">
@@ -919,7 +1009,10 @@ export function SetupWizard() {
               </button>
             )}
             {etlResult && (
-              <pre class="volo-subcard" style={{ marginTop: "14px", fontSize: "12px", overflowX: "auto" }}>
+              <pre
+                class="volo-subcard"
+                style={{ marginTop: "14px", fontSize: "12px", maxHeight: "260px", overflowX: "auto", overflowY: "auto" }}
+              >
                 {JSON.stringify(etlResult, null, 2)}
               </pre>
             )}

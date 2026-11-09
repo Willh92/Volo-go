@@ -18,14 +18,19 @@ services:
       VOLO_SECRET_KEY: "${VOLO_SECRET_KEY:-}"
       VOLO_GEO_ACCESS_ENABLED: "${VOLO_GEO_ACCESS_ENABLED:-true}"
       VOLO_DEFAULT_LOCALE: "${VOLO_DEFAULT_LOCALE:-zh-CN}"
-      VOLO_DB_DRIVER: "${VOLO_DB_DRIVER:-sqlite}"
+      VOLO_DB_DRIVER: "${VOLO_DB_DRIVER:-}"
       VOLO_DB_DSN: "${VOLO_DB_DSN:-}"
       VOLO_DB_SIMPLE_PROTOCOL: "${VOLO_DB_SIMPLE_PROTOCOL:-false}"
     volumes:
-      - ./data:/app/data
-      - ./plugins:/app/plugins
-      - ./themes:/app/themes
-      - ./locales:/app/locales
+      - volo_data:/app/data
+      # Optional host bind-mount mode (instead of named volume `volo_data` above):
+      #   mkdir -p data && chown 65532:65532 data
+      # Do NOT bind-mount empty ./themes or ./plugins directories unless populated,
+      # because empty host directories shadow image-bundled /app/themes & /app/plugins:
+      # - ./data:/app/data
+      # - ./plugins:/app/plugins
+      # - ./themes:/app/themes
+      # - ./locales:/app/locales
     healthcheck:
       test: ["CMD", "/usr/local/bin/volo", "healthcheck"]
       interval: 30s
@@ -70,5 +75,6 @@ services:
       retries: 5
 
 volumes:
+  volo_data:
   volo-pgdata:
   volo-mysqldata:

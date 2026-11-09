@@ -38,12 +38,16 @@ type Identity struct {
 	Source      string `json:"source"` // "cookie" | "header_healed" | "minted"
 }
 
+// GuestPassport aliases Identity for HTTP cookie issuance callers.
+type GuestPassport = Identity
+
 // PassportManager issues, verifies, and self-heals persistent guest passports across
 // HttpOnly Cookie + localStorage/IndexedDB (X-Volo-Guest-Passport header) and manages
 // password-bound article/lock unlock state.
 type PassportManager struct {
-	keyRing      *config.KeyRing
-	secureCookie atomic.Bool
+	keyRing         *config.KeyRing
+	secureCookie    atomic.Bool
+	secureRequestFn atomic.Pointer[func(*http.Request) bool]
 }
 
 func NewPassportManager(keyRing *config.KeyRing, publicURL string) *PassportManager {
@@ -60,6 +64,34 @@ func (pm *PassportManager) SetPublicURL(publicURL string) {
 		return
 	}
 	pm.secureCookie.Store(strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicURL)), "https://"))
+}
+
+// SetSecureRequestFunc wires a trusted-proxy-aware HTTPS request detector for dynamic Cookie Secure flags.
+func (pm *PassportManager) SetSecureRequestFunc(fn func(*http.Request) bool) {
+	if pm == nil {
+		return
+	}
+	if fn == nil {
+		pm.secureRequestFn.Store(nil)
+		return
+	}
+	pm.secureRequestFn.Store(&fn)
+}
+
+func (pm *PassportManager) isSecureForRequest(r *http.Request) bool {
+	if pm == nil {
+		return r != nil && r.TLS != nil
+	}
+	if pm.secureCookie.Load() {
+		return true
+	}
+	if r != nil && r.TLS != nil {
+		return true
+	}
+	if ptr := pm.secureRequestFn.Load(); ptr != nil && *ptr != nil && r != nil {
+		return (*ptr)(r)
+	}
+	return false
 }
 
 // HashGuestID computes the irreversible SHA-256 storage identifier for comments.guest_id_hash.
@@ -118,7 +150,7 @@ func (pm *PassportManager) ResolveOrHeal(w http.ResponseWriter, r *http.Request,
 	if hdr := strings.TrimSpace(r.Header.Get(PassportHeaderName)); hdr != "" {
 		if gid, ts, ok := pm.VerifyPassport(hdr); ok {
 			if w != nil {
-				pm.setPassportCookie(w, hdr)
+				pm.IssueCookieWithSecure(w, GuestPassport{SignedToken: hdr}, pm.isSecureForRequest(r))
 			}
 			return &Identity{
 				GuestID:     gid,
@@ -138,7 +170,7 @@ func (pm *PassportManager) ResolveOrHeal(w http.ResponseWriter, r *http.Request,
 	now := time.Now().UnixMilli()
 	tok := pm.SignPassport(gid, now)
 	if w != nil {
-		pm.setPassportCookie(w, tok)
+		pm.IssueCookieWithSecure(w, GuestPassport{SignedToken: tok}, pm.isSecureForRequest(r))
 	}
 	return &Identity{
 		GuestID:     gid,
@@ -149,14 +181,38 @@ func (pm *PassportManager) ResolveOrHeal(w http.ResponseWriter, r *http.Request,
 	}, true
 }
 
-func (pm *PassportManager) setPassportCookie(w http.ResponseWriter, token string) {
+// IssueCookie writes the HttpOnly GuestPassport cookie using the manager's configured Secure flag.
+func (pm *PassportManager) IssueCookie(w http.ResponseWriter, gp GuestPassport) {
+	secure := false
+	if pm != nil {
+		secure = pm.secureCookie.Load()
+	}
+	pm.IssueCookieWithSecure(w, gp, secure)
+}
+
+// IssueCookieWithSecure writes the HttpOnly GuestPassport cookie with an explicit per-request Secure flag.
+func (pm *PassportManager) IssueCookieWithSecure(w http.ResponseWriter, gp GuestPassport, secure bool) {
+	if w == nil {
+		return
+	}
+	tok := strings.TrimSpace(gp.SignedToken)
+	if tok == "" && pm != nil && gp.GuestID != "" {
+		ts := gp.IssuedAtMS
+		if ts <= 0 {
+			ts = time.Now().UnixMilli()
+		}
+		tok = pm.SignPassport(gp.GuestID, ts)
+	}
+	if tok == "" {
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     PassportCookieName,
-		Value:    token,
+		Value:    tok,
 		Path:     "/",
 		MaxAge:   PassportMaxAgeSec,
 		HttpOnly: true,
-		Secure:   pm.secureCookie.Load(),
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -174,6 +230,31 @@ func (pm *PassportManager) computePassportMAC(payload string) string {
 type unlockBundle struct {
 	GuestID string            `json:"g"`
 	Entries map[string]string `json:"e"` // articleID -> exp_sec.mac
+}
+
+// WriteUnlockCookie writes the HttpOnly persistent unlock cookie using the manager's configured Secure flag.
+func (pm *PassportManager) WriteUnlockCookie(w http.ResponseWriter, rawValue string) {
+	secure := false
+	if pm != nil {
+		secure = pm.secureCookie.Load()
+	}
+	pm.WriteUnlockCookieWithSecure(w, rawValue, secure)
+}
+
+// WriteUnlockCookieWithSecure writes the HttpOnly persistent unlock cookie with an explicit per-request Secure flag.
+func (pm *PassportManager) WriteUnlockCookieWithSecure(w http.ResponseWriter, rawValue string, secure bool) {
+	if w == nil || strings.TrimSpace(rawValue) == "" {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     UnlockCookieName,
+		Value:    strings.TrimSpace(rawValue),
+		Path:     "/",
+		MaxAge:   UnlockMaxAgeSec,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // GrantArticleUnlock binds an unlocked article state to BOTH the visitor's GuestID AND the
@@ -206,15 +287,7 @@ func (pm *PassportManager) GrantArticleUnlock(w http.ResponseWriter, r *http.Req
 	sig := pm.computePassportMAC("unlock-bundle:" + encoded)
 	cookieVal := encoded + "." + sig
 	if w != nil {
-		http.SetCookie(w, &http.Cookie{
-			Name:     UnlockCookieName,
-			Value:    cookieVal,
-			Path:     "/",
-			MaxAge:   UnlockMaxAgeSec,
-			HttpOnly: true,
-			Secure:   pm.secureCookie.Load(),
-			SameSite: http.SameSiteLaxMode,
-		})
+		pm.WriteUnlockCookieWithSecure(w, cookieVal, pm.isSecureForRequest(r))
 	}
 	return cookieVal, nil
 }

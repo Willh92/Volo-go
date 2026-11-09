@@ -11,24 +11,28 @@ For production deployments, place `Volo-go` behind a TLS-terminating reverse pro
 | Mode | `.env` Settings | Best For | Security & Performance Advantages |
 | :--- | :--- | :--- | :--- |
 | **TCP Loopback** | `VOLO_LISTEN_ADDR=127.0.0.1:8080`<br>`VOLO_LISTEN_SOCKET=` | Docker networks, Windows, macOS, control panels (1Panel / Nginx Proxy Manager) | Binds strictly to loopback so external scanners cannot bypass your reverse proxy on port `8080` |
-| **Unix Domain Socket (UDS)** | `VOLO_LISTEN_SOCKET=/run/volo/volo.sock`<br>`VOLO_LISTEN_SOCKET_MODE=0660` | Same-host Linux Nginx / Caddy deployments | Eliminates TCP/IP stack overhead and ephemeral port exhaustion; enforces POSIX group permissions (`0660`) |
+| **Unix Domain Socket (UDS)** | `VOLO_LISTEN_SOCKET=/run/volo/volo.sock`<br>`VOLO_SOCKET_MODE=0660`<br>`VOLO_SOCKET_GROUP=www-data` | Same-host Linux Nginx / Caddy deployments | Eliminates TCP/IP stack overhead and ephemeral port exhaustion; enforces POSIX socket permissions (`0660`) and group ownership (`www-data` / `nginx`) while keeping `/var/lib/volo` isolated under `volo:volo` |
 
 ---
 
 ## 2. Critical Security: `VOLO_TRUSTED_PROXIES` Anti-Spoofing
 
-Naive applications trust the leftmost IP in `X-Forwarded-For`, allowing attackers to spoof `X-Forwarded-For: 1.2.3.4` and trivially bypass login rate limits and IP bans.
+Naive applications trust the leftmost IP in `X-Forwarded-For`, allowing attackers to spoof headers and trivially bypass login rate limits, offline GeoIP rules, and WAF bans.
 
-`Volo-go` (`security.ResolveClientIP`) implements **right-to-left hop stripping**:
-1. Forwarding headers are inspected **only** when the immediate peer IP matches `VOLO_TRUSTED_PROXIES` (or connects over a local Unix Domain Socket);
-2. `X-Forwarded-For` is scanned **from rightmost to leftmost**, stripping hops inside `VOLO_TRUSTED_PROXIES` and selecting the **first untrusted external IP** as the true client IP;
+`Volo-go` (`security.ResolveClientIP`) implements **peer allowlist gating + right-to-left hop stripping**:
+1. Forwarding headers are inspected **only** when the immediate peer matches `VOLO_TRUSTED_PROXIES` (or connects over a local Unix Domain Socket when `unix` is trusted);
+2. `X-Forwarded-For` is scanned **from rightmost to leftmost**, stripping hops inside `VOLO_TRUSTED_PROXIES` and selecting the **first untrusted external IP** as the true client IP (single-hop local Nginx/Caddy setups may also pass `$remote_addr` in `X-Real-IP`);
 3. **Never** set `VOLO_TRUSTED_PROXIES=0.0.0.0/0` on an internet-exposed listener!
 
 ### Standard `VOLO_TRUSTED_PROXIES` Values by Topology
 
-- **Local Nginx / Caddy / Apache directly facing visitors**:
+- **Local Nginx / Caddy / Apache (TCP Loopback)**:
   ```dotenv
   VOLO_TRUSTED_PROXIES=127.0.0.1/32,::1/128
+  ```
+- **Local Nginx / Caddy (Unix Domain Socket Mode)**:
+  ```dotenv
+  VOLO_TRUSTED_PROXIES=127.0.0.1/32,::1/128,unix
   ```
 - **Docker Compose reverse proxy container (Traefik / Caddy / NPM)**:
   ```dotenv
@@ -49,8 +53,8 @@ Naive applications trust the leftmost IP in `X-Forwarded-For`, allowing attacker
 Template: [`deploy/reverse-proxy/nginx-tcp.conf`](../../deploy/reverse-proxy/nginx-tcp.conf)
 
 Key settings:
-1. `client_max_body_size 128m;` to permit high-res photos, podcast episodes (MP3/M4A), and backup `.zip` uploads;
-2. `proxy_buffering off;` + `Range` / `If-Range` pass-through on `/uploads/` so `http.ServeContent` delivers instant zero-copy `206 Partial Content` audio scrubbing without buffering large media files onto Nginx's disk;
+1. `client_max_body_size 128m;` to permit high-res photos, `<video>` clips, podcast episodes (MP3/M4A), and backup `.zip` uploads;
+2. `proxy_buffering off;` + `Range` / `If-Range` pass-through on `/uploads/` so `http.ServeContent` delivers instant zero-copy `206 Partial Content` audio/video scrubbing without buffering large media files onto Nginx's disk;
 3. Standard `Host`, `X-Real-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto` headers.
 
 ```nginx
@@ -94,19 +98,27 @@ server {
 }
 ```
 
-### 3.2 Nginx (Unix Domain Socket Mode)
+### 3.2 Nginx (Zero-TCP Unix Domain Socket Mode)
 
 Template: [`deploy/reverse-proxy/nginx-unix-socket.conf`](../../deploy/reverse-proxy/nginx-unix-socket.conf)
 
-1. Install the service sharing Nginx's group (`www-data` on Debian/Ubuntu, `nginx` on RHEL/Rocky):
+1. Install the service granting socket group access to Nginx (`www-data` on Debian/Ubuntu, `nginx` on RHEL/Rocky) via `--socket-mode` and `--socket-group` while keeping `/var/lib/volo` and `/etc/volo/volo.env` isolated under `volo:volo`:
    ```bash
    sudo ./scripts/install-service.sh install \
-     --group www-data \
      --unix-socket /run/volo/volo.sock \
      --socket-mode 0660 \
+     --socket-group www-data \
      --public-url https://blog.example.com
    ```
-2. Point Nginx's upstream to `server unix:/run/volo/volo.sock;`. If you encounter `502 Bad Gateway (Permission denied)`, check `id www-data` and `ls -l /run/volo/volo.sock`.
+   Matching `/etc/volo/volo.env` settings:
+   ```dotenv
+   VOLO_LISTEN_SOCKET=/run/volo/volo.sock
+   VOLO_SOCKET_MODE=0660
+   VOLO_SOCKET_GROUP=www-data
+   VOLO_PUBLIC_URL=https://blog.example.com
+   VOLO_TRUSTED_PROXIES=127.0.0.1/32,::1/128,unix
+   ```
+2. Point Nginx's upstream to `server unix:/run/volo/volo.sock;`. If you encounter `502 Bad Gateway (Permission denied)`, check `id www-data` and `ls -l /run/volo/volo.sock` (plus SELinux context on RHEL-based distros).
 
 ### 3.3 Caddy v2 (Automatic HTTPS + HTTP/3)
 
@@ -139,7 +151,7 @@ blog.example.com {
 ### 3.5 Web Control Panels (1Panel / Nginx Proxy Manager / Plesk)
 
 When creating a reverse proxy site pointing to `http://127.0.0.1:8080`:
-1. **Disable forced full-page HTML caching** in the panel: `Volo-go` already serves microsecond in-memory caches and emits `Cache-Control: private, no-store` on password-protected posts. Overriding upstream `Cache-Control` headers can leak or break unlock states;
+1. **Disable forced full-page HTML caching** in the panel: `Volo-go` already serves microsecond in-memory caches and emits `Cache-Control: private, no-store` on password-protected posts. Overriding upstream `Cache-Control` headers can break unlock states or hot-reloaded stealth admin paths (`security.admin_path`);
 2. Increase max upload body size (`client_max_body_size`) to `128m`;
 3. Ensure `VOLO_PUBLIC_URL=https://your-domain` matches the exact browser origin.
 
@@ -152,9 +164,9 @@ When creating a reverse proxy site pointing to `http://127.0.0.1:8080`:
    - Bind `Volo-go` to `127.0.0.1:8080` and point local `cloudflared` to `http://127.0.0.1:8080`;
    - Set `VOLO_PUBLIC_URL=https://blog.example.com` and `VOLO_TRUSTED_PROXIES=127.0.0.1/32,::1/128`.
 3. **Recommended CDN Cache Rules**:
-   - **Cache Eligible**: `/uploads/*`, `/themes/*`, `/avatars/*` (respect origin `Cache-Control` and `ETag`);
-   - **Revalidate via Origin `ETag`**: `/rss.xml`, `/atom.xml`, `/podcast.xml`, `/sitemap.xml`;
-   - **Bypass Cache**: `/api/*`, `/setup*`, your custom `VOLO_ADMIN_PATH` prefix, and any `?preview=` query URLs.
+   - **Cache Eligible**: `/uploads/*`, `/themes/*`, `/plugins/*`, `/avatars/*` (respect origin `Cache-Control` and `ETag`);
+   - **Revalidate via Origin `ETag`**: `/rss.xml`, `/atom.xml`, `/podcast.xml`, `/sitemap.xml`, and sharded `/sitemap-*.xml` (`max-age=60` + strong `ETag`);
+   - **Bypass Cache**: `/api/*`, `/setup*`, your `VOLO_ADMIN_PATH` / dynamic stealth admin prefix, and any `?preview=` query URLs (`Volo-go` automatically sends `Cache-Control: private, no-store` on protected/unlocked responses).
 
 ---
 
@@ -163,7 +175,7 @@ When creating a reverse proxy site pointing to `http://127.0.0.1:8080`:
 Run these four checks to verify your reverse proxy pipeline end-to-end:
 
 ```bash
-# 1. Verify /healthz liveness and read-only DB probe
+# 1. Verify /healthz liveness and DB readiness (returns {"status":"ok","database":"ok","uptime_sec":...})
 curl -fsS https://blog.example.com/healthz
 
 # 2. Verify BREACH-safe Gzip compression and Vary negotiation on public HTML
@@ -173,6 +185,6 @@ curl -sI -H "Accept-Encoding: gzip" https://blog.example.com/ | grep -iE "conten
 ETAG=$(curl -sI https://blog.example.com/rss.xml | awk -F': ' 'tolower($1)=="etag"{print $2}' | tr -d '\r')
 curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: ${ETAG}" https://blog.example.com/rss.xml
 
-# 4. Run built-in environment & security diagnostics
+# 4. Run built-in environment, multi-DB GeoIP, and security diagnostics
 volo doctor --env-file /etc/volo/volo.env
 ```

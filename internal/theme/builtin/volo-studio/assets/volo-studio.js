@@ -28,6 +28,29 @@
     return mins >= 390 && mins < 1140 ? "light" : "dark";
   }
 
+  function updateGitHubStatsTheme(scope, theme) {
+    var eff = theme || document.documentElement.getAttribute("data-theme") || "light";
+    (scope || document).querySelectorAll('img[src*="/github-stats/"]').forEach(function (img) {
+      var raw = img.getAttribute("src") || "";
+      if (!raw || raw.indexOf(".svg") === -1) return;
+      try {
+        var u = new URL(raw, window.location.origin);
+        if (u.searchParams.get("theme") !== eff) {
+          u.searchParams.set("theme", eff);
+          img.setAttribute("src", raw.charAt(0) === "/" ? (u.pathname + u.search + u.hash) : u.href);
+        }
+      } catch (_) {}
+    });
+  }
+
+  function getCSRFToken() {
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta && meta.getAttribute("content")) return meta.getAttribute("content");
+    var cm = document.getElementById("volo-comments");
+    if (cm && cm.getAttribute("data-csrf-token")) return cm.getAttribute("data-csrf-token");
+    return "";
+  }
+
   /* Strictly honor server-rendered data-accent; only switch 4-mode light/dark appearance */
   function applyTheme(mode) {
     var root = document.documentElement;
@@ -64,6 +87,7 @@
       el.setAttribute("aria-checked", selected ? "true" : "false");
     });
 
+    updateGitHubStatsTheme(document, nextTheme);
     if (prevTheme && prevTheme !== nextTheme) {
       reRenderMermaidForTheme();
     }
@@ -1002,8 +1026,78 @@
     try { localStorage.setItem(BOOK_PROGRESS_KEY, JSON.stringify(map)); } catch (_) {}
   }
 
+  var pendingFilterFocus = null;
+  var filterNavTimer = null;
+
+  function scheduleServerFilterNav(selector, rawVal, preserveKeys) {
+    clearTimeout(filterNavTimer);
+    filterNavTimer = setTimeout(function () {
+      try {
+        var u = new URL(window.location.href);
+        var trimmed = String(rawVal || "").trim();
+        var curQ = (u.searchParams.get("q") || "").trim();
+        if (trimmed === curQ) return;
+        var nextParams = new URLSearchParams();
+        (preserveKeys || []).forEach(function (k) {
+          var v = u.searchParams.get(k);
+          if (v) nextParams.set(k, v);
+        });
+        if (trimmed) nextParams.set("q", trimmed);
+        var qs = nextParams.toString();
+        var nextURL = u.pathname + (qs ? "?" + qs : "");
+        var activeEl = document.querySelector(selector);
+        pendingFilterFocus = {
+          sel: selector,
+          val: rawVal,
+          pos: activeEl && typeof activeEl.selectionStart === "number" ? activeEl.selectionStart : String(rawVal || "").length
+        };
+        navigatePJAX(nextURL, false);
+      } catch (_) {}
+    }, 300);
+  }
+
+  function restorePendingFilterFocus(root) {
+    if (!pendingFilterFocus) return;
+    var info = pendingFilterFocus;
+    pendingFilterFocus = null;
+    var input = (root || document).querySelector(info.sel);
+    if (!input) return;
+    if (typeof info.val === "string" && input.value !== info.val) {
+      input.value = info.val;
+    }
+    try {
+      input.focus({ preventScroll: true });
+      if (typeof input.setSelectionRange === "function") {
+        input.setSelectionRange(info.pos, info.pos);
+      }
+    } catch (_) {}
+  }
+
+  function initSeriesBoxScroll(scope) {
+    (scope || document).querySelectorAll(".volo-series-box").forEach(function (box) {
+      var scrollCur = function () {
+        var cur = box.querySelector(".volo-series-box__list .is-current");
+        if (!cur) return;
+        var list = box.querySelector(".volo-series-box__list");
+        if (list && list.scrollHeight > list.clientHeight) {
+          centerActiveLinkInContainer(list, cur);
+        } else if (typeof cur.scrollIntoView === "function") {
+          cur.scrollIntoView({ block: "nearest" });
+        }
+      };
+      if (box.open) requestAnimationFrame(scrollCur);
+      if (box.dataset.boundSeriesScroll !== "1") {
+        box.dataset.boundSeriesScroll = "1";
+        box.addEventListener("toggle", function () {
+          if (box.open) scrollCur();
+        });
+      }
+    });
+  }
+
   function initTaxonomyAndBookFilters(scope) {
     var root = scope || document;
+    var mainWrap = document.getElementById("studio-main") || root;
     var tagIn = root.querySelector(".js-tag-filter-input");
     var tagList = root.querySelector(".js-tag-filter-list, .js-tag-filter-grid");
     var tagEmpty = root.querySelector(".js-tag-filter-empty");
@@ -1014,7 +1108,8 @@
       var serverTagQ = tagClear ? (tagClear.getAttribute("data-server-query") || "") : "";
       var pageCnt = tagCount ? (parseInt(tagCount.getAttribute("data-page-count") || "0", 10) || 0) : 0;
       var totalCnt = tagCount ? (parseInt(tagCount.getAttribute("data-total-count") || "0", 10) || pageCnt) : 0;
-      var syncTagFilter = function () {
+      var hasTagPager = !!(serverTagQ || totalCnt > pageCnt || mainWrap.querySelector(".pagination"));
+      var syncTagFilter = function (fromInput) {
         var q = String(tagIn.value || "").trim().toLowerCase();
         var shown = 0;
         if (tagList) {
@@ -1036,19 +1131,24 @@
             tagCount.textContent = String(pageCnt);
           }
         }
+        if (fromInput && hasTagPager && !tagIn._composing) {
+          scheduleServerFilterNav(".js-tag-filter-input", tagIn.value, ["sort", "skin", "theme_preview"]);
+        }
       };
-      tagIn.addEventListener("input", syncTagFilter);
+      tagIn.addEventListener("compositionstart", function () { tagIn._composing = true; });
+      tagIn.addEventListener("compositionend", function () { tagIn._composing = false; syncTagFilter(true); });
+      tagIn.addEventListener("input", function () { syncTagFilter(true); });
       if (tagClear) {
         tagClear.addEventListener("click", function (ev) {
           if (!serverTagQ) {
             ev.preventDefault();
             tagIn.value = "";
-            syncTagFilter();
+            syncTagFilter(false);
             tagIn.focus();
           }
         });
       }
-      if (tagIn.value && tagIn.value !== serverTagQ) syncTagFilter();
+      if (tagIn.value && tagIn.value !== serverTagQ) syncTagFilter(false);
     }
 
     root.querySelectorAll("[data-collection-root]").forEach(function (colRoot) {
@@ -1087,28 +1187,37 @@
     var bookIn = root.querySelector(".js-book-filter-input");
     var bookGrid = root.querySelector(".js-book-filter-grid");
     var bookEmpty = root.querySelector(".js-book-filter-empty");
-    if (bookIn && bookGrid && bookIn.dataset.boundFilter !== "1") {
+    if (bookIn && bookIn.dataset.boundFilter !== "1") {
       bookIn.dataset.boundFilter = "1";
-      if (!bookIn.value) {
-        try {
-          var urlQ = new URLSearchParams(window.location.search).get("q") || "";
-          if (urlQ) bookIn.value = urlQ;
-        } catch (_) {}
-      }
-      var syncBookFilter = function () {
+      var urlBookQ = "";
+      try {
+        urlBookQ = new URLSearchParams(window.location.search).get("q") || "";
+        if (!bookIn.value && urlBookQ) bookIn.value = urlBookQ;
+      } catch (_) {}
+      var hasBookPager = !!(urlBookQ || mainWrap.querySelector(".pagination"));
+      var syncBookFilter = function (fromInput) {
         var q = String(bookIn.value || "").trim().toLowerCase();
         var shown = 0;
-        bookGrid.querySelectorAll("[data-book-filter]").forEach(function (item) {
-          var hay = (item.getAttribute("data-book-filter") || item.textContent || "").toLowerCase();
-          var match = !q || hay.indexOf(q) !== -1;
-          item.hidden = !match;
-          if (match) shown++;
-        });
-        if (bookEmpty) bookEmpty.hidden = !q || shown > 0;
+        if (bookGrid) {
+          bookGrid.querySelectorAll("[data-book-filter]").forEach(function (item) {
+            var hay = (item.getAttribute("data-book-filter") || item.textContent || "").toLowerCase();
+            var match = !q || hay.indexOf(q) !== -1;
+            item.hidden = !match;
+            if (match) shown++;
+          });
+        }
+        if (bookEmpty && bookGrid) bookEmpty.hidden = !q || shown > 0;
+        if (fromInput && hasBookPager && !bookIn._composing) {
+          scheduleServerFilterNav(".js-book-filter-input", bookIn.value, ["skin", "theme_preview"]);
+        }
       };
-      bookIn.addEventListener("input", syncBookFilter);
-      if (bookIn.value) syncBookFilter();
+      bookIn.addEventListener("compositionstart", function () { bookIn._composing = true; });
+      bookIn.addEventListener("compositionend", function () { bookIn._composing = false; syncBookFilter(true); });
+      bookIn.addEventListener("input", function () { syncBookFilter(true); });
+      if (bookIn.value && bookIn.value !== urlBookQ) syncBookFilter(false);
     }
+
+    restorePendingFilterFocus(root);
   }
 
   function centerActiveLinkInContainer(navEl, linkEl) {
@@ -1567,9 +1676,13 @@
         var tType = btn.getAttribute("data-target-type");
         var tID = btn.getAttribute("data-target-id");
         var kind = btn.getAttribute("data-kind");
+        var headers = { "Content-Type": "application/json", "X-Volo-Env-FP": collectEnvFP() };
+        var csrf = getCSRFToken();
+        if (csrf) headers["X-CSRF-Token"] = csrf;
         fetch("/api/v1/reactions", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-Volo-Env-FP": collectEnvFP() },
+          credentials: "same-origin",
+          headers: headers,
           body: JSON.stringify({ target_type: tType, target_id: tID, kind: kind })
         }).then(function (r) { return r.json(); }).then(function (d) {
           if (d && d.counts) {
@@ -1597,7 +1710,8 @@
       reqErr: "请求失败，请稍后重试",
       netErr: "网络错误，请检查连接后重试",
       codeSent: "验证码已发送",
-      noResults: "未找到相关内容"
+      noResults: "未找到相关内容",
+      loadMore: "加载更多"
     },
     "zh-TW": {
       loginErr: "登入失敗，請檢查帳號或密碼",
@@ -1606,7 +1720,18 @@
       reqErr: "請求失敗，請稍後重試",
       netErr: "網路錯誤，請檢查連線後重試",
       codeSent: "驗證碼已發送",
-      noResults: "找不到相關內容"
+      noResults: "找不到相關內容",
+      loadMore: "載入更多"
+    },
+    ja: {
+      loginErr: "ログインに失敗しました。認証情報をご確認ください",
+      regErr: "登録に失敗しました。入力内容をご確認ください",
+      unlockErr: "パスワードが正しくありません",
+      reqErr: "リクエストに失敗しました。しばらくしてから再試行してください",
+      netErr: "ネットワークエラーが発生しました",
+      codeSent: "確認コードを送信しました",
+      noResults: "該当する記事が見つかりません",
+      loadMore: "もっと見る"
     },
     en: {
       loginErr: "Invalid credentials or sign-in failed",
@@ -1615,7 +1740,8 @@
       reqErr: "Request failed",
       netErr: "Network error, please try again",
       codeSent: "Verification code sent",
-      noResults: "No results"
+      noResults: "No results",
+      loadMore: "Load more"
     }
   };
 
@@ -1626,6 +1752,8 @@
       dict = (raw.indexOf("tw") !== -1 || raw.indexOf("hk") !== -1 || raw.indexOf("mo") !== -1 || raw.indexOf("hant") !== -1)
         ? I18N_FALLBACKS["zh-TW"]
         : I18N_FALLBACKS["zh-CN"];
+    } else if (raw.indexOf("ja") === 0) {
+      dict = I18N_FALLBACKS.ja;
     }
     return (dict && dict[key]) || I18N_FALLBACKS.en[key] || "";
   }
@@ -1747,7 +1875,7 @@
     }
   }
 
-  /* Instant Search Modal (Ctrl+K, /, ArrowUp/Down/Enter, <mark>, Filter Pills) & Lightbox */
+  /* Instant Search Modal (Ctrl+K, /, ArrowUp/Down/Enter, <mark>, Filter Pills, Load More) & Lightbox */
   function initSearchAndLightbox() {
     var modal = document.getElementById("volo-search-modal");
     var input = document.getElementById("volo-search-input");
@@ -1757,6 +1885,11 @@
     var lightboxImg = document.getElementById("volo-lightbox-img");
     var lightboxCap = document.getElementById("volo-lightbox-caption");
     var activeIdx = -1;
+    var curQuery = "";
+    var curPage = 1;
+    var seenUrls = {};
+    var searchSeq = 0;
+    var searchLoading = false;
 
     if (filterBar && filterBar.querySelector(".volo-filter-pill")) {
       filterBar.hidden = false;
@@ -1809,30 +1942,86 @@
       });
     }
 
-    function runQuery(q) {
+    function renderHitMarkup(h, q, isActive) {
+      return '<a class="volo-search-hit' + (isActive ? " is-active" : "") + '" role="option" href="' + encodeURI(h.url) + '">' +
+        "<strong>" + highlightTerms(h.title || "", q) + "</strong>" +
+        (h.snippet ? '<div class="volo-search-hit__snip">' + highlightTerms(h.snippet, q) + "</div>" : "") +
+        "</a>";
+    }
+
+    function runQuery(q, append) {
       if (!modal || !list) return;
-      activeIdx = -1;
+      var mySeq = ++searchSeq;
       if (!q) {
+        curQuery = "";
+        curPage = 1;
+        seenUrls = {};
+        activeIdx = -1;
+        searchLoading = false;
         list.innerHTML = "";
         return;
       }
-      fetch("/api/v1/search?q=" + encodeURIComponent(q))
+      var nextPage = append ? (curPage + 1) : 1;
+      var curOffset = append ? list.querySelectorAll(".volo-search-hit").length : 0;
+      if (!append) {
+        curQuery = q;
+        curPage = 1;
+        seenUrls = {};
+        activeIdx = -1;
+      }
+      searchLoading = true;
+      var moreBtn = append ? list.querySelector(".js-search-load-more") : null;
+      if (moreBtn) moreBtn.disabled = true;
+
+      var url = "/api/v1/search?q=" + encodeURIComponent(q) + (append ? ("&page=" + nextPage + "&offset=" + curOffset) : "");
+      fetch(url)
         .then(function (r) { return r.json(); })
         .then(function (d) {
-          var hits = (d && d.hits) || [];
-          if (!hits.length) {
+          if (mySeq !== searchSeq) return;
+          searchLoading = false;
+          var rawHits = (d && d.hits) || [];
+          var hits = [];
+          rawHits.forEach(function (h) {
+            var uKey = (h && h.url) || "";
+            if (!uKey || !seenUrls[uKey]) {
+              if (uKey) seenUrls[uKey] = true;
+              hits.push(h);
+            }
+          });
+          var prevMore = list.querySelector(".volo-search-more-wrap");
+          if (prevMore) prevMore.remove();
+
+          if (!append && !hits.length) {
             list.innerHTML = '<div class="volo-search-empty">' + escapeHTML(modal.getAttribute("data-empty") || i18nFallback("noResults")) + "</div>";
             return;
           }
-          list.innerHTML = hits.map(function (h, i) {
-            return '<a class="volo-search-hit' + (i === 0 ? " is-active" : "") + '" role="option" href="' + encodeURI(h.url) + '">' +
-              "<strong>" + highlightTerms(h.title || "", q) + "</strong>" +
-              (h.snippet ? '<div class="volo-search-hit__snip">' + highlightTerms(h.snippet, q) + "</div>" : "") +
-              "</a>";
-          }).join("");
-          activeIdx = 0;
+          if (append) {
+            curPage = nextPage;
+            if (hits.length) {
+              list.insertAdjacentHTML("beforeend", hits.map(function (h) {
+                return renderHitMarkup(h, q, false);
+              }).join(""));
+            }
+          } else {
+            list.innerHTML = hits.map(function (h, i) {
+              return renderHitMarkup(h, q, i === 0);
+            }).join("");
+            activeIdx = 0;
+          }
+          if (d && d.has_more && hits.length > 0) {
+            var loadMoreLabel = modal.getAttribute("data-load-more") || i18nFallback("loadMore");
+            list.insertAdjacentHTML(
+              "beforeend",
+              '<div class="volo-search-more-wrap"><button type="button" class="volo-search-more js-search-load-more">' +
+                escapeHTML(loadMoreLabel) +
+              "</button></div>"
+            );
+          }
         })
-        .catch(function () {});
+        .catch(function () {
+          if (mySeq === searchSeq) searchLoading = false;
+          if (moreBtn) moreBtn.disabled = false;
+        });
     }
 
     document.addEventListener("click", function (ev) {
@@ -1842,6 +2031,12 @@
       }
       if (ev.target.closest("[data-search-close]") || (modal && ev.target === modal)) {
         closeSearch();
+        return;
+      }
+      var moreHitBtn = ev.target.closest(".js-search-load-more");
+      if (moreHitBtn && modal && !modal.hidden) {
+        ev.preventDefault();
+        if (curQuery && !searchLoading) runQuery(curQuery, true);
         return;
       }
       var pill = ev.target.closest(".volo-filter-pill");
@@ -1973,8 +2168,8 @@
         clearTimeout(timer);
         document.querySelectorAll(".volo-filter-pill.is-active").forEach(function (p) { p.classList.remove("is-active"); });
         var q = input.value.trim();
-        if (!q) { list.innerHTML = ""; activeIdx = -1; return; }
-        timer = setTimeout(function () { runQuery(q); }, 150);
+        if (!q) { runQuery(""); return; }
+        timer = setTimeout(function () { runQuery(q, false); }, 150);
       });
     }
   }
@@ -2010,6 +2205,58 @@
     }
   }
 
+  function hoistStylesheets(container, removeFromBody) {
+    if (!container || !container.querySelectorAll || !document.head) return;
+    Array.prototype.slice.call(container.querySelectorAll('link[rel="stylesheet"][href]')).forEach(function (lnk) {
+      var h = lnk.getAttribute("href") || "";
+      if (!h) return;
+      var exists = Array.prototype.some.call(document.head.querySelectorAll('link[rel="stylesheet"]'), function (cur) {
+        return cur.getAttribute("href") === h;
+      });
+      if (!exists) {
+        var clone = document.createElement("link");
+        clone.rel = "stylesheet";
+        clone.href = h;
+        var media = lnk.getAttribute("media");
+        if (media) clone.media = media;
+        var integrity = lnk.getAttribute("integrity");
+        if (integrity) clone.setAttribute("integrity", integrity);
+        var crossOrigin = lnk.getAttribute("crossorigin");
+        if (crossOrigin !== null) clone.setAttribute("crossorigin", crossOrigin);
+        document.head.appendChild(clone);
+      }
+      if (removeFromBody && lnk.parentNode) {
+        lnk.remove();
+      }
+    });
+  }
+
+  function activateContainerScripts(container, skipProseAndComments) {
+    if (!container || !container.querySelectorAll) return;
+    Array.prototype.slice.call(container.querySelectorAll("script")).forEach(function (oldScript) {
+      if (!oldScript.parentNode) return;
+      var sType = (oldScript.getAttribute("type") || "").trim().toLowerCase();
+      if (sType && sType !== "text/javascript" && sType !== "application/javascript" && sType !== "module") {
+        return;
+      }
+      if (skipProseAndComments && oldScript.closest(".volo-prose, #volo-comments") && !oldScript.closest(".volo-plugin-slot")) {
+        return;
+      }
+      var src = oldScript.getAttribute("src") || "";
+      if (src.indexOf("/assets/volo-studio.js") !== -1 || src.indexOf("/assets/comment-widget.js") !== -1) {
+        return;
+      }
+      var fresh = document.createElement("script");
+      Array.prototype.forEach.call(oldScript.attributes, function (attr) {
+        fresh.setAttribute(attr.name, attr.value);
+      });
+      if (!src) {
+        fresh.textContent = oldScript.textContent || "";
+      }
+      oldScript.parentNode.replaceChild(fresh, oldScript);
+    });
+  }
+
   function syncDocumentHead(doc) {
     if (!doc || !doc.head || !document.head) return;
     document.title = doc.title || document.title;
@@ -2038,19 +2285,7 @@
       var h = curLink.getAttribute("href") || "";
       if (nextHrefs.indexOf(h) === -1) curLink.remove();
     });
-    nextThemeLinks.forEach(function (nextLink) {
-      var h = nextLink.getAttribute("href") || "";
-      if (!h) return;
-      var exists = Array.prototype.some.call(document.head.querySelectorAll('link[rel="stylesheet"]'), function (l) {
-        return l.getAttribute("href") === h;
-      });
-      if (!exists) {
-        var cloneLink = document.createElement("link");
-        cloneLink.rel = "stylesheet";
-        cloneLink.href = h;
-        document.head.appendChild(cloneLink);
-      }
-    });
+    hoistStylesheets(doc.head, false);
 
     var nextCanon = doc.head.querySelector('link[rel="canonical"]');
     var curCanon = document.head.querySelector('link[rel="canonical"]');
@@ -2065,7 +2300,7 @@
       curCanon.remove();
     }
 
-    ["description", "robots"].forEach(function (name) {
+    ["description", "robots", "csrf-token"].forEach(function (name) {
       var nextMeta = doc.head.querySelector('meta[name="' + name + '"]');
       var curMeta = document.head.querySelector('meta[name="' + name + '"]');
       if (nextMeta) {
@@ -2100,8 +2335,13 @@
     var nextHW = doc.querySelector(".studio-header-widgets");
     if (nextHW && curHW) {
       curHW.innerHTML = nextHW.innerHTML;
+      hoistStylesheets(curHW, true);
+      activateContainerScripts(curHW, false);
     } else if (nextHW && !curHW && mainEl && mainEl.parentNode) {
-      mainEl.parentNode.insertBefore(nextHW.cloneNode(true), mainEl);
+      var insertedHW = nextHW.cloneNode(true);
+      mainEl.parentNode.insertBefore(insertedHW, mainEl);
+      hoistStylesheets(insertedHW, true);
+      activateContainerScripts(insertedHW, false);
     } else if (!nextHW && curHW) {
       curHW.remove();
     }
@@ -2123,7 +2363,10 @@
         if (innerKey && curDock.querySelector('[data-volo-persist="' + innerKey + '"]')) return;
       }
       if (ch.id && document.getElementById(ch.id)) return;
-      curDock.appendChild(ch.cloneNode(true));
+      var clonedDock = ch.cloneNode(true);
+      curDock.appendChild(clonedDock);
+      hoistStylesheets(clonedDock, true);
+      activateContainerScripts(clonedDock, false);
     });
     syncPodcastOpenState();
   }
@@ -2191,9 +2434,13 @@
         var nextFooter = doc.querySelector(".studio-footer");
         if (curFooter && nextFooter && curFooter.innerHTML !== nextFooter.innerHTML) {
           curFooter.innerHTML = nextFooter.innerHTML;
+          hoistStylesheets(curFooter, true);
+          activateContainerScripts(curFooter, false);
         }
 
         main.innerHTML = nextMain.innerHTML;
+        hoistStylesheets(main, true);
+        activateContainerScripts(main, true);
         main.classList.remove("is-transitioning");
         if (!prefersReducedMotion()) {
           void main.offsetWidth;
@@ -2259,11 +2506,13 @@
   function hydratePage(scope) {
     checkBrokenImages(scope);
     enhanceProse(scope);
+    updateGitHubStatsTheme(scope);
     initCodeCopy(scope);
     initEnhancements(scope);
     initShareBar(scope);
     inspectGitHubDescriptions(scope);
     initArticleTOC(scope);
+    initSeriesBoxScroll(scope);
     initPodcastAndUnlock(scope);
     syncPodcastOpenState();
     syncReadingProgress();
@@ -2274,7 +2523,32 @@
 
   document.addEventListener("submit", function (ev) {
     var form = ev.target;
-    if (!form || !form.matches || !form.matches("form.studio-tax-search")) return;
+    if (!form || !form.matches) return;
+    if (form.matches("form.js-reader-logout-form, form[action='/api/v1/reader/logout']")) {
+      ev.preventDefault();
+      var csrfField = form.querySelector("input[name='csrf_token']");
+      var csrfVal = getCSRFToken() || (csrfField && csrfField.value) || "";
+      var logoutHeaders = { "Accept": "application/json" };
+      if (csrfVal) logoutHeaders["X-CSRF-Token"] = csrfVal;
+      fetch("/api/v1/reader/logout", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: logoutHeaders
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d }; });
+      }).then(function (res) {
+        var nextRedir = sanitizeNextPath((res.d && (res.d.redirect || res.d.next)) || "");
+        if (nextRedir) {
+          window.location.href = window.location.origin + "/" + nextRedir.replace(/^[\/\\]+/, "");
+        } else {
+          window.location.reload();
+        }
+      }).catch(function () {
+        window.location.reload();
+      });
+      return;
+    }
+    if (!form.matches("form.studio-tax-search")) return;
     if ((form.getAttribute("method") || "get").toLowerCase() !== "get") return;
     if (document.documentElement.getAttribute("data-pjax") === "false") return;
     ev.preventDefault();
@@ -2354,6 +2628,28 @@
       return;
     }
 
+    var claimGuestBtn = ev.target.closest("[data-claim-guest-comments]");
+    if (claimGuestBtn && !claimGuestBtn.closest("#volo-comments")) {
+      ev.preventDefault();
+      if (claimGuestBtn.disabled) return;
+      claimGuestBtn.disabled = true;
+      var claimHeaders = { "Content-Type": "application/json", "X-Volo-Env-FP": collectEnvFP() };
+      var claimCSRF = getCSRFToken();
+      if (claimCSRF) claimHeaders["X-CSRF-Token"] = claimCSRF;
+      fetch("/api/v1/reader/claim-guest-comments", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: claimHeaders,
+        body: "{}"
+      }).then(function (r) {
+        if (r.ok) window.location.reload();
+        else claimGuestBtn.disabled = false;
+      }).catch(function () {
+        claimGuestBtn.disabled = false;
+      });
+      return;
+    }
+
     var tagsToggle = ev.target.closest(".js-foot-tags-toggle");
     if (tagsToggle) {
       var tagBox = tagsToggle.closest(".article-foot-tags, .studio-article__foot-tags");
@@ -2366,6 +2662,22 @@
         tagsToggle.textContent = willExpand
           ? (tagsToggle.getAttribute("data-less-label") || "−")
           : (tagsToggle.getAttribute("data-more-label") || "+");
+      }
+      return;
+    }
+
+    var pillsToggle = ev.target.closest(".js-jump-pills-toggle");
+    if (pillsToggle) {
+      var pillBox = pillsToggle.closest(".studio-jump-pills");
+      if (pillBox) {
+        var expandPills = pillsToggle.getAttribute("aria-expanded") !== "true";
+        pillBox.querySelectorAll("[data-extra-pill]").forEach(function (el) {
+          el.hidden = !expandPills;
+        });
+        pillsToggle.setAttribute("aria-expanded", expandPills ? "true" : "false");
+        pillsToggle.textContent = expandPills
+          ? (pillsToggle.getAttribute("data-less-label") || "−")
+          : (pillsToggle.getAttribute("data-more-label") || "+");
       }
       return;
     }

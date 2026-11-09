@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"html"
 	"net/url"
@@ -11,7 +12,6 @@ import (
 	"sync"
 	"unicode"
 
-	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
@@ -54,12 +54,14 @@ type Options struct {
 	IsReaderLoggedIn    bool            // True when authenticated reader/editor/admin (for :::lock type="user")
 	HasAudio            bool            // Enables [mm:ss] / [hh:mm:ss] podcast seek buttons
 	ShowLineNumbers     bool
+	PreserveDirectives  bool // Emits non-editable data-volo-md-b64 containers for lossless WYSIWYG round-tripping
 	LockPromptTitle     string
 	LockPromptAction    string
 	FeedLockedNotice    string
 	LookupBook          func(slug string) (BookCardInfo, bool)
 	ListBooks           func() []BookCardInfo
 	LookupMediaDims     func(src string) (width int, height int, ok bool)
+	CustomDirective     func(name string, attrs map[string]string, body string) (rawHTML string, ok bool)
 }
 
 // Output contains sanitized HTML plus extracted outline, plain text, first public image, and lazy-load hints.
@@ -76,27 +78,36 @@ type Output struct {
 	NeedsMermaid      bool      `json:"needs_mermaid"`
 }
 
-// Engine is a thread-safe, zero-CGO Markdown rendering pipeline powered by goldmark + chroma/v2 + bluemonday.
+// Engine is a thread-safe, zero-CGO Markdown rendering pipeline powered by goldmark, native lexers, and an HTML5 sanitizer.
 type Engine struct {
 	mdOnce         sync.Once
 	md             goldmark.Markdown
 	sanOnce        sync.Once
-	sanitizer      *bluemonday.Policy
+	sanitizer      *htmlSanitizer
+	editorSanOnce  sync.Once
+	editorSan      *htmlSanitizer
 	commentMDOnce  sync.Once
 	commentMD      goldmark.Markdown
 	commentSanOnce sync.Once
-	commentSan     *bluemonday.Policy
+	commentSan     *htmlSanitizer
 }
 
 var (
-	defaultEngineOnce   sync.Once
-	defaultEngineInst   *Engine
-	inputCheckboxTypeRe = regexp.MustCompile(`^checkbox$`)
-	safeMediaSrcAttrRe  = regexp.MustCompile(`^(?:https?://[^\s"'<>]+|/[^/\s"'<>\\][^\s"'<>]*)$`)
-	chromaCommentClsRe  = regexp.MustCompile(`^(chroma|line|cl|ln|lnt|lntable|lntd|hl|[a-z]{1,3})$`)
-	safeFontColorRe     = regexp.MustCompile(`^(?i)\s*(?:#[0-9a-f]{3,8}|[a-z]{2,24}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))\s*;?\s*$`)
-	safeFontSizeRe      = regexp.MustCompile(`^[+-]?[1-7]$`)
-	safeInlineStyleRe   = regexp.MustCompile(`^(?i)\s*(?:(?:color|background-color|font-size|font-weight|font-style|text-align|text-decoration)\s*:\s*(?:#[0-9a-f]{3,8}|[a-z0-9.% -]{1,32}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))\s*;?\s*)+$`)
+	defaultEngineOnce       sync.Once
+	defaultEngineInst       *Engine
+	inputCheckboxTypeRe     = regexp.MustCompile(`^checkbox$`)
+	safeMediaSrcAttrRe      = regexp.MustCompile(`^(?:https?://[^\s"'<>]+|/[^/\s"'<>\\][^\s"'<>]*)$`)
+	safeEmbedIframeRe       = regexp.MustCompile(`^https://(?:player\.bilibili\.com/player\.html\?bvid=BV[0-9A-Za-z]{10}(?:&(?:amp;)?autoplay=0)?|www\.youtube(?:-nocookie)?\.com/embed/[A-Za-z0-9_-]{11})$`)
+	safeIframeSandboxRe     = regexp.MustCompile(`^allow-scripts allow-same-origin allow-presentation$`)
+	safeIframeRefPolRe      = regexp.MustCompile(`^(?:no-referrer|strict-origin-when-cross-origin)$`)
+	chromaCommentClsRe      = regexp.MustCompile(`^(chroma|line|cl|ln|lnt|lntable|lntd|hl|c1|s1|s2|[a-z]{1,3})$`)
+	safeFontColorRe         = regexp.MustCompile(`^(?i)\s*(?:#[0-9a-f]{3,8}|[a-z]{2,24}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))\s*;?\s*$`)
+	safeFontSizeRe          = regexp.MustCompile(`^[+-]?[1-7]$`)
+	safeInlineStyleRe       = regexp.MustCompile(`^(?i)\s*(?:(?:color|background-color|font-size|font-weight|font-style|text-align|text-decoration)\s*:\s*(?:#[0-9a-f]{3,8}|[a-z0-9.% -]{1,32}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))\s*;?\s*)+$`)
+	commentListStartRe      = regexp.MustCompile(`^[0-9]+$`)
+	commentTableAlignRe     = regexp.MustCompile(`^(?i)(left|right|center|justify)$`)
+	commentTableScrollClsRe = regexp.MustCompile(`^volo-table-scroll$`)
+	tocPreserveSlotRe       = regexp.MustCompile(`<div class="volo-inline-toc-slot" data-volo-md-b64="([A-Za-z0-9+/=]+)"></div>`)
 )
 
 // Default returns a shared singleton Engine.
@@ -124,7 +135,7 @@ func (e *Engine) ensureMarkdown() goldmark.Markdown {
 				parser.WithAutoHeadingID(),
 			),
 			goldmark.WithRendererOptions(
-				gmhtml.WithUnsafe(),    // Raw HTML is strictly filtered by bluemonday policy right after rendering
+				gmhtml.WithUnsafe(),    // Raw HTML is strictly filtered by the HTML5 fragment sanitizer right after rendering
 				gmhtml.WithHardWraps(), // Preserve single-newline soft line breaks (<br>) across paragraphs and blockquotes
 			),
 		)
@@ -148,72 +159,37 @@ func (e *Engine) ensureCommentMarkdown() goldmark.Markdown {
 	return e.commentMD
 }
 
-func (e *Engine) ensureSanitizer() *bluemonday.Policy {
+func (e *Engine) ensureSanitizer() *htmlSanitizer {
 	e.sanOnce.Do(func() {
-		e.sanitizer = buildSanitizerPolicy()
+		e.sanitizer = newArticleSanitizer(false)
 	})
 	return e.sanitizer
 }
 
-func (e *Engine) ensureCommentSanitizer() *bluemonday.Policy {
+func (e *Engine) ensureEditorSanitizer() *htmlSanitizer {
+	e.editorSanOnce.Do(func() {
+		e.editorSan = newArticleSanitizer(true)
+	})
+	return e.editorSan
+}
+
+func (e *Engine) ensureCommentSanitizer() *htmlSanitizer {
 	e.commentSanOnce.Do(func() {
-		e.commentSan = buildCommentSanitizerPolicy()
+		e.commentSan = newCommentSanitizer()
 	})
 	return e.commentSan
 }
 
-func buildSanitizerPolicy() *bluemonday.Policy {
-	p := bluemonday.UGCPolicy()
-	p.AllowAttrs("id", "class", "tabindex", "aria-label", "aria-hidden", "role", "title").Globally()
-	p.AllowAttrs("data-lang", "data-lock-type", "data-article-id", "data-audio-seek", "data-book-slug", "data-github-profile", "data-callout").Globally()
-	p.AllowElements("figure", "figcaption", "section", "aside", "details", "summary", "mark", "kbd", "abbr", "button", "audio", "source", "input", "font", "u", "s", "center")
-	p.AllowAttrs("color").Matching(safeFontColorRe).OnElements("font")
-	p.AllowAttrs("size").Matching(safeFontSizeRe).OnElements("font")
-	p.AllowAttrs("style").Matching(safeInlineStyleRe).OnElements("span", "font", "p", "div", "mark", "strong", "em", "b", "i", "u", "s", "td", "th")
-	p.AllowAttrs("type").OnElements("button", "source")
-	p.AllowAttrs("type").Matching(inputCheckboxTypeRe).OnElements("input")
-	p.AllowAttrs("checked", "disabled").OnElements("input")
-	p.AllowAttrs("open").OnElements("details")
-	p.AllowAttrs("controls", "preload").OnElements("audio", "source")
-	p.AllowAttrs("src").Matching(safeMediaSrcAttrRe).OnElements("audio", "source")
-	p.AllowAttrs("width", "height", "loading", "decoding", "src", "alt", "title").OnElements("img")
-	p.AllowAttrs("href", "title", "target", "rel", "data-no-pjax").OnElements("a")
-	p.RequireNoFollowOnLinks(false)
-	p.AddTargetBlankToFullyQualifiedLinks(false)
-	return p
-}
-
-var (
-	commentListStartRe  = regexp.MustCompile(`^[0-9]+$`)
-	commentTableAlignRe = regexp.MustCompile(`^(?i)(left|right|center|justify)$`)
-)
-
-func buildCommentSanitizerPolicy() *bluemonday.Policy {
-	p := bluemonday.NewPolicy()
-	p.AllowStandardURLs()
-	p.AllowElements(
-		"p", "br", "hr", "blockquote",
-		"ul", "ol", "li", "dl", "dt", "dd",
-		"h1", "h2", "h3", "h4", "h5", "h6",
-		"strong", "b", "em", "i", "del", "s", "strike", "ins", "sub", "sup", "kbd", "q", "cite", "abbr",
-		"pre", "code", "span",
-		"table", "thead", "tbody", "tfoot", "tr", "th", "td",
-	)
-	p.AllowAttrs("title").OnElements("abbr")
-	p.AllowAttrs("start").Matching(commentListStartRe).OnElements("ol")
-	p.AllowAttrs("align").Matching(commentTableAlignRe).OnElements("th", "td")
-	p.AllowAttrs("href", "title").OnElements("a")
-	p.RequireNoFollowOnLinks(true)
-	p.RequireNoReferrerOnLinks(true)
-	p.AddTargetBlankToFullyQualifiedLinks(true)
-	p.AllowImages()
-	p.AllowAttrs("class").Matching(chromaCommentClsRe).OnElements("pre", "code", "span", "table", "tbody", "tr", "td")
-	return p
-}
-
-// SanitizeHTML passes an HTML fragment directly through the engine's strict bluemonday XSS policy.
-func (e *Engine) SanitizeHTML(rawHTML string) string {
+func (e *Engine) sanitizeArticleHTML(rawHTML string, allowEditorDirectives bool) string {
+	if allowEditorDirectives {
+		return e.ensureEditorSanitizer().Sanitize(rawHTML)
+	}
 	return e.ensureSanitizer().Sanitize(rawHTML)
+}
+
+// SanitizeHTML passes an HTML fragment directly through the engine's strict HTML5 XSS sanitizer.
+func (e *Engine) SanitizeHTML(rawHTML string) string {
+	return e.sanitizeArticleHTML(rawHTML, false)
 }
 
 // RenderComment renders untrusted visitor/reader comment Markdown into strictly sanitized HTML
@@ -231,7 +207,26 @@ func (e *Engine) RenderComment(markdown string) string {
 		rendered = strings.ReplaceAll(rendered, "<p>"+token+"</p>", fragment)
 		rendered = strings.ReplaceAll(rendered, token, fragment)
 	}
+	rendered = wrapTablesInScroll(rendered)
 	return e.ensureCommentSanitizer().Sanitize(rendered)
+}
+
+// RenderBasic renders Markdown into sanitized HTML with responsive table scroll wrappers.
+func (e *Engine) RenderBasic(markdown string) string {
+	if strings.TrimSpace(markdown) == "" {
+		return ""
+	}
+	return wrapTablesInScroll(e.Render(markdown, Options{Mode: RenderModeWeb}).HTML)
+}
+
+// RenderSummary renders summary/excerpt Markdown into sanitized HTML after stripping locked blocks,
+// wrapping any tables in .volo-table-scroll for narrow viewports.
+func (e *Engine) RenderSummary(markdown string) string {
+	clean := StripAllLockBlocks(markdown)
+	if strings.TrimSpace(clean) == "" {
+		return ""
+	}
+	return wrapTablesInScroll(e.Render(clean, Options{Mode: RenderModeWeb}).HTML)
 }
 
 // Render transforms Markdown into sanitized, zero-JS syntax-highlighted HTML while strictly
@@ -246,39 +241,64 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 	_ = e.ensureMarkdown().Convert([]byte(prep.markdown), &rawBuf)
 	rendered := rawBuf.String()
 
-	// Replace placeholders (Chroma code blocks, Mermaid diagrams, Lock cards, Book cards) before sanitization.
+	// Replace placeholders (code blocks, Mermaid diagrams, Math blocks/spans, Lock cards, Book cards, Custom directives) before sanitization.
 	for token, fragment := range prep.replacements {
 		slot := `<div data-volo-slot="` + token + `"></div>`
 		rendered = strings.ReplaceAll(rendered, "<p>"+slot+"</p>", fragment)
 		rendered = strings.ReplaceAll(rendered, slot, fragment)
-		rendered = strings.ReplaceAll(rendered, "<p>"+token+"</p>", fragment)
+		if !strings.HasPrefix(fragment, "<span ") {
+			rendered = strings.ReplaceAll(rendered, "<p>"+token+"</p>", fragment)
+		}
 		rendered = strings.ReplaceAll(rendered, token, fragment)
 	}
 
 	// Transform GitHub-flavored Alerts (> [!NOTE], > [!TIP], > [!IMPORTANT], > [!WARNING], > [!CAUTION]) into .volo-callout blocks.
 	rendered = transformGitHubAlerts(rendered, opts.Locale)
 
+	// Transform extended inline Markdown syntax (==highlight==, ^sup^, ~sub~) outside code, math, and URLs.
+	rendered = enhanceExtendedInlineFormatting(rendered)
+
 	// Enhance <img> tags with intrinsic dimensions & lazy decoding and capture FirstImageURL from unlocked content.
 	var firstImg string
 	rendered = enhanceImages(rendered, opts.LookupMediaDims, &firstImg)
 
-	// Enhance GitHub showcase stats/tables and wrap prose tables for responsive overflow protection in web mode.
+	// Enhance standalone media links (.mp4/.webm/.m4v, .mp3/.m4a/.ogg/.wav/.weba, Bilibili, YouTube) and responsive tables in web mode.
 	if opts.Mode == RenderModeWeb {
+		rendered = enhanceStandaloneMediaLinks(rendered)
 		rendered = enhanceTablesAndGitHubShowcase(rendered)
 	}
 
-	// Convert [mm:ss] / [hh:mm:ss] timestamps outside code/links when podcast audio is attached.
+	// Convert [mm:ss] / [hh:mm:ss] timestamps outside code/links/math when podcast audio is attached.
 	if opts.HasAudio && opts.Mode == RenderModeWeb {
 		rendered = injectAudioTimestamps(rendered)
 	}
 
-	// Sanitize with bluemonday to neutralize any script/event-handler XSS vectors.
-	safeHTML := e.ensureSanitizer().Sanitize(rendered)
+	// Sanitize through the HTML5 fragment sanitizer to neutralize script/event-handler/scheme XSS vectors.
+	safeHTML := e.sanitizeArticleHTML(rendered, opts.PreserveDirectives)
 	if opts.Mode == RenderModeWeb {
 		safeHTML = assignReadableHeadingIDs(safeHTML)
 	}
 
 	toc := extractHeadingsTOC(safeHTML)
+	if opts.PreserveDirectives && strings.Contains(safeHTML, `class="volo-inline-toc-slot"`) {
+		safeHTML = tocPreserveSlotRe.ReplaceAllStringFunc(safeHTML, func(slot string) string {
+			m := tocPreserveSlotRe.FindStringSubmatch(slot)
+			if len(m) < 2 {
+				return ""
+			}
+			if opts.Mode == RenderModeWeb && len(toc) > 0 {
+				return renderInlineTOCWithDirective(toc, opts.Locale, m[1])
+			}
+			return renderInlineTOCWithDirective(nil, opts.Locale, m[1])
+		})
+	}
+	if strings.Contains(safeHTML, `<div class="volo-inline-toc-slot"></div>`) {
+		if opts.Mode == RenderModeWeb && len(toc) > 0 {
+			safeHTML = strings.ReplaceAll(safeHTML, `<div class="volo-inline-toc-slot"></div>`, renderInlineTOC(toc, opts.Locale))
+		} else {
+			safeHTML = strings.ReplaceAll(safeHTML, `<div class="volo-inline-toc-slot"></div>`, "")
+		}
+	}
 	plain := ExtractPlainTextFromHTML(safeHTML)
 	wc, mins := ComputeReadingStats(plain)
 
@@ -310,7 +330,7 @@ func (e *Engine) RenderTrustedMarkdownHTML(markdownSrc string) string {
 	if err := e.ensureMarkdown().Convert([]byte(clean), &mdBuf); err != nil {
 		return clean
 	}
-	return strings.TrimSpace(mdBuf.String())
+	return wrapTablesInScroll(strings.TrimSpace(mdBuf.String()))
 }
 
 type preprocessResult struct {
@@ -330,13 +350,15 @@ func preprocessCommentCodeBlocks(src string) (string, map[string]string) {
 	slots := make(map[string]string)
 	outLines := make([]string, 0, len(lines))
 	seq := 0
+	var tracker blockLineTracker
 
 	for i := 0; i < len(lines); {
 		line := lines[i]
-		if prefix, rest, ok := parseBlockLinePrefix(line); ok {
-			if ch, fenceLen, fOk := parseFenceStart(rest); fOk {
-				info := strings.TrimSpace(rest[fenceLen:])
-				lang := strings.Fields(info)
+		info := tracker.next(line)
+		if info.ok {
+			if ch, fenceLen, fOk := parseFenceStart(info.rest); fOk {
+				infoStr := strings.TrimSpace(info.rest[fenceLen:])
+				lang := strings.Fields(infoStr)
 				langName := ""
 				if len(lang) > 0 {
 					langName = strings.ToLower(lang[0])
@@ -344,22 +366,22 @@ func preprocessCommentCodeBlocks(src string) (string, map[string]string) {
 				i++
 				var codeLines []string
 				for i < len(lines) {
-					if _, closeRest, cLineOk := parseBlockLinePrefix(lines[i]); cLineOk {
+					if closeRest, cLineOk := parseChildBlockLine(lines[i], info.activeIndent); cLineOk {
 						if cCh, cLen, cOk := parseFenceStart(closeRest); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(closeRest[cLen:]) == "" {
 							i++
 							break
 						}
 					}
-					codeLines = append(codeLines, stripBlockPrefix(lines[i], prefix))
+					codeLines = append(codeLines, stripBlockPrefixCols(lines[i], info.quoteDepth, info.stripCols))
 					i++
 				}
 				seq++
 				tok := fmt.Sprintf("VOLOCMTCODE%dX%dEND", len(src), seq)
 				slots[tok] = highlightCommentCodeChroma(strings.Join(codeLines, "\n"), langName)
-				if prefix == "" {
+				if info.openPrefix == "" {
 					outLines = append(outLines, "", tok, "")
 				} else {
-					outLines = append(outLines, prefix+tok)
+					outLines = append(outLines, info.openPrefix+tok)
 				}
 				continue
 			}
@@ -368,6 +390,60 @@ func preprocessCommentCodeBlocks(src string) (string, map[string]string) {
 		i++
 	}
 	return strings.Join(outLines, "\n"), slots
+}
+
+func encodeDirectiveB64(rawMD string, opts Options) string {
+	if !opts.PreserveDirectives || opts.Mode == RenderModeFeed {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString([]byte(rawMD))
+}
+
+func injectPreserveAttrsOnRootTag(htmlFragment string, b64 string) string {
+	if b64 == "" {
+		return htmlFragment
+	}
+	trimmed := strings.TrimSpace(htmlFragment)
+	attrChunk := ` contenteditable="false" data-volo-md-b64="` + b64 + `"`
+	for _, rootTag := range []string{"div", "section", "nav", "aside"} {
+		lower := strings.ToLower(trimmed)
+		closeTag := "</" + rootTag + ">"
+		if hasHTMLTagOpen(lower, rootTag) && strings.HasSuffix(lower, closeTag) {
+			gt := scanHTMLTagOrCommentEnd(trimmed, 0)
+			if gt > 1 && !strings.HasSuffix(trimmed[:gt], "/>") {
+				// Verify this root tag does not close prematurely before the end of the fragment.
+				depth := 1
+				scan := gt
+				singleRoot := true
+				for scan < len(trimmed)-len(closeTag) {
+					nextLt := strings.IndexByte(trimmed[scan:], '<')
+					if nextLt < 0 {
+						break
+					}
+					pos := scan + nextLt
+					end := scanHTMLTagOrCommentEnd(trimmed, pos)
+					if end < 0 {
+						break
+					}
+					innerLower := strings.ToLower(trimmed[pos:end])
+					if hasHTMLTagOpen(innerLower, rootTag) && !strings.HasSuffix(innerLower, "/>") {
+						depth++
+					} else if strings.HasPrefix(innerLower, "</"+rootTag) {
+						depth--
+						if depth == 0 {
+							singleRoot = false
+							break
+						}
+					}
+					scan = end
+				}
+				if singleRoot {
+					return trimmed[:gt-1] + attrChunk + trimmed[gt-1:]
+				}
+			}
+		}
+	}
+	return `<div class="volo-custom-directive"` + attrChunk + `>` + htmlFragment + `</div>`
 }
 
 func preprocessDirectives(src string, opts Options) preprocessResult {
@@ -383,25 +459,123 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 		seq++
 		return fmt.Sprintf("VOLOPLACEHOLDER%s%dEND", kind, seq)
 	}
-	emitSlot := func(prefix, tok string) {
+	emitSlot := func(openPrefix, tok string) {
 		slot := `<div data-volo-slot="` + tok + `"></div>`
-		if prefix == "" {
+		if openPrefix == "" {
 			outLines = append(outLines, "", slot, "")
 		} else {
-			outLines = append(outLines, prefix+slot)
+			outLines = append(outLines, openPrefix+slot)
 		}
+	}
+
+	var tracker blockLineTracker
+	inHTMLComment := false
+	inRawPre := false
+
+	processProseSegment := func(seg string) string {
+		if seg == "" {
+			return ""
+		}
+		processed, foundMath := extractLineMath(seg, nextToken, res.replacements)
+		if foundMath {
+			res.needsMath = true
+		}
+		return rewriteSubscriptOutsideCode(rewriteWikiLinksOutsideCode(processed))
 	}
 
 	i := 0
 	for i < len(lines) {
 		line := lines[i]
-		prefix, rest, lineOk := parseBlockLinePrefix(line)
 
-		if lineOk {
-			// 1. Fenced code block (` ```lang ` or `~~~lang`): highlight via Chroma or emit Mermaid container!
+		// Handle active multi-line raw HTML comment (`<!-- ... -->`).
+		if inHTMLComment {
+			if closeIdx := strings.Index(line, "-->"); closeIdx >= 0 {
+				inHTMLComment = false
+				end := closeIdx + 3
+				tail := line[end:]
+				if strings.TrimSpace(tail) == "" {
+					outLines = append(outLines, line)
+				} else {
+					outLines = append(outLines, line[:end]+processProseSegment(tail))
+				}
+			} else {
+				outLines = append(outLines, line)
+			}
+			i++
+			continue
+		}
+
+		// Handle active multi-line raw `<pre>...</pre>` block.
+		if inRawPre {
+			if closeEnd := findCaseInsensitivePreCloseEnd(line); closeEnd >= 0 {
+				inRawPre = false
+				tail := line[closeEnd:]
+				if strings.TrimSpace(tail) == "" {
+					outLines = append(outLines, line)
+				} else {
+					outLines = append(outLines, line[:closeEnd]+processProseSegment(tail))
+				}
+			} else {
+				outLines = append(outLines, line)
+			}
+			i++
+			continue
+		}
+
+		info := tracker.next(line)
+
+		if info.ok {
+			rest := info.rest
+
+			// 0a. Raw HTML comment block (`<!-- ... -->`).
+			if strings.HasPrefix(rest, "<!--") {
+				openPos := strings.Index(line, "<!--")
+				if closeRel := strings.Index(line[openPos+4:], "-->"); closeRel >= 0 {
+					closeEnd := openPos + 4 + closeRel + 3
+					tail := line[closeEnd:]
+					if strings.TrimSpace(tail) == "" {
+						outLines = append(outLines, line)
+					} else {
+						outLines = append(outLines, line[:closeEnd]+processProseSegment(tail))
+					}
+				} else {
+					if hasClosingHTMLComment(lines[i+1:]) {
+						inHTMLComment = true
+					}
+					outLines = append(outLines, line)
+				}
+				i++
+				continue
+			}
+
+			// 0b. Raw `<pre>...</pre>` HTML block.
+			if hasHTMLTagOpen(strings.ToLower(rest), "pre") {
+				openPos := strings.IndexByte(line, '<')
+				tagEnd := scanHTMLTagOrCommentEnd(line, openPos)
+				if tagEnd > openPos && !strings.HasSuffix(strings.TrimSpace(line[openPos:tagEnd]), "/>") {
+					if closeRel := findCaseInsensitivePreCloseEnd(line[tagEnd:]); closeRel >= 0 {
+						closeEnd := tagEnd + closeRel
+						tail := line[closeEnd:]
+						if strings.TrimSpace(tail) == "" {
+							outLines = append(outLines, line)
+						} else {
+							outLines = append(outLines, line[:closeEnd]+processProseSegment(tail))
+						}
+					} else {
+						if hasClosingPreTag(lines[i+1:]) {
+							inRawPre = true
+						}
+						outLines = append(outLines, line)
+					}
+					i++
+					continue
+				}
+			}
+
+			// 1. Fenced code block (` ```lang ` or `~~~lang`): highlight via native lexer or emit Mermaid container!
 			if ch, fenceLen, ok := parseFenceStart(rest); ok {
-				info := strings.TrimSpace(rest[fenceLen:])
-				lang := strings.Fields(info)
+				infoStr := strings.TrimSpace(rest[fenceLen:])
+				lang := strings.Fields(infoStr)
 				langName := ""
 				if len(lang) > 0 {
 					langName = strings.ToLower(lang[0])
@@ -409,13 +583,13 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				i++
 				var codeLines []string
 				for i < len(lines) {
-					if _, closeRest, cLineOk := parseBlockLinePrefix(lines[i]); cLineOk {
+					if closeRest, cLineOk := parseChildBlockLine(lines[i], info.activeIndent); cLineOk {
 						if cCh, cLen, cOk := parseFenceStart(closeRest); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(closeRest[cLen:]) == "" {
 							i++
 							break
 						}
 					}
-					codeLines = append(codeLines, stripBlockPrefix(lines[i], prefix))
+					codeLines = append(codeLines, stripBlockPrefixCols(lines[i], info.quoteDepth, info.stripCols))
 					i++
 				}
 				codeBody := strings.Join(codeLines, "\n")
@@ -426,7 +600,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				} else {
 					res.replacements[tok] = highlightCodeChroma(codeBody, langName, opts.ShowLineNumbers)
 				}
-				emitSlot(prefix, tok)
+				emitSlot(info.openPrefix, tok)
 				continue
 			}
 
@@ -445,6 +619,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				hint := strings.TrimSpace(attrs["hint"])
 				i++
 
+				rawFenceLines := []string{rest}
 				var innerLines []string
 				inInnerFence := false
 				var innerFenceCh byte
@@ -453,7 +628,8 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 
 				for i < len(lines) {
 					cur := lines[i]
-					if _, curRest, curOk := parseBlockLinePrefix(cur); curOk {
+					strippedCur := stripBlockPrefixCols(cur, info.quoteDepth, info.stripCols)
+					if curRest, curOk := parseChildBlockLine(cur, info.activeIndent); curOk {
 						if fCh, fLen, fOk := parseFenceStart(curRest); fOk {
 							if !inInnerFence {
 								inInnerFence = true
@@ -462,7 +638,8 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 							} else if fCh == innerFenceCh && fLen >= innerFenceLen && strings.TrimSpace(curRest[fLen:]) == "" {
 								inInnerFence = false
 							}
-							innerLines = append(innerLines, stripBlockPrefix(cur, prefix))
+							innerLines = append(innerLines, strippedCur)
+							rawFenceLines = append(rawFenceLines, strippedCur)
 							i++
 							continue
 						}
@@ -470,10 +647,12 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 							if curRest == ":::" {
 								if lockNestDepth > 0 {
 									lockNestDepth--
-									innerLines = append(innerLines, stripBlockPrefix(cur, prefix))
+									innerLines = append(innerLines, strippedCur)
+									rawFenceLines = append(rawFenceLines, strippedCur)
 									i++
 									continue
 								}
+								rawFenceLines = append(rawFenceLines, ":::")
 								i++
 								break
 							}
@@ -482,9 +661,12 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 							}
 						}
 					}
-					innerLines = append(innerLines, stripBlockPrefix(cur, prefix))
+					innerLines = append(innerLines, strippedCur)
+					rawFenceLines = append(rawFenceLines, strippedCur)
 					i++
 				}
+
+				lockB64 := encodeDirectiveB64(strings.Join(rawFenceLines, "\n"), opts)
 
 				canView := false
 				if opts.Mode == RenderModeWeb {
@@ -506,7 +688,12 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				if canView {
 					seq++
 					lockPrefix := "INNER" + strconv.Itoa(seq)
-					innerPrep := preprocessDirectives(strings.Join(innerLines, "\n"), opts)
+					innerOpts := opts
+					if lockB64 != "" {
+						// Outer lock wrapper already preserves the full :::lock fence verbatim.
+						innerOpts.PreserveDirectives = false
+					}
+					innerPrep := preprocessDirectives(strings.Join(innerLines, "\n"), innerOpts)
 					for k, v := range innerPrep.replacements {
 						res.replacements[lockPrefix+k] = v
 						innerPrep.markdown = strings.ReplaceAll(innerPrep.markdown, k, lockPrefix+k)
@@ -523,22 +710,26 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 					if innerPrep.needsMermaid {
 						res.needsMermaid = true
 					}
-					openDiv := `<div class="volo-lock-block volo-lock-block--unlocked" data-lock-type="` + html.EscapeString(lockType) + `">`
-					if prefix == "" {
+					extraAttrs := ""
+					if lockB64 != "" {
+						extraAttrs = ` contenteditable="false" data-volo-md-b64="` + lockB64 + `"`
+					}
+					openDiv := `<div class="volo-lock-block volo-lock-block--unlocked" data-lock-type="` + html.EscapeString(lockType) + `"` + extraAttrs + `>`
+					if info.openPrefix == "" {
 						outLines = append(outLines, openDiv, "", innerPrep.markdown, "", `</div>`)
 					} else {
-						outLines = append(outLines, prefix+openDiv, prefix)
+						outLines = append(outLines, info.openPrefix+openDiv, info.contPrefix)
 						for _, il := range strings.Split(innerPrep.markdown, "\n") {
-							outLines = append(outLines, prefix+il)
+							outLines = append(outLines, info.contPrefix+il)
 						}
-						outLines = append(outLines, prefix, prefix+`</div>`)
+						outLines = append(outLines, info.contPrefix, info.contPrefix+`</div>`)
 					}
 				} else {
 					// Locked! Inner lines are completely discarded before AST parsing — zero chance of leakage!
 					res.hasUnresolvedLock = true
 					tok := nextToken("LOCK")
-					res.replacements[tok] = renderLockedPlaceholder(lockType, hint, opts)
-					emitSlot(prefix, tok)
+					res.replacements[tok] = renderLockedPlaceholder(lockType, hint, opts, lockB64)
+					emitSlot(info.openPrefix, tok)
 				}
 				continue
 			}
@@ -555,42 +746,119 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				if slug == "" {
 					slug = attrs["book"]
 				}
+				rawBookMD := rest
 				i++
 				if !hasInlineClose && i < len(lines) {
-					if _, nextRest, nextOk := parseBlockLinePrefix(lines[i]); nextOk && nextRest == ":::" {
+					if nextRest, nextOk := parseChildBlockLine(lines[i], info.activeIndent); nextOk && nextRest == ":::" {
+						rawBookMD += "\n:::"
 						i++
 					}
 				}
+				bookB64 := encodeDirectiveB64(rawBookMD, opts)
 				tok := nextToken("BOOK")
-				res.replacements[tok] = renderBookCard(slug, opts)
-				emitSlot(prefix, tok)
+				cardHTML := renderBookCard(slug, opts)
+				if bookB64 != "" {
+					if cardHTML == "" {
+						cardHTML = `<span class="volo-embed-book__title"><strong>:::book</strong></span>`
+					}
+					cardHTML = `<div class="volo-embed-book-wrap" contenteditable="false" data-volo-md-b64="` + bookB64 + `">` + cardHTML + `</div>`
+				}
+				res.replacements[tok] = cardHTML
+				emitSlot(info.openPrefix, tok)
 				continue
 			}
 
-			// 4. `:::bookshelf` / `:::bookshelf:::`
+			// 4. `:::bookshelf` / `:::bookshelf[limit="12"]` / `:::bookshelf:::`
 			if isDirectivePrefix(rest, ":::bookshelf") {
 				rawArgs := rest[len(":::bookshelf"):]
 				hasInlineClose := strings.HasSuffix(strings.TrimSpace(rawArgs), ":::")
+				attrs := parseDirectiveAttrs(rawArgs)
+				limit := 0
+				if rawLim := strings.TrimSpace(attrs["limit"]); rawLim != "" {
+					if n, err := strconv.Atoi(rawLim); err == nil && n > 0 {
+						limit = n
+					}
+				}
+				rawShelfMD := rest
 				i++
 				if !hasInlineClose && i < len(lines) {
-					if _, nextRest, nextOk := parseBlockLinePrefix(lines[i]); nextOk && nextRest == ":::" {
+					if nextRest, nextOk := parseChildBlockLine(lines[i], info.activeIndent); nextOk && nextRest == ":::" {
+						rawShelfMD += "\n:::"
 						i++
 					}
 				}
+				shelfB64 := encodeDirectiveB64(rawShelfMD, opts)
 				tok := nextToken("BOOKSHELF")
-				res.replacements[tok] = renderBookshelfGrid(opts)
-				emitSlot(prefix, tok)
+				res.replacements[tok] = renderBookshelfGrid(opts, limit, shelfB64)
+				emitSlot(info.openPrefix, tok)
 				continue
 			}
+
+			// 5. Unknown `:::name[...]` custom plugin directives.
+			if opts.CustomDirective != nil || opts.PreserveDirectives {
+				if dirName, rawArgs, dOk := parseCustomDirectiveHeader(rest); dOk {
+					attrs := parseDirectiveAttrs(rawArgs)
+					body, rawCustomMD, nextIdx := scanCustomDirectiveBody(lines, i, info, rest, rawArgs)
+					customB64 := encodeDirectiveB64(rawCustomMD, opts)
+					if opts.CustomDirective != nil {
+						if rawHTML, handled := opts.CustomDirective(dirName, attrs, body); handled {
+							i = nextIdx
+							tok := nextToken("CUSTOM")
+							res.replacements[tok] = injectPreserveAttrsOnRootTag(rawHTML, customB64)
+							emitSlot(info.openPrefix, tok)
+							continue
+						}
+					}
+					if customB64 != "" {
+						i = nextIdx
+						tok := nextToken("CUSTOM")
+						label := ":::" + dirName
+						res.replacements[tok] = `<div class="volo-custom-directive" contenteditable="false" data-volo-md-b64="` + customB64 + `"><p>` + html.EscapeString(label) + `</p></div>`
+						emitSlot(info.openPrefix, tok)
+						continue
+					}
+				}
+			}
+
+			// 5b. Standalone `[toc]` / `[TOC]` inline Table of Contents marker.
+			if info.quoteDepth == 0 && info.activeIndent == 0 && strings.EqualFold(rest, "[toc]") {
+				tocB64 := encodeDirectiveB64(rest, opts)
+				tok := nextToken("TOC")
+				if tocB64 != "" {
+					res.replacements[tok] = `<div class="volo-inline-toc-slot" data-volo-md-b64="` + tocB64 + `"></div>`
+				} else {
+					res.replacements[tok] = `<div class="volo-inline-toc-slot"></div>`
+				}
+				emitSlot("", tok)
+				i++
+				continue
+			}
+
+			// 6. Standalone or multi-line display math (`$$...$$` or `\[...\]`).
+			if mathBody, nextIdx, mOk := tryExtractBlockMath(lines, i, info, rest); mOk {
+				res.needsMath = true
+				tok := nextToken("MATHBLOCK")
+				res.replacements[tok] = `<div class="volo-math-block">$$` + html.EscapeString(mathBody) + `$$</div>`
+				emitSlot(info.openPrefix, tok)
+				i = nextIdx
+				continue
+			}
+
+			// 7. Single-line display/inline math, wiki-links, and subscripts (handling mid-line `<!--` / `<pre>` openings).
+			outLine, openedComment, openedPre := processInlineLineWithRawHTMLState(line, processProseSegment)
+			if openedComment && hasClosingHTMLComment(lines[i+1:]) {
+				inHTMLComment = true
+			}
+			if openedPre && hasClosingPreTag(lines[i+1:]) {
+				inRawPre = true
+			}
+			outLines = append(outLines, outLine)
+			i++
+			continue
 		}
 
-		// Detect math expressions outside fenced code blocks (`$$...$$`, `\[...\]`, `\(...\)`, or `$...$`).
-		if !res.needsMath && containsMathSyntax(line) {
-			res.needsMath = true
-		}
-
-		// Convert obsidian-style `[[slug]]` or `[[slug|Title]]` wiki links outside inline code.
-		outLines = append(outLines, rewriteWikiLinksOutsideCode(line))
+		// Indented (>= activeIndent + 4 columns) code block lines stay completely untouched!
+		outLines = append(outLines, line)
 		i++
 	}
 
@@ -598,10 +866,135 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 	return res
 }
 
-// parseBlockLinePrefix strips optional CommonMark `>` blockquote prefixes (each preceded by 0..3 spaces)
-// and verifies the remaining line has at most 0..3 leading spaces (NOT a 4-space/tab indented code block).
-func parseBlockLinePrefix(line string) (prefix string, rest string, ok bool) {
-	pos := 0
+func hasClosingHTMLComment(lines []string) bool {
+	for _, ln := range lines {
+		if strings.Contains(ln, "-->") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasClosingPreTag(lines []string) bool {
+	for _, ln := range lines {
+		if findCaseInsensitivePreCloseEnd(ln) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func findCaseInsensitivePreCloseEnd(s string) int {
+	lower := strings.ToLower(s)
+	offset := 0
+	for offset < len(lower) {
+		rel := strings.Index(lower[offset:], "</pre")
+		if rel < 0 {
+			return -1
+		}
+		pos := offset + rel
+		after := pos + len("</pre")
+		if after < len(lower) {
+			ch := lower[after]
+			if ch == '>' {
+				return after + 1
+			}
+			if ch == ' ' || ch == '\t' || ch == '\r' {
+				if gt := strings.IndexByte(lower[after:], '>'); gt >= 0 {
+					return after + gt + 1
+				}
+			}
+		}
+		offset = pos + 5
+	}
+	return -1
+}
+
+// processInlineLineWithRawHTMLState applies `processSeg` outside unclosed mid-line `<!--` comments
+// and unclosed mid-line `<pre>` blocks, tracking multi-line transitions cleanly.
+func processInlineLineWithRawHTMLState(line string, processSeg func(string) string) (out string, openedComment bool, openedPre bool) {
+	if !strings.Contains(line, "<!--") && !strings.Contains(strings.ToLower(line), "<pre") {
+		return processSeg(line), false, false
+	}
+
+	var b strings.Builder
+	b.Grow(len(line))
+	segStart := 0
+
+	for p := 0; p < len(line); {
+		if line[p] == '`' {
+			tickLen := 0
+			for p+tickLen < len(line) && line[p+tickLen] == '`' {
+				tickLen++
+			}
+			if closeIdx := findClosingBacktickRun(line, p+tickLen, tickLen); closeIdx >= 0 {
+				p = closeIdx + tickLen
+				continue
+			}
+			p += tickLen
+			continue
+		}
+		if strings.HasPrefix(line[p:], "<!--") {
+			if closeRel := strings.Index(line[p+4:], "-->"); closeRel >= 0 {
+				p = p + 4 + closeRel + 3
+				continue
+			}
+			b.WriteString(processSeg(line[segStart:p]))
+			b.WriteString(line[p:])
+			return b.String(), true, false
+		}
+		if line[p] == '<' && hasHTMLTagOpen(strings.ToLower(line[p:]), "pre") {
+			tagEnd := scanHTMLTagOrCommentEnd(line, p)
+			if tagEnd > p && !strings.HasSuffix(strings.TrimSpace(line[p:tagEnd]), "/>") {
+				if closeRel := findCaseInsensitivePreCloseEnd(line[tagEnd:]); closeRel >= 0 {
+					b.WriteString(processSeg(line[segStart:p]))
+					endPre := tagEnd + closeRel
+					b.WriteString(line[p:endPre])
+					p = endPre
+					segStart = p
+					continue
+				}
+				b.WriteString(processSeg(line[segStart:p]))
+				b.WriteString(line[p:])
+				return b.String(), false, true
+			}
+		}
+		p++
+	}
+
+	if segStart == 0 {
+		return processSeg(line), false, false
+	}
+	b.WriteString(processSeg(line[segStart:]))
+	return b.String(), false, false
+}
+
+type listItemContext struct {
+	quoteDepth       int
+	contentIndent    int
+	sawBlank         bool
+	emptyOnFirstLine bool
+	justOpened       bool
+}
+
+type blockLineInfo struct {
+	openPrefix   string
+	contPrefix   string
+	rest         string
+	quoteDepth   int
+	activeIndent int
+	stripCols    int
+	ok           bool
+}
+
+// blockLineTracker tracks CommonMark blockquote and list-item indentation across lines
+// so child blocks (`    :::lock`, `    ```go`) inside `- item` or `10. item` are recognized
+// identically to Goldmark while top-level 4-space indented code blocks remain untouched.
+type blockLineTracker struct {
+	stack []listItemContext
+}
+
+func scanBlockquotePrefix(line string) (quoteDepth int, pos int) {
 	for pos < len(line) {
 		sp := 0
 		for sp < 4 && pos+sp < len(line) && line[pos+sp] == ' ' {
@@ -612,61 +1005,361 @@ func parseBlockLinePrefix(line string) (prefix string, rest string, ok bool) {
 			if pos < len(line) && line[pos] == ' ' {
 				pos++
 			}
+			quoteDepth++
 			continue
 		}
 		break
 	}
-	sp := 0
-	for pos+sp < len(line) && line[pos+sp] == ' ' {
-		sp++
-		if sp >= 4 {
-			return "", "", false
-		}
-	}
-	if pos+sp < len(line) && line[pos+sp] == '\t' {
-		return "", "", false
-	}
-	pos += sp
-	return line[:pos], strings.TrimRight(line[pos:], " \t\r"), true
+	return quoteDepth, pos
 }
 
-// stripBlockPrefix removes matching blockquote `>` markers and up to the opening line's leading spaces.
-func stripBlockPrefix(line, fencePrefix string) string {
-	if fencePrefix == "" {
-		return line
+func measureLeadingIndent(s string) (cols int, bytesConsumed int) {
+	for bytesConsumed < len(s) {
+		ch := s[bytesConsumed]
+		if ch == ' ' {
+			cols++
+			bytesConsumed++
+		} else if ch == '\t' {
+			cols += 4 - (cols % 4)
+			bytesConsumed++
+		} else {
+			break
+		}
 	}
-	hasQuote := strings.Contains(fencePrefix, ">")
-	pos := 0
-	if hasQuote {
-		quotesWanted := strings.Count(fencePrefix, ">")
-		quotesSeen := 0
-		for quotesSeen < quotesWanted && pos < len(line) {
-			sp := 0
-			for sp < 4 && pos+sp < len(line) && line[pos+sp] == ' ' {
-				sp++
+	return cols, bytesConsumed
+}
+
+func isThematicBreakLine(trimmed string) bool {
+	if len(trimmed) < 3 {
+		return false
+	}
+	marker := trimmed[0]
+	if marker != '-' && marker != '*' && marker != '_' {
+		return false
+	}
+	count := 0
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if ch == marker {
+			count++
+		} else if ch != ' ' && ch != '\t' && ch != '\r' {
+			return false
+		}
+	}
+	return count >= 3
+}
+
+func parseCommonMarkListMarker(s string) (markerBytes int, ok bool) {
+	if len(s) == 0 || isThematicBreakLine(s) {
+		return 0, false
+	}
+	c0 := s[0]
+	if c0 == '-' || c0 == '*' || c0 == '+' {
+		if len(s) == 1 || s[1] == ' ' || s[1] == '\t' || s[1] == '\r' {
+			return 1, true
+		}
+		return 0, false
+	}
+	k := 0
+	for k < len(s) && k < 9 && s[k] >= '0' && s[k] <= '9' {
+		k++
+	}
+	if k > 0 && k < len(s) && (s[k] == '.' || s[k] == ')') {
+		if k+1 == len(s) || s[k+1] == ' ' || s[k+1] == '\t' || s[k+1] == '\r' {
+			return k + 1, true
+		}
+	}
+	return 0, false
+}
+
+func interruptsLazyListContinuation(trimmed string) bool {
+	if trimmed == "" {
+		return true
+	}
+	if isThematicBreakLine(trimmed) {
+		return true
+	}
+	if _, ok := parseCommonMarkListMarker(trimmed); ok {
+		return true
+	}
+	if _, _, ok := parseFenceStart(trimmed); ok {
+		return true
+	}
+	if strings.HasPrefix(trimmed, ":::") {
+		return true
+	}
+	if trimmed[0] == '#' {
+		h := 0
+		for h < len(trimmed) && h <= 6 && trimmed[h] == '#' {
+			h++
+		}
+		if h >= 1 && h <= 6 && (h == len(trimmed) || trimmed[h] == ' ' || trimmed[h] == '\t') {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *blockLineTracker) next(line string) blockLineInfo {
+	quoteDepth, pos := scanBlockquotePrefix(line)
+
+	// Pop lists nested inside deeper blockquotes that have ended.
+	for len(t.stack) > 0 && t.stack[len(t.stack)-1].quoteDepth > quoteDepth {
+		t.stack = t.stack[:len(t.stack)-1]
+	}
+
+	afterQuote := line[pos:]
+	if strings.TrimSpace(afterQuote) == "" {
+		for idx := len(t.stack) - 1; idx >= 0; idx-- {
+			if t.stack[idx].quoteDepth != quoteDepth {
+				break
 			}
-			if sp <= 3 && pos+sp < len(line) && line[pos+sp] == '>' {
-				pos += sp + 1
-				if pos < len(line) && line[pos] == ' ' {
-					pos++
-				}
-				quotesSeen++
+			if t.stack[idx].emptyOnFirstLine && t.stack[idx].justOpened {
+				t.stack = t.stack[:idx]
 				continue
 			}
-			break
+			t.stack[idx].sawBlank = true
+			t.stack[idx].justOpened = false
+		}
+		return blockLineInfo{
+			openPrefix: line[:pos],
+			contPrefix: line[:pos],
+			rest:       "",
+			quoteDepth: quoteDepth,
+			ok:         true,
 		}
 	}
-	trailSpaces := 0
-	for i := len(fencePrefix) - 1; i >= 0 && fencePrefix[i] == ' '; i-- {
-		if hasQuote && i > 0 && fencePrefix[i-1] == '>' {
+
+	col, indentBytes := measureLeadingIndent(afterQuote)
+	contentPos := pos + indentBytes
+	trimmedRest := strings.TrimRight(line[contentPos:], " \t\r")
+
+	// Pop active list contexts at this quoteDepth whose indentation is not satisfied.
+	for len(t.stack) > 0 {
+		top := &t.stack[len(t.stack)-1]
+		if top.quoteDepth != quoteDepth {
 			break
 		}
-		trailSpaces++
+		if col < top.contentIndent && (top.sawBlank || interruptsLazyListContinuation(trimmedRest)) {
+			t.stack = t.stack[:len(t.stack)-1]
+			continue
+		}
+		break
 	}
-	for removed := 0; removed < trailSpaces && pos < len(line) && line[pos] == ' '; removed++ {
-		pos++
+
+	activeIndent := 0
+	if len(t.stack) > 0 && t.stack[len(t.stack)-1].quoteDepth == quoteDepth {
+		top := &t.stack[len(t.stack)-1]
+		activeIndent = top.contentIndent
+		top.sawBlank = false
+		top.emptyOnFirstLine = false
+		top.justOpened = false
+	}
+
+	if col > activeIndent+3 {
+		return blockLineInfo{ok: false}
+	}
+
+	// Check whether this line itself opens a list item (`- ...`, `1. ...`).
+	if mLen, isList := parseCommonMarkListMarker(line[contentPos:]); isList {
+		afterMarkerStart := contentPos + mLen
+		remAfterMarker := line[afterMarkerStart:]
+		spCols := 0
+		spBytes := 0
+		baseCol := col + mLen
+		for spBytes < len(remAfterMarker) {
+			ch := remAfterMarker[spBytes]
+			if ch == ' ' {
+				spCols++
+				spBytes++
+			} else if ch == '\t' {
+				adv := 4 - ((baseCol + spCols) % 4)
+				spCols += adv
+				spBytes++
+			} else {
+				break
+			}
+		}
+		tailAfterSpaces := strings.TrimRight(remAfterMarker[spBytes:], " \t\r")
+		if tailAfterSpaces == "" {
+			newIndent := baseCol + 1
+			t.stack = append(t.stack, listItemContext{
+				quoteDepth:       quoteDepth,
+				contentIndent:    newIndent,
+				emptyOnFirstLine: true,
+				justOpened:       true,
+			})
+			cont := line[:pos] + strings.Repeat(" ", newIndent)
+			return blockLineInfo{
+				openPrefix:   line[:afterMarkerStart+spBytes],
+				contPrefix:   cont,
+				rest:         "",
+				quoteDepth:   quoteDepth,
+				activeIndent: newIndent,
+				stripCols:    newIndent,
+				ok:           true,
+			}
+		}
+		if spCols >= 5 {
+			// CommonMark: 5+ spaces after a list marker begins an indented code block inside the list item!
+			newIndent := baseCol + 1
+			t.stack = append(t.stack, listItemContext{
+				quoteDepth:    quoteDepth,
+				contentIndent: newIndent,
+			})
+			return blockLineInfo{ok: false}
+		}
+		newIndent := baseCol + spCols
+		t.stack = append(t.stack, listItemContext{
+			quoteDepth:    quoteDepth,
+			contentIndent: newIndent,
+			justOpened:    true,
+		})
+		cont := line[:pos] + strings.Repeat(" ", newIndent)
+		return blockLineInfo{
+			openPrefix:   line[:afterMarkerStart+spBytes],
+			contPrefix:   cont,
+			rest:         tailAfterSpaces,
+			quoteDepth:   quoteDepth,
+			activeIndent: newIndent,
+			stripCols:    newIndent,
+			ok:           true,
+		}
+	}
+
+	return blockLineInfo{
+		openPrefix:   line[:contentPos],
+		contPrefix:   line[:contentPos],
+		rest:         trimmedRest,
+		quoteDepth:   quoteDepth,
+		activeIndent: activeIndent,
+		stripCols:    col,
+		ok:           true,
+	}
+}
+
+func parseChildBlockLine(line string, activeIndent int) (rest string, ok bool) {
+	_, pos := scanBlockquotePrefix(line)
+	col, indentBytes := measureLeadingIndent(line[pos:])
+	if col > activeIndent+3 {
+		return "", false
+	}
+	return strings.TrimRight(line[pos+indentBytes:], " \t\r"), true
+}
+
+func stripBlockPrefixCols(line string, quoteDepth int, stripCols int) string {
+	pos := 0
+	quotesSeen := 0
+	for quotesSeen < quoteDepth && pos < len(line) {
+		sp := 0
+		for sp < 4 && pos+sp < len(line) && line[pos+sp] == ' ' {
+			sp++
+		}
+		if sp <= 3 && pos+sp < len(line) && line[pos+sp] == '>' {
+			pos += sp + 1
+			if pos < len(line) && line[pos] == ' ' {
+				pos++
+			}
+			quotesSeen++
+			continue
+		}
+		break
+	}
+	if stripCols <= 0 {
+		return line[pos:]
+	}
+	col := 0
+	for pos < len(line) && col < stripCols {
+		ch := line[pos]
+		if ch == ' ' {
+			col++
+			pos++
+		} else if ch == '\t' {
+			adv := 4 - (col % 4)
+			pos++
+			if col+adv > stripCols {
+				return strings.Repeat(" ", (col+adv)-stripCols) + line[pos:]
+			}
+			col += adv
+		} else {
+			break
+		}
 	}
 	return line[pos:]
+}
+
+func parseCustomDirectiveHeader(rest string) (name string, rawArgs string, ok bool) {
+	if !strings.HasPrefix(rest, ":::") || len(rest) <= 3 {
+		return "", "", false
+	}
+	c0 := rest[3]
+	if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z')) {
+		return "", "", false
+	}
+	k := 3
+	for k < len(rest) {
+		ch := rest[k]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
+			k++
+			continue
+		}
+		break
+	}
+	dirName := strings.ToLower(rest[3:k])
+	rem := rest[k:]
+	if rem != "" && rem != ":::" && rem[0] != ' ' && rem[0] != '\t' && rem[0] != '[' {
+		return "", "", false
+	}
+	return dirName, rem, true
+}
+
+func scanCustomDirectiveBody(lines []string, openIdx int, info blockLineInfo, openRest string, rawArgs string) (body string, rawMD string, nextIdx int) {
+	if strings.HasSuffix(strings.TrimSpace(rawArgs), ":::") {
+		return "", openRest, openIdx + 1
+	}
+	var innerLines []string
+	inInnerFence := false
+	var innerFenceCh byte
+	innerFenceLen := 0
+	nestDepth := 0
+
+	for j := openIdx + 1; j < len(lines); j++ {
+		cur := lines[j]
+		stripped := stripBlockPrefixCols(cur, info.quoteDepth, info.stripCols)
+		if curRest, curOk := parseChildBlockLine(cur, info.activeIndent); curOk {
+			if fCh, fLen, fOk := parseFenceStart(curRest); fOk {
+				if !inInnerFence {
+					inInnerFence = true
+					innerFenceCh = fCh
+					innerFenceLen = fLen
+				} else if fCh == innerFenceCh && fLen >= innerFenceLen && strings.TrimSpace(curRest[fLen:]) == "" {
+					inInnerFence = false
+				}
+				innerLines = append(innerLines, stripped)
+				continue
+			}
+			if !inInnerFence {
+				if curRest == ":::" {
+					if nestDepth > 0 {
+						nestDepth--
+						innerLines = append(innerLines, stripped)
+						continue
+					}
+					bodyStr := strings.Join(innerLines, "\n")
+					if len(innerLines) == 0 {
+						return "", openRest + "\n:::", j + 1
+					}
+					return bodyStr, openRest + "\n" + bodyStr + "\n:::", j + 1
+				}
+				if isOpeningBlockDirective(curRest) {
+					nestDepth++
+				}
+			}
+		}
+		innerLines = append(innerLines, stripped)
+	}
+	// Leaf directive without closing `:::`
+	return "", openRest, openIdx + 1
 }
 
 func parseFenceStart(trimmed string) (byte, int, bool) {
@@ -743,7 +1436,7 @@ func parseDirectiveAttrs(raw string) map[string]string {
 	return out
 }
 
-func renderLockedPlaceholder(lockType string, hint string, opts Options) string {
+func renderLockedPlaceholder(lockType string, hint string, opts Options, directiveB64 string) string {
 	if opts.Mode == RenderModeFeed {
 		notice := opts.FeedLockedNotice
 		if notice == "" {
@@ -782,7 +1475,11 @@ func renderLockedPlaceholder(lockType string, hint string, opts Options) string 
 	}
 
 	var b strings.Builder
-	b.WriteString(`<aside class="volo-lock-card" data-lock-type="` + html.EscapeString(lockType) + `" data-article-id="` + html.EscapeString(opts.ArticleID) + `">`)
+	b.WriteString(`<aside class="volo-lock-card" data-lock-type="` + html.EscapeString(lockType) + `" data-article-id="` + html.EscapeString(opts.ArticleID) + `"`)
+	if directiveB64 != "" {
+		b.WriteString(` contenteditable="false" data-volo-md-b64="` + directiveB64 + `"`)
+	}
+	b.WriteByte('>')
 	b.WriteString(`<p class="volo-lock-title">` + html.EscapeString(title) + `</p>`)
 	if hint != "" {
 		b.WriteString(`<p class="volo-lock-hint">` + html.EscapeString(hint) + `</p>`)
@@ -860,20 +1557,27 @@ func renderBookCard(slug string, opts Options) string {
 	return b.String()
 }
 
-func renderBookshelfGrid(opts Options) string {
+func renderBookshelfGrid(opts Options, limit int, directiveB64 string) string {
 	var books []BookCardInfo
 	if opts.ListBooks != nil {
 		books = opts.ListBooks()
+	}
+	if limit > 0 && len(books) > limit {
+		books = books[:limit]
+	}
+	extraAttrs := ""
+	if directiveB64 != "" {
+		extraAttrs = ` contenteditable="false" data-volo-md-b64="` + directiveB64 + `"`
 	}
 	if len(books) == 0 {
 		emptyMsg := "暂无已发布的在线书籍"
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(opts.Locale)), "en") {
 			emptyMsg = "No online books published yet."
 		}
-		return `<section class="volo-embed-bookshelf volo-embed-bookshelf--empty"><p class="volo-embed-bookshelf__empty">` + html.EscapeString(emptyMsg) + `</p></section>`
+		return `<section class="volo-embed-bookshelf volo-embed-bookshelf--empty"` + extraAttrs + `><p class="volo-embed-bookshelf__empty">` + html.EscapeString(emptyMsg) + `</p></section>`
 	}
 	var b strings.Builder
-	b.WriteString(`<section class="volo-embed-bookshelf">`)
+	b.WriteString(`<section class="volo-embed-bookshelf"` + extraAttrs + `>`)
 	for _, bk := range books {
 		bookHref := "/books/" + url.PathEscape(bk.Slug)
 		b.WriteString(`<a class="volo-book-tile" href="` + bookHref + `" data-book-slug="` + html.EscapeString(bk.Slug) + `">`)
@@ -938,10 +1642,12 @@ func isSafeImageSrc(src string) bool {
 var timestampTokenRe = regexp.MustCompile(`\[(\d{1,2}):([0-5]\d)(?::([0-5]\d))?\]`)
 
 func injectAudioTimestamps(htmlSrc string) string {
-	// Walk HTML tags so we NEVER rewrite timestamps inside <code>, <pre>, <a>, or HTML attributes!
+	// Walk HTML tags so we NEVER rewrite timestamps inside <code>, <pre>, <a>, <button>, math containers, or HTML attributes!
 	var out strings.Builder
 	out.Grow(len(htmlSrc) + 64)
 	skipDepth := 0
+	mathSpanDepth := 0
+	mathDivDepth := 0
 	i := 0
 	for i < len(htmlSrc) {
 		if htmlSrc[i] == '<' {
@@ -952,7 +1658,15 @@ func injectAudioTimestamps(htmlSrc string) string {
 			}
 			tag := htmlSrc[i : i+end+1]
 			lowerTag := strings.ToLower(tag)
-			if strings.HasPrefix(lowerTag, "<code") || strings.HasPrefix(lowerTag, "<pre") || strings.HasPrefix(lowerTag, "<a ") || lowerTag == "<a>" || strings.HasPrefix(lowerTag, "<button") {
+			if strings.HasPrefix(lowerTag, "<span") && strings.Contains(lowerTag, "volo-math-inline") {
+				mathSpanDepth++
+			} else if strings.HasPrefix(lowerTag, "</span") && mathSpanDepth > 0 {
+				mathSpanDepth--
+			} else if strings.HasPrefix(lowerTag, "<div") && strings.Contains(lowerTag, "volo-math-block") {
+				mathDivDepth++
+			} else if strings.HasPrefix(lowerTag, "</div") && mathDivDepth > 0 {
+				mathDivDepth--
+			} else if strings.HasPrefix(lowerTag, "<code") || strings.HasPrefix(lowerTag, "<pre") || strings.HasPrefix(lowerTag, "<a ") || lowerTag == "<a>" || strings.HasPrefix(lowerTag, "<button") {
 				skipDepth++
 			} else if strings.HasPrefix(lowerTag, "</code") || strings.HasPrefix(lowerTag, "</pre") || strings.HasPrefix(lowerTag, "</a") || strings.HasPrefix(lowerTag, "</button") {
 				if skipDepth > 0 {
@@ -972,7 +1686,7 @@ func injectAudioTimestamps(htmlSrc string) string {
 			textSeg = htmlSrc[i : i+nextTag]
 			i += nextTag
 		}
-		if skipDepth > 0 || !strings.Contains(textSeg, "[") {
+		if skipDepth > 0 || mathSpanDepth > 0 || mathDivDepth > 0 || !strings.Contains(textSeg, "[") {
 			out.WriteString(textSeg)
 			continue
 		}
@@ -1061,34 +1775,399 @@ func ComputeReadingStats(plainText string) (wordCount int, readingMinutes int) {
 	return total, mins
 }
 
-func containsMathSyntax(line string) bool {
-	// Strip inline backtick spans first so `$HOME` in code spans never triggers KaTeX!
-	clean := stripInlineCodeSpans(line)
-	if strings.Contains(clean, "$$") || strings.Contains(clean, `\(`) || strings.Contains(clean, `\[`) {
+func countPrecedingBackslashes(s string, pos int) int {
+	n := 0
+	for pos-1-n >= 0 && s[pos-1-n] == '\\' {
+		n++
+	}
+	return n
+}
+
+func findUnescapedDelim(s string, delim string) int {
+	offset := 0
+	for offset <= len(s)-len(delim) {
+		idx := strings.Index(s[offset:], delim)
+		if idx < 0 {
+			return -1
+		}
+		absIdx := offset + idx
+		if countPrecedingBackslashes(s, absIdx)%2 == 0 {
+			return absIdx
+		}
+		offset = absIdx + 1
+	}
+	return -1
+}
+
+// tryExtractBlockMath extracts standalone single-line or multi-line `$$...$$` and `\[...\]` display math blocks.
+func tryExtractBlockMath(lines []string, startIdx int, info blockLineInfo, rest string) (body string, nextIdx int, ok bool) {
+	var openDelim, closeDelim string
+	if strings.HasPrefix(rest, "$$") {
+		openDelim, closeDelim = "$$", "$$"
+	} else if strings.HasPrefix(rest, `\[`) {
+		openDelim, closeDelim = `\[`, `\]`
+	} else {
+		return "", 0, false
+	}
+
+	firstAfterOpen := rest[len(openDelim):]
+	if cIdx := findUnescapedDelim(firstAfterOpen, closeDelim); cIdx >= 0 {
+		if strings.TrimSpace(firstAfterOpen[cIdx+len(closeDelim):]) == "" {
+			return firstAfterOpen[:cIdx], startIdx + 1, true
+		}
+		return "", 0, false
+	}
+
+	var middleLines []string
+	for j := startIdx + 1; j < len(lines); j++ {
+		if jRest, jOk := parseChildBlockLine(lines[j], info.activeIndent); jOk {
+			if _, _, fOk := parseFenceStart(jRest); fOk {
+				return "", 0, false
+			}
+			if strings.HasPrefix(jRest, ":::") {
+				return "", 0, false
+			}
+		}
+		stripped := strings.TrimRight(stripBlockPrefixCols(lines[j], info.quoteDepth, info.stripCols), "\r")
+		if endPos := findUnescapedDelim(stripped, closeDelim); endPos >= 0 {
+			if strings.TrimSpace(stripped[endPos+len(closeDelim):]) == "" {
+				var parts []string
+				if strings.TrimSpace(firstAfterOpen) != "" {
+					parts = append(parts, firstAfterOpen)
+				}
+				parts = append(parts, middleLines...)
+				if strings.TrimSpace(stripped[:endPos]) != "" {
+					parts = append(parts, stripped[:endPos])
+				}
+				return strings.Join(parts, "\n"), j + 1, true
+			}
+		}
+		middleLines = append(middleLines, stripped)
+	}
+	return "", 0, false
+}
+
+func isASCIIWordByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
+}
+
+func isInlineSpaceByte(b byte) bool {
+	return b == ' ' || b == '\t'
+}
+
+// isReferenceLinkDefLine reports whether `line` is a CommonMark link reference definition (`[id]: url ...`),
+// excluding GFM footnote definitions (`[^1]: ...`), wiki-links (`[[...]]`), and GitHub alerts (`[!NOTE]`).
+func isReferenceLinkDefLine(line string) bool {
+	_, pos := scanBlockquotePrefix(line)
+	col, indentBytes := measureLeadingIndent(line[pos:])
+	if col > 3 {
+		return false
+	}
+	s := line[pos+indentBytes:]
+	if len(s) < 4 || s[0] != '[' || s[1] == '^' || s[1] == '[' || s[1] == '!' {
+		return false
+	}
+	closeIdx := -1
+	for k := 1; k < len(s); k++ {
+		if s[k] == '\\' && k+1 < len(s) {
+			k++
+			continue
+		}
+		if s[k] == '[' {
+			return false
+		}
+		if s[k] == ']' {
+			closeIdx = k
+			break
+		}
+	}
+	if closeIdx <= 1 || closeIdx+1 >= len(s) || s[closeIdx+1] != ':' {
+		return false
+	}
+	dest := strings.TrimSpace(s[closeIdx+2:])
+	return dest != ""
+}
+
+// scanMarkdownLinkDestEnd scans `](...)` starting at `bracketPos` (where `line[bracketPos] == ']'`
+// and `line[bracketPos+1] == '('`), honoring balanced parentheses, backslash escapes, `<...>` destinations,
+// and optional quoted link titles. Returns the index immediately after the closing `)`, or -1 if unclosed.
+func scanMarkdownLinkDestEnd(line string, bracketPos int) int {
+	if bracketPos+1 >= len(line) || line[bracketPos] != ']' || line[bracketPos+1] != '(' {
+		return -1
+	}
+	if countPrecedingBackslashes(line, bracketPos)%2 == 1 {
+		return -1
+	}
+	q := bracketPos + 2
+	for q < len(line) && isInlineSpaceByte(line[q]) {
+		q++
+	}
+	if q < len(line) && line[q] == '<' {
+		q++
+		for q < len(line) && line[q] != '>' {
+			if line[q] == '\\' && q+1 < len(line) {
+				q += 2
+				continue
+			}
+			if line[q] == '<' {
+				return -1
+			}
+			q++
+		}
+		if q >= len(line) {
+			return -1
+		}
+		q++ // past '>'
+	}
+	depth := 1
+	for q < len(line) && depth > 0 {
+		ch := line[q]
+		if ch == '\\' && q+1 < len(line) {
+			q += 2
+			continue
+		}
+		if (ch == '"' || ch == '\'') && q > bracketPos+2 && isInlineSpaceByte(line[q-1]) {
+			quote := ch
+			q++
+			for q < len(line) && line[q] != quote {
+				if line[q] == '\\' && q+1 < len(line) {
+					q += 2
+					continue
+				}
+				q++
+			}
+			if q < len(line) {
+				q++
+			}
+			continue
+		}
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+		}
+		q++
+	}
+	if depth == 0 {
+		return q
+	}
+	return -1
+}
+
+func isMathStartAfterCurrencyDollar(b byte) bool {
+	switch b {
+	case '\\', '{', '(', '[', '-', '+', '|':
 		return true
-	}
-	first := strings.IndexByte(clean, '$')
-	if first < 0 {
+	default:
 		return false
 	}
-	if first > 0 && clean[first-1] == '\\' {
-		return false
+}
+
+// findClosingBacktickRun locates the matching CommonMark closing backtick run of exact length `tickLen`
+// starting at `searchStart`, or returns -1 if unmatched.
+func findClosingBacktickRun(line string, searchStart int, tickLen int) int {
+	for k := searchStart; k < len(line); {
+		if line[k] != '`' {
+			k++
+			continue
+		}
+		run := 0
+		for k+run < len(line) && line[k+run] == '`' {
+			run++
+		}
+		if run == tickLen {
+			return k
+		}
+		k += run
 	}
-	second := strings.IndexByte(clean[first+1:], '$')
-	return second > 0
+	return -1
+}
+
+// extractLineMath scans a single Markdown line outside CommonMark inline code spans, raw HTML tags/comments,
+// Markdown link destinations `](...)`, and URLs, replacing display math (`$$...$$`, `\[...\]`) and inline math
+// (`\(...\)`, `$...$`) with safe alphanumeric placeholders while preserving currency (`$100 and $200`, `预算$100，公式$\alpha$`).
+func extractLineMath(line string, nextToken func(string) string, replacements map[string]string) (string, bool) {
+	if !strings.Contains(line, "$") && !strings.Contains(line, `\(`) && !strings.Contains(line, `\[`) {
+		return line, false
+	}
+	if isReferenceLinkDefLine(line) {
+		return line, false
+	}
+
+	var out strings.Builder
+	out.Grow(len(line))
+	foundMath := false
+
+	for p := 0; p < len(line); {
+		ch := line[p]
+
+		// 1. CommonMark inline backtick code spans (exact run-length matching).
+		if ch == '`' {
+			tickLen := 0
+			for p+tickLen < len(line) && line[p+tickLen] == '`' {
+				tickLen++
+			}
+			if closeIdx := findClosingBacktickRun(line, p+tickLen, tickLen); closeIdx >= 0 {
+				out.WriteString(line[p : closeIdx+tickLen])
+				p = closeIdx + tickLen
+				continue
+			}
+			out.WriteString(line[p : p+tickLen])
+			p += tickLen
+			continue
+		}
+
+		// 2. Raw HTML tags (`<div attr="a > b $1 $2">`), HTML comments (`<!-- ... -->`), and inline `<pre>...</pre>`.
+		if ch == '<' && p+1 < len(line) {
+			if tagEnd := scanHTMLTagOrCommentEnd(line, p); tagEnd > p {
+				lowerTag := strings.ToLower(line[p:tagEnd])
+				if hasHTMLTagOpen(lowerTag, "pre") && !strings.HasSuffix(strings.TrimSpace(lowerTag), "/>") {
+					if closeRel := findCaseInsensitivePreCloseEnd(line[tagEnd:]); closeRel >= 0 {
+						endPre := tagEnd + closeRel
+						out.WriteString(line[p:endPre])
+						p = endPre
+						continue
+					}
+				}
+				out.WriteString(line[p:tagEnd])
+				p = tagEnd
+				continue
+			}
+		}
+
+		// 2b. Markdown inline link/image destination `](...)` with balanced parentheses.
+		if ch == ']' && p+1 < len(line) && line[p+1] == '(' {
+			if destEnd := scanMarkdownLinkDestEnd(line, p); destEnd > p {
+				out.WriteString(line[p:destEnd])
+				p = destEnd
+				continue
+			}
+		}
+
+		// 2c. Bare URLs and paths (`https://...`, `http://...`, `www....`, custom `scheme://...`).
+		if urlEnd := skipURLOrPathToken(line, p); urlEnd > p {
+			out.WriteString(line[p:urlEnd])
+			p = urlEnd
+			continue
+		}
+
+		// 3. Backslash sequences (`\[...\]`, `\(...\)`, `\$`, `\\`, etc.).
+		if ch == '\\' && p+1 < len(line) {
+			next := line[p+1]
+			if next == '[' {
+				if endRel := findUnescapedDelim(line[p+2:], `\]`); endRel >= 0 {
+					body := line[p+2 : p+2+endRel]
+					tok := nextToken("MATHBLOCK")
+					replacements[tok] = `<div class="volo-math-block">$$` + html.EscapeString(body) + `$$</div>`
+					out.WriteString(tok)
+					foundMath = true
+					p += 2 + endRel + 2
+					continue
+				}
+			} else if next == '(' {
+				if endRel := findUnescapedDelim(line[p+2:], `\)`); endRel >= 0 {
+					body := line[p+2 : p+2+endRel]
+					tok := nextToken("MATHINLINE")
+					replacements[tok] = `<span class="volo-math-inline">$` + html.EscapeString(body) + `$</span>`
+					out.WriteString(tok)
+					foundMath = true
+					p += 2 + endRel + 2
+					continue
+				}
+			}
+			out.WriteString(line[p : p+2])
+			p += 2
+			continue
+		}
+
+		// 4. Unescaped `$` or `$$`.
+		if ch == '$' {
+			if p+1 < len(line) && line[p+1] == '$' {
+				if endRel := findUnescapedDelim(line[p+2:], "$$"); endRel >= 0 {
+					body := line[p+2 : p+2+endRel]
+					tok := nextToken("MATHBLOCK")
+					replacements[tok] = `<div class="volo-math-block">$$` + html.EscapeString(body) + `$$</div>`
+					out.WriteString(tok)
+					foundMath = true
+					p += 2 + endRel + 2
+					continue
+				}
+				// Unclosed `$$` run: emit literally.
+				run := 2
+				for p+run < len(line) && line[p+run] == '$' {
+					run++
+				}
+				out.WriteString(line[p : p+run])
+				p += run
+				continue
+			}
+
+			// Single `$` inline math:
+			// - Must not be preceded by ASCII word byte (e.g., `US$50`)
+			// - Must not start with unescaped whitespace
+			// - Scan to next unescaped `$` (never crossing `` ` `` or `$$`):
+			//   - Must not end with unescaped whitespace
+			//   - Must not be immediately followed by an ASCII digit/word byte or `$`
+			//   - Currency-bridging guard: when opening `$` starts with digits (`$100`) and the next `$`
+			//     is followed by `\`, `{`, `(`, `[`, `-`, `+`, `|` (`预算$100，公式$\alpha$`), treat `$100` as currency!
+			if (p == 0 || !isASCIIWordByte(line[p-1])) && p+1 < len(line) && !isInlineSpaceByte(line[p+1]) {
+				opensWithDigit := line[p+1] >= '0' && line[p+1] <= '9'
+				closeIdx := -1
+				for q := p + 1; q < len(line); q++ {
+					if line[q] == '`' {
+						break
+					}
+					if line[q] == '$' && countPrecedingBackslashes(line[p+1:], q-(p+1))%2 == 0 {
+						if q+1 < len(line) && line[q+1] == '$' {
+							break
+						}
+						prevUnescapedSpace := isInlineSpaceByte(line[q-1]) && countPrecedingBackslashes(line[p+1:], (q-1)-(p+1))%2 == 0
+						nextWordOrDollar := q+1 < len(line) && (isASCIIWordByte(line[q+1]) || line[q+1] == '$')
+						currencyBridge := opensWithDigit && q+1 < len(line) && isMathStartAfterCurrencyDollar(line[q+1])
+						if !prevUnescapedSpace && !nextWordOrDollar && !currencyBridge {
+							closeIdx = q
+						}
+						// Always stop at the first unescaped `$` so failed currency `$` never bridges into later math.
+						break
+					}
+				}
+				if closeIdx > p+1 {
+					body := line[p+1 : closeIdx]
+					tok := nextToken("MATHINLINE")
+					replacements[tok] = `<span class="volo-math-inline">$` + html.EscapeString(body) + `$</span>`
+					out.WriteString(tok)
+					foundMath = true
+					p = closeIdx + 1
+					continue
+				}
+			}
+		}
+
+		out.WriteByte(ch)
+		p++
+	}
+
+	return out.String(), foundMath
 }
 
 func stripInlineCodeSpans(line string) string {
 	var b strings.Builder
-	inCode := false
-	for i := 0; i < len(line); i++ {
-		if line[i] == '`' {
-			inCode = !inCode
+	for p := 0; p < len(line); {
+		if line[p] == '`' {
+			tickLen := 0
+			for p+tickLen < len(line) && line[p+tickLen] == '`' {
+				tickLen++
+			}
+			if closeIdx := findClosingBacktickRun(line, p+tickLen, tickLen); closeIdx >= 0 {
+				p = closeIdx + tickLen
+				continue
+			}
+			b.WriteString(line[p : p+tickLen])
+			p += tickLen
 			continue
 		}
-		if !inCode {
-			b.WriteByte(line[i])
-		}
+		b.WriteByte(line[p])
+		p++
 	}
 	return b.String()
 }
@@ -1099,10 +2178,18 @@ func rewriteWikiLinksOutsideCode(line string) string {
 	if !strings.Contains(line, "[[") {
 		return line
 	}
-	// Preserve inline code spans untouched.
-	parts := strings.Split(line, "`")
-	for i := 0; i < len(parts); i += 2 {
-		parts[i] = wikiLinkRe.ReplaceAllStringFunc(parts[i], func(m string) string {
+	if isReferenceLinkDefLine(line) {
+		return line
+	}
+	var out strings.Builder
+	out.Grow(len(line))
+	lastPlain := 0
+	flushPlain := func(end int) {
+		if end <= lastPlain {
+			return
+		}
+		seg := line[lastPlain:end]
+		out.WriteString(wikiLinkRe.ReplaceAllStringFunc(seg, func(m string) string {
 			sub := wikiLinkRe.FindStringSubmatch(m)
 			if len(sub) < 2 {
 				return m
@@ -1113,9 +2200,180 @@ func rewriteWikiLinksOutsideCode(line string) string {
 				label = strings.TrimSpace(sub[2])
 			}
 			return fmt.Sprintf("[%s](/posts/%s)", label, url.PathEscape(slug))
-		})
+		}))
 	}
-	return strings.Join(parts, "`")
+	for p := 0; p < len(line); {
+		if line[p] == '`' {
+			tickLen := 0
+			for p+tickLen < len(line) && line[p+tickLen] == '`' {
+				tickLen++
+			}
+			if closeIdx := findClosingBacktickRun(line, p+tickLen, tickLen); closeIdx >= 0 {
+				flushPlain(p)
+				out.WriteString(line[p : closeIdx+tickLen])
+				p = closeIdx + tickLen
+				lastPlain = p
+				continue
+			}
+			p += tickLen
+			continue
+		}
+		if line[p] == '<' && p+1 < len(line) {
+			if tagEnd := scanHTMLTagOrCommentEnd(line, p); tagEnd > p {
+				flushPlain(p)
+				lowerTag := strings.ToLower(line[p:tagEnd])
+				if hasHTMLTagOpen(lowerTag, "pre") && !strings.HasSuffix(strings.TrimSpace(lowerTag), "/>") {
+					if closeRel := findCaseInsensitivePreCloseEnd(line[tagEnd:]); closeRel >= 0 {
+						endPre := tagEnd + closeRel
+						out.WriteString(line[p:endPre])
+						p = endPre
+						lastPlain = p
+						continue
+					}
+				}
+				out.WriteString(line[p:tagEnd])
+				p = tagEnd
+				lastPlain = p
+				continue
+			}
+		}
+		if line[p] == ']' && p+1 < len(line) && line[p+1] == '(' {
+			if destEnd := scanMarkdownLinkDestEnd(line, p); destEnd > p {
+				flushPlain(p)
+				out.WriteString(line[p:destEnd])
+				p = destEnd
+				lastPlain = p
+				continue
+			}
+		}
+		p++
+	}
+	flushPlain(len(line))
+	return out.String()
+}
+
+func isGoldmarkLinkifiedURL(tok string) bool {
+	if len(tok) >= 4 && strings.EqualFold(tok[:4], "www.") {
+		return true
+	}
+	colon := strings.IndexByte(tok, ':')
+	if colon <= 0 {
+		return false
+	}
+	switch strings.ToLower(tok[:colon]) {
+	case "http", "https", "ftp", "mailto":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeTildeProtectedToken(out *strings.Builder, tok string) {
+	if isGoldmarkLinkifiedURL(tok) || !strings.Contains(tok, "~") {
+		out.WriteString(tok)
+		return
+	}
+	// Escape `~` as `&#126;` in plain-text file paths (`/~user/file~1~2`, `~/dir/file~1~`) and custom
+	// deep-link URLs (`huanai://open/~u/a~1~`) so Goldmark's GFM Strikethrough extension does not
+	// rewrite `~user/file~` into `<del>user/file</del>` before HTML rendering!
+	for i := 0; i < len(tok); i++ {
+		if tok[i] == '~' {
+			out.WriteString("&#126;")
+		} else {
+			out.WriteByte(tok[i])
+		}
+	}
+}
+
+func rewriteSubscriptOutsideCode(line string) string {
+	if !strings.Contains(line, "~") {
+		return line
+	}
+	if isReferenceLinkDefLine(line) {
+		return line
+	}
+	var out strings.Builder
+	out.Grow(len(line) + 16)
+	for p := 0; p < len(line); {
+		if line[p] == '`' {
+			tickLen := 0
+			for p+tickLen < len(line) && line[p+tickLen] == '`' {
+				tickLen++
+			}
+			if closeIdx := findClosingBacktickRun(line, p+tickLen, tickLen); closeIdx >= 0 {
+				out.WriteString(line[p : closeIdx+tickLen])
+				p = closeIdx + tickLen
+				continue
+			}
+			out.WriteString(line[p : p+tickLen])
+			p += tickLen
+			continue
+		}
+		if line[p] == '<' && p+1 < len(line) {
+			if tagEnd := scanHTMLTagOrCommentEnd(line, p); tagEnd > p {
+				lowerTag := strings.ToLower(line[p:tagEnd])
+				if hasHTMLTagOpen(lowerTag, "pre") && !strings.HasSuffix(strings.TrimSpace(lowerTag), "/>") {
+					if closeRel := findCaseInsensitivePreCloseEnd(line[tagEnd:]); closeRel >= 0 {
+						endPre := tagEnd + closeRel
+						out.WriteString(line[p:endPre])
+						p = endPre
+						continue
+					}
+				}
+				out.WriteString(line[p:tagEnd])
+				p = tagEnd
+				continue
+			}
+		}
+		if line[p] == ']' && p+1 < len(line) && line[p+1] == '(' {
+			if destEnd := scanMarkdownLinkDestEnd(line, p); destEnd > p {
+				out.WriteString(line[p:destEnd])
+				p = destEnd
+				continue
+			}
+		}
+		if urlOrPathEnd := skipURLOrPathToken(line, p); urlOrPathEnd > p {
+			writeTildeProtectedToken(&out, line[p:urlOrPathEnd])
+			p = urlOrPathEnd
+			continue
+		}
+		if line[p] == '~' && p > 0 && line[p-1] == '/' && (p+1 == len(line) || line[p+1] != '~') {
+			out.WriteString("&#126;")
+			p++
+			continue
+		}
+		if p+2 < len(line) && line[p] == '~' &&
+			(p == 0 || (line[p-1] != '~' && line[p-1] != '\\' && line[p-1] != '/')) &&
+			line[p+1] != '~' && line[p+1] != '/' && !isASCIIWhitespace(line[p+1]) {
+			limit := len(line)
+			if p+48 < limit {
+				limit = p + 48
+			}
+			closed := -1
+			for q := p + 1; q < limit; q++ {
+				ch := line[q]
+				if isASCIIWhitespace(ch) || ch == '<' || ch == '>' || ch == '`' || ch == '[' || ch == ']' || ch == '/' {
+					break
+				}
+				if ch == '~' {
+					if q > p+1 && line[q-1] != '\\' && (q+1 == len(line) || line[q+1] != '~') {
+						closed = q
+					}
+					break
+				}
+			}
+			if closed > p+1 {
+				out.WriteString("<sub>")
+				out.WriteString(html.EscapeString(line[p+1 : closed]))
+				out.WriteString("</sub>")
+				p = closed + 1
+				continue
+			}
+		}
+		out.WriteByte(line[p])
+		p++
+	}
+	return out.String()
 }
 
 var internalPostLinkRe = regexp.MustCompile(`(?:/posts/|/articles/\d{4}/\d{2}/\d{2}/)([a-zA-Z0-9._-]+?)(?:\.html)?(?:[)"'\s#?]|$)`)
@@ -1147,7 +2405,7 @@ func ExtractOutboundPostSlugs(rawMarkdown string) []string {
 }
 
 // StripLockedMarkdownBlocks is an alias for StripAllLockBlocks, removing all `:::lock ... :::` blocks
-// outside fenced code blocks while honoring CommonMark indentation, blockquotes, and nested directives.
+// outside fenced code blocks while honoring CommonMark indentation, blockquotes, list items, and nested directives.
 func StripLockedMarkdownBlocks(src string) string {
 	return StripAllLockBlocks(src)
 }
@@ -1162,52 +2420,69 @@ func StripAllLockBlocks(src string) string {
 	lines := strings.Split(normalized, "\n")
 	out := make([]string, 0, len(lines))
 
+	var tracker blockLineTracker
 	inFence := false
 	var fenceChar byte
 	fenceLen := 0
+	fenceIndent := 0
 	inLock := false
 	lockNestDepth := 0
+	lockIndent := 0
 
 	for _, line := range lines {
-		if _, rest, lineOk := parseBlockLinePrefix(line); lineOk {
-			if ch, n, ok := parseFenceStart(rest); ok {
-				if !inFence {
+		if inFence {
+			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
+				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
+					inFence = false
+				}
+			}
+			if !inLock {
+				out = append(out, line)
+			}
+			continue
+		}
+		if inLock {
+			if rest, ok := parseChildBlockLine(line, lockIndent); ok {
+				if ch, n, fOk := parseFenceStart(rest); fOk {
 					inFence = true
 					fenceChar = ch
 					fenceLen = n
-				} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
-					inFence = false
-				}
-				if !inLock {
-					out = append(out, line)
-				}
-				continue
-			}
-			if !inFence {
-				if !inLock && isDirectivePrefix(rest, ":::lock") {
-					inLock = true
-					lockNestDepth = 0
+					fenceIndent = lockIndent
 					continue
 				}
-				if inLock {
-					if rest == ":::" {
-						if lockNestDepth > 0 {
-							lockNestDepth--
-							continue
-						}
-						inLock = false
+				if rest == ":::" {
+					if lockNestDepth > 0 {
+						lockNestDepth--
 						continue
 					}
-					if isOpeningBlockDirective(rest) {
-						lockNestDepth++
-					}
+					inLock = false
 					continue
 				}
+				if isOpeningBlockDirective(rest) {
+					lockNestDepth++
+				}
+			}
+			continue
+		}
+
+		info := tracker.next(line)
+		if info.ok {
+			if ch, n, ok := parseFenceStart(info.rest); ok {
+				inFence = true
+				fenceChar = ch
+				fenceLen = n
+				fenceIndent = info.activeIndent
+				out = append(out, line)
+				continue
+			}
+			if isDirectivePrefix(info.rest, ":::lock") {
+				inLock = true
+				lockNestDepth = 0
+				lockIndent = info.activeIndent
+				continue
 			}
 		}
-		if !inLock {
-			out = append(out, line)
-		}
+		out = append(out, line)
 	}
 	return strings.Join(out, "\n")
 }
@@ -1217,25 +2492,31 @@ func StripAllCodeAndLockBlocks(src string) string {
 	noLock := StripAllLockBlocks(src)
 	lines := strings.Split(strings.ReplaceAll(noLock, "\r\n", "\n"), "\n")
 	out := make([]string, 0, len(lines))
+	var tracker blockLineTracker
 	inFence := false
 	var fenceChar byte
 	fenceLen := 0
+	fenceIndent := 0
 	for _, line := range lines {
-		if _, rest, lineOk := parseBlockLinePrefix(line); lineOk {
-			if ch, n, ok := parseFenceStart(rest); ok {
-				if !inFence {
-					inFence = true
-					fenceChar = ch
-					fenceLen = n
-				} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
+		if inFence {
+			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
+				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
 					inFence = false
 				}
+			}
+			continue
+		}
+		info := tracker.next(line)
+		if info.ok {
+			if ch, n, ok := parseFenceStart(info.rest); ok {
+				inFence = true
+				fenceChar = ch
+				fenceLen = n
+				fenceIndent = info.activeIndent
 				continue
 			}
 		}
-		if !inFence {
-			out = append(out, stripInlineCodeSpans(line))
-		}
+		out = append(out, stripInlineCodeSpans(line))
 	}
 	return strings.Join(out, "\n")
 }
@@ -1244,28 +2525,35 @@ func StripAllCodeAndLockBlocks(src string) string {
 // (or `password="..."`) attributes in order of appearance.
 func ExtractAllLockPasswords(src string) []string {
 	lines := strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
+	var tracker blockLineTracker
 	inFence := false
 	var fenceChar byte
 	fenceLen := 0
+	fenceIndent := 0
 	var out []string
 	seen := make(map[string]struct{})
 	for _, line := range lines {
-		_, rest, lineOk := parseBlockLinePrefix(line)
-		if !lineOk {
-			continue
-		}
-		if ch, n, ok := parseFenceStart(rest); ok {
-			if !inFence {
-				inFence = true
-				fenceChar = ch
-				fenceLen = n
-			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
-				inFence = false
+		if inFence {
+			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
+				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
+					inFence = false
+				}
 			}
 			continue
 		}
-		if !inFence && isDirectivePrefix(rest, ":::lock") {
-			attrs := parseDirectiveAttrs(rest[len(":::lock"):])
+		info := tracker.next(line)
+		if !info.ok {
+			continue
+		}
+		if ch, n, ok := parseFenceStart(info.rest); ok {
+			inFence = true
+			fenceChar = ch
+			fenceLen = n
+			fenceIndent = info.activeIndent
+			continue
+		}
+		if isDirectivePrefix(info.rest, ":::lock") {
+			attrs := parseDirectiveAttrs(info.rest[len(":::lock"):])
 			p := strings.TrimSpace(attrs["pwd"])
 			if p == "" {
 				p = strings.TrimSpace(attrs["password"])
@@ -1294,25 +2582,32 @@ func ExtractFirstLockPassword(src string) string {
 // ContainsLockDirective reports whether src contains at least one `:::lock` directive outside fenced code blocks.
 func ContainsLockDirective(src string) bool {
 	lines := strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
+	var tracker blockLineTracker
 	inFence := false
 	var fenceChar byte
 	fenceLen := 0
+	fenceIndent := 0
 	for _, line := range lines {
-		_, rest, lineOk := parseBlockLinePrefix(line)
-		if !lineOk {
-			continue
-		}
-		if ch, n, ok := parseFenceStart(rest); ok {
-			if !inFence {
-				inFence = true
-				fenceChar = ch
-				fenceLen = n
-			} else if ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
-				inFence = false
+		if inFence {
+			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
+				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
+					inFence = false
+				}
 			}
 			continue
 		}
-		if !inFence && isDirectivePrefix(rest, ":::lock") {
+		info := tracker.next(line)
+		if !info.ok {
+			continue
+		}
+		if ch, n, ok := parseFenceStart(info.rest); ok {
+			inFence = true
+			fenceChar = ch
+			fenceLen = n
+			fenceIndent = info.activeIndent
+			continue
+		}
+		if isDirectivePrefix(info.rest, ":::lock") {
 			return true
 		}
 	}

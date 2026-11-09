@@ -300,5 +300,3 @@ func TestResolveNavMenuIndividualCustomItemsAndSafeDeletion(t *testing.T) {
 		}
 	}
 }
-
-

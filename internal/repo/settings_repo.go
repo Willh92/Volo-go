@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,7 +61,8 @@ func (m *SettingsManager) Revision() uint64 {
 
 // Reload loads all persisted setting domains from the database and swaps the in-memory snapshot atomically.
 func (m *SettingsManager) Reload(ctx context.Context) (domain.SettingsSnapshot, error) {
-	rows, err := sqlx.Select[domain.SettingRecord](ctx, m.store,
+	var rows []domain.SettingRecord
+	err := sqlx.SelectInto(ctx, m.store, &rows,
 		`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings`)
 	if err != nil {
 		return m.Snapshot(), fmt.Errorf("settings: reload query: %w", err)
@@ -179,7 +181,8 @@ func (m *SettingsManager) GetDomain(ctx context.Context, domainName string) (any
 		return nil, 0, fmt.Errorf("settings: unknown domain %q", domainName)
 	}
 	var ver int64 = 1
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec,
 		`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domainName)
 	if err == nil {
 		ver = rec.Version
@@ -210,7 +213,8 @@ func (m *SettingsManager) PatchDomain(ctx context.Context, domainName string, pa
 
 	var newVersion int64
 	err := m.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		existing, err := sqlx.Get[domain.SettingRecord](ctx, tx,
+		var existing domain.SettingRecord
+		err := sqlx.GetInto(ctx, tx, &existing,
 			`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domainName)
 		hasExisting := err == nil
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -258,7 +262,28 @@ func (m *SettingsManager) PatchDomain(ctx context.Context, domainName string, pa
 		delete(patchMap, "webdav_password_set")
 		delete(patchMap, "clear_secrets")
 
+		var replacedCustomVars map[string]any
+		hasCustomVarsOverride := false
+		if domainName == domain.SettingsDomainSite {
+			if rawCV, hasCV := patchMap["custom_vars"]; hasCV {
+				if cvMap, ok := rawCV.(map[string]any); ok {
+					cleanedCV := make(map[string]any, len(cvMap))
+					for k, v := range cvMap {
+						if v != nil {
+							cleanedCV[k] = v
+						}
+					}
+					replacedCustomVars = cleanedCV
+					hasCustomVarsOverride = true
+					delete(patchMap, "custom_vars")
+				}
+			}
+		}
+
 		deepMergeMaps(mergedMap, patchMap)
+		if hasCustomVarsOverride {
+			mergedMap["custom_vars"] = replacedCustomVars
+		}
 		mergedJSON, err := json.Marshal(mergedMap)
 		if err != nil {
 			return err
@@ -351,7 +376,8 @@ func (m *SettingsManager) mergeDomainSecrets(domainName string, patchMap map[str
 
 // GetStorageSecrets decrypts storage credentials for internal runtime use (never exposed via API).
 func (m *SettingsManager) GetStorageSecrets(ctx context.Context) (domain.StorageSecrets, error) {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec,
 		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainStorage)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -364,7 +390,8 @@ func (m *SettingsManager) GetStorageSecrets(ctx context.Context) (domain.Storage
 
 // GetNotificationsSecrets decrypts SMTP credentials for internal mailer use.
 func (m *SettingsManager) GetNotificationsSecrets(ctx context.Context) (domain.NotificationsSecrets, error) {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec,
 		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainNotifications)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -377,7 +404,8 @@ func (m *SettingsManager) GetNotificationsSecrets(ctx context.Context) (domain.N
 
 // GetBackupSecrets decrypts remote cloud backup credentials for internal sync use.
 func (m *SettingsManager) GetBackupSecrets(ctx context.Context) (domain.BackupSecrets, error) {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec,
 		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainBackup)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -390,7 +418,8 @@ func (m *SettingsManager) GetBackupSecrets(ctx context.Context) (domain.BackupSe
 
 // PeekShareTokenSecret reads the current ShareToken HMAC secret from ReadDB with zero write side-effects.
 func (m *SettingsManager) PeekShareTokenSecret(ctx context.Context) string {
-	rec, err := sqlx.Get[domain.SettingRecord](ctx, m.store,
+	var rec domain.SettingRecord
+	err := sqlx.GetInto(ctx, m.store, &rec,
 		`SELECT secret_ciphertext FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
 	if err != nil || rec.SecretCiphertext == "" {
 		return ""
@@ -431,7 +460,8 @@ func (m *SettingsManager) RotateShareTokenSecret(ctx context.Context) (string, e
 	}
 
 	err = m.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		existing, qErr := sqlx.Get[domain.SettingRecord](ctx, tx,
+		var existing domain.SettingRecord
+		qErr := sqlx.GetInto(ctx, tx, &existing,
 			`SELECT domain, value_json, secret_ciphertext, version, updated_at FROM settings WHERE domain = ?`, domain.SettingsDomainSecurity)
 		valJSON := ""
 		ver := int64(1)
@@ -534,6 +564,18 @@ func extractDomainFromSnapshot(s domain.SettingsSnapshot, d string) any {
 	}
 }
 
+var indexNowKeyRe = regexp.MustCompile(`^[a-zA-Z0-9-]{8,128}$`)
+
+func clampSettingInt(val, lo, hi int) int {
+	if val < lo {
+		return lo
+	}
+	if val > hi {
+		return hi
+	}
+	return val
+}
+
 func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 	def := domain.DefaultSettingsSnapshot("zh-CN")
 	switch d {
@@ -591,9 +633,19 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
+		switch strings.ToLower(strings.TrimSpace(v.ListStyle)) {
+		case "summary", "title_only", "full":
+			v.ListStyle = strings.ToLower(strings.TrimSpace(v.ListStyle))
+		default:
+			v.ListStyle = "summary"
+		}
 		if v.PostsPerPage < 1 || v.PostsPerPage > 100 {
 			v.PostsPerPage = 15
 		}
+		v.RecentPostsCount = clampSettingInt(v.RecentPostsCount, 0, 100)
+		v.RelatedPostsCount = clampSettingInt(v.RelatedPostsCount, 0, 100)
+		v.PopularTagsCount = clampSettingInt(v.PopularTagsCount, 0, 100)
+		v.RecentCommentsCount = clampSettingInt(v.RecentCommentsCount, 0, 100)
 		if v.PoWDifficultyBits < 8 || v.PoWDifficultyBits > 24 {
 			v.PoWDifficultyBits = 16
 		}
@@ -612,7 +664,7 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		v.VendorCDNPrefix = cleanVendorPrefix
 		return json.Marshal(v)
 	case domain.SettingsDomainFeed:
-		var v domain.FeedSettings
+		v := def.Feed
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
@@ -621,22 +673,28 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		}
 		return json.Marshal(v)
 	case domain.SettingsDomainSEO:
-		var v domain.SEOSettings
+		v := def.SEO
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
+		}
+		v.IndexNowKey = strings.TrimSpace(StripASCIIControls(v.IndexNowKey))
+		if v.IndexNowKey != "" && !indexNowKeyRe.MatchString(v.IndexNowKey) {
+			return nil, fmt.Errorf("settings: invalid seo.index_now_key %q (must match ^[a-zA-Z0-9-]{8,128}$)", v.IndexNowKey)
 		}
 		if v.GitHubRepos == nil {
 			v.GitHubRepos = []domain.GitHubRepoItem{}
 		}
 		return json.Marshal(v)
 	case domain.SettingsDomainStorage:
-		var v domain.StorageSettings
+		v := def.Storage
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
 		if !isValidStorageDriverID(v.ActiveDriver) {
 			return nil, fmt.Errorf("settings: invalid storage.active_driver %q", v.ActiveDriver)
 		}
+		v.MaxUploadMB = clampSettingInt(v.MaxUploadMB, 1, 2048)
+		v.ImageQuality = clampSettingInt(v.ImageQuality, 1, 100)
 		v.LocalDir = strings.TrimSpace(StripASCIIControls(v.LocalDir))
 		if strings.Contains(v.LocalDir, "..") {
 			return nil, fmt.Errorf("settings: invalid storage.local_dir %q", v.LocalDir)
@@ -654,14 +712,14 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		v.S3SecretKeySet = false
 		return json.Marshal(v)
 	case domain.SettingsDomainNotifications:
-		var v domain.NotificationsSettings
+		v := def.Notifications
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
 		v.SMTPPasswordSet = false
 		return json.Marshal(v)
 	case domain.SettingsDomainSecurity:
-		var v domain.SecuritySettings
+		v := def.Security
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
@@ -671,6 +729,35 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		}
 		v.DynamicLoginPath = normDyn
 		v.GeoIPDir = strings.TrimSpace(StripASCIIControls(v.GeoIPDir))
+		v.GeoDefaultAction = strings.ToLower(strings.TrimSpace(v.GeoDefaultAction))
+		if v.GeoDefaultAction == "" {
+			v.GeoDefaultAction = "allow"
+		}
+		switch v.GeoDefaultAction {
+		case "allow", "deny":
+		default:
+			return nil, fmt.Errorf("settings: invalid security.geo_default_action %q", v.GeoDefaultAction)
+		}
+		v.GeoUnknownAction = strings.ToLower(strings.TrimSpace(v.GeoUnknownAction))
+		if v.GeoUnknownAction == "" {
+			v.GeoUnknownAction = "allow"
+		}
+		switch v.GeoUnknownAction {
+		case "allow", "deny":
+		default:
+			return nil, fmt.Errorf("settings: invalid security.geo_unknown_action %q", v.GeoUnknownAction)
+		}
+		v.TOTPRequiredScope = strings.ToLower(strings.TrimSpace(v.TOTPRequiredScope))
+		if v.TOTPRequiredScope == "" {
+			v.TOTPRequiredScope = "off"
+		}
+		switch v.TOTPRequiredScope {
+		case "off", "admin", "staff":
+		default:
+			return nil, fmt.Errorf("settings: invalid security.totp_required_scope %q", v.TOTPRequiredScope)
+		}
+		v.TOTPRememberDays = clampSettingInt(v.TOTPRememberDays, 0, 365)
+		v.TOTPWindowSteps = clampSettingInt(v.TOTPWindowSteps, 0, 5)
 		return json.Marshal(v)
 	case domain.SettingsDomainAppearance:
 		v := def.Appearance
@@ -682,6 +769,15 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		default:
 			return nil, fmt.Errorf("settings: invalid appearance.accent %q", v.Accent)
 		}
+		v.DefaultMode = strings.ToLower(strings.TrimSpace(v.DefaultMode))
+		if v.DefaultMode == "" {
+			v.DefaultMode = "auto"
+		}
+		switch v.DefaultMode {
+		case "auto", "system", "light", "dark":
+		default:
+			return nil, fmt.Errorf("settings: invalid appearance.default_mode %q", v.DefaultMode)
+		}
 		v.MobileTheme = strings.TrimSpace(v.MobileTheme)
 		if v.MobileTheme == "same" {
 			v.MobileTheme = ""
@@ -692,7 +788,7 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		}
 		return json.Marshal(v)
 	case domain.SettingsDomainBackup:
-		var v domain.BackupSettings
+		v := def.Backup
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
@@ -868,12 +964,42 @@ func sanitizeCustomCSS(css string) string {
 
 const maxSiteInjectionBytes = 65536
 
-// NormalizeSiteInjectionHTML cleans NUL bytes and CRLF line endings while preserving
-// Admin-configured <head> and footer HTML/script snippets (e.g. verification tags,
-// Google AdSense, Analytics, ICP links). Write access is strictly RoleAdmin-only.
+var (
+	siteInjSVGBlockRe      = regexp.MustCompile(`(?is)<svg\b[^>]*>.*?</svg\s*>`)
+	siteInjSVGTagRe        = regexp.MustCompile(`(?is)</?svg\b[^>]*>`)
+	siteInjMathBlockRe     = regexp.MustCompile(`(?is)<math\b[^>]*>.*?</math\s*>`)
+	siteInjMathTagRe       = regexp.MustCompile(`(?is)</?math\b[^>]*>`)
+	siteInjBaseTagRe       = regexp.MustCompile(`(?is)</?base\b[^>]*>`)
+	siteInjMetaRefreshRe   = regexp.MustCompile(`(?is)<meta\b[^>]*\bhttp-equiv\s*=\s*(?:"\s*refresh\s*"|'\s*refresh\s*'|refresh\b)[^>]*>`)
+	siteInjXLinkHrefAttrRe = regexp.MustCompile(`(?is)\s*\bxlink\s*:\s*href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"']*)`)
+)
+
+// NormalizeSiteInjectionHTML cleans NUL bytes and CRLF line endings and strips
+// <svg>, <math>, <base>, <meta http-equiv="refresh">, and xlink:href SMIL XSS vectors
+// while preserving Admin-configured <head> and footer HTML/script snippets.
 func NormalizeSiteInjectionHTML(raw string) string {
 	cleaned := strings.ReplaceAll(raw, "\x00", "")
 	cleaned = strings.ReplaceAll(cleaned, "\r\n", "\n")
+	for {
+		prev := cleaned
+		cleaned = siteInjSVGBlockRe.ReplaceAllString(cleaned, "")
+		cleaned = siteInjSVGTagRe.ReplaceAllString(cleaned, "")
+		cleaned = siteInjMathBlockRe.ReplaceAllString(cleaned, "")
+		cleaned = siteInjMathTagRe.ReplaceAllString(cleaned, "")
+		cleaned = siteInjBaseTagRe.ReplaceAllString(cleaned, "")
+		cleaned = siteInjMetaRefreshRe.ReplaceAllString(cleaned, "")
+		cleaned = siteInjXLinkHrefAttrRe.ReplaceAllString(cleaned, "")
+		for {
+			idx := indexFoldASCII(cleaned, "xlink:href")
+			if idx < 0 {
+				break
+			}
+			cleaned = cleaned[:idx] + cleaned[idx+len("xlink:href"):]
+		}
+		if cleaned == prev {
+			break
+		}
+	}
 	cleaned = strings.TrimSpace(cleaned)
 	if len(cleaned) > maxSiteInjectionBytes {
 		cleaned = strings.TrimSpace(cleaned[:maxSiteInjectionBytes])

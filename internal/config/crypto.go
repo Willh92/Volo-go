@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	secretFileName   = ".secret.key"
-	envelopePrefixV1 = "enc:v1:"
+	secretFileName    = ".secret.key"
+	envelopePrefixV1  = "enc:v1:"
+	secretBoxPrefixV1 = "v1:"
+	secretBoxAAD      = "volo-go:secret-box:v1"
 )
 
 // KeyRing holds domain-separated cryptographic subkeys derived from VOLO_SECRET_KEY
@@ -276,4 +278,83 @@ func CheckSecretKeyFilePerm(dataDir string) (exists bool, mode os.FileMode, err 
 		return true, st.Mode(), fmt.Errorf("secret file %q is a symlink", p)
 	}
 	return true, st.Mode().Perm(), nil
+}
+
+// SecretBox provides domain-separated AES-256-GCM encryption for secret values
+// (such as plugin secret config fields) formatted as "v1:<base64url(nonce||ct||tag)>".
+type SecretBox struct {
+	key [32]byte
+}
+
+// NewSecretBox constructs a SecretBox from a 32-byte key.
+func NewSecretBox(key [32]byte) *SecretBox {
+	return &SecretBox{key: key}
+}
+
+// SecretBox returns a domain-separated SecretBox derived from the KeyRing, or nil if kr is nil.
+func (kr *KeyRing) SecretBox() *SecretBox {
+	if kr == nil {
+		return nil
+	}
+	return &SecretBox{
+		key: hkdfSHA256(kr.dbSecretsKey[:], "volo-go:v1:secret-box-aes-gcm"),
+	}
+}
+
+// Seal encrypts plaintext into a "v1:<base64url>" token. Empty plaintext returns "".
+func (sb *SecretBox) Seal(plaintext string) (string, error) {
+	if sb == nil {
+		return "", errors.New("config: secret box is nil")
+	}
+	if plaintext == "" {
+		return "", nil
+	}
+	block, err := aes.NewCipher(sb.key[:])
+	if err != nil {
+		return "", fmt.Errorf("config: secret box cipher init: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("config: secret box gcm init: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("config: secret box nonce: %w", err)
+	}
+	sealed := gcm.Seal(nonce, nonce, []byte(plaintext), []byte(secretBoxAAD))
+	return secretBoxPrefixV1 + base64.RawURLEncoding.EncodeToString(sealed), nil
+}
+
+// Open decrypts a "v1:<base64url>" token produced by Seal. Empty ciphertext returns "".
+func (sb *SecretBox) Open(ciphertext string) (string, error) {
+	if sb == nil {
+		return "", errors.New("config: secret box is nil")
+	}
+	if ciphertext == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(ciphertext, secretBoxPrefixV1) {
+		return "", errors.New("config: unrecognized secret box prefix")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(ciphertext, secretBoxPrefixV1))
+	if err != nil {
+		return "", fmt.Errorf("config: decode secret box token: %w", err)
+	}
+	block, err := aes.NewCipher(sb.key[:])
+	if err != nil {
+		return "", fmt.Errorf("config: secret box cipher init: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("config: secret box gcm init: %w", err)
+	}
+	if len(raw) < gcm.NonceSize()+gcm.Overhead() {
+		return "", errors.New("config: truncated secret box token")
+	}
+	nonce, ct := raw[:gcm.NonceSize()], raw[gcm.NonceSize():]
+	pt, err := gcm.Open(nil, nonce, ct, []byte(secretBoxAAD))
+	if err != nil {
+		return "", errors.New("config: secret box authentication failed")
+	}
+	return string(pt), nil
 }

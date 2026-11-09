@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -42,6 +43,7 @@ type PublicArticleCard struct {
 	CategorySlug        string       `json:"category_slug,omitempty"`
 	Tags                []domain.Tag `json:"tags,omitempty"`
 	Summary             string       `json:"summary"`
+	FullHTML            string       `json:"full_html,omitempty"`
 	CoverURL            string       `json:"cover_url,omitempty"` // Empty on locked posts -> triggers offline SVG cover-art
 	Lang                string       `json:"lang"`
 	PublishedAt         int64        `json:"published_at"`
@@ -140,13 +142,15 @@ type FeedItem struct {
 
 // Guard enforces the 10-surface content visibility perimeter and stateless ShareToken verification.
 type Guard struct {
-	keys      *config.KeyRing
-	settings  *repo.SettingsManager
-	passports *guest.PassportManager
-	catalog   *i18n.Catalog
-	renderer  *render.Engine
-	cache     *boundedRenderLRU
-	nowFn     func() time.Time
+	keys              *config.KeyRing
+	settings          *repo.SettingsManager
+	passports         *guest.PassportManager
+	catalog           *i18n.Catalog
+	renderer          *render.Engine
+	cache             *boundedRenderLRU
+	nowFn             func() time.Time
+	renderCacheSaltFn atomic.Pointer[func() string]
+	customDirectiveFn atomic.Pointer[func(string, map[string]string, string) (string, bool)]
 }
 
 // NewGuard constructs a ContentVisibilityGuard.
@@ -169,6 +173,50 @@ func NewGuard(
 		cache:     newBoundedRenderLRU(DefaultRenderCacheMaxBytes),
 		nowFn:     time.Now,
 	}
+}
+
+// SetRenderCacheSaltFunc registers an optional dynamic digest callback mixed into Markdown render cache keys.
+func (g *Guard) SetRenderCacheSaltFunc(fn func() string) {
+	if g == nil {
+		return
+	}
+	if fn == nil {
+		g.renderCacheSaltFn.Store(nil)
+		return
+	}
+	g.renderCacheSaltFn.Store(&fn)
+}
+
+// SetCustomDirectiveFunc registers an optional plugin directive renderer for public Markdown blocks.
+func (g *Guard) SetCustomDirectiveFunc(fn func(string, map[string]string, string) (string, bool)) {
+	if g == nil {
+		return
+	}
+	if fn == nil {
+		g.customDirectiveFn.Store(nil)
+		return
+	}
+	g.customDirectiveFn.Store(&fn)
+}
+
+func (g *Guard) customDirective() func(string, map[string]string, string) (string, bool) {
+	if g == nil {
+		return nil
+	}
+	if ptr := g.customDirectiveFn.Load(); ptr != nil {
+		return *ptr
+	}
+	return nil
+}
+
+func (g *Guard) renderCacheSalt() string {
+	if g == nil {
+		return ""
+	}
+	if ptr := g.renderCacheSaltFn.Load(); ptr != nil && *ptr != nil {
+		return (*ptr)()
+	}
+	return ""
 }
 
 // PurgeCache clears cached Markdown render artifacts (e.g. when media asset dimensions are refreshed).
@@ -527,7 +575,8 @@ func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Categor
 		return card
 	}
 
-	ck := cardCacheKey(raw, locale, lookupDims != nil)
+	salt := g.renderCacheSalt()
+	ck := cardCacheKey(raw, locale, lookupDims != nil, salt)
 	if cached, ok := g.cache.getCard(ck); ok {
 		card.Summary = cached.summary
 		card.CoverURL = cached.coverURL
@@ -543,17 +592,11 @@ func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Categor
 
 	// Surface 1 & 2 for `:::lock` posts: physically strip ALL `:::lock ... :::` blocks BEFORE summary & image extraction!
 	safeSummaryMD := render.StripAllLockBlocks(raw.SummaryMD)
-	safeContentMD := render.StripAllLockBlocks(raw.ContentMD)
-
-	renderedContent := g.renderer.Render(safeContentMD, render.Options{
-		Mode:            render.RenderModeWeb,
-		Locale:          locale,
-		ArticleID:       raw.ID,
-		Unlocked:        false,
-		LookupMediaDims: lookupDims,
-	})
-
+	cover := strings.TrimSpace(raw.CoverURL)
+	wordCount := raw.WordCount
+	readingMinutes := raw.ReadingMinutes
 	summaryText := ""
+
 	if strings.TrimSpace(safeSummaryMD) != "" {
 		sumOut := g.renderer.Render(safeSummaryMD, render.Options{
 			Mode:     render.RenderModeWeb,
@@ -561,32 +604,108 @@ func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Categor
 			Unlocked: false,
 		})
 		summaryText = sumOut.PlainText
-	} else {
-		summaryText = truncateRunes(renderedContent.PlainText, 180)
 	}
 
-	cover := strings.TrimSpace(raw.CoverURL)
-	if cover == "" {
-		cover = renderedContent.FirstImageURL
+	if summaryText == "" || cover == "" || wordCount <= 0 || readingMinutes <= 0 {
+		safeContentMD := render.StripAllLockBlocks(raw.ContentMD)
+		renderedContent := g.renderer.Render(safeContentMD, render.Options{
+			Mode:            render.RenderModeWeb,
+			Locale:          locale,
+			ArticleID:       raw.ID,
+			Unlocked:        false,
+			LookupMediaDims: lookupDims,
+		})
+		if summaryText == "" {
+			summaryText = truncateRunes(renderedContent.PlainText, 180)
+		}
+		if cover == "" {
+			cover = renderedContent.FirstImageURL
+		}
+		if wordCount <= 0 {
+			wordCount = renderedContent.WordCount
+		}
+		if readingMinutes <= 0 {
+			readingMinutes = renderedContent.ReadingMinutes
+		}
 	}
 
 	g.cache.putCard(ck, cachedCardMeta{
 		summary:        summaryText,
 		coverURL:       cover,
-		wordCount:      renderedContent.WordCount,
-		readingMinutes: renderedContent.ReadingMinutes,
+		wordCount:      wordCount,
+		readingMinutes: readingMinutes,
 	})
 
 	card.Summary = summaryText
 	card.CoverURL = cover
 	card.HasAudio = strings.TrimSpace(raw.AudioURL) != ""
 	if card.WordCount <= 0 {
-		card.WordCount = renderedContent.WordCount
+		card.WordCount = wordCount
 	}
 	if card.ReadingMinutes <= 0 {
-		card.ReadingMinutes = renderedContent.ReadingMinutes
+		card.ReadingMinutes = readingMinutes
 	}
 	return card
+}
+
+// PopulateCardFullHTML renders sanitized full HTML into card.FullHTML for ListStyle="full" timelines
+// ONLY when the article has no whole-article password and no inline content lock (Surface 1 & 2).
+func (g *Guard) PopulateCardFullHTML(
+	_ context.Context,
+	_ *http.Request,
+	_ *domain.User,
+	raw domain.RawArticle,
+	card *PublicArticleCard,
+) {
+	if g == nil || card == nil {
+		return
+	}
+	card.FullHTML = ""
+	if raw.Status != "" && raw.Status != domain.ArticleStatusPublished {
+		return
+	}
+	if _, isProtected := g.DecryptArticlePassword(raw); isProtected || strings.TrimSpace(raw.PasswordCiphertext) != "" {
+		card.IsPasswordProtected = true
+		return
+	}
+	if raw.HasContentLock || card.HasContentLock || render.ContainsLockDirective(raw.ContentMD) || render.ContainsLockDirective(raw.SummaryMD) {
+		return
+	}
+
+	locale := strings.TrimSpace(card.Lang)
+	showLineNumbers := false
+	if g.settings != nil {
+		snap := g.settings.Snapshot()
+		if locale == "" {
+			locale = strings.TrimSpace(snap.Site.DefaultLocale)
+		}
+		showLineNumbers = snap.Reading.ShowCodeLineNumbers
+	}
+	if locale == "" {
+		locale = "zh-CN"
+	}
+
+	salt := g.renderCacheSalt()
+	outKey := outputCacheKey(raw, render.RenderModeWeb, locale, false, false, nil, false, showLineNumbers, false, salt)
+	out, gotCached := g.cache.getOutput(outKey)
+	if !gotCached {
+		out = g.renderer.Render(raw.ContentMD, render.Options{
+			Mode:            render.RenderModeWeb,
+			Locale:          locale,
+			ArticleID:       raw.ID,
+			Unlocked:        false,
+			HasAudio:        strings.TrimSpace(raw.AudioURL) != "",
+			ShowLineNumbers: showLineNumbers,
+			CustomDirective: g.customDirective(),
+		})
+		if !strings.Contains(raw.ContentMD, ":::book") {
+			g.cache.putOutput(outKey, out)
+		}
+	}
+	if out.HasLockBlock || out.HasUnresolvedLock {
+		return
+	}
+	card.FullHTML = g.renderer.SanitizeHTML(out.HTML)
 }
 
 // --- Surface 3: Adjacent Prev/Next & Related Articles ---
@@ -625,6 +744,7 @@ type DetailRenderDeps struct {
 	LookupBook           func(slug string) (render.BookCardInfo, bool)
 	ListBooks            func() []render.BookCardInfo
 	LookupMediaDims      func(src string) (int, int, bool)
+	CustomDirective      func(name string, attrs map[string]string, body string) (string, bool)
 }
 
 // ToDetail produces a sanitized PublicArticleView for article detail pages.
@@ -689,7 +809,7 @@ func (g *Guard) ToDetail(
 	var gotCached bool
 	var outKey string
 	if cacheableDetail {
-		outKey = outputCacheKey(raw, render.RenderModeWeb, deps.Locale, unattributedUnlocked, status.AuthorOrShareBypass, status.UnlockedPasswords, isReaderLoggedIn, deps.ShowLineNumbers, deps.LookupMediaDims != nil)
+		outKey = outputCacheKey(raw, render.RenderModeWeb, deps.Locale, unattributedUnlocked, status.AuthorOrShareBypass, status.UnlockedPasswords, isReaderLoggedIn, deps.ShowLineNumbers, deps.LookupMediaDims != nil, g.renderCacheSalt())
 		out, gotCached = g.cache.getOutput(outKey)
 	}
 	unlockedMap := status.UnlockedPasswords
@@ -697,6 +817,10 @@ func (g *Guard) ToDetail(
 		unlockedMap = map[string]bool{}
 	}
 	if !gotCached {
+		customDir := deps.CustomDirective
+		if customDir == nil {
+			customDir = g.customDirective()
+		}
 		out = g.renderer.Render(raw.ContentMD, render.Options{
 			Mode:                render.RenderModeWeb,
 			Locale:              deps.Locale,
@@ -710,6 +834,7 @@ func (g *Guard) ToDetail(
 			LookupBook:          deps.LookupBook,
 			ListBooks:           deps.ListBooks,
 			LookupMediaDims:     deps.LookupMediaDims,
+			CustomDirective:     customDir,
 		})
 		if cacheableDetail {
 			g.cache.putOutput(outKey, out)
@@ -820,7 +945,35 @@ func (g *Guard) ToFeedItem(raw domain.RawArticle, fullOutput bool, locale string
 		return FeedItem{}, false
 	}
 
-	fKey := outputCacheKey(raw, render.RenderModeFeed, locale, false, false, nil, false, false, false)
+	if !fullOutput &&
+		!raw.HasContentLock &&
+		!render.ContainsLockDirective(raw.ContentMD) &&
+		strings.TrimSpace(raw.SummaryMD) != "" &&
+		!render.ContainsLockDirective(raw.SummaryMD) {
+		summary := plainTextExcerptFromMarkdown(raw.SummaryMD, 220)
+		absURL := strings.TrimRight(publicBaseURL, "/") + ArticlePath(raw.Slug)
+		audioURL := strings.TrimSpace(raw.AudioURL)
+		if strings.HasPrefix(audioURL, "/") {
+			audioURL = strings.TrimRight(publicBaseURL, "/") + audioURL
+		}
+		return FeedItem{
+			ID:               raw.ID,
+			Title:            raw.Title,
+			URL:              absURL,
+			Summary:          summary,
+			HTML:             "<p>" + html.EscapeString(summary) + "</p>",
+			AuthorName:       authorName,
+			CategoryName:     categoryName,
+			PublishedAt:      raw.PublishedAt,
+			UpdatedAt:        raw.UpdatedAt,
+			AudioURL:         audioURL,
+			AudioDurationSec: raw.AudioDurationSec,
+			AudioSizeBytes:   raw.AudioSizeBytes,
+			AudioMIME:        raw.AudioMIME,
+		}, true
+	}
+
+	fKey := outputCacheKey(raw, render.RenderModeFeed, locale, false, false, nil, false, false, false, g.renderCacheSalt())
 	feedOut, ok := g.cache.getOutput(fKey)
 	if !ok {
 		feedOut = g.renderer.Render(raw.ContentMD, render.Options{
@@ -920,16 +1073,28 @@ func (g *Guard) ToSafeRawMarkdown(raw domain.RawArticle) (string, bool) {
 }
 
 func (g *Guard) protectedNotice(locale string) string {
+	loc := strings.ToLower(strings.TrimSpace(locale))
 	if g.catalog != nil {
 		msg := g.catalog.T(locale, "article.protected_summary")
 		if msg != "article.protected_summary" && msg != "" {
-			return msg
+			needsDistinctScript := strings.HasPrefix(loc, "ja") ||
+				strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant")
+			if !needsDistinctScript ||
+				(msg != g.catalog.T("en-US", "article.protected_summary") && msg != g.catalog.T("zh-CN", "article.protected_summary")) {
+				return msg
+			}
 		}
 	}
-	if strings.HasPrefix(strings.ToLower(locale), "en") {
+	switch {
+	case strings.HasPrefix(loc, "en"):
 		return "This post is password-protected."
+	case strings.HasPrefix(loc, "ja"):
+		return "この記事はパスワードで保護されています。"
+	case strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant"):
+		return "受密碼保護的文章"
+	default:
+		return "受密码保护的文章"
 	}
-	return "受密码保护的文章"
 }
 
 func formatLicense(override string, tmpl string, siteTitle string, title string, author string, fullURL string, pubUnix int64) string {
@@ -959,6 +1124,179 @@ func formatLicense(override string, tmpl string, siteTitle string, title string,
 		"{date}", dateStr,
 	)
 	return r.Replace(src)
+}
+
+func plainTextExcerptFromMarkdown(md string, maxRunes int) string {
+	s := strings.ReplaceAll(md, "\r\n", "\n")
+	var out strings.Builder
+	out.Grow(len(s))
+
+	lines := strings.Split(s, "\n")
+	inFence := false
+	fenceChar := byte(0)
+	for li, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			ch := trimmed[0]
+			if !inFence {
+				inFence = true
+				fenceChar = ch
+				continue
+			}
+			if ch == fenceChar {
+				inFence = false
+				fenceChar = 0
+				continue
+			}
+		}
+		if li > 0 {
+			out.WriteByte(' ')
+		}
+		if inFence {
+			out.WriteString(line)
+			continue
+		}
+		work := strings.TrimLeft(line, " \t")
+		for strings.HasPrefix(work, ">") {
+			work = strings.TrimLeft(work[1:], " \t")
+		}
+		if strings.HasPrefix(work, "#") {
+			j := 0
+			for j < len(work) && j < 6 && work[j] == '#' {
+				j++
+			}
+			if j < len(work) && (work[j] == ' ' || work[j] == '\t') {
+				work = strings.TrimLeft(work[j:], " \t")
+			}
+		}
+		for _, prefix := range []string{"- [ ] ", "- [x] ", "- [X] ", "- ", "* ", "+ "} {
+			if strings.HasPrefix(work, prefix) {
+				work = work[len(prefix):]
+				break
+			}
+		}
+		appendMarkdownInlinePlain(&out, work)
+	}
+
+	collapsed := strings.Join(strings.Fields(out.String()), " ")
+	return truncateRunes(collapsed, maxRunes)
+}
+
+func appendMarkdownInlinePlain(out *strings.Builder, s string) {
+	for i := 0; i < len(s); {
+		if s[i] == '`' {
+			ticks := 0
+			for i+ticks < len(s) && s[i+ticks] == '`' {
+				ticks++
+			}
+			delim := s[i : i+ticks]
+			end := strings.Index(s[i+ticks:], delim)
+			if end >= 0 {
+				code := s[i+ticks : i+ticks+end]
+				if len(code) >= 2 && code[0] == ' ' && code[len(code)-1] == ' ' && strings.TrimSpace(code) != "" {
+					code = code[1 : len(code)-1]
+				}
+				out.WriteString(code)
+				i += ticks + end + ticks
+				continue
+			}
+			out.WriteString(delim)
+			i += ticks
+			continue
+		}
+		if s[i] == '!' && i+1 < len(s) && s[i+1] == '[' {
+			if label, next, ok := parseMarkdownInlineLink(s, i+1); ok {
+				out.WriteString(stripPlainSegmentHTML(label))
+				i = next
+				continue
+			}
+		}
+		if s[i] == '[' {
+			if label, next, ok := parseMarkdownInlineLink(s, i); ok {
+				out.WriteString(stripPlainSegmentHTML(label))
+				i = next
+				continue
+			}
+		}
+		if s[i] == '<' {
+			if strings.HasPrefix(s[i:], "<!--") {
+				if end := strings.Index(s[i+4:], "-->"); end >= 0 {
+					i += 4 + end + 3
+					continue
+				}
+			}
+			if i+1 < len(s) {
+				c1 := s[i+1]
+				if (c1 >= 'a' && c1 <= 'z') || (c1 >= 'A' && c1 <= 'Z') || c1 == '/' || c1 == '!' || c1 == '?' {
+					if end := strings.IndexByte(s[i+1:], '>'); end >= 0 {
+						i += 1 + end + 1
+						continue
+					}
+				}
+			}
+		}
+		if strings.HasPrefix(s[i:], "**") || strings.HasPrefix(s[i:], "__") || strings.HasPrefix(s[i:], "~~") {
+			i += 2
+			continue
+		}
+		if s[i] == '*' {
+			i++
+			continue
+		}
+		if s[i] == '\\' && i+1 < len(s) {
+			out.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
+		out.WriteByte(s[i])
+		i++
+	}
+}
+
+func parseMarkdownInlineLink(s string, openBracket int) (string, int, bool) {
+	depth := 0
+	closeBracket := -1
+	for i := openBracket; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			continue
+		}
+		if s[i] == '[' {
+			depth++
+		} else if s[i] == ']' {
+			depth--
+			if depth == 0 {
+				closeBracket = i
+				break
+			}
+		}
+	}
+	if closeBracket < 0 || closeBracket+1 >= len(s) || s[closeBracket+1] != '(' {
+		return "", 0, false
+	}
+	pDepth := 0
+	for j := closeBracket + 1; j < len(s); j++ {
+		if s[j] == '\\' && j+1 < len(s) {
+			j++
+			continue
+		}
+		if s[j] == '(' {
+			pDepth++
+		} else if s[j] == ')' {
+			pDepth--
+			if pDepth == 0 {
+				return s[openBracket+1 : closeBracket], j + 1, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
+func stripPlainSegmentHTML(seg string) string {
+	var b strings.Builder
+	b.Grow(len(seg))
+	appendMarkdownInlinePlain(&b, seg)
+	return b.String()
 }
 
 func truncateRunes(s string, maxRunes int) string {

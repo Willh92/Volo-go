@@ -1,22 +1,50 @@
 package sqlx
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/pbkdf2"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
+	pgProtocolVersion30 uint32 = 196608   // 3.0 (0x00030000)
+	pgSSLRequestCode    uint32 = 80877103 // (1234 << 16) | 5679
+	pgCancelRequestCode uint32 = 80877102 // (1234 << 16) | 5678
+
+	pgAuthOK                uint32 = 0
+	pgAuthCleartextPassword uint32 = 3
+	pgAuthMD5Password       uint32 = 5
+	pgAuthSASL              uint32 = 10
+	pgAuthSASLContinue      uint32 = 11
+	pgAuthSASLFinal         uint32 = 12
+
+	pgMaxPacketBytes = 256 * 1024 * 1024 // 256 MiB defensive upper bound
+	pgDefaultHost    = "/var/run/postgresql"
+	pgDefaultPort    = uint16(5432)
+
 	pgOIDBool        uint32 = 16
 	pgOIDBytea       uint32 = 17
 	pgOIDInt8        uint32 = 20
@@ -29,23 +57,632 @@ const (
 	pgOIDTimestamptz uint32 = 1184
 )
 
-// pgConnConnector implements database/sql/driver.Connector directly atop github.com/jackc/pgx/v5/pgconn.
-// It uses unnamed extended-protocol ExecParams (PgBouncer / Supabase / Neon transaction-pooler safe)
-// or explicit Simple Query Protocol without linking pgtype's 5,200+ unused geometry/multirange codecs.
-type pgConnConnector struct {
-	cfg            *pgconn.Config
-	simpleProtocol bool
+func init() {
+	sql.Register("volo_pgx", pgConnDriver{})
 }
 
-type pgConnDriver struct{}
+// PostgresFallbackConfig describes an additional failover host:port endpoint in a multi-host DSN.
+type PostgresFallbackConfig struct {
+	Host string
+	Port uint16
+}
 
-func parsePGConnConfig(dsn string, defaultSimple bool) (*pgconn.Config, bool, error) {
-	cfg, err := pgconn.ParseConfig(dsn)
+// PostgresConfig holds parsed PostgreSQL connection parameters from either a URI or keyword/value DSN.
+type PostgresConfig struct {
+	Host      string
+	Port      uint16
+	User      string
+	Password  string
+	Database  string
+	SSLMode   string
+	Params    map[string]string
+	Fallbacks []PostgresFallbackConfig
+}
+
+// Copy returns an independent deep copy of PostgresConfig.
+func (c *PostgresConfig) Copy() *PostgresConfig {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	cp.Params = make(map[string]string, len(c.Params))
+	for k, v := range c.Params {
+		cp.Params[k] = v
+	}
+	if len(c.Fallbacks) > 0 {
+		cp.Fallbacks = make([]PostgresFallbackConfig, len(c.Fallbacks))
+		copy(cp.Fallbacks, c.Fallbacks)
+	}
+	return &cp
+}
+
+type pgHostPort struct {
+	host string
+	port uint16
+}
+
+// ParsePostgresConfig parses both `postgres://` / `postgresql://` URLs (including percent-encoded
+// credentials, `[::1]:5432` IPv6 literals, comma-separated multi-host failover lists, and query params)
+// and libpq keyword/value DSN strings (`host=127.0.0.1 port=5432 user=postgres password='...' dbname=volo`).
+func ParsePostgresConfig(dsn string) (*PostgresConfig, error) {
+	if strings.IndexByte(dsn, 0) >= 0 {
+		return nil, errors.New("sqlx: NUL byte forbidden in postgres DSN")
+	}
+	trimmed := strings.TrimSpace(dsn)
+	if trimmed == "" {
+		return nil, errors.New("sqlx: empty postgres DSN")
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
+		return parsePostgresURL(trimmed)
+	}
+	return parsePostgresKeywordDSN(trimmed)
+}
+
+func parsePostgresURL(raw string) (*PostgresConfig, error) {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] <= 0x20 || raw[i] == 0x7f {
+			return nil, errors.New("sqlx: whitespace or control character forbidden in postgres URL")
+		}
+	}
+	if strings.IndexByte(raw, '#') >= 0 {
+		return nil, errors.New("sqlx: unescaped '#' forbidden in postgres URL (encode '#' as %23)")
+	}
+
+	var afterScheme string
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "postgresql://") {
+		afterScheme = raw[len("postgresql://"):]
+	} else {
+		afterScheme = raw[len("postgres://"):]
+	}
+
+	rest, rawQuery, hasQuery := strings.Cut(afterScheme, "?")
+	cfg := &PostgresConfig{
+		SSLMode: "prefer",
+		Params:  make(map[string]string),
+	}
+
+	authority, rawPath, hasSlash := strings.Cut(rest, "/")
+	if hasSlash && rawPath != "" {
+		dbName, err := url.PathUnescape(rawPath)
+		if err != nil {
+			return nil, fmt.Errorf("sqlx: invalid percent-encoding in postgres database path: %w", err)
+		}
+		if strings.IndexByte(dbName, 0) >= 0 {
+			return nil, errors.New("sqlx: NUL byte forbidden in postgres database name")
+		}
+		cfg.Database = dbName
+	}
+
+	if strings.Count(authority, "@") > 1 {
+		return nil, errors.New("sqlx: unescaped '@' in postgres URL userinfo")
+	}
+	if atIdx := strings.IndexByte(authority, '@'); atIdx >= 0 {
+		userInfo := authority[:atIdx]
+		authority = authority[atIdx+1:]
+		rawUser, rawPass, hasPass := strings.Cut(userInfo, ":")
+		u, err := url.PathUnescape(rawUser)
+		if err != nil {
+			return nil, fmt.Errorf("sqlx: invalid percent-encoding in postgres username: %w", err)
+		}
+		if strings.IndexByte(u, 0) >= 0 {
+			return nil, errors.New("sqlx: NUL byte forbidden in postgres username")
+		}
+		cfg.User = u
+		if hasPass {
+			p, err := url.PathUnescape(rawPass)
+			if err != nil {
+				return nil, fmt.Errorf("sqlx: invalid percent-encoding in postgres password: %w", err)
+			}
+			if strings.IndexByte(p, 0) >= 0 {
+				return nil, errors.New("sqlx: NUL byte forbidden in postgres password")
+			}
+			cfg.Password = p
+		}
+	}
+
+	var endpoints []pgHostPort
+	if authority != "" {
+		parts := strings.Split(authority, ",")
+		endpoints = make([]pgHostPort, 0, len(parts))
+		for _, part := range parts {
+			if part == "" {
+				return nil, errors.New("sqlx: empty host entry in multi-host postgres URL")
+			}
+			ep, err := parseURLHostPort(part, len(parts) > 1)
+			if err != nil {
+				return nil, err
+			}
+			endpoints = append(endpoints, ep)
+		}
+	}
+
+	var queryHostSpec string
+	var hasQueryHost bool
+	var queryPortSpec string
+	var hasQueryPort bool
+
+	if hasQuery && rawQuery != "" {
+		for _, seg := range strings.Split(rawQuery, "&") {
+			if seg == "" {
+				return nil, errors.New("sqlx: empty query parameter in postgres URL")
+			}
+			rk, rv, hasEq := strings.Cut(seg, "=")
+			if !hasEq || rk == "" {
+				return nil, fmt.Errorf("sqlx: malformed query parameter %q in postgres URL", seg)
+			}
+			k, err := url.QueryUnescape(rk)
+			if err != nil {
+				return nil, fmt.Errorf("sqlx: invalid query parameter key %q: %w", rk, err)
+			}
+			v, err := url.QueryUnescape(rv)
+			if err != nil {
+				return nil, fmt.Errorf("sqlx: invalid query parameter value for %q: %w", k, err)
+			}
+			if strings.IndexByte(k, 0) >= 0 || strings.IndexByte(v, 0) >= 0 {
+				return nil, errors.New("sqlx: NUL byte forbidden in postgres query parameter")
+			}
+			kl := strings.ToLower(strings.TrimSpace(k))
+			switch kl {
+			case "host":
+				queryHostSpec = v
+				hasQueryHost = true
+			case "port":
+				queryPortSpec = v
+				hasQueryPort = true
+			case "user":
+				cfg.User = v
+			case "password":
+				cfg.Password = v
+			case "dbname":
+				cfg.Database = v
+			case "sslmode":
+				mode, mErr := normalizeSSLMode(v)
+				if mErr != nil {
+					return nil, mErr
+				}
+				cfg.SSLMode = mode
+			default:
+				cfg.Params[kl] = v
+			}
+		}
+	}
+
+	if err := finalizeEndpointsAndParams(cfg, endpoints, queryHostSpec, hasQueryHost, queryPortSpec, hasQueryPort); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func parseURLHostPort(item string, disallowEmptyHost bool) (pgHostPort, error) {
+	if strings.HasPrefix(item, "[") {
+		closeIdx := strings.IndexByte(item, ']')
+		if closeIdx < 0 {
+			return pgHostPort{}, errors.New("sqlx: unclosed '[' in IPv6 postgres host")
+		}
+		rawIP := item[1:closeIdx]
+		ipStr, err := url.PathUnescape(rawIP)
+		if err != nil || ipStr == "" {
+			return pgHostPort{}, fmt.Errorf("sqlx: invalid IPv6 host %q", item)
+		}
+		addrOnly, _, _ := strings.Cut(ipStr, "%")
+		if parsed := net.ParseIP(addrOnly); parsed == nil || !strings.Contains(addrOnly, ":") {
+			return pgHostPort{}, fmt.Errorf("sqlx: invalid IPv6 address %q in brackets", ipStr)
+		}
+		rem := item[closeIdx+1:]
+		var port uint16
+		if rem != "" {
+			if !strings.HasPrefix(rem, ":") {
+				return pgHostPort{}, fmt.Errorf("sqlx: unexpected trailing characters %q after IPv6 host", rem)
+			}
+			p, pErr := parseStrictPort(rem[1:])
+			if pErr != nil {
+				return pgHostPort{}, pErr
+			}
+			port = p
+		}
+		return pgHostPort{host: ipStr, port: port}, nil
+	}
+
+	if strings.Count(item, ":") > 1 {
+		return pgHostPort{}, fmt.Errorf("sqlx: IPv6 address %q in postgres URL must be enclosed in brackets", item)
+	}
+	if colonIdx := strings.IndexByte(item, ':'); colonIdx >= 0 {
+		rawH := item[:colonIdx]
+		rawP := item[colonIdx+1:]
+		p, err := parseStrictPort(rawP)
+		if err != nil {
+			return pgHostPort{}, err
+		}
+		h, err := url.PathUnescape(rawH)
+		if err != nil {
+			return pgHostPort{}, fmt.Errorf("sqlx: invalid percent-encoding in host %q: %w", rawH, err)
+		}
+		if strings.IndexByte(h, 0) >= 0 {
+			return pgHostPort{}, errors.New("sqlx: NUL byte forbidden in postgres host")
+		}
+		if disallowEmptyHost && h == "" {
+			return pgHostPort{}, errors.New("sqlx: empty host in multi-host postgres URL")
+		}
+		return pgHostPort{host: h, port: p}, nil
+	}
+
+	h, err := url.PathUnescape(item)
+	if err != nil {
+		return pgHostPort{}, fmt.Errorf("sqlx: invalid percent-encoding in host %q: %w", item, err)
+	}
+	if h == "" || strings.IndexByte(h, 0) >= 0 {
+		return pgHostPort{}, errors.New("sqlx: invalid postgres host")
+	}
+	return pgHostPort{host: h}, nil
+}
+
+func parsePostgresKeywordDSN(dsn string) (*PostgresConfig, error) {
+	cfg := &PostgresConfig{
+		SSLMode: "prefer",
+		Params:  make(map[string]string),
+	}
+	var hostSpec string
+	var hasHost bool
+	var portSpec string
+	var hasPort bool
+	pairCount := 0
+
+	i := 0
+	n := len(dsn)
+	for i < n {
+		for i < n && isPGConnSpace(dsn[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		keyStart := i
+		for i < n && isPGKeywordByte(dsn[i]) {
+			i++
+		}
+		if i == keyStart {
+			return nil, fmt.Errorf("sqlx: invalid postgres DSN syntax at offset %d", i)
+		}
+		key := strings.ToLower(dsn[keyStart:i])
+
+		for i < n && isPGConnSpace(dsn[i]) {
+			i++
+		}
+		if i >= n || dsn[i] != '=' {
+			return nil, fmt.Errorf("sqlx: missing '=' after %q in postgres DSN", key)
+		}
+		i++ // consume '='
+		for i < n && isPGConnSpace(dsn[i]) {
+			i++
+		}
+
+		var val string
+		if i < n && dsn[i] == '\'' {
+			i++ // consume opening quote
+			var vb strings.Builder
+			closed := false
+			for i < n {
+				ch := dsn[i]
+				if ch == '\\' {
+					i++
+					if i >= n {
+						return nil, fmt.Errorf("sqlx: unterminated escape in quoted value for %q", key)
+					}
+					vb.WriteByte(dsn[i])
+					i++
+					continue
+				}
+				if ch == '\'' {
+					i++
+					closed = true
+					break
+				}
+				vb.WriteByte(ch)
+				i++
+			}
+			if !closed {
+				return nil, fmt.Errorf("sqlx: unterminated single-quoted value for %q in postgres DSN", key)
+			}
+			if i < n && !isPGConnSpace(dsn[i]) {
+				return nil, fmt.Errorf("sqlx: missing whitespace after quoted value for %q", key)
+			}
+			val = vb.String()
+		} else {
+			var vb strings.Builder
+			for i < n && !isPGConnSpace(dsn[i]) {
+				ch := dsn[i]
+				if ch == '\'' {
+					return nil, fmt.Errorf("sqlx: unexpected quote inside unquoted value for %q", key)
+				}
+				if ch == '\\' {
+					i++
+					if i >= n {
+						return nil, fmt.Errorf("sqlx: trailing backslash in value for %q", key)
+					}
+					vb.WriteByte(dsn[i])
+					i++
+					continue
+				}
+				vb.WriteByte(ch)
+				i++
+			}
+			val = vb.String()
+		}
+
+		pairCount++
+		switch key {
+		case "host":
+			hostSpec = val
+			hasHost = true
+		case "port":
+			portSpec = val
+			hasPort = true
+		case "user":
+			cfg.User = val
+		case "password":
+			cfg.Password = val
+		case "dbname":
+			cfg.Database = val
+		case "sslmode":
+			mode, err := normalizeSSLMode(val)
+			if err != nil {
+				return nil, err
+			}
+			cfg.SSLMode = mode
+		default:
+			cfg.Params[key] = val
+		}
+	}
+
+	if pairCount == 0 {
+		return nil, errors.New("sqlx: empty postgres DSN")
+	}
+	if err := finalizeEndpointsAndParams(cfg, nil, hostSpec, hasHost, portSpec, hasPort); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func finalizeEndpointsAndParams(
+	cfg *PostgresConfig,
+	urlEndpoints []pgHostPort,
+	hostSpec string,
+	hasHostSpec bool,
+	portSpec string,
+	hasPortSpec bool,
+) error {
+	endpoints := urlEndpoints
+	if hasHostSpec {
+		if strings.TrimSpace(hostSpec) == "" {
+			return errors.New("sqlx: empty host parameter in postgres DSN")
+		}
+		parts := strings.Split(hostSpec, ",")
+		parsed := make([]pgHostPort, 0, len(parts))
+		for _, rawPart := range parts {
+			part := strings.TrimSpace(rawPart)
+			if part == "" {
+				return errors.New("sqlx: empty host entry in multi-host postgres DSN")
+			}
+			ep, err := parseKeywordHostItem(part)
+			if err != nil {
+				return err
+			}
+			parsed = append(parsed, ep)
+		}
+		if len(endpoints) == 0 {
+			endpoints = parsed
+		} else {
+			if len(parsed) == 1 && len(endpoints) == 1 && endpoints[0].host == "" {
+				endpoints[0].host = parsed[0].host
+				if endpoints[0].port == 0 {
+					endpoints[0].port = parsed[0].port
+				}
+			} else {
+				endpoints = parsed
+			}
+		}
+	}
+
+	var explicitPorts []uint16
+	if hasPortSpec {
+		if strings.TrimSpace(portSpec) == "" {
+			return errors.New("sqlx: empty port parameter in postgres DSN")
+		}
+		pParts := strings.Split(portSpec, ",")
+		explicitPorts = make([]uint16, 0, len(pParts))
+		for _, rp := range pParts {
+			p, err := parseStrictPort(strings.TrimSpace(rp))
+			if err != nil {
+				return err
+			}
+			explicitPorts = append(explicitPorts, p)
+		}
+	}
+
+	if len(endpoints) == 0 {
+		endpoints = []pgHostPort{{host: pgDefaultHost}}
+	} else if len(endpoints) == 1 && endpoints[0].host == "" {
+		endpoints[0].host = pgDefaultHost
+	}
+
+	if len(explicitPorts) > 0 {
+		if len(explicitPorts) != 1 && len(explicitPorts) != len(endpoints) {
+			return fmt.Errorf("sqlx: postgres port count (%d) does not match host count (%d)", len(explicitPorts), len(endpoints))
+		}
+		for idx := range endpoints {
+			if len(explicitPorts) == 1 {
+				if endpoints[idx].port == 0 || hasPortSpec {
+					endpoints[idx].port = explicitPorts[0]
+				}
+			} else {
+				endpoints[idx].port = explicitPorts[idx]
+			}
+		}
+	}
+
+	defaultPort := pgDefaultPort
+	if len(explicitPorts) == 1 {
+		defaultPort = explicitPorts[0]
+	}
+	for idx := range endpoints {
+		if endpoints[idx].port == 0 {
+			endpoints[idx].port = defaultPort
+		}
+	}
+
+	cfg.Host = endpoints[0].host
+	cfg.Port = endpoints[0].port
+	if len(endpoints) > 1 {
+		cfg.Fallbacks = make([]PostgresFallbackConfig, len(endpoints)-1)
+		for idx := 1; idx < len(endpoints); idx++ {
+			cfg.Fallbacks[idx-1] = PostgresFallbackConfig{
+				Host: endpoints[idx].host,
+				Port: endpoints[idx].port,
+			}
+		}
+	}
+
+	if ct, ok := cfg.Params["connect_timeout"]; ok && strings.TrimSpace(ct) != "" {
+		if _, err := strconv.Atoi(strings.TrimSpace(ct)); err != nil {
+			return fmt.Errorf("sqlx: invalid connect_timeout %q: %w", ct, err)
+		}
+	}
+	if ha, ok := cfg.Params["hostaddr"]; ok && strings.TrimSpace(ha) != "" {
+		haParts := strings.Split(ha, ",")
+		if len(haParts) != 1 && len(haParts) != len(endpoints) {
+			return fmt.Errorf("sqlx: postgres hostaddr count (%d) does not match host count (%d)", len(haParts), len(endpoints))
+		}
+		for _, item := range haParts {
+			ip := strings.TrimSpace(item)
+			if ip == "" || net.ParseIP(ip) == nil {
+				return fmt.Errorf("sqlx: invalid IP in postgres hostaddr %q", item)
+			}
+		}
+	}
+	return nil
+}
+
+func parseKeywordHostItem(part string) (pgHostPort, error) {
+	if strings.HasPrefix(part, "[") {
+		closeIdx := strings.IndexByte(part, ']')
+		if closeIdx < 0 {
+			return pgHostPort{}, errors.New("sqlx: unclosed '[' in IPv6 postgres host")
+		}
+		ipStr := part[1:closeIdx]
+		addrOnly, _, _ := strings.Cut(ipStr, "%")
+		if ipStr == "" || net.ParseIP(addrOnly) == nil || !strings.Contains(addrOnly, ":") {
+			return pgHostPort{}, fmt.Errorf("sqlx: invalid IPv6 host %q", part)
+		}
+		rem := part[closeIdx+1:]
+		if rem == "" {
+			return pgHostPort{host: ipStr}, nil
+		}
+		if !strings.HasPrefix(rem, ":") {
+			return pgHostPort{}, fmt.Errorf("sqlx: invalid host:port %q", part)
+		}
+		p, err := parseStrictPort(rem[1:])
+		if err != nil {
+			return pgHostPort{}, err
+		}
+		return pgHostPort{host: ipStr, port: p}, nil
+	}
+	if strings.Count(part, ":") == 1 {
+		h, rawP, _ := strings.Cut(part, ":")
+		if h == "" {
+			return pgHostPort{}, fmt.Errorf("sqlx: empty host in %q", part)
+		}
+		p, err := parseStrictPort(rawP)
+		if err != nil {
+			return pgHostPort{}, err
+		}
+		return pgHostPort{host: h, port: p}, nil
+	}
+	return pgHostPort{host: part}, nil
+}
+
+func parseStrictPort(raw string) (uint16, error) {
+	if raw == "" {
+		return 0, errors.New("sqlx: empty postgres port")
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return 0, fmt.Errorf("sqlx: invalid postgres port %q", raw)
+		}
+	}
+	n, err := strconv.ParseUint(raw, 10, 16)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("sqlx: postgres port %q out of range (1..65535)", raw)
+	}
+	return uint16(n), nil
+}
+
+func normalizeSSLMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	switch mode {
+	case "", "prefer":
+		return "prefer", nil
+	case "disable", "allow", "require", "verify-ca", "verify-full":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("sqlx: invalid postgres sslmode %q", raw)
+	}
+}
+
+func isPGConnSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'
+}
+
+func isPGKeywordByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+var pgClientOnlyParams = map[string]struct{}{
+	"host":                      {},
+	"hostaddr":                  {},
+	"port":                      {},
+	"dbname":                    {},
+	"user":                      {},
+	"password":                  {},
+	"passfile":                  {},
+	"channel_binding":           {},
+	"connect_timeout":           {},
+	"sslmode":                   {},
+	"sslcompression":            {},
+	"sslcert":                   {},
+	"sslkey":                    {},
+	"sslpassword":               {},
+	"sslrootcert":               {},
+	"sslcrl":                    {},
+	"sslcrldir":                 {},
+	"sslsni":                    {},
+	"requirepeer":               {},
+	"ssl_min_protocol_version":  {},
+	"ssl_max_protocol_version":  {},
+	"gssencmode":                {},
+	"krbsrvname":                {},
+	"gsslib":                    {},
+	"gssdelegation":             {},
+	"service":                   {},
+	"target_session_attrs":      {},
+	"load_balance_hosts":        {},
+	"keepalives":                {},
+	"keepalives_idle":           {},
+	"keepalives_interval":       {},
+	"keepalives_count":          {},
+	"tcp_user_timeout":          {},
+	"prefer_simple_protocol":    {},
+	"default_query_exec_mode":   {},
+}
+
+func parsePGConnConfig(dsn string, defaultSimple bool) (*PostgresConfig, bool, error) {
+	cfg, err := ParsePostgresConfig(dsn)
 	if err != nil {
 		return nil, false, err
 	}
 	simple := defaultSimple
-	for k, v := range cfg.RuntimeParams {
+	for k, v := range cfg.Params {
 		switch strings.ToLower(strings.TrimSpace(k)) {
 		case "prefer_simple_protocol":
 			val := strings.ToLower(strings.TrimSpace(v))
@@ -54,46 +691,103 @@ func parsePGConnConfig(dsn string, defaultSimple bool) (*pgconn.Config, bool, er
 			} else if val == "false" || val == "0" {
 				simple = defaultSimple
 			}
-			delete(cfg.RuntimeParams, k)
+			delete(cfg.Params, k)
 		case "default_query_exec_mode":
 			if strings.EqualFold(strings.TrimSpace(v), "simple_protocol") {
 				simple = true
 			}
-			delete(cfg.RuntimeParams, k)
+			delete(cfg.Params, k)
 		}
 	}
 	return cfg, simple, nil
 }
 
-func wrapPGErr(conn *pgconn.PgConn, ctx context.Context, err error) error {
+// pgWireError represents a PostgreSQL v3 ErrorResponse ('E') packet.
+type pgWireError struct {
+	Severity string
+	Code     string
+	Message  string
+	Detail   string
+	Hint     string
+}
+
+func (e *pgWireError) Error() string {
+	var b strings.Builder
+	if e.Severity != "" {
+		b.WriteString(e.Severity)
+		b.WriteString(": ")
+	}
+	b.WriteString(e.Message)
+	if e.Code != "" {
+		b.WriteString(" (SQLSTATE ")
+		b.WriteString(e.Code)
+		b.WriteByte(')')
+	}
+	if e.Detail != "" {
+		b.WriteString(": ")
+		b.WriteString(e.Detail)
+	}
+	return b.String()
+}
+
+type pgRetryableErr struct {
+	err error
+}
+
+func (e pgRetryableErr) Error() string { return e.err.Error() }
+func (e pgRetryableErr) Unwrap() error { return e.err }
+
+func isPGSafeToRetry(err error) bool {
+	var re pgRetryableErr
+	return errors.As(err, &re)
+}
+
+func wrapPGErr(conn *pgWireConn, ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
 	if errors.Is(err, driver.ErrBadConn) {
 		return err
 	}
-	if (ctx == nil || ctx.Err() == nil) && (conn == nil || conn.IsClosed() || pgconn.SafeToRetry(err)) {
+	if (ctx == nil || ctx.Err() == nil) && (conn == nil || conn.IsClosed() || isPGSafeToRetry(err)) {
 		return fmt.Errorf("%w: %v", driver.ErrBadConn, err)
 	}
 	return err
 }
 
+// pgConnConnector implements database/sql/driver.Connector directly over Pure-Go PostgreSQL v3 wire protocol.
+// It uses unnamed extended-protocol P/B/D/E/S pipelining (PgBouncer / Supabase / Neon transaction-pooler safe)
+// or explicit Simple Query Protocol with zero external library dependencies.
+type pgConnConnector struct {
+	cfg            *PostgresConfig
+	simpleProtocol bool
+}
+
+type pgConnDriver struct{}
+
 func (d pgConnDriver) Open(name string) (driver.Conn, error) {
-	cfg, simpleProto, err := parsePGConnConfig(name, false)
+	conn, err := d.OpenConnector(name)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	c, err := pgconn.ConnectConfig(ctx, cfg)
+	return conn.Connect(ctx)
+}
+
+func (d pgConnDriver) OpenConnector(name string) (driver.Connector, error) {
+	cfg, simpleProto, err := parsePGConnConfig(name, false)
 	if err != nil {
 		return nil, err
 	}
-	return &pgDriverConn{conn: c, simpleProtocol: simpleProto}, nil
+	return &pgConnConnector{
+		cfg:            cfg,
+		simpleProtocol: simpleProto,
+	}, nil
 }
 
 func (c *pgConnConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	raw, err := pgconn.ConnectConfig(ctx, c.cfg.Copy())
+	raw, err := connectPGWire(ctx, c.cfg.Copy())
 	if err != nil {
 		return nil, err
 	}
@@ -107,8 +801,1098 @@ func (c *pgConnConnector) Driver() driver.Driver {
 	return pgConnDriver{}
 }
 
+type pgFieldDesc struct {
+	name string
+	oid  uint32
+}
+
+type pgWireConn struct {
+	rawNetConn  net.Conn // underlying TCP/Unix socket for goroutine-safe SetDeadline
+	netConn     net.Conn // active stream (either rawNetConn or *tls.Conn)
+	rd          *bufio.Reader
+	wbuf        []byte
+	readScratch []byte
+
+	dialNet     string
+	dialAddr    string
+	processID   uint32
+	secretKey   []byte
+	paramStatus map[string]string
+	txStatus    byte
+	busy        bool
+	closed      bool
+}
+
+func (c *pgWireConn) IsClosed() bool {
+	return c == nil || c.closed
+}
+
+func (c *pgWireConn) IsBusy() bool {
+	return c != nil && c.busy
+}
+
+func (c *pgWireConn) TxStatus() byte {
+	if c == nil {
+		return 0
+	}
+	return c.txStatus
+}
+
+func (c *pgWireConn) ParameterStatus(key string) string {
+	if c == nil {
+		return ""
+	}
+	return c.paramStatus[key]
+}
+
+func (c *pgWireConn) markBroken() {
+	if c == nil || c.closed {
+		return
+	}
+	c.closed = true
+	c.busy = false
+	_ = c.netConn.Close()
+}
+
+func (c *pgWireConn) Close() error {
+	if c == nil || c.closed {
+		return nil
+	}
+	c.closed = true
+	c.busy = false
+	_ = c.rawNetConn.SetDeadline(time.Now().Add(2 * time.Second))
+	var term [5]byte
+	term[0] = 'X'
+	binary.BigEndian.PutUint32(term[1:5], 4)
+	_, _ = c.netConn.Write(term[:])
+	return c.netConn.Close()
+}
+
+type pgCancelGuard struct {
+	conn *pgWireConn
+	ctx  context.Context
+	stop chan struct{}
+	done chan struct{}
+}
+
+func (c *pgWireConn) startCancelGuard(ctx context.Context) *pgCancelGuard {
+	if ctx == nil || ctx.Done() == nil {
+		return nil
+	}
+	g := &pgCancelGuard{
+		conn: c,
+		ctx:  ctx,
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	rawConn := c.rawNetConn
+	dialNet := c.dialNet
+	dialAddr := c.dialAddr
+	pid := c.processID
+	var secretCopy []byte
+	if len(c.secretKey) > 0 {
+		secretCopy = make([]byte, len(c.secretKey))
+		copy(secretCopy, c.secretKey)
+	}
+
+	go func() {
+		defer close(g.done)
+		select {
+		case <-g.stop:
+			return
+		case <-ctx.Done():
+			if pid != 0 && len(secretCopy) > 0 && dialNet != "" && dialAddr != "" {
+				cancelSent := make(chan struct{})
+				go func() {
+					defer close(cancelSent)
+					sendPGCancelRequest(dialNet, dialAddr, pid, secretCopy)
+				}()
+				timer := time.NewTimer(150 * time.Millisecond)
+				select {
+				case <-cancelSent:
+					timer.Stop()
+				case <-g.stop:
+					timer.Stop()
+				case <-timer.C:
+				}
+			}
+			_ = rawConn.SetDeadline(time.Now())
+		}
+	}()
+	return g
+}
+
+func (g *pgCancelGuard) finish() {
+	if g == nil {
+		return
+	}
+	select {
+	case <-g.stop:
+		return
+	default:
+		close(g.stop)
+	}
+	<-g.done
+	if !g.conn.closed {
+		_ = g.conn.rawNetConn.SetDeadline(time.Time{})
+	}
+}
+
+func (g *pgCancelGuard) normalizeErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if g != nil && g.ctx != nil && g.ctx.Err() != nil {
+		var pgErr *pgWireError
+		if errors.As(err, &pgErr) {
+			return err
+		}
+		return g.ctx.Err()
+	}
+	return err
+}
+
+func sendPGCancelRequest(dialNet, dialAddr string, pid uint32, secretKey []byte) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, dialNet, dialAddr)
+	if err != nil {
+		return
+	}
+	defer nc.Close()
+	_ = nc.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+
+	pktLen := 8 + 4 + len(secretKey)
+	buf := make([]byte, pktLen)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(pktLen))
+	binary.BigEndian.PutUint32(buf[4:8], pgCancelRequestCode)
+	binary.BigEndian.PutUint32(buf[8:12], pid)
+	copy(buf[12:], secretKey)
+	_, _ = nc.Write(buf)
+}
+
+func connectPGWire(ctx context.Context, cfg *PostgresConfig) (*pgWireConn, error) {
+	if cfg == nil {
+		return nil, errors.New("sqlx: nil postgres config")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	targets := make([]pgHostPort, 0, 1+len(cfg.Fallbacks))
+	primaryPort := cfg.Port
+	if primaryPort == 0 {
+		primaryPort = pgDefaultPort
+	}
+	primaryHost := cfg.Host
+	if primaryHost == "" {
+		primaryHost = pgDefaultHost
+	}
+	targets = append(targets, pgHostPort{host: primaryHost, port: primaryPort})
+	for _, fb := range cfg.Fallbacks {
+		fbPort := fb.Port
+		if fbPort == 0 {
+			fbPort = primaryPort
+		}
+		fbHost := fb.Host
+		if fbHost == "" {
+			fbHost = pgDefaultHost
+		}
+		targets = append(targets, pgHostPort{host: fbHost, port: fbPort})
+	}
+
+	var hostAddrs []string
+	if ha := strings.TrimSpace(cfg.Params["hostaddr"]); ha != "" {
+		hostAddrs = strings.Split(ha, ",")
+	}
+
+	var perAttemptTimeout time.Duration
+	if ct := strings.TrimSpace(cfg.Params["connect_timeout"]); ct != "" {
+		if sec, err := strconv.Atoi(ct); err == nil && sec > 0 {
+			perAttemptTimeout = time.Duration(sec) * time.Second
+		}
+	}
+
+	sslMode, err := normalizeSSLMode(cfg.SSLMode)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for idx, tgt := range targets {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var dialHostOverride string
+		if len(hostAddrs) == 1 {
+			dialHostOverride = strings.TrimSpace(hostAddrs[0])
+		} else if idx < len(hostAddrs) {
+			dialHostOverride = strings.TrimSpace(hostAddrs[idx])
+		}
+
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		if perAttemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, perAttemptTimeout)
+		}
+		conn, cErr := connectSingleTarget(attemptCtx, cfg, tgt, dialHostOverride, sslMode)
+		if cancel != nil {
+			cancel()
+		}
+		if cErr == nil {
+			return conn, nil
+		}
+		lastErr = cErr
+	}
+	return nil, lastErr
+}
+
+func connectSingleTarget(
+	ctx context.Context,
+	cfg *PostgresConfig,
+	tgt pgHostPort,
+	dialHostOverride string,
+	sslMode string,
+) (*pgWireConn, error) {
+	if strings.HasPrefix(tgt.host, "/") {
+		if sslMode == "require" || sslMode == "verify-ca" || sslMode == "verify-full" {
+			return nil, fmt.Errorf("sqlx: sslmode=%s is not supported over unix domain socket %q", sslMode, tgt.host)
+		}
+		sockPath := filepath.Join(tgt.host, fmt.Sprintf(".s.PGSQL.%d", tgt.port))
+		return dialAndHandshake(ctx, cfg, "unix", sockPath, tgt.host, false, sslMode)
+	}
+
+	dialHost := tgt.host
+	if dialHostOverride != "" {
+		dialHost = dialHostOverride
+	}
+	tcpAddr := net.JoinHostPort(dialHost, strconv.Itoa(int(tgt.port)))
+
+	switch sslMode {
+	case "disable":
+		return dialAndHandshake(ctx, cfg, "tcp", tcpAddr, tgt.host, false, sslMode)
+	case "allow":
+		conn, err := dialAndHandshake(ctx, cfg, "tcp", tcpAddr, tgt.host, false, sslMode)
+		if err == nil || ctx.Err() != nil {
+			return conn, err
+		}
+		return dialAndHandshake(ctx, cfg, "tcp", tcpAddr, tgt.host, true, sslMode)
+	case "prefer":
+		conn, err := dialAndHandshake(ctx, cfg, "tcp", tcpAddr, tgt.host, true, sslMode)
+		if err == nil || ctx.Err() != nil {
+			return conn, err
+		}
+		return dialAndHandshake(ctx, cfg, "tcp", tcpAddr, tgt.host, false, sslMode)
+	default: // require, verify-ca, verify-full
+		return dialAndHandshake(ctx, cfg, "tcp", tcpAddr, tgt.host, true, sslMode)
+	}
+}
+
+func dialAndHandshake(
+	ctx context.Context,
+	cfg *PostgresConfig,
+	network string,
+	addr string,
+	serverHost string,
+	wantTLS bool,
+	sslMode string,
+) (*pgWireConn, error) {
+	var d net.Dialer
+	rawConn, err := d.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	activeConn := rawConn
+	handshakeDone := make(chan struct{})
+	if ctx.Done() != nil {
+		if dl, ok := ctx.Deadline(); ok {
+			_ = rawConn.SetDeadline(dl)
+		}
+		go func() {
+			select {
+			case <-handshakeDone:
+			case <-ctx.Done():
+				_ = rawConn.SetDeadline(time.Now())
+			}
+		}()
+	}
+	cleanupHandshake := func(ok bool) {
+		close(handshakeDone)
+		if ok {
+			_ = rawConn.SetDeadline(time.Time{})
+		} else {
+			_ = rawConn.Close()
+		}
+	}
+
+	if wantTLS {
+		var sslPkt [8]byte
+		binary.BigEndian.PutUint32(sslPkt[0:4], 8)
+		binary.BigEndian.PutUint32(sslPkt[4:8], pgSSLRequestCode)
+		if _, err := activeConn.Write(sslPkt[:]); err != nil {
+			cleanupHandshake(false)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("sqlx: write SSLRequest: %w", err)
+		}
+		var reply [1]byte
+		if _, err := io.ReadFull(activeConn, reply[:]); err != nil {
+			cleanupHandshake(false)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("sqlx: read SSLRequest response: %w", err)
+		}
+		switch reply[0] {
+		case 'S':
+			tlsCfg, tErr := buildPGTLSConfig(cfg, serverHost, sslMode)
+			if tErr != nil {
+				cleanupHandshake(false)
+				return nil, tErr
+			}
+			tlsConn := tls.Client(activeConn, tlsCfg)
+			if hErr := tlsConn.HandshakeContext(ctx); hErr != nil {
+				cleanupHandshake(false)
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return nil, fmt.Errorf("sqlx: postgres TLS handshake failed: %w", hErr)
+			}
+			activeConn = tlsConn
+		case 'N':
+			if sslMode != "prefer" {
+				cleanupHandshake(false)
+				return nil, fmt.Errorf("sqlx: postgres server refused SSL connection (sslmode=%s)", sslMode)
+			}
+			// sslmode=prefer continues over the existing plaintext connection seamlessly.
+		default:
+			cleanupHandshake(false)
+			return nil, fmt.Errorf("sqlx: unexpected postgres SSLRequest response byte 0x%02x", reply[0])
+		}
+	}
+
+	wc := &pgWireConn{
+		rawNetConn:  rawConn,
+		netConn:     activeConn,
+		rd:          bufio.NewReaderSize(activeConn, 8192),
+		wbuf:        make([]byte, 0, 512),
+		readScratch: make([]byte, 0, 512),
+		dialNet:     network,
+		dialAddr:    addr,
+		paramStatus: make(map[string]string, 12),
+		txStatus:    'I',
+	}
+
+	if err := wc.performStartupAndAuth(cfg); err != nil {
+		cleanupHandshake(false)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	cleanupHandshake(true)
+	return wc, nil
+}
+
+func buildPGTLSConfig(cfg *PostgresConfig, serverHost string, sslMode string) (*tls.Config, error) {
+	effectiveMode := sslMode
+	rootCertPath := strings.TrimSpace(cfg.Params["sslrootcert"])
+	var rootPool *x509.CertPool
+	if rootCertPath != "" {
+		if rootCertPath == "system" {
+			effectiveMode = "verify-full"
+		} else {
+			pemBytes, err := os.ReadFile(rootCertPath)
+			if err != nil {
+				return nil, fmt.Errorf("sqlx: read sslrootcert %q: %w", rootCertPath, err)
+			}
+			rootPool = x509.NewCertPool()
+			if !rootPool.AppendCertsFromPEM(pemBytes) {
+				return nil, fmt.Errorf("sqlx: no valid PEM certificates found in sslrootcert %q", rootCertPath)
+			}
+		}
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	certPath := strings.TrimSpace(cfg.Params["sslcert"])
+	keyPath := strings.TrimSpace(cfg.Params["sslkey"])
+	if certPath != "" || keyPath != "" {
+		if certPath == "" || keyPath == "" {
+			return nil, errors.New("sqlx: both sslcert and sslkey must be specified together")
+		}
+		pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("sqlx: load client certificate/key: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{pair}
+	}
+
+	cleanHost := strings.Trim(serverHost, "[]")
+	if zoneIdx := strings.IndexByte(cleanHost, '%'); zoneIdx > 0 {
+		cleanHost = cleanHost[:zoneIdx]
+	}
+
+	switch effectiveMode {
+	case "verify-full":
+		tlsCfg.InsecureSkipVerify = false
+		tlsCfg.RootCAs = rootPool
+		tlsCfg.ServerName = cleanHost
+	case "verify-ca":
+		tlsCfg.InsecureSkipVerify = true
+		if net.ParseIP(cleanHost) == nil {
+			tlsCfg.ServerName = cleanHost
+		}
+		tlsCfg.VerifyPeerCertificate = makeCertChainVerifier(rootPool)
+	case "require":
+		tlsCfg.InsecureSkipVerify = true
+		if net.ParseIP(cleanHost) == nil {
+			tlsCfg.ServerName = cleanHost
+		}
+		if rootPool != nil {
+			tlsCfg.VerifyPeerCertificate = makeCertChainVerifier(rootPool)
+		}
+	default: // allow, prefer
+		tlsCfg.InsecureSkipVerify = true
+		if net.ParseIP(cleanHost) == nil {
+			tlsCfg.ServerName = cleanHost
+		}
+	}
+	return tlsCfg, nil
+}
+
+func makeCertChainVerifier(roots *x509.CertPool) func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("sqlx: server presented no TLS certificates")
+		}
+		certs := make([]*x509.Certificate, len(rawCerts))
+		for i, asn1Data := range rawCerts {
+			c, err := x509.ParseCertificate(asn1Data)
+			if err != nil {
+				return fmt.Errorf("sqlx: parse server certificate: %w", err)
+			}
+			certs[i] = c
+		}
+		opts := x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: x509.NewCertPool(),
+		}
+		for _, ic := range certs[1:] {
+			opts.Intermediates.AddCert(ic)
+		}
+		_, err := certs[0].Verify(opts)
+		return err
+	}
+}
+
+type scramSession struct {
+	clientNonce             string
+	clientFirstBare         string
+	expectedServerSignature []byte
+	serverVerified          bool
+}
+
+func (c *pgWireConn) performStartupAndAuth(cfg *PostgresConfig) error {
+	user := cfg.User
+	if user == "" {
+		user = "postgres"
+	}
+	dbName := cfg.Database
+	if dbName == "" {
+		dbName = user
+	}
+
+	c.wbuf = c.wbuf[:0]
+	c.wbuf = append(c.wbuf, 0, 0, 0, 0) // placeholder for total packet length
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, pgProtocolVersion30)
+
+	appendCStringPair := func(k, v string) error {
+		if strings.IndexByte(k, 0) >= 0 || strings.IndexByte(v, 0) >= 0 {
+			return errors.New("sqlx: NUL byte forbidden in postgres startup parameter")
+		}
+		c.wbuf = append(c.wbuf, k...)
+		c.wbuf = append(c.wbuf, 0)
+		c.wbuf = append(c.wbuf, v...)
+		c.wbuf = append(c.wbuf, 0)
+		return nil
+	}
+
+	if err := appendCStringPair("user", user); err != nil {
+		return err
+	}
+	if err := appendCStringPair("database", dbName); err != nil {
+		return err
+	}
+	hasClientEncoding := false
+	for k, v := range cfg.Params {
+		kl := strings.ToLower(strings.TrimSpace(k))
+		if _, isClientOnly := pgClientOnlyParams[kl]; isClientOnly {
+			continue
+		}
+		if kl == "client_encoding" {
+			hasClientEncoding = true
+		}
+		if err := appendCStringPair(k, v); err != nil {
+			return err
+		}
+	}
+	if !hasClientEncoding {
+		_ = appendCStringPair("client_encoding", "UTF8")
+	}
+	c.wbuf = append(c.wbuf, 0)
+	binary.BigEndian.PutUint32(c.wbuf[0:4], uint32(len(c.wbuf)))
+
+	if err := c.flushWriteBuf(); err != nil {
+		return fmt.Errorf("sqlx: send StartupMessage: %w", err)
+	}
+
+	var scram *scramSession
+	authDone := false
+
+	for {
+		msgType, payload, err := c.readPacket()
+		if err != nil {
+			return fmt.Errorf("sqlx: postgres startup read: %w", err)
+		}
+		switch msgType {
+		case 'R':
+			if len(payload) < 4 {
+				return errors.New("sqlx: truncated Authentication packet")
+			}
+			authCode := binary.BigEndian.Uint32(payload[0:4])
+			switch authCode {
+			case pgAuthOK:
+				if scram != nil && !scram.serverVerified {
+					return errors.New("sqlx: SCRAM-SHA-256 AuthenticationOk received without server-final verification")
+				}
+				authDone = true
+			case pgAuthCleartextPassword:
+				if err := c.sendPasswordPacket(cfg.Password); err != nil {
+					return err
+				}
+			case pgAuthMD5Password:
+				if len(payload) < 8 {
+					return errors.New("sqlx: truncated AuthenticationMD5Password salt")
+				}
+				digest := computePGMD5Password(user, cfg.Password, payload[4:8])
+				if err := c.sendPasswordPacket(digest); err != nil {
+					return err
+				}
+			case pgAuthSASL:
+				s, initPkt, sErr := startSCRAMSHA256(payload[4:])
+				if sErr != nil {
+					return sErr
+				}
+				scram = s
+				if err := c.sendTypedPacket('p', initPkt); err != nil {
+					return err
+				}
+			case pgAuthSASLContinue:
+				if scram == nil {
+					return errors.New("sqlx: unexpected AuthenticationSASLContinue")
+				}
+				finalMsg, sErr := scram.stepContinue(cfg.Password, string(payload[4:]))
+				if sErr != nil {
+					return sErr
+				}
+				if err := c.sendTypedPacket('p', []byte(finalMsg)); err != nil {
+					return err
+				}
+			case pgAuthSASLFinal:
+				if scram == nil {
+					return errors.New("sqlx: unexpected AuthenticationSASLFinal")
+				}
+				if err := scram.stepFinal(string(payload[4:])); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("sqlx: unsupported postgres authentication method %d", authCode)
+			}
+
+		case 'S':
+			c.handleParameterStatus(payload)
+		case 'K':
+			c.handleBackendKeyData(payload)
+		case 'N':
+			// Ignore NoticeResponse
+		case 'E':
+			return parsePGErrorResponse(payload)
+		case 'Z':
+			if !authDone {
+				return errors.New("sqlx: ReadyForQuery received before AuthenticationOk")
+			}
+			if len(payload) >= 1 {
+				c.txStatus = payload[0]
+			}
+			c.shrinkBuffersIfOversized()
+			return nil
+		default:
+			// Ignore unknown informational backend messages cleanly.
+		}
+	}
+}
+
+func computePGMD5Password(user, password string, salt []byte) string {
+	h1 := md5.New()
+	_, _ = io.WriteString(h1, password)
+	_, _ = io.WriteString(h1, user)
+	innerHex := hex.EncodeToString(h1.Sum(nil))
+
+	h2 := md5.New()
+	_, _ = io.WriteString(h2, innerHex)
+	_, _ = h2.Write(salt)
+	return "md5" + hex.EncodeToString(h2.Sum(nil))
+}
+
+func startSCRAMSHA256(mechPayload []byte) (*scramSession, []byte, error) {
+	hasSCRAM256 := false
+	rem := mechPayload
+	for len(rem) > 0 {
+		nulIdx := bytes.IndexByte(rem, 0)
+		if nulIdx <= 0 {
+			break
+		}
+		mech := string(rem[:nulIdx])
+		if mech == "SCRAM-SHA-256" {
+			hasSCRAM256 = true
+		}
+		rem = rem[nulIdx+1:]
+	}
+	if !hasSCRAM256 {
+		return nil, nil, errors.New("sqlx: postgres server SASL mechanisms do not include SCRAM-SHA-256")
+	}
+
+	var rawNonce [18]byte
+	if _, err := rand.Read(rawNonce[:]); err != nil {
+		return nil, nil, fmt.Errorf("sqlx: generate SCRAM nonce: %w", err)
+	}
+	clientNonce := base64.StdEncoding.EncodeToString(rawNonce[:])
+	clientFirstBare := "n=,r=" + clientNonce
+	clientFirstMsg := "n,," + clientFirstBare
+
+	const mechName = "SCRAM-SHA-256"
+	pkt := make([]byte, 0, len(mechName)+1+4+len(clientFirstMsg))
+	pkt = append(pkt, mechName...)
+	pkt = append(pkt, 0)
+	pkt = binary.BigEndian.AppendUint32(pkt, uint32(len(clientFirstMsg)))
+	pkt = append(pkt, clientFirstMsg...)
+
+	return &scramSession{
+		clientNonce:     clientNonce,
+		clientFirstBare: clientFirstBare,
+	}, pkt, nil
+}
+
+func (s *scramSession) stepContinue(password string, serverFirst string) (string, error) {
+	var combinedNonce, saltB64, iterStr string
+	for _, part := range strings.Split(serverFirst, ",") {
+		if len(part) < 2 || part[1] != '=' {
+			continue
+		}
+		switch part[0] {
+		case 'r':
+			combinedNonce = part[2:]
+		case 's':
+			saltB64 = part[2:]
+		case 'i':
+			iterStr = part[2:]
+		case 'm':
+			return "", fmt.Errorf("sqlx: unsupported mandatory SCRAM extension %q", part)
+		}
+	}
+	if !strings.HasPrefix(combinedNonce, s.clientNonce) || len(combinedNonce) <= len(s.clientNonce) {
+		return "", errors.New("sqlx: SCRAM-SHA-256 server nonce does not extend client nonce")
+	}
+	salt, err := base64.StdEncoding.DecodeString(saltB64)
+	if err != nil || len(salt) == 0 {
+		return "", errors.New("sqlx: invalid SCRAM-SHA-256 salt")
+	}
+	iterations, err := strconv.Atoi(iterStr)
+	if err != nil || iterations < 1 || iterations > 10_000_000 {
+		return "", fmt.Errorf("sqlx: invalid SCRAM-SHA-256 iteration count %q", iterStr)
+	}
+
+	saltedPassword, err := pbkdf2.Key(sha256.New, password, salt, iterations, 32)
+	if err != nil {
+		return "", fmt.Errorf("sqlx: SCRAM-SHA-256 pbkdf2 failed: %w", err)
+	}
+
+	clientKey := hmacSHA256(saltedPassword, []byte("Client Key"))
+	storedKeyArr := sha256.Sum256(clientKey)
+	storedKey := storedKeyArr[:]
+
+	// base64("n,,") == "biws"
+	clientFinalWithoutProof := "c=biws,r=" + combinedNonce
+	authMessage := s.clientFirstBare + "," + serverFirst + "," + clientFinalWithoutProof
+
+	clientSig := hmacSHA256(storedKey, []byte(authMessage))
+	clientProof := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		clientProof[i] = clientKey[i] ^ clientSig[i]
+	}
+
+	serverKey := hmacSHA256(saltedPassword, []byte("Server Key"))
+	s.expectedServerSignature = hmacSHA256(serverKey, []byte(authMessage))
+
+	return clientFinalWithoutProof + ",p=" + base64.StdEncoding.EncodeToString(clientProof), nil
+}
+
+func (s *scramSession) stepFinal(serverFinal string) error {
+	for _, part := range strings.Split(serverFinal, ",") {
+		if strings.HasPrefix(part, "e=") {
+			return fmt.Errorf("sqlx: SCRAM-SHA-256 server error: %s", part[2:])
+		}
+		if strings.HasPrefix(part, "v=") {
+			gotSig, err := base64.StdEncoding.DecodeString(part[2:])
+			if err != nil {
+				return fmt.Errorf("sqlx: invalid SCRAM-SHA-256 server verifier base64: %w", err)
+			}
+			if !hmac.Equal(gotSig, s.expectedServerSignature) {
+				return errors.New("sqlx: SCRAM-SHA-256 server signature mismatch")
+			}
+			s.serverVerified = true
+			return nil
+		}
+	}
+	return errors.New("sqlx: SCRAM-SHA-256 server-final-message missing verifier")
+}
+
+func hmacSHA256(key, data []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(data)
+	return mac.Sum(nil)
+}
+
+func (c *pgWireConn) sendPasswordPacket(secret string) error {
+	if strings.IndexByte(secret, 0) >= 0 {
+		return errors.New("sqlx: NUL byte forbidden in postgres password")
+	}
+	c.wbuf = c.wbuf[:0]
+	c.wbuf = append(c.wbuf, 'p')
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(4+len(secret)+1))
+	c.wbuf = append(c.wbuf, secret...)
+	c.wbuf = append(c.wbuf, 0)
+	return c.flushWriteBuf()
+}
+
+func (c *pgWireConn) sendTypedPacket(msgType byte, body []byte) error {
+	c.wbuf = c.wbuf[:0]
+	c.wbuf = append(c.wbuf, msgType)
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(4+len(body)))
+	c.wbuf = append(c.wbuf, body...)
+	return c.flushWriteBuf()
+}
+
+func (c *pgWireConn) flushWriteBuf() error {
+	_, err := c.netConn.Write(c.wbuf)
+	if err != nil {
+		c.markBroken()
+		return err
+	}
+	c.shrinkWriteBufIfOversized()
+	return nil
+}
+
+func (c *pgWireConn) shrinkWriteBufIfOversized() {
+	if cap(c.wbuf) > 65536 {
+		c.wbuf = make([]byte, 0, 512)
+	} else {
+		c.wbuf = c.wbuf[:0]
+	}
+}
+
+func (c *pgWireConn) shrinkBuffersIfOversized() {
+	c.shrinkWriteBufIfOversized()
+	if cap(c.readScratch) > 65536 {
+		c.readScratch = make([]byte, 0, 512)
+	} else {
+		c.readScratch = c.readScratch[:0]
+	}
+}
+
+func (c *pgWireConn) readPacket() (byte, []byte, error) {
+	var hdr [5]byte
+	if _, err := io.ReadFull(c.rd, hdr[:]); err != nil {
+		c.markBroken()
+		return 0, nil, err
+	}
+	msgType := hdr[0]
+	msgLen := binary.BigEndian.Uint32(hdr[1:5])
+	if msgLen < 4 || msgLen > pgMaxPacketBytes {
+		c.markBroken()
+		return 0, nil, fmt.Errorf("sqlx: invalid postgres packet length %d for message %q", msgLen, msgType)
+	}
+	bodyLen := int(msgLen - 4)
+	if cap(c.readScratch) < bodyLen {
+		c.readScratch = make([]byte, bodyLen)
+	} else {
+		c.readScratch = c.readScratch[:bodyLen]
+	}
+	if bodyLen > 0 {
+		if _, err := io.ReadFull(c.rd, c.readScratch); err != nil {
+			c.markBroken()
+			return 0, nil, err
+		}
+	}
+	return msgType, c.readScratch, nil
+}
+
+func (c *pgWireConn) handleParameterStatus(payload []byte) {
+	nul1 := bytes.IndexByte(payload, 0)
+	if nul1 < 0 {
+		return
+	}
+	name := string(payload[:nul1])
+	rest := payload[nul1+1:]
+	nul2 := bytes.IndexByte(rest, 0)
+	if nul2 < 0 {
+		c.paramStatus[name] = string(rest)
+		return
+	}
+	c.paramStatus[name] = string(rest[:nul2])
+}
+
+func (c *pgWireConn) handleBackendKeyData(payload []byte) {
+	if len(payload) < 8 {
+		return
+	}
+	c.processID = binary.BigEndian.Uint32(payload[0:4])
+	c.secretKey = append(c.secretKey[:0], payload[4:]...)
+}
+
+func parsePGErrorResponse(payload []byte) *pgWireError {
+	pgErr := &pgWireError{}
+	pos := 0
+	for pos < len(payload) {
+		fieldType := payload[pos]
+		pos++
+		if fieldType == 0 {
+			break
+		}
+		nulIdx := bytes.IndexByte(payload[pos:], 0)
+		if nulIdx < 0 {
+			break
+		}
+		val := string(payload[pos : pos+nulIdx])
+		pos += nulIdx + 1
+		switch fieldType {
+		case 'V':
+			pgErr.Severity = val
+		case 'S':
+			if pgErr.Severity == "" {
+				pgErr.Severity = val
+			}
+		case 'C':
+			pgErr.Code = val
+		case 'M':
+			pgErr.Message = val
+		case 'D':
+			pgErr.Detail = val
+		case 'H':
+			pgErr.Hint = val
+		}
+	}
+	if pgErr.Message == "" {
+		pgErr.Message = "unknown postgres error"
+	}
+	return pgErr
+}
+
+func isFatalPGError(pgErr *pgWireError) bool {
+	if pgErr == nil {
+		return false
+	}
+	sev := strings.ToUpper(pgErr.Severity)
+	if sev == "FATAL" || sev == "PANIC" {
+		return true
+	}
+	// Class 08 = Connection Exception; 57P01..57P03 = admin/crash shutdown
+	return strings.HasPrefix(pgErr.Code, "08") || strings.HasPrefix(pgErr.Code, "57P")
+}
+
+func parsePGRowDescription(payload []byte) ([]pgFieldDesc, error) {
+	if len(payload) < 2 {
+		return nil, errors.New("sqlx: truncated RowDescription header")
+	}
+	count := int(int16(binary.BigEndian.Uint16(payload[0:2])))
+	if count < 0 {
+		return nil, fmt.Errorf("sqlx: negative RowDescription column count %d", count)
+	}
+	fields := make([]pgFieldDesc, count)
+	pos := 2
+	for i := 0; i < count; i++ {
+		nulIdx := bytes.IndexByte(payload[pos:], 0)
+		if nulIdx < 0 {
+			return nil, errors.New("sqlx: unterminated column name in RowDescription")
+		}
+		name := string(payload[pos : pos+nulIdx])
+		pos += nulIdx + 1
+		if pos+18 > len(payload) {
+			return nil, errors.New("sqlx: truncated column metadata in RowDescription")
+		}
+		oid := binary.BigEndian.Uint32(payload[pos+6 : pos+10])
+		pos += 18
+		fields[i] = pgFieldDesc{name: name, oid: oid}
+	}
+	return fields, nil
+}
+
+func parsePGCommandTagRowsAffected(payload []byte) int64 {
+	tag := string(bytes.TrimRight(payload, "\x00"))
+	switch {
+	case strings.HasPrefix(tag, "INSERT "),
+		strings.HasPrefix(tag, "UPDATE "),
+		strings.HasPrefix(tag, "DELETE "),
+		strings.HasPrefix(tag, "SELECT "),
+		strings.HasPrefix(tag, "COPY "),
+		strings.HasPrefix(tag, "FETCH "),
+		strings.HasPrefix(tag, "MOVE "),
+		strings.HasPrefix(tag, "MERGE "):
+		lastSpace := strings.LastIndexByte(tag, ' ')
+		if lastSpace < 0 || lastSpace+1 >= len(tag) {
+			return 0
+		}
+		n, err := strconv.ParseInt(tag[lastSpace+1:], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
+func (c *pgWireConn) writeSimpleQuery(sqlText string) error {
+	if strings.IndexByte(sqlText, 0) >= 0 {
+		return errors.New("sqlx: NUL byte forbidden in postgres SQL query")
+	}
+	c.wbuf = c.wbuf[:0]
+	c.wbuf = append(c.wbuf, 'Q')
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(4+len(sqlText)+1))
+	c.wbuf = append(c.wbuf, sqlText...)
+	c.wbuf = append(c.wbuf, 0)
+	if err := c.flushWriteBuf(); err != nil {
+		return pgRetryableErr{err: err}
+	}
+	return nil
+}
+
+func (c *pgWireConn) writeExtendedQuery(query string, params [][]byte) error {
+	if strings.IndexByte(query, 0) >= 0 {
+		return errors.New("sqlx: NUL byte forbidden in postgres SQL query")
+	}
+	if len(params) > math.MaxInt16 {
+		return fmt.Errorf("sqlx: postgres parameter count %d exceeds %d limit", len(params), math.MaxInt16)
+	}
+
+	c.wbuf = c.wbuf[:0]
+
+	// 1. Parse ('P'): unnamed statement "", query\0, 0 param OIDs
+	parseLen := 4 + 1 + len(query) + 1 + 2
+	c.wbuf = append(c.wbuf, 'P')
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(parseLen))
+	c.wbuf = append(c.wbuf, 0)
+	c.wbuf = append(c.wbuf, query...)
+	c.wbuf = append(c.wbuf, 0)
+	c.wbuf = binary.BigEndian.AppendUint16(c.wbuf, 0)
+
+	// 2. Bind ('B'): unnamed portal "", unnamed stmt "", 0 param format codes (all text),
+	//    len(params) values, 0 result format codes (all text)
+	bindLen := 4 + 1 + 1 + 2 + 2 + 2
+	for _, p := range params {
+		bindLen += 4
+		if p != nil {
+			bindLen += len(p)
+		}
+	}
+	c.wbuf = append(c.wbuf, 'B')
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(bindLen))
+	c.wbuf = append(c.wbuf, 0, 0)                          // portal="", stmt=""
+	c.wbuf = binary.BigEndian.AppendUint16(c.wbuf, 0)      // 0 param format codes -> default text
+	c.wbuf = binary.BigEndian.AppendUint16(c.wbuf, uint16(len(params)))
+	for _, p := range params {
+		if p == nil {
+			c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, 0xffffffff) // -1 NULL
+		} else {
+			c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(len(p)))
+			c.wbuf = append(c.wbuf, p...)
+		}
+	}
+	c.wbuf = binary.BigEndian.AppendUint16(c.wbuf, 0) // 0 result format codes -> default text
+
+	// 3. Describe ('D'): 'P' (portal), unnamed ""
+	c.wbuf = append(c.wbuf, 'D')
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, 4+1+1)
+	c.wbuf = append(c.wbuf, 'P', 0)
+
+	// 4. Execute ('E'): unnamed portal "", maxRows=0 (unlimited)
+	c.wbuf = append(c.wbuf, 'E')
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, 4+1+4)
+	c.wbuf = append(c.wbuf, 0)
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, 0)
+
+	// 5. Sync ('S')
+	c.wbuf = append(c.wbuf, 'S')
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, 4)
+
+	if err := c.flushWriteBuf(); err != nil {
+		return pgRetryableErr{err: err}
+	}
+	return nil
+}
+
+func (c *pgWireConn) drainUntilReadyForQuery() (int64, error) {
+	var rowsAffected int64
+	var firstErr error
+	for {
+		msgType, payload, err := c.readPacket()
+		if err != nil {
+			c.busy = false
+			if firstErr != nil {
+				return rowsAffected, firstErr
+			}
+			return rowsAffected, err
+		}
+		switch msgType {
+		case 'C':
+			rowsAffected = parsePGCommandTagRowsAffected(payload)
+		case 'S':
+			c.handleParameterStatus(payload)
+		case 'K':
+			c.handleBackendKeyData(payload)
+		case 'E':
+			pgErr := parsePGErrorResponse(payload)
+			if isFatalPGError(pgErr) {
+				c.markBroken()
+				return rowsAffected, pgErr
+			}
+			if firstErr == nil {
+				firstErr = pgErr
+			}
+		case 'Z':
+			if len(payload) >= 1 {
+				c.txStatus = payload[0]
+			}
+			c.busy = false
+			c.shrinkBuffersIfOversized()
+			return rowsAffected, firstErr
+		default:
+			// '1', '2', 'n', 'T', 'D', 'I', 'N'
+		}
+	}
+}
+
 type pgDriverConn struct {
-	conn           *pgconn.PgConn
+	conn           *pgWireConn
 	simpleProtocol bool
 }
 
@@ -116,13 +1900,21 @@ func (c *pgDriverConn) Prepare(query string) (driver.Stmt, error) {
 	return &pgDriverStmt{conn: c, query: query}, nil
 }
 
+func (c *pgDriverConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.conn == nil || c.conn.IsClosed() {
+		return nil, driver.ErrBadConn
+	}
+	return &pgDriverStmt{conn: c, query: query}, nil
+}
+
 func (c *pgDriverConn) Close() error {
 	if c.conn == nil || c.conn.IsClosed() {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return c.conn.Close(ctx)
+	return c.conn.Close()
 }
 
 func (c *pgDriverConn) Begin() (driver.Tx, error) {
@@ -169,10 +1961,14 @@ func (c *pgDriverConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driv
 }
 
 func (c *pgDriverConn) Ping(ctx context.Context) error {
-	if c.conn == nil || c.conn.IsClosed() {
+	if c.conn == nil || c.conn.IsClosed() || c.conn.IsBusy() {
 		return driver.ErrBadConn
 	}
-	return wrapPGErr(c.conn, ctx, c.conn.Ping(ctx))
+	_, err := c.ExecContext(ctx, ";", nil)
+	if err != nil && (ctx == nil || ctx.Err() == nil) {
+		c.conn.markBroken()
+	}
+	return wrapPGErr(c.conn, ctx, err)
 }
 
 func (c *pgDriverConn) IsValid() bool {
@@ -197,9 +1993,15 @@ func (c *pgDriverConn) requireStandardConformingStrings() error {
 }
 
 func (c *pgDriverConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	if c.conn == nil || c.conn.IsClosed() {
+	if c.conn == nil || c.conn.IsClosed() || c.conn.IsBusy() {
 		return nil, driver.ErrBadConn
 	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+
 	if c.simpleProtocol || len(args) == 0 {
 		if len(args) > 0 {
 			if err := c.requireStandardConformingStrings(); err != nil {
@@ -210,14 +2012,17 @@ func (c *pgDriverConn) ExecContext(ctx context.Context, query string, args []dri
 		if err != nil {
 			return nil, err
 		}
-		mrr := c.conn.Exec(ctx, sqlText)
-		results, err := mrr.ReadAll()
-		if err != nil {
-			return nil, wrapPGErr(c.conn, ctx, err)
+		guard := c.conn.startCancelGuard(ctx)
+		defer guard.finish()
+
+		c.conn.busy = true
+		if err := c.conn.writeSimpleQuery(sqlText); err != nil {
+			c.conn.busy = false
+			return nil, wrapPGErr(c.conn, ctx, guard.normalizeErr(err))
 		}
-		var rowsAffected int64
-		if len(results) > 0 {
-			rowsAffected = results[len(results)-1].CommandTag.RowsAffected()
+		rowsAffected, err := c.conn.drainUntilReadyForQuery()
+		if err != nil {
+			return nil, wrapPGErr(c.conn, ctx, guard.normalizeErr(err))
 		}
 		return driver.RowsAffected(rowsAffected), nil
 	}
@@ -226,18 +2031,32 @@ func (c *pgDriverConn) ExecContext(ctx context.Context, query string, args []dri
 	if err != nil {
 		return nil, err
 	}
-	rr := c.conn.ExecParams(ctx, query, params, nil, nil, nil)
-	tag, err := rr.Close()
-	if err != nil {
-		return nil, wrapPGErr(c.conn, ctx, err)
+	guard := c.conn.startCancelGuard(ctx)
+	defer guard.finish()
+
+	c.conn.busy = true
+	if err := c.conn.writeExtendedQuery(query, params); err != nil {
+		c.conn.busy = false
+		return nil, wrapPGErr(c.conn, ctx, guard.normalizeErr(err))
 	}
-	return driver.RowsAffected(tag.RowsAffected()), nil
+	rowsAffected, err := c.conn.drainUntilReadyForQuery()
+	if err != nil {
+		return nil, wrapPGErr(c.conn, ctx, guard.normalizeErr(err))
+	}
+	return driver.RowsAffected(rowsAffected), nil
 }
 
 func (c *pgDriverConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if c.conn == nil || c.conn.IsClosed() {
+	if c.conn == nil || c.conn.IsClosed() || c.conn.IsBusy() {
 		return nil, driver.ErrBadConn
 	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	var guard *pgCancelGuard
 	if c.simpleProtocol {
 		if len(args) > 0 {
 			if err := c.requireStandardConformingStrings(); err != nil {
@@ -248,40 +2067,82 @@ func (c *pgDriverConn) QueryContext(ctx context.Context, query string, args []dr
 		if err != nil {
 			return nil, err
 		}
-		mrr := c.conn.Exec(ctx, sqlText)
-		for mrr.NextResult() {
-			rr := mrr.ResultReader()
-			fields := rr.FieldDescriptions()
-			if len(fields) > 0 {
-				return newPGRows(rr, mrr, fields), nil
-			}
-			tag, cErr := rr.Close()
-			if cErr != nil {
-				_ = mrr.Close()
-				return nil, wrapPGErr(c.conn, ctx, cErr)
-			}
-			_ = tag
+		guard = c.conn.startCancelGuard(ctx)
+		c.conn.busy = true
+		if err := c.conn.writeSimpleQuery(sqlText); err != nil {
+			c.conn.busy = false
+			normErr := guard.normalizeErr(err)
+			guard.finish()
+			return nil, wrapPGErr(c.conn, ctx, normErr)
 		}
-		if err := mrr.Close(); err != nil {
-			return nil, wrapPGErr(c.conn, ctx, err)
+	} else {
+		params, err := encodePGParams(args)
+		if err != nil {
+			return nil, err
 		}
-		return &pgRows{closed: true}, nil
+		guard = c.conn.startCancelGuard(ctx)
+		c.conn.busy = true
+		if err := c.conn.writeExtendedQuery(query, params); err != nil {
+			c.conn.busy = false
+			normErr := guard.normalizeErr(err)
+			guard.finish()
+			return nil, wrapPGErr(c.conn, ctx, normErr)
+		}
 	}
 
-	params, err := encodePGParams(args)
-	if err != nil {
-		return nil, err
-	}
-	rr := c.conn.ExecParams(ctx, query, params, nil, nil, nil)
-	fields := rr.FieldDescriptions()
-	if len(fields) == 0 {
-		tag, err := rr.Close()
+	var firstErr error
+	for {
+		msgType, payload, err := c.conn.readPacket()
 		if err != nil {
-			return nil, wrapPGErr(c.conn, ctx, err)
+			c.conn.busy = false
+			normErr := guard.normalizeErr(err)
+			guard.finish()
+			if firstErr != nil {
+				return nil, wrapPGErr(c.conn, ctx, firstErr)
+			}
+			return nil, wrapPGErr(c.conn, ctx, normErr)
 		}
-		return &pgRows{closed: true, commandTag: tag}, nil
+		switch msgType {
+		case 'T':
+			if firstErr != nil {
+				continue
+			}
+			fields, fErr := parsePGRowDescription(payload)
+			if fErr != nil {
+				c.conn.markBroken()
+				guard.finish()
+				return nil, wrapPGErr(c.conn, ctx, fErr)
+			}
+			return newPGRows(c.conn, guard, fields), nil
+		case 'S':
+			c.conn.handleParameterStatus(payload)
+		case 'K':
+			c.conn.handleBackendKeyData(payload)
+		case 'E':
+			pgErr := parsePGErrorResponse(payload)
+			if isFatalPGError(pgErr) {
+				c.conn.markBroken()
+				guard.finish()
+				return nil, wrapPGErr(c.conn, ctx, pgErr)
+			}
+			if firstErr == nil {
+				firstErr = pgErr
+			}
+		case 'Z':
+			if len(payload) >= 1 {
+				c.conn.txStatus = payload[0]
+			}
+			c.conn.busy = false
+			c.conn.shrinkBuffersIfOversized()
+			guard.finish()
+			if firstErr != nil {
+				return nil, wrapPGErr(c.conn, ctx, firstErr)
+			}
+			return &pgRows{closed: true}, nil
+		default:
+			// '1', '2', 'n', 'C', 'I', 'N' before any RowDescription
+		}
 	}
-	return newPGRows(rr, nil, fields), nil
 }
 
 type pgDriverTx struct {
@@ -314,32 +2175,39 @@ func (s *pgDriverStmt) Exec(args []driver.Value) (driver.Result, error) {
 	return s.conn.ExecContext(context.Background(), s.query, valuesToNamed(args))
 }
 
+func (s *pgDriverStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	return s.conn.ExecContext(ctx, s.query, args)
+}
+
 func (s *pgDriverStmt) Query(args []driver.Value) (driver.Rows, error) {
 	return s.conn.QueryContext(context.Background(), s.query, valuesToNamed(args))
 }
 
-type pgRows struct {
-	cols       []string
-	oids       []uint32
-	rr         *pgconn.ResultReader
-	mrr        *pgconn.MultiResultReader
-	commandTag pgconn.CommandTag
-	closeErr   error
-	closed     bool
+func (s *pgDriverStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return s.conn.QueryContext(ctx, s.query, args)
 }
 
-func newPGRows(rr *pgconn.ResultReader, mrr *pgconn.MultiResultReader, fields []pgconn.FieldDescription) *pgRows {
+type pgRows struct {
+	cols     []string
+	oids     []uint32
+	conn     *pgWireConn
+	guard    *pgCancelGuard
+	closeErr error
+	closed   bool
+}
+
+func newPGRows(conn *pgWireConn, guard *pgCancelGuard, fields []pgFieldDesc) *pgRows {
 	cols := make([]string, len(fields))
 	oids := make([]uint32, len(fields))
 	for i, f := range fields {
-		cols[i] = f.Name
-		oids[i] = f.DataTypeOID
+		cols[i] = f.name
+		oids[i] = f.oid
 	}
 	return &pgRows{
-		cols: cols,
-		oids: oids,
-		rr:   rr,
-		mrr:  mrr,
+		cols:  cols,
+		oids:  oids,
+		conn:  conn,
+		guard: guard,
 	}
 }
 
@@ -349,62 +2217,138 @@ func (r *pgRows) Close() error {
 	return r.closeReader()
 }
 
-func (r *pgRows) CommandTag() pgconn.CommandTag {
-	return r.commandTag
-}
-
 func (r *pgRows) closeReader() error {
 	if r.closed {
 		return r.closeErr
 	}
 	r.closed = true
-	var firstErr error
-	if r.rr != nil {
-		tag, err := r.rr.Close()
-		r.commandTag = tag
-		r.rr = nil
-		if err != nil {
-			firstErr = err
+	defer func() {
+		if r.guard != nil {
+			r.guard.finish()
+			r.guard = nil
 		}
+		r.conn = nil
+	}()
+	if r.conn != nil && !r.conn.IsClosed() && r.conn.IsBusy() {
+		_, err := r.conn.drainUntilReadyForQuery()
+		r.closeErr = r.guard.normalizeErr(err)
 	}
-	if r.mrr != nil {
-		if err := r.mrr.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		r.mrr = nil
-	}
-	r.closeErr = firstErr
 	return r.closeErr
 }
 
 func (r *pgRows) Next(dest []driver.Value) error {
-	if r.closed || r.rr == nil {
+	if r.closed || r.conn == nil {
 		return io.EOF
 	}
-	if !r.rr.NextRow() {
-		if err := r.closeReader(); err != nil {
-			return err
+	for {
+		msgType, payload, err := r.conn.readPacket()
+		if err != nil {
+			r.conn.busy = false
+			normErr := r.guard.normalizeErr(err)
+			r.closed = true
+			r.closeErr = normErr
+			if r.guard != nil {
+				r.guard.finish()
+				r.guard = nil
+			}
+			r.conn = nil
+			return normErr
 		}
-		return io.EOF
+		switch msgType {
+		case 'D':
+			return r.decodeDataRow(payload, dest)
+		case 'C', 'I':
+			// Current result set completed; drain ReadyForQuery (and any trailing batch messages).
+			if err := r.closeReader(); err != nil {
+				return err
+			}
+			return io.EOF
+		case 'E':
+			pgErr := parsePGErrorResponse(payload)
+			if isFatalPGError(pgErr) {
+				r.conn.markBroken()
+			} else {
+				_, _ = r.conn.drainUntilReadyForQuery()
+			}
+			r.closed = true
+			r.closeErr = pgErr
+			if r.guard != nil {
+				r.guard.finish()
+				r.guard = nil
+			}
+			r.conn = nil
+			return pgErr
+		case 'Z':
+			if len(payload) >= 1 {
+				r.conn.txStatus = payload[0]
+			}
+			r.conn.busy = false
+			r.conn.shrinkBuffersIfOversized()
+			r.closed = true
+			if r.guard != nil {
+				r.guard.finish()
+				r.guard = nil
+			}
+			r.conn = nil
+			return io.EOF
+		case 'S':
+			r.conn.handleParameterStatus(payload)
+		case 'K':
+			r.conn.handleBackendKeyData(payload)
+		default:
+			// Ignore NoticeResponse ('N') or auxiliary frames.
+		}
 	}
-	row := r.rr.Values()
-	for i := range dest {
-		if i >= len(row) || row[i] == nil {
-			dest[i] = nil
+}
+
+func (r *pgRows) decodeDataRow(payload []byte, dest []driver.Value) error {
+	if len(payload) < 2 {
+		r.conn.markBroken()
+		_ = r.closeReader()
+		return errors.New("sqlx: truncated DataRow packet")
+	}
+	colCount := int(int16(binary.BigEndian.Uint16(payload[0:2])))
+	if colCount < 0 {
+		r.conn.markBroken()
+		_ = r.closeReader()
+		return fmt.Errorf("sqlx: invalid DataRow column count %d", colCount)
+	}
+	pos := 2
+	for i := 0; i < colCount; i++ {
+		if pos+4 > len(payload) {
+			r.conn.markBroken()
+			_ = r.closeReader()
+			return errors.New("sqlx: truncated DataRow column length")
+		}
+		colLen := int32(binary.BigEndian.Uint32(payload[pos : pos+4]))
+		pos += 4
+		if colLen == -1 {
+			if i < len(dest) {
+				dest[i] = nil
+			}
 			continue
 		}
-		// Copy column bytes out of pgconn's reusable buffer before decoding.
-		rawCopy := make([]byte, len(row[i]))
-		copy(rawCopy, row[i])
-		var oid uint32
-		if i < len(r.oids) {
-			oid = r.oids[i]
+		if colLen < -1 || pos+int(colLen) > len(payload) {
+			r.conn.markBroken()
+			_ = r.closeReader()
+			return errors.New("sqlx: invalid DataRow column slice bounds")
 		}
-		val, err := decodePGTextValue(oid, rawCopy)
-		if err != nil {
-			return err
+		rawCol := payload[pos : pos+int(colLen)]
+		pos += int(colLen)
+		if i < len(dest) {
+			var oid uint32
+			if i < len(r.oids) {
+				oid = r.oids[i]
+			}
+			val, err := decodePGTextValue(oid, rawCol)
+			if err != nil {
+				return err
+			}
+			dest[i] = val
 		}
-		dest[i] = val
+	}
+	for i := colCount; i < len(dest); i++ {
+		dest[i] = nil
 	}
 	return nil
 }
@@ -419,6 +2363,8 @@ func encodePGParams(args []driver.NamedValue) ([][]byte, error) {
 		switch v := a.Value.(type) {
 		case int64:
 			out[i] = []byte(strconv.FormatInt(v, 10))
+		case uint64:
+			out[i] = []byte(strconv.FormatUint(v, 10))
 		case float64:
 			switch {
 			case math.IsNaN(v):
@@ -500,6 +2446,8 @@ func formatSimpleLiteral(val driver.Value) (string, error) {
 			return "(" + strconv.FormatInt(v, 10) + ")", nil
 		}
 		return strconv.FormatInt(v, 10), nil
+	case uint64:
+		return strconv.FormatUint(v, 10), nil
 	case float64:
 		switch {
 		case math.IsNaN(v):

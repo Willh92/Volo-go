@@ -67,6 +67,37 @@ func (s *AppServer) recordAuditLog(r *http.Request, actor *domain.User, action s
 		`INSERT INTO audit_logs (id, actor_id, actor_name, action, resource_type, resource_id, client_ip, detail_json, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id.Next(), actor.ID, actor.Username, action, resourceType, resourceID, security.MaskIP(clientIP), detJSON, time.Now().UnixMilli())
+	s.auditActionsMu.Lock()
+	s.auditActionsExp = time.Time{}
+	s.auditActionsMu.Unlock()
+}
+
+func (s *AppServer) listDistinctAuditActions(ctx context.Context) []string {
+	now := time.Now()
+	s.auditActionsMu.Lock()
+	if s.auditActions != nil && now.Before(s.auditActionsExp) {
+		out := make([]string, len(s.auditActions))
+		copy(out, s.auditActions)
+		s.auditActionsMu.Unlock()
+		return out
+	}
+	s.auditActionsMu.Unlock()
+
+	var actionRows []struct {
+		Action string `db:"action"`
+	}
+	err := sqlx.SelectInto(ctx, s.deps.Store, &actionRows, `SELECT DISTINCT action FROM audit_logs WHERE action <> '' ORDER BY action ASC`)
+	actions := make([]string, 0, len(actionRows))
+	for _, ar := range actionRows {
+		actions = append(actions, ar.Action)
+	}
+	if err == nil {
+		s.auditActionsMu.Lock()
+		s.auditActions = actions
+		s.auditActionsExp = now.Add(60 * time.Second)
+		s.auditActionsMu.Unlock()
+	}
+	return actions
 }
 
 func parseAdminPageParams(r *http.Request, defaultPerPage, maxPerPage int) (int, int) {
@@ -98,7 +129,7 @@ func (s *AppServer) resolveBackupDir() string {
 	return "backups"
 }
 
-func (s *AppServer) mintBackupExportTicket(userID string, sessionID string, ipBucket string) (string, error) {
+func (s *AppServer) mintBackupExportTicket(userID string, sessionID string, ipBucket string, backupName string) (string, error) {
 	if strings.TrimSpace(userID) == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(ipBucket) == "" {
 		return "", errors.New("interactive admin session required for backup ticket")
 	}
@@ -119,15 +150,16 @@ func (s *AppServer) mintBackupExportTicket(userID string, sessionID string, ipBu
 		}
 	}
 	s.backupTickets[tok] = backupExportTicket{
-		UserID:    userID,
-		SessionID: sessionID,
-		IPBucket:  ipBucket,
-		ExpiresAt: now.Add(60 * time.Second),
+		UserID:     userID,
+		SessionID:  sessionID,
+		IPBucket:   ipBucket,
+		BackupName: strings.TrimSpace(backupName),
+		ExpiresAt:  now.Add(60 * time.Second),
 	}
 	return tok, nil
 }
 
-func (s *AppServer) consumeBackupExportTicket(r *http.Request, rawTicket string) (*domain.User, bool) {
+func (s *AppServer) consumeBackupExportTicket(r *http.Request, rawTicket string, expectedBackupName string) (*domain.User, bool) {
 	tok := strings.TrimSpace(rawTicket)
 	if len(tok) != 64 || s.deps.Store == nil {
 		return nil, false
@@ -158,7 +190,11 @@ func (s *AppServer) consumeBackupExportTicket(r *http.Request, rawTicket string)
 	if entry.UserID != viewer.ID || entry.SessionID != sess.ID || entry.IPBucket != ipBucket {
 		return nil, false
 	}
-	u, err := sqlx.Get[domain.User](r.Context(), s.deps.Store,
+	if entry.BackupName != strings.TrimSpace(expectedBackupName) {
+		return nil, false
+	}
+	var u domain.User
+	err := sqlx.GetInto(r.Context(), s.deps.Store, &u,
 		`SELECT * FROM users WHERE id = ? AND status = ? AND role = ?`,
 		entry.UserID, domain.UserStatusActive, domain.RoleAdmin)
 	if err != nil {
@@ -208,7 +244,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
-			actor, ok := s.consumeBackupExportTicket(r, ticket)
+			actor, ok := s.consumeBackupExportTicket(r, ticket, "")
 			if !ok {
 				writeErrJSON(w, http.StatusUnauthorized, "invalid or expired backup export ticket")
 				return
@@ -216,12 +252,49 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			s.handleAdminBackupExport(w, r, actor)
 			return
 		}
-		actor, _, ok := s.authenticateAdminRequest(w, r, auth.ScopeBackupRead, true)
+		actor, sess, ok := s.authenticateAdminRequest(w, r, auth.ScopeBackupRead, true)
 		if !ok {
+			return
+		}
+		if sess != nil {
+			writeErrJSON(w, http.StatusForbidden, "step-up password ticket required for interactive backup export")
 			return
 		}
 		s.handleAdminBackupExport(w, r, actor)
 		return
+	}
+
+	if (strings.HasPrefix(sub, "backup/local/") || strings.HasPrefix(sub, "backups/local/")) && r.Method == http.MethodGet {
+		localRest := strings.TrimPrefix(sub, "backups/local/")
+		if localRest == sub {
+			localRest = strings.TrimPrefix(sub, "backup/local/")
+		}
+		if localRest != "" && !strings.Contains(localRest, "/") {
+			base := filepath.Base(localRest)
+			if base != localRest || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
+				writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
+				return
+			}
+			if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
+				actor, ok := s.consumeBackupExportTicket(r, ticket, base)
+				if !ok {
+					writeErrJSON(w, http.StatusUnauthorized, "invalid or expired backup download ticket")
+					return
+				}
+				s.serveLocalBackupArchive(w, r, actor, base)
+				return
+			}
+			actor, sess, ok := s.authenticateAdminRequest(w, r, auth.ScopeBackupRead, true)
+			if !ok {
+				return
+			}
+			if sess != nil {
+				writeErrJSON(w, http.StatusForbidden, "step-up password ticket required for interactive local backup download")
+				return
+			}
+			s.serveLocalBackupArchive(w, r, actor, base)
+			return
+		}
 	}
 
 	actor, sess, ok := s.authenticateAdminRequest(w, r, "", true)
@@ -257,8 +330,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSEO, patchForks, 0)
 		}
 		repos, err := s.refreshGitHubRepositories(r.Context(), req.Username)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		resp := map[string]any{
@@ -275,8 +347,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case sub == "seo/github-publish" && r.Method == http.MethodPost:
 		art, err := s.publishGitHubShowcaseArticle(r.Context(), actor)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.recordAuditLog(r, actor, "github.publish_showcase", "article", art.ID, map[string]any{"slug": art.Slug})
@@ -289,8 +360,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 
 	case sub == "seo/indexnow-push" && r.Method == http.MethodPost:
 		n, err := s.pushIndexNowURLs(r.Context(), s.publicBaseURL(r))
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"pushed_urls": n})
@@ -377,17 +447,12 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM audit_logs WHERE `+whereSQL, args...).Scan(&total)
 		baseSQL := `SELECT * FROM audit_logs WHERE ` + whereSQL + ` ORDER BY created_at DESC`
 		qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-		rows, _ := sqlx.Select[domain.AuditLog](r.Context(), s.deps.Store, qSQL, fullArgs...)
+		var rows []domain.AuditLog
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 		if rows == nil {
 			rows = []domain.AuditLog{}
 		}
-		actionRows, _ := sqlx.Select[struct {
-			Action string `db:"action"`
-		}](r.Context(), s.deps.Store, `SELECT DISTINCT action FROM audit_logs WHERE action <> '' ORDER BY action ASC`)
-		actions := make([]string, 0, len(actionRows))
-		for _, ar := range actionRows {
-			actions = append(actions, ar.Action)
-		}
+		actions := s.listDistinctAuditActions(r.Context())
 		writeJSON(w, http.StatusOK, map[string]any{
 			"items":     rows,
 			"logs":      rows,
@@ -414,9 +479,8 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		ipBucket := security.RateLimitBucketKey(s.clientIP(r))
-		tok, err := s.mintBackupExportTicket(actor.ID, sess.ID, ipBucket)
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		tok, err := s.mintBackupExportTicket(actor.ID, sess.ID, ipBucket, "")
+		if writeServerErr(w, err) {
 			return
 		}
 		mediaQuery := ""
@@ -433,31 +497,16 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		})
 
 	case sub == "backup/local" || strings.HasPrefix(sub, "backup/local/"):
-		s.handleAdminLocalBackups(w, r, actor, strings.TrimPrefix(sub, "backup/local"))
+		s.handleAdminLocalBackups(w, r, actor, sess, strings.TrimPrefix(sub, "backup/local"))
 
 	case sub == "backups/local" || strings.HasPrefix(sub, "backups/local/"):
-		s.handleAdminLocalBackups(w, r, actor, strings.TrimPrefix(sub, "backups/local"))
+		s.handleAdminLocalBackups(w, r, actor, sess, strings.TrimPrefix(sub, "backups/local"))
 
 	case (sub == "backup/restore" || sub == "backups/restore") && r.Method == http.MethodPost:
 		s.handleAdminBackupRestore(w, r, actor)
 
 	case (sub == "backup/import-legacy" || sub == "backups/import-legacy") && r.Method == http.MethodPost:
-		rep, dryRun, newSiteURL, err := s.streamLegacyImportUpload(w, r, false)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if !dryRun {
-			if newSiteURL != "" {
-				s.deps.Config.SetPublicURL(strings.TrimRight(newSiteURL, "/"))
-				if s.deps.WAF != nil {
-					s.deps.WAF.SetPublicURL(s.deps.Config.GetPublicURL())
-				}
-			}
-			s.reloadRuntimeAfterDBRestore(r.Context())
-			s.recordAuditLog(r, actor, "backup.import_legacy", "system", "etl", nil)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "report": rep})
+		s.handleAdminImportLegacy(w, r, actor)
 
 	case sub == "doctor" && r.Method == http.MethodGet:
 		rep := doctor.Run(r.Context(), s.deps.Config, s.deps.Store)
@@ -468,11 +517,47 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+func (s *AppServer) handleAdminImportLegacy(w http.ResponseWriter, r *http.Request, actor *domain.User) {
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	prep, err := s.spoolLegacyImportUpload(w, r)
+	if writeBadErr(w, err) {
+		return
+	}
+	defer os.Remove(prep.tmpPath)
+
+	// Production import-legacy on an already-initialized site NEVER permits DB swaps,
+	// admin credential overrides, or canonical PublicURL mutation.
+	prep.rawDriver = ""
+	prep.rawDSN = ""
+	prep.adminUsername = ""
+	prep.adminEmail = ""
+	prep.adminDisplayName = ""
+	prep.adminPasswordHash = ""
+	prep.newSiteURL = ""
+
+	if !prep.dryRun {
+		if !s.verifyStepUpPassword(w, r, actor.ID, prep.currentPassword) {
+			return
+		}
+	}
+
+	rep, err := s.executeLegacyImport(r.Context(), prep, false)
+	if writeBadErr(w, err) {
+		return
+	}
+	if !prep.dryRun {
+		s.reloadRuntimeAfterDBRestore(r.Context())
+		s.recordAuditLog(r, actor, "backup.import_legacy", "system", "etl", nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": prep.dryRun, "report": rep})
+}
+
 func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request, actor *domain.User, sess *domain.UserSession, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "" {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+		if !requireMethod(w, r, http.MethodGet) {
 			return
 		}
 		type oidcLinkDTO struct {
@@ -482,7 +567,8 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 			CreatedAt    int64  `db:"created_at" json:"created_at"`
 			LastUsedAt   int64  `db:"last_used_at" json:"last_used_at"`
 		}
-		rows, _ := sqlx.Select[oidcLinkDTO](r.Context(), s.deps.Store,
+		var rows []oidcLinkDTO
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows,
 			`SELECT id, name, credential_id, created_at, last_used_at
 			 FROM user_credentials WHERE user_id = ? AND kind = 'oidc' ORDER BY created_at DESC`,
 			actor.ID)
@@ -510,6 +596,59 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	if rest == "begin" {
+		if !requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		if !s.requireSameOrigin(w, r) {
+			return
+		}
+		if sess == nil || sess.ID == "" {
+			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
+			return
+		}
+		var req struct {
+			Provider        string `json:"provider"`
+			Next            string `json:"next"`
+			CurrentPassword string `json:"current_password"`
+		}
+		if !decodeJSONBody(w, r, 4096, &req) {
+			return
+		}
+		provName := strings.TrimSpace(req.Provider)
+		if provName == "" || s.deps.Plugins == nil {
+			writeErrJSON(w, http.StatusBadRequest, "oidc provider is required")
+			return
+		}
+		prov, ok := s.deps.Plugins.Providers().OIDC(provName)
+		if !ok || prov == nil {
+			writeErrJSON(w, http.StatusNotFound, "unknown oidc provider")
+			return
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
+			return
+		}
+		tok, err := s.mintOIDCBindTicket(actor.ID, sess.ID, prov.Name())
+		if writeServerErr(w, err) {
+			return
+		}
+		redirectURL := "/api/v1/auth/oidc/" + url.PathEscape(prov.Name()) + "/start?target=bind&bind_ticket=" + url.QueryEscape(tok)
+		if rawNext := strings.TrimSpace(req.Next); rawNext != "" {
+			if !isSafeRelativeRedirect(rawNext) {
+				writeErrJSON(w, http.StatusBadRequest, "invalid next redirect path")
+				return
+			}
+			redirectURL += "&next=" + url.QueryEscape(rawNext)
+		}
+		s.recordAuditLog(r, actor, "security.oidc_bind_begin", "user_credential", prov.Name(), nil)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"bind_ticket":  tok,
+			"redirect_url": redirectURL,
+		})
+		return
+	}
+
 	if r.Method == http.MethodDelete {
 		if sess == nil || sess.ID == "" {
 			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
@@ -527,8 +666,7 @@ func (s *AppServer) handleAdminOIDCLinks(w http.ResponseWriter, r *http.Request,
 		res, err := s.deps.Store.ExecContext(r.Context(),
 			`DELETE FROM user_credentials WHERE id = ? AND user_id = ? AND kind = 'oidc'`,
 			rest, actor.ID)
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
@@ -548,7 +686,8 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.NavItem](r.Context(), s.deps.Store, `SELECT * FROM nav_items ORDER BY sort_order ASC, created_at ASC`)
+			var rows []domain.NavItem
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM nav_items ORDER BY sort_order ASC, created_at ASC`)
 			if rows == nil {
 				rows = []domain.NavItem{}
 			}
@@ -591,8 +730,7 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 				`INSERT INTO nav_items (id, parent_id, title, i18n_titles_json, url, open_in_new_tab, icon, sort_order, is_enabled, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				in.ID, in.ParentID, in.Title, in.I18nTitlesJSON, in.URL, in.OpenInNewTab, in.Icon, in.SortOrder, in.IsEnabled, now, now)
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -626,15 +764,15 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			`UPDATE nav_items SET parent_id = ?, title = ?, i18n_titles_json = ?, url = ?, open_in_new_tab = ?, icon = ?, sort_order = ?, is_enabled = ?, updated_at = ? WHERE id = ?`,
 			in.ParentID, title, in.I18nTitlesJSON, cleanURL,
 			in.OpenInNewTab, cleanIcon, in.SortOrder, in.IsEnabled, time.Now().UnixMilli(), rest)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		writeOKJSON(w)
 	case http.MethodDelete:
-		delRows, _ := sqlx.Select[struct {
+		var delRows []struct {
 			ID string `db:"id"`
-		}](r.Context(), s.deps.Store, `SELECT id FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
+		}
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &delRows, `SELECT id FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
 		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM nav_items WHERE id = ? OR parent_id = ?`, rest, rest)
 		if len(delRows) > 0 {
 			delIDs := make([]string, 0, len(delRows))
@@ -656,11 +794,11 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "patrol" && r.Method == http.MethodPost {
 		n, err := s.patrolAllFriendLinks(r.Context())
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
-		rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links ORDER BY sort_order ASC`)
+		var rows []domain.Link
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM links ORDER BY sort_order ASC`)
 		writeJSON(w, http.StatusOK, map[string]any{"checked": n, "items": rows, "links": rows})
 		return
 	}
@@ -706,8 +844,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		if action == "delete" {
@@ -750,13 +887,15 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM links WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM links WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.Link](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.Link
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Link{}
 			}
-			catRows, _ := sqlx.Select[struct {
+			var catRows []struct {
 				CategoryName string `db:"category_name"`
-			}](r.Context(), s.deps.Store, `SELECT DISTINCT category_name FROM links WHERE TRIM(category_name) <> '' ORDER BY category_name ASC`)
+			}
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &catRows, `SELECT DISTINCT category_name FROM links WHERE TRIM(category_name) <> '' ORDER BY category_name ASC`)
 			categories := make([]string, 0, len(catRows))
 			for _, cr := range catRows {
 				categories = append(categories, cr.CategoryName)
@@ -814,7 +953,8 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 
 	parts := strings.Split(rest, "/")
 	if len(parts) == 2 && parts[1] == "check" && r.Method == http.MethodPost {
-		lk, err := sqlx.Get[domain.Link](r.Context(), s.deps.Store, `SELECT * FROM links WHERE id = ?`, strings.TrimSpace(parts[0]))
+		var lk domain.Link
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &lk, `SELECT * FROM links WHERE id = ?`, strings.TrimSpace(parts[0]))
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "link not found")
 			return
@@ -849,8 +989,7 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 		_, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE links SET title = ?, url = ?, description = ?, icon_url = ?, category_name = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
 			title, cleanURL, in.Description, cleanIcon, in.CategoryName, in.SortOrder, time.Now().UnixMilli(), rest)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -914,7 +1053,8 @@ func flattenOPMLOutlines(in []opmlOutline, dst *[]opmlOutline) {
 func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if (rest == "export.opml" || rest == "export" || rest == "opml") && r.Method == http.MethodGet {
-		rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
+		var rows []domain.Follow
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM follows ORDER BY sort_order ASC, created_at ASC`)
 		siteTitle := "Volo Subscriptions"
 		if s.deps.Settings != nil && strings.TrimSpace(s.deps.Settings.Snapshot().Site.Title) != "" {
 			siteTitle = strings.TrimSpace(s.deps.Settings.Snapshot().Site.Title) + " Subscriptions"
@@ -939,8 +1079,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			Body: opmlBodyDoc{Outlines: outlines},
 		}
 		xmlBytes, err := xml.MarshalIndent(doc, "", "  ")
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -1003,9 +1142,10 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		var flat []opmlOutline
 		flattenOPMLOutlines(doc.Body.Outlines, &flat)
 
-		existing, _ := sqlx.Select[struct {
+		var existing []struct {
 			FeedURL string `db:"feed_url"`
-		}](r.Context(), s.deps.Store, `SELECT feed_url FROM follows`)
+		}
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &existing, `SELECT feed_url FROM follows`)
 		seen := make(map[string]struct{}, len(existing)+len(flat))
 		for _, ex := range existing {
 			seen[strings.ToLower(strings.TrimSpace(ex.FeedURL))] = struct{}{}
@@ -1073,8 +1213,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 
 	if rest == "sync" && r.Method == http.MethodPost {
 		n, err := s.syncAllFollowFeeds(r.Context())
-		if err != nil {
-			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+		if writeServerErr(w, err) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"synced_items": n})
@@ -1114,7 +1253,8 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM follows WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM follows WHERE ` + whereSQL + ` ORDER BY sort_order ASC, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.Follow](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.Follow
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.Follow{}
 			}
@@ -1180,7 +1320,8 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 
 	parts := strings.Split(rest, "/")
 	if len(parts) == 2 && parts[1] == "sync" && r.Method == http.MethodPost {
-		fw, err := sqlx.Get[domain.Follow](r.Context(), s.deps.Store, `SELECT * FROM follows WHERE id = ?`, strings.TrimSpace(parts[0]))
+		var fw domain.Follow
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &fw, `SELECT * FROM follows WHERE id = ?`, strings.TrimSpace(parts[0]))
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "follow subscription not found")
 			return
@@ -1242,8 +1383,7 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			`UPDATE follows SET title = ?, site_url = ?, feed_url = ?, description = ?, icon_url = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
 			title, cleanSite, cleanFeed,
 			in.Description, cleanIcon, in.SortOrder, time.Now().UnixMilli(), rest)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -1417,7 +1557,8 @@ func parseRedirectImportCandidates(formatHint string, rawData []byte) ([]redirec
 func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "export" && r.Method == http.MethodGet {
-		rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, `SELECT * FROM redirects ORDER BY created_at DESC`)
+		var rows []domain.RedirectRule
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, `SELECT * FROM redirects ORDER BY created_at DESC`)
 		if rows == nil {
 			rows = []domain.RedirectRule{}
 		}
@@ -1528,8 +1669,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		if imported == 0 && len(candidates) > 0 {
@@ -1587,8 +1727,7 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		if s.deps.Content != nil {
@@ -1636,7 +1775,8 @@ func (s *AppServer) handleAdminRedirects(w http.ResponseWriter, r *http.Request,
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM redirects WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM redirects WHERE ` + whereSQL + ` ORDER BY ` + orderClause
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.RedirectRule](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.RedirectRule
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.RedirectRule{}
 			}
@@ -1884,19 +2024,48 @@ func (s *AppServer) replayWebhookDelivery(ctx context.Context, wh domain.Webhook
 	return persist(resp.StatusCode, durMS, respStr, nil)
 }
 
+func (s *AppServer) validateWebhookOutboundURL(rawURL string) (string, error) {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return "", errors.New("webhook url is required")
+	}
+	dialer := s.deps.OutboundDialer
+	if dialer == nil {
+		dialer = &security.OutboundSafeDialer{Timeout: 8 * time.Second}
+	}
+	u, err := dialer.ValidateOutboundURL(trimmed)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
 func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.Webhook](r.Context(), s.deps.Store, `SELECT * FROM webhooks ORDER BY created_at DESC`)
+			page, perPage := parseAdminPageParams(r, 20, 100)
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM webhooks`).Scan(&total)
+			baseSQL := `SELECT * FROM webhooks ORDER BY created_at DESC`
+			qSQL, fullArgs := s.paginateQuery(baseSQL, nil, page, perPage)
+			var rows []domain.Webhook
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			out := make([]map[string]any, 0, len(rows))
 			for _, wh := range rows {
 				hasSec := wh.SecretCiphertext != ""
 				wh.SecretCiphertext = ""
 				out = append(out, map[string]any{"webhook": wh, "secret_set": hasSec})
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": out})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"items":     out,
+				"webhooks":  out,
+				"total":     total,
+				"page":      page,
+				"per_page":  perPage,
+				"page_size": perPage,
+			})
 
 		case http.MethodPost:
 			var in struct {
@@ -1914,6 +2083,12 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 				writeErrJSON(w, http.StatusBadRequest, "name and url required")
 				return
 			}
+			cleanURL, uErr := s.validateWebhookOutboundURL(in.URL)
+			if uErr != nil {
+				writeErrJSON(w, http.StatusBadRequest, uErr.Error())
+				return
+			}
+			in.URL = cleanURL
 			if in.Provider == "" {
 				in.Provider = "custom"
 			}
@@ -1952,26 +2127,37 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 
 	parts := strings.Split(rest, "/")
 	whID := parts[0]
-	wh, err := sqlx.Get[domain.Webhook](r.Context(), s.deps.Store, `SELECT * FROM webhooks WHERE id = ?`, whID)
+	var wh domain.Webhook
+	err := sqlx.GetInto(r.Context(), s.deps.Store, &wh, `SELECT * FROM webhooks WHERE id = ?`, whID)
 	if err != nil {
 		writeErrJSON(w, http.StatusNotFound, "webhook not found")
 		return
 	}
 	if len(parts) == 2 && parts[1] == "deliveries" && r.Method == http.MethodGet {
-		rows, _ := sqlx.Select[domain.WebhookDelivery](r.Context(), s.deps.Store,
-			`SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC, id DESC LIMIT 100`, wh.ID)
+		page, perPage := parseAdminPageParams(r, 20, 100)
+		var total int
+		_ = s.deps.Store.QueryRowContext(r.Context(),
+			`SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id = ?`, wh.ID).Scan(&total)
+		baseSQL := `SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC, id DESC`
+		qSQL, fullArgs := s.paginateQuery(baseSQL, []any{wh.ID}, page, perPage)
+		var rows []domain.WebhookDelivery
+		_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 		if rows == nil {
 			rows = []domain.WebhookDelivery{}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"items":      rows,
 			"deliveries": rows,
-			"total":      len(rows),
+			"total":      total,
+			"page":       page,
+			"per_page":   perPage,
+			"page_size":  perPage,
 		})
 		return
 	}
 	if len(parts) == 4 && parts[1] == "deliveries" && parts[3] == "replay" && r.Method == http.MethodPost {
-		orig, dErr := sqlx.Get[domain.WebhookDelivery](r.Context(), s.deps.Store,
+		var orig domain.WebhookDelivery
+		dErr := sqlx.GetInto(r.Context(), s.deps.Store, &orig,
 			`SELECT * FROM webhook_deliveries WHERE id = ? AND webhook_id = ?`, strings.TrimSpace(parts[2]), wh.ID)
 		if dErr != nil {
 			writeErrJSON(w, http.StatusNotFound, "webhook delivery not found")
@@ -2020,6 +2206,17 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 		if !decodeJSONBody(w, r, 16384, &in) {
 			return
 		}
+		nextName := strings.TrimSpace(in.Name)
+		nextURL := strings.TrimSpace(in.URL)
+		if nextName == "" || nextURL == "" {
+			writeErrJSON(w, http.StatusBadRequest, "name and url required")
+			return
+		}
+		cleanURL, uErr := s.validateWebhookOutboundURL(nextURL)
+		if uErr != nil {
+			writeErrJSON(w, http.StatusBadRequest, uErr.Error())
+			return
+		}
 		secCipher := wh.SecretCiphertext
 		if in.ClearSecret {
 			secCipher = ""
@@ -2035,9 +2232,8 @@ func (s *AppServer) handleAdminWebhooks(w http.ResponseWriter, r *http.Request, 
 		}
 		_, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE webhooks SET name = ?, provider = ?, url = ?, secret_ciphertext = ?, chat_id = ?, events_json = ?, is_enabled = ?, updated_at = ? WHERE id = ?`,
-			strings.TrimSpace(in.Name), in.Provider, strings.TrimSpace(in.URL), secCipher, in.ChatID, evJSON, in.IsEnabled, time.Now().UnixMilli(), whID)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+			nextName, in.Provider, cleanURL, secCipher, in.ChatID, evJSON, in.IsEnabled, time.Now().UnixMilli(), whID)
+		if writeBadErr(w, err) {
 			return
 		}
 		writeOKJSON(w)
@@ -2255,6 +2451,13 @@ func (s *AppServer) normalizeAppearanceNavConfigs(ctx context.Context, locale st
 	return app
 }
 
+func (s *AppServer) redactAppearanceThemeSecrets(app domain.AppearanceSettings) domain.AppearanceSettings {
+	if s != nil && s.deps.Themes != nil && len(app.ThemeConfigs) > 0 {
+		app.ThemeConfigs = s.deps.Themes.RedactAllThemeConfigs(app.ThemeConfigs)
+	}
+	return app
+}
+
 func (s *AppServer) pruneDeletedNavFromThemeConfigs(ctx context.Context, deletedIDs []string) {
 	if len(deletedIDs) == 0 || s.deps.Settings == nil {
 		return
@@ -2316,6 +2519,14 @@ func (s *AppServer) pruneDeletedNavFromThemeConfigs(ctx context.Context, deleted
 	}
 }
 
+func isAlreadyExistsInstallErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "already exists") || strings.Contains(low, "already installed")
+}
+
 func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	locale := actor.PreferredLocale
@@ -2328,7 +2539,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 
 	if rest == "" && r.Method == http.MethodGet {
 		snap := s.deps.Settings.Snapshot()
-		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance)
+		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"active_theme": normApp.ActiveTheme,
 			"mobile_theme": normApp.MobileTheme,
@@ -2339,12 +2550,11 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	}
 
 	if rest == "reload" && r.Method == http.MethodPost {
-		if err := s.deps.Themes.Reload(); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, s.deps.Themes.Reload()) {
 			return
 		}
 		snap := s.deps.Settings.Snapshot()
-		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance)
+		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":           true,
 			"active_theme": normApp.ActiveTheme,
@@ -2395,13 +2605,13 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			patchMap["active_theme"] = tid
 		}
 		patch, _ := json.Marshal(patchMap)
-		val, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patch, 0)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		_, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patch, 0)
+		if writeBadErr(w, err) {
 			return
 		}
 		s.recordAuditLog(r, actor, "theme.activate", "theme", tid, map[string]any{"target": target})
-		writeJSON(w, http.StatusOK, map[string]any{"appearance": val, "version": ver})
+		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, s.deps.Settings.Snapshot().Appearance))
+		writeJSON(w, http.StatusOK, map[string]any{"appearance": normApp, "version": ver})
 		return
 	}
 
@@ -2431,6 +2641,10 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
 		mf, iErr := s.deps.Themes.InstallZip(bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite)
 		if iErr != nil {
+			if !overwrite && isAlreadyExistsInstallErr(iErr) {
+				writeErrJSON(w, http.StatusConflict, iErr.Error())
+				return
+			}
 			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
 			return
 		}
@@ -2450,8 +2664,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			return
 		}
 		var buf bytes.Buffer
-		if err := s.deps.Themes.ExportZip(&buf, themeID); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, s.deps.Themes.ExportZip(&buf, themeID)) {
 			return
 		}
 		s.recordAuditLog(r, actor, "theme.export", "theme", themeID, nil)
@@ -2485,6 +2698,9 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			cfgPatch["header_nav_seen_custom"] = seenIDs
 		}
 		cur := s.deps.Settings.Snapshot().Appearance
+		if s.deps.Themes != nil {
+			cfgPatch = s.deps.Themes.MergeThemeConfigSecrets(themeID, cfgPatch, cur.ThemeConfigs[themeID])
+		}
 		nextConfigs := make(map[string]map[string]any, len(cur.ThemeConfigs)+1)
 		for k, v := range cur.ThemeConfigs {
 			copied := make(map[string]any, len(v))
@@ -2495,23 +2711,20 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		}
 		nextConfigs[themeID] = cfgPatch
 		patchBytes, _ := json.Marshal(map[string]any{"theme_configs": nextConfigs})
-		val, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		_, ver, err := s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
+		if writeBadErr(w, err) {
 			return
 		}
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "theme.config", "theme", themeID, nil)
 		outApp := s.deps.Settings.Snapshot().Appearance
-		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, outApp)
-		_ = val
+		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, outApp))
 		writeJSON(w, http.StatusOK, map[string]any{"appearance": normApp, "version": ver})
 		return
 	}
 
 	if len(parts) == 1 && themeID != "" && r.Method == http.MethodDelete {
-		if err := s.deps.Themes.Uninstall(themeID); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, s.deps.Themes.Uninstall(themeID)) {
 			return
 		}
 		curApp := s.deps.Settings.Snapshot().Appearance
@@ -2529,7 +2742,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
 		nextApp := s.deps.Settings.Snapshot().Appearance
-		normApp := s.normalizeAppearanceNavConfigs(r.Context(), locale, nextApp)
+		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, nextApp))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":           true,
 			"active_theme": normApp.ActiveTheme,
@@ -2578,8 +2791,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 	}
 
 	if rest == "reload" && r.Method == http.MethodPost {
-		if err := s.deps.Catalog.ReloadDir(); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, s.deps.Catalog.ReloadDir()) {
 			return
 		}
 		if s.deps.Themes != nil {
@@ -2607,8 +2819,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			raw, _ := json.Marshal(req.Messages)
 			ow := req.Overwrite == nil || *req.Overwrite
 			sum, err := s.deps.Catalog.InstallPackJSON(req.Code, raw, ow)
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			if s.deps.Themes != nil {
@@ -2693,8 +2904,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 	code := strings.TrimSpace(parts[0])
 	if len(parts) == 2 && parts[1] == "export" && r.Method == http.MethodGet {
 		data, err := s.deps.Catalog.ExportPackJSON(code)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		resolved := s.deps.Catalog.Match(code, "")
@@ -2705,8 +2915,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 	}
 
 	if len(parts) == 1 && code != "" && r.Method == http.MethodDelete {
-		if err := s.deps.Catalog.DeleteExternalPack(code); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, s.deps.Catalog.DeleteExternalPack(code)) {
 			return
 		}
 		if s.deps.Themes != nil {
@@ -2750,8 +2959,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 	}
 
 	if (rest == "reload" || rest == "discover") && r.Method == http.MethodPost {
-		if err := s.deps.Plugins.ReloadAll(r.Context()); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, s.deps.Plugins.ReloadAll(r.Context())) {
 			return
 		}
 		list := s.deps.Plugins.List(locale)
@@ -2785,6 +2993,10 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
 		sum, iErr := s.deps.Plugins.InstallFromZip(r.Context(), bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite, locale)
 		if iErr != nil {
+			if !overwrite && isAlreadyExistsInstallErr(iErr) {
+				writeErrJSON(w, http.StatusConflict, iErr.Error())
+				return
+			}
 			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
 			return
 		}
@@ -2794,20 +3006,32 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 	}
 
 	parts := strings.Split(rest, "/")
-	pid := parts[0]
+	pid := strings.TrimSpace(parts[0])
 	if len(parts) == 2 {
 		switch {
+		case (parts[1] == "export" || parts[1] == "export.zip") && r.Method == http.MethodGet:
+			var buf bytes.Buffer
+			if err := s.deps.Plugins.ExportZip(pid, &buf); err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "not found") {
+					writeErrJSON(w, http.StatusNotFound, err.Error())
+				} else {
+					writeErrJSON(w, http.StatusBadRequest, err.Error())
+				}
+				return
+			}
+			s.recordAuditLog(r, actor, "plugin.export", "plugin", pid, nil)
+			w.Header().Set("Content-Type", "application/zip")
+			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.zip"`, pid))
+			_, _ = w.Write(buf.Bytes())
 		case parts[1] == "enable" && r.Method == http.MethodPost:
-			if err := s.deps.Plugins.Enable(r.Context(), pid); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, s.deps.Plugins.Enable(r.Context(), pid)) {
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.enable", "plugin", pid, nil)
 			sum, _ := s.deps.Plugins.Get(pid, locale)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "disable" && r.Method == http.MethodPost:
-			if err := s.deps.Plugins.Disable(r.Context(), pid); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, s.deps.Plugins.Disable(r.Context(), pid)) {
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.disable", "plugin", pid, nil)
@@ -2815,23 +3039,20 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "reload" && r.Method == http.MethodPost:
 			sum, err := s.deps.Plugins.ReloadPlugin(r.Context(), pid, locale)
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.reload", "plugin", pid, nil)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum})
 		case parts[1] == "reset-circuit" && r.Method == http.MethodPost:
-			if err := s.deps.Plugins.ResetCircuit(r.Context(), pid); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, s.deps.Plugins.ResetCircuit(r.Context(), pid)) {
 				return
 			}
 			sum, _ := s.deps.Plugins.Get(pid, locale)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "kv" && r.Method == http.MethodDelete:
 			cleared, err := s.deps.Plugins.ClearPluginKV(r.Context(), pid)
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			s.recordAuditLog(r, actor, "plugin.clear_kv", "plugin", pid, map[string]any{"cleared": cleared})
@@ -2842,8 +3063,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 				return
 			}
 			sum, err := s.deps.Plugins.UpdateConfig(r.Context(), pid, patch, locale)
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			s.invalidateMediaRefCache()
@@ -2859,8 +3079,7 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 	}
 
 	if len(parts) == 1 && r.Method == http.MethodDelete {
-		if err := s.deps.Plugins.Uninstall(r.Context(), pid); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, s.deps.Plugins.Uninstall(r.Context(), pid)) {
 			return
 		}
 		s.invalidateMediaRefCache()
@@ -2869,6 +3088,20 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+func (s *AppServer) pluginsDir() string {
+	if s != nil && s.deps.Config != nil {
+		return strings.TrimSpace(s.deps.Config.PluginsDir)
+	}
+	return ""
+}
+
+func (s *AppServer) themesDir() string {
+	if s != nil && s.deps.Config != nil {
+		return strings.TrimSpace(s.deps.Config.ThemesDir)
+	}
+	return ""
 }
 
 func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
@@ -2890,20 +3123,33 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 		for _, d := range domains {
 			val, ver, err := s.deps.Settings.GetDomain(r.Context(), d)
 			if err == nil {
+				if d == domain.SettingsDomainAppearance {
+					if appVal, ok := val.(domain.AppearanceSettings); ok {
+						val = s.redactAppearanceThemeSecrets(appVal)
+					}
+				}
 				result[d] = val
 				versions[d] = ver
 			}
 		}
 		storageDrivers := []string{"local", "s3"}
 		if s.deps.Plugins != nil && s.deps.Plugins.Providers() != nil {
-			if ids := s.deps.Plugins.Providers().StorageProviderIDs(); len(ids) > 0 {
-				storageDrivers = ids
+			seenDrivers := map[string]bool{"local": true, "s3": true}
+			for _, drv := range s.deps.Plugins.Providers().StorageProviderIDs() {
+				cleanDrv := strings.TrimSpace(drv)
+				if cleanDrv != "" && !seenDrivers[cleanDrv] {
+					seenDrivers[cleanDrv] = true
+					storageDrivers = append(storageDrivers, cleanDrv)
+				}
 			}
 		}
 		defaultUploadDir, effectiveUploadDir := "", ""
+		uploadDirPinned, geoIPDirPinned := false, false
 		if s.deps.Config != nil {
 			defaultUploadDir = s.deps.Config.GetDefaultUploadDir()
 			effectiveUploadDir = s.deps.Config.GetUploadDir()
+			uploadDirPinned = s.deps.Config.IsUploadDirPinned()
+			geoIPDirPinned = s.deps.Config.IsGeoIPDirPinned()
 		}
 		_, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -2912,8 +3158,10 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			"storage_drivers":      storageDrivers,
 			"default_upload_dir":   defaultUploadDir,
 			"effective_upload_dir": effectiveUploadDir,
+			"upload_dir_pinned":    uploadDirPinned,
 			"default_geoip_dir":    defaultGeoIPDir,
 			"effective_geoip_dir":  effectiveGeoIPDir,
+			"geoip_dir_pinned":     geoIPDirPinned,
 			"geoip_status":         geoStatus,
 		})
 		return
@@ -2985,13 +3233,28 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			writeErrJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if rest == domain.SettingsDomainAppearance {
+			if appVal, ok := val.(domain.AppearanceSettings); ok {
+				val = s.redactAppearanceThemeSecrets(appVal)
+			}
+		}
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
-		writeJSON(w, http.StatusOK, map[string]any{"domain": rest, "value": val, "version": ver})
+		resp := map[string]any{"domain": rest, "value": val, "version": ver}
+		if rest == domain.SettingsDomainStorage && s.deps.Config != nil {
+			resp["effective_upload_dir"] = s.deps.Config.GetUploadDir()
+			resp["upload_dir_pinned"] = s.deps.Config.IsUploadDirPinned()
+		}
+		if rest == domain.SettingsDomainSecurity && s.deps.Config != nil {
+			_, _, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
+			resp["effective_geoip_dir"] = effectiveGeoIPDir
+			resp["geoip_dir_pinned"] = s.deps.Config.IsGeoIPDirPinned()
+			resp["geoip_status"] = geoStatus
+		}
+		writeJSON(w, http.StatusOK, resp)
 
 	case http.MethodPatch:
 		rawBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256*1024))
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		var meta struct {
@@ -3004,6 +3267,27 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		delete(patchMap, "expected_version")
+		if rest == domain.SettingsDomainAppearance && s.deps.Themes != nil && s.deps.Settings != nil {
+			if rawTC, hasTC := patchMap["theme_configs"]; hasTC && rawTC != nil {
+				if tcMap, ok := rawTC.(map[string]any); ok {
+					curConfigs := s.deps.Settings.Snapshot().Appearance.ThemeConfigs
+					mergedTC := make(map[string]map[string]any, len(curConfigs)+len(tcMap))
+					for tid, existing := range curConfigs {
+						copied := make(map[string]any, len(existing))
+						for k, v := range existing {
+							copied[k] = v
+						}
+						mergedTC[tid] = copied
+					}
+					for tid, incomingAny := range tcMap {
+						if incomingCfg, ok := incomingAny.(map[string]any); ok {
+							mergedTC[tid] = s.deps.Themes.MergeThemeConfigSecrets(tid, incomingCfg, curConfigs[tid])
+						}
+					}
+					patchMap["theme_configs"] = mergedTC
+				}
+			}
+		}
 		if rest == domain.SettingsDomainStorage && s.deps.Config != nil {
 			if rawLocalDir, hasLocalDir := patchMap["local_dir"]; hasLocalDir {
 				dirStr, ok := rawLocalDir.(string)
@@ -3074,13 +3358,23 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 		}
+		if rest == domain.SettingsDomainAppearance {
+			if appVal, ok := val.(domain.AppearanceSettings); ok {
+				val = s.redactAppearanceThemeSecrets(appVal)
+			}
+		}
 		s.invalidateMediaRefCache()
 		s.recordAuditLog(r, actor, "settings.patch", "settings", rest, map[string]any{"version": ver})
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, ver))
 		resp := map[string]any{"domain": rest, "value": val, "version": ver}
+		if rest == domain.SettingsDomainStorage && s.deps.Config != nil {
+			resp["effective_upload_dir"] = s.deps.Config.GetUploadDir()
+			resp["upload_dir_pinned"] = s.deps.Config.IsUploadDirPinned()
+		}
 		if rest == domain.SettingsDomainSecurity {
 			_, _, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
 			resp["effective_geoip_dir"] = effectiveGeoIPDir
+			resp["geoip_dir_pinned"] = s.deps.Config != nil && s.deps.Config.IsGeoIPDirPinned()
 			resp["geoip_status"] = geoStatus
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -3115,22 +3409,25 @@ func (s *AppServer) rollbackSecuritySettings(r *http.Request, prev domain.Securi
 }
 
 // syncConfiguredUploadDir applies the persisted `storage.local_dir` setting (validated against
-// workspace containment boundaries) to Config, Media pipeline, and BackupScheduler at runtime.
+// workspace containment boundaries) to Config, Media pipeline, and BackupScheduler at runtime,
+// unless UploadDir was explicitly pinned via CLI flag, OS ENV, or `.env`.
 func (s *AppServer) syncConfiguredUploadDir() {
 	if s == nil || s.deps.Config == nil {
 		return
 	}
-	rawDir := ""
-	if s.deps.Settings != nil {
-		rawDir = strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalDir)
-	}
-	if rawDir == "" {
-		s.deps.Config.SetUploadDir("")
-	} else if validDir, err := s.deps.Config.ValidateCustomUploadDir(rawDir); err == nil && validDir != "" {
-		_ = os.MkdirAll(validDir, 0o750)
-		s.deps.Config.SetUploadDir(validDir)
-	} else {
-		s.deps.Config.SetUploadDir("")
+	if !s.deps.Config.IsUploadDirPinned() {
+		rawDir := ""
+		if s.deps.Settings != nil {
+			rawDir = strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalDir)
+		}
+		if rawDir == "" {
+			s.deps.Config.SetUploadDir("")
+		} else if validDir, err := s.deps.Config.ValidateCustomUploadDir(rawDir); err == nil && validDir != "" {
+			_ = os.MkdirAll(validDir, 0o750)
+			s.deps.Config.SetUploadDir(validDir)
+		} else {
+			s.deps.Config.SetUploadDir("")
+		}
 	}
 	effective := s.deps.Config.GetUploadDir()
 	if setter, ok := s.deps.Media.(interface{ SetUploadDir(string) }); ok {
@@ -3142,21 +3439,24 @@ func (s *AppServer) syncConfiguredUploadDir() {
 }
 
 // syncConfiguredGeoIPDir applies the persisted `security.geoip_dir` setting (validated against
-// workspace containment boundaries) to Config and atomically hot-reloads GeoEngine offline databases.
+// workspace containment boundaries) to Config and atomically hot-reloads GeoEngine offline databases,
+// unless GeoIPDir was explicitly pinned via CLI flag, OS ENV, or `.env`.
 func (s *AppServer) syncConfiguredGeoIPDir() error {
 	if s == nil || s.deps.Config == nil {
 		return nil
 	}
-	rawPath := ""
-	if s.deps.Settings != nil {
-		rawPath = strings.TrimSpace(s.deps.Settings.Snapshot().Security.GeoIPDir)
-	}
-	if rawPath == "" {
-		s.deps.Config.SetGeoIPDir("")
-	} else if validPath, err := s.deps.Config.ValidateCustomGeoIPPath(rawPath); err == nil && validPath != "" {
-		s.deps.Config.SetGeoIPDir(validPath)
-	} else {
-		s.deps.Config.SetGeoIPDir("")
+	if !s.deps.Config.IsGeoIPDirPinned() {
+		rawPath := ""
+		if s.deps.Settings != nil {
+			rawPath = strings.TrimSpace(s.deps.Settings.Snapshot().Security.GeoIPDir)
+		}
+		if rawPath == "" {
+			s.deps.Config.SetGeoIPDir("")
+		} else if validPath, err := s.deps.Config.ValidateCustomGeoIPPath(rawPath); err == nil && validPath != "" {
+			s.deps.Config.SetGeoIPDir(validPath)
+		} else {
+			s.deps.Config.SetGeoIPDir("")
+		}
 	}
 	if s.deps.Geo != nil {
 		return s.deps.Geo.LoadDatabases(s.deps.Config.GetGeoIPDir())
@@ -3193,7 +3493,8 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				 FROM users WHERE ` + whereSQL + `
 				 ORDER BY CASE WHEN role = 'admin' THEN 0 WHEN role = 'editor' THEN 1 ELSE 2 END, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.User](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.User
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.User{}
 			}
@@ -3214,25 +3515,35 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				Role            string `json:"role"`
 				Password        string `json:"password"`
 				PreferredLocale string `json:"preferred_locale"`
+				CurrentPassword string `json:"current_password"`
 			}
 			if !decodeJSONBody(w, r, 16384, &req) {
 				return
 			}
-			if err := auth.ValidatePasswordPolicy(req.Password); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			uname := strings.TrimSpace(req.Username)
+			if writeBadErr(w, auth.ValidateUsername(uname)) {
+				return
+			}
+			if writeBadErr(w, s.deps.Auth.EnsureUsernameNotMatchingEmail(r.Context(), uname, "")) {
+				return
+			}
+			if writeBadErr(w, auth.ValidatePasswordPolicy(req.Password)) {
 				return
 			}
 			role := strings.ToLower(strings.TrimSpace(req.Role))
 			if role != domain.RoleEditor && role != domain.RoleAdmin && role != domain.RoleReader {
 				role = domain.RoleEditor
 			}
+			if role == domain.RoleAdmin || role == domain.RoleEditor {
+				if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
+					return
+				}
+			}
 			pwHash, err := auth.HashPassword(req.Password)
-			if err != nil {
-				writeErrJSON(w, http.StatusInternalServerError, err.Error())
+			if writeServerErr(w, err) {
 				return
 			}
 			now := time.Now().UnixMilli()
-			uname := strings.TrimSpace(req.Username)
 			disp := strings.TrimSpace(req.DisplayName)
 			if disp == "" {
 				disp = uname
@@ -3285,7 +3596,8 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		if !decodeJSONBody(w, r, 8192, &req) {
 			return
 		}
-		u, err := sqlx.Get[domain.User](r.Context(), s.deps.Store, `SELECT * FROM users WHERE id = ?`, rest)
+		var u domain.User
+		err := sqlx.GetInto(r.Context(), s.deps.Store, &u, `SELECT * FROM users WHERE id = ?`, rest)
 		if err != nil {
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
@@ -3294,8 +3606,9 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			writeErrJSON(w, http.StatusBadRequest, "cannot demote or disable your own admin account")
 			return
 		}
+		roleChanged := req.Role != nil && (*req.Role == domain.RoleAdmin || *req.Role == domain.RoleEditor || *req.Role == domain.RoleReader) && *req.Role != u.Role
 		emailChanged := req.Email != nil && strings.TrimSpace(*req.Email) != "" && !strings.EqualFold(strings.TrimSpace(*req.Email), u.Email)
-		if rest == actor.ID && (emailChanged || req.Password != "") {
+		if roleChanged || emailChanged || req.Password != "" {
 			if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
 				return
 			}
@@ -3316,8 +3629,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			u.Status = *req.Status
 		}
 		if req.Password != "" {
-			if err := auth.ValidatePasswordPolicy(req.Password); err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, auth.ValidatePasswordPolicy(req.Password)) {
 				return
 			}
 			u.PasswordHash, _ = auth.HashPassword(req.Password)
@@ -3326,18 +3638,19 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		_, err = s.deps.Store.ExecContext(r.Context(),
 			`UPDATE users SET display_name = ?, email = ?, preferred_locale = ?, role = ?, status = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
 			u.DisplayName, u.Email, u.PreferredLocale, u.Role, u.Status, u.PasswordHash, u.LegacyHash, time.Now().UnixMilli(), rest)
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
-		if u.Status == domain.UserStatusDisabled || req.Password != "" {
+		if u.Status == domain.UserStatusDisabled || req.Password != "" || roleChanged {
 			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM user_sessions WHERE user_id = ?`, rest)
+			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM user_credentials WHERE user_id = ? AND kind = 'oidc'`, rest)
 			_ = s.deps.Auth.RevokeUserAPITokens(r.Context(), rest)
 		}
 		s.recordAuditLog(r, actor, "user.update", "user", rest, map[string]any{
 			"role":             u.Role,
 			"status":           u.Status,
 			"self":             rest == actor.ID,
+			"role_changed":     roleChanged,
 			"email_changed":    emailChanged,
 			"password_changed": req.Password != "",
 		})
@@ -3391,8 +3704,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			}
 			return nil
 		})
-		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, err.Error())
+		if writeBadErr(w, err) {
 			return
 		}
 		if s.deps.WAF != nil {
@@ -3430,7 +3742,8 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM security_ip_bans WHERE `+whereSQL, args...).Scan(&total)
 			baseSQL := `SELECT * FROM security_ip_bans WHERE ` + whereSQL + ` ORDER BY created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
-			rows, _ := sqlx.Select[domain.SecurityIPBan](r.Context(), s.deps.Store, qSQL, fullArgs...)
+			var rows []domain.SecurityIPBan
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.SecurityIPBan{}
 			}
@@ -3458,8 +3771,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			}
 			clientIP := s.clientIP(r)
 			rec, err := s.deps.WAF.AddManualBan(r.Context(), req.CIDR, req.Note, expMS, clientIP)
-			if err != nil {
-				writeErrJSON(w, http.StatusBadRequest, err.Error())
+			if writeBadErr(w, err) {
 				return
 			}
 			s.recordAuditLog(r, actor, "security.ip_ban_add", "ip_ban", rec.ID, map[string]any{"cidr": rec.CIDR})
@@ -3573,6 +3885,7 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			"geoip_dir":           configuredGeoIPDir,
 			"default_geoip_dir":   defaultGeoIPDir,
 			"effective_geoip_dir": effectiveGeoIPDir,
+			"geoip_dir_pinned":    s.deps.Config != nil && s.deps.Config.IsGeoIPDirPinned(),
 			"geoip_status":        geoStatus,
 			"version":             secVer,
 		})
@@ -3582,18 +3895,29 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, _ := sqlx.Select[domain.SecurityGeoRule](r.Context(), s.deps.Store,
-				`SELECT * FROM security_geo_rules ORDER BY sort_order ASC, created_at ASC`)
+			page, perPage := parseAdminPageParams(r, 50, 200)
+			var total int
+			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM security_geo_rules`).Scan(&total)
+			baseSQL := `SELECT * FROM security_geo_rules ORDER BY sort_order ASC, created_at ASC`
+			qSQL, fullArgs := s.paginateQuery(baseSQL, nil, page, perPage)
+			var rows []domain.SecurityGeoRule
+			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.SecurityGeoRule{}
 			}
 			configuredGeoIPDir, defaultGeoIPDir, effectiveGeoIPDir, geoStatus := s.geoIPMeta()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"items":                      rows,
+				"rules":                      rows,
+				"total":                      total,
+				"page":                       page,
+				"per_page":                   perPage,
+				"page_size":                  perPage,
 				"geo_access_circuit_enabled": s.deps.Config != nil && s.deps.Config.GeoAccessEnabled,
 				"geoip_dir":                  configuredGeoIPDir,
 				"default_geoip_dir":          defaultGeoIPDir,
 				"effective_geoip_dir":        effectiveGeoIPDir,
+				"geoip_dir_pinned":           s.deps.Config != nil && s.deps.Config.IsGeoIPDirPinned(),
 				"geoip_status":               geoStatus,
 			})
 		case http.MethodPost:
@@ -3633,7 +3957,8 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 
 	switch r.Method {
 	case http.MethodPut:
-		prev, pErr := sqlx.Get[domain.SecurityGeoRule](r.Context(), s.deps.Store, `SELECT * FROM security_geo_rules WHERE id = ?`, rest)
+		var prev domain.SecurityGeoRule
+		pErr := sqlx.GetInto(r.Context(), s.deps.Store, &prev, `SELECT * FROM security_geo_rules WHERE id = ?`, rest)
 		if pErr != nil {
 			writeErrJSON(w, http.StatusNotFound, "geo rule not found")
 			return
@@ -3689,6 +4014,8 @@ func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Reque
 	_, _ = backup.Create(r.Context(), s.deps.Store, w, backup.CreateOptions{
 		IncludeMedia: withMedia,
 		UploadDir:    s.deps.Config.GetUploadDir(),
+		PluginsDir:   s.pluginsDir(),
+		ThemesDir:    s.themesDir(),
 	})
 }
 
@@ -3724,7 +4051,36 @@ func (s *AppServer) listLocalBackups(backupDir string) []localBackupItem {
 	return items
 }
 
-func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
+func (s *AppServer) serveLocalBackupArchive(w http.ResponseWriter, r *http.Request, actor *domain.User, base string) {
+	clean := filepath.Base(base)
+	if clean != base || strings.Contains(clean, "..") || !strings.HasSuffix(strings.ToLower(clean), ".zip") {
+		writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
+		return
+	}
+	fullPath := filepath.Join(s.resolveBackupDir(), clean)
+	st, err := os.Lstat(fullPath)
+	if err != nil || !st.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	f, err := os.Open(fullPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	s.recordAuditLog(r, actor, "backup.local_download", "system", clean, nil)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, clean))
+	http.ServeContent(w, r, clean, info.ModTime(), f)
+}
+
+func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Request, actor *domain.User, sess *domain.UserSession, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	backupDir := s.resolveBackupDir()
 
@@ -3741,6 +4097,8 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 					Plugins:        s.deps.Plugins,
 					BackupDir:      backupDir,
 					UploadDir:      s.deps.Config.GetUploadDir(),
+					PluginsDir:     s.pluginsDir(),
+					ThemesDir:      s.themesDir(),
 					OutboundDialer: s.deps.OutboundDialer,
 				})
 			}
@@ -3769,6 +4127,46 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 	}
 
 	parts := strings.Split(rest, "/")
+	if len(parts) == 2 && parts[1] == "ticket" && r.Method == http.MethodPost {
+		if sess == nil || sess.ID == "" {
+			writeErrJSON(w, http.StatusForbidden, "interactive admin session required for backup download ticket")
+			return
+		}
+		base := filepath.Base(parts[0])
+		if base != parts[0] || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
+			writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
+			return
+		}
+		fullPath := filepath.Join(backupDir, base)
+		st, err := os.Lstat(fullPath)
+		if err != nil || !st.Mode().IsRegular() {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			CurrentPassword string `json:"current_password"`
+		}
+		if !decodeOptJSONBody(w, r, 4096, &req) {
+			return
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, req.CurrentPassword) {
+			return
+		}
+		ipBucket := security.RateLimitBucketKey(s.clientIP(r))
+		tok, err := s.mintBackupExportTicket(actor.ID, sess.ID, ipBucket, base)
+		if writeServerErr(w, err) {
+			return
+		}
+		s.recordAuditLog(r, actor, "backup.local_download_ticket", "system", base, nil)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"ticket":       tok,
+			"expires_in":   60,
+			"download_url": "/api/admin/backups/local/" + url.PathEscape(base) + "?ticket=" + tok,
+		})
+		return
+	}
+
 	if len(parts) == 2 && parts[1] == "restore" && r.Method == http.MethodPost {
 		base := filepath.Base(parts[0])
 		if base != parts[0] || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
@@ -3782,12 +4180,23 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		dryRun, _ := strconv.ParseBool(r.URL.Query().Get("dry_run"))
-		if !dryRun && r.ContentLength > 0 {
-			var bodyReq struct {
-				DryRun bool `json:"dry_run"`
+		var bodyReq struct {
+			DryRun          bool   `json:"dry_run"`
+			CurrentPassword string `json:"current_password"`
+		}
+		if !decodeOptJSONBody(w, r, 4096, &bodyReq) {
+			return
+		}
+		if bodyReq.DryRun {
+			dryRun = true
+		}
+		if !dryRun {
+			curPwd := bodyReq.CurrentPassword
+			if strings.TrimSpace(curPwd) == "" {
+				curPwd = r.URL.Query().Get("current_password")
 			}
-			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&bodyReq) == nil && bodyReq.DryRun {
-				dryRun = true
+			if !s.verifyStepUpPassword(w, r, actor.ID, curPwd) {
+				return
 			}
 		}
 		if isLegacyArchiveFile(fullPath) {
@@ -3811,8 +4220,10 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		}
 
 		sum, rErr := backup.RestoreFromFile(r.Context(), s.deps.Store, fullPath, backup.RestoreOptions{
-			DryRun:    dryRun,
-			UploadDir: s.deps.Config.GetUploadDir(),
+			DryRun:     dryRun,
+			UploadDir:  s.deps.Config.GetUploadDir(),
+			PluginsDir: s.pluginsDir(),
+			ThemesDir:  s.themesDir(),
 		})
 		if rErr != nil {
 			writeErrJSON(w, http.StatusBadRequest, rErr.Error())
@@ -3835,20 +4246,11 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 
 	switch r.Method {
 	case http.MethodGet:
-		f, err := os.Open(fullPath)
-		if err != nil {
-			http.NotFound(w, r)
+		if sess != nil {
+			writeErrJSON(w, http.StatusForbidden, "step-up password ticket required for interactive local backup download")
 			return
 		}
-		defer f.Close()
-		info, err := f.Stat()
-		if err != nil || info.IsDir() {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, base))
-		http.ServeContent(w, r, base, info.ModTime(), f)
+		s.serveLocalBackupArchive(w, r, actor, base)
 	case http.MethodDelete:
 		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 			writeErrJSON(w, http.StatusInternalServerError, err.Error())
@@ -3929,11 +4331,12 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 	}
 
 	sum, err := backup.RestoreFromFile(r.Context(), s.deps.Store, tmpPath, backup.RestoreOptions{
-		DryRun:    dryRun,
-		UploadDir: s.deps.Config.GetUploadDir(),
+		DryRun:     dryRun,
+		UploadDir:  s.deps.Config.GetUploadDir(),
+		PluginsDir: s.pluginsDir(),
+		ThemesDir:  s.themesDir(),
 	})
-	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, err.Error())
+	if writeBadErr(w, err) {
 		return
 	}
 	if !dryRun {

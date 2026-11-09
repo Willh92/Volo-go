@@ -3,8 +3,10 @@ package plugin
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +45,12 @@ const (
 	DefaultCronTimeout  = 15 * time.Second
 	DefaultMaxFailures  = 5
 )
+
+// SecretSealer seals and opens sensitive plugin configuration fields (e.g. backed by config.SecretBox).
+type SecretSealer interface {
+	Seal(plaintext string) (string, error)
+	Open(ciphertext string) (string, error)
+}
 
 // HookRejectedError signals an intentional business-rule rejection returned by a pre-action hook (e.g. comment.before_create).
 type HookRejectedError struct {
@@ -159,20 +168,25 @@ func (BaseBuiltinPlugin) AllowProtectedArticles() bool          { return false }
 
 // HostContext exposes capability-scoped host services to a BuiltinPlugin.
 type HostContext struct {
-	PluginID  string
-	KV        *KVStore
-	Providers *ProviderRegistry
-	logger    *PluginLogger
-	hostI18n  *i18n.Catalog
-	getConfig func() map[string]any
-	dialer    *security.OutboundSafeDialer
+	PluginID     string
+	KV           *KVStore
+	Providers    *ProviderRegistry
+	logger       *PluginLogger
+	hostI18n     *i18n.Catalog
+	getConfig    func() map[string]any
+	unsealSecret func(string) string
+	dialer       *security.OutboundSafeDialer
 }
 
 func (h *HostContext) Config() map[string]any {
 	cfg := h.getConfig()
 	out := make(map[string]any, len(cfg))
 	for k, v := range cfg {
-		out[k] = v
+		if s, ok := v.(string); ok && strings.HasPrefix(s, "v1:") && h.unsealSecret != nil {
+			out[k] = h.unsealSecret(s)
+		} else {
+			out[k] = v
+		}
 	}
 	return out
 }
@@ -207,6 +221,7 @@ type PluginSummary struct {
 	AllowedHosts  []string        `json:"allowed_hosts"`
 	ConfigSchema  []ConfigField   `json:"config_schema"`
 	PublicConfig  map[string]any  `json:"public_config"`
+	Config        map[string]any  `json:"config,omitempty"`
 	SecretKeysSet map[string]bool `json:"secret_keys_set"`
 	InstalledAt   int64           `json:"installed_at"`
 	UpdatedAt     int64           `json:"updated_at"`
@@ -225,6 +240,7 @@ type EditorQuickInsertView struct {
 type ManagerOptions struct {
 	Store                 *sqlx.Store
 	Keys                  *config.KeyRing
+	SecretSealer          SecretSealer
 	PluginsDir            string
 	DataDir               string
 	Catalog               *i18n.Catalog
@@ -285,6 +301,8 @@ type Manager struct {
 	mu                    sync.RWMutex
 	store                 *sqlx.Store
 	keys                  *config.KeyRing
+	sealerMu              sync.RWMutex
+	sealer                SecretSealer
 	pluginsDir            string
 	logger                *PluginLogger
 	catalog               *i18n.Catalog
@@ -300,6 +318,7 @@ type Manager struct {
 	siteInfoFn   atomic.Pointer[func() map[string]any]
 	reqInspector atomic.Pointer[func(*http.Request) (bool, string)]
 
+	fedWG   sync.WaitGroup
 	plugins map[string]*managedPlugin
 	closed  bool
 }
@@ -329,9 +348,14 @@ func NewManager(opts ManagerOptions) *Manager {
 	if opts.PluginsDir != "" {
 		_ = os.MkdirAll(opts.PluginsDir, 0o750)
 	}
+	sealer := normalizeSealer(opts.SecretSealer)
+	if sealer == nil && opts.Keys != nil {
+		sealer = normalizeSealer(opts.Keys.SecretBox())
+	}
 	return &Manager{
 		store:                 opts.Store,
 		keys:                  opts.Keys,
+		sealer:                sealer,
 		pluginsDir:            opts.PluginsDir,
 		logger:                NewPluginLogger(opts.DataDir),
 		catalog:               opts.Catalog,
@@ -345,6 +369,52 @@ func NewManager(opts ManagerOptions) *Manager {
 		allowLoopbackForTests: opts.AllowLoopbackForTests,
 		plugins:               make(map[string]*managedPlugin),
 	}
+}
+
+func normalizeSealer(s SecretSealer) SecretSealer {
+	if s == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(s)
+	if rv.Kind() == reflect.Ptr && rv.IsNil() {
+		return nil
+	}
+	return s
+}
+
+// SetSecretSealer configures or replaces the SecretSealer used for sealing/opening "secret" schema fields.
+func (m *Manager) SetSecretSealer(s SecretSealer) {
+	if m == nil {
+		return
+	}
+	m.sealerMu.Lock()
+	m.sealer = normalizeSealer(s)
+	m.sealerMu.Unlock()
+}
+
+func (m *Manager) getSealer() SecretSealer {
+	if m == nil {
+		return nil
+	}
+	m.sealerMu.RLock()
+	s := m.sealer
+	m.sealerMu.RUnlock()
+	return s
+}
+
+func (m *Manager) unsealSecretValue(val string) string {
+	if !strings.HasPrefix(val, "v1:") {
+		return val
+	}
+	sealer := m.getSealer()
+	if sealer == nil {
+		return val
+	}
+	plain, err := sealer.Open(val)
+	if err != nil {
+		return ""
+	}
+	return plain
 }
 
 func (m *Manager) Providers() *ProviderRegistry { return m.providers }
@@ -640,6 +710,15 @@ func (m *Manager) syncRecordWithDB(
 
 	if errors.Is(err, sql.ErrNoRows) {
 		defPub, defSec, _ := manifest.ValidateAndMergeConfig(nil, nil, nil)
+		if sealer := m.getSealer(); sealer != nil {
+			for k, v := range defSec {
+				if v != "" && !strings.HasPrefix(v, "v1:") {
+					if sealed, sErr := sealer.Seal(v); sErr == nil {
+						defSec[k] = sealed
+					}
+				}
+			}
+		}
 		pubCfg = defPub
 		secretCfg = defSec
 		cfgBytes, _ := json.Marshal(pubCfg)
@@ -691,6 +770,15 @@ func (m *Manager) syncRecordWithDB(
 			}
 			secretCfg = openedSec
 		}
+		if sealer := m.getSealer(); sealer != nil {
+			for k, v := range secretCfg {
+				if v != "" && !strings.HasPrefix(v, "v1:") {
+					if sealed, sErr := sealer.Seal(v); sErr == nil {
+						secretCfg[k] = sealed
+					}
+				}
+			}
+		}
 		if existing.Version != manifest.Version {
 			_, _ = m.store.ExecContext(
 				ctx,
@@ -725,27 +813,48 @@ func (m *Manager) syncRecordWithDB(
 }
 
 func (m *Manager) sealSecrets(pluginID string, secrets map[string]string) (string, error) {
-	if len(secrets) == 0 || m.keys == nil {
+	if len(secrets) == 0 {
 		return "", nil
 	}
 	raw, err := json.Marshal(secrets)
 	if err != nil {
 		return "", err
 	}
-	return m.keys.SealString(string(raw), "plugins.secret_ciphertext:"+pluginID)
+	if m.keys != nil {
+		return m.keys.SealString(string(raw), "plugins.secret_ciphertext:"+pluginID)
+	}
+	if m.getSealer() != nil {
+		return string(raw), nil
+	}
+	return "", nil
 }
 
 func (m *Manager) openSecretsLenient(pluginID string, ciphertext string) map[string]string {
 	out := make(map[string]string)
-	if ciphertext == "" || m.keys == nil {
+	if ciphertext == "" {
 		return out
 	}
-	plain, err := m.keys.OpenString(ciphertext, "plugins.secret_ciphertext:"+pluginID)
-	if err != nil {
-		m.logger.Write(pluginID, "warn", "secrets", "encrypted plugin secrets could not be opened (key changed); re-enter in admin console")
+	if m.keys != nil && strings.HasPrefix(ciphertext, "enc:v1:") {
+		plain, err := m.keys.OpenString(ciphertext, "plugins.secret_ciphertext:"+pluginID)
+		if err != nil {
+			m.logger.Write(pluginID, "warn", "secrets", "encrypted plugin secrets could not be opened (key changed); re-enter in admin console")
+			return out
+		}
+		_ = json.Unmarshal([]byte(plain), &out)
 		return out
 	}
-	_ = json.Unmarshal([]byte(plain), &out)
+	if strings.HasPrefix(strings.TrimSpace(ciphertext), "{") {
+		_ = json.Unmarshal([]byte(ciphertext), &out)
+		return out
+	}
+	if m.keys != nil {
+		plain, err := m.keys.OpenString(ciphertext, "plugins.secret_ciphertext:"+pluginID)
+		if err != nil {
+			m.logger.Write(pluginID, "warn", "secrets", "encrypted plugin secrets could not be opened (key changed); re-enter in admin console")
+			return out
+		}
+		_ = json.Unmarshal([]byte(plain), &out)
+	}
 	return out
 }
 
@@ -774,12 +883,13 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			return fmt.Errorf("plugin %q: missing builtin implementation", mp.manifest.ID)
 		}
 		hostCtx := &HostContext{
-			PluginID:  mp.manifest.ID,
-			KV:        mp.kv,
-			Providers: m.providers,
-			logger:    m.logger,
-			hostI18n:  m.catalog,
-			getConfig: mp.getConfigMap,
+			PluginID:     mp.manifest.ID,
+			KV:           mp.kv,
+			Providers:    m.providers,
+			logger:       m.logger,
+			hostI18n:     m.catalog,
+			getConfig:    mp.getConfigMap,
+			unsealSecret: m.unsealSecretValue,
 			dialer: &security.OutboundSafeDialer{
 				AllowedHosts:          mp.manifest.EffectiveAllowedHosts(),
 				Timeout:               5 * time.Second,
@@ -799,6 +909,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			logger:                m.logger,
 			hostI18n:              m.catalog,
 			getConfig:             mp.getConfigMap,
+			unsealSecret:          m.unsealSecretValue,
 			getSiteInfo:           m.getSiteInfo,
 			customResolver:        m.customResolver,
 			allowLoopbackForTests: m.allowLoopbackForTests,
@@ -836,6 +947,12 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 		if mp.manifest.HasPermission("provider:oidc") && rt.hasCallable("oidcAuthURL") && rt.hasCallable("oidcExchange") {
 			adapter := newGojaOIDCAdapter(ctx, m, mp, rt)
 			m.providers.RegisterOIDC(mp.manifest.ID, adapter)
+		}
+		if mp.manifest.HasFederationCapability() {
+			m.providers.RegisterFederation(mp.manifest.ID, &gojaFederationAdapter{
+				manager: m,
+				mp:      mp,
+			})
 		}
 	}
 
@@ -1035,6 +1152,29 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 		mp.mu.Unlock()
 		return PluginSummary{}, err
 	}
+	if sealer := m.getSealer(); sealer != nil {
+		for k, v := range nextSec {
+			if v == "" {
+				continue
+			}
+			rawPatch, inPatch := patch[k]
+			rawStr, isStr := rawPatch.(string)
+			needsSeal := false
+			if inPatch && isStr && rawStr != SecretMaskSentinel && rawStr != mp.secretConfig[k] {
+				needsSeal = true
+			} else if !strings.HasPrefix(v, "v1:") {
+				needsSeal = true
+			}
+			if needsSeal {
+				sealed, sErr := sealer.Seal(v)
+				if sErr != nil {
+					mp.mu.Unlock()
+					return PluginSummary{}, sErr
+				}
+				nextSec[k] = sealed
+			}
+		}
+	}
 	cfgBytes, err := json.Marshal(nextPub)
 	if err != nil {
 		mp.mu.Unlock()
@@ -1062,6 +1202,347 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 
 	m.logger.Write(pluginID, "info", "config", "configuration hot-reloaded")
 	return m.toSummary(mp, locale), nil
+}
+
+// SaveConfig validates, seals, and persists plugin configuration (preserving masked "********" secret sentinels).
+func (m *Manager) SaveConfig(ctx context.Context, pluginID string, patch map[string]any, locale string) (PluginSummary, error) {
+	return m.UpdateConfig(ctx, pluginID, patch, locale)
+}
+
+// GetConfigRedacted returns a copy of pluginID's configuration suitable for the Admin UI,
+// masking any non-empty "secret" schema field to "********".
+func (m *Manager) GetConfigRedacted(pluginID string) (map[string]any, bool) {
+	mp, ok := m.getPlugin(pluginID)
+	if !ok {
+		return nil, false
+	}
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	return buildRedactedConfigLocked(mp), true
+}
+
+// LocalizedPlugins returns secret-masked localized plugin summaries for the Admin UI.
+func (m *Manager) LocalizedPlugins(locale string) []PluginSummary {
+	return m.List(locale)
+}
+
+func buildRedactedConfigLocked(mp *managedPlugin) map[string]any {
+	out := make(map[string]any, len(mp.publicConfig)+len(mp.secretConfig))
+	for k, v := range mp.publicConfig {
+		out[k] = v
+	}
+	for _, f := range mp.manifest.ConfigSchema {
+		if f.IsSecret() {
+			if mp.secretConfig[f.Key] != "" {
+				out[f.Key] = SecretMaskSentinel
+			} else {
+				out[f.Key] = ""
+			}
+		}
+	}
+	return out
+}
+
+// ExportZip safely packages `./plugins/<id>` into a `.zip` archive written to w,
+// validating a safe plugin ID, rejecting symlinks, and stripping raw unmasked secrets from local state files.
+func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
+	if m == nil {
+		return errors.New("plugin: manager is nil")
+	}
+	if w == nil {
+		return errors.New("plugin: export writer is nil")
+	}
+	idClean := strings.TrimSpace(pluginID)
+	if !validPluginIDRe.MatchString(idClean) {
+		return fmt.Errorf("plugin: invalid plugin id %q", pluginID)
+	}
+	if strings.TrimSpace(m.pluginsDir) == "" {
+		return errors.New("plugin: external plugins directory is not configured")
+	}
+
+	targetDir := filepath.Join(m.pluginsDir, idClean)
+	targetLstat, err := os.Lstat(targetDir)
+	if err != nil {
+		return fmt.Errorf("plugin %q: stat plugin directory: %w", idClean, err)
+	}
+	if targetLstat.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("plugin %q: symlink plugin directory rejected", idClean)
+	}
+	if !targetLstat.IsDir() {
+		return fmt.Errorf("plugin %q: path is not a directory", idClean)
+	}
+
+	realPluginsRoot, err := filepath.EvalSymlinks(m.pluginsDir)
+	if err != nil {
+		return fmt.Errorf("plugin %q: resolve plugins root: %w", idClean, err)
+	}
+	realPluginDir, err := filepath.EvalSymlinks(targetDir)
+	if err != nil {
+		return fmt.Errorf("plugin %q: resolve plugin dir: %w", idClean, err)
+	}
+	if realPluginDir == realPluginsRoot || !isSubPath(realPluginsRoot, realPluginDir) {
+		return fmt.Errorf("plugin %q: plugin directory escapes plugins root", idClean)
+	}
+
+	secretFieldKeys := make(map[string]bool)
+	knownRawSecrets := make(map[string]bool)
+	if mp, ok := m.getPlugin(idClean); ok {
+		for _, f := range mp.manifest.ConfigSchema {
+			if f.IsSecret() {
+				secretFieldKeys[f.Key] = true
+			}
+		}
+		mp.mu.Lock()
+		for _, val := range mp.secretConfig {
+			if val != "" {
+				knownRawSecrets[val] = true
+				if plain := m.unsealSecretValue(val); plain != "" {
+					knownRawSecrets[plain] = true
+				}
+			}
+		}
+		mp.mu.Unlock()
+	}
+
+	manifestPath := filepath.Join(realPluginDir, "manifest.json")
+	if mfInfo, mErr := os.Lstat(manifestPath); mErr == nil {
+		if mfInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("plugin %q: symlink manifest.json rejected", idClean)
+		}
+		if mfBytes, rErr := os.ReadFile(manifestPath); rErr == nil {
+			if parsed, pErr := ParseManifest(mfBytes); pErr == nil {
+				for _, f := range parsed.ConfigSchema {
+					if f.IsSecret() {
+						secretFieldKeys[f.Key] = true
+					}
+				}
+			}
+		}
+	}
+
+	type exportEntry struct {
+		relSlash string
+		absPath  string
+		modTime  time.Time
+	}
+	var entries []exportEntry
+	var totalBytes int64
+
+	walkErr := filepath.WalkDir(realPluginDir, func(curPath string, _ os.DirEntry, walkInErr error) error {
+		if walkInErr != nil {
+			return walkInErr
+		}
+		linfo, sErr := os.Lstat(curPath)
+		if sErr != nil {
+			return sErr
+		}
+		if linfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("plugin %q: symlink entry %q rejected during export", idClean, curPath)
+		}
+		if curPath == realPluginDir {
+			return nil
+		}
+		rel, rErr := filepath.Rel(realPluginDir, curPath)
+		if rErr != nil {
+			return rErr
+		}
+		relSlash := filepath.ToSlash(rel)
+		baseLower := strings.ToLower(filepath.Base(curPath))
+
+		if shouldSkipPluginExportFile(baseLower, linfo.IsDir()) {
+			if linfo.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if linfo.IsDir() {
+			return nil
+		}
+		if !linfo.Mode().IsRegular() {
+			return fmt.Errorf("plugin %q: irregular file %q rejected during export", idClean, relSlash)
+		}
+		if linfo.Size() > MaxZipSingleBytes {
+			return fmt.Errorf("plugin %q: file %q exceeds %d MiB export limit", idClean, relSlash, MaxZipSingleBytes>>20)
+		}
+		totalBytes += linfo.Size()
+		if totalBytes > MaxZipArchiveBytes {
+			return fmt.Errorf("plugin %q: archive exceeds %d MiB export limit", idClean, MaxZipArchiveBytes>>20)
+		}
+		entries = append(entries, exportEntry{
+			relSlash: relSlash,
+			absPath:  curPath,
+			modTime:  linfo.ModTime().UTC(),
+		})
+		if len(entries) > MaxZipEntries {
+			return fmt.Errorf("plugin %q: file count exceeds %d export limit", idClean, MaxZipEntries)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return walkErr
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].relSlash < entries[j].relSlash
+	})
+
+	zw := zip.NewWriter(w)
+	for _, ent := range entries {
+		rawBytes, rErr := os.ReadFile(ent.absPath)
+		if rErr != nil {
+			_ = zw.Close()
+			return rErr
+		}
+		payloadBytes := sanitizeExportedPluginFileBytes(ent.relSlash, rawBytes, secretFieldKeys, knownRawSecrets)
+
+		hdr := &zip.FileHeader{
+			Name:     ent.relSlash,
+			Method:   zip.Deflate,
+			Modified: ent.modTime,
+		}
+		hdr.SetMode(0o644)
+		fw, cErr := zw.CreateHeader(hdr)
+		if cErr != nil {
+			_ = zw.Close()
+			return cErr
+		}
+		if _, wErr := fw.Write(payloadBytes); wErr != nil {
+			_ = zw.Close()
+			return wErr
+		}
+	}
+	return zw.Close()
+}
+
+func shouldSkipPluginExportFile(baseLower string, isDir bool) bool {
+	if baseLower == ".git" || baseLower == ".ds_store" ||
+		strings.HasPrefix(baseLower, ".tmp") || strings.HasPrefix(baseLower, ".bak") ||
+		strings.HasSuffix(baseLower, ".tmp") || strings.HasSuffix(baseLower, ".bak") {
+		return true
+	}
+	if isDir {
+		return baseLower == ".secrets" || baseLower == ".private"
+	}
+	if baseLower == ".env" || strings.HasPrefix(baseLower, ".env.") ||
+		strings.HasPrefix(baseLower, ".secret") ||
+		baseLower == "secrets.json" || baseLower == "secret.json" ||
+		strings.HasSuffix(baseLower, ".key") || strings.HasSuffix(baseLower, ".pem") {
+		return true
+	}
+	return false
+}
+
+func sanitizeExportedPluginFileBytes(
+	relSlash string,
+	raw []byte,
+	secretFieldKeys map[string]bool,
+	knownRawSecrets map[string]bool,
+) []byte {
+	lowerRel := strings.ToLower(relSlash)
+	if !strings.HasSuffix(lowerRel, ".json") {
+		return raw
+	}
+	if lowerRel == "manifest.json" {
+		var mfMap map[string]any
+		if err := json.Unmarshal(raw, &mfMap); err != nil {
+			return raw
+		}
+		changed := false
+		if schemaRaw, ok := mfMap["config_schema"].([]any); ok {
+			for _, item := range schemaRaw {
+				fieldMap, mOk := item.(map[string]any)
+				if !mOk {
+					continue
+				}
+				isSec, _ := fieldMap["secret"].(bool)
+				fType, _ := fieldMap["type"].(string)
+				if isSec || strings.EqualFold(strings.TrimSpace(fType), "secret") {
+					if defVal, hasDef := fieldMap["default"]; hasDef && defVal != nil && defVal != "" {
+						delete(fieldMap, "default")
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
+			return raw
+		}
+		if out, mErr := json.MarshalIndent(mfMap, "", "  "); mErr == nil {
+			return out
+		}
+		return raw
+	}
+
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return raw
+	}
+	cleaned, changed := stripSecretsFromJSONNode(doc, secretFieldKeys, knownRawSecrets)
+	if !changed {
+		return raw
+	}
+	if out, mErr := json.MarshalIndent(cleaned, "", "  "); mErr == nil {
+		return out
+	}
+	return raw
+}
+
+func stripSecretsFromJSONNode(
+	node any,
+	secretFieldKeys map[string]bool,
+	knownRawSecrets map[string]bool,
+) (any, bool) {
+	switch v := node.(type) {
+	case map[string]any:
+		changed := false
+		out := make(map[string]any, len(v))
+		for k, val := range v {
+			if secretFieldKeys[k] || isLikelySecretStateKey(k) {
+				if s, isStr := val.(string); !isStr || (s != "" && s != SecretMaskSentinel) {
+					changed = true
+					continue
+				}
+			}
+			if s, isStr := val.(string); isStr && s != "" && knownRawSecrets[s] {
+				changed = true
+				continue
+			}
+			nextVal, subChanged := stripSecretsFromJSONNode(val, secretFieldKeys, knownRawSecrets)
+			if subChanged {
+				changed = true
+			}
+			out[k] = nextVal
+		}
+		return out, changed
+	case []any:
+		changed := false
+		out := make([]any, 0, len(v))
+		for _, elem := range v {
+			if s, isStr := elem.(string); isStr && s != "" && knownRawSecrets[s] {
+				changed = true
+				continue
+			}
+			nextElem, subChanged := stripSecretsFromJSONNode(elem, secretFieldKeys, knownRawSecrets)
+			if subChanged {
+				changed = true
+			}
+			out = append(out, nextElem)
+		}
+		return out, changed
+	default:
+		return node, false
+	}
+}
+
+func isLikelySecretStateKey(k string) bool {
+	lk := strings.ToLower(strings.TrimSpace(k))
+	switch lk {
+	case "secret", "secrets", "api_key", "apikey", "api_token", "apitoken",
+		"token", "access_token", "refresh_token", "private_key", "password",
+		"passwd", "client_secret", "webhook_secret", "signing_secret", "secret_ciphertext":
+		return true
+	}
+	return strings.HasSuffix(lk, "_secret") || strings.HasSuffix(lk, "_api_key") || strings.HasSuffix(lk, "_token")
 }
 
 // InstallFromZip safely validates and extracts an external plugin .zip package with strict anti-Zip-Slip,
@@ -1218,7 +1699,7 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 	return m.toSummary(mp, locale), nil
 }
 
-// Uninstall disables an external plugin, deletes its directory, KV keys, DB row, and logs.
+// Uninstall disables an external plugin, invokes its optional onUninstall() hook, and deletes its directory, KV keys, DB row, and logs.
 func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 	mp, ok := m.getPlugin(pluginID)
 	if !ok {
@@ -1228,6 +1709,24 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 		return fmt.Errorf("plugin %q is built-in and cannot be uninstalled (use Disable instead)", pluginID)
 	}
 	_ = m.Disable(ctx, pluginID)
+
+	// Best-effort bounded onUninstall() lifecycle hook before deleting plugin_kv, config, and directory.
+	if mp.manifest.Runtime != RuntimeBuiltin && mp.pluginDir != "" {
+		if tempRT, rtErr := newGojaPluginRuntime(gojaRuntimeOptions{
+			manifest:              mp.manifest,
+			pluginDir:             mp.pluginDir,
+			kv:                    mp.kv,
+			logger:                m.logger,
+			hostI18n:              m.catalog,
+			getConfig:             mp.getConfigMap,
+			unsealSecret:          m.unsealSecretValue,
+			getSiteInfo:           m.getSiteInfo,
+			customResolver:        m.customResolver,
+			allowLoopbackForTests: m.allowLoopbackForTests,
+		}); rtErr == nil {
+			_, _, _ = tempRT.invoke(ctx, m.hookTimeout, "onUninstall")
+		}
+	}
 
 	m.mu.Lock()
 	delete(m.plugins, pluginID)
@@ -1292,10 +1791,11 @@ func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
 	}
 	secSet := make(map[string]bool)
 	for _, f := range mp.manifest.ConfigSchema {
-		if f.Secret {
+		if f.IsSecret() {
 			secSet[f.Key] = mp.secretConfig[f.Key] != ""
 		}
 	}
+	redactedCfg := buildRedactedConfigLocked(mp)
 	return PluginSummary{
 		ID:            mp.manifest.ID,
 		Kind:          mp.kind,
@@ -1313,9 +1813,251 @@ func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
 		AllowedHosts:  mp.manifest.EffectiveAllowedHosts(),
 		ConfigSchema:  mp.manifest.ConfigSchema,
 		PublicConfig:  pubCopy,
+		Config:        redactedCfg,
 		SecretKeysSet: secSet,
 		InstalledAt:   mp.installedAt,
 		UpdatedAt:     mp.updatedAt,
+	}
+}
+
+// RenderHooksStateHash computes a fast SHA-256 hex digest over all currently enabled plugins
+// with render capability (ID, version, circuit state, and config hash).
+// Returns "" when zero render plugins are enabled so callers can bypass cache key expansion.
+func (m *Manager) RenderHooksStateHash() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	candidates := make([]*managedPlugin, 0, len(m.plugins))
+	for _, mp := range m.plugins {
+		if mp.manifest.HasRenderCapability() {
+			candidates = append(candidates, mp)
+		}
+	}
+	m.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return ""
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].manifest.ID < candidates[j].manifest.ID
+	})
+
+	h := sha256.New()
+	enabledCount := 0
+	for _, mp := range candidates {
+		mp.mu.Lock()
+		if !mp.enabled || mp.circuitState != CircuitClosed {
+			mp.mu.Unlock()
+			continue
+		}
+		enabledCount++
+		pubBytes, _ := json.Marshal(mp.publicConfig)
+		secKeys := make([]string, 0, len(mp.secretConfig))
+		for k := range mp.secretConfig {
+			secKeys = append(secKeys, k)
+		}
+		sort.Strings(secKeys)
+		cfgDigest := sha256.New()
+		_, _ = cfgDigest.Write(pubBytes)
+		for _, k := range secKeys {
+			_, _ = cfgDigest.Write([]byte{0})
+			_, _ = cfgDigest.Write([]byte(k))
+			_, _ = cfgDigest.Write([]byte{'='})
+			_, _ = cfgDigest.Write([]byte(mp.secretConfig[k]))
+		}
+		circuit := mp.circuitState
+		mp.mu.Unlock()
+
+		_, _ = h.Write([]byte(mp.manifest.ID))
+		_, _ = h.Write([]byte{'|'})
+		_, _ = h.Write([]byte(mp.manifest.Version))
+		_, _ = h.Write([]byte{'|'})
+		_, _ = h.Write([]byte(circuit))
+		_, _ = h.Write([]byte{'|'})
+		_, _ = h.Write(cfgDigest.Sum(nil))
+		_, _ = h.Write([]byte{'\n'})
+	}
+	if enabledCount == 0 {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// DispatchRenderPreMarkdown dispatches render.pre_markdown across enabled render plugins and returns updated content_md.
+func (m *Manager) DispatchRenderPreMarkdown(ctx context.Context, raw ArticleHookPayload) string {
+	if m == nil {
+		return raw.ContentMD
+	}
+	return m.DispatchArticleHook(ctx, HookRenderPreMarkdown, raw).ContentMD
+}
+
+// DispatchRenderPreMarkdownFull dispatches render.pre_markdown and returns both updated content_md and summary_md.
+func (m *Manager) DispatchRenderPreMarkdownFull(ctx context.Context, raw ArticleHookPayload) (contentMD, summaryMD string) {
+	if m == nil {
+		return raw.ContentMD, raw.SummaryMD
+	}
+	out := m.DispatchArticleHook(ctx, HookRenderPreMarkdown, raw)
+	return out.ContentMD, out.SummaryMD
+}
+
+// DispatchRenderPostHTML dispatches render.post_html across enabled render plugins and returns updated HTML.
+func (m *Manager) DispatchRenderPostHTML(ctx context.Context, raw ArticleHookPayload) string {
+	if m == nil {
+		return raw.HTML
+	}
+	return m.DispatchArticleHook(ctx, HookRenderPostHTML, raw).HTML
+}
+
+// DispatchRenderDirective invokes custom markdown directive handlers registered via volo.registerDirective
+// or hooks["render.directive"] with full timeout and circuit-breaker protection.
+func (m *Manager) DispatchRenderDirective(ctx context.Context, name string, attrs map[string]string, body string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	normName := strings.ToLower(strings.TrimSpace(name))
+	if normName == "" || normName == "lock" {
+		return "", false
+	}
+
+	active := m.snapshotEnabledPlugins()
+	for _, mp := range active {
+		if !mp.manifest.HasRenderCapability() {
+			continue
+		}
+
+		mp.mu.Lock()
+		enabled := mp.enabled && mp.circuitState == CircuitClosed
+		rt := mp.gojaRT
+		bp := mp.builtin
+		runtimeKind := mp.manifest.Runtime
+		mp.mu.Unlock()
+		if !enabled {
+			continue
+		}
+
+		if runtimeKind == RuntimeBuiltin && bp != nil {
+			dCtx, cancel := context.WithTimeout(ctx, m.hookTimeout)
+			attrsCopy := make(map[string]string, len(attrs))
+			for k, v := range attrs {
+				attrsCopy[k] = v
+			}
+			res, err := bp.OnHook(dCtx, HookRenderDirective, map[string]any{
+				"name":  normName,
+				"attrs": attrsCopy,
+				"body":  body,
+			})
+			cancel()
+			if err != nil {
+				m.recordFailure(ctx, mp, "directive:"+normName, err)
+				continue
+			}
+			switch v := res.(type) {
+			case string:
+				if v != "" {
+					m.recordSuccess(ctx, mp)
+					return v, true
+				}
+			case map[string]any:
+				if h, ok := v["html"].(string); ok && h != "" {
+					m.recordSuccess(ctx, mp)
+					return h, true
+				}
+			}
+			continue
+		}
+
+		if rt != nil {
+			htmlOut, handled, err := rt.invokeDirective(ctx, m.hookTimeout, normName, attrs, body)
+			if err != nil {
+				m.recordFailure(ctx, mp, "directive:"+normName, err)
+				continue
+			}
+			if handled {
+				m.recordSuccess(ctx, mp)
+				return htmlOut, true
+			}
+		}
+	}
+	return "", false
+}
+
+// DispatchFederationArticle asynchronously invokes all enabled plugins with "federation" capability,
+// calling their publish / deliver handler with timeout, circuit-breaker protection, and plugin log entries.
+func (m *Manager) DispatchFederationArticle(ctx context.Context, action string, articlePayload map[string]any) {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	closed := m.closed
+	m.mu.RUnlock()
+	if closed {
+		return
+	}
+
+	normAction := strings.ToLower(strings.TrimSpace(action))
+	if normAction == "" {
+		normAction = "publish"
+	}
+	safePayload := sanitizeFederationPayloadMap(articlePayload)
+	providers := m.providers.Federations()
+	if len(providers) == 0 {
+		return
+	}
+
+	var baseCtx context.Context
+	var callerDeadline time.Time
+	var hasDeadline bool
+	if ctx != nil {
+		baseCtx = context.WithoutCancel(ctx)
+		callerDeadline, hasDeadline = ctx.Deadline()
+	} else {
+		baseCtx = context.Background()
+	}
+
+	for _, prov := range providers {
+		prov := prov
+		m.fedWG.Add(1)
+		go func() {
+			defer m.fedWG.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					m.logger.Write(prov.Name(), "error", "federation:"+normAction, fmt.Sprintf("recovered panic: %v", rec))
+				}
+			}()
+
+			timeout := m.routeTimeout
+			if hasDeadline {
+				rem := time.Until(callerDeadline)
+				if rem <= 0 {
+					timeout = 1 * time.Millisecond
+				} else if rem < timeout {
+					timeout = rem
+				}
+			}
+			fCtx, cancel := context.WithTimeout(baseCtx, timeout)
+			defer cancel()
+
+			payloadCopy := cloneArbitraryMap(safePayload)
+			if ga, isGoja := prov.(*gojaFederationAdapter); isGoja {
+				_ = ga.Publish(fCtx, normAction, payloadCopy)
+				return
+			}
+
+			mp, hasMP := m.getPlugin(prov.Name())
+			if err := prov.Publish(fCtx, normAction, payloadCopy); err != nil {
+				if hasMP {
+					m.recordFailure(fCtx, mp, "federation:"+normAction, err)
+				} else {
+					m.logger.Write(prov.Name(), "error", "federation:"+normAction, err.Error())
+				}
+				return
+			}
+			if hasMP {
+				m.recordSuccess(fCtx, mp)
+			}
+			m.logger.Write(prov.Name(), "info", "federation:"+normAction, "federation "+normAction+" completed")
+		}()
 	}
 }
 
@@ -1353,9 +2095,24 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 				if nextMD, sOk := out["content_md"].(string); sOk && nextMD != "" {
 					cur.ContentMD = nextMD
 				}
+				if nextSummary, sOk := out["summary_md"].(string); sOk && nextSummary != "" {
+					cur.SummaryMD = nextSummary
+				}
 			case ArticleHookPayload:
 				if out.ContentMD != "" {
 					cur.ContentMD = out.ContentMD
+				}
+				if out.SummaryMD != "" {
+					cur.SummaryMD = out.SummaryMD
+				}
+			case *ArticleHookPayload:
+				if out != nil {
+					if out.ContentMD != "" {
+						cur.ContentMD = out.ContentMD
+					}
+					if out.SummaryMD != "" {
+						cur.SummaryMD = out.SummaryMD
+					}
 				}
 			case string:
 				if out != "" {
@@ -1364,12 +2121,23 @@ func (m *Manager) DispatchArticleHook(ctx context.Context, hookName string, raw 
 			}
 		}
 		if hookName == HookRenderPostHTML && !cur.IsPasswordProtected && !hasLock {
-			if outMap, ok := res.(map[string]any); ok {
-				if nextHTML, sOk := outMap["html"].(string); sOk && nextHTML != "" {
+			switch out := res.(type) {
+			case string:
+				if out != "" {
+					cur.HTML = out
+				}
+			case map[string]any:
+				if nextHTML, sOk := out["html"].(string); sOk && nextHTML != "" {
 					cur.HTML = nextHTML
 				}
-			} else if outStruct, ok := res.(ArticleHookPayload); ok && outStruct.HTML != "" {
-				cur.HTML = outStruct.HTML
+			case ArticleHookPayload:
+				if out.HTML != "" {
+					cur.HTML = out.HTML
+				}
+			case *ArticleHookPayload:
+				if out != nil && out.HTML != "" {
+					cur.HTML = out.HTML
+				}
 			}
 		}
 	}
@@ -1923,13 +2691,38 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 	ext := strings.ToLower(filepath.Ext(realTarget))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	if ext == ".svg" || ext == ".html" || ext == ".htm" || ext == ".xml" {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox")
+	if isSandboxedMarkupAssetExt(ext) {
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	}
-	if ct := mime.TypeByExtension(ext); ct != "" {
+	ct := mime.TypeByExtension(ext)
+	if ct == "" || isNonStandardExecutableOrMarkupAssetExt(ext) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", "attachment")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	} else {
 		w.Header().Set("Content-Type", ct)
 	}
 	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
+}
+
+func isSandboxedMarkupAssetExt(ext string) bool {
+	switch ext {
+	case ".xhtml", ".shtml", ".svg", ".html", ".htm", ".xml":
+		return true
+	default:
+		return false
+	}
+}
+
+func isNonStandardExecutableOrMarkupAssetExt(ext string) bool {
+	switch ext {
+	case "", ".exe", ".dll", ".msi", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".wsf",
+		".sh", ".bash", ".zsh", ".py", ".rb", ".pl", ".php", ".phtml", ".jsp", ".asp", ".aspx", ".cgi",
+		".jar", ".war", ".swf", ".hta", ".htc", ".mht", ".mhtml", ".svgz", ".xsl", ".xslt":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) recordFailure(ctx context.Context, mp *managedPlugin, stage string, err error) {
@@ -1996,7 +2789,15 @@ func (m *Manager) PurgeExpiredKV(ctx context.Context) (int64, error) {
 	return PurgeExpiredKV(ctx, m.store, time.Now().Unix())
 }
 
-// Close gracefully stops all plugin background cron jobs and detaches runtimes.
+// WaitFederation waits for any in-flight asynchronous DispatchFederationArticle deliveries to finish.
+func (m *Manager) WaitFederation() {
+	if m == nil {
+		return
+	}
+	m.fedWG.Wait()
+}
+
+// Close gracefully stops all plugin background cron jobs, waits for in-flight federation tasks, and detaches runtimes.
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closed {
@@ -2010,6 +2811,7 @@ func (m *Manager) Close(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
+	m.fedWG.Wait()
 	for _, mp := range list {
 		m.deactivateRuntime(ctx, mp)
 	}
@@ -2505,6 +3307,112 @@ func (a *gojaStorageAdapter) HealthCheck(ctx context.Context) error {
 	}
 	return nil
 }
+
+type gojaFederationAdapter struct {
+	manager *Manager
+	mp      *managedPlugin
+}
+
+func (a *gojaFederationAdapter) Name() string { return a.mp.manifest.ID }
+
+func (a *gojaFederationAdapter) Publish(ctx context.Context, action string, articlePayload map[string]any) error {
+	a.mp.mu.Lock()
+	rt := a.mp.gojaRT
+	enabled := a.mp.enabled && a.mp.circuitState == CircuitClosed
+	a.mp.mu.Unlock()
+
+	if !enabled || rt == nil {
+		return errors.New("plugin federation inactive")
+	}
+
+	normAction := strings.ToLower(strings.TrimSpace(action))
+	if normAction == "" {
+		normAction = "publish"
+	}
+	safePayload := sanitizeFederationPayloadMap(articlePayload)
+
+	_, found, err := rt.invokeFederation(ctx, a.manager.routeTimeout, normAction, safePayload)
+	if err != nil {
+		a.manager.recordFailure(ctx, a.mp, "federation:"+normAction, err)
+		return err
+	}
+	if !found {
+		return nil
+	}
+	a.manager.recordSuccess(ctx, a.mp)
+	a.manager.logger.Write(a.mp.manifest.ID, "info", "federation:"+normAction, "federation "+normAction+" completed")
+	return nil
+}
+
+func sanitizeFederationPayloadMap(in map[string]any) map[string]any {
+	if in == nil {
+		return map[string]any{}
+	}
+	out := cloneArbitraryMap(in)
+	isProtected, _ := out["is_password_protected"].(bool)
+	if !isProtected {
+		if v, ok := out["IsPasswordProtected"].(bool); ok && v {
+			isProtected = true
+		}
+	}
+	if isProtected {
+		out["summary_md"] = ""
+		out["content_md"] = ""
+		out["html"] = ""
+		out["cover_url"] = ""
+		out["audio_url"] = ""
+		out["omitted_protected"] = true
+		delete(out, "SummaryMD")
+		delete(out, "ContentMD")
+		delete(out, "HTML")
+		delete(out, "CoverURL")
+		delete(out, "AudioURL")
+		return out
+	}
+
+	summaryMD, _ := out["summary_md"].(string)
+	contentMD, _ := out["content_md"].(string)
+	htmlBody, _ := out["html"].(string)
+	hasLock, _ := out["has_content_lock"].(bool)
+	if hasLock || strings.Contains(summaryMD, ":::lock") || strings.Contains(contentMD, ":::lock") || strings.Contains(htmlBody, ":::lock") {
+		out["has_content_lock"] = true
+		if summaryMD != "" {
+			out["summary_md"] = stripAllLockBlocks(summaryMD)
+		}
+		if contentMD != "" {
+			out["content_md"] = stripAllLockBlocks(contentMD)
+		}
+		if _, exists := out["html"]; exists {
+			out["html"] = ""
+		}
+	}
+	return out
+}
+
+func cloneArbitraryMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		switch tv := v.(type) {
+		case map[string]any:
+			out[k] = cloneArbitraryMap(tv)
+		case []any:
+			cp := make([]any, len(tv))
+			copy(cp, tv)
+			out[k] = cp
+		case []string:
+			cp := make([]string, len(tv))
+			copy(cp, tv)
+			out[k] = cp
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
 
 // RedactArticleForPlugin enforces the 10th Privacy Surface:
 // 1. Password-protected articles omit SummaryMD, ContentMD, HTML, CoverURL, and AudioURL completely.
