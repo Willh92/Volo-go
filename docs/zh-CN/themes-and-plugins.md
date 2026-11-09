@@ -97,7 +97,7 @@ themes/my-editorial/
 
 ---
 
-## 2. 三模态创作编辑器（3-Mode Studio Editor）
+## 2. 三模态创作编辑器与前台全屏评论编辑器
 
 管理工作台内置基于 CodeMirror 6 深度定制的三模态创作编辑器，兼顾纯正 Markdown 掌控力与所见即所得流式体验：
 
@@ -107,7 +107,10 @@ themes/my-editorial/
 - **原生多媒体、LaTeX 公式保护与语音速记**：
   - 原生支持 `<video>` / `<audio>` 上传嵌入与播客外链，拖拽/粘贴图片自动上传；
   - **LaTeX 数学公式保护**：渲染管线自动保护行内 `$...$` 与块级 `$$...$$` 公式免受 Markdown 下划线 `_` / 星号 `*` 误解析破坏，配合前台按需懒加载 KaTeX 与 Mermaid；
-  - 内置浏览器端**语音录制（Voice Recording）**直传媒体库并一键插入音频播放器标签，且开放 `slots:editor.quick_insert` 供插件注册自定义快捷指令按钮（如一键插入 `:::callout` 容器块）。
+  - 内置浏览器端**语音录制（Voice Recording）**直传媒体库并一键插入音频播放器标签，且开放 `slots:editor.quick_insert` 供插件注册自定义快捷指令按钮。
+- **前台安全增强型全屏评论回复编辑器（`comment-widget.js`）**：
+  - `volo-studio` 与 `volo-journal` 统一内置增强型 Markdown 回复框，提供快捷格式工具栏（加粗、斜体、删除线、行内/多行代码块、引用、列表、安全协议校验链接）、与入库同标准 HTML5 AST 净化的实时预览（`POST /api/v1/comments/preview`）、沉浸式**全屏编辑模式**（支持 `Esc` 退出）以及按身份动态同步的字符数/行数计数器；
+  - 内置多维评论高度防刷屏机制（Zalgo 组合符封顶、零宽/盲文空白行折叠、标题降级、代码块/图片最大高度约束与超高评论自动折叠「展开全文 / 收起」）。
 
 ---
 
@@ -129,8 +132,8 @@ plugins/hello-callout/
 
 - **数据隔离与卸载彻底清理**：
   - 数据库存储按 `(plugin_id, key)` 在 `plugin_kv` 物理隔离（单键 `<= 256 KiB`、单插件默认 `<= 2,000` 条配额），加密配置密封于 `plugins.secret_ciphertext`；插件仅可只读访问自身根目录内文件，禁止写宿主文件系统。
-  - **完整 5 阶段生命周期**：`onInstall()`（首次安装或原位升级后） -> `onEnable()`（启用加载） -> `onConfigChange(newCfg)`（后台保存配置即时热响应，无需重启 VM） -> `onDisable()`（停用并注销该插件全部动态定时任务与 Provider） -> `onUninstall()`（卸载前最佳努力执行收尾，随后宿主在事务内彻底清除该插件的 `plugin_kv`、`plugins` 记录及 `./plugins/<id>` 目录）。
-- **热安装、原位升级（`overwrite=true`）与纯净 `.zip` 导出**：支持上传 `.zip` 包完成零停机安装或原位覆盖升级（自动保留已有 `config_json`、自定义优先级与 `secret_ciphertext` 加密密钥），并支持 `GET /api/admin/plugins/{id}/export` 导出不含任何机密密文的纯净 `.zip` 包。
+  - **完整 5 阶段生命周期**：`onInstall()`（首次安装或原位升级后） -> `onEnable()`（启用加载） -> `onConfigChange(newCfg)`（后台保存配置即时热响应，无需重启 VM） -> `onDisable()`（停用并注销该插件全部动态定时任务、缓冲自增计数与 Provider） -> `onUninstall()`（卸载前最佳努力执行收尾，随后宿主在事务内彻底清除该插件的 `plugin_kv`、`plugins` 记录及 `./plugins/<id>` 目录）。
+- **热安装、原位升级（`overwrite=true`）与纯净 `.zip` 导出**：支持上传 `.zip` 包完成零停机安装或原位覆盖升级（自动保留已有 `config_json`、自定义优先级、`secret_ciphertext` 加密密钥与已启用运行状态），并支持 `GET /api/admin/plugins/{id}/export` 导出不含任何机密密文的纯净 `.zip` 包。
 
 ### 3.2 `manifest.json` 完整字段、`priority` 链式优先级与 `type: "secret"` 加密配置
 
@@ -249,17 +252,17 @@ plugins/hello-callout/
    - **领域钩子**（支持 `hooks:*`、`hooks:<domain>.*` 通配符或细粒度令牌）：
      - 前置拦截钩子：`hooks:comment.before_create`、`hooks:comment.before_update`、`hooks:user.before_register`、`hooks:user.before_update_profile`、`hooks:article.before_save`、`hooks:page.before_save`、`hooks:media.before_upload`；
      - 后置通知与渲染钩子：`hooks:article.{published,updated,deleted}`、`hooks:page.{published,updated,deleted}`、`hooks:comment.{created,moderated}`、`hooks:render.{pre_markdown,post_html}`；
-   - **界面插槽**（`ui:slots` 或 `slots:*`）：`public.head`、`public.header`、`public.sidebar`、`article.before_content`、`article.after_content`、`comment.before`、`comment.after`、`public.footer`、`editor.quick_insert`、`admin.dashboard_card`；
+   - **界面插槽**（`ui:slots` 或 `slots:*`）：`public.head`、`public.header`、`public.sidebar`、`article.before_content`、`article.after_content`、`comment.before`、`comment.after`、`public.footer`、`editor.quick_insert`、`admin.dashboard_card`（声明 `persist: true` 时跨 PJAX 持久挂载）；
    - **网络与路由**：`http:routes`（挂载 `/plugins/<id>/api/*`）、`http:raw_headers`、`http.outbound:<hostname>` / `allowed_hosts`（配合 `OutboundSafeDialer` 防 SSRF）；
    - **核心扩展 Provider**（多个同类型插件严格按 `priority` 升序链式执行）：
      - `provider:storage`：`storagePut` / `storageDelete` / `storageHealthCheck`（自动降级本地磁盘）；
-     - `provider:oidc`：`oidcAuthURL` / `oidcExchange` / `oidcProviderInfo`（PKCE + `nonce` 校验）；
+     - `provider:oidc`：`oidcAuthURL` / `oidcExchange` / `oidcProviderInfo`（PKCE + `nonce` 校验，配置更新即时刷新 Provider 缓存）；
      - `provider:notifier`：`sendNotification(event)` / `notifySend(event)`；
      - `provider:antispam`：`checkSpam(input)`（返回 `{ action: "pass" | "allow" | "moderate" | "reject", reason, score }`）与可选 `checkNickname(input)`（返回 `{ allow: boolean, reason }`）；
    - **高敏读取**：`articles:read_protected`。
 
-2. **沙箱熔断、资源护栏与宿主安全联动**：
-   - 每次 JS Hook / Directive / Cron / Federation / Slot 执行均受指令步数预算、墙钟超时、循环引用深度上限及 `4 MiB` 字符串体积上限保护；非业务抛错或超时连续达到阈值自动打开**熔断器（`CIRCUIT_OPEN`）**；
+2. **沙箱熔断、原型冻结隔离与资源护栏**：
+   - 每次 JS 执行受指令步数预算、不可被 `try/catch` 吞没的墙钟超时哨兵（`ErrExecutionTimeout`）、AST 递归深度（`<= 128`）、流式 `JSON.parse` 深度/元素数上限、全局正则匹配上限及 `4 MiB` 字符串体积上限保护；内置原型全部冻结且池化 VM 在每次借还间执行 `snapshotPostInit`/`restorePostInit` 重置；非业务抛错或超时连续达到阈值自动打开**熔断器（`CIRCUIT_OPEN`）**；
    - 关于宿主级 **动态隐身后台路径热更新（`security.admin_path`）** 与 **多库共存 GeoIP 访问控制引擎** 的详细安全机制，请参阅 [`SECURITY.md`](../../SECURITY.md)。
 
 ### 3.5 沙箱 SDK（`volo.*`）、原生 `wordFilter` 引擎与 `main.js` 示例
@@ -269,7 +272,8 @@ plugins/hello-callout/
 - `volo.wordFilter.compile({ deny, allow, normalize, maxRepeat })` / `volo.wordFilter.loadHoubbDict(relGzPath, opts)`：编译原生零 CGO 双数组 Aho-Corasick 词库匹配器，返回实例支持 `.match(text)`、`.contains(text)`、`.censor(text, maskRune?)` 与 `.stats()`；
 - `volo.cron.register(name, intervalSec, handlerName, immediate?)` / `volo.cron.unregister(name)` / `volo.cron.list()`：动态定时任务管理（需 `cron` 权限）；
 - `volo.registerDirective(name, handlerFn)` / `volo.registerFederation({ publish(ev), deliver(ev) })`；
-- `volo.escapeHTML(str)`、`volo.config.{get,all}()`、`volo.kv.{get,getInt,set,del,incr,list}(...)`、`volo.crypto.{sha256,hmacSha256,randomUUID}()`、`volo.site.info()`、`volo.rateLimit(...)`、`volo.http.fetch(...)`、`volo.i18n.t(...)` 与 `volo.log.{info,warn,error}(msg)`。
+- `volo.kv.{get,getInt,set,del,incr,incrAsync,flush,list}(...)`：其中 `incrAsync(key, delta?)` 提供内存写合并异步自增（每 5s 及插件停用/停机时自动批量刷写落库，`getInt` 实时叠加待刷增量），消除热点请求写库阻塞；
+- `volo.escapeHTML(str)`、`btoa` / `atob`（二进制安全 Latin-1 编解码）、`volo.config.{get,all}()`、`volo.crypto.{sha256,hmacSha256,randomUUID}()`、`volo.site.info()`、`volo.rateLimit(...)`、`volo.http.fetch(url, { body_base64, response_encoding: "base64", ... })`、`volo.i18n.t(...)` 与 `volo.log.{info,warn,error}(msg)`。
 
 ```javascript
 let matcher = null;

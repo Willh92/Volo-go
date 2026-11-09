@@ -108,6 +108,8 @@ type boundCommonFlags struct {
 	envFile          string
 	listenAddr       string
 	listenSocket     string
+	socketGroup      string
+	socketMode       string
 	publicURL        string
 	trustedProxies   string
 	adminPath        string
@@ -131,6 +133,9 @@ func registerCommonFlags(fs *flag.FlagSet, b *boundCommonFlags) {
 	fs.StringVar(&b.envFile, "env-file", "", "Path to .env file (default .env)")
 	fs.StringVar(&b.listenAddr, "listen-addr", "", "TCP listen address (e.g. 0.0.0.0:8080)")
 	fs.StringVar(&b.listenSocket, "listen-socket", "", "Unix domain socket path[,octal_mode]")
+	fs.StringVar(&b.listenSocket, "unix-socket", "", "Alias for --listen-socket (Unix domain socket path)")
+	fs.StringVar(&b.socketGroup, "socket-group", "", "Unix domain socket group name or numeric GID")
+	fs.StringVar(&b.socketMode, "socket-mode", "", "Unix domain socket octal file mode (default 0660)")
 	fs.StringVar(&b.publicURL, "public-url", "", "Canonical public URL")
 	fs.StringVar(&b.trustedProxies, "trusted-proxies", "", "Comma-separated trusted proxy CIDRs or 'unix'")
 	fs.StringVar(&b.adminPath, "admin-path", "", "Custom stealth admin path prefix (e.g. /secret-panel)")
@@ -161,9 +166,17 @@ func buildCLIOverrides(fs *flag.FlagSet, b *boundCommonFlags) config.CLIOverride
 		v := b.listenAddr
 		o.ListenAddr = &v
 	}
-	if setFlags["listen-socket"] {
+	if setFlags["listen-socket"] || setFlags["unix-socket"] {
 		v := b.listenSocket
 		o.ListenSocket = &v
+	}
+	if setFlags["socket-group"] {
+		v := b.socketGroup
+		o.SocketGroup = &v
+	}
+	if setFlags["socket-mode"] {
+		v := b.socketMode
+		o.SocketMode = &v
 	}
 	if setFlags["public-url"] {
 		v := b.publicURL
@@ -477,6 +490,10 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 			notifier.SetPublicURL(cfg.GetPublicURL())
 			notifier.NotifyCommentCreated(pubCtx, view, in)
 		},
+		NotifyCommentApproved: func(pubCtx context.Context, cmt domain.Comment) {
+			notifier.SetPublicURL(cfg.GetPublicURL())
+			notifier.NotifyCommentReplyApproved(pubCtx, cmt)
+		},
 		NotifyArticlePublished: func(pubCtx context.Context, raw domain.RawArticle) {
 			notifier.SetPublicURL(cfg.GetPublicURL())
 			notifier.BroadcastArticlePublished(pubCtx, raw, "")
@@ -636,10 +653,10 @@ func cmdAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 
 		var targetUser domain.User
 		err = store.WithTx(ctx, func(tx *sqlx.Tx) error {
-			u, qErr := sqlx.Get[domain.User](ctx, tx,
+			var u domain.User
+			if qErr := sqlx.GetInto(ctx, tx, &u,
 				`SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
-				ident, ident)
-			if qErr != nil {
+				ident, ident); qErr != nil {
 				if errors.Is(qErr, sql.ErrNoRows) {
 					return fmt.Errorf("user %q not found", ident)
 				}
@@ -704,10 +721,10 @@ func cmdAdmin(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		var removedCount int64
 		var targetUser domain.User
 		err = store.WithTx(ctx, func(tx *sqlx.Tx) error {
-			u, qErr := sqlx.Get[domain.User](ctx, tx,
+			var u domain.User
+			if qErr := sqlx.GetInto(ctx, tx, &u,
 				`SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)`,
-				ident, ident)
-			if qErr != nil {
+				ident, ident); qErr != nil {
 				if errors.Is(qErr, sql.ErrNoRows) {
 					return fmt.Errorf("user %q not found", ident)
 				}
@@ -951,40 +968,66 @@ func cmdHealthcheck(ctx context.Context, args []string, stdout io.Writer, stderr
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	return runHealthcheck(ctx, fs, &common, *targetURL, stdout, stderr)
+}
 
+func runHealthcheck(ctx context.Context, fs *flag.FlagSet, common *boundCommonFlags, rawTargetURL string, stdout io.Writer, stderr io.Writer) int {
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
-	transport := &http.Transport{Proxy: nil}
-	client := &http.Client{
-		Timeout:   4 * time.Second,
-		Transport: transport,
-	}
-	urlStr := strings.TrimSpace(*targetURL)
-	if urlStr == "" {
-		cfg, err := config.Load(buildCLIOverrides(fs, &common))
+	cli := buildCLIOverrides(fs, common)
+	cli.SkipKeyRing = true
+
+	var sockPath string
+	urlStr := strings.TrimSpace(rawTargetURL)
+	if cli.ListenSocket != nil && strings.TrimSpace(*cli.ListenSocket) != "" {
+		spec, err := config.ParseListenSocketSpec(*cli.ListenSocket)
+		if err != nil {
+			fmt.Fprintf(stderr, "volo healthcheck: %v\n", err)
+			return 1
+		}
+		sockPath = spec.Path
+	} else if urlStr == "" {
+		cfg, err := config.Load(cli)
 		if err != nil {
 			fmt.Fprintf(stderr, "volo healthcheck: %v\n", err)
 			return 1
 		}
 		if cfg.ListenSocket != nil && cfg.ListenSocket.Path != "" {
-			sockPath := cfg.ListenSocket.Path
-			transport.DialContext = func(dCtx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(dCtx, "unix", sockPath)
-			}
-			urlStr = "http://unix/healthz"
+			sockPath = cfg.ListenSocket.Path
 		} else {
 			host, port, sErr := net.SplitHostPort(cfg.ListenAddr)
 			if sErr != nil {
-				urlStr = "http://127.0.0.1:8080/healthz"
+				if strings.HasPrefix(cfg.ListenAddr, ":") && len(cfg.ListenAddr) > 1 {
+					urlStr = "http://127.0.0.1" + cfg.ListenAddr + "/healthz"
+				} else {
+					urlStr = "http://127.0.0.1:8080/healthz"
+				}
 			} else {
-				if host == "" || host == "0.0.0.0" || host == "::" {
+				if host == "" || host == "0.0.0.0" || host == "::" || host == "*" {
 					host = "127.0.0.1"
 				}
 				urlStr = "http://" + net.JoinHostPort(host, port) + "/healthz"
 			}
 		}
+	}
+
+	transport := &http.Transport{Proxy: nil}
+	if sockPath != "" {
+		transport = &http.Transport{
+			Proxy: nil,
+			DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(dCtx, "unix", sockPath)
+			},
+		}
+		if urlStr == "" {
+			urlStr = "http://unix/healthz"
+		}
+	}
+
+	client := &http.Client{
+		Timeout:   4 * time.Second,
+		Transport: transport,
 	}
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, urlStr, nil)

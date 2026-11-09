@@ -1,18 +1,18 @@
 package notify
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"html"
 	"mime"
 	"mime/quotedprintable"
 	"net"
-	"net/mail"
 	"net/netip"
-	"net/smtp"
 	"sort"
 	"strconv"
 	"strings"
@@ -135,6 +135,9 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 	if !cfg.SMTPEnabled {
 		return errors.New("notify: SMTP delivery is disabled")
 	}
+	if strings.ContainsAny(cfg.SMTPHost, "\r\n\x00") {
+		return errors.New("notify: invalid smtp_host")
+	}
 	host := sanitizeHeaderToken(cfg.SMTPHost)
 	if host == "" {
 		return errors.New("notify: smtp_host is required")
@@ -155,19 +158,22 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 		}
 	}
 
-	fromAddr, err := mail.ParseAddress(sanitizeHeaderToken(cfg.SMTPFromEmail))
-	if err != nil || fromAddr.Address == "" {
+	if strings.ContainsAny(cfg.SMTPFromName, "\r\n\x00") {
+		return errors.New("notify: invalid smtp_from_name")
+	}
+	fromName, fromAddr, err := parseCleanEmailAddr(cfg.SMTPFromEmail)
+	if err != nil || fromAddr == "" {
 		return errors.New("notify: valid smtp_from_email is required")
 	}
 	if name := sanitizeHeaderToken(cfg.SMTPFromName); name != "" {
-		fromAddr.Name = name
+		fromName = name
 	}
-	toAddr, err := mail.ParseAddress(sanitizeHeaderToken(msg.To))
-	if err != nil || toAddr.Address == "" {
+	toName, toAddr, err := parseCleanEmailAddr(msg.To)
+	if err != nil || toAddr == "" {
 		return errors.New("notify: invalid recipient email address")
 	}
 
-	rawMIME, err := buildMIMEMessage(fromAddr, toAddr, msg)
+	rawMIME, err := buildMIMEMessage(fromName, fromAddr, toName, toAddr, msg)
 	if err != nil {
 		return err
 	}
@@ -190,7 +196,7 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 		InsecureSkipVerify: false, // Hard invariant: never skip certificate verification
 	}
 
-	var client *smtp.Client
+	var client *smtpConn
 	switch secMode {
 	case "tls":
 		resolvedIPs, rErr := m.resolvePublicOnlyAddrs(ctx, host)
@@ -224,7 +230,7 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 		} else {
 			_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
 		}
-		c, cErr := smtp.NewClient(conn, host)
+		c, cErr := newSMTPConn(conn)
 		if cErr != nil {
 			_ = conn.Close()
 			return fmt.Errorf("notify: smtp client init failed: %w", cErr)
@@ -247,17 +253,17 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 		} else {
 			_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
 		}
-		c, cErr := smtp.NewClient(conn, host)
+		c, cErr := newSMTPConn(conn)
 		if cErr != nil {
 			_ = conn.Close()
 			return fmt.Errorf("notify: smtp client init failed: %w", cErr)
 		}
-		if ok, _ := c.Extension("STARTTLS"); !ok {
-			_ = c.Close()
+		if ok, _ := c.extension("STARTTLS"); !ok {
+			_ = c.close()
 			return errors.New("notify: server does not advertise STARTTLS")
 		}
-		if sErr := c.StartTLS(tlsCfg); sErr != nil {
-			_ = c.Close()
+		if sErr := c.startTLS(ctx, tlsCfg); sErr != nil {
+			_ = c.close()
 			return fmt.Errorf("notify: STARTTLS handshake failed: %w", sErr)
 		}
 		client = c
@@ -279,7 +285,7 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 		} else {
 			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 		}
-		c, cErr := smtp.NewClient(conn, host)
+		c, cErr := newSMTPConn(conn)
 		if cErr != nil {
 			_ = conn.Close()
 			return fmt.Errorf("notify: internal smtp client init failed: %w", cErr)
@@ -289,33 +295,366 @@ func (m *Mailer) Send(ctx context.Context, cfg domain.NotificationsSettings, smt
 	default:
 		return fmt.Errorf("notify: unsupported smtp_security mode %q", cfg.SMTPSecurity)
 	}
-	defer client.Close()
+	defer client.close()
 
 	if cfg.SMTPAuth && strings.TrimSpace(cfg.SMTPUsername) != "" {
-		auth := smtp.PlainAuth("", strings.TrimSpace(cfg.SMTPUsername), smtpPassword, host)
-		if err := client.Auth(auth); err != nil {
+		if err := client.auth(strings.TrimSpace(cfg.SMTPUsername), smtpPassword); err != nil {
 			return fmt.Errorf("notify: smtp auth failed: %w", err)
 		}
 	}
 
-	if err := client.Mail(fromAddr.Address); err != nil {
+	if err := client.mailFrom(fromAddr); err != nil {
 		return fmt.Errorf("notify: MAIL FROM failed: %w", err)
 	}
-	if err := client.Rcpt(toAddr.Address); err != nil {
+	if err := client.rcptTo(toAddr); err != nil {
 		return fmt.Errorf("notify: RCPT TO failed: %w", err)
 	}
-	wc, err := client.Data()
+	if err := client.data(rawMIME); err != nil {
+		return fmt.Errorf("notify: DATA delivery failed: %w", err)
+	}
+	return client.quit()
+}
+
+// parseCleanEmailAddr validates and extracts a single RFC 5322 email address ("user@domain" or
+// "Display Name <user@domain>"), strictly rejecting CRLF/NUL, angle-bracket injection, multiple
+// addresses, missing '@', or malformed local/domain parts.
+func parseCleanEmailAddr(raw string) (displayName string, addr string, err error) {
+	if strings.ContainsAny(raw, "\r\n\x00") {
+		return "", "", errors.New("email address contains forbidden control characters")
+	}
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", "", errors.New("empty email address")
+	}
+
+	addrSpec := s
+	if lt := strings.IndexByte(s, '<'); lt >= 0 {
+		gt := strings.IndexByte(s[lt+1:], '>')
+		if gt < 0 {
+			return "", "", errors.New("unclosed angle bracket in email address")
+		}
+		gt += lt + 1
+		if strings.TrimSpace(s[gt+1:]) != "" {
+			return "", "", errors.New("unexpected trailing tokens after angle-bracketed email address")
+		}
+		addrSpec = strings.TrimSpace(s[lt+1 : gt])
+		namePart := strings.TrimSpace(s[:lt])
+		if strings.ContainsAny(namePart, "<>") {
+			return "", "", errors.New("nested angle brackets in display name")
+		}
+		if len(namePart) >= 2 && namePart[0] == '"' && namePart[len(namePart)-1] == '"' {
+			unq := strings.ReplaceAll(namePart[1:len(namePart)-1], `\"`, `"`)
+			unq = strings.ReplaceAll(unq, `\\`, `\`)
+			namePart = strings.TrimSpace(unq)
+		} else if strings.ContainsAny(namePart, ",;") {
+			return "", "", errors.New("unquoted list separator in display name")
+		}
+		displayName = namePart
+	} else if strings.IndexByte(s, '>') >= 0 {
+		return "", "", errors.New("stray closing angle bracket in email address")
+	}
+
+	if addrSpec == "" || len(addrSpec) > 254 {
+		return "", "", errors.New("invalid email address length")
+	}
+	for i := 0; i < len(addrSpec); i++ {
+		b := addrSpec[i]
+		if b <= 0x20 || b == 0x7F || b == '<' || b == '>' || b == ',' || b == ';' || b == ':' || b == '"' || b == '\\' {
+			return "", "", errors.New("forbidden character in email address")
+		}
+	}
+
+	at := strings.IndexByte(addrSpec, '@')
+	if at <= 0 || at != strings.LastIndexByte(addrSpec, '@') || at == len(addrSpec)-1 {
+		return "", "", errors.New("email address must contain exactly one '@' separating local and domain parts")
+	}
+	local := addrSpec[:at]
+	domainPart := addrSpec[at+1:]
+
+	if len(local) > 64 || local[0] == '.' || local[len(local)-1] == '.' || strings.Contains(local, "..") {
+		return "", "", errors.New("invalid email local-part")
+	}
+	if domainPart[0] == '.' || domainPart[len(domainPart)-1] == '.' || strings.Contains(domainPart, "..") || strings.IndexByte(domainPart, '.') < 0 {
+		return "", "", errors.New("invalid email domain")
+	}
+	labels := strings.Split(domainPart, ".")
+	for _, lbl := range labels {
+		if lbl == "" || len(lbl) > 63 || lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
+			return "", "", errors.New("invalid email domain label")
+		}
+		for i := 0; i < len(lbl); i++ {
+			c := lbl[i]
+			isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+			if !isAlphaNum && c != '-' && c < 0x80 {
+				return "", "", errors.New("invalid character in email domain label")
+			}
+		}
+	}
+	return displayName, addrSpec, nil
+}
+
+type smtpConn struct {
+	conn net.Conn
+	r    *bufio.Reader
+	ext  map[string]string
+}
+
+func newSMTPConn(conn net.Conn) (*smtpConn, error) {
+	c := &smtpConn{
+		conn: conn,
+		r:    bufio.NewReaderSize(conn, 4096),
+		ext:  make(map[string]string),
+	}
+	if _, _, err := c.readResponse(220); err != nil {
+		return nil, err
+	}
+	if err := c.ehlo(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *smtpConn) ehlo() error {
+	if err := c.writeCmd("EHLO localhost"); err != nil {
+		return err
+	}
+	code, lines, err := c.readResponse(250)
 	if err != nil {
-		return fmt.Errorf("notify: DATA command failed: %w", err)
+		if code == 500 || code == 502 {
+			if hErr := c.writeCmd("HELO localhost"); hErr != nil {
+				return hErr
+			}
+			_, _, hErr := c.readResponse(250)
+			return hErr
+		}
+		return err
 	}
-	if _, err := wc.Write(rawMIME); err != nil {
-		_ = wc.Close()
-		return fmt.Errorf("notify: write body failed: %w", err)
+	c.ext = make(map[string]string, len(lines))
+	for i := 1; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, " ")
+		c.ext[strings.ToUpper(k)] = strings.TrimSpace(v)
+		if !ok {
+			c.ext[strings.ToUpper(line)] = ""
+		}
 	}
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("notify: close DATA failed: %w", err)
+	return nil
+}
+
+func (c *smtpConn) extension(name string) (bool, string) {
+	v, ok := c.ext[strings.ToUpper(name)]
+	return ok, v
+}
+
+func (c *smtpConn) startTLS(ctx context.Context, tlsCfg *tls.Config) error {
+	if err := c.writeCmd("STARTTLS"); err != nil {
+		return err
 	}
-	return client.Quit()
+	if _, _, err := c.readResponse(220); err != nil {
+		return err
+	}
+	tlsConn := tls.Client(c.conn, tlsCfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	c.conn = tlsConn
+	c.r = bufio.NewReaderSize(tlsConn, 4096)
+	return c.ehlo()
+}
+
+func (c *smtpConn) auth(username, password string) error {
+	if strings.ContainsAny(username, "\r\n\x00") || strings.ContainsAny(password, "\r\n\x00") {
+		return errors.New("smtp credentials contain forbidden control characters")
+	}
+	hasAuth, mechsRaw := c.extension("AUTH")
+	useLogin := false
+	if hasAuth && mechsRaw != "" {
+		hasPlain := false
+		hasLogin := false
+		for _, m := range strings.Fields(mechsRaw) {
+			switch strings.ToUpper(m) {
+			case "PLAIN":
+				hasPlain = true
+			case "LOGIN":
+				hasLogin = true
+			}
+		}
+		if !hasPlain && hasLogin {
+			useLogin = true
+		}
+	}
+	if useLogin {
+		if err := c.writeCmd("AUTH LOGIN"); err != nil {
+			return err
+		}
+		if _, _, err := c.readResponse(334); err != nil {
+			return err
+		}
+		if err := c.writeCmd(base64.StdEncoding.EncodeToString([]byte(username))); err != nil {
+			return err
+		}
+		if _, _, err := c.readResponse(334); err != nil {
+			return err
+		}
+		if err := c.writeCmd(base64.StdEncoding.EncodeToString([]byte(password))); err != nil {
+			return err
+		}
+		_, _, err := c.readResponse(235)
+		return err
+	}
+
+	plainToken := base64.StdEncoding.EncodeToString([]byte("\x00" + username + "\x00" + password))
+	if err := c.writeCmd("AUTH PLAIN " + plainToken); err != nil {
+		return err
+	}
+	code, _, err := c.readResponse(235)
+	if err != nil && code == 334 {
+		if wErr := c.writeCmd(plainToken); wErr != nil {
+			return wErr
+		}
+		_, _, err = c.readResponse(235)
+	}
+	return err
+}
+
+func (c *smtpConn) mailFrom(addr string) error {
+	if err := c.writeCmd("MAIL FROM:<" + addr + ">"); err != nil {
+		return err
+	}
+	_, _, err := c.readResponse(250)
+	return err
+}
+
+func (c *smtpConn) rcptTo(addr string) error {
+	if err := c.writeCmd("RCPT TO:<" + addr + ">"); err != nil {
+		return err
+	}
+	code, lines, err := c.readResponse(0)
+	if err != nil {
+		return err
+	}
+	if code != 250 && code != 251 {
+		return fmt.Errorf("smtp status %d: %s", code, strings.Join(lines, "; "))
+	}
+	return nil
+}
+
+func (c *smtpConn) data(rawMIME []byte) error {
+	if err := c.writeCmd("DATA"); err != nil {
+		return err
+	}
+	if _, _, err := c.readResponse(354); err != nil {
+		return err
+	}
+	bw := bufio.NewWriterSize(c.conn, 8192)
+	if err := writeDotStuffedSMTPData(bw, rawMIME); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	_, _, err := c.readResponse(250)
+	return err
+}
+
+func (c *smtpConn) quit() error {
+	_ = c.writeCmd("QUIT")
+	_, _, _ = c.readResponse(221)
+	return c.close()
+}
+
+func (c *smtpConn) close() error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
+}
+
+func (c *smtpConn) writeCmd(cmd string) error {
+	if strings.ContainsAny(cmd, "\r\n\x00") {
+		return errors.New("smtp command contains CRLF/NUL")
+	}
+	_, err := c.conn.Write([]byte(cmd + "\r\n"))
+	return err
+}
+
+func (c *smtpConn) readResponse(expectCode int) (int, []string, error) {
+	var lines []string
+	var code int
+	for len(lines) < 64 {
+		line, err := c.r.ReadString('\n')
+		if err != nil {
+			return 0, nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if len(line) < 3 {
+			return 0, nil, fmt.Errorf("malformed smtp response line %q", line)
+		}
+		parsed, pErr := strconv.Atoi(line[:3])
+		if pErr != nil {
+			return 0, nil, fmt.Errorf("invalid smtp status code in %q", line)
+		}
+		code = parsed
+		msg := ""
+		sep := byte(' ')
+		if len(line) > 3 {
+			sep = line[3]
+			msg = line[4:]
+		}
+		lines = append(lines, msg)
+		if sep != '-' {
+			break
+		}
+	}
+	if expectCode > 0 && code != expectCode {
+		return code, lines, fmt.Errorf("smtp status %d: %s", code, strings.Join(lines, "; "))
+	}
+	return code, lines, nil
+}
+
+// writeDotStuffedSMTPData writes rawMIME normalized to CRLF line endings with RFC 5321
+// transparency dot-stuffing (doubling any leading '.' on a line) followed by "\r\n.\r\n".
+func writeDotStuffedSMTPData(bw *bufio.Writer, data []byte) error {
+	atLineStart := true
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if b == '\r' {
+			if i+1 < len(data) && data[i+1] == '\n' {
+				i++
+			}
+			if _, err := bw.WriteString("\r\n"); err != nil {
+				return err
+			}
+			atLineStart = true
+			continue
+		}
+		if b == '\n' {
+			if _, err := bw.WriteString("\r\n"); err != nil {
+				return err
+			}
+			atLineStart = true
+			continue
+		}
+		if atLineStart && b == '.' {
+			if err := bw.WriteByte('.'); err != nil {
+				return err
+			}
+		}
+		atLineStart = false
+		if err := bw.WriteByte(b); err != nil {
+			return err
+		}
+	}
+	if !atLineStart {
+		if _, err := bw.WriteString("\r\n"); err != nil {
+			return err
+		}
+	}
+	_, err := bw.WriteString(".\r\n")
+	return err
 }
 
 func orderAddrsIPv4First(ips []netip.Addr) []netip.Addr {
@@ -414,7 +753,15 @@ func sanitizeHeaderToken(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func buildMIMEMessage(from, to *mail.Address, msg MailMessage) ([]byte, error) {
+func formatAddressHeader(displayName, addr string) string {
+	cleanName := sanitizeHeaderToken(displayName)
+	if cleanName == "" {
+		return "<" + addr + ">"
+	}
+	return mime.QEncoding.Encode("utf-8", cleanName) + " <" + addr + ">"
+}
+
+func buildMIMEMessage(fromName, fromAddr, toName, toAddr string, msg MailMessage) ([]byte, error) {
 	subj := mime.QEncoding.Encode("utf-8", sanitizeHeaderToken(msg.Subject))
 	textBody := strings.TrimSpace(msg.TextBody)
 	htmlBody := strings.TrimSpace(msg.HTMLBody)
@@ -426,8 +773,8 @@ func buildMIMEMessage(from, to *mail.Address, msg MailMessage) ([]byte, error) {
 
 	boundary := fmt.Sprintf("volo-mime-%d", time.Now().UnixNano())
 	var buf bytes.Buffer
-	buf.WriteString("From: " + from.String() + "\r\n")
-	buf.WriteString("To: " + to.String() + "\r\n")
+	buf.WriteString("From: " + formatAddressHeader(fromName, fromAddr) + "\r\n")
+	buf.WriteString("To: " + formatAddressHeader(toName, toAddr) + "\r\n")
 	buf.WriteString("Subject: " + subj + "\r\n")
 	buf.WriteString("Date: " + time.Now().UTC().Format(time.RFC1123Z) + "\r\n")
 	buf.WriteString("MIME-Version: 1.0\r\n")

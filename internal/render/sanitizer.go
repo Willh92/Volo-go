@@ -123,6 +123,28 @@ func (s *htmlSanitizer) writeCommentElement(out *strings.Builder, n *nethtml.Nod
 		return
 	}
 
+	switch tag {
+	case "h1", "h2", "h3":
+		// Demote hero-sized headings in comments so `#` lines cannot inflate comment thread height.
+		tag = "h4"
+	case "br":
+		// Cap consecutive <br> runs inside a parent element to at most 2.
+		consec := 0
+		for p := n.PrevSibling; p != nil; p = p.PrevSibling {
+			if p.Type == nethtml.TextNode && strings.TrimSpace(p.Data) == "" {
+				continue
+			}
+			if p.Type == nethtml.ElementNode && strings.EqualFold(p.Data, "br") {
+				consec++
+				continue
+			}
+			break
+		}
+		if consec >= 2 {
+			return
+		}
+	}
+
 	if tag == "a" {
 		rawHref, hasHref := findAttrVal(n.Attr, "href")
 		cleanHref, isExtHTTP, ok := "", false, false
@@ -162,6 +184,8 @@ func (s *htmlSanitizer) writeCommentElement(out *strings.Builder, n *nethtml.Nod
 		out.WriteString("<img src=\"")
 		writeEscapedAttrVal(out, cleanSrc)
 		out.WriteByte('"')
+		wroteLoading := false
+		wroteDecoding := false
 		for _, a := range n.Attr {
 			if a.Namespace != "" {
 				continue
@@ -177,7 +201,25 @@ func (s *htmlSanitizer) writeCommentElement(out *strings.Builder, n *nethtml.Nod
 				if safeDimensionAttrRe.MatchString(v) {
 					writeAttrKV(out, k, v)
 				}
+			case "loading":
+				v := strings.ToLower(strings.TrimSpace(a.Val))
+				if v == "lazy" || v == "eager" {
+					writeAttrKV(out, "loading", v)
+					wroteLoading = true
+				}
+			case "decoding":
+				v := strings.ToLower(strings.TrimSpace(a.Val))
+				if v == "async" || v == "sync" || v == "auto" {
+					writeAttrKV(out, "decoding", v)
+					wroteDecoding = true
+				}
 			}
+		}
+		if !wroteLoading {
+			writeAttrKV(out, "loading", "lazy")
+		}
+		if !wroteDecoding {
+			writeAttrKV(out, "decoding", "async")
 		}
 		out.WriteByte('>')
 		return
@@ -373,6 +415,14 @@ func (s *htmlSanitizer) writeArticleElement(out *strings.Builder, n *nethtml.Nod
 			case "decoding":
 				if strings.EqualFold(v, "async") || strings.EqualFold(v, "sync") || strings.EqualFold(v, "auto") {
 					writeAttrKV(out, k, strings.ToLower(v))
+				}
+			case "srcset":
+				if cleanSet, sOK := sanitizeImageSrcset(a.Val); sOK {
+					writeAttrKV(out, "srcset", cleanSet)
+				}
+			case "sizes":
+				if len(v) > 0 && len(v) <= 512 && !containsControlChars(a.Val) && !strings.ContainsAny(v, "<>\"'") {
+					writeAttrKV(out, "sizes", v)
 				}
 			default:
 				s.writeAllowedGlobalArticleAttr(out, tag, k, a.Val)
@@ -855,6 +905,64 @@ func sanitizeImageSrc(rawVal string) (string, bool) {
 		return "", false
 	}
 	return normalized, true
+}
+
+var safeSrcsetDescriptorRe = regexp.MustCompile(`^\d{1,5}(?:\.\d{1,3})?[wxWX]$`)
+
+func sanitizeImageSrcset(rawVal string) (string, bool) {
+	s := stripControlAndTrimSpace(rawVal)
+	if s == "" || len(s) > 4096 {
+		return "", false
+	}
+	var kept []string
+	i, n := 0, len(s)
+	for i < n && len(kept) < 16 {
+		for i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == ',') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		urlStart := i
+		for i < n && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r' {
+			i++
+		}
+		rawURL := s[urlStart:i]
+		desc := ""
+		if strings.HasSuffix(rawURL, ",") {
+			rawURL = strings.TrimRight(rawURL, ",")
+		} else {
+			for i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+				i++
+			}
+			if i < n && s[i] != ',' {
+				descStart := i
+				for i < n && s[i] != ',' {
+					i++
+				}
+				desc = strings.TrimSpace(s[descStart:i])
+			}
+			if i < n && s[i] == ',' {
+				i++
+			}
+		}
+		cleanURL, ok := sanitizeImageSrc(rawURL)
+		if !ok {
+			continue
+		}
+		if desc != "" {
+			if !safeSrcsetDescriptorRe.MatchString(desc) {
+				continue
+			}
+			kept = append(kept, cleanURL+" "+strings.ToLower(desc))
+		} else {
+			kept = append(kept, cleanURL)
+		}
+	}
+	if len(kept) == 0 {
+		return "", false
+	}
+	return strings.Join(kept, ", "), true
 }
 
 func stripControlAndTrimSpace(s string) string {

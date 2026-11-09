@@ -85,6 +85,12 @@ type OIDCAdvancedProvider interface {
 	ExchangeWithParams(ctx context.Context, params OIDCExchangeParams) (OIDCIdentity, error)
 }
 
+// OIDCDiscoveryInvalidator may be implemented by OIDCProvider or BuiltinPlugin implementations
+// that cache OIDC discovery (.well-known/openid-configuration) or JWKS metadata in memory.
+type OIDCDiscoveryInvalidator interface {
+	InvalidateOIDCDiscovery()
+}
+
 // CommentCheckInput contains sanitized comment attributes evaluated by AntiSpamProvider.
 type CommentCheckInput struct {
 	TargetType string `json:"target_type"`
@@ -200,10 +206,11 @@ func sortProviderChain[T any](list []providerEntry[T]) {
 }
 
 func sortStorageEntries(list []providerEntry[StorageProvider]) {
-	// ActiveStorage selects list[len-1]: put lowest priority value (highest priority) at the tail,
-	// preserving registration order on equal priority.
 	sort.SliceStable(list, func(i, j int) bool {
-		return list[i].priority > list[j].priority
+		if list[i].priority != list[j].priority {
+			return list[i].priority < list[j].priority
+		}
+		return list[i].pluginID < list[j].pluginID
 	})
 }
 
@@ -353,6 +360,17 @@ func (r *ProviderRegistry) DetachPlugin(pluginID string) {
 	}
 }
 
+// DetachOIDCPlugin removes only OIDC providers registered by pluginID.
+func (r *ProviderRegistry) DetachOIDCPlugin(pluginID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name, ent := range r.oidcMap {
+		if ent.pluginID == pluginID {
+			delete(r.oidcMap, name)
+		}
+	}
+}
+
 // Federations returns a snapshot of all active plugin FederationProviders.
 func (r *ProviderRegistry) Federations() []FederationProvider {
 	r.mu.RLock()
@@ -364,12 +382,12 @@ func (r *ProviderRegistry) Federations() []FederationProvider {
 	return out
 }
 
-// ActiveStorage returns the most recently activated plugin StorageProvider, or defaultStorage.
+// ActiveStorage returns the highest-priority active plugin StorageProvider, or defaultStorage.
 func (r *ProviderRegistry) ActiveStorage() StorageProvider {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if n := len(r.storageList); n > 0 {
-		return r.storageList[n-1].provider
+	if len(r.storageList) > 0 {
+		return r.storageList[0].provider
 	}
 	return r.defaultStorage
 }
@@ -378,7 +396,7 @@ func (r *ProviderRegistry) ActiveStorage() StorageProvider {
 func (r *ProviderRegistry) StorageByID(pluginID string) (StorageProvider, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for i := len(r.storageList) - 1; i >= 0; i-- {
+	for i := range r.storageList {
 		if r.storageList[i].pluginID == pluginID {
 			return r.storageList[i].provider, true
 		}
@@ -415,6 +433,19 @@ func (r *ProviderRegistry) OIDC(name string) (OIDCProvider, bool) {
 	defer r.mu.RUnlock()
 	ent, ok := r.oidcMap[name]
 	return ent.provider, ok
+}
+
+// OIDCProvidersForPlugin returns all active OIDCProviders owned by pluginID.
+func (r *ProviderRegistry) OIDCProvidersForPlugin(pluginID string) []OIDCProvider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []OIDCProvider
+	for _, ent := range r.oidcMap {
+		if ent.pluginID == pluginID && ent.provider != nil {
+			out = append(out, ent.provider)
+		}
+	}
+	return out
 }
 
 // OIDCProviders returns all active OIDCProviders sorted deterministically by plugin priority then provider name.

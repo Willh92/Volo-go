@@ -7,21 +7,24 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/security"
+	"github.com/Willh92/Volo-go/internal/tinyxml"
 )
+
+// ErrObjectNotFound is returned by GetObject when the S3 bucket responds with HTTP 404.
+var ErrObjectNotFound = errors.New("s3 object not found")
 
 var (
 	validS3EndpointRe  = regexp.MustCompile(`^https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?(/[A-Za-z0-9._/-]*)?$`)
@@ -114,9 +117,8 @@ func NewClient(cfg Config, safeDialer *security.OutboundSafeDialer) (*Client, er
 				return nil, fmt.Errorf("s3 resolve %q failed: %w", host, rErr)
 			}
 			for _, ip := range ips {
-				ip = ip.Unmap()
-				if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || netip.MustParsePrefix("169.254.0.0/16").Contains(ip) {
-					return nil, fmt.Errorf("s3 SSRF guard: link-local/metadata IP %s blocked", ip)
+				if security.IsForbiddenIP(ip) {
+					return nil, fmt.Errorf("s3 SSRF guard: forbidden non-public IP %s blocked", ip.Unmap())
 				}
 			}
 			return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0].Unmap().String(), port))
@@ -282,7 +284,64 @@ func (c *Client) DeleteObject(ctx context.Context, objectKey string) error {
 	return nil
 }
 
-const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+const (
+	emptyPayloadSHA256      = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	defaultGetObjectMaxByte = 32 << 20
+)
+
+// GetObject fetches an object from the bucket via SigV4-signed GET, capping reads at maxBytes (default 32 MiB when <= 0)
+// and returning ErrObjectNotFound on HTTP 404.
+func (c *Client) GetObject(ctx context.Context, key string, maxBytes int64) (data []byte, contentType string, etag string, lastModified time.Time, err error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultGetObjectMaxByte
+	}
+	fk := c.fullKey(key)
+	targetURL, hostHdr, canonicalURI, err := c.buildObjectTarget(fk)
+	if err != nil {
+		return nil, "", "", time.Time{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, "", "", time.Time{}, err
+	}
+	c.signRequest(req, hostHdr, canonicalURI, emptyPayloadSHA256)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, "", "", time.Time{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		return nil, "", "", time.Time{}, ErrObjectNotFound
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, "", "", time.Time{}, fmt.Errorf("s3 GET status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if readErr != nil {
+		return nil, "", "", time.Time{}, readErr
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, "", "", time.Time{}, fmt.Errorf("s3 object %q exceeds maximum size (%d bytes)", key, maxBytes)
+	}
+
+	contentType = strings.TrimSpace(resp.Header.Get("Content-Type"))
+	etag = strings.TrimSpace(resp.Header.Get("ETag"))
+	if lm := strings.TrimSpace(resp.Header.Get("Last-Modified")); lm != "" {
+		if t, pErr := http.ParseTime(lm); pErr == nil {
+			lastModified = t.UTC()
+		} else if t, pErr := time.Parse(time.RFC1123Z, lm); pErr == nil {
+			lastModified = t.UTC()
+		} else if t, pErr := time.Parse(time.RFC3339, lm); pErr == nil {
+			lastModified = t.UTC()
+		}
+	}
+	return body, contentType, etag, lastModified, nil
+}
 
 // ObjectInfo summarizes a single S3 object returned by ListObjects.
 type ObjectInfo struct {
@@ -300,17 +359,6 @@ func (c *Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, 
 	}
 	searchPrefix := c.fullKey(prefix)
 	pfxTrim := strings.Trim(c.cfg.KeyPrefix, "/")
-
-	type xmlContent struct {
-		Key          string `xml:"Key"`
-		LastModified string `xml:"LastModified"`
-		Size         int64  `xml:"Size"`
-	}
-	type listBucketResult struct {
-		IsTruncated           bool         `xml:"IsTruncated"`
-		NextContinuationToken string       `xml:"NextContinuationToken"`
-		Contents              []xmlContent `xml:"Contents"`
-	}
 
 	var out []ObjectInfo
 	contToken := ""
@@ -344,12 +392,12 @@ func (c *Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, 
 			return nil, fmt.Errorf("s3 LIST status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
-		var parsed listBucketResult
-		if err := xml.Unmarshal(body, &parsed); err != nil {
-			return nil, fmt.Errorf("s3 LIST parse XML: %w", err)
+		root, parseErr := tinyxml.Parse(body)
+		if parseErr != nil {
+			return nil, fmt.Errorf("s3 LIST parse XML: %w", parseErr)
 		}
-		for _, item := range parsed.Contents {
-			relKey := strings.TrimLeft(item.Key, "/")
+		for _, item := range root.ChildrenByLocal("Contents") {
+			relKey := strings.TrimLeft(item.ChildText("Key"), "/")
 			if pfxTrim != "" {
 				if strings.HasPrefix(relKey, pfxTrim+"/") {
 					relKey = strings.TrimPrefix(relKey, pfxTrim+"/")
@@ -361,23 +409,26 @@ func (c *Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, 
 				continue
 			}
 			var modTime time.Time
-			if ts := strings.TrimSpace(item.LastModified); ts != "" {
+			if ts := strings.TrimSpace(item.ChildText("LastModified")); ts != "" {
 				if t, pErr := time.Parse(time.RFC3339Nano, ts); pErr == nil {
 					modTime = t.UTC()
 				} else if t, pErr := time.Parse(time.RFC3339, ts); pErr == nil {
 					modTime = t.UTC()
 				}
 			}
+			sizeVal, _ := strconv.ParseInt(strings.TrimSpace(item.ChildText("Size")), 10, 64)
 			out = append(out, ObjectInfo{
 				Key:          relKey,
 				LastModified: modTime,
-				Size:         item.Size,
+				Size:         sizeVal,
 			})
 		}
-		if !parsed.IsTruncated || strings.TrimSpace(parsed.NextContinuationToken) == "" {
+		isTruncated := strings.EqualFold(strings.TrimSpace(root.ChildText("IsTruncated")), "true")
+		nextToken := strings.TrimSpace(root.ChildText("NextContinuationToken"))
+		if !isTruncated || nextToken == "" {
 			break
 		}
-		contToken = strings.TrimSpace(parsed.NextContinuationToken)
+		contToken = nextToken
 	}
 	return out, nil
 }

@@ -2,7 +2,6 @@
   "meta.code": "zh-CN",
   "meta.name": "简体中文",
   "meta.dir": "ltr",
-
   "nav.home": "首页",
   "nav.categories": "分类",
   "nav.tags": "标签",
@@ -16,7 +15,6 @@
   "nav.admin_console": "管理后台",
   "nav.login": "读者登录",
   "nav.logout": "退出登录",
-
   "appearance.auto": "自动日夜",
   "appearance.auto_desc": "06:30–19:00 浅色",
   "appearance.system": "跟随系统",
@@ -26,10 +24,8 @@
   "appearance.dark": "深色模式",
   "appearance.dark_desc": "始终使用深色",
   "appearance.switch_lang": "切换语言",
-
   "article.license_title": "版权声明",
   "studio.archive_summary": "共 {articles} 篇文章 · 跨越 {months} 个月",
-
   "article.pinned": "置顶",
   "article.reading_stats": "全文约 {words} 字 · 预计阅读 {minutes} 分钟",
   "article.outdated_notice": "本文最后更新于 {days} 天前，文中涉及的技术细节可能已随版本演进发生变化。",
@@ -52,11 +48,9 @@
   "article.copy_code": "复制",
   "article.copied_code": "已复制",
   "article.raw_markdown": "查看 Markdown 源码",
-
   "podcast.badge": "播客单集",
   "podcast.speed": "倍速",
   "podcast.subscribe_rss": "订阅播客 RSS",
-
   "bookshelf.title": "在线书架",
   "bookshelf.search_placeholder": "搜索书名、别名或简介…",
   "bookshelf.open_reader": "展开站内阅读",
@@ -68,7 +62,6 @@
   "bookshelf.expand_toc": "展开目录",
   "bookshelf.focus_fullscreen": "专注全屏",
   "bookshelf.exit_fullscreen": "退出全屏",
-
   "comment.section_title": "评论交流 ({count})",
   "comment.closed_notice": "本站或本文当前已关闭评论。",
   "comment.registered_only": "当前仅限已验证读者发表评论，请先登录或注册。",
@@ -108,7 +101,6 @@
   "comment.ban_note_ph": "封禁原因备注（选填）",
   "comment.ban_confirm": "确认封禁",
   "comment.shortcut_submit": "Ctrl + Enter 发送",
-
   "admin.ws.overview": "创作与概览",
   "admin.ws.content": "内容与媒体",
   "admin.ws.distribute": "分发与连接",
@@ -116,7 +108,6 @@
   "admin.ws.system": "系统与安全",
   "admin.setup.welcome": "欢迎使用 Volo-go 独立博客引擎",
   "admin.setup.subtitle": "零历史包袱 · 纯静态单文件 · 全链路隐私守护",
-
   "notify.verify_code.subject": "[{site}] 你的读者邮箱验证码：{code}",
   "notify.verify_code.body": "你好！你正在 {site} 验证读者邮箱，6 位一次性验证码为：{code}（10 分钟内有效）。如非本人操作请忽略。",
   "notify.new_comment.subject": "[{site}] 新评论提醒：《{title}》",
@@ -126,12 +117,10 @@
   "notify.test_smtp.subject": "[{site}] SMTP 邮件通道连通性测试",
   "notify.test_smtp.body": "恭喜！你的 {site} SMTP 邮件通知服务配置正确且 TLS 握手验证通过。",
   "notify.webhook.test_title": "Volo-go Webhook 通道连通性测试",
-
   "error.unauthorized": "请先登录后再执行此操作",
   "error.forbidden": "当前账号无权访问该资源",
   "error.rate_limited": "操作过于频繁，请稍后再试",
   "error.not_found": "请求的页面或资源不存在",
-
   "sidebar.categories": "分类目录",
   "sidebar.tags": "常用标签",
   "sidebar.recent_comments": "最新评论",
@@ -281,5 +270,26 @@
   "auth.err_2fa_expired": "两步验证会话已过期，请重新登录",
   "auth.err_passkey_failed": "通行密钥验证失败，请重试或改用密码登录",
   "error.hint_403": "当前请求因访问权限或安全策略限制无法继续访问。",
-  "error.hint_429": "短时间内请求过于频繁，请稍候片刻再刷新重试。"
+  "error.hint_429": "短时间内请求过于频繁，请稍候片刻再刷新重试。",
+  "comment.tab_split": "双栏",
+  "comment.fullscreen": "全屏编辑 (Ctrl+Shift+F)",
+  "comment.exit_fullscreen": "退出全屏 (Esc)",
+  "comment.expand_full": "展开全文",
+  "comment.collapse_full": "收起",
+  "comment.lines_unit": "行",
+  "comment.err_length_bounds": "评论字数需在 {min}～{max} 个字符之间",
+  "comment.err_too_many_lines": "评论换行过多（最多 {max} 行），请精简空行后再提交",
+  "comment.tb_bold": "粗体 (Ctrl+B)",
+  "comment.tb_italic": "斜体 (Ctrl+I)",
+  "comment.tb_strike": "删除线",
+  "comment.tb_code": "行内代码 (Ctrl+E)",
+  "comment.tb_heading": "小标题",
+  "comment.tb_quote": "引用",
+  "comment.tb_ul": "无序列表",
+  "comment.tb_ol": "有序列表",
+  "comment.tb_hr": "分割线",
+  "comment.tb_link": "链接 (Ctrl+K)",
+  "comment.tb_image": "插入图片",
+  "comment.tb_codeblock": "代码块",
+  "comment.tb_table": "插入表格"
 }

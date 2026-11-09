@@ -2,7 +2,7 @@
 
 > 中文版本：[部署与各系统服务安装指南](../zh-CN/deployment.md)
 
-`Volo-go` compiles with Go `1.27.3` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (`< 20 MiB` on `linux/amd64`, `< 21 MiB` across all targets) across **6 supported static release targets**:
+`Volo-go` compiles with Go `1.27.3` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (**strictly `< 20 MiB` across all 6 supported static release targets**, `~19.1 MiB` on `linux/amd64`):
 - **Linux**: `linux/amd64`, `linux/arm64` (`systemd` system/user units & `OpenRC`)
 - **macOS**: `darwin/amd64`, `darwin/arm64` (`launchd` `LaunchDaemon` / `LaunchAgent`)
 - **Windows**: `windows/amd64`, `windows/arm64` (native `sc.exe` Windows Service via `svc_windows.go`, `NSSM`, and Scheduled Task fallback)
@@ -28,7 +28,7 @@
 | :--- | :--- | :--- | :--- |
 | `VOLO_ENV_FILE` | `--env-file` | `.env` | Path to `.env` configuration file (`/etc/volo/volo.env` in system services) |
 | `VOLO_LISTEN_ADDR` | `--listen-addr` | `0.0.0.0:8080` | TCP bind address (`127.0.0.1:8080` recommended behind a local reverse proxy) |
-| `VOLO_LISTEN_SOCKET` | `--listen-socket` | *(empty)* | Unix Domain Socket path (`/run/volo/volo.sock` or `/run/volo/volo.sock,0660`; disables TCP listener and acquires a `0600` `.sock.lock` file lock) |
+| `VOLO_LISTEN_SOCKET` | `--listen-socket` (alias `--unix-socket`) | *(empty)* | Unix Domain Socket path (`/run/volo/volo.sock` or `/run/volo/volo.sock,0660`; verifies canonical parent directory, rejects symlinks via `Lstat`, and acquires a `0600` `.sock.lock` file lock) |
 | `VOLO_SOCKET_MODE` | `--socket-mode` | `0660` | Octal permission bits applied to the Unix Domain Socket |
 | `VOLO_SOCKET_GROUP` | `--socket-group` | *(empty)* | Group ownership for the Unix Domain Socket (e.g., `www-data` on Debian/Ubuntu, `nginx` on RHEL) |
 | `VOLO_PUBLIC_URL` | `--public-url` | `http://localhost:8080` | Canonical public URL (used for Canonical tags, RSS/Podcast, Sitemap, WebAuthn Origin, and email links) |
@@ -57,8 +57,9 @@
 ## 2. Linux Service Installation & Auto-Rollback Upgrades (`systemd` & `OpenRC`)
 
 [`scripts/install-service.sh`](../../scripts/install-service.sh) provides unified service management for Linux and macOS (retaining `install-service-linux.sh` and `install-service-macos.sh` compatibility shims):
-- **Pre-Upgrade Backup & Automatic Healthcheck Rollback**: During `upgrade` (or `update`), the installer automatically creates a pre-upgrade database backup via `volo backup create` (skippable with `--skip-backup`), preserves the previous binary as `volo.bak`, verifies `SHA256SUMS.txt` fail-closed, restarts the service, and runs `volo healthcheck` — **automatically restoring `volo.bak` and restarting the previous version if post-upgrade health verification fails**;
-- **Init System Coverage**: Supports system-wide `systemd` (`ExecStart=/usr/local/bin/volo serve --env-file /etc/volo/volo.env`), rootless `--user-mode` (`systemd --user`), and Alpine / Gentoo `OpenRC` (`pidfile="/run/volo/volo.pid"`).
+- **Binary vs. Data Privilege Separation**: Supports independent `--user`, `--group`, `--bin-dir` (or `--prefix`), and `--data-dir` paths, keeping installed binaries immutable under `root:root 0755` while confining runtime data under `volo:volo 0750`;
+- **Pre-Upgrade Backup & Automatic Healthcheck Rollback**: During `upgrade` (or `update`), the installer creates a pre-upgrade database backup via `volo backup create` and reconciles file ownership (skippable with `--skip-backup`), preserves `volo.bak`, falls back automatically to GitHub if `--mirror` fails, verifies `SHA256SUMS.txt` fail-closed, restarts the service, and runs read-only `volo healthcheck` — **automatically restoring `volo.bak` and restarting the previous version if health verification fails**;
+- **Init System Coverage**: Supports system-wide `systemd` (`RuntimeDirectory=volo` + dynamic `ProtectHome`/`PrivateTmp` sandboxing), rootless `--user-mode` (`systemd --user`), and Alpine / Gentoo `OpenRC`.
 
 ### 2.1 One-Line Install, Unix Socket Mode & Auto-Rollback Upgrades
 
@@ -71,8 +72,11 @@ sudo ./scripts/install-service.sh upgrade
 # Skip pre-upgrade DB backup if desired, or specify --mirror with automatic GitHub fallback:
 sudo ./scripts/install-service.sh upgrade --skip-backup --mirror https://ghfast.top
 
-# Zero-TCP Unix Domain Socket mode for local Nginx / Caddy (/var/lib/volo & /etc/volo/volo.env stay isolated under volo:volo)
+# Zero-TCP Unix Domain Socket mode with explicit binary/data directory separation
 sudo ./scripts/install-service.sh install \
+  --user volo --group volo \
+  --bin-dir /usr/local/bin \
+  --data-dir /var/lib/volo \
   --unix-socket /run/volo/volo.sock \
   --socket-mode 0660 \
   --socket-group www-data \
@@ -84,8 +88,8 @@ sudo ./scripts/install-service.sh install \
 
 ### 2.2 `systemd` Hardening & Custom External Directories (`ReadWritePaths` Override)
 
-[`deploy/systemd/volo.service`](../../deploy/systemd/volo.service) enables `ProtectSystem=strict`, `ProtectHome=true`, and `ReadWritePaths=/var/lib/volo /run/volo` by default.
-When configuring custom directories outside `/var/lib/volo` (for example, `upload_dir` / `storage.local_dir`, `geoip_dir` / `security.geoip_dir`, `VOLO_BACKUP_DIR`, `VOLO_THEMES_DIR`, or `VOLO_PLUGINS_DIR`), grant write access via a `systemd` drop-in override:
+[`deploy/systemd/volo.service`](../../deploy/systemd/volo.service) enables `ProtectSystem=strict`, `RuntimeDirectory=volo`, and `ReadWritePaths=/var/lib/volo /run/volo` by default (automatically adjusting `ProtectHome`/`PrivateTmp` and emitting `tmpfiles.d` rules when `--data-dir` or `--unix-socket` uses custom paths).
+When hot-switching directories outside `/var/lib/volo` later from the Admin Console (`storage.local_dir` or `security.geoip_dir`), grant write access via a `systemd` drop-in override:
 
 ```bash
 sudo systemctl edit volo
@@ -102,7 +106,7 @@ ReadWritePaths=/custom/uploads /custom/geoip
 
 ### 2.3 `OpenRC` Init Script & Lifecycle Commands
 
-The Alpine / Gentoo init script [`deploy/openrc/volo.initd`](../../deploy/openrc/volo.initd) supervises the daemon using `command_args="serve --env-file /etc/volo/volo.env"` and `pidfile="/run/volo/volo.pid"` (provisioning `0755` `/run/volo` and `0750` `/var/lib/volo` & `/var/log/volo` in `start_pre`).
+The Alpine / Gentoo init script [`deploy/openrc/volo.initd`](../../deploy/openrc/volo.initd) parses `/etc/volo/volo.env` via a shell-free `load_volo_env()` key-value parser (eliminating `.` sourcing command injection) and supervises the daemon with `pidfile="/run/volo/volo.pid"`.
 
 ```bash
 sudo ./scripts/install-service.sh status      # Inspect service status

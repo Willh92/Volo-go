@@ -35,8 +35,9 @@ const (
 	defaultVMPoolCap         = 4
 	defaultVMMaxConcurrency  = 8
 	maxPooledVMUses          = 1000
-	maxPluginFetchBodyBytes  = 4 << 20 // 4 MiB cap on outbound HTTP responses (supports full houbb dict sync)
-	maxPluginAssetReadBytes  = 4 << 20 // 4 MiB cap on read-only decompressed plugin asset reads
+	maxPluginFetchBodyBytes  = 4 << 20  // 4 MiB cap on default text outbound HTTP responses (supports full houbb dict sync)
+	maxPluginBinaryBodyBytes = 32 << 20 // 32 MiB cap on binary base64 outbound HTTP request/response bodies
+	maxPluginAssetReadBytes  = 4 << 20  // 4 MiB cap on read-only decompressed plugin asset reads
 	maxPluginRateLimitKeys   = 2048
 	maxCachedWordMatcherSigs = 2
 	remoteDictRawChunkBytes  = 36_000 // Encodes to exactly 48,000 base64 chars (< 64 KiB & < 512 KiB plugin_kv cap)
@@ -531,6 +532,20 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 				}
 				return r.kv.IncrBy(wrapper.activeCtx(), key, delta, ttlSec)
 			})
+			incrBufFn := func(key string, delta int64) (int64, error) {
+				if delta == 0 {
+					delta = 1
+				}
+				return r.kv.IncrBuffered(wrapper.activeCtx(), key, delta)
+			}
+			kvBridge.Set("incrAsync", incrBufFn)
+			kvBridge.Set("incrBuffered", incrBufFn)
+			kvBridge.Set("flush", func() (bool, error) {
+				if fErr := r.kv.Flush(wrapper.activeCtx()); fErr != nil {
+					return false, fErr
+				}
+				return true, nil
+			})
 			kvBridge.Set("deletePrefix", func(prefix string) (int64, error) {
 				n, dErr := r.kv.DeletePrefix(wrapper.activeCtx(), prefix)
 				if dErr != nil {
@@ -755,6 +770,22 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 		return nil, normalizeJSError(r.manifest.ID, "init", runErr)
 	}
 	wrapper.hooksFrozen = true
+
+	// Shallow-freeze host bridge namespaces and builtin prototypes, and snapshot post-init globals
+	// so pooled VMs cannot leak prototype or globalThis mutations across invocations.
+	for _, pv := range voloObj.props {
+		if pv.kind == valObject && pv.obj != nil && pv.obj.scope == nil {
+			pv.obj.frozen = true
+		} else if pv.kind == valFunc && pv.fn != nil {
+			pv.fn.frozenProps = true
+		}
+	}
+	if vm.builtinGlobals != nil {
+		vm.builtinGlobals["console"] = jsValue{kind: valObject, obj: consoleObj}
+		vm.builtinGlobals["volo"] = jsValue{kind: valObject, obj: voloObj}
+		vm.builtinGlobals["ctx"] = jsValue{kind: valObject, obj: voloObj}
+	}
+	vm.snapshotPostInit()
 
 	modVal := moduleObj.get("exports")
 	if modVal.kind == valObject && modVal.obj != nil {
@@ -1510,11 +1541,10 @@ func (r *gojaPluginRuntime) maskSanitizerNickname(ctx context.Context, nickname 
 	return out
 }
 
-func (r *gojaPluginRuntime) closeRuntime() {
+func (r *gojaPluginRuntime) resetHTTPClient() {
 	if r == nil {
 		return
 	}
-	r.clearWordMatchers()
 	r.httpMu.Lock()
 	oldClient := r.httpClientPtr
 	r.httpClientPtr = nil
@@ -1523,6 +1553,12 @@ func (r *gojaPluginRuntime) closeRuntime() {
 	if oldClient != nil {
 		oldClient.CloseIdleConnections()
 	}
+}
+
+func (r *gojaPluginRuntime) resetPool() {
+	if r == nil {
+		return
+	}
 	for {
 		select {
 		case <-r.pool:
@@ -1530,6 +1566,15 @@ func (r *gojaPluginRuntime) closeRuntime() {
 			return
 		}
 	}
+}
+
+func (r *gojaPluginRuntime) closeRuntime() {
+	if r == nil {
+		return
+	}
+	r.clearWordMatchers()
+	r.resetHTTPClient()
+	r.resetPool()
 }
 
 func (p *pooledVM) activeCtx() context.Context {
@@ -1634,6 +1679,34 @@ func (r *gojaPluginRuntime) getHTTPClient() (*http.Client, error) {
 	return client, nil
 }
 
+func decodeFetchBase64(s string, maxBytes int) ([]byte, error) {
+	var clean strings.Builder
+	clean.Grow(len(s))
+	maxEncoded := base64.StdEncoding.EncodedLen(maxBytes) + 4
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r', '\f':
+		default:
+			clean.WriteByte(s[i])
+			if clean.Len() > maxEncoded {
+				return nil, fmt.Errorf("plugin http.fetch: body_base64 exceeds %d MiB limit", maxBytes>>20)
+			}
+		}
+	}
+	enc := clean.String()
+	decoded, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(enc, "="))
+		if err != nil {
+			return nil, fmt.Errorf("plugin http.fetch: invalid body_base64: %w", err)
+		}
+	}
+	if len(decoded) > maxBytes {
+		return nil, fmt.Errorf("plugin http.fetch: body_base64 exceeds %d MiB limit", maxBytes>>20)
+	}
+	return decoded, nil
+}
+
 func (r *gojaPluginRuntime) executeFetch(ctx context.Context, rawURL string, opts map[string]any) (map[string]any, error) {
 	httpClient, err := r.getHTTPClient()
 	if err != nil {
@@ -1641,17 +1714,43 @@ func (r *gojaPluginRuntime) executeFetch(ctx context.Context, rawURL string, opt
 	}
 	method := http.MethodGet
 	var bodyReader io.Reader
+	var contentLen int64 = -1
 	headers := make(map[string]string)
+	wantBase64Resp := false
 
 	if opts != nil {
 		if m, ok := opts["method"].(string); ok && strings.TrimSpace(m) != "" {
 			method = strings.ToUpper(strings.TrimSpace(m))
 		}
-		if b, ok := opts["body"].(string); ok && b != "" {
+		rawB64, hasB64 := opts["body_base64"].(string)
+		if !hasB64 {
+			rawB64, hasB64 = opts["bodyBase64"].(string)
+		}
+		if hasB64 {
+			if rawB64 != "" {
+				decoded, dErr := decodeFetchBase64(rawB64, maxPluginBinaryBodyBytes)
+				if dErr != nil {
+					return nil, dErr
+				}
+				bodyReader = bytes.NewReader(decoded)
+				contentLen = int64(len(decoded))
+			} else {
+				bodyReader = bytes.NewReader(nil)
+				contentLen = 0
+			}
+		} else if b, ok := opts["body"].(string); ok && b != "" {
 			if len(b) > (1 << 20) {
 				return nil, errors.New("plugin http.fetch: request body exceeds 1 MiB")
 			}
-			bodyReader = bytes.NewBufferString(b)
+			bodyReader = strings.NewReader(b)
+			contentLen = int64(len(b))
+		}
+		if enc, ok := opts["response_encoding"].(string); ok && strings.EqualFold(strings.TrimSpace(enc), "base64") {
+			wantBase64Resp = true
+		} else if enc, ok := opts["responseEncoding"].(string); ok && strings.EqualFold(strings.TrimSpace(enc), "base64") {
+			wantBase64Resp = true
+		} else if bin, ok := opts["binary"].(bool); ok && bin {
+			wantBase64Resp = true
 		}
 		if rawHdrs, ok := opts["headers"].(map[string]any); ok {
 			for k, v := range rawHdrs {
@@ -1669,6 +1768,9 @@ func (r *gojaPluginRuntime) executeFetch(ctx context.Context, rawURL string, opt
 	if err != nil {
 		return nil, err
 	}
+	if contentLen >= 0 {
+		req.ContentLength = contentLen
+	}
 	req.Header.Set("User-Agent", "Volo-go-Plugin/"+r.manifest.ID)
 	for k, v := range headers {
 		if strings.EqualFold(k, "Host") {
@@ -1683,15 +1785,38 @@ func (r *gojaPluginRuntime) executeFetch(ctx context.Context, rawURL string, opt
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxPluginFetchBodyBytes))
-	if err != nil {
-		return nil, err
-	}
 	respHeaders := make(map[string]string, len(resp.Header))
 	for k, vs := range resp.Header {
 		if len(vs) > 0 {
 			respHeaders[strings.ToLower(k)] = vs[0]
 		}
+	}
+
+	if wantBase64Resp {
+		if resp.ContentLength > maxPluginBinaryBodyBytes {
+			return nil, fmt.Errorf("plugin http.fetch: response body exceeds %d MiB limit", maxPluginBinaryBodyBytes>>20)
+		}
+		bodyBytes, rErr := io.ReadAll(io.LimitReader(resp.Body, maxPluginBinaryBodyBytes+1))
+		if rErr != nil {
+			return nil, rErr
+		}
+		if len(bodyBytes) > maxPluginBinaryBodyBytes {
+			return nil, fmt.Errorf("plugin http.fetch: response body exceeds %d MiB limit", maxPluginBinaryBodyBytes>>20)
+		}
+		encoded := base64.StdEncoding.EncodeToString(bodyBytes)
+		return kvMap(
+			"status", resp.StatusCode,
+			"ok", resp.StatusCode >= 200 && resp.StatusCode < 300,
+			"headers", respHeaders,
+			"body", encoded,
+			"body_base64", encoded,
+			"byte_length", len(bodyBytes),
+		), nil
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxPluginFetchBodyBytes))
+	if err != nil {
+		return nil, err
 	}
 	bodyText := string(bodyBytes)
 	return kvMap("status", resp.StatusCode, "ok", resp.StatusCode >= 200 && resp.StatusCode < 300, "headers", respHeaders, "body", bodyText), nil
@@ -1714,6 +1839,7 @@ func (r *gojaPluginRuntime) hasCallable(fnName string) bool {
 	}
 	defer func() {
 		if pvm.uses < maxPooledVMUses {
+			pvm.vm.restorePostInit()
 			select {
 			case r.pool <- pvm:
 			default:
@@ -1761,6 +1887,7 @@ func (r *gojaPluginRuntime) withPooledVM(
 		pvm.reqCtx = nil
 		pvm.setNativeBudget = nil
 		if !tainted && err == nil && pvm.uses < maxPooledVMUses {
+			pvm.vm.restorePostInit()
 			select {
 			case r.pool <- pvm:
 			default:
@@ -2219,6 +2346,9 @@ func normalizeJSError(pluginID string, stage string, err error) error {
 	}
 	var interrupted *jsInterruptedError
 	if errors.As(err, &interrupted) {
+		if errors.Is(interrupted, ErrExecutionTimeout) {
+			return fmt.Errorf("plugin %q (%s): %w", pluginID, stage, ErrExecutionTimeout)
+		}
 		valStr := fmt.Sprint(interrupted.Value())
 		if strings.Contains(valStr, ErrExecutionTimeout.Error()) {
 			return fmt.Errorf("plugin %q (%s): %w", pluginID, stage, ErrExecutionTimeout)

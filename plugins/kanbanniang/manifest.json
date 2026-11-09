@@ -9,12 +9,14 @@
   "name": {
     "zh-CN": "工作室看板娘 (Mascot Companion)",
     "en-US": "Studio Mascot Companion",
-    "zh-TW": "工作室看板娘 (Mascot Companion)"
+    "zh-TW": "工作室看板娘 (Mascot Companion)",
+    "ja-JP": "スタジオ看板娘 (Mascot Companion)"
   },
   "description": {
     "zh-CN": "纯离线 SVG 轻量互动看板娘挂件，原生支持 PJAX 跨页常驻与 plugin_kv 摸头计数，宿主零硬编码耦合。",
     "en-US": "Self-contained SVG interactive mascot companion surviving PJAX navigation with persistent plugin_kv head-pat counter and zero host coupling.",
-    "zh-TW": "純離線 SVG 輕量互動看板娘掛件，原生支援 PJAX 跨頁常駐與 plugin_kv 摸頭計數，宿主零硬編碼耦合。"
+    "zh-TW": "純離線 SVG 輕量互動看板娘掛件，原生支援 PJAX 跨頁常駐與 plugin_kv 摸頭計數，宿主零硬編碼耦合。",
+    "ja-JP": "完全オフラインの軽量SVGインタラクティブ看板娘ウィジェット。PJAXページ遷移を跨いで常駐し、plugin_kv によるなでなで回数集計に対応。"
   },
   "permissions": [
     "kv",
@@ -42,45 +44,51 @@
       "type": "select",
       "default": "neko",
       "options": [
-        { "value": "neko", "label": { "zh-CN": "墨绿小猫 (Neko)", "en-US": "Studio Neko", "zh-TW": "墨綠小貓 (Neko)" } },
-        { "value": "owl", "label": { "zh-CN": "守夜猫头鹰 (Owl)", "en-US": "Night Owl", "zh-TW": "守夜貓頭鷹 (Owl)" } },
-        { "value": "bot", "label": { "zh-CN": "极简像素机 (Bot)", "en-US": "Minimal Bot", "zh-TW": "極簡像素機 (Bot)" } }
+        { "value": "neko", "label": { "zh-CN": "墨绿小猫 (Neko)", "en-US": "Studio Neko", "zh-TW": "墨綠小貓 (Neko)", "ja-JP": "スタジオ黒猫 (Neko)" } },
+        { "value": "owl", "label": { "zh-CN": "守夜猫头鹰 (Owl)", "en-US": "Night Owl", "zh-TW": "守夜貓頭鷹 (Owl)", "ja-JP": "夜更かしフクロウ (Owl)" } },
+        { "value": "bot", "label": { "zh-CN": "极简像素机 (Bot)", "en-US": "Minimal Bot", "zh-TW": "極簡像素機 (Bot)", "ja-JP": "ミニマルロボ (Bot)" } }
       ],
-      "label": { "zh-CN": "角色形象", "en-US": "Character Style", "zh-TW": "角色形象" }
+      "label": { "zh-CN": "角色形象", "en-US": "Character Style", "zh-TW": "角色形象", "ja-JP": "キャラクター" }
     },
     {
       "key": "position",
       "type": "select",
       "default": "left",
       "options": [
-        { "value": "left", "label": { "zh-CN": "左下角", "en-US": "Bottom Left", "zh-TW": "左下角" } },
-        { "value": "right", "label": { "zh-CN": "右下角", "en-US": "Bottom Right", "zh-TW": "右下角" } }
+        { "value": "left", "label": { "zh-CN": "左下角", "en-US": "Bottom Left", "zh-TW": "左下角", "ja-JP": "左下" } },
+        { "value": "right", "label": { "zh-CN": "右下角", "en-US": "Bottom Right", "zh-TW": "右下角", "ja-JP": "右下" } }
       ],
-      "label": { "zh-CN": "停靠位置", "en-US": "Dock Position", "zh-TW": "停靠位置" }
+      "label": { "zh-CN": "停靠位置", "en-US": "Dock Position", "zh-TW": "停靠位置", "ja-JP": "表示位置" }
     },
     {
       "key": "greeting_zh",
       "type": "string",
       "default": "欢迎来到独立博客，点我可以摸摸头～",
-      "label": { "zh-CN": "中文问候语", "en-US": "Chinese Greeting", "zh-TW": "簡體中文問候語" }
+      "label": { "zh-CN": "中文问候语", "en-US": "Chinese Greeting", "zh-TW": "簡體中文問候語", "ja-JP": "簡体字中国語の挨拶" }
     },
     {
       "key": "greeting_tw",
       "type": "string",
       "default": "歡迎來到獨立部落格，點我可以摸摸頭～",
-      "label": { "zh-CN": "繁体中文问候语", "en-US": "Traditional Chinese Greeting", "zh-TW": "繁體中文問候語" }
+      "label": { "zh-CN": "繁体中文问候语", "en-US": "Traditional Chinese Greeting", "zh-TW": "繁體中文問候語", "ja-JP": "繁体字中国語の挨拶" }
     },
     {
       "key": "greeting_en",
       "type": "string",
       "default": "Welcome! Click me for a head-pat~",
-      "label": { "zh-CN": "英文问候语", "en-US": "English Greeting", "zh-TW": "英文問候語" }
+      "label": { "zh-CN": "英文问候语", "en-US": "English Greeting", "zh-TW": "英文問候語", "ja-JP": "英語の挨拶" }
+    },
+    {
+      "key": "greeting_ja",
+      "type": "string",
+      "default": "個人ブログへようこそ！クリックすると頭をなでられます～",
+      "label": { "zh-CN": "日文问候语", "en-US": "Japanese Greeting", "zh-TW": "日文問候語", "ja-JP": "日本語の挨拶" }
     },
     {
       "key": "hide_on_mobile",
       "type": "boolean",
       "default": true,
-      "label": { "zh-CN": "窄屏自动隐藏", "en-US": "Hide on Mobile Screens", "zh-TW": "窄螢幕自動隱藏" }
+      "label": { "zh-CN": "窄屏自动隐藏", "en-US": "Hide on Mobile Screens", "zh-TW": "窄螢幕自動隱藏", "ja-JP": "モバイル画面で自動的に非表示" }
     }
   ]
 }

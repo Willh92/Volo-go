@@ -287,6 +287,7 @@ function SortableFixedOptsField({
                   checked={true}
                   onChange={(checked) => {
                     if (!checked) {
+                      captureFlip();
                       onChange(
                         fieldKey,
                         enabledKeys.filter((it) => it !== k)
@@ -346,7 +347,7 @@ function SortableFixedOptsField({
           );
         })}
         {disabledOpts.map((opt) => (
-          <div key={opt.value} class="volo-sortable-row is-off">
+          <div key={opt.value} data-flip-row="1" class="volo-sortable-row is-off">
             <div class="volo-sortable-main">
               <span class="volo-drag-handle is-disabled" aria-hidden="true">
                 <DragGripIcon />
@@ -355,6 +356,7 @@ function SortableFixedOptsField({
                 checked={false}
                 onChange={(checked) => {
                   if (checked) {
+                    captureFlip();
                     onChange(fieldKey, [...enabledKeys, opt.value]);
                   }
                 }}
@@ -417,6 +419,7 @@ function SortableFreeItemsField({
   const addFree = () => {
     const trimmed = freeItemDraft.trim();
     if (!trimmed || items.includes(trimmed)) return;
+    captureFlip();
     onChange(fieldKey, [...items, trimmed]);
     setFreeItemDraft("");
   };
@@ -510,7 +513,10 @@ function SortableFreeItemsField({
                   <button
                     type="button"
                     class="volo-act-btn danger"
-                    onClick={() => onChange(fieldKey, items.filter((_, i) => i !== idx))}
+                    onClick={() => {
+                      captureFlip();
+                      onChange(fieldKey, items.filter((_, i) => i !== idx));
+                    }}
                   >
                     <CloseIcon size={13} />
                   </button>
@@ -1020,6 +1026,7 @@ export function AppearanceWorkspace({
   const [logsModalOpen, setLogsModalOpen] = useState<boolean>(false);
   const [logLevelFilter, setLogLevelFilter] = useState<string>("");
   const [logTextFilter, setLogTextFilter] = useState<string>("");
+  const [logPage, setLogPage] = useState<number>(1);
 
   const formatCronInterval = (secRaw: any): string => {
     const sec = Math.max(1, Number(secRaw || 0));
@@ -2102,6 +2109,7 @@ export function AppearanceWorkspace({
                                   );
                                   setLogLevelFilter("");
                                   setLogTextFilter("");
+                                  setLogPage(1);
                                   setLogsModal({ id: p.id, logs: r.items || [] });
                                   setLogsModalOpen(true);
                                 } catch (err: any) {
@@ -2401,8 +2409,8 @@ export function AppearanceWorkspace({
               onClick={async () => {
                 if (!prioModal) return;
                 const parsed = Math.round(Number(prioValue));
-                if (!Number.isFinite(parsed) || parsed < -1000 || parsed > 10000) {
-                  showToast(`${t("app.plugin_prio_label")} (-1000 .. 10000)`, "err");
+                if (!Number.isFinite(parsed) || parsed < -10000 || parsed > 10000) {
+                  showToast(`${t("app.plugin_prio_label")} (-10000 .. 10000)`, "err");
                   return;
                 }
                 try {
@@ -2436,7 +2444,7 @@ export function AppearanceWorkspace({
           <input
             type="number"
             class="volo-input"
-            min={-1000}
+            min={-10000}
             max={10000}
             step={1}
             value={prioValue}
@@ -2463,7 +2471,10 @@ export function AppearanceWorkspace({
           <div style={{ width: "140px", maxWidth: "100%" }}>
             <ConsoleSelect
               value={logLevelFilter}
-              onChange={(v) => setLogLevelFilter(v)}
+              onChange={(v) => {
+                setLogLevelFilter(v);
+                setLogPage(1);
+              }}
               options={[
                 { value: "", label: "ALL" },
                 { value: "info", label: "INFO" },
@@ -2478,34 +2489,52 @@ export function AppearanceWorkspace({
             style={{ flex: "1 1 200px", minWidth: 0 }}
             placeholder={t("app.logs_filter_ph")}
             value={logTextFilter}
-            onInput={(e) => setLogTextFilter((e.currentTarget as HTMLInputElement).value)}
+            onInput={(e) => {
+              setLogTextFilter((e.currentTarget as HTMLInputElement).value);
+              setLogPage(1);
+            }}
           />
         </div>
-        <pre
-          style={{
-            maxHeight: "360px",
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-            fontSize: "12px",
-            background: "var(--volo-raised)",
-            padding: "12px",
-            borderRadius: "8px",
-            margin: 0,
-          }}
-        >
-          {!logsModal || filteredLogs.length === 0
-            ? t("app.logs_empty")
-            : filteredLogs
-                .map((l: any) => {
-                  const ts = l?.ts ? `${String(l.ts)} ` : "";
-                  const lvl = String(l?.level || "info").toUpperCase();
-                  const ev = l?.event ? `${String(l.event)}: ` : "";
-                  const msg = String(l?.msg ?? l?.message ?? "");
-                  return `${ts}[${lvl}] ${ev}${msg}`.trim();
-                })
-                .join("\n")}
-        </pre>
+        {(() => {
+          const pagedPluginLogs = paginateItems(filteredLogs, logPage, 50);
+          return (
+            <>
+              <pre
+                style={{
+                  maxHeight: "360px",
+                  overflow: "auto",
+                  whiteSpace: "pre-wrap",
+                  overflowWrap: "anywhere",
+                  fontSize: "12px",
+                  background: "var(--volo-raised)",
+                  padding: "12px",
+                  borderRadius: "8px",
+                  margin: 0,
+                }}
+              >
+                {!logsModal || pagedPluginLogs.slice.length === 0
+                  ? t("app.logs_empty")
+                  : pagedPluginLogs.slice
+                      .map((l: any) => {
+                        const ts = l?.ts ? `${String(l.ts)} ` : "";
+                        const lvl = String(l?.level || "info").toUpperCase();
+                        const ev = l?.event ? `${String(l.event)}: ` : "";
+                        const msg = String(l?.msg ?? l?.message ?? "");
+                        return `${ts}[${lvl}] ${ev}${msg}`.trim();
+                      })
+                      .join("\n")}
+              </pre>
+              {filteredLogs.length > 50 && (
+                <Pagination
+                  total={filteredLogs.length}
+                  page={pagedPluginLogs.safePage}
+                  pageSize={50}
+                  onChange={setLogPage}
+                />
+              )}
+            </>
+          );
+        })()}
       </AnimatedModal>
     </div>
   );

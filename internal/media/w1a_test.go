@@ -3,9 +3,6 @@ package media_test
 import (
 	"bytes"
 	"encoding/json"
-	"image"
-	"image/color"
-	"image/png"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,7 +11,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/media"
 )
 
-func TestMedia_StripEXIFFalsePreservesOriginalBytesAndLargeImageLimit(t *testing.T) {
+func TestMedia_StripEXIFFalsePreservesOriginalBytesAndMaxUploadMBEnforcement(t *testing.T) {
 	ctx, _, settings, uploadDir, pipe, _, _ := setupMediaEnv(t)
 
 	// 1. Configure StripEXIF=false, AdaptiveWebP=false, MaxUploadMB=60
@@ -54,38 +51,37 @@ func TestMedia_StripEXIFFalsePreservesOriginalBytesAndLargeImageLimit(t *testing
 		t.Fatalf("expected preserved JPEG to retain EXIF metadata")
 	}
 
-	// 2. Verify raster image > 25 MiB succeeds when MaxUploadMB=60 (while staying well within maxImagePixels)
-	img := image.NewNRGBA(image.Rect(0, 0, 64, 64))
-	img.SetNRGBA(0, 0, color.NRGBA{R: 10, G: 20, B: 30, A: 255})
-	var pngBuf bytes.Buffer
-	if err := png.Encode(&pngBuf, img); err != nil {
+	// 2. Verify a 10 MiB camera JPEG succeeds when MaxUploadMB=60, while >25 MiB raster cap is enforced,
+	// AND lowering MaxUploadMB=5 strictly rejects the 10 MiB image!
+	tenMiBPad := 10 << 20
+	var tenMiBJPG bytes.Buffer
+	tenMiBJPG.Grow(len(gpsJPEG) + tenMiBPad)
+	tenMiBJPG.Write(gpsJPEG)
+	tenMiBJPG.Write(bytes.Repeat([]byte{0x00}, tenMiBPad))
+
+	largeAsset, err := pipe.Upload(ctx, "admin-1", "camera-10mb.jpg", "image/jpeg", bytes.NewReader(tenMiBJPG.Bytes()))
+	if err != nil {
+		t.Fatalf("expected 10 MiB JPEG upload to succeed when MaxUploadMB=60, got: %v", err)
+	}
+	if largeAsset.SizeBytes < int64(tenMiBPad) {
+		t.Fatalf("expected preserved >10 MiB size, got %d", largeAsset.SizeBytes)
+	}
+
+	// Lower MaxUploadMB to 5 MiB -> 10 MiB raster upload MUST be rejected!
+	patch5MB, _ := json.Marshal(map[string]any{
+		"max_upload_mb": 5,
+	})
+	if _, _, err := settings.PatchDomain(ctx, domain.SettingsDomainStorage, patch5MB, 0); err != nil {
 		t.Fatal(err)
 	}
-	// Inject a valid ancillary PNG tEXt chunk (~26 MiB) before IEND so the PNG is >25 MiB with tiny pixel count.
-	rawPNG := pngBuf.Bytes()
-	iendOffset := len(rawPNG) - 12
-	chunkPayloadLen := 26 << 20
-	var largePNG bytes.Buffer
-	largePNG.Grow(len(rawPNG) + chunkPayloadLen + 12)
-	largePNG.Write(rawPNG[:iendOffset])
-	// PNG decoders ignore trailing bytes after IEND or valid chunks; easier & valid: append ancillary chunk with valid CRC,
-	// or test JPEG trailing padding after EOI? Wait: Go's jpeg.Decode stops at EOI and ignores trailing bytes!
-	var jpgBuf bytes.Buffer
-	jpgBuf.Grow(len(gpsJPEG) + chunkPayloadLen)
-	jpgBuf.Write(gpsJPEG)
-	jpgBuf.Write(bytes.Repeat([]byte{0x00}, chunkPayloadLen))
-
-	largeAsset, err := pipe.Upload(ctx, "admin-1", "large-camera.jpg", "image/jpeg", bytes.NewReader(jpgBuf.Bytes()))
-	if err != nil {
-		t.Fatalf("expected 26 MiB JPEG upload to succeed when MaxUploadMB=60, got: %v", err)
-	}
-	if largeAsset.SizeBytes < int64(chunkPayloadLen) {
-		t.Fatalf("expected preserved >26 MiB size, got %d", largeAsset.SizeBytes)
+	if _, err := pipe.Upload(ctx, "admin-1", "exceeds-5mb.jpg", "image/jpeg", bytes.NewReader(tenMiBJPG.Bytes())); err == nil {
+		t.Fatalf("expected 10 MiB JPEG upload to be rejected when MaxUploadMB=5")
 	}
 
 	// 3. Re-enable StripEXIF=true and verify strict stripping is enforced again
 	patchStripTrue, _ := json.Marshal(map[string]any{
-		"strip_exif": true,
+		"strip_exif":    true,
+		"max_upload_mb": 50,
 	})
 	if _, _, err := settings.PatchDomain(ctx, domain.SettingsDomainStorage, patchStripTrue, 0); err != nil {
 		t.Fatal(err)

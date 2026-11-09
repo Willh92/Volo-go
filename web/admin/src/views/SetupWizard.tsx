@@ -470,7 +470,10 @@ export function SetupWizard() {
       )}
       <div class="volo-form-actions no-border" style={{ justifyContent: "flex-end", marginTop: "6px", flexWrap: "wrap", gap: "8px" }}>
         {dbPingMsg && (
-          <span class={`volo-badge is-wrap ${dbPingErr ? "volo-badge-danger" : "volo-badge-ok"}`} style={{ marginRight: "auto" }}>
+          <span
+            class={`volo-badge is-wrap ${dbPingErr ? "volo-badge-danger" : "volo-badge-ok"}`}
+            style={{ marginRight: "auto", minWidth: 0, maxWidth: "100%", overflowWrap: "anywhere" }}
+          >
             {dbPingMsg}
           </span>
         )}
@@ -550,7 +553,7 @@ export function SetupWizard() {
         {sourcePingMsg && (
           <span
             class={`volo-badge ${sourcePingErr ? "volo-badge-danger" : "volo-badge-ok"}`}
-            style={{ marginRight: "auto", whiteSpace: "normal", wordBreak: "break-word" }}
+            style={{ marginRight: "auto", minWidth: 0, maxWidth: "100%", whiteSpace: "normal", overflowWrap: "anywhere", wordBreak: "break-word" }}
           >
             {sourcePingMsg}
           </span>
@@ -1011,7 +1014,17 @@ export function SetupWizard() {
             {etlResult && (
               <pre
                 class="volo-subcard"
-                style={{ marginTop: "14px", fontSize: "12px", maxHeight: "260px", overflowX: "auto", overflowY: "auto" }}
+                style={{
+                  marginTop: "14px",
+                  fontSize: "12px",
+                  minWidth: 0,
+                  maxWidth: "100%",
+                  maxHeight: "260px",
+                  whiteSpace: "pre-wrap",
+                  overflowWrap: "anywhere",
+                  overflowX: "auto",
+                  overflowY: "auto",
+                }}
               >
                 {JSON.stringify(etlResult, null, 2)}
               </pre>

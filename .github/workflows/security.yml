@@ -20,6 +20,8 @@ jobs:
     name: Go govulncheck & Frontend Audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -36,6 +38,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm audit --omit=dev --audit-level=high
+          rm -rf ../../internal/adminui/dist && mkdir -p ../../internal/adminui/dist
           npm run build
 
       - name: Setup Go
@@ -47,6 +50,7 @@ jobs:
       - name: Run govulncheck
         env:
           CGO_ENABLED: "0"
+          GOEXPERIMENT: "nojsonv2"
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
@@ -76,7 +80,9 @@ jobs:
         if: matrix.language == 'go'
         run: |
           mkdir -p internal/adminui/dist
-          printf '<!doctype html><title>volo</title>\n' > internal/adminui/dist/index.html
+          if [ ! -f internal/adminui/dist/index.html ] && [ ! -f internal/adminui/dist/index.html.gz ]; then
+            printf '<!doctype html><title>volo</title>\n' > internal/adminui/dist/index.html
+          fi
 
       - name: Setup Go
         if: matrix.language == 'go'
@@ -86,6 +92,9 @@ jobs:
           cache: true
 
       - name: Initialize CodeQL
+        env:
+          CGO_ENABLED: "0"
+          GOEXPERIMENT: "nojsonv2"
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
@@ -95,9 +104,12 @@ jobs:
         if: matrix.build-mode == 'autobuild'
         env:
           CGO_ENABLED: "0"
+          GOEXPERIMENT: "nojsonv2"
         uses: github/codeql-action/autobuild@v4
 
       - name: Perform CodeQL Analysis
+        env:
+          GOEXPERIMENT: "nojsonv2"
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"

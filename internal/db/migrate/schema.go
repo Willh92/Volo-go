@@ -39,7 +39,7 @@ func loadV1SchemaTemplate() string {
 }
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 7
+const CurrentSchemaVersion = 8
 
 type migrationStep struct {
 	Version     int
@@ -82,6 +82,11 @@ var steps = []migrationStep{
 		Version:     7,
 		Description: "Backfill zero published_at on published articles and add media uploader and audit log composite indexes",
 		Statements:  buildV7ArticlePublishedAtAndAuditMediaIndexes,
+	},
+	{
+		Version:     8,
+		Description: "Add timed account ban, mute, reason, and reversible historical comment shielding columns to users",
+		Statements:  buildV8UserModerationAndCommentShielding,
 	},
 }
 
@@ -181,6 +186,17 @@ func buildV7ArticlePublishedAtAndAuditMediaIndexes(_ dialect.Dialect) []string {
 		`CREATE INDEX idx_media_uploader_created ON media_assets (uploader_id, created_at)`,
 		`CREATE INDEX idx_audit_actor_created ON audit_logs (actor_id, created_at)`,
 		`CREATE INDEX idx_audit_action_created ON audit_logs (action, created_at)`,
+	}
+}
+
+func buildV8UserModerationAndCommentShielding(d dialect.Dialect) []string {
+	t := d.Types()
+	return []string{
+		fmt.Sprintf(`ALTER TABLE users ADD COLUMN ban_until%s NOT NULL DEFAULT 0`, t.BigInt),
+		fmt.Sprintf(`ALTER TABLE users ADD COLUMN muted_until%s NOT NULL DEFAULT 0`, t.BigInt),
+		fmt.Sprintf(`ALTER TABLE users ADD COLUMN ban_reason%s NOT NULL DEFAULT ''`, t.Varchar255),
+		fmt.Sprintf(`ALTER TABLE users ADD COLUMN shield_comments%s NOT NULL DEFAULT %s`, t.Bool, t.BoolFalseLit),
+		fmt.Sprintf(`ALTER TABLE users ADD COLUMN shield_text%s NOT NULL DEFAULT ''`, t.Varchar255),
 	}
 }
 

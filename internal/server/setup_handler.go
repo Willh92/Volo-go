@@ -651,6 +651,12 @@ func (s *AppServer) reloadRuntimeAfterDBRestore(ctx context.Context) {
 	_ = s.syncConfiguredGeoIPDir()
 	if s.deps.WAF != nil {
 		_ = s.deps.WAF.ReloadBans(ctx)
+		if s.deps.Settings != nil {
+			s.deps.WAF.UpdateConfig(s.deps.Settings.Snapshot().Security.WAFWindowSeconds)
+		}
+	}
+	if s.imageView != nil {
+		s.imageView.Purge()
 	}
 	if s.deps.Geo != nil {
 		_ = s.deps.Geo.ReloadRules(ctx, s.deps.Store)
@@ -1895,7 +1901,8 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		"admin_path":     s.deps.Config.AdminPath,
 		"target_dialect": s.deps.Store.Dialect().Name(),
 	}
-	if adminUser, qErr := sqlx.Get[domain.User](r.Context(), s.deps.Store,
+	var adminUser domain.User
+	if qErr := sqlx.GetInto(r.Context(), s.deps.Store, &adminUser,
 		`SELECT * FROM users WHERE role = ? AND status = ? ORDER BY created_at ASC LIMIT 1`,
 		domain.RoleAdmin, domain.UserStatusActive); qErr == nil && adminUser.ID != "" {
 		geo := ""

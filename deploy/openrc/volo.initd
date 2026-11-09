@@ -4,17 +4,58 @@
 name="Volo-go"
 description="Volo-go Pure-Go Sovereign Blog Engine"
 
-set -a
-# shellcheck disable=SC1091
-if [ -f /etc/volo/volo.env ]; then . /etc/volo/volo.env; fi
-set +a
+load_volo_env() {
+    _env_file="$1"
+    [ -f "$_env_file" ] || return 0
+    _cr="$(printf '\r')"
+    while IFS='=' read -r key val || [ -n "$key" ]; do
+        key="${key#"${key%%[![:space:]]*}"}"
+        case "$key" in
+            ""|\#*) continue ;;
+            export[[:space:]]*)
+                key="${key#export}"
+                key="${key#"${key%%[![:space:]]*}"}"
+                ;;
+        esac
+        key="${key%"$_cr"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        case "$key" in
+            ""|[!A-Z_]*|*[!A-Z0-9_]*) continue ;;
+        esac
+        val="${val%"$_cr"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        case "$val" in
+            \"*\")
+                if [ "${#val}" -ge 2 ]; then
+                    val="${val#\"}"
+                    val="${val%\"}"
+                fi
+                ;;
+            \'*\')
+                if [ "${#val}" -ge 2 ]; then
+                    val="${val#\'}"
+                    val="${val%\'}"
+                fi
+                ;;
+        esac
+        export "$key=$val"
+    done < "$_env_file"
+    unset _env_file _cr key val
+}
+
+load_volo_env /etc/volo/volo.env
+
+volo_user="${VOLO_USER:-volo}"
+volo_group="${VOLO_GROUP:-volo}"
+volo_sock_group="${VOLO_SOCKET_GROUP:-$volo_group}"
 
 command="/usr/local/bin/volo"
 command_args="serve --env-file /etc/volo/volo.env"
-command_user="${VOLO_USER:-volo}:${VOLO_GROUP:-volo}"
+command_user="${volo_user}:${volo_group}"
 command_background="yes"
 pidfile="/run/volo/volo.pid"
-directory="/var/lib/volo"
+directory="${VOLO_WORK_DIR:-/var/lib/volo}"
 output_log="/var/log/volo/volo.log"
 error_log="/var/log/volo/volo.err"
 stopsig="SIGTERM"
@@ -27,6 +68,13 @@ depend() {
 }
 
 start_pre() {
-    checkpath -d -m 0755 -o "${command_user}" /run/volo
-    checkpath -d -m 0750 -o "${command_user}" /var/lib/volo /var/log/volo
+    checkpath -d -m 2750 -o "${volo_user}:${volo_sock_group}" /run/volo
+    checkpath -d -m 0750 -o "${command_user}" "${directory}" /var/log/volo
+    if [ -n "${VOLO_LISTEN_SOCKET:-}" ]; then
+        _sock_path="${VOLO_LISTEN_SOCKET%%,*}"
+        _sock_dir="$(dirname "$_sock_path")"
+        if [ -n "$_sock_dir" ] && [ "$_sock_dir" != "/" ] && [ "$_sock_dir" != "." ] && [ "$_sock_dir" != "/run/volo" ] && [ "$_sock_dir" != "${directory}" ]; then
+            checkpath -d -m 2750 -o "${volo_user}:${volo_sock_group}" "$_sock_dir"
+        fi
+    fi
 }

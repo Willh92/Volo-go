@@ -31,7 +31,6 @@ import (
 	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
-	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
@@ -467,12 +466,23 @@ func (s *AppServer) handleAdminLogin2FA(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.setSessionCookieForRequest(w, r, res.RawToken)
-	if trustCookie != "" {
+	remDays := s.deps.Settings.Snapshot().Security.TOTPRememberDays
+	if trustCookie != "" && remDays > 0 {
 		http.SetCookie(w, &http.Cookie{
 			Name:     trusted2FACookieName,
 			Value:    trustCookie,
 			Path:     "/api",
-			MaxAge:   s.deps.Settings.Snapshot().Security.TOTPRememberDays * 86400,
+			MaxAge:   remDays * 86400,
+			HttpOnly: true,
+			Secure:   s.isCookieSecureForRequest(r),
+			SameSite: http.SameSiteLaxMode,
+		})
+	} else {
+		http.SetCookie(w, &http.Cookie{
+			Name:     trusted2FACookieName,
+			Value:    "",
+			Path:     "/api",
+			MaxAge:   -1,
 			HttpOnly: true,
 			Secure:   s.isCookieSecureForRequest(r),
 			SameSite: http.SameSiteLaxMode,
@@ -552,6 +562,10 @@ func (s *AppServer) localizeAdminAuthError(r *http.Request, err error) string {
 	}
 	locale := s.resolveLocale(r)
 	cat := s.deps.Catalog
+	var banErr *auth.UserBannedError
+	if errors.As(err, &banErr) {
+		return formatLocalizedBanNotice(locale, banErr)
+	}
 	switch {
 	case errors.Is(err, auth.ErrInvalidCredentials):
 		return cat.T(locale, "reader.err_invalid_credentials")
@@ -583,8 +597,10 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		csrf := ""
 		sessID := ""
 		if sess != nil {
-			csrf = s.deps.Auth.ComputeCSRFToken(sess.ID)
 			sessID = sess.ID
+			if strings.TrimSpace(r.Header.Get("X-Volo-Console")) == "1" {
+				csrf = s.deps.Auth.ComputeCSRFToken(sess.ID)
+			}
 		}
 		var totpCnt, pkCnt int
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM user_credentials WHERE user_id = ? AND kind = 'totp'`, actor.ID).Scan(&totpCnt)
@@ -1658,6 +1674,7 @@ func (s *AppServer) handleAdminRenderPreview(w http.ResponseWriter, r *http.Requ
 		Markdown           string `json:"markdown"`
 		Locale             string `json:"locale"`
 		PreserveDirectives bool   `json:"preserve_directives"`
+		HasAudio           bool   `json:"has_audio"`
 	}
 	if !decodeJSONBody(w, r, 4<<20, &req) {
 		return
@@ -1692,6 +1709,7 @@ func (s *AppServer) handleAdminRenderPreview(w http.ResponseWriter, r *http.Requ
 		Unlocked:            true,
 		AuthorOrShareBypass: true,
 		IsReaderLoggedIn:    true,
+		HasAudio:            req.HasAudio,
 		ShowLineNumbers:     s.deps.Settings.Snapshot().Reading.ShowCodeLineNumbers,
 		PreserveDirectives:  req.PreserveDirectives,
 		LookupBook:          func(bSlug string) (render.BookCardInfo, bool) { return s.deps.Content.LookupBookCard(ctx, bSlug) },
@@ -1717,7 +1735,7 @@ func (s *AppServer) handleAdminRenderPreview(w http.ResponseWriter, r *http.Requ
 		"toc":           out.TOC,
 		"needs_math":    out.NeedsMath,
 		"needs_mermaid": out.NeedsMermaid,
-		"has_audio":     strings.Contains(out.HTML, "<audio"),
+		"has_audio":     req.HasAudio || strings.Contains(out.HTML, "<audio"),
 	})
 }
 
@@ -2157,7 +2175,7 @@ func (s *AppServer) handleAdminArticles(w http.ResponseWriter, r *http.Request, 
 			writeErrJSON(w, http.StatusBadRequest, tErr.Error())
 			return
 		}
-		shareURL := strings.TrimRight(s.publicBaseURL(r), "/") + visibility.ArticlePath(raw.Slug) + "?preview=" + tok
+		shareURL := strings.TrimRight(s.publicBaseURL(r), "/") + s.deps.Content.Guard().ArticleURL(raw) + "?preview=" + tok
 		writeJSON(w, http.StatusOK, map[string]any{
 			"token":      tok,
 			"expires_at": expUnix,
@@ -3869,6 +3887,12 @@ func authorizeAndScrubAdminComment(actor *domain.User, c domain.Comment, targetA
 }
 
 func (s *AppServer) dispatchCommentModeratedHook(ctx context.Context, cmt domain.Comment, status string) {
+	if status == domain.CommentStatusApproved && cmt.Status != domain.CommentStatusApproved &&
+		strings.TrimSpace(cmt.ParentID) != "" && s.deps.NotifyCommentApproved != nil {
+		approvedCopy := cmt
+		approvedCopy.Status = domain.CommentStatusApproved
+		go s.deps.NotifyCommentApproved(context.Background(), approvedCopy)
+	}
 	if s.deps.Plugins == nil {
 		return
 	}
@@ -4010,10 +4034,47 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 
+		userModMap := make(map[string]domain.User)
+		{
+			userIDSet := make(map[string]struct{})
+			var userArgs []any
+			var userPH []string
+			for _, c := range rows {
+				uid := strings.TrimSpace(c.UserID)
+				if uid == "" {
+					continue
+				}
+				if _, exists := userIDSet[uid]; !exists {
+					userIDSet[uid] = struct{}{}
+					userArgs = append(userArgs, uid)
+					userPH = append(userPH, "?")
+				}
+			}
+			if len(userArgs) > 0 {
+				var uRows []domain.User
+				_ = sqlx.SelectInto(r.Context(), s.deps.Store, &uRows,
+					`SELECT id, role, status, ban_until, muted_until, ban_reason, shield_comments, shield_text FROM users WHERE id IN (`+strings.Join(userPH, ",")+`)`,
+					userArgs...)
+				for i := range uRows {
+					if s.deps.Auth != nil {
+						s.deps.Auth.HealExpiredUser(r.Context(), &uRows[i])
+					}
+					userModMap[uRows[i].ID] = uRows[i]
+				}
+			}
+		}
+
 		type adminCommentView struct {
 			domain.Comment
-			TargetTitle string `json:"target_title"`
-			TargetSlug  string `json:"target_slug"`
+			TargetTitle        string `json:"target_title"`
+			TargetSlug         string `json:"target_slug"`
+			UserRole           string `json:"user_role,omitempty"`
+			UserStatus         string `json:"user_status,omitempty"`
+			UserBanUntil       int64  `json:"user_ban_until,omitempty"`
+			UserMutedUntil     int64  `json:"user_muted_until,omitempty"`
+			UserBanReason      string `json:"user_ban_reason,omitempty"`
+			UserShieldComments bool   `json:"user_shield_comments,omitempty"`
+			UserShieldText     string `json:"user_shield_text,omitempty"`
 		}
 		items := make([]adminCommentView, 0, len(rows))
 		for _, c := range rows {
@@ -4029,11 +4090,21 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			}
 			scrubbed, sErr := authorizeAndScrubAdminComment(actor, c, ownerID)
 			if sErr == nil {
-				items = append(items, adminCommentView{
+				view := adminCommentView{
 					Comment:     scrubbed,
 					TargetTitle: tm.Title,
 					TargetSlug:  tm.Slug,
-				})
+				}
+				if uMod, ok := userModMap[strings.TrimSpace(c.UserID)]; ok {
+					view.UserRole = uMod.Role
+					view.UserStatus = uMod.Status
+					view.UserBanUntil = uMod.BanUntil
+					view.UserMutedUntil = uMod.MutedUntil
+					view.UserBanReason = uMod.BanReason
+					view.UserShieldComments = uMod.ShieldComments
+					view.UserShieldText = uMod.ShieldText
+				}
+				items = append(items, view)
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -4190,7 +4261,9 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		}
 		s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
 		if nextStatus != cmt.Status {
-			s.dispatchCommentModeratedHook(r.Context(), cmt, nextStatus)
+			cmtMod := cmt
+			cmtMod.ContentMD = nextContent
+			s.dispatchCommentModeratedHook(r.Context(), cmtMod, nextStatus)
 		}
 		writeOKJSON(w)
 
@@ -4532,6 +4605,9 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		if affected > 0 {
 			_ = s.deps.Content.RefreshMediaDimsCache(r.Context())
 			s.invalidateMediaRefCache()
+			if s.imageView != nil {
+				s.imageView.Purge()
+			}
 		}
 		s.recordAuditLog(r, actor, "media.batch_delete", "media_asset", "batch", map[string]any{"affected": affected})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
@@ -4609,6 +4685,9 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		if clean {
 			deletedCnt = len(orphans)
 			s.invalidateMediaRefCache()
+			if s.imageView != nil {
+				s.imageView.Purge()
+			}
 			s.recordAuditLog(r, actor, "media.orphans_clean", "media_asset", "orphans", map[string]any{"deleted_count": deletedCnt, "freed_bytes": freed})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -4692,6 +4771,9 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		}
 		_ = s.deps.Content.RefreshMediaDimsCache(r.Context())
 		s.invalidateMediaRefCache()
+		if s.imageView != nil {
+			s.imageView.Purge()
+		}
 		writeOKJSON(w)
 		return
 	}
@@ -4782,7 +4864,7 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 	exifStripped := false
 	var width, height int
 
-	if ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".gif" {
+	if ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".gif" || ext == ".avif" {
 		cleanBytes, normMIME, w, h, changed, nErr := media.NormalizeLocalImageBytes(raw, ext)
 		if nErr != nil {
 			return nil, nErr
@@ -4792,7 +4874,7 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 		}
 		mimeType = strings.ToLower(strings.TrimSpace(normMIME))
 		width, height = w, h
-		exifStripped = ext != ".gif"
+		exifStripped = ext != ".gif" && ext != ".avif"
 	} else if strings.HasPrefix(mimeType, "image/") {
 		if cfg, _, iErr := image.DecodeConfig(strings.NewReader(string(raw))); iErr == nil {
 			width, height = cfg.Width, cfg.Height

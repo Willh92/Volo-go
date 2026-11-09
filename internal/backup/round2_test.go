@@ -24,6 +24,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/i18n"
 	"github.com/Willh92/Volo-go/internal/repo"
+	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
@@ -384,9 +385,10 @@ func TestBackupRound3_ConcurrentCreate_UnsignedEntryRejection_MySQLUnicodeCI_And
 		t.Fatal(err)
 	}
 	sched := NewScheduler(SchedulerOptions{
-		Store:     store,
-		Settings:  settings,
-		BackupDir: backupDir,
+		Store:          store,
+		Settings:       settings,
+		BackupDir:      backupDir,
+		OutboundDialer: &security.OutboundSafeDialer{AllowLoopbackForTests: true},
 	})
 	for i := 0; i < 4; i++ {
 		if _, err := sched.RunOnce(ctx); err != nil {

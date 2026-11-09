@@ -284,8 +284,8 @@ func (m *Manifest) Validate() error {
 		if !m.CanUseSlot(slot.Slot) {
 			return fmt.Errorf("plugin %q: ui_slot %q requires permission \"slots:%s\" or \"ui:slots\"", m.ID, slot.Slot, slot.Slot)
 		}
-		if slot.Persist && slot.Slot != SlotPublicFooter && slot.Slot != SlotPublicHeader {
-			return fmt.Errorf("plugin %q: persist=true is only supported on public.footer or public.header", m.ID)
+		if slot.Persist && slot.Slot != SlotPublicFooter && slot.Slot != SlotPublicHeader && slot.Slot != SlotPublicHead {
+			return fmt.Errorf("plugin %q: persist=true is only supported on public.head, public.header, or public.footer", m.ID)
 		}
 		if slot.ScriptAsset != "" {
 			clean, err := sanitizeRelativeAssetPath(slot.ScriptAsset)
@@ -458,7 +458,7 @@ func validatePermissionToken(perm string) error {
 		return nil
 	case p == "cron" || p == "articles:read_protected" || p == "crypto" || p == "site:read" || p == "ratelimit":
 		return nil
-	case p == "provider:storage" || p == "provider:notifier" || p == "provider:oidc" || p == "provider:antispam":
+	case p == "provider:storage" || p == "provider:notifier" || p == "provider:oidc" || p == "auth:oidc" || p == "provider:antispam":
 		return nil
 	default:
 		return fmt.Errorf("unknown permission %q", perm)
@@ -490,6 +490,11 @@ func (m *Manifest) HasPermission(perm string) bool {
 		}
 	}
 	return false
+}
+
+// HasOIDCCapability reports whether the plugin declares OIDC provider permissions.
+func (m *Manifest) HasOIDCCapability() bool {
+	return m.HasPermission("provider:oidc") || m.HasPermission("auth:oidc")
 }
 
 // CanReadKV reports whether the plugin may read from plugin_kv.

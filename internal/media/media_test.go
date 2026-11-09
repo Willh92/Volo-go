@@ -24,6 +24,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/repo"
+	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
@@ -135,9 +136,10 @@ func setupMediaEnv(t *testing.T) (context.Context, *sqlx.Store, *repo.SettingsMa
 	}
 	var cbW, cbH int
 	pipe := media.NewPipeline(media.PipelineOptions{
-		Store:     store,
-		Settings:  settings,
-		UploadDir: uploadDir,
+		Store:          store,
+		Settings:       settings,
+		UploadDir:      uploadDir,
+		OutboundDialer: &security.OutboundSafeDialer{AllowLoopbackForTests: true},
 		OnDimsUpdated: func(_ string, w, h int) {
 			cbW, cbH = w, h
 		},

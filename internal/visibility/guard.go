@@ -227,9 +227,49 @@ func (g *Guard) PurgeCache() {
 	g.cache.Purge()
 }
 
-// ArticlePath returns the canonical path `/posts/{slug}` for an article.
+// ArticlePath returns the default canonical path `/posts/{slug}` for an article.
 func ArticlePath(slug string) string {
 	return "/posts/" + url.PathEscape(strings.TrimSpace(slug))
+}
+
+// FormatArticlePath renders an article URL according to style (`/posts/{slug}`, `/archives/{slug}`, `/p/{slug}`, `/{year}/{month}/{slug}`).
+func FormatArticlePath(style string, slug string, publishedAtMS int64, tz string) string {
+	escSlug := url.PathEscape(strings.TrimSpace(slug))
+	switch strings.TrimSpace(style) {
+	case domain.PermalinkStyleArchives:
+		return "/archives/" + escSlug
+	case domain.PermalinkStyleShortP:
+		return "/p/" + escSlug
+	case domain.PermalinkStyleYearMonth:
+		ts := publishedAtMS
+		var tm time.Time
+		if ts > 0 {
+			tm = time.UnixMilli(ts).In(domain.ResolveSiteLocation(tz))
+		} else {
+			tm = time.Now().In(domain.ResolveSiteLocation(tz))
+		}
+		return fmt.Sprintf("/%04d/%02d/%s", tm.Year(), int(tm.Month()), escSlug)
+	default:
+		return "/posts/" + escSlug
+	}
+}
+
+// ArticleSlugURL resolves the configured canonical path for slug + timestamp using active SEOSettings.
+func (g *Guard) ArticleSlugURL(slug string, publishedAtMS int64) string {
+	if g == nil || g.settings == nil {
+		return ArticlePath(slug)
+	}
+	snap := g.settings.Snapshot()
+	return FormatArticlePath(snap.SEO.PostPermalinkStyle, slug, publishedAtMS, snap.Site.TimeZone)
+}
+
+// ArticleURL resolves the configured canonical path for raw using active SEOSettings.
+func (g *Guard) ArticleURL(raw domain.RawArticle) string {
+	ts := raw.PublishedAt
+	if ts <= 0 {
+		ts = raw.CreatedAt
+	}
+	return g.ArticleSlugURL(raw.Slug, ts)
 }
 
 func openKeyRingWithFallback(kr *config.KeyRing, ciphertext string, primaryAAD string, fallbackAADs ...string) (string, error) {
@@ -545,7 +585,7 @@ func (g *Guard) ToCard(raw domain.RawArticle, locale string, cat *domain.Categor
 		AuthorID:       raw.AuthorID,
 		Title:          raw.Title,
 		Slug:           raw.Slug,
-		URL:            ArticlePath(raw.Slug),
+		URL:            g.ArticleURL(raw),
 		CategoryID:     raw.CategoryID,
 		Tags:           tags,
 		Lang:           raw.Lang,
@@ -717,7 +757,7 @@ func (g *Guard) ToNeighbor(raw domain.RawArticle) PublicNeighbor {
 		ID:                  raw.ID,
 		Title:               raw.Title,
 		Slug:                raw.Slug,
-		URL:                 ArticlePath(raw.Slug),
+		URL:                 g.ArticleURL(raw),
 		PublishedAt:         raw.PublishedAt,
 		IsPasswordProtected: isProtected,
 	}
@@ -761,7 +801,7 @@ func (g *Guard) ToDetail(
 		ApplyNoIndexPrivateHeaders(w)
 	}
 
-	artURL := ArticlePath(raw.Slug)
+	artURL := g.ArticleURL(raw)
 	view := PublicArticleView{
 		ID:                  raw.ID,
 		AuthorID:            raw.AuthorID,
@@ -951,7 +991,7 @@ func (g *Guard) ToFeedItem(raw domain.RawArticle, fullOutput bool, locale string
 		strings.TrimSpace(raw.SummaryMD) != "" &&
 		!render.ContainsLockDirective(raw.SummaryMD) {
 		summary := plainTextExcerptFromMarkdown(raw.SummaryMD, 220)
-		absURL := strings.TrimRight(publicBaseURL, "/") + ArticlePath(raw.Slug)
+		absURL := strings.TrimRight(publicBaseURL, "/") + g.ArticleURL(raw)
 		audioURL := strings.TrimSpace(raw.AudioURL)
 		if strings.HasPrefix(audioURL, "/") {
 			audioURL = strings.TrimRight(publicBaseURL, "/") + audioURL
@@ -1017,7 +1057,7 @@ func (g *Guard) ToFeedItem(raw domain.RawArticle, fullOutput bool, locale string
 		bodyHTML = "<p>" + html.EscapeString(summary) + "</p>"
 	}
 
-	absURL := strings.TrimRight(publicBaseURL, "/") + ArticlePath(raw.Slug)
+	absURL := strings.TrimRight(publicBaseURL, "/") + g.ArticleURL(raw)
 	audioURL := strings.TrimSpace(raw.AudioURL)
 	if strings.HasPrefix(audioURL, "/") {
 		audioURL = strings.TrimRight(publicBaseURL, "/") + audioURL

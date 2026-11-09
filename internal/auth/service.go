@@ -53,6 +53,34 @@ var (
 	ErrNicknameRejected   = errors.New("auth: nickname contains restricted or reserved words")
 )
 
+// UserBannedError reports that an account is suspended (permanently when BanUntil == 0, or until BanUntil Unix ms).
+// Unwrap returns ErrForbidden so existing RBAC/status checks using errors.Is(err, ErrForbidden) remain compatible.
+type UserBannedError struct {
+	BanUntil int64
+	Reason   string
+}
+
+func (e *UserBannedError) Error() string {
+	if e == nil {
+		return ErrForbidden.Error()
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if e.BanUntil > 0 {
+		if reason != "" {
+			return fmt.Sprintf("auth: account suspended until %d (%s)", e.BanUntil, reason)
+		}
+		return fmt.Sprintf("auth: account suspended until %d", e.BanUntil)
+	}
+	if reason != "" {
+		return fmt.Sprintf("auth: account suspended (%s)", reason)
+	}
+	return "auth: account suspended"
+}
+
+func (e *UserBannedError) Unwrap() error {
+	return ErrForbidden
+}
+
 const (
 	emailCodeResendCooldown = 60 * time.Second
 	emailCodeTTL            = 10 * time.Minute
@@ -355,6 +383,9 @@ func (s *Service) LoginStaff(
 	if u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor {
 		return nil, ErrForbidden
 	}
+	if u.IsBannedAt(time.Now().UnixMilli()) {
+		return nil, &UserBannedError{BanUntil: u.BanUntil, Reason: u.BanReason}
+	}
 	if u.Status != domain.UserStatusActive {
 		return nil, ErrForbidden
 	}
@@ -383,8 +414,12 @@ func (s *Service) CompleteStaffPrimaryLogin(
 	userAgent string,
 	trusted2FACookie string,
 ) (*LoginResult, error) {
+	s.HealExpiredUser(ctx, &u)
 	if u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor {
 		return nil, ErrForbidden
+	}
+	if u.IsBannedAt(time.Now().UnixMilli()) {
+		return nil, &UserBannedError{BanUntil: u.BanUntil, Reason: u.BanReason}
 	}
 	if u.Status != domain.UserStatusActive {
 		return nil, ErrForbidden
@@ -439,7 +474,14 @@ func (s *Service) CompleteStaff2FA(
 
 	var u domain.User
 	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, claims.UserID)
-	if err != nil || u.Status != domain.UserStatusActive {
+	if err != nil {
+		return nil, "", ErrUnauthorized
+	}
+	s.HealExpiredUser(ctx, &u)
+	if u.IsBannedAt(time.Now().UnixMilli()) {
+		return nil, "", &UserBannedError{BanUntil: u.BanUntil, Reason: u.BanReason}
+	}
+	if u.Status != domain.UserStatusActive {
 		return nil, "", ErrUnauthorized
 	}
 
@@ -458,11 +500,13 @@ func (s *Service) CompleteStaff2FA(
 	rememberDays := 7
 	if s.settingsMgr != nil {
 		sec := s.settingsMgr.Snapshot().Security
-		if sec.TOTPWindowSteps >= 0 && sec.TOTPWindowSteps <= 3 {
+		if sec.TOTPWindowSteps >= 0 && sec.TOTPWindowSteps <= 5 {
 			winSteps = sec.TOTPWindowSteps
 		}
-		if sec.TOTPRememberDays > 0 {
+		if sec.TOTPRememberDays >= 0 {
 			rememberDays = sec.TOTPRememberDays
+		} else {
+			rememberDays = 0
 		}
 	}
 
@@ -509,7 +553,7 @@ func (s *Service) CompleteStaff2FA(
 	}
 
 	var totpUntil int64
-	if rememberDevice {
+	if rememberDevice && rememberDays > 0 {
 		totpUntil = now.Add(time.Duration(rememberDays) * 24 * time.Hour).UnixMilli()
 		trustedDeviceCookie, _ = s.mintTrusted2FATicket(u.ID, u.PasswordHash, totpCred.SecretCiphertext, userAgent, totpUntil)
 	}
@@ -530,7 +574,13 @@ func (s *Service) CompleteStaff2FA(
 
 // EnrollTOTP persists an encrypted TOTP secret and 8 hashed recovery codes for userID after verifying code.
 func (s *Service) EnrollTOTP(ctx context.Context, userID string, secretBase32 string, verificationCode string) (recoveryPlain []string, err error) {
-	if err := VerifyTOTPCode(userID, secretBase32, verificationCode, time.Now(), 1, s.replayGuard); err != nil {
+	winSteps := 1
+	if s.settingsMgr != nil {
+		if ws := s.settingsMgr.Snapshot().Security.TOTPWindowSteps; ws >= 0 && ws <= 5 {
+			winSteps = ws
+		}
+	}
+	if err := VerifyTOTPCode(userID, secretBase32, verificationCode, time.Now(), winSteps, s.replayGuard); err != nil {
 		return nil, err
 	}
 	sealedSecret, err := s.keyRing.SealString(secretBase32, "cred:totp:"+userID)
@@ -644,11 +694,21 @@ func (s *Service) LoginWithPasskey(
 
 	var u domain.User
 	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, cred.UserID)
-	if err != nil || u.Status != domain.UserStatusActive || (u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor) {
+	if err != nil {
+		return nil, ErrForbidden
+	}
+	s.HealExpiredUser(ctx, &u)
+	now := time.Now().UnixMilli()
+	if u.Role != domain.RoleAdmin && u.Role != domain.RoleEditor {
+		return nil, ErrForbidden
+	}
+	if u.IsBannedAt(now) {
+		return nil, &UserBannedError{BanUntil: u.BanUntil, Reason: u.BanReason}
+	}
+	if u.Status != domain.UserStatusActive {
 		return nil, ErrForbidden
 	}
 
-	now := time.Now().UnixMilli()
 	_, _ = s.store.ExecContext(ctx,
 		`UPDATE user_credentials SET sign_count = ?, last_used_at = ? WHERE id = ?`,
 		newSignCount, now, cred.ID)
@@ -910,6 +970,9 @@ func (s *Service) LoginReader(
 	if u.Role != domain.RoleReader {
 		return nil, ErrForbidden
 	}
+	if u.IsBannedAt(time.Now().UnixMilli()) {
+		return nil, &UserBannedError{BanUntil: u.BanUntil, Reason: u.BanReason}
+	}
 	if u.Status != domain.UserStatusActive || u.EmailVerifiedAt <= 0 {
 		return nil, ErrForbidden
 	}
@@ -1013,7 +1076,11 @@ func (s *Service) AuthenticateSession(ctx context.Context, rawToken string) (*do
 	}
 	var u domain.User
 	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, sess.UserID)
-	if err != nil || u.Status != domain.UserStatusActive {
+	if err != nil {
+		return nil, nil, ErrUnauthorized
+	}
+	s.HealExpiredUser(ctx, &u)
+	if u.Status != domain.UserStatusActive || u.IsBannedAt(now) {
 		return nil, nil, ErrUnauthorized
 	}
 	if now-sess.LastSeenAt > 60_000 {
@@ -1197,7 +1264,11 @@ func (s *Service) AuthenticateAPIToken(ctx context.Context, rawToken string, req
 
 	var u domain.User
 	err = sqlx.GetInto(ctx, s.store, &u, `SELECT * FROM users WHERE id = ?`, rec.UserID)
-	if err != nil || u.Status != domain.UserStatusActive {
+	if err != nil {
+		return nil, nil, ErrUnauthorized
+	}
+	s.HealExpiredUser(ctx, &u)
+	if u.Status != domain.UserStatusActive || u.IsBannedAt(now) {
 		return nil, nil, ErrUnauthorized
 	}
 	if requiresAdminRole {
@@ -1225,6 +1296,37 @@ func (s *Service) RevokeUserAPITokens(ctx context.Context, userID string) error 
 	return err
 }
 
+// HealExpiredUser automatically clears expired timed account bans (`ban_until`) and timed mutes (`muted_until`),
+// and removes `shield_comments` when no active ban or mute remains so historical comments automatically recover.
+func (s *Service) HealExpiredUser(ctx context.Context, u *domain.User) bool {
+	if s == nil || s.store == nil || u == nil || strings.TrimSpace(u.ID) == "" {
+		return false
+	}
+	now := time.Now().UnixMilli()
+	banExpired := u.Status == domain.UserStatusDisabled && u.BanUntil > 0 && now >= u.BanUntil
+	muteExpired := u.MutedUntil > 0 && now >= u.MutedUntil
+	if !banExpired && !muteExpired {
+		return false
+	}
+	if banExpired {
+		u.Status = domain.UserStatusActive
+		u.BanUntil = 0
+	}
+	if muteExpired {
+		u.MutedUntil = 0
+	}
+	if !u.IsBannedAt(now) && !u.IsMutedAt(now) {
+		u.BanReason = ""
+		u.ShieldComments = false
+		u.ShieldText = ""
+	}
+	u.UpdatedAt = now
+	_, _ = s.store.ExecContext(ctx,
+		`UPDATE users SET status = ?, ban_until = ?, muted_until = ?, ban_reason = ?, shield_comments = ?, shield_text = ?, updated_at = ? WHERE id = ?`,
+		u.Status, u.BanUntil, u.MutedUntil, u.BanReason, u.ShieldComments, u.ShieldText, now, u.ID)
+	return true
+}
+
 // --- Internal helpers ---
 
 func (s *Service) findUserByIdent(ctx context.Context, ident string) (domain.User, error) {
@@ -1238,6 +1340,7 @@ func (s *Service) findUserByIdent(ctx context.Context, ident string) (domain.Use
 			`SELECT * FROM users WHERE LOWER(email) = LOWER(?)`,
 			clean)
 		if err == nil {
+			s.HealExpiredUser(ctx, &u)
 			return u, nil
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -1249,6 +1352,7 @@ func (s *Service) findUserByIdent(ctx context.Context, ident string) (domain.Use
 		clean); err != nil {
 		return domain.User{}, err
 	}
+	s.HealExpiredUser(ctx, &u)
 	return u, nil
 }
 
@@ -1288,6 +1392,9 @@ func (s *Service) mintTrusted2FATicket(userID string, passwordHash string, totpS
 }
 
 func (s *Service) verifyTrusted2FATicket(cookieVal string, expectedUserID string, passwordHash string, totpSecretCiphertext string, userAgent string) bool {
+	if s.settingsMgr != nil && s.settingsMgr.Snapshot().Security.TOTPRememberDays <= 0 {
+		return false
+	}
 	if strings.TrimSpace(cookieVal) == "" || strings.TrimSpace(totpSecretCiphertext) == "" {
 		return false
 	}

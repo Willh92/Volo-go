@@ -4,6 +4,29 @@ All notable changes to `Volo-go` are documented in this file. Format follows [Ke
 
 ---
 
+## [1.0.0] - 2026-11-09
+
+### Added / 新增特性
+- **Real-Time Non-Destructive ImageView Rendering (`/uploads/...?...`)**:
+  - **Dual Qiniu + KV Query Syntax**: Simultaneously supports Qiniu Cloud native path parameters (`?imageView2/<mode>/w/960/h/540/format/webp/q/85/interlace/1/colors/128/strip/ignore-error/1`) and standard key-value query parameters (`?mode=1&w=960&h=540&format=webp&interlace=1&q=85&colors=128&strip&meta-keep-list=...&ignore-error=1`) in any combination across resize/crop modes `0`–`5` (`fit`, `fill`, `lfit`, `mfit`, `pad`, `crop`), output formats `jpg`/`png`/`webp`/`avif` (pure-Go fallback to `webp` with `X-Volo-Format-Fallback: avif->webp`), quality `1`–`100`, palette quantization `2`–`256`, EXIF orientation auto-righting, and `ignore-error=1` graceful fallback.
+  - **Zero-Mutation Passthrough, Coalescing & Orphan/CLS Linkage**: Unparameterized `/uploads/...` requests stream original files directly with zero overhead and never modify source uploads on disk or S3; parameterized transforms run through `singleflight` request coalescing + a strict `8 MiB` byte-bounded LRU cache keyed on `(path, mtime, size, spec)` + strong `ETag` / `304 Not Modified`, while `LookupMediaDims` predicts transformed `width`/`height` for zero-CLS rendering and `orphan.go` strips query/fragment suffixes so parameterized Markdown image references are never falsely flagged as orphans.
+- **Schema `v8` — Discourse-Style Account Ban/Unban, Timed Suspension, Mute & Reversible Comment Shielding**:
+  - Added `ban_until`, `muted_until`, `ban_reason`, `shield_comments`, and `shield_text` to `users` (`v8` idempotent migration across SQLite, PostgreSQL, and MySQL) with Admin Console Users management (`GET`/`PATCH /api/admin/users`) and one-click Comments moderation actions.
+  - Supports permanent or timed account bans (immediately revoking active sessions and PATs, with automatic reactivation upon expiry) and permanent or timed mutes (allowing login and reading while blocking new/edited comments and reactions with localized expiry notices).
+  - **Reversible Historical Comment Shielding**: Enabling `shield_comments` non-destructively replaces all public comments by a banned or muted user with customizable placeholder copy (`shield_text`) at render time while preserving original `comments.content_md` and reply trees in the database — unbanning/unmuting or timer expiration immediately restores original comments intact.
+- **Per-Identity Comment Bounds, Vertical Height-Bombing Defense & Fullscreen Reply Editor**:
+  - **Configurable Per-Identity Bounds**: Enforces default minimum `2` runes, `512` max runes (`16` max lines) for guests, `1024` max runes (`24` max lines) for registered readers, and `4096` max runes (`64` max lines) for staff (`admin`/`editor`), all dynamically configurable in Admin Console `reading` settings and exposed via `/api/v1/comments`.
+  - **Multi-Layer Height-Bombing Defense**: Normalizes Unicode line separators, caps Zalgo combining-mark towers (`<= 3` per base rune), collapses invisible blank filler lines (Braille blank `U+2800`, Hangul filler `U+3164`/`U+FFA0`, ZWSP, lone `\` hard breaks, empty list markers), collapses `3+` consecutive newlines, deduplicates empty blockquotes/rules, demotes comment `h1`–`h3` -> `h4`, caps consecutive `<br>` tags at `2`, bounds comment `<img>`/`<pre>` CSS heights, and auto-folds tall comments with expand/collapse toggles.
+  - **Enhanced Safe Reply Markdown Editor**: Upgraded public comment editor in `volo-studio` and `volo-journal` with formatting toolbar (`bold`, `italic`, `strike`, inline/fenced code, quote, list, safe link), sanitized live preview (`POST /api/v1/comments/preview`), distraction-free fullscreen editing (`Esc` exit), and live rune/line counters.
+
+### Changed, Hardened & Slimmed / 性能瘦身、全配置闭环与安全加固
+- **Sub-`20.00 MiB` Pure-Go Binary Slimming Across All 6 Targets**: Replaced `encoding/xml` with a zero-reflection streaming parser (`internal/tinyxml`), replaced `net/smtp` + `net/mail` with a pure-Go STARTTLS/SMTPS client and RFC 5322 validator (`internal/notify`), eliminated generic `sqlx.Get`/`Select` instantiations in favor of `GetInto`/`SelectInto`, and built with `GOEXPERIMENT=nojsonv2` + `-funcalign=8` — keeping **every release binary across all 6 OS/Arch targets strictly `< 20.00 MiB`** (`linux/amd64` ~`19.1 MiB`, warm `VmRSS` ~`24.2 MiB < 35.00 MiB`).
+- **End-to-End Settings & Security Closure**: Wired all 4 `seo.post_permalink_style` templates (`/posts/{slug}`, `/archives/{slug}`, `/p/{slug}`, `/{year}/{month}/{slug}` + `.md` + instant cache/search rebuild), `security.totp_remember_days = 0` & `totp_window_steps`, `NotifyCommentReplyApproved` on pending reply approval, `storage.max_upload_mb` multipart enforcement, `feed.item_count` in `/podcast.xml`, live `WAF.UpdateConfig`, and `X-Volo-Console: 1` anti-CSRF gating on `/api/admin/me`.
+- **Plugin Sandbox & Write-Behind KV Hardening**: Added streaming depth/key/element-bounded `JSON.parse` & `goToJSValueBounded`, AST recursion depth limits (`128`), frozen builtin prototypes + `snapshotPostInit`/`restorePostInit` pooled VM isolation, `ErrExecutionTimeout` sentinel preservation, binary-safe `btoa`/`atob` & base64 `volo.http.fetch`, write-behind `volo.kv.incrAsync`/`flush` hub eliminating hot-path SQLite contention, and `kanbanniang` `ja-JP` localization.
+- **Unix Domain Socket, Service Installers & Release CI Gate**: Added `--unix-socket` alias, parent `EvalSymlinks` + leaf `Lstat` symlink defense, `--socket-group`/`--socket-mode` enforcement, read-only `volo healthcheck`, shell-free OpenRC `load_volo_env()` (eliminating `. /etc/volo/volo.env` RCE), `systemd` `RuntimeDirectory=volo` + `--bin-dir` vs `--data-dir` privilege separation, Windows `icacls`/`sc.exe` exit checks, and automated GitHub Actions `verify` gate distinguishing stable (`latest`) vs preview (`prerelease`) releases.
+
+---
+
 ## [1.0.0-rc6] - 2026-11-09
 
 ### Added / 新增特性
@@ -28,7 +51,7 @@ All notable changes to `Volo-go` are documented in this file. Format follows [Ke
 
 ---
 
-## [1.0.0] - 2026-11-08
+## [1.0.0-rc1] - 2026-11-08
 
 ### Added / 新增特性
 - **Pure-Go Single-Binary Engine & 6-Target Static Matrix (`CGO_ENABLED=0`)**:

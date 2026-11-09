@@ -245,13 +245,19 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		t.Fatalf("duplicate index idx_media_created should have been dropped in V6")
 	}
 
-	// Verify V7 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
+	// Verify V8 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
 	var maxVer int
 	if err := store.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 7 || CurrentSchemaVersion != 7 {
-		t.Fatalf("expected schema version 7, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
+	if maxVer != 8 || CurrentSchemaVersion != 8 {
+		t.Fatalf("expected schema version 8, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
+	}
+	for _, col := range []string{"ban_until", "muted_until", "ban_reason", "shield_comments", "shield_text"} {
+		exists, cErr := columnExists(ctx, store, "users", col)
+		if cErr != nil || !exists {
+			t.Fatalf("expected users.%s column from V8 migration (exists=%v, err=%v)", col, exists, cErr)
+		}
 	}
 	if err := execIdempotentAddColumn(ctx, store, `ALTER TABLE media_assets ADD COLUMN alt_text TEXT NOT NULL DEFAULT ''`); err != nil {
 		t.Fatalf("execIdempotentAddColumn on existing column failed: %v", err)

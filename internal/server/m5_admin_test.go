@@ -141,20 +141,23 @@ func setupM5TestEnv(t *testing.T, customAdminPath string) *m5Env {
 		PublicURL: cfg.PublicURL,
 	})
 
+	t.Cleanup(func() { _ = disp.Close(ctx) })
+
 	appSrv, err := server.NewAppServer(server.AppDeps{
-		Config:               cfg,
-		Store:                store,
-		Settings:             settingsMgr,
-		Catalog:              cat,
-		Auth:                 authSvc,
-		Passports:            passports,
-		PoW:                  pow,
-		Plugins:              pluginMgr,
-		Content:              cnt,
-		SendVerificationMail: disp.SendVerificationCode,
-		NotifyCommentCreated: disp.NotifyCommentCreated,
-		TestSMTP:             disp.SendTestSMTP,
-		TestWebhook:          disp.TriggerTestWebhook,
+		Config:                cfg,
+		Store:                 store,
+		Settings:              settingsMgr,
+		Catalog:               cat,
+		Auth:                  authSvc,
+		Passports:             passports,
+		PoW:                   pow,
+		Plugins:               pluginMgr,
+		Content:               cnt,
+		SendVerificationMail:  disp.SendVerificationCode,
+		NotifyCommentCreated:  disp.NotifyCommentCreated,
+		NotifyCommentApproved: disp.NotifyCommentReplyApproved,
+		TestSMTP:              disp.SendTestSMTP,
+		TestWebhook:           disp.TriggerTestWebhook,
 	})
 	if err != nil {
 		t.Fatalf("NewAppServer: %v", err)

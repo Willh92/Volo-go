@@ -34,6 +34,11 @@ import {
   useDebouncedValue,
   useFlipList,
   usePointerSortableList,
+  UserModerationModal,
+  UserModerationTarget,
+  isAccountBannedNow,
+  isAccountMutedNow,
+  runQuickUserUnmod,
   PlusIcon,
   CloseIcon,
 } from "../components/UIControls";
@@ -269,6 +274,7 @@ export function ContentWorkspace({
   const [banReason, setBanReason] = useState("comment spam");
   const [banRejectPending, setBanRejectPending] = useState(true);
   const [banningIp, setBanningIp] = useState(false);
+  const [cmtUserModTarget, setCmtUserModTarget] = useState<UserModerationTarget | null>(null);
 
   // Media Library (10,000+ scale)
   const [media, setMedia] = useState<MediaAssetRecord[]>([]);
@@ -277,7 +283,7 @@ export function ContentWorkspace({
   const [orphanCount, setOrphanCount] = useState(0);
   const [mediaView, setMediaView] = useState<"grid" | "list">("grid");
   const [mediaRefFilter, setMediaRefFilter] = useState<"all" | "orphan" | "used">("all");
-  const [mediaKindFilter, setMediaKindFilter] = useState<"all" | "image" | "audio" | "other">("all");
+  const [mediaKindFilter, setMediaKindFilter] = useState<"all" | "image" | "video" | "audio" | "other">("all");
   const [mediaMonthFilter, setMediaMonthFilter] = useState("");
   const [mediaSort, setMediaSort] = useState<"newest" | "size" | "name">("newest");
   const [mediaQuery, setMediaQuery] = useState("");
@@ -1650,8 +1656,12 @@ export function ContentWorkspace({
 
   const copyMediaMarkdown = (m: MediaAssetRecord) => {
     const label = m.alt_text || m.original_name || m.id;
-    const isImg = String(m.mime_type || "").startsWith("image/");
-    const md = isImg ? `![${label}](${m.public_url})` : `[${label}](${m.public_url})`;
+    const mime = String(m.mime_type || "");
+    const md = mime.startsWith("image/")
+      ? `![${label}](${m.public_url})`
+      : mime.startsWith("video/")
+      ? `<video controls preload="metadata" src="${m.public_url}"></video>`
+      : `[${label}](${m.public_url})`;
     void navigator.clipboard?.writeText(md);
     showToast(t("cnt.media_copied"));
   };
@@ -3636,6 +3646,23 @@ export function ContentWorkspace({
                   displayComments.map((row) => {
                     const c = row.comment || row;
                     const canBanIp = isAdmin && Boolean(c.ip_masked || c.client_ip || c.author_name);
+                    const cmtUserId = String(c.user_id || row.user_id || "");
+                    const canModUser = isAdmin && Boolean(cmtUserId) && cmtUserId !== currentUserSig.value?.id;
+                    const nowMs = Date.now();
+                    const uModState = {
+                      status: row.user_status ?? c.user_status,
+                      ban_until: row.user_ban_until ?? c.user_ban_until,
+                      muted_until: row.user_muted_until ?? c.user_muted_until,
+                    };
+                    const cmtUserBanned =
+                      Boolean(cmtUserId) &&
+                      (Boolean(row.user_banned ?? c.user_banned) || isAccountBannedNow(uModState, nowMs));
+                    const cmtUserMuted =
+                      Boolean(cmtUserId) &&
+                      (Boolean(row.user_muted ?? c.user_muted) || isAccountMutedNow(uModState, nowMs));
+                    const cmtUserShielded =
+                      Boolean(row.is_shielded ?? c.is_shielded) ||
+                      (Boolean(row.user_shield_comments ?? c.user_shield_comments) && (cmtUserBanned || cmtUserMuted));
                     const targetTitle = row.target_title || row.target_slug || c.target_id;
                     const targetHref =
                       row.target_url ||
@@ -3673,6 +3700,15 @@ export function ContentWorkspace({
                                 </a>
                               ) : (
                                 <span>{c.author_name}</span>
+                              )}
+                              {cmtUserBanned && (
+                                <span class="volo-status-pill danger">{t("sys.user_status_banned")}</span>
+                              )}
+                              {cmtUserMuted && (
+                                <span class="volo-status-pill warn">{t("sys.user_status_muted")}</span>
+                              )}
+                              {cmtUserShielded && (
+                                <span class="volo-mini-tag">{t("sys.user_shielded_badge")}</span>
                               )}
                               {c.geo_region && <span class="volo-mini-tag">{c.geo_region}</span>}
                               {uaSummary && (
@@ -3804,6 +3840,33 @@ export function ContentWorkspace({
                                   },
                                 },
                                 {
+                                  label: t("sys.user_mod_btn"),
+                                  hidden: !canModUser,
+                                  danger: true,
+                                  onClick: () =>
+                                    setCmtUserModTarget({
+                                      userId: cmtUserId,
+                                      label: c.author_name ? `${c.author_name} (${cmtUserId.slice(0, 8)})` : cmtUserId,
+                                      defaultAction: cmtUserMuted && !cmtUserBanned ? "mute" : "ban",
+                                      banReason: String(row.user_ban_reason ?? c.user_ban_reason ?? ""),
+                                      shieldComments:
+                                        row.user_shield_comments !== undefined || c.user_shield_comments !== undefined
+                                          ? Boolean(row.user_shield_comments ?? c.user_shield_comments)
+                                          : true,
+                                      shieldText: String(row.user_shield_text ?? c.user_shield_text ?? ""),
+                                    }),
+                                },
+                                {
+                                  label: t("sys.user_unban"),
+                                  hidden: !canModUser || !cmtUserBanned,
+                                  onClick: () => void runQuickUserUnmod(cmtUserId, "unban", () => void loadSub()),
+                                },
+                                {
+                                  label: t("sys.user_unmute"),
+                                  hidden: !canModUser || !cmtUserMuted,
+                                  onClick: () => void runQuickUserUnmod(cmtUserId, "unmute", () => void loadSub()),
+                                },
+                                {
                                   label: t("cnt.cmt_ban_ip"),
                                   hidden: !canBanIp,
                                   danger: true,
@@ -3865,6 +3928,12 @@ export function ContentWorkspace({
               setPageIdx(1);
             }}
             onChange={setPageIdx}
+          />
+
+          <UserModerationModal
+            target={cmtUserModTarget}
+            onClose={() => setCmtUserModTarget(null)}
+            onSaved={() => void loadSub()}
           />
 
           <AnimatedModal
@@ -4081,12 +4150,13 @@ export function ContentWorkspace({
                   searchable={false}
                   value={mediaKindFilter}
                   onChange={(val) => {
-                    setMediaKindFilter(val as "all" | "image" | "audio" | "other");
+                    setMediaKindFilter(val as "all" | "image" | "video" | "audio" | "other");
                     setPageIdx(1);
                   }}
                   options={[
                     { value: "all", label: t("cnt.media_type_all") },
                     { value: "image", label: t("cnt.media_type_image") },
+                    { value: "video", label: t("cnt.media_type_video") },
                     { value: "audio", label: t("cnt.media_type_audio") },
                     { value: "other", label: t("cnt.media_type_other") },
                   ]}
@@ -4134,6 +4204,7 @@ export function ContentWorkspace({
                     const displayName = m.original_name || m.id;
                     const mime = String(m.mime_type || "");
                     const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id];
+                    const isVideo = mime.startsWith("video/") && !brokenMediaIds[m.id];
                     const isAudio = mime.startsWith("audio/");
                     const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
                     const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE").toUpperCase();
@@ -4158,6 +4229,14 @@ export function ContentWorkspace({
                               loading="lazy"
                               decoding="async"
                               class={isSmallImg ? "is-small-img" : ""}
+                              onError={() => setBrokenMediaIds((prev) => ({ ...prev, [m.id]: true }))}
+                            />
+                          ) : isVideo ? (
+                            <video
+                              src={m.public_url}
+                              preload="metadata"
+                              muted
+                              playsInline
                               onError={() => setBrokenMediaIds((prev) => ({ ...prev, [m.id]: true }))}
                             />
                           ) : isAudio ? (
@@ -4255,6 +4334,7 @@ export function ContentWorkspace({
                         const displayName = m.original_name || m.id;
                         const mime = String(m.mime_type || "");
                         const isImage = mime.startsWith("image/") && !brokenMediaIds[m.id];
+                        const isVideo = mime.startsWith("video/") && !brokenMediaIds[m.id];
                         const isAudio = mime.startsWith("audio/");
                         const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
                         const extBadge = (displayName.split(".").pop() || mime.split("/").pop() || "FILE")
@@ -4290,6 +4370,15 @@ export function ContentWorkspace({
                                       loading="lazy"
                                       decoding="async"
                                       class={isSmallImg ? "is-small-img" : ""}
+                                      onError={() => setBrokenMediaIds((prev) => ({ ...prev, [m.id]: true }))}
+                                    />
+                                  ) : isVideo ? (
+                                    <video
+                                      src={m.public_url}
+                                      preload="metadata"
+                                      muted
+                                      playsInline
+                                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
                                       onError={() => setBrokenMediaIds((prev) => ({ ...prev, [m.id]: true }))}
                                     />
                                   ) : isAudio ? (
@@ -4443,6 +4532,14 @@ export function ContentWorkspace({
                     <img
                       src={previewAsset.public_url}
                       alt={previewAsset.alt_text || previewAsset.original_name}
+                      onError={() => setBrokenMediaIds((prev) => ({ ...prev, [previewAsset.id]: true }))}
+                    />
+                  ) : String(previewAsset.mime_type || "").startsWith("video/") && !brokenMediaIds[previewAsset.id] ? (
+                    <video
+                      controls
+                      preload="metadata"
+                      src={previewAsset.public_url}
+                      style={{ maxWidth: "100%", maxHeight: "56vh", borderRadius: "8px" }}
                       onError={() => setBrokenMediaIds((prev) => ({ ...prev, [previewAsset.id]: true }))}
                     />
                   ) : String(previewAsset.mime_type || "").startsWith("audio/") ? (

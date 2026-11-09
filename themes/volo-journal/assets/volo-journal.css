@@ -1,5 +1,7 @@
 /* Volo Journal — Scoped Serif Editorial Layer (zero global leakage) */
 html[data-volo-skin="volo-journal"] .studio-brand__title,
+html[data-volo-skin="volo-journal"] .err-brand__title,
+html[data-volo-skin="volo-journal"] .err-title,
 html[data-volo-skin="volo-journal"] .volo-prose,
 html[data-volo-skin="volo-journal"] .studio-article__title,
 html[data-volo-skin="volo-journal"] .article__title,
@@ -27,7 +29,9 @@ html[data-volo-skin="volo-journal"] .volo-prose :is(
   .volo-callout-header,
   .vc-meta,
   .vc-actions,
-  .vc-act-btn
+  .vc-act-btn,
+  .volo-comment-expand-btn,
+  .volo-comment-shielded
 ) {
   font-family: var(--volo-font-sans);
   letter-spacing: normal;
@@ -61,6 +65,27 @@ html[data-volo-skin="volo-journal"] :is(.vc-btn-danger, .volo-btn--danger) {
   background: var(--volo-danger-solid, #b42318);
   border-color: var(--volo-danger-solid, #b42318);
   color: var(--volo-on-danger, #ffffff);
+}
+
+html[data-volo-skin="volo-journal"] :is(.vc-content, .comment-body, .j-comment-body, .volo-cw-preview) img {
+  max-height: 240px;
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+}
+html[data-volo-skin="volo-journal"] :is(.vc-content, .comment-body, .j-comment-body, .volo-cw-preview) pre {
+  max-height: 200px;
+  overflow-y: auto;
+}
+html[data-volo-skin="volo-journal"] .volo-comment-shielded {
+  margin: 4px 0 !important;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px dashed var(--volo-line);
+  background: color-mix(in srgb, var(--volo-raised) 74%, var(--volo-surface));
+  color: var(--volo-muted);
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 /* Unified 1180px Shell Alignment across Header, Main, Masthead & Footer */
@@ -117,6 +142,13 @@ html[data-volo-skin="volo-journal"] .journal-masthead__title {
   font-weight: 700;
   line-height: 1.3;
   color: var(--volo-text);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+html[data-volo-skin="volo-journal"] .journal-card__title,
+html[data-volo-skin="volo-journal"] .article__title {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 html[data-volo-skin="volo-journal"] .journal-masthead__motto {
   margin: 8px auto 0;

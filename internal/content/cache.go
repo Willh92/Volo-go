@@ -34,14 +34,16 @@ type redirectEntry struct {
 }
 
 type redirectTableSnapshot struct {
-	dataRev uint64
-	rules   map[string]redirectEntry
+	dataRev     uint64
+	settingsRev uint64
+	rules       map[string]redirectEntry
 }
 
 type publicChromeSnapshot struct {
 	dataRev            uint64
 	settingsRev        uint64
 	sanitizerHash      string
+	defaultLocale      string
 	rawNavItems        []domain.NavItem
 	categories         []CategoryWithCount
 	catsByID           map[string]domain.Category
@@ -54,9 +56,15 @@ type publicChromeSnapshot struct {
 	authors            []PublicAuthorProfile
 	authorsByID        map[string]PublicAuthorProfile
 	stats              PublicSiteStats
+	recentRaw          []domain.RawArticle
+	mostViewedRaw      []domain.RawArticle
+	mostCommentedRaw   []domain.RawArticle
+	tagsByArt          map[string][]domain.Tag
 	recentCards        []visibility.PublicArticleCard
 	mostViewedCards    []visibility.PublicArticleCard
 	mostCommentedCards []visibility.PublicArticleCard
+	cardsMu            sync.RWMutex
+	cardsByLocale      map[string][3][]visibility.PublicArticleCard
 }
 
 // CachedDocument holds a revision-coherent public XML/Markdown distribution document
@@ -206,7 +214,7 @@ func (s *Service) currentSanitizerHash() string {
 	return s.plugins.Providers().SanitizerStateHash()
 }
 
-// PurgeRuntimeCaches clears in-memory redirect, chrome, feed, article HTML, comment HTML, and visibility render caches.
+// PurgeRuntimeCaches clears in-memory redirect, chrome, feed, article HTML, comment HTML, book chapter, and visibility render caches.
 func (s *Service) PurgeRuntimeCaches() {
 	if s == nil {
 		return
@@ -231,14 +239,18 @@ func (s *Service) PurgeRuntimeCaches() {
 	clear(s.commentHTMLCurr)
 	clear(s.commentHTMLPrev)
 	s.commentHTMLMu.Unlock()
+	s.bookChapterMu.Lock()
+	clear(s.bookChapterCache)
+	s.bookChapterMu.Unlock()
+	s.kwFilter.Store(nil)
 	if s.guard != nil {
 		s.guard.PurgeCache()
 	}
 }
 
 func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapshot, error) {
-	curRev := s.store.DataRevision()
-	if snap := s.caches.redirects.Load(); snap != nil && snap.dataRev == curRev {
+	curRev, curSettingsRev := s.currentRevisions()
+	if snap := s.caches.redirects.Load(); snap != nil && snap.dataRev == curRev && snap.settingsRev == curSettingsRev {
 		return snap, nil
 	}
 
@@ -251,7 +263,7 @@ func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapsh
 	}
 	var legacyArts []domain.RawArticle
 	err = sqlx.SelectInto(ctx, s.store, &legacyArts,
-		`SELECT slug, legacy_permalink FROM articles WHERE legacy_permalink <> '' AND status = ?`,
+		`SELECT slug, published_at, legacy_permalink FROM articles WHERE legacy_permalink <> '' AND status = ?`,
 		domain.ArticleStatusPublished,
 	)
 	if err != nil {
@@ -262,7 +274,7 @@ func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapsh
 	// Populate legacy permalinks first so explicit `redirects` table overrides win on conflict.
 	for _, a := range legacyArts {
 		src := strings.TrimSpace(a.LegacyPermalink)
-		dest := visibility.ArticlePath(a.Slug)
+		dest := s.guard.ArticleURL(a)
 		if src != "" && a.Slug != "" && src != dest {
 			rules[src] = redirectEntry{
 				targetPath: dest,
@@ -273,23 +285,23 @@ func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapsh
 	for _, r := range rulesRows {
 		src := strings.TrimSpace(r.SourcePath)
 		dest := strings.TrimSpace(r.TargetPath)
-		if src == "" || dest == "" || src == dest {
-			continue
-		}
-		code := r.StatusCode
-		if code != http.StatusMovedPermanently && code != http.StatusFound {
-			code = http.StatusMovedPermanently
-		}
-		rules[src] = redirectEntry{
-			id:         r.ID,
-			targetPath: dest,
-			statusCode: code,
+		if src != "" && dest != "" && src != dest {
+			code := r.StatusCode
+			if code != http.StatusMovedPermanently && code != http.StatusFound {
+				code = http.StatusMovedPermanently
+			}
+			rules[src] = redirectEntry{
+				id:         r.ID,
+				targetPath: dest,
+				statusCode: code,
+			}
 		}
 	}
 
 	next := &redirectTableSnapshot{
-		dataRev: curRev,
-		rules:   rules,
+		dataRev:     curRev,
+		settingsRev: curSettingsRev,
+		rules:       rules,
 	}
 	s.caches.redirects.Store(next)
 	return next, nil
@@ -373,7 +385,7 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 			defaultLoc = loc
 		}
 	}
-	buildSnapshotCards := func(src []domain.RawArticle) []visibility.PublicArticleCard {
+	buildSnapshotCards := func(src []domain.RawArticle, loc string) []visibility.PublicArticleCard {
 		cards := make([]visibility.PublicArticleCard, 0, len(src))
 		for _, r := range src {
 			var catPtr *domain.Category
@@ -381,7 +393,7 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 				cCopy := c
 				catPtr = &cCopy
 			}
-			card := s.guard.ToCard(r, defaultLoc, catPtr, tagsByArt[r.ID], s.LookupMediaDims)
+			card := s.guard.ToCard(r, loc, catPtr, tagsByArt[r.ID], s.LookupMediaDims)
 			if au, ok := authorsByID[r.AuthorID]; ok {
 				card.AuthorName = au.DisplayName
 				card.AuthorAvatarURL = au.AvatarURL
@@ -393,11 +405,17 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 		}
 		return cards
 	}
+	defaultTriple := [3][]visibility.PublicArticleCard{
+		buildSnapshotCards(recentRaw, defaultLoc),
+		buildSnapshotCards(mostViewedRaw, defaultLoc),
+		buildSnapshotCards(mostCommentedRaw, defaultLoc),
+	}
 
 	next := &publicChromeSnapshot{
 		dataRev:            dRev,
 		settingsRev:        sRev,
 		sanitizerHash:      s.currentSanitizerHash(),
+		defaultLocale:      defaultLoc,
 		rawNavItems:        navRows,
 		categories:         cats,
 		catsByID:           catsByID,
@@ -410,12 +428,73 @@ func (s *Service) getChromeSnapshot(ctx context.Context) (*publicChromeSnapshot,
 		authors:            authors,
 		authorsByID:        authorsByID,
 		stats:              stats,
-		recentCards:        buildSnapshotCards(recentRaw),
-		mostViewedCards:    buildSnapshotCards(mostViewedRaw),
-		mostCommentedCards: buildSnapshotCards(mostCommentedRaw),
+		recentRaw:          recentRaw,
+		mostViewedRaw:      mostViewedRaw,
+		mostCommentedRaw:   mostCommentedRaw,
+		tagsByArt:          tagsByArt,
+		recentCards:        defaultTriple[0],
+		mostViewedCards:    defaultTriple[1],
+		mostCommentedCards: defaultTriple[2],
+		cardsByLocale: map[string][3][]visibility.PublicArticleCard{
+			defaultLoc: defaultTriple,
+		},
 	}
 	s.caches.chrome.Store(next)
 	return next, nil
+}
+
+func (s *Service) chromeCardsForLocale(snap *publicChromeSnapshot, locale string) [3][]visibility.PublicArticleCard {
+	if snap == nil {
+		return [3][]visibility.PublicArticleCard{}
+	}
+	loc := strings.TrimSpace(locale)
+	if loc == "" {
+		loc = snap.defaultLocale
+	}
+	if loc == snap.defaultLocale {
+		return [3][]visibility.PublicArticleCard{snap.recentCards, snap.mostViewedCards, snap.mostCommentedCards}
+	}
+	snap.cardsMu.RLock()
+	if hit, ok := snap.cardsByLocale[loc]; ok {
+		snap.cardsMu.RUnlock()
+		return hit
+	}
+	snap.cardsMu.RUnlock()
+
+	buildFor := func(src []domain.RawArticle) []visibility.PublicArticleCard {
+		cards := make([]visibility.PublicArticleCard, 0, len(src))
+		for _, r := range src {
+			var catPtr *domain.Category
+			if c, ok := snap.catsByID[r.CategoryID]; ok {
+				cCopy := c
+				catPtr = &cCopy
+			}
+			card := s.guard.ToCard(r, loc, catPtr, snap.tagsByArt[r.ID], s.LookupMediaDims)
+			if au, ok := snap.authorsByID[r.AuthorID]; ok {
+				card.AuthorName = au.DisplayName
+				card.AuthorAvatarURL = au.AvatarURL
+			} else if snap.owner.DisplayName != "" {
+				card.AuthorName = snap.owner.DisplayName
+				card.AuthorAvatarURL = snap.owner.AvatarURL
+			}
+			cards = append(cards, card)
+		}
+		return cards
+	}
+	triple := [3][]visibility.PublicArticleCard{
+		buildFor(snap.recentRaw),
+		buildFor(snap.mostViewedRaw),
+		buildFor(snap.mostCommentedRaw),
+	}
+	snap.cardsMu.Lock()
+	if snap.cardsByLocale == nil {
+		snap.cardsByLocale = make(map[string][3][]visibility.PublicArticleCard, 4)
+	}
+	if len(snap.cardsByLocale) < 8 {
+		snap.cardsByLocale[loc] = triple
+	}
+	snap.cardsMu.Unlock()
+	return triple
 }
 
 func (s *Service) getOrBuildCachedDoc(

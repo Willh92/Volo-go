@@ -14,7 +14,7 @@
 | :--- | :--- | :--- |
 | `--env-file <path>` | `VOLO_ENV_FILE` | 指定 `.env` 配置文件路径（默认 `./.env`） |
 | `--listen-addr <host:port>` | `VOLO_LISTEN_ADDR` | TCP 监听地址（默认 `0.0.0.0:8080`，与 `--listen-socket` 互斥） |
-| `--listen-socket <path[,mode]>` | `VOLO_LISTEN_SOCKET` | Unix Domain Socket 路径（可选附带八进制权限后缀，如 `/run/volo/volo.sock,0660`） |
+| `--listen-socket <path[,mode]>`（别名 `--unix-socket`） | `VOLO_LISTEN_SOCKET` | Unix Domain Socket 路径（可选附带八进制权限后缀，如 `/run/volo/volo.sock,0660`） |
 | `--socket-mode <octal>` / `--socket-group <group>` | `VOLO_SOCKET_MODE` / `VOLO_SOCKET_GROUP` | Unix Socket 权限掩码（默认 `0660`）与所属用户组（如 `www-data`、`nginx`） |
 | `--public-url <url>` | `VOLO_PUBLIC_URL` | 站点规范公网根地址（用于 Canonical、RSS/Podcast、Sitemap、WebAuthn Origin 与邮件链接） |
 | `--trusted-proxies <cidrs\|unix>` | `VOLO_TRUSTED_PROXIES` | 受信反向代理 IP/CIDR 列表或 `unix`（默认 `127.0.0.1,::1`） |
@@ -31,7 +31,7 @@
 
 ### 1.1 `volo serve`（默认命令）
 
-启动 HTTP 或 Unix Domain Socket 服务，自动执行幂等数据库 Schema 迁移（`v7`）、预热全文检索索引与只读元数据快照，启动定时文章发布器、插件 Cron 调度器与滚动备份调度器，并监听 `SIGINT` / `SIGTERM` 执行优雅停机（排空在途请求 + 确定性刷盘异步阅读计数）。
+启动 HTTP 或 Unix Domain Socket 服务，自动执行幂等数据库 Schema 迁移（`v8`）、预热全文检索索引与只读元数据快照，启动定时文章发布器、插件 Cron 调度器与滚动备份调度器，并监听 `SIGINT` / `SIGTERM` 执行优雅停机（排空在途请求 + 确定性刷盘异步阅读与插件 KV 计数）。
 
 ```bash
 # 零配置启动（默认监听 0.0.0.0:8080，自动初始化 ./data/volo.db）
@@ -116,7 +116,7 @@
 # 输出机器可读 JSON（非健康状态退出码为 1，适合 CI / 监控采集）
 ./volo doctor --json
 
-# 探测运行中实例的 /healthz（未指定 --url 时自动根据配置探测本地 TCP 端口或 Unix Domain Socket http://unix/healthz）
+# 探测运行中实例的 /healthz（只读零副作用：不创建 .secret.key；自动根据配置探测 TCP 或 Unix Socket http://unix/healthz）
 ./volo healthcheck
 ./volo healthcheck --url http://127.0.0.1:8080/healthz
 
@@ -131,7 +131,7 @@
 在管理台 **「系统与安全 -> 账户与安全 -> API 令牌」** 中可签发带过期时间与最小权限 Scope 的个人访问令牌。
 
 - 数据库仅存储令牌的 `SHA-256` 摘要（`token_hash`）与前 12 位展示前缀（`token_prefix`），明文仅在创建时显示一次；
-- 使用 `Authorization: Bearer volo_pat_<secret>` 请求 `/api/admin/*` 接口时自动走无状态鉴权，无需携带浏览器 Session Cookie 或 `X-CSRF-Token`。
+- 使用 `Authorization: Bearer volo_pat_<secret>` 请求 `/api/admin/*` 接口时自动走无状态鉴权，无需携带浏览器 Session Cookie 或 `X-CSRF-Token`（浏览器管理台会话引导 `GET /api/admin/me` 则需附带 `X-Volo-Console: 1` 请求头获取 CSRF 令牌）。
 
 ### 2.1 权限范围（Scopes）对照表
 
@@ -143,7 +143,7 @@
 | `media:write` | 上传媒体资源（自动剥离 GPS EXIF、摆正方向并自适应编码 WebP） | PicGo / ShareX / uPic 图床直传 |
 | `backup:read` | 流式下载全站备份包（`GET /api/admin/backups/export`） | 异地定时拉取加密冷备脚本 |
 
-> **安全边界**：系统设置热更新（`PATCH /api/admin/settings/{domain}`）、用户权限变更、WAF 封禁及插件安装/导出（`POST /api/admin/plugins/install`、`GET /api/admin/plugins/{id}/export`）等高危管理操作**强制要求交互式管理员会话（含 2FA 策略校验）**，任何 API Token 均无法越权调用。
+> **安全边界**：系统设置热更新（`PATCH /api/admin/settings/{domain}`）、用户封禁/禁言/角色变更（`PATCH /api/admin/users`）、WAF 封禁及插件安装/导出等高危管理操作**强制要求交互式管理员会话（含 2FA 策略校验）**，任何 API Token 均无法越权调用。
 
 ### 2.2 `curl` / Obsidian 发布与更新文章示例（`articles:write`）
 
@@ -201,38 +201,46 @@ curl -X POST "${VOLO_URL}/api/admin/media/upload" \
 }
 ```
 
-### 2.4 分类/书架批量重排、插件链式优先级编排与定时调度管理接口
+### 2.4 账户封禁/禁言治理、分类/书架批量重排与插件链式编排接口
 
-除常规 CRUD 外，管理端提供以下高频编排与生态分发接口：
-
-- **`POST /api/admin/categories/reorder`** 与 **`POST /api/admin/books/reorder`**：按传入 ID 顺序单事务批量重排分类或书架项目的 `sort_order`：
-  ```bash
-  curl -X POST "${VOLO_URL}/api/admin/categories/reorder" \
-    -H "Authorization: Bearer ${VOLO_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d '{"ids": ["0196ed8c01", "0196ed8c02", "0196ed8c03"]}'
-  ```
-- **`POST /api/admin/plugins/reorder`** 与 **`PATCH /api/admin/plugins/{id}/priority`**（需交互式管理员会话）：编排插件链式执行顺序或精确设置单个插件的 `priority` 数值（范围 `-10000`–`10000`，数值越小越先执行，决定所有 `before_*` 拦截钩子、生命周期事件、UI 插槽及同类型 `Provider` 的确定性执行顺序）。
-- **`GET /api/admin/plugins/cron`** 与 **`POST /api/admin/plugins/{id}/trigger-cron`**（需交互式管理员会话）：查看各插件后台 `CronRegistry` 定时任务运行统计（上次执行耗时、下次触发时间、最近错误）或立即异步手动触发指定任务。
-- **`GET /api/admin/plugins/{id}/export`**（需交互式管理员会话）：将已安装插件目录打包导出为纯净 `.zip` 归档（自动剔除运行态临时文件与数据库内的 `secret_ciphertext` 机密值，安全用于跨站迁移或二次分发），配套 `POST /api/admin/plugins/install?overwrite=true` 支持保留配置与机密字段的原地热升级。
+- **`GET /api/admin/users`** 与 **`PATCH /api/admin/users`**（需交互式管理员会话）：类 Discourse 账户治理接口，支持动作 `action: "ban" | "unban" | "mute" | "unmute" | "shield"`、时长 `duration_hours`（`0` 表示永久，`> 0` 按小时计算到期自动恢复）、原因 `reason`、是否屏蔽历史评论 `shield_comments` 及自定义替换文案 `shield_text`（解封或到期后历史评论立即无损恢复）。
+- **`POST /api/admin/categories/reorder`** 与 **`POST /api/admin/books/reorder`**：按传入 ID 顺序单事务批量重排分类或书架项目的 `sort_order`。
+- **`POST /api/admin/plugins/reorder`** 与 **`PATCH /api/admin/plugins/{id}/priority`**（需交互式管理员会话）：编排插件链式执行顺序或精确设置 `priority` 数值（`-1000`–`10000`）。
+- **`GET /api/admin/plugins/cron`**、**`POST /api/admin/plugins/{id}/trigger-cron`** 与 **`GET /api/admin/plugins/{id}/export`**。
 
 ---
 
-## 3. 前台公开接口与机器可读订阅端点
+## 3. 实时无损图片变换参数参考（`/uploads/...?...`）
+
+访问站内上传图片时，不带参数即零开销直出原图；附带参数时支持 **七牛云原生路径式语法**（如 `?imageView2/1/w/960/h/540/format/webp/q/85/interlace/1/strip/ignore-error/1`）与 **标准键值对查询语法**（如 `?mode=1&w=960&h=540&format=webp&interlace=1&q=85&colors=128&strip&ignore-error=1`）任意组合，**全程绝不改动原图**，并通过 `singleflight` + `8 MiB` 内存 LRU + 强 `ETag` / `304` 高速分发（孤儿媒体扫描与 CLS 尺寸推导均自动兼容带参 URL）：
+
+| 参数 | 含义 | 取值范围 / 说明 |
+| :--- | :--- | :--- |
+| `mode` | 缩放裁剪模式 | `0`（长边 `w` 短边 `h` 等比内缩）、`1`（居中裁剪 `w×h`）、`2`（限定最大宽高 `w×h` 等比内缩）、`3`（限定最小宽高 `w×h` 等比外扩）、`4`（长边短边等比内缩并补边）、`5`（长边短边等比外扩居中裁剪） |
+| `w` / `h` | 宽度或长边 / 高度或短边 | `1`–`4096`（像素，单图乘积受安全上限保护） |
+| `format` | 输出图片格式 | `jpg`（`jpeg`）、`png`、`webp`、`avif`（纯 Go 环境请求 `avif` 自动无损回退输出 `image/webp` 并附带 `X-Volo-Format-Fallback: avif->webp`） |
+| `interlace` | 渐进显示 | `0`、`1` |
+| `q` | 编码质量 | `1`–`100`（默认 `85`） |
+| `colors` | GIF/PNG 调色板颜色数量 | `2`–`256` 指定颜色档位量化 |
+| `strip` / `meta-keep-list` | 元数据剥离控制 | 默认重编码自动剥离元数据（保护隐私） |
+| `ignore-error` | 异常容错回退 | `0`、`1`（设为 `1` 时若参数越界或非光栅图直接安全直出原图，不返回 `400`） |
+
+---
+
+## 4. 前台公开接口与机器可读订阅端点
 
 | 路径 | 方法 | 说明 |
 | :--- | :--- | :--- |
-| `/healthz` | `GET` / `HEAD` | 存活与数据库只读探针：正常返回 `200` `{"status":"ok","database":"ok","uptime_sec":120}`；数据库异常返回 `503` `{"status":"degraded","database":"unavailable","uptime_sec":120}` |
-| `/rss.xml` / `/atom.xml` | `GET` | 标准 RSS 2.0 与 Atom 1.0 订阅源（支持强 `ETag` / `304`，自动脱敏加密文章与 `:::lock` 块） |
-| `/podcast.xml` | `GET` | Apple Podcasts / Spotify 兼容 iTunes 播客订阅源 |
-| `/sitemap.xml` / `/robots.txt` | `GET` | 搜索引擎 XML 站点地图（含多语言 `hreflang`；当公开 URL 总数 `<= 10,000` 时直接返回 `<urlset>`，**超过 `10,000` 条时自动分片输出 `<sitemapindex>` 并托管 `/sitemap-1.xml`、`/sitemap-2.xml` 等子分片**）与爬虫协议（启用自定义隐身管理台路径时自动隐藏后台 `Disallow` 条目） |
-| `/llms.txt` / `/llms-full.txt` | `GET` | AI 大语言模型结构化索引与公开语料汇总（可于订阅设置 `feed.enable_llms_txt` 一键关闭） |
-| `/posts/{slug}.md` | `GET` | 单篇公开文章的纯净原始 Markdown 视图（受 `feed.enable_raw_markdown` 控制，密码锁文章未授权返回 `403`） |
-| `/api/v1/search?q=<kw>&page=<n>` | `GET` | 二阶段毫秒级分页全文检索（支持 `q` 关键词与 `page` 页码参数，返回高亮摘要片段 `hits` 与分页元数据，100% 剥离密码文章与 `:::lock` 内容） |
+| `/healthz` | `GET` / `HEAD` | 存活与数据库只读探针：正常返回 `200` `{"status":"ok","database":"ok","uptime_sec":120}`；异常返回 `503` |
+| `/rss.xml` / `/atom.xml` / `/podcast.xml` | `GET` | RSS 2.0、Atom 1.0 与 Apple/Spotify iTunes 播客源（共享 `feed.item_count`，强 `ETag` / `304`，脱敏加密内容） |
+| `/sitemap.xml` / `/robots.txt` | `GET` | XML 站点地图（超 `10,000` 条自动分片 `<sitemapindex>`）与爬虫协议（自定义隐身后台时自动隐藏 `Disallow`） |
+| `/llms.txt` / `/llms-full.txt` | `GET` | AI 结构化索引与公开语料汇总（受 `feed.enable_llms_txt` 控制） |
+| `/posts/{slug}.md`（及 `/archives/{slug}.md`、`/p/{slug}.md`、`/{year}/{month}/{slug}.md`） | `GET` | 单篇公开文章原始 Markdown 视图（随 `seo.post_permalink_style` 同步生效，受 `feed.enable_raw_markdown` 控制） |
+| `/api/v1/search?q=<kw>&page=<n>` | `GET` | 二阶段毫秒级分页全文检索（100% 剥离密码文章与 `:::lock` 内容） |
 | `/api/v1/i18n/{locale}` | `GET` | 获取合并自定义覆盖词条后的前端多语言字典包（支持 `ETag` 缓存协商） |
-| `/api/v1/pow/challenge` | `GET` | 获取无第三方依赖的 `HMAC + SHA-256` 工作量证明挑战令牌 |
-| `/api/v1/guest/passport` | `GET` / `POST` | 签发或自愈刷新三端持久游客签名通行证（`__volo_gp`） |
-| `/api/v1/reader/profile` | `PATCH` | 已登录读者自助更新显示昵称、头像与个人简介（自动经过宿主屏蔽词表、`provider:antispam` 插件与 `user.before_update_profile` 链式拦截校验） |
+| `/api/v1/pow/challenge` / `/api/v1/guest/passport` | `GET` / `POST` | 工作量证明挑战令牌与三端自愈游客通行证（`__volo_gp`） |
+| `/api/v1/reader/profile` | `PATCH` | 已登录读者更新昵称、头像与简介（经宿主屏蔽词、`provider:antispam` 与 `user.before_update_profile` 并集校验） |
 | `/api/v1/articles/{id}/unlock` | `POST` | 校验文章或独立页面（`page:<id>`）阅读口令并下发限定作用域的解锁凭证 |
-| `/api/v1/comments` | `GET` / `POST` | 分页查询文章/页面评论树或提交经 PoW 校验与反垃圾链式审查的新评论 |
-| `/api/v1/reactions` | `POST` | 文章与评论轻量表情互动计数 |
+| `/api/v1/comments` | `GET` / `POST` | 查询评论树（同步下发当前身份 `comment_min_length` / `comment_max_length` / `comment_max_lines` / `viewer_muted` 状态及被屏蔽账户占位渲染）或发表新评论 |
+| `/api/v1/comments/preview` | `POST` | 前台评论框实时 Markdown 预览接口（套用与入库完全一致的 HTML5 AST 白名单净化与防刷屏高度折叠规则） |
+| `/api/v1/reactions` | `POST` | 文章与评论轻量表情互动计数（禁言/封禁账户自动拦截） |

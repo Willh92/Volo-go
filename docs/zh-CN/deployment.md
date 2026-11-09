@@ -2,7 +2,7 @@
 
 > English version: [Deployment & OS Service Installers](../en-US/deployment.md)
 
-`Volo-go` 基于 Go `1.27.3`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（`linux/amd64` `< 20 MiB`，全平台 `< 21 MiB`），官方原生构建并支持 **6 大静态发布目标架构**：
+`Volo-go` 基于 Go `1.27.3`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（**全部 6 大静态发布目标架构均严格 `< 20 MiB`**，`linux/amd64` `~19.1 MiB`）：
 - **Linux**: `linux/amd64`、`linux/arm64`（支持 `systemd` 系统/用户级与 `OpenRC`）
 - **macOS**: `darwin/amd64`、`darwin/arm64`（支持 `launchd` `LaunchDaemon` / `LaunchAgent`）
 - **Windows**: `windows/amd64`、`windows/arm64`（支持 `svc_windows.go` 原生 `sc.exe` Windows Service、`NSSM` 与系统计划任务）
@@ -28,7 +28,7 @@
 | :--- | :--- | :--- | :--- |
 | `VOLO_ENV_FILE` | `--env-file` | `.env` | `.env` 配置文件路径（服务模式下通常为 `/etc/volo/volo.env`） |
 | `VOLO_LISTEN_ADDR` | `--listen-addr` | `0.0.0.0:8080` | TCP 监听地址（本机反代部署推荐设为 `127.0.0.1:8080`） |
-| `VOLO_LISTEN_SOCKET` | `--listen-socket` | *(空)* | Unix Domain Socket 路径（支持 `/run/volo/volo.sock` 或 `/run/volo/volo.sock,0660`；启用后自动关闭 TCP 监听并加 `.sock.lock` 文件锁） |
+| `VOLO_LISTEN_SOCKET` | `--listen-socket`（别名 `--unix-socket`） | *(空)* | Unix Domain Socket 路径（支持 `/run/volo/volo.sock` 或 `/run/volo/volo.sock,0660`；自动校验父目录真实路径、拒绝符号链接并加 `.sock.lock` 锁） |
 | `VOLO_SOCKET_MODE` | `--socket-mode` | `0660` | Unix Domain Socket 八进制权限位 |
 | `VOLO_SOCKET_GROUP` | `--socket-group` | *(空)* | Unix Domain Socket 所属系统用户组（如 Debian/Ubuntu 的 `www-data` 或 RHEL 的 `nginx`） |
 | `VOLO_PUBLIC_URL` | `--public-url` | `http://localhost:8080` | 站点规范公开 URL（用于 Canonical、RSS/Podcast、Sitemap、WebAuthn Origin 与邮件链接） |
@@ -57,8 +57,9 @@
 ## 2. Linux 系统服务安装与自动回滚在线升级（`systemd` 与 `OpenRC`）
 
 仓库内置跨平台服务管理脚本 [`scripts/install-service.sh`](../../scripts/install-service.sh)（同时保留 `install-service-linux.sh` / `install-service-macos.sh` 兼容入口）：
-- **安全自动备份与探活失败自动回滚**：执行 `upgrade`（或 `update`）时，脚本会自动先调用 `volo backup create` 创建升级前数据库快照（可通过 `--skip-backup` 跳过）、将旧版可执行文件备份为 `volo.bak`、强制校验 `SHA256SUMS.txt` 并重启服务，随后调用 `volo healthcheck` 探测 `/healthz`——**一旦新版本启动或健康检查失败，立即自动还原 `volo.bak` 并恢复原服务运行**；
-- **全平台原生适配**：支持 `systemd` 系统级（`ExecStart=/usr/local/bin/volo serve --env-file /etc/volo/volo.env`）、`--user-mode` 非 root 用户级服务，以及 Alpine / Gentoo `OpenRC`（守护进程 PID 文件位于 `/run/volo/volo.pid`）。
+- **二进制与数据路径最小权限物理分离**：支持独立自定义 `--user`、`--group`、`--bin-dir`（或 `--prefix`）与 `--data-dir`，默认将可执行文件固定为 `root:root 0755` 只读保护，同时将数据目录收紧为 `volo:volo 0750`；
+- **安全自动备份与探活失败自动回滚**：执行 `upgrade`（或 `update`）时，脚本会自动调用 `volo backup create` 创建升级前数据库快照并校准文件属主（可通过 `--skip-backup` 跳过）、将旧版二进制备份为 `volo.bak`、支持 `--mirror` 不可达自动回退官方 GitHub 源、强制校验 `SHA256SUMS.txt`，重启后运行只读 `volo healthcheck`——**一旦探活失败，立即自动还原 `volo.bak` 并恢复原服务**；
+- **全平台原生适配**：支持 `systemd` 系统级（内置 `RuntimeDirectory=volo` 与动态 `ProtectHome`/`PrivateTmp` 计算）、`--user-mode` 非 root 用户级服务，以及 Alpine / Gentoo `OpenRC`。
 
 ### 2.1 一键安装、Unix Socket 模式与带回滚保障的在线更新
 
@@ -71,8 +72,11 @@ sudo ./scripts/install-service.sh upgrade
 # 如已自行完成外部快照，可传 --skip-backup 跳过升级前备份，或通过 --mirror 指定下载镜像加速：
 sudo ./scripts/install-service.sh upgrade --skip-backup --mirror https://ghfast.top
 
-# 配合本机 Nginx 的零 TCP 开销 Unix Domain Socket 模式（/var/lib/volo 与 /etc/volo/volo.env 仍严格归属 volo:volo）
+# 配合本机 Nginx 的零 TCP 开销 Unix Domain Socket 模式（支持自定义 --bin-dir 与 --data-dir 分离部署）
 sudo ./scripts/install-service.sh install \
+  --user volo --group volo \
+  --bin-dir /usr/local/bin \
+  --data-dir /var/lib/volo \
   --unix-socket /run/volo/volo.sock \
   --socket-mode 0660 \
   --socket-group www-data \
@@ -84,8 +88,8 @@ sudo ./scripts/install-service.sh install \
 
 ### 2.2 `systemd` 沙箱加固与自定义外部目录（`ReadWritePaths` 覆盖说明）
 
-官方 [`deploy/systemd/volo.service`](../../deploy/systemd/volo.service) 默认开启 `ProtectSystem=strict`、`ProtectHome=true` 与 `ReadWritePaths=/var/lib/volo /run/volo` 内核级只读沙箱保护。
-如果您在 `.env` 或管理台中将 `upload_dir`（`storage.local_dir`）、`geoip_dir`（`security.geoip_dir`）、`VOLO_BACKUP_DIR`、`VOLO_THEMES_DIR` 或 `VOLO_PLUGINS_DIR` 指向了 `/var/lib/volo` 之外的自定义路径，请通过 `systemd` drop-in 覆盖文件授予读写权限（无需直接改动主单元文件）：
+官方 [`deploy/systemd/volo.service`](../../deploy/systemd/volo.service) 默认开启 `ProtectSystem=strict`、`RuntimeDirectory=volo` 与 `ReadWritePaths=/var/lib/volo /run/volo` 内核级只读沙箱保护（安装脚本在自定义 `--data-dir` 或 `--unix-socket` 位于 `/home`、`/tmp` 时会自动调整沙箱指令并写入 `tmpfiles.d` 规则）。
+如果您后续在管理台中将 `upload_dir`（`storage.local_dir`）或 `geoip_dir`（`security.geoip_dir`）热切换至 `/var/lib/volo` 之外的目录，可通过 `systemd` drop-in 覆盖文件授予读写权限：
 
 ```bash
 sudo systemctl edit volo
@@ -102,7 +106,7 @@ ReadWritePaths=/custom/uploads /custom/geoip
 
 ### 2.3 `OpenRC` 服务说明与生命周期命令
 
-Alpine Linux / Gentoo 模板位于 [`deploy/openrc/volo.initd`](../../deploy/openrc/volo.initd)，通过 `command_args="serve --env-file /etc/volo/volo.env"` 与 `pidfile="/run/volo/volo.pid"` 托管后台守护进程（启动前自动创建 `0755` `/run/volo` 与 `0750` `/var/lib/volo`、`/var/log/volo`）。
+Alpine Linux / Gentoo 模板位于 [`deploy/openrc/volo.initd`](../../deploy/openrc/volo.initd)，内置零 Shell 执行风险的 `load_volo_env()` 纯键值环境解析器，通过 `command_args="serve --env-file /etc/volo/volo.env"` 与 `pidfile="/run/volo/volo.pid"` 安全托管后台守护进程。
 
 ```bash
 sudo ./scripts/install-service.sh status      # 查看运行状态

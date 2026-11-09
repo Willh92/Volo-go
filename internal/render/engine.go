@@ -196,10 +196,11 @@ func (e *Engine) SanitizeHTML(rawHTML string) string {
 // WITHOUT raw HTML passthrough, WITHOUT footnotes (preventing #fn:1 collisions), and WITHOUT
 // id, input, button, audio, source, tabindex, or data-* attributes.
 func (e *Engine) RenderComment(markdown string) string {
-	if strings.TrimSpace(markdown) == "" {
+	compacted := CompactCommentMarkdown(markdown)
+	if compacted == "" {
 		return ""
 	}
-	mdClean, codeSlots := preprocessCommentCodeBlocks(markdown)
+	mdClean, codeSlots := preprocessCommentCodeBlocks(compacted)
 	var rawBuf bytes.Buffer
 	_ = e.ensureCommentMarkdown().Convert([]byte(mdClean), &rawBuf)
 	rendered := rawBuf.String()
@@ -209,6 +210,213 @@ func (e *Engine) RenderComment(markdown string) string {
 	}
 	rendered = wrapTablesInScroll(rendered)
 	return e.ensureCommentSanitizer().Sanitize(rendered)
+}
+
+func isInvisibleCommentFillerRune(r rune) bool {
+	if unicode.IsSpace(r) {
+		return true
+	}
+	switch r {
+	case '\u180e', '\u200b', '\u200c', '\u200d', '\u200e', '\u200f',
+		'\u2060', '\u2800', '\u3164', '\ufeff', '\uffa0':
+		return true
+	default:
+		return false
+	}
+}
+
+func trimCommentInvisibleFillers(s string) string {
+	return strings.TrimFunc(s, isInvisibleCommentFillerRune)
+}
+
+func isCommentFenceMarker(trimmed string) (byte, int, bool) {
+	if len(trimmed) < 3 {
+		return 0, 0, false
+	}
+	ch := trimmed[0]
+	if ch != '`' && ch != '~' {
+		return 0, 0, false
+	}
+	n := 0
+	for n < len(trimmed) && trimmed[n] == ch {
+		n++
+	}
+	if n < 3 {
+		return 0, 0, false
+	}
+	return ch, n, true
+}
+
+func isCommentThematicBreak(trimmed string) bool {
+	if len(trimmed) < 3 {
+		return false
+	}
+	var marker rune
+	count := 0
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		if r != '-' && r != '*' && r != '_' {
+			return false
+		}
+		if marker == 0 {
+			marker = r
+		} else if r != marker {
+			return false
+		}
+		count++
+	}
+	return count >= 3
+}
+
+func isCommentEmptyListMarker(trimmed string) bool {
+	if trimmed == "-" || trimmed == "*" || trimmed == "+" {
+		return true
+	}
+	i := 0
+	for i < len(trimmed) && trimmed[i] >= '0' && trimmed[i] <= '9' && i < 9 {
+		i++
+	}
+	return i > 0 && i == len(trimmed)-1 && (trimmed[i] == '.' || trimmed[i] == ')')
+}
+
+func isCommentEmptyBlockquote(line string) bool {
+	s := trimCommentInvisibleFillers(line)
+	if !strings.HasPrefix(s, ">") {
+		return false
+	}
+	for _, r := range s {
+		if r != '>' && !isInvisibleCommentFillerRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// CompactCommentMarkdown normalizes untrusted comment Markdown to prevent vertical-height bombing:
+// - Normalizes CRLF/CR/VT/FF/NEL/LS/PS line separators to '\n';
+// - Caps Zalgo combining-mark towers to at most 3 combining marks per base rune;
+// - Collapses invisible filler lines (Braille blank, Hangul filler, ZWSP, lone '\' hard breaks, empty list markers)
+//   and 3+ consecutive newlines into at most a single blank paragraph separator;
+// - Deduplicates consecutive empty blockquote lines and consecutive thematic breaks (`---`).
+func CompactCommentMarkdown(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	var norm strings.Builder
+	norm.Grow(len(raw))
+	combRun := 0
+	prevCR := false
+	for _, r := range raw {
+		if r == '\r' {
+			norm.WriteByte('\n')
+			prevCR = true
+			combRun = 0
+			continue
+		}
+		if r == '\n' {
+			if !prevCR {
+				norm.WriteByte('\n')
+			}
+			prevCR = false
+			combRun = 0
+			continue
+		}
+		prevCR = false
+		switch r {
+		case '\x00':
+			continue
+		case '\v', '\f', '\u0085', '\u2028', '\u2029':
+			norm.WriteByte('\n')
+			combRun = 0
+			continue
+		}
+		if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
+			combRun++
+			if combRun > 3 {
+				continue
+			}
+		} else {
+			combRun = 0
+		}
+		norm.WriteRune(r)
+	}
+
+	rawLines := strings.Split(norm.String(), "\n")
+	out := make([]string, 0, len(rawLines))
+	var fenceChar byte
+	fenceLen := 0
+	lastNonBlankWasHR := false
+	lastWasEmptyQuote := false
+
+	for _, line := range rawLines {
+		visTrim := trimCommentInvisibleFillers(line)
+		if fenceChar != 0 {
+			if ch, n, ok := isCommentFenceMarker(visTrim); ok && ch == fenceChar && n >= fenceLen && strings.TrimSpace(visTrim[n:]) == "" {
+				fenceChar = 0
+				fenceLen = 0
+				out = append(out, visTrim)
+				continue
+			}
+			if visTrim == "" {
+				if len(out) > 0 && out[len(out)-1] != "" {
+					out = append(out, "")
+				}
+				continue
+			}
+			out = append(out, strings.TrimRight(line, " \t"))
+			continue
+		}
+
+		if ch, n, ok := isCommentFenceMarker(visTrim); ok {
+			fenceChar = ch
+			fenceLen = n
+			lastNonBlankWasHR = false
+			lastWasEmptyQuote = false
+			out = append(out, strings.TrimRight(line, " \t"))
+			continue
+		}
+
+		if visTrim == "" || visTrim == `\` || isCommentEmptyListMarker(visTrim) {
+			if len(out) > 0 && out[len(out)-1] != "" {
+				out = append(out, "")
+			}
+			lastWasEmptyQuote = false
+			continue
+		}
+
+		if isCommentEmptyBlockquote(line) {
+			if lastWasEmptyQuote || len(out) == 0 {
+				continue
+			}
+			lastWasEmptyQuote = true
+			out = append(out, ">")
+			continue
+		}
+		lastWasEmptyQuote = false
+
+		if isCommentThematicBreak(visTrim) {
+			if lastNonBlankWasHR || len(out) == 0 {
+				continue
+			}
+			lastNonBlankWasHR = true
+			out = append(out, "---")
+			continue
+		}
+		lastNonBlankWasHR = false
+
+		cleaned := strings.TrimRightFunc(line, isInvisibleCommentFillerRune)
+		if strings.HasSuffix(line, "  ") && cleaned != "" {
+			cleaned += "  "
+		}
+		out = append(out, cleaned)
+	}
+
+	for len(out) > 0 && (out[len(out)-1] == "" || out[len(out)-1] == ">" || out[len(out)-1] == "---") {
+		out = out[:len(out)-1]
+	}
+	return strings.Join(out, "\n")
 }
 
 // RenderBasic renders Markdown into sanitized HTML with responsive table scroll wrappers.

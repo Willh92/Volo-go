@@ -29,8 +29,10 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/guest"
 	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/repo"
+	"github.com/Willh92/Volo-go/internal/s3client"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/internal/visibility"
@@ -64,6 +66,7 @@ type AppDeps struct {
 
 	SendVerificationMail   VerificationMailSender
 	NotifyCommentCreated   CommentEventNotifier
+	NotifyCommentApproved  func(ctx context.Context, cmt domain.Comment)
 	Media                  MediaProcessor
 	NotifyArticlePublished func(ctx context.Context, raw domain.RawArticle)
 	TestSMTP               func(ctx context.Context, cfg domain.NotificationsSettings, overridePassword string, toEmail string, locale string) error
@@ -81,8 +84,9 @@ type backupExportTicket struct {
 
 // AppServer serves all public pages, feeds, zero-copy Range media, plugins, and v1 APIs (plus Admin/Setup routes).
 type AppServer struct {
-	deps    AppDeps
-	handler http.Handler
+	deps      AppDeps
+	handler   http.Handler
+	imageView *media.ImageViewEngine
 
 	setupMu          sync.Mutex
 	fallbackFeedHost atomic.Pointer[string]
@@ -192,7 +196,10 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		_ = deps.Content.WarmCaches(context.Background())
 	}
 
-	s := &AppServer{deps: deps}
+	s := &AppServer{
+		deps:      deps,
+		imageView: media.NewImageViewEngine(8 << 20),
+	}
 	if deps.Passports != nil {
 		deps.Passports.SetSecureRequestFunc(s.isCookieSecureForRequest)
 	}
@@ -317,6 +324,9 @@ func (s *AppServer) dispatchFederationForArticle(ctx context.Context, action str
 	}
 	baseURL := s.feedBaseURL(nil)
 	artURL := visibility.ArticlePath(raw.Slug)
+	if s.deps.Content != nil && s.deps.Content.Guard() != nil {
+		artURL = s.deps.Content.Guard().ArticleURL(raw)
+	}
 	fullURL := strings.TrimRight(baseURL, "/") + artURL
 	s.deps.Plugins.DispatchFederationArticle(ctx, action, map[string]any{
 		"id":           raw.ID,
@@ -462,6 +472,7 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 
 	// Public Studio HTML Routes
 	mux.HandleFunc("/posts/", s.handlePostRoute)
+	mux.HandleFunc("/p/", s.handleShortPostRoute)
 	mux.HandleFunc("/categories", s.handleCategoriesOverview)
 	mux.HandleFunc("/categories/", s.handleCategoryPosts)
 	mux.HandleFunc("/tags", s.handleTagsOverview)
@@ -553,6 +564,16 @@ func isInlineSafeUploadExt(ext string) bool {
 
 func explicitInlineMediaMIME(ext string) string {
 	switch strings.ToLower(ext) {
+	case ".avif":
+		return "image/avif"
+	case ".webp":
+		return "image/webp"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
 	case ".weba":
 		return "audio/webm"
 	case ".m4a":
@@ -574,13 +595,13 @@ func explicitInlineMediaMIME(ext string) string {
 
 var contentDispositionSanitizer = strings.NewReplacer(`"`, "_", "\r", "", "\n", "", `\`, "_")
 
-func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir string, cleanRel string) bool {
+func resolveSafeLocalUploadFile(baseDir string, cleanRel string) (string, os.FileInfo, bool) {
 	if strings.TrimSpace(baseDir) == "" || cleanRel == "" || strings.Contains(cleanRel, "..") {
-		return false
+		return "", nil, false
 	}
 	rootAbs, err := filepath.Abs(baseDir)
 	if err != nil {
-		return false
+		return "", nil, false
 	}
 	if evalRoot, eErr := filepath.EvalSymlinks(rootAbs); eErr == nil {
 		rootAbs = evalRoot
@@ -589,12 +610,23 @@ func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir str
 	fullPath := filepath.Join(rootAbs, filepath.FromSlash(cleanRel))
 	realFile, err := filepath.EvalSymlinks(fullPath)
 	if err != nil {
-		return false
+		return "", nil, false
 	}
 	if realFile != rootAbs && !strings.HasPrefix(realFile, rootAbs+string(filepath.Separator)) {
+		return "", nil, false
+	}
+	st, err := os.Stat(realFile)
+	if err != nil || st.IsDir() || !st.Mode().IsRegular() {
+		return "", nil, false
+	}
+	return realFile, st, true
+}
+
+func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir string, cleanRel string) bool {
+	realFile, _, ok := resolveSafeLocalUploadFile(baseDir, cleanRel)
+	if !ok {
 		return false
 	}
-
 	f, err := os.Open(realFile)
 	if err != nil {
 		return false
@@ -627,6 +659,24 @@ func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir str
 	return true
 }
 
+func (s *AppServer) serveOriginalUploadOr404(w http.ResponseWriter, r *http.Request, cleanRel string) {
+	activeDir := ""
+	defDir := ""
+	if s.deps.Config != nil {
+		activeDir = s.deps.Config.GetUploadDir()
+		defDir = s.deps.Config.GetDefaultUploadDir()
+	}
+	if serveSafeUserStaticFile(w, r, activeDir, cleanRel) {
+		return
+	}
+	if defDir != "" && defDir != activeDir {
+		if serveSafeUserStaticFile(w, r, defDir, cleanRel) {
+			return
+		}
+	}
+	http.NotFound(w, r)
+}
+
 func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -639,16 +689,156 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	activeDir := s.deps.Config.GetUploadDir()
-	if serveSafeUserStaticFile(w, r, activeDir, cleanRel) {
+
+	// Zero-overhead fast path when no query parameters are supplied or extension is non-image.
+	ext := filepath.Ext(cleanRel)
+	if r.URL.RawQuery == "" || !media.IsTransformableImageExt(ext) || s.imageView == nil {
+		s.serveOriginalUploadOr404(w, r, cleanRel)
 		return
 	}
-	if defDir := s.deps.Config.GetDefaultUploadDir(); defDir != "" && defDir != activeDir {
-		if serveSafeUserStaticFile(w, r, defDir, cleanRel) {
-			return
+
+	spec, hasTransform, parseErr := media.ParseImageViewSpec(r.URL.RawQuery)
+	if parseErr == nil && !hasTransform {
+		s.serveOriginalUploadOr404(w, r, cleanRel)
+		return
+	}
+
+	var (
+		src        media.ImageViewSource
+		localDir   string
+		hasLocal   bool
+		s3RawBytes []byte
+	)
+	if s.deps.Config != nil {
+		activeDir := s.deps.Config.GetUploadDir()
+		if realFile, st, ok := resolveSafeLocalUploadFile(activeDir, cleanRel); ok {
+			hasLocal = true
+			localDir = activeDir
+			rf := realFile
+			src = media.ImageViewSource{
+				Key:         "local:" + cleanRel,
+				ModTimeNano: st.ModTime().UnixNano(),
+				Size:        st.Size(),
+				Ext:         ext,
+				Load:        func(context.Context) ([]byte, error) { return os.ReadFile(rf) },
+			}
+		} else if defDir := s.deps.Config.GetDefaultUploadDir(); defDir != "" && defDir != activeDir {
+			if realFile2, st2, ok2 := resolveSafeLocalUploadFile(defDir, cleanRel); ok2 {
+				hasLocal = true
+				localDir = defDir
+				rf2 := realFile2
+				src = media.ImageViewSource{
+					Key:         "local:" + cleanRel,
+					ModTimeNano: st2.ModTime().UnixNano(),
+					Size:        st2.Size(),
+					Ext:         ext,
+					Load:        func(context.Context) ([]byte, error) { return os.ReadFile(rf2) },
+				}
+			}
 		}
 	}
-	http.NotFound(w, r)
+
+	if !hasLocal && s.deps.Settings != nil {
+		stCfg := s.deps.Settings.Snapshot().Storage
+		if strings.EqualFold(strings.TrimSpace(stCfg.ActiveDriver), "s3") {
+			if sec, secErr := s.deps.Settings.GetStorageSecrets(r.Context()); secErr == nil {
+				if cli, cErr := s3client.NewClient(s3client.Config{
+					Endpoint:      stCfg.S3Endpoint,
+					Region:        stCfg.S3Region,
+					Bucket:        stCfg.S3Bucket,
+					AccessKey:     stCfg.S3AccessKey,
+					SecretKey:     sec.S3SecretKey,
+					PublicBaseURL: stCfg.S3PublicBaseURL,
+					KeyPrefix:     stCfg.S3KeyPrefix,
+					PathStyle:     stCfg.S3PathStyle,
+				}, s.deps.OutboundDialer); cErr == nil {
+					maxFetch := int64(stCfg.MaxUploadMB) << 20
+					if maxFetch <= 0 {
+						maxFetch = 25 << 20
+					}
+					data, _, _, lastMod, gErr := cli.GetObject(r.Context(), cleanRel, maxFetch)
+					if gErr == nil && len(data) > 0 {
+						s3RawBytes = data
+						src = media.ImageViewSource{
+							Key:         "s3:" + cleanRel,
+							ModTimeNano: lastMod.UnixNano(),
+							Size:        int64(len(data)),
+							Ext:         ext,
+							Load:        func(context.Context) ([]byte, error) { return s3RawBytes, nil },
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if src.Load == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	if parseErr != nil {
+		if spec.IgnoreError {
+			if hasLocal {
+				_ = serveSafeUserStaticFile(w, r, localDir, cleanRel)
+				return
+			}
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+			w.Header().Set("Cache-Control", "public, max-age=2592000")
+			mimeHdr := explicitInlineMediaMIME(ext)
+			if mimeHdr == "" {
+				mimeHdr = "application/octet-stream"
+			}
+			w.Header().Set("Content-Type", mimeHdr)
+			w.Header().Set("Content-Length", strconv.Itoa(len(s3RawBytes)))
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			_, _ = w.Write(s3RawBytes)
+			return
+		}
+		writeErrJSON(w, http.StatusBadRequest, parseErr.Error())
+		return
+	}
+
+	expectedETag := s.imageView.ComputeETag(src.Key, src.ModTimeNano, src.Size, spec)
+	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), expectedETag) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "public, max-age=2592000")
+		w.Header().Set("ETag", expectedETag)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	res, tErr := s.imageView.Transform(r.Context(), src, spec)
+	if tErr != nil {
+		writeErrJSON(w, http.StatusBadRequest, tErr.Error())
+		return
+	}
+
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("Cache-Control", "public, max-age=2592000")
+	if res.ETag != "" {
+		w.Header().Set("ETag", res.ETag)
+	}
+	outCT := "application/octet-stream"
+	switch res.ContentType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif":
+		outCT = res.ContentType
+	}
+	w.Header().Set("Content-Type", outCT)
+	if res.FormatFallback != "" {
+		w.Header().Set("X-Volo-Image-Format-Fallback", res.FormatFallback)
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(res.Data)))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_, _ = w.Write(res.Data)
 }
 
 func (s *AppServer) handleServeThemeAsset(w http.ResponseWriter, r *http.Request) {
@@ -693,6 +883,16 @@ func (s *AppServer) handleLegacyCategoryRedirect(w http.ResponseWriter, r *http.
 	http.Redirect(w, r, dest, http.StatusMovedPermanently)
 }
 
+func (s *AppServer) articleRedirectPathBySlug(ctx context.Context, slug string) string {
+	if s.deps.Content != nil && s.deps.Content.Guard() != nil {
+		if raw, err := s.deps.Content.GetPublishedRawArticleBySlug(ctx, slug); err == nil {
+			return s.deps.Content.Guard().ArticleURL(raw)
+		}
+		return s.deps.Content.Guard().ArticleSlugURL(slug, 0)
+	}
+	return visibility.ArticlePath(slug)
+}
+
 func (s *AppServer) handleLegacyArticleRedirect(w http.ResponseWriter, r *http.Request) {
 	trimmed := strings.Trim(strings.TrimPrefix(r.URL.Path, "/articles/"), "/")
 	if trimmed == "" {
@@ -705,7 +905,7 @@ func (s *AppServer) handleLegacyArticleRedirect(w http.ResponseWriter, r *http.R
 		http.NotFound(w, r)
 		return
 	}
-	dest := "/posts/" + slug
+	dest := s.articleRedirectPathBySlug(r.Context(), slug)
 	if r.URL.RawQuery != "" {
 		dest += "?" + r.URL.RawQuery
 	}
@@ -1400,6 +1600,25 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			}
 		}
 
+		snap := s.deps.Settings.Snapshot()
+		minLen, maxLen := snap.Reading.EffectiveCommentLengthBounds(viewer)
+		maxLines := snap.Reading.EffectiveCommentMaxLines(viewer)
+
+		nowMS := time.Now().UnixMilli()
+		checkUser := viewer
+		if checkUser == nil {
+			checkUser = rawViewer
+		}
+		viewerMuted := false
+		viewerMuteNotice := ""
+		if checkUser != nil && checkUser.IsMutedAt(nowMS) {
+			viewerMuted = true
+			viewerMuteNotice = formatLocalizedMuteNotice(locale, &content.UserMutedError{
+				MutedUntil: checkUser.MutedUntil,
+				Reason:     checkUser.BanReason,
+			})
+		}
+
 		resp := map[string]any{
 			"comments":              res.Comments,
 			"page":                  res.Page,
@@ -1410,6 +1629,13 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			"has_more":              res.HasMore,
 			"claimable_guest_count": claimableGuestCount,
 			"clear_guest_passport":  clearGuestPassport,
+			"comment_min_length":    minLen,
+			"comment_max_length":    maxLen,
+			"comment_max_lines":     maxLines,
+			"viewer_muted":          viewerMuted,
+		}
+		if viewerMuteNotice != "" {
+			resp["viewer_mute_notice"] = viewerMuteNotice
 		}
 		if res.FocusFound != nil {
 			resp["focus_found"] = *res.FocusFound
@@ -1424,6 +1650,23 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			return
 		}
 		locale := s.resolveLocale(r)
+		if rawViewer != nil && viewer == nil {
+			nowMS := time.Now().UnixMilli()
+			if rawViewer.IsBannedAt(nowMS) {
+				writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, &auth.UserBannedError{
+					BanUntil: rawViewer.BanUntil,
+					Reason:   rawViewer.BanReason,
+				}))
+				return
+			}
+			if rawViewer.IsMutedAt(nowMS) {
+				writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, &content.UserMutedError{
+					MutedUntil: rawViewer.MutedUntil,
+					Reason:     rawViewer.BanReason,
+				}))
+				return
+			}
+		}
 		clientIP := s.clientIP(r)
 		if !s.deps.WAF.AllowRate("comment_post", clientIP, 12, time.Minute) {
 			writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
@@ -1444,7 +1687,11 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 		in.Locale = locale
 
 		created, passportTok, err := s.deps.Content.CreateComment(r.Context(), w, r, viewer, in)
-		if errors.Is(err, visibility.ErrProtectedForbidden) || errors.Is(err, content.ErrCommentsClosed) || errors.Is(err, content.ErrRegisteredOnly) || errors.Is(err, content.ErrCommentRejected) {
+		var muteErr *content.UserMutedError
+		var banErr *auth.UserBannedError
+		if errors.As(err, &muteErr) || errors.As(err, &banErr) ||
+			errors.Is(err, visibility.ErrProtectedForbidden) || errors.Is(err, content.ErrCommentsClosed) ||
+			errors.Is(err, content.ErrRegisteredOnly) || errors.Is(err, content.ErrCommentRejected) {
 			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, err))
 			return
 		}
@@ -1479,6 +1726,42 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 	viewer := s.publicPrivilegeViewer(r.Context(), rawViewer)
 	locale := s.resolveLocale(r)
 
+	if commentID == "preview" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.requireSameOrigin(w, r) {
+			return
+		}
+		clientIP := s.clientIP(r)
+		if !s.deps.WAF.AllowRate("public:comment:preview", clientIP, 60, time.Minute) {
+			writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
+			return
+		}
+		var body struct {
+			ContentMD string `json:"content_md"`
+			Content   string `json:"content"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&body); err != nil {
+			writeErrJSON(w, http.StatusBadRequest, s.deps.Catalog.T(locale, "error.bad_request"))
+			return
+		}
+		md := body.ContentMD
+		if md == "" {
+			md = body.Content
+		}
+		htmlOut, err := s.deps.Content.PreviewCommentHTML(r.Context(), viewer, md)
+		if err != nil {
+			writeErrJSON(w, http.StatusBadRequest, s.localizePublicError(locale, err))
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, map[string]any{"html": htmlOut})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodPatch:
 		if !s.requireSameOrigin(w, r) {
@@ -1495,7 +1778,11 @@ func (s *AppServer) handleCommentItemAPI(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		updated, err := s.deps.Content.UpdateOwnComment(r.Context(), r, viewer, commentID, body.ContentMD)
-		if errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, content.ErrCommentRejected) || errors.Is(err, visibility.ErrProtectedForbidden) {
+		var muteErr *content.UserMutedError
+		var banErr *auth.UserBannedError
+		if errors.As(err, &muteErr) || errors.As(err, &banErr) ||
+			errors.Is(err, content.ErrCommentEditForbidden) || errors.Is(err, content.ErrCommentRejected) ||
+			errors.Is(err, visibility.ErrProtectedForbidden) {
 			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, err))
 			return
 		}
@@ -1571,6 +1858,30 @@ func (s *AppServer) handleReactionsAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	viewer := s.publicPrivilegeViewer(r.Context(), rawViewer)
 	locale := s.resolveLocale(r)
+	checkUser := viewer
+	if checkUser == nil {
+		checkUser = rawViewer
+	}
+	if checkUser != nil {
+		nowMS := time.Now().UnixMilli()
+		if s.deps.Auth != nil {
+			s.deps.Auth.HealExpiredUser(r.Context(), checkUser)
+		}
+		if checkUser.IsBannedAt(nowMS) {
+			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, &auth.UserBannedError{
+				BanUntil: checkUser.BanUntil,
+				Reason:   checkUser.BanReason,
+			}))
+			return
+		}
+		if checkUser.IsMutedAt(nowMS) {
+			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, &content.UserMutedError{
+				MutedUntil: checkUser.MutedUntil,
+				Reason:     checkUser.BanReason,
+			}))
+			return
+		}
+	}
 	clientIP := s.clientIP(r)
 	if !s.deps.WAF.AllowRate("public_reactions", clientIP, 40, time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
@@ -1743,6 +2054,11 @@ func (s *AppServer) handleReaderLogin(w http.ResponseWriter, r *http.Request) {
 	res, err := s.deps.Auth.LoginReader(r.Context(), req.Ident, req.Password, clientIP, geo, r.UserAgent())
 	if err != nil {
 		s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
+		var banErr *auth.UserBannedError
+		if errors.As(err, &banErr) {
+			writeErrJSON(w, http.StatusForbidden, s.localizePublicError(locale, banErr))
+			return
+		}
 		if errors.Is(err, auth.ErrForbidden) {
 			err = auth.ErrInvalidCredentials
 		}
@@ -2176,6 +2492,12 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Lookup `{YYYY}/{MM}/{slug}` permalink route before standalone page lookup
+	if ymSlug, ok := matchYearMonthArticlePath(r.URL.Path); ok {
+		s.serveArticleSegment(w, r, ymSlug)
+		return
+	}
+
 	// Lookup Standalone Markdown Page (`/{slug}`)
 	slug := strings.TrimPrefix(r.URL.Path, "/")
 	if slug == "" || strings.Contains(slug, "/") {
@@ -2229,8 +2551,29 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 	s.renderStudioFallback(w, r, http.StatusOK, candidates, pctx)
 }
 
+func matchYearMonthArticlePath(rawPath string) (string, bool) {
+	trimmed := strings.TrimPrefix(rawPath, "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 3 || len(parts[0]) != 4 || len(parts[1]) != 2 || parts[2] == "" {
+		return "", false
+	}
+	yr, err1 := strconv.Atoi(parts[0])
+	mo, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || yr < 1900 || yr > 9999 || mo < 1 || mo > 12 {
+		return "", false
+	}
+	return parts[2], true
+}
+
 func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
-	rawSeg := strings.TrimPrefix(r.URL.Path, "/posts/")
+	s.serveArticleSegment(w, r, strings.TrimPrefix(r.URL.Path, "/posts/"))
+}
+
+func (s *AppServer) handleShortPostRoute(w http.ResponseWriter, r *http.Request) {
+	s.serveArticleSegment(w, r, strings.TrimPrefix(r.URL.Path, "/p/"))
+}
+
+func (s *AppServer) serveArticleSegment(w http.ResponseWriter, r *http.Request, rawSeg string) {
 	if rawSeg == "" || strings.Contains(rawSeg, "/") {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
@@ -2816,6 +3159,8 @@ func (s *AppServer) handleLegacyArchiveRedirect(w http.ResponseWriter, r *http.R
 	dest, isExactYM := canonicalizeArchiveTail(tail)
 	if isExactYM {
 		dest = "/archives/" + dest
+	} else if strings.HasPrefix(dest, "/posts/") {
+		dest = s.articleRedirectPathBySlug(r.Context(), strings.TrimPrefix(dest, "/posts/"))
 	}
 	if dest == "" {
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
@@ -2837,6 +3182,9 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 	if !isExactYM {
 		if ym != "" {
 			dest := ym
+			if strings.HasPrefix(dest, "/posts/") {
+				dest = s.articleRedirectPathBySlug(r.Context(), strings.TrimPrefix(dest, "/posts/"))
+			}
 			if r.URL.RawQuery != "" {
 				if strings.Contains(dest, "?") {
 					dest += "&" + r.URL.RawQuery
@@ -2845,6 +3193,10 @@ func (s *AppServer) handleArchiveMonthPosts(w http.ResponseWriter, r *http.Reque
 				}
 			}
 			http.Redirect(w, r, dest, http.StatusMovedPermanently)
+			return
+		}
+		if cleanSlug := strings.Trim(rawTail, "/"); cleanSlug != "" && !strings.Contains(cleanSlug, "/") {
+			s.serveArticleSegment(w, r, cleanSlug)
 			return
 		}
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
@@ -2940,7 +3292,7 @@ func (s *AppServer) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
 	pctx.ArticleCards = sv.Articles
 	pctx.Page = page
 	pctx.TotalPages = totalPages
-	pctx.Pagination = theme.BuildPagination(page, totalPages, perPage, sv.TotalArticles, 5)
+	pctx.Pagination = theme.BuildPagination(page, pctx.TotalPages, perPage, sv.TotalArticles, 5)
 	s.renderStudioFallback(w, r, http.StatusOK, []string{"series_detail.html", "index.html"}, pctx)
 }
 
@@ -2986,10 +3338,22 @@ func (s *AppServer) extractLocalPostSlugFromChapterURL(r *http.Request, rawURL s
 	if idx := strings.IndexAny(pathPart, "?#"); idx >= 0 {
 		pathPart = pathPart[:idx]
 	}
-	if !strings.HasPrefix(pathPart, "/posts/") {
-		return ""
+	var seg string
+	switch {
+	case strings.HasPrefix(pathPart, "/posts/"):
+		seg = strings.Trim(strings.TrimPrefix(pathPart, "/posts/"), "/")
+	case strings.HasPrefix(pathPart, "/p/"):
+		seg = strings.Trim(strings.TrimPrefix(pathPart, "/p/"), "/")
+	case strings.HasPrefix(pathPart, "/archives/"):
+		cand := strings.Trim(strings.TrimPrefix(pathPart, "/archives/"), "/")
+		if ym, isExact := canonicalizeArchiveTail(cand); !isExact && ym == "" {
+			seg = cand
+		}
+	default:
+		if ymSlug, ok := matchYearMonthArticlePath(pathPart); ok {
+			seg = ymSlug
+		}
 	}
-	seg := strings.Trim(strings.TrimPrefix(pathPart, "/posts/"), "/")
 	if seg == "" || strings.Contains(seg, "/") || strings.HasSuffix(seg, ".md") {
 		return ""
 	}
@@ -3442,11 +3806,17 @@ func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request)
 				res, lErr := s.deps.Auth.LoginReader(r.Context(), r.FormValue("ident"), r.FormValue("password"), clientIP, geo, r.UserAgent())
 				if lErr != nil {
 					s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonLoginFail, 1)
-					status = http.StatusUnauthorized
-					if errors.Is(lErr, auth.ErrForbidden) {
-						lErr = auth.ErrInvalidCredentials
+					var banErr *auth.UserBannedError
+					if errors.As(lErr, &banErr) {
+						status = http.StatusForbidden
+						authErrMsg = s.localizePublicError(locale, banErr)
+					} else {
+						status = http.StatusUnauthorized
+						if errors.Is(lErr, auth.ErrForbidden) {
+							lErr = auth.ErrInvalidCredentials
+						}
+						authErrMsg = s.localizePublicError(locale, lErr)
 					}
-					authErrMsg = s.localizePublicError(locale, lErr)
 				} else {
 					s.setSessionCookieForRequest(w, r, res.RawToken)
 					dest := "/"
@@ -3474,9 +3844,135 @@ func (s *AppServer) handleReaderAuthPage(w http.ResponseWriter, r *http.Request)
 	s.renderStudio(w, r, status, "reader_auth.html", pctx)
 }
 
+func formatLocalizedBanNotice(locale string, banErr *auth.UserBannedError) string {
+	if banErr == nil {
+		return "Account suspended."
+	}
+	loc := strings.ToLower(strings.TrimSpace(locale))
+	untilStr := ""
+	if banErr.BanUntil > 0 {
+		untilStr = time.UnixMilli(banErr.BanUntil).UTC().Format("2006-01-02 15:04 UTC")
+	}
+	reason := strings.TrimSpace(banErr.Reason)
+
+	switch {
+	case strings.HasPrefix(loc, "ja"):
+		msg := "このアカウントは凍結されています"
+		if untilStr != "" {
+			msg += "（期限：" + untilStr + "）"
+		}
+		if reason != "" {
+			msg += "：" + reason
+		} else {
+			msg += "。"
+		}
+		return msg
+	case strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant"):
+		msg := "此帳號已被封禁"
+		if untilStr != "" {
+			msg += "（至 " + untilStr + "）"
+		}
+		if reason != "" {
+			msg += "：" + reason
+		} else {
+			msg += "。"
+		}
+		return msg
+	case strings.HasPrefix(loc, "zh"):
+		msg := "该账号已被封禁"
+		if untilStr != "" {
+			msg += "（至 " + untilStr + "）"
+		}
+		if reason != "" {
+			msg += "：" + reason
+		} else {
+			msg += "。"
+		}
+		return msg
+	default:
+		msg := "This account has been suspended"
+		if untilStr != "" {
+			msg += " (until " + untilStr + ")"
+		}
+		if reason != "" {
+			msg += ": " + reason
+		} else {
+			msg += "."
+		}
+		return msg
+	}
+}
+
+func formatLocalizedMuteNotice(locale string, muteErr *content.UserMutedError) string {
+	if muteErr == nil {
+		return "Account muted."
+	}
+	loc := strings.ToLower(strings.TrimSpace(locale))
+	untilStr := ""
+	if muteErr.MutedUntil > 0 {
+		untilStr = time.UnixMilli(muteErr.MutedUntil).UTC().Format("2006-01-02 15:04 UTC")
+	}
+	reason := strings.TrimSpace(muteErr.Reason)
+
+	switch {
+	case strings.HasPrefix(loc, "ja"):
+		msg := "このアカウントは発言制限（ミュート）されています"
+		if untilStr != "" {
+			msg += "（期限：" + untilStr + "）"
+		}
+		if reason != "" {
+			msg += "：" + reason
+		} else {
+			msg += "。"
+		}
+		return msg
+	case strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant"):
+		msg := "您的帳號目前處於禁言狀態"
+		if untilStr != "" {
+			msg += "（至 " + untilStr + "）"
+		}
+		if reason != "" {
+			msg += "：" + reason
+		} else {
+			msg += "。"
+		}
+		return msg
+	case strings.HasPrefix(loc, "zh"):
+		msg := "您的账号当前处于禁言状态"
+		if untilStr != "" {
+			msg += "（至 " + untilStr + "）"
+		}
+		if reason != "" {
+			msg += "：" + reason
+		} else {
+			msg += "。"
+		}
+		return msg
+	default:
+		msg := "Your account is currently muted"
+		if untilStr != "" {
+			msg += " (until " + untilStr + ")"
+		}
+		if reason != "" {
+			msg += ": " + reason
+		} else {
+			msg += "."
+		}
+		return msg
+	}
+}
+
 func (s *AppServer) localizePublicError(locale string, err error) string {
 	if err == nil {
 		return ""
+	}
+	var banErr *auth.UserBannedError
+	if errors.As(err, &banErr) {
+		return formatLocalizedBanNotice(locale, banErr)
+	}
+	var muteErr *content.UserMutedError
+	if errors.As(err, &muteErr) {
+		return formatLocalizedMuteNotice(locale, muteErr)
 	}
 	cat := s.deps.Catalog
 	switch {
@@ -3510,6 +4006,36 @@ func (s *AppServer) localizePublicError(locale string, err error) string {
 			return custom
 		}
 		return cat.T(locale, "comment.err_antispam")
+	}
+
+	var lenErr *content.CommentLengthError
+	if errors.As(err, &lenErr) {
+		loc := strings.ToLower(strings.TrimSpace(locale))
+		switch {
+		case strings.HasPrefix(loc, "ja"):
+			return fmt.Sprintf("コメントは %d〜%d 文字で入力してください。", lenErr.MinRunes, lenErr.MaxRunes)
+		case strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant"):
+			return fmt.Sprintf("評論內容長度須在 %d～%d 字元之間。", lenErr.MinRunes, lenErr.MaxRunes)
+		case strings.HasPrefix(loc, "zh"):
+			return fmt.Sprintf("评论内容长度需在 %d～%d 字符之间。", lenErr.MinRunes, lenErr.MaxRunes)
+		default:
+			return fmt.Sprintf("Comment length must be between %d and %d characters.", lenErr.MinRunes, lenErr.MaxRunes)
+		}
+	}
+
+	var lineErr *content.CommentLineLimitError
+	if errors.As(err, &lineErr) {
+		loc := strings.ToLower(strings.TrimSpace(locale))
+		switch {
+		case strings.HasPrefix(loc, "ja"):
+			return fmt.Sprintf("コメントの行数が多すぎます（最大 %d 行）。段落をまとめてください。", lineErr.MaxLines)
+		case strings.Contains(loc, "tw") || strings.Contains(loc, "hk") || strings.Contains(loc, "hant"):
+			return fmt.Sprintf("評論換行過多（最多 %d 行），請合併段落後重試。", lineErr.MaxLines)
+		case strings.HasPrefix(loc, "zh"):
+			return fmt.Sprintf("评论换行过多（最多 %d 行），请合并段落后重试。", lineErr.MaxLines)
+		default:
+			return fmt.Sprintf("Too many line breaks in comment (maximum %d lines).", lineErr.MaxLines)
+		}
 	}
 
 	low := strings.ToLower(strings.TrimSpace(err.Error()))
@@ -3682,7 +4208,7 @@ func (s *AppServer) handlePublicGitHubShowcaseRoute(w http.ResponseWriter, r *ht
 		`SELECT slug FROM articles WHERE status = ? AND (slug IN ('github', 'my-github-repos') OR legacy_permalink IN ('/my-github-repos', '/github')) ORDER BY updated_at DESC LIMIT 1`,
 		domain.ArticleStatusPublished).Scan(&slug)
 	if err == nil && slug != "" {
-		http.Redirect(w, r, visibility.ArticlePath(slug), http.StatusFound)
+		http.Redirect(w, r, s.articleRedirectPathBySlug(r.Context(), slug), http.StatusFound)
 		return
 	}
 	s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")

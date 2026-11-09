@@ -12,17 +12,20 @@
   function resolveLabels(root) {
     var lang = String((document.documentElement && document.documentElement.lang) || "").toLowerCase();
     var isEN = lang.indexOf("en") === 0;
+    var isJA = lang.indexOf("ja") === 0;
     var isTW = lang === "zh-tw" || lang.indexOf("zh-hant") === 0;
     var greeting = isEN
       ? (root.getAttribute("data-greeting-en") || root.getAttribute("data-greeting") || "Welcome! Click me for a head-pat~")
-      : isTW
-        ? (root.getAttribute("data-greeting-tw") || root.getAttribute("data-greeting") || "歡迎來到獨立部落格，點我可以摸摸頭～")
-        : (root.getAttribute("data-greeting-zh") || root.getAttribute("data-greeting") || "欢迎来到独立博客，点我可以摸摸头～");
+      : isJA
+        ? (root.getAttribute("data-greeting-ja") || root.getAttribute("data-greeting") || "個人ブログへようこそ！クリックすると頭をなでられます～")
+        : isTW
+          ? (root.getAttribute("data-greeting-tw") || root.getAttribute("data-greeting") || "歡迎來到獨立部落格，點我可以摸摸頭～")
+          : (root.getAttribute("data-greeting-zh") || root.getAttribute("data-greeting") || "欢迎来到独立博客，点我可以摸摸头～");
     return {
-      dock: isEN ? "Studio Mascot" : "看板娘助手",
-      btn: isEN ? "Pat mascot" : "摸摸看板娘",
-      close: isEN ? "Dismiss message" : "收起提示",
-      rateLimited: isEN ? "Gentle pats please~" : isTW ? "摸太快啦，休息一下～" : "摸太快啦，歇会儿再摸～",
+      dock: isEN ? "Studio Mascot" : isJA ? "スタジオ看板娘" : "看板娘助手",
+      btn: isEN ? "Pat mascot" : isJA ? "看板娘をなでる" : "摸摸看板娘",
+      close: isEN ? "Dismiss message" : isJA ? "メッセージを閉じる" : "收起提示",
+      rateLimited: isEN ? "Gentle pats please~" : isJA ? "ゆっくりなでてね～" : isTW ? "摸太快啦，休息一下～" : "摸太快啦，歇会儿再摸～",
       greeting: greeting
     };
   }

@@ -9,30 +9,86 @@ function escapeAttr(s) {
     .replace(/>/g, "&gt;");
 }
 
+var DEFAULT_LOCALE_MESSAGES = {
+  "zh-CN": {
+    greeting: "欢迎来到独立博客，点我可以摸摸头～",
+    ariaLabel: "看板娘助手",
+    btnLabel: "摸摸看板娘",
+    closeLabel: "收起提示",
+    dashboardTitle: "看板娘互动统计",
+    rateLimited: "摸太快啦，歇会儿再摸～",
+  },
+  "zh-TW": {
+    greeting: "歡迎來到獨立部落格，點我可以摸摸頭～",
+    ariaLabel: "看板娘助手",
+    btnLabel: "摸摸看板娘",
+    closeLabel: "收起提示",
+    dashboardTitle: "看板娘互動統計",
+    rateLimited: "摸太快啦，休息一下～",
+  },
+  "en-US": {
+    greeting: "Welcome! Click me for a head-pat~",
+    ariaLabel: "Studio Mascot",
+    btnLabel: "Pat mascot",
+    closeLabel: "Dismiss message",
+    dashboardTitle: "Mascot Head-Pats",
+    rateLimited: "Gentle pats please~",
+  },
+  "ja-JP": {
+    greeting: "個人ブログへようこそ！クリックすると頭をなでられます～",
+    ariaLabel: "スタジオ看板娘",
+    btnLabel: "看板娘をなでる",
+    closeLabel: "メッセージを閉じる",
+    dashboardTitle: "看板娘なでなで統計",
+    rateLimited: "ゆっくりなでてね～",
+  },
+};
+
+function normalizeLocaleKey(locale) {
+  var loc = String(locale || "").toLowerCase();
+  if (loc.indexOf("en") === 0) return "en-US";
+  if (loc.indexOf("ja") === 0) return "ja-JP";
+  if (loc === "zh-tw" || loc.indexOf("zh-hant") === 0) return "zh-TW";
+  return "zh-CN";
+}
+
 function safeSettings(locale) {
   var cfg = volo.config.all() || {};
   var ch = String(cfg.character || "neko");
   if (!ALLOWED_CHARACTERS[ch]) ch = "neko";
   var pos = String(cfg.position || "left");
   if (!ALLOWED_POSITIONS[pos]) pos = "left";
-  var loc = String(locale || "").toLowerCase();
-  var isEN = loc.indexOf("en") === 0;
-  var isTW = loc === "zh-tw" || loc.indexOf("zh-hant") === 0;
-  var zhCN = String(cfg.greeting_zh || "欢迎来到独立博客，点我可以摸摸头～").slice(0, 140);
-  var zhTW = String(cfg.greeting_tw || cfg.greeting_zh || "歡迎來到獨立部落格，點我可以摸摸頭～").slice(0, 140);
-  var enUS = String(cfg.greeting_en || "Welcome! Click me for a head-pat~").slice(0, 140);
-  var greeting = isEN ? enUS : isTW ? zhTW : zhCN;
+  var locKey = normalizeLocaleKey(locale);
+  var msg = DEFAULT_LOCALE_MESSAGES[locKey] || DEFAULT_LOCALE_MESSAGES["zh-CN"];
+  var zhCN = String(cfg.greeting_zh || DEFAULT_LOCALE_MESSAGES["zh-CN"].greeting).slice(0, 140);
+  var zhTW = String(
+    cfg.greeting_tw || cfg.greeting_zh || DEFAULT_LOCALE_MESSAGES["zh-TW"].greeting
+  ).slice(0, 140);
+  var enUS = String(cfg.greeting_en || DEFAULT_LOCALE_MESSAGES["en-US"].greeting).slice(0, 140);
+  var jaJP = String(cfg.greeting_ja || DEFAULT_LOCALE_MESSAGES["ja-JP"].greeting).slice(0, 140);
+  var greeting =
+    locKey === "en-US"
+      ? enUS
+      : locKey === "ja-JP"
+        ? jaJP
+        : locKey === "zh-TW"
+          ? zhTW
+          : zhCN;
   return {
+    locale: locKey,
     character: ch,
     position: pos,
     greeting: greeting,
     greetingZh: zhCN,
     greetingTw: zhTW,
     greetingEn: enUS,
+    greetingJa: jaJP,
     hideOnMobile: cfg.hide_on_mobile !== false,
-    ariaLabel: isEN ? "Studio Mascot" : "看板娘助手",
-    btnLabel: isEN ? "Pat mascot" : "摸摸看板娘",
-    closeLabel: isEN ? "Dismiss message" : "收起提示",
+    ariaLabel: msg.ariaLabel,
+    btnLabel: msg.btnLabel,
+    closeLabel: msg.closeLabel,
+    dashboardTitle: msg.dashboardTitle,
+    rateLimited: msg.rateLimited,
   };
 }
 
@@ -46,15 +102,9 @@ function renderSlot(slotName, slotCtx) {
   var pats = Number(volo.kv.getInt("total_pats") || 0);
 
   if (slotName === "admin.dashboard_card") {
-    var loc = String(locale).toLowerCase();
-    var title = loc.indexOf("en") === 0
-      ? "Mascot Head-Pats"
-      : loc === "zh-tw" || loc.indexOf("zh-hant") === 0
-        ? "看板娘互動統計"
-        : "看板娘互动统计";
     return (
       '<div class="kbn-admin-stat"><strong>' +
-      escapeAttr(title) +
+      escapeAttr(st.dashboardTitle) +
       ":</strong> <span>" +
       pats +
       "</span> (" +
@@ -83,6 +133,8 @@ function renderSlot(slotName, slotCtx) {
       escapeAttr(st.greetingTw) +
       '" data-greeting-en="' +
       escapeAttr(st.greetingEn) +
+      '" data-greeting-ja="' +
+      escapeAttr(st.greetingJa) +
       '" data-pats="' +
       pats +
       '" data-btn-label="' +
@@ -108,7 +160,10 @@ function onRequest(req) {
         body: JSON.stringify({ ok: false, error: "rate limit exceeded" }),
       };
     }
-    var total = volo.kv.incr("total_pats", 1, 0);
+    var total =
+      typeof volo.kv.incrAsync === "function"
+        ? volo.kv.incrAsync("total_pats", 1)
+        : volo.kv.incr("total_pats", 1, 0);
     return {
       status: 200,
       headers: { "Content-Type": "application/json; charset=utf-8" },

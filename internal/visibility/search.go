@@ -13,6 +13,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
+	"github.com/Willh92/Volo-go/internal/repo"
 )
 
 const (
@@ -82,6 +83,7 @@ type SearchIndex struct {
 	mu       sync.RWMutex
 	store    *sqlx.Store
 	renderer *render.Engine
+	settings *repo.SettingsManager
 	maxBytes int
 	used     int
 	complete bool
@@ -101,6 +103,16 @@ func NewSearchIndex(store *sqlx.Store, renderer *render.Engine, maxBytes int) *S
 		renderer: renderer,
 		maxBytes: maxBytes,
 	}
+}
+
+// SetSettings attaches SettingsManager so article hit URLs reflect live PostPermalinkStyle changes.
+func (idx *SearchIndex) SetSettings(settings *repo.SettingsManager) {
+	if idx == nil {
+		return
+	}
+	idx.mu.Lock()
+	idx.settings = settings
+	idx.mu.Unlock()
 }
 
 // Rebuild streams published, non-password-protected articles and published standalone pages into the bounded RAM index.
@@ -512,9 +524,23 @@ func (idx *SearchIndex) collectAllHits(ctx context.Context, tokens []string, loc
 		return scored[i].hit.ID < scored[j].hit.ID
 	})
 
+	idx.mu.RLock()
+	settingsMgr := idx.settings
+	idx.mu.RUnlock()
+	var permStyle, siteTZ string
+	if settingsMgr != nil {
+		snap := settingsMgr.Snapshot()
+		permStyle = snap.SEO.PostPermalinkStyle
+		siteTZ = snap.Site.TimeZone
+	}
+
 	hits := make([]SearchHit, len(scored))
 	for i := range scored {
-		hits[i] = scored[i].hit
+		h := scored[i].hit
+		if permStyle != "" && (h.Kind == "" || h.Kind == "article") && h.Slug != "" {
+			h.URL = FormatArticlePath(permStyle, h.Slug, h.PublishedAt, siteTZ)
+		}
+		hits[i] = h
 	}
 	return hits, nil
 }

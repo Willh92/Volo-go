@@ -439,6 +439,7 @@ export async function apiFetch<T = any>(
 ): Promise<T> {
   const method = (opts.method || "GET").toUpperCase();
   const headers = new Headers(opts.headers || {});
+  headers.set("X-Volo-Console", "1");
   if (!headers.has("Accept-Language") && localeSig.value) {
     headers.set("Accept-Language", localeSig.value);
   }
@@ -567,6 +568,7 @@ export function uploadWithProgress<T = any>(
     const xhr = new XMLHttpRequest();
     xhr.open(method.toUpperCase(), url, true);
     xhr.withCredentials = true;
+    xhr.setRequestHeader("X-Volo-Console", "1");
     if (localeSig.value) {
       xhr.setRequestHeader("Accept-Language", localeSig.value);
     }

@@ -111,3 +111,157 @@ func TestUnixSocketListenerPermissionsLockAndGracefulShutdown(t *testing.T) {
 		t.Fatalf("expected lock file to be unlinked on shutdown, got err=%v", err)
 	}
 }
+
+func TestUnixSocketSymlinkParentLeafRejectionStaleRecoveryAndModes(t *testing.T) {
+	tmp := t.TempDir()
+
+	// 1. Symlinked parent directory (like /var/run -> /run or macOS /tmp -> /private/tmp) MUST succeed,
+	//    and SocketMode "0600" / "660" + SocketGroup MUST be applied cleanly.
+	realRunDir := filepath.Join(tmp, "run")
+	if err := os.MkdirAll(realRunDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	symVarRun := filepath.Join(tmp, "var-run")
+	if err := os.Symlink(realRunDir, symVarRun); err != nil {
+		t.Skipf("symlinks unavailable in test environment: %v", err)
+	}
+
+	sockViaSymParent := filepath.Join(symVarRun, "volo", "volo.sock")
+	gidStr := fmtInt(os.Getgid())
+	cfgSym0600 := &config.Config{
+		ListenSocket: &config.ListenSocketSpec{Path: sockViaSymParent},
+		SocketMode:   "0600",
+		SocketGroup:  gidStr,
+	}
+	h1, err := OpenListener(cfgSym0600)
+	if err != nil {
+		t.Fatalf("expected symlinked parent directory to be allowed, got: %v", err)
+	}
+	st1, err := os.Lstat(filepath.Join(realRunDir, "volo", "volo.sock"))
+	if err != nil {
+		_ = h1.Close()
+		t.Fatalf("lstat socket in resolved parent: %v", err)
+	}
+	if st1.Mode().Perm() != 0o600 {
+		_ = h1.Close()
+		t.Fatalf("expected socket mode 0600, got %04o", st1.Mode().Perm())
+	}
+	_ = h1.Close()
+
+	// Also verify 3-digit base-8 SocketMode "660" works and invalid group fails cleanly.
+	cfgSym660 := &config.Config{
+		ListenSocket: &config.ListenSocketSpec{Path: sockViaSymParent},
+		SocketMode:   "660",
+	}
+	h660, err := OpenListener(cfgSym660)
+	if err != nil {
+		t.Fatalf("OpenListener with SocketMode=660 failed: %v", err)
+	}
+	st660, err := os.Lstat(filepath.Join(realRunDir, "volo", "volo.sock"))
+	if err != nil {
+		_ = h660.Close()
+		t.Fatal(err)
+	}
+	if st660.Mode().Perm() != 0o660 {
+		_ = h660.Close()
+		t.Fatalf("expected socket mode 0660 for '660', got %04o", st660.Mode().Perm())
+	}
+	_ = h660.Close()
+
+	cfgBadGrp := &config.Config{
+		ListenSocket: &config.ListenSocketSpec{Path: sockViaSymParent},
+		SocketMode:   "0660",
+		SocketGroup:  "nonexistent_volo_group_999999",
+	}
+	if _, err := OpenListener(cfgBadGrp); err == nil {
+		t.Fatal("expected nonexistent SocketGroup to return an error")
+	}
+
+	// 2. Leaf symlink at socketPath MUST be rejected without modifying the symlink target!
+	victimFile := filepath.Join(tmp, "victim.txt")
+	if err := os.WriteFile(victimFile, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	leafSymSock := filepath.Join(symVarRun, "volo", "evil.sock")
+	if err := os.Symlink(victimFile, leafSymSock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenListener(&config.Config{
+		ListenSocket: &config.ListenSocketSpec{Path: leafSymSock},
+		SocketMode:   "0660",
+	}); err == nil {
+		t.Fatal("expected leaf symlink at socketPath to be rejected")
+	}
+	if data, err := os.ReadFile(victimFile); err != nil || string(data) != "keep" {
+		t.Fatalf("victim target was unexpectedly altered: err=%v data=%q", err, string(data))
+	}
+
+	// 3. Leaf symlink at socketPath+".lock" MUST also be rejected!
+	lockTestSock := filepath.Join(realRunDir, "lockcheck.sock")
+	if err := os.Symlink(victimFile, lockTestSock+".lock"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenListener(&config.Config{
+		ListenSocket: &config.ListenSocketSpec{Path: lockTestSock},
+		SocketMode:   "0660",
+	}); err == nil {
+		t.Fatal("expected leaf symlink at .sock.lock to be rejected")
+	}
+	if data, err := os.ReadFile(victimFile); err != nil || string(data) != "keep" {
+		t.Fatalf("victim lock target was unexpectedly altered: err=%v data=%q", err, string(data))
+	}
+
+	// 4. Stale socket recovery + live socket lock protection:
+	staleSock := filepath.Join(realRunDir, "stale.sock")
+	rawUnixLn, err := net.ListenUnix("unix", &net.UnixAddr{Name: staleSock, Net: "unix"})
+	if err != nil {
+		t.Fatalf("create raw unix socket: %v", err)
+	}
+	rawUnixLn.SetUnlinkOnClose(false)
+	_ = rawUnixLn.Close()
+	if st, err := os.Lstat(staleSock); err != nil || st.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("expected stale socket file to remain on disk before recovery, err=%v", err)
+	}
+
+	cfgStale := &config.Config{
+		ListenSocket: &config.ListenSocketSpec{Path: staleSock},
+		SocketMode:   "0660",
+	}
+	recoveredHandle, err := OpenListener(cfgStale)
+	if err != nil {
+		t.Fatalf("expected stale unix socket to be recovered cleanly, got: %v", err)
+	}
+	defer recoveredHandle.Close()
+
+	// While recoveredHandle is live, a second OpenListener MUST fail and leave recoveredHandle intact!
+	if _, dupErr := OpenListener(cfgStale); dupErr == nil {
+		t.Fatal("expected live socket protection to block duplicate bind")
+	}
+	conn, dialErr := net.DialTimeout("unix", staleSock, time.Second)
+	if dialErr != nil {
+		t.Fatalf("expected live socket to remain connectable after blocked duplicate bind: %v", dialErr)
+	}
+	_ = conn.Close()
+}
+
+func fmtInt(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}

@@ -177,8 +177,12 @@
       stroke-linecap: round;
       stroke-linejoin: round;
     }
-    html[data-theme="dark"] .err-icon-sun { display: none; }
-    html:not([data-theme="dark"]) .err-icon-moon { display: none; }
+    .err-theme-btn .err-mode-icon { display: none; }
+    html[data-mode="auto"] .err-theme-btn .err-mode-icon[data-mode-icon="auto"],
+    html[data-mode="system"] .err-theme-btn .err-mode-icon[data-mode-icon="system"],
+    html[data-mode="light"] .err-theme-btn .err-mode-icon[data-mode-icon="light"],
+    html[data-mode="dark"] .err-theme-btn .err-mode-icon[data-mode-icon="dark"] { display: block; }
+    html:not([data-mode]) .err-theme-btn .err-mode-icon[data-mode-icon="auto"] { display: block; }
 
     .err-stage {
       flex: 1;
@@ -456,6 +460,7 @@
       .err-actions .err-btn { flex: 1 1 auto; }
     }
   </style>
+  {{block "head_extra" .}}{{if eq .ThemeID "volo-journal"}}<link rel="stylesheet" href="{{assetURL .ThemeID "volo-journal.css"}}">{{end}}{{end}}
 </head>
 <body class="volo-err-shell">
   <div class="err-topbar" role="navigation" aria-label="{{$siteTitle}}">
@@ -474,13 +479,19 @@
         <span class="err-arrow" aria-hidden="true">↗</span>
       </a>
       <button type="button" class="err-theme-btn" id="volo-err-theme-toggle"
-              aria-label="{{t .Locale "appearance.dark"}} / {{t .Locale "appearance.light"}}"
-              title="{{t .Locale "appearance.dark"}} / {{t .Locale "appearance.light"}}">
-        <svg class="err-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+              data-title-auto="{{t .Locale "appearance.auto"}}"
+              data-title-system="{{t .Locale "appearance.system"}}"
+              data-title-light="{{t .Locale "appearance.light"}}"
+              data-title-dark="{{t .Locale "appearance.dark"}}"
+              aria-label="{{t .Locale "appearance.auto"}}"
+              title="{{t .Locale "appearance.auto"}}">
+        <svg class="err-mode-icon" data-mode-icon="auto" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg>
+        <svg class="err-mode-icon" data-mode-icon="system" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+        <svg class="err-mode-icon" data-mode-icon="light" viewBox="0 0 24 24" aria-hidden="true">
           <circle cx="12" cy="12" r="4.2"/>
           <path d="M12 2.5v2.2M12 19.3v2.2M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6"/>
         </svg>
-        <svg class="err-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+        <svg class="err-mode-icon" data-mode-icon="dark" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M20.2 14.8A8.2 8.2 0 0 1 9.2 3.8a8.3 8.3 0 1 0 11 11Z"/>
         </svg>
       </button>
@@ -548,15 +559,42 @@
         if (brandImg.complete && brandImg.naturalWidth === 0) onImgFail();
       }
 
+      var MODES = ["auto", "system", "light", "dark"];
+      function resolveModeTheme(m) {
+        if (m === "light" || m === "dark") return m;
+        if (m === "system") {
+          return (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+        }
+        var d = new Date(), mins = d.getHours() * 60 + d.getMinutes();
+        return (mins >= 390 && mins < 1140) ? "light" : "dark";
+      }
       var toggleBtn = document.getElementById("volo-err-theme-toggle");
+      function applyErrMode(m, save) {
+        if (MODES.indexOf(m) === -1) m = "auto";
+        var eff = resolveModeTheme(m);
+        root.setAttribute("data-mode", m);
+        root.setAttribute("data-theme", eff);
+        if (toggleBtn) {
+          var lbl = toggleBtn.getAttribute("data-title-" + m) || m;
+          toggleBtn.setAttribute("title", lbl);
+          toggleBtn.setAttribute("aria-label", lbl);
+        }
+        if (save) {
+          try { localStorage.setItem("volo_theme_mode", m); } catch(_){}
+        }
+      }
+      applyErrMode(root.getAttribute("data-mode") || "auto", false);
       if (toggleBtn) {
         toggleBtn.addEventListener("click", function(){
-          var cur = root.getAttribute("data-theme") === "dark" ? "dark" : "light";
-          var next = cur === "dark" ? "light" : "dark";
-          root.setAttribute("data-mode", next);
-          root.setAttribute("data-theme", next);
-          try { localStorage.setItem("volo_theme_mode", next); } catch(_){}
+          var cur = root.getAttribute("data-mode") || "auto";
+          var next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
+          applyErrMode(next, true);
         });
+      }
+      if (window.matchMedia) {
+        var mq = window.matchMedia("(prefers-color-scheme: dark)");
+        var onSys = function(){ if ((root.getAttribute("data-mode") || "auto") === "system") applyErrMode("system", false); };
+        if (mq.addEventListener) mq.addEventListener("change", onSys);
       }
 
       var modal = document.getElementById("volo-err-search-modal");

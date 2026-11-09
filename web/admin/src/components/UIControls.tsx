@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { createPortal } from "preact/compat";
 import type { CSSProperties, ComponentChildren } from "preact";
-import { confirmSig, resolveConfirm } from "../api";
+import { apiFetch, confirmSig, resolveConfirm, showToast } from "../api";
 import type { LocaleOption } from "../i18n";
 import { t } from "../i18n";
 
@@ -87,7 +87,8 @@ export function computePortalMenuStyle(
 
   const spaceBelow = vvTop + vpH - anchorRect.bottom - margin;
   const spaceAbove = anchorRect.top - vvTop - margin;
-  const flipUp = spaceBelow < Math.min(220, prefMaxH) && spaceAbove > spaceBelow;
+  const needH = opts?.estH ? Math.min(prefMaxH, Math.max(96, opts.estH)) : Math.min(220, prefMaxH);
+  const flipUp = spaceBelow < needH && spaceAbove > spaceBelow;
   const availH = Math.max(96, (flipUp ? spaceAbove : spaceBelow) - 4);
   const actualMaxH = Math.min(prefMaxH, availH);
   const openUpH = opts?.estH ? Math.min(actualMaxH, Math.max(44, opts.estH)) : actualMaxH;
@@ -249,7 +250,10 @@ export function ConsoleSelect({
   }, [open, searchQ]);
 
   useEffect(() => {
-    if (open) updateMenuPosition();
+    if (!open) return;
+    updateMenuPosition();
+    const raf = window.requestAnimationFrame(() => updateMenuPosition());
+    return () => window.cancelAnimationFrame(raf);
   }, [open, filteredOptions.length, isSearchable]);
 
   useEffect(() => {
@@ -1203,6 +1207,7 @@ export function ActionMenu({
 
   useEffect(() => {
     if (!open) return;
+    const raf = window.requestAnimationFrame(() => updatePos());
     const onDocDown = (ev: MouseEvent) => {
       const target = ev.target as Node;
       if (btnRef.current?.contains(target) || menuRef.current?.contains(target)) return;
@@ -1235,6 +1240,7 @@ export function ActionMenu({
     vv?.addEventListener("resize", onScrollOrResize);
     vv?.addEventListener("scroll", onScrollOrResize);
     return () => {
+      window.cancelAnimationFrame(raf);
       document.removeEventListener("mousedown", onDocDown, true);
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
@@ -1243,7 +1249,7 @@ export function ActionMenu({
       vv?.removeEventListener("resize", onScrollOrResize);
       vv?.removeEventListener("scroll", onScrollOrResize);
     };
-  }, [open, closing]);
+  }, [open, closing, visibleItems.length]);
 
   if (visibleItems.length === 0) return null;
 
@@ -1377,6 +1383,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
 
   useEffect(() => {
     if (!open) return;
+    const raf = window.requestAnimationFrame(() => updatePos());
     const onDocDown = (ev: MouseEvent) => {
       const target = ev.target as Node;
       if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
@@ -1409,6 +1416,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
     vv?.addEventListener("resize", onScrollOrResize);
     vv?.addEventListener("scroll", onScrollOrResize);
     return () => {
+      window.cancelAnimationFrame(raf);
       document.removeEventListener("mousedown", onDocDown, true);
       document.removeEventListener("keydown", onEsc);
       window.removeEventListener(POPOVER_CLOSE_EVENT, onPopClose);
@@ -1417,7 +1425,7 @@ export function LocalePopover({ value, locales, onChange, pill = true }: LocaleP
       vv?.removeEventListener("resize", onScrollOrResize);
       vv?.removeEventListener("scroll", onScrollOrResize);
     };
-  }, [open, closing]);
+  }, [open, closing, locales.length]);
 
   const toggle = () => {
     if (open && !closing) {
@@ -2155,7 +2163,7 @@ export function Pagination({
   total,
   page,
   pageSize = 20,
-  pageSizeOptions = [20, 50, 100],
+  pageSizeOptions = [10, 20, 50],
   onPageSizeChange,
   onChange,
 }: PaginationProps) {
@@ -2678,7 +2686,7 @@ export function usePointerSortableList<T>(
     const container = listRef.current;
     const map = new Map<HTMLElement, number>();
     if (container) {
-      const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx]");
+      const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx], [data-flip-row]");
       for (let i = 0; i < rows.length; i++) {
         map.set(rows[i], rows[i].getBoundingClientRect().top);
       }
@@ -2698,11 +2706,11 @@ export function usePointerSortableList<T>(
     if (typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
       return;
     }
-    const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx]");
+    const rows = container.querySelectorAll<HTMLElement>("[data-sort-idx], [data-flip-row]");
     const movedEls: { el: HTMLElement; dy: number }[] = [];
     for (let i = 0; i < rows.length; i++) {
       const el = rows[i];
-      const rIdx = Number(el.dataset.sortIdx);
+      const rIdx = el.dataset.sortIdx !== undefined ? Number(el.dataset.sortIdx) : -1;
       if (draggingIdxRef.current !== null && rIdx === draggingIdxRef.current) continue;
       const oldTop = prevMap.get(el);
       if (oldTop === undefined) continue;
@@ -2978,4 +2986,221 @@ export function usePointerSortableList<T>(
 
   return { listRef, draggingIdx, grabbingIdx, captureFlip, getHandleProps };
 }
+
+export function isAccountBannedNow(
+  u: { status?: string; ban_until?: number | null } | null | undefined,
+  now = Date.now()
+): boolean {
+  if (!u || u.status !== "disabled") return false;
+  const until = Number(u.ban_until || 0);
+  return until <= 0 || now < until;
+}
+
+export function isAccountMutedNow(
+  u: { muted_until?: number | null } | null | undefined,
+  now = Date.now()
+): boolean {
+  if (!u) return false;
+  const until = Number(u.muted_until || 0);
+  return until < 0 || (until > 0 && now < until);
+}
+
+export async function runQuickUserUnmod(
+  userId: string,
+  action: "unban" | "unmute",
+  onDone: () => void
+): Promise<void> {
+  try {
+    await apiFetch(`/api/admin/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ action }),
+    });
+    showToast(t("common.saved"));
+    onDone();
+  } catch (err: any) {
+    showToast(err.message);
+  }
+}
+
+export interface UserModerationTarget {
+  userId: string;
+  label: string;
+  defaultAction?: "ban" | "mute";
+  banReason?: string;
+  shieldComments?: boolean;
+  shieldText?: string;
+}
+
+export function UserModerationModal({
+  target,
+  onClose,
+  onSaved,
+}: {
+  target: UserModerationTarget | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [action, setAction] = useState<"ban" | "mute">("ban");
+  const [durPreset, setDurPreset] = useState<string>("720");
+  const [customHours, setCustomHours] = useState<string>("48");
+  const [reason, setReason] = useState<string>("");
+  const [shieldComments, setShieldComments] = useState<boolean>(true);
+  const [shieldText, setShieldText] = useState<string>("");
+  const [busy, setBusy] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!target) return;
+    setAction(target.defaultAction || "ban");
+    setDurPreset("720");
+    setCustomHours("48");
+    setReason(target.banReason || "");
+    setShieldComments(target.shieldComments ?? true);
+    setShieldText(target.shieldText || "");
+  }, [target]);
+
+  const submit = async (e?: Event) => {
+    e?.preventDefault();
+    if (!target || busy) return;
+    const duration_hours =
+      durPreset === "custom"
+        ? Math.max(1, Math.min(87600, Math.round(Number(customHours) || 24)))
+        : Math.max(0, Number(durPreset) || 0);
+    setBusy(true);
+    try {
+      await apiFetch(`/api/admin/users/${encodeURIComponent(target.userId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          action,
+          duration_hours,
+          ban_reason: reason.trim(),
+          shield_comments: shieldComments,
+          shield_text: shieldComments ? shieldText.trim() : "",
+        }),
+      });
+      showToast(t("common.saved"));
+      onClose();
+      onSaved();
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <AnimatedModal
+      open={!!target}
+      onClose={onClose}
+      title={t("sys.user_mod_title")}
+      subtitle={target?.label || ""}
+      maxWidth="480px"
+      footer={
+        <>
+          <button type="button" class="volo-btn" onClick={onClose}>
+            {t("common.cancel")}
+          </button>
+          <button
+            type="button"
+            class={`volo-btn ${action === "ban" ? "volo-btn-danger" : "volo-btn-primary"}`}
+            disabled={busy}
+            onClick={() => void submit()}
+          >
+            {action === "ban" ? t("sys.user_mod_confirm_ban") : t("sys.user_mod_confirm_mute")}
+          </button>
+        </>
+      }
+    >
+      <form onSubmit={(e) => void submit(e)} autoComplete="off">
+        <div class="volo-field">
+          <label>{t("sys.user_mod_mode")}</label>
+          <div class="volo-filter-pills">
+            <button
+              type="button"
+              class={`volo-filter-pill ${action === "ban" ? "active" : ""}`}
+              onClick={() => setAction("ban")}
+            >
+              {t("sys.user_mod_ban")}
+            </button>
+            <button
+              type="button"
+              class={`volo-filter-pill ${action === "mute" ? "active" : ""}`}
+              onClick={() => setAction("mute")}
+            >
+              {t("sys.user_mod_mute")}
+            </button>
+          </div>
+          <div class="volo-help" style={{ marginTop: "4px" }}>
+            {action === "ban" ? t("sys.user_mod_ban_desc") : t("sys.user_mod_mute_desc")}
+          </div>
+        </div>
+
+        <div class="volo-field">
+          <label>{t("cnt.cmt_ban_duration")}</label>
+          <ConsoleSelect
+            searchable={false}
+            value={durPreset}
+            onChange={setDurPreset}
+            options={[
+              { value: "1", label: t("cnt.cmt_ban_1h") },
+              { value: "24", label: t("cnt.cmt_ban_24h") },
+              { value: "72", label: t("sys.user_mod_3d") },
+              { value: "168", label: t("cnt.cmt_ban_7d") },
+              { value: "720", label: t("cnt.cmt_ban_30d") },
+              { value: "0", label: t("cnt.cmt_ban_perm") },
+              { value: "custom", label: t("sys.user_mod_custom_dur") },
+            ]}
+          />
+          {durPreset === "custom" && (
+            <input
+              type="number"
+              min="1"
+              max="87600"
+              class="volo-input"
+              style={{ marginTop: "8px" }}
+              value={customHours}
+              onInput={(e) => setCustomHours((e.currentTarget as HTMLInputElement).value)}
+              placeholder="48"
+            />
+          )}
+        </div>
+
+        <div class="volo-field">
+          <label>{t("cnt.cmt_ban_reason")}</label>
+          <input
+            class="volo-input"
+            maxLength={255}
+            placeholder={t("sys.user_mod_reason_ph")}
+            value={reason}
+            onInput={(e) => setReason((e.currentTarget as HTMLInputElement).value)}
+          />
+        </div>
+
+        <div class="volo-field" style={{ marginBottom: shieldComments ? undefined : 0 }}>
+          <SwitchToggle
+            checked={shieldComments}
+            onChange={setShieldComments}
+            label={t("sys.user_mod_shield_lbl")}
+          />
+          <div class="volo-help" style={{ marginTop: "4px" }}>
+            {t("sys.user_mod_shield_help")}
+          </div>
+        </div>
+
+        {shieldComments && (
+          <div class="volo-field" style={{ marginBottom: 0 }}>
+            <label>{t("sys.user_mod_shield_text")}</label>
+            <input
+              class="volo-input"
+              maxLength={255}
+              placeholder={t("sys.user_mod_shield_text_ph")}
+              value={shieldText}
+              onInput={(e) => setShieldText((e.currentTarget as HTMLInputElement).value)}
+            />
+          </div>
+        )}
+      </form>
+    </AnimatedModal>
+  );
+}
+
 

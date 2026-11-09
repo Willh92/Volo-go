@@ -22,6 +22,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/guest"
 	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/media"
 	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
@@ -217,6 +218,9 @@ func NewService(opts ServiceOptions) *Service {
 	if searchIdx == nil {
 		searchIdx = visibility.NewSearchIndex(opts.Store, rnd, visibility.DefaultSearchMaxBytes)
 	}
+	if searchIdx != nil {
+		searchIdx.SetSettings(opts.Settings)
+	}
 	dialer := opts.OutboundDialer
 	if dialer == nil {
 		dialer = &security.OutboundSafeDialer{Timeout: 10 * time.Second}
@@ -399,11 +403,31 @@ func (s *Service) PutMediaDims(publicURL string, width int, height int) {
 
 // LookupMediaDims returns cached intrinsic pixel dimensions for a local/S3 media URL.
 func (s *Service) LookupMediaDims(src string) (int, int, bool) {
+	clean := strings.TrimSpace(src)
+	if clean == "" {
+		return 0, 0, false
+	}
+	if idx := strings.IndexByte(clean, '#'); idx >= 0 {
+		clean = clean[:idx]
+	}
+	basePath := clean
+	rawQuery := ""
+	if qIdx := strings.IndexByte(clean, '?'); qIdx >= 0 {
+		basePath = clean[:qIdx]
+		rawQuery = clean[qIdx+1:]
+	}
 	s.mediaMu.RLock()
-	wh, ok := s.mediaDims[strings.TrimSpace(src)]
+	wh, ok := s.mediaDims[basePath]
+	if !ok && basePath != clean {
+		wh, ok = s.mediaDims[clean]
+	}
 	s.mediaMu.RUnlock()
 	if !ok {
 		return 0, 0, false
+	}
+	if rawQuery != "" {
+		tw, th := media.PredictTransformedDims(wh[0], wh[1], rawQuery)
+		return tw, th, true
 	}
 	return wh[0], wh[1], true
 }
@@ -684,25 +708,31 @@ func (s *Service) hydrateCards(ctx context.Context, raws []domain.RawArticle, lo
 
 // GetPublishedRawArticleBySlug fetches a published RawArticle by slug.
 func (s *Service) GetPublishedRawArticleBySlug(ctx context.Context, slug string) (domain.RawArticle, error) {
-	return sqlx.Get[domain.RawArticle](
-		ctx, s.store,
+	var raw domain.RawArticle
+	err := sqlx.GetInto(
+		ctx, s.store, &raw,
 		`SELECT * FROM articles WHERE slug = ? AND status = ?`,
 		strings.TrimSpace(slug), domain.ArticleStatusPublished,
 	)
+	return raw, err
 }
 
 // GetRawArticleBySlugAnyStatus fetches a RawArticle regardless of publication status (used only when gated by Staff ownership or valid ShareToken).
 func (s *Service) GetRawArticleBySlugAnyStatus(ctx context.Context, slug string) (domain.RawArticle, error) {
-	return sqlx.Get[domain.RawArticle](
-		ctx, s.store,
+	var raw domain.RawArticle
+	err := sqlx.GetInto(
+		ctx, s.store, &raw,
 		`SELECT * FROM articles WHERE slug = ?`,
 		strings.TrimSpace(slug),
 	)
+	return raw, err
 }
 
 // GetRawArticleByID fetches a RawArticle by ID.
 func (s *Service) GetRawArticleByID(ctx context.Context, articleID string) (domain.RawArticle, error) {
-	return sqlx.Get[domain.RawArticle](ctx, s.store, `SELECT * FROM articles WHERE id = ?`, strings.TrimSpace(articleID))
+	var raw domain.RawArticle
+	err := sqlx.GetInto(ctx, s.store, &raw, `SELECT * FROM articles WHERE id = ?`, strings.TrimSpace(articleID))
+	return raw, err
 }
 
 func (s *Service) buildArticleHTMLCacheKey(raw domain.RawArticle, locale string, publicBaseURL string, authorName string, showLineNumbers bool, enableLicense bool, salt string) string {
@@ -754,7 +784,8 @@ func (s *Service) RenderArticleDetail(
 		}
 	}
 	if authorName == "" {
-		if u, err := sqlx.Get[domain.User](ctx, s.store, `SELECT display_name, username, avatar_url, bio, website_url FROM users WHERE id = ?`, raw.AuthorID); err == nil {
+		var u domain.User
+		if err := sqlx.GetInto(ctx, s.store, &u, `SELECT display_name, username, avatar_url, bio, website_url FROM users WHERE id = ?`, raw.AuthorID); err == nil {
 			authorName = u.DisplayName
 			if authorName == "" {
 				authorName = u.Username
@@ -780,7 +811,8 @@ func (s *Service) RenderArticleDetail(
 			}
 		}
 		if catPtr == nil {
-			if c, err := sqlx.Get[domain.Category](ctx, s.store, `SELECT * FROM categories WHERE id = ?`, raw.CategoryID); err == nil {
+			var c domain.Category
+			if err := sqlx.GetInto(ctx, s.store, &c, `SELECT * FROM categories WHERE id = ?`, raw.CategoryID); err == nil {
 				catPtr = &c
 			}
 		}
@@ -817,7 +849,7 @@ func (s *Service) RenderArticleDetail(
 				Tags:             tagsMap[raw.ID],
 				Title:            raw.Title,
 				Slug:             raw.Slug,
-				URL:              visibility.ArticlePath(raw.Slug),
+				URL:              s.guard.ArticleURL(raw),
 				Summary:          cached.summary,
 				HTML:             cached.html,
 				CoverURL:         cached.coverURL,
@@ -1053,7 +1085,7 @@ func (s *Service) listArticleTranslations(ctx context.Context, cur domain.RawArt
 	}
 	var rows []domain.RawArticle
 	err := sqlx.SelectInto(ctx, s.store, &rows,
-		`SELECT title, slug, lang, password_ciphertext
+		`SELECT title, slug, lang, published_at, password_ciphertext
 		 FROM articles
 		 WHERE translation_group = ? AND status = ? AND id <> ?
 		 ORDER BY lang ASC`,
@@ -1071,7 +1103,7 @@ func (s *Service) listArticleTranslations(ctx context.Context, cur domain.RawArt
 			Lang:  r.Lang,
 			Title: r.Title,
 			Slug:  r.Slug,
-			URL:   visibility.ArticlePath(r.Slug),
+			URL:   s.guard.ArticleURL(r),
 		})
 	}
 	return out
@@ -1776,7 +1808,9 @@ func (s *Service) queryArchiveStatsForLocation(ctx context.Context, loc *time.Lo
 
 // ListSeries returns all Series ordered by sort_order.
 func (s *Service) ListSeries(ctx context.Context) ([]domain.Series, error) {
-	return sqlx.Select[domain.Series](ctx, s.store, `SELECT * FROM series ORDER BY sort_order ASC, created_at DESC`)
+	var out []domain.Series
+	err := sqlx.SelectInto(ctx, s.store, &out, `SELECT * FROM series ORDER BY sort_order ASC, created_at DESC`)
+	return out, err
 }
 
 // ListSeriesPage filters Series by optional query q and paginates in SQL.
@@ -1897,7 +1931,9 @@ func (s *Service) defaultLocale() string {
 
 // ListLinks returns friend links ordered by sort_order.
 func (s *Service) ListLinks(ctx context.Context) ([]domain.Link, error) {
-	return sqlx.Select[domain.Link](ctx, s.store, `SELECT * FROM links ORDER BY sort_order ASC, created_at ASC`)
+	var out []domain.Link
+	err := sqlx.SelectInto(ctx, s.store, &out, `SELECT * FROM links ORDER BY sort_order ASC, created_at ASC`)
+	return out, err
 }
 
 // ListPublicLinksPage returns distinct ordered link categories (for jump pills) and a SQL-paginated slice of links.
@@ -2299,6 +2335,7 @@ func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, side
 	if sidebarPostLimit > maxCachedRecentCmts {
 		sidebarPostLimit = maxCachedRecentCmts
 	}
+	localeCards := s.chromeCardsForLocale(snap, locale)
 	cloneCards := func(src []visibility.PublicArticleCard, n int) []visibility.PublicArticleCard {
 		if len(src) > n {
 			src = src[:n]
@@ -2313,9 +2350,9 @@ func (s *Service) GetPublicChromeExtras(ctx context.Context, locale string, side
 		}
 		return out
 	}
-	recentCards := cloneCards(snap.recentCards, sidebarPostLimit)
-	viewedCards := cloneCards(snap.mostViewedCards, sidebarPostLimit)
-	cmtedCards := cloneCards(snap.mostCommentedCards, sidebarPostLimit)
+	recentCards := cloneCards(localeCards[0], sidebarPostLimit)
+	viewedCards := cloneCards(localeCards[1], sidebarPostLimit)
+	cmtedCards := cloneCards(localeCards[2], sidebarPostLimit)
 
 	authorsCopy := make([]PublicAuthorProfile, len(snap.authors))
 	copy(authorsCopy, snap.authors)
@@ -2417,9 +2454,10 @@ func (s *Service) ListRandomArticles(ctx context.Context, excludeID string, loca
 	if err != nil || snap == nil {
 		return nil
 	}
+	localeCards := s.chromeCardsForLocale(snap, locale)
 	seen := map[string]bool{excludeID: true}
 	var pool []visibility.PublicArticleCard
-	for _, src := range [][]visibility.PublicArticleCard{snap.recentCards, snap.mostViewedCards} {
+	for _, src := range [][]visibility.PublicArticleCard{localeCards[0], localeCards[1]} {
 		for _, c := range src {
 			if !seen[c.ID] && !c.IsPasswordProtected {
 				seen[c.ID] = true

@@ -31,6 +31,11 @@ import {
   UploadProgressBar,
   useDebouncedValue,
   useFlipList,
+  UserModerationModal,
+  UserModerationTarget,
+  isAccountBannedNow,
+  isAccountMutedNow,
+  runQuickUserUnmod,
   PlusIcon,
   CloseIcon,
 } from "../components/UIControls";
@@ -310,6 +315,8 @@ export function SystemWorkspace({
   const [users, setUsers] = useState<any[]>([]);
   const [usersTotal, setUsersTotal] = useState(0);
   const [userRoleFilter, setUserRoleFilter] = useState<"all" | "admin" | "editor" | "reader">("all");
+  const [userStatusFilter, setUserStatusFilter] = useState<"all" | "active" | "disabled" | "muted">("all");
+  const [modTarget, setModTarget] = useState<UserModerationTarget | null>(null);
   const [userQuery, setUserQuery] = useState("");
   const debouncedUserQ = useDebouncedValue(userQuery, 250);
   const [userModalOpen, setUserModalOpen] = useState(false);
@@ -397,6 +404,7 @@ export function SystemWorkspace({
   const [logLevel, setLogLevel] = useState("ALL");
   const [logQuery, setLogQuery] = useState("");
   const debouncedLogQ = useDebouncedValue(logQuery, 250);
+  const [logPage, setLogPage] = useState(1);
   const [autoScrollLogs, setAutoScrollLogs] = useState<boolean>(true);
   const logViewerRef = useRef<HTMLDivElement>(null);
 
@@ -417,8 +425,12 @@ export function SystemWorkspace({
       if (lvl && lvl !== "ALL") params.set("level", lvl);
       if (q.trim()) params.set("q", q.trim());
       const res = await apiFetch<any>(`/api/admin/runtime-logs?${params.toString()}`);
-      setRuntimeLogs(res.items || []);
+      const items = res.items || [];
+      setRuntimeLogs(items);
       setLogStats(res);
+      if (autoScrollLogs) {
+        setLogPage(Math.max(1, Math.ceil(items.length / 50)));
+      }
     } catch (err: any) {
       showToast(err.message);
     }
@@ -432,6 +444,7 @@ export function SystemWorkspace({
       params.set("page", String(usersPage));
       params.set("per_page", String(usersPageSize));
       if (userRoleFilter !== "all") params.set("role", userRoleFilter);
+      if (userStatusFilter !== "all") params.set("status", userStatusFilter);
       if (debouncedUserQ.trim()) params.set("q", debouncedUserQ.trim());
       const res = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/users?${params.toString()}`);
       const list = res.items || [];
@@ -639,7 +652,7 @@ export function SystemWorkspace({
     if (sub !== "users" || !isAdmin) return;
     if (userQuery !== debouncedUserQ) return;
     void loadUsersList();
-  }, [sub, usersPage, usersPageSize, userRoleFilter, debouncedUserQ]);
+  }, [sub, usersPage, usersPageSize, userRoleFilter, userStatusFilter, debouncedUserQ]);
 
   // WAF IP Bans server-paginated effect
   useEffect(() => {
@@ -665,7 +678,7 @@ export function SystemWorkspace({
   useEffect(() => {
     if (sub !== "logs" || !autoScrollLogs || !logViewerRef.current) return;
     logViewerRef.current.scrollTop = logViewerRef.current.scrollHeight;
-  }, [sub, runtimeLogs, autoScrollLogs]);
+  }, [sub, runtimeLogs, logPage, autoScrollLogs]);
 
   const patchDomain = async (domainName: string, bodyObj: Record<string, any>): Promise<boolean> => {
     if (savingDomain) return false;
@@ -929,6 +942,7 @@ export function SystemWorkspace({
         )
       );
     } catch (err: any) {
+      geoFlip.captureFlip();
       setGeoRules(prevRules);
       showToast(err.message);
       void loadSub();
@@ -964,6 +978,27 @@ export function SystemWorkspace({
       }
     }
     const cur = domains?.storage?.active_driver || "";
+    if (cur && !opts.some((o) => o.value === cur)) {
+      opts.push({ value: cur, label: cur, badge: t("sys.plugin_driver_badge") });
+    }
+    return opts;
+  })();
+
+  const backupRemoteProtoOpts = (() => {
+    const opts: Array<{ value: string; label: string; badge?: string }> = [
+      { value: "s3", label: "S3 / R2 / MinIO" },
+      { value: "webdav", label: "WebDAV" },
+    ];
+    for (const d of storageDrivers) {
+      const rawId = typeof d === "string" ? d : d?.id || d?.value;
+      if (!rawId || rawId === "local" || rawId === "s3") continue;
+      const val = String(rawId).startsWith("plugin:") ? String(rawId) : `plugin:${rawId}`;
+      const label = typeof d === "string" ? d : d?.label || d?.name || rawId;
+      if (!opts.some((o) => o.value === val)) {
+        opts.push({ value: val, label, badge: t("sys.plugin_driver_badge") });
+      }
+    }
+    const cur = domains?.backup?.remote_protocol || "";
     if (cur && !opts.some((o) => o.value === cur)) {
       opts.push({ value: cur, label: cur, badge: t("sys.plugin_driver_badge") });
     }
@@ -1009,6 +1044,7 @@ export function SystemWorkspace({
 
   const geoPaged = paginateItems(filteredGeoRules, geoPage, geoPageSize);
   const localBakPaged = paginateItems(localBackups, localBakPage, 10);
+  const runtimeLogsPaged = paginateItems(runtimeLogs, logPage, 50);
   const pkPaged = paginateItems(passkeys, pkPage, 10);
   const patPaged = paginateItems(tokens, patPage, 10);
   const sessPaged = paginateItems(sessions, sessPage, 10);
@@ -1828,6 +1864,85 @@ export function SystemWorkspace({
               </div>
               {domains.reading?.comment_access_mode !== "off" && (
                 <>
+                  <div class="volo-auto-grid" style={{ marginTop: "8px" }}>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_min_len")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        min={1}
+                        max={500}
+                        value={domains.reading?.comment_min_length ?? 2}
+                        onInput={(e) => setDomField("reading", "comment_min_length", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_max_guest")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        min={10}
+                        max={16000}
+                        value={domains.reading?.comment_max_length_guest ?? 512}
+                        onInput={(e) => setDomField("reading", "comment_max_length_guest", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_max_user")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        min={10}
+                        max={32000}
+                        value={domains.reading?.comment_max_length_user ?? 1024}
+                        onInput={(e) => setDomField("reading", "comment_max_length_user", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_max_staff")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        min={10}
+                        max={64000}
+                        value={domains.reading?.comment_max_length_staff ?? 4096}
+                        onInput={(e) => setDomField("reading", "comment_max_length_staff", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_lines_guest")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        min={3}
+                        max={200}
+                        value={domains.reading?.comment_max_lines_guest ?? 16}
+                        onInput={(e) => setDomField("reading", "comment_max_lines_guest", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_lines_user")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        min={3}
+                        max={200}
+                        value={domains.reading?.comment_max_lines_user ?? 24}
+                        onInput={(e) => setDomField("reading", "comment_max_lines_user", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                    <div class="volo-field">
+                      <label>{t("sys.cmt_lines_staff")}</label>
+                      <input
+                        type="number"
+                        class="volo-input"
+                        min={3}
+                        max={200}
+                        value={domains.reading?.comment_max_lines_staff ?? 64}
+                        onInput={(e) => setDomField("reading", "comment_max_lines_staff", Number((e.currentTarget as HTMLInputElement).value))}
+                      />
+                    </div>
+                  </div>
                   <div class="volo-check-grid">
                     <SwitchToggle
                       checked={domains.reading?.builtin_spam_filter !== false}
@@ -3484,6 +3599,22 @@ export function SystemWorkspace({
               ))}
             </div>
             <div class="volo-filter-controls">
+              <div style={{ minWidth: "136px" }}>
+                <ConsoleSelect
+                  searchable={false}
+                  value={userStatusFilter}
+                  options={[
+                    { value: "all", label: t("art.all") },
+                    { value: "active", label: t("tbl.status_active") },
+                    { value: "disabled", label: t("sys.user_status_banned") },
+                    { value: "muted", label: t("sys.user_status_muted") },
+                  ]}
+                  onChange={(v) => {
+                    setUserStatusFilter(v as any);
+                    setUsersPage(1);
+                  }}
+                />
+              </div>
               <input
                 class="volo-input volo-search-input"
                 name="users_search_filter"
@@ -3517,6 +3648,10 @@ export function SystemWorkspace({
                 ) : (
                   usersPageSlice.map((u) => {
                     const isSelf = u.id === currentUserSig.value?.id;
+                    const nowMs = Date.now();
+                    const isBanned = isAccountBannedNow(u, nowMs);
+                    const isMuted = isAccountMutedNow(u, nowMs);
+                    const isShielded = Boolean(u.shield_comments) && (isBanned || isMuted);
                     return (
                       <tr key={u.id}>
                         <td class="col-fluid" data-label={t("sys.col_user")}>
@@ -3525,9 +3660,14 @@ export function SystemWorkspace({
                               <span>{u.display_name || u.username}</span>
                               <span class="volo-code-chip is-wrap">@{u.username}</span>
                             </div>
-                            {u.email && (
+                            {(u.email || ((isBanned || isMuted) && u.ban_reason)) && (
                               <div class="volo-cell-meta">
-                                <span>{u.email}</span>
+                                {u.email && <span>{u.email}</span>}
+                                {(isBanned || isMuted) && u.ban_reason && (
+                                  <span class="volo-mini-tag" title={u.ban_reason}>
+                                    {u.ban_reason}
+                                  </span>
+                                )}
                               </div>
                             )}
                           </div>
@@ -3569,10 +3709,48 @@ export function SystemWorkspace({
                           )}
                         </td>
                         <td class="col-status" data-label={t("art.status")}>
-                          <span class={`volo-status-pill ${u.status === "active" ? "ok" : "warn"}`}>
-                            <span class="volo-status-dot" />
-                            {u.status === "active" ? t("tbl.status_active") : t("tbl.status_disabled")}
-                          </span>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center" }}>
+                            {isBanned ? (
+                              <span
+                                class="volo-status-pill danger"
+                                title={
+                                  Number(u.ban_until) > 0
+                                    ? t("sys.user_until_fmt", { time: formatDateTime(u.ban_until) })
+                                    : t("cnt.cmt_ban_perm")
+                                }
+                              >
+                                <span class="volo-status-dot" />
+                                {Number(u.ban_until) > 0
+                                  ? t("sys.user_banned_until", { time: formatDateTime(u.ban_until) })
+                                  : t("sys.user_status_banned")}
+                              </span>
+                            ) : (
+                              <span class="volo-status-pill ok">
+                                <span class="volo-status-dot" />
+                                {t("tbl.status_active")}
+                              </span>
+                            )}
+                            {isMuted && (
+                              <span
+                                class="volo-status-pill warn"
+                                title={
+                                  Number(u.muted_until) > 0
+                                    ? t("sys.user_until_fmt", { time: formatDateTime(u.muted_until) })
+                                    : t("cnt.cmt_ban_perm")
+                                }
+                              >
+                                <span class="volo-status-dot" />
+                                {Number(u.muted_until) > 0
+                                  ? t("sys.user_muted_until", { time: formatDateTime(u.muted_until) })
+                                  : t("sys.user_status_muted")}
+                              </span>
+                            )}
+                            {isShielded && (
+                              <span class="volo-mini-tag" title={u.shield_text || t("sys.user_mod_shield_lbl")}>
+                                {t("sys.user_shielded_badge")}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td class="col-date" data-label={t("sys.col_created")}>
                           {formatDateTime(u.created_at)}
@@ -3600,29 +3778,48 @@ export function SystemWorkspace({
                             >
                               {t("common.edit")}
                             </button>
+                            {!isSelf && isBanned && (
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={() => void runQuickUserUnmod(u.id, "unban", () => void loadUsersList())}
+                              >
+                                {t("sys.user_unban")}
+                              </button>
+                            )}
+                            {!isSelf && !isBanned && isMuted && (
+                              <button
+                                type="button"
+                                class="volo-act-btn"
+                                onClick={() => void runQuickUserUnmod(u.id, "unmute", () => void loadUsersList())}
+                              >
+                                {t("sys.user_unmute")}
+                              </button>
+                            )}
                             {!isSelf && (
                               <ActionMenu
                                 items={[
                                   {
-                                    label: u.status === "active" ? t("sys.user_disable") : t("sys.user_enable"),
-                                    onClick: async () => {
-                                      const nextSt = u.status === "active" ? "disabled" : "active";
-                                      if (
-                                        nextSt === "disabled" &&
-                                        !(await openConfirm({ message: t("sys.confirm_disable_user", { name: u.username }), danger: true }))
-                                      ) {
-                                        return;
-                                      }
-                                      try {
-                                        await apiFetch(`/api/admin/users/${u.id}`, {
-                                          method: "PATCH",
-                                          body: JSON.stringify({ status: nextSt }),
-                                        });
-                                        void loadUsersList();
-                                      } catch (err: any) {
-                                        showToast(err.message);
-                                      }
-                                    },
+                                    label: t("sys.user_mod_btn"),
+                                    onClick: () =>
+                                      setModTarget({
+                                        userId: u.id,
+                                        label: `${u.display_name || u.username} (@${u.username})`,
+                                        defaultAction: isMuted && !isBanned ? "mute" : "ban",
+                                        banReason: u.ban_reason || "",
+                                        shieldComments: u.shield_comments ?? true,
+                                        shieldText: u.shield_text || "",
+                                      }),
+                                  },
+                                  {
+                                    label: t("sys.user_unban"),
+                                    hidden: !isBanned,
+                                    onClick: () => void runQuickUserUnmod(u.id, "unban", () => void loadUsersList()),
+                                  },
+                                  {
+                                    label: t("sys.user_unmute"),
+                                    hidden: !isMuted,
+                                    onClick: () => void runQuickUserUnmod(u.id, "unmute", () => void loadUsersList()),
                                   },
                                   {
                                     label: t("common.delete"),
@@ -3661,6 +3858,12 @@ export function SystemWorkspace({
               setUsersPage(p);
               resetConsoleScroll();
             }}
+          />
+
+          <UserModerationModal
+            target={modTarget}
+            onClose={() => setModTarget(null)}
+            onSaved={() => void loadUsersList()}
           />
 
           <AnimatedModal
@@ -5052,13 +5255,11 @@ export function SystemWorkspace({
                     onChange={(v) => setDomField("backup", "local_auto_enabled", v)}
                     label={t("sys.auto_local_on")}
                   />
-                  {domains.backup?.local_auto_enabled && (
-                    <SwitchToggle
-                      checked={!!domains.backup?.include_media_in_auto}
-                      onChange={(v) => setDomField("backup", "include_media_in_auto", v)}
-                      label={t("sys.auto_media_on")}
-                    />
-                  )}
+                  <SwitchToggle
+                    checked={!!domains.backup?.include_media_in_auto}
+                    onChange={(v) => setDomField("backup", "include_media_in_auto", v)}
+                    label={t("sys.auto_media_on")}
+                  />
                   <SwitchToggle
                     checked={!!domains.backup?.remote_enabled}
                     onChange={(v) => setDomField("backup", "remote_enabled", v)}
@@ -5095,10 +5296,7 @@ export function SystemWorkspace({
                       <label>{t("sys.remote_proto")}</label>
                       <ConsoleSelect
                         value={domains.backup?.remote_protocol || "s3"}
-                        options={[
-                          { value: "s3", label: "S3 / R2 / MinIO" },
-                          { value: "webdav", label: "WebDAV" },
-                        ]}
+                        options={backupRemoteProtoOpts}
                         onChange={(v) => setDomField("backup", "remote_protocol", v)}
                       />
                     </div>
@@ -5172,7 +5370,7 @@ export function SystemWorkspace({
                           </div>
                         </div>
                       </div>
-                    ) : (
+                    ) : (domains.backup?.remote_protocol || "s3") === "s3" ? (
                       <div class="volo-subcard">
                         <div class="volo-grid-2">
                           <div class="volo-field">
@@ -5272,7 +5470,7 @@ export function SystemWorkspace({
                           />
                         </div>
                       </div>
-                    )}
+                    ) : null}
                   </>
                 )}
 
@@ -5594,7 +5792,10 @@ export function SystemWorkspace({
                   key={lv}
                   type="button"
                   class={`volo-filter-pill ${logLevel === lv ? "active" : ""}`}
-                  onClick={() => setLogLevel(lv)}
+                  onClick={() => {
+                    setLogLevel(lv);
+                    setLogPage(1);
+                  }}
                 >
                   {lv === "ALL" ? t("art.all") : lv}
                 </button>
@@ -5612,13 +5813,23 @@ export function SystemWorkspace({
                 autoComplete="off"
                 placeholder={t("sys.logs_search_ph")}
                 value={logQuery}
-                onInput={(e) => setLogQuery((e.currentTarget as HTMLInputElement).value)}
+                onInput={(e) => {
+                  setLogQuery((e.currentTarget as HTMLInputElement).value);
+                  setLogPage(1);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void loadRuntimeLogs(logLevel, logQuery);
                 }}
               />
               {logQuery && (
-                <button type="button" class="volo-act-btn" onClick={() => setLogQuery("")}>
+                <button
+                  type="button"
+                  class="volo-act-btn"
+                  onClick={() => {
+                    setLogQuery("");
+                    setLogPage(1);
+                  }}
+                >
                   <CloseIcon size={13} />
                 </button>
               )}
@@ -5626,10 +5837,10 @@ export function SystemWorkspace({
           </div>
 
           <div ref={logViewerRef} class="volo-log-viewer">
-            {runtimeLogs.length === 0 ? (
+            {runtimeLogsPaged.slice.length === 0 ? (
               <div class="volo-log-empty">{t("sys.logs_empty")}</div>
             ) : (
-              runtimeLogs.map((l) => {
+              runtimeLogsPaged.slice.map((l) => {
                 const lv = String(l.level || "INFO");
                 const { msg, attrs } = extractLogAttrs(l);
                 return (
@@ -5648,6 +5859,17 @@ export function SystemWorkspace({
               })
             )}
           </div>
+          <Pagination
+            total={runtimeLogs.length}
+            page={runtimeLogsPaged.safePage}
+            pageSize={50}
+            onChange={(p) => {
+              if (p < runtimeLogsPaged.totalPages && autoScrollLogs) {
+                setAutoScrollLogs(false);
+              }
+              setLogPage(p);
+            }}
+          />
         </div>
       )}
 

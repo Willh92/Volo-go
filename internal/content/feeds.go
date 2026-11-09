@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"html"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
+	"github.com/Willh92/Volo-go/internal/tinyxml"
 	"github.com/Willh92/Volo-go/internal/visibility"
 )
 
@@ -312,7 +312,7 @@ func (s *Service) BuildPodcastXML(ctx context.Context, publicBaseURL string, loc
 	pod := snap.Feed.Podcast
 	base := strings.TrimRight(publicBaseURL, "/")
 
-	items, err := s.collectPublicFeedItems(ctx, base, locale, true, 50)
+	items, err := s.collectPublicFeedItems(ctx, base, locale, true, snap.Feed.ItemCount)
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +567,7 @@ func (s *Service) BuildSitemapShardXML(ctx context.Context, publicBaseURL string
 		if !s.guard.IsPublicIndexable(a) {
 			continue
 		}
-		loc := base + visibility.ArticlePath(a.Slug)
+		loc := base + s.guard.ArticleURL(a)
 		upd := a.UpdatedAt
 		if upd <= 0 {
 			upd = a.PublishedAt
@@ -583,7 +583,7 @@ func (s *Service) BuildSitemapShardXML(ctx context.Context, publicBaseURL string
 				if lang == "" {
 					lang = "x-default"
 				}
-				fmt.Fprintf(&b, "    <xhtml:link rel=\"alternate\" hreflang=%q href=%q/>\n", lang, base+visibility.ArticlePath(peer.Slug))
+				fmt.Fprintf(&b, "    <xhtml:link rel=\"alternate\" hreflang=%q href=%q/>\n", lang, base+s.guard.ArticleURL(peer))
 			}
 		}
 		b.WriteString("  </url>\n")
@@ -649,7 +649,7 @@ func (s *Service) resolveSitemapArticleGroups(ctx context.Context, arts []domain
 		}
 		var peers []domain.RawArticle
 		err := sqlx.SelectInto(ctx, s.store, &peers,
-			`SELECT id, slug, lang, translation_group, status, password_ciphertext
+			`SELECT id, slug, lang, translation_group, published_at, status, password_ciphertext
 			 FROM articles
 			 WHERE status = ? AND password_ciphertext = '' AND translation_group IN (`+strings.Join(ph, ",")+`)
 			 ORDER BY published_at DESC`,
@@ -795,13 +795,13 @@ func (s *Service) BuildLLMSTxt(ctx context.Context, publicBaseURL string, full b
 					summary = plain
 				}
 			}
-			fmt.Fprintf(&b, "- [%s](%s%s.md): %s\n", a.Title, base, visibility.ArticlePath(a.Slug), summary)
+			fmt.Fprintf(&b, "- [%s](%s%s.md): %s\n", a.Title, base, s.guard.ArticleURL(a), summary)
 		} else {
 			md, ok := s.guard.ToSafeRawMarkdown(a)
 			if !ok {
 				continue
 			}
-			fmt.Fprintf(&b, "---\nURL: %s%s\n\n%s\n", base, visibility.ArticlePath(a.Slug), md)
+			fmt.Fprintf(&b, "---\nURL: %s%s\n\n%s\n", base, s.guard.ArticleURL(a), md)
 		}
 	}
 
@@ -936,9 +936,7 @@ func writeXMLTag(b *bytes.Buffer, indent string, tag string, val string) {
 }
 
 func xmlEscape(s string) string {
-	var buf bytes.Buffer
-	_ = xml.EscapeText(&buf, []byte(s))
-	return buf.String()
+	return tinyxml.EscapeText(s)
 }
 
 func safeCDATA(s string) string {

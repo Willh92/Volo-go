@@ -352,3 +352,66 @@ func TestWAFBanDeduplicationPruningAndConcurrentAccess(t *testing.T) {
 		<-done
 	}
 }
+
+func TestIsForbiddenIPAndWAFHotReloadWindowClamping(t *testing.T) {
+	forbidden := []string{
+		"0.0.0.0",
+		"127.0.0.1",
+		"10.0.0.1",
+		"172.16.0.1",
+		"192.168.1.1",
+		"100.64.0.1",
+		"169.254.169.254",
+		"198.18.0.1",
+		"224.0.0.1",
+		"::",
+		"::1",
+		"fc00::1",
+		"fe80::1",
+		"ff02::1",
+		"::ffff:127.0.0.1",
+		"::ffff:100.64.1.1",
+	}
+	for _, raw := range forbidden {
+		if !IsForbiddenIP(netip.MustParseAddr(raw)) {
+			t.Fatalf("expected IsForbiddenIP(%q) == true", raw)
+		}
+	}
+	if !IsForbiddenIP(netip.Addr{}) {
+		t.Fatal("expected zero netip.Addr to be forbidden")
+	}
+	for _, pub := range []string{"1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"} {
+		if IsForbiddenIP(netip.MustParseAddr(pub)) {
+			t.Fatalf("expected IsForbiddenIP(%q) == false", pub)
+		}
+	}
+
+	// Verify WAF hot-reload window clamping: a 2-hour bucket is immediately clamped when window shrinks to 50ms.
+	waf := NewWAFEngine(nil, nil, nil, nil)
+	defer waf.Close()
+	ip := netip.MustParseAddr("198.51.100.88")
+
+	if !waf.AllowRate("waf_shield", ip, 1, 2*time.Hour) {
+		t.Fatal("expected initial request to pass")
+	}
+	// Shrink window via AllowRate hot-reload (e.g. WAFWindowSeconds reduced)
+	if waf.AllowRate("waf_shield", ip, 1, 40*time.Millisecond) {
+		t.Fatal("expected second request within 40ms clamped window to still be limited")
+	}
+	time.Sleep(55 * time.Millisecond)
+	if !waf.AllowRate("waf_shield", ip, 1, 40*time.Millisecond) {
+		t.Fatal("expected bucket to reset after clamped 40ms window instead of staying stuck for 2 hours")
+	}
+
+	// Also verify UpdateConfig clamps active waf_shield buckets directly
+	ip2 := netip.MustParseAddr("198.51.100.89")
+	_ = waf.AllowRate("waf_shield", ip2, 1, 3*time.Hour)
+	waf.UpdateConfig(1)
+	waf.rateMu.Lock()
+	rem := time.Until(waf.rates["waf_shield|"+RateLimitBucketKey(ip2)].windowReset)
+	waf.rateMu.Unlock()
+	if rem > 2*time.Second {
+		t.Fatalf("expected UpdateConfig(1) to clamp windowReset <= 1s, got %v", rem)
+	}
+}
+

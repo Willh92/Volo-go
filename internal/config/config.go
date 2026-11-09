@@ -26,6 +26,7 @@ const (
 	DefaultMaxIdleConns   = 5
 	DefaultConnLifetimeS  = 1800
 	DefaultShutdownSec    = 15
+	DefaultSocketMode     = "0660"
 	DefaultUnixSocketPerm = os.FileMode(0o660)
 )
 
@@ -50,8 +51,11 @@ var (
 // Pointer fields distinguish "explicitly passed flag" (even if empty string or false) from "omitted".
 type CLIOverrides struct {
 	EnvFile            string
+	SkipKeyRing        bool
 	ListenAddr         *string
 	ListenSocket       *string
+	SocketGroup        *string
+	SocketMode         *string
 	PublicURL          *string
 	TrustedProxies     *string
 	AdminPath          *string
@@ -90,6 +94,8 @@ type Config struct {
 
 	ListenAddr        string
 	ListenSocket      *ListenSocketSpec
+	SocketGroup       string
+	SocketMode        string
 	PublicURL         string
 	PublicOrigin      string // scheme://authority
 	TrustedProxiesRaw string
@@ -581,11 +587,61 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	if cli.ListenAddr != nil && cli.ListenSocket != nil && *cli.ListenAddr != "" && *cli.ListenSocket != "" {
 		return nil, errors.New("config: --listen-addr and --listen-socket cannot be specified simultaneously")
 	}
+
+	socketGroup, _ := resolveStr(cli.SocketGroup, "VOLO_SOCKET_GROUP", "")
+	socketModeRaw, _ := resolveStr(cli.SocketMode, "VOLO_SOCKET_MODE", DefaultSocketMode)
+	if socketModeRaw == "" {
+		socketModeRaw = DefaultSocketMode
+	}
+	socketModePerm, err := ParseSocketMode(socketModeRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	socketModeLayer := 4
+	if cli.SocketMode != nil && strings.TrimSpace(*cli.SocketMode) != "" {
+		socketModeLayer = 1
+	} else if v, ok := envMap["VOLO_SOCKET_MODE"]; ok && strings.TrimSpace(v) != "" {
+		socketModeLayer = 2
+	} else if v, ok := dotEnvMap["VOLO_SOCKET_MODE"]; ok && strings.TrimSpace(v) != "" {
+		socketModeLayer = 3
+	}
+
+	hasInlineSocketPerm := func(raw string) bool {
+		idx := strings.IndexByte(raw, ',')
+		return idx >= 0 && strings.TrimSpace(raw[idx+1:]) != ""
+	}
+	inlinePermLayer := 5
+	if cli.ListenSocket != nil && hasInlineSocketPerm(*cli.ListenSocket) {
+		inlinePermLayer = 1
+	} else if cli.ListenSocket == nil {
+		if v, ok := envMap["VOLO_LISTEN_SOCKET"]; ok && hasInlineSocketPerm(v) {
+			inlinePermLayer = 2
+		} else if _, envSet := envMap["VOLO_LISTEN_SOCKET"]; !envSet {
+			if v, ok := dotEnvMap["VOLO_LISTEN_SOCKET"]; ok && hasInlineSocketPerm(v) {
+				inlinePermLayer = 3
+			}
+		}
+	}
+
 	var socketSpec *ListenSocketSpec
+	socketModeFinal := fmt.Sprintf("%04o", socketModePerm)
 	if socketRaw != "" {
 		spec, err := ParseListenSocketSpec(socketRaw)
 		if err != nil {
 			return nil, err
+		}
+		useExplicitSocketMode := true
+		if inlinePermLayer < socketModeLayer {
+			useExplicitSocketMode = false
+		} else if inlinePermLayer == socketModeLayer && inlinePermLayer > 1 && socketModePerm == DefaultUnixSocketPerm {
+			useExplicitSocketMode = false
+		}
+		if useExplicitSocketMode {
+			spec.Perm = socketModePerm
+			socketModeFinal = fmt.Sprintf("%04o", socketModePerm)
+		} else {
+			socketModeFinal = fmt.Sprintf("%04o", spec.Perm)
 		}
 		socketSpec = spec
 		_ = listenAddrExplicit
@@ -628,10 +684,14 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 		locale = DefaultLocale
 	}
 
-	secretExplicit, _ := resolveStr(cli.SecretKey, "VOLO_SECRET_KEY", "")
-	keyRing, secretSource, err := LoadOrInitKeyRing(secretExplicit, dataDir)
-	if err != nil {
-		return nil, err
+	var keyRing *KeyRing
+	var secretSource string
+	if !cli.SkipKeyRing {
+		secretExplicit, _ := resolveStr(cli.SecretKey, "VOLO_SECRET_KEY", "")
+		keyRing, secretSource, err = LoadOrInitKeyRing(secretExplicit, dataDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	dbDriver, driverExplicit := resolveStr(cli.DBDriver, "VOLO_DB_DRIVER", DefaultDBDriver)
@@ -642,7 +702,7 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	}
 
 	// If neither driver nor DSN was explicitly pinned via CLI/ENV/.env, check Setup Wizard's db.json.
-	if !driverExplicit && !dsnExplicit {
+	if !cli.SkipKeyRing && !driverExplicit && !dsnExplicit && keyRing != nil {
 		if saved, err := LoadWizardDBConfig(dataDir, keyRing); err == nil && saved != nil {
 			dbDriver = saved.Driver
 			dbDSN = saved.DSN
@@ -674,6 +734,8 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	return &Config{
 		ListenAddr:        listenAddr,
 		ListenSocket:      socketSpec,
+		SocketGroup:       socketGroup,
+		SocketMode:        socketModeFinal,
 		PublicURL:         pubURL,
 		PublicOrigin:      pubOrigin,
 		TrustedProxiesRaw: trustedRaw,
@@ -705,6 +767,24 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	}, nil
 }
 
+// ParseSocketMode parses an octal Unix socket mode string such as "0660" or "660".
+// Empty strings default to 0660; values outside (0, 0777] or non-octal characters fail fast.
+func ParseSocketMode(modeStr string) (os.FileMode, error) {
+	trimmed := strings.TrimSpace(modeStr)
+	if trimmed == "" {
+		return DefaultUnixSocketPerm, nil
+	}
+	clean := strings.TrimPrefix(trimmed, "0")
+	if len(trimmed) < 3 || len(trimmed) > 4 || len(clean) > 3 {
+		return 0, fmt.Errorf("config: invalid socket octal permission %q", modeStr)
+	}
+	parsed, err := strconv.ParseUint(trimmed, 8, 32)
+	if err != nil || parsed == 0 || parsed > 0o777 {
+		return 0, fmt.Errorf("config: invalid socket octal permission %q", modeStr)
+	}
+	return os.FileMode(parsed), nil
+}
+
 // ParseListenSocketSpec parses "/run/volo/volo.sock,0660" (matching bolo-solo's strict socket permission semantics).
 // Missing or empty permission after a single comma defaults to 0660; extra commas or non-octal permissions fail fast.
 func ParseListenSocketSpec(raw string) (*ListenSocketSpec, error) {
@@ -721,16 +801,11 @@ func ParseListenSocketSpec(raw string) (*ListenSocketSpec, error) {
 	}
 	perm := DefaultUnixSocketPerm
 	if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
-		permStr := strings.TrimSpace(parts[1])
-		clean := strings.TrimPrefix(permStr, "0")
-		if len(permStr) < 3 || len(permStr) > 4 || len(clean) > 3 {
-			return nil, fmt.Errorf("config: invalid socket octal permission %q in VOLO_LISTEN_SOCKET", permStr)
+		parsedPerm, err := ParseSocketMode(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("config: invalid socket octal permission %q in VOLO_LISTEN_SOCKET", strings.TrimSpace(parts[1]))
 		}
-		parsed, err := strconv.ParseUint(permStr, 8, 32)
-		if err != nil || parsed == 0 || parsed > 0o777 {
-			return nil, fmt.Errorf("config: invalid socket octal permission %q in VOLO_LISTEN_SOCKET", permStr)
-		}
-		perm = os.FileMode(parsed)
+		perm = parsedPerm
 	}
 	return &ListenSocketSpec{Path: sockPath, Perm: perm}, nil
 }

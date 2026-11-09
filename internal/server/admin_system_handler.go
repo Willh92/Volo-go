@@ -10,7 +10,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +36,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/theme"
+	"github.com/Willh92/Volo-go/internal/tinyxml"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
@@ -354,7 +354,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			"ok":           true,
 			"article_id":   art.ID,
 			"article_slug": art.Slug,
-			"article_url":  "/posts/" + art.Slug,
+			"article_url":  s.deps.Content.Guard().ArticleURL(*art),
 		})
 
 	case sub == "seo/indexnow-push" && r.Method == http.MethodPost:
@@ -1002,51 +1002,73 @@ func (s *AppServer) handleAdminLinks(w http.ResponseWriter, r *http.Request, act
 	}
 }
 
-type opmlDocument struct {
-	XMLName xml.Name    `xml:"opml"`
-	Version string      `xml:"version,attr"`
-	Head    opmlHead    `xml:"head"`
-	Body    opmlBodyDoc `xml:"body"`
-}
-
-type opmlHead struct {
-	Title       string `xml:"title,omitempty"`
-	DateCreated string `xml:"dateCreated,omitempty"`
-}
-
-type opmlBodyDoc struct {
-	Outlines []opmlOutline `xml:"outline"`
-}
-
 type opmlOutline struct {
-	Text         string        `xml:"text,attr,omitempty"`
-	Title        string        `xml:"title,attr,omitempty"`
-	Type         string        `xml:"type,attr,omitempty"`
-	XMLURL       string        `xml:"xmlUrl,attr,omitempty"`
-	XMLURLLower  string        `xml:"xmlurl,attr,omitempty"`
-	HTMLURL      string        `xml:"htmlUrl,attr,omitempty"`
-	HTMLURLLower string        `xml:"htmlurl,attr,omitempty"`
-	Description  string        `xml:"description,attr,omitempty"`
-	Outlines     []opmlOutline `xml:"outline,omitempty"`
+	Text        string
+	Title       string
+	Type        string
+	XMLURL      string
+	HTMLURL     string
+	Description string
 }
 
-func flattenOPMLOutlines(in []opmlOutline, dst *[]opmlOutline) {
-	for _, o := range in {
-		rawXML := strings.TrimSpace(o.XMLURL)
-		if rawXML == "" {
-			rawXML = strings.TrimSpace(o.XMLURLLower)
-		}
-		if rawXML != "" {
-			o.XMLURL = rawXML
-			if strings.TrimSpace(o.HTMLURL) == "" && strings.TrimSpace(o.HTMLURLLower) != "" {
-				o.HTMLURL = strings.TrimSpace(o.HTMLURLLower)
+func collectOPMLOutlinesFromNode(n *tinyxml.Node, dst *[]opmlOutline) {
+	if n == nil {
+		return
+	}
+	for _, ch := range n.Children {
+		if strings.EqualFold(ch.Local, "outline") {
+			rawXML := strings.TrimSpace(ch.Attr("xmlUrl"))
+			if rawXML != "" {
+				*dst = append(*dst, opmlOutline{
+					Text:        ch.Attr("text"),
+					Title:       ch.Attr("title"),
+					Type:        ch.Attr("type"),
+					XMLURL:      rawXML,
+					HTMLURL:     strings.TrimSpace(ch.Attr("htmlUrl")),
+					Description: ch.Attr("description"),
+				})
 			}
-			*dst = append(*dst, o)
 		}
-		if len(o.Outlines) > 0 {
-			flattenOPMLOutlines(o.Outlines, dst)
+		if len(ch.Children) > 0 {
+			collectOPMLOutlinesFromNode(ch, dst)
 		}
 	}
+}
+
+func renderOPMLDocument(siteTitle string, dateCreated string, outlines []opmlOutline) []byte {
+	var b bytes.Buffer
+	b.WriteString(tinyxml.Header)
+	b.WriteString("<opml version=\"2.0\">\n  <head>\n")
+	if siteTitle != "" {
+		b.WriteString("    <title>" + tinyxml.EscapeText(siteTitle) + "</title>\n")
+	}
+	if dateCreated != "" {
+		b.WriteString("    <dateCreated>" + tinyxml.EscapeText(dateCreated) + "</dateCreated>\n")
+	}
+	b.WriteString("  </head>\n  <body>\n")
+	for _, o := range outlines {
+		b.WriteString("    <outline")
+		writeOPMLAttr(&b, "text", o.Text)
+		writeOPMLAttr(&b, "title", o.Title)
+		writeOPMLAttr(&b, "type", o.Type)
+		writeOPMLAttr(&b, "xmlUrl", o.XMLURL)
+		writeOPMLAttr(&b, "htmlUrl", o.HTMLURL)
+		writeOPMLAttr(&b, "description", o.Description)
+		b.WriteString("></outline>\n")
+	}
+	b.WriteString("  </body>\n</opml>")
+	return b.Bytes()
+}
+
+func writeOPMLAttr(b *bytes.Buffer, key, val string) {
+	if val == "" {
+		return
+	}
+	b.WriteByte(' ')
+	b.WriteString(key)
+	b.WriteString(`="`)
+	b.WriteString(tinyxml.EscapeText(val))
+	b.WriteByte('"')
 }
 
 func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
@@ -1069,21 +1091,9 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 				Description: fw.Description,
 			})
 		}
-		doc := opmlDocument{
-			Version: "2.0",
-			Head: opmlHead{
-				Title:       siteTitle,
-				DateCreated: time.Now().UTC().Format(time.RFC1123Z),
-			},
-			Body: opmlBodyDoc{Outlines: outlines},
-		}
-		xmlBytes, err := xml.MarshalIndent(doc, "", "  ")
-		if writeServerErr(w, err) {
-			return
-		}
+		xmlBytes := renderOPMLDocument(siteTitle, time.Now().UTC().Format(time.RFC1123Z), outlines)
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="volo-follows.opml"`)
-		_, _ = w.Write([]byte(xml.Header))
 		_, _ = w.Write(xmlBytes)
 		return
 	}
@@ -1133,13 +1143,21 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 			writeErrJSON(w, http.StatusBadRequest, "empty OPML payload")
 			return
 		}
-		var doc opmlDocument
-		if err := xml.Unmarshal(rawOPML, &doc); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "invalid OPML XML: "+err.Error())
+		root, err := tinyxml.Parse(rawOPML)
+		if err != nil || root == nil || !strings.EqualFold(root.Local, "opml") {
+			if err != nil {
+				writeErrJSON(w, http.StatusBadRequest, "invalid OPML XML: "+err.Error())
+			} else {
+				writeErrJSON(w, http.StatusBadRequest, "invalid OPML XML: missing <opml> root")
+			}
 			return
 		}
 		var flat []opmlOutline
-		flattenOPMLOutlines(doc.Body.Outlines, &flat)
+		if bodyNode := root.Child("body"); bodyNode != nil {
+			collectOPMLOutlinesFromNode(bodyNode, &flat)
+		} else {
+			collectOPMLOutlinesFromNode(root, &flat)
+		}
 
 		var existing []struct {
 			FeedURL string `db:"feed_url"`
@@ -3199,6 +3217,9 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			if writeBadErr(w, err) {
 				return
 			}
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			s.recordAuditLog(r, actor, "plugin.clear_kv", "plugin", pid, map[string]any{"cleared": cleared})
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared, "deleted": cleared})
 		case parts[1] == "config" && r.Method == http.MethodPatch:
@@ -3535,6 +3556,18 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 					return
 				}
 			}
+			if s.deps.WAF != nil {
+				s.deps.WAF.UpdateConfig(s.deps.Settings.Snapshot().Security.WAFWindowSeconds)
+			}
+		}
+		if (rest == domain.SettingsDomainSite || rest == domain.SettingsDomainSEO) && s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+			if srch := s.deps.Content.SearchIndex(); srch != nil {
+				_ = srch.Rebuild(r.Context())
+			}
+		}
+		if rest == domain.SettingsDomainReading && s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
 		}
 		if rest == domain.SettingsDomainAppearance {
 			if appVal, ok := val.(domain.AppearanceSettings); ok {
@@ -3580,6 +3613,9 @@ func (s *AppServer) rollbackSecuritySettings(r *http.Request, prev domain.Securi
 	if s.deps.Settings != nil {
 		rbBytes, _ := json.Marshal(prev)
 		_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSecurity, rbBytes, 0)
+	}
+	if s.deps.WAF != nil {
+		s.deps.WAF.UpdateConfig(prev.WAFWindowSeconds)
 	}
 	if resyncGeo {
 		_ = s.syncConfiguredGeoIPDir()
@@ -3649,7 +3685,9 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		case http.MethodGet:
 			page, perPage := parseAdminPageParams(r, 50, 300)
 			roleFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("role")))
+			statusFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
 			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			nowMS := time.Now().UnixMilli()
 			where := []string{"1=1"}
 			var args []any
 			switch roleFilter {
@@ -3659,6 +3697,17 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			case "staff":
 				where = append(where, "role IN ('admin', 'editor')")
 			}
+			switch statusFilter {
+			case "active":
+				where = append(where, "(status = 'active' OR (status = 'disabled' AND ban_until > 0 AND ban_until <= ?))")
+				args = append(args, nowMS)
+			case "disabled", "banned":
+				where = append(where, "(status = 'disabled' AND (ban_until <= 0 OR ban_until > ?))")
+				args = append(args, nowMS)
+			case "muted":
+				where = append(where, "(muted_until < 0 OR muted_until > ?)")
+				args = append(args, nowMS)
+			}
 			if q != "" {
 				pat := "%" + escapeLikePattern(q) + "%"
 				where = append(where, "(LOWER(username) LIKE LOWER(?) ESCAPE '!' OR LOWER(email) LIKE LOWER(?) ESCAPE '!' OR LOWER(display_name) LIKE LOWER(?) ESCAPE '!')")
@@ -3667,7 +3716,7 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			whereSQL := strings.Join(where, " AND ")
 			var total int
 			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM users WHERE `+whereSQL, args...).Scan(&total)
-			baseSQL := `SELECT id, username, email, display_name, avatar_url, bio, website_url, role, status, email_verified_at, preferred_locale, created_at, updated_at
+			baseSQL := `SELECT id, username, email, display_name, avatar_url, bio, website_url, role, status, ban_until, muted_until, ban_reason, shield_comments, shield_text, email_verified_at, preferred_locale, created_at, updated_at
 				 FROM users WHERE ` + whereSQL + `
 				 ORDER BY CASE WHEN role = 'admin' THEN 0 WHEN role = 'editor' THEN 1 ELSE 2 END, created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
@@ -3675,6 +3724,11 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
 			if rows == nil {
 				rows = []domain.User{}
+			}
+			if s.deps.Auth != nil {
+				for i := range rows {
+					s.deps.Auth.HealExpiredUser(r.Context(), &rows[i])
+				}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"items":     rows,
@@ -3763,15 +3817,22 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 	switch r.Method {
 	case http.MethodPatch:
 		var req struct {
-			DisplayName     *string `json:"display_name"`
-			Email           *string `json:"email"`
-			PreferredLocale *string `json:"preferred_locale"`
-			Role            *string `json:"role"`
-			Status          *string `json:"status"`
-			Password        string  `json:"password"`
-			CurrentPassword string  `json:"current_password"`
+			Action          string   `json:"action"`
+			DurationHours   *float64 `json:"duration_hours"`
+			DisplayName     *string  `json:"display_name"`
+			Email           *string  `json:"email"`
+			PreferredLocale *string  `json:"preferred_locale"`
+			Role            *string  `json:"role"`
+			Status          *string  `json:"status"`
+			BanUntil        *int64   `json:"ban_until"`
+			MutedUntil      *int64   `json:"muted_until"`
+			BanReason       *string  `json:"ban_reason"`
+			ShieldComments  *bool    `json:"shield_comments"`
+			ShieldText      *string  `json:"shield_text"`
+			Password        string   `json:"password"`
+			CurrentPassword string   `json:"current_password"`
 		}
-		if !decodeJSONBody(w, r, 8192, &req) {
+		if !decodeJSONBody(w, r, 16384, &req) {
 			return
 		}
 		var u domain.User
@@ -3780,10 +3841,22 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			writeErrJSON(w, http.StatusNotFound, "user not found")
 			return
 		}
-		if rest == actor.ID && ((req.Status != nil && *req.Status != domain.UserStatusActive) || (req.Role != nil && *req.Role != domain.RoleAdmin)) {
-			writeErrJSON(w, http.StatusBadRequest, "cannot demote or disable your own admin account")
+		if s.deps.Auth != nil {
+			s.deps.Auth.HealExpiredUser(r.Context(), &u)
+		}
+
+		action := strings.ToLower(strings.TrimSpace(req.Action))
+		isSelfModeration := action == "ban" || action == "mute" ||
+			(req.Status != nil && *req.Status != domain.UserStatusActive) ||
+			(req.BanUntil != nil && *req.BanUntil > 0) ||
+			(req.MutedUntil != nil && *req.MutedUntil != 0) ||
+			(req.ShieldComments != nil && *req.ShieldComments) ||
+			(req.Role != nil && *req.Role != domain.RoleAdmin)
+		if rest == actor.ID && isSelfModeration {
+			writeErrJSON(w, http.StatusBadRequest, "cannot demote, ban, or mute your own admin account")
 			return
 		}
+
 		roleChanged := req.Role != nil && (*req.Role == domain.RoleAdmin || *req.Role == domain.RoleEditor || *req.Role == domain.RoleReader) && *req.Role != u.Role
 		emailChanged := req.Email != nil && strings.TrimSpace(*req.Email) != "" && !strings.EqualFold(strings.TrimSpace(*req.Email), u.Email)
 		if roleChanged || emailChanged || req.Password != "" {
@@ -3803,9 +3876,99 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		if req.Role != nil && (*req.Role == domain.RoleAdmin || *req.Role == domain.RoleEditor || *req.Role == domain.RoleReader) {
 			u.Role = *req.Role
 		}
+
+		nowMS := time.Now().UnixMilli()
+		auditAction := "user.update"
+
 		if req.Status != nil && (*req.Status == domain.UserStatusActive || *req.Status == domain.UserStatusDisabled) {
 			u.Status = *req.Status
+			if u.Status == domain.UserStatusActive {
+				u.BanUntil = 0
+			} else if req.BanUntil == nil && req.DurationHours == nil && action == "" {
+				u.BanUntil = 0 // permanent ban when status explicitly set to disabled without duration
+			}
 		}
+		if req.BanUntil != nil {
+			if *req.BanUntil <= 0 {
+				u.BanUntil = 0
+			} else {
+				u.BanUntil = *req.BanUntil
+			}
+		}
+		if req.MutedUntil != nil {
+			if *req.MutedUntil < 0 {
+				u.MutedUntil = -1
+			} else if *req.MutedUntil == 0 {
+				u.MutedUntil = 0
+			} else {
+				u.MutedUntil = *req.MutedUntil
+			}
+		}
+		if req.BanReason != nil {
+			u.BanReason = sanitizeModerationText(*req.BanReason, 300)
+		}
+		if req.ShieldText != nil {
+			u.ShieldText = sanitizeModerationText(*req.ShieldText, 240)
+		}
+		if req.ShieldComments != nil {
+			u.ShieldComments = *req.ShieldComments
+		}
+
+		switch action {
+		case "ban":
+			u.Status = domain.UserStatusDisabled
+			if req.DurationHours != nil && *req.DurationHours > 0 {
+				dur := time.Duration(*req.DurationHours * float64(time.Hour))
+				if dur > 10*365*24*time.Hour {
+					dur = 10 * 365 * 24 * time.Hour
+				}
+				u.BanUntil = nowMS + dur.Milliseconds()
+			} else if req.BanUntil == nil {
+				u.BanUntil = 0 // permanent ban
+			}
+			auditAction = "user.ban"
+		case "unban":
+			u.Status = domain.UserStatusActive
+			u.BanUntil = 0
+			if !u.IsMutedAt(nowMS) {
+				u.BanReason = ""
+				if req.ShieldComments == nil {
+					u.ShieldComments = false
+				}
+			}
+			auditAction = "user.unban"
+		case "mute":
+			if req.DurationHours != nil && *req.DurationHours > 0 {
+				dur := time.Duration(*req.DurationHours * float64(time.Hour))
+				if dur > 10*365*24*time.Hour {
+					dur = 10 * 365 * 24 * time.Hour
+				}
+				u.MutedUntil = nowMS + dur.Milliseconds()
+			} else if req.MutedUntil == nil {
+				u.MutedUntil = -1 // indefinite mute
+			}
+			auditAction = "user.mute"
+		case "unmute":
+			u.MutedUntil = 0
+			if !u.IsBannedAt(nowMS) {
+				u.BanReason = ""
+				if req.ShieldComments == nil {
+					u.ShieldComments = false
+				}
+			}
+			auditAction = "user.unmute"
+		case "":
+			// Direct field updates handled above
+		default:
+			writeErrJSON(w, http.StatusBadRequest, "invalid user moderation action")
+			return
+		}
+
+		// Reversible shielding only applies while banned or muted; once neither applies, restore comments automatically.
+		if !u.IsBannedAt(nowMS) && !u.IsMutedAt(nowMS) {
+			u.ShieldComments = false
+		}
+
 		if req.Password != "" {
 			if writeBadErr(w, auth.ValidatePasswordPolicy(req.Password)) {
 				return
@@ -3813,26 +3976,33 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			u.PasswordHash, _ = auth.HashPassword(req.Password)
 			u.LegacyHash = ""
 		}
+		u.UpdatedAt = nowMS
 		_, err = s.deps.Store.ExecContext(r.Context(),
-			`UPDATE users SET display_name = ?, email = ?, preferred_locale = ?, role = ?, status = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
-			u.DisplayName, u.Email, u.PreferredLocale, u.Role, u.Status, u.PasswordHash, u.LegacyHash, time.Now().UnixMilli(), rest)
+			`UPDATE users SET display_name = ?, email = ?, preferred_locale = ?, role = ?, status = ?, ban_until = ?, muted_until = ?, ban_reason = ?, shield_comments = ?, shield_text = ?, password_hash = ?, legacy_hash = ?, updated_at = ? WHERE id = ?`,
+			u.DisplayName, u.Email, u.PreferredLocale, u.Role, u.Status, u.BanUntil, u.MutedUntil, u.BanReason, u.ShieldComments, u.ShieldText, u.PasswordHash, u.LegacyHash, nowMS, rest)
 		if writeBadErr(w, err) {
 			return
 		}
-		if u.Status == domain.UserStatusDisabled || req.Password != "" || roleChanged {
+		if u.IsBannedAt(nowMS) || req.Password != "" || roleChanged {
 			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM user_sessions WHERE user_id = ?`, rest)
 			_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM user_credentials WHERE user_id = ? AND kind = 'oidc'`, rest)
 			_ = s.deps.Auth.RevokeUserAPITokens(r.Context(), rest)
 		}
-		s.recordAuditLog(r, actor, "user.update", "user", rest, map[string]any{
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
+		s.recordAuditLog(r, actor, auditAction, "user", rest, map[string]any{
 			"role":             u.Role,
 			"status":           u.Status,
+			"ban_until":        u.BanUntil,
+			"muted_until":      u.MutedUntil,
+			"shield_comments":  u.ShieldComments,
 			"self":             rest == actor.ID,
 			"role_changed":     roleChanged,
 			"email_changed":    emailChanged,
 			"password_changed": req.Password != "",
 		})
-		writeOKJSON(w)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": u})
 
 	case http.MethodDelete:
 		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
@@ -3842,12 +4012,27 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 			_, err := tx.ExecContext(r.Context(), `DELETE FROM users WHERE id = ?`, rest)
 			return err
 		})
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "user.delete", "user", rest, nil)
 		writeOKJSON(w)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func sanitizeModerationText(raw string, maxRunes int) string {
+	clean := strings.TrimSpace(repo.StripASCIIControls(raw))
+	if clean == "" {
+		return ""
+	}
+	runes := []rune(clean)
+	if len(runes) > maxRunes {
+		clean = string(runes[:maxRunes])
+	}
+	return clean
 }
 
 func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {

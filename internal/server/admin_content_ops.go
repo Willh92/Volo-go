@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -26,7 +25,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
-	"github.com/Willh92/Volo-go/internal/visibility"
+	"github.com/Willh92/Volo-go/internal/tinyxml"
 	"github.com/Willh92/Volo-go/pkg/id"
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
@@ -169,7 +168,8 @@ func (s *AppServer) handleAdminBatchImportArticles(w http.ResponseWriter, r *htt
 				}
 			} else if cleanCat := strings.TrimSpace(fm.Category); cleanCat != "" {
 				catSlug := sanitizeSlug(cleanCat)
-				if cat, gErr := sqlx.Get[domain.Category](r.Context(), tx, `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) OR slug = ?`, cleanCat, catSlug); gErr == nil {
+				var cat domain.Category
+				if gErr := sqlx.GetInto(r.Context(), tx, &cat, `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) OR slug = ?`, cleanCat, catSlug); gErr == nil {
 					catID = cat.ID
 				}
 			}
@@ -785,90 +785,87 @@ func (s *AppServer) syncAllFollowFeeds(ctx context.Context) (int, error) {
 }
 
 func parseRSSOrAtomFeed(raw []byte) ([]parsedFeedEntry, error) {
-	type rssItem struct {
-		Title       string `xml:"title"`
-		Link        string `xml:"link"`
-		GUID        string `xml:"guid"`
-		Description string `xml:"description"`
-		Author      string `xml:"author"`
-		Creator     string `xml:"creator"`
-		PubDate     string `xml:"pubDate"`
+	root, err := tinyxml.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unrecognized RSS/Atom XML: %w", err)
 	}
-	type rssDoc struct {
-		Channel struct {
-			Items []rssItem `xml:"item"`
-		} `xml:"channel"`
+	var rssItems []*tinyxml.Node
+	if ch := root.Child("channel"); ch != nil {
+		rssItems = ch.ChildrenByLocal("item")
 	}
-	var rDoc rssDoc
-	if xml.Unmarshal(raw, &rDoc) == nil && len(rDoc.Channel.Items) > 0 {
-		out := make([]parsedFeedEntry, 0, len(rDoc.Channel.Items))
-		for _, it := range rDoc.Channel.Items {
-			guid := strings.TrimSpace(it.GUID)
+	if len(rssItems) == 0 {
+		rssItems = root.ChildrenByLocal("item")
+	}
+	if len(rssItems) > 0 {
+		out := make([]parsedFeedEntry, 0, len(rssItems))
+		for _, it := range rssItems {
+			link := strings.TrimSpace(it.ChildText("link"))
+			guid := strings.TrimSpace(it.ChildText("guid"))
 			if guid == "" {
-				guid = strings.TrimSpace(it.Link)
+				guid = link
 			}
-			author := strings.TrimSpace(it.Author)
+			author := strings.TrimSpace(it.ChildText("author"))
 			if author == "" {
-				author = strings.TrimSpace(it.Creator)
+				author = strings.TrimSpace(it.ChildText("creator"))
+			}
+			desc := it.ChildText("description")
+			if desc == "" {
+				desc = it.ChildText("encoded")
+			}
+			pubRaw := it.ChildText("pubDate")
+			if pubRaw == "" {
+				pubRaw = it.ChildText("date")
 			}
 			out = append(out, parsedFeedEntry{
 				GUID:      guid,
-				Title:     strings.TrimSpace(it.Title),
-				URL:       strings.TrimSpace(it.Link),
-				Summary:   stripHTMLTagsSimple(it.Description),
+				Title:     strings.TrimSpace(it.ChildText("title")),
+				URL:       link,
+				Summary:   stripHTMLTagsSimple(desc),
 				Author:    author,
-				Published: parseFlexibleTimeMS(it.PubDate),
+				Published: parseFlexibleTimeMS(pubRaw),
 			})
 		}
 		return out, nil
 	}
 
-	type atomLink struct {
-		Href string `xml:"href,attr"`
-		Rel  string `xml:"rel,attr"`
+	entries := root.ChildrenByLocal("entry")
+	if !strings.EqualFold(root.Local, "feed") && len(entries) == 0 {
+		return nil, errors.New("unrecognized RSS/Atom XML: missing channel or feed entries")
 	}
-	type atomEntry struct {
-		ID      string     `xml:"id"`
-		Title   string     `xml:"title"`
-		Links   []atomLink `xml:"link"`
-		Summary string     `xml:"summary"`
-		Content string     `xml:"content"`
-		Updated string     `xml:"updated"`
-		Author  struct {
-			Name string `xml:"name"`
-		} `xml:"author"`
-	}
-	type atomFeed struct {
-		Entries []atomEntry `xml:"entry"`
-	}
-	var aDoc atomFeed
-	if err := xml.Unmarshal(raw, &aDoc); err != nil {
-		return nil, fmt.Errorf("unrecognized RSS/Atom XML: %w", err)
-	}
-	out := make([]parsedFeedEntry, 0, len(aDoc.Entries))
-	for _, ent := range aDoc.Entries {
+	out := make([]parsedFeedEntry, 0, len(entries))
+	for _, ent := range entries {
 		href := ""
-		for _, lk := range ent.Links {
-			if lk.Href != "" && (lk.Rel == "" || lk.Rel == "alternate") {
-				href = strings.TrimSpace(lk.Href)
+		for _, lk := range ent.ChildrenByLocal("link") {
+			rel := strings.TrimSpace(lk.Attr("rel"))
+			cand := strings.TrimSpace(lk.Attr("href"))
+			if cand != "" && (rel == "" || strings.EqualFold(rel, "alternate")) {
+				href = cand
 				break
 			}
 		}
-		guid := strings.TrimSpace(ent.ID)
+		guid := strings.TrimSpace(ent.ChildText("id"))
 		if guid == "" {
 			guid = href
 		}
-		summary := ent.Summary
+		summary := ent.ChildText("summary")
 		if summary == "" {
-			summary = ent.Content
+			summary = ent.ChildText("content")
+		}
+		authorName := ""
+		if au := ent.Child("author"); au != nil {
+			authorName = strings.TrimSpace(au.ChildText("name"))
+		}
+		upd := ent.ChildText("updated")
+		if upd == "" {
+			upd = ent.ChildText("published")
 		}
 		out = append(out, parsedFeedEntry{
 			GUID:      guid,
-			Title:     strings.TrimSpace(ent.Title),
+			Title:     strings.TrimSpace(ent.ChildText("title")),
 			URL:       href,
 			Summary:   stripHTMLTagsSimple(summary),
-			Author:    strings.TrimSpace(ent.Author.Name),
-			Published: parseFlexibleTimeMS(ent.Updated),
+			Author:    authorName,
+			Published: parseFlexibleTimeMS(upd),
 		})
 	}
 	return out, nil
@@ -1208,7 +1205,7 @@ func (s *AppServer) publishGitHubShowcaseArticle(ctx context.Context, actor *dom
 		if bErr := s.bindArticleTagsByNamesTx(ctx, tx, cur.ID, tagNames, now); bErr != nil {
 			return bErr
 		}
-		targetURL := "/posts/" + cur.Slug
+		targetURL := s.deps.Content.Guard().ArticleURL(cur)
 		var navCnt int
 		_ = tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM nav_items WHERE url IN (?, '/posts/github', '/posts/my-github-repos', '/my-github-repos', '/github')`,
@@ -1258,7 +1255,7 @@ func (s *AppServer) pushIndexNowURLs(ctx context.Context, baseURL string) (int, 
 	// Strictly exclude password-protected posts from IndexNow submission!
 	var rows []domain.RawArticle
 	err = sqlx.SelectInto(ctx, s.deps.Store, &rows,
-		`SELECT slug FROM articles WHERE status = ? AND password_ciphertext = '' ORDER BY updated_at DESC LIMIT 50`,
+		`SELECT slug, published_at FROM articles WHERE status = ? AND password_ciphertext = '' ORDER BY updated_at DESC LIMIT 50`,
 		domain.ArticleStatusPublished)
 	if err != nil {
 		return 0, err
@@ -1266,7 +1263,7 @@ func (s *AppServer) pushIndexNowURLs(ctx context.Context, baseURL string) (int, 
 	urls := make([]string, 0, len(rows)+1)
 	urls = append(urls, strings.TrimRight(baseURL, "/")+"/")
 	for _, r := range rows {
-		urls = append(urls, strings.TrimRight(baseURL, "/")+visibility.ArticlePath(r.Slug))
+		urls = append(urls, strings.TrimRight(baseURL, "/")+s.deps.Content.Guard().ArticleURL(r))
 	}
 
 	payload, _ := json.Marshal(map[string]any{

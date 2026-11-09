@@ -18,11 +18,14 @@
 
     {{if eq .TaxonomyKind "categories"}}
       {{if .Categories}}
+        {{$shownCatLen := len .Categories}}
+        {{$totalCatLen := $shownCatLen}}
+        {{if gt .Pagination.TotalItems $totalCatLen}}{{$totalCatLen = .Pagination.TotalItems}}{{end}}
         <div class="studio-article studio-card-pad" data-collection-root="categories">
           <div class="studio-collection-toolbar studio-collection-toolbar--inline">
             <div class="studio-collection-search-wrap">
               <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{t .Locale "nav.categories"}}" autocomplete="off">
-              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{len .Categories}}">{{len .Categories}}</span>
+              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{$totalCatLen}}">{{if gt $totalCatLen $shownCatLen}}{{$shownCatLen}} / {{$totalCatLen}}{{else}}{{$totalCatLen}}{{end}}</span>
             </div>
             {{if gt (len .Categories) 1}}
               <nav class="studio-jump-pills" aria-label="{{t .Locale "nav.categories"}}">
@@ -146,13 +149,18 @@
         {{template "empty_state" (dict "Title" (t .Locale "studio.empty_archives_title") "Desc" (t .Locale "studio.empty_archives_desc"))}}
       {{end}}
     {{else if eq .TaxonomyKind "series"}}
-      {{if .SeriesList}}
+      {{if or .SeriesList .TagQuery}}
+        {{$shownSeriesLen := len .SeriesList}}
+        {{$totalSeriesLen := $shownSeriesLen}}
+        {{if gt .Pagination.TotalItems $totalSeriesLen}}{{$totalSeriesLen = .Pagination.TotalItems}}{{end}}
         <div class="studio-article studio-card-pad" data-collection-root="series">
           <div class="studio-collection-toolbar studio-collection-toolbar--inline">
-            <div class="studio-collection-search-wrap">
-              <input type="search" class="volo-input studio-collection-filter js-collection-filter" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{.HeroTitle}}" autocomplete="off">
-              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{len .SeriesList}}">{{len .SeriesList}}</span>
-            </div>
+            <form class="studio-tax-search studio-collection-search-wrap" method="get" action="/series">
+              <input type="search" name="q" value="{{.TagQuery}}" class="volo-input studio-tax-search__input studio-collection-filter js-collection-filter js-series-filter-input" placeholder="{{t .Locale "studio.filter_placeholder"}}" aria-label="{{.HeroTitle}}" autocomplete="off">
+              <a class="studio-icon-btn studio-tag-clear js-series-filter-clear" href="/series" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg><span>×</span></a>
+              <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{.HeroTitle}}">↵</button>
+              <span class="volo-badge studio-collection-count js-collection-count" data-total="{{$totalSeriesLen}}">{{if and (gt $totalSeriesLen $shownSeriesLen) (not .TagQuery)}}{{$shownSeriesLen}} / {{$totalSeriesLen}}{{else}}{{$shownSeriesLen}}{{end}}</span>
+            </form>
             {{if gt (len .SeriesList) 1}}
               <nav class="studio-jump-pills" aria-label="{{.HeroTitle}}">
                 {{range $i, $s := .SeriesList}}
@@ -163,15 +171,19 @@
               </nav>
             {{end}}
           </div>
-          <div class="bookshelf-grid">
-            {{range .SeriesList}}
-              <a id="series-card-{{.Slug}}" class="book-card studio-tax-card" href="/series/{{.Slug}}" data-collection-item="{{lower .Title}} {{lower .Slug}} {{lower .Description}}">
-                <strong>{{.Title}}</strong>
-                {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
-              </a>
-            {{end}}
-          </div>
-          <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+          {{if .SeriesList}}
+            <div class="bookshelf-grid">
+              {{range .SeriesList}}
+                <a id="series-card-{{.Slug}}" class="book-card studio-tax-card" href="/series/{{.Slug}}" data-collection-item="{{lower .Title}} {{lower .Slug}} {{lower .Description}}">
+                  <strong>{{.Title}}</strong>
+                  {{if .Description}}<p class="studio-tax-card__desc">{{.Description}}</p>{{end}}
+                </a>
+              {{end}}
+            </div>
+            <p class="studio-muted-empty js-collection-empty" hidden>{{t .Locale "studio.filter_empty"}}</p>
+          {{else}}
+            <p class="studio-muted-empty">{{t .Locale "search.empty"}}</p>
+          {{end}}
         </div>
         {{template "pagination" .}}
       {{else}}

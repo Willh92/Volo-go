@@ -33,7 +33,7 @@ export interface MediaLibraryModalProps {
   open: boolean;
   onClose: () => void;
   onSelect: (asset: MediaAssetRecord) => void;
-  filterKind?: "all" | "image" | "audio";
+  filterKind?: "all" | "image" | "video" | "audio";
   title?: string;
 }
 
@@ -55,7 +55,7 @@ export function MediaLibraryModal({
   const [reconciling, setReconciling] = useState(false);
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 250);
-  const [kindTab, setKindTab] = useState<"all" | "image" | "audio">(filterKind);
+  const [kindTab, setKindTab] = useState<"all" | "image" | "video" | "audio">(filterKind);
   const [usageTab, setUsageTab] = useState<"all" | "used" | "unused">("all");
   const [monthFilter, setMonthFilter] = useState("");
   const [brokenIds, setBrokenIds] = useState<Record<string, boolean>>({});
@@ -80,8 +80,7 @@ export function MediaLibraryModal({
         per_page: String(MODAL_PAGE_SIZE),
       });
       if (q.trim()) params.set("q", q.trim());
-      if (kind === "image") params.set("mime", "image");
-      else if (kind === "audio") params.set("mime", "audio");
+      if (kind !== "all") params.set("mime", kind);
       if (usage !== "all") {
         params.set("usage", usage);
         if (usage === "unused") params.set("orphan_only", "1");
@@ -198,6 +197,8 @@ export function MediaLibraryModal({
   const acceptAttr =
     filterKind === "image"
       ? "image/*"
+      : filterKind === "video"
+      ? "video/*"
       : filterKind === "audio"
       ? "audio/*"
       : "image/*,audio/*,video/*";
@@ -218,7 +219,7 @@ export function MediaLibraryModal({
       <div class="volo-filter-bar" style={{ marginBottom: "14px" }}>
         {filterKind === "all" ? (
           <div class="volo-filter-pills">
-            {(["all", "image", "audio"] as const).map((k) => (
+            {(["all", "image", "video", "audio"] as const).map((k) => (
               <button
                 key={k}
                 type="button"
@@ -232,13 +233,19 @@ export function MediaLibraryModal({
                   ? t("cnt.media_type_all")
                   : k === "image"
                   ? t("cnt.media_type_image")
+                  : k === "video"
+                  ? t("cnt.media_type_video")
                   : t("cnt.media_type_audio")}
               </button>
             ))}
           </div>
         ) : (
           <span class="volo-badge">
-            {filterKind === "image" ? t("cnt.media_type_image") : t("cnt.media_type_audio")}
+            {filterKind === "image"
+              ? t("cnt.media_type_image")
+              : filterKind === "video"
+              ? t("cnt.media_type_video")
+              : t("cnt.media_type_audio")}
           </span>
         )}
 
@@ -312,6 +319,7 @@ export function MediaLibraryModal({
           <div class="volo-media-picker-grid">
             {displayItems.map((m) => {
               const isImg = (m.mime_type || "").startsWith("image/");
+              const isVideo = (m.mime_type || "").startsWith("video/");
               const isAudio = (m.mime_type || "").startsWith("audio/");
               const isBroken = Boolean(brokenIds[m.id]);
               const isSmallImg = m.width > 0 && m.width <= 160 && m.height > 0 && m.height <= 140;
@@ -335,6 +343,14 @@ export function MediaLibraryModal({
                         class={isSmallImg ? "is-small-img" : ""}
                         onError={() => setBrokenIds((prev) => ({ ...prev, [m.id]: true }))}
                       />
+                    ) : isVideo && !isBroken ? (
+                      <video
+                        src={m.public_url}
+                        preload="metadata"
+                        muted
+                        playsInline
+                        onError={() => setBrokenIds((prev) => ({ ...prev, [m.id]: true }))}
+                      />
                     ) : isAudio ? (
                       <div class="volo-media-type-placeholder">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -346,7 +362,7 @@ export function MediaLibraryModal({
                       </div>
                     ) : (
                       <div class="volo-media-type-placeholder">
-                        <span>{isBroken ? "IMG" : (m.mime_type || "FILE").split("/").pop()?.toUpperCase()}</span>
+                        <span>{isBroken ? (isVideo ? "VIDEO" : "IMG") : (m.mime_type || "FILE").split("/").pop()?.toUpperCase()}</span>
                       </div>
                     )}
                     {typeof m.ref_count === "number" && (
@@ -382,7 +398,7 @@ export function MediaLibraryModal({
 
 export interface MediaPickButtonProps {
   onPick: (url: string, asset: MediaAssetRecord) => void;
-  filterKind?: "all" | "image" | "audio";
+  filterKind?: "all" | "image" | "video" | "audio";
   label?: string;
   className?: string;
 }

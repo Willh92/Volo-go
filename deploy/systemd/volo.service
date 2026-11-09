@@ -16,21 +16,22 @@ TimeoutStopSec=20
 Restart=on-failure
 RestartSec=3
 
-# Runtime directory for zero-TCP-overhead Unix Domain Socket (/run/volo/volo.sock)
+# Persistent runtime directory across reboots for Unix Domain Socket (/run/volo/volo.sock).
+# When sharing the socket with nginx/caddy (VOLO_SOCKET_GROUP=www-data, VOLO_SOCKET_MODE=0660),
+# add `SupplementaryGroups=www-data` via `sudo systemctl edit volo` (or use scripts/install-service.sh).
 RuntimeDirectory=volo
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=2750
 
 # File descriptor & process limits
 LimitNOFILE=65536
 
 # Systemd sandboxing & privilege hardening
-# Note: When configuring custom directories outside /var/lib/volo (e.g. VOLO_UPLOAD_DIR,
-# VOLO_BACKUP_DIR, VOLO_GEOIP_DIR, VOLO_THEMES_DIR, or VOLO_PLUGINS_DIR), grant write
-# access via a drop-in override (`sudo systemctl edit volo`):
+# Note: scripts/install-service.sh automatically resolves symlinks and adapts ReadWritePaths,
+# ProtectHome, and PrivateTmp for custom install/data/socket paths. When editing manually:
 #   [Service]
-#   ReadWritePaths=/custom/uploads /custom/geoip
-# If custom paths reside under /home/... (blocked by ProtectHome=true), also add:
-#   ProtectHome=read-only
+#   ReadWritePaths=/custom/real/data/path /custom/real/socket/parent
+#   ProtectHome=false    # required if binary, data, or socket lives under /home or /root
+#   PrivateTmp=false     # required if data or socket lives under /tmp or /var/tmp
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

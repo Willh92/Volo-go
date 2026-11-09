@@ -18,6 +18,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/repo"
+	"github.com/Willh92/Volo-go/internal/security"
 )
 
 func TestScheduler_LocalRetentionPruningAndRemoteS3WebDAVSync(t *testing.T) {
@@ -121,10 +122,11 @@ func TestScheduler_LocalRetentionPruningAndRemoteS3WebDAVSync(t *testing.T) {
 	}
 
 	sched := backup.NewScheduler(backup.SchedulerOptions{
-		Store:     store,
-		Settings:  settings,
-		BackupDir: backupDir,
-		UploadDir: uploadDir,
+		Store:          store,
+		Settings:       settings,
+		BackupDir:      backupDir,
+		UploadDir:      uploadDir,
+		OutboundDialer: &security.OutboundSafeDialer{AllowLoopbackForTests: true},
 	})
 
 	for i := 0; i < 3; i++ {
@@ -172,5 +174,17 @@ func TestScheduler_LocalRetentionPruningAndRemoteS3WebDAVSync(t *testing.T) {
 	mu.Unlock()
 	if gotS3 != 1 {
 		t.Fatalf("expected 1 S3 streaming PUT, got %d", gotS3)
+	}
+
+	// 3. Storage plugin protocol when plugin is detached/unavailable handles gracefully without failing automatic local backup!
+	_, _, err = settings.PatchDomain(ctx, domain.SettingsDomainBackup, []byte(`{
+		"remote_protocol": "plugin:detached-storage"
+	}`), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resPlug, err := sched.RunOnce(ctx)
+	if err != nil || resPlug.LocalPath == "" {
+		t.Fatalf("expected detached plugin remote protocol to preserve automatic local backup without error, got res=%+v err=%v", resPlug, err)
 	}
 }

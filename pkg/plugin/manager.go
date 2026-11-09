@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -316,6 +317,7 @@ type managedPlugin struct {
 	gojaRT         *gojaPluginRuntime
 	kv             *KVStore
 	enabled        bool
+	runtimeActive  bool
 	priority       int
 	customPriority bool
 	prioritySnap   atomic.Int64
@@ -750,6 +752,19 @@ func (m *Manager) ClearPluginKV(ctx context.Context, pluginID string) (int64, er
 	if !ok {
 		return 0, fmt.Errorf("plugin %q not found", idClean)
 	}
+	if hub := lookupKVHub(m.store); hub != nil {
+		hub.flushMu.Lock()
+		hub.mu.Lock()
+		hub.gen++
+		for pk := range hub.entries {
+			if pk.pluginID == idClean {
+				delete(hub.dirty, pk)
+				delete(hub.entries, pk)
+			}
+		}
+		hub.mu.Unlock()
+		defer hub.flushMu.Unlock()
+	}
 	res, err := m.store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, idClean)
 	if err != nil {
 		return 0, err
@@ -852,9 +867,11 @@ func (m *Manager) syncRecordWithDB(
 	builtin BuiltinPlugin,
 ) (*managedPlugin, error) {
 	now := time.Now().Unix()
-	existing, err := sqlx.Get[domain.PluginRecord](
+	var existing domain.PluginRecord
+	err := sqlx.GetInto(
 		ctx,
 		m.store,
+		&existing,
 		`SELECT id, kind, version, is_enabled, config_json, secret_ciphertext, circuit_state, failure_count, last_error, installed_at, updated_at
 		 FROM plugins WHERE id = ?`,
 		manifest.ID,
@@ -1118,7 +1135,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 				mp:      mp,
 			})
 		}
-		if mp.manifest.HasPermission("provider:oidc") && rt.hasCallable("oidcAuthURL") && rt.hasCallable("oidcExchange") {
+		if mp.manifest.HasOIDCCapability() && rt.hasCallable("oidcAuthURL") && rt.hasCallable("oidcExchange") {
 			adapter := newGojaOIDCAdapter(ctx, m, mp, rt)
 			m.providers.RegisterOIDC(mp.manifest.ID, adapter)
 		}
@@ -1137,6 +1154,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			}
 		}
 	}
+	mp.runtimeActive = true
 	m.logger.Write(mp.manifest.ID, "info", "lifecycle", "plugin enabled v"+mp.manifest.Version)
 	return nil
 }
@@ -1157,15 +1175,31 @@ func (m *Manager) deactivateRuntimeOpts(ctx context.Context, mp *managedPlugin, 
 	builtin := mp.builtin
 	rt := mp.gojaRT
 	mp.gojaRT = nil
+	wasRuntimeActive := mp.runtimeActive
+	mp.runtimeActive = false
 	mp.mu.Unlock()
 
-	if runtimeKind == RuntimeBuiltin && builtin != nil {
+	if runtimeKind == RuntimeBuiltin && builtin != nil && wasRuntimeActive {
 		_ = safeCallBuiltin(mp.manifest.ID, "OnDisable", func() error {
 			return builtin.OnDisable(ctx)
 		})
 	} else if rt != nil {
 		_, _, _ = rt.invoke(ctx, m.hookTimeout, "onDisable")
 		rt.closeRuntime()
+	}
+
+	if m.store != nil {
+		flushCtx := ctx
+		var cancel context.CancelFunc
+		if flushCtx == nil || flushCtx.Err() != nil {
+			flushCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+		}
+		if fErr := FlushPluginKV(flushCtx, m.store, mp.manifest.ID); fErr != nil {
+			slog.Warn("plugin: failed to flush buffered kv on deactivate", "plugin_id", mp.manifest.ID, "err", fErr)
+		}
+		if cancel != nil {
+			cancel()
+		}
 	}
 	m.logger.Write(mp.manifest.ID, "info", "lifecycle", "plugin disabled")
 }
@@ -1221,6 +1255,10 @@ func (m *Manager) Enable(ctx context.Context, pluginID string) error {
 		mp.mu.Unlock()
 		return fmt.Errorf("plugin %q circuit breaker is OPEN (%s); reset circuit before enabling", pluginID, mp.lastError)
 	}
+	if mp.enabled && mp.runtimeActive {
+		mp.mu.Unlock()
+		return nil
+	}
 	mp.enabled = true
 	mp.updatedAt = time.Now().Unix()
 	mp.mu.Unlock()
@@ -1228,6 +1266,7 @@ func (m *Manager) Enable(ctx context.Context, pluginID string) error {
 	if err := m.activateRuntime(ctx, mp); err != nil {
 		mp.mu.Lock()
 		mp.enabled = false
+		mp.runtimeActive = false
 		mp.lastError = err.Error()
 		mp.mu.Unlock()
 		_, _ = m.store.ExecContext(
@@ -1288,6 +1327,22 @@ func (m *Manager) ResetCircuit(ctx context.Context, pluginID string) error {
 		CircuitClosed, now, pluginID,
 	)
 	return err
+}
+
+func invalidateOIDCDiscoveryKV(ctx context.Context, kv *KVStore) {
+	if kv == nil {
+		return
+	}
+	items, err := kv.ListPrefix(ctx, "", 256, "")
+	if err != nil {
+		return
+	}
+	for _, it := range items {
+		lk := strings.ToLower(it.Key)
+		if strings.Contains(lk, "discovery") || strings.Contains(lk, "jwks") || strings.Contains(lk, "openid") {
+			_ = kv.Delete(ctx, it.Key)
+		}
+	}
 }
 
 // UpdateConfig validates a partial/full config patch against ConfigSchema, seals secret fields with AES-256-GCM,
@@ -1366,6 +1421,7 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 	mp.rebuildConfigSnapshot()
 	isActive := mp.enabled && mp.circuitState == CircuitClosed
 	runtimeKind := mp.manifest.Runtime
+	hasOIDCCap := mp.manifest.HasOIDCCapability()
 	bp := mp.builtin
 	rt := mp.gojaRT
 	cfgSnap := mp.getConfigMap()
@@ -1383,6 +1439,35 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 		return PluginSummary{}, err
 	}
 
+	if rt != nil {
+		rt.resetHTTPClient()
+	}
+
+	var activeOIDCProvs []OIDCProvider
+	if m.providers != nil {
+		activeOIDCProvs = m.providers.OIDCProvidersForPlugin(pluginID)
+	}
+	isOIDCPlugin := hasOIDCCap || len(activeOIDCProvs) > 0
+	if isOIDCPlugin {
+		invalidateOIDCDiscoveryKV(ctx, mp.kv)
+		if bp != nil {
+			if inv, ok := bp.(OIDCDiscoveryInvalidator); ok {
+				_ = safeCallBuiltin(pluginID, "InvalidateOIDCDiscovery", func() error {
+					inv.InvalidateOIDCDiscovery()
+					return nil
+				})
+			}
+		}
+		for _, prov := range activeOIDCProvs {
+			if inv, ok := prov.(OIDCDiscoveryInvalidator); ok {
+				inv.InvalidateOIDCDiscovery()
+			}
+		}
+		if rt != nil {
+			rt.resetPool()
+		}
+	}
+
 	if isActive {
 		cfgCopy := make(map[string]any, len(cfgSnap))
 		for k, v := range cfgSnap {
@@ -1393,13 +1478,20 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 			}
 		}
 		if runtimeKind == RuntimeBuiltin && bp != nil {
-			if listener, lOk := bp.(ConfigChangeListener); lOk {
+			_, hasListener := bp.(ConfigChangeListener)
+			_, hasInvalidator := bp.(OIDCDiscoveryInvalidator)
+			if hasListener {
 				if cErr := safeCallBuiltin(pluginID, "OnConfigChange", func() error {
-					return listener.OnConfigChange(ctx, cfgCopy)
+					return bp.(ConfigChangeListener).OnConfigChange(ctx, cfgCopy)
 				}); cErr != nil {
 					m.recordFailure(ctx, mp, "config_change", cErr)
 				} else {
 					m.recordSuccess(ctx, mp)
+				}
+			} else if isOIDCPlugin && !hasInvalidator {
+				m.deactivateRuntime(ctx, mp)
+				if aErr := m.activateRuntime(ctx, mp); aErr != nil {
+					m.recordFailure(ctx, mp, "config_change", aErr)
 				}
 			}
 		} else if rt != nil && rt.hasCallable("onConfigChange") {
@@ -1408,6 +1500,11 @@ func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[s
 			} else {
 				m.recordSuccess(ctx, mp)
 			}
+		}
+		if isOIDCPlugin && rt != nil && m.providers != nil && rt.hasCallable("oidcAuthURL") && rt.hasCallable("oidcExchange") {
+			m.providers.DetachOIDCPlugin(pluginID)
+			adapter := newGojaOIDCAdapter(ctx, m, mp, rt)
+			m.providers.RegisterOIDC(pluginID, adapter)
 		}
 	}
 
@@ -1865,11 +1962,12 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 		return PluginSummary{}, err
 	}
 
-	// Check existing plugin conflict and capture previous version for onInstall lifecycle hook.
+	// Check existing plugin conflict and capture previous version + enabled state for upgrade lifecycle.
 	targetDir := filepath.Join(m.pluginsDir, manifest.ID)
 	existingMP, exists := m.getPlugin(manifest.ID)
 	prevVersion := ""
 	isUpgrade := false
+	wasEnabled := false
 	if exists {
 		if existingMP.kind == "builtin" {
 			return PluginSummary{}, fmt.Errorf("plugin %q conflicts with a built-in plugin", manifest.ID)
@@ -1877,16 +1975,27 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 		if !overwrite {
 			return PluginSummary{}, fmt.Errorf("plugin %q is already installed (set overwrite=true to upgrade)", manifest.ID)
 		}
+		existingMP.mu.Lock()
+		wasEnabled = existingMP.enabled
+		existingMP.mu.Unlock()
 		prevVersion = existingMP.manifest.Version
 		isUpgrade = true
-		_ = m.Disable(ctx, manifest.ID)
+		if dErr := m.Disable(ctx, manifest.ID); dErr != nil {
+			slog.Warn("plugin: disable before upgrade failed", "plugin_id", manifest.ID, "err", dErr)
+		}
 	} else {
 		if _, statErr := os.Stat(targetDir); statErr == nil && !overwrite {
 			return PluginSummary{}, fmt.Errorf("plugin directory %q already exists", manifest.ID)
 		}
-		if dbRec, dbErr := sqlx.Get[domain.PluginRecord](ctx, m.store, `SELECT version FROM plugins WHERE id = ?`, manifest.ID); dbErr == nil && dbRec.Version != "" {
-			prevVersion = dbRec.Version
-			isUpgrade = true
+		var dbRec domain.PluginRecord
+		if dbErr := sqlx.GetInto(ctx, m.store, &dbRec, `SELECT version, is_enabled FROM plugins WHERE id = ?`, manifest.ID); dbErr == nil {
+			if dbRec.Version != "" {
+				prevVersion = dbRec.Version
+				isUpgrade = true
+			}
+			if overwrite && dbRec.IsEnabled {
+				wasEnabled = true
+			}
 		}
 	}
 
@@ -1918,7 +2027,7 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 
 	// Optional bounded onInstall({ previous_version, version, is_upgrade }) lifecycle hook on fresh install or version upgrade.
 	if !isUpgrade || prevVersion != manifest.Version {
-		if installRT, rtErr := newGojaPluginRuntime(gojaRuntimeOptions{
+		installRT, rtErr := newGojaPluginRuntime(gojaRuntimeOptions{
 			manifest:              mp.manifest,
 			pluginDir:             mp.pluginDir,
 			kv:                    mp.kv,
@@ -1930,19 +2039,32 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 			getSiteInfo:           m.getSiteInfo,
 			customResolver:        m.customResolver,
 			allowLoopbackForTests: m.allowLoopbackForTests,
-		}); rtErr == nil {
+		})
+		if rtErr != nil {
+			slog.Warn("plugin: failed to initialize runtime for onInstall hook", "plugin_id", manifest.ID, "version", manifest.Version, "err", rtErr)
+			m.logger.Write(manifest.ID, "warn", "install", "onInstall init error: "+rtErr.Error())
+		} else {
 			if installRT.hasCallable("onInstall") {
-				_, _, _ = installRT.invoke(ctx, m.hookTimeout, "onInstall", map[string]any{
+				if _, _, hErr := installRT.invoke(ctx, m.hookTimeout, "onInstall", map[string]any{
 					"previous_version": prevVersion,
 					"version":          manifest.Version,
 					"is_upgrade":       isUpgrade,
-				})
+				}); hErr != nil {
+					slog.Warn("plugin: onInstall hook failed", "plugin_id", manifest.ID, "version", manifest.Version, "is_upgrade", isUpgrade, "err", hErr)
+					m.logger.Write(manifest.ID, "warn", "install", "onInstall error: "+hErr.Error())
+				}
 			}
 			installRT.closeRuntime()
 		}
 	}
 
 	m.logger.Write(manifest.ID, "info", "install", "installed external plugin v"+manifest.Version)
+	if wasEnabled {
+		if eErr := m.Enable(ctx, manifest.ID); eErr != nil {
+			slog.Warn("plugin: failed to re-enable upgraded plugin", "plugin_id", manifest.ID, "version", manifest.Version, "err", eErr)
+			return m.toSummary(mp, locale), fmt.Errorf("plugin %q upgraded to v%s but failed to re-enable: %w", manifest.ID, manifest.Version, eErr)
+		}
+	}
 	return m.toSummary(mp, locale), nil
 }
 
@@ -1998,13 +2120,29 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 		}
 	}
 
-	_ = m.store.WithTx(ctx, func(tx *sqlx.Tx) error {
+	if hub := lookupKVHub(m.store); hub != nil {
+		hub.flushMu.Lock()
+		hub.mu.Lock()
+		hub.gen++
+		for pk := range hub.entries {
+			if pk.pluginID == pluginID {
+				delete(hub.dirty, pk)
+				delete(hub.entries, pk)
+			}
+		}
+		hub.mu.Unlock()
+		defer hub.flushMu.Unlock()
+	}
+
+	if err := m.store.WithTx(ctx, func(tx *sqlx.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, pluginID); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `DELETE FROM plugins WHERE id = ?`, pluginID)
 		return err
-	})
+	}); err != nil {
+		return fmt.Errorf("plugin %q: database cleanup failed: %w", pluginID, err)
+	}
 	m.logger.RemoveLogs(pluginID)
 	return nil
 }
@@ -2775,13 +2913,88 @@ func (m *Manager) RenderDashboardCards(ctx context.Context, slotCtx SlotRenderCo
 	return m.RenderSlots(ctx, SlotAdminDashboardCard, slotCtx)
 }
 
+func annotateHeadPersistAttrs(raw string, idEsc string) string {
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	headTags := []string{"<link", "<style", "<script", "<meta"}
+	var out strings.Builder
+	out.Grow(len(raw) + 64)
+	i := 0
+	for i < len(raw) {
+		matchedTag := ""
+		if raw[i] == '<' {
+			remLower := strings.ToLower(raw[i:])
+			for _, ht := range headTags {
+				if strings.HasPrefix(remLower, ht) && len(remLower) > len(ht) {
+					nextCh := remLower[len(ht)]
+					if nextCh == ' ' || nextCh == '\t' || nextCh == '\n' || nextCh == '\r' || nextCh == '>' || nextCh == '/' {
+						matchedTag = raw[i : i+len(ht)]
+						break
+					}
+				}
+			}
+		}
+		if matchedTag == "" {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		// Scan to closing '>' of opening tag (respecting quotes).
+		j := i + len(matchedTag)
+		inSingle := false
+		inDouble := false
+		for j < len(raw) {
+			ch := raw[j]
+			if ch == '\'' && !inDouble {
+				inSingle = !inSingle
+			} else if ch == '"' && !inSingle {
+				inDouble = !inDouble
+			} else if ch == '>' && !inSingle && !inDouble {
+				break
+			}
+			j++
+		}
+		if j >= len(raw) {
+			out.WriteString(raw[i:])
+			break
+		}
+		tagBody := raw[i:j]
+		tagLower := strings.ToLower(tagBody)
+		selfClose := strings.HasSuffix(strings.TrimSpace(tagBody), "/")
+		if selfClose {
+			slashIdx := strings.LastIndexByte(tagBody, '/')
+			out.WriteString(tagBody[:slashIdx])
+			if !strings.Contains(tagLower, "data-volo-persist") {
+				fmt.Fprintf(&out, ` data-volo-persist="%s"`, idEsc)
+			}
+			if !strings.Contains(tagLower, "data-volo-plugin") {
+				fmt.Fprintf(&out, ` data-volo-plugin="%s"`, idEsc)
+			}
+			out.WriteString(tagBody[slashIdx:])
+		} else {
+			out.WriteString(tagBody)
+			if !strings.Contains(tagLower, "data-volo-persist") {
+				fmt.Fprintf(&out, ` data-volo-persist="%s"`, idEsc)
+			}
+			if !strings.Contains(tagLower, "data-volo-plugin") {
+				fmt.Fprintf(&out, ` data-volo-plugin="%s"`, idEsc)
+			}
+		}
+		out.WriteByte('>')
+		i = j + 1
+	}
+	return out.String()
+}
+
 // RenderSlots collects rendered HTML/asset fragments for slotName across all enabled plugins.
-// Persistent slots (Persist=true) are automatically wrapped with `data-volo-persist="<plugin_id>"`
+// Persistent slots (Persist=true) are automatically annotated or wrapped with `data-volo-persist="<plugin_id>"`
 // for zero-coupled PJAX survival in volo-studio.
 func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx SlotRenderContext) []RenderedSlot {
 	active := m.snapshotEnabledPlugins()
 	var out []RenderedSlot
 	isAdminCard := slotName == SlotAdminDashboardCard
+	isHeadSlot := slotName == SlotPublicHead
 
 	for _, mp := range active {
 		for _, spec := range mp.manifest.UISlots {
@@ -2791,10 +3004,14 @@ func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx Slot
 			var buf strings.Builder
 			verEsc := html.EscapeString(mp.manifest.Version)
 			idEsc := html.EscapeString(mp.manifest.ID)
+			persistHeadAttr := ""
+			if spec.Persist && isHeadSlot {
+				persistHeadAttr = fmt.Sprintf(` data-volo-persist="%s"`, idEsc)
+			}
 
 			if spec.StyleAsset != "" && !isAdminCard {
-				fmt.Fprintf(&buf, `<link rel="stylesheet" href="/plugins/%s/assets/%s?v=%s" data-volo-plugin="%s">`,
-					idEsc, html.EscapeString(spec.StyleAsset), verEsc, idEsc)
+				fmt.Fprintf(&buf, `<link rel="stylesheet" href="/plugins/%s/assets/%s?v=%s"%s data-volo-plugin="%s">`,
+					idEsc, html.EscapeString(spec.StyleAsset), verEsc, persistHeadAttr, idEsc)
 			}
 			var bodyBuf strings.Builder
 			if spec.HTML != "" {
@@ -2814,10 +3031,14 @@ func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx Slot
 			if isAdminCard {
 				buf.WriteString(render.Default().SanitizeHTML(bodyBuf.String()))
 			} else {
-				buf.WriteString(bodyBuf.String())
+				rawBody := bodyBuf.String()
+				if spec.Persist && isHeadSlot && rawBody != "" {
+					rawBody = annotateHeadPersistAttrs(rawBody, idEsc)
+				}
+				buf.WriteString(rawBody)
 				if spec.ScriptAsset != "" {
-					fmt.Fprintf(&buf, `<script defer src="/plugins/%s/assets/%s?v=%s" data-volo-plugin="%s"></script>`,
-						idEsc, html.EscapeString(spec.ScriptAsset), verEsc, idEsc)
+					fmt.Fprintf(&buf, `<script defer src="/plugins/%s/assets/%s?v=%s"%s data-volo-plugin="%s"></script>`,
+						idEsc, html.EscapeString(spec.ScriptAsset), verEsc, persistHeadAttr, idEsc)
 				}
 			}
 
@@ -2825,7 +3046,7 @@ func (m *Manager) RenderSlots(ctx context.Context, slotName string, slotCtx Slot
 			if strings.TrimSpace(fragment) == "" {
 				continue
 			}
-			if spec.Persist && !isAdminCard {
+			if spec.Persist && !isAdminCard && !isHeadSlot {
 				fragment = fmt.Sprintf(`<div data-volo-persist="%s" data-volo-plugin="%s">%s</div>`, idEsc, idEsc, fragment)
 			}
 			out = append(out, RenderedSlot{
@@ -3362,6 +3583,19 @@ func (m *Manager) Close(ctx context.Context) error {
 	}
 	if m.cron != nil {
 		m.cron.Close()
+	}
+	if m.store != nil {
+		flushCtx := ctx
+		var cancel context.CancelFunc
+		if flushCtx == nil || flushCtx.Err() != nil {
+			flushCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+		}
+		if fErr := CloseKVBuffer(flushCtx, m.store); fErr != nil {
+			slog.Warn("plugin: failed to flush buffered kv on manager close", "err", fErr)
+		}
+		if cancel != nil {
+			cancel()
+		}
 	}
 	return nil
 }

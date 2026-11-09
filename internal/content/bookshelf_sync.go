@@ -21,7 +21,6 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/render"
-	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/id"
 )
 
@@ -257,7 +256,7 @@ func (s *Service) SyncBookTOC(ctx context.Context, bookID string) (int, error) {
 		}
 		var arts []domain.RawArticle
 		sErr := sqlx.SelectInto(ctx, s.store, &arts,
-			`SELECT a.id, a.title, a.slug, a.password_ciphertext
+			`SELECT a.id, a.title, a.slug, a.published_at, a.password_ciphertext
 			 FROM series_articles sa
 			 INNER JOIN articles a ON a.id = sa.article_id
 			 WHERE sa.series_id = ? AND a.status = ? AND a.password_ciphertext = ''
@@ -273,7 +272,7 @@ func (s *Service) SyncBookTOC(ctx context.Context, bookID string) (int, error) {
 				BookID:    bk.ID,
 				ParentID:  "",
 				Title:     a.Title,
-				URL:       visibility.ArticlePath(a.Slug),
+				URL:       s.guard.ArticleURL(a),
 				Depth:     0,
 				SortOrder: idx + 1,
 			})

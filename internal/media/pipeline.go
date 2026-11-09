@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"image"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
@@ -227,7 +226,10 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 	now := time.Now().UTC()
 
 	if kind == mediaKindImage {
-		imgMaxBytes := max(int64(maxImageUploadBytes), maxBytes)
+		imgMaxBytes := int64(maxImageUploadBytes)
+		if maxBytes > 0 && maxBytes < imgMaxBytes {
+			imgMaxBytes = maxBytes
+		}
 		raw, rErr := readBounded(fullReader, imgMaxBytes)
 		if rErr != nil {
 			return nil, rErr
@@ -242,8 +244,22 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 		err = func() error {
 			defer func() { <-transcodeSem }()
 
+			if detectedMIME == "image/avif" {
+				w, h, avifErr := parseAVIFDimensions(raw)
+				if avifErr != nil {
+					return avifErr
+				}
+				width, height = w, h
+				finalBytes = raw
+				raw = nil
+				finalExt = ".avif"
+				finalMIME = "image/avif"
+				exifStripped = false
+				return nil
+			}
+
 			// Step 1: Decompression-bomb pre-check BEFORE allocating full pixel buffers!
-			cfg, formatName, cfgErr := image.DecodeConfig(bytes.NewReader(raw))
+			cfg, formatName, cfgErr := decodeImageConfigSafe(raw)
 			if cfgErr != nil {
 				return fmt.Errorf("invalid or corrupt image header: %w", cfgErr)
 			}
@@ -279,7 +295,7 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 				orient := ReadEXIFOrientation(raw)
 				if !stCfg.StripEXIF && orient == 1 && (!stCfg.AdaptiveWebP || formatName == "webp") &&
 					(formatName == "jpeg" || formatName == "png" || formatName == "webp") {
-					img, _, decErr := image.Decode(bytes.NewReader(raw))
+					img, _, decErr := decodeRasterImageSafe(raw)
 					if decErr != nil {
 						raw = nil
 						return fmt.Errorf("image decode failed: %w", decErr)
@@ -321,7 +337,7 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 					return nil
 				}
 
-				img, _, decErr := image.Decode(bytes.NewReader(raw))
+				img, _, decErr := decodeRasterImageSafe(raw)
 				raw = nil // Release compressed upload buffer before pixel transforms & WebP encoding.
 				if decErr != nil {
 					return fmt.Errorf("image decode failed: %w", decErr)
@@ -953,6 +969,11 @@ func classifyAndVerifyMagic(ext string, raw []byte) (mediaKind, string, error) {
 			return 0, "", errors.New("file magic bytes do not match WebP RIFF signature")
 		}
 		return mediaKindImage, "image/webp", nil
+	case ".avif":
+		if !hasAVIFMagic(raw) {
+			return 0, "", errors.New("file magic bytes do not match AVIF ftyp signature")
+		}
+		return mediaKindImage, "image/avif", nil
 	case ".mp3":
 		if len(raw) < 3 || (!bytes.HasPrefix(raw, []byte("ID3")) && (raw[0] != 0xFF || (raw[1]&0xE0) != 0xE0)) {
 			return 0, "", errors.New("file magic bytes do not match MP3 signature")

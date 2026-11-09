@@ -14,7 +14,7 @@ Every subcommand honors the unified configuration hierarchy (`CLI Flags > OS VOL
 | :--- | :--- | :--- |
 | `--env-file <path>` | `VOLO_ENV_FILE` | Path to `.env` file (default `./.env`) |
 | `--listen-addr <host:port>` | `VOLO_LISTEN_ADDR` | TCP listen address (default `0.0.0.0:8080`, mutually exclusive with `--listen-socket`) |
-| `--listen-socket <path[,mode]>` | `VOLO_LISTEN_SOCKET` | Unix Domain Socket path (with optional octal mode suffix, e.g., `/run/volo/volo.sock,0660`) |
+| `--listen-socket <path[,mode]>` (alias `--unix-socket`) | `VOLO_LISTEN_SOCKET` | Unix Domain Socket path (with optional octal mode suffix, e.g., `/run/volo/volo.sock,0660`) |
 | `--socket-mode <octal>` / `--socket-group <group>` | `VOLO_SOCKET_MODE` / `VOLO_SOCKET_GROUP` | Unix socket octal permissions (default `0660`) and group ownership (e.g., `www-data`, `nginx`) |
 | `--public-url <url>` | `VOLO_PUBLIC_URL` | Canonical public base URL (used for canonical tags, RSS/Podcast, Sitemap, WebAuthn Origin, and email links) |
 | `--trusted-proxies <cidrs\|unix>` | `VOLO_TRUSTED_PROXIES` | Comma-separated trusted reverse proxy IPs/CIDRs or `unix` (default `127.0.0.1,::1`) |
@@ -31,7 +31,7 @@ Every subcommand honors the unified configuration hierarchy (`CLI Flags > OS VOL
 
 ### 1.1 `volo serve` (Default Command)
 
-Starts the HTTP or Unix Domain Socket server, runs idempotent schema migrations (`v7`), warms the full-text search index and public chrome snapshots, starts the scheduled-article publisher, plugin Cron scheduler, and backup scheduler, and traps `SIGINT` / `SIGTERM` for graceful connection draining and deterministic analytics flushing.
+Starts the HTTP or Unix Domain Socket server, runs idempotent schema migrations (`v8`), warms the full-text search index and public chrome snapshots, starts the scheduled-article publisher, plugin Cron scheduler, and backup scheduler, and traps `SIGINT` / `SIGTERM` for graceful connection draining and deterministic analytics + plugin KV flushing.
 
 ```bash
 # Zero-config startup (binds 0.0.0.0:8080 and initializes ./data/volo.db)
@@ -116,7 +116,7 @@ Streams and normalizes legacy 15-table `.zip` or `data.json` archives with built
 # Machine-readable JSON diagnostics (exits 1 when unhealthy; ideal for CI & monitoring)
 ./volo doctor --json
 
-# Probe live /healthz (auto-discovers configured TCP ListenAddr or Unix Domain Socket http://unix/healthz when --url is omitted)
+# Read-only /healthz probe (never creates .secret.key; auto-discovers TCP ListenAddr or Unix Socket http://unix/healthz)
 ./volo healthcheck
 ./volo healthcheck --url http://127.0.0.1:8080/healthz
 
@@ -131,7 +131,7 @@ Streams and normalizes legacy 15-table `.zip` or `data.json` archives with built
 Create scoped Personal Access Tokens with optional expiration dates in **Console -> System & Security -> Account & Security -> API Tokens**.
 
 - Only the `SHA-256` digest (`token_hash`) and 12-character display prefix (`token_prefix`) are persisted in the database; raw secrets are displayed once upon creation.
-- Requests carrying `Authorization: Bearer volo_pat_<secret>` authenticate statelessly to `/api/admin/*` without requiring browser session cookies or `X-CSRF-Token`.
+- Requests carrying `Authorization: Bearer volo_pat_<secret>` authenticate statelessly to `/api/admin/*` without requiring browser session cookies or `X-CSRF-Token` (browser Admin Console session bootstrap calls to `GET /api/admin/me` pass `X-Volo-Console: 1` to obtain the CSRF token).
 
 ### 2.1 Scope Matrix
 
@@ -143,7 +143,7 @@ Create scoped Personal Access Tokens with optional expiration dates in **Console
 | `media:write` | Upload media assets (auto GPS EXIF stripping, orientation normalization, adaptive WebP) | PicGo / ShareX / uPic direct image host |
 | `backup:read` | Stream full backup archives (`GET /api/admin/backups/export`) | Offsite encrypted backup pull cron jobs |
 
-> **Privilege Boundary**: System settings mutations (`PATCH /api/admin/settings/{domain}`), user RBAC management, WAF bans, and plugin install/export (`POST /api/admin/plugins/install`, `GET /api/admin/plugins/{id}/export`) strictly require an interactive admin session (enforcing 2FA policy) and can never be invoked with an API token.
+> **Privilege Boundary**: System settings mutations (`PATCH /api/admin/settings/{domain}`), user ban/mute/RBAC management (`PATCH /api/admin/users`), WAF bans, and plugin install/export strictly require an interactive admin session (enforcing 2FA policy) and can never be invoked with an API token.
 
 ### 2.2 Publishing & Updating Articles via `curl` / Obsidian (`articles:write`)
 
@@ -201,36 +201,46 @@ Successful `201 Created` response returning both the full `asset` record and a t
 }
 ```
 
-### 2.4 Category/Bookshelf Batch Reordering, Plugin Chain Priority & Cron Endpoints
+### 2.4 Account Ban/Mute Governance, Batch Reordering & Plugin Chain Endpoints
 
-- **`POST /api/admin/categories/reorder`** & **`POST /api/admin/books/reorder`**: Atomically update `sort_order` in a single transaction according to the submitted ID array:
-  ```bash
-  curl -X POST "${VOLO_URL}/api/admin/categories/reorder" \
-    -H "Authorization: Bearer ${VOLO_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d '{"ids": ["0196ed8c01", "0196ed8c02", "0196ed8c03"]}'
-  ```
-- **`POST /api/admin/plugins/reorder`** & **`PATCH /api/admin/plugins/{id}/priority`** (requires interactive admin session): Reorder the plugin execution chain or set an exact numeric `priority` (`-10000`–`10000`; lower numbers run earlier across all `before_*` interceptable hooks, lifecycle events, UI slots, and same-type `Provider` chains).
-- **`GET /api/admin/plugins/cron`** & **`POST /api/admin/plugins/{id}/trigger-cron`** (requires interactive admin session): Inspect live `CronRegistry` background job metrics (last duration, next run timestamp, recent errors) or trigger a task immediately.
-- **`GET /api/admin/plugins/{id}/export`** (requires interactive admin session): Exports an installed plugin directory as a clean `.zip` package (stripping runtime temp files and never bundling database `secret_ciphertext` values), paired with `POST /api/admin/plugins/install?overwrite=true` for in-place upgrades that preserve existing configuration and encrypted secrets.
+- **`GET /api/admin/users`** & **`PATCH /api/admin/users`** (requires interactive admin session): Discourse-style account moderation supporting `action: "ban" | "unban" | "mute" | "unmute" | "shield"`, `duration_hours` (`0` = indefinite, `> 0` = timed auto-expiry), `reason`, `shield_comments` (`boolean`), and `shield_text` (non-destructively masking historical comments until unbanned/unmuted or expired).
+- **`POST /api/admin/categories/reorder`** & **`POST /api/admin/books/reorder`**: Atomically update `sort_order` in a single transaction.
+- **`POST /api/admin/plugins/reorder`** & **`PATCH /api/admin/plugins/{id}/priority`** (requires interactive admin session): Reorder the plugin execution chain or set an exact numeric `priority` (`-1000`–`10000`).
+- **`GET /api/admin/plugins/cron`**, **`POST /api/admin/plugins/{id}/trigger-cron`**, and **`GET /api/admin/plugins/{id}/export`**.
 
 ---
 
-## 3. Public JSON v1 & Machine Distribution Endpoints
+## 3. Real-Time Non-Destructive ImageView Reference (`/uploads/...?...`)
+
+Unparameterized `/uploads/...` URLs stream the original file directly with zero overhead. Appending query parameters enables real-time non-destructive rendering supporting **both Qiniu Cloud native path parameters** (e.g., `?imageView2/1/w/960/h/540/format/webp/q/85/interlace/1/strip/ignore-error/1`) and **standard key-value parameters** (e.g., `?mode=1&w=960&h=540&format=webp&interlace=1&q=85&colors=128&strip&ignore-error=1`) in any combination — **never modifying source files on disk or S3**, backed by `singleflight` + `8 MiB` byte-bounded LRU + strong `ETag` / `304` negotiation (and recognized by orphan media scanning and CLS dimension prediction):
+
+| Parameter | Meaning | Supported Values / Behavior |
+| :--- | :--- | :--- |
+| `mode` | Resize / crop mode | `0` (fit long edge `w` / short edge `h`), `1` (center crop `w×h`), `2` (fit inside max `w×h`), `3` (min `w×h` outer fit), `4` (long/short edge fit + pad), `5` (long/short edge outer fit + center crop) |
+| `w` / `h` | Width (or long edge) / Height (or short edge) | `1`–`4096` pixels |
+| `format` | Output format | `jpg` (`jpeg`), `png`, `webp`, `avif` (pure-Go builds gracefully emit `image/webp` with `X-Volo-Format-Fallback: avif->webp` when `avif` is requested) |
+| `interlace` | Progressive / interlaced output | `0`, `1` |
+| `q` | Encoding quality | `1`–`100` (default `85`) |
+| `colors` | GIF/PNG palette color count | `2`–`256` quantized palette colors |
+| `strip` / `meta-keep-list` | Metadata stripping | Re-encoded outputs strip metadata by default |
+| `ignore-error` | Error fallback | `0`, `1` (when `1`, invalid parameters or non-raster assets stream the original file cleanly instead of `400`) |
+
+---
+
+## 4. Public JSON v1 & Machine Distribution Endpoints
 
 | Endpoint | Method | Purpose |
 | :--- | :--- | :--- |
-| `/healthz` | `GET` / `HEAD` | Process liveness & DB readiness probe: returns `200` `{"status":"ok","database":"ok","uptime_sec":120}` when healthy, or `503` `{"status":"degraded","database":"unavailable","uptime_sec":120}` when DB ping fails |
-| `/rss.xml` / `/atom.xml` | `GET` | RSS 2.0 & Atom 1.0 feeds (strong `ETag` / `304`, full privacy redaction of locked posts & `:::lock` blocks) |
-| `/podcast.xml` | `GET` | Apple Podcasts / Spotify compatible iTunes Podcast RSS feed |
-| `/sitemap.xml` / `/robots.txt` | `GET` | Search engine XML sitemap with `hreflang` alternates (serves `<urlset>` directly up to `10,000` public URLs, and **automatically shards into a `<sitemapindex>` serving `/sitemap-1.xml`, `/sitemap-2.xml`, … when exceeding `10,000` URLs**) & `robots.txt` (omits admin `Disallow` when stealth admin path is active) |
+| `/healthz` | `GET` / `HEAD` | Process liveness & DB readiness probe (`200` `{"status":"ok","database":"ok",...}` or `503`) |
+| `/rss.xml` / `/atom.xml` / `/podcast.xml` | `GET` | RSS 2.0, Atom 1.0, and Apple/Spotify iTunes Podcast feeds (honoring `feed.item_count`, strong `ETag` / `304`, and lock redaction) |
+| `/sitemap.xml` / `/robots.txt` | `GET` | XML sitemap (auto-shards into `<sitemapindex>` above `10,000` URLs) & `robots.txt` (omits admin `Disallow` when stealth admin path is active) |
 | `/llms.txt` / `/llms-full.txt` | `GET` | Structured LLM index & public Markdown corpus (toggleable via `feed.enable_llms_txt`) |
-| `/posts/{slug}.md` | `GET` | Clean raw Markdown endpoint for public posts (controlled by `feed.enable_raw_markdown`; returns `403` when locked) |
-| `/api/v1/search?q=<kw>&page=<n>` | `GET` | Paginated two-stage full-text search accepting `q` and `page`, returning highlighted `hits` and pagination metadata with zero lock leakage |
+| `/posts/{slug}.md` (plus `/archives/{slug}.md`, `/p/{slug}.md`, `/{year}/{month}/{slug}.md`) | `GET` | Clean raw Markdown endpoint matching active `seo.post_permalink_style` (controlled by `feed.enable_raw_markdown`) |
+| `/api/v1/search?q=<kw>&page=<n>` | `GET` | Paginated two-stage full-text search with zero lock leakage |
 | `/api/v1/i18n/{locale}` | `GET` | Resolved public locale bundle merged with custom overrides (`ETag` negotiated) |
-| `/api/v1/pow/challenge` | `GET` | Self-hosted `HMAC + SHA-256` Proof-of-Work challenge issuer |
-| `/api/v1/guest/passport` | `GET` / `POST` | Issue or self-heal the 3-tier signed Guest Passport (`__volo_gp`) |
-| `/api/v1/reader/profile` | `PATCH` | Self-service display name, avatar, and bio updates for signed-in readers (validated through the union of host blocked keywords, `provider:antispam` plugins, and `user.before_update_profile` chained interception) |
+| `/api/v1/pow/challenge` / `/api/v1/guest/passport` | `GET` / `POST` | Self-hosted `HMAC + SHA-256` PoW challenge & 3-tier Guest Passport (`__volo_gp`) |
+| `/api/v1/reader/profile` | `PATCH` | Self-service display name, avatar, and bio updates for signed-in readers |
 | `/api/v1/articles/{id}/unlock` | `POST` | Verify a post or standalone page (`page:<id>`) password and issue a scoped unlock cookie |
-| `/api/v1/comments` | `GET` / `POST` | Fetch paginated threaded comments or submit a PoW-verified, antispam-screened comment |
-| `/api/v1/reactions` | `POST` | Lightweight emoji reactions on articles and comments |
+| `/api/v1/comments` | `GET` / `POST` | Fetch threaded comments (including caller `comment_min_length`, `comment_max_length`, `comment_max_lines`, `viewer_muted`, and shielded comment placeholders) or post a comment |
+| `/api/v1/comments/preview` | `POST` | Sanitized live Markdown preview for the public reply editor (enforcing identical HTML5 AST & height-bomb defenses) |
+| `/api/v1/reactions` | `POST` | Lightweight emoji reactions on articles and comments (blocked when muted/banned) |

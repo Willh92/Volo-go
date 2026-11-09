@@ -243,6 +243,7 @@ export function DistributeWorkspace({
   const [followPreviewLoading, setFollowPreviewLoading] = useState(false);
   const [followPreviewQuery, setFollowPreviewQuery] = useState("");
   const [followPreviewPage, setFollowPreviewPage] = useState(1);
+  const [followEntryLimits, setFollowEntryLimits] = useState<Record<string, number>>({});
   const [opmlImportOpen, setOpmlImportOpen] = useState(false);
   const [opmlData, setOpmlData] = useState("");
   const [importingOpml, setImportingOpml] = useState(false);
@@ -2771,25 +2772,45 @@ export function DistributeWorkspace({
                       <ConsoleEmpty />
                     ) : (
                       <>
-                        {pagedGroups.slice.map(({ fl, entries }, idx) => (
-                          <div key={fl.id || idx} class="volo-subcard">
-                            <div class="volo-subcard-title">
-                              <span>{fl.title || fl.feed_url}</span>
-                              <span class="volo-mini-tag">{entries.length}</span>
-                            </div>
-                            {entries.slice(0, 8).map((it: any) => (
-                              <div key={it.id || it.url} class="volo-cell-main" style={{ padding: "6px 0", borderTop: "1px dashed var(--volo-line)" }}>
-                                <div class="volo-cell-title">
-                                  <a href={it.url} target="_blank" rel="noreferrer">
-                                    {it.title || it.url}
-                                  </a>
-                                  {it.published_at > 0 && <span class="volo-help">{formatDateTime(it.published_at)}</span>}
-                                </div>
-                                {it.summary && <div class="volo-help">{it.summary}</div>}
+                        {pagedGroups.slice.map(({ fl, entries }, idx) => {
+                          const gKey = String(fl.id || fl.feed_url || idx);
+                          const lim = followEntryLimits[gKey] || 8;
+                          return (
+                            <div key={gKey} class="volo-subcard">
+                              <div class="volo-subcard-title">
+                                <span>{fl.title || fl.feed_url}</span>
+                                <span class="volo-mini-tag">{entries.length}</span>
                               </div>
-                            ))}
-                          </div>
-                        ))}
+                              {entries.slice(0, lim).map((it: any) => (
+                                <div key={it.id || it.url} class="volo-cell-main" style={{ padding: "6px 0", borderTop: "1px dashed var(--volo-line)" }}>
+                                  <div class="volo-cell-title">
+                                    <a href={it.url} target="_blank" rel="noreferrer">
+                                      {it.title || it.url}
+                                    </a>
+                                    {it.published_at > 0 && <span class="volo-help">{formatDateTime(it.published_at)}</span>}
+                                  </div>
+                                  {it.summary && <div class="volo-help">{it.summary}</div>}
+                                </div>
+                              ))}
+                              {entries.length > lim && (
+                                <div style={{ paddingTop: "8px", borderTop: "1px dashed var(--volo-line)" }}>
+                                  <button
+                                    type="button"
+                                    class="volo-tag-more-btn"
+                                    onClick={() =>
+                                      setFollowEntryLimits((prev) => ({
+                                        ...prev,
+                                        [gKey]: lim + 20,
+                                      }))
+                                    }
+                                  >
+                                    {t("ui.token_more", { count: entries.length - lim })}
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                         {validGroups.length > 10 && (
                           <Pagination
                             total={validGroups.length}
@@ -3514,6 +3535,20 @@ export function DistributeWorkspace({
                   />
                   <MediaPickButton filterKind="image" onPick={(u) => setSeoCfg({ ...seoCfg, default_og_image_url: u })} />
                 </div>
+              </div>
+              <div class="volo-field">
+                <label>{t("dist.seo_permalink")}</label>
+                <ConsoleSelect
+                  searchable={false}
+                  value={seoCfg.post_permalink_style || "/posts/{slug}"}
+                  options={[
+                    { value: "/posts/{slug}", label: "/posts/{slug}" },
+                    { value: "/archives/{slug}", label: "/archives/{slug}" },
+                    { value: "/p/{slug}", label: "/p/{slug}" },
+                    { value: "/{year}/{month}/{slug}", label: "/{year}/{month}/{slug}" },
+                  ]}
+                  onChange={(v) => setSeoCfg({ ...seoCfg, post_permalink_style: v })}
+                />
               </div>
             </div>
             <div class="volo-field">

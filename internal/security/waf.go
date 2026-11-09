@@ -160,6 +160,15 @@ func (w *WAFEngine) sweep(now time.Time) {
 	w.pruneExpiredBansLocked(nowMS)
 	w.bansMu.Unlock()
 
+	var maxWAFReset time.Time
+	if w.settingsMgr != nil {
+		winSec := w.settingsMgr.Snapshot().Security.WAFWindowSeconds
+		if winSec <= 0 {
+			winSec = 180
+		}
+		maxWAFReset = now.Add(time.Duration(winSec) * time.Second)
+	}
+
 	w.rateMu.Lock()
 	for k, v := range w.strikes {
 		if now.Sub(v.windowStart) > 10*time.Minute {
@@ -169,11 +178,39 @@ func (w *WAFEngine) sweep(now time.Time) {
 	for k, v := range w.rates {
 		if now.After(v.windowReset) {
 			delete(w.rates, k)
+			continue
+		}
+		if !maxWAFReset.IsZero() && strings.HasPrefix(k, "waf_shield|") && v.windowReset.After(maxWAFReset) {
+			v.windowReset = maxWAFReset
 		}
 	}
 	for k, v := range w.authRates {
 		if now.After(v.windowReset) {
 			delete(w.authRates, k)
+		}
+	}
+	w.rateMu.Unlock()
+}
+
+// UpdateConfig clamps active global WAF rate-limit buckets immediately when WAFWindowSeconds is reduced via hot-reload.
+func (w *WAFEngine) UpdateConfig(wafWindowSeconds int) {
+	if w == nil {
+		return
+	}
+	if wafWindowSeconds <= 0 {
+		wafWindowSeconds = 180
+	}
+	now := time.Now()
+	maxReset := now.Add(time.Duration(wafWindowSeconds) * time.Second)
+
+	w.rateMu.Lock()
+	for k, v := range w.rates {
+		if now.After(v.windowReset) {
+			delete(w.rates, k)
+			continue
+		}
+		if strings.HasPrefix(k, "waf_shield|") && v.windowReset.After(maxReset) {
+			v.windowReset = maxReset
 		}
 	}
 	w.rateMu.Unlock()
@@ -686,6 +723,11 @@ func (w *WAFEngine) AllowRate(scope string, clientAddr netip.Addr, limit int, wi
 		}
 		buckets[key] = &rateWindow{count: 1, windowReset: now.Add(window)}
 		return true
+	}
+	if window > 0 {
+		if maxReset := now.Add(window); rw.windowReset.After(maxReset) {
+			rw.windowReset = maxReset
+		}
 	}
 	if rw.count >= limit {
 		return false

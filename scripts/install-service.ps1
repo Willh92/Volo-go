@@ -31,6 +31,7 @@ param(
   [string]$Action = "Install",
   [string]$BinaryPath = "",
   [string]$ArchivePath = "",
+  [Alias("BinDir")]
   [string]$InstallDir = "",
   [switch]$Download,
   [switch]$FromGitHub,
@@ -115,6 +116,11 @@ $ProgramFiles64 = if (-not [string]::IsNullOrWhiteSpace($env:ProgramW6432)) {
 } else {
   "C:\Program Files"
 }
+$ProgramDataRoot = if (-not [string]::IsNullOrWhiteSpace($env:ProgramData)) {
+  $env:ProgramData
+} else {
+  "C:\ProgramData"
+}
 
 $ScriptDir = if ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 $EffectiveListen = if ($ListenAddr) { $ListenAddr } else { "${HostAddr}:${Port}" }
@@ -124,17 +130,18 @@ $Script:HasExplicitDataDir = $PSBoundParameters.ContainsKey("DataDir") -and (-no
 $Script:HasExplicitEnvFile = $PSBoundParameters.ContainsKey("EnvFile") -and (-not [string]::IsNullOrWhiteSpace($EnvFile))
 $Script:HasExplicitListen = $PSBoundParameters.ContainsKey("ListenAddr") -or $PSBoundParameters.ContainsKey("HostAddr") -or $PSBoundParameters.ContainsKey("Port")
 
-if ($InstallDir) {
+# Keep binary installation directory (-InstallDir) strictly decoupled from runtime data directory (-DataDir)
+# so service accounts never receive write/modify permissions on the directory holding volo.exe.
+if (-not [string]::IsNullOrWhiteSpace($InstallDir)) {
   $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
-  if (-not $DataDir) { $DataDir = $InstallDir }
 } else {
-  $InstallDir = Join-Path $ProgramFiles64 "Volo"
-  if (-not $DataDir) {
-    $ProgramDataRoot = if ($env:ProgramData) { $env:ProgramData } else { "C:\ProgramData" }
-    $DataDir = Join-Path $ProgramDataRoot "Volo"
-  }
+  $InstallDir = [System.IO.Path]::GetFullPath((Join-Path $ProgramFiles64 "Volo"))
 }
-$DataDir = [System.IO.Path]::GetFullPath($DataDir)
+if (-not [string]::IsNullOrWhiteSpace($DataDir)) {
+  $DataDir = [System.IO.Path]::GetFullPath($DataDir)
+} else {
+  $DataDir = [System.IO.Path]::GetFullPath((Join-Path $ProgramDataRoot "Volo"))
+}
 if ($EnvFile) {
   $EnvFile = [System.IO.Path]::GetFullPath($EnvFile)
 } else {
@@ -188,7 +195,7 @@ function Format-Win32Arg([string]$Value) {
   return $sb.ToString()
 }
 
-function Invoke-ScExe([string[]]$ScArgs, [switch]$IgnoreExitCode) {
+function Invoke-ScExe([string[]]$ScArgs, [int[]]$AllowedExitCodes = @(0)) {
   $argLine = ($ScArgs | ForEach-Object { Format-Win32Arg $_ }) -join " "
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = "sc.exe"
@@ -202,13 +209,21 @@ function Invoke-ScExe([string[]]$ScArgs, [switch]$IgnoreExitCode) {
   $stdout = $proc.StandardOutput.ReadToEnd()
   $stderr = $proc.StandardError.ReadToEnd()
   $proc.WaitForExit()
+  $global:LASTEXITCODE = $proc.ExitCode
   $combined = ($stdout + "`n" + $stderr).Trim()
-  if ((-not $IgnoreExitCode) -and ($proc.ExitCode -ne 0)) {
-    throw "sc.exe $($ScArgs[0]) failed (exit code $($proc.ExitCode)): $combined"
+  if (($LASTEXITCODE -ne 0) -and ($AllowedExitCodes -notcontains $LASTEXITCODE)) {
+    throw "sc.exe $($ScArgs[0]) failed (exit code $LASTEXITCODE): $combined"
   }
   return [PSCustomObject]@{
-    ExitCode = $proc.ExitCode
+    ExitCode = $LASTEXITCODE
     Output   = $combined
+  }
+}
+
+function Invoke-Icacls([string[]]$IcaclsArgs) {
+  $out = (& icacls.exe @IcaclsArgs 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0) {
+    throw "icacls.exe failed (exit code $LASTEXITCODE) for arguments [$($IcaclsArgs -join ' ')]: $out"
   }
 }
 
@@ -234,7 +249,67 @@ function Invoke-FileDownload([string]$Url, [string]$OutFile, [switch]$Quiet) {
   return $false
 }
 
-function Assert-SafePurgeDir([string]$TargetPath) {
+function Test-IsSubPathOrEqual([string]$CandidatePath, [string]$BaseDir) {
+  if ([string]::IsNullOrWhiteSpace($CandidatePath) -or [string]::IsNullOrWhiteSpace($BaseDir)) {
+    return $false
+  }
+  $normCand = [System.IO.Path]::GetFullPath($CandidatePath).TrimEnd('\', '/')
+  $normBase = [System.IO.Path]::GetFullPath($BaseDir).TrimEnd('\', '/')
+  if ([string]::Equals($normCand, $normBase, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return $true
+  }
+  return $normCand.StartsWith(($normBase + "\"), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-BinaryDataSeparation([string]$BinDir, [string]$RuntimeDataDir) {
+  if (Test-IsSubPathOrEqual -CandidatePath $BinDir -BaseDir $RuntimeDataDir) {
+    throw "Privilege separation violation: -InstallDir ('$BinDir') must not equal or reside inside -DataDir ('$RuntimeDataDir'), because service account Modify ACLs on DataDir would allow modifying volo.exe."
+  }
+  if (Test-IsSubPathOrEqual -CandidatePath $RuntimeDataDir -BaseDir $BinDir) {
+    throw "Privilege separation violation: -DataDir ('$RuntimeDataDir') must not reside inside -InstallDir ('$BinDir'). Keep binaries under Program Files and mutable state under ProgramData."
+  }
+}
+
+function Test-IsProtectedSystemRoot([string]$CandidatePath) {
+  if ([string]::IsNullOrWhiteSpace($CandidatePath)) { return $true }
+  $full = [System.IO.Path]::GetFullPath($CandidatePath).TrimEnd('\', '/')
+  $root = [System.IO.Path]::GetPathRoot($full).TrimEnd('\', '/')
+  if ($full.Length -le 3 -or [string]::Equals($full, $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return $true
+  }
+  $protectedExact = @(
+    $env:SystemRoot,
+    $(if ($env:SystemRoot) { Join-Path $env:SystemRoot "System32" } else { "" }),
+    $ProgramFiles64,
+    $env:ProgramW6432,
+    $env:ProgramFiles,
+    ${env:ProgramFiles(x86)},
+    $ProgramDataRoot,
+    $env:ProgramData,
+    $env:USERPROFILE,
+    $env:PUBLIC,
+    $env:APPDATA,
+    $env:LOCALAPPDATA,
+    $env:TEMP,
+    "C:\Windows",
+    "C:\Windows\System32",
+    "C:\Program Files",
+    "C:\Program Files (x86)",
+    "C:\ProgramData",
+    "C:\Users",
+    "C:\System Volume Information",
+    'C:\$Recycle.Bin'
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  foreach ($p in $protectedExact) {
+    $normP = [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/')
+    if ([string]::Equals($full, $normP, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Assert-SafePurgeDir([string]$TargetPath, [string]$ProtectedBinDir = "") {
   if ([string]::IsNullOrWhiteSpace($TargetPath)) {
     throw "Refusing to purge an empty directory path."
   }
@@ -243,25 +318,49 @@ function Assert-SafePurgeDir([string]$TargetPath) {
   if ($full.Length -le 3 -or [string]::Equals($full, $root, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to purge drive root: $full"
   }
-  $protected = @(
+  if (Test-IsProtectedSystemRoot -CandidatePath $full) {
+    throw "Refusing to purge protected system directory: $full"
+  }
+
+  # Never allow recursive deletion anywhere inside Windows or Program Files trees.
+  $protectedTrees = @(
     $env:SystemRoot,
+    $ProgramFiles64,
     $env:ProgramW6432,
     $env:ProgramFiles,
     ${env:ProgramFiles(x86)},
-    $env:ProgramData,
-    $env:USERPROFILE,
-    $env:PUBLIC,
     "C:\Windows",
     "C:\Program Files",
-    "C:\Program Files (x86)",
-    "C:\ProgramData",
-    "C:\Users"
+    "C:\Program Files (x86)"
   ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-  foreach ($p in $protected) {
-    $normP = [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/')
-    if ([string]::Equals($full, $normP, [System.StringComparison]::OrdinalIgnoreCase)) {
-      throw "Refusing to purge protected system directory: $full"
+  foreach ($tree in $protectedTrees) {
+    if (Test-IsSubPathOrEqual -CandidatePath $full -BaseDir $tree) {
+      throw "Refusing to purge path inside protected OS/Program Files directory tree ('$tree'): $full"
     }
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($ProtectedBinDir)) {
+    if ((Test-IsSubPathOrEqual -CandidatePath $full -BaseDir $ProtectedBinDir) -or
+        (Test-IsSubPathOrEqual -CandidatePath $ProtectedBinDir -BaseDir $full)) {
+      throw "Refusing to purge binary installation directory ('$ProtectedBinDir') via -PurgeData: $full"
+    }
+  }
+
+  # Refuse to delete arbitrary non-data directories: require either a Volo-named leaf directory
+  # or recognizable Volo runtime data markers inside an existing directory.
+  $leafName = [System.IO.Path]::GetFileName($full)
+  $hasVoloLeaf = ($leafName -match '(?i)volo')
+  $hasVoloMarker = $false
+  if (Test-Path -LiteralPath $full -PathType Container) {
+    foreach ($marker in @("volo.env", "data\volo.db", "data\db.json", "data\.secret.key", "themes\volo-journal")) {
+      if (Test-Path -LiteralPath (Join-Path $full $marker)) {
+        $hasVoloMarker = $true
+        break
+      }
+    }
+  }
+  if ((-not $hasVoloLeaf) -and (-not $hasVoloMarker)) {
+    throw "Refusing to purge unrecognized non-data directory '$full' (no Volo data markers found and directory name does not match 'volo')."
   }
 }
 
@@ -418,13 +517,13 @@ function Resolve-ExistingRegistration([ref]$RefBin, [ref]$RefDataDir, [ref]$RefE
   }
 }
 
-function Get-ReleaseBaseUrl([string]$Ref) {
+function Get-ReleaseBaseUrl([string]$Ref, [switch]$Direct) {
   $rawBase = if ($Ref -eq "latest") {
     "https://github.com/$Repo/releases/latest/download"
   } else {
     "https://github.com/$Repo/releases/download/$Ref"
   }
-  if ($Mirror) {
+  if ($Mirror -and (-not $Direct)) {
     return ($Mirror.TrimEnd('/') + "/" + $rawBase)
   }
   return $rawBase
@@ -710,6 +809,7 @@ function Download-ReleaseBundle {
   $assetName = $stableAsset
   $dlZip = Join-Path $tmpDir $assetName
   $dlSum = Join-Path $tmpDir "SHA256SUMS.txt"
+  $usedDirectFallback = $false
 
   # 1. Try unversioned release asset first (e.g. $Mirror/https://github.com/$Repo/releases/latest/download/volo-windows-$Arch.zip)
   Write-Host "[Volo] Downloading $assetName from GitHub Releases ($Repo @ $primary)..." -ForegroundColor Cyan
@@ -745,12 +845,32 @@ function Download-ReleaseBundle {
     }
   }
 
+  # 4. If -Mirror failed, automatically warn and fall back to direct https://github.com/...
+  if ((-not $ok) -and $Mirror) {
+    Write-Host "[Volo] WARNING: Mirror '$Mirror' failed to serve release archive; falling back to direct GitHub Releases..." -ForegroundColor Yellow
+    $usedDirectFallback = $true
+    $baseUrl = Get-ReleaseBaseUrl $primary -Direct
+    $assetName = $stableAsset
+    $dlZip = Join-Path $tmpDir $assetName
+    $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
+    if ((-not $ok) -and ($primary -ne "latest")) {
+      $assetName = "volo-$primary-windows-$Arch.zip"
+      $dlZip = Join-Path $tmpDir $assetName
+      $ok = Invoke-FileDownload -Url "$baseUrl/$assetName" -OutFile $dlZip
+    }
+  }
+
   if (-not $ok) {
     throw "Failed to download release archive for windows/$Arch from $Repo ($primary)."
   }
 
   if (-not $NoVerify) {
     $sumOk = Invoke-FileDownload -Url "$baseUrl/SHA256SUMS.txt" -OutFile $dlSum -Quiet
+    if ((-not $sumOk) -and $Mirror -and (-not $usedDirectFallback)) {
+      Write-Host "[Volo] WARNING: Mirror failed to serve SHA256SUMS.txt; falling back to direct GitHub SHA256SUMS.txt..." -ForegroundColor Yellow
+      $directBase = Get-ReleaseBaseUrl $primary -Direct
+      $sumOk = Invoke-FileDownload -Url "$directBase/SHA256SUMS.txt" -OutFile $dlSum -Quiet
+    }
     if (-not $sumOk) {
       throw "Failed to download SHA256SUMS.txt from $baseUrl/SHA256SUMS.txt (pass -NoVerify only for custom mirrors without checksums)."
     }
@@ -1068,13 +1188,18 @@ function Register-OrUpdateNativeService([string]$TargetExe, [string]$CfgEnvFile)
   if (-not $existingSvc) {
     $createArgs = @("create", $ServiceName, "binPath=", $svcCmdLine, "start=", "auto", "DisplayName=", "Volo-go ($ServiceName)") + $acctArgs
     [void](Invoke-ScExe -ScArgs $createArgs)
+    if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed with exit code $LASTEXITCODE." }
   } else {
     $configArgs = @("config", $ServiceName, "binPath=", $svcCmdLine, "start=", "auto", "DisplayName=", "Volo-go ($ServiceName)") + $acctArgs
     [void](Invoke-ScExe -ScArgs $configArgs)
+    if ($LASTEXITCODE -ne 0) { throw "sc.exe config failed with exit code $LASTEXITCODE." }
   }
-  [void](Invoke-ScExe -ScArgs @("description", $ServiceName, "Volo-go Blog Service ($CfgEnvFile)") -IgnoreExitCode)
-  [void](Invoke-ScExe -ScArgs @("failure", $ServiceName, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/10000") -IgnoreExitCode)
-  [void](Invoke-ScExe -ScArgs @("failureflag", $ServiceName, "1") -IgnoreExitCode)
+  [void](Invoke-ScExe -ScArgs @("description", $ServiceName, "Volo-go Blog Service ($CfgEnvFile)"))
+  if ($LASTEXITCODE -ne 0) { throw "sc.exe description failed with exit code $LASTEXITCODE." }
+  [void](Invoke-ScExe -ScArgs @("failure", $ServiceName, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/10000"))
+  if ($LASTEXITCODE -ne 0) { throw "sc.exe failure failed with exit code $LASTEXITCODE." }
+  [void](Invoke-ScExe -ScArgs @("failureflag", $ServiceName, "1"))
+  if ($LASTEXITCODE -ne 0) { throw "sc.exe failureflag failed with exit code $LASTEXITCODE." }
 }
 
 function Register-OrUpdateNssmService([string]$TargetExe, [string]$WorkDir, [string]$CfgEnvFile) {
@@ -1089,7 +1214,10 @@ function Register-OrUpdateNssmService([string]$TargetExe, [string]$WorkDir, [str
 
   $existingSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
   if ($existingSvc -and (-not (Test-IsNssmService))) {
-    [void](Invoke-ScExe -ScArgs @("delete", $ServiceName) -IgnoreExitCode)
+    [void](Invoke-ScExe -ScArgs @("delete", $ServiceName) -AllowedExitCodes @(0, 1060, 1072))
+    if (($LASTEXITCODE -ne 0) -and ($LASTEXITCODE -ne 1060) -and ($LASTEXITCODE -ne 1072)) {
+      throw "sc.exe delete failed with exit code $LASTEXITCODE."
+    }
     Start-Sleep -Seconds 1
     $existingSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
   }
@@ -1228,26 +1356,63 @@ function Resolve-IcaclsPrincipal([string]$Identity) {
   switch -Regex ($Identity.Trim()) {
     '^(NT AUTHORITY\\)?SYSTEM$|^LocalSystem$' { return "*S-1-5-18" }
     '^(BUILTIN\\)?Administrators$'            { return "*S-1-5-32-544" }
+    '^(BUILTIN\\)?Users$'                     { return "*S-1-5-32-545" }
     '^(NT AUTHORITY\\)?NetworkService$'       { return "*S-1-5-20" }
     '^(NT AUTHORITY\\)?LocalService$'         { return "*S-1-5-19" }
     default                                   { return $Identity.Trim() }
   }
 }
 
-function Set-DataDirPermissions([string]$TargetDir, [string]$Account, [string]$Group) {
+function Set-InstallDirPermissions([string]$TargetDir, [string]$Account) {
   if ($DryRun) {
-    Write-Host "[dry-run] Restrict NTFS ACLs on $TargetDir (SID-based icacls)"
+    Write-Host "[dry-run] Restrict binary directory NTFS ACLs on $TargetDir (Administrators/SYSTEM Full, Users/Service Read+Execute only)"
     return
   }
-  & icacls $TargetDir /inheritance:r | Out-Null
-  & icacls $TargetDir /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+  if (-not (Test-Path -LiteralPath $TargetDir)) {
+    New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+  }
+  if (Test-IsProtectedSystemRoot -CandidatePath $TargetDir) {
+    Write-Host "[Volo] Skipping directory ACL reset on shared system root '$TargetDir'; locking down binary file ACLs directly." -ForegroundColor Yellow
+    return
+  }
+  Invoke-Icacls @($TargetDir, "/inheritance:r")
+  Invoke-Icacls @($TargetDir, "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX")
+  $acctSpec = Resolve-IcaclsPrincipal $Account
+  if ($acctSpec -and ($acctSpec -ne "*S-1-5-18") -and ($acctSpec -ne "*S-1-5-32-544") -and ($acctSpec -ne "*S-1-5-32-545")) {
+    Invoke-Icacls @($TargetDir, "/grant:r", "${acctSpec}:(OI)(CI)RX")
+  }
+}
+
+function Set-BinaryFilePermissions([string]$TargetExe, [string]$Account) {
+  if ($DryRun) {
+    Write-Host "[dry-run] Restrict binary file NTFS ACLs on $TargetExe (Administrators/SYSTEM Full, Users/Service Read+Execute only)"
+    return
+  }
+  if (-not (Test-Path -LiteralPath $TargetExe)) {
+    return
+  }
+  Invoke-Icacls @($TargetExe, "/inheritance:r")
+  Invoke-Icacls @($TargetExe, "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F", "*S-1-5-32-545:RX")
+  $acctSpec = Resolve-IcaclsPrincipal $Account
+  if ($acctSpec -and ($acctSpec -ne "*S-1-5-18") -and ($acctSpec -ne "*S-1-5-32-544") -and ($acctSpec -ne "*S-1-5-32-545")) {
+    Invoke-Icacls @($TargetExe, "/grant:r", "${acctSpec}:RX")
+  }
+}
+
+function Set-DataDirPermissions([string]$TargetDir, [string]$Account, [string]$Group) {
+  if ($DryRun) {
+    Write-Host "[dry-run] Restrict runtime data NTFS ACLs on $TargetDir (Administrators/SYSTEM Full, Service Modify)"
+    return
+  }
+  Invoke-Icacls @($TargetDir, "/inheritance:r")
+  Invoke-Icacls @($TargetDir, "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
   $acctSpec = Resolve-IcaclsPrincipal $Account
   if ($acctSpec -and ($acctSpec -ne "*S-1-5-18") -and ($acctSpec -ne "*S-1-5-32-544")) {
-    & icacls $TargetDir /grant:r "${acctSpec}:(OI)(CI)M" | Out-Null
+    Invoke-Icacls @($TargetDir, "/grant:r", "${acctSpec}:(OI)(CI)M")
   }
   $grpSpec = Resolve-IcaclsPrincipal $Group
   if ($grpSpec -and ($grpSpec -ne "*S-1-5-18") -and ($grpSpec -ne "*S-1-5-32-544")) {
-    & icacls $TargetDir /grant:r "${grpSpec}:(OI)(CI)RX" | Out-Null
+    Invoke-Icacls @($TargetDir, "/grant:r", "${grpSpec}:(OI)(CI)RX")
   }
 }
 
@@ -1259,11 +1424,11 @@ function Set-SecretEnvFilePermissions([string]$TargetFile, [string]$Account) {
   if (-not (Test-Path -LiteralPath $TargetFile)) {
     return
   }
-  & icacls $TargetFile /inheritance:r | Out-Null
-  & icacls $TargetFile /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+  Invoke-Icacls @($TargetFile, "/inheritance:r")
+  Invoke-Icacls @($TargetFile, "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F")
   $acctSpec = Resolve-IcaclsPrincipal $Account
   if ($acctSpec -and ($acctSpec -ne "*S-1-5-18") -and ($acctSpec -ne "*S-1-5-32-544")) {
-    & icacls $TargetFile /grant:r "${acctSpec}:R" | Out-Null
+    Invoke-Icacls @($TargetFile, "/grant:r", "${acctSpec}:R")
   }
 }
 
@@ -1271,6 +1436,7 @@ try {
   $DestBin = [System.IO.Path]::GetFullPath((Join-Path $InstallDir "volo.exe"))
   switch ($Action) {
     "Install" {
+      Assert-BinaryDataSeparation -BinDir $InstallDir -RuntimeDataDir $DataDir
       $SrcBin = Resolve-VoloBinary
       Test-VoloBinarySmoke -CandidateExe $SrcBin
       Stop-VoloServiceAndWait -TargetExe $DestBin
@@ -1286,6 +1452,8 @@ try {
       Sync-BundledExtensions -DestRoot $DataDir -CfgEnvFile $EnvFile
       Set-DataDirPermissions -TargetDir $DataDir -Account $ServiceAccount -Group $PermissionGroup
       Install-BinarySafe -SourceExe $SrcBin -TargetExe $DestBin
+      Set-InstallDirPermissions -TargetDir $InstallDir -Account $ServiceAccount
+      Set-BinaryFilePermissions -TargetExe $DestBin -Account $ServiceAccount
 
       if (-not (Test-Path -LiteralPath $EnvFile)) {
         $SecretHex = if ($DryRun) { "<redacted>" } else { New-RandomHex32 }
@@ -1336,6 +1504,10 @@ try {
     }
     "Upgrade" {
       Resolve-ExistingRegistration ([ref]$DestBin) ([ref]$DataDir) ([ref]$EnvFile)
+      $effBinDir = Split-Path -Parent $DestBin
+      if ($Script:HasExplicitInstallDir -or $Script:HasExplicitDataDir) {
+        Assert-BinaryDataSeparation -BinDir $effBinDir -RuntimeDataDir $DataDir
+      }
       $SrcBin = Resolve-VoloBinary
       Test-VoloBinarySmoke -CandidateExe $SrcBin
       Invoke-PreUpgradeBackup -LiveBin $DestBin -RootDataDir $DataDir -CfgEnvFile $EnvFile
@@ -1345,6 +1517,14 @@ try {
         Sync-BundledExtensions -DestRoot $DataDir -CfgEnvFile $EnvFile
       }
       Install-BinarySafe -SourceExe $SrcBin -TargetExe $DestBin
+      if ((-not (Test-IsSubPathOrEqual -CandidatePath $effBinDir -BaseDir $DataDir)) -and
+          (-not (Test-IsSubPathOrEqual -CandidatePath $DataDir -BaseDir $effBinDir))) {
+        if ($DryRun -or (Test-Path -LiteralPath $DataDir)) {
+          Set-DataDirPermissions -TargetDir $DataDir -Account $ServiceAccount -Group $PermissionGroup
+        }
+        Set-InstallDirPermissions -TargetDir $effBinDir -Account $ServiceAccount
+      }
+      Set-BinaryFilePermissions -TargetExe $DestBin -Account $ServiceAccount
 
       # Keep service registration parameters synchronized (e.g. NSSM AppParameters or explicit ServiceManager migration)
       $effUpgradeMgr = Resolve-EffectiveServiceManager -RequestedMode $ServiceManager -ForUpgrade
@@ -1385,6 +1565,7 @@ try {
           if ($hadPrevBin -and (Test-Path -LiteralPath "$DestBin.bak")) {
             Write-Host "[Volo] Rolling back '$DestBin.bak' -> '$DestBin' and restarting previous version..." -ForegroundColor Yellow
             Install-BinarySafe -SourceExe "$DestBin.bak" -TargetExe $DestBin
+            Set-BinaryFilePermissions -TargetExe $DestBin -Account $ServiceAccount
             try {
               Start-VoloRegisteredService
               Write-Host "[Volo] Previous binary restored and service '$ServiceName' restarted." -ForegroundColor Yellow
@@ -1404,6 +1585,9 @@ try {
     }
     "Uninstall" {
       Resolve-ExistingRegistration ([ref]$DestBin) ([ref]$DataDir) ([ref]$EnvFile)
+      if ($PurgeData) {
+        Assert-SafePurgeDir -TargetPath $DataDir -ProtectedBinDir (Split-Path -Parent $DestBin)
+      }
       Stop-VoloServiceAndWait -TargetExe $DestBin
       if ($DryRun) {
         Write-Host "[dry-run] Uninstall '$ServiceName' (Binary: $DestBin, DataDir: $DataDir, PurgeData: $PurgeData)"
@@ -1413,14 +1597,16 @@ try {
             & $NssmCmd.Source remove $ServiceName confirm 2>$null | Out-Null
           }
           if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-            [void](Invoke-ScExe -ScArgs @("delete", $ServiceName) -IgnoreExitCode)
+            [void](Invoke-ScExe -ScArgs @("delete", $ServiceName) -AllowedExitCodes @(0, 1060, 1072))
+            if (($LASTEXITCODE -ne 0) -and ($LASTEXITCODE -ne 1060) -and ($LASTEXITCODE -ne 1072)) {
+              throw "sc.exe delete failed with exit code $LASTEXITCODE."
+            }
           }
         }
         Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $DestBin -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath "$DestBin.bak" -Force -ErrorAction SilentlyContinue
         if ($PurgeData) {
-          Assert-SafePurgeDir $DataDir
           if ($EnvFile -and (Test-Path -LiteralPath $EnvFile)) {
             Remove-Item -LiteralPath $EnvFile -Force -ErrorAction SilentlyContinue
           }

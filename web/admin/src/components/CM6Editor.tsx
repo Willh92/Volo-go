@@ -12,6 +12,7 @@ export interface CM6EditorProps {
   value: string;
   onChange: (next: string) => void;
   quickInserts?: QuickInsertItem[];
+  hasAudio?: boolean;
   onSave?: () => void;
 }
 

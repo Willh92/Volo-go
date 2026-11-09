@@ -33,6 +33,7 @@ jobs:
         working-directory: web/admin
         run: |
           npm ci --no-audit --no-fund
+          rm -rf ../../internal/adminui/dist && mkdir -p ../../internal/adminui/dist
           npm run build
 
       - name: Setup Go
@@ -44,6 +45,7 @@ jobs:
       - name: Run Benchmarks & Publish Step Summary
         env:
           CGO_ENABLED: "0"
+          GOEXPERIMENT: "nojsonv2"
         run: |
           go test -run=^$ -bench=. -benchmem -benchtime=250ms \
             ./internal/render ./internal/visibility ./internal/db/sqlx ./internal/server | tee /tmp/bench.out

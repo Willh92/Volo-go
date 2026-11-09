@@ -273,13 +273,22 @@ function matchNickname(sigs, nickname) {
 }
 
 function recordIntercept(isNickname) {
-  if (!volo.kv || typeof volo.kv.incr !== "function") {
+  if (!volo.kv) {
     return;
   }
   try {
-    volo.kv.incr("stats:blocked_total", 1, 0);
-    if (isNickname) {
-      volo.kv.incr("stats:blocked_nickname", 1, 0);
+    if (typeof volo.kv.incrAsync === "function") {
+      volo.kv.incrAsync("stats:blocked_total", 1);
+      if (isNickname) {
+        volo.kv.incrAsync("stats:blocked_nickname", 1);
+      }
+      return;
+    }
+    if (typeof volo.kv.incr === "function") {
+      volo.kv.incr("stats:blocked_total", 1, 0);
+      if (isNickname) {
+        volo.kv.incr("stats:blocked_nickname", 1, 0);
+      }
     }
   } catch (_e) {}
 }

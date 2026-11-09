@@ -2,7 +2,6 @@
   "meta.code": "en-US",
   "meta.name": "English",
   "meta.dir": "ltr",
-
   "nav.home": "Home",
   "nav.categories": "Categories",
   "nav.tags": "Tags",
@@ -16,7 +15,6 @@
   "nav.admin_console": "Console",
   "nav.login": "Sign In",
   "nav.logout": "Sign Out",
-
   "appearance.auto": "Auto",
   "appearance.auto_desc": "06:30–19:00 light",
   "appearance.system": "System",
@@ -26,10 +24,8 @@
   "appearance.dark": "Dark",
   "appearance.dark_desc": "Always dark",
   "appearance.switch_lang": "Language",
-
   "article.license_title": "Copyright & License",
   "studio.archive_summary": "{articles} posts across {months} months",
-
   "article.pinned": "Pinned",
   "article.reading_stats": "{words} words · {minutes} min read",
   "article.outdated_notice": "Last updated {days} days ago. Technical details may have evolved since publication.",
@@ -52,11 +48,9 @@
   "article.copy_code": "Copy",
   "article.copied_code": "Copied",
   "article.raw_markdown": "View Raw Markdown",
-
   "podcast.badge": "Podcast Episode",
   "podcast.speed": "Speed",
   "podcast.subscribe_rss": "Podcast RSS",
-
   "bookshelf.title": "Bookshelf",
   "bookshelf.search_placeholder": "Search books, slugs, or descriptions…",
   "bookshelf.open_reader": "Open Reader",
@@ -68,7 +62,6 @@
   "bookshelf.expand_toc": "Show Contents",
   "bookshelf.focus_fullscreen": "Focus Fullscreen",
   "bookshelf.exit_fullscreen": "Exit Fullscreen",
-
   "comment.section_title": "Comments ({count})",
   "comment.closed_notice": "Comments are currently closed.",
   "comment.registered_only": "Only verified registered readers may comment. Please sign in first.",
@@ -108,7 +101,6 @@
   "comment.ban_note_ph": "Reason note (optional)",
   "comment.ban_confirm": "Confirm Ban",
   "comment.shortcut_submit": "Ctrl + Enter to send",
-
   "admin.ws.overview": "Create & Overview",
   "admin.ws.content": "Content & Media",
   "admin.ws.distribute": "Distribute & Connect",
@@ -116,7 +108,6 @@
   "admin.ws.system": "System & Security",
   "admin.setup.welcome": "Welcome to Volo-go",
   "admin.setup.subtitle": "Clean-slate · Pure Go single binary · Zero-leak privacy",
-
   "notify.verify_code.subject": "[{site}] Verification code: {code}",
   "notify.verify_code.body": "Hello! Your 6-digit verification code for {site} is {code} (valid for 10 minutes).",
   "notify.new_comment.subject": "[{site}] New comment on \"{title}\"",
@@ -126,12 +117,10 @@
   "notify.test_smtp.subject": "[{site}] SMTP Delivery Test",
   "notify.test_smtp.body": "Success! Your {site} SMTP notification channel is configured properly with verified TLS.",
   "notify.webhook.test_title": "Volo-go Webhook Connectivity Test",
-
   "error.unauthorized": "Authentication required",
   "error.forbidden": "You do not have permission to access this resource",
   "error.rate_limited": "Too many requests. Please slow down and try again.",
   "error.not_found": "The requested page or resource was not found",
-
   "sidebar.categories": "Categories",
   "sidebar.tags": "Popular Tags",
   "sidebar.recent_comments": "Recent Comments",
@@ -281,5 +270,26 @@
   "auth.err_2fa_expired": "Two-factor login challenge expired. Please sign in again.",
   "auth.err_passkey_failed": "Passkey verification failed. Please try again or sign in with password.",
   "error.hint_403": "Access to this page is restricted by permissions or security policy.",
-  "error.hint_429": "Too many requests in a short period. Please wait a moment and try again."
+  "error.hint_429": "Too many requests in a short period. Please wait a moment and try again.",
+  "comment.tab_split": "Split",
+  "comment.fullscreen": "Fullscreen (Ctrl+Shift+F)",
+  "comment.exit_fullscreen": "Exit Fullscreen (Esc)",
+  "comment.expand_full": "Show more",
+  "comment.collapse_full": "Show less",
+  "comment.lines_unit": "lines",
+  "comment.err_length_bounds": "Comment must be between {min} and {max} characters",
+  "comment.err_too_many_lines": "Too many line breaks (maximum {max} lines)",
+  "comment.tb_bold": "Bold (Ctrl+B)",
+  "comment.tb_italic": "Italic (Ctrl+I)",
+  "comment.tb_strike": "Strikethrough",
+  "comment.tb_code": "Inline Code (Ctrl+E)",
+  "comment.tb_heading": "Heading",
+  "comment.tb_quote": "Quote",
+  "comment.tb_ul": "Bullet List",
+  "comment.tb_ol": "Numbered List",
+  "comment.tb_hr": "Divider",
+  "comment.tb_link": "Link (Ctrl+K)",
+  "comment.tb_image": "Image",
+  "comment.tb_codeblock": "Code Block",
+  "comment.tb_table": "Table"
 }

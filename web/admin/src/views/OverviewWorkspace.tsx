@@ -293,7 +293,20 @@ function MonthlyArticlesChart({
   isHistory?: boolean;
 }) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const series = items.length > 0 ? items : buildFallbackMonths(12);
+
+  useEffect(() => {
+    if (hoverIdx === null) return;
+    const onDocDown = (ev: PointerEvent) => {
+      if (stageRef.current && !stageRef.current.contains(ev.target as Node)) {
+        setHoverIdx(null);
+      }
+    };
+    document.addEventListener("pointerdown", onDocDown, { passive: true });
+    return () => document.removeEventListener("pointerdown", onDocDown);
+  }, [hoverIdx !== null]);
+
   const W = 320;
   const H = 164;
   const padL = 36;
@@ -338,6 +351,7 @@ function MonthlyArticlesChart({
   const barTRatio = Math.max(0, Math.min(1, (activeBarTopY - padT) / plotH));
   const barXPct = activeCx !== null ? (activeCx / W) * 100 : 50;
   const barYPct = (activeBarTopY / H) * 100;
+  const flipBarLeft = hoverIdx !== null && ((n <= 12 && hoverIdx >= 9) || barXPct > 55);
 
   const onTouch = (e: TouchEvent) => {
     const touch = e.touches?.[0];
@@ -347,14 +361,14 @@ function MonthlyArticlesChart({
   };
 
   return (
-    <div class="volo-chart-stage" style={{ flex: 1, display: "flex", alignItems: "center" }}>
+    <div ref={stageRef} class="volo-chart-stage" style={{ flex: 1, display: "flex", alignItems: "center" }}>
       {active && activeCx !== null && (
         <div
           class="volo-chart-tooltip volo-chart-tooltip--floating"
           style={{
-            left: `${barXPct.toFixed(2)}%`,
+            left: `${Math.max(6, Math.min(94, barXPct)).toFixed(2)}%`,
             top: `${barYPct.toFixed(2)}%`,
-            transform: `translate(${barXPct > 52 ? "calc(-100% - 12px)" : "12px"}, -${Math.round(15 + barTRatio * 85)}%)`,
+            transform: `translate(${flipBarLeft ? "calc(-100% - 10px)" : "10px"}, -${Math.round(15 + barTRatio * 85)}%)`,
           }}
         >
           <div style={{ fontWeight: 650, marginBottom: "1px" }}>{active.month}</div>
@@ -477,7 +491,26 @@ function DonutChart({
   emptyText: string;
   prefix?: string;
 }) {
-  const [hoverState, setHoverState] = useState<{ idx: number; source: "ring" | "legend" } | null>(null);
+  const [hoverState, setHoverState] = useState<{
+    idx: number;
+    source: "ring" | "legend";
+    x?: number;
+    y?: number;
+    wrapW?: number;
+  } | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!hoverState) return;
+    const onDocDown = (ev: PointerEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(ev.target as Node)) {
+        setHoverState(null);
+      }
+    };
+    document.addEventListener("pointerdown", onDocDown, { passive: true });
+    return () => document.removeEventListener("pointerdown", onDocDown);
+  }, [Boolean(hoverState)]);
 
   const allPositive = (items || [])
     .map((it) => ({
@@ -538,29 +571,63 @@ function DonutChart({
   const hoverIdx = hoverState && computed[hoverState.idx] ? hoverState.idx : null;
   const activeSeg = hoverIdx !== null ? computed[hoverIdx] : null;
 
+  const buildRingHover = (idx: number, clientX?: number, clientY?: number) => {
+    const seg = computed[idx];
+    const wrapEl = wrapRef.current;
+    const stageEl = stageRef.current;
+    const wrapRect = wrapEl?.getBoundingClientRect();
+    const wrapW = Math.max(160, wrapRect?.width || wrapEl?.clientWidth || 260);
+    const fallbackX = (stageEl?.offsetLeft || 0) + (seg ? seg.arcX : cx);
+    const fallbackY = (stageEl?.offsetTop || 0) + (seg ? seg.arcY : cy);
+    const x = clientX !== undefined && wrapRect ? clientX - wrapRect.left : fallbackX;
+    const y = clientY !== undefined && wrapRect ? clientY - wrapRect.top : fallbackY;
+    return { idx, source: "ring" as const, x, y, wrapW };
+  };
+
+  let donutTipStyle: CSSProperties | undefined;
+  if (activeSeg && hoverState?.source === "ring") {
+    const wrapW = Math.max(160, hoverState.wrapW || wrapRef.current?.clientWidth || 260);
+    const rawX = hoverState.x ?? ((stageRef.current?.offsetLeft || 0) + activeSeg.arcX);
+    const rawY = hoverState.y ?? ((stageRef.current?.offsetTop || 0) + activeSeg.arcY);
+    const clampedX = Math.max(8, Math.min(wrapW - 8, rawX));
+    const flipLeft = rawX > wrapW * 0.55;
+    const yXform = rawY < 40 ? "12px" : "-120%";
+    if (flipLeft) {
+      const safeRight = Math.max(8, Math.min(wrapW - clampedX, Math.max(8, wrapW - Math.min(180, wrapW - 8))));
+      donutTipStyle = {
+        right: `${safeRight.toFixed(1)}px`,
+        left: "auto",
+        top: `${Math.max(8, rawY).toFixed(1)}px`,
+        maxWidth: `${Math.min(240, Math.max(96, wrapW - safeRight - 8)).toFixed(0)}px`,
+        transform: `translate(0, ${yXform})`,
+      };
+    } else {
+      const safeLeft = Math.max(8, Math.min(clampedX, Math.max(8, wrapW - Math.min(180, wrapW - 8))));
+      donutTipStyle = {
+        left: `${safeLeft.toFixed(1)}px`,
+        right: "auto",
+        top: `${Math.max(8, rawY).toFixed(1)}px`,
+        maxWidth: `${Math.min(240, Math.max(96, wrapW - safeLeft - 8)).toFixed(0)}px`,
+        transform: `translate(0, ${yXform})`,
+      };
+    }
+  }
+
   return (
-    <div class="volo-donut-wrap" onMouseLeave={() => setHoverState(null)}>
-      <div class="volo-donut-stage">
-        {activeSeg && hoverState?.source === "ring" && (
-          <div
-            class="volo-chart-tooltip volo-chart-tooltip--floating"
-            style={{
-              left: `${Math.max(8, Math.min(108, activeSeg.arcX)).toFixed(1)}px`,
-              top: `${activeSeg.arcY.toFixed(1)}px`,
-              transform: `translate(${
-                Math.cos(activeSeg.theta) < -0.25 ? "-10%" : Math.cos(activeSeg.theta) > 0.35 ? "-26%" : "-50%"
-              }, ${Math.sin(activeSeg.theta) > 0.08 ? "10px" : "calc(-100% - 10px)"})`,
-            }}
-          >
-            <div style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <span class="volo-tooltip-dot" style={{ background: activeSeg.color }} />
-              <strong>{activeSeg.dispName}</strong>
-              <span style={{ opacity: 0.9 }}>
-                {activeSeg.val.toLocaleString()} ({activeSeg.pct}%)
-              </span>
-            </div>
+    <div ref={wrapRef} class="volo-donut-wrap" onMouseLeave={() => setHoverState(null)}>
+      {activeSeg && hoverState?.source === "ring" && donutTipStyle && (
+        <div class="volo-chart-tooltip volo-chart-tooltip--floating" style={donutTipStyle}>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", maxWidth: "100%", minWidth: 0 }}>
+            <span class="volo-tooltip-dot" style={{ background: activeSeg.color }} />
+            <strong style={{ overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>{activeSeg.dispName}</strong>
+            <span style={{ opacity: 0.9, flexShrink: 0 }}>
+              {activeSeg.val.toLocaleString()} ({activeSeg.pct}%)
+            </span>
           </div>
-        )}
+        </div>
+      )}
+
+      <div ref={stageRef} class="volo-donut-stage">
         <svg
           width="112"
           height="112"
@@ -583,9 +650,18 @@ function DonutChart({
                 key={`${seg.it.name}-${seg.idx}`}
                 class={`volo-donut-seg ${isHover ? "is-hover" : isDim ? "is-dim" : ""}`}
                 style={{ transform: popTransform }}
-                onMouseEnter={() => setHoverState({ idx: seg.idx, source: "ring" })}
-                onClick={() =>
-                  setHoverState((prev) => (prev?.idx === seg.idx ? null : { idx: seg.idx, source: "ring" }))
+                onMouseEnter={(e) => setHoverState(buildRingHover(seg.idx, e.clientX, e.clientY))}
+                onMouseMove={(e) => setHoverState(buildRingHover(seg.idx, e.clientX, e.clientY))}
+                onTouchStart={(e) => {
+                  const tc = e.touches?.[0];
+                  setHoverState(buildRingHover(seg.idx, tc?.clientX, tc?.clientY));
+                }}
+                onClick={(e) =>
+                  setHoverState((prev) =>
+                    prev?.idx === seg.idx && prev.source === "ring"
+                      ? null
+                      : buildRingHover(seg.idx, e.clientX || undefined, e.clientY || undefined)
+                  )
                 }
               >
                 <circle
@@ -694,6 +770,17 @@ export function OverviewWorkspace({
   const chartStageRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    if (hoverIdx === null) return;
+    const onDocDown = (ev: PointerEvent) => {
+      if (chartStageRef.current && !chartStageRef.current.contains(ev.target as Node)) {
+        setHoverIdx(null);
+      }
+    };
+    document.addEventListener("pointerdown", onDocDown, { passive: true });
+    return () => document.removeEventListener("pointerdown", onDocDown);
+  }, [hoverIdx !== null]);
+
+  useEffect(() => {
     if (typeof window === "undefined" || !window.matchMedia) return;
     const mql = window.matchMedia("(max-width: 640px)");
     const onChange = (ev: MediaQueryListEvent) => setIsNarrowChart(ev.matches);
@@ -742,6 +829,7 @@ export function OverviewWorkspace({
   const [tagPoolOpen, setTagPoolOpen] = useState(false);
   const [tagPoolQuery, setTagPoolQuery] = useState("");
   const [tagPoolSort, setTagPoolSort] = useState<"count" | "name">("count");
+  const [tagPoolLimit, setTagPoolLimit] = useState<number>(120);
   const [remoteTags, setRemoteTags] = useState<any[]>([]);
   const [tagSuggestOpen, setTagSuggestOpen] = useState(false);
   const [tagSuggestIdx, setTagSuggestIdx] = useState(0);
@@ -1761,9 +1849,9 @@ export function OverviewWorkspace({
     const safeSuggestIdx =
       suggestOptions.length > 0 ? Math.max(0, Math.min(tagSuggestIdx, suggestOptions.length - 1)) : 0;
 
-    // Bounded Tag Pool (top 80 matches sorted by Popular or A-Z)
+    // Progressive Tag Pool (initial 120 matches + Show more)
     const poolQueryLower = tagPoolQuery.trim().toLowerCase();
-    const visiblePoolTags = mergedTags
+    const sortedPoolTags = mergedTags
       .filter((tg) => !poolQueryLower || String(tg.name || "").toLowerCase().includes(poolQueryLower))
       .sort((a, b) => {
         if (tagPoolSort === "name") {
@@ -1772,8 +1860,9 @@ export function OverviewWorkspace({
         const cDiff = getTagCount(b) - getTagCount(a);
         if (cDiff !== 0) return cDiff;
         return String(a.name || "").localeCompare(String(b.name || ""));
-      })
-      .slice(0, 80);
+      });
+    const visiblePoolTags = sortedPoolTags.slice(0, tagPoolLimit);
+    const hiddenPoolCount = Math.max(0, sortedPoolTags.length - visiblePoolTags.length);
 
     return (
       <div>
@@ -1921,6 +2010,7 @@ export function OverviewWorkspace({
                   dirtyEditorSig.value = true;
                 }}
                 quickInserts={quickInserts}
+                hasAudio={Boolean(audioURL.trim())}
                 onSave={() => void handleSave(undefined, true)}
               />
             </div>
@@ -2315,7 +2405,10 @@ export function OverviewWorkspace({
                         class="volo-input volo-tag-pool-search"
                         placeholder={t("art.tag_pool_search_ph")}
                         value={tagPoolQuery}
-                        onInput={(e) => setTagPoolQuery((e.currentTarget as HTMLInputElement).value)}
+                        onInput={(e) => {
+                          setTagPoolQuery((e.currentTarget as HTMLInputElement).value);
+                          setTagPoolLimit(120);
+                        }}
                       />
                       <div class="volo-filter-pills">
                         <button
@@ -2338,24 +2431,35 @@ export function OverviewWorkspace({
                       {visiblePoolTags.length === 0 ? (
                         <span class="volo-help">{t("tbl.empty")}</span>
                       ) : (
-                        visiblePoolTags.map((tg) => {
-                          const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
-                          const cnt = getTagCount(tg);
-                          return (
+                        <>
+                          {visiblePoolTags.map((tg) => {
+                            const active = activeTagsLower.has(String(tg.name || "").toLowerCase());
+                            const cnt = getTagCount(tg);
+                            return (
+                              <button
+                                key={tg.id || tg.name}
+                                type="button"
+                                class={`volo-chip-btn ${active ? "active" : ""}`}
+                                onClick={() => {
+                                  toggleTagChip(tg.name);
+                                  dirtyEditorSig.value = true;
+                                }}
+                              >
+                                #{tg.name}
+                                {cnt > 0 ? <span style={{ opacity: 0.65, marginLeft: "3px" }}>({cnt})</span> : null}
+                              </button>
+                            );
+                          })}
+                          {hiddenPoolCount > 0 && (
                             <button
-                              key={tg.id || tg.name}
                               type="button"
-                              class={`volo-chip-btn ${active ? "active" : ""}`}
-                              onClick={() => {
-                                toggleTagChip(tg.name);
-                                dirtyEditorSig.value = true;
-                              }}
+                              class="volo-tag-more-btn"
+                              onClick={() => setTagPoolLimit((prev) => prev + 240)}
                             >
-                              #{tg.name}
-                              {cnt > 0 ? <span style={{ opacity: 0.65, marginLeft: "3px" }}>({cnt})</span> : null}
+                              {t("ui.token_more", { count: hiddenPoolCount })}
                             </button>
-                          );
-                        })
+                          )}
+                        </>
                       )}
                     </div>
                   </div>
@@ -3261,7 +3365,7 @@ export function OverviewWorkspace({
         <div class="volo-chart-box">
           <div class="volo-chart-legend">
             <span
-              class={`volo-chart-legend-item ${focusSeries === "pv" ? "is-active" : focusSeries === "uv" ? "is-dimmed" : ""}`}
+              class={`volo-chart-legend-item ${focusSeries === "pv" ? "is-active" : focusSeries === "uv" ? "is-dim" : ""}`}
               onMouseEnter={() => setFocusSeries("pv")}
               onMouseLeave={() => setFocusSeries(null)}
             >
@@ -3269,7 +3373,7 @@ export function OverviewWorkspace({
               {t("ov.legend_pv")}
             </span>
             <span
-              class={`volo-chart-legend-item ${focusSeries === "uv" ? "is-active" : focusSeries === "pv" ? "is-dimmed" : ""}`}
+              class={`volo-chart-legend-item ${focusSeries === "uv" ? "is-active" : focusSeries === "pv" ? "is-dim" : ""}`}
               onMouseEnter={() => setFocusSeries("uv")}
               onMouseLeave={() => setFocusSeries(null)}
             >
@@ -3279,28 +3383,37 @@ export function OverviewWorkspace({
           </div>
 
           <div class="volo-chart-stage" ref={chartStageRef}>
-            {activeTrend && activePvPt && (
-              <div
-                class="volo-chart-tooltip volo-chart-tooltip--floating"
-                style={{
-                  left: `${xPct.toFixed(2)}%`,
-                  top: `${yPct.toFixed(2)}%`,
-                  transform: `translate(${xPct > 50 ? `calc(-100% - ${tipGap}px)` : `${tipGap}px`}, -${Math.round(15 + tRatio * 85)}%)`,
-                }}
-              >
-                <div style={{ fontWeight: 650, marginBottom: "3px" }}>{activeTrend.stat_date}</div>
-                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: "5px" }}>
-                    <span class="volo-tooltip-dot" style={{ background: "var(--volo-accent)" }} />
-                    PV: <strong>{Number(activeTrend.pv || 0).toLocaleString()}</strong>
-                  </span>
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: "5px", color: "var(--volo-chart-uv-on-dark)" }}>
-                    <span class="volo-tooltip-dot" style={{ background: "var(--volo-chart-uv)" }} />
-                    UV: <strong>{Number(activeTrend.uv || 0).toLocaleString()}</strong>
-                  </span>
+            {activeTrend && activePvPt && hoverIdx !== null && (() => {
+              const isLeftEdge = hoverIdx <= Math.min(2, Math.floor((n - 1) / 3));
+              const isRightEdge = hoverIdx >= Math.max(1, n - 3) || (!isLeftEdge && xPct > 54);
+              const yShift = `-${Math.round(15 + tRatio * 85)}%`;
+              const tipStyle: CSSProperties = isNarrowChart
+                ? isLeftEdge
+                  ? { left: "8px", top: `${yPct.toFixed(2)}%`, transform: `translate(0, ${yShift})` }
+                  : isRightEdge
+                  ? { left: "calc(100% - 8px)", top: `${yPct.toFixed(2)}%`, transform: `translate(-100%, ${yShift})` }
+                  : { left: `${xPct.toFixed(2)}%`, top: `${yPct.toFixed(2)}%`, transform: `translate(-${Math.round(xPct)}%, ${yShift})` }
+                : {
+                    left: `${Math.max(4, Math.min(96, xPct)).toFixed(2)}%`,
+                    top: `${yPct.toFixed(2)}%`,
+                    transform: `translate(${isRightEdge ? `calc(-100% - ${tipGap}px)` : `${tipGap}px`}, ${yShift})`,
+                  };
+              return (
+                <div class="volo-chart-tooltip volo-chart-tooltip--floating" style={tipStyle}>
+                  <div style={{ fontWeight: 650, marginBottom: "3px" }}>{activeTrend.stat_date}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: "5px" }}>
+                      <span class="volo-tooltip-dot" style={{ background: "var(--volo-accent)" }} />
+                      PV: <strong>{Number(activeTrend.pv || 0).toLocaleString()}</strong>
+                    </span>
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: "5px", color: "var(--volo-chart-uv-on-dark)" }}>
+                      <span class="volo-tooltip-dot" style={{ background: "var(--volo-chart-uv)" }} />
+                      UV: <strong>{Number(activeTrend.uv || 0).toLocaleString()}</strong>
+                    </span>
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             <svg
               viewBox={`0 0 ${W} ${H}`}
@@ -3455,7 +3568,7 @@ export function OverviewWorkspace({
                       />
                     )}
                     <circle
-                      class={`volo-chart-dot ${isHover ? "is-active" : ""}`}
+                      class={`volo-chart-dot ${isHover ? "is-hover" : ""}`}
                       cx={u.x}
                       cy={u.y}
                       r={isHover ? 4.8 : 2.6}
@@ -3465,7 +3578,7 @@ export function OverviewWorkspace({
                       style={{ opacity: focusSeries === "pv" ? 0.28 : 1 }}
                     />
                     <circle
-                      class={`volo-chart-dot ${isHover ? "is-active" : ""}`}
+                      class={`volo-chart-dot ${isHover ? "is-hover" : ""}`}
                       cx={p.x}
                       cy={p.y}
                       r={isHover ? 5.6 : 3.4}
@@ -3620,7 +3733,7 @@ export function OverviewWorkspace({
                       {hasOver24 && (
                         <button
                           type="button"
-                          class={`volo-chart-toggle-btn ${effectiveMode === "24m" ? "is-active" : ""}`}
+                          class={`volo-chart-toggle-btn ${effectiveMode === "24m" ? "active" : ""}`}
                           onClick={() => setMonthlyRangeMode("24m")}
                         >
                           {t("ov.monthly_24m")}
@@ -3628,14 +3741,14 @@ export function OverviewWorkspace({
                       )}
                       <button
                         type="button"
-                        class={`volo-chart-toggle-btn ${effectiveMode === "history" ? "is-active" : ""}`}
+                        class={`volo-chart-toggle-btn ${effectiveMode === "history" ? "active" : ""}`}
                         onClick={() => setMonthlyRangeMode("history")}
                       >
                         {t("ov.monthly_history")}
                       </button>
                       <button
                         type="button"
-                        class={`volo-chart-toggle-btn ${effectiveMode === "12m" ? "is-active" : ""}`}
+                        class={`volo-chart-toggle-btn ${effectiveMode === "12m" ? "active" : ""}`}
                         onClick={() => setMonthlyRangeMode("12m")}
                       >
                         {t("ov.monthly_12m")}

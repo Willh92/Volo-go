@@ -140,7 +140,16 @@ type jsToken struct {
 	newline bool // preceded by a line terminator
 }
 
+const maxJSParseDepth = 128
+
 func tokenizeJS(src string) ([]jsToken, error) {
+	return tokenizeJSWithDepth(src, 0)
+}
+
+func tokenizeJSWithDepth(src string, tplDepth int) ([]jsToken, error) {
+	if tplDepth > maxJSParseDepth {
+		return nil, fmt.Errorf("SyntaxError: maximum template literal nesting depth (%d) exceeded", maxJSParseDepth)
+	}
 	var toks []jsToken
 	n := len(src)
 	i := 0
@@ -230,12 +239,14 @@ func tokenizeJS(src string) ([]jsToken, error) {
 						sb.WriteByte('\r')
 					case 't':
 						sb.WriteByte('\t')
+					case '0':
+						sb.WriteByte(0)
 					case '\\', '\'', '"', '/':
 						sb.WriteByte(esc)
 					case 'x':
 						if i+2 <= n {
 							if v, err := strconv.ParseUint(src[i:i+2], 16, 8); err == nil {
-								sb.WriteByte(byte(v))
+								sb.WriteRune(rune(v))
 								i += 2
 								continue
 							}
@@ -276,7 +287,8 @@ func tokenizeJS(src string) ([]jsToken, error) {
 		// Template literal `...${expr}...` desugared into ("a" + (expr) + "b")
 		if ch == '`' {
 			i++
-			emit(tokLParen, "(")
+			toks = append(toks, jsToken{kind: tokLParen, lit: "(", aux: "tpl", line: line, newline: sawNL})
+			sawNL = false
 			var sb strings.Builder
 			firstPart := true
 			flushStr := func() {
@@ -306,7 +318,7 @@ func tokenizeJS(src string) ([]jsToken, error) {
 					case 'x':
 						if i+2 <= n {
 							if v, err := strconv.ParseUint(src[i:i+2], 16, 8); err == nil {
-								sb.WriteByte(byte(v))
+								sb.WriteRune(rune(v))
 								i += 2
 								continue
 							}
@@ -332,11 +344,11 @@ func tokenizeJS(src string) ([]jsToken, error) {
 					flushStr()
 					i += 2
 					exprStart := i
-					endIdx, err := scanTemplateExprEnd(src, exprStart, &line)
+					endIdx, err := scanTemplateExprEnd(src, exprStart, &line, tplDepth+1)
 					if err != nil {
 						return nil, err
 					}
-					subToks, err := tokenizeJS(src[exprStart:endIdx])
+					subToks, err := tokenizeJSWithDepth(src[exprStart:endIdx], tplDepth+1)
 					if err != nil {
 						return nil, err
 					}
@@ -640,7 +652,10 @@ func tokenizeJS(src string) ([]jsToken, error) {
 	return toks, nil
 }
 
-func scanTemplateExprEnd(src string, start int, line *int) (int, error) {
+func scanTemplateExprEnd(src string, start int, line *int, tplDepth int) (int, error) {
+	if tplDepth > maxJSParseDepth {
+		return 0, fmt.Errorf("line %d: SyntaxError: maximum template literal nesting depth (%d) exceeded", *line, maxJSParseDepth)
+	}
 	n := len(src)
 	i := start
 	depth := 1
@@ -723,7 +738,7 @@ func scanTemplateExprEnd(src string, start int, line *int) (int, error) {
 		}
 		// Nested template literal
 		if ch == '`' {
-			nextPos, err := skipNestedTemplate(src, i+1, line)
+			nextPos, err := skipNestedTemplate(src, i+1, line, tplDepth)
 			if err != nil {
 				return 0, err
 			}
@@ -770,6 +785,9 @@ func scanTemplateExprEnd(src string, start int, line *int) (int, error) {
 		}
 		if ch == '{' {
 			depth++
+			if depth > maxJSParseDepth {
+				return 0, fmt.Errorf("line %d: SyntaxError: maximum template brace nesting depth (%d) exceeded", *line, maxJSParseDepth)
+			}
 			prevSig = '{'
 			prevTwo = ""
 			lastIdent = ""
@@ -815,7 +833,10 @@ func scanTemplateExprEnd(src string, start int, line *int) (int, error) {
 	return 0, fmt.Errorf("line %d: unterminated template interpolation", *line)
 }
 
-func skipNestedTemplate(src string, start int, line *int) (int, error) {
+func skipNestedTemplate(src string, start int, line *int, tplDepth int) (int, error) {
+	if tplDepth > maxJSParseDepth {
+		return 0, fmt.Errorf("line %d: SyntaxError: maximum template literal nesting depth (%d) exceeded", *line, maxJSParseDepth)
+	}
 	n := len(src)
 	i := start
 	for i < n {
@@ -828,7 +849,7 @@ func skipNestedTemplate(src string, start int, line *int) (int, error) {
 			continue
 		}
 		if c == '$' && i+1 < n && src[i+1] == '{' {
-			endIdx, err := scanTemplateExprEnd(src, i+2, line)
+			endIdx, err := scanTemplateExprEnd(src, i+2, line, tplDepth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -1073,8 +1094,36 @@ func (*exprSeq) exprNode()       {}
 // --- Recursive-Descent Parser ---
 
 type jsParser struct {
-	toks []jsToken
-	pos  int
+	toks  []jsToken
+	pos   int
+	depth int
+}
+
+func (p *jsParser) enter() error {
+	p.depth++
+	if p.depth > maxJSParseDepth {
+		return fmt.Errorf("line %d: SyntaxError: maximum parse nesting depth (%d) exceeded", p.cur().line, maxJSParseDepth)
+	}
+	return nil
+}
+
+func (p *jsParser) leave() {
+	p.depth--
+}
+
+func (p *jsParser) parseNestedStmt() (jsStmt, error) {
+	if p.cur().kind == tokLBrace {
+		stmts, err := p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+		return &stmtBlock{stmts: stmts}, nil
+	}
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+	return p.parseStmt()
 }
 
 func compileJSProgram(name string, src string) (*jsProgram, error) {
@@ -1176,14 +1225,14 @@ func (p *jsParser) parseStmt() (jsStmt, error) {
 		if _, err := p.expect(tokRParen); err != nil {
 			return nil, err
 		}
-		thenSt, err := p.parseStmt()
+		thenSt, err := p.parseNestedStmt()
 		if err != nil {
 			return nil, err
 		}
 		var altSt jsStmt
 		if p.cur().kind == tokElse {
 			p.next()
-			altSt, err = p.parseStmt()
+			altSt, err = p.parseNestedStmt()
 			if err != nil {
 				return nil, err
 			}
@@ -1201,14 +1250,14 @@ func (p *jsParser) parseStmt() (jsStmt, error) {
 		if _, err := p.expect(tokRParen); err != nil {
 			return nil, err
 		}
-		body, err := p.parseStmt()
+		body, err := p.parseNestedStmt()
 		if err != nil {
 			return nil, err
 		}
 		return &stmtWhile{cond: cond, body: body}, nil
 	case tokDo:
 		p.next()
-		body, err := p.parseStmt()
+		body, err := p.parseNestedStmt()
 		if err != nil {
 			return nil, err
 		}
@@ -1260,6 +1309,10 @@ func (p *jsParser) parseStmt() (jsStmt, error) {
 }
 
 func (p *jsParser) parseBlock() ([]jsStmt, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	if _, err := p.expect(tokLBrace); err != nil {
 		return nil, err
 	}
@@ -1299,6 +1352,10 @@ func (p *jsParser) parseBindingPattern() (jsPattern, error) {
 }
 
 func (p *jsParser) parseArrayPattern() (*patArray, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	if _, err := p.expect(tokLBrack); err != nil {
 		return nil, err
 	}
@@ -1347,6 +1404,10 @@ func (p *jsParser) parseArrayPattern() (*patArray, error) {
 }
 
 func (p *jsParser) parseObjectPattern() (*patObject, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	if _, err := p.expect(tokLBrace); err != nil {
 		return nil, err
 	}
@@ -1545,7 +1606,7 @@ func (p *jsParser) parseForStmt() (jsStmt, error) {
 			if _, err := p.expect(tokRParen); err != nil {
 				return nil, err
 			}
-			body, err := p.parseStmt()
+			body, err := p.parseNestedStmt()
 			if err != nil {
 				return nil, err
 			}
@@ -1562,7 +1623,7 @@ func (p *jsParser) parseForStmt() (jsStmt, error) {
 			if _, err := p.expect(tokRParen); err != nil {
 				return nil, err
 			}
-			body, err := p.parseStmt()
+			body, err := p.parseNestedStmt()
 			if err != nil {
 				return nil, err
 			}
@@ -1612,7 +1673,7 @@ func (p *jsParser) parseForStmt() (jsStmt, error) {
 	if _, err := p.expect(tokRParen); err != nil {
 		return nil, err
 	}
-	body, err := p.parseStmt()
+	body, err := p.parseNestedStmt()
 	if err != nil {
 		return nil, err
 	}
@@ -1620,6 +1681,10 @@ func (p *jsParser) parseForStmt() (jsStmt, error) {
 }
 
 func (p *jsParser) parseSwitchStmt() (jsStmt, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	p.next() // 'switch'
 	if _, err := p.expect(tokLParen); err != nil {
 		return nil, err
@@ -1753,6 +1818,10 @@ func (p *jsParser) parseAssignExpr() (jsExpr, error) {
 	}
 	switch p.cur().kind {
 	case tokAssign, tokPlusAssign, tokMinusAssign, tokStarAssign, tokSlashAssign, tokPctAssign:
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		op := p.next().kind
 		right, err := p.parseAssignExpr()
 		if err != nil {
@@ -1797,6 +1866,10 @@ func (p *jsParser) parseArrowBody(params []jsParam) (jsExpr, error) {
 		}
 		return &exprFunc{params: params, body: body, arrow: true}, nil
 	}
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	ex, err := p.parseAssignExpr()
 	if err != nil {
 		return nil, err
@@ -1812,6 +1885,10 @@ func (p *jsParser) parseCondExpr() (jsExpr, error) {
 	if p.cur().kind != tokQuestion {
 		return test, nil
 	}
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	p.next()
 	cons, err := p.parseAssignExpr()
 	if err != nil {
@@ -1877,6 +1954,10 @@ func (p *jsParser) parseBinaryExpr(minPrec int) (jsExpr, error) {
 func (p *jsParser) parseUnaryExpr() (jsExpr, error) {
 	switch p.cur().kind {
 	case tokNot, tokMinus, tokPlus, tokBitNot, tokTypeof, tokVoid, tokDelete:
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		op := p.next().kind
 		arg, err := p.parseUnaryExpr()
 		if err != nil {
@@ -1884,6 +1965,10 @@ func (p *jsParser) parseUnaryExpr() (jsExpr, error) {
 		}
 		return &exprUnary{op: op, arg: arg}, nil
 	case tokInc, tokDec:
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		op := p.next().kind
 		arg, err := p.parseUnaryExpr()
 		if err != nil {
@@ -1891,6 +1976,10 @@ func (p *jsParser) parseUnaryExpr() (jsExpr, error) {
 		}
 		return &exprUpdate{op: op, prefix: true, arg: arg}, nil
 	case tokNew:
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		p.next()
 		callee, err := p.parseMemberExpr()
 		if err != nil {
@@ -1910,6 +1999,22 @@ func (p *jsParser) parseUnaryExpr() (jsExpr, error) {
 	}
 }
 
+func (p *jsParser) parseComputedIndex() (jsExpr, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+	p.next() // '['
+	idx, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tokRBrack); err != nil {
+		return nil, err
+	}
+	return idx, nil
+}
+
 func (p *jsParser) parseMemberExpr() (jsExpr, error) {
 	base, err := p.parsePrimaryExpr()
 	if err != nil {
@@ -1927,12 +2032,8 @@ func (p *jsParser) parseMemberExpr() (jsExpr, error) {
 		case tokOptChain:
 			p.next()
 			if p.cur().kind == tokLBrack {
-				p.next()
-				idx, err := p.parseExpr()
+				idx, err := p.parseComputedIndex()
 				if err != nil {
-					return nil, err
-				}
-				if _, err := p.expect(tokRBrack); err != nil {
 					return nil, err
 				}
 				base = &exprMember{obj: base, index: idx, computed: true, optional: true}
@@ -1944,12 +2045,8 @@ func (p *jsParser) parseMemberExpr() (jsExpr, error) {
 				base = &exprMember{obj: base, prop: propTok.lit, optional: true}
 			}
 		case tokLBrack:
-			p.next()
-			idx, err := p.parseExpr()
+			idx, err := p.parseComputedIndex()
 			if err != nil {
-				return nil, err
-			}
-			if _, err := p.expect(tokRBrack); err != nil {
 				return nil, err
 			}
 			base = &exprMember{obj: base, index: idx, computed: true}
@@ -1980,12 +2077,8 @@ func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
 		case tokOptChain:
 			p.next()
 			if p.cur().kind == tokLBrack {
-				p.next()
-				idx, err := p.parseExpr()
+				idx, err := p.parseComputedIndex()
 				if err != nil {
-					return nil, err
-				}
-				if _, err := p.expect(tokRBrack); err != nil {
 					return nil, err
 				}
 				base = &exprMember{obj: base, index: idx, computed: true, optional: true}
@@ -2003,12 +2096,8 @@ func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
 				base = &exprMember{obj: base, prop: propTok.lit, optional: true}
 			}
 		case tokLBrack:
-			p.next()
-			idx, err := p.parseExpr()
+			idx, err := p.parseComputedIndex()
 			if err != nil {
-				return nil, err
-			}
-			if _, err := p.expect(tokRBrack); err != nil {
 				return nil, err
 			}
 			base = &exprMember{obj: base, index: idx, computed: true}
@@ -2031,6 +2120,10 @@ func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
 }
 
 func (p *jsParser) parseArgList() ([]jsExpr, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	if _, err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
@@ -2093,6 +2186,12 @@ func (p *jsParser) parsePrimaryExpr() (jsExpr, error) {
 		p.next()
 		return &exprRegex{pattern: t.lit, flags: t.aux}, nil
 	case tokLParen:
+		if t.aux != "tpl" {
+			if err := p.enter(); err != nil {
+				return nil, err
+			}
+			defer p.leave()
+		}
 		p.next()
 		ex, err := p.parseExpr()
 		if err != nil {
@@ -2103,6 +2202,10 @@ func (p *jsParser) parsePrimaryExpr() (jsExpr, error) {
 		}
 		return &exprParen{inner: ex}, nil
 	case tokLBrack:
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		p.next()
 		var elems []jsExpr
 		for p.cur().kind != tokRBrack && p.cur().kind != tokEOF {
@@ -2136,6 +2239,10 @@ func (p *jsParser) parsePrimaryExpr() (jsExpr, error) {
 		}
 		return &exprArray{elems: elems}, nil
 	case tokLBrace:
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		p.next()
 		var props []objProp
 		for p.cur().kind != tokRBrace && p.cur().kind != tokEOF {

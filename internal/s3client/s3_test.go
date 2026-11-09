@@ -5,11 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Willh92/Volo-go/internal/security"
 )
 
 func TestNewClientRejectsUnsafePublicBaseURLAndScalesStreamTimeout(t *testing.T) {
@@ -45,9 +48,25 @@ func TestNewClientRejectsUnsafePublicBaseURLAndScalesStreamTimeout(t *testing.T)
 		t.Fatalf("expected 30m ceiling on huge stream timeout, got %v", capped)
 	}
 
-	// 3. End-to-end PutStream & PublicURL against local SigV4 mock endpoint.
+	// 3. End-to-end PutStream, GetObject, and SSRF guard against local SigV4 mock endpoint.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut || !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if r.Method == http.MethodGet {
+			if strings.HasSuffix(r.URL.Path, "/missing.webp") {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("ETag", `"etag-mp4-1"`)
+			w.Header().Set("Last-Modified", "Mon, 09 Nov 2026 08:00:00 GMT")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("mp4-bytes"))
+			return
+		}
+		if r.Method != http.MethodPut {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -55,6 +74,23 @@ func TestNewClientRejectsUnsafePublicBaseURLAndScalesStreamTimeout(t *testing.T)
 	}))
 	defer srv.Close()
 
+	// Default nil safeDialer must block loopback/private targets via security.IsForbiddenIP!
+	strictCli, err := NewClient(Config{
+		Endpoint:  srv.URL,
+		Region:    "us-east-1",
+		Bucket:    "media",
+		AccessKey: "AKIA123",
+		SecretKey: "secret456",
+		PathStyle: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewClient strict failed: %v", err)
+	}
+	if _, _, _, _, sErr := strictCli.GetObject(context.Background(), "2026/11/clip.mp4", 1024); sErr == nil || !strings.Contains(sErr.Error(), "SSRF") {
+		t.Fatalf("expected nil safeDialer to block loopback IP via security.IsForbiddenIP, got: %v", sErr)
+	}
+
+	testDialer := &security.OutboundSafeDialer{AllowLoopbackForTests: true}
 	cli, err := NewClient(Config{
 		Endpoint:      srv.URL,
 		Region:        "us-east-1",
@@ -63,7 +99,7 @@ func TestNewClientRejectsUnsafePublicBaseURLAndScalesStreamTimeout(t *testing.T)
 		SecretKey:     "secret456",
 		PublicBaseURL: "https://cdn.example.com/assets",
 		PathStyle:     true,
-	}, nil)
+	}, testDialer)
 	if err != nil {
 		t.Fatalf("NewClient valid config failed: %v", err)
 	}
@@ -73,6 +109,20 @@ func TestNewClientRejectsUnsafePublicBaseURLAndScalesStreamTimeout(t *testing.T)
 	}
 	if gotURL != "https://cdn.example.com/assets/2026/11/clip.mp4" {
 		t.Fatalf("unexpected PublicURL: %q", gotURL)
+	}
+
+	data, ct, etag, lm, err := cli.GetObject(context.Background(), "2026/11/clip.mp4", 1024)
+	if err != nil {
+		t.Fatalf("GetObject failed: %v", err)
+	}
+	if string(data) != "mp4-bytes" || ct != "video/mp4" || etag != `"etag-mp4-1"` || lm.Year() != 2026 {
+		t.Fatalf("unexpected GetObject result: data=%q ct=%q etag=%q lm=%v", string(data), ct, etag, lm)
+	}
+	if _, _, _, _, err := cli.GetObject(context.Background(), "2026/11/clip.mp4", 4); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected GetObject maxBytes overflow error, got: %v", err)
+	}
+	if _, _, _, _, err := cli.GetObject(context.Background(), "2026/11/missing.webp", 1024); !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("expected ErrObjectNotFound on 404, got: %v", err)
 	}
 }
 
@@ -162,7 +212,7 @@ func TestListObjectsPaginatedAndCanonicalQuerySigV4(t *testing.T) {
 		SecretKey: secretKey,
 		KeyPrefix: "daily",
 		PathStyle: true,
-	}, nil)
+	}, &security.OutboundSafeDialer{AllowLoopbackForTests: true})
 	if err != nil {
 		t.Fatal(err)
 	}

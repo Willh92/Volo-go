@@ -11,6 +11,7 @@
       <div class="studio-tax-toolbar">
         <form class="studio-tax-search" method="get" action="/books">
           <input class="volo-input studio-tax-search__input js-book-filter-input" type="search" name="q" value="{{.TagQuery}}" placeholder="{{t .Locale "bookshelf.search_placeholder"}}" aria-label="{{t .Locale "bookshelf.search_placeholder"}}" autocomplete="off">
+          <a class="studio-icon-btn studio-tag-clear js-book-filter-clear" href="/books" data-server-query="{{.TagQuery}}" {{if not .TagQuery}}hidden{{end}} title="{{t .Locale "studio.clear_filter"}}" aria-label="{{t .Locale "studio.clear_filter"}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg><span>×</span></a>
           <button class="volo-btn studio-tax-search__btn" type="submit" aria-label="{{t .Locale "bookshelf.search_placeholder"}}">↵</button>
         </form>
       </div>
@@ -41,6 +42,10 @@
       </div>
       <p class="studio-muted-empty js-book-filter-empty" hidden>{{t .Locale "search.empty"}}</p>
       {{template "pagination" .}}
+    {{else if .TagQuery}}
+      <div class="studio-article studio-card-pad">
+        <p class="studio-muted-empty">{{t .Locale "search.empty"}}</p>
+      </div>
     {{else}}
       {{template "empty_state" (dict "Title" (t .Locale "studio.empty_books_title") "Desc" (t .Locale "studio.empty_books_desc"))}}
     {{end}}

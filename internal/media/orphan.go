@@ -582,17 +582,17 @@ func lastThreeSlashSegments(s string) string {
 	return ""
 }
 
-// safeDeleteLocalUpload verifies via `filepath.EvalSymlinks` that target resides strictly inside uploadDir
-// before unlinking, preventing symlink escape or tampered `object_key` traversal!
-func safeDeleteLocalUpload(uploadDir string, objectKey string) error {
-	cleanUploadRoot, err := filepath.EvalSymlinks(uploadDir)
+// SafeUnlinkLocalFile verifies via `filepath.EvalSymlinks` that relPath resides strictly inside rootDir
+// before unlinking, preventing symlink escape or path traversal outside rootDir.
+func SafeUnlinkLocalFile(rootDir string, relPath string) error {
+	cleanUploadRoot, err := filepath.EvalSymlinks(rootDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	rel := filepath.Clean(filepath.FromSlash(strings.TrimLeft(objectKey, "/")))
+	rel := filepath.Clean(filepath.FromSlash(strings.TrimLeft(relPath, "/")))
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return errors.New("refusing to delete invalid relative object key")
 	}
@@ -616,4 +616,8 @@ func safeDeleteLocalUpload(uploadDir string, objectKey string) error {
 		return errors.New("upload path escapes UploadDir containment boundary")
 	}
 	return os.Remove(resolved)
+}
+
+func safeDeleteLocalUpload(uploadDir string, objectKey string) error {
+	return SafeUnlinkLocalFile(uploadDir, objectKey)
 }

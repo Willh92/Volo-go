@@ -2,14 +2,18 @@ package media
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/draw"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"io"
+	"sort"
 	"strings"
 
 	"github.com/HugoSmits86/nativewebp"
@@ -53,6 +57,42 @@ func ReadEXIFOrientation(raw []byte) int {
 		pos += 12
 	}
 	return 1
+}
+
+// rewriteTIFFOrientationTo1 returns a cloned TIFF buffer with IFD0 Orientation (0x0112) set to 1
+// so rotated pixel outputs that retain EXIF metadata are never double-rotated by viewers.
+func rewriteTIFFOrientationTo1(tiffPayload []byte) []byte {
+	out := make([]byte, len(tiffPayload))
+	copy(out, tiffPayload)
+	if len(out) < 8 {
+		return out
+	}
+	var bo binary.ByteOrder
+	switch string(out[:4]) {
+	case "II\x2a\x00":
+		bo = binary.LittleEndian
+	case "MM\x00\x2a":
+		bo = binary.BigEndian
+	default:
+		return out
+	}
+	ifdOffset := int(bo.Uint32(out[4:8]))
+	if ifdOffset < 8 || ifdOffset+2 > len(out) {
+		return out
+	}
+	numEntries := int(bo.Uint16(out[ifdOffset : ifdOffset+2]))
+	pos := ifdOffset + 2
+	for i := 0; i < numEntries && pos+12 <= len(out); i++ {
+		tag := bo.Uint16(out[pos : pos+2])
+		typ := bo.Uint16(out[pos+2 : pos+4])
+		cnt := bo.Uint32(out[pos+4 : pos+8])
+		if tag == exifOrientationTag && typ == 3 && cnt >= 1 {
+			bo.PutUint16(out[pos+8:pos+10], 1)
+			return out
+		}
+		pos += 12
+	}
+	return out
 }
 
 func unwrapTIFFHeader(payload []byte) []byte {
@@ -151,6 +191,718 @@ func extractTIFFPayload(raw []byte) []byte {
 	}
 
 	return nil
+}
+
+// hasAVIFMagic inspects an ISOBMFF ftyp header for an "avif" or "avis" major or compatible brand.
+func hasAVIFMagic(raw []byte) bool {
+	if len(raw) < 16 || string(raw[4:8]) != "ftyp" {
+		return false
+	}
+	boxSize := uint64(binary.BigEndian.Uint32(raw[0:4]))
+	hdrLen := 8
+	if boxSize == 1 {
+		if len(raw) < 24 {
+			return false
+		}
+		boxSize = binary.BigEndian.Uint64(raw[8:16])
+		hdrLen = 16
+	} else if boxSize == 0 {
+		boxSize = uint64(len(raw))
+	}
+	if boxSize < uint64(hdrLen+8) {
+		return false
+	}
+	end := len(raw)
+	if boxSize < uint64(end) {
+		end = int(boxSize)
+	}
+	if end < hdrLen+8 {
+		return false
+	}
+	major := string(raw[hdrLen : hdrLen+4])
+	if major == "avif" || major == "avis" {
+		return true
+	}
+	for pos := hdrLen + 8; pos+4 <= end; pos += 4 {
+		brand := string(raw[pos : pos+4])
+		if brand == "avif" || brand == "avis" {
+			return true
+		}
+	}
+	return false
+}
+
+func nextISOBMFFBox(buf []byte, pos int) (boxType string, payload []byte, nextPos int, ok bool) {
+	if pos+8 > len(buf) {
+		return "", nil, 0, false
+	}
+	sz32 := binary.BigEndian.Uint32(buf[pos : pos+4])
+	typ := string(buf[pos+4 : pos+8])
+	hdr := 8
+	var boxLen uint64
+	if sz32 == 1 {
+		if pos+16 > len(buf) {
+			return "", nil, 0, false
+		}
+		boxLen = binary.BigEndian.Uint64(buf[pos+8 : pos+16])
+		hdr = 16
+	} else if sz32 == 0 {
+		boxLen = uint64(len(buf) - pos)
+	} else {
+		boxLen = uint64(sz32)
+	}
+	if boxLen < uint64(hdr) || boxLen > uint64(len(buf)-pos) {
+		return "", nil, 0, false
+	}
+	end := pos + int(boxLen)
+	return typ, buf[pos+hdr : end], end, true
+}
+
+// parseAVIFDimensions parses an ISOBMFF AVIF stream (`ftyp` -> `meta` -> `iprp` -> `ipco` -> `ispe`/`irot`)
+// to extract intrinsic pixel dimensions and enforce the 24MP decompression-bomb ceiling.
+func parseAVIFDimensions(raw []byte) (int, int, error) {
+	if !hasAVIFMagic(raw) {
+		return 0, 0, errors.New("file magic bytes do not match AVIF ftyp signature")
+	}
+	var metaPayload []byte
+	for pos := 0; pos < len(raw); {
+		typ, payload, next, ok := nextISOBMFFBox(raw, pos)
+		if !ok {
+			break
+		}
+		if typ == "meta" {
+			metaPayload = payload
+			break
+		}
+		pos = next
+	}
+	if len(metaPayload) < 12 {
+		return 0, 0, errors.New("invalid AVIF container: missing meta box")
+	}
+	// ISO 14496-12 `meta` is a FullBox (4-byte version+flags before child boxes).
+	metaChildren := metaPayload[4:]
+
+	var (
+		hasPrimaryID bool
+		primaryID    uint32
+		ipcoPayload  []byte
+		ipmaPayloads [][]byte
+	)
+	for pos := 0; pos < len(metaChildren); {
+		typ, payload, next, ok := nextISOBMFFBox(metaChildren, pos)
+		if !ok {
+			break
+		}
+		switch typ {
+		case "pitm":
+			if len(payload) >= 6 {
+				ver := payload[0]
+				if ver == 0 {
+					primaryID = uint32(binary.BigEndian.Uint16(payload[4:6]))
+					hasPrimaryID = true
+				} else if len(payload) >= 8 {
+					primaryID = binary.BigEndian.Uint32(payload[4:8])
+					hasPrimaryID = true
+				}
+			}
+		case "iprp":
+			for p2 := 0; p2 < len(payload); {
+				t2, pay2, n2, ok2 := nextISOBMFFBox(payload, p2)
+				if !ok2 {
+					break
+				}
+				switch t2 {
+				case "ipco":
+					ipcoPayload = pay2
+				case "ipma":
+					ipmaPayloads = append(ipmaPayloads, pay2)
+				}
+				p2 = n2
+			}
+		}
+		pos = next
+	}
+	if len(ipcoPayload) == 0 {
+		return 0, 0, errors.New("invalid AVIF container: missing ipco property container")
+	}
+
+	type propEntry struct {
+		typ   string
+		w, h  int
+		angle int // 0, 90, 180, 270
+	}
+	var props []propEntry // 1-indexed in ISOBMFF ipma
+	for pos := 0; pos < len(ipcoPayload); {
+		typ, payload, next, ok := nextISOBMFFBox(ipcoPayload, pos)
+		if !ok {
+			break
+		}
+		pe := propEntry{typ: typ}
+		if typ == "ispe" && len(payload) >= 12 {
+			pe.w = int(binary.BigEndian.Uint32(payload[4:8]))
+			pe.h = int(binary.BigEndian.Uint32(payload[8:12]))
+		} else if typ == "irot" && len(payload) >= 1 {
+			pe.angle = int(payload[0]&0x03) * 90
+		}
+		props = append(props, pe)
+		pos = next
+	}
+
+	// Resolve primary item's associated properties via ipma if available.
+	var primaryProps []int
+	if hasPrimaryID {
+		for _, ipma := range ipmaPayloads {
+			if len(ipma) < 8 {
+				continue
+			}
+			ver := ipma[0]
+			flags := int(ipma[1])<<16 | int(ipma[2])<<8 | int(ipma[3])
+			entryCount := int(binary.BigEndian.Uint32(ipma[4:8]))
+			off := 8
+			for e := 0; e < entryCount && off < len(ipma); e++ {
+				var itemID uint32
+				if ver < 1 {
+					if off+2 > len(ipma) {
+						off = len(ipma)
+						break
+					}
+					itemID = uint32(binary.BigEndian.Uint16(ipma[off : off+2]))
+					off += 2
+				} else {
+					if off+4 > len(ipma) {
+						off = len(ipma)
+						break
+					}
+					itemID = binary.BigEndian.Uint32(ipma[off : off+4])
+					off += 4
+				}
+				if off >= len(ipma) {
+					break
+				}
+				assocCount := int(ipma[off])
+				off++
+				for a := 0; a < assocCount; a++ {
+					var propIdx int
+					if flags&1 != 0 {
+						if off+2 > len(ipma) {
+							off = len(ipma)
+							break
+						}
+						propIdx = int(binary.BigEndian.Uint16(ipma[off:off+2]) & 0x7FFF)
+						off += 2
+					} else {
+						if off >= len(ipma) {
+							break
+						}
+						propIdx = int(ipma[off] & 0x7F)
+						off++
+					}
+					if itemID == primaryID && propIdx >= 1 && propIdx <= len(props) {
+						primaryProps = append(primaryProps, propIdx-1)
+					}
+				}
+			}
+		}
+	}
+
+	var width, height, rotAngle int
+	for _, idx := range primaryProps {
+		p := props[idx]
+		if p.typ == "ispe" && p.w > 0 && p.h > 0 && width == 0 {
+			width, height = p.w, p.h
+		} else if p.typ == "irot" {
+			rotAngle = p.angle
+		}
+	}
+	if width == 0 || height == 0 {
+		for _, p := range props {
+			if p.typ == "ispe" && p.w > 0 && p.h > 0 {
+				if int64(p.w)*int64(p.h) > int64(width)*int64(height) {
+					width, height = p.w, p.h
+				}
+			} else if p.typ == "irot" && rotAngle == 0 {
+				rotAngle = p.angle
+			}
+		}
+	}
+	if width <= 0 || height <= 0 {
+		return 0, 0, errors.New("invalid AVIF container: missing valid ispe dimensions")
+	}
+	if rotAngle == 90 || rotAngle == 270 {
+		width, height = height, width
+	}
+	if width > maxImageDimension || height > maxImageDimension || int64(width)*int64(height) > maxImagePixels {
+		return 0, 0, fmt.Errorf("image dimensions %dx%d exceed 24MP decompression safety limit", width, height)
+	}
+	return width, height, nil
+}
+
+func isWebPRIFF(raw []byte) bool {
+	return len(raw) >= 12 && string(raw[0:4]) == "RIFF" && string(raw[8:12]) == "WEBP"
+}
+
+func decodeImageConfigSafe(raw []byte) (image.Config, string, error) {
+	cfg, fmtName, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err == nil {
+		return cfg, fmtName, nil
+	}
+	if isWebPRIFF(raw) {
+		if wCfg, wErr := nativewebp.DecodeConfig(bytes.NewReader(raw)); wErr == nil {
+			return wCfg, "webp", nil
+		}
+	}
+	return image.Config{}, "", err
+}
+
+func decodeRasterImageSafe(raw []byte) (image.Image, string, error) {
+	img, fmtName, err := image.Decode(bytes.NewReader(raw))
+	if err == nil {
+		return img, fmtName, nil
+	}
+	if isWebPRIFF(raw) {
+		if wImg, wErr := nativewebp.Decode(bytes.NewReader(raw)); wErr == nil {
+			return wImg, "webp", nil
+		}
+		if wImg, wErr := nativewebp.DecodeIgnoreAlphaFlag(bytes.NewReader(raw)); wErr == nil {
+			return wImg, "webp", nil
+		}
+	}
+	return nil, "", err
+}
+
+// imageMetadataChunks holds raw container metadata extracted prior to pixel transcoding.
+type imageMetadataChunks struct {
+	exifTIFF   []byte // Raw TIFF starting with "II*\x00" or "MM\x00*" (without "Exif\x00\x00")
+	iccProfile []byte // Raw uncompressed ICC color profile bytes
+	xmpXML     []byte // Raw UTF-8 XMP packet XML bytes
+}
+
+func extractImageMetadata(raw []byte) imageMetadataChunks {
+	var m imageMetadataChunks
+	if len(raw) < 8 {
+		return m
+	}
+
+	// 1. JPEG: APP1 Exif, APP1 XMP, APP2 ICC_PROFILE
+	if raw[0] == 0xFF && raw[1] == 0xD8 {
+		type iccPart struct {
+			seq  int
+			data []byte
+		}
+		var iccParts []iccPart
+		const xmpPrefix = "http://ns.adobe.com/xap/1.0/\x00"
+		const iccPrefix = "ICC_PROFILE\x00"
+		i := 2
+		for i+4 <= len(raw) {
+			if raw[i] != 0xFF {
+				break
+			}
+			for i < len(raw) && raw[i] == 0xFF {
+				i++
+			}
+			if i >= len(raw) {
+				break
+			}
+			marker := raw[i]
+			i++
+			if marker == 0xDA || marker == 0xD9 {
+				break
+			}
+			if marker == 0x00 || (marker >= 0xD0 && marker <= 0xD7) {
+				continue
+			}
+			if i+2 > len(raw) {
+				break
+			}
+			segLen := int(binary.BigEndian.Uint16(raw[i : i+2]))
+			if segLen < 2 || i+segLen > len(raw) {
+				break
+			}
+			segData := raw[i+2 : i+segLen]
+			switch marker {
+			case 0xE1:
+				if m.exifTIFF == nil {
+					if tiff := unwrapTIFFHeader(segData); tiff != nil {
+						m.exifTIFF = append([]byte(nil), tiff...)
+					}
+				}
+				if m.xmpXML == nil && len(segData) > len(xmpPrefix) && string(segData[:len(xmpPrefix)]) == xmpPrefix {
+					m.xmpXML = append([]byte(nil), segData[len(xmpPrefix):]...)
+				}
+			case 0xE2:
+				if len(segData) > 14 && string(segData[:12]) == iccPrefix {
+					seq := int(segData[12])
+					iccParts = append(iccParts, iccPart{seq: seq, data: segData[14:]})
+				}
+			}
+			i += segLen
+		}
+		if len(iccParts) > 0 {
+			sort.SliceStable(iccParts, func(a, b int) bool { return iccParts[a].seq < iccParts[b].seq })
+			var total int
+			for _, p := range iccParts {
+				total += len(p.data)
+			}
+			if total > 0 && total <= 4<<20 {
+				buf := make([]byte, 0, total)
+				for _, p := range iccParts {
+					buf = append(buf, p.data...)
+				}
+				m.iccProfile = buf
+			}
+		}
+		return m
+	}
+
+	// 2. PNG: eXIf, iCCP, iTXt ("XML:com.adobe.xmp\x00")
+	if bytes.HasPrefix(raw, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		const xmpKeyword = "XML:com.adobe.xmp\x00"
+		i := 8
+		for i+12 <= len(raw) {
+			cLen := int(binary.BigEndian.Uint32(raw[i : i+4]))
+			if cLen < 0 || i+12+cLen > len(raw) {
+				break
+			}
+			cType := string(raw[i+4 : i+8])
+			cData := raw[i+8 : i+8+cLen]
+			switch cType {
+			case "eXIf":
+				if m.exifTIFF == nil {
+					if tiff := unwrapTIFFHeader(cData); tiff != nil {
+						m.exifTIFF = append([]byte(nil), tiff...)
+					}
+				}
+			case "iCCP":
+				if m.iccProfile == nil {
+					nulIdx := bytes.IndexByte(cData, 0)
+					if nulIdx >= 0 && nulIdx+2 < len(cData) && cData[nulIdx+1] == 0 {
+						if zr, zErr := zlib.NewReader(bytes.NewReader(cData[nulIdx+2:])); zErr == nil {
+							decomp, rErr := io.ReadAll(io.LimitReader(zr, 4<<20))
+							_ = zr.Close()
+							if rErr == nil && len(decomp) > 0 && len(decomp) < 4<<20 {
+								m.iccProfile = decomp
+							}
+						}
+					}
+				}
+			case "iTXt":
+				if m.xmpXML == nil && len(cData) > len(xmpKeyword)+4 && string(cData[:len(xmpKeyword)]) == xmpKeyword {
+					rest := cData[len(xmpKeyword):]
+					compFlag := rest[0]
+					compMethod := rest[1]
+					rest = rest[2:]
+					if nul1 := bytes.IndexByte(rest, 0); nul1 >= 0 {
+						rest = rest[nul1+1:]
+						if nul2 := bytes.IndexByte(rest, 0); nul2 >= 0 {
+							textBytes := rest[nul2+1:]
+							if compFlag == 0 {
+								m.xmpXML = append([]byte(nil), textBytes...)
+							} else if compFlag == 1 && compMethod == 0 {
+								if zr, zErr := zlib.NewReader(bytes.NewReader(textBytes)); zErr == nil {
+									decomp, rErr := io.ReadAll(io.LimitReader(zr, 4<<20))
+									_ = zr.Close()
+									if rErr == nil && len(decomp) > 0 && len(decomp) < 4<<20 {
+										m.xmpXML = decomp
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if cType == "IEND" {
+				break
+			}
+			i += 12 + cLen
+		}
+		return m
+	}
+
+	// 3. WebP RIFF: EXIF, ICCP, XMP
+	if isWebPRIFF(raw) {
+		i := 12
+		for i+8 <= len(raw) {
+			fourCC := string(raw[i : i+4])
+			cLen := int(binary.LittleEndian.Uint32(raw[i+4 : i+8]))
+			if cLen < 0 || i+8+cLen > len(raw) {
+				break
+			}
+			cData := raw[i+8 : i+8+cLen]
+			switch fourCC {
+			case "EXIF":
+				if m.exifTIFF == nil {
+					if tiff := unwrapTIFFHeader(cData); tiff != nil {
+						m.exifTIFF = append([]byte(nil), tiff...)
+					}
+				}
+			case "ICCP":
+				if m.iccProfile == nil && len(cData) > 0 && len(cData) <= 4<<20 {
+					m.iccProfile = append([]byte(nil), cData...)
+				}
+			case "XMP ":
+				if m.xmpXML == nil && len(cData) > 0 && len(cData) <= 4<<20 {
+					m.xmpXML = append([]byte(nil), cData...)
+				}
+			}
+			padded := cLen
+			if padded%2 == 1 {
+				padded++
+			}
+			i += 8 + padded
+		}
+	}
+	return m
+}
+
+func writePNGChunk(buf *bytes.Buffer, chunkType string, payload []byte) {
+	var lenBytes [4]byte
+	binary.BigEndian.PutUint32(lenBytes[:], uint32(len(payload)))
+	buf.Write(lenBytes[:])
+	buf.WriteString(chunkType)
+	buf.Write(payload)
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write([]byte(chunkType))
+	_, _ = crc.Write(payload)
+	var crcBytes [4]byte
+	binary.BigEndian.PutUint32(crcBytes[:], crc.Sum32())
+	buf.Write(crcBytes[:])
+}
+
+// injectImageMetadata losslessly injects the subset of metadata chunks enabled in `keep`
+// ("exif", "icc", "xmp") into a newly encoded JPEG, PNG, or WebP buffer.
+func injectImageMetadata(encoded []byte, format string, keep map[string]bool, meta imageMetadataChunks, orientApplied bool) ([]byte, error) {
+	var exifTIFF, iccBytes, xmpBytes []byte
+	if keep["exif"] && len(meta.exifTIFF) > 0 {
+		if orientApplied {
+			exifTIFF = rewriteTIFFOrientationTo1(meta.exifTIFF)
+		} else {
+			exifTIFF = meta.exifTIFF
+		}
+	}
+	if keep["icc"] && len(meta.iccProfile) > 0 {
+		iccBytes = meta.iccProfile
+	}
+	if keep["xmp"] && len(meta.xmpXML) > 0 {
+		xmpBytes = meta.xmpXML
+	}
+	if len(exifTIFF) == 0 && len(iccBytes) == 0 && len(xmpBytes) == 0 {
+		return encoded, nil
+	}
+
+	switch format {
+	case "jpg", "jpeg":
+		if len(encoded) < 4 || encoded[0] != 0xFF || encoded[1] != 0xD8 {
+			return encoded, nil
+		}
+		insertAt := 2
+		if len(encoded) >= 6 && encoded[2] == 0xFF && encoded[3] == 0xE0 {
+			app0Len := int(binary.BigEndian.Uint16(encoded[4:6]))
+			if app0Len >= 2 && 4+app0Len <= len(encoded) {
+				insertAt = 4 + app0Len
+			}
+		}
+		var out bytes.Buffer
+		out.Grow(len(encoded) + len(exifTIFF) + len(iccBytes) + len(xmpBytes) + 64)
+		out.Write(encoded[:insertAt])
+
+		if len(exifTIFF) > 0 && 2+6+len(exifTIFF) <= 65535 {
+			out.Write([]byte{0xFF, 0xE1})
+			var sz [2]byte
+			binary.BigEndian.PutUint16(sz[:], uint16(2+6+len(exifTIFF)))
+			out.Write(sz[:])
+			out.WriteString("Exif\x00\x00")
+			out.Write(exifTIFF)
+		}
+		if len(iccBytes) > 0 {
+			const maxICCChunk = 65519
+			numChunks := (len(iccBytes) + maxICCChunk - 1) / maxICCChunk
+			if numChunks <= 255 {
+				for idx := 0; idx < numChunks; idx++ {
+					start := idx * maxICCChunk
+					end := start + maxICCChunk
+					if end > len(iccBytes) {
+						end = len(iccBytes)
+					}
+					part := iccBytes[start:end]
+					out.Write([]byte{0xFF, 0xE2})
+					var sz [2]byte
+					binary.BigEndian.PutUint16(sz[:], uint16(2+14+len(part)))
+					out.Write(sz[:])
+					out.WriteString("ICC_PROFILE\x00")
+					out.WriteByte(byte(idx + 1))
+					out.WriteByte(byte(numChunks))
+					out.Write(part)
+				}
+			}
+		}
+		const xmpPrefix = "http://ns.adobe.com/xap/1.0/\x00"
+		if len(xmpBytes) > 0 && 2+len(xmpPrefix)+len(xmpBytes) <= 65535 {
+			out.Write([]byte{0xFF, 0xE1})
+			var sz [2]byte
+			binary.BigEndian.PutUint16(sz[:], uint16(2+len(xmpPrefix)+len(xmpBytes)))
+			out.Write(sz[:])
+			out.WriteString(xmpPrefix)
+			out.Write(xmpBytes)
+		}
+		out.Write(encoded[insertAt:])
+		return out.Bytes(), nil
+
+	case "png":
+		sig := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+		if !bytes.HasPrefix(encoded, sig) {
+			return encoded, nil
+		}
+		var out bytes.Buffer
+		out.Grow(len(encoded) + len(exifTIFF) + len(iccBytes) + len(xmpBytes) + 64)
+		out.Write(sig)
+		pos := 8
+		injectedICCP := false
+		injectedTail := false
+		for pos+12 <= len(encoded) {
+			cLen := int(binary.BigEndian.Uint32(encoded[pos : pos+4]))
+			if cLen < 0 || pos+12+cLen > len(encoded) {
+				return encoded, nil
+			}
+			cType := string(encoded[pos+4 : pos+8])
+			totalChunk := 12 + cLen
+			if cType == "IEND" && !injectedTail {
+				injectedTail = true
+				if len(exifTIFF) > 0 {
+					writePNGChunk(&out, "eXIf", exifTIFF)
+				}
+				if len(xmpBytes) > 0 {
+					var itxt bytes.Buffer
+					itxt.WriteString("XML:com.adobe.xmp\x00\x00\x00\x00\x00")
+					itxt.Write(xmpBytes)
+					writePNGChunk(&out, "iTXt", itxt.Bytes())
+				}
+			}
+			out.Write(encoded[pos : pos+totalChunk])
+			if cType == "IHDR" && !injectedICCP && len(iccBytes) > 0 {
+				injectedICCP = true
+				var iccp bytes.Buffer
+				iccp.WriteString("ICC Profile\x00\x00")
+				zw := zlib.NewWriter(&iccp)
+				_, _ = zw.Write(iccBytes)
+				_ = zw.Close()
+				writePNGChunk(&out, "iCCP", iccp.Bytes())
+			}
+			pos += totalChunk
+			if cType == "IEND" {
+				break
+			}
+		}
+		return out.Bytes(), nil
+
+	case "webp":
+		if !isWebPRIFF(encoded) {
+			return encoded, nil
+		}
+		cfg, _, cfgErr := decodeImageConfigSafe(encoded)
+		if cfgErr != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+			return encoded, nil
+		}
+		type riffChunk struct {
+			fourCC string
+			data   []byte
+		}
+		var bodyChunks []riffChunk
+		hasAlpha := false
+		hasAnim := false
+		pos := 12
+		for pos+8 <= len(encoded) {
+			fourCC := string(encoded[pos : pos+4])
+			cLen := int(binary.LittleEndian.Uint32(encoded[pos+4 : pos+8]))
+			if cLen < 0 || pos+8+cLen > len(encoded) {
+				break
+			}
+			cData := encoded[pos+8 : pos+8+cLen]
+			switch fourCC {
+			case "VP8X":
+				if len(cData) >= 1 && (cData[0]&0x10) != 0 {
+					hasAlpha = true
+				}
+			case "EXIF", "ICCP", "XMP ":
+				// Replaced below
+			default:
+				if fourCC == "ALPH" {
+					hasAlpha = true
+				} else if fourCC == "VP8L" && len(cData) >= 5 && (cData[4]&0x10) != 0 {
+					hasAlpha = true
+				} else if fourCC == "ANIM" || fourCC == "ANMF" {
+					hasAnim = true
+				}
+				bodyChunks = append(bodyChunks, riffChunk{fourCC: fourCC, data: cData})
+			}
+			padded := cLen
+			if padded%2 == 1 {
+				padded++
+			}
+			pos += 8 + padded
+		}
+		if len(bodyChunks) == 0 {
+			return encoded, nil
+		}
+
+		writeRIFFChunk := func(buf *bytes.Buffer, fourCC string, payload []byte) {
+			buf.WriteString(fourCC)
+			var sz [4]byte
+			binary.LittleEndian.PutUint32(sz[:], uint32(len(payload)))
+			buf.Write(sz[:])
+			buf.Write(payload)
+			if len(payload)%2 == 1 {
+				buf.WriteByte(0x00)
+			}
+		}
+
+		var flags byte
+		if len(iccBytes) > 0 {
+			flags |= 0x20
+		}
+		if hasAlpha {
+			flags |= 0x10
+		}
+		if len(exifTIFF) > 0 {
+			flags |= 0x08
+		}
+		if len(xmpBytes) > 0 {
+			flags |= 0x04
+		}
+		if hasAnim {
+			flags |= 0x02
+		}
+
+		wMinus1 := uint32(cfg.Width - 1)
+		hMinus1 := uint32(cfg.Height - 1)
+		vp8x := [10]byte{
+			flags, 0, 0, 0,
+			byte(wMinus1), byte(wMinus1 >> 8), byte(wMinus1 >> 16),
+			byte(hMinus1), byte(hMinus1 >> 8), byte(hMinus1 >> 16),
+		}
+
+		var out bytes.Buffer
+		out.Grow(len(encoded) + len(iccBytes) + len(exifTIFF) + len(xmpBytes) + 48)
+		out.WriteString("RIFF\x00\x00\x00\x00WEBP")
+		writeRIFFChunk(&out, "VP8X", vp8x[:])
+		if len(iccBytes) > 0 {
+			writeRIFFChunk(&out, "ICCP", iccBytes)
+		}
+		for _, ch := range bodyChunks {
+			writeRIFFChunk(&out, ch.fourCC, ch.data)
+		}
+		if len(exifTIFF) > 0 {
+			writeRIFFChunk(&out, "EXIF", exifTIFF)
+		}
+		if len(xmpBytes) > 0 {
+			writeRIFFChunk(&out, "XMP ", xmpBytes)
+		}
+		res := out.Bytes()
+		binary.LittleEndian.PutUint32(res[4:8], uint32(len(res)-8))
+		return res, nil
+
+	default:
+		return encoded, nil
+	}
 }
 
 // StripWebPMetadataLossless removes `EXIF`, `XMP `, and `ICCP` chunks from a WebP RIFF container
@@ -324,6 +1076,8 @@ func NormalizeLocalImageBytes(raw []byte, extLower string) (clean []byte, mimeTy
 			ext = ".webp"
 		case bytes.HasPrefix(raw, []byte("GIF87a")) || bytes.HasPrefix(raw, []byte("GIF89a")):
 			ext = ".gif"
+		case hasAVIFMagic(raw):
+			ext = ".avif"
 		}
 	}
 
@@ -334,8 +1088,15 @@ func NormalizeLocalImageBytes(raw []byte, extLower string) (clean []byte, mimeTy
 	if kind != mediaKindImage {
 		return nil, "", 0, 0, false, fmt.Errorf("extension %q is not a supported raster image", ext)
 	}
+	if detectedMIME == "image/avif" {
+		w, h, aErr := parseAVIFDimensions(raw)
+		if aErr != nil {
+			return nil, "", 0, 0, false, aErr
+		}
+		return raw, "image/avif", w, h, false, nil
+	}
 
-	cfg, formatName, cfgErr := image.DecodeConfig(bytes.NewReader(raw))
+	cfg, formatName, cfgErr := decodeImageConfigSafe(raw)
 	if cfgErr != nil {
 		return nil, "", 0, 0, false, fmt.Errorf("invalid image header: %w", cfgErr)
 	}
@@ -351,7 +1112,7 @@ func NormalizeLocalImageBytes(raw []byte, extLower string) (clean []byte, mimeTy
 
 	orient := ReadEXIFOrientation(raw)
 	if orient > 1 && formatName != "gif" {
-		img, _, decErr := image.Decode(bytes.NewReader(raw))
+		img, _, decErr := decodeRasterImageSafe(raw)
 		if decErr != nil {
 			return nil, "", 0, 0, false, fmt.Errorf("image decode failed: %w", decErr)
 		}
@@ -482,7 +1243,7 @@ func ContainsEXIFOrGPS(raw []byte) bool {
 		return false
 	}
 
-	// PNG: scan chunks for eXIf
+	// PNG: scan chunks for eXIf or XMP iTXt
 	if bytes.HasPrefix(raw, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
 		i := 8
 		for i+12 <= len(raw) {
@@ -492,6 +1253,9 @@ func ContainsEXIFOrGPS(raw []byte) bool {
 			}
 			chunkType := string(raw[i+4 : i+8])
 			if chunkType == "eXIf" {
+				return true
+			}
+			if chunkType == "iTXt" && bytes.HasPrefix(raw[i+8:i+8+chunkLen], []byte("XML:com.adobe.xmp\x00")) {
 				return true
 			}
 			if chunkType == "IEND" {

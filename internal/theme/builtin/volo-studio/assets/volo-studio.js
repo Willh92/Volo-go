@@ -130,7 +130,7 @@
       isOverlayActive(document.getElementById("volo-lightbox")) ||
       isTocDrawerModalActive() ||
       isMobileBookDrawerOpen() ||
-      isOverlayActive(document.querySelector(".volo-comment-composer")) ||
+      isOverlayActive(document.querySelector(".volo-comment-composer:not(.is-inline)")) ||
       isOverlayActive(document.querySelector(".vc-ban-modal"));
     if (locked === bodyScrollLocked) return;
     if (locked) {
@@ -1155,12 +1155,16 @@
       var filterIn = colRoot.querySelector(".js-collection-filter");
       if (!filterIn || filterIn.dataset.boundFilter === "1") return;
       filterIn.dataset.boundFilter = "1";
+      var isSeriesServer = filterIn.classList.contains("js-series-filter-input");
+      var clearBtn = colRoot.querySelector(".js-series-filter-clear");
+      var serverQ = clearBtn ? (clearBtn.getAttribute("data-server-query") || "") : "";
+      var hasPager = isSeriesServer && !!(serverQ || mainWrap.querySelector(".pagination"));
       var emptyEl = colRoot.querySelector(".js-collection-empty");
       var countEl = colRoot.querySelector(".js-collection-count");
       var groups = Array.prototype.slice.call(colRoot.querySelectorAll("[data-collection-group]"));
       var allItems = Array.prototype.slice.call(colRoot.querySelectorAll("[data-collection-item]"));
       var totalItems = countEl ? (parseInt(countEl.getAttribute("data-total") || "0", 10) || allItems.length) : allItems.length;
-      var syncCollection = function () {
+      var syncCollection = function (fromInput) {
         var q = String(filterIn.value || "").trim().toLowerCase();
         var shown = 0;
         allItems.forEach(function (item) {
@@ -1175,24 +1179,44 @@
           });
           grp.hidden = !!q && !grpVisible;
         });
+        if (clearBtn) clearBtn.hidden = !q && !serverQ;
         if (countEl) {
-          countEl.textContent = q ? (shown + " / " + totalItems) : String(totalItems);
+          countEl.textContent = q ? (shown + " / " + totalItems) : (totalItems > allItems.length && allItems.length > 0 ? (allItems.length + " / " + totalItems) : String(totalItems));
         }
         if (emptyEl) emptyEl.hidden = !q || shown > 0;
+        if (fromInput && hasPager && !filterIn._composing) {
+          scheduleServerFilterNav(".js-series-filter-input", filterIn.value, ["skin", "theme_preview"]);
+        }
       };
-      filterIn.addEventListener("input", syncCollection);
-      if (filterIn.value) syncCollection();
+      if (isSeriesServer) {
+        filterIn.addEventListener("compositionstart", function () { filterIn._composing = true; });
+        filterIn.addEventListener("compositionend", function () { filterIn._composing = false; syncCollection(true); });
+      }
+      filterIn.addEventListener("input", function () { syncCollection(true); });
+      if (clearBtn) {
+        clearBtn.addEventListener("click", function (ev) {
+          if (!serverQ) {
+            ev.preventDefault();
+            filterIn.value = "";
+            syncCollection(false);
+            filterIn.focus();
+          }
+        });
+      }
+      if (filterIn.value && filterIn.value !== serverQ) syncCollection(false);
     });
 
     var bookIn = root.querySelector(".js-book-filter-input");
     var bookGrid = root.querySelector(".js-book-filter-grid");
     var bookEmpty = root.querySelector(".js-book-filter-empty");
+    var bookClear = root.querySelector(".js-book-filter-clear");
     if (bookIn && bookIn.dataset.boundFilter !== "1") {
       bookIn.dataset.boundFilter = "1";
-      var urlBookQ = "";
+      var urlBookQ = bookClear ? (bookClear.getAttribute("data-server-query") || "") : "";
       try {
-        urlBookQ = new URLSearchParams(window.location.search).get("q") || "";
-        if (!bookIn.value && urlBookQ) bookIn.value = urlBookQ;
+        var qsBook = new URLSearchParams(window.location.search).get("q") || "";
+        if (!urlBookQ) urlBookQ = qsBook;
+        if (!bookIn.value && qsBook) bookIn.value = qsBook;
       } catch (_) {}
       var hasBookPager = !!(urlBookQ || mainWrap.querySelector(".pagination"));
       var syncBookFilter = function (fromInput) {
@@ -1206,6 +1230,7 @@
             if (match) shown++;
           });
         }
+        if (bookClear) bookClear.hidden = !q && !urlBookQ;
         if (bookEmpty && bookGrid) bookEmpty.hidden = !q || shown > 0;
         if (fromInput && hasBookPager && !bookIn._composing) {
           scheduleServerFilterNav(".js-book-filter-input", bookIn.value, ["skin", "theme_preview"]);
@@ -1214,6 +1239,16 @@
       bookIn.addEventListener("compositionstart", function () { bookIn._composing = true; });
       bookIn.addEventListener("compositionend", function () { bookIn._composing = false; syncBookFilter(true); });
       bookIn.addEventListener("input", function () { syncBookFilter(true); });
+      if (bookClear) {
+        bookClear.addEventListener("click", function (ev) {
+          if (!urlBookQ) {
+            ev.preventDefault();
+            bookIn.value = "";
+            syncBookFilter(false);
+            bookIn.focus();
+          }
+        });
+      }
       if (bookIn.value && bookIn.value !== urlBookQ) syncBookFilter(false);
     }
 
@@ -2099,7 +2134,15 @@
         return;
       }
       var proseImg = ev.target.closest(".volo-prose img");
-      if (proseImg && !proseImg.closest("a, .volo-embed-book, .volo-book-tile, .vc-item") && lightbox && lightboxImg) {
+      if (
+        proseImg &&
+        !proseImg.closest("a, .volo-embed-book, .volo-book-tile") &&
+        !proseImg.classList.contains("vc-avatar") &&
+        !proseImg.classList.contains("vc-identity__avatar") &&
+        !proseImg.hasAttribute("data-avatar-seed") &&
+        lightbox &&
+        lightboxImg
+      ) {
         var src = proseImg.getAttribute("src");
         if (src) {
           openLightbox(src, proseImg.getAttribute("alt") || "");
@@ -2382,6 +2425,8 @@
     if (activeFetchCtrl) activeFetchCtrl.abort();
     activeFetchCtrl = new AbortController();
     closePopovers();
+    var cmtSec = document.getElementById("volo-comments");
+    if (cmtSec && typeof cmtSec._closeOverlays === "function") cmtSec._closeOverlays();
     closeAnimated(document.getElementById("volo-search-modal"), null, 180);
     closeAnimated(document.getElementById("volo-lightbox"), null, 180);
     closeAnimated(document.getElementById("volo-toc-drawer"), document.getElementById("volo-mobile-toc-btn"), 180);

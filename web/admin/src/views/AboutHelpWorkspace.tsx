@@ -189,14 +189,14 @@ export function AboutHelpWorkspace({
           <div class="volo-grid-2">
             <div class="volo-card">
               <div class="volo-sec-head">
-                <div class="volo-sec-copy">
+                <div class="volo-sec-copy" style={{ minWidth: 0 }}>
                   <h3 class="volo-card-title">{t("about.repo_head")}</h3>
-                  <p class="volo-sec-desc">
+                  <p class="volo-sec-desc" style={{ minWidth: 0, overflowWrap: "anywhere" }}>
                     <a
                       href={info?.repo?.html_url || "https://github.com/Willh92/Volo-go"}
                       target="_blank"
                       rel="noreferrer"
-                      style={{ color: "var(--volo-accent)", fontWeight: 600, textDecoration: "none" }}
+                      style={{ color: "var(--volo-accent)", fontWeight: 600, textDecoration: "none", overflowWrap: "anywhere" }}
                     >
                       {info?.repo?.full_name || "Willh92/Volo-go"} ↗
                     </a>
@@ -279,9 +279,9 @@ export function AboutHelpWorkspace({
                 </div>
 
                 <div class="volo-subcard" style={{ margin: "6px 0 12px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap", minWidth: 0 }}>
                     <span class="volo-help">{t("about.latest_tag")}</span>
-                    <span class="volo-code-chip">
+                    <span class="volo-code-chip" style={{ minWidth: 0, maxWidth: "100%", overflowWrap: "anywhere", whiteSpace: "normal" }}>
                       {info?.latest_release?.tag_name || info?.version || "v1.0.0"}
                     </span>
                   </div>

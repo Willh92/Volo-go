@@ -451,3 +451,55 @@ func TestSecretBoxSealAndOpen(t *testing.T) {
 		t.Fatal("expected tampered SecretBox ciphertext to fail")
 	}
 }
+
+func TestSocketGroupModeAndSkipKeyRing(t *testing.T) {
+	tmpDir := t.TempDir()
+	missingDataDir := filepath.Join(tmpDir, "never-created-data")
+	missingEnv := filepath.Join(tmpDir, "missing.env")
+
+	// SkipKeyRing=true MUST NOT create DataDir or .secret.key
+	cfgNoKR, err := LoadWithEnviron(CLIOverrides{
+		EnvFile:     missingEnv,
+		SkipKeyRing: true,
+		DataDir:     &missingDataDir,
+	}, []string{
+		"VOLO_LISTEN_SOCKET=/run/volo/volo.sock",
+		"VOLO_SOCKET_GROUP=www-data",
+		"VOLO_SOCKET_MODE=600",
+	})
+	if err != nil {
+		t.Fatalf("LoadWithEnviron(SkipKeyRing): %v", err)
+	}
+	if _, statErr := os.Stat(missingDataDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected SkipKeyRing=true to avoid creating DataDir, got err=%v", statErr)
+	}
+	if cfgNoKR.KeyRing != nil {
+		t.Fatal("expected nil KeyRing when SkipKeyRing=true")
+	}
+	if cfgNoKR.SocketGroup != "www-data" || cfgNoKR.SocketMode != "0600" {
+		t.Fatalf("unexpected SocketGroup=%q SocketMode=%q", cfgNoKR.SocketGroup, cfgNoKR.SocketMode)
+	}
+	if cfgNoKR.ListenSocket == nil || cfgNoKR.ListenSocket.Perm != 0o600 {
+		t.Fatalf("expected ListenSocket.Perm=0600, got %+v", cfgNoKR.ListenSocket)
+	}
+
+	// Default SocketMode is "0660"
+	cfgDef, err := LoadWithEnviron(CLIOverrides{
+		EnvFile:     missingEnv,
+		SkipKeyRing: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfgDef.SocketMode != "0660" || cfgDef.SocketGroup != "" {
+		t.Fatalf("expected default SocketMode=0660 and empty SocketGroup, got mode=%q group=%q", cfgDef.SocketMode, cfgDef.SocketGroup)
+	}
+
+	// Invalid VOLO_SOCKET_MODE fails fast
+	if _, err := LoadWithEnviron(CLIOverrides{
+		EnvFile:     missingEnv,
+		SkipKeyRing: true,
+	}, []string{"VOLO_SOCKET_MODE=0999"}); err == nil {
+		t.Fatal("expected invalid VOLO_SOCKET_MODE=0999 to fail")
+	}
+}

@@ -47,21 +47,23 @@
           </div>
         </section>
       {{end}}
-
-      {{if .RecentPosts}}
-        <section class="studio-article studio-card-pad">
-          <h2 class="studio-card-title">{{t .Locale "sidebar.recent_posts"}}</h2>
-          <div class="studio-archive-list">
-            {{range .RecentPosts}}
-              <a class="studio-archive-row" href="{{.URL}}">
-                <strong>{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</strong>
-                <time datetime="{{fmtISO .PublishedAt}}">{{fmtDate .PublishedAt}}</time>
-              </a>
-            {{end}}
-          </div>
-        </section>
-      {{end}}
       {{template "pagination" .}}
+
+      {{if and (le .Page 1) (le .Pagination.Page 1)}}
+        {{if .RecentPosts}}
+          <section class="studio-article studio-card-pad">
+            <h2 class="studio-card-title">{{t .Locale "sidebar.recent_posts"}}</h2>
+            <div class="studio-archive-list">
+              {{range .RecentPosts}}
+                <a class="studio-archive-row" href="{{.URL}}">
+                  <strong>{{if .IsPasswordProtected}}🔒 {{end}}{{.Title}}</strong>
+                  <time datetime="{{fmtISO .PublishedAt}}">{{fmtDate .PublishedAt}}</time>
+                </a>
+              {{end}}
+            </div>
+          </section>
+        {{end}}
+      {{end}}
     {{else}}
       {{template "empty_state" (dict "Title" (t .Locale "studio.empty_dynamic_title") "Desc" (t .Locale "studio.empty_dynamic_desc"))}}
     {{end}}

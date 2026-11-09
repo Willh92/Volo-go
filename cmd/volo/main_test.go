@@ -347,3 +347,78 @@ func TestCLIBackupCreateAndRestoreIncludesPluginsAndThemes(t *testing.T) {
 	}
 }
 
+func TestCLIHealthcheckReadOnlyCWDAndUnixSocketAlias(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "srv-data")
+	sockPath := filepath.Join(tmp, "alias.sock")
+
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	doneCh := make(chan int, 1)
+	go func() {
+		var sOut, sErr bytes.Buffer
+		doneCh <- runCLI(serveCtx, []string{
+			"serve",
+			"--data-dir", dataDir,
+			"--unix-socket", sockPath,
+			"--socket-mode", "0600",
+		}, &sOut, &sErr)
+	}()
+	defer func() {
+		cancelServe()
+		<-doneCh
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if st, err := os.Lstat(sockPath); err == nil {
+			if st.Mode().Perm() != 0o600 {
+				t.Fatalf("expected --socket-mode 0600 on socket, got %04o", st.Mode().Perm())
+			}
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Switch working directory to an isolated read-only directory (0555) with NO ./data directory.
+	roDir := filepath.Join(tmp, "readonly-cwd")
+	if err := os.MkdirAll(roDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(roDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(roDir, 0o755)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(roDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	// 1. Healthcheck via --unix-socket from read-only CWD MUST succeed and never create ./data/.secret.key!
+	var hcOut, hcErr bytes.Buffer
+	hcCode := runCLI(ctx, []string{"healthcheck", "--unix-socket", sockPath}, &hcOut, &hcErr)
+	if hcCode != 0 || !strings.Contains(hcOut.String(), `"status":"ok"`) {
+		t.Fatalf("healthcheck --unix-socket from read-only CWD failed (code=%d): out=%q err=%q", hcCode, hcOut.String(), hcErr.String())
+	}
+	if _, err := os.Stat(filepath.Join(roDir, "data")); !os.IsNotExist(err) {
+		t.Fatalf("healthcheck unexpectedly created ./data in CWD: err=%v", err)
+	}
+
+	// 2. Healthcheck via VOLO_LISTEN_SOCKET env var from read-only CWD MUST also succeed without touching ./data!
+	t.Setenv("VOLO_LISTEN_SOCKET", sockPath)
+	hcOut.Reset()
+	hcErr.Reset()
+	hcCode = runCLI(ctx, []string{"healthcheck"}, &hcOut, &hcErr)
+	if hcCode != 0 || !strings.Contains(hcOut.String(), `"status":"ok"`) {
+		t.Fatalf("healthcheck via VOLO_LISTEN_SOCKET from read-only CWD failed (code=%d): out=%q err=%q", hcCode, hcOut.String(), hcErr.String())
+	}
+	if _, err := os.Stat(filepath.Join(roDir, "data")); !os.IsNotExist(err) {
+		t.Fatalf("healthcheck via env unexpectedly created ./data in CWD: err=%v", err)
+	}
+}
+

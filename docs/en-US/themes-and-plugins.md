@@ -97,7 +97,7 @@ For a complete FreeMarker (`.ftl`) migration reference, see the [Theme Authoring
 
 ---
 
-## 2. 3-Mode Studio Editor
+## 2. 3-Mode Studio Editor & Fullscreen Public Reply Editor
 
 The Admin Console features a custom CodeMirror 6 **3-Mode Studio Editor** combining precision Markdown control with fluid visual editing:
 
@@ -108,6 +108,9 @@ The Admin Console features a custom CodeMirror 6 **3-Mode Studio Editor** combin
   - Native `<video>` and `<audio>` embeds, podcast enclosures, and drag-and-drop/paste uploads;
   - **LaTeX Math Protection**: Inline `$...$` and display `$$...$$` expressions are shielded during Markdown parsing so underscores `_` and asterisks `*` are never corrupted, paired with lazy on-demand KaTeX and Mermaid loading on the public site;
   - Built-in browser **voice recording** that uploads directly to the Media Library and inserts ready-to-play `<audio>` tags, plus `slots:editor.quick_insert` toolbar integration for custom plugin directives.
+- **Enhanced Safe Fullscreen Reply Markdown Editor (`comment-widget.js`)**:
+  - Both `volo-studio` and `volo-journal` include an upgraded public reply Markdown editor with a formatting toolbar (`bold`, `italic`, `strike`, inline/fenced code, quote, list, protocol-validated link), sanitized live preview (`POST /api/v1/comments/preview`), **fullscreen distraction-free mode** (`Esc` exit), and live per-identity rune/line counters;
+  - Defends comment threads against vertical-height bombing via Zalgo combining-mark caps, invisible filler-line collapsing, heading demotion (`h1`–`h3` -> `h4`), CSS height caps on `<img>`/`<pre>`, and automatic expand/collapse folding on tall comments.
 
 ---
 
@@ -129,8 +132,8 @@ plugins/hello-callout/
 
 - **Physical Data Isolation & Clean Uninstall**:
   - Persistent state is isolated per `(plugin_id, key)` in `plugin_kv` (`<= 256 KiB` per value, `<= 2,000` keys default quota), with secrets sealed in `plugins.secret_ciphertext`; plugins can read relative files inside their own folder only and can never write to the host filesystem.
-  - **5-Stage Lifecycle**: `onInstall()` (fresh install or in-place ZIP upgrade) -> `onEnable()` -> `onConfigChange(newCfg)` (hot-applied immediately without restarting the VM) -> `onDisable()` (unregisters all dynamic cron jobs and providers) -> `onUninstall()` (invoked best-effort before transactionally wiping `plugin_kv`, `plugins`, and `./plugins/<id>` on disk).
-- **Hot Install, In-Place Upgrade (`overwrite=true`) & Clean `.zip` Export**: Upload via `POST /api/admin/plugins/install?overwrite=true` to hot-upgrade while preserving `config_json`, custom `priority`, and encrypted `secret_ciphertext` secrets, or export via `GET /api/admin/plugins/{id}/export` without leaking secret ciphertexts.
+  - **5-Stage Lifecycle**: `onInstall()` (fresh install or in-place ZIP upgrade) -> `onEnable()` -> `onConfigChange(newCfg)` (hot-applied immediately without restarting the VM) -> `onDisable()` (flushes buffered KV counters and unregisters dynamic cron jobs/providers) -> `onUninstall()` (invoked best-effort before transactionally wiping `plugin_kv`, `plugins`, and `./plugins/<id>` on disk).
+- **Hot Install, In-Place Upgrade (`overwrite=true`) & Clean `.zip` Export**: Upload via `POST /api/admin/plugins/install?overwrite=true` to hot-upgrade while preserving `config_json`, custom `priority`, encrypted `secret_ciphertext` secrets, and active enabled state, or export via `GET /api/admin/plugins/{id}/export` without leaking secret ciphertexts.
 
 ### 3.2 `manifest.json`, `priority` Chain Ordering & `type: "secret"` Encrypted Fields
 
@@ -249,17 +252,17 @@ plugins/hello-callout/
    - **Domain Hooks** (`hooks:*`, `hooks:<domain>.*` wildcards, or granular tokens):
      - Pre-action interception hooks: `hooks:comment.before_create`, `hooks:comment.before_update`, `hooks:user.before_register`, `hooks:user.before_update_profile`, `hooks:article.before_save`, `hooks:page.before_save`, `hooks:media.before_upload`;
      - Post-action & render hooks: `hooks:article.{published,updated,deleted}`, `hooks:page.{published,updated,deleted}`, `hooks:comment.{created,moderated}`, `hooks:render.{pre_markdown,post_html}`;
-   - **UI Slots** (`ui:slots` or `slots:*`): `public.head`, `public.header`, `public.sidebar`, `article.before_content`, `article.after_content`, `comment.before`, `comment.after`, `public.footer`, `editor.quick_insert`, `admin.dashboard_card`;
+   - **UI Slots** (`ui:slots` or `slots:*`): `public.head`, `public.header`, `public.sidebar`, `article.before_content`, `article.after_content`, `comment.before`, `comment.after`, `public.footer`, `editor.quick_insert`, `admin.dashboard_card` (supporting `persist: true` across PJAX navigations);
    - **Network & Custom Routes**: `http:routes` (`/plugins/<id>/api/*`), `http:raw_headers`, `http.outbound:<hostname>` / `allowed_hosts` (enforced with `OutboundSafeDialer`);
    - **Core Extension Providers** (chained deterministically in ascending `priority` order):
      - `provider:storage`: `storagePut` / `storageDelete` / `storageHealthCheck` (with automatic local-disk fallback);
-     - `provider:oidc`: `oidcAuthURL` / `oidcExchange` / `oidcProviderInfo` (PKCE + `nonce` replay protection);
+     - `provider:oidc`: `oidcAuthURL` / `oidcExchange` / `oidcProviderInfo` (PKCE + `nonce` replay protection, with instant cache refresh on config updates);
      - `provider:notifier`: `sendNotification(event)` / `notifySend(event)`;
      - `provider:antispam`: `checkSpam(input)` (`{ action: "pass" | "allow" | "moderate" | "reject", reason, score }`) and optional `checkNickname(input)` (`{ allow: boolean, reason }`);
    - **Sensitive Content Gate**: `articles:read_protected`.
 
-2. **Circuit Breakers, Resource Guardrails & Host Security Integration**:
-   - Every JS Hook, Directive, Cron job, Federation task, and UI Slot runs under instruction step budgets, wall-clock timeouts, cycle-depth limits, and `4 MiB` string caps; consecutive runtime errors or timeouts automatically trip `CIRCUIT_OPEN`;
+2. **Circuit Breakers, Frozen Prototype Isolation & Resource Guardrails**:
+   - Every JS execution runs under instruction step budgets, uncatchable wall-clock timeout sentinels (`ErrExecutionTimeout`), AST recursion limits (`<= 128`), streaming `JSON.parse` depth/element caps, global RegExp match limits, and `4 MiB` string caps; builtin prototypes are frozen and pooled VMs reset via `snapshotPostInit`/`restorePostInit` on return; consecutive runtime errors or timeouts automatically trip `CIRCUIT_OPEN`;
    - See [`SECURITY.md`](../../SECURITY.md) for host-level **Dynamic Stealth Admin Path (`security.admin_path`)** and **Multi-DB GeoIP** details.
 
 ### 3.5 Sandbox SDK (`volo.*`), Native `wordFilter` Engine & `main.js` Example
@@ -269,7 +272,8 @@ Host bridge object `volo` (alias `ctx`):
 - `volo.wordFilter.compile({ deny, allow, normalize, maxRepeat })` / `volo.wordFilter.loadHoubbDict(relGzPath, opts)`: compile zero-CGO CSR/Double-Array Aho-Corasick matchers exposing `.match(text)`, `.contains(text)`, `.censor(text, maskRune?)`, and `.stats()`;
 - `volo.cron.register(name, intervalSec, handlerName, immediate?)` / `volo.cron.unregister(name)` / `volo.cron.list()`: dynamic scheduled jobs (requires `cron`);
 - `volo.registerDirective(name, handlerFn)` / `volo.registerFederation({ publish(ev), deliver(ev) })`;
-- `volo.escapeHTML(str)`, `volo.config.{get,all}()`, `volo.kv.{get,getInt,set,del,incr,list}(...)`, `volo.crypto.{sha256,hmacSha256,randomUUID}()`, `volo.site.info()`, `volo.rateLimit(...)`, `volo.http.fetch(...)`, `volo.i18n.t(...)`, and `volo.log.{info,warn,error}(msg)`.
+- `volo.kv.{get,getInt,set,del,incr,incrAsync,flush,list}(...)`: `incrAsync(key, delta?)` coalesces hot-path counter increments in memory and flushes every `5s` (and on plugin disable/shutdown) while `getInt` overlays pending deltas in real time;
+- `volo.escapeHTML(str)`, `btoa` / `atob` (binary-safe Latin-1), `volo.config.{get,all}()`, `volo.crypto.{sha256,hmacSha256,randomUUID}()`, `volo.site.info()`, `volo.rateLimit(...)`, `volo.http.fetch(url, { body_base64, response_encoding: "base64", ... })`, `volo.i18n.t(...)`, and `volo.log.{info,warn,error}(msg)`.
 
 ```javascript
 let matcher = null;

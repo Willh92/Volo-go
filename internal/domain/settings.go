@@ -49,12 +49,109 @@ type ReadingSettings struct {
 	AllowReaderRegister   bool     `json:"allow_reader_register"`
 	CommentAccessMode     string   `json:"comment_access_mode"`     // all | registered | off
 	CommentModerationMode string   `json:"comment_moderation_mode"` // off | smart | all
+	CommentMinLength      int      `json:"comment_min_length"`       // default 2
+	CommentMaxLengthGuest int      `json:"comment_max_length_guest"` // default 512
+	CommentMaxLengthUser  int      `json:"comment_max_length_user"`  // default 1024
+	CommentMaxLengthStaff int      `json:"comment_max_length_staff"` // default 4096
+	CommentMaxLinesGuest  int      `json:"comment_max_lines_guest"`  // default 16
+	CommentMaxLinesUser   int      `json:"comment_max_lines_user"`   // default 24
+	CommentMaxLinesStaff  int      `json:"comment_max_lines_staff"`  // default 64
 	BuiltinSpamFilter     bool     `json:"builtin_spam_filter"`
 	BlockedKeywords       []string `json:"blocked_keywords"`
 	AllowedKeywords       []string `json:"allowed_keywords"`
 	PoWDifficultyBits     int      `json:"pow_difficulty_bits"`
 	AssetCDNPrefix        string   `json:"asset_cdn_prefix"`
 	VendorCDNPrefix       string   `json:"vendor_cdn_prefix"`
+}
+
+// Default comment length constraints by caller identity.
+const (
+	DefaultCommentMinLength      = 2
+	DefaultCommentMaxLengthGuest = 512
+	DefaultCommentMaxLengthUser  = 1024
+	DefaultCommentMaxLengthStaff = 4096
+)
+
+// EffectiveCommentLengthBounds resolves the active [minRunes, maxRunes] limits for viewer (nil = guest).
+func (r ReadingSettings) EffectiveCommentLengthBounds(viewer *User) (minRunes int, maxRunes int) {
+	minRunes = r.CommentMinLength
+	if minRunes <= 0 {
+		minRunes = DefaultCommentMinLength
+	}
+	if minRunes > 500 {
+		minRunes = 500
+	}
+	if viewer != nil && viewer.Status == UserStatusActive {
+		if viewer.Role == RoleAdmin || viewer.Role == RoleEditor {
+			maxRunes = r.CommentMaxLengthStaff
+			if maxRunes <= 0 {
+				maxRunes = DefaultCommentMaxLengthStaff
+			}
+		} else {
+			maxRunes = r.CommentMaxLengthUser
+			if maxRunes <= 0 {
+				maxRunes = DefaultCommentMaxLengthUser
+			}
+		}
+	} else {
+		maxRunes = r.CommentMaxLengthGuest
+		if maxRunes <= 0 {
+			maxRunes = DefaultCommentMaxLengthGuest
+		}
+	}
+	if maxRunes < minRunes {
+		maxRunes = minRunes
+	}
+	return minRunes, maxRunes
+}
+
+// Default per-identity comment line-count caps defending comment threads against vertical-height bombing.
+const (
+	DefaultCommentMaxLinesGuest = 16
+	DefaultCommentMaxLinesUser  = 24
+	DefaultCommentMaxLinesStaff = 64
+)
+
+// EffectiveCommentMaxLines returns the maximum normalized line count allowed for viewer's comment.
+func (r ReadingSettings) EffectiveCommentMaxLines(viewer *User) int {
+	if viewer != nil && viewer.Status == UserStatusActive {
+		if viewer.Role == RoleAdmin || viewer.Role == RoleEditor {
+			if r.CommentMaxLinesStaff > 0 {
+				return r.CommentMaxLinesStaff
+			}
+			return DefaultCommentMaxLinesStaff
+		}
+		if r.CommentMaxLinesUser > 0 {
+			return r.CommentMaxLinesUser
+		}
+		return DefaultCommentMaxLinesUser
+	}
+	if r.CommentMaxLinesGuest > 0 {
+		return r.CommentMaxLinesGuest
+	}
+	return DefaultCommentMaxLinesGuest
+}
+
+// Supported canonical post permalink style templates.
+const (
+	PermalinkStylePosts     = "/posts/{slug}"
+	PermalinkStyleArchives  = "/archives/{slug}"
+	PermalinkStyleShortP    = "/p/{slug}"
+	PermalinkStyleYearMonth = "/{year}/{month}/{slug}"
+)
+
+// NormalizePostPermalinkStyle returns a canonical permalink template, defaulting to `/posts/{slug}`.
+func NormalizePostPermalinkStyle(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return PermalinkStylePosts, true
+	}
+	switch s {
+	case PermalinkStylePosts, PermalinkStyleArchives, PermalinkStyleShortP, PermalinkStyleYearMonth:
+		return s, true
+	default:
+		return "", false
+	}
 }
 
 // PodcastChannelConfig holds full Apple/Spotify iTunes Podcast metadata inside "feed" domain.
@@ -245,6 +342,13 @@ func DefaultReadingSettings() ReadingSettings {
 		AllowReaderRegister:   false,
 		CommentAccessMode:     CommentAccessAll,
 		CommentModerationMode: CommentModerationSmart,
+		CommentMinLength:      DefaultCommentMinLength,
+		CommentMaxLengthGuest: DefaultCommentMaxLengthGuest,
+		CommentMaxLengthUser:  DefaultCommentMaxLengthUser,
+		CommentMaxLengthStaff: DefaultCommentMaxLengthStaff,
+		CommentMaxLinesGuest:  DefaultCommentMaxLinesGuest,
+		CommentMaxLinesUser:   DefaultCommentMaxLinesUser,
+		CommentMaxLinesStaff:  DefaultCommentMaxLinesStaff,
 		BuiltinSpamFilter:     true,
 		BlockedKeywords:       []string{},
 		AllowedKeywords:       []string{},

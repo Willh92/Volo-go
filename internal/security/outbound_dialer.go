@@ -56,20 +56,7 @@ type OutboundSafeDialer struct {
 
 // IsPublicRoutableIP returns true ONLY if addr is a globally routable unicast public IP.
 func IsPublicRoutableIP(addr netip.Addr) bool {
-	if !addr.IsValid() {
-		return false
-	}
-	u := addr.Unmap()
-	if u.IsLoopback() || u.IsPrivate() || u.IsLinkLocalUnicast() || u.IsLinkLocalMulticast() ||
-		u.IsMulticast() || u.IsUnspecified() {
-		return false
-	}
-	for _, pfx := range blockedSpecialPrefixes {
-		if pfx.Contains(u) {
-			return false
-		}
-	}
-	return true
+	return !IsForbiddenIP(addr)
 }
 
 // CheckHostAllowed verifies host against AllowedHosts (supports exact match or "*.example.com" wildcard).

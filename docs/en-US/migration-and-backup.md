@@ -14,7 +14,7 @@
 
 Legacy backups carry historical schema debt (sharded 10KB key-value JSON strings, indirect tag-based categorization, legacy password hashes, and `.html` permalinks). `Volo-go`'s streaming `json.Decoder` pipeline transforms them inside an atomic transaction without buffering the entire archive in memory:
 
-| Legacy Structure | `Volo-go` Normalized Target (`v7` Schema) | Transformation Behavior |
+| Legacy Structure | `Volo-go` Normalized Target (`v8` Schema) | Transformation Behavior |
 | :--- | :--- | :--- |
 | Sharded key-value JSON documents (Series, Bookshelf, Daily Analytics, Webhooks) | `series`, `series_articles`, `books`, `book_chapters`, `analytics_daily`, `webhooks` | Reassembles multi-shard JSON payloads into first-class relational tables with foreign keys |
 | Indirect `category` + `category_tag` + `tag_article` categorization | `articles.category_id` + `article_tags` | Derives each post's primary category directly from its tag bindings while preserving all freeform tags |
@@ -60,7 +60,7 @@ Every native `.zip` archive streams all **33 normalized data tables** in `migrat
 
 ```text
 volo-backup-20261108-010000.zip
-├── manifest.json                 # Records format, schema_version (v7), source_dialect, byte sizes, row counts & SHA-256 digests
+├── manifest.json                 # Records format, schema_version (v8), source_dialect, byte sizes, row counts & SHA-256 digests
 ├── tables/
 │   ├── 01_settings.ndjson        # Dialect-neutral NDJSON streams for all 33 canonical tables in FK order
 │   ├── 02_users.ndjson

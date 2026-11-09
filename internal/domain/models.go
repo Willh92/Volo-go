@@ -8,6 +8,8 @@ const (
 
 	UserStatusActive   = "active"
 	UserStatusDisabled = "disabled"
+
+	MutedIndefinitely int64 = -1
 )
 
 // Article statuses.
@@ -68,10 +70,45 @@ type User struct {
 	PasswordHash    string `db:"password_hash" json:"password_hash,omitempty"`
 	LegacyHash      string `db:"legacy_hash" json:"legacy_hash,omitempty"`
 	Status          string `db:"status" json:"status"`
+	BanUntil        int64  `db:"ban_until" json:"ban_until"`
+	MutedUntil      int64  `db:"muted_until" json:"muted_until"`
+	BanReason       string `db:"ban_reason" json:"ban_reason"`
+	ShieldComments  bool   `db:"shield_comments" json:"shield_comments"`
+	ShieldText      string `db:"shield_text" json:"shield_text"`
 	EmailVerifiedAt int64  `db:"email_verified_at" json:"email_verified_at"`
 	PreferredLocale string `db:"preferred_locale" json:"preferred_locale"`
 	CreatedAt       int64  `db:"created_at" json:"created_at"`
 	UpdatedAt       int64  `db:"updated_at" json:"updated_at"`
+}
+
+// IsBannedAt reports whether the account is currently suspended at nowMS.
+func (u *User) IsBannedAt(nowMS int64) bool {
+	if u == nil || u.Status != UserStatusDisabled {
+		return false
+	}
+	if u.BanUntil > 0 && nowMS >= u.BanUntil {
+		return false
+	}
+	return true
+}
+
+// IsMutedAt reports whether the account is currently silenced (cannot post/edit comments) at nowMS.
+func (u *User) IsMutedAt(nowMS int64) bool {
+	if u == nil {
+		return false
+	}
+	if u.MutedUntil < 0 {
+		return true
+	}
+	return u.MutedUntil > 0 && nowMS < u.MutedUntil
+}
+
+// IsCommentShieldedAt reports whether this user's historical comments should be replaced with placeholder copy at nowMS.
+func (u *User) IsCommentShieldedAt(nowMS int64) bool {
+	if u == nil || !u.ShieldComments {
+		return false
+	}
+	return u.IsBannedAt(nowMS) || u.IsMutedAt(nowMS)
 }
 
 type UserCredential struct {

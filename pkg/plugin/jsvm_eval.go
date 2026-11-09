@@ -1,10 +1,12 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
 	"reflect"
@@ -32,11 +34,13 @@ const (
 	valFunc
 	valRegExp
 
-	maxJSArrayLen    = 65536
-	maxJSObjectKeys  = 16384
-	maxJSStringBytes = 4 << 20 // 4 MiB string byte-length cap
-	maxJSExportDepth = 64      // Maximum object/array recursion depth
-	maxJSExportNodes = 50_000  // Maximum visited nodes during export/stringify/toString
+	maxJSArrayLen     = 65536
+	maxJSObjectKeys   = 16384
+	maxJSStringBytes  = 4 << 20 // 4 MiB string byte-length cap
+	maxJSExportDepth  = 64      // Maximum object/array recursion depth
+	maxJSExportNodes  = 50_000  // Maximum visited nodes during export/stringify/toString
+	maxJSONParseDepth = 64      // Maximum JSON.parse / goToJSValue recursion depth
+	maxJSONParseNodes = 100_000 // Maximum JSON.parse / goToJSValue total node budget
 )
 
 type jsValue struct {
@@ -59,8 +63,10 @@ var (
 
 type jsObject struct {
 	props   map[string]jsValue
+	scope   *jsScope // non-nil for globalThis proxy object
 	isError bool
 	isDate  bool
+	frozen  bool
 	epochMs float64
 }
 
@@ -78,16 +84,17 @@ type jsRegExp struct {
 type jsNativeFn func(rt *jsRuntime, thisVal jsValue, args []jsValue) (jsValue, error)
 
 type jsFunc struct {
-	name      string
-	params    []jsParam
-	body      []jsStmt
-	env       *jsScope
-	native    jsNativeFn
-	props     map[string]jsValue
-	arrow     bool
-	hasBound  bool
-	boundThis jsValue
-	boundArgs []jsValue
+	name        string
+	params      []jsParam
+	body        []jsStmt
+	env         *jsScope
+	native      jsNativeFn
+	props       map[string]jsValue
+	frozenProps bool
+	arrow       bool
+	hasBound    bool
+	boundThis   jsValue
+	boundArgs   []jsValue
 }
 
 type jsScope struct {
@@ -173,6 +180,9 @@ func (s *jsScope) set(name string, v jsValue) error {
 	for root.parent != nil {
 		root = root.parent
 	}
+	if _, exists := root.vars[name]; !exists && len(root.vars) >= maxJSObjectKeys {
+		panic(errJSObjectKeysLimit)
+	}
 	root.vars[name] = v
 	return nil
 }
@@ -188,6 +198,13 @@ func (e *jsInterruptedError) Error() string {
 
 func (e *jsInterruptedError) Value() any {
 	return e.cause
+}
+
+func (e *jsInterruptedError) Unwrap() error {
+	if err, ok := e.cause.(error); ok {
+		return err
+	}
+	return nil
 }
 
 type jsThrownError struct {
@@ -223,11 +240,22 @@ type flowResult struct {
 }
 
 type jsRuntime struct {
-	global       *jsScope
-	maxStack     int
-	stackDepth   int
-	interrupted  atomic.Bool
-	interruptVal atomic.Value
+	global          *jsScope
+	globalObj       *jsObject
+	objProto        *jsObject
+	arrProto        *jsObject
+	strProto        *jsObject
+	numProto        *jsObject
+	reProto         *jsObject
+	funcProto       *jsObject
+	builtinGlobals  map[string]jsValue
+	postInitGlobals map[string]jsValue
+	postInitConsts  map[string]bool
+	protoSnaps      map[*jsObject]map[string]jsValue
+	maxStack        int
+	stackDepth      int
+	interrupted     atomic.Bool
+	interruptVal    atomic.Value
 }
 
 func newJSRuntime() *jsRuntime {
@@ -239,18 +267,117 @@ func newJSRuntime() *jsRuntime {
 	return rt
 }
 
+// freezeBuiltinsAndSnapshot captures post-module-init global state and freezes
+// builtin prototypes/namespaces so pooled VMs cannot leak prototype or globalThis
+// mutations across invocations while preserving normal module-level globals.
+func (rt *jsRuntime) snapshotPostInit() {
+	for _, proto := range []*jsObject{rt.objProto, rt.arrProto, rt.strProto, rt.numProto, rt.reProto, rt.funcProto} {
+		if proto != nil {
+			proto.frozen = true
+		}
+	}
+	rt.protoSnaps = make(map[*jsObject]map[string]jsValue, 6)
+	for _, proto := range []*jsObject{rt.objProto, rt.arrProto, rt.strProto, rt.numProto, rt.reProto, rt.funcProto} {
+		if proto != nil {
+			cp := make(map[string]jsValue, len(proto.props))
+			for k, v := range proto.props {
+				cp[k] = v
+			}
+			rt.protoSnaps[proto] = cp
+		}
+	}
+	for name := range rt.builtinGlobals {
+		if v, ok := rt.global.vars[name]; ok {
+			if v.kind == valObject && v.obj != nil && v.obj.scope == nil {
+				v.obj.frozen = true
+			} else if v.kind == valFunc && v.fn != nil {
+				v.fn.frozenProps = true
+			}
+		}
+	}
+	rt.postInitGlobals = make(map[string]jsValue, len(rt.global.vars))
+	for k, v := range rt.global.vars {
+		rt.postInitGlobals[k] = v
+	}
+	if len(rt.global.consts) > 0 {
+		rt.postInitConsts = make(map[string]bool, len(rt.global.consts))
+		for k, v := range rt.global.consts {
+			rt.postInitConsts[k] = v
+		}
+	}
+}
+
+func (rt *jsRuntime) restorePostInit() {
+	for proto, snap := range rt.protoSnaps {
+		for k := range proto.props {
+			if _, ok := snap[k]; !ok {
+				delete(proto.props, k)
+			}
+		}
+		for k, v := range snap {
+			proto.props[k] = v
+		}
+		proto.frozen = true
+	}
+	if rt.postInitGlobals == nil {
+		return
+	}
+	// Remove any undeclared/globalThis properties added during the invocation.
+	for k := range rt.global.vars {
+		if _, existed := rt.postInitGlobals[k]; !existed {
+			delete(rt.global.vars, k)
+		}
+	}
+	// Restore any deleted globals and ensure all builtins match their post-init bindings.
+	for k, initVal := range rt.postInitGlobals {
+		if _, exists := rt.global.vars[k]; !exists {
+			rt.global.vars[k] = initVal
+			continue
+		}
+		if _, isBuiltin := rt.builtinGlobals[k]; isBuiltin {
+			rt.global.vars[k] = initVal
+		}
+	}
+	if rt.global.consts != nil {
+		for k := range rt.global.consts {
+			if !rt.postInitConsts[k] {
+				delete(rt.global.consts, k)
+			}
+		}
+	}
+	for k, isC := range rt.postInitConsts {
+		if isC {
+			if rt.global.consts == nil {
+				rt.global.consts = make(map[string]bool, len(rt.postInitConsts))
+			}
+			rt.global.consts[k] = true
+		}
+	}
+}
+
 func (rt *jsRuntime) SetMaxCallStackSize(limit int) {
 	if limit > 0 {
 		rt.maxStack = limit
 	}
 }
 
+type jsInterruptBox struct {
+	val any
+}
+
 func (rt *jsRuntime) Interrupt(v any) {
 	if v == nil {
 		v = "interrupted"
 	}
-	rt.interruptVal.Store(fmt.Sprint(v))
+	rt.interruptVal.Store(jsInterruptBox{val: v})
 	rt.interrupted.Store(true)
+}
+
+func (rt *jsRuntime) loadInterruptCause() any {
+	if box, ok := rt.interruptVal.Load().(jsInterruptBox); ok {
+		return box.val
+	}
+	return nil
 }
 
 func (rt *jsRuntime) ClearInterrupt() {
@@ -259,7 +386,7 @@ func (rt *jsRuntime) ClearInterrupt() {
 
 func (rt *jsRuntime) checkInterrupt() error {
 	if rt.interrupted.Load() {
-		return &jsInterruptedError{cause: rt.interruptVal.Load()}
+		return &jsInterruptedError{cause: rt.loadInterruptCause()}
 	}
 	return nil
 }
@@ -275,6 +402,13 @@ func (rt *jsRuntime) NewObject() *jsObject {
 }
 
 func (o *jsObject) Set(key string, v any) {
+	if o.frozen {
+		return
+	}
+	if o.scope != nil {
+		_ = o.scope.set(key, goToJSValue(v))
+		return
+	}
 	if o.props == nil {
 		o.props = make(map[string]jsValue)
 	}
@@ -285,6 +419,13 @@ func (o *jsObject) Set(key string, v any) {
 }
 
 func (o *jsObject) setVal(key string, v jsValue) {
+	if o.frozen {
+		return
+	}
+	if o.scope != nil {
+		_ = o.scope.set(key, v)
+		return
+	}
 	if o.props == nil {
 		o.props = make(map[string]jsValue)
 	}
@@ -295,7 +436,15 @@ func (o *jsObject) setVal(key string, v jsValue) {
 }
 
 func (o *jsObject) get(key string) jsValue {
-	if o == nil || o.props == nil {
+	if o == nil {
+		return jsUndefinedVal
+	}
+	if o.scope != nil {
+		if v, ok := o.scope.vars[key]; ok {
+			return v
+		}
+	}
+	if o.props == nil {
 		return jsUndefinedVal
 	}
 	if v, ok := o.props[key]; ok {
@@ -319,6 +468,11 @@ func (rt *jsRuntime) RunProgram(prog *jsProgram) (retVal jsValue, retErr error) 
 	}
 	defer func() {
 		if rec := recover(); rec != nil {
+			if thrown, ok := rec.(*jsThrownError); ok {
+				retVal = jsUndefinedVal
+				retErr = thrown
+				return
+			}
 			if limErr, ok := rec.(jsLimitError); ok && rt.stackDepth == 0 {
 				retVal = jsUndefinedVal
 				retErr = limErr
@@ -450,6 +604,11 @@ func (rt *jsRuntime) callFunc(fn *jsFunc, thisVal jsValue, args []jsValue) (retV
 	defer func() {
 		rt.stackDepth--
 		if rec := recover(); rec != nil {
+			if thrown, ok := rec.(*jsThrownError); ok {
+				retVal = jsUndefinedVal
+				retErr = thrown
+				return
+			}
 			if limErr, ok := rec.(jsLimitError); ok && outermost {
 				retVal = jsUndefinedVal
 				retErr = limErr
@@ -1011,7 +1170,9 @@ func (rt *jsRuntime) execStmt(st jsStmt, scope *jsScope, thisVal jsValue) (flowR
 		}
 		return flowResult{}, nil
 	case *stmtTry:
-		res, err := rt.execStmts(s.block, newJSScope(scope), thisVal)
+		tryScope := newJSScope(scope)
+		rt.hoistFuncs(s.block, tryScope)
+		res, err := rt.execStmts(s.block, tryScope, thisVal)
 		var inter *jsInterruptedError
 		if errors.As(err, &inter) {
 			return flowResult{}, err
@@ -1029,14 +1190,18 @@ func (rt *jsRuntime) execStmt(st jsStmt, scope *jsScope, thisVal jsValue) (flowR
 				if bErr := rt.bindPattern(s.catchPat, catchVal, catchScope, catchScope, thisVal, false); bErr != nil {
 					err = bErr
 				} else {
+					rt.hoistFuncs(s.handler, catchScope)
 					res, err = rt.execStmts(s.handler, catchScope, thisVal)
 				}
 			} else {
+				rt.hoistFuncs(s.handler, catchScope)
 				res, err = rt.execStmts(s.handler, catchScope, thisVal)
 			}
 		}
 		if len(s.finalizer) > 0 {
-			fRes, fErr := rt.execStmts(s.finalizer, newJSScope(scope), thisVal)
+			finScope := newJSScope(scope)
+			rt.hoistFuncs(s.finalizer, finScope)
+			fRes, fErr := rt.execStmts(s.finalizer, finScope, thisVal)
 			if fErr != nil {
 				return flowResult{}, fErr
 			}
@@ -1361,7 +1526,24 @@ func (rt *jsRuntime) evalExpr(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVal
 					key = kv.toString()
 				}
 				if objVal.kind == valObject && objVal.obj != nil {
-					delete(objVal.obj.props, key)
+					if objVal.obj.frozen {
+						return jsFalseVal, nil
+					}
+					if objVal.obj.scope != nil {
+						if objVal.obj.scope.consts != nil && objVal.obj.scope.consts[key] {
+							return jsFalseVal, nil
+						}
+						delete(objVal.obj.scope.vars, key)
+					} else {
+						delete(objVal.obj.props, key)
+					}
+				} else if objVal.kind == valFunc && objVal.fn != nil {
+					if objVal.fn.frozenProps {
+						return jsFalseVal, nil
+					}
+					if objVal.fn.props != nil {
+						delete(objVal.fn.props, key)
+					}
 				}
 			}
 			return jsTrueVal, nil
@@ -1573,7 +1755,26 @@ func (rt *jsRuntime) resolveLValue(target jsExpr, scope *jsScope, thisVal jsValu
 		cur := rt.getProperty(objVal, prop)
 		return cur, func(v jsValue) error {
 			if objVal.kind == valObject && objVal.obj != nil {
+				if objVal.obj.frozen {
+					return nil
+				}
+				if objVal.obj.scope != nil {
+					return objVal.obj.scope.set(prop, v)
+				}
 				objVal.obj.setVal(prop, v)
+				return nil
+			}
+			if objVal.kind == valFunc && objVal.fn != nil {
+				if objVal.fn.frozenProps {
+					return nil
+				}
+				if objVal.fn.props == nil {
+					objVal.fn.props = make(map[string]jsValue)
+				}
+				if _, exists := objVal.fn.props[prop]; !exists && len(objVal.fn.props) >= maxJSObjectKeys {
+					panic(errJSObjectKeysLimit)
+				}
+				objVal.fn.props[prop] = v
 				return nil
 			}
 			if objVal.kind == valArray && objVal.arr != nil {
@@ -1590,6 +1791,7 @@ func (rt *jsRuntime) resolveLValue(target jsExpr, scope *jsScope, thisVal jsValu
 					objVal.arr.items[idx] = v
 					return nil
 				}
+				return nil
 			}
 			return errors.New("Cannot set property " + prop)
 		}, nil
@@ -1663,7 +1865,12 @@ func (rt *jsRuntime) evalBinaryOp(op jsTokKind, l, r jsValue) (jsValue, error) {
 		return jsValue{kind: valNumber, num: float64(uint32(l.toNumber()) >> (uint32(r.toNumber()) & 31))}, nil
 	case tokIn:
 		if r.kind == valObject && r.obj != nil {
-			_, ok := r.obj.props[l.toString()]
+			k := l.toString()
+			if r.obj.scope != nil {
+				_, ok := r.obj.scope.vars[k]
+				return boolVal(ok), nil
+			}
+			_, ok := r.obj.props[k]
 			return boolVal(ok), nil
 		}
 		if r.kind == valArray && r.arr != nil {
@@ -1996,7 +2203,14 @@ func (rt *jsRuntime) compileRegExp(pattern, flags string) (jsValue, error) {
 func hasOwnPropValue(target jsValue, prop string) bool {
 	switch target.kind {
 	case valObject:
-		if target.obj == nil || target.obj.props == nil {
+		if target.obj == nil {
+			return false
+		}
+		if target.obj.scope != nil {
+			_, ok := target.obj.scope.vars[prop]
+			return ok
+		}
+		if target.obj.props == nil {
 			return false
 		}
 		_, ok := target.obj.props[prop]
@@ -2045,7 +2259,14 @@ func newHasOwnPropertyFn() jsValue {
 }
 
 func sortedObjectKeys(o *jsObject) []string {
-	if o == nil || len(o.props) == 0 {
+	if o == nil {
+		return nil
+	}
+	src := o.props
+	if o.scope != nil {
+		src = o.scope.vars
+	}
+	if len(src) == 0 {
 		return nil
 	}
 	type idxEntry struct {
@@ -2054,7 +2275,7 @@ func sortedObjectKeys(o *jsObject) []string {
 	}
 	var indices []idxEntry
 	var others []string
-	for k := range o.props {
+	for k := range src {
 		if n, err := strconv.Atoi(k); err == nil && n >= 0 && strconv.Itoa(n) == k {
 			indices = append(indices, idxEntry{idx: n, key: k})
 		} else {
@@ -2071,11 +2292,31 @@ func sortedObjectKeys(o *jsObject) []string {
 	return out
 }
 
+func (rt *jsRuntime) getProtoProp(proto *jsObject, prop string) (jsValue, bool) {
+	if proto != nil && proto.props != nil {
+		if v, ok := proto.props[prop]; ok {
+			return v, true
+		}
+	}
+	if rt != nil && rt.objProto != nil && proto != rt.objProto && rt.objProto.props != nil {
+		if v, ok := rt.objProto.props[prop]; ok {
+			return v, true
+		}
+	}
+	return jsUndefinedVal, false
+}
+
 func (rt *jsRuntime) getProperty(target jsValue, prop string) jsValue {
 	if prop == "__proto__" || prop == "constructor" {
-		if target.kind == valObject && target.obj != nil && target.obj.props != nil {
-			if v, ok := target.obj.props[prop]; ok {
-				return v
+		if target.kind == valObject && target.obj != nil {
+			if target.obj.scope != nil {
+				if v, ok := target.obj.scope.vars[prop]; ok {
+					return v
+				}
+			} else if target.obj.props != nil {
+				if v, ok := target.obj.props[prop]; ok {
+					return v
+				}
 			}
 		}
 		return jsUndefinedVal
@@ -2083,6 +2324,11 @@ func (rt *jsRuntime) getProperty(target jsValue, prop string) jsValue {
 	switch target.kind {
 	case valObject:
 		if target.obj != nil {
+			if target.obj.scope != nil {
+				if v, ok := target.obj.scope.vars[prop]; ok {
+					return v
+				}
+			}
 			if target.obj.props != nil {
 				if v, ok := target.obj.props[prop]; ok {
 					return v
@@ -2096,23 +2342,51 @@ func (rt *jsRuntime) getProperty(target jsValue, prop string) jsValue {
 			if prop == "hasOwnProperty" {
 				return newHasOwnPropertyFn()
 			}
+			if v, ok := rt.getProtoProp(rt.objProto, prop); ok {
+				return v
+			}
 			return jsUndefinedVal
 		}
 	case valNumber:
-		return numberProperty(target.num, prop)
+		if v := numberProperty(target.num, prop); v.kind != valUndefined {
+			return v
+		}
+		if v, ok := rt.getProtoProp(rt.numProto, prop); ok {
+			return v
+		}
 	case valFunc:
 		if target.fn != nil {
-			return funcProperty(target.fn, prop)
+			if v := funcProperty(target.fn, prop); v.kind != valUndefined {
+				return v
+			}
+			if v, ok := rt.getProtoProp(rt.funcProto, prop); ok {
+				return v
+			}
 		}
 	case valString:
-		return stringProperty(target.str, prop)
+		if v := stringProperty(target.str, prop); v.kind != valUndefined {
+			return v
+		}
+		if v, ok := rt.getProtoProp(rt.strProto, prop); ok {
+			return v
+		}
 	case valArray:
 		if target.arr != nil {
-			return arrayProperty(target.arr, prop)
+			if v := arrayProperty(target.arr, prop); v.kind != valUndefined {
+				return v
+			}
+			if v, ok := rt.getProtoProp(rt.arrProto, prop); ok {
+				return v
+			}
 		}
 	case valRegExp:
 		if target.re != nil {
-			return regexpProperty(target.re, prop)
+			if v := regexpProperty(target.re, prop); v.kind != valUndefined {
+				return v
+			}
+			if v, ok := rt.getProtoProp(rt.reProto, prop); ok {
+				return v
+			}
 		}
 	}
 	return jsUndefinedVal
@@ -2542,16 +2816,46 @@ func stringProperty(s string, prop string) jsValue {
 		})
 	case "split":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			hasLimit := false
+			limit := maxJSArrayLen + 1
+			if len(args) >= 2 && args[1].kind != valUndefined {
+				hasLimit = true
+				lf := args[1].toNumber()
+				if math.IsNaN(lf) || lf == 0 {
+					return jsValue{kind: valArray, arr: &jsArray{items: []jsValue{}}}, nil
+				}
+				u := uint32(int64(math.Trunc(lf)))
+				if u == 0 {
+					return jsValue{kind: valArray, arr: &jsArray{items: []jsValue{}}}, nil
+				}
+				if int(u) <= maxJSArrayLen {
+					limit = int(u)
+				}
+			}
 			var parts []string
 			if len(args) == 0 || args[0].kind == valUndefined {
 				parts = []string{s}
 			} else if args[0].kind == valRegExp && args[0].re != nil {
-				parts = args[0].re.re.Split(s, maxJSArrayLen+2)
+				fetchMax := maxJSArrayLen + 2
+				if hasLimit && limit <= maxJSArrayLen {
+					fetchMax = limit + 1
+				}
+				parts = args[0].re.re.Split(s, fetchMax)
+				if hasLimit && len(parts) > limit {
+					parts = parts[:limit]
+				}
 			} else {
-				parts = strings.SplitN(s, args[0].toString(), maxJSArrayLen+2)
+				fetchMax := maxJSArrayLen + 2
+				if hasLimit && limit <= maxJSArrayLen {
+					fetchMax = limit + 1
+				}
+				parts = strings.SplitN(s, args[0].toString(), fetchMax)
+				if hasLimit && len(parts) > limit {
+					parts = parts[:limit]
+				}
 			}
 			if len(parts) > maxJSArrayLen {
-				return rt.throwValErr("RangeError", "Invalid array length")
+				return rt.throwValErr("RangeError", "Maximum split match count exceeded")
 			}
 			items := make([]jsValue, len(parts))
 			for i, p := range parts {
@@ -2563,6 +2867,9 @@ func stringProperty(s string, prop string) jsValue {
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 			if len(args) < 2 {
 				return jsValue{kind: valString, str: s}, nil
+			}
+			if prop == "replaceAll" && args[0].kind == valRegExp && args[0].re != nil && !args[0].re.global {
+				return rt.throwValErr("TypeError", "String.prototype.replaceAll called with a non-global RegExp argument")
 			}
 			if args[1].kind == valFunc && args[1].fn != nil {
 				cb := args[1].fn
@@ -2605,10 +2912,17 @@ func stringProperty(s string, prop string) jsValue {
 			}
 			if prop == "replaceAll" {
 				if pat == "" {
-					if int64(len(s))+(int64(utf8.RuneCountInString(s))+1)*int64(len(repl)) > maxJSStringBytes {
+					rc := utf8.RuneCountInString(s)
+					if rc+1 > maxJSArrayLen {
+						return rt.throwValErr("RangeError", "Maximum match count exceeded")
+					}
+					if int64(len(s))+(int64(rc)+1)*int64(len(repl)) > maxJSStringBytes {
 						return rt.throwStrLenErr()
 					}
 				} else if cnt := strings.Count(s, pat); cnt > 0 {
+					if cnt > maxJSArrayLen {
+						return rt.throwValErr("RangeError", "Maximum match count exceeded")
+					}
 					if int64(len(s))+int64(cnt)*(int64(len(repl))-int64(len(pat))) > maxJSStringBytes {
 						return rt.throwStrLenErr()
 					}
@@ -2626,10 +2940,22 @@ func stringProperty(s string, prop string) jsValue {
 		})
 	case "match":
 		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			if len(args) == 0 || args[0].kind != valRegExp || args[0].re == nil {
-				return jsNullVal, nil
+			var rx *jsRegExp
+			if len(args) == 0 || args[0].kind == valUndefined {
+				rv, err := rt.compileRegExp("", "")
+				if err != nil {
+					return jsUndefinedVal, err
+				}
+				rx = rv.re
+			} else if args[0].kind == valRegExp && args[0].re != nil {
+				rx = args[0].re
+			} else {
+				rv, err := rt.compileRegExp(args[0].toString(), "")
+				if err != nil {
+					return jsUndefinedVal, err
+				}
+				rx = rv.re
 			}
-			rx := args[0].re
 			var sub []string
 			if rx.global {
 				sub = rx.re.FindAllString(s, maxJSArrayLen+1)
@@ -2640,11 +2966,54 @@ func stringProperty(s string, prop string) jsValue {
 				return jsNullVal, nil
 			}
 			if len(sub) > maxJSArrayLen {
-				return rt.throwValErr("RangeError", "Invalid array length")
+				return rt.throwValErr("RangeError", "Maximum regex match count exceeded")
 			}
 			items := make([]jsValue, len(sub))
 			for i, m := range sub {
 				items[i] = jsValue{kind: valString, str: m}
+			}
+			return jsValue{kind: valArray, arr: &jsArray{items: items}}, nil
+		})
+	case "matchAll":
+		return nativeVal(func(rt *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			var rx *jsRegExp
+			if len(args) == 0 || args[0].kind == valUndefined {
+				rv, err := rt.compileRegExp("", "g")
+				if err != nil {
+					return jsUndefinedVal, err
+				}
+				rx = rv.re
+			} else if args[0].kind == valRegExp && args[0].re != nil {
+				if !args[0].re.global {
+					return rt.throwValErr("TypeError", "String.prototype.matchAll called with a non-global RegExp argument")
+				}
+				rx = args[0].re
+			} else {
+				rv, err := rt.compileRegExp(args[0].toString(), "g")
+				if err != nil {
+					return jsUndefinedVal, err
+				}
+				rx = rv.re
+			}
+			locs := rx.re.FindAllStringSubmatchIndex(s, maxJSArrayLen+1)
+			if len(locs) > maxJSArrayLen {
+				return rt.throwValErr("RangeError", "Maximum regex match count exceeded")
+			}
+			items := make([]jsValue, len(locs))
+			for i, loc := range locs {
+				if err := rt.checkInterrupt(); err != nil {
+					return jsUndefinedVal, err
+				}
+				numGroups := len(loc) / 2
+				mItems := make([]jsValue, numGroups)
+				for g := 0; g < numGroups; g++ {
+					if loc[2*g] >= 0 {
+						mItems[g] = jsValue{kind: valString, str: s[loc[2*g]:loc[2*g+1]]}
+					} else {
+						mItems[g] = jsUndefinedVal
+					}
+				}
+				items[i] = jsValue{kind: valArray, arr: &jsArray{items: mItems}}
 			}
 			return jsValue{kind: valArray, arr: &jsArray{items: items}}, nil
 		})
@@ -2661,11 +3030,14 @@ func stringProperty(s string, prop string) jsValue {
 func replaceRegexpCallbackBounded(rt *jsRuntime, s string, rx *jsRegExp, cb *jsFunc, all bool) (string, error) {
 	limit := 1
 	if all {
-		limit = -1
+		limit = maxJSArrayLen + 1
 	}
 	matches := rx.re.FindAllStringSubmatchIndex(s, limit)
 	if len(matches) == 0 {
 		return s, nil
+	}
+	if len(matches) > maxJSArrayLen {
+		return "", rt.throwErr("RangeError", "Maximum regex match count exceeded")
 	}
 	subNames := rx.re.SubexpNames()
 	hasNamed := false
@@ -2756,6 +3128,9 @@ func replaceStringCallbackBounded(rt *jsRuntime, s string, pat string, cb *jsFun
 	var b strings.Builder
 	if pat == "" {
 		runes := []rune(s)
+		if len(runes)+1 > maxJSArrayLen {
+			return "", rt.throwErr("RangeError", "Maximum match count exceeded")
+		}
 		for i := 0; i <= len(runes); i++ {
 			if err := rt.checkInterrupt(); err != nil {
 				return "", err
@@ -2779,6 +3154,7 @@ func replaceStringCallbackBounded(rt *jsRuntime, s string, pat string, cb *jsFun
 
 	searchPos := 0
 	runeOffset := 0
+	matchCount := 0
 	patRuneLen := utf8.RuneCountInString(pat)
 	for searchPos <= len(s) {
 		if err := rt.checkInterrupt(); err != nil {
@@ -2790,6 +3166,10 @@ func replaceStringCallbackBounded(rt *jsRuntime, s string, pat string, cb *jsFun
 				return "", rt.throwErr("RangeError", "Invalid string length")
 			}
 			break
+		}
+		matchCount++
+		if matchCount > maxJSArrayLen {
+			return "", rt.throwErr("RangeError", "Maximum match count exceeded")
 		}
 		mStart := searchPos + rel
 		if !appendBoundedString(&b, s[searchPos:mStart]) {
@@ -3509,6 +3889,16 @@ func decodeURIComponentRFC3986(s string) (string, bool) {
 }
 
 func (rt *jsRuntime) installBuiltins() {
+	rt.objProto = rt.NewObject()
+	rt.objProto.setVal("hasOwnProperty", newHasOwnPropertyFn())
+	rt.arrProto = rt.NewObject()
+	rt.strProto = rt.NewObject()
+	rt.numProto = rt.NewObject()
+	rt.reProto = rt.NewObject()
+	rt.funcProto = rt.NewObject()
+	rt.globalObj = &jsObject{scope: rt.global, props: make(map[string]jsValue)}
+	rt.global.define("globalThis", jsValue{kind: valObject, obj: rt.globalObj}, false)
+
 	rt.global.define("NaN", jsValue{kind: valNumber, num: math.NaN()}, true)
 	rt.global.define("Infinity", jsValue{kind: valNumber, num: math.Inf(1)}, true)
 
@@ -3525,6 +3915,7 @@ func (rt *jsRuntime) installBuiltins() {
 			return jsValue{kind: valString, str: s}, nil
 		},
 		props: map[string]jsValue{
+			"prototype": {kind: valObject, obj: rt.strProto},
 			"fromCharCode": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				if len(args) == 0 {
 					return jsValue{kind: valString, str: ""}, nil
@@ -3565,6 +3956,7 @@ func (rt *jsRuntime) installBuiltins() {
 			return jsValue{kind: valNumber, num: args[0].toNumber()}, nil
 		},
 		props: map[string]jsValue{
+			"prototype":         {kind: valObject, obj: rt.numProto},
 			"NaN":               {kind: valNumber, num: math.NaN()},
 			"POSITIVE_INFINITY": {kind: valNumber, num: math.Inf(1)},
 			"NEGATIVE_INFINITY": {kind: valNumber, num: math.Inf(-1)},
@@ -3658,21 +4050,28 @@ func (rt *jsRuntime) installBuiltins() {
 		}), false)
 	}
 
-	rt.global.define("RegExp", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		pat, flags := "", ""
-		if len(args) >= 1 && args[0].kind != valUndefined {
-			if args[0].kind == valRegExp && args[0].re != nil {
-				pat = args[0].re.pattern
-				flags = args[0].re.flags
-			} else {
-				pat = args[0].toString()
+	reCtor := &jsFunc{
+		name: "RegExp",
+		native: func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			pat, flags := "", ""
+			if len(args) >= 1 && args[0].kind != valUndefined {
+				if args[0].kind == valRegExp && args[0].re != nil {
+					pat = args[0].re.pattern
+					flags = args[0].re.flags
+				} else {
+					pat = args[0].toString()
+				}
 			}
-		}
-		if len(args) >= 2 && args[1].kind != valUndefined {
-			flags = args[1].toString()
-		}
-		return r.compileRegExp(pat, flags)
-	}), false)
+			if len(args) >= 2 && args[1].kind != valUndefined {
+				flags = args[1].toString()
+			}
+			return r.compileRegExp(pat, flags)
+		},
+		props: map[string]jsValue{
+			"prototype": {kind: valObject, obj: rt.reProto},
+		},
+	}
+	rt.global.define("RegExp", jsValue{kind: valFunc, fn: reCtor}, false)
 
 	// JSON
 	jsonObj := rt.NewObject()
@@ -3683,7 +4082,7 @@ func (rt *jsRuntime) installBuiltins() {
 		out, errKind, errMsg := stringifyJSValueBounded(r, args[0])
 		if errKind != "" {
 			if errKind == "interrupt" {
-				return jsUndefinedVal, &jsInterruptedError{cause: r.interrupted.Load()}
+				return jsUndefinedVal, &jsInterruptedError{cause: r.loadInterruptCause()}
 			}
 			return r.throwValErr(errKind, errMsg)
 		}
@@ -3693,11 +4092,11 @@ func (rt *jsRuntime) installBuiltins() {
 		if len(args) == 0 {
 			return r.throwValErr("SyntaxError", "Unexpected end of JSON input")
 		}
-		var raw any
-		if err := json.Unmarshal([]byte(args[0].toString()), &raw); err != nil {
-			return r.throwValErr("SyntaxError", err.Error())
+		raw, ok := args[0].toStringChecked()
+		if !ok {
+			return r.throwStrLenErr()
 		}
-		return r.ToValue(raw), nil
+		return parseJSONBounded(r, raw)
 	}))
 	rt.global.define("JSON", jsValue{kind: valObject, obj: jsonObj}, false)
 
@@ -3785,6 +4184,7 @@ func (rt *jsRuntime) installBuiltins() {
 			return jsValue{kind: valArray, arr: &jsArray{items: items}}, nil
 		},
 		props: map[string]jsValue{
+			"prototype": {kind: valObject, obj: rt.arrProto},
 			"isArray": nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				return boolVal(len(args) > 0 && args[0].kind == valArray), nil
 			}),
@@ -3873,9 +4273,6 @@ func (rt *jsRuntime) installBuiltins() {
 	rt.global.define("Array", jsValue{kind: valFunc, fn: arrCtor}, false)
 
 	// Object & Object.prototype
-	objProto := rt.NewObject()
-	objProto.setVal("hasOwnProperty", newHasOwnPropertyFn())
-
 	objectIterFn := func(mode uint8) jsValue {
 		// mode: 0=keys, 1=values, 2=entries
 		return nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
@@ -3899,9 +4296,9 @@ func (rt *jsRuntime) installBuiltins() {
 						case 0:
 							out[i] = jsValue{kind: valString, str: k}
 						case 1:
-							out[i] = args[0].obj.props[k]
+							out[i] = args[0].obj.get(k)
 						default:
-							out[i] = makePair(k, args[0].obj.props[k])
+							out[i] = makePair(k, args[0].obj.get(k))
 						}
 					}
 				}
@@ -3968,10 +4365,42 @@ func (rt *jsRuntime) installBuiltins() {
 			}
 		},
 		props: map[string]jsValue{
-			"prototype": {kind: valObject, obj: objProto},
+			"prototype": {kind: valObject, obj: rt.objProto},
 			"keys":      objectIterFn(0),
 			"values":    objectIterFn(1),
 			"entries":   objectIterFn(2),
+			"freeze": nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+				if len(args) == 0 {
+					return jsUndefinedVal, nil
+				}
+				if args[0].kind == valObject && args[0].obj != nil && args[0].obj.scope == nil {
+					args[0].obj.frozen = true
+				} else if args[0].kind == valFunc && args[0].fn != nil {
+					args[0].fn.frozenProps = true
+				}
+				return args[0], nil
+			}),
+			"isFrozen": nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+				if len(args) == 0 {
+					return jsTrueVal, nil
+				}
+				switch args[0].kind {
+				case valObject:
+					if args[0].obj == nil {
+						return jsTrueVal, nil
+					}
+					return boolVal(args[0].obj.frozen), nil
+				case valFunc:
+					if args[0].fn == nil {
+						return jsTrueVal, nil
+					}
+					return boolVal(args[0].fn.frozenProps), nil
+				case valArray, valRegExp:
+					return jsFalseVal, nil
+				default:
+					return jsTrueVal, nil
+				}
+			}),
 			"fromEntries": nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
 				if len(args) == 0 || args[0].kind == valUndefined || args[0].kind == valNull {
 					return nullObjErr(r)
@@ -4010,10 +4439,13 @@ func (rt *jsRuntime) installBuiltins() {
 				}
 				dst := args[0]
 				if dst.kind == valObject && dst.obj != nil {
+					if dst.obj.frozen {
+						return r.throwValErr("TypeError", "Cannot assign to read only property of frozen object")
+					}
 					for _, src := range args[1:] {
 						if src.kind == valObject && src.obj != nil {
 							for _, k := range sortedObjectKeys(src.obj) {
-								dst.obj.setVal(k, src.obj.props[k])
+								dst.obj.setVal(k, src.obj.get(k))
 							}
 						}
 					}
@@ -4024,26 +4456,42 @@ func (rt *jsRuntime) installBuiltins() {
 	}
 	rt.global.define("Object", jsValue{kind: valFunc, fn: objCtor}, false)
 
-	// Web-standard Base64 helpers (btoa / atob)
+	// Web-standard Base64 helpers (btoa / atob): Latin-1 U+0000..U+00FF <-> raw 0x00..0xFF
 	rt.global.define("btoa", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		var s string
-		if len(args) > 0 {
-			s = args[0].toString()
+		if len(args) == 0 {
+			return r.throwValErr("TypeError", "btoa requires at least 1 argument")
+		}
+		s, ok := args[0].toStringChecked()
+		if !ok {
+			return r.throwStrLenErr()
 		}
 		buf := make([]byte, 0, len(s))
-		for _, rn := range s {
-			if rn > 255 {
+		for i := 0; i < len(s); {
+			rn, wid := utf8.DecodeRuneInString(s[i:])
+			if rn == utf8.RuneError && wid == 1 {
+				buf = append(buf, s[i])
+				i++
+				continue
+			}
+			if rn < 0 || rn > 0xFF {
 				return r.throwValErr("InvalidCharacterError", "btoa input contains characters outside Latin1 range")
 			}
 			buf = append(buf, byte(rn))
+			i += wid
+		}
+		if base64.StdEncoding.EncodedLen(len(buf)) > maxJSStringBytes {
+			return r.throwStrLenErr()
 		}
 		return jsValue{kind: valString, str: base64.StdEncoding.EncodeToString(buf)}, nil
 	}), false)
 
 	rt.global.define("atob", nativeVal(func(r *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		var s string
-		if len(args) > 0 {
-			s = args[0].toString()
+		if len(args) == 0 {
+			return r.throwValErr("TypeError", "atob requires at least 1 argument")
+		}
+		s, ok := args[0].toStringChecked()
+		if !ok {
+			return r.throwStrLenErr()
 		}
 		var clean strings.Builder
 		clean.Grow(len(s))
@@ -4055,18 +4503,37 @@ func (rt *jsRuntime) installBuiltins() {
 			}
 		}
 		encoded := clean.String()
-		decoded, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(encoded, "="))
-			if err != nil {
-				return r.throwValErr("InvalidCharacterError", "atob input is not valid base64")
+		if len(encoded)%4 == 0 {
+			if strings.HasSuffix(encoded, "==") {
+				encoded = encoded[:len(encoded)-2]
+			} else if strings.HasSuffix(encoded, "=") {
+				encoded = encoded[:len(encoded)-1]
 			}
 		}
-		runes := make([]rune, len(decoded))
-		for i, b := range decoded {
-			runes[i] = rune(b)
+		if len(encoded)%4 == 1 || strings.IndexByte(encoded, '=') >= 0 {
+			return r.throwValErr("InvalidCharacterError", "atob input is not valid base64")
 		}
-		return jsValue{kind: valString, str: string(runes)}, nil
+		decoded, err := base64.RawStdEncoding.DecodeString(encoded)
+		if err != nil {
+			return r.throwValErr("InvalidCharacterError", "atob input is not valid base64")
+		}
+		utf8Len := 0
+		for _, b := range decoded {
+			if b < 0x80 {
+				utf8Len++
+			} else {
+				utf8Len += 2
+			}
+		}
+		if utf8Len > maxJSStringBytes {
+			return r.throwStrLenErr()
+		}
+		var out strings.Builder
+		out.Grow(utf8Len)
+		for _, b := range decoded {
+			out.WriteRune(rune(b))
+		}
+		return jsValue{kind: valString, str: out.String()}, nil
 	}), false)
 
 	// Constructible Date (`new Date()`, `new Date(ms)`, `new Date(isoStr)`, `Date()`, `Date.now()`, `Date.parse()`)
@@ -4091,6 +4558,128 @@ func (rt *jsRuntime) installBuiltins() {
 		},
 	}
 	rt.global.define("Date", jsValue{kind: valFunc, fn: dateCtor}, false)
+
+	rt.builtinGlobals = make(map[string]jsValue, len(rt.global.vars)+4)
+	for k, v := range rt.global.vars {
+		rt.builtinGlobals[k] = v
+	}
+}
+
+func parseJSONBounded(r *jsRuntime, raw string) (jsValue, error) {
+	b := []byte(raw)
+	if !json.Valid(b) {
+		return r.throwValErr("SyntaxError", "Unexpected token in JSON")
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+
+	nodes := 0
+	var readVal func(depth int) (jsValue, error)
+	readVal = func(depth int) (jsValue, error) {
+		if r != nil {
+			if err := r.checkInterrupt(); err != nil {
+				return jsUndefinedVal, err
+			}
+		}
+		nodes++
+		if nodes > maxJSONParseNodes {
+			return r.throwValErr("RangeError", "Maximum JSON node budget exceeded")
+		}
+		tok, err := dec.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return r.throwValErr("SyntaxError", "Unexpected end of JSON input")
+			}
+			return r.throwValErr("SyntaxError", err.Error())
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			if depth >= maxJSONParseDepth {
+				return r.throwValErr("RangeError", "Maximum JSON nesting depth exceeded")
+			}
+			switch t {
+			case '{':
+				obj := &jsObject{props: make(map[string]jsValue)}
+				for dec.More() {
+					if r != nil {
+						if err := r.checkInterrupt(); err != nil {
+							return jsUndefinedVal, err
+						}
+					}
+					kt, kErr := dec.Token()
+					if kErr != nil {
+						return r.throwValErr("SyntaxError", kErr.Error())
+					}
+					keyStr, ok := kt.(string)
+					if !ok {
+						return r.throwValErr("SyntaxError", "Expected JSON object property name")
+					}
+					if len(keyStr) > maxJSStringBytes {
+						return r.throwStrLenErr()
+					}
+					if _, exists := obj.props[keyStr]; !exists && len(obj.props) >= maxJSObjectKeys {
+						return r.throwValErr("RangeError", "Maximum JSON object keys exceeded")
+					}
+					val, vErr := readVal(depth + 1)
+					if vErr != nil {
+						return jsUndefinedVal, vErr
+					}
+					obj.props[keyStr] = val
+				}
+				if _, cErr := dec.Token(); cErr != nil {
+					return r.throwValErr("SyntaxError", cErr.Error())
+				}
+				return jsValue{kind: valObject, obj: obj}, nil
+			case '[':
+				var items []jsValue
+				for dec.More() {
+					if len(items) >= maxJSArrayLen {
+						return r.throwValErr("RangeError", "Maximum JSON array length exceeded")
+					}
+					elem, eErr := readVal(depth + 1)
+					if eErr != nil {
+						return jsUndefinedVal, eErr
+					}
+					items = append(items, elem)
+				}
+				if _, cErr := dec.Token(); cErr != nil {
+					return r.throwValErr("SyntaxError", cErr.Error())
+				}
+				if items == nil {
+					items = []jsValue{}
+				}
+				return jsValue{kind: valArray, arr: &jsArray{items: items}}, nil
+			default:
+				return r.throwValErr("SyntaxError", "Unexpected JSON delimiter")
+			}
+		case nil:
+			return jsNullVal, nil
+		case bool:
+			return boolVal(t), nil
+		case json.Number:
+			f, pErr := strconv.ParseFloat(string(t), 64)
+			if pErr != nil && !errors.Is(pErr, strconv.ErrRange) {
+				return r.throwValErr("SyntaxError", pErr.Error())
+			}
+			return jsValue{kind: valNumber, num: f}, nil
+		case string:
+			if len(t) > maxJSStringBytes {
+				return r.throwStrLenErr()
+			}
+			return jsValue{kind: valString, str: t}, nil
+		default:
+			return r.throwValErr("SyntaxError", "Unexpected JSON token")
+		}
+	}
+
+	val, err := readVal(0)
+	if err != nil {
+		return jsUndefinedVal, err
+	}
+	if _, extraErr := dec.Token(); !errors.Is(extraErr, io.EOF) {
+		return r.throwValErr("SyntaxError", "Unexpected trailing token in JSON")
+	}
+	return val, nil
 }
 
 func parseJSDateArgs(args []jsValue) float64 {
@@ -4241,11 +4830,36 @@ func newJSDateVal(_ *jsRuntime, epochMs float64) jsValue {
 
 // --- Go <-> JS Marshaling (`json` struct tag aware) ---
 
+func newStandaloneErrorVal(name, msg string) jsValue {
+	o := &jsObject{
+		isError: true,
+		props: map[string]jsValue{
+			"name":    {kind: valString, str: name},
+			"message": {kind: valString, str: msg},
+		},
+	}
+	return jsValue{kind: valObject, obj: o}
+}
+
+func throwConversionRangeError(msg string) {
+	panic(&jsThrownError{val: newStandaloneErrorVal("RangeError", msg)})
+}
+
 func (rt *jsRuntime) ToValue(v any) jsValue {
-	return goToJSValue(v)
+	nodes := 0
+	return goToJSValueBounded(v, 0, &nodes)
 }
 
 func goToJSValue(v any) jsValue {
+	nodes := 0
+	return goToJSValueBounded(v, 0, &nodes)
+}
+
+func goToJSValueBounded(v any, depth int, nodes *int) jsValue {
+	*nodes++
+	if *nodes > maxJSONParseNodes {
+		throwConversionRangeError("Maximum converted JS node budget exceeded")
+	}
 	if v == nil {
 		return jsNullVal
 	}
@@ -4269,22 +4883,60 @@ func goToJSValue(v any) jsValue {
 		return jsValue{kind: valNumber, num: x}
 	case string:
 		return jsValue{kind: valString, str: x}
+	case []any:
+		if depth >= maxJSONParseDepth {
+			throwConversionRangeError("Maximum converted JS nesting depth exceeded")
+		}
+		if len(x) > maxJSArrayLen {
+			throwConversionRangeError("Maximum converted JS array length exceeded")
+		}
+		items := make([]jsValue, len(x))
+		for i, elem := range x {
+			items[i] = goToJSValueBounded(elem, depth+1, nodes)
+		}
+		return jsValue{kind: valArray, arr: &jsArray{items: items}}
+	case []string:
+		if depth >= maxJSONParseDepth {
+			throwConversionRangeError("Maximum converted JS nesting depth exceeded")
+		}
+		if len(x) > maxJSArrayLen {
+			throwConversionRangeError("Maximum converted JS array length exceeded")
+		}
+		*nodes += len(x)
+		if *nodes > maxJSONParseNodes {
+			throwConversionRangeError("Maximum converted JS node budget exceeded")
+		}
+		items := make([]jsValue, len(x))
+		for i, s := range x {
+			items[i] = jsValue{kind: valString, str: s}
+		}
+		return jsValue{kind: valArray, arr: &jsArray{items: items}}
 	case map[string]any:
+		if depth >= maxJSONParseDepth {
+			throwConversionRangeError("Maximum converted JS nesting depth exceeded")
+		}
 		if len(x) > maxJSObjectKeys {
-			panic(errJSObjectKeysLimit)
+			throwConversionRangeError("Maximum converted JS object keys exceeded")
 		}
 		o := &jsObject{props: make(map[string]jsValue, len(x))}
 		for k, val := range x {
-			o.setVal(k, goToJSValue(val))
+			o.props[k] = goToJSValueBounded(val, depth+1, nodes)
 		}
 		return jsValue{kind: valObject, obj: o}
 	case map[string]string:
+		if depth >= maxJSONParseDepth {
+			throwConversionRangeError("Maximum converted JS nesting depth exceeded")
+		}
 		if len(x) > maxJSObjectKeys {
-			panic(errJSObjectKeysLimit)
+			throwConversionRangeError("Maximum converted JS object keys exceeded")
+		}
+		*nodes += len(x)
+		if *nodes > maxJSONParseNodes {
+			throwConversionRangeError("Maximum converted JS node budget exceeded")
 		}
 		o := &jsObject{props: make(map[string]jsValue, len(x))}
 		for k, val := range x {
-			o.setVal(k, jsValue{kind: valString, str: val})
+			o.props[k] = jsValue{kind: valString, str: val}
 		}
 		return jsValue{kind: valObject, obj: o}
 	}
@@ -4299,6 +4951,9 @@ func goToJSValue(v any) jsValue {
 
 	switch rv.Kind() {
 	case reflect.Struct:
+		if depth >= maxJSONParseDepth {
+			throwConversionRangeError("Maximum converted JS nesting depth exceeded")
+		}
 		o := &jsObject{props: make(map[string]jsValue, rv.NumField())}
 		rtStruct := rv.Type()
 		for i := 0; i < rv.NumField(); i++ {
@@ -4316,23 +4971,40 @@ func goToJSValue(v any) jsValue {
 					key = namePart
 				}
 			}
-			o.setVal(key, goToJSValue(rv.Field(i).Interface()))
+			if _, exists := o.props[key]; !exists && len(o.props) >= maxJSObjectKeys {
+				throwConversionRangeError("Maximum converted JS object keys exceeded")
+			}
+			o.props[key] = goToJSValueBounded(rv.Field(i).Interface(), depth+1, nodes)
 		}
 		return jsValue{kind: valObject, obj: o}
 	case reflect.Slice, reflect.Array:
-		items := make([]jsValue, rv.Len())
-		for i := 0; i < rv.Len(); i++ {
-			items[i] = goToJSValue(rv.Index(i).Interface())
+		if depth >= maxJSONParseDepth {
+			throwConversionRangeError("Maximum converted JS nesting depth exceeded")
+		}
+		n := rv.Len()
+		if n > maxJSArrayLen {
+			throwConversionRangeError("Maximum converted JS array length exceeded")
+		}
+		items := make([]jsValue, n)
+		for i := 0; i < n; i++ {
+			items[i] = goToJSValueBounded(rv.Index(i).Interface(), depth+1, nodes)
 		}
 		return jsValue{kind: valArray, arr: &jsArray{items: items}}
 	case reflect.Map:
+		if depth >= maxJSONParseDepth {
+			throwConversionRangeError("Maximum converted JS nesting depth exceeded")
+		}
 		if rv.Len() > maxJSObjectKeys {
-			panic(errJSObjectKeysLimit)
+			throwConversionRangeError("Maximum converted JS object keys exceeded")
 		}
 		o := &jsObject{props: make(map[string]jsValue, rv.Len())}
 		iter := rv.MapRange()
 		for iter.Next() {
-			o.setVal(fmt.Sprint(iter.Key().Interface()), goToJSValue(iter.Value().Interface()))
+			k := fmt.Sprint(iter.Key().Interface())
+			if _, exists := o.props[k]; !exists && len(o.props) >= maxJSObjectKeys {
+				throwConversionRangeError("Maximum converted JS object keys exceeded")
+			}
+			o.props[k] = goToJSValueBounded(iter.Value().Interface(), depth+1, nodes)
 		}
 		return jsValue{kind: valObject, obj: o}
 	case reflect.Func:
@@ -4461,12 +5133,15 @@ func replaceRegexpBounded(rt *jsRuntime, s string, rx *jsRegExp, repl string, gl
 	if hasAnchorOrWordBoundary {
 		var matches [][]int
 		if hasDollar {
-			matches = rx.re.FindAllStringSubmatchIndex(s, -1)
+			matches = rx.re.FindAllStringSubmatchIndex(s, maxJSArrayLen+1)
 		} else {
-			matches = rx.re.FindAllStringIndex(s, -1)
+			matches = rx.re.FindAllStringIndex(s, maxJSArrayLen+1)
 		}
 		if len(matches) == 0 {
 			return s, true, nil
+		}
+		if len(matches) > maxJSArrayLen {
+			return "", false, rt.throwErr("RangeError", "Maximum regex match count exceeded")
 		}
 		lastEnd := 0
 		for _, loc := range matches {
@@ -4496,6 +5171,7 @@ func replaceRegexpBounded(rt *jsRuntime, s string, rx *jsRegExp, repl string, gl
 	lastAppend := 0
 	searchPos := 0
 	prevNonEmptyEnd := -1
+	emptyMatchCount := 0
 	for searchPos <= len(s) {
 		if err := rt.checkInterrupt(); err != nil {
 			return "", false, err
@@ -4522,6 +5198,12 @@ func replaceRegexpBounded(rt *jsRuntime, s string, rx *jsRegExp, repl string, gl
 			_, wid := utf8.DecodeRuneInString(s[mEnd:])
 			searchPos = mEnd + wid
 			continue
+		}
+		if mStart == mEnd {
+			emptyMatchCount++
+			if emptyMatchCount > maxJSArrayLen {
+				return "", false, rt.throwErr("RangeError", "Maximum regex match count exceeded")
+			}
 		}
 		if !appendBoundedString(&b, s[lastAppend:mStart]) {
 			return "", false, nil

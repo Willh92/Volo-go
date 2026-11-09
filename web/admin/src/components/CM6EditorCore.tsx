@@ -620,7 +620,7 @@ function enhanceRenderedPreviewDOM(
         const raw = (el.textContent || "").trim();
         const isBlock = el.classList.contains("volo-math-block");
         const stripped = isBlock
-          ? raw.replace(/^\$\$\s*|\s*\$\$$/g, "")
+          ? raw.replace(/^(?:\$\$|\\\[)\s*|\s*(?:\$\$|\\\])$/g, "")
           : raw.replace(/^\$|\$$/g, "");
         el.setAttribute("data-math-src", stripped);
         el.setAttribute("data-math-display", isBlock ? "1" : "0");
@@ -667,8 +667,28 @@ function enhanceRenderedPreviewDOM(
     }
   }
 
-  // 3. Split Preview code copy buttons
+  // 3. Split Preview visual boundary markers (<!--more-->, :::lock) & code copy buttons
   if (!opts.isWysiwyg) {
+    for (const p of Array.from(root.querySelectorAll<HTMLElement>("p"))) {
+      if ((p.textContent || "").trim() === "§VOLO_MORE_MARKER§") {
+        const marker = document.createElement("div");
+        marker.className = "volo-pv-marker";
+        const span = document.createElement("span");
+        span.textContent = "<!--more-->";
+        marker.appendChild(span);
+        p.replaceWith(marker);
+      }
+    }
+    for (const lk of Array.from(root.querySelectorAll<HTMLElement>(".volo-lock-block--unlocked"))) {
+      if (lk.querySelector(":scope > .volo-pv-marker")) continue;
+      const lType = lk.getAttribute("data-lock-type") || "password";
+      const marker = document.createElement("div");
+      marker.className = "volo-pv-marker";
+      const span = document.createElement("span");
+      span.textContent = `:::lock (${lType})`;
+      marker.appendChild(span);
+      lk.prepend(marker);
+    }
     const copyTxt = opts.copyLabel || "Copy";
     const copiedTxt = opts.copiedLabel || "Copied";
     for (const pre of Array.from(root.querySelectorAll<HTMLElement>("pre:not(.mermaid)"))) {
@@ -777,8 +797,54 @@ interface IRDocScan {
   tableLines: Set<number>;
   multiLinks: IRMultiLinkSpan[];
   fenceState: Uint8Array;
+  fenceNoHash: Uint8Array;
   calloutKind: Uint8Array;
 }
+
+const NO_HASH_COMMENT_LANGS = new Set([
+  "c",
+  "cpp",
+  "c++",
+  "cc",
+  "cxx",
+  "h",
+  "hpp",
+  "cs",
+  "csharp",
+  "go",
+  "golang",
+  "js",
+  "jsx",
+  "javascript",
+  "mjs",
+  "cjs",
+  "ts",
+  "tsx",
+  "typescript",
+  "java",
+  "kotlin",
+  "kt",
+  "swift",
+  "dart",
+  "rust",
+  "rs",
+  "zig",
+  "css",
+  "scss",
+  "less",
+  "html",
+  "xml",
+  "svg",
+  "json",
+  "jsonc",
+  "sql",
+  "glsl",
+  "hlsl",
+  "wgsl",
+  "scala",
+  "groovy",
+  "objc",
+]);
 
 const CALLOUT_CODE_MAP: Record<string, number> = {
   note: 1,
@@ -826,6 +892,7 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
 
   const total = doc.lines;
   const fenceState = new Uint8Array(total + 1);
+  const fenceNoHash = new Uint8Array(total + 1);
   const calloutKind = new Uint8Array(total + 1);
   const linesText = new Array<string>(total + 1);
   const lineFroms = new Int32Array(total + 1);
@@ -837,6 +904,7 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
   let fenceChar = "";
   let fenceLen = 0;
   let fenceLang = "";
+  let curFenceNoHash = 0;
   let fenceStartLn = -1;
   let activeCallout = 0;
 
@@ -855,6 +923,7 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
         fenceChar = openM.fenceChar;
         fenceLen = openM.fenceLen;
         fenceLang = openM.lang.toLowerCase();
+        curFenceNoHash = NO_HASH_COMMENT_LANGS.has(fenceLang) ? 1 : 0;
         fenceStartLn = iterLn;
         activeCallout = 0;
         continue;
@@ -891,14 +960,17 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
       fenceChar = "";
       fenceLen = 0;
       fenceLang = "";
+      curFenceNoHash = 0;
       fenceStartLn = -1;
     } else {
       fenceState[iterLn] = 2;
+      fenceNoHash[iterLn] = curFenceNoHash;
     }
   }
 
   // Second O(N) pass over non-fenced lines using direct array lookups + watermarks (zero B-tree traversal)
   let noCloseMathUntil = 0;
+  let noCloseBrkMathUntil = 0;
   let noCloseTableUntil = 0;
 
   for (let ln = 1; ln <= total; ln++) {
@@ -908,51 +980,58 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
     const lineFrom = lineFroms[ln];
     const lineTo = lineFrom + text.length;
 
-    // 0. Display math block ($$...$$ single-line or multi-line)
-    if (text.includes("$$")) {
-      const singleMath = /^\s*\$\$([^\n$]+)\$\$\s*$/.exec(text);
-      if (singleMath && singleMath[1].trim()) {
+    // 0. Display math block ($$...$$ or \[...\] single-line or multi-line)
+    if (text.includes("$$") || text.includes("\\[")) {
+      const singleMath = /^\s*(?:\$\$([^\n$]+)\$\$|\\\[([^\n]+?)\\\])\s*$/.exec(text);
+      const singleExpr = (singleMath?.[1] || singleMath?.[2] || "").trim();
+      if (singleExpr) {
         mathBlocks.push({
           startLine: ln,
           endLine: ln,
           from: lineFrom,
           to: lineTo,
-          expr: singleMath[1].trim(),
+          expr: singleExpr,
         });
         tableLines.add(ln);
         continue;
       }
-      if (/^\s*\$\$\s*$/.test(text) && ln < total && ln >= noCloseMathUntil) {
-        let endLn = -1;
-        let hitFence = false;
-        const limit = Math.min(total, ln + 120);
-        for (let k = ln + 1; k <= limit; k++) {
-          if (fenceState[k] !== 0) {
-            hitFence = true;
-            break;
+      const isDollarOpen = /^\s*\$\$\s*$/.test(text);
+      const isBrkOpen = !isDollarOpen && /^\s*\\\[\s*$/.test(text);
+      if ((isDollarOpen && ln >= noCloseMathUntil) || (isBrkOpen && ln >= noCloseBrkMathUntil)) {
+        if (ln < total) {
+          const closeRe = isDollarOpen ? /^\s*\$\$\s*$/ : /^\s*\\\]\s*$/;
+          let endLn = -1;
+          let hitFence = false;
+          const limit = Math.min(total, ln + 120);
+          for (let k = ln + 1; k <= limit; k++) {
+            if (fenceState[k] !== 0) {
+              hitFence = true;
+              break;
+            }
+            if (closeRe.test(linesText[k])) {
+              endLn = k;
+              break;
+            }
           }
-          if (/^\s*\$\$\s*$/.test(linesText[k])) {
-            endLn = k;
-            break;
+          if (endLn > ln + 1) {
+            const endTo = lineFroms[endLn] + linesText[endLn].length;
+            const expr = doc.sliceString(lineFroms[ln + 1], lineFroms[endLn - 1] + linesText[endLn - 1].length).trim();
+            if (expr) {
+              mathBlocks.push({
+                startLine: ln,
+                endLine: endLn,
+                from: lineFrom,
+                to: endTo,
+                expr,
+              });
+              for (let k = ln; k <= endLn; k++) tableLines.add(k);
+              ln = endLn;
+              continue;
+            }
+          } else if (endLn < 0 && !hitFence) {
+            if (isDollarOpen) noCloseMathUntil = limit;
+            else noCloseBrkMathUntil = limit;
           }
-        }
-        if (endLn > ln + 1) {
-          const endTo = lineFroms[endLn] + linesText[endLn].length;
-          const expr = doc.sliceString(lineFroms[ln + 1], lineFroms[endLn - 1] + linesText[endLn - 1].length).trim();
-          if (expr) {
-            mathBlocks.push({
-              startLine: ln,
-              endLine: endLn,
-              from: lineFrom,
-              to: endTo,
-              expr,
-            });
-            for (let k = ln; k <= endLn; k++) tableLines.add(k);
-            ln = endLn;
-            continue;
-          }
-        } else if (endLn < 0 && !hitFence) {
-          noCloseMathUntil = limit;
         }
       }
     }
@@ -1066,7 +1145,7 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
     }
   }
 
-  const res: IRDocScan = { tables, mermaids, mathBlocks, tableLines, multiLinks, fenceState, calloutKind };
+  const res: IRDocScan = { tables, mermaids, mathBlocks, tableLines, multiLinks, fenceState, fenceNoHash, calloutKind };
   irDocScanCache.set(doc, res);
   return res;
 }
@@ -1273,7 +1352,7 @@ function buildInstantRenderPlugin(): Extension {
               toks.push({ s, e, cls });
             };
             let cm: RegExpExecArray | null;
-            const cmtRe = /(?:^|\s)(#.*$|\/\/.*$)/g;
+            const cmtRe = scan.fenceNoHash[line.number] ? /(?:^|\s)(\/\/.*$)/g : /(?:^|\s)(#.*$|\/\/.*$)/g;
             while ((cm = cmtRe.exec(text)) !== null) {
               const idx = cm.index + (cm[0].length - cm[1].length);
               claim(idx, idx + cm[1].length, "c1");
@@ -1688,7 +1767,7 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Markdown Images ![alt](url) on non-cursor lines
-          const mdImgRe = /!\[([^\]\n]*)\]\(([^)\n]+)\)/g;
+          const mdImgRe = /!\[([^\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
           while ((m = mdImgRe.exec(text)) !== null) {
             const alt = (m[1] || "").trim();
             const rawTarget = parseMarkdownImageTarget(m[2] || "");
@@ -1760,7 +1839,7 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Markdown Links [label](url)
-          const linkRe = /(?:^|[^!])\[([^\]\n]+)\]\(([^)\n]+)\)/g;
+          const linkRe = /(?:^|[^!])\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
           while ((m = linkRe.exec(text)) !== null) {
             const lead = m[0].startsWith("[") ? 0 : 1;
             const s = m.index + lead;
@@ -2148,13 +2227,13 @@ function computeIRImgBox(src: string): { w: number; h: number } | null {
 function lineHasIRTallWidget(state: EditorState, lineNumber: number, text: string): boolean {
   if (getIRDocScan(state.doc).tableLines.has(lineNumber)) return true;
   if (text.length === 0 || text.length > 2400) return false;
-  if (/!\[[^\]\n]*\]\([^)\n]+\)/.test(text) || /<(?:img|video|audio)\b[^>]*\bsrc\s*=/i.test(text)) {
+  if (/!\[[^\]\n]*\]\((?:[^()\n]|\([^()\n]*\))+\)/.test(text) || /<(?:img|video|audio)\b[^>]*\bsrc\s*=/i.test(text)) {
     return true;
   }
   if (/^\s*\[toc\]\s*$/i.test(text) || matchStandaloneEmbedVideo(text) !== null) {
     return true;
   }
-  const soloLink = /^\s*\[([^\]\n]+)\]\(([^)\n]+)\)\s*$/.exec(text);
+  const soloLink = /^\s*\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)\s*$/.exec(text);
   if (soloLink) {
     const target = parseMarkdownImageTarget(soloLink[2] || "");
     if (isVideoMedia("", target) || isAudioMedia("", target)) return true;
@@ -2233,7 +2312,7 @@ function appendSafeCellMarkdown(host: HTMLElement, raw: string): void {
   parts.forEach((seg, idx) => {
     if (idx > 0) host.appendChild(document.createElement("br"));
     const tokenRe =
-      /!\[([^\]\n]*)\]\(([^)\n]+)\)|\[([^\]\n]+)\]\(([^)\n]+)\)|(`+)(?!`)([^\n]+?)(?<!`)\5(?!`)|(\bhttps?:\/\/[^\s<>()[\]"']+)|\$(?!\s|\$)([^\n$]*?[^\s\\$])\$(?![0-9a-zA-Z\\$])|\*\*([^*\n]+)\*\*|==([^=\n]+)==|~~([^~\n]+)~~|\*([^*\s][^*\n]*?)\*|\^([^\s^\n[\]]+)\^|~([^\s~\n/]+)~|<(u|mark|kbd|sup|sub|strong|b|em|i|s|del)>([^<\n]+)<\/\15>|<a\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([^<\n]+)<\/a>/gi;
+      /!\[([^\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(`+)(?!`)([^\n]+?)(?<!`)\5(?!`)|(\bhttps?:\/\/[^\s<>()[\]"']+)|\$(?!\s|\$)([^\n$]*?[^\s\\$])\$(?![0-9a-zA-Z\\$])|\*\*([^*\n]+)\*\*|==([^=\n]+)==|~~([^~\n]+)~~|\*([^*\s][^*\n]*?)\*|\^([^\s^\n[\]]+)\^|~([^\s~\n/]+)~|<(u|mark|kbd|sup|sub|strong|b|em|i|s|del)>([^<\n]+)<\/\15>|<a\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([^<\n]+)<\/a>/gi;
     let last = 0;
     let m: RegExpExecArray | null;
     while ((m = tokenRe.exec(seg)) !== null) {
@@ -3483,6 +3562,8 @@ function serializeListItemChildren(
   return chunks;
 }
 
+let activeWysiwygSourceMD = "";
+
 function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
   if (node.nodeType === Node.TEXT_NODE) {
     return (node.textContent || "").replace(/\u00a0/g, " ");
@@ -3835,6 +3916,24 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       }
       const href = (el.getAttribute("href") || "").trim();
       const label = inner().replace(/\s*\n+\s*/g, " ").trim();
+      const explicitWiki = (el.getAttribute("data-wiki-link") || el.getAttribute("data-wiki-slug") || "").trim();
+      if (explicitWiki) {
+        return label && label !== explicitWiki ? `[[${explicitWiki}|${label}]]` : `[[${explicitWiki}]]`;
+      }
+      const postSlugM = /^\/posts\/([a-zA-Z0-9._%-]+)$/.exec(href);
+      if (postSlugM) {
+        try {
+          const slug = decodeURIComponent(postSlugM[1]);
+          if (
+            /^[a-zA-Z0-9._-]+$/.test(slug) &&
+            (activeWysiwygSourceMD.includes(`[[${slug}]]`) || activeWysiwygSourceMD.includes(`[[${slug}|`))
+          ) {
+            return label && label !== slug ? `[[${slug}|${label}]]` : `[[${slug}]]`;
+          }
+        } catch {
+          /* ignore malformed percent escape */
+        }
+      }
       if (!href || /^(?:javascript|vbscript):/i.test(href)) {
         return label;
       }
@@ -3844,6 +3943,15 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       const src = (el.getAttribute("src") || "").trim();
       if (!src || /^(?:javascript|vbscript):/i.test(src)) return "";
       const alt = (el.getAttribute("alt") || "").replace(/[\r\n[\]]+/g, " ").trim();
+      const wAttr = (el.getAttribute("width") || el.style?.width || "").trim();
+      const hAttr = (el.getAttribute("height") || el.style?.height || "").trim();
+      const wasExplicitHtmlImg =
+        Boolean(wAttr || hAttr) &&
+        (/[%a-z]/i.test(wAttr + hAttr) || (activeWysiwygSourceMD.includes("<img") && activeWysiwygSourceMD.includes(src)));
+      if (wasExplicitHtmlImg) {
+        const escAlt = alt.replace(/"/g, "&quot;");
+        return `<img src="${src}"${escAlt ? ` alt="${escAlt}"` : ""}${wAttr ? ` width="${wAttr}"` : ""}${hAttr ? ` height="${hAttr}"` : ""} />`;
+      }
       return `![${alt}](${src})`;
     }
     case "audio": {
@@ -4335,13 +4443,41 @@ function clipboardHtmlToMarkdown(
   return { markdown, pendingUploads };
 }
 
+function injectSplitPreviewMarkers(md: string): string {
+  if (!md.includes("<!--")) return md;
+  const lines = md.split("\n");
+  let fenceChar = "";
+  let fenceLen = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (!fenceChar) {
+      const open = matchFenceOpen(ln);
+      if (open) {
+        fenceChar = open.fenceChar;
+        fenceLen = open.fenceLen;
+        continue;
+      }
+      if (/^\s*<!--\s*more\s*-->\s*$/i.test(ln)) {
+        lines[i] = "\n§VOLO_MORE_MARKER§\n";
+      }
+    } else if (matchFenceClose(ln, fenceChar, fenceLen)) {
+      fenceChar = "";
+      fenceLen = 0;
+    }
+  }
+  return lines.join("\n");
+}
+
 async function fetchPreviewHTML(
   contentMd: string,
   locale: string,
   preserveDirectives: boolean,
-  signal?: AbortSignal
+  hasAudio: boolean,
+  signal?: AbortSignal,
+  forExport?: boolean
 ): Promise<string> {
-  const payload: Record<string, unknown> = { content_md: contentMd, locale };
+  const effectiveMd = preserveDirectives || forExport ? contentMd : injectSplitPreviewMarkers(contentMd);
+  const payload: Record<string, unknown> = { content_md: effectiveMd, locale, has_audio: hasAudio };
   if (preserveDirectives) {
     payload.preserve_directives = true;
   }
@@ -4391,7 +4527,8 @@ const EDITOR_CALLOUTS = [
 
 type ToolbarPopKind = "" | "heading" | "color" | "callout" | "media" | "book" | "math" | "export";
 
-export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM6EditorProps) {
+export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasAudio }: CM6EditorProps) {
+  activeWysiwygSourceMD = value;
   const editorRootRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -4444,7 +4581,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
   const [qiMediaTotal, setQiMediaTotal] = useState<number>(0);
   const [qiMediaPage, setQiMediaPage] = useState<number>(1);
   const [qiMediaSearch, setQiMediaSearch] = useState<string>("");
-  const [qiMediaMime, setQiMediaMime] = useState<"" | "image" | "audio">("");
+  const [qiMediaMime, setQiMediaMime] = useState<"" | "image" | "video" | "audio">("");
   const debouncedQiMediaQ = useDebouncedValue(qiMediaSearch, 250);
 
   const [qiBooks, setQiBooks] = useState<any[]>([]);
@@ -5136,7 +5273,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave }: CM
 
     let rendered = previewHTML;
     try {
-      const html = await fetchPreviewHTML(md, curLocale, false);
+      const html = await fetchPreviewHTML(md, curLocale, false, Boolean(hasAudio), undefined, true);
       rendered = html || rendered;
     } catch {
       /* fallback to cached previewHTML */
@@ -5364,6 +5501,13 @@ ${rendered}
           return true;
         },
       },
+      {
+        key: "Mod-Shift-f",
+        run: () => {
+          setFullscreen((f) => !f);
+          return true;
+        },
+      },
     ]);
 
     const state = EditorState.create({
@@ -5455,7 +5599,7 @@ ${rendered}
     const ctrl = new AbortController();
     const timer = window.setTimeout(async () => {
       try {
-        const html = await fetchPreviewHTML(value, curLocale, mode === "wysiwyg", ctrl.signal);
+        const html = await fetchPreviewHTML(value, curLocale, mode === "wysiwyg", Boolean(hasAudio), ctrl.signal);
         if (ctrl.signal.aborted) return;
         setPreviewHTML(html);
         if (
@@ -5478,7 +5622,7 @@ ${rendered}
       window.clearTimeout(timer);
       ctrl.abort();
     };
-  }, [value, mode, curLocale]);
+  }, [value, mode, curLocale, hasAudio]);
 
   // Enhance Split Preview (`sv`) DOM with KaTeX math, Mermaid diagrams, and code copy buttons
   useEffect(() => {
@@ -5614,12 +5758,29 @@ ${rendered}
   }, [mode, previewHTML, syncScroll]);
 
   useEffect(() => {
+    const onGlobalShortcut = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "f" || e.key === "F")) {
+        const root = editorRootRef.current;
+        if (!root) return;
+        if (fullscreen || root.contains(document.activeElement)) {
+          e.preventDefault();
+          setFullscreen((f) => !f);
+        }
+      }
+    };
+    window.addEventListener("keydown", onGlobalShortcut);
+    return () => window.removeEventListener("keydown", onGlobalShortcut);
+  }, [fullscreen]);
+
+  useEffect(() => {
     const root = editorRootRef.current;
     if (!fullscreen) {
       root?.style.removeProperty("--volo-vv-h");
       root?.style.removeProperty("--volo-vv-top");
       return;
     }
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     const syncVv = () => {
       const el = editorRootRef.current;
       if (!el) return;
@@ -5647,6 +5808,7 @@ ${rendered}
     };
     document.addEventListener("keydown", onKey);
     return () => {
+      document.body.style.overflow = prevOverflow;
       window.removeEventListener("resize", syncVv);
       vv?.removeEventListener("resize", syncVv);
       vv?.removeEventListener("scroll", syncVv);
@@ -5746,6 +5908,7 @@ ${rendered}
       refs: "0",
       page: String(qiMediaPage),
       per_page: "18",
+      page_size: "18",
     });
     if (debouncedQiMediaQ.trim()) params.set("q", debouncedQiMediaQ.trim());
     if (qiMediaMime) params.set("mime", qiMediaMime);
@@ -5763,6 +5926,7 @@ ${rendered}
     const params = new URLSearchParams({
       page: String(qiBooksPage),
       per_page: "10",
+      page_size: "10",
     });
     if (debouncedQiBookQ.trim()) params.set("q", debouncedQiBookQ.trim());
     apiFetch<{ items?: any[]; books?: any[]; total?: number }>(`/api/admin/books?${params.toString()}`)
@@ -5779,6 +5943,7 @@ ${rendered}
     const params = new URLSearchParams({
       page: String(qiArtPage),
       per_page: "20",
+      page_size: "20",
     });
     if (debouncedQiArtQ.trim()) params.set("q", debouncedQiArtQ.trim());
     apiFetch<{ items?: any[]; articles?: any[]; total?: number }>(`/api/admin/articles?${params.toString()}`)
@@ -7052,6 +7217,7 @@ ${rendered}
                 [
                   ["", t("cnt.media_type_all")],
                   ["image", t("cnt.media_type_image")],
+                  ["video", t("cnt.media_type_video")],
                   ["audio", t("cnt.media_type_audio")],
                 ] as const
               ).map(([mVal, mLabel]) => (
@@ -7086,6 +7252,7 @@ ${rendered}
                   const name = m.orig_filename || m.original_name || m.id;
                   const mime = String(m.mime_type || "");
                   const isImg = mime.startsWith("image/");
+                  const isVid = !isImg && isVideoMedia(mime, m.public_url);
                   return (
                     <button
                       key={m.id}
@@ -7094,7 +7261,7 @@ ${rendered}
                       onClick={() => {
                         if (isImg) {
                           insertSnippet(`![${name}](${m.public_url})`);
-                        } else if (isVideoMedia(mime, m.public_url)) {
+                        } else if (isVid) {
                           insertSnippet(`\n<video controls preload="metadata" src="${m.public_url}"></video>\n`);
                         } else if (isAudioMedia(mime, m.public_url)) {
                           insertSnippet(`\n<audio controls preload="metadata" src="${m.public_url}"></audio>\n`);
@@ -7106,6 +7273,8 @@ ${rendered}
                     >
                       {isImg ? (
                         <img src={m.public_url} alt={name} loading="lazy" />
+                      ) : isVid ? (
+                        <video src={m.public_url} preload="metadata" muted playsInline />
                       ) : (
                         <div class="volo-qi-file-badge">{m.mime_type || "FILE"}</div>
                       )}

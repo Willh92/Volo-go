@@ -3,16 +3,28 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version tag (e.g. v1.0.0 or v1.0.0-preview.1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Force mark release as pre-release"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   build-frontend:
     name: Build Embedded Admin Console
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -28,6 +40,7 @@ jobs:
         working-directory: web/admin
         run: |
           npm ci --no-audit --no-fund
+          rm -rf ../../internal/adminui/dist && mkdir -p ../../internal/adminui/dist
           npm run build
 
       - name: Upload Built Admin Dist
@@ -36,10 +49,94 @@ jobs:
           name: admin-dist
           path: internal/adminui/dist
 
-  cross-binaries:
-    name: Build Static Binaries (${{ matrix.goos }}/${{ matrix.goarch }})
+  verify:
+    name: Verify Release Metadata, Vet & Tests
     needs: build-frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      is_default_or_tag: ${{ steps.meta.outputs.is_default_or_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Resolve Release Version & Prerelease Metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+          FULL_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            RAW_VER="${INPUT_VERSION#refs/tags/}"
+            case "${RAW_VER}" in
+              v*) VER="${RAW_VER}" ;;
+              *)  VER="v${RAW_VER}" ;;
+            esac
+          else
+            VER="${REF_NAME}"
+          fi
+
+          if ! printf '%s\n' "${VER}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "Invalid semantic version tag: '${VER}' (expected e.g. v1.0.0 or v1.0.0-preview.1)" >&2
+            exit 1
+          fi
+
+          IS_PRE="false"
+          case "${VER}" in
+            *-*) IS_PRE="true" ;;
+          esac
+          if [ "${INPUT_PRERELEASE}" = "true" ]; then
+            IS_PRE="true"
+          fi
+
+          IS_DEF_OR_TAG="false"
+          case "${FULL_REF}" in
+            refs/tags/v*) IS_DEF_OR_TAG="true" ;;
+            "refs/heads/${DEFAULT_BRANCH}") IS_DEF_OR_TAG="true" ;;
+          esac
+
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "is_prerelease=${IS_PRE}" >> "${GITHUB_OUTPUT}"
+          echo "is_default_or_tag=${IS_DEF_OR_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved release: version=${VER}, is_prerelease=${IS_PRE}, is_default_or_tag=${IS_DEF_OR_TAG}"
+
+      - name: Clean Stale Placeholder Dist Before Artifact Download
+        run: rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
+
+      - name: Download Built Admin Dist
+        uses: actions/download-artifact@v8
+        with:
+          name: admin-dist
+          path: internal/adminui/dist
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Release Gate (go vet & go test with GOEXPERIMENT=nojsonv2)
+        env:
+          CGO_ENABLED: "0"
+          GOEXPERIMENT: "nojsonv2"
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
+  cross-binaries:
+    name: Build Static Binaries (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: [verify, build-frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +170,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Clean Stale Placeholder Dist Before Artifact Download
+        run: rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
+
       - name: Download Built Admin Dist
         uses: actions/download-artifact@v8
         with:
@@ -91,10 +191,10 @@ jobs:
           GOEXPERIMENT: "nojsonv2"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.verify.outputs.version }}
           VOLO_BUDGET_BIN_MB: ${{ vars.VOLO_BUDGET_BIN_MB }}
         run: |
-          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-21}"
+          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-20}"
           MAX_BIN_BYTES=$((BUDGET_BIN_MB * 1024 * 1024))
           STAGE="volo-${VERSION}-${GOOS}-${GOARCH}"
           mkdir -p "dist/${STAGE}/scripts"
@@ -105,8 +205,9 @@ jobs:
             ./cmd/volo
 
           BIN_BYTES=$(wc -c < "dist/${STAGE}/volo${{ matrix.ext }}" | tr -d ' ')
+          echo "Built ${STAGE}/volo${{ matrix.ext }}: ${BIN_BYTES} bytes (limit < ${MAX_BIN_BYTES} bytes / ${BUDGET_BIN_MB}.00 MiB)"
           if [ "${BIN_BYTES}" -ge "${MAX_BIN_BYTES}" ]; then
-            echo "Binary exceeds ${BUDGET_BIN_MB} MiB budget (${BIN_BYTES} >= ${MAX_BIN_BYTES} bytes)" >&2
+            echo "Binary exceeds ${BUDGET_BIN_MB}.00 MiB budget (${BIN_BYTES} >= ${MAX_BIN_BYTES} bytes)" >&2
             exit 1
           fi
 
@@ -143,9 +244,20 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release & Checksums
-    needs: cross-binaries
+    needs: [verify, cross-binaries]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - name: Forward Release Metadata
+        id: meta
+        env:
+          VER: ${{ needs.verify.outputs.version }}
+          IS_PRE: ${{ needs.verify.outputs.is_prerelease }}
+        run: |
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "is_prerelease=${IS_PRE}" >> "${GITHUB_OUTPUT}"
+
       - name: Download All Target Archives
         uses: actions/download-artifact@v8
         with:
@@ -160,13 +272,19 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ steps.meta.outputs.is_prerelease == 'true' && 'false' || 'true' }}
           generate_release_notes: true
           files: release-assets/*
 
   publish-ghcr:
     name: Build & Push Multi-Arch GHCR Container
-    needs: build-frontend
+    needs: [verify, build-frontend]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -192,9 +310,10 @@ jobs:
           labels: |
             org.opencontainers.image.licenses=Apache-2.0
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{version}},value=${{ needs.verify.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.is_prerelease != 'true' }}
+            type=semver,pattern={{major}},value=${{ needs.verify.outputs.version }},enable=${{ needs.verify.outputs.is_prerelease != 'true' }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.is_prerelease != 'true' && needs.verify.outputs.is_default_or_tag == 'true' }}
 
       - name: Build and Push Multi-Arch Image (linux/amd64, linux/arm64)
         uses: docker/build-push-action@v7
@@ -205,4 +324,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ needs.verify.outputs.version }}

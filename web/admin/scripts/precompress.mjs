@@ -123,26 +123,28 @@ function walkAdminDist(dir) {
 }
 
 function syncBuiltinEmbeddedAssets() {
-  const pairs = [
-    [
-      new URL("../../../internal/i18n/builtin/zh-CN.json", import.meta.url).pathname,
-      new URL("../../../internal/i18n/builtin_gz/zh-CN.json.gz", import.meta.url).pathname,
-      "zh-CN.json",
-    ],
-    [
-      new URL("../../../internal/i18n/builtin/en-US.json", import.meta.url).pathname,
-      new URL("../../../internal/i18n/builtin_gz/en-US.json.gz", import.meta.url).pathname,
-      "en-US.json",
-    ],
-    [
-      new URL("../../../internal/theme/builtin/volo-studio/assets/volo-studio.js", import.meta.url).pathname,
-      new URL("../../../internal/theme/builtin/volo-studio/assets_gz/volo-studio.js.gz", import.meta.url).pathname,
-      "volo-studio.js",
-    ],
-  ];
-  for (const [src, dst, name] of pairs) {
-    const raw = minifyEmbeddedPayload(name, readFileSync(src));
-    writeFileSync(dst, deterministicGzip(raw));
+  const i18nDir = new URL("../../../internal/i18n/builtin", import.meta.url).pathname;
+  const i18nGzDir = new URL("../../../internal/i18n/builtin_gz", import.meta.url).pathname;
+  for (const name of readdirSync(i18nDir)) {
+    if (!name.endsWith(".json")) continue;
+    const raw = minifyEmbeddedPayload(name, readFileSync(join(i18nDir, name)));
+    writeFileSync(join(i18nGzDir, `${name}.gz`), deterministicGzip(raw));
+  }
+
+  const studioAssetsDir = new URL("../../../internal/theme/builtin/volo-studio/assets", import.meta.url).pathname;
+  const studioAssetsGzDir = new URL("../../../internal/theme/builtin/volo-studio/assets_gz", import.meta.url).pathname;
+  for (const name of readdirSync(studioAssetsDir)) {
+    if (!name.endsWith(".js") && !name.endsWith(".css")) continue;
+    const raw = minifyEmbeddedPayload(name, readFileSync(join(studioAssetsDir, name)));
+    writeFileSync(join(studioAssetsGzDir, `${name}.gz`), deterministicGzip(raw));
+  }
+
+  const studioTplDir = new URL("../../../internal/theme/builtin/volo-studio/templates", import.meta.url).pathname;
+  const studioTplGzDir = new URL("../../../internal/theme/builtin/volo-studio/templates_gz", import.meta.url).pathname;
+  for (const name of readdirSync(studioTplDir)) {
+    if (!name.endsWith(".html")) continue;
+    const raw = minifyEmbeddedPayload(name, readFileSync(join(studioTplDir, name)));
+    writeFileSync(join(studioTplGzDir, `${name}.gz`), deterministicGzip(raw));
   }
 }
 

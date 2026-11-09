@@ -121,6 +121,27 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 		if err := json.Unmarshal([]byte(rec.ValueJSON), &s.Reading); err != nil {
 			return err
 		}
+		if s.Reading.CommentMinLength <= 0 {
+			s.Reading.CommentMinLength = domain.DefaultCommentMinLength
+		}
+		if s.Reading.CommentMaxLengthGuest <= 0 {
+			s.Reading.CommentMaxLengthGuest = max(domain.DefaultCommentMaxLengthGuest, s.Reading.CommentMinLength)
+		}
+		if s.Reading.CommentMaxLengthUser <= 0 {
+			s.Reading.CommentMaxLengthUser = max(domain.DefaultCommentMaxLengthUser, s.Reading.CommentMinLength)
+		}
+		if s.Reading.CommentMaxLengthStaff <= 0 {
+			s.Reading.CommentMaxLengthStaff = max(domain.DefaultCommentMaxLengthStaff, s.Reading.CommentMinLength)
+		}
+		if s.Reading.CommentMaxLinesGuest <= 0 {
+			s.Reading.CommentMaxLinesGuest = domain.DefaultCommentMaxLinesGuest
+		}
+		if s.Reading.CommentMaxLinesUser <= 0 {
+			s.Reading.CommentMaxLinesUser = domain.DefaultCommentMaxLinesUser
+		}
+		if s.Reading.CommentMaxLinesStaff <= 0 {
+			s.Reading.CommentMaxLinesStaff = domain.DefaultCommentMaxLinesStaff
+		}
 		if strings.TrimSpace(s.Reading.VendorCDNPrefix) == "" {
 			s.Reading.VendorCDNPrefix = domain.DefaultVendorCDNPrefix
 		}
@@ -649,6 +670,41 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if v.PoWDifficultyBits < 8 || v.PoWDifficultyBits > 24 {
 			v.PoWDifficultyBits = 16
 		}
+		if v.CommentMinLength <= 0 {
+			v.CommentMinLength = domain.DefaultCommentMinLength
+		} else {
+			v.CommentMinLength = clampSettingInt(v.CommentMinLength, 1, 500)
+		}
+		if v.CommentMaxLengthGuest <= 0 {
+			v.CommentMaxLengthGuest = max(domain.DefaultCommentMaxLengthGuest, v.CommentMinLength)
+		} else {
+			v.CommentMaxLengthGuest = clampSettingInt(v.CommentMaxLengthGuest, v.CommentMinLength, 16000)
+		}
+		if v.CommentMaxLengthUser <= 0 {
+			v.CommentMaxLengthUser = max(domain.DefaultCommentMaxLengthUser, v.CommentMinLength)
+		} else {
+			v.CommentMaxLengthUser = clampSettingInt(v.CommentMaxLengthUser, v.CommentMinLength, 32000)
+		}
+		if v.CommentMaxLengthStaff <= 0 {
+			v.CommentMaxLengthStaff = max(domain.DefaultCommentMaxLengthStaff, v.CommentMinLength)
+		} else {
+			v.CommentMaxLengthStaff = clampSettingInt(v.CommentMaxLengthStaff, v.CommentMinLength, 64000)
+		}
+		if v.CommentMaxLinesGuest <= 0 {
+			v.CommentMaxLinesGuest = domain.DefaultCommentMaxLinesGuest
+		} else {
+			v.CommentMaxLinesGuest = clampSettingInt(v.CommentMaxLinesGuest, 2, 200)
+		}
+		if v.CommentMaxLinesUser <= 0 {
+			v.CommentMaxLinesUser = domain.DefaultCommentMaxLinesUser
+		} else {
+			v.CommentMaxLinesUser = clampSettingInt(v.CommentMaxLinesUser, 2, 300)
+		}
+		if v.CommentMaxLinesStaff <= 0 {
+			v.CommentMaxLinesStaff = domain.DefaultCommentMaxLinesStaff
+		} else {
+			v.CommentMaxLinesStaff = clampSettingInt(v.CommentMaxLinesStaff, 2, 500)
+		}
 		cleanAssetPrefix, okAsset := sanitizeCDNPrefix(v.AssetCDNPrefix)
 		if !okAsset {
 			return nil, fmt.Errorf("settings: invalid reading.asset_cdn_prefix %q", v.AssetCDNPrefix)
@@ -677,6 +733,11 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
+		normPerm, okPerm := domain.NormalizePostPermalinkStyle(v.PostPermalinkStyle)
+		if !okPerm {
+			return nil, fmt.Errorf("settings: invalid seo.post_permalink_style %q", v.PostPermalinkStyle)
+		}
+		v.PostPermalinkStyle = normPerm
 		v.IndexNowKey = strings.TrimSpace(StripASCIIControls(v.IndexNowKey))
 		if v.IndexNowKey != "" && !indexNowKeyRe.MatchString(v.IndexNowKey) {
 			return nil, fmt.Errorf("settings: invalid seo.index_now_key %q (must match ^[a-zA-Z0-9-]{8,128}$)", v.IndexNowKey)
@@ -728,6 +789,8 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		v.DynamicLoginPath = normDyn
+		v.WAFWindowSeconds = clampSettingInt(v.WAFWindowSeconds, 1, 86400)
+		v.WAFMaxRequests = clampSettingInt(v.WAFMaxRequests, 1, 100000)
 		v.GeoIPDir = strings.TrimSpace(StripASCIIControls(v.GeoIPDir))
 		v.GeoDefaultAction = strings.ToLower(strings.TrimSpace(v.GeoDefaultAction))
 		if v.GeoDefaultAction == "" {
@@ -792,9 +855,8 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
-		if v.LocalKeepCount < 1 {
-			v.LocalKeepCount = 7
-		}
+		v.LocalIntervalHrs = clampSettingInt(v.LocalIntervalHrs, 1, 720)
+		v.LocalKeepCount = clampSettingInt(v.LocalKeepCount, 1, 1000)
 		v.WebDAVPasswordSet = false
 		v.S3SecretKeySet = false
 		return json.Marshal(v)

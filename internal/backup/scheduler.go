@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +22,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/s3client"
 	"github.com/Willh92/Volo-go/internal/security"
+	"github.com/Willh92/Volo-go/internal/tinyxml"
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
@@ -248,6 +248,13 @@ func (s *Scheduler) runCycle(ctx context.Context) (*RunResult, error) {
 		}
 		target, err := s.uploadArchiveStream(ctx, cfg, sec, localPath, filename)
 		if err != nil {
+			proto := strings.ToLower(strings.TrimSpace(cfg.RemoteProtocol))
+			if proto != "" && proto != "s3" && proto != "webdav" {
+				if s.opts.Logger != nil {
+					fmt.Fprintf(s.opts.Logger, "volo backup scheduler: plugin remote upload skipped (%s): %v\n", cfg.RemoteProtocol, err)
+				}
+				return res, nil
+			}
 			return res, err
 		}
 		res.RemoteUploaded = true
@@ -506,7 +513,41 @@ func (s *Scheduler) pruneRemoteAutoBackups(ctx context.Context, cfg domain.Backu
 		return pruneWebDAVAutoBackups(ctx, cfg, sec.WebDAVPassword, keepCount, s.opts.OutboundDialer)
 
 	default:
-		return 0, nil
+		// Storage plugin protocols do not expose a mandatory list API; prune via optional List if implemented,
+		// otherwise return (0, nil) gracefully without failing automatic backups.
+		sp, _, ok := s.resolveBackupStoragePlugin(proto)
+		if !ok {
+			return 0, nil
+		}
+		lister, hasList := sp.(interface {
+			List(ctx context.Context, prefix string) ([]string, error)
+		})
+		if !hasList {
+			return 0, nil
+		}
+		keys, err := lister.List(ctx, "backups/volo-auto-")
+		if err != nil {
+			return 0, nil
+		}
+		var autos []string
+		for _, k := range keys {
+			if isAutoBackupZipName(path.Base(strings.TrimSpace(k))) {
+				autos = append(autos, k)
+			}
+		}
+		if len(autos) <= keepCount {
+			return 0, nil
+		}
+		sort.Slice(autos, func(i, j int) bool {
+			return path.Base(autos[i]) > path.Base(autos[j])
+		})
+		pruned := 0
+		for _, old := range autos[keepCount:] {
+			if sp.Delete(ctx, old) == nil {
+				pruned++
+			}
+		}
+		return pruned, nil
 	}
 }
 
@@ -547,23 +588,8 @@ func pruneWebDAVAutoBackups(ctx context.Context, cfg domain.BackupSettings, pass
 		return 0, fmt.Errorf("webdav PROPFIND status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	type davProp struct {
-		LastModified string `xml:"getlastmodified"`
-	}
-	type davPropStat struct {
-		Prop davProp `xml:"prop"`
-	}
-	type davResponse struct {
-		Href      string        `xml:"href"`
-		PropStats []davPropStat `xml:"propstat"`
-		Direct    davProp       `xml:"prop"`
-	}
-	type davMultistatus struct {
-		Responses []davResponse `xml:"response"`
-	}
-
-	var ms davMultistatus
-	if err := xml.Unmarshal(body, &ms); err != nil {
+	msNode, err := tinyxml.Parse(body)
+	if err != nil {
 		return 0, fmt.Errorf("webdav PROPFIND parse XML: %w", err)
 	}
 
@@ -577,8 +603,8 @@ func pruneWebDAVAutoBackups(ctx context.Context, cfg domain.BackupSettings, pass
 	}
 	seen := make(map[string]bool)
 	var autos []davBackupEntry
-	for _, r := range ms.Responses {
-		rawHref := strings.TrimSpace(r.Href)
+	for _, rNode := range msNode.ChildrenByLocal("response") {
+		rawHref := strings.TrimSpace(rNode.ChildText("href"))
 		if rawHref == "" {
 			continue
 		}
@@ -607,11 +633,16 @@ func pruneWebDAVAutoBackups(ctx context.Context, cfg domain.BackupSettings, pass
 		}
 		seen[base] = true
 
-		rawMod := strings.TrimSpace(r.Direct.LastModified)
-		for _, ps := range r.PropStats {
-			if m := strings.TrimSpace(ps.Prop.LastModified); m != "" {
-				rawMod = m
-				break
+		var rawMod string
+		if dirProp := rNode.Child("prop"); dirProp != nil {
+			rawMod = strings.TrimSpace(dirProp.ChildText("getlastmodified"))
+		}
+		for _, ps := range rNode.ChildrenByLocal("propstat") {
+			if p := ps.Child("prop"); p != nil {
+				if m := strings.TrimSpace(p.ChildText("getlastmodified")); m != "" {
+					rawMod = m
+					break
+				}
 			}
 		}
 		var modTime time.Time

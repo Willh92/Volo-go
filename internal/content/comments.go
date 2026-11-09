@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/dialect"
@@ -36,6 +38,123 @@ var (
 	ErrCommentRejected      = errors.New("comments: rejected by anti-spam policy")
 )
 
+// CommentLengthError reports a comment rune length outside the configured [MinRunes, MaxRunes] bounds for the viewer's identity.
+type CommentLengthError struct {
+	MinRunes int
+	MaxRunes int
+}
+
+func (e *CommentLengthError) Error() string {
+	return fmt.Sprintf("comments: content length must be between %d and %d characters", e.MinRunes, e.MaxRunes)
+}
+
+// CommentLineLimitError reports that a comment still exceeds the identity's maximum normalized line count after vertical compaction.
+type CommentLineLimitError struct {
+	MaxLines int
+}
+
+func (e *CommentLineLimitError) Error() string {
+	return fmt.Sprintf("comments: content exceeds maximum %d lines", e.MaxLines)
+}
+
+// UserMutedError reports that a logged-in account is currently muted (or suspended) from posting/editing comments or reactions.
+type UserMutedError struct {
+	MutedUntil int64
+	Reason     string
+}
+
+func (e *UserMutedError) Error() string {
+	if e == nil {
+		return "comments: account is muted"
+	}
+	if e.MutedUntil > 0 {
+		return fmt.Sprintf("comments: account is muted until %d", e.MutedUntil)
+	}
+	return "comments: account is muted"
+}
+
+func defaultShieldedCommentText(locale string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(locale)), "en") {
+		return "This comment has been hidden due to account moderation."
+	}
+	return "该账户处于受限状态，历史评论已折叠屏蔽。"
+}
+
+func renderShieldedCommentHTML(customText string, locale string) string {
+	txt := strings.TrimSpace(customText)
+	if txt == "" {
+		txt = defaultShieldedCommentText(locale)
+	}
+	return `<p class="volo-comment-shielded"><em>` + html.EscapeString(txt) + `</em></p>`
+}
+
+func (s *Service) commentDisplayLocale(r *http.Request) string {
+	if r != nil {
+		if q := strings.TrimSpace(r.URL.Query().Get("lang")); q != "" {
+			return q
+		}
+		if c, err := r.Cookie("volo_lang"); err == nil && strings.TrimSpace(c.Value) != "" {
+			return strings.TrimSpace(c.Value)
+		}
+		if al := strings.TrimSpace(r.Header.Get("Accept-Language")); al != "" {
+			first, _, _ := strings.Cut(al, ",")
+			first, _, _ = strings.Cut(first, ";")
+			if strings.TrimSpace(first) != "" {
+				return strings.TrimSpace(first)
+			}
+		}
+	}
+	if s != nil && s.settings != nil {
+		if dl := strings.TrimSpace(s.settings.Snapshot().Site.DefaultLocale); dl != "" {
+			return dl
+		}
+	}
+	return "zh-CN"
+}
+
+func normalizeAndCheckCommentContent(rawMD string, reading domain.ReadingSettings, viewer *domain.User, enforceMin bool) (string, error) {
+	compacted := render.CompactCommentMarkdown(rawMD)
+	minRunes, maxRunes := reading.EffectiveCommentLengthBounds(viewer)
+	rc := utf8.RuneCountInString(compacted)
+	if (enforceMin && rc < minRunes) || rc > maxRunes {
+		return "", &CommentLengthError{MinRunes: minRunes, MaxRunes: maxRunes}
+	}
+	if compacted != "" {
+		maxLines := reading.EffectiveCommentMaxLines(viewer)
+		if strings.Count(compacted, "\n")+1 > maxLines {
+			return "", &CommentLineLimitError{MaxLines: maxLines}
+		}
+	}
+	return compacted, nil
+}
+
+// PreviewCommentHTML renders and sanitizes a visitor's Markdown comment draft (applying live sensitive-word masking).
+func (s *Service) PreviewCommentHTML(ctx context.Context, viewer *domain.User, rawMD string) (string, error) {
+	if strings.TrimSpace(rawMD) == "" {
+		return "", nil
+	}
+	var snap domain.SettingsSnapshot
+	if s.settings != nil {
+		snap = s.settings.Snapshot()
+	} else {
+		snap = domain.DefaultSettingsSnapshot("zh-CN")
+	}
+	compacted, err := normalizeAndCheckCommentContent(rawMD, snap.Reading, viewer, false)
+	if err != nil {
+		return "", err
+	}
+	if compacted == "" {
+		return "", nil
+	}
+	htmlOut := s.renderer.RenderComment(compacted)
+	isAdminOrEditor := viewer != nil && viewer.Status == domain.UserStatusActive &&
+		(viewer.Role == domain.RoleAdmin || viewer.Role == domain.RoleEditor)
+	if !isAdminOrEditor {
+		htmlOut = s.maskCommentHTML(ctx, snap, htmlOut)
+	}
+	return htmlOut, nil
+}
+
 // PublicCommentView is the zero-PII comment model exposed to visitors and comment-widget.js.
 type PublicCommentView struct {
 	ID          string              `json:"id"`
@@ -46,6 +165,7 @@ type PublicCommentView struct {
 	AvatarURL   string              `json:"avatar_url"`
 	AvatarSeed  string              `json:"avatar_seed"`
 	IsAuthor    bool                `json:"is_author,omitempty"`
+	IsShielded  bool                `json:"is_shielded,omitempty"`
 	ContentHTML string              `json:"content_html"`
 	ContentMD   string              `json:"content_md,omitempty"` // Only populated when CanEdit==true!
 	GeoRegion   string              `json:"geo_region,omitempty"`
@@ -218,6 +338,81 @@ func buildCommentVisibilityWhere(tType, tID string, isAdmin bool, callerUserID, 
 
 const maxHydratedRepliesPerBatch = 500
 
+func (s *Service) healExpiredModerationRow(ctx context.Context, u *domain.User, nowMS int64) {
+	if s == nil || s.store == nil || u == nil || strings.TrimSpace(u.ID) == "" {
+		return
+	}
+	banExpired := u.Status == domain.UserStatusDisabled && u.BanUntil > 0 && nowMS >= u.BanUntil
+	muteExpired := u.MutedUntil > 0 && nowMS >= u.MutedUntil
+	if !banExpired && !muteExpired {
+		return
+	}
+	if banExpired {
+		u.Status = domain.UserStatusActive
+		u.BanUntil = 0
+	}
+	if muteExpired {
+		u.MutedUntil = 0
+	}
+	if !u.IsBannedAt(nowMS) && !u.IsMutedAt(nowMS) {
+		u.BanReason = ""
+		u.ShieldComments = false
+		u.ShieldText = ""
+	}
+	_, _ = s.store.ExecContext(ctx,
+		`UPDATE users SET status = ?, ban_until = ?, muted_until = ?, ban_reason = ?, shield_comments = ?, shield_text = ?, updated_at = ? WHERE id = ?`,
+		u.Status, u.BanUntil, u.MutedUntil, u.BanReason, u.ShieldComments, u.ShieldText, nowMS, u.ID)
+}
+
+func (s *Service) loadAuthorModerationByID(ctx context.Context, userIDs []string, nowMS int64) map[string]domain.User {
+	out := make(map[string]domain.User, len(userIDs))
+	if len(userIDs) == 0 || s == nil || s.store == nil {
+		return out
+	}
+	seen := make(map[string]bool, len(userIDs))
+	args := make([]any, 0, len(userIDs))
+	ph := make([]string, 0, len(userIDs))
+	for _, uid := range userIDs {
+		uid = strings.TrimSpace(uid)
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		args = append(args, uid)
+		ph = append(ph, "?")
+	}
+	if len(args) == 0 {
+		return out
+	}
+	var rows []domain.User
+	err := sqlx.SelectInto(ctx, s.store, &rows,
+		`SELECT id, status, ban_until, muted_until, ban_reason, shield_comments, shield_text FROM users WHERE id IN (`+strings.Join(ph, ",")+`)`,
+		args...)
+	if err != nil {
+		return out
+	}
+	for _, au := range rows {
+		s.healExpiredModerationRow(ctx, &au, nowMS)
+		out[au.ID] = au
+	}
+	return out
+}
+
+func applyCommentShielding(view *PublicCommentView, authorMod map[string]domain.User, userID string, nowMS int64, locale string) {
+	if view == nil || strings.TrimSpace(userID) == "" || len(authorMod) == 0 {
+		return
+	}
+	au, ok := authorMod[strings.TrimSpace(userID)]
+	if !ok || !au.IsCommentShieldedAt(nowMS) {
+		return
+	}
+	view.IsShielded = true
+	view.ContentHTML = renderShieldedCommentHTML(au.ShieldText, locale)
+	view.ContentMD = ""
+	view.AuthorURL = ""
+	view.CanEdit = false
+}
+
 func (s *Service) hydrateRootThreadsReplies(
 	ctx context.Context,
 	visWhere string,
@@ -229,6 +424,7 @@ func (s *Service) hydrateRootThreadsReplies(
 	callerGuestHash string,
 	nowMS int64,
 	viewer *domain.User,
+	locale string,
 ) ([]PublicCommentView, error) {
 	if len(rootRows) == 0 {
 		return []PublicCommentView{}, nil
@@ -236,6 +432,7 @@ func (s *Service) hydrateRootThreadsReplies(
 	roots := make([]PublicCommentView, len(rootRows))
 	rootIdxForID := make(map[string]int, len(rootRows)*2)
 	frontier := make([]string, 0, len(rootRows))
+	var distinctUserIDs []string
 
 	for i, rr := range rootRows {
 		dc := rr.toDomainComment()
@@ -243,6 +440,9 @@ func (s *Service) hydrateRootThreadsReplies(
 		roots[i] = s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer)
 		rootIdxForID[rr.ID] = i
 		frontier = append(frontier, rr.ID)
+		if rr.UserID != "" {
+			distinctUserIDs = append(distinctUserIDs, rr.UserID)
+		}
 	}
 
 	repliesByRoot := make([][]publicCommentRow, len(rootRows))
@@ -294,9 +494,17 @@ func (s *Service) hydrateRootThreadsReplies(
 				repliesByRoot[rIdx] = append(repliesByRoot[rIdx], rep)
 				totalReplies++
 				nextFrontier = append(nextFrontier, rep.ID)
+				if rep.UserID != "" {
+					distinctUserIDs = append(distinctUserIDs, rep.UserID)
+				}
 			}
 		}
 		frontier = nextFrontier
+	}
+
+	authorMod := s.loadAuthorModerationByID(ctx, distinctUserIDs, nowMS)
+	for i, rr := range rootRows {
+		applyCommentShielding(&roots[i], authorMod, rr.UserID, nowMS, locale)
 	}
 
 	for rIdx, repList := range repliesByRoot {
@@ -315,7 +523,9 @@ func (s *Service) hydrateRootThreadsReplies(
 		for _, rep := range repList {
 			dc := rep.toDomainComment()
 			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
-			views = append(views, s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer))
+			v := s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer)
+			applyCommentShielding(&v, authorMod, rep.UserID, nowMS, locale)
+			views = append(views, v)
 		}
 		roots[rIdx].Replies = views
 	}
@@ -347,7 +557,7 @@ func (s *Service) ListTargetComments(
 	if err != nil {
 		return nil, err
 	}
-	return s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer)
+	return s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer, s.commentDisplayLocale(r))
 }
 
 // ListTargetCommentsPage returns a paginated slice of root comment threads (newest-first, with replies intact).
@@ -483,16 +693,26 @@ func (s *Service) ListTargetCommentsPage(
 		return PaginatedCommentsResult{}, err
 	}
 
+	locale := s.commentDisplayLocale(r)
 	var slice []PublicCommentView
 	if rootPredicate == `` {
 		slice = make([]PublicCommentView, 0, len(rootRows))
+		var uIDs []string
+		for _, rr := range rootRows {
+			if rr.UserID != "" {
+				uIDs = append(uIDs, rr.UserID)
+			}
+		}
+		authorMod := s.loadAuthorModerationByID(ctx, uIDs, nowMS)
 		for _, rr := range rootRows {
 			dc := rr.toDomainComment()
 			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
-			slice = append(slice, s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer))
+			v := s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer)
+			applyCommentShielding(&v, authorMod, rr.UserID, nowMS, locale)
+			slice = append(slice, v)
 		}
 	} else {
-		slice, err = s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer)
+		slice, err = s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer, locale)
 		if err != nil {
 			return PaginatedCommentsResult{}, err
 		}
@@ -584,22 +804,37 @@ func (s *Service) queryRecentPublicComments(ctx context.Context, limit int) ([]R
 
 func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int, offset int) ([]RecentCommentItem, error) {
 	type joinedRecent struct {
-		ID             string `db:"id"`
-		UserID         string `db:"user_id"`
-		UserRole       string `db:"user_role"`
-		AuthorName     string `db:"author_name"`
-		ContentMD      string `db:"content_md"`
-		TargetTitle    string `db:"target_title"`
-		TargetSlug     string `db:"target_slug"`
-		TargetAuthorID string `db:"target_author_id"`
-		TargetType     string `db:"target_type"`
-		CreatedAt      int64  `db:"created_at"`
+		ID                 string `db:"id"`
+		UserID             string `db:"user_id"`
+		UserRole           string `db:"user_role"`
+		UserStatus         string `db:"user_status"`
+		UserBanUntil       int64  `db:"user_ban_until"`
+		UserMutedUntil     int64  `db:"user_muted_until"`
+		UserBanReason      string `db:"user_ban_reason"`
+		UserShieldComments int    `db:"user_shield_comments"`
+		UserShieldText     string `db:"user_shield_text"`
+		AuthorName         string `db:"author_name"`
+		ContentMD          string `db:"content_md"`
+		TargetTitle        string `db:"target_title"`
+		TargetSlug         string `db:"target_slug"`
+		TargetAuthorID     string `db:"target_author_id"`
+		TargetPubAt        int64  `db:"target_pub_at"`
+		TargetType         string `db:"target_type"`
+		CreatedAt          int64  `db:"created_at"`
 	}
 	baseSQL := `
-		SELECT c.id, c.user_id, COALESCE(u.role, '') AS user_role, c.author_name, c.content_md,
+		SELECT c.id, c.user_id, COALESCE(u.role, '') AS user_role,
+		       COALESCE(u.status, '') AS user_status,
+		       COALESCE(u.ban_until, 0) AS user_ban_until,
+		       COALESCE(u.muted_until, 0) AS user_muted_until,
+		       COALESCE(u.ban_reason, '') AS user_ban_reason,
+		       CASE WHEN u.shield_comments THEN 1 ELSE 0 END AS user_shield_comments,
+		       COALESCE(u.shield_text, '') AS user_shield_text,
+		       c.author_name, c.content_md,
 		       COALESCE(a.title, p.title, '') AS target_title,
 		       COALESCE(a.slug, p.slug, '') AS target_slug,
 		       COALESCE(a.author_id, p.author_id, '') AS target_author_id,
+		       COALESCE(a.published_at, 0) AS target_pub_at,
 		       c.target_type, c.created_at
 		FROM comments c
 		LEFT JOIN users u ON c.user_id <> '' AND u.id = c.user_id
@@ -621,15 +856,38 @@ func (s *Service) queryRecentPublicCommentsOffset(ctx context.Context, limit int
 	if s.settings != nil {
 		snap = s.settings.Snapshot()
 	}
+	nowMS := time.Now().UnixMilli()
 	out := make([]RecentCommentItem, 0, len(rows))
 	for _, r := range rows {
-		renderedHTML := s.maskCommentHTML(ctx, snap, s.renderer.RenderComment(r.ContentMD))
-		plain := render.ExtractPlainTextFromHTML(renderedHTML)
+		var plain string
+		if r.UserID != "" {
+			au := domain.User{
+				ID:             r.UserID,
+				Status:         r.UserStatus,
+				BanUntil:       r.UserBanUntil,
+				MutedUntil:     r.UserMutedUntil,
+				BanReason:      r.UserBanReason,
+				ShieldComments: r.UserShieldComments != 0,
+				ShieldText:     r.UserShieldText,
+			}
+			s.healExpiredModerationRow(ctx, &au, nowMS)
+			if au.IsCommentShieldedAt(nowMS) {
+				if custom := strings.TrimSpace(au.ShieldText); custom != "" {
+					plain = custom
+				} else {
+					plain = defaultShieldedCommentText(snap.Site.DefaultLocale)
+				}
+			}
+		}
+		if plain == "" {
+			renderedHTML := s.maskCommentHTML(ctx, snap, s.renderer.RenderComment(r.ContentMD))
+			plain = render.ExtractPlainTextFromHTML(renderedHTML)
+		}
 		isStaffOrAuthor := r.UserID != "" &&
 			(r.UserRole == domain.RoleAdmin || r.UserRole == domain.RoleEditor ||
 				(r.TargetAuthorID != "" && r.UserID == r.TargetAuthorID))
 		maskedAuthor := s.maskDisplayNickname(ctx, snap, r.AuthorName, isStaffOrAuthor)
-		targetURL := visibility.ArticlePath(r.TargetSlug) + "#comment-" + r.ID
+		targetURL := s.guard.ArticleSlugURL(r.TargetSlug, r.TargetPubAt) + "#comment-" + r.ID
 		if r.TargetType == domain.TargetTypePage {
 			targetURL = "/" + r.TargetSlug + "#comment-" + r.ID
 		}
@@ -657,6 +915,15 @@ func (s *Service) CreateComment(
 	snap := s.settings.Snapshot()
 	if snap.Reading.CommentAccessMode == domain.CommentAccessOff {
 		return PublicCommentView{}, "", ErrCommentsClosed
+	}
+	nowCheck := time.Now().UnixMilli()
+	if viewer != nil {
+		if viewer.IsBannedAt(nowCheck) {
+			return PublicCommentView{}, "", &UserMutedError{MutedUntil: viewer.BanUntil, Reason: viewer.BanReason}
+		}
+		if viewer.IsMutedAt(nowCheck) {
+			return PublicCommentView{}, "", &UserMutedError{MutedUntil: viewer.MutedUntil, Reason: viewer.BanReason}
+		}
 	}
 	isLoggedUser := viewer != nil && viewer.Status == domain.UserStatusActive
 	if snap.Reading.CommentAccessMode == domain.CommentAccessRegistered && !isLoggedUser {
@@ -694,9 +961,9 @@ func (s *Service) CreateComment(
 		return PublicCommentView{}, "", errors.New("comments: unsupported target_type")
 	}
 
-	contentMD := strings.TrimSpace(in.ContentMD)
-	if contentMD == "" || len([]rune(contentMD)) > 4000 {
-		return PublicCommentView{}, "", errors.New("comments: content length must be between 1 and 4000 characters")
+	contentMD, normErr := normalizeAndCheckCommentContent(in.ContentMD, snap.Reading, viewer, true)
+	if normErr != nil {
+		return PublicCommentView{}, "", normErr
 	}
 
 	// Resolve identity: authenticated user OR self-healing GuestPassport + PoW verification.
@@ -869,11 +1136,11 @@ func (s *Service) CreateComment(
 			}
 		} else if resMap, ok := hookOut.(map[string]any); ok {
 			if nextMD, sOk := resMap["content_md"].(string); sOk {
-				trimmedNext := strings.TrimSpace(nextMD)
-				if trimmedNext == "" || len([]rune(trimmedNext)) > 4000 {
+				compactedNext, cErr := normalizeAndCheckCommentContent(nextMD, snap.Reading, viewer, true)
+				if cErr != nil {
 					return PublicCommentView{}, "", ErrCommentRejected
 				}
-				record.ContentMD = trimmedNext
+				record.ContentMD = compactedNext
 			}
 			if nextStatus, sOk := resMap["status"].(string); sOk && nextStatus == domain.CommentStatusPending {
 				record.Status = domain.CommentStatusPending
@@ -955,9 +1222,19 @@ func (s *Service) UpdateOwnComment(
 	commentID string,
 	newContentMD string,
 ) (PublicCommentView, error) {
-	trimmed := strings.TrimSpace(newContentMD)
-	if trimmed == "" || len([]rune(trimmed)) > 4000 {
-		return PublicCommentView{}, errors.New("comments: content length must be between 1 and 4000 characters")
+	nowCheck := time.Now().UnixMilli()
+	if viewer != nil {
+		if viewer.IsBannedAt(nowCheck) {
+			return PublicCommentView{}, &UserMutedError{MutedUntil: viewer.BanUntil, Reason: viewer.BanReason}
+		}
+		if viewer.IsMutedAt(nowCheck) {
+			return PublicCommentView{}, &UserMutedError{MutedUntil: viewer.MutedUntil, Reason: viewer.BanReason}
+		}
+	}
+	snap := s.settings.Snapshot()
+	trimmed, normErr := normalizeAndCheckCommentContent(newContentMD, snap.Reading, viewer, true)
+	if normErr != nil {
+		return PublicCommentView{}, normErr
 	}
 
 	var existing domain.Comment
@@ -992,7 +1269,6 @@ func (s *Service) UpdateOwnComment(
 
 	nextStatus := existing.Status
 	if !isStaff {
-		snap := s.settings.Snapshot()
 		evalLocale := strings.TrimSpace(existing.NotifyLocale)
 		if evalLocale == "" {
 			evalLocale = snap.Site.DefaultLocale
@@ -1057,11 +1333,11 @@ func (s *Service) UpdateOwnComment(
 					}
 				} else if resMap, ok := hookOut.(map[string]any); ok {
 					if nextMD, sOk := resMap["content_md"].(string); sOk {
-						trimmedNext := strings.TrimSpace(nextMD)
-						if trimmedNext == "" || len([]rune(trimmedNext)) > 4000 {
+						compactedNext, cErr := normalizeAndCheckCommentContent(nextMD, snap.Reading, viewer, true)
+						if cErr != nil {
 							return PublicCommentView{}, ErrCommentRejected
 						}
-						trimmed = trimmedNext
+						trimmed = compactedNext
 					}
 					if hs, sOk := resMap["status"].(string); sOk && hs == domain.CommentStatusPending {
 						nextStatus = domain.CommentStatusPending

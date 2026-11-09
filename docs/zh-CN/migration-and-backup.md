@@ -14,7 +14,7 @@
 
 旧版备份包中存在大量历史包袱（如 10KB 字符串分片表、标签间接推导分类、裸口令哈希与 `.html` 固定链接）。`Volo-go` 的流式解析器（`json.Decoder` 逐条消费，不将大包读入内存）在单次导入事务中自动完成以下转换：
 
-| 旧版历史结构 | `Volo-go` 正规化落库目标（`v7` Schema） | 迁移行为说明 |
+| 旧版历史结构 | `Volo-go` 正规化落库目标（`v8` Schema） | 迁移行为说明 |
 | :--- | :--- | :--- |
 | 分片键值文档（专题、书架、每日统计、Webhook） | `series`、`series_articles`、`books`、`book_chapters`、`analytics_daily`、`webhooks` | 自动拼合还原多片 JSON 并拆入具备外键约束的正规关系表 |
 | `category` + `category_tag` + `tag_article` 间接归类 | `articles.category_id` + `article_tags` | 自动通过文章关联标签反向推导主分类并直接绑定至文章，同时保留全部自由标签 |
@@ -60,7 +60,7 @@
 
 ```text
 volo-backup-20261108-010000.zip
-├── manifest.json                 # 记录 format、schema_version (v7)、source_dialect 及每个流的字节数、行数与 SHA-256
+├── manifest.json                 # 记录 format、schema_version (v8)、source_dialect 及每个流的字节数、行数与 SHA-256
 ├── tables/
 │   ├── 01_settings.ndjson        # 按外键依赖顺序排列的 33 张业务表数据库无关 NDJSON 行流
 │   ├── 02_users.ndjson

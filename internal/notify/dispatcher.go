@@ -405,6 +405,58 @@ func (d *Dispatcher) dispatchCommentNotifications(ctx context.Context, view cont
 	}
 }
 
+// NotifyCommentReplyApproved asynchronously notifies the parent commenter when a pending reply comment
+// is moderated to approved, matching step 3 of dispatchCommentNotifications.
+func (d *Dispatcher) NotifyCommentReplyApproved(_ context.Context, cmt domain.Comment) {
+	if d == nil || d.settings == nil || d.store == nil || d.mailer == nil || strings.TrimSpace(cmt.ParentID) == "" {
+		return
+	}
+	d.enqueueAsync(15*time.Second, func(bgCtx context.Context) {
+		snap := d.settings.Snapshot()
+		if !snap.Notifications.SMTPEnabled || !snap.Notifications.NotifyReplyByEmail || cmt.ParentID == "" {
+			return
+		}
+		sec, err := d.settings.GetNotificationsSecrets(bgCtx)
+		if err != nil {
+			return
+		}
+		var parent domain.Comment
+		pErr := sqlx.GetInto(bgCtx, d.store, &parent,
+			`SELECT id, user_id, notify_email_ciphertext, notify_locale, is_deleted FROM comments WHERE id = ?`, cmt.ParentID)
+		if pErr != nil || parent.IsDeleted {
+			return
+		}
+		recipientEmail := d.decryptCommentNotifyEmail(bgCtx, parent)
+		if recipientEmail == "" {
+			return
+		}
+		title, targetPath := d.resolveTargetTitleAndPath(bgCtx, cmt.TargetType, cmt.TargetID)
+		fullURL := d.getPublicURL() + targetPath + "#comment-" + cmt.ID
+		loc := parent.NotifyLocale
+		if loc == "" {
+			loc = snap.Site.DefaultLocale
+		}
+		vars := map[string]any{
+			"site":    snap.Site.Title,
+			"title":   title,
+			"author":  cmt.AuthorName,
+			"content": truncatePlain(cmt.ContentMD, 400),
+			"url":     fullURL,
+		}
+		subj := "New reply"
+		body := truncatePlain(cmt.ContentMD, 400)
+		if d.catalog != nil {
+			subj = d.catalog.T(loc, "notify.reply_comment.subject", vars)
+			body = d.catalog.T(loc, "notify.reply_comment.body", vars)
+		}
+		_ = d.mailer.Send(bgCtx, snap.Notifications, sec.SMTPPassword, MailMessage{
+			To:       recipientEmail,
+			Subject:  subj,
+			TextBody: body,
+		})
+	})
+}
+
 // BroadcastArticlePublished dispatches `article.published` to Webhooks with strict zero-leak scrubbing!
 func (d *Dispatcher) BroadcastArticlePublished(_ context.Context, raw domain.RawArticle, safeSummary string) {
 	snap := d.settings.Snapshot()
@@ -503,7 +555,8 @@ func (d *Dispatcher) decryptCommentNotifyEmail(ctx context.Context, c domain.Com
 		}
 	}
 	if c.UserID != "" {
-		if u, err := sqlx.Get[domain.User](ctx, d.store, `SELECT email FROM users WHERE id = ? AND status = ?`, c.UserID, domain.UserStatusActive); err == nil {
+		var u domain.User
+		if err := sqlx.GetInto(ctx, d.store, &u, `SELECT email FROM users WHERE id = ? AND status = ?`, c.UserID, domain.UserStatusActive); err == nil {
 			return strings.TrimSpace(u.Email)
 		}
 	}

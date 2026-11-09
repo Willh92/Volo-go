@@ -660,6 +660,7 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 			s.redirectOIDCError(w, r, "admin", st.Next, "unlinked")
 			return
 		}
+		s.deps.Auth.HealExpiredUser(r.Context(), &u)
 		if u.Status != domain.UserStatusActive {
 			s.redirectOIDCError(w, r, "admin", st.Next, "disabled")
 			return
@@ -701,8 +702,9 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 		}
 
 		var matchedUser domain.User
-		if cred, qErr := sqlx.Get[domain.UserCredential](
-			r.Context(), s.deps.Store,
+		var cred domain.UserCredential
+		if qErr := sqlx.GetInto(
+			r.Context(), s.deps.Store, &cred,
 			`SELECT * FROM user_credentials WHERE kind = 'oidc' AND credential_id = ?`,
 			credKey,
 		); qErr == nil {
@@ -712,6 +714,7 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 				s.redirectOIDCError(w, r, "reader", st.Next, "state")
 				return
 			}
+			s.deps.Auth.HealExpiredUser(r.Context(), &u)
 			if u.Role != domain.RoleReader {
 				s.redirectOIDCError(w, r, "reader", st.Next, "forbidden")
 				return
@@ -730,6 +733,7 @@ func (s *AppServer) handleOIDCCallback(w http.ResponseWriter, r *http.Request, p
 				normEmail,
 			)
 			if uErr == nil {
+				s.deps.Auth.HealExpiredUser(r.Context(), &u)
 				if u.Role != domain.RoleReader {
 					s.redirectOIDCError(w, r, "reader", st.Next, "forbidden")
 					return
