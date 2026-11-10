@@ -113,3 +113,42 @@ jobs:
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
+          output: sarif-results
+
+      - name: Summarize CodeQL Findings
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+          rows = []
+          for path in glob.glob("sarif-results/*.sarif"):
+              with open(path, encoding="utf-8") as fh:
+                  data = json.load(fh)
+              for run in data.get("runs", []):
+                  for res in run.get("results", []):
+                      if res.get("suppressions"):
+                          continue
+                      loc = (res.get("locations") or [{}])[0].get("physicalLocation", {})
+                      uri = loc.get("artifactLocation", {}).get("uri", "?")
+                      line = loc.get("region", {}).get("startLine", 0)
+                      msg = res.get("message", {}).get("text", "").splitlines()[0][:160]
+                      rows.append((res.get("ruleId", "?"), res.get("level", "warning"), f"{uri}:{line}", msg))
+          print(f"CodeQL findings: {len(rows)}")
+          for r in rows:
+              print(" | ".join(r))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write(f"### CodeQL `${{ matrix.language }}` findings: {len(rows)}\n\n")
+              if rows:
+                  out.write("| Rule | Level | Location | Message |\n|---|---|---|---|\n")
+                  for r in rows:
+                      out.write("| " + " | ".join(x.replace("|", "\\|") for x in r) + " |\n")
+          PY
+
+      - name: Upload CodeQL SARIF
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: sarif-results/*.sarif
+          if-no-files-found: ignore
+          retention-days: 14
