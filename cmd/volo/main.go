@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -1094,7 +1096,7 @@ func runHealthcheck(ctx context.Context, fs *flag.FlagSet, common *boundCommonFl
 				urlStr = scheme + net.JoinHostPort(host, port) + "/healthz"
 			}
 			if cfg.TLSEnabled() {
-				tlsProbe = healthcheckTLSConfig(probeHost, cfg.GetPublicURL())
+				tlsProbe = healthcheckTLSConfig(probeHost, cfg.GetPublicURL(), cfg.TLSCertFile)
 			}
 		}
 	}
@@ -1138,22 +1140,64 @@ func runHealthcheck(ctx context.Context, fs *flag.FlagSet, common *boundCommonFl
 }
 
 // healthcheckTLSConfig returns the client TLS settings for the auto-derived native-HTTPS /healthz probe.
-// Certificate verification is skipped ONLY when the probe targets a loopback address: the probe never
-// leaves the host, the certificate is issued for the public hostname (not 127.0.0.1), and the goal is a
-// liveness check of this very process. Non-loopback probes keep full verification against the
-// VOLO_PUBLIC_URL hostname.
-func healthcheckTLSConfig(probeHost, publicURL string) *tls.Config {
-	if strings.EqualFold(strings.TrimSpace(probeHost), "localhost") {
-		return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12} //nolint:gosec // loopback-only liveness probe (see comment above)
-	}
-	if ip, err := netip.ParseAddr(strings.Trim(probeHost, "[]")); err == nil && ip.Unmap().IsLoopback() {
-		return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12} //nolint:gosec // loopback-only liveness probe (see comment above)
-	}
+// Verification is never disabled. For loopback probes the certificate is issued for the public hostname
+// (not 127.0.0.1), so trust is pinned to the very certificate chain configured in VOLO_TLS_CERT_FILE
+// (system roots plus every certificate in that file, which also covers self-signed certificates) and the
+// expected server name is taken from VOLO_PUBLIC_URL or, failing that, the leaf certificate's SAN/CN.
+// Non-loopback probes verify against the system roots and the VOLO_PUBLIC_URL hostname.
+func healthcheckTLSConfig(probeHost, publicURL, certFile string) *tls.Config {
 	serverName := ""
 	if u, err := url.Parse(publicURL); err == nil {
 		serverName = u.Hostname()
 	}
-	return &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
+	host := strings.Trim(strings.TrimSpace(probeHost), "[]")
+	loopback := strings.EqualFold(host, "localhost")
+	if ip, err := netip.ParseAddr(host); err == nil && ip.Unmap().IsLoopback() {
+		loopback = true
+	}
+	cfg := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
+	if !loopback {
+		return cfg
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	rest, _ := os.ReadFile(certFile)
+	var leaf *x509.Certificate
+	for len(rest) > 0 {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, pErr := x509.ParseCertificate(block.Bytes)
+		if pErr != nil {
+			continue
+		}
+		if leaf == nil {
+			leaf = c
+		}
+		pool.AddCert(c)
+	}
+	cfg.RootCAs = pool
+	if leaf != nil && (serverName == "" || leaf.VerifyHostname(serverName) != nil) {
+		switch {
+		case len(leaf.DNSNames) > 0:
+			cfg.ServerName = strings.TrimPrefix(leaf.DNSNames[0], "*.")
+			if strings.HasPrefix(leaf.DNSNames[0], "*.") {
+				cfg.ServerName = "healthz." + cfg.ServerName
+			}
+		case len(leaf.IPAddresses) > 0:
+			cfg.ServerName = leaf.IPAddresses[0].String()
+		case leaf.Subject.CommonName != "":
+			cfg.ServerName = leaf.Subject.CommonName
+		}
+	}
+	return cfg
 }
 
 // extractFirstPositional allows callers to write either `volo backup restore foo.zip --dry-run`

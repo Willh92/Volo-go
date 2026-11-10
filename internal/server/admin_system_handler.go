@@ -405,7 +405,9 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("format")), "text") {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.Header().Set("Content-Disposition", `attachment; filename="volo-runtime.log"`)
-			_, _ = w.Write([]byte(logging.FormatText(items)))
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			// Served as a plain-text attachment (never rendered as HTML).
+			http.ServeContent(w, r, "volo-runtime.log", time.Time{}, strings.NewReader(logging.FormatText(items)))
 			return
 		}
 		var ms runtime.MemStats

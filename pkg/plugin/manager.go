@@ -2041,7 +2041,8 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		})
 		if rtErr != nil {
-			slog.Warn("plugin: failed to initialize runtime for onInstall hook", "plugin_id", manifest.ID, "version", manifest.Version, "err", rtErr)
+			// Error details may echo plugin-controlled HTTP data; they go to the plugin's own log only.
+			slog.Warn("plugin: failed to initialize runtime for onInstall hook (see plugin log)", "plugin_id", manifest.ID, "version", manifest.Version)
 			m.logger.Write(manifest.ID, "warn", "install", "onInstall init error: "+rtErr.Error())
 		} else {
 			if installRT.hasCallable("onInstall") {
@@ -2061,7 +2062,8 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 	m.logger.Write(manifest.ID, "info", "install", "installed external plugin v"+manifest.Version)
 	if wasEnabled {
 		if eErr := m.Enable(ctx, manifest.ID); eErr != nil {
-			slog.Warn("plugin: failed to re-enable upgraded plugin", "plugin_id", manifest.ID, "version", manifest.Version, "err", eErr)
+			slog.Warn("plugin: failed to re-enable upgraded plugin (see plugin log)", "plugin_id", manifest.ID, "version", manifest.Version)
+			m.logger.Write(manifest.ID, "warn", "install", "re-enable after upgrade failed: "+eErr.Error())
 			return m.toSummary(mp, locale), fmt.Errorf("plugin %q upgraded to v%s but failed to re-enable: %w", manifest.ID, manifest.Version, eErr)
 		}
 	}

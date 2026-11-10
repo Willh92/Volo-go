@@ -736,7 +736,9 @@ func (r *urlRewriter) rewriteURL(raw string) string {
 		}
 	}
 
-	if !strings.Contains(u, "://") && !strings.HasPrefix(u, "/") && !strings.HasPrefix(u, "#") && !strings.HasPrefix(u, "?") && !strings.HasPrefix(u, "data:") && !strings.HasPrefix(u, "mailto:") && !strings.HasPrefix(u, "javascript:") {
+	lu := strings.ToLower(u)
+	if !strings.Contains(u, "://") && !strings.HasPrefix(u, "/") && !strings.HasPrefix(u, "#") && !strings.HasPrefix(u, "?") &&
+		!strings.HasPrefix(lu, "data:") && !strings.HasPrefix(lu, "mailto:") && !strings.HasPrefix(lu, "javascript:") && !strings.HasPrefix(lu, "vbscript:") {
 		relPath, relSuffix := splitPathQueryFrag(u)
 		for _, pfx := range []string{"image/", "images/", "upload/"} {
 			if strings.HasPrefix(relPath, pfx) && len(relPath) > len(pfx) {
