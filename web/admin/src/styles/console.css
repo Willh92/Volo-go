@@ -4677,9 +4677,6 @@ body.volo-is-sorting * {
   .volo-content {
     padding: 18px 16px 68px;
   }
-  .volo-ed-mobile-tabs {
-    display: flex;
-  }
   .volo-ed-body.mode-sv,
   .volo-ed-body.mode-sv.with-outline,
   .volo-ed-body.mode-ir.with-outline,
@@ -4693,13 +4690,24 @@ body.volo-is-sorting * {
     height: 440px;
     max-height: none;
   }
-  .volo-ed-body.mob-pane-write .volo-preview-pane,
-  .volo-ed-body.mob-pane-write .volo-ed-outline {
-    display: none !important;
+  .volo-ed-body.mode-sv .volo-preview-pane {
+    border-top: 0;
   }
-  .volo-ed-body.mob-pane-preview .volo-cm-host,
+  .volo-ed-body.mob-pane-write .volo-ed-outline,
   .volo-ed-body.mob-pane-preview .volo-ed-outline {
     display: none !important;
+  }
+  /* Split view on phones: the inactive pane stays laid out (hidden overlay) instead of display:none,
+     so bidirectional scroll sync keeps editor and preview aligned when toggling 编辑 / 预览. */
+  .volo-ed-body.mode-sv {
+    position: relative;
+  }
+  .volo-ed-body.mode-sv.mob-pane-write .volo-preview-pane,
+  .volo-ed-body.mode-sv.mob-pane-preview .volo-cm-host {
+    position: absolute !important;
+    inset: 0;
+    visibility: hidden;
+    pointer-events: none;
   }
   .volo-ed-body.mob-pane-outline .volo-cm-host,
   .volo-ed-body.mob-pane-outline .volo-preview-pane,
@@ -6254,6 +6262,18 @@ html[data-theme="dark"] .volo-auth-story {
   padding: 6px 10px;
   background: var(--volo-surface);
   border-bottom: 1px solid var(--volo-line);
+}
+
+/* Must come after the base rule above (same specificity), otherwise the tab bar stays hidden on phones. */
+@media (max-width: 1024px) {
+  .volo-ed-mobile-tabs {
+    display: flex;
+  }
+  .volo-ed-mobile-tabs .volo-filter-pill {
+    flex: 1 1 0;
+    text-align: center;
+    min-height: 32px;
+  }
 }
 
 .volo-search-input {

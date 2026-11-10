@@ -7150,7 +7150,11 @@ ${rendered}
             <button
               type="button"
               class={`volo-filter-pill ${mobilePane === "preview" ? "active" : ""}`}
-              onClick={() => setMobilePane("preview")}
+              onClick={() => {
+                const active = document.activeElement as HTMLElement | null;
+                if (active && editorRootRef.current?.contains(active)) active.blur();
+                setMobilePane("preview");
+              }}
             >
               {t("ed.mob_preview")}
             </button>
