@@ -515,7 +515,8 @@ func (w *WAFEngine) recordStrikeInternal(ctx context.Context, clientAddr netip.A
 
 	if is404Probe && (weight >= 2 || reasonCode == ReasonScannerTrap || curOcc >= 3) {
 		if w.AllowRate("audit404:"+reasonCode, clientAddr, 1, time.Minute) {
-			cleanPath := reqPath
+			cleanPath := strings.ReplaceAll(reqPath, "\n", "")
+			cleanPath = strings.ReplaceAll(cleanPath, "\r", "")
 			if len(cleanPath) > 180 {
 				cleanPath = cleanPath[:180]
 			}
