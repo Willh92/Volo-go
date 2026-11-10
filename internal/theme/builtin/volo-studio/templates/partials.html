@@ -105,7 +105,7 @@
 
 {{define "article_card"}}{{$listStyle := default "summary" .ListStyle}}{{if and (not .ListStyle) .Reading}}{{$listStyle = default "summary" .Reading.ListStyle}}{{end}}
 <article class="article__item{{if eq $listStyle "title_only"}} article__item--title-only{{else if and (eq $listStyle "full") .Card.FullHTML}} article__item--full{{end}}">
-  <a class="studio-post-cover" href="{{.Card.URL}}" tabindex="-1" aria-hidden="true">
+  <a class="studio-post-cover" href="{{.Card.URL}}" tabindex="-1" aria-label="{{.Card.Title}}">
     {{if .Card.IsPasswordProtected}}
       {{coverSVG .Card.Slug true}}
     {{else if .Card.CoverURL}}

@@ -74,6 +74,7 @@
   "comment.submitting_pow": "Verifying anti-spam proof…",
   "comment.pending_notice": "Your comment has been submitted and awaits moderation.",
   "comment.deleted_tombstone": "This comment was deleted",
+  "comment.deleted_placeholder": "This comment has been deleted",
   "comment.reply": "Reply",
   "comment.edit": "Edit",
   "comment.delete": "Delete",
@@ -291,5 +292,8 @@
   "comment.tb_link": "Link (Ctrl+K)",
   "comment.tb_image": "Image",
   "comment.tb_codeblock": "Code Block",
-  "comment.tb_table": "Table"
+  "comment.tb_table": "Table",
+  "bookshelf.source_auto": "Online Docs",
+  "bookshelf.source_manual": "Handbook",
+  "bookshelf.source_series": "Series"
 }

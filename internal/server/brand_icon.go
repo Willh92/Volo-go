@@ -71,6 +71,7 @@ func (s *AppServer) handleServeFaviconSVG(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if custom := s.resolveCustomFaviconRedirect(); custom != "" {
+		w.Header().Set("Cache-Control", "no-cache")
 		http.Redirect(w, r, custom, http.StatusFound)
 		return
 	}
@@ -95,7 +96,10 @@ func (s *AppServer) handleServeFaviconICO(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if custom := s.resolveCustomFaviconRedirect(); custom != "" && strings.HasSuffix(strings.ToLower(custom), ".ico") {
+	// Browsers, feed readers and crawlers request /favicon.ico directly; follow any custom site icon
+	// (PNG/JPG/SVG/ICO all work through a redirect) instead of always serving the built-in mark.
+	if custom := s.resolveCustomFaviconRedirect(); custom != "" {
+		w.Header().Set("Cache-Control", "no-cache")
 		http.Redirect(w, r, custom, http.StatusFound)
 		return
 	}

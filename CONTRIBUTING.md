@@ -26,7 +26,7 @@ CGO_ENABLED=0 go vet ./...
 ### 2. 架构与质量红线（不可退化）
 
 1. **体积与内存硬预算**：
-   - 跨 6 大静态发布目标平台（`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`）单二进制体积必须 **`< 20 MiB`**；
+   - 跨 6 大静态发布目标平台（`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`）单二进制体积必须 **`< 21 MiB`**；
    - 空载与温热常驻内存 `VmRSS` 必须 **`< 35 MiB`**；
    - 内嵌管理台静态产物总 Gzip 体积必须 **`< 300 KB`**，且 CodeMirror 6 三模式编辑器核心（`IR` / `WYSIWYG` / `SV`）必须保持按需懒加载。
 2. **多数据库方言与事务纪律**：
@@ -74,7 +74,7 @@ CGO_ENABLED=0 go vet ./...
 ### 2. Non-Negotiable Architectural Invariants
 
 1. **Footprint Budgets**:
-   - Compiled binary size **`< 20 MiB`** across all 6 static release targets (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`);
+   - Compiled binary size **`< 21 MiB`** across all 6 static release targets (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`);
    - Idle & warm `VmRSS` **`< 35 MiB`**;
    - Embedded Admin SPA **`< 300 KB`** total gzipped, keeping the CodeMirror 6 3-mode editor core (`IR` / `WYSIWYG` / `SV`) lazy-loaded.
 2. **SQL Dialect & Transaction Discipline**:

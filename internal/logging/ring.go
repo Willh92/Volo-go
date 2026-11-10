@@ -258,6 +258,41 @@ func NewSlogHandler(out io.Writer, rb *RingBuffer, minLevel slog.Level) slog.Han
 	}
 }
 
+func sanitizeLogStr(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+	return s
+}
+
+// LogError emits an ERROR entry through slog.Default() and guarantees it is also recorded in Default()
+// even when slog.Default() has not been swapped to NewSlogHandler (e.g. in tests or embedded callers).
+func LogError(source string, msg string, args ...any) {
+	source = sanitizeLogStr(source)
+	msg = sanitizeLogStr(msg)
+	fullArgs := make([]any, 0, len(args)+2)
+	if source != "" {
+		fullArgs = append(fullArgs, "source", source)
+	}
+	for _, a := range args {
+		if str, ok := a.(string); ok {
+			fullArgs = append(fullArgs, sanitizeLogStr(str))
+		} else {
+			fullArgs = append(fullArgs, a)
+		}
+	}
+	slog.Error(msg, fullArgs...)
+	if _, ok := slog.Default().Handler().(*ringSlogHandler); !ok {
+		var b strings.Builder
+		b.WriteString(msg)
+		for i := 0; i+1 < len(args); i += 2 {
+			k := sanitizeLogStr(fmt.Sprint(args[i]))
+			v := sanitizeLogStr(fmt.Sprint(args[i+1]))
+			fmt.Fprintf(&b, " %s=%s", k, v)
+		}
+		defaultBuffer.Record("ERROR", source, b.String())
+	}
+}
+
 func (h *ringSlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.minLevel
 }
@@ -273,12 +308,12 @@ func (h *ringSlogHandler) Handle(_ context.Context, r slog.Record) error {
 		lvl = "DEBUG"
 	}
 
-	src := h.source
+	src := sanitizeLogStr(h.source)
 	var b strings.Builder
-	b.WriteString(r.Message)
+	b.WriteString(sanitizeLogStr(r.Message))
 	if h.preAttrs != "" {
 		b.WriteByte(' ')
-		b.WriteString(h.preAttrs)
+		b.WriteString(sanitizeLogStr(h.preAttrs))
 	}
 	r.Attrs(func(a slog.Attr) bool {
 		a.Value = a.Value.Resolve()
@@ -287,15 +322,15 @@ func (h *ringSlogHandler) Handle(_ context.Context, r slog.Record) error {
 		}
 		if a.Key == "component" || a.Key == "source" {
 			if src == "" {
-				src = a.Value.String()
+				src = sanitizeLogStr(a.Value.String())
 				return true
 			}
 		}
-		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value.Any())
+		fmt.Fprintf(&b, " %s=%s", sanitizeLogStr(a.Key), sanitizeLogStr(fmt.Sprint(a.Value.Any())))
 		return true
 	})
 
-	msg := b.String()
+	msg := sanitizeLogStr(b.String())
 	if h.rb != nil {
 		h.rb.Record(lvl, src, msg)
 	}

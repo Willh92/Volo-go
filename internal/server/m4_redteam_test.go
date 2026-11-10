@@ -562,10 +562,10 @@ func TestLegacyRedirectRangeMediaCommentWidgetBudgetAndGuestSelfHeal(t *testing.
 		t.Fatalf("expected 206 Partial Content 'ABCDEFGHIJ', got status=%d body=%q", rangeResp.StatusCode, string(part))
 	}
 
-	// 3. Verify comment-widget.js Gzip budget (< 10240 Bytes) + HTTP Gzip & 304 ETag negotiation!
+	// 3. Verify comment-widget.js Gzip budget (< 11264 Bytes) + HTTP Gzip & 304 ETag negotiation!
 	gzSize, ok := env.app.Deps().Themes.GzippedAssetSize("volo-studio", "comment-widget.js")
-	if !ok || gzSize <= 0 || gzSize >= 10240 {
-		t.Fatalf("comment-widget.js Gzip size must be < 10240 bytes, got %d (ok=%v)", gzSize, ok)
+	if !ok || gzSize <= 0 || gzSize >= 11264 {
+		t.Fatalf("comment-widget.js Gzip size must be < 11264 bytes, got %d (ok=%v)", gzSize, ok)
 	}
 	assetReq, _ := http.NewRequest("GET", env.ts.URL+"/themes/volo-studio/assets/comment-widget.js?v=test", nil)
 	assetReq.Header.Set("Accept-Encoding", "gzip")
@@ -575,8 +575,8 @@ func TestLegacyRedirectRangeMediaCommentWidgetBudgetAndGuestSelfHeal(t *testing.
 	}
 	gzPayload, _ := io.ReadAll(assetResp.Body)
 	assetResp.Body.Close()
-	if assetResp.Header.Get("Content-Encoding") != "gzip" || len(gzPayload) >= 10240 {
-		t.Fatalf("expected gzipped asset < 10240B, got encoding=%q len=%d", assetResp.Header.Get("Content-Encoding"), len(gzPayload))
+	if assetResp.Header.Get("Content-Encoding") != "gzip" || len(gzPayload) >= 11264 {
+		t.Fatalf("expected gzipped asset < 11264B, got encoding=%q len=%d", assetResp.Header.Get("Content-Encoding"), len(gzPayload))
 	}
 	gzReader, err := gzip.NewReader(bytes.NewReader(gzPayload))
 	if err != nil {

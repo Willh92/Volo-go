@@ -1187,6 +1187,10 @@ export function OverviewWorkspace({
       return;
     }
     if (section === "editor") {
+      ++editReqSeqRef.current;
+      dirtyEditorSig.value = false;
+      editingIDRef.current = null;
+      setEditingID(null);
       void loadTaxonomies().then((cats) => {
         if (editingIDRef.current === null && sectionRef.current === "editor") {
           void startNewArticle(cats);
@@ -1217,6 +1221,30 @@ export function OverviewWorkspace({
       void loadOverview(trendDays);
     }
   }, [section]);
+
+  useEffect(() => {
+    const onNavReselect = (ev: Event) => {
+      const sec = (ev as CustomEvent<{ section?: string }>)?.detail?.section || sectionRef.current;
+      if (sec === "editor") {
+        ++editReqSeqRef.current;
+        dirtyEditorSig.value = false;
+        editingIDRef.current = null;
+        setEditingID(null);
+        void loadTaxonomies().then((cats) => {
+          if (sectionRef.current === "editor") {
+            void startNewArticle(cats);
+          }
+        });
+      } else if ((sec === "articles" || sec === "drafts") && editingIDRef.current !== null) {
+        ++editReqSeqRef.current;
+        dirtyEditorSig.value = false;
+        editingIDRef.current = null;
+        setEditingID(null);
+      }
+    };
+    window.addEventListener("volo:nav-reselect", onNavReselect);
+    return () => window.removeEventListener("volo:nav-reselect", onNavReselect);
+  }, []);
 
   useEffect(() => {
     if (section === "dashboard") {
@@ -2481,7 +2509,7 @@ export function OverviewWorkspace({
                 </button>
                 {!collapsedPanels.media && (
                   <>
-                    <div class="volo-auto-grid">
+                    <div class="volo-auto-grid volo-media-grid">
                       <div class="volo-field">
                         <label>{t("art.cover_url")}</label>
                         <div class="volo-input-row">

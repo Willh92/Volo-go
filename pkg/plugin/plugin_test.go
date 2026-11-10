@@ -259,9 +259,9 @@ func TestChaosSandboxInfiniteLoopStackOverflowAndCircuitBreaker(t *testing.T) {
 	}
 }
 
-//  2. Capability Sandbox & Outbound SSRF Firewall Tests:
-//     - Undeclared permissions (`kv`) are NOT injected into `volo` object (`undefined`)
-//     - Outbound fetch to cloud metadata `169.254.169.254`, loopback `127.0.0.1`, DNS-rebound internal IP,
+// 2. Capability Sandbox & Outbound SSRF Firewall Tests:
+//   - Undeclared permissions (`kv`) are NOT injected into `volo` object (`undefined`)
+//   - Outbound fetch to cloud metadata `169.254.169.254`, loopback `127.0.0.1`, DNS-rebound internal IP,
 //     and non-allowlisted host `evil.example.com` are 100% blocked!
 func TestCapabilitySandboxAndSSRFFirewall(t *testing.T) {
 	ctx := context.Background()

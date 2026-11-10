@@ -658,7 +658,7 @@ function App() {
 
   const navigateTo = async (rawSec: string) => {
     const next = (rawSec in SECTION_LABEL_KEYS ? rawSec : "dashboard") as NavSection;
-    if (next !== section && dirtyEditorSig.value) {
+    if (dirtyEditorSig.value) {
       const ok = await openConfirm({
         title: t("ui.unsaved_title"),
         message: t("ui.unsaved_msg"),
@@ -668,6 +668,7 @@ function App() {
       if (!ok) return;
       dirtyEditorSig.value = false;
     }
+    const isReselect = next === section;
     setSection(next);
     setMobileMenuOpen(false);
     const parent = findParentGroup(next);
@@ -678,6 +679,9 @@ function App() {
       const targetHash = `#${next}`;
       if (window.location.hash !== targetHash) {
         window.history.replaceState(null, "", targetHash);
+      }
+      if (isReselect) {
+        window.dispatchEvent(new CustomEvent("volo:nav-reselect", { detail: { section: next } }));
       }
     }
     resetConsoleScroll();
@@ -972,7 +976,7 @@ function App() {
         <div class="volo-rail-footer">
           <span>
             <span class="volo-rail-dot" />
-            VOLO v1.0.0
+            VOLO v1.0.1
           </span>
           <span>{t(`role.${user.role}`)}</span>
         </div>

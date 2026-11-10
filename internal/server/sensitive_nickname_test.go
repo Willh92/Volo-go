@@ -1036,4 +1036,3 @@ func TestExistingSensitiveCommentsAndNicknames_MaskedOnDisplayWithoutAnomaly(t *
 		t.Fatalf("expected host builtin_spam_filter blocked_keywords to mask existing comment HTML, got %q", hostMaskedGuest.ContentHTML)
 	}
 }
-

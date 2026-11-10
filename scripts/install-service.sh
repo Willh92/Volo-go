@@ -1778,15 +1778,24 @@ VOLO_ADMIN_PATH=${ADMIN_PATH}
 VOLO_SECRET_KEY=<generated-256-bit-secret>
 VOLO_GEO_ACCESS_ENABLED=true
 
+# Optional native HTTPS (keep commented behind Nginx / Caddy; not compatible with VOLO_LISTEN_SOCKET).
+# Set both files to serve HTTPS on VOLO_LISTEN_ADDR (certificates hot-reload on renewal);
+# ports below 1024 need CAP_NET_BIND_SERVICE (systemd AmbientCapabilities=).
+# VOLO_TLS_CERT_FILE=/etc/volo/tls/fullchain.pem
+# VOLO_TLS_KEY_FILE=/etc/volo/tls/privkey.pem
+# VOLO_TLS_MIN_VERSION=1.2
+# VOLO_TLS_HTTP_REDIRECT_ADDR=:80
+
 # Database defaults to SQLite (<VOLO_DATA_DIR>/volo.db) or Setup Wizard data/db.json.
 # Uncomment only to force-override via environment variables:
 # VOLO_DB_DRIVER=sqlite
 # VOLO_DB_DSN=${TARGET_ROOT}/data/volo.db
 
 VOLO_DATA_DIR=${TARGET_ROOT}/data
-VOLO_UPLOAD_DIR=${TARGET_ROOT}/data/uploads
+# Leave VOLO_UPLOAD_DIR / VOLO_GEOIP_DIR commented to manage paths dynamically in Web Console:
+# VOLO_UPLOAD_DIR=${TARGET_ROOT}/data/uploads
 VOLO_BACKUP_DIR=${TARGET_ROOT}/data/backups
-VOLO_GEOIP_DIR=${TARGET_ROOT}/data/geoip
+# VOLO_GEOIP_DIR=${TARGET_ROOT}/data/geoip
 VOLO_PLUGINS_DIR=${TARGET_ROOT}/plugins
 VOLO_THEMES_DIR=${TARGET_ROOT}/themes
 VOLO_LOCALES_DIR=${TARGET_ROOT}/locales"
@@ -2232,6 +2241,12 @@ WantedBy=default.target"
         for cand_p in \
           "$DATA_DIR" "$DATA_DIR_REAL" \
           "$EFF_DATA_DIR" "$EFF_DATA_DIR_REAL" \
+          "$EFF_UPLOAD_DIR" "$(resolve_real_path "$EFF_UPLOAD_DIR")" \
+          "$EFF_BACKUP_DIR" "$(resolve_real_path "$EFF_BACKUP_DIR")" \
+          "$EFF_GEOIP_DIR" "$(resolve_real_path "$EFF_GEOIP_DIR")" \
+          "$RESOLVED_PLUGINS_DIR" "$(resolve_real_path "$RESOLVED_PLUGINS_DIR")" \
+          "$RESOLVED_THEMES_DIR" "$(resolve_real_path "$RESOLVED_THEMES_DIR")" \
+          "$RESOLVED_LOCALES_DIR" "$(resolve_real_path "$RESOLVED_LOCALES_DIR")" \
           "$INSTALL_BIN" "$INSTALL_BIN_REAL" \
           "$ENV_FILE" "$ENV_FILE_REAL" \
           "$EFF_SOCK" "$SOCK_PARENT" "$SOCK_PARENT_REAL"

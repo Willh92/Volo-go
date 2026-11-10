@@ -16,12 +16,12 @@ import (
 )
 
 const (
-	MaxKVKeyBytes          = 191
-	MaxKVValueBytes        = 512 * 1024 // 512 KiB per value (supports lexicon/dictionary payloads)
-	MaxKVKeysPerPlugin     = 1000
-	maxKVListLimit         = 200
-	defaultKVListLimit     = 50
-	kvBufferedFlushPeriod  = 5 * time.Second
+	MaxKVKeyBytes         = 191
+	MaxKVValueBytes       = 512 * 1024 // 512 KiB per value (supports lexicon/dictionary payloads)
+	MaxKVKeysPerPlugin    = 1000
+	maxKVListLimit        = 200
+	defaultKVListLimit    = 50
+	kvBufferedFlushPeriod = 5 * time.Second
 )
 
 // KVItem represents a key-value entry returned by ListPrefix.
@@ -876,4 +876,3 @@ func ClearPluginKV(ctx context.Context, store *sqlx.Store, pluginID string) erro
 	_, err := store.ExecBgContext(ctx, `DELETE FROM plugin_kv WHERE plugin_id = ?`, pluginID)
 	return err
 }
-

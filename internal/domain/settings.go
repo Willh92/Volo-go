@@ -47,8 +47,8 @@ type ReadingSettings struct {
 	EnablePJAX            bool     `json:"enable_pjax"`
 	ShowCodeLineNumbers   bool     `json:"show_code_line_numbers"`
 	AllowReaderRegister   bool     `json:"allow_reader_register"`
-	CommentAccessMode     string   `json:"comment_access_mode"`     // all | registered | off
-	CommentModerationMode string   `json:"comment_moderation_mode"` // off | smart | all
+	CommentAccessMode     string   `json:"comment_access_mode"`      // all | registered | off
+	CommentModerationMode string   `json:"comment_moderation_mode"`  // off | smart | all
 	CommentMinLength      int      `json:"comment_min_length"`       // default 2
 	CommentMaxLengthGuest int      `json:"comment_max_length_guest"` // default 512
 	CommentMaxLengthUser  int      `json:"comment_max_length_user"`  // default 1024
@@ -60,8 +60,10 @@ type ReadingSettings struct {
 	BlockedKeywords       []string `json:"blocked_keywords"`
 	AllowedKeywords       []string `json:"allowed_keywords"`
 	PoWDifficultyBits     int      `json:"pow_difficulty_bits"`
-	AssetCDNPrefix        string   `json:"asset_cdn_prefix"`
-	VendorCDNPrefix       string   `json:"vendor_cdn_prefix"`
+	// CommentTrashRetentionDays: trashed comments older than this are purged by the janitor (0 = manual only).
+	CommentTrashRetentionDays int    `json:"comment_trash_retention_days"`
+	AssetCDNPrefix            string `json:"asset_cdn_prefix"`
+	VendorCDNPrefix           string `json:"vendor_cdn_prefix"`
 }
 
 // Default comment length constraints by caller identity.
@@ -354,8 +356,16 @@ func DefaultReadingSettings() ReadingSettings {
 		AllowedKeywords:       []string{},
 		PoWDifficultyBits:     16,
 		VendorCDNPrefix:       DefaultVendorCDNPrefix,
+
+		CommentTrashRetentionDays: DefaultCommentTrashRetentionDays,
 	}
 }
+
+// Comment trash retention bounds (days). 0 disables automatic purging (manual empty only).
+const (
+	DefaultCommentTrashRetentionDays = 30
+	MaxCommentTrashRetentionDays     = 3650
+)
 
 // DefaultVendorCDNPrefix is the default npm CDN prefix for on-demand KaTeX & Mermaid libraries.
 const DefaultVendorCDNPrefix = "https://cdn.jsdelivr.net/npm"

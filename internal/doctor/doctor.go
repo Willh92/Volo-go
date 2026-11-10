@@ -2,6 +2,8 @@ package doctor
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -99,6 +101,11 @@ func Run(ctx context.Context, cfg *config.Config, store *sqlx.Store) *Report {
 
 	// 5. Optional Offline GeoIP Databases
 	add(checkGeoIPAssets(ctx, cfg, store))
+
+	// 5b. Native HTTPS certificate (only when VOLO_TLS_CERT_FILE/VOLO_TLS_KEY_FILE are configured)
+	if cfg.TLSEnabled() {
+		add(checkTLSCertificate(cfg, time.Now()))
+	}
 
 	// 6. Admin Console Path Cloaking Posture
 	adminPath := "/console"
@@ -393,6 +400,84 @@ func checkWritableDirs(cfg *config.Config) CheckResult {
 			"backups": dBackups,
 		},
 		Summary: fmt.Sprintf("data (%s), uploads (%s), and backups (%s) writable", dData, dUploads, dBackups),
+	}
+}
+
+// tlsExpiryWarnWindow is the remaining-validity threshold under which the TLS certificate check warns.
+const tlsExpiryWarnWindow = 14 * 24 * time.Hour
+
+// checkTLSCertificate verifies the native HTTPS key pair is readable and matching, and grades the
+// leaf certificate's remaining validity: expired -> fail, < 14 days -> warn, otherwise ok.
+func checkTLSCertificate(cfg *config.Config, now time.Time) CheckResult {
+	certPath := cleanDisplayPath(cfg.TLSCertFile)
+	keyPath := cleanDisplayPath(cfg.TLSKeyFile)
+	for _, f := range []struct{ label, path string }{{"cert", cfg.TLSCertFile}, {"key", cfg.TLSKeyFile}} {
+		fh, err := os.Open(f.path)
+		if err != nil {
+			return CheckResult{
+				Name:    "tls_certificate",
+				Status:  StatusFail,
+				Code:    "tls_unreadable",
+				Params:  map[string]string{"label": f.label, "path": cleanDisplayPath(f.path), "err": err.Error()},
+				Summary: fmt.Sprintf("tls %s file %s is not readable: %v", f.label, cleanDisplayPath(f.path), err),
+			}
+		}
+		_ = fh.Close()
+	}
+	pair, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+	if err != nil {
+		return CheckResult{
+			Name:    "tls_certificate",
+			Status:  StatusFail,
+			Code:    "tls_keypair_invalid",
+			Params:  map[string]string{"cert": certPath, "key": keyPath, "err": err.Error()},
+			Summary: fmt.Sprintf("tls key pair invalid or mismatched (cert=%s key=%s): %v", certPath, keyPath, err),
+		}
+	}
+	leaf := pair.Leaf
+	if leaf == nil && len(pair.Certificate) > 0 {
+		leaf, err = x509.ParseCertificate(pair.Certificate[0])
+	}
+	if leaf == nil || err != nil {
+		return CheckResult{
+			Name:    "tls_certificate",
+			Status:  StatusFail,
+			Code:    "tls_keypair_invalid",
+			Params:  map[string]string{"cert": certPath, "key": keyPath, "err": fmt.Sprint(err)},
+			Summary: fmt.Sprintf("tls leaf certificate unparsable (cert=%s): %v", certPath, err),
+		}
+	}
+	expires := leaf.NotAfter.UTC().Format("2006-01-02")
+	daysLeft := int(leaf.NotAfter.Sub(now).Hours() / 24)
+	subject := leaf.Subject.CommonName
+	if len(leaf.DNSNames) > 0 {
+		subject = strings.Join(leaf.DNSNames, ",")
+	}
+	params := map[string]string{"cert": certPath, "subject": subject, "expires": expires, "days": strconv.Itoa(daysLeft)}
+	switch {
+	case !now.Before(leaf.NotAfter):
+		return CheckResult{
+			Name:    "tls_certificate",
+			Status:  StatusFail,
+			Code:    "tls_cert_expired",
+			Params:  params,
+			Summary: fmt.Sprintf("tls certificate %s (%s) expired on %s", certPath, subject, expires),
+		}
+	case leaf.NotAfter.Sub(now) < tlsExpiryWarnWindow:
+		return CheckResult{
+			Name:    "tls_certificate",
+			Status:  StatusWarn,
+			Code:    "tls_cert_expiring",
+			Params:  params,
+			Summary: fmt.Sprintf("tls certificate %s (%s) expires in %d days on %s; renew soon (hot-reloaded on file change)", certPath, subject, daysLeft, expires),
+		}
+	}
+	return CheckResult{
+		Name:    "tls_certificate",
+		Status:  StatusOK,
+		Code:    "tls_cert_ok",
+		Params:  params,
+		Summary: fmt.Sprintf("tls certificate %s (%s) valid until %s (%d days left)", certPath, subject, expires, daysLeft),
 	}
 }
 

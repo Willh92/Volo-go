@@ -28,6 +28,10 @@
 | `--db-dsn <dsn>` | `VOLO_DB_DSN` | 数据库连接串（SQLite 留空默认 `${VOLO_DATA_DIR}/volo.db`） |
 | `--db-simple-protocol` | `VOLO_DB_SIMPLE_PROTOCOL` | 为 PostgreSQL 事务池（Supabase / PgBouncer）启用纯 Go `pgwire` Simple Query 协议 |
 | `--shutdown-timeout <sec>` | `VOLO_SHUTDOWN_TIMEOUT_SEC` | 优雅停机排空超时秒数（范围 `1`–`120`，默认 `15`） |
+| `--tls-cert <file>` | `VOLO_TLS_CERT_FILE` | 原生 HTTPS 证书链 PEM（与 `--tls-key` 同时设置后启用 TLS；文件变更自动热重载；不能与 `--listen-socket` 同时使用） |
+| `--tls-key <file>` | `VOLO_TLS_KEY_FILE` | 原生 HTTPS 私钥 PEM |
+| `--tls-min-version <1.2\|1.3>` | `VOLO_TLS_MIN_VERSION` | 最低 TLS 版本（默认 `1.2`） |
+| `--tls-http-redirect-addr <addr>` | `VOLO_TLS_HTTP_REDIRECT_ADDR` | 可选明文 HTTP 监听地址（如 `:80`），以 `308` 跳转到 HTTPS |
 
 ### 1.1 `volo serve`（默认命令）
 

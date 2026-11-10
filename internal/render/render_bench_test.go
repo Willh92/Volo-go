@@ -8,7 +8,7 @@ import (
 var sampleBenchmarkMarkdown = strings.Repeat(strings.Join([]string{
 	"## Pure-Go Sovereign Publishing Engine",
 	"",
-	"Volo-go compiles into a single static binary (`CGO_ENABLED=0`) under 20 MiB with live RSS under 35 MiB.",
+	"Volo-go compiles into a single static binary (`CGO_ENABLED=0`) under 21 MiB with live RSS under 35 MiB.",
 	"",
 	"| Capability | Implementation | Memory Budget |",
 	"| --- | --- | --- |",

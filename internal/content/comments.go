@@ -166,6 +166,7 @@ type PublicCommentView struct {
 	AvatarSeed  string              `json:"avatar_seed"`
 	IsAuthor    bool                `json:"is_author,omitempty"`
 	IsShielded  bool                `json:"is_shielded,omitempty"`
+	IsDeleted   bool                `json:"is_deleted,omitempty"` // Tombstone placeholder kept only to preserve surviving replies.
 	ContentHTML string              `json:"content_html"`
 	ContentMD   string              `json:"content_md,omitempty"` // Only populated when CanEdit==true!
 	GeoRegion   string              `json:"geo_region,omitempty"`
@@ -258,7 +259,7 @@ func (s *Service) authorizeCommentTarget(
 	}
 }
 
-const publicCommentSelectCols = `id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash, author_name, author_url, avatar_url, ip_masked, CASE WHEN client_ip <> '' THEN 1 ELSE 0 END AS has_client_ip, geo_region, content_md, status, created_at, updated_at`
+const publicCommentSelectCols = `id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash, author_name, author_url, avatar_url, ip_masked, CASE WHEN client_ip <> '' THEN 1 ELSE 0 END AS has_client_ip, geo_region, content_md, status, is_deleted, created_at, updated_at`
 
 type publicCommentRow struct {
 	ID          string `db:"id"`
@@ -275,6 +276,7 @@ type publicCommentRow struct {
 	GeoRegion   string `db:"geo_region"`
 	ContentMD   string `db:"content_md"`
 	Status      string `db:"status"`
+	IsDeleted   bool   `db:"is_deleted"`
 	CreatedAt   int64  `db:"created_at"`
 	UpdatedAt   int64  `db:"updated_at"`
 }
@@ -299,6 +301,7 @@ func (r publicCommentRow) toDomainComment() domain.Comment {
 		GeoRegion:   r.GeoRegion,
 		ContentMD:   r.ContentMD,
 		Status:      r.Status,
+		IsDeleted:   r.IsDeleted,
 		CreatedAt:   r.CreatedAt,
 		UpdatedAt:   r.UpdatedAt,
 	}
@@ -317,22 +320,49 @@ func (s *Service) resolveCommentViewerIdentity(r *http.Request, viewer *domain.U
 	return isAdmin, callerUserID, callerGuestHash
 }
 
+// commentVisibilityPredicate returns the status/ownership visibility clause (prefixed with " AND ") for a
+// non-deleted comment row, qualifying columns with colPrefix (e.g. "ch."). Admins see every status, so the clause is empty.
+func commentVisibilityPredicate(colPrefix string, isAdmin bool, callerUserID, callerGuestHash string, nowMS int64) (string, []any) {
+	if isAdmin {
+		return "", nil
+	}
+	visOr := []string{colPrefix + `status = ?`}
+	args := []any{domain.CommentStatusApproved}
+	if callerUserID != "" {
+		visOr = append(visOr, colPrefix+`user_id = ?`)
+		args = append(args, callerUserID)
+	}
+	if callerGuestHash != "" {
+		visOr = append(visOr, `(`+colPrefix+`guest_id_hash = ? AND `+colPrefix+`created_at >= ?)`)
+		args = append(args, callerGuestHash, nowMS-GuestEditWindow.Milliseconds())
+	}
+	return ` AND (` + strings.Join(visOr, " OR ") + `)`, args
+}
+
 func buildCommentVisibilityWhere(tType, tID string, isAdmin bool, callerUserID, callerGuestHash string, nowMS int64) (string, []any) {
 	where := `target_type = ? AND target_id = ? AND is_deleted = ?`
 	args := []any{tType, tID, false}
-	if !isAdmin {
-		visOr := []string{`status = ?`}
-		args = append(args, domain.CommentStatusApproved)
-		if callerUserID != "" {
-			visOr = append(visOr, `user_id = ?`)
-			args = append(args, callerUserID)
-		}
-		if callerGuestHash != "" {
-			visOr = append(visOr, `(guest_id_hash = ? AND created_at >= ?)`)
-			args = append(args, callerGuestHash, nowMS-GuestEditWindow.Milliseconds())
-		}
-		where += ` AND (` + strings.Join(visOr, " OR ") + `)`
-	}
+	vis, visArgs := commentVisibilityPredicate("", isAdmin, callerUserID, callerGuestHash, nowMS)
+	where += vis
+	args = append(args, visArgs...)
+	return where, args
+}
+
+// buildCommentTreeWhere extends buildCommentVisibilityWhere with soft-deleted "placeholder" rows: a deleted
+// comment stays in the public tree (rendered as a tombstone) while at least one direct reply is still visible
+// to the viewer, so thread structure and pagination never orphan surviving replies. The EXISTS probe hits
+// idx_comments_target_root_created (target_type, target_id, is_deleted, parent_id, ...).
+func buildCommentTreeWhere(tType, tID string, isAdmin bool, callerUserID, callerGuestHash string, nowMS int64) (string, []any) {
+	liveVis, liveArgs := commentVisibilityPredicate("", isAdmin, callerUserID, callerGuestHash, nowMS)
+	childVis, childArgs := commentVisibilityPredicate("ch.", isAdmin, callerUserID, callerGuestHash, nowMS)
+	where := `target_type = ? AND target_id = ? AND ((is_deleted = ?` + liveVis + `) OR (is_deleted = ? AND EXISTS (` +
+		`SELECT 1 FROM comments ch WHERE ch.target_type = ? AND ch.target_id = ? AND ch.is_deleted = ? AND ch.parent_id = comments.id` +
+		childVis + `)))`
+	args := make([]any, 0, 8+len(liveArgs)+len(childArgs))
+	args = append(args, tType, tID, false)
+	args = append(args, liveArgs...)
+	args = append(args, true, tType, tID, false)
+	args = append(args, childArgs...)
 	return where, args
 }
 
@@ -434,15 +464,21 @@ func (s *Service) hydrateRootThreadsReplies(
 	frontier := make([]string, 0, len(rootRows))
 	var distinctUserIDs []string
 
+	deletedNames := make(map[string]string)
 	for i, rr := range rootRows {
-		dc := rr.toDomainComment()
-		isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
-		roots[i] = s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer)
+		if rr.IsDeleted {
+			roots[i] = s.deletedCommentPlaceholderView(rr, locale)
+			deletedNames[rr.ID] = rr.AuthorName
+		} else {
+			dc := rr.toDomainComment()
+			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
+			roots[i] = s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer)
+			if rr.UserID != "" {
+				distinctUserIDs = append(distinctUserIDs, rr.UserID)
+			}
+		}
 		rootIdxForID[rr.ID] = i
 		frontier = append(frontier, rr.ID)
-		if rr.UserID != "" {
-			distinctUserIDs = append(distinctUserIDs, rr.UserID)
-		}
 	}
 
 	repliesByRoot := make([][]publicCommentRow, len(rootRows))
@@ -494,7 +530,9 @@ func (s *Service) hydrateRootThreadsReplies(
 				repliesByRoot[rIdx] = append(repliesByRoot[rIdx], rep)
 				totalReplies++
 				nextFrontier = append(nextFrontier, rep.ID)
-				if rep.UserID != "" {
+				if rep.IsDeleted {
+					deletedNames[rep.ID] = rep.AuthorName
+				} else if rep.UserID != "" {
 					distinctUserIDs = append(distinctUserIDs, rep.UserID)
 				}
 			}
@@ -504,7 +542,9 @@ func (s *Service) hydrateRootThreadsReplies(
 
 	authorMod := s.loadAuthorModerationByID(ctx, distinctUserIDs, nowMS)
 	for i, rr := range rootRows {
-		applyCommentShielding(&roots[i], authorMod, rr.UserID, nowMS, locale)
+		if !rr.IsDeleted {
+			applyCommentShielding(&roots[i], authorMod, rr.UserID, nowMS, locale)
+		}
 	}
 
 	for rIdx, repList := range repliesByRoot {
@@ -521,6 +561,14 @@ func (s *Service) hydrateRootThreadsReplies(
 		}
 		views := make([]PublicCommentView, 0, len(repList))
 		for _, rep := range repList {
+			if rep.IsDeleted {
+				views = append(views, s.deletedCommentPlaceholderView(rep, locale))
+				continue
+			}
+			// Never echo a deleted author's nickname through "@reply_to_name" on surviving replies.
+			if delName, ok := deletedNames[strings.TrimSpace(rep.ParentID)]; ok && delName != "" && rep.ReplyToName == delName {
+				rep.ReplyToName = ""
+			}
 			dc := rep.toDomainComment()
 			isOwn := canModifyComment(dc, callerUserID, callerGuestHash, nowMS)
 			v := s.toPublicCommentViewCtx(ctx, dc, postAuthorID, isOwn || isAdmin, viewer)
@@ -549,15 +597,15 @@ func (s *Service) ListTargetComments(
 	}
 	isAdmin, callerUserID, callerGuestHash := s.resolveCommentViewerIdentity(r, viewer)
 	nowMS := time.Now().UnixMilli()
-	visWhere, visArgs := buildCommentVisibilityWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
+	treeWhere, treeArgs := buildCommentTreeWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
 
-	rootSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere + ` AND parent_id = '' ORDER BY created_at DESC, id DESC`
+	rootSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + treeWhere + ` AND parent_id = '' ORDER BY created_at DESC, id DESC`
 	var rootRows []publicCommentRow
-	err = sqlx.SelectInto(ctx, s.store, &rootRows, rootSQL, visArgs...)
+	err = sqlx.SelectInto(ctx, s.store, &rootRows, rootSQL, treeArgs...)
 	if err != nil {
 		return nil, err
 	}
-	return s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer, s.commentDisplayLocale(r))
+	return s.hydrateRootThreadsReplies(ctx, treeWhere, treeArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer, s.commentDisplayLocale(r))
 }
 
 // ListTargetCommentsPage returns a paginated slice of root comment threads (newest-first, with replies intact).
@@ -590,12 +638,15 @@ func (s *Service) ListTargetCommentsPage(
 	isAdmin, callerUserID, callerGuestHash := s.resolveCommentViewerIdentity(r, viewer)
 	nowMS := time.Now().UnixMilli()
 	visWhere, visArgs := buildCommentVisibilityWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
+	treeWhere, treeArgs := buildCommentTreeWhere(tType, tID, isAdmin, callerUserID, callerGuestHash, nowMS)
 
+	// totalComments counts only live (non-deleted) visible comments; totalRoots counts live roots plus
+	// deleted-root placeholders that still carry at least one visible reply.
 	var totalComments, totalRoots int
 	if err := s.store.QueryRowContext(
 		ctx,
-		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN parent_id = '' THEN 1 ELSE 0 END), 0) FROM comments WHERE `+visWhere,
-		visArgs...,
+		`SELECT COALESCE(SUM(CASE WHEN is_deleted = ? THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN parent_id = '' THEN 1 ELSE 0 END), 0) FROM comments WHERE `+treeWhere,
+		append([]any{false}, treeArgs...)...,
 	).Scan(&totalComments, &totalRoots); err != nil {
 		return PaginatedCommentsResult{}, err
 	}
@@ -619,10 +670,12 @@ func (s *Service) ListTargetCommentsPage(
 	}
 
 	rootPredicate := ` AND parent_id = ''`
+	listWhere, listArgs := treeWhere, treeArgs
 	if totalRoots == 0 {
-		// Rare fallback when all root ancestors were soft-deleted leaving orphaned replies.
+		// Rare fallback when root ancestors were physically removed leaving orphaned replies.
 		totalRoots = totalComments
 		rootPredicate = ``
+		listWhere, listArgs = visWhere, visArgs
 	}
 
 	totalPages := (totalRoots + perPage - 1) / perPage
@@ -641,12 +694,12 @@ func (s *Service) ListTargetCommentsPage(
 		var rootID string
 		var rootCreatedAt int64
 		for hop := 0; hop < 8 && curID != ""; hop++ {
-			aArgs := make([]any, 0, 1+len(visArgs))
+			aArgs := make([]any, 0, 1+len(listArgs))
 			aArgs = append(aArgs, curID)
-			aArgs = append(aArgs, visArgs...)
+			aArgs = append(aArgs, listArgs...)
 			var anc ancestorRow
 			aErr := sqlx.GetInto(ctx, s.store, &anc,
-				`SELECT id, parent_id, created_at FROM comments WHERE id = ? AND `+visWhere,
+				`SELECT id, parent_id, created_at FROM comments WHERE id = ? AND `+listWhere,
 				aArgs...,
 			)
 			if aErr != nil {
@@ -662,10 +715,10 @@ func (s *Service) ListTargetCommentsPage(
 		if rootID != "" {
 			focusResolvedRoot = true
 			var rankBefore int
-			rankArgs := make([]any, 0, len(visArgs)+3)
-			rankArgs = append(rankArgs, visArgs...)
+			rankArgs := make([]any, 0, len(listArgs)+3)
+			rankArgs = append(rankArgs, listArgs...)
 			rankArgs = append(rankArgs, rootCreatedAt, rootCreatedAt, rootID)
-			rankSQL := `SELECT COUNT(*) FROM comments WHERE ` + visWhere + rootPredicate +
+			rankSQL := `SELECT COUNT(*) FROM comments WHERE ` + listWhere + rootPredicate +
 				` AND (created_at > ? OR (created_at = ? AND id > ?))`
 			if rErr := s.store.QueryRowContext(ctx, rankSQL, rankArgs...).Scan(&rankBefore); rErr == nil {
 				page = (rankBefore / perPage) + 1
@@ -681,10 +734,10 @@ func (s *Service) ListTargetCommentsPage(
 	}
 
 	offset := (page - 1) * perPage
-	rootBaseSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + visWhere + rootPredicate + ` ORDER BY created_at DESC, id DESC`
+	rootBaseSQL := `SELECT ` + publicCommentSelectCols + ` FROM comments WHERE ` + listWhere + rootPredicate + ` ORDER BY created_at DESC, id DESC`
 	rootPageSQL, pageArgs := s.store.Dialect().PaginateSQL(rootBaseSQL, perPage, offset)
-	rootArgs := make([]any, 0, len(visArgs)+len(pageArgs))
-	rootArgs = append(rootArgs, visArgs...)
+	rootArgs := make([]any, 0, len(listArgs)+len(pageArgs))
+	rootArgs = append(rootArgs, listArgs...)
 	rootArgs = append(rootArgs, pageArgs...)
 
 	var rootRows []publicCommentRow
@@ -712,7 +765,7 @@ func (s *Service) ListTargetCommentsPage(
 			slice = append(slice, v)
 		}
 	} else {
-		slice, err = s.hydrateRootThreadsReplies(ctx, visWhere, visArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer, locale)
+		slice, err = s.hydrateRootThreadsReplies(ctx, listWhere, listArgs, rootRows, postAuthorID, isAdmin, callerUserID, callerGuestHash, nowMS, viewer, locale)
 		if err != nil {
 			return PaginatedCommentsResult{}, err
 		}
@@ -1423,7 +1476,7 @@ func (s *Service) DeleteOwnComment(ctx context.Context, r *http.Request, viewer 
 	}
 
 	return s.store.WithTx(ctx, func(tx *sqlx.Tx) error {
-		if _, err := tx.ExecContext(ctx, `UPDATE comments SET is_deleted = ?, updated_at = ? WHERE id = ?`, true, nowMS, existing.ID); err != nil {
+		if err := SoftDeleteCommentTx(ctx, tx, existing.ID, nowMS); err != nil {
 			return err
 		}
 		return syncApprovedCommentCountTx(ctx, tx, existing.TargetType, existing.TargetID)

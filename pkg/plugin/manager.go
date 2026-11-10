@@ -4278,7 +4278,6 @@ func cloneArbitraryMap(in map[string]any) map[string]any {
 	return out
 }
 
-
 // RedactArticleForPlugin enforces the 10th Privacy Surface:
 // 1. Password-protected articles omit SummaryMD, ContentMD, HTML, CoverURL, and AudioURL completely.
 // 2. Partial `:::lock` blocks (including unclosed `:::lock` to EOF outside code fences) are physically stripped.

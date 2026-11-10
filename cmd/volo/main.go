@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -41,8 +44,8 @@ import (
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
-// Version can be overridden at link time via -ldflags="-X main.Version=v1.0.0".
-var Version = "v1.0.0"
+// Version can be overridden at link time via -ldflags="-X main.Version=v1.0.1".
+var Version = "v1.0.1"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -101,6 +104,14 @@ Usage:
   volo doctor [--json]                          Run environment, crypto, DB WAL & FS diagnostics
   volo healthcheck [--url <healthz_url>]        Probe live /healthz over TCP or Unix Socket (Distroless ready)
   volo version                                  Print binary version & runtime info
+
+Native HTTPS (optional; not needed behind Nginx/Caddy/Cloudflare):
+  --tls-cert <file>                Certificate chain PEM (VOLO_TLS_CERT_FILE)
+  --tls-key <file>                 Private key PEM (VOLO_TLS_KEY_FILE)
+  --tls-min-version 1.2|1.3        Minimum TLS version, default 1.2 (VOLO_TLS_MIN_VERSION)
+  --tls-http-redirect-addr <addr>  Extra plain-HTTP listener that 308-redirects to HTTPS,
+                                   e.g. :80 (VOLO_TLS_HTTP_REDIRECT_ADDR)
+  Certificates are hot-reloaded when the files change (acme.sh / certbot renewals); HTTP/2 is negotiated via ALPN.
 `)
 }
 
@@ -127,6 +138,10 @@ type boundCommonFlags struct {
 	dbDSN            string
 	dbSimpleProtocol bool
 	shutdownSec      int
+	tlsCertFile      string
+	tlsKeyFile       string
+	tlsMinVersion    string
+	tlsRedirectAddr  string
 }
 
 func registerCommonFlags(fs *flag.FlagSet, b *boundCommonFlags) {
@@ -153,6 +168,10 @@ func registerCommonFlags(fs *flag.FlagSet, b *boundCommonFlags) {
 	fs.StringVar(&b.dbDSN, "db-dsn", "", "Database DSN")
 	fs.BoolVar(&b.dbSimpleProtocol, "db-simple-protocol", false, "Enable pgx simple protocol for transaction poolers")
 	fs.IntVar(&b.shutdownSec, "shutdown-timeout", 15, "Graceful shutdown timeout in seconds")
+	fs.StringVar(&b.tlsCertFile, "tls-cert", "", "Native HTTPS certificate chain PEM file (enables TLS together with --tls-key)")
+	fs.StringVar(&b.tlsKeyFile, "tls-key", "", "Native HTTPS private key PEM file")
+	fs.StringVar(&b.tlsMinVersion, "tls-min-version", "", "Minimum TLS version: 1.2 (default) or 1.3")
+	fs.StringVar(&b.tlsRedirectAddr, "tls-http-redirect-addr", "", "Optional plain-HTTP listener (e.g. :80) that 308-redirects to HTTPS")
 }
 
 func buildCLIOverrides(fs *flag.FlagSet, b *boundCommonFlags) config.CLIOverrides {
@@ -246,6 +265,22 @@ func buildCLIOverrides(fs *flag.FlagSet, b *boundCommonFlags) config.CLIOverride
 		v := b.shutdownSec
 		o.ShutdownTimeoutSec = &v
 	}
+	if setFlags["tls-cert"] {
+		v := b.tlsCertFile
+		o.TLSCertFile = &v
+	}
+	if setFlags["tls-key"] {
+		v := b.tlsKeyFile
+		o.TLSKeyFile = &v
+	}
+	if setFlags["tls-min-version"] {
+		v := b.tlsMinVersion
+		o.TLSMinVersion = &v
+	}
+	if setFlags["tls-http-redirect-addr"] {
+		v := b.tlsRedirectAddr
+		o.TLSHTTPRedirectAddr = &v
+	}
 	return o
 }
 
@@ -268,6 +303,23 @@ func openMigratedStore(ctx context.Context, cfg *config.Config) (*sqlx.Store, er
 	return store, nil
 }
 
+func probeWritableDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	if _, err := os.ReadDir(dir); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".volo-rw-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
+}
+
 func applyPersistedUploadDir(ctx context.Context, cfg *config.Config, store *sqlx.Store, settingsMgr *repo.SettingsManager, fs *flag.FlagSet) {
 	if cfg == nil || cfg.IsUploadDirPinned() {
 		return
@@ -283,9 +335,6 @@ func applyPersistedUploadDir(ctx context.Context, cfg *config.Config, store *sql
 			return
 		}
 	}
-	if strings.TrimSpace(os.Getenv("VOLO_UPLOAD_DIR")) != "" {
-		return
-	}
 	mgr := settingsMgr
 	if mgr == nil && store != nil {
 		mgr = repo.NewSettingsManager(store, cfg.KeyRing, cfg.DefaultLocale)
@@ -299,7 +348,11 @@ func applyPersistedUploadDir(ctx context.Context, cfg *config.Config, store *sql
 		return
 	}
 	if validDir, err := cfg.ValidateCustomUploadDir(rawDir); err == nil && validDir != "" {
-		_ = os.MkdirAll(validDir, 0o750)
+		if rwErr := probeWritableDir(validDir); rwErr != nil {
+			slog.Warn("persisted storage.local_dir is not readable/writable; keeping default upload directory active",
+				"component", "storage", "local_dir", validDir, "fallback_dir", cfg.GetUploadDir(), "err", rwErr)
+			return
+		}
 		cfg.SetUploadDir(validDir)
 	}
 }
@@ -318,9 +371,6 @@ func applyPersistedGeoIPDir(ctx context.Context, cfg *config.Config, store *sqlx
 		if geoFlagSet {
 			return
 		}
-	}
-	if strings.TrimSpace(os.Getenv("VOLO_GEOIP_DIR")) != "" {
-		return
 	}
 	mgr := settingsMgr
 	if mgr == nil && store != nil {
@@ -391,11 +441,23 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		return 1
 	}
 
-	for _, dir := range []string{cfg.DataDir, cfg.GetUploadDir(), cfg.BackupDir} {
-		if mkErr := os.MkdirAll(dir, 0o750); mkErr != nil {
-			fmt.Fprintf(stderr, "volo serve: directory init failed (%s): %v\n", dir, mkErr)
-			return 1
-		}
+	if mkErr := os.MkdirAll(cfg.DataDir, 0o750); mkErr != nil {
+		fmt.Fprintf(stderr, "volo serve: data directory init failed (%s): %v\n", cfg.DataDir, mkErr)
+		return 1
+	}
+	if upErr := probeWritableDir(cfg.GetUploadDir()); upErr != nil {
+		fallbackUp := filepath.Join(cfg.DataDir, "uploads")
+		slog.Warn("configured upload directory is not writable at startup (check permissions or systemd ProtectHome/ReadWritePaths); falling back to data/uploads so console remains accessible",
+			"component", "storage", "configured_dir", cfg.GetUploadDir(), "fallback_dir", fallbackUp, "err", upErr)
+		_ = os.MkdirAll(fallbackUp, 0o750)
+		cfg.SetUploadDir(fallbackUp)
+	}
+	if bkErr := os.MkdirAll(cfg.BackupDir, 0o750); bkErr != nil {
+		fallbackBk := filepath.Join(cfg.DataDir, "backups")
+		slog.Warn("configured backup directory is not writable at startup; falling back to data/backups",
+			"component", "backup", "configured_dir", cfg.BackupDir, "fallback_dir", fallbackBk, "err", bkErr)
+		_ = os.MkdirAll(fallbackBk, 0o750)
+		cfg.BackupDir = fallbackBk
 	}
 
 	store, err := openMigratedStore(ctx, cfg)
@@ -577,15 +639,30 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		}
 	}()
 
+	// Comment trash janitor: purges trashed comments older than reading.comment_trash_retention_days (every 6h).
+	if contentSvc := appSrv.Deps().Content; contentSvc != nil {
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			contentSvc.RunCommentTrashJanitor(bgCtx)
+		}()
+	}
+
 	handle, err := server.OpenListener(cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "volo serve: %v\n", err)
 		return 1
 	}
 
-	slog.Info("server listening", "component", "http", "version", Version, "addr", handle.Network+"://"+handle.Address, "admin", cfg.AdminPath)
+	slog.Info("server listening", "component", "http", "version", Version, "addr", handle.Network+"://"+handle.Address, "admin", cfg.AdminPath, "tls", handle.TLSConfig != nil)
 	fmt.Fprintf(stdout, "Volo-go %s listening on %s://%s (dialect=%s, admin=%s)\n",
 		Version, handle.Network, handle.Address, store.Dialect().Name(), cfg.AdminPath)
+	if handle.TLSConfig != nil {
+		fmt.Fprintf(stdout, "Native HTTPS enabled on https://%s (HTTP/2 + HTTP/1.1, TLS >= %s, cert hot-reload)\n", handle.Address, cfg.TLSMinVersion)
+		if handle.RedirectListener != nil {
+			fmt.Fprintf(stdout, "HTTP -> HTTPS redirect listening on http://%s\n", handle.RedirectListener.Addr().String())
+		}
+	}
 
 	if err := server.ServeWithGracefulShutdown(ctx, handle, appSrv.Handler(), cfg.ShutdownTimeout); err != nil {
 		slog.Error("server shutdown error", "component", "http", "err", err)
@@ -979,6 +1056,7 @@ func runHealthcheck(ctx context.Context, fs *flag.FlagSet, common *boundCommonFl
 	cli.SkipKeyRing = true
 
 	var sockPath string
+	var tlsProbe *tls.Config
 	urlStr := strings.TrimSpace(rawTargetURL)
 	if cli.ListenSocket != nil && strings.TrimSpace(*cli.ListenSocket) != "" {
 		spec, err := config.ParseListenSocketSpec(*cli.ListenSocket)
@@ -996,23 +1074,32 @@ func runHealthcheck(ctx context.Context, fs *flag.FlagSet, common *boundCommonFl
 		if cfg.ListenSocket != nil && cfg.ListenSocket.Path != "" {
 			sockPath = cfg.ListenSocket.Path
 		} else {
+			scheme := "http://"
+			if cfg.TLSEnabled() {
+				scheme = "https://"
+			}
+			probeHost := "127.0.0.1"
 			host, port, sErr := net.SplitHostPort(cfg.ListenAddr)
 			if sErr != nil {
 				if strings.HasPrefix(cfg.ListenAddr, ":") && len(cfg.ListenAddr) > 1 {
-					urlStr = "http://127.0.0.1" + cfg.ListenAddr + "/healthz"
+					urlStr = scheme + "127.0.0.1" + cfg.ListenAddr + "/healthz"
 				} else {
-					urlStr = "http://127.0.0.1:8080/healthz"
+					urlStr = scheme + "127.0.0.1:8080/healthz"
 				}
 			} else {
 				if host == "" || host == "0.0.0.0" || host == "::" || host == "*" {
 					host = "127.0.0.1"
 				}
-				urlStr = "http://" + net.JoinHostPort(host, port) + "/healthz"
+				probeHost = host
+				urlStr = scheme + net.JoinHostPort(host, port) + "/healthz"
+			}
+			if cfg.TLSEnabled() {
+				tlsProbe = healthcheckTLSConfig(probeHost, cfg.GetPublicURL())
 			}
 		}
 	}
 
-	transport := &http.Transport{Proxy: nil}
+	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsProbe}
 	if sockPath != "" {
 		transport = &http.Transport{
 			Proxy: nil,
@@ -1048,6 +1135,25 @@ func runHealthcheck(ctx context.Context, fs *flag.FlagSet, common *boundCommonFl
 	}
 	fmt.Fprintln(stdout, strings.TrimSpace(string(body)))
 	return 0
+}
+
+// healthcheckTLSConfig returns the client TLS settings for the auto-derived native-HTTPS /healthz probe.
+// Certificate verification is skipped ONLY when the probe targets a loopback address: the probe never
+// leaves the host, the certificate is issued for the public hostname (not 127.0.0.1), and the goal is a
+// liveness check of this very process. Non-loopback probes keep full verification against the
+// VOLO_PUBLIC_URL hostname.
+func healthcheckTLSConfig(probeHost, publicURL string) *tls.Config {
+	if strings.EqualFold(strings.TrimSpace(probeHost), "localhost") {
+		return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12} //nolint:gosec // loopback-only liveness probe (see comment above)
+	}
+	if ip, err := netip.ParseAddr(strings.Trim(probeHost, "[]")); err == nil && ip.Unmap().IsLoopback() {
+		return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12} //nolint:gosec // loopback-only liveness probe (see comment above)
+	}
+	serverName := ""
+	if u, err := url.Parse(publicURL); err == nil {
+		serverName = u.Hostname()
+	}
+	return &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
 }
 
 // extractFirstPositional allows callers to write either `volo backup restore foo.zip --dry-run`

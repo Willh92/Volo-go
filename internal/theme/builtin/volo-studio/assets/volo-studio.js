@@ -124,34 +124,77 @@
   }
 
   var bodyScrollLocked = false;
+  /* iOS Safari ignores overflow:hidden on <body> for touch scrolling and lets the page jump when
+     the soft keyboard opens. On touch devices we therefore pin <body> with position:fixed at the
+     current scroll offset and restore it on unlock. Desktop keeps the plain overflow lock. */
+  var bodyScrollFixed = false;
+  var bodyScrollFixedY = 0;
+  var bodyScrollFixedURL = "";
+  function isCoarseTouchDevice() {
+    try {
+      return !!(window.matchMedia && window.matchMedia("(hover: none) and (pointer: coarse)").matches);
+    } catch (_) {
+      return false;
+    }
+  }
   function syncBodyScrollLock() {
     var locked =
       isOverlayActive(document.getElementById("volo-search-modal")) ||
       isOverlayActive(document.getElementById("volo-lightbox")) ||
       isTocDrawerModalActive() ||
       isMobileBookDrawerOpen() ||
-      isOverlayActive(document.querySelector(".volo-comment-composer:not(.is-inline)")) ||
+      isOverlayActive(document.querySelector(".volo-comment-composer")) ||
       isOverlayActive(document.querySelector(".vc-ban-modal"));
     if (locked === bodyScrollLocked) return;
+    var bodyEl = document.body;
     if (locked) {
       var sbw = Math.max(0, (window.innerWidth || 0) - (document.documentElement.clientWidth || 0));
       var gtr = window.CSS && CSS.supports && CSS.supports("scrollbar-gutter: stable");
       bodyScrollLocked = true;
       document.documentElement.style.overflow = "hidden";
-      if (document.body) {
-        document.body.style.overflow = "hidden";
-        if (!gtr && sbw > 0) document.body.style.paddingRight = sbw + "px";
+      if (bodyEl) {
+        bodyEl.style.overflow = "hidden";
+        if (!gtr && sbw > 0) bodyEl.style.paddingRight = sbw + "px";
+        if (isCoarseTouchDevice()) {
+          bodyScrollFixedY = Math.max(0, Math.round(window.scrollY || window.pageYOffset || 0));
+          bodyScrollFixedURL = window.location.pathname + window.location.search;
+          bodyScrollFixed = true;
+          bodyEl.style.position = "fixed";
+          bodyEl.style.top = -bodyScrollFixedY + "px";
+          bodyEl.style.left = "0";
+          bodyEl.style.right = "0";
+          bodyEl.style.width = "100%";
+        }
       }
     } else {
       bodyScrollLocked = false;
       document.documentElement.style.overflow = "";
-      if (document.body) {
-        document.body.style.overflow = "";
-        document.body.style.paddingRight = "";
+      if (bodyEl) {
+        bodyEl.style.overflow = "";
+        bodyEl.style.paddingRight = "";
+        if (bodyScrollFixed) {
+          var restoreY = bodyScrollFixedY;
+          /* PJAX may have navigated while locked; never restore the previous page's offset. */
+          var samePage = bodyScrollFixedURL === window.location.pathname + window.location.search;
+          bodyScrollFixed = false;
+          bodyEl.style.position = "";
+          bodyEl.style.top = "";
+          bodyEl.style.left = "";
+          bodyEl.style.right = "";
+          bodyEl.style.width = "";
+          if (samePage && restoreY > 0) {
+            var rootStyle = document.documentElement.style;
+            var prevSB = rootStyle.scrollBehavior;
+            rootStyle.scrollBehavior = "auto";
+            window.scrollTo(0, restoreY);
+            rootStyle.scrollBehavior = prevSB;
+          }
+        }
       }
     }
   }
   window.__voloSyncScrollLock = syncBodyScrollLock;
+  window.__voloIsScrollPinned = function () { return bodyScrollFixed; };
 
   function clampPopoverToViewport(el) {
     if (!el || !el.classList.contains("volo-popover")) return;
@@ -948,7 +991,7 @@
     }
 
     function requestSpy() {
-      if (scrollAnimRAF !== 0 || spyPending) return;
+      if (scrollAnimRAF !== 0 || spyPending || bodyScrollFixed) return;
       spyPending = true;
       requestAnimationFrame(updateSpy);
     }
@@ -1491,10 +1534,11 @@
       syncMobBookBtn();
       syncBodyScrollLock();
     };
-    window.addEventListener("scroll", syncMobBookBtn, { passive: true });
+    var onBookScroll = function () { if (!bodyScrollFixed) syncMobBookBtn(); };
+    window.addEventListener("scroll", onBookScroll, { passive: true });
     window.addEventListener("resize", onBookViewportChange, { passive: true });
     tocCleanups.push(function () {
-      window.removeEventListener("scroll", syncMobBookBtn);
+      window.removeEventListener("scroll", onBookScroll);
       window.removeEventListener("resize", onBookViewportChange);
     });
 
@@ -2221,6 +2265,8 @@
   function initBackToTop() {
     var topBtn = document.getElementById("studioBackToTop");
     function onScroll() {
+      /* While <body> is pinned for an overlay (touch devices) scrollY reads 0; keep the last state. */
+      if (bodyScrollFixed) return;
       if (topBtn) topBtn.hidden = window.scrollY < 360;
       syncReadingProgress();
     }

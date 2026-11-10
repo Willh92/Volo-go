@@ -2,7 +2,7 @@
 
 > English version: [Architecture & Performance Internals](../en-US/architecture.md)
 
-`Volo-go` 是从零构建的现代纯 Go（`CGO_ENABLED=0`，Go `1.27.3`，`GOEXPERIMENT=nojsonv2`）独立主权博客引擎，核心设计目标是在**全部 6 大发布目标平台均严格 `< 20 MiB` 的静态单二进制**（`linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`）与 **`< 35 MiB` 常驻内存 (`VmRSS`)** 的严格边界内，提供三方言存储支持、实时无损图片变换、10 大出口零死角隐私防护、纯 Go ES6 插件沙箱与微秒级高并发吞吐。
+`Volo-go` 是从零构建的现代纯 Go（`CGO_ENABLED=0`，Go `1.27.3`，`GOEXPERIMENT=nojsonv2`）独立主权博客引擎，核心设计目标是在**全部 6 大发布目标平台均严格 `< 21 MiB` 的静态单二进制**（`linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`）与 **`< 35 MiB` 常驻内存 (`VmRSS`)** 的严格边界内，提供三方言存储支持、实时无损图片变换、10 大出口零死角隐私防护、纯 Go ES6 插件沙箱与微秒级高并发吞吐。
 
 ---
 

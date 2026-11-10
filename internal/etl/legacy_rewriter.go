@@ -720,12 +720,30 @@ func (r *urlRewriter) rewriteURL(raw string) string {
 			}
 			return target
 		}
+		if strings.HasPrefix(relPath, "/upload/") && len(relPath) > len("/upload/") {
+			target := "/uploads/" + strings.TrimPrefix(relPath, "/upload/") + relSuffix
+			if target != u {
+				r.count++
+			}
+			return target
+		}
 		if upPath, exOK := r.extractedImages[relPath]; exOK {
 			target := upPath + relSuffix
 			if target != u {
 				r.count++
 			}
 			return target
+		}
+	}
+
+	if !strings.Contains(u, "://") && !strings.HasPrefix(u, "/") && !strings.HasPrefix(u, "#") && !strings.HasPrefix(u, "?") && !strings.HasPrefix(u, "data:") && !strings.HasPrefix(u, "mailto:") && !strings.HasPrefix(u, "javascript:") {
+		relPath, relSuffix := splitPathQueryFrag(u)
+		for _, pfx := range []string{"image/", "images/", "upload/"} {
+			if strings.HasPrefix(relPath, pfx) && len(relPath) > len(pfx) {
+				target := "/uploads/" + strings.TrimPrefix(relPath, pfx) + relSuffix
+				r.count++
+				return target
+			}
 		}
 	}
 

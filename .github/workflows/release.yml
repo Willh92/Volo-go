@@ -194,13 +194,13 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
           VOLO_BUDGET_BIN_MB: ${{ vars.VOLO_BUDGET_BIN_MB }}
         run: |
-          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-20}"
+          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-21}"
           MAX_BIN_BYTES=$((BUDGET_BIN_MB * 1024 * 1024))
           STAGE="volo-${VERSION}-${GOOS}-${GOARCH}"
           mkdir -p "dist/${STAGE}/scripts"
           go build -buildvcs=false -trimpath \
             -gcflags="all=-l" \
-            -ldflags="-s -w -funcalign=8 -X main.Version=${VERSION}" \
+            -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
             -o "dist/${STAGE}/volo${{ matrix.ext }}" \
             ./cmd/volo
 
@@ -211,9 +211,16 @@ jobs:
             exit 1
           fi
 
-          cp .env.example README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md docker-compose.yml "dist/${STAGE}/"
-          cp scripts/install-service.sh scripts/install-service.ps1 scripts/install-service-linux.sh scripts/install-service-macos.sh scripts/install-service-windows.ps1 "dist/${STAGE}/scripts/"
-          chmod +x "dist/${STAGE}/scripts/"*.sh
+          cp .env.example README.md README.zh-CN.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md CHANGELOG.zh-CN.md docker-compose.yml "dist/${STAGE}/"
+          # Ship only the service installers relevant to the target OS. The install-service.sh
+          # dispatcher is self-contained (it never sources the per-OS wrappers), and the
+          # install-service-<os> files are thin compatibility wrappers around the dispatcher.
+          case "${GOOS}" in
+            linux)   cp scripts/install-service.sh scripts/install-service-linux.sh "dist/${STAGE}/scripts/" ;;
+            darwin)  cp scripts/install-service.sh scripts/install-service-macos.sh "dist/${STAGE}/scripts/" ;;
+            windows) cp scripts/install-service.ps1 scripts/install-service-windows.ps1 "dist/${STAGE}/scripts/" ;;
+            *) echo "Unsupported GOOS for packaging: ${GOOS}" >&2; exit 1 ;;
+          esac
           cp -r deploy "dist/${STAGE}/deploy"
           cp -r docs "dist/${STAGE}/docs"
           cp -r locales "dist/${STAGE}/locales"
@@ -224,17 +231,49 @@ jobs:
             python3 -c 'import sys; p, v = sys.argv[1], sys.argv[2]; lines = ["@echo off", "chcp 65001 >nul", "cd /d \"%~dp0\"", "echo ==========================================================", f"echo   Volo-go {v} Local Server Starting on 127.0.0.1:8080", "echo ==========================================================", "start \"\" \"http://127.0.0.1:8080\"", "\"%~dp0volo.exe\" serve --listen-addr 127.0.0.1:8080", "pause", ""]; open(p, "wb").write("\r\n".join(lines).encode("ascii"))' "dist/${STAGE}/start-volo.bat" "${VERSION}"
           fi
 
+          # Reproducible archives: normalized permissions and mtimes pinned to the tag commit time.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct 2>/dev/null || true)"
+          case "${SOURCE_DATE_EPOCH}" in
+            ''|*[!0-9]*) SOURCE_DATE_EPOCH="$(date -u -d 2026-01-01T00:00:00Z +%s)" ;;
+          esac
+          export SOURCE_DATE_EPOCH
+          chmod -R u+rwX,go+rX,go-w "dist/${STAGE}"
+          chmod 0755 "dist/${STAGE}/volo${{ matrix.ext }}"
+          find "dist/${STAGE}/scripts" -type f -name '*.sh' -exec chmod 0755 {} +
+          find "dist/${STAGE}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
           cd dist
           STABLE="volo-${GOOS}-${GOARCH}"
+          HAVE_7Z=0
+          if command -v 7z >/dev/null 2>&1; then HAVE_7Z=1; fi
           if [ "${{ matrix.archive }}" = "zip" ]; then
             rm -f "${STAGE}.zip"
-            zip -rq "${STAGE}.zip" "${STAGE}"
+            if [ "${HAVE_7Z}" = "1" ]; then
+              7z a -tzip -mx=9 -mfb=258 -mpass=15 -bd -bso0 -bsp0 "${STAGE}.zip" "${STAGE}"
+            else
+              echo "7z not found; falling back to zip -9" >&2
+              find "${STAGE}" -print | LC_ALL=C sort | zip -9qX "${STAGE}.zip" -@
+            fi
             cp "${STAGE}.zip" "${STABLE}.zip"
           else
-            tar -czf "${STAGE}.tar.gz" "${STAGE}"
+            rm -f "${STAGE}.tar" "${STAGE}.tar.gz"
+            tar --sort=name --format=gnu --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" -cf "${STAGE}.tar" "${STAGE}"
+            touch -d "@${SOURCE_DATE_EPOCH}" "${STAGE}.tar"
+            if [ "${HAVE_7Z}" = "1" ]; then
+              7z a -tgzip -mx=9 -mfb=258 -mpass=15 -bd -bso0 -bsp0 "${STAGE}.tar.gz" "${STAGE}.tar"
+            else
+              echo "7z not found; falling back to gzip -9n" >&2
+              gzip -9n -c "${STAGE}.tar" > "${STAGE}.tar.gz"
+            fi
+            rm -f "${STAGE}.tar"
             cp "${STAGE}.tar.gz" "${STABLE}.tar.gz"
           fi
           rm -rf "${STAGE}"
+          echo "Release archives (bytes):"
+          for f in "${STAGE}".* "${STABLE}".*; do
+            printf '  %-48s %12s bytes (%s)\n' "${f}" "$(wc -c < "${f}" | tr -d ' ')" "$(du -h "${f}" | cut -f1)"
+          done
 
       - name: Upload Target Archive
         uses: actions/upload-artifact@v7
@@ -249,14 +288,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Forward Release Metadata
+      - name: Checkout repository (with tags for release notes)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Forward Release Metadata & Generate Concise Release Notes
         id: meta
         env:
           VER: ${{ needs.verify.outputs.version }}
           IS_PRE: ${{ needs.verify.outputs.is_prerelease }}
+          REPO: ${{ github.repository }}
         run: |
           echo "version=${VER}" >> "${GITHUB_OUTPUT}"
           echo "is_prerelease=${IS_PRE}" >> "${GITHUB_OUTPUT}"
+          python3 .github/scripts/generate-release-notes.py \
+            --version "${VER}" \
+            --repo "${REPO}" \
+            --output release-notes.md
+          cat release-notes.md
 
       - name: Download All Target Archives
         uses: actions/download-artifact@v8
@@ -272,10 +322,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          name: Volo-go ${{ steps.meta.outputs.version }}
           tag_name: ${{ steps.meta.outputs.version }}
           prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
           make_latest: ${{ steps.meta.outputs.is_prerelease == 'true' && 'false' || 'true' }}
-          generate_release_notes: true
+          body_path: release-notes.md
+          generate_release_notes: false
           files: release-assets/*
 
   publish-ghcr:

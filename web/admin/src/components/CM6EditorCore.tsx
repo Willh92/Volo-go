@@ -726,8 +726,10 @@ function parseMarkdownImageTarget(rawTarget: string): string {
 
 function resolveIRImageSrc(rawSrc: string): string {
   const s = rawSrc.trim();
-  if (!s || /^(?:javascript|vbscript|file):/i.test(s) || s.startsWith("//") || s.startsWith("/\\")) return "";
-  if (/^(?:https?:\/\/|data:image\/|blob:|\/)/i.test(s)) return s;
+  if (!s || s.startsWith("//") || s.startsWith("/\\")) return "";
+  if (/^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(s)) return s;
+  if (/^(?:javascript|vbscript|data|file):/i.test(s)) return "";
+  if (/^(?:https?:\/\/|blob:|\/)/i.test(s)) return s;
   if (s.startsWith("./")) return "/" + s.slice(2).replace(/^\/+/, "");
   if (/^(?:image|images|uploads)\//i.test(s)) return "/" + s;
   return s;
@@ -799,6 +801,10 @@ interface IRDocScan {
   fenceState: Uint8Array;
   fenceNoHash: Uint8Array;
   calloutKind: Uint8Array;
+  /** 0 = none, 1 = center, 2 = right, 3 = left — lines inside a multi-line `<div align=…>` / `<center>` block */
+  alignKind: Uint8Array;
+  /** 1 on the standalone opening / closing tag lines of such a block (hidden off-cursor in IR mode) */
+  alignTagLine: Uint8Array;
 }
 
 const NO_HASH_COMMENT_LANGS = new Set([
@@ -966,6 +972,51 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
       fenceState[iterLn] = 2;
       fenceNoHash[iterLn] = curFenceNoHash;
     }
+  }
+
+  // Multi-line alignment containers: `<div align=center>` … `</div>`, `<p align="right">` … `</p>`,
+  // `<center>` … `</center>`, `<div style="text-align:center">` … (Solo / GitHub README style).
+  const alignKind = new Uint8Array(total + 1);
+  const alignTagLine = new Uint8Array(total + 1);
+  for (let ln = 1; ln < total; ln++) {
+    if (fenceState[ln] !== 0) continue;
+    const text = linesText[ln];
+    if (!text || text.length > 400 || !text.includes("<")) continue;
+    const om = /^\s*<(div|p|center|section)\b([^<>]*)>\s*$/i.exec(text);
+    if (!om) continue;
+    const tag = om[1].toLowerCase();
+    let kind = 0;
+    if (tag === "center") {
+      kind = 1;
+    } else {
+      const al = (
+        readHtmlAttr(om[0], "align") ||
+        (/text-align\s*:\s*(center|right|left)/i.exec(readHtmlAttr(om[0], "style"))?.[1] ?? "")
+      ).toLowerCase();
+      kind = al === "center" ? 1 : al === "right" ? 2 : al === "left" ? 3 : 0;
+    }
+    if (!kind) continue;
+    const openRe = new RegExp(`<${tag}\\b[^<>]*>`, "gi");
+    const closeRe = new RegExp(`</${tag}\\s*>`, "gi");
+    let depth = 1;
+    let endLn = -1;
+    const limit = Math.min(total, ln + 400);
+    for (let k = ln + 1; k <= limit; k++) {
+      if (fenceState[k] !== 0) continue;
+      const lt = linesText[k];
+      if (!lt || !lt.includes("<")) continue;
+      depth += (lt.match(openRe) || []).length;
+      depth -= (lt.match(closeRe) || []).length;
+      if (depth <= 0) {
+        endLn = k;
+        break;
+      }
+    }
+    if (endLn < 0) continue;
+    alignTagLine[ln] = 1;
+    if (/^\s*<\/[a-z]+\s*>\s*$/i.test(linesText[endLn])) alignTagLine[endLn] = 1;
+    // Later (inner) containers overwrite outer ones, so nested alignment wins.
+    for (let k = ln + 1; k < endLn; k++) alignKind[k] = kind;
   }
 
   // Second O(N) pass over non-fenced lines using direct array lookups + watermarks (zero B-tree traversal)
@@ -1145,7 +1196,18 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
     }
   }
 
-  const res: IRDocScan = { tables, mermaids, mathBlocks, tableLines, multiLinks, fenceState, fenceNoHash, calloutKind };
+  const res: IRDocScan = {
+    tables,
+    mermaids,
+    mathBlocks,
+    tableLines,
+    multiLinks,
+    fenceState,
+    fenceNoHash,
+    calloutKind,
+    alignKind,
+    alignTagLine,
+  };
   irDocScanCache.set(doc, res);
   return res;
 }
@@ -1420,8 +1482,22 @@ function buildInstantRenderPlugin(): Extension {
         const pLine = /^(\s*<p\b[^>]*>)(.*)(<\/p>\s*)$/i.exec(text);
         const liLine = /^(\s*<li\b[^>]*>)(.*)(<\/li>\s*)$/i.exec(text);
         const listWrapLine = /^\s*<\/?(?:ul|ol)\b[^>]*>\s*$/i.exec(text);
+        const alignTagLine = scan.alignTagLine[line.number] === 1;
+        const alignKind = scan.alignKind[line.number] || 0;
+        if (alignKind) {
+          builder.add(
+            line.from,
+            line.from,
+            Decoration.line({ class: alignKind === 1 ? "cm-ir-center" : alignKind === 2 ? "cm-ir-align-right" : "cm-ir-align-left" })
+          );
+        }
 
-        if (hm) {
+        if (alignTagLine) {
+          // Standalone `<div align=center>` / `</div>` wrapper lines stay visible (dimmed source) so they remain
+          // discoverable and editable; inner lines get the alignment class above.
+          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-align-tag" }));
+          markFree(0, text.length);
+        } else if (hm) {
           const lvl = hm[1].length;
           builder.add(line.from, line.from, Decoration.line({ class: `cm-ir-h cm-ir-h${lvl}` }));
           if (!isCursorLine && markFree(0, hm[0].length)) {
@@ -1766,8 +1842,38 @@ function buildInstantRenderPlugin(): Extension {
             }
           }
 
+          // Linked images [![alt](src)](href): render the image and collapse the link wrapper into a host chip
+          const linkedImgRe =
+            /\[!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
+          while ((m = linkedImgRe.exec(text)) !== null) {
+            const alt = (m[1] || "").trim();
+            const rawTarget = parseMarkdownImageTarget(m[2] || "");
+            const resolvedSrc = resolveIRImageSrc(rawTarget);
+            if (!resolvedSrc) continue;
+            const href = parseMarkdownImageTarget(m[3] || "");
+            const s = m.index;
+            const e = s + m[0].length;
+            const imgFrom = s + 1;
+            const imgTo = imgFrom + 2 + m[1].length + 2 + m[2].length + 1;
+            if (markFree(s, e)) {
+              ops.push({ from: line.from + s, to: line.from + imgFrom, deco: hideDeco });
+              ops.push({
+                from: line.from + imgFrom,
+                to: line.from + imgTo,
+                deco: Decoration.replace({
+                  widget: new ImageIRWidget(resolvedSrc, rawTarget, alt, line.from + imgFrom, line.from + e),
+                }),
+              });
+              ops.push({
+                from: line.from + imgTo,
+                to: line.from + e,
+                deco: Decoration.replace({ widget: new LinkedImageBadgeIRWidget(href, line.from + e) }),
+              });
+            }
+          }
+
           // Markdown Images ![alt](url) on non-cursor lines
-          const mdImgRe = /!\[([^\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
+          const mdImgRe = /!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
           while ((m = mdImgRe.exec(text)) !== null) {
             const alt = (m[1] || "").trim();
             const rawTarget = parseMarkdownImageTarget(m[2] || "");
@@ -1839,10 +1945,9 @@ function buildInstantRenderPlugin(): Extension {
           }
 
           // Markdown Links [label](url)
-          const linkRe = /(?:^|[^!])\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
+          const linkRe = /(?<!!)\[([^[\]\n]+)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
           while ((m = linkRe.exec(text)) !== null) {
-            const lead = m[0].startsWith("[") ? 0 : 1;
-            const s = m.index + lead;
+            const s = m.index;
             const e = m.index + m[0].length;
             const rawLabel = m[1];
             const labelLen = rawLabel.length;
@@ -2227,13 +2332,13 @@ function computeIRImgBox(src: string): { w: number; h: number } | null {
 function lineHasIRTallWidget(state: EditorState, lineNumber: number, text: string): boolean {
   if (getIRDocScan(state.doc).tableLines.has(lineNumber)) return true;
   if (text.length === 0 || text.length > 2400) return false;
-  if (/!\[[^\]\n]*\]\((?:[^()\n]|\([^()\n]*\))+\)/.test(text) || /<(?:img|video|audio)\b[^>]*\bsrc\s*=/i.test(text)) {
+  if (/!\[[^[\]\n]*\]\((?!\))[^()\n]*(?:\([^()\n]*\)[^()\n]*)*\)/.test(text) || /<(?:img|video|audio)\b[^>]*?\bsrc\s*=/i.test(text)) {
     return true;
   }
   if (/^\s*\[toc\]\s*$/i.test(text) || matchStandaloneEmbedVideo(text) !== null) {
     return true;
   }
-  const soloLink = /^\s*\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)\s*$/.exec(text);
+  const soloLink = /^\s*\[([^[\]\n]+)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)\s*$/.exec(text);
   if (soloLink) {
     const target = parseMarkdownImageTarget(soloLink[2] || "");
     if (isVideoMedia("", target) || isAudioMedia("", target)) return true;
@@ -2312,7 +2417,7 @@ function appendSafeCellMarkdown(host: HTMLElement, raw: string): void {
   parts.forEach((seg, idx) => {
     if (idx > 0) host.appendChild(document.createElement("br"));
     const tokenRe =
-      /!\[([^\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(`+)(?!`)([^\n]+?)(?<!`)\5(?!`)|(\bhttps?:\/\/[^\s<>()[\]"']+)|\$(?!\s|\$)([^\n$]*?[^\s\\$])\$(?![0-9a-zA-Z\\$])|\*\*([^*\n]+)\*\*|==([^=\n]+)==|~~([^~\n]+)~~|\*([^*\s][^*\n]*?)\*|\^([^\s^\n[\]]+)\^|~([^\s~\n/]+)~|<(u|mark|kbd|sup|sub|strong|b|em|i|s|del)>([^<\n]+)<\/\15>|<a\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([^<\n]+)<\/a>/gi;
+      /!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)|\[([^[\]\n]+)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)|(`+)(?!`)([^\n]+?)(?<!`)\5(?!`)|(\bhttps?:\/\/[^\s<>()[\]"']+)|\$(?!\s|\$)([^\n$]*?[^\s\\$])\$(?![0-9a-zA-Z\\$])|\*\*([^*\n]+)\*\*|==([^=\n]+)==|~~([^~\n]+)~~|\*([^*\s][^*\n]*?)\*|\^([^\s^\n[\]]+)\^|~([^\s~\n/]+)~|<(u|mark|kbd|sup|sub|strong|b|em|i|s|del)>([^<\n]+)<\/\15>|<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([^<\n]+)<\/a>/gi;
     let last = 0;
     let m: RegExpExecArray | null;
     while ((m = tokenRe.exec(seg)) !== null) {
@@ -2715,6 +2820,45 @@ class ImageIRWidget extends WidgetType {
     wrap.appendChild(img);
     wrap.appendChild(fb);
     return wrap;
+  }
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+/** Compact "↗ host" chip that stands in for the hidden `](href)` tail of a linked image `[![alt](src)](href)`. */
+class LinkedImageBadgeIRWidget extends WidgetType {
+  constructor(
+    readonly href: string,
+    readonly endPos: number
+  ) {
+    super();
+  }
+  eq(other: LinkedImageBadgeIRWidget): boolean {
+    return this.href === other.href && this.endPos === other.endPos;
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const chip = document.createElement("span");
+    chip.className = "cm-ir-img-link-badge";
+    chip.title = this.href;
+    let label = this.href;
+    const hm = /^(?:https?:)?\/\/([^/?#]+)(.*)$/i.exec(this.href);
+    if (hm) {
+      const rest = hm[2].replace(/\/+$/, "");
+      label = hm[1].replace(/^www\./i, "") + rest;
+    }
+    if (label.length > 42) label = label.slice(0, 41) + "…";
+    chip.textContent = `↗ ${label}`;
+    chip.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      view.dispatch({
+        selection: { anchor: Math.min(this.endPos, view.state.doc.length) },
+        userEvent: "select.pointer",
+      });
+      view.focus();
+    });
+    return chip;
   }
   ignoreEvent(): boolean {
     return true;
@@ -3642,6 +3786,14 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
     if (tex) return `$${tex}$`;
   }
 
+  const escHtmlAttr = (val: string): string =>
+    val
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
   // Wrapped WYSIWYG audio/video card
   if (el.classList.contains("volo-wysiwyg-audio-block")) {
     const vSrc = (
@@ -3650,8 +3802,8 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       el.querySelector("video source")?.getAttribute("src") ||
       ""
     ).trim();
-    if (vSrc) {
-      return `\n<video controls preload="metadata" src="${vSrc}"></video>\n\n`;
+    if (vSrc && !/^(?:javascript|vbscript|data):/i.test(vSrc)) {
+      return `\n<video controls preload="metadata" src="${escHtmlAttr(vSrc)}"></video>\n\n`;
     }
     const aSrc = (
       el.getAttribute("data-audio-src") ||
@@ -3659,7 +3811,9 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       el.querySelector("audio source")?.getAttribute("src") ||
       ""
     ).trim();
-    return aSrc ? `\n<audio controls preload="metadata" src="${aSrc}"></audio>\n\n` : "";
+    return aSrc && !/^(?:javascript|vbscript|data):/i.test(aSrc)
+      ? `\n<audio controls preload="metadata" src="${escHtmlAttr(aSrc)}"></audio>\n\n`
+      : "";
   }
 
   // Preserve custom directive blocks if present
@@ -3713,6 +3867,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       return `\n##### ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
     case "h6":
       return `\n###### ${inner().replace(/\s*\n+\s*/g, " ").trim()}\n\n`;
+    case "center":
     case "p":
     case "div":
     case "section":
@@ -3720,6 +3875,14 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
     case "aside":
     case "figcaption": {
       const txt = inner().trim();
+      // Preserve presentational alignment wrappers (`<div align=center>`, `<center>`, `style="text-align:right"`)
+      const alignVal =
+        tag === "center"
+          ? "center"
+          : (el.getAttribute("align") || el.style?.textAlign || "").toLowerCase().trim();
+      if (txt && (alignVal === "center" || alignVal === "right")) {
+        return `\n<div align="${alignVal}">\n\n${txt}\n\n</div>\n\n`;
+      }
       return txt ? `\n${txt}\n\n` : "\n";
     }
     case "br":
@@ -3934,14 +4097,15 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
           /* ignore malformed percent escape */
         }
       }
-      if (!href || /^(?:javascript|vbscript):/i.test(href)) {
+      if (!href || /^(?:javascript|vbscript|data):/i.test(href)) {
         return label;
       }
       return `[${label || href}](${href})`;
     }
     case "img": {
       const src = (el.getAttribute("src") || "").trim();
-      if (!src || /^(?:javascript|vbscript):/i.test(src)) return "";
+      const isSafeDataImg = /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(src);
+      if (!src || (!isSafeDataImg && /^(?:javascript|vbscript|data):/i.test(src))) return "";
       const alt = (el.getAttribute("alt") || "").replace(/[\r\n[\]]+/g, " ").trim();
       const wAttr = (el.getAttribute("width") || el.style?.width || "").trim();
       const hAttr = (el.getAttribute("height") || el.style?.height || "").trim();
@@ -3949,20 +4113,23 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         Boolean(wAttr || hAttr) &&
         (/[%a-z]/i.test(wAttr + hAttr) || (activeWysiwygSourceMD.includes("<img") && activeWysiwygSourceMD.includes(src)));
       if (wasExplicitHtmlImg) {
-        const escAlt = alt.replace(/"/g, "&quot;");
-        return `<img src="${src}"${escAlt ? ` alt="${escAlt}"` : ""}${wAttr ? ` width="${wAttr}"` : ""}${hAttr ? ` height="${hAttr}"` : ""} />`;
+        const escSrc = escHtmlAttr(src);
+        const escAlt = escHtmlAttr(alt);
+        const escW = escHtmlAttr(wAttr);
+        const escH = escHtmlAttr(hAttr);
+        return `<img src="${escSrc}"${escAlt ? ` alt="${escAlt}"` : ""}${escW ? ` width="${escW}"` : ""}${escH ? ` height="${escH}"` : ""} />`;
       }
       return `![${alt}](${src})`;
     }
     case "audio": {
       const src = (el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "").trim();
-      if (!src) return "";
-      return `\n<audio controls preload="metadata" src="${src}"></audio>\n\n`;
+      if (!src || /^(?:javascript|vbscript|data):/i.test(src)) return "";
+      return `\n<audio controls preload="metadata" src="${escHtmlAttr(src)}"></audio>\n\n`;
     }
     case "video": {
       const src = (el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "").trim();
-      if (!src) return "";
-      return `\n<video controls preload="metadata" src="${src}"></video>\n\n`;
+      if (!src || /^(?:javascript|vbscript|data):/i.test(src)) return "";
+      return `\n<video controls preload="metadata" src="${escHtmlAttr(src)}"></video>\n\n`;
     }
     case "hr":
       return `\n---\n\n`;
@@ -4561,6 +4728,10 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
   const [previewHTML, setPreviewHTML] = useState<string>("");
   const [uploading, setUploading] = useState<boolean>(false);
   const [fullscreen, setFullscreen] = useState<boolean>(false);
+  /** Soft keyboard is open while focus is inside the editor (mobile; derived from visualViewport). */
+  const [kbOpen, setKbOpen] = useState<boolean>(false);
+  /** Focus snapshot taken right before a fullscreen toggle so the caret survives the relayout. */
+  const fsFocusRef = useRef<{ kind: "cm" | "wysiwyg"; range: Range | null } | null>(null);
   const [showOutline, setShowOutline] = useState<boolean>(false);
   const [mobilePane, setMobilePane] = useState<"write" | "preview" | "outline">("write");
 
@@ -4736,9 +4907,11 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
       return;
     }
 
-    const token = `__VOLO_SPLICE_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}__`;
+    const randBuf = new Uint32Array(1);
+    crypto.getRandomValues(randBuf);
+    const spliceMarker = `__VOLO_SPLICE_${Date.now().toString(36)}_${randBuf[0].toString(36)}__`;
     const marker = document.createElement("span");
-    marker.setAttribute("data-volo-splice", token);
+    marker.setAttribute("data-volo-splice", spliceMarker);
 
     const anchorEl =
       range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
@@ -4759,7 +4932,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const serialized = htmlToMarkdown(root);
     marker.remove();
 
-    const idx = serialized.indexOf(token);
+    const idx = serialized.indexOf(spliceMarker);
     if (idx < 0) {
       wysiwygForceSyncRef.current = true;
       const base = serialized || valueRef.current || "";
@@ -4768,7 +4941,7 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     }
 
     const before = serialized.slice(0, idx);
-    const after = serialized.slice(idx + token.length);
+    const after = serialized.slice(idx + spliceMarker.length);
     const isBlockSnippet = mdSnippet.startsWith("\n") || /^(?::::|```|\$\$|\| |> |#{1,6}\s|-\s|\d+\.\s|---)/.test(mdSnippet);
     let nextMd: string;
     if (isBlockSnippet) {
@@ -4901,7 +5074,12 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     if (!view) return;
     const sel = view.state.selection.main;
     const rawSel = view.state.sliceDoc(sel.from, sel.to);
-    const unwrapped = (rawSel || "text").replace(/^<(?:font|span)\b[^>]*>([\s\S]*?)<\/(?:font|span)>$/i, "$1");
+    let unwrapped = rawSel || "text";
+    let prevUnwrapped: string;
+    do {
+      prevUnwrapped = unwrapped;
+      unwrapped = unwrapped.replace(/^<(?:font|span)\b[^>]*>([\s\S]*?)<\/(?:font|span)\b[^>]*>$/i, "$1");
+    } while (unwrapped !== prevUnwrapped);
     const before = `<font color="${color}">`;
     const after = `</font>`;
     const insert = `${before}${unwrapped}${after}`;
@@ -4925,11 +5103,18 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const view = viewRef.current;
     if (!view) return;
     const sel = view.state.selection.main;
-    const stripTags = (s: string) =>
-      s
-        .replace(/<\/?(?:font|mark|u|sup|sub)\b[^>]*>/gi, "")
-        .replace(/==([^=\n]+)==/g, "$1")
-        .replace(/<span\s+style\s*=\s*(?:"[^"]*"|'[^']*')\s*>([\s\S]*?)<\/span>/gi, "$1");
+    const stripTags = (s: string) => {
+      let out = s;
+      let prev: string;
+      do {
+        prev = out;
+        out = out
+          .replace(/<\/?(?:font|mark|u|sup|sub)\b[^>]*>/gi, "")
+          .replace(/==([^=\n]+)==/g, "$1")
+          .replace(/<span\s+style\s*=\s*(?:"[^"]*"|'[^']*')\s*>([\s\S]*?)<\/span\b[^>]*>/gi, "$1");
+      } while (out !== prev);
+      return out;
+    };
     if (!sel.empty) {
       const cleaned = stripTags(view.state.sliceDoc(sel.from, sel.to));
       view.dispatch({
@@ -5772,29 +5957,105 @@ ${rendered}
     return () => window.removeEventListener("keydown", onGlobalShortcut);
   }, [fullscreen]);
 
+  // visualViewport tracking (rAF-throttled, always on): exposes --volo-vv-h / --volo-vv-top so editor heights
+  // can be clamped to the visible area (and fullscreen pinned to it), and derives `kbOpen` — soft keyboard up
+  // while an editable inside the editor is focused — so secondary chrome can fold away on mobile.
   useEffect(() => {
-    const root = editorRootRef.current;
-    if (!fullscreen) {
-      root?.style.removeProperty("--volo-vv-h");
-      root?.style.removeProperty("--volo-vv-top");
-      return;
-    }
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    const syncVv = () => {
+    const vv = window.visualViewport;
+    const coarse = window.matchMedia?.("(pointer: coarse)");
+    let raf = 0;
+    let lastH = -1;
+    let lastTop = -1;
+    let baseW = -1;
+    let baseH = 0;
+    let kb = false;
+    let pending: boolean | null = null;
+    const isEditable = (n: Element | null): boolean =>
+      !!n &&
+      (n instanceof HTMLTextAreaElement ||
+        (n instanceof HTMLInputElement &&
+          !/^(?:button|checkbox|radio|range|color|file|submit|reset|image)$/i.test(n.type)) ||
+        (n as HTMLElement).isContentEditable);
+    const sync = () => {
+      raf = 0;
       const el = editorRootRef.current;
       if (!el) return;
-      const vv = window.visualViewport;
-      const h = vv ? Math.round(vv.height) : window.innerHeight;
+      const ih = window.innerHeight;
+      const h = Math.round(vv ? vv.height : ih);
       const top = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
-      el.style.setProperty("--volo-vv-h", `${h}px`);
-      el.style.setProperty("--volo-vv-top", `${top}px`);
+      if (h !== lastH) {
+        el.style.setProperty("--volo-vv-h", `${h}px`);
+        lastH = h;
+      }
+      if (top !== lastTop) {
+        el.style.setProperty("--volo-vv-top", `${top}px`);
+        lastTop = top;
+      }
+      // Baseline = tallest visual viewport seen at the current width (reset on rotation). Covers browsers that
+      // shrink the layout viewport with the keyboard, where innerHeight - vv.height stays ~0.
+      if (window.innerWidth !== baseW) {
+        baseW = window.innerWidth;
+        baseH = 0;
+      }
+      baseH = Math.max(baseH, h);
+      const kbPx = Math.max(ih - h - top, baseH - h);
+      const ae = document.activeElement;
+      const next =
+        !!vv &&
+        !!coarse?.matches &&
+        (vv.scale || 1) < 1.05 &&
+        kbPx > 120 &&
+        !!ae &&
+        el.contains(ae) &&
+        isEditable(ae);
+      // Commit only once the value is stable for two frames (iOS animates keyboard / IME candidate bar).
+      if (next === kb) {
+        pending = null;
+      } else if (pending === next) {
+        pending = null;
+        kb = next;
+        setKbOpen(next);
+      } else {
+        pending = next;
+        raf = window.requestAnimationFrame(sync);
+      }
     };
-    syncVv();
-    const vv = window.visualViewport;
-    window.addEventListener("resize", syncVv);
-    vv?.addEventListener("resize", syncVv);
-    vv?.addEventListener("scroll", syncVv);
+    const schedule = () => {
+      if (!raf) raf = window.requestAnimationFrame(sync);
+    };
+    sync();
+    window.addEventListener("resize", schedule);
+    vv?.addEventListener("resize", schedule);
+    vv?.addEventListener("scroll", schedule);
+    document.addEventListener("focusin", schedule);
+    document.addEventListener("focusout", schedule);
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf);
+      window.removeEventListener("resize", schedule);
+      vv?.removeEventListener("resize", schedule);
+      vv?.removeEventListener("scroll", schedule);
+      document.removeEventListener("focusin", schedule);
+      document.removeEventListener("focusout", schedule);
+      editorRootRef.current?.style.removeProperty("--volo-vv-h");
+      editorRootRef.current?.style.removeProperty("--volo-vv-top");
+    };
+  }, []);
+
+  // Keyboard just opened: the editor height is clamped to the visual viewport, keep the caret in view.
+  useEffect(() => {
+    if (!kbOpen) return;
+    const raf = window.requestAnimationFrame(() => {
+      const view = viewRef.current;
+      if (!view || !view.hasFocus) return;
+      view.dispatch({ effects: EditorView.scrollIntoView(view.state.selection.main.head, { y: "nearest" }) });
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [kbOpen]);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || e.defaultPrevented) return;
@@ -5809,14 +6070,66 @@ ${rendered}
     document.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = prevOverflow;
-      window.removeEventListener("resize", syncVv);
-      vv?.removeEventListener("resize", syncVv);
-      vv?.removeEventListener("scroll", syncVv);
       document.removeEventListener("keydown", onKey);
-      editorRootRef.current?.style.removeProperty("--volo-vv-h");
-      editorRootRef.current?.style.removeProperty("--volo-vv-top");
     };
   }, [fullscreen]);
+
+  // After a toolbar fullscreen toggle: put focus / caret back where it was (the relayout can drop focus on
+  // mobile, which would also collapse the soft keyboard) and keep the caret visible in the new geometry.
+  useEffect(() => {
+    const snap = fsFocusRef.current;
+    fsFocusRef.current = null;
+    if (!snap) return;
+    const raf = window.requestAnimationFrame(() => {
+      if (snap.kind === "cm") {
+        const view = viewRef.current;
+        if (!view) return;
+        if (!view.hasFocus) view.focus();
+        view.dispatch({ effects: EditorView.scrollIntoView(view.state.selection.main.head, { y: "nearest" }) });
+        return;
+      }
+      const surf = wysiwygRef.current;
+      if (!surf || surf.contains(document.activeElement)) return;
+      try {
+        surf.focus({ preventScroll: true });
+      } catch {
+        surf.focus();
+      }
+      const sel = window.getSelection();
+      if (snap.range && sel && surf.contains(snap.range.startContainer)) {
+        sel.removeAllRanges();
+        sel.addRange(snap.range);
+      }
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [fullscreen]);
+
+  const toggleFullscreen = () => {
+    const ae = document.activeElement;
+    const view = viewRef.current;
+    const surf = wysiwygRef.current;
+    if (view && (view.hasFocus || (ae && view.dom.contains(ae)))) {
+      fsFocusRef.current = { kind: "cm", range: null };
+    } else if (surf && ae && surf.contains(ae)) {
+      const sel = window.getSelection();
+      fsFocusRef.current = {
+        kind: "wysiwyg",
+        range: sel && sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null,
+      };
+    } else {
+      fsFocusRef.current = null;
+    }
+    setFullscreen((v) => !v);
+  };
+
+  // Toolbar buttons must not steal focus from the editor: a blur collapses the mobile keyboard (and loses the
+  // WYSIWYG selection) only for it to re-open right after. Cancelling mousedown keeps focus; click still fires.
+  const handleToolbarMouseDown = (e: MouseEvent) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (!target || target.closest("input, select, textarea, [contenteditable]")) return;
+    if (target.closest("button")) e.preventDefault();
+  };
 
   // Unified portal popover positioning for Heading / Color / Callout / Media / Bookshelf / Math / Export menus
   useEffect(() => {
@@ -5991,13 +6304,17 @@ ${rendered}
   const mergedQuickInserts = quickInserts.length > 0 ? quickInserts : dynQuickInserts || [];
 
   return (
-    <div ref={editorRootRef} class={`volo-studio-editor ${fullscreen ? "is-fullscreen" : ""}`}>
+    <div
+      ref={editorRootRef}
+      class={`volo-studio-editor ${fullscreen ? "is-fullscreen" : ""} ${kbOpen ? "is-kb-open" : ""}`}
+    >
       {/* Top Sticky Rich Icon Toolbar */}
       <div
         class="volo-ed-toolbar"
         onPointerOver={handleToolbarPointerOver as any}
         onPointerLeave={() => setEdTip(null)}
         onPointerDown={() => setEdTip(null)}
+        onMouseDown={handleToolbarMouseDown as any}
       >
         <div class="volo-ed-tools">
           {/* Group 1: Undo / Redo */}
@@ -6532,7 +6849,7 @@ ${rendered}
             class={`volo-ed-btn ${fullscreen ? "active" : ""}`}
             data-tip={fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen")}
             aria-label={fullscreen ? t("ed.exit_fullscreen") : t("ed.fullscreen")}
-            onClick={() => setFullscreen((v) => !v)}
+            onClick={toggleFullscreen}
           >
             {fullscreen ? (
               <SvgIcon>

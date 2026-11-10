@@ -291,4 +291,3 @@ func TestRound3_CLIResetPasswordAndPasswdRevokeAPITokensAndSessions(t *testing.T
 		t.Fatalf("expected sess=0 pat=0 otherPat=1 after volo passwd, got sess=%d pat=%d otherPat=%d", sessCnt, patCnt, otherPatCnt)
 	}
 }
-

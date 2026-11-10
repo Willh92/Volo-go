@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -28,6 +29,7 @@ const (
 	DefaultShutdownSec    = 15
 	DefaultSocketMode     = "0660"
 	DefaultUnixSocketPerm = os.FileMode(0o660)
+	DefaultTLSMinVersion  = "1.2"
 )
 
 var (
@@ -73,6 +75,11 @@ type CLIOverrides struct {
 	DBDSN              *string
 	DBSimpleProtocol   *bool
 	ShutdownTimeoutSec *int
+	// Native HTTPS/TLS serving (optional; typical reverse-proxy deployments leave these unset).
+	TLSCertFile         *string
+	TLSKeyFile          *string
+	TLSMinVersion       *string
+	TLSHTTPRedirectAddr *string
 }
 
 // ListenSocketSpec represents a parsed VOLO_LISTEN_SOCKET ("/path/to/volo.sock,0660").
@@ -108,6 +115,12 @@ type Config struct {
 	ShutdownTimeout   time.Duration
 	DefaultLocale     string
 
+	// Native HTTPS/TLS serving. TLS is enabled iff TLSCertFile and TLSKeyFile are both set.
+	TLSCertFile         string
+	TLSKeyFile          string
+	TLSMinVersion       string // "1.2" (default) | "1.3"
+	TLSHTTPRedirectAddr string // optional plain-HTTP redirect listener, e.g. ":80"
+
 	DataDir          string
 	UploadDir        string
 	DefaultUploadDir string
@@ -126,6 +139,14 @@ type Config struct {
 	DBMaxOpenConns   int
 	DBMaxIdleConns   int
 	DBConnLifetime   time.Duration
+}
+
+// TLSEnabled reports whether native HTTPS serving is configured (both cert and key files set).
+func (c *Config) TLSEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.TLSCertFile != "" && c.TLSKeyFile != ""
 }
 
 // GetUploadDir returns the active local media upload directory in a thread-safe manner.
@@ -564,8 +585,8 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	if dataDir == "" {
 		dataDir = DefaultDataDir
 	}
-	uploadDir, uploadDirExplicit := resolveStr(cli.UploadDir, "VOLO_UPLOAD_DIR", filepath.Join(dataDir, "uploads"))
-	uploadDirPinned := cli.UploadDir != nil || (uploadDirExplicit && uploadDir != "")
+	uploadDir, _ := resolveStr(cli.UploadDir, "VOLO_UPLOAD_DIR", filepath.Join(dataDir, "uploads"))
+	uploadDirPinned := cli.UploadDir != nil && strings.TrimSpace(*cli.UploadDir) != ""
 	if uploadDir == "" {
 		uploadDir = filepath.Join(dataDir, "uploads")
 	}
@@ -573,8 +594,8 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	if backupDir == "" {
 		backupDir = filepath.Join(dataDir, "backups")
 	}
-	geoIPDir, geoIPDirExplicit := resolveStr(cli.GeoIPDir, "VOLO_GEOIP_DIR", filepath.Join(dataDir, "geoip"))
-	geoIPDirPinned := cli.GeoIPDir != nil || (geoIPDirExplicit && geoIPDir != "")
+	geoIPDir, _ := resolveStr(cli.GeoIPDir, "VOLO_GEOIP_DIR", filepath.Join(dataDir, "geoip"))
+	geoIPDirPinned := cli.GeoIPDir != nil && strings.TrimSpace(*cli.GeoIPDir) != ""
 	if geoIPDir == "" {
 		geoIPDir = filepath.Join(dataDir, "geoip")
 	}
@@ -679,6 +700,30 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 		return nil, err
 	}
 
+	tlsCert, _ := resolveStr(cli.TLSCertFile, "VOLO_TLS_CERT_FILE", "")
+	tlsKey, _ := resolveStr(cli.TLSKeyFile, "VOLO_TLS_KEY_FILE", "")
+	tlsMinRaw, _ := resolveStr(cli.TLSMinVersion, "VOLO_TLS_MIN_VERSION", DefaultTLSMinVersion)
+	tlsRedirect, _ := resolveStr(cli.TLSHTTPRedirectAddr, "VOLO_TLS_HTTP_REDIRECT_ADDR", "")
+	tlsMin, err := normalizeTLSMinVersion(tlsMinRaw)
+	if err != nil {
+		return nil, err
+	}
+	if (tlsCert == "") != (tlsKey == "") {
+		return nil, errors.New("config: VOLO_TLS_CERT_FILE (--tls-cert) and VOLO_TLS_KEY_FILE (--tls-key) must be set together")
+	}
+	tlsOn := tlsCert != "" && tlsKey != ""
+	if tlsOn && socketSpec != nil {
+		return nil, errors.New("config: native TLS (VOLO_TLS_CERT_FILE/VOLO_TLS_KEY_FILE) cannot be combined with a Unix socket listener (VOLO_LISTEN_SOCKET); terminate TLS at the reverse proxy instead")
+	}
+	if tlsRedirect != "" {
+		if !tlsOn {
+			return nil, errors.New("config: VOLO_TLS_HTTP_REDIRECT_ADDR (--tls-http-redirect-addr) requires native TLS (VOLO_TLS_CERT_FILE and VOLO_TLS_KEY_FILE)")
+		}
+		if _, _, err := net.SplitHostPort(tlsRedirect); err != nil {
+			return nil, fmt.Errorf("config: invalid VOLO_TLS_HTTP_REDIRECT_ADDR %q (expected host:port such as \":80\"): %w", tlsRedirect, err)
+		}
+	}
+
 	locale, _ := resolveStr(cli.DefaultLocale, "VOLO_DEFAULT_LOCALE", DefaultLocale)
 	if locale == "" {
 		locale = DefaultLocale
@@ -732,38 +777,42 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	}
 
 	return &Config{
-		ListenAddr:        listenAddr,
-		ListenSocket:      socketSpec,
-		SocketGroup:       socketGroup,
-		SocketMode:        socketModeFinal,
-		PublicURL:         pubURL,
-		PublicOrigin:      pubOrigin,
-		TrustedProxiesRaw: trustedRaw,
-		TrustedProxies:    trustedPolicy,
-		AdminPath:         adminPath,
-		IsCustomAdminPath: isCustomAdmin,
-		SecretKeySource:   secretSource,
-		KeyRing:           keyRing,
-		GeoAccessEnabled:  geoEnabled,
-		ShutdownTimeout:   time.Duration(shutdownSec) * time.Second,
-		DefaultLocale:     locale,
-		DataDir:           dataDir,
-		UploadDir:         uploadDir,
-		DefaultUploadDir:  uploadDir,
-		UploadDirPinned:   uploadDirPinned,
-		BackupDir:         backupDir,
-		GeoIPDir:          geoIPDir,
-		DefaultGeoIPDir:   geoIPDir,
-		GeoIPDirPinned:    geoIPDirPinned,
-		ThemesDir:         themesDir,
-		PluginsDir:        pluginsDir,
-		LocalesDir:        localesDir,
-		DBDriver:          dbDriver,
-		DBDSN:             dbDSN,
-		DBSimpleProtocol:  simpleProto,
-		DBMaxOpenConns:    maxOpen,
-		DBMaxIdleConns:    maxIdle,
-		DBConnLifetime:    time.Duration(connLifeSec) * time.Second,
+		ListenAddr:          listenAddr,
+		ListenSocket:        socketSpec,
+		SocketGroup:         socketGroup,
+		SocketMode:          socketModeFinal,
+		PublicURL:           pubURL,
+		PublicOrigin:        pubOrigin,
+		TrustedProxiesRaw:   trustedRaw,
+		TrustedProxies:      trustedPolicy,
+		AdminPath:           adminPath,
+		IsCustomAdminPath:   isCustomAdmin,
+		SecretKeySource:     secretSource,
+		KeyRing:             keyRing,
+		GeoAccessEnabled:    geoEnabled,
+		ShutdownTimeout:     time.Duration(shutdownSec) * time.Second,
+		DefaultLocale:       locale,
+		TLSCertFile:         tlsCert,
+		TLSKeyFile:          tlsKey,
+		TLSMinVersion:       tlsMin,
+		TLSHTTPRedirectAddr: tlsRedirect,
+		DataDir:             dataDir,
+		UploadDir:           uploadDir,
+		DefaultUploadDir:    uploadDir,
+		UploadDirPinned:     uploadDirPinned,
+		BackupDir:           backupDir,
+		GeoIPDir:            geoIPDir,
+		DefaultGeoIPDir:     geoIPDir,
+		GeoIPDirPinned:      geoIPDirPinned,
+		ThemesDir:           themesDir,
+		PluginsDir:          pluginsDir,
+		LocalesDir:          localesDir,
+		DBDriver:            dbDriver,
+		DBDSN:               dbDSN,
+		DBSimpleProtocol:    simpleProto,
+		DBMaxOpenConns:      maxOpen,
+		DBMaxIdleConns:      maxIdle,
+		DBConnLifetime:      time.Duration(connLifeSec) * time.Second,
 	}, nil
 }
 
@@ -888,6 +937,19 @@ func normalizeDriverName(d string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(d))
 	}
+}
+
+// normalizeTLSMinVersion validates VOLO_TLS_MIN_VERSION ("1.2" default, or "1.3").
+func normalizeTLSMinVersion(raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	v = strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(v), "tls"), "v")
+	switch v {
+	case "":
+		return DefaultTLSMinVersion, nil
+	case "1.2", "1.3":
+		return v, nil
+	}
+	return "", fmt.Errorf("config: unsupported VOLO_TLS_MIN_VERSION %q (must be 1.2 or 1.3)", raw)
 }
 
 func parseStrictBool(key string, raw string) (bool, error) {

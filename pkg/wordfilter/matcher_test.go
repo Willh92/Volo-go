@@ -90,7 +90,7 @@ func TestMatcher_AntiBypassAndAllowlistParity(t *testing.T) {
 		"这也是非*禁*词*示*例。",
 		"购买了一台傻瓜相机拍照",
 		"傻傻瓜瓜相机",
-		"傻非禁词示例逼", // Allowlist must never splice surrounding runes together!
+		"傻非禁词示例逼",   // Allowlist must never splice surrounding runes together!
 		"他是个傻boy哈哈", // Trailing ASCII boundary protects "傻b" from matching "傻boy"
 		"测试一条正常的留言",
 		"if (x < 10 && arr[0] > 1) { return true; }",
@@ -125,8 +125,8 @@ func TestMatcher_UnicodeImpersonationAndKanaPreservation(t *testing.T) {
 		"🇦🇩🇲🇮🇳",
 		"ℛℴℴ𝓉",
 		"a\u0336d\u0336m\u0336i\u0336n\u0336",
-		"\u0430dmin", // Cyrillic 'а'
-		"\u0391dmin", // Greek 'Α'
+		"\u0430dmin",     // Cyrillic 'а'
+		"\u0391dmin",     // Greek 'Α'
 		"r\u043e\u043et", // Cyrillic 'о'
 	}
 	for _, s := range spoofed {
@@ -475,4 +475,3 @@ func TestMaskHTML_ComprehensiveAndSafety(t *testing.T) {
 		}
 	}
 }
-

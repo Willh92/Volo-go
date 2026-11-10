@@ -944,5 +944,3 @@ func TestSensitiveWordsPlugin_MaskExistingAndTagListSchema(t *testing.T) {
 		t.Fatalf("expected new sensitive comment still rejected when mask_existing=false, got %+v", verdict)
 	}
 }
-
-

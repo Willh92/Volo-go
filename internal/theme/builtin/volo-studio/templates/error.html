@@ -8,8 +8,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
   <title>{{if .PageTitle}}{{.PageTitle}}{{else}}{{$code}} · {{$headline}} — {{$siteTitle}}{{end}}</title>
-  {{if .Site.FaviconURL}}<link rel="icon" href="{{.Site.FaviconURL}}">{{else}}<link rel="icon" type="image/svg+xml" href="/favicon.svg">{{end}}
-  <link rel="alternate icon" sizes="32x32" href="/favicon.ico">
+  {{if and .Site.FaviconURL (ne .Site.FaviconURL "/favicon.svg") (ne .Site.FaviconURL "/favicon.ico")}}<link rel="icon" href="{{.Site.FaviconURL}}">
+  <link rel="apple-touch-icon" href="{{.Site.FaviconURL}}">{{else}}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" sizes="32x32" href="/favicon.ico">{{end}}
   <script>
     (function(){
       var m = "";

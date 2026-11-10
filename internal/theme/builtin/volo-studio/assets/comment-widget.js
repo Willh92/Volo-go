@@ -226,17 +226,20 @@
     });
 
     const renderItem = (c, depth, parentAuthor) => {
-      const seed = c.avatar_seed || c.id || "guest", av = isSafeHref(c.avatar_url) ? String(c.avatar_url).trim() : "/avatars/" + encU(seed) + ".svg";
-      const pName = c.reply_to_name || (depth >= 1 ? parentAuthor : ""), at = pName ? '<span class="vc-reply-at">@' + esc(pName) + "</span>" : "";
-      const rawU = c.author_url ? String(c.author_url).trim() : "";
-      const who = /^https?:\/\//i.test(rawU) ? '<a href="' + esc(rawU) + '" rel="nofollow ugc noopener" target="_blank">' + esc(c.author_name) + "</a>" : "<strong>" + esc(c.author_name) + "</strong>";
+      // Soft-deleted comments that still carry visible replies arrive as zero-PII placeholders
+      // (is_deleted / status "deleted"): no author, link, badges, reply-at prefix or actions.
+      const isDel = !!c.is_deleted || c.status === "deleted";
+      const seed = c.avatar_seed || c.id || "guest", av = !isDel && isSafeHref(c.avatar_url) ? String(c.avatar_url).trim() : "/avatars/" + encU(seed) + ".svg";
+      const pName = isDel ? "" : c.reply_to_name || (depth >= 1 ? parentAuthor : ""), at = pName ? '<span class="vc-reply-at">@' + esc(pName) + "</span>" : "";
+      const rawU = !isDel && c.author_url ? String(c.author_url).trim() : "";
+      const who = isDel ? "" : /^https?:\/\//i.test(rawU) ? '<a href="' + esc(rawU) + '" rel="nofollow ugc noopener" target="_blank">' + esc(c.author_name) + "</a>" : "<strong>" + esc(c.author_name) + "</strong>";
       const cid = esc(c.id), delLbl = dL("del", "Delete"), acts = [];
       const mkAct = (cls, ex, lbl) => btnH("vc-act-btn " + cls, esc(lbl), ' data-id="' + cid + '"' + ex);
-      if (canCompose && !viewerMuted) acts.push(mkAct("js-vc-reply", ' data-name="' + esc(c.author_name) + '"', dL("reply", "Reply")));
-      if (c.can_edit && !c.is_shielded && !viewerMuted) {
+      if (!isDel && canCompose && !viewerMuted) acts.push(mkAct("js-vc-reply", ' data-name="' + esc(c.author_name) + '"', dL("reply", "Reply")));
+      if (!isDel && c.can_edit && !c.is_shielded && !viewerMuted) {
         acts.push(mkAct("js-vc-edit", ' data-md="' + esc(c.content_md || "") + '"', dL("edit", "Edit")), mkAct("vc-act-btn--danger js-vc-del", "", delLbl));
       }
-      if (c.can_moderate && csrfToken) {
+      if (!isDel && c.can_moderate && csrfToken) {
         if (c.status === "pending") acts.push(mkAct("js-vc-mod-approve", "", dL("approve", "Approve")));
         if (!c.can_edit) acts.push(mkAct("vc-act-btn--danger js-vc-mod-del", "", delLbl));
         if (c.can_ban_ip) acts.push(mkAct("vc-act-btn--danger js-vc-mod-ban", ' data-ip="' + esc(c.ip_masked || "") + '"', dL("ban", "Ban IP")));
@@ -250,16 +253,16 @@
           : '<div class="vc-replies"' + dA + ">" + mapR(reps) + "</div>";
       }
       let bodyHTML = String(c.content_html || "");
-      if (at) bodyHTML = /^\s*<p(?:\s[^>]*)?>/i.test(bodyHTML) ? bodyHTML.replace(/^(\s*<p(?:\s[^>]*)?>)/i, "$1" + at + " ") : at + " " + bodyHTML;
-      return '<div class="vc-item" id="comment-' + cid + '"><img class="vc-avatar" src="' + esc(av) + '" data-avatar-seed="' + esc(seed) + '" alt="" width="38" height="38" loading="lazy"><div class="vc-body"><div class="vc-meta">' + who +
-        (c.is_author ? '<span class="vc-author-badge">' + esc(dL("author", "Author")) + "</span>" : "") +
-        (c.status === "pending" ? '<span class="vc-pending-badge vc-badge--pending">' + esc(dL("pending-badge", "Pending")) + "</span>" : "") +
-        "<span>· " + fmtTime(c.created_at) + "</span>" +
-        (c.geo_region ? '<span class="vc-geo">' + esc(c.geo_region) + "</span>" : "") +
-        (c.ip_masked ? '<span class="vc-ip-badge">' + esc(c.ip_masked) + "</span>" : "") +
+      if (at) bodyHTML = /^\s*<p\b[^>]*>/i.test(bodyHTML) ? bodyHTML.replace(/^(\s*<p\b[^>]*>)/i, "$1" + at + " ") : at + " " + bodyHTML;
+      return '<div class="vc-item' + (isDel ? " is-deleted" : "") + '" id="comment-' + cid + '"><img class="vc-avatar" src="' + esc(av) + '" data-avatar-seed="' + esc(seed) + '" alt="" width="38" height="38" loading="lazy"><div class="vc-body"><div class="vc-meta">' + who +
+        (!isDel && c.is_author ? '<span class="vc-author-badge">' + esc(dL("author", "Author")) + "</span>" : "") +
+        (!isDel && c.status === "pending" ? '<span class="vc-pending-badge vc-badge--pending">' + esc(dL("pending-badge", "Pending")) + "</span>" : "") +
+        "<span>" + (isDel ? "" : "· ") + fmtTime(c.created_at) + "</span>" +
+        (!isDel && c.geo_region ? '<span class="vc-geo">' + esc(c.geo_region) + "</span>" : "") +
+        (!isDel && c.ip_masked ? '<span class="vc-ip-badge">' + esc(c.ip_masked) + "</span>" : "") +
         '</div><div class="vc-content vc-item-body volo-prose">' + bodyHTML + "</div>" +
         (acts.length ? '<div class="vc-actions">' + acts.join("") + "</div>" : "") +
-        '<div class="vc-inline-slot js-vc-inline-slot"></div></div>' + kids + "</div>";
+        "</div>" + kids + "</div>";
     };
 
     const showBanner = (txt, isErr) => {
@@ -271,8 +274,6 @@
       if (reqPage) curPage = reqPage;
       let qs = "target_type=" + encU(tType) + "&target_id=" + encU(tID) + "&page=" + curPage + "&per_page=20";
       if (seekID && !stepping) qs += "&focus_comment=" + encU(seekID) + "&target_comment_id=" + encU(seekID);
-      const drw = q(".js-vc-drawer");
-      if (drw && drw.parentElement !== el) el.appendChild(drw);
       jReq("/api/v1/comments?" + qs).then((res) => {
         if (!res.ok) throw 0;
         const d = res.d, box = q(".js-vc-list");
@@ -339,20 +340,21 @@
           ? '<div class="vc-identity"><img class="vc-identity__avatar" src="' + esc(vAvatar) + '" data-avatar-seed="' + esc(viewerID || viewerName) + '" alt="" width="28" height="28"><span>' + esc(viewerName) + "</span>" + (viewerRole === "admin" ? '<span class="vc-author-badge">' + esc(dL("author", "Author")) + "</span>" : "") + "</div>"
           : '<div class="vc-guest-chip js-vc-guest-chip"' + (prof.name ? "" : " hidden") + '><span class="js-vc-guest-label">' + esc(dL("guest-as", "{name}").replace("{name}", prof.name || "")) + "</span><span>·</span>" + btnH("js-vc-toggle-guest", esc(dL("edit-profile", "Edit"))) + "</div>";
         const gIn = (nm, tp, lk, fb, val, ex = "") => '<input class="volo-input vc-input" name="' + nm + '"' + (tp ? ' type="' + tp + '"' : "") + ex + ' placeholder="' + esc(dL(lk, fb)) + '" value="' + esc(val || "") + '">';
-        const gRow = isLogged ? "" : '<div class="vc-row js-vc-guest-row"' + (prof.name ? " hidden" : "") + ">" + gIn("author_name", "", "nick", "Name", prof.name, ' required maxlength="48"') + gIn("notify_email", "email", "email", "Email", prof.email) + gIn("author_url", "url", "site", "Website", prof.url) + "</div>";
+        const gRow = isLogged ? "" : '<div class="vc-row js-vc-guest-row"' + (prof.name ? " hidden" : "") + ">" + gIn("author_name", "", "nick", "Name", prof.name, ' required maxlength="48"') + gIn("notify_email", "email", "email", "Email", prof.email) + gIn("author_url", "url", "site", "Website", prof.url) + "</div>" +
+          btnH("vc-id-summary js-vc-id-expand", '<span class="vc-id-summary__label js-vc-id-sum-label"></span><span class="vc-id-summary__act">' + esc(dL("edit-profile", "Edit")) + "</span>");
         const tools = TOOLS.map((t) => {
           if (!t) return '<span class="vc-tb-sep" aria-hidden="true"></span>';
-          const tip = esc(dL("tb-" + (t[0] === "image" ? "img" : t[0]), t[1]));
+          const tip = esc(dL("tb-" + (t[0] === "image" ? "image" : t[0]), t[1]));
           return btnH("vc-tool-btn", t[2], ' data-md-act="' + t[0] + '" title="' + tip + '" aria-label="' + tip + '"');
         }).join("");
         const fsLbl = esc(dL("fullscreen", "Fullscreen"));
         drwHTML = '<div class="vc-backdrop js-vc-backdrop" hidden></div><div class="volo-comment-composer js-vc-drawer" role="dialog" aria-modal="true" hidden><form class="vc-form js-vc-form"><div class="vc-composer-top"><div class="vc-composer-top__left">' + idHTML +
           '<div class="vc-context-pill js-vc-ctx" hidden><span class="js-vc-ctx-text"></span>' + btnH("js-vc-clear-ctx", "×", ' aria-label="Clear"') + '</div></div><div class="vc-composer-top__right">' +
           btnH("studio-icon-btn studio-icon-btn--square js-vc-fs", "⛶", ' aria-pressed="false" title="' + fsLbl + '" aria-label="' + fsLbl + '"') +
-          btnH("studio-icon-btn studio-icon-btn--square js-vc-close", "✕", ' aria-label="' + cancelLbl + '"') + "</div></div>" + gRow +
+          btnH("studio-icon-btn studio-icon-btn--square js-vc-close", "✕", ' aria-label="' + cancelLbl + '"') + '</div></div><div class="vc-composer-body js-vc-body">' + gRow +
           '<input class="vc-hp" name="website_hp" tabindex="-1" autocomplete="off"><div class="vc-editor-shell"><div class="vc-toolbar"><div class="vc-md-tools" role="toolbar">' + tools + '</div><div class="vc-tabs" role="tablist">' +
           btnH("vc-tab is-active", esc(dL("write", "Write")), ' data-vc-tab="write"') + btnH("vc-tab vc-tab--split", esc(dL("split", "Split")), ' data-vc-tab="split"') + btnH("vc-tab", esc(dL("preview", "Preview")), ' data-vc-tab="preview"') + "</div></div>" +
-          '<div class="vc-editor-panes js-vc-panes" data-pane-mode="write"><textarea class="vc-textarea js-vc-ta" name="content_md" required placeholder="' + esc(dL("ph", "")) + '"></textarea><div class="vc-preview volo-cw-preview volo-prose js-vc-preview" hidden></div></div></div>' +
+          '<div class="vc-editor-panes js-vc-panes" data-pane-mode="write"><textarea class="vc-textarea js-vc-ta" name="content_md" required placeholder="' + esc(dL("ph", "")) + '"></textarea><div class="vc-preview volo-cw-preview volo-prose js-vc-preview" hidden></div></div></div></div>' +
           '<div class="vc-composer-foot"><div class="vc-composer-meta"><span class="vc-char-cnt js-vc-cnt">0 / ' + maxLen + '</span><span class="vc-msg js-vc-msg"></span></div><div class="vc-composer-btns">' +
           btnH("studio-icon-btn js-vc-close", cancelLbl) + '<button type="submit" class="volo-btn js-vc-submit">' + esc(dL("submit", "Post")) + "</button></div></div></form></div>";
       }
@@ -365,21 +367,74 @@
 
       el.innerHTML = '<div class="vc-head"><h3 class="vc-head__title">' + esc(dL("title", "Comments")) + "</h3>" + claimHTML + "</div>" + topPrompt + '<div class="js-vc-status volo-banner" hidden></div><div class="js-vc-list"></div>' + drwHTML + banHTML;
 
-      const drawer = q(".js-vc-drawer"), bdrop = q(".js-vc-backdrop"), form = q(".js-vc-form"), ta = q(".js-vc-ta"), pBox = q(".js-vc-preview"), panes = q(".js-vc-panes");
+      const drawer = q(".js-vc-drawer"), bdrop = q(".js-vc-backdrop"), form = q(".js-vc-form"), bodyEl = q(".js-vc-body"), ta = q(".js-vc-ta"), pBox = q(".js-vc-preview"), panes = q(".js-vc-panes");
       const cntEl = q(".js-vc-cnt"), ctxPill = q(".js-vc-ctx"), ctxText = q(".js-vc-ctx-text"), subBtn = q(".js-vc-submit"), msgEl = q(".js-vc-msg"), fsBtn = q(".js-vc-fs"), banModal = q(".js-vc-ban-modal");
-      let curTab = "write", isFS = false, inlineHost = null, prevTimer = 0, prevCtrl = null;
+      let curTab = "write", isFS = false, prevTimer = 0, prevCtrl = null;
       sBan = q(".js-vc-status");
 
       const syncLock = () => win.__voloSyncScrollLock?.();
-      const clrVV = () => { if (drawer) drawer.style.bottom = drawer.style.maxHeight = ""; };
-      const syncVV = () => {
-        const vv = win.visualViewport;
-        if (!drawer || drawer.hidden || isFS || inlineHost || !vv) return;
-        const kb = Math.max(0, (win.innerHeight || 0) - vv.height - vv.offsetTop);
-        drawer.style.bottom = kb > 0 ? Math.round(kb) + "px" : "";
-        drawer.style.maxHeight = Math.max(180, Math.round(vv.height - 16)) + "px";
+      const gRowEl = q(".js-vc-guest-row"), idSumLbl = q(".js-vc-id-sum-label");
+      const isNarrow = () => (win.innerWidth || 1024) < 768;
+      const finePointer = () => { try { return !!win.matchMedia?.("(pointer: fine)").matches; } catch { return false; } };
+      const focusNoScroll = (n) => { if (!n) return; try { n.focus({ preventScroll: true }); } catch { n.focus(); } };
+      /* Keyboard state is committed only when the measured value is stable for two consecutive frames,
+         which avoids is-kb-open flicker while iOS animates the keyboard / IME candidate bar. */
+      let vvRAF = 0, kbState = false, kbPending = null, vvTop = -1, vvH = -1, vvKb = -1;
+      // On narrow screens with the keyboard open, fold the guest identity row into a one-line summary
+      // (unless one of its inputs is focused) so the textarea keeps the remaining space.
+      const syncIdentity = () => {
+        if (!drawer || !gRowEl) return;
+        const ae = doc.activeElement, idFocus = !!(ae && gRowEl.contains(ae));
+        const collapse = kbState && !idFocus && !gRowEl.hidden && isNarrow();
+        if (collapse && idSumLbl) {
+          const nm = String(gRowEl.querySelector("input[name='author_name']")?.value || "").trim();
+          idSumLbl.textContent = nm ? dL("guest-as", "{name}").replace("{name}", nm) : dL("nick", "Name");
+        }
+        clsT(drawer, "is-identity-collapsed", collapse);
       };
-      onEv(win.visualViewport, "resize", syncVV);
+      const focusIdentity = () => {
+        if (!gRowEl) return;
+        gRowEl.hidden = false; clsR(drawer, "is-identity-collapsed");
+        gRowEl.querySelector("input[name='author_name']")?.focus();
+      };
+      const setKb = (v) => {
+        if (kbState === v) return;
+        kbState = v; clsT(drawer, "is-kb-open", v); syncIdentity();
+        if (v && doc.activeElement === ta && bodyEl) bodyEl.scrollTop = bodyEl.scrollHeight;
+      };
+      const clrVV = () => {
+        if (vvRAF) { cancelAnimationFrame(vvRAF); vvRAF = 0; }
+        kbPending = null; kbState = false; vvTop = vvH = vvKb = -1;
+        if (drawer) {
+          ["--vc-vv-top", "--vc-vv-h", "--vc-kb"].forEach((p) => drawer.style.removeProperty(p));
+          clsR(drawer, "is-kb-open", "has-vv", "is-identity-collapsed");
+        }
+      };
+      /* Geometry is exposed only through CSS custom properties: the sheet follows the keyboard with
+         translateY(-kb) and fullscreen is pinned with translateY(vv.offsetTop), so per-frame visualViewport
+         scrolls never touch top/bottom; height only changes when the visual viewport is resized. */
+      const syncVV = () => {
+        if (vvRAF) { cancelAnimationFrame(vvRAF); vvRAF = 0; }
+        const vv = win.visualViewport;
+        if (!drawer || drawer.hidden || !vv) return;
+        // Pinch-zoom also shrinks the visual viewport; don't mistake it for a keyboard — fall back to static CSS.
+        if ((vv.scale || 1) > 1.05) { clsR(drawer, "has-vv"); return; }
+        const ih = win.innerHeight || rootEl.clientHeight || 0;
+        const top = Math.max(0, Math.round(vv.offsetTop)), h = Math.round(vv.height);
+        const kb = Math.max(0, Math.round(ih - vv.height - vv.offsetTop));
+        const kbOpen = drawer.contains(doc.activeElement) && (kb > 80 || (isNarrow() && vv.height < 480));
+        const ds = drawer.style;
+        if (top !== vvTop) ds.setProperty("--vc-vv-top", (vvTop = top) + "px");
+        if (h !== vvH) ds.setProperty("--vc-vv-h", (vvH = h) + "px");
+        if (kb !== vvKb) ds.setProperty("--vc-kb", (vvKb = kb) + "px");
+        clsA(drawer, "has-vv");
+        if (kbOpen === kbState) kbPending = null;
+        else if (kbPending === kbOpen) { kbPending = null; setKb(kbOpen); }
+        else { kbPending = kbOpen; vvRAF = requestAnimationFrame(syncVV); }
+      };
+      const scheduleVV = () => { if (!vvRAF) vvRAF = requestAnimationFrame(syncVV); };
+      onEv(win.visualViewport, "resize", scheduleVV);
+      onEv(win.visualViewport, "scroll", scheduleVV);
 
       const submitLbl = dL("submit", "Post"), saveLbl = dL("save", "Save");
       const syncCounter = () => {
@@ -419,48 +474,57 @@
 
       const setFullscreen = (next) => {
         if (!drawer || isFS === next) return;
+        // Snapshot caret so it survives the relayout (switching tabs / geometry can drop focus on mobile).
+        const hadFocus = !!ta && doc.activeElement === ta, selS = ta?.selectionStart ?? 0, selE = ta?.selectionEnd ?? 0;
         isFS = next; clsT(drawer, "is-fullscreen", isFS);
         if (fsBtn) {
           const lbl = dL(isFS ? "exit-fullscreen" : "fullscreen", isFS ? "Exit Fullscreen" : "Fullscreen");
           sa(fsBtn, "aria-pressed", "" + isFS); fsBtn.title = lbl; sa(fsBtn, "aria-label", lbl);
           fsBtn.textContent = isFS ? "❐" : "⛶";
         }
+        if (bdrop) { bdrop.hidden = false; clsR(bdrop, "is-closing"); clsA(bdrop, "is-open"); }
         if (isFS) {
-          clsR(drawer, "is-inline"); sa(drawer, "aria-modal", "true"); clrVV();
-          if (bdrop) { bdrop.hidden = false; clsA(bdrop, "is-open"); }
           if ((win.innerWidth || 1024) >= 768 && curTab === "write") setTab("split");
-        } else {
-          if (inlineHost && doc.body.contains(inlineHost)) {
-            clsA(drawer, "is-inline"); sa(drawer, "aria-modal", "false");
-            if (bdrop) { clsR(bdrop, "is-open"); bdrop.hidden = true; }
-          }
-          if (curTab === "split") setTab("write");
-          syncVV();
+        } else if (curTab === "split") {
+          setTab("write");
         }
-        syncLock(); if (ta && !ta.hidden) ta.focus();
+        syncVV(); syncLock();
+        if (hadFocus && ta && !ta.hidden) {
+          // Focus normally never leaves (toolbar presses are cancelled); if it did, put it and the caret back
+          // without scrolling. Untouched focus is left alone — re-focusing makes iOS scroll/jump.
+          if (doc.activeElement !== ta) {
+            focusNoScroll(ta);
+            try { ta.setSelectionRange(selS, selE); } catch {}
+          }
+          requestAnimationFrame(() => { if (doc.activeElement === ta && clsH(drawer, "is-kb-open") && bodyEl) bodyEl.scrollTop = bodyEl.scrollHeight; });
+          return;
+        }
+        // Not focused: only auto-focus with a fine pointer — on touch devices focus() would pop the keyboard.
+        if (ta && !ta.hidden && doc.activeElement !== ta && finePointer()) focusNoScroll(ta);
       };
 
-      onEv(win, "resize", () => { if (isFS && curTab === "split" && (win.innerWidth || 1024) < 768) setTab("write"); });
+      onEv(win, "resize", () => {
+        if (isFS && curTab === "split" && (win.innerWidth || 1024) < 768) setTab("write");
+        scheduleVV(); syncIdentity();
+      });
 
-      const openComposer = (cid) => {
-        if (!drawer || viewerMuted) return;
-        const slot = cid ? byId("comment-" + cid)?.querySelector(".js-vc-inline-slot") : null;
-        if (!slot && !bdrop) return;
-        inlineHost = slot || null;
-        (slot || el).appendChild(drawer);
-        drawer.hidden = false; clsR(drawer, "is-closing"); clsA(drawer, "is-open");
-        const inl = !!slot && !isFS;
-        clsT(drawer, "is-inline", inl); sa(drawer, "aria-modal", "" + !inl); clrVV();
-        if (bdrop) { bdrop.hidden = inl; clsR(bdrop, "is-closing"); clsT(bdrop, "is-open", !inl); }
-        syncLock(); if (!isFS) setTab("write");
-        setTimeout(() => { ta?.focus(); if (!slot) syncVV(); }, 25);
+      const openComposer = () => {
+        if (!drawer || viewerMuted || !bdrop) return;
+        if (bdrop.parentElement !== el) el.appendChild(bdrop);
+        if (drawer.parentElement !== el) el.appendChild(drawer);
+        drawer.hidden = false; clsR(drawer, "is-closing", "is-inline"); clsA(drawer, "is-open");
+        sa(drawer, "aria-modal", "true");
+        bdrop.hidden = false; clsR(bdrop, "is-closing"); clsA(bdrop, "is-open");
+        syncVV(); syncLock();
+        if (!isFS) setTab("write");
+        setTimeout(() => { ta?.focus(); syncVV(); }, 30);
       };
 
       const closeComposer = () => {
         if (!drawer || drawer.hidden) return;
         if (isFS) setFullscreen(false);
-        clrVV(); inlineHost = null;
-        if (drawer.parentElement !== el) el.appendChild(drawer);
+        if (editingID && ta) { editingID = ta.value = ""; syncCounter(); syncCtx(); }
+        clrVV();
         [bdrop, drawer].forEach((n) => n && (clsR(n, "is-open", "is-inline", "is-closing"), n.hidden = true));
         syncLock();
       };
@@ -485,6 +549,26 @@
         subBtn.textContent = editingID ? saveLbl : submitLbl;
       };
       const setErr = (t) => msgEl && (msgEl.textContent = t || "", clsT(msgEl, "is-err", !!t));
+
+      onEv(form, "focusin", () => {
+        syncIdentity();
+        setTimeout(() => {
+          syncVV();
+          if (doc.activeElement === ta && clsH(drawer, "is-kb-open") && bodyEl) bodyEl.scrollTop = bodyEl.scrollHeight;
+        }, 60);
+      });
+      onEv(form, "focusout", () => setTimeout(() => { scheduleVV(); syncIdentity(); }, 80));
+
+      /* Tapping toolbar / tab / fullscreen buttons must not blur the textarea: a blur collapses the
+         mobile keyboard (and IME composition) only for it to re-open right after. Cancelling the
+         pointerdown (touch/pen) and mousedown defaults keeps focus where it is; click still fires. */
+      const keepFocusSel = ".js-vc-fs, [data-vc-tab], .vc-tool-btn, .js-vc-id-expand, .js-vc-clear-ctx";
+      const keepFocus = (ev) => {
+        if (!ta || doc.activeElement !== ta || (ev.button !== undefined && ev.button !== 0)) return;
+        if (ev.target?.closest?.(keepFocusSel)) ev.preventDefault();
+      };
+      onEv(drawer, "pointerdown", (ev) => { if (ev.pointerType && ev.pointerType !== "mouse") keepFocus(ev); });
+      onEv(drawer, "mousedown", keepFocus);
 
       if (ta && cntEl) {
         onEv(ta, "input", () => { syncCounter(); setErr(""); if (curTab !== "write") updatePreview(false); });
@@ -521,8 +605,7 @@
         if (len < minLen || len > maxLen) { setErr(dL("err-len", "Comment must be {min}–{max} characters").replace("{min}", "" + minLen).replace("{max}", "" + maxLen)); ta.focus(); return; }
         if (lines > maxLines) { setErr(dL("err-lines", "Maximum {max} lines allowed").replace("{max}", "" + maxLines)); ta.focus(); return; }
         if (!isLogged && !editingID && !String(fd.get("author_name") || "").trim()) {
-          const gRow = q(".js-vc-guest-row"); if (gRow) gRow.hidden = false;
-          form.querySelector("input[name='author_name']")?.focus(); return;
+          focusIdentity(); return;
         }
         isSubmitting = subBtn.disabled = true; setErr("");
         const done = () => { isSubmitting = false; syncCounter(); syncCtx(); };
@@ -582,22 +665,26 @@
           }).catch(() => {});
           return;
         }
-        if (cl(".js-vc-open")) { repID = repName = editingID = ""; syncCtx(); openComposer(""); return; }
+        if (cl(".js-vc-open")) {
+          if (editingID && ta) { ta.value = ""; syncCounter(); }
+          repID = repName = editingID = ""; syncCtx(); openComposer(); return;
+        }
         if (cl(".js-vc-fs")) { setFullscreen(!isFS); return; }
         if (cl(".js-vc-close")) { closeComposer(); return; }
         if (cl(".js-vc-backdrop")) { if (isFS) setFullscreen(false); else closeComposer(); return; }
         if (cl(".js-vc-clear-ctx")) {
-          const wasIn = !!inlineHost; repID = repName = "";
+          repID = repName = "";
           if (editingID && ta) ta.value = "";
           editingID = ""; ta?.dispatchEvent(new Event("input")); syncCtx();
-          if (wasIn) closeComposer();
           return;
         }
         if (cl(".js-vc-toggle-guest")) {
           const gRow = q(".js-vc-guest-row");
-          if (gRow && !(gRow.hidden = !gRow.hidden)) gRow.querySelector("input[name='author_name']")?.focus();
+          if (gRow && !(gRow.hidden = !gRow.hidden)) focusIdentity();
+          else syncIdentity();
           return;
         }
+        if (cl(".js-vc-id-expand")) { focusIdentity(); return; }
         const pBtn = cl(".js-vc-page");
         if (pBtn) { if (!pBtn.disabled) { refreshList(+pBtn.dataset.page || 1, false); win.__voloScrollToEl?.(el, false); } return; }
         const smBtn = cl(".js-vc-show-more");
@@ -607,9 +694,12 @@
         const tabBtn = cl("[data-vc-tab]");
         if (tabBtn) { setTab(tabBtn.dataset.vcTab); return; }
         const rBtn = cl(".js-vc-reply");
-        if (rBtn) { editingID = ""; repID = rBtn.dataset.id; repName = rBtn.dataset.name; syncCtx(); openComposer(repID); return; }
+        if (rBtn) {
+          if (editingID && ta) { ta.value = ""; syncCounter(); }
+          editingID = ""; repID = rBtn.dataset.id; repName = rBtn.dataset.name; syncCtx(); openComposer(); return;
+        }
         const eBtn = cl(".js-vc-edit");
-        if (eBtn && ta) { repID = repName = ""; editingID = eBtn.dataset.id; ta.value = eBtn.dataset.md || ""; syncCounter(); syncCtx(); openComposer(editingID); return; }
+        if (eBtn && ta) { repID = repName = ""; editingID = eBtn.dataset.id; ta.value = eBtn.dataset.md || ""; syncCounter(); syncCtx(); openComposer(); return; }
         const dBtn = cl(".js-vc-del");
         if (dBtn) { if (cfTap(dBtn)) actReq("/api/v1/comments/" + encU(dBtn.dataset.id), "DELETE", null, !!csrfToken, ref); return; }
         const apBtn = cl(".js-vc-mod-approve");

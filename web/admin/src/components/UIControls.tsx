@@ -2102,7 +2102,11 @@ export function NavIconPreview({ icon, fallbackLabel, size = 16 }: NavIconPrevie
     );
   }
 
-  if (!imgErr && (raw.startsWith("/") || raw.startsWith("http://") || raw.startsWith("https://") || raw.startsWith("data:"))) {
+  const isSafePreviewSrc =
+    (raw.startsWith("/") && !raw.startsWith("//") && !raw.startsWith("/\\")) ||
+    /^https?:\/\//i.test(raw) ||
+    /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(raw);
+  if (!imgErr && isSafePreviewSrc) {
     return (
       <span class="volo-icon-preview-box" style={{ width: `${boxSize}px`, height: `${boxSize}px` }} title={raw}>
         <img

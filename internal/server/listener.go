@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,12 +26,22 @@ type ListenerHandle struct {
 	NetListener net.Listener
 	Network     string // "tcp" | "unix"
 	Address     string
-	cleanupOnce sync.Once
-	cleanupFn   func()
+	// TLSConfig is non-nil when native HTTPS is enabled (VOLO_TLS_CERT_FILE/VOLO_TLS_KEY_FILE);
+	// NetListener then stays a raw TCP listener and ServeWithGracefulShutdown serves TLS (h2 + http/1.1).
+	TLSConfig   *tls.Config
+	tlsReloader *certReloader
+	// Optional plain-HTTP -> HTTPS 308 redirect listener (VOLO_TLS_HTTP_REDIRECT_ADDR).
+	RedirectListener net.Listener
+	redirectHandler  http.Handler
+	cleanupOnce      sync.Once
+	cleanupFn        func()
 }
 
 func (h *ListenerHandle) Close() error {
 	err := h.NetListener.Close()
+	if h.RedirectListener != nil {
+		_ = h.RedirectListener.Close()
+	}
 	h.Cleanup()
 	return err
 }
@@ -48,22 +59,49 @@ func (h *ListenerHandle) Cleanup() {
 
 // OpenListener binds either VOLO_LISTEN_SOCKET (Unix Domain Socket with explicit chmod/chown,
 // resolved parent dir + leaf symlink guards, live-process probe, and 0600 .sock.lock) or VOLO_LISTEN_ADDR (TCP).
+// When native TLS is configured, the certificate/key pair is validated up front (fail fast) and the
+// optional HTTP->HTTPS redirect listener is bound as well.
 func OpenListener(cfg *config.Config) (*ListenerHandle, error) {
 	if cfg == nil {
 		return nil, errors.New("server: nil config")
 	}
 	if cfg.ListenSocket != nil && strings.TrimSpace(cfg.ListenSocket.Path) != "" {
+		if cfg.TLSEnabled() {
+			return nil, errors.New("server: native TLS cannot be combined with a Unix socket listener")
+		}
 		return openUnixSocketListener(cfg.ListenSocket, cfg.SocketGroup, cfg.SocketMode)
+	}
+	var (
+		tlsCfg   *tls.Config
+		reloader *certReloader
+	)
+	if cfg.TLSEnabled() {
+		var err error
+		if tlsCfg, reloader, err = buildTLSConfig(cfg); err != nil {
+			return nil, err
+		}
 	}
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("server: listen tcp %s: %w", cfg.ListenAddr, err)
 	}
-	return &ListenerHandle{
+	handle := &ListenerHandle{
 		NetListener: ln,
 		Network:     "tcp",
 		Address:     ln.Addr().String(),
-	}, nil
+		TLSConfig:   tlsCfg,
+		tlsReloader: reloader,
+	}
+	if tlsCfg != nil {
+		redirectLn, redirectHandler, err := openTLSRedirectListener(cfg, ln.Addr())
+		if err != nil {
+			_ = ln.Close()
+			return nil, err
+		}
+		handle.RedirectListener = redirectLn
+		handle.redirectHandler = redirectHandler
+	}
+	return handle, nil
 }
 
 func parseUnixSocketPerm(modeStr string, fallback os.FileMode) (os.FileMode, error) {
@@ -267,6 +305,8 @@ func NewHealthzHandler(store *sqlx.Store, startedAt time.Time) http.HandlerFunc 
 
 // ServeWithGracefulShutdown runs an hardened *http.Server on handle until ctx is canceled,
 // then drains in-flight requests within shutdownTimeout and cleans up Unix socket files.
+// When handle.TLSConfig is set it serves HTTPS (HTTP/2 via ALPN "h2", HTTP/1.1 fallback), and the
+// optional HTTP->HTTPS redirect server is drained together with the main server.
 func ServeWithGracefulShutdown(ctx context.Context, handle *ListenerHandle, handler http.Handler, shutdownTimeout time.Duration) error {
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = 15 * time.Second
@@ -281,26 +321,71 @@ func ServeWithGracefulShutdown(ctx context.Context, handle *ListenerHandle, hand
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 * 1024,
 	}
+	if handle.TLSConfig != nil {
+		srv.TLSConfig = handle.TLSConfig
+	}
+
+	var redirectSrv *http.Server
+	redirectErrCh := make(chan error, 1)
+	if handle.RedirectListener != nil && handle.redirectHandler != nil {
+		redirectSrv = newRedirectServer(handle.redirectHandler)
+		go func() {
+			if err := redirectSrv.Serve(handle.RedirectListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				redirectErrCh <- fmt.Errorf("server: https redirect listener: %w", err)
+			}
+		}()
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.Serve(handle.NetListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if srv.TLSConfig != nil {
+			// Empty cert/key paths: certificates come from TLSConfig.GetCertificate (hot reload).
+			// ServeTLS also wires up the bundled HTTP/2 server for "h2" ALPN negotiation.
+			err = srv.ServeTLS(handle.NetListener, "", "")
+		} else {
+			err = srv.Serve(handle.NetListener)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
 		errCh <- nil
 	}()
 
+	shutdownRedirect := func(shutCtx context.Context) {
+		if redirectSrv == nil {
+			return
+		}
+		if err := redirectSrv.Shutdown(shutCtx); err != nil {
+			_ = redirectSrv.Close()
+		}
+	}
+
 	select {
 	case err := <-errCh:
+		closeCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		shutdownRedirect(closeCtx)
+		return err
+	case err := <-redirectErrCh:
+		_ = srv.Close()
+		<-errCh
 		return err
 	case <-ctx.Done():
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+		redirectDone := make(chan struct{})
+		go func() {
+			shutdownRedirect(shutCtx)
+			close(redirectDone)
+		}()
 		if err := srv.Shutdown(shutCtx); err != nil {
 			_ = srv.Close()
+			<-redirectDone
 			return fmt.Errorf("server: graceful shutdown timed out: %w", err)
 		}
+		<-redirectDone
 		return <-errCh
 	}
 }

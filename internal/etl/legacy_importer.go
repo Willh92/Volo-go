@@ -49,18 +49,18 @@ var (
 
 // ImportOptions configures streaming legacy bolo-solo archive ETL, URL/domain rewriting, and setup overrides.
 type ImportOptions struct {
-	DryRun            bool
-	LegacyMediaDir    string // Optional path to legacy ./image directory to register/copy
-	TargetUploadDir   string
-	AdminPath         string // Default "/console"
-	OldURLPrefixes    []string
-	NewSiteURL        string
-	SiteTitle         string
-	SiteSubtitle      string
-	DefaultLocale     string
-	TimeZone          string
-	Accent            string
-	ForceLocalStorage bool
+	DryRun                 bool
+	LegacyMediaDir         string // Optional path to legacy ./image directory to register/copy
+	TargetUploadDir        string
+	AdminPath              string // Default "/console"
+	OldURLPrefixes         []string
+	NewSiteURL             string
+	SiteTitle              string
+	SiteSubtitle           string
+	DefaultLocale          string
+	TimeZone               string
+	Accent                 string
+	ForceLocalStorage      bool
 	AdminUsername          string
 	AdminEmail             string
 	AdminDisplayName       string
@@ -3280,4 +3280,3 @@ func sanitizeLegacySiteInjectionHTML(raw string) string {
 	}
 	return cleaned
 }
-

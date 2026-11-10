@@ -218,12 +218,12 @@ func (w *mockPGWire) queueRowDescription(cols []mockCol) {
 	for _, c := range cols {
 		b = append(b, c.name...)
 		b = append(b, 0)
-		b = binary.BigEndian.AppendUint32(b, 0)         // table OID
-		b = binary.BigEndian.AppendUint16(b, 0)         // attr num
-		b = binary.BigEndian.AppendUint32(b, c.oid)     // type OID
-		b = binary.BigEndian.AppendUint16(b, 0xffff)    // size -1
+		b = binary.BigEndian.AppendUint32(b, 0)          // table OID
+		b = binary.BigEndian.AppendUint16(b, 0)          // attr num
+		b = binary.BigEndian.AppendUint32(b, c.oid)      // type OID
+		b = binary.BigEndian.AppendUint16(b, 0xffff)     // size -1
 		b = binary.BigEndian.AppendUint32(b, 0xffffffff) // typmod -1
-		b = binary.BigEndian.AppendUint16(b, 0)         // text format
+		b = binary.BigEndian.AppendUint16(b, 0)          // text format
 	}
 	w.queueMsg('T', b)
 }
@@ -1012,14 +1012,14 @@ func TestPGTLSModesAndMultiHostFallbackRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "127.0.0.1"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IsCA:         true,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
 		BasicConstraintsValid: true,
 	}
 	derBytes, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)

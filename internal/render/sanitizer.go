@@ -731,6 +731,20 @@ func (s *htmlSanitizer) writeAllowedGlobalArticleAttr(out *strings.Builder, tag,
 		if safeMediaSrcAttrRe.MatchString(clean) {
 			writeAttrKV(out, k, clean)
 		}
+	case "align":
+		// Presentational alignment used by migrated Solo / GitHub-README style content
+		// (`<div align=center>`, `<p align="right">`, `<img align="left">`).
+		low := strings.ToLower(trimmed)
+		switch tag {
+		case "div", "p", "center", "section", "figure", "h1", "h2", "h3", "h4", "h5", "h6":
+			if low == "left" || low == "center" || low == "right" || low == "justify" {
+				writeAttrKV(out, "align", low)
+			}
+		case "img":
+			if low == "left" || low == "right" || low == "middle" || low == "top" || low == "bottom" {
+				writeAttrKV(out, "align", low)
+			}
+		}
 	case "data-volo-md-b64":
 		if s.allowEditorDirectives && isEditorDirectiveContainer(tag) && safeEditorB64AttrRe.MatchString(trimmed) {
 			writeAttrKV(out, "data-volo-md-b64", trimmed)

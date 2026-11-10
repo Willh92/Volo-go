@@ -28,6 +28,10 @@ Every subcommand honors the unified configuration hierarchy (`CLI Flags > OS VOL
 | `--db-dsn <dsn>` | `VOLO_DB_DSN` | Database DSN (defaults to `${VOLO_DATA_DIR}/volo.db` on SQLite when empty) |
 | `--db-simple-protocol` | `VOLO_DB_SIMPLE_PROTOCOL` | Enable PostgreSQL pure-Go `pgwire` simple query protocol for transaction poolers (Supabase / PgBouncer) |
 | `--shutdown-timeout <sec>` | `VOLO_SHUTDOWN_TIMEOUT_SEC` | Graceful shutdown drain timeout in seconds (`1`–`120`, default `15`) |
+| `--tls-cert <file>` | `VOLO_TLS_CERT_FILE` | Native HTTPS certificate chain PEM (enables TLS together with `--tls-key`; hot-reloaded on change; not combinable with `--listen-socket`) |
+| `--tls-key <file>` | `VOLO_TLS_KEY_FILE` | Native HTTPS private key PEM |
+| `--tls-min-version <1.2\|1.3>` | `VOLO_TLS_MIN_VERSION` | Minimum TLS version (default `1.2`) |
+| `--tls-http-redirect-addr <addr>` | `VOLO_TLS_HTTP_REDIRECT_ADDR` | Optional plain-HTTP listener (e.g. `:80`) that `308`-redirects to HTTPS |
 
 ### 1.1 `volo serve` (Default Command)
 

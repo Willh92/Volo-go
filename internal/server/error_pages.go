@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/logging"
 	"github.com/Willh92/Volo-go/internal/repo"
 	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/theme"
@@ -50,7 +52,7 @@ func isActiveStaffUser(u *domain.User) bool {
 
 func (s *AppServer) isStaffRequest(r *http.Request) bool {
 	u, _ := s.resolveViewer(r)
-	return isActiveStaffUser(u) && s.isStaffTOTPCompliant(r.Context(), u)
+	return isActiveStaffUser(u)
 }
 
 func defaultErrorKeyForStatus(status int) string {
@@ -109,7 +111,7 @@ func isSubresourceAssetRequest(r *http.Request) bool {
 		return false
 	}
 	accept := strings.ToLower(strings.TrimSpace(r.Header.Get("Accept")))
-	if accept != "" && !strings.Contains(accept, "text/html") && !strings.Contains(accept, "*/*") {
+	if accept != "" && !strings.Contains(accept, "text/html") && !strings.Contains(accept, "application/xhtml+xml") {
 		if strings.Contains(accept, "image/") ||
 			strings.Contains(accept, "text/css") ||
 			strings.Contains(accept, "javascript") ||
@@ -138,6 +140,17 @@ var (
 		"/.well-known/assetlinks.json":      {},
 	}
 
+	benign404AssetPrefixes = []string{
+		"/uploads/", "/upload/", "/image/", "/images/", "/posts/image/", "/posts/images/", "/posts/upload/",
+		"/avatars/", "/themes/", "/plugins/", "/assets/", "/static/",
+	}
+
+	benign404AssetSuffixes = []string{
+		".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".ico", ".bmp", ".tif", ".tiff",
+		".css", ".js", ".mjs", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+		".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".mp4", ".webm", ".mov",
+	}
+
 	highRisk404Suffixes = []string{
 		".php", ".asp", ".aspx", ".jsp", ".cgi",
 		".env", ".bak", ".sql", ".ini", ".conf", ".sh",
@@ -149,6 +162,20 @@ var (
 		"/server-status", "/debug", "/setup", "/api/setup",
 	}
 )
+
+func isBenignStaticAsset404Path(lowPath string) bool {
+	for _, pfx := range benign404AssetPrefixes {
+		if strings.HasPrefix(lowPath, pfx) {
+			return true
+		}
+	}
+	for _, sfx := range benign404AssetSuffixes {
+		if strings.HasSuffix(lowPath, sfx) {
+			return true
+		}
+	}
+	return false
+}
 
 func classify404Risk(r *http.Request) (reasonCode string, weight int, track bool) {
 	if r == nil || r.URL == nil {
@@ -179,7 +206,8 @@ func classify404Risk(r *http.Request) (reasonCode string, weight int, track bool
 	}
 	if strings.HasPrefix(lowPath, "/apple-touch-icon") ||
 		strings.HasPrefix(lowPath, "/.well-known/appspecific/") ||
-		strings.HasSuffix(lowPath, ".map") {
+		strings.HasSuffix(lowPath, ".map") ||
+		isBenignStaticAsset404Path(lowPath) {
 		return "", 0, false
 	}
 	if isSubresourceAssetRequest(r) {
@@ -206,7 +234,7 @@ func (s *AppServer) record404ProbeOnce(r *http.Request, viewer *domain.User, for
 		tp = s.deps.Config.TrustedProxies
 	}
 	clientIP := security.ResolveClientIP(r, tp)
-	skipBan := isActiveStaffUser(viewer) && s.isStaffTOTPCompliant(r.Context(), viewer)
+	skipBan := isActiveStaffUser(viewer)
 	if !skipBan && viewer == nil {
 		skipBan = s.isStaffRequest(r)
 	}
@@ -304,14 +332,41 @@ func (s *AppServer) renderLightweightErrorPageWithViewer(w http.ResponseWriter, 
 
 type customErrorInterceptWriter struct {
 	http.ResponseWriter
-	status      int
-	intercepted bool
-	wroteHeader bool
-	buf         []byte
+	status         int
+	intercepted    bool
+	wroteHeader    bool
+	buf            []byte
+	internalDetail string
 }
 
 func (cw *customErrorInterceptWriter) Unwrap() http.ResponseWriter {
 	return cw.ResponseWriter
+}
+
+func recordInternal500(w http.ResponseWriter, staticMsg string, err error) {
+	detail := staticMsg
+	if err != nil {
+		detail = staticMsg + ": " + err.Error()
+	}
+	cur := w
+	for cur != nil {
+		if cw, ok := cur.(*customErrorInterceptWriter); ok && cw != nil {
+			cw.internalDetail = detail
+			break
+		}
+		if u, ok := cur.(interface{ Unwrap() http.ResponseWriter }); ok {
+			cur = u.Unwrap()
+		} else {
+			break
+		}
+	}
+	http.Error(w, staticMsg, http.StatusInternalServerError)
+}
+
+func sanitizeLogField(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+	return s
 }
 
 func (cw *customErrorInterceptWriter) Flush() {
@@ -347,14 +402,27 @@ func (cw *customErrorInterceptWriter) WriteHeader(code int) {
 	cw.ResponseWriter.WriteHeader(code)
 }
 
+func compactPanicStack(raw []byte) string {
+	lines := strings.Split(string(raw), "\n")
+	var frames []string
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, "goroutine ") || strings.Contains(t, "runtime/panic.go") || strings.Contains(t, "runtime/debug.Stack") {
+			continue
+		}
+		frames = append(frames, t)
+		if len(frames) >= 6 {
+			break
+		}
+	}
+	return strings.Join(frames, " | ")
+}
+
 func (cw *customErrorInterceptWriter) Write(p []byte) (int, error) {
 	if !cw.wroteHeader {
 		cw.WriteHeader(http.StatusOK)
 	}
-	if !cw.intercepted {
-		return cw.ResponseWriter.Write(p)
-	}
-	if len(cw.buf) < 512 {
+	if (cw.intercepted || cw.status >= http.StatusInternalServerError) && len(cw.buf) < 512 {
 		rem := 512 - len(cw.buf)
 		if len(p) <= rem {
 			cw.buf = append(cw.buf, p...)
@@ -362,18 +430,67 @@ func (cw *customErrorInterceptWriter) Write(p []byte) (int, error) {
 			cw.buf = append(cw.buf, p[:rem]...)
 		}
 	}
+	if !cw.intercepted {
+		return cw.ResponseWriter.Write(p)
+	}
 	return len(p), nil
 }
 
 // wrapCustomErrorPages ensures that ANY plain-text or empty 4xx/5xx error emitted anywhere in the mux
 // (including http.NotFound, http.Error, method-not-allowed, disabled feeds, setup cloaking, or plugin 404s)
-// renders the active theme's custom error.html for browser requests (or structured JSON for /api/*)
+// renders the active theme's custom error.html for browser requests (or structured JSON for /api/*),
+// records 5xx errors and recovered panics into runtime-logs so administrators can inspect exact causes in the console,
 // AND records 404 risk-control signals without ever double-counting.
 func (s *AppServer) wrapCustomErrorPages(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r, _ = withErrorProbeTracker(r)
 		cw := &customErrorInterceptWriter{ResponseWriter: w}
-		next.ServeHTTP(cw, r)
+		reqURL := "/"
+		if r != nil && r.URL != nil {
+			reqURL = sanitizeLogField(r.URL.RequestURI())
+		}
+		reqMethod := ""
+		if r != nil {
+			reqMethod = sanitizeLogField(r.Method)
+		}
+
+		var panicked bool
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					panicked = true
+					logging.LogError("http", "http panic recovered",
+						"method", reqMethod,
+						"path", reqURL,
+						"panic", sanitizeLogField(fmt.Sprint(rec)),
+						"stack", sanitizeLogField(compactPanicStack(debug.Stack())),
+					)
+					if !cw.wroteHeader {
+						cw.wroteHeader = true
+						cw.status = http.StatusInternalServerError
+						cw.intercepted = true
+					}
+				}
+			}()
+			next.ServeHTTP(cw, r)
+		}()
+
+		if !panicked && cw.status >= http.StatusInternalServerError {
+			rawDetail := cw.internalDetail
+			if rawDetail == "" {
+				rawDetail = string(cw.buf)
+			}
+			detail := sanitizeLogField(strings.Join(strings.Fields(strings.TrimSpace(rawDetail)), " "))
+			if detail == "" {
+				detail = http.StatusText(cw.status)
+			}
+			logging.LogError("http", "http 5xx error",
+				"status", cw.status,
+				"method", reqMethod,
+				"path", reqURL,
+				"detail", detail,
+			)
+		}
 
 		if !cw.intercepted {
 			return

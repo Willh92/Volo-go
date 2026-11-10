@@ -1730,6 +1730,8 @@ a.volo-series-box__link:hover {
   border-radius: 10px;
   cursor: zoom-in;
 }
+.volo-prose :is([align="center"], center) { text-align: center; }
+.volo-prose [align="right"] { text-align: right; }
 html[data-theme="dark"] .volo-prose img[src*="/images/github-icon.svg"],
 html[data-theme="dark"] .volo-prose img[src*="/images/admin-"] {
   filter: invert(1) brightness(1.15);
@@ -2841,6 +2843,10 @@ button.volo-audio-ts:hover,
   grid-template-columns: repeat(auto-fill, minmax(min(236px, 100%), 1fr));
   gap: 16px;
 }
+.bookshelf-grid.js-book-filter-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(168px, 100%), 1fr));
+  gap: 14px;
+}
 .book-card {
   padding: 18px;
   background: var(--volo-surface);
@@ -2852,6 +2858,28 @@ button.volo-audio-ts:hover,
   gap: 10px;
   min-width: 0;
   transition: border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
+}
+.js-book-filter-grid .book-card {
+  padding: 12px;
+  gap: 8px;
+  border-radius: 11px;
+}
+.js-book-filter-grid .book-card__meta {
+  font-size: 0.76rem;
+  gap: 6px;
+}
+.js-book-filter-grid .book-card__title {
+  font-size: 0.96rem;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.js-book-filter-grid .studio-tax-card__desc {
+  font-size: 0.82rem;
+  line-height: 1.5;
+  -webkit-line-clamp: 2;
 }
 .book-card:hover {
   border-color: color-mix(in srgb, var(--volo-accent) 45%, var(--volo-line));
@@ -3860,11 +3888,17 @@ body.is-book-fullscreen #studio-main {
 
 .volo-comment-composer {
   position: fixed;
-  left: 50%;
+  /* Centered via left/right + auto margins (not translateX) so toggling fullscreen never jumps
+     horizontally; transform is reserved for the vertical slide. */
+  left: 0;
+  right: 0;
+  margin-inline: auto;
   bottom: 0;
-  width: min(760px, 100vw);
+  width: min(760px, 100%);
   max-height: min(88dvh, 640px);
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   z-index: 175;
   background: var(--volo-surface);
   border: 1px solid var(--volo-line);
@@ -3872,41 +3906,29 @@ body.is-book-fullscreen #studio-main {
   border-radius: 18px 18px 0 0;
   box-shadow: 0 -16px 46px rgba(0, 0, 0, 0.22);
   padding: 16px 20px max(16px, env(safe-area-inset-bottom));
-  transform: translate(-50%, 100%);
+  transform: translateY(100%);
   opacity: 0;
   transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1), opacity 180ms ease;
 }
+.volo-comment-composer[hidden] {
+  display: none !important;
+}
 .volo-comment-composer.is-open {
-  transform: translate(-50%, 0);
+  transform: translateY(0);
   opacity: 1;
 }
 .volo-comment-composer.is-closing {
-  transform: translate(-50%, 100%);
+  transform: translateY(100%);
   opacity: 0;
   pointer-events: none;
-}
-.volo-comment-composer.is-inline {
-  position: relative;
-  left: auto;
-  bottom: auto;
-  width: 100%;
-  max-height: none;
-  overflow: visible;
-  z-index: 2;
-  margin-top: 10px;
-  padding: 14px 16px;
-  border: 1px solid var(--volo-line);
-  border-radius: 14px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
-  transform: none;
-  opacity: 1;
 }
 .volo-comment-composer.is-fullscreen {
   position: fixed;
   inset: 0;
   left: 0;
   bottom: 0;
-  width: 100vw;
+  width: 100%;
+  margin: 0;
   height: 100vh;
   height: 100dvh;
   max-height: none;
@@ -3917,9 +3939,25 @@ body.is-book-fullscreen #studio-main {
   padding: max(14px, env(safe-area-inset-top)) clamp(14px, 3vw, 32px) max(14px, env(safe-area-inset-bottom));
   transform: none;
   opacity: 1;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+}
+/* visualViewport geometry: comment-widget.js writes --vc-vv-top / --vc-vv-h / --vc-kb and adds .has-vv.
+   Position follows the keyboard / visual-viewport pan via translateY only (compositor, no top/bottom
+   relayout); max-height/height change only when the visual viewport is actually resized. */
+.volo-comment-composer.has-vv:not(.is-fullscreen) {
+  max-height: max(200px, calc(var(--vc-vv-h, 100vh) - 16px));
+}
+.volo-comment-composer.is-open.has-vv:not(.is-fullscreen):not(.is-closing) {
+  transform: translateY(calc(-1 * var(--vc-kb, 0px)));
+}
+.volo-comment-composer.has-vv.is-kb-open:not(.is-fullscreen) {
+  max-height: max(200px, calc(var(--vc-vv-h, 100vh) - 6px));
+}
+.volo-comment-composer.has-vv.is-fullscreen {
+  top: 0;
+  bottom: auto;
+  height: max(180px, var(--vc-vv-h, 100vh));
+  transform: translateY(var(--vc-vv-top, 0px));
+  transition: opacity 180ms ease;
 }
 .volo-comment-composer.is-fullscreen .vc-form {
   flex: 1;
@@ -3937,16 +3975,36 @@ body.is-book-fullscreen #studio-main {
   flex-direction: column;
   min-width: 0;
 }
+.volo-comment-composer.is-fullscreen .vc-composer-body,
 .volo-comment-composer.is-fullscreen .vc-editor-shell,
 .volo-comment-composer.is-fullscreen .vc-editor-panes {
   flex: 1;
   min-height: 0;
 }
 
-.vc-form { display: flex; flex-direction: column; gap: 10px; margin: 0; }
-.vc-composer-top {
+.vc-form {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  overflow: hidden;
+}
+.vc-composer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.vc-composer-top {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
   justify-content: space-between;
   flex-wrap: nowrap;
   gap: 8px;
@@ -3955,7 +4013,8 @@ body.is-book-fullscreen #studio-main {
 .vc-composer-top__left {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px 8px;
   min-width: 0;
   flex: 1 1 auto;
 }
@@ -4038,7 +4097,7 @@ body.is-book-fullscreen #studio-main {
   font-size: 12px;
   font-weight: 600;
   flex: 0 1 auto;
-  max-width: min(56vw, 280px);
+  max-width: min(68vw, 280px);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4066,11 +4125,47 @@ body.is-book-fullscreen #studio-main {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
+/* Compact one-line guest identity summary, shown only while the row is folded (keyboard open, narrow). */
+.vc-id-summary {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 12px;
+  border: 1px solid var(--volo-line);
+  border-radius: 999px;
+  background: var(--volo-raised);
+  color: var(--volo-muted);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.vc-id-summary__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vc-id-summary__act {
+  flex-shrink: 0;
+  color: var(--volo-accent);
+  font-weight: 600;
+}
+.volo-comment-composer.is-identity-collapsed .vc-row:not([hidden]) {
+  display: none;
+}
+.volo-comment-composer.is-identity-collapsed .vc-row:not([hidden]) + .vc-id-summary {
+  display: flex;
+}
 .vc-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
   padding: 4px 6px;
   border: 1px solid var(--volo-line);
@@ -4085,9 +4180,14 @@ body.is-book-fullscreen #studio-main {
   gap: 2px;
 }
 .vc-md-tools {
+  flex: 1 1 auto;
+  min-width: 0;
   max-width: 100%;
   overflow-x: auto;
   scrollbar-width: none;
+}
+.vc-tabs {
+  flex-shrink: 0;
 }
 .vc-md-tools::-webkit-scrollbar { display: none; }
 .vc-tb-sep {
@@ -4114,6 +4214,7 @@ body.is-book-fullscreen #studio-main {
   font-weight: 600;
   cursor: pointer;
   flex-shrink: 0;
+  touch-action: manipulation;
   transition: background-color 0.14s ease, color 0.14s ease;
 }
 .vc-tab { padding: 0 9px; }
@@ -4177,11 +4278,37 @@ body.is-book-fullscreen #studio-main {
   resize: none;
 }
 .vc-composer-foot {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 10px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--volo-line) 75%, transparent);
+  background: var(--volo-surface);
+}
+.volo-comment-composer.is-kb-open {
+  padding: 10px 12px 10px;
+}
+.volo-comment-composer.is-kb-open.is-fullscreen {
+  padding: max(10px, env(safe-area-inset-top)) 12px 10px;
+}
+.volo-comment-composer.is-kb-open .vc-form,
+.volo-comment-composer.is-kb-open .vc-composer-body {
+  gap: 6px;
+}
+.volo-comment-composer.is-kb-open:not(.is-fullscreen) .vc-textarea {
+  min-height: 68px;
+  padding: 8px 10px;
+}
+.volo-comment-composer.is-kb-open:not(.is-fullscreen) .vc-preview {
+  min-height: 68px;
+  max-height: 150px;
+}
+.volo-comment-composer.is-kb-open .vc-composer-foot {
+  padding-top: 6px;
+  gap: 8px;
 }
 .vc-composer-meta {
   display: inline-flex;
@@ -5116,6 +5243,30 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
   }
 }
 
+/* iOS Safari auto-zooms the page when focusing a control whose computed font-size is < 16px.
+   Feature-detected to iOS/iPadOS WebKit and limited to narrow or touch-first viewports; user zoom
+   stays enabled (viewport meta is untouched). Placeholders may remain smaller. */
+@supports (-webkit-touch-callout: none) {
+  @media (max-width: 768px), (hover: none) and (pointer: coarse) {
+    input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]),
+    select,
+    textarea,
+    [contenteditable="true"],
+    [contenteditable=""],
+    .volo-input,
+    .vc-input,
+    .vc-textarea,
+    .volo-search-input,
+    .book-chap-filter__input,
+    .studio-tax-search__input,
+    .studio-collection-filter,
+    .reader-auth-code-row__input,
+    .err-search-input {
+      font-size: 16px !important;
+    }
+  }
+}
+
 @media (max-width: 760px) {
   .studio-container, .studio-footer { width: calc(100% - 28px); }
   .studio-header__inner { flex-wrap: wrap; gap: 8px; padding: 10px 0; min-height: 56px; }
@@ -5177,7 +5328,16 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
   .studio-card-pad { padding: 20px 18px; }
   .studio-article__title { font-size: 22px; }
   .volo-comments-card { padding: 20px 18px; }
-  .vc-row { grid-template-columns: minmax(0, 1fr); }
+  .volo-comment-composer:not(.is-fullscreen) {
+    padding: 12px 14px max(12px, env(safe-area-inset-bottom));
+  }
+  .vc-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .vc-row > :first-child {
+    grid-column: 1 / -1;
+  }
   .volo-neighbors,
   .studio-neighbors { grid-template-columns: minmax(0, 1fr); }
   .studio-fab-dock {
@@ -5235,6 +5395,32 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
 }
 
 @media (max-width: 640px) {
+  .bookshelf-grid.js-book-filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .js-book-filter-grid .book-card {
+    padding: 10px;
+    gap: 6px;
+    border-radius: 10px;
+  }
+  .js-book-filter-grid .book-card__meta {
+    font-size: 0.72rem;
+    gap: 4px;
+  }
+  .js-book-filter-grid .book-card__title {
+    font-size: 0.9rem;
+    line-height: 1.38;
+  }
+  .js-book-filter-grid .studio-tax-card__desc {
+    font-size: 0.78rem;
+  }
+  .js-book-filter-grid .studio-resume-badge {
+    height: 30px;
+    padding: 0 9px;
+    font-size: 11.5px;
+    border-radius: 8px;
+  }
   .volo-search-foot {
     display: none;
   }
@@ -5511,4 +5697,23 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
   }
   .studio-layout { display: block; }
   .studio-article { border: none; padding: 0; }
+}
+
+/* Comment trash: soft-deleted comments that still have visible replies render as a zero-PII placeholder. */
+.vc-item.is-deleted > .vc-avatar {
+  opacity: 0.4;
+  filter: grayscale(1);
+}
+.vc-item.is-deleted > .vc-body > .vc-meta {
+  color: var(--volo-muted);
+}
+.vc-deleted-placeholder {
+  margin: 0;
+  color: var(--volo-muted);
+  font-style: italic;
+  user-select: none;
+}
+.volo-prose .vc-deleted-placeholder,
+[data-theme="dark"] .vc-deleted-placeholder {
+  color: var(--volo-muted);
 }

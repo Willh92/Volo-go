@@ -2,7 +2,7 @@
 
 > 中文版本：[部署与各系统服务安装指南](../zh-CN/deployment.md)
 
-`Volo-go` compiles with Go `1.27.3` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (**strictly `< 20 MiB` across all 6 supported static release targets**, `~19.1 MiB` on `linux/amd64`):
+`Volo-go` compiles with Go `1.27.3` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (**strictly `< 21 MiB` across all 6 supported static release targets**, `~19.7 MiB` on `linux/amd64`):
 - **Linux**: `linux/amd64`, `linux/arm64` (`systemd` system/user units & `OpenRC`)
 - **macOS**: `darwin/amd64`, `darwin/arm64` (`launchd` `LaunchDaemon` / `LaunchAgent`)
 - **Windows**: `windows/amd64`, `windows/arm64` (native `sc.exe` Windows Service via `svc_windows.go`, `NSSM`, and Scheduled Task fallback)
@@ -17,8 +17,8 @@
 - **Core Bootstrap Settings (4-Layer Order)**:
   `CLI Flags (--listen-addr, etc.) > OS Environment (VOLO_*) > .env File > Built-in Safe Defaults`
 - **Hot-Reloadable `VOLO_UPLOAD_DIR` & `VOLO_GEOIP_DIR` Paths (5-Layer Order)**:
-  `CLI Flags (--upload-dir / --geoip-dir) > OS ENV (VOLO_UPLOAD_DIR / VOLO_GEOIP_DIR) > .env File > Admin DB Settings (storage.local_dir / security.geoip_dir) > Default (${VOLO_DATA_DIR}/uploads or ${VOLO_DATA_DIR}/geoip)`
-  > Leaving these unpinned in CLI/ENV/`.env` lets administrators hot-switch the local media directory and offline GeoIP directory live from the Admin Console; setting them in any of the top 3 layers pins the path.
+  `CLI Flags (--upload-dir / --geoip-dir) > Admin DB Settings (storage.local_dir / security.geoip_dir) > OS ENV / .env File (VOLO_UPLOAD_DIR / VOLO_GEOIP_DIR) > Default (${VOLO_DATA_DIR}/uploads or ${VOLO_DATA_DIR}/geoip)`
+  > Only explicit CLI flags pin the path. `VOLO_UPLOAD_DIR` / `VOLO_GEOIP_DIR` from the OS environment or `.env` act as defaults that administrators can hot-switch live from the Admin Console (clearing the Admin Console value falls back to them).
 - **Setup Wizard Database Persistence (`data/db.json`)**:
   Leaving `VOLO_DB_DRIVER` (and `VOLO_DB_DSN`) unset/commented out in `.env` and `docker-compose.yml` allows the `/setup` wizard's `AES-256-GCM` encrypted `${VOLO_DATA_DIR}/db.json` (`SQLite` / `PostgreSQL` / `MySQL`) to persist across container recreations and service restarts. Setting `VOLO_DB_DRIVER` or `VOLO_DB_DSN` explicitly overrides `db.json`.
 
@@ -43,6 +43,10 @@
 | `VOLO_DB_CONN_MAX_LIFETIME_SEC` | — | `1800` | Max DB connection lifetime in seconds (`10`–`86400`) |
 | `VOLO_GEO_ACCESS_ENABLED` | `--geo-access-enabled` | `true` | Master circuit breaker for offline GeoIP rules (set `false` to emergency-bypass geo lockouts without deleting DB rules) |
 | `VOLO_SHUTDOWN_TIMEOUT_SEC` | `--shutdown-timeout` | `15` | Graceful shutdown drain timeout in seconds (`1`–`120`) |
+| `VOLO_TLS_CERT_FILE` | `--tls-cert` | *(empty)* | Native HTTPS certificate chain (PEM). Together with `VOLO_TLS_KEY_FILE` enables TLS on `VOLO_LISTEN_ADDR` (HTTP/2 via ALPN; hot-reloaded when the file changes). Cannot be combined with `VOLO_LISTEN_SOCKET` |
+| `VOLO_TLS_KEY_FILE` | `--tls-key` | *(empty)* | Native HTTPS private key (PEM); must be set together with `VOLO_TLS_CERT_FILE` and readable by the service user |
+| `VOLO_TLS_MIN_VERSION` | `--tls-min-version` | `1.2` | Minimum negotiated TLS version: `1.2` or `1.3` |
+| `VOLO_TLS_HTTP_REDIRECT_ADDR` | `--tls-http-redirect-addr` | *(empty)* | Optional extra plain-HTTP listener (e.g. `:80`) that `308`-redirects every request to `https://` on the `VOLO_PUBLIC_URL` host; requires native TLS |
 | `VOLO_DEFAULT_LOCALE` | `--default-locale` | `zh-CN` | Fallback default locale (built-in `zh-CN`, `en-US`; extensible via `VOLO_LOCALES_DIR`) |
 | `VOLO_DATA_DIR` | `--data-dir` | `./data` | Base runtime data directory (`volo.db`, `db.json`, `.secret.key`, logs) |
 | `VOLO_UPLOAD_DIR` | `--upload-dir` | `${VOLO_DATA_DIR}/uploads` | Local uploaded media directory (5-layer precedence with hot-reloadable `storage.local_dir`) |
@@ -51,6 +55,26 @@
 | `VOLO_THEMES_DIR` | `--themes-dir` | `./themes` | External hot-mountable themes directory |
 | `VOLO_PLUGINS_DIR` | `--plugins-dir` | `./plugins` | External hot-pluggable plugins directory |
 | `VOLO_LOCALES_DIR` | `--locales-dir` | `./locales` | External locale override JSON directory |
+
+### 1.3 Native HTTPS (Optional)
+
+A reverse proxy (Nginx / Caddy, see the [Reverse Proxy Guide](./reverse-proxy.md)) remains the recommended production setup. For small single-host deployments Volo-go can terminate TLS itself:
+
+```ini
+# /etc/volo/volo.env
+VOLO_LISTEN_ADDR=0.0.0.0:443
+VOLO_PUBLIC_URL=https://blog.example.com
+VOLO_TLS_CERT_FILE=/etc/volo/tls/fullchain.pem
+VOLO_TLS_KEY_FILE=/etc/volo/tls/privkey.pem
+# VOLO_TLS_MIN_VERSION=1.3
+VOLO_TLS_HTTP_REDIRECT_ADDR=:80
+```
+
+- The key pair is validated at startup (fail fast). Renewed files are picked up automatically (checked at most every 30 s); if a renewal is half-written the last good certificate keeps being served.
+- HTTP/2 is negotiated via ALPN (`h2`, HTTP/1.1 fallback). The redirect listener derives its target from `VOLO_PUBLIC_URL` (an explicit port in an `https://` public URL wins, otherwise the TLS listen port), never from the client `Host` header.
+- Binding ports below 1024 as the unprivileged `volo` user requires `CAP_NET_BIND_SERVICE`: add a drop-in via `sudo systemctl edit volo` containing `[Service]` + `AmbientCapabilities=CAP_NET_BIND_SERVICE`, then `sudo systemctl restart volo`. Outside systemd, `sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/volo` works too (re-apply after each upgrade; ignored under `NoNewPrivileges=true`).
+- Copy certificates to a path readable by the service user (e.g. an acme.sh `--install-cert` / certbot `--deploy-hook` into `/etc/volo/tls/` with `chown root:volo` + `chmod 0640` on the key) rather than pointing at root-only `/etc/letsencrypt/live`.
+- `volo doctor` adds a `tls_certificate` check (unreadable / mismatched / expired → fail, `< 14` days left → warn), and `volo healthcheck` automatically probes `https://` (certificate verification is skipped only for loopback probes).
 
 ---
 

@@ -308,6 +308,13 @@ func TestUXAndAdminModalCRUDParity(t *testing.T) {
 	if ghCoverResp.StatusCode != http.StatusOK || !bytes.Contains(ghCoverBody, []byte("<svg")) {
 		t.Fatalf("GET /images/github_repo.jpg failed: status=%d", ghCoverResp.StatusCode)
 	}
+	// 1b. Volo-solo / Solo webapp-bundled default avatars referenced by migrated comments must not 404
+	for _, legacyAvatar := range []string{"/images/volo-mark.svg", "/images/default-user-thumbnail.png", "/posts/images/volo-mark.svg"} {
+		avResp, avBody := doJSONReq(t, http.MethodGet, env.ts.URL+legacyAvatar, nil, nil, nil)
+		if avResp.StatusCode != http.StatusOK || !bytes.Contains(avBody, []byte("<svg")) {
+			t.Fatalf("GET %s failed: status=%d", legacyAvatar, avResp.StatusCode)
+		}
+	}
 
 	// 2. `GET /api/admin/me` returns `storage_driver`
 	meResp, meBody := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/me", nil, adminCookies, nil)

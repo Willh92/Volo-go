@@ -645,8 +645,15 @@ func (w *WAFEngine) isStaffSession(r *http.Request) bool {
 func isStaticWAFExemptionPath(p string) bool {
 	return strings.HasPrefix(p, "/themes/") ||
 		strings.HasPrefix(p, "/uploads/") ||
+		strings.HasPrefix(p, "/upload/") ||
+		strings.HasPrefix(p, "/image/") ||
 		strings.HasPrefix(p, "/images/") ||
+		strings.HasPrefix(p, "/posts/image/") ||
+		strings.HasPrefix(p, "/posts/images/") ||
+		strings.HasPrefix(p, "/posts/upload/") ||
 		strings.HasPrefix(p, "/avatars/") ||
+		strings.HasPrefix(p, "/plugins/") ||
+		strings.HasPrefix(p, "/assets/") ||
 		p == "/favicon.ico" ||
 		p == "/favicon.svg" ||
 		p == "/assets/favicon.svg"
@@ -738,8 +745,8 @@ func (w *WAFEngine) AllowRate(scope string, clientAddr netip.Addr, limit int, wi
 
 // WrapHTTP wraps next with:
 // 1. /healthz bypass (always fast)
-// 2. IP/CIDR ban enforcement (403)
-// 3. Offline GeoIP access control (with emergency circuit-breaker bypass)
+// 2. IP/CIDR ban enforcement (403, bypassed by authenticated staff sessions)
+// 3. Offline GeoIP access control (with emergency circuit-breaker + authenticated staff bypass)
 // 4. Global WAF sliding-window rate shield (429 when WAFEnabled)
 // 5. Custom AdminPath stealth 404 cloaking on default /console
 // 6. Automated scanner trap 404 + strike & audit recording
@@ -770,15 +777,15 @@ func (w *WAFEngine) WrapHTTP(next http.Handler) http.Handler {
 		}
 		clientIP := ResolveClientIP(r, tp)
 
-		// 1. Active IP / /64 CIDR Ban Check
-		if banned, _ := w.IsBanned(clientIP); banned {
+		// 1. Active IP / /64 CIDR Ban Check (authenticated staff sessions bypass IP lockouts so admins can always access /console)
+		if banned, _ := w.IsBanned(clientIP); banned && !w.isStaffSession(r) {
 			w.serveBlocked(rw, r, http.StatusForbidden, "error.forbidden")
 			return
 		}
 
-		// 2. Offline GeoIP Access Control (with VOLO_GEO_ACCESS_ENABLED circuit breaker)
+		// 2. Offline GeoIP Access Control (with VOLO_GEO_ACCESS_ENABLED circuit breaker + authenticated staff bypass)
 		if w.geo != nil && (w.cfg == nil || w.cfg.GeoAccessEnabled) {
-			if allowed := w.geo.Allows(clientIP); !allowed {
+			if allowed := w.geo.Allows(clientIP); !allowed && !w.isStaffSession(r) {
 				w.serveBlocked(rw, r, http.StatusForbidden, "error.forbidden")
 				return
 			}

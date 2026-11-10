@@ -18,7 +18,7 @@ RUN rm -rf /src/internal/adminui/dist && mkdir -p /src/internal/adminui/dist && 
 FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS go-builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=v1.0.0
+ARG VERSION=v1.0.1
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -34,7 +34,7 @@ COPY --from=admin-builder /src/internal/theme/builtin/volo-studio/templates_gz .
 RUN CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -buildvcs=false -trimpath \
     -gcflags="all=-l" \
-    -ldflags="-s -w -funcalign=8 -X main.Version=${VERSION}" \
+    -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
     -o /out/volo ./cmd/volo
 
 # Prepare non-root runtime directory skeleton (uid:gid 65532:65532 for distroless:nonroot)
@@ -61,7 +61,7 @@ COPY --from=go-builder --chown=65532:65532 /volo-root/ /app/
 COPY --chown=65532:65532 plugins/ /app/plugins/
 COPY --chown=65532:65532 themes/ /app/themes/
 COPY --chown=65532:65532 locales/ /app/locales/
-COPY --chown=65532:65532 LICENSE THIRD_PARTY_NOTICES.md README.md CHANGELOG.md /app/
+COPY --chown=65532:65532 LICENSE THIRD_PARTY_NOTICES.md README.md README.zh-CN.md CHANGELOG.md CHANGELOG.zh-CN.md /app/
 COPY --from=go-builder /out/volo /usr/local/bin/volo
 
 ENV VOLO_LISTEN_ADDR=0.0.0.0:8080 \

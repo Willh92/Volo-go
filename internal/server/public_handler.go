@@ -467,8 +467,10 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/my-github-repos", s.handlePublicGitHubShowcaseRoute)
 	mux.HandleFunc("/images/", s.handleLegacyImageShim)
 	mux.HandleFunc("/image/", s.handleLegacyImageShim)
+	mux.HandleFunc("/upload/", s.handleLegacyImageShim)
 	mux.HandleFunc("/posts/images/", s.handleLegacyImageShim)
 	mux.HandleFunc("/posts/image/", s.handleLegacyImageShim)
+	mux.HandleFunc("/posts/upload/", s.handleLegacyImageShim)
 
 	// Public Studio HTML Routes
 	mux.HandleFunc("/posts/", s.handlePostRoute)
@@ -507,6 +509,7 @@ func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 			!strings.HasPrefix(p, "/api/") &&
 			!strings.HasPrefix(p, "/themes/") &&
 			!strings.HasPrefix(p, "/uploads/") &&
+			!strings.HasPrefix(p, "/upload/") &&
 			!strings.HasPrefix(p, "/images/") &&
 			!strings.HasPrefix(p, "/image/") &&
 			!strings.HasPrefix(p, "/plugins/") &&
@@ -656,6 +659,71 @@ func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir str
 
 	// Zero-copy HTTP Range / 206 Partial Content streaming via stdlib http.ServeContent!
 	http.ServeContent(w, r, name, st.ModTime(), f)
+	return true
+}
+
+func (s *AppServer) serveLocalImageWithView(w http.ResponseWriter, r *http.Request, baseDir string, cleanRel string) bool {
+	realFile, st, ok := resolveSafeLocalUploadFile(baseDir, cleanRel)
+	if !ok {
+		return false
+	}
+	ext := filepath.Ext(cleanRel)
+	if r.URL.RawQuery == "" || !media.IsTransformableImageExt(ext) || s.imageView == nil {
+		return serveSafeUserStaticFile(w, r, baseDir, cleanRel)
+	}
+	spec, hasTransform, parseErr := media.ParseImageViewSpec(r.URL.RawQuery)
+	if parseErr == nil && !hasTransform {
+		return serveSafeUserStaticFile(w, r, baseDir, cleanRel)
+	}
+	if parseErr != nil {
+		if spec.IgnoreError {
+			return serveSafeUserStaticFile(w, r, baseDir, cleanRel)
+		}
+		writeErrJSON(w, http.StatusBadRequest, parseErr.Error())
+		return true
+	}
+	rf := realFile
+	src := media.ImageViewSource{
+		Key:         "local:" + rf,
+		ModTimeNano: st.ModTime().UnixNano(),
+		Size:        st.Size(),
+		Ext:         ext,
+		Load:        func(context.Context) ([]byte, error) { return os.ReadFile(rf) },
+	}
+	expectedETag := s.imageView.ComputeETag(src.Key, src.ModTimeNano, src.Size, spec)
+	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), expectedETag) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "public, max-age=2592000")
+		w.Header().Set("ETag", expectedETag)
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	res, tErr := s.imageView.Transform(r.Context(), src, spec)
+	if tErr != nil {
+		writeErrJSON(w, http.StatusBadRequest, tErr.Error())
+		return true
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("Cache-Control", "public, max-age=2592000")
+	if res.ETag != "" {
+		w.Header().Set("ETag", res.ETag)
+	}
+	outCT := "application/octet-stream"
+	switch res.ContentType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif":
+		outCT = res.ContentType
+	}
+	w.Header().Set("Content-Type", outCT)
+	if res.FormatFallback != "" {
+		w.Header().Set("X-Volo-Image-Format-Fallback", res.FormatFallback)
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(res.Data)))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+	_, _ = w.Write(res.Data)
 	return true
 }
 
@@ -1076,7 +1144,7 @@ func (s *AppServer) requirePublicSessionCSRF(w http.ResponseWriter, r *http.Requ
 func (s *AppServer) handleRSS(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.deps.Content.GetCachedRSS(r.Context(), s.feedBaseURL(r), s.resolveLocale(r))
 	if err != nil {
-		http.Error(w, "feed error", http.StatusInternalServerError)
+		recordInternal500(w, "rss feed error", err)
 		return
 	}
 	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
@@ -1086,7 +1154,7 @@ func (s *AppServer) handleRSS(w http.ResponseWriter, r *http.Request) {
 func (s *AppServer) handleAtom(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.deps.Content.GetCachedAtom(r.Context(), s.feedBaseURL(r), s.resolveLocale(r))
 	if err != nil {
-		http.Error(w, "feed error", http.StatusInternalServerError)
+		recordInternal500(w, "atom feed error", err)
 		return
 	}
 	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
@@ -1096,7 +1164,7 @@ func (s *AppServer) handleAtom(w http.ResponseWriter, r *http.Request) {
 func (s *AppServer) handleJSONFeed(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.deps.Content.GetCachedJSONFeed(r.Context(), s.feedBaseURL(r), s.resolveLocale(r))
 	if err != nil {
-		http.Error(w, "feed error", http.StatusInternalServerError)
+		recordInternal500(w, "json feed error", err)
 		return
 	}
 	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
@@ -1110,7 +1178,7 @@ func (s *AppServer) handlePodcast(w http.ResponseWriter, r *http.Request) {
 	}
 	doc, err := s.deps.Content.GetCachedPodcast(r.Context(), s.feedBaseURL(r), s.resolveLocale(r))
 	if err != nil {
-		http.Error(w, "podcast feed error", http.StatusInternalServerError)
+		recordInternal500(w, "podcast feed error", err)
 		return
 	}
 	addVaryHeader(w.Header(), "Accept-Language", "Cookie")
@@ -1120,7 +1188,7 @@ func (s *AppServer) handlePodcast(w http.ResponseWriter, r *http.Request) {
 func (s *AppServer) handleSitemap(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.deps.Content.GetCachedSitemap(r.Context(), s.feedBaseURL(r))
 	if err != nil {
-		http.Error(w, "sitemap error", http.StatusInternalServerError)
+		recordInternal500(w, "sitemap error", err)
 		return
 	}
 	serveCachedDocument(w, r, doc)
@@ -1145,7 +1213,7 @@ func (s *AppServer) handleSitemapShard(w http.ResponseWriter, r *http.Request, s
 	}
 	doc, err := s.deps.Content.GetCachedSitemapShard(r.Context(), s.feedBaseURL(r), shard)
 	if err != nil {
-		http.Error(w, "sitemap error", http.StatusInternalServerError)
+		recordInternal500(w, "sitemap shard error", err)
 		return
 	}
 	serveCachedDocument(w, r, doc)
@@ -1171,7 +1239,7 @@ func (s *AppServer) handleLLMSTxt(w http.ResponseWriter, r *http.Request, full b
 	}
 	doc, err := s.deps.Content.GetCachedLLMSTxt(r.Context(), s.feedBaseURL(r), full)
 	if err != nil {
-		http.Error(w, "llms.txt error", http.StatusInternalServerError)
+		recordInternal500(w, "llms.txt error", err)
 		return
 	}
 	serveCachedDocument(w, r, doc)
@@ -2375,7 +2443,7 @@ func (s *AppServer) renderStudioFallback(w http.ResponseWriter, r *http.Request,
 		pctx.ThemeConfig = s.deps.Themes.ResolveThemeConfig(activeTheme, pctx.Appearance.ThemeConfigs)
 	}
 	if err := s.deps.Themes.RenderWithFallback(w, status, activeTheme, candidates, pctx); err != nil {
-		http.Error(w, "render error: "+err.Error(), http.StatusInternalServerError)
+		recordInternal500(w, "render error", fmt.Errorf("theme=%s templates=%v: %w", activeTheme, candidates, err))
 	}
 }
 
@@ -2461,7 +2529,7 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 			Viewer:          pctx.Viewer,
 		})
 		if err != nil {
-			http.Error(w, "query failed", http.StatusInternalServerError)
+			recordInternal500(w, "home articles query failed", err)
 			return
 		}
 		pctx.HeroTitle = pctx.Site.Title
@@ -2509,6 +2577,9 @@ func (s *AppServer) handleRootOrStandalonePage(w http.ResponseWriter, r *http.Re
 	locale := s.resolveLocale(r)
 	pgView, err := s.deps.Content.GetPublicPageBySlugForViewer(r.Context(), r, slug, locale, viewer)
 	if err != nil {
+		if slugDecoded, uErr := url.PathUnescape(slug); uErr == nil && s.tryServeFallbackRasterImage(w, r, slugDecoded) {
+			return
+		}
 		s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 		return
 	}
@@ -2611,6 +2682,9 @@ func (s *AppServer) serveArticleSegment(w http.ResponseWriter, r *http.Request, 
 		// all other callers receive an indistinguishable 404 Not Found.
 		cand, cErr := s.deps.Content.GetRawArticleBySlugAnyStatus(r.Context(), slugDecoded)
 		if cErr != nil {
+			if s.tryServeFallbackRasterImage(w, r, slugDecoded) {
+				return
+			}
 			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 			return
 		}
@@ -2624,6 +2698,9 @@ func (s *AppServer) serveArticleSegment(w http.ResponseWriter, r *http.Request, 
 		staffOwner := viewer != nil && viewer.Status == domain.UserStatusActive &&
 			(viewer.Role == domain.RoleAdmin || (viewer.Role == domain.RoleEditor && viewer.ID == cand.AuthorID))
 		if !staffOwner && (shareTok == "" || !s.deps.Content.Guard().VerifyShareToken(r.Context(), cand, shareTok)) {
+			if s.tryServeFallbackRasterImage(w, r, slugDecoded) {
+				return
+			}
 			s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 			return
 		}
@@ -2638,7 +2715,7 @@ func (s *AppServer) serveArticleSegment(w http.ResponseWriter, r *http.Request, 
 		r.Context(), w, r, raw, viewer, pctx.Locale, s.publicBaseURL(r),
 	)
 	if err != nil {
-		http.Error(w, "render failed", http.StatusInternalServerError)
+		recordInternal500(w, "article detail render failed", err)
 		return
 	}
 
@@ -4214,6 +4291,43 @@ func (s *AppServer) handlePublicGitHubShowcaseRoute(w http.ResponseWriter, r *ht
 	s.renderErrorPage(w, r, http.StatusNotFound, "error.not_found")
 }
 
+func isFallbackRasterImageSlug(slug string) bool {
+	if slug == "" || strings.ContainsAny(slug, `/\`) || strings.Contains(slug, "..") {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(slug)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".ico", ".bmp":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *AppServer) tryServeFallbackRasterImage(w http.ResponseWriter, r *http.Request, slug string) bool {
+	if r == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) || !isFallbackRasterImageSlug(slug) {
+		return false
+	}
+	if s.deps.Config == nil {
+		return false
+	}
+	for _, upDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir()} {
+		if strings.TrimSpace(upDir) != "" && s.serveLocalImageWithView(w, r, upDir, slug) {
+			return true
+		}
+	}
+	for _, baseDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir(), s.deps.Config.DataDir} {
+		if strings.TrimSpace(baseDir) == "" {
+			continue
+		}
+		for _, sub := range []string{"images", "image", "upload"} {
+			if s.serveLocalImageWithView(w, r, filepath.Join(baseDir, sub), slug) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -4225,6 +4339,10 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 		rel = strings.TrimPrefix(r.URL.Path, "/posts/images/")
 	case strings.HasPrefix(r.URL.Path, "/posts/image/"):
 		rel = strings.TrimPrefix(r.URL.Path, "/posts/image/")
+	case strings.HasPrefix(r.URL.Path, "/posts/upload/"):
+		rel = strings.TrimPrefix(r.URL.Path, "/posts/upload/")
+	case strings.HasPrefix(r.URL.Path, "/upload/"):
+		rel = strings.TrimPrefix(r.URL.Path, "/upload/")
 	case strings.HasPrefix(r.URL.Path, "/image/"):
 		rel = strings.TrimPrefix(r.URL.Path, "/image/")
 	default:
@@ -4235,20 +4353,22 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 		http.NotFound(w, r)
 		return
 	}
-	// Serve user-provided static file if placed in uploads/{images,image}/ or data/{images,image}/, or directly in uploads/
-	for _, baseDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir(), s.deps.Config.DataDir} {
-		if strings.TrimSpace(baseDir) == "" {
-			continue
-		}
-		for _, sub := range []string{"images", "image"} {
-			if serveSafeUserStaticFile(w, r, filepath.Join(baseDir, sub), clean) {
-				return
+	if s.deps.Config != nil {
+		// Serve user-provided static file (with ?imageView2 transform support) if placed in uploads/{images,image,upload}/, data/{images,image,upload}/, or directly in uploads/
+		for _, baseDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir(), s.deps.Config.DataDir} {
+			if strings.TrimSpace(baseDir) == "" {
+				continue
+			}
+			for _, sub := range []string{"images", "image", "upload"} {
+				if s.serveLocalImageWithView(w, r, filepath.Join(baseDir, sub), clean) {
+					return
+				}
 			}
 		}
-	}
-	for _, upDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir()} {
-		if strings.TrimSpace(upDir) != "" && serveSafeUserStaticFile(w, r, upDir, clean) {
-			return
+		for _, upDir := range []string{s.deps.Config.GetUploadDir(), s.deps.Config.GetDefaultUploadDir()} {
+			if strings.TrimSpace(upDir) != "" && s.serveLocalImageWithView(w, r, upDir, clean) {
+				return
+			}
 		}
 	}
 
@@ -4264,6 +4384,13 @@ func (s *AppServer) handleLegacyImageShim(w http.ResponseWriter, r *http.Request
 		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="#24292f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><style>svg{stroke:#24292f}@media (prefers-color-scheme:dark){svg{stroke:#f0f6f2}}</style><path d="M6.2 2.5H3.6A1.4 1.4 0 0 0 2.2 3.9v8.2a1.4 1.4 0 0 0 1.4 1.4h2.6"/><path d="M10.5 11.2 13.8 8l-3.3-3.2"/><path d="M13.8 8H6.2"/></svg>`
 	case "github_repo.jpg", "github_repo.png", "github_repo.svg":
 		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="800" height="450"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0d1513"/><stop offset="55%" stop-color="#14231e"/><stop offset="100%" stop-color="#1d352d"/></linearGradient><pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#5fb399" stroke-opacity="0.08" stroke-width="1"/></pattern></defs><rect width="800" height="450" fill="url(#bg)"/><rect width="800" height="450" fill="url(#grid)"/><g fill="none" stroke="#64c3a6" stroke-opacity="0.22" stroke-width="1.5"><rect x="44" y="38" width="712" height="374" rx="18"/><circle cx="78" cy="68" r="5" fill="#e06c75" stroke="none"/><circle cx="96" cy="68" r="5" fill="#e5c07b" stroke="none"/><circle cx="114" cy="68" r="5" fill="#98c379" stroke="none"/><line x1="44" y1="94" x2="756" y2="94"/></g><g stroke-linecap="round"><line x1="84" y1="142" x2="220" y2="142" stroke="#64c3a6" stroke-opacity="0.65" stroke-width="6"/><line x1="238" y1="142" x2="394" y2="142" stroke="#8ab4f8" stroke-opacity="0.35" stroke-width="6"/><line x1="84" y1="176" x2="462" y2="176" stroke="#d8e6e0" stroke-opacity="0.22" stroke-width="5"/><line x1="84" y1="208" x2="348" y2="208" stroke="#64c3a6" stroke-opacity="0.38" stroke-width="5"/><line x1="366" y1="208" x2="498" y2="208" stroke="#e5c07b" stroke-opacity="0.32" stroke-width="5"/><line x1="84" y1="240" x2="412" y2="240" stroke="#d8e6e0" stroke-opacity="0.16" stroke-width="5"/></g><g transform="translate(556,142) scale(8.8)"><path fill="#e6f2ed" fill-opacity="0.9" d="M8 1.2a6.8 6.8 0 0 0-2.15 13.25c.34.06.46-.15.46-.33v-1.15c-1.89.41-2.29-.91-2.29-.91-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.61 1.04 1.59.74 1.98.57.06-.44.24-.74.43-.91-1.51-.17-3.1-.76-3.1-3.36 0-.74.26-1.35.7-1.82-.07-.17-.3-.86.07-1.8 0 0 .57-.18 1.87.7a6.5 6.5 0 0 1 3.4 0c1.3-.88 1.87-.7 1.87-.7.37.94.14 1.63.07 1.8.44.47.7 1.08.7 1.82 0 2.61-1.59 3.19-3.11 3.36.25.21.46.63.46 1.27v1.88c0 .18.12.39.47.33A6.8 6.8 0 0 0 8 1.2Z"/></g><text x="84" y="330" font-family="system-ui,-apple-system,sans-serif" font-size="30" font-weight="700" fill="#eef6f2" letter-spacing="0.4">OPEN SOURCE MATRIX</text><text x="84" y="364" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="15" fill="#8fb5a7">git://github.com · public repositories &amp; craft</text></svg>`
+	case "volo-mark.svg", "volo-mark.png":
+		// Volo-solo (Java) shipped this brand mark inside its webapp bundle (src/main/webapp/images/) and used it as
+		// the default owner/commenter avatar, so migrated comments reference it although it never existed in uploads.
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"><rect width="64" height="64" rx="19" fill="#246b51"/><path d="m15 18 12 29h9l13-29H38L32 35l-6-17Z" fill="#eef5ee"/></svg>`
+	case "default-user-thumbnail.png", "default-user-thumbnail.svg":
+		// Solo / Bolo-solo bundled default commenter avatar (also never part of the uploads directory).
+		svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"><rect width="64" height="64" rx="19" fill="#dfe8e2"/><circle cx="32" cy="25" r="11" fill="#8fa89b"/><path d="M12 54c2.6-10.4 10.6-16 20-16s17.4 5.6 20 16" fill="#8fa89b"/></svg>`
 	default:
 		http.NotFound(w, r)
 		return

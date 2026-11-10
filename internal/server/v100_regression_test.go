@@ -390,7 +390,10 @@ func TestV100_AccountBanMute_TimedExpiry_And_ReversibleCommentShielding(t *testi
 	}
 
 	resp, dynRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/dynamic", nil, nil, nil)
-	if resp.StatusCode == http.StatusOK && strings.Contains(string(dynRaw), "Alice original historical comment") {
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /dynamic = %d %s", resp.StatusCode, string(dynRaw))
+	}
+	if strings.Contains(string(dynRaw), "Alice original historical comment") {
 		t.Fatalf("/dynamic recent comments leaked shielded comment: %s", string(dynRaw))
 	}
 
@@ -671,5 +674,252 @@ func TestV100_ImageViewHTTP_NonDestructive_OrphanAndCLS_Permalinks_And_CSRFConso
 		if rSearch.StatusCode != http.StatusOK || !strings.Contains(string(searchB), tc.wantPath) {
 			t.Fatalf("expected search index URL %s for style=%s, got: %s", tc.wantPath, tc.style, string(searchB))
 		}
+	}
+}
+
+func TestV100_WAFStaticAsset404Exemption_And_AdminSessionBypass(t *testing.T) {
+	env, adminCookies, adminHdrs, _ := bootstrapAuditEnv(t)
+	adminHdrs["Origin"] = env.ts.URL
+
+	// 1. Anonymous visitor hitting 20 missing migrated images/assets (both with Chrome Accept */*;q=0.8 without Sec-Fetch-Dest
+	//    and via direct browser tab Sec-Fetch-Dest: document) MUST NEVER be auto-banned!
+	visitorIP := map[string]string{
+		"X-Real-IP": "198.51.100.88",
+		"Accept":    "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+	}
+	missingAssets := []string{
+		"/head.jpg",
+		"/image/20211222174013238.jpg?imageView2/2/w/1280/format/jpg/interlace/1/q/100",
+		"/images/legacy-banner.png",
+		"/uploads/2023/05/missing.webp",
+		"/posts/image/old-cover.jpeg",
+		"/themes/volo-studio/assets/missing.css",
+		"/upload/missing-legacy.png",
+	}
+	for i := 0; i < 3; i++ {
+		for _, p := range missingAssets {
+			r1, _ := doJSONReq(t, http.MethodGet, env.ts.URL+p, nil, nil, visitorIP)
+			if r1.StatusCode != http.StatusNotFound {
+				t.Fatalf("GET %s = %d, want 404", p, r1.StatusCode)
+			}
+			r2, _ := doJSONReq(t, http.MethodGet, env.ts.URL+p, nil, nil, map[string]string{
+				"X-Real-IP":      "198.51.100.88",
+				"Sec-Fetch-Dest": "document",
+				"Accept":         "text/html,application/xhtml+xml,image/avif,image/webp,*/*;q=0.8",
+			})
+			if r2.StatusCode != http.StatusNotFound {
+				t.Fatalf("direct tab GET %s = %d, want 404", p, r2.StatusCode)
+			}
+		}
+	}
+	homeOK, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, map[string]string{"X-Real-IP": "198.51.100.88"})
+	if homeOK.StatusCode != http.StatusOK {
+		t.Fatalf("visitor hitting missing migrated images must never be banned, got GET / = %d", homeOK.StatusCode)
+	}
+
+	// 2. High-risk scanner probes disguised under /image/ (e.g. /image/shell.php, /uploads/.env) MUST STILL trigger auto-ban!
+	scannerIP := map[string]string{"X-Real-IP": "198.51.100.89"}
+	for _, trap := range []string{"/image/shell.php", "/uploads/.env"} {
+		trResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+trap, nil, nil, scannerIP)
+		if trResp.StatusCode != http.StatusNotFound {
+			t.Fatalf("scanner GET %s = %d, want 404", trap, trResp.StatusCode)
+		}
+	}
+	scannerBlocked, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, scannerIP)
+	if scannerBlocked.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected scanner probing /image/shell.php + /uploads/.env to be auto-banned (403), got %d", scannerBlocked.StatusCode)
+	}
+
+	// 3. Enable totp_required_scope="admin" BEFORE admin enrolls TOTP (simulating Solo -> Volo-go migration):
+	//    (a) Authenticated admin hitting repeated 404s / scanner traps MUST NOT self-ban their IP;
+	//    (b) Even when accessing from an ALREADY banned IP (198.51.100.89), authenticated admin session MUST bypass WAF 403!
+	secPatch, _ := json.Marshal(map[string]any{"totp_required_scope": "admin"})
+	if _, _, err := env.settings.PatchDomain(env.ctx, domain.SettingsDomainSecurity, secPatch, 0); err != nil {
+		t.Fatalf("PatchDomain totp_required_scope=admin: %v", err)
+	}
+	adminExtIP := map[string]string{"X-Real-IP": "198.51.100.90"}
+	for i := 0; i < 8; i++ {
+		_, _ = doJSONReq(t, http.MethodGet, env.ts.URL+"/missing-draft-route-"+strconv.Itoa(i), nil, adminCookies, adminExtIP)
+	}
+	anonSameIP, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, adminExtIP)
+	if anonSameIP.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated admin (even pre-TOTP enrollment) must never self-ban their IP, got %d", anonSameIP.StatusCode)
+	}
+
+	adminOnBannedIP, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, adminCookies, scannerIP)
+	if adminOnBannedIP.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated admin session must bypass IP ban lockout on GET /, got %d", adminOnBannedIP.StatusCode)
+	}
+	adminMeOnBannedIP, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/me", nil, adminCookies, map[string]string{
+		"X-Real-IP":      "198.51.100.89",
+		"X-Volo-Console": "1",
+	})
+	if adminMeOnBannedIP.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated admin session must bypass IP ban lockout on /api/admin/me, got %d", adminMeOnBannedIP.StatusCode)
+	}
+}
+
+func TestV101_LegacyImageViewAndStorageProbe(t *testing.T) {
+	env, adminCookies, adminHdrs, _ := bootstrapAuditEnv(t)
+	adminHdrs["Origin"] = env.ts.URL
+	// Simulate .env / OS ENV deployment (unpinned by CLI flag) so Admin Console storage.local_dir overrides default!
+	env.cfg.UploadDirPinned = false
+
+	// Write a 24x24 PNG into custom upload dir and verify /api/admin/settings/storage/test + PATCH storage
+	customUp := filepath.Join(t.TempDir(), "solo-upload")
+	if err := os.MkdirAll(filepath.Join(customUp, "2024"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 24, 24))
+	for y := 0; y < 24; y++ {
+		for x := 0; x < 24; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: 40, G: 120, B: 200, A: 255})
+		}
+	}
+	var pngBuf bytes.Buffer
+	if err := png.Encode(&pngBuf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customUp, "head.png"), pngBuf.Bytes(), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customUp, "2024", "banner.png"), pngBuf.Bytes(), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	probeResp, probeBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/settings/storage/test", map[string]any{
+		"settings": map[string]any{
+			"active_driver": "local",
+			"local_dir":     customUp,
+		},
+	}, adminCookies, adminHdrs)
+	if probeResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/admin/settings/storage/test = %d %s", probeResp.StatusCode, string(probeBody))
+	}
+	var probeJSON struct {
+		OK           bool   `json:"ok"`
+		Readable     bool   `json:"readable"`
+		Writable     bool   `json:"writable"`
+		FileCount    int    `json:"file_count"`
+		EffectiveDir string `json:"effective_dir"`
+	}
+	if err := json.Unmarshal(probeBody, &probeJSON); err != nil || !probeJSON.OK || !probeJSON.Readable || !probeJSON.Writable || probeJSON.FileCount != 2 {
+		t.Fatalf("unexpected storage probe payload: %s", string(probeBody))
+	}
+
+	patchResp, patchBody := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/storage", map[string]any{
+		"local_dir": customUp,
+	}, adminCookies, adminHdrs)
+	if patchResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH /api/admin/settings/storage = %d %s", patchResp.StatusCode, string(patchBody))
+	}
+
+	// Verify /head.png, /posts/head.png, /posts/image/2024/banner.png?imageView2/2/w/8, and /upload/2024/banner.png?imageView2/2/w/8
+	for _, route := range []string{
+		"/head.png?imageView2/2/w/8",
+		"/posts/head.png?imageView2/2/w/8",
+		"/posts/image/2024/banner.png?imageView2/2/w/8",
+		"/upload/2024/banner.png?imageView2/2/w/8",
+	} {
+		rImg, imgBytes := doJSONReq(t, http.MethodGet, env.ts.URL+route, nil, nil, nil)
+		if rImg.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s = %d", route, rImg.StatusCode)
+		}
+		cfg, _, decErr := image.DecodeConfig(bytes.NewReader(imgBytes))
+		if decErr != nil || cfg.Width != 8 {
+			t.Fatalf("GET %s expected resized width=8, got width=%d err=%v", route, cfg.Width, decErr)
+		}
+	}
+}
+
+func TestV101_DynamicPagination_IPBanGeoLocation_And_Runtime500Logs(t *testing.T) {
+	env, adminCookies, adminHdrs, _ := bootstrapAuditEnv(t)
+	adminHdrs["Origin"] = env.ts.URL
+
+	// 1. Create 1 published article + 22 approved comments so /dynamic exceeds 1 page (TotalPages >= 2) and exercises dynamic.html pagination!
+	rArt, rawArt := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/articles", map[string]any{
+		"title":         "Dynamic Stream Post",
+		"slug":          "dyn-stream-post",
+		"content_md":    "Body content for dynamic stream pagination.",
+		"status":        "published",
+		"allow_comment": true,
+	}, adminCookies, adminHdrs)
+	if rArt.StatusCode != http.StatusCreated {
+		t.Fatalf("create article = %d %s", rArt.StatusCode, string(rawArt))
+	}
+	var createdArt struct {
+		Article domain.RawArticle `json:"article"`
+	}
+	if err := json.Unmarshal(rawArt, &createdArt); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 22; i++ {
+		hdrs := map[string]string{
+			"Origin":            env.ts.URL,
+			auth.CSRFHeaderName: adminHdrs[auth.CSRFHeaderName],
+			"X-Real-IP":         "203.0.113." + strconv.Itoa(i),
+		}
+		rCmt, rawCmt := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/v1/comments", map[string]any{
+			"target_type": "article",
+			"target_id":   createdArt.Article.ID,
+			"content_md":  "Approved dynamic comment #" + strconv.Itoa(i),
+		}, adminCookies, hdrs)
+		if rCmt.StatusCode != http.StatusCreated {
+			t.Fatalf("create comment %d = %d %s", i, rCmt.StatusCode, string(rawCmt))
+		}
+	}
+
+	for _, dynRoute := range []string{"/dynamic", "/dynamic?page=2"} {
+		rDyn, dynHTML := doJSONReq(t, http.MethodGet, env.ts.URL+dynRoute, nil, nil, nil)
+		if rDyn.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s = %d %s", dynRoute, rDyn.StatusCode, string(dynHTML))
+		}
+		if !strings.Contains(string(dynHTML), "Approved dynamic comment #") {
+			t.Fatalf("expected rendered comments on %s, got len=%d", dynRoute, len(dynHTML))
+		}
+		if dynRoute == "/dynamic" && !strings.Contains(string(dynHTML), "page=2") {
+			t.Fatalf("expected page=2 pagination link on %s, got len=%d", dynRoute, len(dynHTML))
+		}
+	}
+
+	// 2. IP Ban creation with empty note + GET /api/admin/security/ip-bans geo_location enrichment
+	rBan, banBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/ip-bans", map[string]any{
+		"cidr":          "10.99.88.77/32",
+		"note":          "",
+		"expires_hours": 24,
+	}, adminCookies, adminHdrs)
+	if rBan.StatusCode != http.StatusCreated && rBan.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/admin/security/ip-bans = %d %s", rBan.StatusCode, string(banBody))
+	}
+
+	rBanList, banListRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/security/ip-bans?q=10.99.88.77", nil, adminCookies, adminHdrs)
+	if rBanList.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/admin/security/ip-bans = %d %s", rBanList.StatusCode, string(banListRaw))
+	}
+	if !strings.Contains(string(banListRaw), `"geo_location":"Local Network"`) {
+		t.Fatalf("expected geo_location Local Network in ip-bans payload, got: %s", string(banListRaw))
+	}
+
+	// 3. Trigger an HTTP 500 error and verify /api/admin/runtime-logs?level=ERROR records path + root-cause detail!
+	if _, err := env.store.ExecContext(env.ctx, `ALTER TABLE articles RENAME TO articles_bak_500`); err != nil {
+		t.Fatal(err)
+	}
+	env.content.PurgeRuntimeCaches()
+
+	r500, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/?probe500=1", nil, nil, nil)
+	_, _ = env.store.ExecContext(env.ctx, `ALTER TABLE articles_bak_500 RENAME TO articles`)
+	env.content.PurgeRuntimeCaches()
+
+	if r500.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected GET /?probe500=1 to return 500, got %d", r500.StatusCode)
+	}
+
+	rLogs, logsRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/runtime-logs?level=ERROR&q=probe500", nil, adminCookies, adminHdrs)
+	if rLogs.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/admin/runtime-logs = %d %s", rLogs.StatusCode, string(logsRaw))
+	}
+	logsStr := string(logsRaw)
+	if !strings.Contains(logsStr, "http 5xx error") || !strings.Contains(logsStr, "home articles query failed") {
+		t.Fatalf("expected runtime-logs to contain http 5xx error and home articles query failed detail, got: %s", logsStr)
 	}
 }

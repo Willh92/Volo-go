@@ -386,8 +386,9 @@ export function getLocaleDir(code?: string): string {
   );
 }
 
-export function tFor(locale: string, key: string, vars?: Record<string, string | number>): string {
+export function tFor(locale: string, keyOrIdx: string | number, vars?: Record<string, string | number>): string {
   void catalogVersionSig.value;
+  const key = typeof keyOrIdx === "number" ? (bundledKeys[keyOrIdx] ?? String(keyOrIdx)) : keyOrIdx;
   const isZh = locale.toLowerCase().startsWith("zh");
   let tpl =
     catalogs[locale]?.[key] ??
@@ -403,7 +404,7 @@ export function tFor(locale: string, key: string, vars?: Record<string, string |
   return tpl;
 }
 
-export function t(key: string, vars?: Record<string, string | number>): string {
+export function t(key: string | number, vars?: Record<string, string | number>): string {
   return tFor(localeSig.value, key, vars);
 }
 
@@ -593,15 +594,28 @@ const WAF_REASON_KEYS: Record<string, string> = {
   scanner_trap: "sys.waf_reason_scanner_trap",
   script_scan: "sys.waf_reason_script_scan",
   sensitive_probe: "sys.waf_reason_sensitive_probe",
+  env_probe: "sys.waf_reason_sensitive_probe",
+  git_probe: "sys.waf_reason_sensitive_probe",
+  wp_probe: "sys.waf_reason_scanner_trap",
+  xmlrpc_probe: "sys.waf_reason_scanner_trap",
+  admin_probe: "sys.waf_reason_scanner_trap",
+  setup_probe: "sys.waf_reason_scanner_trap",
+  honeypot_trap: "sys.waf_reason_scanner_trap",
+  bot_probe: "sys.waf_reason_malicious_ua",
   manual_ban: "sys.waf_reason_manual_ban",
   manual: "sys.waf_reason_manual_ban",
   admin_ban: "sys.waf_reason_manual_ban",
   admin_block: "sys.waf_reason_manual_ban",
+  "manual administrator block": "sys.waf_reason_manual_ban",
   not_found_scan: "sys.waf_reason_not_found_scan",
   not_found_flood: "sys.waf_reason_not_found_scan",
   path_scan: "sys.waf_reason_not_found_scan",
   dir_scan: "sys.waf_reason_not_found_scan",
   "404_flood": "sys.waf_reason_not_found_scan",
+  path_traversal: "sys.waf_reason_path_traversal",
+  directory_traversal: "sys.waf_reason_path_traversal",
+  lfi_probe: "sys.waf_reason_path_traversal",
+  rfi_probe: "sys.waf_reason_exploit_probe",
   rate_abuse: "sys.waf_reason_rate_abuse",
   rate_limit: "sys.waf_reason_rate_abuse",
   burst_limit: "sys.waf_reason_rate_abuse",
@@ -622,7 +636,13 @@ const WAF_REASON_KEYS: Record<string, string> = {
   exploit_probe: "sys.waf_reason_exploit_probe",
   payload_attack: "sys.waf_reason_exploit_probe",
   sql_injection: "sys.waf_reason_exploit_probe",
+  sqli: "sys.waf_reason_exploit_probe",
   xss_probe: "sys.waf_reason_exploit_probe",
+  xss: "sys.waf_reason_exploit_probe",
+  geo_block: "sys.waf_reason_geo_block",
+  geo_deny: "sys.waf_reason_geo_block",
+  pow_fail: "sys.waf_reason_pow_fail",
+  csrf_fail: "sys.waf_reason_csrf_fail",
 };
 
 export function localizeAuditAction(act?: string): string {
@@ -635,7 +655,9 @@ export function localizeAuditAction(act?: string): string {
 export function localizeWafReason(code?: string): string {
   const orig = String(code || "").trim();
   if (!orig) return "";
-  const cleaned = orig.replace(/^auto[-_ ]?ban\s*:\s*/i, "").trim().toLowerCase();
+  const autoMatch = orig.match(/^automated defense triggered\s*\(([^)]+)\)\s*$/i);
+  const unwrapped = autoMatch ? autoMatch[1] : orig;
+  const cleaned = unwrapped.replace(/^auto[-_ ]?ban\s*:\s*/i, "").trim().toLowerCase();
   const key = WAF_REASON_KEYS[cleaned];
   return key ? t(key) : orig;
 }

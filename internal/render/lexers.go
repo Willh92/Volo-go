@@ -22,21 +22,21 @@ const (
 )
 
 type codeLexer struct {
-	customScan        func(w *codeHTMLWriter, src string)
-	skipWS            bool
-	hasFastIdent      bool
-	identAllowDollar  bool
-	identFoldCase     bool
-	rustMacroBang     bool
-	hasSlashComments  bool
-	hasDashComment    bool
-	prefixMode        identPrefixMode
-	defaultIdentCls   string
-	identMap          map[string]string
-	byteRules         [256][]chromaRule
-	nonASCIIRules     []chromaRule
-	opBytes           [256]bool
-	punctCls          [256]string
+	customScan       func(w *codeHTMLWriter, src string)
+	skipWS           bool
+	hasFastIdent     bool
+	identAllowDollar bool
+	identFoldCase    bool
+	rustMacroBang    bool
+	hasSlashComments bool
+	hasDashComment   bool
+	prefixMode       identPrefixMode
+	defaultIdentCls  string
+	identMap         map[string]string
+	byteRules        [256][]chromaRule
+	nonASCIIRules    []chromaRule
+	opBytes          [256]bool
+	punctCls         [256]string
 }
 
 var (

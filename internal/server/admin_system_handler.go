@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -3401,22 +3402,56 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			SecretKey string                  `json:"s3_secret_key"`
 		}
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req)
-		if req.Settings != nil && s.deps.Config != nil {
-			drv := strings.ToLower(strings.TrimSpace(req.Settings.ActiveDriver))
-			if drv == "" || drv == "local" {
-				if _, vErr := s.deps.Config.ValidateCustomUploadDir(req.Settings.LocalDir); vErr != nil {
+		drv := ""
+		if req.Settings != nil {
+			drv = strings.ToLower(strings.TrimSpace(req.Settings.ActiveDriver))
+		} else if s.deps.Settings != nil {
+			drv = strings.ToLower(strings.TrimSpace(s.deps.Settings.Snapshot().Storage.ActiveDriver))
+		}
+		if drv == "" || drv == "local" {
+			var prevStorage domain.StorageSettings
+			var prevVer int64
+			stagedCustom := false
+			if s.deps.Settings != nil {
+				prevStorage = s.deps.Settings.Snapshot().Storage
+				_, prevVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainStorage)
+			}
+			if s.deps.Config != nil && req.Settings != nil && !s.deps.Config.IsUploadDirPinned() {
+				normDir, vErr := s.deps.Config.ValidateCustomUploadDir(req.Settings.LocalDir)
+				if vErr != nil {
 					writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": vErr.Error()})
 					return
 				}
+				if s.deps.Settings != nil && normDir != prevStorage.LocalDir {
+					stagePatch, _ := json.Marshal(map[string]any{"local_dir": normDir})
+					_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainStorage, stagePatch, 0)
+					stagedCustom = true
+				}
 			}
+			absDir, fileCount, rwErr := s.syncAndProbeConfiguredUploadDir()
+			if stagedCustom {
+				s.rollbackStorageSettings(r, prevStorage, prevVer)
+			}
+			if rwErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"ok":            false,
+					"effective_dir": absDir,
+					"error":         formatUploadDirAccessError(absDir, rwErr),
+				})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":            true,
+				"driver":        "local",
+				"effective_dir": absDir,
+				"readable":      true,
+				"writable":      true,
+				"file_count":    fileCount,
+			})
+			return
 		}
 		if s.deps.Media != nil {
 			if err := s.deps.Media.TestStorage(r.Context(), req.Settings, req.SecretKey); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
-				return
-			}
-		} else if s.deps.Config != nil {
-			if err := os.MkdirAll(s.deps.Config.GetUploadDir(), 0o750); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
@@ -3487,7 +3522,14 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 		}
+		var prevStorage domain.StorageSettings
+		var prevStorageVer int64
+		hasLocalDirPatch := false
 		if rest == domain.SettingsDomainStorage && s.deps.Config != nil {
+			if s.deps.Settings != nil {
+				prevStorage = s.deps.Settings.Snapshot().Storage
+				_, prevStorageVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainStorage)
+			}
 			if rawLocalDir, hasLocalDir := patchMap["local_dir"]; hasLocalDir {
 				dirStr, ok := rawLocalDir.(string)
 				if !ok {
@@ -3499,6 +3541,7 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 					writeErrJSON(w, http.StatusBadRequest, vErr.Error())
 					return
 				}
+				hasLocalDirPatch = normDir != ""
 				patchMap["local_dir"] = normDir
 			}
 		}
@@ -3538,7 +3581,11 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		if rest == domain.SettingsDomainStorage {
-			s.syncConfiguredUploadDir()
+			if absDir, _, rwErr := s.syncAndProbeConfiguredUploadDir(); rwErr != nil && hasLocalDirPatch && (s.deps.Config == nil || !s.deps.Config.IsUploadDirPinned()) {
+				s.rollbackStorageSettings(r, prevStorage, prevStorageVer)
+				writeErrJSON(w, http.StatusBadRequest, formatUploadDirAccessError(absDir, rwErr))
+				return
+			}
 		}
 		if rest == domain.SettingsDomainSecurity {
 			if hasGeoIPDirPatch || s.deps.Settings.Snapshot().Security.GeoIPDir != prevSec.GeoIPDir {
@@ -3609,6 +3656,17 @@ func (s *AppServer) geoIPMeta() (configuredDir, defaultDir, effectiveDir string,
 	return
 }
 
+func (s *AppServer) rollbackStorageSettings(r *http.Request, prev domain.StorageSettings, prevVer int64) {
+	if s.deps.Settings != nil {
+		rbBytes, _ := json.Marshal(prev)
+		_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainStorage, rbBytes, 0)
+		if prevVer > 0 && s.deps.Store != nil {
+			_, _ = s.deps.Store.ExecContext(r.Context(), `UPDATE settings SET version = ? WHERE domain = ?`, prevVer, domain.SettingsDomainStorage)
+		}
+	}
+	s.syncConfiguredUploadDir()
+}
+
 func (s *AppServer) rollbackSecuritySettings(r *http.Request, prev domain.SecuritySettings, resyncGeo bool) {
 	if s.deps.Settings != nil {
 		rbBytes, _ := json.Marshal(prev)
@@ -3622,23 +3680,111 @@ func (s *AppServer) rollbackSecuritySettings(r *http.Request, prev domain.Securi
 	}
 }
 
-// syncConfiguredUploadDir applies the persisted `storage.local_dir` setting (validated against
-// workspace containment boundaries) to Config, Media pipeline, and BackupScheduler at runtime,
-// unless UploadDir was explicitly pinned via CLI flag, OS ENV, or `.env`.
-func (s *AppServer) syncConfiguredUploadDir() {
-	if s == nil || s.deps.Config == nil {
-		return
+func countMediaFilesBounded(dir string, depth int, budget *int) int {
+	if depth > 5 || budget == nil || *budget <= 0 {
+		return 0
 	}
-	if !s.deps.Config.IsUploadDirPinned() {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		if *budget <= 0 {
+			break
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		*budget--
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		if entry.IsDir() {
+			count += countMediaFilesBounded(filepath.Join(dir, name), depth+1, budget)
+			continue
+		}
+		if entry.Type().IsRegular() && isSupportedReconcileExt(filepath.Ext(name)) {
+			count++
+		}
+	}
+	return count
+}
+
+func probeAndDescribeLocalUploadDir(rawDir string) (absDir string, mediaCount int, err error) {
+	trimmed := strings.TrimSpace(rawDir)
+	if trimmed == "" {
+		return "", 0, errors.New("upload directory path is empty")
+	}
+	absDir, err = filepath.Abs(trimmed)
+	if err != nil {
+		return trimmed, 0, err
+	}
+	if err := os.MkdirAll(absDir, 0o750); err != nil {
+		return absDir, 0, err
+	}
+	if _, err := os.ReadDir(absDir); err != nil {
+		return absDir, 0, err
+	}
+	budget := 5000
+	mediaCount = countMediaFilesBounded(absDir, 0, &budget)
+	f, err := os.CreateTemp(absDir, ".volo-rw-probe-*")
+	if err != nil {
+		return absDir, mediaCount, err
+	}
+	probeName := f.Name()
+	_ = f.Close()
+	_ = os.Remove(probeName)
+	return absDir, mediaCount, nil
+}
+
+func formatUploadDirAccessError(absDir string, err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := fmt.Sprintf("本地上传目录无法读写 (%s): %v", absDir, err)
+	if runtime.GOOS == "linux" {
+		lowErr := strings.ToLower(err.Error())
+		if absDir == "/home" || strings.HasPrefix(absDir, "/home/") ||
+			absDir == "/root" || strings.HasPrefix(absDir, "/root/") ||
+			strings.Contains(lowErr, "read-only file system") ||
+			strings.Contains(lowErr, "permission denied") ||
+			strings.Contains(lowErr, "no such file") {
+			msg += " — 提示：systemd 服务默认开启 ProtectHome=true 与 ProtectSystem=strict 沙箱保护（/home 对服务隔离不可见，且仅 ReadWritePaths 白名单目录可写）。推荐将旧图片迁移至站点数据目录（如 cp -rn /home/solo/upload/. <站点目录>/data/uploads/ 并执行 chown -R www:www <站点目录>/data/uploads），或在 systemctl edit volo 中配置 ProtectHome=read-only 与 ReadWritePaths=" + absDir + " 后重启服务。"
+		}
+	}
+	return msg
+}
+
+func (s *AppServer) syncAndProbeConfiguredUploadDir() (absDir string, mediaCount int, err error) {
+	if s == nil || s.deps.Config == nil {
+		return "", 0, nil
+	}
+	targetDir := s.deps.Config.GetDefaultUploadDir()
+	if s.deps.Config.IsUploadDirPinned() {
+		targetDir = s.deps.Config.GetUploadDir()
+	} else {
 		rawDir := ""
 		if s.deps.Settings != nil {
 			rawDir = strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalDir)
 		}
 		if rawDir == "" {
 			s.deps.Config.SetUploadDir("")
-		} else if validDir, err := s.deps.Config.ValidateCustomUploadDir(rawDir); err == nil && validDir != "" {
-			_ = os.MkdirAll(validDir, 0o750)
-			s.deps.Config.SetUploadDir(validDir)
+			targetDir = s.deps.Config.GetUploadDir()
+		} else if validDir, vErr := s.deps.Config.ValidateCustomUploadDir(rawDir); vErr == nil && validDir != "" {
+			targetDir = validDir
+		} else {
+			s.deps.Config.SetUploadDir("")
+			if vErr != nil {
+				return rawDir, 0, vErr
+			}
+		}
+	}
+	absDir, mediaCount, err = probeAndDescribeLocalUploadDir(targetDir)
+	if !s.deps.Config.IsUploadDirPinned() {
+		if err == nil && strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalDir) != "" {
+			s.deps.Config.SetUploadDir(absDir)
 		} else {
 			s.deps.Config.SetUploadDir("")
 		}
@@ -3650,6 +3796,14 @@ func (s *AppServer) syncConfiguredUploadDir() {
 	if s.deps.BackupScheduler != nil {
 		s.deps.BackupScheduler.SetUploadDir(effective)
 	}
+	return absDir, mediaCount, err
+}
+
+// syncConfiguredUploadDir applies the persisted `storage.local_dir` setting (validated against
+// workspace containment boundaries) to Config, Media pipeline, and BackupScheduler at runtime,
+// unless UploadDir was explicitly pinned via CLI flag (`--upload-dir`).
+func (s *AppServer) syncConfiguredUploadDir() {
+	_, _, _ = s.syncAndProbeConfiguredUploadDir()
 }
 
 // syncConfiguredGeoIPDir applies the persisted `security.geoip_dir` setting (validated against
@@ -4035,6 +4189,40 @@ func sanitizeModerationText(raw string, maxRunes int) string {
 	return clean
 }
 
+type ipBanAdminView struct {
+	domain.SecurityIPBan
+	CountryISO  string `json:"country_iso"`
+	GeoLocation string `json:"geo_location"`
+}
+
+func (s *AppServer) enrichIPBanViews(rows []domain.SecurityIPBan) []ipBanAdminView {
+	out := make([]ipBanAdminView, 0, len(rows))
+	for _, row := range rows {
+		v := ipBanAdminView{SecurityIPBan: row}
+		if s != nil && s.deps.Geo != nil {
+			raw := strings.TrimSpace(row.CIDR)
+			var addr netip.Addr
+			if pfx, err := netip.ParsePrefix(raw); err == nil {
+				addr = pfx.Addr()
+			} else if a, err := netip.ParseAddr(raw); err == nil {
+				addr = a
+			}
+			if addr.IsValid() {
+				if loc, ok := s.deps.Geo.Lookup(addr); ok {
+					v.CountryISO = loc.CountryISO
+					if loc.Region != "" {
+						v.GeoLocation = loc.Region
+					} else {
+						v.GeoLocation = loc.CountryISO
+					}
+				}
+			}
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
 	if rest == "batch" && r.Method == http.MethodPost {
@@ -4107,16 +4295,19 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			var rows []domain.SecurityIPBan
 			_ = sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
-			if rows == nil {
-				rows = []domain.SecurityIPBan{}
+			items := s.enrichIPBanViews(rows)
+			geoLoaded := false
+			if s.deps.Geo != nil {
+				geoLoaded = len(s.deps.Geo.Status().ActiveFiles) > 0
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"items":     rows,
-				"bans":      rows,
-				"total":     total,
-				"page":      page,
-				"per_page":  perPage,
-				"page_size": perPage,
+				"items":      items,
+				"bans":       items,
+				"total":      total,
+				"page":       page,
+				"per_page":   perPage,
+				"page_size":  perPage,
+				"geo_loaded": geoLoaded,
 			})
 
 		case http.MethodPost:
@@ -4138,7 +4329,8 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 				return
 			}
 			s.recordAuditLog(r, actor, "security.ip_ban_add", "ip_ban", rec.ID, map[string]any{"cidr": rec.CIDR})
-			writeJSON(w, http.StatusCreated, map[string]any{"ban": rec})
+			enriched := s.enrichIPBanViews([]domain.SecurityIPBan{*rec})
+			writeJSON(w, http.StatusCreated, map[string]any{"ban": enriched[0]})
 
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)

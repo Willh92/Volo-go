@@ -49,7 +49,7 @@
       {{end}}
       {{template "pagination" .}}
 
-      {{if and (le .Page 1) (le .Pagination.Page 1)}}
+      {{if and (le .Page 1) (le .Pagination.CurrentPage 1)}}
         {{if .RecentPosts}}
           <section class="studio-article studio-card-pad">
             <h2 class="studio-card-title">{{t .Locale "sidebar.recent_posts"}}</h2>

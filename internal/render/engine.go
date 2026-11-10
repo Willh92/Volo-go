@@ -295,11 +295,11 @@ func isCommentEmptyBlockquote(line string) bool {
 }
 
 // CompactCommentMarkdown normalizes untrusted comment Markdown to prevent vertical-height bombing:
-// - Normalizes CRLF/CR/VT/FF/NEL/LS/PS line separators to '\n';
-// - Caps Zalgo combining-mark towers to at most 3 combining marks per base rune;
-// - Collapses invisible filler lines (Braille blank, Hangul filler, ZWSP, lone '\' hard breaks, empty list markers)
-//   and 3+ consecutive newlines into at most a single blank paragraph separator;
-// - Deduplicates consecutive empty blockquote lines and consecutive thematic breaks (`---`).
+//   - Normalizes CRLF/CR/VT/FF/NEL/LS/PS line separators to '\n';
+//   - Caps Zalgo combining-mark towers to at most 3 combining marks per base rune;
+//   - Collapses invisible filler lines (Braille blank, Hangul filler, ZWSP, lone '\' hard breaks, empty list markers)
+//     and 3+ consecutive newlines into at most a single blank paragraph separator;
+//   - Deduplicates consecutive empty blockquote lines and consecutive thematic breaks (`---`).
 func CompactCommentMarkdown(raw string) string {
 	if raw == "" {
 		return ""
@@ -444,6 +444,7 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 		opts.Mode = RenderModeWeb
 	}
 	prep := preprocessDirectives(markdownSrc, opts)
+	prep.markdown = normalizeAlignmentWrappers(prep.markdown)
 
 	var rawBuf bytes.Buffer
 	_ = e.ensureMarkdown().Convert([]byte(prep.markdown), &rawBuf)
@@ -534,6 +535,7 @@ func (e *Engine) RenderTrustedMarkdownHTML(markdownSrc string) string {
 	if clean == "" {
 		return ""
 	}
+	clean = normalizeAlignmentWrappers(clean)
 	var mdBuf bytes.Buffer
 	if err := e.ensureMarkdown().Convert([]byte(clean), &mdBuf); err != nil {
 		return clean

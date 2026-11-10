@@ -377,8 +377,8 @@ func TestDispatcherNotifyCommentReplyApproved(t *testing.T) {
 	})
 
 	var (
-		mu      sync.Mutex
-		gotRec  *recordedSMTPMessage
+		mu        sync.Mutex
+		gotRec    *recordedSMTPMessage
 		delivered = make(chan struct{}, 1)
 	)
 	disp.Mailer().resolver = func(_ context.Context, _ string) ([]netip.Addr, error) {

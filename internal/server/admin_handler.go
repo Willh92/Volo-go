@@ -25,6 +25,7 @@ import (
 
 	"github.com/Willh92/Volo-go/internal/adminui"
 	"github.com/Willh92/Volo-go/internal/auth"
+	"github.com/Willh92/Volo-go/internal/content"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 	"github.com/Willh92/Volo-go/internal/media"
@@ -3921,28 +3922,39 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 
 		scopeWhere := "c.is_deleted = ?"
 		scopeArgs := []any{false}
+		// Trash scope: soft-deleted rows that still carry restorable content (purge placeholders are hidden).
+		trashWhere := "c.is_deleted = ? AND c.content_md <> ''"
+		trashArgs := []any{true}
 		if actor.Role != domain.RoleAdmin {
 			scopeWhere = "c.is_deleted = ? AND (a.author_id = ? OR p.author_id = ?)"
 			scopeArgs = append(scopeArgs, actor.ID, actor.ID)
+			trashWhere += " AND (a.author_id = ? OR p.author_id = ?)"
+			trashArgs = append(trashArgs, actor.ID, actor.ID)
 		}
 
-		var cntAll, cntPend, cntApp, cntRej int
+		var cntAll, cntPend, cntApp, cntRej, cntTrash int
 		_ = s.deps.Store.QueryRowContext(r.Context(),
 			`SELECT COUNT(*),
 			        COALESCE(SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END), 0),
 			        COALESCE(SUM(CASE WHEN c.status = 'approved' THEN 1 ELSE 0 END), 0),
 			        COALESCE(SUM(CASE WHEN c.status = 'rejected' THEN 1 ELSE 0 END), 0)
 			 `+joinSQL+` WHERE `+scopeWhere, scopeArgs...).Scan(&cntAll, &cntPend, &cntApp, &cntRej)
+		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) `+joinSQL+` WHERE `+trashWhere, trashArgs...).Scan(&cntTrash)
 		statusCounts := map[string]int{
 			"all":      cntAll,
 			"pending":  cntPend,
 			"approved": cntApp,
 			"rejected": cntRej,
+			"trash":    cntTrash,
 		}
 
+		trashMode := status == "trash"
 		where := []string{scopeWhere}
 		args := append([]any{}, scopeArgs...)
-		if status != "" && status != "all" {
+		if trashMode {
+			where = []string{trashWhere}
+			args = append([]any{}, trashArgs...)
+		} else if status != "" && status != "all" {
 			where = append(where, "c.status = ?")
 			args = append(args, status)
 		}
@@ -3979,7 +3991,11 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		var total int
 		_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) `+joinSQL+` WHERE `+whereSQL, args...).Scan(&total)
 
-		baseSQL := `SELECT c.* ` + joinSQL + ` WHERE ` + whereSQL + ` ORDER BY c.created_at DESC`
+		orderSQL := ` ORDER BY c.created_at DESC`
+		if trashMode {
+			orderSQL = ` ORDER BY c.updated_at DESC, c.id DESC`
+		}
+		baseSQL := `SELECT c.* ` + joinSQL + ` WHERE ` + whereSQL + orderSQL
 		qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 		var rows []domain.Comment
 		err := sqlx.SelectInto(r.Context(), s.deps.Store, &rows, qSQL, fullArgs...)
@@ -4107,15 +4123,33 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 				items = append(items, view)
 			}
 		}
+		trashRetentionDays := domain.DefaultCommentTrashRetentionDays
+		if s.deps.Settings != nil {
+			trashRetentionDays = s.deps.Settings.Snapshot().Reading.CommentTrashRetentionDays
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"items":         items,
-			"comments":      items,
-			"total":         total,
-			"page":          page,
-			"per_page":      perPage,
-			"page_size":     perPage,
-			"status_counts": statusCounts,
+			"items":                items,
+			"comments":             items,
+			"total":                total,
+			"page":                 page,
+			"per_page":             perPage,
+			"page_size":            perPage,
+			"status_counts":        statusCounts,
+			"trash_retention_days": trashRetentionDays,
 		})
+		return
+	}
+
+	if rest == "trash/empty" {
+		if !requireMethod(w, r, http.MethodPost) || !requireAdminJSON(w, actor) {
+			return
+		}
+		purged, kept, err := s.deps.Content.EmptyCommentTrash(r.Context())
+		if writeServerErr(w, err) {
+			return
+		}
+		s.recordAuditLog(r, actor, "comment.trash_empty", "comment", "trash", map[string]any{"purged": purged, "kept_placeholders": kept})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "purged": purged, "kept_placeholders": kept})
 		return
 	}
 
@@ -4217,17 +4251,49 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if len(parts) == 2 && parts[1] == "restore" {
+		if !requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		restored, rErr := s.deps.Content.RestoreComment(r.Context(), cmt.ID)
+		if errors.Is(rErr, content.ErrCommentNotInTrash) {
+			writeErrJSON(w, http.StatusConflict, "comment is not in trash")
+			return
+		}
+		if writeServerErr(w, rErr) {
+			return
+		}
+		s.recordAuditLog(r, actor, "comment.restore", "comment", cmt.ID, map[string]any{
+			"target_type": cmt.TargetType, "target_id": cmt.TargetID, "promoted_to_root": restored.ParentID != cmt.ParentID,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "parent_id": restored.ParentID})
+		return
+	}
+	if len(parts) != 1 {
+		writeErrJSON(w, http.StatusNotFound, "not found")
+		return
+	}
+
 	switch r.Method {
 	case http.MethodPatch:
 		var req struct {
-			Status    *string `json:"status"`
-			ContentMD *string `json:"content_md"`
+			Status     *string `json:"status"`
+			ContentMD  *string `json:"content_md"`
+			AuthorName *string `json:"author_name"`
+			AvatarURL  *string `json:"avatar_url"`
+			AuthorURL  *string `json:"author_url"`
 		}
 		if !decodeJSONBody(w, r, 32768, &req) {
 			return
 		}
-		if req.Status == nil && req.ContentMD == nil {
-			writeErrJSON(w, http.StatusBadRequest, "status or content_md required")
+		identityPatch := content.CommentIdentityPatch{AuthorName: req.AuthorName, AvatarURL: req.AvatarURL, AuthorURL: req.AuthorURL}
+		if req.Status == nil && req.ContentMD == nil && identityPatch.Empty() {
+			writeErrJSON(w, http.StatusBadRequest, "status, content_md or author fields required")
+			return
+		}
+		identity, idErr := content.NormalizeCommentIdentityPatch(identityPatch)
+		if idErr != nil {
+			writeErrJSON(w, http.StatusBadRequest, idErr.Error())
 			return
 		}
 		nextStatus := cmt.Status
@@ -4253,25 +4319,77 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			}
 			nextContent = trimmed
 		}
-		_, err := s.deps.Store.ExecContext(r.Context(),
-			`UPDATE comments SET status = ?, content_md = ?, updated_at = ? WHERE id = ?`,
-			nextStatus, nextContent, time.Now().UnixMilli(), cmtID)
+		nowMS := time.Now().UnixMilli()
+		identityChanged := false
+		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			if nextStatus != cmt.Status || nextContent != cmt.ContentMD {
+				if _, uErr := tx.ExecContext(r.Context(),
+					`UPDATE comments SET status = ?, content_md = ?, updated_at = ? WHERE id = ?`,
+					nextStatus, nextContent, nowMS, cmtID); uErr != nil {
+					return uErr
+				}
+			}
+			changed, aErr := content.ApplyCommentIdentityTx(r.Context(), tx, cmt, identity, nowMS)
+			identityChanged = changed
+			if aErr != nil {
+				return aErr
+			}
+			return s.recountTargetCommentsTx(r.Context(), tx, cmt.TargetType, cmt.TargetID)
+		})
 		if writeServerErr(w, err) {
 			return
 		}
-		s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
 		if nextStatus != cmt.Status {
 			cmtMod := cmt
 			cmtMod.ContentMD = nextContent
 			s.dispatchCommentModeratedHook(r.Context(), cmtMod, nextStatus)
 		}
+		if identityChanged {
+			detail := map[string]any{"target_type": cmt.TargetType, "target_id": cmt.TargetID}
+			if identity.AuthorName != nil {
+				detail["author_name"] = *identity.AuthorName
+			}
+			if identity.AvatarURL != nil {
+				detail["avatar_url"] = *identity.AvatarURL
+			}
+			if identity.AuthorURL != nil {
+				detail["author_url"] = *identity.AuthorURL
+			}
+			s.recordAuditLog(r, actor, "comment.identity_update", "comment", cmt.ID, detail)
+		}
 		writeOKJSON(w)
 
 	case http.MethodDelete:
-		_, _ = s.deps.Store.ExecContext(r.Context(),
-			`UPDATE comments SET is_deleted = ?, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
-			true, time.Now().UnixMilli(), cmtID)
-		s.recountTargetComments(r.Context(), cmt.TargetType, cmt.TargetID)
+		purge := r.URL.Query().Get("purge")
+		if purge == "1" || strings.EqualFold(purge, "true") {
+			if !cmt.IsDeleted {
+				writeErrJSON(w, http.StatusConflict, "comment is not in trash")
+				return
+			}
+			kept, pErr := s.deps.Content.PurgeComment(r.Context(), cmt.ID)
+			if writeServerErr(w, pErr) {
+				return
+			}
+			s.recordAuditLog(r, actor, "comment.purge", "comment", cmt.ID, map[string]any{
+				"target_type": cmt.TargetType, "target_id": cmt.TargetID, "kept_placeholder": kept,
+			})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "kept_placeholder": kept})
+			return
+		}
+		if !cmt.IsDeleted {
+			err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+				if dErr := content.SoftDeleteCommentTx(r.Context(), tx, cmt.ID, time.Now().UnixMilli()); dErr != nil {
+					return dErr
+				}
+				return s.recountTargetCommentsTx(r.Context(), tx, cmt.TargetType, cmt.TargetID)
+			})
+			if writeServerErr(w, err) {
+				return
+			}
+			s.recordAuditLog(r, actor, "comment.delete", "comment", cmt.ID, map[string]any{
+				"target_type": cmt.TargetType, "target_id": cmt.TargetID,
+			})
+		}
 		writeOKJSON(w)
 
 	default:
@@ -4299,6 +4417,10 @@ func (s *AppServer) handleAdminCommentsBatch(w http.ResponseWriter, r *http.Requ
 		action = "pending"
 	case "delete":
 		action = "delete"
+	case "restore":
+		action = "restore"
+	case "purge":
+		action = "purge"
 	case "ban_ip", "ban-ip":
 		if !requireAdminJSON(w, actor) {
 			return
@@ -4420,9 +4542,12 @@ func (s *AppServer) handleAdminCommentsBatch(w http.ResponseWriter, r *http.Requ
 	recountSet := make(map[targetPair]struct{})
 	var hooks []modHookItem
 	affected := 0
+	keptPlaceholders := 0
 
 	if len(comments) > 0 {
 		txErr := s.deps.Store.WithTx(ctx, func(tx *sqlx.Tx) error {
+			affected, keptPlaceholders = 0, 0
+			hooks = hooks[:0]
 			for _, cmt := range comments {
 				var uErr error
 				nextModStatus := ""
@@ -4443,9 +4568,24 @@ func (s *AppServer) handleAdminCommentsBatch(w http.ResponseWriter, r *http.Requ
 						`UPDATE comments SET status = ?, updated_at = ? WHERE id = ?`,
 						domain.CommentStatusPending, now, cmt.ID)
 				case "delete":
-					_, uErr = tx.ExecContext(ctx,
-						`UPDATE comments SET is_deleted = ?, content_md = '', notify_email_ciphertext = '', updated_at = ? WHERE id = ?`,
-						true, now, cmt.ID)
+					if cmt.IsDeleted {
+						continue
+					}
+					uErr = content.SoftDeleteCommentTx(ctx, tx, cmt.ID, now)
+				case "restore":
+					if _, rErr := content.RestoreCommentTx(ctx, tx, cmt, now); rErr != nil {
+						if errors.Is(rErr, content.ErrCommentNotInTrash) {
+							continue
+						}
+						uErr = rErr
+					}
+				case "purge":
+					if !cmt.IsDeleted {
+						continue
+					}
+					_, k, pErr := content.PurgeTrashedCommentsTx(ctx, tx, []domain.Comment{cmt})
+					keptPlaceholders += k
+					uErr = pErr
 				}
 				if uErr != nil {
 					return uErr
@@ -4471,8 +4611,14 @@ func (s *AppServer) handleAdminCommentsBatch(w http.ResponseWriter, r *http.Requ
 	for _, h := range hooks {
 		s.dispatchCommentModeratedHook(ctx, h.cmt, h.nextStatus)
 	}
-	s.recordAuditLog(r, actor, "comment.batch", "comment", action, map[string]any{"action": action, "affected": affected})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+	detail := map[string]any{"action": action, "affected": affected}
+	resp := map[string]any{"ok": true, "affected": affected}
+	if action == "purge" {
+		detail["kept_placeholders"] = keptPlaceholders
+		resp["kept_placeholders"] = keptPlaceholders
+	}
+	s.recordAuditLog(r, actor, "comment.batch", "comment", action, detail)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *AppServer) recountTargetCommentsTx(ctx context.Context, tx *sqlx.Tx, targetType, targetID string) error {
@@ -4543,13 +4689,25 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 		if !requireAdminJSON(w, actor) {
 			return
 		}
+		effectiveDir := ""
+		if s.deps.Config != nil {
+			effectiveDir = strings.TrimSpace(s.deps.Config.GetUploadDir())
+		}
+		if effectiveDir != "" {
+			if absDir, _, rwErr := probeAndDescribeLocalUploadDir(effectiveDir); rwErr != nil {
+				writeErrJSON(w, http.StatusBadRequest, formatUploadDirAccessError(absDir, rwErr))
+				return
+			} else {
+				effectiveDir = absDir
+			}
+		}
 		imported := s.reconcileLocalUploads(r.Context())
 		if imported > 0 {
 			_ = s.deps.Content.RefreshMediaDimsCache(r.Context())
 			s.invalidateMediaRefCache()
 		}
-		s.recordAuditLog(r, actor, "media.reconcile", "media_asset", "local", map[string]any{"imported": imported})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported})
+		s.recordAuditLog(r, actor, "media.reconcile", "media_asset", "local", map[string]any{"imported": imported, "effective_dir": effectiveDir})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported, "effective_dir": effectiveDir})
 		return
 	}
 

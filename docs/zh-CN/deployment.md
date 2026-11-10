@@ -2,7 +2,7 @@
 
 > English version: [Deployment & OS Service Installers](../en-US/deployment.md)
 
-`Volo-go` 基于 Go `1.27.3`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（**全部 6 大静态发布目标架构均严格 `< 20 MiB`**，`linux/amd64` `~19.1 MiB`）：
+`Volo-go` 基于 Go `1.27.3`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（**全部 6 大静态发布目标架构均严格 `< 21 MiB`**，`linux/amd64` `~19.7 MiB`）：
 - **Linux**: `linux/amd64`、`linux/arm64`（支持 `systemd` 系统/用户级与 `OpenRC`）
 - **macOS**: `darwin/amd64`、`darwin/arm64`（支持 `launchd` `LaunchDaemon` / `LaunchAgent`）
 - **Windows**: `windows/amd64`、`windows/arm64`（支持 `svc_windows.go` 原生 `sc.exe` Windows Service、`NSSM` 与系统计划任务）
@@ -17,8 +17,8 @@
 - **全局基础配置（四层顺序）**：
   `CLI 命令行参数 (--listen-addr 等) > 操作系统环境变量 (VOLO_*) > .env 文件 > 内置安全默认值`
 - **`VOLO_UPLOAD_DIR` 与 `VOLO_GEOIP_DIR` 热重载目录（五层顺序）**：
-  `CLI 参数 (--upload-dir / --geoip-dir) > 系统环境变量 (VOLO_UPLOAD_DIR / VOLO_GEOIP_DIR) > .env 文件 > 管理台数据库设置 (storage.local_dir / security.geoip_dir) > 默认目录 (${VOLO_DATA_DIR}/uploads 或 ${VOLO_DATA_DIR}/geoip)`
-  > 当未通过 CLI、OS 环境变量或 `.env` 显式锁定时，管理员可在管理台直接在线热修改媒体目录与离线 GeoIP 目录；一旦通过前 3 层显式指定，则以锁定路径为准。
+  `CLI 参数 (--upload-dir / --geoip-dir) > 管理台数据库设置 (storage.local_dir / security.geoip_dir) > 系统环境变量 / .env 文件 (VOLO_UPLOAD_DIR / VOLO_GEOIP_DIR) > 默认目录 (${VOLO_DATA_DIR}/uploads 或 ${VOLO_DATA_DIR}/geoip)`
+  > 仅显式 CLI 参数会锁定路径；系统环境变量或 `.env` 中的 `VOLO_UPLOAD_DIR` / `VOLO_GEOIP_DIR` 作为默认值，管理员仍可在管理台在线热切换（清空管理台设置后回退到该默认值）。
 - **首次建站向导数据库持久化（`data/db.json`）**：
   在 `.env` 与 `docker-compose.yml` 中**默认不设置（注释留空）`VOLO_DB_DRIVER` 与 `VOLO_DB_DSN`**，可让 `/setup` 建站向导所选数据库配置（SQLite / PostgreSQL / MySQL，DSN 经 `AES-256-GCM` 密封保存于 `${VOLO_DATA_DIR}/db.json`）在容器重建与服务重启后自动生效；若显式设置了 `VOLO_DB_DRIVER` 或 `VOLO_DB_DSN`，则会覆盖 `db.json`。
 
@@ -43,6 +43,10 @@
 | `VOLO_DB_CONN_MAX_LIFETIME_SEC` | — | `1800` | 数据库连接最大存活秒数（有效范围 `10`–`86400`） |
 | `VOLO_GEO_ACCESS_ENABLED` | `--geo-access-enabled` | `true` | 离线 GeoIP 区域访问控制总开关（误封锁死时设为 `false` 即可免删库规则紧急旁路恢复） |
 | `VOLO_SHUTDOWN_TIMEOUT_SEC` | `--shutdown-timeout` | `15` | 优雅停机排空在途请求与刷写异步统计的超时秒数（有效范围 `1`–`120`） |
+| `VOLO_TLS_CERT_FILE` | `--tls-cert` | *(空)* | 原生 HTTPS 证书链（PEM）。与 `VOLO_TLS_KEY_FILE` 同时设置后在 `VOLO_LISTEN_ADDR` 上启用 TLS（ALPN 协商 HTTP/2，文件变更自动热重载）；不能与 `VOLO_LISTEN_SOCKET` 同时使用 |
+| `VOLO_TLS_KEY_FILE` | `--tls-key` | *(空)* | 原生 HTTPS 私钥（PEM），须与 `VOLO_TLS_CERT_FILE` 成对设置，且服务用户可读 |
+| `VOLO_TLS_MIN_VERSION` | `--tls-min-version` | `1.2` | 最低 TLS 协议版本：`1.2` 或 `1.3` |
+| `VOLO_TLS_HTTP_REDIRECT_ADDR` | `--tls-http-redirect-addr` | *(空)* | 可选的额外明文 HTTP 监听地址（如 `:80`），所有请求以 `308` 跳转到 `VOLO_PUBLIC_URL` 主机的 `https://`；需先启用原生 TLS |
 | `VOLO_DEFAULT_LOCALE` | `--default-locale` | `zh-CN` | 默认回退界面语言（内置 `zh-CN`、`en-US`，可通过 `VOLO_LOCALES_DIR` 扩展） |
 | `VOLO_DATA_DIR` | `--data-dir` | `./data` | 核心运行时数据目录（`volo.db`、`db.json`、`.secret.key`、日志） |
 | `VOLO_UPLOAD_DIR` | `--upload-dir` | `${VOLO_DATA_DIR}/uploads` | 本地媒体上传存储目录（支持 5 层优先级与管理台 `storage.local_dir` 热重载） |
@@ -51,6 +55,26 @@
 | `VOLO_THEMES_DIR` | `--themes-dir` | `./themes` | 外部主题热挂载目录 |
 | `VOLO_PLUGINS_DIR` | `--plugins-dir` | `./plugins` | 外部插件热挂载目录 |
 | `VOLO_LOCALES_DIR` | `--locales-dir` | `./locales` | 外部多语言覆盖包目录 |
+
+### 1.3 原生 HTTPS（可选）
+
+生产环境仍推荐使用反向代理（Nginx / Caddy，参见 [反向代理指南](./reverse-proxy.md)）。小型单机部署也可由 Volo-go 直接终止 TLS：
+
+```ini
+# /etc/volo/volo.env
+VOLO_LISTEN_ADDR=0.0.0.0:443
+VOLO_PUBLIC_URL=https://blog.example.com
+VOLO_TLS_CERT_FILE=/etc/volo/tls/fullchain.pem
+VOLO_TLS_KEY_FILE=/etc/volo/tls/privkey.pem
+# VOLO_TLS_MIN_VERSION=1.3
+VOLO_TLS_HTTP_REDIRECT_ADDR=:80
+```
+
+- 启动时校验证书与私钥（错误立即失败退出）；续期后的文件会被自动加载（最多每 30 秒检测一次），续期文件写入不完整时继续使用上一份有效证书。
+- 通过 ALPN 协商 HTTP/2（`h2`，自动回退 HTTP/1.1）。跳转监听的目标地址取自 `VOLO_PUBLIC_URL`（`https://` 公开地址中显式写明的端口优先，否则使用 TLS 监听端口），从不使用客户端 `Host` 头。
+- 以非特权 `volo` 用户监听 1024 以下端口需要 `CAP_NET_BIND_SERVICE`：执行 `sudo systemctl edit volo` 添加 `[Service]` 与 `AmbientCapabilities=CAP_NET_BIND_SERVICE`，然后 `sudo systemctl restart volo`。非 systemd 场景也可使用 `sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/volo`（每次升级后需重新执行；`NoNewPrivileges=true` 下不生效）。
+- 请将证书复制到服务用户可读的位置（如通过 acme.sh `--install-cert` / certbot `--deploy-hook` 复制到 `/etc/volo/tls/`，私钥 `chown root:volo` + `chmod 0640`），不要直接指向仅 root 可读的 `/etc/letsencrypt/live`。
+- `volo doctor` 新增 `tls_certificate` 检查（不可读 / 不匹配 / 已过期 → 失败，剩余 `< 14` 天 → 警告）；`volo healthcheck` 会自动改用 `https://` 探测（仅回环地址探测时跳过证书校验）。
 
 ---
 

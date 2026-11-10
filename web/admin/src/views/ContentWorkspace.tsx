@@ -260,11 +260,25 @@ export function ContentWorkspace({
     pending?: number;
     approved?: number;
     rejected?: number;
+    trash?: number;
   }>({});
+  const [cmtTrashRetentionDays, setCmtTrashRetentionDays] = useState<number | null>(null);
   const [cmtQuery, setCmtQuery] = useState("");
   const debouncedCmtQuery = useDebouncedValue(cmtQuery, 250);
   const [selCmtIds, setSelCmtIds] = useState<string[]>([]);
-  const [cmtBox, setCmtBox] = useState<{ id: string; mode: "reply" | "edit"; text: string } | null>(null);
+  const [cmtBox, setCmtBox] = useState<{
+    id: string;
+    mode: "reply" | "edit";
+    text: string;
+    // Guest identity (edit mode only); orig* track the loaded values so only changed fields are PATCHed.
+    authorName?: string;
+    avatarUrl?: string;
+    authorUrl?: string;
+    origAuthorName?: string;
+    origAvatarUrl?: string;
+    origAuthorUrl?: string;
+  } | null>(null);
+  const cmtTrashMode = cmtStatus === "trash";
   const [banIpModal, setBanIpModal] = useState<{
     commentId?: string;
     batchIds?: string[];
@@ -490,13 +504,15 @@ export function ContentWorkspace({
         const r = await apiFetch<{
           items: any[];
           total?: number;
-          status_counts?: { all?: number; pending?: number; approved?: number; rejected?: number };
+          status_counts?: { all?: number; pending?: number; approved?: number; rejected?: number; trash?: number };
+          trash_retention_days?: number;
         }>(`/api/admin/comments?${qs.toString()}`);
         if (reqId !== reqSeqRef.current) return;
         const list = r.items || [];
         setComments(list);
         setSubTotal(typeof r.total === "number" ? r.total : list.length);
         if (r.status_counts) setCmtStatusCounts(r.status_counts);
+        if (typeof r.trash_retention_days === "number") setCmtTrashRetentionDays(r.trash_retention_days);
       } else if (sub === "media") {
         const qs = new URLSearchParams();
         qs.set("page", String(pageIdx));
@@ -1379,7 +1395,7 @@ export function ContentWorkspace({
     }
   };
 
-  const runBatchComments = async (action: "approve" | "reject" | "delete" | "ban_ip") => {
+  const runBatchComments = async (action: "approve" | "reject" | "delete" | "ban_ip" | "restore" | "purge") => {
     if (!selCmtIds.length) return;
     if (action === "ban_ip") {
       setBanDurationHrs("720");
@@ -1393,13 +1409,40 @@ export function ContentWorkspace({
         return;
       }
     }
+    if (action === "purge") {
+      if (!(await openConfirm({ message: t("cnt.cmt_confirm_batch_purge", { n: selCmtIds.length }), danger: true }))) {
+        return;
+      }
+    }
     try {
       await apiFetch("/api/admin/comments/batch", {
         method: "POST",
         body: JSON.stringify({ ids: selCmtIds, action }),
       });
       setSelCmtIds([]);
-      showToast(action === "delete" ? t("common.deleted") : t("common.saved"));
+      showToast(
+        action === "delete"
+          ? t("cnt.cmt_moved_to_trash")
+          : action === "restore"
+            ? t("cnt.cmt_restored")
+            : action === "purge"
+              ? t("cnt.cmt_purged")
+              : t("common.saved")
+      );
+      void loadSub();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  const emptyCommentTrash = async () => {
+    if (!(await openConfirm({ message: t("cnt.cmt_confirm_empty_trash"), danger: true }))) return;
+    try {
+      const r = await apiFetch<{ purged?: number; kept_placeholders?: number }>("/api/admin/comments/trash/empty", {
+        method: "POST",
+      });
+      setSelCmtIds([]);
+      showToast(t("cnt.cmt_trash_emptied", { n: r?.purged ?? 0 }), "ok");
       void loadSub();
     } catch (err: any) {
       showToast(err.message);
@@ -1485,9 +1528,22 @@ export function ContentWorkspace({
         });
         showToast(t("cnt.cmt_replied"));
       } else {
+        const patch: Record<string, string> = { content_md: txt };
+        const nextName = (cmtBox.authorName ?? "").trim();
+        const nextAvatar = (cmtBox.avatarUrl ?? "").trim();
+        const nextSite = (cmtBox.authorUrl ?? "").trim();
+        if (cmtBox.authorName !== undefined && nextName !== (cmtBox.origAuthorName ?? "")) {
+          if (!nextName) {
+            showToast(t("cnt.cmt_guest_name_required"));
+            return;
+          }
+          patch.author_name = nextName;
+        }
+        if (cmtBox.avatarUrl !== undefined && nextAvatar !== (cmtBox.origAvatarUrl ?? "")) patch.avatar_url = nextAvatar;
+        if (cmtBox.authorUrl !== undefined && nextSite !== (cmtBox.origAuthorUrl ?? "")) patch.author_url = nextSite;
         await apiFetch(`/api/admin/comments/${cmtBox.id}`, {
           method: "PATCH",
-          body: JSON.stringify({ content_md: txt }),
+          body: JSON.stringify(patch),
         });
         showToast(t("common.saved"));
       }
@@ -3573,12 +3629,17 @@ export function ContentWorkspace({
                   { val: "pending", label: t("cnt.cmt_pending"), count: cmtStatusCounts.pending },
                   { val: "approved", label: t("cnt.cmt_approved"), count: cmtStatusCounts.approved },
                   { val: "rejected", label: t("cnt.cmt_rejected"), count: cmtStatusCounts.rejected },
+                  { val: "trash", label: t("cnt.cmt_trash"), count: cmtStatusCounts.trash },
                 ].map((it) => (
                   <button
                     key={it.val}
                     type="button"
                     class={`volo-filter-pill ${cmtStatus === it.val ? "active" : ""}`}
                     onClick={() => {
+                      if ((cmtStatus === "trash") !== (it.val === "trash")) {
+                        setSelCmtIds([]);
+                        setCmtBox(null);
+                      }
                       setCmtStatus(it.val);
                       setPageIdx(1);
                     }}
@@ -3590,6 +3651,29 @@ export function ContentWorkspace({
               </div>
             </div>
           </div>
+
+          {cmtTrashMode && (
+            <div
+              class="volo-row-actions"
+              style={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", margin: "0 0 10px" }}
+            >
+              <span class="volo-help">
+                {cmtTrashRetentionDays && cmtTrashRetentionDays > 0
+                  ? t("cnt.cmt_trash_hint_auto", { n: cmtTrashRetentionDays })
+                  : t("cnt.cmt_trash_hint_manual")}
+              </span>
+              {isAdmin && (
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-danger volo-btn-sm"
+                  disabled={!cmtStatusCounts.trash}
+                  onClick={() => void emptyCommentTrash()}
+                >
+                  {t("cnt.cmt_empty_trash")}
+                </button>
+              )}
+            </div>
+          )}
 
           <MobileSelectAllBar
             checked={
@@ -3742,6 +3826,47 @@ export function ContentWorkspace({
                             </div>
                             {isBoxOpen && cmtBox && (
                               <div style={{ marginTop: "6px" }}>
+                                {cmtBox.mode === "edit" && (
+                                  <div class="volo-auto-grid" style={{ marginBottom: "6px" }}>
+                                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                                      <label>{t("cnt.cmt_guest_name")}</label>
+                                      <input
+                                        class="volo-input"
+                                        maxLength={48}
+                                        value={cmtBox.authorName ?? ""}
+                                        onInput={(e) =>
+                                          setCmtBox({ ...cmtBox, authorName: (e.currentTarget as HTMLInputElement).value })
+                                        }
+                                      />
+                                    </div>
+                                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                                      <label>{t("cnt.cmt_guest_avatar")}</label>
+                                      <input
+                                        class="volo-input"
+                                        type="url"
+                                        maxLength={512}
+                                        placeholder="https://…"
+                                        value={cmtBox.avatarUrl ?? ""}
+                                        onInput={(e) =>
+                                          setCmtBox({ ...cmtBox, avatarUrl: (e.currentTarget as HTMLInputElement).value })
+                                        }
+                                      />
+                                    </div>
+                                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                                      <label>{t("cnt.cmt_guest_site")}</label>
+                                      <input
+                                        class="volo-input"
+                                        type="url"
+                                        maxLength={512}
+                                        placeholder="https://…"
+                                        value={cmtBox.authorUrl ?? ""}
+                                        onInput={(e) =>
+                                          setCmtBox({ ...cmtBox, authorUrl: (e.currentTarget as HTMLInputElement).value })
+                                        }
+                                      />
+                                    </div>
+                                  </div>
+                                )}
                                 <textarea
                                   class="volo-textarea"
                                   rows={3}
@@ -3771,20 +3896,67 @@ export function ContentWorkspace({
                           </div>
                         </td>
                         <td class="col-status" data-label={t("art.status")}>
-                          <span
-                            class={`volo-status-pill ${
-                              c.status === "approved" ? "ok" : c.status === "rejected" ? "danger" : "warn"
-                            }`}
-                          >
-                            <span class="volo-status-dot" />
-                            {cmtStatusLabel(c.status)}
-                          </span>
+                          {cmtTrashMode ? (
+                            <span class="volo-status-pill" title={cmtStatusLabel(c.status)}>
+                              <span class="volo-status-dot" />
+                              {t("cnt.cmt_deleted")}
+                            </span>
+                          ) : (
+                            <span
+                              class={`volo-status-pill ${
+                                c.status === "approved" ? "ok" : c.status === "rejected" ? "danger" : "warn"
+                              }`}
+                            >
+                              <span class="volo-status-dot" />
+                              {cmtStatusLabel(c.status)}
+                            </span>
+                          )}
                         </td>
-                        <td class="col-date" data-label={t("art.updated")}>
-                          {formatDateTime(c.created_at)}
+                        <td class="col-date" data-label={cmtTrashMode ? t("cnt.cmt_deleted_at") : t("art.updated")}>
+                          {cmtTrashMode ? (
+                            <span title={formatDateTime(c.created_at)}>{formatDateTime(c.updated_at || c.created_at)}</span>
+                          ) : (
+                            formatDateTime(c.created_at)
+                          )}
                         </td>
                         <td class="col-act" data-label={t("art.actions")}>
                           <div class="volo-row-actions">
+                            {cmtTrashMode ? (
+                              <>
+                                <button
+                                  type="button"
+                                  class="volo-act-btn"
+                                  onClick={async () => {
+                                    try {
+                                      await apiFetch(`/api/admin/comments/${c.id}/restore`, { method: "POST" });
+                                      showToast(t("cnt.cmt_restored"), "ok");
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
+                                  }}
+                                >
+                                  {t("cnt.cmt_restore")}
+                                </button>
+                                <button
+                                  type="button"
+                                  class="volo-act-btn danger"
+                                  onClick={async () => {
+                                    if (!(await openConfirm({ message: t("cnt.cmt_confirm_purge"), danger: true }))) return;
+                                    try {
+                                      await apiFetch(`/api/admin/comments/${c.id}?purge=1`, { method: "DELETE" });
+                                      showToast(t("cnt.cmt_purged"));
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
+                                  }}
+                                >
+                                  {t("cnt.cmt_purge")}
+                                </button>
+                              </>
+                            ) : (
+                            <>
                             {c.status !== "approved" && (
                               <button
                                 type="button"
@@ -3820,7 +3992,17 @@ export function ContentWorkspace({
                                 setCmtBox(
                                   cmtBox?.id === c.id && cmtBox?.mode === "edit"
                                     ? null
-                                    : { id: c.id, mode: "edit", text: c.content_md || "" }
+                                    : {
+                                        id: c.id,
+                                        mode: "edit",
+                                        text: c.content_md || "",
+                                        authorName: c.author_name || "",
+                                        avatarUrl: c.avatar_url || "",
+                                        authorUrl: c.author_url || "",
+                                        origAuthorName: c.author_name || "",
+                                        origAvatarUrl: c.avatar_url || "",
+                                        origAuthorUrl: c.author_url || "",
+                                      }
                                 )
                               }
                             >
@@ -3885,13 +4067,19 @@ export function ContentWorkspace({
                                   danger: true,
                                   onClick: async () => {
                                     if (!(await openConfirm({ message: t("cnt.confirm_del_cmt"), danger: true }))) return;
-                                    await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
-                                    showToast(t("common.deleted"));
-                                    void loadSub();
+                                    try {
+                                      await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
+                                      showToast(t("cnt.cmt_moved_to_trash"));
+                                      void loadSub();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
                                   },
                                 },
                               ]}
                             />
+                            </>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -3903,20 +4091,33 @@ export function ContentWorkspace({
           </div>
 
           <BatchBar count={selCmtIds.length} onClear={() => setSelCmtIds([])}>
-            <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("approve")}>
-              {t("cnt.cmt_approve")}
-            </button>
-            <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("reject")}>
-              {t("cnt.cmt_reject")}
-            </button>
-            {isAdmin && (
-              <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("ban_ip")}>
-                {t("cnt.cmt_ban_ip")}
-              </button>
+            {cmtTrashMode ? (
+              <>
+                <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("restore")}>
+                  {t("cnt.cmt_restore")}
+                </button>
+                <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("purge")}>
+                  {t("cnt.cmt_purge")}
+                </button>
+              </>
+            ) : (
+              <>
+                <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("approve")}>
+                  {t("cnt.cmt_approve")}
+                </button>
+                <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("reject")}>
+                  {t("cnt.cmt_reject")}
+                </button>
+                {isAdmin && (
+                  <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("ban_ip")}>
+                    {t("cnt.cmt_ban_ip")}
+                  </button>
+                )}
+                <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("delete")}>
+                  {t("common.delete")}
+                </button>
+              </>
             )}
-            <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("delete")}>
-              {t("common.delete")}
-            </button>
           </BatchBar>
 
           <Pagination
@@ -4199,7 +4400,7 @@ export function ContentWorkspace({
                     );
                   }}
                 />
-                <div class="volo-media-grid">
+                <div class={`volo-media-grid ${selMediaIds.length > 0 ? "has-selection" : ""}`}>
                   {displayMedia.map((m) => {
                     const displayName = m.original_name || m.id;
                     const mime = String(m.mime_type || "");
@@ -4218,6 +4419,7 @@ export function ContentWorkspace({
                           <label class="volo-media-select-cb" onClick={(e) => e.stopPropagation()}>
                             <input
                               type="checkbox"
+                              aria-label={displayName}
                               checked={isSelected}
                               onChange={() => toggleSel(selMediaIds, setSelMediaIds, m.id)}
                             />
@@ -4276,8 +4478,26 @@ export function ContentWorkspace({
                             <button type="button" class="volo-act-btn" onClick={() => copyMediaUrl(m)}>
                               {t("cnt.media_copy")}
                             </button>
-                            <button type="button" class="volo-act-btn danger" onClick={() => void handleDeleteMediaItem(m)}>
-                              {t("common.delete")}
+                            <button
+                              type="button"
+                              class="volo-act-btn danger is-icon"
+                              title={t("common.delete")}
+                              aria-label={t("common.delete")}
+                              onClick={() => void handleDeleteMediaItem(m)}
+                            >
+                              <svg
+                                viewBox="0 0 16 16"
+                                width="13"
+                                height="13"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="1.5"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                aria-hidden="true"
+                              >
+                                <path d="M2.5 4.2h11M6.2 4.2V2.8h3.6v1.4M4 4.2l.7 9h6.6l.7-9M6.6 6.7v4.2M9.4 6.7v4.2" />
+                              </svg>
                             </button>
                           </div>
                         </div>

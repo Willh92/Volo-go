@@ -126,6 +126,17 @@ func emitNormalizedTokensFromBlob(blob string, emit func(string)) {
 			emit(sub)
 			emit(strings.TrimLeft(sub, "/"))
 		}
+		// Legacy (Solo) relative/absolute image routes such as `image/x.png`, `/posts/image/x.png`
+		// or `https://host/images/2019/x.png` are served by the legacy image shim from either
+		// <upload>/<prefix>/<rest> or <upload>/<rest>, so also emit the de-prefixed object key.
+		base := clean
+		if pathPart := extractURLPath(clean); pathPart != "" {
+			base = pathPart
+		}
+		if rest := stripLegacyImagePrefix(base); rest != "" {
+			emit(rest)
+			emit("/uploads/" + rest)
+		}
 	}
 
 	if trimmedWhole := strings.TrimSpace(blob); trimmedWhole != "" && !strings.ContainsAny(trimmedWhole, " \t\r\n") {
@@ -537,6 +548,39 @@ func stripQueryAndFragment(s string) string {
 		s = s[:idx]
 	}
 	return s
+}
+
+// stripLegacyImagePrefix mirrors the prefixes accepted by the legacy image shim
+// (`/image/`, `/images/`, `/upload/`, optionally under `/posts/`, also as relative `./image/...`)
+// and returns the remaining object-key-like tail, or "" when s has no such prefix.
+func stripLegacyImagePrefix(s string) string {
+	p := s
+	for {
+		switch {
+		case strings.HasPrefix(p, "./"):
+			p = p[2:]
+		case strings.HasPrefix(p, "../"):
+			p = p[3:]
+		case strings.HasPrefix(p, "/"):
+			p = p[1:]
+		default:
+			goto trimmed
+		}
+	}
+trimmed:
+	if len(p) > len("posts/") && strings.EqualFold(p[:len("posts/")], "posts/") {
+		p = p[len("posts/"):]
+	}
+	for _, pfx := range []string{"images/", "image/", "upload/"} {
+		if len(p) > len(pfx) && strings.EqualFold(p[:len(pfx)], pfx) {
+			rest := strings.TrimLeft(p[len(pfx):], "/")
+			if rest == "" || strings.Contains(rest, "..") {
+				return ""
+			}
+			return rest
+		}
+	}
+	return ""
 }
 
 func extractURLPath(s string) string {

@@ -29,8 +29,9 @@
   <link rel="alternate" type="application/rss+xml" title="{{.Site.Title}} RSS" href="/rss.xml">
   <link rel="alternate" type="application/atom+xml" title="{{.Site.Title}} Atom" href="/atom.xml">
   {{if .Feed.Podcast.Enabled}}<link rel="alternate" type="application/rss+xml" title="{{.Site.Title}} Podcast" href="/podcast.xml">{{end}}
-  {{if .Site.FaviconURL}}<link rel="icon" href="{{.Site.FaviconURL}}">{{else}}<link rel="icon" type="image/svg+xml" href="/favicon.svg">{{end}}
-  <link rel="alternate icon" sizes="32x32" href="/favicon.ico">
+  {{if and .Site.FaviconURL (ne .Site.FaviconURL "/favicon.svg") (ne .Site.FaviconURL "/favicon.ico")}}<link rel="icon" href="{{.Site.FaviconURL}}">
+  <link rel="apple-touch-icon" href="{{.Site.FaviconURL}}">{{else}}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" sizes="32x32" href="/favicon.ico">{{end}}
   <script>
     (function(){
       var m = "";

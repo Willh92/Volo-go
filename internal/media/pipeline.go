@@ -557,6 +557,9 @@ func (p *Pipeline) TestStorage(ctx context.Context, override *domain.StorageSett
 		if err := os.MkdirAll(targetDir, 0o750); err != nil {
 			return err
 		}
+		if _, err := os.ReadDir(targetDir); err != nil {
+			return err
+		}
 		tmp, err := os.CreateTemp(targetDir, ".volo-probe-*")
 		if err != nil {
 			return err

@@ -325,4 +325,3 @@ func TestCustomAppDeepLinkAnchorSanitization(t *testing.T) {
 		}
 	}
 }
-

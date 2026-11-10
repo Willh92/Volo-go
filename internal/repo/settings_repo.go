@@ -142,6 +142,7 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 		if s.Reading.CommentMaxLinesStaff <= 0 {
 			s.Reading.CommentMaxLinesStaff = domain.DefaultCommentMaxLinesStaff
 		}
+		s.Reading.CommentTrashRetentionDays = clampSettingInt(s.Reading.CommentTrashRetentionDays, 0, domain.MaxCommentTrashRetentionDays)
 		if strings.TrimSpace(s.Reading.VendorCDNPrefix) == "" {
 			s.Reading.VendorCDNPrefix = domain.DefaultVendorCDNPrefix
 		}

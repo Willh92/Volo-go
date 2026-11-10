@@ -29,7 +29,7 @@
               <div class="book-card__cover" aria-hidden="true">{{coverSVG .Slug false}}</div>
             {{end}}
             <div class="book-card__meta">
-              <span class="volo-badge">{{.SourceType}}</span>
+              <span class="volo-badge">{{if eq .SourceType "auto"}}{{t $.Locale "bookshelf.source_auto"}}{{else if eq .SourceType "manual"}}{{t $.Locale "bookshelf.source_manual"}}{{else if eq .SourceType "series"}}{{t $.Locale "bookshelf.source_series"}}{{else if eq .SourceType "gitbook"}}GitBook{{else if eq .SourceType "mdbook"}}mdBook{{else if eq .SourceType "vuepress"}}VuePress{{else}}{{.SourceType}}{{end}}</span>
               <span>{{t $.Locale "bookshelf.chapters" (dict "count" .ChapterCount)}}</span>
             </div>
             <h2 class="book-card__title"><a class="book-card__main-link" href="/books/{{.Slug}}">{{.Title}}</a></h2>

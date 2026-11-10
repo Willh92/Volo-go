@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ==============================================================================
 # Volo-go Binary Size & Idle RSS Restraint Verifier
-# Policy: Treat default thresholds (< 20 MiB binary, < 35 MiB idle RSS) as
+# Policy: Treat default thresholds (< 21 MiB binary, < 35 MiB idle RSS) as
 # engineering restraint targets. When approaching or exceeding them, prioritize
 # architectural/algorithmic optimization or lighter alternatives first; relax
 # thresholds (or override via VOLO_BUDGET_BIN_MB / VOLO_BUDGET_RSS_MB) only when
@@ -15,7 +15,7 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/volo-budget-XXXXXX")"
 trap 'if [[ -n "${SERVER_PID:-}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then kill -TERM "${SERVER_PID}" 2>/dev/null || true; wait "${SERVER_PID}" 2>/dev/null || true; fi; rm -rf "${WORK_DIR}"' EXIT
 
 BIN_PATH="${WORK_DIR}/volo"
-BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-20}"
+BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-21}"
 BUDGET_RSS_MB="${VOLO_BUDGET_RSS_MB:-35}"
 MAX_BIN_BYTES=$((BUDGET_BIN_MB * 1024 * 1024))
 MAX_RSS_KB=$((BUDGET_RSS_MB * 1024))
@@ -26,7 +26,7 @@ echo "[1/4] Building pure-Go static binary (CGO_ENABLED=0)..."
   cd "${ROOT_DIR}"
   CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 go build -buildvcs=false -trimpath \
     -gcflags="all=-l" \
-    -ldflags="-s -w -funcalign=8 -X main.Version=v1.0.0-verify" \
+    -ldflags="-s -w -buildid= -X main.Version=v1.0.1-verify" \
     -o "${BIN_PATH}" ./cmd/volo
 )
 

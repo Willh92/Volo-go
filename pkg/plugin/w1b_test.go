@@ -282,12 +282,12 @@ func TestExportZipSecurityAndRoundTrip(t *testing.T) {
 				{"key": "title", "type": "string", "default": "Hello", "label": {"en-US": "Title"}}
 			]
 		}`,
-		"main.js":            `exports.onEnable = function() {};`,
-		"assets/style.css":   `body { color: #111; }`,
-		"local-state.json":   `{"sync_cursor": 42, "webhook_token": "raw-unmasked-local-secret", "api_key": "raw-key-123"}`,
-		".env":               `RAW_ENV_SECRET=should-never-export`,
-		"secrets.json":       `{"raw":"should-never-export"}`,
-		"cache.tmp":          `transient`,
+		"main.js":          `exports.onEnable = function() {};`,
+		"assets/style.css": `body { color: #111; }`,
+		"local-state.json": `{"sync_cursor": 42, "webhook_token": "raw-unmasked-local-secret", "api_key": "raw-key-123"}`,
+		".env":             `RAW_ENV_SECRET=should-never-export`,
+		"secrets.json":     `{"raw":"should-never-export"}`,
+		"cache.tmp":        `transient`,
 	}, "")
 
 	if _, err := mgr.InstallFromZip(ctx, bytes.NewReader(srcZip), int64(len(srcZip)), true, "en-US"); err != nil {
@@ -781,6 +781,3 @@ func TestPluginSensitiveLexiconReadClearAndOnUninstall(t *testing.T) {
 		t.Fatalf("expected 0 plugin_kv items after Uninstall, got len=%d err=%v", len(items), lErr)
 	}
 }
-
-
-

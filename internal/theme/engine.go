@@ -129,6 +129,9 @@ type PaginationView struct {
 	ShowLast    bool  `json:"show_last"`
 }
 
+// Page returns CurrentPage as a template compatibility alias so custom themes referencing .Pagination.Page never error.
+func (p PaginationView) Page() int { return p.CurrentPage }
+
 // BuildPagination computes a centered sliding window of page numbers.
 func BuildPagination(currentPage, totalPages, pageSize, totalItems, windowSize int) PaginationView {
 	if totalPages < 1 {

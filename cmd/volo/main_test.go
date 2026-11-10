@@ -226,13 +226,17 @@ func TestPersistedDirPrecedenceAndGeoCloser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Load config with .env pinning VOLO_UPLOAD_DIR and VOLO_GEOIP_DIR.
-	cfgPinned, err := config.LoadWithEnviron(config.CLIOverrides{EnvFile: envFile}, nil)
+	// 1. Explicit CLI flags (--upload-dir / --geoip-dir) pin paths and ignore DB overrides.
+	cfgPinned, err := config.LoadWithEnviron(config.CLIOverrides{
+		EnvFile:   envFile,
+		UploadDir: &envUploadDir,
+		GeoIPDir:  &envGeoDir,
+	}, nil)
 	if err != nil {
-		t.Fatalf("LoadWithEnviron(.env): %v", err)
+		t.Fatalf("LoadWithEnviron(CLI pinned): %v", err)
 	}
 	if !cfgPinned.IsUploadDirPinned() || !cfgPinned.IsGeoIPDirPinned() {
-		t.Fatalf("expected UploadDirPinned=true and GeoIPDirPinned=true from .env")
+		t.Fatalf("expected UploadDirPinned=true and GeoIPDirPinned=true from explicit CLI flags")
 	}
 
 	store, err := openMigratedStore(ctx, cfgPinned)
@@ -259,30 +263,31 @@ func TestPersistedDirPrecedenceAndGeoCloser(t *testing.T) {
 	applyPersistedGeoIPDir(ctx, cfgPinned, store, settingsMgr, fsEmpty)
 
 	if cfgPinned.GetUploadDir() != envUploadDir {
-		t.Fatalf(".env VOLO_UPLOAD_DIR was overwritten by DB setting: got %q, want %q", cfgPinned.GetUploadDir(), envUploadDir)
+		t.Fatalf("CLI UploadDir was overwritten by DB setting: got %q, want %q", cfgPinned.GetUploadDir(), envUploadDir)
 	}
 	if cfgPinned.GetGeoIPDir() != envGeoDir {
-		t.Fatalf(".env VOLO_GEOIP_DIR was overwritten by DB setting: got %q, want %q", cfgPinned.GetGeoIPDir(), envGeoDir)
+		t.Fatalf("CLI GeoIPDir was overwritten by DB setting: got %q, want %q", cfgPinned.GetGeoIPDir(), envGeoDir)
 	}
 
-	// Verify unpinned config DOES adopt persisted DB settings when neither CLI, OS ENV, nor .env pins them.
-	cfgUnpinned, err := config.LoadWithEnviron(config.CLIOverrides{
-		EnvFile: filepath.Join(tmp, "nonexistent.env"),
-		DataDir: &dataDir,
-	}, nil)
+	// 2. .env VOLO_UPLOAD_DIR / VOLO_GEOIP_DIR act as defaults and ARE overridden by Admin Console DB settings.
+	cfgDotEnv, err := config.LoadWithEnviron(config.CLIOverrides{EnvFile: envFile}, nil)
 	if err != nil {
-		t.Fatalf("LoadWithEnviron(unpinned): %v", err)
+		t.Fatalf("LoadWithEnviron(.env): %v", err)
 	}
-	if cfgUnpinned.IsUploadDirPinned() || cfgUnpinned.IsGeoIPDirPinned() {
-		t.Fatalf("expected unpinned dirs when only DataDir is overridden")
+	if cfgDotEnv.IsUploadDirPinned() || cfgDotEnv.IsGeoIPDirPinned() {
+		t.Fatalf("expected .env dirs to remain unpinned so Admin Console can override them")
 	}
-	applyPersistedUploadDir(ctx, cfgUnpinned, store, settingsMgr, fsEmpty)
-	applyPersistedGeoIPDir(ctx, cfgUnpinned, store, settingsMgr, fsEmpty)
-	if cfgUnpinned.GetUploadDir() != dbUploadDir {
-		t.Fatalf("expected unpinned UploadDir to adopt DB setting %q, got %q", dbUploadDir, cfgUnpinned.GetUploadDir())
+	applyPersistedUploadDir(ctx, cfgDotEnv, store, settingsMgr, fsEmpty)
+	applyPersistedGeoIPDir(ctx, cfgDotEnv, store, settingsMgr, fsEmpty)
+	if cfgDotEnv.GetUploadDir() != dbUploadDir {
+		t.Fatalf("expected Admin Console local_dir %q to override .env default, got %q", dbUploadDir, cfgDotEnv.GetUploadDir())
 	}
-	if cfgUnpinned.GetGeoIPDir() != dbGeoDir {
-		t.Fatalf("expected unpinned GeoIPDir to adopt DB setting %q, got %q", dbGeoDir, cfgUnpinned.GetGeoIPDir())
+	if cfgDotEnv.GetGeoIPDir() != dbGeoDir {
+		t.Fatalf("expected Admin Console geoip_dir %q to override .env default, got %q", dbGeoDir, cfgDotEnv.GetGeoIPDir())
+	}
+	cfgDotEnv.SetUploadDir("")
+	if cfgDotEnv.GetUploadDir() != envUploadDir {
+		t.Fatalf("expected clearing local_dir to fall back to .env default %q, got %q", envUploadDir, cfgDotEnv.GetUploadDir())
 	}
 
 	// Verify closeGeoEngineFromDeps closes GeoEngine cleanly without panicking on active or nil Geo.
@@ -421,4 +426,3 @@ func TestCLIHealthcheckReadOnlyCWDAndUnixSocketAlias(t *testing.T) {
 		t.Fatalf("healthcheck via env unexpectedly created ./data in CWD: err=%v", err)
 	}
 }
-

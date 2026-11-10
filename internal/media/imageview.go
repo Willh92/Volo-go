@@ -1807,9 +1807,9 @@ func quantizeMedianCut(src *image.NRGBA, maxColors int) *image.Paletted {
 				dstRow[x] = uint8(cached)
 				continue
 			}
-			r5 := int((r >> 3)<<3 | (r >> 5))
-			g5 := int((g >> 3)<<3 | (g >> 5))
-			b5 := int((bl >> 3)<<3 | (bl >> 5))
+			r5 := int((r>>3)<<3 | (r >> 5))
+			g5 := int((g>>3)<<3 | (g >> 5))
+			b5 := int((bl>>3)<<3 | (bl >> 5))
 			bestIdx := 0
 			bestDist := int(^uint(0) >> 1)
 			for i, pe := range palEntries {
@@ -1989,11 +1989,11 @@ func encodePNGInterlacedAdam7NRGBA(src *image.NRGBA) ([]byte, error) {
 	var ihdr [13]byte
 	binary.BigEndian.PutUint32(ihdr[0:4], uint32(w))
 	binary.BigEndian.PutUint32(ihdr[4:8], uint32(h))
-	ihdr[8] = 8          // 8 bits per sample
-	ihdr[9] = colorType  // 2 (RGB) or 6 (RGBA)
-	ihdr[10] = 0         // deflate compression
-	ihdr[11] = 0         // adaptive filter
-	ihdr[12] = 1         // Adam7 interlace!
+	ihdr[8] = 8         // 8 bits per sample
+	ihdr[9] = colorType // 2 (RGB) or 6 (RGBA)
+	ihdr[10] = 0        // deflate compression
+	ihdr[11] = 0        // adaptive filter
+	ihdr[12] = 1        // Adam7 interlace!
 	writePNGChunk(&out, "IHDR", ihdr[:])
 	writePNGChunk(&out, "IDAT", idatRaw.Bytes())
 	writePNGChunk(&out, "IEND", nil)

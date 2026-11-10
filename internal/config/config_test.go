@@ -357,7 +357,7 @@ func TestUploadAndGeoIPDirPinnedPrecedence(t *testing.T) {
 		t.Fatal("expected GeoIPDirPinned=false by default")
 	}
 
-	// 2. .env file sets VOLO_UPLOAD_DIR and VOLO_GEOIP_DIR -> both pinned
+	// 2. .env file sets VOLO_UPLOAD_DIR and VOLO_GEOIP_DIR -> sets DefaultUploadDir/DefaultGeoIPDir while remaining unpinned for Admin Console overrides
 	dotEnvPath := filepath.Join(tmpDir, ".env")
 	dotUpload := filepath.Join(tmpDir, "dotenv-uploads")
 	dotGeo := filepath.Join(tmpDir, "dotenv-geoip")
@@ -372,14 +372,14 @@ func TestUploadAndGeoIPDirPinnedPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatalf(".env LoadWithEnviron: %v", err)
 	}
-	if !cfgDotEnv.IsUploadDirPinned() || cfgDotEnv.GetUploadDir() != dotUpload {
-		t.Fatalf("expected .env UploadDir pinned to %q, got pinned=%v dir=%q", dotUpload, cfgDotEnv.IsUploadDirPinned(), cfgDotEnv.GetUploadDir())
+	if cfgDotEnv.IsUploadDirPinned() || cfgDotEnv.GetUploadDir() != dotUpload || cfgDotEnv.GetDefaultUploadDir() != dotUpload {
+		t.Fatalf("expected .env UploadDir unpinned with default %q, got pinned=%v dir=%q", dotUpload, cfgDotEnv.IsUploadDirPinned(), cfgDotEnv.GetUploadDir())
 	}
-	if !cfgDotEnv.IsGeoIPDirPinned() || cfgDotEnv.GetGeoIPDir() != dotGeo {
-		t.Fatalf("expected .env GeoIPDir pinned to %q, got pinned=%v dir=%q", dotGeo, cfgDotEnv.IsGeoIPDirPinned(), cfgDotEnv.GetGeoIPDir())
+	if cfgDotEnv.IsGeoIPDirPinned() || cfgDotEnv.GetGeoIPDir() != dotGeo || cfgDotEnv.GetDefaultGeoIPDir() != dotGeo {
+		t.Fatalf("expected .env GeoIPDir unpinned with default %q, got pinned=%v dir=%q", dotGeo, cfgDotEnv.IsGeoIPDirPinned(), cfgDotEnv.GetGeoIPDir())
 	}
 
-	// 3. OS ENV overrides .env -> both pinned to OS ENV paths
+	// 3. OS ENV overrides .env as DefaultUploadDir/DefaultGeoIPDir while remaining overridable by Admin Console
 	envUpload := filepath.Join(tmpDir, "env-uploads")
 	envGeo := filepath.Join(tmpDir, "env-geoip")
 	cfgOSEnv, err := LoadWithEnviron(CLIOverrides{
@@ -392,14 +392,14 @@ func TestUploadAndGeoIPDirPinnedPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OS ENV LoadWithEnviron: %v", err)
 	}
-	if !cfgOSEnv.IsUploadDirPinned() || cfgOSEnv.GetUploadDir() != envUpload {
-		t.Fatalf("expected OS ENV UploadDir pinned to %q, got pinned=%v dir=%q", envUpload, cfgOSEnv.IsUploadDirPinned(), cfgOSEnv.GetUploadDir())
+	if cfgOSEnv.IsUploadDirPinned() || cfgOSEnv.GetUploadDir() != envUpload || cfgOSEnv.GetDefaultUploadDir() != envUpload {
+		t.Fatalf("expected OS ENV UploadDir unpinned with default %q, got pinned=%v dir=%q", envUpload, cfgOSEnv.IsUploadDirPinned(), cfgOSEnv.GetUploadDir())
 	}
-	if !cfgOSEnv.IsGeoIPDirPinned() || cfgOSEnv.GetGeoIPDir() != envGeo {
-		t.Fatalf("expected OS ENV GeoIPDir pinned to %q, got pinned=%v dir=%q", envGeo, cfgOSEnv.IsGeoIPDirPinned(), cfgOSEnv.GetGeoIPDir())
+	if cfgOSEnv.IsGeoIPDirPinned() || cfgOSEnv.GetGeoIPDir() != envGeo || cfgOSEnv.GetDefaultGeoIPDir() != envGeo {
+		t.Fatalf("expected OS ENV GeoIPDir unpinned with default %q, got pinned=%v dir=%q", envGeo, cfgOSEnv.IsGeoIPDirPinned(), cfgOSEnv.GetGeoIPDir())
 	}
 
-	// 4. CLI flags override OS ENV and .env -> both pinned to CLI paths
+	// 4. Explicit CLI flags (--upload-dir / --geoip-dir) override OS ENV and .env AND pin both paths
 	cliUpload := filepath.Join(tmpDir, "cli-uploads")
 	cliGeo := filepath.Join(tmpDir, "cli-geoip")
 	cfgCLI, err := LoadWithEnviron(CLIOverrides{
@@ -501,5 +501,85 @@ func TestSocketGroupModeAndSkipKeyRing(t *testing.T) {
 		SkipKeyRing: true,
 	}, []string{"VOLO_SOCKET_MODE=0999"}); err == nil {
 		t.Fatal("expected invalid VOLO_SOCKET_MODE=0999 to fail")
+	}
+}
+
+func TestTLSConfigPrecedenceAndValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	noEnv := filepath.Join(tmpDir, "nonexistent.env")
+	strp := func(s string) *string { return &s }
+	load := func(cli CLIOverrides, environ []string) (*Config, error) {
+		cli.SkipKeyRing = true
+		if cli.EnvFile == "" {
+			cli.EnvFile = noEnv
+		}
+		cli.DataDir = &tmpDir
+		return LoadWithEnviron(cli, environ)
+	}
+
+	// Default: TLS disabled, min version 1.2.
+	cfg, err := load(CLIOverrides{}, nil)
+	if err != nil {
+		t.Fatalf("default load: %v", err)
+	}
+	if cfg.TLSEnabled() || cfg.TLSMinVersion != "1.2" || cfg.TLSHTTPRedirectAddr != "" {
+		t.Fatalf("unexpected TLS defaults: enabled=%v min=%q redirect=%q", cfg.TLSEnabled(), cfg.TLSMinVersion, cfg.TLSHTTPRedirectAddr)
+	}
+	var nilCfg *Config
+	if nilCfg.TLSEnabled() {
+		t.Fatal("nil config must report TLS disabled")
+	}
+
+	// 4-layer precedence: .env < OS env < CLI.
+	envFile := filepath.Join(tmpDir, ".env")
+	body := "VOLO_TLS_CERT_FILE=/dotenv/cert.pem\nVOLO_TLS_KEY_FILE=/dotenv/key.pem\nVOLO_TLS_MIN_VERSION=1.3\nVOLO_TLS_HTTP_REDIRECT_ADDR=:80\n"
+	if err := os.WriteFile(envFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = load(CLIOverrides{EnvFile: envFile}, []string{"VOLO_TLS_CERT_FILE=/env/cert.pem", "VOLO_TLS_HTTP_REDIRECT_ADDR=127.0.0.1:8081"})
+	if err != nil {
+		t.Fatalf("precedence load: %v", err)
+	}
+	if !cfg.TLSEnabled() || cfg.TLSCertFile != "/env/cert.pem" || cfg.TLSKeyFile != "/dotenv/key.pem" || cfg.TLSMinVersion != "1.3" || cfg.TLSHTTPRedirectAddr != "127.0.0.1:8081" {
+		t.Fatalf("unexpected env precedence result: %+v", cfg)
+	}
+	cfg, err = load(CLIOverrides{EnvFile: envFile, TLSCertFile: strp("/cli/cert.pem"), TLSMinVersion: strp("1.2")}, []string{"VOLO_TLS_CERT_FILE=/env/cert.pem"})
+	if err != nil {
+		t.Fatalf("cli precedence load: %v", err)
+	}
+	if cfg.TLSCertFile != "/cli/cert.pem" || cfg.TLSMinVersion != "1.2" || cfg.TLSHTTPRedirectAddr != ":80" {
+		t.Fatalf("unexpected CLI precedence result: cert=%q min=%q redirect=%q", cfg.TLSCertFile, cfg.TLSMinVersion, cfg.TLSHTTPRedirectAddr)
+	}
+
+	// CLI explicit empty disables TLS from lower layers (both must be cleared, otherwise mismatch error).
+	if _, err := load(CLIOverrides{EnvFile: envFile, TLSCertFile: strp("")}, nil); err == nil || !strings.Contains(err.Error(), "must be set together") {
+		t.Fatalf("expected cert/key pairing error, got %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		cli     CLIOverrides
+		environ []string
+		wantErr string
+	}{
+		{"cert only", CLIOverrides{TLSCertFile: strp("/c.pem")}, nil, "must be set together"},
+		{"key only", CLIOverrides{}, []string{"VOLO_TLS_KEY_FILE=/k.pem"}, "must be set together"},
+		{"bad min version", CLIOverrides{TLSMinVersion: strp("1.1")}, nil, "VOLO_TLS_MIN_VERSION"},
+		{"tls with socket", CLIOverrides{TLSCertFile: strp("/c.pem"), TLSKeyFile: strp("/k.pem"), ListenSocket: strp(filepath.Join(tmpDir, "volo.sock"))}, nil, "Unix socket"},
+		{"redirect without tls", CLIOverrides{TLSHTTPRedirectAddr: strp(":80")}, nil, "requires native TLS"},
+		{"redirect bad addr", CLIOverrides{TLSCertFile: strp("/c.pem"), TLSKeyFile: strp("/k.pem"), TLSHTTPRedirectAddr: strp("80")}, nil, "VOLO_TLS_HTTP_REDIRECT_ADDR"},
+	}
+	for _, tc := range cases {
+		if _, err := load(tc.cli, tc.environ); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Fatalf("%s: expected error containing %q, got %v", tc.name, tc.wantErr, err)
+		}
+	}
+
+	// Accepted aliases for min version.
+	for _, v := range []string{"1.3", "TLS1.3", " 1.3 "} {
+		cfg, err := load(CLIOverrides{TLSMinVersion: strp(v)}, nil)
+		if err != nil || cfg.TLSMinVersion != "1.3" {
+			t.Fatalf("min version %q: got %q err=%v", v, cfg.TLSMinVersion, err)
+		}
 	}
 }

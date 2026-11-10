@@ -414,4 +414,3 @@ func TestIsForbiddenIPAndWAFHotReloadWindowClamping(t *testing.T) {
 		t.Fatalf("expected UpdateConfig(1) to clamp windowReset <= 1s, got %v", rem)
 	}
 }
-

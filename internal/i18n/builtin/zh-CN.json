@@ -74,6 +74,7 @@
   "comment.submitting_pow": "正在完成安全校验…",
   "comment.pending_notice": "评论已提交，审核通过后将公开展示。",
   "comment.deleted_tombstone": "该条评论已被作者或管理员删除",
+  "comment.deleted_placeholder": "该评论已删除",
   "comment.reply": "回复",
   "comment.edit": "编辑",
   "comment.delete": "删除",
@@ -291,5 +292,8 @@
   "comment.tb_link": "链接 (Ctrl+K)",
   "comment.tb_image": "插入图片",
   "comment.tb_codeblock": "代码块",
-  "comment.tb_table": "插入表格"
+  "comment.tb_table": "插入表格",
+  "bookshelf.source_auto": "在线文档",
+  "bookshelf.source_manual": "精选读物",
+  "bookshelf.source_series": "专栏合集"
 }

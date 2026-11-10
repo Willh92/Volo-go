@@ -27,8 +27,21 @@ function compactLocalesPlugin(): Plugin {
     return { items, keys };
   }
 
+  let cachedKeyMap: Map<string, number> | null = null;
+  function getKeyIndexMap() {
+    if (!cachedKeyMap) {
+      const { keys } = readLocaleCatalogs();
+      cachedKeyMap = new Map<string, number>();
+      keys.forEach((k, idx) => cachedKeyMap!.set(k, idx));
+    }
+    return cachedKeyMap;
+  }
+
   return {
     name: "volo-compact-locales",
+    buildStart() {
+      cachedKeyMap = null;
+    },
     resolveId(id) {
       if (id === virtualId) return resolvedId;
       return null;
@@ -52,6 +65,21 @@ function compactLocalesPlugin(): Plugin {
         `let _p = "";\n` +
         `export const keys = ${JSON.stringify(packedKeys.join("~"))}.split("~").map((s) => (_p = _p.slice(0, parseInt(s[0], 36)) + s.slice(1)));\n`
       );
+    },
+    transform(code, id) {
+      const cleanId = id.split("?")[0].replaceAll("\\", "/");
+      if (!cleanId.includes("/src/") || (!cleanId.endsWith(".ts") && !cleanId.endsWith(".tsx")) || cleanId.endsWith("/src/i18n.ts")) {
+        return null;
+      }
+      const keyMap = getKeyIndexMap();
+      let changed = false;
+      const out = code.replace(/(?<![A-Za-z0-9_$?.])t\(\s*(["'])([A-Za-z0-9_.-]+)\1(?=\s*[,)])/g, (full, _q, key: string) => {
+        const idx = keyMap.get(key);
+        if (idx === undefined) return full;
+        changed = true;
+        return `t(${idx}`;
+      });
+      return changed ? { code: out, map: null } : null;
     },
     configureServer(server) {
       server.middlewares.use((req, res, next) => {

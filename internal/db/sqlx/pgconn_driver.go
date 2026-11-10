@@ -639,41 +639,41 @@ func isPGKeywordByte(b byte) bool {
 }
 
 var pgClientOnlyParams = map[string]struct{}{
-	"host":                      {},
-	"hostaddr":                  {},
-	"port":                      {},
-	"dbname":                    {},
-	"user":                      {},
-	"password":                  {},
-	"passfile":                  {},
-	"channel_binding":           {},
-	"connect_timeout":           {},
-	"sslmode":                   {},
-	"sslcompression":            {},
-	"sslcert":                   {},
-	"sslkey":                    {},
-	"sslpassword":               {},
-	"sslrootcert":               {},
-	"sslcrl":                    {},
-	"sslcrldir":                 {},
-	"sslsni":                    {},
-	"requirepeer":               {},
-	"ssl_min_protocol_version":  {},
-	"ssl_max_protocol_version":  {},
-	"gssencmode":                {},
-	"krbsrvname":                {},
-	"gsslib":                    {},
-	"gssdelegation":             {},
-	"service":                   {},
-	"target_session_attrs":      {},
-	"load_balance_hosts":        {},
-	"keepalives":                {},
-	"keepalives_idle":           {},
-	"keepalives_interval":       {},
-	"keepalives_count":          {},
-	"tcp_user_timeout":          {},
-	"prefer_simple_protocol":    {},
-	"default_query_exec_mode":   {},
+	"host":                     {},
+	"hostaddr":                 {},
+	"port":                     {},
+	"dbname":                   {},
+	"user":                     {},
+	"password":                 {},
+	"passfile":                 {},
+	"channel_binding":          {},
+	"connect_timeout":          {},
+	"sslmode":                  {},
+	"sslcompression":           {},
+	"sslcert":                  {},
+	"sslkey":                   {},
+	"sslpassword":              {},
+	"sslrootcert":              {},
+	"sslcrl":                   {},
+	"sslcrldir":                {},
+	"sslsni":                   {},
+	"requirepeer":              {},
+	"ssl_min_protocol_version": {},
+	"ssl_max_protocol_version": {},
+	"gssencmode":               {},
+	"krbsrvname":               {},
+	"gsslib":                   {},
+	"gssdelegation":            {},
+	"service":                  {},
+	"target_session_attrs":     {},
+	"load_balance_hosts":       {},
+	"keepalives":               {},
+	"keepalives_idle":          {},
+	"keepalives_interval":      {},
+	"keepalives_count":         {},
+	"tcp_user_timeout":         {},
+	"prefer_simple_protocol":   {},
+	"default_query_exec_mode":  {},
 }
 
 func parsePGConnConfig(dsn string, defaultSimple bool) (*PostgresConfig, bool, error) {
@@ -1908,8 +1908,8 @@ func (c *pgWireConn) writeExtendedQuery(query string, params [][]byte) error {
 	}
 	c.wbuf = append(c.wbuf, 'B')
 	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(bindLen))
-	c.wbuf = append(c.wbuf, 0, 0)                          // portal="", stmt=""
-	c.wbuf = binary.BigEndian.AppendUint16(c.wbuf, 0)      // 0 param format codes -> default text
+	c.wbuf = append(c.wbuf, 0, 0)                     // portal="", stmt=""
+	c.wbuf = binary.BigEndian.AppendUint16(c.wbuf, 0) // 0 param format codes -> default text
 	c.wbuf = binary.BigEndian.AppendUint16(c.wbuf, uint16(len(params)))
 	for _, p := range params {
 		if p == nil {
