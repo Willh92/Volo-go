@@ -2,7 +2,7 @@
 
 > English version: [Deployment & OS Service Installers](../en-US/deployment.md)
 
-`Volo-go` 基于 Go `1.27.3`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（**全部 6 大静态发布目标架构均严格 `< 21 MiB`**，`linux/amd64` `~19.7 MiB`）：
+`Volo-go` 基于 Go `1.27.4`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（**全部 6 大静态发布目标架构均严格 `< 21 MiB`**，`linux/amd64` `~19.7 MiB`）：
 - **Linux**: `linux/amd64`、`linux/arm64`（支持 `systemd` 系统/用户级与 `OpenRC`）
 - **macOS**: `darwin/amd64`、`darwin/arm64`（支持 `launchd` `LaunchDaemon` / `LaunchAgent`）
 - **Windows**: `windows/amd64`、`windows/arm64`（支持 `svc_windows.go` 原生 `sc.exe` Windows Service、`NSSM` 与系统计划任务）

@@ -2,7 +2,7 @@
 
 > 中文版本：[部署与各系统服务安装指南](../zh-CN/deployment.md)
 
-`Volo-go` compiles with Go `1.27.3` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (**strictly `< 21 MiB` across all 6 supported static release targets**, `~19.7 MiB` on `linux/amd64`):
+`Volo-go` compiles with Go `1.27.4` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (**strictly `< 21 MiB` across all 6 supported static release targets**, `~19.7 MiB` on `linux/amd64`):
 - **Linux**: `linux/amd64`, `linux/arm64` (`systemd` system/user units & `OpenRC`)
 - **macOS**: `darwin/amd64`, `darwin/arm64` (`launchd` `LaunchDaemon` / `LaunchAgent`)
 - **Windows**: `windows/amd64`, `windows/arm64` (native `sc.exe` Windows Service via `svc_windows.go`, `NSSM`, and Scheduled Task fallback)

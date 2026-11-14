@@ -34,7 +34,7 @@ COPY --from=admin-builder /src/internal/theme/builtin/volo-studio/templates_gz .
 RUN CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -buildvcs=false -trimpath \
     -gcflags="all=-l" \
-    -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
+    -ldflags="-s -w -funcalign=8 -buildid= -X main.Version=${VERSION}" \
     -o /out/volo ./cmd/volo
 
 # Prepare non-root runtime directory skeleton (uid:gid 65532:65532 for distroless:nonroot)

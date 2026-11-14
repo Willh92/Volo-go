@@ -2,7 +2,7 @@
 
 > 中文版本：[架构设计与性能内幕](../zh-CN/architecture.md)
 
-`Volo-go` is a pure-Go (`CGO_ENABLED=0`, Go `1.27.3`, `GOEXPERIMENT=nojsonv2`) sovereign blog engine engineered from scratch to deliver multi-database dialect portability, real-time non-destructive image rendering, a 10-surface zero-leak privacy perimeter, first-party pure-Go ES6 plugin sandboxing, and microsecond-class read throughput inside a **strictly `< 21 MiB` static single binary across all 6 release targets** (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) and **`< 35 MiB` resident memory (`VmRSS`)** envelope.
+`Volo-go` is a pure-Go (`CGO_ENABLED=0`, Go `1.27.4`, `GOEXPERIMENT=nojsonv2`) sovereign blog engine engineered from scratch to deliver multi-database dialect portability, real-time non-destructive image rendering, a 10-surface zero-leak privacy perimeter, first-party pure-Go ES6 plugin sandboxing, and microsecond-class read throughput inside a **strictly `< 21 MiB` static single binary across all 6 release targets** (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) and **`< 35 MiB` resident memory (`VmRSS`)** envelope.
 
 ---
 

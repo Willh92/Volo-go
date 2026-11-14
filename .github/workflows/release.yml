@@ -200,7 +200,7 @@ jobs:
           mkdir -p "dist/${STAGE}/scripts"
           go build -buildvcs=false -trimpath \
             -gcflags="all=-l" \
-            -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
+            -ldflags="-s -w -funcalign=8 -buildid= -X main.Version=${VERSION}" \
             -o "dist/${STAGE}/volo${{ matrix.ext }}" \
             ./cmd/volo
 

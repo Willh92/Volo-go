@@ -27,7 +27,8 @@
   - 停止每小时误删刚到期的封禁记录；新增已过期封禁保留天数（`ip_ban_retention_days`，默认 `30` 天）、管理审计日志保留天数（`audit_log_retention_days`，默认 `90` 天）与插件运行日志保留天数（`plugin_log_retention_days`，默认 `30` 天，均支持 `0` 永久保留），并提供审计日志与单插件日志一键清空接口及按钮（`DELETE /api/admin/audit-logs`、`DELETE /api/admin/plugins/{id}/logs`）。
 
 ### 变更
-- **发布包瘦身**：发布压缩包仅包含对应系统的安装脚本，文件顺序 / 属主 / 时间戳可复现，并使用 7-Zip 最高压缩（缺失时回退 `gzip -9n` / `zip -9`）。为容纳 HTTP/2 与原生 TLS，二进制体积预算由 20 MiB 调整为 21 MiB（linux/amd64 约 19.7 MiB）；评论组件 gzip 预算由 10 KiB 调整为 11 KiB。
+- **升级 Go `1.27.4` 工具链修复标准库漏洞**：将 `go.mod` 工具链版本升级至 `1.27.4`（修复 `net/http` `GO-2026-6859` `MaxBytesReader` 响应头竞态问题，通过 `govulncheck` 安全门禁），并在发布构建恢复 `-funcalign=8` 链接对齐压缩，使全平台压缩包稳定控制在 `< 8 MiB`。
+- **发布包瘦身**：发布压缩包仅包含对应系统的安装脚本，文件顺序 / 属主 / 时间戳可复现，并使用 7-Zip 最高压缩（缺失时回退 `gzip -9n` / `zip -9`）。为容纳 HTTP/2 与原生 TLS，二进制体积预算由 20 MiB 调整为 21 MiB（linux/amd64 约 19.4 MiB）；评论组件 gzip 预算由 10 KiB 调整为 11 KiB。
 - **版本号统一**：二进制、Docker 镜像、`docker-compose.yml` 与后台前端包统一为 `v1.0.1`。
 
 ### 修复与体验优化

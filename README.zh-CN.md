@@ -42,7 +42,7 @@
 | 并发文章阅读 + 异步写合并 (`RecordView`) | **`454.9 µs/op`** (双核全链路 SSR+Gzip) | 内存增量实时叠加 + 2s/停机批量落盘，零 SQLite 写锁争用 |
 | 二阶段全文检索 (`SearchIndex`) | **`29.4 µs/op`** | 8 MiB 常驻索引 + UTF-8 零切片窗口摘要提取 + 分页 `/api/v1/search` |
 
-1. **极致纯净的 6 平台 `< 21 MiB` 单文件交付 (`CGO_ENABLED=0`)**：基于 Go `1.27.3`（`GOEXPERIMENT=nojsonv2`）零 C 依赖静态编译，自研零反射 `tinyxml` 与纯 Go SMTP/PGv3 驱动，覆盖 `linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`；内置前台主题、管理台 SPA、多语言字典（附外置 `zh-TW` / `ja-JP`）与运维 CLI；`http.ServeContent` 零拷贝音视频 `Range` (`206 Partial Content`) 传输、BREACH 免疫动态 Gzip、优雅停机（`VOLO_SHUTDOWN_TIMEOUT_SEC`）确定性刷盘与只读安全 `volo healthcheck`。
+1. **极致纯净的 6 平台 `< 21 MiB` 单文件交付 (`CGO_ENABLED=0`)**：基于 Go `1.27.4`（`GOEXPERIMENT=nojsonv2`）零 C 依赖静态编译，自研零反射 `tinyxml` 与纯 Go SMTP/PGv3 驱动，覆盖 `linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`；内置前台主题、管理台 SPA、多语言字典（附外置 `zh-TW` / `ja-JP`）与运维 CLI；`http.ServeContent` 零拷贝音视频 `Range` (`206 Partial Content`) 传输、BREACH 免疫动态 Gzip、优雅停机（`VOLO_SHUTDOWN_TIMEOUT_SEC`）确定性刷盘与只读安全 `volo healthcheck`。
 2. **多层配置底座与自研纯 Go 三方言存储引擎**：基础启动参数按 `CLI Flags > VOLO_* 环境变量 > .env > 安全默认值` 解析，上传目录与 GeoIP 目录支持 `CLI 参数 (--upload-dir / --geoip-dir) > 管理台数据库设置 > 环境变量 / .env > 默认值` 灵活覆盖（附目录读写自检）；不显式固定 `VOLO_DB_DRIVER` 时，`/setup` 向导经 `AES-256-GCM` 加密保存的 `data/db.json`（SQLite / PostgreSQL / MySQL）可在容器与服务重启后持久生效；原生支持 **SQLite WAL**（读写连接池物理隔离）、**PostgreSQL**（自研零依赖 `pgwire` PGv3 驱动）与 **MySQL 8+ / MariaDB / TiDB**。
 3. **正规化领域模型（`v8` Schema，33 张数据表 + 9 大设置域）、创作编辑器与全屏评论框**：涵盖 9 大原子热重载设置域（含 4 种 `seo.post_permalink_style` 固定链接风格实时切换）；后台内置 **IR / WYSIWYG / SV** 三模式 Studio 编辑器，前台内置移动端软键盘友好的统一 **Markdown 评论/回复编辑器**（工具栏、净化实时预览、全屏沉浸编辑、按身份字数/行数门禁与超高评论防刷屏折叠）。
 4. **动态隐身后台、三档阶梯自动风控、多库离线 GeoIP 与账户/IP 治理**：支持管理台免重启热切换隐身路径（`security.admin_path`）、可配置三档阶梯自动风控与 IP/CIDR 免封白名单（`risk_whitelist_cidrs`）、保留轨迹的 IP 封禁全生命周期管理与封禁/审计/插件日志保留策略，以及 `GeoLite2` + `ip2region` 多库共存热重载；`admin` / `editor` / `reader` RBAC、`Argon2id`、WebAuthn Passkey、TOTP、Step-Up 二次验证、`volo_pat_*` Token、三端自愈 `GuestPassport` + 动态 PoW，**永久/限时封禁、禁言与可逆历史评论一键文案屏蔽（解封或到期自动无损恢复）**，并提供**评论回收站**（完整恢复、彻底删除时脱敏、可配置自动清理、保留楼层占位）与迁移评论游客信息编辑。
@@ -52,7 +52,7 @@
 
 ## 快速开始
 
-### 1. 源码构建与零配置启动（Go `1.27.3` + Node.js `24 LTS`）
+### 1. 源码构建与零配置启动（Go `1.27.4` + Node.js `24 LTS`）
 
 ```bash
 # 1. 构建内嵌管理台前端产物
