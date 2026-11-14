@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,11 +145,24 @@ func resolveSocketGroupGID(socketGroup string) (int, error) {
 	return gid, nil
 }
 
+func unixSocketMaxPathBytes() int {
+	switch runtime.GOOS {
+	case "darwin", "freebsd", "openbsd", "netbsd":
+		return 103
+	default:
+		return 107
+	}
+}
+
 func openUnixSocketListener(spec *config.ListenSocketSpec, socketGroup string, socketMode string) (*ListenerHandle, error) {
 	cleanedPath := filepath.Clean(strings.TrimSpace(spec.Path))
 	baseName := filepath.Base(cleanedPath)
 	if cleanedPath == "" || baseName == "" || baseName == "." || baseName == ".." || baseName == string(filepath.Separator) {
 		return nil, fmt.Errorf("server: invalid unix socket path %q", spec.Path)
+	}
+	maxSockBytes := unixSocketMaxPathBytes()
+	if len(cleanedPath) > maxSockBytes {
+		return nil, fmt.Errorf("server: unix socket path %q (%d bytes) exceeds platform sun_path limit (%d bytes)", cleanedPath, len(cleanedPath), maxSockBytes)
 	}
 
 	perm, err := parseUnixSocketPerm(socketMode, spec.Perm)
@@ -185,8 +199,11 @@ func openUnixSocketListener(spec *config.ListenSocketSpec, socketGroup string, s
 
 	realSockPath := filepath.Join(parentReal, baseName)
 	sockPath := realSockPath
-	if len(sockPath) > 100 && len(cleanedPath) <= 100 {
+	if len(sockPath) > maxSockBytes && len(cleanedPath) <= maxSockBytes {
 		sockPath = cleanedPath
+	}
+	if len(sockPath) > maxSockBytes {
+		return nil, fmt.Errorf("server: unix socket path %q (%d bytes) exceeds platform sun_path limit (%d bytes)", sockPath, len(sockPath), maxSockBytes)
 	}
 
 	// Check if leaf socket already exists: reject regular files/symlinks, and refuse clobbering an active socket!

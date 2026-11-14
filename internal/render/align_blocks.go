@@ -11,6 +11,20 @@ var (
 	alignWrapperStyleRe    = regexp.MustCompile(`(?i)\bstyle\s*=\s*["'][^"']*\btext-align\s*:\s*(?:left|center|right|justify)\b`)
 )
 
+type alignStackEntry struct {
+	lineIdx   int
+	isWrapper bool
+}
+
+func isAlignWrapperTagName(t string) bool {
+	switch t {
+	case "div", "p", "center", "section":
+		return true
+	default:
+		return false
+	}
+}
+
 // normalizeAlignmentWrappers lets Markdown render inside standalone alignment wrappers such as
 //
 //	<div align=center>
@@ -22,7 +36,9 @@ var (
 // blank lines). Blank lines are inserted after the opening and around the closing wrapper line, and a
 // `<p align=…>` wrapper is promoted to `<div align=…>` because a `<p>` cannot contain the generated
 // paragraphs. Blocks whose inner lines are indented by 4+ spaces / tabs are left untouched so they do
-// not turn into indented code blocks. Fenced code is already replaced by placeholders at this point.
+// not turn into indented code blocks. Raw `<pre>...</pre>`, HTML comments `<!-- ... -->`, and fenced
+// code blocks are tracked in a single O(N) pass so inner tags are never mutated and unclosed wrappers
+// never trigger quadratic rescans.
 func normalizeAlignmentWrappers(md string) string {
 	if !strings.Contains(md, "<") || !strings.Contains(md, "\n") {
 		return md
@@ -32,55 +48,210 @@ func normalizeAlignmentWrappers(md string) string {
 		return md
 	}
 	lines := strings.Split(md, "\n")
+
+	lastCommentCloseLine := -1
+	lastPreCloseLine := -1
+	for idx := len(lines) - 1; idx >= 0 && (lastCommentCloseLine < 0 || lastPreCloseLine < 0); idx-- {
+		if lastCommentCloseLine < 0 && strings.Contains(lines[idx], "-->") {
+			lastCommentCloseLine = idx
+		}
+		if lastPreCloseLine < 0 && findCaseInsensitivePreCloseEnd(lines[idx]) >= 0 {
+			lastPreCloseLine = idx
+		}
+	}
+
 	openTag := make(map[int]string)
 	closeTag := make(map[int]string)
+	stacks := make(map[string][]alignStackEntry, 4)
+	lastIndentedLine := -1
+
+	var tracker blockLineTracker
+	inFence := false
+	var fenceChar byte
+	fenceLen := 0
+	fenceIndent := 0
+	fenceQuoteDepth := 0
+	inComment := false
+	inPre := false
 
 	for i := 0; i < len(lines); i++ {
-		if len(lines[i]) > 512 {
-			continue
-		}
-		m := alignWrapperOpenLineRe.FindStringSubmatch(lines[i])
-		if m == nil {
-			continue
-		}
-		tag := strings.ToLower(m[1])
-		if tag != "center" && !alignWrapperAttrRe.MatchString(m[2]) && !alignWrapperStyleRe.MatchString(m[2]) {
-			continue
-		}
-		depth := 1
-		end := -1
-		limit := i + 2000
-		if limit > len(lines)-1 {
-			limit = len(lines) - 1
-		}
-		for k := i + 1; k <= limit; k++ {
-			low := strings.ToLower(lines[k])
-			if !strings.Contains(low, tag) {
+		line := lines[i]
+
+		if inFence {
+			cl := parseChildBlockLine(line, fenceQuoteDepth, fenceIndent, -1)
+			if cl.quoteBroken {
+				inFence = false
+			} else {
+				if cl.quoteOK && cl.indentOK {
+					if ch, n, fOk := parseFenceStart(cl.trimmed); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(cl.trimmed[n:]) == "" {
+						inFence = false
+					}
+				}
 				continue
 			}
-			depth += countHTMLOpenTag(low, tag)
-			depth -= strings.Count(low, "</"+tag+">")
-			if depth <= 0 {
-				end = k
-				break
-			}
 		}
-		if end < 0 || strings.TrimSpace(strings.ToLower(lines[end])) != "</"+tag+">" {
+
+		if inComment {
+			if closeIdx := strings.Index(line, "-->"); closeIdx >= 0 {
+				inComment = false
+				rem := line[closeIdx+3:]
+				if strings.Contains(rem, "<!--") && !strings.Contains(rem[strings.Index(rem, "<!--")+4:], "-->") && i < lastCommentCloseLine {
+					inComment = true
+				} else if strings.Contains(strings.ToLower(rem), "<pre") {
+					lowRem := strings.ToLower(rem)
+					if idx := strings.Index(lowRem, "<pre"); idx >= 0 && hasHTMLTagOpen(lowRem[idx:], "pre") && findCaseInsensitivePreCloseEnd(rem[idx:]) < 0 && i < lastPreCloseLine {
+						inPre = true
+					}
+				}
+			}
 			continue
 		}
-		indented := false
-		for k := i + 1; k < end; k++ {
-			if strings.HasPrefix(lines[k], "    ") || strings.HasPrefix(lines[k], "\t") {
-				indented = true
-				break
+
+		if inPre {
+			if closeEnd := findCaseInsensitivePreCloseEnd(line); closeEnd >= 0 {
+				inPre = false
+				rem := line[closeEnd:]
+				if strings.Contains(rem, "<!--") && !strings.Contains(rem[strings.Index(rem, "<!--")+4:], "-->") && i < lastCommentCloseLine {
+					inComment = true
+				} else if strings.Contains(strings.ToLower(rem), "<pre") {
+					lowRem := strings.ToLower(rem)
+					if idx := strings.Index(lowRem, "<pre"); idx >= 0 && hasHTMLTagOpen(lowRem[idx:], "pre") && findCaseInsensitivePreCloseEnd(rem[idx:]) < 0 && i < lastPreCloseLine {
+						inPre = true
+					}
+				}
 			}
-		}
-		if indented {
 			continue
 		}
-		openTag[i] = tag
-		closeTag[end] = tag
+
+		info := tracker.next(line)
+		if info.ok {
+			if ch, n, ok := parseFenceStart(info.rest); ok {
+				inFence = true
+				fenceChar = ch
+				fenceLen = n
+				fenceIndent = info.activeIndent
+				fenceQuoteDepth = info.quoteDepth
+				continue
+			}
+			if strings.HasPrefix(info.rest, "<!--") {
+				openPos := strings.Index(line, "<!--")
+				if strings.Index(line[openPos+4:], "-->") < 0 {
+					if i < lastCommentCloseLine || info.quoteDepth == 0 {
+						inComment = true
+					}
+					continue
+				}
+			}
+			if hasHTMLTagOpen(strings.ToLower(info.rest), "pre") {
+				openPos := strings.IndexByte(line, '<')
+				tagEnd := scanHTMLTagOrCommentEnd(line, openPos)
+				if tagEnd > openPos && !strings.HasSuffix(strings.TrimSpace(line[openPos:tagEnd]), "/>") {
+					if findCaseInsensitivePreCloseEnd(line[tagEnd:]) < 0 {
+						if i < lastPreCloseLine {
+							inPre = true
+						}
+						continue
+					}
+				}
+			}
+		}
+
+		isIndented := strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "\t")
+		if len(line) <= 512 && !isIndented {
+			if m := alignWrapperOpenLineRe.FindStringSubmatch(line); m != nil && !strings.HasSuffix(strings.TrimSpace(m[2]), "/") {
+				tag := strings.ToLower(m[1])
+				if tag == "center" || alignWrapperAttrRe.MatchString(m[2]) || alignWrapperStyleRe.MatchString(m[2]) {
+					stacks[tag] = append(stacks[tag], alignStackEntry{lineIdx: i, isWrapper: true})
+					continue
+				}
+			}
+			trimmedLow := strings.ToLower(strings.TrimSpace(line))
+			if strings.HasPrefix(trimmedLow, "</") && strings.HasSuffix(trimmedLow, ">") {
+				candTag := trimmedLow[2 : len(trimmedLow)-1]
+				if isAlignWrapperTagName(candTag) {
+					if stk := stacks[candTag]; len(stk) > 0 {
+						top := stk[len(stk)-1]
+						stacks[candTag] = stk[:len(stk)-1]
+						if top.isWrapper && lastIndentedLine <= top.lineIdx && i-top.lineIdx <= 2000 {
+							openTag[top.lineIdx] = candTag
+							closeTag[i] = candTag
+						}
+					}
+					continue
+				}
+			}
+		}
+
+		if isIndented {
+			lastIndentedLine = i
+		}
+
+		if strings.IndexByte(line, '<') < 0 {
+			continue
+		}
+
+		low := strings.ToLower(line)
+		for p := 0; p < len(line); {
+			lt := strings.IndexByte(line[p:], '<')
+			if lt < 0 {
+				break
+			}
+			p += lt
+			if strings.HasPrefix(line[p:], "<!--") {
+				if rel := strings.Index(line[p+4:], "-->"); rel >= 0 {
+					p += 4 + rel + 3
+					continue
+				}
+				if i < lastCommentCloseLine {
+					inComment = true
+				}
+				break
+			}
+			if hasHTMLTagOpen(low[p:], "pre") {
+				tagEnd := scanHTMLTagOrCommentEnd(line, p)
+				if tagEnd > p && !strings.HasSuffix(strings.TrimSpace(line[p:tagEnd]), "/>") {
+					if closeRel := findCaseInsensitivePreCloseEnd(line[tagEnd:]); closeRel >= 0 {
+						p = tagEnd + closeRel
+						continue
+					}
+					if i < lastPreCloseLine {
+						inPre = true
+					}
+					break
+				}
+			}
+			matchedTag := false
+			for _, tName := range []string{"div", "p", "center", "section"} {
+				if hasHTMLTagOpen(low[p:], tName) {
+					tagEnd := scanHTMLTagOrCommentEnd(line, p)
+					if tagEnd > p {
+						if !strings.HasSuffix(strings.TrimSpace(line[p:tagEnd]), "/>") {
+							stacks[tName] = append(stacks[tName], alignStackEntry{lineIdx: i, isWrapper: false})
+						}
+						p = tagEnd
+					} else {
+						stacks[tName] = append(stacks[tName], alignStackEntry{lineIdx: i, isWrapper: false})
+						p += 1 + len(tName)
+					}
+					matchedTag = true
+					break
+				}
+				closeLiteral := "</" + tName + ">"
+				if strings.HasPrefix(low[p:], closeLiteral) {
+					if stk := stacks[tName]; len(stk) > 0 {
+						stacks[tName] = stk[:len(stk)-1]
+					}
+					p += len(closeLiteral)
+					matchedTag = true
+					break
+				}
+			}
+			if !matchedTag {
+				p++
+			}
+		}
 	}
+
 	if len(openTag) == 0 {
 		return md
 	}
@@ -118,21 +289,4 @@ func normalizeAlignmentWrappers(md string) string {
 		out = append(out, line)
 	}
 	return strings.Join(out, "\n")
-}
-
-// countHTMLOpenTag counts `<tag>` / `<tag …>` occurrences in an already lower-cased line.
-func countHTMLOpenTag(low, tag string) int {
-	n := 0
-	needle := "<" + tag
-	for idx := 0; ; {
-		j := strings.Index(low[idx:], needle)
-		if j < 0 {
-			return n
-		}
-		pos := idx + j + len(needle)
-		if pos >= len(low) || low[pos] == '>' || low[pos] == ' ' || low[pos] == '\t' || low[pos] == '/' {
-			n++
-		}
-		idx = pos
-	}
 }

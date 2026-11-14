@@ -187,4 +187,48 @@ func TestScheduler_LocalRetentionPruningAndRemoteS3WebDAVSync(t *testing.T) {
 	if err != nil || resPlug.LocalPath == "" {
 		t.Fatalf("expected detached plugin remote protocol to preserve automatic local backup without error, got res=%+v err=%v", resPlug, err)
 	}
+
+	// 4. Container restart / cold-start seeding from BackupDir:
+	//    When a recent volo-auto-*.zip already exists on disk, a freshly constructed scheduler MUST NOT
+	//    trigger a redundant backup on its first tick; when the newest auto-backup is older than LocalIntervalHrs,
+	//    it MUST run.
+	_, _, err = settings.PatchDomain(ctx, domain.SettingsDomainBackup, []byte(`{
+		"local_auto_enabled": true,
+		"local_interval_hrs": 24,
+		"remote_enabled": false
+	}`), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rebootSchedRecent := backup.NewScheduler(backup.SchedulerOptions{
+		Store:     store,
+		Settings:  settings,
+		BackupDir: backupDir,
+		UploadDir: uploadDir,
+	})
+	if _, ran, err := rebootSchedRecent.RunIfDue(ctx); err != nil || ran {
+		t.Fatalf("expected cold-start scheduler to skip tick when recent volo-auto-*.zip exists, got ran=%v err=%v", ran, err)
+	}
+
+	staleTime := time.Now().Add(-25 * time.Hour)
+	dirEntries, _ := os.ReadDir(backupDir)
+	for _, e := range dirEntries {
+		if !e.IsDir() {
+			p := filepath.Join(backupDir, e.Name())
+			if err := os.Chtimes(p, staleTime, staleTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	rebootSchedStale := backup.NewScheduler(backup.SchedulerOptions{
+		Store:     store,
+		Settings:  settings,
+		BackupDir: backupDir,
+		UploadDir: uploadDir,
+	})
+	if resDue, ran, err := rebootSchedStale.RunIfDue(ctx); err != nil || !ran || resDue == nil || resDue.LocalPath == "" {
+		t.Fatalf("expected cold-start scheduler to run when newest volo-auto-*.zip is stale (>24h), got ran=%v res=%+v err=%v", ran, resDue, err)
+	}
 }

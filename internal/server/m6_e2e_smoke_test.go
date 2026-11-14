@@ -377,8 +377,8 @@ func TestM6_FullProductionSmokeLoop(t *testing.T) {
 	if err := json.Unmarshal(upRaw, &upOut); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(upOut.Asset.PublicURL, ".webp") || upOut.Asset.MIMEType != "image/webp" {
-		t.Fatalf("expected adaptive WebP output, got url=%q mime=%q", upOut.Asset.PublicURL, upOut.Asset.MIMEType)
+	if !strings.HasSuffix(upOut.Asset.PublicURL, ".jpg") || upOut.Asset.MIMEType != "image/jpeg" {
+		t.Fatalf("expected re-encoded JPEG output (skipping lossless VP8L on JPEG), got url=%q mime=%q", upOut.Asset.PublicURL, upOut.Asset.MIMEType)
 	}
 	if upOut.Asset.Width != 80 || upOut.Asset.Height != 120 {
 		t.Fatalf("expected upright swapped dimensions 80x120, got %dx%d", upOut.Asset.Width, upOut.Asset.Height)
@@ -387,7 +387,7 @@ func TestM6_FullProductionSmokeLoop(t *testing.T) {
 		t.Fatalf("expected exif_stripped=true on uploaded photo")
 	}
 
-	// Fetch served WebP over HTTP & verify 100% zero EXIF/GPS residue + Range 206 support
+	// Fetch served JPEG over HTTP & verify 100% zero EXIF/GPS residue + Range 206 support
 	mediaGetResp, servedBytes := doJSONReq(t, http.MethodGet, ts.URL+upOut.Asset.PublicURL, nil, nil, nil)
 	if mediaGetResp.StatusCode != http.StatusOK || len(servedBytes) == 0 {
 		t.Fatalf("GET %s = %d (len=%d)", upOut.Asset.PublicURL, mediaGetResp.StatusCode, len(servedBytes))
@@ -398,8 +398,8 @@ func TestM6_FullProductionSmokeLoop(t *testing.T) {
 	rangeResp, rangeBytes := doJSONReq(t, http.MethodGet, ts.URL+upOut.Asset.PublicURL, nil, nil, map[string]string{
 		"Range": "bytes=0-11",
 	})
-	if rangeResp.StatusCode != http.StatusPartialContent || len(rangeBytes) != 12 || string(rangeBytes[:4]) != "RIFF" {
-		t.Fatalf("expected 206 Partial Content RIFF WebP header, got status=%d len=%d", rangeResp.StatusCode, len(rangeBytes))
+	if rangeResp.StatusCode != http.StatusPartialContent || len(rangeBytes) != 12 || rangeBytes[0] != 0xFF || rangeBytes[1] != 0xD8 || rangeBytes[2] != 0xFF {
+		t.Fatalf("expected 206 Partial Content JPEG SOI header, got status=%d len=%d", rangeResp.StatusCode, len(rangeBytes))
 	}
 
 	// Upload a second unreferenced PNG that will become an orphan
@@ -534,12 +534,19 @@ func TestM6_FullProductionSmokeLoop(t *testing.T) {
 	_, homeWithMascot := doJSONReq(t, http.MethodGet, ts.URL+"/", nil, nil, nil)
 	homeMascotStr := string(homeWithMascot)
 	if !strings.Contains(homeMascotStr, `id="volo-kanbanniang-root"`) ||
+		!strings.Contains(homeMascotStr, `<canvas id="soloKanbanniang"`) ||
 		!strings.Contains(homeMascotStr, `data-pats="2"`) ||
 		!strings.Contains(homeMascotStr, `/plugins/kanbanniang/assets/widget.js`) {
-		t.Fatalf("expected persistent kanbanniang widget with data-pats=\"2\" on GET /, got:\n%s", homeMascotStr)
+		t.Fatalf("expected persistent kanbanniang Live2D widget with data-pats=\"2\" on GET /, got:\n%s", homeMascotStr)
 	}
 	if wResp, wBody := doJSONReq(t, http.MethodGet, ts.URL+"/plugins/kanbanniang/assets/widget.js", nil, nil, nil); wResp.StatusCode != http.StatusOK || len(wBody) == 0 {
 		t.Fatalf("GET /plugins/kanbanniang/assets/widget.js = %d", wResp.StatusCode)
+	}
+	if l2dResp, l2dBody := doJSONReq(t, http.MethodGet, ts.URL+"/plugins/kanbanniang/assets/live2d.js?v=2.0.0", nil, nil, nil); l2dResp.StatusCode != http.StatusOK || len(l2dBody) == 0 {
+		t.Fatalf("GET /plugins/kanbanniang/assets/live2d.js = %d", l2dResp.StatusCode)
+	}
+	if mdlResp, mdlBody := doJSONReq(t, http.MethodGet, ts.URL+"/plugins/kanbanniang/api/model?model=Potion-Maker/Pio", nil, nil, nil); mdlResp.StatusCode != http.StatusOK || !strings.Contains(string(mdlBody), `"Potion-Maker/Pio"`) || (!strings.Contains(string(mdlBody), `"textures_webp"`) && !strings.Contains(string(mdlBody), `.webp"`)) {
+		t.Fatalf("GET /plugins/kanbanniang/api/model = %d %s", mdlResp.StatusCode, string(mdlBody))
 	}
 
 	// -------------------------------------------------------------------------

@@ -14,6 +14,7 @@ const (
 	defaultMaxCronConcurrency = 4
 	maxCronJobsPerPlugin      = 16
 	minCronIntervalSeconds    = 5
+	maxCronIntervalSeconds    = 365 * 86400
 
 	CronSourceManifest = "manifest"
 	CronSourceDynamic  = "dynamic"
@@ -232,6 +233,9 @@ func (r *CronRegistry) RegisterJob(pluginID string, spec CronSpec, source string
 	}
 	if spec.IntervalSeconds < minCronIntervalSeconds {
 		return fmt.Errorf("cron: interval_seconds must be >= %d", minCronIntervalSeconds)
+	}
+	if spec.IntervalSeconds > maxCronIntervalSeconds {
+		spec.IntervalSeconds = maxCronIntervalSeconds
 	}
 	if source == "" {
 		source = CronSourceDynamic

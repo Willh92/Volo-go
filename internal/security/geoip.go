@@ -504,10 +504,10 @@ func (g *GeoEngine) Allows(addr netip.Addr) bool {
 		if !sec.GeoPolicyActive {
 			return true
 		}
-		if strings.EqualFold(sec.GeoDefaultAction, "deny") {
+		if strings.EqualFold(sec.GeoDefaultAction, "deny") || strings.EqualFold(sec.GeoDefaultAction, "block") {
 			defaultPolicy = "deny"
 		}
-		if strings.EqualFold(sec.GeoUnknownAction, "deny") {
+		if strings.EqualFold(sec.GeoUnknownAction, "deny") || strings.EqualFold(sec.GeoUnknownAction, "block") {
 			unknownPolicy = "deny"
 		}
 	}
@@ -523,8 +523,11 @@ func (g *GeoEngine) Allows(addr netip.Addr) bool {
 // that would immediately lock out their own current IP address!
 func (g *GeoEngine) ValidateRulesAgainstAdminIP(rules []domain.SecurityGeoRule, defaultPolicy string, adminAddr netip.Addr) error {
 	unknownPolicy := "allow"
-	if g.settingsMgr != nil && strings.EqualFold(g.settingsMgr.Snapshot().Security.GeoUnknownAction, "deny") {
-		unknownPolicy = "deny"
+	if g.settingsMgr != nil {
+		unk := g.settingsMgr.Snapshot().Security.GeoUnknownAction
+		if strings.EqualFold(unk, "deny") || strings.EqualFold(unk, "block") {
+			unknownPolicy = "deny"
+		}
 	}
 	return g.ValidateRulesWithUnknownAgainstAdminIP(rules, defaultPolicy, unknownPolicy, adminAddr)
 }
@@ -536,11 +539,11 @@ func (g *GeoEngine) ValidateRulesWithUnknownAgainstAdminIP(rules []domain.Securi
 		return nil
 	}
 	normDefault := "allow"
-	if strings.EqualFold(defaultPolicy, "deny") {
+	if strings.EqualFold(defaultPolicy, "deny") || strings.EqualFold(defaultPolicy, "block") {
 		normDefault = "deny"
 	}
 	normUnknown := "allow"
-	if strings.EqualFold(unknownPolicy, "deny") {
+	if strings.EqualFold(unknownPolicy, "deny") || strings.EqualFold(unknownPolicy, "block") {
 		normUnknown = "deny"
 	}
 	if !g.evaluateRules(adminAddr.Unmap(), rules, normDefault, normUnknown) {
@@ -557,15 +560,15 @@ func (g *GeoEngine) evaluateRules(addr netip.Addr, rules []domain.SecurityGeoRul
 		}
 	}
 	if enabledCount == 0 && strings.EqualFold(defaultPolicy, unknownPolicy) {
-		return !strings.EqualFold(defaultPolicy, "deny")
+		return !strings.EqualFold(defaultPolicy, "deny") && !strings.EqualFold(defaultPolicy, "block")
 	}
 
 	loc, ok := g.Lookup(addr)
 	if !ok {
-		return !strings.EqualFold(unknownPolicy, "deny")
+		return !strings.EqualFold(unknownPolicy, "deny") && !strings.EqualFold(unknownPolicy, "block")
 	}
 	if enabledCount == 0 {
-		return !strings.EqualFold(defaultPolicy, "deny")
+		return !strings.EqualFold(defaultPolicy, "deny") && !strings.EqualFold(defaultPolicy, "block")
 	}
 
 	for _, rule := range rules {
@@ -573,18 +576,18 @@ func (g *GeoEngine) evaluateRules(addr netip.Addr, rules []domain.SecurityGeoRul
 			continue
 		}
 		if matchesGeoRule(loc, rule) {
-			return !strings.EqualFold(rule.Action, "deny")
+			return strings.EqualFold(strings.TrimSpace(rule.Action), "allow")
 		}
 		switch strings.ToLower(strings.TrimSpace(rule.OnMiss)) {
 		case "allow":
 			return true
-		case "deny":
+		case "deny", "block":
 			return false
 		default:
 			// "next" -> continue evaluating chain
 		}
 	}
-	return !strings.EqualFold(defaultPolicy, "deny")
+	return !strings.EqualFold(defaultPolicy, "deny") && !strings.EqualFold(defaultPolicy, "block")
 }
 
 func matchesGeoRule(loc GeoLocation, rule domain.SecurityGeoRule) bool {

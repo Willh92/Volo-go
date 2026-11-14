@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +20,24 @@ import (
 
 func TestUnixSocketListenerPermissionsLockAndGracefulShutdown(t *testing.T) {
 	tmp := t.TempDir()
-	sockPath := filepath.Join(tmp, "volo.sock")
+	shortDir, err := os.MkdirTemp("", "vsock-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	sockPath := filepath.Join(shortDir, "volo.sock")
+
+	// Overlong AF_UNIX paths (> sun_path limit) must fail cleanly before creating parent dirs or lockfiles.
+	longParent := filepath.Join(shortDir, strings.Repeat("d", 110))
+	longSock := filepath.Join(longParent, "volo.sock")
+	if _, longErr := OpenListener(&config.Config{
+		ListenSocket: &config.ListenSocketSpec{Path: longSock, Perm: 0o660},
+	}); longErr == nil || !strings.Contains(longErr.Error(), "sun_path") {
+		t.Fatalf("expected sun_path length error for %q, got: %v", longSock, longErr)
+	}
+	if _, stErr := os.Lstat(longParent); !os.IsNotExist(stErr) {
+		t.Fatalf("expected overlong socket parent dir %q NOT to be created", longParent)
+	}
 
 	store, err := sqlx.Open(context.Background(), sqlx.Options{
 		Driver: "sqlite",
@@ -49,14 +69,14 @@ func TestUnixSocketListenerPermissionsLockAndGracefulShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lstat socket: %v", err)
 	}
-	if sockInfo.Mode().Perm() != 0o660 {
+	if runtime.GOOS != "windows" && sockInfo.Mode().Perm() != 0o660 {
 		t.Fatalf("expected socket perm 0660, got %04o", sockInfo.Mode().Perm())
 	}
 	lockInfo, err := os.Lstat(sockPath + ".lock")
 	if err != nil {
 		t.Fatalf("lstat lock: %v", err)
 	}
-	if lockInfo.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && lockInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("expected lock perm 0600, got %04o", lockInfo.Mode().Perm())
 	}
 
@@ -113,7 +133,11 @@ func TestUnixSocketListenerPermissionsLockAndGracefulShutdown(t *testing.T) {
 }
 
 func TestUnixSocketSymlinkParentLeafRejectionStaleRecoveryAndModes(t *testing.T) {
-	tmp := t.TempDir()
+	tmp, err := os.MkdirTemp("", "vsock-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
 
 	// 1. Symlinked parent directory (like /var/run -> /run or macOS /tmp -> /private/tmp) MUST succeed,
 	//    and SocketMode "0600" / "660" + SocketGroup MUST be applied cleanly.
@@ -127,7 +151,10 @@ func TestUnixSocketSymlinkParentLeafRejectionStaleRecoveryAndModes(t *testing.T)
 	}
 
 	sockViaSymParent := filepath.Join(symVarRun, "volo", "volo.sock")
-	gidStr := fmtInt(os.Getgid())
+	gidStr := ""
+	if gid := os.Getgid(); gid >= 0 {
+		gidStr = fmtInt(gid)
+	}
 	cfgSym0600 := &config.Config{
 		ListenSocket: &config.ListenSocketSpec{Path: sockViaSymParent},
 		SocketMode:   "0600",
@@ -142,7 +169,7 @@ func TestUnixSocketSymlinkParentLeafRejectionStaleRecoveryAndModes(t *testing.T)
 		_ = h1.Close()
 		t.Fatalf("lstat socket in resolved parent: %v", err)
 	}
-	if st1.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && st1.Mode().Perm() != 0o600 {
 		_ = h1.Close()
 		t.Fatalf("expected socket mode 0600, got %04o", st1.Mode().Perm())
 	}
@@ -162,7 +189,7 @@ func TestUnixSocketSymlinkParentLeafRejectionStaleRecoveryAndModes(t *testing.T)
 		_ = h660.Close()
 		t.Fatal(err)
 	}
-	if st660.Mode().Perm() != 0o660 {
+	if runtime.GOOS != "windows" && st660.Mode().Perm() != 0o660 {
 		_ = h660.Close()
 		t.Fatalf("expected socket mode 0660 for '660', got %04o", st660.Mode().Perm())
 	}
@@ -242,6 +269,22 @@ func TestUnixSocketSymlinkParentLeafRejectionStaleRecoveryAndModes(t *testing.T)
 		t.Fatalf("expected live socket to remain connectable after blocked duplicate bind: %v", dialErr)
 	}
 	_ = conn.Close()
+}
+
+func TestEmergencyFallbackErrorHTMLDarkModeCSS(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeEmergencyFallbackErrorHTML(rec, http.StatusServiceUnavailable, "Service <busy>")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	wantDarkCSS := "@media(prefers-color-scheme:dark){body{background:#121316;color:#e5e7eb}p{color:#9ca3af}}"
+	if !strings.Contains(body, wantDarkCSS) {
+		t.Fatalf("expected emergency fallback HTML to contain dark-mode CSS %q, got: %s", wantDarkCSS, body)
+	}
+	if !strings.Contains(body, "Service &lt;busy&gt;") {
+		t.Fatalf("expected HTML-escaped message in emergency fallback HTML, got: %s", body)
+	}
 }
 
 func fmtInt(v int) string {

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-11-14",
+  "repository": "https://github.com/Willh92/Volo-go",
+  "plugins": [
+    {
+      "id": "sensitive-words",
+      "version": "1.1.0",
+      "min_host_version": "0.1.0",
+      "runtime": "goja",
+      "path": "plugins/sensitive-words",
+      "distribution": "bundled",
+      "bundled_in_core_archive": true,
+      "bundled_in_docker_image": true,
+      "name": {
+        "zh-CN": "敏感词与昵称卫士 (Sensitive Words)",
+        "en-US": "Sensitive Word & Nickname Guard",
+        "zh-TW": "敏感詞與暱稱衛士 (Sensitive Words)",
+        "ja-JP": "NGワード・なりすまし防止ガード (Sensitive Words)"
+      },
+      "summary": {
+        "zh-CN": "内置 6.4 万级分类敏感词库，基于宿主零 GC 指针 BFS-CSR Aho-Corasick 自动机统一守护评论与读者昵称。",
+        "en-US": "64k+ categorized word guard powered by host zero-GC-pointer BFS-CSR Aho-Corasick engine for comments and nicknames."
+      }
+    },
+    {
+      "id": "kanbanniang",
+      "version": "2.0.0",
+      "min_host_version": "0.1.0",
+      "runtime": "goja",
+      "path": "plugins/kanbanniang",
+      "distribution": "standalone-release",
+      "bundled_in_core_archive": false,
+      "bundled_in_docker_image": false,
+      "release_tag": "plugin-kanbanniang-v2.0.0",
+      "release_asset": "plugin-kanbanniang-v2.0.0.zip",
+      "release_asset_alias": "plugin-kanbanniang.zip",
+      "download_url": "https://github.com/Willh92/Volo-go/releases/download/plugin-kanbanniang-v2.0.0/plugin-kanbanniang-v2.0.0.zip",
+      "name": {
+        "zh-CN": "Live2D 看板娘 (Kanbanniang)",
+        "en-US": "Live2D Mascot Companion (Kanbanniang)",
+        "zh-TW": "Live2D 看板娘 (Kanbanniang)",
+        "ja-JP": "Live2D 看板娘アシスタント (Kanbanniang)"
+      },
+      "summary": {
+        "zh-CN": "完整内置 26 套本地离线 Live2D 模型、Pio/Tia 随机换装、7 键悬浮/触控工具栏、拖拽定位、樱花动态背景与摸头计数，采用纯 WebP 轻量化贴图并兼容自定义 PNG 模型包。",
+        "en-US": "26 self-hosted offline Live2D models, Pio/Tia outfit variants, 7-action hover/touch toolbar, pointer drag, animated WebP sakura backgrounds, KV head-pats, and pure-WebP slimmed textures with custom PNG pack support."
+      }
+    }
+  ]
+}

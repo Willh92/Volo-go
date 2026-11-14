@@ -1093,15 +1093,25 @@ func TestRound2_LifecycleHooks_AdminOps_MediaEXIF_WebhooksReplay_And_BackupTicke
 	if setResp.StatusCode != http.StatusOK || !strings.Contains(string(setRaw), `"storage_drivers"`) {
 		t.Fatalf("GET /api/admin/settings missing storage_drivers: %d %s", setResp.StatusCode, string(setRaw))
 	}
-	geoResp, geoRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules", map[string]any{
+	geoChalResp, _ := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules", map[string]any{
 		"name":       "Challenge Unknown",
 		"is_enabled": true,
 		"action":     "challenge",
 		"on_miss":    "challenge",
 		"countries":  "ZZ",
 	}, adminCookies, adminHdrs)
-	if geoResp.StatusCode != http.StatusCreated || !strings.Contains(string(geoRaw), `"on_miss":"challenge"`) {
-		t.Fatalf("POST security/geo-rules (on_miss=challenge) = %d %s", geoResp.StatusCode, string(geoRaw))
+	if geoChalResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected unimplemented action/on_miss=challenge to return 400, got %d", geoChalResp.StatusCode)
+	}
+	geoResp, geoRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules", map[string]any{
+		"name":       "Block Unknown",
+		"is_enabled": true,
+		"action":     "block",
+		"on_miss":    "block",
+		"countries":  "ZZ",
+	}, adminCookies, adminHdrs)
+	if geoResp.StatusCode != http.StatusCreated || !strings.Contains(string(geoRaw), `"action":"deny"`) || !strings.Contains(string(geoRaw), `"on_miss":"deny"`) {
+		t.Fatalf("POST security/geo-rules (block -> deny) = %d %s", geoResp.StatusCode, string(geoRaw))
 	}
 
 	// Backup single-use 60s download ticket (requires step-up current_password + bound session & IP bucket)

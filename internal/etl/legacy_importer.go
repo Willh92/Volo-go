@@ -297,6 +297,7 @@ type pass1Data struct {
 	articlePrimaryCat   map[string]string   // mapped article_id -> derived primary category_id
 	commentMailFallback map[string]string   // comment_oId -> email (from legacy mailUserContext)
 	linkHealth          map[string]legacyLinkHealthItem
+	pluginStatuses      map[string]string   // plugin_oId -> legacy status ("ENABLED" / "DISABLED")
 }
 
 func (st *pass1Data) resolveArticleID(rawID string) string {
@@ -344,6 +345,7 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), opt
 		articlePrimaryCat:   make(map[string]string),
 		commentMailFallback: make(map[string]string),
 		linkHealth:          make(map[string]legacyLinkHealthItem),
+		pluginStatuses:      make(map[string]string),
 	}
 
 	dec := json.NewDecoder(rc)
@@ -393,6 +395,22 @@ func runPass1(ctx context.Context, openStream func() (io.ReadCloser, error), opt
 					return nil
 				}
 				st.options[oid] = legacyOptionRow{OID: oid, Category: cat, Value: val}
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+
+		case "plugin", "plugins":
+			if err := streamJSONArray(dec, func(raw map[string]any) error {
+				pid := strings.TrimSpace(firstNonEmpty(strVal(raw["oId"]), strVal(raw["id"])))
+				if pid == "" {
+					return nil
+				}
+				status := strings.TrimSpace(firstNonEmpty(strVal(raw["status"]), strVal(raw["pluginStatus"])))
+				if status == "" {
+					status = "ENABLED"
+				}
+				st.pluginStatuses[pid] = status
 				return nil
 			}); err != nil {
 				return nil, err
@@ -801,6 +819,42 @@ type decomposedState struct {
 	webhooks       []domain.Webhook
 	ipBans         []domain.SecurityIPBan
 	geoRules       []domain.SecurityGeoRule
+	kanbanMigrated *legacyKanbanMigration
+}
+
+type legacyKanbanMigration struct {
+	hasExplicitStatus bool
+	enabled           bool
+	model             string
+}
+
+var legacyKanbanAllowedModels = map[string]bool{
+	"HyperdimensionNeptunia/blanc_classic":   true,
+	"HyperdimensionNeptunia/blanc_normal":    true,
+	"HyperdimensionNeptunia/blanc_swimwear":  true,
+	"HyperdimensionNeptunia/histoire":        true,
+	"HyperdimensionNeptunia/nepgear":         true,
+	"HyperdimensionNeptunia/nepgear_extra":   true,
+	"HyperdimensionNeptunia/nepgearswim":     true,
+	"HyperdimensionNeptunia/nepmaid":         true,
+	"HyperdimensionNeptunia/nepnep":          true,
+	"HyperdimensionNeptunia/nepswim":         true,
+	"HyperdimensionNeptunia/neptune_classic": true,
+	"HyperdimensionNeptunia/neptune_santa":   true,
+	"HyperdimensionNeptunia/noir":            true,
+	"HyperdimensionNeptunia/noir_classic":    true,
+	"HyperdimensionNeptunia/noir_santa":      true,
+	"HyperdimensionNeptunia/noireswim":       true,
+	"HyperdimensionNeptunia/vert_classic":    true,
+	"HyperdimensionNeptunia/vert_normal":     true,
+	"HyperdimensionNeptunia/vert_swimwear":   true,
+	"KantaiCollection/murakumo":              true,
+	"Potion-Maker/Pio":                       true,
+	"Potion-Maker/Tia":                       true,
+	"ShizukuTalk/shizuku-48":                 true,
+	"ShizukuTalk/shizuku-pajama":             true,
+	"bilibili-live/22":                       true,
+	"bilibili-live/33":                       true,
 }
 
 func decomposeOptions(
@@ -822,6 +876,21 @@ func decomposeOptions(
 	}
 	if v := getOpt("version"); v != "" {
 		report.SourceVersion = v
+	}
+
+	rawKanbanStatus, hasKanbanPlugin := st.pluginStatuses["kanbanniang"]
+	_, hasKanbanOptRow := st.options["kanbanniangSelector"]
+	rawKanbanModel := getOpt("kanbanniangSelector")
+	if hasKanbanPlugin || hasKanbanOptRow {
+		normModel := "random"
+		if legacyKanbanAllowedModels[rawKanbanModel] {
+			normModel = rawKanbanModel
+		}
+		out.kanbanMigrated = &legacyKanbanMigration{
+			hasExplicitStatus: hasKanbanPlugin,
+			enabled:           strings.EqualFold(rawKanbanStatus, "ENABLED") || rawKanbanStatus == "1" || strings.EqualFold(rawKanbanStatus, "true"),
+			model:             normModel,
+		}
 	}
 
 	// 1. Site & Appearance settings
@@ -1384,6 +1453,51 @@ func insertPass1EntitiesTx(
 		}
 	}
 
+	if dec.kanbanMigrated != nil {
+		if err := upsertMigratedKanbanniangPluginTx(ctx, tx, dec.kanbanMigrated); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func upsertMigratedKanbanniangPluginTx(ctx context.Context, tx *sqlx.Tx, km *legacyKanbanMigration) error {
+	if km == nil {
+		return nil
+	}
+	now := time.Now().Unix()
+	var existingCfgRaw string
+	var existingEnabled bool
+	hasExisting := false
+	rowErr := tx.QueryRowContext(ctx, `SELECT is_enabled, config_json FROM plugins WHERE id = ?`, "kanbanniang").Scan(&existingEnabled, &existingCfgRaw)
+	if rowErr == nil {
+		hasExisting = true
+	}
+	cfgMap := make(map[string]any)
+	if existingCfgRaw != "" {
+		_ = json.Unmarshal([]byte(existingCfgRaw), &cfgMap)
+	}
+	cfgMap["model"] = km.model
+	cfgBytes, err := json.Marshal(cfgMap)
+	if err != nil {
+		return fmt.Errorf("etl: marshal kanbanniang config: %w", err)
+	}
+	targetEnabled := km.enabled
+	if !km.hasExplicitStatus && hasExisting {
+		targetEnabled = existingEnabled
+	}
+	upsertSQL := tx.Dialect().UpsertSQL(
+		"plugins",
+		[]string{"id", "kind", "version", "is_enabled", "config_json", "secret_ciphertext", "circuit_state", "failure_count", "last_error", "installed_at", "updated_at"},
+		[]string{"id"},
+		[]string{"is_enabled", "config_json", "circuit_state", "failure_count", "last_error", "updated_at"},
+	)
+	if _, err := tx.ExecContext(ctx, upsertSQL,
+		"kanbanniang", "external", "2.0.0", targetEnabled, string(cfgBytes), "", "closed", 0, "", now, now,
+	); err != nil {
+		return fmt.Errorf("etl: upsert kanbanniang plugin state: %w", err)
+	}
 	return nil
 }
 

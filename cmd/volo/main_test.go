@@ -8,6 +8,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -355,8 +356,13 @@ func TestCLIBackupCreateAndRestoreIncludesPluginsAndThemes(t *testing.T) {
 func TestCLIHealthcheckReadOnlyCWDAndUnixSocketAlias(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
+	sockDir, err := os.MkdirTemp("", "vsock-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	dataDir := filepath.Join(tmp, "srv-data")
-	sockPath := filepath.Join(tmp, "alias.sock")
+	sockPath := filepath.Join(sockDir, "alias.sock")
 
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	doneCh := make(chan int, 1)
@@ -377,7 +383,7 @@ func TestCLIHealthcheckReadOnlyCWDAndUnixSocketAlias(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if st, err := os.Lstat(sockPath); err == nil {
-			if st.Mode().Perm() != 0o600 {
+			if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 				t.Fatalf("expected --socket-mode 0600 on socket, got %04o", st.Mode().Perm())
 			}
 			break

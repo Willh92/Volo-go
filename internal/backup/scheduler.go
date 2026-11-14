@@ -63,10 +63,58 @@ type Scheduler struct {
 
 // NewScheduler constructs a rolling backup scheduler.
 func NewScheduler(opts SchedulerOptions) *Scheduler {
-	return &Scheduler{
+	s := &Scheduler{
 		opts:   opts,
 		stopCh: make(chan struct{}),
 	}
+	s.seedLastRunFromDisk()
+	return s
+}
+
+func latestAutoBackupModTime(backupDir string) time.Time {
+	dir := strings.TrimSpace(backupDir)
+	if dir == "" {
+		return time.Time{}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}
+	}
+	var newest time.Time
+	for _, e := range entries {
+		if e.IsDir() || !isAutoBackupZipName(e.Name()) {
+			continue
+		}
+		info, iErr := e.Info()
+		if iErr != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if mod := info.ModTime().UTC(); mod.After(newest) {
+			newest = mod
+		}
+	}
+	return newest
+}
+
+func (s *Scheduler) seedLastRunFromDisk() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	alreadySet := !s.lastRun.IsZero()
+	s.mu.Unlock()
+	if alreadySet {
+		return
+	}
+	newest := latestAutoBackupModTime(s.opts.BackupDir)
+	if newest.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	if s.lastRun.IsZero() {
+		s.lastRun = newest
+	}
+	s.mu.Unlock()
 }
 
 // GetUploadDir returns the active media upload directory for backup archiving.
@@ -126,6 +174,8 @@ func (s *Scheduler) Start(ctx context.Context) {
 	s.wg.Add(1)
 	s.stateMu.Unlock()
 
+	s.seedLastRunFromDisk()
+
 	go func() {
 		defer s.wg.Done()
 		ticker := time.NewTicker(5 * time.Minute)
@@ -137,28 +187,49 @@ func (s *Scheduler) Start(ctx context.Context) {
 			case <-stopCh:
 				return
 			case <-ticker.C:
-				cfg := s.opts.Settings.Snapshot().Backup
-				if !cfg.LocalAutoEnabled {
-					continue
-				}
-				intervalHrs := cfg.LocalIntervalHrs
-				if intervalHrs <= 0 {
-					intervalHrs = 24
-				}
-				s.mu.Lock()
-				due := s.lastRun.IsZero() || time.Since(s.lastRun) >= time.Duration(intervalHrs)*time.Hour
-				s.mu.Unlock()
-				if !due {
-					continue
-				}
-				runCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-				if _, err := s.runCycle(runCtx); err != nil && s.opts.Logger != nil {
+				if _, _, err := s.RunIfDue(ctx); err != nil && s.opts.Logger != nil {
 					fmt.Fprintf(s.opts.Logger, "volo backup scheduler: cycle failed: %v\n", err)
 				}
-				cancel()
 			}
 		}
 	}()
+}
+
+// RunIfDue checks whether automatic local backups are enabled and whether the configured
+// interval has elapsed since the most recent run (seeding `lastRun` from the newest
+// `volo-auto-*.zip` file in `BackupDir` on cold start / container reboot).
+func (s *Scheduler) RunIfDue(ctx context.Context) (*RunResult, bool, error) {
+	if s == nil || s.opts.Settings == nil {
+		return nil, false, nil
+	}
+	cfg := s.opts.Settings.Snapshot().Backup
+	if !cfg.LocalAutoEnabled {
+		return nil, false, nil
+	}
+	intervalHrs := cfg.LocalIntervalHrs
+	if intervalHrs <= 0 {
+		intervalHrs = 24
+	}
+	s.seedLastRunFromDisk()
+	s.mu.Lock()
+	due := s.lastRun.IsZero() || time.Since(s.lastRun) >= time.Duration(intervalHrs)*time.Hour
+	s.mu.Unlock()
+	if !due {
+		return nil, false, nil
+	}
+	s.stateMu.Lock()
+	if s.closed {
+		s.stateMu.Unlock()
+		return nil, false, errors.New("backup scheduler is closed")
+	}
+	s.wg.Add(1)
+	s.stateMu.Unlock()
+	defer s.wg.Done()
+
+	runCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+	res, err := s.runCycle(runCtx)
+	return res, true, err
 }
 
 // Close stops the background scheduler loop and waits for any in-progress backup cycle to finish

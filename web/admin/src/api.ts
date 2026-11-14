@@ -6,6 +6,7 @@ import {
   normalizeLocale,
   registerExternalLocales,
   t,
+  tOpt,
 } from "./i18n";
 
 export interface BootConfig {
@@ -16,6 +17,7 @@ export interface BootConfig {
   default_locale: string;
   accent: string;
   default_theme: string;
+  default_mode?: string;
   site_title: string;
   vendor_cdn_prefix?: string;
   locales?: LocaleOption[];
@@ -114,7 +116,7 @@ function readInitialThemeMode(): string {
   } catch {
     // Ignore storage errors
   }
-  return bootConfig.default_theme || "auto";
+  return bootConfig.default_mode || bootConfig.default_theme || "auto";
 }
 
 export function resolveEffectiveTheme(mode: string): "light" | "dark" {
@@ -265,7 +267,7 @@ export function toggleEffectiveTheme(): "light" | "dark" {
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (ev) => {
     if (!ev.key || ev.key === "volo_theme_mode") {
-      let nextMode = bootConfig.default_theme || "auto";
+      let nextMode = bootConfig.default_mode || bootConfig.default_theme || "auto";
       try {
         nextMode = localStorage.getItem("volo_theme_mode") || nextMode;
       } catch {
@@ -297,7 +299,7 @@ if (typeof window !== "undefined") {
   }, 60_000);
 }
 
-const EXACT_ADMIN_ERROR_KEYS: Record<string, string> = {
+const EXACT_ADMIN_ERROR_KEYS: Record<string, string | number> = {
   "invalid json": "api.err_invalid_json",
   "invalid json body": "api.err_invalid_json",
   "malformed json": "api.err_invalid_json",
@@ -369,9 +371,9 @@ export function localizeAdminError(rawMsg: string): string {
 
   const norm = trimmed.replace(/[.!]+$/, "").trim().toLowerCase();
   const exactKey = EXACT_ADMIN_ERROR_KEYS[norm];
-  if (exactKey) {
-    const val = t(exactKey);
-    if (val !== exactKey) return val;
+  if (exactKey !== undefined) {
+    const val = tOpt(exactKey);
+    if (val) return val;
   }
 
   const authMatch = /^auth:\s*(.+)$/i.exec(trimmed);
@@ -392,7 +394,7 @@ export function localizeAdminError(rawMsg: string): string {
     return t("api.err_http_status", { status: code });
   }
 
-  const prefixRules: Array<[RegExp, string]> = [
+  const prefixRules: Array<[RegExp, string | number]> = [
     [/^settings:\s*(.+)$/i, "api.err_settings_prefix"],
     [/^validation(?:\s+failed)?:\s*(.+)$/i, "api.err_validation_prefix"],
     [/^database:\s*(.+)$/i, "api.err_db_prefix"],
@@ -404,8 +406,8 @@ export function localizeAdminError(rawMsg: string): string {
     const m = re.exec(trimmed);
     if (m && m[1]) {
       const inner = localizeAdminError(m[1]);
-      const val = t(key, { detail: inner });
-      if (val !== key) return val;
+      const val = tOpt(key, { detail: inner });
+      if (val) return val;
     }
   }
 

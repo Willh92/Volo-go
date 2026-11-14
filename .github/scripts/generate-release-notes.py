@@ -12,6 +12,7 @@ Priority:
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
 import subprocess
@@ -335,10 +336,34 @@ def main() -> int:
         links.append(f"[Compare `{prev_tag}...{tag}`](https://github.com/{repo}/compare/{prev_tag}...{tag})")
 
     ghcr_image = f"ghcr.io/{repo.lower()}:{ver_no_v}"
+    plugin_line = ""
+    catalog_file = root / "plugins" / "catalog.json"
+    if catalog_file.is_file():
+        try:
+            cat_data = json.loads(catalog_file.read_text(encoding="utf-8"))
+            standalone_links = []
+            for entry in cat_data.get("plugins", []):
+                if isinstance(entry, dict) and entry.get("distribution") == "standalone-release":
+                    pid = entry.get("id", "")
+                    pver = entry.get("version", "")
+                    ptag = entry.get("release_tag") or f"plugin-{pid}-v{pver}"
+                    passet = entry.get("release_asset") or f"plugin-{pid}-v{pver}.zip"
+                    standalone_links.append(
+                        f"[`{pid}` `v{pver}` (`{passet}`)](https://github.com/{repo}/releases/tag/{ptag})"
+                    )
+            if standalone_links:
+                standalone_links.append(
+                    f"[插件目录 / Catalog](https://github.com/{repo}/blob/{tag}/plugins/README.zh-CN.md)"
+                )
+                plugin_line = f"- **可选独立插件包 / Optional Plugin Packages**: {' · '.join(standalone_links)}\n"
+        except Exception:
+            plugin_line = ""
+
     footer = (
         "---\n\n"
         f"- **完整更新日志 / Full Changelog**: {' · '.join(links)}\n"
         f"- **容器镜像 / Container**: `docker pull {ghcr_image}`\n"
+        f"{plugin_line}"
         "- **校验值 / Checksums**: 见附件 `SHA256SUMS.txt`"
     )
     sections.append(footer)

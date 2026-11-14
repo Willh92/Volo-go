@@ -84,16 +84,30 @@
       --volo-accent-contrast: #f5f8f5;
     }
     [data-accent="forest"] { --volo-accent: #246b51; --volo-button: #246b51; --volo-button-hover: #1b5741; --volo-accent-soft: rgba(36, 107, 81, 0.1); }
-    [data-theme="dark"][data-accent="forest"] { --volo-accent: #9bcab1; --volo-button: #476e59; --volo-button-hover: #527c65; --volo-accent-soft: rgba(155, 202, 177, 0.15); }
     [data-accent="ocean"] { --volo-accent: #2d6583; --volo-button: #2d6583; --volo-button-hover: #23516b; --volo-accent-soft: rgba(45, 101, 131, 0.11); }
-    [data-theme="dark"][data-accent="ocean"] { --volo-accent: #a2c5dd; --volo-button: #476b85; --volo-button-hover: #527c94; --volo-accent-soft: rgba(162, 197, 221, 0.15); }
     [data-accent="teal"] { --volo-accent: #286c70; --volo-button: #286c70; --volo-button-hover: #20575a; --volo-accent-soft: rgba(40, 108, 112, 0.11); }
-    [data-theme="dark"][data-accent="teal"] { --volo-accent: #9acbcc; --volo-button: #416e71; --volo-button-hover: #4c7e80; --volo-accent-soft: rgba(154, 203, 204, 0.15); }
     [data-accent="amber"] { --volo-accent: #855c27; --volo-button: #855c27; --volo-button-hover: #6e4a20; --volo-accent-soft: rgba(133, 92, 39, 0.11); }
-    [data-theme="dark"][data-accent="amber"] { --volo-accent: #d6bd91; --volo-button: #795f3c; --volo-button-hover: #886d48; --volo-accent-soft: rgba(214, 189, 145, 0.15); }
     [data-accent="plum"] { --volo-accent: #70517d; --volo-button: #70517d; --volo-button-hover: #5a4167; --volo-accent-soft: rgba(112, 81, 125, 0.11); }
-    [data-theme="dark"][data-accent="plum"] { --volo-accent: #c8b5d7; --volo-button: #6d567d; --volo-button-hover: #7d658d; --volo-accent-soft: rgba(200, 181, 215, 0.15); }
     [data-accent="rose"] { --volo-accent: #87525f; --volo-button: #87525f; --volo-button-hover: #714450; --volo-accent-soft: rgba(135, 82, 95, 0.11); }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"]))[data-accent="forest"] { --volo-accent: #9bcab1; --volo-button: #476e59; --volo-button-hover: #527c65; --volo-accent-soft: rgba(155, 202, 177, 0.15); }
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"]))[data-accent="ocean"] { --volo-accent: #a2c5dd; --volo-button: #476b85; --volo-button-hover: #527c94; --volo-accent-soft: rgba(162, 197, 221, 0.15); }
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"]))[data-accent="teal"] { --volo-accent: #9acbcc; --volo-button: #416e71; --volo-button-hover: #4c7e80; --volo-accent-soft: rgba(154, 203, 204, 0.15); }
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"]))[data-accent="amber"] { --volo-accent: #d6bd91; --volo-button: #795f3c; --volo-button-hover: #886d48; --volo-accent-soft: rgba(214, 189, 145, 0.15); }
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"]))[data-accent="plum"] { --volo-accent: #c8b5d7; --volo-button: #6d567d; --volo-button-hover: #7d658d; --volo-accent-soft: rgba(200, 181, 215, 0.15); }
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"]))[data-accent="rose"] { --volo-accent: #d6b1bd; --volo-button: #7d5865; --volo-button-hover: #8d6572; --volo-accent-soft: rgba(214, 177, 189, 0.15); }
+    }
+    :root:has(> head > meta[name="color-scheme"][content="dark"])[data-accent="forest"],
+    [data-theme="dark"][data-accent="forest"] { --volo-accent: #9bcab1; --volo-button: #476e59; --volo-button-hover: #527c65; --volo-accent-soft: rgba(155, 202, 177, 0.15); }
+    :root:has(> head > meta[name="color-scheme"][content="dark"])[data-accent="ocean"],
+    [data-theme="dark"][data-accent="ocean"] { --volo-accent: #a2c5dd; --volo-button: #476b85; --volo-button-hover: #527c94; --volo-accent-soft: rgba(162, 197, 221, 0.15); }
+    :root:has(> head > meta[name="color-scheme"][content="dark"])[data-accent="teal"],
+    [data-theme="dark"][data-accent="teal"] { --volo-accent: #9acbcc; --volo-button: #416e71; --volo-button-hover: #4c7e80; --volo-accent-soft: rgba(154, 203, 204, 0.15); }
+    :root:has(> head > meta[name="color-scheme"][content="dark"])[data-accent="amber"],
+    [data-theme="dark"][data-accent="amber"] { --volo-accent: #d6bd91; --volo-button: #795f3c; --volo-button-hover: #886d48; --volo-accent-soft: rgba(214, 189, 145, 0.15); }
+    :root:has(> head > meta[name="color-scheme"][content="dark"])[data-accent="plum"],
+    [data-theme="dark"][data-accent="plum"] { --volo-accent: #c8b5d7; --volo-button: #6d567d; --volo-button-hover: #7d658d; --volo-accent-soft: rgba(200, 181, 215, 0.15); }
+    :root:has(> head > meta[name="color-scheme"][content="dark"])[data-accent="rose"],
     [data-theme="dark"][data-accent="rose"] { --volo-accent: #d6b1bd; --volo-button: #7d5865; --volo-button-hover: #8d6572; --volo-accent-soft: rgba(214, 177, 189, 0.15); }
     *, *::before, *::after { box-sizing: border-box; }
     [hidden] { display: none !important; }
@@ -487,12 +501,19 @@
       .err-card { padding: 26px 18px; border-radius: 16px; }
       .err-actions .err-btn { flex: 1 1 auto; }
     }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
   </style>
   {{block "head_extra" .}}{{if eq .ThemeID "volo-journal"}}<link rel="stylesheet" href="{{assetURL .ThemeID "volo-journal.css"}}">{{end}}{{end}}
 </head>
 <body class="volo-err-shell">
   <div class="err-topbar" role="navigation" aria-label="{{$siteTitle}}">
-    <a class="err-brand" href="/">
+    <a class="err-brand" href="/" aria-label="{{$siteTitle}}">
       {{if $brandImg}}
         <img class="err-brand__img" src="{{$brandImg}}" alt="" width="36" height="36" id="volo-err-brand-img">
         <span class="err-brand__mark" id="volo-err-brand-fallback" hidden aria-hidden="true">V.</span>
@@ -502,7 +523,7 @@
       <span class="err-brand__title">{{$siteTitle}}</span>
     </a>
     <div class="err-topbar__right">
-      <a class="err-top-home" href="/">
+      <a class="err-top-home" href="/" aria-label="{{t .Locale "error.back_home_top"}}">
         <span>{{t .Locale "error.back_home_top"}}</span>
         <span class="err-arrow" aria-hidden="true">↗</span>
       </a>
@@ -623,8 +644,14 @@
       }
       if (window.matchMedia) {
         var mq = window.matchMedia("(prefers-color-scheme: dark)");
-        var onSys = function(){ if ((root.getAttribute("data-mode") || "auto") === "system") applyErrMode("system", false); };
+        var onSys = function(){
+          var cur = root.getAttribute("data-mode") || "";
+          if (cur === "system" || (!cur && (root.getAttribute("data-default-mode") || "auto") === "system")) {
+            applyErrMode("system", false);
+          }
+        };
         if (mq.addEventListener) mq.addEventListener("change", onSys);
+        else if (mq.addListener) mq.addListener(onSys);
       }
 
       var modal = document.getElementById("volo-err-search-modal");

@@ -325,3 +325,317 @@ func TestCustomAppDeepLinkAnchorSanitization(t *testing.T) {
 		}
 	}
 }
+
+func TestCodeHighlightAutoDetectedLangAndLexerEdgeCases(t *testing.T) {
+	eng := NewEngine()
+	md := strings.Join([]string{
+		"```",
+		"server {",
+		"    listen 8080;",
+		"    proxy_pass http://127.0.0.1:8080;",
+		"    proxy_read_timeout 500ms;",
+		"}",
+		"```",
+		"",
+		"```css",
+		"a:hover { display:flex; color:#fff; margin:0 auto; }",
+		"```",
+		"",
+		"    SELECT id, title FROM posts WHERE id > 0;",
+		"",
+		`<pre><code class="language-go">func main() { println(len("hi")) }</code></pre>`,
+	}, "\n")
+
+	out := eng.Render(md, Options{Mode: RenderModeWeb, ShowLineNumbers: true})
+
+	// 1. Unlabeled Nginx block emits data-detected-lang="nginx" (no data-lang) & keeps http:// URI intact
+	if !strings.Contains(out.HTML, `<figure class="volo-codeblock" data-detected-lang="nginx">`) {
+		t.Fatalf("expected auto-detected data-detected-lang=\"nginx\", got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `<span class="s2">http://127.0.0.1:8080</span>`) {
+		t.Fatalf("expected intact Nginx URI token, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `<span class="m">500ms</span>`) {
+		t.Fatalf("expected Nginx ms duration unit token, got: %s", out.HTML)
+	}
+
+	// 2. Compact CSS properties without space after colon classify value keywords & pseudo-classes accurately
+	if !strings.Contains(out.HTML, `<span class="nd">hover</span>`) {
+		t.Fatalf("expected CSS :hover pseudo-class as nd, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `<span class="na">display</span><span class="p">:</span><span class="kc">flex</span>`) {
+		t.Fatalf("expected compact CSS display:flex classified as na + kc, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `<span class="mh">#fff</span>`) {
+		t.Fatalf("expected CSS #fff classified as mh, got: %s", out.HTML)
+	}
+
+	// 3. 4-space indented SQL block & raw <pre><code class="language-go"> upgraded to .volo-codeblock + .chroma
+	if !strings.Contains(out.HTML, `data-detected-lang="sql"`) {
+		t.Fatalf("expected 4-space indented SQL block to be highlighted and auto-detected, got: %s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `<figure class="volo-codeblock" data-lang="go">`) || !strings.Contains(out.HTML, `<span class="nb">len</span>`) {
+		t.Fatalf("expected raw <pre><code class=\"language-go\"> upgraded with Go builtin nb, got: %s", out.HTML)
+	}
+}
+
+func TestQuoteDepthIsolationAndLockFailClosed(t *testing.T) {
+	eng := NewEngine()
+
+	t.Run("top-level :::lock containing > ::: never leaks in Render, RenderSummary, or StripAllLockBlocks", func(t *testing.T) {
+		md := strings.Join([]string{
+			"Public intro.",
+			`:::lock pwd="topsecret"`,
+			"SECRET_BEFORE_QUOTE_FENCE",
+			"> :::",
+			"SECRET_AFTER_QUOTE_FENCE",
+			":::",
+			"Public outro.",
+		}, "\n")
+
+		out := eng.Render(md, Options{Mode: RenderModeWeb})
+		if !out.HasLockBlock || !out.HasUnresolvedLock {
+			t.Fatalf("expected unresolved lock block, got HasLock=%v HasUnresolved=%v", out.HasLockBlock, out.HasUnresolvedLock)
+		}
+		for _, secret := range []string{"SECRET_BEFORE_QUOTE_FENCE", "SECRET_AFTER_QUOTE_FENCE"} {
+			if strings.Contains(out.HTML, secret) || strings.Contains(out.PlainText, secret) {
+				t.Fatalf("Render() leaked %q:\nHTML: %s\nPlain: %s", secret, out.HTML, out.PlainText)
+			}
+		}
+		if !strings.Contains(out.HTML, "Public intro.") || !strings.Contains(out.HTML, "Public outro.") {
+			t.Fatalf("Render() dropped public text:\n%s", out.HTML)
+		}
+
+		summary := eng.RenderSummary(md)
+		for _, secret := range []string{"SECRET_BEFORE_QUOTE_FENCE", "SECRET_AFTER_QUOTE_FENCE"} {
+			if strings.Contains(summary, secret) {
+				t.Fatalf("RenderSummary() leaked %q:\n%s", secret, summary)
+			}
+		}
+		if !strings.Contains(summary, "Public intro.") || !strings.Contains(summary, "Public outro.") {
+			t.Fatalf("RenderSummary() dropped public text:\n%s", summary)
+		}
+
+		stripped := StripAllLockBlocks(md)
+		for _, secret := range []string{"SECRET_BEFORE_QUOTE_FENCE", "SECRET_AFTER_QUOTE_FENCE"} {
+			if strings.Contains(stripped, secret) {
+				t.Fatalf("StripAllLockBlocks() leaked %q:\n%s", secret, stripped)
+			}
+		}
+		if !strings.Contains(stripped, "Public intro.") || !strings.Contains(stripped, "Public outro.") {
+			t.Fatalf("StripAllLockBlocks() dropped public text:\n%s", stripped)
+		}
+
+		// Unlocked rendering preserves inner "> :::" blockquote content cleanly.
+		unlocked := eng.Render(md, Options{
+			Mode:              RenderModeWeb,
+			UnlockedPasswords: map[string]bool{"topsecret": true},
+		})
+		if !strings.Contains(unlocked.HTML, "SECRET_BEFORE_QUOTE_FENCE") || !strings.Contains(unlocked.HTML, "SECRET_AFTER_QUOTE_FENCE") {
+			t.Fatalf("unlocked Render() lost inner content:\n%s", unlocked.HTML)
+		}
+	})
+
+	t.Run("blockquote > :::lock terminated by unquoted outer line fails closed before outer line", func(t *testing.T) {
+		md := strings.Join([]string{
+			`> :::lock pwd="qpwd"`,
+			"> QUOTED_SECRET_LINE_1",
+			"> > DEEPLY_QUOTED_SECRET_LINE_2",
+			"Unquoted public outer paragraph.",
+		}, "\n")
+
+		out := eng.Render(md, Options{Mode: RenderModeWeb})
+		if !out.HasLockBlock || !out.HasUnresolvedLock {
+			t.Fatalf("expected unresolved lock block, got HasLock=%v HasUnresolved=%v", out.HasLockBlock, out.HasUnresolvedLock)
+		}
+		for _, secret := range []string{"QUOTED_SECRET_LINE_1", "DEEPLY_QUOTED_SECRET_LINE_2"} {
+			if strings.Contains(out.HTML, secret) || strings.Contains(out.PlainText, secret) {
+				t.Fatalf("Render() leaked blockquote lock secret %q:\n%s", secret, out.HTML)
+			}
+		}
+		if !strings.Contains(out.HTML, "<p>Unquoted public outer paragraph.</p>") {
+			t.Fatalf("expected unquoted outer paragraph outside blockquote:\n%s", out.HTML)
+		}
+
+		summary := eng.RenderSummary(md)
+		if strings.Contains(summary, "QUOTED_SECRET_LINE_1") || strings.Contains(summary, "DEEPLY_QUOTED_SECRET_LINE_2") {
+			t.Fatalf("RenderSummary() leaked blockquote lock secret:\n%s", summary)
+		}
+		if !strings.Contains(summary, "Unquoted public outer paragraph.") {
+			t.Fatalf("RenderSummary() lost outer paragraph:\n%s", summary)
+		}
+
+		stripped := StripAllLockBlocks(md)
+		if strings.Contains(stripped, "QUOTED_SECRET_LINE_1") || strings.Contains(stripped, "DEEPLY_QUOTED_SECRET_LINE_2") {
+			t.Fatalf("StripAllLockBlocks() leaked blockquote lock secret:\n%s", stripped)
+		}
+		if !strings.Contains(stripped, "Unquoted public outer paragraph.") {
+			t.Fatalf("StripAllLockBlocks() lost outer paragraph:\n%s", stripped)
+		}
+	})
+
+	t.Run("top-level fenced code and $$ math blocks do not close prematurely on > fence", func(t *testing.T) {
+		md := strings.Join([]string{
+			"```markdown",
+			"before quoted fence",
+			"> ```",
+			"after quoted fence",
+			"```",
+			"",
+			"$$",
+			"x + y",
+			"> $$",
+			"z = 1",
+			"$$",
+		}, "\n")
+
+		out := eng.Render(md, Options{Mode: RenderModeWeb})
+		if strings.Count(out.HTML, `class="volo-codeblock"`) != 1 {
+			t.Fatalf("expected single code block, got:\n%s", out.HTML)
+		}
+		if !strings.Contains(out.HTML, "before quoted fence") || !strings.Contains(out.HTML, "after quoted fence") {
+			t.Fatalf("expected lines before and after > ``` inside same code block:\n%s", out.HTML)
+		}
+		if strings.Count(out.HTML, `class="volo-math-block"`) != 1 {
+			t.Fatalf("expected single math block, got:\n%s", out.HTML)
+		}
+		if !strings.Contains(out.HTML, "z = 1") {
+			t.Fatalf("expected z = 1 inside math block:\n%s", out.HTML)
+		}
+	})
+
+	t.Run("blockquote > ```go followed by unquoted paragraph closes code block at blockquote end", func(t *testing.T) {
+		md := strings.Join([]string{
+			"> ```go",
+			"> x := 42",
+			"> > inner > keep",
+			"Unquoted paragraph after quote.",
+		}, "\n")
+
+		out := eng.Render(md, Options{Mode: RenderModeWeb})
+		if !strings.Contains(out.HTML, "<blockquote>") {
+			t.Fatalf("expected blockquote wrapper:\n%s", out.HTML)
+		}
+		if !strings.Contains(out.HTML, `data-lang="go"`) || !strings.Contains(out.PlainText, "> inner > keep") {
+			t.Fatalf("expected Go code block inside blockquote preserving extra > prefix:\n%s", out.HTML)
+		}
+		bqClose := strings.Index(out.HTML, "</blockquote>")
+		outerPar := strings.Index(out.HTML, "<p>Unquoted paragraph after quote.</p>")
+		if bqClose < 0 || outerPar < bqClose {
+			t.Fatalf("expected unquoted paragraph after </blockquote>:\n%s", out.HTML)
+		}
+	})
+}
+
+func TestBarePreCodeEntitiesMermaidAndAlignmentRawState(t *testing.T) {
+	eng := NewEngine()
+
+	md := strings.Join([]string{
+		`<pre data-title="a>b"><code class="language-sh">curl "https://api.example.com?a=1&copy=2&reg=3&times=4&amp;ok=5" &amp;&amp; echo &apos;done&apos;</code></pre>`,
+		"",
+		`<pre><code class="language-mermaid">graph TD`,
+		`  A -->|<label>| B`,
+		`  B -->|&lt;step&gt;| C</code></pre>`,
+		"",
+		"<pre>",
+		`<p align="center">`,
+		"raw pre line",
+		"</p>",
+		"</pre>",
+		"",
+		"<!--",
+		`<p align="center">`,
+		"commented line",
+		"</p>",
+		"-->",
+	}, "\n")
+
+	out := eng.Render(md, Options{Mode: RenderModeWeb})
+	if strings.Contains(out.HTML, "©") || strings.Contains(out.HTML, "®") || strings.Contains(out.HTML, "×") {
+		t.Fatalf("semicolon-less query params were corrupted into entities:\n%s", out.HTML)
+	}
+	if !strings.Contains(out.HTML, `?a=1&amp;copy=2&amp;reg=3&amp;times=4&amp;ok=5`) {
+		t.Fatalf("expected intact query string inside highlighted code block:\n%s", out.HTML)
+	}
+	if !out.NeedsMermaid || !strings.Contains(out.HTML, `<pre class="mermaid">`) || !strings.Contains(out.HTML, `&lt;label&gt;`) || !strings.Contains(out.HTML, `&lt;step&gt;`) {
+		t.Fatalf("expected bare language-mermaid block upgraded to <pre class=\"mermaid\"> with escaped <label>:\n%s", out.HTML)
+	}
+	if strings.Contains(out.HTML, `<div align="center">`) {
+		t.Fatalf("<p align=\"center\"> inside <pre> or HTML comment was wrongly promoted to <div align=\"center\">:\n%s", out.HTML)
+	}
+
+	// Stress-check linear O(L) highlight scanning on repeated unclosed `==a ==b ...`
+	repeatedMarks := strings.Repeat("==word ", 4000)
+	markOut := eng.Render(repeatedMarks, Options{Mode: RenderModeWeb})
+	if strings.Contains(markOut.HTML, "<mark>") {
+		t.Fatalf("expected no <mark> for unclosed == tokens")
+	}
+}
+
+func TestExpandedLexersAndLanguageAliases(t *testing.T) {
+	eng := NewEngine()
+
+	t.Run("php splits $class as nv variable and highlights #, //, /* */ comments", func(t *testing.T) {
+		phpHTML := HighlightCodeHTML("<?php\n# hash comment\n// slash comment\n/* block */\nnamespace App;\nreadonly class Demo {\n    public function run($class): void {\n        echo match ($class) { default => 'ok' };\n    }\n}\n", "php", false)
+		if !strings.Contains(phpHTML, `<span class="nv">$class</span>`) {
+			t.Fatalf("expected PHP $class highlighted as nv variable without splitting keyword:\n%s", phpHTML)
+		}
+		if !strings.Contains(phpHTML, `<span class="k">class</span>`) || !strings.Contains(phpHTML, `<span class="k">readonly</span>`) || !strings.Contains(phpHTML, `<span class="k">match</span>`) {
+			t.Fatalf("expected PHP keywords highlighted:\n%s", phpHTML)
+		}
+		if strings.Count(phpHTML, `<span class="c1">`) < 2 || !strings.Contains(phpHTML, `<span class="cm">`) {
+			t.Fatalf("expected PHP #, //, and /* */ comments highlighted:\n%s", phpHTML)
+		}
+	})
+
+	t.Run("ruby, lua, graphql, proto, genericLex -- comments, and aliases", func(t *testing.T) {
+		rbHTML := HighlightCodeHTML("# comment\nclass User\n  attr_accessor :role\n  def admin?\n    @role == :admin || @@default == $GLOBAL_ROLE\n  end\nend\n", "rb", false)
+		if !strings.Contains(rbHTML, `<span class="ss">:role</span>`) || !strings.Contains(rbHTML, `<span class="nv">@role</span>`) || !strings.Contains(rbHTML, `<span class="nv">@@default</span>`) || !strings.Contains(rbHTML, `<span class="nv">$GLOBAL_ROLE</span>`) {
+			t.Fatalf("expected Ruby symbols and @/@@/$ variables highlighted:\n%s", rbHTML)
+		}
+
+		luaHTML := HighlightCodeHTML("--[[ multi\ncomment ]]\n-- line comment\nlocal function add(a, b)\n  if a == nil then return 0 end\n  return a + b\nend\n", "lua", false)
+		if !strings.Contains(luaHTML, `<span class="cm">--[[ multi`) || !strings.Contains(luaHTML, `<span class="c1">-- line comment</span>`) || !strings.Contains(luaHTML, `<span class="k">local</span>`) {
+			t.Fatalf("expected Lua comments and keywords highlighted:\n%s", luaHTML)
+		}
+
+		gqlHTML := HighlightCodeHTML("# query doc\nquery GetUser($id: ID!) @cached {\n  user(id: $id) { name }\n}\n", "gql", false)
+		if !strings.Contains(gqlHTML, `<span class="c1"># query doc</span>`) || !strings.Contains(gqlHTML, `<span class="nv">$id</span>`) || !strings.Contains(gqlHTML, `<span class="nd">@cached</span>`) || !strings.Contains(gqlHTML, `<span class="k">query</span>`) {
+			t.Fatalf("expected GraphQL comment, $var, @directive, and query keyword highlighted:\n%s", gqlHTML)
+		}
+
+		protoHTML := HighlightCodeHTML("// proto3\nsyntax = \"proto3\";\nmessage User { int64 id = 1; repeated string tags = 2; }\nservice Api { rpc Get(User) returns (User); }\n", "protobuf", false)
+		if !strings.Contains(protoHTML, `<span class="c1">// proto3</span>`) || !strings.Contains(protoHTML, `<span class="k">message</span>`) || !strings.Contains(protoHTML, `<span class="kt">int64</span>`) || !strings.Contains(protoHTML, `<span class="k">returns</span>`) {
+			t.Fatalf("expected Protobuf comment, keywords, and scalar types highlighted:\n%s", protoHTML)
+		}
+
+		genHTML := HighlightCodeHTML("-- dash comment\nval x = compute(42);\n", "hs", false)
+		if !strings.Contains(genHTML, `<span class="c1">-- dash comment</span>`) {
+			t.Fatalf("expected -- comment highlighted in genericLex:\n%s", genHTML)
+		}
+
+		// Verify heuristic auto-detection for idiomatic Ruby and Lua
+		autoMD := "```\ndef greet(name)\n  puts name\nend\n```\n\n```\nlocal function fib(n)\n  return n\nend\n```\n"
+		autoOut := eng.Render(autoMD, Options{Mode: RenderModeWeb})
+		if !strings.Contains(autoOut.HTML, `data-detected-lang="ruby"`) || !strings.Contains(autoOut.HTML, `data-detected-lang="lua"`) {
+			t.Fatalf("expected Ruby and Lua auto-detection:\n%s", autoOut.HTML)
+		}
+
+		// Verify requested aliases resolve to non-nil lexers with matching comment styles
+		for _, alias := range []string{"scss", "sass", "less", "json5", "mjs", "cjs", "mts", "cts", "zsh", "fish", "console", "shellsession", "hcl", "tf", "terraform", "prisma", "dart", "scala", "zig", "elixir", "ex", "r", "perl", "pl"} {
+			if resolveCodeLexer(alias) == nil {
+				t.Fatalf("expected non-nil lexer for alias %q", alias)
+			}
+		}
+		if !strings.Contains(HighlightCodeHTML("# tf comment\nresource \"x\" \"y\" {}", "terraform", false), `<span class="c1"># tf comment</span>`) {
+			t.Fatal("expected # comment in terraform")
+		}
+		if !strings.Contains(HighlightCodeHTML("# ex comment\n[1, 2] -- [2]", "elixir", false), `<span class="c1"># ex comment</span>`) ||
+			strings.Contains(HighlightCodeHTML("[1, 2] -- [2]", "elixir", false), `class="c1"`) {
+			t.Fatal("expected # comment in elixir without misclassifying -- list operator as comment")
+		}
+		if !strings.Contains(HighlightCodeHTML("// zig comment\nconst x = 1;", "zig", false), `<span class="c1">// zig comment</span>`) {
+			t.Fatal("expected // comment in zig")
+		}
+	})
+}

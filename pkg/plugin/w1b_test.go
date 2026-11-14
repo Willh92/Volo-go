@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -307,13 +308,16 @@ func TestExportZipSecurityAndRoundTrip(t *testing.T) {
 	outsideSecret := filepath.Join(tmpDir, "host-secret.txt")
 	_ = os.WriteFile(outsideSecret, []byte("HOST_SECRET"), 0o600)
 	if err := os.Symlink(outsideSecret, symlinkPath); err != nil {
-		t.Fatalf("create symlink: %v", err)
+		if runtime.GOOS != "windows" {
+			t.Fatalf("create symlink: %v", err)
+		}
+	} else {
+		var symBuf bytes.Buffer
+		if err := mgr.ExportZip("exportable-demo", &symBuf); err == nil {
+			t.Fatal("expected ExportZip to reject plugin containing symlink")
+		}
+		_ = os.Remove(symlinkPath)
 	}
-	var symBuf bytes.Buffer
-	if err := mgr.ExportZip("exportable-demo", &symBuf); err == nil {
-		t.Fatal("expected ExportZip to reject plugin containing symlink")
-	}
-	_ = os.Remove(symlinkPath)
 
 	// 3. Clean export strips unmasked secrets while preserving legitimate code & state.
 	var exported bytes.Buffer

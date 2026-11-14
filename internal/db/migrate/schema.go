@@ -39,7 +39,7 @@ func loadV1SchemaTemplate() string {
 }
 
 // CurrentSchemaVersion is the canonical normalized schema version of Volo-go.
-const CurrentSchemaVersion = 8
+const CurrentSchemaVersion = 9
 
 type migrationStep struct {
 	Version     int
@@ -87,6 +87,11 @@ var steps = []migrationStep{
 		Version:     8,
 		Description: "Add timed account ban, mute, reason, and reversible historical comment shielding columns to users",
 		Statements:  buildV8UserModerationAndCommentShielding,
+	},
+	{
+		Version:     9,
+		Description: "Add composite sort and incremental sync indexes on comments, follows, and series",
+		Statements:  buildV9CommentsFollowsSeriesIndexes,
 	},
 }
 
@@ -197,6 +202,14 @@ func buildV8UserModerationAndCommentShielding(d dialect.Dialect) []string {
 		fmt.Sprintf(`ALTER TABLE users ADD COLUMN ban_reason%s NOT NULL DEFAULT ''`, t.Varchar255),
 		fmt.Sprintf(`ALTER TABLE users ADD COLUMN shield_comments%s NOT NULL DEFAULT %s`, t.Bool, t.BoolFalseLit),
 		fmt.Sprintf(`ALTER TABLE users ADD COLUMN shield_text%s NOT NULL DEFAULT ''`, t.Varchar255),
+	}
+}
+
+func buildV9CommentsFollowsSeriesIndexes(_ dialect.Dialect) []string {
+	return []string{
+		`CREATE INDEX idx_comments_del_updated ON comments (is_deleted, updated_at, id)`,
+		`CREATE INDEX idx_follows_sort_created ON follows (sort_order, created_at)`,
+		`CREATE INDEX idx_series_sort_created ON series (sort_order, created_at)`,
 	}
 }
 

@@ -46,8 +46,8 @@ import (
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
-// Version can be overridden at link time via -ldflags="-X main.Version=v1.0.1".
-var Version = "v1.0.1"
+// Version can be overridden at link time via -ldflags="-X main.Version=v1.0.2".
+var Version = "v1.0.2"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -508,12 +508,6 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		DataDir:      cfg.DataDir,
 		Catalog:      catalog,
 	})
-	_ = pluginMgr.DiscoverAndStart(ctx)
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = pluginMgr.Close(shutCtx)
-	}()
 
 	outboundDialer := &security.OutboundSafeDialer{Timeout: 10 * time.Second}
 	mediaPipe := media.NewPipeline(media.PipelineOptions{
@@ -524,6 +518,25 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		Plugins:        pluginMgr,
 	})
 	pluginMgr.Providers().SetDefaults(mediaPipe, nil)
+	pluginMgr.SetSiteInfoFunc(func() map[string]any {
+		snap := settingsMgr.Snapshot()
+		return map[string]any{
+			"title":          snap.Site.Title,
+			"subtitle":       snap.Site.Subtitle,
+			"description":    snap.Site.Description,
+			"public_url":     cfg.GetPublicURL(),
+			"default_locale": snap.Site.DefaultLocale,
+			"active_theme":   snap.Appearance.ActiveTheme,
+			"version":        Version,
+		}
+	})
+
+	_ = pluginMgr.DiscoverAndStart(ctx)
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = pluginMgr.Close(shutCtx)
+	}()
 
 	notifier := notify.NewDispatcher(notify.DispatcherOptions{
 		Store:          store,

@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Willh92/Volo-go/internal/auth"
 	"github.com/Willh92/Volo-go/internal/config"
@@ -246,6 +247,16 @@ func eligibleForPublicDynamicGzip(r *http.Request, adminPath string) bool {
 	return true
 }
 
+func extendStreamingDeadlines(w http.ResponseWriter, d time.Duration) {
+	if w == nil || d <= 0 {
+		return
+	}
+	rc := http.NewResponseController(w)
+	deadline := time.Now().Add(d)
+	_ = rc.SetReadDeadline(deadline)
+	_ = rc.SetWriteDeadline(deadline)
+}
+
 type dynamicGzipResponseWriter struct {
 	http.ResponseWriter
 	statusCode  int
@@ -254,6 +265,10 @@ type dynamicGzipResponseWriter struct {
 	passthrough bool
 	gz          *gzip.Writer
 	buf         []byte
+}
+
+func (g *dynamicGzipResponseWriter) Unwrap() http.ResponseWriter {
+	return g.ResponseWriter
 }
 
 func (g *dynamicGzipResponseWriter) WriteHeader(code int) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -106,12 +107,15 @@ func TestOrphanScanner_PreservesImageViewQueryReferencedAssets(t *testing.T) {
 	}
 	sym := filepath.Join(uploadDir, "sym.txt")
 	if err := os.Symlink(outside, sym); err != nil {
-		t.Fatal(err)
-	}
-	if err := media.SafeUnlinkLocalFile(uploadDir, "sym.txt"); err == nil {
-		t.Fatalf("expected SafeUnlinkLocalFile to reject symlink")
-	}
-	if _, err := os.Stat(outside); err != nil {
-		t.Fatalf("outside file must remain untouched: %v", err)
+		if runtime.GOOS != "windows" {
+			t.Fatal(err)
+		}
+	} else {
+		if err := media.SafeUnlinkLocalFile(uploadDir, "sym.txt"); err == nil {
+			t.Fatalf("expected SafeUnlinkLocalFile to reject symlink")
+		}
+		if _, err := os.Stat(outside); err != nil {
+			t.Fatalf("outside file must remain untouched: %v", err)
+		}
 	}
 }

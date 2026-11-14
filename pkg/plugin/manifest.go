@@ -307,6 +307,9 @@ func (m *Manifest) Validate() error {
 	}
 
 	// Validate cron definitions.
+	if len(m.Cron) > maxCronJobsPerPlugin {
+		return fmt.Errorf("plugin %q: exceeded maximum of %d cron jobs", m.ID, maxCronJobsPerPlugin)
+	}
 	seenCron := make(map[string]bool, len(m.Cron))
 	for _, c := range m.Cron {
 		if !m.HasPermission("cron") {

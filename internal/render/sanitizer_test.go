@@ -428,6 +428,67 @@ func TestLexers_RustLifetimesCppSeparatorsPythonFStringsAndHTMLProse(t *testing.
 	}
 }
 
+func TestRender_ExternalImageReferrerAndAutoDetectedCodeHighlighting(t *testing.T) {
+	eng := NewEngine()
+
+	// 1. External http(s) images emit referrerpolicy="no-referrer"; local /uploads images stay untouched.
+	imgMD := strings.Join([]string{
+		`![ext](https://gips3.baidu.com/it/u=1,2&fm=3028)`,
+		``,
+		`![local](/uploads/2026/11/sample.webp)`,
+		``,
+		`<img src="https://cdn.example.com/pic.png" alt="html-ext">`,
+		``,
+		`<img src="/uploads/2026/11/inline.png" alt="html-local">`,
+	}, "\n")
+	imgOut := eng.Render(imgMD, Options{Mode: RenderModeWeb, Locale: "zh-CN"}).HTML
+	if !strings.Contains(imgOut, `src="https://gips3.baidu.com/it/u=1,2&amp;fm=3028"`) ||
+		!strings.Contains(imgOut, `referrerpolicy="no-referrer"`) {
+		t.Fatalf("expected external Markdown image to carry referrerpolicy=\"no-referrer\", got:\n%s", imgOut)
+	}
+	if strings.Count(imgOut, `referrerpolicy="no-referrer"`) != 2 {
+		t.Fatalf("expected exactly 2 external images with referrerpolicy=\"no-referrer\" (none on local uploads), got:\n%s", imgOut)
+	}
+
+	// 2. Unlabeled Nginx, JSON, and CSS fenced code blocks auto-detect and highlight without data-lang=""
+	codeMD := strings.Join([]string{
+		"```",
+		"server {",
+		"    listen 8080;",
+		"    # setting relative redirect",
+		"    absolute_redirect off;",
+		"}",
+		"```",
+		"",
+		"```",
+		"{",
+		`  "host": "127.0.0.1",`,
+		`  "enabled": true,`,
+		`  "port": 8080`,
+		"}",
+		"```",
+		"",
+		"```",
+		":root {",
+		"  --volo-accent: #246b51;",
+		"}",
+		"```",
+	}, "\n")
+	codeOut := eng.Render(codeMD, Options{Mode: RenderModeWeb, Locale: "zh-CN"}).HTML
+	if strings.Contains(codeOut, `data-lang=""`) {
+		t.Fatalf("unlabeled code block must not emit empty data-lang=\"\":\n%s", codeOut)
+	}
+	if !strings.Contains(codeOut, `class="nt"&gt;&quot;host&quot;`) && !strings.Contains(codeOut, `<span class="nt">"host"</span>`) {
+		t.Fatalf("expected auto-detected JSON key token span (nt) in:\n%s", codeOut)
+	}
+	if !strings.Contains(codeOut, `<span class="nv">--volo-accent</span>`) || !strings.Contains(codeOut, `<span class="mh">#246b51</span>`) {
+		t.Fatalf("expected auto-detected CSS custom property / hex spans in:\n%s", codeOut)
+	}
+	if !strings.Contains(codeOut, `<span class="k">server</span>`) && !strings.Contains(codeOut, `<span class="nb">listen</span>`) {
+		t.Fatalf("expected auto-detected Nginx keyword/directive spans in:\n%s", codeOut)
+	}
+}
+
 func BenchmarkHighlightCodeHTML_MultiLang(b *testing.B) {
 	snippet := strings.Join([]string{
 		"fn process<'a, 'b>(input: &'a str, fallback: &'b str) -> Result<&'a str, String> {",

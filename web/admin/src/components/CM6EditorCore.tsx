@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { createPortal } from "preact/compat";
+import { createPortal } from "preact";
 import type { CSSProperties } from "preact";
 import { Compartment, EditorState, Prec, RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
@@ -90,6 +90,158 @@ import type { CM6CssEditorProps, CM6EditorProps } from "./CM6Editor";
 
 type EditorMode = "ir" | "wysiwyg" | "sv";
 
+const CODE_BLOCK_LANGS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "go", label: "Go" },
+  { value: "bash", label: "Bash / Shell" },
+  { value: "javascript", label: "JavaScript" },
+  { value: "typescript", label: "TypeScript" },
+  { value: "python", label: "Python" },
+  { value: "rust", label: "Rust" },
+  { value: "csharp", label: "C#" },
+  { value: "cpp", label: "C / C++" },
+  { value: "java", label: "Java" },
+  { value: "php", label: "PHP" },
+  { value: "ruby", label: "Ruby" },
+  { value: "lua", label: "Lua" },
+  { value: "dart", label: "Dart" },
+  { value: "scala", label: "Scala" },
+  { value: "zig", label: "Zig" },
+  { value: "elixir", label: "Elixir" },
+  { value: "sql", label: "SQL" },
+  { value: "graphql", label: "GraphQL" },
+  { value: "proto", label: "Protobuf" },
+  { value: "hcl", label: "HCL / Terraform" },
+  { value: "json", label: "JSON" },
+  { value: "yaml", label: "YAML" },
+  { value: "toml", label: "TOML / INI" },
+  { value: "nginx", label: "Nginx" },
+  { value: "html", label: "HTML / XML" },
+  { value: "css", label: "CSS" },
+  { value: "scss", label: "SCSS / Less" },
+  { value: "diff", label: "Diff" },
+  { value: "", label: "" },
+];
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      /* fallback for non-secure LAN contexts */
+    }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  ta.style.pointerEvents = "none";
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    ta.remove();
+  }
+}
+
+interface SearchMatchRange {
+  from: number;
+  to: number;
+}
+
+interface CMSearchState {
+  decos: DecorationSet;
+  matches: SearchMatchRange[];
+  activeIdx: number;
+}
+
+const setSearchStateEffect = StateEffect.define<{ matches: SearchMatchRange[]; activeIdx: number }>();
+
+const cmSearchHighlightField = StateField.define<CMSearchState>({
+  create: () => ({ decos: Decoration.none, matches: [], activeIdx: 0 }),
+  update(prev, tr) {
+    for (const ef of tr.effects) {
+      if (ef.is(setSearchStateEffect)) {
+        const { matches, activeIdx } = ef.value;
+        if (matches.length === 0) return { decos: Decoration.none, matches: [], activeIdx: 0 };
+        const b = new RangeSetBuilder<Decoration>();
+        const docLen = tr.state.doc.length;
+        const clamped: SearchMatchRange[] = [];
+        matches.forEach((m, idx) => {
+          const s = Math.max(0, Math.min(docLen, m.from));
+          const e = Math.max(s, Math.min(docLen, m.to));
+          clamped.push({ from: s, to: e });
+          if (s < e) {
+            b.add(
+              s,
+              e,
+              Decoration.mark({
+                class: idx === activeIdx ? "cm-searchMatch cm-searchMatch-selected" : "cm-searchMatch",
+              })
+            );
+          }
+        });
+        return { decos: b.finish(), matches: clamped, activeIdx };
+      }
+    }
+    if (!tr.docChanged || prev.matches.length === 0) return prev;
+    return {
+      decos: prev.decos.map(tr.changes),
+      matches: prev.matches.map((m) => ({
+        from: tr.changes.mapPos(m.from, 1),
+        to: tr.changes.mapPos(m.to, -1),
+      })),
+      activeIdx: prev.activeIdx,
+    };
+  },
+  provide: (f) => EditorView.decorations.from(f, (v) => v.decos),
+});
+
+function getActiveSearchLineRange(
+  state: EditorState
+): { from: number; to: number; startLine: number; endLine: number } | null {
+  const sh = state.field(cmSearchHighlightField, false);
+  if (!sh || sh.matches.length === 0) return null;
+  const idx = Math.max(0, Math.min(sh.activeIdx, sh.matches.length - 1));
+  const m = sh.matches[idx];
+  if (!m) return null;
+  const docLen = state.doc.length;
+  const from = Math.max(0, Math.min(docLen, m.from));
+  const to = Math.max(from, Math.min(docLen, m.to));
+  return {
+    from,
+    to,
+    startLine: state.doc.lineAt(from).number,
+    endLine: state.doc.lineAt(to).number,
+  };
+}
+
+function indentTwoSpaces(view: EditorView): boolean {
+  const { state } = view;
+  if (state.readOnly) return false;
+  const changes: Array<{ from: number; to: number; insert: string }> = [];
+  const seen = new Set<number>();
+  for (const r of state.selection.ranges) {
+    const startLine = state.doc.lineAt(r.from).number;
+    const endLine =
+      r.to > r.from && state.doc.lineAt(r.to).from === r.to
+        ? Math.max(startLine, state.doc.lineAt(r.to).number - 1)
+        : state.doc.lineAt(r.to).number;
+    for (let ln = startLine; ln <= endLine; ln++) {
+      if (seen.has(ln)) continue;
+      seen.add(ln);
+      const line = state.doc.line(ln);
+      changes.push({ from: line.from, to: line.from, insert: "  " });
+    }
+  }
+  if (changes.length > 0) {
+    view.dispatch({ changes, userEvent: "input.indent" });
+  }
+  return true;
+}
+
 function dedentTwoSpaces(view: EditorView): boolean {
   const { state } = view;
   if (state.readOnly) return false;
@@ -97,7 +249,10 @@ function dedentTwoSpaces(view: EditorView): boolean {
   const seen = new Set<number>();
   for (const r of state.selection.ranges) {
     const startLine = state.doc.lineAt(r.from).number;
-    const endLine = state.doc.lineAt(r.to).number;
+    const endLine =
+      r.to > r.from && state.doc.lineAt(r.to).from === r.to
+        ? Math.max(startLine, state.doc.lineAt(r.to).number - 1)
+        : state.doc.lineAt(r.to).number;
     for (let ln = startLine; ln <= endLine; ln++) {
       if (seen.has(ln)) continue;
       seen.add(ln);
@@ -119,7 +274,16 @@ function dedentTwoSpaces(view: EditorView): boolean {
 
 const voloIndentWithTab: KeyBinding = {
   key: "Tab",
-  run: insertTab,
+  run: (view) => {
+    const sel = view.state.selection.main;
+    if (!sel.empty) return indentTwoSpaces(view);
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert: "  " },
+      selection: { anchor: sel.from + 2 },
+      userEvent: "input",
+    });
+    return true;
+  },
   shift: dedentTwoSpaces,
 };
 
@@ -165,6 +329,8 @@ const voloBaseKeymap: KeyBinding[] = [
 ];
 
 interface FenceOpenMatch {
+  quotePrefixLen: number;
+  quoteDepth: number;
   leadSpaces: number;
   fenceChar: "`" | "~";
   fenceLen: number;
@@ -173,34 +339,76 @@ interface FenceOpenMatch {
   langRawLen: number;
 }
 
+function countQuotePrefix(text: string): { depth: number; len: number } {
+  const m = /^((?: {0,3}>\s?)+)/.exec(text);
+  if (!m) return { depth: 0, len: 0 };
+  return { depth: Math.min(3, (m[1].match(/>/g) || []).length), len: m[1].length };
+}
+
+function stripQuotePrefix(text: string, maxMarkers: number): { stripped: string; len: number } {
+  if (maxMarkers <= 0) return { stripped: text, len: 0 };
+  let idx = 0;
+  let count = 0;
+  while (count < maxMarkers && idx < text.length) {
+    let sp = 0;
+    while (sp < 3 && idx + sp < text.length && text[idx + sp] === " ") sp++;
+    if (text[idx + sp] !== ">") break;
+    idx += sp + 1;
+    if (text[idx] === " ") idx++;
+    count++;
+  }
+  return { stripped: text.slice(idx), len: idx };
+}
+
 function matchFenceOpen(text: string): FenceOpenMatch | null {
-  const m = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(text);
+  const m = /^((?: {0,3}>\s?)*)( {0,3})(`{3,}|~{3,})(.*)$/.exec(text);
   if (!m) return null;
-  const fenceChar = m[2][0] as "`" | "~";
-  const rest = m[3];
+  const qPrefix = m[1];
+  const qDepth = qPrefix ? Math.min(3, (qPrefix.match(/>/g) || []).length) : 0;
+  const fenceChar = m[3][0] as "`" | "~";
+  const rest = m[4];
   if (fenceChar === "`" && rest.includes("`")) return null;
   const leadTrim = /^\s*/.exec(rest)?.[0].length ?? 0;
   const langTok = /^[^\s`~]*/.exec(rest.slice(leadTrim))?.[0] ?? "";
   return {
-    leadSpaces: m[1].length,
+    quotePrefixLen: qPrefix.length,
+    quoteDepth: qDepth,
+    leadSpaces: qPrefix.length + m[2].length,
     fenceChar,
-    fenceLen: m[2].length,
+    fenceLen: m[3].length,
     lang: langTok,
-    langOffset: m[1].length + m[2].length + leadTrim,
+    langOffset: qPrefix.length + m[2].length + m[3].length + leadTrim,
     langRawLen: langTok.length,
   };
 }
 
-function matchFenceClose(text: string, fenceChar: string, fenceLen: number): boolean {
-  const m = /^( {0,3})(`{3,}|~{3,})\s*$/.exec(text);
+function matchFenceClose(text: string, fenceChar: string, fenceLen: number, fenceQuoteDepth = 0): boolean {
+  const m = /^((?: {0,3}>\s?)*)( {0,3})(`{3,}|~{3,})\s*$/.exec(text);
   if (!m) return false;
-  return m[2][0] === fenceChar && m[2].length >= fenceLen;
+  const qDepth = m[1] ? Math.min(3, (m[1].match(/>/g) || []).length) : 0;
+  return qDepth === fenceQuoteDepth && m[3][0] === fenceChar && m[3].length >= fenceLen;
 }
 
 function isInsideFencedCode(state: EditorState, lineNumber: number): boolean {
   if (lineNumber <= 1 || lineNumber > state.doc.lines) return false;
   const st = getIRDocScan(state.doc).fenceState[lineNumber] || 0;
   return st === 2 || st === 3;
+}
+
+function isInsideMathBlock(state: EditorState, lineNumber: number): boolean {
+  if (lineNumber < 1 || lineNumber > state.doc.lines) return false;
+  const scan = getIRDocScan(state.doc);
+  if (scan.mathBlocks.some((mb) => lineNumber >= mb.startLine && lineNumber <= mb.endLine)) return true;
+  let openDollar = false;
+  let openBrk = false;
+  for (let ln = 1; ln <= lineNumber; ln++) {
+    if (scan.fenceState[ln] !== 0) continue;
+    const t = state.doc.line(ln).text;
+    if (/^\s*\$\$\s*$/.test(t)) openDollar = !openDollar;
+    else if (/^\s*\\\[\s*$/.test(t)) openBrk = true;
+    else if (/^\s*\\\]\s*$/.test(t)) openBrk = false;
+  }
+  return openDollar || openBrk;
 }
 
 const mdLinePrefixRe =
@@ -217,25 +425,13 @@ function getGfmTableCellRanges(lineFrom: number, lineText: string): Array<{ from
   const trimmed = lineText.trim();
   if (!trimmed.includes("|")) return [];
   const pipePositions: number[] = [];
-  let codeTicks = 0;
   for (let i = 0; i < lineText.length; i++) {
     const ch = lineText[i];
     if (ch === "\\" && i + 1 < lineText.length && (lineText[i + 1] === "|" || lineText[i + 1] === "\\")) {
       i++;
       continue;
     }
-    if (ch === "`") {
-      let run = 1;
-      while (i + run < lineText.length && lineText[i + run] === "`") run++;
-      if (codeTicks === 0) {
-        codeTicks = run;
-      } else if (run === codeTicks) {
-        codeTicks = 0;
-      }
-      i += run - 1;
-      continue;
-    }
-    if (ch === "|" && codeTicks === 0) {
+    if (ch === "|") {
       pipePositions.push(i);
     }
   }
@@ -331,11 +527,277 @@ function navigateGfmTableCell(view: EditorView, dir: 1 | -1): boolean {
   return false;
 }
 
+const HASH_COMMENT_LANGS = new Set([
+  "py",
+  "python",
+  "sh",
+  "bash",
+  "zsh",
+  "shell",
+  "console",
+  "yaml",
+  "yml",
+  "toml",
+  "ini",
+  "conf",
+  "nginx",
+  "rb",
+  "ruby",
+  "pl",
+  "perl",
+  "r",
+  "dockerfile",
+  "makefile",
+  "env",
+]);
+
+const DASH_COMMENT_LANGS = new Set(["sql", "mysql", "postgres", "postgresql", "sqlite", "pgsql", "lua"]);
+
+function resolveEnclosingFenceLang(state: EditorState, lineNumber: number): string {
+  const scan = getIRDocScan(state.doc);
+  if ((scan.fenceState[lineNumber] || 0) !== 2) return "";
+  for (let ln = lineNumber - 1; ln >= 1; ln--) {
+    if (scan.fenceState[ln] === 1) {
+      const open = matchFenceOpen(state.doc.line(ln).text);
+      return (open?.lang || scan.fenceAutoLang.get(ln) || "code").toLowerCase();
+    }
+    if (scan.fenceState[ln] !== 2) break;
+  }
+  return "code";
+}
+
+function toggleEditorComment(view: EditorView, cssOnly = false): boolean {
+  const { state } = view;
+  if (state.readOnly) return false;
+  const sel = state.selection.main;
+  const startLn = state.doc.lineAt(sel.from).number;
+  const endLn =
+    sel.to > sel.from && state.doc.lineAt(sel.to).from === sel.to
+      ? Math.max(startLn, state.doc.lineAt(sel.to).number - 1)
+      : state.doc.lineAt(sel.to).number;
+
+  let blockPair: [string, string] | null = null;
+  let lineTok = "";
+  if (cssOnly) {
+    blockPair = ["/* ", " */"];
+  } else {
+    const fLang = resolveEnclosingFenceLang(state, startLn);
+    if (!fLang || fLang === "html" || fLang === "xml" || fLang === "svg" || fLang === "md" || fLang === "markdown") {
+      blockPair = ["<!-- ", " -->"];
+    } else if (fLang === "css") {
+      blockPair = ["/* ", " */"];
+    } else if (HASH_COMMENT_LANGS.has(fLang)) {
+      lineTok = "#";
+    } else if (DASH_COMMENT_LANGS.has(fLang)) {
+      lineTok = "--";
+    } else {
+      lineTok = "//";
+    }
+  }
+
+  if (lineTok) {
+    const lines: Array<{ from: number; text: string }> = [];
+    let allCommented = true;
+    let hasNonEmpty = false;
+    let minIndent = Infinity;
+    const tokEsc = lineTok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const checkRe = new RegExp(`^([ \\t]*)${tokEsc} ?`);
+    for (let ln = startLn; ln <= endLn; ln++) {
+      const l = state.doc.line(ln);
+      lines.push({ from: l.from, text: l.text });
+      if (!l.text.trim()) continue;
+      hasNonEmpty = true;
+      const leadLen = /^[ \t]*/.exec(l.text)?.[0].length ?? 0;
+      if (leadLen < minIndent) minIndent = leadLen;
+      if (!checkRe.test(l.text)) allCommented = false;
+    }
+    if (!hasNonEmpty) {
+      const l = state.doc.line(startLn);
+      const ins = `${lineTok} `;
+      view.dispatch({
+        changes: { from: l.from, to: l.from, insert: ins },
+        selection: { anchor: l.from + ins.length },
+        userEvent: "input",
+      });
+      return true;
+    }
+    const changes: Array<{ from: number; to: number; insert: string }> = [];
+    for (const l of lines) {
+      if (!l.text.trim()) continue;
+      if (allCommented) {
+        const m = checkRe.exec(l.text);
+        if (m) {
+          changes.push({ from: l.from + m[1].length, to: l.from + m[0].length, insert: "" });
+        }
+      } else {
+        const pos = l.from + (Number.isFinite(minIndent) ? minIndent : 0);
+        changes.push({ from: pos, to: pos, insert: `${lineTok} ` });
+      }
+    }
+    if (changes.length > 0) view.dispatch({ changes, userEvent: "input" });
+    return true;
+  }
+
+  const [openTok, closeTok] = blockPair!;
+  const openTrim = openTok.trim();
+  const closeTrim = closeTok.trim();
+  if (!sel.empty && startLn === endLn) {
+    const raw = state.sliceDoc(sel.from, sel.to);
+    if (raw.startsWith(openTrim) && raw.endsWith(closeTrim) && raw.length >= openTrim.length + closeTrim.length) {
+      const inner = raw.slice(openTrim.length, raw.length - closeTrim.length).replace(/^ | $/g, "");
+      view.dispatch({
+        changes: { from: sel.from, to: sel.to, insert: inner },
+        selection: { anchor: sel.from, head: sel.from + inner.length },
+        userEvent: "input",
+      });
+      return true;
+    }
+  }
+  const changes: Array<{ from: number; to: number; insert: string }> = [];
+  for (let ln = startLn; ln <= endLn; ln++) {
+    const l = state.doc.line(ln);
+    const trimmed = l.text.trim();
+    if (!trimmed && startLn !== endLn) continue;
+    const lead = /^[ \t]*/.exec(l.text)?.[0] || "";
+    const trail = /[ \t]*$/.exec(l.text)?.[0] || "";
+    const bodyFrom = l.from + lead.length;
+    const bodyTo = l.to - trail.length;
+    if (trimmed.startsWith(openTrim) && trimmed.endsWith(closeTrim) && trimmed.length >= openTrim.length + closeTrim.length) {
+      const inner = trimmed.slice(openTrim.length, trimmed.length - closeTrim.length).replace(/^ | $/g, "");
+      changes.push({ from: bodyFrom, to: bodyTo, insert: inner });
+    } else {
+      changes.push({ from: bodyFrom, to: bodyTo, insert: `${openTok}${trimmed}${closeTok}` });
+    }
+  }
+  if (changes.length > 0) view.dispatch({ changes, userEvent: "input" });
+  return true;
+}
+
+const CODE_AUTO_PAIRS: Record<string, string> = {
+  "(": ")",
+  "[": "]",
+  "{": "}",
+  '"': '"',
+  "'": "'",
+  "`": "`",
+};
+
+const MD_WRAP_PAIRS: Record<string, string> = {
+  ...CODE_AUTO_PAIRS,
+  "*": "*",
+  "~": "~",
+  "=": "=",
+  "$": "$",
+};
+
+const CLOSING_SKIP_CHARS = new Set([")", "]", "}", '"', "'", "`"]);
+
+function buildSmartTypingExt(cssOnly = false): Extension {
+  return EditorView.inputHandler.of((view, from, to, text) => {
+    if (view.composing || text.length !== 1 || view.state.readOnly || view.state.selection.ranges.length !== 1) {
+      return false;
+    }
+    const doc = view.state.doc;
+    const line = doc.lineAt(from);
+    const inCode = cssOnly || isInsideFencedCode(view.state, line.number);
+
+    // 1. Wrap non-empty single-line selection with matching pair instead of overwriting
+    if (from < to && to <= line.to) {
+      const closeCh = (inCode ? CODE_AUTO_PAIRS : MD_WRAP_PAIRS)[text];
+      if (closeCh) {
+        const selected = view.state.sliceDoc(from, to);
+        view.dispatch({
+          changes: { from, to, insert: `${text}${selected}${closeCh}` },
+          selection: { anchor: from + 1, head: to + 1 },
+          userEvent: "input.type",
+        });
+        return true;
+      }
+      return false;
+    }
+
+    // 2. Inside fenced code / CSS editor: skip-over closing delimiter & auto-close opening delimiter
+    if (from === to && inCode) {
+      const nextCh = from < line.to ? view.state.sliceDoc(from, from + 1) : "";
+      const prevCh = from > line.from ? view.state.sliceDoc(from - 1, from) : "";
+      if (CLOSING_SKIP_CHARS.has(text) && nextCh === text && prevCh !== "\\") {
+        if ((text === '"' || text === "'" || text === "`") && prevCh === text) {
+          // Empty pair "|": step out cleanly
+          view.dispatch({ selection: { anchor: from + 1 }, userEvent: "select" });
+          return true;
+        }
+        if (text === ")" || text === "]" || text === "}") {
+          view.dispatch({ selection: { anchor: from + 1 }, userEvent: "select" });
+          return true;
+        }
+      }
+      const closeCh = CODE_AUTO_PAIRS[text];
+      if (closeCh && (!nextCh || /^[\s)\]};,:>]$/.test(nextCh))) {
+        if ((text === '"' || text === "'" || text === "`") && /[A-Za-z0-9_\\]/.test(prevCh)) {
+          return false;
+        }
+        view.dispatch({
+          changes: { from, to, insert: `${text}${closeCh}` },
+          selection: { anchor: from + 1 },
+          userEvent: "input.type",
+        });
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+function expandIndentedBracesOnEnter(view: EditorView): boolean {
+  const { state } = view;
+  if (state.readOnly || state.selection.ranges.length !== 1 || !state.selection.main.empty) return false;
+  const pos = state.selection.main.head;
+  const line = state.doc.lineAt(pos);
+  if (pos <= line.from || pos >= line.to) return false;
+  const prev = state.sliceDoc(pos - 1, pos);
+  const next = state.sliceDoc(pos, pos + 1);
+  if ((prev === "{" && next === "}") || (prev === "[" && next === "]") || (prev === "(" && next === ")")) {
+    const indent = /^[ \t]*/.exec(line.text)?.[0] || "";
+    const innerLine = `\n${indent}  `;
+    const closeLine = `\n${indent}`;
+    view.dispatch({
+      changes: { from: pos, to: pos, insert: `${innerLine}${closeLine}` },
+      selection: { anchor: pos + innerLine.length },
+      scrollIntoView: true,
+      userEvent: "input",
+    });
+    return true;
+  }
+  return false;
+}
+
 const markdownEditingKeymap: KeyBinding[] = [
   {
     key: "Tab",
-    run: (view) => navigateGfmTableCell(view, 1),
-    shift: (view) => navigateGfmTableCell(view, -1),
+    run: (view) => {
+      if (navigateGfmTableCell(view, 1)) return true;
+      const { state } = view;
+      if (state.readOnly) return false;
+      const sel = state.selection.main;
+      const fromLn = state.doc.lineAt(sel.from).number;
+      const toLn = state.doc.lineAt(sel.to).number;
+      if (fromLn !== toLn) return indentTwoSpaces(view);
+      const line = state.doc.line(fromLn);
+      if (!isInsideFencedCode(state, fromLn) && /^\s*(?:[-*+]|\d+[.)])\s/.test(line.text)) {
+        return indentTwoSpaces(view);
+      }
+      if (!sel.empty) return indentTwoSpaces(view);
+      view.dispatch({
+        changes: { from: sel.from, to: sel.to, insert: "  " },
+        selection: { anchor: sel.from + 2 },
+        userEvent: "input",
+      });
+      return true;
+    },
+    shift: (view) => {
+      if (navigateGfmTableCell(view, -1)) return true;
+      return dedentTwoSpaces(view);
+    },
   },
   {
     key: "Enter",
@@ -346,7 +808,9 @@ const markdownEditingKeymap: KeyBinding[] = [
       }
       const pos = state.selection.main.head;
       const line = state.doc.lineAt(pos);
-      if (isInsideFencedCode(state, line.number)) return false;
+      if (isInsideFencedCode(state, line.number)) {
+        return expandIndentedBracesOnEnter(view);
+      }
 
       const beforeCursor = line.text.slice(0, pos - line.from);
       const afterCursor = line.text.slice(pos - line.from);
@@ -356,8 +820,26 @@ const markdownEditingKeymap: KeyBinding[] = [
       const hasMarker = Boolean(quotePrefix.trim() || bullet || ordNum);
       if (!hasMarker) return false;
 
-      // Empty list item / empty blockquote line -> exit block cleanly
+      // Empty list item / empty blockquote line -> step out one nesting level or exit block cleanly
       if (!restBefore.trim() && !afterCursor.trim()) {
+        if ((bullet || ordNum) && quotePrefix.trim()) {
+          view.dispatch({
+            changes: { from: line.from, to: line.to, insert: quotePrefix },
+            selection: { anchor: line.from + quotePrefix.length },
+            userEvent: "input",
+          });
+          return true;
+        }
+        const qCount = (quotePrefix.match(/>/g) || []).length;
+        if (qCount >= 2) {
+          const outerQuote = quotePrefix.replace(/>\s*$/, "");
+          view.dispatch({
+            changes: { from: line.from, to: line.to, insert: outerQuote },
+            selection: { anchor: line.from + outerQuote.length },
+            userEvent: "input",
+          });
+          return true;
+        }
         view.dispatch({
           changes: { from: line.from, to: line.to, insert: "" },
           selection: { anchor: line.from },
@@ -390,7 +872,22 @@ const markdownEditingKeymap: KeyBinding[] = [
       }
       const pos = state.selection.main.head;
       const line = state.doc.lineAt(pos);
-      if (pos === line.from || isInsideFencedCode(state, line.number)) return false;
+      if (pos === line.from) return false;
+      if (isInsideFencedCode(state, line.number)) {
+        if (pos < line.to) {
+          const prevCh = state.sliceDoc(pos - 1, pos);
+          const nextCh = state.sliceDoc(pos, pos + 1);
+          if (CODE_AUTO_PAIRS[prevCh] === nextCh) {
+            view.dispatch({
+              changes: { from: pos - 1, to: pos + 1, insert: "" },
+              selection: { anchor: pos - 1 },
+              userEvent: "delete.backward",
+            });
+            return true;
+          }
+        }
+        return false;
+      }
       const before = line.text.slice(0, pos - line.from);
       if (/^\s*(?:>\s*)+(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)?$/.test(before) ||
           /^\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)$/.test(before)) {
@@ -570,18 +1067,59 @@ function ensureEditorMermaid(): Promise<any> {
   return editorMermaidPromise;
 }
 
+let mermaidThemeObserverInstalled = false;
+let lastMermaidThemeDark: boolean | null = null;
+
+function isEffectiveMermaidDark(): boolean {
+  if (typeof document === "undefined") return false;
+  const attr = document.documentElement.getAttribute("data-theme");
+  if (attr === "dark") return true;
+  if (attr === "light") return false;
+  return typeof window !== "undefined" && Boolean(window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+}
+
+function ensureMermaidThemeObserver(): void {
+  if (mermaidThemeObserverInstalled || typeof document === "undefined") return;
+  mermaidThemeObserverInstalled = true;
+  lastMermaidThemeDark = isEffectiveMermaidDark();
+  let rafId = 0;
+  const checkThemeChange = () => {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(() => {
+      rafId = 0;
+      const nextDark = isEffectiveMermaidDark();
+      if (nextDark === lastMermaidThemeDark) return;
+      lastMermaidThemeDark = nextDark;
+      const targets = document.querySelectorAll<HTMLElement>("[data-mermaid-code]");
+      targets.forEach((el) => {
+        const code = el.getAttribute("data-mermaid-code") || "";
+        if (code) renderMermaidSvg(code, el);
+      });
+    });
+  };
+  const mo = new MutationObserver(checkThemeChange);
+  mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  const mql = window.matchMedia?.("(prefers-color-scheme: dark)");
+  mql?.addEventListener?.("change", checkThemeChange);
+}
+
 function renderMermaidSvg(code: string, target: HTMLElement, onReady?: () => void): void {
   const trimmed = code.trim();
   if (!trimmed) {
+    target.removeAttribute("data-mermaid-code");
     target.textContent = "";
     return;
   }
-  target.textContent = trimmed;
+  ensureMermaidThemeObserver();
+  target.setAttribute("data-mermaid-code", trimmed);
+  if (!target.querySelector("svg")) {
+    target.textContent = trimmed;
+  }
   target.classList.add("cm-ir-mermaid-pending");
   void ensureEditorMermaid()
     .then(async (mermaid) => {
       if (!mermaid || !target.isConnected) return;
-      const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+      const isDark = isEffectiveMermaidDark();
       mermaid.initialize({
         startOnLoad: false,
         theme: isDark ? "dark" : "default",
@@ -608,10 +1146,28 @@ function renderMermaidSvg(code: string, target: HTMLElement, onReady?: () => voi
     });
 }
 
-function enhanceRenderedPreviewDOM(
+export function enhanceRenderedPreviewDOM(
   root: HTMLElement,
-  opts: { isWysiwyg?: boolean; copyLabel?: string; copiedLabel?: string } = {}
+  opts: {
+    isWysiwyg?: boolean;
+    copyLabel?: string;
+    copiedLabel?: string;
+    plainLabel?: string;
+    onLangChange?: () => void;
+  } = {}
 ): void {
+  // 0. Ensure external images bypass strict hotlink Referer checks and fix &amp;-escaped URLs
+  root.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
+    const rawSrc = img.getAttribute("src") || "";
+    const cleaned = cleanClipboardUrl(rawSrc) || rawSrc.trim();
+    if (cleaned && cleaned !== rawSrc) {
+      img.setAttribute("src", cleaned);
+    }
+    if (cleaned && !/^(?:\/(?!\/)|data:|blob:)/i.test(cleaned)) {
+      img.referrerPolicy = "no-referrer";
+    }
+  });
+
   // 1. KaTeX math blocks & inline spans (preserving data-math-src for lossless WYSIWYG round-tripping)
   const mathNodes = Array.from(root.querySelectorAll<HTMLElement>(".volo-math-block, .volo-math-inline"));
   if (mathNodes.length > 0) {
@@ -667,7 +1223,7 @@ function enhanceRenderedPreviewDOM(
     }
   }
 
-  // 3. Split Preview visual boundary markers (<!--more-->, :::lock) & code copy buttons
+  // 3. Split Preview visual boundary markers (<!--more-->, :::lock)
   if (!opts.isWysiwyg) {
     for (const p of Array.from(root.querySelectorAll<HTMLElement>("p"))) {
       if ((p.textContent || "").trim() === "§VOLO_MORE_MARKER§") {
@@ -689,30 +1245,141 @@ function enhanceRenderedPreviewDOM(
       marker.appendChild(span);
       lk.prepend(marker);
     }
-    const copyTxt = opts.copyLabel || "Copy";
-    const copiedTxt = opts.copiedLabel || "Copied";
-    for (const pre of Array.from(root.querySelectorAll<HTMLElement>("pre:not(.mermaid)"))) {
-      if (pre.querySelector(".volo-ed-code-copy")) continue;
-      pre.style.position = "relative";
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "volo-ed-code-copy";
-      btn.textContent = copyTxt;
-      btn.onclick = (ev) => {
-        ev.preventDefault();
+  }
+
+  // 4. Unified Code Block Header (.volo-code-block + .volo-code-head) in Split Preview & WYSIWYG
+  const copyTxt = opts.copyLabel || "Copy";
+  const copiedTxt = opts.copiedLabel || "Copied";
+  const plainTxt = opts.plainLabel || "CODE";
+  for (const pre of Array.from(root.querySelectorAll<HTMLElement>("pre:not(.mermaid)"))) {
+    const fig = pre.closest("figure.volo-codeblock") as HTMLElement | null;
+    const container = fig || pre.parentElement;
+    if (fig && fig.querySelector(":scope > .volo-code-head")) continue;
+    if (!fig && container?.classList.contains("volo-code-block")) continue;
+
+    const codeEl = pre.querySelector("code");
+    const cls = `${pre.className || ""} ${codeEl?.className || ""}`;
+    const langMatch = /(?:language|lang)-([a-zA-Z0-9_+#.-]+)/.exec(cls);
+    const explicitLang = (
+      fig?.getAttribute("data-lang") ||
+      pre.getAttribute("data-lang") ||
+      codeEl?.getAttribute("data-lang") ||
+      (langMatch ? langMatch[1] : "")
+    )
+      .trim()
+      .toLowerCase();
+    const detectedLang = (
+      fig?.getAttribute("data-detected-lang") ||
+      pre.getAttribute("data-detected-lang") ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+    let host: HTMLElement;
+    if (fig) {
+      fig.classList.add("volo-code-block");
+      host = fig;
+    } else {
+      const wrap = document.createElement("figure");
+      wrap.className = "volo-codeblock volo-code-block";
+      if (explicitLang) wrap.setAttribute("data-lang", explicitLang);
+      if (detectedLang) wrap.setAttribute("data-detected-lang", detectedLang);
+      pre.replaceWith(wrap);
+      wrap.appendChild(pre);
+      host = wrap;
+    }
+
+    const head = document.createElement("div");
+    head.className = "volo-code-head";
+    head.contentEditable = "false";
+
+    if (opts.isWysiwyg) {
+      const select = document.createElement("select");
+      select.className = "volo-code-lang-select";
+      select.setAttribute("aria-label", t("ed.code_lang_ph"));
+      const seenVals = new Set<string>();
+      for (const item of CODE_BLOCK_LANGS) {
+        seenVals.add(item.value);
+        const opt = document.createElement("option");
+        opt.value = item.value;
+        opt.textContent =
+          item.value === ""
+            ? detectedLang
+              ? `${detectedLang.toUpperCase()} · auto`
+              : plainTxt
+            : item.label;
+        select.appendChild(opt);
+      }
+      if (explicitLang && !seenVals.has(explicitLang)) {
+        const customOpt = document.createElement("option");
+        customOpt.value = explicitLang;
+        customOpt.textContent = explicitLang.toUpperCase();
+        select.insertBefore(customOpt, select.firstChild);
+      }
+      select.value = explicitLang;
+      select.onchange = (ev) => {
         ev.stopPropagation();
-        const clone = (pre.querySelector("code") || pre).cloneNode(true) as HTMLElement;
-        clone.querySelectorAll(".ln, .lnt, .volo-ed-code-copy").forEach((n) => n.remove());
-        void navigator.clipboard?.writeText(clone.textContent || "").then(() => {
-          btn.textContent = copiedTxt;
-          window.setTimeout(() => {
-            if (btn.isConnected) btn.textContent = copyTxt;
-          }, 1400);
-        });
+        const nextLang = select.value.trim().toLowerCase();
+        if (nextLang) host.setAttribute("data-lang", nextLang);
+        else host.removeAttribute("data-lang");
+        opts.onLangChange?.();
       };
-      pre.appendChild(btn);
+      head.appendChild(select);
+    } else {
+      const langSpan = document.createElement("span");
+      langSpan.className = "volo-code-lang";
+      if (!explicitLang) langSpan.setAttribute("data-auto-lang", "1");
+      langSpan.textContent = (explicitLang || detectedLang || "code").toUpperCase();
+      head.appendChild(langSpan);
+    }
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "volo-copy-btn";
+    btn.textContent = copyTxt;
+    btn.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const clone = (pre.querySelector("code") || pre).cloneNode(true) as HTMLElement;
+      clone.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
+      void copyTextToClipboard((clone.textContent || "").replace(/\u00a0/g, " ")).then(() => {
+        const prevTimer = (btn as any)._copyTimer;
+        if (prevTimer) window.clearTimeout(prevTimer);
+        btn.setAttribute("data-copied", "true");
+        btn.textContent = `✓ ${copiedTxt}`;
+        (btn as any)._copyTimer = window.setTimeout(() => {
+          (btn as any)._copyTimer = 0;
+          if (btn.isConnected) {
+            btn.removeAttribute("data-copied");
+            btn.textContent = copyTxt;
+          }
+        }, 1400);
+      });
+    };
+    head.appendChild(btn);
+    host.insertBefore(head, host.firstChild);
+  }
+}
+
+function cleanClipboardUrl(raw: string): string {
+  let s = raw.replace(/[\u200b-\u200d\ufeff]/g, "").trim();
+  if (!s || /^(?:javascript|vbscript):/i.test(s)) return "";
+  if (/^data:/i.test(s) && !/^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(s)) {
+    return "";
+  }
+  if (/^(?:https?:\/\/|\/\/|\/)/i.test(s)) {
+    for (let pass = 0; pass < 2 && s.includes("&amp;"); pass++) {
+      s = s.replace(/&amp;/gi, "&");
     }
   }
+  return s;
+}
+
+function escapeMdLinkLabel(label: string): string {
+  return label.replace(/\\([[\]])|([[\]])/g, (_, esc: string | undefined, br: string | undefined) =>
+    esc ? `\\${esc}` : `\\${br}`
+  );
 }
 
 function parseMarkdownImageTarget(rawTarget: string): string {
@@ -725,11 +1392,15 @@ function parseMarkdownImageTarget(rawTarget: string): string {
 }
 
 function resolveIRImageSrc(rawSrc: string): string {
-  const s = rawSrc.trim();
+  let s = rawSrc.trim();
   if (!s || s.startsWith("//") || s.startsWith("/\\")) return "";
   if (/^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(s)) return s;
   if (/^(?:javascript|vbscript|data|file):/i.test(s)) return "";
-  if (/^(?:https?:\/\/|blob:|\/)/i.test(s)) return s;
+  if (/^https?:\/\//i.test(s)) {
+    s = cleanClipboardUrl(s);
+    return s;
+  }
+  if (/^(?:blob:|\/)/i.test(s)) return s;
   if (s.startsWith("./")) return "/" + s.slice(2).replace(/^\/+/, "");
   if (/^(?:image|images|uploads)\//i.test(s)) return "/" + s;
   return s;
@@ -748,6 +1419,7 @@ function isAudioMedia(mime?: string, url?: string): boolean {
 }
 
 const irFocusEffect = StateEffect.define<boolean>();
+const irImgDimReadyEffect = StateEffect.define<string>();
 const irFocusedField = StateField.define<boolean>({
   create: () => false,
   update(val, tr) {
@@ -757,6 +1429,18 @@ const irFocusedField = StateField.define<boolean>({
     return val;
   },
 });
+
+interface IRImageSpan {
+  lineNumber: number;
+  spanFrom: number;
+  spanTo: number;
+  imgFrom: number;
+  imgTo: number;
+  resolvedSrc: string;
+  rawTarget: string;
+  alt: string;
+  href: string;
+}
 
 interface IRTableBlock {
   kind: "html" | "md";
@@ -798,13 +1482,28 @@ interface IRDocScan {
   mathBlocks: IRMathBlock[];
   tableLines: Set<number>;
   multiLinks: IRMultiLinkSpan[];
+  images: IRImageSpan[];
   fenceState: Uint8Array;
   fenceNoHash: Uint8Array;
+  /** 0=generic, 1=c/go/js/ts/rs, 2=sh/py/yaml/nginx/toml, 3=json, 4=html/xml, 5=css, 6=diff, 7=sql */
+  fenceFam: Uint8Array;
+  /** 1 when line enters inside an unclosed multi-line block comment (`/*…* /` or `<!--…-->`) */
+  fenceBlockCmt: Uint8Array;
+  /** On fence open line (`fenceState === 1`), stores closing line number (or 0 if unclosed) */
+  fenceEndLine: Int32Array;
+  /** Auto-detected language name for unlabeled fences (`fenceStartLn -> lang`) */
+  fenceAutoLang: Map<number, string>;
   calloutKind: Uint8Array;
+  /** Nesting depth of `>` blockquote markers (`0..3`) */
+  quoteDepth: Uint8Array;
+  /** Bitmask on quote lines: `1` = first line of quote card, `2` = last line of quote card */
+  quoteEdge: Uint8Array;
   /** 0 = none, 1 = center, 2 = right, 3 = left — lines inside a multi-line `<div align=…>` / `<center>` block */
   alignKind: Uint8Array;
   /** 1 on the standalone opening / closing tag lines of such a block (hidden off-cursor in IR mode) */
   alignTagLine: Uint8Array;
+  /** 0 = none, 1 = opening `:::lock`, 2 = inner line, 3 = closing `:::` */
+  lockState: Uint8Array;
 }
 
 const NO_HASH_COMMENT_LANGS = new Set([
@@ -816,7 +1515,14 @@ const NO_HASH_COMMENT_LANGS = new Set([
   "h",
   "hpp",
   "cs",
+  "c#",
   "csharp",
+  "fs",
+  "f#",
+  "fsharp",
+  "vb",
+  "vb.net",
+  "vbnet",
   "go",
   "golang",
   "js",
@@ -835,15 +1541,29 @@ const NO_HASH_COMMENT_LANGS = new Set([
   "rust",
   "rs",
   "zig",
+  "lua",
+  "proto",
+  "protobuf",
   "css",
   "scss",
   "less",
   "html",
+  "htm",
   "xml",
   "svg",
+  "vue",
+  "svelte",
   "json",
   "jsonc",
+  "json5",
   "sql",
+  "mysql",
+  "postgres",
+  "postgresql",
+  "sqlite",
+  "pgsql",
+  "diff",
+  "patch",
   "glsl",
   "hlsl",
   "wgsl",
@@ -851,6 +1571,314 @@ const NO_HASH_COMMENT_LANGS = new Set([
   "groovy",
   "objc",
 ]);
+
+function resolveFenceLangFamily(lang: string): number {
+  switch (lang) {
+    case "json":
+    case "jsonc":
+    case "json5":
+      return 3;
+    case "html":
+    case "htm":
+    case "xml":
+    case "svg":
+    case "vue":
+    case "svelte":
+      return 4;
+    case "css":
+    case "scss":
+    case "less":
+      return 5;
+    case "diff":
+    case "patch":
+      return 6;
+    case "sql":
+    case "mysql":
+    case "postgres":
+    case "postgresql":
+    case "sqlite":
+    case "pgsql":
+      return 7;
+    case "lua":
+      return 8;
+    case "graphql":
+    case "gql":
+      return 9;
+    case "proto":
+    case "protobuf":
+      return 10;
+    case "sh":
+    case "bash":
+    case "zsh":
+    case "shell":
+    case "console":
+    case "py":
+    case "python":
+    case "rb":
+    case "ruby":
+    case "elixir":
+    case "ex":
+    case "exs":
+    case "hcl":
+    case "terraform":
+    case "tf":
+    case "yaml":
+    case "yml":
+    case "toml":
+    case "ini":
+    case "conf":
+    case "nginx":
+    case "env":
+    case "dockerfile":
+    case "makefile":
+    case "perl":
+    case "pl":
+    case "r":
+      return 2;
+    case "c":
+    case "cpp":
+    case "c++":
+    case "cc":
+    case "cxx":
+    case "h":
+    case "hpp":
+    case "cs":
+    case "c#":
+    case "csharp":
+    case "fs":
+    case "f#":
+    case "fsharp":
+    case "vb":
+    case "vb.net":
+    case "vbnet":
+    case "go":
+    case "golang":
+    case "js":
+    case "jsx":
+    case "javascript":
+    case "mjs":
+    case "cjs":
+    case "ts":
+    case "tsx":
+    case "typescript":
+    case "java":
+    case "kotlin":
+    case "kt":
+    case "swift":
+    case "dart":
+    case "rust":
+    case "rs":
+    case "zig":
+    case "scala":
+    case "php":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function detectIRCodeLang(
+  linesText: string[],
+  startLn: number,
+  endLn: number
+): { lang: string; fam: number; noHash: number } {
+  if (startLn > endLn) return { lang: "", fam: 0, noHash: 0 };
+  const sampleLines: string[] = [];
+  let charBudget = 0;
+  for (let k = startLn; k <= endLn && sampleLines.length < 32 && charBudget < 2400; k++) {
+    const t = linesText[k];
+    if (t.trim()) {
+      sampleLines.push(t);
+      charBudget += t.length + 1;
+    }
+  }
+  if (sampleLines.length === 0) return { lang: "", fam: 0, noHash: 0 };
+  const sample = sampleLines.join("\n");
+  const first = sampleLines[0].trim();
+
+  if (/^(?:diff --git\b|---\s+\S|\+\+\+\s+\S|@@\s+-\d+)/m.test(sample)) {
+    return { lang: "diff", fam: 6, noHash: 1 };
+  }
+  if (/^(?:<!DOCTYPE\s+html\b|<\?xml\b|<(?:html|head|body|div|section|template|svg|script|style|table|form|main|article)\b)/i.test(first)) {
+    return { lang: first.startsWith("<?xml") ? "xml" : "html", fam: 4, noHash: 1 };
+  }
+  if ((first.startsWith("{") || first.startsWith("[")) && /"[^"\n]+"\s*:/.test(sample)) {
+    return { lang: "json", fam: 3, noHash: 1 };
+  }
+  if (/^\s*(?:SELECT\b[\s\S]*\bFROM\b|INSERT\s+INTO\b|UPDATE\s+\w+\s+SET\b|DELETE\s+FROM\b|CREATE\s+(?:TABLE|INDEX|VIEW|DATABASE)\b|ALTER\s+TABLE\b)/im.test(sample)) {
+    return { lang: "sql", fam: 7, noHash: 1 };
+  }
+  if (
+    /\b(?:server\s*\{|location\s+[~^=*\s/]|proxy_pass\s+|fastcgi_pass\s+|upstream\s+\w+|listen\s+\d+|server_name\s+|absolute_redirect\s+(?:on|off)|proxy_set_header\s+)/.test(
+      sample
+    )
+  ) {
+    return { lang: "nginx", fam: 2, noHash: 0 };
+  }
+  if (
+    /(?:^\s*(?:@media|@keyframes|:root|\.[a-zA-Z_-][\w-]*\s*[,{]|#[a-zA-Z_-][\w-]*\s*[,{]))/m.test(sample) &&
+    /[a-z-]+\s*:\s*[^;\n]+;/.test(sample)
+  ) {
+    return { lang: "css", fam: 5, noHash: 1 };
+  }
+  if (/\b(?:package\s+[a-z_]\w*|func\s+(?:\([^)]+\)\s*)?[A-Za-z_]\w*\s*\(|fmt\.Print|if\s+err\s*!=\s*nil\b)/.test(sample)) {
+    return { lang: "go", fam: 1, noHash: 1 };
+  }
+  if (/\b(?:fn\s+[a-z_]\w*\s*[<(]|let\s+mut\s+|impl\b|pub\s+(?:fn|struct|enum|use)\b|println!\s*\()/.test(sample)) {
+    return { lang: "rust", fam: 1, noHash: 1 };
+  }
+  if (/^\s*syntax\s*=\s*["']proto[23]["']/m.test(sample) || /\b(?:message|service)\s+[A-Z]\w*\s*\{/.test(sample)) {
+    return { lang: "proto", fam: 10, noHash: 1 };
+  }
+  if (/^<\?php\b/m.test(sample) || (/\$[A-Za-z_]\w*\s*=/.test(sample) && /->|::|\bfunction\b/.test(sample))) {
+    return { lang: "php", fam: 1, noHash: 0 };
+  }
+  if (/^\s*(?:query|mutation|subscription|fragment\s+\w+\s+on|type\s+\w+\s*(?:implements\s+\w+\s*)?\{)/m.test(sample)) {
+    return { lang: "graphql", fam: 9, noHash: 0 };
+  }
+  if (/^\s*#\s*(?:include|define|ifdef|ifndef|pragma)\b/m.test(sample) || /\b(?:std::|int\s+main\s*\()/.test(sample)) {
+    return { lang: "cpp", fam: 1, noHash: 1 };
+  }
+  if (/\b(?:local\s+[A-Za-z_]\w*\s*=|elseif\b.*\bthen\b|function\s+[A-Za-z_][\w.:]*\s*\([\s\S]*?\bend\b)/.test(sample)) {
+    return { lang: "lua", fam: 8, noHash: 1 };
+  }
+  if (/^\s*(?:def\s+[A-Za-z_]\w*\s*\(|from\s+[A-Za-z_][\w.]*\s+import\s+|elif\s+.+:|if\s+__name__\s*==)/m.test(sample)) {
+    return { lang: "python", fam: 2, noHash: 0 };
+  }
+  if (/\b(?:def\s+[a-z_]\w*[?!]?|attr_accessor\b|require\s+['"]|puts\s+|elsif\b)/.test(sample) && /\bend\b/.test(sample)) {
+    return { lang: "ruby", fam: 2, noHash: 0 };
+  }
+  if (/\b(?:const\s+\w+\s*=|let\s+\w+\s*=|export\s+(?:default|function|const|interface|type|class)\b|import\s+.+\s+from\s+['"]|console\.\w+\()/.test(sample)) {
+    return { lang: /\b(?:interface\s+\w+|:\s*(?:string|number|boolean|Record|ReadonlyArray)\b)/.test(sample) ? "typescript" : "javascript", fam: 1, noHash: 1 };
+  }
+  if (/^(?:#!\/(?:usr\/bin\/env\s+)?(?:ba|z)?sh\b|\s*(?:sudo|apt|apt-get|yum|dnf|docker|kubectl|systemctl|git|npm|pnpm|curl|wget|chmod|chown|mkdir|export)\s+)/m.test(sample)) {
+    return { lang: "bash", fam: 2, noHash: 0 };
+  }
+  if (
+    !sample.includes("{") &&
+    !sample.includes(";") &&
+    sampleLines.filter((l) => /^\s*(?:-\s+)?[A-Za-z0-9_.-]+:\s*(?:\S|$)/.test(l)).length >= 2
+  ) {
+    return { lang: "yaml", fam: 2, noHash: 0 };
+  }
+  return { lang: "", fam: 0, noHash: 0 };
+}
+
+function populateFenceBlockMeta(
+  linesText: string[],
+  startLn: number,
+  endLn: number,
+  fam: number,
+  noHash: number,
+  qDepth: number,
+  fenceFam: Uint8Array,
+  fenceNoHash: Uint8Array,
+  fenceBlockCmt: Uint8Array
+): void {
+  const supportsHtmlCmt = fam === 4;
+  const supportsLuaCmt = fam === 8;
+  const supportsSlashCmt = fam === 0 || fam === 1 || fam === 3 || fam === 5 || fam === 7 || fam === 10;
+  let inBlock = false;
+
+  for (let k = startLn; k <= endLn; k++) {
+    fenceFam[k] = fam;
+    fenceNoHash[k] = noHash;
+    fenceBlockCmt[k] = inBlock ? 1 : 0;
+    const rawLine = linesText[k];
+    if (!rawLine || rawLine.length > 1600) continue;
+    const s = qDepth > 0 ? stripQuotePrefix(rawLine, qDepth).stripped : rawLine;
+    if (!s) continue;
+
+    if (supportsHtmlCmt) {
+      let i = 0;
+      while (i < s.length) {
+        if (inBlock) {
+          const closeIdx = s.indexOf("-->", i);
+          if (closeIdx < 0) break;
+          inBlock = false;
+          i = closeIdx + 3;
+        } else {
+          const openIdx = s.indexOf("<!--", i);
+          if (openIdx < 0) break;
+          inBlock = true;
+          i = openIdx + 4;
+        }
+      }
+    } else if (supportsLuaCmt) {
+      let i = 0;
+      while (i < s.length) {
+        if (inBlock) {
+          const closeIdx = s.indexOf("]]", i);
+          if (closeIdx < 0) break;
+          inBlock = false;
+          i = closeIdx + 2;
+          continue;
+        }
+        if (s[i] === "-" && s[i + 1] === "-") {
+          if (s[i + 2] === "[" && s[i + 3] === "[") {
+            inBlock = true;
+            i += 4;
+            continue;
+          }
+          break;
+        }
+        if (s[i] === '"' || s[i] === "'") {
+          const q = s[i++];
+          while (i < s.length) {
+            if (s[i] === "\\") {
+              i += 2;
+              continue;
+            }
+            if (s[i++] === q) break;
+          }
+          continue;
+        }
+        i++;
+      }
+    } else if (supportsSlashCmt) {
+      let i = 0;
+      while (i < s.length) {
+        if (inBlock) {
+          const closeIdx = s.indexOf("*/", i);
+          if (closeIdx < 0) break;
+          inBlock = false;
+          i = closeIdx + 2;
+          continue;
+        }
+        const ch = s[i];
+        const nx = s[i + 1];
+        if (ch === "/" && nx === "/") break;
+        if (fam === 7 && ch === "-" && nx === "-") break;
+        if (!noHash && ch === "#" && nx !== "[" && (i === 0 || /\s/.test(s[i - 1]))) break;
+        if (ch === "/" && nx === "*") {
+          inBlock = true;
+          i += 2;
+          continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+          if (ch === "'" && /[A-Za-z_]/.test(nx || "") && s[i + 2] !== "'") {
+            i += 2;
+            continue;
+          }
+          i++;
+          while (i < s.length) {
+            if (s[i] === "\\") {
+              i += 2;
+              continue;
+            }
+            if (s[i] === ch) {
+              i++;
+              break;
+            }
+            i++;
+          }
+          continue;
+        }
+        i++;
+      }
+    }
+  }
+}
 
 const CALLOUT_CODE_MAP: Record<string, number> = {
   note: 1,
@@ -895,11 +1923,19 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
   const mathBlocks: IRMathBlock[] = [];
   const tableLines = new Set<number>();
   const multiLinks: IRMultiLinkSpan[] = [];
+  const images: IRImageSpan[] = [];
 
   const total = doc.lines;
   const fenceState = new Uint8Array(total + 1);
   const fenceNoHash = new Uint8Array(total + 1);
+  const fenceFam = new Uint8Array(total + 1);
+  const fenceBlockCmt = new Uint8Array(total + 1);
+  const fenceEndLine = new Int32Array(total + 1);
+  const fenceAutoLang = new Map<number, string>();
   const calloutKind = new Uint8Array(total + 1);
+  const quoteDepth = new Uint8Array(total + 1);
+  const quoteEdge = new Uint8Array(total + 1);
+  const lockState = new Uint8Array(total + 1);
   const linesText = new Array<string>(total + 1);
   const lineFroms = new Int32Array(total + 1);
   linesText[0] = "";
@@ -910,9 +1946,33 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
   let fenceChar = "";
   let fenceLen = 0;
   let fenceLang = "";
+  let fenceQuoteDepth = 0;
   let curFenceNoHash = 0;
+  let curFenceFam = 0;
   let fenceStartLn = -1;
   let activeCallout = 0;
+  let inLockBlock = false;
+
+  const finalizeFenceMeta = (openLn: number, bodyEndLn: number, closeLn: number, rawLang: string, qDepth: number) => {
+    if (openLn <= 0) return;
+    if (closeLn > openLn) fenceEndLine[openLn] = closeLn;
+    if (bodyEndLn <= openLn || rawLang === "mermaid") return;
+    let fam = curFenceFam;
+    let noHash = curFenceNoHash;
+    if (!rawLang) {
+      const strippedLines =
+        qDepth > 0
+          ? linesText.map((lt, idx) => (idx > openLn && idx <= bodyEndLn ? stripQuotePrefix(lt, qDepth).stripped : lt))
+          : linesText;
+      const det = detectIRCodeLang(strippedLines, openLn + 1, bodyEndLn);
+      if (det.lang) {
+        fenceAutoLang.set(openLn, det.lang);
+        fam = det.fam;
+        noHash = det.noHash;
+      }
+    }
+    populateFenceBlockMeta(linesText, openLn + 1, bodyEndLn, fam, noHash, qDepth, fenceFam, fenceNoHash, fenceBlockCmt);
+  };
 
   const cursor = doc.iterLines();
   while (!cursor.next().done) {
@@ -922,6 +1982,17 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
     lineFroms[iterLn] = curFrom;
     curFrom += text.length + 1;
 
+    if (fenceChar && fenceQuoteDepth > 0 && countQuotePrefix(text).depth < fenceQuoteDepth) {
+      finalizeFenceMeta(fenceStartLn, iterLn - 1, 0, fenceLang, fenceQuoteDepth);
+      fenceChar = "";
+      fenceLen = 0;
+      fenceLang = "";
+      fenceQuoteDepth = 0;
+      curFenceNoHash = 0;
+      curFenceFam = 0;
+      fenceStartLn = -1;
+    }
+
     if (!fenceChar) {
       const openM = matchFenceOpen(text);
       if (openM) {
@@ -929,29 +2000,54 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
         fenceChar = openM.fenceChar;
         fenceLen = openM.fenceLen;
         fenceLang = openM.lang.toLowerCase();
+        fenceQuoteDepth = openM.quoteDepth;
         curFenceNoHash = NO_HASH_COMMENT_LANGS.has(fenceLang) ? 1 : 0;
+        curFenceFam = resolveFenceLangFamily(fenceLang);
         fenceStartLn = iterLn;
-        activeCallout = 0;
+        if (openM.quoteDepth > 0) {
+          quoteDepth[iterLn] = openM.quoteDepth;
+          calloutKind[iterLn] = activeCallout;
+        } else {
+          activeCallout = 0;
+        }
+        if (inLockBlock) lockState[iterLn] = 2;
         continue;
       }
-      const qm = /^\s*>\s?(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:\s|$))?/i.exec(text);
+      if (!inLockBlock && /^\s*:::lock(?:\s|$)/i.test(text)) {
+        lockState[iterLn] = 1;
+        inLockBlock = true;
+      } else if (inLockBlock && /^\s*:::\s*$/.test(text)) {
+        lockState[iterLn] = 3;
+        inLockBlock = false;
+      } else if (inLockBlock) {
+        lockState[iterLn] = 2;
+      }
+      const qm = /^(\s*(?:>\s?)+)(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:\s|$))?/i.exec(text);
       if (qm) {
-        if (qm[1]) {
-          activeCallout = CALLOUT_CODE_MAP[qm[1].toLowerCase()] || 0;
+        quoteDepth[iterLn] = Math.min(3, (qm[1].match(/>/g) || []).length);
+        if (qm[2]) {
+          activeCallout = CALLOUT_CODE_MAP[qm[2].toLowerCase()] || 0;
         }
         calloutKind[iterLn] = activeCallout;
       } else {
         activeCallout = 0;
       }
-    } else if (matchFenceClose(text, fenceChar, fenceLen)) {
+    } else if (matchFenceClose(text, fenceChar, fenceLen, fenceQuoteDepth)) {
       fenceState[iterLn] = 3;
+      if (fenceQuoteDepth > 0) {
+        quoteDepth[iterLn] = fenceQuoteDepth;
+        calloutKind[iterLn] = activeCallout;
+      }
+      if (inLockBlock) lockState[iterLn] = 2;
+      finalizeFenceMeta(fenceStartLn, iterLn - 1, iterLn, fenceLang, fenceQuoteDepth);
       if (fenceLang === "mermaid" && fenceStartLn > 0 && iterLn > fenceStartLn) {
         const openFrom = lineFroms[fenceStartLn];
         const closeTo = lineFroms[iterLn] + text.length;
-        const code =
-          iterLn > fenceStartLn + 1
-            ? doc.sliceString(lineFroms[fenceStartLn + 1], lineFroms[iterLn - 1] + linesText[iterLn - 1].length)
-            : "";
+        const rawLines: string[] = [];
+        for (let k = fenceStartLn + 1; k <= iterLn - 1; k++) {
+          rawLines.push(fenceQuoteDepth > 0 ? stripQuotePrefix(linesText[k], fenceQuoteDepth).stripped : linesText[k]);
+        }
+        const code = rawLines.join("\n");
         if (code.trim()) {
           mermaids.push({
             startLine: fenceStartLn,
@@ -966,11 +2062,31 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
       fenceChar = "";
       fenceLen = 0;
       fenceLang = "";
+      fenceQuoteDepth = 0;
       curFenceNoHash = 0;
+      curFenceFam = 0;
       fenceStartLn = -1;
     } else {
       fenceState[iterLn] = 2;
       fenceNoHash[iterLn] = curFenceNoHash;
+      fenceFam[iterLn] = curFenceFam;
+      if (fenceQuoteDepth > 0) {
+        quoteDepth[iterLn] = fenceQuoteDepth;
+        calloutKind[iterLn] = activeCallout;
+      }
+      if (inLockBlock) lockState[iterLn] = 2;
+    }
+  }
+  if (fenceChar && fenceStartLn > 0 && total > fenceStartLn) {
+    finalizeFenceMeta(fenceStartLn, total, 0, fenceLang, fenceQuoteDepth);
+  }
+  for (let ln = 1; ln <= total; ln++) {
+    if (quoteDepth[ln] === 0) continue;
+    if (ln === 1 || quoteDepth[ln - 1] === 0 || calloutKind[ln - 1] !== calloutKind[ln]) {
+      quoteEdge[ln] |= 1;
+    }
+    if (ln === total || quoteDepth[ln + 1] === 0 || calloutKind[ln + 1] !== calloutKind[ln]) {
+      quoteEdge[ln] |= 2;
     }
   }
 
@@ -1196,20 +2312,511 @@ function getIRDocScan(doc: EditorState["doc"]): IRDocScan {
     }
   }
 
+  // Third O(N) pass: pre-scan single-line Markdown / HTML images across the whole document so CM6 HeightMap
+  // registers image heights before scrolling brings them into the viewport and probes natural dimensions early.
+  for (let ln = 1; ln <= total; ln++) {
+    if (fenceState[ln] !== 0 || tableLines.has(ln) || alignTagLine[ln] === 1) continue;
+    const text = linesText[ln];
+    if (!text || text.length > 2400) continue;
+    if (!text.includes("![") && !text.includes("<img") && !text.includes("<IMG")) continue;
+
+    const lineFrom = lineFroms[ln];
+    const occ = new Uint8Array(text.length);
+    const claim = (s: number, e: number) => {
+      if (s < 0 || e > occ.length || s >= e) return false;
+      for (let i = s; i < e; i++) if (occ[i]) return false;
+      for (let i = s; i < e; i++) occ[i] = 1;
+      return true;
+    };
+
+    for (const ml of multiLinks) {
+      if (ln >= ml.startLine && ln <= ml.endLine) {
+        const rs = Math.max(0, ml.openFrom - lineFrom);
+        const re = Math.min(occ.length, ml.closeTo - lineFrom);
+        for (let i = rs; i < re; i++) occ[i] = 1;
+      }
+    }
+
+    let im: RegExpExecArray | null;
+    const inlineCodeRe = /(`+)([^`\n]+?)\1/g;
+    while ((im = inlineCodeRe.exec(text)) !== null) {
+      claim(im.index, im.index + im[0].length);
+    }
+    const htmlCodeRe = /<code\b[^>]*>[^<\n]*<\/code>/gi;
+    while ((im = htmlCodeRe.exec(text)) !== null) {
+      claim(im.index, im.index + im[0].length);
+    }
+
+    const foundOnLine: IRImageSpan[] = [];
+    const linkedImgRe =
+      /\[!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
+    while ((im = linkedImgRe.exec(text)) !== null) {
+      const alt = (im[1] || "").trim();
+      const rawTarget = parseMarkdownImageTarget(im[2] || "");
+      const resolvedSrc = resolveIRImageSrc(rawTarget);
+      if (!resolvedSrc) continue;
+      const href = cleanClipboardUrl(parseMarkdownImageTarget(im[3] || "")) || parseMarkdownImageTarget(im[3] || "");
+      const s = im.index;
+      const e = s + im[0].length;
+      const imgFrom = s + 1;
+      const imgTo = imgFrom + 2 + im[1].length + 2 + im[2].length + 1;
+      if (claim(s, e)) {
+        seedIRImageHintDims(resolvedSrc);
+        warmIRImageDim(resolvedSrc);
+        foundOnLine.push({
+          lineNumber: ln,
+          spanFrom: lineFrom + s,
+          spanTo: lineFrom + e,
+          imgFrom: lineFrom + imgFrom,
+          imgTo: lineFrom + imgTo,
+          resolvedSrc,
+          rawTarget,
+          alt,
+          href,
+        });
+      }
+    }
+
+    const mdImgRe = /!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
+    while ((im = mdImgRe.exec(text)) !== null) {
+      const alt = (im[1] || "").trim();
+      const rawTarget = parseMarkdownImageTarget(im[2] || "");
+      const resolvedSrc = resolveIRImageSrc(rawTarget);
+      if (!resolvedSrc) continue;
+      const s = im.index;
+      const e = s + im[0].length;
+      if (claim(s, e)) {
+        seedIRImageHintDims(resolvedSrc);
+        warmIRImageDim(resolvedSrc);
+        foundOnLine.push({
+          lineNumber: ln,
+          spanFrom: lineFrom + s,
+          spanTo: lineFrom + e,
+          imgFrom: lineFrom + s,
+          imgTo: lineFrom + e,
+          resolvedSrc,
+          rawTarget,
+          alt,
+          href: "",
+        });
+      }
+    }
+
+    const htmlImgRe = /<img\b[^>]*>/gi;
+    while ((im = htmlImgRe.exec(text)) !== null) {
+      const rawTarget = readHtmlAttr(im[0], "src");
+      const resolvedSrc = resolveIRImageSrc(rawTarget);
+      if (!resolvedSrc) continue;
+      const alt = readHtmlAttr(im[0], "alt");
+      const s = im.index;
+      const e = s + im[0].length;
+      if (claim(s, e)) {
+        seedIRImageHintDims(resolvedSrc, im[0]);
+        warmIRImageDim(resolvedSrc);
+        foundOnLine.push({
+          lineNumber: ln,
+          spanFrom: lineFrom + s,
+          spanTo: lineFrom + e,
+          imgFrom: lineFrom + s,
+          imgTo: lineFrom + e,
+          resolvedSrc,
+          rawTarget,
+          alt,
+          href: "",
+        });
+      }
+    }
+
+    if (foundOnLine.length > 1) {
+      foundOnLine.sort((a, b) => a.spanFrom - b.spanFrom || a.spanTo - b.spanTo);
+    }
+    for (const imgSpan of foundOnLine) images.push(imgSpan);
+  }
+
   const res: IRDocScan = {
     tables,
     mermaids,
     mathBlocks,
     tableLines,
     multiLinks,
+    images,
     fenceState,
     fenceNoHash,
+    fenceFam,
+    fenceBlockCmt,
+    fenceEndLine,
+    fenceAutoLang,
     calloutKind,
+    quoteDepth,
+    quoteEdge,
     alignKind,
     alignTagLine,
+    lockState,
   };
   irDocScanCache.set(doc, res);
   return res;
+}
+
+function highlightIRCodeLine(
+  text: string,
+  fam: number,
+  noHash: number,
+  enteredInBlockCmt: boolean,
+  claim: (s: number, e: number, cls: string) => void
+): void {
+  let cm: RegExpExecArray | null;
+
+  // Family 6: Unified Diff / Patch
+  if (fam === 6) {
+    const hunkM = /^(@@[^@\n]*@@)(.*)$/.exec(text);
+    if (hunkM) {
+      claim(0, hunkM[1].length, "gu");
+      return;
+    }
+    if (/^(?:diff --git\b|index\s|---\s|\+\+\+\s|\*\*\*\s)/.test(text)) {
+      claim(0, text.length, "gh");
+    } else if (text.startsWith("+")) {
+      claim(0, text.length, "gi");
+    } else if (text.startsWith("-")) {
+      claim(0, text.length, "gd");
+    }
+    return;
+  }
+
+  // Family 4: HTML / XML / SVG / Vue
+  if (fam === 4) {
+    let startIdx = 0;
+    if (enteredInBlockCmt) {
+      const closeIdx = text.indexOf("-->");
+      if (closeIdx < 0) {
+        claim(0, text.length, "cm");
+        return;
+      }
+      claim(0, closeIdx + 3, "cm");
+      startIdx = closeIdx + 3;
+    }
+    while (startIdx < text.length) {
+      const openIdx = text.indexOf("<!--", startIdx);
+      if (openIdx < 0) break;
+      const closeIdx = text.indexOf("-->", openIdx + 4);
+      if (closeIdx < 0) {
+        claim(openIdx, text.length, "cm");
+        break;
+      }
+      claim(openIdx, closeIdx + 3, "cm");
+      startIdx = closeIdx + 3;
+    }
+    const dtRe = /<!DOCTYPE[^>]*>|<\?xml[^?]*\?>/gi;
+    while ((cm = dtRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "cp");
+    const strRe = /"[^"]*"|'[^']*'/g;
+    while ((cm = strRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "s2");
+    const tagRe = /(<\/?)([A-Za-z][A-Za-z0-9:._-]*)/g;
+    while ((cm = tagRe.exec(text)) !== null) {
+      claim(cm.index, cm.index + cm[1].length, "p");
+      claim(cm.index + cm[1].length, cm.index + cm[0].length, "nt");
+    }
+    const closeBrkRe = /\/?>/g;
+    while ((cm = closeBrkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "p");
+    const attrRe = /(\s)([A-Za-z_:][A-Za-z0-9_.:-]*)(?=\s*=)/g;
+    while ((cm = attrRe.exec(text)) !== null) {
+      claim(cm.index + cm[1].length, cm.index + cm[0].length, "na");
+    }
+    const entRe = /&[A-Za-z0-9#]+;/g;
+    while ((cm = entRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    return;
+  }
+
+  // Family 8: Lua (--[[ ... ]] block comments, -- line comments)
+  if (fam === 8) {
+    let idx8 = 0;
+    if (enteredInBlockCmt) {
+      const closeIdx = text.indexOf("]]");
+      if (closeIdx < 0) {
+        claim(0, text.length, "cm");
+        return;
+      }
+      claim(0, closeIdx + 2, "cm");
+      idx8 = closeIdx + 2;
+    }
+    while (idx8 < text.length) {
+      if (text[idx8] === "-" && text[idx8 + 1] === "-") {
+        if (text[idx8 + 2] === "[" && text[idx8 + 3] === "[") {
+          const end = text.indexOf("]]", idx8 + 4);
+          if (end < 0) {
+            claim(idx8, text.length, "cm");
+            break;
+          }
+          claim(idx8, end + 2, "cm");
+          idx8 = end + 2;
+          continue;
+        }
+        claim(idx8, text.length, "c1");
+        break;
+      }
+      if (text[idx8] === '"' || text[idx8] === "'") {
+        const q = text[idx8];
+        let j = idx8 + 1;
+        while (j < text.length) {
+          if (text[j] === "\\") {
+            j += 2;
+            continue;
+          }
+          if (text[j++] === q) break;
+        }
+        claim(idx8, Math.min(j, text.length), q === "'" ? "s1" : "s2");
+        idx8 = j;
+        continue;
+      }
+      idx8++;
+    }
+    const lcRe = /\b(?:true|false|nil|self)\b/g;
+    while ((cm = lcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    const lkRe = /\b(?:local|function|end|if|then|else|elseif|for|in|while|do|repeat|until|return|break|goto|and|or|not)\b/g;
+    while ((cm = lkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
+    const lfRe = /\b([A-Za-z_]\w*)(?=\s*[({'"\[])/g;
+    while ((cm = lfRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
+    const lnRe = /\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/g;
+    while ((cm = lnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    return;
+  }
+
+  // Lexical left-to-right pass for multi-line block comments, C preprocessor, line comments & string literals
+  let idx = 0;
+  const supportsBlockCmt = fam === 0 || fam === 1 || fam === 3 || fam === 5 || fam === 7 || fam === 10;
+  if (enteredInBlockCmt && supportsBlockCmt) {
+    const closeIdx = text.indexOf("*/");
+    if (closeIdx < 0) {
+      claim(0, text.length, "cm");
+      return;
+    }
+    claim(0, closeIdx + 2, "cm");
+    idx = closeIdx + 2;
+  }
+
+  if (idx === 0 && (fam === 0 || fam === 1)) {
+    const ppM = /^(\s*)(#\s*(?:include|define|undef|ifdef|ifndef|if|elif|else|endif|pragma|error|region|endregion)\b)(\s*<[^>\n]+>)?/.exec(
+      text
+    );
+    if (ppM) {
+      const dFrom = ppM[1].length;
+      const dTo = dFrom + ppM[2].length;
+      claim(dFrom, dTo, "cp");
+      if (ppM[3]) claim(dTo, dTo + ppM[3].length, "cpf");
+      idx = ppM[0].length;
+    }
+  }
+
+  while (idx < text.length) {
+    const ch = text[idx];
+    const nx = text[idx + 1];
+    if (supportsBlockCmt && ch === "/" && nx === "*") {
+      const end = text.indexOf("*/", idx + 2);
+      if (end < 0) {
+        claim(idx, text.length, "cm");
+        break;
+      }
+      claim(idx, end + 2, "cm");
+      idx = end + 2;
+      continue;
+    }
+    if (ch === "/" && nx === "/" && (idx === 0 || text[idx - 1] !== ":")) {
+      claim(idx, text.length, "c1");
+      break;
+    }
+    if (fam === 7 && ch === "-" && nx === "-") {
+      claim(idx, text.length, "c1");
+      break;
+    }
+    if (!noHash && ch === "#" && nx !== "[" && (idx === 0 || /\s/.test(text[idx - 1]))) {
+      claim(idx, text.length, "c1");
+      break;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      if (ch === "'" && (fam === 0 || fam === 1)) {
+        const lifeM = /^'[A-Za-z_][A-Za-z0-9_]*(?!')/.exec(text.slice(idx));
+        if (lifeM && (idx === 0 || !/[A-Za-z0-9_]/.test(text[idx - 1]))) {
+          claim(idx, idx + lifeM[0].length, "kt");
+          idx += lifeM[0].length;
+          continue;
+        }
+      }
+      let j = idx + 1;
+      while (j < text.length) {
+        if (text[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (text[j] === ch) {
+          j++;
+          break;
+        }
+        j++;
+      }
+      const endPos = Math.min(j, text.length);
+      const isJsonKey = fam === 3 && ch === '"' && /^\s*:/.test(text.slice(endPos));
+      claim(idx, endPos, isJsonKey ? "nt" : ch === "'" ? "s1" : "s2");
+      idx = endPos;
+      continue;
+    }
+    idx++;
+  }
+
+  // Family 3: JSON / JSONC / JSON5
+  if (fam === 3) {
+    const jkRe = /(?:^|[{,\s])([A-Za-z_$][\w$]*)(?=\s*:)/g;
+    while ((cm = jkRe.exec(text)) !== null) {
+      const s = cm.index + cm[0].length - cm[1].length;
+      claim(s, s + cm[1].length, "nt");
+    }
+    const jcRe = /\b(?:true|false|null|Infinity|NaN)\b/g;
+    while ((cm = jcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    const jnRe = /[+-]?\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b/g;
+    while ((cm = jnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    const jpRe = /[{}\[\]:,]/g;
+    while ((cm = jpRe.exec(text)) !== null) claim(cm.index, cm.index + 1, "p");
+    return;
+  }
+
+  // Family 5: CSS / SCSS / Less
+  if (fam === 5) {
+    const atRe = /@[A-Za-z-]+/g;
+    while ((cm = atRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
+    const impRe = /!\s*important\b/gi;
+    while ((cm = impRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    const cvRe = /--[A-Za-z0-9_-]+|\$[A-Za-z_-][\w-]*/g;
+    while ((cm = cvRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nv");
+    const psRe = /(::?[A-Za-z-]+)(?=[^{};]*(?:\{|$))/g;
+    while ((cm = psRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nd");
+    const clsIdRe = /[.#][A-Za-z_-][A-Za-z0-9_-]*(?=[^{};]*\{)/g;
+    while ((cm = clsIdRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
+    const prRe = /(?:^|[;{\s(])([A-Za-z-]+)(?=\s*:(?!:)[^;{}]*(?:;|\}|\)|$))/g;
+    while ((cm = prRe.exec(text)) !== null) {
+      const s = cm.index + cm[0].length - cm[1].length;
+      claim(s, s + cm[1].length, "na");
+    }
+    const fnRe = /\b([A-Za-z_-][\w-]*)(?=\()/g;
+    while ((cm = fnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
+    const hexNumRe = /#[0-9a-fA-F]{3,8}\b|-?\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvh|svh|dvw|svw|%|s|ms|deg|fr|ch)?\b/g;
+    while ((cm = hexNumRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    const valKwRe =
+      /\b(?:none|auto|inherit|initial|unset|solid|dashed|dotted|flex|grid|block|inline|inline-flex|inline-block|relative|absolute|fixed|sticky|hidden|clip|visible|pointer|center|left|right|top|bottom|space-between|transparent|currentColor|border-box|ease|linear|infinite|both|row|column|wrap|nowrap|bold|normal|italic)\b/g;
+    while ((cm = valKwRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    return;
+  }
+
+  // Family 7: SQL
+  if (fam === 7) {
+    const scRe = /\b(?:NULL|TRUE|FALSE)\b/gi;
+    while ((cm = scRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    const stRe =
+      /\b(?:INT|INTEGER|BIGINT|SMALLINT|SERIAL|BIGSERIAL|TEXT|VARCHAR|CHAR|BOOLEAN|BOOL|DATE|TIME|TIMESTAMP|TIMESTAMPTZ|NUMERIC|DECIMAL|FLOAT|DOUBLE|REAL|JSON|JSONB|UUID|BLOB|BYTEA)\b/gi;
+    while ((cm = stRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
+    const skRe =
+      /\b(?:SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AS|AND|OR|NOT|IN|IS|LIKE|ILIKE|BETWEEN|EXISTS|GROUP|BY|ORDER|HAVING|LIMIT|OFFSET|UNION|ALL|DISTINCT|CREATE|ALTER|DROP|TRUNCATE|TABLE|INDEX|VIEW|DATABASE|SCHEMA|PRIMARY|KEY|FOREIGN|REFERENCES|UNIQUE|DEFAULT|CHECK|CONSTRAINT|CASCADE|BEGIN|COMMIT|ROLLBACK|TRANSACTION|WITH|CASE|WHEN|THEN|ELSE|END|RETURNING|ASC|DESC)\b/gi;
+    while ((cm = skRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
+    const sfRe = /\b([A-Za-z_]\w*)(?=\s*\()/g;
+    while ((cm = sfRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
+    const snRe = /-?\b\d+(?:\.\d+)?\b/g;
+    while ((cm = snRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    return;
+  }
+
+  // Family 9: GraphQL
+  if (fam === 9) {
+    const gdRe = /@[A-Za-z_]\w*/g;
+    while ((cm = gdRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nd");
+    const gvRe = /\$[A-Za-z_]\w*/g;
+    while ((cm = gvRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nv");
+    const gcRe = /\b(?:true|false|null)\b/g;
+    while ((cm = gcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    const gtRe = /\b(?:Int|Float|String|Boolean|ID)\b/g;
+    while ((cm = gtRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
+    const gkRe =
+      /\b(?:query|mutation|subscription|fragment|on|type|interface|union|enum|input|scalar|schema|directive|extend|implements|repeatable)\b/g;
+    while ((cm = gkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
+    const gfRe = /\b([A-Za-z_]\w*)(?=\s*:)/g;
+    while ((cm = gfRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "na");
+    const gtyRe = /\b[A-Z][A-Za-z0-9_]*\b/g;
+    while ((cm = gtyRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
+    const gnRe = /-?\b\d+(?:\.\d+)?\b/g;
+    while ((cm = gnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    return;
+  }
+
+  // Family 10: Protobuf
+  if (fam === 10) {
+    const pcRe = /\b(?:true|false|max)\b/g;
+    while ((cm = pcRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+    const ptRe =
+      /\b(?:double|float|int32|int64|uint32|uint64|sint32|sint64|fixed32|fixed64|sfixed32|sfixed64|bool|string|bytes)\b/g;
+    while ((cm = ptRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
+    const pkRe =
+      /\b(?:syntax|edition|package|import|public|weak|option|message|enum|service|rpc|returns|stream|repeated|optional|required|oneof|map|reserved|extensions|to)\b/g;
+    while ((cm = pkRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
+    const ptyRe = /\b[A-Z][A-Za-z0-9_]*\b/g;
+    while ((cm = ptyRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
+    const pnRe = /\b(?:0[xX][0-9a-fA-F]+|\d+)\b/g;
+    while ((cm = pnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
+    return;
+  }
+
+  // Families 0, 1, 2: Programming, PHP, Ruby, Elixir, HCL/Terraform, Zig, Scala, Dart, C#, F#, VB, Shell, Nginx, YAML, TOML
+  const phpTagRe = /<\?(?:php|=)?|\?>/gi;
+  while ((cm = phpTagRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "cp");
+  const rsAttrRe = /^\s*(#!?\[[^\]]*\])/g;
+  while ((cm = rsAttrRe.exec(text)) !== null) {
+    const idx = cm.index + cm[0].length - cm[1].length;
+    claim(idx, idx + cm[1].length, "nd");
+  }
+  const decRe = /(?:^|[\s(])(@[A-Za-z_][\w.]*)/g;
+  while ((cm = decRe.exec(text)) !== null) {
+    const idx = cm.index + cm[0].length - cm[1].length;
+    claim(idx, idx + cm[1].length, "nd");
+  }
+  const symRe = /(?:^|[\s([,=])(:[A-Za-z_]\w*[?!]?)\b/g;
+  while ((cm = symRe.exec(text)) !== null) {
+    const idx = cm.index + cm[0].length - cm[1].length;
+    claim(idx, idx + cm[1].length, "kc");
+  }
+  const uriRe = /\b(?:https?|wss?|grpcs?|fastcgi|uwsgi|scgi):\/\/[^\s;'"]+/g;
+  while ((cm = uriRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "s2");
+  const varRe = /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$[@*#?$!0-9-]/g;
+  while ((cm = varRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nv");
+  const flagRe = /(?:^|\s)(--?[A-Za-z][\w-]*)/g;
+  while ((cm = flagRe.exec(text)) !== null) {
+    const idx = cm.index + (cm[0].length - cm[1].length);
+    claim(idx, idx + cm[1].length, "na");
+  }
+  if (fam !== 1) {
+    const keyRe = /^\s*(?:-\s+)?([A-Za-z_][A-Za-z0-9_.-]*)(?=\s*(?::(?:\s|$)|=))/g;
+    while ((cm = keyRe.exec(text)) !== null) {
+      const idx = cm.index + cm[0].lastIndexOf(cm[1]);
+      claim(idx, idx + cm[1].length, "nt");
+    }
+  }
+  const constRe = /\b(?:true|false|null|nil|undefined|None|True|False|Nothing|on|off|yes|no|NaN|Infinity|iota|self|Self|this|super|base)\b/g;
+  while ((cm = constRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kc");
+  const primTypeRe =
+    /\b(?:string|int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|uintptr|float32|float64|bool|byte|sbyte|decimal|object|dynamic|rune|error|any|void|char|short|ushort|long|ulong|double|float|size_t|usize|isize|i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|f16|f32|f64|f128|anyerror|comptime_int|comptime_float|str|number|boolean|unknown|never|symbol|bigint|Unit|Any|AnyRef|AnyVal|Option|Result|Vec|Box|Rc|Arc|String|Map|Set|List|Future|Stream|Iterable|Promise|Array|Record)\b/g;
+  while ((cm = primTypeRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "kt");
+  const kwRe =
+    /\b(?:sudo|apt|apt-get|yum|dnf|apk|cd|mkdir|tar|wget|curl|make|docker|kubectl|systemctl|git|npm|pnpm|terraform|export|return|func|go|defer|chan|select|fallthrough|range|map|function|fn|mut|ref|move|unsafe|where|trait|dyn|crate|use|extern|def|defp|defmodule|defmacro|defprotocol|defimpl|defstruct|alias|require|quote|unquote|cond|receive|after|lambda|yield|pass|raise|except|global|nonlocal|assert|del|elif|elsif|unless|until|begin|rescue|ensure|module|end|when|then|attr_accessor|attr_reader|attr_writer|resource|variable|output|provider|locals|data|echo|foreach|endforeach|endif|callable|clone|global|class|interface|implements|extends|with|mixin|extension|factory|late|covariant|required|sealed|internal|record|init|delegate|event|operator|out|params|checked|unchecked|fixed|lock|stackalloc|using|get|set|let|member|open|rec|mutable|comptime|errdefer|orelse|unreachable|nosuspend|suspend|resume|object|implicit|lazy|abstract|readonly|keyof|typeof|instanceof|infer|declare|namespace|enum|impl|pub|mod|match|async|await|try|catch|finally|throw|new|delete|const|var|val|if|else|for|while|do|loop|switch|case|default|break|continue|import|from|package|type|struct|union|static|final|private|protected|public|override|virtual|inline|constexpr|template|typename|in|of|as|is|not|and|or|Sub|Function|Dim|As|If|Then|Else|ElseIf|End|For|To|Next|While|Return|Imports|Module|Class|Public|Private|server|location|upstream|events|stream|http|listen|proxy_pass|fastcgi_pass|proxy_set_header|rewrite|root|index|error_page|access_log|error_log|include|ssl_certificate|ssl_certificate_key|client_max_body_size|keepalive_timeout|gzip|absolute_redirect|server_name|try_files|add_header)\b/g;
+  while ((cm = kwRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "k");
+  const macroRe = /\b([a-z_][a-z0-9_]*)!(?=\s*[(\[{])/g;
+  while ((cm = macroRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nd");
+  const fnRe = /\b([A-Za-z_]\w*[?!]?)(?=\s*\()/g;
+  while ((cm = fnRe.exec(text)) !== null) claim(cm.index, cm.index + cm[1].length, "nf");
+  const typeRe = /\b[A-Z][a-zA-Z0-9_]*\b/g;
+  while ((cm = typeRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "nc");
+  if (fam !== 1) {
+    const directiveRe = /^(\s*)([a-z][a-z0-9_]{2,})(?=\s+[^\s=:{])/g;
+    while ((cm = directiveRe.exec(text)) !== null) {
+      const idx = cm.index + cm[1].length;
+      claim(idx, idx + cm[2].length, "na");
+    }
+  }
+  const numRe = /\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?(?:ms|s|m|h|d|k|K|M|G)?)\b/g;
+  while ((cm = numRe.exec(text)) !== null) claim(cm.index, cm.index + cm[0].length, "mi");
 }
 
 interface IRBlockDecoState {
@@ -1217,13 +2824,17 @@ interface IRBlockDecoState {
   focused: boolean;
   selFromLine: number;
   selToLine: number;
+  actFromLine: number;
+  actToLine: number;
 }
 
 function buildIRBlockDecos(
   state: EditorState,
   focused: boolean,
   selFromLine: number,
-  selToLine: number
+  selToLine: number,
+  actFromLine: number,
+  actToLine: number
 ): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>();
   const scan = getIRDocScan(state.doc);
@@ -1231,26 +2842,43 @@ function buildIRBlockDecos(
     scan.tables.length === 0 &&
     scan.mermaids.length === 0 &&
     scan.mathBlocks.length === 0 &&
-    scan.multiLinks.length === 0
+    scan.multiLinks.length === 0 &&
+    scan.images.length === 0
   ) {
     return builder.finish();
   }
   const hideDeco = Decoration.replace({});
 
   type BlockOp =
-    | { pos: number; kind: "table"; item: IRTableBlock }
-    | { pos: number; kind: "mermaid"; item: IRMermaidBlock }
-    | { pos: number; kind: "math"; item: IRMathBlock }
-    | { pos: number; kind: "mlink"; item: IRMultiLinkSpan };
+    | { pos: number; endPos: number; kind: "table"; item: IRTableBlock }
+    | { pos: number; endPos: number; kind: "mermaid"; item: IRMermaidBlock }
+    | { pos: number; endPos: number; kind: "math"; item: IRMathBlock }
+    | { pos: number; endPos: number; kind: "mlink"; item: IRMultiLinkSpan }
+    | { pos: number; endPos: number; kind: "image"; item: IRImageSpan };
   const merged: BlockOp[] = [
-    ...scan.tables.map((item) => ({ pos: item.from, kind: "table" as const, item })),
-    ...scan.mermaids.map((item) => ({ pos: item.from, kind: "mermaid" as const, item })),
-    ...scan.mathBlocks.map((item) => ({ pos: item.from, kind: "math" as const, item })),
-    ...scan.multiLinks.map((item) => ({ pos: item.openFrom, kind: "mlink" as const, item })),
-  ].sort((a, b) => a.pos - b.pos);
+    ...scan.tables.map((item) => ({ pos: item.from, endPos: item.to, kind: "table" as const, item })),
+    ...scan.mermaids.map((item) => ({ pos: item.from, endPos: item.to, kind: "mermaid" as const, item })),
+    ...scan.mathBlocks.map((item) => ({ pos: item.from, endPos: item.to, kind: "math" as const, item })),
+    ...scan.multiLinks.map((item) => ({ pos: item.openFrom, endPos: item.closeTo, kind: "mlink" as const, item })),
+    ...scan.images.map((item) => ({ pos: item.spanFrom, endPos: item.spanTo, kind: "image" as const, item })),
+  ].sort((a, b) => a.pos - b.pos || a.endPos - b.endPos);
 
+  let lastEmittedTo = 0;
   for (const entry of merged) {
-    if (focused && selFromLine <= entry.item.endLine && selToLine >= entry.item.startLine) {
+    if (entry.kind === "image") {
+      if (
+        (focused && selFromLine <= entry.item.lineNumber && selToLine >= entry.item.lineNumber) ||
+        (actFromLine > 0 && actFromLine <= entry.item.lineNumber && actToLine >= entry.item.lineNumber)
+      ) {
+        continue;
+      }
+    } else if (
+      (focused && selFromLine <= entry.item.endLine && selToLine >= entry.item.startLine) ||
+      (actFromLine > 0 && actFromLine <= entry.item.endLine && actToLine >= entry.item.startLine)
+    ) {
+      continue;
+    }
+    if (entry.pos < lastEmittedTo) {
       continue;
     }
     if (entry.kind === "table") {
@@ -1263,6 +2891,7 @@ function buildIRBlockDecos(
           block: true,
         })
       );
+      lastEmittedTo = item.to;
     } else if (entry.kind === "mermaid") {
       const { item } = entry;
       builder.add(
@@ -1273,6 +2902,7 @@ function buildIRBlockDecos(
           block: true,
         })
       );
+      lastEmittedTo = item.to;
     } else if (entry.kind === "math") {
       const { item } = entry;
       builder.add(
@@ -1283,13 +2913,33 @@ function buildIRBlockDecos(
           block: true,
         })
       );
-    } else {
+      lastEmittedTo = item.to;
+    } else if (entry.kind === "mlink") {
       const { item } = entry;
-      builder.add(item.openFrom, item.openTo, hideDeco);
+      if (item.openFrom < item.openTo) builder.add(item.openFrom, item.openTo, hideDeco);
       if (item.openTo < item.closeFrom) {
         builder.add(item.openTo, item.closeFrom, Decoration.mark({ class: "cm-ir-link" }));
       }
-      builder.add(item.closeFrom, item.closeTo, hideDeco);
+      if (item.closeFrom < item.closeTo) builder.add(item.closeFrom, item.closeTo, hideDeco);
+      lastEmittedTo = item.closeTo;
+    } else {
+      const { item } = entry;
+      if (item.spanFrom < item.imgFrom) builder.add(item.spanFrom, item.imgFrom, hideDeco);
+      builder.add(
+        item.imgFrom,
+        item.imgTo,
+        Decoration.replace({
+          widget: new ImageIRWidget(item.resolvedSrc, item.rawTarget, item.alt, item.imgFrom, item.spanTo),
+        })
+      );
+      if (item.imgTo < item.spanTo) {
+        builder.add(
+          item.imgTo,
+          item.spanTo,
+          Decoration.replace({ widget: new LinkedImageBadgeIRWidget(item.href, item.spanTo) })
+        );
+      }
+      lastEmittedTo = item.spanTo;
     }
   }
   return builder.finish();
@@ -1300,28 +2950,42 @@ const irBlockDecoField = StateField.define<IRBlockDecoState>({
     const focused = state.field(irFocusedField, false) ?? false;
     const selFromLine = focused ? state.doc.lineAt(state.selection.main.from).number : -1;
     const selToLine = focused ? state.doc.lineAt(state.selection.main.to).number : -1;
+    const act = getActiveSearchLineRange(state);
+    const actFromLine = act ? act.startLine : -1;
+    const actToLine = act ? act.endLine : -1;
     return {
-      decos: buildIRBlockDecos(state, focused, selFromLine, selToLine),
+      decos: buildIRBlockDecos(state, focused, selFromLine, selToLine, actFromLine, actToLine),
       focused,
       selFromLine,
       selToLine,
+      actFromLine,
+      actToLine,
     };
   },
   update(prev, tr) {
     const focused = tr.state.field(irFocusedField, false) ?? false;
     const selFromLine = focused ? tr.state.doc.lineAt(tr.state.selection.main.from).number : -1;
     const selToLine = focused ? tr.state.doc.lineAt(tr.state.selection.main.to).number : -1;
+    const act = getActiveSearchLineRange(tr.state);
+    const actFromLine = act ? act.startLine : -1;
+    const actToLine = act ? act.endLine : -1;
+    const dimUpdated = tr.effects.some((e) => e.is(irImgDimReadyEffect));
     if (
       tr.docChanged ||
+      dimUpdated ||
       focused !== prev.focused ||
       selFromLine !== prev.selFromLine ||
-      selToLine !== prev.selToLine
+      selToLine !== prev.selToLine ||
+      actFromLine !== prev.actFromLine ||
+      actToLine !== prev.actToLine
     ) {
       return {
-        decos: buildIRBlockDecos(tr.state, focused, selFromLine, selToLine),
+        decos: buildIRBlockDecos(tr.state, focused, selFromLine, selToLine, actFromLine, actToLine),
         focused,
         selFromLine,
         selToLine,
+        actFromLine,
+        actToLine,
       };
     }
     return prev;
@@ -1329,29 +2993,81 @@ const irBlockDecoField = StateField.define<IRBlockDecoState>({
   provide: (f) => EditorView.decorations.from(f, (v) => v.decos),
 });
 
+function buildIRQuoteLineCls(depth: number, edge: number, alertKind: string): string {
+  let quoteCls = "cm-ir-quote";
+  if (depth === 2) quoteCls += " cm-ir-quote-d2";
+  else if (depth >= 3) quoteCls += " cm-ir-quote-d3";
+  if (edge & 1) quoteCls += " cm-ir-quote-first";
+  if (edge & 2) quoteCls += " cm-ir-quote-last";
+  if (alertKind) quoteCls += ` cm-ir-callout cm-ir-callout-${alertKind}`;
+  return quoteCls;
+}
+
 function buildInstantRenderPlugin(): Extension {
   const hideDeco = Decoration.replace({});
   const buildDecos = (view: EditorView): DecorationSet => {
-    const builder = new RangeSetBuilder<Decoration>();
     const state = view.state;
-    if (view.visibleRanges.length === 0) return builder.finish();
+    if (view.visibleRanges.length === 0) return Decoration.none;
+    const allRanges: ReturnType<Decoration["range"]>[] = [];
+    const addLine = (pos: number, cls: string) => {
+      allRanges.push(Decoration.line({ class: cls }).range(pos));
+    };
+    const addRange = (from: number, to: number, deco: Decoration) => {
+      if (from < to) allRanges.push(deco.range(from, to));
+    };
+    const addPoint = (pos: number, deco: Decoration) => {
+      allRanges.push(deco.range(pos));
+    };
 
     const focused = view.hasFocus;
     const composing = view.composing;
     const trackSel = focused || composing;
     const selFromLine = trackSel ? state.doc.lineAt(state.selection.main.from).number : -1;
     const selToLine = trackSel ? state.doc.lineAt(state.selection.main.to).number : -1;
+    const actSearch = getActiveSearchLineRange(state);
+    const actFromLine = actSearch ? actSearch.startLine : -1;
+    const actToLine = actSearch ? actSearch.endLine : -1;
     const scan = getIRDocScan(state.doc);
 
     const collapsedBlockLines = new Set<number>();
     for (const blk of [...scan.tables, ...scan.mermaids, ...scan.mathBlocks]) {
-      if (!(focused && selFromLine <= blk.endLine && selToLine >= blk.startLine)) {
+      const expanded =
+        (focused && selFromLine <= blk.endLine && selToLine >= blk.startLine) ||
+        (actFromLine > 0 && actFromLine <= blk.endLine && actToLine >= blk.startLine);
+      if (!expanded) {
         for (let k = blk.startLine; k <= blk.endLine; k++) collapsedBlockLines.add(k);
       }
     }
     const activeMultiLinks = scan.multiLinks.filter(
-      (ml) => !(focused && selFromLine <= ml.endLine && selToLine >= ml.startLine)
+      (ml) =>
+        !(
+          (focused && selFromLine <= ml.endLine && selToLine >= ml.startLine) ||
+          (actFromLine > 0 && actFromLine <= ml.endLine && actToLine >= ml.startLine)
+        )
     );
+    const irBlockState = state.field(irBlockDecoField, false);
+    const imagesByLine = new Map<number, IRImageSpan[]>();
+    if (scan.images.length > 0) {
+      const bf = irBlockState?.focused ?? focused;
+      const bsFrom = irBlockState?.selFromLine ?? selFromLine;
+      const bsTo = irBlockState?.selToLine ?? selToLine;
+      const bActFrom = irBlockState?.actFromLine ?? actFromLine;
+      const bActTo = irBlockState?.actToLine ?? actToLine;
+      for (const imgSpan of scan.images) {
+        if (
+          (bf && bsFrom <= imgSpan.lineNumber && bsTo >= imgSpan.lineNumber) ||
+          (bActFrom > 0 && bActFrom <= imgSpan.lineNumber && bActTo >= imgSpan.lineNumber)
+        ) {
+          continue;
+        }
+        let list = imagesByLine.get(imgSpan.lineNumber);
+        if (!list) {
+          list = [];
+          imagesByLine.set(imgSpan.lineNumber, list);
+        }
+        list.push(imgSpan);
+      }
+    }
 
     let lastEmittedLine = 0;
 
@@ -1370,27 +3086,61 @@ function buildInstantRenderPlugin(): Extension {
         }
 
         const text = line.text;
-        const isCursorLine = trackSel && line.number >= selFromLine && line.number <= selToLine;
+        const isSearchActiveLine = actFromLine > 0 && line.number >= actFromLine && line.number <= actToLine;
+        const isCursorLine = (trackSel && line.number >= selFromLine && line.number <= selToLine) || isSearchActiveLine;
         const fState = scan.fenceState[line.number] || 0;
+        const lockSt = scan.lockState[line.number] || 0;
+        if (lockSt > 0) {
+          addLine(
+            line.from,
+            lockSt === 1 ? "cm-ir-lock cm-ir-lock-open" : lockSt === 3 ? "cm-ir-lock cm-ir-lock-close" : "cm-ir-lock cm-ir-lock-body"
+          );
+        }
 
+        const fQDepth = scan.quoteDepth[line.number] || 0;
         if (fState === 1 || fState === 3) {
           const opening = fState === 1;
-          builder.add(
-            line.from,
-            line.from,
-            Decoration.line({ class: opening ? "cm-ir-fence cm-ir-fence-open" : "cm-ir-fence cm-ir-fence-close" })
-          );
+          let fenceLineCls = opening ? "cm-ir-fence cm-ir-fence-open" : "cm-ir-fence cm-ir-fence-close";
+          if (fQDepth > 0) {
+            const scanCallout = CALLOUT_NAMES[scan.calloutKind[line.number] || 0] || "";
+            fenceLineCls += " " + buildIRQuoteLineCls(fQDepth, scan.quoteEdge[line.number] || 3, scanCallout);
+          }
+          addLine(line.from, fenceLineCls);
           if (!isCursorLine && text.length > 0) {
-            const openInfo = opening ? matchFenceOpen(text) : null;
-            if (openInfo && openInfo.langRawLen > 0) {
-              builder.add(line.from, line.from + openInfo.langOffset, hideDeco);
-              builder.add(
-                line.from + openInfo.langOffset,
-                line.from + openInfo.langOffset + openInfo.langRawLen,
-                Decoration.mark({ class: "cm-ir-fence-lang" })
-              );
+            if (opening) {
+              const openInfo = matchFenceOpen(text);
+              const explicitLang = (openInfo?.lang || "").toLowerCase();
+              if (explicitLang === "mermaid") {
+                if (openInfo && openInfo.langRawLen > 0) {
+                  addRange(line.from, line.from + openInfo.langOffset, hideDeco);
+                  addRange(
+                    line.from + openInfo.langOffset,
+                    line.from + openInfo.langOffset + openInfo.langRawLen,
+                    Decoration.mark({ class: "cm-ir-fence-lang" })
+                  );
+                } else {
+                  addRange(line.from, line.to, Decoration.mark({ class: "cm-ir-fence-muted" }));
+                }
+              } else {
+                const autoLang = scan.fenceAutoLang.get(line.number) || "";
+                const closeLn = scan.fenceEndLine[line.number] || 0;
+                addRange(
+                  line.from,
+                  line.to,
+                  Decoration.replace({ widget: new FenceLangIRWidget(line.number, explicitLang, autoLang) })
+                );
+                if (closeLn > line.number) {
+                  addPoint(line.to, Decoration.widget({ widget: new FenceCopyIRWidget(line.number, closeLn), side: 1 }));
+                }
+              }
             } else {
-              builder.add(line.from, line.to, Decoration.mark({ class: "cm-ir-fence-muted" }));
+              if (fQDepth > 0) {
+                const qp = stripQuotePrefix(text, fQDepth);
+                if (qp.len > 0) addRange(line.from, line.from + qp.len, hideDeco);
+                addRange(line.from + qp.len, line.to, Decoration.mark({ class: "cm-ir-fence-muted" }));
+              } else {
+                addRange(line.from, line.to, Decoration.mark({ class: "cm-ir-fence-muted" }));
+              }
             }
           }
           pos = line.to + 1;
@@ -1398,81 +3148,94 @@ function buildInstantRenderPlugin(): Extension {
         }
 
         if (fState === 2) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-codeblock-line chroma" }));
-          if (!(composing && isCursorLine) && text.length > 0 && text.length < 1200) {
+          let codeLineCls = "cm-ir-codeblock-line chroma";
+          if (fQDepth > 0) {
+            const scanCallout = CALLOUT_NAMES[scan.calloutKind[line.number] || 0] || "";
+            codeLineCls += " " + buildIRQuoteLineCls(fQDepth, scan.quoteEdge[line.number] || 3, scanCallout);
+          }
+          addLine(line.from, codeLineCls);
+          const qp = fQDepth > 0 ? stripQuotePrefix(text, fQDepth) : { stripped: text, len: 0 };
+          if (!isCursorLine && qp.len > 0) {
+            addRange(line.from, line.from + qp.len, hideDeco);
+          }
+          const codeSlice = qp.stripped;
+          const baseOffset = line.from + qp.len;
+          if (!(composing && isCursorLine) && codeSlice.length > 0 && codeSlice.length < 1600) {
             interface CodeTok {
               s: number;
               e: number;
               cls: string;
             }
             const toks: CodeTok[] = [];
-            const used = new Uint8Array(text.length);
+            const used = new Uint8Array(codeSlice.length);
             const claim = (s: number, e: number, cls: string) => {
-              if (s >= e) return;
+              if (s >= e || s < 0 || e > codeSlice.length) return;
               for (let i = s; i < e; i++) if (used[i]) return;
               for (let i = s; i < e; i++) used[i] = 1;
               toks.push({ s, e, cls });
             };
-            let cm: RegExpExecArray | null;
-            const cmtRe = scan.fenceNoHash[line.number] ? /(?:^|\s)(\/\/.*$)/g : /(?:^|\s)(#.*$|\/\/.*$)/g;
-            while ((cm = cmtRe.exec(text)) !== null) {
-              const idx = cm.index + (cm[0].length - cm[1].length);
-              claim(idx, idx + cm[1].length, "c1");
-            }
-            const strRe = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g;
-            while ((cm = strRe.exec(text)) !== null) {
-              claim(cm.index, cm.index + cm[0].length, "s2");
-            }
-            const flagRe = /(?:^|\s)(--?[a-zA-Z][\w-]*)/g;
-            while ((cm = flagRe.exec(text)) !== null) {
-              const idx = cm.index + (cm[0].length - cm[1].length);
-              claim(idx, idx + cm[1].length, "na");
-            }
-            const kwRe =
-              /\b(?:sudo|apt|apt-get|yum|dnf|apk|cd|mkdir|tar|wget|curl|make|export|return|func|const|let|var|if|else|for|import|from|package|type|struct)\b/g;
-            while ((cm = kwRe.exec(text)) !== null) {
-              claim(cm.index, cm.index + cm[0].length, "k");
-            }
-            const numRe = /\b\d+(?:\.\d+)?\b/g;
-            while ((cm = numRe.exec(text)) !== null) {
-              claim(cm.index, cm.index + cm[0].length, "mi");
-            }
-            toks.sort((a, b) => a.s - b.s);
+            highlightIRCodeLine(
+              codeSlice,
+              scan.fenceFam[line.number] || 0,
+              scan.fenceNoHash[line.number] || 0,
+              scan.fenceBlockCmt[line.number] === 1,
+              claim
+            );
+            toks.sort((a, b) => a.s - b.s || a.e - b.e);
             for (const tk of toks) {
-              builder.add(line.from + tk.s, line.from + tk.e, Decoration.mark({ class: tk.cls }));
+              addRange(baseOffset + tk.s, baseOffset + tk.e, Decoration.mark({ class: tk.cls }));
             }
           }
           pos = line.to + 1;
           continue;
         }
 
-        interface SpanOp {
-          from: number;
-          to: number;
-          deco: Decoration;
-        }
-        const ops: SpanOp[] = [];
-        const occupied = new Uint8Array(Math.min(text.length, 2400));
-        const markFree = (s: number, e: number) => {
-          if (s < 0 || e > occupied.length || s >= e) return false;
-          for (let i = s; i < e; i++) if (occupied[i]) return false;
-          for (let i = s; i < e; i++) occupied[i] = 1;
+        const capLen = Math.min(text.length, 2400);
+        const mChars = text.slice(0, capLen).split("");
+        const claimLiteral = (s: number, e: number): boolean => {
+          if (s < 0 || e > capLen || s >= e) return false;
+          for (let i = s; i < e; i++) {
+            if (mChars[i] === "\x01" || mChars[i] === "\x02") return false;
+          }
+          for (let i = s; i < e; i++) mChars[i] = "\x02";
+          return true;
+        };
+        const claimDelims = (openFrom: number, openTo: number, closeFrom: number, closeTo: number): boolean => {
+          if (openFrom < 0 || closeTo > capLen || openFrom > openTo || openTo > closeFrom || closeFrom > closeTo) {
+            return false;
+          }
+          if (openFrom === openTo && closeFrom === closeTo) return false;
+          for (let i = openFrom; i < openTo; i++) {
+            if (mChars[i] === "\x01" || mChars[i] === "\x02") return false;
+          }
+          for (let i = closeFrom; i < closeTo; i++) {
+            if (mChars[i] === "\x01" || mChars[i] === "\x02") return false;
+          }
+          for (let i = openFrom; i < openTo; i++) mChars[i] = "\x01";
+          for (let i = closeFrom; i < closeTo; i++) mChars[i] = "\x01";
           return true;
         };
 
-        // Reserve segments already handled by multi-line <a> decorations in irBlockDecoField
+        // Reserve segments already handled by multi-line <a> and pre-scanned image decorations in irBlockDecoField
         for (const ml of activeMultiLinks) {
           if (line.number >= ml.startLine && line.number <= ml.endLine) {
             const rs = Math.max(0, ml.openFrom - line.from);
-            const re = Math.min(occupied.length, ml.closeTo - line.from);
-            for (let i = rs; i < re; i++) occupied[i] = 1;
+            const re = Math.min(capLen, ml.closeTo - line.from);
+            for (let i = rs; i < re; i++) mChars[i] = "\x02";
+          }
+        }
+        const lineImages = imagesByLine.get(line.number);
+        if (lineImages) {
+          for (const imgSpan of lineImages) {
+            const rs = Math.max(0, imgSpan.spanFrom - line.from);
+            const re = Math.min(capLen, imgSpan.spanTo - line.from);
+            for (let i = rs; i < re; i++) mChars[i] = "\x02";
           }
         }
 
-        // Line-level block decorations (must be emitted at line.from BEFORE inline ops)
         const hm = /^(#{1,6})\s+/.exec(text);
         const htmlHm = !hm ? /^(\s*<h([1-6])\b[^>]*>)(.*)(<\/h\2>\s*)$/i.exec(text) : null;
-        const qm = /^(\s*>\s?)(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*)?/i.exec(text);
+        const qm = /^(\s*(?:>\s?)+)(?:\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*)?/i.exec(text);
         const htmlQm = !qm ? /^(\s*<blockquote\b[^>]*>)(.*)(<\/blockquote>\s*)$/i.exec(text) : null;
         const soloToc = /^\s*\[toc\]\s*$/i.exec(text);
         const dm = !soloToc ? /^\s*:::(?:bookshelf|book|lock)?.*$/i.exec(text) : null;
@@ -1485,159 +3248,153 @@ function buildInstantRenderPlugin(): Extension {
         const alignTagLine = scan.alignTagLine[line.number] === 1;
         const alignKind = scan.alignKind[line.number] || 0;
         if (alignKind) {
-          builder.add(
+          addLine(
             line.from,
-            line.from,
-            Decoration.line({ class: alignKind === 1 ? "cm-ir-center" : alignKind === 2 ? "cm-ir-align-right" : "cm-ir-align-left" })
+            alignKind === 1 ? "cm-ir-center" : alignKind === 2 ? "cm-ir-align-right" : "cm-ir-align-left"
           );
         }
 
         if (alignTagLine) {
-          // Standalone `<div align=center>` / `</div>` wrapper lines stay visible (dimmed source) so they remain
-          // discoverable and editable; inner lines get the alignment class above.
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-align-tag" }));
-          markFree(0, text.length);
+          addLine(line.from, "cm-ir-align-tag");
+          claimLiteral(0, capLen);
         } else if (hm) {
           const lvl = hm[1].length;
-          builder.add(line.from, line.from, Decoration.line({ class: `cm-ir-h cm-ir-h${lvl}` }));
-          if (!isCursorLine && markFree(0, hm[0].length)) {
-            ops.push({ from: line.from, to: line.from + hm[0].length, deco: hideDeco });
+          addLine(line.from, `cm-ir-h cm-ir-h${lvl}`);
+          if (!isCursorLine && claimLiteral(0, hm[0].length)) {
+            addRange(line.from, line.from + hm[0].length, hideDeco);
           }
         } else if (htmlHm) {
           const lvl = Number(htmlHm[2]);
-          builder.add(line.from, line.from, Decoration.line({ class: `cm-ir-h cm-ir-h${lvl}` }));
+          addLine(line.from, `cm-ir-h cm-ir-h${lvl}`);
           if (!isCursorLine) {
             const openLen = htmlHm[1].length;
             const closeStart = text.length - htmlHm[4].length;
-            if (markFree(0, openLen)) ops.push({ from: line.from, to: line.from + openLen, deco: hideDeco });
-            if (markFree(closeStart, text.length)) ops.push({ from: line.from + closeStart, to: line.to, deco: hideDeco });
+            if (claimDelims(0, openLen, closeStart, text.length)) {
+              addRange(line.from, line.from + openLen, hideDeco);
+              addRange(line.from + closeStart, line.to, hideDeco);
+            }
           }
         } else if (qm) {
           const scanCallout = CALLOUT_NAMES[scan.calloutKind[line.number] || 0] || "";
           const alertKind = qm[2] ? qm[2].toLowerCase() : scanCallout;
-          builder.add(
-            line.from,
-            line.from,
-            Decoration.line({ class: alertKind ? `cm-ir-quote cm-ir-callout cm-ir-callout-${alertKind}` : "cm-ir-quote" })
-          );
-          if (!isCursorLine && markFree(0, qm[1].length)) {
-            ops.push({ from: line.from, to: line.from + qm[1].length, deco: hideDeco });
-            if (qm[2] && markFree(qm[1].length, qm[0].length)) {
-              ops.push({
-                from: line.from + qm[1].length,
-                to: line.from + qm[0].length,
-                deco: Decoration.mark({ class: "cm-ir-callout-tag" }),
-              });
+          const depth = scan.quoteDepth[line.number] || Math.min(3, (qm[1].match(/>/g) || []).length);
+          const edge = scan.quoteEdge[line.number] || 3;
+          addLine(line.from, buildIRQuoteLineCls(depth, edge, alertKind));
+          if (!isCursorLine && claimLiteral(0, qm[1].length)) {
+            addRange(line.from, line.from + qm[1].length, hideDeco);
+            if (qm[2] && claimLiteral(qm[1].length, qm[0].length)) {
+              addRange(
+                line.from + qm[1].length,
+                line.from + qm[0].length,
+                Decoration.replace({ widget: new CalloutPillIRWidget(alertKind, line.from + qm[0].length) })
+              );
             }
           }
         } else if (htmlQm) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-quote" }));
+          addLine(line.from, "cm-ir-quote cm-ir-quote-first cm-ir-quote-last");
           if (!isCursorLine) {
             const openLen = htmlQm[1].length;
             const closeStart = text.length - htmlQm[3].length;
-            if (markFree(0, openLen)) ops.push({ from: line.from, to: line.from + openLen, deco: hideDeco });
-            if (markFree(closeStart, text.length)) ops.push({ from: line.from + closeStart, to: line.to, deco: hideDeco });
+            if (claimDelims(0, openLen, closeStart, text.length)) {
+              addRange(line.from, line.from + openLen, hideDeco);
+              addRange(line.from + closeStart, line.to, hideDeco);
+            }
           }
         } else if (soloToc) {
-          if (!isCursorLine && markFree(0, text.length)) {
-            ops.push({
-              from: line.from,
-              to: line.to,
-              deco: Decoration.replace({ widget: new TocIRWidget(line.from, line.to) }),
-            });
+          if (!isCursorLine && claimLiteral(0, text.length)) {
+            addRange(
+              line.from,
+              line.to,
+              Decoration.replace({ widget: new TocIRWidget(line.from, line.to) })
+            );
           } else {
-            builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-directive" }));
+            addLine(line.from, "cm-ir-directive");
           }
         } else if (dm) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-directive" }));
+          addLine(line.from, "cm-ir-directive");
         } else if (hrm) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-hr" }));
-          if (!isCursorLine && markFree(0, text.length)) {
-            ops.push({ from: line.from, to: line.to, deco: hideDeco });
+          addLine(line.from, "cm-ir-hr");
+          if (!isCursorLine && claimLiteral(0, text.length)) {
+            addRange(line.from, line.to, hideDeco);
           }
         } else if (soloBr || listWrapLine) {
-          if (!isCursorLine && markFree(0, text.length)) {
-            ops.push({ from: line.from, to: line.to, deco: hideDeco });
+          if (!isCursorLine && claimLiteral(0, text.length)) {
+            addRange(line.from, line.to, hideDeco);
           }
         } else if (centerLine) {
-          builder.add(line.from, line.from, Decoration.line({ class: "cm-ir-center" }));
+          addLine(line.from, "cm-ir-center");
           if (!isCursorLine) {
             const openLen = centerLine[1].length;
             const closeStart = text.length - centerLine[3].length;
-            if (markFree(0, openLen)) {
-              ops.push({ from: line.from, to: line.from + openLen, deco: hideDeco });
-            }
-            if (markFree(closeStart, text.length)) {
-              ops.push({ from: line.from + closeStart, to: line.to, deco: hideDeco });
+            if (claimDelims(0, openLen, closeStart, text.length)) {
+              addRange(line.from, line.from + openLen, hideDeco);
+              addRange(line.from + closeStart, line.to, hideDeco);
             }
           }
         } else if (pLine && !isCursorLine) {
           const openLen = pLine[1].length;
           const closeStart = text.length - pLine[3].length;
-          if (markFree(0, openLen)) ops.push({ from: line.from, to: line.from + openLen, deco: hideDeco });
-          if (markFree(closeStart, text.length)) ops.push({ from: line.from + closeStart, to: line.to, deco: hideDeco });
+          if (claimDelims(0, openLen, closeStart, text.length)) {
+            addRange(line.from, line.from + openLen, hideDeco);
+            addRange(line.from + closeStart, line.to, hideDeco);
+          }
         } else if (liLine && !isCursorLine) {
           const openLen = liLine[1].length;
           const closeStart = text.length - liLine[3].length;
-          if (markFree(0, openLen)) {
-            ops.push({
-              from: line.from,
-              to: line.from + openLen,
-              deco: Decoration.replace({ widget: new BulletIRWidget() }),
-            });
-          }
-          if (markFree(closeStart, text.length)) {
-            ops.push({ from: line.from + closeStart, to: line.to, deco: hideDeco });
+          if (claimDelims(0, openLen, closeStart, text.length)) {
+            addRange(
+              line.from,
+              line.from + openLen,
+              Decoration.replace({ widget: new BulletIRWidget() })
+            );
+            addRange(line.from + closeStart, line.to, hideDeco);
           }
         }
 
-        // Inline decorations on non-cursor lines (never applied when IME is composing on cursor line)
+        // Inline decorations on non-cursor / non-active-search lines (never applied when IME is composing on cursor line)
         if (!isCursorLine && text.length > 0 && text.length <= 2400) {
-          // Interactive task checkbox (- [ ] / - [x])
-          const tm = /^(\s*)([-*+]\s+)(\[[ xX]\])(\s+)/.exec(text);
+          // Interactive task checkbox (- [ ] / - [x] and blockquote > - [ ] / > - [x])
+          const tm = /^((?: {0,3}>\s?)*\s*)([-*+]\s+)(\[[ xX]\])(\s+)/.exec(text);
           if (tm) {
             const bulletStart = tm[1].length;
             const boxStart = bulletStart + tm[2].length;
             const boxEnd = boxStart + tm[3].length;
-            if (markFree(bulletStart, boxEnd)) {
+            if (claimLiteral(bulletStart, boxEnd)) {
               const checked = /x/i.test(tm[3]);
-              ops.push({ from: line.from + bulletStart, to: line.from + boxStart, deco: hideDeco });
-              ops.push({
-                from: line.from + boxStart,
-                to: line.from + boxEnd,
-                deco: Decoration.replace({
+              addRange(line.from + bulletStart, line.from + boxStart, hideDeco);
+              addRange(
+                line.from + boxStart,
+                line.from + boxEnd,
+                Decoration.replace({
                   widget: new TaskCheckboxIRWidget(checked, line.from + boxStart, line.from + boxEnd),
-                }),
-              });
+                })
+              );
             }
           }
 
-          // Inline code `...` / ``a ` b`` (claim first so raw tags/flags/math/URLs inside backticks stay literal)
+          // Inline code `...` / ``a ` b`` (atomic literal: claim entire span as \x02)
           const codeRe = /(`+)(?!`)([^\n]+?)(?<!`)\1(?!`)/g;
           let m: RegExpExecArray | null;
-          while ((m = codeRe.exec(text)) !== null) {
+          let curMask = mChars.join("");
+          while ((m = codeRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
             const tLen = m[1].length;
-            if (e - s > tLen * 2 && markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + tLen, deco: hideDeco });
-              ops.push({
-                from: line.from + s + tLen,
-                to: line.from + e - tLen,
-                deco: Decoration.mark({ class: "cm-ir-inline-code" }),
-              });
-              ops.push({ from: line.from + e - tLen, to: line.from + e, deco: hideDeco });
+            if (e - s > tLen * 2 && claimLiteral(s, e)) {
+              addRange(line.from + s, line.from + s + tLen, hideDeco);
+              addRange(line.from + s + tLen, line.from + e - tLen, Decoration.mark({ class: "cm-ir-inline-code" }));
+              addRange(line.from + e - tLen, line.from + e, hideDeco);
             }
           }
 
           // Standalone Bilibili / YouTube embed preview widget
           const soloEmbed = matchStandaloneEmbedVideo(text);
-          if (soloEmbed && markFree(0, text.length)) {
-            ops.push({
-              from: line.from,
-              to: line.to,
-              deco: Decoration.replace({ widget: new EmbedVideoIRWidget(soloEmbed, line.from, line.to) }),
-            });
+          if (soloEmbed && claimLiteral(0, text.length)) {
+            addRange(
+              line.from,
+              line.to,
+              Decoration.replace({ widget: new EmbedVideoIRWidget(soloEmbed, line.from, line.to) })
+            );
           }
 
           // Standalone Markdown video/audio link ([title](/uploads/demo.mp4))
@@ -1645,43 +3402,44 @@ function buildInstantRenderPlugin(): Extension {
           if (soloMediaLink) {
             const target = parseMarkdownImageTarget(soloMediaLink[2] || "");
             if (/^(?:\/|https?:\/\/)/i.test(target)) {
-              if (isVideoMedia("", target) && markFree(0, text.length)) {
-                ops.push({
-                  from: line.from,
-                  to: line.to,
-                  deco: Decoration.replace({ widget: new VideoIRWidget(target, line.from, line.to) }),
-                });
-              } else if (isAudioMedia("", target) && markFree(0, text.length)) {
-                ops.push({
-                  from: line.from,
-                  to: line.to,
-                  deco: Decoration.replace({ widget: new AudioIRWidget(target, line.from, line.to) }),
-                });
+              if (isVideoMedia("", target) && claimLiteral(0, text.length)) {
+                addRange(
+                  line.from,
+                  line.to,
+                  Decoration.replace({ widget: new VideoIRWidget(target, line.from, line.to) })
+                );
+              } else if (isAudioMedia("", target) && claimLiteral(0, text.length)) {
+                addRange(
+                  line.from,
+                  line.to,
+                  Decoration.replace({ widget: new AudioIRWidget(target, line.from, line.to) })
+                );
               }
             }
           }
 
           // Footnote references [^id] (claim before ^sup^ and [label](url))
-          const fnRefRe = /\[\^([^\s\]\n]+)\]/g;
-          while ((m = fnRefRe.exec(text)) !== null) {
+          curMask = mChars.join("");
+          const fnRefRe = /\[\^([^\s\]\n\x01\x02]+)\]/g;
+          while ((m = fnRefRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: Decoration.mark({ class: "cm-ir-sup cm-ir-link" }),
-              });
+            if (claimLiteral(s, e)) {
+              addRange(line.from + s, line.from + e, Decoration.mark({ class: "cm-ir-sup cm-ir-link" }));
             }
           }
 
           // HTML inline <code>...</code>, <kbd>...</kbd>, <sup>...</sup>, <sub>...</sub>
+          curMask = mChars.join("");
           const htmlTechRe = /(<(code|kbd|sup|sub)\b[^>]*>)([^<\n]+)(<\/\2>)/gi;
-          while ((m = htmlTechRe.exec(text)) !== null) {
+          while ((m = htmlTechRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
-              const tName = m[2].toLowerCase();
+            const tName = m[2].toLowerCase();
+            const openEnd = s + m[1].length;
+            const closeStart = e - m[4].length;
+            const ok = tName === "code" ? claimLiteral(s, e) : claimDelims(s, openEnd, closeStart, e);
+            if (ok) {
               const cls =
                 tName === "code"
                   ? "cm-ir-inline-code"
@@ -1690,139 +3448,125 @@ function buildInstantRenderPlugin(): Extension {
                   : tName === "sup"
                   ? "cm-ir-sup"
                   : "cm-ir-sub";
-              const openEnd = s + m[1].length;
-              const closeStart = e - m[4].length;
-              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
-              ops.push({ from: line.from + openEnd, to: line.from + closeStart, deco: Decoration.mark({ class: cls }) });
-              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
+              addRange(line.from + s, line.from + openEnd, hideDeco);
+              addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: cls }));
+              addRange(line.from + closeStart, line.from + e, hideDeco);
             }
           }
 
           // Inline <br> / <br/> / <br /> inside prose lines
+          curMask = mChars.join("");
           const brRe = /<br\s*\/?>/gi;
-          while ((m = brRe.exec(text)) !== null) {
+          while ((m = brRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
+            if (claimLiteral(s, e)) {
               const trailingOnly = /^\s*$/.test(text.slice(e));
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: trailingOnly ? hideDeco : Decoration.replace({ widget: new BrIRWidget() }),
-              });
+              addRange(
+                line.from + s,
+                line.from + e,
+                trailingOnly ? hideDeco : Decoration.replace({ widget: new BrIRWidget() })
+              );
             }
           }
 
-          // Linear-time <font color="...">...</font>
+          // Linear-time <font color="...">...</font> (delimiter-only claim + data-volo-color for dark mode)
+          curMask = mChars.join("");
           const fontRe = /(<font\b[^>]*>)([^<\n]+)(<\/font>)/gi;
-          while ((m = fontRe.exec(text)) !== null) {
+          while ((m = fontRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            const rawColor = readHtmlAttr(m[1], "color");
-            if (rawColor && SAFE_IR_COLOR_RE.test(rawColor) && markFree(s, e)) {
-              const openEnd = s + m[1].length;
-              const closeStart = e - m[3].length;
-              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
-              ops.push({
-                from: line.from + openEnd,
-                to: line.from + closeStart,
-                deco: Decoration.mark({ attributes: { style: `color: ${rawColor};` } }),
-              });
-              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
+            const rawColor = readHtmlAttr(text.slice(s, s + m[1].length), "color");
+            const openEnd = s + m[1].length;
+            const closeStart = e - m[3].length;
+            if (rawColor && SAFE_IR_COLOR_RE.test(rawColor) && claimDelims(s, openEnd, closeStart, e)) {
+              const normColor = rawColor.trim().toLowerCase();
+              addRange(line.from + s, line.from + openEnd, hideDeco);
+              addRange(
+                line.from + openEnd,
+                line.from + closeStart,
+                Decoration.mark({
+                  attributes: { style: `color: ${rawColor};`, "data-volo-color": normColor },
+                })
+              );
+              addRange(line.from + closeStart, line.from + e, hideDeco);
             }
           }
 
           // Linear-time <span style="color: ...">...</span>
+          curMask = mChars.join("");
           const spanRe = /(<span\b[^>]*>)([^<\n]+)(<\/span>)/gi;
-          while ((m = spanRe.exec(text)) !== null) {
+          while ((m = spanRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            const rawStyle = readHtmlAttr(m[1], "style");
+            const rawStyle = readHtmlAttr(text.slice(s, s + m[1].length), "style");
             const colorMatch = /^\s*color\s*:\s*([^;]+)\s*;?\s*$/i.exec(rawStyle);
             const safeColor = colorMatch ? colorMatch[1].trim() : "";
-            if (safeColor && SAFE_IR_COLOR_RE.test(safeColor) && markFree(s, e)) {
-              const openEnd = s + m[1].length;
-              const closeStart = e - m[3].length;
-              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
-              ops.push({
-                from: line.from + openEnd,
-                to: line.from + closeStart,
-                deco: Decoration.mark({ attributes: { style: `color: ${safeColor};` } }),
-              });
-              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
+            const openEnd = s + m[1].length;
+            const closeStart = e - m[3].length;
+            if (safeColor && SAFE_IR_COLOR_RE.test(safeColor) && claimDelims(s, openEnd, closeStart, e)) {
+              addRange(line.from + s, line.from + openEnd, hideDeco);
+              addRange(
+                line.from + openEnd,
+                line.from + closeStart,
+                Decoration.mark({
+                  attributes: { style: `color: ${safeColor};`, "data-volo-color": safeColor.toLowerCase() },
+                })
+              );
+              addRange(line.from + closeStart, line.from + e, hideDeco);
             }
           }
 
           // Highlight <mark>...</mark>
+          curMask = mChars.join("");
           const markRe = /(<mark>)([^<\n]+)(<\/mark>)/gi;
-          while ((m = markRe.exec(text)) !== null) {
+          while ((m = markRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 6, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 6,
-                to: line.from + e - 7,
-                deco: Decoration.mark({ class: "cm-ir-mark" }),
-              });
-              ops.push({ from: line.from + e - 7, to: line.from + e, deco: hideDeco });
+            if (claimDelims(s, s + 6, e - 7, e)) {
+              addRange(line.from + s, line.from + s + 6, hideDeco);
+              addRange(line.from + s + 6, line.from + e - 7, Decoration.mark({ class: "cm-ir-mark" }));
+              addRange(line.from + e - 7, line.from + e, hideDeco);
             }
           }
 
           // Underline <u>...</u>
+          curMask = mChars.join("");
           const uRe = /(<u>)([^<\n]+)(<\/u>)/gi;
-          while ((m = uRe.exec(text)) !== null) {
+          while ((m = uRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 3, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 3,
-                to: line.from + e - 4,
-                deco: Decoration.mark({ class: "cm-ir-underline" }),
-              });
-              ops.push({ from: line.from + e - 4, to: line.from + e, deco: hideDeco });
+            if (claimDelims(s, s + 3, e - 4, e)) {
+              addRange(line.from + s, line.from + s + 3, hideDeco);
+              addRange(line.from + s + 3, line.from + e - 4, Decoration.mark({ class: "cm-ir-underline" }));
+              addRange(line.from + e - 4, line.from + e, hideDeco);
             }
           }
 
           // Single-line HTML <a ...>...</a> links
-          const htmlLinkRe =
-            /(<a\b(?:"[^"]*"|'[^']*'|[^"'>])*?>)((?:<(?:strong|b|em|i)>)?[^<\n]+(?:<\/(?:strong|b|em|i)>)?)(<\/a>)/gi;
-          while ((m = htmlLinkRe.exec(text)) !== null) {
+          curMask = mChars.join("");
+          const htmlLinkRe = /(<a\b(?:"[^"]*"|'[^']*'|[^"'>])*?>)([^<\n]+)(<\/a>)/gi;
+          while ((m = htmlLinkRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
-              const openEnd = s + m[1].length;
-              const closeStart = e - m[3].length;
-              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
-              const innerWrap = /^<(strong|b|em|i)>([^<\n]+)<\/\1>$/i.exec(m[2]);
-              if (innerWrap) {
-                const subOpen = openEnd + innerWrap[1].length + 2;
-                const subClose = closeStart - (innerWrap[1].length + 3);
-                const wCls =
-                  innerWrap[1].toLowerCase() === "strong" || innerWrap[1].toLowerCase() === "b"
-                    ? "cm-ir-link cm-ir-bold"
-                    : "cm-ir-link cm-ir-italic";
-                ops.push({ from: line.from + openEnd, to: line.from + subOpen, deco: hideDeco });
-                ops.push({ from: line.from + subOpen, to: line.from + subClose, deco: Decoration.mark({ class: wCls }) });
-                ops.push({ from: line.from + subClose, to: line.from + closeStart, deco: hideDeco });
-              } else {
-                ops.push({
-                  from: line.from + openEnd,
-                  to: line.from + closeStart,
-                  deco: Decoration.mark({ class: "cm-ir-link" }),
-                });
-              }
-              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
+            const openEnd = s + m[1].length;
+            const closeStart = e - m[3].length;
+            if (claimDelims(s, openEnd, closeStart, e)) {
+              addRange(line.from + s, line.from + openEnd, hideDeco);
+              addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: "cm-ir-link" }));
+              addRange(line.from + closeStart, line.from + e, hideDeco);
             }
           }
 
           // HTML inline formatting tags (<strong>/<b>, <em>/<i>, <s>/<del>/<strike>)
+          curMask = mChars.join("");
           const htmlFmtRe = /(<(strong|b|em|i|s|del|strike)>)([^<\n]+)(<\/\2>)/gi;
-          while ((m = htmlFmtRe.exec(text)) !== null) {
+          while ((m = htmlFmtRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
+            const openEnd = s + m[1].length;
+            const closeStart = e - m[4].length;
+            if (claimDelims(s, openEnd, closeStart, e)) {
               const tagLow = m[2].toLowerCase();
               const cls =
                 tagLow === "strong" || tagLow === "b"
@@ -1830,287 +3574,201 @@ function buildInstantRenderPlugin(): Extension {
                   : tagLow === "em" || tagLow === "i"
                   ? "cm-ir-italic"
                   : "cm-ir-strike";
-              const openEnd = s + m[1].length;
-              const closeStart = e - m[4].length;
-              ops.push({ from: line.from + s, to: line.from + openEnd, deco: hideDeco });
-              ops.push({
-                from: line.from + openEnd,
-                to: line.from + closeStart,
-                deco: Decoration.mark({ class: cls }),
-              });
-              ops.push({ from: line.from + closeStart, to: line.from + e, deco: hideDeco });
-            }
-          }
-
-          // Linked images [![alt](src)](href): render the image and collapse the link wrapper into a host chip
-          const linkedImgRe =
-            /\[!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
-          while ((m = linkedImgRe.exec(text)) !== null) {
-            const alt = (m[1] || "").trim();
-            const rawTarget = parseMarkdownImageTarget(m[2] || "");
-            const resolvedSrc = resolveIRImageSrc(rawTarget);
-            if (!resolvedSrc) continue;
-            const href = parseMarkdownImageTarget(m[3] || "");
-            const s = m.index;
-            const e = s + m[0].length;
-            const imgFrom = s + 1;
-            const imgTo = imgFrom + 2 + m[1].length + 2 + m[2].length + 1;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + imgFrom, deco: hideDeco });
-              ops.push({
-                from: line.from + imgFrom,
-                to: line.from + imgTo,
-                deco: Decoration.replace({
-                  widget: new ImageIRWidget(resolvedSrc, rawTarget, alt, line.from + imgFrom, line.from + e),
-                }),
-              });
-              ops.push({
-                from: line.from + imgTo,
-                to: line.from + e,
-                deco: Decoration.replace({ widget: new LinkedImageBadgeIRWidget(href, line.from + e) }),
-              });
-            }
-          }
-
-          // Markdown Images ![alt](url) on non-cursor lines
-          const mdImgRe = /!\[([^[\]\n]*)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
-          while ((m = mdImgRe.exec(text)) !== null) {
-            const alt = (m[1] || "").trim();
-            const rawTarget = parseMarkdownImageTarget(m[2] || "");
-            const resolvedSrc = resolveIRImageSrc(rawTarget);
-            if (!resolvedSrc) continue;
-            const s = m.index;
-            const e = s + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: Decoration.replace({
-                  widget: new ImageIRWidget(resolvedSrc, rawTarget, alt, line.from + s, line.from + e),
-                }),
-              });
-            }
-          }
-
-          // Linear-time HTML <img ...> on non-cursor lines
-          const htmlImgRe = /<img\b[^>]*>/gi;
-          while ((m = htmlImgRe.exec(text)) !== null) {
-            const rawTarget = readHtmlAttr(m[0], "src");
-            const resolvedSrc = resolveIRImageSrc(rawTarget);
-            if (!resolvedSrc) continue;
-            const alt = readHtmlAttr(m[0], "alt");
-            const s = m.index;
-            const e = s + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: Decoration.replace({
-                  widget: new ImageIRWidget(resolvedSrc, rawTarget, alt, line.from + s, line.from + e),
-                }),
-              });
+              addRange(line.from + s, line.from + openEnd, hideDeco);
+              addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: cls }));
+              addRange(line.from + closeStart, line.from + e, hideDeco);
             }
           }
 
           // Linear-time <audio ...></audio> player on non-cursor lines
+          curMask = mChars.join("");
           const audioRe = /(<audio\b[^>]*>)\s*(?:<\/audio>)?/gi;
-          while ((m = audioRe.exec(text)) !== null) {
-            const rawSrc = readHtmlAttr(m[1], "src");
-            if (!rawSrc || !/^(?:\/|https?:\/\/)/i.test(rawSrc)) continue;
+          while ((m = audioRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = m.index + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: Decoration.replace({ widget: new AudioIRWidget(rawSrc, line.from + s, line.from + e) }),
-              });
+            const rawSrc = readHtmlAttr(text.slice(s, s + m[1].length), "src");
+            if (!rawSrc || !/^(?:\/|https?:\/\/)/i.test(rawSrc)) continue;
+            if (claimLiteral(s, e)) {
+              addRange(
+                line.from + s,
+                line.from + e,
+                Decoration.replace({ widget: new AudioIRWidget(rawSrc, line.from + s, line.from + e) })
+              );
             }
           }
 
           // Linear-time <video ...></video> player on non-cursor lines
+          curMask = mChars.join("");
           const videoRe = /(<video\b[^>]*>)\s*(?:<\/video>)?/gi;
-          while ((m = videoRe.exec(text)) !== null) {
-            const rawSrc = readHtmlAttr(m[1], "src");
+          while ((m = videoRe.exec(curMask)) !== null) {
+            const s = m.index;
+            const e = m.index + m[0].length;
+            const rawSrc = readHtmlAttr(text.slice(s, s + m[1].length), "src");
             if (!rawSrc || !/^(?:\/|https?:\/\/)/i.test(rawSrc)) continue;
-            const s = m.index;
-            const e = m.index + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: Decoration.replace({ widget: new VideoIRWidget(rawSrc, line.from + s, line.from + e) }),
-              });
+            if (claimLiteral(s, e)) {
+              addRange(
+                line.from + s,
+                line.from + e,
+                Decoration.replace({ widget: new VideoIRWidget(rawSrc, line.from + s, line.from + e) })
+              );
             }
           }
 
-          // Markdown Links [label](url)
-          const linkRe = /(?<!!)\[([^[\]\n]+)\]\((?!\))([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)/g;
-          while ((m = linkRe.exec(text)) !== null) {
+          // Volo Wiki Links [[slug]] / [[slug|label]]
+          curMask = mChars.join("");
+          const wikiRe = /\[\[([^[\]\n|\x01\x02]+?)(?:\|([^[\]\n]+))?\]\]/g;
+          while ((m = wikiRe.exec(curMask)) !== null) {
             const s = m.index;
-            const e = m.index + m[0].length;
-            const rawLabel = m[1];
-            const labelLen = rawLabel.length;
-            if (markFree(s, e)) {
-              const boldWrap = /^\*\*([^*]+)\*\*$/.exec(rawLabel);
-              if (boldWrap) {
-                ops.push({ from: line.from + s, to: line.from + s + 3, deco: hideDeco });
-                ops.push({
-                  from: line.from + s + 3,
-                  to: line.from + s + 1 + labelLen - 2,
-                  deco: Decoration.mark({ class: "cm-ir-link cm-ir-bold" }),
-                });
-                ops.push({ from: line.from + s + 1 + labelLen - 2, to: line.from + e, deco: hideDeco });
-              } else {
-                ops.push({ from: line.from + s, to: line.from + s + 1, deco: hideDeco });
-                ops.push({
-                  from: line.from + s + 1,
-                  to: line.from + s + 1 + labelLen,
-                  deco: Decoration.mark({ class: "cm-ir-link" }),
-                });
-                ops.push({ from: line.from + s + 1 + labelLen, to: line.from + e, deco: hideDeco });
-              }
+            const e = s + m[0].length;
+            const slug = text.slice(s + 2, s + 2 + m[1].length).trim();
+            if (!slug) continue;
+            const hasAlias = m[2] !== undefined;
+            const openEnd = hasAlias ? s + 2 + m[1].length + 1 : s + 2;
+            const closeStart = e - 2;
+            if (openEnd < closeStart && claimDelims(s, openEnd, closeStart, e)) {
+              addRange(line.from + s, line.from + openEnd, hideDeco);
+              addRange(
+                line.from + openEnd,
+                line.from + closeStart,
+                Decoration.mark({
+                  class: "cm-ir-link cm-ir-wikilink",
+                  attributes: { "data-wiki-slug": slug },
+                })
+              );
+              addRange(line.from + closeStart, line.from + e, hideDeco);
             }
           }
 
-          // Bare URL autolinks in prose (claim BEFORE math/strike/italic/sup/sub so URLs with ~, *, ^, $ stay intact)
-          const bareUrlRe = /\bhttps?:\/\/[^\s<>()[\]"']+/gi;
-          while ((m = bareUrlRe.exec(text)) !== null) {
+          // Markdown Links [label](url) — delimiter-only occupied so [`code` link](url) and [Click **here**](url) compose!
+          curMask = mChars.join("");
+          const linkRe = /(?<!!)\[([^[\]\n]+)\]\((?!\))([^()\n\x01\x02]*(?:\([^()\n\x01\x02]*\)[^()\n\x01\x02]*)*)\)/g;
+          while ((m = linkRe.exec(curMask)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            const labelLen = m[1].length;
+            const openEnd = s + 1;
+            const closeStart = s + 1 + labelLen;
+            if (claimDelims(s, openEnd, closeStart, e)) {
+              for (let i = closeStart; i < e; i++) mChars[i] = "\x02";
+              addRange(line.from + s, line.from + openEnd, hideDeco);
+              addRange(line.from + openEnd, line.from + closeStart, Decoration.mark({ class: "cm-ir-link" }));
+              addRange(line.from + closeStart, line.from + e, hideDeco);
+            }
+          }
+
+          // Bare URL autolinks in prose (claim literal BEFORE math/strike/italic/sup/sub)
+          curMask = mChars.join("");
+          const bareUrlRe = /\bhttps?:\/\/[^\s<>()[\]"'\x01\x02]+/gi;
+          while ((m = bareUrlRe.exec(curMask)) !== null) {
             const s = m.index;
             let e = s + m[0].length;
             while (e > s && /[.,;:!?]$/.test(text[e - 1])) e--;
-            if (e > s && markFree(s, e)) {
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: Decoration.mark({ class: "cm-ir-link" }),
-              });
+            if (e > s && claimLiteral(s, e)) {
+              addRange(line.from + s, line.from + e, Decoration.mark({ class: "cm-ir-link" }));
             }
           }
 
-          // Inline LaTeX math $...$ (Pandoc & CJK currency-safe, skipping bare URLs) & \(...\)
-          const inlineMathRe = /(?:^|[^\\$])\$(?!\s|\$)([^\n$]*?[^\s\\$])\$(?![0-9a-zA-Z\\$])|\\\(([^\n]+?)\\\)/g;
-          while ((m = inlineMathRe.exec(text)) !== null) {
+          // Inline LaTeX math $...$ & \(...\) (atomic literal span)
+          curMask = mChars.join("");
+          const inlineMathRe =
+            /(?:^|[^\\$])\$(?!\s|\$)([^\n$\x01\x02]*?[^\s\\$\x01\x02])\$(?![0-9a-zA-Z\\$])|\\\(([^\n\x01\x02]+?)\\\)/g;
+          while ((m = inlineMathRe.exec(curMask)) !== null) {
             const isParen = m[2] !== undefined;
             const lead = isParen || m[0].startsWith("$") ? 0 : 1;
             const s = m.index + lead;
             const e = m.index + m[0].length;
-            const expr = (isParen ? m[2] : m[1] || "").trim();
-            if (expr && (isParen || isLikelyInlineMath(expr)) && markFree(s, e)) {
-              ops.push({
-                from: line.from + s,
-                to: line.from + e,
-                deco: Decoration.replace({
+            const rawInner = isParen ? text.slice(s + 2, e - 2) : text.slice(s + 1, e - 1);
+            const expr = rawInner.trim();
+            if (expr && (isParen || isLikelyInlineMath(expr)) && claimLiteral(s, e)) {
+              addRange(
+                line.from + s,
+                line.from + e,
+                Decoration.replace({
                   widget: new MathInlineIRWidget(expr, line.from + s, line.from + e),
-                }),
-              });
+                })
+              );
             }
           }
 
-          // Bold **...**
-          const boldRe = /\*\*([^*\n]+)\*\*/g;
-          while ((m = boldRe.exec(text)) !== null) {
-            const s = m.index;
-            const e = s + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 2, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 2,
-                to: line.from + e - 2,
-                deco: Decoration.mark({ class: "cm-ir-bold" }),
-              });
-              ops.push({ from: line.from + e - 2, to: line.from + e, deco: hideDeco });
-            }
-          }
-
-          // Extended Highlight ==...==
+          // Extended Highlight ==...== (delimiter-only so ==mark **bold**== composes)
+          curMask = mChars.join("");
           const eqMarkRe = /(?:^|[^=])==(?!=|\s)([^=\n]*?[^\s=])==(?!=)/g;
-          while ((m = eqMarkRe.exec(text)) !== null) {
+          while ((m = eqMarkRe.exec(curMask)) !== null) {
             const lead = m[0].startsWith("=") ? 0 : 1;
             const s = m.index + lead;
             const e = m.index + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 2, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 2,
-                to: line.from + e - 2,
-                deco: Decoration.mark({ class: "cm-ir-mark" }),
-              });
-              ops.push({ from: line.from + e - 2, to: line.from + e, deco: hideDeco });
+            if (claimDelims(s, s + 2, e - 2, e)) {
+              addRange(line.from + s, line.from + s + 2, hideDeco);
+              addRange(line.from + s + 2, line.from + e - 2, Decoration.mark({ class: "cm-ir-mark" }));
+              addRange(line.from + e - 2, line.from + e, hideDeco);
+            }
+          }
+
+          // Bold **...** (supports nested *italic* inside **bold *italic*** and *italic **bold***)
+          curMask = mChars.join("");
+          const boldRe = /\*\*(?!\s)((?:[^*\n]|\*(?!\s|\*)(?:[^*\n]*?[^\s*\n])?\*)+?)\*\*/g;
+          while ((m = boldRe.exec(curMask)) !== null) {
+            const s = m.index;
+            const e = s + m[0].length;
+            if (claimDelims(s, s + 2, e - 2, e)) {
+              addRange(line.from + s, line.from + s + 2, hideDeco);
+              addRange(line.from + s + 2, line.from + e - 2, Decoration.mark({ class: "cm-ir-bold" }));
+              addRange(line.from + e - 2, line.from + e, hideDeco);
             }
           }
 
           // Strikethrough ~~...~~ (must run BEFORE single-tilde ~sub~)
+          curMask = mChars.join("");
           const strikeRe = /~~([^~\n]+)~~/g;
-          while ((m = strikeRe.exec(text)) !== null) {
+          while ((m = strikeRe.exec(curMask)) !== null) {
             const s = m.index;
             const e = s + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 2, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 2,
-                to: line.from + e - 2,
-                deco: Decoration.mark({ class: "cm-ir-strike" }),
-              });
-              ops.push({ from: line.from + e - 2, to: line.from + e, deco: hideDeco });
+            if (claimDelims(s, s + 2, e - 2, e)) {
+              addRange(line.from + s, line.from + s + 2, hideDeco);
+              addRange(line.from + s + 2, line.from + e - 2, Decoration.mark({ class: "cm-ir-strike" }));
+              addRange(line.from + e - 2, line.from + e, hideDeco);
             }
           }
 
           // Italic *...*
+          curMask = mChars.join("");
           const italicRe = /(?:^|[^*])\*([^*\s][^*\n]*?)\*(?!\*)/g;
-          while ((m = italicRe.exec(text)) !== null) {
+          while ((m = italicRe.exec(curMask)) !== null) {
             const fullOffset = m[0].startsWith("*") ? 0 : 1;
             const s = m.index + fullOffset;
             const e = m.index + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 1, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 1,
-                to: line.from + e - 1,
-                deco: Decoration.mark({ class: "cm-ir-italic" }),
-              });
-              ops.push({ from: line.from + e - 1, to: line.from + e, deco: hideDeco });
+            if (claimDelims(s, s + 1, e - 1, e)) {
+              addRange(line.from + s, line.from + s + 1, hideDeco);
+              addRange(line.from + s + 1, line.from + e - 1, Decoration.mark({ class: "cm-ir-italic" }));
+              addRange(line.from + e - 1, line.from + e, hideDeco);
             }
           }
 
           // Extended Superscript ^sup^
+          curMask = mChars.join("");
           const supRe = /(?:^|[^^\\[])\^([^\s^\n[\]]+)\^(?!\^)/g;
-          while ((m = supRe.exec(text)) !== null) {
+          while ((m = supRe.exec(curMask)) !== null) {
             const lead = m[0].startsWith("^") ? 0 : 1;
             const s = m.index + lead;
             const e = m.index + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 1, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 1,
-                to: line.from + e - 1,
-                deco: Decoration.mark({ class: "cm-ir-sup" }),
-              });
-              ops.push({ from: line.from + e - 1, to: line.from + e, deco: hideDeco });
+            if (claimDelims(s, s + 1, e - 1, e)) {
+              addRange(line.from + s, line.from + s + 1, hideDeco);
+              addRange(line.from + s + 1, line.from + e - 1, Decoration.mark({ class: "cm-ir-sup" }));
+              addRange(line.from + e - 1, line.from + e, hideDeco);
             }
           }
 
           // Extended Subscript ~sub~
+          curMask = mChars.join("");
           const subRe = /(?:^|[^~\\/])~([^\s~\n/]+)~(?!~)/g;
-          while ((m = subRe.exec(text)) !== null) {
+          while ((m = subRe.exec(curMask)) !== null) {
             const lead = m[0].startsWith("~") ? 0 : 1;
             const s = m.index + lead;
             const e = m.index + m[0].length;
-            if (markFree(s, e)) {
-              ops.push({ from: line.from + s, to: line.from + s + 1, deco: hideDeco });
-              ops.push({
-                from: line.from + s + 1,
-                to: line.from + e - 1,
-                deco: Decoration.mark({ class: "cm-ir-sub" }),
-              });
-              ops.push({ from: line.from + e - 1, to: line.from + e, deco: hideDeco });
-            }
-          }
-
-          ops.sort((a, b) => a.from - b.from || a.to - b.to);
-          for (const op of ops) {
-            if (op.from < op.to) {
-              builder.add(op.from, op.to, op.deco);
+            if (claimDelims(s, s + 1, e - 1, e)) {
+              addRange(line.from + s, line.from + s + 1, hideDeco);
+              addRange(line.from + s + 1, line.from + e - 1, Decoration.mark({ class: "cm-ir-sub" }));
+              addRange(line.from + e - 1, line.from + e, hideDeco);
             }
           }
         }
@@ -2118,7 +3776,7 @@ function buildInstantRenderPlugin(): Extension {
         pos = line.to + 1;
       }
     }
-    return builder.finish();
+    return Decoration.set(allRanges, true);
   };
 
   const irPlugin = ViewPlugin.fromClass(
@@ -2136,9 +3794,11 @@ function buildInstantRenderPlugin(): Extension {
       readonly view: EditorView;
       readonly onMouseDown: (e: MouseEvent) => void;
       readonly onScroll: () => void;
+      readonly onWheel: () => void;
 
       constructor(view: EditorView) {
         this.view = view;
+        activeIRViews.add(view);
         this.wasComposing = view.composing;
         this.decorations = buildDecos(view);
         const ln = view.state.doc.lineAt(view.state.selection.main.head);
@@ -2155,9 +3815,14 @@ function buildInstantRenderPlugin(): Extension {
         };
         this.onScroll = () => {
           this.currentScrollTop = view.scrollDOM.scrollTop;
+          lastIRScrollActivityAt = performance.now();
+        };
+        this.onWheel = () => {
+          lastIRScrollActivityAt = performance.now();
         };
         view.dom.addEventListener("mousedown", this.onMouseDown, true);
         view.scrollDOM.addEventListener("scroll", this.onScroll, { passive: true });
+        view.scrollDOM.addEventListener("wheel", this.onWheel, { passive: true });
         this.scheduleHeadSample(view);
         if (view.hasFocus !== (view.state.field(irFocusedField, false) ?? false)) {
           const nextFoc = view.hasFocus;
@@ -2215,8 +3880,16 @@ function buildInstantRenderPlugin(): Extension {
         const prevHadImg = this.activeLineHasImg;
         const nextHasImg = focused ? lineHasIRTallWidget(state, nextLine.number, nextLine.text) : false;
         const lineChanged = nextLineNo !== prevLineNo;
+        const searchChanged = update.transactions.some((tr) => tr.effects.some((e) => e.is(setSearchStateEffect)));
 
-        if (update.docChanged || update.viewportChanged || update.selectionSet || update.focusChanged || composingChanged) {
+        if (
+          update.docChanged ||
+          update.viewportChanged ||
+          update.selectionSet ||
+          update.focusChanged ||
+          composingChanged ||
+          searchChanged
+        ) {
           this.decorations = buildDecos(update.view);
         }
 
@@ -2304,8 +3977,10 @@ function buildInstantRenderPlugin(): Extension {
 
       destroy() {
         this.destroyed = true;
+        activeIRViews.delete(this.view);
         this.view.dom.removeEventListener("mousedown", this.onMouseDown, true);
         this.view.scrollDOM.removeEventListener("scroll", this.onScroll);
+        this.view.scrollDOM.removeEventListener("wheel", this.onWheel);
       }
     },
     { decorations: (v) => v.decorations }
@@ -2316,8 +3991,113 @@ function buildInstantRenderPlugin(): Extension {
 
 const MAX_IR_IMG_W = 560;
 const MAX_IR_IMG_H = 260;
+const DEFAULT_IR_IMG_PENDING_W = 320;
+const DEFAULT_IR_IMG_PENDING_H = 180;
 const irImageDims = new Map<string, { w: number; h: number }>();
+const irImageBroken = new Set<string>();
+const irImageProbing = new Set<string>();
+const activeIRViews = new Set<EditorView>();
+let lastIRScrollActivityAt = 0;
+let pendingWarmFlushTimer: number | null = null;
+let lastWarmReadySrc = "";
 let pendingIRClickClientY: number | null = null;
+
+function setIRImageDim(src: string, w: number, h: number): void {
+  if (!src || !(w > 0) || !(h > 0)) return;
+  irImageBroken.delete(src);
+  if (!irImageDims.has(src) && irImageDims.size >= 256) {
+    const oldest = irImageDims.keys().next().value;
+    if (oldest !== undefined) irImageDims.delete(oldest);
+  }
+  irImageDims.set(src, { w, h });
+}
+
+function scheduleIdleIRImgFlush(src: string): void {
+  lastWarmReadySrc = src;
+  if (pendingWarmFlushTimer !== null) return;
+  const run = () => {
+    pendingWarmFlushTimer = null;
+    if (activeIRViews.size === 0) return;
+    const idleFor = performance.now() - lastIRScrollActivityAt;
+    if (idleFor < 220) {
+      pendingWarmFlushTimer = window.setTimeout(run, Math.ceil(230 - idleFor));
+      return;
+    }
+    const readySrc = lastWarmReadySrc;
+    for (const v of activeIRViews) {
+      if (v.dom.isConnected && !v.composing) {
+        v.dispatch({ effects: irImgDimReadyEffect.of(readySrc) });
+      }
+    }
+  };
+  pendingWarmFlushTimer = window.setTimeout(run, 230);
+}
+
+function seedIRImageHintDims(src: string, htmlTag?: string): void {
+  if (!src || irImageDims.has(src)) return;
+  if (htmlTag) {
+    const w = Number(readHtmlAttr(htmlTag, "width"));
+    const h = Number(readHtmlAttr(htmlTag, "height"));
+    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+      setIRImageDim(src, w, h);
+      return;
+    }
+  }
+  const qiniuM = /imageView2\/\d+\/w\/(\d+)\/h\/(\d+)/i.exec(src);
+  if (qiniuM) {
+    const w = Number(qiniuM[1]);
+    const h = Number(qiniuM[2]);
+    if (w > 0 && h > 0) {
+      setIRImageDim(src, w, h);
+      return;
+    }
+  }
+  const kvW = /[?&](?:w|width)=(\d+)/i.exec(src);
+  const kvH = /[?&](?:h|height)=(\d+)/i.exec(src);
+  if (kvW && kvH) {
+    const w = Number(kvW[1]);
+    const h = Number(kvH[1]);
+    if (w > 0 && h > 0) {
+      setIRImageDim(src, w, h);
+    }
+  }
+}
+
+function warmIRImageDim(src: string): void {
+  if (
+    !src ||
+    irImageDims.has(src) ||
+    irImageBroken.has(src) ||
+    irImageProbing.has(src) ||
+    irImageProbing.size >= 48 ||
+    src.startsWith("data:")
+  ) {
+    return;
+  }
+  irImageProbing.add(src);
+  const probe = new Image();
+  if (!/^(?:\/(?!\/)|data:|blob:)/i.test(src)) {
+    probe.referrerPolicy = "no-referrer";
+  }
+  probe.decoding = "async";
+  probe.onload = () => {
+    irImageProbing.delete(src);
+    if (probe.naturalWidth > 0 && probe.naturalHeight > 0) {
+      setIRImageDim(src, probe.naturalWidth, probe.naturalHeight);
+      scheduleIdleIRImgFlush(src);
+    }
+  };
+  probe.onerror = () => {
+    irImageProbing.delete(src);
+    if (irImageBroken.size >= 256) {
+      const oldest = irImageBroken.values().next().value;
+      if (oldest !== undefined) irImageBroken.delete(oldest);
+    }
+    irImageBroken.add(src);
+    scheduleIdleIRImgFlush(src);
+  };
+  probe.src = src;
+}
 
 function computeIRImgBox(src: string): { w: number; h: number } | null {
   const nat = irImageDims.get(src);
@@ -2401,7 +4181,7 @@ function splitGfmTableRow(line: string): string[] {
       }
       cur += s.slice(i, i + run);
       i += run - 1;
-    } else if (ch === "|" && codeTicks === 0) {
+    } else if (ch === "|") {
       cells.push(cur.trim());
       cur = "";
     } else {
@@ -2739,6 +4519,7 @@ class TableIRWidget extends WidgetType {
 }
 
 class ImageIRWidget extends WidgetType {
+  readonly boxKey: string;
   constructor(
     readonly src: string,
     readonly rawSrc: string,
@@ -2747,6 +4528,8 @@ class ImageIRWidget extends WidgetType {
     readonly endPos: number
   ) {
     super();
+    const box = computeIRImgBox(src);
+    this.boxKey = irImageBroken.has(src) ? "broken" : box ? `${box.w}x${box.h}` : "pending";
   }
   eq(other: ImageIRWidget): boolean {
     return (
@@ -2754,55 +4537,139 @@ class ImageIRWidget extends WidgetType {
       this.rawSrc === other.rawSrc &&
       this.alt === other.alt &&
       this.pos === other.pos &&
-      this.endPos === other.endPos
+      this.endPos === other.endPos &&
+      this.boxKey === other.boxKey
     );
   }
   get estimatedHeight(): number {
+    if (irImageBroken.has(this.src)) return 34;
     const box = computeIRImgBox(this.src);
-    return box ? box.h + 8 : 120;
+    return (box ? box.h : DEFAULT_IR_IMG_PENDING_H) + 10;
   }
   toDOM(view: EditorView): HTMLElement {
     const wrap = document.createElement("span");
     wrap.className = "cm-ir-img-wrap";
     wrap.title = this.alt ? `${this.alt} (${this.rawSrc})` : this.rawSrc;
 
+    const fb = document.createElement("span");
+    fb.className = "cm-ir-img-fallback";
+    fb.textContent = this.alt ? `🖼 ${this.alt} · ${this.rawSrc}` : `🖼 ${this.rawSrc}`;
+
+    if (irImageBroken.has(this.src)) {
+      fb.hidden = false;
+      wrap.appendChild(fb);
+      wrap.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        pendingIRClickClientY = e.clientY;
+        const safePos = Math.min(this.endPos, view.state.doc.length);
+        view.dispatch({
+          selection: { anchor: safePos },
+          userEvent: "select.pointer",
+        });
+        view.focus();
+      });
+      return wrap;
+    }
+
+    fb.hidden = true;
     const img = document.createElement("img");
     img.className = "cm-ir-img";
+    if (this.src && !/^(?:\/(?!\/)|data:|blob:)/i.test(this.src)) {
+      img.referrerPolicy = "no-referrer";
+    }
     const cached = computeIRImgBox(this.src);
     if (cached) {
+      wrap.classList.add("is-sized");
+      wrap.style.width = `${cached.w}px`;
+      wrap.style.aspectRatio = `${cached.w} / ${cached.h}`;
       img.width = cached.w;
       img.height = cached.h;
-      img.style.width = `${cached.w}px`;
-      img.style.aspectRatio = `${cached.w} / ${cached.h}`;
       img.decoding = "sync";
     } else {
+      wrap.classList.add("is-loading");
+      wrap.style.width = `${DEFAULT_IR_IMG_PENDING_W}px`;
+      wrap.style.aspectRatio = `${DEFAULT_IR_IMG_PENDING_W} / ${DEFAULT_IR_IMG_PENDING_H}`;
       img.decoding = "async";
     }
     img.src = this.src;
     img.alt = this.alt;
 
-    const fb = document.createElement("span");
-    fb.className = "cm-ir-img-fallback";
-    fb.hidden = true;
-    fb.textContent = this.alt ? `🖼 ${this.alt} · ${this.rawSrc}` : `🖼 ${this.rawSrc}`;
-
     img.onload = () => {
       if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-        irImageDims.set(this.src, { w: img.naturalWidth, h: img.naturalHeight });
-        const box = computeIRImgBox(this.src);
-        if (box) {
-          img.style.width = `${box.w}px`;
-          img.style.aspectRatio = `${box.w} / ${box.h}`;
+        setIRImageDim(this.src, img.naturalWidth, img.naturalHeight);
+      }
+      if (cached) return;
+      const box = computeIRImgBox(this.src);
+      const commitLoadedSize = () => {
+        if (!view.dom.isConnected) return;
+        const idleFor = performance.now() - lastIRScrollActivityAt;
+        if (idleFor < 220) {
+          window.setTimeout(commitLoadedSize, Math.ceil(230 - idleFor));
+          return;
         }
-      }
-      if (!cached && view.dom.isConnected) {
-        view.requestMeasure();
-      }
+        if (!wrap.isConnected) {
+          if (!view.composing) {
+            view.dispatch({ effects: irImgDimReadyEffect.of(this.src) });
+          }
+          return;
+        }
+        view.requestMeasure({
+          read: (v) => {
+            const wrapRect = wrap.getBoundingClientRect();
+            const scrollerRect = v.scrollDOM.getBoundingClientRect();
+            return {
+              oldH: wrapRect.height,
+              aboveViewport: wrapRect.bottom <= scrollerRect.top + 48,
+            };
+          },
+          write: (m, v) => {
+            wrap.classList.remove("is-loading");
+            if (box) {
+              wrap.classList.add("is-sized");
+              wrap.style.width = `${box.w}px`;
+              wrap.style.aspectRatio = `${box.w} / ${box.h}`;
+              img.width = box.w;
+              img.height = box.h;
+            } else {
+              wrap.style.width = "";
+              wrap.style.aspectRatio = "";
+            }
+            const newH = wrap.getBoundingClientRect().height;
+            if (m.aboveViewport && Math.abs(newH - m.oldH) >= 1) {
+              v.scrollDOM.scrollTop += Math.round(newH - m.oldH);
+            }
+            queueMicrotask(() => {
+              if (v.dom.isConnected && !v.composing) {
+                v.dispatch({ effects: irImgDimReadyEffect.of(this.src) });
+              }
+            });
+          },
+        });
+      };
+      commitLoadedSize();
     };
 
     img.onerror = () => {
+      if (irImageBroken.size >= 256) {
+        const oldest = irImageBroken.values().next().value;
+        if (oldest !== undefined) irImageBroken.delete(oldest);
+      }
+      irImageBroken.add(this.src);
+      wrap.classList.remove("is-loading", "is-sized");
+      wrap.style.width = "";
+      wrap.style.height = "";
+      wrap.style.aspectRatio = "";
       img.hidden = true;
       fb.hidden = false;
+      if (view.dom.isConnected) {
+        view.requestMeasure();
+        queueMicrotask(() => {
+          if (view.dom.isConnected && !view.composing) {
+            view.dispatch({ effects: irImgDimReadyEffect.of(this.src) });
+          }
+        });
+      }
     };
 
     wrap.addEventListener("mousedown", (e) => {
@@ -2820,6 +4687,164 @@ class ImageIRWidget extends WidgetType {
     wrap.appendChild(img);
     wrap.appendChild(fb);
     return wrap;
+  }
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+class FenceLangIRWidget extends WidgetType {
+  constructor(
+    readonly openLineNo: number,
+    readonly explicitLang: string,
+    readonly autoLang: string
+  ) {
+    super();
+  }
+  eq(other: FenceLangIRWidget): boolean {
+    return (
+      this.openLineNo === other.openLineNo &&
+      this.explicitLang === other.explicitLang &&
+      this.autoLang === other.autoLang
+    );
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const wrap = document.createElement("span");
+    const select = document.createElement("select");
+    select.className = "cm-ir-fence-lang-select";
+    select.setAttribute("aria-label", t("ed.code_lang_ph"));
+    const seen = new Set<string>();
+    for (const item of CODE_BLOCK_LANGS) {
+      seen.add(item.value);
+      const opt = document.createElement("option");
+      opt.value = item.value;
+      opt.textContent =
+        item.value === ""
+          ? this.autoLang
+            ? `${this.autoLang.toUpperCase()} · auto`
+            : t("ed.code_plain")
+          : item.label;
+      select.appendChild(opt);
+    }
+    if (this.explicitLang && !seen.has(this.explicitLang)) {
+      const custom = document.createElement("option");
+      custom.value = this.explicitLang;
+      custom.textContent = this.explicitLang.toUpperCase();
+      select.insertBefore(custom, select.firstChild);
+    }
+    select.value = this.explicitLang;
+    select.addEventListener("mousedown", (e) => {
+      e.stopPropagation();
+    });
+    select.addEventListener("change", (e) => {
+      e.stopPropagation();
+      if (this.openLineNo < 1 || this.openLineNo > view.state.doc.lines) return;
+      const ln = view.state.doc.line(this.openLineNo);
+      const info = matchFenceOpen(ln.text);
+      if (!info) return;
+      const lead = ln.text.slice(0, info.leadSpaces);
+      const fence = info.fenceChar.repeat(info.fenceLen);
+      const nextLang = select.value.trim().toLowerCase();
+      const nextLineText = `${lead}${fence}${nextLang}`;
+      view.dispatch({
+        changes: { from: ln.from, to: ln.to, insert: nextLineText },
+        userEvent: "input",
+      });
+    });
+    wrap.appendChild(select);
+    return wrap;
+  }
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+class FenceCopyIRWidget extends WidgetType {
+  constructor(
+    readonly openLineNo: number,
+    readonly closeLineNo: number
+  ) {
+    super();
+  }
+  eq(other: FenceCopyIRWidget): boolean {
+    return this.openLineNo === other.openLineNo && this.closeLineNo === other.closeLineNo;
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const bar = document.createElement("span");
+    bar.className = "cm-ir-fence-bar";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cm-ir-fence-btn";
+    const copyTxt = t("ed.copy_code");
+    const copiedTxt = t("ed.copied");
+    btn.textContent = copyTxt;
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const doc = view.state.doc;
+      const startLn = this.openLineNo + 1;
+      const endLn = Math.min(doc.lines, this.closeLineNo - 1);
+      const code =
+        startLn <= endLn && startLn >= 1 ? doc.sliceString(doc.line(startLn).from, doc.line(endLn).to) : "";
+      void copyTextToClipboard(code).then(() => {
+        const prev = (btn as any)._copyTimer;
+        if (prev) window.clearTimeout(prev);
+        btn.setAttribute("data-copied", "true");
+        btn.textContent = `✓ ${copiedTxt}`;
+        (btn as any)._copyTimer = window.setTimeout(() => {
+          (btn as any)._copyTimer = 0;
+          if (btn.isConnected) {
+            btn.removeAttribute("data-copied");
+            btn.textContent = copyTxt;
+          }
+        }, 1400);
+      });
+    });
+    bar.appendChild(btn);
+    return bar;
+  }
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+const CALLOUT_PILL_ICONS: Record<string, string> = {
+  note: "ℹ",
+  tip: "💡",
+  important: "✦",
+  warning: "⚠",
+  caution: "⛔",
+};
+
+class CalloutPillIRWidget extends WidgetType {
+  constructor(
+    readonly kind: string,
+    readonly endPos: number
+  ) {
+    super();
+  }
+  eq(other: CalloutPillIRWidget): boolean {
+    return this.kind === other.kind && this.endPos === other.endPos;
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const pill = document.createElement("span");
+    pill.className = "cm-ir-callout-pill";
+    const icon = CALLOUT_PILL_ICONS[this.kind] || "ℹ";
+    pill.textContent = `${icon} ${t(`ed.callout_${this.kind}`)}`;
+    pill.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      view.dispatch({
+        selection: { anchor: Math.min(this.endPos, view.state.doc.length) },
+        userEvent: "select.pointer",
+      });
+      view.focus();
+    });
+    return pill;
   }
   ignoreEvent(): boolean {
     return true;
@@ -3475,22 +5500,25 @@ function wrapInlineMarker(raw: string, marker: string): string {
 
 function escapeTableCellPipes(s: string): string {
   let out = "";
-  let inCode = false;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (ch === "`") {
-      inCode = !inCode;
-      out += ch;
-    } else if (ch === "\\" && i + 1 < s.length && s[i + 1] === "|") {
-      out += "\\|";
+    if (ch === "\\" && i + 1 < s.length) {
+      out += ch + s[i + 1];
       i++;
-    } else if (ch === "|" && !inCode) {
+    } else if (ch === "|") {
       out += "\\|";
     } else {
       out += ch;
     }
   }
   return out;
+}
+
+function formatMdLinkDest(url: string, rawTitle?: string | null): string {
+  const u = url.trim();
+  const safeU = /[\s()]/.test(u) ? `<${u.replace(/</g, "%3C").replace(/>/g, "%3E")}>` : u;
+  const t = (rawTitle || "").replace(/[\r\n]+/g, " ").trim();
+  return t ? `${safeU} "${t.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : safeU;
 }
 
 function parseCssRgbChannels(raw: string): [number, number, number, number] | null {
@@ -3830,13 +5858,12 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       : Array.from(el.childNodes).filter(
           (n) => !(n instanceof HTMLElement && n.classList.contains("volo-callout__title"))
         );
-    const bodyMd = serializeNodesToMarkdown(bodyNodes, 0).trim();
+    const bodyMd = serializeNodesToMarkdown(bodyNodes, 0).trim().replace(/\n{3,}/g, "\n\n");
+    if (!bodyMd) return `\n> [!${kind}]\n\n`;
     const quoted = bodyMd
-      ? bodyMd
-          .split("\n")
-          .map((l) => (l.trim() ? `> ${l}` : ">"))
-          .join("\n")
-      : "> ...";
+      .split("\n")
+      .map((l) => (l.trim() ? `> ${l}` : ">"))
+      .join("\n");
     return `\n> [!${kind}]\n${quoted}\n\n`;
   }
 
@@ -3970,19 +5997,20 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
     case "dd":
       return `: ${inner().trim()}\n`;
     case "figure": {
-      if (el.classList.contains("volo-codeblock") || el.hasAttribute("data-lang")) {
+      if (el.classList.contains("volo-codeblock") || el.hasAttribute("data-lang") || el.hasAttribute("data-detected-lang")) {
         const codeEl = el.querySelector("code");
         const preEl = el.querySelector("pre");
         const cls = codeEl?.className || "";
-        const langMatch = /(?:language|lang)-([a-zA-Z0-9_+-]+)/.exec(cls);
+        const langMatch = /(?:language|lang)-([a-zA-Z0-9_+#.-]+)/.exec(cls);
+        const explicitSpan = el.querySelector(".volo-code-lang:not([data-auto-lang])");
         const lang =
           el.getAttribute("data-lang") ||
           preEl?.getAttribute("data-lang") ||
           codeEl?.getAttribute("data-lang") ||
           (langMatch ? langMatch[1] : "") ||
-          (el.querySelector(".volo-code-lang")?.textContent || "").trim();
+          (explicitSpan?.textContent || "").trim().toLowerCase();
         const srcNode = (codeEl || preEl || el).cloneNode(true) as HTMLElement;
-        srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button").forEach((n) => n.remove());
+        srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
         const raw = (srcNode.textContent || "").replace(/\u00a0/g, " ");
         return `\n\`\`\`${lang}\n${raw.replace(/\n$/, "")}\n\`\`\`\n\n`;
       }
@@ -3996,12 +6024,21 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       }
       const codeTxt = (el.textContent || "").replace(/\u00a0/g, " ").replace(/\r?\n/g, " ");
       if (!codeTxt) return "";
-      return codeTxt.includes("`") ? `\`\` ${codeTxt} \`\`` : `\`${codeTxt}\``;
+      let maxTicks = 0;
+      for (const m of codeTxt.matchAll(/`+/g)) {
+        if (m[0].length > maxTicks) maxTicks = m[0].length;
+      }
+      const fence = "`".repeat(maxTicks + 1);
+      const needPad =
+        codeTxt.startsWith("`") ||
+        codeTxt.endsWith("`") ||
+        (codeTxt.startsWith(" ") && codeTxt.endsWith(" ") && codeTxt.trim().length > 0);
+      return needPad ? `${fence} ${codeTxt} ${fence}` : `${fence}${codeTxt}${fence}`;
     }
     case "pre": {
       const codeEl = el.querySelector("code");
       const cls = `${el.className || ""} ${codeEl?.className || ""}`;
-      const langMatch = /(?:language|lang)-([a-zA-Z0-9_+-]+)/.exec(cls);
+      const langMatch = /(?:language|lang)-([a-zA-Z0-9_+#.-]+)/.exec(cls);
       const attrLang =
         el.getAttribute("data-lang") ||
         el.getAttribute("data-language") ||
@@ -4012,13 +6049,14 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         "";
       const lang = attrLang || (langMatch ? langMatch[1] : /\bmermaid\b/i.test(cls) ? "mermaid" : "");
       const srcNode = (codeEl || el).cloneNode(true) as HTMLElement;
-      srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button").forEach((n) => n.remove());
+      srcNode.querySelectorAll(".ln, .lnt, .volo-code-head, button, select").forEach((n) => n.remove());
       const raw = (srcNode.textContent || "").replace(/\u00a0/g, " ");
       return `\n\`\`\`${lang}\n${raw.replace(/\n$/, "")}\n\`\`\`\n\n`;
     }
     case "blockquote": {
-      const lines = inner()
-        .trim()
+      const bqBody = inner().trim().replace(/\n{3,}/g, "\n\n");
+      if (!bqBody) return `\n>\n\n`;
+      const lines = bqBody
         .split("\n")
         .map((l) => (l.trim() ? `> ${l}` : ">"))
         .join("\n");
@@ -4077,10 +6115,11 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
       if (el.classList.contains("footnote-backref") || el.getAttribute("role") === "doc-backlink") {
         return "";
       }
-      const href = (el.getAttribute("href") || "").trim();
-      const label = inner().replace(/\s*\n+\s*/g, " ").trim();
+      const rawHref = el.getAttribute("href") || "";
+      const href = cleanClipboardUrl(rawHref);
       const explicitWiki = (el.getAttribute("data-wiki-link") || el.getAttribute("data-wiki-slug") || "").trim();
       if (explicitWiki) {
+        const label = inner().replace(/\s*\n+\s*/g, " ").trim();
         return label && label !== explicitWiki ? `[[${explicitWiki}|${label}]]` : `[[${explicitWiki}]]`;
       }
       const postSlugM = /^\/posts\/([a-zA-Z0-9._%-]+)$/.exec(href);
@@ -4091,22 +6130,79 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
             /^[a-zA-Z0-9._-]+$/.test(slug) &&
             (activeWysiwygSourceMD.includes(`[[${slug}]]`) || activeWysiwygSourceMD.includes(`[[${slug}|`))
           ) {
+            const label = inner().replace(/\s*\n+\s*/g, " ").trim();
             return label && label !== slug ? `[[${slug}|${label}]]` : `[[${slug}]]`;
           }
         } catch {
           /* ignore malformed percent escape */
         }
       }
-      if (!href || /^(?:javascript|vbscript|data):/i.test(href)) {
-        return label;
+      if (!href) {
+        return inner().replace(/\s*\n+\s*/g, " ").trim();
       }
-      return `[${label || href}](${href})`;
+
+      const aTitle = el.getAttribute("title");
+      const dest = formatMdLinkDest(href, aTitle);
+
+      // Link wrapping image(s) (e.g. Baidu/WeChat/card anchor wrapping badge overlay + <img>): emit valid linked image(s) without newlines inside [...]
+      if (el.querySelector("img")) {
+        const imgMds: string[] = [];
+        for (const im of Array.from(el.querySelectorAll("img"))) {
+          const imSrc = cleanClipboardUrl(
+            im.getAttribute("data-actualsrc") ||
+              im.getAttribute("data-original") ||
+              im.getAttribute("data-lazy-src") ||
+              im.getAttribute("data-src") ||
+              im.getAttribute("src") ||
+              ""
+          );
+          if (!imSrc || imSrc.startsWith("data:image/svg+xml")) continue;
+          const alt = escapeMdLinkLabel((im.getAttribute("alt") || "").replace(/[\r\n]+/g, " ").trim());
+          imgMds.push(`[![${alt}](${formatMdLinkDest(imSrc, im.getAttribute("title"))})](${dest})`);
+        }
+        const clone = el.cloneNode(true) as HTMLElement;
+        clone
+          .querySelectorAll("img, picture, source, svg, button, [class*='tag'], [class*='badge'], [class*='count'], [class*='time'], [class*='date']")
+          .forEach((n) => n.remove());
+        const caption = (clone.textContent || "").replace(/\s+/g, " ").trim();
+        const isOverlayBadge =
+          !caption ||
+          /^\d+$/.test(caption) ||
+          /^(?:昨天|今天|前天|\d+\s*(?:分钟|小时|天|周|月|年)前)$/i.test(caption) ||
+          (caption.length <= 6 && !/[。！？.!?]/.test(caption));
+        if (imgMds.length > 0) {
+          return isOverlayBadge
+            ? imgMds.join("\n\n")
+            : `${imgMds.join("\n\n")}\n\n[${escapeMdLinkLabel(caption)}](${dest})`;
+        }
+      }
+
+      // Link wrapping a single heading (<a href="..."><h3>Title</h3></a>): lift heading syntax outside the brackets
+      const headingChild = el.querySelector("h1, h2, h3, h4, h5, h6");
+      if (headingChild) {
+        const clone = el.cloneNode(true) as HTMLElement;
+        clone.querySelector("h1, h2, h3, h4, h5, h6")?.remove();
+        if (!(clone.textContent || "").trim()) {
+          const lvl = Math.min(6, Math.max(1, Number(headingChild.tagName.slice(1)) || 2));
+          const hText = (headingChild.textContent || "").replace(/\s+/g, " ").trim();
+          if (hText) {
+            return `\n\n${"#".repeat(lvl)} [${escapeMdLinkLabel(hText)}](${dest})\n\n`;
+          }
+        }
+      }
+
+      const label = inner().replace(/\s*\n+\s*/g, " ").trim();
+      if (!label || label === href) {
+        return `[${escapeMdLinkLabel(href)}](${dest})`;
+      }
+      return `[${escapeMdLinkLabel(label)}](${dest})`;
     }
     case "img": {
-      const src = (el.getAttribute("src") || "").trim();
+      const rawSrc = el.getAttribute("src") || "";
+      const src = cleanClipboardUrl(rawSrc) || rawSrc.trim();
       const isSafeDataImg = /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon);base64,/i.test(src);
       if (!src || (!isSafeDataImg && /^(?:javascript|vbscript|data):/i.test(src))) return "";
-      const alt = (el.getAttribute("alt") || "").replace(/[\r\n[\]]+/g, " ").trim();
+      const alt = escapeMdLinkLabel((el.getAttribute("alt") || "").replace(/[\r\n]+/g, " ").trim());
       const wAttr = (el.getAttribute("width") || el.style?.width || "").trim();
       const hAttr = (el.getAttribute("height") || el.style?.height || "").trim();
       const wasExplicitHtmlImg =
@@ -4119,7 +6215,7 @@ function serializeNodeToMarkdown(node: Node, listDepth = 0): string {
         const escH = escHtmlAttr(hAttr);
         return `<img src="${escSrc}"${escAlt ? ` alt="${escAlt}"` : ""}${escW ? ` width="${escW}"` : ""}${escH ? ` height="${escH}"` : ""} />`;
       }
-      return `![${alt}](${src})`;
+      return `![${alt}](${formatMdLinkDest(src, el.getAttribute("title"))})`;
     }
     case "audio": {
       const src = (el.getAttribute("src") || el.querySelector("source")?.getAttribute("src") || "").trim();
@@ -4221,7 +6317,7 @@ function extractPreCodeLines(container: HTMLElement): string {
   const clone = container.cloneNode(true) as HTMLElement;
   clone
     .querySelectorAll(
-      ".ln, .lnt, .lineno, .line-numbers-rows, .hljs-ln-numbers, .code-snippet__line-index, .hljs-button, .copy-code-btn, [class*='copy-btn'], [class*='copy_btn'], [data-clipboard-text], button, .volo-code-head"
+      ".ln, .lnt, .lineno, .line-numbers-rows, .hljs-ln-numbers, .code-snippet__line-index, .hljs-button, .copy-code-btn, [class*='copy-btn'], [class*='copy_btn'], [data-clipboard-text], button, select, .volo-code-head"
     )
     .forEach((n) => n.remove());
   clone.querySelectorAll("br").forEach((br) => br.replaceWith(clone.ownerDocument.createTextNode("\n")));
@@ -4288,6 +6384,309 @@ function extractToolbarCodeLang(el: HTMLElement): string {
   return "";
 }
 
+function encodeVoloClipboardSource(md: string): string {
+  try {
+    const bytes = new TextEncoder().encode(md);
+    let bin = "";
+    const chunk = 8192;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  } catch {
+    return "";
+  }
+}
+
+function decodeVoloClipboardSource(b64: string): string | null {
+  try {
+    const bin = atob(b64.trim());
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return new TextDecoder("utf-8").decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function escapeClipboardHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function formatClipboardInlineMd(text: string): string {
+  let out = escapeClipboardHtml(text);
+  out = out.replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (_, alt, url) => `<img src="${escapeClipboardHtml(cleanClipboardUrl(url) || url)}" alt="${alt}" />`);
+  out = out.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (_, label, url) => `<a href="${escapeClipboardHtml(cleanClipboardUrl(url) || url)}">${label}</a>`);
+  out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/==([^=\n]+)==/g, "<mark>$1</mark>");
+  out = out.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  return out;
+}
+
+function markdownSelectionToClipboardHTML(md: string): string {
+  const b64 = encodeVoloClipboardSource(md);
+  const lines = md.replace(/\r\n?/g, "\n").split("\n");
+  const blocks: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const fenceM = /^(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fenceM) {
+      const ch = fenceM[1][0];
+      const fLen = fenceM[1].length;
+      const lang = fenceM[2].trim().split(/\s+/)[0] || "";
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length) {
+        const cl = lines[i];
+        if (new RegExp(`^${ch === "`" ? "`" : "~"}{${fLen},}\\s*$`).test(cl)) {
+          i++;
+          break;
+        }
+        codeLines.push(cl);
+        i++;
+      }
+      const cls = lang ? ` class="language-${escapeClipboardHtml(lang)}"` : "";
+      blocks.push(`<pre><code${cls}>${escapeClipboardHtml(codeLines.join("\n"))}</code></pre>`);
+      continue;
+    }
+    const hm = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (hm) {
+      const lvl = hm[1].length;
+      blocks.push(`<h${lvl}>${formatClipboardInlineMd(hm[2])}</h${lvl}>`);
+      i++;
+      continue;
+    }
+    if (/^\s*(?:---|\*\*\*|___)\s*$/.test(line)) {
+      blocks.push("<hr />");
+      i++;
+      continue;
+    }
+    if (/^\s*>\s?/.test(line)) {
+      const qLines: string[] = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        qLines.push(lines[i].replace(/^\s*>\s?/, ""));
+        i++;
+      }
+      blocks.push(`<blockquote><p>${formatClipboardInlineMd(qLines.join(" "))}</p></blockquote>`);
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(`<li>${formatClipboardInlineMd(lines[i].replace(/^\s*[-*+]\s+/, ""))}</li>`);
+        i++;
+      }
+      blocks.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(`<li>${formatClipboardInlineMd(lines[i].replace(/^\s*\d+\.\s+/, ""))}</li>`);
+        i++;
+      }
+      blocks.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+    const paraLines: string[] = [line];
+    i++;
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^(?:#{1,6}\s|```|~~~|\s*>\s?|\s*[-*+]\s+|\s*\d+\.\s+|\s*(?:---|\*\*\*|___)\s*$)/.test(lines[i])
+    ) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    blocks.push(`<p>${paraLines.map((pl) => formatClipboardInlineMd(pl)).join("<br />")}</p>`);
+  }
+  const attr = b64 ? ` data-volo-source-md="${escapeClipboardHtml(b64)}"` : "";
+  return `<div${attr}>${blocks.join("") || formatClipboardInlineMd(md)}</div>`;
+}
+
+function tsvToMarkdownTable(rawPlain: string): string | null {
+  const norm = rawPlain.replace(/\r\n?/g, "\n").trimEnd();
+  if (!norm.includes("\t")) return null;
+  const lines = norm.split("\n").filter((l) => l.length > 0);
+  if (lines.length < 2 || lines.length > 500) return null;
+  if (lines.some((l) => l.startsWith("\t") || /^\s*(?:func |const |let |var |package |import |def |class |SELECT |```)/i.test(l))) {
+    return null;
+  }
+  const rows = lines.map((l) => l.split("\t").map((c) => c.trim().replace(/\\/g, "\\\\").replace(/\|/g, "\\|")));
+  const colCount = rows[0].length;
+  if (colCount < 2 || colCount > 32) return null;
+  let mismatches = 0;
+  for (const r of rows) {
+    if (r.length !== colCount) mismatches++;
+  }
+  if (mismatches > Math.floor(rows.length * 0.3)) return null;
+  const pad = (r: string[]) => Array.from({ length: colCount }, (_, idx) => r[idx] || "");
+  const header = `| ${pad(rows[0]).join(" | ")} |`;
+  const sep = `| ${Array.from({ length: colCount }, () => "---").join(" | ")} |`;
+  const body = rows.slice(1).map((r) => `| ${pad(r).join(" | ")} |`);
+  return [header, sep, ...body].join("\n");
+}
+
+function isMediaClipboardFile(f: File): boolean {
+  const mt = (f.type || "").toLowerCase();
+  if (mt.startsWith("image/") || mt.startsWith("audio/") || mt.startsWith("video/")) return true;
+  return /\.(?:png|jpe?g|gif|webp|avif|bmp|ico|svg|mp3|wav|ogg|m4a|flac|aac|opus|mp4|webm|mov|m4v|ogv)$/i.test(f.name || "");
+}
+
+function extractClipboardMediaFiles(dt: DataTransfer): File[] {
+  const found: File[] = [];
+  const seen = new Set<string>();
+  const add = (f: File | null) => {
+    if (!f || !isMediaClipboardFile(f)) return;
+    const key = `${f.name}:${f.size}:${f.type}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      found.push(f);
+    }
+  };
+  if (dt.files) {
+    for (let i = 0; i < dt.files.length; i++) add(dt.files[i]);
+  }
+  if (dt.items) {
+    for (let i = 0; i < dt.items.length; i++) {
+      if (dt.items[i].kind === "file") add(dt.items[i].getAsFile());
+    }
+  }
+  return found;
+}
+
+function shouldHandlePasteAsBinaryMedia(dt: DataTransfer, files: File[], rawPlain: string, rawHTML: string): boolean {
+  if (files.length === 0) return false;
+  const plainTrim = rawPlain.trim();
+  if (!plainTrim && !rawHTML.trim()) return true;
+  if (plainTrim) {
+    const fileNames = new Set(files.map((f) => f.name.toLowerCase()));
+    const plainLines = plainTrim
+      .split(/\r?\n/)
+      .map((l) => l.trim().replace(/^file:\/\//i, "").split(/[\\/]/).pop()?.toLowerCase() || "")
+      .filter(Boolean);
+    const plainMatchesFiles = plainLines.length > 0 && plainLines.every((n) => fileNames.has(n));
+    if (!plainMatchesFiles) return false;
+  }
+  if (!rawHTML.trim()) return true;
+  try {
+    const d = new DOMParser().parseFromString(rawHTML, "text/html");
+    const imgs = Array.from(d.body?.querySelectorAll("img") || []);
+    const onlyLocalImgs =
+      imgs.length > 0 &&
+      imgs.every((im) => /^(?:file:|webkit-fake-url:)/i.test((im.getAttribute("src") || "").trim()));
+    const textLeft = (d.body?.textContent || "").trim();
+    return onlyLocalImgs || !textLeft;
+  } catch {
+    return false;
+  }
+}
+
+function extractWysiwygSelectionClipboard(
+  root: HTMLElement
+): { plain: string; html: string; range: Range } | null {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!root.contains(range.commonAncestorContainer)) return null;
+
+  const startEl =
+    range.startContainer.nodeType === Node.ELEMENT_NODE
+      ? (range.startContainer as Element)
+      : range.startContainer.parentElement;
+  const endEl =
+    range.endContainer.nodeType === Node.ELEMENT_NODE
+      ? (range.endContainer as Element)
+      : range.endContainer.parentElement;
+  const startPre = startEl?.closest("pre");
+  const endPre = endEl?.closest("pre");
+  if (startPre && startPre === endPre) {
+    const wrap = document.createElement("div");
+    wrap.appendChild(range.cloneContents());
+    if (!wrap.querySelector(".volo-code-head")) {
+      const codeText = extractPreCodeLines(wrap);
+      if (!codeText) return null;
+      return {
+        plain: codeText,
+        html: `<pre><code>${escapeClipboardHtml(codeText)}</code></pre>`,
+        range,
+      };
+    }
+  }
+
+  const wrap = document.createElement("div");
+  wrap.appendChild(range.cloneContents());
+  wrap
+    .querySelectorAll(".ln, .lnt, .volo-code-head, .volo-ed-code-copy, button, select, .volo-ed-empty-hint")
+    .forEach((n) => n.remove());
+  wrap.querySelectorAll("pre").forEach((pre) => {
+    const codeText = extractPreCodeLines(pre as HTMLElement);
+    const replacement = document.createElement("pre");
+    const code = document.createElement("code");
+    const lang = pre.closest("[data-lang]")?.getAttribute("data-lang") || "";
+    if (lang) code.className = `language-${lang}`;
+    code.textContent = codeText;
+    replacement.appendChild(code);
+    pre.replaceWith(replacement);
+  });
+  const md = htmlToMarkdown(wrap).trim();
+  const plain = md || (wrap.textContent || "").replace(/\u00a0/g, " ");
+  if (!plain) return null;
+  const b64 = encodeVoloClipboardSource(plain);
+  const attr = b64 ? ` data-volo-source-md="${escapeClipboardHtml(b64)}"` : "";
+  return {
+    plain,
+    html: `<div${attr}>${wrap.innerHTML}</div>`,
+    range,
+  };
+}
+
+function unwrapSearchHighlightEm(body: HTMLElement, doc: Document): void {
+  const isCJK = (ch: string) => /[\u3400-\u9fff\uf900-\ufaff]/.test(ch);
+  const ems = Array.from(body.querySelectorAll<HTMLElement>("em"));
+  for (const em of ems) {
+    if (em.closest("pre, code")) continue;
+    const cls = (em.className || "").toLowerCase();
+    const fs = (em.style?.fontStyle || "").toLowerCase().trim();
+    const col = (em.style?.color || "").trim();
+    const insideHeadingOrLink = Boolean(em.closest("h1, h2, h3, h4, h5, h6, a[href], .c-abstract, .c-container, [data-click], [tpl]"));
+    const styledAsHighlight = fs === "normal" || Boolean(col) || /(?:highlight|hl|keyword|search|c-color)/.test(cls);
+
+    let tightCjkSearch = false;
+    const prev = em.previousSibling;
+    const next = em.nextSibling;
+    const prevTxt = prev?.nodeType === Node.TEXT_NODE ? prev.textContent || "" : "";
+    const nextTxt = next?.nodeType === Node.TEXT_NODE ? next.textContent || "" : "";
+    const emTxt = (em.textContent || "").trim();
+    const touchesAnotherEm =
+      (prev instanceof Element && prev.tagName === "EM") || (next instanceof Element && next.tagName === "EM");
+    if (touchesAnotherEm) {
+      tightCjkSearch = true;
+    } else if (emTxt && /[\u3400-\u9fff]/.test(emTxt)) {
+      const tailChar = prevTxt.slice(-1);
+      const headChar = nextTxt.slice(0, 1);
+      if ((tailChar && isCJK(tailChar)) || (headChar && isCJK(headChar))) {
+        tightCjkSearch = true;
+      }
+    }
+
+    if (insideHeadingOrLink || styledAsHighlight || tightCjkSearch) {
+      const frag = doc.createDocumentFragment();
+      while (em.firstChild) frag.appendChild(em.firstChild);
+      em.replaceWith(frag);
+    }
+  }
+}
+
 function clipboardHtmlToMarkdown(
   rawHTML: string
 ): { markdown: string; pendingUploads: Array<{ placeholder: string; file: File }> } | null {
@@ -4298,17 +6697,49 @@ function clipboardHtmlToMarkdown(
   const body = doc.body;
   if (!body) return null;
 
-  // 0. Detect terminal / IDE syntax-highlighted HTML clipboards BEFORE stripping <meta>, falling back to clean text/plain
+  // 0a. Exact lossless round-trip when pasting selection copied inside Volo Studio
+  const voloCarrier = body.querySelector<HTMLElement>("[data-volo-source-md]");
+  if (voloCarrier) {
+    const check = body.cloneNode(true) as HTMLElement;
+    check.querySelectorAll("[data-volo-source-md]").forEach((n) => n.remove());
+    if (!(check.textContent || "").trim()) {
+      const restored = decodeVoloClipboardSource(voloCarrier.getAttribute("data-volo-source-md") || "");
+      if (restored !== null) {
+        return { markdown: restored, pendingUploads: [] };
+      }
+    }
+  }
+
+  // 0b. Detect terminal / IDE syntax-highlighted HTML clipboards BEFORE stripping <meta>, falling back to clean text/plain
   if (isTerminalOrIdeClipboardDOM(doc, body)) {
     return null;
   }
 
-  // 1. Strip scripts, styles, icons, copy buttons, and unsafe embeds
+  // 1. Strip scripts, styles, icons, hidden noise, copy buttons, and unsafe embeds
   body
     .querySelectorAll(
-      "script, style, meta, link, title, noscript, iframe, object, embed, svg, canvas, button, select, textarea, .headerlink, a.anchor, a.header-anchor, .volo-code-head, .volo-ed-code-copy, .copy-code-button, .copy-code-btn, .hljs-button, [class*='copy-btn'], [class*='copy_btn'], [data-clipboard-text], .line-numbers-rows, .code-snippet__line-index"
+      "script, style, meta, link, title, noscript, iframe, object, embed, svg, canvas, button, select, textarea, [hidden], .headerlink, a.anchor, a.header-anchor, .volo-code-head, .volo-ed-code-copy, .copy-code-button, .copy-code-btn, .hljs-button, [class*='copy-btn'], [class*='copy_btn'], [data-clipboard-text], .line-numbers-rows, .code-snippet__line-index, [class*='tts'], [class*='audio-play'], [class*='corner-tag'], [class*='img-count'], [class*='pic-num']"
     )
     .forEach((n) => n.remove());
+  for (const el of Array.from(body.querySelectorAll<HTMLElement>("[aria-hidden='true'], [style]"))) {
+    if (el.closest(".katex, math, pre, code")) continue;
+    if (el.getAttribute("aria-hidden") === "true") {
+      el.remove();
+      continue;
+    }
+    const st = (el.getAttribute("style") || "").toLowerCase();
+    if (/(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\s*;|\s*$)|font-size\s*:\s*0(?:px|em|rem)?(?:\s*;|\s*$))/i.test(st)) {
+      el.remove();
+    }
+  }
+  for (const sup of Array.from(body.querySelectorAll<HTMLElement>("sup"))) {
+    if (sup.closest("pre, code, .katex, math")) continue;
+    const cls = (sup.className || "").toLowerCase();
+    const txt = (sup.textContent || "").trim();
+    if (/(?:cite|ref|source|index)/.test(cls) || /^\[\d{1,3}\]$/.test(txt) || (sup.hasAttribute("data-url") && /^\d{1,3}$/.test(txt))) {
+      sup.remove();
+    }
+  }
 
   // 1b. Normalize Yuque (<ne-h1>..<ne-h6>, <ne-p>, <ne-code>, data-lake-card="codeblock") & Feishu (.ace-code-block)
   for (let lvl = 1; lvl <= 6; lvl++) {
@@ -4417,6 +6848,9 @@ function clipboardHtmlToMarkdown(
     }
   }
 
+  // 2b. Unwrap search-engine keyword highlight <em> tags before styling conversion
+  unwrapSearchHighlightEm(body, doc);
+
   // 3. Strip permalink '#' / '¶' anchors inside headings
   for (const a of Array.from(body.querySelectorAll<HTMLAnchorElement>("h1 a, h2 a, h3 a, h4 a, h5 a, h6 a"))) {
     const href = (a.getAttribute("href") || "").trim();
@@ -4430,9 +6864,9 @@ function clipboardHtmlToMarkdown(
     if (!hl.querySelector("table, pre")) continue;
     const cls = `${hl.className || ""} ${hl.querySelector("code, pre")?.className || ""}`;
     const langM =
-      /(?:language|lang)-([a-zA-Z0-9_+-]+)/.exec(cls) ||
-      /\bhighlight-source-([a-zA-Z0-9_+-]+)/.exec(cls) ||
-      /\bhighlight\s+([a-zA-Z0-9_+-]+)/.exec(hl.className || "");
+      /(?:language|lang)-([a-zA-Z0-9_+#.-]+)/.exec(cls) ||
+      /\bhighlight-source-([a-zA-Z0-9_+#.-]+)/.exec(cls) ||
+      /\bhighlight\s+([a-zA-Z0-9_+#.-]+)/.exec(hl.className || "");
     const lang = hl.getAttribute("data-lang") || (langM ? langM[1] : "");
     hl.querySelectorAll(".gutter, td.blob-num, td.rouge-gutter, pre.lineno, figcaption").forEach((n) => n.remove());
     const lntds = hl.querySelectorAll(":scope table td.lntd");
@@ -4490,7 +6924,7 @@ function clipboardHtmlToMarkdown(
     if (pre.classList.contains("mermaid")) continue;
     const codeEl = pre.querySelector("code");
     const langCls = `${pre.className || ""} ${codeEl?.className || ""}`;
-    const langM = /(?:language|lang)-([a-zA-Z0-9_+-]+)/.exec(langCls);
+    const langM = /(?:language|lang)-([a-zA-Z0-9_+#.-]+)/.exec(langCls);
     const attrLang = (
       pre.getAttribute("data-lang") ||
       pre.getAttribute("data-language") ||
@@ -4511,7 +6945,7 @@ function clipboardHtmlToMarkdown(
     pre.replaceChildren(cleanCode);
   }
 
-  // 6. Resolve lazy-loaded <img> sources (WeChat data-src, Zhihu data-actualsrc/data-original, srcset)
+  // 6. Resolve lazy-loaded <img> sources (WeChat data-src, Zhihu data-actualsrc/data-original, srcset) & decode &amp;
   for (const img of Array.from(body.querySelectorAll<HTMLImageElement>("img"))) {
     let realSrc = (
       img.getAttribute("data-actualsrc") ||
@@ -4525,6 +6959,7 @@ function clipboardHtmlToMarkdown(
       const firstSet = (img.getAttribute("srcset") || "").split(",")[0]?.trim().split(/\s+/)[0] || "";
       if (firstSet) realSrc = firstSet;
     }
+    realSrc = cleanClipboardUrl(realSrc) || realSrc;
     if (!realSrc || realSrc.startsWith("data:image/svg+xml")) {
       img.remove();
       continue;
@@ -4692,7 +7127,16 @@ const EDITOR_CALLOUTS = [
   { kind: "CAUTION", color: "#dc2626" },
 ] as const;
 
-type ToolbarPopKind = "" | "heading" | "color" | "callout" | "media" | "book" | "math" | "export";
+type ToolbarPopKind = "" | "heading" | "color" | "callout" | "media" | "codeblock" | "book" | "math" | "export";
+
+interface SlashCmdItem {
+  id: string;
+  keywords: string;
+  label: string;
+  kbd: string;
+  action: "snippet" | "code" | "math" | "lock" | "media";
+  payload?: string;
+}
 
 export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasAudio }: CM6EditorProps) {
   activeWysiwygSourceMD = value;
@@ -4772,12 +7216,43 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
   const [lockHint, setLockHint] = useState<string>("");
   const [lockBody, setLockBody] = useState<string>("");
 
+  // Native Find & Replace Bar State
+  const [findOpen, setFindOpen] = useState<boolean>(false);
+  const [findShowReplace, setFindShowReplace] = useState<boolean>(false);
+  const [findQuery, setFindQuery] = useState<string>("");
+  const [replaceQuery, setReplaceQuery] = useState<string>("");
+  const [findCase, setFindCase] = useState<boolean>(false);
+  const [findRegex, setFindRegex] = useState<boolean>(false);
+  const [findIdx, setFindIdx] = useState<number>(0);
+  const findInputRef = useRef<HTMLInputElement | null>(null);
+  const openFindBarRef = useRef<(withReplace: boolean) => void>(() => {});
+
+  // Slash `/` Command Palette State
+  const [slashMenu, setSlashMenu] = useState<{
+    query: string;
+    from: number;
+    to: number;
+    x: number;
+    y: number;
+    idx: number;
+  } | null>(null);
+  const slashMenuRef = useRef(slashMenu);
+  slashMenuRef.current = slashMenu;
+  const slashPopupRef = useRef<HTMLDivElement | null>(null);
+  const execSlashItemRef = useRef<(idxOffset?: number) => boolean>(() => false);
+
   const togglePop = (kind: Exclude<ToolbarPopKind, "">) => {
     setEdTip(null);
     setActivePop((prev) => (prev === kind ? "" : kind));
   };
 
   const switchMode = (next: EditorMode) => {
+    if (next === "wysiwyg") {
+      setFindOpen(false);
+    } else {
+      activeWysiwygCellRef.current = null;
+      setWysiwygTblActive(false);
+    }
     setMode(next);
     localStorage.setItem("volo_editor_mode", next);
   };
@@ -4795,17 +7270,20 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const toc: OutlineItem[] = [];
     let fenceChar = "";
     let fenceLen = 0;
+    let fenceQDepth = 0;
     linesArr.forEach((ln, idx) => {
       if (!fenceChar) {
         const open = matchFenceOpen(ln);
         if (open) {
           fenceChar = open.fenceChar;
           fenceLen = open.fenceLen;
+          fenceQDepth = open.quoteDepth;
           return;
         }
-      } else if (matchFenceClose(ln, fenceChar, fenceLen)) {
+      } else if (matchFenceClose(ln, fenceChar, fenceLen, fenceQDepth)) {
         fenceChar = "";
         fenceLen = 0;
+        fenceQDepth = 0;
         return;
       }
       if (fenceChar) return;
@@ -4830,6 +7308,8 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
   const wysiwygEmitQueuedRef = useRef<boolean>(false);
   const wysiwygPlaceCaretRef = useRef<boolean>(false);
   const lastWysiwygRangeRef = useRef<Range | null>(null);
+  const activeWysiwygCellRef = useRef<HTMLTableCellElement | null>(null);
+  const [wysiwygTblActive, setWysiwygTblActive] = useState<boolean>(false);
 
   const saveWysiwygSelection = (root?: HTMLElement | null) => {
     const host = root || wysiwygRef.current;
@@ -4839,7 +7319,123 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const r = sel.getRangeAt(0);
     if (host.contains(r.commonAncestorContainer)) {
       lastWysiwygRangeRef.current = r.cloneRange();
+      const baseEl = r.startContainer instanceof Element ? r.startContainer : r.startContainer.parentElement;
+      const cell = baseEl?.closest("td, th") as HTMLTableCellElement | null;
+      const validCell = cell && host.contains(cell) ? cell : null;
+      activeWysiwygCellRef.current = validCell;
+      setWysiwygTblActive(Boolean(validCell));
     }
+  };
+
+  const mutateWysiwygTable = (
+    op: "row_above" | "row_below" | "del_row" | "col_left" | "col_right" | "del_col" | "del_table"
+  ) => {
+    const root = wysiwygRef.current;
+    const cell = activeWysiwygCellRef.current;
+    if (!root || !cell || !root.contains(cell)) return;
+    const tr = cell.closest("tr") as HTMLTableRowElement | null;
+    const table = cell.closest("table") as HTMLTableElement | null;
+    if (!tr || !table || !root.contains(table)) return;
+    wysiwygDirtyRef.current = true;
+    const allRows = Array.from(table.querySelectorAll("tr"));
+    const colCount = Math.max(1, tr.children.length);
+    const colIdx = Math.max(0, Array.from(tr.children).indexOf(cell));
+    const removeWholeTable = () => {
+      const wrap = table.closest(".volo-table-scroll");
+      (wrap && root.contains(wrap) ? wrap : table).remove();
+      activeWysiwygCellRef.current = null;
+      setWysiwygTblActive(false);
+      normalizeWysiwygDOM(root, t("common.delete"));
+      onChangeRef.current(htmlToMarkdown(root));
+    };
+    if (op === "del_table") {
+      removeWholeTable();
+      return;
+    }
+    let focusTarget: HTMLElement | null = cell;
+    if (op === "row_above" || op === "row_below") {
+      const inHead = tr.parentElement?.tagName === "THEAD";
+      let tbody = table.querySelector("tbody");
+      if (!tbody) {
+        tbody = document.createElement("tbody");
+        table.appendChild(tbody);
+      }
+      if (inHead && op === "row_above") {
+        const demoted = document.createElement("tr");
+        for (const ch of Array.from(tr.children)) {
+          const td = document.createElement("td");
+          td.innerHTML = ch.innerHTML || "<br>";
+          demoted.appendChild(td);
+          ch.innerHTML = "<br>";
+        }
+        tbody.insertBefore(demoted, tbody.firstChild);
+        focusTarget = (tr.children[colIdx] as HTMLElement) || cell;
+      } else {
+        const newTr = document.createElement("tr");
+        for (let i = 0; i < colCount; i++) {
+          const td = document.createElement("td");
+          td.appendChild(document.createElement("br"));
+          newTr.appendChild(td);
+        }
+        if (inHead) {
+          tbody.insertBefore(newTr, tbody.firstChild);
+        } else if (op === "row_above") {
+          tr.before(newTr);
+        } else {
+          tr.after(newTr);
+        }
+        focusTarget = (newTr.children[colIdx] as HTMLElement) || null;
+      }
+    } else if (op === "del_row") {
+      if (allRows.length <= 1) {
+        removeWholeTable();
+        return;
+      }
+      const inHead = tr.parentElement?.tagName === "THEAD";
+      const tbody = table.querySelector("tbody");
+      if (inHead && tbody && tbody.rows.length > 0) {
+        const nextRow = tbody.rows[0];
+        Array.from(tr.children).forEach((th, idx) => {
+          th.innerHTML = nextRow.children[idx]?.innerHTML || "<br>";
+        });
+        nextRow.remove();
+        focusTarget = (tr.children[colIdx] as HTMLElement) || null;
+      } else {
+        const neighbor = (tr.nextElementSibling || tr.previousElementSibling) as HTMLTableRowElement | null;
+        tr.remove();
+        if (table.querySelectorAll("tr").length === 0) {
+          removeWholeTable();
+          return;
+        }
+        focusTarget = (neighbor?.children[Math.min(colIdx, Math.max(0, (neighbor?.children.length || 1) - 1))] as HTMLElement) || null;
+      }
+    } else if (op === "col_left" || op === "col_right") {
+      for (const r of allRows) {
+        const refC = r.children[Math.min(colIdx, Math.max(0, r.children.length - 1))];
+        const tag = r.parentElement?.tagName === "THEAD" || refC?.tagName === "TH" ? "th" : "td";
+        const nc = document.createElement(tag);
+        nc.appendChild(document.createElement("br"));
+        if (!refC) r.appendChild(nc);
+        else if (op === "col_left") refC.before(nc);
+        else refC.after(nc);
+        if (r === tr) focusTarget = nc;
+      }
+    } else if (op === "del_col") {
+      if (colCount <= 1) {
+        removeWholeTable();
+        return;
+      }
+      for (const r of allRows) {
+        r.children[colIdx]?.remove();
+      }
+      focusTarget = (tr.children[Math.min(colIdx, tr.children.length - 1)] as HTMLElement) || null;
+    }
+    root.focus();
+    if (focusTarget && root.contains(focusTarget)) {
+      placeCaretInBlock(focusTarget, true);
+      saveWysiwygSelection(root);
+    }
+    onChangeRef.current(htmlToMarkdown(root));
   };
 
   const restoreWysiwygSelection = (root: HTMLElement): Range | null => {
@@ -5051,7 +7647,49 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     const view = viewRef.current;
     if (!view) return;
     const sel = view.state.selection.main;
-    const selected = view.state.sliceDoc(sel.from, sel.to) || fallback;
+    const rawSel = view.state.sliceDoc(sel.from, sel.to);
+    const isSingleStar = before === "*" && after === "*";
+
+    // Toggle-unwrap when selection itself already starts & ends with matching markers
+    if (
+      rawSel.length > before.length + after.length &&
+      rawSel.startsWith(before) &&
+      rawSel.endsWith(after) &&
+      !(isSingleStar && rawSel.startsWith("**") && rawSel.endsWith("**") && !rawSel.startsWith("***"))
+    ) {
+      const inner = rawSel.slice(before.length, rawSel.length - after.length);
+      view.dispatch({
+        changes: { from: sel.from, to: sel.to, insert: inner },
+        selection: { anchor: sel.from, head: sel.from + inner.length },
+        userEvent: "input",
+      });
+      view.focus();
+      return;
+    }
+
+    // Toggle-unwrap when surrounding document text immediately wraps the current selection
+    if (
+      sel.from >= before.length &&
+      sel.to + after.length <= view.state.doc.length &&
+      view.state.sliceDoc(sel.from - before.length, sel.from) === before &&
+      view.state.sliceDoc(sel.to, sel.to + after.length) === after &&
+      !(
+        isSingleStar &&
+        sel.from >= 2 &&
+        view.state.sliceDoc(sel.from - 2, sel.from) === "**" &&
+        !(sel.from >= 3 && view.state.sliceDoc(sel.from - 3, sel.from) === "***")
+      )
+    ) {
+      view.dispatch({
+        changes: { from: sel.from - before.length, to: sel.to + after.length, insert: rawSel },
+        selection: { anchor: sel.from - before.length, head: sel.from - before.length + rawSel.length },
+        userEvent: "input",
+      });
+      view.focus();
+      return;
+    }
+
+    const selected = rawSel || fallback;
     const insert = `${before}${selected}${after}`;
     view.dispatch({
       changes: { from: sel.from, to: sel.to, insert },
@@ -5059,6 +7697,35 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
     });
     view.focus();
   };
+
+  const insertCodeBlock = (lang: string) => {
+    if (modeRef.current === "wysiwyg" && wysiwygRef.current) {
+      const selTxt = getSelectedText().replace(/^\n+|\n+$/g, "");
+      spliceMarkdownAtWysiwygCaret(wysiwygRef.current, `\n\`\`\`${lang}\n${selTxt}\n\`\`\`\n`);
+      return;
+    }
+    const view = viewRef.current;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    const rawSel = view.state.sliceDoc(sel.from, sel.to).replace(/^\n+|\n+$/g, "");
+    const startLine = view.state.doc.lineAt(sel.from);
+    const endLine = view.state.doc.lineAt(sel.to);
+    const needLeadNl = sel.from > startLine.from ? "\n" : "";
+    const needTrailNl = sel.to < endLine.to ? "\n" : "";
+    const openFence = `${needLeadNl}\`\`\`${lang}\n`;
+    const closeFence = `\n\`\`\`${needTrailNl}`;
+    const insert = `${openFence}${rawSel}${closeFence}`;
+    const cursorStart = sel.from + openFence.length;
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert },
+      selection: { anchor: cursorStart, head: cursorStart + rawSel.length },
+      scrollIntoView: true,
+      userEvent: "input",
+    });
+    view.focus();
+  };
+  const insertCodeBlockRef = useRef(insertCodeBlock);
+  insertCodeBlockRef.current = insertCodeBlock;
 
   const applyColorStyle = (color: string) => {
     if (mode === "wysiwyg" && wysiwygRef.current) {
@@ -5470,17 +8137,24 @@ export function CM6EditorCore({ value, onChange, quickInserts = [], onSave, hasA
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
 <title>Exported Article</title>
 <style>
-  body { max-width: 780px; margin: 40px auto; padding: 0 20px; font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: #1c1917; background: #fff; }
-  pre { background: #f5f5f4; padding: 14px 16px; border-radius: 10px; overflow-x: auto; }
+  :root { --bg: #fff; --fg: #1c1917; --surf: #f5f5f4; --quote-bg: #fafaf9; --bd: #e7e5e4; --acc: #d97706; --mark-bg: #fef08a; --mark-fg: #1c1917; --link: #2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121211; --fg: #eceae5; --surf: #1e1d1b; --quote-bg: #181716; --bd: #2e2c29; --acc: #f59e0b; --mark-bg: rgba(250, 204, 21, 0.28); --mark-fg: #fef9c3; --link: #60a5fa; }
+    [style*="color: #000"], [style*="color:#000"], [style*="color: #111"], [style*="color: #222"], [style*="color: #333"], [style*="color: black"], font[color="black"], font[color="#000"], font[color="#000000"], font[color="#111111"], font[color="#222222"], font[color="#333333"] { color: var(--fg) !important; }
+  }
+  body { max-width: 780px; margin: 40px auto; padding: 0 20px; font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  a { color: var(--link); }
+  pre { background: var(--surf); padding: 14px 16px; border-radius: 10px; overflow-x: auto; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
-  blockquote { margin: 1em 0; padding: 0.5em 1em; border-left: 3px solid #d97706; background: #fafaf9; }
+  blockquote { margin: 1em 0; padding: 0.5em 1em; border-left: 3px solid var(--acc); background: var(--quote-bg); }
   table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-  th, td { border: 1px solid #e7e5e4; padding: 8px 12px; text-align: left; }
-  th { background: #f5f5f4; }
+  th, td { border: 1px solid var(--bd); padding: 8px 12px; text-align: left; }
+  th { background: var(--surf); }
   img, video, audio { max-width: 100%; border-radius: 8px; }
-  mark { background: #fef08a; padding: 0.1em 0.28em; border-radius: 4px; }
+  mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0.1em 0.28em; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -5508,6 +8182,295 @@ ${rendered}
     }
   };
 
+  const findOpenRef = useRef(findOpen);
+  findOpenRef.current = findOpen;
+
+  const findResult = useMemo<{ matches: SearchMatchRange[]; invalid: boolean }>(() => {
+    if (!findOpen || !findQuery) return { matches: [], invalid: false };
+    let re: RegExp;
+    try {
+      const pattern = findRegex ? findQuery : findQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      re = new RegExp(pattern, findCase ? "g" : "gi");
+    } catch {
+      return { matches: [], invalid: true };
+    }
+    const matches: SearchMatchRange[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(value)) !== null) {
+      if (m[0].length === 0) {
+        re.lastIndex = m.index + 1;
+        if (re.lastIndex > value.length) break;
+        continue;
+      }
+      matches.push({ from: m.index, to: m.index + m[0].length });
+      if (matches.length >= 2000) break;
+    }
+    return { matches, invalid: false };
+  }, [findOpen, findQuery, findCase, findRegex, value]);
+
+  const findMatches = findResult.matches;
+  const findInvalid = findResult.invalid;
+  const safeFindIdx = findMatches.length === 0 ? 0 : Math.min(findIdx, findMatches.length - 1);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: setSearchStateEffect.of({
+        matches: findOpen && mode !== "wysiwyg" ? findMatches : [],
+        activeIdx: safeFindIdx,
+      }),
+    });
+  }, [findOpen, mode, findMatches, safeFindIdx]);
+
+  const openFindBar = (withReplace: boolean) => {
+    let selTxt = "";
+    if (modeRef.current === "wysiwyg") {
+      selTxt = window.getSelection()?.toString() || "";
+    } else if (viewRef.current) {
+      const sel = viewRef.current.state.selection.main;
+      if (!sel.empty) selTxt = viewRef.current.state.sliceDoc(sel.from, sel.to);
+    }
+    if (selTxt && !selTxt.includes("\n") && selTxt.length <= 120) {
+      setFindQuery(selTxt);
+      setFindIdx(0);
+    }
+    if (modeRef.current === "wysiwyg") {
+      switchMode("ir");
+    }
+    setMobilePane("write");
+    setFindOpen(true);
+    if (withReplace) setFindShowReplace(true);
+    requestAnimationFrame(() => {
+      findInputRef.current?.focus();
+      findInputRef.current?.select();
+    });
+  };
+  openFindBarRef.current = openFindBar;
+
+  const closeFindBar = () => {
+    setFindOpen(false);
+    viewRef.current?.focus();
+  };
+
+  const stepFindMatch = (dir: 1 | -1) => {
+    if (findMatches.length === 0) return;
+    setMobilePane("write");
+    const nextIdx = (safeFindIdx + dir + findMatches.length) % findMatches.length;
+    setFindIdx(nextIdx);
+    const target = findMatches[nextIdx];
+    const view = viewRef.current;
+    if (view && target) {
+      view.dispatch({
+        selection: { anchor: target.from, head: target.to },
+        effects: EditorView.scrollIntoView(target.from, { y: "center" }),
+      });
+    }
+  };
+
+  const computeMatchReplacement = (matchedText: string): string => {
+    if (!findRegex) return replaceQuery;
+    try {
+      return matchedText.replace(new RegExp(findQuery, findCase ? "" : "i"), replaceQuery);
+    } catch {
+      return replaceQuery;
+    }
+  };
+
+  const replaceCurrentMatch = () => {
+    const view = viewRef.current;
+    if (!view || findMatches.length === 0) return;
+    const target = findMatches[safeFindIdx];
+    if (!target) return;
+    const rep = computeMatchReplacement(view.state.sliceDoc(target.from, target.to));
+    view.dispatch({
+      changes: { from: target.from, to: target.to, insert: rep },
+      selection: { anchor: target.from + rep.length },
+      scrollIntoView: true,
+      userEvent: "input",
+    });
+  };
+
+  const replaceAllMatches = () => {
+    const view = viewRef.current;
+    if (!view || findMatches.length === 0) return;
+    const changes = findMatches.map((m) => ({
+      from: m.from,
+      to: m.to,
+      insert: computeMatchReplacement(view.state.sliceDoc(m.from, m.to)),
+    }));
+    view.dispatch({ changes, userEvent: "input" });
+    setFindIdx(0);
+  };
+
+  const slashItems = useMemo<SlashCmdItem[]>(
+    () => [
+      { id: "h1", keywords: "h1 heading1 title 一级标题", label: `${t("ed.heading")} 1`, kbd: "# ", action: "snippet", payload: "# " },
+      { id: "h2", keywords: "h2 heading2 subtitle 二级标题", label: `${t("ed.heading")} 2`, kbd: "## ", action: "snippet", payload: "## " },
+      { id: "h3", keywords: "h3 heading3 三级标题", label: `${t("ed.heading")} 3`, kbd: "### ", action: "snippet", payload: "### " },
+      { id: "code", keywords: "code fence block 代码块", label: t("ed.code_block"), kbd: "```", action: "code" },
+      { id: "quote", keywords: "quote blockquote 引用", label: t("ed.quote"), kbd: "> ", action: "snippet", payload: "> " },
+      { id: "note", keywords: "note info callout 提示", label: t("ed.callout_note"), kbd: "[!NOTE]", action: "snippet", payload: "> [!NOTE]\n> " },
+      { id: "tip", keywords: "tip callout 技巧", label: t("ed.callout_tip"), kbd: "[!TIP]", action: "snippet", payload: "> [!TIP]\n> " },
+      { id: "warn", keywords: "warn warning caution callout 警告", label: t("ed.callout_warning"), kbd: "[!WARNING]", action: "snippet", payload: "> [!WARNING]\n> " },
+      { id: "task", keywords: "todo task check 待办 任务", label: t("ed.task"), kbd: "- [ ]", action: "snippet", payload: "- [ ] " },
+      { id: "ul", keywords: "list bullet ul 列表", label: t("ed.ul"), kbd: "- ", action: "snippet", payload: "- " },
+      { id: "table", keywords: "table grid 表格", label: t("ed.table"), kbd: "| |", action: "snippet", payload: `${t("ed.table_tpl")}\n` },
+      { id: "math", keywords: "math latex katex 公式", label: t("ed.math_block"), kbd: "$$", action: "math" },
+      {
+        id: "mermaid",
+        keywords: "mermaid diagram chart 流程图",
+        label: t("ed.mermaid_diagram"),
+        kbd: "mermaid",
+        action: "snippet",
+        payload: "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```\n",
+      },
+      { id: "media", keywords: "image media photo audio video 图片 媒体", label: t("ed.insert_from_library"), kbd: "![](...)", action: "media" },
+      { id: "lock", keywords: "lock password secret 加密 密码", label: t("ed.sc_lock_pwd"), kbd: ":::lock", action: "lock" },
+      { id: "hr", keywords: "hr divider line 分割线", label: t("ed.hr"), kbd: "---", action: "snippet", payload: "---\n" },
+      { id: "toc", keywords: "toc outline 目录", label: t("ed.insert_toc"), kbd: "[toc]", action: "snippet", payload: "[toc]\n" },
+    ],
+    [curLocale]
+  );
+
+  const slashItemsRef = useRef<SlashCmdItem[]>([]);
+  slashItemsRef.current = slashItems;
+
+  const filteredSlashItems = useMemo(() => {
+    if (!slashMenu) return [];
+    const q = slashMenu.query.trim().toLowerCase();
+    if (!q) return slashItems;
+    return slashItems.filter(
+      (it) => it.id.includes(q) || it.keywords.toLowerCase().includes(q) || it.label.toLowerCase().includes(q)
+    );
+  }, [slashMenu, slashItems]);
+
+  const filteredSlashItemsRef = useRef<SlashCmdItem[]>([]);
+  filteredSlashItemsRef.current = filteredSlashItems;
+
+  const computeSlashMenuXY = (coords: { left: number; top: number; bottom: number }, query: string) => {
+    const q = query.trim().toLowerCase();
+    const count = !q
+      ? slashItemsRef.current.length
+      : slashItemsRef.current.filter(
+          (it) => it.id.includes(q) || it.keywords.toLowerCase().includes(q) || it.label.toLowerCase().includes(q)
+        ).length;
+    const vv = window.visualViewport;
+    const vpTop = vv ? vv.offsetTop : 0;
+    const vpLeft = vv ? vv.offsetLeft : 0;
+    const vpW = vv ? vv.width : window.innerWidth;
+    const vpH = vv ? vv.height : window.innerHeight;
+    const estH = Math.min(260, Math.max(1, count) * 40 + 16) + 6;
+    const x = Math.max(vpLeft + 12, Math.min(vpLeft + vpW - 260, Math.round(coords.left)));
+    const y =
+      coords.bottom + estH > vpTop + vpH
+        ? Math.max(vpTop + 12, Math.round(coords.top - estH))
+        : Math.round(coords.bottom + 6);
+    return { x, y };
+  };
+  const computeSlashMenuXYRef = useRef(computeSlashMenuXY);
+  computeSlashMenuXYRef.current = computeSlashMenuXY;
+
+  const executeSlashItem = (item: SlashCmdItem): boolean => {
+    const cur = slashMenuRef.current;
+    const view = viewRef.current;
+    if (!cur || !view) return false;
+    setSlashMenu(null);
+    const doc = view.state.doc;
+    const fromPos = Math.max(0, Math.min(doc.length, cur.from));
+    const toPos = Math.max(fromPos, Math.min(doc.length, cur.to));
+    const line = doc.lineAt(fromPos);
+    const leadText = doc.sliceString(line.from, fromPos);
+
+    if (item.action === "code") {
+      const ins = "```go\n\n```";
+      view.dispatch({
+        changes: { from: fromPos, to: toPos, insert: ins },
+        selection: { anchor: fromPos + 6 },
+        scrollIntoView: true,
+        userEvent: "input",
+      });
+      view.focus();
+      return true;
+    }
+    if (item.action === "math") {
+      const ins = "$$\n\n$$";
+      view.dispatch({
+        changes: { from: fromPos, to: toPos, insert: ins },
+        selection: { anchor: fromPos + 3 },
+        scrollIntoView: true,
+        userEvent: "input",
+      });
+      view.focus();
+      return true;
+    }
+    if (item.action === "media") {
+      view.dispatch({ changes: { from: fromPos, to: toPos, insert: "" }, selection: { anchor: fromPos }, userEvent: "input" });
+      setMediaModalOpen(true);
+      return true;
+    }
+    if (item.action === "lock") {
+      view.dispatch({ changes: { from: fromPos, to: toPos, insert: "" }, selection: { anchor: fromPos }, userEvent: "input" });
+      setLockMode("pwd");
+      setQiTab("lock");
+      setQiOpen(true);
+      return true;
+    }
+    const payload = item.payload || "";
+    const replaceStart = payload.startsWith("> ") && /^\s*>\s*$/.test(leadText) ? line.from : fromPos;
+    view.dispatch({
+      changes: { from: replaceStart, to: toPos, insert: payload },
+      selection: { anchor: replaceStart + payload.length },
+      scrollIntoView: true,
+      userEvent: "input",
+    });
+    view.focus();
+    return true;
+  };
+
+  execSlashItemRef.current = (idxOverride?: number) => {
+    const list = filteredSlashItemsRef.current;
+    const cur = slashMenuRef.current;
+    if (!cur || list.length === 0) return false;
+    const idx = Math.max(0, Math.min(list.length - 1, idxOverride ?? cur.idx));
+    return executeSlashItem(list[idx]);
+  };
+
+  useEffect(() => {
+    if (!slashMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (slashPopupRef.current?.contains(e.target as Node)) return;
+      setSlashMenu(null);
+    };
+    const onScroll = (e: Event) => {
+      if (slashPopupRef.current && e.target instanceof Node && slashPopupRef.current.contains(e.target)) return;
+      setSlashMenu(null);
+    };
+    const onVpChange = () => {
+      const cur = slashMenuRef.current;
+      const view = viewRef.current;
+      if (!cur || !view || !view.dom.isConnected) return;
+      const pos = Math.max(0, Math.min(view.state.doc.length, cur.to));
+      const coords = view.coordsAtPos(pos);
+      if (!coords) return;
+      const { x, y } = computeSlashMenuXYRef.current(coords, cur.query);
+      setSlashMenu((prev) => (prev ? { ...prev, x, y } : null));
+    };
+    const vv = window.visualViewport;
+    document.addEventListener("mousedown", onDown, true);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onVpChange);
+    vv?.addEventListener("resize", onVpChange);
+    vv?.addEventListener("scroll", onVpChange);
+    return () => {
+      document.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onVpChange);
+      vv?.removeEventListener("resize", onVpChange);
+      vv?.removeEventListener("scroll", onVpChange);
+    };
+  }, [slashMenu !== null]);
+
   const modeExtensions = (m: EditorMode) =>
     m === "ir" ? [buildInstantRenderPlugin()] : [lineNumbers()];
 
@@ -5530,27 +8493,52 @@ ${rendered}
         });
         return false;
       },
+      copy(event, view) {
+        const sel = view.state.selection.main;
+        if (sel.empty || isCursorInFencedCode(view.state)) return false;
+        const selectedMd = view.state.sliceDoc(sel.from, sel.to);
+        if (!selectedMd) return false;
+        const dt = event.clipboardData;
+        if (!dt) return false;
+        event.preventDefault();
+        dt.setData("text/plain", selectedMd);
+        dt.setData("text/html", markdownSelectionToClipboardHTML(selectedMd));
+        return true;
+      },
+      cut(event, view) {
+        const sel = view.state.selection.main;
+        if (sel.empty || isCursorInFencedCode(view.state)) return false;
+        const selectedMd = view.state.sliceDoc(sel.from, sel.to);
+        if (!selectedMd) return false;
+        const dt = event.clipboardData;
+        if (!dt) return false;
+        event.preventDefault();
+        dt.setData("text/plain", selectedMd);
+        dt.setData("text/html", markdownSelectionToClipboardHTML(selectedMd));
+        if (!view.state.readOnly) {
+          view.dispatch({
+            changes: { from: sel.from, to: sel.to, insert: "" },
+            selection: { anchor: sel.from },
+            userEvent: "delete.cut",
+          });
+        }
+        return true;
+      },
       paste(event, view) {
         const dt = event.clipboardData;
         if (!dt) return false;
-        const items = dt.items;
         const types = Array.from(dt.types || []);
         const rawPlain = dt.getData("text/plain") || "";
         const rawHTML = dt.getData("text/html") || "";
+        const mediaFiles = extractClipboardMediaFiles(dt);
 
-        // 1. Direct binary image paste (screenshot / "Copy image" when clipboard has no prose text)
-        if (!rawPlain.trim() && items) {
-          for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            if (item.kind === "file" && item.type.startsWith("image/")) {
-              const f = item.getAsFile();
-              if (f) {
-                event.preventDefault();
-                void uploadMediaFile(f);
-                return true;
-              }
-            }
+        // 1. Direct binary media paste (screenshot / OS file copy / Copy image)
+        if (shouldHandlePasteAsBinaryMedia(dt, mediaFiles, rawPlain, rawHTML)) {
+          event.preventDefault();
+          for (const f of mediaFiles) {
+            void uploadMediaFile(f);
           }
+          return true;
         }
 
         // 2. Keep IDE code copies & pastes inside fenced code blocks as literal plain text
@@ -5561,7 +8549,7 @@ ${rendered}
           return false;
         }
 
-        // 3. Rich webpage HTML -> clean GFM Markdown conversion (+ automatic base64 image upload)
+        // 3. Rich webpage / Volo HTML -> clean GFM Markdown conversion (+ automatic base64 image upload)
         if (rawHTML) {
           const converted = clipboardHtmlToMarkdown(rawHTML);
           if (converted && converted.markdown) {
@@ -5586,26 +8574,42 @@ ${rendered}
           }
         }
 
-        // 4. Fallback binary image file paste
-        if (items) {
-          for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            if (item.kind === "file" && item.type.startsWith("image/")) {
-              const f = item.getAsFile();
-              if (f) {
-                event.preventDefault();
-                void uploadMediaFile(f);
-                return true;
-              }
-            }
+        // 4. TSV (spreadsheet / database grid) -> GFM table fallback
+        const tableMd = tsvToMarkdownTable(rawPlain);
+        if (tableMd) {
+          event.preventDefault();
+          const sel = view.state.selection.main;
+          let toInsert = tableMd;
+          const charBefore = sel.from > 0 ? view.state.sliceDoc(sel.from - 1, sel.from) : "\n";
+          const charAfter = sel.to < view.state.doc.length ? view.state.sliceDoc(sel.to, sel.to + 1) : "\n";
+          if (charBefore !== "\n") toInsert = "\n\n" + toInsert;
+          if (charAfter !== "\n") toInsert = toInsert + "\n\n";
+          view.dispatch({
+            changes: { from: sel.from, to: sel.to, insert: toInsert },
+            selection: { anchor: sel.from + toInsert.length },
+            userEvent: "input.paste",
+          });
+          return true;
+        }
+
+        // 5. Fallback binary media file paste
+        if (mediaFiles.length > 0 && !rawPlain.trim()) {
+          event.preventDefault();
+          for (const f of mediaFiles) {
+            void uploadMediaFile(f);
           }
+          return true;
         }
         return false;
       },
-      drop(event) {
+      drop(event, view) {
         const files = event.dataTransfer?.files;
         if (files && files.length > 0) {
           event.preventDefault();
+          const dropPos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+          if (dropPos !== null) {
+            view.dispatch({ selection: { anchor: dropPos } });
+          }
           const list = Array.from(files);
           void (async () => {
             for (const f of list) {
@@ -5618,6 +8622,57 @@ ${rendered}
       },
     });
 
+    const slashKeymap = Prec.highest(
+      keymap.of([
+        {
+          key: "ArrowDown",
+          run: () => {
+            if (!slashMenuRef.current || filteredSlashItemsRef.current.length === 0) return false;
+            const len = filteredSlashItemsRef.current.length;
+            setSlashMenu((prev) => (prev ? { ...prev, idx: (prev.idx + 1) % len } : null));
+            return true;
+          },
+        },
+        {
+          key: "ArrowUp",
+          run: () => {
+            if (!slashMenuRef.current || filteredSlashItemsRef.current.length === 0) return false;
+            const len = filteredSlashItemsRef.current.length;
+            setSlashMenu((prev) => (prev ? { ...prev, idx: (prev.idx - 1 + len) % len } : null));
+            return true;
+          },
+        },
+        {
+          key: "Enter",
+          run: () => {
+            if (!slashMenuRef.current || filteredSlashItemsRef.current.length === 0) return false;
+            return execSlashItemRef.current();
+          },
+        },
+        {
+          key: "Tab",
+          run: () => {
+            if (!slashMenuRef.current || filteredSlashItemsRef.current.length === 0) return false;
+            return execSlashItemRef.current();
+          },
+        },
+        {
+          key: "Escape",
+          run: () => {
+            if (slashMenuRef.current) {
+              setSlashMenu(null);
+              return true;
+            }
+            if (findOpenRef.current) {
+              setFindOpen(false);
+              return true;
+            }
+            return false;
+          },
+        },
+      ])
+    );
+
     const shortcutKeymap = keymap.of([
       {
         key: "Mod-s",
@@ -5627,6 +8682,31 @@ ${rendered}
           } else {
             window.dispatchEvent(new CustomEvent("volo:save"));
           }
+          return true;
+        },
+      },
+      {
+        key: "Mod-f",
+        run: () => {
+          openFindBarRef.current(false);
+          return true;
+        },
+      },
+      {
+        key: "Mod-h",
+        run: () => {
+          openFindBarRef.current(true);
+          return true;
+        },
+      },
+      {
+        key: "Mod-/",
+        run: (v) => toggleEditorComment(v, false),
+      },
+      {
+        key: "Mod-Alt-c",
+        run: () => {
+          insertCodeBlockRef.current("bash");
           return true;
         },
       },
@@ -5699,8 +8779,11 @@ ${rendered}
       doc: value,
       extensions: [
         modeCompartment.current.of(modeExtensions(mode)),
+        cmSearchHighlightField,
+        slashKeymap,
         history(),
         Prec.high(keymap.of(markdownEditingKeymap)),
+        buildSmartTypingExt(false),
         pasteURLAsLinkExt,
         EditorView.lineWrapping,
         phCompartment.current.of(placeholder(t("ed.placeholder"))),
@@ -5710,6 +8793,48 @@ ${rendered}
         EditorView.updateListener.of((update) => {
           if (update.docChanged && !update.view.composing && !composingRef.current) {
             onChangeRef.current(update.state.doc.toString());
+          }
+          if (
+            !update.view.composing &&
+            !composingRef.current &&
+            modeRef.current !== "wysiwyg" &&
+            (update.docChanged || (slashMenuRef.current !== null && update.selectionSet))
+          ) {
+            const sel = update.state.selection.main;
+            if (!sel.empty) {
+              if (slashMenuRef.current) setSlashMenu(null);
+              return;
+            }
+            const headPos = sel.head;
+            const line = update.state.doc.lineAt(headPos);
+            if (isInsideFencedCode(update.state, line.number) || isInsideMathBlock(update.state, line.number)) {
+              if (slashMenuRef.current) setSlashMenu(null);
+              return;
+            }
+            const before = line.text.slice(0, headPos - line.from);
+            const after = line.text.slice(headPos - line.from);
+            const sm = after.trim() === "" ? /^(\s*(?:>\s*)?)\/([a-zA-Z0-9_-]{0,16})$/.exec(before) : null;
+            if (!sm) {
+              if (slashMenuRef.current) setSlashMenu(null);
+              return;
+            }
+            const slashFrom = line.from + sm[1].length;
+            const query = sm[2];
+            const viewInstance = update.view;
+            requestAnimationFrame(() => {
+              if (!viewInstance.dom.isConnected || viewInstance.state.selection.main.head !== headPos) return;
+              const coords = viewInstance.coordsAtPos(headPos);
+              if (!coords) return;
+              const { x, y } = computeSlashMenuXYRef.current(coords, query);
+              setSlashMenu((prev) => ({
+                query,
+                from: slashFrom,
+                to: headPos,
+                x,
+                y,
+                idx: prev && prev.from === slashFrom ? prev.idx : 0,
+              }));
+            });
           }
         }),
       ],
@@ -5750,7 +8875,15 @@ ${rendered}
         wysiwygRef.current.innerHTML = previewHTML || `<p><br></p>`;
       }
       normalizeWysiwygDOM(wysiwygRef.current, t("common.delete"));
-      enhanceRenderedPreviewDOM(wysiwygRef.current, { isWysiwyg: true });
+      enhanceRenderedPreviewDOM(wysiwygRef.current, {
+        isWysiwyg: true,
+        copyLabel: t("ed.copy_code"),
+        copiedLabel: t("ed.copied"),
+        plainLabel: t("ed.code_plain"),
+        onLangChange: () => {
+          if (wysiwygRef.current) onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
+        },
+      });
     }
   }, [mode]);
 
@@ -5797,7 +8930,15 @@ ${rendered}
           wysiwygDirtyRef.current = false;
           wysiwygRef.current.innerHTML = html || `<p><br></p>`;
           normalizeWysiwygDOM(wysiwygRef.current, t("common.delete"));
-          enhanceRenderedPreviewDOM(wysiwygRef.current, { isWysiwyg: true });
+          enhanceRenderedPreviewDOM(wysiwygRef.current, {
+            isWysiwyg: true,
+            copyLabel: t("ed.copy_code"),
+            copiedLabel: t("ed.copied"),
+            plainLabel: t("ed.code_plain"),
+            onLangChange: () => {
+              if (wysiwygRef.current) onChangeRef.current(htmlToMarkdown(wysiwygRef.current));
+            },
+          });
         }
       } catch {
         // Ignore aborted or transient preview errors while typing
@@ -5816,6 +8957,7 @@ ${rendered}
       isWysiwyg: false,
       copyLabel: t("ed.copy_code"),
       copiedLabel: t("ed.copied"),
+      plainLabel: t("ed.code_plain"),
     });
   }, [mode, previewHTML, curLocale]);
 
@@ -5832,15 +8974,40 @@ ${rendered}
       pv: number;
     }
 
+    let anchorsCache: ScrollAnchor[] | null = null;
+    let cachedDocRef: EditorState["doc"] | null = null;
+    let cachedCmH = -1;
+    let cachedPvH = -1;
+
+    const normHeading = (s: string): string =>
+      s
+        .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+        .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, a, b) => b || a)
+        .replace(/<[^>]+>/g, " ")
+        .replace(/[`*_~=^#<>|\\]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+
     const computeAnchors = (): ScrollAnchor[] | null => {
       const cmMax = Math.max(0, cmScroller.scrollHeight - cmScroller.clientHeight);
       const pvMax = Math.max(0, pvPane.scrollHeight - pvPane.clientHeight);
       if (cmMax <= 0 && pvMax <= 0) return null;
-      const anchors: ScrollAnchor[] = [{ cm: 0, pv: 0 }];
+      if (
+        anchorsCache &&
+        cachedDocRef === view.state.doc &&
+        cachedCmH === cmScroller.scrollHeight &&
+        cachedPvH === pvPane.scrollHeight
+      ) {
+        return anchorsCache;
+      }
 
-      const mdOffsets: number[] = [];
+      const anchors: ScrollAnchor[] = [{ cm: 0, pv: 0 }];
+      const mdHeads: Array<{ offset: number; level: number; norm: string }> = [];
       let fenceChar = "";
       let fenceLen = 0;
+      let fenceQDepth = 0;
       for (let ln = 1; ln <= view.state.doc.lines; ln++) {
         const lineObj = view.state.doc.line(ln);
         if (!fenceChar) {
@@ -5848,26 +9015,60 @@ ${rendered}
           if (open) {
             fenceChar = open.fenceChar;
             fenceLen = open.fenceLen;
+            fenceQDepth = open.quoteDepth;
             continue;
           }
-        } else if (matchFenceClose(lineObj.text, fenceChar, fenceLen)) {
+        } else if (matchFenceClose(lineObj.text, fenceChar, fenceLen, fenceQDepth)) {
           fenceChar = "";
           fenceLen = 0;
+          fenceQDepth = 0;
           continue;
         }
-        if (!fenceChar && /^#{1,6}\s+\S/.test(lineObj.text)) {
-          mdOffsets.push(lineObj.from);
+        if (!fenceChar) {
+          const hm = /^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(lineObj.text);
+          if (hm) {
+            mdHeads.push({ offset: lineObj.from, level: hm[1].length, norm: normHeading(hm[2]) });
+          }
         }
       }
 
-      const pvHeads = pvPane.querySelectorAll<HTMLElement>(
-        ":scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6"
+      const pvHeads = Array.from(pvPane.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6")).filter(
+        (el) => !el.closest(".volo-callout, .volo-embed-book, .volo-bookshelf, blockquote, details, td, th")
       );
-      if (mdOffsets.length > 0 && mdOffsets.length === pvHeads.length && cmMax > 0 && pvMax > 0) {
+
+      if (mdHeads.length > 0 && pvHeads.length > 0 && cmMax > 0 && pvMax > 0) {
+        const pvMeta = pvHeads.map((el) => ({
+          el,
+          level: Number(el.tagName.slice(1)) || 1,
+          norm: normHeading(el.textContent || ""),
+        }));
         const paneTop = pvPane.getBoundingClientRect().top;
-        for (let i = 0; i < mdOffsets.length; i++) {
-          const cmY = Math.min(cmMax, Math.max(0, view.lineBlockAt(mdOffsets[i]).top - 8));
-          const pvY = Math.min(pvMax, Math.max(0, pvHeads[i].getBoundingClientRect().top - paneTop + pvPane.scrollTop - 8));
+        let pvCursor = 0;
+        for (let i = 0; i < mdHeads.length && pvCursor < pvMeta.length; i++) {
+          const mh = mdHeads[i];
+          let matchedIdx = -1;
+          const lookLimit = Math.min(pvMeta.length, pvCursor + 8);
+          for (let j = pvCursor; j < lookLimit; j++) {
+            const pm = pvMeta[j];
+            if (pm.level !== mh.level) continue;
+            if (
+              pm.norm === mh.norm ||
+              (mh.norm.length >= 2 && (pm.norm.includes(mh.norm) || mh.norm.includes(pm.norm)))
+            ) {
+              matchedIdx = j;
+              break;
+            }
+          }
+          if (matchedIdx < 0 && mdHeads.length === pvMeta.length && pvMeta[i]?.level === mh.level) {
+            matchedIdx = i;
+          }
+          if (matchedIdx < 0) continue;
+          pvCursor = matchedIdx + 1;
+          const cmY = Math.min(cmMax, Math.max(0, view.lineBlockAt(mh.offset).top - 8));
+          const pvY = Math.min(
+            pvMax,
+            Math.max(0, pvMeta[matchedIdx].el.getBoundingClientRect().top - paneTop + pvPane.scrollTop - 8)
+          );
           const prev = anchors[anchors.length - 1];
           if (cmY >= prev.cm && pvY >= prev.pv && (cmY > prev.cm || pvY > prev.pv)) {
             anchors.push({ cm: cmY, pv: pvY });
@@ -5877,6 +9078,10 @@ ${rendered}
 
       const last = anchors[anchors.length - 1];
       anchors.push({ cm: Math.max(last.cm, cmMax), pv: Math.max(last.pv, pvMax) });
+      anchorsCache = anchors;
+      cachedDocRef = view.state.doc;
+      cachedCmH = cmScroller.scrollHeight;
+      cachedPvH = pvPane.scrollHeight;
       return anchors;
     };
 
@@ -5931,12 +9136,38 @@ ${rendered}
       }
     };
 
+    const invalidateAnchors = () => {
+      anchorsCache = null;
+      if (syncScrollRef.current && scrollDriverRef.current.source !== "pv") {
+        syncCmToPv();
+      }
+    };
+
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(invalidateAnchors);
+      ro.observe(pvPane);
+      ro.observe(cmScroller);
+      for (const ch of Array.from(pvPane.children)) ro.observe(ch);
+    }
+    let mo: MutationObserver | null = null;
+    if (typeof MutationObserver !== "undefined") {
+      mo = new MutationObserver(() => {
+        anchorsCache = null;
+      });
+      mo.observe(pvPane, { childList: true, subtree: true });
+    }
+    pvPane.addEventListener("load", invalidateAnchors, true);
+
     cmScroller.addEventListener("scroll", syncCmToPv, { passive: true });
     pvPane.addEventListener("scroll", syncPvToCm, { passive: true });
     const rafId = window.requestAnimationFrame(syncCmToPv);
 
     return () => {
       window.cancelAnimationFrame(rafId);
+      ro?.disconnect();
+      mo?.disconnect();
+      pvPane.removeEventListener("load", invalidateAnchors, true);
       cmScroller.removeEventListener("scroll", syncCmToPv);
       pvPane.removeEventListener("scroll", syncPvToCm);
     };
@@ -6152,6 +9383,8 @@ ${rendered}
           ? { minW: 224, maxW: 260, maxH: 310, estH: 236 }
           : activePop === "callout"
           ? { minW: 196, maxW: 240, maxH: 250, estH: 200 }
+          : activePop === "codeblock"
+          ? { minW: 168, maxW: 220, maxH: 300, estH: 280 }
           : activePop === "book"
           ? { minW: 236, maxW: 290, maxH: 180, estH: 112 }
           : activePop === "math"
@@ -6609,19 +9842,24 @@ ${rendered}
               <line x1="15" y1="3" x2="15" y2="21" />
             </SvgIcon>
           </button>
-          <button
-            type="button"
-            class="volo-ed-btn"
-            data-tip={t("ed.code_block")}
-            aria-label={t("ed.code_block")}
-            onClick={() => insertSnippet("\n```bash\n\n```\n")}
-          >
-            <SvgIcon>
-              <rect x="3" y="4" width="18" height="16" rx="2" />
-              <polyline points="8 10 11 12.5 8 15" />
-              <line x1="13" y1="15" x2="16" y2="15" />
-            </SvgIcon>
-          </button>
+          <div class="volo-pop-wrap">
+            <button
+              ref={(el) => {
+                popBtnRefs.current.codeblock = el;
+              }}
+              type="button"
+              class={`volo-ed-btn ${activePop === "codeblock" ? "active" : ""}`}
+              data-tip={t("ed.code_block")}
+              aria-label={t("ed.code_block")}
+              onClick={() => togglePop("codeblock")}
+            >
+              <SvgIcon>
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <polyline points="8 10 11 12.5 8 15" />
+                <line x1="13" y1="15" x2="16" y2="15" />
+              </SvgIcon>
+            </button>
+          </div>
 
           <div class="volo-pop-wrap">
             <button
@@ -6739,11 +9977,13 @@ ${rendered}
           ))}
         </div>
 
-        {/* Right Controls: 3-Mode Switcher + Sync Scroll (in sv) + Outline + Export + Fullscreen */}
+        {/* Right Controls: 3-Mode Switcher + Sync Scroll (in sv) + Find + Outline + Export + Fullscreen */}
         <div class="volo-ed-right">
           <div class="volo-ed-modes" role="tablist">
             <button
               type="button"
+              role="tab"
+              aria-selected={mode === "ir"}
               class={`volo-ed-mode-btn ${mode === "ir" ? "active" : ""}`}
               onClick={() => {
                 switchMode("ir");
@@ -6754,6 +9994,8 @@ ${rendered}
             </button>
             <button
               type="button"
+              role="tab"
+              aria-selected={mode === "wysiwyg"}
               class={`volo-ed-mode-btn ${mode === "wysiwyg" ? "active" : ""}`}
               onClick={() => {
                 switchMode("wysiwyg");
@@ -6764,6 +10006,8 @@ ${rendered}
             </button>
             <button
               type="button"
+              role="tab"
+              aria-selected={mode === "sv"}
               class={`volo-ed-mode-btn ${mode === "sv" ? "active" : ""}`}
               onClick={() => switchMode("sv")}
             >
@@ -6793,6 +10037,19 @@ ${rendered}
               </SvgIcon>
             </button>
           )}
+
+          <button
+            type="button"
+            class={`volo-ed-btn ${findOpen ? "active" : ""}`}
+            data-tip={t("ed.find_replace")}
+            aria-label={t("ed.find_replace")}
+            onClick={() => (findOpen ? closeFindBar() : openFindBar(false))}
+          >
+            <SvgIcon>
+              <circle cx="11" cy="11" r="7" />
+              <line x1="20" y1="20" x2="16.1" y2="16.1" />
+            </SvgIcon>
+          </button>
 
           <button
             type="button"
@@ -7083,6 +10340,21 @@ ${rendered}
               </>
             )}
 
+            {activePop === "codeblock" &&
+              CODE_BLOCK_LANGS.map((item) => (
+                <button
+                  key={item.value || "plain"}
+                  type="button"
+                  class="volo-cselect-item"
+                  onClick={() => {
+                    setActivePop("");
+                    insertCodeBlock(item.value);
+                  }}
+                >
+                  <span class="volo-cselect-item-text">{item.value ? item.label : t("ed.code_plain")}</span>
+                </button>
+              ))}
+
             {activePop === "export" && (
               <>
                 <button
@@ -7117,6 +10389,42 @@ ${rendered}
                 </button>
               </>
             )}
+          </div>,
+          document.body
+        )}
+
+      {/* Slash `/` Block Command Menu Portal */}
+      {slashMenu &&
+        filteredSlashItems.length > 0 &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            ref={slashPopupRef}
+            class="volo-slash-menu"
+            style={{ left: `${slashMenu.x}px`, top: `${slashMenu.y}px` }}
+            role="listbox"
+          >
+            <div class="volo-slash-head">{t("ed.slash_hint")}</div>
+            {filteredSlashItems.map((it, idx) => {
+              const active = idx === Math.min(slashMenu.idx, filteredSlashItems.length - 1);
+              return (
+                <button
+                  key={it.id}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  class={`volo-slash-item ${active ? "is-active" : ""}`}
+                  onMouseEnter={() => setSlashMenu((prev) => (prev ? { ...prev, idx } : null))}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    executeSlashItem(it);
+                  }}
+                >
+                  <span>{it.label}</span>
+                  <span class="volo-slash-kbd">{it.kbd}</span>
+                </button>
+              );
+            })}
           </div>,
           document.body
         )}
@@ -7173,6 +10481,119 @@ ${rendered}
 
       {/* Main Editor Body */}
       <div class={`volo-ed-body mode-${mode} mob-pane-${mobilePane} ${showOutline ? "with-outline" : ""}`}>
+        {/* Native Floating Find & Replace Bar */}
+        {findOpen && mode !== "wysiwyg" && (
+          <div class="volo-ed-findbar" role="search">
+            <div class="volo-ed-findbar-row">
+              <input
+                ref={findInputRef}
+                type="text"
+                class={`volo-ed-find-input ${findInvalid ? "is-invalid" : ""}`}
+                placeholder={t("ed.find_ph")}
+                value={findQuery}
+                onInput={(e) => {
+                  setFindQuery((e.currentTarget as HTMLInputElement).value);
+                  setFindIdx(0);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    stepFindMatch(e.shiftKey ? -1 : 1);
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    closeFindBar();
+                  }
+                }}
+              />
+              {findQuery ? (
+                <span class="volo-ed-find-count">
+                  {findMatches.length > 0 ? `${safeFindIdx + 1}/${findMatches.length}` : t("ed.no_matches")}
+                </span>
+              ) : null}
+              <button
+                type="button"
+                class={`volo-ed-find-btn ${findCase ? "is-on" : ""}`}
+                title={t("ed.match_case")}
+                aria-label={t("ed.match_case")}
+                aria-pressed={findCase}
+                onClick={() => setFindCase((v) => !v)}
+              >
+                Aa
+              </button>
+              <button
+                type="button"
+                class={`volo-ed-find-btn ${findRegex ? "is-on" : ""}`}
+                title={t("ed.match_regex")}
+                aria-label={t("ed.match_regex")}
+                aria-pressed={findRegex}
+                onClick={() => setFindRegex((v) => !v)}
+              >
+                .*
+              </button>
+              <button
+                type="button"
+                class="volo-ed-find-btn"
+                aria-label="Previous"
+                onClick={() => stepFindMatch(-1)}
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                class="volo-ed-find-btn"
+                aria-label="Next"
+                onClick={() => stepFindMatch(1)}
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                class={`volo-ed-find-btn ${findShowReplace ? "is-on" : ""}`}
+                title={t("ed.replace_ph")}
+                aria-label={t("ed.replace_ph")}
+                aria-pressed={findShowReplace}
+                onClick={() => setFindShowReplace((v) => !v)}
+              >
+                ⇄
+              </button>
+              <button
+                type="button"
+                class="volo-ed-find-btn"
+                aria-label={t("common.close")}
+                onClick={closeFindBar}
+              >
+                ×
+              </button>
+            </div>
+            {findShowReplace && (
+              <div class="volo-ed-findbar-row">
+                <input
+                  type="text"
+                  class="volo-ed-find-input"
+                  placeholder={t("ed.replace_ph")}
+                  value={replaceQuery}
+                  onInput={(e) => setReplaceQuery((e.currentTarget as HTMLInputElement).value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      replaceCurrentMatch();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      closeFindBar();
+                    }
+                  }}
+                />
+                <button type="button" class="volo-ed-find-btn" onClick={replaceCurrentMatch}>
+                  {t("ed.replace_one")}
+                </button>
+                <button type="button" class="volo-ed-find-btn" onClick={replaceAllMatches}>
+                  {t("ed.replace_all")}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* CM6 Host stays mounted for undo history; hidden only in pure visual mode */}
         <div
           class={`volo-cm-host ${mode === "ir" ? "is-ir-mode" : ""}`}
@@ -7180,16 +10601,87 @@ ${rendered}
           style={{ display: mode === "wysiwyg" ? "none" : undefined }}
         />
 
-        {/* Visual WYSIWYG Editable Surface */}
+        {/* Visual WYSIWYG Table Action Bar + Editable Surface */}
+        {mode === "wysiwyg" && wysiwygTblActive && (
+          <div
+            class="volo-wysiwyg-tbl-bar"
+            role="toolbar"
+            aria-label={t("ed.table")}
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("row_above")}>
+              +Row ↑
+            </button>
+            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("row_below")}>
+              +Row ↓
+            </button>
+            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("del_row")}>
+              -Row
+            </button>
+            <span class="volo-ed-sep" />
+            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("col_left")}>
+              +Col ←
+            </button>
+            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("col_right")}>
+              +Col →
+            </button>
+            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("del_col")}>
+              -Col
+            </button>
+            <span class="volo-ed-sep" />
+            <button type="button" class="volo-ed-find-btn" onClick={() => mutateWysiwygTable("del_table")}>
+              × {t("ed.table")}
+            </button>
+          </div>
+        )}
         {mode === "wysiwyg" && (
           <div
             ref={wysiwygRef}
             class="volo-wysiwyg-surface"
             contentEditable
+            onDragOver={(e) => {
+              e.preventDefault();
+            }}
+            onDrop={(e) => {
+              const files = e.dataTransfer?.files;
+              if (!files || files.length === 0) return;
+              e.preventDefault();
+              const root = e.currentTarget as HTMLElement;
+              const docAny = document as any;
+              let dropRange: Range | null = null;
+              if (typeof docAny.caretRangeFromPoint === "function") {
+                dropRange = docAny.caretRangeFromPoint(e.clientX, e.clientY);
+              } else if (typeof docAny.caretPositionFromPoint === "function") {
+                const cp = docAny.caretPositionFromPoint(e.clientX, e.clientY);
+                if (cp?.offsetNode) {
+                  dropRange = document.createRange();
+                  dropRange.setStart(cp.offsetNode, cp.offset);
+                  dropRange.collapse(true);
+                }
+              }
+              if (dropRange && root.contains(dropRange.commonAncestorContainer)) {
+                const sel = window.getSelection();
+                if (sel) {
+                  sel.removeAllRanges();
+                  sel.addRange(dropRange);
+                }
+                lastWysiwygRangeRef.current = dropRange.cloneRange();
+              }
+              const list = Array.from(files);
+              void (async () => {
+                for (const f of list) {
+                  await uploadMediaFile(f);
+                }
+              })();
+            }}
             onMouseDown={(e) => {
               const root = e.currentTarget as HTMLElement;
               const target = e.target as HTMLElement | null;
               if (!target) return;
+
+              if (target.closest(".volo-code-head")) {
+                return;
+              }
 
               const delBtn = target.closest(".volo-wysiwyg-audio-del");
               if (delBtn) {
@@ -7207,7 +10699,7 @@ ${rendered}
               if (selBlock) {
                 selBlock.classList.add("is-selected");
                 const tag = target.tagName.toLowerCase();
-                if (tag !== "audio" && tag !== "video" && tag !== "button" && tag !== "input") {
+                if (tag !== "audio" && tag !== "video" && tag !== "button" && tag !== "input" && tag !== "select") {
                   e.preventDefault();
                   root.focus();
                 }
@@ -7273,6 +10765,11 @@ ${rendered}
             }}
             onKeyDown={(e) => {
               if (e.isComposing || (e as any).keyCode === 229 || wysiwygComposingRef.current) return;
+              if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.key === "f" || e.key === "F" || e.key === "h" || e.key === "H")) {
+                e.preventDefault();
+                openFindBar(e.key.toLowerCase() === "h");
+                return;
+              }
               const root = e.currentTarget as HTMLElement;
               const selectedBlock = root.querySelector(
                 ".volo-wysiwyg-audio-block.is-selected, [data-volo-md-b64].is-selected"
@@ -7355,6 +10852,36 @@ ${rendered}
               saveWysiwygSelection(root);
               scheduleWysiwygEmit(root, false);
             }}
+            onCopy={(e) => {
+              const root = e.currentTarget as HTMLElement;
+              const dt = e.clipboardData;
+              if (!dt) return;
+              const payload = extractWysiwygSelectionClipboard(root);
+              if (!payload) return;
+              e.preventDefault();
+              dt.setData("text/plain", payload.plain);
+              dt.setData("text/html", payload.html);
+            }}
+            onCut={(e) => {
+              const root = e.currentTarget as HTMLElement;
+              const dt = e.clipboardData;
+              if (!dt) return;
+              const payload = extractWysiwygSelectionClipboard(root);
+              if (!payload) return;
+              e.preventDefault();
+              dt.setData("text/plain", payload.plain);
+              dt.setData("text/html", payload.html);
+              if (root.isContentEditable) {
+                payload.range.deleteContents();
+                const sel = window.getSelection();
+                if (sel) {
+                  sel.removeAllRanges();
+                  sel.addRange(payload.range);
+                }
+                saveWysiwygSelection(root);
+                scheduleWysiwygEmit(root, true);
+              }
+            }}
             onPaste={(e) => {
               const root = e.currentTarget as HTMLElement;
               saveWysiwygSelection(root);
@@ -7363,30 +10890,65 @@ ${rendered}
               const types = Array.from(dt.types || []);
               const rawPlain = dt.getData("text/plain") || "";
               const rawHTML = dt.getData("text/html") || "";
-              if (!rawPlain.trim()) {
-                for (let i = 0; i < (dt.items?.length || 0); i++) {
-                  const it = dt.items[i];
-                  if (it.kind === "file" && it.type.startsWith("image/")) {
-                    const f = it.getAsFile();
-                    if (f) {
-                      e.preventDefault();
-                      void uploadMediaFile(f);
-                      return;
-                    }
-                  }
+              const mediaFiles = extractClipboardMediaFiles(dt);
+              if (shouldHandlePasteAsBinaryMedia(dt, mediaFiles, rawPlain, rawHTML)) {
+                e.preventDefault();
+                for (const f of mediaFiles) {
+                  void uploadMediaFile(f);
                 }
+                return;
               }
               if (types.includes("vscode-editor-data") || types.includes("application/x-jetbrains-editor")) {
                 return;
               }
+              const sel = window.getSelection();
+              const anchorEl =
+                sel && sel.rangeCount > 0
+                  ? sel.getRangeAt(0).startContainer.nodeType === Node.ELEMENT_NODE
+                    ? (sel.getRangeAt(0).startContainer as Element)
+                    : sel.getRangeAt(0).startContainer.parentElement
+                  : null;
+              if (anchorEl?.closest("pre")) {
+                return;
+              }
+              if (
+                !rawHTML.trim() &&
+                /^https?:\/\/\S+$/i.test(rawPlain.trim()) &&
+                sel &&
+                !sel.isCollapsed &&
+                !anchorEl?.closest("a, code")
+              ) {
+                const selStr = sel.toString().trim();
+                if (selStr && !selStr.includes("\n")) {
+                  e.preventDefault();
+                  const cleanHref = cleanClipboardUrl(rawPlain.trim()) || rawPlain.trim();
+                  document.execCommand("createLink", false, cleanHref);
+                  saveWysiwygSelection(root);
+                  scheduleWysiwygEmit(root, false);
+                  return;
+                }
+              }
               if (rawHTML) {
                 const converted = clipboardHtmlToMarkdown(rawHTML);
-                if (converted) {
+                if (converted && converted.markdown) {
                   e.preventDefault();
                   spliceMarkdownAtWysiwygCaret(root, converted.markdown);
                   if (converted.pendingUploads.length > 0) {
                     void uploadPendingPasteImages(converted.pendingUploads);
                   }
+                  return;
+                }
+              }
+              const tableMd = tsvToMarkdownTable(rawPlain);
+              if (tableMd) {
+                e.preventDefault();
+                spliceMarkdownAtWysiwygCaret(root, tableMd);
+                return;
+              }
+              if (mediaFiles.length > 0 && !rawPlain.trim()) {
+                e.preventDefault();
+                for (const f of mediaFiles) {
+                  void uploadMediaFile(f);
                 }
               }
             }}
@@ -7867,8 +11429,11 @@ function buildCssSyntaxPlugin() {
     const doc = view.state.doc;
     const composing = view.composing;
     const cursorLine = composing ? doc.lineAt(view.state.selection.main.head) : null;
+    let lastAddedTo = 0;
     for (const { from, to } of view.visibleRanges) {
-      const slice = doc.sliceString(from, to);
+      const scanFrom = Math.max(0, from - 4096);
+      const scanTo = Math.min(doc.length, to + 512);
+      const slice = doc.sliceString(scanFrom, scanTo);
       interface Tok {
         s: number;
         e: number;
@@ -7877,37 +11442,65 @@ function buildCssSyntaxPlugin() {
       const toks: Tok[] = [];
       const used = new Uint8Array(slice.length);
       const claim = (s: number, e: number, cls: string) => {
-        if (s >= e) return;
+        if (s >= e || s < 0 || e > slice.length) return;
         for (let i = s; i < e; i++) if (used[i]) return;
         for (let i = s; i < e; i++) used[i] = 1;
-        toks.push({ s: from + s, e: from + e, cls });
+        const absS = Math.max(from, scanFrom + s);
+        const absE = Math.min(to, scanFrom + e);
+        if (absS < absE) toks.push({ s: absS, e: absE, cls });
       };
 
       let m: RegExpExecArray | null;
       const cmtRe = /\/\*[\s\S]*?\*\//g;
-      while ((m = cmtRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "c");
+      while ((m = cmtRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "cm");
 
       const strRe = /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/g;
-      while ((m = strRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "s");
+      while ((m = strRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "s2");
 
       const atRe = /@[a-zA-Z-]+/g;
       while ((m = atRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "k");
 
+      const impRe = /!important\b/gi;
+      while ((m = impRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "kc");
+
       const varRe = /--[a-zA-Z0-9_-]+/g;
-      while ((m = varRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "na");
+      while ((m = varRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "nv");
 
-      const propRe = /([a-zA-Z-]+)(\s*:)/g;
-      while ((m = propRe.exec(slice)) !== null) claim(m.index, m.index + m[1].length, "kt");
+      const psRe = /(::?[a-zA-Z-][a-zA-Z0-9_-]*)(?=(?:[^;{}()]|\([^()]*\))*\{)/g;
+      while ((m = psRe.exec(slice)) !== null) claim(m.index, m.index + m[1].length, "nd");
 
-      const numRe = /#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvh|%|s|ms|deg)?\b/g;
-      while ((m = numRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "m");
+      // Distinguish .class and #id selectors outside `{...}` from #rgb/#rrggbb/#rrggbbaa hex colors inside declarations
+      const clsIdSelRe = /[.#][A-Za-z_-][A-Za-z0-9_-]*(?=(?:[^;{}()]|\([^()]*\))*\{)/g;
+      while ((m = clsIdSelRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "nc");
+
+      // Property names only inside `{ prop: val; }` or `@media (prop: val)` — never tag names before `:hover` / `::before`
+      const propRe = /(?:^|[;{\s(])([a-zA-Z-]+)(?=\s*:(?!:)(?:[^;{}()]|\([^()]*\))*?(?:;|\}|\)))/g;
+      while ((m = propRe.exec(slice)) !== null) {
+        const s = m.index + m[0].length - m[1].length;
+        claim(s, s + m[1].length, "na");
+      }
+
+      const fnRe = /\b([a-zA-Z_-][\w-]*)(?=\()/g;
+      while ((m = fnRe.exec(slice)) !== null) claim(m.index, m.index + m[1].length, "nf");
+
+      const hexRe = /#[0-9a-fA-F]{3,8}\b(?=(?:[^;{}()]|\([^()]*\))*?(?:;|\}|\)))/g;
+      while ((m = hexRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "mi");
+
+      const numRe = /-?\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|dvw|svw|dvh|svh|%|s|ms|deg|fr|ch)?\b/g;
+      while ((m = numRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "mi");
+
+      const valKwRe =
+        /\b(?:none|auto|inherit|initial|unset|solid|dashed|dotted|flex|grid|block|inline|inline-flex|inline-block|relative|absolute|fixed|sticky|hidden|clip|visible|pointer|center|left|right|top|bottom|space-between|transparent|currentColor|border-box|ease|linear|infinite|both|row|column|wrap|nowrap|bold|normal|italic)\b/g;
+      while ((m = valKwRe.exec(slice)) !== null) claim(m.index, m.index + m[0].length, "kc");
 
       toks.sort((a, b) => a.s - b.s || a.e - b.e);
       for (const tk of toks) {
+        if (tk.s < lastAddedTo) continue;
         if (cursorLine && tk.s < cursorLine.to && tk.e > cursorLine.from) {
           continue;
         }
         builder.add(tk.s, tk.e, Decoration.mark({ class: tk.cls }));
+        lastAddedTo = tk.e;
       }
     }
     return builder.finish();
@@ -7936,6 +11529,7 @@ function buildCssSyntaxPlugin() {
 export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave }: CM6CssEditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const phCompartment = useRef(new Compartment());
   const valueRef = useRef(value);
   valueRef.current = value;
   const composingRef = useRef(false);
@@ -7970,7 +11564,41 @@ export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave 
         history(),
         EditorView.lineWrapping,
         buildCssSyntaxPlugin(),
-        placeholder(phText || ""),
+        buildSmartTypingExt(true),
+        phCompartment.current.of(placeholder(phText || "")),
+        Prec.high(
+          keymap.of([
+            {
+              key: "Enter",
+              run: expandIndentedBracesOnEnter,
+            },
+            {
+              key: "Backspace",
+              run: (v) => {
+                const { state: st } = v;
+                if (st.readOnly || st.selection.ranges.length !== 1 || !st.selection.main.empty) return false;
+                const pos = st.selection.main.head;
+                const ln = st.doc.lineAt(pos);
+                if (pos <= ln.from || pos >= ln.to) return false;
+                const prevCh = st.sliceDoc(pos - 1, pos);
+                const nextCh = st.sliceDoc(pos, pos + 1);
+                if (CODE_AUTO_PAIRS[prevCh] === nextCh) {
+                  v.dispatch({
+                    changes: { from: pos - 1, to: pos + 1, insert: "" },
+                    selection: { anchor: pos - 1 },
+                    userEvent: "delete.backward",
+                  });
+                  return true;
+                }
+                return false;
+              },
+            },
+            {
+              key: "Mod-/",
+              run: (v) => toggleEditorComment(v, true),
+            },
+          ])
+        ),
         keymap.of([
           {
             key: "Mod-s",
@@ -8015,6 +11643,12 @@ export function CM6CssEditorCore({ value, onChange, placeholder: phText, onSave 
       });
     }
   }, [value]);
+
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: phCompartment.current.reconfigure(placeholder(phText || "")),
+    });
+  }, [phText]);
 
   return <div ref={hostRef} class="volo-cm-host volo-css-cm-host chroma" />;
 }

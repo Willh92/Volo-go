@@ -4,15 +4,18 @@ import {
   apiFetch,
   applyThemeAttributes,
   dirtyEditorSig,
+  localizeAdminError,
   openConfirm,
   resetConsoleScroll,
   showToast,
   themeModeSig,
+  uploadWithProgress,
 } from "../api";
 import {
   ensureLocaleLoaded,
   exportFullTemplateJSON,
   exportLocalePackJSON,
+  formatDateTime,
   localeSig,
   syncExternalLocales,
   t,
@@ -32,6 +35,7 @@ import {
   TableSkeleton,
   TokenListInput,
   UploadButton,
+  UploadProgressBar,
   useFlipList,
   usePointerSortableList,
 } from "../components/UIControls";
@@ -136,12 +140,12 @@ function getSchemaFieldGroup(f: any): string {
   );
 }
 
-function buildSchemaDefaults(schema: any[]): Record<string, any> {
+function buildSchemaDefaults(schema: any[], clearSecrets = false): Record<string, any> {
   const out: Record<string, any> = {};
   for (const f of schema || []) {
     if (!f?.key) continue;
     if (isSecretSchemaField(f)) {
-      out[f.key] = "";
+      out[f.key] = clearSecrets ? CLEAR_SECRET_SENTINEL : "";
     } else if (isTagListSchemaField(f)) {
       out[f.key] = coerceTagListValue(f.default);
     } else if (Array.isArray(f.default)) {
@@ -167,8 +171,25 @@ function validateSchemaRequired(
   secretKeysSet?: Record<string, boolean>,
 ): string | null {
   for (const f of schema || []) {
-    if (!f?.key || !f.required) continue;
+    if (!f?.key) continue;
     const label = resolveSchemaText(f.label) || String(f.key);
+    if (f.type === "number") {
+      const rawVal = values[f.key] !== undefined ? values[f.key] : f.default;
+      const isEmpty = rawVal === "" || rawVal === null || rawVal === undefined;
+      if (!isEmpty) {
+        const numVal = Number(rawVal);
+        if (Number.isNaN(numVal)) {
+          return t("app.cfg_required_missing", { field: label });
+        }
+        if (typeof f.min === "number" && numVal < f.min) {
+          return `${label} >= ${f.min}`;
+        }
+        if (typeof f.max === "number" && numVal > f.max) {
+          return `${label} <= ${f.max}`;
+        }
+      }
+    }
+    if (!f.required) continue;
     if (isSecretSchemaField(f)) {
       const cur = values[f.key];
       const hasSaved = (Boolean(secretKeysSet?.[f.key]) || cur === "********") && cur !== CLEAR_SECRET_SENTINEL;
@@ -190,12 +211,6 @@ function validateSchemaRequired(
       if (val === "" || val === null || val === undefined || Number.isNaN(Number(val))) {
         return t("app.cfg_required_missing", { field: label });
       }
-      if (typeof f.min === "number" && Number(val) < f.min) {
-        return `${label} >= ${f.min}`;
-      }
-      if (typeof f.max === "number" && Number(val) > f.max) {
-        return `${label} <= ${f.max}`;
-      }
     } else if (f.type !== "boolean") {
       if (String(val ?? "").trim() === "") {
         return t("app.cfg_required_missing", { field: label });
@@ -203,6 +218,131 @@ function validateSchemaRequired(
     }
   }
   return null;
+}
+
+async function inspectZipManifestId(
+  file: File,
+  manifestFile: string,
+  installedIds: string[]
+): Promise<string | null> {
+  const known = new Set(installedIds.filter(Boolean));
+  if (known.size === 0) return null;
+  try {
+    const tailLen = Math.min(file.size, 65558);
+    const tailBuf = await file.slice(file.size - tailLen, file.size).arrayBuffer();
+    const tailView = new DataView(tailBuf);
+    let eocd = -1;
+    for (let i = tailLen - 22; i >= 0; i--) {
+      if (tailView.getUint32(i, true) === 0x06054b50) {
+        eocd = i;
+        break;
+      }
+    }
+    if (eocd >= 0) {
+      const cdSize = tailView.getUint32(eocd + 12, true);
+      const cdOffset = tailView.getUint32(eocd + 16, true);
+      if (cdOffset < file.size && cdSize > 0 && cdSize <= 4 * 1024 * 1024) {
+        const cdBuf = await file.slice(cdOffset, Math.min(file.size, cdOffset + cdSize)).arrayBuffer();
+        const cdBytes = new Uint8Array(cdBuf);
+        const cdView = new DataView(cdBuf);
+        const dec = new TextDecoder();
+        const targetLower = manifestFile.toLowerCase();
+        let pos = 0;
+        let folderHint = "";
+        while (pos + 46 <= cdBytes.length && cdView.getUint32(pos, true) === 0x02014b50) {
+          const method = cdView.getUint16(pos + 10, true);
+          const compSize = cdView.getUint32(pos + 20, true);
+          const nameLen = cdView.getUint16(pos + 28, true);
+          const extraLen = cdView.getUint16(pos + 30, true);
+          const commentLen = cdView.getUint16(pos + 32, true);
+          const lhOffset = cdView.getUint32(pos + 42, true);
+          if (pos + 46 + nameLen > cdBytes.length) break;
+          const entryName = dec.decode(cdBytes.subarray(pos + 46, pos + 46 + nameLen)).replace(/\\/g, "/");
+          const parts = entryName.split("/").filter(Boolean);
+          if (
+            parts[parts.length - 1]?.toLowerCase() === targetLower &&
+            parts.length <= 2 &&
+            compSize > 0 &&
+            compSize <= 262144 &&
+            lhOffset + 30 < file.size
+          ) {
+            if (parts.length === 2 && known.has(parts[0])) folderHint = parts[0];
+            const sliceEnd = Math.min(file.size, lhOffset + 30 + nameLen + 1024 + compSize);
+            const lhBuf = await file.slice(lhOffset, sliceEnd).arrayBuffer();
+            const lhView = new DataView(lhBuf);
+            if (lhBuf.byteLength >= 30 && lhView.getUint32(0, true) === 0x04034b50) {
+              const lhNameLen = lhView.getUint16(26, true);
+              const lhExtraLen = lhView.getUint16(28, true);
+              const dataStart = 30 + lhNameLen + lhExtraLen;
+              if (dataStart + compSize <= lhBuf.byteLength) {
+                const rawEntry = new Uint8Array(lhBuf, dataStart, compSize);
+                let jsonText = "";
+                if (method === 0) {
+                  jsonText = dec.decode(rawEntry);
+                } else if (method === 8 && typeof DecompressionStream === "function") {
+                  const ds = new DecompressionStream("deflate-raw");
+                  const copy = new Uint8Array(rawEntry.byteLength);
+                  copy.set(rawEntry);
+                  const stream = new Blob([copy]).stream().pipeThrough(ds);
+                  jsonText = await new Response(stream).text();
+                }
+                if (jsonText) {
+                  const parsed = JSON.parse(jsonText);
+                  const id = typeof parsed?.id === "string" ? parsed.id.trim() : "";
+                  if (id && known.has(id)) return id;
+                }
+              }
+            }
+          }
+          pos += 46 + nameLen + extraLen + commentLen;
+        }
+        if (folderHint && known.has(folderHint)) return folderHint;
+      }
+    }
+  } catch {
+    // Fall through to filename heuristic
+  }
+  const base = file.name.replace(/\.zip$/i, "");
+  for (const id of known) {
+    const esc = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`^(?:volo-(?:plugin|theme)-|plugin-|theme-)?${esc}(?:-[vV]?\\d+\\..*|_.*)?$`, "i").test(base)) {
+      return id;
+    }
+  }
+  return null;
+}
+
+async function downloadZipBlob(url: string, filename: string): Promise<void> {
+  try {
+    const res = await fetch(url, {
+      credentials: "same-origin",
+      headers: {
+        "X-Volo-Console": "1",
+        ...(localeSig.value ? { "Accept-Language": localeSig.value } : {}),
+      },
+    });
+    if (!res.ok) {
+      let rawMsg = `HTTP ${res.status}`;
+      const ct = res.headers.get("Content-Type") || "";
+      if (ct.includes("application/json")) {
+        const j = await res.json().catch(() => null);
+        if (j?.error) rawMsg = String(j.error);
+      }
+      showToast(localizeAdminError(rawMsg), "err");
+      return;
+    }
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    const objUrl = URL.createObjectURL(blob);
+    a.href = objUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+  } catch (err: any) {
+    showToast(err?.message || t("api.err_network"), "err");
+  }
 }
 
 function SortableFixedOptsField({
@@ -992,6 +1132,8 @@ export function AppearanceWorkspace({
   const [sub, setSub] = useState<AppearanceTab>(activeTab);
   const [loading, setLoading] = useState<boolean>(true);
   const [uploading, setUploading] = useState<boolean>(false);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const [triggeringCronKey, setTriggeringCronKey] = useState<string>("");
 
   const [themes, setThemes] = useState<any[]>([]);
   const [themeQuery, setThemeQuery] = useState<string>("");
@@ -1028,6 +1170,40 @@ export function AppearanceWorkspace({
   const [logLevelFilter, setLogLevelFilter] = useState<string>("");
   const [logTextFilter, setLogTextFilter] = useState<string>("");
   const [logPage, setLogPage] = useState<number>(1);
+  const [logLimit, setLogLimit] = useState<number>(100);
+  const [logsRefreshing, setLogsRefreshing] = useState<boolean>(false);
+
+  const fetchPluginLogs = async (pluginId: string, limit = logLimit) => {
+    setLogsRefreshing(true);
+    try {
+      const r = await apiFetch<{ items: any[] }>(
+        `/api/admin/plugins/${encodeURIComponent(pluginId)}/logs?limit=${limit}`,
+      );
+      setLogsModal({ id: pluginId, logs: r.items || [] });
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setLogsRefreshing(false);
+    }
+  };
+
+  const triggerSingleCronJob = async (pluginId: string, jobName: string) => {
+    const key = `${pluginId}:${jobName}`;
+    if (triggeringCronKey) return;
+    setTriggeringCronKey(key);
+    try {
+      await apiFetch(`/api/admin/plugins/${encodeURIComponent(pluginId)}/cron`, {
+        method: "POST",
+        body: JSON.stringify({ name: jobName }),
+      });
+      showToast(t("app.plugin_cron_triggered", { count: 1 }), "ok");
+      void loadData(true);
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setTriggeringCronKey("");
+    }
+  };
 
   const formatCronInterval = (secRaw: any): string => {
     const sec = Math.max(1, Number(secRaw || 0));
@@ -1305,24 +1481,37 @@ export function AppearanceWorkspace({
                       const fd = new FormData();
                       fd.append("file", f);
                       const qs = `locale=${encodeURIComponent(localeSig.value)}${overwrite ? "&overwrite=true" : ""}`;
-                      await apiFetch(`/api/admin/themes/install?${qs}`, {
-                        method: "POST",
-                        body: fd,
-                      });
+                      await uploadWithProgress(`/api/admin/themes/install?${qs}`, fd, setUploadPct);
                     };
+                    let preConfirmedOverwrite = false;
+                    const existingThemeId = await inspectZipManifestId(
+                      f,
+                      "theme.json",
+                      themes.filter((th) => !th.is_builtin && !th.builtin).map((th) => String(th.id)),
+                    );
+                    if (existingThemeId) {
+                      const ok = await openConfirm({
+                        message: t("app.confirm_overwrite_theme"),
+                        danger: true,
+                      });
+                      if (!ok) return;
+                      preConfirmedOverwrite = true;
+                    }
                     setUploading(true);
+                    setUploadPct(0);
                     try {
-                      await uploadThemeZip(false);
+                      await uploadThemeZip(preConfirmedOverwrite);
                       setBrokenPreviews({});
                       showToast(t("app.theme_installed"), "ok");
                       void loadData(true);
                     } catch (err: any) {
-                      if (isAlreadyExistsConflict(err)) {
+                      if (!preConfirmedOverwrite && isAlreadyExistsConflict(err)) {
                         const ok = await openConfirm({
                           message: t("app.confirm_overwrite_theme"),
                           danger: true,
                         });
                         if (ok) {
+                          setUploadPct(0);
                           try {
                             await uploadThemeZip(true);
                             setBrokenPreviews({});
@@ -1337,11 +1526,20 @@ export function AppearanceWorkspace({
                       }
                     } finally {
                       setUploading(false);
+                      setUploadPct(null);
                     }
                   }}
                 />
               </div>
             </div>
+            {uploading && uploadPct !== null && (
+              <div style={{ marginBottom: "12px" }}>
+                <UploadProgressBar
+                  progress={uploadPct}
+                  label={t("cnt.media_uploading_pct", { pct: uploadPct })}
+                />
+              </div>
+            )}
 
             <div class="volo-theme-grid">
               {pagedThemes.slice.map((th) => {
@@ -1437,13 +1635,18 @@ export function AppearanceWorkspace({
                         >
                           {t("common.preview")} ↗
                         </a>
-                        <a
+                        <button
+                          type="button"
                           class="volo-btn volo-btn-sm"
-                          href={`/api/admin/themes/${encodeURIComponent(th.id)}/export`}
-                          download={`${th.id}.zip`}
+                          onClick={() =>
+                            void downloadZipBlob(
+                              `/api/admin/themes/${encodeURIComponent(th.id)}/export`,
+                              `${th.id}.zip`,
+                            )
+                          }
                         >
                           {t("app.theme_export_zip")}
-                        </a>
+                        </button>
                         {schema.length > 0 && (
                           <button
                             type="button"
@@ -1610,7 +1813,18 @@ export function AppearanceWorkspace({
                     dirtyEditorSig.value = false;
                     setAppCfg(res.value || { ...appCfg, accent: nextAccent });
                     setAppVer(res.version);
-                    applyThemeAttributes(themeModeSig.value, nextAccent, false);
+                    const hasLocalMode = (() => {
+                      try {
+                        return Boolean(localStorage.getItem("volo_theme_mode"));
+                      } catch {
+                        return false;
+                      }
+                    })();
+                    const nextMode =
+                      !hasLocalMode && (res.value?.default_mode || appCfg.default_mode)
+                        ? String(res.value?.default_mode || appCfg.default_mode)
+                        : themeModeSig.value;
+                    applyThemeAttributes(nextMode, nextAccent, false);
                     showToast(t("common.saved"), "ok");
                   } catch (err: any) {
                     showToast(err.message, "err");
@@ -1695,7 +1909,7 @@ export function AppearanceWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("app.loc_col_lang")}</th>
@@ -1911,23 +2125,36 @@ export function AppearanceWorkspace({
                     const fd = new FormData();
                     fd.append("file", f);
                     const qs = `locale=${encodeURIComponent(localeSig.value)}${overwrite ? "&overwrite=true" : ""}`;
-                    await apiFetch(`/api/admin/plugins/install?${qs}`, {
-                      method: "POST",
-                      body: fd,
-                    });
+                    await uploadWithProgress(`/api/admin/plugins/install?${qs}`, fd, setUploadPct);
                   };
+                  let preConfirmedOverwrite = false;
+                  const existingPluginId = await inspectZipManifestId(
+                    f,
+                    "manifest.json",
+                    plugins.map((p) => String(p.id)),
+                  );
+                  if (existingPluginId) {
+                    const ok = await openConfirm({
+                      message: t("app.confirm_overwrite_plugin"),
+                      danger: true,
+                    });
+                    if (!ok) return;
+                    preConfirmedOverwrite = true;
+                  }
                   setUploading(true);
+                  setUploadPct(0);
                   try {
-                    await uploadPluginZip(false);
+                    await uploadPluginZip(preConfirmedOverwrite);
                     showToast(t("app.installed_toast"), "ok");
                     void loadData(true);
                   } catch (err: any) {
-                    if (isAlreadyExistsConflict(err)) {
+                    if (!preConfirmedOverwrite && isAlreadyExistsConflict(err)) {
                       const ok = await openConfirm({
                         message: t("app.confirm_overwrite_plugin"),
                         danger: true,
                       });
                       if (ok) {
+                        setUploadPct(0);
                         try {
                           await uploadPluginZip(true);
                           showToast(t("app.installed_toast"), "ok");
@@ -1941,14 +2168,23 @@ export function AppearanceWorkspace({
                     }
                   } finally {
                     setUploading(false);
+                    setUploadPct(null);
                   }
                 }}
               />
             </div>
           </div>
+          {uploading && uploadPct !== null && (
+            <div style={{ marginBottom: "12px" }}>
+              <UploadProgressBar
+                progress={uploadPct}
+                label={t("cnt.media_uploading_pct", { pct: uploadPct })}
+              />
+            </div>
+          )}
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("app.plugin_col_info")}</th>
@@ -1987,25 +2223,61 @@ export function AppearanceWorkspace({
                               <div class="volo-cell-meta"><span>{resolveSchemaText(p.description)}</span></div>
                             )}
                             {rowCronJobs.length > 0 && (
-                              <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "4px" }}>
-                                {rowCronJobs.map((job) => (
-                                  <span
-                                    key={job.name}
-                                    class="volo-code-chip"
-                                    title={job.last_error ? `${job.name}: ${job.last_error}` : job.handler || job.name}
-                                    style={
-                                      job.last_error
-                                        ? { borderColor: "var(--volo-danger)", color: "var(--volo-danger)" }
-                                        : undefined
-                                    }
-                                  >
-                                    {t("app.plugin_cron_badge", {
-                                      name: String(job.name || "cron"),
-                                      interval: formatCronInterval(job.interval_seconds),
-                                      runs: Number(job.run_count || 0),
-                                    })}
-                                  </span>
-                                ))}
+                              <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "4px", alignItems: "center" }}>
+                                {rowCronJobs.map((job) => {
+                                  const jobName = String(job.name || "cron");
+                                  const isRunning = Boolean(job.running || job.is_running || triggeringCronKey === `${p.id}:${jobName}`);
+                                  const rawLast = job.last_run_at;
+                                  const lastRunLabel =
+                                    rawLast && rawLast !== "0" && Number(rawLast) !== 0
+                                      ? formatDateTime(
+                                          typeof rawLast === "number" && rawLast > 0 && rawLast < 1e12
+                                            ? rawLast * 1000
+                                            : rawLast,
+                                        )
+                                      : "";
+                                  return (
+                                    <span
+                                      key={jobName}
+                                      class="volo-code-chip"
+                                      title={job.last_error ? `${jobName}: ${job.last_error}` : job.handler || jobName}
+                                      style={{
+                                        display: "inline-flex",
+                                        alignItems: "center",
+                                        gap: "6px",
+                                        ...(job.last_error
+                                          ? { borderColor: "var(--volo-danger)", color: "var(--volo-danger)" }
+                                          : {}),
+                                      }}
+                                    >
+                                      <span>
+                                        {t("app.plugin_cron_badge", {
+                                          name: jobName,
+                                          interval: formatCronInterval(job.interval_seconds),
+                                          runs: Number(job.run_count || 0),
+                                        })}
+                                        {lastRunLabel ? ` · ${lastRunLabel}` : ""}
+                                      </span>
+                                      {isRunning && (
+                                        <span class="volo-status-pill warn" style={{ padding: "0 6px", fontSize: "11px" }}>
+                                          <span class="volo-status-dot" />
+                                          {t("app.plugin_cron_running")}
+                                        </span>
+                                      )}
+                                      {Boolean(p.is_enabled) && (
+                                        <button
+                                          type="button"
+                                          class="volo-act-btn"
+                                          style={{ padding: "1px 6px", height: "20px", fontSize: "11px" }}
+                                          disabled={isRunning || Boolean(triggeringCronKey)}
+                                          onClick={() => void triggerSingleCronJob(String(p.id), jobName)}
+                                        >
+                                          ▶ {t("app.plugin_cron_run_one")}
+                                        </button>
+                                      )}
+                                    </span>
+                                  );
+                                })}
                               </div>
                             )}
                             {p.last_error && (
@@ -2104,18 +2376,12 @@ export function AppearanceWorkspace({
                               type="button"
                               class="volo-act-btn"
                               onClick={async () => {
-                                try {
-                                  const r = await apiFetch<{ items: any[] }>(
-                                    `/api/admin/plugins/${encodeURIComponent(p.id)}/logs`,
-                                  );
-                                  setLogLevelFilter("");
-                                  setLogTextFilter("");
-                                  setLogPage(1);
-                                  setLogsModal({ id: p.id, logs: r.items || [] });
-                                  setLogsModalOpen(true);
-                                } catch (err: any) {
-                                  showToast(err.message, "err");
-                                }
+                                setLogLevelFilter("");
+                                setLogTextFilter("");
+                                setLogPage(1);
+                                setLogsModal({ id: p.id, logs: [] });
+                                setLogsModalOpen(true);
+                                await fetchPluginLogs(p.id, logLimit);
                               }}
                             >
                               {t("app.logs")}
@@ -2138,14 +2404,11 @@ export function AppearanceWorkspace({
                                 {
                                   label: t("app.plugin_export_zip"),
                                   hidden: isBuiltinPlugin,
-                                  onClick: () => {
-                                    const a = document.createElement("a");
-                                    a.href = `/api/admin/plugins/${encodeURIComponent(p.id)}/export`;
-                                    a.download = `${p.id}.zip`;
-                                    document.body.appendChild(a);
-                                    a.click();
-                                    a.remove();
-                                  },
+                                  onClick: () =>
+                                    void downloadZipBlob(
+                                      `/api/admin/plugins/${encodeURIComponent(p.id)}/export`,
+                                      `${p.id}.zip`,
+                                    ),
                                 },
                                 {
                                   label: t("app.plugin_trigger_cron"),
@@ -2282,7 +2545,7 @@ export function AppearanceWorkspace({
               style={{ marginRight: "auto" }}
               onClick={async () => {
                 if (!(await openConfirm({ message: t("app.confirm_reset_cfg"), danger: false }))) return;
-                setThemeCfgVals(buildSchemaDefaults(themeSchema));
+                setThemeCfgVals(buildSchemaDefaults(themeSchema, true));
               }}
             >
               {t("app.reset_defaults")}
@@ -2347,7 +2610,7 @@ export function AppearanceWorkspace({
               style={{ marginRight: "auto" }}
               onClick={async () => {
                 if (!(await openConfirm({ message: t("app.confirm_reset_cfg"), danger: false }))) return;
-                setCfgValues(buildSchemaDefaults(pluginSchema));
+                setCfgValues(buildSchemaDefaults(pluginSchema, true));
               }}
             >
               {t("app.reset_defaults")}
@@ -2409,11 +2672,13 @@ export function AppearanceWorkspace({
               class="volo-btn volo-btn-primary"
               onClick={async () => {
                 if (!prioModal) return;
-                const parsed = Math.round(Number(prioValue));
-                if (!Number.isFinite(parsed) || parsed < -10000 || parsed > 10000) {
-                  showToast(`${t("app.plugin_prio_label")} (-10000 .. 10000)`, "err");
+                const rawNum = Math.round(Number(prioValue));
+                if (!Number.isFinite(rawNum)) {
+                  showToast(`${t("app.plugin_prio_label")} (-1000 .. 1000)`, "err");
                   return;
                 }
+                const parsed = Math.max(-1000, Math.min(1000, rawNum));
+                if (parsed !== rawNum) setPrioValue(String(parsed));
                 try {
                   const res = await apiFetch<{ items?: any[] }>(
                     `/api/admin/plugins/${encodeURIComponent(prioModal.id)}/priority?locale=${encodeURIComponent(localeSig.value)}`,
@@ -2445,11 +2710,17 @@ export function AppearanceWorkspace({
           <input
             type="number"
             class="volo-input"
-            min={-10000}
-            max={10000}
+            min={-1000}
+            max={1000}
             step={1}
             value={prioValue}
             onInput={(e) => setPrioValue((e.currentTarget as HTMLInputElement).value)}
+            onBlur={() => {
+              const n = Math.round(Number(prioValue));
+              if (Number.isFinite(n)) {
+                setPrioValue(String(Math.max(-1000, Math.min(1000, n))));
+              }
+            }}
           />
           <div class="volo-help" style={{ marginTop: "8px" }}>
             {t("app.plugin_chain_hint")}
@@ -2500,9 +2771,10 @@ export function AppearanceWorkspace({
           </>
         }
       >
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px" }}>
-          <div style={{ width: "140px", maxWidth: "100%" }}>
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px" }}>
+          <div style={{ width: "120px", maxWidth: "100%" }}>
             <ConsoleSelect
+              searchable={false}
               value={logLevelFilter}
               onChange={(v) => {
                 setLogLevelFilter(v);
@@ -2516,10 +2788,29 @@ export function AppearanceWorkspace({
               ]}
             />
           </div>
+          <div style={{ width: "112px", maxWidth: "100%" }}>
+            <ConsoleSelect
+              searchable={false}
+              value={String(logLimit)}
+              onChange={(v) => {
+                const nextLim = Number(v) || 100;
+                setLogLimit(nextLim);
+                setLogPage(1);
+                if (logsModal?.id) {
+                  void fetchPluginLogs(logsModal.id, nextLim);
+                }
+              }}
+              options={[
+                { value: "100", label: "100" },
+                { value: "250", label: "250" },
+                { value: "500", label: "500" },
+              ]}
+            />
+          </div>
           <input
             type="search"
             class="volo-input"
-            style={{ flex: "1 1 200px", minWidth: 0 }}
+            style={{ flex: "1 1 180px", minWidth: 0 }}
             placeholder={t("app.logs_filter_ph")}
             value={logTextFilter}
             onInput={(e) => {
@@ -2527,6 +2818,16 @@ export function AppearanceWorkspace({
               setLogPage(1);
             }}
           />
+          {logsModal?.id && (
+            <button
+              type="button"
+              class="volo-btn volo-btn-sm"
+              disabled={logsRefreshing}
+              onClick={() => void fetchPluginLogs(logsModal.id, logLimit)}
+            >
+              {t("common.refresh")}
+            </button>
+          )}
         </div>
         {(() => {
           const pagedPluginLogs = paginateItems(filteredLogs, logPage, 50);

@@ -466,7 +466,11 @@ func (d *Dispatcher) BroadcastArticlePublished(_ context.Context, raw domain.Raw
 	} else if body == "" {
 		body = truncatePlain(plugin.StripLockedMarkdownBlocks(raw.ContentMD), 180)
 	}
-	fullURL := d.getPublicURL() + visibility.ArticlePath(raw.Slug)
+	pubAt := raw.PublishedAt
+	if pubAt <= 0 {
+		pubAt = raw.CreatedAt
+	}
+	fullURL := d.getPublicURL() + visibility.FormatArticlePath(snap.SEO.PostPermalinkStyle, raw.Slug, pubAt, snap.Site.TimeZone)
 
 	d.enqueueAsync(12*time.Second, func(bgCtx context.Context) {
 		d.BroadcastWebhookEvent(bgCtx, WebhookEvent{
@@ -584,9 +588,19 @@ func (d *Dispatcher) resolveTargetTitleAndPath(ctx context.Context, targetType, 
 		return "Page", "/"
 	}
 	var art domain.RawArticle
-	err := sqlx.GetInto(ctx, d.store, &art, `SELECT title, slug FROM articles WHERE id = ?`, targetID)
+	err := sqlx.GetInto(ctx, d.store, &art, `SELECT title, slug, published_at, created_at FROM articles WHERE id = ?`, targetID)
 	if err == nil {
-		return art.Title, visibility.ArticlePath(art.Slug)
+		pubAt := art.PublishedAt
+		if pubAt <= 0 {
+			pubAt = art.CreatedAt
+		}
+		var style, tz string
+		if d.settings != nil {
+			snap := d.settings.Snapshot()
+			style = snap.SEO.PostPermalinkStyle
+			tz = snap.Site.TimeZone
+		}
+		return art.Title, visibility.FormatArticlePath(style, art.Slug, pubAt, tz)
 	}
 	return "Post", "/"
 }

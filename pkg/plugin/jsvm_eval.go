@@ -41,6 +41,7 @@ const (
 	maxJSExportNodes  = 50_000  // Maximum visited nodes during export/stringify/toString
 	maxJSONParseDepth = 64      // Maximum JSON.parse / goToJSValue recursion depth
 	maxJSONParseNodes = 100_000 // Maximum JSON.parse / goToJSValue total node budget
+	maxJSEvalDepth    = 512     // Maximum recursive expression evaluation depth
 )
 
 type jsValue struct {
@@ -246,14 +247,18 @@ type jsRuntime struct {
 	arrProto        *jsObject
 	strProto        *jsObject
 	numProto        *jsObject
+	boolProto       *jsObject
 	reProto         *jsObject
 	funcProto       *jsObject
+	jsonObj         *jsObject
+	mathObj         *jsObject
 	builtinGlobals  map[string]jsValue
 	postInitGlobals map[string]jsValue
 	postInitConsts  map[string]bool
 	protoSnaps      map[*jsObject]map[string]jsValue
 	maxStack        int
 	stackDepth      int
+	evalDepth       int
 	interrupted     atomic.Bool
 	interruptVal    atomic.Value
 }
@@ -271,13 +276,17 @@ func newJSRuntime() *jsRuntime {
 // builtin prototypes/namespaces so pooled VMs cannot leak prototype or globalThis
 // mutations across invocations while preserving normal module-level globals.
 func (rt *jsRuntime) snapshotPostInit() {
-	for _, proto := range []*jsObject{rt.objProto, rt.arrProto, rt.strProto, rt.numProto, rt.reProto, rt.funcProto} {
+	sharedBuiltins := []*jsObject{
+		rt.objProto, rt.arrProto, rt.strProto, rt.numProto,
+		rt.boolProto, rt.reProto, rt.funcProto, rt.jsonObj, rt.mathObj,
+	}
+	for _, proto := range sharedBuiltins {
 		if proto != nil {
 			proto.frozen = true
 		}
 	}
-	rt.protoSnaps = make(map[*jsObject]map[string]jsValue, 6)
-	for _, proto := range []*jsObject{rt.objProto, rt.arrProto, rt.strProto, rt.numProto, rt.reProto, rt.funcProto} {
+	rt.protoSnaps = make(map[*jsObject]map[string]jsValue, len(sharedBuiltins))
+	for _, proto := range sharedBuiltins {
 		if proto != nil {
 			cp := make(map[string]jsValue, len(proto.props))
 			for k, v := range proto.props {
@@ -1215,16 +1224,24 @@ func (rt *jsRuntime) execStmt(st jsStmt, scope *jsScope, thisVal jsValue) (flowR
 }
 
 func hasOptionalLink(ex jsExpr) bool {
-	switch e := ex.(type) {
-	case *exprMember:
-		return e.optional || hasOptionalLink(e.obj)
-	case *exprCall:
-		if e.isNew {
+	for {
+		switch e := ex.(type) {
+		case *exprMember:
+			if e.optional {
+				return true
+			}
+			ex = e.obj
+		case *exprCall:
+			if e.isNew {
+				return false
+			}
+			if e.optional {
+				return true
+			}
+			ex = e.callee
+		default:
 			return false
 		}
-		return e.optional || hasOptionalLink(e.callee)
-	default:
-		return false
 	}
 }
 
@@ -1258,6 +1275,15 @@ func (rt *jsRuntime) evalCallArgs(rawArgs []jsExpr, scope *jsScope, thisVal jsVa
 	return argVals, nil
 }
 
+func (rt *jsRuntime) evalSubChain(ex jsExpr, scope *jsScope, thisVal jsValue) (jsValue, jsValue, bool, error) {
+	if rt.evalDepth >= maxJSEvalDepth {
+		return jsUndefinedVal, jsUndefinedVal, false, rt.throwErr("RangeError", "Maximum call stack size exceeded")
+	}
+	rt.evalDepth++
+	defer func() { rt.evalDepth-- }()
+	return rt.evalChain(ex, scope, thisVal)
+}
+
 func (rt *jsRuntime) evalChain(ex jsExpr, scope *jsScope, thisVal jsValue) (jsValue, jsValue, bool, error) {
 	if err := rt.checkInterrupt(); err != nil {
 		return jsUndefinedVal, jsUndefinedVal, false, err
@@ -1268,7 +1294,7 @@ func (rt *jsRuntime) evalChain(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVa
 		var shortCircuited bool
 		var err error
 		if hasOptionalLink(e.obj) {
-			objVal, _, shortCircuited, err = rt.evalChain(e.obj, scope, thisVal)
+			objVal, _, shortCircuited, err = rt.evalSubChain(e.obj, scope, thisVal)
 			if err != nil || shortCircuited {
 				return jsUndefinedVal, jsUndefinedVal, shortCircuited, err
 			}
@@ -1300,12 +1326,12 @@ func (rt *jsRuntime) evalChain(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVa
 		var shortCircuited bool
 		var err error
 		if mem, ok := e.callee.(*exprMember); ok {
-			calleeVal, receiver, shortCircuited, err = rt.evalChain(mem, scope, thisVal)
+			calleeVal, receiver, shortCircuited, err = rt.evalSubChain(mem, scope, thisVal)
 			if err != nil || shortCircuited {
 				return jsUndefinedVal, jsUndefinedVal, shortCircuited, err
 			}
 		} else if hasOptionalLink(e.callee) {
-			calleeVal, _, shortCircuited, err = rt.evalChain(e.callee, scope, thisVal)
+			calleeVal, _, shortCircuited, err = rt.evalSubChain(e.callee, scope, thisVal)
 			if err != nil || shortCircuited {
 				return jsUndefinedVal, jsUndefinedVal, shortCircuited, err
 			}
@@ -1336,6 +1362,11 @@ func (rt *jsRuntime) evalExpr(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVal
 	if err := rt.checkInterrupt(); err != nil {
 		return jsUndefinedVal, err
 	}
+	if rt.evalDepth >= maxJSEvalDepth {
+		return rt.throwValErr("RangeError", "Maximum call stack size exceeded")
+	}
+	rt.evalDepth++
+	defer func() { rt.evalDepth-- }()
 	switch e := ex.(type) {
 	case *exprParen:
 		return rt.evalExpr(e.inner, scope, thisVal)
@@ -2347,6 +2378,25 @@ func (rt *jsRuntime) getProperty(target jsValue, prop string) jsValue {
 			}
 			return jsUndefinedVal
 		}
+	case valBool:
+		switch prop {
+		case "toString":
+			bStr := "false"
+			if target.b {
+				bStr = "true"
+			}
+			return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+				return jsValue{kind: valString, str: bStr}, nil
+			})
+		case "valueOf":
+			bv := target
+			return nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+				return bv, nil
+			})
+		}
+		if v, ok := rt.getProtoProp(rt.boolProto, prop); ok {
+			return v
+		}
 	case valNumber:
 		if v := numberProperty(target.num, prop); v.kind != valUndefined {
 			return v
@@ -3316,23 +3366,75 @@ func arrayProperty(arr *jsArray, prop string) jsValue {
 					defined = append(defined, it)
 				}
 			}
-			var sortErr error
-			sort.SliceStable(defined, func(i, j int) bool {
+			if len(defined) > 1 {
 				if cmpFn == nil {
-					return defined[i].toString() < defined[j].toString()
+					type sortEntry struct {
+						val jsValue
+						key string
+					}
+					entries := make([]sortEntry, len(defined))
+					for i, it := range defined {
+						if err := rt.checkInterrupt(); err != nil {
+							return jsUndefinedVal, err
+						}
+						var s string
+						var ok bool
+						if it.kind == valObject && it.obj != nil {
+							if ts := it.obj.get("toString"); ts.kind == valFunc && ts.fn != nil {
+								tv, callErr := rt.callFunc(ts.fn, it, nil)
+								if callErr != nil {
+									return jsUndefinedVal, callErr
+								}
+								s, ok = tv.toStringChecked()
+							} else {
+								s, ok = it.toStringChecked()
+							}
+						} else {
+							s, ok = it.toStringChecked()
+						}
+						if !ok {
+							return rt.throwStrLenErr()
+						}
+						entries[i] = sortEntry{val: it, key: s}
+					}
+					var sortErr error
+					sort.SliceStable(entries, func(i, j int) bool {
+						if sortErr != nil {
+							return false
+						}
+						if err := rt.checkInterrupt(); err != nil {
+							sortErr = err
+							return false
+						}
+						return entries[i].key < entries[j].key
+					})
+					if sortErr != nil {
+						return jsUndefinedVal, sortErr
+					}
+					for i, e := range entries {
+						defined[i] = e.val
+					}
+				} else {
+					var sortErr error
+					sort.SliceStable(defined, func(i, j int) bool {
+						if sortErr != nil {
+							return false
+						}
+						if err := rt.checkInterrupt(); err != nil {
+							sortErr = err
+							return false
+						}
+						res, err := rt.callFunc(cmpFn, jsUndefinedVal, []jsValue{defined[i], defined[j]})
+						if err != nil {
+							sortErr = err
+							return false
+						}
+						return res.toNumber() < 0
+					})
+					if sortErr != nil {
+						return jsUndefinedVal, sortErr
+					}
 				}
-				if sortErr != nil {
-					return false
-				}
-				res, err := rt.callFunc(cmpFn, jsUndefinedVal, []jsValue{defined[i], defined[j]})
-				if err != nil {
-					sortErr = err
-					return false
-				}
-				return res.toNumber() < 0
-			})
-			if sortErr != nil {
-				return jsUndefinedVal, sortErr
 			}
 			for i := 0; i < undefCount; i++ {
 				defined = append(defined, jsUndefinedVal)
@@ -3894,6 +3996,7 @@ func (rt *jsRuntime) installBuiltins() {
 	rt.arrProto = rt.NewObject()
 	rt.strProto = rt.NewObject()
 	rt.numProto = rt.NewObject()
+	rt.boolProto = rt.NewObject()
 	rt.reProto = rt.NewObject()
 	rt.funcProto = rt.NewObject()
 	rt.globalObj = &jsObject{scope: rt.global, props: make(map[string]jsValue)}
@@ -3982,9 +4085,16 @@ func (rt *jsRuntime) installBuiltins() {
 	}
 	rt.global.define("Number", jsValue{kind: valFunc, fn: numCtor}, false)
 
-	rt.global.define("Boolean", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-		return boolVal(len(args) > 0 && args[0].toBool()), nil
-	}), false)
+	boolCtor := &jsFunc{
+		name: "Boolean",
+		native: func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			return boolVal(len(args) > 0 && args[0].toBool()), nil
+		},
+		props: map[string]jsValue{
+			"prototype": {kind: valObject, obj: rt.boolProto},
+		},
+	}
+	rt.global.define("Boolean", jsValue{kind: valFunc, fn: boolCtor}, false)
 
 	rt.global.define("parseInt", parseIntFn, false)
 	rt.global.define("parseFloat", parseFloatFn, false)
@@ -4558,6 +4668,22 @@ func (rt *jsRuntime) installBuiltins() {
 		},
 	}
 	rt.global.define("Date", jsValue{kind: valFunc, fn: dateCtor}, false)
+
+	rt.jsonObj = jsonObj
+	rt.mathObj = mathObj
+	for _, shared := range []*jsObject{
+		rt.objProto, rt.arrProto, rt.strProto, rt.numProto,
+		rt.boolProto, rt.reProto, rt.funcProto, jsonObj, mathObj,
+	} {
+		if shared != nil {
+			shared.frozen = true
+		}
+	}
+	for _, ctor := range []*jsFunc{strCtor, numCtor, boolCtor, reCtor, arrCtor, objCtor, dateCtor} {
+		if ctor != nil {
+			ctor.frozenProps = true
+		}
+	}
 
 	rt.builtinGlobals = make(map[string]jsValue, len(rt.global.vars)+4)
 	for k, v := range rt.global.vars {

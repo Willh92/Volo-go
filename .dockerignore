@@ -18,3 +18,5 @@ web/admin/node_modules
 web/node_modules
 coverage.txt
 *.test
+plugins/kanbanniang
+internal/adminui/dist

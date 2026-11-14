@@ -496,6 +496,9 @@ func (s *AppServer) registerRoutes(mux *http.ServeMux) {
 func (s *AppServer) withRedirectGuardian(next http.Handler) http.Handler {
 	staticAdmin := s.staticAdminPrefix()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.deps.Config != nil && s.deps.Config.TLSEnabled() {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		p := r.URL.Path
 		adminPrefix, _ := s.effectiveAdminPrefix()
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
@@ -642,7 +645,7 @@ func serveSafeUserStaticFile(w http.ResponseWriter, r *http.Request, baseDir str
 	}
 
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
 	w.Header().Set("Cache-Control", "public, max-age=2592000")
 	etag := fmt.Sprintf(`"%x-%x"`, st.ModTime().UnixNano(), st.Size())
 	w.Header().Set("ETag", etag)
@@ -704,7 +707,7 @@ func (s *AppServer) serveLocalImageWithView(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
 	w.Header().Set("Cache-Control", "public, max-age=2592000")
 	if res.ETag != "" {
 		w.Header().Set("ETag", res.ETag)
@@ -852,7 +855,7 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
 			w.Header().Set("Cache-Control", "public, max-age=2592000")
 			mimeHdr := explicitInlineMediaMIME(ext)
 			if mimeHdr == "" {
@@ -887,7 +890,7 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox")
 	w.Header().Set("Cache-Control", "public, max-age=2592000")
 	if res.ETag != "" {
 		w.Header().Set("ETag", res.ETag)
@@ -1736,9 +1739,16 @@ func (s *AppServer) handleCommentsRootAPI(w http.ResponseWriter, r *http.Request
 			}
 		}
 		clientIP := s.clientIP(r)
-		if !s.deps.WAF.AllowRate("comment_post", clientIP, 12, time.Minute) {
-			writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
-			return
+		rdCfg := s.deps.Settings.Snapshot().Reading
+		if rdCfg.CommentRateMaxCount > 0 {
+			winSec := rdCfg.CommentRateWindowSeconds
+			if winSec <= 0 {
+				winSec = domain.DefaultCommentRateWindowSeconds
+			}
+			if !s.deps.WAF.AllowRate("comment_post", clientIP, rdCfg.CommentRateMaxCount, time.Duration(winSec)*time.Second) {
+				writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
+				return
+			}
 		}
 		var in content.CreateCommentInput
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
@@ -2306,9 +2316,13 @@ func (s *AppServer) basePageContextWithSession(r *http.Request, viewer *domain.U
 	locale := s.resolveLocale(r)
 	navItems, _ := s.deps.Content.ListPublicNavItems(r.Context(), locale)
 	cats, _ := s.deps.Content.ListCategoriesWithCounts(r.Context())
+	if r.URL.Path != "/categories" && len(cats) > 50 {
+		cats = cats[:50]
+	}
 	var tags []content.TagWithCount
 	if snap.Reading.PopularTagsCount > 0 {
-		tags, _ = s.deps.Content.ListTagsWithCounts(r.Context(), snap.Reading.PopularTagsCount)
+		tagLimit := min(snap.Reading.PopularTagsCount, 100)
+		tags, _ = s.deps.Content.ListTagsWithCounts(r.Context(), tagLimit)
 	}
 	var recentComments []content.RecentCommentItem
 	if snap.Reading.RecentCommentsCount > 0 && r.URL.Path != "/dynamic" {
@@ -2636,6 +2650,16 @@ func matchYearMonthArticlePath(rawPath string) (string, bool) {
 	return parts[2], true
 }
 
+func sameDecodedPath(reqPath string, targetPath string) bool {
+	if reqPath == targetPath {
+		return true
+	}
+	if dec, err := url.PathUnescape(targetPath); err == nil && dec == reqPath {
+		return true
+	}
+	return false
+}
+
 func (s *AppServer) handlePostRoute(w http.ResponseWriter, r *http.Request) {
 	s.serveArticleSegment(w, r, strings.TrimPrefix(r.URL.Path, "/posts/"))
 }
@@ -2707,6 +2731,17 @@ func (s *AppServer) serveArticleSegment(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("Cache-Control", "private, no-store")
 		raw = cand
 	}
+	if raw.Status == domain.ArticleStatusPublished && (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		s.deps.Content != nil && s.deps.Content.Guard() != nil {
+		if canonicalPath := s.deps.Content.Guard().ArticleURL(raw); canonicalPath != "" && !sameDecodedPath(r.URL.Path, canonicalPath) {
+			target := canonicalPath
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+			return
+		}
+	}
 	if raw.HasContentLock || strings.TrimSpace(raw.PasswordCiphertext) != "" || render.ContainsLockDirective(raw.ContentMD) || render.ContainsLockDirective(raw.SummaryMD) {
 		w.Header().Set("Cache-Control", "private, no-store")
 	}
@@ -2719,6 +2754,9 @@ func (s *AppServer) serveArticleSegment(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if detail.URL != "" {
+		pctx.CanonicalURL = s.publicBaseURL(r) + detail.URL
+	}
 	pctx.IsArticle = true
 	pctx.PageTitle = detail.Title + " · " + pctx.Site.Title
 	pctx.MetaDescription = detail.Summary

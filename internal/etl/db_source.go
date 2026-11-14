@@ -48,6 +48,7 @@ var legacyEntitySpecs = []legacyEntitySpec{
 	{rootKey: "comments", suffixes: []string{"comment", "comments"}},
 	{rootKey: "links", suffixes: []string{"link", "links"}},
 	{rootKey: "follows", suffixes: []string{"follow", "follows"}},
+	{rootKey: "plugins", suffixes: []string{"plugin", "plugins"}},
 }
 
 // canonicalSoloColumnByNorm maps normalized (lowercase, underscore-stripped) SQL column names
@@ -131,6 +132,11 @@ var canonicalSoloColumnByNorm = map[string]string{
 	"followdescription":          "followDescription",
 	"followicon":                 "followIcon",
 	"followorder":                "followOrder",
+	"status":                     "status",
+	"pluginstatus":               "status",
+	"author":                     "author",
+	"name":                       "name",
+	"version":                    "version",
 }
 
 var legacyTimestampCanonKeys = map[string]bool{

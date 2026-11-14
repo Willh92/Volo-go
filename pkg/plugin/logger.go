@@ -126,7 +126,8 @@ func (l *PluginLogger) Tail(pluginID string, limit int) ([]LogEntry, error) {
 	}
 	defer f.Close()
 
-	ring := make([]LogEntry, 0, limit)
+	const initRingCap = 64
+	ring := make([]LogEntry, 0, initRingCap)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 8192), 64*1024)
 	for scanner.Scan() {

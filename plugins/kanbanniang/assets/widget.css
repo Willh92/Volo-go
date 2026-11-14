@@ -1,183 +1,333 @@
-.volo-kbn-dock {
+/* Volo-go Live2D Kanbanniang Stylesheet
+ * Preserves the classic 280x250 arched frame, 7-action hover toolbar, and speech bubble,
+ * integrated with Volo-go theme tokens, dock offsets, reduced-motion, and print media.
+ */
+
+.volo-kbn-dock.solo-kanbanniang {
   position: fixed;
-  bottom: max(20px, calc(env(safe-area-inset-bottom) + 14px));
-  z-index: 42;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-  user-select: none;
-  pointer-events: none;
-  font-family: var(--volo-font-sans, system-ui, -apple-system, sans-serif);
-}
-
-.volo-kbn-left,
-.volo-kbn-dock[data-position="left"] {
-  left: 22px;
+  bottom: max(16px, calc(env(safe-area-inset-bottom, 0px) + 12px));
+  left: 16px;
   right: auto;
-  align-items: flex-start;
+  width: 280px;
+  height: 250px;
+  z-index: 42;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  box-sizing: content-box;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-color: rgba(255, 255, 255, 0.68);
+  background-color: color-mix(in srgb, var(--volo-surface, #ffffff) 68%, transparent);
+  border-color: rgba(0, 0, 0, 0.14);
+  border-color: var(--volo-line, rgba(0, 0, 0, 0.14));
+  border-style: dashed dashed none;
+  border-radius: 50% 50% 30% 30%;
+  border-width: 2px;
+  font-family: var(--volo-font-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  transition: opacity 0.18s ease, background-color 0.2s ease, border-color 0.2s ease;
 }
 
-#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .volo-kbn-left,
-#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .volo-kbn-dock[data-position="left"],
-html[data-podcast-open="1"] .volo-kbn-left,
-html[data-podcast-open="1"] .volo-kbn-dock[data-position="left"],
-body.has-podcast-mini .volo-kbn-left,
-body.has-podcast-mini .volo-kbn-dock[data-position="left"] {
-  bottom: calc(92px + env(safe-area-inset-bottom, 0px));
+.volo-kbn-dock.solo-kanbanniang:active {
+  cursor: grabbing;
 }
 
-/* Offset right-docked mascot cleanly above .studio-fab-dock (Mobile TOC + Back-to-Top) */
-.volo-kbn-right,
-.volo-kbn-dock[data-position="right"] {
-  right: 22px;
-  left: auto;
-  bottom: calc(max(20px, env(safe-area-inset-bottom, 0px)) + 108px);
-  align-items: flex-end;
-}
-
-html[data-podcast-open="1"] .volo-kbn-right,
-html[data-podcast-open="1"] .volo-kbn-dock[data-position="right"],
-body.has-podcast-mini .volo-kbn-right,
-body.has-podcast-mini .volo-kbn-dock[data-position="right"] {
-  bottom: calc(192px + env(safe-area-inset-bottom, 0px));
-}
-
-.volo-kbn-bubble {
-  pointer-events: auto;
-  display: inline-flex;
-  align-items: flex-start;
-  gap: 6px;
-  max-width: min(216px, calc(100vw - 36px));
-  padding: 7px 9px 7px 11px;
-  border-radius: 12px;
-  font-size: 12px;
-  line-height: 1.45;
-  background: var(--volo-surface, #ffffff);
-  color: var(--volo-text, #1d2420);
-  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.1));
-  box-shadow: var(--volo-shadow, 0 6px 20px rgba(0, 0, 0, 0.08));
-  transition: opacity 0.2s ease, transform 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
-}
-
-.volo-kbn-bubble[hidden] {
+.solo-kanbanniang[hidden],
+.solo-kanbanniang.is-closed {
   display: none !important;
 }
 
-.volo-kbn-bubble.is-collapsed {
+.solo-kanbanniang.is-closing {
   opacity: 0;
-  transform: translateY(4px) scale(0.96);
   pointer-events: none;
 }
 
-.volo-kbn-bubble__text {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.volo-kbn-close {
-  appearance: none;
-  width: 18px;
-  height: 18px;
-  padding: 0;
-  margin-top: -1px;
-  border-radius: 50%;
-  border: none;
-  background: transparent;
-  color: var(--volo-muted, #6b7280);
-  font-size: 13px;
-  line-height: 1;
-  display: inline-grid;
-  place-items: center;
-  flex-shrink: 0;
-  cursor: pointer;
-  transition: background-color 0.14s ease, color 0.14s ease;
-}
-
-.volo-kbn-close:hover {
-  background: var(--volo-raised, rgba(0, 0, 0, 0.06));
-  color: var(--volo-text, #1d2420);
-}
-
-.volo-kbn-btn {
+.solo-kanbanniang canvas {
+  display: block;
+  width: 280px;
+  height: 250px;
   pointer-events: auto;
-  width: 56px;
-  height: 56px;
-  padding: 0;
-  border-radius: 50%;
-  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.12));
-  background: var(--volo-surface, #ffffff);
-  color: var(--volo-accent, #2d6a4f);
-  cursor: pointer;
-  box-shadow: var(--volo-shadow, 0 8px 22px rgba(0, 0, 0, 0.1));
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1), border-color 0.18s ease, color 0.18s ease;
 }
 
-.volo-kbn-btn:hover {
-  transform: translateY(-3px) scale(1.04);
-  border-color: color-mix(in srgb, var(--volo-accent, #2d6a4f) 50%, var(--volo-line, transparent));
+/* Left / Right Dock Positioning (when not manually dragged) */
+.solo-kanbanniang.volo-kbn-left:not([data-dragged="1"]),
+.solo-kanbanniang[data-position="left"]:not([data-dragged="1"]) {
+  left: 16px;
+  right: auto;
 }
 
-.volo-kbn-btn:active {
-  transform: scale(0.95);
+.solo-kanbanniang.volo-kbn-right:not([data-dragged="1"]),
+.solo-kanbanniang[data-position="right"]:not([data-dragged="1"]) {
+  right: 16px;
+  left: auto;
+  bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + 104px);
 }
 
-.volo-kbn-btn:focus-visible {
-  outline: 2px solid var(--volo-accent, #2d6a4f);
-  outline-offset: 2px;
+/* Podcast Mini-Player & Mobile Book TOC FAB Avoidance */
+#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .solo-kanbanniang[data-position="left"]:not([data-dragged="1"]),
+html[data-podcast-open="1"] .solo-kanbanniang[data-position="left"]:not([data-dragged="1"]),
+body.has-podcast-mini .solo-kanbanniang[data-position="left"]:not([data-dragged="1"]) {
+  bottom: calc(92px + env(safe-area-inset-bottom, 0px));
 }
 
-@media (max-width: 1180px) {
-  .volo-kbn-btn {
-    width: 48px;
-    height: 48px;
-  }
-  .volo-kbn-btn svg {
-    width: 32px;
-    height: 32px;
-  }
+#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .solo-kanbanniang[data-position="right"]:not([data-dragged="1"]),
+html[data-podcast-open="1"] .solo-kanbanniang[data-position="right"]:not([data-dragged="1"]),
+body.has-podcast-mini .solo-kanbanniang[data-position="right"]:not([data-dragged="1"]) {
+  bottom: calc(192px + env(safe-area-inset-bottom, 0px));
 }
 
 @media (max-width: 900px) {
-  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-left,
-  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-dock[data-position="left"],
-  .volo-kbn-dock.is-book-fab-offset:not([data-position="right"]) {
+  body:has(.book-mobile-toc-fab:not([hidden])) .solo-kanbanniang[data-position="left"]:not([data-dragged="1"]),
+  .solo-kanbanniang.is-book-fab-offset:not([data-position="right"]):not([data-dragged="1"]) {
     bottom: calc(68px + env(safe-area-inset-bottom, 0px));
   }
 }
 
-@media (max-width: 760px) {
-  .volo-kbn-hide-mobile {
+/* Dark Theme Surface Adaptation (preserve sakura.webp petal visibility — never multiply to black) */
+html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang {
+  background-color: rgba(34, 40, 42, 0.72);
+  background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 72%, transparent);
+  border-color: rgba(255, 255, 255, 0.14);
+  border-color: var(--volo-line, rgba(255, 255, 255, 0.14));
+  background-blend-mode: normal;
+}
+
+html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
+  background-color: rgba(34, 40, 42, 0.52);
+  background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 52%, transparent);
+  background-blend-mode: normal;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) .volo-kbn-dock.solo-kanbanniang {
+    background-color: rgba(34, 40, 42, 0.72);
+    background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 72%, transparent);
+    border-color: rgba(255, 255, 255, 0.14);
+    border-color: var(--volo-line, rgba(255, 255, 255, 0.14));
+    background-blend-mode: normal;
+  }
+
+  html:not([data-theme="light"]) .volo-kbn-dock.solo-kanbanniang.has-bg {
+    background-color: rgba(34, 40, 42, 0.52);
+    background-color: color-mix(in srgb, var(--volo-raised, #242b2d) 52%, transparent);
+    background-blend-mode: normal;
+  }
+}
+
+/* Right-Side 7-Action Hover / Touch Toolbar */
+.solo-kanbanniang__tool {
+  position: absolute;
+  right: 6px;
+  top: 16px;
+  width: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  z-index: 2;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+}
+
+.solo-kanbanniang:hover .solo-kanbanniang__tool,
+.solo-kanbanniang:focus-within .solo-kanbanniang__tool,
+.solo-kanbanniang.is-tools-open .solo-kanbanniang__tool {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .solo-kanbanniang:hover:not(.is-tools-open):not(:focus-within) .solo-kanbanniang__tool {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .solo-kanbanniang.is-tools-open .solo-kanbanniang__tool,
+  .solo-kanbanniang:focus-within .solo-kanbanniang__tool {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.solo-kanbanniang__tool button {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 5px;
+  margin: 0;
+  border: 0;
+  border-radius: 7px;
+  background: var(--volo-surface, #ffffff);
+  color: var(--volo-muted, #52665a);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.14);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: color 0.16s ease, background-color 0.16s ease, transform 0.14s ease;
+}
+
+.solo-kanbanniang__tool button:hover,
+.solo-kanbanniang__tool button:focus-visible {
+  color: var(--volo-accent, #256751);
+  background: var(--volo-raised, #f0f5f1);
+  outline: 2px solid var(--volo-accent, #256751);
+  outline-offset: 1px;
+}
+
+.solo-kanbanniang__tool button:active {
+  transform: scale(0.94);
+}
+
+.solo-kanbanniang .solo-kanbanniang__tool svg {
+  fill: currentColor;
+  stroke: currentColor;
+  stroke-width: 0;
+  width: 18px;
+  height: 18px;
+  display: block;
+  margin: 0;
+  color: inherit;
+  pointer-events: none;
+}
+
+/* Speech Bubble (anchored above frame so model face stays unobstructed, with viewport clamping) */
+.solo-kanbanniang__tip {
+  opacity: 0;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  top: auto;
+  left: 0;
+  width: 260px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(1.55em * 4 + 16px);
+  margin: 0 10px;
+  padding: 8px 11px;
+  border-radius: 8px;
+  box-sizing: border-box;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  font-size: 13px;
+  line-height: 1.55;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+  background: var(--volo-surface, rgba(255, 255, 255, 0.95));
+  color: var(--volo-text, #26372f);
+  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.1));
+  box-shadow: var(--volo-shadow, 0 3px 14px rgba(0, 0, 0, 0.12));
+  pointer-events: none;
+  z-index: 3;
+  transition: opacity 0.2s ease;
+}
+
+.solo-kanbanniang__tip.is-flipped-below {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
+
+.solo-kanbanniang__tip.is-clamped-viewport {
+  bottom: auto;
+  top: var(--kbn-tip-top, 8px);
+}
+
+.solo-kanbanniang__tip.is-visible {
+  animation: kanbanniangshake 60s ease-in-out 5s infinite;
+}
+
+@keyframes kanbanniangshake {
+  2% { transform: translate(0.5px, -1.5px) rotate(-0.5deg); }
+  4% { transform: translate(0.5px, 1.5px) rotate(1.5deg); }
+  6% { transform: translate(1.5px, 1.5px) rotate(1.5deg); }
+  8% { transform: translate(2.5px, 1.5px) rotate(0.5deg); }
+  10% { transform: translate(0.5px, 2.5px) rotate(0.5deg); }
+  12% { transform: translate(1.5px, 1.5px) rotate(0.5deg); }
+  14% { transform: translate(0.5px, 0.5px) rotate(0.5deg); }
+  16% { transform: translate(-1.5px, -0.5px) rotate(1.5deg); }
+  18% { transform: translate(0.5px, 0.5px) rotate(1.5deg); }
+  20% { transform: translate(2.5px, 2.5px) rotate(1.5deg); }
+  22% { transform: translate(0.5px, -1.5px) rotate(1.5deg); }
+  24% { transform: translate(-1.5px, 1.5px) rotate(-0.5deg); }
+  26% { transform: translate(1.5px, 0.5px) rotate(1.5deg); }
+  28% { transform: translate(-0.5px, -0.5px) rotate(-0.5deg); }
+  30% { transform: translate(1.5px, -0.5px) rotate(-0.5deg); }
+  32% { transform: translate(2.5px, -1.5px) rotate(1.5deg); }
+  34% { transform: translate(2.5px, 2.5px) rotate(-0.5deg); }
+  36% { transform: translate(0.5px, -1.5px) rotate(0.5deg); }
+  38% { transform: translate(2.5px, -0.5px) rotate(-0.5deg); }
+  40% { transform: translate(-0.5px, 2.5px) rotate(0.5deg); }
+  42% { transform: translate(-1.5px, 2.5px) rotate(0.5deg); }
+  44% { transform: translate(-1.5px, 1.5px) rotate(0.5deg); }
+  46% { transform: translate(1.5px, -0.5px) rotate(-0.5deg); }
+  48% { transform: translate(2.5px, -0.5px) rotate(0.5deg); }
+  50% { transform: translate(-1.5px, 1.5px) rotate(0.5deg); }
+  52% { transform: translate(-0.5px, 1.5px) rotate(0.5deg); }
+  54% { transform: translate(-1.5px, 1.5px) rotate(0.5deg); }
+  56% { transform: translate(0.5px, 2.5px) rotate(1.5deg); }
+  58% { transform: translate(2.5px, 2.5px) rotate(0.5deg); }
+  60% { transform: translate(2.5px, -1.5px) rotate(1.5deg); }
+  62% { transform: translate(-1.5px, 0.5px) rotate(1.5deg); }
+  64% { transform: translate(-1.5px, 1.5px) rotate(1.5deg); }
+  66% { transform: translate(0.5px, 2.5px) rotate(1.5deg); }
+  68% { transform: translate(2.5px, -1.5px) rotate(1.5deg); }
+  70% { transform: translate(2.5px, 2.5px) rotate(0.5deg); }
+  72% { transform: translate(-0.5px, -1.5px) rotate(1.5deg); }
+  74% { transform: translate(-1.5px, 2.5px) rotate(1.5deg); }
+  76% { transform: translate(-1.5px, 2.5px) rotate(1.5deg); }
+  78% { transform: translate(-1.5px, 2.5px) rotate(0.5deg); }
+  80% { transform: translate(-1.5px, 0.5px) rotate(-0.5deg); }
+  82% { transform: translate(-1.5px, 0.5px) rotate(-0.5deg); }
+  84% { transform: translate(-0.5px, 0.5px) rotate(1.5deg); }
+  86% { transform: translate(2.5px, 1.5px) rotate(0.5deg); }
+  88% { transform: translate(-1.5px, 0.5px) rotate(1.5deg); }
+  90% { transform: translate(-1.5px, -0.5px) rotate(-0.5deg); }
+  92% { transform: translate(-1.5px, -1.5px) rotate(1.5deg); }
+  94% { transform: translate(0.5px, 0.5px) rotate(-0.5deg); }
+  96% { transform: translate(2.5px, -0.5px) rotate(-0.5deg); }
+  98% { transform: translate(-1.5px, -1.5px) rotate(-0.5deg); }
+  0%, 100% { transform: translate(0, 0) rotate(0); }
+}
+
+/* Auto-hide during Fullscreen Overlays / Lightboxes / Search Modals / Drawers / Composers */
+html:has(.lightbox-overlay.is-open) .solo-kanbanniang,
+html:has(#volo-lightbox.is-open) .solo-kanbanniang,
+html:has([data-search-modal]:not([hidden])) .solo-kanbanniang,
+html:has(#volo-search-modal:not([hidden])) .solo-kanbanniang,
+html:has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang,
+html:has(.studio-reader-drawer.is-open) .solo-kanbanniang,
+html:has(.volo-comment-composer.is-open) .solo-kanbanniang,
+html:has(dialog[open]) .solo-kanbanniang,
+body.modal-open .solo-kanbanniang {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+@media (max-width: 800px) {
+  .solo-kanbanniang.volo-kbn-hide-mobile {
     display: none !important;
   }
-  .volo-kbn-left,
-  .volo-kbn-dock[data-position="left"] {
-    left: 14px;
-    bottom: max(16px, calc(env(safe-area-inset-bottom) + 12px));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .solo-kanbanniang {
+    background-image: none !important;
   }
-  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-left,
-  body:has(.book-mobile-toc-fab:not([hidden])) .volo-kbn-dock[data-position="left"],
-  .volo-kbn-dock.is-book-fab-offset:not([data-position="right"]) {
-    bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+  .solo-kanbanniang,
+  .solo-kanbanniang__tip,
+  .solo-kanbanniang__tip.is-visible,
+  .solo-kanbanniang__tool,
+  .solo-kanbanniang__tool button {
+    animation: none !important;
+    transition: none !important;
   }
-  .volo-kbn-right,
-  .volo-kbn-dock[data-position="right"] {
-    right: 14px;
-    bottom: calc(max(16px, env(safe-area-inset-bottom)) + 102px);
-  }
-  html[data-podcast-open="1"] .volo-kbn-left,
-  html[data-podcast-open="1"] .volo-kbn-dock[data-position="left"],
-  body.has-podcast-mini .volo-kbn-left,
-  body.has-podcast-mini .volo-kbn-dock[data-position="left"] {
-    bottom: calc(92px + env(safe-area-inset-bottom, 0px));
-  }
-  html[data-podcast-open="1"] .volo-kbn-right,
-  html[data-podcast-open="1"] .volo-kbn-dock[data-position="right"],
-  body.has-podcast-mini .volo-kbn-right,
-  body.has-podcast-mini .volo-kbn-dock[data-position="right"] {
-    bottom: calc(192px + env(safe-area-inset-bottom, 0px));
+}
+
+@media print {
+  .solo-kanbanniang {
+    display: none !important;
   }
 }

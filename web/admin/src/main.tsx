@@ -1,6 +1,5 @@
-import { render } from "preact";
+import { createPortal, render } from "preact";
 import type { CSSProperties } from "preact";
-import { createPortal } from "preact/compat";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import "./styles/console.css";
 import {
@@ -35,7 +34,17 @@ import {
   t,
 } from "./i18n";
 import { BrandLogo } from "./components/BrandLogo";
-import { AnimatedModal, CloseIcon, GlobalConfirmModal, LocalePopover, SvgIcon, computePortalMenuStyle, useDebouncedValue } from "./components/UIControls";
+import {
+  acquireModalScrollLock,
+  AnimatedModal,
+  CloseIcon,
+  computePortalMenuStyle,
+  GlobalConfirmModal,
+  LocalePopover,
+  releaseModalScrollLock,
+  SvgIcon,
+  useDebouncedValue,
+} from "./components/UIControls";
 import { LoginView, formatOidcError } from "./views/LoginView";
 import type { OverviewSection } from "./views/OverviewWorkspace";
 import type { ContentSubTab } from "./views/ContentWorkspace";
@@ -74,7 +83,7 @@ const ACCENT_OPTIONS: Array<{ id: string; swatch: string }> = [
 
 const MODE_OPTIONS = ["auto", "system", "light", "dark"] as const;
 
-const SECTION_LABEL_KEYS: Record<NavSection, string> = {
+const SECTION_LABEL_KEYS: Record<NavSection, string | number> = {
   dashboard: "nav.home",
   editor: "nav.post_new",
   articles: "nav.post_list",
@@ -110,11 +119,11 @@ const SECTION_LABEL_KEYS: Record<NavSection, string> = {
 interface NavEntry {
   kind: "item" | "group";
   id: string;
-  labelKey: string;
+  labelKey: string | number;
   icon: string;
   adminOnly?: boolean;
   section?: NavSection;
-  children?: Array<{ section: NavSection; labelKey: string; adminOnly?: boolean }>;
+  children?: Array<{ section: NavSection; labelKey: string | number; adminOnly?: boolean }>;
 }
 
 const SIDEBAR_ENTRIES: NavEntry[] = [
@@ -544,6 +553,33 @@ function CommandPalette({
   );
 }
 
+const HORIZONTAL_STRIPS_SELECTOR = ".volo-subtabs, .volo-filter-pills, .volo-seg, .volo-ed-modes, .volo-ed-mobile-tabs";
+const ACTIVE_CHIP_SELECTOR = ":scope > .active, :scope > .is-active, :scope > [aria-selected='true']";
+
+function revealActiveChipInStrip(strip: HTMLElement, activeEl: HTMLElement, smooth: boolean): boolean {
+  if (strip.clientWidth <= 0 || activeEl.offsetWidth <= 0) return false;
+  if (strip.scrollWidth <= strip.clientWidth + 1) return true;
+  const cRect = strip.getBoundingClientRect();
+  const aRect = activeEl.getBoundingClientRect();
+  const peek = Math.min(28, Math.max(14, Math.round(cRect.width * 0.08)));
+  const padLeft = activeEl.previousElementSibling ? peek : 6;
+  const padRight = activeEl.nextElementSibling ? peek : 6;
+  if (aRect.left >= cRect.left + padLeft - 0.5 && aRect.right <= cRect.right - padRight + 0.5) {
+    return true;
+  }
+  const delta =
+    aRect.width >= cRect.width - 12
+      ? aRect.left - (cRect.left + 6)
+      : aRect.left + aRect.width / 2 - (cRect.left + cRect.width / 2);
+  const useSmooth = smooth && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  try {
+    strip.scrollBy({ left: delta, behavior: useSmooth ? "smooth" : ("instant" as ScrollBehavior) });
+  } catch {
+    strip.scrollLeft += delta;
+  }
+  return true;
+}
+
 function findParentGroup(sec: NavSection): string | null {
   for (const entry of SIDEBAR_ENTRIES) {
     if (entry.kind === "group" && entry.children?.some((c) => c.section === sec)) {
@@ -593,11 +629,15 @@ function App() {
   const [appearanceClosing, setAppearanceClosing] = useState<boolean>(false);
   const [appearanceStyle, setAppearanceStyle] = useState<CSSProperties>({});
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const mobileToggleRef = useRef<HTMLButtonElement | null>(null);
+  const wasMobileMenuOpenRef = useRef<boolean>(false);
   const [cmdkOpen, setCmdkOpen] = useState<boolean>(false);
   const [avatarErr, setAvatarErr] = useState<boolean>(false);
   const appCloseTimer = useRef<number | undefined>(undefined);
   const appBtnRef = useRef<HTMLButtonElement | null>(null);
   const appMenuRef = useRef<HTMLDivElement | null>(null);
+  const seenStripActiveRef = useRef<WeakMap<HTMLElement, HTMLElement>>(new WeakMap());
+  const scheduleStripRevealRef = useRef<((forceInstant: boolean) => void) | null>(null);
 
   const curLocale = localeSig.value;
   const locales = availableLocalesSig.value;
@@ -695,6 +735,104 @@ function App() {
       refreshMe().finally(() => setReady(true));
     }
   }, []);
+
+  useEffect(() => {
+    let rafId = 0;
+    let pendingInstant = false;
+    let retriesLeft = 0;
+
+    const syncStrips = (forceInstant: boolean): boolean => {
+      let allReady = true;
+      const seen = seenStripActiveRef.current;
+      document.querySelectorAll<HTMLElement>(HORIZONTAL_STRIPS_SELECTOR).forEach((strip) => {
+        const activeEl = strip.querySelector<HTMLElement>(ACTIVE_CHIP_SELECTOR);
+        if (!activeEl) return;
+        const prevActive = seen.get(strip);
+        if (prevActive === activeEl && !forceInstant) return;
+        const smooth = Boolean(prevActive && prevActive !== activeEl && !forceInstant);
+        const settled = revealActiveChipInStrip(strip, activeEl, smooth);
+        if (settled) {
+          seen.set(strip, activeEl);
+        } else {
+          allReady = false;
+        }
+      });
+      return allReady;
+    };
+
+    const schedule = (forceInstant: boolean, retryBudget = 2) => {
+      if (forceInstant) pendingInstant = true;
+      if (retryBudget > retriesLeft) retriesLeft = retryBudget;
+      if (rafId) return;
+      const tick = () => {
+        rafId = 0;
+        const inst = pendingInstant;
+        pendingInstant = false;
+        const settled = syncStrips(inst);
+        if (!settled && retriesLeft > 0) {
+          retriesLeft--;
+          rafId = window.requestAnimationFrame(tick);
+        } else {
+          retriesLeft = 0;
+        }
+      };
+      rafId = window.requestAnimationFrame(tick);
+    };
+
+    scheduleStripRevealRef.current = (forceInstant: boolean) => {
+      window.requestAnimationFrame(() => schedule(forceInstant));
+    };
+
+    const mo = new MutationObserver((mutations) => {
+      let hit = false;
+      for (const m of mutations) {
+        if (m.type === "attributes") {
+          const target = m.target;
+          if (target instanceof HTMLElement && target.parentElement?.matches(HORIZONTAL_STRIPS_SELECTOR)) {
+            hit = true;
+            break;
+          }
+        } else if (m.type === "childList" && m.addedNodes.length > 0) {
+          for (let i = 0; i < m.addedNodes.length; i++) {
+            const node = m.addedNodes[i];
+            if (!(node instanceof HTMLElement)) continue;
+            if (node.closest(".cm-editor, .volo-preview-pane, .volo-wysiwyg-surface")) continue;
+            if (node.matches(HORIZONTAL_STRIPS_SELECTOR) || node.querySelector(HORIZONTAL_STRIPS_SELECTOR)) {
+              hit = true;
+              break;
+            }
+          }
+          if (hit) break;
+        }
+      }
+      if (hit) schedule(false);
+    });
+
+    mo.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "aria-selected"],
+    });
+
+    const onResize = () => schedule(true, 1);
+    window.addEventListener("resize", onResize, { passive: true });
+    schedule(true);
+
+    return () => {
+      mo.disconnect();
+      window.removeEventListener("resize", onResize);
+      if (rafId) window.cancelAnimationFrame(rafId);
+      scheduleStripRevealRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    scheduleStripRevealRef.current?.(true);
+    const onReselect = () => scheduleStripRevealRef.current?.(true);
+    window.addEventListener("volo:nav-reselect", onReselect);
+    return () => window.removeEventListener("volo:nav-reselect", onReselect);
+  }, [ready, section, curLocale]);
 
   useEffect(() => {
     let invalidTickPending = false;
@@ -834,6 +972,29 @@ function App() {
       vv?.removeEventListener("scroll", updateAppearancePos);
     };
   }, [appearanceOpen, appearanceClosing]);
+
+  useEffect(() => {
+    if (!mobileMenuOpen) {
+      if (wasMobileMenuOpenRef.current) {
+        wasMobileMenuOpenRef.current = false;
+        mobileToggleRef.current?.focus();
+      }
+      return;
+    }
+    wasMobileMenuOpenRef.current = true;
+    acquireModalScrollLock();
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setMobileMenuOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("keydown", onEsc);
+      releaseModalScrollLock();
+    };
+  }, [mobileMenuOpen]);
 
   useEffect(() => {
     document.documentElement.lang = curLocale;
@@ -976,7 +1137,7 @@ function App() {
         <div class="volo-rail-footer">
           <span>
             <span class="volo-rail-dot" />
-            VOLO v1.0.1
+            VOLO v1.0.2
           </span>
           <span>{t(`role.${user.role}`)}</span>
         </div>
@@ -986,8 +1147,10 @@ function App() {
         <header class="volo-topbar">
           <div class="volo-topbar-left">
             <button
+              ref={mobileToggleRef}
               type="button"
               class="volo-icon-btn volo-mobile-toggle"
+              aria-expanded={mobileMenuOpen}
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
               aria-label={t("shell.console_title")}
             >

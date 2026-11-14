@@ -2,7 +2,7 @@
 {{define "skin_name"}}volo-journal{{end}}
 {{define "head_extra"}}  <link rel="stylesheet" href="{{assetURL .ThemeID "volo-journal.css"}}">
 {{end}}
-{{define "brand_extra"}}{{coalesce (themeCfg .ThemeConfig "journal_motto" "") .Site.Subtitle}}{{end}}
+{{define "brand_extra"}}{{if not (and .IsHome (le .Page 1))}}{{coalesce (themeCfg .ThemeConfig "journal_motto" "") .Site.Subtitle}}{{end}}{{end}}
 {{define "header_widgets"}}{{if .HeaderWidgets}}
     <div class="studio-container studio-header-widgets">
       {{range .HeaderWidgets}}{{safeHTML .HTML}}{{end}}

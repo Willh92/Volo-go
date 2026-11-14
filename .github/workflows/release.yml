@@ -36,18 +36,28 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/admin/package-lock.json
 
-      - name: Build Admin SPA
+      - name: Build Admin SPA & Precompress Embedded Assets
         working-directory: web/admin
         run: |
           npm ci --no-audit --no-fund
           rm -rf ../../internal/adminui/dist && mkdir -p ../../internal/adminui/dist
           npm run build
 
+      - name: Pack Built Embedded Assets
+        run: |
+          tar -cf embedded-assets.tar \
+            internal/adminui/dist \
+            internal/i18n/builtin_gz \
+            internal/theme/builtin/volo-studio/assets_gz \
+            internal/theme/builtin/volo-studio/templates_gz \
+            internal/theme/builtin/volo-studio/theme.json.gz \
+            internal/theme/builtin/volo-studio/preview.svg.gz
+
       - name: Upload Built Admin Dist
         uses: actions/upload-artifact@v7
         with:
           name: admin-dist
-          path: internal/adminui/dist
+          path: embedded-assets.tar
 
   verify:
     name: Verify Release Metadata, Vet & Tests
@@ -108,14 +118,16 @@ jobs:
           echo "is_default_or_tag=${IS_DEF_OR_TAG}" >> "${GITHUB_OUTPUT}"
           echo "Resolved release: version=${VER}, is_prerelease=${IS_PRE}, is_default_or_tag=${IS_DEF_OR_TAG}"
 
-      - name: Clean Stale Placeholder Dist Before Artifact Download
-        run: rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
-
       - name: Download Built Admin Dist
         uses: actions/download-artifact@v8
         with:
           name: admin-dist
-          path: internal/adminui/dist
+          path: .
+
+      - name: Extract Built Embedded Assets
+        run: |
+          rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
+          tar -xf embedded-assets.tar && rm -f embedded-assets.tar
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -170,14 +182,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Clean Stale Placeholder Dist Before Artifact Download
-        run: rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
-
       - name: Download Built Admin Dist
         uses: actions/download-artifact@v8
         with:
           name: admin-dist
-          path: internal/adminui/dist
+          path: .
+
+      - name: Extract Built Embedded Assets
+        run: |
+          rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
+          tar -xf embedded-assets.tar && rm -f embedded-assets.tar
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -200,6 +214,9 @@ jobs:
           mkdir -p "dist/${STAGE}/scripts"
           go build -buildvcs=false -trimpath \
             -gcflags="all=-l" \
+            -gcflags="github.com/Willh92/Volo-go/internal/render/...=-l=4" \
+            -gcflags="github.com/Willh92/Volo-go/internal/security/...=-l=4" \
+            -gcflags="github.com/Willh92/Volo-go/pkg/plugin/...=-l=4" \
             -ldflags="-s -w -funcalign=8 -buildid= -X main.Version=${VERSION}" \
             -o "dist/${STAGE}/volo${{ matrix.ext }}" \
             ./cmd/volo
@@ -225,6 +242,9 @@ jobs:
           cp -r docs "dist/${STAGE}/docs"
           cp -r locales "dist/${STAGE}/locales"
           cp -r plugins "dist/${STAGE}/plugins"
+          # Keep main OS/arch core bundles ~8 MB slim; standalone-release plugins (kanbanniang)
+          # are version-deduplicated into their own `plugin-kanbanniang-v<version>` GitHub Release.
+          rm -rf "dist/${STAGE}/plugins/kanbanniang"
           cp -r themes "dist/${STAGE}/themes"
 
           if [ "${GOOS}" = "windows" ]; then
@@ -281,9 +301,87 @@ jobs:
           name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
 
+  ensure-kanbanniang-release:
+    name: Ensure Version-Deduplicated Kanbanniang Plugin Release
+    needs: [verify]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: plugin-kanbanniang-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Sparse checkout plugin metadata & packager
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/scripts/package-plugin.py
+            plugins/catalog.json
+            plugins/kanbanniang/manifest.json
+            plugins/kanbanniang/main.js
+          sparse-checkout-cone-mode: false
+
+      - name: Check If Current Kanbanniang Version Release Already Exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          META_OUT="$(python3 .github/scripts/package-plugin.py --plugin kanbanniang --print-meta)"
+          echo "${META_OUT}"
+          echo "${META_OUT}" >> "${GITHUB_OUTPUT}"
+
+          TAG="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_tag=//p')"
+          ASSET="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_asset=//p')"
+
+          if gh release view "${TAG}" --repo "${REPO}" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "${ASSET}"; then
+            echo "should_package=false" >> "${GITHUB_OUTPUT}"
+            echo "Skip packaging: ${TAG} (${ASSET}) is already published; avoiding duplicate build & upload."
+          else
+            echo "should_package=true" >> "${GITHUB_OUTPUT}"
+            echo "Release ${TAG} not found yet; packaging standalone Kanbanniang ZIP..."
+          fi
+
+      - name: Checkout full repository (Only When Version Is Unpublished)
+        if: steps.check.outputs.should_package == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build Deterministic Kanbanniang ZIP Archive (Only When Version Is Unpublished)
+        if: steps.check.outputs.should_package == 'true'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct -- plugins/kanbanniang 2>/dev/null || true)"
+          case "${SOURCE_DATE_EPOCH}" in
+            ''|*[!0-9]*) SOURCE_DATE_EPOCH="$(date -u -d 2026-01-01T00:00:00Z +%s)" ;;
+          esac
+          export SOURCE_DATE_EPOCH
+          python3 .github/scripts/package-plugin.py \
+            --plugin kanbanniang \
+            --output-dir plugin-dist \
+            --repo "${REPO}"
+
+      - name: Publish Standalone Kanbanniang Plugin Release (make_latest=false)
+        if: steps.check.outputs.should_package == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          name: "Plugin: Kanbanniang v${{ steps.check.outputs.version }}"
+          tag_name: ${{ steps.check.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: false
+          make_latest: "false"
+          body_path: plugin-dist/plugin-release-notes.md
+          generate_release_notes: false
+          files: |
+            plugin-dist/${{ steps.check.outputs.release_asset }}
+            plugin-dist/${{ steps.check.outputs.release_asset_alias }}
+            plugin-dist/SHA256SUMS.txt
+
   publish-release:
     name: Publish GitHub Release & Checksums
-    needs: [verify, cross-binaries]
+    needs: [verify, cross-binaries, ensure-kanbanniang-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write

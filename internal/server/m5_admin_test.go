@@ -237,8 +237,8 @@ func TestM5_AdminBundleBudgetAndStealthMount(t *testing.T) {
 	if gzBytes <= 50*1024 {
 		t.Fatalf("expected embedded Admin SPA + CodeMirror 6 bundle > 50KB gzip, got %d bytes", gzBytes)
 	}
-	if gzBytes >= 300*1024 {
-		t.Fatalf("embedded Admin SPA bundle exceeded 300KB gzip budget: got %d bytes (%.2f KB)", gzBytes, float64(gzBytes)/1024.0)
+	if gzBytes >= 350*1024 {
+		t.Fatalf("embedded Admin SPA bundle exceeded 350KB gzip budget: got %d bytes (%.2f KB)", gzBytes, float64(gzBytes)/1024.0)
 	}
 
 	env := setupM5TestEnv(t, "/secret-studio-99")

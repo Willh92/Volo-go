@@ -55,19 +55,13 @@
 </div>
 
 {{if $showPageTOC}}
-  {{$minLvl := 6}}{{range .StandalonePage.TOC}}{{if lt .Level $minLvl}}{{$minLvl = .Level}}{{end}}{{end}}
   <div id="volo-toc-drawer" class="volo-toc-drawer" hidden>
     <div class="volo-toc-drawer__panel" role="dialog" aria-modal="true" aria-label="{{t .Locale "article.toc_title"}}">
       <div class="volo-toc-drawer__head">
         <strong>{{t .Locale "article.toc_title"}}</strong>
         <button type="button" class="studio-icon-btn studio-icon-btn--square" data-toc-close aria-label="{{t .Locale "studio.close"}}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
       </div>
-      <nav class="volo-toc-nav volo-toc__list" aria-label="{{t .Locale "article.toc_title"}}">
-        {{range .StandalonePage.TOC}}
-          {{$depth := sub .Level $minLvl}}{{if lt $depth 0}}{{$depth = 0}}{{end}}{{if gt $depth 4}}{{$depth = 4}}{{end}}
-          <a class="volo-toc-link{{if gt $depth 0}} is-sub{{end}}" data-toc-id="{{.ID}}" href="#{{.ID}}" title="{{.Text}}" style="padding-left:{{add 12 (mul $depth 12)}}px"><span class="volo-toc-label">{{.Text}}</span></a>
-        {{end}}
-      </nav>
+      <div class="studio-toc-drawer__body" data-toc-clone-target></div>
     </div>
   </div>
 {{end}}

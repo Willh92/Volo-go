@@ -2,6 +2,8 @@ package plugin
 
 import (
 	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -38,9 +40,9 @@ import (
 )
 
 const (
-	MaxZipArchiveBytes = 32 << 20 // 32 MiB max ZIP archive or total extracted size
-	MaxZipSingleBytes  = 8 << 20  // 8 MiB max single extracted file
-	MaxZipEntries      = 256
+	MaxZipArchiveBytes = 256 << 20 // 256 MiB max ZIP archive or total extracted size
+	MaxZipSingleBytes  = 8 << 20   // 8 MiB max single extracted file
+	MaxZipEntries      = 2048
 
 	DefaultHookTimeout  = 500 * time.Millisecond
 	DefaultRouteTimeout = 3 * time.Second
@@ -435,9 +437,10 @@ type Manager struct {
 	siteInfoFn   atomic.Pointer[func() map[string]any]
 	reqInspector atomic.Pointer[func(*http.Request) (bool, string)]
 
-	fedWG   sync.WaitGroup
-	plugins map[string]*managedPlugin
-	closed  bool
+	fedWG          sync.WaitGroup
+	assetGzipCache pluginAssetGzipCache
+	plugins        map[string]*managedPlugin
+	closed         bool
 }
 
 // NewManager constructs a Plugin Manager.
@@ -625,6 +628,7 @@ func (m *Manager) RegisterBuiltin(ctx context.Context, bp BuiltinPlugin) error {
 	m.mu.Lock()
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
+	m.assetGzipCache.deletePlugin(manifest.ID)
 
 	if mp.enabled && mp.circuitState == CircuitClosed {
 		return m.activateRuntime(ctx, mp)
@@ -845,6 +849,7 @@ func (m *Manager) ReloadPlugin(ctx context.Context, pluginID string, locale stri
 	m.mu.Lock()
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
+	m.assetGzipCache.deletePlugin(manifest.ID)
 
 	mp.mu.Lock()
 	shouldActivate := mp.enabled && mp.circuitState == CircuitClosed
@@ -1164,6 +1169,7 @@ func (m *Manager) deactivateRuntime(ctx context.Context, mp *managedPlugin) {
 }
 
 func (m *Manager) deactivateRuntimeOpts(ctx context.Context, mp *managedPlugin, waitCron bool) {
+	m.assetGzipCache.deletePlugin(mp.manifest.ID)
 	// Never pass wait=true from inside a cron worker goroutine of the same plugin!
 	if m.cron != nil {
 		m.cron.UnregisterPlugin(mp.manifest.ID, waitCron)
@@ -1592,6 +1598,12 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 		return fmt.Errorf("plugin %q: plugin directory escapes plugins root", idClean)
 	}
 
+	pluginRoot, err := os.OpenRoot(realPluginDir)
+	if err != nil {
+		return fmt.Errorf("plugin %q: open confined root: %w", idClean, err)
+	}
+	defer pluginRoot.Close()
+
 	secretFieldKeys := make(map[string]bool)
 	knownRawSecrets := make(map[string]bool)
 	if mp, ok := m.getPlugin(idClean); ok {
@@ -1612,16 +1624,19 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 		mp.mu.Unlock()
 	}
 
-	manifestPath := filepath.Join(realPluginDir, "manifest.json")
-	if mfInfo, mErr := os.Lstat(manifestPath); mErr == nil {
+	if mfInfo, mErr := pluginRoot.Lstat("manifest.json"); mErr == nil {
 		if mfInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("plugin %q: symlink manifest.json rejected", idClean)
 		}
-		if mfBytes, rErr := os.ReadFile(manifestPath); rErr == nil {
-			if parsed, pErr := ParseManifest(mfBytes); pErr == nil {
-				for _, f := range parsed.ConfigSchema {
-					if f.IsSecret() {
-						secretFieldKeys[f.Key] = true
+		if mfFile, oErr := pluginRoot.Open("manifest.json"); oErr == nil {
+			mfBytes, rErr := io.ReadAll(io.LimitReader(mfFile, MaxZipSingleBytes+1))
+			_ = mfFile.Close()
+			if rErr == nil && int64(len(mfBytes)) <= MaxZipSingleBytes {
+				if parsed, pErr := ParseManifest(mfBytes); pErr == nil {
+					for _, f := range parsed.ConfigSchema {
+						if f.IsSecret() {
+							secretFieldKeys[f.Key] = true
+						}
 					}
 				}
 			}
@@ -1630,7 +1645,7 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 
 	type exportEntry struct {
 		relSlash string
-		absPath  string
+		relOS    string
 		modTime  time.Time
 	}
 	var entries []exportEntry
@@ -1640,13 +1655,6 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 		if walkInErr != nil {
 			return walkInErr
 		}
-		linfo, sErr := os.Lstat(curPath)
-		if sErr != nil {
-			return sErr
-		}
-		if linfo.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("plugin %q: symlink entry %q rejected during export", idClean, curPath)
-		}
 		if curPath == realPluginDir {
 			return nil
 		}
@@ -1655,6 +1663,13 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 			return rErr
 		}
 		relSlash := filepath.ToSlash(rel)
+		linfo, sErr := pluginRoot.Lstat(rel)
+		if sErr != nil {
+			return fmt.Errorf("plugin %q: stat %q: %w", idClean, relSlash, sErr)
+		}
+		if linfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("plugin %q: symlink entry %q rejected during export", idClean, curPath)
+		}
 		baseLower := strings.ToLower(filepath.Base(curPath))
 
 		if shouldSkipPluginExportFile(baseLower, linfo.IsDir()) {
@@ -1678,7 +1693,7 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 		}
 		entries = append(entries, exportEntry{
 			relSlash: relSlash,
-			absPath:  curPath,
+			relOS:    rel,
 			modTime:  linfo.ModTime().UTC(),
 		})
 		if len(entries) > MaxZipEntries {
@@ -1696,16 +1711,10 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 
 	zw := zip.NewWriter(w)
 	for _, ent := range entries {
-		rawBytes, rErr := os.ReadFile(ent.absPath)
-		if rErr != nil {
-			_ = zw.Close()
-			return rErr
-		}
-		payloadBytes := sanitizeExportedPluginFileBytes(ent.relSlash, rawBytes, secretFieldKeys, knownRawSecrets)
-
+		lowerRel := strings.ToLower(ent.relSlash)
 		hdr := &zip.FileHeader{
 			Name:     ent.relSlash,
-			Method:   zip.Deflate,
+			Method:   zipMethodForPluginAsset(lowerRel),
 			Modified: ent.modTime,
 		}
 		hdr.SetMode(0o644)
@@ -1714,12 +1723,59 @@ func (m *Manager) ExportZip(pluginID string, w io.Writer) error {
 			_ = zw.Close()
 			return cErr
 		}
-		if _, wErr := fw.Write(payloadBytes); wErr != nil {
+		srcFile, oErr := pluginRoot.Open(ent.relOS)
+		if oErr != nil {
 			_ = zw.Close()
-			return wErr
+			return oErr
+		}
+		st, sErr := srcFile.Stat()
+		if sErr != nil || !st.Mode().IsRegular() {
+			_ = srcFile.Close()
+			_ = zw.Close()
+			if sErr != nil {
+				return sErr
+			}
+			return fmt.Errorf("plugin %q: irregular file %q rejected during export", idClean, ent.relSlash)
+		}
+		if strings.HasSuffix(lowerRel, ".json") {
+			rawBytes, rErr := io.ReadAll(io.LimitReader(srcFile, MaxZipSingleBytes+1))
+			_ = srcFile.Close()
+			if rErr != nil {
+				_ = zw.Close()
+				return rErr
+			}
+			if int64(len(rawBytes)) > MaxZipSingleBytes {
+				_ = zw.Close()
+				return fmt.Errorf("plugin %q: file %q exceeds %d MiB export limit", idClean, ent.relSlash, MaxZipSingleBytes>>20)
+			}
+			payloadBytes := sanitizeExportedPluginFileBytes(ent.relSlash, rawBytes, secretFieldKeys, knownRawSecrets)
+			if _, wErr := fw.Write(payloadBytes); wErr != nil {
+				_ = zw.Close()
+				return wErr
+			}
+			continue
+		}
+		written, cpErr := io.Copy(fw, io.LimitReader(srcFile, MaxZipSingleBytes+1))
+		_ = srcFile.Close()
+		if cpErr != nil {
+			_ = zw.Close()
+			return cpErr
+		}
+		if written > MaxZipSingleBytes {
+			_ = zw.Close()
+			return fmt.Errorf("plugin %q: file %q exceeds %d MiB export limit", idClean, ent.relSlash, MaxZipSingleBytes>>20)
 		}
 	}
 	return zw.Close()
+}
+
+func zipMethodForPluginAsset(lowerRel string) uint16 {
+	switch filepath.Ext(lowerRel) {
+	case ".png", ".webp", ".gif", ".jpg", ".jpeg", ".avif", ".ogg", ".mp3", ".woff2", ".gz", ".zip":
+		return zip.Store
+	default:
+		return zip.Deflate
+	}
 }
 
 func shouldSkipPluginExportFile(baseLower string, isDir bool) bool {
@@ -1748,6 +1804,9 @@ func sanitizeExportedPluginFileBytes(
 ) []byte {
 	lowerRel := strings.ToLower(relSlash)
 	if !strings.HasSuffix(lowerRel, ".json") {
+		return raw
+	}
+	if strings.HasPrefix(lowerRel, "assets/") || strings.HasPrefix(lowerRel, "locales/") {
 		return raw
 	}
 	if lowerRel == "manifest.json" {
@@ -1781,6 +1840,10 @@ func sanitizeExportedPluginFileBytes(
 		return raw
 	}
 
+	if len(secretFieldKeys) == 0 && len(knownRawSecrets) == 0 && !jsonBytesMayContainSecretKey(raw) {
+		return raw
+	}
+
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return raw
@@ -1795,6 +1858,35 @@ func sanitizeExportedPluginFileBytes(
 	return raw
 }
 
+func jsonBytesMayContainSecretKey(raw []byte) bool {
+	n := len(raw)
+	for i := 0; i < n; i++ {
+		c := raw[i]
+		if c == '\\' && i+1 < n && (raw[i+1] == 'u' || raw[i+1] == 'U') {
+			return true
+		}
+		switch c | 0x20 {
+		case 's':
+			if i+6 <= n && (raw[i+1]|0x20) == 'e' && (raw[i+2]|0x20) == 'c' && (raw[i+3]|0x20) == 'r' && (raw[i+4]|0x20) == 'e' && (raw[i+5]|0x20) == 't' {
+				return true
+			}
+		case 't':
+			if i+5 <= n && (raw[i+1]|0x20) == 'o' && (raw[i+2]|0x20) == 'k' && (raw[i+3]|0x20) == 'e' && (raw[i+4]|0x20) == 'n' {
+				return true
+			}
+		case 'k':
+			if i+3 <= n && (raw[i+1]|0x20) == 'e' && (raw[i+2]|0x20) == 'y' {
+				return true
+			}
+		case 'p':
+			if i+4 <= n && (raw[i+1]|0x20) == 'a' && (raw[i+2]|0x20) == 's' && (raw[i+3]|0x20) == 's' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func stripSecretsFromJSONNode(
 	node any,
 	secretFieldKeys map[string]bool,
@@ -1802,41 +1894,61 @@ func stripSecretsFromJSONNode(
 ) (any, bool) {
 	switch v := node.(type) {
 	case map[string]any:
-		changed := false
-		out := make(map[string]any, len(v))
+		var out map[string]any
+		cloneMap := func() {
+			if out == nil {
+				out = make(map[string]any, len(v))
+				for pk, pv := range v {
+					out[pk] = pv
+				}
+			}
+		}
 		for k, val := range v {
 			if secretFieldKeys[k] || isLikelySecretStateKey(k) {
 				if s, isStr := val.(string); !isStr || (s != "" && s != SecretMaskSentinel) {
-					changed = true
+					cloneMap()
+					delete(out, k)
 					continue
 				}
 			}
 			if s, isStr := val.(string); isStr && s != "" && knownRawSecrets[s] {
-				changed = true
+				cloneMap()
+				delete(out, k)
 				continue
 			}
 			nextVal, subChanged := stripSecretsFromJSONNode(val, secretFieldKeys, knownRawSecrets)
 			if subChanged {
-				changed = true
+				cloneMap()
+				out[k] = nextVal
 			}
-			out[k] = nextVal
 		}
-		return out, changed
+		if out == nil {
+			return v, false
+		}
+		return out, true
 	case []any:
-		changed := false
-		out := make([]any, 0, len(v))
-		for _, elem := range v {
+		var out []any
+		for i, elem := range v {
 			if s, isStr := elem.(string); isStr && s != "" && knownRawSecrets[s] {
-				changed = true
+				if out == nil {
+					out = make([]any, 0, len(v))
+					out = append(out, v[:i]...)
+				}
 				continue
 			}
 			nextElem, subChanged := stripSecretsFromJSONNode(elem, secretFieldKeys, knownRawSecrets)
-			if subChanged {
-				changed = true
+			if subChanged && out == nil {
+				out = make([]any, 0, len(v))
+				out = append(out, v[:i]...)
 			}
-			out = append(out, nextElem)
+			if out != nil {
+				out = append(out, nextElem)
+			}
 		}
-		return out, changed
+		if out == nil {
+			return v, false
+		}
+		return out, true
 	default:
 		return node, false
 	}
@@ -2016,6 +2128,7 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 	if hadOldDir {
 		_ = os.RemoveAll(backupDir)
 	}
+	m.assetGzipCache.deletePlugin(manifest.ID)
 
 	mp, err := m.syncRecordWithDB(ctx, manifest, "external", targetDir, nil)
 	if err != nil {
@@ -2024,6 +2137,7 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 	m.mu.Lock()
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
+	m.assetGzipCache.deletePlugin(manifest.ID)
 
 	// Optional bounded onInstall({ previous_version, version, is_upgrade }) lifecycle hook on fresh install or version upgrade.
 	if !isUpgrade || prevVersion != manifest.Version {
@@ -2113,6 +2227,7 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 	m.mu.Lock()
 	delete(m.plugins, pluginID)
 	m.mu.Unlock()
+	m.assetGzipCache.deletePlugin(pluginID)
 
 	if mp.pluginDir != "" && m.pluginsDir != "" {
 		realPluginsRoot, err1 := filepath.EvalSymlinks(m.pluginsDir)
@@ -3250,24 +3365,34 @@ func (m *Manager) servePluginAPI(w http.ResponseWriter, r *http.Request, mp *man
 		http.NotFound(w, r)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 256*1024)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			_, _ = w.Write([]byte(`{"error":"request body too large"}`))
+	var bodyBytes []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = http.MaxBytesReader(w, r.Body, 256*1024)
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_, _ = w.Write([]byte(`{"error":"request body too large"}`))
+				return
+			}
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 			return
 		}
-		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
-		return
 	}
-	queryMap := make(map[string]string, len(r.URL.Query()))
-	for k, vs := range r.URL.Query() {
-		if len(vs) > 0 {
-			queryMap[k] = vs[0]
+	var queryMap map[string]string
+	if r.URL.RawQuery != "" {
+		parsedQuery := r.URL.Query()
+		queryMap = make(map[string]string, len(parsedQuery))
+		for k, vs := range parsedQuery {
+			if len(vs) > 0 {
+				queryMap[k] = vs[0]
+			}
 		}
+	} else {
+		queryMap = map[string]string{}
 	}
 	hdrMap := make(map[string]string)
 	for _, allowedHdr := range []string{"Accept", "Content-Type", "Accept-Language", "User-Agent"} {
@@ -3420,6 +3545,123 @@ func coerceAPIResponse(raw any) APIResponse {
 	}
 }
 
+const (
+	maxPluginAssetGzipCacheTotalBytes = 4 << 20   // 4 MiB total compressed asset cache across all plugins
+	maxPluginAssetGzipCacheRawSize    = 512 << 10 // 512 KiB max uncompressed asset eligible for RAM cache
+)
+
+type pluginAssetGzipEntry struct {
+	pluginID string
+	size     int64
+	modNano  int64
+	gzBytes  []byte
+}
+
+type pluginAssetGzipCache struct {
+	mu         sync.RWMutex
+	entries    map[string]pluginAssetGzipEntry
+	order      []string
+	totalBytes int
+}
+
+func (c *pluginAssetGzipCache) get(key string, size int64, modNano int64) ([]byte, bool) {
+	c.mu.RLock()
+	ent, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok || ent.size != size || ent.modNano != modNano {
+		return nil, false
+	}
+	return ent.gzBytes, true
+}
+
+func (c *pluginAssetGzipCache) put(pluginID, key string, size int64, modNano int64, gzBytes []byte) {
+	n := len(gzBytes)
+	if n == 0 || n > maxPluginAssetGzipCacheTotalBytes {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]pluginAssetGzipEntry, 32)
+	}
+	if prev, exists := c.entries[key]; exists {
+		c.totalBytes -= len(prev.gzBytes)
+		delete(c.entries, key)
+		kept := c.order[:0]
+		for _, k := range c.order {
+			if k != key {
+				kept = append(kept, k)
+			}
+		}
+		for i := len(kept); i < len(c.order); i++ {
+			c.order[i] = ""
+		}
+		c.order = kept
+	}
+	for c.totalBytes+n > maxPluginAssetGzipCacheTotalBytes && len(c.order) > 0 {
+		victim := c.order[0]
+		c.order[0] = ""
+		c.order = c.order[1:]
+		if old, exists := c.entries[victim]; exists {
+			c.totalBytes -= len(old.gzBytes)
+			delete(c.entries, victim)
+		}
+	}
+	c.entries[key] = pluginAssetGzipEntry{
+		pluginID: pluginID,
+		size:     size,
+		modNano:  modNano,
+		gzBytes:  gzBytes,
+	}
+	c.order = append(c.order, key)
+	c.totalBytes += n
+}
+
+func (c *pluginAssetGzipCache) deletePlugin(pluginID string) {
+	if pluginID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) == 0 {
+		return
+	}
+	removed := false
+	for k, ent := range c.entries {
+		if ent.pluginID == pluginID {
+			c.totalBytes -= len(ent.gzBytes)
+			delete(c.entries, k)
+			removed = true
+		}
+	}
+	if !removed {
+		return
+	}
+	if len(c.entries) == 0 {
+		c.order = nil
+		c.totalBytes = 0
+		return
+	}
+	kept := c.order[:0]
+	for _, k := range c.order {
+		if _, ok := c.entries[k]; ok {
+			kept = append(kept, k)
+		}
+	}
+	for i := len(kept); i < len(c.order); i++ {
+		c.order[i] = ""
+	}
+	c.order = kept
+}
+
+func (c *pluginAssetGzipCache) clear() {
+	c.mu.Lock()
+	c.entries = nil
+	c.order = nil
+	c.totalBytes = 0
+	c.mu.Unlock()
+}
+
 func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *managedPlugin, relAsset string) {
 	if mp.pluginDir == "" {
 		http.NotFound(w, r)
@@ -3430,20 +3672,17 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 		http.NotFound(w, r)
 		return
 	}
-	assetsRoot := filepath.Join(mp.pluginDir, "assets")
-	realAssetsRoot, err := filepath.EvalSymlinks(assetsRoot)
-	if err != nil {
+	if pInfo, pErr := os.Lstat(mp.pluginDir); pErr != nil || pInfo.Mode()&os.ModeSymlink != 0 || !pInfo.IsDir() {
 		http.NotFound(w, r)
 		return
 	}
-	candidate := filepath.Join(realAssetsRoot, filepath.FromSlash(cleanRel))
-	realTarget, err := filepath.EvalSymlinks(candidate)
-	if err != nil || realTarget == realAssetsRoot || !isSubPath(realAssetsRoot, realTarget) {
+	assetsRoot := filepath.Join(mp.pluginDir, "assets")
+	if aInfo, aErr := os.Lstat(assetsRoot); aErr != nil || aInfo.Mode()&os.ModeSymlink != 0 || !aInfo.IsDir() {
 		http.NotFound(w, r)
 		return
 	}
 
-	f, err := os.Open(realTarget)
+	f, err := os.OpenInRoot(assetsRoot, filepath.FromSlash(cleanRel))
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -3456,21 +3695,288 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(realTarget))
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
-	if isSandboxedMarkupAssetExt(ext) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
-	}
-	ct := mime.TypeByExtension(ext)
-	if ct == "" || isNonStandardExecutableOrMarkupAssetExt(ext) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", "attachment")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	ext := strings.ToLower(filepath.Ext(cleanRel))
+	hdr := w.Header()
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	if hasNonEmptyRawQueryParam(r.URL.RawQuery, "v") {
+		hdr.Set("Cache-Control", "public, max-age=2592000, stale-while-revalidate=86400")
 	} else {
-		w.Header().Set("Content-Type", ct)
+		hdr.Set("Cache-Control", "public, max-age=86400")
 	}
-	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
+	if isSandboxedMarkupAssetExt(ext) {
+		hdr.Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	}
+	ct, safeInline := resolvePluginAssetContentType(ext)
+	if !safeInline || ct == "" {
+		hdr.Set("Content-Type", "application/octet-stream")
+		hdr.Set("Content-Disposition", "attachment")
+		hdr.Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	} else {
+		hdr.Set("Content-Type", ct)
+	}
+
+	fileSize := st.Size()
+	modNano := st.ModTime().UnixNano()
+	compressible := safeInline && ct != "" && fileSize >= 256 && isCompressiblePluginAssetExt(ext)
+	if compressible {
+		hdr.Add("Vary", "Accept-Encoding")
+	}
+	isGetOrHead := r.Method == http.MethodGet || r.Method == http.MethodHead
+	canGzip := compressible &&
+		isGetOrHead &&
+		r.Header.Get("Range") == "" &&
+		acceptsGzipEncoding(r.Header.Get("Accept-Encoding"))
+
+	etag := formatPluginAssetETag(fileSize, modNano, canGzip)
+	hdr.Set("ETag", etag)
+	if isGetOrHead && pluginAssetETagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	if canGzip {
+		hdr.Set("Content-Encoding", "gzip")
+		cacheEligible := fileSize <= maxPluginAssetGzipCacheRawSize
+		var cacheKey string
+		if cacheEligible {
+			cacheKey = mp.manifest.ID + "\x00" + cleanRel
+			if gzBytes, ok := m.assetGzipCache.get(cacheKey, fileSize, modNano); ok {
+				hdr.Set("Content-Length", strconv.Itoa(len(gzBytes)))
+				w.WriteHeader(http.StatusOK)
+				if r.Method == http.MethodGet {
+					_, _ = w.Write(gzBytes)
+				}
+				return
+			}
+		}
+		if r.Method == http.MethodHead {
+			hdr.Del("Content-Length")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		bufPtr := pluginAssetCopyBufPool.Get().(*[]byte)
+		copyBuf := *bufPtr
+		defer pluginAssetCopyBufPool.Put(bufPtr)
+
+		if cacheEligible {
+			var memBuf bytes.Buffer
+			memBuf.Grow(int(fileSize/2) + 128)
+			gz := pluginAssetGzipPool.Get().(*gzip.Writer)
+			gz.Reset(&memBuf)
+			_, cpErr := io.CopyBuffer(gz, f, copyBuf)
+			clErr := gz.Close()
+			gz.Reset(io.Discard)
+			pluginAssetGzipPool.Put(gz)
+			if cpErr != nil || clErr != nil {
+				http.Error(w, "failed to read asset", http.StatusInternalServerError)
+				return
+			}
+			gzBytes := append([]byte(nil), memBuf.Bytes()...)
+			m.assetGzipCache.put(mp.manifest.ID, cacheKey, fileSize, modNano, gzBytes)
+			hdr.Set("Content-Length", strconv.Itoa(len(gzBytes)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(gzBytes)
+			return
+		}
+
+		hdr.Del("Content-Length")
+		w.WriteHeader(http.StatusOK)
+		gz := pluginAssetGzipPool.Get().(*gzip.Writer)
+		gz.Reset(w)
+		_, _ = io.CopyBuffer(gz, f, copyBuf)
+		_ = gz.Close()
+		gz.Reset(io.Discard)
+		pluginAssetGzipPool.Put(gz)
+		return
+	}
+	serveReq := r
+	if ir := strings.TrimSpace(r.Header.Get("If-Range")); strings.HasPrefix(ir, `"pa-`) && strings.HasSuffix(ir, `-gz"`) {
+		cloned := *r
+		cloned.Header = r.Header.Clone()
+		cloned.Header.Set("If-Range", strings.TrimSuffix(ir, `-gz"`)+`"`)
+		serveReq = &cloned
+	}
+	http.ServeContent(w, serveReq, st.Name(), st.ModTime(), f)
+}
+
+var pluginAssetGzipPool = sync.Pool{
+	New: func() any {
+		gw, _ := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+		return gw
+	},
+}
+
+var pluginAssetCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32*1024)
+		return &buf
+	},
+}
+
+func formatPluginAssetETag(size int64, modNano int64, gz bool) string {
+	var buf [64]byte
+	b := append(buf[:0], `"pa-`...)
+	b = strconv.AppendInt(b, size, 16)
+	b = append(b, '-')
+	b = strconv.AppendInt(b, modNano, 16)
+	if gz {
+		b = append(b, `-gz"`...)
+	} else {
+		b = append(b, '"')
+	}
+	return string(b)
+}
+
+func hasNonEmptyRawQueryParam(rawQuery, key string) bool {
+	rest := rawQuery
+	for rest != "" {
+		var seg string
+		seg, rest, _ = strings.Cut(rest, "&")
+		if seg == "" || strings.IndexByte(seg, ';') >= 0 {
+			continue
+		}
+		k, v, hasEq := strings.Cut(seg, "=")
+		if strings.IndexByte(k, '%') >= 0 || strings.IndexByte(k, '+') >= 0 {
+			var err error
+			k, err = url.QueryUnescape(k)
+			if err != nil {
+				continue
+			}
+		}
+		if k != key {
+			continue
+		}
+		if !hasEq || v == "" {
+			return false
+		}
+		if strings.IndexByte(v, '%') >= 0 || strings.IndexByte(v, '+') >= 0 {
+			uv, err := url.QueryUnescape(v)
+			if err != nil {
+				continue
+			}
+			return uv != ""
+		}
+		return true
+	}
+	return false
+}
+
+func resolvePluginAssetContentType(ext string) (string, bool) {
+	if isNonStandardExecutableOrMarkupAssetExt(ext) {
+		return "", false
+	}
+	switch ext {
+	case ".js", ".mjs":
+		return "text/javascript; charset=utf-8", true
+	case ".css":
+		return "text/css; charset=utf-8", true
+	case ".json":
+		return "application/json; charset=utf-8", true
+	case ".svg":
+		return "image/svg+xml", true
+	case ".png":
+		return "image/png", true
+	case ".webp":
+		return "image/webp", true
+	case ".gif":
+		return "image/gif", true
+	case ".jpg", ".jpeg":
+		return "image/jpeg", true
+	case ".avif":
+		return "image/avif", true
+	case ".ico":
+		return "image/x-icon", true
+	case ".ogg":
+		return "audio/ogg", true
+	case ".mp3":
+		return "audio/mpeg", true
+	case ".wav":
+		return "audio/wav", true
+	case ".woff2":
+		return "font/woff2", true
+	case ".woff":
+		return "font/woff", true
+	case ".ttf":
+		return "font/ttf", true
+	case ".txt", ".mtn":
+		return "text/plain; charset=utf-8", true
+	case ".moc":
+		return "application/octet-stream", true
+	default:
+		ct := mime.TypeByExtension(ext)
+		if ct == "" {
+			return "", false
+		}
+		return ct, true
+	}
+}
+
+func isCompressiblePluginAssetExt(ext string) bool {
+	switch ext {
+	case ".js", ".mjs", ".css", ".json", ".moc", ".mtn", ".svg", ".txt", ".xml":
+		return true
+	default:
+		return false
+	}
+}
+
+func acceptsGzipEncoding(header string) bool {
+	if header == "" {
+		return false
+	}
+	starAllowed := false
+	starExplicit := false
+	rest := header
+	for rest != "" {
+		var part string
+		part, rest, _ = strings.Cut(rest, ",")
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, params, hasParams := strings.Cut(part, ";")
+		name = strings.TrimSpace(name)
+		qZero := false
+		for hasParams && params != "" {
+			var p string
+			p, params, _ = strings.Cut(params, ";")
+			p = strings.TrimSpace(p)
+			if len(p) >= 2 && (p[0] == 'q' || p[0] == 'Q') && p[1] == '=' {
+				qVal, err := strconv.ParseFloat(strings.TrimSpace(p[2:]), 64)
+				if err == nil && qVal <= 0 {
+					qZero = true
+				}
+			}
+		}
+		if strings.EqualFold(name, "gzip") || strings.EqualFold(name, "x-gzip") {
+			return !qZero
+		}
+		if name == "*" {
+			starExplicit = true
+			starAllowed = !qZero
+		}
+	}
+	return starExplicit && starAllowed
+}
+
+func pluginAssetETagMatches(inmHeader, targetETag string) bool {
+	inm := strings.TrimSpace(inmHeader)
+	if inm == "" || targetETag == "" {
+		return false
+	}
+	if inm == "*" {
+		return true
+	}
+	normTarget := strings.TrimPrefix(targetETag, "W/")
+	rest := inm
+	for rest != "" {
+		var raw string
+		raw, rest, _ = strings.Cut(rest, ",")
+		cand := strings.TrimPrefix(strings.TrimSpace(raw), "W/")
+		if cand == normTarget {
+			return true
+		}
+	}
+	return false
 }
 
 func isSandboxedMarkupAssetExt(ext string) bool {
@@ -3583,6 +4089,7 @@ func (m *Manager) Close(ctx context.Context) error {
 	for _, mp := range list {
 		m.deactivateRuntime(ctx, mp)
 	}
+	m.assetGzipCache.clear()
 	if m.cron != nil {
 		m.cron.Close()
 	}

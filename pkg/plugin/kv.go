@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,13 +17,17 @@ import (
 )
 
 const (
-	MaxKVKeyBytes         = 191
-	MaxKVValueBytes       = 512 * 1024 // 512 KiB per value (supports lexicon/dictionary payloads)
-	MaxKVKeysPerPlugin    = 1000
-	maxKVListLimit        = 200
-	defaultKVListLimit    = 50
-	kvBufferedFlushPeriod = 5 * time.Second
+	MaxKVKeyBytes          = 191
+	MaxKVValueBytes        = 512 * 1024 // 512 KiB per value (supports lexicon/dictionary payloads)
+	MaxKVKeysPerPlugin     = 1000
+	maxKVDirtyEntriesTotal = MaxKVKeysPerPlugin * 16
+	maxKVListLimit         = 200
+	defaultKVListLimit     = 50
+	kvBufferedFlushPeriod  = 5 * time.Second
 )
+
+// ErrKVQuotaExceeded is returned when a plugin reaches MaxKVKeysPerPlugin (or the KV dirty buffer cap).
+var ErrKVQuotaExceeded = errors.New("plugin_kv: key quota exceeded")
 
 // KVItem represents a key-value entry returned by ListPrefix.
 type KVItem struct {
@@ -41,6 +46,7 @@ type kvPluginKey struct {
 type kvCounterEntry struct {
 	base       int64
 	baseLoaded bool
+	persisted  bool
 	delta      int64
 }
 
@@ -175,40 +181,75 @@ func (h *kvBufferHub) flush(ctx context.Context, filterPluginID string) error {
 	})
 
 	now := time.Now().Unix()
-	committed := make(map[kvPluginKey]int64, len(batch))
+	var firstErr error
 
-	err := h.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
-		for _, item := range batch {
-			nextVal, stepErr := applyCounterDeltaTx(ctx, tx, item.pk.pluginID, item.pk.key, item.delta, 0, now)
-			if stepErr != nil {
-				return stepErr
-			}
-			committed[item.pk] = nextVal
+	for start := 0; start < len(batch); {
+		pluginID := batch[start].pk.pluginID
+		end := start + 1
+		for end < len(batch) && batch[end].pk.pluginID == pluginID {
+			end++
 		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
+		pluginBatch := batch[start:end]
+		start = end
 
-	h.mu.Lock()
-	h.gen++
-	for _, item := range batch {
-		ent := h.entries[item.pk]
-		if ent == nil {
+		pluginCommitted := make(map[kvPluginKey]int64, len(pluginBatch))
+		var pluginDropped []deltaItem
+
+		pErr := h.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
+			for _, item := range pluginBatch {
+				nextVal, stepErr := applyCounterDeltaTx(ctx, tx, item.pk.pluginID, item.pk.key, item.delta, 0, now)
+				if stepErr != nil {
+					if errors.Is(stepErr, ErrKVQuotaExceeded) {
+						pluginDropped = append(pluginDropped, item)
+						continue
+					}
+					return stepErr
+				}
+				pluginCommitted[item.pk] = nextVal
+			}
+			return nil
+		})
+		if pErr != nil {
+			if firstErr == nil {
+				firstErr = pErr
+			}
 			continue
 		}
-		ent.base = committed[item.pk]
-		ent.baseLoaded = true
-		ent.delta -= item.delta
-		if ent.delta == 0 {
-			delete(h.dirty, item.pk)
-		} else {
-			h.dirty[item.pk] = ent.delta
+
+		if len(pluginDropped) > 0 {
+			slog.Warn("plugin_kv: dropping buffered increments over key quota",
+				"plugin_id", pluginID,
+				"dropped_keys", len(pluginDropped),
+				"first_key", pluginDropped[0].pk.key,
+			)
 		}
+
+		h.mu.Lock()
+		h.gen++
+		for _, item := range pluginBatch {
+			ent := h.entries[item.pk]
+			if ent == nil {
+				continue
+			}
+			if nextVal, ok := pluginCommitted[item.pk]; ok {
+				ent.base = nextVal
+				ent.baseLoaded = true
+				ent.persisted = true
+			}
+			ent.delta -= item.delta
+			if ent.delta == 0 {
+				delete(h.dirty, item.pk)
+				if _, ok := pluginCommitted[item.pk]; !ok && !ent.persisted {
+					delete(h.entries, item.pk)
+				}
+			} else {
+				h.dirty[item.pk] = ent.delta
+			}
+		}
+		h.mu.Unlock()
 	}
-	h.mu.Unlock()
-	return nil
+
+	return firstErr
 }
 
 // FlushPluginKV deterministically flushes any dirty buffered KV counters for pluginID in a single transaction.
@@ -364,6 +405,10 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 	for {
 		hub.mu.Lock()
 		if ent := hub.entries[pk]; ent != nil && ent.baseLoaded {
+			if delta != 0 && hub.dirty[pk] == 0 && len(hub.dirty) >= maxKVDirtyEntriesTotal {
+				hub.mu.Unlock()
+				return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
+			}
 			ent.delta += delta
 			if ent.delta == 0 {
 				delete(hub.dirty, pk)
@@ -374,6 +419,20 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 			combined := ent.base + ent.delta
 			hub.mu.Unlock()
 			return combined, nil
+		}
+		pluginDirty := 0
+		for dpk := range hub.dirty {
+			if dpk.pluginID == kv.pluginID {
+				pluginDirty++
+			}
+		}
+		if pluginDirty >= MaxKVKeysPerPlugin {
+			hub.mu.Unlock()
+			return 0, fmt.Errorf("%w: plugin %q reached maximum quota of %d keys", ErrKVQuotaExceeded, kv.pluginID, MaxKVKeysPerPlugin)
+		}
+		if len(hub.dirty) >= maxKVDirtyEntriesTotal {
+			hub.mu.Unlock()
+			return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
 		}
 		readGen := hub.gen
 		hub.mu.Unlock()
@@ -394,12 +453,27 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 			return 0, qErr
 		}
 		var loadedBase int64
-		if qErr == nil && (row.ExpiresAt == 0 || row.ExpiresAt > now) {
+		rowExists := qErr == nil && (row.ExpiresAt == 0 || row.ExpiresAt > now)
+		if rowExists {
 			loadedBase = parseCounterRowBase(row)
+		}
+		var dbLiveCount int
+		if !rowExists {
+			if cErr := kv.store.QueryRowContext(
+				ctx,
+				`SELECT COUNT(*) FROM plugin_kv WHERE plugin_id = ? AND (expires_at = 0 OR expires_at > ?)`,
+				kv.pluginID, now,
+			).Scan(&dbLiveCount); cErr != nil {
+				return 0, cErr
+			}
 		}
 
 		hub.mu.Lock()
 		if ent := hub.entries[pk]; ent != nil && ent.baseLoaded {
+			if delta != 0 && hub.dirty[pk] == 0 && len(hub.dirty) >= maxKVDirtyEntriesTotal {
+				hub.mu.Unlock()
+				return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
+			}
 			ent.delta += delta
 			if ent.delta == 0 {
 				delete(hub.dirty, pk)
@@ -417,12 +491,51 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 		}
 		ent := hub.entries[pk]
 		if ent == nil {
-			if len(hub.entries) >= MaxKVKeysPerPlugin*16 {
-				// Evict clean entries before growing unboundedly.
+			pluginEntries := 0
+			pluginDirtyNow := 0
+			unpersistedDirty := 0
+			for epk, cand := range hub.entries {
+				if epk.pluginID != kv.pluginID {
+					continue
+				}
+				if cand.delta == 0 {
+					continue
+				}
+				pluginDirtyNow++
+				if !cand.persisted {
+					unpersistedDirty++
+				}
+			}
+			if pluginDirtyNow >= MaxKVKeysPerPlugin || (!rowExists && dbLiveCount+unpersistedDirty >= MaxKVKeysPerPlugin) {
+				hub.mu.Unlock()
+				return 0, fmt.Errorf("%w: plugin %q reached maximum quota of %d keys", ErrKVQuotaExceeded, kv.pluginID, MaxKVKeysPerPlugin)
+			}
+			if len(hub.dirty) >= maxKVDirtyEntriesTotal {
+				hub.mu.Unlock()
+				return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
+			}
+			for epk := range hub.entries {
+				if epk.pluginID == kv.pluginID {
+					pluginEntries++
+				}
+			}
+			if pluginEntries >= MaxKVKeysPerPlugin {
+				for epk, cand := range hub.entries {
+					if epk.pluginID == kv.pluginID && cand.delta == 0 {
+						delete(hub.entries, epk)
+					}
+				}
+			}
+			if len(hub.entries) >= maxKVDirtyEntriesTotal {
+				// Evict clean entries before growing; reject if all entries are dirty.
 				for epk, cand := range hub.entries {
 					if cand.delta == 0 {
 						delete(hub.entries, epk)
 					}
+				}
+				if len(hub.entries) >= maxKVDirtyEntriesTotal {
+					hub.mu.Unlock()
+					return 0, fmt.Errorf("%w: total dirty buffered counter limit (%d) reached", ErrKVQuotaExceeded, maxKVDirtyEntriesTotal)
 				}
 			}
 			ent = &kvCounterEntry{}
@@ -430,6 +543,7 @@ func (kv *KVStore) IncrBuffered(ctx context.Context, key string, delta int64) (i
 		}
 		ent.base = loadedBase
 		ent.baseLoaded = true
+		ent.persisted = rowExists
 		ent.delta += delta
 		if ent.delta == 0 {
 			delete(hub.dirty, pk)
@@ -494,7 +608,7 @@ func (kv *KVStore) Set(ctx context.Context, key string, value string, ttlSeconds
 		hub.gen++
 		delete(hub.dirty, pk)
 		if ttlSeconds <= 0 && parsedErr == nil {
-			hub.entries[pk] = &kvCounterEntry{base: intVal, baseLoaded: true, delta: 0}
+			hub.entries[pk] = &kvCounterEntry{base: intVal, baseLoaded: true, persisted: true, delta: 0}
 		} else {
 			delete(hub.entries, pk)
 		}
@@ -544,6 +658,7 @@ func (kv *KVStore) IncrBy(ctx context.Context, key string, delta int64, ttlSecon
 			if ttlSeconds <= 0 {
 				ent.base = nextVal
 				ent.baseLoaded = true
+				ent.persisted = true
 			} else {
 				ent.baseLoaded = false
 			}
@@ -782,7 +897,7 @@ func enforcePluginKVQuotaTx(ctx context.Context, tx *sqlx.Tx, pluginID string, k
 		return err
 	}
 	if count >= MaxKVKeysPerPlugin {
-		return fmt.Errorf("plugin_kv: plugin %q reached maximum quota of %d keys", pluginID, MaxKVKeysPerPlugin)
+		return fmt.Errorf("%w: plugin %q reached maximum quota of %d keys", ErrKVQuotaExceeded, pluginID, MaxKVKeysPerPlugin)
 	}
 	return nil
 }

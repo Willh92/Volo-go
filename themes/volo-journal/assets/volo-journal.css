@@ -61,6 +61,13 @@ html[data-volo-skin="volo-journal"] .volo-prose .volo-callout {
   font-style: normal;
 }
 
+html[data-volo-skin="volo-journal"] .volo-prose blockquote {
+  border-left-width: 3.5px;
+  border-radius: 2px 8px 8px 2px;
+  padding: 13px 20px 13px 22px;
+  background: color-mix(in srgb, var(--volo-accent) 4.5%, var(--volo-raised));
+}
+
 html[data-volo-skin="volo-journal"] :is(.vc-btn-danger, .volo-btn--danger) {
   background: var(--volo-danger-solid, #b42318);
   border-color: var(--volo-danger-solid, #b42318);
@@ -186,9 +193,22 @@ html[data-volo-skin="volo-journal"] .studio-layout--article.has-toc {
   margin-inline: auto;
 }
 
+html[data-volo-skin="volo-journal"] .studio-layout--wide,
 html[data-volo-skin="volo-journal"] .studio-layout--tpl-wide,
 html[data-volo-skin="volo-journal"] .studio-layout--article:has(article[data-page-template="wide"]) {
   max-width: 1120px;
+}
+
+@media (min-width: 1440px) {
+  html[data-volo-skin="volo-journal"] #studio-main.studio-container:has(.studio-layout--wide, .studio-layout--tpl-wide, article[data-page-template="wide"]) {
+    width: min(1320px, calc(100% - 64px));
+    max-width: 1320px;
+  }
+  html[data-volo-skin="volo-journal"] .studio-layout--wide,
+  html[data-volo-skin="volo-journal"] .studio-layout--tpl-wide,
+  html[data-volo-skin="volo-journal"] .studio-layout--article:has(article[data-page-template="wide"]) {
+    max-width: 1280px;
+  }
 }
 
 html[data-volo-skin="volo-journal"] .studio-layout--tpl-minimal,
@@ -204,13 +224,11 @@ html[data-volo-skin="volo-journal"] .studio-sidebar {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr));
   gap: 18px;
+  min-inline-size: 0;
 }
 
-/* Suppress duplicate bottom sidebar on /follows and /dynamic in single-column journal mode */
-html[data-volo-skin="volo-journal"] .studio-layout--follows > .studio-sidebar,
-html[data-volo-skin="volo-journal"] .studio-layout--dynamic > .studio-sidebar,
-html[data-volo-skin="volo-journal"] .studio-layout:has(.studio-follow-head, .studio-stats-grid, .studio-dynamic-list) > .studio-sidebar {
-  display: none !important;
+html[data-volo-skin="volo-journal"] .studio-sidebar:empty {
+  display: none;
 }
 
 html[data-volo-skin="volo-journal"] .studio-toc-slot {

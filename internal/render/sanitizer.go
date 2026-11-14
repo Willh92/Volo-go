@@ -424,6 +424,10 @@ func (s *htmlSanitizer) writeArticleElement(out *strings.Builder, n *nethtml.Nod
 				if len(v) > 0 && len(v) <= 512 && !containsControlChars(a.Val) && !strings.ContainsAny(v, "<>\"'") {
 					writeAttrKV(out, "sizes", v)
 				}
+			case "referrerpolicy":
+				if safeIframeRefPolRe.MatchString(strings.ToLower(v)) {
+					writeAttrKV(out, "referrerpolicy", strings.ToLower(v))
+				}
 			default:
 				s.writeAllowedGlobalArticleAttr(out, tag, k, a.Val)
 			}
@@ -714,7 +718,7 @@ func (s *htmlSanitizer) writeAllowedGlobalArticleAttr(out *strings.Builder, tag,
 		if low == "true" || low == "false" {
 			writeAttrKV(out, k, low)
 		}
-	case "data-lang", "data-lock-type", "data-article-id", "data-book-slug",
+	case "data-lang", "data-detected-lang", "data-lock-type", "data-article-id", "data-book-slug",
 		"data-github-profile", "data-callout", "data-md-toc", "data-md-media-label",
 		"data-math-src", "data-mermaid-src", "data-footnote-ref", "data-footnote-backref":
 		writeAttrKV(out, k, rawVal)

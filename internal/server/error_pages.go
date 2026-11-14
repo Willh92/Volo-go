@@ -319,15 +319,23 @@ func (s *AppServer) renderLightweightErrorPageWithViewer(w http.ResponseWriter, 
 	}
 	addVaryHeader(w.Header(), "Accept-Encoding", "Accept-Language")
 	w.Header().Set("Cache-Control", "no-store")
-	if err := s.deps.Themes.RenderWithFallback(w, status, activeTheme, []string{"error.html"}, pctx); err != nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(status)
-		msg := html.EscapeString(pctx.ErrorMessage)
-		if msg == "" {
-			msg = html.EscapeString(http.StatusText(status))
-		}
-		_, _ = fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>%d</title></head><body style=\"font-family:system-ui,sans-serif;padding:48px 24px;max-width:560px;margin:0 auto;color:#222\"><h1 style=\"margin:0 0 8px\">%d</h1><p style=\"margin:0 0 16px;color:#666\">%s</p><a href=\"/\">&larr; Home</a></body></html>", status, status, msg)
+	var renderErr error
+	if s.deps.Themes != nil {
+		renderErr = s.deps.Themes.RenderWithFallback(w, status, activeTheme, []string{"error.html"}, pctx)
 	}
+	if s.deps.Themes == nil || renderErr != nil {
+		writeEmergencyFallbackErrorHTML(w, status, pctx.ErrorMessage)
+	}
+}
+
+func writeEmergencyFallbackErrorHTML(w http.ResponseWriter, status int, rawMsg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	msg := html.EscapeString(rawMsg)
+	if msg == "" {
+		msg = html.EscapeString(http.StatusText(status))
+	}
+	_, _ = fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>%d</title><style>body{font-family:system-ui,sans-serif;padding:48px 24px;max-width:560px;margin:0 auto;color:#222}h1{margin:0 0 8px}p{margin:0 0 16px;color:#666}@media(prefers-color-scheme:dark){body{background:#121316;color:#e5e7eb}p{color:#9ca3af}}</style></head><body><h1>%d</h1><p>%s</p><a href=\"/\">&larr; Home</a></body></html>", status, status, msg)
 }
 
 type customErrorInterceptWriter struct {

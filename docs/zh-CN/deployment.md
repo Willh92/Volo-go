@@ -2,7 +2,7 @@
 
 > English version: [Deployment & OS Service Installers](../en-US/deployment.md)
 
-`Volo-go` 基于 Go `1.27.4`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（**全部 6 大静态发布目标架构均严格 `< 21 MiB`**，`linux/amd64` `~19.7 MiB`）：
+`Volo-go` 基于 Go `1.27.4`（`CGO_ENABLED=0`、`GOEXPERIMENT=nojsonv2`）编译为单个零外部依赖静态二进制文件（**全部 6 大静态发布目标架构均 `< 22 MiB`**，`linux/amd64` `~19.6 MiB`）：
 - **Linux**: `linux/amd64`、`linux/arm64`（支持 `systemd` 系统/用户级与 `OpenRC`）
 - **macOS**: `darwin/amd64`、`darwin/arm64`（支持 `launchd` `LaunchDaemon` / `LaunchAgent`）
 - **Windows**: `windows/amd64`、`windows/arm64`（支持 `svc_windows.go` 原生 `sc.exe` Windows Service、`NSSM` 与系统计划任务）
@@ -211,7 +211,7 @@ docker compose --profile postgres up -d
      ```bash
      mkdir -p data && sudo chown -R 65532:65532 data
      ```
-  2. **切勿挂载空的 `./themes` 或 `./plugins` 宿主机目录**至 `/app/themes` 或 `/app/plugins`，否则空目录会遮蔽镜像内预置的外部主题（如 `volo-journal`）与插件（如 `kanbanniang`）。
+  2. **切勿挂载空的 `./themes` 或 `./plugins` 宿主机目录**至 `/app/themes` 或 `/app/plugins`，否则空目录会遮蔽镜像内预置的外部主题（如 `volo-journal`）与默认插件（如 `sensitive-words`）；如需安装大型独立发布插件（如 Live2D 看板娘 `plugin-kanbanniang-v2.0.0.zip`，详见 [官方插件目录](../../plugins/README.zh-CN.md)），可直接在管理台 **「外观与扩展 -> 插件扩展」** 上传 `.zip` 安装。
 
 ### 5.2 三大数据库引擎 DSN 写法（固定环境变量模式）
 

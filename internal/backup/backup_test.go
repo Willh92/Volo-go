@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -371,5 +372,114 @@ func TestExtensionsPluginsAndThemesBackupRestoreAndSecurityCaps(t *testing.T) {
 	}
 	if _, sErr := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{MaxSingleFileBytes: 10}); sErr == nil || !strings.Contains(sErr.Error(), "limit") {
 		t.Fatalf("expected MaxSingleFileBytes rejection, got %v", sErr)
+	}
+}
+
+func TestBackup_MixedStoreAndDeflateMediaAndExtensionsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	srcDB := openTestSQLiteStore(t, filepath.Join(tmp, "mix-src.db"))
+
+	srcUpload := filepath.Join(tmp, "uploads")
+	srcPlugins := filepath.Join(tmp, "plugins")
+	if err := os.MkdirAll(filepath.Join(srcUpload, "2026"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(srcPlugins, "kanbanniang", "assets"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	webpData := bytes.Repeat([]byte("RIFFWEBP"), 64)
+	txtData := bytes.Repeat([]byte("compressible-notes-line\n"), 64)
+	pngData := bytes.Repeat([]byte("\x89PNG\r\n\x1a\n"), 64)
+	mocData := bytes.Repeat([]byte("moc-model-stream-"), 64)
+
+	_ = os.WriteFile(filepath.Join(srcUpload, "2026", "photo.webp"), webpData, 0o640)
+	_ = os.WriteFile(filepath.Join(srcUpload, "2026", "readme.txt"), txtData, 0o640)
+	_ = os.WriteFile(filepath.Join(srcPlugins, "kanbanniang", "manifest.json"), []byte(`{"id":"kanbanniang","version":"2.0.0"}`), 0o640)
+	_ = os.WriteFile(filepath.Join(srcPlugins, "kanbanniang", "assets", "tex.png"), pngData, 0o640)
+	_ = os.WriteFile(filepath.Join(srcPlugins, "kanbanniang", "assets", "avatar.moc"), mocData, 0o640)
+
+	zipPath := filepath.Join(tmp, "mixed-method.zip")
+	if _, err := CreateToFile(ctx, srcDB, zipPath, CreateOptions{
+		IncludeMedia: true,
+		UploadDir:    srcUpload,
+		PluginsDir:   srcPlugins,
+	}); err != nil {
+		t.Fatalf("CreateToFile: %v", err)
+	}
+
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	methods := make(map[string]uint16)
+	for _, f := range zr.File {
+		methods[f.Name] = f.Method
+	}
+	_ = zr.Close()
+
+	if methods["uploads/2026/photo.webp"] != zip.Store {
+		t.Fatalf("expected uploads/2026/photo.webp to use zip.Store, got %d", methods["uploads/2026/photo.webp"])
+	}
+	if methods["uploads/2026/readme.txt"] != zip.Deflate {
+		t.Fatalf("expected uploads/2026/readme.txt to use zip.Deflate, got %d", methods["uploads/2026/readme.txt"])
+	}
+	if methods["extensions/plugins/kanbanniang/assets/tex.png"] != zip.Store {
+		t.Fatalf("expected extension .png to use zip.Store, got %d", methods["extensions/plugins/kanbanniang/assets/tex.png"])
+	}
+	if methods["extensions/plugins/kanbanniang/assets/avatar.moc"] != zip.Deflate {
+		t.Fatalf("expected extension .moc to use zip.Deflate, got %d", methods["extensions/plugins/kanbanniang/assets/avatar.moc"])
+	}
+
+	dstDB := openTestSQLiteStore(t, filepath.Join(tmp, "mix-dst.db"))
+	dstUpload := filepath.Join(tmp, "dst-uploads")
+	dstPlugins := filepath.Join(tmp, "dst-plugins")
+
+	if _, err := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{
+		DryRun:     true,
+		UploadDir:  dstUpload,
+		PluginsDir: dstPlugins,
+	}); err != nil {
+		t.Fatalf("DryRun Verify failed: %v", err)
+	}
+
+	sum, err := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{
+		UploadDir:  dstUpload,
+		PluginsDir: dstPlugins,
+	})
+	if err != nil {
+		t.Fatalf("RestoreFromFile failed: %v", err)
+	}
+	if sum.MediaFiles != 2 || sum.ExtensionFiles != 3 {
+		t.Fatalf("unexpected restore counts: media=%d ext=%d", sum.MediaFiles, sum.ExtensionFiles)
+	}
+	gotPNG, err := os.ReadFile(filepath.Join(dstPlugins, "kanbanniang", "assets", "tex.png"))
+	if err != nil || !bytes.Equal(gotPNG, pngData) {
+		t.Fatalf("restored tex.png mismatch: err=%v len=%d", err, len(gotPNG))
+	}
+	gotWebP, err := os.ReadFile(filepath.Join(dstUpload, "2026", "photo.webp"))
+	if err != nil || !bytes.Equal(gotWebP, webpData) {
+		t.Fatalf("restored photo.webp mismatch: err=%v len=%d", err, len(gotWebP))
+	}
+}
+
+func TestNormalizeRestoreValue_UsersShieldCommentsCrossDB(t *testing.T) {
+	if !isBooleanColumn("users", "shield_comments") {
+		t.Fatal("expected users.shield_comments to be registered in isBooleanColumn")
+	}
+	// SQLite/MySQL numeric 1/0 -> Postgres native bool true/false
+	if got := coerceJSONValForDB("users", "shield_comments", json.Number("1"), "postgres"); got != true {
+		t.Fatalf("postgres coerceJSONValForDB(1) = %#v, want true", got)
+	}
+	if got := coerceJSONValForDB("users", "shield_comments", json.Number("0"), "postgres"); got != false {
+		t.Fatalf("postgres coerceJSONValForDB(0) = %#v, want false", got)
+	}
+	// Postgres bool true/false -> SQLite/MySQL integer 1/0
+	if got := coerceJSONValForDB("users", "shield_comments", true, "sqlite"); got != 1 {
+		t.Fatalf("sqlite coerceJSONValForDB(true) = %#v, want 1", got)
+	}
+	if got := coerceJSONValForDB("users", "shield_comments", false, "mysql"); got != 0 {
+		t.Fatalf("mysql coerceJSONValForDB(false) = %#v, want 0", got)
 	}
 }

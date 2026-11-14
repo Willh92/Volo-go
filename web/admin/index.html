@@ -27,7 +27,7 @@
       try {
         m = localStorage.getItem("volo_theme_mode") || localStorage.getItem("volo_console_theme") || "";
       } catch (_) {}
-      if (!m) m = cfg.default_theme || "auto";
+      if (!m) m = cfg.default_mode || cfg.default_theme || "auto";
       var eff = m;
       if (m === "system") {
         eff = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";

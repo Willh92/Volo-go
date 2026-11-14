@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Willh92/Volo-go/internal/domain"
 )
 
 func mmdbEncodeUint64(v uint64) []byte {
@@ -389,5 +391,53 @@ func TestGeoEngineDualIPv4AndIPv6XDBSlotsAndHotReload(t *testing.T) {
 	}
 	if err := eng.LoadDatabases(rawFile); err == nil {
 		t.Fatalf("expected non-DB regular file %q to be rejected by LoadDatabases", rawFile)
+	}
+}
+
+func TestGeoEngineEvaluateRulesFailClosedOnBlockChallengeAndUnknown(t *testing.T) {
+	dir := t.TempDir()
+	v4 := buildSyntheticXDB(xdbIPv4Ver, 500, []syntheticXDBEntry{
+		{addr: netip.MustParseAddr("8.8.8.8"), region: "US|0|California|Sunnyvale|Google"},
+		{addr: netip.MustParseAddr("223.5.5.5"), region: "中国|0|浙江省|杭州市|阿里"},
+	})
+	if err := os.WriteFile(filepath.Join(dir, "ip2region_v4.xdb"), v4, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng := NewGeoEngine(dir, nil)
+	defer eng.Close()
+
+	us := netip.MustParseAddr("8.8.8.8")
+	cn := netip.MustParseAddr("223.5.5.5")
+
+	// Matched rules with "block", "challenge", or unknown actions MUST fail-closed (deny)!
+	for _, act := range []string{"deny", "block", "challenge", "unknown_action"} {
+		rules := []domain.SecurityGeoRule{{
+			ID:        "r1",
+			IsEnabled: true,
+			Action:    act,
+			OnMiss:    "next",
+			Countries: "US",
+		}}
+		if eng.evaluateRules(us, rules, "allow", "allow") {
+			t.Fatalf("expected matched rule with action=%q to fail-closed (deny), but it allowed US!", act)
+		}
+		if !eng.evaluateRules(cn, rules, "allow", "allow") {
+			t.Fatalf("expected unmatched CN with defaultPolicy=allow to be allowed for action=%q", act)
+		}
+	}
+
+	// OnMiss = "block" MUST deny unmatched traffic, just like "deny".
+	allowCNBlockRest := []domain.SecurityGeoRule{{
+		ID:        "r2",
+		IsEnabled: true,
+		Action:    "allow",
+		OnMiss:    "block",
+		Countries: "CN",
+	}}
+	if !eng.evaluateRules(cn, allowCNBlockRest, "allow", "allow") {
+		t.Fatalf("expected matched CN with action=allow to be allowed")
+	}
+	if eng.evaluateRules(us, allowCNBlockRest, "allow", "allow") {
+		t.Fatalf("expected unmatched US with on_miss=block to be denied!")
 	}
 }

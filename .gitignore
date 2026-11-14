@@ -28,6 +28,9 @@ coverage.txt
 !/themes/volo-studio/
 !/themes/volo-journal/
 /plugins/*
+!/plugins/catalog.json
+!/plugins/README.md
+!/plugins/README.zh-CN.md
 !/plugins/kanbanniang/
 !/plugins/sensitive-words/
 

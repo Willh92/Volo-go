@@ -39,6 +39,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/theme"
 	"github.com/Willh92/Volo-go/internal/tinyxml"
 	"github.com/Willh92/Volo-go/pkg/id"
+	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
 func (s *AppServer) commentInputFromStaff(actor *domain.User, parent domain.Comment, md string, clientIP string) content.CreateCommentInput {
@@ -538,6 +539,7 @@ func (s *AppServer) handleAdminImportLegacy(w http.ResponseWriter, r *http.Reque
 	if !s.requireSameOrigin(w, r) {
 		return
 	}
+	extendStreamingDeadlines(w, 15*time.Minute)
 	prep, err := s.spoolLegacyImportUpload(w, r)
 	if writeBadErr(w, err) {
 		return
@@ -1255,11 +1257,27 @@ func (s *AppServer) handleAdminFollows(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	if rest == "items" && r.Method == http.MethodGet {
-		groups, _ := s.deps.Content.ListFollowsWithItems(r.Context(), 50)
-		if groups == nil {
-			groups = []content.FollowGroup{}
+		page, perPage := parseAdminPageParams(r, 10, 50)
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		itemsPerFollow := 20
+		if rawIPF := strings.TrimSpace(r.URL.Query().Get("items_per_follow")); rawIPF != "" {
+			if n, err := strconv.Atoi(rawIPF); err == nil && n > 0 {
+				itemsPerFollow = n
+			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+		if itemsPerFollow > 50 {
+			itemsPerFollow = 50
+		}
+		pagedGroups, totalValidGroups, _ := s.deps.Content.ListFollowsWithItemsSearchPage(r.Context(), q, page, perPage, itemsPerFollow)
+		if pagedGroups == nil {
+			pagedGroups = []content.FollowGroup{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"groups":   pagedGroups,
+			"total":    totalValidGroups,
+			"page":     page,
+			"per_page": perPage,
+		})
 		return
 	}
 	if rest == "" {
@@ -2754,6 +2772,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	}
 
 	if rest == "install" && r.Method == http.MethodPost {
+		extendStreamingDeadlines(w, 15*time.Minute)
 		files, fields, mErr := readMultipartInMemoryFiles(w, r, 32<<20, 32<<20, 2)
 		if mErr != nil {
 			writeErrJSON(w, http.StatusBadRequest, mErr.Error())
@@ -2797,6 +2816,7 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 	parts := strings.Split(rest, "/")
 	themeID := strings.TrimSpace(parts[0])
 	if len(parts) == 2 && (parts[1] == "export" || parts[1] == "export.zip") && r.Method == http.MethodGet {
+		extendStreamingDeadlines(w, 15*time.Minute)
 		if s.deps.Themes == nil || !s.deps.Themes.Has(themeID) {
 			writeErrJSON(w, http.StatusNotFound, "theme not found: "+themeID)
 			return
@@ -3148,30 +3168,30 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 	}
 
 	if rest == "install" && r.Method == http.MethodPost {
-		files, fields, mErr := readMultipartInMemoryFiles(w, r, 32<<20, 32<<20, 2)
+		extendStreamingDeadlines(w, 15*time.Minute)
+		uploaded, mErr := streamMultipartSingleFile(w, r, "", plugin.MaxZipArchiveBytes, s.ensureTempDir(), "volo-plugin-install-", ".zip", ".zip")
 		if mErr != nil {
 			writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 			return
 		}
-		var uf *inMemoryMultipartFile
-		for i := range files {
-			if files[i].FieldName == "file" || uf == nil {
-				uf = &files[i]
-				if files[i].FieldName == "file" {
-					break
-				}
-			}
-		}
-		if uf == nil {
-			writeErrJSON(w, http.StatusBadRequest, "missing 'file' field")
-			return
-		}
-		owRaw := strings.TrimSpace(fields["overwrite"])
+		defer os.Remove(uploaded.TempPath)
+		owRaw := strings.TrimSpace(uploaded.FormFields["overwrite"])
 		if owRaw == "" {
 			owRaw = strings.TrimSpace(r.URL.Query().Get("overwrite"))
 		}
 		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
-		sum, iErr := s.deps.Plugins.InstallFromZip(r.Context(), bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite, locale)
+		zf, oErr := os.Open(uploaded.TempPath)
+		if oErr != nil {
+			writeErrJSON(w, http.StatusInternalServerError, oErr.Error())
+			return
+		}
+		defer zf.Close()
+		zStat, sErr := zf.Stat()
+		if sErr != nil {
+			writeErrJSON(w, http.StatusInternalServerError, sErr.Error())
+			return
+		}
+		sum, iErr := s.deps.Plugins.InstallFromZip(r.Context(), zf, zStat.Size(), overwrite, locale)
 		if iErr != nil {
 			if !overwrite && isAlreadyExistsInstallErr(iErr) {
 				writeErrJSON(w, http.StatusConflict, iErr.Error())
@@ -3190,19 +3210,39 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 	if len(parts) == 2 {
 		switch {
 		case (parts[1] == "export" || parts[1] == "export.zip") && r.Method == http.MethodGet:
-			var buf bytes.Buffer
-			if err := s.deps.Plugins.ExportZip(pid, &buf); err != nil {
-				if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			extendStreamingDeadlines(w, 15*time.Minute)
+			tmpFile, tErr := os.CreateTemp(s.ensureTempDir(), "volo-plugin-export-*.zip")
+			if tErr != nil {
+				writeErrJSON(w, http.StatusInternalServerError, tErr.Error())
+				return
+			}
+			tmpPath := tmpFile.Name()
+			defer os.Remove(tmpPath)
+			if err := s.deps.Plugins.ExportZip(pid, tmpFile); err != nil {
+				_ = tmpFile.Close()
+				if strings.Contains(strings.ToLower(err.Error()), "not found") || os.IsNotExist(err) {
 					writeErrJSON(w, http.StatusNotFound, err.Error())
 				} else {
 					writeErrJSON(w, http.StatusBadRequest, err.Error())
 				}
 				return
 			}
+			if _, skErr := tmpFile.Seek(0, io.SeekStart); skErr != nil {
+				_ = tmpFile.Close()
+				writeErrJSON(w, http.StatusInternalServerError, skErr.Error())
+				return
+			}
+			st, stErr := tmpFile.Stat()
+			if stErr != nil {
+				_ = tmpFile.Close()
+				writeErrJSON(w, http.StatusInternalServerError, stErr.Error())
+				return
+			}
+			defer tmpFile.Close()
 			s.recordAuditLog(r, actor, "plugin.export", "plugin", pid, nil)
 			w.Header().Set("Content-Type", "application/zip")
 			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.zip"`, pid))
-			_, _ = w.Write(buf.Bytes())
+			http.ServeContent(w, r, pid+".zip", st.ModTime(), tmpFile)
 		case parts[1] == "enable" && r.Method == http.MethodPost:
 			if writeBadErr(w, s.deps.Plugins.Enable(r.Context(), pid)) {
 				return
@@ -3268,8 +3308,19 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			list := s.deps.Plugins.List(locale)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum, "items": list, "plugins": list})
 		case parts[1] == "logs" && r.Method == http.MethodGet:
-			entries, _ := s.deps.Plugins.Logger().Tail(pid, 100)
-			writeJSON(w, http.StatusOK, map[string]any{"items": entries})
+			limit := 100
+			if rawLim := strings.TrimSpace(r.URL.Query().Get("limit")); rawLim != "" {
+				if n, err := strconv.Atoi(rawLim); err == nil {
+					if n < 1 {
+						n = 1
+					} else if n > 500 {
+						n = 500
+					}
+					limit = n
+				}
+			}
+			entries, _ := s.deps.Plugins.Logger().Tail(pid, limit)
+			writeJSON(w, http.StatusOK, map[string]any{"items": entries, "limit": limit})
 		case parts[1] == "logs" && r.Method == http.MethodDelete:
 			if lgr := s.deps.Plugins.Logger(); lgr != nil {
 				if writeBadErr(w, lgr.ClearLogs(pid)) {
@@ -3833,7 +3884,7 @@ func (s *AppServer) syncConfiguredUploadDir() {
 
 // syncConfiguredGeoIPDir applies the persisted `security.geoip_dir` setting (validated against
 // workspace containment boundaries) to Config and atomically hot-reloads GeoEngine offline databases,
-// unless GeoIPDir was explicitly pinned via CLI flag, OS ENV, or `.env`.
+// unless GeoIPDir was explicitly pinned via CLI flag (`--geoip-dir`).
 func (s *AppServer) syncConfiguredGeoIPDir() error {
 	if s == nil || s.deps.Config == nil {
 		return nil
@@ -4527,6 +4578,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			Note           *string `json:"note"`
 			ExpiresMinutes *int    `json:"expires_minutes"`
 			ExpiresHours   *int    `json:"expires_hours"`
+			Occurrences    *int    `json:"occurrences"`
 			Reban          bool    `json:"reban"`
 		}
 		if !decodeJSONBody(w, r, 8192, &req) {
@@ -4553,7 +4605,9 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 		}
 		nextOcc := existing.Occurrences
 		wasExpired := existing.ExpiresAt > 0 && existing.ExpiresAt <= nowMS
-		if req.Reban && wasExpired && (nextExp == 0 || nextExp > nowMS) {
+		if req.Occurrences != nil {
+			nextOcc = max(0, min(*req.Occurrences, 1000000))
+		} else if req.Reban && wasExpired && (nextExp == 0 || nextExp > nowMS) {
 			nextOcc = existing.Occurrences + 1
 		}
 		if _, err := s.deps.Store.ExecContext(r.Context(),
@@ -4572,7 +4626,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 		if req.Reban {
 			act = "security.ip_ban_reban"
 		}
-		s.recordAuditLog(r, actor, act, "ip_ban", banID, map[string]any{"cidr": existing.CIDR, "expires_at": nextExp})
+		s.recordAuditLog(r, actor, act, "ip_ban", banID, map[string]any{"cidr": existing.CIDR, "expires_at": nextExp, "occurrences": nextOcc})
 		enriched := s.enrichIPBanViews([]domain.SecurityIPBan{existing})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ban": enriched[0]})
 		return
@@ -4590,31 +4644,27 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
-func normalizeGeoAction(raw string) string {
+func normalizeGeoAction(raw string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "allow":
-		return "allow"
-	case "block":
-		return "block"
-	case "challenge":
-		return "challenge"
+		return "allow", true
+	case "", "deny", "block":
+		return "deny", true
 	default:
-		return "deny"
+		return "", false
 	}
 }
 
-func normalizeGeoOnMiss(raw string) string {
+func normalizeGeoOnMiss(raw string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "next":
+		return "next", true
 	case "allow":
-		return "allow"
-	case "deny":
-		return "deny"
-	case "block":
-		return "block"
-	case "challenge":
-		return "challenge"
+		return "allow", true
+	case "deny", "block":
+		return "deny", true
 	default:
-		return "next"
+		return "", false
 	}
 }
 
@@ -4724,8 +4774,18 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			}
 			in.ID = id.Next()
 			in.Name = strings.TrimSpace(in.Name)
-			in.Action = normalizeGeoAction(in.Action)
-			in.OnMiss = normalizeGeoOnMiss(in.OnMiss)
+			act, ok := normalizeGeoAction(in.Action)
+			if !ok {
+				writeErrJSON(w, http.StatusBadRequest, "unsupported geo rule action (allowed: allow, deny, block)")
+				return
+			}
+			onMiss, ok := normalizeGeoOnMiss(in.OnMiss)
+			if !ok {
+				writeErrJSON(w, http.StatusBadRequest, "unsupported geo rule on_miss (allowed: next, allow, deny, block)")
+				return
+			}
+			in.Action = act
+			in.OnMiss = onMiss
 			now := time.Now().UnixMilli()
 			in.CreatedAt = now
 			in.UpdatedAt = now
@@ -4765,8 +4825,18 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		in.Name = strings.TrimSpace(in.Name)
-		in.Action = normalizeGeoAction(in.Action)
-		in.OnMiss = normalizeGeoOnMiss(in.OnMiss)
+		act, ok := normalizeGeoAction(in.Action)
+		if !ok {
+			writeErrJSON(w, http.StatusBadRequest, "unsupported geo rule action (allowed: allow, deny, block)")
+			return
+		}
+		onMiss, ok := normalizeGeoOnMiss(in.OnMiss)
+		if !ok {
+			writeErrJSON(w, http.StatusBadRequest, "unsupported geo rule on_miss (allowed: next, allow, deny, block)")
+			return
+		}
+		in.Action = act
+		in.OnMiss = onMiss
 		now := time.Now().UnixMilli()
 		if _, err := s.deps.Store.ExecContext(r.Context(),
 			`UPDATE security_geo_rules SET name = ?, is_enabled = ?, action = ?, on_miss = ?, countries = ?, regions = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
@@ -4802,6 +4872,7 @@ func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	extendStreamingDeadlines(w, 15*time.Minute)
 	withMedia := r.URL.Query().Get("media") == "1" || r.URL.Query().Get("media") == "true" ||
 		r.URL.Query().Get("include_media") == "1" || r.URL.Query().Get("include_media") == "true"
 	filename := fmt.Sprintf("volo-backup-%s.zip", time.Now().UTC().Format("20060102-150405"))
@@ -4872,6 +4943,7 @@ func (s *AppServer) serveLocalBackupArchive(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.recordAuditLog(r, actor, "backup.local_download", "system", clean, nil)
+	extendStreamingDeadlines(w, 15*time.Minute)
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, clean))
 	http.ServeContent(w, r, clean, info.ModTime(), f)
@@ -4886,6 +4958,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, map[string]any{"items": s.listLocalBackups(backupDir)})
 		case http.MethodPost:
+			extendStreamingDeadlines(w, 15*time.Minute)
 			sched := s.deps.BackupScheduler
 			if sched == nil {
 				sched = backup.NewScheduler(backup.SchedulerOptions{
@@ -4965,6 +5038,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 	}
 
 	if len(parts) == 2 && parts[1] == "restore" && r.Method == http.MethodPost {
+		extendStreamingDeadlines(w, 15*time.Minute)
 		base := filepath.Base(parts[0])
 		if base != parts[0] || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
 			writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
@@ -5084,6 +5158,7 @@ func isLegacyArchiveFile(archivePath string) bool {
 }
 
 func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Request, actor *domain.User) {
+	extendStreamingDeadlines(w, 15*time.Minute)
 	const maxRestoreUpload = 512 << 20
 	uploaded, sErr := streamMultipartSingleFile(w, r, "file", maxRestoreUpload, s.ensureTempDir(), "volo-restore-", ".zip", ".zip", ".json")
 	if sErr != nil {

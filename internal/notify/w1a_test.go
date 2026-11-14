@@ -105,3 +105,62 @@ func TestMailer_SMTPTargetIPSSRFValidation(t *testing.T) {
 		t.Fatalf("expected public IP to be allowed in tls mode: %v", err)
 	}
 }
+
+func TestDispatcher_PostPermalinkStyleClosure(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(tmp, "notify-permalink.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatal(err)
+	}
+	kr, _, err := config.LoadOrInitKeyRing(strings.Repeat("p", 32), tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := repo.NewSettingsManager(store, kr, "zh-CN")
+	if _, err := sm.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Seed article with published_at = 2026-05-15T12:00:00Z (1778846400000 ms)
+	const pubMS int64 = 1778846400000
+	if _, err := store.ExecContext(ctx,
+		`INSERT INTO articles (id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md, cover_url, status, published_at, scheduled_at, is_pinned, allow_comment, password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes, audio_mime, lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count, created_at, updated_at)
+		 VALUES ('art-1', 'u1', '', 'Permalink Post', 'hello-style', '', '', 'Body', '', 'published', ?, 0, ?, ?, '', ?, '', 0, 0, '', 'zh-CN', '', '', 1, 1, 0, 0, ?, ?)`,
+		pubMS, false, true, false, pubMS, pubMS); err != nil {
+		t.Fatal(err)
+	}
+
+	disp := NewDispatcher(DispatcherOptions{
+		Store:     store,
+		Keys:      kr,
+		Settings:  sm,
+		PublicURL: "https://blog.example.com",
+	})
+	defer func() { _ = disp.Close(ctx) }()
+
+	for _, tc := range []struct {
+		style    string
+		wantPath string
+	}{
+		{domain.PermalinkStyleShortP, "/p/hello-style"},
+		{domain.PermalinkStyleArchives, "/archives/hello-style"},
+		{domain.PermalinkStyleYearMonth, "/2026/05/hello-style"},
+		{domain.PermalinkStylePosts, "/posts/hello-style"},
+	} {
+		patchSEO, _ := json.Marshal(map[string]any{"post_permalink_style": tc.style})
+		if _, _, err := sm.PatchDomain(ctx, domain.SettingsDomainSEO, patchSEO, 0); err != nil {
+			t.Fatal(err)
+		}
+		_, gotPath := disp.resolveTargetTitleAndPath(ctx, domain.TargetTypeArticle, "art-1")
+		if gotPath != tc.wantPath {
+			t.Fatalf("resolveTargetTitleAndPath(style=%s) = %q, want %q", tc.style, gotPath, tc.wantPath)
+		}
+	}
+}

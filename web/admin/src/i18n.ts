@@ -386,22 +386,37 @@ export function getLocaleDir(code?: string): string {
   );
 }
 
-export function tFor(locale: string, keyOrIdx: string | number, vars?: Record<string, string | number>): string {
+export function tOptFor(
+  locale: string,
+  keyOrIdx: string | number,
+  vars?: Record<string, string | number>
+): string | undefined {
   void catalogVersionSig.value;
-  const key = typeof keyOrIdx === "number" ? (bundledKeys[keyOrIdx] ?? String(keyOrIdx)) : keyOrIdx;
+  const key = typeof keyOrIdx === "number" ? bundledKeys[keyOrIdx] : keyOrIdx;
+  if (!key) return undefined;
   const isZh = locale.toLowerCase().startsWith("zh");
   let tpl =
     catalogs[locale]?.[key] ??
     (isZh
       ? catalogs["zh-CN"]?.[key] ?? catalogs["en-US"]?.[key]
-      : catalogs["en-US"]?.[key] ?? catalogs["zh-CN"]?.[key]) ??
-    key;
+      : catalogs["en-US"]?.[key] ?? catalogs["zh-CN"]?.[key]);
+  if (tpl === undefined) return undefined;
   if (vars) {
     for (const [k, v] of Object.entries(vars)) {
       tpl = tpl.replaceAll(`{${k}}`, String(v));
     }
   }
   return tpl;
+}
+
+export function tOpt(keyOrIdx: string | number, vars?: Record<string, string | number>): string | undefined {
+  return tOptFor(localeSig.value, keyOrIdx, vars);
+}
+
+export function tFor(locale: string, keyOrIdx: string | number, vars?: Record<string, string | number>): string {
+  const found = tOptFor(locale, keyOrIdx, vars);
+  if (found !== undefined) return found;
+  return typeof keyOrIdx === "number" ? (bundledKeys[keyOrIdx] ?? String(keyOrIdx)) : keyOrIdx;
 }
 
 export function t(key: string | number, vars?: Record<string, string | number>): string {
@@ -416,147 +431,46 @@ export function formatDateTime(val?: number | string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-const BACKUP_TABLE_KEYS: Record<string, string> = {
-  settings: "bak.tbl.settings",
-  users: "bak.tbl.users",
-  user_credentials: "bak.tbl.user_credentials",
-  user_sessions: "bak.tbl.user_sessions",
-  api_tokens: "bak.tbl.api_tokens",
-  categories: "bak.tbl.categories",
-  tags: "bak.tbl.tags",
-  articles: "bak.tbl.articles",
-  article_tags: "bak.tbl.article_tags",
-  article_revisions: "bak.tbl.revisions",
-  revisions: "bak.tbl.revisions",
-  article_backlinks: "bak.tbl.article_backlinks",
-  pages: "bak.tbl.pages",
-  nav_items: "bak.tbl.nav_items",
-  series: "bak.tbl.series",
-  series_articles: "bak.tbl.series_articles",
-  books: "bak.tbl.books",
-  book_chapters: "bak.tbl.book_chapters",
-  comments: "bak.tbl.comments",
-  reactions: "bak.tbl.reactions",
-  links: "bak.tbl.links",
-  follows: "bak.tbl.follows",
-  follow_items: "bak.tbl.follow_items",
-  media_assets: "bak.tbl.media_assets",
-  redirects: "bak.tbl.redirects",
-  webhooks: "bak.tbl.webhooks",
-  webhook_deliveries: "bak.tbl.webhook_deliveries",
-  analytics_daily: "bak.tbl.analytics_daily",
-  analytics_top_items: "bak.tbl.analytics_top_items",
-  security_ip_bans: "bak.tbl.security_ip_bans",
-  security_geo_rules: "bak.tbl.security_geo_rules",
-  audit_logs: "bak.tbl.audit_logs",
-  plugins: "bak.tbl.plugins",
-  plugin_kv: "bak.tbl.plugin_kv",
-};
-
 export function localizeBackupTable(name?: string): string {
   const raw = String(name || "").trim();
   if (!raw) return "";
-  const key = BACKUP_TABLE_KEYS[raw.toLowerCase()];
-  return key ? t(key) : raw;
+  const low = raw.toLowerCase();
+  return tOpt(`bak.tbl.${low === "article_revisions" ? "revisions" : low}`) ?? raw;
 }
 
-const AUDIT_RESOURCE_KEYS: Record<string, string> = {
-  article: "audit.res.article",
-  page: "audit.res.page",
-  category: "audit.res.category",
-  tag: "audit.res.tag",
-  series: "audit.res.series",
-  book: "audit.res.book",
-  comment: "audit.res.comment",
-  media_asset: "audit.res.media",
-  media: "audit.res.media",
-  user: "audit.res.user",
-  user_session: "audit.res.session",
-  user_credential: "audit.res.credential",
-  api_token: "audit.res.api_token",
-  settings: "audit.res.settings",
-  system: "audit.res.system",
-  theme: "audit.res.theme",
-  plugin: "audit.res.plugin",
-  locale: "audit.res.locale",
-  ip_ban: "audit.res.ip_ban",
-  geo_rule: "audit.res.geo_rule",
-  link: "audit.res.link",
-  follow: "audit.res.follow",
-  nav_item: "audit.res.nav",
-  nav: "audit.res.nav",
-  redirect: "audit.res.redirect",
-  webhook: "audit.res.webhook",
+const AUDIT_RES_ALIAS: Record<string, string> = {
+  media_asset: "media",
+  user_session: "session",
+  user_credential: "credential",
+  nav_item: "nav",
 };
 
 export function localizeAuditResource(res?: string): string {
   const raw = String(res || "").trim();
   if (!raw) return "";
-  const key = AUDIT_RESOURCE_KEYS[raw.toLowerCase()];
-  return key ? t(key) : raw;
+  const low = raw.toLowerCase();
+  return tOpt(`audit.res.${AUDIT_RES_ALIAS[low] || low}`) ?? raw;
 }
 
-const AUDIT_ACTION_KEYS: Record<string, string> = {
-  "auth.login": "audit.act.auth_login",
-  "auth.login_2fa": "audit.act.auth_login_2fa",
-  "auth.login_passkey": "audit.act.auth_login_passkey",
-  "auth.login_oidc": "audit.act.auth_login_oidc",
-  "auth.logout": "audit.act.auth_logout",
+const AUDIT_ACTION_KEYS: Record<string, string | number> = {
   "auth.password_change": "audit.act.auth_pwd_change",
   "reader.register_oidc": "audit.act.reader_reg_oidc",
-  "settings.patch": "audit.act.settings_patch",
-  "article.create": "audit.act.article_create",
-  "article.update": "audit.act.article_update",
-  "article.save": "audit.act.article_save",
-  "article.delete": "audit.act.article_delete",
-  "article.pin": "audit.act.article_pin",
-  "article.batch": "audit.act.article_batch",
   "article.batch_import": "audit.act.article_import",
-  "page.create": "audit.act.page_create",
-  "page.update": "audit.act.page_update",
-  "page.delete": "audit.act.page_delete",
-  "tags.cleanup": "audit.act.tags_cleanup",
-  "tags.merge": "audit.act.tags_merge",
   "tag.batch_delete": "audit.act.tag_batch_del",
   "comment.moderate": "audit.act.comment_mod",
   "comment.delete": "audit.act.comment_del",
-  "comment.batch": "audit.act.comment_batch",
-  "media.upload": "audit.act.media_upload",
-  "media.delete": "audit.act.media_delete",
   "media.batch_delete": "audit.act.media_batch_del",
-  "media.reconcile": "audit.act.media_reconcile",
   "media.orphans_clean": "audit.act.media_clean",
-  "backup.export": "audit.act.backup_export",
   "backup.export_ticket": "audit.act.backup_ticket",
-  "backup.restore": "audit.act.backup_restore",
   "backup.restore_legacy": "audit.act.backup_restore_leg",
   "backup.import_legacy": "audit.act.backup_import_leg",
   "backup.local_snapshot": "audit.act.backup_snap",
   "backup.local_restore": "audit.act.backup_snap_res",
   "backup.local_delete": "audit.act.backup_snap_del",
-  "user.create": "audit.act.user_create",
-  "user.update": "audit.act.user_update",
-  "user.delete": "audit.act.user_delete",
-  "plugin.install": "audit.act.plugin_install",
-  "plugin.update": "audit.act.plugin_update",
-  "plugin.enable": "audit.act.plugin_enable",
-  "plugin.disable": "audit.act.plugin_disable",
-  "plugin.reload": "audit.act.plugin_reload",
-  "plugin.clear_kv": "audit.act.plugin_clear_kv",
   "plugin.config_patch": "audit.act.plugin_cfg",
-  "plugin.export": "audit.act.plugin_export",
   "plugin.priority": "audit.act.plugin_prio",
-  "plugin.reorder": "audit.act.plugin_reorder",
   "plugin.cron_trigger": "audit.act.plugin_cron",
-  "plugin.uninstall": "audit.act.plugin_uninstall",
-  "theme.activate": "audit.act.theme_activate",
-  "theme.install": "audit.act.theme_install",
-  "theme.export": "audit.act.theme_export",
-  "theme.config": "audit.act.theme_config",
-  "theme.uninstall": "audit.act.theme_uninstall",
-  "locale.install": "audit.act.locale_install",
   "locale.install_zip": "audit.act.locale_zip",
-  "locale.delete": "audit.act.locale_delete",
   "security.ban": "audit.act.sec_ban",
   "security.waf_auto_ban": "audit.act.sec_auto_ban",
   "security.waf_404_probe": "audit.act.sec_404_probe",
@@ -579,29 +493,28 @@ const AUDIT_ACTION_KEYS: Record<string, string> = {
   "security.oidc_link": "audit.act.sec_oidc_link",
   "security.oidc_unlink": "audit.act.sec_oidc_unlink",
   "security.rotate_share_secret": "audit.act.sec_rot_share",
-  "link.batch": "audit.act.link_batch",
-  "link.check": "audit.act.link_check",
   "follow.import_opml": "audit.act.follow_opml",
   "follow.sync_single": "audit.act.follow_sync",
   "redirect.import": "audit.act.redir_import",
   "redirect.batch_delete": "audit.act.redir_batch_del",
-  "webhook.replay": "audit.act.webhook_replay",
   "github.publish_showcase": "audit.act.gh_publish",
   "system.clear_runtime_logs": "audit.act.sys_clear_logs",
 };
 
-const WAF_REASON_KEYS: Record<string, string> = {
+const WAF_REASON_KEYS: Record<string, string | number> = {
   scanner_trap: "sys.waf_reason_scanner_trap",
-  script_scan: "sys.waf_reason_script_scan",
-  sensitive_probe: "sys.waf_reason_sensitive_probe",
-  env_probe: "sys.waf_reason_sensitive_probe",
-  git_probe: "sys.waf_reason_sensitive_probe",
   wp_probe: "sys.waf_reason_scanner_trap",
   xmlrpc_probe: "sys.waf_reason_scanner_trap",
   admin_probe: "sys.waf_reason_scanner_trap",
   setup_probe: "sys.waf_reason_scanner_trap",
   honeypot_trap: "sys.waf_reason_scanner_trap",
+  sensitive_probe: "sys.waf_reason_sensitive_probe",
+  env_probe: "sys.waf_reason_sensitive_probe",
+  git_probe: "sys.waf_reason_sensitive_probe",
   bot_probe: "sys.waf_reason_malicious_ua",
+  malicious_ua: "sys.waf_reason_malicious_ua",
+  ua_block: "sys.waf_reason_malicious_ua",
+  bad_bot: "sys.waf_reason_malicious_ua",
   manual_ban: "sys.waf_reason_manual_ban",
   manual: "sys.waf_reason_manual_ban",
   admin_ban: "sys.waf_reason_manual_ban",
@@ -616,6 +529,12 @@ const WAF_REASON_KEYS: Record<string, string> = {
   directory_traversal: "sys.waf_reason_path_traversal",
   lfi_probe: "sys.waf_reason_path_traversal",
   rfi_probe: "sys.waf_reason_exploit_probe",
+  exploit_probe: "sys.waf_reason_exploit_probe",
+  payload_attack: "sys.waf_reason_exploit_probe",
+  sql_injection: "sys.waf_reason_exploit_probe",
+  sqli: "sys.waf_reason_exploit_probe",
+  xss_probe: "sys.waf_reason_exploit_probe",
+  xss: "sys.waf_reason_exploit_probe",
   rate_abuse: "sys.waf_reason_rate_abuse",
   rate_limit: "sys.waf_reason_rate_abuse",
   burst_limit: "sys.waf_reason_rate_abuse",
@@ -625,31 +544,20 @@ const WAF_REASON_KEYS: Record<string, string> = {
   auth_fail: "sys.waf_reason_login_fail",
   brute_force: "sys.waf_reason_login_fail",
   login_bruteforce: "sys.waf_reason_login_fail",
-  two_factor_fail: "sys.waf_reason_two_factor_fail",
-  unlock_fail: "sys.waf_reason_unlock_fail",
   comment_spam: "sys.waf_reason_comment_spam",
   comment_ip_ban: "sys.waf_reason_comment_spam",
   honeypot: "sys.waf_reason_comment_spam",
-  malicious_ua: "sys.waf_reason_malicious_ua",
-  ua_block: "sys.waf_reason_malicious_ua",
-  bad_bot: "sys.waf_reason_malicious_ua",
-  exploit_probe: "sys.waf_reason_exploit_probe",
-  payload_attack: "sys.waf_reason_exploit_probe",
-  sql_injection: "sys.waf_reason_exploit_probe",
-  sqli: "sys.waf_reason_exploit_probe",
-  xss_probe: "sys.waf_reason_exploit_probe",
-  xss: "sys.waf_reason_exploit_probe",
   geo_block: "sys.waf_reason_geo_block",
   geo_deny: "sys.waf_reason_geo_block",
-  pow_fail: "sys.waf_reason_pow_fail",
-  csrf_fail: "sys.waf_reason_csrf_fail",
 };
 
 export function localizeAuditAction(act?: string): string {
   const raw = String(act || "").trim();
   if (!raw) return "";
-  const key = AUDIT_ACTION_KEYS[raw.toLowerCase()];
-  return key ? t(key) : raw;
+  const low = raw.toLowerCase();
+  const key = AUDIT_ACTION_KEYS[low];
+  if (key !== undefined) return t(key);
+  return tOpt(`audit.act.${low.replace(/\./g, "_")}`) ?? raw;
 }
 
 export function localizeWafReason(code?: string): string {
@@ -659,5 +567,6 @@ export function localizeWafReason(code?: string): string {
   const unwrapped = autoMatch ? autoMatch[1] : orig;
   const cleaned = unwrapped.replace(/^auto[-_ ]?ban\s*:\s*/i, "").trim().toLowerCase();
   const key = WAF_REASON_KEYS[cleaned];
-  return key ? t(key) : orig;
+  if (key !== undefined) return t(key);
+  return tOpt(`sys.waf_reason_${cleaned}`) ?? orig;
 }

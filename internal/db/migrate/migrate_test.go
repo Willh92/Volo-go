@@ -224,6 +224,10 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		"idx_media_uploader_created",
 		"idx_audit_actor_created",
 		"idx_audit_action_created",
+		// V9 comments, follows, and series composite indexes
+		"idx_comments_del_updated",
+		"idx_follows_sort_created",
+		"idx_series_sort_created",
 	}
 
 	rows, err := sqlx.Select[struct {
@@ -245,13 +249,13 @@ func TestQueryIndexesAndNoDuplicateIndexCollision(t *testing.T) {
 		t.Fatalf("duplicate index idx_media_created should have been dropped in V6")
 	}
 
-	// Verify V8 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
+	// Verify V9 schema version recorded and execIdempotentAddColumn pre-checks existing columns cleanly
 	var maxVer int
 	if err := store.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 8 || CurrentSchemaVersion != 8 {
-		t.Fatalf("expected schema version 8, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
+	if maxVer != 9 || CurrentSchemaVersion != 9 {
+		t.Fatalf("expected schema version 9, got maxVer=%d CurrentSchemaVersion=%d", maxVer, CurrentSchemaVersion)
 	}
 	for _, col := range []string{"ban_until", "muted_until", "ban_reason", "shield_comments", "shield_text"} {
 		exists, cErr := columnExists(ctx, store, "users", col)

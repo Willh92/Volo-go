@@ -4810,6 +4810,7 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 	}
 
 	if (rest == "upload" || rest == "") && r.Method == http.MethodPost {
+		extendStreamingDeadlines(w, 15*time.Minute)
 		maxMB := s.deps.Settings.Snapshot().Storage.MaxUploadMB
 		if maxMB <= 0 {
 			maxMB = 25

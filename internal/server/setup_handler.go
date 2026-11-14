@@ -856,6 +856,7 @@ func (s *AppServer) handleSetupImportLegacy(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Spool the multipart upload BEFORE acquiring s.setupMu so slow clients cannot block concurrent wizard calls.
+	extendStreamingDeadlines(w, 15*time.Minute)
 	prep, err := s.spoolLegacyImportUpload(w, r)
 	if writeBadErr(w, err) {
 		return
@@ -1704,6 +1705,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		writeErrJSON(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
+	extendStreamingDeadlines(w, 15*time.Minute)
 
 	var req struct {
 		Driver               string `json:"driver"`

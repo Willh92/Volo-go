@@ -2,7 +2,7 @@
 
 > English version: [Architecture & Performance Internals](../en-US/architecture.md)
 
-`Volo-go` 是从零构建的现代纯 Go（`CGO_ENABLED=0`，Go `1.27.4`，`GOEXPERIMENT=nojsonv2`）独立主权博客引擎，核心设计目标是在**全部 6 大发布目标平台均严格 `< 21 MiB` 的静态单二进制**（`linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`）与 **`< 35 MiB` 常驻内存 (`VmRSS`)** 的严格边界内，提供三方言存储支持、实时无损图片变换、10 大出口零死角隐私防护、纯 Go ES6 插件沙箱与微秒级高并发吞吐。
+`Volo-go` 是从零构建的现代纯 Go（`CGO_ENABLED=0`，Go `1.27.4`，`GOEXPERIMENT=nojsonv2`）独立主权博客引擎，核心设计目标是在**全部 6 大发布目标平台 `< 22 MiB` 的静态单二进制**（`linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64` 实测 `~19.4–20.2 MiB`）与 **`< 35 MiB` 常驻内存 (`VmRSS`)** 的克制边界内，提供三方言存储支持、实时无损图片变换、10 大出口零死角隐私防护、纯 Go ES6 插件沙箱与微秒级高并发吞吐。
 
 ---
 
@@ -46,9 +46,9 @@
 
 ---
 
-## 2. 正规化数据模型（`v8` Schema：33 张业务数据表 + 9 大设置域）
+## 2. 正规化数据模型（`v9` Schema：33 张业务数据表 + 9 大设置域）
 
-`Volo-go` 彻底摒弃了传统博客“利用键值表分片硬塞业务大 JSON”与“文章必须经由标签间接绑定分类”的反范式包袱，建立清晰的正规化关系模型（位于 `internal/db/migrate/schema.go`，当前 Schema 版本 **`v8`**，由 `schema_migrations` 跟踪 `v1`–`v8` 幂等演进，`CanonicalTables` 共包含 **33 张业务数据表**）：
+`Volo-go` 彻底摒弃了传统博客“利用键值表分片硬塞业务大 JSON”与“文章必须经由标签间接绑定分类”的反范式包袱，建立清晰的正规化关系模型（位于 `internal/db/migrate/schema.go`，当前 Schema 版本 **`v9`**，由 `schema_migrations` 跟踪 `v1`–`v9` 幂等演进，`CanonicalTables` 共包含 **33 张业务数据表**）：
 
 | 领域 | 数据表（共 33 张业务表 + `schema_migrations`） | 设计要点 |
 | :--- | :--- | :--- |
@@ -64,7 +64,7 @@
 | 设置域 (`domain`) | 核心职责与代表配置项 |
 | :--- | :--- |
 | `site` | 站点标题/副标题、默认语言、时区、公告栏、社交链接、版权模板、自定义全局变量 `custom_vars` |
-| `reading` | 列表样式 `list_style`（`summary \| title_only \| full`）、分页条数、PJAX、即时搜索、评论准入与智能审核、按身份动态评论字数/最大行数（`comment_min_length`、`comment_max_length_{guest,user,staff}`、`comment_max_lines_{guest,user,staff}`）、动态 PoW 难度、CDN 前缀 |
+| `reading` | 列表样式 `list_style`（`summary \| title_only \| full`）、分页条数、PJAX、即时搜索、评论准入与智能审核、按身份动态评论字数/最大行数（`comment_min_length`、`comment_max_length_{guest,user,staff}`、`comment_max_lines_{guest,user,staff}`）、可配单 IP 评论限流（`comment_rate_window_seconds`、`comment_rate_max_count`）、动态 PoW 难度、CDN 前缀 |
 | `feed` | RSS/Atom 输出模式（摘要/全文）、条目上限 `item_count`（同步覆盖 RSS/Atom/Podcast）、`/llms.txt` 开关、`.md` 原始视图开关、播客（`podcast`）频道元数据 |
 | `seo` | 默认关键词/描述、默认 OG 图、4 种文章固定链接模板 `post_permalink_style`（`/posts/{slug}`、`/archives/{slug}`、`/p/{slug}`、`/{year}/{month}/{slug}`，修改即时刷新缓存与检索索引）、IndexNow 密钥、GitHub 展示缓存 |
 | `storage` | 活跃存储驱动（`local \| s3`）、本地上传目录 `local_dir`、最大上传体积 `max_upload_mb`、EXIF 剥离、自适应 WebP 质量、S3/R2/MinIO 连接与加密 `s3_secret_key` |

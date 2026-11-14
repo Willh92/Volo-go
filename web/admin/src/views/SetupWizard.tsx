@@ -190,10 +190,17 @@ export function SetupWizard() {
           });
         }
         if (s.timezone) setTimezone(s.timezone);
-        if (s.accent) {
-          setAccent(s.accent);
-          applyThemeAttributes(themeModeSig.value, s.accent, false);
+        const nextAccent = s.accent || accentSig.value;
+        if (s.accent) setAccent(s.accent);
+        let hasExplicitLocal = false;
+        try {
+          hasExplicitLocal = Boolean(localStorage.getItem("volo_theme_mode"));
+        } catch {
+          /* ignore */
         }
+        const srvMode = s.default_mode || s.default_theme;
+        const nextMode = !hasExplicitLocal && srvMode ? String(srvMode) : themeModeSig.value;
+        applyThemeAttributes(nextMode, nextAccent, false);
         setCheckingLock(false);
       } catch {
         if (!cancelled) setCheckingLock(false);

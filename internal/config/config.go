@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -175,7 +176,8 @@ func (c *Config) GetDefaultUploadDir() string {
 	return c.UploadDir
 }
 
-// IsUploadDirPinned reports whether UploadDir was explicitly pinned via CLI flag, OS environment, or .env file.
+// IsUploadDirPinned reports whether UploadDir was explicitly pinned via CLI flag (--upload-dir).
+// Directory precedence: CLI Flags (--upload-dir) > Admin Console DB Settings (storage.local_dir) > OS ENV / .env > Built-in Defaults.
 func (c *Config) IsUploadDirPinned() bool {
 	if c == nil {
 		return false
@@ -229,7 +231,8 @@ func (c *Config) GetDefaultGeoIPDir() string {
 	return c.GeoIPDir
 }
 
-// IsGeoIPDirPinned reports whether GeoIPDir was explicitly pinned via CLI flag, OS environment, or .env file.
+// IsGeoIPDirPinned reports whether GeoIPDir was explicitly pinned via CLI flag (--geoip-dir).
+// Directory precedence: CLI Flags (--geoip-dir) > Admin Console DB Settings (security.geoip_dir) > OS ENV / .env > Built-in Defaults.
 func (c *Config) IsGeoIPDirPinned() bool {
 	if c == nil {
 		return false
@@ -257,6 +260,63 @@ func (c *Config) SetGeoIPDir(dir string) {
 	c.mu.Unlock()
 }
 
+func hasWindowsReservedDeviceName(normSlash string) bool {
+	parts := strings.Split(normSlash, "/")
+	for i, seg := range parts {
+		if seg == "" {
+			continue
+		}
+		if i == 0 && len(seg) == 2 && seg[1] == ':' && ((seg[0] >= 'a' && seg[0] <= 'z') || (seg[0] >= 'A' && seg[0] <= 'Z')) {
+			continue
+		}
+		base := strings.TrimRight(seg, " .")
+		if idx := strings.IndexAny(base, ".:"); idx >= 0 {
+			base = base[:idx]
+		}
+		switch strings.ToUpper(strings.TrimSpace(base)) {
+		case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+			"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+			"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+			return true
+		}
+	}
+	return false
+}
+
+func checkCustomPathSystemRoots(absTarget string, fieldName string, allowUsrShareGeoIP bool) error {
+	vol := filepath.VolumeName(absTarget)
+	noVol := strings.ToLower(filepath.ToSlash(absTarget[len(vol):]))
+	allowedSysGeoShare := allowUsrShareGeoIP && (noVol == "/usr/share/geoip" || strings.HasPrefix(noVol, "/usr/share/geoip/"))
+	if !allowedSysGeoShare {
+		for _, sysRoot := range []string{
+			"/etc", "/proc", "/sys", "/dev", "/boot", "/root", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/run", "/var/run",
+		} {
+			if noVol == sysRoot || strings.HasPrefix(noVol, sysRoot+"/") {
+				return fmt.Errorf("config: %s cannot target system directory %q", fieldName, sysRoot)
+			}
+		}
+	}
+
+	lowTarget := strings.ToLower(filepath.ToSlash(filepath.Clean(absTarget)))
+	winRoots := []string{
+		"c:/windows", "c:/program files", "c:/program files (x86)", "c:/programdata",
+	}
+	for _, envKey := range []string{"SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"} {
+		if ev := strings.TrimSpace(os.Getenv(envKey)); ev != "" {
+			norm := strings.TrimRight(strings.ToLower(filepath.ToSlash(filepath.Clean(ev))), "/")
+			if norm != "" && norm != "." && norm != "/" {
+				winRoots = append(winRoots, norm)
+			}
+		}
+	}
+	for _, winRoot := range winRoots {
+		if lowTarget == winRoot || strings.HasPrefix(lowTarget, winRoot+"/") {
+			return fmt.Errorf("config: %s cannot target system directory %q", fieldName, winRoot)
+		}
+	}
+	return nil
+}
+
 // ValidateCustomGeoIPPath ensures a custom GeoIP directory or .mmdb/.xdb file path does not traverse "..",
 // target sensitive OS roots, or overlap with public upload/protected workspace directories.
 func (c *Config) ValidateCustomGeoIPPath(rawPath string) (string, error) {
@@ -269,15 +329,27 @@ func (c *Config) ValidateCustomGeoIPPath(rawPath string) (string, error) {
 			return "", errors.New("config: geoip_dir contains control characters")
 		}
 	}
+	if strings.HasPrefix(trimmed, `\\`) {
+		return "", errors.New("config: geoip_dir cannot use UNC network paths")
+	}
 	normSlash := strings.ReplaceAll(trimmed, `\`, "/")
 	for _, seg := range strings.Split(normSlash, "/") {
 		if seg == ".." {
 			return "", errors.New("config: geoip_dir must not contain '..' segments")
 		}
 	}
+	if hasWindowsReservedDeviceName(normSlash) {
+		return "", errors.New("config: geoip_dir contains a reserved device name")
+	}
 	cleaned := filepath.Clean(trimmed)
+	if strings.HasPrefix(cleaned, `\\`) || strings.HasPrefix(filepath.VolumeName(cleaned), `\\`) {
+		return "", errors.New("config: geoip_dir cannot use UNC network paths")
+	}
 	if cleaned == "." || cleaned == ".." || cleaned == "/" || cleaned == `\` {
 		return "", errors.New("config: geoip_dir must point to a dedicated GeoIP directory or .mmdb/.xdb file")
+	}
+	if !filepath.IsAbs(cleaned) {
+		return "", errors.New("config: geoip_dir must be an explicit absolute path")
 	}
 	absTarget, err := filepath.Abs(cleaned)
 	if err != nil {
@@ -286,17 +358,8 @@ func (c *Config) ValidateCustomGeoIPPath(rawPath string) (string, error) {
 	if filepath.Dir(absTarget) == absTarget {
 		return "", errors.New("config: geoip_dir cannot be filesystem root")
 	}
-	lowTarget := strings.ToLower(filepath.ToSlash(absTarget))
-	allowedSysGeoShare := lowTarget == "/usr/share/geoip" || strings.HasPrefix(lowTarget, "/usr/share/geoip/")
-	if !allowedSysGeoShare {
-		for _, sysRoot := range []string{
-			"/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/run", "/var/run",
-			"c:/windows", "c:/program files", "c:/program files (x86)",
-		} {
-			if lowTarget == sysRoot || strings.HasPrefix(lowTarget, sysRoot+"/") {
-				return "", fmt.Errorf("config: geoip_dir cannot target system directory %q", sysRoot)
-			}
-		}
+	if err := checkCustomPathSystemRoots(absTarget, "geoip_dir", true); err != nil {
+		return "", err
 	}
 
 	// Pure lexical extension check (zero filesystem syscalls on user-supplied path strings;
@@ -377,15 +440,27 @@ func (c *Config) ValidateCustomUploadDir(rawDir string) (string, error) {
 			return "", errors.New("config: local_dir contains control characters")
 		}
 	}
+	if strings.HasPrefix(trimmed, `\\`) {
+		return "", errors.New("config: local_dir cannot use UNC network paths")
+	}
 	normSlash := strings.ReplaceAll(trimmed, `\`, "/")
 	for _, seg := range strings.Split(normSlash, "/") {
 		if seg == ".." {
 			return "", errors.New("config: local_dir must not contain '..' segments")
 		}
 	}
+	if hasWindowsReservedDeviceName(normSlash) {
+		return "", errors.New("config: local_dir contains a reserved device name")
+	}
 	cleaned := filepath.Clean(trimmed)
+	if strings.HasPrefix(cleaned, `\\`) || strings.HasPrefix(filepath.VolumeName(cleaned), `\\`) {
+		return "", errors.New("config: local_dir cannot use UNC network paths")
+	}
 	if cleaned == "." || cleaned == ".." || cleaned == "/" || cleaned == `\` {
 		return "", errors.New("config: local_dir must point to a dedicated media directory")
+	}
+	if !filepath.IsAbs(cleaned) {
+		return "", errors.New("config: local_dir must be an explicit absolute path")
 	}
 	absTarget, err := filepath.Abs(cleaned)
 	if err != nil {
@@ -394,14 +469,8 @@ func (c *Config) ValidateCustomUploadDir(rawDir string) (string, error) {
 	if filepath.Dir(absTarget) == absTarget {
 		return "", errors.New("config: local_dir cannot be filesystem root")
 	}
-	lowTarget := strings.ToLower(filepath.ToSlash(absTarget))
-	for _, sysRoot := range []string{
-		"/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/run", "/var/run",
-		"c:/windows", "c:/program files", "c:/program files (x86)",
-	} {
-		if lowTarget == sysRoot || strings.HasPrefix(lowTarget, sysRoot+"/") {
-			return "", fmt.Errorf("config: local_dir cannot target system directory %q", sysRoot)
-		}
+	if err := checkCustomPathSystemRoots(absTarget, "local_dir", false); err != nil {
+		return "", err
 	}
 
 	var protected []string
@@ -834,6 +903,15 @@ func ParseSocketMode(modeStr string) (os.FileMode, error) {
 	return os.FileMode(parsed), nil
 }
 
+func unixSocketMaxPathBytes() int {
+	switch runtime.GOOS {
+	case "darwin", "freebsd", "openbsd", "netbsd":
+		return 103
+	default:
+		return 107
+	}
+}
+
 // ParseListenSocketSpec parses "/run/volo/volo.sock,0660" (matching bolo-solo's strict socket permission semantics).
 // Missing or empty permission after a single comma defaults to 0660; extra commas or non-octal permissions fail fast.
 func ParseListenSocketSpec(raw string) (*ListenSocketSpec, error) {
@@ -845,8 +923,9 @@ func ParseListenSocketSpec(raw string) (*ListenSocketSpec, error) {
 	if sockPath == "" {
 		return nil, errors.New("config: VOLO_LISTEN_SOCKET path must not be empty")
 	}
-	if len(sockPath) > 100 {
-		return nil, fmt.Errorf("config: VOLO_LISTEN_SOCKET path %q exceeds 100-byte POSIX sun_path limit", sockPath)
+	maxBytes := unixSocketMaxPathBytes()
+	if len(sockPath) > maxBytes {
+		return nil, fmt.Errorf("config: VOLO_LISTEN_SOCKET path %q (%d bytes) exceeds %d-byte sun_path limit", sockPath, len(sockPath), maxBytes)
 	}
 	perm := DefaultUnixSocketPerm
 	if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {

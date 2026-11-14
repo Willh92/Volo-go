@@ -14,7 +14,7 @@
 
 旧版备份包中存在大量历史包袱（如 10KB 字符串分片表、标签间接推导分类、裸口令哈希与 `.html` 固定链接）。`Volo-go` 的流式解析器（`json.Decoder` 逐条消费，不将大包读入内存）在单次导入事务中自动完成以下转换：
 
-| 旧版历史结构 | `Volo-go` 正规化落库目标（`v8` Schema） | 迁移行为说明 |
+| 旧版历史结构 | `Volo-go` 正规化落库目标（`v9` Schema） | 迁移行为说明 |
 | :--- | :--- | :--- |
 | 分片键值文档（专题、书架、每日统计、Webhook） | `series`、`series_articles`、`books`、`book_chapters`、`analytics_daily`、`webhooks` | 自动拼合还原多片 JSON 并拆入具备外键约束的正规关系表 |
 | `category` + `category_tag` + `tag_article` 间接归类 | `articles.category_id` + `article_tags` | 自动通过文章关联标签反向推导主分类并直接绑定至文章，同时保留全部自由标签 |
@@ -22,6 +22,7 @@
 | 自定义导航栏与独立链接 | `nav_items` 与 `pages` | 完整保留顶部导航顺序、图标与新窗口属性 |
 | 老文章路径（如 `/articles/2021/05/12/1620812.html`） | `articles.legacy_permalink` + `redirects` | 新系统生成干净 Slug 的同时将原路径写入 `legacy_permalink`；访问旧 `.html` URL 自动触发 `O(1)` 内存路由返回 **`301 Moved Permanently`** 跳转至规范地址，SEO 权重零流失 |
 | 旧版 `PBKDF2` / 历史密码哈希 | `users.legacy_hash` -> `Argon2id` | 导入后老用户无需重置密码，首次成功登录时自动在后台静默升级为 `Argon2id` 并擦除 `legacy_hash` |
+| 旧版 `plugins` 状态与 `kanbanniangSelector` 模型配置 | `plugins`（`id="kanbanniang"`） | 自动保留原站点看板娘插件启用/停用状态，并将所选的 26 套 Live2D 模型 ID 白名单校验后写入 `config_json`（未知/退役模型名自动安全回退为 `"random"`） |
 
 ### 1.2 迁移操作步骤（CLI 或 Web 向导二选一）
 
@@ -60,7 +61,7 @@
 
 ```text
 volo-backup-20261108-010000.zip
-├── manifest.json                 # 记录 format、schema_version (v8)、source_dialect 及每个流的字节数、行数与 SHA-256
+├── manifest.json                 # 记录 format、schema_version (v9)、source_dialect 及每个流的字节数、行数与 SHA-256
 ├── tables/
 │   ├── 01_settings.ndjson        # 按外键依赖顺序排列的 33 张业务表数据库无关 NDJSON 行流
 │   ├── 02_users.ndjson

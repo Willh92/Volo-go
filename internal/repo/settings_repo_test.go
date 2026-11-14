@@ -207,3 +207,60 @@ func TestSecurityRiskControlAndRetentionSettingsNormalization(t *testing.T) {
 	}
 }
 
+func TestReadingCommentRateSettingsNormalization(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	kr, _, err := config.LoadOrInitKeyRing("unit-test-master-secret-key-2026", tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(tmpDir, "reading_rate.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewSettingsManager(store, kr, "zh-CN")
+	def := mgr.Snapshot().Reading
+	if def.CommentRateWindowSeconds != 60 || def.CommentRateMaxCount != 12 {
+		t.Fatalf("unexpected default comment rate settings: window=%d max=%d", def.CommentRateWindowSeconds, def.CommentRateMaxCount)
+	}
+
+	// Positive below minimum window (1 -> 5) and negative max count (-5 -> 0) clamp safely.
+	if _, _, err := mgr.PatchDomain(ctx, "reading", []byte(`{"comment_rate_window_seconds":1,"comment_rate_max_count":-5}`), 0); err != nil {
+		t.Fatalf("PatchDomain(reading clamp low): %v", err)
+	}
+	got := mgr.Snapshot().Reading
+	if got.CommentRateWindowSeconds != 5 || got.CommentRateMaxCount != 0 {
+		t.Fatalf("expected low clamp window=5 max=0, got window=%d max=%d", got.CommentRateWindowSeconds, got.CommentRateMaxCount)
+	}
+
+	// Non-positive window (<= 0) falls back to default 60; excessive max clamps to 10000.
+	if _, _, err := mgr.PatchDomain(ctx, "reading", []byte(`{"comment_rate_window_seconds":0,"comment_rate_max_count":999999}`), 0); err != nil {
+		t.Fatalf("PatchDomain(reading clamp high/default): %v", err)
+	}
+	got = mgr.Snapshot().Reading
+	if got.CommentRateWindowSeconds != 60 || got.CommentRateMaxCount != 10000 {
+		t.Fatalf("expected window=60 max=10000, got window=%d max=%d", got.CommentRateWindowSeconds, got.CommentRateMaxCount)
+	}
+
+	// Excessive window clamps to 86400; explicit max_count=0 is preserved as unlimited and survives Reload.
+	if _, _, err := mgr.PatchDomain(ctx, "reading", []byte(`{"comment_rate_window_seconds":999999,"comment_rate_max_count":0}`), 0); err != nil {
+		t.Fatalf("PatchDomain(reading unlimited): %v", err)
+	}
+	mgr2 := NewSettingsManager(store, kr, "zh-CN")
+	if _, err := mgr2.Reload(ctx); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	got2 := mgr2.Snapshot().Reading
+	if got2.CommentRateWindowSeconds != 86400 || got2.CommentRateMaxCount != 0 {
+		t.Fatalf("expected persisted window=86400 max=0, got window=%d max=%d", got2.CommentRateWindowSeconds, got2.CommentRateMaxCount)
+	}
+}
+

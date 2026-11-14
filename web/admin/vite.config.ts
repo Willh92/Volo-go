@@ -68,17 +68,56 @@ function compactLocalesPlugin(): Plugin {
     },
     transform(code, id) {
       const cleanId = id.split("?")[0].replaceAll("\\", "/");
-      if (!cleanId.includes("/src/") || (!cleanId.endsWith(".ts") && !cleanId.endsWith(".tsx")) || cleanId.endsWith("/src/i18n.ts")) {
+      if (!cleanId.includes("/src/") || (!cleanId.endsWith(".ts") && !cleanId.endsWith(".tsx"))) {
         return null;
       }
       const keyMap = getKeyIndexMap();
       let changed = false;
-      const out = code.replace(/(?<![A-Za-z0-9_$?.])t\(\s*(["'])([A-Za-z0-9_.-]+)\1(?=\s*[,)])/g, (full, _q, key: string) => {
-        const idx = keyMap.get(key);
-        if (idx === undefined) return full;
-        changed = true;
-        return `t(${idx}`;
-      });
+      let out = code;
+      if (!cleanId.endsWith("/src/i18n.ts")) {
+        out = out
+          .replace(/(?<![A-Za-z0-9_$?.])t\(\s*(["'])([A-Za-z0-9_.-]+)\1(?=\s*[,)])/g, (full, _q, key: string) => {
+            const idx = keyMap.get(key);
+            if (idx === undefined) return full;
+            changed = true;
+            return `t(${idx}`;
+          })
+          .replace(
+            /(?<![A-Za-z0-9_$?.])t\(\s*([^?()\n]+?\?)\s*(["'])([A-Za-z0-9_.-]+)\2\s*:\s*(["'])([A-Za-z0-9_.-]+)\4(?=\s*[,)])/g,
+            (full, cond: string, _q1, k1: string, _q2, k2: string) => {
+              const i1 = keyMap.get(k1);
+              const i2 = keyMap.get(k2);
+              if (i1 === undefined || i2 === undefined) return full;
+              changed = true;
+              return `t(${cond}${i1}:${i2}`;
+            }
+          )
+          .replace(
+            /(?<![A-Za-z0-9_$?.])tFor\(\s*([^,()\n]+?)\s*,\s*(["'])([A-Za-z0-9_.-]+)\2(?=\s*[,)])/g,
+            (full, locExpr: string, _q, key: string) => {
+              const idx = keyMap.get(key);
+              if (idx === undefined) return full;
+              changed = true;
+              return `tFor(${locExpr},${idx}`;
+            }
+          );
+      }
+      if (
+        cleanId.endsWith("/src/i18n.ts") ||
+        cleanId.endsWith("/src/api.ts") ||
+        cleanId.endsWith("/src/main.tsx") ||
+        cleanId.endsWith("/src/components/UIControls.tsx")
+      ) {
+        out = out.replace(
+          /([:[,]\s*)(["'])((?:bak\.tbl\.|audit\.res\.|audit\.act\.|sys\.waf_reason_|api\.err_|nav\.|dp\.[mw])[A-Za-z0-9_.-]+)\2/g,
+          (full, prefix: string, _q, key: string) => {
+            const idx = keyMap.get(key);
+            if (idx === undefined) return full;
+            changed = true;
+            return `${prefix}${idx}`;
+          }
+        );
+      }
       return changed ? { code: out, map: null } : null;
     },
     configureServer(server) {
@@ -178,6 +217,7 @@ export default defineConfig({
         safari: (17 << 16) | (5 << 8),
         chrome: 124 << 16,
         firefox: 125 << 16,
+        edge: 124 << 16,
       },
     },
   },
@@ -194,13 +234,23 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: false,
     target: "es2022",
+    cssTarget: ["chrome124", "firefox125", "safari17.5", "edge124"],
     cssCodeSplit: false,
     modulePreload: false,
     chunkSizeWarningLimit: 1000,
     rolldownOptions: {
       output: {
-        entryFileNames: "assets/index-[hash].js",
-        chunkFileNames: "assets/editor-[hash].js",
+        entryFileNames: "assets/index.js",
+        chunkFileNames: (chunkInfo) => {
+          if (chunkInfo.name === "CM6EditorCore") return "assets/editor.js";
+          if (chunkInfo.name === "SetupWizard") return "assets/setup.js";
+          return "assets/[name].js";
+        },
+        assetFileNames: (assetInfo) => {
+          const name = assetInfo.names?.[0] || assetInfo.name || "";
+          if (name.endsWith(".css")) return "assets/style[extname]";
+          return "assets/[name][extname]";
+        },
       },
     },
   },

@@ -208,6 +208,7 @@ func (e *Engine) RenderComment(markdown string) string {
 		rendered = strings.ReplaceAll(rendered, "<p>"+token+"</p>", fragment)
 		rendered = strings.ReplaceAll(rendered, token, fragment)
 	}
+	rendered = enhanceBarePreCodeBlocks(rendered, false, true)
 	rendered = wrapTablesInScroll(rendered)
 	return e.ensureCommentSanitizer().Sanitize(rendered)
 }
@@ -461,6 +462,12 @@ func (e *Engine) Render(markdownSrc string, opts Options) Output {
 		rendered = strings.ReplaceAll(rendered, token, fragment)
 	}
 
+	// Upgrade 4-space indented Markdown code blocks and bare HTML <pre><code> blocks with Chroma syntax highlighting.
+	rendered = enhanceBarePreCodeBlocks(rendered, opts.ShowLineNumbers, false)
+	if !prep.needsMermaid && strings.Contains(rendered, `<pre class="mermaid">`) {
+		prep.needsMermaid = true
+	}
+
 	// Transform GitHub-flavored Alerts (> [!NOTE], > [!TIP], > [!IMPORTANT], > [!WARNING], > [!CAUTION]) into .volo-callout blocks.
 	rendered = transformGitHubAlerts(rendered, opts.Locale)
 
@@ -554,6 +561,131 @@ type preprocessResult struct {
 
 var attrPairRe = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'\]:]+))`)
 
+var (
+	barePreCodeRe  = regexp.MustCompile(`(?is)<pre(\s(?:"[^"]*"|'[^']*'|[^'">])*)?>\s*<code(\s(?:"[^"]*"|'[^']*'|[^'">])*)?>([\s\S]*?)</code>\s*</pre>`)
+	bareCodeLangRe = regexp.MustCompile(`(?i)(?:data-lang\s*=\s*["']?([a-zA-Z0-9_+#.-]+)|\b(?:language|lang)-([a-zA-Z0-9_+#.-]+))`)
+)
+
+// unescapeSemicolonEntities decodes ONLY semicolon-terminated HTML/XML character references
+// (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, `&apos;`, `&#123;`, `&#x1F680;`, and standard `&name;`),
+// never corrupting query parameters such as `?a=1&copy=2&reg=3&times=4`.
+func unescapeSemicolonEntities(s string) string {
+	if !strings.Contains(s, "&") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	last := 0
+	n := len(s)
+	for i := 0; i < n; {
+		if s[i] != '&' {
+			i++
+			continue
+		}
+		k := i + 1
+		valid := false
+		if k < n && s[k] == '#' {
+			k++
+			if k < n && (s[k] == 'x' || s[k] == 'X') {
+				k++
+				start := k
+				for k < n && k-start <= 8 && ((s[k] >= '0' && s[k] <= '9') || (s[k] >= 'a' && s[k] <= 'f') || (s[k] >= 'A' && s[k] <= 'F')) {
+					k++
+				}
+				valid = k > start && k < n && s[k] == ';'
+			} else {
+				start := k
+				for k < n && k-start <= 8 && s[k] >= '0' && s[k] <= '9' {
+					k++
+				}
+				valid = k > start && k < n && s[k] == ';'
+			}
+		} else {
+			start := k
+			for k < n && k-start <= 32 && ((s[k] >= 'a' && s[k] <= 'z') || (s[k] >= 'A' && s[k] <= 'Z') || (s[k] >= '0' && s[k] <= '9')) {
+				k++
+			}
+			valid = k > start && k < n && s[k] == ';'
+		}
+		if !valid {
+			i++
+			continue
+		}
+		tok := s[i : k+1]
+		var decoded string
+		switch tok {
+		case "&amp;", "&AMP;":
+			decoded = "&"
+		case "&lt;", "&LT;":
+			decoded = "<"
+		case "&gt;", "&GT;":
+			decoded = ">"
+		case "&quot;", "&QUOT;", "&#34;", "&#x22;", "&#X22;":
+			decoded = `"`
+		case "&#39;", "&#x27;", "&#X27;", "&apos;", "&APOS;":
+			decoded = "'"
+		default:
+			decoded = html.UnescapeString(tok)
+		}
+		if decoded == tok {
+			i = k + 1
+			continue
+		}
+		if i > last {
+			b.WriteString(s[last:i])
+		}
+		b.WriteString(decoded)
+		i = k + 1
+		last = i
+	}
+	if last == 0 {
+		return s
+	}
+	if last < n {
+		b.WriteString(s[last:])
+	}
+	return b.String()
+}
+
+func enhanceBarePreCodeBlocks(rawHTML string, withLineNumbers bool, forComment bool) string {
+	if !strings.Contains(rawHTML, "<pre") && !strings.Contains(rawHTML, "<PRE") {
+		return rawHTML
+	}
+	return barePreCodeRe.ReplaceAllStringFunc(rawHTML, func(match string) string {
+		m := barePreCodeRe.FindStringSubmatch(match)
+		if len(m) < 4 {
+			return match
+		}
+		preAttrsLower := strings.ToLower(m[1])
+		codeAttrsLower := strings.ToLower(m[2])
+		if strings.Contains(preAttrsLower, "chroma") || strings.Contains(preAttrsLower, "mermaid") || strings.Contains(codeAttrsLower, "chroma") {
+			return match
+		}
+		inner := m[3]
+		lang := ""
+		if lm := bareCodeLangRe.FindStringSubmatch(m[2] + " " + m[1]); len(lm) >= 3 {
+			if lm[1] != "" {
+				lang = strings.ToLower(lm[1])
+			} else if lm[2] != "" {
+				lang = strings.ToLower(lm[2])
+			}
+		}
+		if lang == "mermaid" && !forComment {
+			rawCode := strings.TrimSuffix(unescapeSemicolonEntities(inner), "\n")
+			return `<pre class="mermaid">` + html.EscapeString(rawCode) + `</pre>`
+		}
+		innerLower := strings.ToLower(inner)
+		if strings.Contains(innerLower, `<span class="tok-`) || strings.Contains(innerLower, "volo-code-block") || strings.Contains(innerLower, "volo-codeblock") {
+			return match
+		}
+		rawCode := strings.TrimSuffix(unescapeSemicolonEntities(inner), "\n")
+		if forComment {
+			return highlightCommentCodeChroma(rawCode, lang)
+		}
+		return highlightCodeChroma(rawCode, lang, withLineNumbers)
+	})
+}
+
 func preprocessCommentCodeBlocks(src string) (string, map[string]string) {
 	normalized := strings.ReplaceAll(src, "\r\n", "\n")
 	lines := strings.Split(normalized, "\n")
@@ -575,14 +707,20 @@ func preprocessCommentCodeBlocks(src string) (string, map[string]string) {
 				}
 				i++
 				var codeLines []string
+				brokeQuote := false
 				for i < len(lines) {
-					if closeRest, cLineOk := parseChildBlockLine(lines[i], info.activeIndent); cLineOk {
-						if cCh, cLen, cOk := parseFenceStart(closeRest); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(closeRest[cLen:]) == "" {
+					cl := parseChildBlockLine(lines[i], info.quoteDepth, info.activeIndent, info.stripCols)
+					if cl.quoteBroken {
+						brokeQuote = true
+						break
+					}
+					if cl.quoteOK && cl.indentOK {
+						if cCh, cLen, cOk := parseFenceStart(cl.trimmed); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(cl.trimmed[cLen:]) == "" {
 							i++
 							break
 						}
 					}
-					codeLines = append(codeLines, stripBlockPrefixCols(lines[i], info.quoteDepth, info.stripCols))
+					codeLines = append(codeLines, cl.stripped)
 					i++
 				}
 				seq++
@@ -592,6 +730,9 @@ func preprocessCommentCodeBlocks(src string) (string, map[string]string) {
 					outLines = append(outLines, "", tok, "")
 				} else {
 					outLines = append(outLines, info.openPrefix+tok)
+					if brokeQuote {
+						outLines = append(outLines, "")
+					}
 				}
 				continue
 			}
@@ -682,6 +823,17 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 	inHTMLComment := false
 	inRawPre := false
 
+	lastCommentCloseLine := -1
+	lastPreCloseLine := -1
+	for idx := len(lines) - 1; idx >= 0 && (lastCommentCloseLine < 0 || lastPreCloseLine < 0); idx-- {
+		if lastCommentCloseLine < 0 && strings.Contains(lines[idx], "-->") {
+			lastCommentCloseLine = idx
+		}
+		if lastPreCloseLine < 0 && findCaseInsensitivePreCloseEnd(lines[idx]) >= 0 {
+			lastPreCloseLine = idx
+		}
+	}
+
 	processProseSegment := func(seg string) string {
 		if seg == "" {
 			return ""
@@ -749,7 +901,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 						outLines = append(outLines, line[:closeEnd]+processProseSegment(tail))
 					}
 				} else {
-					if hasClosingHTMLComment(lines[i+1:]) {
+					if i < lastCommentCloseLine {
 						inHTMLComment = true
 					}
 					outLines = append(outLines, line)
@@ -772,7 +924,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 							outLines = append(outLines, line[:closeEnd]+processProseSegment(tail))
 						}
 					} else {
-						if hasClosingPreTag(lines[i+1:]) {
+						if i < lastPreCloseLine {
 							inRawPre = true
 						}
 						outLines = append(outLines, line)
@@ -793,13 +945,17 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				i++
 				var codeLines []string
 				for i < len(lines) {
-					if closeRest, cLineOk := parseChildBlockLine(lines[i], info.activeIndent); cLineOk {
-						if cCh, cLen, cOk := parseFenceStart(closeRest); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(closeRest[cLen:]) == "" {
+					cl := parseChildBlockLine(lines[i], info.quoteDepth, info.activeIndent, info.stripCols)
+					if cl.quoteBroken {
+						break
+					}
+					if cl.quoteOK && cl.indentOK {
+						if cCh, cLen, cOk := parseFenceStart(cl.trimmed); cOk && cCh == ch && cLen >= fenceLen && strings.TrimSpace(cl.trimmed[cLen:]) == "" {
 							i++
 							break
 						}
 					}
-					codeLines = append(codeLines, stripBlockPrefixCols(lines[i], info.quoteDepth, info.stripCols))
+					codeLines = append(codeLines, cl.stripped)
 					i++
 				}
 				codeBody := strings.Join(codeLines, "\n")
@@ -838,8 +994,16 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 
 				for i < len(lines) {
 					cur := lines[i]
-					strippedCur := stripBlockPrefixCols(cur, info.quoteDepth, info.stripCols)
-					if curRest, curOk := parseChildBlockLine(cur, info.activeIndent); curOk {
+					cl := parseChildBlockLine(cur, info.quoteDepth, info.activeIndent, info.stripCols)
+					if cl.quoteBroken {
+						// Enclosing blockquote terminated: seal locked content accumulated so far (fail-closed)
+						// and close this blockquote-scoped lock block BEFORE consuming the outer line!
+						rawFenceLines = append(rawFenceLines, ":::")
+						break
+					}
+					strippedCur := cl.stripped
+					if cl.quoteOK && cl.indentOK {
+						curRest := cl.trimmed
 						if fCh, fLen, fOk := parseFenceStart(curRest); fOk {
 							if !inInnerFence {
 								inInnerFence = true
@@ -959,7 +1123,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				rawBookMD := rest
 				i++
 				if !hasInlineClose && i < len(lines) {
-					if nextRest, nextOk := parseChildBlockLine(lines[i], info.activeIndent); nextOk && nextRest == ":::" {
+					if cl := parseChildBlockLine(lines[i], info.quoteDepth, info.activeIndent, -1); cl.quoteOK && cl.indentOK && cl.trimmed == ":::" {
 						rawBookMD += "\n:::"
 						i++
 					}
@@ -992,7 +1156,7 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 				rawShelfMD := rest
 				i++
 				if !hasInlineClose && i < len(lines) {
-					if nextRest, nextOk := parseChildBlockLine(lines[i], info.activeIndent); nextOk && nextRest == ":::" {
+					if cl := parseChildBlockLine(lines[i], info.quoteDepth, info.activeIndent, -1); cl.quoteOK && cl.indentOK && cl.trimmed == ":::" {
 						rawShelfMD += "\n:::"
 						i++
 					}
@@ -1056,10 +1220,10 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 
 			// 7. Single-line display/inline math, wiki-links, and subscripts (handling mid-line `<!--` / `<pre>` openings).
 			outLine, openedComment, openedPre := processInlineLineWithRawHTMLState(line, processProseSegment)
-			if openedComment && hasClosingHTMLComment(lines[i+1:]) {
+			if openedComment && i < lastCommentCloseLine {
 				inHTMLComment = true
 			}
-			if openedPre && hasClosingPreTag(lines[i+1:]) {
+			if openedPre && i < lastPreCloseLine {
 				inRawPre = true
 			}
 			outLines = append(outLines, outLine)
@@ -1074,24 +1238,6 @@ func preprocessDirectives(src string, opts Options) preprocessResult {
 
 	res.markdown = strings.Join(outLines, "\n")
 	return res
-}
-
-func hasClosingHTMLComment(lines []string) bool {
-	for _, ln := range lines {
-		if strings.Contains(ln, "-->") {
-			return true
-		}
-	}
-	return false
-}
-
-func hasClosingPreTag(lines []string) bool {
-	for _, ln := range lines {
-		if findCaseInsensitivePreCloseEnd(ln) >= 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func findCaseInsensitivePreCloseEnd(s string) int {
@@ -1448,13 +1594,43 @@ func (t *blockLineTracker) next(line string) blockLineInfo {
 	}
 }
 
-func parseChildBlockLine(line string, activeIndent int) (rest string, ok bool) {
-	_, pos := scanBlockquotePrefix(line)
-	col, indentBytes := measureLeadingIndent(line[pos:])
-	if col > activeIndent+3 {
-		return "", false
+type childBlockLine struct {
+	trimmed     string
+	stripped    string
+	quoteDepth  int
+	indent      int
+	quoteOK     bool // curQuoteDepth == expectedQuoteDepth
+	quoteBroken bool // curQuoteDepth < expectedQuoteDepth
+	indentOK    bool // quoteOK && indent <= activeIndent+3
+}
+
+func parseChildBlockLine(line string, expectedQuoteDepth int, activeIndent int, stripCols int) childBlockLine {
+	curQuoteDepth, allQuotePos := scanBlockquotePrefix(line)
+	if curQuoteDepth < expectedQuoteDepth {
+		return childBlockLine{
+			quoteDepth:  curQuoteDepth,
+			quoteBroken: true,
+		}
 	}
-	return strings.TrimRight(line[pos+indentBytes:], " \t\r"), true
+	var stripped string
+	if stripCols >= 0 {
+		stripped = stripBlockPrefixCols(line, expectedQuoteDepth, stripCols)
+	}
+	if curQuoteDepth > expectedQuoteDepth {
+		return childBlockLine{
+			stripped:   stripped,
+			quoteDepth: curQuoteDepth,
+		}
+	}
+	col, indentBytes := measureLeadingIndent(line[allQuotePos:])
+	return childBlockLine{
+		trimmed:    strings.TrimRight(line[allQuotePos+indentBytes:], " \t\r"),
+		stripped:   stripped,
+		quoteDepth: curQuoteDepth,
+		indent:     col,
+		quoteOK:    true,
+		indentOK:   col <= activeIndent+3,
+	}
 }
 
 func stripBlockPrefixCols(line string, quoteDepth int, stripCols int) string {
@@ -1535,8 +1711,13 @@ func scanCustomDirectiveBody(lines []string, openIdx int, info blockLineInfo, op
 
 	for j := openIdx + 1; j < len(lines); j++ {
 		cur := lines[j]
-		stripped := stripBlockPrefixCols(cur, info.quoteDepth, info.stripCols)
-		if curRest, curOk := parseChildBlockLine(cur, info.activeIndent); curOk {
+		cl := parseChildBlockLine(cur, info.quoteDepth, info.activeIndent, info.stripCols)
+		if cl.quoteBroken {
+			break
+		}
+		stripped := cl.stripped
+		if cl.quoteOK && cl.indentOK {
+			curRest := cl.trimmed
 			if fCh, fLen, fOk := parseFenceStart(curRest); fOk {
 				if !inInnerFence {
 					inInnerFence = true
@@ -1826,6 +2007,9 @@ func enhanceImages(htmlSrc string, lookupDims func(string) (int, int, bool), fir
 		if !strings.Contains(tag, "decoding=") {
 			attrs.WriteString(` decoding="async"`)
 		}
+		if (strings.HasPrefix(src, "https://") || strings.HasPrefix(src, "http://")) && !strings.Contains(tag, "referrerpolicy=") {
+			attrs.WriteString(` referrerpolicy="no-referrer"`)
+		}
 		if lookupDims != nil && !imgWidthRe.MatchString(tag) {
 			if w, h, ok := lookupDims(src); ok && w > 0 && h > 0 {
 				fmt.Fprintf(&attrs, ` width="%d" height="%d"`, w, h)
@@ -2030,26 +2214,32 @@ func tryExtractBlockMath(lines []string, startIdx int, info blockLineInfo, rest 
 
 	var middleLines []string
 	for j := startIdx + 1; j < len(lines); j++ {
-		if jRest, jOk := parseChildBlockLine(lines[j], info.activeIndent); jOk {
-			if _, _, fOk := parseFenceStart(jRest); fOk {
-				return "", 0, false
-			}
-			if strings.HasPrefix(jRest, ":::") {
-				return "", 0, false
-			}
+		cl := parseChildBlockLine(lines[j], info.quoteDepth, info.activeIndent, info.stripCols)
+		if cl.quoteBroken {
+			return "", 0, false
 		}
-		stripped := strings.TrimRight(stripBlockPrefixCols(lines[j], info.quoteDepth, info.stripCols), "\r")
-		if endPos := findUnescapedDelim(stripped, closeDelim); endPos >= 0 {
-			if strings.TrimSpace(stripped[endPos+len(closeDelim):]) == "" {
-				var parts []string
-				if strings.TrimSpace(firstAfterOpen) != "" {
-					parts = append(parts, firstAfterOpen)
+		stripped := strings.TrimRight(cl.stripped, "\r")
+		if cl.quoteOK {
+			if cl.indentOK {
+				if _, _, fOk := parseFenceStart(cl.trimmed); fOk {
+					return "", 0, false
 				}
-				parts = append(parts, middleLines...)
-				if strings.TrimSpace(stripped[:endPos]) != "" {
-					parts = append(parts, stripped[:endPos])
+				if strings.HasPrefix(cl.trimmed, ":::") {
+					return "", 0, false
 				}
-				return strings.Join(parts, "\n"), j + 1, true
+			}
+			if endPos := findUnescapedDelim(stripped, closeDelim); endPos >= 0 {
+				if strings.TrimSpace(stripped[endPos+len(closeDelim):]) == "" {
+					var parts []string
+					if strings.TrimSpace(firstAfterOpen) != "" {
+						parts = append(parts, firstAfterOpen)
+					}
+					parts = append(parts, middleLines...)
+					if strings.TrimSpace(stripped[:endPos]) != "" {
+						parts = append(parts, stripped[:endPos])
+					}
+					return strings.Join(parts, "\n"), j + 1, true
+				}
 			}
 		}
 		middleLines = append(middleLines, stripped)
@@ -2635,44 +2825,59 @@ func StripAllLockBlocks(src string) string {
 	var fenceChar byte
 	fenceLen := 0
 	fenceIndent := 0
+	fenceQuoteDepth := 0
 	inLock := false
 	lockNestDepth := 0
 	lockIndent := 0
+	lockQuoteDepth := 0
 
 	for _, line := range lines {
 		if inFence {
-			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
-				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
-					inFence = false
+			cl := parseChildBlockLine(line, fenceQuoteDepth, fenceIndent, -1)
+			if cl.quoteBroken {
+				inFence = false
+			} else {
+				if cl.quoteOK && cl.indentOK {
+					if ch, n, fOk := parseFenceStart(cl.trimmed); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(cl.trimmed[n:]) == "" {
+						inFence = false
+					}
 				}
+				if !inLock {
+					out = append(out, line)
+				}
+				continue
 			}
-			if !inLock {
-				out = append(out, line)
-			}
-			continue
 		}
 		if inLock {
-			if rest, ok := parseChildBlockLine(line, lockIndent); ok {
-				if ch, n, fOk := parseFenceStart(rest); fOk {
-					inFence = true
-					fenceChar = ch
-					fenceLen = n
-					fenceIndent = lockIndent
-					continue
-				}
-				if rest == ":::" {
-					if lockNestDepth > 0 {
-						lockNestDepth--
+			cl := parseChildBlockLine(line, lockQuoteDepth, lockIndent, -1)
+			if cl.quoteBroken {
+				inLock = false
+				lockNestDepth = 0
+			} else {
+				if cl.quoteOK && cl.indentOK {
+					rest := cl.trimmed
+					if ch, n, fOk := parseFenceStart(rest); fOk {
+						inFence = true
+						fenceChar = ch
+						fenceLen = n
+						fenceIndent = lockIndent
+						fenceQuoteDepth = lockQuoteDepth
 						continue
 					}
-					inLock = false
-					continue
+					if rest == ":::" {
+						if lockNestDepth > 0 {
+							lockNestDepth--
+							continue
+						}
+						inLock = false
+						continue
+					}
+					if isOpeningBlockDirective(rest) {
+						lockNestDepth++
+					}
 				}
-				if isOpeningBlockDirective(rest) {
-					lockNestDepth++
-				}
+				continue
 			}
-			continue
 		}
 
 		info := tracker.next(line)
@@ -2682,6 +2887,7 @@ func StripAllLockBlocks(src string) string {
 				fenceChar = ch
 				fenceLen = n
 				fenceIndent = info.activeIndent
+				fenceQuoteDepth = info.quoteDepth
 				out = append(out, line)
 				continue
 			}
@@ -2689,6 +2895,7 @@ func StripAllLockBlocks(src string) string {
 				inLock = true
 				lockNestDepth = 0
 				lockIndent = info.activeIndent
+				lockQuoteDepth = info.quoteDepth
 				continue
 			}
 		}
@@ -2707,14 +2914,20 @@ func StripAllCodeAndLockBlocks(src string) string {
 	var fenceChar byte
 	fenceLen := 0
 	fenceIndent := 0
+	fenceQuoteDepth := 0
 	for _, line := range lines {
 		if inFence {
-			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
-				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
-					inFence = false
+			cl := parseChildBlockLine(line, fenceQuoteDepth, fenceIndent, -1)
+			if cl.quoteBroken {
+				inFence = false
+			} else {
+				if cl.quoteOK && cl.indentOK {
+					if ch, n, fOk := parseFenceStart(cl.trimmed); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(cl.trimmed[n:]) == "" {
+						inFence = false
+					}
 				}
+				continue
 			}
-			continue
 		}
 		info := tracker.next(line)
 		if info.ok {
@@ -2723,6 +2936,7 @@ func StripAllCodeAndLockBlocks(src string) string {
 				fenceChar = ch
 				fenceLen = n
 				fenceIndent = info.activeIndent
+				fenceQuoteDepth = info.quoteDepth
 				continue
 			}
 		}
@@ -2740,16 +2954,22 @@ func ExtractAllLockPasswords(src string) []string {
 	var fenceChar byte
 	fenceLen := 0
 	fenceIndent := 0
+	fenceQuoteDepth := 0
 	var out []string
 	seen := make(map[string]struct{})
 	for _, line := range lines {
 		if inFence {
-			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
-				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
-					inFence = false
+			cl := parseChildBlockLine(line, fenceQuoteDepth, fenceIndent, -1)
+			if cl.quoteBroken {
+				inFence = false
+			} else {
+				if cl.quoteOK && cl.indentOK {
+					if ch, n, fOk := parseFenceStart(cl.trimmed); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(cl.trimmed[n:]) == "" {
+						inFence = false
+					}
 				}
+				continue
 			}
-			continue
 		}
 		info := tracker.next(line)
 		if !info.ok {
@@ -2760,6 +2980,7 @@ func ExtractAllLockPasswords(src string) []string {
 			fenceChar = ch
 			fenceLen = n
 			fenceIndent = info.activeIndent
+			fenceQuoteDepth = info.quoteDepth
 			continue
 		}
 		if isDirectivePrefix(info.rest, ":::lock") {
@@ -2797,14 +3018,20 @@ func ContainsLockDirective(src string) bool {
 	var fenceChar byte
 	fenceLen := 0
 	fenceIndent := 0
+	fenceQuoteDepth := 0
 	for _, line := range lines {
 		if inFence {
-			if rest, ok := parseChildBlockLine(line, fenceIndent); ok {
-				if ch, n, fOk := parseFenceStart(rest); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(rest[n:]) == "" {
-					inFence = false
+			cl := parseChildBlockLine(line, fenceQuoteDepth, fenceIndent, -1)
+			if cl.quoteBroken {
+				inFence = false
+			} else {
+				if cl.quoteOK && cl.indentOK {
+					if ch, n, fOk := parseFenceStart(cl.trimmed); fOk && ch == fenceChar && n >= fenceLen && strings.TrimSpace(cl.trimmed[n:]) == "" {
+						inFence = false
+					}
 				}
+				continue
 			}
-			continue
 		}
 		info := tracker.next(line)
 		if !info.ok {
@@ -2815,6 +3042,7 @@ func ContainsLockDirective(src string) bool {
 			fenceChar = ch
 			fenceLen = n
 			fenceIndent = info.activeIndent
+			fenceQuoteDepth = info.quoteDepth
 			continue
 		}
 		if isDirectivePrefix(info.rest, ":::lock") {

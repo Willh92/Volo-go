@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/guest"
 )
 
 func TestAdminIPBanLifecycleCommentBanDurationsAndLogClear(t *testing.T) {
@@ -65,6 +66,33 @@ func TestAdminIPBanLifecycleCommentBanDurationsAndLogClear(t *testing.T) {
 	_ = json.Unmarshal(patchRaw, &patched)
 	if patched.Ban.ExpiresAt != 0 || patched.Ban.Occurrences != 2 || patched.Ban.Note != "escalated to permanent" {
 		t.Fatalf("unexpected patched ban: %+v", patched.Ban)
+	}
+
+	// 3b. Explicit occurrences reset (0) and manual adjustment (7) via PATCH without forcing reban
+	resetResp, resetRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/security/ip-bans/"+created.Ban.ID, map[string]any{
+		"note":        "reset risk count",
+		"occurrences": 0,
+	}, adminCookies, adminHdrs)
+	if resetResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH ip-ban occurrences=0: %d %s", resetResp.StatusCode, string(resetRaw))
+	}
+	var resetBan struct {
+		Ban domain.SecurityIPBan `json:"ban"`
+	}
+	_ = json.Unmarshal(resetRaw, &resetBan)
+	if resetBan.Ban.Occurrences != 0 || resetBan.Ban.Note != "reset risk count" {
+		t.Fatalf("expected occurrences=0 after reset, got %+v", resetBan.Ban)
+	}
+
+	adjResp, adjRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/security/ip-bans/"+created.Ban.ID, map[string]any{
+		"occurrences": 7,
+	}, adminCookies, adminHdrs)
+	if adjResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH ip-ban occurrences=7: %d %s", adjResp.StatusCode, string(adjRaw))
+	}
+	_ = json.Unmarshal(adjRaw, &resetBan)
+	if resetBan.Ban.Occurrences != 7 {
+		t.Fatalf("expected occurrences=7 after manual adjustment, got %+v", resetBan.Ban)
 	}
 
 	// 4. Batch set_duration -> batch unban -> purge-expired
@@ -159,5 +187,93 @@ func TestAdminIPBanLifecycleCommentBanDurationsAndLogClear(t *testing.T) {
 	_ = json.Unmarshal(audListRaw, &audBody)
 	if audBody.Total != 0 {
 		t.Fatalf("expected 0 audit logs after DELETE /api/admin/audit-logs, got %d", audBody.Total)
+	}
+}
+
+func TestPublicCommentConfigurableRateLimit(t *testing.T) {
+	env, adminCookies, adminHdrs, _ := setupRound2Env(t)
+	hdrs := map[string]string{"Origin": env.ts.URL}
+	for k, v := range adminHdrs {
+		hdrs[k] = v
+	}
+
+	artResp, artRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/articles", map[string]any{
+		"title":         "Rate Limit Test Post",
+		"slug":          "rate-limit-test-post",
+		"summary_md":    "summary",
+		"content_md":    "Testing dynamic per-IP comment rate limit.",
+		"status":        "published",
+		"allow_comment": true,
+	}, adminCookies, hdrs)
+	if artResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create article = %d %s", artResp.StatusCode, string(artRaw))
+	}
+	var artBody struct {
+		Article domain.RawArticle `json:"article"`
+	}
+	_ = json.Unmarshal(artRaw, &artBody)
+	artID := artBody.Article.ID
+
+	// Configure per-IP rate limit to max 1 comment per 60s window
+	patchResp, patchRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/reading", map[string]any{
+		"comment_access_mode":         "all",
+		"comment_moderation_mode":     "off",
+		"pow_difficulty_bits":         8,
+		"comment_rate_window_seconds": 60,
+		"comment_rate_max_count":      1,
+	}, adminCookies, hdrs)
+	if patchResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH settings/reading = %d %s", patchResp.StatusCode, string(patchRaw))
+	}
+
+	guestHdrs := map[string]string{"Origin": env.ts.URL}
+	postGuestComment := func(author, body string) (*http.Response, []byte) {
+		t.Helper()
+		chalResp, chalRaw := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/v1/pow/challenge", nil, nil, nil)
+		if chalResp.StatusCode != http.StatusOK {
+			t.Fatalf("GET pow/challenge = %d %s", chalResp.StatusCode, string(chalRaw))
+		}
+		var chal guest.PoWChallenge
+		if err := json.Unmarshal(chalRaw, &chal); err != nil {
+			t.Fatal(err)
+		}
+		nonce := guest.SolveForTest(chal.Challenge, chal.DifficultyBits)
+		return doJSONReq(t, http.MethodPost, env.ts.URL+"/api/v1/comments", map[string]any{
+			"target_type":   "article",
+			"target_id":     artID,
+			"author_name":   author,
+			"content_md":    body,
+			"pow_challenge": chal.Challenge,
+			"pow_solution":  nonce,
+			"env_fp":        "1920x1080|2|Asia/Shanghai|zh-CN|8",
+		}, nil, guestHdrs)
+	}
+
+	c1Resp, c1Raw := postGuestComment("GuestOne", "First comment allowed within limit.")
+	if c1Resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 1st comment 201 Created, got %d %s", c1Resp.StatusCode, string(c1Raw))
+	}
+
+	c2Resp, c2Raw := postGuestComment("GuestTwo", "Second immediate comment should be rate-limited.")
+	if c2Resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 2nd comment 429 TooManyRequests, got %d %s", c2Resp.StatusCode, string(c2Raw))
+	}
+
+	// Switching max_count to 0 removes per-IP rate limiting immediately
+	patchUnlimResp, patchUnlimRaw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/reading", map[string]any{
+		"comment_rate_max_count": 0,
+	}, adminCookies, hdrs)
+	if patchUnlimResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH settings/reading unlimited = %d %s", patchUnlimResp.StatusCode, string(patchUnlimRaw))
+	}
+
+	c3Resp, c3Raw := postGuestComment("GuestThree", "Third comment succeeds once unlimited (max=0).")
+	if c3Resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 3rd comment 201 Created after max_count=0, got %d %s", c3Resp.StatusCode, string(c3Raw))
+	}
+
+	c4Resp, c4Raw := postGuestComment("GuestFour", "Fourth comment also succeeds when unlimited.")
+	if c4Resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 4th comment 201 Created after max_count=0, got %d %s", c4Resp.StatusCode, string(c4Raw))
 	}
 }

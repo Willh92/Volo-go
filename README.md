@@ -7,7 +7,7 @@
 
 **Pure-Go Sovereign Independent Blog Engine**
 
-`CGO_ENABLED=0` static single binary across 6 OS/Arch targets · Strictly **`< 21 MiB`** across all 6 targets · **`24.23 MiB` (< 35 MiB)** warm `VmRSS` · Native multi-dialect SQL (SQLite WAL / PostgreSQL / MySQL) · Real-time non-destructive ImageView (`?imageView2` + KV) · 10-surface zero-leakage privacy guard · 3-mode (`IR` / `WYSIWYG` / `SV`) Studio Editor & fullscreen Markdown comment composer
+`CGO_ENABLED=0` static single binary across 6 OS/Arch targets · **`~19.4–20.2 MiB`** (`< 22 MiB` gate) across all 6 targets · **`24.23 MiB` (< 35 MiB)** warm `VmRSS` · Native multi-dialect SQL (SQLite WAL / PostgreSQL / MySQL) · Real-time non-destructive ImageView (`?imageView2` + KV) · 10-surface zero-leakage privacy guard · 3-mode (`IR` / `WYSIWYG` / `SV`) Studio Editor & fullscreen Markdown comment composer
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) · [Changelog](./CHANGELOG.md) | [版本更新日志](./CHANGELOG.zh-CN.md)
 
@@ -17,11 +17,12 @@
 
 | Guide | Topics Covered |
 | :--- | :--- |
-| [Architecture & Performance Internals (`docs/en-US/architecture.md`)](./docs/en-US/architecture.md) | `v8` schema (33 normalized data tables + 9 hot-reload settings domains), real-time ImageView pipeline, multi-dialect SQL & split WAL pools, 10-surface privacy perimeter, memory budget |
+| [Architecture & Performance Internals (`docs/en-US/architecture.md`)](./docs/en-US/architecture.md) | `v9` schema (33 normalized data tables + 9 hot-reload settings domains), real-time ImageView pipeline, multi-dialect SQL & split WAL pools, 10-surface privacy perimeter, memory budget |
 | [Deployment & OS Service Installers (`docs/en-US/deployment.md`)](./docs/en-US/deployment.md) | Multi-layer config precedence, 6 static release targets, Linux (`systemd` / `OpenRC` privilege separation), macOS (`launchd`), Windows native service (`sc.exe` / `NSSM`), auto-rollback upgrades, Docker / GHCR |
 | [Reverse Proxy & CDN Guide (`docs/en-US/reverse-proxy.md`)](./docs/en-US/reverse-proxy.md) | TCP vs Unix Domain Socket (`--unix-socket` / `--socket-mode` / `--socket-group`), `VOLO_TRUSTED_PROXIES` anti-spoofing CIDRs, Nginx / Caddy / Traefik / Apache / Cloudflare recipes |
 | [CLI & Open API Reference (`docs/en-US/cli-and-api.md`)](./docs/en-US/cli-and-api.md) | Built-in `volo` CLI subcommands, scoped `volo_pat_*` tokens, real-time `?imageView2` & KV image query parameters, account ban/mute APIs, paginated search, and REST endpoints |
-| [Themes & Plugin SDK (`docs/en-US/themes-and-plugins.md`)](./docs/en-US/themes-and-plugins.md) | `theme.json`, fullscreen reply Markdown editor, pure-Go ES6 plugin sandbox (5-stage lifecycle, unified `before_*` chains, `volo.kv.incrAsync`, `CronRegistry`, `wordFilter`), ZIP install/export |
+| [Themes & Plugin SDK (`docs/en-US/themes-and-plugins.md`)](./docs/en-US/themes-and-plugins.md) | `theme.json`, fullscreen reply Markdown editor, pure-Go ES6 plugin sandbox (5-stage lifecycle, unified `before_*` chains, `volo.kv.incrAsync`, `CronRegistry`, `wordFilter`), 256 MiB streaming ZIP install/export |
+| [Official Plugin Catalog (`plugins/README.md`)](./plugins/README.md) | Canonical plugin version registry ([`plugins/catalog.json`](./plugins/catalog.json): bundled `sensitive-words v1.1.0` & standalone 26-model offline Live2D `kanbanniang v2.0.0`) and version-deduplicated GitHub Actions packaging |
 | [Theme Skin Migration Guide (`docs/en-US/theme-migration.md`)](./docs/en-US/theme-migration.md) | Standalone full-HTML & layout inheritance modes, full `PageContext`, `config_schema` fields, and template FuncMap reference |
 | [Language Pack Extension Guide (`docs/en-US/locale-extension.md`)](./docs/en-US/locale-extension.md) | Hot-installable JSON / `.zip` language packs (with complete `zh-TW` & `ja-JP` packs), `admin.nav.*` namespace, and starter template export |
 | [Legacy Migration & Cross-DB Backup (`docs/en-US/migration-and-backup.md`)](./docs/en-US/migration-and-backup.md) | Streaming legacy 15-table ETL, `301` `.html` permalink preservation, `SQLite ⇄ PostgreSQL ⇄ MySQL` 33-table streaming backups |
@@ -33,18 +34,18 @@
 
 | Metric / Benchmark (`CGO_ENABLED=0`) | Measured Result | Hard Budget / Notes |
 | :--- | :--- | :--- |
-| Static Single Binary Size (`linux/amd64`) | **`19.68 MiB`** | Strictly **`< 21.00 MiB`** across all 6 OS/Arch targets (`< 8.00 MiB` archives) |
+| Static Single Binary Size (`linux/amd64`) | **`~19.6 MiB`** | **`< 22.00 MiB`** across all 6 OS/Arch targets (`< 8.00 MiB` archives) |
 | Warm Resident Memory (`VmRSS`) | **`24.23 MiB`** | `< 35.00 MiB` including embedded themes, plugin sandbox, `wordFilter` engine, and warm caches |
-| Admin Console Initial Core (Gzip) | **`~85 KB`** (`< 300 KB` total) | Workspaces & CodeMirror 6 3-mode editor core are lazy-loaded (`66%+` smaller initial payload) |
+| Admin Console Initial Core (Gzip) | **`~132 KB`** (`~317.5 KiB` total) | `< 380 KiB` total embedded SPA budget; CodeMirror 6 3-mode editor core is lazy-loaded |
 | Warm Article Card Cache (`ToCard`) | **`1.19 µs/op`** (`864 B/op`) | 4 MiB digest-verified LRU (`758×` faster than cold Markdown render) |
 | Warm Article Detail Cache (`ToDetail`) | **`4.64 µs/op`** (`3.3 KB/op`) | Strictly excludes password-locked & `?preview=` requests (zero cross-user leakage) |
 | Pre-Compressed RSS / Sitemap + `ETag` | **`7.69 µs/op`** (`~130k req/s`) | `1ns` revision invalidation; auto-shards into `<sitemapindex>` above `10,000` URLs |
 | Concurrent Article Read + Write-Behind (`RecordView`) | **`454.9 µs/op`** (2-core SSR+Gzip) | Real-time pending counter merge + 2s/shutdown batched flush (zero SQLite write lock contention) |
 | Two-Stage Full-Text Search (`SearchIndex`) | **`29.4 µs/op`** | 8 MiB in-memory index + UTF-8 Rune-safe snippet windowing + paginated `/api/v1/search` |
 
-1. **Sub-`21 MiB` Pure-Go Single-File Delivery Across All 6 Targets (`CGO_ENABLED=0`)**: Built with Go `1.27.4` (`GOEXPERIMENT=nojsonv2`), zero-reflection `tinyxml`, and pure-Go SMTP/PGv3 drivers for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. Bundles themes, Studio Admin SPA, locale catalogs (plus external `zh-TW` & `ja-JP`), and Ops CLI with zero-copy `http.ServeContent` `Range` (`206 Partial Content`) media streaming, BREACH-safe pooled Gzip, deterministic `SIGTERM` drain, and read-only safe `volo healthcheck`.
+1. **Compact Pure-Go Single-File Delivery Across All 6 Targets (`CGO_ENABLED=0`, `< 22 MiB`)**: Built with Go `1.27.4` (`GOEXPERIMENT=nojsonv2`), zero-reflection `tinyxml`, and pure-Go SMTP/PGv3 drivers for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. Bundles themes, Studio Admin SPA, locale catalogs (plus external `zh-TW` & `ja-JP`), and Ops CLI with zero-copy `http.ServeContent` `Range` (`206 Partial Content`) media streaming, BREACH-safe pooled Gzip, deterministic `SIGTERM` drain, and read-only safe `volo healthcheck`.
 2. **Multi-Layer Config & Pure-Go Multi-Dialect DB**: Base bootstrap flags resolve `CLI Flags > OS VOLO_* Env > .env > Defaults`, while runtime upload and GeoIP directories follow `CLI Flags (--upload-dir / --geoip-dir) > Admin Console DB Settings > OS ENV / .env > Defaults`. Leaving `VOLO_DB_DRIVER` unset lets the `/setup` wizard's `AES-256-GCM` encrypted `data/db.json` (`SQLite` / `PostgreSQL` / `MySQL`) persist across container/service restarts. Supports **SQLite WAL** (split writer/read-only pools), **PostgreSQL** (first-party pure-Go `pgwire` PGv3 driver), and **MySQL 8+ / MariaDB / TiDB**.
-3. **Normalized Domain Model (`v8` Schema, 33 Data Tables + 9 Settings Domains), Studio Editor & Fullscreen Comment Editor**: Atomic hot-reload across all 9 domains (including all 4 `seo.post_permalink_style` URL templates); features the **3-Mode Studio Editor** (`IR`, `WYSIWYG`, `SV`) in the Admin Console plus a unified mobile-safe **Public Reply Markdown Editor** (toolbar, sanitized live preview, distraction-free fullscreen mode, configurable per-identity rune/line bounds, and vertical height-bomb defense).
+3. **Normalized Domain Model (`v9` Schema, 33 Data Tables + 9 Settings Domains), Studio Editor & Fullscreen Comment Editor**: Atomic hot-reload across all 9 domains (including all 4 `seo.post_permalink_style` URL templates with canonical `301` normalization); features the **3-Mode Studio Editor** (`IR`, `WYSIWYG`, `SV` with native Find & Replace, `/` command menu, 30+ language syntax highlighting, and rich HTML paste cleaning) in the Admin Console plus a unified mobile-safe **Public Reply Markdown Editor** (toolbar, sanitized live preview, distraction-free fullscreen mode, configurable per-identity rune/line bounds, and vertical height-bomb defense).
 4. **Dynamic Stealth Admin Path, 3-Tier WAF Risk Control, Multi-DB Offline GeoIP & Account/IP Governance**: Zero-downtime hot-reloadable stealth admin path (`security.admin_path`), configurable 3-tier scanner risk control + IP/CIDR whitelist (`risk_whitelist_cidrs`) + history-preserving IP ban lifecycle & retention policies (`ip_ban` / `audit_log` / `plugin_log`), and side-by-side `GeoLite2` + `ip2region` GeoIP engine; `admin` / `editor` / `reader` RBAC, `Argon2id`, WebAuthn Passkeys, TOTP, Step-Up re-authentication, scoped `volo_pat_*` tokens, 3-tier self-healing `GuestPassport` + stateless PoW, **permanent/timed account bans, mutes, and non-destructive historical comment shielding**, plus a **comment trash** (lossless restore, permanent delete with full PII scrub, configurable auto-purge, thread-preserving placeholders) and admin guest-identity editing for migrated comments.
 5. **Real-Time Non-Destructive ImageView (`?imageView2` & KV), 10-Surface Privacy & Chained Plugin SDK**: `/uploads/...` (and legacy Solo image paths) support both Qiniu Cloud path syntax (`?imageView2/<mode>/w/960/h/540/format/webp/q/85/...`) and KV query parameters (`?mode=1&w=960&h=540&format=webp&q=85&colors=128&strip&ignore-error=1`) without mutating source files (`singleflight` + `8 MiB` LRU + `304 ETag` + orphan-scanner & CLS linkage, with zero-overhead passthrough when unparameterized); `ContentVisibilityGuard` guarantees zero leakage across all 10 surfaces; plugins run in a bounded pure-Go ES6 sandbox with frozen prototypes, 5-stage lifecycle, `before_*` chains, `volo.kv.incrAsync` write-behind counters, `CronRegistry`, and native `wordFilter`.
 
@@ -58,7 +59,7 @@
 # 1. Build embedded Admin Console frontend assets
 npm --prefix web/admin ci && npm --prefix web/admin run build
 
-# 2. Compile pure-Go static binary (< 21 MiB)
+# 2. Compile pure-Go static binary (< 22 MiB)
 CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 go build -buildvcs=false -trimpath \
   -gcflags="all=-l" -ldflags="-s -w -buildid=" ./cmd/volo
 

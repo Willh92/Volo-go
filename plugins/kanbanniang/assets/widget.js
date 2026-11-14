@@ -1,217 +1,1133 @@
+/* Volo-go Live2D Kanbanniang Controller
+ * Pure-WebP bundled textures & sakura animations (with custom PNG pack compatibility),
+ * zero-inline CSP data-* bootstrap, touch toolbar toggle, viewport-clamped speech bubble,
+ * WebGL context recovery, PJAX persistence, pointer drag, tips.json, and KV head-pats.
+ */
 (function () {
-  var SVGS = {
-    neko: '<svg viewBox="0 0 64 64" width="38" height="38" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 26 L18 11 L28 20 H36 L46 11 L50 26 C53 33 52 46 32 49 C12 46 11 33 14 26 Z"/><circle cx="24" cy="33" r="2.2" fill="currentColor"/><circle cx="40" cy="33" r="2.2" fill="currentColor"/><path d="M29 39 Q32 42 35 39"/></svg>',
-    owl: '<svg viewBox="0 0 64 64" width="38" height="38" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><rect x="15" y="14" width="34" height="36" rx="16"/><circle cx="25" cy="29" r="5"/><circle cx="39" cy="29" r="5"/><path d="M30 35 L32 39 L34 35 Z" fill="currentColor"/></svg>',
-    bot: '<svg viewBox="0 0 64 64" width="38" height="38" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="32" y1="9" x2="32" y2="17"/><circle cx="32" cy="7" r="2"/><rect x="14" y="17" width="36" height="30" rx="8"/><rect x="22" y="27" width="6" height="6" rx="1" fill="currentColor"/><rect x="36" y="27" width="6" height="6" rx="1" fill="currentColor"/><line x1="25" y1="39" x2="39" y2="39"/></svg>'
+  "use strict";
+
+  var ALPHA_WEBP_URI =
+    "data:image/webp;base64,UklGRh4AAABXRUJQVlA4TBEAAAAvAUAAEAfQs5Y0qoCBiOh/AAA=";
+  var ANIM_WEBP_URI =
+    "data:image/webp;base64,UklGRoQAAABXRUJQVlA4WAoAAAASAAAAAQAAAQAAQU5JTQYAAAD/////AABBTk1GKAAAAAAAAAAAAAEAAAEAAGQAAAJWUDhMDwAAAC8BQAAQBxD9jwIGIqL/AQBBTk1GKAAAAAAAAAAAAAEAAAEAAGQAAAJWUDhMDwAAAC8BQAAQBxDR/wIGIqL/AQA=";
+  var OVERLAY_OPEN_SELECTOR =
+    "[data-book-reader], .lightbox-overlay.is-open, #volo-lightbox.is-open, [data-search-modal]:not([hidden]), #volo-search-modal:not([hidden]), #volo-toc-drawer:not([hidden]), .studio-reader-drawer.is-open, .volo-comment-composer.is-open, dialog[open], body.modal-open";
+
+  var host =
+    (typeof document.getElementById === "function" &&
+      (document.getElementById("volo-kanbanniang-root") ||
+        document.getElementById("volo-kanbanniang-dock"))) ||
+    document.querySelector(".solo-kanbanniang");
+
+  if (!host) return;
+
+  if (
+    !host.parentElement ||
+    !host.parentElement.hasAttribute("data-volo-persist")
+  ) {
+    host.setAttribute("data-volo-persist", "kanbanniang");
+  }
+
+  if (
+    window.VoloKanban &&
+    typeof window.VoloKanban.isAlive === "function" &&
+    window.VoloKanban.isAlive() &&
+    host.isConnected &&
+    host.getAttribute("data-mounted") === "1"
+  ) {
+    if (typeof window.VoloKanban.syncLocale === "function") {
+      window.VoloKanban.syncLocale();
+    }
+    return;
+  }
+  if (window.VoloKanban && typeof window.VoloKanban.destroy === "function") {
+    window.VoloKanban.destroy();
+  }
+
+  host.setAttribute("data-mounted", "1");
+
+  function safeSameOriginMountPath(raw, fallback) {
+    var s = String(raw || "").trim();
+    if (!s || s.indexOf("://") !== -1 || s.indexOf("//") === 0) {
+      return fallback;
+    }
+    var parts = s.split("/").filter(Boolean);
+    if (!parts.length) return fallback;
+    return "/" + parts.map(encodeURIComponent).join("/");
+  }
+
+  var version = host.getAttribute("data-version") || "2.0.0";
+  var staticBase = safeSameOriginMountPath(
+    host.getAttribute("data-static-base"),
+    "/plugins/kanbanniang/assets"
+  );
+  var apiBase = safeSameOriginMountPath(
+    host.getAttribute("data-api-base"),
+    "/plugins/kanbanniang/api"
+  );
+  var tipEl = host.querySelector(".solo-kanbanniang__tip");
+
+  var alive = true;
+  var started = false;
+  var ready = false;
+  var initialGreetShown = false;
+  var tipsLoaded = false;
+  var currentModel = "";
+  var lastDescriptor = null;
+  var patCount = parseInt(host.getAttribute("data-pats") || "0", 10) || 0;
+
+  var messageTimer = 0;
+  var closeTimer = 0;
+  var loadTimer = 0;
+  var chatTimer = 0;
+  var idleHandle = 0;
+  var idleIsCallback = false;
+  var dragState = null;
+  var lastHoverTarget = null;
+  var removers = [];
+  var abortCtrl = typeof AbortController === "function" ? new AbortController() : null;
+
+  var tips = {
+    mouseover: [],
+    click: [],
+    seasons: [],
+    chat: ["谢谢你来看望这个文字空间。"]
   };
 
-  var collapseTimer = 0;
-  var hideTimer = 0;
-  var dismissed = false;
+  function sGet(key) {
+    try {
+      return window.sessionStorage.getItem(key);
+    } catch (err) {
+      return null;
+    }
+  }
 
-  function resolveLabels(root) {
-    var lang = String((document.documentElement && document.documentElement.lang) || "").toLowerCase();
+  function sSet(key, val) {
+    try {
+      window.sessionStorage.setItem(key, String(val));
+    } catch (err) {}
+  }
+
+  function isClosedInSession() {
+    return (
+      sGet("volo.kanban.closed") === "1" || sGet("soloKanbanniang") === "close"
+    );
+  }
+
+  function viewportWidth() {
+    return typeof window.innerWidth === "number"
+      ? window.innerWidth
+      : document.documentElement
+        ? document.documentElement.clientWidth
+        : 1024;
+  }
+
+  function viewportHeight() {
+    return typeof window.innerHeight === "number"
+      ? window.innerHeight
+      : document.documentElement
+        ? document.documentElement.clientHeight
+        : 768;
+  }
+
+  function shouldPauseForMobile() {
+    return host.getAttribute("data-hide-mobile") !== "0" && viewportWidth() <= 800;
+  }
+
+  function prefersReducedMotion() {
+    try {
+      return !!(
+        window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      );
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function isTouchOrCoarse(ev) {
+    if (ev && (ev.pointerType === "touch" || ev.pointerType === "pen")) {
+      return true;
+    }
+    try {
+      return !!(
+        window.matchMedia &&
+        window.matchMedia("(hover: none), (pointer: coarse)").matches
+      );
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function isOverlayBlocking() {
+    try {
+      if (document.body && document.body.classList.contains("modal-open")) {
+        return true;
+      }
+      return !!document.querySelector(OVERLAY_OPEN_SELECTOR);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function clampTipToViewport() {
+    if (!tipEl || !host) return;
+    tipEl.classList.remove("is-flipped-below", "is-clamped-viewport");
+    tipEl.style.removeProperty("--kbn-tip-top");
+    var hostRect = host.getBoundingClientRect();
+    if (!hostRect || (hostRect.width === 0 && hostRect.height === 0)) return;
+    var tipHeight = tipEl.offsetHeight || 72;
+    var neededSpace = tipHeight + 14;
+    if (hostRect.top >= neededSpace) {
+      return;
+    }
+    var spaceBelow = viewportHeight() - hostRect.bottom;
+    if (spaceBelow >= neededSpace) {
+      tipEl.classList.add("is-flipped-below");
+      return;
+    }
+    var safeTop = Math.round(8 - hostRect.top);
+    if (hostRect.height > tipHeight + 8) {
+      safeTop = Math.min(safeTop, Math.round(hostRect.height - tipHeight - 4));
+    }
+    tipEl.style.setProperty("--kbn-tip-top", safeTop + "px");
+    tipEl.classList.add("is-clamped-viewport");
+  }
+
+  function listen(target, type, fn, opts) {
+    if (!target || !target.addEventListener) return;
+    target.addEventListener(type, fn, opts || false);
+    removers.push(function () {
+      try {
+        target.removeEventListener(type, fn, opts || false);
+      } catch (err) {}
+    });
+  }
+
+  function sanitizeHttpUrl(raw) {
+    var s = String(raw || "").trim();
+    if (/^https?:\/\/[^\s"'<>]+$/i.test(s)) return s;
+    return "https://github.com/Willh92/Volo-go";
+  }
+
+  function resolveLocaleStrings() {
+    var lang = String(
+      (document.documentElement && document.documentElement.lang) || ""
+    ).toLowerCase();
     var isEN = lang.indexOf("en") === 0;
     var isJA = lang.indexOf("ja") === 0;
     var isTW = lang === "zh-tw" || lang.indexOf("zh-hant") === 0;
+
     var greeting = isEN
-      ? (root.getAttribute("data-greeting-en") || root.getAttribute("data-greeting") || "Welcome! Click me for a head-pat~")
+      ? host.getAttribute("data-greeting-en") ||
+        host.getAttribute("data-greeting") ||
+        "Welcome! Click me for a head-pat~"
       : isJA
-        ? (root.getAttribute("data-greeting-ja") || root.getAttribute("data-greeting") || "個人ブログへようこそ！クリックすると頭をなでられます～")
+        ? host.getAttribute("data-greeting-ja") ||
+          host.getAttribute("data-greeting") ||
+          "個人ブログへようこそ！クリックすると頭をなでられます～"
         : isTW
-          ? (root.getAttribute("data-greeting-tw") || root.getAttribute("data-greeting") || "歡迎來到獨立部落格，點我可以摸摸頭～")
-          : (root.getAttribute("data-greeting-zh") || root.getAttribute("data-greeting") || "欢迎来到独立博客，点我可以摸摸头～");
+          ? host.getAttribute("data-greeting-tw") ||
+            host.getAttribute("data-greeting") ||
+            "歡迎來到這個文字空間，點我可以摸摸頭～"
+          : host.getAttribute("data-greeting-zh") ||
+            host.getAttribute("data-greeting") ||
+            "欢迎来到这个文字空间，点我可以摸摸头～";
+
     return {
-      dock: isEN ? "Studio Mascot" : isJA ? "スタジオ看板娘" : "看板娘助手",
-      btn: isEN ? "Pat mascot" : isJA ? "看板娘をなでる" : "摸摸看板娘",
-      close: isEN ? "Dismiss message" : isJA ? "メッセージを閉じる" : "收起提示",
-      rateLimited: isEN ? "Gentle pats please~" : isJA ? "ゆっくりなでてね～" : isTW ? "摸太快啦，休息一下～" : "摸太快啦，歇会儿再摸～",
-      greeting: greeting
+      ariaLabel: isEN
+        ? "Studio Mascot"
+        : isJA
+          ? "スタジオ看板娘"
+          : "看板娘助手",
+      greeting: greeting,
+      rateLimited: isEN
+        ? "Gentle pats please~"
+        : isJA
+          ? "ゆっくりなでてね～"
+          : isTW
+            ? "摸太快啦，休息一下～"
+            : host.getAttribute("data-rate-limited") || "摸太快啦，歇会儿再摸～",
+      changeTip: isEN
+        ? "Changed into a new outfit to keep reading with you~"
+        : isJA
+          ? "新しい衣装に着替えました。一緒に読書を続けましょう～"
+          : isTW
+            ? "換一套新裝，繼續陪你閱讀。"
+            : host.getAttribute("data-change-tip") || "换一套新装，继续陪你阅读。",
+      copyTip: isEN
+        ? "Copied! Please remember to credit the source when sharing."
+        : isJA
+          ? "転載の際は出典の明記をお願いします。"
+          : isTW
+            ? "如果轉載，也請記得註明出處。"
+            : host.getAttribute("data-copy-tip") || "如果转载，也请记得注明出处。",
+      tools: {
+        home: isEN ? "Back to Home" : isJA ? "ホームへ戻る" : isTW ? "返回首頁" : "返回首页",
+        rss: isEN ? "Subscribe via RSS" : isJA ? "RSSを購読" : isTW ? "訂閱部落格" : "订阅博客",
+        chat: isEN ? "Say Something" : isJA ? "ひとこと話す" : isTW ? "說句話" : "说句话",
+        change: isEN ? "Switch Model / Outfit" : isJA ? "モデル・衣装切替" : isTW ? "切換模型與換裝" : "切换模型与换装",
+        photo: isEN ? "Take Screenshot" : isJA ? "スクリーンショット保存" : isTW ? "儲存圖片" : "保存图片",
+        github: isEN ? "View Project" : isJA ? "プロジェクトを見る" : isTW ? "查看專案主頁" : "查看项目主页",
+        close: isEN ? "Hide Mascot" : isJA ? "看板娘を閉じる" : isTW ? "關閉看板娘" : "关闭看板娘"
+      }
     };
   }
 
-  function collapseBubble(bubble) {
-    if (!bubble || bubble.hidden) return;
-    clearTimeout(collapseTimer);
-    clearTimeout(hideTimer);
-    bubble.classList.add("is-collapsed");
-    hideTimer = setTimeout(function () {
-      if (bubble.classList.contains("is-collapsed")) bubble.hidden = true;
-    }, 200);
-  }
-
-  function showBubble(bubble, textEl, text, autoHideMs) {
-    if (!bubble || !textEl) return;
-    clearTimeout(collapseTimer);
-    clearTimeout(hideTimer);
-    if (text) textEl.textContent = text;
-    bubble.hidden = false;
-    requestAnimationFrame(function () {
-      bubble.classList.remove("is-collapsed");
-    });
-    if (autoHideMs > 0) {
-      collapseTimer = setTimeout(function () {
-        collapseBubble(bubble);
-      }, autoHideMs);
-    }
-  }
-
-  function mount() {
-    var root = document.getElementById("volo-kanbanniang-root");
-    if (!root || root.getAttribute("data-mounted") === "1") return;
-    root.setAttribute("data-mounted", "1");
-    if (!root.parentElement || !root.parentElement.hasAttribute("data-volo-persist")) {
-      root.setAttribute("data-volo-persist", "kanbanniang");
-    }
-
-    var labels = resolveLabels(root);
-    root.setAttribute("aria-label", root.getAttribute("aria-label") || labels.dock);
-
-    var ch = root.getAttribute("data-character") || "neko";
-    var greeting = root.getAttribute("data-greeting") || labels.greeting;
-    var patCount = parseInt(root.getAttribute("data-pats") || "0", 10) || 0;
-
-    var bubble = document.createElement("div");
-    bubble.className = "volo-kbn-bubble";
-    var textSpan = document.createElement("span");
-    textSpan.className = "volo-kbn-bubble__text";
-    textSpan.textContent = greeting;
-
-    var closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "volo-kbn-close";
-    var initCloseLbl = root.getAttribute("data-close-label") || labels.close;
-    closeBtn.setAttribute("aria-label", initCloseLbl);
-    closeBtn.title = initCloseLbl;
-    closeBtn.textContent = "×";
-    closeBtn.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      dismissed = true;
-      collapseBubble(bubble);
-    });
-
-    bubble.appendChild(textSpan);
-    bubble.appendChild(closeBtn);
-
-    var btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "volo-kbn-btn";
-    btn.setAttribute("aria-label", root.getAttribute("data-btn-label") || labels.btn);
-    btn.innerHTML = SVGS[ch] || SVGS.neko;
-
-    btn.addEventListener("mouseenter", function () {
-      if (dismissed) return;
-      showBubble(bubble, textSpan, "", 0);
-    });
-    btn.addEventListener("mouseleave", function () {
-      if (!bubble.hidden) {
-        clearTimeout(collapseTimer);
-        collapseTimer = setTimeout(function () { collapseBubble(bubble); }, 5000);
+  function syncLocale() {
+    if (!host) return;
+    var loc = resolveLocaleStrings();
+    host.setAttribute("aria-label", loc.ariaLabel);
+    var keys = ["home", "rss", "chat", "change", "photo", "github", "close"];
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      var btn = host.querySelector('[data-kbn-tool="' + k + '"]');
+      if (btn && loc.tools[k]) {
+        btn.title = loc.tools[k];
+        btn.setAttribute("aria-label", loc.tools[k]);
       }
-    });
+    }
+    if (isOverlayBlocking()) {
+      hideMessage();
+    }
+    syncOffsetsAndPosition();
+  }
 
-    btn.addEventListener("click", function () {
-      dismissed = false;
-      var curLabels = resolveLabels(root);
-      fetch("/plugins/kanbanniang/api/pat", {
-        method: "POST",
-        headers: { Accept: "application/json" }
-      })
-        .then(function (r) {
-          return r.json().catch(function () { return {}; }).then(function (d) {
-            return { status: r.status, ok: r.ok, d: d };
-          });
-        })
-        .then(function (res) {
-          if (res.status === 429) {
-            showBubble(bubble, textSpan, curLabels.rateLimited, 3500);
+  function hideMessage() {
+    if (!tipEl) return;
+    clearTimeout(messageTimer);
+    tipEl.style.opacity = "0";
+    tipEl.classList.remove("is-visible");
+  }
+
+  function showMessage(text, durationMs) {
+    if (!alive || !ready || !tipEl || isClosedInSession()) return;
+    if (isOverlayBlocking()) {
+      hideMessage();
+      return;
+    }
+    if (Array.isArray(text)) {
+      if (text.length === 0) return;
+      text = text[Math.floor(Math.random() * text.length)];
+    }
+    if (!text) return;
+    tipEl.textContent = String(text);
+    clampTipToViewport();
+    tipEl.style.opacity = "1";
+    tipEl.classList.add("is-visible");
+    clearTimeout(messageTimer);
+    messageTimer = window.setTimeout(function () {
+      if (tipEl) {
+        tipEl.style.opacity = "0";
+        tipEl.classList.remove("is-visible");
+      }
+    }, durationMs || 4000);
+  }
+
+  function probeWebGLAlphaWebP() {
+    return new Promise(function (resolve) {
+      var settled = false;
+      function done(ok) {
+        if (!settled) {
+          settled = true;
+          resolve(ok);
+        }
+      }
+      var timer = window.setTimeout(function () {
+        done(false);
+      }, 800);
+      var img = new Image();
+      img.onload = function () {
+        window.clearTimeout(timer);
+        if (img.width !== 2 || img.height !== 2) {
+          done(false);
+          return;
+        }
+        try {
+          var cvs = document.createElement("canvas");
+          cvs.width = 1;
+          cvs.height = 1;
+          var gl =
+            cvs.getContext("webgl") || cvs.getContext("experimental-webgl");
+          if (!gl) {
+            done(false);
             return;
           }
-          if (res.d && typeof res.d.total_pats === "number") {
-            patCount = res.d.total_pats;
-          } else if (res.ok) {
-            patCount += 1;
-          }
-          root.setAttribute("data-pats", String(patCount));
-          showBubble(bubble, textSpan, "✨ +" + patCount, 5000);
-        })
-        .catch(function () {
-          patCount += 1;
-          root.setAttribute("data-pats", String(patCount));
-          showBubble(bubble, textSpan, "✨ +" + patCount, 5000);
-        });
+          var tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            img
+          );
+          var ok = gl.getError() === 0;
+          if (tex) gl.deleteTexture(tex);
+          var lose = gl.getExtension("WEBGL_lose_context");
+          if (lose) lose.loseContext();
+          done(ok);
+        } catch (err) {
+          done(false);
+        }
+      };
+      img.onerror = function () {
+        window.clearTimeout(timer);
+        done(false);
+      };
+      img.src = ALPHA_WEBP_URI;
     });
-
-    root.appendChild(bubble);
-    root.appendChild(btn);
-
-    collapseTimer = setTimeout(function () {
-      collapseBubble(bubble);
-    }, 5000);
-    syncMobileOffset();
   }
 
-  function syncMobileOffset() {
-    var root = document.getElementById("volo-kanbanniang-root");
-    if (!root) return;
-    var pos = root.getAttribute("data-position") || (root.classList.contains("volo-kbn-right") ? "right" : "left");
+  function probeAnimatedWebP() {
+    return new Promise(function (resolve) {
+      var settled = false;
+      function done(ok) {
+        if (!settled) {
+          settled = true;
+          resolve(ok);
+        }
+      }
+      var timer = window.setTimeout(function () {
+        done(false);
+      }, 800);
+      var img = new Image();
+      img.onload = function () {
+        window.clearTimeout(timer);
+        done(img.width === 2 && img.height === 2);
+      };
+      img.onerror = function () {
+        window.clearTimeout(timer);
+        done(false);
+      };
+      img.src = ANIM_WEBP_URI;
+    });
+  }
+
+  function ensureCapabilities() {
+    if (!window.__voloKbnCapsPromise) {
+      window.__voloKbnCapsPromise = Promise.all([
+        probeWebGLAlphaWebP(),
+        probeAnimatedWebP()
+      ]).then(function (res) {
+        return { webglWebp: !!res[0], animWebp: !!res[1] };
+      });
+    }
+    return window.__voloKbnCapsPromise;
+  }
+
+  function loadSDK() {
+    if (typeof window.loadlive2d === "function") {
+      return Promise.resolve();
+    }
+    if (!window.__voloKanbanSDK) {
+      window.__voloKanbanSDK = new Promise(function (resolve, reject) {
+        var script = document.createElement("script");
+        script.src =
+          staticBase + "/live2d.js?v=" + encodeURIComponent(version);
+        script.async = true;
+        script.onload = function () {
+          if (typeof window.loadlive2d === "function") resolve();
+          else reject(new Error("Live2D runtime failed to initialize"));
+        };
+        script.onerror = function () {
+          if (script.parentNode) script.parentNode.removeChild(script);
+          reject(new Error("Local Live2D script is unavailable"));
+        };
+        document.head.appendChild(script);
+      }).catch(function (err) {
+        window.__voloKanbanSDK = null;
+        throw err;
+      });
+    }
+    return window.__voloKanbanSDK;
+  }
+
+  function fetchModelDescriptor(isRandomSwitch) {
+    var endpoint = isRandomSwitch ? "/absoluteRandomModel" : "/model";
+    var qs = isRandomSwitch
+      ? "?exclude=" +
+        encodeURIComponent(currentModel || "") +
+        "&t=" +
+        Date.now()
+      : "?model=" +
+        encodeURIComponent(host.getAttribute("data-model") || "random");
+    var fetchOpts = { headers: { Accept: "application/json" } };
+    if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
+    return fetch(apiBase + endpoint + qs, fetchOpts).then(function (resp) {
+      if (!resp.ok) throw new Error("Model API returned " + resp.status);
+      return resp.json();
+    });
+  }
+
+  function refreshSakuraBackground() {
+    if (!alive || !host) return;
+    if (host.getAttribute("data-sakura") === "0" || prefersReducedMotion()) {
+      host.style.backgroundImage = "none";
+      host.classList.remove("has-bg");
+      return;
+    }
+    var idx = Math.floor(Math.random() * 11);
+    var webpUrl =
+      staticBase +
+      "/background/sakura" +
+      idx +
+      ".webp?v=" +
+      encodeURIComponent(version);
+
+    ensureCapabilities().then(function (caps) {
+      if (!alive || !host) return;
+      if (!caps.animWebp) {
+        host.style.backgroundImage = "none";
+        host.classList.remove("has-bg");
+        return;
+      }
+      var pre = new Image();
+      pre.onload = function () {
+        if (alive && host && !prefersReducedMotion()) {
+          host.style.backgroundImage = 'url("' + webpUrl + '")';
+          host.classList.add("has-bg");
+        }
+      };
+      pre.onerror = function () {
+        if (caps) caps.animWebp = false;
+        if (alive && host) {
+          host.style.backgroundImage = "none";
+          host.classList.remove("has-bg");
+        }
+      };
+      pre.src = webpUrl;
+    });
+  }
+
+  function matchSeasonalTip(seasons) {
+    if (!Array.isArray(seasons) || seasons.length === 0) return "";
+    var now = new Date();
+    var m = now.getMonth() + 1;
+    var d = now.getDate();
+    var curVal = m * 100 + d;
+    for (var i = 0; i < seasons.length; i++) {
+      var item = seasons[i];
+      if (!item || typeof item.date !== "string" || !item.text) continue;
+      var parts = item.date.split("-");
+      var startMD = parts[0].trim().split("/");
+      if (startMD.length !== 2) continue;
+      var sVal = parseInt(startMD[0], 10) * 100 + parseInt(startMD[1], 10);
+      var eVal = sVal;
+      if (parts.length > 1) {
+        var endMD = parts[1].trim().split("/");
+        if (endMD.length === 2) {
+          eVal = parseInt(endMD[0], 10) * 100 + parseInt(endMD[1], 10);
+        }
+      }
+      if (curVal >= sVal && curVal <= eVal) {
+        var year = now.getFullYear();
+        return String(item.text)
+          .replace(/\{years\}/g, String(year - 1949))
+          .replace(/\{year\}/g, String(year));
+      }
+    }
+    return "";
+  }
+
+  function ensureTipsLoaded() {
+    if (tipsLoaded || !alive) return;
+    tipsLoaded = true;
+    var fetchOpts = { headers: { Accept: "application/json" } };
+    if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
+    fetch(
+      staticBase + "/tips.json?v=" + encodeURIComponent(version),
+      fetchOpts
+    )
+      .then(function (r) {
+        if (!r.ok) throw new Error("tips unavailable");
+        return r.json();
+      })
+      .then(function (data) {
+        if (!alive || !data) return;
+        tips = data;
+        if (ready && sGet("volo.kanban.seasonShown") !== "1") {
+          var seasonal = matchSeasonalTip(tips.seasons);
+          if (seasonal) {
+            sSet("volo.kanban.seasonShown", "1");
+            showMessage(seasonal, 6000);
+          }
+        }
+      })
+      .catch(function () {});
+
+    if (host.getAttribute("data-idle-chat") !== "0") {
+      chatTimer = window.setInterval(function () {
+        if (
+          alive &&
+          ready &&
+          !document.hidden &&
+          !isOverlayBlocking()
+        ) {
+          showMessage(tips.chat, 4000);
+        }
+      }, 30000);
+    }
+  }
+
+  function syncOffsetsAndPosition() {
+    if (!host) return;
+    var rawX = sGet("volo.kanban.x");
+    var rawY = sGet("volo.kanban.y");
+    if (rawX === null) rawX = sGet("soloKanbanniangX");
+    if (rawY === null) rawY = sGet("soloKanbanniangY");
+
+    if (rawX !== null && rawY !== null) {
+      var x = Number(rawX);
+      var y = Number(rawY);
+      if (isFinite(x) && isFinite(y)) {
+        var clampedX = Math.max(0, Math.min(x, viewportWidth() - 284));
+        var clampedY = Math.max(0, Math.min(y, viewportHeight() - 254));
+        host.setAttribute("data-dragged", "1");
+        host.style.left = clampedX + "px";
+        host.style.top = clampedY + "px";
+        host.style.right = "auto";
+        host.style.bottom = "auto";
+        clampTipToViewport();
+        return;
+      }
+    }
+
+    host.removeAttribute("data-dragged");
+    host.style.removeProperty("left");
+    host.style.removeProperty("top");
+    host.style.removeProperty("right");
+
+    var pos =
+      host.getAttribute("data-position") ||
+      (host.classList.contains("volo-kbn-right") ? "right" : "left");
     var fab = document.querySelector(".book-mobile-toc-fab");
     var fabOnScreen = !!(
       fab &&
       !fab.hidden &&
-      (window.innerWidth || 1024) <= 900 &&
+      viewportWidth() <= 900 &&
       pos !== "right" &&
       window.getComputedStyle(fab).display !== "none"
     );
-    root.classList.toggle("is-book-fab-offset", fabOnScreen);
+    host.classList.toggle("is-book-fab-offset", fabOnScreen);
     var podcastOpen =
       document.documentElement.getAttribute("data-podcast-open") === "1" ||
       (document.body && document.body.classList.contains("has-podcast-mini"));
     if (fabOnScreen && !podcastOpen) {
-      root.style.bottom = "calc(68px + env(safe-area-inset-bottom, 0px))";
+      host.style.bottom = "calc(68px + env(safe-area-inset-bottom, 0px))";
     } else {
-      root.style.removeProperty("bottom");
+      host.style.removeProperty("bottom");
+    }
+    clampTipToViewport();
+  }
+
+  function pause() {
+    ready = false;
+    started = false;
+    lastHoverTarget = null;
+    dragState = null;
+    if (host) {
+      host.hidden = true;
+      host.classList.remove("is-tools-open");
+      host.style.removeProperty("transform");
+      host.style.removeProperty("will-change");
+      delete host.dataset.ready;
+    }
+    window.clearTimeout(loadTimer);
+    hideMessage();
+    if (window.loadlive2d && typeof window.loadlive2d.dispose === "function") {
+      window.loadlive2d.dispose();
     }
   }
 
-  function onAfterNavigate() {
-    var root = document.getElementById("volo-kanbanniang-root");
-    if (!root) return;
-    if (root.getAttribute("data-mounted") !== "1") {
-      mount();
+  function bindCanvasContextRecovery(canvasEl) {
+    if (!canvasEl || canvasEl.__voloCtxBound) return;
+    canvasEl.__voloCtxBound = true;
+    listen(canvasEl, "webglcontextlost", function (ev) {
+      if (!alive || !started) return;
+      if (ev && typeof ev.preventDefault === "function") {
+        ev.preventDefault();
+      }
+      ready = false;
+      if (host) {
+        delete host.dataset.ready;
+      }
+      window.clearTimeout(loadTimer);
+    });
+    listen(canvasEl, "webglcontextrestored", function () {
+      if (!alive || !started || shouldPauseForMobile() || isClosedInSession()) {
+        return;
+      }
+      window.clearTimeout(loadTimer);
+      loadTimer = window.setTimeout(pause, 12000);
+      if (lastDescriptor && typeof window.loadlive2d === "function") {
+        window.loadlive2d("soloKanbanniang", lastDescriptor);
+      } else {
+        change(false);
+      }
+    });
+  }
+
+  function destroy() {
+    if (!alive) return;
+    alive = false;
+    if (idleHandle) {
+      if (idleIsCallback && typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idleHandle);
+      } else {
+        window.clearTimeout(idleHandle);
+      }
+      idleHandle = 0;
+    }
+    if (abortCtrl) {
+      try {
+        abortCtrl.abort();
+      } catch (err) {}
+    }
+    window.clearTimeout(closeTimer);
+    window.clearInterval(chatTimer);
+    var list = removers.splice(0);
+    for (var i = 0; i < list.length; i++) {
+      list[i]();
+    }
+    pause();
+  }
+
+  function change(isRandomSwitch) {
+    if (!alive || !started) return;
+    ready = false;
+    delete host.dataset.ready;
+    window.clearTimeout(loadTimer);
+    loadTimer = window.setTimeout(pause, 12000);
+
+    fetchModelDescriptor(!!isRandomSwitch)
+      .then(function (descriptor) {
+        if (!alive || !started || shouldPauseForMobile()) return;
+        lastDescriptor = descriptor || lastDescriptor;
+        currentModel = (descriptor && descriptor.name) || currentModel;
+        window.loadlive2d("soloKanbanniang", descriptor);
+      })
+      .catch(function () {
+        pause();
+      });
+  }
+
+  function start() {
+    if (!alive || started || shouldPauseForMobile() || isClosedInSession()) {
       return;
     }
-    var labels = resolveLabels(root);
-    root.setAttribute("aria-label", labels.dock);
-    var btn = root.querySelector(".volo-kbn-btn");
-    if (btn) btn.setAttribute("aria-label", labels.btn);
-    var closeBtn = root.querySelector(".volo-kbn-close");
-    if (closeBtn) {
-      closeBtn.setAttribute("aria-label", labels.close);
-      closeBtn.title = labels.close;
-    }
-    var bubble = root.querySelector(".volo-kbn-bubble");
-    var textEl = root.querySelector(".volo-kbn-bubble__text");
-    if (textEl && (!bubble || bubble.hidden)) {
-      textEl.textContent = labels.greeting;
-    }
-    /* Keep patCount intact across PJAX; collapse speech bubble on book reader so TOC/controls are unobstructed */
-    if (document.querySelector("[data-book-reader]")) {
-      collapseBubble(bubble);
-    }
-    syncMobileOffset();
+    started = true;
+    window.clearTimeout(loadTimer);
+    loadTimer = window.setTimeout(pause, 12000);
+
+    Promise.all([
+      ensureCapabilities(),
+      loadSDK(),
+      fetchModelDescriptor(false)
+    ])
+      .then(function (res) {
+        if (!alive || shouldPauseForMobile() || !host.isConnected) {
+          started = false;
+          window.clearTimeout(loadTimer);
+          return;
+        }
+        var caps = res[0];
+        var descriptor = res[2];
+        window.VoloLive2D = window.VoloLive2D || {};
+        window.VoloLive2D.useWebp = !!caps.webglWebp;
+        window.VoloLive2D.muted = host.getAttribute("data-mute-sound") === "1";
+
+        var oldCanvas = host.querySelector("#soloKanbanniang");
+        if (oldCanvas && oldCanvas.parentNode) {
+          var freshCanvas = oldCanvas.cloneNode(false);
+          oldCanvas.parentNode.replaceChild(freshCanvas, oldCanvas);
+          bindCanvasContextRecovery(freshCanvas);
+        }
+
+        lastDescriptor = descriptor || null;
+        currentModel = (descriptor && descriptor.name) || "";
+        window.loadlive2d("soloKanbanniang", descriptor);
+      })
+      .catch(function () {
+        pause();
+      });
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", mount, { once: true });
-  } else {
-    mount();
+  function scheduleIdleStart() {
+    if (shouldPauseForMobile() || isClosedInSession()) {
+      host.hidden = true;
+      return;
+    }
+    if (typeof window.requestIdleCallback === "function") {
+      idleIsCallback = true;
+      idleHandle = window.requestIdleCallback(
+        function () {
+          idleHandle = 0;
+          start();
+        },
+        { timeout: 1500 }
+      );
+    } else {
+      idleIsCallback = false;
+      idleHandle = window.setTimeout(function () {
+        idleHandle = 0;
+        start();
+      }, 200);
+    }
   }
-  if (!window.__voloKanbanniangPJAXBound) {
-    window.__voloKanbanniangPJAXBound = true;
-    document.addEventListener("volo:pjax:after", onAfterNavigate);
-    document.addEventListener("volo:page-load", onAfterNavigate);
-    window.addEventListener("scroll", syncMobileOffset, { passive: true });
-    window.addEventListener("resize", syncMobileOffset, { passive: true });
+
+  function navigateHome() {
+    try {
+      var a = document.createElement("a");
+      a.href = "/";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      var ev = new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      });
+      var notPrevented = a.dispatchEvent(ev);
+      if (a.parentNode) a.parentNode.removeChild(a);
+      if (notPrevented) {
+        window.location.assign("/");
+      }
+    } catch (err) {
+      window.location.assign("/");
+    }
+  }
+
+  function sendHeadPat() {
+    var loc = resolveLocaleStrings();
+    fetch(apiBase + "/pat", {
+      method: "POST",
+      headers: { Accept: "application/json" }
+    })
+      .then(function (r) {
+        return r
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (d) {
+            return { status: r.status, ok: r.ok, d: d };
+          });
+      })
+      .then(function (res) {
+        if (!alive) return;
+        if (res.status === 429) {
+          showMessage(loc.rateLimited, 3500);
+          return;
+        }
+        if (res.d && typeof res.d.total_pats === "number") {
+          patCount = res.d.total_pats;
+        } else if (res.ok) {
+          patCount += 1;
+        }
+        host.setAttribute("data-pats", String(patCount));
+        if (Array.isArray(tips.click) && tips.click.length > 0) {
+          var quote = tips.click[Math.floor(Math.random() * tips.click.length)];
+          showMessage(quote + " (✨ +" + patCount + ")", 4500);
+        } else {
+          showMessage("✨ +" + patCount, 4000);
+        }
+      })
+      .catch(function () {
+        if (!alive) return;
+        patCount += 1;
+        host.setAttribute("data-pats", String(patCount));
+        if (Array.isArray(tips.click) && tips.click.length > 0) {
+          showMessage(tips.click, 4500);
+        } else {
+          showMessage("✨ +" + patCount, 4000);
+        }
+      });
+  }
+
+  function bindTool(toolName, handler) {
+    var btn = host.querySelector('[data-kbn-tool="' + toolName + '"]');
+    if (btn) {
+      listen(btn, "click", function (ev) {
+        ev.stopPropagation();
+        handler();
+      });
+    }
+  }
+
+  bindTool("home", navigateHome);
+  bindTool("rss", function () {
+    window.location.assign("/rss.xml");
+  });
+  bindTool("chat", function () {
+    showMessage(tips.chat, 4500);
+    refreshSakuraBackground();
+  });
+  bindTool("change", function () {
+    change(true);
+    showMessage(resolveLocaleStrings().changeTip, 4500);
+    refreshSakuraBackground();
+  });
+  bindTool("photo", function () {
+    if (ready && window.Live2D) {
+      window.Live2D.captureName = "volo-kanbanniang.png";
+      window.Live2D.captureFrame = true;
+    }
+  });
+  bindTool("github", function () {
+    var url = sanitizeHttpUrl(host.getAttribute("data-project-url"));
+    window.open(url, "_blank", "noopener,noreferrer");
+  });
+  bindTool("close", function () {
+    sSet("volo.kanban.closed", "1");
+    sSet("soloKanbanniang", "close");
+    host.classList.add("is-closing");
+    closeTimer = window.setTimeout(function () {
+      host.classList.remove("is-closing");
+      host.classList.add("is-closed");
+      pause();
+    }, 180);
+  });
+
+  listen(window, "volo:kanban-ready", function (ev) {
+    if (!alive || !started || shouldPauseForMobile() || isClosedInSession()) {
+      return;
+    }
+    ready = true;
+    window.clearTimeout(loadTimer);
+    host.dataset.ready = "true";
+    if (ev && ev.detail && ev.detail.model) {
+      currentModel = ev.detail.model;
+    }
+    host.hidden = false;
+    host.classList.remove("is-closed", "is-closing");
+    syncOffsetsAndPosition();
+    refreshSakuraBackground();
+    ensureTipsLoaded();
+
+    if (!initialGreetShown) {
+      initialGreetShown = true;
+      if (!isOverlayBlocking()) {
+        showMessage(resolveLocaleStrings().greeting, 5000);
+      }
+    }
+  });
+
+  bindCanvasContextRecovery(host.querySelector("#soloKanbanniang"));
+
+  listen(
+    window,
+    "resize",
+    function () {
+      if (shouldPauseForMobile()) {
+        if (started) pause();
+      } else {
+        syncOffsetsAndPosition();
+        start();
+      }
+    },
+    { passive: true }
+  );
+
+  listen(document, "volo:pjax:after", syncLocale);
+  listen(document, "volo:page-load", syncLocale);
+
+  listen(
+    document,
+    "pointerdown",
+    function (ev) {
+      if (!host || !host.classList.contains("is-tools-open")) return;
+      var target = ev && ev.target;
+      if (!target || !host.contains(target)) {
+        host.classList.remove("is-tools-open");
+      }
+    },
+    { passive: true }
+  );
+
+  listen(document, "keydown", function (ev) {
+    if (ev && ev.key === "Escape" && host) {
+      host.classList.remove("is-tools-open");
+    }
+  });
+
+  listen(document, "copy", function () {
+    showMessage(resolveLocaleStrings().copyTip, 4000);
+  });
+
+  listen(
+    document,
+    "mouseover",
+    function (ev) {
+      if (
+        !ready ||
+        dragState ||
+        document.hidden ||
+        !tips ||
+        !Array.isArray(tips.mouseover) ||
+        tips.mouseover.length === 0
+      ) {
+        return;
+      }
+      var target = ev && ev.target;
+      if (
+        !target ||
+        target === lastHoverTarget ||
+        typeof target.closest !== "function"
+      ) {
+        return;
+      }
+      lastHoverTarget = target;
+      if (isOverlayBlocking()) return;
+      var list = tips.mouseover;
+      for (var i = 0; i < list.length; i++) {
+        var entry = list[i];
+        if (!entry || !entry.selector || !entry.text) continue;
+        var matched = null;
+        try {
+          matched = target.closest(entry.selector);
+        } catch (err) {
+          continue;
+        }
+        if (
+          matched &&
+          (!ev.relatedTarget || !matched.contains(ev.relatedTarget))
+        ) {
+          var labelText = String(matched.textContent || "")
+            .trim()
+            .slice(0, 42);
+          showMessage(String(entry.text).replace("{text}", labelText), 3200);
+          break;
+        }
+      }
+    },
+    { passive: true }
+  );
+
+  listen(host, "pointerdown", function (ev) {
+    if (ev.button !== 0 && ev.pointerType === "mouse") return;
+    if (ev.target && typeof ev.target.closest === "function") {
+      if (ev.target.closest("button")) return;
+    }
+    var rect = host.getBoundingClientRect();
+    var w = rect.width || 284;
+    var h = rect.height || 254;
+    dragState = {
+      id: ev.pointerId,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      startLeft: rect.left,
+      startTop: rect.top,
+      maxW: Math.max(0, viewportWidth() - w),
+      maxH: Math.max(0, viewportHeight() - h),
+      nextX: rect.left,
+      nextY: rect.top,
+      moved: false,
+      isCanvas: !!(ev.target && ev.target.id === "soloKanbanniang")
+    };
+    if (typeof host.setPointerCapture === "function") {
+      try {
+        host.setPointerCapture(ev.pointerId);
+      } catch (err) {}
+    }
+  });
+
+  listen(host, "pointermove", function (ev) {
+    if (!dragState || dragState.id !== ev.pointerId) return;
+    var rawDx = ev.clientX - dragState.startX;
+    var rawDy = ev.clientY - dragState.startY;
+    if (!dragState.moved && rawDx * rawDx + rawDy * rawDy <= 25) {
+      return;
+    }
+    if (!dragState.moved) {
+      dragState.moved = true;
+      host.setAttribute("data-dragged", "1");
+      host.style.left = dragState.startLeft + "px";
+      host.style.top = dragState.startTop + "px";
+      host.style.right = "auto";
+      host.style.bottom = "auto";
+      host.style.willChange = "transform";
+    }
+    var clampedX = Math.max(
+      0,
+      Math.min(dragState.startLeft + rawDx, dragState.maxW)
+    );
+    var clampedY = Math.max(
+      0,
+      Math.min(dragState.startTop + rawDy, dragState.maxH)
+    );
+    dragState.nextX = clampedX;
+    dragState.nextY = clampedY;
+    var tx = clampedX - dragState.startLeft;
+    var ty = clampedY - dragState.startTop;
+    host.style.transform = "translate3d(" + tx + "px," + ty + "px,0)";
+  });
+
+  function finishPointer(ev, isCancel) {
+    if (!dragState || dragState.id !== ev.pointerId) return;
+    var state = dragState;
+    dragState = null;
+    if (
+      typeof host.hasPointerCapture === "function" &&
+      typeof host.releasePointerCapture === "function"
+    ) {
+      try {
+        if (host.hasPointerCapture(ev.pointerId)) {
+          host.releasePointerCapture(ev.pointerId);
+        }
+      } catch (err) {}
+    }
+    if (state.moved) {
+      var finalX = Math.round(state.nextX);
+      var finalY = Math.round(state.nextY);
+      host.style.removeProperty("transform");
+      host.style.removeProperty("will-change");
+      host.style.left = finalX + "px";
+      host.style.top = finalY + "px";
+      host.style.right = "auto";
+      host.style.bottom = "auto";
+      sSet("volo.kanban.x", finalX);
+      sSet("volo.kanban.y", finalY);
+      sSet("soloKanbanniangX", finalX);
+      sSet("soloKanbanniangY", finalY);
+      clampTipToViewport();
+      window.dispatchEvent(new CustomEvent("volo:kanban-moved"));
+      return;
+    }
+    if (!isCancel) {
+      if (isTouchOrCoarse(ev)) {
+        host.classList.toggle("is-tools-open");
+      }
+      if (state.isCanvas && ready) {
+        sendHeadPat();
+      }
+    }
+  }
+
+  listen(host, "pointerup", function (ev) {
+    finishPointer(ev, false);
+  });
+  listen(host, "pointercancel", function (ev) {
+    finishPointer(ev, true);
+  });
+
+  window.VoloKanban = {
+    destroy: destroy,
+    change: change,
+    showMessage: showMessage,
+    syncLocale: syncLocale,
+    isReady: function () {
+      return ready;
+    },
+    isAlive: function () {
+      return alive;
+    }
+  };
+
+  syncLocale();
+  if (document.readyState === "loading") {
+    listen(document, "DOMContentLoaded", scheduleIdleStart, { once: true });
+  } else {
+    scheduleIdleStart();
   }
 })();

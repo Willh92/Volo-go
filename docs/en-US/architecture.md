@@ -2,7 +2,7 @@
 
 > 中文版本：[架构设计与性能内幕](../zh-CN/architecture.md)
 
-`Volo-go` is a pure-Go (`CGO_ENABLED=0`, Go `1.27.4`, `GOEXPERIMENT=nojsonv2`) sovereign blog engine engineered from scratch to deliver multi-database dialect portability, real-time non-destructive image rendering, a 10-surface zero-leak privacy perimeter, first-party pure-Go ES6 plugin sandboxing, and microsecond-class read throughput inside a **strictly `< 21 MiB` static single binary across all 6 release targets** (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) and **`< 35 MiB` resident memory (`VmRSS`)** envelope.
+`Volo-go` is a pure-Go (`CGO_ENABLED=0`, Go `1.27.4`, `GOEXPERIMENT=nojsonv2`) sovereign blog engine engineered from scratch to deliver multi-database dialect portability, real-time non-destructive image rendering, a 10-surface zero-leak privacy perimeter, first-party pure-Go ES6 plugin sandboxing, and microsecond-class read throughput inside a **`< 22 MiB` static single binary across all 6 release targets** (`~19.4–20.2 MiB` measured across `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) and **`< 35 MiB` resident memory (`VmRSS`)** envelope.
 
 ---
 
@@ -46,9 +46,9 @@
 
 ---
 
-## 2. Normalized Relational Schema (`v8`: 33 Data Tables + 9 Settings Domains)
+## 2. Normalized Relational Schema (`v9`: 33 Data Tables + 9 Settings Domains)
 
-`Volo-go` replaces fragmented key-value JSON blobs and indirect tag-derived categorization with a normalized relational schema (`internal/db/migrate/schema.go`, current schema version **`v8`**, tracked via `schema_migrations` across idempotent steps `v1`–`v8`, with **33 normalized data tables** in `CanonicalTables`):
+`Volo-go` replaces fragmented key-value JSON blobs and indirect tag-derived categorization with a normalized relational schema (`internal/db/migrate/schema.go`, current schema version **`v9`**, tracked via `schema_migrations` across idempotent steps `v1`–`v9`, with **33 normalized data tables** in `CanonicalTables`):
 
 | Domain | Tables (33 Data Tables + `schema_migrations`) | Key Design Choices |
 | :--- | :--- | :--- |
@@ -64,7 +64,7 @@
 | Settings Domain | Core Responsibilities & Representative Keys |
 | :--- | :--- |
 | `site` | Title/subtitle, default locale, timezone, notice board, social links, license template, global `custom_vars` map |
-| `reading` | Timeline `list_style` (`summary \| title_only \| full`), pagination counts, PJAX, instant search, comment access & smart moderation, per-identity comment rune/line bounds (`comment_min_length`, `comment_max_length_{guest,user,staff}`, `comment_max_lines_{guest,user,staff}`), PoW difficulty, CDN prefixes |
+| `reading` | Timeline `list_style` (`summary \| title_only \| full`), pagination counts, PJAX, instant search, comment access & smart moderation, per-identity comment rune/line bounds (`comment_min_length`, `comment_max_length_{guest,user,staff}`, `comment_max_lines_{guest,user,staff}`), configurable per-IP comment rate limiting (`comment_rate_window_seconds`, `comment_rate_max_count`), PoW difficulty, CDN prefixes |
 | `feed` | RSS/Atom output mode (`summary \| full`), `item_count` (shared across RSS, Atom, and Podcast), `/llms.txt` toggle, `.md` raw view toggle, Apple/Spotify `podcast` channel metadata |
 | `seo` | Meta keywords/description, default OG image, 4 canonical `post_permalink_style` templates (`/posts/{slug}`, `/archives/{slug}`, `/p/{slug}`, `/{year}/{month}/{slug}` with instant cache & search rebuild), IndexNow key, cached GitHub showcase repos |
 | `storage` | Active driver (`local \| s3`), custom local media directory `local_dir`, `max_upload_mb`, EXIF stripping, adaptive WebP quality, S3/R2/MinIO settings & encrypted `s3_secret_key` |

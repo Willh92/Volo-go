@@ -1762,23 +1762,27 @@ func (s *Service) queryArchiveStatsForLocation(ctx context.Context, loc *time.Lo
 	if loc == nil {
 		loc = s.siteLocation()
 	}
-	type pubRow struct {
-		PublishedAt int64 `db:"published_at"`
-	}
-	var rows []pubRow
-	err := sqlx.SelectInto(ctx, s.store, &rows,
+	rows, err := s.store.QueryContext(ctx,
 		`SELECT CASE WHEN published_at > 0 THEN published_at ELSE created_at END AS published_at FROM articles WHERE status = ? ORDER BY published_at DESC`,
 		domain.ArticleStatusPublished,
 	)
 	if err != nil {
 		return ArchiveStats{}, err
 	}
+	defer rows.Close()
+
 	yearCounts := make(map[string]int)
 	monthCounts := make(map[string]int)
 	var yearOrder []string
 	var monthOrder []string
-	for _, r := range rows {
-		ym := time.UnixMilli(r.PublishedAt).In(loc).Format("2006-01")
+	totalArticles := 0
+	for rows.Next() {
+		var pubAt int64
+		if sErr := rows.Scan(&pubAt); sErr != nil {
+			return ArchiveStats{}, sErr
+		}
+		totalArticles++
+		ym := time.UnixMilli(pubAt).In(loc).Format("2006-01")
 		yr := ym[:4]
 		if yearCounts[yr] == 0 {
 			yearOrder = append(yearOrder, yr)
@@ -1789,6 +1793,9 @@ func (s *Service) queryArchiveStatsForLocation(ctx context.Context, loc *time.Lo
 		}
 		monthCounts[ym]++
 	}
+	if err := rows.Err(); err != nil {
+		return ArchiveStats{}, err
+	}
 	years := make([]ArchiveYear, 0, len(yearOrder))
 	for _, yr := range yearOrder {
 		years = append(years, ArchiveYear{Year: yr, Count: yearCounts[yr]})
@@ -1798,7 +1805,7 @@ func (s *Service) queryArchiveStatsForLocation(ctx context.Context, loc *time.Lo
 		months = append(months, ArchiveMonth{YearMonth: ym, Count: monthCounts[ym]})
 	}
 	return ArchiveStats{
-		TotalArticles: len(rows),
+		TotalArticles: totalArticles,
 		Years:         years,
 		Months:        months,
 		YearCounts:    yearCounts,
@@ -2015,7 +2022,92 @@ func (s *Service) ListFollowsWithItemsPage(ctx context.Context, page int, perPag
 	return s.hydrateFollowGroups(ctx, follows, itemsPerFollow), total, nil
 }
 
+// ListFollowsWithItemsSearchPage filters RSS Follow subscriptions by optional query q (matching follow title/feed_url
+// or item title/url/summary) and returns a bounded page of groups and total matching follow count.
+func (s *Service) ListFollowsWithItemsSearchPage(ctx context.Context, q string, page int, perPage int, itemsPerFollow int) ([]FollowGroup, int, error) {
+	limit, offset := dialect.NormalizePage(page, perPage, 10, 50)
+	if itemsPerFollow <= 0 {
+		itemsPerFollow = 20
+	}
+	if itemsPerFollow > 50 {
+		itemsPerFollow = 50
+	}
+
+	cleanQ := strings.TrimSpace(q)
+	if cleanQ == "" {
+		return s.ListFollowsWithItemsPage(ctx, page, limit, itemsPerFollow)
+	}
+
+	esc := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(cleanQ)
+	pat := "%" + esc + "%"
+	whereSQL := `
+		WHERE LOWER(f.title) LIKE LOWER(?) ESCAPE '!'
+		   OR LOWER(f.feed_url) LIKE LOWER(?) ESCAPE '!'
+		   OR EXISTS (
+		        SELECT 1 FROM follow_items fi
+		        WHERE fi.follow_id = f.id
+		          AND (LOWER(fi.title) LIKE LOWER(?) ESCAPE '!'
+		            OR LOWER(fi.url) LIKE LOWER(?) ESCAPE '!'
+		            OR LOWER(fi.summary) LIKE LOWER(?) ESCAPE '!')
+		   )`
+	whereArgs := []any{pat, pat, pat, pat, pat}
+
+	var total int
+	if err := s.store.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows f `+whereSQL, whereArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []FollowGroup{}, 0, nil
+	}
+
+	pageSQL, pageArgs := s.store.Dialect().PaginateSQL(
+		`SELECT * FROM follows f `+whereSQL+` ORDER BY f.sort_order ASC, f.created_at ASC`,
+		limit, offset,
+	)
+	fullArgs := append(append([]any{}, whereArgs...), pageArgs...)
+	var follows []domain.Follow
+	if err := sqlx.SelectInto(ctx, s.store, &follows, pageSQL, fullArgs...); err != nil {
+		return nil, 0, err
+	}
+	if len(follows) == 0 {
+		return []FollowGroup{}, total, nil
+	}
+
+	lowQ := strings.ToLower(cleanQ)
+	var directFollows []domain.Follow
+	var itemOnlyFollows []domain.Follow
+	for _, f := range follows {
+		if strings.Contains(strings.ToLower(f.Title), lowQ) || strings.Contains(strings.ToLower(f.FeedURL), lowQ) {
+			directFollows = append(directFollows, f)
+		} else {
+			itemOnlyFollows = append(itemOnlyFollows, f)
+		}
+	}
+
+	byID := make(map[string][]domain.FollowItem, len(follows))
+	for _, grp := range s.hydrateFollowGroups(ctx, directFollows, itemsPerFollow) {
+		byID[grp.Follow.ID] = grp.Items
+	}
+	for _, grp := range s.hydrateFollowGroupsFiltered(ctx, itemOnlyFollows, pat, itemsPerFollow) {
+		byID[grp.Follow.ID] = grp.Items
+	}
+
+	out := make([]FollowGroup, 0, len(follows))
+	for _, f := range follows {
+		items := byID[f.ID]
+		if items == nil {
+			items = []domain.FollowItem{}
+		}
+		out = append(out, FollowGroup{Follow: f, Items: items})
+	}
+	return out, total, nil
+}
+
 func (s *Service) hydrateFollowGroups(ctx context.Context, follows []domain.Follow, itemsPerFollow int) []FollowGroup {
+	return s.hydrateFollowGroupsFiltered(ctx, follows, "", itemsPerFollow)
+}
+
+func (s *Service) hydrateFollowGroupsFiltered(ctx context.Context, follows []domain.Follow, likePat string, itemsPerFollow int) []FollowGroup {
 	if len(follows) == 0 {
 		return []FollowGroup{}
 	}
@@ -2023,14 +2115,29 @@ func (s *Service) hydrateFollowGroups(ctx context.Context, follows []domain.Foll
 		itemsPerFollow = 5
 	}
 	placeholders := make([]string, len(follows))
-	args := make([]any, len(follows))
+	args := make([]any, 0, len(follows)+4)
 	for i, f := range follows {
 		placeholders[i] = "?"
-		args[i] = f.ID
+		args = append(args, f.ID)
 	}
+	itemFilterSQL := ""
+	if likePat != "" {
+		itemFilterSQL = ` AND (LOWER(title) LIKE LOWER(?) ESCAPE '!' OR LOWER(url) LIKE LOWER(?) ESCAPE '!' OR LOWER(summary) LIKE LOWER(?) ESCAPE '!')`
+		args = append(args, likePat, likePat, likePat)
+	}
+	args = append(args, itemsPerFollow)
 	q := fmt.Sprintf(
-		`SELECT * FROM follow_items WHERE follow_id IN (%s) ORDER BY published_at DESC`,
+		`SELECT id, follow_id, guid_hash, title, url, summary, author_name, published_at
+		 FROM (
+			SELECT id, follow_id, guid_hash, title, url, summary, author_name, published_at,
+			       ROW_NUMBER() OVER (PARTITION BY follow_id ORDER BY published_at DESC, id DESC) AS rn
+			FROM follow_items
+			WHERE follow_id IN (%s)%s
+		 ) t
+		 WHERE t.rn <= ?
+		 ORDER BY t.published_at DESC, t.id DESC`,
 		strings.Join(placeholders, ","),
+		itemFilterSQL,
 	)
 	var allItems []domain.FollowItem
 	_ = sqlx.SelectInto(ctx, s.store, &allItems, q, args...)
@@ -2042,7 +2149,11 @@ func (s *Service) hydrateFollowGroups(ctx context.Context, follows []domain.Foll
 	}
 	out := make([]FollowGroup, 0, len(follows))
 	for _, f := range follows {
-		out = append(out, FollowGroup{Follow: f, Items: byFollow[f.ID]})
+		items := byFollow[f.ID]
+		if items == nil {
+			items = []domain.FollowItem{}
+		}
+		out = append(out, FollowGroup{Follow: f, Items: items})
 	}
 	return out
 }

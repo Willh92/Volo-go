@@ -68,7 +68,7 @@ func Default() *Handler {
 	return defaultHandler
 }
 
-// TotalGzipBytes returns the total pre-compressed Gzip byte size of all embedded Admin SPA assets (for < 300 KB budget audit).
+// TotalGzipBytes returns the total pre-compressed Gzip byte size of all embedded Admin SPA assets (for < 300 KiB budget audit).
 func (h *Handler) TotalGzipBytes() int {
 	total := 0
 	for rel, item := range h.assets {
@@ -373,7 +373,7 @@ func (h *Handler) renderIndexHTML(baseHref string, boot BootConfig) []byte {
 func serveCachedAsset(w http.ResponseWriter, r *http.Request, item cachedAsset) {
 	w.Header().Set("Content-Type", item.contentType)
 	w.Header().Set("Vary", "Accept-Encoding")
-	if item.immutable {
+	if item.immutable && (r.URL.RawQuery != "" || hasAssetFilenameHash(r.URL.Path)) {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	} else {
 		w.Header().Set("Cache-Control", "public, max-age=300")
@@ -409,6 +409,16 @@ func serveCachedAsset(w http.ResponseWriter, r *http.Request, item cachedAsset) 
 			_, _ = io.Copy(w, gr)
 		}
 	}
+}
+
+func hasAssetFilenameHash(urlPath string) bool {
+	base := path.Base(urlPath)
+	dash := strings.LastIndexByte(base, '-')
+	dot := strings.IndexByte(base[max(0, dash):], '.')
+	if dash <= 0 || dot <= 5 {
+		return false
+	}
+	return true
 }
 
 func acceptsGzip(hdr string) bool {

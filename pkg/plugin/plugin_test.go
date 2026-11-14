@@ -23,7 +23,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/i18n"
 )
 
-func openTestPluginEnv(t *testing.T) (*sqlx.Store, *config.KeyRing, *i18n.Catalog, string) {
+func openTestPluginEnv(t testing.TB) (*sqlx.Store, *config.KeyRing, *i18n.Catalog, string) {
 	t.Helper()
 	ctx := context.Background()
 	tmpDir := t.TempDir()

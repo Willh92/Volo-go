@@ -14,7 +14,7 @@
 
 Legacy backups carry historical schema debt (sharded 10KB key-value JSON strings, indirect tag-based categorization, legacy password hashes, and `.html` permalinks). `Volo-go`'s streaming `json.Decoder` pipeline transforms them inside an atomic transaction without buffering the entire archive in memory:
 
-| Legacy Structure | `Volo-go` Normalized Target (`v8` Schema) | Transformation Behavior |
+| Legacy Structure | `Volo-go` Normalized Target (`v9` Schema) | Transformation Behavior |
 | :--- | :--- | :--- |
 | Sharded key-value JSON documents (Series, Bookshelf, Daily Analytics, Webhooks) | `series`, `series_articles`, `books`, `book_chapters`, `analytics_daily`, `webhooks` | Reassembles multi-shard JSON payloads into first-class relational tables with foreign keys |
 | Indirect `category` + `category_tag` + `tag_article` categorization | `articles.category_id` + `article_tags` | Derives each post's primary category directly from its tag bindings while preserving all freeform tags |
@@ -22,6 +22,7 @@ Legacy backups carry historical schema debt (sharded 10KB key-value JSON strings
 | Custom navigation links | `nav_items` & `pages` | Preserves navigation order, icons, and target attributes |
 | Legacy post URLs (e.g. `/articles/2021/05/12/1620812.html`) | `articles.legacy_permalink` + `redirects` | Generates clean semantic slugs while storing the original path in `legacy_permalink`; requests to old `.html` URLs resolve in `O(1)` memory with **`301 Moved Permanently`** redirects |
 | Legacy `PBKDF2` password hashes | `users.legacy_hash` -> `Argon2id` | Imported users sign in without password resets; first successful login transparently upgrades the hash to `Argon2id` and clears `legacy_hash` |
+| Legacy `plugins` state & `kanbanniangSelector` option | `plugins` (`id="kanbanniang"`) | Preserves the legacy Live2D mascot enabled/disabled status and maps any selected model among the 26 bundled Live2D models into `config_json` (falling back safely to `"random"` for retired/unknown IDs) |
 
 ### 1.2 Running the Migration (CLI or Web UI)
 
@@ -60,7 +61,7 @@ Every native `.zip` archive streams all **33 normalized data tables** in `migrat
 
 ```text
 volo-backup-20261108-010000.zip
-├── manifest.json                 # Records format, schema_version (v8), source_dialect, byte sizes, row counts & SHA-256 digests
+├── manifest.json                 # Records format, schema_version (v9), source_dialect, byte sizes, row counts & SHA-256 digests
 ├── tables/
 │   ├── 01_settings.ndjson        # Dialect-neutral NDJSON streams for all 33 canonical tables in FK order
 │   ├── 02_users.ndjson

@@ -27,6 +27,8 @@ import {
   MoveTopIcon,
   paginateItems,
   Pagination,
+  runConcurrentUploads,
+  summarizeUA,
   SwitchToggle,
   TableSkeleton,
   UploadButton,
@@ -128,37 +130,6 @@ function formatAssetSize(bytes: number): string {
   return `${Math.max(1, Math.round(n / 1024))} KB`;
 }
 
-function summarizeUA(ua?: string): string {
-  if (!ua) return "";
-  const s = String(ua).trim();
-  if (!s) return "";
-  const browser = /Edg\//i.test(s)
-    ? "Edge"
-    : /OPR\/|Opera/i.test(s)
-    ? "Opera"
-    : /Firefox\//i.test(s)
-    ? "Firefox"
-    : /Chrome\//i.test(s) && !/Chromium/i.test(s)
-    ? "Chrome"
-    : /Safari\//i.test(s) && !/Chrome/i.test(s)
-    ? "Safari"
-    : /curl\//i.test(s)
-    ? "curl"
-    : "";
-  const os = /iPhone|iPad|iOS/i.test(s)
-    ? "iOS"
-    : /Android/i.test(s)
-    ? "Android"
-    : /Mac OS X|Macintosh/i.test(s)
-    ? "macOS"
-    : /Windows/i.test(s)
-    ? "Windows"
-    : /Linux/i.test(s)
-    ? "Linux"
-    : "";
-  return [browser, os].filter(Boolean).join(" · ") || s.slice(0, 22);
-}
-
 export function ContentWorkspace({
   activeTab = "categories",
   onNavigate,
@@ -241,6 +212,9 @@ export function ContentWorkspace({
   const [bookModalOpen, setBookModalOpen] = useState(false);
   const [bookForm, setBookForm] = useState({ ...EMPTY_BOOK });
   const [bookSeriesOpts, setBookSeriesOpts] = useState<any[] | null>(null);
+  const [bookSeriesTotal, setBookSeriesTotal] = useState(0);
+  const [bookSeriesPage, setBookSeriesPage] = useState(1);
+  const [bookSeriesQ, setBookSeriesQ] = useState("");
   const [seriesLabels, setSeriesLabels] = useState<Record<string, string>>({});
   const [swappingBook, setSwappingBook] = useState(false);
   const bookFlip = useFlipList<HTMLTableSectionElement>();
@@ -489,13 +463,24 @@ export function ContentWorkspace({
         }
         const [bkRes, serRes] = await Promise.all([
           apiFetch<{ items: any[]; total?: number }>(`/api/admin/books?${qs.toString()}`),
-          apiFetch<{ items: any[] }>("/api/admin/series?per_page=200"),
+          apiFetch<{ items: any[]; total?: number }>("/api/admin/series?page=1&per_page=20"),
         ]);
         if (reqId !== reqSeqRef.current) return;
         const list = bkRes.items || [];
+        const serList = serRes.items || [];
         setBooks(list);
         setSubTotal(typeof bkRes.total === "number" ? bkRes.total : list.length);
-        setSeries(serRes.items || []);
+        setSeries(serList);
+        setBookSeriesTotal(serRes.total ?? serList.length);
+        if (serList.length > 0) {
+          setSeriesLabels((prev) => {
+            const next = { ...prev };
+            for (const s of serList) {
+              if (s?.id && s.title) next[s.id] = s.title;
+            }
+            return next;
+          });
+        }
       } else if (sub === "comments") {
         const qs = new URLSearchParams();
         qs.set("page", String(pageIdx));
@@ -1559,39 +1544,41 @@ export function ContentWorkspace({
     }
   };
 
+  const loadBookSeriesPage = async (pg: number, q: string) => {
+    try {
+      const qs = new URLSearchParams({ page: String(pg), per_page: "20" });
+      if (q.trim()) qs.set("q", q.trim());
+      const res = await apiFetch<{ items?: any[]; series?: any[]; total?: number }>(
+        `/api/admin/series?${qs.toString()}`
+      );
+      const items = res.items || res.series || [];
+      setBookSeriesOpts(items);
+      setBookSeriesTotal(res.total ?? items.length);
+      if (items.length > 0) {
+        setSeriesLabels((prev) => {
+          const next = { ...prev };
+          for (const s of items) {
+            if (s?.id && s.title) next[s.id] = s.title;
+          }
+          return next;
+        });
+      }
+    } catch {}
+  };
+
   const uploadMediaFiles = async (fileList: FileList | File[]) => {
     const files = Array.from(fileList);
     if (files.length === 0) return;
     setUploadingMedia(true);
     setMediaUploadPct(0);
-    const totalBytes = Math.max(1, files.reduce((acc, f) => acc + Math.max(1, f.size), 0));
-    const perFileLoaded = new Array<number>(files.length).fill(0);
-    const updateAggPct = () => {
-      const loaded = perFileLoaded.reduce((a, b) => a + b, 0);
-      setMediaUploadPct(Math.min(100, Math.round((loaded / totalBytes) * 100)));
-    };
     let okCount = 0;
-    let cursor = 0;
-    const workerCount = Math.min(3, files.length);
     try {
-      await Promise.all(
-        Array.from({ length: workerCount }, async () => {
-          while (cursor < files.length) {
-            const idx = cursor++;
-            const f = files[idx];
-            const fSize = Math.max(1, f.size);
-            const fd = new FormData();
-            fd.append("file", f);
-            await uploadWithProgress("/api/admin/media/upload", fd, (pct) => {
-              perFileLoaded[idx] = (pct / 100) * fSize;
-              updateAggPct();
-            });
-            perFileLoaded[idx] = fSize;
-            updateAggPct();
-            okCount++;
-          }
-        })
-      );
+      await runConcurrentUploads(files, 3, setMediaUploadPct, async (f, _idx, onFilePct) => {
+        const fd = new FormData();
+        fd.append("file", f);
+        await uploadWithProgress("/api/admin/media/upload", fd, onFilePct);
+        okCount++;
+      });
       if (okCount > 0) {
         showToast(okCount > 1 ? t("cnt.media_uploaded_n", { count: okCount }) : t("cnt.media_uploaded"));
         await loadSub();
@@ -1816,7 +1803,7 @@ export function ContentWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("cnt.col_name")}</th>
@@ -2064,7 +2051,7 @@ export function ContentWorkspace({
           />
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-check">
@@ -2309,7 +2296,7 @@ export function ContentWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("cnt.col_name")}</th>
@@ -2731,7 +2718,7 @@ export function ContentWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("cnt.book_col")}</th>
@@ -2956,23 +2943,10 @@ export function ContentWorkspace({
                             bookForm.series_id
                           : t("art.series_none")
                       }
-                      onSearch={async (q) => {
-                        try {
-                          const qs = new URLSearchParams({ per_page: "100" });
-                          if (q) qs.set("q", q);
-                          const res = await apiFetch<{ items?: any[]; series?: any[] }>(`/api/admin/series?${qs.toString()}`);
-                          const items = res.items || res.series || [];
-                          setBookSeriesOpts(items);
-                          if (items.length > 0) {
-                            setSeriesLabels((prev) => {
-                              const next = { ...prev };
-                              for (const s of items) {
-                                if (s?.id && s.title) next[s.id] = s.title;
-                              }
-                              return next;
-                            });
-                          }
-                        } catch {}
+                      onSearch={(q) => {
+                        setBookSeriesQ(q);
+                        setBookSeriesPage(1);
+                        void loadBookSeriesPage(1, q);
                       }}
                       options={(() => {
                         const base = bookSeriesOpts ?? series;
@@ -2995,6 +2969,17 @@ export function ContentWorkspace({
                         return opts;
                       })()}
                     />
+                    {bookSeriesTotal > 20 && (
+                      <Pagination
+                        total={bookSeriesTotal}
+                        page={bookSeriesPage}
+                        pageSize={20}
+                        onChange={(p) => {
+                          setBookSeriesPage(p);
+                          void loadBookSeriesPage(p, bookSeriesQ);
+                        }}
+                      />
+                    )}
                   </div>
                 ) : (
                   <div class="volo-field">
@@ -3511,7 +3496,7 @@ export function ContentWorkspace({
                 </div>
               </div>
               <div class="volo-table-wrap">
-                <table class="volo-table">
+                <table class="volo-table volo-table-compact">
                   <thead>
                     <tr>
                       <th class="col-fluid">{t("cnt.page_col")}</th>
@@ -3703,7 +3688,7 @@ export function ContentWorkspace({
           />
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-check">

@@ -293,7 +293,9 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 
 			if !isAnimatedGIF {
 				orient := ReadEXIFOrientation(raw)
-				if !stCfg.StripEXIF && orient == 1 && (!stCfg.AdaptiveWebP || formatName == "webp") &&
+				needsJPEGQualityReencode := formatName == "jpeg" && stCfg.ImageQuality > 0 && stCfg.ImageQuality < 100
+				if !stCfg.StripEXIF && orient == 1 && !needsJPEGQualityReencode &&
+					(!stCfg.AdaptiveWebP || formatName == "webp" || formatName == "jpeg") &&
 					(formatName == "jpeg" || formatName == "png" || formatName == "webp") {
 					img, _, decErr := decodeRasterImageSafe(raw)
 					if decErr != nil {
@@ -337,6 +339,11 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 					return nil
 				}
 
+				origRawLen := len(raw)
+				var keptMeta imageMetadataChunks
+				if !stCfg.StripEXIF {
+					keptMeta = extractImageMetadata(raw)
+				}
 				img, _, decErr := decodeRasterImageSafe(raw)
 				raw = nil // Release compressed upload buffer before pixel transforms & WebP encoding.
 				if decErr != nil {
@@ -370,6 +377,21 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 					}
 					baselineExt = ".webp"
 					baselineMIME = "image/webp"
+					// Avoid 10x lossless VP8L bloat when rotating a photographic lossy WebP with EXIF orientation != 1.
+					if baselineBuf.Len() > origRawLen*2 && origRawLen > 32*1024 {
+						isOpaque := false
+						if o, ok := any(upright).(interface{ Opaque() bool }); ok && o.Opaque() {
+							isOpaque = true
+						}
+						if isOpaque {
+							var jpgBuf bytes.Buffer
+							if jErr := jpeg.Encode(&jpgBuf, upright, &jpeg.Options{Quality: quality}); jErr == nil && jpgBuf.Len() > 0 && jpgBuf.Len() < baselineBuf.Len() {
+								baselineBuf = jpgBuf
+								baselineExt = ".jpg"
+								baselineMIME = "image/jpeg"
+							}
+						}
+					}
 				default: // jpeg
 					if err := jpeg.Encode(&baselineBuf, upright, &jpeg.Options{Quality: quality}); err != nil {
 						return fmt.Errorf("jpeg re-encode failed: %w", err)
@@ -382,8 +404,8 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 				finalExt = baselineExt
 				finalMIME = baselineMIME
 
-				// Pure-Go Adaptive WebP: encode lossless WebP and adopt it whenever smaller than baseline (or when already WebP)
-				if stCfg.AdaptiveWebP && formatName != "webp" {
+				// Pure-Go Adaptive WebP: HugoSmits86/nativewebp is lossless VP8L only, so run trial conversion on lossless PNG/GIF inputs and skip JPEG photos.
+				if stCfg.AdaptiveWebP && formatName != "webp" && formatName != "jpeg" {
 					var webpBuf bytes.Buffer
 					if wErr := nativewebp.Encode(&webpBuf, upright, nil); wErr == nil && webpBuf.Len() > 0 && webpBuf.Len() < len(finalBytes) {
 						finalBytes = webpBuf.Bytes()
@@ -392,6 +414,13 @@ func (p *Pipeline) Upload(ctx context.Context, uploaderID string, origFilename s
 					}
 				}
 				upright = nil
+
+				if !stCfg.StripEXIF {
+					outFmt := strings.TrimPrefix(finalExt, ".")
+					if injected, mErr := injectImageMetadata(finalBytes, outFmt, map[string]bool{"exif": true, "icc": true, "xmp": true}, keptMeta, orient > 1); mErr == nil {
+						finalBytes = injected
+					}
+				}
 
 				if stCfg.StripEXIF && ContainsEXIFOrGPS(finalBytes) {
 					return errors.New("privacy invariant violation: residual metadata detected after pixel re-encode")

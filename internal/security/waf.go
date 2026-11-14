@@ -290,7 +290,8 @@ func (w *WAFEngine) ReloadBans(ctx context.Context) error {
 	now := time.Now().UnixMilli()
 	var rows []domain.SecurityIPBan
 	err := sqlx.SelectInto(ctx, w.store, &rows,
-		`SELECT * FROM security_ip_bans WHERE expires_at = 0 OR expires_at > ? ORDER BY created_at DESC`, now)
+		`SELECT * FROM security_ip_bans WHERE expires_at = 0 OR expires_at > ? ORDER BY created_at DESC`,
+		now)
 	if err != nil {
 		return err
 	}
@@ -324,11 +325,7 @@ func (w *WAFEngine) ReloadBans(ctx context.Context) error {
 	w.bansMu.Lock()
 	w.activeBans = newBans
 	w.banReasons = newReasons
-	for pfx, c := range newCounts {
-		if c > w.banCounts[pfx] {
-			w.banCounts[pfx] = c
-		}
-	}
+	w.banCounts = newCounts
 	w.banPrefixes = newPrefixes
 	w.bansMu.Unlock()
 	return nil
@@ -876,7 +873,7 @@ func (w *WAFEngine) WrapHTTP(next http.Handler) http.Handler {
 		w.bansMu.RLock()
 		pubURL := w.publicURL
 		w.bansMu.RUnlock()
-		if r.TLS != nil || strings.HasPrefix(strings.ToLower(pubURL), "https://") {
+		if r.TLS != nil || (w.cfg != nil && w.cfg.TLSEnabled()) || strings.HasPrefix(strings.ToLower(pubURL), "https://") {
 			rw.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 

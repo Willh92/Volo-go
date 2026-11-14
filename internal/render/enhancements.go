@@ -808,21 +808,24 @@ func rewriteExtendedTextSegment(text string) string {
 	var b strings.Builder
 	b.Grow(len(text) + 24)
 	lastFlush := 0
+	noHighlightCloseUntil := 0
 	for p := 0; p < len(text); {
 		if end := skipURLOrPathToken(text, p); end > p {
 			p = end
 			continue
 		}
-		if p+3 < len(text) && text[p] == '=' && text[p+1] == '=' &&
+		if p >= noHighlightCloseUntil && p+3 < len(text) && text[p] == '=' && text[p+1] == '=' &&
 			(p == 0 || text[p-1] != '=') &&
 			text[p+2] != '=' && !isASCIIWhitespace(text[p+2]) {
 			closed := -1
-			for q := p + 2; q+1 < len(text); q++ {
+			lineEnd := len(text)
+			for q := p + 2; q < len(text); q++ {
 				if text[q] == '\n' || text[q] == '\r' {
+					lineEnd = q
 					break
 				}
-				if text[q] == '=' && text[q+1] == '=' &&
-					q > p+2 && text[q-1] != '=' && !isASCIIWhitespace(text[q-1]) &&
+				if q > p+2 && q+1 < len(text) && text[q] == '=' && text[q+1] == '=' &&
+					text[q-1] != '=' && !isASCIIWhitespace(text[q-1]) &&
 					(q+2 == len(text) || text[q+2] != '=') {
 					closed = q
 					break
@@ -839,6 +842,7 @@ func rewriteExtendedTextSegment(text string) string {
 				lastFlush = p
 				continue
 			}
+			noHighlightCloseUntil = lineEnd
 		}
 		p++
 	}

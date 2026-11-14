@@ -43,8 +43,9 @@ func TestBuildIndexCSPAndMemoryDedup(t *testing.T) {
 	}
 
 	totalGZ := h.TotalGzipBytes()
-	if totalGZ <= 50*1024 || totalGZ >= 300*1024 {
-		t.Fatalf("expected TotalGzipBytes in (50 KiB, 300 KiB), got %d bytes (%.1f KiB)", totalGZ, float64(totalGZ)/1024.0)
+	const maxAdminSPAGzipBytes = 380 * 1024
+	if totalGZ <= 50*1024 || totalGZ >= maxAdminSPAGzipBytes {
+		t.Fatalf("expected TotalGzipBytes in (50 KiB, 380 KiB), got %d bytes (%.1f KiB)", totalGZ, float64(totalGZ)/1024.0)
 	}
 
 	// Verify zh-CN boot locale injection

@@ -30,19 +30,53 @@
       </div>
     {{end}}
     <nav class="book-reader-toc__nav" aria-label="{{.BookDetail.Title}}">
-      {{range .BookDetail.FlatChapters}}
-        {{$d := .Depth}}{{if lt $d 0}}{{$d = 0}}{{end}}{{if gt $d 4}}{{$d = 4}}{{end}}
-        {{$isAct := and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}
-        {{if hasPrefix .URL "/"}}
-          <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
-        {{else if .URL}}
-          {{if or (eq $.BookDetail.EmbedMode "iframe") (eq $.BookDetail.EmbedMode "inline")}}
-            <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
+      {{$totalChaps := len .BookDetail.FlatChapters}}
+      {{$hasGroups := false}}{{$minGrpDepth := 99}}
+      {{range .BookDetail.FlatChapters}}{{if not .URL}}{{$hasGroups = true}}{{if lt .Depth $minGrpDepth}}{{$minGrpDepth = .Depth}}{{end}}{{end}}{{end}}
+      {{if and (gt $totalChaps 60) $hasGroups}}
+        {{$activeVol := -1}}{{$scanVol := -1}}
+        {{range .BookDetail.FlatChapters}}
+          {{if and (not .URL) (le .Depth $minGrpDepth)}}{{$scanVol = add $scanVol 1}}{{else if and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}{{$activeVol = $scanVol}}{{end}}
+        {{end}}
+        {{if and (lt $activeVol 0) (ge $scanVol 0)}}{{$activeVol = 0}}{{end}}
+        {{$curVol := -1}}{{$volOpen := false}}
+        {{range .BookDetail.FlatChapters}}
+          {{$d := .Depth}}{{if lt $d 0}}{{$d = 0}}{{end}}{{if gt $d 4}}{{$d = 4}}{{end}}
+          {{$isAct := and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}
+          {{if and (not .URL) (le .Depth $minGrpDepth)}}
+            {{if $volOpen}}</div></details>{{end}}
+            {{$curVol = add $curVol 1}}{{$volOpen = true}}{{$isOpen := eq $curVol $activeVol}}
+            <details class="book-reader-toc__volume"{{if $isOpen}} open data-default-open="1"{{end}}>
+              <summary class="book-reader-toc__volume-sum"><span>{{.Title}}</span></summary>
+              <div class="book-reader-toc__volume-list">
+          {{else if hasPrefix .URL "/"}}
+            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link reader-tree__item{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
+          {{else if .URL}}
+            {{if or (eq $.BookDetail.EmbedMode "iframe") (eq $.BookDetail.EmbedMode "inline")}}
+              <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link reader-tree__item{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
+            {{else}}
+              <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link book-chap-link reader-tree__item" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}} ↗</a>
+            {{end}}
           {{else}}
-            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link book-chap-link" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}} ↗</a>
+            <span class="book-reader-toc__group reader-tree__item" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</span>
           {{end}}
-        {{else}}
-          <span class="book-reader-toc__group" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</span>
+        {{end}}
+        {{if $volOpen}}</div></details>{{end}}
+      {{else}}
+        {{range .BookDetail.FlatChapters}}
+          {{$d := .Depth}}{{if lt $d 0}}{{$d = 0}}{{end}}{{if gt $d 4}}{{$d = 4}}{{end}}
+          {{$isAct := and $.ActiveChapter (eq $.ActiveChapter.ID .ID)}}
+          {{if hasPrefix .URL "/"}}
+            <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link reader-tree__item{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
+          {{else if .URL}}
+            {{if or (eq $.BookDetail.EmbedMode "iframe") (eq $.BookDetail.EmbedMode "inline")}}
+              <a href="/books/{{$.BookDetail.Slug}}?ch={{.ID}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" class="book-reader-toc__link book-chap-link reader-tree__item{{if $isAct}} is-active active{{end}}" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</a>
+            {{else}}
+              <a href="{{.URL}}" data-chapter-id="{{.ID}}" data-chapter-title="{{.Title}}" target="_blank" rel="noopener" data-no-pjax class="book-reader-toc__link book-chap-link reader-tree__item" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}} ↗</a>
+            {{end}}
+          {{else}}
+            <span class="book-reader-toc__group reader-tree__item" style="padding-left:{{add 12 (mul $d 12)}}px">{{.Title}}</span>
+          {{end}}
         {{end}}
       {{end}}
     </nav>
@@ -103,7 +137,15 @@
           <div class="js-unlock-msg volo-unlock-err"{{if not .BookUnlockError}} hidden{{end}}>{{default (t .Locale "article.unlock_wrong_pwd") .BookUnlockError}}</div>
         </form>
         {{if .BookArticleSlug}}
-          <p class="book-unlock-card__foot"><a class="studio-meta-link" href="/posts/{{.BookArticleSlug}}">/posts/{{.BookArticleSlug}} ↗</a></p>
+          {{$bookArtURL := printf "/posts/%s" .BookArticleSlug}}
+          {{if eq .SEO.PostPermalinkStyle "/archives/{slug}"}}
+            {{$bookArtURL = printf "/archives/%s" .BookArticleSlug}}
+          {{else if eq .SEO.PostPermalinkStyle "/p/{slug}"}}
+            {{$bookArtURL = printf "/p/%s" .BookArticleSlug}}
+          {{else if and (eq .SEO.PostPermalinkStyle "/{year}/{month}/{slug}") .ActiveChapter (hasPrefix .ActiveChapter.URL "/2")}}
+            {{$bookArtURL = .ActiveChapter.URL}}
+          {{end}}
+          <p class="book-unlock-card__foot"><a class="studio-meta-link" href="{{$bookArtURL}}">{{$bookArtURL}} ↗</a></p>
         {{end}}
       </div>
     {{else if .ActiveChapter}}

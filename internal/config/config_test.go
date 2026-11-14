@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestFourLayerPrecedenceAndZeroConfig(t *testing.T) {
 		t.Fatal("expected GeoAccessEnabled=true by default")
 	}
 	exists, mode, err := CheckSecretKeyFilePerm(tmpDir)
-	if err != nil || !exists || mode != 0o600 {
+	if err != nil || !exists || (runtime.GOOS != "windows" && mode != 0o600) {
 		t.Fatalf("expected auto-generated 0600 .secret.key, exists=%v mode=%o err=%v", exists, mode, err)
 	}
 
@@ -107,9 +108,10 @@ func TestKeyRingAESGCMAndSymlinkRejection(t *testing.T) {
 	symDir := t.TempDir()
 	realFile := filepath.Join(tmpDir, "dummy.key")
 	_ = os.WriteFile(realFile, []byte(strings.Repeat("a", 64)), 0o600)
-	_ = os.Symlink(realFile, filepath.Join(symDir, ".secret.key"))
-	if _, _, err := LoadOrInitKeyRing("", symDir); err == nil {
-		t.Fatal("expected symlinked .secret.key to be rejected")
+	if symErr := os.Symlink(realFile, filepath.Join(symDir, ".secret.key")); symErr == nil {
+		if _, _, err := LoadOrInitKeyRing("", symDir); err == nil {
+			t.Fatal("expected symlinked .secret.key to be rejected")
+		}
 	}
 }
 
@@ -122,7 +124,7 @@ func TestSocketAdminPathAndTrustedProxiesValidation(t *testing.T) {
 	if err != nil || s2.Perm != 0o600 {
 		t.Fatalf("expected 0600 perm, got %+v err=%v", s2, err)
 	}
-	for _, bad := range []string{"", ",0660", "/run/a.sock,0999", "/run/a.sock,0660,extra", "/" + strings.Repeat("a", 105)} {
+	for _, bad := range []string{"", ",0660", "/run/a.sock,0999", "/run/a.sock,0660,extra", "/" + strings.Repeat("a", 108)} {
 		if _, err := ParseListenSocketSpec(bad); err == nil {
 			t.Fatalf("expected invalid socket spec %q to fail", bad)
 		}
@@ -240,7 +242,12 @@ func TestListenSocketAutoTrustUnixUnlessExplicitEmpty(t *testing.T) {
 	}
 
 	// 2. VOLO_LISTEN_SOCKET set + default VOLO_TRUSTED_PROXIES -> TrustUnix=true automatically
-	sockPath := filepath.Join(tmpDir, "volo.sock")
+	shortSockDir, err := os.MkdirTemp("", "vcfg-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortSockDir) })
+	sockPath := filepath.Join(shortSockDir, "volo.sock")
 	cfgSockDefault, err := LoadWithEnviron(CLIOverrides{
 		EnvFile: missingEnv,
 		DataDir: &tmpDir,
@@ -298,8 +305,12 @@ func TestValidateCustomGeoIPPathAndRuntimeSetGeoIPDir(t *testing.T) {
 	if v, err := cfg.ValidateCustomGeoIPPath(customMMDB); err != nil || v == "" {
 		t.Fatalf("expected direct .mmdb file path to pass validation: v=%q err=%v", v, err)
 	}
-	if v, err := cfg.ValidateCustomGeoIPPath("/usr/share/GeoIP"); err != nil || v == "" {
-		t.Fatalf("expected /usr/share/GeoIP to be permitted: v=%q err=%v", v, err)
+	sysShareGeo := "/usr/share/GeoIP"
+	if vol := filepath.VolumeName(tmpDir); vol != "" {
+		sysShareGeo = vol + `\usr\share\GeoIP`
+	}
+	if v, err := cfg.ValidateCustomGeoIPPath(sysShareGeo); err != nil || v == "" {
+		t.Fatalf("expected %s to be permitted: v=%q err=%v", sysShareGeo, v, err)
 	}
 
 	// SetGeoIPDir overrides active path and "" resets to DefaultGeoIPDir
@@ -312,28 +323,59 @@ func TestValidateCustomGeoIPPathAndRuntimeSetGeoIPDir(t *testing.T) {
 		t.Fatalf("GetGeoIPDir after reset = %q, want %q", got, defGeo)
 	}
 
-	// Reject traversal, OS roots, dataDir enclosure, upload overlap, and non-GeoIP file extensions
+	// Reject traversal, relative/drive-less paths, UNC paths, reserved device names, OS roots, dataDir enclosure, upload overlap, and non-GeoIP file extensions
 	txtFile := filepath.Join(tmpDir, "notes.txt")
+	volPrefix := filepath.VolumeName(tmpDir)
 
-	for _, bad := range []string{
+	badGeoPaths := []string{
+		"relative/geoip",
 		"../outside",
+		`\\fileserver\share\geoip`,
 		"/etc",
 		"/etc/GeoIP",
 		"/proc/self",
+		filepath.Join(tmpDir, "CON"),
+		filepath.Join(tmpDir, "NUL.mmdb"),
+		filepath.Join(tmpDir, "COM1", "geo"),
 		dataDir,
 		uploadDir,
 		filepath.Join(uploadDir, "geo"),
 		filepath.Join(tmpDir, "volo.db"),
 		txtFile,
-	} {
+	}
+	if volPrefix != "" {
+		badGeoPaths = append(badGeoPaths,
+			"/usr/share/GeoIP", // drive-less root-relative path on Windows
+			volPrefix+`\etc`,
+			volPrefix+`\etc\GeoIP`,
+			volPrefix+`\proc\self`,
+		)
+	}
+	for _, bad := range badGeoPaths {
 		if _, err := cfg.ValidateCustomGeoIPPath(bad); err == nil {
 			t.Fatalf("expected unsafe GeoIP path %q to be rejected", bad)
 		}
 	}
 
-	// Also verify ValidateCustomUploadDir cannot overlap DefaultGeoIPDir
-	if _, err := cfg.ValidateCustomUploadDir(defGeo); err == nil {
-		t.Fatalf("expected ValidateCustomUploadDir to reject DefaultGeoIPDir %q", defGeo)
+	// Also verify ValidateCustomUploadDir rejects relative/UNC/device/system/GeoIP paths
+	badUploadPaths := []string{
+		"relative/uploads",
+		`\\fileserver\share\uploads`,
+		"/etc/volo-media",
+		filepath.Join(tmpDir, "AUX"),
+		filepath.Join(tmpDir, "LPT1.dir"),
+		defGeo,
+	}
+	if volPrefix != "" {
+		badUploadPaths = append(badUploadPaths, volPrefix+`\etc\volo-media`)
+	}
+	if sysRoot := os.Getenv("SystemRoot"); sysRoot != "" {
+		badUploadPaths = append(badUploadPaths, sysRoot, filepath.Join(sysRoot, "Temp"))
+	}
+	for _, bad := range badUploadPaths {
+		if _, err := cfg.ValidateCustomUploadDir(bad); err == nil {
+			t.Fatalf("expected ValidateCustomUploadDir to reject unsafe path %q", bad)
+		}
 	}
 }
 

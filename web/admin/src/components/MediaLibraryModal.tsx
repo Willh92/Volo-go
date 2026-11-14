@@ -10,6 +10,7 @@ import {
   UploadButton,
   UploadProgressBar,
   paginateItems,
+  runConcurrentUploads,
   useDebouncedValue,
 } from "./UIControls";
 
@@ -133,46 +134,26 @@ export function MediaLibraryModal({
     if (files.length === 0) return;
     setUploading(true);
     setUploadPct(0);
-    const totalBytes = Math.max(1, files.reduce((acc, f) => acc + Math.max(1, f.size), 0));
-    const perFileLoaded = new Array<number>(files.length).fill(0);
-    const updateAggPct = () => {
-      const loaded = perFileLoaded.reduce((a, b) => a + b, 0);
-      setUploadPct(Math.min(100, Math.round((loaded / totalBytes) * 100)));
-    };
     try {
       let lastPicked: MediaAssetRecord | null = null;
       let uploadedCount = 0;
-      let cursor = 0;
-      const workerCount = Math.min(3, files.length);
-      await Promise.all(
-        Array.from({ length: workerCount }, async () => {
-          while (cursor < files.length) {
-            const idx = cursor++;
-            const file = files[idx];
-            const fSize = Math.max(1, file.size);
-            const fd = new FormData();
-            fd.append("file", file);
-            const res = await uploadWithProgress<{ asset?: MediaAssetRecord; item?: MediaAssetRecord }>(
-              "/api/admin/media/upload",
-              fd,
-              (pct) => {
-                perFileLoaded[idx] = (pct / 100) * fSize;
-                updateAggPct();
-              }
-            );
-            perFileLoaded[idx] = fSize;
-            updateAggPct();
-            const picked = res.asset || res.item;
-            if (picked) {
-              lastPicked = {
-                ...picked,
-                original_name: picked.original_name || picked.orig_filename || file.name,
-              };
-              uploadedCount++;
-            }
-          }
-        })
-      );
+      await runConcurrentUploads(files, 3, setUploadPct, async (file, _idx, onFilePct) => {
+        const fd = new FormData();
+        fd.append("file", file);
+        const res = await uploadWithProgress<{ asset?: MediaAssetRecord; item?: MediaAssetRecord }>(
+          "/api/admin/media/upload",
+          fd,
+          onFilePct
+        );
+        const picked = res.asset || res.item;
+        if (picked) {
+          lastPicked = {
+            ...picked,
+            original_name: picked.original_name || picked.orig_filename || file.name,
+          };
+          uploadedCount++;
+        }
+      });
       if (files.length === 1 && lastPicked) {
         const chosen = lastPicked as MediaAssetRecord;
         showToast(t("ed.uploaded", { name: chosen.original_name }), "ok");

@@ -35,7 +35,7 @@
 
 ### 1.1 `volo serve`（默认命令）
 
-启动 HTTP 或 Unix Domain Socket 服务，自动执行幂等数据库 Schema 迁移（`v8`）、预热全文检索索引与只读元数据快照，启动定时文章发布器、插件 Cron 调度器与滚动备份调度器，并监听 `SIGINT` / `SIGTERM` 执行优雅停机（排空在途请求 + 确定性刷盘异步阅读与插件 KV 计数）。
+启动 HTTP 或 Unix Domain Socket 服务，自动执行幂等数据库 Schema 迁移（`v9`）、预热全文检索索引与只读元数据快照，启动定时文章发布器、插件 Cron 调度器与滚动备份调度器，并监听 `SIGINT` / `SIGTERM` 执行优雅停机（排空在途请求 + 确定性刷盘异步阅读与插件 KV 计数）。
 
 ```bash
 # 零配置启动（默认监听 0.0.0.0:8080，自动初始化 ./data/volo.db）
@@ -208,7 +208,7 @@ curl -X POST "${VOLO_URL}/api/admin/media/upload" \
 ### 2.4 账户与 IP 封禁治理、日志清理、批量重排与插件链式编排接口
 
 - **`GET /api/admin/users`** 与 **`PATCH /api/admin/users`**（需交互式管理员会话）：类 Discourse 账户治理接口，支持动作 `action: "ban" | "unban" | "mute" | "unmute" | "shield"`、时长 `duration_hours`（`0` 表示永久，`> 0` 按小时计算到期自动恢复）、原因 `reason`、是否屏蔽历史评论 `shield_comments` 及自定义替换文案 `shield_text`（解封或到期后历史评论立即无损恢复）。
-- **`GET / POST /api/admin/security/ip-bans`**、**`PATCH / DELETE /api/admin/security/ip-bans/{id}`**、**`POST /api/admin/security/ip-bans/{id}/unban`**、**`POST /api/admin/security/ip-bans/batch`** 与 **`POST /api/admin/security/ip-bans/purge-expired`**（需交互式管理员会话）：完整 IP/CIDR 封禁全生命周期管理接口，返回 `counts`（`active` / `expired` / `all` 数量统计）、`source`（`manual` / `auto_waf`）、累计触发次数 `occurrences` 及离线 GeoIP `location`。单条或批量 `unban` 执行提前到期并保留历史记录；`PATCH` 与批量 `set_duration` 支持修改 `expires_minutes`（`0` 永久，`> 0` 从当前起算分钟数）或备注 `note`（支持已过期记录一键重新封禁）；`DELETE`、批量 `delete` 与 `purge-expired` 执行物理删除。评论管理封禁接口（`POST /api/admin/comments/{id}/ban-ip` 与 `POST /api/admin/comments/batch` 的 `ban_ip` 动作）同步支持传入 `expires_minutes`。
+- **`GET / POST /api/admin/security/ip-bans`**、**`PATCH / DELETE /api/admin/security/ip-bans/{id}`**、**`POST /api/admin/security/ip-bans/{id}/unban`**、**`POST /api/admin/security/ip-bans/batch`** 与 **`POST /api/admin/security/ip-bans/purge-expired`**（需交互式管理员会话）：完整 IP/CIDR 封禁全生命周期管理接口，返回 `counts`（`active` / `expired` / `all` 数量统计）、`source`（`manual` / `auto_waf`）、累计触发次数 `occurrences` 及离线 GeoIP `location`。单条或批量 `unban` 执行提前到期并保留历史记录；`PATCH` 与批量 `set_duration` 支持修改 `expires_minutes`（`0` 永久，`> 0` 从当前起算分钟数）或备注 `note`（支持已过期记录一键重新封禁），单条 `PATCH` 还支持显式调整或清零累计触发次数 `occurrences`（`0`–`1000000`）；`DELETE`、批量 `delete` 与 `purge-expired` 执行物理删除。评论管理封禁接口（`POST /api/admin/comments/{id}/ban-ip` 与 `POST /api/admin/comments/batch` 的 `ban_ip` 动作）同步支持传入 `expires_minutes`。
 - **`DELETE /api/admin/audit-logs`** 与 **`DELETE /api/admin/plugins/{id}/logs`**（需交互式管理员会话）：一键清空管理审计日志与指定插件运行日志（配合 `security.ip_ban_retention_days`、`security.audit_log_retention_days`、`security.plugin_log_retention_days` 自动按天清理，`0` 表示永久保留）。
 - **`POST /api/admin/categories/reorder`** 与 **`POST /api/admin/books/reorder`**：按传入 ID 顺序单事务批量重排分类或书架项目的 `sort_order`。
 - **`POST /api/admin/plugins/reorder`** 与 **`PATCH /api/admin/plugins/{id}/priority`**（需交互式管理员会话）：编排插件链式执行顺序或精确设置 `priority` 数值（`-1000`–`10000`）。

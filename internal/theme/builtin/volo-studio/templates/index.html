@@ -3,9 +3,10 @@
 
 {{if .IsHome}}
   {{if and (le .Page 1) (ne (trim .Site.NoticeBoard) "")}}
+    {{$heroBadge := trim (printf "%v" (themeCfg .ThemeConfig "hero_badge" ""))}}
     <section class="studio-hero" aria-label="{{t .Locale "sidebar.notice"}}">
       <div class="studio-hero-copy">
-        <h2 class="studio-hero-label">{{coalesce (themeCfg .ThemeConfig "hero_badge" "") (t .Locale "sidebar.notice")}}</h2>
+        {{if ne $heroBadge ""}}<h2 class="studio-hero-label">{{$heroBadge}}</h2>{{end}}
         <div class="studio-hero-notice">{{renderNotice .Site.NoticeBoard}}</div>
       </div>
       <svg class="studio-hero-graphic" viewBox="0 0 168 104" aria-hidden="true">

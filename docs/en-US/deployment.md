@@ -2,7 +2,7 @@
 
 > 中文版本：[部署与各系统服务安装指南](../zh-CN/deployment.md)
 
-`Volo-go` compiles with Go `1.27.4` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (**strictly `< 21 MiB` across all 6 supported static release targets**, `~19.7 MiB` on `linux/amd64`):
+`Volo-go` compiles with Go `1.27.4` (`CGO_ENABLED=0`, `GOEXPERIMENT=nojsonv2`) into a single zero-dependency static binary (**`< 22 MiB` across all 6 supported static release targets**, `~19.6 MiB` on `linux/amd64`):
 - **Linux**: `linux/amd64`, `linux/arm64` (`systemd` system/user units & `OpenRC`)
 - **macOS**: `darwin/amd64`, `darwin/arm64` (`launchd` `LaunchDaemon` / `LaunchAgent`)
 - **Windows**: `windows/amd64`, `windows/arm64` (native `sc.exe` Windows Service via `svc_windows.go`, `NSSM`, and Scheduled Task fallback)
@@ -211,7 +211,7 @@ docker compose --profile postgres up -d
      ```bash
      mkdir -p data && sudo chown -R 65532:65532 data
      ```
-  2. **Do not bind-mount empty `./themes` or `./plugins` host directories** onto `/app/themes` or `/app/plugins`, as empty host directories will shadow the image-bundled themes (`volo-journal`) and plugins (`kanbanniang`).
+  2. **Do not bind-mount empty `./themes` or `./plugins` host directories** onto `/app/themes` or `/app/plugins`, as empty host directories will shadow the image-bundled themes (`volo-journal`) and plugins (`sensitive-words`). Optional standalone plugin packages such as Live2D Mascot (`plugin-kanbanniang-v2.0.0.zip`, see the [Official Plugin Catalog](../../plugins/README.md)) can be uploaded directly in **Admin Console -> Appearance & Extensions -> Plugins**.
 
 ### 5.2 Database Engine DSN Examples (Explicit Pinning Mode)
 

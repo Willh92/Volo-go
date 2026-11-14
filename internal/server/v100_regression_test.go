@@ -101,11 +101,11 @@ func TestV100_PerIdentityCommentBounds_And_HeightBombDefense(t *testing.T) {
 
 	// Disable guest PoW and auto-approve comments so we can exercise length & line limits rapidly without WAF rate noise.
 	resp, raw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/reading", map[string]any{
-		"posts_per_page":        10,
-		"comment_mode":          "guest_allowed",
-		"comment_moderation":    "all_auto",
-		"enable_pow":            false,
-		"allow_reader_register": true,
+		"posts_per_page":          10,
+		"comment_access_mode":     "all",
+		"comment_moderation_mode": "off",
+		"enable_pow":              false,
+		"allow_reader_register":   true,
 	}, adminCookies, adminHdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PATCH settings/reading = %d %s", resp.StatusCode, string(raw))
@@ -274,11 +274,11 @@ func TestV100_AccountBanMute_TimedExpiry_And_ReversibleCommentShielding(t *testi
 	adminHdrs["Origin"] = env.ts.URL
 
 	resp, raw := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/reading", map[string]any{
-		"posts_per_page":        10,
-		"comment_mode":          "guest_allowed",
-		"comment_moderation":    "all_auto",
-		"enable_pow":            false,
-		"allow_reader_register": true,
+		"posts_per_page":          10,
+		"comment_access_mode":     "all",
+		"comment_moderation_mode": "off",
+		"enable_pow":              false,
+		"allow_reader_register":   true,
 	}, adminCookies, adminHdrs)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PATCH settings/reading = %d %s", resp.StatusCode, string(raw))
@@ -658,9 +658,20 @@ func TestV100_ImageViewHTTP_NonDestructive_OrphanAndCLS_Permalinks_And_CSRFConso
 		if rSet.StatusCode != http.StatusOK {
 			t.Fatalf("PATCH seo permalink style %s = %d %s", tc.style, rSet.StatusCode, string(bSet))
 		}
-		rPage, _ := doJSONReq(t, http.MethodGet, env.ts.URL+tc.wantPath, nil, nil, nil)
+		rPage, pageB := doJSONReq(t, http.MethodGet, env.ts.URL+tc.wantPath, nil, nil, nil)
 		if rPage.StatusCode != http.StatusOK {
 			t.Fatalf("GET %s (style=%s) = %d", tc.wantPath, tc.style, rPage.StatusCode)
+		}
+		wantCanon := strings.TrimRight(env.cfg.GetPublicURL(), "/") + tc.wantPath
+		if !strings.Contains(string(pageB), wantCanon) {
+			t.Fatalf("expected article CanonicalURL/JSON-LD to contain %s for style=%s", wantCanon, tc.style)
+		}
+		if tc.style != domain.PermalinkStylePosts {
+			rRedir, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/posts/param-image-post?ref=rss", nil, nil, nil)
+			if rRedir.StatusCode != http.StatusMovedPermanently || rRedir.Header.Get("Location") != tc.wantPath+"?ref=rss" {
+				t.Fatalf("GET /posts/param-image-post?ref=rss (style=%s) = (%d, %q), want (301, %q)",
+					tc.style, rRedir.StatusCode, rRedir.Header.Get("Location"), tc.wantPath+"?ref=rss")
+			}
 		}
 		rMD, mdBytes := doJSONReq(t, http.MethodGet, env.ts.URL+tc.wantMD, nil, nil, nil)
 		if rMD.StatusCode != http.StatusOK || !strings.Contains(string(mdBytes), "Parameterized Image Post") {
@@ -921,5 +932,159 @@ func TestV101_DynamicPagination_IPBanGeoLocation_And_Runtime500Logs(t *testing.T
 	logsStr := string(logsRaw)
 	if !strings.Contains(logsStr, "http 5xx error") || !strings.Contains(logsStr, "home articles query failed") {
 		t.Fatalf("expected runtime-logs to contain http 5xx error and home articles query failed detail, got: %s", logsStr)
+	}
+}
+
+func TestV102_FollowsItemsPaginationPluginLogsHeadersAndSecurityClosure(t *testing.T) {
+	env, adminCookies, adminHdrs, _ := bootstrapAuditEnv(t)
+	adminHdrs["Origin"] = env.ts.URL
+
+	// 1. Paginate & search GET /api/admin/follows/items (?page=, ?per_page=, ?q=, ?items_per_follow=)
+	feedSpecs := []struct {
+		title string
+		url   string
+		item  string
+	}{
+		{"Alpha Systems Blog", "https://alpha.example.com/feed.xml", "Distributed Consensus"},
+		{"RustKernelFeed", "https://rustkernel.example.com/rss", "Zero-Copy Ring Buffers"},
+		{"Gamma Typography", "https://gamma.example.com/atom.xml", "Optical Sizing Notes"},
+	}
+	nowMS := time.Now().UnixMilli()
+	for idx, spec := range feedSpecs {
+		rFol, rawFol := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/follows", map[string]any{
+			"title":      spec.title,
+			"feed_url":   spec.url,
+			"site_url":   "https://example.com",
+			"sort_order": idx + 1,
+		}, adminCookies, adminHdrs)
+		if rFol.StatusCode != http.StatusCreated && rFol.StatusCode != http.StatusOK {
+			t.Fatalf("create follow %d = %d %s", idx, rFol.StatusCode, string(rawFol))
+		}
+		var created struct {
+			Follow domain.Follow `json:"follow"`
+		}
+		_ = json.Unmarshal(rawFol, &created)
+		fid := created.Follow.ID
+		if fid == "" {
+			var alt domain.Follow
+			_ = json.Unmarshal(rawFol, &alt)
+			fid = alt.ID
+		}
+		for j := 0; j < 3; j++ {
+			itemID := id.Next()
+			_, err := env.store.ExecContext(env.ctx,
+				`INSERT INTO follow_items (id, follow_id, guid_hash, title, url, summary, author_name, published_at)
+				 VALUES (?, ?, ?, ?, ?, ?, 'Author', ?)`,
+				itemID, fid, "guid-"+itemID, spec.item+" #"+strconv.Itoa(j+1), "https://example.com/p/"+itemID, "Summary for "+spec.item, nowMS-int64(j*1000),
+			)
+			if err != nil {
+				t.Fatalf("insert follow_item: %v", err)
+			}
+		}
+	}
+
+	rItemsP1, rawItemsP1 := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/follows/items?page=1&per_page=2&items_per_follow=2", nil, adminCookies, adminHdrs)
+	if rItemsP1.StatusCode != http.StatusOK {
+		t.Fatalf("GET follows/items page 1 = %d %s", rItemsP1.StatusCode, string(rawItemsP1))
+	}
+	var p1 struct {
+		Groups []struct {
+			domain.Follow
+			Items []domain.FollowItem `json:"items"`
+		} `json:"groups"`
+		Total   int `json:"total"`
+		Page    int `json:"page"`
+		PerPage int `json:"per_page"`
+	}
+	if err := json.Unmarshal(rawItemsP1, &p1); err != nil {
+		t.Fatalf("decode follows/items page 1: %v", err)
+	}
+	if p1.Total != 3 || p1.Page != 1 || p1.PerPage != 2 || len(p1.Groups) != 2 {
+		t.Fatalf("unexpected page 1 envelope: total=%d page=%d per_page=%d len(groups)=%d", p1.Total, p1.Page, p1.PerPage, len(p1.Groups))
+	}
+	for _, g := range p1.Groups {
+		if len(g.Items) != 2 {
+			t.Fatalf("expected items_per_follow=2 to bound items to 2, got %d", len(g.Items))
+		}
+	}
+
+	rItemsQ, rawItemsQ := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/follows/items?q=Zero-Copy", nil, adminCookies, adminHdrs)
+	if rItemsQ.StatusCode != http.StatusOK {
+		t.Fatalf("GET follows/items?q=Zero-Copy = %d %s", rItemsQ.StatusCode, string(rawItemsQ))
+	}
+	var qRes struct {
+		Groups []domain.Follow `json:"groups"`
+		Total  int             `json:"total"`
+	}
+	_ = json.Unmarshal(rawItemsQ, &qRes)
+	if qRes.Total != 1 || len(qRes.Groups) != 1 || qRes.Groups[0].Title != "RustKernelFeed" {
+		t.Fatalf("expected item search q=Zero-Copy to match RustKernelFeed, got total=%d groups=%+v", qRes.Total, qRes.Groups)
+	}
+
+	// 2. Plugin logs ?limit= clamping (1..500, default 100)
+	if env.app.Deps().Plugins != nil && env.app.Deps().Plugins.Logger() != nil {
+		lgr := env.app.Deps().Plugins.Logger()
+		for i := 1; i <= 5; i++ {
+			lgr.Write("demo-plug", "INFO", "boot", "entry-"+strconv.Itoa(i))
+		}
+		rPL2, rawPL2 := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/plugins/demo-plug/logs?limit=2", nil, adminCookies, adminHdrs)
+		if rPL2.StatusCode != http.StatusOK {
+			t.Fatalf("GET plugin logs?limit=2 = %d %s", rPL2.StatusCode, string(rawPL2))
+		}
+		var pl2 struct {
+			Items []any `json:"items"`
+			Limit int   `json:"limit"`
+		}
+		_ = json.Unmarshal(rawPL2, &pl2)
+		if pl2.Limit != 2 || len(pl2.Items) != 2 {
+			t.Fatalf("expected limit=2 & 2 entries, got limit=%d len=%d", pl2.Limit, len(pl2.Items))
+		}
+
+		rPLMax, rawPLMax := doJSONReq(t, http.MethodGet, env.ts.URL+"/api/admin/plugins/demo-plug/logs?limit=9999", nil, adminCookies, adminHdrs)
+		if rPLMax.StatusCode != http.StatusOK {
+			t.Fatalf("GET plugin logs?limit=9999 = %d %s", rPLMax.StatusCode, string(rawPLMax))
+		}
+		var plMax struct {
+			Limit int `json:"limit"`
+		}
+		_ = json.Unmarshal(rawPLMax, &plMax)
+		if plMax.Limit != 500 {
+			t.Fatalf("expected limit=9999 clamped to 500, got %d", plMax.Limit)
+		}
+	}
+
+	// 3. /uploads/* strict sandbox CSP & TLSEnabled() HSTS header
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	img.SetNRGBA(0, 0, color.NRGBA{R: 10, G: 20, B: 30, A: 255})
+	var pngBuf bytes.Buffer
+	if err := png.Encode(&pngBuf, img); err != nil {
+		t.Fatal(err)
+	}
+	upSubDir := filepath.Join(env.cfg.GetUploadDir(), "2026", "11")
+	if err := os.MkdirAll(upSubDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(upSubDir, "csp-check.png"), pngBuf.Bytes(), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	rUp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/uploads/2026/11/csp-check.png", nil, nil, nil)
+	if rUp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /uploads/2026/11/csp-check.png = %d", rUp.StatusCode)
+	}
+	wantCSP := "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox"
+	if gotCSP := rUp.Header.Get("Content-Security-Policy"); gotCSP != wantCSP {
+		t.Fatalf("expected /uploads/* CSP %q, got %q", wantCSP, gotCSP)
+	}
+
+	env.cfg.TLSCertFile = "dummy-cert.pem"
+	env.cfg.TLSKeyFile = "dummy-key.pem"
+	defer func() {
+		env.cfg.TLSCertFile = ""
+		env.cfg.TLSKeyFile = ""
+	}()
+	rTLS, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, nil)
+	wantHSTS := "max-age=31536000; includeSubDomains"
+	if gotHSTS := rTLS.Header.Get("Strict-Transport-Security"); gotHSTS != wantHSTS {
+		t.Fatalf("expected HSTS %q when TLSEnabled(), got %q", wantHSTS, gotHSTS)
 	}
 }

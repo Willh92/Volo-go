@@ -39,7 +39,7 @@
           </div>
           <div class="bookshelf-grid">
             {{range .Categories}}
-              <a id="cat-card-{{.Slug}}" class="book-card studio-tax-card" href="/categories/{{.Slug}}" data-collection-item="{{lower .Name}} {{lower .Slug}} {{lower .Description}}">
+              <a id="cat-card-{{.Slug}}" class="book-card studio-tax-card studio-cat-card" href="/categories/{{.Slug}}" data-collection-item="{{lower .Name}} {{lower .Slug}} {{lower .Description}}">
                 <div class="studio-tax-card__head">
                   <strong>{{.Name}}</strong>
                   <span class="volo-badge">{{.ArticleCount}}</span>
@@ -118,9 +118,18 @@
                   </div>
                   <div class="studio-archive-posts">
                     {{range .Posts}}
+                      {{$postHref := printf "/posts/%s" .Slug}}
+                      {{if eq $.SEO.PostPermalinkStyle "/archives/{slug}"}}
+                        {{$postHref = printf "/archives/%s" .Slug}}
+                      {{else if eq $.SEO.PostPermalinkStyle "/p/{slug}"}}
+                        {{$postHref = printf "/p/%s" .Slug}}
+                      {{else if eq $.SEO.PostPermalinkStyle "/{year}/{month}/{slug}"}}
+                        {{$ymSlash := fmtTime .PublishedAt "yyyy/MM"}}
+                        {{if ne $ymSlash ""}}{{$postHref = printf "/%s/%s" $ymSlash .Slug}}{{end}}
+                      {{end}}
                       <div class="studio-archive-post-row">
                         <time class="studio-archive-post-row__date">{{.MonthDay}}</time>
-                        <a class="studio-archive-post-row__title" href="/posts/{{.Slug}}">{{.Title}}</a>
+                        <a class="studio-archive-post-row__title" href="{{$postHref}}">{{.Title}}</a>
                         {{if .CategoryName}}
                           <a class="studio-cat-chip studio-archive-post-row__cat" href="/categories/{{.CategorySlug}}">{{.CategoryName}}</a>
                         {{end}}

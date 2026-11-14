@@ -133,7 +133,7 @@ plugins/hello-callout/
 - **数据隔离与卸载彻底清理**：
   - 数据库存储按 `(plugin_id, key)` 在 `plugin_kv` 物理隔离（单键 `<= 256 KiB`、单插件默认 `<= 2,000` 条配额），加密配置密封于 `plugins.secret_ciphertext`；插件仅可只读访问自身根目录内文件，禁止写宿主文件系统。
   - **完整 5 阶段生命周期**：`onInstall()`（首次安装或原位升级后） -> `onEnable()`（启用加载） -> `onConfigChange(newCfg)`（后台保存配置即时热响应，无需重启 VM） -> `onDisable()`（停用并注销该插件全部动态定时任务、缓冲自增计数与 Provider） -> `onUninstall()`（卸载前最佳努力执行收尾，随后宿主在事务内彻底清除该插件的 `plugin_kv`、`plugins` 记录及 `./plugins/<id>` 目录）。
-- **热安装、原位升级（`overwrite=true`）与纯净 `.zip` 导出**：支持上传 `.zip` 包完成零停机安装或原位覆盖升级（自动保留已有 `config_json`、自定义优先级、`secret_ciphertext` 加密密钥与已启用运行状态），并支持 `GET /api/admin/plugins/{id}/export` 导出不含任何机密密文的纯净 `.zip` 包。
+- **热安装、原位升级（`overwrite=true`）与 256 MiB 流式 `.zip` 导入导出**：支持流式上传最高 `256 MiB`（`<= 2,048` 文件条目）的插件 `.zip` 包完成零停机安装或原位覆盖升级（自动保留已有 `config_json`、自定义优先级、`secret_ciphertext` 加密密钥与已启用运行状态），并支持 `GET /api/admin/plugins/{id}/export` 流式导出不含任何机密密文的纯净 `.zip` 包（已压缩图像/音频自动采用 `zip.Store` 零二次膨胀，代码与模型文件采用 `zip.Deflate`）。
 
 ### 3.2 `manifest.json` 完整字段、`priority` 链式优先级与 `type: "secret"` 加密配置
 
@@ -303,6 +303,17 @@ function renderSlot(slotName) {
   return "";
 }
 ```
+
+### 3.6 官方插件目录与版本感知自动分包（[`plugins/catalog.json`](../../plugins/catalog.json)）
+
+官方插件版本清单统一维护在 [`plugins/README.zh-CN.md`](../../plugins/README.zh-CN.md) 与机器可读索引 [`plugins/catalog.json`](../../plugins/catalog.json) 中，并由 CI 强制校验清单版本与各插件 `manifest.json` 完全一致：
+
+| 插件 ID | 最新版本 | 分发策略 | 核心包 / Docker 默认内置 | 核心特性说明 |
+| :--- | :---: | :--- | :---: | :--- |
+| [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled`（随主包内置） | 是 | 6.4 万级分类敏感词库 + 宿主 16B/状态 BFS-CSR Aho-Corasick 自动机，统一守护评论与昵称。 |
+| [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.0`** | `standalone-release`（[`plugin-kanbanniang-v2.0.0.zip`](https://github.com/Willh92/Volo-go/releases/tag/plugin-kanbanniang-v2.0.0)） | 否（按需安装） | 完整内置 26 套离线 Live2D 模型、Pio/Tia 150 套随机换装、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与摸头计数；全量采用无损透明/动图 `.webp` 贴图，独立包体积精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`）。 |
+
+- **GitHub Actions 版本不变不重复打包**：由 [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) 与 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) 自动检查 `plugin-kanbanniang-v<version>` Release 是否已发布；当 `kanbanniang/manifest.json` 版本号未变时直接跳过压缩与上传，避免每次主程序发版重复构建百兆级插件归档。
 
 ---
 

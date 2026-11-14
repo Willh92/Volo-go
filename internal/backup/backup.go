@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,9 +33,20 @@ const (
 	maxSingleEntryBytes     = 512 * 1024 * 1024  // 512 MiB per stream guard against zip bombs
 	maxTotalRestoreBytes    = 2048 * 1024 * 1024 // 2 GiB total unpacked cap
 	maxExtensionSingleBytes = 32 * 1024 * 1024   // 32 MiB per extension file
-	maxExtensionTotalBytes  = 256 * 1024 * 1024  // 256 MiB total unpacked extensions cap
+	maxExtensionTotalBytes  = 512 * 1024 * 1024  // 512 MiB total unpacked extensions cap
 	restoreBatchSize        = 200
 )
+
+func backupZipMethodForPath(p string) uint16 {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".png", ".webp", ".gif", ".jpg", ".jpeg", ".avif",
+		".ogg", ".mp3", ".m4a", ".aac", ".opus",
+		".mp4", ".webm", ".woff", ".woff2", ".zip", ".gz":
+		return zip.Store
+	default:
+		return zip.Deflate
+	}
+}
 
 func isBlockedRestoreUploadExt(p string) bool {
 	switch strings.ToLower(path.Ext(p)) {
@@ -118,11 +130,23 @@ func CreateToFile(ctx context.Context, store *sqlx.Store, outputZipPath string, 
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
-	if err := os.Rename(tmpPath, outputZipPath); err != nil {
+	if err := renameBackupTempFile(tmpPath, outputZipPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
 	return manifest, nil
+}
+
+func renameBackupTempFile(tmpPath, outputZipPath string) error {
+	err := os.Rename(tmpPath, outputZipPath)
+	if err == nil || runtime.GOOS != "windows" {
+		return err
+	}
+	for attempt := 1; attempt <= 5 && err != nil; attempt++ {
+		time.Sleep(time.Duration(attempt*5) * time.Millisecond)
+		err = os.Rename(tmpPath, outputZipPath)
+	}
+	return err
 }
 
 // Create writes a database-agnostic streaming ZIP archive to w without buffering whole tables in RAM.
@@ -409,7 +433,7 @@ func streamMediaDirToZip(ctx context.Context, zw *zip.Writer, uploadDir string) 
 		entryPath := "uploads/" + rel
 		zf, err := zw.CreateHeader(&zip.FileHeader{
 			Name:     entryPath,
-			Method:   zip.Deflate,
+			Method:   backupZipMethodForPath(rel),
 			Modified: time.Now().UTC(),
 		})
 		if err != nil {
@@ -530,7 +554,7 @@ func streamExtensionsDirToZip(ctx context.Context, zw *zip.Writer, rootDir strin
 		entryPath := zipPrefix + "/" + rel
 		hdr := &zip.FileHeader{
 			Name:     entryPath,
-			Method:   zip.Deflate,
+			Method:   backupZipMethodForPath(rel),
 			Modified: linfo.ModTime().UTC(),
 		}
 		hdr.SetMode(0o644)
@@ -1409,7 +1433,8 @@ func coerceJSONValForDB(table string, col string, val any, dialectName string) a
 
 func isBooleanColumn(table string, col string) bool {
 	switch table + "." + col {
-	case "articles.is_pinned",
+	case "users.shield_comments",
+		"articles.is_pinned",
 		"articles.allow_comment",
 		"articles.has_content_lock",
 		"pages.is_published",

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { createPortal } from "preact/compat";
+import { createPortal } from "preact";
 import type { CSSProperties, ComponentChildren } from "preact";
 import { apiFetch, confirmSig, resolveConfirm, showToast } from "../api";
 import type { LocaleOption } from "../i18n";
@@ -2268,7 +2268,7 @@ let modalLockCount = 0;
 let savedBodyOverflow = "";
 let savedBodyPaddingRight = "";
 
-function acquireModalScrollLock() {
+export function acquireModalScrollLock() {
   if (typeof window === "undefined" || typeof document === "undefined") return;
   if (modalLockCount === 0) {
     savedBodyOverflow = document.body.style.overflow;
@@ -2287,13 +2287,79 @@ function acquireModalScrollLock() {
   modalLockCount += 1;
 }
 
-function releaseModalScrollLock() {
+export function releaseModalScrollLock() {
   if (typeof document === "undefined" || modalLockCount <= 0) return;
   modalLockCount -= 1;
   if (modalLockCount === 0) {
     document.body.style.overflow = savedBodyOverflow;
     document.body.style.paddingRight = savedBodyPaddingRight;
   }
+}
+
+export function summarizeUA(raw?: string, fallback = ""): string {
+  const ua = String(raw || "").trim();
+  if (!ua) return fallback;
+  const browser = /Edg\//i.test(ua)
+    ? "Edge"
+    : /OPR\/|Opera/i.test(ua)
+    ? "Opera"
+    : /Firefox\//i.test(ua)
+    ? "Firefox"
+    : /Obsidian/i.test(ua)
+    ? "Obsidian"
+    : /curl\//i.test(ua)
+    ? "curl"
+    : /CriOS|Chrome\//i.test(ua) && !/Chromium/i.test(ua)
+    ? "Chrome"
+    : /Safari\//i.test(ua) && !/Chrome/i.test(ua)
+    ? "Safari"
+    : "";
+  const os = /iPhone|iPad|iPod|iOS/i.test(ua)
+    ? "iOS"
+    : /Android/i.test(ua)
+    ? "Android"
+    : /Mac OS X|Macintosh/i.test(ua)
+    ? "macOS"
+    : /Windows/i.test(ua)
+    ? "Windows"
+    : /Linux/i.test(ua)
+    ? "Linux"
+    : "";
+  if (browser && os) return `${browser} · ${os}`;
+  if (browser || os) return browser || os;
+  return ua.length > 36 ? `${ua.slice(0, 36)}…` : ua;
+}
+
+export async function runConcurrentUploads(
+  files: File[],
+  concurrency: number,
+  onProgress: (pct: number) => void,
+  uploadOne: (file: File, idx: number, onFilePct: (pct: number) => void) => Promise<void>
+): Promise<void> {
+  if (files.length === 0) return;
+  const totalBytes = Math.max(1, files.reduce((acc, f) => acc + Math.max(1, f.size), 0));
+  const perFileLoaded = new Array<number>(files.length).fill(0);
+  const updateAggPct = () => {
+    const loaded = perFileLoaded.reduce((a, b) => a + b, 0);
+    onProgress(Math.min(100, Math.round((loaded / totalBytes) * 100)));
+  };
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, files.length));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (cursor < files.length) {
+        const idx = cursor++;
+        const file = files[idx];
+        const fSize = Math.max(1, file.size);
+        await uploadOne(file, idx, (pct) => {
+          perFileLoaded[idx] = (pct / 100) * fSize;
+          updateAggPct();
+        });
+        perFileLoaded[idx] = fSize;
+        updateAggPct();
+      }
+    })
+  );
 }
 
 function parseTokenBatch(raw: string, uppercase: boolean): string[] {

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -466,11 +467,20 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 			if len(args) < 2 {
 				return jsFalseVal, nil
 			}
+			limitF := math.Trunc(args[1].toNumber())
+			if math.IsNaN(limitF) || math.IsInf(limitF, 0) || limitF <= 0 || limitF > 1_000_000 {
+				return jsFalseVal, nil
+			}
+			maxCount := int(limitF)
 			windowSec := 60
 			if len(args) >= 3 && args[2].kind != valUndefined && args[2].kind != valNull {
-				windowSec = int(args[2].toNumber())
+				winF := math.Trunc(args[2].toNumber())
+				if math.IsNaN(winF) || math.IsInf(winF, 0) || winF <= 0 || winF > 86400 {
+					return jsFalseVal, nil
+				}
+				windowSec = int(winF)
 			}
-			if r.checkRateLimit(args[0].toString(), int(args[1].toNumber()), windowSec) {
+			if r.checkRateLimit(args[0].toString(), maxCount, windowSec) {
 				return jsTrueVal, nil
 			}
 			return jsFalseVal, nil
@@ -585,10 +595,15 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 			}
 			return parsed, nil
 		})
-		assetsBridge.Set("exists", func(relPath string) bool {
-			_, rErr := r.resolvePluginAssetPath(relPath)
-			return rErr == nil
-		})
+		assetsBridge.setVal("exists", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+			if len(args) < 1 || args[0].kind == valUndefined || args[0].kind == valNull {
+				return jsFalseVal, nil
+			}
+			if r.pluginAssetExists(args[0].toString()) {
+				return jsTrueVal, nil
+			}
+			return jsFalseVal, nil
+		}))
 		voloObj.Set("readAsset", readTextFn)
 		voloObj.Set("assets", assetsBridge)
 	}
@@ -801,11 +816,30 @@ func parseCronIntOption(raw any) int {
 	case int:
 		return v
 	case int64:
+		if v <= 0 {
+			return 0
+		}
+		if v > maxCronIntervalSeconds {
+			return maxCronIntervalSeconds
+		}
 		return int(v)
 	case float64:
-		return int(v)
+		f := math.Trunc(v)
+		if math.IsNaN(f) || math.IsInf(f, -1) || f <= 0 {
+			return 0
+		}
+		if math.IsInf(f, 1) || f > maxCronIntervalSeconds {
+			return maxCronIntervalSeconds
+		}
+		return int(f)
 	case json.Number:
 		n, _ := v.Int64()
+		if n <= 0 {
+			return 0
+		}
+		if n > maxCronIntervalSeconds {
+			return maxCronIntervalSeconds
+		}
 		return int(n)
 	default:
 		return 0
@@ -858,6 +892,24 @@ func (r *gojaPluginRuntime) openConfinedAssetFile(relPath string) (*os.File, err
 		return nil, fmt.Errorf("plugin asset %q: exceeds %d MiB limit", relPath, maxPluginAssetReadBytes>>20)
 	}
 	return f, nil
+}
+
+func (r *gojaPluginRuntime) pluginAssetExists(relPath string) bool {
+	if r.pluginDir == "" {
+		return false
+	}
+	trimmed := strings.TrimPrefix(strings.TrimSpace(relPath), "./")
+	cleanRel, err := sanitizeRelativeAssetPath(trimmed)
+	if err != nil {
+		return false
+	}
+	f, err := os.OpenInRoot(r.pluginDir, filepath.FromSlash(cleanRel))
+	if err != nil {
+		return false
+	}
+	st, sErr := f.Stat()
+	_ = f.Close()
+	return sErr == nil && st.Mode().IsRegular() && st.Size() <= MaxZipSingleBytes
 }
 
 func (r *gojaPluginRuntime) resolvePluginAssetPath(relPath string) (string, error) {

@@ -983,3 +983,112 @@ func TestETLRound3_DisguisedMarkup_RollbackCleanup_FKSafeClear_AnalyticsMapping_
 		t.Fatalf("unexpected sanitized Site settings: favicon=%q social=%+v", snap.Site.FaviconURL, snap.Site.SocialLinks)
 	}
 }
+
+func TestImportLegacyKanbanniangPluginStatusAndModelMigration(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(tmp, "kanban-etl.db"),
+	})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer store.Close()
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatalf("migrate up: %v", err)
+	}
+
+	kr, _, err := config.LoadOrInitKeyRing(strings.Repeat("f", 64), tmp)
+	if err != nil {
+		t.Fatalf("keyring: %v", err)
+	}
+	settingsMgr := repo.NewSettingsManager(store, kr, "zh-CN")
+
+	// Case 1: Legacy "plugins" (ENABLED) + valid 26-model "kanbanniangSelector"
+	docEnabled := map[string]any{
+		"users": []map[string]any{
+			{"oId": "default", "userName": "admin", "userEmail": "admin@example.com", "userRole": "adminRole"},
+		},
+		"options": []map[string]any{
+			{"oId": "blogTitle", "optionValue": "Kanban Studio"},
+			{"oId": "kanbanniangSelector", "optionCategory": "kanbanniang", "optionValue": "HyperdimensionNeptunia/noir_classic"},
+		},
+		"plugins": []map[string]any{
+			{"oId": "kanbanniang", "name": "看板娘", "version": "2.0.1", "status": "ENABLED", "setting": "{}"},
+		},
+	}
+	enabledJSON := filepath.Join(tmp, "legacy-kanban-enabled.json")
+	rawEnabled, err := json.Marshal(docEnabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(enabledJSON, rawEnabled, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ImportLegacyArchive(ctx, store, settingsMgr, kr, enabledJSON, ImportOptions{}); err != nil {
+		t.Fatalf("ImportLegacyArchive (enabled kanbanniang) failed: %v", err)
+	}
+
+	var isEnabled bool
+	var version, cfgRaw string
+	if err := store.QueryRowContext(ctx, `SELECT version, is_enabled, config_json FROM plugins WHERE id = ?`, "kanbanniang").Scan(&version, &isEnabled, &cfgRaw); err != nil {
+		t.Fatalf("query migrated kanbanniang plugin row: %v", err)
+	}
+	if !isEnabled || version != "2.0.0" {
+		t.Fatalf("expected enabled kanbanniang v2.0.0, got enabled=%v version=%q", isEnabled, version)
+	}
+	var cfgMap map[string]any
+	if err := json.Unmarshal([]byte(cfgRaw), &cfgMap); err != nil {
+		t.Fatalf("unmarshal kanbanniang config_json: %v", err)
+	}
+	if cfgMap["model"] != "HyperdimensionNeptunia/noir_classic" {
+		t.Fatalf("expected migrated model 'HyperdimensionNeptunia/noir_classic', got %v", cfgMap["model"])
+	}
+
+	// Pre-populate custom widget config fields to verify re-import preserves non-model keys,
+	// updates status to DISABLED, and sanitizes retired/unsafe kanbanniangSelector to "random".
+	if _, err := store.ExecContext(ctx, `UPDATE plugins SET config_json = ? WHERE id = ?`, `{"model":"Potion-Maker/Pio","position":"left","width":320}`, "kanbanniang"); err != nil {
+		t.Fatal(err)
+	}
+
+	docDisabled := map[string]any{
+		"users": []map[string]any{
+			{"oId": "default", "userName": "admin", "userEmail": "admin@example.com", "userRole": "adminRole"},
+		},
+		"options": []map[string]any{
+			{"oId": "kanbanniangSelector", "optionValue": "../evil-traversal"},
+		},
+		"plugin": []map[string]any{
+			{"oId": "kanbanniang", "status": "DISABLED"},
+		},
+	}
+	disabledJSON := filepath.Join(tmp, "legacy-kanban-disabled.json")
+	rawDisabled, err := json.Marshal(docDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(disabledJSON, rawDisabled, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ImportLegacyArchive(ctx, store, settingsMgr, kr, disabledJSON, ImportOptions{}); err != nil {
+		t.Fatalf("ImportLegacyArchive (disabled kanbanniang) failed: %v", err)
+	}
+
+	if err := store.QueryRowContext(ctx, `SELECT is_enabled, config_json FROM plugins WHERE id = ?`, "kanbanniang").Scan(&isEnabled, &cfgRaw); err != nil {
+		t.Fatalf("query updated kanbanniang plugin row: %v", err)
+	}
+	if isEnabled {
+		t.Fatalf("expected kanbanniang to be disabled after status=DISABLED migration")
+	}
+	cfgMap = nil
+	if err := json.Unmarshal([]byte(cfgRaw), &cfgMap); err != nil {
+		t.Fatalf("unmarshal updated kanbanniang config_json: %v", err)
+	}
+	if cfgMap["model"] != "random" || cfgMap["position"] != "left" {
+		t.Fatalf("expected model fallback to 'random' and preserved position='left', got %+v", cfgMap)
+	}
+}

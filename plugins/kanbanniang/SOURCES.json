@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/88250/solo/commit/4767c0b64eff170a3cf55c9b43cc6a9111f7b8a4",
+  "live2d_api_ack": "https://github.com/fghrsh/live2d_api",
+  "license": "LICENSE",
+  "models": "See README.md and root THIRD_PARTY_NOTICES.md for original model authors and non-commercial terms.",
+  "adaptations": [
+    "Ported to Volo-go zero-host-coupling Goja plugin architecture with 4-locale i18n and plugin_kv head-pat counter",
+    "Preserved lossless POT .png/.gif canonical assets and standard Cubism 2.1 descriptors alongside progressive .webp companions with client probe and per-image onerror fallback",
+    "Fixed motion file cache key mismatch, lazy-loaded motions on demand, added 30 FPS pacing and background-tab hibernation",
+    "Local tips, seasons, click quotes, and WebGL/audio/XHR disposal across PJAX navigation"
+  ],
+  "modelsIncluded": 26
+}

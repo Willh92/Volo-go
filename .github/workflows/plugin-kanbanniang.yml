@@ -1,0 +1,122 @@
+name: Package Kanbanniang Plugin
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "plugins/kanbanniang/**"
+      - "plugins/catalog.json"
+      - ".github/scripts/package-plugin.py"
+      - ".github/workflows/plugin-kanbanniang.yml"
+  workflow_dispatch:
+    inputs:
+      force_republish:
+        description: "Force rebuild and republish even if current manifest version release already exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-kanbanniang-release
+  cancel-in-progress: false
+
+jobs:
+  publish-plugin:
+    name: Check Version & Publish Standalone Kanbanniang ZIP
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Sparse checkout plugin metadata & packager
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/scripts/package-plugin.py
+            plugins/catalog.json
+            plugins/kanbanniang/manifest.json
+            plugins/kanbanniang/main.js
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve Plugin Version & Check If Already Published
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          FORCE_REPUBLISH: ${{ inputs.force_republish }}
+        run: |
+          META_OUT="$(python3 .github/scripts/package-plugin.py --plugin kanbanniang --print-meta)"
+          echo "${META_OUT}"
+          echo "${META_OUT}" >> "${GITHUB_OUTPUT}"
+
+          VER="$(printf '%s\n' "${META_OUT}" | sed -n 's/^version=//p')"
+          TAG="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_tag=//p')"
+          ASSET="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_asset=//p')"
+
+          ALREADY="false"
+          if gh release view "${TAG}" --repo "${REPO}" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "${ASSET}"; then
+            ALREADY="true"
+          fi
+
+          if [ "${ALREADY}" = "true" ] && [ "${FORCE_REPUBLISH}" != "true" ]; then
+            echo "should_package=false" >> "${GITHUB_OUTPUT}"
+            echo "Skip packaging: ${TAG} (${ASSET}) is already published and version (${VER}) has not changed."
+          else
+            echo "should_package=true" >> "${GITHUB_OUTPUT}"
+            echo "Proceeding to package and publish ${TAG} (${ASSET})..."
+          fi
+
+      - name: Checkout full repository (When Packaging New Version)
+        if: steps.check.outputs.should_package == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go (When Packaging New Version)
+        if: steps.check.outputs.should_package == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify Kanbanniang Plugin Integrity Before Packaging
+        if: steps.check.outputs.should_package == 'true'
+        env:
+          CGO_ENABLED: "0"
+          GOEXPERIMENT: "nojsonv2"
+        run: go test -count=1 ./pkg/plugin -run TestKanbanniang
+
+      - name: Build Deterministic Kanbanniang ZIP Archive
+        if: steps.check.outputs.should_package == 'true'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct -- plugins/kanbanniang 2>/dev/null || true)"
+          case "${SOURCE_DATE_EPOCH}" in
+            ''|*[!0-9]*) SOURCE_DATE_EPOCH="$(date -u -d 2026-01-01T00:00:00Z +%s)" ;;
+          esac
+          export SOURCE_DATE_EPOCH
+          python3 .github/scripts/package-plugin.py \
+            --plugin kanbanniang \
+            --output-dir plugin-dist \
+            --repo "${REPO}"
+          ls -lh plugin-dist
+
+      - name: Publish Standalone Plugin GitHub Release
+        if: steps.check.outputs.should_package == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          name: "Plugin: Kanbanniang v${{ steps.check.outputs.version }}"
+          tag_name: ${{ steps.check.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: false
+          make_latest: "false"
+          body_path: plugin-dist/plugin-release-notes.md
+          generate_release_notes: false
+          files: |
+            plugin-dist/${{ steps.check.outputs.release_asset }}
+            plugin-dist/${{ steps.check.outputs.release_asset_alias }}
+            plugin-dist/SHA256SUMS.txt

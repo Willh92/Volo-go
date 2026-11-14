@@ -1,26 +1,27 @@
 {
   "id": "kanbanniang",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "min_host_version": "0.1.0",
   "runtime": "goja",
   "entry": "main.js",
   "author": "Volo Studio",
   "homepage": "https://github.com/Willh92/Volo-go",
   "name": {
-    "zh-CN": "工作室看板娘 (Mascot Companion)",
-    "en-US": "Studio Mascot Companion",
-    "zh-TW": "工作室看板娘 (Mascot Companion)",
-    "ja-JP": "スタジオ看板娘 (Mascot Companion)"
+    "zh-CN": "工作室看板娘 (Live2D Mascot)",
+    "en-US": "Studio Live2D Mascot",
+    "zh-TW": "工作室看板娘 (Live2D Mascot)",
+    "ja-JP": "スタジオ看板娘 (Live2D Mascot)"
   },
   "description": {
-    "zh-CN": "纯离线 SVG 轻量互动看板娘挂件，原生支持 PJAX 跨页常驻与 plugin_kv 摸头计数，宿主零硬编码耦合。",
-    "en-US": "Self-contained SVG interactive mascot companion surviving PJAX navigation with persistent plugin_kv head-pat counter and zero host coupling.",
-    "zh-TW": "純離線 SVG 輕量互動看板娘掛件，原生支援 PJAX 跨頁常駐與 plugin_kv 摸頭計數，宿主零硬編碼耦合。",
-    "ja-JP": "完全オフラインの軽量SVGインタラクティブ看板娘ウィジェット。PJAXページ遷移を跨いで常駐し、plugin_kv によるなでなで回数集計に対応。"
+    "zh-CN": "本地化 WebGL Live2D 互动看板娘插件，内置 26 套经典模型与随机换装、樱花动态背景、拖拽记忆、PJAX 跨页常驻及摸头统计。",
+    "en-US": "Self-hosted WebGL Live2D interactive mascot with 26 local models, costume switching, sakura backgrounds, drag memory, PJAX persistence, and head-pat stats.",
+    "zh-TW": "本地化 WebGL Live2D 互動看板娘外掛，內建 26 套經典模型與隨機換裝、櫻花動態背景、拖曳記憶、PJAX 跨頁常駐及摸頭統計。",
+    "ja-JP": "ローカルWebGL Live2Dインタラクティブ看板娘プラグイン。26種類のモデルと着せ替え、桜アニメーション背景、ドラッグ位置記憶、PJAX常駐、なでなで統計に対応。"
   },
   "permissions": [
     "kv",
     "ratelimit",
+    "site:read",
     "slots:public.footer",
     "slots:admin.dashboard_card",
     "http:routes"
@@ -40,15 +41,39 @@
   ],
   "config_schema": [
     {
-      "key": "character",
+      "key": "model",
       "type": "select",
-      "default": "neko",
+      "default": "random",
       "options": [
-        { "value": "neko", "label": { "zh-CN": "墨绿小猫 (Neko)", "en-US": "Studio Neko", "zh-TW": "墨綠小貓 (Neko)", "ja-JP": "スタジオ黒猫 (Neko)" } },
-        { "value": "owl", "label": { "zh-CN": "守夜猫头鹰 (Owl)", "en-US": "Night Owl", "zh-TW": "守夜貓頭鷹 (Owl)", "ja-JP": "夜更かしフクロウ (Owl)" } },
-        { "value": "bot", "label": { "zh-CN": "极简像素机 (Bot)", "en-US": "Minimal Bot", "zh-TW": "極簡像素機 (Bot)", "ja-JP": "ミニマルロボ (Bot)" } }
+        { "value": "random", "label": { "zh-CN": "随机模型 (每次访问随机)", "en-US": "Random Model (Each Session)", "zh-TW": "隨機模型 (每次造訪隨機)", "ja-JP": "ランダムモデル" } },
+        { "value": "Potion-Maker/Pio", "label": { "zh-CN": "药水制作师 · Pio (随机换装)", "en-US": "Potion Maker · Pio (Costumes)", "zh-TW": "藥水製作師 · Pio (隨機換裝)", "ja-JP": "ポーションメーカー · Pio (着せ替え)" } },
+        { "value": "Potion-Maker/Tia", "label": { "zh-CN": "药水制作师 · Tia (随机换装)", "en-US": "Potion Maker · Tia (Costumes)", "zh-TW": "藥水製作師 · Tia (隨機換裝)", "ja-JP": "ポーションメーカー · Tia (着せ替え)" } },
+        { "value": "bilibili-live/22", "label": { "zh-CN": "直播娘 · 22", "en-US": "Live Mascot · 22", "zh-TW": "直播娘 · 22", "ja-JP": "ライブ娘 · 22" } },
+        { "value": "bilibili-live/33", "label": { "zh-CN": "直播娘 · 33", "en-US": "Live Mascot · 33", "zh-TW": "直播娘 · 33", "ja-JP": "ライブ娘 · 33" } },
+        { "value": "ShizukuTalk/shizuku-48", "label": { "zh-CN": "雫 (Shizuku · 制服)", "en-US": "Shizuku (Uniform)", "zh-TW": "雫 (Shizuku · 制服)", "ja-JP": "しずく (制服)" } },
+        { "value": "ShizukuTalk/shizuku-pajama", "label": { "zh-CN": "雫 (Shizuku · 居家睡衣)", "en-US": "Shizuku (Pajama)", "zh-TW": "雫 (Shizuku · 居家睡衣)", "ja-JP": "しずく (パジャマ)" } },
+        { "value": "KantaiCollection/murakumo", "label": { "zh-CN": "丛云 (Murakumo)", "en-US": "Murakumo", "zh-TW": "叢雲 (Murakumo)", "ja-JP": "叢雲 (Murakumo)" } },
+        { "value": "HyperdimensionNeptunia/nepnep", "label": { "zh-CN": "涅普顿 · Nepnep (含语音)", "en-US": "Neptune · Nepnep (Voice)", "zh-TW": "涅普頓 · Nepnep (含語音)", "ja-JP": "ネプテューヌ · Nepnep (音声付)" } },
+        { "value": "HyperdimensionNeptunia/neptune_classic", "label": { "zh-CN": "涅普顿 · 经典服", "en-US": "Neptune · Classic", "zh-TW": "涅普頓 · 經典服", "ja-JP": "ネプテューヌ · クラシック" } },
+        { "value": "HyperdimensionNeptunia/neptune_santa", "label": { "zh-CN": "涅普顿 · 圣诞装", "en-US": "Neptune · Santa", "zh-TW": "涅普頓 · 聖誕裝", "ja-JP": "ネプテューヌ · サンタ" } },
+        { "value": "HyperdimensionNeptunia/nepmaid", "label": { "zh-CN": "涅普顿 · 女仆装", "en-US": "Neptune · Maid", "zh-TW": "涅普頓 · 女僕裝", "ja-JP": "ネプテューヌ · メイド" } },
+        { "value": "HyperdimensionNeptunia/nepswim", "label": { "zh-CN": "涅普顿 · 泳装", "en-US": "Neptune · Swimwear", "zh-TW": "涅普頓 · 泳裝", "ja-JP": "ネプテューヌ · 水着" } },
+        { "value": "HyperdimensionNeptunia/noir_classic", "label": { "zh-CN": "诺瓦露 · 经典服", "en-US": "Noire · Classic", "zh-TW": "諾瓦露 · 經典服", "ja-JP": "ノワール · クラシック" } },
+        { "value": "HyperdimensionNeptunia/noir", "label": { "zh-CN": "诺瓦露 · 常服", "en-US": "Noire · Normal", "zh-TW": "諾瓦露 · 常服", "ja-JP": "ノワール · 通常" } },
+        { "value": "HyperdimensionNeptunia/noir_santa", "label": { "zh-CN": "诺瓦露 · 圣诞装", "en-US": "Noire · Santa", "zh-TW": "諾瓦露 · 聖誕裝", "ja-JP": "ノワール · サンタ" } },
+        { "value": "HyperdimensionNeptunia/noireswim", "label": { "zh-CN": "诺瓦露 · 泳装", "en-US": "Noire · Swimwear", "zh-TW": "諾瓦露 · 泳裝", "ja-JP": "ノワール · 水着" } },
+        { "value": "HyperdimensionNeptunia/blanc_classic", "label": { "zh-CN": "布兰 · 经典服", "en-US": "Blanc · Classic", "zh-TW": "布蘭 · 經典服", "ja-JP": "ブラン · クラシック" } },
+        { "value": "HyperdimensionNeptunia/blanc_normal", "label": { "zh-CN": "布兰 · 常服", "en-US": "Blanc · Normal", "zh-TW": "布蘭 · 常服", "ja-JP": "ブラン · 通常" } },
+        { "value": "HyperdimensionNeptunia/blanc_swimwear", "label": { "zh-CN": "布兰 · 泳装", "en-US": "Blanc · Swimwear", "zh-TW": "布蘭 · 泳裝", "ja-JP": "ブラン · 水着" } },
+        { "value": "HyperdimensionNeptunia/vert_classic", "label": { "zh-CN": "贝露 · 经典服", "en-US": "Vert · Classic", "zh-TW": "貝露 · 經典服", "ja-JP": "ベール · クラシック" } },
+        { "value": "HyperdimensionNeptunia/vert_normal", "label": { "zh-CN": "贝露 · 常服", "en-US": "Vert · Normal", "zh-TW": "貝露 · 常服", "ja-JP": "ベール · 通常" } },
+        { "value": "HyperdimensionNeptunia/vert_swimwear", "label": { "zh-CN": "贝露 · 泳装", "en-US": "Vert · Swimwear", "zh-TW": "貝露 · 泳裝", "ja-JP": "ベール · 水着" } },
+        { "value": "HyperdimensionNeptunia/nepgear", "label": { "zh-CN": "涅普姬雅 · 常服", "en-US": "Nepgear · Normal", "zh-TW": "涅普姬雅 · 常服", "ja-JP": "ネプギア · 通常" } },
+        { "value": "HyperdimensionNeptunia/nepgear_extra", "label": { "zh-CN": "涅普姬雅 · 礼服", "en-US": "Nepgear · Extra", "zh-TW": "涅普姬雅 · 禮服", "ja-JP": "ネプギア · エクストラ" } },
+        { "value": "HyperdimensionNeptunia/nepgearswim", "label": { "zh-CN": "涅普姬雅 · 泳装", "en-US": "Nepgear · Swimwear", "zh-TW": "涅普姬雅 · 泳裝", "ja-JP": "ネプギア · 水着" } },
+        { "value": "HyperdimensionNeptunia/histoire", "label": { "zh-CN": "伊丝托瓦露 (Histoire)", "en-US": "Histoire", "zh-TW": "伊絲托瓦露 (Histoire)", "ja-JP": "イストワール (Histoire)" } }
       ],
-      "label": { "zh-CN": "角色形象", "en-US": "Character Style", "zh-TW": "角色形象", "ja-JP": "キャラクター" }
+      "label": { "zh-CN": "默认 Live2D 模型", "en-US": "Default Live2D Model", "zh-TW": "預設 Live2D 模型", "ja-JP": "デフォルト Live2D モデル" }
     },
     {
       "key": "position",
@@ -58,24 +83,48 @@
         { "value": "left", "label": { "zh-CN": "左下角", "en-US": "Bottom Left", "zh-TW": "左下角", "ja-JP": "左下" } },
         { "value": "right", "label": { "zh-CN": "右下角", "en-US": "Bottom Right", "zh-TW": "右下角", "ja-JP": "右下" } }
       ],
-      "label": { "zh-CN": "停靠位置", "en-US": "Dock Position", "zh-TW": "停靠位置", "ja-JP": "表示位置" }
+      "label": { "zh-CN": "初始停靠位置", "en-US": "Initial Dock Position", "zh-TW": "初始停靠位置", "ja-JP": "初期表示位置" }
+    },
+    {
+      "key": "sakura_background",
+      "type": "boolean",
+      "default": true,
+      "label": { "zh-CN": "樱花飘落动态背景", "en-US": "Sakura Animated Background", "zh-TW": "櫻花飄落動態背景", "ja-JP": "桜アニメーション背景" }
+    },
+    {
+      "key": "idle_chat",
+      "type": "boolean",
+      "default": true,
+      "label": { "zh-CN": "空闲随笔气泡 (每 30 秒)", "en-US": "Idle Chat Bubble (Every 30s)", "zh-TW": "空閒隨筆氣泡 (每 30 秒)", "ja-JP": "待機おしゃべり (30秒ごと)" }
+    },
+    {
+      "key": "mute_sound",
+      "type": "boolean",
+      "default": false,
+      "label": { "zh-CN": "静音模型互动语音", "en-US": "Mute Model Voice Clips", "zh-TW": "靜音模型互動語音", "ja-JP": "モデル音声をミュート" }
+    },
+    {
+      "key": "project_url",
+      "type": "url",
+      "default": "https://github.com/Willh92/Volo-go",
+      "label": { "zh-CN": "项目按钮跳转链接", "en-US": "Project Button URL", "zh-TW": "專案按鈕跳轉連結", "ja-JP": "プロジェクトボタンのURL" }
     },
     {
       "key": "greeting_zh",
       "type": "string",
-      "default": "欢迎来到独立博客，点我可以摸摸头～",
+      "default": "欢迎来到这个文字空间，点我可以摸摸头～",
       "label": { "zh-CN": "中文问候语", "en-US": "Chinese Greeting", "zh-TW": "簡體中文問候語", "ja-JP": "簡体字中国語の挨拶" }
     },
     {
       "key": "greeting_tw",
       "type": "string",
-      "default": "歡迎來到獨立部落格，點我可以摸摸頭～",
+      "default": "歡迎來到這個文字空間，點我可以摸摸頭～",
       "label": { "zh-CN": "繁体中文问候语", "en-US": "Traditional Chinese Greeting", "zh-TW": "繁體中文問候語", "ja-JP": "繁体字中国語の挨拶" }
     },
     {
       "key": "greeting_en",
       "type": "string",
-      "default": "Welcome! Click me for a head-pat~",
+      "default": "Welcome to this writing space! Click me for a head-pat~",
       "label": { "zh-CN": "英文问候语", "en-US": "English Greeting", "zh-TW": "英文問候語", "ja-JP": "英語の挨拶" }
     },
     {
@@ -88,7 +137,7 @@
       "key": "hide_on_mobile",
       "type": "boolean",
       "default": true,
-      "label": { "zh-CN": "窄屏自动隐藏", "en-US": "Hide on Mobile Screens", "zh-TW": "窄螢幕自動隱藏", "ja-JP": "モバイル画面で自動的に非表示" }
+      "label": { "zh-CN": "窄屏自动隐藏 (<= 800px)", "en-US": "Auto-Hide on Narrow Screens (<= 800px)", "zh-TW": "窄螢幕自動隱藏 (<= 800px)", "ja-JP": "モバイル画面で自動的に非表示 (<= 800px)" }
     }
   ]
 }

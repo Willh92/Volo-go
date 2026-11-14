@@ -75,3 +75,15 @@ Pages containing LaTeX math expressions or Mermaid diagrams dynamically load the
 | :--- | :--- | :--- | :--- |
 | `houbb/sensitive-word` & `houbb/sensitive-word-data` | Apache-2.0 | Sanitized & categorized base dictionary in `plugins/sensitive-words` | https://github.com/houbb/sensitive-word |
 | `BYVoid/OpenCC` (`TSCharacters.txt` via `houbb/opencc4j`) | Apache-2.0 | Static BMP Traditional-to-Simplified Hanzi folding table in `pkg/wordfilter` | https://github.com/BYVoid/OpenCC |
+
+---
+
+## 6. Optional Standalone Plugin Package (`plugins/kanbanniang`) / 可选独立发布插件包（看板娘）
+
+> **Distribution Scope / 分发范围说明**: To keep core OS/arch binary bundles (`~8 MB`) and the Distroless container image minimal and purely Apache-2.0 compatible, `plugins/kanbanniang` is **excluded** from the main `Volo-go` binary archives and base container image, and is distributed separately as an optional standalone plugin archive (`plugin-kanbanniang-v2.0.0.zip`).
+> 为保持核心跨平台发行包（`~8 MB`）与 Distroless 容器镜像精简纯粹，`plugins/kanbanniang` **不包含**在主程序压缩包与默认容器镜像中，而是作为可选独立插件包（`plugin-kanbanniang-v2.0.0.zip`）按需安装。
+
+| Component / 组件 | License / 条款 | Purpose / 用途 | Reference / 说明 |
+| :--- | :--- | :--- | :--- |
+| `kanbanniang` controller & integration wrapper (adapted from `88250/solo` & `b3log/kanbanniang`) | MIT | Plugin controller, toolbar icons, tips structure, and Live2D integration wrapper | [`plugins/kanbanniang/LICENSE`](./plugins/kanbanniang/LICENSE) |
+| Live2D Cubism 2.1 WebGL runtime (`plugins/kanbanniang/assets/live2d.js` core) & 26 bundled character models | Upstream Original Authors / Personal & Non-Commercial Terms | Local offline Live2D WebGL rendering runtime and character `.moc` / `.mtn` / texture / audio assets | [`plugins/kanbanniang/SOURCES.json`](./plugins/kanbanniang/SOURCES.json), [`plugins/kanbanniang/README.md`](./plugins/kanbanniang/README.md) |

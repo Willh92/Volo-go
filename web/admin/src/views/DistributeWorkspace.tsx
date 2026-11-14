@@ -240,8 +240,10 @@ export function DistributeWorkspace({
   const [followForm, setFollowForm] = useState({ ...EMPTY_FOLLOW });
   const [followPreviewOpen, setFollowPreviewOpen] = useState(false);
   const [followGroups, setFollowGroups] = useState<any[]>([]);
+  const [followPreviewTotal, setFollowPreviewTotal] = useState(0);
   const [followPreviewLoading, setFollowPreviewLoading] = useState(false);
   const [followPreviewQuery, setFollowPreviewQuery] = useState("");
+  const debouncedFollowPreviewQ = useDebouncedValue(followPreviewQuery, 250);
   const [followPreviewPage, setFollowPreviewPage] = useState(1);
   const [followEntryLimits, setFollowEntryLimits] = useState<Record<string, number>>({});
   const [opmlImportOpen, setOpmlImportOpen] = useState(false);
@@ -250,7 +252,9 @@ export function DistributeWorkspace({
 
   // Webhooks + Deliveries Log Modal
   const [webhooks, setWebhooks] = useState<any[]>([]);
+  const [whTotal, setWhTotal] = useState(0);
   const [whSearch, setWhSearch] = useState("");
+  const debouncedWhQ = useDebouncedValue(whSearch, 250);
   const [testingWhId, setTestingWhId] = useState("");
   const [whModalOpen, setWhModalOpen] = useState(false);
   const [whForm, setWhForm] = useState({ ...EMPTY_WH });
@@ -382,6 +386,25 @@ export function DistributeWorkspace({
     }
   };
 
+  const loadWebhooks = async () => {
+    if (!isAdmin) return;
+    setLoading(true);
+    try {
+      const sp = new URLSearchParams();
+      sp.set("page", String(pageIdx));
+      sp.set("per_page", String(pageSize));
+      if (debouncedWhQ.trim()) sp.set("q", debouncedWhQ.trim());
+      const r = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/webhooks?${sp.toString()}`);
+      const list = r.items || [];
+      setWebhooks(list);
+      setWhTotal(r.total ?? list.length);
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const loadSub = async () => {
     if (sub === "nav_redirects") {
       if (navSub === "nav") {
@@ -399,12 +422,13 @@ export function DistributeWorkspace({
       await loadFollows();
       return;
     }
+    if (sub === "webhooks") {
+      await loadWebhooks();
+      return;
+    }
     setLoading(true);
     try {
-      if (sub === "webhooks" && isAdmin) {
-        const r = await apiFetch<{ items: any[] }>("/api/admin/webhooks?per_page=200");
-        setWebhooks(r.items || []);
-      } else if ((sub === "feed_seo" || sub === "github") && isAdmin) {
+      if ((sub === "feed_seo" || sub === "github") && isAdmin) {
         const s = await apiFetch<any>("/api/admin/settings");
         setFeedCfg(s.domains?.feed || {});
         setFeedVer(s.versions?.feed || 0);
@@ -426,10 +450,17 @@ export function DistributeWorkspace({
   useEffect(() => {
     if (sub === "nav_redirects" && navSub === "nav") {
       void loadNav();
-    } else if (sub === "webhooks" || sub === "feed_seo" || sub === "github") {
+    } else if (sub === "feed_seo" || sub === "github") {
       void loadSub();
     }
   }, [sub, navSub]);
+
+  // Webhooks server-paginated fetch
+  useEffect(() => {
+    if (sub !== "webhooks" || !isAdmin) return;
+    if (whSearch !== debouncedWhQ) return;
+    void loadWebhooks();
+  }, [sub, isAdmin, pageIdx, pageSize, debouncedWhQ]);
 
   // Redirects server-paginated fetch
   useEffect(() => {
@@ -795,19 +826,33 @@ export function DistributeWorkspace({
     }
   };
 
-  const openFollowPreview = async () => {
-    setFollowPreviewQuery("");
-    setFollowPreviewPage(1);
-    setFollowPreviewOpen(true);
+  const loadFollowPreview = async (page: number, q: string) => {
     setFollowPreviewLoading(true);
     try {
-      const r = await apiFetch<{ groups?: any[]; items?: any[] }>("/api/admin/follows/items");
-      setFollowGroups(r.groups || r.items || []);
+      const r = await apiFetch<{ groups?: any[]; items?: any[]; total?: number }>(
+        `/api/admin/follows/items?page=${page}&per_page=10&q=${encodeURIComponent(q)}&items_per_follow=20`
+      );
+      const list = r.groups || r.items || [];
+      setFollowGroups(list);
+      setFollowPreviewTotal(r.total ?? list.length);
     } catch (err: any) {
       showToast(err.message);
     } finally {
       setFollowPreviewLoading(false);
     }
+  };
+
+  useEffect(() => {
+    if (!followPreviewOpen) return;
+    if (followPreviewQuery !== debouncedFollowPreviewQ) return;
+    void loadFollowPreview(followPreviewPage, debouncedFollowPreviewQ.trim());
+  }, [followPreviewOpen, followPreviewPage, debouncedFollowPreviewQ]);
+
+  const openFollowPreview = () => {
+    setFollowPreviewQuery("");
+    setFollowPreviewPage(1);
+    setFollowEntryLimits({});
+    setFollowPreviewOpen(true);
   };
 
   const saveWebhook = async (e?: Event) => {
@@ -1005,17 +1050,9 @@ export function DistributeWorkspace({
   const followPageSlice =
     follows.length > pageSize ? paginateItems(follows, pageIdx, pageSize).slice : follows;
 
-  const filteredWebhooks = whSearch.trim()
-    ? webhooks.filter((item) => {
-        const w = item.webhook || item;
-        const q = whSearch.trim().toLowerCase();
-        return (
-          String(w.name || "").toLowerCase().includes(q) ||
-          String(w.url || w.target_url || "").toLowerCase().includes(q) ||
-          String(w.provider || w.platform || "").toLowerCase().includes(q)
-        );
-      })
-    : webhooks;
+  const whPageSlice =
+    webhooks.length > pageSize ? paginateItems(webhooks, pageIdx, pageSize).slice : webhooks;
+  const effectiveWhTotal = Math.max(whTotal, webhooks.length);
 
   const allGhRepos: any[] = Array.isArray(seoCfg?.github_repos) ? seoCfg.github_repos : [];
   const filteredGhRepos = ghSearch.trim()
@@ -1035,7 +1072,6 @@ export function DistributeWorkspace({
 
   const pagedNav = paginateItems(filteredNavRows, pageIdx, pageSize);
   const pagedGh = paginateItems(filteredGhRepos, pageIdx, pageSize);
-  const pagedWebhooks = paginateItems(filteredWebhooks, pageIdx, pageSize);
 
   const toggleSel = (list: string[], setList: (v: string[]) => void, id: string) => {
     setList(list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
@@ -1123,7 +1159,7 @@ export function DistributeWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("cnt.col_name")}</th>
@@ -1872,7 +1908,7 @@ export function DistributeWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-status">{t("dist.gh_col_show")}</th>
@@ -2069,7 +2105,7 @@ export function DistributeWorkspace({
           />
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-check">
@@ -2470,7 +2506,7 @@ export function DistributeWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("cnt.col_name")}</th>
@@ -2717,114 +2753,112 @@ export function DistributeWorkspace({
 
           <AnimatedModal
             open={followPreviewOpen}
-            onClose={() => setFollowPreviewOpen(false)}
+            onClose={() => {
+              setFollowPreviewOpen(false);
+              setFollowPreviewQuery("");
+              setFollowPreviewPage(1);
+            }}
             title={t("dist.follows_preview")}
             subtitle={t("dist.follows_desc")}
             maxWidth="720px"
             footer={
-              <button type="button" class="volo-btn volo-btn-primary" onClick={() => setFollowPreviewOpen(false)}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-primary"
+                onClick={() => {
+                  setFollowPreviewOpen(false);
+                  setFollowPreviewQuery("");
+                  setFollowPreviewPage(1);
+                }}
+              >
                 {t("common.close")}
               </button>
             }
           >
-            {followPreviewLoading ? (
-              <div class="volo-help">{t("shell.loading")}</div>
-            ) : followGroups.length === 0 || followGroups.every((g) => !(g.items || []).length && !g.url) ? (
-              <ConsoleEmpty />
-            ) : (
-              (() => {
-                const q = followPreviewQuery.trim().toLowerCase();
-                const validGroups = followGroups
-                  .map((g) => {
-                    const fl = g.follow || g;
-                    const rawEntries: any[] = Array.isArray(g.items) ? g.items : g.url ? [g] : [];
-                    if (!rawEntries.length) return null;
-                    if (!q) return { fl, entries: rawEntries };
-                    const groupMatches =
-                      String(fl.title || "").toLowerCase().includes(q) ||
-                      String(fl.feed_url || "").toLowerCase().includes(q);
-                    if (groupMatches) return { fl, entries: rawEntries };
-                    const matchedEntries = rawEntries.filter(
-                      (it: any) =>
-                        String(it.title || "").toLowerCase().includes(q) ||
-                        String(it.url || "").toLowerCase().includes(q) ||
-                        String(it.summary || "").toLowerCase().includes(q)
-                    );
-                    return matchedEntries.length > 0 ? { fl, entries: matchedEntries } : null;
-                  })
-                  .filter(Boolean) as { fl: any; entries: any[] }[];
-                const pagedGroups = paginateItems(validGroups, followPreviewPage, 10);
-                return (
-                  <div>
-                    <div class="volo-field" style={{ marginBottom: "12px" }}>
-                      <input
-                        class="volo-input"
-                        autoComplete="off"
-                        placeholder={t("dist.follows_preview_search_ph")}
-                        value={followPreviewQuery}
-                        onInput={(e) => {
-                          setFollowPreviewQuery((e.currentTarget as HTMLInputElement).value);
-                          setFollowPreviewPage(1);
-                        }}
-                      />
-                    </div>
-                    {validGroups.length === 0 ? (
-                      <ConsoleEmpty />
-                    ) : (
-                      <>
-                        {pagedGroups.slice.map(({ fl, entries }, idx) => {
-                          const gKey = String(fl.id || fl.feed_url || idx);
-                          const lim = followEntryLimits[gKey] || 8;
-                          return (
-                            <div key={gKey} class="volo-subcard">
-                              <div class="volo-subcard-title">
-                                <span>{fl.title || fl.feed_url}</span>
-                                <span class="volo-mini-tag">{entries.length}</span>
-                              </div>
-                              {entries.slice(0, lim).map((it: any) => (
-                                <div key={it.id || it.url} class="volo-cell-main" style={{ padding: "6px 0", borderTop: "1px dashed var(--volo-line)" }}>
-                                  <div class="volo-cell-title">
-                                    <a href={it.url} target="_blank" rel="noreferrer">
-                                      {it.title || it.url}
-                                    </a>
-                                    {it.published_at > 0 && <span class="volo-help">{formatDateTime(it.published_at)}</span>}
-                                  </div>
-                                  {it.summary && <div class="volo-help">{it.summary}</div>}
-                                </div>
-                              ))}
-                              {entries.length > lim && (
-                                <div style={{ paddingTop: "8px", borderTop: "1px dashed var(--volo-line)" }}>
-                                  <button
-                                    type="button"
-                                    class="volo-tag-more-btn"
-                                    onClick={() =>
-                                      setFollowEntryLimits((prev) => ({
-                                        ...prev,
-                                        [gKey]: lim + 20,
-                                      }))
-                                    }
-                                  >
-                                    {t("ui.token_more", { count: entries.length - lim })}
-                                  </button>
-                                </div>
-                              )}
+            <div>
+              <div class="volo-field" style={{ marginBottom: "12px" }}>
+                <input
+                  class="volo-input"
+                  autoComplete="off"
+                  placeholder={t("dist.follows_preview_search_ph")}
+                  value={followPreviewQuery}
+                  onInput={(e) => {
+                    setFollowPreviewQuery((e.currentTarget as HTMLInputElement).value);
+                    setFollowPreviewPage(1);
+                  }}
+                />
+              </div>
+              {followPreviewLoading && followGroups.length === 0 ? (
+                <div class="volo-help">{t("shell.loading")}</div>
+              ) : (
+                (() => {
+                  const validGroups = followGroups
+                    .map((g) => {
+                      const fl = g.follow || g;
+                      const rawEntries: any[] = Array.isArray(g.items) ? g.items : g.url ? [g] : [];
+                      if (!rawEntries.length) return null;
+                      return { fl, entries: rawEntries };
+                    })
+                    .filter(Boolean) as { fl: any; entries: any[] }[];
+                  const groupSlice =
+                    validGroups.length > 10
+                      ? paginateItems(validGroups, followPreviewPage, 10).slice
+                      : validGroups;
+                  const totalGroups = Math.max(followPreviewTotal, validGroups.length);
+                  return validGroups.length === 0 ? (
+                    <ConsoleEmpty />
+                  ) : (
+                    <>
+                      {groupSlice.map(({ fl, entries }, idx) => {
+                        const gKey = String(fl.id || fl.feed_url || idx);
+                        const lim = followEntryLimits[gKey] || 8;
+                        return (
+                          <div key={gKey} class="volo-subcard">
+                            <div class="volo-subcard-title">
+                              <span>{fl.title || fl.feed_url}</span>
+                              <span class="volo-mini-tag">{entries.length}</span>
                             </div>
-                          );
-                        })}
-                        {validGroups.length > 10 && (
-                          <Pagination
-                            total={validGroups.length}
-                            page={pagedGroups.safePage}
-                            pageSize={10}
-                            onChange={(p) => setFollowPreviewPage(p)}
-                          />
-                        )}
-                      </>
-                    )}
-                  </div>
-                );
-              })()
-            )}
+                            {entries.slice(0, lim).map((it: any) => (
+                              <div key={it.id || it.url} class="volo-cell-main" style={{ padding: "6px 0", borderTop: "1px dashed var(--volo-line)" }}>
+                                <div class="volo-cell-title">
+                                  <a href={it.url} target="_blank" rel="noreferrer">
+                                    {it.title || it.url}
+                                  </a>
+                                  {it.published_at > 0 && <span class="volo-help">{formatDateTime(it.published_at)}</span>}
+                                </div>
+                                {it.summary && <div class="volo-help">{it.summary}</div>}
+                              </div>
+                            ))}
+                            {entries.length > lim && (
+                              <div style={{ paddingTop: "8px", borderTop: "1px dashed var(--volo-line)" }}>
+                                <button
+                                  type="button"
+                                  class="volo-tag-more-btn"
+                                  onClick={() =>
+                                    setFollowEntryLimits((prev) => ({
+                                      ...prev,
+                                      [gKey]: lim + 20,
+                                    }))
+                                  }
+                                >
+                                  {t("ui.token_more", { count: entries.length - lim })}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                      <Pagination
+                        total={totalGroups}
+                        page={followPreviewPage}
+                        pageSize={10}
+                        onChange={(p) => setFollowPreviewPage(p)}
+                      />
+                    </>
+                  );
+                })()
+              )}
+            </div>
           </AnimatedModal>
         </div>
       )}
@@ -2862,7 +2896,7 @@ export function DistributeWorkspace({
           </div>
 
           <div class="volo-table-wrap">
-            <table class="volo-table">
+            <table class="volo-table volo-table-compact">
               <thead>
                 <tr>
                   <th class="col-fluid">{t("cnt.col_name")}</th>
@@ -2875,10 +2909,10 @@ export function DistributeWorkspace({
               <tbody>
                 {loading && webhooks.length === 0 ? (
                   <TableSkeleton cols={5} />
-                ) : pagedWebhooks.slice.length === 0 ? (
+                ) : whPageSlice.length === 0 ? (
                   <ConsoleEmpty colSpan={5} />
                 ) : (
-                  pagedWebhooks.slice.map((item) => {
+                  whPageSlice.map((item) => {
                     const w = item.webhook || item;
                     const prov = w.provider || w.platform || "custom";
                     const evList = parseJsonArr(w.events_json || w.events);
@@ -3006,8 +3040,8 @@ export function DistributeWorkspace({
             </table>
           </div>
           <Pagination
-            total={filteredWebhooks.length}
-            page={pagedWebhooks.safePage}
+            total={effectiveWhTotal}
+            page={pageIdx}
             pageSize={pageSize}
             onPageSizeChange={onChangePageSize}
             onChange={setPageIdx}

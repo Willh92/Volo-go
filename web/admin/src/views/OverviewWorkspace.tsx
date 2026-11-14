@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import { createPortal } from "preact/compat";
+import { createPortal } from "preact";
 import type { CSSProperties } from "preact";
 import {
   apiFetch,
@@ -868,6 +868,27 @@ export function OverviewWorkspace({
   const [revisionNote, setRevisionNote] = useState("");
   const [previewURL, setPreviewURL] = useState("");
   const [inlinePreviewHTML, setInlinePreviewHTML] = useState<string | null>(null);
+  const inlinePreviewRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!inlinePreviewHTML) return;
+    let cancelled = false;
+    void import("../components/CM6EditorCore")
+      .then((m) => {
+        if (!cancelled && inlinePreviewRef.current) {
+          m.enhanceRenderedPreviewDOM(inlinePreviewRef.current, {
+            isWysiwyg: false,
+            copyLabel: t("ed.copy_code"),
+            copiedLabel: t("ed.copied"),
+            plainLabel: t("ed.code_plain"),
+          });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [inlinePreviewHTML]);
 
   const [pendingDraft, setPendingDraft] = useState<LocalDraft | null>(null);
   const [inlineRevs, setInlineRevs] = useState<any[]>([]);
@@ -2757,6 +2778,7 @@ export function OverviewWorkspace({
           }
         >
           <div
+            ref={inlinePreviewRef}
             class="volo-preview-pane"
             style={{ height: "auto", maxHeight: "65vh" }}
             dangerouslySetInnerHTML={{ __html: inlinePreviewHTML || "" }}
@@ -3302,25 +3324,69 @@ export function OverviewWorkspace({
       {/* Content & Runtime Summary KPIs */}
       {overview ? (
         <div class="volo-kpi-grid">
-          <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("articles")}>
+          <div
+            class="volo-kpi volo-kpi-click"
+            role="button"
+            tabIndex={0}
+            onClick={() => onNavigate?.("articles")}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onNavigate?.("articles");
+              }
+            }}
+          >
             <div class="volo-kpi-label">{t("ov.published")}</div>
             <div class="volo-kpi-val" title={Number(overview.counts?.published ?? 0).toLocaleString()}>
               {formatCompactNum(overview.counts?.published ?? 0)}
             </div>
           </div>
-          <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("drafts")}>
+          <div
+            class="volo-kpi volo-kpi-click"
+            role="button"
+            tabIndex={0}
+            onClick={() => onNavigate?.("drafts")}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onNavigate?.("drafts");
+              }
+            }}
+          >
             <div class="volo-kpi-label">{t("ov.drafts")}</div>
             <div class="volo-kpi-val" title={Number(overview.counts?.drafts ?? 0).toLocaleString()}>
               {formatCompactNum(overview.counts?.drafts ?? 0)}
             </div>
           </div>
-          <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("pages")}>
+          <div
+            class="volo-kpi volo-kpi-click"
+            role="button"
+            tabIndex={0}
+            onClick={() => onNavigate?.("pages")}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onNavigate?.("pages");
+              }
+            }}
+          >
             <div class="volo-kpi-label">{t("ov.pages")}</div>
             <div class="volo-kpi-val" title={Number(overview.counts?.pages ?? 0).toLocaleString()}>
               {formatCompactNum(overview.counts?.pages ?? 0)}
             </div>
           </div>
-          <div class="volo-kpi volo-kpi-click" onClick={() => onNavigate?.("comments")}>
+          <div
+            class="volo-kpi volo-kpi-click"
+            role="button"
+            tabIndex={0}
+            onClick={() => onNavigate?.("comments")}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onNavigate?.("comments");
+              }
+            }}
+          >
             <div class="volo-kpi-label">{t("ov.pending_comments")}</div>
             <div class="volo-kpi-val" title={pendingCommentCount.toLocaleString()}>
               {formatCompactNum(pendingCommentCount)}

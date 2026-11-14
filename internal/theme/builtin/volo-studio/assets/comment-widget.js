@@ -508,8 +508,37 @@
         scheduleVV(); syncIdentity();
       });
 
-      const openComposer = () => {
+      let lastTriggerEl = null, lastBanTriggerEl = null;
+      const trapModalTab = (box, ev) => {
+        if (!box || box.hidden || ev.key !== "Tab" || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+        const nodes = qa(box, 'button:not([disabled]), [href], input:not([disabled]):not([tabindex="-1"]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')
+          .filter((n) => !n.hidden && !n.closest("[hidden]") && n.offsetParent !== null);
+        if (!nodes.length) return;
+        const first = nodes[0], last = nodes[nodes.length - 1], ae = doc.activeElement;
+        if (ev.shiftKey) {
+          if (ae === first || !box.contains(ae)) { ev.preventDefault(); focusNoScroll(last); }
+        } else if (ae === last || !box.contains(ae)) {
+          ev.preventDefault(); focusNoScroll(first);
+        }
+      };
+      if (drawer) onEv(drawer, "keydown", (ev) => trapModalTab(drawer, ev));
+      if (banModal) onEv(banModal, "keydown", (ev) => trapModalTab(banModal, ev));
+
+      const closeBanModal = (restoreFocus = true) => {
+        if (!banModal || banModal.hidden) return;
+        banModal.hidden = true;
+        syncLock();
+        const prev = lastBanTriggerEl;
+        lastBanTriggerEl = null;
+        if (restoreFocus && prev && prev.isConnected) focusNoScroll(prev);
+      };
+
+      const openComposer = (triggerNode) => {
         if (!drawer || viewerMuted || !bdrop) return;
+        if (drawer.hidden) {
+          const cand = triggerNode || doc.activeElement;
+          lastTriggerEl = cand && cand !== doc.body && cand !== rootEl ? cand : q(".js-vc-open");
+        }
         if (bdrop.parentElement !== el) el.appendChild(bdrop);
         if (drawer.parentElement !== el) el.appendChild(drawer);
         drawer.hidden = false; clsR(drawer, "is-closing", "is-inline"); clsA(drawer, "is-open");
@@ -517,16 +546,24 @@
         bdrop.hidden = false; clsR(bdrop, "is-closing"); clsA(bdrop, "is-open");
         syncVV(); syncLock();
         if (!isFS) setTab("write");
-        setTimeout(() => { ta?.focus(); syncVV(); }, 30);
+        setTimeout(() => { focusNoScroll(ta); syncVV(); }, 30);
       };
 
-      const closeComposer = () => {
+      const closeComposer = (restoreFocus = true) => {
         if (!drawer || drawer.hidden) return;
         if (isFS) setFullscreen(false);
         if (editingID && ta) { editingID = ta.value = ""; syncCounter(); syncCtx(); }
         clrVV();
         [bdrop, drawer].forEach((n) => n && (clsR(n, "is-open", "is-inline", "is-closing"), n.hidden = true));
         syncLock();
+        const prev = lastTriggerEl;
+        lastTriggerEl = null;
+        if (restoreFocus && prev && prev.isConnected) {
+          focusNoScroll(prev);
+        } else if (restoreFocus) {
+          const fb = q(".js-vc-open");
+          if (fb && fb.isConnected) focusNoScroll(fb);
+        }
       };
 
       refreshList(1, false);
@@ -591,12 +628,12 @@
       }
 
       el._handleEscape = () => {
-        if (banModal && !banModal.hidden) { banModal.hidden = true; syncLock(); return true; }
+        if (banModal && !banModal.hidden) { closeBanModal(true); return true; }
         if (isFS) { setFullscreen(false); return true; }
-        if (drawer && !drawer.hidden) { closeComposer(); return true; }
+        if (drawer && !drawer.hidden) { closeComposer(true); return true; }
         return false;
       };
-      el._closeOverlays = () => { if (banModal) banModal.hidden = true; closeComposer(); syncLock(); };
+      el._closeOverlays = () => { closeBanModal(false); closeComposer(false); syncLock(); };
 
       onEv(form, "submit", (ev) => {
         ev.preventDefault();
@@ -665,13 +702,14 @@
           }).catch(() => {});
           return;
         }
-        if (cl(".js-vc-open")) {
+        const openBtn = cl(".js-vc-open");
+        if (openBtn) {
           if (editingID && ta) { ta.value = ""; syncCounter(); }
-          repID = repName = editingID = ""; syncCtx(); openComposer(); return;
+          repID = repName = editingID = ""; syncCtx(); openComposer(openBtn); return;
         }
         if (cl(".js-vc-fs")) { setFullscreen(!isFS); return; }
-        if (cl(".js-vc-close")) { closeComposer(); return; }
-        if (cl(".js-vc-backdrop")) { if (isFS) setFullscreen(false); else closeComposer(); return; }
+        if (cl(".js-vc-close")) { closeComposer(true); return; }
+        if (cl(".js-vc-backdrop")) { if (isFS) setFullscreen(false); else closeComposer(true); return; }
         if (cl(".js-vc-clear-ctx")) {
           repID = repName = "";
           if (editingID && ta) ta.value = "";
@@ -696,10 +734,10 @@
         const rBtn = cl(".js-vc-reply");
         if (rBtn) {
           if (editingID && ta) { ta.value = ""; syncCounter(); }
-          editingID = ""; repID = rBtn.dataset.id; repName = rBtn.dataset.name; syncCtx(); openComposer(); return;
+          editingID = ""; repID = rBtn.dataset.id; repName = rBtn.dataset.name; syncCtx(); openComposer(rBtn); return;
         }
         const eBtn = cl(".js-vc-edit");
-        if (eBtn && ta) { repID = repName = ""; editingID = eBtn.dataset.id; ta.value = eBtn.dataset.md || ""; syncCounter(); syncCtx(); openComposer(); return; }
+        if (eBtn && ta) { repID = repName = ""; editingID = eBtn.dataset.id; ta.value = eBtn.dataset.md || ""; syncCounter(); syncCtx(); openComposer(eBtn); return; }
         const dBtn = cl(".js-vc-del");
         if (dBtn) { if (cfTap(dBtn)) actReq("/api/v1/comments/" + encU(dBtn.dataset.id), "DELETE", null, !!csrfToken, ref); return; }
         const apBtn = cl(".js-vc-mod-approve");
@@ -708,11 +746,14 @@
         if (mdDel) { if (cfTap(mdDel)) actReq("/api/admin/comments/" + encU(mdDel.dataset.id), "DELETE", null, true, ref); return; }
         const banBtn = cl(".js-vc-mod-ban");
         if (banBtn && banModal) {
+          lastBanTriggerEl = banBtn;
           banID = banBtn.dataset.id;
           const ip = banBtn.dataset.ip, bt = banModal.querySelector(".js-vc-ban-title"), bn = banModal.querySelector(".js-vc-ban-note");
           if (bt) bt.textContent = dL("ban-title", "Ban IP") + (ip ? " (" + ip + ")" : "");
           if (bn) bn.value = "";
-          banModal.hidden = false; syncLock(); return;
+          banModal.hidden = false; syncLock();
+          setTimeout(() => focusNoScroll(bn || banModal.querySelector(".js-vc-ban-cancel")), 20);
+          return;
         }
         const durBtn = cl(".vc-dur-btn");
         if (durBtn && banModal) {
@@ -720,10 +761,10 @@
           qa(banModal, ".vc-dur-btn").forEach((b) => clsT(b, "is-active", b === durBtn));
           return;
         }
-        if (cl(".js-vc-ban-cancel") || (banModal && ev.target === banModal)) { if (banModal) { banModal.hidden = true; syncLock(); } return; }
+        if (cl(".js-vc-ban-cancel") || (banModal && ev.target === banModal)) { closeBanModal(true); return; }
         if (cl(".js-vc-ban-ok") && banModal && banID) {
           const rej = banModal.querySelector(".js-vc-ban-reject"), noteIn = banModal.querySelector(".js-vc-ban-note");
-          banModal.hidden = true; syncLock();
+          closeBanModal(false);
           actReq("/api/admin/comments/" + encU(banID) + "/ban-ip", "POST", { note: noteIn ? noteIn.value.trim() : "", expires_hours: banHours, reject_comment: rej ? !!rej.checked : true }, true, ref);
           return;
         }

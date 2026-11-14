@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -429,16 +430,19 @@ func TestMedia_NineScopeOrphanScannerZeroFalsePositives(t *testing.T) {
 	}
 	symRel := "escape-link.pdf"
 	if err := os.Symlink(outsideFile, filepath.Join(uploadDir, symRel)); err != nil {
-		t.Fatal(err)
-	}
-	symID := id.Next()
-	_, _ = store.ExecContext(ctx,
-		`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
-		 VALUES (?, 'local', ?, '/uploads/escape-link.pdf', 'escape.pdf', 'application/pdf', 4, 0, 0, '00', 0, 'u1', ?)`,
-		symID, symRel, now)
-	_ = pipe.Delete(ctx, symID)
-	if _, err := os.Stat(outsideFile); err != nil {
-		t.Fatalf("CRITICAL: symlink escape deleted file outside UploadDir!")
+		if runtime.GOOS != "windows" {
+			t.Fatal(err)
+		}
+	} else {
+		symID := id.Next()
+		_, _ = store.ExecContext(ctx,
+			`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
+			 VALUES (?, 'local', ?, '/uploads/escape-link.pdf', 'escape.pdf', 'application/pdf', 4, 0, 0, '00', 0, 'u1', ?)`,
+			symID, symRel, now)
+		_ = pipe.Delete(ctx, symID)
+		if _, err := os.Stat(outsideFile); err != nil {
+			t.Fatalf("CRITICAL: symlink escape deleted file outside UploadDir!")
+		}
 	}
 }
 

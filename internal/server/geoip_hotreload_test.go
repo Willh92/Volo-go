@@ -234,3 +234,115 @@ func TestAdminGeoIPDynamicPathHotReloadAndSelfLockoutProtection(t *testing.T) {
 		t.Fatalf("expected rollback to restore DefaultGeoIPDir after self-lockout refusal, got %q", env.cfg.GetGeoIPDir())
 	}
 }
+
+func TestAdminGeoRulesBlockNormalizedAndChallengeRejected(t *testing.T) {
+	env := setupM5TestEnv(t, "/console")
+	env.cfg.TrustedProxies.Prefixes = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+
+	setupResp, setupRaw := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/setup/complete", map[string]any{
+		"site_title":     "Geo Block Test",
+		"site_subtitle":  "Fail Closed",
+		"default_locale": "zh-CN",
+		"accent":         "teal",
+		"admin_username": "geoadmin2",
+		"admin_email":    "geo2@example.com",
+		"admin_password": "Admin!Password#2026",
+	}, nil, nil)
+	if setupResp.StatusCode != http.StatusOK {
+		t.Fatalf("setup failed: %d %s", setupResp.StatusCode, string(setupRaw))
+	}
+	var setupData struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	_ = json.Unmarshal(setupRaw, &setupData)
+	adminCookies := setupResp.Cookies()
+	csrfHeaders := map[string]string{auth.CSRFHeaderName: setupData.CSRFToken}
+
+	customGeoDir := filepath.Join(t.TempDir(), "geo-block-db")
+	t.Cleanup(func() {
+		if env.app.Deps().Geo != nil {
+			env.app.Deps().Geo.Close()
+		}
+	})
+	if err := os.MkdirAll(customGeoDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customGeoDir, "GeoLite2-Country.mmdb"), buildTestServerMMDB("GeoLite2-Country"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	relResp, relBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules/reload", map[string]any{
+		"geoip_dir": customGeoDir,
+	}, adminCookies, csrfHeaders)
+	if relResp.StatusCode != http.StatusOK {
+		t.Fatalf("reload geoip_dir failed: %d %s", relResp.StatusCode, string(relBody))
+	}
+	patchResp, patchBody := doJSONReq(t, http.MethodPatch, env.ts.URL+"/api/admin/settings/security", map[string]any{
+		"geo_policy_active":  true,
+		"geo_default_action": "allow",
+	}, adminCookies, csrfHeaders)
+	if patchResp.StatusCode != http.StatusOK {
+		t.Fatalf("enable geo_policy_active failed: %d %s", patchResp.StatusCode, string(patchBody))
+	}
+
+	// 1. "challenge" action and on_miss MUST be rejected with 400 Bad Request
+	chalResp, _ := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules", map[string]any{
+		"name":       "Challenge US",
+		"is_enabled": true,
+		"action":     "challenge",
+		"on_miss":    "next",
+		"countries":  "US",
+	}, adminCookies, csrfHeaders)
+	if chalResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected action=challenge to be rejected with 400, got %d", chalResp.StatusCode)
+	}
+	chalMissResp, _ := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules", map[string]any{
+		"name":       "Challenge Miss",
+		"is_enabled": true,
+		"action":     "allow",
+		"on_miss":    "challenge",
+		"countries":  "CN",
+	}, adminCookies, csrfHeaders)
+	if chalMissResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected on_miss=challenge to be rejected with 400, got %d", chalMissResp.StatusCode)
+	}
+
+	// 2. "block" action normalizes to "deny" and strictly blocks matched traffic (403 Forbidden)
+	blkResp, blkBody := doJSONReq(t, http.MethodPost, env.ts.URL+"/api/admin/security/geo-rules", map[string]any{
+		"name":       "Block US",
+		"is_enabled": true,
+		"action":     "block",
+		"on_miss":    "next",
+		"countries":  "US",
+	}, adminCookies, csrfHeaders)
+	if blkResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create action=block rule failed: %d %s", blkResp.StatusCode, string(blkBody))
+	}
+	var created struct {
+		Rule struct {
+			ID     string `json:"id"`
+			Action string `json:"action"`
+		} `json:"rule"`
+	}
+	_ = json.Unmarshal(blkBody, &created)
+	if created.Rule.Action != "deny" {
+		t.Fatalf("expected action=block normalized to deny, got %q", created.Rule.Action)
+	}
+	usResp, _ := doJSONReq(t, http.MethodGet, env.ts.URL+"/", nil, nil, map[string]string{
+		"X-Forwarded-For": "8.8.8.8",
+	})
+	if usResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 8.8.8.8 (US) to be 403 Forbidden under normalized block rule, got %d", usResp.StatusCode)
+	}
+
+	// PUT with "challenge" must also fail with 400
+	putChalResp, _ := doJSONReq(t, http.MethodPut, env.ts.URL+"/api/admin/security/geo-rules/"+created.Rule.ID, map[string]any{
+		"name":       "Challenge US",
+		"is_enabled": true,
+		"action":     "challenge",
+		"on_miss":    "next",
+		"countries":  "US",
+	}, adminCookies, csrfHeaders)
+	if putChalResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected PUT action=challenge to be rejected with 400, got %d", putChalResp.StatusCode)
+	}
+}

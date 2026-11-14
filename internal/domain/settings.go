@@ -56,15 +56,23 @@ type ReadingSettings struct {
 	CommentMaxLinesGuest  int      `json:"comment_max_lines_guest"`  // default 16
 	CommentMaxLinesUser   int      `json:"comment_max_lines_user"`   // default 24
 	CommentMaxLinesStaff  int      `json:"comment_max_lines_staff"`  // default 64
-	BuiltinSpamFilter     bool     `json:"builtin_spam_filter"`
-	BlockedKeywords       []string `json:"blocked_keywords"`
-	AllowedKeywords       []string `json:"allowed_keywords"`
-	PoWDifficultyBits     int      `json:"pow_difficulty_bits"`
+	BuiltinSpamFilter         bool     `json:"builtin_spam_filter"`
+	BlockedKeywords           []string `json:"blocked_keywords"`
+	AllowedKeywords           []string `json:"allowed_keywords"`
+	PoWDifficultyBits         int      `json:"pow_difficulty_bits"`
+	CommentRateWindowSeconds  int      `json:"comment_rate_window_seconds"` // default 60
+	CommentRateMaxCount       int      `json:"comment_rate_max_count"`      // default 12; 0 = unlimited
 	// CommentTrashRetentionDays: trashed comments older than this are purged by the janitor (0 = manual only).
 	CommentTrashRetentionDays int    `json:"comment_trash_retention_days"`
 	AssetCDNPrefix            string `json:"asset_cdn_prefix"`
 	VendorCDNPrefix           string `json:"vendor_cdn_prefix"`
 }
+
+// Default comment rate-limit settings.
+const (
+	DefaultCommentRateWindowSeconds = 60
+	DefaultCommentRateMaxCount      = 12
+)
 
 // Default comment length constraints by caller identity.
 const (
@@ -360,11 +368,13 @@ func DefaultReadingSettings() ReadingSettings {
 		CommentMaxLinesGuest:  DefaultCommentMaxLinesGuest,
 		CommentMaxLinesUser:   DefaultCommentMaxLinesUser,
 		CommentMaxLinesStaff:  DefaultCommentMaxLinesStaff,
-		BuiltinSpamFilter:     true,
-		BlockedKeywords:       []string{},
-		AllowedKeywords:       []string{},
-		PoWDifficultyBits:     16,
-		VendorCDNPrefix:       DefaultVendorCDNPrefix,
+		BuiltinSpamFilter:         true,
+		BlockedKeywords:           []string{},
+		AllowedKeywords:           []string{},
+		PoWDifficultyBits:         16,
+		CommentRateWindowSeconds:  DefaultCommentRateWindowSeconds,
+		CommentRateMaxCount:       DefaultCommentRateMaxCount,
+		VendorCDNPrefix:           DefaultVendorCDNPrefix,
 
 		CommentTrashRetentionDays: DefaultCommentTrashRetentionDays,
 	}

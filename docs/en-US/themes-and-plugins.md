@@ -304,6 +304,17 @@ function renderSlot(slotName) {
 }
 ```
 
+### 3.6 Official Plugin Catalog & Version-Deduplicated Standalone Packaging ([`plugins/catalog.json`](../../plugins/catalog.json))
+
+Official plugin versions are tracked in [`plugins/README.md`](../../plugins/README.md) and the machine-readable [`plugins/catalog.json`](../../plugins/catalog.json) registry (verified in CI against each plugin's `manifest.json`):
+
+| Plugin ID | Latest Version | Distribution | Bundled in Core Archive / Docker | Highlights |
+| :--- | :---: | :--- | :---: | :--- |
+| [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled` | Yes | 64k+ categorized dictionary powered by the host 16B/state BFS-CSR Aho-Corasick engine for comments and nicknames. |
+| [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.0`** | `standalone-release` ([`plugin-kanbanniang-v2.0.0.zip`](https://github.com/Willh92/Volo-go/releases/tag/plugin-kanbanniang-v2.0.0)) | No (Install on demand) | Full self-hosted pack of 26 offline Live2D models, 150 Pio/Tia outfit variants, touch-friendly 7-action toolbar, pointer drag, dark-mode-safe sakura backgrounds, WebGL context recovery, zero-inline strict-CSP bootstrap, and KV head-pats; ships pure lossless/animated `.webp` textures in a slim `~35.5 MiB` archive (`65%+` smaller than legacy PNG/GIF bundles). |
+
+- **Streaming `256 MiB` `.zip` Lifecycle & Zero Duplicate Releases**: Host plugin install/export streams archives up to `256 MiB` (`<= 2,048` entries, using `zip.Store` for pre-compressed media and `zip.Deflate` for code/models). [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) and [`.github/workflows/release.yml`](../../.github/workflows/release.yml) check whether `plugin-kanbanniang-v<version>` already exists on GitHub Releases and skip rebuilding/uploading whenever `manifest.json` version is unchanged.
+
 ---
 
 ## 4. Outbound Webhooks & HMAC Signature Verification

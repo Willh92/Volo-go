@@ -140,7 +140,10 @@ type jsToken struct {
 	newline bool // preceded by a line terminator
 }
 
-const maxJSParseDepth = 128
+const (
+	maxJSParseDepth   = 128
+	maxJSExprChainLen = 1024
+)
 
 func tokenizeJS(src string) ([]jsToken, error) {
 	return tokenizeJSWithDepth(src, 0)
@@ -1936,10 +1939,15 @@ func (p *jsParser) parseBinaryExpr(minPrec int) (jsExpr, error) {
 	if err != nil {
 		return nil, err
 	}
+	chainLen := 0
 	for {
 		prec := binPrec(p.cur().kind)
 		if prec < minPrec {
 			break
+		}
+		chainLen++
+		if chainLen > maxJSExprChainLen {
+			return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
 		}
 		op := p.next().kind
 		right, err := p.parseBinaryExpr(prec + 1)
@@ -2020,9 +2028,14 @@ func (p *jsParser) parseMemberExpr() (jsExpr, error) {
 	if err != nil {
 		return nil, err
 	}
+	chainLen := 0
 	for {
 		switch p.cur().kind {
 		case tokDot:
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
+			}
 			p.next()
 			propTok := p.next()
 			if !isIdentifierNameToken(propTok) {
@@ -2030,6 +2043,10 @@ func (p *jsParser) parseMemberExpr() (jsExpr, error) {
 			}
 			base = &exprMember{obj: base, prop: propTok.lit}
 		case tokOptChain:
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
+			}
 			p.next()
 			if p.cur().kind == tokLBrack {
 				idx, err := p.parseComputedIndex()
@@ -2045,6 +2062,10 @@ func (p *jsParser) parseMemberExpr() (jsExpr, error) {
 				base = &exprMember{obj: base, prop: propTok.lit, optional: true}
 			}
 		case tokLBrack:
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
+			}
 			idx, err := p.parseComputedIndex()
 			if err != nil {
 				return nil, err
@@ -2065,9 +2086,14 @@ func (p *jsParser) parsePostfixExpr() (jsExpr, error) {
 }
 
 func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
+	chainLen := 0
 	for {
 		switch p.cur().kind {
 		case tokDot:
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
+			}
 			p.next()
 			propTok := p.next()
 			if !isIdentifierNameToken(propTok) {
@@ -2075,6 +2101,10 @@ func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
 			}
 			base = &exprMember{obj: base, prop: propTok.lit}
 		case tokOptChain:
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
+			}
 			p.next()
 			if p.cur().kind == tokLBrack {
 				idx, err := p.parseComputedIndex()
@@ -2096,12 +2126,20 @@ func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
 				base = &exprMember{obj: base, prop: propTok.lit, optional: true}
 			}
 		case tokLBrack:
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
+			}
 			idx, err := p.parseComputedIndex()
 			if err != nil {
 				return nil, err
 			}
 			base = &exprMember{obj: base, index: idx, computed: true}
 		case tokLParen:
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
+			}
 			args, err := p.parseArgList()
 			if err != nil {
 				return nil, err
@@ -2110,6 +2148,10 @@ func (p *jsParser) parsePostfixChain(base jsExpr) (jsExpr, error) {
 		case tokInc, tokDec:
 			if p.cur().newline {
 				return base, nil
+			}
+			chainLen++
+			if chainLen > maxJSExprChainLen {
+				return nil, fmt.Errorf("line %d: SyntaxError: expression chain length (%d) exceeded", p.cur().line, maxJSExprChainLen)
 			}
 			op := p.next().kind
 			base = &exprUpdate{op: op, prefix: false, arg: base}

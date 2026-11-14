@@ -143,6 +143,12 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 		if s.Reading.CommentMaxLinesStaff <= 0 {
 			s.Reading.CommentMaxLinesStaff = domain.DefaultCommentMaxLinesStaff
 		}
+		if s.Reading.CommentRateWindowSeconds <= 0 {
+			s.Reading.CommentRateWindowSeconds = domain.DefaultCommentRateWindowSeconds
+		} else {
+			s.Reading.CommentRateWindowSeconds = clampSettingInt(s.Reading.CommentRateWindowSeconds, 5, 86400)
+		}
+		s.Reading.CommentRateMaxCount = clampSettingInt(s.Reading.CommentRateMaxCount, 0, 10000)
 		s.Reading.CommentTrashRetentionDays = clampSettingInt(s.Reading.CommentTrashRetentionDays, 0, domain.MaxCommentTrashRetentionDays)
 		if strings.TrimSpace(s.Reading.VendorCDNPrefix) == "" {
 			s.Reading.VendorCDNPrefix = domain.DefaultVendorCDNPrefix
@@ -678,6 +684,12 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 		if v.PoWDifficultyBits < 8 || v.PoWDifficultyBits > 24 {
 			v.PoWDifficultyBits = 16
 		}
+		if v.CommentRateWindowSeconds <= 0 {
+			v.CommentRateWindowSeconds = domain.DefaultCommentRateWindowSeconds
+		} else {
+			v.CommentRateWindowSeconds = clampSettingInt(v.CommentRateWindowSeconds, 5, 86400)
+		}
+		v.CommentRateMaxCount = clampSettingInt(v.CommentRateMaxCount, 0, 10000)
 		if v.CommentMinLength <= 0 {
 			v.CommentMinLength = domain.DefaultCommentMinLength
 		} else {
