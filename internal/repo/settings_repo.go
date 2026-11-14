@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strings"
 	"sync"
@@ -172,7 +173,13 @@ func (m *SettingsManager) applyRecordToSnapshot(s *domain.SettingsSnapshot, rec 
 		}
 		return nil
 	case domain.SettingsDomainSecurity:
-		return json.Unmarshal([]byte(rec.ValueJSON), &s.Security)
+		if err := json.Unmarshal([]byte(rec.ValueJSON), &s.Security); err != nil {
+			return err
+		}
+		if s.Security.RiskWhitelistCIDRs == nil {
+			s.Security.RiskWhitelistCIDRs = []string{}
+		}
+		return nil
 	case domain.SettingsDomainAppearance:
 		if err := json.Unmarshal([]byte(rec.ValueJSON), &s.Appearance); err != nil {
 			return err
@@ -790,6 +797,19 @@ func validateAndNormalizeDomainJSON(d string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		v.DynamicLoginPath = normDyn
+		v.RiskWindowSeconds = clampSettingInt(v.RiskWindowSeconds, 10, 86400)
+		v.RiskStrikeThreshold = clampSettingInt(v.RiskStrikeThreshold, 1, 1000)
+		v.RiskTier1Minutes = clampSettingInt(v.RiskTier1Minutes, 1, 525600)
+		v.RiskTier2Minutes = clampSettingInt(v.RiskTier2Minutes, 1, 525600)
+		v.RiskTier3Minutes = clampSettingInt(v.RiskTier3Minutes, 0, 525600)
+		normWL, wlErr := normalizeWhitelistCIDRs(v.RiskWhitelistCIDRs)
+		if wlErr != nil {
+			return nil, wlErr
+		}
+		v.RiskWhitelistCIDRs = normWL
+		v.IPBanRetentionDays = clampSettingInt(v.IPBanRetentionDays, 0, 3650)
+		v.AuditLogRetentionDays = clampSettingInt(v.AuditLogRetentionDays, 0, 3650)
+		v.PluginLogRetentionDays = clampSettingInt(v.PluginLogRetentionDays, 0, 3650)
 		v.WAFWindowSeconds = clampSettingInt(v.WAFWindowSeconds, 1, 86400)
 		v.WAFMaxRequests = clampSettingInt(v.WAFMaxRequests, 1, 100000)
 		v.GeoIPDir = strings.TrimSpace(StripASCIIControls(v.GeoIPDir))
@@ -1166,4 +1186,44 @@ func normalizeDynamicLoginPath(raw string) (string, error) {
 		}
 	}
 	return s, nil
+}
+
+func normalizeWhitelistCIDRs(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return []string{}, nil
+	}
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		for _, tok := range strings.FieldsFunc(item, func(r rune) bool {
+			return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+		}) {
+			s := strings.TrimSpace(StripASCIIControls(tok))
+			if s == "" {
+				continue
+			}
+			var canon string
+			if pfx, err := netip.ParsePrefix(s); err == nil {
+				canon = pfx.Masked().String()
+			} else if addr, aErr := netip.ParseAddr(s); aErr == nil {
+				u := addr.Unmap()
+				if u.Is4() {
+					canon = netip.PrefixFrom(u, 32).String()
+				} else {
+					canon = netip.PrefixFrom(u, 128).String()
+				}
+			} else {
+				return nil, fmt.Errorf("settings: invalid security.risk_whitelist_cidrs entry %q", s)
+			}
+			if _, exists := seen[canon]; exists {
+				continue
+			}
+			seen[canon] = struct{}{}
+			out = append(out, canon)
+			if len(out) > 200 {
+				return nil, errors.New("settings: security.risk_whitelist_cidrs exceeds maximum of 200 entries")
+			}
+		}
+	}
+	return out, nil
 }

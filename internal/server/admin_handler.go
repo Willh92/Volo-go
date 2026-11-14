@@ -4217,20 +4217,32 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		var req struct {
-			Note          string `json:"note"`
-			ExpiresHours  int    `json:"expires_hours"`
-			RejectComment bool   `json:"reject_comment"`
-			RejectPending bool   `json:"reject_pending"`
+			Note            string `json:"note"`
+			Reason          string `json:"reason"`
+			ExpiresMinutes  *int   `json:"expires_minutes"`
+			DurationMinutes *int   `json:"duration_minutes"`
+			ExpiresHours    *int   `json:"expires_hours"`
+			DurationHours   *int   `json:"duration_hours"`
+			RejectComment   bool   `json:"reject_comment"`
+			RejectPending   bool   `json:"reject_pending"`
 		}
 		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req)
 		note := strings.TrimSpace(req.Note)
 		if note == "" {
+			note = strings.TrimSpace(req.Reason)
+		}
+		if note == "" {
 			note = "comment moderation (" + cmt.AuthorName + ")"
 		}
-		var expMS int64
-		if req.ExpiresHours > 0 {
-			expMS = time.Now().Add(time.Duration(req.ExpiresHours) * time.Hour).UnixMilli()
+		minsPtr := req.ExpiresMinutes
+		if minsPtr == nil {
+			minsPtr = req.DurationMinutes
 		}
+		hrsPtr := req.ExpiresHours
+		if hrsPtr == nil {
+			hrsPtr = req.DurationHours
+		}
+		expMS, _ := resolveBanExpiresAtMS(time.Now(), minsPtr, hrsPtr)
 		callerIP := s.clientIP(r)
 		rec, bErr := s.deps.WAF.AddManualBan(r.Context(), targetIP, note, expMS, callerIP)
 		if bErr != nil {
@@ -4399,10 +4411,14 @@ func (s *AppServer) handleAdminComments(w http.ResponseWriter, r *http.Request, 
 
 func (s *AppServer) handleAdminCommentsBatch(w http.ResponseWriter, r *http.Request, actor *domain.User) {
 	var req struct {
-		Action       string   `json:"action"`
-		IDs          []string `json:"ids"`
-		Note         string   `json:"note"`
-		ExpiresHours int      `json:"expires_hours"`
+		Action          string   `json:"action"`
+		IDs             []string `json:"ids"`
+		Note            string   `json:"note"`
+		Reason          string   `json:"reason"`
+		ExpiresMinutes  *int     `json:"expires_minutes"`
+		DurationMinutes *int     `json:"duration_minutes"`
+		ExpiresHours    *int     `json:"expires_hours"`
+		DurationHours   *int     `json:"duration_hours"`
 	}
 	if !decodeJSONBody(w, r, 65536, &req) {
 		return
@@ -4513,21 +4529,42 @@ func (s *AppServer) handleAdminCommentsBatch(w http.ResponseWriter, r *http.Requ
 	now := time.Now().UnixMilli()
 	callerIP := s.clientIP(r)
 	if action == "ban_ip" && s.deps.WAF != nil {
-		hours := req.ExpiresHours
-		if hours <= 0 {
-			hours = 30 * 24
+		minsPtr := req.ExpiresMinutes
+		if minsPtr == nil {
+			minsPtr = req.DurationMinutes
 		}
-		expMS := time.Now().Add(time.Duration(hours) * time.Hour).UnixMilli()
+		hrsPtr := req.ExpiresHours
+		if hrsPtr == nil {
+			hrsPtr = req.DurationHours
+		}
+		expMS, explicit := resolveBanExpiresAtMS(time.Now(), minsPtr, hrsPtr)
+		if !explicit {
+			expMS = time.Now().Add(30 * 24 * time.Hour).UnixMilli()
+		}
+		rawNote := strings.TrimSpace(req.Note)
+		if rawNote == "" {
+			rawNote = strings.TrimSpace(req.Reason)
+		}
+		bannedCnt := 0
+		var lastBanErr error
 		for _, cmt := range comments {
 			targetIP := strings.TrimSpace(cmt.ClientIP)
 			if targetIP == "" {
 				continue
 			}
-			note := strings.TrimSpace(req.Note)
+			note := rawNote
 			if note == "" {
 				note = "comment batch moderation (" + cmt.AuthorName + ")"
 			}
-			_, _ = s.deps.WAF.AddManualBan(ctx, targetIP, note, expMS, callerIP)
+			if _, bErr := s.deps.WAF.AddManualBan(ctx, targetIP, note, expMS, callerIP); bErr != nil {
+				lastBanErr = bErr
+			} else {
+				bannedCnt++
+			}
+		}
+		if bannedCnt == 0 && lastBanErr != nil {
+			writeErrJSON(w, http.StatusBadRequest, lastBanErr.Error())
+			return
 		}
 	}
 

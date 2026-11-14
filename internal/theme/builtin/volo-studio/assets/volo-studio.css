@@ -1,7 +1,6 @@
 /* Volo Studio — Botanical & Editorial Craft Public Theme */
-:root,
-[data-theme="light"] {
-  color-scheme: light;
+:root {
+  color-scheme: light dark;
   --volo-bg: #f6f7f3;
   --volo-surface: #ffffff;
   --volo-raised: #f0f3ee;
@@ -36,9 +35,51 @@
   --volo-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
+:root:has(> head > meta[name="color-scheme"][content="light"]),
+[data-theme="light"]:not([data-mode="system"]) {
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"])) {
+    --volo-bg: #1b2021;
+    --volo-surface: #242b2c;
+    --volo-raised: #2b3434;
+    --volo-text: #d6dfda;
+    --volo-muted: #a1b1a8;
+    --volo-line: #3c4945;
+    --volo-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+    --shadow-sm: 0 4px 16px rgba(0, 0, 0, 0.34);
+    --shadow-md: 0 14px 38px rgba(0, 0, 0, 0.45);
+    --volo-accent: #9bcab1;
+    --volo-button: #476e59;
+    --volo-button-hover: #527c65;
+    --volo-accent-soft: rgba(155, 202, 177, 0.15);
+    --volo-accent-contrast: #f5f8f5;
+    --volo-danger: #e09aa4;
+    --volo-danger-solid: #fda4af;
+    --volo-on-danger: #2a080d;
+    --volo-warn: #dfb069;
+    --volo-code-bg: #202729;
+    --volo-syn-kw: #9bcab1;
+    --volo-syn-str: #e0b583;
+    --volo-syn-num: #8cc2dd;
+    --volo-syn-fn: #c6aad8;
+    --volo-syn-c: #82958c;
+    --volo-syn-cm: #82958c;
+    --volo-syn-ty: #88c7c9;
+    --volo-syn-var: #9ac2da;
+  }
+}
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]),
+[data-theme="dark"]:not([data-mode="system"]) {
+  color-scheme: dark;
+}
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]),
 html[data-theme="dark"],
 [data-theme="dark"] {
-  color-scheme: dark;
   --volo-bg: #1b2021;
   --volo-surface: #242b2c;
   --volo-raised: #2b3434;

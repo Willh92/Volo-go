@@ -70,7 +70,7 @@
 | `storage` | Active driver (`local \| s3`), custom local media directory `local_dir`, `max_upload_mb`, EXIF stripping, adaptive WebP quality, S3/R2/MinIO settings & encrypted `s3_secret_key` |
 | `appearance` | Desktop `active_theme`, optional `mobile_theme`, `accent` palette, `default_mode`, site-wide `custom_css`, per-theme `theme_configs` |
 | `notifications` | Pure-Go SMTP client configuration & encrypted `smtp_password`, admin comment alerts, and reader reply email notifications (including `NotifyCommentReplyApproved` when pending replies are approved) |
-| `security` | Risk control & live `WAF.UpdateConfig` window limits, offline GeoIP toggle & hot-reloadable `geoip_dir`, mandatory TOTP scope, `totp_remember_days` (`0` disables device remember) & `totp_window_steps`, zero-restart stealth path `dynamic_login_path` (`admin_path`), and encrypted `share_token_secret` |
+| `security` | Live `WAF.UpdateConfig` window limits, 3-tier scanner risk control (`risk_window_seconds`, `risk_strike_threshold`, `risk_tier{1,2,3}_minutes`, `risk_whitelist_cidrs`), retention policies (`ip_ban_retention_days`, `audit_log_retention_days`, `plugin_log_retention_days`), offline GeoIP toggle & hot-reloadable `geoip_dir`, mandatory TOTP scope, `totp_remember_days` & `totp_window_steps`, zero-restart stealth path `dynamic_login_path` (`admin_path`), and encrypted `share_token_secret` |
 | `backup` | Scheduled local rolling backup interval/retention/media toggle, remote replication (`s3 \| webdav`), and encrypted `webdav_password` / `s3_secret_key` |
 
 ---

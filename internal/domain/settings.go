@@ -257,18 +257,27 @@ type NotificationsSecrets struct {
 
 // SecuritySettings ("security" domain).
 type SecuritySettings struct {
-	RiskControlEnabled bool   `json:"risk_control_enabled"`
-	WAFEnabled         bool   `json:"waf_enabled"`
-	WAFWindowSeconds   int    `json:"waf_window_seconds"`
-	WAFMaxRequests     int    `json:"waf_max_requests"`
-	GeoPolicyActive    bool   `json:"geo_policy_active"`
-	GeoDefaultAction   string `json:"geo_default_action"` // allow | deny
-	GeoUnknownAction   string `json:"geo_unknown_action"` // allow | deny
-	GeoIPDir           string `json:"geoip_dir"`
-	TOTPRequiredScope  string `json:"totp_required_scope"` // off | admin | staff
-	TOTPRememberDays   int    `json:"totp_remember_days"`
-	TOTPWindowSteps    int    `json:"totp_window_steps"`
-	DynamicLoginPath   string `json:"dynamic_login_path"`
+	RiskControlEnabled     bool     `json:"risk_control_enabled"`
+	RiskWindowSeconds      int      `json:"risk_window_seconds"`
+	RiskStrikeThreshold    int      `json:"risk_strike_threshold"`
+	RiskTier1Minutes       int      `json:"risk_tier1_minutes"`
+	RiskTier2Minutes       int      `json:"risk_tier2_minutes"`
+	RiskTier3Minutes       int      `json:"risk_tier3_minutes"` // 0 = permanent ban
+	RiskWhitelistCIDRs     []string `json:"risk_whitelist_cidrs"`
+	IPBanRetentionDays     int      `json:"ip_ban_retention_days"`     // 0 = keep permanently
+	AuditLogRetentionDays  int      `json:"audit_log_retention_days"`  // 0 = keep permanently
+	PluginLogRetentionDays int      `json:"plugin_log_retention_days"` // 0 = keep permanently
+	WAFEnabled             bool     `json:"waf_enabled"`
+	WAFWindowSeconds       int      `json:"waf_window_seconds"`
+	WAFMaxRequests         int      `json:"waf_max_requests"`
+	GeoPolicyActive        bool     `json:"geo_policy_active"`
+	GeoDefaultAction       string   `json:"geo_default_action"` // allow | deny
+	GeoUnknownAction       string   `json:"geo_unknown_action"` // allow | deny
+	GeoIPDir               string   `json:"geoip_dir"`
+	TOTPRequiredScope      string   `json:"totp_required_scope"` // off | admin | staff
+	TOTPRememberDays       int      `json:"totp_remember_days"`
+	TOTPWindowSteps        int      `json:"totp_window_steps"`
+	DynamicLoginPath       string   `json:"dynamic_login_path"`
 }
 
 // SecuritySecrets is encrypted via AES-256-GCM into settings.secret_ciphertext for domain="security".
@@ -438,16 +447,25 @@ func DefaultSettingsSnapshot(defaultLocale string) SettingsSnapshot {
 			NotifyReplyByEmail:   true,
 		},
 		Security: SecuritySettings{
-			RiskControlEnabled: true,
-			WAFEnabled:         true,
-			WAFWindowSeconds:   180,
-			WAFMaxRequests:     180,
-			GeoPolicyActive:    false,
-			GeoDefaultAction:   "allow",
-			GeoUnknownAction:   "allow",
-			TOTPRequiredScope:  "off",
-			TOTPRememberDays:   14,
-			TOTPWindowSteps:    1,
+			RiskControlEnabled:     true,
+			RiskWindowSeconds:      600,
+			RiskStrikeThreshold:    5,
+			RiskTier1Minutes:       15,
+			RiskTier2Minutes:       60,
+			RiskTier3Minutes:       1440,
+			RiskWhitelistCIDRs:     []string{},
+			IPBanRetentionDays:     30,
+			AuditLogRetentionDays:  90,
+			PluginLogRetentionDays: 30,
+			WAFEnabled:             true,
+			WAFWindowSeconds:       180,
+			WAFMaxRequests:         180,
+			GeoPolicyActive:        false,
+			GeoDefaultAction:       "allow",
+			GeoUnknownAction:       "allow",
+			TOTPRequiredScope:      "off",
+			TOTPRememberDays:       14,
+			TOTPWindowSteps:        1,
 		},
 		Appearance: AppearanceSettings{
 			ActiveTheme:  "volo-studio",

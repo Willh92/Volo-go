@@ -284,7 +284,8 @@ export function ContentWorkspace({
     batchIds?: string[];
     ipLabel?: string;
   } | null>(null);
-  const [banDurationHrs, setBanDurationHrs] = useState("720");
+  const [banDurMins, setBanDurMins] = useState("43200");
+  const [banCustomMins, setBanCustomMins] = useState("60");
   const [banReason, setBanReason] = useState("comment spam");
   const [banRejectPending, setBanRejectPending] = useState(true);
   const [banningIp, setBanningIp] = useState(false);
@@ -1398,7 +1399,8 @@ export function ContentWorkspace({
   const runBatchComments = async (action: "approve" | "reject" | "delete" | "ban_ip" | "restore" | "purge") => {
     if (!selCmtIds.length) return;
     if (action === "ban_ip") {
-      setBanDurationHrs("720");
+      setBanDurMins("43200");
+      setBanCustomMins("60");
       setBanReason("comment spam");
       setBanRejectPending(true);
       setBanIpModal({ batchIds: [...selCmtIds], ipLabel: `${selCmtIds.length}` });
@@ -1454,7 +1456,12 @@ export function ContentWorkspace({
     if (!banIpModal || banningIp) return;
     setBanningIp(true);
     try {
-      const hrs = Number(banDurationHrs) || 0;
+      const mins =
+        banDurMins === "0"
+          ? 0
+          : banDurMins === "custom"
+            ? Math.max(1, Math.min(5256000, Math.round(Number(banCustomMins) || 60)))
+            : Math.max(1, Math.round(Number(banDurMins) || 43200));
       const reason = banReason.trim() || "comment spam";
       if (banIpModal.batchIds && banIpModal.batchIds.length > 0) {
         await apiFetch("/api/admin/comments/batch", {
@@ -1462,8 +1469,7 @@ export function ContentWorkspace({
           body: JSON.stringify({
             ids: banIpModal.batchIds,
             action: "ban_ip",
-            duration_hours: hrs,
-            expires_hours: hrs,
+            expires_minutes: mins,
             reason,
             note: reason,
             reject_pending: banRejectPending,
@@ -1480,8 +1486,7 @@ export function ContentWorkspace({
         await apiFetch(`/api/admin/comments/${banIpModal.commentId}/ban-ip`, {
           method: "POST",
           body: JSON.stringify({
-            duration_hours: hrs,
-            expires_hours: hrs,
+            expires_minutes: mins,
             reason,
             note: reason,
             reject_pending: banRejectPending,
@@ -2520,6 +2525,7 @@ export function ContentWorkspace({
                               aria-label={t("cnt.lbl_sort")}
                               onKeyDown={(e) => {
                                 if (e.key === "Enter") {
+                                  if (e.isComposing || e.keyCode === 229) return;
                                   e.preventDefault();
                                   const target = Number((e.currentTarget as HTMLInputElement).value) || idx + 1;
                                   moveSeriesArticleTo(idx, target - 1);
@@ -3620,7 +3626,11 @@ export function ContentWorkspace({
                   setPageIdx(1);
                 }}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void loadSub();
+                  if (e.key === "Enter") {
+                    if (e.isComposing || e.keyCode === 229) return;
+                    e.preventDefault();
+                    void loadSub();
+                  }
                 }}
               />
               <div class="volo-filter-pills">
@@ -4048,150 +4058,168 @@ export function ContentWorkspace({
                                   hidden: !canModUser || !cmtUserMuted,
                                   onClick: () => void runQuickUserUnmod(cmtUserId, "unmute", () => void loadSub()),
                                 },
-                                {
-                                  label: t("cnt.cmt_ban_ip"),
-                                  hidden: !canBanIp,
-                                  danger: true,
-                                  onClick: () => {
-                                    setBanDurationHrs("720");
-                                    setBanReason("comment spam");
-                                    setBanRejectPending(true);
-                                    setBanIpModal({
-                                      commentId: c.id,
-                                      ipLabel: c.client_ip || c.ip_masked || c.author_name,
-                                    });
+                                  {
+                                    label: t("cnt.cmt_ban_ip"),
+                                    hidden: !canBanIp,
+                                    danger: true,
+                                    onClick: () => {
+                                      setBanDurMins("43200");
+                                      setBanCustomMins("60");
+                                      setBanReason("comment spam");
+                                      setBanRejectPending(true);
+                                      setBanIpModal({
+                                        commentId: c.id,
+                                        ipLabel: c.client_ip || c.ip_masked || c.author_name,
+                                      });
+                                    },
                                   },
-                                },
-                                {
-                                  label: t("common.delete"),
-                                  danger: true,
-                                  onClick: async () => {
-                                    if (!(await openConfirm({ message: t("cnt.confirm_del_cmt"), danger: true }))) return;
-                                    try {
-                                      await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
-                                      showToast(t("cnt.cmt_moved_to_trash"));
-                                      void loadSub();
-                                    } catch (err: any) {
-                                      showToast(err.message);
-                                    }
+                                  {
+                                    label: t("common.delete"),
+                                    danger: true,
+                                    onClick: async () => {
+                                      if (!(await openConfirm({ message: t("cnt.confirm_del_cmt"), danger: true }))) return;
+                                      try {
+                                        await apiFetch(`/api/admin/comments/${c.id}`, { method: "DELETE" });
+                                        showToast(t("cnt.cmt_moved_to_trash"));
+                                        void loadSub();
+                                      } catch (err: any) {
+                                        showToast(err.message);
+                                      }
+                                    },
                                   },
-                                },
-                              ]}
-                            />
-                            </>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
+                                ]}
+                              />
+                              </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
 
-          <BatchBar count={selCmtIds.length} onClear={() => setSelCmtIds([])}>
-            {cmtTrashMode ? (
-              <>
-                <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("restore")}>
-                  {t("cnt.cmt_restore")}
-                </button>
-                <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("purge")}>
-                  {t("cnt.cmt_purge")}
-                </button>
-              </>
-            ) : (
-              <>
-                <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("approve")}>
-                  {t("cnt.cmt_approve")}
-                </button>
-                <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("reject")}>
-                  {t("cnt.cmt_reject")}
-                </button>
-                {isAdmin && (
-                  <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("ban_ip")}>
+            <BatchBar count={selCmtIds.length} onClear={() => setSelCmtIds([])}>
+              {cmtTrashMode ? (
+                <>
+                  <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("restore")}>
+                    {t("cnt.cmt_restore")}
+                  </button>
+                  <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("purge")}>
+                    {t("cnt.cmt_purge")}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("approve")}>
+                    {t("cnt.cmt_approve")}
+                  </button>
+                  <button type="button" class="volo-act-btn" onClick={() => void runBatchComments("reject")}>
+                    {t("cnt.cmt_reject")}
+                  </button>
+                  {isAdmin && (
+                    <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("ban_ip")}>
+                      {t("cnt.cmt_ban_ip")}
+                    </button>
+                  )}
+                  <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("delete")}>
+                    {t("common.delete")}
+                  </button>
+                </>
+              )}
+            </BatchBar>
+
+            <Pagination
+              total={subTotal}
+              page={pageIdx}
+              pageSize={pageSize}
+              onPageSizeChange={(sz) => {
+                setPageSize(sz);
+                setPageIdx(1);
+              }}
+              onChange={setPageIdx}
+            />
+
+            <UserModerationModal
+              target={cmtUserModTarget}
+              onClose={() => setCmtUserModTarget(null)}
+              onSaved={() => void loadSub()}
+            />
+
+            <AnimatedModal
+              open={!!banIpModal}
+              onClose={() => setBanIpModal(null)}
+              title={t("cnt.cmt_ban_ip")}
+              subtitle={banIpModal?.ipLabel || ""}
+              maxWidth="460px"
+              footer={
+                <>
+                  <button type="button" class="volo-btn" onClick={() => setBanIpModal(null)}>
+                    {t("common.cancel")}
+                  </button>
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-danger"
+                    disabled={banningIp}
+                    onClick={() => void submitBanIpModal()}
+                  >
                     {t("cnt.cmt_ban_ip")}
                   </button>
+                </>
+              }
+            >
+              <form onSubmit={(e) => void submitBanIpModal(e)} autoComplete="off">
+                <div class="volo-field">
+                  <label>{t("cnt.cmt_ban_duration")}</label>
+                  <ConsoleSelect
+                    searchable={false}
+                    value={banDurMins}
+                    onChange={setBanDurMins}
+                    options={[
+                      { value: "15", label: t("cnt.cmt_ban_15m") },
+                      { value: "60", label: t("cnt.cmt_ban_1h") },
+                      { value: "1440", label: t("cnt.cmt_ban_24h") },
+                      { value: "4320", label: t("cnt.cmt_ban_3d") },
+                      { value: "10080", label: t("cnt.cmt_ban_7d") },
+                      { value: "43200", label: t("cnt.cmt_ban_30d") },
+                      { value: "0", label: t("cnt.cmt_ban_perm") },
+                      { value: "custom", label: t("cnt.cmt_ban_custom") },
+                    ]}
+                  />
+                </div>
+                {banDurMins === "custom" && (
+                  <div class="volo-field">
+                    <label>{t("cnt.cmt_ban_custom_mins")}</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={5256000}
+                      required
+                      class="volo-input"
+                      value={banCustomMins}
+                      onInput={(e) => setBanCustomMins((e.currentTarget as HTMLInputElement).value)}
+                    />
+                  </div>
                 )}
-                <button type="button" class="volo-act-btn danger" onClick={() => void runBatchComments("delete")}>
-                  {t("common.delete")}
-                </button>
-              </>
-            )}
-          </BatchBar>
-
-          <Pagination
-            total={subTotal}
-            page={pageIdx}
-            pageSize={pageSize}
-            onPageSizeChange={(sz) => {
-              setPageSize(sz);
-              setPageIdx(1);
-            }}
-            onChange={setPageIdx}
-          />
-
-          <UserModerationModal
-            target={cmtUserModTarget}
-            onClose={() => setCmtUserModTarget(null)}
-            onSaved={() => void loadSub()}
-          />
-
-          <AnimatedModal
-            open={!!banIpModal}
-            onClose={() => setBanIpModal(null)}
-            title={t("cnt.cmt_ban_ip")}
-            subtitle={banIpModal?.ipLabel || ""}
-            maxWidth="460px"
-            footer={
-              <>
-                <button type="button" class="volo-btn" onClick={() => setBanIpModal(null)}>
-                  {t("common.cancel")}
-                </button>
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-danger"
-                  disabled={banningIp}
-                  onClick={() => void submitBanIpModal()}
-                >
-                  {t("cnt.cmt_ban_ip")}
-                </button>
-              </>
-            }
-          >
-            <form onSubmit={(e) => void submitBanIpModal(e)} autoComplete="off">
-              <div class="volo-field">
-                <label>{t("cnt.cmt_ban_duration")}</label>
-                <ConsoleSelect
-                  searchable={false}
-                  value={banDurationHrs}
-                  onChange={setBanDurationHrs}
-                  options={[
-                    { value: "1", label: t("cnt.cmt_ban_1h") },
-                    { value: "24", label: t("cnt.cmt_ban_24h") },
-                    { value: "168", label: t("cnt.cmt_ban_7d") },
-                    { value: "720", label: t("cnt.cmt_ban_30d") },
-                    { value: "0", label: t("cnt.cmt_ban_perm") },
-                  ]}
-                />
-              </div>
-              <div class="volo-field">
-                <label>{t("cnt.cmt_ban_reason")}</label>
-                <input
-                  class="volo-input"
-                  value={banReason}
-                  onInput={(e) => setBanReason((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="volo-field" style={{ marginBottom: 0 }}>
-                <SwitchToggle
-                  checked={banRejectPending}
-                  onChange={setBanRejectPending}
-                  label={t("cnt.cmt_ban_reject_pending")}
-                />
-              </div>
-            </form>
-          </AnimatedModal>
+                <div class="volo-field">
+                  <label>{t("cnt.cmt_ban_reason")}</label>
+                  <input
+                    class="volo-input"
+                    value={banReason}
+                    onInput={(e) => setBanReason((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="volo-field" style={{ marginBottom: 0 }}>
+                  <SwitchToggle
+                    checked={banRejectPending}
+                    onChange={setBanRejectPending}
+                    label={t("cnt.cmt_ban_reject_pending")}
+                  />
+                </div>
+              </form>
+            </AnimatedModal>
         </div>
       )}
 

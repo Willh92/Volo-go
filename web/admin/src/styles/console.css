@@ -1,6 +1,5 @@
-:root,
-[data-theme="light"] {
-  color-scheme: light;
+:root {
+  color-scheme: light dark;
   --volo-bg: #f6f7f3;
   --volo-surface: #ffffff;
   --volo-raised: #f9faf7;
@@ -41,6 +40,11 @@
   --volo-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --volo-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", monospace;
   --volo-font-mono: var(--volo-mono);
+}
+
+:root:has(> head > meta[name="color-scheme"][content="light"]),
+[data-theme="light"]:not([data-mode="system"]) {
+  color-scheme: light;
 }
 
 /* 6-Accent Studio Palette (Synchronized with public volo-studio) */
@@ -95,8 +99,49 @@
   --volo-nav-mark-ink: #2c1920;
 }
 
-[data-theme="dark"] {
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"])) {
+    --volo-bg: #1b2021;
+    --volo-surface: #242b2c;
+    --volo-raised: #2b3434;
+    --volo-line: #3c4945;
+    --volo-text: #d6dfda;
+    --volo-muted: #a1b1a8;
+    --volo-accent: #9bcab1;
+    --volo-accent-hover: #b4dbc6;
+    --volo-accent-soft: rgba(155, 202, 177, 0.14);
+    --volo-nav: #202728;
+    --volo-btn-bg: #476e59;
+    --volo-btn-hover: #537f67;
+    --volo-ok: #7fc29b;
+    --volo-warn: #dfb069;
+    --volo-danger: #e09aa4;
+    --volo-shadow: 0 14px 32px rgba(9, 13, 14, 0.28);
+    --volo-shadow-pop: 0 18px 42px rgba(9, 13, 14, 0.44);
+    --volo-code-bg: #202729;
+    --volo-syn-kw: #9bcab1;
+    --volo-syn-str: #e0b583;
+    --volo-syn-num: #8cc2dd;
+    --volo-syn-fn: #c6aad8;
+    --volo-syn-cm: #8c9f95;
+    --volo-syn-cmt: #8c9f95;
+    --volo-syn-ty: #88c7c9;
+    --volo-syn-type: #88c7c9;
+    --volo-syn-attr: #8cc2dd;
+    --volo-syn-del: #ec929d;
+    --volo-syn-ins: #7fd1a3;
+    --volo-chart-uv: #60a5fa;
+    --volo-chart-uv-on-dark: #93c5fd;
+  }
+}
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]),
+[data-theme="dark"]:not([data-mode="system"]) {
   color-scheme: dark;
+}
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]),
+[data-theme="dark"] {
   --volo-bg: #1b2021;
   --volo-surface: #242b2c;
   --volo-raised: #2b3434;
@@ -1492,8 +1537,19 @@ input[type="checkbox"] {
   border-bottom: 0;
 }
 
-.volo-table tbody tr:hover td {
-  background: var(--volo-raised);
+.volo-table tr,
+.volo-btn,
+.volo-act-btn,
+.volo-filter-pill,
+.volo-tab,
+.volo-seg-btn {
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .volo-table tbody tr:hover td {
+    background: var(--volo-raised);
+  }
 }
 
 .col-status { width: 118px; white-space: nowrap; }
@@ -4909,7 +4965,8 @@ body.volo-is-sorting * {
     color: var(--volo-muted);
     flex-shrink: 0;
   }
-  .volo-table td.col-fluid[data-label] {
+  .volo-table td.col-fluid[data-label],
+  .volo-table td.col-stack-mobile[data-label] {
     flex-direction: column;
     align-items: flex-start;
     gap: 5px;

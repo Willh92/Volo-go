@@ -11,6 +11,7 @@
   {{if and .Site.FaviconURL (ne .Site.FaviconURL "/favicon.svg") (ne .Site.FaviconURL "/favicon.ico")}}<link rel="icon" href="{{.Site.FaviconURL}}">
   <link rel="apple-touch-icon" href="{{.Site.FaviconURL}}">{{else}}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="alternate icon" sizes="32x32" href="/favicon.ico">{{end}}
+  <meta name="color-scheme" content="light dark">
   <script>
     (function(){
       var m = "";
@@ -21,11 +22,13 @@
       else if (m !== "light" && m !== "dark") { var d = new Date(), mins = d.getHours() * 60 + d.getMinutes(); eff = (mins >= 390 && mins < 1140) ? "light" : "dark"; }
       document.documentElement.setAttribute("data-mode", m);
       document.documentElement.setAttribute("data-theme", eff);
+      var meta = document.querySelector('meta[name="color-scheme"]');
+      if (meta) meta.content = (m === "system") ? "light dark" : eff;
     })();
   </script>
   <style>
-    :root, [data-theme="light"] {
-      color-scheme: light;
+    :root {
+      color-scheme: light dark;
       --volo-bg: #f6f7f3;
       --volo-surface: #ffffff;
       --volo-raised: #f0f3ee;
@@ -41,8 +44,32 @@
       --volo-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
       --volo-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     }
-    html[data-theme="dark"], [data-theme="dark"] {
+    :root:has(> head > meta[name="color-scheme"][content="light"]),
+    [data-theme="light"]:not([data-mode="system"]) {
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"])) {
+        --volo-bg: #1b2021;
+        --volo-surface: #242b2c;
+        --volo-raised: #2b3434;
+        --volo-text: #d6dfda;
+        --volo-muted: #a1b1a8;
+        --volo-line: #3c4945;
+        --volo-shadow: 0 16px 42px rgba(0, 0, 0, 0.32);
+        --volo-accent: #9bcab1;
+        --volo-button: #476e59;
+        --volo-button-hover: #527c65;
+        --volo-accent-soft: rgba(155, 202, 177, 0.15);
+        --volo-accent-contrast: #f5f8f5;
+      }
+    }
+    :root:has(> head > meta[name="color-scheme"][content="dark"]),
+    [data-theme="dark"]:not([data-mode="system"]) {
       color-scheme: dark;
+    }
+    :root:has(> head > meta[name="color-scheme"][content="dark"]),
+    html[data-theme="dark"], [data-theme="dark"] {
       --volo-bg: #1b2021;
       --volo-surface: #242b2c;
       --volo-raised: #2b3434;
@@ -575,6 +602,8 @@
         var eff = resolveModeTheme(m);
         root.setAttribute("data-mode", m);
         root.setAttribute("data-theme", eff);
+        var meta = document.querySelector('meta[name="color-scheme"]');
+        if (meta) meta.content = (m === "system") ? "light dark" : eff;
         if (toggleBtn) {
           var lbl = toggleBtn.getAttribute("data-title-" + m) || m;
           toggleBtn.setAttribute("title", lbl);

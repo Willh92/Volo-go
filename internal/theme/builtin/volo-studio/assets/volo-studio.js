@@ -65,6 +65,10 @@
     var nextTheme = resolveEffectiveTheme(chosenMode);
     root.setAttribute("data-mode", chosenMode);
     root.setAttribute("data-theme", nextTheme);
+    var schemeMeta = document.querySelector('meta[name="color-scheme"]');
+    if (schemeMeta) {
+      schemeMeta.content = chosenMode === "system" ? "light dark" : nextTheme;
+    }
 
     var labelEl = document.getElementById("volo-theme-label");
     var toggleBtn = document.getElementById("volo-theme-btn");

@@ -465,6 +465,21 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			"page_size": perPage,
 		})
 
+	case sub == "audit-logs" && r.Method == http.MethodDelete:
+		var affected int64
+		if res, err := s.deps.Store.ExecContext(r.Context(), `DELETE FROM audit_logs`); !writeServerErr(w, err) {
+			if res != nil {
+				affected, _ = res.RowsAffected()
+			}
+		} else {
+			return
+		}
+		s.auditActionsMu.Lock()
+		s.auditActions = nil
+		s.auditActionsExp = time.Time{}
+		s.auditActionsMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+
 	case (sub == "backup/ticket" || sub == "backups/ticket") && r.Method == http.MethodPost:
 		if sess == nil || sess.ID == "" {
 			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(s.resolveLocale(r), "error.forbidden"))
@@ -3255,6 +3270,14 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		case parts[1] == "logs" && r.Method == http.MethodGet:
 			entries, _ := s.deps.Plugins.Logger().Tail(pid, 100)
 			writeJSON(w, http.StatusOK, map[string]any{"items": entries})
+		case parts[1] == "logs" && r.Method == http.MethodDelete:
+			if lgr := s.deps.Plugins.Logger(); lgr != nil {
+				if writeBadErr(w, lgr.ClearLogs(pid)) {
+					return
+				}
+			}
+			s.recordAuditLog(r, actor, "plugin.clear_logs", "plugin", pid, nil)
+			writeOKJSON(w)
 		case parts[1] == "cron" && r.Method == http.MethodGet:
 			jobs := s.deps.Plugins.PluginCronJobs(pid)
 			writeJSON(w, http.StatusOK, map[string]any{"items": jobs, "cron_jobs": jobs})
@@ -4225,17 +4248,80 @@ func (s *AppServer) enrichIPBanViews(rows []domain.SecurityIPBan) []ipBanAdminVi
 	return out
 }
 
+func parseIPBanPrefixForGuard(raw string) (netip.Prefix, bool) {
+	s := strings.TrimSpace(raw)
+	if pfx, err := netip.ParsePrefix(s); err == nil {
+		return pfx.Masked(), true
+	}
+	if addr, err := netip.ParseAddr(s); err == nil {
+		u := addr.Unmap()
+		if u.Is4() {
+			return netip.PrefixFrom(u, 32), true
+		}
+		return netip.PrefixFrom(u, 128), true
+	}
+	return netip.Prefix{}, false
+}
+
+func resolveBanExpiresAtMS(now time.Time, expiresMinutes *int, expiresHours *int) (int64, bool) {
+	if expiresMinutes != nil {
+		if *expiresMinutes <= 0 {
+			return 0, true
+		}
+		mins := *expiresMinutes
+		if mins > 5256000 {
+			mins = 5256000
+		}
+		return now.Add(time.Duration(mins) * time.Minute).UnixMilli(), true
+	}
+	if expiresHours != nil {
+		if *expiresHours <= 0 {
+			return 0, true
+		}
+		hrs := *expiresHours
+		if hrs > 87600 {
+			hrs = 87600
+		}
+		return now.Add(time.Duration(hrs) * time.Hour).UnixMilli(), true
+	}
+	return 0, false
+}
+
 func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	if (rest == "purge-expired" && r.Method == http.MethodPost) || (rest == "expired" && r.Method == http.MethodDelete) {
+		nowMS := time.Now().UnixMilli()
+		var affected int64
+		res, err := s.deps.Store.ExecContext(r.Context(),
+			`DELETE FROM security_ip_bans WHERE expires_at > 0 AND expires_at <= ?`, nowMS)
+		if writeBadErr(w, err) {
+			return
+		}
+		if res != nil {
+			affected, _ = res.RowsAffected()
+		}
+		if s.deps.WAF != nil {
+			_ = s.deps.WAF.ReloadBans(r.Context())
+		}
+		s.recordAuditLog(r, actor, "security.ip_ban_purge_expired", "ip_ban", "expired", map[string]any{"affected": affected})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		return
+	}
+
 	if rest == "batch" && r.Method == http.MethodPost {
 		var req struct {
-			Action string   `json:"action"`
-			IDs    []string `json:"ids"`
+			Action         string   `json:"action"`
+			IDs            []string `json:"ids"`
+			ExpiresMinutes *int     `json:"expires_minutes"`
+			ExpiresHours   *int     `json:"expires_hours"`
 		}
 		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
-		if strings.ToLower(strings.TrimSpace(req.Action)) != "delete" {
+		action := strings.ToLower(strings.TrimSpace(req.Action))
+		switch action {
+		case "delete", "unban", "set_duration", "duration", "update_duration":
+		default:
 			writeErrJSON(w, http.StatusBadRequest, "invalid batch action")
 			return
 		}
@@ -4244,10 +4330,54 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			writeErrJSON(w, http.StatusBadRequest, "ids required")
 			return
 		}
+		now := time.Now()
+		nowMS := now.UnixMilli()
+
+		var targetExpMS int64
+		if action == "set_duration" || action == "duration" || action == "update_duration" {
+			expMS, ok := resolveBanExpiresAtMS(now, req.ExpiresMinutes, req.ExpiresHours)
+			if !ok {
+				writeErrJSON(w, http.StatusBadRequest, "expires_minutes or expires_hours required")
+				return
+			}
+			targetExpMS = expMS
+			clientIP := s.clientIP(r)
+			if clientIP.IsValid() && (targetExpMS == 0 || targetExpMS > nowMS) {
+				ph := strings.Repeat("?,", len(ids)-1) + "?"
+				qArgs := make([]any, len(ids))
+				for i, bid := range ids {
+					qArgs[i] = bid
+				}
+				var existing []domain.SecurityIPBan
+				_ = sqlx.SelectInto(r.Context(), s.deps.Store, &existing,
+					`SELECT * FROM security_ip_bans WHERE id IN (`+ph+`)`, qArgs...)
+				uClient := clientIP.Unmap()
+				for _, row := range existing {
+					if pfx, ok := parseIPBanPrefixForGuard(row.CIDR); ok && pfx.Contains(uClient) {
+						writeErrJSON(w, http.StatusBadRequest, fmt.Sprintf("security: refusing to ban your own active IP %s", clientIP.String()))
+						return
+					}
+				}
+			}
+		}
+
 		affected := 0
 		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
 			for _, bid := range ids {
-				res, dErr := tx.ExecContext(r.Context(), `DELETE FROM security_ip_bans WHERE id = ?`, bid)
+				var res interface{ RowsAffected() (int64, error) }
+				var dErr error
+				switch action {
+				case "delete":
+					res, dErr = tx.ExecContext(r.Context(), `DELETE FROM security_ip_bans WHERE id = ?`, bid)
+				case "unban":
+					res, dErr = tx.ExecContext(r.Context(),
+						`UPDATE security_ip_bans SET expires_at = ?, updated_at = ? WHERE id = ? AND (expires_at = 0 OR expires_at > ?)`,
+						nowMS, nowMS, bid, nowMS)
+				default:
+					res, dErr = tx.ExecContext(r.Context(),
+						`UPDATE security_ip_bans SET expires_at = ?, updated_at = ? WHERE id = ?`,
+						targetExpMS, nowMS, bid)
+				}
 				if dErr != nil {
 					return dErr
 				}
@@ -4263,10 +4393,19 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 		if s.deps.WAF != nil {
 			_ = s.deps.WAF.ReloadBans(r.Context())
 		}
-		s.recordAuditLog(r, actor, "security.ip_ban_batch_delete", "ip_ban", "batch", map[string]any{"affected": affected})
+		auditAct := "security.ip_ban_batch_delete"
+		detail := map[string]any{"affected": affected}
+		if action == "unban" {
+			auditAct = "security.ip_ban_batch_unban"
+		} else if action != "delete" {
+			auditAct = "security.ip_ban_batch_duration"
+			detail["expires_at"] = targetExpMS
+		}
+		s.recordAuditLog(r, actor, auditAct, "ip_ban", "batch", detail)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
 		return
 	}
+
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
@@ -4275,13 +4414,23 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			state := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("state")))
 			now := time.Now().UnixMilli()
 
-			where := []string{"1=1"}
-			var args []any
+			searchWhere := "1=1"
+			var searchArgs []any
 			if q != "" {
 				pat := "%" + escapeLikePattern(q) + "%"
-				where = append(where, "(LOWER(cidr) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason_code) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason) LIKE LOWER(?) ESCAPE '!' OR LOWER(note) LIKE LOWER(?) ESCAPE '!')")
-				args = append(args, pat, pat, pat, pat)
+				searchWhere = "(LOWER(cidr) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason_code) LIKE LOWER(?) ESCAPE '!' OR LOWER(reason) LIKE LOWER(?) ESCAPE '!' OR LOWER(note) LIKE LOWER(?) ESCAPE '!')"
+				searchArgs = append(searchArgs, pat, pat, pat, pat)
 			}
+
+			var activeCnt, expiredCnt int
+			countArgs := append([]any{now, now}, searchArgs...)
+			_ = s.deps.Store.QueryRowContext(r.Context(),
+				`SELECT COALESCE(SUM(CASE WHEN expires_at = 0 OR expires_at > ? THEN 1 ELSE 0 END), 0),
+				        COALESCE(SUM(CASE WHEN expires_at > 0 AND expires_at <= ? THEN 1 ELSE 0 END), 0)
+				 FROM security_ip_bans WHERE `+searchWhere, countArgs...).Scan(&activeCnt, &expiredCnt)
+
+			where := []string{searchWhere}
+			args := append([]any{}, searchArgs...)
 			switch state {
 			case "active":
 				where = append(where, "(expires_at = 0 OR expires_at > ?)")
@@ -4292,7 +4441,14 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 			}
 			whereSQL := strings.Join(where, " AND ")
 			var total int
-			_ = s.deps.Store.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM security_ip_bans WHERE `+whereSQL, args...).Scan(&total)
+			switch state {
+			case "active":
+				total = activeCnt
+			case "expired":
+				total = expiredCnt
+			default:
+				total = activeCnt + expiredCnt
+			}
 			baseSQL := `SELECT * FROM security_ip_bans WHERE ` + whereSQL + ` ORDER BY created_at DESC`
 			qSQL, fullArgs := s.paginateQuery(baseSQL, args, page, perPage)
 			var rows []domain.SecurityIPBan
@@ -4306,6 +4462,7 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 				"items":      items,
 				"bans":       items,
 				"total":      total,
+				"counts":     map[string]int{"active": activeCnt, "expired": expiredCnt, "all": activeCnt + expiredCnt},
 				"page":       page,
 				"per_page":   perPage,
 				"page_size":  perPage,
@@ -4314,23 +4471,21 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 
 		case http.MethodPost:
 			var req struct {
-				CIDR         string `json:"cidr"`
-				Note         string `json:"note"`
-				ExpiresHours int    `json:"expires_hours"`
+				CIDR           string `json:"cidr"`
+				Note           string `json:"note"`
+				ExpiresMinutes *int   `json:"expires_minutes"`
+				ExpiresHours   *int   `json:"expires_hours"`
 			}
 			if !decodeJSONBody(w, r, 8192, &req) {
 				return
 			}
-			var expMS int64
-			if req.ExpiresHours > 0 {
-				expMS = time.Now().Add(time.Duration(req.ExpiresHours) * time.Hour).UnixMilli()
-			}
+			expMS, _ := resolveBanExpiresAtMS(time.Now(), req.ExpiresMinutes, req.ExpiresHours)
 			clientIP := s.clientIP(r)
 			rec, err := s.deps.WAF.AddManualBan(r.Context(), req.CIDR, req.Note, expMS, clientIP)
 			if writeBadErr(w, err) {
 				return
 			}
-			s.recordAuditLog(r, actor, "security.ip_ban_add", "ip_ban", rec.ID, map[string]any{"cidr": rec.CIDR})
+			s.recordAuditLog(r, actor, "security.ip_ban_add", "ip_ban", rec.ID, map[string]any{"cidr": rec.CIDR, "expires_at": rec.ExpiresAt})
 			enriched := s.enrichIPBanViews([]domain.SecurityIPBan{*rec})
 			writeJSON(w, http.StatusCreated, map[string]any{"ban": enriched[0]})
 
@@ -4340,10 +4495,95 @@ func (s *AppServer) handleAdminIPBans(w http.ResponseWriter, r *http.Request, ac
 		return
 	}
 
-	if r.Method == http.MethodDelete {
-		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM security_ip_bans WHERE id = ?`, rest)
-		_ = s.deps.WAF.ReloadBans(r.Context())
-		s.recordAuditLog(r, actor, "security.ip_ban_remove", "ip_ban", rest, nil)
+	parts := strings.Split(rest, "/")
+	banID := strings.TrimSpace(parts[0])
+	if len(parts) == 2 && parts[1] == "unban" && r.Method == http.MethodPost {
+		nowMS := time.Now().UnixMilli()
+		res, err := s.deps.Store.ExecContext(r.Context(),
+			`UPDATE security_ip_bans SET expires_at = ?, updated_at = ? WHERE id = ? AND (expires_at = 0 OR expires_at > ?)`,
+			nowMS, nowMS, banID, nowMS)
+		if writeBadErr(w, err) {
+			return
+		}
+		var affected int64
+		if res != nil {
+			affected, _ = res.RowsAffected()
+		}
+		if s.deps.WAF != nil {
+			_ = s.deps.WAF.ReloadBans(r.Context())
+		}
+		s.recordAuditLog(r, actor, "security.ip_ban_unban", "ip_ban", banID, map[string]any{"affected": affected})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
+		return
+	}
+
+	if len(parts) == 1 && (r.Method == http.MethodPatch || r.Method == http.MethodPut) {
+		var existing domain.SecurityIPBan
+		if err := sqlx.GetInto(r.Context(), s.deps.Store, &existing, `SELECT * FROM security_ip_bans WHERE id = ?`, banID); err != nil {
+			writeErrJSON(w, http.StatusNotFound, "ip ban not found")
+			return
+		}
+		var req struct {
+			Note           *string `json:"note"`
+			ExpiresMinutes *int    `json:"expires_minutes"`
+			ExpiresHours   *int    `json:"expires_hours"`
+			Reban          bool    `json:"reban"`
+		}
+		if !decodeJSONBody(w, r, 8192, &req) {
+			return
+		}
+		now := time.Now()
+		nowMS := now.UnixMilli()
+		nextExp := existing.ExpiresAt
+		if expMS, ok := resolveBanExpiresAtMS(now, req.ExpiresMinutes, req.ExpiresHours); ok {
+			nextExp = expMS
+		}
+		if nextExp == 0 || nextExp > nowMS {
+			clientIP := s.clientIP(r)
+			if clientIP.IsValid() {
+				if pfx, ok := parseIPBanPrefixForGuard(existing.CIDR); ok && pfx.Contains(clientIP.Unmap()) {
+					writeErrJSON(w, http.StatusBadRequest, fmt.Sprintf("security: refusing to ban your own active IP %s", clientIP.String()))
+					return
+				}
+			}
+		}
+		nextNote := existing.Note
+		if req.Note != nil {
+			nextNote = strings.TrimSpace(*req.Note)
+		}
+		nextOcc := existing.Occurrences
+		wasExpired := existing.ExpiresAt > 0 && existing.ExpiresAt <= nowMS
+		if req.Reban && wasExpired && (nextExp == 0 || nextExp > nowMS) {
+			nextOcc = existing.Occurrences + 1
+		}
+		if _, err := s.deps.Store.ExecContext(r.Context(),
+			`UPDATE security_ip_bans SET note = ?, occurrences = ?, expires_at = ?, updated_at = ? WHERE id = ?`,
+			nextNote, nextOcc, nextExp, nowMS, banID); writeBadErr(w, err) {
+			return
+		}
+		existing.Note = nextNote
+		existing.Occurrences = nextOcc
+		existing.ExpiresAt = nextExp
+		existing.UpdatedAt = nowMS
+		if s.deps.WAF != nil {
+			_ = s.deps.WAF.ReloadBans(r.Context())
+		}
+		act := "security.ip_ban_update"
+		if req.Reban {
+			act = "security.ip_ban_reban"
+		}
+		s.recordAuditLog(r, actor, act, "ip_ban", banID, map[string]any{"cidr": existing.CIDR, "expires_at": nextExp})
+		enriched := s.enrichIPBanViews([]domain.SecurityIPBan{existing})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ban": enriched[0]})
+		return
+	}
+
+	if len(parts) == 1 && r.Method == http.MethodDelete {
+		_, _ = s.deps.Store.ExecContext(r.Context(), `DELETE FROM security_ip_bans WHERE id = ?`, banID)
+		if s.deps.WAF != nil {
+			_ = s.deps.WAF.ReloadBans(r.Context())
+		}
+		s.recordAuditLog(r, actor, "security.ip_ban_remove", "ip_ban", banID, nil)
 		writeOKJSON(w)
 		return
 	}

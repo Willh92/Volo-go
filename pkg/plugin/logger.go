@@ -161,3 +161,90 @@ func (l *PluginLogger) RemoveLogs(pluginID string) {
 	_ = os.Remove(path)
 	_ = os.Remove(path + ".1")
 }
+
+// ClearLogs truncates/removes runtime JSONL log files for a specific plugin.
+func (l *PluginLogger) ClearLogs(pluginID string) error {
+	if l == nil || l.baseDir == "" {
+		return nil
+	}
+	path, ok := l.logPath(pluginID)
+	if !ok {
+		return os.ErrInvalid
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_ = os.Remove(path)
+	_ = os.Remove(path + ".1")
+	return nil
+}
+
+// PruneExpiredLogs removes JSONL log entries older than maxAge across all plugin log files.
+// A maxAge <= 0 disables pruning (retains logs indefinitely).
+func (l *PluginLogger) PruneExpiredLogs(maxAge time.Duration) {
+	if l == nil || l.baseDir == "" || maxAge <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	entries, err := os.ReadDir(l.baseDir)
+	if err != nil {
+		return
+	}
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if !strings.HasSuffix(name, ".jsonl") && !strings.HasSuffix(name, ".jsonl.1") {
+			continue
+		}
+		fullPath := filepath.Join(l.baseDir, name)
+		prunePluginLogFileLocked(fullPath, cutoff)
+	}
+}
+
+func prunePluginLogFileLocked(fullPath string, cutoff time.Time) {
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return
+	}
+	var kept []string
+	dropped := false
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 8192), 64*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var ent LogEntry
+		if uErr := json.Unmarshal([]byte(line), &ent); uErr == nil && ent.Timestamp != "" {
+			if ts, pErr := time.Parse(time.RFC3339, ent.Timestamp); pErr == nil && ts.Before(cutoff) {
+				dropped = true
+				continue
+			}
+		}
+		kept = append(kept, line)
+	}
+	scanErr := scanner.Err()
+	_ = f.Close()
+	if scanErr != nil {
+		return
+	}
+	if len(kept) == 0 {
+		_ = os.Remove(fullPath)
+		return
+	}
+	if !dropped {
+		return
+	}
+	tmpPath := fullPath + ".tmp"
+	if wErr := os.WriteFile(tmpPath, []byte(strings.Join(kept, "\n")+"\n"), 0o640); wErr == nil {
+		_ = os.Rename(tmpPath, fullPath)
+	} else {
+		_ = os.Remove(tmpPath)
+	}
+}

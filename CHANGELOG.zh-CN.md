@@ -20,6 +20,11 @@
   - 新增「评论回收站保留天数」设置（默认 `30`，`0` 为仅手动清理），后台任务每 6 小时自动清理过期评论。
   - 已删除但仍有可见回复的评论显示多语言「该评论已删除」占位，楼层结构与分页保持完整。
 - **评论游客信息编辑**：后台评论编辑弹窗支持修改昵称、头像 URL 与个人网站（自动校验规范化），便于修复迁移遗留评论；子回复中的 `@昵称` 自动同步。
+- **可配置三档阶梯自动风控、IP/CIDR 免封白名单与封禁全生命周期治理**：
+  - 开放完整自动风控策略参数：统计窗口（`risk_window_seconds`，默认 `600` 秒）、触发阈值（`risk_strike_threshold`，默认 `5` 次）、三档阶梯封禁时长（初犯 `15` 分钟 / 再犯 `60` 分钟 / 累犯 `1440` 分钟，支持设为 `0` 永久封禁）及规范化 IP/CIDR 免封白名单（`risk_whitelist_cidrs`，豁免自动风控计数与全局高频限流），并结合数据库 `security_ip_bans.occurrences` 历史累计次数实现跨周期累犯加重。
+  - 重构 IP 封禁生命周期：「解封」（`POST /api/admin/security/ip-bans/{id}/unban`、批量 `unban`）改为提前到期并完整保留历史记录；新增单条编辑与已过期一键重新封禁（`PATCH /api/admin/security/ip-bans/{id}`，支持 `15分钟 / 1小时 / 24小时 / 3天 / 7天 / 30天 / 永久 / 自定义分钟数`）、批量修改时长（`set_duration`）与彻底删除（`delete`）、一键清理已过期记录（`POST /api/admin/security/ip-bans/purge-expired`）、`生效中 / 已过期 / 全部` 数量徽标、来源标签（手动封禁 / 自动风控）与累计触发次数（`×N`），以及评论管理单条 / 批量「封禁 IP」同款时长选择（`expires_minutes`）。
+- **过期封禁与审计 / 插件日志保留策略及一键清空**：
+  - 停止每小时误删刚到期的封禁记录；新增已过期封禁保留天数（`ip_ban_retention_days`，默认 `30` 天）、管理审计日志保留天数（`audit_log_retention_days`，默认 `90` 天）与插件运行日志保留天数（`plugin_log_retention_days`，默认 `30` 天，均支持 `0` 永久保留），并提供审计日志与单插件日志一键清空接口及按钮（`DELETE /api/admin/audit-logs`、`DELETE /api/admin/plugins/{id}/logs`）。
 
 ### 变更
 - **发布包瘦身**：发布压缩包仅包含对应系统的安装脚本，文件顺序 / 属主 / 时间戳可复现，并使用 7-Zip 最高压缩（缺失时回退 `gzip -9n` / `zip -9`）。为容纳 HTTP/2 与原生 TLS，二进制体积预算由 20 MiB 调整为 21 MiB（linux/amd64 约 19.7 MiB）；评论组件 gzip 预算由 10 KiB 调整为 11 KiB。
@@ -69,6 +74,11 @@
   - 文章编辑器「媒体与摘要」面板中，「播客音频 URL」「音频时长」输入框不再被封面预览图撑到行底，改为紧贴标签显示。
   - 文章卡片封面链接改用 `aria-label`，消除点击封面时浏览器报出的 `Blocked aria-hidden` 无障碍警告。
 - **公告栏对齐块渲染**：后台公告栏 Markdown 与文章正文一致，支持 `<p|div|center align=…>` 包裹块内的 Markdown 渲染。
+- **移动端卡片交互修复、`<meta name="color-scheme">` 同步与输入法回车防误触**：
+  - 将表格行 `:hover` 高亮限定于精细指针设备（`@media (hover: hover) and (pointer: fine)`）并在触屏关闭弹窗时自动失焦，彻底消除手机端列表卡片残留异常悬停矩形框。
+  - 修复移动端「顶部导航」卡片中「目标地址」字段孤立悬浮右侧的排版错位（支持 `.col-stack-mobile` 纵向堆叠长链接）。
+  - 在前台主题与管理后台统一接入 `<meta name="color-scheme">` 动态同步（`light dark` / `light` / `dark`）与 `:root { color-scheme: light dark }`。
+  - 为全部自定义 `Enter` 提交输入框补齐 `isComposing || keyCode === 229` 中文 / 日文输入法候选词回车保护。
 
 ---
 

@@ -1157,8 +1157,8 @@ export function DistributeWorkspace({
                             {it.is_enabled === false && <span class="volo-mini-tag warn">{t("tbl.status_disabled")}</span>}
                           </div>
                         </td>
-                        <td class="col-cat" data-label={t("tbl.col_url")}>
-                          <span class="volo-code-chip">{it.url}</span>
+                        <td class="col-cat col-stack-mobile" data-label={t("tbl.col_url")}>
+                          <span class="volo-code-chip is-wrap">{it.url}</span>
                         </td>
                         <td class="col-fluid" data-label={t("tbl.col_i18n")}>
                           <span class="volo-help">{i18nSummary || "—"}</span>

@@ -344,12 +344,58 @@ export function SystemWorkspace({
   // WAF IP Bans (server-paginated) + GeoIP
   const [bans, setBans] = useState<any[]>([]);
   const [bansTotal, setBansTotal] = useState(0);
+  const [banCounts, setBanCounts] = useState({ active: 0, expired: 0, all: 0 });
   const [banStateFilter, setBanStateFilter] = useState<"active" | "expired" | "all">("active");
   const [banQuery, setBanQuery] = useState("");
   const debouncedBanQ = useDebouncedValue(banQuery, 250);
   const [selBanIds, setSelBanIds] = useState<string[]>([]);
   const [banModalOpen, setBanModalOpen] = useState(false);
-  const [banForm, setBanForm] = useState({ cidr: "", note: "", expires_hours: 24 });
+  const [banModalMode, setBanModalMode] = useState<"create" | "edit" | "reban">("create");
+  const [editingBanId, setEditingBanId] = useState<string | null>(null);
+  const [banDurPreset, setBanDurPreset] = useState<string>("1440");
+  const [banCustomMins, setBanCustomMins] = useState<string>("60");
+  const [banForm, setBanForm] = useState({ cidr: "", note: "" });
+  const [batchDurOpen, setBatchDurOpen] = useState(false);
+  const [batchDurPreset, setBatchDurPreset] = useState<string>("1440");
+  const [batchDurCustomMins, setBatchDurCustomMins] = useState<string>("60");
+
+  const resolveBanMinutesValue = (preset: string, customStr: string): number | undefined => {
+    if (preset === "keep") return undefined;
+    if (preset === "0") return 0;
+    if (preset === "custom") {
+      return Math.max(1, Math.min(5256000, Math.round(Number(customStr) || 60)));
+    }
+    return Math.max(1, Math.round(Number(preset) || 1440));
+  };
+
+  const openBanModalForRecord = (b: any, mode: "edit" | "reban") => {
+    setBanModalMode(mode);
+    setEditingBanId(String(b.id));
+    setBanForm({ cidr: String(b.cidr || ""), note: String(b.note || "") });
+    const now = Date.now();
+    const isExpired = b.expires_at > 0 && b.expires_at <= now;
+    if (mode === "reban") {
+      setBanDurPreset("1440");
+      setBanCustomMins("60");
+    } else if (isExpired) {
+      setBanDurPreset("keep");
+      setBanCustomMins("60");
+    } else if (b.expires_at === 0) {
+      setBanDurPreset("0");
+      setBanCustomMins("60");
+    } else {
+      const rem = Math.max(1, Math.round((Number(b.expires_at) - now) / 60000));
+      const known = ["15", "60", "1440", "4320", "10080", "43200"];
+      if (known.includes(String(rem))) {
+        setBanDurPreset(String(rem));
+        setBanCustomMins("60");
+      } else {
+        setBanDurPreset("custom");
+        setBanCustomMins(String(rem));
+      }
+    }
+    setBanModalOpen(true);
+  };
 
   const [geoRules, setGeoRules] = useState<any[]>([]);
   const [geoQuery, setGeoQuery] = useState("");
@@ -474,10 +520,20 @@ export function SystemWorkspace({
       params.set("per_page", String(bansPageSize));
       params.set("state", banStateFilter);
       if (debouncedBanQ.trim()) params.set("q", debouncedBanQ.trim());
-      const b = await apiFetch<{ items: any[]; total?: number }>(`/api/admin/security/ip-bans?${params.toString()}`);
+      const b = await apiFetch<{
+        items: any[];
+        total?: number;
+        counts?: { active?: number; expired?: number; all?: number };
+      }>(`/api/admin/security/ip-bans?${params.toString()}`);
       const list = b.items || [];
       setBans(list);
-      setBansTotal(b.total ?? list.length);
+      const tot = b.total ?? list.length;
+      setBansTotal(tot);
+      setBanCounts({
+        active: b.counts?.active ?? (banStateFilter === "active" ? tot : 0),
+        expired: b.counts?.expired ?? (banStateFilter === "expired" ? tot : 0),
+        all: b.counts?.all ?? tot,
+      });
     } catch (err: any) {
       showToast(err.message);
     } finally {
@@ -579,7 +635,11 @@ export function SystemWorkspace({
         });
         if (debouncedBanQ.trim()) banSp.set("q", debouncedBanQ.trim());
         const [b, g, st] = await Promise.all([
-          apiFetch<{ items: any[]; total?: number }>(`/api/admin/security/ip-bans?${banSp.toString()}`),
+          apiFetch<{
+            items: any[];
+            total?: number;
+            counts?: { active?: number; expired?: number; all?: number };
+          }>(`/api/admin/security/ip-bans?${banSp.toString()}`),
           apiFetch<{
             items: any[];
             geo_access_circuit_enabled?: boolean;
@@ -591,8 +651,14 @@ export function SystemWorkspace({
           apiFetch<any>("/api/admin/settings"),
         ]);
         const bList = b.items || [];
+        const bTot = b.total ?? bList.length;
         setBans(bList);
-        setBansTotal(b.total ?? bList.length);
+        setBansTotal(bTot);
+        setBanCounts({
+          active: b.counts?.active ?? (banStateFilter === "active" ? bTot : 0),
+          expired: b.counts?.expired ?? (banStateFilter === "expired" ? bTot : 0),
+          all: b.counts?.all ?? bTot,
+        });
         setGeoRules(g.items || []);
         setGeoCircuitEnabled(g.geo_access_circuit_enabled !== false);
         setDomains(st.domains || {});
@@ -4213,7 +4279,7 @@ export function SystemWorkspace({
                 resetConsoleScroll();
               }}
             >
-              {t("sys.sub_waf_bans")} ({bansTotal})
+              {t("sys.sub_waf_bans")} ({banCounts.all > 0 ? banCounts.active : bansTotal})
             </button>
             <button
               type="button"
@@ -4253,6 +4319,91 @@ export function SystemWorkspace({
                     onChange={(v) => setDomField("security", "risk_control_enabled", v)}
                   />
                 </div>
+                {domains.security?.risk_control_enabled !== false && (
+                  <div class="volo-toggle-group-body">
+                    <div class="volo-grid-2">
+                      <div class="volo-field">
+                        <label>{t("sys.risk_window_sec")}</label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={86400}
+                          class="volo-input"
+                          value={domains.security?.risk_window_seconds ?? 600}
+                          onInput={(e) =>
+                            setDomField("security", "risk_window_seconds", Number((e.currentTarget as HTMLInputElement).value))
+                          }
+                        />
+                      </div>
+                      <div class="volo-field">
+                        <label>{t("sys.risk_strike_threshold")}</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={1000}
+                          class="volo-input"
+                          value={domains.security?.risk_strike_threshold ?? 5}
+                          onInput={(e) =>
+                            setDomField("security", "risk_strike_threshold", Number((e.currentTarget as HTMLInputElement).value))
+                          }
+                        />
+                      </div>
+                    </div>
+                    <div class="volo-auto-grid">
+                      <div class="volo-field">
+                        <label>{t("sys.risk_tier1_min")}</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={525600}
+                          class="volo-input"
+                          value={domains.security?.risk_tier1_minutes ?? 15}
+                          onInput={(e) =>
+                            setDomField("security", "risk_tier1_minutes", Number((e.currentTarget as HTMLInputElement).value))
+                          }
+                        />
+                      </div>
+                      <div class="volo-field">
+                        <label>{t("sys.risk_tier2_min")}</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={525600}
+                          class="volo-input"
+                          value={domains.security?.risk_tier2_minutes ?? 60}
+                          onInput={(e) =>
+                            setDomField("security", "risk_tier2_minutes", Number((e.currentTarget as HTMLInputElement).value))
+                          }
+                        />
+                      </div>
+                      <div class="volo-field">
+                        <label>{t("sys.risk_tier3_min")}</label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={525600}
+                          class="volo-input"
+                          value={domains.security?.risk_tier3_minutes ?? 1440}
+                          onInput={(e) =>
+                            setDomField("security", "risk_tier3_minutes", Number((e.currentTarget as HTMLInputElement).value))
+                          }
+                        />
+                      </div>
+                    </div>
+                    <span class="volo-help" style={{ display: "block", marginBottom: "12px" }}>
+                      {t("sys.risk_tier3_hint")}
+                    </span>
+                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <label>{t("sys.risk_whitelist_cidrs")}</label>
+                      <TokenListInput
+                        placeholder={t("sys.risk_whitelist_ph")}
+                        values={Array.isArray(domains.security?.risk_whitelist_cidrs) ? domains.security.risk_whitelist_cidrs : []}
+                        onChange={(next) => setDomField("security", "risk_whitelist_cidrs", next)}
+                      />
+                      <span class="volo-help">{t("sys.risk_whitelist_desc")}</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div class={`volo-toggle-group ${domains.security?.waf_enabled !== false ? "is-on" : "is-off"}`}>
@@ -4385,6 +4536,55 @@ export function SystemWorkspace({
                   />
                 </div>
               </div>
+
+              <div class="volo-subcard">
+                <div class="volo-subcard-title">{t("sys.retention_sub_title")}</div>
+                <div class="volo-auto-grid">
+                  <div class="volo-field" style={{ marginBottom: 0 }}>
+                    <label>{t("sys.ip_ban_retention_days")}</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={3650}
+                      class="volo-input"
+                      value={domains.security?.ip_ban_retention_days ?? 30}
+                      onInput={(e) =>
+                        setDomField("security", "ip_ban_retention_days", Number((e.currentTarget as HTMLInputElement).value))
+                      }
+                    />
+                  </div>
+                  <div class="volo-field" style={{ marginBottom: 0 }}>
+                    <label>{t("sys.audit_log_retention_days")}</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={3650}
+                      class="volo-input"
+                      value={domains.security?.audit_log_retention_days ?? 90}
+                      onInput={(e) =>
+                        setDomField("security", "audit_log_retention_days", Number((e.currentTarget as HTMLInputElement).value))
+                      }
+                    />
+                  </div>
+                  <div class="volo-field" style={{ marginBottom: 0 }}>
+                    <label>{t("sys.plugin_log_retention_days")}</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={3650}
+                      class="volo-input"
+                      value={domains.security?.plugin_log_retention_days ?? 30}
+                      onInput={(e) =>
+                        setDomField("security", "plugin_log_retention_days", Number((e.currentTarget as HTMLInputElement).value))
+                      }
+                    />
+                  </div>
+                </div>
+                <span class="volo-help" style={{ display: "block", marginTop: "8px" }}>
+                  {t("sys.ip_ban_retention_hint")}
+                </span>
+              </div>
+
               <div class="volo-form-actions">
                 <button
                   type="button"
@@ -4415,27 +4615,57 @@ export function SystemWorkspace({
                   <h3 class="volo-card-title">{t("sys.waf_bans_head")}</h3>
                   <p class="volo-sec-desc">{t("sys.waf_bans_desc")}</p>
                 </div>
-                <button
-                  type="button"
-                  class="volo-btn volo-btn-primary volo-btn-sm"
-                  onClick={() => {
-                    setBanForm({ cidr: "", note: "", expires_hours: 24 });
-                    setBanModalOpen(true);
-                  }}
-                >
-                  <PlusIcon size={14} /> {t("sys.new_ban")}
-                </button>
+                <div class="volo-input-row" style={{ gap: "8px", flexWrap: "wrap" }}>
+                  {banCounts.expired > 0 && (
+                    <button
+                      type="button"
+                      class="volo-btn volo-btn-danger volo-btn-sm"
+                      onClick={async () => {
+                        if (!(await openConfirm({ message: t("sys.confirm_purge_expired_bans"), danger: true }))) {
+                          return;
+                        }
+                        try {
+                          const res = await apiFetch<{ affected?: number }>(
+                            "/api/admin/security/ip-bans/purge-expired",
+                            { method: "POST", body: "{}" }
+                          );
+                          setSelBanIds([]);
+                          showToast(t("sys.waf_purged_expired", { n: res?.affected ?? 0 }), "ok");
+                          void loadBansList();
+                        } catch (err: any) {
+                          showToast(err.message);
+                        }
+                      }}
+                    >
+                      {t("sys.waf_purge_expired_btn")} ({banCounts.expired})
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    class="volo-btn volo-btn-primary volo-btn-sm"
+                    onClick={() => {
+                      setBanModalMode("create");
+                      setEditingBanId(null);
+                      setBanDurPreset("1440");
+                      setBanCustomMins("60");
+                      setBanForm({ cidr: "", note: "" });
+                      setBanModalOpen(true);
+                    }}
+                  >
+                    <PlusIcon size={14} /> {t("sys.new_ban")}
+                  </button>
+                </div>
               </div>
 
               <div class="volo-filter-bar">
                 <div class="volo-filter-pills">
                   {(
                     [
-                      ["active", t("sys.waf_state_active")],
-                      ["expired", t("sys.waf_state_expired")],
-                      ["all", t("art.all")],
+                      ["active", t("sys.waf_state_active"), banCounts.active],
+                      ["expired", t("sys.waf_state_expired"), banCounts.expired],
+                      ["all", t("art.all"), banCounts.all],
                     ] as const
-                  ).map(([st, lbl]) => (
+                  ).map(([st, lbl, cnt]) => (
                     <button
                       key={st}
                       type="button"
@@ -4446,7 +4676,7 @@ export function SystemWorkspace({
                         setSelBanIds([]);
                       }}
                     >
-                      {lbl}
+                      {lbl} ({cnt})
                     </button>
                   ))}
                 </div>
@@ -4496,87 +4726,165 @@ export function SystemWorkspace({
                       </th>
                       <th>{t("tbl.col_cidr")}</th>
                       <th>{t("tbl.col_geo")}</th>
+                      <th>{t("sys.waf_col_source")}</th>
                       <th class="col-fluid">{t("tbl.col_note")}</th>
                       <th class="col-act col-act-th">{t("art.actions")}</th>
                     </tr>
                   </thead>
                   <tbody>
                     {loading ? (
-                      <TableSkeleton cols={5} rows={4} />
+                      <TableSkeleton cols={6} rows={4} />
                     ) : bansPageSlice.length === 0 ? (
-                      <ConsoleEmpty colSpan={5} />
+                      <ConsoleEmpty colSpan={6} />
                     ) : (
-                      bansPageSlice.map((b) => (
-                        <tr key={b.id}>
-                          <td class="col-check">
-                            <input
-                              type="checkbox"
-                              checked={selBanIds.includes(b.id)}
-                              onChange={(e) => {
-                                const on = (e.currentTarget as HTMLInputElement).checked;
-                                setSelBanIds((prev) => (on ? [...prev, b.id] : prev.filter((x) => x !== b.id)));
-                              }}
-                            />
-                          </td>
-                          <td data-label={t("tbl.col_cidr")}>
-                            <span class="volo-code-chip is-wrap">{b.cidr}</span>
-                          </td>
-                          <td data-label={t("tbl.col_geo")}>
-                            {b.country_iso === "LOCAL" || b.geo_location === "Local Network" ? (
-                              <span class="volo-mini-tag">{t("sys.geo_local_net")}</span>
-                            ) : b.geo_location ? (
-                              <div class="volo-input-row" style={{ gap: "6px", flexWrap: "wrap" }}>
-                                {b.country_iso && <span class="volo-code-chip">{b.country_iso}</span>}
-                                <span>{b.geo_location}</span>
-                              </div>
-                            ) : (
-                              <span class="volo-help">—</span>
-                            )}
-                          </td>
-                          <td class="col-fluid" data-label={t("tbl.col_note")}>
-                            <div class="volo-cell-meta">
-                              <span>
-                                {(() => {
-                                  const code = String(b.reason_code || "").trim();
-                                  const reason = String(b.reason || "").trim();
-                                  const note = String(b.note || "").trim();
-                                  const primaryRaw = code || reason || note;
-                                  if (!primaryRaw) return "—";
-                                  const primary = localizeWafReason(primaryRaw);
-                                  const extra =
-                                    note &&
-                                    note.toLowerCase() !== primaryRaw.toLowerCase() &&
-                                    !/^auto[-_ ]?ban\s*:/i.test(note)
-                                      ? localizeWafReason(note)
-                                      : "";
-                                  return extra && extra !== primary ? `${primary} · ${extra}` : primary;
-                                })()}
-                              </span>
-                              <span>{b.expires_at > 0 ? formatDateTime(b.expires_at) : t("sys.waf_dur_perm")}</span>
-                            </div>
-                          </td>
-                          <td class="col-act" data-label={t("art.actions")}>
-                            <div class="volo-row-actions">
-                              <button
-                                type="button"
-                                class="volo-act-btn danger"
-                                onClick={async () => {
-                                  if (!(await openConfirm({ message: t("sys.confirm_unban_ip", { cidr: b.cidr }), danger: true }))) return;
-                                  try {
-                                    await apiFetch(`/api/admin/security/ip-bans/${b.id}`, { method: "DELETE" });
-                                    setSelBanIds((prev) => prev.filter((x) => x !== b.id));
-                                    void loadBansList();
-                                  } catch (err: any) {
-                                    showToast(err.message);
-                                  }
+                      bansPageSlice.map((b) => {
+                        const isExpired = b.expires_at > 0 && b.expires_at <= Date.now();
+                        const occ = Math.max(1, Number(b.occurrences) || 1);
+                        return (
+                          <tr key={b.id}>
+                            <td class="col-check">
+                              <input
+                                type="checkbox"
+                                checked={selBanIds.includes(b.id)}
+                                onChange={(e) => {
+                                  const on = (e.currentTarget as HTMLInputElement).checked;
+                                  setSelBanIds((prev) => (on ? [...prev, b.id] : prev.filter((x) => x !== b.id)));
                                 }}
-                              >
-                                {t("sys.waf_unban_btn")}
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))
+                              />
+                            </td>
+                            <td data-label={t("tbl.col_cidr")}>
+                              <span class="volo-code-chip is-wrap">{b.cidr}</span>
+                            </td>
+                            <td data-label={t("tbl.col_geo")}>
+                              {b.country_iso === "LOCAL" || b.geo_location === "Local Network" ? (
+                                <span class="volo-mini-tag">{t("sys.geo_local_net")}</span>
+                              ) : b.geo_location ? (
+                                <div class="volo-input-row" style={{ gap: "6px", flexWrap: "wrap" }}>
+                                  {b.country_iso && <span class="volo-code-chip">{b.country_iso}</span>}
+                                  <span>{b.geo_location}</span>
+                                </div>
+                              ) : (
+                                <span class="volo-help">—</span>
+                              )}
+                            </td>
+                            <td data-label={t("sys.waf_col_source")}>
+                              <div class="volo-input-row" style={{ gap: "6px", flexWrap: "wrap" }}>
+                                <span class={`volo-mini-tag ${b.source === "manual" ? "" : "warn"}`}>
+                                  {b.source === "manual" ? t("sys.waf_src_manual") : t("sys.waf_src_auto")}
+                                </span>
+                                <span
+                                  class="volo-code-chip"
+                                  title={t("sys.waf_occurrences_tip", { n: occ })}
+                                >
+                                  ×{occ}
+                                </span>
+                              </div>
+                            </td>
+                            <td class="col-fluid" data-label={t("tbl.col_note")}>
+                              <div class="volo-cell-meta">
+                                <span>
+                                  {(() => {
+                                    const code = String(b.reason_code || "").trim();
+                                    const reason = String(b.reason || "").trim();
+                                    const note = String(b.note || "").trim();
+                                    const primaryRaw = code || reason || note;
+                                    if (!primaryRaw) return "—";
+                                    const primary = localizeWafReason(primaryRaw);
+                                    const extra =
+                                      note &&
+                                      note.toLowerCase() !== primaryRaw.toLowerCase() &&
+                                      !/^auto[-_ ]?ban\s*:/i.test(note)
+                                        ? localizeWafReason(note)
+                                        : "";
+                                    return extra && extra !== primary ? `${primary} · ${extra}` : primary;
+                                  })()}
+                                </span>
+                                {b.created_at > 0 && (
+                                  <span>{t("sys.waf_created_at", { time: formatDateTime(b.created_at) })}</span>
+                                )}
+                                <span>
+                                  {b.expires_at === 0
+                                    ? t("sys.waf_dur_perm")
+                                    : isExpired
+                                      ? t("sys.waf_expired_at", { time: formatDateTime(b.expires_at) })
+                                      : t("sys.waf_expires_at", { time: formatDateTime(b.expires_at) })}
+                                </span>
+                              </div>
+                            </td>
+                            <td class="col-act" data-label={t("art.actions")}>
+                              <div class="volo-row-actions">
+                                {isExpired && (
+                                  <button
+                                    type="button"
+                                    class="volo-act-btn"
+                                    onClick={() => openBanModalForRecord(b, "reban")}
+                                  >
+                                    {t("sys.waf_reban_btn")}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  class="volo-act-btn"
+                                  onClick={() => openBanModalForRecord(b, "edit")}
+                                >
+                                  {t("common.edit")}
+                                </button>
+                                {!isExpired && (
+                                  <button
+                                    type="button"
+                                    class="volo-act-btn"
+                                    onClick={async () => {
+                                      if (
+                                        !(await openConfirm({
+                                          message: t("sys.confirm_unban_ip", { cidr: b.cidr }),
+                                          danger: true,
+                                        }))
+                                      ) {
+                                        return;
+                                      }
+                                      try {
+                                        await apiFetch(`/api/admin/security/ip-bans/${b.id}/unban`, {
+                                          method: "POST",
+                                          body: "{}",
+                                        });
+                                        setSelBanIds((prev) => prev.filter((x) => x !== b.id));
+                                        void loadBansList();
+                                      } catch (err: any) {
+                                        showToast(err.message);
+                                      }
+                                    }}
+                                  >
+                                    {t("sys.waf_unban_btn")}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  class="volo-act-btn danger"
+                                  onClick={async () => {
+                                    if (
+                                      !(await openConfirm({
+                                        message: t("sys.confirm_delete_ban", { cidr: b.cidr }),
+                                        danger: true,
+                                      }))
+                                    ) {
+                                      return;
+                                    }
+                                    try {
+                                      await apiFetch(`/api/admin/security/ip-bans/${b.id}`, { method: "DELETE" });
+                                      setSelBanIds((prev) => prev.filter((x) => x !== b.id));
+                                      void loadBansList();
+                                    } catch (err: any) {
+                                      showToast(err.message);
+                                    }
+                                  }}
+                                >
+                                  {t("sys.waf_delete_perm_btn")}
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -4585,11 +4893,48 @@ export function SystemWorkspace({
               <BatchBar count={selBanIds.length} onClear={() => setSelBanIds([])}>
                 <button
                   type="button"
-                  class="volo-act-btn danger"
+                  class="volo-act-btn"
+                  onClick={() => {
+                    setBatchDurPreset("1440");
+                    setBatchDurCustomMins("60");
+                    setBatchDurOpen(true);
+                  }}
+                >
+                  {t("sys.waf_batch_dur_btn")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-act-btn"
                   onClick={async () => {
                     if (
                       !(await openConfirm({
                         message: t("sys.confirm_batch_unban", { n: selBanIds.length }),
+                        danger: true,
+                      }))
+                    ) {
+                      return;
+                    }
+                    try {
+                      await apiFetch("/api/admin/security/ip-bans/batch", {
+                        method: "POST",
+                        body: JSON.stringify({ action: "unban", ids: selBanIds }),
+                      });
+                      setSelBanIds([]);
+                      void loadBansList();
+                    } catch (err: any) {
+                      showToast(err.message);
+                    }
+                  }}
+                >
+                  {t("sys.waf_unban_btn")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-act-btn danger"
+                  onClick={async () => {
+                    if (
+                      !(await openConfirm({
+                        message: t("sys.confirm_batch_delete_bans", { n: selBanIds.length }),
                         danger: true,
                       }))
                     ) {
@@ -4607,7 +4952,7 @@ export function SystemWorkspace({
                     }
                   }}
                 >
-                  {t("sys.waf_unban_btn")}
+                  {t("sys.waf_delete_perm_btn")}
                 </button>
               </BatchBar>
 
@@ -4628,7 +4973,13 @@ export function SystemWorkspace({
               <AnimatedModal
                 open={banModalOpen}
                 onClose={() => setBanModalOpen(false)}
-                title={t("sys.new_ban")}
+                title={
+                  banModalMode === "create"
+                    ? t("sys.new_ban")
+                    : banModalMode === "reban"
+                      ? t("sys.waf_reban_title")
+                      : t("sys.waf_edit_ban")
+                }
                 maxWidth="520px"
                 footer={
                   <>
@@ -4636,7 +4987,11 @@ export function SystemWorkspace({
                       {t("common.cancel")}
                     </button>
                     <button type="submit" form="volo-sys-ban-form" class="volo-btn volo-btn-primary">
-                      {t("sys.waf_ban_btn")}
+                      {banModalMode === "create"
+                        ? t("sys.waf_ban_btn")
+                        : banModalMode === "reban"
+                          ? t("sys.waf_reban_btn")
+                          : t("common.save")}
                     </button>
                   </>
                 }
@@ -4646,15 +5001,30 @@ export function SystemWorkspace({
                   autoComplete="off"
                   onSubmit={async (e) => {
                     e.preventDefault();
+                    const mins = resolveBanMinutesValue(banDurPreset, banCustomMins);
                     try {
-                      await apiFetch("/api/admin/security/ip-bans", {
-                        method: "POST",
-                        body: JSON.stringify({
-                          cidr: banForm.cidr,
+                      if (banModalMode === "create" || !editingBanId) {
+                        await apiFetch("/api/admin/security/ip-bans", {
+                          method: "POST",
+                          body: JSON.stringify({
+                            cidr: banForm.cidr,
+                            note: banForm.note,
+                            expires_minutes: mins ?? 1440,
+                          }),
+                        });
+                      } else {
+                        const payload: Record<string, any> = {
                           note: banForm.note,
-                          expires_hours: banForm.expires_hours,
-                        }),
-                      });
+                          reban: banModalMode === "reban" || mins !== undefined,
+                        };
+                        if (mins !== undefined) {
+                          payload.expires_minutes = mins;
+                        }
+                        await apiFetch(`/api/admin/security/ip-bans/${encodeURIComponent(editingBanId)}`, {
+                          method: "PATCH",
+                          body: JSON.stringify(payload),
+                        });
+                      }
                       setBanModalOpen(false);
                       showToast(t("common.saved"));
                       void loadBansList();
@@ -4668,6 +5038,7 @@ export function SystemWorkspace({
                     <input
                       class="volo-input"
                       required
+                      disabled={banModalMode !== "create"}
                       name="waf_ban_cidr_target"
                       autoComplete="off"
                       placeholder={t("sys.waf_cidr_ph")}
@@ -4678,16 +5049,38 @@ export function SystemWorkspace({
                   <div class="volo-field">
                     <label>{t("sys.lbl_ban_dur")}</label>
                     <ConsoleSelect
-                      value={String(banForm.expires_hours)}
+                      searchable={false}
+                      value={banDurPreset}
                       options={[
-                        { value: "24", label: t("sys.waf_dur_24h") },
-                        { value: "168", label: t("sys.waf_dur_7d") },
-                        { value: "720", label: t("sys.waf_dur_30d") },
+                        ...(banModalMode === "edit" && banDurPreset === "keep"
+                          ? [{ value: "keep", label: t("sys.waf_state_expired") }]
+                          : []),
+                        { value: "15", label: t("sys.waf_dur_15m") },
+                        { value: "60", label: t("sys.waf_dur_1h") },
+                        { value: "1440", label: t("sys.waf_dur_24h") },
+                        { value: "4320", label: t("sys.waf_dur_3d") },
+                        { value: "10080", label: t("sys.waf_dur_7d") },
+                        { value: "43200", label: t("sys.waf_dur_30d") },
                         { value: "0", label: t("sys.waf_dur_perm") },
+                        { value: "custom", label: t("sys.waf_dur_custom") },
                       ]}
-                      onChange={(v) => setBanForm({ ...banForm, expires_hours: Number(v) })}
+                      onChange={(v) => setBanDurPreset(v)}
                     />
                   </div>
+                  {banDurPreset === "custom" && (
+                    <div class="volo-field">
+                      <label>{t("sys.waf_dur_custom_mins")}</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5256000}
+                        required
+                        class="volo-input"
+                        value={banCustomMins}
+                        onInput={(e) => setBanCustomMins((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                  )}
                   <div class="volo-field">
                     <label>{t("sys.lbl_ban_reason")}</label>
                     <input
@@ -4699,6 +5092,81 @@ export function SystemWorkspace({
                       onInput={(e) => setBanForm({ ...banForm, note: (e.currentTarget as HTMLInputElement).value })}
                     />
                   </div>
+                </form>
+              </AnimatedModal>
+
+              <AnimatedModal
+                open={batchDurOpen}
+                onClose={() => setBatchDurOpen(false)}
+                title={t("sys.waf_batch_dur_title", { n: selBanIds.length })}
+                maxWidth="460px"
+                footer={
+                  <>
+                    <button type="button" class="volo-btn" onClick={() => setBatchDurOpen(false)}>
+                      {t("common.cancel")}
+                    </button>
+                    <button type="submit" form="volo-sys-batch-ban-dur-form" class="volo-btn volo-btn-primary">
+                      {t("common.save")}
+                    </button>
+                  </>
+                }
+              >
+                <form
+                  id="volo-sys-batch-ban-dur-form"
+                  autoComplete="off"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const mins = resolveBanMinutesValue(batchDurPreset, batchDurCustomMins) ?? 1440;
+                    try {
+                      await apiFetch("/api/admin/security/ip-bans/batch", {
+                        method: "POST",
+                        body: JSON.stringify({
+                          action: "set_duration",
+                          ids: selBanIds,
+                          expires_minutes: mins,
+                        }),
+                      });
+                      setBatchDurOpen(false);
+                      setSelBanIds([]);
+                      showToast(t("common.saved"));
+                      void loadBansList();
+                    } catch (err: any) {
+                      showToast(err.message);
+                    }
+                  }}
+                >
+                  <div class="volo-field">
+                    <label>{t("sys.lbl_ban_dur")}</label>
+                    <ConsoleSelect
+                      searchable={false}
+                      value={batchDurPreset}
+                      options={[
+                        { value: "15", label: t("sys.waf_dur_15m") },
+                        { value: "60", label: t("sys.waf_dur_1h") },
+                        { value: "1440", label: t("sys.waf_dur_24h") },
+                        { value: "4320", label: t("sys.waf_dur_3d") },
+                        { value: "10080", label: t("sys.waf_dur_7d") },
+                        { value: "43200", label: t("sys.waf_dur_30d") },
+                        { value: "0", label: t("sys.waf_dur_perm") },
+                        { value: "custom", label: t("sys.waf_dur_custom") },
+                      ]}
+                      onChange={(v) => setBatchDurPreset(v)}
+                    />
+                  </div>
+                  {batchDurPreset === "custom" && (
+                    <div class="volo-field" style={{ marginBottom: 0 }}>
+                      <label>{t("sys.waf_dur_custom_mins")}</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5256000}
+                        required
+                        class="volo-input"
+                        value={batchDurCustomMins}
+                        onInput={(e) => setBatchDurCustomMins((e.currentTarget as HTMLInputElement).value)}
+                      />
+                    </div>
+                  )}
                 </form>
               </AnimatedModal>
             </div>
@@ -4786,6 +5254,7 @@ export function SystemWorkspace({
                       }
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && !(geoipDirPinned || Boolean(domains?.security?.geoip_dir_pinned))) {
+                          if (e.isComposing || e.keyCode === 229) return;
                           e.preventDefault();
                           void reloadGeoDatabases(true);
                         }
@@ -6018,7 +6487,11 @@ export function SystemWorkspace({
                   setLogPage(1);
                 }}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void loadRuntimeLogs(logLevel, logQuery);
+                  if (e.key === "Enter") {
+                    if (e.isComposing || e.keyCode === 229) return;
+                    e.preventDefault();
+                    void loadRuntimeLogs(logLevel, logQuery);
+                  }
                 }}
               />
               {logQuery && (
@@ -6080,9 +6553,35 @@ export function SystemWorkspace({
               <h3 class="volo-card-title">{t("sys.audit")}</h3>
               <p class="volo-sec-desc">{t("sys.audit_desc")}</p>
             </div>
-            <button type="button" class="volo-btn volo-btn-sm" onClick={() => void loadAuditLogs()}>
-              {t("common.refresh")}
-            </button>
+            <div class="volo-input-row" style={{ gap: "8px", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-danger volo-btn-sm"
+                disabled={auditTotal === 0 && auditLogs.length === 0}
+                onClick={async () => {
+                  if (!(await openConfirm({ message: t("sys.audit_clear_confirm"), danger: true }))) return;
+                  try {
+                    const res = await apiFetch<{ affected?: number }>("/api/admin/audit-logs", {
+                      method: "DELETE",
+                    });
+                    setKnownAuditActions([]);
+                    setAuditAction("all");
+                    setAuditQuery("");
+                    setAuditPage(1);
+                    setExpandedAuditId(null);
+                    showToast(t("sys.audit_cleared", { n: res?.affected ?? 0 }), "ok");
+                    void loadAuditLogs("", "all", 1, auditPageSize);
+                  } catch (err: any) {
+                    showToast(err.message);
+                  }
+                }}
+              >
+                {t("sys.audit_clear_btn")}
+              </button>
+              <button type="button" class="volo-btn volo-btn-sm" onClick={() => void loadAuditLogs()}>
+                {t("common.refresh")}
+              </button>
+            </div>
           </div>
 
           <div class="volo-filter-bar">
@@ -6107,7 +6606,11 @@ export function SystemWorkspace({
                   setAuditPage(1);
                 }}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void loadAuditLogs(auditQuery, auditAction, auditPage, auditPageSize);
+                  if (e.key === "Enter") {
+                    if (e.isComposing || e.keyCode === 229) return;
+                    e.preventDefault();
+                    void loadAuditLogs(auditQuery, auditAction, auditPage, auditPageSize);
+                  }
                 }}
               />
             </div>

@@ -148,3 +148,62 @@ func TestSettingsManagerAtomicPatchSecretMaskingAndHotReload(t *testing.T) {
 		t.Fatal("expected error for protocol-relative // favicon_url")
 	}
 }
+
+func TestSecurityRiskControlAndRetentionSettingsNormalization(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	kr, _, err := config.LoadOrInitKeyRing("unit-test-master-secret-key-2026", tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlx.Open(ctx, sqlx.Options{
+		Driver: "sqlite",
+		DSN:    filepath.Join(tmpDir, "sec_settings.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := migrate.Up(ctx, store); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewSettingsManager(store, kr, "zh-CN")
+	defSec := mgr.Snapshot().Security
+	if defSec.RiskWindowSeconds != 600 || defSec.RiskStrikeThreshold != 5 || defSec.RiskTier1Minutes != 15 || defSec.RiskTier2Minutes != 60 || defSec.RiskTier3Minutes != 1440 {
+		t.Fatalf("unexpected default risk control settings: %+v", defSec)
+	}
+	if defSec.IPBanRetentionDays != 30 || defSec.AuditLogRetentionDays != 90 || defSec.PluginLogRetentionDays != 30 {
+		t.Fatalf("unexpected default retention settings: %+v", defSec)
+	}
+
+	// Patch with canonicalized CIDRs, permanent tier3 (0), permanent retention (0)
+	_, ver, err := mgr.PatchDomain(ctx, "security", []byte(`{
+		"risk_window_seconds": 300,
+		"risk_strike_threshold": 3,
+		"risk_tier1_minutes": 10,
+		"risk_tier2_minutes": 120,
+		"risk_tier3_minutes": 0,
+		"risk_whitelist_cidrs": ["198.51.100.7", "198.51.100.7/32", "203.0.113.42/24", "2001:db8::1"],
+		"ip_ban_retention_days": 0,
+		"audit_log_retention_days": 0,
+		"plugin_log_retention_days": 14
+	}`), 0)
+	if err != nil {
+		t.Fatalf("PatchDomain(security) failed: %v", err)
+	}
+	got := mgr.Snapshot().Security
+	if got.RiskTier3Minutes != 0 || got.IPBanRetentionDays != 0 || got.AuditLogRetentionDays != 0 || got.PluginLogRetentionDays != 14 {
+		t.Fatalf("expected 0 permanent tier3/retention to be preserved, got %+v", got)
+	}
+	wantCIDRs := []string{"198.51.100.7/32", "203.0.113.0/24", "2001:db8::1/128"}
+	if strings.Join(got.RiskWhitelistCIDRs, ",") != strings.Join(wantCIDRs, ",") {
+		t.Fatalf("unexpected canonicalized whitelist CIDRs: got=%v want=%v", got.RiskWhitelistCIDRs, wantCIDRs)
+	}
+
+	// Reject malformed CIDR/IP in risk_whitelist_cidrs
+	if _, _, err := mgr.PatchDomain(ctx, "security", []byte(`{"risk_whitelist_cidrs":["not-an-ip"]}`), ver); err == nil {
+		t.Fatal("expected error on invalid risk_whitelist_cidrs entry")
+	}
+}
+

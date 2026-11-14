@@ -7,9 +7,15 @@
   <title>Volo Studio Console</title>
   <!--VOLO_BOOT-->
   <style>
-    html { background: #f6f7f3; color: #19211f; color-scheme: light; }
-    html[data-theme="dark"] { background: #1b2021; color: #e7ecea; color-scheme: dark; }
+    :root { background: #f6f7f3; color: #19211f; color-scheme: light dark; }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]):not(:has(> head > meta[name="color-scheme"][content="light"])) { background: #1b2021; color: #e7ecea; }
+    }
+    html[data-theme="dark"], :root:has(> head > meta[name="color-scheme"][content="dark"]) { background: #1b2021; color: #e7ecea; }
+    :root:has(> head > meta[name="color-scheme"][content="dark"]) { color-scheme: dark; }
+    :root:has(> head > meta[name="color-scheme"][content="light"]) { color-scheme: light; }
   </style>
+  <meta name="color-scheme" content="light dark" />
   <script>
     (function () {
       var cfg = {};
@@ -34,6 +40,8 @@
       var root = document.documentElement;
       root.setAttribute("data-mode", m);
       root.setAttribute("data-theme", eff);
+      var meta = document.querySelector('meta[name="color-scheme"]');
+      if (meta) meta.content = m === "system" ? "light dark" : eff;
       if (cfg.accent) root.setAttribute("data-accent", cfg.accent);
     })();
   </script>

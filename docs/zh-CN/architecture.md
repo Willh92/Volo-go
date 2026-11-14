@@ -70,7 +70,7 @@
 | `storage` | 活跃存储驱动（`local \| s3`）、本地上传目录 `local_dir`、最大上传体积 `max_upload_mb`、EXIF 剥离、自适应 WebP 质量、S3/R2/MinIO 连接与加密 `s3_secret_key` |
 | `appearance` | 桌面端主题 `active_theme`、移动端独立主题 `mobile_theme`、主题色 `accent`、明暗模式 `default_mode`、全站 `custom_css`、按主题隔离的 `theme_configs` |
 | `notifications` | 纯 Go SMTP 邮件服务与加密 `smtp_password`、新评论站长通知与读者回复邮件提醒（含待审回复审核通过补发 `NotifyCommentReplyApproved`） |
-| `security` | 扫描风控与 WAF 窗口实时联动、离线 GeoIP 热重载目录 `geoip_dir`、强制 TOTP 范围、`totp_remember_days`（支持 `0` 禁用记住设备）与 `totp_window_steps`、免重启隐身后台路径 `dynamic_login_path`（`admin_path`）及加密 `share_token_secret` |
+| `security` | 高频限流与 WAF 实时联动、可配置三档阶梯扫描风控与免封白名单（`risk_window_seconds`、`risk_strike_threshold`、`risk_tier{1,2,3}_minutes`、`risk_whitelist_cidrs`）、封禁与审计/插件日志保留天数（`{ip_ban,audit_log,plugin_log}_retention_days`）、离线 GeoIP 热重载目录 `geoip_dir`、强制 TOTP 范围、`totp_remember_days` 与 `totp_window_steps`、免重启隐身后台路径 `dynamic_login_path`（`admin_path`）及加密 `share_token_secret` |
 | `backup` | 本地定时自动备份周期/保留份数/是否含媒体、远程异地备份（`s3 \| webdav`）及加密 `webdav_password` / `s3_secret_key` |
 
 ---

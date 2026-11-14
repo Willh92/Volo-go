@@ -67,6 +67,7 @@ type WAFEngine struct {
 	publicURL        string
 	activeBans       map[netip.Prefix]int64
 	banReasons       map[netip.Prefix]string
+	banCounts        map[netip.Prefix]int
 	banPrefixes      []netip.Prefix
 	errorHandler     func(w http.ResponseWriter, r *http.Request, status int, msgKey string)
 	staffBypassCheck func(r *http.Request) bool
@@ -101,6 +102,7 @@ func NewWAFEngine(cfg *config.Config, store *sqlx.Store, settingsMgr *repo.Setti
 		publicURL:   pubURL,
 		activeBans:  make(map[netip.Prefix]int64),
 		banReasons:  make(map[netip.Prefix]string),
+		banCounts:   make(map[netip.Prefix]int),
 		strikes:     make(map[string]*strikeBucket),
 		rates:       make(map[string]*rateWindow),
 		authRates:   make(map[string]*rateWindow),
@@ -161,17 +163,22 @@ func (w *WAFEngine) sweep(now time.Time) {
 	w.bansMu.Unlock()
 
 	var maxWAFReset time.Time
+	riskWin := 10 * time.Minute
 	if w.settingsMgr != nil {
-		winSec := w.settingsMgr.Snapshot().Security.WAFWindowSeconds
+		sec := w.settingsMgr.Snapshot().Security
+		winSec := sec.WAFWindowSeconds
 		if winSec <= 0 {
 			winSec = 180
 		}
 		maxWAFReset = now.Add(time.Duration(winSec) * time.Second)
+		if sec.RiskWindowSeconds > 0 {
+			riskWin = time.Duration(sec.RiskWindowSeconds) * time.Second
+		}
 	}
 
 	w.rateMu.Lock()
 	for k, v := range w.strikes {
-		if now.Sub(v.windowStart) > 10*time.Minute {
+		if now.Sub(v.windowStart) > riskWin {
 			delete(w.strikes, k)
 		}
 	}
@@ -289,11 +296,15 @@ func (w *WAFEngine) ReloadBans(ctx context.Context) error {
 	}
 	newBans := make(map[netip.Prefix]int64, len(rows))
 	newReasons := make(map[netip.Prefix]string, len(rows))
+	newCounts := make(map[netip.Prefix]int, len(rows))
 	newPrefixes := make([]netip.Prefix, 0, len(rows))
 	for _, r := range rows {
 		pfx, ok := parseBanPrefix(r.CIDR)
 		if !ok {
 			continue
+		}
+		if r.Occurrences > newCounts[pfx] {
+			newCounts[pfx] = r.Occurrences
 		}
 		if r.ExpiresAt > 0 && r.ExpiresAt <= now {
 			continue
@@ -313,6 +324,11 @@ func (w *WAFEngine) ReloadBans(ctx context.Context) error {
 	w.bansMu.Lock()
 	w.activeBans = newBans
 	w.banReasons = newReasons
+	for pfx, c := range newCounts {
+		if c > w.banCounts[pfx] {
+			w.banCounts[pfx] = c
+		}
+	}
 	w.banPrefixes = newPrefixes
 	w.bansMu.Unlock()
 	return nil
@@ -331,6 +347,27 @@ func parseBanPrefix(raw string) (netip.Prefix, bool) {
 		return netip.PrefixFrom(u, 128), true
 	}
 	return netip.Prefix{}, false
+}
+
+func isWhitelistedCIDRs(clientAddr netip.Addr, cidrs []string) bool {
+	if !clientAddr.IsValid() || len(cidrs) == 0 {
+		return false
+	}
+	u := clientAddr.Unmap()
+	for _, raw := range cidrs {
+		if pfx, ok := parseBanPrefix(raw); ok && pfx.Contains(u) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsWhitelisted reports whether clientAddr matches security.risk_whitelist_cidrs.
+func (w *WAFEngine) IsWhitelisted(clientAddr netip.Addr) bool {
+	if w == nil || w.settingsMgr == nil || !clientAddr.IsValid() {
+		return false
+	}
+	return isWhitelistedCIDRs(clientAddr, w.settingsMgr.Snapshot().Security.RiskWhitelistCIDRs)
 }
 
 // IsBanned checks if clientAddr is covered by any active manual or automatic IP/CIDR ban.
@@ -403,11 +440,22 @@ func (w *WAFEngine) AddManualBan(ctx context.Context, cidrOrIP string, note stri
 		UpdatedAt:   now,
 	}
 	if w.store != nil {
+		var prev domain.SecurityIPBan
+		if err := sqlx.GetInto(ctx, w.store, &prev, `SELECT * FROM security_ip_bans WHERE cidr = ?`, rec.CIDR); err == nil && prev.ID != "" {
+			rec.ID = prev.ID
+			rec.CreatedAt = prev.CreatedAt
+			if prev.Occurrences >= 1 {
+				rec.Occurrences = prev.Occurrences + 1
+			}
+			if rec.Note == "" && prev.Note != "" {
+				rec.Note = prev.Note
+			}
+		}
 		upsert := w.store.Dialect().UpsertSQL(
 			"security_ip_bans",
 			[]string{"id", "cidr", "source", "reason_code", "reason", "note", "occurrences", "expires_at", "created_at", "updated_at"},
 			[]string{"cidr"},
-			[]string{"source", "reason_code", "reason", "note", "expires_at", "updated_at"},
+			[]string{"source", "reason_code", "reason", "note", "occurrences", "expires_at", "updated_at"},
 		)
 		if _, err := w.store.ExecContext(ctx, upsert,
 			rec.ID, rec.CIDR, rec.Source, rec.ReasonCode, rec.Reason, rec.Note, rec.Occurrences, rec.ExpiresAt, rec.CreatedAt, rec.UpdatedAt,
@@ -417,6 +465,8 @@ func (w *WAFEngine) AddManualBan(ctx context.Context, cidrOrIP string, note stri
 		_ = w.ReloadBans(ctx)
 	} else {
 		w.bansMu.Lock()
+		w.banCounts[pfx]++
+		rec.Occurrences = w.banCounts[pfx]
 		w.upsertBanLocked(pfx, rec.ExpiresAt, rec.ReasonCode, now)
 		w.bansMu.Unlock()
 	}
@@ -468,6 +518,9 @@ func (w *WAFEngine) recordStrikeInternal(ctx context.Context, clientAddr netip.A
 	if !secSnap.RiskControlEnabled {
 		return false
 	}
+	if clientAddr.IsValid() && isWhitelistedCIDRs(clientAddr, secSnap.RiskWhitelistCIDRs) {
+		return false
+	}
 
 	canBan := clientAddr.IsValid() && !clientAddr.IsLoopback() && !skipBan
 	if !canBan && !is404Probe {
@@ -479,13 +532,22 @@ func (w *WAFEngine) recordStrikeInternal(ctx context.Context, clientAddr netip.A
 		bucketKey = "local"
 	}
 	now := time.Now()
+	riskWinSec := secSnap.RiskWindowSeconds
+	if riskWinSec <= 0 {
+		riskWinSec = 600
+	}
+	riskWin := time.Duration(riskWinSec) * time.Second
+	threshold := secSnap.RiskStrikeThreshold
+	if threshold <= 0 {
+		threshold = 5
+	}
 
 	w.rateMu.Lock()
 	sb, exists := w.strikes[bucketKey]
-	if !exists || now.Sub(sb.windowStart) > 10*time.Minute {
+	if !exists || now.Sub(sb.windowStart) > riskWin {
 		if !exists && len(w.strikes) >= maxWAFStrikes {
 			for k, v := range w.strikes {
-				if now.Sub(v.windowStart) > 10*time.Minute {
+				if now.Sub(v.windowStart) > riskWin {
 					delete(w.strikes, k)
 				}
 			}
@@ -504,11 +566,8 @@ func (w *WAFEngine) recordStrikeInternal(ctx context.Context, clientAddr netip.A
 	curScore := sb.score
 	curOcc := sb.occurrences
 
-	const threshold = 5
 	shouldBan := canBan && curScore >= threshold
-	if shouldBan {
-		sb.score = 0
-	} else if !canBan && curScore >= threshold {
+	if shouldBan || (!canBan && curScore >= threshold) {
 		sb.score = 0
 	}
 	w.rateMu.Unlock()
@@ -538,34 +597,89 @@ func (w *WAFEngine) recordStrikeInternal(ctx context.Context, clientAddr netip.A
 		return false
 	}
 
-	// Escalating ban ladder: 1st ban = 15m, 2nd = 1h, 3rd+ = 24h
-	occ := curOcc
-	const baseMins = 15
-	dur := time.Duration(baseMins) * time.Minute
-	if occ >= threshold*3 {
-		dur = 24 * time.Hour
-	} else if occ >= threshold*2 {
-		dur = time.Duration(baseMins*4) * time.Minute
-	}
-	nowMS := now.UnixMilli()
-	expiresAt := now.Add(dur).UnixMilli()
-
 	pfx, ok := parseBanPrefix(bucketKey)
 	if !ok {
 		return false
 	}
+	nowMS := now.UnixMilli()
+
+	var prev domain.SecurityIPBan
+	hasPrev := false
+	if w.store != nil {
+		if err := sqlx.GetInto(ctx, w.store, &prev, `SELECT * FROM security_ip_bans WHERE cidr = ?`, pfx.String()); err == nil && prev.ID != "" {
+			hasPrev = true
+		}
+	}
+
+	var banCount int
+	if hasPrev {
+		banCount = prev.Occurrences + 1
+	} else {
+		w.bansMu.RLock()
+		banCount = w.banCounts[pfx] + 1
+		w.bansMu.RUnlock()
+	}
+	if banCount < 1 {
+		banCount = 1
+	}
+
+	tier1Min := secSnap.RiskTier1Minutes
+	if tier1Min <= 0 {
+		tier1Min = 15
+	}
+	tier2Min := secSnap.RiskTier2Minutes
+	if tier2Min <= 0 {
+		tier2Min = 60
+	}
+	tier3Min := secSnap.RiskTier3Minutes
+	if secSnap.RiskTier1Minutes <= 0 && tier3Min <= 0 {
+		tier3Min = 1440
+	}
+
+	var expiresAt int64
+	switch {
+	case banCount >= 3:
+		if tier3Min <= 0 {
+			expiresAt = 0 // permanent ban
+		} else {
+			expiresAt = now.Add(time.Duration(tier3Min) * time.Minute).UnixMilli()
+		}
+	case banCount == 2:
+		expiresAt = now.Add(time.Duration(tier2Min) * time.Minute).UnixMilli()
+	default:
+		expiresAt = now.Add(time.Duration(tier1Min) * time.Minute).UnixMilli()
+	}
+
 	rec := domain.SecurityIPBan{
 		ID:          id.Next(),
 		CIDR:        pfx.String(),
 		Source:      "auto",
 		ReasonCode:  reasonCode,
 		Reason:      fmt.Sprintf("Automated defense triggered (%s)", reasonCode),
-		Occurrences: occ,
+		Occurrences: banCount,
 		ExpiresAt:   expiresAt,
 		CreatedAt:   nowMS,
 		UpdatedAt:   nowMS,
 	}
+	if hasPrev {
+		rec.ID = prev.ID
+		rec.CreatedAt = prev.CreatedAt
+		rec.Note = prev.Note
+		// Never overwrite metadata or downgrade an active manual or permanent ban.
+		if prev.ExpiresAt == 0 || (prev.Source == "manual" && prev.ExpiresAt > nowMS) {
+			rec.Source = prev.Source
+			rec.ReasonCode = prev.ReasonCode
+			rec.Reason = prev.Reason
+		}
+		if prev.ExpiresAt == 0 || rec.ExpiresAt == 0 {
+			rec.ExpiresAt = 0
+		} else if prev.ExpiresAt > rec.ExpiresAt {
+			rec.ExpiresAt = prev.ExpiresAt
+		}
+	}
+
 	w.bansMu.Lock()
+	w.banCounts[pfx] = rec.Occurrences
 	w.upsertBanLocked(pfx, rec.ExpiresAt, rec.ReasonCode, nowMS)
 	w.bansMu.Unlock()
 
@@ -575,25 +689,25 @@ func (w *WAFEngine) recordStrikeInternal(ctx context.Context, clientAddr netip.A
 			upsert = `INSERT INTO security_ip_bans (id, cidr, source, reason_code, reason, note, occurrences, expires_at, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
-  source = IF(expires_at = 0 OR source = 'manual', source, VALUES(source)),
-  reason_code = IF(expires_at = 0 OR source = 'manual', reason_code, VALUES(reason_code)),
-  reason = IF(expires_at = 0 OR source = 'manual', reason, VALUES(reason)),
+  source = IF(expires_at = 0 OR (source = 'manual' AND expires_at > VALUES(updated_at)), source, VALUES(source)),
+  reason_code = IF(expires_at = 0 OR (source = 'manual' AND expires_at > VALUES(updated_at)), reason_code, VALUES(reason_code)),
+  reason = IF(expires_at = 0 OR (source = 'manual' AND expires_at > VALUES(updated_at)), reason, VALUES(reason)),
   occurrences = GREATEST(occurrences + 1, VALUES(occurrences)),
-  expires_at = IF(expires_at = 0, 0, GREATEST(expires_at, VALUES(expires_at))),
+  expires_at = IF(expires_at = 0 OR VALUES(expires_at) = 0, 0, GREATEST(expires_at, VALUES(expires_at))),
   updated_at = VALUES(updated_at)`
 		} else {
 			upsert = `INSERT INTO security_ip_bans (id, cidr, source, reason_code, reason, note, occurrences, expires_at, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (cidr) DO UPDATE SET
-  source = CASE WHEN security_ip_bans.expires_at = 0 OR security_ip_bans.source = 'manual' THEN security_ip_bans.source ELSE EXCLUDED.source END,
-  reason_code = CASE WHEN security_ip_bans.expires_at = 0 OR security_ip_bans.source = 'manual' THEN security_ip_bans.reason_code ELSE EXCLUDED.reason_code END,
-  reason = CASE WHEN security_ip_bans.expires_at = 0 OR security_ip_bans.source = 'manual' THEN security_ip_bans.reason ELSE EXCLUDED.reason END,
+  source = CASE WHEN security_ip_bans.expires_at = 0 OR (security_ip_bans.source = 'manual' AND security_ip_bans.expires_at > EXCLUDED.updated_at) THEN security_ip_bans.source ELSE EXCLUDED.source END,
+  reason_code = CASE WHEN security_ip_bans.expires_at = 0 OR (security_ip_bans.source = 'manual' AND security_ip_bans.expires_at > EXCLUDED.updated_at) THEN security_ip_bans.reason_code ELSE EXCLUDED.reason_code END,
+  reason = CASE WHEN security_ip_bans.expires_at = 0 OR (security_ip_bans.source = 'manual' AND security_ip_bans.expires_at > EXCLUDED.updated_at) THEN security_ip_bans.reason ELSE EXCLUDED.reason END,
   occurrences = CASE WHEN security_ip_bans.occurrences >= EXCLUDED.occurrences THEN security_ip_bans.occurrences + 1 ELSE EXCLUDED.occurrences END,
-  expires_at = CASE WHEN security_ip_bans.expires_at = 0 THEN 0 WHEN security_ip_bans.expires_at > EXCLUDED.expires_at THEN security_ip_bans.expires_at ELSE EXCLUDED.expires_at END,
+  expires_at = CASE WHEN security_ip_bans.expires_at = 0 OR EXCLUDED.expires_at = 0 THEN 0 WHEN security_ip_bans.expires_at > EXCLUDED.expires_at THEN security_ip_bans.expires_at ELSE EXCLUDED.expires_at END,
   updated_at = EXCLUDED.updated_at`
 		}
 		_, _ = w.store.ExecBgContext(ctx, upsert,
-			rec.ID, rec.CIDR, rec.Source, rec.ReasonCode, rec.Reason, "", rec.Occurrences, rec.ExpiresAt, rec.CreatedAt, rec.UpdatedAt)
+			rec.ID, rec.CIDR, rec.Source, rec.ReasonCode, rec.Reason, rec.Note, rec.Occurrences, rec.ExpiresAt, rec.CreatedAt, rec.UpdatedAt)
 
 		detail := map[string]any{
 			"cidr":        rec.CIDR,
@@ -796,7 +910,7 @@ func (w *WAFEngine) WrapHTTP(next http.Handler) http.Handler {
 		if w.settingsMgr != nil && clientIP.IsValid() && !clientIP.IsLoopback() &&
 			!isStaticWAFExemptionPath(reqPath) && !strings.HasPrefix(reqPath, "/api/admin/") {
 			sec := w.settingsMgr.Snapshot().Security
-			if sec.WAFEnabled && sec.WAFMaxRequests > 0 {
+			if sec.WAFEnabled && sec.WAFMaxRequests > 0 && !isWhitelistedCIDRs(clientIP, sec.RiskWhitelistCIDRs) {
 				winSec := sec.WAFWindowSeconds
 				if winSec <= 0 {
 					winSec = 180

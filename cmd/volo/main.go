@@ -397,10 +397,17 @@ func closeGeoEngineFromDeps(deps server.AppDeps) {
 	}
 }
 
-func pruneExpiredMaintenance(ctx context.Context, store *sqlx.Store, pluginMgr *plugin.Manager) {
+func pruneExpiredMaintenance(ctx context.Context, store *sqlx.Store, pluginMgr *plugin.Manager, settingsMgr *repo.SettingsManager) {
+	sec := domain.DefaultSettingsSnapshot("zh-CN").Security
+	if settingsMgr != nil {
+		sec = settingsMgr.Snapshot().Security
+	}
 	if pluginMgr != nil {
 		if _, err := pluginMgr.PurgeExpiredKV(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Warn("plugin_kv purge failed", "component", "maintenance", "err", err)
+		}
+		if sec.PluginLogRetentionDays > 0 && pluginMgr.Logger() != nil {
+			pluginMgr.Logger().PruneExpiredLogs(time.Duration(sec.PluginLogRetentionDays) * 24 * time.Hour)
 		}
 	}
 	if store != nil {
@@ -408,8 +415,17 @@ func pruneExpiredMaintenance(ctx context.Context, store *sqlx.Store, pluginMgr *
 		if _, err := store.ExecContext(ctx, `DELETE FROM user_sessions WHERE expires_at <= ?`, nowMs); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Warn("expired user_sessions purge failed", "component", "maintenance", "err", err)
 		}
-		if _, err := store.ExecContext(ctx, `DELETE FROM security_ip_bans WHERE expires_at > 0 AND expires_at <= ?`, nowMs); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Warn("expired security_ip_bans purge failed", "component", "maintenance", "err", err)
+		if sec.IPBanRetentionDays > 0 {
+			banCutoff := nowMs - int64(sec.IPBanRetentionDays)*24*3600*1000
+			if _, err := store.ExecContext(ctx, `DELETE FROM security_ip_bans WHERE expires_at > 0 AND expires_at <= ?`, banCutoff); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Warn("expired security_ip_bans purge failed", "component", "maintenance", "err", err)
+			}
+		}
+		if sec.AuditLogRetentionDays > 0 {
+			auditCutoff := nowMs - int64(sec.AuditLogRetentionDays)*24*3600*1000
+			if _, err := store.ExecContext(ctx, `DELETE FROM audit_logs WHERE created_at <= ?`, auditCutoff); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Warn("expired audit_logs purge failed", "component", "maintenance", "err", err)
+			}
 		}
 	}
 }
@@ -624,11 +640,11 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		}
 	}()
 
-	// Hourly background maintenance ticker (plugin_kv TTL purge + expired user_sessions / security_ip_bans cleanup)
+	// Hourly background maintenance ticker (plugin_kv TTL purge + retention-based cleanup)
 	bgWG.Add(1)
 	go func() {
 		defer bgWG.Done()
-		pruneExpiredMaintenance(bgCtx, store, pluginMgr)
+		pruneExpiredMaintenance(bgCtx, store, pluginMgr, settingsMgr)
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
@@ -636,7 +652,7 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 			case <-bgCtx.Done():
 				return
 			case <-ticker.C:
-				pruneExpiredMaintenance(bgCtx, store, pluginMgr)
+				pruneExpiredMaintenance(bgCtx, store, pluginMgr, settingsMgr)
 			}
 		}
 	}()

@@ -440,6 +440,7 @@ function SortableFreeItemsField({
           onInput={(e) => setFreeItemDraft((e.currentTarget as HTMLInputElement).value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
+              if (e.isComposing || e.keyCode === 229) return;
               e.preventDefault();
               addFree();
             }
@@ -2462,9 +2463,41 @@ export function AppearanceWorkspace({
         title={t("app.logs_title", { id: logsModal?.id || "" })}
         maxWidth="680px"
         footer={
-          <button type="button" class="volo-btn" onClick={() => setLogsModalOpen(false)}>
-            {t("common.close")}
-          </button>
+          <>
+            {logsModal?.id && (
+              <button
+                type="button"
+                class="volo-btn volo-btn-danger"
+                disabled={!logsModal.logs?.length}
+                onClick={async () => {
+                  if (!logsModal?.id) return;
+                  if (
+                    !(await openConfirm({
+                      message: t("app.logs_clear_confirm", { id: logsModal.id }),
+                      danger: true,
+                    }))
+                  ) {
+                    return;
+                  }
+                  try {
+                    await apiFetch(`/api/admin/plugins/${encodeURIComponent(logsModal.id)}/logs`, {
+                      method: "DELETE",
+                    });
+                    setLogsModal((prev) => (prev ? { ...prev, logs: [] } : prev));
+                    setLogPage(1);
+                    showToast(t("app.logs_cleared"), "ok");
+                  } catch (err: any) {
+                    showToast(err.message, "err");
+                  }
+                }}
+              >
+                {t("app.logs_clear_btn")}
+              </button>
+            )}
+            <button type="button" class="volo-btn" onClick={() => setLogsModalOpen(false)}>
+              {t("common.close")}
+            </button>
+          </>
         }
       >
         <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px" }}>

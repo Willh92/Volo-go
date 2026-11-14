@@ -426,3 +426,71 @@ func TestCLIHealthcheckReadOnlyCWDAndUnixSocketAlias(t *testing.T) {
 		t.Fatalf("healthcheck via env unexpectedly created ./data in CWD: err=%v", err)
 	}
 }
+
+func TestPruneExpiredMaintenanceRetentionPolicies(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cfg, err := config.Load(config.CLIOverrides{
+		DataDir: strPtr(filepath.Join(tmp, "data")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := openMigratedStore(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	settingsMgr := repo.NewSettingsManager(store, cfg.KeyRing, "zh-CN")
+	nowMS := time.Now().UnixMilli()
+	dayMS := int64(24 * 3600 * 1000)
+
+	// Seed 2 expired bans: one expired 2 hours ago, one expired 45 days ago
+	if _, err := store.ExecContext(ctx, `INSERT INTO security_ip_bans (id, cidr, source, reason_code, reason, note, occurrences, expires_at, created_at, updated_at) VALUES
+		('b_recent_exp', '203.0.113.1/32', 'auto_risk', 'scanner_trap', 'scanner_trap', '', 1, ?, ?, ?),
+		('b_old_exp', '203.0.113.2/32', 'auto_risk', 'scanner_trap', 'scanner_trap', '', 2, ?, ?, ?)`,
+		nowMS-2*3600*1000, nowMS-3*3600*1000, nowMS-2*3600*1000,
+		nowMS-45*dayMS, nowMS-46*dayMS, nowMS-45*dayMS); err != nil {
+		t.Fatal(err)
+	}
+	// Seed 2 audit logs: one 5 days old, one 120 days old
+	if _, err := store.ExecContext(ctx, `INSERT INTO audit_logs (id, actor_id, actor_name, action, resource_type, resource_id, client_ip, detail_json, created_at) VALUES
+		('al_recent', 'u1', 'admin', 'login', 'session', 's1', '127.0.0.1', '{}', ?),
+		('al_old', 'u1', 'admin', 'login', 'session', 's2', '127.0.0.1', '{}', ?)`,
+		nowMS-5*dayMS, nowMS-120*dayMS); err != nil {
+		t.Fatal(err)
+	}
+
+	// Case 1: retention = 0 (keep forever) -> nothing pruned!
+	if _, _, err := settingsMgr.PatchDomain(ctx, "security", []byte(`{"ip_ban_retention_days":0,"audit_log_retention_days":0}`), 0); err != nil {
+		t.Fatal(err)
+	}
+	pruneExpiredMaintenance(ctx, store, nil, settingsMgr)
+	var banCnt, audCnt int
+	if err := store.QueryRowContext(ctx, `SELECT COUNT(*) FROM security_ip_bans`).Scan(&banCnt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_logs`).Scan(&audCnt); err != nil {
+		t.Fatal(err)
+	}
+	if banCnt != 2 || audCnt != 2 {
+		t.Fatalf("expected retention=0 to preserve all records, got bans=%d audits=%d", banCnt, audCnt)
+	}
+
+	// Case 2: default retention (30d bans, 90d audit logs) -> keeps recently expired ban & recent audit log, prunes 45d ban & 120d audit log!
+	if _, _, err := settingsMgr.PatchDomain(ctx, "security", []byte(`{"ip_ban_retention_days":30,"audit_log_retention_days":90}`), 1); err != nil {
+		t.Fatal(err)
+	}
+	pruneExpiredMaintenance(ctx, store, nil, settingsMgr)
+	var remBanID, remAudID string
+	if err := store.QueryRowContext(ctx, `SELECT id FROM security_ip_bans`).Scan(&remBanID); err != nil || remBanID != "b_recent_exp" {
+		t.Fatalf("expected only b_recent_exp to survive 30d retention, got id=%q err=%v", remBanID, err)
+	}
+	if err := store.QueryRowContext(ctx, `SELECT id FROM audit_logs`).Scan(&remAudID); err != nil || remAudID != "al_recent" {
+		t.Fatalf("expected only al_recent to survive 90d retention, got id=%q err=%v", remAudID, err)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+

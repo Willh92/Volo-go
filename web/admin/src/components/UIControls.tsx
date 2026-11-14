@@ -1585,6 +1585,13 @@ export function AnimatedModal({
       };
     } else if (rendered) {
       notifyClosePopovers(0, true);
+      if (
+        typeof window !== "undefined" &&
+        window.matchMedia?.("(hover: none), (pointer: coarse)").matches &&
+        document.activeElement instanceof HTMLElement
+      ) {
+        document.activeElement.blur();
+      }
       isOpenRef.current = false;
       setEntered(false);
       setClosing(true);
@@ -2498,6 +2505,7 @@ export function TokenListInput({
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
+                if (e.isComposing || e.keyCode === 229) return;
                 if (draft.trim()) {
                   e.preventDefault();
                   commitTokens(draft);

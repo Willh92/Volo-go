@@ -2971,6 +2971,8 @@ export function OverviewWorkspace({
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
+                  if (e.isComposing || e.keyCode === 229) return;
+                  e.preventDefault();
                   setArtPage(1);
                   void loadArticlesPage({ page: 1, q: query });
                 }

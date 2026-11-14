@@ -205,9 +205,11 @@ Successful `201 Created` response returning both the full `asset` record and a t
 }
 ```
 
-### 2.4 Account Ban/Mute Governance, Batch Reordering & Plugin Chain Endpoints
+### 2.4 Account & IP Ban Governance, Log Retention, Batch Reordering & Plugin Chain Endpoints
 
 - **`GET /api/admin/users`** & **`PATCH /api/admin/users`** (requires interactive admin session): Discourse-style account moderation supporting `action: "ban" | "unban" | "mute" | "unmute" | "shield"`, `duration_hours` (`0` = indefinite, `> 0` = timed auto-expiry), `reason`, `shield_comments` (`boolean`), and `shield_text` (non-destructively masking historical comments until unbanned/unmuted or expired).
+- **`GET / POST /api/admin/security/ip-bans`**, **`PATCH / DELETE /api/admin/security/ip-bans/{id}`**, **`POST /api/admin/security/ip-bans/{id}/unban`**, **`POST /api/admin/security/ip-bans/batch`**, & **`POST /api/admin/security/ip-bans/purge-expired`** (requires interactive admin session): Full IP/CIDR ban lifecycle returning `counts` (`active`, `expired`, `all`), `source` (`manual` / `auto_waf`), cumulative `occurrences`, and offline GeoIP `location`. Single/batch `unban` early-expires bans while preserving historical records; `PATCH` and batch `set_duration` update `expires_minutes` (`0` = permanent, `> 0` = minutes from now) or `note` (and re-ban expired entries); `DELETE`, batch `delete`, and `purge-expired` physically remove rows. Comment moderation (`POST /api/admin/comments/{id}/ban-ip` and `POST /api/admin/comments/batch` with `action: "ban_ip"`) accepts matching `expires_minutes`.
+- **`DELETE /api/admin/audit-logs`** & **`DELETE /api/admin/plugins/{id}/logs`** (requires interactive admin session): One-click physical clear for admin audit logs and per-plugin runtime logs (alongside automatic scheduled cleanup controlled by `security.ip_ban_retention_days`, `security.audit_log_retention_days`, and `security.plugin_log_retention_days`, where `0` = retain indefinitely).
 - **`POST /api/admin/categories/reorder`** & **`POST /api/admin/books/reorder`**: Atomically update `sort_order` in a single transaction.
 - **`POST /api/admin/plugins/reorder`** & **`PATCH /api/admin/plugins/{id}/priority`** (requires interactive admin session): Reorder the plugin execution chain or set an exact numeric `priority` (`-1000`–`10000`).
 - **`GET /api/admin/plugins/cron`**, **`POST /api/admin/plugins/{id}/trigger-cron`**, and **`GET /api/admin/plugins/{id}/export`**.

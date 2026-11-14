@@ -247,6 +247,10 @@ export function applyThemeAttributes(mode: string, accent: string, persistMode =
     document.documentElement.setAttribute("data-mode", cleanMode);
     document.documentElement.setAttribute("data-accent", cleanAccent);
     document.documentElement.setAttribute("data-theme", effective);
+    const schemeMeta = document.querySelector<HTMLMetaElement>('meta[name="color-scheme"]');
+    if (schemeMeta) {
+      schemeMeta.content = cleanMode === "system" ? "light dark" : effective;
+    }
   }
 }
 
