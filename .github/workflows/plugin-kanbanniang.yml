@@ -69,6 +69,10 @@ jobs:
             echo "Proceeding to package and publish ${TAG} (${ASSET})..."
           fi
 
+      - name: Reset sparse-checkout workspace (When Packaging New Version)
+        if: steps.check.outputs.should_package == 'true'
+        run: find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
       - name: Checkout full repository (When Packaging New Version)
         if: steps.check.outputs.should_package == 'true'
         uses: actions/checkout@v7

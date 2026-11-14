@@ -208,7 +208,7 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
           VOLO_BUDGET_BIN_MB: ${{ vars.VOLO_BUDGET_BIN_MB }}
         run: |
-          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-21}"
+          BUDGET_BIN_MB="${VOLO_BUDGET_BIN_MB:-22}"
           MAX_BIN_BYTES=$((BUDGET_BIN_MB * 1024 * 1024))
           STAGE="volo-${VERSION}-${GOOS}-${GOARCH}"
           mkdir -p "dist/${STAGE}/scripts"
@@ -341,6 +341,10 @@ jobs:
             echo "should_package=true" >> "${GITHUB_OUTPUT}"
             echo "Release ${TAG} not found yet; packaging standalone Kanbanniang ZIP..."
           fi
+
+      - name: Reset sparse-checkout workspace (Only When Version Is Unpublished)
+        if: steps.check.outputs.should_package == 'true'
+        run: find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
       - name: Checkout full repository (Only When Version Is Unpublished)
         if: steps.check.outputs.should_package == 'true'

@@ -145,6 +145,44 @@ def resolve_zip_date_time(epoch_str: str | None) -> tuple[int, int, int, int, in
     return (ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second)
 
 
+def verify_full_plugin_tree(
+    plugin_dir: pathlib.Path, plugin_id: str, manifest: dict
+) -> None:
+    entry_rel = str(manifest.get("entry") or "main.js").strip()
+    if not (plugin_dir / entry_rel).is_file():
+        raise FileNotFoundError(
+            f"Incomplete checkout for {plugin_id!r}: missing entry {entry_rel}"
+        )
+    if plugin_id == "kanbanniang":
+        required_rels = [
+            "LICENSE",
+            "README.md",
+            "SOURCES.json",
+            "assets/live2d.js",
+            "assets/widget.js",
+            "assets/widget.css",
+            "assets/tips.json",
+            "assets/model-list.json",
+        ]
+        for rel in required_rels:
+            if not (plugin_dir / rel).is_file():
+                raise FileNotFoundError(
+                    f"Incomplete kanbanniang tree (sparse-checkout still active?): missing {rel}"
+                )
+        model_list = json.loads(
+            (plugin_dir / "assets" / "model-list.json").read_text(encoding="utf-8")
+        )
+        models = (
+            model_list
+            if isinstance(model_list, list)
+            else (model_list.get("models") or [])
+        )
+        if len(models) < 20:
+            raise ValueError(
+                f"Expected >= 20 model entries in model-list.json, got {len(models)}"
+            )
+
+
 def build_plugin_zip(
     plugin_dir: pathlib.Path,
     plugin_id: str,
@@ -287,6 +325,7 @@ def main() -> int:
     notes_md = out_dir / "plugin-release-notes.md"
     sums_txt = out_dir / "SHA256SUMS.txt"
 
+    verify_full_plugin_tree(meta["plugin_dir"], meta["id"], meta["manifest"])
     file_count, raw_bytes = build_plugin_zip(
         meta["plugin_dir"], meta["id"], versioned_zip, zip_dt
     )
