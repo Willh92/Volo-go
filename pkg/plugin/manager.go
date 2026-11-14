@@ -3546,8 +3546,8 @@ func coerceAPIResponse(raw any) APIResponse {
 }
 
 const (
-	maxPluginAssetGzipCacheTotalBytes = 4 << 20   // 4 MiB total compressed asset cache across all plugins
-	maxPluginAssetGzipCacheRawSize    = 512 << 10 // 512 KiB max uncompressed asset eligible for RAM cache
+	maxPluginAssetGzipCacheTotalBytes = 8 << 20 // 8 MiB total compressed asset cache across all plugins
+	maxPluginAssetGzipCacheRawSize    = 2 << 20 // 2 MiB max uncompressed asset eligible for RAM cache (covers all 26 Live2D .moc binaries)
 )
 
 type pluginAssetGzipEntry struct {

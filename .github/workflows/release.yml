@@ -43,6 +43,14 @@ jobs:
           rm -rf ../../internal/adminui/dist && mkdir -p ../../internal/adminui/dist
           npm run build
 
+      - name: Minify Bundled Plugins for Release Archives
+        run: |
+          rm -rf dist-minified-plugins && mkdir -p dist-minified-plugins
+          node .github/scripts/minify-plugin-assets.mjs \
+            --dir plugins/sensitive-words \
+            --out-dir dist-minified-plugins/sensitive-words
+          node -e 'const fs=require("fs");fs.writeFileSync("dist-minified-plugins/catalog.json",JSON.stringify(JSON.parse(fs.readFileSync("plugins/catalog.json","utf8"))));'
+
       - name: Pack Built Embedded Assets
         run: |
           tar -cf embedded-assets.tar \
@@ -51,7 +59,8 @@ jobs:
             internal/theme/builtin/volo-studio/assets_gz \
             internal/theme/builtin/volo-studio/templates_gz \
             internal/theme/builtin/volo-studio/theme.json.gz \
-            internal/theme/builtin/volo-studio/preview.svg.gz
+            internal/theme/builtin/volo-studio/preview.svg.gz \
+            dist-minified-plugins
 
       - name: Upload Built Admin Dist
         uses: actions/upload-artifact@v7
@@ -127,7 +136,7 @@ jobs:
       - name: Extract Built Embedded Assets
         run: |
           rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
-          tar -xf embedded-assets.tar && rm -f embedded-assets.tar
+          tar -xf embedded-assets.tar && rm -rf embedded-assets.tar dist-minified-plugins
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -190,7 +199,7 @@ jobs:
 
       - name: Extract Built Embedded Assets
         run: |
-          rm -rf internal/adminui/dist && mkdir -p internal/adminui/dist
+          rm -rf internal/adminui/dist dist-minified-plugins && mkdir -p internal/adminui/dist
           tar -xf embedded-assets.tar && rm -f embedded-assets.tar
 
       - name: Setup Go
@@ -245,6 +254,10 @@ jobs:
           # Keep main OS/arch core bundles ~8 MB slim; standalone-release plugins (kanbanniang)
           # are version-deduplicated into their own `plugin-kanbanniang-v<version>` GitHub Release.
           rm -rf "dist/${STAGE}/plugins/kanbanniang"
+          if [ -d dist-minified-plugins ]; then
+            cp -rf dist-minified-plugins/. "dist/${STAGE}/plugins/"
+            rm -rf dist-minified-plugins
+          fi
           cp -r themes "dist/${STAGE}/themes"
 
           if [ "${GOOS}" = "windows" ]; then
@@ -351,6 +364,18 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Setup Node.js 24 (Only When Version Is Unpublished)
+        if: steps.check.outputs.should_package == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/admin/package-lock.json
+
+      - name: Install Minifier Toolchain Dependencies (Only When Version Is Unpublished)
+        if: steps.check.outputs.should_package == 'true'
+        run: npm ci --prefix web/admin --no-audit --no-fund
 
       - name: Build Deterministic Kanbanniang ZIP Archive (Only When Version Is Unpublished)
         if: steps.check.outputs.should_package == 'true'

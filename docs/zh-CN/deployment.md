@@ -211,7 +211,7 @@ docker compose --profile postgres up -d
      ```bash
      mkdir -p data && sudo chown -R 65532:65532 data
      ```
-  2. **切勿挂载空的 `./themes` 或 `./plugins` 宿主机目录**至 `/app/themes` 或 `/app/plugins`，否则空目录会遮蔽镜像内预置的外部主题（如 `volo-journal`）与默认插件（如 `sensitive-words`）；如需安装大型独立发布插件（如 Live2D 看板娘 `plugin-kanbanniang-v2.0.0.zip`，详见 [官方插件目录](../../plugins/README.zh-CN.md)），可直接在管理台 **「外观与扩展 -> 插件扩展」** 上传 `.zip` 安装。
+  2. **切勿挂载空的 `./themes` 或 `./plugins` 宿主机目录**至 `/app/themes` 或 `/app/plugins`，否则空目录会遮蔽镜像内预置的外部主题（如 `volo-journal`）与默认插件（如 `sensitive-words`）；如需安装大型独立发布插件（如 Live2D 看板娘 `plugin-kanbanniang-v2.0.2.zip` / `plugin-kanbanniang.zip`，详见 [官方插件目录](../../plugins/README.zh-CN.md)），可直接在管理台 **「外观与扩展 -> 插件扩展」** 上传 `.zip` 安装。
 
 ### 5.2 三大数据库引擎 DSN 写法（固定环境变量模式）
 

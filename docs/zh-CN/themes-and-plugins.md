@@ -311,7 +311,7 @@ function renderSlot(slotName) {
 | 插件 ID | 最新版本 | 分发策略 | 核心包 / Docker 默认内置 | 核心特性说明 |
 | :--- | :---: | :--- | :---: | :--- |
 | [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled`（随主包内置） | 是 | 6.4 万级分类敏感词库 + 宿主 16B/状态 BFS-CSR Aho-Corasick 自动机，统一守护评论与昵称。 |
-| [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.0`** | `standalone-release`（[`plugin-kanbanniang-v2.0.0.zip`](https://github.com/Willh92/Volo-go/releases/tag/plugin-kanbanniang-v2.0.0)） | 否（按需安装） | 完整内置 26 套离线 Live2D 模型、Pio/Tia 150 套随机换装、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与摸头计数；全量采用无损透明/动图 `.webp` 贴图，独立包体积精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`）。 |
+| [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.2`** | `standalone-release`（[`plugin-kanbanniang-v2.0.2.zip`](https://github.com/Willh92/Volo-go/releases/tag/plugin-kanbanniang-v2.0.2)） | 否（按需安装） | 完整内置 26 套离线 Live2D 模型、Pio/Tia 150 套随机换装、`.moc`/`.webp`/动作并行预取、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与摸头计数；全量采用无损透明/动图 `.webp` 贴图与 AST 代码压缩，独立包体积精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`）。 |
 
 - **GitHub Actions 版本不变不重复打包**：由 [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) 与 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) 自动检查 `plugin-kanbanniang-v<version>` Release 是否已发布；当 `kanbanniang/manifest.json` 版本号未变时直接跳过压缩与上传，避免每次主程序发版重复构建百兆级插件归档。
 

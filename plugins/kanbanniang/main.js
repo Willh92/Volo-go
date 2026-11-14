@@ -1,4 +1,4 @@
-var PLUGIN_VERSION = "2.0.0";
+var PLUGIN_VERSION = "2.0.2";
 var MODEL_NAME_RE = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/;
 var ALLOWED_POSITIONS = { left: true, right: true };
 var RESOURCE_KEYS = {
@@ -13,7 +13,7 @@ var RESOURCE_KEYS = {
 var cachedManifestRaw = null;
 var cachedModelNames = null;
 var descriptorCache = {};
-var ASSET_VERIFY_TTL_MS = 2000;
+var ASSET_VERIFY_TTL_MS = 300000;
 var HTML_ESC_RE = /[&"<>]/;
 
 function escapeHtml(s) {
@@ -581,6 +581,16 @@ function renderSlot(slotName, slotCtx) {
       (st.hideOnMobile ? " volo-kbn-hide-mobile" : "");
 
     var toolsHtml = LOCALE_TOOLS_HTML[st.locale] || LOCALE_TOOLS_HTML["zh-CN"];
+    var initialDescAttr = "";
+    if (st.model && st.model !== "random") {
+      try {
+        var descJson = selectModelDescriptorJson(st.model, "");
+        if (descJson) {
+          initialDescAttr =
+            ' data-initial-descriptor="' + escapeHtml(descJson) + '"';
+        }
+      } catch (err) {}
+    }
 
     return (
       '<aside id="volo-kanbanniang-root" class="' +
@@ -591,7 +601,9 @@ function renderSlot(slotName, slotCtx) {
       st.position +
       '" data-model="' +
       st.model +
-      '" data-sakura="' +
+      '"' +
+      initialDescAttr +
+      ' data-sakura="' +
       (st.sakuraBackground ? "1" : "0") +
       '" data-idle-chat="' +
       (st.idleChat ? "1" : "0") +

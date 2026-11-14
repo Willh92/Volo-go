@@ -22,7 +22,9 @@ import os
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import zipfile
 
 STORED_EXTENSIONS = {
@@ -183,12 +185,93 @@ def verify_full_plugin_tree(
             )
 
 
+MINIFIABLE_EXTENSIONS = {
+    ".js",
+    ".css",
+    ".json",
+}
+
+
+def resolve_node_binary() -> str:
+    env_bin = os.environ.get("NODE_BIN", "").strip()
+    if env_bin and pathlib.Path(env_bin).is_file():
+        return env_bin
+    found = shutil.which("node")
+    if found:
+        return found
+    raise RuntimeError(
+        "Node.js is required to minify plugin JS/CSS assets (pass --no-minify to skip)"
+    )
+
+
+def minify_plugin_files(
+    repo_root: pathlib.Path,
+    plugin_dir: pathlib.Path,
+    entry_rel: str,
+    files: list[tuple[str, pathlib.Path]],
+    tmp_dir: pathlib.Path,
+) -> tuple[dict[str, pathlib.Path], int, int]:
+    minifier_script = repo_root / ".github" / "scripts" / "minify-plugin-assets.mjs"
+    admin_modules = repo_root / "web" / "admin" / "node_modules"
+    if not minifier_script.is_file():
+        raise FileNotFoundError(f"Missing plugin minifier script: {minifier_script}")
+    if not admin_modules.is_dir():
+        raise FileNotFoundError(
+            f"Missing {admin_modules} (run `npm ci --prefix web/admin` first or pass --no-minify)"
+        )
+
+    batch_items = []
+    overrides: dict[str, pathlib.Path] = {}
+    for idx, (arcname, src_path) in enumerate(files):
+        if src_path.suffix.lower() not in MINIFIABLE_EXTENSIONS:
+            continue
+        rel = src_path.relative_to(plugin_dir).as_posix()
+        out_path = tmp_dir / "out" / f"{idx}_{src_path.name}"
+        batch_items.append(
+            {
+                "rel": rel,
+                "src": str(src_path),
+                "out": str(out_path),
+            }
+        )
+        overrides[arcname] = out_path
+
+    if not batch_items:
+        return overrides, 0, 0
+
+    batch_json = tmp_dir / "batch.json"
+    batch_json.write_text(
+        json.dumps({"entry": entry_rel, "files": batch_items}),
+        encoding="utf-8",
+    )
+
+    node_bin = resolve_node_binary()
+    proc = subprocess.run(
+        [node_bin, str(minifier_script), "--batch", str(batch_json)],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err_detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            f"Plugin asset minification failed (exit {proc.returncode}): {err_detail}"
+        )
+
+    summary = json.loads(proc.stdout.strip().splitlines()[-1])
+    return overrides, int(summary.get("rawBytes", 0)), int(summary.get("minBytes", 0))
+
+
 def build_plugin_zip(
+    repo_root: pathlib.Path,
     plugin_dir: pathlib.Path,
     plugin_id: str,
+    manifest: dict,
     out_zip: pathlib.Path,
     zip_dt: tuple[int, int, int, int, int, int],
-) -> tuple[int, int]:
+    minify: bool = True,
+) -> tuple[int, int, int, int]:
     files: list[tuple[str, pathlib.Path]] = []
     for p in plugin_dir.rglob("*"):
         if p.is_symlink():
@@ -205,28 +288,41 @@ def build_plugin_zip(
     if out_zip.exists():
         out_zip.unlink()
 
+    entry_rel = str(manifest.get("entry") or "main.js").strip()
     raw_total = 0
-    with zipfile.ZipFile(
-        out_zip, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-    ) as zf:
-        for arcname, src_path in files:
-            st = src_path.stat()
-            ext = src_path.suffix.lower()
-            compress_type = (
-                zipfile.ZIP_STORED
-                if ext in STORED_EXTENSIONS
-                else zipfile.ZIP_DEFLATED
-            )
-            info = zipfile.ZipInfo(filename=arcname, date_time=zip_dt)
-            info.compress_type = compress_type
-            info.file_size = st.st_size
-            info.create_system = 3  # Unix permissions for consistent Go zip.Mode()
-            info.external_attr = 0o100644 << 16
-            raw_total += st.st_size
-            with src_path.open("rb") as sf, zf.open(info, mode="w") as zf_out:
-                shutil.copyfileobj(sf, zf_out, 256 * 1024)
+    text_raw_bytes = 0
+    text_min_bytes = 0
 
-    return len(files), raw_total
+    with tempfile.TemporaryDirectory(prefix="volo-plugin-min-") as tmp_raw:
+        tmp_dir = pathlib.Path(tmp_raw)
+        overrides: dict[str, pathlib.Path] = {}
+        if minify:
+            overrides, text_raw_bytes, text_min_bytes = minify_plugin_files(
+                repo_root, plugin_dir, entry_rel, files, tmp_dir
+            )
+
+        with zipfile.ZipFile(
+            out_zip, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as zf:
+            for arcname, src_path in files:
+                payload_path = overrides.get(arcname, src_path)
+                st = payload_path.stat()
+                ext = src_path.suffix.lower()
+                compress_type = (
+                    zipfile.ZIP_STORED
+                    if ext in STORED_EXTENSIONS
+                    else zipfile.ZIP_DEFLATED
+                )
+                info = zipfile.ZipInfo(filename=arcname, date_time=zip_dt)
+                info.compress_type = compress_type
+                info.file_size = st.st_size
+                info.create_system = 3  # Unix permissions for consistent Go zip.Mode()
+                info.external_attr = 0o100644 << 16
+                raw_total += st.st_size
+                with payload_path.open("rb") as sf, zf.open(info, mode="w") as zf_out:
+                    shutil.copyfileobj(sf, zf_out, 256 * 1024)
+
+    return len(files), raw_total, text_raw_bytes, text_min_bytes
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -302,6 +398,11 @@ def main() -> int:
         default="",
         help="GitHub repository slug (owner/name) for release notes",
     )
+    parser.add_argument(
+        "--no-minify",
+        action="store_true",
+        help="Skip AST minification of plugin .js, .css, and .json assets",
+    )
     args = parser.parse_args()
 
     repo_root = pathlib.Path(args.repo_root).resolve()
@@ -326,8 +427,14 @@ def main() -> int:
     sums_txt = out_dir / "SHA256SUMS.txt"
 
     verify_full_plugin_tree(meta["plugin_dir"], meta["id"], meta["manifest"])
-    file_count, raw_bytes = build_plugin_zip(
-        meta["plugin_dir"], meta["id"], versioned_zip, zip_dt
+    file_count, raw_bytes, text_raw, text_min = build_plugin_zip(
+        repo_root,
+        meta["plugin_dir"],
+        meta["id"],
+        meta["manifest"],
+        versioned_zip,
+        zip_dt,
+        minify=not args.no_minify,
     )
     shutil.copyfile(versioned_zip, alias_zip)
 
@@ -339,9 +446,14 @@ def main() -> int:
     write_release_notes(meta, notes_md, args.repo)
 
     zip_bytes = versioned_zip.stat().st_size
+    min_info = (
+        f", text_minified={text_raw}B->{text_min}B"
+        if not args.no_minify and text_raw > 0
+        else ""
+    )
     print(
-        f"Packaged {versioned_zip.name}: {file_count} files, "
-        f"raw={raw_bytes} bytes -> zip={zip_bytes} bytes ({zip_bytes / (1024 * 1024):.2f} MiB), "
+        f"Packaged {versioned_zip.name}: {file_count} files{min_info}, "
+        f"payload={raw_bytes} bytes -> zip={zip_bytes} bytes ({zip_bytes / (1024 * 1024):.2f} MiB), "
         f"sha256={digest}"
     )
     return 0

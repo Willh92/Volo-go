@@ -22,7 +22,7 @@
 | [反向代理与 CDN 配置指南 (`docs/zh-CN/reverse-proxy.md`)](./docs/zh-CN/reverse-proxy.md) | TCP vs Unix Socket (`--unix-socket` / `--socket-mode` / `--socket-group`)、`VOLO_TRUSTED_PROXIES` 防伪造模型、Nginx / Caddy / Traefik / Apache / Cloudflare 完整配置 |
 | [CLI 瑞士军刀与开放 API (`docs/zh-CN/cli-and-api.md`)](./docs/zh-CN/cli-and-api.md) | `volo` 全子命令、细粒度 `volo_pat_*` API Token、实时图片裁剪参数（`?imageView2` & KV）、账户封禁/禁言接口、分页搜索与管理端/公开端 REST 接口 |
 | [主题定制与插件开发 (`docs/zh-CN/themes-and-plugins.md`)](./docs/zh-CN/themes-and-plugins.md) | `theme.json`、增强型全屏评论 Markdown 编辑器、纯 Go ES6 插件沙箱（5 阶段生命周期、`before_*` 链式拦截、`volo.kv.incrAsync`、`CronRegistry`、`wordFilter`）与 256 MiB 流式 ZIP 热插拔/导出 |
-| [官方插件目录 (`plugins/README.zh-CN.md`)](./plugins/README.zh-CN.md) | 官方插件最新版本清单（[`plugins/catalog.json`](./plugins/catalog.json)：`sensitive-words v1.1.0` 内置、`kanbanniang v2.0.0` 26 模型离线 Live2D 独立包）与 GitHub Actions 版本去重发布机制 |
+| [官方插件目录 (`plugins/README.zh-CN.md`)](./plugins/README.zh-CN.md) | 官方插件最新版本清单（[`plugins/catalog.json`](./plugins/catalog.json)：`sensitive-words v1.1.0` 内置、`kanbanniang v2.0.2` 26 模型离线 Live2D 独立包）与 GitHub Actions 版本去重发布机制 |
 | [旧版主题皮肤迁移指南 (`docs/zh-CN/theme-migration.md`)](./docs/zh-CN/theme-migration.md) | 独立整页 HTML / 布局继承双模式、`PageContext` 全量数据模型、`config_schema` 自定义配置与模板函数速查 |
 | [多语言包扩展指南 (`docs/zh-CN/locale-extension.md`)](./docs/zh-CN/locale-extension.md) | 单文件 JSON / `.zip` 语言包热安装（附完整 `zh-TW` / `ja-JP` 语言包）、`admin.nav.*` 命名空间与模板导出 |
 | [旧版无损迁移与跨库备份 (`docs/zh-CN/migration-and-backup.md`)](./docs/zh-CN/migration-and-backup.md) | 历史 15 表备份流式 ETL 清洗、`301` 永久链接守护、`SQLite ⇄ PostgreSQL ⇄ MySQL` 33 表跨库流式搬家 |

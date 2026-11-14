@@ -56,7 +56,7 @@
     return "/" + parts.map(encodeURIComponent).join("/");
   }
 
-  var version = host.getAttribute("data-version") || "2.0.0";
+  var version = host.getAttribute("data-version") || "2.0.2";
   var staticBase = safeSameOriginMountPath(
     host.getAttribute("data-static-base"),
     "/plugins/kanbanniang/assets"
@@ -74,6 +74,8 @@
   var tipsLoaded = false;
   var currentModel = "";
   var lastDescriptor = null;
+  var loadSeq = 0;
+  var pendingChangeTip = false;
   var patCount = parseInt(host.getAttribute("data-pats") || "0", 10) || 0;
 
   var messageTimer = 0;
@@ -81,11 +83,14 @@
   var loadTimer = 0;
   var chatTimer = 0;
   var idleHandle = 0;
-  var idleIsCallback = false;
+  var idleIsRaf = false;
   var dragState = null;
   var lastHoverTarget = null;
   var removers = [];
   var abortCtrl = typeof AbortController === "function" ? new AbortController() : null;
+  var preloadBytesMap = Object.create(null);
+  var preloadImagesMap = Object.create(null);
+  var preloadImageEls = [];
 
   var tips = {
     mouseover: [],
@@ -324,7 +329,7 @@
     }, durationMs || 4000);
   }
 
-  function probeWebGLAlphaWebP() {
+  function probeImage2x2(dataUri) {
     return new Promise(function (resolve) {
       var settled = false;
       function done(ok) {
@@ -335,63 +340,7 @@
       }
       var timer = window.setTimeout(function () {
         done(false);
-      }, 800);
-      var img = new Image();
-      img.onload = function () {
-        window.clearTimeout(timer);
-        if (img.width !== 2 || img.height !== 2) {
-          done(false);
-          return;
-        }
-        try {
-          var cvs = document.createElement("canvas");
-          cvs.width = 1;
-          cvs.height = 1;
-          var gl =
-            cvs.getContext("webgl") || cvs.getContext("experimental-webgl");
-          if (!gl) {
-            done(false);
-            return;
-          }
-          var tex = gl.createTexture();
-          gl.bindTexture(gl.TEXTURE_2D, tex);
-          gl.texImage2D(
-            gl.TEXTURE_2D,
-            0,
-            gl.RGBA,
-            gl.RGBA,
-            gl.UNSIGNED_BYTE,
-            img
-          );
-          var ok = gl.getError() === 0;
-          if (tex) gl.deleteTexture(tex);
-          var lose = gl.getExtension("WEBGL_lose_context");
-          if (lose) lose.loseContext();
-          done(ok);
-        } catch (err) {
-          done(false);
-        }
-      };
-      img.onerror = function () {
-        window.clearTimeout(timer);
-        done(false);
-      };
-      img.src = ALPHA_WEBP_URI;
-    });
-  }
-
-  function probeAnimatedWebP() {
-    return new Promise(function (resolve) {
-      var settled = false;
-      function done(ok) {
-        if (!settled) {
-          settled = true;
-          resolve(ok);
-        }
-      }
-      var timer = window.setTimeout(function () {
-        done(false);
-      }, 800);
+      }, 600);
       var img = new Image();
       img.onload = function () {
         window.clearTimeout(timer);
@@ -401,21 +350,163 @@
         window.clearTimeout(timer);
         done(false);
       };
-      img.src = ANIM_WEBP_URI;
+      img.src = dataUri;
     });
   }
 
   function ensureCapabilities() {
     if (!window.__voloKbnCapsPromise) {
-      window.__voloKbnCapsPromise = Promise.all([
-        probeWebGLAlphaWebP(),
-        probeAnimatedWebP()
-      ]).then(function (res) {
-        return { webglWebp: !!res[0], animWebp: !!res[1] };
-      });
+      var hasWebGL = !!window.WebGLRenderingContext;
+      var cachedCaps = sGet("volo.kanban.caps");
+      if (cachedCaps && cachedCaps.indexOf(",") === 1) {
+        var parts = cachedCaps.split(",");
+        window.__voloKbnCapsPromise = Promise.resolve({
+          webglWebp: hasWebGL && parts[0] === "1",
+          animWebp: parts[1] === "1"
+        });
+      } else {
+        window.__voloKbnCapsPromise = Promise.all([
+          hasWebGL ? probeImage2x2(ALPHA_WEBP_URI) : Promise.resolve(false),
+          probeImage2x2(ANIM_WEBP_URI)
+        ]).then(function (res) {
+          var caps = { webglWebp: !!res[0], animWebp: !!res[1] };
+          sSet(
+            "volo.kanban.caps",
+            (caps.webglWebp ? "1" : "0") + "," + (caps.animWebp ? "1" : "0")
+          );
+          return caps;
+        });
+      }
     }
     return window.__voloKbnCapsPromise;
   }
+
+  function clearPreload() {
+    preloadBytesMap = Object.create(null);
+    preloadImagesMap = Object.create(null);
+    for (var i = 0; i < preloadImageEls.length; i++) {
+      var im = preloadImageEls[i];
+      if (im) {
+        im.onload = im.onerror = null;
+        try {
+          im.removeAttribute("src");
+        } catch (err) {}
+      }
+    }
+    preloadImageEls.length = 0;
+  }
+
+  function resolveDescriptorAssetUrl(descriptor, relPath) {
+    if (!relPath) return "";
+    if (/^https?:\/\/|^\/\//i.test(relPath)) return relPath;
+    var baseRaw =
+      (descriptor && descriptor.asset_base) || staticBase + "/";
+    var homeDir = baseRaw;
+    try {
+      homeDir = new URL(baseRaw, window.location.href).href;
+    } catch (err) {}
+    var url = homeDir + relPath;
+    var ver = descriptor && descriptor.asset_version;
+    if (ver && url.indexOf("?") < 0) {
+      url += "?v=" + encodeURIComponent(ver);
+    }
+    return url;
+  }
+
+  function prefetchBytes(url) {
+    if (!url || preloadBytesMap[url] || typeof window.fetch !== "function") {
+      return;
+    }
+    var opts = { credentials: "same-origin" };
+    if (abortCtrl) opts.signal = abortCtrl.signal;
+    var p = window.fetch(url, opts).then(function (resp) {
+      if (!resp.ok) throw new Error("Asset HTTP " + resp.status);
+      return resp.arrayBuffer();
+    });
+    p.catch(function () {});
+    preloadBytesMap[url] = p;
+  }
+
+  function prefetchImage(url) {
+    if (!url || preloadImagesMap[url]) return;
+    var p = new Promise(function (resolve, reject) {
+      var img = new Image();
+      preloadImageEls.push(img);
+      img.crossOrigin = "Anonymous";
+      img.onload = function () {
+        img.onload = img.onerror = null;
+        resolve(img);
+      };
+      img.onerror = function () {
+        img.onload = img.onerror = null;
+        try {
+          img.removeAttribute("src");
+        } catch (err) {}
+        reject(new Error("Texture preload failed"));
+      };
+      img.src = url;
+    });
+    p.catch(function () {});
+    preloadImagesMap[url] = p;
+  }
+
+  function prefetchDescriptor(descriptor, useWebp) {
+    if (!descriptor || typeof descriptor !== "object") return;
+    if (descriptor.model) {
+      prefetchBytes(resolveDescriptorAssetUrl(descriptor, descriptor.model));
+    }
+    if (descriptor.physics) {
+      prefetchBytes(resolveDescriptorAssetUrl(descriptor, descriptor.physics));
+    }
+    if (descriptor.pose) {
+      prefetchBytes(resolveDescriptorAssetUrl(descriptor, descriptor.pose));
+    }
+    if (
+      descriptor.motions &&
+      Array.isArray(descriptor.motions.idle) &&
+      descriptor.motions.idle.length === 1 &&
+      descriptor.motions.idle[0] &&
+      descriptor.motions.idle[0].file
+    ) {
+      prefetchBytes(
+        resolveDescriptorAssetUrl(descriptor, descriptor.motions.idle[0].file)
+      );
+    }
+    if (Array.isArray(descriptor.textures)) {
+      for (var i = 0; i < descriptor.textures.length; i++) {
+        var webpRel =
+          useWebp &&
+          Array.isArray(descriptor.textures_webp) &&
+          descriptor.textures_webp[i]
+            ? descriptor.textures_webp[i]
+            : null;
+        var texRel = webpRel || descriptor.textures[i];
+        if (texRel) {
+          prefetchImage(resolveDescriptorAssetUrl(descriptor, texRel));
+        }
+      }
+    }
+  }
+
+  window.__voloKbnPreload = {
+    hasBytes: function (url) {
+      return !!preloadBytesMap[url];
+    },
+    takeBytes: function (url) {
+      var p = preloadBytesMap[url] || null;
+      if (p) delete preloadBytesMap[url];
+      return p;
+    },
+    hasImage: function (url) {
+      return !!preloadImagesMap[url];
+    },
+    takeImage: function (url) {
+      var p = preloadImagesMap[url] || null;
+      if (p) delete preloadImagesMap[url];
+      return p;
+    },
+    clear: clearPreload
+  };
 
   function loadSDK() {
     if (typeof window.loadlive2d === "function") {
@@ -444,7 +535,24 @@
     return window.__voloKanbanSDK;
   }
 
+  function consumeInitialDescriptor() {
+    var raw = host.getAttribute("data-initial-descriptor");
+    if (!raw) return null;
+    host.removeAttribute("data-initial-descriptor");
+    try {
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.model) {
+        return Promise.resolve(parsed);
+      }
+    } catch (err) {}
+    return null;
+  }
+
   function fetchModelDescriptor(isRandomSwitch) {
+    if (!isRandomSwitch) {
+      var inlined = consumeInitialDescriptor();
+      if (inlined) return inlined;
+    }
     var endpoint = isRandomSwitch ? "/absoluteRandomModel" : "/model";
     var qs = isRandomSwitch
       ? "?exclude=" +
@@ -623,13 +731,16 @@
   }
 
   function pause() {
+    loadSeq += 1;
+    pendingChangeTip = false;
     ready = false;
     started = false;
     lastHoverTarget = null;
     dragState = null;
+    clearPreload();
     if (host) {
       host.hidden = true;
-      host.classList.remove("is-tools-open");
+      host.classList.remove("is-tools-open", "is-loading");
       host.style.removeProperty("transform");
       host.style.removeProperty("will-change");
       delete host.dataset.ready;
@@ -673,8 +784,8 @@
     if (!alive) return;
     alive = false;
     if (idleHandle) {
-      if (idleIsCallback && typeof window.cancelIdleCallback === "function") {
-        window.cancelIdleCallback(idleHandle);
+      if (idleIsRaf && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(idleHandle);
       } else {
         window.clearTimeout(idleHandle);
       }
@@ -696,20 +807,43 @@
 
   function change(isRandomSwitch) {
     if (!alive || !started) return;
+    var seq = ++loadSeq;
     ready = false;
     delete host.dataset.ready;
+    clearPreload();
+    host.classList.add("is-loading");
     window.clearTimeout(loadTimer);
     loadTimer = window.setTimeout(pause, 12000);
 
-    fetchModelDescriptor(!!isRandomSwitch)
-      .then(function (descriptor) {
+    var prepared = Promise.all([
+      ensureCapabilities(),
+      fetchModelDescriptor(!!isRandomSwitch)
+    ]).then(function (pair) {
+      var caps = pair[0];
+      var descriptor = pair[1];
+      if (
+        seq === loadSeq &&
+        alive &&
+        started &&
+        !shouldPauseForMobile() &&
+        descriptor
+      ) {
+        prefetchDescriptor(descriptor, !!caps.webglWebp);
+      }
+      return descriptor;
+    });
+
+    Promise.all([prepared, loadSDK()])
+      .then(function (res) {
+        if (seq !== loadSeq) return;
+        var descriptor = res[0];
         if (!alive || !started || shouldPauseForMobile()) return;
         lastDescriptor = descriptor || lastDescriptor;
         currentModel = (descriptor && descriptor.name) || currentModel;
         window.loadlive2d("soloKanbanniang", descriptor);
       })
       .catch(function () {
-        pause();
+        if (seq === loadSeq) pause();
       });
   }
 
@@ -717,23 +851,47 @@
     if (!alive || started || shouldPauseForMobile() || isClosedInSession()) {
       return;
     }
+    var seq = ++loadSeq;
     started = true;
+    syncOffsetsAndPosition();
+    host.classList.remove("is-closed", "is-closing");
+    host.classList.add("is-loading");
+    host.hidden = false;
     window.clearTimeout(loadTimer);
     loadTimer = window.setTimeout(pause, 12000);
 
-    Promise.all([
+    var sdkPromise = loadSDK();
+    var prepared = Promise.all([
       ensureCapabilities(),
-      loadSDK(),
       fetchModelDescriptor(false)
-    ])
+    ]).then(function (pair) {
+      var caps = pair[0];
+      var descriptor = pair[1];
+      if (
+        seq === loadSeq &&
+        alive &&
+        started &&
+        !shouldPauseForMobile() &&
+        descriptor
+      ) {
+        prefetchDescriptor(descriptor, !!caps.webglWebp);
+      }
+      return pair;
+    });
+
+    Promise.all([prepared, sdkPromise])
       .then(function (res) {
+        if (seq !== loadSeq) return;
         if (!alive || shouldPauseForMobile() || !host.isConnected) {
           started = false;
+          host.classList.remove("is-loading");
+          host.hidden = true;
+          clearPreload();
           window.clearTimeout(loadTimer);
           return;
         }
-        var caps = res[0];
-        var descriptor = res[2];
+        var caps = res[0][0];
+        var descriptor = res[0][1];
         window.VoloLive2D = window.VoloLive2D || {};
         window.VoloLive2D.useWebp = !!caps.webglWebp;
         window.VoloLive2D.muted = host.getAttribute("data-mute-sound") === "1";
@@ -750,7 +908,7 @@
         window.loadlive2d("soloKanbanniang", descriptor);
       })
       .catch(function () {
-        pause();
+        if (seq === loadSeq) pause();
       });
   }
 
@@ -759,21 +917,18 @@
       host.hidden = true;
       return;
     }
-    if (typeof window.requestIdleCallback === "function") {
-      idleIsCallback = true;
-      idleHandle = window.requestIdleCallback(
-        function () {
-          idleHandle = 0;
-          start();
-        },
-        { timeout: 1500 }
-      );
+    if (typeof window.requestAnimationFrame === "function") {
+      idleIsRaf = true;
+      idleHandle = window.requestAnimationFrame(function () {
+        idleHandle = 0;
+        start();
+      });
     } else {
-      idleIsCallback = false;
+      idleIsRaf = false;
       idleHandle = window.setTimeout(function () {
         idleHandle = 0;
         start();
-      }, 200);
+      }, 16);
     }
   }
 
@@ -864,9 +1019,8 @@
     refreshSakuraBackground();
   });
   bindTool("change", function () {
+    pendingChangeTip = true;
     change(true);
-    showMessage(resolveLocaleStrings().changeTip, 4500);
-    refreshSakuraBackground();
   });
   bindTool("photo", function () {
     if (ready && window.Live2D) {
@@ -900,15 +1054,29 @@
       currentModel = ev.detail.model;
     }
     host.hidden = false;
-    host.classList.remove("is-closed", "is-closing");
+    host.classList.remove("is-closed", "is-closing", "is-loading");
     syncOffsetsAndPosition();
+    if (window.VoloLive2D) {
+      if (typeof window.VoloLive2D.drawNow === "function") {
+        window.VoloLive2D.drawNow();
+      } else if (typeof window.VoloLive2D.invalidateRect === "function") {
+        window.VoloLive2D.invalidateRect();
+      }
+    }
+    window.dispatchEvent(new CustomEvent("volo:kanban-moved"));
     refreshSakuraBackground();
     ensureTipsLoaded();
 
     if (!initialGreetShown) {
       initialGreetShown = true;
+      pendingChangeTip = false;
       if (!isOverlayBlocking()) {
         showMessage(resolveLocaleStrings().greeting, 5000);
+      }
+    } else if (pendingChangeTip) {
+      pendingChangeTip = false;
+      if (!isOverlayBlocking()) {
+        showMessage(resolveLocaleStrings().changeTip, 4500);
       }
     }
   });
@@ -1025,11 +1193,6 @@
       moved: false,
       isCanvas: !!(ev.target && ev.target.id === "soloKanbanniang")
     };
-    if (typeof host.setPointerCapture === "function") {
-      try {
-        host.setPointerCapture(ev.pointerId);
-      } catch (err) {}
-    }
   });
 
   listen(host, "pointermove", function (ev) {
@@ -1041,6 +1204,11 @@
     }
     if (!dragState.moved) {
       dragState.moved = true;
+      if (typeof host.setPointerCapture === "function") {
+        try {
+          host.setPointerCapture(ev.pointerId);
+        } catch (err) {}
+      }
       host.setAttribute("data-dragged", "1");
       host.style.left = dragState.startLeft + "px";
       host.style.top = dragState.startTop + "px";
@@ -1099,6 +1267,13 @@
         host.classList.toggle("is-tools-open");
       }
       if (state.isCanvas && ready) {
+        if (
+          ev.pointerType !== "mouse" &&
+          window.VoloLive2D &&
+          typeof window.VoloLive2D.tapClient === "function"
+        ) {
+          window.VoloLive2D.tapClient(ev.clientX, ev.clientY);
+        }
         sendHeadPat();
       }
     }
@@ -1108,6 +1283,9 @@
     finishPointer(ev, false);
   });
   listen(host, "pointercancel", function (ev) {
+    finishPointer(ev, true);
+  });
+  listen(host, "lostpointercapture", function (ev) {
     finishPointer(ev, true);
   });
 

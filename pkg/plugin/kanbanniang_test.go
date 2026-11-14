@@ -7,10 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,8 +66,8 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 		}
 		seenInCatalog[entry.ID] = entry.Version
 	}
-	if seenInCatalog["kanbanniang"] != "2.0.0" || seenInCatalog["sensitive-words"] == "" {
-		t.Fatalf("expected kanbanniang=2.0.0 and sensitive-words in catalog, got %+v", seenInCatalog)
+	if seenInCatalog["kanbanniang"] != "2.0.2" || seenInCatalog["sensitive-words"] == "" {
+		t.Fatalf("expected kanbanniang=2.0.2 and sensitive-words in catalog, got %+v", seenInCatalog)
 	}
 
 	// 2. Stage kanbanniang into isolated test environment and verify admin/public endpoints + all 26 models.
@@ -153,9 +155,38 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 	}
 	// Only the host-managed external defer <script src="/plugins/kanbanniang/assets/widget.js?v=..."> tag may appear (zero inline JS).
 	if strings.Count(footerHTML, "<script") != 1 ||
-		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.0"`) ||
+		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.2"`) ||
 		!strings.Contains(footerHTML, `></script>`) {
 		t.Fatalf("expected single external defer widget.js script with zero inline JS, got: %s", footerHTML)
+	}
+	// Default "random" model must NOT inline data-initial-descriptor so each visitor session picks a fresh random character.
+	if strings.Contains(footerHTML, "data-initial-descriptor=") {
+		t.Fatalf("expected random model mode to omit data-initial-descriptor, got: %s", footerHTML)
+	}
+
+	// Fixed model mode ("bilibili-live/22") must inline data-initial-descriptor for 0-RTT startup.
+	if _, err := mgr.UpdateConfig(ctx, "kanbanniang", map[string]any{"model": "bilibili-live/22"}, "zh-CN"); err != nil {
+		t.Fatalf("UpdateConfig fixed model: %v", err)
+	}
+	fixedSlots := mgr.RenderSlots(ctx, SlotPublicFooter, SlotRenderContext{Locale: "zh-CN", Path: "/"})
+	if len(fixedSlots) != 1 || !strings.Contains(fixedSlots[0].HTML, `data-initial-descriptor="`) {
+		t.Fatalf("expected fixed model mode to inline data-initial-descriptor, got: %+v", fixedSlots)
+	}
+	attrStart := strings.Index(fixedSlots[0].HTML, `data-initial-descriptor="`) + len(`data-initial-descriptor="`)
+	attrEnd := strings.Index(fixedSlots[0].HTML[attrStart:], `"`)
+	if attrEnd <= 0 {
+		t.Fatalf("malformed data-initial-descriptor attribute in %s", fixedSlots[0].HTML)
+	}
+	inlinedJSON := html.UnescapeString(fixedSlots[0].HTML[attrStart : attrStart+attrEnd])
+	var inlinedDesc struct {
+		Name  string `json:"name"`
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal([]byte(inlinedJSON), &inlinedDesc); err != nil || inlinedDesc.Name != "bilibili-live/22" || inlinedDesc.Model != "model/bilibili-live/22/model.moc" {
+		t.Fatalf("unexpected inlined descriptor: err=%v desc=%+v raw=%s", err, inlinedDesc, inlinedJSON)
+	}
+	if _, err := mgr.UpdateConfig(ctx, "kanbanniang", map[string]any{"model": "random"}, "zh-CN"); err != nil {
+		t.Fatalf("restore random model config: %v", err)
 	}
 
 	// Verify all 26 bundled models resolve cleanly with pure .webp textures on disk.
@@ -371,6 +402,23 @@ func TestKanbanniang_AssetDeliveryGzipETagRangeAndLargeZipRoundTrip(t *testing.T
 		t.Fatalf("expected HEAD If-None-Match 304, got %d", head304Rec.Code)
 	}
 
+	// 1b. Large .moc (> 512 KiB, up to 1.96 MB) must also hit the 2 MiB-per-entry RAM gzip cache with Content-Length.
+	largeMocRel := "/plugins/kanbanniang/assets/model/HyperdimensionNeptunia/nepgearswim/model.moc?v=2.0.1"
+	largeGetReq := httptest.NewRequest(http.MethodGet, largeMocRel, nil)
+	largeGetReq.Header.Set("Accept-Encoding", "gzip")
+	largeGetRec := httptest.NewRecorder()
+	mgr.Handler().ServeHTTP(largeGetRec, largeGetReq)
+	if largeGetRec.Code != http.StatusOK || largeGetRec.Header().Get("Content-Encoding") != "gzip" || largeGetRec.Header().Get("Content-Length") == "" {
+		t.Fatalf("expected >512KiB nepgearswim model.moc to hit RAM gzip cache with Content-Length, got code=%d ce=%q cl=%q", largeGetRec.Code, largeGetRec.Header().Get("Content-Encoding"), largeGetRec.Header().Get("Content-Length"))
+	}
+	largeHeadReq := httptest.NewRequest(http.MethodHead, largeMocRel, nil)
+	largeHeadReq.Header.Set("Accept-Encoding", "gzip")
+	largeHeadRec := httptest.NewRecorder()
+	mgr.Handler().ServeHTTP(largeHeadRec, largeHeadReq)
+	if largeHeadRec.Code != http.StatusOK || largeHeadRec.Header().Get("Content-Length") != largeGetRec.Header().Get("Content-Length") {
+		t.Fatalf("expected matching HEAD Content-Length on >512KiB .moc: HEAD=%q GET=%q", largeHeadRec.Header().Get("Content-Length"), largeGetRec.Header().Get("Content-Length"))
+	}
+
 	// Live file modification on disk must invalidate the RAM Gzip cache immediately via (size, modTime) check.
 	tipsDiskPath := filepath.Join(pluginsDir, "kanbanniang", "assets", "tips.json")
 	origTipsBytes, err := os.ReadFile(tipsDiskPath)
@@ -504,6 +552,160 @@ func TestKanbanniang_AssetDeliveryGzipETagRangeAndLargeZipRoundTrip(t *testing.T
 	zfStat, _ := zfIn.Stat()
 	if _, err := mgr.InstallFromZip(ctx, zfIn, zfStat.Size(), true, "en-US"); err != nil {
 		t.Fatalf("InstallFromZip >300 entries failed: %v", err)
+	}
+}
+
+func TestKanbanniang_MinifiedZipInstallAndJSVMExecution(t *testing.T) {
+	ctx := context.Background()
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	adminNodeModules := filepath.Join(repoRoot, "web", "admin", "node_modules")
+	if _, err := os.Stat(adminNodeModules); err != nil {
+		t.Skipf("skipping minifier integration test: %s not present", adminNodeModules)
+	}
+
+	nodeBin := strings.TrimSpace(os.Getenv("NODE_BIN"))
+	if nodeBin == "" {
+		var nodeErr error
+		nodeBin, nodeErr = exec.LookPath("node")
+		if nodeErr != nil {
+			t.Skip("skipping minifier integration test: node not found in PATH")
+		}
+	}
+	var pyBin string
+	for _, cand := range []string{"python3", "python"} {
+		if p, pErr := exec.LookPath(cand); pErr == nil {
+			if exec.Command(p, "--version").Run() == nil {
+				pyBin = p
+				break
+			}
+		}
+	}
+	if pyBin == "" {
+		t.Skip("skipping minifier integration test: working python3/python not found in PATH")
+	}
+
+	outDir := filepath.Join(t.TempDir(), "plugin-dist")
+	pkgCmd := exec.Command(
+		pyBin,
+		filepath.Join(repoRoot, ".github", "scripts", "package-plugin.py"),
+		"--plugin", "kanbanniang",
+		"--repo-root", repoRoot,
+		"--output-dir", outDir,
+	)
+	pkgCmd.Env = append(os.Environ(), "NODE_BIN="+nodeBin, "SOURCE_DATE_EPOCH=1767225600")
+	if out, cErr := pkgCmd.CombinedOutput(); cErr != nil {
+		t.Fatalf("package-plugin.py failed: %v\n%s", cErr, string(out))
+	}
+
+	builtZip := filepath.Join(outDir, "plugin-kanbanniang-v2.0.2.zip")
+	zr, err := zip.OpenReader(builtZip)
+	if err != nil {
+		t.Fatalf("open built zip: %v", err)
+	}
+	zipSizes := make(map[string]uint64)
+	zipSamples := make(map[string]string)
+	for _, zf := range zr.File {
+		zipSizes[zf.Name] = zf.UncompressedSize64
+		switch zf.Name {
+		case "kanbanniang/main.js", "kanbanniang/assets/widget.js", "kanbanniang/assets/widget.css", "kanbanniang/manifest.json":
+			rc, oErr := zf.Open()
+			if oErr != nil {
+				_ = zr.Close()
+				t.Fatal(oErr)
+			}
+			b, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			zipSamples[zf.Name] = string(b)
+		}
+	}
+	_ = zr.Close()
+
+	for _, rel := range []string{"main.js", "assets/widget.js", "assets/widget.css", "assets/live2d.js", "manifest.json", "assets/tips.json"} {
+		rawInfo, sErr := os.Stat(filepath.Join(repoRoot, "plugins", "kanbanniang", filepath.FromSlash(rel)))
+		if sErr != nil {
+			t.Fatal(sErr)
+		}
+		gotMin, ok := zipSizes["kanbanniang/"+rel]
+		if !ok {
+			t.Fatalf("missing kanbanniang/%s in built zip", rel)
+		}
+		if gotMin >= uint64(rawInfo.Size()) {
+			t.Fatalf("expected kanbanniang/%s to be minified (< %d bytes), got %d bytes", rel, rawInfo.Size(), gotMin)
+		}
+	}
+	if strings.Contains(zipSamples["kanbanniang/manifest.json"], "\n") {
+		t.Fatalf("expected compact single-line manifest.json in zip")
+	}
+	if strings.Contains(zipSamples["kanbanniang/assets/widget.js"], "/* Volo-go Live2D Kanbanniang Controller") {
+		t.Fatalf("expected non-license comments stripped from widget.js in zip")
+	}
+
+	// Install minified kanbanniang ZIP AND stage minified sensitive-words into Manager, then exercise JSVM execution.
+	store, kr, i18nCat, tmpDir := openTestPluginEnv(t)
+	pluginsDir := filepath.Join(tmpDir, "plugins")
+	minSwCmd := exec.Command(
+		nodeBin,
+		filepath.Join(repoRoot, ".github", "scripts", "minify-plugin-assets.mjs"),
+		"--dir", filepath.Join(repoRoot, "plugins", "sensitive-words"),
+		"--out-dir", filepath.Join(pluginsDir, "sensitive-words"),
+	)
+	if out, cErr := minSwCmd.CombinedOutput(); cErr != nil {
+		t.Fatalf("minify sensitive-words failed: %v\n%s", cErr, string(out))
+	}
+
+	provReg := NewProviderRegistry(nil, nil)
+	mgr := NewManager(ManagerOptions{
+		Store:        store,
+		Keys:         kr,
+		Providers:    provReg,
+		Catalog:      i18nCat,
+		PluginsDir:   pluginsDir,
+		DataDir:      filepath.Join(tmpDir, "data"),
+		HookTimeout:  3 * time.Second,
+		RouteTimeout: 3 * time.Second,
+	})
+	mgr.SetRequestInspector(func(r *http.Request) (bool, string) {
+		return false, "127.0.0.0"
+	})
+	defer func() { _ = mgr.Close(ctx) }()
+
+	if err := mgr.DiscoverAndStart(ctx); err != nil {
+		t.Fatalf("DiscoverAndStart minified sensitive-words: %v", err)
+	}
+	if err := mgr.Enable(ctx, "sensitive-words"); err != nil {
+		t.Fatalf("Enable minified sensitive-words: %v", err)
+	}
+	nickVerdict := provReg.EvaluateNickname(ctx, NicknameCheckInput{Nickname: "系统管理员", Locale: "zh-CN"})
+	if nickVerdict.Action != SpamActionReject {
+		t.Fatalf("expected minified sensitive-words to reject reserved nickname, verdict=%+v", nickVerdict)
+	}
+
+	zf, err := os.Open(builtZip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zf.Close()
+	zStat, _ := zf.Stat()
+	if _, err := mgr.InstallFromZip(ctx, zf, zStat.Size(), true, "zh-CN"); err != nil {
+		t.Fatalf("InstallFromZip minified kanbanniang failed: %v", err)
+	}
+	if err := mgr.Enable(ctx, "kanbanniang"); err != nil {
+		t.Fatalf("Enable minified kanbanniang failed: %v", err)
+	}
+
+	patRec := httptest.NewRecorder()
+	mgr.Handler().ServeHTTP(patRec, httptest.NewRequest(http.MethodPost, "/plugins/kanbanniang/api/pat", nil))
+	if patRec.Code != http.StatusOK || !strings.Contains(patRec.Body.String(), `"total_pats":1`) {
+		t.Fatalf("expected POST /api/pat on minified kanbanniang to return total_pats=1, got %d %s", patRec.Code, patRec.Body.String())
+	}
+
+	mdlRec := httptest.NewRecorder()
+	mgr.Handler().ServeHTTP(mdlRec, httptest.NewRequest(http.MethodGet, "/plugins/kanbanniang/api/model?model=bilibili-live/22", nil))
+	if mdlRec.Code != http.StatusOK || !strings.Contains(mdlRec.Body.String(), `"name":"bilibili-live/22"`) {
+		t.Fatalf("expected GET /api/model on minified kanbanniang to succeed, got %d %s", mdlRec.Code, mdlRec.Body.String())
 	}
 }
 

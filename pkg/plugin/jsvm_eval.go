@@ -1669,6 +1669,18 @@ func (rt *jsRuntime) evalExpr(ex jsExpr, scope *jsScope, thisVal jsValue) (jsVal
 			out = jsValue{kind: valNumber, num: cur.toNumber() / rhs.toNumber()}
 		case tokPctAssign:
 			out = jsValue{kind: valNumber, num: math.Mod(cur.toNumber(), rhs.toNumber())}
+		case tokBitAndAssign:
+			out = jsValue{kind: valNumber, num: float64(int32(cur.toNumber()) & int32(rhs.toNumber()))}
+		case tokBitOrAssign:
+			out = jsValue{kind: valNumber, num: float64(int32(cur.toNumber()) | int32(rhs.toNumber()))}
+		case tokBitXorAssign:
+			out = jsValue{kind: valNumber, num: float64(int32(cur.toNumber()) ^ int32(rhs.toNumber()))}
+		case tokShlAssign:
+			out = jsValue{kind: valNumber, num: float64(int32(cur.toNumber()) << (uint32(rhs.toNumber()) & 31))}
+		case tokShrAssign:
+			out = jsValue{kind: valNumber, num: float64(int32(cur.toNumber()) >> (uint32(rhs.toNumber()) & 31))}
+		case tokUShrAssign:
+			out = jsValue{kind: valNumber, num: float64(uint32(cur.toNumber()) >> (uint32(rhs.toNumber()) & 31))}
 		}
 		if err := setter(out); err != nil {
 			var thrown *jsThrownError

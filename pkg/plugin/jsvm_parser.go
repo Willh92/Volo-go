@@ -36,6 +36,12 @@ const (
 	tokStarAssign
 	tokSlashAssign
 	tokPctAssign
+	tokBitAndAssign
+	tokBitOrAssign
+	tokBitXorAssign
+	tokShlAssign
+	tokShrAssign
+	tokUShrAssign
 	tokPlus
 	tokMinus
 	tokStar
@@ -538,8 +544,17 @@ func tokenizeJSWithDepth(src string, tplDepth int) ([]jsToken, error) {
 		case strings.HasPrefix(rem, "!=="):
 			emit(tokStrictNeq, "!==")
 			i += 3
+		case strings.HasPrefix(rem, ">>>="):
+			emit(tokUShrAssign, ">>>=")
+			i += 4
 		case strings.HasPrefix(rem, ">>>"):
 			emit(tokUShr, ">>>")
+			i += 3
+		case strings.HasPrefix(rem, "<<="):
+			emit(tokShlAssign, "<<=")
+			i += 3
+		case strings.HasPrefix(rem, ">>="):
+			emit(tokShrAssign, ">>=")
 			i += 3
 		case strings.HasPrefix(rem, "=>"):
 			emit(tokArrow, "=>")
@@ -588,6 +603,15 @@ func tokenizeJSWithDepth(src string, tplDepth int) ([]jsToken, error) {
 			i += 2
 		case strings.HasPrefix(rem, "%="):
 			emit(tokPctAssign, "%=")
+			i += 2
+		case strings.HasPrefix(rem, "&="):
+			emit(tokBitAndAssign, "&=")
+			i += 2
+		case strings.HasPrefix(rem, "|="):
+			emit(tokBitOrAssign, "|=")
+			i += 2
+		case strings.HasPrefix(rem, "^="):
+			emit(tokBitXorAssign, "^=")
 			i += 2
 		case strings.HasPrefix(rem, "<<"):
 			emit(tokShl, "<<")
@@ -1820,7 +1844,8 @@ func (p *jsParser) parseAssignExpr() (jsExpr, error) {
 		return nil, err
 	}
 	switch p.cur().kind {
-	case tokAssign, tokPlusAssign, tokMinusAssign, tokStarAssign, tokSlashAssign, tokPctAssign:
+	case tokAssign, tokPlusAssign, tokMinusAssign, tokStarAssign, tokSlashAssign, tokPctAssign,
+		tokBitAndAssign, tokBitOrAssign, tokBitXorAssign, tokShlAssign, tokShrAssign, tokUShrAssign:
 		if err := p.enter(); err != nil {
 			return nil, err
 		}

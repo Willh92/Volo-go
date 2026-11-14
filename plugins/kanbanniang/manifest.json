@@ -1,6 +1,6 @@
 {
   "id": "kanbanniang",
-  "version": "2.0.0",
+  "version": "2.0.2",
   "min_host_version": "0.1.0",
   "runtime": "goja",
   "entry": "main.js",

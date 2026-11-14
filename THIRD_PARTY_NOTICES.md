@@ -80,8 +80,8 @@ Pages containing LaTeX math expressions or Mermaid diagrams dynamically load the
 
 ## 6. Optional Standalone Plugin Package (`plugins/kanbanniang`) / 可选独立发布插件包（看板娘）
 
-> **Distribution Scope / 分发范围说明**: To keep core OS/arch binary bundles (`~8 MB`) and the Distroless container image minimal and purely Apache-2.0 compatible, `plugins/kanbanniang` is **excluded** from the main `Volo-go` binary archives and base container image, and is distributed separately as an optional standalone plugin archive (`plugin-kanbanniang-v2.0.0.zip`).
-> 为保持核心跨平台发行包（`~8 MB`）与 Distroless 容器镜像精简纯粹，`plugins/kanbanniang` **不包含**在主程序压缩包与默认容器镜像中，而是作为可选独立插件包（`plugin-kanbanniang-v2.0.0.zip`）按需安装。
+> **Distribution Scope / 分发范围说明**: To keep core OS/arch binary bundles (`~8 MB`) and the Distroless container image minimal and purely Apache-2.0 compatible, `plugins/kanbanniang` is **excluded** from the main `Volo-go` binary archives and base container image, and is distributed separately as an optional standalone plugin archive (`plugin-kanbanniang-v2.0.2.zip` / `plugin-kanbanniang.zip`).
+> 为保持核心跨平台发行包（`~8 MB`）与 Distroless 容器镜像精简纯粹，`plugins/kanbanniang` **不包含**在主程序压缩包与默认容器镜像中，而是作为可选独立插件包（`plugin-kanbanniang-v2.0.2.zip` / `plugin-kanbanniang.zip`）按需安装。
 
 | Component / 组件 | License / 条款 | Purpose / 用途 | Reference / 说明 |
 | :--- | :--- | :--- | :--- |

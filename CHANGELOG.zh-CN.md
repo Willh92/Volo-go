@@ -9,7 +9,7 @@
 ## [1.0.2] - 2026-11-14
 
 ### 新增特性
-- **官方 Live2D 看板娘独立插件 `kanbanniang v2.0.0` 与插件目录体系**：新增机器可读插件注册表 `plugins/catalog.json` 与 GitHub Actions 版本去重自动打包工作流，完整内置 26 套本地离线 Live2D 模型、Pio/Tia 150 套随机换装、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与异步摸头计数；全量采用无损透明/动图 `.webp` 贴图，独立安装包精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`），支持 `volo import-legacy` 自动迁移历史看板娘模型配置。
+- **官方 Live2D 看板娘独立插件 `kanbanniang v2.0.2` 与插件目录体系**：新增机器可读插件注册表 `plugins/catalog.json` 与 GitHub Actions 版本去重自动打包工作流，完整内置 26 套本地离线 Live2D 模型、Pio/Tia 150 套随机换装、SSR 首帧模型描述注入与 `.moc`/`.webp`/动作并行预取、统一单调时钟 WebGL 渲染循环、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与异步摸头计数；全量采用无损透明/动图 `.webp` 贴图与构建期 AST 代码压缩，独立安装包精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`），支持 `volo import-legacy` 自动迁移历史看板娘模型配置。
 - **多语言家族代码高亮引擎与无标尺智能探测**：纯 Go 服务端与三模式编辑器同步扩展专用词法器（涵盖 Go、JS/TS/JSX/TSX、Python、Rust、Java/Kotlin、C/C++/C#、PHP、Ruby、Lua、GraphQL、Protobuf、HCL/Terraform、SQL、YAML、TOML、Nginx/Apache/Conf、Shell/PowerShell、Diff、HTML/XML、CSS/SCSS、JSON/JSONC 等 30+ 语言），支持未标注语言围栏代码块的自动语言推断、语言徽标展示与一键选择修改语言。
 - **Studio 三模式编辑器深度增强**：新增原生查找与替换栏（`Ctrl/Cmd+F`、`Ctrl/Cmd+H`，支持在即时渲染模式下自动展开命中的折叠块与隐藏语法）、行首 `/` 快捷插入命令菜单（自动适配移动端 `visualViewport` 软键盘高度）、成对符号智能补全/包裹、跨网页富文本粘贴智能清洗（自动剔除搜索引擎角标与追踪噪音、解码懒加载图片、转换代码块与表格）、图片加载零抖动占位防跳以及 WYSIWYG 文件拖拽上传与表格行列快捷浮条。
 - **Markdown 引用块与五色 GitHub Callout 视觉升级**：重构前台双主题（`volo-studio` / `volo-journal`）与管理台编辑器的引用块及 `[!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]` 提示框层级排版、深浅色对比度与嵌套引用间距。
@@ -17,12 +17,12 @@
 ### 变更与瘦身优化
 - **管理台内嵌资源瘦身与确定性资产命名**：清理死 CSS 规则并用 `:is(...)` 合并编辑器样式、将静态 `i18n` 映射键编译为紧凑数字索引、启用 7-Zip / Zopfli 高密度预压缩并切换为确定性资产名 + `?v=<hash>` 缓存指纹，根除构建残留文件并将内嵌 SPA 总 Gzip 体积控制在 `~317.5 KiB`（门禁预留余量 `< 380 KiB`）。
 - **选择性热路径函数内联与数据库 Schema `v9` 索引加速**：为 `internal/render`、`internal/security` 与 `pkg/plugin` 热路径开启 `-l=4` 编译器内联，全 6 平台静态二进制实测 `~19.4–20.2 MiB`（门禁预留余量 `< 22.00 MiB`）；新增 Schema `v9` 复合索引（`idx_comments_del_updated`、`idx_follows_sort_created`、`idx_series_sort_created`），并将订阅聚合查询重构为 SQL `ROW_NUMBER()` 窗口函数。
-- **插件沙箱流式 `256 MiB` 导入导出与大文件流式超时按需展期**：插件与主题安装/导出升级为流式 ZIP 处理（支持实时上传进度条与同名覆盖预检），并在已鉴权的大媒体上传、备份恢复/下载及在线迁库路由通过 `http.ResponseController` 按需延长读写截止时间，兼顾慢速连接防护与百兆级文件传输。
+- **插件沙箱流式 `256 MiB` 导入导出、构建期 AST 压缩与 `.moc` 内存 Gzip 缓存**：插件与主题安装/导出升级为流式 ZIP 处理（支持实时上传进度条与同名覆盖预检），新增发布期插件 `.js`/`.css`/`.json` 确定性 AST 压缩流水线（`vite` + `lightningcss`），将插件静态资源 Gzip 内存缓存单文件上限提升至 `2 MiB`（总池 `8 MiB`）以覆盖全量 `.moc` 模型二进制，并在已鉴权的大媒体上传、备份恢复/下载及在线迁库路由通过 `http.ResponseController` 按需延长读写截止时间。
 
 ### 安全加固与问题修复
 - **Markdown `:::lock` 引用穿透明文防泄密与线性复杂度加固**：修复 `parseChildBlockLine` 未按外层引用深度校验闭合标记导致顶层 `:::lock` 内出现 `> :::` 时提前闭合的泄密隐患（改为严格同层闭合与引用终止 fail-closed 封存）；消除未闭合 HTML 注释/`<pre>`/`==highlight==` 的 `O(N^2)` 重复扫描，并修复裸 `<pre><code>` 对无分号 URL 参数（如 `&copy=`）的实体误解码。
 - **GeoIP 规则 Fail-Closed 闭环与跨平台目录/Socket 安全校验**：修复 GeoIP 规则 `"block"` 动作在运行时误放行的问题（统一归一为拦截并改为 fail-closed 判定）；加固 Windows 自定义上传/GeoIP 目录对无盘符根路径（如 `"/etc"`）、盘符系统目录、UNC 路径与保留设备名的拦截；补齐 `AF_UNIX` `sun_path` 长度预检、`/uploads/*` 沙箱 CSP 响应头与原生 TLS HSTS 响应头。
-- **插件 JSVM 栈溢出防护与异步 KV 缓冲池多租户隔离**：限制超长表达式链与求值递归深度（转为可捕获异常）、为 `Array.prototype.sort` 植入预转串与超时中断、冻结池化 VM 内建原型，并将 `volo.kv.incrAsync` 改为单插件配额硬限 + 按插件独立事务刷盘，防止单一异常插件拖垮全局 KV 持久化。
+- **插件 JSVM 栈溢出防护、位复合赋值支持与异步 KV 缓冲池多租户隔离**：限制超长表达式链与求值递归深度（转为可捕获异常）、补齐 `&=` / `|=` / `^=` / `<<=` / `>>=` / `>>>=` 位运算复合赋值语法支持、为 `Array.prototype.sort` 植入预转串与超时中断、冻结池化 VM 内建原型，并将 `volo.kv.incrAsync` 改为单插件配额硬限 + 按插件独立事务刷盘，防止单一异常插件拖垮全局 KV 持久化。
 - **全站配置闭环、跨库恢复与双主题深浅色/移动端/分页打磨**：补齐 `seo.post_permalink_style` 旧 `/posts/{slug}` 的 `301` 规范跳转与模板/通知路径同步，修复 PostgreSQL 恢复 `users.shield_comments` 布尔列映射、JPEG 无损 VP8L 冗余试编码及容器重启 5 分钟无条件自动备份问题；补齐后台订阅条目、Webhooks、GeoIP、Passkeys、会话与令牌全量分页；修复双主题无 JS 系统深色回退、移动端导航遮罩裁字、横向滚动条选中项自动归位、后台抽屉键盘焦点隔离与宽屏卡片底边对齐。
 
 ---

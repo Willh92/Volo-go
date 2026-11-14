@@ -12,8 +12,8 @@
   height: 250px;
   z-index: 42;
   cursor: grab;
-  user-select: none;
   -webkit-user-select: none;
+  user-select: none;
   touch-action: none;
   box-sizing: content-box;
   background-size: cover;
@@ -49,6 +49,39 @@
   width: 280px;
   height: 250px;
   pointer-events: auto;
+  opacity: 1;
+  transition: opacity 0.22s ease;
+}
+
+.solo-kanbanniang.is-loading canvas {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.solo-kanbanniang.is-loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2.5px solid rgba(37, 103, 81, 0.22);
+  border-color: color-mix(in srgb, var(--volo-accent, #256751) 22%, transparent);
+  border-top-color: var(--volo-accent, #256751);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .solo-kanbanniang.is-loading::after {
+    animation: kbnLoaderSpin 0.85s linear infinite;
+  }
+}
+
+@keyframes kbnLoaderSpin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Left / Right Dock Positioning (when not manually dragged) */
@@ -235,8 +268,10 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
   top: var(--kbn-tip-top, 8px);
 }
 
-.solo-kanbanniang__tip.is-visible {
-  animation: kanbanniangshake 60s ease-in-out 5s infinite;
+@media (prefers-reduced-motion: no-preference) {
+  .solo-kanbanniang__tip.is-visible {
+    animation: kanbanniangshake 60s ease-in-out 5s infinite;
+  }
 }
 
 @keyframes kanbanniangshake {
@@ -316,13 +351,8 @@ body.modal-open .solo-kanbanniang {
   .solo-kanbanniang {
     background-image: none !important;
   }
-  .solo-kanbanniang,
-  .solo-kanbanniang__tip,
-  .solo-kanbanniang__tip.is-visible,
-  .solo-kanbanniang__tool,
-  .solo-kanbanniang__tool button {
-    animation: none !important;
-    transition: none !important;
+  .solo-kanbanniang__tool button:active {
+    transform: none;
   }
 }
 
