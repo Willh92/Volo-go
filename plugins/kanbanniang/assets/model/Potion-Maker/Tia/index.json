@@ -57,9 +57,6 @@
         "file": "model/Potion-Maker/Pio/motions/Breath Dere1.mtn"
       },
       {
-        "file": "model/Potion-Maker/Pio/motions/Breath Dere2.mtn"
-      },
-      {
         "file": "model/Potion-Maker/Pio/motions/Breath Dere3.mtn"
       },
       {
@@ -77,7 +74,7 @@
     ],
     "sleepy": [
       {
-        "file": "model/Potion-Maker/Pio/motions/Sleeping.mtn"
+        "file": "model/Potion-Maker/Tia/motions/Sleeping.mtn"
       }
     ],
     "flick_head": [

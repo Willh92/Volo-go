@@ -556,27 +556,129 @@ function CommandPalette({
 const HORIZONTAL_STRIPS_SELECTOR = ".volo-subtabs, .volo-filter-pills, .volo-seg, .volo-ed-modes, .volo-ed-mobile-tabs";
 const ACTIVE_CHIP_SELECTOR = ":scope > .active, :scope > .is-active, :scope > [aria-selected='true']";
 
+function findEdgeVisibleChild(strip: HTMLElement, first: boolean): HTMLElement | null {
+  let cur = first ? strip.firstElementChild : strip.lastElementChild;
+  while (cur) {
+    if (cur instanceof HTMLElement && cur.offsetWidth > 0) return cur;
+    cur = first ? cur.nextElementSibling : cur.previousElementSibling;
+  }
+  return null;
+}
+
 function revealActiveChipInStrip(strip: HTMLElement, activeEl: HTMLElement, smooth: boolean): boolean {
   if (strip.clientWidth <= 0 || activeEl.offsetWidth <= 0) return false;
-  if (strip.scrollWidth <= strip.clientWidth + 1) return true;
-  const cRect = strip.getBoundingClientRect();
-  const aRect = activeEl.getBoundingClientRect();
-  const peek = Math.min(28, Math.max(14, Math.round(cRect.width * 0.08)));
-  const padLeft = activeEl.previousElementSibling ? peek : 6;
-  const padRight = activeEl.nextElementSibling ? peek : 6;
-  if (aRect.left >= cRect.left + padLeft - 0.5 && aRect.right <= cRect.right - padRight + 0.5) {
+  const maxScroll = Math.max(0, strip.scrollWidth - strip.clientWidth);
+  if (maxScroll <= 1) {
+    if (Math.abs(strip.scrollLeft) > 0.5) {
+      strip.scrollLeft = 0;
+    }
     return true;
   }
-  const delta =
-    aRect.width >= cRect.width - 12
-      ? aRect.left - (cRect.left + 6)
-      : aRect.left + aRect.width / 2 - (cRect.left + cRect.width / 2);
+
+  const firstEl = findEdgeVisibleChild(strip, true);
+  const lastEl = findEdgeVisibleChild(strip, false);
+  const isFirst = !firstEl || firstEl === activeEl;
+  const isLast = !lastEl || lastEl === activeEl;
+
+  const cs = window.getComputedStyle(strip);
+  const isRTL = cs.direction === "rtl";
+  const cRect = strip.getBoundingClientRect();
+  const aRect = activeEl.getBoundingClientRect();
+  const scale = strip.offsetWidth > 0 && cRect.width > 0 ? cRect.width / strip.offsetWidth : 1;
+  const peek = Math.min(28, Math.max(20, Math.round(strip.clientWidth * 0.08)));
   const useSmooth = smooth && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-  try {
-    strip.scrollBy({ left: delta, behavior: useSmooth ? "smooth" : ("instant" as ScrollBehavior) });
-  } catch {
-    strip.scrollLeft += delta;
+
+  const applyScroll = (targetLeft: number, forceInstant: boolean) => {
+    if (!smooth && !forceInstant && Math.abs(strip.scrollLeft - targetLeft) <= 0.5) return;
+    if (forceInstant || !useSmooth) {
+      strip.scrollLeft = targetLeft;
+      return;
+    }
+    try {
+      strip.scrollTo({ left: targetLeft, behavior: "smooth" });
+    } catch {
+      strip.scrollLeft = targetLeft;
+    }
+  };
+
+  if (isRTL) {
+    const minRTL = -maxScroll;
+    if (isFirst) {
+      const padRight = parseFloat(cs.paddingRight) || 0;
+      const borderRight = Math.max(0, strip.offsetWidth - strip.clientWidth - strip.clientLeft);
+      const expectedRight = cRect.right - (borderRight + padRight) * scale;
+      const visualDrift = Math.abs(aRect.right - expectedRight) > 3;
+      applyScroll(0, Math.abs(strip.scrollLeft) <= 0.5 && visualDrift);
+      return true;
+    }
+    if (isLast && activeEl.offsetWidth < strip.clientWidth - 12) {
+      const padLeft = parseFloat(cs.paddingLeft) || 0;
+      const expectedLeft = cRect.left + (strip.clientLeft + padLeft) * scale;
+      const visualDrift = Math.abs(aRect.left - expectedLeft) > 3;
+      applyScroll(minRTL, Math.abs(strip.scrollLeft - minRTL) <= 0.5 && visualDrift);
+      return true;
+    }
+    const curClamped = Math.max(minRTL, Math.min(0, strip.scrollLeft));
+    if (
+      Math.abs(strip.scrollLeft - curClamped) <= 0.5 &&
+      aRect.left >= cRect.left + peek * scale - 0.5 &&
+      aRect.right <= cRect.right - peek * scale + 0.5
+    ) {
+      return true;
+    }
+    const rawDelta =
+      activeEl.offsetWidth >= strip.clientWidth - 12
+        ? aRect.right - (cRect.right - 6 * scale)
+        : aRect.left + aRect.width / 2 - (cRect.left + cRect.width / 2);
+    const targetRTL = Math.max(minRTL, Math.min(0, Math.round(curClamped + rawDelta / scale)));
+    applyScroll(targetRTL, Math.abs(strip.scrollLeft - curClamped) > 1);
+    return true;
   }
+
+  const padLeft = parseFloat(cs.paddingLeft) || 0;
+  const padRight = parseFloat(cs.paddingRight) || 0;
+  const firstMarginLeft = firstEl ? parseFloat(window.getComputedStyle(firstEl).marginLeft) || 0 : 0;
+  const firstStart = padLeft + firstMarginLeft;
+  const itemStart = firstEl ? firstStart + (aRect.left - firstEl.getBoundingClientRect().left) / scale : firstStart;
+
+  if (isFirst) {
+    const expectedLeft = cRect.left + (strip.clientLeft + firstStart) * scale;
+    const visualDrift = Math.abs(aRect.left - expectedLeft) > 3;
+    if (!smooth && Math.abs(strip.scrollLeft) <= 0.5 && !visualDrift) return true;
+    applyScroll(0, Math.abs(strip.scrollLeft) <= 0.5 && visualDrift);
+    return true;
+  }
+
+  if (isLast && activeEl.offsetWidth < strip.clientWidth - 12) {
+    const borderRight = Math.max(0, strip.offsetWidth - strip.clientWidth - strip.clientLeft);
+    const lastMarginRight = lastEl ? parseFloat(window.getComputedStyle(lastEl).marginRight) || 0 : 0;
+    const expectedRight = cRect.right - (borderRight + padRight + lastMarginRight) * scale;
+    const visualDrift = Math.abs(aRect.right - expectedRight) > 3;
+    if (!smooth && Math.abs(strip.scrollLeft - maxScroll) <= 0.5 && !visualDrift) return true;
+    applyScroll(maxScroll, Math.abs(strip.scrollLeft - maxScroll) <= 0.5 && visualDrift);
+    return true;
+  }
+
+  const expectedVisualLeft = cRect.left + (strip.clientLeft + itemStart - strip.scrollLeft) * scale;
+  const isOverscrolled =
+    strip.scrollLeft < -0.5 ||
+    strip.scrollLeft > maxScroll + 0.5 ||
+    Math.abs(aRect.left - expectedVisualLeft) > 3;
+
+  if (
+    !isOverscrolled &&
+    aRect.left >= cRect.left + peek * scale - 0.5 &&
+    aRect.right <= cRect.right - peek * scale + 0.5
+  ) {
+    return true;
+  }
+
+  const rawTarget =
+    activeEl.offsetWidth >= strip.clientWidth - 12
+      ? itemStart - 6
+      : itemStart + activeEl.offsetWidth / 2 - strip.clientWidth / 2;
+  const targetLeft = Math.max(0, Math.min(maxScroll, Math.round(rawTarget)));
+  applyScroll(targetLeft, isOverscrolled && Math.abs(strip.scrollLeft - targetLeft) <= 0.5);
   return true;
 }
 

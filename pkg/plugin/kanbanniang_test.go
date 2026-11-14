@@ -66,8 +66,8 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 		}
 		seenInCatalog[entry.ID] = entry.Version
 	}
-	if seenInCatalog["kanbanniang"] != "2.0.2" || seenInCatalog["sensitive-words"] == "" {
-		t.Fatalf("expected kanbanniang=2.0.2 and sensitive-words in catalog, got %+v", seenInCatalog)
+	if seenInCatalog["kanbanniang"] != "2.0.4" || seenInCatalog["sensitive-words"] == "" {
+		t.Fatalf("expected kanbanniang=2.0.4 and sensitive-words in catalog, got %+v", seenInCatalog)
 	}
 
 	// 2. Stage kanbanniang into isolated test environment and verify admin/public endpoints + all 26 models.
@@ -155,7 +155,7 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 	}
 	// Only the host-managed external defer <script src="/plugins/kanbanniang/assets/widget.js?v=..."> tag may appear (zero inline JS).
 	if strings.Count(footerHTML, "<script") != 1 ||
-		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.2"`) ||
+		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.4"`) ||
 		!strings.Contains(footerHTML, `></script>`) {
 		t.Fatalf("expected single external defer widget.js script with zero inline JS, got: %s", footerHTML)
 	}
@@ -600,7 +600,7 @@ func TestKanbanniang_MinifiedZipInstallAndJSVMExecution(t *testing.T) {
 		t.Fatalf("package-plugin.py failed: %v\n%s", cErr, string(out))
 	}
 
-	builtZip := filepath.Join(outDir, "plugin-kanbanniang-v2.0.2.zip")
+	builtZip := filepath.Join(outDir, "plugin-kanbanniang-v2.0.4.zip")
 	zr, err := zip.OpenReader(builtZip)
 	if err != nil {
 		t.Fatalf("open built zip: %v", err)
@@ -706,6 +706,74 @@ func TestKanbanniang_MinifiedZipInstallAndJSVMExecution(t *testing.T) {
 	mgr.Handler().ServeHTTP(mdlRec, httptest.NewRequest(http.MethodGet, "/plugins/kanbanniang/api/model?model=bilibili-live/22", nil))
 	if mdlRec.Code != http.StatusOK || !strings.Contains(mdlRec.Body.String(), `"name":"bilibili-live/22"`) {
 		t.Fatalf("expected GET /api/model on minified kanbanniang to succeed, got %d %s", mdlRec.Code, mdlRec.Body.String())
+	}
+}
+
+func TestKanbanniang_MotionPurityAndControllerInvariants(t *testing.T) {
+	assetsRoot := filepath.Join("..", "..", "plugins", "kanbanniang", "assets")
+	listBytes, err := os.ReadFile(filepath.Join(assetsRoot, "model-list.json"))
+	if err != nil {
+		t.Fatalf("read model-list.json: %v", err)
+	}
+	var models []string
+	if err := json.Unmarshal(listBytes, &models); err != nil || len(models) != 26 {
+		t.Fatalf("expected 26 models in model-list.json, got %d (%v)", len(models), err)
+	}
+
+	for _, modelName := range models {
+		idxBytes, err := os.ReadFile(filepath.Join(assetsRoot, "model", filepath.FromSlash(modelName), "index.json"))
+		if err != nil {
+			t.Fatalf("read %s/index.json: %v", modelName, err)
+		}
+		var spec struct {
+			Motions map[string][]struct {
+				File string `json:"file"`
+			} `json:"motions"`
+		}
+		if err := json.Unmarshal(idxBytes, &spec); err != nil {
+			t.Fatalf("parse %s/index.json: %v", modelName, err)
+		}
+		for grp, items := range spec.Motions {
+			for _, m := range items {
+				if m.File == "" {
+					t.Fatalf("%s motion %s has empty file", modelName, grp)
+				}
+				mtnBytes, mErr := os.ReadFile(filepath.Join(assetsRoot, filepath.FromSlash(m.File)))
+				if mErr != nil {
+					t.Fatalf("%s motion %s (%s) missing on disk: %v", modelName, grp, m.File, mErr)
+				}
+				mtnStr := string(mtnBytes)
+				if modelName == "Potion-Maker/Pio" &&
+					(strings.Contains(mtnStr, "PARTS_01_BUST=") || strings.Contains(mtnStr, "PARAM_EYE_L_OPEN2=")) {
+					t.Fatalf("Potion-Maker/Pio %s contaminated with Tia-exclusive motion %s", grp, m.File)
+				}
+				if modelName == "Potion-Maker/Tia" && strings.Contains(mtnStr, "\nPARAM_EMOTION=0") {
+					t.Fatalf("Potion-Maker/Tia %s contaminated with Pio PARAM_EMOTION=0 motion %s", grp, m.File)
+				}
+			}
+		}
+	}
+
+	widgetSrc, err := os.ReadFile(filepath.Join(assetsRoot, "widget.js"))
+	if err != nil {
+		t.Fatalf("read widget.js: %v", err)
+	}
+	if !strings.Contains(string(widgetSrc), "function pickRuleTip(") ||
+		!strings.Contains(string(widgetSrc), "function resolveTipText(") ||
+		!strings.Contains(string(widgetSrc), "function enterLoadError(") ||
+		!strings.Contains(string(widgetSrc), "function retryLoad(") ||
+		strings.Contains(string(widgetSrc), "showMessage(tips.click,") {
+		t.Fatalf("widget.js missing rule-object tip unwrapping or manual retry recovery guard")
+	}
+
+	live2dSrc, err := os.ReadFile(filepath.Join(assetsRoot, "live2d.js"))
+	if err != nil {
+		t.Fatalf("read live2d.js: %v", err)
+	}
+	for _, needle := range []string{"bufferSubData(", "setSuspended:", "setOpenLevels", "syncCanvasDpr(", "volo:kanban-error"} {
+		if !strings.Contains(string(live2dSrc), needle) {
+			t.Fatalf("live2d.js missing expected optimization/fix symbol %q", needle)
+		}
 	}
 }
 

@@ -56,7 +56,7 @@
     return "/" + parts.map(encodeURIComponent).join("/");
   }
 
-  var version = host.getAttribute("data-version") || "2.0.2";
+  var version = host.getAttribute("data-version") || "2.0.4";
   var staticBase = safeSameOriginMountPath(
     host.getAttribute("data-static-base"),
     "/plugins/kanbanniang/assets"
@@ -67,30 +67,42 @@
   );
   var tipEl = host.querySelector(".solo-kanbanniang__tip");
 
+  var LOAD_TIMEOUT_MS = 25000;
+
   var alive = true;
   var started = false;
   var ready = false;
+  var loadFailed = false;
+  var canvasTainted = false;
   var initialGreetShown = false;
   var tipsLoaded = false;
   var currentModel = "";
+  var failedModel = "";
   var lastDescriptor = null;
+  var warmBootPromise = null;
+  var retryBtn = null;
   var loadSeq = 0;
   var pendingChangeTip = false;
   var patCount = parseInt(host.getAttribute("data-pats") || "0", 10) || 0;
 
   var messageTimer = 0;
+  var messageUntilMs = 0;
+  var seasonTimer = 0;
   var closeTimer = 0;
   var loadTimer = 0;
   var chatTimer = 0;
   var idleHandle = 0;
   var idleIsRaf = false;
+  var overlaySyncRaf = 0;
   var dragState = null;
   var lastHoverTarget = null;
+  var sakuraPreImg = null;
   var removers = [];
+  var canvasRemovers = [];
   var abortCtrl = typeof AbortController === "function" ? new AbortController() : null;
   var preloadBytesMap = Object.create(null);
   var preloadImagesMap = Object.create(null);
-  var preloadImageEls = [];
+  var activePreloadImgs = typeof Set === "function" ? new Set() : null;
 
   var tips = {
     mouseover: [],
@@ -267,6 +279,20 @@
           : isTW
             ? "如果轉載，也請記得註明出處。"
             : host.getAttribute("data-copy-tip") || "如果转载，也请记得注明出处。",
+      retryLabel: isEN
+        ? "Load failed · Retry"
+        : isJA
+          ? "読み込み失敗 · 再試行"
+          : isTW
+            ? "載入失敗 · 點擊重試"
+            : "加载失败 · 点击重试",
+      loadErrorTip: isEN
+        ? "Failed to load model. Click to retry or switch outfit~"
+        : isJA
+          ? "モデルの読み込みに失敗しました。クリックで再試行、または右側のボタンで切替できます～"
+          : isTW
+            ? "模型載入未完成，點擊重試或點右側換裝～"
+            : "模型加载未完成，点击重试或点右侧换装～",
       tools: {
         home: isEN ? "Back to Home" : isJA ? "ホームへ戻る" : isTW ? "返回首頁" : "返回首页",
         rss: isEN ? "Subscribe via RSS" : isJA ? "RSSを購読" : isTW ? "訂閱部落格" : "订阅博客",
@@ -277,6 +303,34 @@
         close: isEN ? "Hide Mascot" : isJA ? "看板娘を閉じる" : isTW ? "關閉看板娘" : "关闭看板娘"
       }
     };
+  }
+
+  function ensureRetryButton() {
+    if (retryBtn) return retryBtn;
+    if (!host || typeof host.querySelector !== "function") return null;
+    retryBtn = host.querySelector("[data-kbn-retry]");
+    if (
+      !retryBtn &&
+      typeof document.createElement === "function" &&
+      typeof host.appendChild === "function"
+    ) {
+      retryBtn = document.createElement("button");
+      retryBtn.type = "button";
+      retryBtn.className = "solo-kanbanniang__retry";
+      retryBtn.setAttribute("data-kbn-retry", "1");
+      retryBtn.hidden = true;
+      var loc = resolveLocaleStrings();
+      retryBtn.textContent = loc.retryLabel;
+      retryBtn.setAttribute("aria-label", loc.retryLabel);
+      listen(retryBtn, "click", function (ev) {
+        if (ev && typeof ev.stopPropagation === "function") {
+          ev.stopPropagation();
+        }
+        retryLoad();
+      });
+      host.appendChild(retryBtn);
+    }
+    return retryBtn;
   }
 
   function syncLocale() {
@@ -292,41 +346,147 @@
         btn.setAttribute("aria-label", loc.tools[k]);
       }
     }
+    if (retryBtn) {
+      retryBtn.textContent = loc.retryLabel;
+      retryBtn.setAttribute("aria-label", loc.retryLabel);
+    }
     if (isOverlayBlocking()) {
       hideMessage();
     }
     syncOffsetsAndPosition();
   }
 
+  function syncOverlayState() {
+    overlaySyncRaf = 0;
+    if (!alive) return;
+    var blocked = isOverlayBlocking();
+    if (blocked) {
+      hideMessage();
+    }
+    if (
+      window.VoloLive2D &&
+      typeof window.VoloLive2D.setSuspended === "function"
+    ) {
+      window.VoloLive2D.setSuspended(blocked);
+    }
+  }
+
+  function scheduleOverlaySync() {
+    if (!alive || overlaySyncRaf) return;
+    if (typeof window.requestAnimationFrame === "function") {
+      overlaySyncRaf = window.requestAnimationFrame(syncOverlayState);
+    } else {
+      overlaySyncRaf = window.setTimeout(syncOverlayState, 16);
+    }
+  }
+
+  function resolveTipText(raw) {
+    for (var depth = 0; depth < 5 && raw != null; depth++) {
+      if (typeof raw === "string") {
+        var trimmed = raw.trim();
+        return trimmed && trimmed.indexOf("[object ") === -1 ? trimmed : "";
+      }
+      if (Array.isArray(raw)) {
+        if (raw.length === 0) return "";
+        raw = raw[Math.floor(Math.random() * raw.length)];
+        continue;
+      }
+      if (typeof raw === "object" && raw.text != null) {
+        raw = raw.text;
+        continue;
+      }
+      return "";
+    }
+    return "";
+  }
+
+  function pickRuleTip(rules, targetEl) {
+    if (!rules) return "";
+    if (typeof rules === "string") return resolveTipText(rules);
+    if (!Array.isArray(rules) || rules.length === 0) return "";
+
+    var candidates = [];
+    for (var i = 0; i < rules.length; i++) {
+      var item = rules[i];
+      if (!item) continue;
+      if (typeof item === "string") {
+        candidates.push(item);
+        continue;
+      }
+      if (typeof item === "object" && item.text != null) {
+        if (!item.selector) {
+          candidates.push(item.text);
+          continue;
+        }
+        if (targetEl && typeof targetEl.closest === "function") {
+          try {
+            if (targetEl.closest(item.selector)) {
+              return resolveTipText(item.text);
+            }
+          } catch (err) {}
+        } else if (String(item.selector).indexOf("soloKanbanniang") !== -1) {
+          candidates.push(item.text);
+        }
+      }
+    }
+    return candidates.length > 0 ? resolveTipText(candidates) : "";
+  }
+
+  function extractHoverLabel(el) {
+    if (!el) return "";
+    var txt = String(el.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!txt && typeof el.getAttribute === "function") {
+      txt = String(
+        el.getAttribute("aria-label") || el.getAttribute("title") || ""
+      )
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+    if (!txt && typeof el.querySelector === "function") {
+      var img = el.querySelector("img[alt]");
+      if (img) {
+        txt = String(img.getAttribute("alt") || "")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+    }
+    return txt.slice(0, 42);
+  }
+
   function hideMessage() {
     if (!tipEl) return;
     clearTimeout(messageTimer);
+    messageUntilMs = 0;
     tipEl.style.opacity = "0";
     tipEl.classList.remove("is-visible");
   }
 
   function showMessage(text, durationMs) {
-    if (!alive || !ready || !tipEl || isClosedInSession()) return;
+    if (!alive || (!ready && !loadFailed) || !tipEl || isClosedInSession()) {
+      return;
+    }
     if (isOverlayBlocking()) {
       hideMessage();
       return;
     }
-    if (Array.isArray(text)) {
-      if (text.length === 0) return;
-      text = text[Math.floor(Math.random() * text.length)];
-    }
-    if (!text) return;
-    tipEl.textContent = String(text);
+    var resolved = resolveTipText(text);
+    if (!resolved) return;
+    var dur = durationMs || 4000;
+    tipEl.textContent = resolved;
     clampTipToViewport();
     tipEl.style.opacity = "1";
     tipEl.classList.add("is-visible");
     clearTimeout(messageTimer);
+    messageUntilMs = Date.now() + dur;
     messageTimer = window.setTimeout(function () {
+      messageUntilMs = 0;
       if (tipEl) {
         tipEl.style.opacity = "0";
         tipEl.classList.remove("is-visible");
       }
-    }, durationMs || 4000);
+    }, dur);
   }
 
   function probeImage2x2(dataUri) {
@@ -381,19 +541,30 @@
     return window.__voloKbnCapsPromise;
   }
 
+  function clearSakuraPreload() {
+    if (sakuraPreImg) {
+      sakuraPreImg.onload = sakuraPreImg.onerror = null;
+      try {
+        sakuraPreImg.removeAttribute("src");
+      } catch (err) {}
+      sakuraPreImg = null;
+    }
+  }
+
   function clearPreload() {
     preloadBytesMap = Object.create(null);
     preloadImagesMap = Object.create(null);
-    for (var i = 0; i < preloadImageEls.length; i++) {
-      var im = preloadImageEls[i];
-      if (im) {
-        im.onload = im.onerror = null;
-        try {
-          im.removeAttribute("src");
-        } catch (err) {}
-      }
+    if (activePreloadImgs) {
+      activePreloadImgs.forEach(function (im) {
+        if (im) {
+          im.onload = im.onerror = null;
+          try {
+            im.removeAttribute("src");
+          } catch (err) {}
+        }
+      });
+      activePreloadImgs.clear();
     }
-    preloadImageEls.length = 0;
   }
 
   function resolveDescriptorAssetUrl(descriptor, relPath) {
@@ -431,13 +602,16 @@
     if (!url || preloadImagesMap[url]) return;
     var p = new Promise(function (resolve, reject) {
       var img = new Image();
-      preloadImageEls.push(img);
+      if (activePreloadImgs) activePreloadImgs.add(img);
       img.crossOrigin = "Anonymous";
+      img.decoding = "async";
       img.onload = function () {
+        if (activePreloadImgs) activePreloadImgs.delete(img);
         img.onload = img.onerror = null;
         resolve(img);
       };
       img.onerror = function () {
+        if (activePreloadImgs) activePreloadImgs.delete(img);
         img.onload = img.onerror = null;
         try {
           img.removeAttribute("src");
@@ -464,13 +638,21 @@
     if (
       descriptor.motions &&
       Array.isArray(descriptor.motions.idle) &&
-      descriptor.motions.idle.length === 1 &&
-      descriptor.motions.idle[0] &&
-      descriptor.motions.idle[0].file
+      descriptor.motions.idle.length > 0
     ) {
-      prefetchBytes(
-        resolveDescriptorAssetUrl(descriptor, descriptor.motions.idle[0].file)
-      );
+      var idleList = descriptor.motions.idle;
+      var idleIdx =
+        typeof descriptor._initIdleIdx === "number" &&
+        descriptor._initIdleIdx >= 0 &&
+        descriptor._initIdleIdx < idleList.length
+          ? descriptor._initIdleIdx
+          : Math.floor(Math.random() * idleList.length);
+      descriptor._initIdleIdx = idleIdx;
+      if (idleList[idleIdx] && idleList[idleIdx].file) {
+        prefetchBytes(
+          resolveDescriptorAssetUrl(descriptor, idleList[idleIdx].file)
+        );
+      }
     }
     if (Array.isArray(descriptor.textures)) {
       for (var i = 0; i < descriptor.textures.length; i++) {
@@ -548,25 +730,35 @@
     return null;
   }
 
-  function fetchModelDescriptor(isRandomSwitch) {
-    if (!isRandomSwitch) {
+  function fetchModelDescriptor(isRandomSwitch, explicitModel) {
+    if (!isRandomSwitch && !explicitModel) {
       var inlined = consumeInitialDescriptor();
       if (inlined) return inlined;
     }
     var endpoint = isRandomSwitch ? "/absoluteRandomModel" : "/model";
+    var targetModel =
+      explicitModel || host.getAttribute("data-model") || "random";
     var qs = isRandomSwitch
       ? "?exclude=" +
-        encodeURIComponent(currentModel || "") +
+        encodeURIComponent(currentModel || failedModel || "") +
         "&t=" +
         Date.now()
       : "?model=" +
-        encodeURIComponent(host.getAttribute("data-model") || "random");
+        encodeURIComponent(targetModel) +
+        (explicitModel ? "&t=" + Date.now() : "");
     var fetchOpts = { headers: { Accept: "application/json" } };
     if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
-    return fetch(apiBase + endpoint + qs, fetchOpts).then(function (resp) {
-      if (!resp.ok) throw new Error("Model API returned " + resp.status);
-      return resp.json();
-    });
+    return fetch(apiBase + endpoint + qs, fetchOpts)
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("Model API returned " + resp.status);
+        return resp.json();
+      })
+      .then(function (data) {
+        if (!data || typeof data !== "object" || !data.model) {
+          throw new Error("Invalid model descriptor");
+        }
+        return data;
+      });
   }
 
   function refreshSakuraBackground() {
@@ -591,14 +783,21 @@
         host.classList.remove("has-bg");
         return;
       }
+      clearSakuraPreload();
       var pre = new Image();
+      sakuraPreImg = pre;
+      pre.decoding = "async";
       pre.onload = function () {
+        if (sakuraPreImg === pre) sakuraPreImg = null;
+        pre.onload = pre.onerror = null;
         if (alive && host && !prefersReducedMotion()) {
           host.style.backgroundImage = 'url("' + webpUrl + '")';
           host.classList.add("has-bg");
         }
       };
       pre.onerror = function () {
+        if (sakuraPreImg === pre) sakuraPreImg = null;
+        pre.onload = pre.onerror = null;
         if (caps) caps.animWebp = false;
         if (alive && host) {
           host.style.backgroundImage = "none";
@@ -659,7 +858,16 @@
           var seasonal = matchSeasonalTip(tips.seasons);
           if (seasonal) {
             sSet("volo.kanban.seasonShown", "1");
-            showMessage(seasonal, 6000);
+            var waitMs = Math.max(0, messageUntilMs - Date.now());
+            if (waitMs > 0) {
+              window.clearTimeout(seasonTimer);
+              seasonTimer = window.setTimeout(function () {
+                seasonTimer = 0;
+                showMessage(seasonal, 6000);
+              }, waitMs + 250);
+            } else {
+              showMessage(seasonal, 6000);
+            }
           }
         }
       })
@@ -730,32 +938,119 @@
     clampTipToViewport();
   }
 
+  function clearCanvasRemovers() {
+    var list = canvasRemovers.splice(0);
+    for (var i = 0; i < list.length; i++) {
+      list[i]();
+    }
+  }
+
+  function clearErrorUI() {
+    loadFailed = false;
+    if (host) {
+      host.classList.remove("is-error");
+      delete host.dataset.error;
+    }
+    if (retryBtn) {
+      retryBtn.hidden = true;
+    }
+  }
+
   function pause() {
     loadSeq += 1;
+    warmBootPromise = null;
     pendingChangeTip = false;
     ready = false;
+    loadFailed = false;
+    failedModel = "";
     started = false;
     lastHoverTarget = null;
     dragState = null;
     clearPreload();
+    clearSakuraPreload();
     if (host) {
       host.hidden = true;
-      host.classList.remove("is-tools-open", "is-loading");
+      host.classList.remove("is-tools-open", "is-loading", "is-error");
       host.style.removeProperty("transform");
       host.style.removeProperty("will-change");
       delete host.dataset.ready;
+      delete host.dataset.error;
+    }
+    if (retryBtn) {
+      retryBtn.hidden = true;
     }
     window.clearTimeout(loadTimer);
+    window.clearTimeout(seasonTimer);
+    seasonTimer = 0;
     hideMessage();
     if (window.loadlive2d && typeof window.loadlive2d.dispose === "function") {
+      clearCanvasRemovers();
+      canvasTainted = true;
       window.loadlive2d.dispose();
     }
+  }
+
+  function enterLoadError(targetModelName) {
+    if (!alive || !started || shouldPauseForMobile() || isClosedInSession()) {
+      return;
+    }
+    loadSeq += 1;
+    warmBootPromise = null;
+    pendingChangeTip = false;
+    ready = false;
+    loadFailed = true;
+    if (targetModelName) {
+      failedModel = targetModelName;
+    } else if (!failedModel && currentModel) {
+      failedModel = currentModel;
+    }
+    clearPreload();
+    window.clearTimeout(loadTimer);
+    if (window.loadlive2d && typeof window.loadlive2d.dispose === "function") {
+      clearCanvasRemovers();
+      canvasTainted = true;
+      window.loadlive2d.dispose();
+    }
+    if (host) {
+      host.hidden = false;
+      host.classList.remove("is-closed", "is-closing", "is-loading");
+      host.classList.add("is-error");
+      delete host.dataset.ready;
+      host.dataset.error = "true";
+    }
+    var btn = ensureRetryButton();
+    if (btn) {
+      btn.hidden = false;
+    }
+    syncOffsetsAndPosition();
+    if (!isOverlayBlocking()) {
+      showMessage(resolveLocaleStrings().loadErrorTip, 6000);
+    }
+  }
+
+  function retryLoad() {
+    if (!alive || isClosedInSession() || shouldPauseForMobile()) return;
+    if (!started) {
+      start();
+      return;
+    }
+    change(false, failedModel);
+  }
+
+  function listenCanvas(canvasEl, type, fn) {
+    if (!canvasEl || !canvasEl.addEventListener) return;
+    canvasEl.addEventListener(type, fn, false);
+    canvasRemovers.push(function () {
+      try {
+        canvasEl.removeEventListener(type, fn, false);
+      } catch (err) {}
+    });
   }
 
   function bindCanvasContextRecovery(canvasEl) {
     if (!canvasEl || canvasEl.__voloCtxBound) return;
     canvasEl.__voloCtxBound = true;
-    listen(canvasEl, "webglcontextlost", function (ev) {
+    listenCanvas(canvasEl, "webglcontextlost", function (ev) {
       if (!alive || !started) return;
       if (ev && typeof ev.preventDefault === "function") {
         ev.preventDefault();
@@ -766,18 +1061,35 @@
       }
       window.clearTimeout(loadTimer);
     });
-    listen(canvasEl, "webglcontextrestored", function () {
+    listenCanvas(canvasEl, "webglcontextrestored", function () {
       if (!alive || !started || shouldPauseForMobile() || isClosedInSession()) {
         return;
       }
+      clearErrorUI();
+      host.classList.add("is-loading");
       window.clearTimeout(loadTimer);
-      loadTimer = window.setTimeout(pause, 12000);
+      loadTimer = window.setTimeout(function () {
+        enterLoadError(currentModel);
+      }, LOAD_TIMEOUT_MS);
       if (lastDescriptor && typeof window.loadlive2d === "function") {
         window.loadlive2d("soloKanbanniang", lastDescriptor);
       } else {
-        change(false);
+        change(false, currentModel);
       }
     });
+  }
+
+  function ensureFreshCanvas() {
+    var canvasEl = host.querySelector("#soloKanbanniang");
+    if (canvasEl && canvasTainted && canvasEl.parentNode) {
+      clearCanvasRemovers();
+      var freshCanvas = canvasEl.cloneNode(false);
+      canvasEl.parentNode.replaceChild(freshCanvas, canvasEl);
+      canvasEl = freshCanvas;
+      canvasTainted = false;
+    }
+    bindCanvasContextRecovery(canvasEl);
+    return canvasEl;
   }
 
   function destroy() {
@@ -791,13 +1103,23 @@
       }
       idleHandle = 0;
     }
+    if (overlaySyncRaf) {
+      if (typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(overlaySyncRaf);
+      } else {
+        window.clearTimeout(overlaySyncRaf);
+      }
+      overlaySyncRaf = 0;
+    }
     if (abortCtrl) {
       try {
         abortCtrl.abort();
       } catch (err) {}
     }
     window.clearTimeout(closeTimer);
+    window.clearTimeout(seasonTimer);
     window.clearInterval(chatTimer);
+    clearCanvasRemovers();
     var list = removers.splice(0);
     for (var i = 0; i < list.length; i++) {
       list[i]();
@@ -805,65 +1127,24 @@
     pause();
   }
 
-  function change(isRandomSwitch) {
+  function change(isRandomSwitch, explicitModel) {
     if (!alive || !started) return;
     var seq = ++loadSeq;
     ready = false;
+    clearErrorUI();
     delete host.dataset.ready;
     clearPreload();
-    host.classList.add("is-loading");
-    window.clearTimeout(loadTimer);
-    loadTimer = window.setTimeout(pause, 12000);
-
-    var prepared = Promise.all([
-      ensureCapabilities(),
-      fetchModelDescriptor(!!isRandomSwitch)
-    ]).then(function (pair) {
-      var caps = pair[0];
-      var descriptor = pair[1];
-      if (
-        seq === loadSeq &&
-        alive &&
-        started &&
-        !shouldPauseForMobile() &&
-        descriptor
-      ) {
-        prefetchDescriptor(descriptor, !!caps.webglWebp);
-      }
-      return descriptor;
-    });
-
-    Promise.all([prepared, loadSDK()])
-      .then(function (res) {
-        if (seq !== loadSeq) return;
-        var descriptor = res[0];
-        if (!alive || !started || shouldPauseForMobile()) return;
-        lastDescriptor = descriptor || lastDescriptor;
-        currentModel = (descriptor && descriptor.name) || currentModel;
-        window.loadlive2d("soloKanbanniang", descriptor);
-      })
-      .catch(function () {
-        if (seq === loadSeq) pause();
-      });
-  }
-
-  function start() {
-    if (!alive || started || shouldPauseForMobile() || isClosedInSession()) {
-      return;
-    }
-    var seq = ++loadSeq;
-    started = true;
-    syncOffsetsAndPosition();
+    host.hidden = false;
     host.classList.remove("is-closed", "is-closing");
     host.classList.add("is-loading");
-    host.hidden = false;
     window.clearTimeout(loadTimer);
-    loadTimer = window.setTimeout(pause, 12000);
+    loadTimer = window.setTimeout(function () {
+      if (seq === loadSeq) enterLoadError(explicitModel || "");
+    }, LOAD_TIMEOUT_MS);
 
-    var sdkPromise = loadSDK();
     var prepared = Promise.all([
       ensureCapabilities(),
-      fetchModelDescriptor(false)
+      fetchModelDescriptor(!!isRandomSwitch, explicitModel)
     ]).then(function (pair) {
       var caps = pair[0];
       var descriptor = pair[1];
@@ -879,7 +1160,75 @@
       return pair;
     });
 
-    Promise.all([prepared, sdkPromise])
+    Promise.all([prepared, loadSDK()])
+      .then(function (res) {
+        if (seq !== loadSeq) return;
+        var caps = res[0][0];
+        var descriptor = res[0][1];
+        if (!alive || !started || shouldPauseForMobile()) return;
+        window.VoloLive2D = window.VoloLive2D || {};
+        window.VoloLive2D.useWebp = !!caps.webglWebp;
+        window.VoloLive2D.muted = host.getAttribute("data-mute-sound") === "1";
+        window.VoloLive2D.suspended = isOverlayBlocking();
+        ensureFreshCanvas();
+        lastDescriptor = descriptor || lastDescriptor;
+        currentModel = (descriptor && descriptor.name) || currentModel;
+        failedModel = (descriptor && descriptor.name) || explicitModel || currentModel;
+        window.loadlive2d("soloKanbanniang", descriptor);
+      })
+      .catch(function () {
+        if (seq === loadSeq) enterLoadError(explicitModel || "");
+      });
+  }
+
+  function warmInitialAssets(expectedSeq) {
+    if (!warmBootPromise) {
+      var sdkPromise = loadSDK();
+      var prepared = Promise.all([
+        ensureCapabilities(),
+        fetchModelDescriptor(false)
+      ]).then(function (pair) {
+        var caps = pair[0];
+        var descriptor = pair[1];
+        if (
+          expectedSeq === loadSeq &&
+          alive &&
+          !shouldPauseForMobile() &&
+          !isClosedInSession() &&
+          descriptor
+        ) {
+          prefetchDescriptor(descriptor, !!caps.webglWebp);
+        }
+        return pair;
+      });
+      warmBootPromise = Promise.all([prepared, sdkPromise]).catch(function (err) {
+        warmBootPromise = null;
+        throw err;
+      });
+    }
+    return warmBootPromise;
+  }
+
+  function start() {
+    if (!alive || started || shouldPauseForMobile() || isClosedInSession()) {
+      return;
+    }
+    var seq = warmBootPromise ? loadSeq : ++loadSeq;
+    started = true;
+    clearErrorUI();
+    syncOffsetsAndPosition();
+    host.classList.remove("is-closed", "is-closing");
+    host.classList.add("is-loading");
+    host.hidden = false;
+    window.clearTimeout(loadTimer);
+    loadTimer = window.setTimeout(function () {
+      if (seq === loadSeq) enterLoadError("");
+    }, LOAD_TIMEOUT_MS);
+
+    var bootPromise = warmInitialAssets(seq);
+    warmBootPromise = null;
+
+    bootPromise
       .then(function (res) {
         if (seq !== loadSeq) return;
         if (!alive || shouldPauseForMobile() || !host.isConnected) {
@@ -895,20 +1244,17 @@
         window.VoloLive2D = window.VoloLive2D || {};
         window.VoloLive2D.useWebp = !!caps.webglWebp;
         window.VoloLive2D.muted = host.getAttribute("data-mute-sound") === "1";
+        window.VoloLive2D.suspended = isOverlayBlocking();
 
-        var oldCanvas = host.querySelector("#soloKanbanniang");
-        if (oldCanvas && oldCanvas.parentNode) {
-          var freshCanvas = oldCanvas.cloneNode(false);
-          oldCanvas.parentNode.replaceChild(freshCanvas, oldCanvas);
-          bindCanvasContextRecovery(freshCanvas);
-        }
+        ensureFreshCanvas();
 
         lastDescriptor = descriptor || null;
         currentModel = (descriptor && descriptor.name) || "";
+        failedModel = currentModel;
         window.loadlive2d("soloKanbanniang", descriptor);
       })
       .catch(function () {
-        if (seq === loadSeq) pause();
+        if (seq === loadSeq) enterLoadError("");
       });
   }
 
@@ -917,6 +1263,8 @@
       host.hidden = true;
       return;
     }
+    var seq = ++loadSeq;
+    warmInitialAssets(seq).catch(function () {});
     if (typeof window.requestAnimationFrame === "function") {
       idleIsRaf = true;
       idleHandle = window.requestAnimationFrame(function () {
@@ -953,7 +1301,7 @@
     }
   }
 
-  function sendHeadPat() {
+  function sendHeadPat(targetEl) {
     var loc = resolveLocaleStrings();
     fetch(apiBase + "/pat", {
       method: "POST",
@@ -981,8 +1329,8 @@
           patCount += 1;
         }
         host.setAttribute("data-pats", String(patCount));
-        if (Array.isArray(tips.click) && tips.click.length > 0) {
-          var quote = tips.click[Math.floor(Math.random() * tips.click.length)];
+        var quote = pickRuleTip(tips.click, targetEl);
+        if (quote) {
           showMessage(quote + " (✨ +" + patCount + ")", 4500);
         } else {
           showMessage("✨ +" + patCount, 4000);
@@ -992,8 +1340,9 @@
         if (!alive) return;
         patCount += 1;
         host.setAttribute("data-pats", String(patCount));
-        if (Array.isArray(tips.click) && tips.click.length > 0) {
-          showMessage(tips.click, 4500);
+        var quote = pickRuleTip(tips.click, targetEl);
+        if (quote) {
+          showMessage(quote + " (✨ +" + patCount + ")", 4500);
         } else {
           showMessage("✨ +" + patCount, 4000);
         }
@@ -1020,6 +1369,10 @@
   });
   bindTool("change", function () {
     pendingChangeTip = true;
+    if (!started) {
+      start();
+      return;
+    }
     change(true);
   });
   bindTool("photo", function () {
@@ -1048,13 +1401,15 @@
       return;
     }
     ready = true;
+    failedModel = "";
+    clearErrorUI();
     window.clearTimeout(loadTimer);
     host.dataset.ready = "true";
     if (ev && ev.detail && ev.detail.model) {
       currentModel = ev.detail.model;
     }
     host.hidden = false;
-    host.classList.remove("is-closed", "is-closing", "is-loading");
+    host.classList.remove("is-closed", "is-closing", "is-loading", "is-error");
     syncOffsetsAndPosition();
     if (window.VoloLive2D) {
       if (typeof window.VoloLive2D.drawNow === "function") {
@@ -1081,6 +1436,17 @@
     }
   });
 
+  listen(window, "volo:kanban-error", function (ev) {
+    if (!alive || !started || shouldPauseForMobile() || isClosedInSession()) {
+      return;
+    }
+    if (ev && ev.detail && ev.detail.reason === "webgl") {
+      canvasTainted = true;
+    }
+    var errModel = (ev && ev.detail && ev.detail.model) || failedModel || currentModel;
+    enterLoadError(errModel);
+  });
+
   bindCanvasContextRecovery(host.querySelector("#soloKanbanniang"));
 
   listen(
@@ -1097,8 +1463,35 @@
     { passive: true }
   );
 
-  listen(document, "volo:pjax:after", syncLocale);
-  listen(document, "volo:page-load", syncLocale);
+  listen(document, "volo:pjax:after", function () {
+    syncLocale();
+    scheduleOverlaySync();
+  });
+  listen(document, "volo:page-load", function () {
+    syncLocale();
+    scheduleOverlaySync();
+  });
+  listen(document, "click", scheduleOverlaySync, { passive: true });
+  listen(document, "close", scheduleOverlaySync, true);
+
+  if (typeof MutationObserver === "function") {
+    var rootObserver = new MutationObserver(scheduleOverlaySync);
+    if (document.documentElement) {
+      rootObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["class", "data-podcast-open"]
+      });
+    }
+    if (document.body) {
+      rootObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ["class"]
+      });
+    }
+    removers.push(function () {
+      rootObserver.disconnect();
+    });
+  }
 
   listen(
     document,
@@ -1117,6 +1510,7 @@
     if (ev && ev.key === "Escape" && host) {
       host.classList.remove("is-tools-open");
     }
+    scheduleOverlaySync();
   });
 
   listen(document, "copy", function () {
@@ -1150,7 +1544,7 @@
       var list = tips.mouseover;
       for (var i = 0; i < list.length; i++) {
         var entry = list[i];
-        if (!entry || !entry.selector || !entry.text) continue;
+        if (!entry || !entry.selector || entry.text == null) continue;
         var matched = null;
         try {
           matched = target.closest(entry.selector);
@@ -1161,10 +1555,14 @@
           matched &&
           (!ev.relatedTarget || !matched.contains(ev.relatedTarget))
         ) {
-          var labelText = String(matched.textContent || "")
-            .trim()
-            .slice(0, 42);
-          showMessage(String(entry.text).replace("{text}", labelText), 3200);
+          var tpl = resolveTipText(entry.text);
+          if (!tpl) break;
+          if (tpl.indexOf("{text}") !== -1) {
+            var labelText = extractHoverLabel(matched);
+            if (!labelText) break;
+            tpl = tpl.replace(/\{text\}/g, labelText);
+          }
+          showMessage(tpl, 3200);
           break;
         }
       }
@@ -1263,18 +1661,21 @@
       return;
     }
     if (!isCancel) {
+      if (loadFailed) {
+        retryLoad();
+        return;
+      }
       if (isTouchOrCoarse(ev)) {
         host.classList.toggle("is-tools-open");
       }
       if (state.isCanvas && ready) {
         if (
-          ev.pointerType !== "mouse" &&
           window.VoloLive2D &&
           typeof window.VoloLive2D.tapClient === "function"
         ) {
           window.VoloLive2D.tapClient(ev.clientX, ev.clientY);
         }
-        sendHeadPat();
+        sendHeadPat(ev.target);
       }
     }
   }
@@ -1292,10 +1693,14 @@
   window.VoloKanban = {
     destroy: destroy,
     change: change,
+    retry: retryLoad,
     showMessage: showMessage,
     syncLocale: syncLocale,
     isReady: function () {
       return ready;
+    },
+    hasError: function () {
+      return loadFailed;
     },
     isAlive: function () {
       return alive;

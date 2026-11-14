@@ -2680,10 +2680,22 @@
     });
   }
 
+  function findEdgeVisibleTrackChild(track, first) {
+    var cur = first ? track.firstElementChild : track.lastElementChild;
+    while (cur) {
+      if (cur.offsetWidth > 0) return cur;
+      cur = first ? cur.nextElementSibling : cur.previousElementSibling;
+    }
+    return null;
+  }
+
   function revealActiveTrackItem(trackSel, activeSel, smooth) {
     document.querySelectorAll(trackSel).forEach(function (track) {
-      if (!track || track.clientWidth <= 0 || track.scrollWidth <= track.clientWidth + 1) {
-        if (track && track.classList && track.classList.contains("studio-nav__track")) updateNavTrackOverflow(track);
+      if (!track || track.clientWidth <= 0) return;
+      var maxScroll = Math.max(0, track.scrollWidth - track.clientWidth);
+      if (maxScroll <= 1) {
+        if (Math.abs(track.scrollLeft) > 0.5) track.scrollLeft = 0;
+        if (track.classList && track.classList.contains("studio-nav__track")) updateNavTrackOverflow(track);
         return;
       }
       var activeEl = track.querySelector(activeSel);
@@ -2691,28 +2703,131 @@
         if (track.classList.contains("studio-nav__track")) updateNavTrackOverflow(track);
         return;
       }
+
+      var firstEl = findEdgeVisibleTrackChild(track, true);
+      var lastEl = findEdgeVisibleTrackChild(track, false);
+      var isFirst = !firstEl || firstEl === activeEl;
+      var isLast = !lastEl || lastEl === activeEl;
+
+      var cs = window.getComputedStyle(track);
+      var isRTL = cs.direction === "rtl";
       var cRect = track.getBoundingClientRect();
       var aRect = activeEl.getBoundingClientRect();
-      var peek = Math.min(28, Math.max(14, Math.round(cRect.width * 0.08)));
-      var padLeft = activeEl.previousElementSibling ? peek : 6;
-      var padRight = activeEl.nextElementSibling ? peek : 18;
-      if (aRect.left >= cRect.left + padLeft - 0.5 && aRect.right <= cRect.right - padRight + 0.5) {
-        if (track.classList.contains("studio-nav__track")) updateNavTrackOverflow(track);
+      var scale = track.offsetWidth > 0 && cRect.width > 0 ? cRect.width / track.offsetWidth : 1;
+      var peek = Math.min(28, Math.max(20, Math.round(track.clientWidth * 0.08)));
+      var wantSmooth = Boolean(smooth);
+      var useSmooth = wantSmooth && !prefersReducedMotion();
+
+      function finishOverflowSync() {
+        if (track.classList.contains("studio-nav__track")) {
+          updateNavTrackOverflow(track);
+          requestAnimationFrame(function () { updateNavTrackOverflow(track); });
+        }
+      }
+
+      function applyScroll(targetLeft, forceInstant) {
+        if (!wantSmooth && !forceInstant && Math.abs(track.scrollLeft - targetLeft) <= 0.5) return;
+        if (forceInstant || !useSmooth) {
+          track.scrollLeft = targetLeft;
+          return;
+        }
+        try {
+          track.scrollTo({ left: targetLeft, behavior: "smooth" });
+        } catch (e) {
+          track.scrollLeft = targetLeft;
+        }
+      }
+
+      if (isRTL) {
+        var minRTL = -maxScroll;
+        if (isFirst) {
+          var rtlPadR = parseFloat(cs.paddingRight) || 0;
+          var rtlBorderR = Math.max(0, track.offsetWidth - track.clientWidth - track.clientLeft);
+          var rtlExpR = cRect.right - (rtlBorderR + rtlPadR) * scale;
+          applyScroll(0, Math.abs(track.scrollLeft) <= 0.5 && Math.abs(aRect.right - rtlExpR) > 3);
+          finishOverflowSync();
+          return;
+        }
+        if (isLast && activeEl.offsetWidth < track.clientWidth - 12) {
+          var rtlPadL = parseFloat(cs.paddingLeft) || 0;
+          var rtlExpL = cRect.left + (track.clientLeft + rtlPadL) * scale;
+          applyScroll(minRTL, Math.abs(track.scrollLeft - minRTL) <= 0.5 && Math.abs(aRect.left - rtlExpL) > 3);
+          finishOverflowSync();
+          return;
+        }
+        var curClamped = Math.max(minRTL, Math.min(0, track.scrollLeft));
+        if (
+          Math.abs(track.scrollLeft - curClamped) <= 0.5 &&
+          aRect.left >= cRect.left + peek * scale - 0.5 &&
+          aRect.right <= cRect.right - peek * scale + 0.5
+        ) {
+          finishOverflowSync();
+          return;
+        }
+        var rawDelta =
+          activeEl.offsetWidth >= track.clientWidth - 12
+            ? aRect.right - (cRect.right - 6 * scale)
+            : (aRect.left + aRect.width / 2) - (cRect.left + cRect.width / 2);
+        var targetRTL = Math.max(minRTL, Math.min(0, Math.round(curClamped + rawDelta / scale)));
+        applyScroll(targetRTL, Math.abs(track.scrollLeft - curClamped) > 1);
+        finishOverflowSync();
         return;
       }
-      var delta =
-        aRect.width >= cRect.width - 12
-          ? aRect.left - (cRect.left + 6)
-          : (aRect.left + aRect.width / 2) - (cRect.left + cRect.width / 2);
-      var useSmooth = Boolean(smooth) && !prefersReducedMotion();
-      try {
-        track.scrollBy({ left: delta, behavior: useSmooth ? "smooth" : "instant" });
-      } catch (e) {
-        track.scrollLeft += delta;
+
+      var padLeft = parseFloat(cs.paddingLeft) || 0;
+      var padRight = parseFloat(cs.paddingRight) || 0;
+      var firstMarginLeft = firstEl ? (parseFloat(window.getComputedStyle(firstEl).marginLeft) || 0) : 0;
+      var firstStart = padLeft + firstMarginLeft;
+      var itemStart = firstEl ? firstStart + (aRect.left - firstEl.getBoundingClientRect().left) / scale : firstStart;
+
+      if (isFirst) {
+        var expectedLeft = cRect.left + (track.clientLeft + firstStart) * scale;
+        var driftFirst = Math.abs(aRect.left - expectedLeft) > 3;
+        if (!wantSmooth && Math.abs(track.scrollLeft) <= 0.5 && !driftFirst) {
+          finishOverflowSync();
+          return;
+        }
+        applyScroll(0, Math.abs(track.scrollLeft) <= 0.5 && driftFirst);
+        finishOverflowSync();
+        return;
       }
-      if (track.classList.contains("studio-nav__track")) {
-        requestAnimationFrame(function () { updateNavTrackOverflow(track); });
+
+      if (isLast && activeEl.offsetWidth < track.clientWidth - 12) {
+        var borderRight = Math.max(0, track.offsetWidth - track.clientWidth - track.clientLeft);
+        var lastMarginRight = lastEl ? (parseFloat(window.getComputedStyle(lastEl).marginRight) || 0) : 0;
+        var expectedRight = cRect.right - (borderRight + padRight + lastMarginRight) * scale;
+        var driftLast = Math.abs(aRect.right - expectedRight) > 3;
+        if (!wantSmooth && Math.abs(track.scrollLeft - maxScroll) <= 0.5 && !driftLast) {
+          finishOverflowSync();
+          return;
+        }
+        applyScroll(maxScroll, Math.abs(track.scrollLeft - maxScroll) <= 0.5 && driftLast);
+        finishOverflowSync();
+        return;
       }
+
+      var expectedVisualLeft = cRect.left + (track.clientLeft + itemStart - track.scrollLeft) * scale;
+      var isOverscrolled =
+        track.scrollLeft < -0.5 ||
+        track.scrollLeft > maxScroll + 0.5 ||
+        Math.abs(aRect.left - expectedVisualLeft) > 3;
+
+      if (
+        !isOverscrolled &&
+        aRect.left >= cRect.left + peek * scale - 0.5 &&
+        aRect.right <= cRect.right - peek * scale + 0.5
+      ) {
+        finishOverflowSync();
+        return;
+      }
+
+      var rawTarget =
+        activeEl.offsetWidth >= track.clientWidth - 12
+          ? itemStart - 6
+          : itemStart + activeEl.offsetWidth / 2 - track.clientWidth / 2;
+      var targetLeft = Math.max(0, Math.min(maxScroll, Math.round(rawTarget)));
+      applyScroll(targetLeft, isOverscrolled && Math.abs(track.scrollLeft - targetLeft) <= 0.5);
+      finishOverflowSync();
     });
   }
 

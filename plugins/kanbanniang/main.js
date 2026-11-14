@@ -1,4 +1,4 @@
-var PLUGIN_VERSION = "2.0.2";
+var PLUGIN_VERSION = "2.0.4";
 var MODEL_NAME_RE = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/;
 var ALLOWED_POSITIONS = { left: true, right: true };
 var RESOURCE_KEYS = {

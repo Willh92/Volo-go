@@ -662,7 +662,6 @@ a {
   max-width: 100%;
   overflow-x: auto;
   overscroll-behavior-x: contain;
-  -webkit-overflow-scrolling: touch;
   scroll-padding-inline: 8px;
 }
 
@@ -4465,7 +4464,6 @@ body.volo-is-sorting * {
     flex-wrap: nowrap;
     white-space: nowrap;
     overscroll-behavior-x: contain;
-    -webkit-overflow-scrolling: touch;
     scroll-padding-inline: 12px;
     padding: 4px 6px 8px;
     margin: -4px -6px 18px;
@@ -4492,7 +4490,6 @@ body.volo-is-sorting * {
     flex-wrap: nowrap;
     max-width: 100%;
     overscroll-behavior-x: contain;
-    -webkit-overflow-scrolling: touch;
     scroll-padding-inline: 8px;
     padding: 3px;
     margin: -3px;
@@ -7864,7 +7861,6 @@ html[data-theme="dark"] .volo-auth-story {
     overflow-x: auto;
     overflow-y: hidden;
     overscroll-behavior-x: contain;
-    -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
   }
   .volo-ed-toolbar::-webkit-scrollbar {

@@ -6,10 +6,10 @@
 
 ---
 
-## [1.0.2] - 2026-11-14
+## [1.0.2] - 2026-11-15
 
 ### 新增特性
-- **官方 Live2D 看板娘独立插件 `kanbanniang v2.0.2` 与插件目录体系**：新增机器可读插件注册表 `plugins/catalog.json` 与 GitHub Actions 版本去重自动打包工作流，完整内置 26 套本地离线 Live2D 模型、Pio/Tia 150 套随机换装、SSR 首帧模型描述注入与 `.moc`/`.webp`/动作并行预取、统一单调时钟 WebGL 渲染循环、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与异步摸头计数；全量采用无损透明/动图 `.webp` 贴图与构建期 AST 代码压缩，独立安装包精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`），支持 `volo import-legacy` 自动迁移历史看板娘模型配置。
+- **官方 Live2D 看板娘独立插件 `kanbanniang v2.0.4` 与插件目录体系**：新增机器可读插件注册表 `plugins/catalog.json` 与 GitHub Actions 版本去重自动打包工作流，完整内置 26 套本地离线 Live2D 模型、Pio/Tia 150 套随机换装（清洗交叉污染动作集，补齐离散表情阶跃过渡与 `.moc` 原生眼睑死区保护）、高分屏 `2x` DPR 锐利渲染、容量自适应 `gl.bufferSubData` 网格流式更新、SSR 首帧模型描述注入与 `.moc`/`.webp`/首条待机动作并行预取、统一单调时钟 WebGL 渲染循环、加载失败保留面板与一键手动重试、全屏遮罩自动挂起、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与异步摸头计数；全量采用无损透明/动图 `.webp` 贴图与构建期 AST 代码压缩，独立安装包精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`），支持 `volo import-legacy` 自动迁移历史看板娘模型配置。
 - **多语言家族代码高亮引擎与无标尺智能探测**：纯 Go 服务端与三模式编辑器同步扩展专用词法器（涵盖 Go、JS/TS/JSX/TSX、Python、Rust、Java/Kotlin、C/C++/C#、PHP、Ruby、Lua、GraphQL、Protobuf、HCL/Terraform、SQL、YAML、TOML、Nginx/Apache/Conf、Shell/PowerShell、Diff、HTML/XML、CSS/SCSS、JSON/JSONC 等 30+ 语言），支持未标注语言围栏代码块的自动语言推断、语言徽标展示与一键选择修改语言。
 - **Studio 三模式编辑器深度增强**：新增原生查找与替换栏（`Ctrl/Cmd+F`、`Ctrl/Cmd+H`，支持在即时渲染模式下自动展开命中的折叠块与隐藏语法）、行首 `/` 快捷插入命令菜单（自动适配移动端 `visualViewport` 软键盘高度）、成对符号智能补全/包裹、跨网页富文本粘贴智能清洗（自动剔除搜索引擎角标与追踪噪音、解码懒加载图片、转换代码块与表格）、图片加载零抖动占位防跳以及 WYSIWYG 文件拖拽上传与表格行列快捷浮条。
 - **Markdown 引用块与五色 GitHub Callout 视觉升级**：重构前台双主题（`volo-studio` / `volo-journal`）与管理台编辑器的引用块及 `[!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]` 提示框层级排版、深浅色对比度与嵌套引用间距。

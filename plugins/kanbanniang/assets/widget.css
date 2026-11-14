@@ -53,9 +53,52 @@
   transition: opacity 0.22s ease;
 }
 
-.solo-kanbanniang.is-loading canvas {
+.solo-kanbanniang.is-loading canvas,
+.solo-kanbanniang.is-error canvas {
   opacity: 0;
   pointer-events: none;
+}
+
+.solo-kanbanniang__retry {
+  appearance: none;
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: max-content;
+  max-width: 196px;
+  height: fit-content;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.14));
+  background: var(--volo-surface, rgba(255, 255, 255, 0.94));
+  color: var(--volo-text, #26372f);
+  box-shadow: var(--volo-shadow, 0 3px 12px rgba(0, 0, 0, 0.12));
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-align: center;
+  cursor: pointer;
+  touch-action: manipulation;
+  z-index: 2;
+  transition: color 0.16s ease, border-color 0.16s ease, background-color 0.16s ease, transform 0.14s ease;
+}
+
+.solo-kanbanniang__retry:hover,
+.solo-kanbanniang__retry:focus-visible {
+  color: var(--volo-accent, #256751);
+  border-color: var(--volo-accent, #256751);
+  background: var(--volo-raised, #f0f5f1);
+  outline: 2px solid var(--volo-accent, #256751);
+  outline-offset: 2px;
+}
+
+.solo-kanbanniang__retry:active {
+  transform: scale(0.96);
+}
+
+.solo-kanbanniang__retry[hidden] {
+  display: none !important;
 }
 
 .solo-kanbanniang.is-loading::after {
@@ -166,18 +209,20 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
 
 .solo-kanbanniang:hover .solo-kanbanniang__tool,
 .solo-kanbanniang:focus-within .solo-kanbanniang__tool,
-.solo-kanbanniang.is-tools-open .solo-kanbanniang__tool {
+.solo-kanbanniang.is-tools-open .solo-kanbanniang__tool,
+.solo-kanbanniang.is-error .solo-kanbanniang__tool {
   opacity: 1;
   pointer-events: auto;
 }
 
 @media (hover: none), (pointer: coarse) {
-  .solo-kanbanniang:hover:not(.is-tools-open):not(:focus-within) .solo-kanbanniang__tool {
+  .solo-kanbanniang:hover:not(.is-tools-open):not(.is-error):not(:focus-within) .solo-kanbanniang__tool {
     opacity: 0;
     pointer-events: none;
   }
 
   .solo-kanbanniang.is-tools-open .solo-kanbanniang__tool,
+  .solo-kanbanniang.is-error .solo-kanbanniang__tool,
   .solo-kanbanniang:focus-within .solo-kanbanniang__tool {
     opacity: 1;
     pointer-events: auto;
@@ -229,6 +274,7 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
 /* Speech Bubble (anchored above frame so model face stays unobstructed, with viewport clamping) */
 .solo-kanbanniang__tip {
   opacity: 0;
+  visibility: hidden;
   position: absolute;
   bottom: calc(100% + 6px);
   top: auto;
@@ -255,7 +301,12 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
   box-shadow: var(--volo-shadow, 0 3px 14px rgba(0, 0, 0, 0.12));
   pointer-events: none;
   z-index: 3;
-  transition: opacity 0.2s ease;
+  animation: none;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+}
+
+.solo-kanbanniang__tip.is-visible {
+  visibility: visible;
 }
 
 .solo-kanbanniang__tip.is-flipped-below {

@@ -2152,7 +2152,6 @@ pre.chroma:has(.lnt) {
   overflow-y: hidden;
   max-width: 100%;
   padding: 4px 0;
-  -webkit-overflow-scrolling: touch;
 }
 .mermaid,
 .volo-prose pre.mermaid,
@@ -2216,7 +2215,6 @@ pre.chroma:has(.lnt) {
 .vc-content .volo-table-scroll {
   overflow-x: auto;
   max-width: 100%;
-  -webkit-overflow-scrolling: touch;
   margin: 1.3em 0;
   border: 1px solid var(--volo-line);
   border-radius: 10px;
@@ -2305,7 +2303,6 @@ html[data-theme="dark"] font[color="#4b5563" i],
 .volo-github-repos-wrap {
   overflow-x: auto;
   max-width: 100%;
-  -webkit-overflow-scrolling: touch;
   margin: 1.4em 0;
   border: 1px solid var(--volo-line);
   border-radius: 12px;
@@ -4271,7 +4268,6 @@ body.is-book-fullscreen #studio-main {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -5598,7 +5594,7 @@ body:has(#volo-podcast-mini:not([hidden])) #volo-kanbanniang-root[data-position=
     gap: 4px;
     overflow-x: auto;
     overscroll-behavior-x: contain;
-    -webkit-overflow-scrolling: touch;
+    scroll-padding-inline: 18px;
   }
   .studio-nav__track.has-overflow-right:not(.has-overflow-left) {
     -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
