@@ -20,7 +20,7 @@ RUN rm -rf /src/internal/adminui/dist /src/dist-minified-plugins && \
     node /src/.github/scripts/minify-plugin-assets.mjs \
       --dir /src/plugins/sensitive-words \
       --out-dir /src/dist-minified-plugins/sensitive-words && \
-    node -e 'const fs=require("fs");fs.writeFileSync("/src/dist-minified-plugins/catalog.json",JSON.stringify(JSON.parse(fs.readFileSync("/src/plugins/catalog.json","utf8"))));'
+    node --input-type=commonjs -e 'const fs=require("fs");fs.writeFileSync("/src/dist-minified-plugins/catalog.json",JSON.stringify(JSON.parse(fs.readFileSync("/src/plugins/catalog.json","utf8"))));'
 
 # ------------------------------------------------------------------------------
 # Stage 2: Compile Pure-Go Static Binary (CGO_ENABLED=0)
