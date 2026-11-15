@@ -791,8 +791,13 @@ func isAuthRateScope(scope string) bool {
 	return strings.HasPrefix(s, "admin:") ||
 		strings.HasPrefix(s, "login") ||
 		strings.HasPrefix(s, "2fa") ||
+		strings.HasPrefix(s, "stepup:") ||
+		strings.HasPrefix(s, "setup:") ||
+		strings.HasPrefix(s, "oidc_start") ||
 		strings.HasPrefix(s, "reader_login") ||
-		strings.HasPrefix(s, "reader_code")
+		strings.HasPrefix(s, "reader_register") ||
+		strings.HasPrefix(s, "reader_code") ||
+		strings.HasPrefix(s, "unlock_ip")
 }
 
 // AllowRate enforces a fixed-window rate limit keyed by (scope + /32 IPv4 or /64 IPv6 bucket),
@@ -853,6 +858,23 @@ func (w *WAFEngine) AllowRate(scope string, clientAddr netip.Addr, limit int, wi
 	}
 	rw.count++
 	return true
+}
+
+// ResetRate clears the rate-limit bucket for (scope, clientAddr), used to reset
+// consecutive step-up password failure counters after a valid password check.
+func (w *WAFEngine) ResetRate(scope string, clientAddr netip.Addr) {
+	if w == nil {
+		return
+	}
+	key := scope + "|" + RateLimitBucketKey(clientAddr)
+	authScope := isAuthRateScope(scope)
+	w.rateMu.Lock()
+	if authScope {
+		delete(w.authRates, key)
+	} else {
+		delete(w.rates, key)
+	}
+	w.rateMu.Unlock()
 }
 
 // WrapHTTP wraps next with:

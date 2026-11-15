@@ -1696,9 +1696,11 @@ export function AnimatedModal({
 export function UploadProgressBar({
   progress,
   label,
+  onCancel,
 }: {
   progress: number | null;
   label?: string;
+  onCancel?: () => void;
 }) {
   if (progress === null || progress === undefined) return null;
   const pct = Math.max(0, Math.min(100, Math.round(progress)));
@@ -1706,12 +1708,257 @@ export function UploadProgressBar({
     <div class="volo-upload-progress" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
       <div class="volo-upload-progress-head">
         <span>{label || t("ed.uploading")}</span>
-        <span class="volo-code-chip">{pct}%</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+          <span class="volo-code-chip">{pct}%</span>
+          {onCancel && (
+            <button
+              type="button"
+              class="volo-act-btn danger"
+              style={{ padding: "1px 7px", fontSize: "11.5px", lineHeight: 1.4 }}
+              onClick={onCancel}
+            >
+              {t("common.cancel")}
+            </button>
+          )}
+        </span>
       </div>
       <div class="volo-upload-progress-track">
         <div class="volo-upload-progress-fill" style={{ width: `${pct}%` }} />
       </div>
     </div>
+  );
+}
+
+let nativeDialogSeq = 0;
+let supportsDisplayTransitionCached: boolean | undefined;
+
+function canTransitionDisplay(): boolean {
+  if (supportsDisplayTransitionCached !== undefined) return supportsDisplayTransitionCached;
+  if (
+    typeof window === "undefined" ||
+    typeof document === "undefined" ||
+    !window.CSS?.supports?.("transition-behavior", "allow-discrete") ||
+    !document.body
+  ) {
+    return false;
+  }
+  const probe = document.createElement("div");
+  probe.style.cssText = "transition: display 1s allow-discrete !important; display: block;";
+  document.body.appendChild(probe);
+  void getComputedStyle(probe).display;
+  probe.style.display = "none";
+  supportsDisplayTransitionCached = getComputedStyle(probe).display === "block";
+  probe.remove();
+  return supportsDisplayTransitionCached;
+}
+
+function supportsTopLayerExit(): boolean {
+  return Boolean(
+    typeof window !== "undefined" &&
+      window.CSS?.supports?.("overlay", "auto") &&
+      canTransitionDisplay()
+  );
+}
+
+export async function closeTopLayer(dlg: HTMLDialogElement): Promise<void> {
+  if (!dlg.open) return;
+  if (!supportsTopLayerExit()) {
+    dlg.setAttribute("data-closing", "");
+    const animations = typeof dlg.getAnimations === "function" ? dlg.getAnimations({ subtree: true }) : [];
+    if (animations.length > 0) {
+      await Promise.race([
+        Promise.allSettled(animations.map((a) => a.finished)),
+        new Promise((r) => setTimeout(r, 400)),
+      ]);
+    }
+    if (!dlg.hasAttribute("data-closing")) return;
+    dlg.removeAttribute("data-closing");
+  }
+  if (dlg.open) dlg.close();
+}
+
+export interface NativeModalDialogProps {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  subtitle?: string;
+  maxWidth?: string;
+  busy?: boolean;
+  busyGuardHint?: string;
+  lightDismiss?: boolean;
+  children: ComponentChildren;
+  footer?: ComponentChildren;
+}
+
+export function NativeModalDialog({
+  open,
+  onClose,
+  title,
+  subtitle,
+  maxWidth = "600px",
+  busy = false,
+  busyGuardHint,
+  lightDismiss = true,
+  children,
+  footer,
+}: NativeModalDialogProps) {
+  const dlgRef = useRef<HTMLDialogElement | null>(null);
+  const idRef = useRef(0);
+  if (!idRef.current) idRef.current = ++nativeDialogSeq;
+  const headingId = `volo-ndlg-h-${idRef.current}`;
+  const guardId = `volo-ndlg-g-${idRef.current}`;
+  const [guardShown, setGuardShown] = useState(false);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const lightDismissRef = useRef(lightDismiss);
+  lightDismissRef.current = lightDismiss;
+  const openRef = useRef(open);
+  openRef.current = open;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    if (!busy && guardShown) setGuardShown(false);
+  }, [busy, guardShown]);
+
+  useEffect(() => {
+    const dlg = dlgRef.current;
+    if (!dlg) return;
+    if (open) {
+      dlg.removeAttribute("data-closing");
+      if (!dlg.open) {
+        notifyClosePopovers(0, true);
+        dlg.showModal();
+      }
+    } else if (dlg.open && !dlg.hasAttribute("data-closing")) {
+      void closeTopLayer(dlg);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    const dlg = dlgRef.current;
+    if (!dlg) return;
+    const onCancel = (e: Event) => {
+      if (busyRef.current) {
+        e.preventDefault();
+        setGuardShown(true);
+        return;
+      }
+      if (!supportsTopLayerExit()) {
+        e.preventDefault();
+        void closeTopLayer(dlg);
+      }
+    };
+    const onDialogClose = () => {
+      dlg.removeAttribute("data-closing");
+      dlg.returnValue = "";
+      setGuardShown(false);
+      if (openRef.current) onCloseRef.current();
+    };
+    let pressedOutside = false;
+    const isOutside = (e: PointerEvent) => {
+      const r = dlg.getBoundingClientRect();
+      return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+    };
+    const onPtrDown = (e: PointerEvent) => {
+      if ("closedBy" in HTMLDialogElement.prototype) return;
+      pressedOutside =
+        lightDismissRef.current &&
+        !busyRef.current &&
+        dlg.open &&
+        e.target === dlg &&
+        isOutside(e);
+    };
+    const onPtrUp = (e: PointerEvent) => {
+      if ("closedBy" in HTMLDialogElement.prototype) return;
+      if (
+        pressedOutside &&
+        lightDismissRef.current &&
+        !busyRef.current &&
+        dlg.open &&
+        e.target === dlg &&
+        isOutside(e)
+      ) {
+        void closeTopLayer(dlg);
+      }
+      pressedOutside = false;
+    };
+    dlg.addEventListener("cancel", onCancel);
+    dlg.addEventListener("close", onDialogClose);
+    dlg.addEventListener("pointerdown", onPtrDown);
+    dlg.addEventListener("pointerup", onPtrUp);
+    return () => {
+      dlg.removeEventListener("cancel", onCancel);
+      dlg.removeEventListener("close", onDialogClose);
+      dlg.removeEventListener("pointerdown", onPtrDown);
+      dlg.removeEventListener("pointerup", onPtrUp);
+    };
+  }, []);
+
+  if (!open && typeof document === "undefined") return null;
+
+  const closedByVal = busy ? "none" : lightDismiss ? "any" : "closerequest";
+
+  return (
+    <dialog
+      ref={dlgRef}
+      class="volo-native-dialog"
+      aria-labelledby={headingId}
+      {...({ closedby: closedByVal } as any)}
+      style={{ "--dialog-max-w": maxWidth } as CSSProperties}
+    >
+      <div class="volo-modal-head">
+        <div style={{ minWidth: 0 }}>
+          <h3 id={headingId} class="volo-card-title" style={{ fontSize: "16.5px" }}>
+            {title}
+          </h3>
+          {subtitle && (
+            <p class="volo-sec-desc" style={{ marginTop: "3px" }}>
+              {subtitle}
+            </p>
+          )}
+        </div>
+        <button
+          type="button"
+          class="volo-modal-close"
+          aria-label={t("common.close")}
+          title={t("common.close")}
+          aria-disabled={busy || undefined}
+          aria-describedby={guardShown && busyGuardHint ? guardId : undefined}
+          onClick={() => {
+            if (busy) {
+              setGuardShown(true);
+              return;
+            }
+            if (dlgRef.current) {
+              void closeTopLayer(dlgRef.current);
+            } else {
+              onClose();
+            }
+          }}
+        >
+          <CloseIcon size={15} />
+        </button>
+      </div>
+      <div class="volo-modal-body">
+        {children}
+        {busy && busyGuardHint && (
+          <div
+            id={guardId}
+            role="status"
+            class="volo-help"
+            style={{
+              marginTop: "8px",
+              color: "var(--volo-warn, var(--volo-accent))",
+              visibility: guardShown ? "visible" : "hidden",
+            }}
+          >
+            {busyGuardHint}
+          </div>
+        )}
+      </div>
+      {footer && <div class="volo-form-actions">{footer}</div>}
+    </dialog>
   );
 }
 
@@ -1954,45 +2201,58 @@ export function TableSkeleton({ cols = 5, rows = 4 }: { cols?: number; rows?: nu
 
 export function GlobalConfirmModal() {
   const cur = confirmSig.value;
+  const lastRef = useRef(cur);
+  if (cur) lastRef.current = cur;
+  const view = cur || lastRef.current;
+  const isDanger = view?.danger !== false;
   return (
-    <AnimatedModal
+    <NativeModalDialog
       open={Boolean(cur)}
       onClose={() => resolveConfirm(false)}
-      title={cur?.title || t("ui.confirm_title")}
+      title={view?.title || t("ui.confirm_title")}
       maxWidth="450px"
+      lightDismiss={false}
       footer={
         <>
-          <button type="button" class="volo-btn" onClick={() => resolveConfirm(false)}>
+          <button
+            type="button"
+            class="volo-btn"
+            autoFocus={isDanger}
+            {...((isDanger ? { autofocus: "" } : {}) as any)}
+            onClick={() => resolveConfirm(false)}
+          >
             {t("common.cancel")}
           </button>
           <button
             type="button"
-            class={`volo-btn ${cur?.danger !== false ? "volo-btn-danger" : "volo-btn-primary"}`}
+            class={`volo-btn ${isDanger ? "volo-btn-danger" : "volo-btn-primary"}`}
+            autoFocus={!isDanger}
+            {...((!isDanger ? { autofocus: "" } : {}) as any)}
             onClick={() => resolveConfirm(true)}
           >
-            {cur?.confirmText || t("ui.confirm_ok")}
+            {view?.confirmText || t("ui.confirm_ok")}
           </button>
         </>
       }
     >
       <p style={{ margin: "2px 0 8px", fontSize: "13.5px", lineHeight: 1.6, color: "var(--volo-text)" }}>
-        {cur?.message || ""}
+        {view?.message || ""}
       </p>
-      {cur?.items && cur.items.length > 0 && (
+      {view?.items && view.items.length > 0 && (
         <div class="volo-confirm-list">
-          {cur.items.slice(0, 50).map((it, i) => (
+          {view.items.slice(0, 50).map((it, i) => (
             <div key={i} class="volo-confirm-list-item">
               {it}
             </div>
           ))}
-          {cur.items.length > 50 && (
+          {view.items.length > 50 && (
             <div class="volo-confirm-list-item volo-help" style={{ padding: "4px 6px", fontWeight: 600 }}>
-              {t("ui.confirm_more_items", { n: cur.items.length - 50 })}
+              {t("ui.confirm_more_items", { n: view.items.length - 50 })}
             </div>
           )}
         </div>
       )}
-    </AnimatedModal>
+    </NativeModalDialog>
   );
 }
 

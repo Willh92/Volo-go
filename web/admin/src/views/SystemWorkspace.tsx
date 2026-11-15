@@ -4135,9 +4135,18 @@ export function SystemWorkspace({
                                     label: t("common.delete"),
                                     danger: true,
                                     onClick: async () => {
-                                      if (!(await openConfirm({ message: t("sys.confirm_del_user", { name: u.username }), danger: true }))) return;
+                                      const pwd = await promptStepUpPassword({
+                                        title: t("common.delete"),
+                                        subtitle: `${t("sys.confirm_del_user", { name: u.username })} — ${t("sys.stepup_user_desc")}`,
+                                        confirmLabel: t("common.delete"),
+                                        danger: true,
+                                      });
+                                      if (!pwd) return;
                                       try {
-                                        await apiFetch(`/api/admin/users/${u.id}`, { method: "DELETE" });
+                                        await apiFetch(`/api/admin/users/${u.id}`, {
+                                          method: "DELETE",
+                                          body: JSON.stringify({ current_password: pwd }),
+                                        });
                                         void loadUsersList();
                                       } catch (err: any) {
                                         showToast(err.message);
@@ -6693,10 +6702,17 @@ export function SystemWorkspace({
                 class="volo-btn volo-btn-danger volo-btn-sm"
                 disabled={auditTotal === 0 && auditLogs.length === 0}
                 onClick={async () => {
-                  if (!(await openConfirm({ message: t("sys.audit_clear_confirm"), danger: true }))) return;
+                  const pwd = await promptStepUpPassword({
+                    title: t("sys.audit_clear_btn"),
+                    subtitle: `${t("sys.audit_clear_confirm")} — ${t("sys.stepup_pwd_required")}`,
+                    confirmLabel: t("sys.audit_clear_btn"),
+                    danger: true,
+                  });
+                  if (!pwd) return;
                   try {
                     const res = await apiFetch<{ affected?: number }>("/api/admin/audit-logs", {
                       method: "DELETE",
+                      body: JSON.stringify({ current_password: pwd }),
                     });
                     setKnownAuditActions([]);
                     setAuditAction("all");

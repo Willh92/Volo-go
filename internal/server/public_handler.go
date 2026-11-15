@@ -27,6 +27,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/dialect"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/extpkg"
 	"github.com/Willh92/Volo-go/internal/guest"
 	"github.com/Willh92/Volo-go/internal/i18n"
 	"github.com/Willh92/Volo-go/internal/media"
@@ -89,6 +90,7 @@ type AppServer struct {
 	imageView *media.ImageViewEngine
 
 	setupMu          sync.Mutex
+	backupOpBusy     atomic.Bool
 	fallbackFeedHost atomic.Pointer[string]
 
 	backupTicketMu sync.Mutex
@@ -105,6 +107,11 @@ type AppServer struct {
 	auditActionsMu  sync.Mutex
 	auditActionsExp time.Time
 	auditActions    []string
+
+	catalogFetcher    *extpkg.MetadataFetcher
+	pluginsCatalogURL string
+	themesCatalogURL  string
+	localesCatalogURL string
 }
 
 // NewAppServer constructs and wires a complete AppServer instance.
@@ -112,6 +119,7 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	if deps.StartedAt.IsZero() {
 		deps.StartedAt = time.Now()
 	}
+	hadExplicitDialer := deps.OutboundDialer != nil
 	if deps.OutboundDialer == nil {
 		deps.OutboundDialer = &security.OutboundSafeDialer{Timeout: 10 * time.Second}
 	}
@@ -160,12 +168,20 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	} else if deps.Config != nil {
 		deps.WAF.SetPublicURL(pubURL)
 	}
+	createdThemes := false
 	if deps.Themes == nil {
 		th, err := theme.NewEngine(deps.Catalog, deps.Config.ThemesDir)
 		if err != nil {
 			return nil, err
 		}
 		deps.Themes = th
+		createdThemes = true
+	}
+	if strings.TrimSpace(deps.Version) != "" {
+		deps.Themes.SetHostVersion(deps.Version)
+	}
+	if hadExplicitDialer || createdThemes {
+		deps.Themes.SetOutboundDialer(deps.OutboundDialer)
 	}
 	deps.Themes.SetAssetCDNPrefixFunc(func() string {
 		return deps.Settings.Snapshot().Reading.AssetCDNPrefix
@@ -197,14 +213,21 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 	}
 
 	s := &AppServer{
-		deps:      deps,
-		imageView: media.NewImageViewEngine(8 << 20),
+		deps:           deps,
+		imageView:      media.NewImageViewEngine(8 << 20),
+		catalogFetcher: extpkg.NewMetadataFetcher(),
 	}
 	if deps.Passports != nil {
 		deps.Passports.SetSecureRequestFunc(s.isCookieSecureForRequest)
 	}
 	s.syncConfiguredUploadDir()
 	if deps.Plugins != nil {
+		if strings.TrimSpace(deps.Version) != "" {
+			deps.Plugins.SetHostVersion(deps.Version)
+		}
+		if hadExplicitDialer {
+			deps.Plugins.SetOutboundDialer(deps.OutboundDialer)
+		}
 		if deps.Auth != nil {
 			deps.Auth.SetPlugins(deps.Plugins)
 		}
@@ -287,31 +310,41 @@ func NewAppServer(deps AppDeps) (*AppServer, error) {
 		deps.WAF.SetStaffBypassCheck(s.isStaffRequest)
 		root = deps.WAF.WrapHTTP(root)
 	}
-	s.handler = root
+	s.handler = s.withHealthzBypass(root)
 	return s, nil
 }
 
 func (s *AppServer) Handler() http.Handler { return s.handler }
 func (s *AppServer) Deps() AppDeps         { return s.deps }
 
-// Close flushes buffered view/analytics counters, waits for federation deliveries, and closes GeoIP handles before database shutdown.
-func (s *AppServer) Close(ctx context.Context) error {
+// DrainApp flushes buffered view/analytics counters and waits for in-flight federation deliveries
+// while leaving WAF/Geo handles open until extension/background workers have stopped.
+func (s *AppServer) DrainApp(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
 	if s.deps.Plugins != nil {
 		s.deps.Plugins.WaitFederation()
 	}
+	if s.deps.Content != nil {
+		return s.deps.Content.Close(ctx)
+	}
+	return nil
+}
+
+// Close flushes buffered view/analytics counters, waits for federation deliveries, and closes WAF & GeoIP handles before database shutdown.
+func (s *AppServer) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	err := s.DrainApp(ctx)
 	if s.deps.WAF != nil {
 		s.deps.WAF.Close()
 	}
 	if s.deps.Geo != nil {
 		s.deps.Geo.Close()
 	}
-	if s.deps.Content == nil {
-		return nil
-	}
-	return s.deps.Content.Close(ctx)
+	return err
 }
 
 func (s *AppServer) dispatchFederationForArticle(ctx context.Context, action string, raw domain.RawArticle) {
@@ -405,7 +438,7 @@ func (s *AppServer) handlePluginMount(next http.Handler) http.Handler {
 }
 
 func (s *AppServer) registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/healthz", NewHealthzHandler(s.deps.Store, s.deps.StartedAt))
+	s.registerHealthRoutes(mux)
 	mux.HandleFunc("/favicon.svg", s.handleServeFaviconSVG)
 	mux.HandleFunc("/assets/favicon.svg", s.handleServeFaviconSVG)
 	mux.HandleFunc("/favicon.ico", s.handleServeFaviconICO)
@@ -775,10 +808,9 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		src        media.ImageViewSource
-		localDir   string
-		hasLocal   bool
-		s3RawBytes []byte
+		src      media.ImageViewSource
+		localDir string
+		hasLocal bool
 	)
 	if s.deps.Config != nil {
 		activeDir := s.deps.Config.GetUploadDir()
@@ -827,16 +859,21 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 					if maxFetch <= 0 {
 						maxFetch = 25 << 20
 					}
-					data, _, _, lastMod, gErr := cli.GetObject(r.Context(), cleanRel, maxFetch)
-					if gErr == nil && len(data) > 0 {
-						s3RawBytes = data
-						src = media.ImageViewSource{
-							Key:         "s3:" + cleanRel,
-							ModTimeNano: lastMod.UnixNano(),
-							Size:        int64(len(data)),
-							Ext:         ext,
-							Load:        func(context.Context) ([]byte, error) { return s3RawBytes, nil },
-						}
+					src = media.ImageViewSource{
+						Key:         "s3:" + cleanRel,
+						ModTimeNano: 0,
+						Size:        0,
+						Ext:         ext,
+						Load: func(loadCtx context.Context) ([]byte, error) {
+							data, _, _, _, gErr := cli.GetObject(loadCtx, cleanRel, maxFetch)
+							if gErr != nil {
+								return nil, gErr
+							}
+							if len(data) == 0 {
+								return nil, s3client.ErrObjectNotFound
+							}
+							return data, nil
+						},
 					}
 				}
 			}
@@ -852,6 +889,15 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 		if spec.IgnoreError {
 			if hasLocal {
 				_ = serveSafeUserStaticFile(w, r, localDir, cleanRel)
+				return
+			}
+			s3RawBytes, lErr := src.Load(r.Context())
+			if lErr != nil {
+				if errors.Is(lErr, s3client.ErrObjectNotFound) || os.IsNotExist(lErr) {
+					http.NotFound(w, r)
+					return
+				}
+				writeErrJSON(w, http.StatusBadGateway, lErr.Error())
 				return
 			}
 			w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -885,6 +931,10 @@ func (s *AppServer) handleServeUpload(w http.ResponseWriter, r *http.Request) {
 
 	res, tErr := s.imageView.Transform(r.Context(), src, spec)
 	if tErr != nil {
+		if errors.Is(tErr, s3client.ErrObjectNotFound) || os.IsNotExist(tErr) {
+			http.NotFound(w, r)
+			return
+		}
 		writeErrJSON(w, http.StatusBadRequest, tErr.Error())
 		return
 	}
@@ -1531,8 +1581,7 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	locale := s.resolveLocale(r)
 	targetID := strings.TrimSpace(parts[0])
 	clientIP := s.clientIP(r)
-	if !s.deps.WAF.AllowRate("unlock_ip", clientIP, 20, 5*time.Minute) ||
-		!s.deps.WAF.AllowRate("unlock:"+targetID, clientIP, 10, 5*time.Minute) {
+	if s.deps.WAF != nil && !s.deps.WAF.AllowRate("unlock_ip", clientIP, 20, 5*time.Minute) {
 		writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
 		return
 	}
@@ -1545,18 +1594,31 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	allowTargetUnlockRate := func() bool {
+		if s.deps.WAF != nil && !s.deps.WAF.AllowRate("unlock:"+targetID, clientIP, 10, 5*time.Minute) {
+			writeErrJSON(w, http.StatusTooManyRequests, s.deps.Catalog.T(locale, "error.rate_limited"))
+			return false
+		}
+		return true
+	}
+
 	var entryKey, plainPwd string
 	if strings.HasPrefix(targetID, "page:") {
 		pageID := strings.TrimSpace(strings.TrimPrefix(targetID, "page:"))
 		var pg domain.Page
 		pErr := sqlx.GetInto(r.Context(), s.deps.Store, &pg, `SELECT * FROM pages WHERE id = ? AND is_published = ?`, pageID, true)
-		if pErr != nil {
+		if pErr != nil || len(render.ExtractAllLockPasswords(pg.ContentMD)) == 0 {
 			http.NotFound(w, r)
+			return
+		}
+		if !allowTargetUnlockRate() {
 			return
 		}
 		matched, ok := verifyPageInlinePassword(pg.ContentMD, req.Password)
 		if !ok {
-			s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+			if s.deps.WAF != nil {
+				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+			}
 			writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "article.unlock_wrong_pwd"))
 			return
 		}
@@ -1565,9 +1627,19 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 	} else {
 		raw, err := s.deps.Content.GetRawArticleByID(r.Context(), targetID)
 		if err == nil && raw.Status == domain.ArticleStatusPublished {
+			if strings.TrimSpace(raw.PasswordCiphertext) == "" && !raw.HasContentLock &&
+				!render.ContainsLockDirective(raw.ContentMD) && !render.ContainsLockDirective(raw.SummaryMD) {
+				http.NotFound(w, r)
+				return
+			}
+			if !allowTargetUnlockRate() {
+				return
+			}
 			matched, ok := s.deps.Content.Guard().VerifyArticlePassword(raw, req.Password)
 			if !ok {
-				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+				if s.deps.WAF != nil {
+					s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+				}
 				writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "article.unlock_wrong_pwd"))
 				return
 			}
@@ -1576,13 +1648,18 @@ func (s *AppServer) handleArticleActionAPI(w http.ResponseWriter, r *http.Reques
 		} else {
 			var pg domain.Page
 			pErr := sqlx.GetInto(r.Context(), s.deps.Store, &pg, `SELECT * FROM pages WHERE id = ? AND is_published = ?`, targetID, true)
-			if pErr != nil {
+			if pErr != nil || len(render.ExtractAllLockPasswords(pg.ContentMD)) == 0 {
 				http.NotFound(w, r)
+				return
+			}
+			if !allowTargetUnlockRate() {
 				return
 			}
 			matched, ok := verifyPageInlinePassword(pg.ContentMD, req.Password)
 			if !ok {
-				s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+				if s.deps.WAF != nil {
+					s.deps.WAF.RecordStrike(r.Context(), clientIP, security.ReasonUnlockFail, 1)
+				}
 				writeErrJSON(w, http.StatusForbidden, s.deps.Catalog.T(locale, "article.unlock_wrong_pwd"))
 				return
 			}
@@ -2992,8 +3069,8 @@ func (s *AppServer) handleTagsOverview(w http.ResponseWriter, r *http.Request) {
 		var whereSQL string
 		var whereArgs []any
 		if q != "" {
-			pat := "%" + strings.ToLower(q) + "%"
-			whereSQL = " WHERE LOWER(t.name) LIKE ? OR LOWER(t.slug) LIKE ?"
+			pat := "%" + escapeLikePattern(strings.ToLower(q)) + "%"
+			whereSQL = " WHERE LOWER(t.name) LIKE ? ESCAPE '!' OR LOWER(t.slug) LIKE ? ESCAPE '!'"
 			whereArgs = []any{pat, pat}
 		}
 		_ = s.deps.Store.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM tags t"+whereSQL, whereArgs...).Scan(&total)

@@ -14,17 +14,21 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template/parse"
 
 	"github.com/Willh92/Volo-go/internal/content"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/extpkg"
 	"github.com/Willh92/Volo-go/internal/i18n"
+	"github.com/Willh92/Volo-go/internal/security"
 	"github.com/Willh92/Volo-go/internal/visibility"
 	"github.com/Willh92/Volo-go/pkg/plugin"
 )
@@ -61,20 +65,22 @@ type ConfigField struct {
 
 // Manifest describes a built-in or external theme (`theme.json`).
 type Manifest struct {
-	ID               string            `json:"id"`
-	Name             map[string]string `json:"name"`
-	Version          string            `json:"version"`
-	Author           string            `json:"author"`
-	Homepage         string            `json:"homepage,omitempty"`
-	License          string            `json:"license,omitempty"`
-	Preview          string            `json:"preview,omitempty"`
-	Description      map[string]string `json:"description"`
-	Accents          []string          `json:"accents"`
-	SupportsDarkMode bool              `json:"supports_dark_mode"`
-	SupportsPJAX     bool              `json:"supports_pjax"`
-	PageTemplates    []ConfigOption    `json:"page_templates,omitempty"`
-	ConfigSchema     []ConfigField     `json:"config_schema,omitempty"`
-	IsBuiltin        bool              `json:"is_builtin"`
+	ID               string               `json:"id"`
+	Name             map[string]string    `json:"name"`
+	Version          string               `json:"version"`
+	MinHostVersion   string               `json:"min_host_version,omitempty"`
+	Author           string               `json:"author"`
+	Homepage         string               `json:"homepage,omitempty"`
+	License          string               `json:"license,omitempty"`
+	Preview          string               `json:"preview,omitempty"`
+	Description      map[string]string    `json:"description"`
+	Accents          []string             `json:"accents"`
+	SupportsDarkMode bool                 `json:"supports_dark_mode"`
+	SupportsPJAX     bool                 `json:"supports_pjax"`
+	PageTemplates    []ConfigOption       `json:"page_templates,omitempty"`
+	ConfigSchema     []ConfigField        `json:"config_schema,omitempty"`
+	Update           *extpkg.UpdateConfig `json:"update,omitempty"`
+	IsBuiltin        bool                 `json:"is_builtin"`
 }
 
 // LocalizedConfigOption holds a locale-resolved select option for Admin UI.
@@ -107,6 +113,8 @@ type LocalizedTheme struct {
 	PreviewURL             string                  `json:"preview_url"`
 	LocalizedPageTemplates []LocalizedConfigOption `json:"localized_page_templates,omitempty"`
 	LocalizedSchema        []LocalizedConfigField  `json:"localized_schema,omitempty"`
+	UpdateCapability       string                  `json:"update_capability"`
+	UpdateStatus           *extpkg.UpdateStatus    `json:"update_status,omitempty"`
 }
 
 // OIDCProviderView describes an active OIDC SSO provider button on login views.
@@ -397,14 +405,25 @@ type SecretSealer interface {
 
 // Engine manages embedded `volo-studio` and hot-reloadable external `./themes/<id>` packages.
 type Engine struct {
-	catalog        *i18n.Catalog
-	themesDir      string
-	cdnPrefixFn    func() string
-	vendorPrefixFn func() string
-	sealer         SecretSealer
+	catalog               *i18n.Catalog
+	themesDir             string
+	cdnPrefixFn           func() string
+	vendorPrefixFn        func() string
+	sealer                SecretSealer
+	hostVersion           string
+	outboundDialer        *security.OutboundSafeDialer
+	allowLoopbackForTests bool
+	officialCatalogURL    atomic.Pointer[string]
+
+	installMu sync.Mutex
 
 	mu     sync.RWMutex
 	themes map[string]*loadedTheme
+
+	metaFetcher    *extpkg.MetadataFetcher
+	updateMu       sync.RWMutex
+	updateCache    map[string]cachedThemeUpdate
+	updateInflight map[string]*themeUpdateCall
 }
 
 // SetSecretSealer configures at-rest AES-256-GCM encryption for theme `type: "secret"` fields.
@@ -453,10 +472,14 @@ func (e *Engine) vendorCDNPrefix() string {
 // NewEngine loads the embedded `volo-studio` theme and scans themesDir for external themes.
 func NewEngine(catalog *i18n.Catalog, themesDir string) (*Engine, error) {
 	e := &Engine{
-		catalog:   catalog,
-		themesDir: strings.TrimSpace(themesDir),
-		themes:    make(map[string]*loadedTheme),
+		catalog:        catalog,
+		themesDir:      strings.TrimSpace(themesDir),
+		themes:         make(map[string]*loadedTheme),
+		metaFetcher:    extpkg.NewMetadataFetcher(),
+		updateCache:    make(map[string]cachedThemeUpdate),
+		updateInflight: make(map[string]*themeUpdateCall),
 	}
+	e.recoverInterruptedThemeSwaps()
 	if err := e.Reload(); err != nil {
 		return nil, err
 	}
@@ -466,6 +489,12 @@ func NewEngine(catalog *i18n.Catalog, themesDir string) (*Engine, error) {
 // Reload discovers built-in `volo-studio` and any valid external themes in themesDir,
 // validating manifests and template layout cheaply while deferring template AST and gzip asset compilation until first use.
 func (e *Engine) Reload() error {
+	e.installMu.Lock()
+	defer e.installMu.Unlock()
+	return e.reloadLocked()
+}
+
+func (e *Engine) reloadLocked() error {
 	next := make(map[string]*loadedTheme)
 
 	subFS, err := fs.Sub(builtinThemeFS, "builtin/volo-studio")
@@ -527,6 +556,19 @@ func (e *Engine) inspectThemeFS(fsys fs.FS, fallbackFS fs.FS, isBuiltin bool) (*
 	mf.IsBuiltin = isBuiltin
 	if mf.ID == "" {
 		return nil, fmt.Errorf("theme.json missing id")
+	}
+	mf.Homepage = extpkg.SanitizeHTTPURL(mf.Homepage)
+	mf.MinHostVersion = strings.TrimSpace(mf.MinHostVersion)
+	if mf.MinHostVersion != "" {
+		if _, ok := extpkg.CompareSemVer(mf.MinHostVersion, mf.MinHostVersion); !ok {
+			return nil, fmt.Errorf("theme %s: invalid min_host_version %q", mf.ID, mf.MinHostVersion)
+		}
+		mf.MinHostVersion = extpkg.NormalizeVersion(mf.MinHostVersion)
+	}
+	if mf.Update != nil {
+		if uErr := extpkg.ValidateUpdateConfig(mf.Update, false, true); uErr != nil {
+			return nil, fmt.Errorf("theme %s: %w", mf.ID, uErr)
+		}
 	}
 	validSchema, err := validateThemeConfigSchema(mf.ConfigSchema)
 	if err != nil {
@@ -628,8 +670,8 @@ func readThemeTemplateFile(srcFS fs.FS, rel string) ([]byte, error) {
 }
 
 const (
-	maxExternalAssetSingleBytes = 5 << 20  // 5 MiB
-	maxExternalAssetTotalBytes  = 20 << 20 // 20 MiB
+	maxExternalAssetSingleBytes = 8 << 20  // 8 MiB
+	maxExternalAssetTotalBytes  = 32 << 20 // 32 MiB
 	maxPooledRenderBufCap       = 64 << 10 // 64 KiB
 )
 
@@ -965,9 +1007,9 @@ func isNonEmptySecretValue(v any) bool {
 
 func defaultPageTemplateOptions() []ConfigOption {
 	return []ConfigOption{
-		{Value: "default", Label: map[string]string{"zh-CN": "标准版式", "en-US": "Default Layout", "zh-TW": "標準版式"}},
-		{Value: "wide", Label: map[string]string{"zh-CN": "宽幅展示", "en-US": "Wide Showcase", "zh-TW": "寬幅展示"}},
-		{Value: "minimal", Label: map[string]string{"zh-CN": "极简阅读", "en-US": "Minimal Sheet", "zh-TW": "極簡閱讀"}},
+		{Value: "default", Label: map[string]string{"zh-CN": "标准版式", "en-US": "Default Layout", "zh-TW": "標準版式", "ja-JP": "標準レイアウト"}},
+		{Value: "wide", Label: map[string]string{"zh-CN": "宽幅展示", "en-US": "Wide Showcase", "zh-TW": "寬幅展示", "ja-JP": "ワイドショーケース"}},
+		{Value: "minimal", Label: map[string]string{"zh-CN": "极简阅读", "en-US": "Minimal Sheet", "zh-TW": "極簡閱讀", "ja-JP": "ミニマルシート"}},
 	}
 }
 
@@ -1025,13 +1067,19 @@ func (e *Engine) ListLocalized(locale string) []LocalizedTheme {
 				Label: pickLocalizedMapValue(pt.Label, locale, pt.Value),
 			})
 		}
+		previewURL := "/themes/" + mf.ID + "/preview"
+		if v := strings.TrimSpace(mf.Version); v != "" {
+			previewURL += "?v=" + url.QueryEscape(v)
+		}
 		out = append(out, LocalizedTheme{
 			Manifest:               mf,
 			DisplayName:            dispName,
 			DisplayDescription:     dispDesc,
-			PreviewURL:             "/themes/" + mf.ID + "/preview",
+			PreviewURL:             previewURL,
 			LocalizedPageTemplates: locPageTpls,
 			LocalizedSchema:        schema,
+			UpdateCapability:       e.themeUpdateCapability(mf),
+			UpdateStatus:           e.getCachedUpdateStatus(mf.ID, mf.Version),
 		})
 	}
 	return out
@@ -1117,14 +1165,26 @@ func (e *Engine) secretKeySet(themeID string) map[string]struct{} {
 }
 
 // RedactThemeConfig returns a shallow copy of cfg with non-empty `"secret"` fields masked as `"********"`.
+// When a SecretSealer is configured and an `"enc:v1:..."` envelope fails decryption (e.g. after a key change
+// or backup restore under a different secret key), the field is returned as `""` so admins see it requires re-entry.
 func (e *Engine) RedactThemeConfig(themeID string, cfg map[string]any) map[string]any {
 	if len(cfg) == 0 {
 		return nil
 	}
+	e.mu.RLock()
+	sealer := e.sealer
+	e.mu.RUnlock()
+
 	secrets := e.secretKeySet(themeID)
 	out := make(map[string]any, len(cfg))
 	for k, v := range cfg {
 		if _, isSecret := secrets[k]; isSecret && isNonEmptySecretValue(v) {
+			if s, ok := v.(string); ok && strings.HasPrefix(s, "enc:v1:") && sealer != nil {
+				if _, err := sealer.OpenString(s, themeConfigSecretAAD(themeID, k)); err != nil {
+					out[k] = ""
+					continue
+				}
+			}
 			out[k] = SecretMask
 			continue
 		}
@@ -1439,6 +1499,41 @@ func extractOriginForPreconnect(prefix string) string {
 	return scheme + rest
 }
 
+func formatThemePreviewETag(version string, contentHash string) string {
+	var sb strings.Builder
+	for _, r := range strings.TrimSpace(version) {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteByte('_')
+		}
+	}
+	safeVer := sb.String()
+	if safeVer == "" {
+		safeVer = "0"
+	}
+	cleanHash := strings.Trim(contentHash, `"`)
+	return fmt.Sprintf(`"tp-%s-%s"`, safeVer, cleanHash)
+}
+
+func themeETagMatches(ifNoneMatch string, targetETag string) bool {
+	hdr := strings.TrimSpace(ifNoneMatch)
+	if hdr == "" || targetETag == "" {
+		return false
+	}
+	if hdr == "*" {
+		return true
+	}
+	normTarget := strings.TrimPrefix(strings.TrimSpace(targetETag), "W/")
+	for _, part := range strings.Split(hdr, ",") {
+		cand := strings.TrimPrefix(strings.TrimSpace(part), "W/")
+		if cand == normTarget {
+			return true
+		}
+	}
+	return false
+}
+
 // ServePreview serves `/themes/{theme}/preview` with either the theme's custom preview image or a generated SVG card.
 func (e *Engine) ServePreview(w http.ResponseWriter, r *http.Request, themeID string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -1457,17 +1552,62 @@ func (e *Engine) ServePreview(w http.ResponseWriter, r *http.Request, themeID st
 	th.mu.Lock()
 	hasPreview := th.hasPreview
 	preview := th.preview
+	mf := th.manifest
 	th.mu.Unlock()
+
+	cacheControl := "public, max-age=300, must-revalidate"
+	if strings.TrimSpace(r.URL.Query().Get("v")) != "" {
+		cacheControl = "public, max-age=3600"
+	}
 
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if hasPreview {
-		serveCachedAsset(w, r, preview, false)
+		etag := formatThemePreviewETag(mf.Version, preview.etag)
+		w.Header().Set("Content-Type", preview.contentType)
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", cacheControl)
+		if themeETagMatches(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		useGzip := len(preview.gzipped) > 0 && acceptsGzip(r.Header.Get("Accept-Encoding"))
+		if useGzip {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodHead {
+				return
+			}
+			_, _ = w.Write(preview.gzipped)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
+		if preview.raw != nil {
+			_, _ = w.Write(preview.raw)
+			return
+		}
+		if len(preview.gzipped) > 0 {
+			if gr, err := gzip.NewReader(bytes.NewReader(preview.gzipped)); err == nil {
+				_, _ = io.Copy(w, gr)
+				_ = gr.Close()
+			}
+		}
 		return
 	}
-	svg := renderThemePreviewSVG(th.manifest)
+	svg := renderThemePreviewSVG(mf)
+	sum := sha256.Sum256([]byte(svg))
+	etag := formatThemePreviewETag(mf.Version, hex.EncodeToString(sum[:12]))
 	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", cacheControl)
+	if themeETagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
@@ -1519,7 +1659,7 @@ func serveCachedAsset(w http.ResponseWriter, r *http.Request, asset cachedAsset,
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 	}
 
-	if r.Header.Get("If-None-Match") == asset.etag {
+	if themeETagMatches(r.Header.Get("If-None-Match"), asset.etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}

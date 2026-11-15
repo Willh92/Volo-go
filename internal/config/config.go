@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -443,6 +444,9 @@ func (c *Config) ValidateCustomUploadDir(rawDir string) (string, error) {
 	if strings.HasPrefix(trimmed, `\\`) {
 		return "", errors.New("config: local_dir cannot use UNC network paths")
 	}
+	if strings.Contains(trimmed, "..") {
+		return "", errors.New("config: local_dir must not contain '..' segments")
+	}
 	normSlash := strings.ReplaceAll(trimmed, `\`, "/")
 	for _, seg := range strings.Split(normSlash, "/") {
 		if seg == ".." {
@@ -577,8 +581,23 @@ func Load(cli CLIOverrides) (*Config, error) {
 	return LoadWithEnviron(cli, os.Environ())
 }
 
+// LoadForDoctor resolves configuration without creating directories or auto-generating .secret.key
+// when no secret key is configured yet, keeping `volo doctor` 100% side-effect-free.
+func LoadForDoctor(cli CLIOverrides) (*Config, error) {
+	return LoadForDoctorWithEnviron(cli, os.Environ())
+}
+
+// LoadForDoctorWithEnviron is the testable core of LoadForDoctor accepting an explicit environment slice.
+func LoadForDoctorWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
+	return loadWithEnviron(cli, environ, true)
+}
+
 // LoadWithEnviron is the testable core of Load accepting an explicit environment slice.
 func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
+	return loadWithEnviron(cli, environ, false)
+}
+
+func loadWithEnviron(cli CLIOverrides, environ []string, doctorReadOnly bool) (*Config, error) {
 	envMap := make(map[string]string, len(environ))
 	for _, kv := range environ {
 		if eq := strings.IndexByte(kv, '='); eq > 0 {
@@ -802,9 +821,21 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 	var secretSource string
 	if !cli.SkipKeyRing {
 		secretExplicit, _ := resolveStr(cli.SecretKey, "VOLO_SECRET_KEY", "")
-		keyRing, secretSource, err = LoadOrInitKeyRing(secretExplicit, dataDir)
-		if err != nil {
-			return nil, err
+		if doctorReadOnly && secretExplicit == "" {
+			keyPath := filepath.Join(dataDir, ".secret.key")
+			if _, statErr := os.Lstat(keyPath); os.IsNotExist(statErr) {
+				secretSource = "missing:" + keyPath
+			} else {
+				keyRing, secretSource, err = LoadOrInitKeyRing("", dataDir)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			keyRing, secretSource, err = LoadOrInitKeyRing(secretExplicit, dataDir)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -817,7 +848,12 @@ func LoadWithEnviron(cli CLIOverrides, environ []string) (*Config, error) {
 
 	// If neither driver nor DSN was explicitly pinned via CLI/ENV/.env, check Setup Wizard's db.json.
 	if !cli.SkipKeyRing && !driverExplicit && !dsnExplicit && keyRing != nil {
-		if saved, err := LoadWizardDBConfig(dataDir, keyRing); err == nil && saved != nil {
+		saved, wErr := LoadWizardDBConfig(dataDir, keyRing)
+		if wErr != nil {
+			if !doctorReadOnly {
+				return nil, fmt.Errorf("config: failed to decrypt or parse %s (verify VOLO_SECRET_KEY / .secret.key matches setup key): %w", filepath.Join(dataDir, "db.json"), wErr)
+			}
+		} else if saved != nil {
 			dbDriver = saved.Driver
 			dbDSN = saved.DSN
 			simpleProto = saved.SimpleProtocol
@@ -1097,4 +1133,94 @@ func LoadWizardDBConfig(dataDir string, kr *KeyRing) (*WizardDBSelection, error)
 		DSN:            dsn,
 		SimpleProtocol: doc.SimpleProtocol,
 	}, nil
+}
+
+// NewKeyRingFromKeyFileBytes derives a KeyRing directly from >= 32 raw key bytes
+// using the exact same HKDF subkey schedule as ${DataDir}/.secret.key.
+func NewKeyRingFromKeyFileBytes(raw []byte) (*KeyRing, error) {
+	if len(raw) < 32 {
+		return nil, errors.New("config: raw secret key file bytes must be at least 32 bytes")
+	}
+	return &KeyRing{
+		dbSecretsKey:     hkdfSHA256(raw, "volo-go:v1:db-secrets-aes-gcm"),
+		guestPassportKey: hkdfSHA256(raw, "volo-go:v1:guest-passport-hmac"),
+		envFPPepperKey:   hkdfSHA256(raw, "volo-go:v1:env-fp-pepper-hmac"),
+		shareTokenKey:    hkdfSHA256(raw, "volo-go:v1:share-token-hmac"),
+		sessionCSRFKey:   hkdfSHA256(raw, "volo-go:v1:session-csrf-hmac"),
+	}, nil
+}
+
+// WriteSecretKeyFile atomically writes hex-encoded raw key bytes (>= 32 bytes) to
+// ${dataDir}/.secret.key with strict 0600 permissions, refusing symlinks.
+func WriteSecretKeyFile(dataDir string, raw []byte) error {
+	if len(raw) < 32 {
+		return errors.New("config: raw secret key file bytes must be at least 32 bytes")
+	}
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
+		return fmt.Errorf("config: create data dir %q: %w", dataDir, err)
+	}
+	target := filepath.Join(dataDir, secretFileName)
+	if info, err := os.Lstat(target); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("config: refusing to overwrite non-regular secret key file %q", target)
+		}
+	}
+	tmp, err := os.CreateTemp(dataDir, ".secret.key.rotate-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(hex.EncodeToString(raw) + "\n"); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		_ = os.Chmod(target, 0o600)
+	}
+	cleanup = false
+	return nil
+}
+
+// ParseEnvKeyRings parses a comma- or semicolon-separated list of explicit secret keys
+// (such as VOLO_SECRET_OLD_KEYS) into derived KeyRing instances.
+func ParseEnvKeyRings(rawList string) ([]*KeyRing, error) {
+	if strings.TrimSpace(rawList) == "" {
+		return nil, nil
+	}
+	parts := strings.FieldsFunc(rawList, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	})
+	out := make([]*KeyRing, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		kr, _, err := LoadOrInitKeyRing(trimmed, "")
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, kr)
+	}
+	return out, nil
 }

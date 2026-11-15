@@ -1,6 +1,6 @@
 {
   "id": "kanbanniang",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "min_host_version": "0.1.0",
   "runtime": "goja",
   "entry": "main.js",
@@ -139,5 +139,9 @@
       "default": true,
       "label": { "zh-CN": "窄屏自动隐藏 (<= 800px)", "en-US": "Auto-Hide on Narrow Screens (<= 800px)", "zh-TW": "窄螢幕自動隱藏 (<= 800px)", "ja-JP": "モバイル画面で自動的に非表示 (<= 800px)" }
     }
-  ]
+  ],
+  "update": {
+    "strategy": "volo-catalog",
+    "url": "https://raw.githubusercontent.com/Willh92/Volo-go/main/plugins/catalog.json"
+  }
 }

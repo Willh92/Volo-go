@@ -470,6 +470,8 @@ const AUDIT_ACTION_KEYS: Record<string, string | number> = {
   "plugin.config_patch": "audit.act.plugin_cfg",
   "plugin.priority": "audit.act.plugin_prio",
   "plugin.cron_trigger": "audit.act.plugin_cron",
+  "plugin.upgrade": "audit.act.plugin_update",
+  "theme.upgrade": "audit.act.theme_update",
   "locale.install_zip": "audit.act.locale_zip",
   "security.ban": "audit.act.sec_ban",
   "security.waf_auto_ban": "audit.act.sec_auto_ban",

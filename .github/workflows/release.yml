@@ -144,11 +144,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run Release Gate (go vet & go test with GOEXPERIMENT=nojsonv2)
+      - name: Run Release Gate (extension parity, go vet & go test with GOEXPERIMENT=nojsonv2)
         env:
           CGO_ENABLED: "0"
           GOEXPERIMENT: "nojsonv2"
         run: |
+          python3 .github/scripts/package-plugin.py --verify-all-meta
           go vet ./...
           go test -count=1 ./...
 
@@ -214,6 +215,8 @@ jobs:
           GOEXPERIMENT: "nojsonv2"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          BIN_EXT: ${{ matrix.ext }}
+          ARCHIVE_FMT: ${{ matrix.archive }}
           VERSION: ${{ needs.verify.outputs.version }}
           VOLO_BUDGET_BIN_MB: ${{ vars.VOLO_BUDGET_BIN_MB }}
         run: |
@@ -227,11 +230,11 @@ jobs:
             -gcflags="github.com/Willh92/Volo-go/internal/security/...=-l=4" \
             -gcflags="github.com/Willh92/Volo-go/pkg/plugin/...=-l=4" \
             -ldflags="-s -w -funcalign=8 -buildid= -X main.Version=${VERSION}" \
-            -o "dist/${STAGE}/volo${{ matrix.ext }}" \
+            -o "dist/${STAGE}/volo${BIN_EXT}" \
             ./cmd/volo
 
-          BIN_BYTES=$(wc -c < "dist/${STAGE}/volo${{ matrix.ext }}" | tr -d ' ')
-          echo "Built ${STAGE}/volo${{ matrix.ext }}: ${BIN_BYTES} bytes (limit < ${MAX_BIN_BYTES} bytes / ${BUDGET_BIN_MB}.00 MiB)"
+          BIN_BYTES=$(wc -c < "dist/${STAGE}/volo${BIN_EXT}" | tr -d ' ')
+          echo "Built ${STAGE}/volo${BIN_EXT}: ${BIN_BYTES} bytes (limit < ${MAX_BIN_BYTES} bytes / ${BUDGET_BIN_MB}.00 MiB)"
           if [ "${BIN_BYTES}" -ge "${MAX_BIN_BYTES}" ]; then
             echo "Binary exceeds ${BUDGET_BIN_MB}.00 MiB budget (${BIN_BYTES} >= ${MAX_BIN_BYTES} bytes)" >&2
             exit 1
@@ -252,7 +255,7 @@ jobs:
           cp -r locales "dist/${STAGE}/locales"
           cp -r plugins "dist/${STAGE}/plugins"
           # Keep main OS/arch core bundles ~8 MB slim; standalone-release plugins (kanbanniang)
-          # are version-deduplicated into their own `plugin-kanbanniang-v<version>` GitHub Release.
+          # and standalone extension .zip archives are consolidated in the unified `extensions-v*` release.
           rm -rf "dist/${STAGE}/plugins/kanbanniang"
           if [ -d dist-minified-plugins ]; then
             cp -rf dist-minified-plugins/. "dist/${STAGE}/plugins/"
@@ -271,7 +274,7 @@ jobs:
           esac
           export SOURCE_DATE_EPOCH
           chmod -R u+rwX,go+rX,go-w "dist/${STAGE}"
-          chmod 0755 "dist/${STAGE}/volo${{ matrix.ext }}"
+          chmod 0755 "dist/${STAGE}/volo${BIN_EXT}"
           find "dist/${STAGE}/scripts" -type f -name '*.sh' -exec chmod 0755 {} +
           find "dist/${STAGE}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
@@ -279,7 +282,7 @@ jobs:
           STABLE="volo-${GOOS}-${GOARCH}"
           HAVE_7Z=0
           if command -v 7z >/dev/null 2>&1; then HAVE_7Z=1; fi
-          if [ "${{ matrix.archive }}" = "zip" ]; then
+          if [ "${ARCHIVE_FMT}" = "zip" ]; then
             rm -f "${STAGE}.zip"
             if [ "${HAVE_7Z}" = "1" ]; then
               7z a -tzip -mx=9 -mfb=258 -mpass=15 -bd -bso0 -bsp0 "${STAGE}.zip" "${STAGE}"
@@ -314,58 +317,79 @@ jobs:
           name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
 
-  ensure-kanbanniang-release:
-    name: Ensure Version-Deduplicated Kanbanniang Plugin Release
+  ensure-extension-releases:
+    name: Ensure Unified Official Extensions Release Bundle
     needs: [verify]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     concurrency:
-      group: plugin-kanbanniang-release
+      group: official-extensions-bundle-release
       cancel-in-progress: false
     permissions:
       contents: write
     steps:
-      - name: Sparse checkout plugin metadata & packager
+      - name: Sparse checkout extension catalogs, manifests & packager
         uses: actions/checkout@v7
         with:
           sparse-checkout: |
-            .github/scripts/package-plugin.py
-            plugins/catalog.json
-            plugins/kanbanniang/manifest.json
-            plugins/kanbanniang/main.js
+            /.github/scripts/package-plugin.py
+            /plugins/catalog.json
+            /plugins/*/manifest.json
+            /plugins/*/main.js
+            /themes/catalog.json
+            /themes/*/theme.json
+            /locales/*.json
           sparse-checkout-cone-mode: false
 
-      - name: Check If Current Kanbanniang Version Release Already Exists
+      - name: Check If Unified Official Extensions Bundle Release Already Exists
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          META_OUT="$(python3 .github/scripts/package-plugin.py --plugin kanbanniang --print-meta)"
+          META_OUT="$(python3 .github/scripts/package-plugin.py --print-bundle-meta)"
           echo "${META_OUT}"
           echo "${META_OUT}" >> "${GITHUB_OUTPUT}"
 
           TAG="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_tag=//p')"
-          ASSET="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_asset=//p')"
+          EXPECTED_CSV="$(printf '%s\n' "${META_OUT}" | sed -n 's/^expected_assets=//p')"
 
-          if gh release view "${TAG}" --repo "${REPO}" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "${ASSET}"; then
-            echo "should_package=false" >> "${GITHUB_OUTPUT}"
-            echo "Skip packaging: ${TAG} (${ASSET}) is already published; avoiding duplicate build & upload."
+          PUBLISHED_ASSETS="$(gh release view "${TAG}" --repo "${REPO}" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          ALL_PRESENT="true"
+          if [ -z "${PUBLISHED_ASSETS}" ]; then
+            ALL_PRESENT="false"
           else
-            echo "should_package=true" >> "${GITHUB_OUTPUT}"
-            echo "Release ${TAG} not found yet; packaging standalone Kanbanniang ZIP..."
+            OLD_IFS="${IFS}"
+            IFS=','
+            for req_asset in ${EXPECTED_CSV}; do
+              if ! printf '%s\n' "${PUBLISHED_ASSETS}" | grep -Fxq "${req_asset}"; then
+                echo "Missing asset on ${TAG}: ${req_asset}"
+                ALL_PRESENT="false"
+                break
+              fi
+            done
+            IFS="${OLD_IFS}"
           fi
 
-      - name: Reset sparse-checkout workspace (Only When Version Is Unpublished)
+          if [ "${ALL_PRESENT}" = "true" ]; then
+            echo "should_package=false" >> "${GITHUB_OUTPUT}"
+            echo "Skip packaging: unified extensions bundle ${TAG} is already published with all expected ZIPs and SHA256SUMS.txt."
+          else
+            echo "should_package=true" >> "${GITHUB_OUTPUT}"
+            echo "Unified extensions bundle ${TAG} incomplete or unpublished; building consolidated Plugins + Themes + Locales ZIP bundle..."
+          fi
+
+      - name: Reset sparse-checkout workspace (Only When Bundle Is Unpublished)
         if: steps.check.outputs.should_package == 'true'
         run: find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-      - name: Checkout full repository (Only When Version Is Unpublished)
+      - name: Checkout full repository (Only When Bundle Is Unpublished)
         if: steps.check.outputs.should_package == 'true'
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js 24 (Only When Version Is Unpublished)
+      - name: Setup Node.js 24 (Only When Bundle Is Unpublished)
         if: steps.check.outputs.should_package == 'true'
         uses: actions/setup-node@v7
         with:
@@ -373,44 +397,40 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/admin/package-lock.json
 
-      - name: Install Minifier Toolchain Dependencies (Only When Version Is Unpublished)
+      - name: Install Minifier Toolchain Dependencies (Only When Bundle Is Unpublished)
         if: steps.check.outputs.should_package == 'true'
         run: npm ci --prefix web/admin --no-audit --no-fund
 
-      - name: Build Deterministic Kanbanniang ZIP Archive (Only When Version Is Unpublished)
+      - name: Build Unified Official Extensions Bundle (Plugins, Themes & Locales)
         if: steps.check.outputs.should_package == 'true'
         env:
           REPO: ${{ github.repository }}
         run: |
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct -- plugins/kanbanniang 2>/dev/null || true)"
-          case "${SOURCE_DATE_EPOCH}" in
-            ''|*[!0-9]*) SOURCE_DATE_EPOCH="$(date -u -d 2026-01-01T00:00:00Z +%s)" ;;
-          esac
-          export SOURCE_DATE_EPOCH
           python3 .github/scripts/package-plugin.py \
-            --plugin kanbanniang \
-            --output-dir plugin-dist \
+            --bundle \
+            --output-dir ext-dist \
             --repo "${REPO}"
+          ls -lh ext-dist
 
-      - name: Publish Standalone Kanbanniang Plugin Release (make_latest=false)
+      - name: Publish Unified Official Extensions Release (make_latest=false)
         if: steps.check.outputs.should_package == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          name: "Plugin: Kanbanniang v${{ steps.check.outputs.version }}"
+          name: "Official Extensions (Plugins & Themes) ${{ steps.check.outputs.bundle_version }}"
           tag_name: ${{ steps.check.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
           prerelease: false
           make_latest: "false"
-          body_path: plugin-dist/plugin-release-notes.md
+          body_path: ext-dist/extensions-release-notes.md
           generate_release_notes: false
           files: |
-            plugin-dist/${{ steps.check.outputs.release_asset }}
-            plugin-dist/${{ steps.check.outputs.release_asset_alias }}
-            plugin-dist/SHA256SUMS.txt
+            ext-dist/*.zip
+            ext-dist/*.sha256
+            ext-dist/SHA256SUMS.txt
 
   publish-release:
     name: Publish GitHub Release & Checksums
-    needs: [verify, cross-binaries, ensure-kanbanniang-release]
+    needs: [verify, cross-binaries, ensure-extension-releases]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -439,6 +439,13 @@ export class ApiError extends Error {
   }
 }
 
+export function isAbortError(err: any): boolean {
+  if (!err) return false;
+  if (err.name === "AbortError" || err.code === 20) return true;
+  if (err instanceof ApiError && (err.status === 499 || Boolean(err.data?.canceled))) return true;
+  return /aborted|canceled|cancelled/i.test(String(err.message || ""));
+}
+
 export async function apiFetch<T = any>(
   url: string,
   opts: RequestInit = {}
@@ -566,12 +573,23 @@ export function uploadWithProgress<T = any>(
   url: string,
   fd: FormData,
   onProgress?: (pct: number) => void,
-  method = "POST"
+  method = "POST",
+  signal?: AbortSignal
 ): Promise<T> {
+  if (signal?.aborted) {
+    return Promise.reject(new ApiError(499, localizeAdminError("upload aborted"), { canceled: true }));
+  }
   busyCountSig.value = busyCountSig.value + 1;
   if (onProgress) onProgress(0);
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    const onSignalAbort = () => xhr.abort();
+    const cleanup = () => {
+      if (signal) signal.removeEventListener("abort", onSignalAbort);
+    };
+    if (signal) {
+      signal.addEventListener("abort", onSignalAbort, { once: true });
+    }
     xhr.open(method.toUpperCase(), url, true);
     xhr.withCredentials = true;
     xhr.setRequestHeader("X-Volo-Console", "1");
@@ -589,6 +607,7 @@ export function uploadWithProgress<T = any>(
       };
     }
     xhr.onload = () => {
+      cleanup();
       busyCountSig.value = Math.max(0, busyCountSig.value - 1);
       const ct = xhr.getResponseHeader("Content-Type") || "";
       let payload: any = null;
@@ -610,13 +629,19 @@ export function uploadWithProgress<T = any>(
       }
     };
     xhr.onerror = () => {
+      cleanup();
       busyCountSig.value = Math.max(0, busyCountSig.value - 1);
       reject(new ApiError(0, localizeAdminError("network error")));
     };
     xhr.onabort = () => {
+      cleanup();
       busyCountSig.value = Math.max(0, busyCountSig.value - 1);
-      reject(new ApiError(0, localizeAdminError("upload aborted")));
+      reject(new ApiError(499, localizeAdminError("upload aborted"), { canceled: true }));
     };
+    if (signal?.aborted) {
+      xhr.abort();
+      return;
+    }
     xhr.send(fd);
   });
 }

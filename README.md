@@ -20,12 +20,12 @@
 | [Architecture & Performance Internals (`docs/en-US/architecture.md`)](./docs/en-US/architecture.md) | `v9` schema (33 normalized data tables + 9 hot-reload settings domains), real-time ImageView pipeline, multi-dialect SQL & split WAL pools, 10-surface privacy perimeter, memory budget |
 | [Deployment & OS Service Installers (`docs/en-US/deployment.md`)](./docs/en-US/deployment.md) | Multi-layer config precedence, 6 static release targets, Linux (`systemd` / `OpenRC` privilege separation), macOS (`launchd`), Windows native service (`sc.exe` / `NSSM`), auto-rollback upgrades, Docker / GHCR |
 | [Reverse Proxy & CDN Guide (`docs/en-US/reverse-proxy.md`)](./docs/en-US/reverse-proxy.md) | TCP vs Unix Domain Socket (`--unix-socket` / `--socket-mode` / `--socket-group`), `VOLO_TRUSTED_PROXIES` anti-spoofing CIDRs, Nginx / Caddy / Traefik / Apache / Cloudflare recipes |
-| [CLI & Open API Reference (`docs/en-US/cli-and-api.md`)](./docs/en-US/cli-and-api.md) | Built-in `volo` CLI subcommands, scoped `volo_pat_*` tokens, real-time `?imageView2` & KV image query parameters, account ban/mute APIs, paginated search, and REST endpoints |
-| [Themes & Plugin SDK (`docs/en-US/themes-and-plugins.md`)](./docs/en-US/themes-and-plugins.md) | `theme.json`, fullscreen reply Markdown editor, pure-Go ES6 plugin sandbox (5-stage lifecycle, unified `before_*` chains, `volo.kv.incrAsync`, `CronRegistry`, `wordFilter`), 256 MiB streaming ZIP install/export |
-| [Official Plugin Catalog (`plugins/README.md`)](./plugins/README.md) | Canonical plugin version registry ([`plugins/catalog.json`](./plugins/catalog.json): bundled `sensitive-words v1.1.0` & standalone 26-model offline Live2D `kanbanniang v2.0.2`) and version-deduplicated GitHub Actions packaging |
+| [CLI & Open API Reference (`docs/en-US/cli-and-api.md`)](./docs/en-US/cli-and-api.md) | Built-in `volo` CLI (`secret rotate`, read-only `doctor`, `/healthz` readiness `healthcheck`), scoped `volo_pat_*` tokens, `?imageView2` & KV ImageView, Step-Up guards, and REST endpoints |
+| [Themes & Plugin SDK (`docs/en-US/themes-and-plugins.md`)](./docs/en-US/themes-and-plugins.md) | `theme.json`, fullscreen reply editor, pure-Go ES6 plugin sandbox, `SHA256SUMS.txt` (`checksum_url`) URL direct install, batch updates, client-side `.zip` preflight inspector, & atomic rollback |
+| [Official Plugin Catalog (`plugins/README.md`)](./plugins/README.md) | Canonical registries ([`plugins/catalog.json`](./plugins/catalog.json), [`themes/catalog.json`](./themes/catalog.json), [`locales/catalog.json`](./locales/catalog.json): `sensitive-words v1.1.0`, `volo-journal v1.1.1`, & 26-model Live2D `kanbanniang v2.0.5` with corner minimize/summon pill) |
 | [Theme Skin Migration Guide (`docs/en-US/theme-migration.md`)](./docs/en-US/theme-migration.md) | Standalone full-HTML & layout inheritance modes, full `PageContext`, `config_schema` fields, and template FuncMap reference |
-| [Language Pack Extension Guide (`docs/en-US/locale-extension.md`)](./docs/en-US/locale-extension.md) | Hot-installable JSON / `.zip` language packs (with complete `zh-TW` & `ja-JP` packs), `admin.nav.*` namespace, and starter template export |
-| [Legacy Migration & Cross-DB Backup (`docs/en-US/migration-and-backup.md`)](./docs/en-US/migration-and-backup.md) | Streaming legacy 15-table ETL, `301` `.html` permalink preservation, `SQLite ⇄ PostgreSQL ⇄ MySQL` 33-table streaming backups |
+| [Language Pack Extension Guide (`docs/en-US/locale-extension.md`)](./docs/en-US/locale-extension.md) | 1-click official catalog & remote URL language pack installer (`zh-TW` & `ja-JP`), hot-installable JSON / `.zip` packs, `admin.nav.*` namespace, and starter template export |
+| [Legacy Migration & Cross-DB Backup (`docs/en-US/migration-and-backup.md`)](./docs/en-US/migration-and-backup.md) | Streaming legacy 15-table ETL, `301` `.html` permalink preservation, `SQLite ⇄ PostgreSQL ⇄ MySQL` 33-table streaming backups, and automatic `pre-restore-*.zip` safety snapshots |
 | [Changelog (`CHANGELOG.md`)](./CHANGELOG.md) | Release history and upgrade notes |
 
 ---
@@ -36,7 +36,7 @@
 | :--- | :--- | :--- |
 | Static Single Binary Size (`linux/amd64`) | **`~19.6 MiB`** | **`< 22.00 MiB`** across all 6 OS/Arch targets (`< 8.00 MiB` archives) |
 | Warm Resident Memory (`VmRSS`) | **`24.23 MiB`** | `< 35.00 MiB` including embedded themes, plugin sandbox, `wordFilter` engine, and warm caches |
-| Admin Console Initial Core (Gzip) | **`~132 KB`** (`~317.5 KiB` total) | `< 380 KiB` total embedded SPA budget; CodeMirror 6 3-mode editor core is lazy-loaded |
+| Admin Console Initial Core (Gzip) | **`~132 KB`** (`~341.0 KiB` total) | `< 380 KiB` total embedded SPA budget; CodeMirror 6 3-mode editor core is lazy-loaded |
 | Warm Article Card Cache (`ToCard`) | **`1.19 µs/op`** (`864 B/op`) | 4 MiB digest-verified LRU (`758×` faster than cold Markdown render) |
 | Warm Article Detail Cache (`ToDetail`) | **`4.64 µs/op`** (`3.3 KB/op`) | Strictly excludes password-locked & `?preview=` requests (zero cross-user leakage) |
 | Pre-Compressed RSS / Sitemap + `ETag` | **`7.69 µs/op`** (`~130k req/s`) | `1ns` revision invalidation; auto-shards into `<sitemapindex>` above `10,000` URLs |
@@ -135,12 +135,13 @@ docker compose up -d --build
 volo serve                                                   # Start HTTP or Unix Domain Socket server
 volo admin reset-password --user <u|email> [--password <pw>] # Reset Argon2id password (alias: volo passwd) & revoke sessions + tokens
 volo admin disable-2fa --user <u|email>                      # Emergency-disable TOTP & recovery codes for a user
+volo secret rotate [--dry-run]                               # Atomically re-encrypt all 8 AES-256-GCM secret stores under a new master key
 volo backup create [--output backup.zip] [--with-media=true] # Create cross-DB streaming NDJSON + media ZIP backup
-volo backup restore <backup.zip> [--dry-run]                 # Verify SHA-256 & restore cross-DB backup
+volo backup restore <backup.zip> [--dry-run]                 # Auto-snapshot pre-restore-*.zip, verify SHA-256 & restore cross-DB backup
 volo import-legacy <legacy.zip|json> [--dry-run] \
   [--old-site-url URL] [--new-site-url URL] [--storage-local] # Stream & normalize legacy 15-table backup archive
-volo doctor [--json]                                         # Run crypto, SQLite WAL, GeoIP & proxy diagnostics
-volo healthcheck [--url http://127.0.0.1:8080/healthz]       # Probe /healthz over TCP or Unix Socket (Distroless ready)
+volo doctor [--json]                                         # Strictly read-only crypto, TLS, SQLite WAL, GeoIP & proxy diagnostics
+volo healthcheck [--url http://127.0.0.1:8080/healthz]       # Probe /healthz DB & runtime readiness over TCP/HTTPS or Unix Socket
 volo version                                                 # Print version & Go OS/Arch runtime info
 ```
 

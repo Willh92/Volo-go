@@ -273,6 +273,34 @@ func FlushAllKV(ctx context.Context, store *sqlx.Store) error {
 	return hub.flush(ctx, "")
 }
 
+func discardHubBuffers(hub *kvBufferHub) {
+	if hub == nil {
+		return
+	}
+	hub.flushMu.Lock()
+	defer hub.flushMu.Unlock()
+	hub.mu.Lock()
+	hub.gen++
+	clear(hub.entries)
+	clear(hub.dirty)
+	hub.mu.Unlock()
+}
+
+// DiscardAllKVBuffers drops all cached base values and dirty buffered KV deltas for store
+// (or across all registered stores when store == nil) WITHOUT flushing them to the database.
+func DiscardAllKVBuffers(store *sqlx.Store) {
+	if store != nil {
+		discardHubBuffers(lookupKVHub(store))
+		return
+	}
+	kvHubRegistry.Range(func(_, v any) bool {
+		if hub, ok := v.(*kvBufferHub); ok {
+			discardHubBuffers(hub)
+		}
+		return true
+	})
+}
+
 // CloseKVBuffer stops any background flush ticker for store and flushes all dirty buffered KV counters.
 func CloseKVBuffer(ctx context.Context, store *sqlx.Store) error {
 	hub := lookupKVHub(store)

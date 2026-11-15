@@ -31,11 +31,13 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 	var catalog struct {
 		SchemaVersion int `json:"schema_version"`
 		Plugins       []struct {
-			ID           string `json:"id"`
-			Version      string `json:"version"`
-			Distribution string `json:"distribution"`
-			ReleaseTag   string `json:"release_tag"`
-			ReleaseAsset string `json:"release_asset"`
+			ID              string `json:"id"`
+			Version         string `json:"version"`
+			Distribution    string `json:"distribution"`
+			ReleaseTag      string `json:"release_tag"`
+			ReleaseAsset    string `json:"release_asset"`
+			ChecksumURL     string `json:"checksum_url"`
+			ApproxSizeBytes int64  `json:"approx_size_bytes"`
 		} `json:"plugins"`
 	}
 	if err := json.Unmarshal(catRaw, &catalog); err != nil {
@@ -57,17 +59,23 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 		if mf.Version != entry.Version {
 			t.Fatalf("catalog version mismatch for %q: catalog=%q vs manifest=%q", entry.ID, entry.Version, mf.Version)
 		}
-		if entry.Distribution == "standalone-release" {
-			wantTag := fmt.Sprintf("plugin-%s-v%s", entry.ID, entry.Version)
-			wantAsset := fmt.Sprintf("plugin-%s-v%s.zip", entry.ID, entry.Version)
-			if entry.ReleaseTag != wantTag || entry.ReleaseAsset != wantAsset {
-				t.Fatalf("standalone release metadata mismatch for %q: tag=%q asset=%q", entry.ID, entry.ReleaseTag, entry.ReleaseAsset)
-			}
+		if !strings.HasPrefix(entry.ReleaseTag, "extensions-v") {
+			t.Fatalf("expected unified extensions-v* release_tag for %q, got %q", entry.ID, entry.ReleaseTag)
+		}
+		wantAsset := fmt.Sprintf("plugin-%s-v%s.zip", entry.ID, entry.Version)
+		if entry.ReleaseAsset != wantAsset {
+			t.Fatalf("release_asset mismatch for %q: got %q, want %q", entry.ID, entry.ReleaseAsset, wantAsset)
+		}
+		if entry.ChecksumURL == "" || !strings.HasSuffix(entry.ChecksumURL, "/"+entry.ReleaseTag+"/SHA256SUMS.txt") {
+			t.Fatalf("expected unified checksum_url for %q, got %q", entry.ID, entry.ChecksumURL)
+		}
+		if entry.ApproxSizeBytes <= 0 {
+			t.Fatalf("expected approx_size_bytes > 0 for %q, got %d", entry.ID, entry.ApproxSizeBytes)
 		}
 		seenInCatalog[entry.ID] = entry.Version
 	}
-	if seenInCatalog["kanbanniang"] != "2.0.4" || seenInCatalog["sensitive-words"] == "" {
-		t.Fatalf("expected kanbanniang=2.0.4 and sensitive-words in catalog, got %+v", seenInCatalog)
+	if seenInCatalog["kanbanniang"] != "2.0.5" || seenInCatalog["sensitive-words"] == "" {
+		t.Fatalf("expected kanbanniang=2.0.5 and sensitive-words in catalog, got %+v", seenInCatalog)
 	}
 
 	// 2. Stage kanbanniang into isolated test environment and verify admin/public endpoints + all 26 models.
@@ -155,7 +163,7 @@ func TestKanbanniang_CatalogParityAndAll26BundledModels(t *testing.T) {
 	}
 	// Only the host-managed external defer <script src="/plugins/kanbanniang/assets/widget.js?v=..."> tag may appear (zero inline JS).
 	if strings.Count(footerHTML, "<script") != 1 ||
-		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.4"`) ||
+		!strings.Contains(footerHTML, `<script defer src="/plugins/kanbanniang/assets/widget.js?v=2.0.5"`) ||
 		!strings.Contains(footerHTML, `></script>`) {
 		t.Fatalf("expected single external defer widget.js script with zero inline JS, got: %s", footerHTML)
 	}
@@ -600,7 +608,7 @@ func TestKanbanniang_MinifiedZipInstallAndJSVMExecution(t *testing.T) {
 		t.Fatalf("package-plugin.py failed: %v\n%s", cErr, string(out))
 	}
 
-	builtZip := filepath.Join(outDir, "plugin-kanbanniang-v2.0.4.zip")
+	builtZip := filepath.Join(outDir, "plugin-kanbanniang-v2.0.5.zip")
 	zr, err := zip.OpenReader(builtZip)
 	if err != nil {
 		t.Fatalf("open built zip: %v", err)
@@ -754,16 +762,35 @@ func TestKanbanniang_MotionPurityAndControllerInvariants(t *testing.T) {
 		}
 	}
 
+	widgetCSS, err := os.ReadFile(filepath.Join(assetsRoot, "widget.css"))
+	if err != nil {
+		t.Fatalf("read widget.css: %v", err)
+	}
+	cssStr := string(widgetCSS)
+	for _, cssNeedle := range []string{
+		"html:has([data-book-reader]) .solo-kanbanniang",
+		"body:has([data-book-reader]) .solo-kanbanniang",
+		".solo-kanbanniang:focus-within .solo-kanbanniang__tool",
+		".solo-kanbanniang-summon",
+	} {
+		if !strings.Contains(cssStr, cssNeedle) {
+			t.Fatalf("widget.css missing expected selector %q", cssNeedle)
+		}
+	}
+
 	widgetSrc, err := os.ReadFile(filepath.Join(assetsRoot, "widget.js"))
 	if err != nil {
 		t.Fatalf("read widget.js: %v", err)
 	}
-	if !strings.Contains(string(widgetSrc), "function pickRuleTip(") ||
-		!strings.Contains(string(widgetSrc), "function resolveTipText(") ||
-		!strings.Contains(string(widgetSrc), "function enterLoadError(") ||
-		!strings.Contains(string(widgetSrc), "function retryLoad(") ||
-		strings.Contains(string(widgetSrc), "showMessage(tips.click,") {
-		t.Fatalf("widget.js missing rule-object tip unwrapping or manual retry recovery guard")
+	jsStr := string(widgetSrc)
+	if !strings.Contains(jsStr, "function pickRuleTip(") ||
+		!strings.Contains(jsStr, "function resolveTipText(") ||
+		!strings.Contains(jsStr, "function enterLoadError(") ||
+		!strings.Contains(jsStr, "function retryLoad(") ||
+		!strings.Contains(jsStr, "solo-kanbanniang-summon") ||
+		!strings.Contains(jsStr, "function restoreFromSummon(") ||
+		strings.Contains(jsStr, "showMessage(tips.click,") {
+		t.Fatalf("widget.js missing rule-object tip unwrapping, summon pill, or manual retry recovery guard")
 	}
 
 	live2dSrc, err := os.ReadFile(filepath.Join(assetsRoot, "live2d.js"))

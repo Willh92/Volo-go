@@ -376,6 +376,12 @@ func (s *Service) RefreshMediaDimsCache(ctx context.Context) error {
 	return nil
 }
 
+var contentLikeEscaper = strings.NewReplacer("!", "!!", "%", "!%", "_", "!_")
+
+func escapeContentLikePattern(s string) string {
+	return contentLikeEscaper.Replace(s)
+}
+
 // PutMediaDims incrementally inserts or updates a single media asset's dimensions in O(1) without scanning media_assets.
 func (s *Service) PutMediaDims(publicURL string, width int, height int) {
 	u := strings.TrimSpace(publicURL)
@@ -390,6 +396,14 @@ func (s *Service) PutMediaDims(publicURL string, width int, height int) {
 	next := [2]int{width, height}
 	changed := !existed || prev != next
 	if changed {
+		if !existed && len(s.mediaDims) >= maxCachedMediaDims {
+			for k := range s.mediaDims {
+				delete(s.mediaDims, k)
+				if len(s.mediaDims) < maxCachedMediaDims {
+					break
+				}
+			}
+		}
 		s.mediaDims[u] = next
 	}
 	s.mediaMu.Unlock()
@@ -1567,8 +1581,8 @@ func (s *Service) ListTagsWithCountsPage(ctx context.Context, q string, page, pe
 	var whereSQL string
 	var whereArgs []any
 	if cleanQ != "" {
-		pat := "%" + strings.ToLower(cleanQ) + "%"
-		whereSQL = " WHERE LOWER(t.name) LIKE ? OR LOWER(t.slug) LIKE ?"
+		pat := "%" + escapeContentLikePattern(strings.ToLower(cleanQ)) + "%"
+		whereSQL = " WHERE LOWER(t.name) LIKE ? ESCAPE '!' OR LOWER(t.slug) LIKE ? ESCAPE '!'"
 		whereArgs = []any{pat, pat}
 	}
 
@@ -1828,8 +1842,8 @@ func (s *Service) ListSeriesPage(ctx context.Context, q string, page, perPage in
 	var whereSQL string
 	var whereArgs []any
 	if cleanQ != "" {
-		pat := "%" + strings.ToLower(cleanQ) + "%"
-		whereSQL = " WHERE LOWER(title) LIKE ? OR LOWER(slug) LIKE ? OR LOWER(description) LIKE ?"
+		pat := "%" + escapeContentLikePattern(strings.ToLower(cleanQ)) + "%"
+		whereSQL = " WHERE LOWER(title) LIKE ? ESCAPE '!' OR LOWER(slug) LIKE ? ESCAPE '!' OR LOWER(description) LIKE ? ESCAPE '!'"
 		whereArgs = []any{pat, pat, pat}
 	}
 

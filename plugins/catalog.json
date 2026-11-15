@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-11-14",
+  "updated_at": "2026-11-15",
   "repository": "https://github.com/Willh92/Volo-go",
+  "release_tag": "extensions-v1.0.3",
   "plugins": [
     {
       "id": "sensitive-words",
@@ -12,6 +13,14 @@
       "distribution": "bundled",
       "bundled_in_core_archive": true,
       "bundled_in_docker_image": true,
+      "release_tag": "extensions-v1.0.3",
+      "release_asset": "plugin-sensitive-words-v1.1.0.zip",
+      "release_asset_alias": "plugin-sensitive-words.zip",
+      "download_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/plugin-sensitive-words-v1.1.0.zip",
+      "checksum_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/SHA256SUMS.txt",
+      "approx_zip_mb": 0.29,
+      "approx_size_bytes": 300363,
+      "homepage": "https://github.com/Willh92/Volo-go/releases/tag/extensions-v1.0.3",
       "name": {
         "zh-CN": "敏感词与昵称卫士 (Sensitive Words)",
         "en-US": "Sensitive Word & Nickname Guard",
@@ -20,22 +29,34 @@
       },
       "summary": {
         "zh-CN": "内置 6.4 万级分类敏感词库，基于宿主零 GC 指针 BFS-CSR Aho-Corasick 自动机统一守护评论与读者昵称。",
-        "en-US": "64k+ categorized word guard powered by host zero-GC-pointer BFS-CSR Aho-Corasick engine for comments and nicknames."
+        "en-US": "64k+ categorized word guard powered by host zero-GC-pointer BFS-CSR Aho-Corasick engine for comments and nicknames.",
+        "zh-TW": "內建 6.4 萬級分類敏感詞庫，基於宿主零 GC 指標 BFS-CSR Aho-Corasick 自動機統一守護評論與讀者暱稱。",
+        "ja-JP": "6.4万語カテゴリ別辞書を内蔵し、ホストのGCポインタゼロ BFS-CSR Aho-Corasick エンジンでコメントとニックネームを保護します。"
+      },
+      "changelog": {
+        "zh-CN": "提供独立插件归档包分发与 SHA-256 校验清单，接入声明式在线更新检测与原子回退热升级。",
+        "en-US": "Added standalone plugin ZIP distribution with SHA-256 verification and declarative 1-click online hot-update support.",
+        "zh-TW": "提供獨立外掛歸檔包分發與 SHA-256 校驗清單，接入宣告式線上更新檢測與原子回退熱升級。",
+        "ja-JP": "スタンドアロンZIP配布とSHA-256検証に対応し、ワンクリックの宣言的オンライン更新をサポート。"
       }
     },
     {
       "id": "kanbanniang",
-      "version": "2.0.4",
+      "version": "2.0.5",
       "min_host_version": "0.1.0",
       "runtime": "goja",
       "path": "plugins/kanbanniang",
       "distribution": "standalone-release",
       "bundled_in_core_archive": false,
       "bundled_in_docker_image": false,
-      "release_tag": "plugin-kanbanniang-v2.0.4",
-      "release_asset": "plugin-kanbanniang-v2.0.4.zip",
+      "release_tag": "extensions-v1.0.3",
+      "release_asset": "plugin-kanbanniang-v2.0.5.zip",
       "release_asset_alias": "plugin-kanbanniang.zip",
-      "download_url": "https://github.com/Willh92/Volo-go/releases/download/plugin-kanbanniang-v2.0.4/plugin-kanbanniang-v2.0.4.zip",
+      "download_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/plugin-kanbanniang-v2.0.5.zip",
+      "checksum_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/SHA256SUMS.txt",
+      "approx_zip_mb": 35.45,
+      "approx_size_bytes": 37176363,
+      "homepage": "https://github.com/Willh92/Volo-go/releases/tag/extensions-v1.0.3",
       "name": {
         "zh-CN": "Live2D 看板娘 (Kanbanniang)",
         "en-US": "Live2D Mascot Companion (Kanbanniang)",
@@ -44,7 +65,15 @@
       },
       "summary": {
         "zh-CN": "完整内置 26 套本地离线 Live2D 模型、Pio/Tia 随机换装、7 键悬浮/触控工具栏、拖拽定位、樱花动态背景与摸头计数，采用纯 WebP 轻量化贴图并兼容自定义 PNG 模型包。",
-        "en-US": "26 self-hosted offline Live2D models, Pio/Tia outfit variants, 7-action hover/touch toolbar, pointer drag, animated WebP sakura backgrounds, KV head-pats, and pure-WebP slimmed textures with custom PNG pack support."
+        "en-US": "26 self-hosted offline Live2D models, Pio/Tia outfit variants, 7-action hover/touch toolbar, pointer drag, animated WebP sakura backgrounds, KV head-pats, and pure-WebP slimmed textures with custom PNG pack support.",
+        "zh-TW": "完整內建 26 套本機離線 Live2D 模型、Pio/Tia 隨機換裝、7 鍵懸浮/觸控工具列、拖曳定位、櫻花動態背景與摸頭計數，採用純 WebP 輕量化貼圖並相容自訂 PNG 模型包。",
+        "ja-JP": "26種類のオフラインLive2Dモデル、Pio/Tia着せ替え、7ボタンツールバー、ドラッグ移動、桜アニメーション背景、なでなで統計を搭載。"
+      },
+      "changelog": {
+        "zh-CN": "新增模型加载失败保留手动重试卡片、接入在线版本检测与一键热更新，支持保留已有模型偏好与摸头计数平滑升级。",
+        "en-US": "Added manual retry error card on asset load failures and 1-click online update support preserving preferences and head-pat stats.",
+        "zh-TW": "新增模型載入失敗保留手動重試卡片、接入線上版本檢測與一鍵熱更新，支援保留既有模型偏好與摸頭計數平滑升級。",
+        "ja-JP": "モデル読み込み失敗時の手動リトライカードを追加し、設定となでなで回数を保持したままのオンライン更新に対応。"
       }
     }
   ]

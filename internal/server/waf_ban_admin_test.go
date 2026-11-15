@@ -172,8 +172,14 @@ func TestAdminIPBanLifecycleCommentBanDurationsAndLogClear(t *testing.T) {
 		t.Fatalf("expected batch ban_ip expires_minutes=0 to store permanent expires_at=0, got expires=%d err=%v", permExpires, err)
 	}
 
-	// 6. DELETE /api/admin/audit-logs clears audit logs cleanly
-	clearAudResp, clearAudRaw := doJSONReq(t, http.MethodDelete, env.ts.URL+"/api/admin/audit-logs", nil, adminCookies, adminHdrs)
+	// 6. DELETE /api/admin/audit-logs enforces step-up password verification and records a single clear tombstone
+	unauthClearResp, _ := doJSONReq(t, http.MethodDelete, env.ts.URL+"/api/admin/audit-logs", nil, adminCookies, adminHdrs)
+	if unauthClearResp.StatusCode != http.StatusBadRequest && unauthClearResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected DELETE audit-logs without step-up password to fail, got %d", unauthClearResp.StatusCode)
+	}
+	clearAudResp, clearAudRaw := doJSONReq(t, http.MethodDelete, env.ts.URL+"/api/admin/audit-logs", map[string]any{
+		"current_password": "Str0ng!Pass#2026",
+	}, adminCookies, adminHdrs)
 	if clearAudResp.StatusCode != http.StatusOK {
 		t.Fatalf("DELETE audit-logs = %d %s", clearAudResp.StatusCode, string(clearAudRaw))
 	}
@@ -182,11 +188,12 @@ func TestAdminIPBanLifecycleCommentBanDurationsAndLogClear(t *testing.T) {
 		t.Fatal(string(audListRaw))
 	}
 	var audBody struct {
-		Total int `json:"total"`
+		Total int               `json:"total"`
+		Items []domain.AuditLog `json:"items"`
 	}
 	_ = json.Unmarshal(audListRaw, &audBody)
-	if audBody.Total != 0 {
-		t.Fatalf("expected 0 audit logs after DELETE /api/admin/audit-logs, got %d", audBody.Total)
+	if audBody.Total != 1 || len(audBody.Items) != 1 || audBody.Items[0].Action != "system.clear_audit_logs" {
+		t.Fatalf("expected 1 system.clear_audit_logs tombstone after DELETE /api/admin/audit-logs, got total=%d items=%+v", audBody.Total, audBody.Items)
 	}
 }
 

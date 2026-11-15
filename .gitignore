@@ -25,6 +25,7 @@ coverage.txt
 
 # External runtime mounts (dev local)
 /themes/*
+!/themes/catalog.json
 !/themes/volo-studio/
 !/themes/volo-journal/
 /plugins/*

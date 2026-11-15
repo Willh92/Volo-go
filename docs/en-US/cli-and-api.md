@@ -71,9 +71,21 @@ Clears `totp` and `recovery_codes` credentials for a locked-out user and records
 ./volo admin disable-2fa --user admin@example.com --env-file /etc/volo/volo.env
 ```
 
-### 1.4 `volo backup create` & `volo backup restore` (Streaming Cross-DB Backup)
+### 1.4 `volo secret rotate` (Atomic Master Key Rotation Across All 8 Encrypted Stores)
 
-See [Legacy Migration & Cross-DB Streaming Backup](./migration-and-backup.md) for architectural details.
+Rotates the host `AES-256-GCM` master key (`KeyRing`) and atomically re-seals all **8 AAD-bound encrypted secret stores** (including `${VOLO_DATA_DIR}/db.json` bootstrap DSN, `settings.secret_ciphertext` domains such as SMTP/S3/WebDAV/OIDC, `plugins.secret_ciphertext`, `webhooks` signing secrets, TOTP secrets, and encrypted recovery credentials) inside a verified transaction:
+
+```bash
+# Dry-run first: verify every existing ciphertext across all 8 stores decrypts cleanly without writing
+./volo secret rotate --env-file /etc/volo/volo.env --dry-run
+
+# Execute atomic master key rotation across all 8 encrypted stores
+./volo secret rotate --env-file /etc/volo/volo.env
+```
+
+### 1.5 `volo backup create` & `volo backup restore` (Streaming Cross-DB Backup & Pre-Restore Snapshots)
+
+See [Legacy Migration & Cross-DB Streaming Backup](./migration-and-backup.md) for architectural details. Before executing a live restore (non-`--dry-run`) over an existing populated database, Volo-go automatically creates a `pre-restore-*.zip` safety snapshot in `${VOLO_BACKUP_DIR}`.
 
 ```bash
 # Stream a full database + media backup archive (--with-media=true by default; defaults to ${VOLO_BACKUP_DIR}/volo-backup-<UTC>.zip)
@@ -85,11 +97,11 @@ See [Legacy Migration & Cross-DB Streaming Backup](./migration-and-backup.md) fo
 # Pre-verify all NDJSON SHA-256 digests and row counts without modifying the database
 ./volo backup restore ./volo-backup.zip --dry-run
 
-# Restore seamlessly across SQLite ⇄ PostgreSQL ⇄ MySQL
+# Auto-snapshot pre-restore-*.zip & restore seamlessly across SQLite ⇄ PostgreSQL ⇄ MySQL
 ./volo backup restore ./volo-backup.zip
 ```
 
-### 1.5 `volo import-legacy` (Streaming Legacy Archive ETL)
+### 1.6 `volo import-legacy` (Streaming Legacy Archive ETL)
 
 Streams and normalizes legacy 15-table `.zip` or `data.json` archives with built-in URL rewriting and storage fallback options:
 
@@ -111,16 +123,16 @@ Streams and normalizes legacy 15-table `.zip` or `data.json` archives with built
   --storage-local
 ```
 
-### 1.6 `volo doctor`, `volo healthcheck`, & `volo version` (Diagnostics & Container Liveness)
+### 1.7 `volo doctor`, `volo healthcheck`, & `volo version` (Read-Only Diagnostics & Readiness Probes)
 
 ```bash
-# Human-readable report (checks KeyRing permissions, admin path status, SQLite WAL, multi-DB GeoIP status, FS writability, and proxy CIDRs)
+# Strictly read-only report (never creates directories, .secret.key, or SQLite WAL sidecars; checks KeyRing, TLS certs, admin path, WAL, GeoIP, FS, & proxy CIDRs)
 ./volo doctor
 
-# Machine-readable JSON diagnostics (exits 1 when unhealthy; ideal for CI & monitoring)
+# Machine-readable JSON read-only diagnostics (exits 1 when unhealthy; ideal for CI & monitoring)
 ./volo doctor --json
 
-# Read-only /healthz probe (never creates .secret.key; auto-discovers TCP ListenAddr or Unix Socket http://unix/healthz)
+# Read-only /healthz readiness probe (never creates .secret.key; auto-discovers TCP/HTTPS ListenAddr or Unix Socket http://unix/healthz)
 ./volo healthcheck
 ./volo healthcheck --url http://127.0.0.1:8080/healthz
 
@@ -207,12 +219,16 @@ Successful `201 Created` response returning both the full `asset` record and a t
 
 ### 2.4 Account & IP Ban Governance, Log Retention, Batch Reordering & Plugin Chain Endpoints
 
-- **`GET /api/admin/users`** & **`PATCH /api/admin/users`** (requires interactive admin session): Discourse-style account moderation supporting `action: "ban" | "unban" | "mute" | "unmute" | "shield"`, `duration_hours` (`0` = indefinite, `> 0` = timed auto-expiry), `reason`, `shield_comments` (`boolean`), and `shield_text` (non-destructively masking historical comments until unbanned/unmuted or expired).
+- **`GET /api/admin/users`**, **`PATCH /api/admin/users`**, & **`DELETE /api/admin/users/{id}`** (requires interactive admin session; `DELETE` additionally enforces Step-Up re-authentication via `X-Volo-Current-Password`): Discourse-style account moderation supporting `action: "ban" | "unban" | "mute" | "unmute" | "shield"`, `duration_hours` (`0` = indefinite, `> 0` = timed auto-expiry), `reason`, `shield_comments` (`boolean`), and `shield_text` (non-destructively masking historical comments until unbanned/unmuted or expired).
 - **`GET / POST /api/admin/security/ip-bans`**, **`PATCH / DELETE /api/admin/security/ip-bans/{id}`**, **`POST /api/admin/security/ip-bans/{id}/unban`**, **`POST /api/admin/security/ip-bans/batch`**, & **`POST /api/admin/security/ip-bans/purge-expired`** (requires interactive admin session): Full IP/CIDR ban lifecycle returning `counts` (`active`, `expired`, `all`), `source` (`manual` / `auto_waf`), cumulative `occurrences`, and offline GeoIP `location`. Single/batch `unban` early-expires bans while preserving historical records; `PATCH` and batch `set_duration` update `expires_minutes` (`0` = permanent, `> 0` = minutes from now) or `note` (and re-ban expired entries), and single-record `PATCH` also supports explicitly adjusting or resetting cumulative `occurrences` (`0`–`1000000`); `DELETE`, batch `delete`, and `purge-expired` physically remove rows. Comment moderation (`POST /api/admin/comments/{id}/ban-ip` and `POST /api/admin/comments/batch` with `action: "ban_ip"`) accepts matching `expires_minutes`.
-- **`DELETE /api/admin/audit-logs`** & **`DELETE /api/admin/plugins/{id}/logs`** (requires interactive admin session): One-click physical clear for admin audit logs and per-plugin runtime logs (alongside automatic scheduled cleanup controlled by `security.ip_ban_retention_days`, `security.audit_log_retention_days`, and `security.plugin_log_retention_days`, where `0` = retain indefinitely).
+- **`DELETE /api/admin/audit-logs`** (requires Step-Up `X-Volo-Current-Password`) & **`DELETE /api/admin/plugins/{id}/logs`** (requires interactive admin session): One-click physical clear for admin audit logs and per-plugin runtime logs (alongside automatic scheduled cleanup controlled by `security.ip_ban_retention_days`, `security.audit_log_retention_days`, and `security.plugin_log_retention_days`, where `0` = retain indefinitely).
 - **`POST /api/admin/categories/reorder`** & **`POST /api/admin/books/reorder`**: Atomically update `sort_order` in a single transaction.
 - **`POST /api/admin/plugins/reorder`** & **`PATCH /api/admin/plugins/{id}/priority`** (requires interactive admin session): Reorder the plugin execution chain or set an exact numeric `priority` (`-1000`–`10000`).
-- **`GET /api/admin/plugins/cron`**, **`POST /api/admin/plugins/{id}/trigger-cron`**, and **`GET /api/admin/plugins/{id}/export`**.
+- **`GET /api/admin/plugins/catalog`**, **`GET /api/admin/themes/catalog`**, & **`GET /api/admin/locales/catalog`** (supports `?refresh=1` to bypass `ETag` cache): Fetch official standalone plugin, theme, and language pack (`zh-TW`, `ja-JP`) catalogs cross-referenced with installed versions, package sizes, `checksum_url`, and host compatibility.
+- **`POST /api/admin/plugins/install`** / **`POST /api/admin/themes/install`** / **`POST /api/admin/locales/install`** (accepts both `multipart/form-data` local uploads and `application/json` `{ "url", "sha256", "checksum_url", "asset_name", "overwrite", "enable"|"activate" }` remote URL installs) plus explicit aliases **`POST /api/admin/{plugins,themes,locales}/install-url`**: SSRF-safe streaming installer with end-to-end `SHA256SUMS.txt` (`checksum_url`) verification (`499` on client abort, `409 Conflict` when `overwrite` is `false`).
+- **`POST /api/admin/plugins/check-updates`** / **`POST /api/admin/themes/check-updates`** (`{ "ids": [...], "force": true }`) and single-item **`POST /api/admin/plugins/{id}/check-update`** / **`POST /api/admin/themes/{id}/check-update`**: Bounded-concurrency on-demand update checks (silently skipping `update_capability == "none"` extensions and never tripping production circuit breakers on upstream errors).
+- **`POST /api/admin/plugins/{id}/update`** (alias `/upgrade`) & **`POST /api/admin/themes/{id}/update`** (alias `/upgrade`): Two-phase transactional online upgrade with instant pre-commit cancellation and automatic directory/DB/runtime rollback on post-swap failure.
+- **`GET /api/admin/plugins/cron`**, **`POST /api/admin/plugins/{id}/trigger-cron`**, **`GET /api/admin/plugins/{id}/export`**, and **`GET /api/admin/themes/{id}/export`**.
 
 ---
 

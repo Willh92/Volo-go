@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -271,8 +272,8 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 			localRest = strings.TrimPrefix(sub, "backup/local/")
 		}
 		if localRest != "" && !strings.Contains(localRest, "/") {
-			base := filepath.Base(localRest)
-			if base != localRest || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
+			base, ok := validateSafeBackupFilename(localRest)
+			if !ok {
 				writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
 				return
 			}
@@ -467,6 +468,19 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		})
 
 	case sub == "audit-logs" && r.Method == http.MethodDelete:
+		var req struct {
+			CurrentPassword string `json:"current_password"`
+		}
+		if !decodeOptJSONBody(w, r, 4096, &req) {
+			return
+		}
+		curPwd := req.CurrentPassword
+		if strings.TrimSpace(curPwd) == "" {
+			curPwd = r.URL.Query().Get("current_password")
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, curPwd) {
+			return
+		}
 		var affected int64
 		if res, err := s.deps.Store.ExecContext(r.Context(), `DELETE FROM audit_logs`); !writeServerErr(w, err) {
 			if res != nil {
@@ -479,6 +493,7 @@ func (s *AppServer) handleAdminSystemRoutes(w http.ResponseWriter, r *http.Reque
 		s.auditActions = nil
 		s.auditActionsExp = time.Time{}
 		s.auditActionsMu.Unlock()
+		s.recordAuditLog(r, actor, "system.clear_audit_logs", "audit_log", "all", map[string]any{"cleared": affected})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "affected": affected})
 
 	case (sub == "backup/ticket" || sub == "backups/ticket") && r.Method == http.MethodPost:
@@ -753,6 +768,9 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 				return
 			}
 			s.invalidateMediaRefCache()
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			writeJSON(w, http.StatusCreated, map[string]any{"item": in})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -786,6 +804,10 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 		if writeBadErr(w, err) {
 			return
 		}
+		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		writeOKJSON(w)
 	case http.MethodDelete:
 		var delRows []struct {
@@ -803,6 +825,9 @@ func (s *AppServer) handleAdminNav(w http.ResponseWriter, r *http.Request, _ *do
 			s.pruneDeletedNavFromThemeConfigs(r.Context(), delIDs)
 		}
 		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		writeOKJSON(w)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -2709,14 +2734,23 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		if writeBadErr(w, s.deps.Themes.Reload()) {
 			return
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
+		var appVer int64
+		if s.deps.Settings != nil {
+			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
+		}
 		snap := s.deps.Settings.Snapshot()
 		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, snap.Appearance))
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":           true,
-			"active_theme": normApp.ActiveTheme,
-			"mobile_theme": normApp.MobileTheme,
-			"appearance":   normApp,
-			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
+			"ok":                 true,
+			"active_theme":       normApp.ActiveTheme,
+			"mobile_theme":       normApp.MobileTheme,
+			"appearance":         normApp,
+			"appearance_version": appVer,
+			"version":            appVer,
+			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
 		})
 		return
 	}
@@ -2765,70 +2799,199 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 		if writeBadErr(w, err) {
 			return
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "theme.activate", "theme", tid, map[string]any{"target": target})
 		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, s.deps.Settings.Snapshot().Appearance))
 		writeJSON(w, http.StatusOK, map[string]any{"appearance": normApp, "version": ver})
 		return
 	}
 
+	if rest == "catalog" && r.Method == http.MethodGet {
+		s.handleAdminThemesCatalog(w, r, locale)
+		return
+	}
+
+	if rest == "check-updates" && r.Method == http.MethodPost {
+		ids, force, ok := parseOptionalCheckUpdatesRequest(w, r, false)
+		if !ok {
+			return
+		}
+		summary, err := s.deps.Themes.CheckUpdates(r.Context(), ids, force, locale)
+		if writeExtensionOpError(w, err, true) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"summary":  summary,
+			"statuses": summary.Statuses,
+			"themes":   s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
+		})
+		return
+	}
+
+	if rest == "install-url" && r.Method == http.MethodPost {
+		s.handleAdminThemeInstallURL(w, r, actor, locale)
+		return
+	}
+
 	if rest == "install" && r.Method == http.MethodPost {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/json") {
+			s.handleAdminThemeInstallURL(w, r, actor, locale)
+			return
+		}
 		extendStreamingDeadlines(w, 15*time.Minute)
-		files, fields, mErr := readMultipartInMemoryFiles(w, r, 32<<20, 32<<20, 2)
+		uploaded, mErr := streamMultipartSingleFile(w, r, "", 32<<20, s.ensureTempDir(), "volo-theme-install-", ".zip", ".zip")
 		if mErr != nil {
 			writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 			return
 		}
-		var uf *inMemoryMultipartFile
-		for i := range files {
-			if files[i].FieldName == "file" || uf == nil {
-				uf = &files[i]
-				if files[i].FieldName == "file" {
-					break
-				}
-			}
-		}
-		if uf == nil {
-			writeErrJSON(w, http.StatusBadRequest, "missing 'file' field")
-			return
-		}
-		owRaw := strings.TrimSpace(fields["overwrite"])
+		defer os.Remove(uploaded.TempPath)
+		owRaw := strings.TrimSpace(uploaded.FormFields["overwrite"])
 		if owRaw == "" {
 			owRaw = strings.TrimSpace(r.URL.Query().Get("overwrite"))
 		}
 		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
-		mf, iErr := s.deps.Themes.InstallZip(bytes.NewReader(uf.Data), int64(len(uf.Data)), overwrite)
-		if iErr != nil {
-			if !overwrite && isAlreadyExistsInstallErr(iErr) {
-				writeErrJSON(w, http.StatusConflict, iErr.Error())
-				return
-			}
-			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
+		actRaw := strings.TrimSpace(uploaded.FormFields["activate"])
+		if actRaw == "" {
+			actRaw = strings.TrimSpace(r.URL.Query().Get("activate"))
+		}
+		activate := actRaw == "1" || strings.EqualFold(actRaw, "true")
+		zf, oErr := os.Open(uploaded.TempPath)
+		if oErr != nil {
+			writeErrJSON(w, http.StatusInternalServerError, oErr.Error())
 			return
 		}
+		defer zf.Close()
+		zStat, sErr := zf.Stat()
+		if sErr != nil {
+			writeErrJSON(w, http.StatusInternalServerError, sErr.Error())
+			return
+		}
+		mf, iErr := s.deps.Themes.InstallZipContext(r.Context(), zf, zStat.Size(), overwrite)
+		if writeExtensionOpError(w, iErr, overwrite) {
+			return
+		}
+		if activate && s.deps.Settings != nil {
+			if patchBytes, pErr := json.Marshal(map[string]any{"active_theme": mf.ID}); pErr == nil {
+				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
+			}
+		}
+		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "theme.install", "theme", mf.ID, map[string]any{"version": mf.Version})
+		var appVer int64
+		if s.deps.Settings != nil {
+			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
+		}
+		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, s.deps.Settings.Snapshot().Appearance))
 		writeJSON(w, http.StatusCreated, map[string]any{
-			"theme":  mf,
-			"themes": s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
+			"theme":              mf,
+			"active_theme":       normApp.ActiveTheme,
+			"mobile_theme":       normApp.MobileTheme,
+			"appearance":         normApp,
+			"appearance_version": appVer,
+			"version":            appVer,
+			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
 		})
 		return
 	}
 
 	parts := strings.Split(rest, "/")
 	themeID := strings.TrimSpace(parts[0])
+	if len(parts) == 2 && parts[1] == "check-update" && r.Method == http.MethodPost {
+		if s.deps.Themes == nil || !s.deps.Themes.Has(themeID) {
+			writeErrJSON(w, http.StatusNotFound, "theme not found: "+themeID)
+			return
+		}
+		_, force, ok := parseOptionalCheckUpdatesRequest(w, r, true)
+		if !ok {
+			return
+		}
+		st, err := s.deps.Themes.CheckThemeUpdate(r.Context(), themeID, force, locale)
+		if writeExtensionOpError(w, err, true) {
+			return
+		}
+		locTh, _ := s.deps.Themes.GetLocalized(themeID, locale)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"status": st,
+			"theme":  locTh,
+			"themes": s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
+		})
+		return
+	}
+
+	if len(parts) == 2 && (parts[1] == "update" || parts[1] == "upgrade") && r.Method == http.MethodPost {
+		extendStreamingDeadlines(w, 15*time.Minute)
+		if s.deps.Themes == nil || !s.deps.Themes.Has(themeID) {
+			writeErrJSON(w, http.StatusNotFound, "theme not found: "+themeID)
+			return
+		}
+		mf, err := s.deps.Themes.UpgradeTheme(r.Context(), themeID, locale)
+		if writeExtensionOpError(w, err, true) {
+			return
+		}
+		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
+		s.recordAuditLog(r, actor, "theme.upgrade", "theme", mf.ID, map[string]any{"version": mf.Version})
+		var appVer int64
+		if s.deps.Settings != nil {
+			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
+		}
+		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, s.deps.Settings.Snapshot().Appearance))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":                 true,
+			"theme":              mf,
+			"active_theme":       normApp.ActiveTheme,
+			"mobile_theme":       normApp.MobileTheme,
+			"appearance":         normApp,
+			"appearance_version": appVer,
+			"version":            appVer,
+			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
+		})
+		return
+	}
+
 	if len(parts) == 2 && (parts[1] == "export" || parts[1] == "export.zip") && r.Method == http.MethodGet {
 		extendStreamingDeadlines(w, 15*time.Minute)
 		if s.deps.Themes == nil || !s.deps.Themes.Has(themeID) {
 			writeErrJSON(w, http.StatusNotFound, "theme not found: "+themeID)
 			return
 		}
-		var buf bytes.Buffer
-		if writeBadErr(w, s.deps.Themes.ExportZip(&buf, themeID)) {
+		tmpFile, tErr := os.CreateTemp(s.ensureTempDir(), "volo-theme-export-*.zip")
+		if tErr != nil {
+			writeErrJSON(w, http.StatusInternalServerError, tErr.Error())
 			return
 		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+		if err := s.deps.Themes.ExportZip(tmpFile, themeID); err != nil {
+			_ = tmpFile.Close()
+			writeBadErr(w, err)
+			return
+		}
+		if _, skErr := tmpFile.Seek(0, io.SeekStart); skErr != nil {
+			_ = tmpFile.Close()
+			writeErrJSON(w, http.StatusInternalServerError, skErr.Error())
+			return
+		}
+		st, stErr := tmpFile.Stat()
+		if stErr != nil {
+			_ = tmpFile.Close()
+			writeErrJSON(w, http.StatusInternalServerError, stErr.Error())
+			return
+		}
+		defer tmpFile.Close()
 		s.recordAuditLog(r, actor, "theme.export", "theme", themeID, nil)
 		w.Header().Set("Content-Type", "application/zip")
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.zip"`, themeID))
-		_, _ = w.Write(buf.Bytes())
+		http.ServeContent(w, r, themeID+".zip", st.ModTime(), tmpFile)
 		return
 	}
 
@@ -2874,6 +3037,9 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			return
 		}
 		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "theme.config", "theme", themeID, nil)
 		outApp := s.deps.Settings.Snapshot().Appearance
 		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, outApp))
@@ -2898,15 +3064,24 @@ func (s *AppServer) handleAdminThemes(w http.ResponseWriter, r *http.Request, ac
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainAppearance, patchBytes, 0)
 		}
 		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "theme.uninstall", "theme", themeID, nil)
+		var appVer int64
+		if s.deps.Settings != nil {
+			_, appVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainAppearance)
+		}
 		nextApp := s.deps.Settings.Snapshot().Appearance
 		normApp := s.redactAppearanceThemeSecrets(s.normalizeAppearanceNavConfigs(r.Context(), locale, nextApp))
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":           true,
-			"active_theme": normApp.ActiveTheme,
-			"mobile_theme": normApp.MobileTheme,
-			"appearance":   normApp,
-			"themes":       s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
+			"ok":                 true,
+			"active_theme":       normApp.ActiveTheme,
+			"mobile_theme":       normApp.MobileTheme,
+			"appearance":         normApp,
+			"appearance_version": appVer,
+			"version":            appVer,
+			"themes":             s.enrichThemesWithCustomNav(r.Context(), locale, s.deps.Themes.ListLocalized(locale)),
 		})
 		return
 	}
@@ -2934,7 +3109,32 @@ func (s *AppServer) ensureLocalesDirReady() string {
 
 func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
 	rest = strings.TrimPrefix(rest, "/")
+	locale := strings.TrimSpace(r.URL.Query().Get("locale"))
+	if locale == "" && actor != nil {
+		locale = actor.PreferredLocale
+	}
+	if locale == "" {
+		locale = s.resolveLocale(r)
+	}
 	extDir := s.ensureLocalesDirReady()
+
+	siteVersion := func() int64 {
+		if s.deps.Settings == nil {
+			return 0
+		}
+		_, ver, _ := s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainSite)
+		return ver
+	}
+
+	if rest == "catalog" && r.Method == http.MethodGet {
+		s.handleAdminLocalesCatalog(w, r, locale)
+		return
+	}
+
+	if rest == "install-url" && r.Method == http.MethodPost {
+		s.handleAdminLocaleInstallURL(w, r, actor, locale)
+		return
+	}
 
 	if rest == "" && r.Method == http.MethodGet {
 		snap := s.deps.Settings.Snapshot()
@@ -2942,6 +3142,7 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			"locales_dir":         extDir,
 			"default_locale":      snap.Site.DefaultLocale,
 			"allow_locale_switch": snap.Site.AllowLocaleSwitch,
+			"site_version":        siteVersion(),
 			"items":               s.deps.Catalog.Packs(),
 			"locales":             s.deps.Catalog.Locales(),
 		})
@@ -2955,10 +3156,14 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		if s.deps.Themes != nil {
 			_ = s.deps.Themes.Reload()
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"items":   s.deps.Catalog.Packs(),
-			"locales": s.deps.Catalog.Locales(),
+			"ok":           true,
+			"site_version": siteVersion(),
+			"items":        s.deps.Catalog.Packs(),
+			"locales":      s.deps.Catalog.Locales(),
 		})
 		return
 	}
@@ -2977,17 +3182,21 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			raw, _ := json.Marshal(req.Messages)
 			ow := req.Overwrite == nil || *req.Overwrite
 			sum, err := s.deps.Catalog.InstallPackJSON(req.Code, raw, ow)
-			if writeBadErr(w, err) {
+			if writeExtensionOpError(w, err, ow) {
 				return
 			}
 			if s.deps.Themes != nil {
 				_ = s.deps.Themes.Reload()
 			}
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			s.recordAuditLog(r, actor, "locale.install", "locale", sum.Code, nil)
 			writeJSON(w, http.StatusCreated, map[string]any{
-				"pack":    sum,
-				"items":   s.deps.Catalog.Packs(),
-				"locales": s.deps.Catalog.Locales(),
+				"pack":         sum,
+				"site_version": siteVersion(),
+				"items":        s.deps.Catalog.Packs(),
+				"locales":      s.deps.Catalog.Locales(),
 			})
 			return
 		}
@@ -3016,18 +3225,21 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		fname := strings.TrimSpace(uf.Filename)
 		if strings.HasSuffix(strings.ToLower(fname), ".zip") {
 			installed, zErr := s.deps.Catalog.InstallPackZip(bytes.NewReader(raw), int64(len(raw)), overwrite)
-			if zErr != nil {
-				writeErrJSON(w, http.StatusBadRequest, zErr.Error())
+			if writeExtensionOpError(w, zErr, overwrite) {
 				return
 			}
 			if s.deps.Themes != nil {
 				_ = s.deps.Themes.Reload()
 			}
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			s.recordAuditLog(r, actor, "locale.install_zip", "locale", installed[0].Code, map[string]any{"count": len(installed)})
 			writeJSON(w, http.StatusCreated, map[string]any{
-				"installed": installed,
-				"items":     s.deps.Catalog.Packs(),
-				"locales":   s.deps.Catalog.Locales(),
+				"installed":    installed,
+				"site_version": siteVersion(),
+				"items":        s.deps.Catalog.Packs(),
+				"locales":      s.deps.Catalog.Locales(),
 			})
 			return
 		}
@@ -3042,18 +3254,21 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 			}
 		}
 		sum, jErr := s.deps.Catalog.InstallPackJSON(codeHint, raw, overwrite)
-		if jErr != nil {
-			writeErrJSON(w, http.StatusBadRequest, jErr.Error())
+		if writeExtensionOpError(w, jErr, overwrite) {
 			return
 		}
 		if s.deps.Themes != nil {
 			_ = s.deps.Themes.Reload()
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "locale.install", "locale", sum.Code, nil)
 		writeJSON(w, http.StatusCreated, map[string]any{
-			"pack":    sum,
-			"items":   s.deps.Catalog.Packs(),
-			"locales": s.deps.Catalog.Locales(),
+			"pack":         sum,
+			"site_version": siteVersion(),
+			"items":        s.deps.Catalog.Packs(),
+			"locales":      s.deps.Catalog.Locales(),
 		})
 		return
 	}
@@ -3079,6 +3294,9 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		if s.deps.Themes != nil {
 			_ = s.deps.Themes.Reload()
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		snap := s.deps.Settings.Snapshot()
 		if !s.deps.Catalog.Has(snap.Site.DefaultLocale) {
 			patch, _ := json.Marshal(map[string]any{"default_locale": "zh-CN"})
@@ -3086,9 +3304,10 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 		}
 		s.recordAuditLog(r, actor, "locale.delete", "locale", code, nil)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"items":   s.deps.Catalog.Packs(),
-			"locales": s.deps.Catalog.Locales(),
+			"ok":           true,
+			"site_version": siteVersion(),
+			"items":        s.deps.Catalog.Packs(),
+			"locales":      s.deps.Catalog.Locales(),
 		})
 		return
 	}
@@ -3097,18 +3316,24 @@ func (s *AppServer) handleAdminLocales(w http.ResponseWriter, r *http.Request, a
 }
 
 func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, actor *domain.User, rest string) {
-	if s.deps.Plugins == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}})
-		return
-	}
 	locale := strings.TrimSpace(r.URL.Query().Get("locale"))
 	if locale == "" {
 		locale = actor.PreferredLocale
 	}
-	if locale == "" {
+	if locale == "" && s.deps.Settings != nil {
 		locale = s.deps.Settings.Snapshot().Site.DefaultLocale
 	}
 	rest = strings.TrimPrefix(rest, "/")
+
+	if rest == "catalog" && r.Method == http.MethodGet {
+		s.handleAdminPluginsCatalog(w, r, locale)
+		return
+	}
+
+	if s.deps.Plugins == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+		return
+	}
 
 	if rest == "" && r.Method == http.MethodGet {
 		list := s.deps.Plugins.List(locale)
@@ -3143,6 +3368,9 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "plugin.reorder", "plugin", "chain", map[string]any{"count": len(ids)})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":        true,
@@ -3157,6 +3385,9 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		if writeBadErr(w, s.deps.Plugins.ReloadAll(r.Context())) {
 			return
 		}
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		list := s.deps.Plugins.List(locale)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":        true,
@@ -3167,7 +3398,37 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 
+	if rest == "check-updates" && r.Method == http.MethodPost {
+		ids, force, ok := parseOptionalCheckUpdatesRequest(w, r, false)
+		if !ok {
+			return
+		}
+		summary, err := s.deps.Plugins.CheckUpdates(r.Context(), ids, force, locale)
+		if writeExtensionOpError(w, err, true) {
+			return
+		}
+		list := s.deps.Plugins.List(locale)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":        true,
+			"summary":   summary,
+			"statuses":  summary.Statuses,
+			"items":     list,
+			"plugins":   list,
+			"cron_jobs": s.deps.Plugins.CronJobs(),
+		})
+		return
+	}
+
+	if rest == "install-url" && r.Method == http.MethodPost {
+		s.handleAdminPluginInstallURL(w, r, actor, locale)
+		return
+	}
+
 	if rest == "install" && r.Method == http.MethodPost {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/json") {
+			s.handleAdminPluginInstallURL(w, r, actor, locale)
+			return
+		}
 		extendStreamingDeadlines(w, 15*time.Minute)
 		uploaded, mErr := streamMultipartSingleFile(w, r, "", plugin.MaxZipArchiveBytes, s.ensureTempDir(), "volo-plugin-install-", ".zip", ".zip")
 		if mErr != nil {
@@ -3180,6 +3441,11 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			owRaw = strings.TrimSpace(r.URL.Query().Get("overwrite"))
 		}
 		overwrite := owRaw == "1" || strings.EqualFold(owRaw, "true")
+		enRaw := strings.TrimSpace(uploaded.FormFields["enable"])
+		if enRaw == "" {
+			enRaw = strings.TrimSpace(r.URL.Query().Get("enable"))
+		}
+		enableAfter := enRaw == "1" || strings.EqualFold(enRaw, "true")
 		zf, oErr := os.Open(uploaded.TempPath)
 		if oErr != nil {
 			writeErrJSON(w, http.StatusInternalServerError, oErr.Error())
@@ -3192,16 +3458,27 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		sum, iErr := s.deps.Plugins.InstallFromZip(r.Context(), zf, zStat.Size(), overwrite, locale)
-		if iErr != nil {
-			if !overwrite && isAlreadyExistsInstallErr(iErr) {
-				writeErrJSON(w, http.StatusConflict, iErr.Error())
-				return
-			}
-			writeErrJSON(w, http.StatusBadRequest, iErr.Error())
+		if writeExtensionOpError(w, iErr, overwrite) {
 			return
 		}
+		if enableAfter && !sum.IsEnabled {
+			if enErr := s.deps.Plugins.Enable(r.Context(), sum.ID); writeExtensionOpError(w, enErr, true) {
+				return
+			}
+			sum, _ = s.deps.Plugins.Get(sum.ID, locale)
+		}
+		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "plugin.install", "plugin", sum.ID, map[string]any{"version": sum.Version})
-		writeJSON(w, http.StatusCreated, map[string]any{"plugin": sum})
+		list := s.deps.Plugins.List(locale)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"plugin":    sum,
+			"items":     list,
+			"plugins":   list,
+			"cron_jobs": s.deps.Plugins.CronJobs(),
+		})
 		return
 	}
 
@@ -3209,6 +3486,48 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 	pid := strings.TrimSpace(parts[0])
 	if len(parts) == 2 {
 		switch {
+		case parts[1] == "check-update" && r.Method == http.MethodPost:
+			if _, exists := s.deps.Plugins.Get(pid, locale); !exists {
+				writeErrJSON(w, http.StatusNotFound, "plugin not found: "+pid)
+				return
+			}
+			_, force, ok := parseOptionalCheckUpdatesRequest(w, r, true)
+			if !ok {
+				return
+			}
+			st, err := s.deps.Plugins.CheckPluginUpdate(r.Context(), pid, force, locale)
+			if writeExtensionOpError(w, err, true) {
+				return
+			}
+			sum, _ := s.deps.Plugins.Get(pid, locale)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":     true,
+				"status": st,
+				"plugin": sum,
+			})
+		case (parts[1] == "update" || parts[1] == "upgrade") && r.Method == http.MethodPost:
+			extendStreamingDeadlines(w, 15*time.Minute)
+			if _, exists := s.deps.Plugins.Get(pid, locale); !exists {
+				writeErrJSON(w, http.StatusNotFound, "plugin not found: "+pid)
+				return
+			}
+			sum, err := s.deps.Plugins.UpgradePlugin(r.Context(), pid, locale)
+			if writeExtensionOpError(w, err, true) {
+				return
+			}
+			s.invalidateMediaRefCache()
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
+			s.recordAuditLog(r, actor, "plugin.upgrade", "plugin", sum.ID, map[string]any{"version": sum.Version})
+			list := s.deps.Plugins.List(locale)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":        true,
+				"plugin":    sum,
+				"items":     list,
+				"plugins":   list,
+				"cron_jobs": s.deps.Plugins.CronJobs(),
+			})
 		case (parts[1] == "export" || parts[1] == "export.zip") && r.Method == http.MethodGet:
 			extendStreamingDeadlines(w, 15*time.Minute)
 			tmpFile, tErr := os.CreateTemp(s.ensureTempDir(), "volo-plugin-export-*.zip")
@@ -3247,12 +3566,18 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			if writeBadErr(w, s.deps.Plugins.Enable(r.Context(), pid)) {
 				return
 			}
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			s.recordAuditLog(r, actor, "plugin.enable", "plugin", pid, nil)
 			sum, _ := s.deps.Plugins.Get(pid, locale)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "disable" && r.Method == http.MethodPost:
 			if writeBadErr(w, s.deps.Plugins.Disable(r.Context(), pid)) {
 				return
+			}
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
 			}
 			s.recordAuditLog(r, actor, "plugin.disable", "plugin", pid, nil)
 			sum, _ := s.deps.Plugins.Get(pid, locale)
@@ -3261,6 +3586,9 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			sum, err := s.deps.Plugins.ReloadPlugin(r.Context(), pid, locale)
 			if writeBadErr(w, err) {
 				return
+			}
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
 			}
 			s.recordAuditLog(r, actor, "plugin.reload", "plugin", pid, nil)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum})
@@ -3290,6 +3618,9 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 				return
 			}
 			s.invalidateMediaRefCache()
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			s.recordAuditLog(r, actor, "plugin.config_patch", "plugin", pid, nil)
 			writeJSON(w, http.StatusOK, map[string]any{"plugin": sum})
 		case parts[1] == "priority" && (r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodPut):
@@ -3304,6 +3635,9 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 				return
 			}
 			s.invalidateMediaRefCache()
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			s.recordAuditLog(r, actor, "plugin.priority", "plugin", pid, map[string]any{"priority": sum.Priority})
 			list := s.deps.Plugins.List(locale)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "plugin": sum, "items": list, "plugins": list})
@@ -3359,6 +3693,9 @@ func (s *AppServer) handleAdminPlugins(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		s.invalidateMediaRefCache()
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
+		}
 		s.recordAuditLog(r, actor, "plugin.uninstall", "plugin", pid, nil)
 		writeOKJSON(w)
 		return
@@ -3376,6 +3713,26 @@ func (s *AppServer) pluginsDir() string {
 func (s *AppServer) themesDir() string {
 	if s != nil && s.deps.Config != nil {
 		return strings.TrimSpace(s.deps.Config.ThemesDir)
+	}
+	return ""
+}
+
+func (s *AppServer) localesDir() string {
+	if s == nil {
+		return ""
+	}
+	if s.deps.Catalog != nil {
+		if d := strings.TrimSpace(s.deps.Catalog.ExternalDir()); d != "" {
+			return d
+		}
+	}
+	if s.deps.Config != nil {
+		if d := strings.TrimSpace(s.deps.Config.LocalesDir); d != "" {
+			return d
+		}
+		if d := strings.TrimSpace(s.deps.Config.DataDir); d != "" {
+			return filepath.Join(d, "locales")
+		}
 	}
 	return ""
 }
@@ -3485,29 +3842,39 @@ func (s *AppServer) handleAdminSettings(w http.ResponseWriter, r *http.Request, 
 			drv = strings.ToLower(strings.TrimSpace(s.deps.Settings.Snapshot().Storage.ActiveDriver))
 		}
 		if drv == "" || drv == "local" {
-			var prevStorage domain.StorageSettings
-			var prevVer int64
-			stagedCustom := false
-			if s.deps.Settings != nil {
-				prevStorage = s.deps.Settings.Snapshot().Storage
-				_, prevVer, _ = s.deps.Settings.GetDomain(r.Context(), domain.SettingsDomainStorage)
-			}
-			if s.deps.Config != nil && req.Settings != nil && !s.deps.Config.IsUploadDirPinned() {
-				normDir, vErr := s.deps.Config.ValidateCustomUploadDir(req.Settings.LocalDir)
-				if vErr != nil {
-					writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": vErr.Error()})
-					return
+			candidateDir := ""
+			if s.deps.Config != nil {
+				if s.deps.Config.IsUploadDirPinned() {
+					candidateDir = s.deps.Config.GetUploadDir()
+				} else if req.Settings != nil {
+					normDir, vErr := s.deps.Config.ValidateCustomUploadDir(req.Settings.LocalDir)
+					if vErr != nil {
+						writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": vErr.Error()})
+						return
+					}
+					if normDir != "" {
+						candidateDir = normDir
+					} else {
+						candidateDir = s.deps.Config.GetDefaultUploadDir()
+					}
+				} else {
+					savedLocal := ""
+					if s.deps.Settings != nil {
+						savedLocal = strings.TrimSpace(s.deps.Settings.Snapshot().Storage.LocalDir)
+					}
+					if savedLocal != "" {
+						normDir, vErr := s.deps.Config.ValidateCustomUploadDir(savedLocal)
+						if vErr != nil {
+							writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": vErr.Error()})
+							return
+						}
+						candidateDir = normDir
+					} else {
+						candidateDir = s.deps.Config.GetDefaultUploadDir()
+					}
 				}
-				if s.deps.Settings != nil && normDir != prevStorage.LocalDir {
-					stagePatch, _ := json.Marshal(map[string]any{"local_dir": normDir})
-					_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainStorage, stagePatch, 0)
-					stagedCustom = true
-				}
 			}
-			absDir, fileCount, rwErr := s.syncAndProbeConfiguredUploadDir()
-			if stagedCustom {
-				s.rollbackStorageSettings(r, prevStorage, prevVer)
-			}
+			absDir, fileCount, rwErr := probeCandidateLocalUploadDir(candidateDir)
 			if rwErr != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{
 					"ok":            false,
@@ -3815,6 +4182,72 @@ func probeAndDescribeLocalUploadDir(rawDir string) (absDir string, mediaCount in
 	return absDir, mediaCount, nil
 }
 
+// probeCandidateLocalUploadDir validates read/write access on a candidate upload directory
+// WITHOUT mutating runtime state or creating missing directories on disk.
+func probeCandidateLocalUploadDir(rawDir string) (absDir string, mediaCount int, err error) {
+	trimmed := strings.TrimSpace(rawDir)
+	if trimmed == "" {
+		return "", 0, errors.New("upload directory path is empty")
+	}
+	if strings.Contains(trimmed, "..") {
+		return "", 0, errors.New("upload directory path must not contain '..'")
+	}
+	absDir, err = filepath.Abs(trimmed)
+	if err != nil {
+		return trimmed, 0, err
+	}
+	st, statErr := os.Stat(absDir)
+	if statErr == nil {
+		if !st.IsDir() {
+			return absDir, 0, errors.New("upload path exists and is not a directory")
+		}
+		if _, err := os.ReadDir(absDir); err != nil {
+			return absDir, 0, err
+		}
+		budget := 5000
+		mediaCount = countMediaFilesBounded(absDir, 0, &budget)
+		f, err := os.CreateTemp(absDir, ".volo-rw-probe-*")
+		if err != nil {
+			return absDir, mediaCount, err
+		}
+		probeName := f.Name()
+		_ = f.Close()
+		_ = os.Remove(probeName)
+		return absDir, mediaCount, nil
+	}
+	if !os.IsNotExist(statErr) {
+		return absDir, 0, statErr
+	}
+	cur := filepath.Dir(absDir)
+	for {
+		pst, pErr := os.Stat(cur)
+		if pErr == nil {
+			if !pst.IsDir() {
+				return absDir, 0, fmt.Errorf("ancestor path %s is not a directory", cur)
+			}
+			if _, rErr := os.ReadDir(cur); rErr != nil {
+				return absDir, 0, rErr
+			}
+			f, wErr := os.CreateTemp(cur, ".volo-rw-probe-*")
+			if wErr != nil {
+				return absDir, 0, wErr
+			}
+			probeName := f.Name()
+			_ = f.Close()
+			_ = os.Remove(probeName)
+			return absDir, 0, nil
+		}
+		if !os.IsNotExist(pErr) {
+			return absDir, 0, pErr
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return absDir, 0, pErr
+		}
+		cur = parent
+	}
+}
+
 func formatUploadDirAccessError(absDir string, err error) string {
 	if err == nil {
 		return ""
@@ -4031,6 +4464,9 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 				writeErrJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
+			if s.deps.Content != nil {
+				s.deps.Content.PurgeRuntimeCaches()
+			}
 			s.recordAuditLog(r, actor, "user.create", "user", u.ID, map[string]any{"role": u.Role, "username": u.Username})
 			writeJSON(w, http.StatusCreated, map[string]any{"user": u})
 
@@ -4235,13 +4671,64 @@ func (s *AppServer) handleAdminUsers(w http.ResponseWriter, r *http.Request, act
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": u})
 
 	case http.MethodDelete:
-		_ = s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
-			_, _ = tx.ExecContext(r.Context(), `DELETE FROM user_sessions WHERE user_id = ?`, rest)
-			_, _ = tx.ExecContext(r.Context(), `DELETE FROM user_credentials WHERE user_id = ?`, rest)
-			_, _ = tx.ExecContext(r.Context(), `DELETE FROM api_tokens WHERE user_id = ?`, rest)
-			_, err := tx.ExecContext(r.Context(), `DELETE FROM users WHERE id = ?`, rest)
-			return err
+		var delReq struct {
+			CurrentPassword string `json:"current_password"`
+		}
+		if !decodeOptJSONBody(w, r, 4096, &delReq) {
+			return
+		}
+		curPwd := delReq.CurrentPassword
+		if strings.TrimSpace(curPwd) == "" {
+			curPwd = r.URL.Query().Get("current_password")
+		}
+		if !s.verifyStepUpPassword(w, r, actor.ID, curPwd) {
+			return
+		}
+		var target domain.User
+		if err := sqlx.GetInto(r.Context(), s.deps.Store, &target, `SELECT * FROM users WHERE id = ?`, rest); err != nil {
+			writeErrJSON(w, http.StatusNotFound, "user not found")
+			return
+		}
+		if s.deps.Auth != nil {
+			s.deps.Auth.HealExpiredUser(r.Context(), &target)
+		}
+		if target.Role == domain.RoleAdmin && !target.IsBannedAt(time.Now().UnixMilli()) {
+			var remainingAdmins int
+			if qErr := s.deps.Store.QueryRowContext(r.Context(),
+				`SELECT COUNT(*) FROM users WHERE role = ? AND status = ? AND id <> ?`,
+				domain.RoleAdmin, domain.UserStatusActive, rest,
+			).Scan(&remainingAdmins); qErr != nil || remainingAdmins <= 0 {
+				writeErrJSON(w, http.StatusBadRequest, "cannot delete the last active admin account")
+				return
+			}
+		}
+		err := s.deps.Store.WithTx(r.Context(), func(tx *sqlx.Tx) error {
+			if target.Role == domain.RoleAdmin {
+				var remaining int
+				if qErr := tx.QueryRowContext(r.Context(),
+					`SELECT COUNT(*) FROM users WHERE role = ? AND status = ? AND id <> ?`,
+					domain.RoleAdmin, domain.UserStatusActive, rest,
+				).Scan(&remaining); qErr != nil {
+					return qErr
+				} else if remaining <= 0 && !target.IsBannedAt(time.Now().UnixMilli()) {
+					return errors.New("cannot delete the last active admin account")
+				}
+			}
+			if _, e := tx.ExecContext(r.Context(), `DELETE FROM user_sessions WHERE user_id = ?`, rest); e != nil {
+				return e
+			}
+			if _, e := tx.ExecContext(r.Context(), `DELETE FROM user_credentials WHERE user_id = ?`, rest); e != nil {
+				return e
+			}
+			if _, e := tx.ExecContext(r.Context(), `DELETE FROM api_tokens WHERE user_id = ?`, rest); e != nil {
+				return e
+			}
+			_, e := tx.ExecContext(r.Context(), `DELETE FROM users WHERE id = ?`, rest)
+			return e
 		})
+		if writeBadErr(w, err) {
+			return
+		}
 		if s.deps.Content != nil {
 			s.deps.Content.PurgeRuntimeCaches()
 		}
@@ -4867,24 +5354,145 @@ func (s *AppServer) handleAdminGeoRules(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
+type countingExportWriter struct {
+	w           http.ResponseWriter
+	filename    string
+	headersSent bool
+	written     int64
+}
+
+func (cw *countingExportWriter) ensureHeaders() {
+	if !cw.headersSent {
+		cw.w.Header().Set("Content-Type", "application/zip")
+		cw.w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, cw.filename))
+		cw.headersSent = true
+	}
+}
+
+func (cw *countingExportWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	cw.ensureHeaders()
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	return n, err
+}
+
+func (s *AppServer) tryAcquireBackupOp(w http.ResponseWriter) bool {
+	if !s.backupOpBusy.CompareAndSwap(false, true) {
+		writeErrJSON(w, http.StatusConflict, "another backup or restore operation is already in progress")
+		return false
+	}
+	return true
+}
+
+func (s *AppServer) flushPreBackupBuffers(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	if s.deps.Store != nil {
+		_ = plugin.FlushAllKV(ctx, s.deps.Store)
+	}
+	if s.deps.Content != nil {
+		_ = s.deps.Content.FlushAnalytics(ctx)
+	}
+}
+
+func verifyBackupArchiveReadable(archivePath string) error {
+	if strings.HasSuffix(strings.ToLower(archivePath), ".json") {
+		f, err := os.Open(archivePath)
+		if err != nil {
+			return fmt.Errorf("unreadable backup archive: %w", err)
+		}
+		st, stErr := f.Stat()
+		_ = f.Close()
+		if stErr != nil {
+			return fmt.Errorf("unreadable backup archive: %w", stErr)
+		}
+		if st.Size() == 0 {
+			return errors.New("unreadable backup archive: empty file")
+		}
+		return nil
+	}
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return fmt.Errorf("unreadable backup archive: %w", err)
+	}
+	_ = zr.Close()
+	return nil
+}
+
+func (s *AppServer) createPreRestoreSafetySnapshot(ctx context.Context) string {
+	if s == nil || s.deps.Store == nil || s.isSetupUnlocked(ctx) {
+		return ""
+	}
+	backupDir := strings.TrimSpace(s.resolveBackupDir())
+	if backupDir == "" {
+		return ""
+	}
+	snapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	s.flushPreBackupBuffers(snapCtx)
+	if err := os.MkdirAll(backupDir, 0o750); err != nil {
+		slog.Warn("pre-restore safety snapshot skipped: cannot prepare backup directory", "dir", backupDir, "err", err)
+		return ""
+	}
+	nowUTC := time.Now().UTC()
+	snapName := fmt.Sprintf("pre-restore-%s.zip", nowUTC.Format("20060102-150405"))
+	snapPath := filepath.Join(backupDir, snapName)
+	if _, err := os.Stat(snapPath); err == nil {
+		snapName = fmt.Sprintf("pre-restore-%s-%03d.zip", nowUTC.Format("20060102-150405"), nowUTC.Nanosecond()/1e6)
+		snapPath = filepath.Join(backupDir, snapName)
+	}
+	_, err := backup.CreateToFile(snapCtx, s.deps.Store, snapPath, backup.CreateOptions{
+		IncludeMedia: false,
+		PluginsDir:   s.pluginsDir(),
+		ThemesDir:    s.themesDir(),
+		LocalesDir:   s.localesDir(),
+	})
+	if err != nil {
+		_ = os.Remove(snapPath)
+		slog.Warn("pre-restore safety snapshot failed; proceeding with restore", "path", snapPath, "err", err)
+		return ""
+	}
+	return snapName
+}
+
 func (s *AppServer) handleAdminBackupExport(w http.ResponseWriter, r *http.Request, actor *domain.User) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.tryAcquireBackupOp(w) {
+		return
+	}
+	defer s.backupOpBusy.Store(false)
+
 	extendStreamingDeadlines(w, 15*time.Minute)
 	withMedia := r.URL.Query().Get("media") == "1" || r.URL.Query().Get("media") == "true" ||
 		r.URL.Query().Get("include_media") == "1" || r.URL.Query().Get("include_media") == "true"
 	filename := fmt.Sprintf("volo-backup-%s.zip", time.Now().UTC().Format("20060102-150405"))
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	s.recordAuditLog(r, actor, "backup.export", "system", filename, map[string]any{"include_media": withMedia})
-	_, _ = backup.Create(r.Context(), s.deps.Store, w, backup.CreateOptions{
+
+	s.flushPreBackupBuffers(r.Context())
+	cw := &countingExportWriter{w: w, filename: filename}
+	_, err := backup.Create(r.Context(), s.deps.Store, cw, backup.CreateOptions{
 		IncludeMedia: withMedia,
 		UploadDir:    s.deps.Config.GetUploadDir(),
 		PluginsDir:   s.pluginsDir(),
 		ThemesDir:    s.themesDir(),
+		LocalesDir:   s.localesDir(),
 	})
+	if err != nil {
+		slog.Error("admin backup export failed", "filename", filename, "bytes_written", cw.written, "err", err)
+		if cw.written == 0 && !cw.headersSent {
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		panic(http.ErrAbortHandler)
+	}
+	s.recordAuditLog(r, actor, "backup.export", "system", filename, map[string]any{"include_media": withMedia})
 }
 
 type localBackupItem struct {
@@ -4919,13 +5527,49 @@ func (s *AppServer) listLocalBackups(backupDir string) []localBackupItem {
 	return items
 }
 
+func validateSafeBackupFilename(raw string) (string, bool) {
+	if raw == "" || len(raw) > 128 {
+		return "", false
+	}
+	if strings.Contains(raw, "..") || strings.ContainsAny(raw, `/\`) {
+		return "", false
+	}
+	base := filepath.Base(raw)
+	if base != raw || !strings.HasSuffix(strings.ToLower(base), ".zip") || len(base) <= 4 {
+		return "", false
+	}
+	for i := 0; i < len(base); i++ {
+		c := base[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		return "", false
+	}
+	return base, true
+}
+
+func resolveSafeBackupFilePath(backupDir, raw string) (string, string, bool) {
+	base, ok := validateSafeBackupFilename(raw)
+	if !ok {
+		return "", "", false
+	}
+	absDir, err := filepath.Abs(backupDir)
+	if err != nil {
+		return "", "", false
+	}
+	fullPath := filepath.Join(absDir, base)
+	if !strings.HasPrefix(fullPath, absDir+string(os.PathSeparator)) {
+		return "", "", false
+	}
+	return base, fullPath, true
+}
+
 func (s *AppServer) serveLocalBackupArchive(w http.ResponseWriter, r *http.Request, actor *domain.User, base string) {
-	clean := filepath.Base(base)
-	if clean != base || strings.Contains(clean, "..") || !strings.HasSuffix(strings.ToLower(clean), ".zip") {
+	clean, fullPath, ok := resolveSafeBackupFilePath(s.resolveBackupDir(), base)
+	if !ok {
 		writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
 		return
 	}
-	fullPath := filepath.Join(s.resolveBackupDir(), clean)
 	st, err := os.Lstat(fullPath)
 	if err != nil || !st.Mode().IsRegular() {
 		http.NotFound(w, r)
@@ -4958,7 +5602,12 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, map[string]any{"items": s.listLocalBackups(backupDir)})
 		case http.MethodPost:
+			if !s.tryAcquireBackupOp(w) {
+				return
+			}
+			defer s.backupOpBusy.Store(false)
 			extendStreamingDeadlines(w, 15*time.Minute)
+			s.flushPreBackupBuffers(r.Context())
 			sched := s.deps.BackupScheduler
 			if sched == nil {
 				sched = backup.NewScheduler(backup.SchedulerOptions{
@@ -4969,6 +5618,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 					UploadDir:      s.deps.Config.GetUploadDir(),
 					PluginsDir:     s.pluginsDir(),
 					ThemesDir:      s.themesDir(),
+					LocalesDir:     s.localesDir(),
 					OutboundDialer: s.deps.OutboundDialer,
 				})
 			}
@@ -5002,12 +5652,11 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			writeErrJSON(w, http.StatusForbidden, "interactive admin session required for backup download ticket")
 			return
 		}
-		base := filepath.Base(parts[0])
-		if base != parts[0] || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
+		base, fullPath, ok := resolveSafeBackupFilePath(backupDir, parts[0])
+		if !ok {
 			writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
 			return
 		}
-		fullPath := filepath.Join(backupDir, base)
 		st, err := os.Lstat(fullPath)
 		if err != nil || !st.Mode().IsRegular() {
 			http.NotFound(w, r)
@@ -5039,12 +5688,11 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 
 	if len(parts) == 2 && parts[1] == "restore" && r.Method == http.MethodPost {
 		extendStreamingDeadlines(w, 15*time.Minute)
-		base := filepath.Base(parts[0])
-		if base != parts[0] || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
+		base, fullPath, ok := resolveSafeBackupFilePath(backupDir, parts[0])
+		if !ok {
 			writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
 			return
 		}
-		fullPath := filepath.Join(backupDir, base)
 		st, err := os.Lstat(fullPath)
 		if err != nil || !st.Mode().IsRegular() {
 			http.NotFound(w, r)
@@ -5070,8 +5718,26 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 				return
 			}
 		}
+		if !s.tryAcquireBackupOp(w) {
+			return
+		}
+		defer s.backupOpBusy.Store(false)
+
+		if vErr := verifyBackupArchiveReadable(fullPath); vErr != nil {
+			writeErrJSON(w, http.StatusBadRequest, vErr.Error())
+			return
+		}
+		safetySnap := ""
+		if !dryRun {
+			safetySnap = s.createPreRestoreSafetySnapshot(r.Context())
+			plugin.DiscardAllKVBuffers(s.deps.Store)
+		}
 		if isLegacyArchiveFile(fullPath) {
-			rep, lErr := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, fullPath, etl.ImportOptions{
+			etlCtx := r.Context()
+			if s.deps.Config != nil {
+				etlCtx = etl.WithDataDir(etlCtx, s.deps.Config.DataDir)
+			}
+			rep, lErr := etl.ImportLegacyArchive(etlCtx, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, fullPath, etl.ImportOptions{
 				DryRun:          dryRun,
 				TargetUploadDir: s.deps.Config.GetUploadDir(),
 				AdminPath:       s.deps.Config.AdminPath,
@@ -5084,9 +5750,13 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 				_, _ = s.deps.Settings.Reload(r.Context())
 				_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
 				s.reloadRuntimeAfterDBRestore(r.Context())
-				s.recordAuditLog(r, actor, "backup.local_restore", "system", base, map[string]any{"legacy": true})
+				s.recordAuditLog(r, actor, "backup.local_restore", "system", base, map[string]any{"legacy": true, "safety_snapshot": safetySnap})
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "legacy": true, "report": rep})
+			resp := map[string]any{"ok": true, "dry_run": dryRun, "legacy": true, "report": rep}
+			if safetySnap != "" {
+				resp["safety_snapshot"] = safetySnap
+			}
+			writeJSON(w, http.StatusOK, resp)
 			return
 		}
 
@@ -5095,6 +5765,7 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 			UploadDir:  s.deps.Config.GetUploadDir(),
 			PluginsDir: s.pluginsDir(),
 			ThemesDir:  s.themesDir(),
+			LocalesDir: s.localesDir(),
 		})
 		if rErr != nil {
 			writeErrJSON(w, http.StatusBadRequest, rErr.Error())
@@ -5102,18 +5773,21 @@ func (s *AppServer) handleAdminLocalBackups(w http.ResponseWriter, r *http.Reque
 		}
 		if !dryRun {
 			s.reloadRuntimeAfterDBRestore(r.Context())
-			s.recordAuditLog(r, actor, "backup.local_restore", "system", base, nil)
+			s.recordAuditLog(r, actor, "backup.local_restore", "system", base, map[string]any{"safety_snapshot": safetySnap})
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry_run": dryRun, "summary": sum})
+		resp := map[string]any{"ok": true, "dry_run": dryRun, "summary": sum}
+		if safetySnap != "" {
+			resp["safety_snapshot"] = safetySnap
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
-	base := filepath.Base(rest)
-	if base != rest || strings.Contains(base, "..") || !strings.HasSuffix(strings.ToLower(base), ".zip") {
+	base, fullPath, ok := resolveSafeBackupFilePath(backupDir, rest)
+	if !ok {
 		writeErrJSON(w, http.StatusBadRequest, "invalid backup filename")
 		return
 	}
-	fullPath := filepath.Join(backupDir, base)
 
 	switch r.Method {
 	case http.MethodGet:
@@ -5182,8 +5856,26 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	if !s.tryAcquireBackupOp(w) {
+		return
+	}
+	defer s.backupOpBusy.Store(false)
+
+	if vErr := verifyBackupArchiveReadable(tmpPath); vErr != nil {
+		writeErrJSON(w, http.StatusBadRequest, vErr.Error())
+		return
+	}
+	safetySnap := ""
+	if !dryRun {
+		safetySnap = s.createPreRestoreSafetySnapshot(r.Context())
+		plugin.DiscardAllKVBuffers(s.deps.Store)
+	}
 	if isLegacyArchiveFile(tmpPath) {
-		rep, lErr := etl.ImportLegacyArchive(r.Context(), s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, etl.ImportOptions{
+		etlCtx := r.Context()
+		if s.deps.Config != nil {
+			etlCtx = etl.WithDataDir(etlCtx, s.deps.Config.DataDir)
+		}
+		rep, lErr := etl.ImportLegacyArchive(etlCtx, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, tmpPath, etl.ImportOptions{
 			DryRun:          dryRun,
 			TargetUploadDir: s.deps.Config.GetUploadDir(),
 			AdminPath:       s.deps.Config.AdminPath,
@@ -5196,9 +5888,13 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 			_, _ = s.deps.Settings.Reload(r.Context())
 			_, _, _ = s.deps.Settings.PatchDomain(r.Context(), domain.SettingsDomainSite, []byte(`{"initialized":true}`), 0)
 			s.reloadRuntimeAfterDBRestore(r.Context())
-			s.recordAuditLog(r, actor, "backup.restore_legacy", "system", "legacy", nil)
+			s.recordAuditLog(r, actor, "backup.restore_legacy", "system", "legacy", map[string]any{"safety_snapshot": safetySnap})
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "legacy": true, "report": rep})
+		resp := map[string]any{"ok": true, "legacy": true, "report": rep}
+		if safetySnap != "" {
+			resp["safety_snapshot"] = safetySnap
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
@@ -5207,13 +5903,18 @@ func (s *AppServer) handleAdminBackupRestore(w http.ResponseWriter, r *http.Requ
 		UploadDir:  s.deps.Config.GetUploadDir(),
 		PluginsDir: s.pluginsDir(),
 		ThemesDir:  s.themesDir(),
+		LocalesDir: s.localesDir(),
 	})
 	if writeBadErr(w, err) {
 		return
 	}
 	if !dryRun {
 		s.reloadRuntimeAfterDBRestore(r.Context())
-		s.recordAuditLog(r, actor, "backup.restore", "system", "native", nil)
+		s.recordAuditLog(r, actor, "backup.restore", "system", "native", map[string]any{"safety_snapshot": safetySnap})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": sum})
+	resp := map[string]any{"ok": true, "summary": sum}
+	if safetySnap != "" {
+		resp["safety_snapshot"] = safetySnap
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

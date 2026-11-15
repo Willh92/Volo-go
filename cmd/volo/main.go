@@ -77,6 +77,8 @@ func runCLI(ctx context.Context, args []string, stdout io.Writer, stderr io.Writ
 		return cmdImportLegacy(ctx, args[1:], stdout, stderr)
 	case "doctor":
 		return cmdDoctor(ctx, args[1:], stdout, stderr)
+	case "secret":
+		return cmdSecret(ctx, args[1:], stdout, stderr)
 	case "healthcheck":
 		return cmdHealthcheck(ctx, args[1:], stdout, stderr)
 	case "version":
@@ -103,6 +105,7 @@ Usage:
   volo backup create [--output file]            Create streaming database (+ optional media) backup
   volo backup restore <archive.zip> [--dry-run] Verify SHA-256 & restore cross-DB native backup
   volo import-legacy <archive.zip|json> [--dry-run] Stream & normalize legacy 15-table backup
+  volo secret rotate [--new-key <k>|--generate] Re-encrypt all at-rest secrets with a new master key
   volo doctor [--json]                          Run environment, crypto, DB WAL & FS diagnostics
   volo healthcheck [--url <healthz_url>]        Probe live /healthz over TCP or Unix Socket (Distroless ready)
   volo version                                  Print binary version & runtime info
@@ -468,6 +471,7 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		slog.Warn("configured upload directory is not writable at startup (check permissions or systemd ProtectHome/ReadWritePaths); falling back to data/uploads so console remains accessible",
 			"component", "storage", "configured_dir", cfg.GetUploadDir(), "fallback_dir", fallbackUp, "err", upErr)
 		_ = os.MkdirAll(fallbackUp, 0o750)
+		cfg.DefaultUploadDir = fallbackUp
 		cfg.SetUploadDir(fallbackUp)
 	}
 	if bkErr := os.MkdirAll(cfg.BackupDir, 0o750); bkErr != nil {
@@ -484,6 +488,37 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		return 1
 	}
 	defer store.Close()
+
+	var (
+		pluginMgr   *plugin.Manager
+		notifier    *notify.Dispatcher
+		backupSched *backup.Scheduler
+		appSrv      *server.AppServer
+		bgWG        sync.WaitGroup
+	)
+	bgCtx, stopBg := context.WithCancel(ctx)
+	defer func() {
+		stopBg()
+		bgWG.Wait()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if appSrv != nil {
+			appSrv.DrainApp(shutCtx)
+		}
+		if backupSched != nil {
+			_ = backupSched.Close(shutCtx)
+		}
+		if notifier != nil {
+			_ = notifier.Close(shutCtx)
+		}
+		if pluginMgr != nil {
+			_ = pluginMgr.Close(shutCtx)
+		}
+		if appSrv != nil {
+			closeGeoEngineFromDeps(appSrv.Deps())
+			_ = appSrv.Close(shutCtx)
+		}
+	}()
 	slog.Info("database ready", "component", "db", "driver", store.Dialect().Name())
 
 	catalog, err := i18n.NewCatalog(cfg.DefaultLocale, cfg.LocalesDir)
@@ -500,16 +535,18 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 	applyPersistedUploadDir(ctx, cfg, store, settingsMgr, fs)
 	applyPersistedGeoIPDir(ctx, cfg, store, settingsMgr, fs)
 
-	pluginMgr := plugin.NewManager(plugin.ManagerOptions{
-		Store:        store,
-		Keys:         cfg.KeyRing,
-		SecretSealer: cfg.KeyRing.SecretBox(),
-		PluginsDir:   cfg.PluginsDir,
-		DataDir:      cfg.DataDir,
-		Catalog:      catalog,
+	outboundDialer := &security.OutboundSafeDialer{Timeout: 10 * time.Second}
+	pluginMgr = plugin.NewManager(plugin.ManagerOptions{
+		Store:          store,
+		Keys:           cfg.KeyRing,
+		SecretSealer:   cfg.KeyRing.SecretBox(),
+		PluginsDir:     cfg.PluginsDir,
+		DataDir:        cfg.DataDir,
+		Catalog:        catalog,
+		HostVersion:    Version,
+		OutboundDialer: outboundDialer,
 	})
 
-	outboundDialer := &security.OutboundSafeDialer{Timeout: 10 * time.Second}
 	mediaPipe := media.NewPipeline(media.PipelineOptions{
 		Store:          store,
 		Settings:       settingsMgr,
@@ -532,13 +569,8 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 	})
 
 	_ = pluginMgr.DiscoverAndStart(ctx)
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = pluginMgr.Close(shutCtx)
-	}()
 
-	notifier := notify.NewDispatcher(notify.DispatcherOptions{
+	notifier = notify.NewDispatcher(notify.DispatcherOptions{
 		Store:          store,
 		Keys:           cfg.KeyRing,
 		Settings:       settingsMgr,
@@ -547,14 +579,9 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		OutboundDialer: outboundDialer,
 		PublicURL:      cfg.GetPublicURL(),
 	})
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = notifier.Close(shutCtx)
-	}()
 
 	// Singleton rolling local + S3/WebDAV/plugin backup scheduler shared with Admin API
-	backupSched := backup.NewScheduler(backup.SchedulerOptions{
+	backupSched = backup.NewScheduler(backup.SchedulerOptions{
 		Store:          store,
 		Settings:       settingsMgr,
 		Plugins:        pluginMgr,
@@ -562,12 +589,13 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		UploadDir:      cfg.GetUploadDir(),
 		PluginsDir:     cfg.PluginsDir,
 		ThemesDir:      cfg.ThemesDir,
+		LocalesDir:     cfg.LocalesDir,
 		OutboundDialer: outboundDialer,
 		Logger:         logging.TeeWriter(stderr, logging.Default()),
 	})
 
 	startedAt := time.Now()
-	appSrv, err := server.NewAppServer(server.AppDeps{
+	appSrv, err = server.NewAppServer(server.AppDeps{
 		Config:               cfg,
 		Store:                store,
 		Settings:             settingsMgr,
@@ -601,12 +629,6 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "volo serve: server init failed: %v\n", err)
 		return 1
 	}
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		closeGeoEngineFromDeps(appSrv.Deps())
-		_ = appSrv.Close(shutCtx)
-	}()
 
 	if appSrv.Deps().Content != nil {
 		contentSvc := appSrv.Deps().Content
@@ -617,18 +639,6 @@ func cmdServeRun(ctx context.Context, args []string, stdout io.Writer, stderr io
 	debug.FreeOSMemory()
 
 	backupSched.Start(ctx)
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = backupSched.Close(shutCtx)
-	}()
-
-	bgCtx, stopBg := context.WithCancel(ctx)
-	var bgWG sync.WaitGroup
-	defer func() {
-		stopBg()
-		bgWG.Wait()
-	}()
 
 	// Background scheduled-article publisher (checks every 30s)
 	bgWG.Add(1)
@@ -900,11 +910,13 @@ func cmdBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 		if dest == "" {
 			dest = filepath.Join(cfg.BackupDir, fmt.Sprintf("volo-backup-%s.zip", time.Now().UTC().Format("20060102-150405")))
 		}
+		_ = plugin.FlushAllKV(ctx, store)
 		manifest, err := backup.CreateToFile(ctx, store, dest, backup.CreateOptions{
 			IncludeMedia: *withMedia,
 			UploadDir:    cfg.GetUploadDir(),
 			PluginsDir:   cfg.PluginsDir,
 			ThemesDir:    cfg.ThemesDir,
+			LocalesDir:   cfg.LocalesDir,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "volo backup create: %v\n", err)
@@ -951,6 +963,7 @@ func cmdBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 			UploadDir:  cfg.GetUploadDir(),
 			PluginsDir: cfg.PluginsDir,
 			ThemesDir:  cfg.ThemesDir,
+			LocalesDir: cfg.LocalesDir,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "volo backup restore: %v\n", err)
@@ -1012,7 +1025,8 @@ func cmdImportLegacy(ctx context.Context, args []string, stdout io.Writer, stder
 		}
 	}
 
-	rep, err := etl.ImportLegacyArchive(ctx, store, settingsMgr, cfg.KeyRing, posPath, etl.ImportOptions{
+	etlCtx := etl.WithDataDir(ctx, cfg.DataDir)
+	rep, err := etl.ImportLegacyArchive(etlCtx, store, settingsMgr, cfg.KeyRing, posPath, etl.ImportOptions{
 		DryRun:            *dryRun,
 		TargetUploadDir:   cfg.GetUploadDir(),
 		AdminPath:         cfg.AdminPath,
@@ -1029,6 +1043,44 @@ func cmdImportLegacy(ctx context.Context, args []string, stdout io.Writer, stder
 	return 0
 }
 
+func applyPersistedDirsReadOnly(ctx context.Context, cfg *config.Config, store *sqlx.Store, fs *flag.FlagSet) {
+	if cfg == nil || store == nil {
+		return
+	}
+	setFlags := map[string]bool{}
+	if fs != nil {
+		fs.Visit(func(f *flag.Flag) {
+			setFlags[f.Name] = true
+		})
+	}
+	if !cfg.IsUploadDirPinned() && !setFlags["upload-dir"] {
+		var stJSON string
+		if err := store.QueryRowContext(ctx, store.Dialect().Rebind(`SELECT value_json FROM settings WHERE domain = ?`), "storage").Scan(&stJSON); err == nil && stJSON != "" {
+			var st struct {
+				LocalDir string `json:"local_dir"`
+			}
+			if json.Unmarshal([]byte(stJSON), &st) == nil && strings.TrimSpace(st.LocalDir) != "" {
+				if validDir, vErr := cfg.ValidateCustomUploadDir(st.LocalDir); vErr == nil && validDir != "" {
+					cfg.SetUploadDir(validDir)
+				}
+			}
+		}
+	}
+	if !cfg.IsGeoIPDirPinned() && !setFlags["geoip-dir"] {
+		var secJSON string
+		if err := store.QueryRowContext(ctx, store.Dialect().Rebind(`SELECT value_json FROM settings WHERE domain = ?`), "security").Scan(&secJSON); err == nil && secJSON != "" {
+			var sec struct {
+				GeoIPDir string `json:"geoip_dir"`
+			}
+			if json.Unmarshal([]byte(secJSON), &sec) == nil && strings.TrimSpace(sec.GeoIPDir) != "" {
+				if validDir, vErr := cfg.ValidateCustomGeoIPPath(sec.GeoIPDir); vErr == nil && validDir != "" {
+					cfg.SetGeoIPDir(validDir)
+				}
+			}
+		}
+	}
+}
+
 func cmdDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
 	fs := flag.NewFlagSet("volo doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1039,19 +1091,35 @@ func cmdDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 		return 2
 	}
 
-	cfg, err := config.Load(buildCLIOverrides(fs, &common))
+	cfg, err := config.LoadForDoctor(buildCLIOverrides(fs, &common))
 	if err != nil {
 		fmt.Fprintf(stderr, "volo doctor: config load failed: %v\n", err)
 		return 1
 	}
-	store, err := openMigratedStore(ctx, cfg)
-	if err != nil {
-		fmt.Fprintf(stderr, "volo doctor: database open failed: %v\n", err)
-		return 1
+
+	var store *sqlx.Store
+	skipOpen := false
+	if cfg.DBDriver == "sqlite" && cfg.DBDSN != "" && cfg.DBDSN != ":memory:" {
+		if _, statErr := os.Stat(cfg.DBDSN); os.IsNotExist(statErr) {
+			skipOpen = true
+		}
 	}
-	defer store.Close()
-	applyPersistedUploadDir(ctx, cfg, store, nil, fs)
-	applyPersistedGeoIPDir(ctx, cfg, store, nil, fs)
+	if !skipOpen {
+		store, err = sqlx.Open(ctx, sqlx.Options{
+			Driver:         cfg.DBDriver,
+			DSN:            cfg.DBDSN,
+			SimpleProtocol: cfg.DBSimpleProtocol,
+			MaxOpenConns:   2,
+			MaxIdleConns:   1,
+			ConnLifetime:   cfg.DBConnLifetime,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "volo doctor: database open failed: %v\n", err)
+			return 1
+		}
+		defer store.Close()
+		applyPersistedDirsReadOnly(ctx, cfg, store, fs)
+	}
 
 	rep := doctor.Run(ctx, cfg, store)
 	if *asJSON {

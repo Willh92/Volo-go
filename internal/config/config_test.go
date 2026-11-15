@@ -625,3 +625,64 @@ func TestTLSConfigPrecedenceAndValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestWizardDBConfigFailFastAndLoadForDoctorReadOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	missingEnv := filepath.Join(tmpDir, "missing.env")
+
+	// 1. LoadForDoctorWithEnviron MUST NOT create missing dataDir or auto-generate .secret.key
+	doctorDataDir := filepath.Join(tmpDir, "nonexistent-data")
+	docCfg, err := LoadForDoctorWithEnviron(CLIOverrides{
+		EnvFile: missingEnv,
+		DataDir: &doctorDataDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf("LoadForDoctorWithEnviron failed: %v", err)
+	}
+	if docCfg.KeyRing != nil || !strings.HasPrefix(docCfg.SecretKeySource, "missing:") {
+		t.Fatalf("expected nil KeyRing and missing: source, got kr=%v src=%q", docCfg.KeyRing, docCfg.SecretKeySource)
+	}
+	if _, statErr := os.Stat(doctorDataDir); !os.IsNotExist(statErr) {
+		t.Fatalf("LoadForDoctorWithEnviron created missing dataDir! err=%v", statErr)
+	}
+
+	// 2. Save data/db.json under keyA, then attempt LoadWithEnviron under keyB -> MUST fail fast (BUG-3)
+	setupDir := filepath.Join(tmpDir, "setup-data")
+	krA, _, err := LoadOrInitKeyRing("setup-key-alpha-2026-strong-secret", setupDir)
+	if err != nil {
+		t.Fatalf("krA: %v", err)
+	}
+	if err := SaveWizardDBConfig(setupDir, krA, WizardDBSelection{
+		Driver:         "postgres",
+		DSN:            "postgres://volo:secret@127.0.0.1:5432/volo?sslmode=disable",
+		SimpleProtocol: true,
+	}); err != nil {
+		t.Fatalf("SaveWizardDBConfig: %v", err)
+	}
+
+	wrongKey := "wrong-key-bravo-2027-strong-secret"
+	_, err = LoadWithEnviron(CLIOverrides{
+		EnvFile:   missingEnv,
+		DataDir:   &setupDir,
+		SecretKey: &wrongKey,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "db.json") {
+		t.Fatalf("expected LoadWithEnviron to fail fast on undecryptable db.json, got err=%v", err)
+	}
+
+	// Corrupt db.json also fails fast
+	corruptDir := filepath.Join(tmpDir, "corrupt-data")
+	if err := os.MkdirAll(corruptDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "db.json"), []byte("{corrupt-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadWithEnviron(CLIOverrides{
+		EnvFile:   missingEnv,
+		DataDir:   &corruptDir,
+		SecretKey: &wrongKey,
+	}, nil); err == nil || !strings.Contains(err.Error(), "db.json") {
+		t.Fatalf("expected LoadWithEnviron to fail fast on corrupt db.json, got err=%v", err)
+	}
+}

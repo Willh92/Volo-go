@@ -54,7 +54,36 @@ type storeState struct {
 	splitPools  bool
 	sqliteInMem bool
 	readOnly    bool
+	writeSem    chan struct{}
 	closeOnce   sync.Once
+}
+
+func (st *storeState) acquireWriteLock(ctx context.Context) error {
+	if st == nil || st.writeSem == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case st.writeSem <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-st.writeSem
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (st *storeState) releaseWriteLock() {
+	if st != nil && st.writeSem != nil {
+		<-st.writeSem
+	}
 }
 
 func (st *storeState) close() error {
@@ -63,15 +92,26 @@ func (st *storeState) close() error {
 	}
 	var firstErr error
 	st.closeOnce.Do(func() {
-		if st.dialect != nil && st.dialect.Name() == "sqlite" && !st.sqliteInMem && !st.readOnly && st.writeDB != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, _ = st.writeDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
-			cancel()
+		locked := false
+		if st.dialect != nil && st.dialect.Name() == "sqlite" && st.writeSem != nil {
+			lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if st.acquireWriteLock(lockCtx) == nil {
+				locked = true
+			}
+			lockCancel()
+		}
+		if locked {
+			defer st.releaseWriteLock()
 		}
 		if st.splitPools && st.readDB != nil {
 			if err := st.readDB.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
+		}
+		if st.dialect != nil && st.dialect.Name() == "sqlite" && !st.sqliteInMem && !st.readOnly && st.writeDB != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, _ = st.writeDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+			cancel()
 		}
 		if st.writeDB != nil {
 			if err := st.writeDB.Close(); err != nil && firstErr == nil {
@@ -80,6 +120,11 @@ func (st *storeState) close() error {
 		}
 	})
 	return firstErr
+}
+
+type retiredState struct {
+	st    *storeState
+	timer *time.Timer
 }
 
 // Store manages dialect-aware read/write connection pools, enforcing:
@@ -91,9 +136,14 @@ type Store struct {
 	dataRev        atomic.Uint64
 	sqliteWriteSem chan struct{}
 	semOnce        sync.Once
+	retiredMu      sync.Mutex
+	retired        []retiredState
 }
 
 func (s *Store) writeSem() chan struct{} {
+	if st := s.state.Load(); st != nil && st.writeSem != nil {
+		return st.writeSem
+	}
 	s.semOnce.Do(func() {
 		if s.sqliteWriteSem == nil {
 			s.sqliteWriteSem = make(chan struct{}, 1)
@@ -103,6 +153,9 @@ func (s *Store) writeSem() chan struct{} {
 }
 
 func (s *Store) acquireWriteLock(ctx context.Context) error {
+	if st := s.state.Load(); st != nil && st.writeSem != nil {
+		return st.acquireWriteLock(ctx)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -123,14 +176,20 @@ func (s *Store) acquireWriteLock(ctx context.Context) error {
 }
 
 func (s *Store) releaseWriteLock() {
+	if st := s.state.Load(); st != nil && st.writeSem != nil {
+		st.releaseWriteLock()
+		return
+	}
 	<-s.writeSem()
 }
 
 func newStoreFromState(st *storeState) *Store {
+	if st != nil && st.writeSem == nil {
+		st.writeSem = make(chan struct{}, 1)
+	}
 	s := &Store{
 		sqliteWriteSem: make(chan struct{}, 1),
 	}
-	s.writeSem()
 	s.state.Store(st)
 	s.dataRev.Store(1)
 	return s
@@ -467,7 +526,8 @@ func (s *Store) ReadDB() *sql.DB {
 }
 
 // Swap atomically switches this Store's underlying pools and dialect to other's pools,
-// increments DataRevision so all read caches invalidate immediately, and closes the previous pools.
+// increments DataRevision so all read caches invalidate immediately, and drains/closes
+// the previous pools after a brief grace window so in-flight requests do not fail mid-query.
 func (s *Store) Swap(other *Store) {
 	if s == nil || other == nil || s == other {
 		return
@@ -476,10 +536,27 @@ func (s *Store) Swap(other *Store) {
 	if next == nil {
 		return
 	}
+	if next.writeSem == nil {
+		next.writeSem = make(chan struct{}, 1)
+	}
 	prev := s.state.Swap(next)
 	s.dataRev.Add(1)
 	if prev != nil && prev != next {
-		_ = prev.close()
+		s.retiredMu.Lock()
+		t := time.AfterFunc(3*time.Second, func() {
+			_ = prev.close()
+			s.retiredMu.Lock()
+			filtered := s.retired[:0]
+			for _, r := range s.retired {
+				if r.st != prev {
+					filtered = append(filtered, r)
+				}
+			}
+			s.retired = filtered
+			s.retiredMu.Unlock()
+		})
+		s.retired = append(s.retired, retiredState{st: prev, timer: t})
+		s.retiredMu.Unlock()
 	}
 }
 
@@ -514,10 +591,21 @@ func (s *Store) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Close performs a clean WAL checkpoint (if SQLite file DB) and closes all database pools.
+// Close performs a clean WAL checkpoint (if SQLite file DB) and closes all database pools,
+// including any recently swapped-out pools still awaiting grace-period drain.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
+	}
+	s.retiredMu.Lock()
+	pending := s.retired
+	s.retired = nil
+	s.retiredMu.Unlock()
+	for _, r := range pending {
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+		_ = r.st.close()
 	}
 	return s.state.Load().close()
 }
@@ -539,10 +627,10 @@ func (s *Store) QueryRowContext(ctx context.Context, query string, args ...any) 
 func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	st := s.state.Load()
 	if st.dialect != nil && st.dialect.Name() == "sqlite" {
-		if err := s.acquireWriteLock(ctx); err != nil {
+		if err := st.acquireWriteLock(ctx); err != nil {
 			return nil, err
 		}
-		defer s.releaseWriteLock()
+		defer st.releaseWriteLock()
 	}
 	res, err := st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 	if err == nil {
@@ -556,10 +644,10 @@ func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql
 func (s *Store) ExecBgContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	st := s.state.Load()
 	if st.dialect != nil && st.dialect.Name() == "sqlite" {
-		if err := s.acquireWriteLock(ctx); err != nil {
+		if err := st.acquireWriteLock(ctx); err != nil {
 			return nil, err
 		}
-		defer s.releaseWriteLock()
+		defer st.releaseWriteLock()
 	}
 	return st.writeDB.ExecContext(ctx, st.dialect.Rebind(query), args...)
 }
@@ -599,10 +687,10 @@ func (s *Store) WithBgTx(ctx context.Context, fn func(tx *Tx) error) error {
 func (s *Store) runTx(ctx context.Context, bumpRev bool, fn func(tx *Tx) error) (err error) {
 	st := s.state.Load()
 	if st.dialect != nil && st.dialect.Name() == "sqlite" {
-		if err := s.acquireWriteLock(ctx); err != nil {
+		if err := st.acquireWriteLock(ctx); err != nil {
 			return err
 		}
-		defer s.releaseWriteLock()
+		defer st.releaseWriteLock()
 	}
 	rawTx, err := st.writeDB.BeginTx(ctx, nil)
 	if err != nil {

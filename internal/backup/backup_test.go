@@ -483,3 +483,152 @@ func TestNormalizeRestoreValue_UsersShieldCommentsCrossDB(t *testing.T) {
 		t.Fatalf("mysql coerceJSONValForDB(false) = %#v, want 0", got)
 	}
 }
+
+func TestRestoreExtensionCleanSwapAndLocalesArchiveExcludingCatalog(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	srcDB := openTestSQLiteStore(t, filepath.Join(tmp, "src.db"))
+	srcPlugins := filepath.Join(tmp, "src-plugins")
+	srcThemes := filepath.Join(tmp, "src-themes")
+	srcLocales := filepath.Join(tmp, "src-locales")
+
+	if err := os.MkdirAll(filepath.Join(srcPlugins, "clean-plugin"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "clean-plugin", "manifest.json"), []byte(`{"id":"clean-plugin","version":"1.0.0"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcPlugins, "clean-plugin", "main.js"), []byte(`exports.v = 1;`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(srcThemes, "clean-theme", "templates"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcThemes, "clean-theme", "theme.json"), []byte(`{"id":"clean-theme","version":"1.0.0"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcThemes, "clean-theme", "templates", "index.html"), []byte(`<h1>v1</h1>`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(srcLocales, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcLocales, "catalog.json"), []byte(`{"must_not_be_archived":true}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcLocales, "fr-FR.json"), []byte(`{"hello":"Bonjour"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcLocales, "ja-JP.json"), []byte(`{"hello":"こんにちは"}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	zipPath := filepath.Join(tmp, "clean-swap-locales.zip")
+	mf, err := CreateToFile(ctx, srcDB, zipPath, CreateOptions{
+		PluginsDir: srcPlugins,
+		ThemesDir:  srcThemes,
+		LocalesDir: srcLocales,
+	})
+	if err != nil {
+		t.Fatalf("CreateToFile: %v", err)
+	}
+	if !mf.IncludesLocales || !mf.IncludesExtensions {
+		t.Fatalf("expected IncludesLocales && IncludesExtensions, got %+v", mf)
+	}
+	for _, fd := range mf.Files {
+		if strings.EqualFold(fd.Path, "locales/catalog.json") {
+			t.Fatalf("locales/catalog.json must be excluded from backup archive, found %+v", fd)
+		}
+	}
+
+	// Pre-populate zombie files in destination plugin/theme directories, plus an unrelated plugin and catalog.json
+	dstDB := openTestSQLiteStore(t, filepath.Join(tmp, "dst.db"))
+	dstPlugins := filepath.Join(tmp, "dst-plugins")
+	dstThemes := filepath.Join(tmp, "dst-themes")
+	dstLocales := filepath.Join(tmp, "dst-locales")
+
+	_ = os.MkdirAll(filepath.Join(dstPlugins, "clean-plugin", "legacy"), 0o750)
+	_ = os.WriteFile(filepath.Join(dstPlugins, "clean-plugin", "zombie.js"), []byte("stale-zombie"), 0o640)
+	_ = os.WriteFile(filepath.Join(dstPlugins, "clean-plugin", "legacy", "old.js"), []byte("stale-dir"), 0o640)
+	_ = os.MkdirAll(filepath.Join(dstPlugins, "other-plugin"), 0o750)
+	_ = os.WriteFile(filepath.Join(dstPlugins, "other-plugin", "keep.js"), []byte("keep-me"), 0o640)
+
+	_ = os.MkdirAll(filepath.Join(dstThemes, "clean-theme", "templates"), 0o750)
+	_ = os.WriteFile(filepath.Join(dstThemes, "clean-theme", "templates", "zombie.html"), []byte("stale-tpl"), 0o640)
+
+	_ = os.MkdirAll(dstLocales, 0o750)
+	_ = os.WriteFile(filepath.Join(dstLocales, "catalog.json"), []byte(`{"builtin_catalog":true}`), 0o640)
+
+	sum, err := RestoreFromFile(ctx, dstDB, zipPath, RestoreOptions{
+		PluginsDir: dstPlugins,
+		ThemesDir:  dstThemes,
+		LocalesDir: dstLocales,
+	})
+	if err != nil {
+		t.Fatalf("RestoreFromFile: %v", err)
+	}
+	if sum.LocaleFiles != 2 {
+		t.Fatalf("expected 2 restored LocaleFiles, got %d", sum.LocaleFiles)
+	}
+
+	// Zombie files in restored extensions must be gone!
+	if _, err := os.Stat(filepath.Join(dstPlugins, "clean-plugin", "zombie.js")); !os.IsNotExist(err) {
+		t.Fatalf("expected zombie.js to be removed during atomic extension swap, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstPlugins, "clean-plugin", "legacy")); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy/ subdir to be removed during atomic extension swap, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstThemes, "clean-theme", "templates", "zombie.html")); !os.IsNotExist(err) {
+		t.Fatalf("expected zombie.html to be removed during atomic theme swap, err=%v", err)
+	}
+	// Unrelated local plugin and restored files must exist!
+	if got, err := os.ReadFile(filepath.Join(dstPlugins, "other-plugin", "keep.js")); err != nil || string(got) != "keep-me" {
+		t.Fatalf("expected other-plugin/keep.js to survive, err=%v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dstPlugins, "clean-plugin", "main.js")); err != nil || string(got) != `exports.v = 1;` {
+		t.Fatalf("expected restored clean-plugin/main.js, err=%v", err)
+	}
+	// Restored locales must exist and dst catalog.json must remain untouched!
+	if got, err := os.ReadFile(filepath.Join(dstLocales, "fr-FR.json")); err != nil || string(got) != `{"hello":"Bonjour"}` {
+		t.Fatalf("restored fr-FR.json mismatch: err=%v got=%q", err, string(got))
+	}
+	if got, err := os.ReadFile(filepath.Join(dstLocales, "catalog.json")); err != nil || string(got) != `{"builtin_catalog":true}` {
+		t.Fatalf("dst catalog.json must not be overwritten: err=%v got=%q", err, string(got))
+	}
+
+	// Security check: archive declaring locales/catalog.json must be rejected!
+	rawZip, _ := os.ReadFile(zipPath)
+	zr, _ := zip.NewReader(bytes.NewReader(rawZip), int64(len(rawZip)))
+	var badBuf bytes.Buffer
+	bzw := zip.NewWriter(&badBuf)
+	for _, zf := range zr.File {
+		if zf.Name == "manifest.json" {
+			continue
+		}
+		rc, _ := zf.Open()
+		var b bytes.Buffer
+		_, _ = b.ReadFrom(rc)
+		_ = rc.Close()
+		w, _ := bzw.Create(zf.Name)
+		_, _ = w.Write(b.Bytes())
+	}
+	catPayload := []byte(`{"hijack":true}`)
+	catW, _ := bzw.Create("locales/catalog.json")
+	_, _ = catW.Write(catPayload)
+	badMf := *mf
+	badMf.Files = append(append([]FileDigest{}, mf.Files...), FileDigest{
+		Path:   "locales/catalog.json",
+		SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		Bytes:  int64(len(catPayload)),
+	})
+	mfw, _ := bzw.Create("manifest.json")
+	_ = json.NewEncoder(mfw).Encode(&badMf)
+	_ = bzw.Close()
+
+	if _, cErr := Restore(ctx, dstDB, bytes.NewReader(badBuf.Bytes()), int64(badBuf.Len()), RestoreOptions{LocalesDir: dstLocales}); cErr == nil || !strings.Contains(cErr.Error(), "catalog.json") {
+		t.Fatalf("expected locales/catalog.json archive entry to be rejected, got %v", cErr)
+	}
+}

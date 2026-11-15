@@ -8,12 +8,15 @@
 
 ## 1. Directory Convention, Hot Installation & Export
 
-External locale packs live in `./locales` by default (configurable via CLI `--locales-dir` or environment variable `VOLO_LOCALES_DIR`). You can install and maintain locale packs in two ways:
+External locale packs live in `./locales` by default (configurable via CLI `--locales-dir` or environment variable `VOLO_LOCALES_DIR`). You can install and maintain locale packs in three ways:
 
-1. **Admin Console UI Install & Export (Recommended)**: Open the Admin Console (default `/console`, or your custom dynamic stealth path configured via `security.admin_path`) -> **Appearance & Extensions -> Locale Packs**:
+1. **1-Click Official Catalog & Remote URL Direct Install (Fastest)**: Open the Admin Console (default `/console`, or your custom dynamic stealth path configured via `security.admin_path`) -> **Appearance & Extensions -> Locale Packs** and click **Install from URL / Official Packs**:
+   - Browse the official catalog ([`locales/catalog.json`](../../locales/catalog.json) via `GET /api/admin/locales/catalog`) for 1-click installation of complete Traditional Chinese (`zh-TW`) and Japanese (`ja-JP`) packs, or enter any direct `http://` / `https://` `.json` or `.zip` URL (`POST /api/admin/locales/install-url` passing `{ url, sha256, checksum_url, asset_name, overwrite }`);
+   - Streaming downloads are verified end-to-end against `SHA256SUMS.txt` (`checksum_url`) or an explicit `sha256` digest, can be aborted cleanly mid-transfer, and hot-register immediately across both public themes and the live Admin Console (`registerExternalLocales`).
+2. **Local File Upload & Starter Export**: In **Appearance & Extensions -> Locale Packs**:
    - Click **Export Starter Template (.json)** (`GET /api/admin/locales/{code}/export`) to download a complete reference JSON containing both public theme and Admin Console keys;
-   - Translate the file and click **Install Locale Pack (.json / .zip)** (`POST /api/admin/locales/install?overwrite=true`) to hot-activate or upgrade in place immediately.
-2. **Directory Drop-in**: Place `<code>.json` (e.g., `locales/ja-JP.json`) inside `./locales/`, then click **Rescan Directory** (`POST /api/admin/locales/reload`) in the Admin Console or restart the server.
+   - Translate the file and click **Install Locale Pack (.json / .zip)** (`POST /api/admin/locales/install?overwrite=true`, with cancelable upload progress) to hot-activate or upgrade in place immediately.
+3. **Directory Drop-in**: Place `<code>.json` (e.g., `locales/ja-JP.json`) inside `./locales/`, then click **Rescan Directory** (`POST /api/admin/locales/reload`) in the Admin Console or restart the server.
 
 ---
 
@@ -42,5 +45,5 @@ Each locale pack is a flat key-value UTF-8 JSON object containing metadata (`met
 ### Core Rules
 - **Automatic Fallback Chain**: Any omitted or untranslated key automatically falls back to the site default locale and built-in `zh-CN` / `en-US` catalogs (`internal/i18n/builtin/{zh-CN,en-US}.json`), enabling incremental translation (even a 10-key override file runs safely).
 - **RTL Layout Support**: Set `"meta.dir": "rtl"` (for Arabic `ar-SA`, Hebrew `he-IL`, etc.) to automatically switch both the public theme and Admin Console into right-to-left layout (`dir="rtl"`).
-- **Collision-Free Namespacing**: Public navigation uses `"nav.*"` (e.g., `"nav.categories"`), while Admin sidebar navigation in single-file packs uses `"admin.nav.*"` (e.g., `"admin.nav.categories"`). Other Admin Console namespaces (`shell.*`, `ov.*`, `art.*`, `cnt.*`, `dist.*`, `app.*`, `sys.*`, `tbl.*`, `common.*`) work either bare or prefixed with `admin.`.
+- **Collision-Free Namespacing**: Public navigation uses `"nav.*"` (e.g., `"nav.categories"`), while Admin sidebar navigation in single-file packs uses `"admin.nav.*"` (e.g., `"admin.nav.categories"`). Other Admin Console namespaces (`shell.*`, `ov.*`, `art.*`, `cnt.*`, `dist.*`, `app.*`, `ext.*`, `sys.*`, `tbl.*`, `common.*`) work either bare or prefixed with `admin.`.
 - **Theme-Scoped Catalogs**: Standalone themes can also ship `themes/<theme-id>/locales/<code>.json` and read theme-scoped strings via `{{tt .ThemeID .Locale "hero_tagline"}}` (falling back automatically to the system catalog `{{t .Locale "key"}}`).

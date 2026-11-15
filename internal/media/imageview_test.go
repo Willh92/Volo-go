@@ -668,3 +668,58 @@ func TestImageViewEngine_SingleflightConcurrencyLRUEvictionAndPurge(t *testing.T
 		t.Fatalf("expected oldest entry 0 to be evicted when LRU byte budget exceeded")
 	}
 }
+
+func TestImageViewEngine_S3LazyLoadZeroFetchOnETagAndCacheHit(t *testing.T) {
+	ctx := context.Background()
+	eng := media.NewImageViewEngine(4 << 20)
+	rawJPG, _, _ := buildRichMetadataJPEG(t, 200, 150, 1)
+
+	var s3Fetches atomic.Int32
+	src := media.ImageViewSource{
+		Key:         "s3:2026/11/01jcxyz.jpg",
+		ModTimeNano: 0,
+		Size:        0,
+		Ext:         ".jpg",
+		Load: func(_ context.Context) ([]byte, error) {
+			s3Fetches.Add(1)
+			return rawJPG, nil
+		},
+	}
+	spec, ok, err := media.ParseImageViewSpec("?imageView2/1/w/160/h/120/format/webp")
+	if err != nil || !ok {
+		t.Fatalf("ParseImageViewSpec failed: ok=%v err=%v", ok, err)
+	}
+
+	// 1. Pre-transform ETag computation must NOT invoke S3 Load closure!
+	expectedETag := eng.ComputeETag(src.Key, src.ModTimeNano, src.Size, spec)
+	if s3Fetches.Load() != 0 {
+		t.Fatalf("ComputeETag must not fetch S3 object, got %d fetches", s3Fetches.Load())
+	}
+
+	// 2. Cold miss fetches S3 object once and produces matching ETag.
+	res, err := eng.Transform(ctx, src, spec)
+	if err != nil {
+		t.Fatalf("Transform cold miss failed: %v", err)
+	}
+	if s3Fetches.Load() != 1 {
+		t.Fatalf("expected 1 S3 fetch on cold miss, got %d", s3Fetches.Load())
+	}
+	if res.ETag != expectedETag {
+		t.Fatalf("expected Transform ETag %s to match ComputeETag %s", res.ETag, expectedETag)
+	}
+
+	// 3. Subsequent warm cache hits perform ZERO S3 fetches!
+	for i := 0; i < 5; i++ {
+		warmRes, wErr := eng.Transform(ctx, src, spec)
+		if wErr != nil {
+			t.Fatalf("Transform warm hit failed: %v", wErr)
+		}
+		if warmRes.ETag != expectedETag || len(warmRes.Data) == 0 {
+			t.Fatalf("unexpected warm cache result: %+v", warmRes)
+		}
+	}
+	if s3Fetches.Load() != 1 {
+		t.Fatalf("expected warm LRU hits to perform 0 extra S3 fetches, got total %d", s3Fetches.Load())
+	}
+}
+

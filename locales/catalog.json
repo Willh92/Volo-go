@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "kind": "locale",
+  "updated_at": "2026-11-15",
+  "repository": "https://github.com/Willh92/Volo-go",
+  "release_tag": "extensions-v1.0.3",
+  "items": [
+    {
+      "id": "zh-TW",
+      "version": "1.0.0",
+      "min_host_version": "0.1.0",
+      "author": "Volo-go",
+      "distribution": "bundled",
+      "bundled_in_core_archive": true,
+      "bundled_in_docker_image": true,
+      "release_tag": "extensions-v1.0.3",
+      "release_asset": "locale-zh-TW-v1.0.0.zip",
+      "release_asset_alias": "locale-zh-TW.zip",
+      "download_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/locale-zh-TW-v1.0.0.zip",
+      "checksum_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/SHA256SUMS.txt",
+      "homepage": "https://github.com/Willh92/Volo-go/releases/tag/extensions-v1.0.3",
+      "approx_size_bytes": 40515,
+      "approx_zip_mb": 0.04,
+      "name": {
+        "zh-CN": "繁體中文",
+        "en-US": "Traditional Chinese (zh-TW)",
+        "zh-TW": "繁體中文",
+        "ja-JP": "繁体字中国語 (zh-TW)"
+      },
+      "summary": {
+        "zh-CN": "官方繁体中文语言包，完整覆盖前台读者界面、管理后台、初始化向导与系统通知。",
+        "en-US": "Official Traditional Chinese language pack covering public reader views, admin console, setup wizard, and system notifications.",
+        "zh-TW": "官方繁體中文語言包，完整涵蓋前台讀者介面、管理後台、初始化精靈與系統通知。",
+        "ja-JP": "公式の繁体字中国語言語パック。公開リーダー画面、管理コンソール、初期セットアップ、システム通知を網羅。"
+      }
+    },
+    {
+      "id": "ja-JP",
+      "version": "1.0.0",
+      "min_host_version": "0.1.0",
+      "author": "Volo-go",
+      "distribution": "bundled",
+      "bundled_in_core_archive": true,
+      "bundled_in_docker_image": true,
+      "release_tag": "extensions-v1.0.3",
+      "release_asset": "locale-ja-JP-v1.0.0.zip",
+      "release_asset_alias": "locale-ja-JP.zip",
+      "download_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/locale-ja-JP-v1.0.0.zip",
+      "checksum_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/SHA256SUMS.txt",
+      "homepage": "https://github.com/Willh92/Volo-go/releases/tag/extensions-v1.0.3",
+      "approx_size_bytes": 41232,
+      "approx_zip_mb": 0.04,
+      "name": {
+        "zh-CN": "日本語",
+        "en-US": "Japanese (ja-JP)",
+        "zh-TW": "日本語",
+        "ja-JP": "日本語"
+      },
+      "summary": {
+        "zh-CN": "官方日语语言包，完整覆盖前台读者界面、管理后台、初始化向导与系统通知。",
+        "en-US": "Official Japanese language pack covering public reader views, admin console, setup wizard, and system notifications.",
+        "zh-TW": "官方日語語言包，完整涵蓋前台讀者介面、管理後台、初始化精靈與系統通知。",
+        "ja-JP": "公式の日本語言語パック。公開リーダー画面、管理コンソール、初期セットアップ、システム通知を完全にサポート。"
+      }
+    }
+  ]
+}

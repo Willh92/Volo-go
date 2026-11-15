@@ -1,10 +1,13 @@
 package i18n
 
 import (
+	"archive/zip"
+	"bytes"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -143,3 +146,62 @@ func TestPacksCompletionPctAgainstDefaultLocale(t *testing.T) {
 		t.Fatalf("expected partial external ja-JP CompletionPct=50, got %d", synByCode["ja-JP"].CompletionPct)
 	}
 }
+
+func TestCatalogJSONSkippedInReloadAndInstallPackZipAndRejectedInValidateLocaleCode(t *testing.T) {
+	if _, err := ValidateLocaleCode("catalog"); err == nil {
+		t.Fatal("expected ValidateLocaleCode(\"catalog\") to fail")
+	}
+	if _, err := ValidateLocaleCode("CATALOG"); err == nil {
+		t.Fatal("expected ValidateLocaleCode(\"CATALOG\") to fail")
+	}
+
+	extDir := t.TempDir()
+	repoCatalog, err := os.ReadFile(filepath.Clean(filepath.Join("..", "..", "locales", "catalog.json")))
+	if err != nil {
+		t.Fatalf("read repo locales/catalog.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(extDir, "catalog.json"), repoCatalog, 0o644); err != nil {
+		t.Fatalf("write catalog.json to extDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(extDir, "ja-JP.json"), []byte(`{"meta.name":"日本語","nav.home":"ホーム"}`), 0o644); err != nil {
+		t.Fatalf("write ja-JP.json: %v", err)
+	}
+
+	cat, err := NewCatalog("zh-CN", extDir)
+	if err != nil {
+		t.Fatalf("NewCatalog with catalog.json present failed: %v", err)
+	}
+	for _, p := range cat.Packs() {
+		if strings.EqualFold(p.Code, "catalog") {
+			t.Fatalf("expected Packs() not to include 'catalog', got %+v", p)
+		}
+	}
+	if _, err := cat.InstallPackJSON("catalog", []byte(`{"nav.home":"x"}`), true); err == nil {
+		t.Fatal("expected InstallPackJSON(\"catalog\", ...) to be rejected")
+	}
+	if err := cat.DeleteExternalPack("catalog"); err == nil {
+		t.Fatal("expected DeleteExternalPack(\"catalog\") to be rejected")
+	}
+
+	// Verify InstallPackZip skips catalog.json inside a multi-file zip while installing valid packs.
+	var zb bytes.Buffer
+	zw := zip.NewWriter(&zb)
+	f1, _ := zw.Create("catalog.json")
+	_, _ = f1.Write(repoCatalog)
+	f2, _ := zw.Create("ko-KR.json")
+	_, _ = f2.Write([]byte(`{"meta.code":"ko-KR","meta.name":"한국어","nav.home":"홈"}`))
+	_ = zw.Close()
+
+	installed, err := cat.InstallPackZip(bytes.NewReader(zb.Bytes()), int64(zb.Len()), true)
+	if err != nil {
+		t.Fatalf("InstallPackZip with catalog.json: %v", err)
+	}
+	if len(installed) != 1 || installed[0].Code != "ko-KR" {
+		t.Fatalf("expected only ko-KR to be installed, got %+v", installed)
+	}
+	afterRaw, err := os.ReadFile(filepath.Join(extDir, "catalog.json"))
+	if err != nil || !bytes.Equal(afterRaw, repoCatalog) {
+		t.Fatal("expected extDir/catalog.json to remain untouched")
+	}
+}
+

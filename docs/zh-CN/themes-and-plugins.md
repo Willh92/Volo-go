@@ -52,6 +52,7 @@ themes/my-editorial/
 ```
 
 - **一键纯净脚手架 `.zip` 导出**：管理员可在后台点击任一主题（含内置 `volo-studio`）的 **「导出主题包 (.zip)」**（`GET /api/admin/themes/{id}/export`），直接下载自动剥离临时文件与系统噪音的纯净 Starter `.zip` 包作为二次开发起点。
+- **浏览器端 `.zip` 零依赖预检弹窗与拖拽直装**：将本地 `.zip` 包拖拽（或选择）至主题/插件安装区时，管理台会在浏览器本地执行零第三方依赖预检（`DataView` 解析 ZIP 中央目录 + `DecompressionStream("deflate-raw")` 解包清单 + `crypto.subtle` 本地计算 `SHA-256` 指纹，上限 `64 MiB`），先弹窗展示解析出的扩展名称/ID、版本差异对比（`已装版本 -> 新版本` 或 `全新安装`）、`min_host_version` 宿主兼容性徽章、本地 `SHA-256` 指纹及「安装后立即激活/启用」勾选项，确认后再执行支持随时取消的上传流程。
 - **原位 `.zip` 覆盖升级**：上传主题时支持 `POST /api/admin/themes/install?overwrite=true` 原位热更新现有同 ID 主题文件，同时完整保留站长已保存的 `Appearance.ThemeConfigs[<id>]` 配置项。
 
 ### 1.3 PJAX 跨页常驻岛协议（`data-volo-persist`）
@@ -304,16 +305,75 @@ function renderSlot(slotName) {
 }
 ```
 
-### 3.6 官方插件目录与版本感知自动分包（[`plugins/catalog.json`](../../plugins/catalog.json)）
+### 3.6 版本更新检测协议（声明式 `update` + 自定义 `onCheckUpdate` 钩子）、URL 流式直装与异常自愈回退
 
-官方插件版本清单统一维护在 [`plugins/README.zh-CN.md`](../../plugins/README.zh-CN.md) 与机器可读索引 [`plugins/catalog.json`](../../plugins/catalog.json) 中，并由 CI 强制校验清单版本与各插件 `manifest.json` 完全一致：
+`Volo-go` 为**插件（`manifest.json`）与主题（`theme.json`）**提供统一的高性能按需更新检测、URL 流式直装与双阶段原子回退机制（**全程零后台定时轮询：空闲时 `0` 网络请求、`0` JS VM 唤醒、`0` 额外常驻内存**）：
 
-| 插件 ID | 最新版本 | 分发策略 | 核心包 / Docker 默认内置 | 核心特性说明 |
+1. **显式三态更新能力模型（`update_capability`）**：
+   - **`none`（不支持在线检测）**：未配置 `"update"` 且未导出 `onCheckUpdate`（或显式声明 `"strategy": "none"`，以及内置默认主题 `volo-studio`）。后台不渲染无效检测按钮，批量检测自动静默跳过（`0` 网络开销）。
+   - **`check_only`（仅检测版本、禁止在线覆盖）**：内置编译扩展（`kind == "builtin"` 或 `is_builtin == true`）、声明 `"allow_online_update": false`，或钩子返回 `online_updatable: false` / 空 `download_url`。后台展示新版本与更新说明并提供前往发布页按钮，禁止在线覆盖写入。
+   - **`online`（支持检测 + 一键在线热更新）**：同时具备有效 `.zip` 下载地址与在线更新许可的外置插件/主题，支持一键原子热更新。
+
+2. **方式一（插件与主题通用 · 零 JS VM 开销）：声明式 `"update"` 配置块**：
+   在 `manifest.json` 或 `theme.json` 中声明 `"update"`，由 Go 原生引擎直接评估（响应体硬上限 `128 KiB`，内置 `singleflight` 请求合并与 `ETag` / `Last-Modified` `304` 缓存复用）：
+   ```json
+   {
+     "min_host_version": "0.1.0",
+     "update": {
+       "strategy": "manifest-json",
+       "url": "https://example.com/my-ext/manifest.json",
+       "download_url": "https://example.com/my-ext/ext-v{version}.zip",
+       "release_url": "https://example.com/my-ext/releases/tag/v{version}",
+       "allow_online_update": true
+     }
+   }
+   ```
+   支持的 `strategy`：
+   - `"volo-catalog"`：匹配 `catalog.json` 中的对应 `id` 条目（自动读取 `version`、`min_host_version`、`download_url`、`sha256`、`checksum_url`、`approx_zip_mb` / `approx_size_bytes` 与 `changelog`）；
+   - `"manifest-json"`：拉取远程 `manifest.json` / `theme.json`（支持 `{version}` 占位符模板替换）；
+   - `"github-release"`：解析 GitHub Releases API（支持 `"repo": "owner/repo"`、可选 `"tag_prefix": "plugin-foo-v"` 与 `"asset": "plugin-foo.zip"`）；
+   - `"none"`：显式声明不支持在线更新检测。
+
+3. **方式二（第三方插件高阶自定义）：Goja `onCheckUpdate(ctx)` 钩子**：
+   对接私有授权中心、Gitee/GitLab 或自建签名接口的第三方插件，只需声明对应域名的 `"allowed_hosts"` 并在 `main.js` 导出 `onCheckUpdate(ctx)`：
+   ```javascript
+   function onCheckUpdate(ctx) {
+     // ctx: { pluginId, currentVersion, hostVersion, locale }
+     const resp = volo.http.fetch("https://ext.example.com/api/update?id=" + encodeURIComponent(ctx.pluginId));
+     if (resp.status !== 200) throw new Error("upstream HTTP " + resp.status);
+     const data = JSON.parse(resp.body);
+     return {
+       latest_version: data.version,          // 必填：最新语义化版本号
+       has_update: data.version !== ctx.currentVersion, // 可选：省略时由宿主按 SemVer 自动比对
+       download_url: data.zip_url || "",      // 留空或设 online_updatable: false 则自动降级为 check_only
+       sha256: data.sha256 || "",             // 可选：64 位十六进制哈希，下载阶段单趟流式强校验
+       release_url: data.page_url || "",      // 可选：发布详情页链接
+       changelog: data.notes || "",           // 支持字符串或多语言对象 { "zh-CN": "...", "en-US": "..." }
+       min_host_version: data.min_host || "", // 高于当前宿主版本时自动拦截不兼容升级
+       online_updatable: true
+     };
+   }
+   ```
+   - **性能与熔断隔离护栏**：已启用插件直接复用池化热 VM；**未启用插件**按需创建单实例 `1-VM` 临时沙箱并在 `defer rt.closeRuntime()` 中立即销毁归还内存；`onCheckUpdate` 独立 `5s` 超时，且**第三方更新源超时/报错绝不累加生产业务 `failure_count` 或误触 `CIRCUIT_OPEN` 熔断器**。
+
+4. **防 SSRF 流式 URL 直装、`SHA256SUMS.txt` 端到端验签、批量一键更新与双阶段原子回退**：
+   - **流式低内存下载与端到端 `SHA256SUMS.txt`（`checksum_url`）强校验**：经 `OutboundSafeDialer` 逐跳校验重定向（`<= 5` 跳），通过 `32 KiB` 池化缓冲区单趟流式直写同卷临时文件并同步计算 `SHA-256`（堆内存占用 `< 64 KiB`），内置 `20s` 单次读停滞看门狗与误填 HTML 网页自动识别。调用 `/install-url` 或 `/upgrade` 传入 `checksum_url`（及可选 `asset_name`）时，后端自动拉取 `SHA256SUMS.txt` 强制比对安装包摘要（管理台卡片同步展示包体积徽章与 **「经 SHA256SUMS 强校验」** 标识）。
+   - **一键串行「全部更新 (N)」批量热更新**：当 `>= 2` 个已装主题或插件存在可在线热更新版本时，更新横幅自动展示 **「全部更新 (N)」** 按钮，打开 Top-Layer 批量进度弹窗按序执行 `/upgrade`，实时呈现逐项状态（等待 / 更新中 / 已完成 / 失败）并支持随时点击 **「取消剩余项」**。
+   - **Phase 1（预检阶段 · 支持零副作用随时取消）**：绑定前端 `AbortController` 请求上下文。下载、解压、路径穿越校验、`min_host_version` 校验及模板/JS 语法预检期间，管理员点击「中断下载」、断网或关闭页面会立即中止传输并清理临时目录，正在运行的旧版插件/主题 `0` 抖动。
+   - **Phase 2（原子提交与异常自动回滚）**：通过预检后进入独立有界提交上下文（不受浏览器断连半途打断），保留 `.backup-*` / `.theme-old-*` 快照直至数据库同步、`onInstall` 与 `Enable` / `Themes.Reload()` **全部成功**后才删除旧版备份；任一步骤抛错即自动原位回滚旧版目录、数据库记录与已启用运行状态，并在进程启动时自动自愈极端断电遗留的备份目录。
+
+### 3.7 官方扩展独立分包目录（[`plugins/catalog.json`](../../plugins/catalog.json)、[`themes/catalog.json`](../../themes/catalog.json) & [`locales/catalog.json`](../../locales/catalog.json)）
+
+所有官方插件、外置主题与独立语言包均附带 `SHA256SUMS.txt`（一键在线直装及 CI 发布均强制执行 `checksum_url` 验签）：
+
+| 类型 / ID | 最新版本 | 分发策略 | 核心包 / Docker 默认内置 | 核心特性说明 |
 | :--- | :---: | :--- | :---: | :--- |
-| [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled`（随主包内置） | 是 | 6.4 万级分类敏感词库 + 宿主 16B/状态 BFS-CSR Aho-Corasick 自动机，统一守护评论与昵称。 |
-| [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.2`** | `standalone-release`（[`plugin-kanbanniang-v2.0.2.zip`](https://github.com/Willh92/Volo-go/releases/tag/plugin-kanbanniang-v2.0.2)） | 否（按需安装） | 完整内置 26 套离线 Live2D 模型、Pio/Tia 150 套随机换装、`.moc`/`.webp`/动作并行预取、触屏友好的 7 键工具栏、拖拽记忆、深浅色自适应樱花背景、WebGL 上下文自愈、零内联严格 CSP 启动与摸头计数；全量采用无损透明/动图 `.webp` 贴图与 AST 代码压缩，独立包体积精简至 `~35.5 MiB`（较原始贴图缩减 `65%+`）。 |
+| 插件 [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled` + `plugin-sensitive-words-v1.1.0.zip` | 是 | 6.4 万级分类敏感词库 + 宿主 16B/状态 BFS-CSR Aho-Corasick 自动机，支持一键在线热更新。 |
+| 插件 [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.5`** | `standalone-release`（`plugin-kanbanniang-v2.0.5.zip`） | 否（按需直装） | 完整内置 26 套离线 Live2D 模型、Pio/Tia 150 套随机换装、7 键工具栏、边角最小化/召唤胶囊、加载失败手动重试卡片与摸头计数（纯 `.webp` 轻量化归档约 `35.5 MiB`）。 |
+| 主题 [`volo-journal`](../../themes/volo-journal/) | **`v1.1.1`** | `bundled` + `theme-volo-journal-v1.1.1.zip` | 是 | 经典纸刊杂志双栏主题，支持独立热更新与桌面/手机双主题分流。 |
+| 语言包 [`zh-TW`](../../locales/zh-TW.json) / [`ja-JP`](../../locales/ja-JP.json) | **`v1.0.0+`** | `locales/catalog.json`（一键在线直装） | 随仓提供 + 官方源直装 | 完整繁體中文与日本語前台 + 后台双层全量词典，支持 `POST /api/admin/locales/install-url` 免重启即时热激活。 |
 
-- **GitHub Actions 版本不变不重复打包**：由 [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) 与 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) 自动检查 `plugin-kanbanniang-v<version>` Release 是否已发布；当 `kanbanniang/manifest.json` 版本号未变时直接跳过压缩与上传，避免每次主程序发版重复构建百兆级插件归档。
+- **GitHub Actions 版本不变不重复打包**：由 [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) 与 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) 逐项比对 `plugin-<id>-v<version>` / `theme-<id>-v<version>` Release 是否已存在；版本号未变时直接跳过压缩与上传，且扩展 Release 始终设置 `make_latest: false` 不抢占主程序 `latest` 指针。
 
 ---
 

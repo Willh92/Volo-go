@@ -140,7 +140,7 @@ func (c *Catalog) Reload(externalDir string) error {
 			return fmt.Errorf("i18n: read external locales dir %q: %w", extDir, err)
 		}
 		for _, ent := range extEntries {
-			if ent.IsDir() || !strings.HasSuffix(strings.ToLower(ent.Name()), ".json") {
+			if ent.IsDir() || !strings.HasSuffix(strings.ToLower(ent.Name()), ".json") || strings.EqualFold(ent.Name(), "catalog.json") {
 				continue
 			}
 			fullPath := filepath.Join(extDir, ent.Name())
@@ -343,11 +343,14 @@ func ValidateLocaleCode(raw string) (string, error) {
 	if trimmed == "" || strings.ContainsAny(trimmed, `/\.`) {
 		return "", errors.New("invalid locale code")
 	}
+	if strings.EqualFold(trimmed, "catalog") {
+		return "", errors.New("reserved locale code \"catalog\"")
+	}
 	if !validLocaleCodeRe.MatchString(trimmed) {
 		return "", fmt.Errorf("invalid BCP-47 locale code %q", raw)
 	}
 	norm := NormalizeLocale(trimmed)
-	if norm == "" || !validLocaleCodeRe.MatchString(norm) {
+	if norm == "" || strings.EqualFold(norm, "catalog") || !validLocaleCodeRe.MatchString(norm) {
 		return "", fmt.Errorf("invalid normalized locale code %q", norm)
 	}
 	return norm, nil
@@ -550,7 +553,7 @@ func (c *Catalog) InstallPackZip(r io.ReaderAt, size int64, overwrite bool) ([]L
 			return nil, errors.New("non-regular files are forbidden in language pack zip")
 		}
 		base := filepath.Base(f.Name)
-		if strings.HasPrefix(base, ".") || !strings.HasSuffix(strings.ToLower(base), ".json") {
+		if strings.HasPrefix(base, ".") || !strings.HasSuffix(strings.ToLower(base), ".json") || strings.EqualFold(base, "catalog.json") {
 			continue
 		}
 		if f.UncompressedSize64 > 4<<20 {
@@ -625,7 +628,7 @@ func (c *Catalog) DeleteExternalPack(rawCode string) error {
 		found := ""
 		if entries, dErr := os.ReadDir(extDir); dErr == nil {
 			for _, ent := range entries {
-				if !ent.IsDir() && strings.HasSuffix(strings.ToLower(ent.Name()), ".json") {
+				if !ent.IsDir() && strings.HasSuffix(strings.ToLower(ent.Name()), ".json") && !strings.EqualFold(ent.Name(), "catalog.json") {
 					stem := strings.TrimSuffix(ent.Name(), filepath.Ext(ent.Name()))
 					if NormalizeLocale(stem) == code {
 						found = filepath.Join(extDir, ent.Name())

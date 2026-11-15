@@ -1853,6 +1853,16 @@ tr.is-flip-moving,
   animation: volo-toast-slide 0.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 
+.volo-toast[popover] {
+  inset: max(18px, env(safe-area-inset-top)) auto auto 50%;
+  margin: 0;
+  overflow: visible;
+}
+
+.volo-toast[popover]:is(:popover-open, .\:popover-open) {
+  display: inline-flex;
+}
+
 .volo-toast.is-err {
   border-color: color-mix(in srgb, var(--volo-danger) 32%, var(--volo-line));
 }
@@ -2068,6 +2078,11 @@ tr.is-flip-moving,
   border-color: var(--volo-accent);
   color: var(--volo-text);
   background: var(--volo-surface);
+}
+
+.volo-modal-close[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .volo-modal-body {
@@ -7961,4 +7976,136 @@ html[data-theme="dark"] .volo-auth-story {
       font-size: 16px !important;
     }
   }
+}
+
+/* Native <dialog> & <progress> for Extension Remote Install & Online Update (modern-web-guidance) */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background: rgb(8 14 12 / 0.48);
+  backdrop-filter: blur(3px);
+}
+dialog.volo-native-dialog {
+  margin: auto;
+  padding: 22px 24px;
+  border: 1px solid var(--volo-line);
+  border-radius: 14px;
+  background: var(--volo-surface);
+  color: var(--volo-text);
+  width: min(92vw, var(--dialog-max-w, 600px));
+  max-height: min(86vh, 720px);
+  max-height: min(86dvh, 720px);
+  box-shadow: var(--volo-shadow-pop);
+  opacity: 0;
+  transition-property: opacity, transform, display, overlay;
+  transition-duration: 0.18s;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  transition-behavior: allow-discrete;
+}
+@media (prefers-reduced-motion: no-preference) {
+  dialog.volo-native-dialog {
+    transform: scale(0.96);
+  }
+}
+dialog.volo-native-dialog::backdrop {
+  background-color: rgb(8 14 12 / 0);
+  backdrop-filter: blur(0px);
+  transition-property: background-color, backdrop-filter, display, overlay;
+  transition-duration: 0.18s;
+  transition-timing-function: ease;
+  transition-behavior: allow-discrete;
+}
+dialog.volo-native-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+dialog.volo-native-dialog[open]:where(:not([data-closing])) {
+  opacity: 1;
+}
+@starting-style {
+  dialog.volo-native-dialog[open]:where(:not([data-closing])) {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  dialog.volo-native-dialog[open]:where(:not([data-closing])) {
+    transform: scale(1);
+  }
+  @starting-style {
+    dialog.volo-native-dialog[open]:where(:not([data-closing])) {
+      transform: scale(0.96);
+    }
+  }
+}
+dialog.volo-native-dialog[open]:where(:not([data-closing]))::backdrop {
+  background-color: rgb(8 14 12 / 0.48);
+  backdrop-filter: blur(3px);
+}
+@starting-style {
+  dialog.volo-native-dialog[open]:where(:not([data-closing]))::backdrop {
+    background-color: rgb(8 14 12 / 0);
+    backdrop-filter: blur(0px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  dialog.volo-native-dialog,
+  dialog.volo-native-dialog::backdrop {
+    transition-duration: 0.1s;
+  }
+}
+@media (max-width: 640px) {
+  dialog.volo-native-dialog {
+    padding: 16px 14px;
+    width: calc(100vw - 20px);
+    max-height: min(90dvh, 720px);
+  }
+}
+progress.volo-native-progress {
+  accent-color: var(--volo-accent);
+  inline-size: 100%;
+  display: block;
+}
+.volo-ext-catalog {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 230px;
+  overflow-y: auto;
+}
+.volo-ext-catalog-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+}
+@media (max-width: 520px) {
+  .volo-ext-catalog-card {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+.volo-zip-dropzone {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.volo-zip-dropzone.is-zip-dropover {
+  border-color: var(--volo-accent) !important;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--volo-accent) 22%, transparent);
+}
+.volo-ext-changelog {
+  white-space: pre-wrap;
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--volo-line);
+  background: var(--volo-raised);
+  max-height: 190px;
+  overflow-y: auto;
 }

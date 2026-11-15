@@ -71,9 +71,21 @@
 ./volo admin disable-2fa --user admin@example.com --env-file /etc/volo/volo.env
 ```
 
-### 1.4 `volo backup create` 与 `volo backup restore`（跨库流式备份与恢复）
+### 1.4 `volo secret rotate`（主密钥原子轮换 · 全量覆盖 8 处加密存储）
 
-详见 [迁移与跨库流式备份指南](./migration-and-backup.md)。
+一键轮换宿主 `AES-256-GCM` 主密钥（`KeyRing`），并在单个受校验事务内自动重加密全站 **8 处 AAD 绑定加密存储**（含 `${VOLO_DATA_DIR}/db.json` 密封连接串、`settings.secret_ciphertext` 下 SMTP/S3/WebDAV/OIDC 等分域机密、`plugins.secret_ciphertext` 插件密钥、`webhooks` 签名密钥、用户 TOTP 种子与恢复码等）：
+
+```bash
+# 先执行 --dry-run 零写入校验：验证当前全部 8 处密文均可正常解密
+./volo secret rotate --env-file /etc/volo/volo.env --dry-run
+
+# 正式执行原子主密钥轮换并更新全部 8 处密文
+./volo secret rotate --env-file /etc/volo/volo.env
+```
+
+### 1.5 `volo backup create` 与 `volo backup restore`（跨库流式备份与恢复前自动安全快照）
+
+详见 [迁移与跨库流式备份指南](./migration-and-backup.md)。在非 `--dry-run` 模式下对已有数据的实例执行恢复前，Volo-go 会自动在 `${VOLO_BACKUP_DIR}` 生成 `pre-restore-*.zip` 恢复前安全快照，以便误操作时随时无损回退。
 
 ```bash
 # 创建包含媒体文件的流式 ZIP 备份包（默认 --with-media=true；未传 --output 时写入 ${VOLO_BACKUP_DIR}/volo-backup-<UTC时间戳>.zip）
@@ -85,11 +97,11 @@
 # 先执行 --dry-run 校验所有 NDJSON 分流 SHA-256 摘要与行数，零数据库改动
 ./volo backup restore ./volo-backup.zip --dry-run
 
-# 正式流式恢复（支持 SQLite ⇄ PostgreSQL ⇄ MySQL 跨数据库无损搬迁）
+# 自动生成 pre-restore-*.zip 安全快照并流式恢复（支持 SQLite ⇄ PostgreSQL ⇄ MySQL 跨数据库无损搬迁）
 ./volo backup restore ./volo-backup.zip
 ```
 
-### 1.5 `volo import-legacy`（历史旧版备份流式清洗导入）
+### 1.6 `volo import-legacy`（历史旧版备份流式清洗导入）
 
 支持直接流式解析历史 15 表 `.zip` 备份包或 `data.json` 归档，并提供域名重写与本地存储回退开关：
 
@@ -111,16 +123,16 @@
   --storage-local
 ```
 
-### 1.6 `volo doctor`、`volo healthcheck` 与 `volo version`（自检诊断与容器探活）
+### 1.7 `volo doctor`、`volo healthcheck` 与 `volo version`（严格只读诊断与就绪探针）
 
 ```bash
-# 人类可读诊断报告（检查主密钥权限、管理台路径状态、SQLite WAL 模式、离线 GeoIP 多库挂载、目录可写性与反代配置）
+# 严格只读诊断报告（绝不创建目录、.secret.key 或 SQLite WAL 附属文件；检查主密钥权限、TLS 证书、管理台路径、SQLite WAL、离线 GeoIP、目录可写性与反代配置）
 ./volo doctor
 
-# 输出机器可读 JSON（非健康状态退出码为 1，适合 CI / 监控采集）
+# 输出机器可读只读诊断 JSON（非健康状态退出码为 1，适合 CI / 监控采集）
 ./volo doctor --json
 
-# 探测运行中实例的 /healthz（只读零副作用：不创建 .secret.key；自动根据配置探测 TCP 或 Unix Socket http://unix/healthz）
+# 探测运行中实例的 /healthz 数据库与运行时就绪探针（只读零副作用：不创建 .secret.key；自动根据配置探测 TCP/HTTPS 或 Unix Socket http://unix/healthz）
 ./volo healthcheck
 ./volo healthcheck --url http://127.0.0.1:8080/healthz
 
@@ -207,12 +219,16 @@ curl -X POST "${VOLO_URL}/api/admin/media/upload" \
 
 ### 2.4 账户与 IP 封禁治理、日志清理、批量重排与插件链式编排接口
 
-- **`GET /api/admin/users`** 与 **`PATCH /api/admin/users`**（需交互式管理员会话）：类 Discourse 账户治理接口，支持动作 `action: "ban" | "unban" | "mute" | "unmute" | "shield"`、时长 `duration_hours`（`0` 表示永久，`> 0` 按小时计算到期自动恢复）、原因 `reason`、是否屏蔽历史评论 `shield_comments` 及自定义替换文案 `shield_text`（解封或到期后历史评论立即无损恢复）。
+- **`GET /api/admin/users`**、**`PATCH /api/admin/users`** 与 **`DELETE /api/admin/users/{id}`**（需交互式管理员会话；其中 `DELETE` 物理删除用户强制校验 `X-Volo-Current-Password` 二次密码重认证）：类 Discourse 账户治理接口，支持动作 `action: "ban" | "unban" | "mute" | "unmute" | "shield"`、时长 `duration_hours`（`0` 表示永久，`> 0` 按小时计算到期自动恢复）、原因 `reason`、是否屏蔽历史评论 `shield_comments` 及自定义替换文案 `shield_text`（解封或到期后历史评论立即无损恢复）。
 - **`GET / POST /api/admin/security/ip-bans`**、**`PATCH / DELETE /api/admin/security/ip-bans/{id}`**、**`POST /api/admin/security/ip-bans/{id}/unban`**、**`POST /api/admin/security/ip-bans/batch`** 与 **`POST /api/admin/security/ip-bans/purge-expired`**（需交互式管理员会话）：完整 IP/CIDR 封禁全生命周期管理接口，返回 `counts`（`active` / `expired` / `all` 数量统计）、`source`（`manual` / `auto_waf`）、累计触发次数 `occurrences` 及离线 GeoIP `location`。单条或批量 `unban` 执行提前到期并保留历史记录；`PATCH` 与批量 `set_duration` 支持修改 `expires_minutes`（`0` 永久，`> 0` 从当前起算分钟数）或备注 `note`（支持已过期记录一键重新封禁），单条 `PATCH` 还支持显式调整或清零累计触发次数 `occurrences`（`0`–`1000000`）；`DELETE`、批量 `delete` 与 `purge-expired` 执行物理删除。评论管理封禁接口（`POST /api/admin/comments/{id}/ban-ip` 与 `POST /api/admin/comments/batch` 的 `ban_ip` 动作）同步支持传入 `expires_minutes`。
-- **`DELETE /api/admin/audit-logs`** 与 **`DELETE /api/admin/plugins/{id}/logs`**（需交互式管理员会话）：一键清空管理审计日志与指定插件运行日志（配合 `security.ip_ban_retention_days`、`security.audit_log_retention_days`、`security.plugin_log_retention_days` 自动按天清理，`0` 表示永久保留）。
+- **`DELETE /api/admin/audit-logs`**（强制校验 `X-Volo-Current-Password` 二次密码重认证）与 **`DELETE /api/admin/plugins/{id}/logs`**（需交互式管理员会话）：一键清空管理审计日志与指定插件运行日志（配合 `security.ip_ban_retention_days`、`security.audit_log_retention_days`、`security.plugin_log_retention_days` 自动按天清理，`0` 表示永久保留）。
 - **`POST /api/admin/categories/reorder`** 与 **`POST /api/admin/books/reorder`**：按传入 ID 顺序单事务批量重排分类或书架项目的 `sort_order`。
 - **`POST /api/admin/plugins/reorder`** 与 **`PATCH /api/admin/plugins/{id}/priority`**（需交互式管理员会话）：编排插件链式执行顺序或精确设置 `priority` 数值（`-1000`–`10000`）。
-- **`GET /api/admin/plugins/cron`**、**`POST /api/admin/plugins/{id}/trigger-cron`** 与 **`GET /api/admin/plugins/{id}/export`**。
+- **`GET /api/admin/plugins/catalog`**、**`GET /api/admin/themes/catalog`** 与 **`GET /api/admin/locales/catalog`**（支持 `?refresh=1` 强制绕过 `ETag` 缓存）：拉取官方独立插件、主题与语言包（`zh-TW`、`ja-JP`）目录，并与本地已装版本、包体积、`checksum_url` 及宿主版本兼容性实时对比。
+- **`POST /api/admin/plugins/install`** / **`POST /api/admin/themes/install`** / **`POST /api/admin/locales/install`**（兼容 `multipart/form-data` 本地上传与 `application/json` `{ "url", "sha256", "checksum_url", "asset_name", "overwrite", "enable"|"activate" }` 远程流式直装）及显式别名 **`POST /api/admin/{plugins,themes,locales}/install-url`**：防 SSRF 流式安装器，原生支持 `SHA256SUMS.txt`（`checksum_url`）端到端验签（用户取消返回 `499`，重名未授权覆盖返回 `409 Conflict`）。
+- **`POST /api/admin/plugins/check-updates`** / **`POST /api/admin/themes/check-updates`**（支持 `{ "ids": [...], "force": true }`）与单条 **`POST /api/admin/plugins/{id}/check-update`** / **`POST /api/admin/themes/{id}/check-update`**：按需执行有界并发更新检测（自动静默跳过 `update_capability == "none"` 的扩展，更新源异常绝不触发生产熔断器）。
+- **`POST /api/admin/plugins/{id}/update`**（别名 `/upgrade`）与 **`POST /api/admin/themes/{id}/update`**（别名 `/upgrade`）：双阶段原子热替换升级（下载/预检期支持随时取消中断，提交切换期异常自动回滚目录、数据库记录与已启用运行态）。
+- **`GET /api/admin/plugins/cron`**、**`POST /api/admin/plugins/{id}/trigger-cron`**、**`GET /api/admin/plugins/{id}/export`** 与 **`GET /api/admin/themes/{id}/export`**。
 
 ---
 

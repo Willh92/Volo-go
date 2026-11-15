@@ -25,6 +25,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/etl"
 	"github.com/Willh92/Volo-go/internal/i18n"
 	"github.com/Willh92/Volo-go/pkg/id"
+	"github.com/Willh92/Volo-go/pkg/plugin"
 )
 
 func (s *AppServer) isTrustedProxyPeer(r *http.Request) bool {
@@ -624,6 +625,7 @@ func (s *AppServer) applySetupDatabaseSelection(ctx context.Context, rawDriver, 
 	}
 
 	s.deps.Config.SetDBSpec(driver, dsn, simpleProto)
+	plugin.DiscardAllKVBuffers(s.deps.Store)
 	s.deps.Store.Swap(newStore)
 	if s.deps.Content != nil {
 		s.deps.Content.ResetAnalyticsBuffer()
@@ -635,12 +637,13 @@ func (s *AppServer) applySetupDatabaseSelection(ctx context.Context, rawDriver, 
 	return nil
 }
 
-// reloadRuntimeAfterDBRestore resets buffered analytics and reloads settings, WAF bans, GeoIP rules,
+// reloadRuntimeAfterDBRestore resets buffered analytics/KV deltas and reloads settings, WAF bans, GeoIP rules,
 // themes, external plugins, media dimensions, and public content/search caches after any DB swap or restore.
 func (s *AppServer) reloadRuntimeAfterDBRestore(ctx context.Context) {
 	if s == nil {
 		return
 	}
+	plugin.DiscardAllKVBuffers(s.deps.Store)
 	if s.deps.Content != nil {
 		s.deps.Content.ResetAnalyticsBuffer()
 	}
@@ -660,6 +663,15 @@ func (s *AppServer) reloadRuntimeAfterDBRestore(ctx context.Context) {
 	}
 	if s.deps.Geo != nil {
 		_ = s.deps.Geo.ReloadRules(ctx, s.deps.Store)
+	}
+	if s.deps.Catalog != nil {
+		if s.deps.Catalog.ExternalDir() == "" {
+			if dir := s.localesDir(); dir != "" {
+				_ = s.deps.Catalog.Reload(dir)
+			}
+		} else {
+			_ = s.deps.Catalog.ReloadDir()
+		}
 	}
 	if s.deps.Themes != nil {
 		_ = s.deps.Themes.Reload()
@@ -1423,7 +1435,11 @@ func (s *AppServer) executeLegacyImport(ctx context.Context, prep *preparedLegac
 		PreserveExistingAdmins: !allowDBSwap,
 	}
 
-	rep, err := etl.ImportLegacyArchive(ctx, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, prep.tmpPath, opts)
+	etlCtx := ctx
+	if s.deps.Config != nil {
+		etlCtx = etl.WithDataDir(etlCtx, s.deps.Config.DataDir)
+	}
+	rep, err := etl.ImportLegacyArchive(etlCtx, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, prep.tmpPath, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1847,6 +1863,10 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		AdminPasswordHash: adminPasswordHash,
 	}
 
+	etlCtx := r.Context()
+	if s.deps.Config != nil {
+		etlCtx = etl.WithDataDir(etlCtx, s.deps.Config.DataDir)
+	}
 	if dryRun {
 		prevalidatedDialect := normTargetDriver
 		if !s.isSameCurrentDB(normTargetDriver, normTargetDSN, targetSimple) {
@@ -1859,7 +1879,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 				prevalidatedDialect = dName
 			}
 		}
-		rep, insp, err := etl.ImportSourceDatabase(r.Context(), srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
+		rep, insp, err := etl.ImportSourceDatabase(etlCtx, srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
 		if writeBadErr(w, err) {
 			return
 		}
@@ -1881,7 +1901,7 @@ func (s *AppServer) handleSetupMigrateDB(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	rep, insp, err := etl.ImportSourceDatabase(r.Context(), srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
+	rep, insp, err := etl.ImportSourceDatabase(etlCtx, srcStore, s.deps.Store, s.deps.Settings, s.deps.Config.KeyRing, pfx, opts)
 	if writeBadErr(w, err) {
 		return
 	}

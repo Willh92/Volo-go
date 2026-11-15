@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -62,8 +63,15 @@ func IsPublicRoutableIP(addr netip.Addr) bool {
 // CheckHostAllowed verifies host against AllowedHosts (supports exact match or "*.example.com" wildcard).
 // When AllowedHosts is empty, any public hostname is allowed (subject to IP validation).
 func (d *OutboundSafeDialer) CheckHostAllowed(host string) error {
-	clean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	if clean == "" || clean == "localhost" || strings.HasSuffix(clean, ".localhost") || strings.HasSuffix(clean, ".internal") {
+	trimmed := strings.TrimSpace(host)
+	if strings.Contains(trimmed, "%") {
+		return fmt.Errorf("%w: IPv6 zone identifier prohibited in host %q", ErrSSRFBlocked, host)
+	}
+	clean := strings.ToLower(strings.TrimSuffix(trimmed, "."))
+	if clean == "" ||
+		clean == "localhost" || strings.HasSuffix(clean, ".localhost") ||
+		clean == "local" || strings.HasSuffix(clean, ".local") ||
+		clean == "internal" || strings.HasSuffix(clean, ".internal") {
 		if d.AllowLoopbackForTests && (clean == "127.0.0.1" || clean == "::1" || clean == "localhost") {
 			return nil
 		}
@@ -129,7 +137,7 @@ func (d *OutboundSafeDialer) DialContext(ctx context.Context, network string, ad
 
 	// Strict all-IP check: if ANY DNS record points to private/metadata space, block immediately!
 	for _, ip := range ips {
-		if d.AllowLoopbackForTests && ip.IsLoopback() {
+		if d.AllowLoopbackForTests && ip.Zone() == "" && ip.IsLoopback() {
 			continue
 		}
 		if !IsPublicRoutableIP(ip) {
@@ -161,7 +169,13 @@ func (d *OutboundSafeDialer) DialContext(ctx context.Context, network string, ad
 
 // ValidateOutboundURL ensures rawURL uses http or https without embedded credentials and passes host policy.
 func (d *OutboundSafeDialer) ValidateOutboundURL(rawURL string) (*url.URL, error) {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
+	trimmed := strings.TrimSpace(rawURL)
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] < 0x20 || trimmed[i] == 0x7f {
+			return nil, fmt.Errorf("%w: control characters prohibited in URL", ErrSSRFBlocked)
+		}
+	}
+	u, err := url.Parse(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid URL: %v", ErrSSRFBlocked, err)
 	}
@@ -172,12 +186,15 @@ func (d *OutboundSafeDialer) ValidateOutboundURL(rawURL string) (*url.URL, error
 	if u.User != nil {
 		return nil, fmt.Errorf("%w: embedded URL userinfo credentials prohibited", ErrSSRFBlocked)
 	}
+	if strings.Contains(u.Host, "%") {
+		return nil, fmt.Errorf("%w: IPv6 zone identifier prohibited in URL host %q", ErrSSRFBlocked, u.Host)
+	}
 	host := u.Hostname()
 	if err := d.CheckHostAllowed(host); err != nil {
 		return nil, err
 	}
 	if literal, lErr := netip.ParseAddr(host); lErr == nil {
-		if !(d.AllowLoopbackForTests && literal.Unmap().IsLoopback()) && !IsPublicRoutableIP(literal) {
+		if !(d.AllowLoopbackForTests && literal.Zone() == "" && literal.Unmap().IsLoopback()) && !IsPublicRoutableIP(literal) {
 			return nil, fmt.Errorf("%w: literal IP %s is non-public", ErrSSRFBlocked, literal.String())
 		}
 	}
@@ -207,6 +224,33 @@ func canonicalProxyHostPort(u *url.URL) string {
 	}
 }
 
+func proxyFromEnvDynamic(req *http.Request) (*url.URL, error) {
+	hp := os.Getenv("HTTP_PROXY")
+	if hp == "" {
+		hp = os.Getenv("http_proxy")
+	}
+	sp := os.Getenv("HTTPS_PROXY")
+	if sp == "" {
+		sp = os.Getenv("https_proxy")
+	}
+	if hp == "" && sp == "" {
+		return nil, nil
+	}
+	if os.Getenv("NO_PROXY") == "" && os.Getenv("no_proxy") == "" {
+		raw := hp
+		if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && sp != "" {
+			raw = sp
+		}
+		if raw != "" {
+			if !strings.Contains(raw, "://") {
+				raw = "http://" + raw
+			}
+			return url.Parse(raw)
+		}
+	}
+	return http.ProxyFromEnvironment(req)
+}
+
 // NewHTTPClient builds a hardened *http.Client using DNS-pinned SSRF protection, strict TLS>=1.2
 // certificate verification (InsecureSkipVerify=false ALWAYS), and max 3 validated redirects.
 func (d *OutboundSafeDialer) NewHTTPClient(timeout time.Duration) *http.Client {
@@ -222,7 +266,7 @@ func (d *OutboundSafeDialer) NewHTTPClient(timeout time.Duration) *http.Client {
 		KeepAlive: 30 * time.Second,
 	}
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: proxyFromEnvDynamic,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if approvedProxy, ok := ctx.Value(approvedProxyAddrKey{}).(string); ok && approvedProxy != "" && addr == approvedProxy {
 				return proxySocketDialer.DialContext(ctx, network, addr)
@@ -243,21 +287,36 @@ func (d *OutboundSafeDialer) NewHTTPClient(timeout time.Duration) *http.Client {
 	// Note: when HTTP_PROXY is NOT used or when dialing directly, DialContext enforces IP pinning;
 	// additionally CheckRedirect + RoundTripper pre-validate every target URL & DNS resolution!
 	return &http.Client{
-		Timeout:   timeout,
-		Transport: &ssrfValidatingRoundTripper{dialer: d, next: transport},
+		Timeout: timeout,
+		Transport: &ssrfValidatingRoundTripper{
+			dialer:    d,
+			next:      transport,
+			proxyFunc: transport.Proxy,
+		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
 				return errors.New("security: stopped after 3 redirects")
 			}
-			_, err := d.ValidateOutboundURL(req.URL.String())
-			return err
+			if len(via) > 0 && strings.EqualFold(via[len(via)-1].URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+				return fmt.Errorf("%w: redirect scheme downgrade from https to %q is prohibited", ErrSSRFBlocked, req.URL.Scheme)
+			}
+			if _, err := d.ValidateOutboundURL(req.URL.String()); err != nil {
+				return err
+			}
+			if len(via) > 0 && (!strings.EqualFold(via[0].URL.Host, req.URL.Host) || !strings.EqualFold(via[len(via)-1].URL.Host, req.URL.Host)) {
+				req.Header.Del("Authorization")
+				req.Header.Del("Proxy-Authorization")
+				req.Header.Del("Cookie")
+			}
+			return nil
 		},
 	}
 }
 
 type ssrfValidatingRoundTripper struct {
-	dialer *OutboundSafeDialer
-	next   http.RoundTripper
+	dialer    *OutboundSafeDialer
+	next      http.RoundTripper
+	proxyFunc func(*http.Request) (*url.URL, error)
 }
 
 func (rt *ssrfValidatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -269,32 +328,35 @@ func (rt *ssrfValidatingRoundTripper) RoundTrip(req *http.Request) (*http.Respon
 	if err := rt.dialer.CheckHostAllowed(host); err != nil {
 		return nil, err
 	}
-	// Always resolve and validate non-literal target hostnames against private/loopback/link-local/metadata
-	// IP ranges, even when an outbound HTTP_PROXY environment variable is configured.
-	if _, lErr := netip.ParseAddr(host); lErr != nil {
-		resolve := rt.dialer.Resolver
-		if resolve == nil {
-			resolve = func(ctx context.Context, h string) ([]netip.Addr, error) {
-				return net.DefaultResolver.LookupNetIP(ctx, "ip", h)
-			}
-		}
-		ips, rErr := resolve(req.Context(), host)
-		if rErr != nil {
-			return nil, fmt.Errorf("security: dns lookup %q: %w", host, rErr)
-		}
-		if len(ips) == 0 {
-			return nil, fmt.Errorf("%w: %q resolved to zero addresses", ErrSSRFBlocked, host)
-		}
-		for _, ip := range ips {
-			if !(rt.dialer.AllowLoopbackForTests && ip.Unmap().IsLoopback()) && !IsPublicRoutableIP(ip) {
-				return nil, fmt.Errorf("%w: resolved address %s for %q is non-public", ErrSSRFBlocked, ip.String(), host)
-			}
-		}
+
+	var proxyURL *url.URL
+	if rt.proxyFunc != nil {
+		proxyURL, _ = rt.proxyFunc(req)
 	}
 
-	// Only after the target req.URL.Hostname() has passed host & IP policy, allow the underlying
-	// transport to connect to a local/corporate HTTP proxy socket if configured in environment.
-	if proxyURL, pErr := http.ProxyFromEnvironment(req); pErr == nil && proxyURL != nil {
+	// Only run the pre-flight DNS LookupNetIP check when an outbound proxy URL is active.
+	// When dialing directly (proxyURL == nil), DialContext already resolves and pins the IP in a single lookup.
+	if proxyURL != nil {
+		if _, lErr := netip.ParseAddr(host); lErr != nil {
+			resolve := rt.dialer.Resolver
+			if resolve == nil {
+				resolve = func(ctx context.Context, h string) ([]netip.Addr, error) {
+					return net.DefaultResolver.LookupNetIP(ctx, "ip", h)
+				}
+			}
+			ips, rErr := resolve(req.Context(), host)
+			if rErr != nil {
+				return nil, fmt.Errorf("security: dns lookup %q: %w", host, rErr)
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("%w: %q resolved to zero addresses", ErrSSRFBlocked, host)
+			}
+			for _, ip := range ips {
+				if !(rt.dialer.AllowLoopbackForTests && ip.Zone() == "" && ip.Unmap().IsLoopback()) && !IsPublicRoutableIP(ip) {
+					return nil, fmt.Errorf("%w: resolved address %s for %q is non-public", ErrSSRFBlocked, ip.String(), host)
+				}
+			}
+		}
 		if proxyAddr := canonicalProxyHostPort(proxyURL); proxyAddr != "" {
 			req = req.WithContext(context.WithValue(req.Context(), approvedProxyAddrKey{}, proxyAddr))
 		}

@@ -35,6 +35,7 @@ type SchedulerOptions struct {
 	UploadDir      string
 	PluginsDir     string
 	ThemesDir      string
+	LocalesDir     string
 	OutboundDialer *security.OutboundSafeDialer
 	Logger         io.Writer
 }
@@ -155,6 +156,16 @@ func (s *Scheduler) GetThemesDir() string {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	return s.opts.ThemesDir
+}
+
+// GetLocalesDir returns the external locales directory configured on the scheduler.
+func (s *Scheduler) GetLocalesDir() string {
+	if s == nil {
+		return ""
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.opts.LocalesDir
 }
 
 // Start launches the background check loop until ctx is canceled or Close is called.
@@ -286,6 +297,9 @@ func (s *Scheduler) runCycle(ctx context.Context) (*RunResult, error) {
 	if err := os.MkdirAll(s.opts.BackupDir, 0o750); err != nil {
 		return nil, err
 	}
+	if s.opts.Store != nil {
+		_ = plugin.FlushAllKV(ctx, s.opts.Store)
+	}
 	cfg := s.opts.Settings.Snapshot().Backup
 	now := time.Now().UTC()
 	filename := fmt.Sprintf("volo-auto-%s-%03d.zip", now.Format("20060102-150405"), now.Nanosecond()/1e6)
@@ -296,6 +310,7 @@ func (s *Scheduler) runCycle(ctx context.Context) (*RunResult, error) {
 		UploadDir:    s.GetUploadDir(),
 		PluginsDir:   s.GetPluginsDir(),
 		ThemesDir:    s.GetThemesDir(),
+		LocalesDir:   s.GetLocalesDir(),
 	}); err != nil {
 		return nil, err
 	}

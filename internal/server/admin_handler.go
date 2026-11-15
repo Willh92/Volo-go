@@ -652,6 +652,17 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 		}
 		locale := s.resolveLocale(r)
 		maskedIP := security.MaskIP(s.clientIP(r))
+		stepUpVerified := false
+		ensureStepUp := func() bool {
+			if stepUpVerified {
+				return true
+			}
+			if !s.verifyStepUpPasswordStatus(w, r, actor.ID, req.CurrentPassword, http.StatusForbidden) {
+				return false
+			}
+			stepUpVerified = true
+			return true
+		}
 		if req.DisplayName != nil && strings.TrimSpace(*req.DisplayName) != "" {
 			nextDisp := strings.TrimSpace(repo.StripASCIIControls(*req.DisplayName))
 			if runes := []rune(nextDisp); len(runes) < 2 || len(runes) > 64 {
@@ -673,9 +684,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 					writeErrJSON(w, http.StatusBadRequest, "invalid email address")
 					return
 				}
-				ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
-				if !ok {
-					writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
+				if !ensureStepUp() {
 					return
 				}
 				fullUser.Email = nextEmail
@@ -757,9 +766,7 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			fullUser.PreferredLocale = s.deps.Catalog.Match(*req.PreferredLocale, "")
 		}
 		if req.NewPassword != "" {
-			ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
-			if !ok {
-				writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
+			if !ensureStepUp() {
 				return
 			}
 			if writeBadErr(w, auth.ValidatePasswordPolicy(req.NewPassword)) {
@@ -779,6 +786,9 @@ func (s *AppServer) handleAdminMe(w http.ResponseWriter, r *http.Request, actor 
 			fullUser.PasswordHash, fullUser.LegacyHash, fullUser.UpdatedAt, fullUser.ID)
 		if writeBadErr(w, err) {
 			return
+		}
+		if s.deps.Content != nil {
+			s.deps.Content.PurgeRuntimeCaches()
 		}
 		if req.NewPassword != "" {
 			curSessID := ""
@@ -822,24 +832,44 @@ func (s *AppServer) stepUpErrorMessage(r *http.Request, missing bool) string {
 }
 
 func (s *AppServer) verifyStepUpPassword(w http.ResponseWriter, r *http.Request, actorID string, candidate string) bool {
+	return s.verifyStepUpPasswordStatus(w, r, actorID, candidate, 0)
+}
+
+func (s *AppServer) verifyStepUpPasswordStatus(w http.ResponseWriter, r *http.Request, actorID string, candidate string, failStatus int) bool {
 	pwd := candidate
 	if strings.TrimSpace(pwd) == "" {
 		pwd = r.Header.Get("X-Volo-Current-Password")
 	}
 	if strings.TrimSpace(pwd) == "" {
-		writeErrJSON(w, http.StatusBadRequest, s.stepUpErrorMessage(r, true))
+		st := http.StatusBadRequest
+		if failStatus > 0 {
+			st = failStatus
+		}
+		writeErrJSON(w, st, s.stepUpErrorMessage(r, true))
 		return false
+	}
+	clientIP := s.clientIP(r)
+	if s.deps.WAF != nil && !s.deps.WAF.AllowRate("stepup:"+actorID, clientIP, 8, 5*time.Minute) {
+		writeErrJSON(w, http.StatusTooManyRequests, "too many password verification attempts, please try again later")
+		return false
+	}
+	wrongSt := http.StatusUnauthorized
+	if failStatus > 0 {
+		wrongSt = failStatus
 	}
 	var fullUser domain.User
 	err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actorID)
 	if err != nil {
-		writeErrJSON(w, http.StatusUnauthorized, s.stepUpErrorMessage(r, false))
+		writeErrJSON(w, wrongSt, s.stepUpErrorMessage(r, false))
 		return false
 	}
 	ok, _ := auth.VerifyPassword(pwd, fullUser.PasswordHash, fullUser.LegacyHash)
 	if !ok {
-		writeErrJSON(w, http.StatusUnauthorized, s.stepUpErrorMessage(r, false))
+		writeErrJSON(w, wrongSt, s.stepUpErrorMessage(r, false))
 		return false
+	}
+	if s.deps.WAF != nil {
+		s.deps.WAF.ResetRate("stepup:"+actorID, clientIP)
 	}
 	return true
 }
@@ -867,18 +897,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		if !decodeJSONBody(w, r, 8192, &req) {
 			return
 		}
-		var fullUser domain.User
-		err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actor.ID)
-		if err != nil {
-			writeErrJSON(w, http.StatusNotFound, "user not found")
-			return
-		}
-		if req.CurrentPassword == "" {
-			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
-			return
-		}
-		if ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash); !ok {
-			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
+		if !s.verifyStepUpPasswordStatus(w, r, actor.ID, req.CurrentPassword, http.StatusForbidden) {
 			return
 		}
 		codes, err := s.deps.Auth.EnrollTOTP(r.Context(), actor.ID, req.Secret, req.Code)
@@ -892,16 +911,10 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		var req struct {
 			CurrentPassword string `json:"current_password"`
 		}
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
-		var fullUser domain.User
-		err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actor.ID)
-		if err != nil {
-			writeErrJSON(w, http.StatusNotFound, "user not found")
+		if !decodeOptJSONBody(w, r, 4096, &req) {
 			return
 		}
-		ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash)
-		if !ok {
-			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
+		if !s.verifyStepUpPasswordStatus(w, r, actor.ID, req.CurrentPassword, http.StatusForbidden) {
 			return
 		}
 		_, _ = s.deps.Store.ExecContext(r.Context(),
@@ -948,18 +961,7 @@ func (s *AppServer) handleAdminSelfCredentials(w http.ResponseWriter, r *http.Re
 		if !decodeJSONBody(w, r, 65536, &req) {
 			return
 		}
-		var fullUser domain.User
-		err := sqlx.GetInto(r.Context(), s.deps.Store, &fullUser, `SELECT * FROM users WHERE id = ?`, actor.ID)
-		if err != nil {
-			writeErrJSON(w, http.StatusNotFound, "user not found")
-			return
-		}
-		if req.CurrentPassword == "" {
-			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
-			return
-		}
-		if ok, _ := auth.VerifyPassword(req.CurrentPassword, fullUser.PasswordHash, fullUser.LegacyHash); !ok {
-			writeErrJSON(w, http.StatusForbidden, "current_password is incorrect")
+		if !s.verifyStepUpPasswordStatus(w, r, actor.ID, req.CurrentPassword, http.StatusForbidden) {
 			return
 		}
 		cdBytes, err1 := base64.RawURLEncoding.DecodeString(req.ClientDataJSON)
@@ -4816,27 +4818,29 @@ func (s *AppServer) handleAdminMedia(w http.ResponseWriter, r *http.Request, act
 			maxMB = 25
 		}
 		maxBytes := int64(maxMB) << 20
-		r.Body = http.MaxBytesReader(w, r.Body, maxBytes+1024*1024)
-		if err := r.ParseMultipartForm(8 << 20); err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "upload exceeds maximum size")
+		uploaded, mErr := streamMultipartSingleFile(w, r, "file", maxBytes, s.ensureTempDir(), "volo-media-upload-", ".bin")
+		if mErr != nil {
+			writeErrJSON(w, http.StatusBadRequest, mErr.Error())
 			return
 		}
-		file, hdr, err := r.FormFile("file")
+		defer os.Remove(uploaded.TempPath)
+
+		file, err := os.Open(uploaded.TempPath)
 		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest, "missing 'file' field")
+			writeErrJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		defer file.Close()
 
-		uploadFilename := hdr.Filename
-		uploadContentType := hdr.Header.Get("Content-Type")
+		uploadFilename := uploaded.OrigFilename
+		uploadContentType := uploaded.ContentType
 		if s.deps.Plugins != nil {
 			res, hErr := s.deps.Plugins.DispatchHook(r.Context(), plugin.HookMediaBeforeUpload, map[string]any{
 				"uploader_id":   actor.ID,
 				"uploader_role": actor.Role,
 				"filename":      uploadFilename,
 				"content_type":  uploadContentType,
-				"size_bytes":    hdr.Size,
+				"size_bytes":    uploaded.SizeBytes,
 			})
 			if hErr != nil {
 				var rej *plugin.HookRejectedError
@@ -5044,37 +5048,12 @@ func sanitizeLocalUploadPrefix(raw string) string {
 }
 
 func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID string, origName string, r io.Reader, maxBytes int64) (*domain.MediaAsset, error) {
-	raw, err := readBoundedStream(r, maxBytes)
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) == 0 {
-		return nil, errors.New("empty upload")
+	if maxBytes <= 0 {
+		maxBytes = 25 << 20
 	}
 	ext, err := canonicalAllowedUploadExt(origName)
 	if err != nil {
 		return nil, err
-	}
-
-	mimeType := defaultReconcileMIMEType(ext, raw[:minInt(512, len(raw))])
-	exifStripped := false
-	var width, height int
-
-	if ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".gif" || ext == ".avif" {
-		cleanBytes, normMIME, w, h, changed, nErr := media.NormalizeLocalImageBytes(raw, ext)
-		if nErr != nil {
-			return nil, nErr
-		}
-		if changed && len(cleanBytes) > 0 {
-			raw = cleanBytes
-		}
-		mimeType = strings.ToLower(strings.TrimSpace(normMIME))
-		width, height = w, h
-		exifStripped = ext != ".gif" && ext != ".avif"
-	} else if strings.HasPrefix(mimeType, "image/") {
-		if cfg, _, iErr := image.DecodeConfig(strings.NewReader(string(raw))); iErr == nil {
-			width, height = cfg.Width, cfg.Height
-		}
 	}
 
 	now := time.Now()
@@ -5092,10 +5071,85 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(dest, raw, 0o640); err != nil {
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(dest), ".volo-upload-*"+ext)
+	if err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256(raw)
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	hasher := sha256.New()
+	var headBuf [512]byte
+	headLen := 0
+	sniffWriter := writerFunc(func(p []byte) (int, error) {
+		if headLen < len(headBuf) {
+			n := copy(headBuf[headLen:], p)
+			headLen += n
+		}
+		return len(p), nil
+	})
+	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher, sniffWriter), io.LimitReader(r, maxBytes+1))
+	closeErr := tmpFile.Close()
+	if copyErr != nil {
+		return nil, copyErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if written <= 0 {
+		return nil, errors.New("empty upload")
+	}
+	if written > maxBytes {
+		return nil, fmt.Errorf("upload exceeds maximum size of %d bytes", maxBytes)
+	}
+
+	mimeType := defaultReconcileMIMEType(ext, headBuf[:headLen])
+	exifStripped := false
+	var width, height int
+	shaHex := hex.EncodeToString(hasher.Sum(nil))
+	sizeBytes := written
+
+	if ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".gif" || ext == ".avif" {
+		raw, rErr := os.ReadFile(tmpPath)
+		if rErr != nil {
+			return nil, rErr
+		}
+		cleanBytes, normMIME, w, h, changed, nErr := media.NormalizeLocalImageBytes(raw, ext)
+		if nErr != nil {
+			return nil, nErr
+		}
+		if changed && len(cleanBytes) > 0 {
+			if wErr := os.WriteFile(tmpPath, cleanBytes, 0o640); wErr != nil {
+				return nil, wErr
+			}
+			sum := sha256.Sum256(cleanBytes)
+			shaHex = hex.EncodeToString(sum[:])
+			sizeBytes = int64(len(cleanBytes))
+		}
+		mimeType = strings.ToLower(strings.TrimSpace(normMIME))
+		width, height = w, h
+		exifStripped = ext != ".gif" && ext != ".avif"
+	} else if strings.HasPrefix(mimeType, "image/") {
+		if imgF, oErr := os.Open(tmpPath); oErr == nil {
+			if cfg, _, iErr := image.DecodeConfig(imgF); iErr == nil {
+				width, height = cfg.Width, cfg.Height
+			}
+			_ = imgF.Close()
+		}
+	}
+
+	_ = os.Chmod(tmpPath, 0o640)
+	if err := os.Rename(tmpPath, dest); err != nil {
+		return nil, err
+	}
+	cleanupTmp = false
+
 	asset := domain.MediaAsset{
 		ID:            id.Next(),
 		StorageDriver: "local",
@@ -5104,10 +5158,10 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 		OriginalName:  filepath.Base(origName),
 		AltText:       "",
 		MIMEType:      mimeType,
-		SizeBytes:     int64(len(raw)),
+		SizeBytes:     sizeBytes,
 		Width:         width,
 		Height:        height,
-		SHA256:        hex.EncodeToString(sum[:]),
+		SHA256:        shaHex,
 		EXIFStripped:  exifStripped,
 		UploaderID:    uploaderID,
 		CreatedAt:     now.UnixMilli(),
@@ -5120,6 +5174,12 @@ func (s *AppServer) saveFallbackLocalMedia(ctx context.Context, uploaderID strin
 		return nil, err
 	}
 	return &asset, nil
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (fn writerFunc) Write(p []byte) (int, error) {
+	return fn(p)
 }
 
 func dedupCleanIDs(raw []string, maxCount int) []string {

@@ -77,11 +77,13 @@ type CachedDocument struct {
 }
 
 type feedCacheEntry struct {
-	dataRev     uint64
-	settingsRev uint64
-	seq         uint64
-	doc         CachedDocument
-	cost        int
+	dataRev       uint64
+	settingsRev   uint64
+	renderSalt    string
+	sanitizerHash string
+	seq           uint64
+	doc           CachedDocument
+	cost          int
 }
 
 type tzArchiveCacheEntry struct {
@@ -105,7 +107,8 @@ type cachedArticleDetail struct {
 }
 
 type serviceCacheState struct {
-	redirects atomic.Pointer[redirectTableSnapshot]
+	redirectMu sync.Mutex
+	redirects  atomic.Pointer[redirectTableSnapshot]
 
 	chromeMu sync.Mutex
 	chrome   atomic.Pointer[publicChromeSnapshot]
@@ -113,15 +116,25 @@ type serviceCacheState struct {
 	archiveTZMu sync.RWMutex
 	archiveByTZ map[string]tzArchiveCacheEntry
 
-	feedMu   sync.RWMutex
-	feedDocs map[string]feedCacheEntry
-	feedUsed int
-	feedSeq  uint64
+	docBuildLocks [32]sync.Mutex
+	feedMu        sync.RWMutex
+	feedDocs      map[string]feedCacheEntry
+	feedUsed      int
+	feedSeq       uint64
 
 	articleHTMLMu    sync.Mutex
 	articleHTMLLL    *list.List
 	articleHTMLItems map[string]*list.Element
 	articleHTMLUsed  int
+}
+
+func hashDocBuildStripe(key string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return h
 }
 
 func newServiceCacheState() *serviceCacheState {
@@ -250,6 +263,14 @@ func (s *Service) PurgeRuntimeCaches() {
 
 func (s *Service) getRedirectSnapshot(ctx context.Context) (*redirectTableSnapshot, error) {
 	curRev, curSettingsRev := s.currentRevisions()
+	if snap := s.caches.redirects.Load(); snap != nil && snap.dataRev == curRev && snap.settingsRev == curSettingsRev {
+		return snap, nil
+	}
+
+	s.caches.redirectMu.Lock()
+	defer s.caches.redirectMu.Unlock()
+
+	curRev, curSettingsRev = s.currentRevisions()
 	if snap := s.caches.redirects.Load(); snap != nil && snap.dataRev == curRev && snap.settingsRev == curSettingsRev {
 		return snap, nil
 	}
@@ -504,9 +525,30 @@ func (s *Service) getOrBuildCachedDoc(
 	buildFn func(context.Context) ([]byte, error),
 ) (CachedDocument, error) {
 	dRev, sRev := s.currentRevisions()
+	rSalt := s.renderCacheSalt()
+	sanHash := s.currentSanitizerHash()
 
 	s.caches.feedMu.RLock()
-	if hit, ok := s.caches.feedDocs[cacheKey]; ok && hit.dataRev == dRev && hit.settingsRev == sRev {
+	if hit, ok := s.caches.feedDocs[cacheKey]; ok &&
+		hit.dataRev == dRev && hit.settingsRev == sRev &&
+		hit.renderSalt == rSalt && hit.sanitizerHash == sanHash {
+		s.caches.feedMu.RUnlock()
+		return hit.doc, nil
+	}
+	s.caches.feedMu.RUnlock()
+
+	stripe := hashDocBuildStripe(cacheKey) % uint32(len(s.caches.docBuildLocks))
+	s.caches.docBuildLocks[stripe].Lock()
+	defer s.caches.docBuildLocks[stripe].Unlock()
+
+	dRev, sRev = s.currentRevisions()
+	rSalt = s.renderCacheSalt()
+	sanHash = s.currentSanitizerHash()
+
+	s.caches.feedMu.RLock()
+	if hit, ok := s.caches.feedDocs[cacheKey]; ok &&
+		hit.dataRev == dRev && hit.settingsRev == sRev &&
+		hit.renderSalt == rSalt && hit.sanitizerHash == sanHash {
 		s.caches.feedMu.RUnlock()
 		return hit.doc, nil
 	}
@@ -517,7 +559,13 @@ func (s *Service) getOrBuildCachedDoc(
 		return CachedDocument{}, err
 	}
 
-	sum := sha256.Sum256(raw)
+	h := sha256.New()
+	_, _ = h.Write(raw)
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(rSalt))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(sanHash))
+	sum := h.Sum(nil)
 	etag := fmt.Sprintf(`"v%d-%d-%s"`, dRev, sRev, hex.EncodeToString(sum[:8]))
 
 	var gzBytes []byte
@@ -538,12 +586,12 @@ func (s *Service) getOrBuildCachedDoc(
 		ContentType: contentType,
 	}
 
-	cost := len(cacheKey) + len(raw) + len(gzBytes) + 64
+	cost := len(cacheKey) + len(raw) + len(gzBytes) + len(rSalt) + len(sanHash) + 64
 	if cost <= maxFeedCacheBytes/2 {
 		s.caches.feedMu.Lock()
-		// Evict stale-revision entries first.
+		// Evict stale-revision or stale-salt entries first.
 		for k, v := range s.caches.feedDocs {
-			if v.dataRev != dRev || v.settingsRev != sRev {
+			if v.dataRev != dRev || v.settingsRev != sRev || v.renderSalt != rSalt || v.sanitizerHash != sanHash {
 				s.caches.feedUsed -= v.cost
 				delete(s.caches.feedDocs, k)
 			}
@@ -578,11 +626,13 @@ func (s *Service) getOrBuildCachedDoc(
 		}
 		s.caches.feedSeq++
 		s.caches.feedDocs[cacheKey] = feedCacheEntry{
-			dataRev:     dRev,
-			settingsRev: sRev,
-			seq:         s.caches.feedSeq,
-			doc:         doc,
-			cost:        cost,
+			dataRev:       dRev,
+			settingsRev:   sRev,
+			renderSalt:    rSalt,
+			sanitizerHash: sanHash,
+			seq:           s.caches.feedSeq,
+			doc:           doc,
+			cost:          cost,
 		}
 		s.caches.feedUsed += cost
 		s.caches.feedMu.Unlock()

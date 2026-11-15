@@ -41,8 +41,7 @@ jobs:
             echo "FAIL: banned legacy coupling identifier detected in source" >&2
             exit 1
           fi
-          python3 .github/scripts/package-plugin.py --plugin kanbanniang --print-meta >/dev/null
-          python3 .github/scripts/package-plugin.py --plugin sensitive-words --print-meta >/dev/null
+          python3 .github/scripts/package-plugin.py --verify-all-meta >/dev/null
           sh -n scripts/install-service.sh
           sh -n scripts/install-service-linux.sh
           sh -n scripts/install-service-macos.sh

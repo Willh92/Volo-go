@@ -94,7 +94,7 @@ func Run(ctx context.Context, cfg *config.Config, store *sqlx.Store) *Report {
 	add(checkCryptoAndSecrets(ctx, cfg, store))
 
 	// 3. Database Connectivity, Dialect, Schema Version & WAL/FK Invariants
-	add(checkDatabase(ctx, store))
+	add(checkDatabase(ctx, cfg, store))
 
 	// 4. Writable Directories Probe (DataDir, UploadDir, BackupDir)
 	add(checkWritableDirs(cfg))
@@ -183,8 +183,73 @@ func checkRuntime() CheckResult {
 	}
 }
 
+func verifyAppearanceThemeConfigSecrets(kr *config.KeyRing, rawJSON string) (string, string, error) {
+	if kr == nil || strings.TrimSpace(rawJSON) == "" {
+		return "", "", nil
+	}
+	var payload struct {
+		ThemeConfigs map[string]map[string]any `json:"theme_configs"`
+	}
+	if err := json.Unmarshal([]byte(rawJSON), &payload); err != nil || len(payload.ThemeConfigs) == 0 {
+		return "", "", nil
+	}
+	var walk func(v any, aad string) error
+	walk = func(v any, aad string) error {
+		switch tv := v.(type) {
+		case string:
+			if strings.HasPrefix(tv, "enc:v1:") {
+				if _, err := kr.OpenString(tv, aad); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, elem := range tv {
+				if err := walk(elem, aad); err != nil {
+					return err
+				}
+			}
+		case map[string]any:
+			for _, elem := range tv {
+				if err := walk(elem, aad); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	for themeID, cfgMap := range payload.ThemeConfigs {
+		cleanTheme := strings.TrimSpace(themeID)
+		for key, val := range cfgMap {
+			cleanKey := strings.TrimSpace(key)
+			aad := "theme.config:" + cleanTheme + ":" + cleanKey
+			if err := walk(val, aad); err != nil {
+				return cleanTheme, cleanKey, err
+			}
+		}
+	}
+	return "", "", nil
+}
+
 func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.Store) CheckResult {
-	if cfg == nil || cfg.KeyRing == nil {
+	if cfg == nil {
+		return CheckResult{
+			Name:    "secret_key",
+			Status:  StatusFail,
+			Code:    "secret_uninit",
+			Summary: "KeyRing is uninitialized",
+		}
+	}
+	if strings.HasPrefix(cfg.SecretKeySource, "missing:") {
+		missingPath := cleanDisplayPath(strings.TrimPrefix(cfg.SecretKeySource, "missing:"))
+		return CheckResult{
+			Name:    "secret_key",
+			Status:  StatusWarn,
+			Code:    "secret_missing_warn",
+			Params:  map[string]string{"path": missingPath},
+			Summary: fmt.Sprintf("secret key file %s not initialized yet and VOLO_SECRET_KEY unset (will be auto-generated on first volo serve)", missingPath),
+		}
+	}
+	if cfg.KeyRing == nil {
 		return CheckResult{
 			Name:    "secret_key",
 			Status:  StatusFail,
@@ -241,21 +306,155 @@ func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.
 		}
 	}
 
-	// Verify existing encrypted secrets in settings table can be opened with active KeyRing
+	// 1/8: Verify data/db.json if present on disk
+	if strings.TrimSpace(cfg.DataDir) != "" {
+		if _, wErr := config.LoadWizardDBConfig(cfg.DataDir, cfg.KeyRing); wErr != nil {
+			return CheckResult{
+				Name:    "secret_key",
+				Status:  StatusWarn,
+				Code:    "secret_mismatch_warn",
+				Params:  map[string]string{"domain": "db.json", "store": "db.json"},
+				Summary: fmt.Sprintf("data/db.json dsn_ciphertext cannot be decrypted with current VOLO_SECRET_KEY: %v", wErr),
+			}
+		}
+	}
+
+	// Verify existing encrypted secrets across all 7 database secret stores
 	if store != nil {
-		var rows []domain.SettingRecord
-		qErr := sqlx.SelectInto(ctx, store, &rows,
-			`SELECT domain, secret_ciphertext FROM settings WHERE secret_ciphertext <> ''`)
-		if qErr == nil {
-			for _, r := range rows {
+		// 2/8: settings.secret_ciphertext
+		var settingRows []domain.SettingRecord
+		if qErr := sqlx.SelectInto(ctx, store, &settingRows,
+			`SELECT domain, secret_ciphertext FROM settings WHERE secret_ciphertext <> ''`); qErr == nil {
+			for _, r := range settingRows {
 				if _, oErr := cfg.KeyRing.OpenString(r.SecretCiphertext, "settings:"+r.Domain); oErr != nil {
 					return CheckResult{
 						Name:    "secret_key",
 						Status:  StatusWarn,
 						Code:    "secret_mismatch_warn",
-						Params:  map[string]string{"domain": r.Domain},
+						Params:  map[string]string{"domain": r.Domain, "store": "settings"},
 						Summary: fmt.Sprintf("settings.%s secret_ciphertext cannot be decrypted with current VOLO_SECRET_KEY (re-enter secret after cross-machine restore)", r.Domain),
 					}
+				}
+			}
+		}
+
+		// 3/8: user_credentials.secret_ciphertext (kind='totp')
+		var totpRows []struct {
+			UserID           string `db:"user_id"`
+			SecretCiphertext string `db:"secret_ciphertext"`
+		}
+		if qErr := sqlx.SelectInto(ctx, store, &totpRows,
+			`SELECT user_id, secret_ciphertext FROM user_credentials WHERE kind = 'totp' AND secret_ciphertext <> ''`); qErr == nil {
+			for _, r := range totpRows {
+				if _, oErr := cfg.KeyRing.OpenString(r.SecretCiphertext, "cred:totp:"+r.UserID); oErr != nil {
+					return CheckResult{
+						Name:    "secret_key",
+						Status:  StatusWarn,
+						Code:    "secret_mismatch_warn",
+						Params:  map[string]string{"domain": "user_credentials.totp", "store": "user_credentials", "user_id": r.UserID},
+						Summary: fmt.Sprintf("user_credentials(totp) for user %s cannot be decrypted with current VOLO_SECRET_KEY", r.UserID),
+					}
+				}
+			}
+		}
+
+		// 4/8: plugins.secret_ciphertext
+		var pluginRows []struct {
+			ID               string `db:"id"`
+			SecretCiphertext string `db:"secret_ciphertext"`
+		}
+		if qErr := sqlx.SelectInto(ctx, store, &pluginRows,
+			`SELECT id, secret_ciphertext FROM plugins WHERE secret_ciphertext <> ''`); qErr == nil {
+			sb := cfg.KeyRing.SecretBox()
+			for _, r := range pluginRows {
+				if _, oErr := sb.Open(r.SecretCiphertext); oErr != nil {
+					return CheckResult{
+						Name:    "secret_key",
+						Status:  StatusWarn,
+						Code:    "secret_mismatch_warn",
+						Params:  map[string]string{"domain": "plugins." + r.ID, "store": "plugins", "plugin_id": r.ID},
+						Summary: fmt.Sprintf("plugins.%s secret_ciphertext cannot be decrypted with current VOLO_SECRET_KEY", r.ID),
+					}
+				}
+			}
+		}
+
+		// 5/8: webhooks.secret_ciphertext
+		var webhookRows []struct {
+			ID               string `db:"id"`
+			SecretCiphertext string `db:"secret_ciphertext"`
+		}
+		if qErr := sqlx.SelectInto(ctx, store, &webhookRows,
+			`SELECT id, secret_ciphertext FROM webhooks WHERE secret_ciphertext <> ''`); qErr == nil {
+			for _, r := range webhookRows {
+				if _, oErr := cfg.KeyRing.OpenStringFallback(r.SecretCiphertext, config.WebhookSecretAAD(r.ID), "webhooks:secret:"+r.ID); oErr != nil {
+					return CheckResult{
+						Name:    "secret_key",
+						Status:  StatusWarn,
+						Code:    "secret_mismatch_warn",
+						Params:  map[string]string{"domain": "webhooks." + r.ID, "store": "webhooks", "webhook_id": r.ID},
+						Summary: fmt.Sprintf("webhooks.%s secret_ciphertext cannot be decrypted with current VOLO_SECRET_KEY", r.ID),
+					}
+				}
+			}
+		}
+
+		// 6/8: articles.password_ciphertext
+		var articleRows []struct {
+			ID                 string `db:"id"`
+			PasswordCiphertext string `db:"password_ciphertext"`
+		}
+		if qErr := sqlx.SelectInto(ctx, store, &articleRows,
+			`SELECT id, password_ciphertext FROM articles WHERE password_ciphertext <> ''`); qErr == nil {
+			for _, r := range articleRows {
+				if _, oErr := cfg.KeyRing.OpenStringFallback(r.PasswordCiphertext, config.ArticlePasswordAAD(r.ID), "articles:password:"+r.ID); oErr != nil {
+					return CheckResult{
+						Name:    "secret_key",
+						Status:  StatusWarn,
+						Code:    "secret_mismatch_warn",
+						Params:  map[string]string{"domain": "articles." + r.ID, "store": "articles", "article_id": r.ID},
+						Summary: fmt.Sprintf("articles.%s password_ciphertext cannot be decrypted with current VOLO_SECRET_KEY", r.ID),
+					}
+				}
+			}
+		}
+
+		// 7/8: comments.notify_email_ciphertext
+		var commentRows []struct {
+			ID                    string `db:"id"`
+			NotifyEmailCiphertext string `db:"notify_email_ciphertext"`
+		}
+		if qErr := sqlx.SelectInto(ctx, store, &commentRows,
+			`SELECT id, notify_email_ciphertext FROM comments WHERE notify_email_ciphertext <> ''`); qErr == nil {
+			for _, r := range commentRows {
+				if _, oErr := cfg.KeyRing.OpenStringFallback(
+					r.NotifyEmailCiphertext,
+					config.CommentNotifyEmailAAD(r.ID),
+					"comments:notify_email:"+r.ID,
+					"comments:email:"+r.ID,
+					"comment:email",
+				); oErr != nil {
+					return CheckResult{
+						Name:    "secret_key",
+						Status:  StatusWarn,
+						Code:    "secret_mismatch_warn",
+						Params:  map[string]string{"domain": "comments." + r.ID, "store": "comments", "comment_id": r.ID},
+						Summary: fmt.Sprintf("comments.%s notify_email_ciphertext cannot be decrypted with current VOLO_SECRET_KEY", r.ID),
+					}
+				}
+			}
+		}
+
+		// 8/8: settings(appearance).value_json -> theme_configs[themeID][key] ("enc:v1:...")
+		var appJSON string
+		if qErr := store.QueryRowContext(ctx, store.Dialect().Rebind(`SELECT value_json FROM settings WHERE domain = ?`), "appearance").Scan(&appJSON); qErr == nil && appJSON != "" {
+			if badTheme, badKey, tErr := verifyAppearanceThemeConfigSecrets(cfg.KeyRing, appJSON); tErr != nil {
+				return CheckResult{
+					Name:    "secret_key",
+					Status:  StatusWarn,
+					Code:    "secret_mismatch_warn",
+					Params:  map[string]string{"domain": "appearance.theme_configs." + badTheme + "." + badKey, "store": "appearance.theme_configs", "theme": badTheme, "key": badKey},
+					Summary: fmt.Sprintf("appearance.theme_configs.%s.%s secret cannot be decrypted with current VOLO_SECRET_KEY", badTheme, badKey),
 				}
 			}
 		}
@@ -271,8 +470,20 @@ func checkCryptoAndSecrets(ctx context.Context, cfg *config.Config, store *sqlx.
 	}
 }
 
-func checkDatabase(ctx context.Context, store *sqlx.Store) CheckResult {
+func checkDatabase(ctx context.Context, cfg *config.Config, store *sqlx.Store) CheckResult {
 	if store == nil {
+		if cfg != nil && cfg.DBDriver == "sqlite" && cfg.DBDSN != "" && cfg.DBDSN != ":memory:" {
+			if _, statErr := os.Stat(cfg.DBDSN); os.IsNotExist(statErr) {
+				dispDSN := cleanDisplayPath(cfg.DBDSN)
+				return CheckResult{
+					Name:    "database",
+					Status:  StatusWarn,
+					Code:    "db_uninitialized",
+					Params:  map[string]string{"dialect": "sqlite", "dsn": dispDSN},
+					Summary: fmt.Sprintf("sqlite database file %s does not exist yet (will be created on first volo serve)", dispDSN),
+				}
+			}
+		}
 		return CheckResult{
 			Name:    "database",
 			Status:  StatusFail,
@@ -322,15 +533,30 @@ func checkDatabase(ctx context.Context, store *sqlx.Store) CheckResult {
 		}
 	}
 
+	pingStr := latency.Round(10 * time.Microsecond).String()
 	extra := ""
 	if dName == "sqlite" {
 		var jm string
 		_ = store.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&jm)
 		var fk int
 		_ = store.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk)
-		extra = fmt.Sprintf(", journal_mode=%s, foreign_keys=%d", strings.ToLower(jm), fk)
+		jmLower := strings.ToLower(strings.TrimSpace(jm))
+		extra = fmt.Sprintf(", journal_mode=%s, foreign_keys=%d", jmLower, fk)
+		if jmLower != "wal" {
+			return CheckResult{
+				Name:   "database",
+				Status: StatusWarn,
+				Code:   "db_sqlite_not_wal",
+				Params: map[string]string{
+					"dialect":      dName,
+					"version":      strconv.Itoa(latestVer),
+					"journal_mode": jmLower,
+					"ping":         pingStr,
+				},
+				Summary: fmt.Sprintf("dialect=%s, schema=v%d, ping=%s%s (expected journal_mode=wal)", dName, latestVer, pingStr, extra),
+			}
+		}
 	}
-	pingStr := latency.Round(10 * time.Microsecond).String()
 
 	return CheckResult{
 		Name:   "database",
@@ -343,6 +569,59 @@ func checkDatabase(ctx context.Context, store *sqlx.Store) CheckResult {
 			"extra":   extra,
 		},
 		Summary: fmt.Sprintf("dialect=%s, schema=v%d, ping=%s%s", dName, latestVer, pingStr, extra),
+	}
+}
+
+func probeDirWritableReadOnly(rawDir string) error {
+	trimmed := strings.TrimSpace(rawDir)
+	if trimmed == "" {
+		return fmt.Errorf("directory path is empty")
+	}
+	absDir, err := filepath.Abs(trimmed)
+	if err != nil {
+		return err
+	}
+	st, statErr := os.Stat(absDir)
+	if statErr == nil {
+		if !st.IsDir() {
+			return fmt.Errorf("path exists and is not a directory")
+		}
+		f, wErr := os.CreateTemp(absDir, ".volo-doctor-*")
+		if wErr != nil {
+			return wErr
+		}
+		name := f.Name()
+		_ = f.Close()
+		_ = os.Remove(name)
+		return nil
+	}
+	if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	cur := filepath.Dir(absDir)
+	for {
+		pst, pErr := os.Stat(cur)
+		if pErr == nil {
+			if !pst.IsDir() {
+				return fmt.Errorf("ancestor %s is not a directory", cur)
+			}
+			f, wErr := os.CreateTemp(cur, ".volo-doctor-*")
+			if wErr != nil {
+				return wErr
+			}
+			name := f.Name()
+			_ = f.Close()
+			_ = os.Remove(name)
+			return nil
+		}
+		if !os.IsNotExist(pErr) {
+			return pErr
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return pErr
+		}
+		cur = parent
 	}
 }
 
@@ -366,17 +645,7 @@ func checkWritableDirs(cfg *config.Config) CheckResult {
 	}
 	for _, t := range targets {
 		dispDir := cleanDisplayPath(t.dir)
-		if err := os.MkdirAll(t.dir, 0o750); err != nil {
-			return CheckResult{
-				Name:    "directories",
-				Status:  StatusFail,
-				Code:    "dirs_mkdir_err",
-				Params:  map[string]string{"label": t.label, "dir": dispDir, "err": err.Error()},
-				Summary: fmt.Sprintf("cannot create %s dir %s: %v", t.label, dispDir, err),
-			}
-		}
-		probePath := filepath.Join(t.dir, fmt.Sprintf(".volo-doctor-%d.tmp", os.Getpid()))
-		if err := os.WriteFile(probePath, []byte("ok"), 0o600); err != nil {
+		if err := probeDirWritableReadOnly(t.dir); err != nil {
 			return CheckResult{
 				Name:    "directories",
 				Status:  StatusFail,
@@ -385,7 +654,6 @@ func checkWritableDirs(cfg *config.Config) CheckResult {
 				Summary: fmt.Sprintf("%s dir %s is not writable: %v", t.label, dispDir, err),
 			}
 		}
-		_ = os.Remove(probePath)
 	}
 	dData := cleanDisplayPath(cfg.DataDir)
 	dUploads := cleanDisplayPath(uploadDir)

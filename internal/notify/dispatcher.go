@@ -330,24 +330,26 @@ func (d *Dispatcher) dispatchCommentNotifications(ctx context.Context, view cont
 	title, targetPath := d.resolveTargetTitleAndPath(ctx, in.TargetType, in.TargetID)
 	fullURL := d.getPublicURL() + targetPath + "#comment-" + view.ID
 
-	// 1. Dispatch Webhooks & Plugin Notifiers
-	d.BroadcastWebhookEvent(ctx, WebhookEvent{
-		Event:     "comment.created",
-		SiteTitle: snap.Site.Title,
-		Title: d.catalog.T(snap.Site.DefaultLocale, "notify.new_comment.subject", map[string]any{
-			"site":  snap.Site.Title,
-			"title": title,
-		}),
-		Body:      view.AuthorName + ": " + truncatePlain(in.ContentMD, 200),
-		TargetURL: fullURL,
-		Timestamp: time.Now().Unix(),
-		Extra: map[string]any{
-			"comment_id":  view.ID,
-			"target_type": in.TargetType,
-			"target_id":   in.TargetID,
-			"status":      view.Status,
-		},
-	})
+	// 1. Dispatch Webhooks & Plugin Notifiers ONLY for approved comments (preventing pending spam webhook amplification)
+	if view.Status == domain.CommentStatusApproved {
+		d.BroadcastWebhookEvent(ctx, WebhookEvent{
+			Event:     "comment.created",
+			SiteTitle: snap.Site.Title,
+			Title: d.catalog.T(snap.Site.DefaultLocale, "notify.new_comment.subject", map[string]any{
+				"site":  snap.Site.Title,
+				"title": title,
+			}),
+			Body:      view.AuthorName + ": " + truncatePlain(in.ContentMD, 200),
+			TargetURL: fullURL,
+			Timestamp: time.Now().Unix(),
+			Extra: map[string]any{
+				"comment_id":  view.ID,
+				"target_type": in.TargetType,
+				"target_id":   in.TargetID,
+				"status":      view.Status,
+			},
+		})
+	}
 
 	if !snap.Notifications.SMTPEnabled {
 		return
@@ -551,6 +553,7 @@ func (d *Dispatcher) decryptCommentNotifyEmail(ctx context.Context, c domain.Com
 		plain, err := d.keys.OpenStringFallback(
 			c.NotifyEmailCiphertext,
 			config.CommentNotifyEmailAAD(c.ID),
+			"comments:notify_email:"+c.ID,
 			"comments:email:"+c.ID,
 			"comment:email",
 		)
@@ -588,7 +591,7 @@ func (d *Dispatcher) resolveTargetTitleAndPath(ctx context.Context, targetType, 
 		return "Page", "/"
 	}
 	var art domain.RawArticle
-	err := sqlx.GetInto(ctx, d.store, &art, `SELECT title, slug, published_at, created_at FROM articles WHERE id = ?`, targetID)
+	err := sqlx.GetInto(ctx, d.store, &art, `SELECT title, slug, password_ciphertext, published_at, created_at FROM articles WHERE id = ?`, targetID)
 	if err == nil {
 		pubAt := art.PublishedAt
 		if pubAt <= 0 {
@@ -600,7 +603,11 @@ func (d *Dispatcher) resolveTargetTitleAndPath(ctx context.Context, targetType, 
 			style = snap.SEO.PostPermalinkStyle
 			tz = snap.Site.TimeZone
 		}
-		return art.Title, visibility.FormatArticlePath(style, art.Slug, pubAt, tz)
+		title := art.Title
+		if strings.TrimSpace(art.PasswordCiphertext) != "" {
+			title = "[Protected Article]"
+		}
+		return title, visibility.FormatArticlePath(style, art.Slug, pubAt, tz)
 	}
 	return "Post", "/"
 }

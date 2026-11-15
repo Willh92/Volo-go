@@ -60,8 +60,8 @@ func (s *Service) ListBooksPage(ctx context.Context, q string, page, perPage int
 	var whereSQL string
 	var whereArgs []any
 	if cleanQ != "" {
-		pat := "%" + strings.ToLower(cleanQ) + "%"
-		whereSQL = " WHERE LOWER(title) LIKE ? OR LOWER(slug) LIKE ? OR LOWER(description) LIKE ? OR LOWER(source_url) LIKE ?"
+		pat := "%" + escapeContentLikePattern(strings.ToLower(cleanQ)) + "%"
+		whereSQL = " WHERE LOWER(title) LIKE ? ESCAPE '!' OR LOWER(slug) LIKE ? ESCAPE '!' OR LOWER(description) LIKE ? ESCAPE '!' OR LOWER(source_url) LIKE ? ESCAPE '!'"
 		whereArgs = []any{pat, pat, pat, pat}
 	}
 

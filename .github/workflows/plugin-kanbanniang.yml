@@ -1,18 +1,19 @@
-name: Package Kanbanniang Plugin
+name: Package Official Extensions
 
 on:
   push:
     branches: ["main"]
     paths:
-      - "plugins/kanbanniang/**"
-      - "plugins/catalog.json"
+      - "plugins/**"
+      - "themes/**"
+      - "locales/**"
       - ".github/scripts/package-plugin.py"
       - ".github/scripts/minify-plugin-assets.mjs"
       - ".github/workflows/plugin-kanbanniang.yml"
   workflow_dispatch:
     inputs:
       force_republish:
-        description: "Force rebuild and republish even if current manifest version release already exists"
+        description: "Force rebuild and republish unified extensions bundle even if all assets exist"
         required: false
         type: boolean
         default: false
@@ -20,67 +21,80 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: plugin-kanbanniang-release
-  cancel-in-progress: false
-
 jobs:
-  publish-plugin:
-    name: Check Version & Publish Standalone Kanbanniang ZIP
+  publish-extensions-bundle:
+    name: Publish Unified Extensions Release Bundle
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: official-extensions-bundle-release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
-      - name: Sparse checkout plugin metadata & packager
+      - name: Sparse checkout extension catalogs, manifests & packager
         uses: actions/checkout@v7
         with:
           sparse-checkout: |
-            .github/scripts/package-plugin.py
-            plugins/catalog.json
-            plugins/kanbanniang/manifest.json
-            plugins/kanbanniang/main.js
+            /.github/scripts/package-plugin.py
+            /plugins/catalog.json
+            /plugins/*/manifest.json
+            /plugins/*/main.js
+            /themes/catalog.json
+            /themes/*/theme.json
+            /locales/*.json
           sparse-checkout-cone-mode: false
 
-      - name: Resolve Plugin Version & Check If Already Published
+      - name: Verify Extension Catalogs & Check If Unified Bundle Release Exists
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           FORCE_REPUBLISH: ${{ inputs.force_republish }}
         run: |
-          META_OUT="$(python3 .github/scripts/package-plugin.py --plugin kanbanniang --print-meta)"
+          META_OUT="$(python3 .github/scripts/package-plugin.py --print-bundle-meta)"
           echo "${META_OUT}"
           echo "${META_OUT}" >> "${GITHUB_OUTPUT}"
 
-          VER="$(printf '%s\n' "${META_OUT}" | sed -n 's/^version=//p')"
           TAG="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_tag=//p')"
-          ASSET="$(printf '%s\n' "${META_OUT}" | sed -n 's/^release_asset=//p')"
+          EXPECTED_CSV="$(printf '%s\n' "${META_OUT}" | sed -n 's/^expected_assets=//p')"
 
-          ALREADY="false"
-          if gh release view "${TAG}" --repo "${REPO}" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "${ASSET}"; then
-            ALREADY="true"
+          PUBLISHED_ASSETS="$(gh release view "${TAG}" --repo "${REPO}" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          ALL_PRESENT="true"
+          if [ -z "${PUBLISHED_ASSETS}" ]; then
+            ALL_PRESENT="false"
+          else
+            OLD_IFS="${IFS}"
+            IFS=','
+            for req_asset in ${EXPECTED_CSV}; do
+              if ! printf '%s\n' "${PUBLISHED_ASSETS}" | grep -Fxq "${req_asset}"; then
+                echo "Missing asset on ${TAG}: ${req_asset}"
+                ALL_PRESENT="false"
+                break
+              fi
+            done
+            IFS="${OLD_IFS}"
           fi
 
-          if [ "${ALREADY}" = "true" ] && [ "${FORCE_REPUBLISH}" != "true" ]; then
+          if [ "${ALL_PRESENT}" = "true" ] && [ "${FORCE_REPUBLISH:-false}" != "true" ]; then
             echo "should_package=false" >> "${GITHUB_OUTPUT}"
-            echo "Skip packaging: ${TAG} (${ASSET}) is already published and version (${VER}) has not changed."
+            echo "Skip packaging: unified release ${TAG} already contains all expected extension archives and SHA256SUMS.txt."
           else
             echo "should_package=true" >> "${GITHUB_OUTPUT}"
-            echo "Proceeding to package and publish ${TAG} (${ASSET})..."
+            echo "Proceeding to package and publish unified extensions bundle ${TAG}..."
           fi
 
-      - name: Reset sparse-checkout workspace (When Packaging New Version)
+      - name: Reset sparse-checkout workspace (When Packaging Bundle)
         if: steps.check.outputs.should_package == 'true'
         run: find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-      - name: Checkout full repository (When Packaging New Version)
+      - name: Checkout full repository (When Packaging Bundle)
         if: steps.check.outputs.should_package == 'true'
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js 24 (When Packaging New Version)
+      - name: Setup Node.js 24 (When Packaging Bundle)
         if: steps.check.outputs.should_package == 'true'
         uses: actions/setup-node@v7
         with:
@@ -88,52 +102,49 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/admin/package-lock.json
 
-      - name: Install Minifier Toolchain Dependencies (When Packaging New Version)
+      - name: Install Minifier Toolchain Dependencies (When Packaging Bundle)
         if: steps.check.outputs.should_package == 'true'
         run: npm ci --prefix web/admin --no-audit --no-fund
 
-      - name: Setup Go (When Packaging New Version)
+      - name: Setup Go (When Packaging Bundle)
         if: steps.check.outputs.should_package == 'true'
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Verify Kanbanniang Plugin Integrity Before Packaging
+      - name: Verify Official Extensions Integrity Before Packaging
         if: steps.check.outputs.should_package == 'true'
         env:
           CGO_ENABLED: "0"
           GOEXPERIMENT: "nojsonv2"
-        run: go test -count=1 ./pkg/plugin -run TestKanbanniang
+        run: |
+          go test -count=1 ./pkg/plugin -run "TestKanbanniang|TestSensitiveWords|TestLegacyV102"
+          go test -count=1 ./internal/theme -run "TestRound3_VoloJournal_Parity|TestStage1_ThemeJaJPCoverage|TestLegacyV102"
 
-      - name: Build Deterministic Kanbanniang ZIP Archive
+      - name: Build Unified Official Extensions Bundle (Plugins, Themes & Locales)
         if: steps.check.outputs.should_package == 'true'
         env:
           REPO: ${{ github.repository }}
         run: |
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct -- plugins/kanbanniang 2>/dev/null || true)"
-          case "${SOURCE_DATE_EPOCH}" in
-            ''|*[!0-9]*) SOURCE_DATE_EPOCH="$(date -u -d 2026-01-01T00:00:00Z +%s)" ;;
-          esac
-          export SOURCE_DATE_EPOCH
           python3 .github/scripts/package-plugin.py \
-            --plugin kanbanniang \
-            --output-dir plugin-dist \
+            --bundle \
+            --output-dir ext-dist \
             --repo "${REPO}"
-          ls -lh plugin-dist
+          ls -lh ext-dist
 
-      - name: Publish Standalone Plugin GitHub Release
+      - name: Publish Unified Official Extensions Release (make_latest=false)
         if: steps.check.outputs.should_package == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          name: "Plugin: Kanbanniang v${{ steps.check.outputs.version }}"
+          name: "Official Extensions (Plugins & Themes) ${{ steps.check.outputs.bundle_version }}"
           tag_name: ${{ steps.check.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
           prerelease: false
           make_latest: "false"
-          body_path: plugin-dist/plugin-release-notes.md
+          body_path: ext-dist/extensions-release-notes.md
           generate_release_notes: false
           files: |
-            plugin-dist/${{ steps.check.outputs.release_asset }}
-            plugin-dist/${{ steps.check.outputs.release_asset_alias }}
-            plugin-dist/SHA256SUMS.txt
+            ext-dist/*.zip
+            ext-dist/*.sha256
+            ext-dist/SHA256SUMS.txt

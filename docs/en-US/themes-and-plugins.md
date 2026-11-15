@@ -52,6 +52,7 @@ themes/my-editorial/
 ```
 
 - **Clean Starter `.zip` Export**: Click **Export (.zip)** (`GET /api/admin/themes/{id}/export`) on any theme card (including built-in `volo-studio`) to download a clean starter `.zip` stripped of temporary or OS noise files.
+- **Client-Side `.zip` Preflight Inspector & Drag-and-Drop**: Dragging and dropping (or selecting) a local `.zip` onto the Theme or Plugin installer runs a zero-dependency in-browser preflight check (`DataView` ZIP Central Directory + `DecompressionStream("deflate-raw")` manifest parser + `crypto.subtle` local `SHA-256` up to `64 MiB`), displaying the parsed Name & ID, version diff (`installed -> new` or `New Install`), `min_host_version` compatibility badge, local `SHA-256` fingerprint, and an **Activate / Enable after install** toggle before uploading with cancelable progress.
 - **In-Place `.zip` Upgrade**: Upload via `POST /api/admin/themes/install?overwrite=true` to hot-upgrade an existing theme in place while preserving all saved `Appearance.ThemeConfigs[<id>]` values.
 
 ### 1.3 Persistent PJAX Islands (`data-volo-persist`)
@@ -304,16 +305,75 @@ function renderSlot(slotName) {
 }
 ```
 
-### 3.6 Official Plugin Catalog & Version-Deduplicated Standalone Packaging ([`plugins/catalog.json`](../../plugins/catalog.json))
+### 3.6 Update Detection Protocol (Declarative `update` + `onCheckUpdate` Hook), Direct URL Install & Atomic Rollback
 
-Official plugin versions are tracked in [`plugins/README.md`](../../plugins/README.md) and the machine-readable [`plugins/catalog.json`](../../plugins/catalog.json) registry (verified in CI against each plugin's `manifest.json`):
+`Volo-go` provides a unified, low-memory update detection, streaming URL direct-install, and two-phase transactional rollback pipeline for **both plugins (`manifest.json`) and themes (`theme.json`)** — with **zero background polling timers (`0` idle network calls, `0` idle JS VM wakeups, `0` background heap growth)**:
 
-| Plugin ID | Latest Version | Distribution | Bundled in Core Archive / Docker | Highlights |
+1. **Explicit 3-State Capability Model (`update_capability`)**:
+   - **`none` (No Update Feed)**: Extensions without `"update"` and without `onCheckUpdate` (or with `"strategy": "none"`, as well as built-in `volo-studio`). The Admin UI renders no broken check/update buttons, and batch checks skip them silently with `0` network calls.
+   - **`check_only` (Version Check Only — No Online Overwrite)**: Built-in compiled extensions (`kind == "builtin"` or `is_builtin == true`), manifests declaring `"allow_online_update": false`, or hooks returning `online_updatable: false` / empty `download_url`. Reports new versions, changelogs, and `release_url` links while blocking online overwrite.
+   - **`online` (Check + 1-Click Transactional Online Update)**: External plugins and themes with a valid `.zip` `download_url` and online updates enabled.
+
+2. **Tier 1 (Plugins & Themes · Zero JS VM Overhead): Declarative `"update"` Block**:
+   Add an `"update"` descriptor to `manifest.json` or `theme.json` for native Go evaluation (`<= 128 KiB` body cap, `singleflight` deduplication, and `ETag` / `Last-Modified` `304` cache reuse):
+   ```json
+   {
+     "min_host_version": "0.1.0",
+     "update": {
+       "strategy": "manifest-json",
+       "url": "https://example.com/my-ext/manifest.json",
+       "download_url": "https://example.com/my-ext/ext-v{version}.zip",
+       "release_url": "https://example.com/my-ext/releases/tag/v{version}",
+       "allow_online_update": true
+     }
+   }
+   ```
+   Supported `strategy` values:
+   - `"volo-catalog"`: Matches this extension's `id` inside a `catalog.json` index (reading `version`, `min_host_version`, `download_url`, `sha256`, `checksum_url`, `approx_zip_mb` / `approx_size_bytes`, and localized `changelog`);
+   - `"manifest-json"`: Fetches a remote `manifest.json` / `theme.json` (interpolating `{version}` placeholders in `download_url` / `release_url`);
+   - `"github-release"`: Queries GitHub Releases API (`"repo": "owner/repo"`, optional `"tag_prefix": "plugin-foo-v"` and `"asset": "plugin-foo.zip"`);
+   - `"none"`: Explicitly opts out of update detection.
+
+3. **Tier 2 (Third-Party Plugins): Custom Goja `onCheckUpdate(ctx)` Hook**:
+   Third-party plugins integrating with private registries, Gitee/GitLab, or custom license endpoints declare their update domain in `"allowed_hosts"` and export `onCheckUpdate(ctx)` in `main.js`:
+   ```javascript
+   function onCheckUpdate(ctx) {
+     // ctx: { pluginId, currentVersion, hostVersion, locale }
+     const resp = volo.http.fetch("https://ext.example.com/api/update?id=" + encodeURIComponent(ctx.pluginId));
+     if (resp.status !== 200) throw new Error("upstream HTTP " + resp.status);
+     const data = JSON.parse(resp.body);
+     return {
+       latest_version: data.version,          // Required: latest semantic version
+       has_update: data.version !== ctx.currentVersion, // Optional: auto-compared via SemVer if omitted
+       download_url: data.zip_url || "",      // Omit or set online_updatable: false for check_only mode
+       sha256: data.sha256 || "",             // Optional: 64-hex SHA-256 verified single-pass during stream
+       release_url: data.page_url || "",      // Optional: human-readable release page URL
+       changelog: data.notes || "",           // String or locale map { "zh-CN": "...", "en-US": "..." }
+       min_host_version: data.min_host || "", // Blocks incompatible upgrades if higher than hostVersion
+       online_updatable: true
+     };
+   }
+   ```
+   - **Memory & Circuit-Breaker Isolation**: Enabled plugins reuse their pooled warm VM; **disabled plugins** spin up a `1-VM` ephemeral runtime and immediately call `defer rt.closeRuntime()` once the check returns; `onCheckUpdate` runs under an isolated `5s` timeout and **never increments `failure_count` or trips the production `CIRCUIT_OPEN` breaker** when an upstream update server fails.
+
+4. **SSRF-Safe Streaming URL Install, `SHA256SUMS.txt` Verification, Batch Updates & Two-Phase Self-Healing Rollback**:
+   - **Low-Memory Streaming Download & End-to-End `SHA256SUMS.txt` (`checksum_url`) Verification**: Validates every redirect hop (`<= 5` hops) through `OutboundSafeDialer`, streams via a pooled `32 KiB` buffer straight to a same-volume temporary file while computing `SHA-256` in a single pass (`< 64 KiB` heap overhead), enforces a `20s` per-read stall watchdog, and rejects accidental HTML web pages before zip extraction. When `checksum_url` (and optional `asset_name`) is passed to `/install-url` or `/upgrade`, the host automatically fetches `SHA256SUMS.txt` and enforces exact digest matching (surfaced in the Admin UI as **SHA-256 Verified via SHA256SUMS** alongside package size badges).
+   - **1-Click Sequential Batch `"Update All (N)"`**: Whenever `>= 2` installed themes or plugins have `online` updates available, the update summary banner exposes **Update All (N)**, opening a Top-Layer batch progress modal that upgrades items sequentially with live per-item status (`pending` / `upgrading` / `done` / `failed`) and instant **Cancel Remaining** abort support.
+   - **Phase 1 (Cancelable Pre-Commit)**: Bound to the UI `AbortController` request context. Aborting during download, extraction, path-traversal checks, `min_host_version` verification, or template/JS syntax dry-runs immediately cleans up temp/staging files with `0` impact on the live running extension.
+   - **Phase 2 (Atomic Swap & Automatic Rollback)**: Runs under a bounded commit context detached from browser disconnects, retaining `.backup-*` / `.theme-old-*` until DB sync, `onInstall`, and `Enable` / `Themes.Reload()` **all succeed** — automatically restoring the previous directory, DB record, and enabled runtime if any post-swap step fails, plus recovering interrupted backups on startup.
+
+### 3.7 Official Extension Catalogs & Standalone Packages ([`plugins/catalog.json`](../../plugins/catalog.json), [`themes/catalog.json`](../../themes/catalog.json) & [`locales/catalog.json`](../../locales/catalog.json))
+
+Every official plugin, external theme, and standalone language pack is published with `SHA256SUMS.txt` (`checksum_url` auto-verified on 1-click install and in CI):
+
+| Kind / ID | Latest Version | Distribution | Bundled in Core Archive / Docker | Highlights |
 | :--- | :---: | :--- | :---: | :--- |
-| [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled` | Yes | 64k+ categorized dictionary powered by the host 16B/state BFS-CSR Aho-Corasick engine for comments and nicknames. |
-| [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.2`** | `standalone-release` ([`plugin-kanbanniang-v2.0.2.zip`](https://github.com/Willh92/Volo-go/releases/tag/plugin-kanbanniang-v2.0.2)) | No (Install on demand) | Full self-hosted pack of 26 offline Live2D models, 150 Pio/Tia outfit variants, parallel `.moc`/`.webp`/motion prefetch, touch-friendly 7-action toolbar, pointer drag, dark-mode-safe sakura backgrounds, WebGL context recovery, zero-inline strict-CSP bootstrap, and KV head-pats; ships pure lossless/animated `.webp` textures + AST-minified scripts in a slim `~35.5 MiB` archive (`65%+` smaller than legacy PNG/GIF bundles). |
+| Plugin [`sensitive-words`](../../plugins/sensitive-words/) | **`v1.1.0`** | `bundled` + `plugin-sensitive-words-v1.1.0.zip` | Yes | 64k+ categorized dictionary powered by the host 16B/state BFS-CSR Aho-Corasick engine, with 1-click online hot-update. |
+| Plugin [`kanbanniang`](../../plugins/kanbanniang/) | **`v2.0.5`** | `standalone-release` (`plugin-kanbanniang-v2.0.5.zip`) | No (1-Click URL install) | Full self-hosted pack of 26 offline Live2D models, 150 Pio/Tia outfit variants, 7-action toolbar, collapsible corner minimize/summon pill, non-closing manual retry error card, and KV head-pats (`~35.5 MiB` pure-WebP archive). |
+| Theme [`volo-journal`](../../themes/volo-journal/) | **`v1.1.1`** | `bundled` + `theme-volo-journal-v1.1.1.zip` | Yes | Classic serif magazine theme supporting independent hot-updates and desktop/mobile split routing. |
+| Locale Packs [`zh-TW`](../../locales/zh-TW.json) / [`ja-JP`](../../locales/ja-JP.json) | **`v1.0.0+`** | `locales/catalog.json` (1-Click URL install) | Repo-shipped + 1-Click Catalog | Complete Traditional Chinese & Japanese public + Admin Console dictionaries hot-activated via `POST /api/admin/locales/install-url`. |
 
-- **Streaming `256 MiB` `.zip` Lifecycle & Zero Duplicate Releases**: Host plugin install/export streams archives up to `256 MiB` (`<= 2,048` entries, using `zip.Store` for pre-compressed media and `zip.Deflate` for code/models). [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) and [`.github/workflows/release.yml`](../../.github/workflows/release.yml) check whether `plugin-kanbanniang-v<version>` already exists on GitHub Releases and skip rebuilding/uploading whenever `manifest.json` version is unchanged.
+- **Zero Duplicate Releases in GitHub Actions**: [`.github/workflows/plugin-kanbanniang.yml`](../../.github/workflows/plugin-kanbanniang.yml) and [`.github/workflows/release.yml`](../../.github/workflows/release.yml) check each `plugin-<id>-v<version>` / `theme-<id>-v<version>` tag independently, skipping compression and upload whenever its version is unchanged and always setting `make_latest: false`.
 
 ---
 

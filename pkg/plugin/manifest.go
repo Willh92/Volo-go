@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/Willh92/Volo-go/internal/extpkg"
 )
 
 // Supported runtimes and circuit states.
@@ -113,22 +115,23 @@ var allowedSlotNames = map[string]bool{
 // Manifest defines the declarative metadata, permission sandbox, UI slots, cron schedules,
 // and localized configuration JSON Schema of a Volo-go plugin (manifest.json).
 type Manifest struct {
-	ID             string            `json:"id"`
-	Version        string            `json:"version"`
-	MinHostVersion string            `json:"min_host_version,omitempty"`
-	Runtime        string            `json:"runtime"`
-	Entry          string            `json:"entry,omitempty"`
-	Priority       *int              `json:"priority,omitempty"`
-	Author         string            `json:"author,omitempty"`
-	Homepage       string            `json:"homepage,omitempty"`
-	Name           map[string]string `json:"name"`
-	Description    map[string]string `json:"description,omitempty"`
-	Permissions    []string          `json:"permissions,omitempty"`
-	AllowedHosts   []string          `json:"allowed_hosts,omitempty"`
-	Hooks          []string          `json:"hooks,omitempty"`
-	UISlots        []SlotSpec        `json:"ui_slots,omitempty"`
-	Cron           []CronSpec        `json:"cron,omitempty"`
-	ConfigSchema   []ConfigField     `json:"config_schema,omitempty"`
+	ID             string               `json:"id"`
+	Version        string               `json:"version"`
+	MinHostVersion string               `json:"min_host_version,omitempty"`
+	Runtime        string               `json:"runtime"`
+	Entry          string               `json:"entry,omitempty"`
+	Priority       *int                 `json:"priority,omitempty"`
+	Author         string               `json:"author,omitempty"`
+	Homepage       string               `json:"homepage,omitempty"`
+	Name           map[string]string    `json:"name"`
+	Description    map[string]string    `json:"description,omitempty"`
+	Permissions    []string             `json:"permissions,omitempty"`
+	AllowedHosts   []string             `json:"allowed_hosts,omitempty"`
+	Hooks          []string             `json:"hooks,omitempty"`
+	UISlots        []SlotSpec           `json:"ui_slots,omitempty"`
+	Cron           []CronSpec           `json:"cron,omitempty"`
+	ConfigSchema   []ConfigField        `json:"config_schema,omitempty"`
+	Update         *extpkg.UpdateConfig `json:"update,omitempty"`
 }
 
 // DefaultPriority returns the manifest's declared priority clamped to bounds, or DefaultPluginPriority (100).
@@ -218,6 +221,15 @@ func (m *Manifest) Validate() error {
 	if !validSemverLooseRe.MatchString(m.Version) {
 		return fmt.Errorf("plugin %q: invalid version %q", m.ID, m.Version)
 	}
+	m.MinHostVersion = strings.TrimSpace(m.MinHostVersion)
+	if m.MinHostVersion != "" && !validSemverLooseRe.MatchString(m.MinHostVersion) {
+		return fmt.Errorf("plugin %q: invalid min_host_version %q", m.ID, m.MinHostVersion)
+	}
+	if m.Update != nil {
+		if err := extpkg.ValidateUpdateConfig(m.Update, true, true); err != nil {
+			return fmt.Errorf("plugin %q: %w", m.ID, err)
+		}
+	}
 	m.Runtime = strings.ToLower(strings.TrimSpace(m.Runtime))
 	if m.Runtime == "" {
 		m.Runtime = RuntimeGoja
@@ -239,10 +251,11 @@ func (m *Manifest) Validate() error {
 		return fmt.Errorf("plugin %q: localized name map must contain at least one non-empty label", m.ID)
 	}
 	if m.Homepage != "" {
-		u, err := url.Parse(strings.TrimSpace(m.Homepage))
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		cleanHomepage := extpkg.SanitizeHTTPURL(m.Homepage)
+		if cleanHomepage == "" {
 			return fmt.Errorf("plugin %q: homepage must use http or https", m.ID)
 		}
+		m.Homepage = cleanHomepage
 	}
 	if m.Priority != nil {
 		clamped := ClampPluginPriority(*m.Priority)

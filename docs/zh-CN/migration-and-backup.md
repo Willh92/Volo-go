@@ -72,6 +72,7 @@ volo-backup-20261108-010000.zip
 ```
 
 恢复时的安全防线：
+- **恢复前自动生成 `pre-restore-*.zip` 安全快照**：对已有数据的数据库执行正式恢复（非 `--dry-run` 的 CLI 或管理台恢复）前，Volo-go 会自动在 `${VOLO_BACKUP_DIR}` 流式写入一份 `pre-restore-<UTC>.zip` 安全快照，确保误选归档时可随时无损回滚；
 - **先验哈希校验**：正式写入数据库前，先流式验证所有条目的字节数与 `SHA-256` 摘要，任何损坏或篡改立即中止，确保目标库不被半截脏数据污染；
 - **防 ZIP 炸弹配额**：单流上限 `512 MiB`、总解压上限 `2 GiB`、严格净化媒体相对路径拦截 `../` 路径穿越；
 - **分批事务回滚**：每 `200` 行流式批量写入并在外键拓扑事务内提交，任意表失败自动整体回滚。
@@ -87,7 +88,8 @@ volo-backup-20261108-010000.zip
 # 2. 修改目标环境的数据库连接配置（例如切换至 PostgreSQL）
 #    VOLO_DB_DRIVER=postgres
 #    VOLO_DB_DSN=postgres://volo:secret@db.internal:5432/volo?sslmode=verify-full
-#    注意：务必保持两端的 VOLO_SECRET_KEY（或 data/.secret.key）一致，以确保已加密的 S3/SMTP/WebDAV/Webhook/插件机密字段可正常解密！
+#    注意：恢复时请保持两端的 VOLO_SECRET_KEY（或 data/.secret.key）一致以确保密文正常解密；
+#    迁移完成后，随时可执行 `volo secret rotate` 原子轮换主密钥并自动重加密全站 8 处密文存储！
 
 # 3. 先 Dry-Run 验证归档完整性，再一键流式导入 PostgreSQL
 ./volo backup restore /tmp/site-full.zip --env-file /etc/volo/volo-pg.env --dry-run

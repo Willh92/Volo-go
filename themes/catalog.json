@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-11-15",
+  "repository": "https://github.com/Willh92/Volo-go",
+  "release_tag": "extensions-v1.0.3",
+  "themes": [
+    {
+      "id": "volo-journal",
+      "version": "1.1.1",
+      "min_host_version": "0.1.0",
+      "path": "themes/volo-journal",
+      "distribution": "bundled",
+      "bundled_in_core_archive": true,
+      "bundled_in_docker_image": true,
+      "release_tag": "extensions-v1.0.3",
+      "release_asset": "theme-volo-journal-v1.1.1.zip",
+      "release_asset_alias": "theme-volo-journal.zip",
+      "download_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/theme-volo-journal-v1.1.1.zip",
+      "checksum_url": "https://github.com/Willh92/Volo-go/releases/download/extensions-v1.0.3/SHA256SUMS.txt",
+      "approx_zip_mb": 0.01,
+      "approx_size_bytes": 9005,
+      "homepage": "https://github.com/Willh92/Volo-go/releases/tag/extensions-v1.0.3",
+      "name": {
+        "zh-CN": "Volo Journal 纸刊",
+        "en-US": "Volo Journal",
+        "zh-TW": "Volo Journal 紙刊",
+        "ja-JP": "Volo Journal ジャーナル"
+      },
+      "summary": {
+        "zh-CN": "单栏居中、经典衬线纸媒排版的官方外部主题包，支持模块化局部模板、独立多语言词典、深色模式与 PJAX 无缝阅读。",
+        "en-US": "Single-column serif editorial journal external theme with modular partials, JSON locales, dark mode, and PJAX navigation.",
+        "zh-TW": "單欄置中、經典襯線紙媒排版的官方外部主題包，支援模組化局部模板、獨立多語言詞典、深色模式與 PJAX 無縫閱讀。",
+        "ja-JP": "シングルカラム・セリフ体エディトリアル組版の公式外部テーマパッケージ。ダークモード・PJAX・多言語辞書対応。"
+      },
+      "changelog": {
+        "zh-CN": "提供独立主题 ZIP 分发与 SHA-256 校验，接入在线版本检测与无损配置保留的一键升级能力。",
+        "en-US": "Added standalone theme ZIP distribution with SHA-256 verification, update detection, and config-preserving 1-click online upgrade.",
+        "zh-TW": "提供獨立主題 ZIP 分發與 SHA-256 校驗，接入線上版本檢測與無損設定保留的一鍵升級能力。",
+        "ja-JP": "スタンドアロンテーマZIP配布とSHA-256検証に対応し、設定を保持したワンクリック更新をサポート。"
+      }
+    }
+  ]
+}

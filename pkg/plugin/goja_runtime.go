@@ -728,41 +728,57 @@ func (r *gojaPluginRuntime) createVM() (pvm *pooledVM, err error) {
 	}
 
 	// Capability 3: Unified scheduled task registry (`volo.cron`, ONLY injected when "cron" permission is declared).
-	if r.manifest.HasPermission("cron") && r.cron != nil {
+	if r.manifest.HasPermission("cron") {
 		cronBridge := vm.NewObject()
-		cronBridge.Set("register", func(name string, opts map[string]any) (bool, error) {
-			if opts == nil {
-				return false, errors.New("volo.cron.register requires an options object")
-			}
-			handler, _ := opts["handler"].(string)
-			intervalSec := parseCronIntOption(opts["interval_seconds"])
-			if intervalSec <= 0 {
-				intervalSec = parseCronIntOption(opts["intervalSeconds"])
-			}
-			immediate, _ := opts["immediate"].(bool)
-			if err := r.cron.RegisterJob(r.manifest.ID, CronSpec{
-				Name:            name,
-				IntervalSeconds: intervalSec,
-				Handler:         handler,
-			}, CronSourceDynamic, immediate); err != nil {
-				return false, err
-			}
-			return true, nil
-		})
-		cronBridge.Set("unregister", func(name string) bool {
-			return r.cron.UnregisterJob(r.manifest.ID, name)
-		})
-		cronBridge.setVal("trigger", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
-			jobName := ""
-			if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
-				jobName = args[0].toString()
-			}
-			cnt := r.cron.Trigger(r.manifest.ID, jobName)
-			return jsValue{kind: valNumber, num: float64(cnt)}, nil
-		}))
-		cronBridge.Set("list", func() []CronJobSnapshot {
-			return r.cron.ListJobs(r.manifest.ID)
-		})
+		if r.cron != nil {
+			cronBridge.Set("register", func(name string, opts map[string]any) (bool, error) {
+				if opts == nil {
+					return false, errors.New("volo.cron.register requires an options object")
+				}
+				handler, _ := opts["handler"].(string)
+				intervalSec := parseCronIntOption(opts["interval_seconds"])
+				if intervalSec <= 0 {
+					intervalSec = parseCronIntOption(opts["intervalSeconds"])
+				}
+				immediate, _ := opts["immediate"].(bool)
+				if err := r.cron.RegisterJob(r.manifest.ID, CronSpec{
+					Name:            name,
+					IntervalSeconds: intervalSec,
+					Handler:         handler,
+				}, CronSourceDynamic, immediate); err != nil {
+					return false, err
+				}
+				return true, nil
+			})
+			cronBridge.Set("unregister", func(name string) bool {
+				return r.cron.UnregisterJob(r.manifest.ID, name)
+			})
+			cronBridge.setVal("trigger", nativeVal(func(_ *jsRuntime, _ jsValue, args []jsValue) (jsValue, error) {
+				jobName := ""
+				if len(args) >= 1 && args[0].kind != valUndefined && args[0].kind != valNull {
+					jobName = args[0].toString()
+				}
+				cnt := r.cron.Trigger(r.manifest.ID, jobName)
+				return jsValue{kind: valNumber, num: float64(cnt)}, nil
+			}))
+			cronBridge.Set("list", func() []CronJobSnapshot {
+				return r.cron.ListJobs(r.manifest.ID)
+			})
+		} else {
+			// Ephemeral/disabled runtimes (e.g. onInstall on a disabled plugin, dry-run, or update check)
+			// expose a safe no-op collector so scripts never crash and never leak live cron jobs.
+			cronBridge.Set("register", func(_ string, opts map[string]any) (bool, error) {
+				if opts == nil {
+					return false, errors.New("volo.cron.register requires an options object")
+				}
+				return false, nil
+			})
+			cronBridge.Set("unregister", func(_ string) bool { return false })
+			cronBridge.setVal("trigger", nativeVal(func(_ *jsRuntime, _ jsValue, _ []jsValue) (jsValue, error) {
+				return jsValue{kind: valNumber, num: 0}, nil
+			}))
+			cronBridge.Set("list", func() []CronJobSnapshot { return []CronJobSnapshot{} })
+		}
 		voloObj.Set("cron", cronBridge)
 	}
 

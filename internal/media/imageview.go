@@ -743,6 +743,9 @@ func NewImageViewEngine(maxCacheBytes int64) *ImageViewEngine {
 
 // ComputeETag returns a strong HTTP ETag uniquely determined by source identity/version and spec.CanonicalKey().
 func (e *ImageViewEngine) ComputeETag(srcKey string, modTimeNano int64, size int64, spec ImageViewSpec) string {
+	if normSpec, err := normalizeAndValidateSpec(spec, false); err == nil {
+		spec = normSpec
+	}
 	h := sha256.New()
 	_, _ = h.Write([]byte("volo-iv2:v1|"))
 	_, _ = h.Write([]byte(srcKey))

@@ -20,12 +20,12 @@
 | [架构设计与性能内幕 (`docs/zh-CN/architecture.md`)](./docs/zh-CN/architecture.md) | `v9` Schema（33 张正规化数据表 + 9 大热重载设置域）、实时无损 ImageView 管线、三方言 SQL 与读写分离池、10 大出口防泄密守卫、多级一致性缓存与内存预算 |
 | [部署与系统服务安装指南 (`docs/zh-CN/deployment.md`)](./docs/zh-CN/deployment.md) | 多层配置优先级、6 大静态发布平台、Linux (`systemd` / `OpenRC` 权限分离)、macOS (`launchd`)、Windows 原生服务 (`sc.exe` / `NSSM`)、升级自动回滚与 Docker 部署 |
 | [反向代理与 CDN 配置指南 (`docs/zh-CN/reverse-proxy.md`)](./docs/zh-CN/reverse-proxy.md) | TCP vs Unix Socket (`--unix-socket` / `--socket-mode` / `--socket-group`)、`VOLO_TRUSTED_PROXIES` 防伪造模型、Nginx / Caddy / Traefik / Apache / Cloudflare 完整配置 |
-| [CLI 瑞士军刀与开放 API (`docs/zh-CN/cli-and-api.md`)](./docs/zh-CN/cli-and-api.md) | `volo` 全子命令、细粒度 `volo_pat_*` API Token、实时图片裁剪参数（`?imageView2` & KV）、账户封禁/禁言接口、分页搜索与管理端/公开端 REST 接口 |
-| [主题定制与插件开发 (`docs/zh-CN/themes-and-plugins.md`)](./docs/zh-CN/themes-and-plugins.md) | `theme.json`、增强型全屏评论 Markdown 编辑器、纯 Go ES6 插件沙箱（5 阶段生命周期、`before_*` 链式拦截、`volo.kv.incrAsync`、`CronRegistry`、`wordFilter`）与 256 MiB 流式 ZIP 热插拔/导出 |
-| [官方插件目录 (`plugins/README.zh-CN.md`)](./plugins/README.zh-CN.md) | 官方插件最新版本清单（[`plugins/catalog.json`](./plugins/catalog.json)：`sensitive-words v1.1.0` 内置、`kanbanniang v2.0.2` 26 模型离线 Live2D 独立包）与 GitHub Actions 版本去重发布机制 |
+| [CLI 瑞士军刀与开放 API (`docs/zh-CN/cli-and-api.md`)](./docs/zh-CN/cli-and-api.md) | `volo` 全子命令（`secret rotate` 全库密钥轮换、只读 `doctor`、`/healthz` 就绪探针）、细粒度 `volo_pat_*` API Token、实时图片裁剪参数（`?imageView2` & KV）、Step-Up 保护与 REST 接口 |
+| [主题定制与插件开发 (`docs/zh-CN/themes-and-plugins.md`)](./docs/zh-CN/themes-and-plugins.md) | `theme.json`、增强型全屏评论 Markdown 编辑器、纯 Go ES6 插件沙箱、`SHA256SUMS.txt`（`checksum_url`）URL 直装、一键批量更新、本地 `.zip` 上传前预检器与原子自愈回退 |
+| [官方插件目录 (`plugins/README.zh-CN.md`)](./plugins/README.zh-CN.md) | 官方扩展版本清单（[`plugins/catalog.json`](./plugins/catalog.json)、[`themes/catalog.json`](./themes/catalog.json)、[`locales/catalog.json`](./locales/catalog.json)：`sensitive-words v1.1.0`、`volo-journal v1.1.1` 及 `kanbanniang v2.0.5` 贴边收起/唤醒离线 Live2D 独立包） |
 | [旧版主题皮肤迁移指南 (`docs/zh-CN/theme-migration.md`)](./docs/zh-CN/theme-migration.md) | 独立整页 HTML / 布局继承双模式、`PageContext` 全量数据模型、`config_schema` 自定义配置与模板函数速查 |
-| [多语言包扩展指南 (`docs/zh-CN/locale-extension.md`)](./docs/zh-CN/locale-extension.md) | 单文件 JSON / `.zip` 语言包热安装（附完整 `zh-TW` / `ja-JP` 语言包）、`admin.nav.*` 命名空间与模板导出 |
-| [旧版无损迁移与跨库备份 (`docs/zh-CN/migration-and-backup.md`)](./docs/zh-CN/migration-and-backup.md) | 历史 15 表备份流式 ETL 清洗、`301` 永久链接守护、`SQLite ⇄ PostgreSQL ⇄ MySQL` 33 表跨库流式搬家 |
+| [多语言包扩展指南 (`docs/zh-CN/locale-extension.md`)](./docs/zh-CN/locale-extension.md) | 官方目录与远程 URL 一键直装语言包（`zh-TW` / `ja-JP`）、单文件 JSON / `.zip` 语言包热安装、`admin.nav.*` 命名空间与模板导出 |
+| [旧版无损迁移与跨库备份 (`docs/zh-CN/migration-and-backup.md`)](./docs/zh-CN/migration-and-backup.md) | 历史 15 表备份流式 ETL 清洗、`301` 永久链接守护、`SQLite ⇄ PostgreSQL ⇄ MySQL` 33 表跨库流式搬家与恢复前自动 `pre-restore-*.zip` 安全快照 |
 | [版本更新日志 (`CHANGELOG.zh-CN.md`)](./CHANGELOG.zh-CN.md) | 各版本新特性、修复记录与升级说明 |
 
 ---
@@ -36,7 +36,7 @@
 | :--- | :--- | :--- |
 | 静态单二进制体积 (`linux/amd64`) | **`~19.6 MiB`** | 跨全部 6 大平台目标（Linux / macOS / Windows `amd64` & `arm64`）均 **`< 22.00 MiB`**（压缩包 `< 8.00 MiB`） |
 | 温热运行常驻内存 (`VmRSS`) | **`24.23 MiB`** | 含内嵌主题、插件沙箱、`wordFilter` 引擎与有界热缓存 `< 35.00 MiB` |
-| 管理台首屏核心体积 (Gzip) | **`~132 KB`** (总内嵌 `~317.5 KiB`) | 总内嵌门禁 `< 380 KiB`，CodeMirror 6 三模式编辑器核心按需懒加载 |
+| 管理台首屏核心体积 (Gzip) | **`~132 KB`** (总内嵌 `~341.0 KiB`) | 总内嵌门禁 `< 380 KiB`，CodeMirror 6 三模式编辑器核心按需懒加载 |
 | 文章卡片摘要热缓存 (`ToCard`) | **`1.19 µs/op`** (`864 B/op`) | 4 MiB 摘要自校验 LRU，较冷渲染提速 `758×` |
 | 文章正文详情热缓存 (`ToDetail`) | **`4.64 µs/op`** (`3.3 KB/op`) | 严格排除密码与限时预览令牌，零串号风险 |
 | RSS / Sitemap 预压缩 + `ETag` 协商 | **`7.69 µs/op`** (`~130k req/s`) | 数据版本号 `1ns` 自动失效，超 `10,000` URL 自动 `<sitemapindex>` 分片 |
@@ -135,12 +135,13 @@ docker compose up -d --build
 volo serve                                                   # 启动 HTTP 或 Unix Domain Socket 服务
 volo admin reset-password --user <u|email> [--password <pw>] # 重置 Argon2id 密码（别名 volo passwd）并吊销全部会话与 Token
 volo admin disable-2fa --user <u|email>                      # 紧急关闭指定账户 TOTP 与恢复码
+volo secret rotate [--dry-run]                               # 单事务原子轮换全站全部 8 处 AES-256-GCM 密文存储
 volo backup create [--output backup.zip] [--with-media=true] # 创建跨库流式 NDJSON + 媒体 ZIP 备份
-volo backup restore <backup.zip> [--dry-run]                 # 校验 SHA-256 并跨库无损恢复备份
+volo backup restore <backup.zip> [--dry-run]                 # 自动快照 pre-restore-*.zip、校验 SHA-256 并跨库无损恢复
 volo import-legacy <legacy.zip|json> [--dry-run] \
   [--old-site-url URL] [--new-site-url URL] [--storage-local] # 流式清洗导入历史 15 表备份包
-volo doctor [--json]                                         # 自检密钥权限、SQLite WAL、GeoIP 目录与反代配置
-volo healthcheck [--url http://127.0.0.1:8080/healthz]       # 原生探活（自动兼容 TCP 与 Unix Socket）
+volo doctor [--json]                                         # 纯只读自检 8 处密文、TLS、SQLite WAL、GeoIP 目录与反代配置
+volo healthcheck [--url http://127.0.0.1:8080/healthz]       # 探测 /healthz 数据库与运行时就绪状态（兼容 TCP/HTTPS 与 Unix Socket）
 volo version                                                 # 打印版本与运行平台信息
 ```
 

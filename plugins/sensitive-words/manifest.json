@@ -480,5 +480,9 @@
         "ja-JP": "自動同期間隔（時間）"
       }
     }
-  ]
+  ],
+  "update": {
+    "strategy": "volo-catalog",
+    "url": "https://raw.githubusercontent.com/Willh92/Volo-go/main/plugins/catalog.json"
+  }
 }

@@ -56,7 +56,8 @@
     return "/" + parts.map(encodeURIComponent).join("/");
   }
 
-  var version = host.getAttribute("data-version") || "2.0.4";
+  var version = host.getAttribute("data-version") || "2.0.5";
+  var CLOSED_KEY = "volo.kanban.closed";
   var staticBase = safeSameOriginMountPath(
     host.getAttribute("data-static-base"),
     "/plugins/kanbanniang/assets"
@@ -81,6 +82,7 @@
   var lastDescriptor = null;
   var warmBootPromise = null;
   var retryBtn = null;
+  var summonBtn = null;
   var loadSeq = 0;
   var pendingChangeTip = false;
   var patCount = parseInt(host.getAttribute("data-pats") || "0", 10) || 0;
@@ -125,10 +127,14 @@
     } catch (err) {}
   }
 
+  function sRemove(key) {
+    try {
+      window.sessionStorage.removeItem(key);
+    } catch (err) {}
+  }
+
   function isClosedInSession() {
-    return (
-      sGet("volo.kanban.closed") === "1" || sGet("soloKanbanniang") === "close"
-    );
+    return sGet(CLOSED_KEY) === "1" || sGet("soloKanbanniang") === "close";
   }
 
   function viewportWidth() {
@@ -293,6 +299,14 @@
           : isTW
             ? "模型載入未完成，點擊重試或點右側換裝～"
             : "模型加载未完成，点击重试或点右侧换装～",
+      summonLabel: isEN ? "Mascot" : isJA ? "マスコット" : "看板娘",
+      summonAriaLabel: isEN
+        ? "Restore Mascot"
+        : isJA
+          ? "マスコットを再表示"
+          : isTW
+            ? "喚出看板娘"
+            : "唤出看板娘",
       tools: {
         home: isEN ? "Back to Home" : isJA ? "ホームへ戻る" : isTW ? "返回首頁" : "返回首页",
         rss: isEN ? "Subscribe via RSS" : isJA ? "RSSを購読" : isTW ? "訂閱部落格" : "订阅博客",
@@ -333,6 +347,88 @@
     return retryBtn;
   }
 
+  function resolveDockPosition() {
+    if (!host) return "left";
+    var attr = host.getAttribute("data-position");
+    if (attr === "right" || host.classList.contains("volo-kbn-right")) {
+      return "right";
+    }
+    return "left";
+  }
+
+  function restoreFromSummon() {
+    if (!alive || !host) return;
+    window.clearTimeout(closeTimer);
+    sRemove(CLOSED_KEY);
+    sRemove("soloKanbanniang");
+    if (summonBtn) {
+      summonBtn.hidden = true;
+    }
+    host.classList.remove("is-closed", "is-closing");
+    if (!shouldPauseForMobile()) {
+      start();
+    }
+  }
+
+  function ensureSummonButton() {
+    if (summonBtn && summonBtn.isConnected) return summonBtn;
+    if (typeof document.getElementById === "function") {
+      var existing = document.getElementById("volo-kanbanniang-summon");
+      if (existing && existing.parentNode) {
+        existing.parentNode.removeChild(existing);
+      }
+    }
+    if (typeof document.createElement !== "function") return null;
+    var container = (host && host.parentElement) || document.body;
+    if (!container || typeof container.appendChild !== "function") return null;
+    summonBtn = document.createElement("button");
+    summonBtn.type = "button";
+    summonBtn.id = "volo-kanbanniang-summon";
+    summonBtn.className = "solo-kanbanniang-summon";
+    summonBtn.setAttribute("data-kbn-summon", "1");
+    if (!container.hasAttribute || !container.hasAttribute("data-volo-persist")) {
+      summonBtn.setAttribute("data-volo-persist", "kanbanniang-summon");
+    }
+    summonBtn.hidden = true;
+    listen(summonBtn, "click", function (ev) {
+      if (ev && typeof ev.stopPropagation === "function") {
+        ev.stopPropagation();
+      }
+      restoreFromSummon();
+    });
+    container.appendChild(summonBtn);
+    return summonBtn;
+  }
+
+  function syncSummonButton() {
+    if (!alive || !host) return;
+    var closed = isClosedInSession();
+    if (!closed && !summonBtn) return;
+    var btn = closed ? ensureSummonButton() : summonBtn;
+    if (!btn) return;
+    var loc = resolveLocaleStrings();
+    btn.textContent = loc.summonLabel;
+    btn.title = loc.summonAriaLabel;
+    btn.setAttribute("aria-label", loc.summonAriaLabel);
+    var pos = resolveDockPosition();
+    btn.setAttribute("data-position", pos);
+    btn.classList.toggle("volo-kbn-right", pos === "right");
+    btn.classList.toggle(
+      "volo-kbn-hide-mobile",
+      host.getAttribute("data-hide-mobile") !== "0"
+    );
+    var fab = document.querySelector(".book-mobile-toc-fab");
+    var fabOnScreen = !!(
+      fab &&
+      !fab.hidden &&
+      viewportWidth() <= 900 &&
+      pos !== "right" &&
+      window.getComputedStyle(fab).display !== "none"
+    );
+    btn.classList.toggle("is-book-fab-offset", fabOnScreen);
+    btn.hidden = !closed || shouldPauseForMobile();
+  }
+
   function syncLocale() {
     if (!host) return;
     var loc = resolveLocaleStrings();
@@ -350,6 +446,7 @@
       retryBtn.textContent = loc.retryLabel;
       retryBtn.setAttribute("aria-label", loc.retryLabel);
     }
+    syncSummonButton();
     if (isOverlayBlocking()) {
       hideMessage();
     }
@@ -1124,6 +1221,10 @@
     for (var i = 0; i < list.length; i++) {
       list[i]();
     }
+    if (summonBtn && summonBtn.parentNode) {
+      summonBtn.parentNode.removeChild(summonBtn);
+    }
+    summonBtn = null;
     pause();
   }
 
@@ -1213,6 +1314,9 @@
     if (!alive || started || shouldPauseForMobile() || isClosedInSession()) {
       return;
     }
+    if (summonBtn) {
+      summonBtn.hidden = true;
+    }
     var seq = warmBootPromise ? loadSeq : ++loadSeq;
     started = true;
     clearErrorUI();
@@ -1261,7 +1365,14 @@
   function scheduleIdleStart() {
     if (shouldPauseForMobile() || isClosedInSession()) {
       host.hidden = true;
+      if (isClosedInSession()) {
+        host.classList.add("is-closed");
+      }
+      syncSummonButton();
       return;
+    }
+    if (summonBtn) {
+      summonBtn.hidden = true;
     }
     var seq = ++loadSeq;
     warmInitialAssets(seq).catch(function () {});
@@ -1354,7 +1465,7 @@
     if (btn) {
       listen(btn, "click", function (ev) {
         ev.stopPropagation();
-        handler();
+        handler(ev);
       });
     }
   }
@@ -1385,14 +1496,23 @@
     var url = sanitizeHttpUrl(host.getAttribute("data-project-url"));
     window.open(url, "_blank", "noopener,noreferrer");
   });
-  bindTool("close", function () {
-    sSet("volo.kanban.closed", "1");
+  bindTool("close", function (ev) {
+    var viaKeyboard = !!(ev && ev.detail === 0);
+    window.clearTimeout(closeTimer);
+    sSet(CLOSED_KEY, "1");
     sSet("soloKanbanniang", "close");
     host.classList.add("is-closing");
     closeTimer = window.setTimeout(function () {
+      if (!alive || !host) return;
       host.classList.remove("is-closing");
       host.classList.add("is-closed");
       pause();
+      syncSummonButton();
+      if (viaKeyboard && summonBtn && !summonBtn.hidden && typeof summonBtn.focus === "function") {
+        try {
+          summonBtn.focus();
+        } catch (err) {}
+      }
     }, 180);
   });
 
@@ -1455,8 +1575,10 @@
     function () {
       if (shouldPauseForMobile()) {
         if (started) pause();
+        syncSummonButton();
       } else {
         syncOffsetsAndPosition();
+        syncSummonButton();
         start();
       }
     },
@@ -1694,6 +1816,7 @@
     destroy: destroy,
     change: change,
     retry: retryLoad,
+    summon: restoreFromSummon,
     showMessage: showMessage,
     syncLocale: syncLocale,
     isReady: function () {

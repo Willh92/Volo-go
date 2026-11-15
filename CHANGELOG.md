@@ -6,6 +6,24 @@ All notable changes to `Volo-go` are documented in this file. Format follows [Ke
 
 ---
 
+## [1.0.3] - 2026-11-15
+
+### Added
+- **Consolidated Official Extensions Bundle (`extensions-v1.0.3`) & Direct URL Installation**: Unified standalone `.zip` packaging across all official plugins (`sensitive-words v1.1.0`, `kanbanniang v2.0.5`), external themes (`volo-journal v1.1.1`), and external locale packs (`zh-TW v1.0.0`, `ja-JP v1.0.0`) into a single version-paired GitHub Release (`extensions-v1.0.3`) with versioned archives, stable alias `.zip` assets, and a consolidated `SHA256SUMS.txt`; added streaming remote `.zip` URL installation with optional `SHA-256` pinning, one-click Official Catalog install, and client-side `.zip` preflight inspection cards in the Admin Console.
+- **Plugin & Theme Update Detection Hooks & Transactional Online Updates**: Introduced declarative and programmable update hooks for both plugins and themes (`volo-catalog`, `manifest-json`, `github-release`, 3rd-party JS `onCheckUpdate`, and Go `UpdateChecker`), with automatic catalog bootstrap compatibility for legacy `v1.0.2` installed official extensions and first-class support for `unsupported`, `check_only`, and `online` capability states; online updates execute a two-phase atomic swap with pre-swap backup, preserved user config/KV state, mid-flight cancellation handling, and automatic rollback on activation failure or network error.
+- **Full-Database Atomic Key Rotation (`volo secret rotate`) & Step-Up Backup Tickets**: Added `volo secret rotate --old-key ... --new-key ... [--dry-run]` to atomically re-encrypt all 6 encrypted database domains (including custom AAD-bound rows) in a single transaction; added 60-second single-use step-up download tickets for interactive local backup downloads and automatic pre-restore safety snapshots.
+
+### Changed & Optimized
+- **Official `kanbanniang v2.0.5`, `sensitive-words v1.1.0` & `volo-journal v1.1.1` Updates**: Wired `volo-catalog` update metadata across all official extensions plus custom `onCheckUpdate` hook support in `kanbanniang v2.0.5` (with refined SSR descriptor encoding and mobile scaling), and enabled build-time AST minification for bundled `plugins/sensitive-words` and `plugins/catalog.json` in `Dockerfile`.
+- **Native Top-Layer `<dialog>` Architecture & 4-Locale Extension UX**: Migrated Admin Console confirmation modals, command palette, media picker, and revision history modals to native HTML `<dialog>` Top-Layer stacking, added batch update check summary pills, and synchronized `zh-CN` / `en-US` / `zh-TW` / `ja-JP` translations.
+- **Full-Lifecycle Extension Backups & Non-Blocking Concurrency Guards**: Included external plugins, themes, and locale packs in scheduled/manual backups and restores, guarded concurrent backup/restore operations via atomic `backupOpBusy` locking, and reduced hot-path allocations.
+
+### Security & Fixes
+- **SSRF-Safe Outbound Extension Fetcher & Zip-Bomb Defenses**: Routed all remote plugin, theme, and locale downloads through DNS-rebinding-safe outbound dialers (blocking loopback, RFC1918/ULA private ranges, link-local, and cloud metadata endpoints) with per-redirect target re-validation, cross-origin sensitive header stripping, and strict `.zip` entry count, uncompressed size, compression ratio, and symlink guards.
+- **Backup Path Containment & Linear-Time Archive Preflight Hardening**: Enforced strict ASCII filename allowlists plus `filepath.Abs` directory prefix containment across all local backup endpoints, hardened Admin Console external links via `new URL()` protocol validation, and replaced dynamic regex construction in client-side `.zip` filename matching with linear-time string scanning.
+
+---
+
 ## [1.0.2] - 2026-11-15
 
 ### Added

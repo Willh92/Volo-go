@@ -2,6 +2,7 @@ package content
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,8 @@ import (
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
 )
+
+var errViewBufferEpochChanged = errors.New("content: view analytics buffer epoch changed")
 
 type dailyTrafficDelta struct {
 	pv int64
@@ -43,6 +46,7 @@ type viewAnalyticsBuffer struct {
 	topItems                 map[topItemBucketKey]int64
 	refererKeys              int
 	totalPendingArticleViews atomic.Int64
+	epoch                    atomic.Uint64
 
 	loopOnce sync.Once
 	stopCh   chan struct{}
@@ -249,6 +253,7 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 		b.mu.Unlock()
 		return nil
 	}
+	startEpoch := b.epoch.Load()
 	artSnap := b.articleViews
 	pageSnap := b.pageViews
 	redSnap := b.redirectHits
@@ -274,8 +279,15 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 	b.dirty = false
 	b.mu.Unlock()
 
+	if b.epoch.Load() != startEpoch {
+		return nil
+	}
+
 	now := time.Now().UnixMilli()
 	err := b.store.WithBgTx(ctx, func(tx *sqlx.Tx) error {
+		if b.epoch.Load() != startEpoch {
+			return errViewBufferEpochChanged
+		}
 		for artID, delta := range artSnap {
 			if delta <= 0 {
 				continue
@@ -323,12 +335,22 @@ func (b *viewAnalyticsBuffer) Flush(ctx context.Context) error {
 				return e
 			}
 		}
+		if b.epoch.Load() != startEpoch {
+			return errViewBufferEpochChanged
+		}
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errViewBufferEpochChanged) || b.epoch.Load() != startEpoch {
+			return nil
+		}
 		const maxFailedRestoreKeys = 4096
 		// Restore deltas (bounded to maxFailedRestoreKeys) so transient lock/IO errors neither drop counts nor grow unbounded.
 		b.mu.Lock()
+		if b.epoch.Load() != startEpoch {
+			b.mu.Unlock()
+			return nil
+		}
 		var restoredArtViews int64
 		for k, v := range artSnap {
 			if _, ok := b.articleViews[k]; ok || len(b.articleViews) < maxFailedRestoreKeys {
@@ -385,6 +407,7 @@ func (b *viewAnalyticsBuffer) Reset() {
 		return
 	}
 	b.mu.Lock()
+	b.epoch.Add(1)
 	b.articleViews = make(map[string]int64)
 	b.pageViews = make(map[string]int64)
 	b.redirectHits = make(map[string]int64)

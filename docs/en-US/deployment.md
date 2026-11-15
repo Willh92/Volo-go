@@ -34,7 +34,7 @@
 | `VOLO_PUBLIC_URL` | `--public-url` | `http://localhost:8080` | Canonical public URL (used for Canonical tags, RSS/Podcast, Sitemap, WebAuthn Origin, and email links) |
 | `VOLO_TRUSTED_PROXIES` | `--trusted-proxies` | `127.0.0.1,::1` | Comma-separated trusted proxy IPs/CIDRs or `unix` (automatically trusts `unix` peers when UDS is active) |
 | `VOLO_ADMIN_PATH` | `--admin-path` | `/console` | Stealth admin console base prefix (also hot-reloadable without restart via `security.admin_path` / `dynamic_login_path`; default `/console`, `/login`, `/admin` return indistinguishable `404`s when customized) |
-| `VOLO_SECRET_KEY` | `--secret-key` | *(auto-generated)* | Master secret (`>= 32` high-entropy chars recommended; auto-generates `0600` `${VOLO_DATA_DIR}/.secret.key` if empty) |
+| `VOLO_SECRET_KEY` | `--secret-key` | *(auto-generated)* | Master secret (`>= 32` high-entropy chars recommended; auto-generates `0600` `${VOLO_DATA_DIR}/.secret.key` if empty; rotatable anytime across all 8 encrypted stores via `volo secret rotate`) |
 | `VOLO_DB_DRIVER` | `--db-driver` | *(unset -> `db.json`, fallback `sqlite`)* | Database driver: `sqlite`, `postgres`, or `mysql` (leave unset to preserve `/setup` wizard's `data/db.json`) |
 | `VOLO_DB_DSN` | `--db-dsn` | `${VOLO_DATA_DIR}/volo.db` | Database connection string (SQLite path, PostgreSQL URI, or MySQL DSN) |
 | `VOLO_DB_SIMPLE_PROTOCOL` | `--db-simple-protocol` | `false` | Enable PostgreSQL pure-Go `pgwire` simple query protocol for transaction poolers (Supabase / PgBouncer) |
@@ -74,7 +74,7 @@ VOLO_TLS_HTTP_REDIRECT_ADDR=:80
 - HTTP/2 is negotiated via ALPN (`h2`, HTTP/1.1 fallback). The redirect listener derives its target from `VOLO_PUBLIC_URL` (an explicit port in an `https://` public URL wins, otherwise the TLS listen port), never from the client `Host` header.
 - Binding ports below 1024 as the unprivileged `volo` user requires `CAP_NET_BIND_SERVICE`: add a drop-in via `sudo systemctl edit volo` containing `[Service]` + `AmbientCapabilities=CAP_NET_BIND_SERVICE`, then `sudo systemctl restart volo`. Outside systemd, `sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/volo` works too (re-apply after each upgrade; ignored under `NoNewPrivileges=true`).
 - Copy certificates to a path readable by the service user (e.g. an acme.sh `--install-cert` / certbot `--deploy-hook` into `/etc/volo/tls/` with `chown root:volo` + `chmod 0640` on the key) rather than pointing at root-only `/etc/letsencrypt/live`.
-- `volo doctor` adds a `tls_certificate` check (unreadable / mismatched / expired → fail, `< 14` days left → warn), and `volo healthcheck` automatically probes `https://` (certificate verification is skipped only for loopback probes).
+- Strictly read-only `volo doctor` adds a `tls_certificate` check (unreadable / mismatched / expired → fail, `< 14` days left → warn), and `volo healthcheck` automatically probes `GET /healthz` (live DB & runtime readiness) over `https://` (certificate verification is skipped only for loopback probes).
 
 ---
 
@@ -211,7 +211,7 @@ docker compose --profile postgres up -d
      ```bash
      mkdir -p data && sudo chown -R 65532:65532 data
      ```
-  2. **Do not bind-mount empty `./themes` or `./plugins` host directories** onto `/app/themes` or `/app/plugins`, as empty host directories will shadow the image-bundled themes (`volo-journal`) and plugins (`sensitive-words`). Optional standalone plugin packages such as Live2D Mascot (`plugin-kanbanniang-v2.0.2.zip` / `plugin-kanbanniang.zip`, see the [Official Plugin Catalog](../../plugins/README.md)) can be uploaded directly in **Admin Console -> Appearance & Extensions -> Plugins**.
+  2. **Do not bind-mount empty `./themes` or `./plugins` host directories** onto `/app/themes` or `/app/plugins`, as empty host directories will shadow the image-bundled themes (`volo-journal`) and plugins (`sensitive-words`). Standalone extensions — such as Live2D Mascot (`plugin-kanbanniang-v2.0.5.zip` with corner minimize/summon pill, see the [Official Plugin Catalog](../../plugins/README.md)) and official `zh-TW` / `ja-JP` language packs — can be installed in 1 click from the official catalog (`SHA256SUMS.txt` verified) or dragged-and-dropped via local `.zip` preflight in **Admin Console -> Appearance & Extensions**.
 
 ### 5.2 Database Engine DSN Examples (Explicit Pinning Mode)
 

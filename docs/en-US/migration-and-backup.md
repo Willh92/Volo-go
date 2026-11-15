@@ -72,6 +72,7 @@ volo-backup-20261108-010000.zip
 ```
 
 Built-in restore protections:
+- **Automatic `pre-restore-*.zip` Safety Snapshots**: Before overwriting a populated database during a live restore (non-`--dry-run` CLI or Admin Console restore), Volo-go automatically streams a `pre-restore-<UTC>.zip` safety snapshot into `${VOLO_BACKUP_DIR}` so you can roll back immediately if the wrong archive was selected;
 - **Pre-Write Digest Verification**: Every stream's byte length and `SHA-256` hash is verified before mutating database state; corrupted or tampered archives abort cleanly;
 - **Zip-Bomb & Path Traversal Guards**: Enforces `512 MiB` per-entry and `2 GiB` total unpacked caps while sanitizing relative media paths against `../` traversal;
 - **Batched Transactional Rollback**: Streams `200`-row batches inside a topological transaction so any failure rolls back atomically.
@@ -87,7 +88,8 @@ Moving an active blog from single-node SQLite to managed PostgreSQL (Supabase / 
 # 2. Point the target environment file at PostgreSQL:
 #    VOLO_DB_DRIVER=postgres
 #    VOLO_DB_DSN=postgres://volo:secret@db.internal:5432/volo?sslmode=verify-full
-#    IMPORTANT: Keep the same VOLO_SECRET_KEY (or data/.secret.key) so AES-256-GCM encrypted S3/SMTP/WebDAV/Webhook/plugin secrets decrypt seamlessly!
+#    IMPORTANT: Keep the same VOLO_SECRET_KEY (or data/.secret.key) during restore so AES-256-GCM secrets decrypt seamlessly;
+#    once restored, you can rotate the master key across all 8 encrypted stores anytime via `volo secret rotate`!
 
 # 3. Pre-verify with --dry-run, then stream-restore into PostgreSQL
 ./volo backup restore /tmp/site-full.zip --env-file /etc/volo/volo-pg.env --dry-run

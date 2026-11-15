@@ -34,7 +34,7 @@
 | `VOLO_PUBLIC_URL` | `--public-url` | `http://localhost:8080` | 站点规范公开 URL（用于 Canonical、RSS/Podcast、Sitemap、WebAuthn Origin 与邮件链接） |
 | `VOLO_TRUSTED_PROXIES` | `--trusted-proxies` | `127.0.0.1,::1` | 受信反向代理 IP/CIDR 白名单或 `unix`（激活 UDS 时默认自动信任本地 `unix` 连接） |
 | `VOLO_ADMIN_PATH` | `--admin-path` | `/console` | 隐身管理台基础前缀（亦可在管理台通过 `security.admin_path` / `dynamic_login_path` 免重启热切换；自定义后访问 `/console`、`/login`、`/admin` 返回无特征 `404`） |
-| `VOLO_SECRET_KEY` | `--secret-key` | *(自动生成)* | 主密钥（建议 `>= 32` 字符高熵随机串；留空时自动生成 `0600` 权限 `${VOLO_DATA_DIR}/.secret.key`） |
+| `VOLO_SECRET_KEY` | `--secret-key` | *(自动生成)* | 主密钥（建议 `>= 32` 字符高熵随机串；留空时自动生成 `0600` 权限 `${VOLO_DATA_DIR}/.secret.key`；支持随时通过 `volo secret rotate` 原子轮换并重加密全站 8 处密文存储） |
 | `VOLO_DB_DRIVER` | `--db-driver` | *(留空读取 `db.json`，回退 `sqlite`)* | 数据库驱动：`sqlite`、`postgres`、`mysql`（建议留空以保留 `/setup` 向导的 `data/db.json` 选择） |
 | `VOLO_DB_DSN` | `--db-dsn` | `${VOLO_DATA_DIR}/volo.db` | 数据库连接串（SQLite 文件路径、PostgreSQL URI 或 MySQL DSN） |
 | `VOLO_DB_SIMPLE_PROTOCOL` | `--db-simple-protocol` | `false` | 为 PostgreSQL 事务连接池（Supabase / PgBouncer）开启纯 Go `pgwire` Simple Query 协议 |
@@ -74,7 +74,7 @@ VOLO_TLS_HTTP_REDIRECT_ADDR=:80
 - 通过 ALPN 协商 HTTP/2（`h2`，自动回退 HTTP/1.1）。跳转监听的目标地址取自 `VOLO_PUBLIC_URL`（`https://` 公开地址中显式写明的端口优先，否则使用 TLS 监听端口），从不使用客户端 `Host` 头。
 - 以非特权 `volo` 用户监听 1024 以下端口需要 `CAP_NET_BIND_SERVICE`：执行 `sudo systemctl edit volo` 添加 `[Service]` 与 `AmbientCapabilities=CAP_NET_BIND_SERVICE`，然后 `sudo systemctl restart volo`。非 systemd 场景也可使用 `sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/volo`（每次升级后需重新执行；`NoNewPrivileges=true` 下不生效）。
 - 请将证书复制到服务用户可读的位置（如通过 acme.sh `--install-cert` / certbot `--deploy-hook` 复制到 `/etc/volo/tls/`，私钥 `chown root:volo` + `chmod 0640`），不要直接指向仅 root 可读的 `/etc/letsencrypt/live`。
-- `volo doctor` 新增 `tls_certificate` 检查（不可读 / 不匹配 / 已过期 → 失败，剩余 `< 14` 天 → 警告）；`volo healthcheck` 会自动改用 `https://` 探测（仅回环地址探测时跳过证书校验）。
+- 严格只读的 `volo doctor` 新增 `tls_certificate` 检查（不可读 / 不匹配 / 已过期 → 失败，剩余 `< 14` 天 → 警告）；`volo healthcheck` 会自动改用 `https://` 探测 `GET /healthz` 数据库与运行时就绪探针（仅回环地址探测时跳过证书校验）。
 
 ---
 
@@ -211,7 +211,7 @@ docker compose --profile postgres up -d
      ```bash
      mkdir -p data && sudo chown -R 65532:65532 data
      ```
-  2. **切勿挂载空的 `./themes` 或 `./plugins` 宿主机目录**至 `/app/themes` 或 `/app/plugins`，否则空目录会遮蔽镜像内预置的外部主题（如 `volo-journal`）与默认插件（如 `sensitive-words`）；如需安装大型独立发布插件（如 Live2D 看板娘 `plugin-kanbanniang-v2.0.2.zip` / `plugin-kanbanniang.zip`，详见 [官方插件目录](../../plugins/README.zh-CN.md)），可直接在管理台 **「外观与扩展 -> 插件扩展」** 上传 `.zip` 安装。
+  2. **切勿挂载空的 `./themes` 或 `./plugins` 宿主机目录**至 `/app/themes` 或 `/app/plugins`，否则空目录会遮蔽镜像内预置的外部主题（如 `volo-journal`）与默认插件（如 `sensitive-words`）；如需安装大型独立发布插件（如带边角最小化/召唤胶囊的 Live2D 看板娘 `plugin-kanbanniang-v2.0.5.zip`，详见 [官方插件目录](../../plugins/README.zh-CN.md)）或官方 `zh-TW` / `ja-JP` 语言包，可直接在管理台 **「外观与扩展」** 通过官方源一键在线直装（自动校验 `SHA256SUMS.txt`）或拖拽本地 `.zip` 预检安装。
 
 ### 5.2 三大数据库引擎 DSN 写法（固定环境变量模式）
 

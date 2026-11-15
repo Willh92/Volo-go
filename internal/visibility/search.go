@@ -373,6 +373,12 @@ func primaryLangTag(locale string) string {
 	return s
 }
 
+var searchLikeEscaper = strings.NewReplacer("!", "!!", "%", "!%", "_", "!_")
+
+func escapeSearchLikePattern(s string) string {
+	return searchLikeEscaper.Replace(s)
+}
+
 func (idx *SearchIndex) collectAllHits(ctx context.Context, tokens []string, locale string, sqlLimit int) ([]SearchHit, error) {
 	idx.mu.RLock()
 	docs := idx.docs
@@ -420,8 +426,8 @@ func (idx *SearchIndex) collectAllHits(ctx context.Context, tokens []string, loc
 		artArgs := make([]any, 0, 2+len(tokens)*5)
 		artArgs = append(artArgs, false, domain.ArticleStatusPublished)
 		for _, tok := range tokens {
-			pat := "%" + tok + "%"
-			artSB.WriteString(` AND (LOWER(title) LIKE ? OR LOWER(slug) LIKE ? OR LOWER(summary_md) LIKE ? OR (has_content_lock = ? AND LOWER(content_md) LIKE ?))`)
+			pat := "%" + escapeSearchLikePattern(tok) + "%"
+			artSB.WriteString(` AND (LOWER(title) LIKE ? ESCAPE '!' OR LOWER(slug) LIKE ? ESCAPE '!' OR LOWER(summary_md) LIKE ? ESCAPE '!' OR (has_content_lock = ? AND LOWER(content_md) LIKE ? ESCAPE '!'))`)
 			artArgs = append(artArgs, pat, pat, pat, false, pat)
 		}
 		artSB.WriteString(` ORDER BY is_pinned DESC, published_at DESC`)
@@ -466,8 +472,8 @@ func (idx *SearchIndex) collectAllHits(ctx context.Context, tokens []string, loc
 		pgArgs := make([]any, 0, 1+len(tokens)*3)
 		pgArgs = append(pgArgs, true)
 		for _, tok := range tokens {
-			pat := "%" + tok + "%"
-			pgSB.WriteString(` AND (LOWER(title) LIKE ? OR LOWER(slug) LIKE ? OR LOWER(content_md) LIKE ?)`)
+			pat := "%" + escapeSearchLikePattern(tok) + "%"
+			pgSB.WriteString(` AND (LOWER(title) LIKE ? ESCAPE '!' OR LOWER(slug) LIKE ? ESCAPE '!' OR LOWER(content_md) LIKE ? ESCAPE '!')`)
 			pgArgs = append(pgArgs, pat, pat, pat)
 		}
 		pgSB.WriteString(` ORDER BY updated_at DESC`)

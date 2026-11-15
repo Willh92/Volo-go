@@ -337,27 +337,46 @@ def main() -> int:
 
     ghcr_image = f"ghcr.io/{repo.lower()}:{ver_no_v}"
     plugin_line = ""
+    ext_links: list[str] = []
+    bundle_tags: set[str] = set()
     catalog_file = root / "plugins" / "catalog.json"
     if catalog_file.is_file():
         try:
             cat_data = json.loads(catalog_file.read_text(encoding="utf-8"))
-            standalone_links = []
             for entry in cat_data.get("plugins", []):
-                if isinstance(entry, dict) and entry.get("distribution") == "standalone-release":
+                if isinstance(entry, dict) and entry.get("release_tag"):
                     pid = entry.get("id", "")
                     pver = entry.get("version", "")
-                    ptag = entry.get("release_tag") or f"plugin-{pid}-v{pver}"
+                    ptag = entry.get("release_tag") or f"extensions-{tag}"
                     passet = entry.get("release_asset") or f"plugin-{pid}-v{pver}.zip"
-                    standalone_links.append(
-                        f"[`{pid}` `v{pver}` (`{passet}`)](https://github.com/{repo}/releases/tag/{ptag})"
-                    )
-            if standalone_links:
-                standalone_links.append(
-                    f"[插件目录 / Catalog](https://github.com/{repo}/blob/{tag}/plugins/README.zh-CN.md)"
-                )
-                plugin_line = f"- **可选独立插件包 / Optional Plugin Packages**: {' · '.join(standalone_links)}\n"
+                    dl_url = entry.get("download_url") or f"https://github.com/{repo}/releases/download/{ptag}/{passet}"
+                    bundle_tags.add(ptag)
+                    ext_links.append(f"[Plugin `{pid}` `v{pver}`]({dl_url})")
         except Exception:
-            plugin_line = ""
+            pass
+    theme_catalog_file = root / "themes" / "catalog.json"
+    if theme_catalog_file.is_file():
+        try:
+            tcat_data = json.loads(theme_catalog_file.read_text(encoding="utf-8"))
+            for entry in tcat_data.get("themes", []):
+                if isinstance(entry, dict) and entry.get("release_tag"):
+                    tid = entry.get("id", "")
+                    tver = entry.get("version", "")
+                    ttag = entry.get("release_tag") or f"extensions-{tag}"
+                    tasset = entry.get("release_asset") or f"theme-{tid}-v{tver}.zip"
+                    dl_url = entry.get("download_url") or f"https://github.com/{repo}/releases/download/{ttag}/{tasset}"
+                    bundle_tags.add(ttag)
+                    ext_links.append(f"[Theme `{tid}` `v{tver}`]({dl_url})")
+        except Exception:
+            pass
+    if ext_links:
+        if len(bundle_tags) == 1:
+            btag = next(iter(bundle_tags))
+            ext_links.insert(0, f"[Release `{btag}`](https://github.com/{repo}/releases/tag/{btag})")
+        ext_links.append(
+            f"[扩展目录 / Catalog](https://github.com/{repo}/blob/{tag}/plugins/README.zh-CN.md)"
+        )
+        plugin_line = f"- **官方独立插件与主题包 / Official Extensions Bundle**: {' · '.join(ext_links)}\n"
 
     footer = (
         "---\n\n"

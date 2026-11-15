@@ -10,8 +10,17 @@ COPY web/admin/package.json web/admin/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY internal/i18n/ /src/internal/i18n/
 COPY internal/theme/ /src/internal/theme/
+COPY .github/scripts/minify-plugin-assets.mjs /src/.github/scripts/minify-plugin-assets.mjs
+COPY plugins/sensitive-words/ /src/plugins/sensitive-words/
+COPY plugins/catalog.json /src/plugins/catalog.json
 COPY web/admin/ ./
-RUN rm -rf /src/internal/adminui/dist && mkdir -p /src/internal/adminui/dist && npm run build
+RUN rm -rf /src/internal/adminui/dist /src/dist-minified-plugins && \
+    mkdir -p /src/internal/adminui/dist /src/dist-minified-plugins && \
+    npm run build && \
+    node /src/.github/scripts/minify-plugin-assets.mjs \
+      --dir /src/plugins/sensitive-words \
+      --out-dir /src/dist-minified-plugins/sensitive-words && \
+    node -e 'const fs=require("fs");fs.writeFileSync("/src/dist-minified-plugins/catalog.json",JSON.stringify(JSON.parse(fs.readFileSync("/src/plugins/catalog.json","utf8"))));'
 
 # ------------------------------------------------------------------------------
 # Stage 2: Compile Pure-Go Static Binary (CGO_ENABLED=0)
@@ -19,7 +28,7 @@ RUN rm -rf /src/internal/adminui/dist && mkdir -p /src/internal/adminui/dist && 
 FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS go-builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=v1.0.2
+ARG VERSION=v1.0.3
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -33,6 +42,7 @@ COPY --from=admin-builder /src/internal/theme/builtin/volo-studio/assets_gz ./in
 COPY --from=admin-builder /src/internal/theme/builtin/volo-studio/templates_gz ./internal/theme/builtin/volo-studio/templates_gz
 COPY --from=admin-builder /src/internal/theme/builtin/volo-studio/theme.json.gz ./internal/theme/builtin/volo-studio/theme.json.gz
 COPY --from=admin-builder /src/internal/theme/builtin/volo-studio/preview.svg.gz ./internal/theme/builtin/volo-studio/preview.svg.gz
+COPY --from=admin-builder /src/dist-minified-plugins /src/dist-minified-plugins
 
 RUN CGO_ENABLED=0 GOEXPERIMENT=nojsonv2 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -buildvcs=false -trimpath \
@@ -53,8 +63,7 @@ RUN mkdir -p \
       /volo-root/plugins \
       /volo-root/themes \
       /volo-root/locales && \
-    cp -r /src/plugins/. /volo-root/plugins/ && \
-    rm -rf /volo-root/plugins/kanbanniang && \
+    cp -rf /src/dist-minified-plugins/. /volo-root/plugins/ && \
     chown -R 65532:65532 /volo-root
 
 # ------------------------------------------------------------------------------

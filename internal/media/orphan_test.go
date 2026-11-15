@@ -119,3 +119,95 @@ func TestOrphanScanner_PreservesImageViewQueryReferencedAssets(t *testing.T) {
 		}
 	}
 }
+
+func TestOrphanScanner_PreservesPluginKVAndSpacedFilenameAssets(t *testing.T) {
+	ctx, store, _, uploadDir, pipe, _, _ := setupMediaEnv(t)
+
+	now := time.Now().UnixMilli()
+	createLocalAsset := func(id, filename, objKey, pubURL string) domain.MediaAsset {
+		full := filepath.Join(uploadDir, filepath.FromSlash(objKey))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("media-bytes-"+id), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		a := domain.MediaAsset{
+			ID:            id,
+			UploaderID:    "u1",
+			OriginalName:  filename,
+			StorageDriver: "local",
+			ObjectKey:     objKey,
+			PublicURL:     pubURL,
+			MIMEType:      "image/jpeg",
+			SizeBytes:     int64(len("media-bytes-" + id)),
+			SHA256:        "sha-" + id,
+			CreatedAt:     now,
+		}
+		_, err := store.ExecContext(ctx,
+			`INSERT INTO media_assets (id, storage_driver, object_key, public_url, original_name, alt_text, mime_type, size_bytes, width, height, sha256, exif_stripped, uploader_id, created_at)
+			 VALUES (?, ?, ?, ?, ?, '', ?, ?, 0, 0, ?, 0, ?, ?)`,
+			a.ID, a.StorageDriver, a.ObjectKey, a.PublicURL, a.OriginalName, a.MIMEType, a.SizeBytes, a.SHA256, a.UploaderID, a.CreatedAt)
+		if err != nil {
+			t.Fatalf("insert media_asset %s: %v", id, err)
+		}
+		return a
+	}
+
+	// 1. Asset referenced only inside plugin_kv.value_text
+	kvAsset := createLocalAsset("m-kv", "banner.jpg", "2026/05/plugin-banner.jpg", "/uploads/2026/05/plugin-banner.jpg")
+	_, err := store.ExecContext(ctx,
+		`INSERT INTO plugin_kv (plugin_id, k, value_text, expires_at, updated_at) VALUES ('hero-plugin', 'slides', ?, 0, ?)`,
+		`{"hero":"/uploads/2026/05/plugin-banner.jpg","title":"Slide"}`, now)
+	if err != nil {
+		t.Fatalf("insert plugin_kv: %v", err)
+	}
+
+	// 2. Asset with spaces in filename/object_key referenced with literal spaces
+	rawSpaceAsset := createLocalAsset("m-space-raw", "my holiday photo.jpg", "legacy/2026/my holiday photo.jpg", "/uploads/legacy/2026/my holiday photo.jpg")
+	// 3. Asset with spaces in filename/object_key referenced via %20 URL-encoding
+	encSpaceAsset := createLocalAsset("m-space-enc", "summer trip 01.jpg", "legacy/2026/summer trip 01.jpg", "/uploads/legacy/2026/summer trip 01.jpg")
+	// 4. Unreferenced asset with spaces (must still be cleaned up)
+	orphanSpaceAsset := createLocalAsset("m-space-orphan", "unused draft pic.jpg", "legacy/2026/unused draft pic.jpg", "/uploads/legacy/2026/unused draft pic.jpg")
+
+	artMD := "Raw space: <img src=\"/uploads/legacy/2026/my holiday photo.jpg\">\n\n" +
+		"Encoded space: ![Trip](/uploads/legacy/2026/summer%20trip%2001.jpg?mode=2&w=800)\n"
+	_, err = store.ExecContext(ctx,
+		`INSERT INTO articles (id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md, cover_url, status, published_at, scheduled_at, is_pinned, allow_comment, password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes, audio_mime, lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count, created_at, updated_at)
+		 VALUES ('sp-art-1', 'u1', '', 'Spaced Media', 'spaced-media', '', '', ?, '', 'published', ?, 0, 0, 1, '', 0, '', 0, 0, '', 'zh-CN', '', '', 1, 1, 0, 0, ?, ?)`,
+		artMD, now, now, now)
+	if err != nil {
+		t.Fatalf("insert article: %v", err)
+	}
+
+	counts, err := media.CountAssetReferences(ctx, store, []domain.MediaAsset{kvAsset, rawSpaceAsset, encSpaceAsset, orphanSpaceAsset})
+	if err != nil {
+		t.Fatalf("CountAssetReferences: %v", err)
+	}
+	for _, want := range []domain.MediaAsset{kvAsset, rawSpaceAsset, encSpaceAsset} {
+		if counts[want.ID] < 1 {
+			t.Fatalf("expected %s (%s) reference count >= 1, got %d", want.ID, want.ObjectKey, counts[want.ID])
+		}
+	}
+	if counts[orphanSpaceAsset.ID] != 0 {
+		t.Fatalf("expected %s reference count = 0, got %d", orphanSpaceAsset.ID, counts[orphanSpaceAsset.ID])
+	}
+
+	orphans, err := pipe.ScanOrphans(ctx, true)
+	if err != nil {
+		t.Fatalf("ScanOrphans(true): %v", err)
+	}
+	if len(orphans) != 1 || orphans[0].ID != orphanSpaceAsset.ID {
+		t.Fatalf("expected only %s to be orphan, got %+v", orphanSpaceAsset.ID, orphans)
+	}
+
+	for _, keep := range []domain.MediaAsset{kvAsset, rawSpaceAsset, encSpaceAsset} {
+		p := filepath.Join(uploadDir, filepath.FromSlash(keep.ObjectKey))
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("expected referenced asset %s (%s) to survive ScanOrphans(true), stat err: %v", keep.ID, keep.ObjectKey, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(uploadDir, filepath.FromSlash(orphanSpaceAsset.ObjectKey))); !os.IsNotExist(err) {
+		t.Fatalf("expected unreferenced asset %s to be deleted", orphanSpaceAsset.ID)
+	}
+}

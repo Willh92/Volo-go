@@ -29,6 +29,7 @@ func mediaReferenceScopes() []mediaRefScope {
 		{query: `SELECT avatar_url, content_md FROM comments WHERE is_deleted = ?`, args: []any{false}},
 		{query: `SELECT value_json FROM settings`},
 		{query: `SELECT config_json FROM plugins`},
+		{query: `SELECT value_text FROM plugin_kv WHERE value_text <> ''`},
 		{query: `SELECT icon_url, description FROM follows`},
 		{query: `SELECT icon, url FROM nav_items`},
 		{query: `SELECT target_path FROM redirects`},
@@ -56,7 +57,7 @@ func (ns *orphanNullString) Scan(src any) error {
 // AssetCandidateKeys returns normalized URL, path, and object_key lookup keys for a MediaAsset.
 func AssetCandidateKeys(a domain.MediaAsset) []string {
 	var keys []string
-	add := func(k string) {
+	addOne := func(k string) {
 		if k == "" {
 			return
 		}
@@ -66,6 +67,15 @@ func AssetCandidateKeys(a domain.MediaAsset) []string {
 			}
 		}
 		keys = append(keys, k)
+	}
+	add := func(k string) {
+		addOne(k)
+		if strings.Contains(k, " ") {
+			addOne(strings.ReplaceAll(k, " ", "%20"))
+		}
+		if strings.Contains(k, "%20") {
+			addOne(strings.ReplaceAll(k, "%20", " "))
+		}
 	}
 	pubURL := strings.TrimSpace(a.PublicURL)
 	objKey := strings.TrimLeft(strings.TrimSpace(a.ObjectKey), "/")
@@ -414,6 +424,11 @@ func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []do
 	referenced := make([]bool, len(assets))
 	candidateToIdxs := make(map[string][]int, len(assets)*3)
 	matchedKeys := make(map[string]bool)
+	type spaceNeedle struct {
+		idx  int
+		keys []string
+	}
+	var spaceAssets []spaceNeedle
 	remaining := 0
 
 	for i, a := range assets {
@@ -422,8 +437,15 @@ func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []do
 			continue
 		}
 		remaining++
+		hasSpace := false
 		for _, k := range keys {
 			candidateToIdxs[k] = append(candidateToIdxs[k], i)
+			if strings.ContainsAny(k, " \t") {
+				hasSpace = true
+			}
+		}
+		if hasSpace {
+			spaceAssets = append(spaceAssets, spaceNeedle{idx: i, keys: keys})
 		}
 	}
 	if remaining == 0 {
@@ -451,6 +473,27 @@ func (p *Pipeline) streamReferencedAssetIndexes(ctx context.Context, assets []do
 					}
 				}
 			})
+			if len(spaceAssets) > 0 && remaining > 0 {
+				norm := col.val
+				if strings.Index(norm, `\/`) >= 0 {
+					norm = strings.ReplaceAll(norm, `\/`, "/")
+				}
+				for _, sp := range spaceAssets {
+					if referenced[sp.idx] {
+						continue
+					}
+					for _, k := range sp.keys {
+						if k != "" && strings.Contains(norm, k) {
+							referenced[sp.idx] = true
+							remaining--
+							break
+						}
+					}
+					if remaining == 0 {
+						break
+					}
+				}
+			}
 			if remaining == 0 {
 				return false
 			}

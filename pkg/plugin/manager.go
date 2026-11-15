@@ -33,6 +33,7 @@ import (
 	"github.com/Willh92/Volo-go/internal/config"
 	"github.com/Willh92/Volo-go/internal/db/sqlx"
 	"github.com/Willh92/Volo-go/internal/domain"
+	"github.com/Willh92/Volo-go/internal/extpkg"
 	"github.com/Willh92/Volo-go/internal/i18n"
 	"github.com/Willh92/Volo-go/internal/render"
 	"github.com/Willh92/Volo-go/internal/security"
@@ -185,6 +186,12 @@ type UninstallListener interface {
 	OnUninstall(ctx context.Context) error
 }
 
+// UpdateChecker is an optional interface that BuiltinPlugin implementations may implement
+// to report new versions/changelogs without allocating external processes or runtimes.
+type UpdateChecker interface {
+	CheckUpdate(ctx context.Context, locale string) (extpkg.UpdateCheckResult, error)
+}
+
 func safeCallBuiltin(pluginID string, stage string, fn func() error) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -259,29 +266,32 @@ func (h *HostContext) CronJobs() []CronJobSnapshot {
 
 // PluginSummary is the safe, secret-masked view returned to Admin REST APIs.
 type PluginSummary struct {
-	ID            string            `json:"id"`
-	Kind          string            `json:"kind"` // builtin | external
-	Runtime       string            `json:"runtime"`
-	Version       string            `json:"version"`
-	Priority      int               `json:"priority"`
-	Name          string            `json:"name"`
-	Description   string            `json:"description"`
-	Author        string            `json:"author,omitempty"`
-	Homepage      string            `json:"homepage,omitempty"`
-	IsEnabled     bool              `json:"is_enabled"`
-	CircuitState  string            `json:"circuit_state"`
-	FailureCount  int               `json:"failure_count"`
-	LastError     string            `json:"last_error,omitempty"`
-	Permissions   []string          `json:"permissions"`
-	Hooks         []string          `json:"hooks,omitempty"`
-	AllowedHosts  []string          `json:"allowed_hosts"`
-	ConfigSchema  []ConfigField     `json:"config_schema"`
-	PublicConfig  map[string]any    `json:"public_config"`
-	Config        map[string]any    `json:"config,omitempty"`
-	SecretKeysSet map[string]bool   `json:"secret_keys_set"`
-	CronJobs      []CronJobSnapshot `json:"cron_jobs,omitempty"`
-	InstalledAt   int64             `json:"installed_at"`
-	UpdatedAt     int64             `json:"updated_at"`
+	ID               string               `json:"id"`
+	Kind             string               `json:"kind"` // builtin | external
+	Runtime          string               `json:"runtime"`
+	Version          string               `json:"version"`
+	MinHostVersion   string               `json:"min_host_version,omitempty"`
+	Priority         int                  `json:"priority"`
+	Name             string               `json:"name"`
+	Description      string               `json:"description"`
+	Author           string               `json:"author,omitempty"`
+	Homepage         string               `json:"homepage,omitempty"`
+	IsEnabled        bool                 `json:"is_enabled"`
+	CircuitState     string               `json:"circuit_state"`
+	FailureCount     int                  `json:"failure_count"`
+	LastError        string               `json:"last_error,omitempty"`
+	Permissions      []string             `json:"permissions"`
+	Hooks            []string             `json:"hooks,omitempty"`
+	AllowedHosts     []string             `json:"allowed_hosts"`
+	ConfigSchema     []ConfigField        `json:"config_schema"`
+	PublicConfig     map[string]any       `json:"public_config"`
+	Config           map[string]any       `json:"config,omitempty"`
+	SecretKeysSet    map[string]bool      `json:"secret_keys_set"`
+	CronJobs         []CronJobSnapshot    `json:"cron_jobs,omitempty"`
+	UpdateCapability string               `json:"update_capability"`
+	UpdateStatus     *extpkg.UpdateStatus `json:"update_status,omitempty"`
+	InstalledAt      int64                `json:"installed_at"`
+	UpdatedAt        int64                `json:"updated_at"`
 }
 
 // EditorQuickInsertView describes a localized quick-insert button for CodeMirror 6.
@@ -300,6 +310,8 @@ type ManagerOptions struct {
 	SecretSealer          SecretSealer
 	PluginsDir            string
 	DataDir               string
+	HostVersion           string
+	OutboundDialer        *security.OutboundSafeDialer
 	Catalog               *i18n.Catalog
 	Providers             *ProviderRegistry
 	HookTimeout           time.Duration
@@ -311,23 +323,24 @@ type ManagerOptions struct {
 }
 
 type managedPlugin struct {
-	mu             sync.Mutex
-	manifest       Manifest
-	kind           string // "builtin" | "external"
-	pluginDir      string
-	builtin        BuiltinPlugin
-	gojaRT         *gojaPluginRuntime
-	kv             *KVStore
-	enabled        bool
-	runtimeActive  bool
-	priority       int
-	customPriority bool
-	prioritySnap   atomic.Int64
-	circuitState   string
-	failureCount   int
-	lastError      string
-	installedAt    int64
-	updatedAt      int64
+	mu                sync.Mutex
+	manifest          Manifest
+	kind              string // "builtin" | "external"
+	pluginDir         string
+	builtin           BuiltinPlugin
+	gojaRT            *gojaPluginRuntime
+	kv                *KVStore
+	enabled           bool
+	runtimeActive     bool
+	hasUpdateHookHint bool
+	priority          int
+	customPriority    bool
+	prioritySnap      atomic.Int64
+	circuitState      string
+	failureCount      int
+	lastError         string
+	installedAt       int64
+	updatedAt         int64
 
 	publicConfig  map[string]any
 	secretConfig  map[string]string
@@ -416,6 +429,7 @@ func (mp *managedPlugin) getConfigMap() map[string]any {
 // Manager orchestrates built-in and external goja plugins, persistent plugin_kv, capability sandboxes,
 // automatic circuit breaking, .zip hot installation, unified cron scheduling, and /plugins/<id>/* HTTP serving.
 type Manager struct {
+	lifecycleMu           sync.RWMutex
 	mu                    sync.RWMutex
 	store                 *sqlx.Store
 	keys                  *config.KeyRing
@@ -441,6 +455,18 @@ type Manager struct {
 	assetGzipCache pluginAssetGzipCache
 	plugins        map[string]*managedPlugin
 	closed         bool
+
+	hostVersion        string
+	outboundDialer     *security.OutboundSafeDialer
+	metaFetcher        *extpkg.MetadataFetcher
+	officialCatalogURL atomic.Pointer[string]
+
+	installLocksMu sync.Mutex
+	installLocks   map[string]*sync.Mutex
+
+	updateMu       sync.RWMutex
+	updateCache    map[string]cachedPluginUpdate
+	updateInflight map[string]*pluginUpdateCall
 }
 
 // NewManager constructs a Plugin Manager.
@@ -488,6 +514,12 @@ func NewManager(opts ManagerOptions) *Manager {
 		customResolver:        opts.CustomResolver,
 		allowLoopbackForTests: opts.AllowLoopbackForTests,
 		plugins:               make(map[string]*managedPlugin),
+		hostVersion:           strings.TrimSpace(opts.HostVersion),
+		outboundDialer:        opts.OutboundDialer,
+		metaFetcher:           extpkg.NewMetadataFetcher(),
+		installLocks:          make(map[string]*sync.Mutex),
+		updateCache:           make(map[string]cachedPluginUpdate),
+		updateInflight:        make(map[string]*pluginUpdateCall),
 	}
 	mgr.cron = newCronRegistry(defaultMaxCronConcurrency, mgr.effectiveCronUnit, mgr.executeScheduledCron)
 	return mgr
@@ -613,13 +645,32 @@ func (m *Manager) inspectRequest(r *http.Request) (bool, string) {
 	return false, ""
 }
 
+func (m *Manager) isClosed() bool {
+	if m == nil {
+		return true
+	}
+	m.mu.RLock()
+	closed := m.closed
+	m.mu.RUnlock()
+	return closed
+}
+
 // RegisterBuiltin registers a compiled-in Go plugin prior to or after DiscoverAndStart.
 func (m *Manager) RegisterBuiltin(ctx context.Context, bp BuiltinPlugin) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return errors.New("plugin: manager is closed")
+	}
 	manifest := bp.Manifest()
 	manifest.Runtime = RuntimeBuiltin
 	if err := manifest.Validate(); err != nil {
 		return err
 	}
+	lk := m.pluginInstallLock(manifest.ID)
+	lk.Lock()
+	defer lk.Unlock()
+
 	mp, err := m.syncRecordWithDB(ctx, manifest, "builtin", "", bp)
 	if err != nil {
 		return err
@@ -629,6 +680,7 @@ func (m *Manager) RegisterBuiltin(ctx context.Context, bp BuiltinPlugin) error {
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
 	m.assetGzipCache.deletePlugin(manifest.ID)
+	m.invalidateUpdateStatus(manifest.ID)
 
 	if mp.enabled && mp.circuitState == CircuitClosed {
 		return m.activateRuntime(ctx, mp)
@@ -640,6 +692,22 @@ func (m *Manager) RegisterBuiltin(ctx context.Context, bp BuiltinPlugin) error {
 // reconciles state with the `plugins` table, and activates newly discovered enabled plugins.
 // Calling DiscoverAndStart multiple times is idempotent and never overwrites active runtimes or cron goroutines.
 func (m *Manager) DiscoverAndStart(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.isClosed() {
+		return errors.New("plugin: manager is closed")
+	}
+	if strings.TrimSpace(m.pluginsDir) == "" {
+		return nil
+	}
+	m.recoverInterruptedSwaps()
+	return m.discoverExternalPluginsLocked(ctx)
+}
+
+func (m *Manager) discoverExternalPluginsLocked(ctx context.Context) error {
 	if strings.TrimSpace(m.pluginsDir) == "" {
 		return nil
 	}
@@ -697,12 +765,22 @@ func (m *Manager) DiscoverAndStart(ctx context.Context) error {
 	return nil
 }
 
-// ReloadAll synchronizes every already-registered plugin with the database (e.g. after full-site DB restore),
-// stops runtimes that became disabled, re-activates enabled plugins with updated config, and discovers any new plugins on disk.
+// ReloadAll synchronizes every already-registered plugin with disk manifests and the database
+// (e.g. after full-site restore), clears asset caches, stops runtimes that became disabled or removed,
+// re-activates enabled plugins with updated config, and discovers any new plugins on disk.
 func (m *Manager) ReloadAll(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.isClosed() {
+		return errors.New("plugin: manager is closed")
+	}
+
+	m.assetGzipCache.clear()
+	m.clearAllUpdateStatus()
+
 	m.mu.RLock()
 	ids := make([]string, 0, len(m.plugins))
 	for id := range m.plugins {
@@ -717,12 +795,78 @@ func (m *Manager) ReloadAll(ctx context.Context) error {
 			continue
 		}
 		m.deactivateRuntime(ctx, existing)
-		synced, err := m.syncRecordWithDB(ctx, existing.manifest, existing.kind, existing.pluginDir, existing.builtin)
+
+		existing.mu.Lock()
+		kind := existing.kind
+		pluginDir := existing.pluginDir
+		builtinImpl := existing.builtin
+		targetManifest := existing.manifest
+		existing.mu.Unlock()
+
+		if kind == "external" {
+			if pluginDir == "" && strings.TrimSpace(m.pluginsDir) != "" {
+				pluginDir = filepath.Join(m.pluginsDir, pid)
+			}
+			if pluginDir == "" {
+				m.mu.Lock()
+				delete(m.plugins, pid)
+				m.mu.Unlock()
+				m.providers.DetachPlugin(pid)
+				if m.cron != nil {
+					m.cron.UnregisterPlugin(pid, true)
+				}
+				continue
+			}
+			manifestBytes, rErr := os.ReadFile(filepath.Join(pluginDir, "manifest.json"))
+			if rErr != nil {
+				if !os.IsNotExist(rErr) {
+					m.logger.Write(pid, "error", "reload_all", rErr.Error())
+				}
+				m.mu.Lock()
+				delete(m.plugins, pid)
+				m.mu.Unlock()
+				m.providers.DetachPlugin(pid)
+				if m.cron != nil {
+					m.cron.UnregisterPlugin(pid, true)
+				}
+				continue
+			}
+			diskManifest, pErr := ParseManifest(manifestBytes)
+			if pErr != nil {
+				m.logger.Write(pid, "error", "reload_all", pErr.Error())
+				m.mu.Lock()
+				delete(m.plugins, pid)
+				m.mu.Unlock()
+				m.providers.DetachPlugin(pid)
+				if m.cron != nil {
+					m.cron.UnregisterPlugin(pid, true)
+				}
+				continue
+			}
+			if diskManifest.ID != pid {
+				m.logger.Write(pid, "error", "reload_all", "directory name does not match manifest.id")
+				m.mu.Lock()
+				delete(m.plugins, pid)
+				m.mu.Unlock()
+				m.providers.DetachPlugin(pid)
+				if m.cron != nil {
+					m.cron.UnregisterPlugin(pid, true)
+				}
+				continue
+			}
+			targetManifest = diskManifest
+		}
+
+		synced, err := m.syncRecordWithDB(ctx, targetManifest, kind, pluginDir, builtinImpl)
 		if err != nil {
 			m.logger.Write(pid, "error", "reload_all", err.Error())
 			continue
 		}
 		existing.mu.Lock()
+		existing.manifest = targetManifest
+		existing.pluginDir = pluginDir
+		existing.hasUpdateHookHint = synced.hasUpdateHookHint
+		existing.setPriorityLocked(synced.priority, synced.customPriority)
 		existing.enabled = synced.enabled
 		existing.circuitState = synced.circuitState
 		existing.failureCount = synced.failureCount
@@ -740,7 +884,7 @@ func (m *Manager) ReloadAll(ctx context.Context) error {
 			}
 		}
 	}
-	return m.DiscoverAndStart(ctx)
+	return m.discoverExternalPluginsLocked(ctx)
 }
 
 // ClearPluginKV deletes all key-value entries stored by pluginID in plugin_kv without bumping content dataRev.
@@ -748,10 +892,18 @@ func (m *Manager) ClearPluginKV(ctx context.Context, pluginID string) (int64, er
 	if m == nil || m.store == nil {
 		return 0, errors.New("plugin: store unavailable")
 	}
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return 0, errors.New("plugin: manager is closed")
+	}
 	idClean := strings.TrimSpace(pluginID)
 	if !validPluginIDRe.MatchString(idClean) {
 		return 0, fmt.Errorf("plugin: invalid plugin id %q", pluginID)
 	}
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
 	mp, ok := m.getPlugin(idClean)
 	if !ok {
 		return 0, fmt.Errorf("plugin %q not found", idClean)
@@ -802,6 +954,14 @@ func (m *Manager) ReloadPlugin(ctx context.Context, pluginID string, locale stri
 	if !validPluginIDRe.MatchString(idClean) {
 		return PluginSummary{}, fmt.Errorf("plugin: invalid plugin id %q", idClean)
 	}
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return PluginSummary{}, errors.New("plugin: manager is closed")
+	}
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
 
 	existing, exists := m.getPlugin(idClean)
 	if exists && existing.kind == "builtin" {
@@ -850,6 +1010,7 @@ func (m *Manager) ReloadPlugin(ctx context.Context, pluginID string, locale stri
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
 	m.assetGzipCache.deletePlugin(manifest.ID)
+	m.invalidateUpdateStatus(manifest.ID)
 
 	mp.mu.Lock()
 	shouldActivate := mp.enabled && mp.circuitState == CircuitClosed
@@ -974,19 +1135,20 @@ func (m *Manager) syncRecordWithDB(
 	}
 
 	mp := &managedPlugin{
-		manifest:     manifest,
-		kind:         kind,
-		pluginDir:    pluginDir,
-		builtin:      builtin,
-		kv:           NewKVStore(m.store, manifest.ID),
-		enabled:      existing.IsEnabled,
-		circuitState: existing.CircuitState,
-		failureCount: existing.FailureCount,
-		lastError:    existing.LastError,
-		installedAt:  existing.InstalledAt,
-		updatedAt:    existing.UpdatedAt,
-		publicConfig: pubCfg,
-		secretConfig: secretCfg,
+		manifest:          manifest,
+		kind:              kind,
+		pluginDir:         pluginDir,
+		builtin:           builtin,
+		kv:                NewKVStore(m.store, manifest.ID),
+		enabled:           existing.IsEnabled,
+		hasUpdateHookHint: detectUpdateHookHint(kind, manifest, pluginDir, builtin),
+		circuitState:      existing.CircuitState,
+		failureCount:      existing.FailureCount,
+		lastError:         existing.LastError,
+		installedAt:       existing.InstalledAt,
+		updatedAt:         existing.UpdatedAt,
+		publicConfig:      pubCfg,
+		secretConfig:      secretCfg,
 	}
 	mp.setPriorityLocked(effPriority, hasCustomPriority)
 	mp.rebuildConfigSnapshot()
@@ -1076,7 +1238,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			dialer: &security.OutboundSafeDialer{
 				AllowedHosts:          mp.manifest.EffectiveAllowedHosts(),
 				Timeout:               5 * time.Second,
-				Resolver:              m.customResolver,
+				Resolver:              m.effectiveResolver(),
 				AllowLoopbackForTests: m.allowLoopbackForTests,
 			},
 		}
@@ -1100,7 +1262,7 @@ func (m *Manager) activateRuntime(ctx context.Context, mp *managedPlugin) error 
 			getConfig:             mp.getConfigMap,
 			unsealSecret:          m.unsealSecretValue,
 			getSiteInfo:           m.getSiteInfo,
-			customResolver:        m.customResolver,
+			customResolver:        m.effectiveResolver(),
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		})
 		if err != nil {
@@ -1251,6 +1413,19 @@ func (m *Manager) runSingleCron(ctx context.Context, mp *managedPlugin, handler 
 
 // Enable enables a plugin (fail-closed if circuit is open until ResetCircuit is called, or auto-resets when requested).
 func (m *Manager) Enable(ctx context.Context, pluginID string) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return errors.New("plugin: manager is closed")
+	}
+	idClean := strings.TrimSpace(pluginID)
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
+	return m.enableLocked(ctx, idClean)
+}
+
+func (m *Manager) enableLocked(ctx context.Context, pluginID string) error {
 	mp, ok := m.getPlugin(pluginID)
 	if !ok {
 		return fmt.Errorf("plugin: %q not found", pluginID)
@@ -1293,6 +1468,16 @@ func (m *Manager) Enable(ctx context.Context, pluginID string) error {
 
 // Disable hot-stops a plugin immediately without restarting Volo-go.
 func (m *Manager) Disable(ctx context.Context, pluginID string) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	idClean := strings.TrimSpace(pluginID)
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
+	return m.disableLocked(ctx, idClean)
+}
+
+func (m *Manager) disableLocked(ctx context.Context, pluginID string) error {
 	mp, ok := m.getPlugin(pluginID)
 	if !ok {
 		return fmt.Errorf("plugin: %q not found", pluginID)
@@ -1314,7 +1499,16 @@ func (m *Manager) Disable(ctx context.Context, pluginID string) error {
 
 // ResetCircuit clears CIRCUIT_OPEN state and failure counters so an administrator can re-enable a repaired plugin.
 func (m *Manager) ResetCircuit(ctx context.Context, pluginID string) error {
-	mp, ok := m.getPlugin(pluginID)
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return errors.New("plugin: manager is closed")
+	}
+	idClean := strings.TrimSpace(pluginID)
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
+	mp, ok := m.getPlugin(idClean)
 	if !ok {
 		return fmt.Errorf("plugin: %q not found", pluginID)
 	}
@@ -1326,11 +1520,11 @@ func (m *Manager) ResetCircuit(ctx context.Context, pluginID string) error {
 	mp.updatedAt = now
 	mp.mu.Unlock()
 
-	m.logger.Write(pluginID, "info", "circuit", "circuit breaker manually reset to CLOSED")
+	m.logger.Write(idClean, "info", "circuit", "circuit breaker manually reset to CLOSED")
 	_, err := m.store.ExecContext(
 		ctx,
 		`UPDATE plugins SET circuit_state = ?, failure_count = 0, last_error = '', updated_at = ? WHERE id = ?`,
-		CircuitClosed, now, pluginID,
+		CircuitClosed, now, idClean,
 	)
 	return err
 }
@@ -1355,10 +1549,20 @@ func invalidateOIDCDiscoveryKV(ctx context.Context, kv *KVStore) {
 // persists to DB, atomically refreshes the live in-memory config snapshot without restarting VMs, and notifies
 // optional onConfigChange(cfg) hooks (e.g. to reschedule dynamic cron jobs).
 func (m *Manager) UpdateConfig(ctx context.Context, pluginID string, patch map[string]any, locale string) (PluginSummary, error) {
-	mp, ok := m.getPlugin(pluginID)
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return PluginSummary{}, errors.New("plugin: manager is closed")
+	}
+	idClean := strings.TrimSpace(pluginID)
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
+	mp, ok := m.getPlugin(idClean)
 	if !ok {
 		return PluginSummary{}, fmt.Errorf("plugin: %q not found", pluginID)
 	}
+	pluginID = idClean
 
 	cleanPatch := make(map[string]any, len(patch))
 	var patchPriority int
@@ -1965,9 +2169,37 @@ func isLikelySecretStateKey(k string) bool {
 	return strings.HasSuffix(lk, "_secret") || strings.HasSuffix(lk, "_api_key") || strings.HasSuffix(lk, "_token")
 }
 
+type installZipOptions struct {
+	overwrite           bool
+	enableAfter         bool
+	expectedPluginID    string
+	expectedPrevVersion string
+	disallowDowngrade   bool
+	locale              string
+}
+
 // InstallFromZip safely validates and extracts an external plugin .zip package with strict anti-Zip-Slip,
-// symlink rejection, anti-Zip-Bomb byte limits, manifest validation, and goja dry-run compilation.
+// symlink rejection, anti-Zip-Bomb byte limits, manifest validation, goja dry-run compilation,
+// host version compatibility checks, and two-phase transactional rollback.
 func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size int64, overwrite bool, locale string) (PluginSummary, error) {
+	return m.installFromZipInternal(ctx, readerAt, size, installZipOptions{
+		overwrite: overwrite,
+		locale:    locale,
+	})
+}
+
+func (m *Manager) installFromZipInternal(
+	ctx context.Context,
+	readerAt io.ReaderAt,
+	size int64,
+	opts installZipOptions,
+) (PluginSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return PluginSummary{}, err
+	}
+	if m.isClosed() {
+		return PluginSummary{}, errors.New("plugin: manager is closed")
+	}
 	if strings.TrimSpace(m.pluginsDir) == "" {
 		return PluginSummary{}, errors.New("plugin: external plugins directory is not configured")
 	}
@@ -1998,6 +2230,9 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 
 	var totalExtracted int64
 	for _, zf := range zr.File {
+		if err := ctx.Err(); err != nil {
+			return PluginSummary{}, err
+		}
 		mode := zf.Mode()
 		if mode&os.ModeSymlink != 0 || (!zf.FileInfo().IsDir() && !mode.IsRegular()) {
 			return PluginSummary{}, fmt.Errorf("plugin: disallowed non-regular or symlink entry %q in zip", zf.Name)
@@ -2059,55 +2294,121 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 	if err != nil {
 		return PluginSummary{}, err
 	}
+	if opts.expectedPluginID != "" && manifest.ID != opts.expectedPluginID {
+		return PluginSummary{}, fmt.Errorf("plugin: archive manifest id %q does not match expected %q", manifest.ID, opts.expectedPluginID)
+	}
 	if manifest.Runtime != RuntimeGoja {
 		return PluginSummary{}, fmt.Errorf("plugin %q: external zip plugins must use runtime \"goja\"", manifest.ID)
 	}
+	if !m.allowLoopbackForTests && manifest.Update != nil && manifest.Update.URL != "" {
+		if _, uErr := extpkg.ValidatePublicHTTPURL(manifest.Update.URL, false); uErr != nil {
+			return PluginSummary{}, fmt.Errorf("plugin %q: update.url: %w", manifest.ID, uErr)
+		}
+	}
+	if !extpkg.IsHostCompatible(m.effectiveHostVersion(), manifest.MinHostVersion) {
+		return PluginSummary{}, fmt.Errorf(
+			"plugin %q v%s requires host Volo-go >= %s (current: %s)",
+			manifest.ID, manifest.Version, manifest.MinHostVersion, m.effectiveHostVersion(),
+		)
+	}
 
 	// Dry-run compile entry JS before touching existing installation.
-	if _, err := newGojaPluginRuntime(gojaRuntimeOptions{
-		manifest:  manifest,
-		pluginDir: contentRoot,
-		logger:    m.logger,
-		hostI18n:  m.catalog,
-		getConfig: func() map[string]any { return nil },
-	}); err != nil {
+	dryRT, err := newGojaPluginRuntime(gojaRuntimeOptions{
+		manifest:       manifest,
+		pluginDir:      contentRoot,
+		logger:         m.logger,
+		hostI18n:       m.catalog,
+		getConfig:      func() map[string]any { return nil },
+		customResolver: m.effectiveResolver(),
+	})
+	if err != nil {
+		return PluginSummary{}, err
+	}
+	hasCallableCheck := dryRT.hasCallable("onCheckUpdate")
+	dryRT.closeRuntime()
+
+	// Final cancelation gate before entering atomic commit phase.
+	if err := ctx.Err(); err != nil {
 		return PluginSummary{}, err
 	}
 
-	// Check existing plugin conflict and capture previous version + enabled state for upgrade lifecycle.
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return PluginSummary{}, errors.New("plugin: manager is closed")
+	}
+
+	installLock := m.pluginInstallLock(manifest.ID)
+	installLock.Lock()
+	defer installLock.Unlock()
+
+	commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer commitCancel()
+
+	// Capture existing state for transactional rollback if post-swap DB sync or re-enable fails.
 	targetDir := filepath.Join(m.pluginsDir, manifest.ID)
 	existingMP, exists := m.getPlugin(manifest.ID)
 	prevVersion := ""
 	isUpgrade := false
 	wasEnabled := false
+	var prevManifest Manifest
 	if exists {
 		if existingMP.kind == "builtin" {
 			return PluginSummary{}, fmt.Errorf("plugin %q conflicts with a built-in plugin", manifest.ID)
 		}
-		if !overwrite {
+		if !opts.overwrite {
 			return PluginSummary{}, fmt.Errorf("plugin %q is already installed (set overwrite=true to upgrade)", manifest.ID)
 		}
 		existingMP.mu.Lock()
-		wasEnabled = existingMP.enabled
+		wasEnabled = existingMP.enabled && existingMP.circuitState != CircuitOpen
+		prevManifest = existingMP.manifest
 		existingMP.mu.Unlock()
-		prevVersion = existingMP.manifest.Version
+		prevVersion = prevManifest.Version
 		isUpgrade = true
-		if dErr := m.Disable(ctx, manifest.ID); dErr != nil {
-			slog.Warn("plugin: disable before upgrade failed", "plugin_id", manifest.ID, "err", dErr)
-		}
 	} else {
-		if _, statErr := os.Stat(targetDir); statErr == nil && !overwrite {
+		if _, statErr := os.Stat(targetDir); statErr == nil && !opts.overwrite {
 			return PluginSummary{}, fmt.Errorf("plugin directory %q already exists", manifest.ID)
 		}
-		var dbRec domain.PluginRecord
-		if dbErr := sqlx.GetInto(ctx, m.store, &dbRec, `SELECT version, is_enabled FROM plugins WHERE id = ?`, manifest.ID); dbErr == nil {
-			if dbRec.Version != "" {
-				prevVersion = dbRec.Version
-				isUpgrade = true
-			}
-			if overwrite && dbRec.IsEnabled {
-				wasEnabled = true
-			}
+	}
+
+	var prevDBRec domain.PluginRecord
+	hadDBRec := false
+	if dbErr := sqlx.GetInto(
+		commitCtx,
+		m.store,
+		&prevDBRec,
+		`SELECT id, kind, version, is_enabled, config_json, secret_ciphertext, circuit_state, failure_count, last_error, installed_at, updated_at
+		 FROM plugins WHERE id = ?`,
+		manifest.ID,
+	); dbErr == nil {
+		hadDBRec = true
+		if prevVersion == "" && prevDBRec.Version != "" {
+			prevVersion = prevDBRec.Version
+			isUpgrade = true
+		}
+		if !exists && opts.overwrite && prevDBRec.IsEnabled && prevDBRec.CircuitState != CircuitOpen {
+			wasEnabled = true
+		}
+	}
+
+	if opts.expectedPrevVersion != "" && prevVersion != opts.expectedPrevVersion {
+		return PluginSummary{}, fmt.Errorf(
+			"plugin %q: concurrent version change detected (expected v%s, found v%s)",
+			manifest.ID, opts.expectedPrevVersion, prevVersion,
+		)
+	}
+	if opts.disallowDowngrade && prevVersion != "" {
+		if cmp, ok := extpkg.CompareSemVer(manifest.Version, prevVersion); !ok || cmp <= 0 {
+			return PluginSummary{}, fmt.Errorf(
+				"plugin %q: downgrade or same-version install rejected (target v%s <= current v%s)",
+				manifest.ID, manifest.Version, prevVersion,
+			)
+		}
+	}
+
+	if exists {
+		if dErr := m.disableLocked(commitCtx, manifest.ID); dErr != nil {
+			slog.Warn("plugin: disable before upgrade failed", "plugin_id", manifest.ID, "err", dErr)
 		}
 	}
 
@@ -2115,6 +2416,9 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 	hadOldDir := false
 	if _, statErr := os.Stat(targetDir); statErr == nil {
 		if err := os.Rename(targetDir, backupDir); err != nil {
+			if exists && wasEnabled && (!hadDBRec || prevDBRec.CircuitState != CircuitOpen) {
+				_ = m.enableLocked(commitCtx, manifest.ID)
+			}
 			return PluginSummary{}, fmt.Errorf("plugin: backup existing dir: %w", err)
 		}
 		hadOldDir = true
@@ -2123,77 +2427,167 @@ func (m *Manager) InstallFromZip(ctx context.Context, readerAt io.ReaderAt, size
 		if hadOldDir {
 			_ = os.Rename(backupDir, targetDir)
 		}
+		if exists && wasEnabled && (!hadDBRec || prevDBRec.CircuitState != CircuitOpen) {
+			_ = m.enableLocked(commitCtx, manifest.ID)
+		}
 		return PluginSummary{}, fmt.Errorf("plugin: move staged plugin into place: %w", err)
-	}
-	if hadOldDir {
-		_ = os.RemoveAll(backupDir)
 	}
 	m.assetGzipCache.deletePlugin(manifest.ID)
 
-	mp, err := m.syncRecordWithDB(ctx, manifest, "external", targetDir, nil)
-	if err != nil {
-		return PluginSummary{}, err
+	rollback := func(cause error) error {
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer rbCancel()
+
+		if curMP, ok := m.getPlugin(manifest.ID); ok {
+			m.deactivateRuntime(rbCtx, curMP)
+		}
+		_ = os.RemoveAll(targetDir)
+		if hadOldDir {
+			if rErr := os.Rename(backupDir, targetDir); rErr != nil {
+				slog.Error("plugin: failed to restore backup directory during rollback", "plugin_id", manifest.ID, "err", rErr)
+			}
+		}
+		m.assetGzipCache.deletePlugin(manifest.ID)
+		m.invalidateUpdateStatus(manifest.ID)
+
+		if hadDBRec {
+			_, _ = m.store.ExecContext(
+				rbCtx,
+				`UPDATE plugins SET kind = ?, version = ?, is_enabled = ?, config_json = ?, secret_ciphertext = ?, circuit_state = ?, failure_count = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+				prevDBRec.Kind, prevDBRec.Version, false, prevDBRec.ConfigJSON, prevDBRec.SecretCiphertext,
+				prevDBRec.CircuitState, prevDBRec.FailureCount, prevDBRec.LastError, prevDBRec.UpdatedAt, manifest.ID,
+			)
+		} else {
+			_ = ClearPluginKV(rbCtx, m.store, manifest.ID)
+			_, _ = m.store.ExecContext(rbCtx, `DELETE FROM plugins WHERE id = ?`, manifest.ID)
+		}
+
+		if hadOldDir {
+			oldBytes, rErr := os.ReadFile(filepath.Join(targetDir, "manifest.json"))
+			var oldMf Manifest
+			if rErr == nil {
+				oldMf, rErr = ParseManifest(oldBytes)
+			} else if exists {
+				oldMf = prevManifest
+				rErr = nil
+			}
+			if rErr == nil {
+				if restoredMP, sErr := m.syncRecordWithDB(rbCtx, oldMf, "external", targetDir, nil); sErr == nil {
+					m.mu.Lock()
+					m.plugins[manifest.ID] = restoredMP
+					m.mu.Unlock()
+					if wasEnabled && (!hadDBRec || prevDBRec.CircuitState != CircuitOpen) {
+						_ = m.enableLocked(rbCtx, manifest.ID)
+					}
+				}
+			}
+		} else {
+			m.mu.Lock()
+			delete(m.plugins, manifest.ID)
+			m.mu.Unlock()
+			m.providers.DetachPlugin(manifest.ID)
+			if m.cron != nil {
+				m.cron.UnregisterPlugin(manifest.ID, true)
+			}
+		}
+		m.logger.Write(manifest.ID, "error", "rollback", "install/upgrade failed and rolled back: "+cause.Error())
+		return fmt.Errorf("plugin %q install/upgrade failed (safely rolled back): %w", manifest.ID, cause)
 	}
+
+	mp, err := m.syncRecordWithDB(commitCtx, manifest, "external", targetDir, nil)
+	if err != nil {
+		return PluginSummary{}, rollback(err)
+	}
+	mp.mu.Lock()
+	mp.hasUpdateHookHint = hasCallableCheck
+	mp.mu.Unlock()
+
 	m.mu.Lock()
 	m.plugins[manifest.ID] = mp
 	m.mu.Unlock()
 	m.assetGzipCache.deletePlugin(manifest.ID)
+	m.invalidateUpdateStatus(manifest.ID)
+
+	shouldEnable := (wasEnabled && (!hadDBRec || prevDBRec.CircuitState != CircuitOpen)) || opts.enableAfter
 
 	// Optional bounded onInstall({ previous_version, version, is_upgrade }) lifecycle hook on fresh install or version upgrade.
 	if !isUpgrade || prevVersion != manifest.Version {
+		var installCron *CronRegistry
+		if shouldEnable {
+			// Even when enabling immediately after, activateRuntime resets plugin cron jobs;
+			// passing nil when !shouldEnable strictly prevents disabled plugins from registering live cron jobs!
+			installCron = nil
+		}
 		installRT, rtErr := newGojaPluginRuntime(gojaRuntimeOptions{
 			manifest:              mp.manifest,
 			pluginDir:             mp.pluginDir,
 			kv:                    mp.kv,
-			cron:                  m.cron,
+			cron:                  installCron,
 			logger:                m.logger,
 			hostI18n:              m.catalog,
 			getConfig:             mp.getConfigMap,
 			unsealSecret:          m.unsealSecretValue,
 			getSiteInfo:           m.getSiteInfo,
-			customResolver:        m.customResolver,
+			customResolver:        m.effectiveResolver(),
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		})
 		if rtErr != nil {
-			// Error details may echo plugin-controlled HTTP data; they go to the plugin's own log only.
 			slog.Warn("plugin: failed to initialize runtime for onInstall hook (see plugin log)", "plugin_id", manifest.ID, "version", manifest.Version)
 			m.logger.Write(manifest.ID, "warn", "install", "onInstall init error: "+rtErr.Error())
-		} else {
-			if installRT.hasCallable("onInstall") {
-				if _, _, hErr := installRT.invoke(ctx, m.hookTimeout, "onInstall", map[string]any{
-					"previous_version": prevVersion,
-					"version":          manifest.Version,
-					"is_upgrade":       isUpgrade,
-				}); hErr != nil {
-					slog.Warn("plugin: onInstall hook failed", "plugin_id", manifest.ID, "version", manifest.Version, "is_upgrade", isUpgrade, "err", hErr)
-					m.logger.Write(manifest.ID, "warn", "install", "onInstall error: "+hErr.Error())
-				}
-			}
-			installRT.closeRuntime()
+			return PluginSummary{}, rollback(rtErr)
+		}
+		var hookErr error
+		if installRT.hasCallable("onInstall") {
+			_, _, hookErr = installRT.invoke(commitCtx, m.hookTimeout, "onInstall", map[string]any{
+				"previous_version": prevVersion,
+				"version":          manifest.Version,
+				"is_upgrade":       isUpgrade,
+			})
+		}
+		installRT.closeRuntime()
+		if hookErr != nil {
+			slog.Warn("plugin: onInstall hook failed", "plugin_id", manifest.ID, "version", manifest.Version, "is_upgrade", isUpgrade, "err", hookErr)
+			m.logger.Write(manifest.ID, "warn", "install", "onInstall error: "+hookErr.Error())
+			return PluginSummary{}, rollback(hookErr)
 		}
 	}
 
-	m.logger.Write(manifest.ID, "info", "install", "installed external plugin v"+manifest.Version)
-	if wasEnabled {
-		if eErr := m.Enable(ctx, manifest.ID); eErr != nil {
-			slog.Warn("plugin: failed to re-enable upgraded plugin (see plugin log)", "plugin_id", manifest.ID, "version", manifest.Version)
-			m.logger.Write(manifest.ID, "warn", "install", "re-enable after upgrade failed: "+eErr.Error())
-			return m.toSummary(mp, locale), fmt.Errorf("plugin %q upgraded to v%s but failed to re-enable: %w", manifest.ID, manifest.Version, eErr)
+	if shouldEnable {
+		if eErr := m.enableLocked(commitCtx, manifest.ID); eErr != nil {
+			slog.Warn("plugin: failed to enable installed/upgraded plugin; rolling back (see plugin log)", "plugin_id", manifest.ID, "version", manifest.Version)
+			m.logger.Write(manifest.ID, "warn", "install", "enable after install/upgrade failed: "+eErr.Error())
+			return PluginSummary{}, rollback(eErr)
 		}
 	}
-	return m.toSummary(mp, locale), nil
+
+	if hadOldDir {
+		_ = os.RemoveAll(backupDir)
+	}
+	m.logger.Write(manifest.ID, "info", "install", "installed external plugin v"+manifest.Version)
+	return m.toSummary(mp, opts.locale), nil
 }
 
 // Uninstall disables an external plugin, invokes its optional onUninstall() hook, and deletes its directory, KV keys, DB row, and logs.
 func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
-	mp, ok := m.getPlugin(pluginID)
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return errors.New("plugin: manager is closed")
+	}
+	idClean := strings.TrimSpace(pluginID)
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
+
+	mp, ok := m.getPlugin(idClean)
 	if !ok {
 		return fmt.Errorf("plugin: %q not found", pluginID)
 	}
+	pluginID = idClean
 	if mp.kind == "builtin" {
 		return fmt.Errorf("plugin %q is built-in and cannot be uninstalled (use Disable instead)", pluginID)
 	}
-	_ = m.Disable(ctx, pluginID)
+	_ = m.disableLocked(ctx, pluginID)
 
 	// Best-effort bounded onUninstall() lifecycle hook before deleting plugin_kv, config, and directory.
 	if mp.manifest.Runtime == RuntimeBuiltin && mp.builtin != nil {
@@ -2207,13 +2601,13 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 			manifest:              mp.manifest,
 			pluginDir:             mp.pluginDir,
 			kv:                    mp.kv,
-			cron:                  m.cron,
+			cron:                  nil,
 			logger:                m.logger,
 			hostI18n:              m.catalog,
 			getConfig:             mp.getConfigMap,
 			unsealSecret:          m.unsealSecretValue,
 			getSiteInfo:           m.getSiteInfo,
-			customResolver:        m.customResolver,
+			customResolver:        m.effectiveResolver(),
 			allowLoopbackForTests: m.allowLoopbackForTests,
 		}); rtErr == nil {
 			_, _, _ = tempRT.invoke(ctx, m.hookTimeout, "onUninstall")
@@ -2228,6 +2622,7 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 	delete(m.plugins, pluginID)
 	m.mu.Unlock()
 	m.assetGzipCache.deletePlugin(pluginID)
+	m.invalidateUpdateStatus(pluginID)
 
 	if mp.pluginDir != "" && m.pluginsDir != "" {
 		realPluginsRoot, err1 := filepath.EvalSymlinks(m.pluginsDir)
@@ -2267,10 +2662,20 @@ func (m *Manager) Uninstall(ctx context.Context, pluginID string) error {
 // SetPriority updates a single plugin's execution priority (smaller value runs earlier in chains),
 // immediately re-sorting all active hook/slot/provider chains and persisting the order.
 func (m *Manager) SetPriority(ctx context.Context, pluginID string, priority int, locale string) (PluginSummary, error) {
-	mp, ok := m.getPlugin(pluginID)
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return PluginSummary{}, errors.New("plugin: manager is closed")
+	}
+	idClean := strings.TrimSpace(pluginID)
+	lk := m.pluginInstallLock(idClean)
+	lk.Lock()
+	defer lk.Unlock()
+	mp, ok := m.getPlugin(idClean)
 	if !ok {
 		return PluginSummary{}, fmt.Errorf("plugin: %q not found", pluginID)
 	}
+	pluginID = idClean
 	clamped := ClampPluginPriority(priority)
 	now := time.Now().Unix()
 
@@ -2300,6 +2705,11 @@ func (m *Manager) SetPriority(ctx context.Context, pluginID string, priority int
 // Reorder assigns spaced execution priorities (10, 20, 30, ...) according to orderedIDs,
 // preserving relative order for any registered plugins omitted from orderedIDs.
 func (m *Manager) Reorder(ctx context.Context, orderedIDs []string, locale string) ([]PluginSummary, error) {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.isClosed() {
+		return nil, errors.New("plugin: manager is closed")
+	}
 	m.mu.RLock()
 	existing := make([]*managedPlugin, 0, len(m.plugins))
 	byID := make(map[string]*managedPlugin, len(m.plugins))
@@ -2446,30 +2856,35 @@ func (m *Manager) toSummary(mp *managedPlugin, locale string) PluginSummary {
 		}
 		return v
 	}, m.allowLoopbackForTests)
+	capab := m.pluginUpdateCapabilityLocked(mp)
+	cachedSt := m.getCachedUpdateStatus(mp.manifest.ID, mp.manifest.Version)
 	return PluginSummary{
-		ID:            mp.manifest.ID,
-		Kind:          mp.kind,
-		Runtime:       mp.manifest.Runtime,
-		Version:       mp.manifest.Version,
-		Priority:      mp.priority,
-		Name:          ResolveLocalized(mp.manifest.Name, locale),
-		Description:   ResolveLocalized(mp.manifest.Description, locale),
-		Author:        mp.manifest.Author,
-		Homepage:      mp.manifest.Homepage,
-		IsEnabled:     mp.enabled,
-		CircuitState:  mp.circuitState,
-		FailureCount:  mp.failureCount,
-		LastError:     mp.lastError,
-		Permissions:   append([]string(nil), mp.manifest.Permissions...),
-		Hooks:         append([]string(nil), mp.manifest.Hooks...),
-		AllowedHosts:  effectiveHosts,
-		ConfigSchema:  mp.manifest.ConfigSchema,
-		PublicConfig:  pubCopy,
-		Config:        redactedCfg,
-		SecretKeysSet: secSet,
-		CronJobs:      cronJobs,
-		InstalledAt:   mp.installedAt,
-		UpdatedAt:     mp.updatedAt,
+		ID:               mp.manifest.ID,
+		Kind:             mp.kind,
+		Runtime:          mp.manifest.Runtime,
+		Version:          mp.manifest.Version,
+		MinHostVersion:   mp.manifest.MinHostVersion,
+		Priority:         mp.priority,
+		Name:             ResolveLocalized(mp.manifest.Name, locale),
+		Description:      ResolveLocalized(mp.manifest.Description, locale),
+		Author:           mp.manifest.Author,
+		Homepage:         mp.manifest.Homepage,
+		IsEnabled:        mp.enabled,
+		CircuitState:     mp.circuitState,
+		FailureCount:     mp.failureCount,
+		LastError:        mp.lastError,
+		Permissions:      append([]string(nil), mp.manifest.Permissions...),
+		Hooks:            append([]string(nil), mp.manifest.Hooks...),
+		AllowedHosts:     effectiveHosts,
+		ConfigSchema:     mp.manifest.ConfigSchema,
+		PublicConfig:     pubCopy,
+		Config:           redactedCfg,
+		SecretKeysSet:    secSet,
+		CronJobs:         cronJobs,
+		UpdateCapability: capab,
+		UpdateStatus:     cachedSt,
+		InstalledAt:      mp.installedAt,
+		UpdatedAt:        mp.updatedAt,
 	}
 }
 
@@ -3701,7 +4116,7 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 	if hasNonEmptyRawQueryParam(r.URL.RawQuery, "v") {
 		hdr.Set("Cache-Control", "public, max-age=2592000, stale-while-revalidate=86400")
 	} else {
-		hdr.Set("Cache-Control", "public, max-age=86400")
+		hdr.Set("Cache-Control", "public, max-age=300, must-revalidate")
 	}
 	if isSandboxedMarkupAssetExt(ext) {
 		hdr.Set("Content-Security-Policy", "default-src 'none'; sandbox")
@@ -3715,6 +4130,11 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 		hdr.Set("Content-Type", ct)
 	}
 
+	mp.mu.Lock()
+	pluginID := mp.manifest.ID
+	pluginVer := mp.manifest.Version
+	mp.mu.Unlock()
+
 	fileSize := st.Size()
 	modNano := st.ModTime().UnixNano()
 	compressible := safeInline && ct != "" && fileSize >= 256 && isCompressiblePluginAssetExt(ext)
@@ -3727,7 +4147,7 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 		r.Header.Get("Range") == "" &&
 		acceptsGzipEncoding(r.Header.Get("Accept-Encoding"))
 
-	etag := formatPluginAssetETag(fileSize, modNano, canGzip)
+	etag := formatPluginAssetETag(pluginVer, fileSize, modNano, canGzip)
 	hdr.Set("ETag", etag)
 	if isGetOrHead && pluginAssetETagMatches(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
@@ -3738,7 +4158,7 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 		cacheEligible := fileSize <= maxPluginAssetGzipCacheRawSize
 		var cacheKey string
 		if cacheEligible {
-			cacheKey = mp.manifest.ID + "\x00" + cleanRel
+			cacheKey = pluginID + "\x00" + pluginVer + "\x00" + cleanRel
 			if gzBytes, ok := m.assetGzipCache.get(cacheKey, fileSize, modNano); ok {
 				hdr.Set("Content-Length", strconv.Itoa(len(gzBytes)))
 				w.WriteHeader(http.StatusOK)
@@ -3771,7 +4191,7 @@ func (m *Manager) servePluginAsset(w http.ResponseWriter, r *http.Request, mp *m
 				return
 			}
 			gzBytes := append([]byte(nil), memBuf.Bytes()...)
-			m.assetGzipCache.put(mp.manifest.ID, cacheKey, fileSize, modNano, gzBytes)
+			m.assetGzipCache.put(pluginID, cacheKey, fileSize, modNano, gzBytes)
 			hdr.Set("Content-Length", strconv.Itoa(len(gzBytes)))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(gzBytes)
@@ -3812,9 +4232,16 @@ var pluginAssetCopyBufPool = sync.Pool{
 	},
 }
 
-func formatPluginAssetETag(size int64, modNano int64, gz bool) string {
-	var buf [64]byte
+func formatPluginAssetETag(version string, size int64, modNano int64, gz bool) string {
+	var buf [96]byte
 	b := append(buf[:0], `"pa-`...)
+	for i := 0; i < len(version); i++ {
+		ch := version[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-' {
+			b = append(b, ch)
+		}
+	}
+	b = append(b, '-')
 	b = strconv.AppendInt(b, size, 16)
 	b = append(b, '-')
 	b = strconv.AppendInt(b, modNano, 16)
@@ -4063,6 +4490,22 @@ func (m *Manager) PurgeExpiredKV(ctx context.Context) (int64, error) {
 	return PurgeExpiredKV(ctx, m.store, time.Now().Unix())
 }
 
+// FlushAllKV flushes all dirty buffered plugin KV counters for this manager's store.
+func (m *Manager) FlushAllKV(ctx context.Context) error {
+	if m == nil || m.store == nil {
+		return nil
+	}
+	return FlushAllKV(ctx, m.store)
+}
+
+// DiscardAllKVBuffers discards all in-memory buffered KV entries for this manager's store without flushing to DB.
+func (m *Manager) DiscardAllKVBuffers() {
+	if m == nil {
+		return
+	}
+	DiscardAllKVBuffers(m.store)
+}
+
 // WaitFederation waits for any in-flight asynchronous DispatchFederationArticle deliveries to finish.
 func (m *Manager) WaitFederation() {
 	if m == nil {
@@ -4073,6 +4516,12 @@ func (m *Manager) WaitFederation() {
 
 // Close gracefully stops all plugin background cron jobs, waits for in-flight federation tasks, and detaches runtimes.
 func (m *Manager) Close(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -4985,14 +5434,15 @@ func isInnerDirectiveOpen(trimmed string) bool {
 }
 
 func sanitizeZipEntryPath(raw string) (string, error) {
-	trimmed := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	trimmed := strings.TrimSuffix(raw, "/")
 	if trimmed == "" {
 		return "", errors.New("empty zip entry name")
 	}
-	if strings.Contains(raw, "\\") || strings.Contains(raw, "\x00") || strings.HasPrefix(raw, "/") || strings.Contains(raw, ":") {
-		return "", errors.New("forbidden path characters")
+	clean, err := extpkg.SanitizeZipPath(trimmed)
+	if err != nil {
+		return "", err
 	}
-	return sanitizeRelativeAssetPath(trimmed)
+	return sanitizeRelativeAssetPath(clean)
 }
 
 func locateManifestRoot(stagingRoot string) (string, error) {

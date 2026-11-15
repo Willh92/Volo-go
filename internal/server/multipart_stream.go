@@ -17,6 +17,7 @@ const (
 type streamedMultipartFile struct {
 	TempPath     string
 	OrigFilename string
+	ContentType  string
 	SizeBytes    int64
 	FormFields   map[string]string
 }
@@ -71,6 +72,7 @@ func streamMultipartSingleFile(
 		isTargetFile := fileName != "" && (fieldName == "" || formName == fieldName)
 
 		if isTargetFile && out == nil {
+			partContentType := strings.TrimSpace(part.Header.Get("Content-Type"))
 			ext := strings.ToLower(filepath.Ext(filepath.Base(fileName)))
 			if len(allowedExts) > 0 {
 				validExt := false
@@ -114,6 +116,7 @@ func streamMultipartSingleFile(
 			out = &streamedMultipartFile{
 				TempPath:     tmpPath,
 				OrigFilename: filepath.Base(fileName),
+				ContentType:  partContentType,
 				SizeBytes:    written,
 			}
 			continue

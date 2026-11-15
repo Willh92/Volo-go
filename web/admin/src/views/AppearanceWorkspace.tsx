@@ -4,6 +4,7 @@ import {
   apiFetch,
   applyThemeAttributes,
   dirtyEditorSig,
+  isAbortError,
   localizeAdminError,
   openConfirm,
   resetConsoleScroll,
@@ -17,6 +18,7 @@ import {
   exportLocalePackJSON,
   formatDateTime,
   localeSig,
+  registerExternalLocales,
   syncExternalLocales,
   t,
 } from "../i18n";
@@ -28,6 +30,7 @@ import {
   ConsoleSelect,
   DragGripIcon,
   MoveTopIcon,
+  NativeModalDialog,
   paginateItems,
   Pagination,
   PlusIcon,
@@ -220,96 +223,216 @@ function validateSchemaRequired(
   return null;
 }
 
-async function inspectZipManifestId(
-  file: File,
-  manifestFile: string,
-  installedIds: string[]
-): Promise<string | null> {
-  const known = new Set(installedIds.filter(Boolean));
-  if (known.size === 0) return null;
+function safeHttpUrl(raw: unknown): string {
+  const s = String(raw ?? "").trim();
+  if (!/^https?:\/\/[^\s\u0000-\u001f\u007f"'<>`]+$/i.test(s)) return "";
   try {
-    const tailLen = Math.min(file.size, 65558);
-    const tailBuf = await file.slice(file.size - tailLen, file.size).arrayBuffer();
-    const tailView = new DataView(tailBuf);
-    let eocd = -1;
-    for (let i = tailLen - 22; i >= 0; i--) {
-      if (tailView.getUint32(i, true) === 0x06054b50) {
-        eocd = i;
-        break;
-      }
+    const u = new URL(s);
+    return u.protocol === "https:" || u.protocol === "http:" ? s : "";
+  } catch {
+    return "";
+  }
+}
+
+function matchesArchiveBaseId(baseName: string, knownId: string): boolean {
+  const idLow = knownId.trim().toLowerCase();
+  if (!idLow) return false;
+  let rest = baseName.trim().toLowerCase();
+  for (const pfx of ["volo-plugin-", "volo-theme-", "plugin-", "theme-"]) {
+    if (rest.startsWith(pfx)) {
+      rest = rest.slice(pfx.length);
+      break;
     }
-    if (eocd >= 0) {
-      const cdSize = tailView.getUint32(eocd + 12, true);
-      const cdOffset = tailView.getUint32(eocd + 16, true);
-      if (cdOffset < file.size && cdSize > 0 && cdSize <= 4 * 1024 * 1024) {
-        const cdBuf = await file.slice(cdOffset, Math.min(file.size, cdOffset + cdSize)).arrayBuffer();
-        const cdBytes = new Uint8Array(cdBuf);
-        const cdView = new DataView(cdBuf);
-        const dec = new TextDecoder();
-        const targetLower = manifestFile.toLowerCase();
-        let pos = 0;
-        let folderHint = "";
-        while (pos + 46 <= cdBytes.length && cdView.getUint32(pos, true) === 0x02014b50) {
-          const method = cdView.getUint16(pos + 10, true);
-          const compSize = cdView.getUint32(pos + 20, true);
-          const nameLen = cdView.getUint16(pos + 28, true);
-          const extraLen = cdView.getUint16(pos + 30, true);
-          const commentLen = cdView.getUint16(pos + 32, true);
-          const lhOffset = cdView.getUint32(pos + 42, true);
-          if (pos + 46 + nameLen > cdBytes.length) break;
-          const entryName = dec.decode(cdBytes.subarray(pos + 46, pos + 46 + nameLen)).replace(/\\/g, "/");
-          const parts = entryName.split("/").filter(Boolean);
-          if (
-            parts[parts.length - 1]?.toLowerCase() === targetLower &&
-            parts.length <= 2 &&
-            compSize > 0 &&
-            compSize <= 262144 &&
-            lhOffset + 30 < file.size
-          ) {
-            if (parts.length === 2 && known.has(parts[0])) folderHint = parts[0];
-            const sliceEnd = Math.min(file.size, lhOffset + 30 + nameLen + 1024 + compSize);
-            const lhBuf = await file.slice(lhOffset, sliceEnd).arrayBuffer();
-            const lhView = new DataView(lhBuf);
-            if (lhBuf.byteLength >= 30 && lhView.getUint32(0, true) === 0x04034b50) {
-              const lhNameLen = lhView.getUint16(26, true);
-              const lhExtraLen = lhView.getUint16(28, true);
-              const dataStart = 30 + lhNameLen + lhExtraLen;
-              if (dataStart + compSize <= lhBuf.byteLength) {
-                const rawEntry = new Uint8Array(lhBuf, dataStart, compSize);
-                let jsonText = "";
-                if (method === 0) {
-                  jsonText = dec.decode(rawEntry);
-                } else if (method === 8 && typeof DecompressionStream === "function") {
-                  const ds = new DecompressionStream("deflate-raw");
-                  const copy = new Uint8Array(rawEntry.byteLength);
-                  copy.set(rawEntry);
-                  const stream = new Blob([copy]).stream().pipeThrough(ds);
-                  jsonText = await new Response(stream).text();
-                }
-                if (jsonText) {
-                  const parsed = JSON.parse(jsonText);
-                  const id = typeof parsed?.id === "string" ? parsed.id.trim() : "";
-                  if (id && known.has(id)) return id;
+  }
+  if (rest === idLow) return true;
+  if (!rest.startsWith(idLow)) return false;
+  const suffix = rest.slice(idLow.length);
+  if (suffix.startsWith("_")) return true;
+  if (!suffix.startsWith("-")) return false;
+  const ver = suffix.startsWith("-v") ? suffix.slice(2) : suffix.slice(1);
+  if (!ver) return false;
+  const dotIdx = ver.indexOf(".");
+  if (dotIdx <= 0) return false;
+  for (let i = 0; i < dotIdx; i++) {
+    const code = ver.charCodeAt(i);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
+function formatApproxPackageSize(it: any): string {
+  const bytes = Number(it?.approx_size_bytes || it?.size_bytes || 0);
+  if (Number.isFinite(bytes) && bytes > 0) {
+    if (bytes >= 1024 * 1024) {
+      return `~${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 1 : 2).replace(/\.0+$/, "")} MB`;
+    }
+    return `~${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+  const mb = Number(it?.approx_zip_mb || 0);
+  if (Number.isFinite(mb) && mb > 0) {
+    return mb >= 0.1 ? `~${mb.toFixed(1).replace(/\.0$/, "")} MB` : `~${Math.max(1, Math.round(mb * 1024))} KB`;
+  }
+  return "";
+}
+
+interface ZipPreflightInfo {
+  file: File;
+  kind: "theme" | "plugin";
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  minHostVersion: string;
+  installedVersion: string | null;
+  sha256: string;
+  parsedOk: boolean;
+}
+
+const MAX_ZIP_PREFLIGHT_BYTES = 64 * 1024 * 1024;
+
+async function inspectZipPreflight(
+  file: File,
+  kind: "theme" | "plugin",
+  installedList: any[],
+): Promise<ZipPreflightInfo> {
+  const manifestFile = (kind === "theme" ? "theme.json" : "manifest.json").toLowerCase();
+  const baseName = file.name.replace(/\.zip$/i, "");
+  let id = "";
+  let name = "";
+  let version = "";
+  let author = "";
+  let minHostVersion = "";
+  let sha256 = "";
+  let parsedOk = false;
+
+  if (file.size > 0 && file.size <= MAX_ZIP_PREFLIGHT_BYTES) {
+    let fullBuf: ArrayBuffer | null = null;
+    try {
+      if (typeof crypto !== "undefined" && crypto.subtle?.digest) {
+        fullBuf = await file.arrayBuffer();
+        const digest = await crypto.subtle.digest("SHA-256", fullBuf);
+        sha256 = Array.from(new Uint8Array(digest))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+      }
+    } catch {
+      // Ignore WebCrypto errors in insecure contexts
+    }
+
+    try {
+      const readSlice = async (start: number, end: number): Promise<ArrayBuffer> => {
+        if (fullBuf) return fullBuf.slice(start, end);
+        return file.slice(start, end).arrayBuffer();
+      };
+      const tailLen = Math.min(file.size, 65558);
+      const tailBuf = await readSlice(file.size - tailLen, file.size);
+      const tailView = new DataView(tailBuf);
+      let eocd = -1;
+      for (let i = tailLen - 22; i >= 0; i--) {
+        if (tailView.getUint32(i, true) === 0x06054b50) {
+          eocd = i;
+          break;
+        }
+      }
+      if (eocd >= 0) {
+        const cdSize = tailView.getUint32(eocd + 12, true);
+        const cdOffset = tailView.getUint32(eocd + 16, true);
+        if (cdOffset < file.size && cdSize > 0 && cdSize <= 4 * 1024 * 1024) {
+          const cdBuf = await readSlice(cdOffset, Math.min(file.size, cdOffset + cdSize));
+          const cdBytes = new Uint8Array(cdBuf);
+          const cdView = new DataView(cdBuf);
+          const dec = new TextDecoder();
+          let pos = 0;
+          let folderHint = "";
+          while (pos + 46 <= cdBytes.length && cdView.getUint32(pos, true) === 0x02014b50) {
+            const method = cdView.getUint16(pos + 10, true);
+            const compSize = cdView.getUint32(pos + 20, true);
+            const nameLen = cdView.getUint16(pos + 28, true);
+            const extraLen = cdView.getUint16(pos + 30, true);
+            const commentLen = cdView.getUint16(pos + 32, true);
+            const lhOffset = cdView.getUint32(pos + 42, true);
+            if (pos + 46 + nameLen > cdBytes.length) break;
+            const entryName = dec.decode(cdBytes.subarray(pos + 46, pos + 46 + nameLen)).replace(/\\/g, "/");
+            const parts = entryName.split("/").filter(Boolean);
+            if (
+              parts[parts.length - 1]?.toLowerCase() === manifestFile &&
+              parts.length <= 2 &&
+              compSize > 0 &&
+              compSize <= 262144 &&
+              lhOffset + 30 < file.size
+            ) {
+              if (parts.length === 2) folderHint = parts[0];
+              const sliceEnd = Math.min(file.size, lhOffset + 30 + nameLen + 1024 + compSize);
+              const lhBuf = await readSlice(lhOffset, sliceEnd);
+              const lhView = new DataView(lhBuf);
+              if (lhBuf.byteLength >= 30 && lhView.getUint32(0, true) === 0x04034b50) {
+                const lhNameLen = lhView.getUint16(26, true);
+                const lhExtraLen = lhView.getUint16(28, true);
+                const dataStart = 30 + lhNameLen + lhExtraLen;
+                if (dataStart + compSize <= lhBuf.byteLength) {
+                  const rawEntry = new Uint8Array(lhBuf, dataStart, compSize);
+                  let jsonText = "";
+                  if (method === 0) {
+                    jsonText = dec.decode(rawEntry);
+                  } else if (method === 8 && typeof DecompressionStream === "function") {
+                    const ds = new DecompressionStream("deflate-raw");
+                    const copy = new Uint8Array(rawEntry.byteLength);
+                    copy.set(rawEntry);
+                    const stream = new Blob([copy]).stream().pipeThrough(ds);
+                    jsonText = await new Response(stream).text();
+                  }
+                  if (jsonText) {
+                    const parsed = JSON.parse(jsonText);
+                    parsedOk = true;
+                    id = String(parsed?.id || folderHint || "").trim();
+                    name = resolveSchemaText(parsed?.display_name ?? parsed?.name) || id;
+                    version = String(parsed?.version || "").replace(/^[vV]/, "").trim();
+                    author = resolveSchemaText(parsed?.author);
+                    minHostVersion = String(parsed?.min_host_version || parsed?.engine_version || "")
+                      .replace(/^[vV]/, "")
+                      .trim();
+                    break;
+                  }
                 }
               }
             }
+            pos += 46 + nameLen + extraLen + commentLen;
           }
-          pos += 46 + nameLen + extraLen + commentLen;
+          if (!id && folderHint) id = folderHint;
         }
-        if (folderHint && known.has(folderHint)) return folderHint;
+      }
+    } catch {
+      // Graceful fallback when archive cannot be parsed client-side
+    }
+  }
+
+  if (!id) {
+    for (const item of installedList) {
+      const knownId = String(item?.id || "").trim();
+      if (!knownId) continue;
+      if (matchesArchiveBaseId(baseName, knownId)) {
+        id = knownId;
+        break;
       }
     }
-  } catch {
-    // Fall through to filename heuristic
   }
-  const base = file.name.replace(/\.zip$/i, "");
-  for (const id of known) {
-    const esc = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (new RegExp(`^(?:volo-(?:plugin|theme)-|plugin-|theme-)?${esc}(?:-[vV]?\\d+\\..*|_.*)?$`, "i").test(base)) {
-      return id;
-    }
-  }
-  return null;
+
+  const matched = id
+    ? installedList.find((it) => String(it?.id || "") === id && !it?.is_builtin && !it?.builtin && it?.kind !== "builtin")
+    : null;
+
+  return {
+    file,
+    kind,
+    id: id || baseName,
+    name: name || id || baseName,
+    version,
+    author,
+    minHostVersion,
+    installedVersion: matched ? String(matched.version || "1.0.0").replace(/^[vV]/, "") : null,
+    sha256,
+    parsedOk,
+  };
 }
 
 async function downloadZipBlob(url: string, filename: string): Promise<void> {
@@ -1121,6 +1244,940 @@ function SchemaConfigPanel({
   );
 }
 
+type RemoteExtKind = "plugin" | "theme" | "locale";
+
+interface RemoteInstallModalProps {
+  open: boolean;
+  kind: RemoteExtKind;
+  onClose: () => void;
+  onInstalled: (res: any, kind: RemoteExtKind) => void;
+}
+
+function RemoteInstallModal({ open, kind, onClose, onInstalled }: RemoteInstallModalProps) {
+  const [urlVal, setUrlVal] = useState("");
+  const [shaVal, setShaVal] = useState("");
+  const [autoAct, setAutoAct] = useState(kind === "plugin");
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
+  const [statusTone, setStatusTone] = useState<"err" | "warn">("err");
+  const [catLoading, setCatLoading] = useState(false);
+  const [catItems, setCatItems] = useState<any[]>([]);
+  const abortRef = useRef<AbortController | null>(null);
+  const catAbortRef = useRef<AbortController | null>(null);
+  const catSeqRef = useRef(0);
+  const urlInputId = `volo-ext-url-${kind}`;
+  const shaInputId = `volo-ext-sha-${kind}`;
+  const locked = busy || confirming;
+
+  const loadCatalog = async (refresh = false) => {
+    catAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    catAbortRef.current = ctrl;
+    const seq = ++catSeqRef.current;
+    setCatLoading(true);
+    try {
+      const base =
+        kind === "plugin"
+          ? "/api/admin/plugins/catalog"
+          : kind === "theme"
+            ? "/api/admin/themes/catalog"
+            : "/api/admin/locales/catalog";
+      const qs = `locale=${encodeURIComponent(localeSig.value)}${refresh ? "&refresh=1" : ""}`;
+      const res = await apiFetch<{ items?: any[] }>(`${base}?${qs}`, { signal: ctrl.signal });
+      if (seq !== catSeqRef.current) return;
+      setCatItems(Array.isArray(res?.items) ? res.items : []);
+    } catch (err: any) {
+      if (seq !== catSeqRef.current || isAbortError(err)) return;
+      if (refresh) {
+        setStatusTone("err");
+        setStatusMsg(err.message || "");
+      }
+    } finally {
+      if (seq === catSeqRef.current) setCatLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!open) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      catAbortRef.current?.abort();
+      catAbortRef.current = null;
+      catSeqRef.current++;
+      setBusy(false);
+      setConfirming(false);
+      setStatusMsg("");
+      return;
+    }
+    setUrlVal("");
+    setShaVal("");
+    setAutoAct(kind === "plugin");
+    setStatusMsg("");
+    setCatItems([]);
+    void loadCatalog(false);
+    return () => {
+      catAbortRef.current?.abort();
+    };
+  }, [open, kind]);
+
+  const executeRemoteInstall = async (
+    rawUrl: string,
+    rawSha: string,
+    overwrite: boolean,
+    extra?: { checksumUrl?: string; assetName?: string },
+  ): Promise<void> => {
+    const cleanUrl = safeHttpUrl(rawUrl);
+    if (!cleanUrl) {
+      setStatusTone("err");
+      setStatusMsg(t("app.ext_url_required"));
+      return;
+    }
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setBusy(true);
+    setStatusMsg(t("app.ext_downloading_status"));
+    try {
+      const endpoint =
+        kind === "plugin"
+          ? `/api/admin/plugins/install-url?locale=${encodeURIComponent(localeSig.value)}`
+          : kind === "theme"
+            ? `/api/admin/themes/install-url?locale=${encodeURIComponent(localeSig.value)}`
+            : `/api/admin/locales/install-url?locale=${encodeURIComponent(localeSig.value)}`;
+      const checksumUrl = safeHttpUrl(extra?.checksumUrl);
+      const assetName = String(extra?.assetName || "").trim();
+      const baseFields = {
+        url: cleanUrl,
+        sha256: rawSha.trim(),
+        ...(checksumUrl ? { checksum_url: checksumUrl } : {}),
+        ...(assetName ? { asset_name: assetName } : {}),
+        overwrite,
+      };
+      const bodyObj =
+        kind === "plugin"
+          ? { ...baseFields, enable: autoAct }
+          : kind === "theme"
+            ? { ...baseFields, activate: autoAct }
+            : baseFields;
+      const res = await apiFetch<any>(endpoint, {
+        method: "POST",
+        body: JSON.stringify(bodyObj),
+        signal: ctrl.signal,
+      });
+      setBusy(false);
+      setStatusMsg("");
+      onInstalled(res, kind);
+      onClose();
+      showToast(
+        kind === "plugin"
+          ? t("app.installed_toast")
+          : kind === "theme"
+            ? t("app.theme_installed")
+            : t("app.loc_installed"),
+        "ok",
+      );
+    } catch (err: any) {
+      setBusy(false);
+      abortRef.current = null;
+      if (isAbortError(err)) {
+        setStatusTone("warn");
+        setStatusMsg(t("app.ext_install_canceled"));
+        return;
+      }
+      if (!overwrite && (err?.status === 409 || /already exists|conflict/i.test(String(err?.message || "")))) {
+        setStatusMsg("");
+        setConfirming(true);
+        const ok = await openConfirm({
+          message:
+            kind === "plugin"
+              ? t("app.confirm_overwrite_plugin")
+              : kind === "theme"
+                ? t("app.confirm_overwrite_theme")
+                : t("ext.confirm_overwrite_locale"),
+          danger: true,
+        });
+        setConfirming(false);
+        if (ok) {
+          await executeRemoteInstall(cleanUrl, rawSha, true, extra);
+        }
+        return;
+      }
+      setStatusTone("err");
+      setStatusMsg(err.message || "");
+    }
+  };
+
+  const modalTitle =
+    kind === "plugin"
+      ? t("app.ext_url_modal_plugin_title")
+      : kind === "theme"
+        ? t("app.ext_url_modal_theme_title")
+        : t("ext.url_modal_locale_title");
+
+  return (
+    <NativeModalDialog
+      open={open}
+      onClose={onClose}
+      busy={locked}
+      busyGuardHint={t("app.ext_busy_close_guard")}
+      title={modalTitle}
+      subtitle={t("app.ext_url_modal_sub")}
+      maxWidth="640px"
+      footer={
+        <>
+          {busy ? (
+            <button
+              type="button"
+              class="volo-btn volo-btn-danger"
+              onClick={() => abortRef.current?.abort()}
+            >
+              {t("app.ext_cancel_transfer")}
+            </button>
+          ) : (
+            <button type="button" class="volo-btn" disabled={confirming} onClick={onClose}>
+              {t("common.cancel")}
+            </button>
+          )}
+          <button
+            type="button"
+            class="volo-btn volo-btn-primary"
+            disabled={locked || !urlVal.trim()}
+            onClick={() => void executeRemoteInstall(urlVal, shaVal, false)}
+          >
+            {t("app.ext_install_start")}
+          </button>
+        </>
+      }
+    >
+      <div class="volo-field">
+        <label htmlFor={urlInputId}>
+          {kind === "locale" ? t("ext.url_locale_label") : t("app.ext_url_label")}
+        </label>
+        <input
+          id={urlInputId}
+          type="url"
+          class="volo-input"
+          autoFocus
+          disabled={locked}
+          placeholder={
+            kind === "plugin"
+              ? t("app.ext_url_plugin_ph")
+              : kind === "theme"
+                ? t("app.ext_url_theme_ph")
+                : t("ext.url_locale_ph")
+          }
+          value={urlVal}
+          onInput={(e) => setUrlVal((e.currentTarget as HTMLInputElement).value)}
+        />
+      </div>
+      <div class="volo-field">
+        <label htmlFor={shaInputId}>{t("app.ext_sha256_label")}</label>
+        <input
+          id={shaInputId}
+          type="text"
+          class="volo-input"
+          disabled={locked}
+          placeholder={t("app.ext_sha256_ph")}
+          value={shaVal}
+          onInput={(e) => setShaVal((e.currentTarget as HTMLInputElement).value)}
+        />
+      </div>
+      {kind !== "locale" && (
+        <div class="volo-field">
+          <SwitchToggle
+            checked={autoAct}
+            disabled={locked}
+            onChange={setAutoAct}
+            label={kind === "plugin" ? t("app.ext_auto_enable") : t("app.ext_auto_activate")}
+          />
+        </div>
+      )}
+
+      {busy && (
+        <div style={{ marginBottom: "12px" }}>
+          <progress class="volo-native-progress" aria-label={t("app.ext_downloading_status")} />
+          <div role="status" class="volo-help" style={{ marginTop: "6px" }}>
+            {statusMsg || t("app.ext_downloading_status")}
+          </div>
+        </div>
+      )}
+      {!busy && statusMsg && (
+        <div
+          role={statusTone === "err" ? "alert" : "status"}
+          class="volo-help"
+          style={{
+            marginBottom: "10px",
+            color: statusTone === "err" ? "var(--volo-danger)" : "var(--volo-warn, var(--volo-muted))",
+          }}
+        >
+          {statusMsg}
+        </div>
+      )}
+
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: "8px",
+          marginTop: "6px",
+          marginBottom: "8px",
+        }}
+      >
+        <strong style={{ fontSize: "13px" }}>{t("app.ext_catalog_head")}</strong>
+        <button
+          type="button"
+          class="volo-btn volo-btn-sm"
+          disabled={locked || catLoading}
+          onClick={() => void loadCatalog(true)}
+        >
+          {t("app.ext_catalog_refresh")}
+        </button>
+      </div>
+      {catItems.length === 0 ? (
+        <div class="volo-help">{catLoading ? t("app.ext_checking") : t("app.ext_catalog_empty")}</div>
+      ) : (
+        <div class="volo-ext-catalog">
+          {catItems.map((it) => {
+            const itemKey = String(it.id || it.code || "");
+            const isInst = Boolean(it.installed);
+            const hasUpd = Boolean(it.has_update);
+            const compat = it.compatible_with_host !== false;
+            const dlUrl = safeHttpUrl(it.download_url);
+            const relHref = safeHttpUrl(it.release_url || it.homepage);
+            const sizeBadge = formatApproxPackageSize(it);
+            const hasVerifiedHash = Boolean(it.sha256 || it.checksum_url);
+            const assetName =
+              String(it.asset_name || "").trim() ||
+              (dlUrl ? decodeURIComponent(dlUrl.split("?")[0].split("/").pop() || "") : "");
+            return (
+              <div key={itemKey} class="volo-ext-catalog-card">
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+                    <strong style={{ fontSize: "13.5px" }}>{it.display_name || it.name || itemKey}</strong>
+                    {it.code && <span class="volo-code-chip">{it.code}</span>}
+                    {it.version && <span class="volo-code-chip">v{it.version}</span>}
+                    {sizeBadge && <span class="volo-code-chip">{sizeBadge}</span>}
+                    {hasVerifiedHash && (
+                      <span class="volo-badge volo-badge-ok">{t("ext.sha256sums_badge")}</span>
+                    )}
+                    {isInst && (
+                      <span class={`volo-badge ${hasUpd ? "" : "volo-badge-ok"}`}>
+                        {t("app.ext_catalog_installed", { ver: it.installed_version || it.version || "1.0.0" })}
+                      </span>
+                    )}
+                    {!compat && it.min_host_version && (
+                      <span class="volo-status-pill danger" style={{ fontSize: "11px" }}>
+                        &gt;= v{it.min_host_version}
+                      </span>
+                    )}
+                  </div>
+                  {(it.display_summary || it.description) && (
+                    <div class="volo-help" style={{ marginTop: "3px" }}>
+                      {resolveSchemaText(it.display_summary || it.description)}
+                    </div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0, flexWrap: "wrap" }}>
+                  {relHref && (
+                    <a
+                      class="volo-btn volo-btn-sm"
+                      href={relHref}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {t("app.ext_view_release")} ↗
+                    </a>
+                  )}
+                  {dlUrl && !it.is_builtin && (
+                    <button
+                      type="button"
+                      class={`volo-btn volo-btn-sm ${!isInst || hasUpd ? "volo-btn-primary" : ""}`}
+                      disabled={locked || !compat}
+                      onClick={() => {
+                        setUrlVal(dlUrl);
+                        setShaVal(String(it.sha256 || ""));
+                        void executeRemoteInstall(dlUrl, String(it.sha256 || ""), isInst, {
+                          checksumUrl: String(it.checksum_url || ""),
+                          assetName,
+                        });
+                      }}
+                    >
+                      {hasUpd
+                        ? t("app.ext_update_now")
+                        : isInst
+                          ? t("app.ext_catalog_reinstall")
+                          : t("app.ext_catalog_install_one")}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </NativeModalDialog>
+  );
+}
+
+interface ExtensionUpdateModalProps {
+  target: { kind: "plugin" | "theme"; id: string; name: string; status: any } | null;
+  onClose: () => void;
+  onUpgraded: (res: any, kind: "plugin" | "theme") => void;
+}
+
+function ExtensionUpdateModal({ target, onClose, onUpgraded }: ExtensionUpdateModalProps) {
+  const [busy, setBusy] = useState(false);
+  const [errMsg, setErrMsg] = useState("");
+  const [errTone, setErrTone] = useState<"err" | "warn">("err");
+  const abortRef = useRef<AbortController | null>(null);
+  const lastTargetRef = useRef(target);
+  if (target) lastTargetRef.current = target;
+  const view = target || lastTargetRef.current;
+
+  useEffect(() => {
+    if (!target) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setBusy(false);
+      setErrMsg("");
+      return;
+    }
+    setErrMsg("");
+  }, [target]);
+
+  const st = view?.status || {};
+  const onlineAllowed = Boolean(st.online_updatable ?? st.can_online_update);
+  const compat = st.compatible_with_host !== false;
+  const latestVer = String(st.latest_version || "");
+  const curVer = String(st.current_version || "");
+  const relUrl = safeHttpUrl(st.release_url);
+  const sizeBadge = formatApproxPackageSize(st);
+  const hasVerifiedHash = Boolean(st.sha256 || st.checksum_url);
+
+  const runOnlineUpgrade = async () => {
+    if (!target || busy || !onlineAllowed || !compat) return;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setBusy(true);
+    setErrMsg("");
+    try {
+      const endpoint =
+        target.kind === "plugin"
+          ? `/api/admin/plugins/${encodeURIComponent(target.id)}/upgrade?locale=${encodeURIComponent(localeSig.value)}`
+          : `/api/admin/themes/${encodeURIComponent(target.id)}/upgrade?locale=${encodeURIComponent(localeSig.value)}`;
+      const res = await apiFetch<any>(endpoint, {
+        method: "POST",
+        body: "{}",
+        signal: ctrl.signal,
+      });
+      setBusy(false);
+      onUpgraded(res, target.kind);
+      onClose();
+      showToast(t("app.ext_upgraded_toast", { name: target.name, ver: latestVer || "latest" }), "ok");
+    } catch (err: any) {
+      setBusy(false);
+      abortRef.current = null;
+      if (isAbortError(err)) {
+        setErrTone("warn");
+        setErrMsg(t("app.ext_install_canceled"));
+        return;
+      }
+      setErrTone("err");
+      setErrMsg(err.message || "");
+    }
+  };
+
+  return (
+    <NativeModalDialog
+      open={Boolean(target)}
+      onClose={onClose}
+      busy={busy}
+      busyGuardHint={t("app.ext_busy_close_guard")}
+      title={t("app.ext_update_modal_title", { name: view?.name || "" })}
+      subtitle={curVer && latestVer ? `v${curVer} → v${latestVer}` : undefined}
+      maxWidth="560px"
+      footer={
+        <>
+          {relUrl && (
+            <a
+              class={`volo-btn ${!onlineAllowed ? "volo-btn-primary" : ""}`}
+              style={{ marginRight: "auto" }}
+              href={relUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {t("app.ext_view_release")} ↗
+            </a>
+          )}
+          {busy ? (
+            <button
+              type="button"
+              class="volo-btn volo-btn-danger"
+              onClick={() => abortRef.current?.abort()}
+            >
+              {t("app.ext_cancel_transfer")}
+            </button>
+          ) : (
+            <button type="button" class="volo-btn" autoFocus onClick={onClose}>
+              {t("common.close")}
+            </button>
+          )}
+          {onlineAllowed && (
+            <button
+              type="button"
+              class="volo-btn volo-btn-primary"
+              disabled={busy || !compat}
+              onClick={() => void runOnlineUpgrade()}
+            >
+              {t("app.ext_confirm_upgrade", { ver: latestVer || "latest" })}
+            </button>
+          )}
+        </>
+      }
+    >
+      {(sizeBadge || hasVerifiedHash) && (
+        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px" }}>
+          {sizeBadge && <span class="volo-code-chip">{sizeBadge}</span>}
+          {hasVerifiedHash && <span class="volo-badge volo-badge-ok">{t("ext.sha256sums_badge")}</span>}
+        </div>
+      )}
+      {!compat && st.min_host_version && (
+        <div
+          role="alert"
+          class="volo-help"
+          style={{
+            marginBottom: "10px",
+            padding: "8px 10px",
+            borderRadius: "8px",
+            border: "1px solid var(--volo-danger)",
+            color: "var(--volo-danger)",
+          }}
+        >
+          {t("app.ext_incompat_host", { min: String(st.min_host_version) })}
+        </div>
+      )}
+      {!onlineAllowed && (
+        <div
+          class="volo-help"
+          style={{
+            marginBottom: "10px",
+            padding: "8px 10px",
+            borderRadius: "8px",
+            border: "1px solid var(--volo-line)",
+            background: "var(--volo-raised)",
+          }}
+        >
+          {t("app.ext_manual_only_hint")}
+        </div>
+      )}
+      <div class="volo-field">
+        <label>{t("app.ext_changelog_label")}</label>
+        <div class="volo-ext-changelog">{String(st.changelog || "").trim() || t("app.ext_no_changelog")}</div>
+      </div>
+      {onlineAllowed && <div class="volo-help">{t("app.ext_rollback_hint")}</div>}
+      {busy && (
+        <div style={{ marginTop: "12px" }}>
+          <progress class="volo-native-progress" aria-label={t("app.ext_upgrading_status")} />
+          <div role="status" class="volo-help" style={{ marginTop: "6px" }}>
+            {t("app.ext_upgrading_status")}
+          </div>
+        </div>
+      )}
+      {!busy && errMsg && (
+        <div
+          role={errTone === "err" ? "alert" : "status"}
+          class="volo-help"
+          style={{
+            marginTop: "10px",
+            color: errTone === "err" ? "var(--volo-danger)" : "var(--volo-warn, var(--volo-muted))",
+          }}
+        >
+          {errMsg}
+        </div>
+      )}
+    </NativeModalDialog>
+  );
+}
+
+interface BatchUpdateItem {
+  id: string;
+  name: string;
+  curVer: string;
+  latestVer: string;
+}
+
+type BatchRowState = "pending" | "upgrading" | "done" | "failed" | "canceled";
+
+function BatchUpdateModal({
+  target,
+  onClose,
+  onItemUpgraded,
+}: {
+  target: { kind: "plugin" | "theme"; items: BatchUpdateItem[] } | null;
+  onClose: () => void;
+  onItemUpgraded: (res: any, kind: "plugin" | "theme") => void;
+}) {
+  const [running, setRunning] = useState(false);
+  const [states, setStates] = useState<Record<string, BatchRowState>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const abortRef = useRef<AbortController | null>(null);
+  const canceledRef = useRef(false);
+  const lastRef = useRef(target);
+  if (target) lastRef.current = target;
+  const view = target || lastRef.current;
+
+  useEffect(() => {
+    if (!target) {
+      canceledRef.current = true;
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setRunning(false);
+      return;
+    }
+    canceledRef.current = false;
+    const init: Record<string, BatchRowState> = {};
+    for (const it of target.items) init[it.id] = "pending";
+    setStates(init);
+    setErrors({});
+    setRunning(true);
+
+    void (async () => {
+      let okCount = 0;
+      let hadError = false;
+      for (let i = 0; i < target.items.length; i++) {
+        const it = target.items[i];
+        if (canceledRef.current) {
+          setStates((prev) => ({ ...prev, [it.id]: "canceled" }));
+          continue;
+        }
+        setStates((prev) => ({ ...prev, [it.id]: "upgrading" }));
+        const ctrl = new AbortController();
+        abortRef.current = ctrl;
+        try {
+          const endpoint =
+            target.kind === "plugin"
+              ? `/api/admin/plugins/${encodeURIComponent(it.id)}/upgrade?locale=${encodeURIComponent(localeSig.value)}`
+              : `/api/admin/themes/${encodeURIComponent(it.id)}/upgrade?locale=${encodeURIComponent(localeSig.value)}`;
+          const res = await apiFetch<any>(endpoint, {
+            method: "POST",
+            body: "{}",
+            signal: ctrl.signal,
+          });
+          okCount++;
+          onItemUpgraded(res, target.kind);
+          setStates((prev) => ({ ...prev, [it.id]: "done" }));
+        } catch (err: any) {
+          if (isAbortError(err) || canceledRef.current) {
+            canceledRef.current = true;
+            setStates((prev) => {
+              const next = { ...prev, [it.id]: "canceled" as BatchRowState };
+              for (let j = i + 1; j < target.items.length; j++) {
+                next[target.items[j].id] = "canceled";
+              }
+              return next;
+            });
+            break;
+          }
+          hadError = true;
+          setStates((prev) => ({ ...prev, [it.id]: "failed" }));
+          setErrors((prev) => ({ ...prev, [it.id]: err?.message || "Failed" }));
+        }
+      }
+      abortRef.current = null;
+      setRunning(false);
+      if (!canceledRef.current && !hadError) {
+        onClose();
+        showToast(t("ext.batch_done_toast", { ok: okCount, total: target.items.length }), "ok");
+      }
+    })();
+
+    return () => {
+      canceledRef.current = true;
+      abortRef.current?.abort();
+    };
+  }, [target]);
+
+  const list = view?.items || [];
+  const doneCount = list.filter((it) => states[it.id] === "done").length;
+
+  return (
+    <NativeModalDialog
+      open={Boolean(target)}
+      onClose={onClose}
+      busy={running}
+      busyGuardHint={t("app.ext_busy_close_guard")}
+      title={t("ext.batch_modal_title", { done: doneCount, total: list.length })}
+      subtitle={t("ext.batch_modal_sub")}
+      maxWidth="540px"
+      footer={
+        running ? (
+          <button
+            type="button"
+            class="volo-btn volo-btn-danger"
+            onClick={() => {
+              canceledRef.current = true;
+              abortRef.current?.abort();
+            }}
+          >
+            {t("ext.batch_cancel_rest")}
+          </button>
+        ) : (
+          <button type="button" class="volo-btn volo-btn-primary" autoFocus onClick={onClose}>
+            {t("common.close")}
+          </button>
+        )
+      }
+    >
+      {running && (
+        <div style={{ marginBottom: "10px" }}>
+          <progress class="volo-native-progress" value={doneCount} max={Math.max(1, list.length)} />
+        </div>
+      )}
+      <div class="volo-ext-catalog">
+        {list.map((it) => {
+          const st = states[it.id] || "pending";
+          const pillTone =
+            st === "done" ? "ok" : st === "failed" ? "danger" : st === "upgrading" ? "warn" : "";
+          const stLabel =
+            st === "done"
+              ? t("ext.batch_st_done")
+              : st === "failed"
+                ? t("ext.batch_st_failed")
+                : st === "upgrading"
+                  ? t("ext.batch_st_upgrading")
+                  : st === "canceled"
+                    ? t("ext.batch_st_canceled")
+                    : t("ext.batch_st_pending");
+          return (
+            <div key={it.id} class="volo-ext-catalog-card">
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+                  <strong style={{ fontSize: "13.5px" }}>{it.name}</strong>
+                  <span class="volo-code-chip">
+                    v{it.curVer} → v{it.latestVer}
+                  </span>
+                </div>
+                {errors[it.id] && (
+                  <div class="volo-help" style={{ marginTop: "3px", color: "var(--volo-danger)" }}>
+                    {errors[it.id]}
+                  </div>
+                )}
+              </div>
+              <span class={`volo-status-pill ${pillTone}`}>
+                <span class="volo-status-dot" />
+                {stLabel}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </NativeModalDialog>
+  );
+}
+
+function ZipPreflightModal({
+  info,
+  onClose,
+  onCompleted,
+}: {
+  info: ZipPreflightInfo | null;
+  onClose: () => void;
+  onCompleted: (res: any, kind: "theme" | "plugin", autoAfter: boolean, pkgId: string) => Promise<void>;
+}) {
+  const [autoAfter, setAutoAfter] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [pct, setPct] = useState<number | null>(null);
+  const [errMsg, setErrMsg] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+  const lastRef = useRef(info);
+  if (info) lastRef.current = info;
+  const view = info || lastRef.current;
+
+  useEffect(() => {
+    if (!info) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setBusy(false);
+      setConfirming(false);
+      setPct(null);
+      setErrMsg("");
+      return;
+    }
+    setAutoAfter(info.kind === "plugin");
+    setPct(null);
+    setErrMsg("");
+  }, [info]);
+
+  const locked = busy || confirming;
+
+  const runZipInstall = async (overwrite: boolean): Promise<void> => {
+    if (!info) return;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setBusy(true);
+    setPct(0);
+    setErrMsg("");
+    try {
+      const fd = new FormData();
+      fd.append("file", info.file);
+      const extraParam =
+        info.kind === "plugin"
+          ? `&enable=${autoAfter ? "true" : "false"}`
+          : `&activate=${autoAfter ? "true" : "false"}`;
+      const qs = `locale=${encodeURIComponent(localeSig.value)}${overwrite ? "&overwrite=true" : ""}${extraParam}`;
+      const endpoint =
+        info.kind === "plugin"
+          ? `/api/admin/plugins/install?${qs}`
+          : `/api/admin/themes/install?${qs}`;
+      const res = await uploadWithProgress<any>(endpoint, fd, setPct, "POST", ctrl.signal);
+      await onCompleted(res, info.kind, autoAfter, info.parsedOk ? info.id : "");
+      setBusy(false);
+      setPct(null);
+      onClose();
+      showToast(info.kind === "plugin" ? t("app.installed_toast") : t("app.theme_installed"), "ok");
+    } catch (err: any) {
+      setBusy(false);
+      setPct(null);
+      abortRef.current = null;
+      if (isAbortError(err)) {
+        return;
+      }
+      if (!overwrite && (err?.status === 409 || /already exists|conflict/i.test(String(err?.message || "")))) {
+        setConfirming(true);
+        const ok = await openConfirm({
+          message: info.kind === "plugin" ? t("app.confirm_overwrite_plugin") : t("app.confirm_overwrite_theme"),
+          danger: true,
+        });
+        setConfirming(false);
+        if (ok) {
+          await runZipInstall(true);
+        }
+        return;
+      }
+      setErrMsg(err.message || "");
+    }
+  };
+
+  const fileSizeLabel = view ? formatApproxPackageSize({ size_bytes: view.file.size }) : "";
+
+  return (
+    <NativeModalDialog
+      open={Boolean(info)}
+      onClose={onClose}
+      busy={locked}
+      busyGuardHint={t("app.ext_busy_close_guard")}
+      title={t("ext.preflight_title")}
+      subtitle={t("ext.preflight_sub")}
+      maxWidth="540px"
+      footer={
+        <>
+          {busy ? (
+            <button
+              type="button"
+              class="volo-btn volo-btn-danger"
+              onClick={() => abortRef.current?.abort()}
+            >
+              {t("common.cancel")}
+            </button>
+          ) : (
+            <button type="button" class="volo-btn" disabled={confirming} onClick={onClose}>
+              {t("common.cancel")}
+            </button>
+          )}
+          <button
+            type="button"
+            class="volo-btn volo-btn-primary"
+            disabled={locked}
+            onClick={() => void runZipInstall(Boolean(view?.installedVersion))}
+          >
+            {t("ext.preflight_confirm_btn")}
+          </button>
+        </>
+      }
+    >
+      {view && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+          <div class="volo-ext-catalog-card" style={{ flexDirection: "column", gap: "6px" }}>
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+              <span class="volo-help">{t("ext.preflight_file")}:</span>
+              <span class="volo-code-chip">{view.file.name}</span>
+              {fileSizeLabel && <span class="volo-code-chip">{fileSizeLabel}</span>}
+            </div>
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+              <span class="volo-help">{t("ext.preflight_pkg")}:</span>
+              <strong>{view.name}</strong>
+              <span class="volo-code-chip">{view.id}</span>
+              {view.author && <span class="volo-help">· {view.author}</span>}
+            </div>
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+              <span class="volo-help">{t("ext.preflight_ver")}:</span>
+              {view.installedVersion ? (
+                <span class="volo-badge">
+                  v{view.installedVersion} → v{view.version || "?"}
+                </span>
+              ) : (
+                <span class="volo-badge volo-badge-ok">
+                  {t("ext.preflight_new_install", { ver: view.version || "1.0.0" })}
+                </span>
+              )}
+              {view.minHostVersion && (
+                <span class="volo-code-chip">
+                  {t("ext.preflight_host_ok", { min: view.minHostVersion })}
+                </span>
+              )}
+            </div>
+            {!view.parsedOk && <div class="volo-help">{t("ext.preflight_unparsed")}</div>}
+            {view.sha256 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
+                <span class="volo-help">{t("ext.preflight_sha256")}:</span>
+                <code class="volo-code-chip" style={{ wordBreak: "break-all", fontSize: "11px" }}>
+                  {view.sha256}
+                </code>
+              </div>
+            )}
+          </div>
+
+          {view.installedVersion && (
+            <div
+              class="volo-help"
+              style={{
+                padding: "8px 10px",
+                borderRadius: "8px",
+                border: "1px solid color-mix(in srgb, var(--volo-warn) 40%, var(--volo-line))",
+                background: "var(--volo-raised)",
+              }}
+            >
+              {t("ext.preflight_overwrite_warn")}
+            </div>
+          )}
+
+          <SwitchToggle
+            checked={autoAfter}
+            disabled={locked}
+            onChange={setAutoAfter}
+            label={view.kind === "plugin" ? t("app.ext_auto_enable") : t("app.ext_auto_activate")}
+          />
+
+          {busy && pct !== null && (
+            <UploadProgressBar
+              progress={pct}
+              label={t("cnt.media_uploading_pct", { pct })}
+              onCancel={() => abortRef.current?.abort()}
+            />
+          )}
+          {!busy && errMsg && (
+            <div role="alert" class="volo-help" style={{ color: "var(--volo-danger)" }}>
+              {errMsg}
+            </div>
+          )}
+        </div>
+      )}
+    </NativeModalDialog>
+  );
+}
+
 export function AppearanceWorkspace({
   activeTab = "themes",
   onNavigate,
@@ -1133,7 +2190,23 @@ export function AppearanceWorkspace({
   const [loading, setLoading] = useState<boolean>(true);
   const [uploading, setUploading] = useState<boolean>(false);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const locUploadAbortRef = useRef<AbortController | null>(null);
   const [triggeringCronKey, setTriggeringCronKey] = useState<string>("");
+  const [remoteInstallKind, setRemoteInstallKind] = useState<RemoteExtKind | null>(null);
+  const [updModalTarget, setUpdModalTarget] = useState<{
+    kind: "plugin" | "theme";
+    id: string;
+    name: string;
+    status: any;
+  } | null>(null);
+  const [batchModalTarget, setBatchModalTarget] = useState<{
+    kind: "plugin" | "theme";
+    items: BatchUpdateItem[];
+  } | null>(null);
+  const [zipPreflight, setZipPreflight] = useState<ZipPreflightInfo | null>(null);
+  const [zipDropKind, setZipDropKind] = useState<"theme" | "plugin" | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState<boolean>(false);
+  const [checkingSingleKey, setCheckingSingleKey] = useState<string>("");
 
   const [themes, setThemes] = useState<any[]>([]);
   const [themeQuery, setThemeQuery] = useState<string>("");
@@ -1252,10 +2325,149 @@ export function AppearanceWorkspace({
     }
   };
 
-  const isAlreadyExistsConflict = (err: any): boolean => {
-    if (err?.status === 409) return true;
-    const raw = String(err?.payload?.error || err?.message || "");
-    return /already exists|conflict/i.test(raw);
+  const applyExtensionMutationResult = (res: any, kind: RemoteExtKind) => {
+    if (kind === "theme") {
+      setBrokenPreviews({});
+      const nextThemes = Array.isArray(res?.themes) ? res.themes : Array.isArray(res?.items) ? res.items : null;
+      if (nextThemes) setThemes(nextThemes);
+      if (res?.appearance) {
+        setAppCfg(
+          draftCssRef.current !== null
+            ? { ...res.appearance, custom_css: draftCssRef.current }
+            : res.appearance,
+        );
+      }
+      const nextVer = res?.appearance_version ?? res?.version;
+      if (typeof nextVer === "number" && nextVer > 0) {
+        setAppVer(nextVer);
+      }
+      if (!nextThemes) {
+        void loadData(true);
+      }
+    } else if (kind === "plugin") {
+      if (Array.isArray(res?.items)) {
+        setPlugins(res.items);
+        if (Array.isArray(res?.cron_jobs)) setPluginCronJobs(res.cron_jobs);
+      } else {
+        void loadData(true);
+      }
+    } else {
+      if (Array.isArray(res?.locales)) {
+        registerExternalLocales(res.locales);
+        syncExternalLocales(res.locales);
+      }
+      if (Array.isArray(res?.items)) {
+        setLocPacks(res.items);
+      } else {
+        void loadData(true);
+      }
+      if (typeof res?.site_version === "number" && res.site_version > 0) {
+        setSiteVer(res.site_version);
+      }
+      void ensureLocaleLoaded(localeSig.value, true);
+    }
+  };
+
+  const openZipPreflight = async (file: File, kind: "theme" | "plugin") => {
+    const info = await inspectZipPreflight(file, kind, kind === "theme" ? themes : plugins);
+    setZipPreflight(info);
+  };
+
+  const isItemOnlineUpdatable = (it: any): boolean => {
+    const cap = String(it?.update_capability || "");
+    if (cap === "none") return false;
+    const st = it?.update_status;
+    if (!st) return false;
+    const hasUpd = Boolean(
+      st.has_update || st.state === "update_available" || st.status === "update_available",
+    );
+    const canOnline = Boolean(st.online_updatable ?? st.can_online_update);
+    const compat = st.compatible_with_host !== false;
+    return hasUpd && canOnline && compat;
+  };
+
+  const updatableThemes: BatchUpdateItem[] = themes.filter(isItemOnlineUpdatable).map((th) => ({
+    id: String(th.id),
+    name: String(th.display_name || th.name || th.id),
+    curVer: String(th.version || "1.0.0"),
+    latestVer: String(th.update_status?.latest_version || ""),
+  }));
+
+  const updatablePlugins: BatchUpdateItem[] = plugins.filter(isItemOnlineUpdatable).map((p) => ({
+    id: String(p.id),
+    name: String(resolveSchemaText(p.name) || p.id),
+    curVer: String(p.version || "1.0.0"),
+    latestVer: String(p.update_status?.latest_version || ""),
+  }));
+
+  const runBatchUpdateCheck = async (kind: "plugin" | "theme") => {
+    if (checkingUpdates) return;
+    setCheckingUpdates(true);
+    try {
+      const endpoint =
+        kind === "plugin"
+          ? `/api/admin/plugins/check-updates?locale=${encodeURIComponent(localeSig.value)}`
+          : `/api/admin/themes/check-updates?locale=${encodeURIComponent(localeSig.value)}`;
+      const res = await apiFetch<any>(endpoint, {
+        method: "POST",
+        body: JSON.stringify({ force: true }),
+      });
+      if (kind === "plugin") {
+        if (Array.isArray(res?.items)) setPlugins(res.items);
+        if (Array.isArray(res?.cron_jobs)) setPluginCronJobs(res.cron_jobs);
+      } else if (Array.isArray(res?.themes)) {
+        setThemes(res.themes);
+      }
+      const s = res?.summary || {};
+      const checked = Number(s.checked || 0);
+      const updates = Number(s.updates || 0);
+      const unsupported = Number(s.unsupported || 0);
+      const errors = Number(s.errors || 0);
+      if (updates > 0) {
+        showToast(t("app.ext_check_summary_has_upd", { checked, updates, unsupported }), "ok");
+      } else if (errors > 0) {
+        showToast(t("app.ext_check_summary_err", { checked, errors }), "err");
+      } else {
+        showToast(t("app.ext_check_summary_latest", { checked, unsupported }), "ok");
+      }
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setCheckingUpdates(false);
+    }
+  };
+
+  const runSingleUpdateCheck = async (kind: "plugin" | "theme", id: string, name: string) => {
+    const key = `${kind}:${id}`;
+    if (checkingSingleKey) return;
+    setCheckingSingleKey(key);
+    try {
+      const endpoint =
+        kind === "plugin"
+          ? `/api/admin/plugins/${encodeURIComponent(id)}/check-update?locale=${encodeURIComponent(localeSig.value)}`
+          : `/api/admin/themes/${encodeURIComponent(id)}/check-update?locale=${encodeURIComponent(localeSig.value)}`;
+      const res = await apiFetch<any>(endpoint, {
+        method: "POST",
+        body: JSON.stringify({ force: true }),
+      });
+      if (kind === "plugin" && res?.plugin) {
+        setPlugins((prev) => prev.map((it) => (it.id === id ? res.plugin : it)));
+      } else if (kind === "theme" && Array.isArray(res?.themes)) {
+        setThemes(res.themes);
+      }
+      const st = res?.status;
+      if (st?.has_update) {
+        setUpdModalTarget({ kind, id, name, status: st });
+      } else if (st?.state === "error") {
+        showToast(st.error || t("app.ext_check_err_short"), "err");
+      } else if (st?.state === "up_to_date") {
+        showToast(`${name}: ${t("app.ext_up_to_date")}`, "ok");
+      }
+    } catch (err: any) {
+      showToast(err.message, "err");
+    } finally {
+      setCheckingSingleKey("");
+    }
   };
 
   useEffect(() => {
@@ -1432,11 +2644,34 @@ export function AppearanceWorkspace({
 
       {sub === "themes" && appCfg && (
         <>
-          <div class="volo-card">
+          <div
+            class={`volo-card volo-zip-dropzone ${zipDropKind === "theme" ? "is-zip-dropover" : ""}`}
+            onDragOver={(e) => {
+              if (e.dataTransfer?.types?.includes("Files")) {
+                e.preventDefault();
+                if (zipDropKind !== "theme") setZipDropKind("theme");
+              }
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setZipDropKind(null);
+              }
+            }}
+            onDrop={(e) => {
+              setZipDropKind(null);
+              if (e.defaultPrevented || !e.dataTransfer?.files?.length) return;
+              const dropped = Array.from(e.dataTransfer.files).find((f) => /\.zip$/i.test(f.name));
+              if (!dropped) return;
+              e.preventDefault();
+              void openZipPreflight(dropped, "theme");
+            }}
+          >
             <div class="volo-sec-head">
               <div class="volo-sec-copy">
                 <h3 class="volo-card-title">{t("app.gallery_head")}</h3>
-                <p class="volo-sec-desc">{t("app.gallery_sub")}</p>
+                <p class="volo-sec-desc">
+                  {t("app.gallery_sub")} · <span class="volo-help">{t("ext.drop_zip_hint")}</span>
+                </p>
               </div>
               <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
                 <input
@@ -1455,13 +2690,11 @@ export function AppearanceWorkspace({
                   class="volo-btn volo-btn-sm"
                   onClick={async () => {
                     try {
-                      const res = await apiFetch<{ themes?: any[]; appearance?: any }>("/api/admin/themes/reload", {
+                      const res = await apiFetch<{ themes?: any[]; appearance?: any; appearance_version?: number }>("/api/admin/themes/reload", {
                         method: "POST",
                         body: "{}",
                       });
-                      setBrokenPreviews({});
-                      if (Array.isArray(res.themes)) setThemes(res.themes);
-                      else void loadData(true);
+                      applyExtensionMutationResult(res, "theme");
                       showToast(t("app.themes_reloaded"), "ok");
                     } catch (err: any) {
                       showToast(err.message, "err");
@@ -1470,74 +2703,46 @@ export function AppearanceWorkspace({
                 >
                   {t("app.themes_reload")}
                 </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm"
+                  disabled={checkingUpdates}
+                  onClick={() => void runBatchUpdateCheck("theme")}
+                >
+                  {checkingUpdates ? t("app.ext_checking") : t("app.ext_check_all")}
+                </button>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm"
+                  onClick={() => setRemoteInstallKind("theme")}
+                >
+                  {t("app.ext_url_install_btn")}
+                </button>
                 <UploadButton
                   accept=".zip"
                   primary
                   small
                   busy={uploading}
                   label={t("app.install_theme_zip")}
-                  onFile={async (f) => {
-                    const uploadThemeZip = async (overwrite: boolean) => {
-                      const fd = new FormData();
-                      fd.append("file", f);
-                      const qs = `locale=${encodeURIComponent(localeSig.value)}${overwrite ? "&overwrite=true" : ""}`;
-                      await uploadWithProgress(`/api/admin/themes/install?${qs}`, fd, setUploadPct);
-                    };
-                    let preConfirmedOverwrite = false;
-                    const existingThemeId = await inspectZipManifestId(
-                      f,
-                      "theme.json",
-                      themes.filter((th) => !th.is_builtin && !th.builtin).map((th) => String(th.id)),
-                    );
-                    if (existingThemeId) {
-                      const ok = await openConfirm({
-                        message: t("app.confirm_overwrite_theme"),
-                        danger: true,
-                      });
-                      if (!ok) return;
-                      preConfirmedOverwrite = true;
-                    }
-                    setUploading(true);
-                    setUploadPct(0);
-                    try {
-                      await uploadThemeZip(preConfirmedOverwrite);
-                      setBrokenPreviews({});
-                      showToast(t("app.theme_installed"), "ok");
-                      void loadData(true);
-                    } catch (err: any) {
-                      if (!preConfirmedOverwrite && isAlreadyExistsConflict(err)) {
-                        const ok = await openConfirm({
-                          message: t("app.confirm_overwrite_theme"),
-                          danger: true,
-                        });
-                        if (ok) {
-                          setUploadPct(0);
-                          try {
-                            await uploadThemeZip(true);
-                            setBrokenPreviews({});
-                            showToast(t("app.theme_installed"), "ok");
-                            void loadData(true);
-                          } catch (retryErr: any) {
-                            showToast(retryErr.message, "err");
-                          }
-                        }
-                      } else {
-                        showToast(err.message, "err");
-                      }
-                    } finally {
-                      setUploading(false);
-                      setUploadPct(null);
-                    }
-                  }}
+                  onFile={(f) => void openZipPreflight(f, "theme")}
                 />
               </div>
             </div>
-            {uploading && uploadPct !== null && (
-              <div style={{ marginBottom: "12px" }}>
-                <UploadProgressBar
-                  progress={uploadPct}
-                  label={t("cnt.media_uploading_pct", { pct: uploadPct })}
-                />
+            {updatableThemes.length >= 2 && (
+              <div
+                class="volo-ext-catalog-card"
+                style={{ alignItems: "center", marginBottom: "14px" }}
+              >
+                <span style={{ fontSize: "13px", fontWeight: 500 }}>
+                  {t("ext.update_banner_msg", { n: updatableThemes.length })}
+                </span>
+                <button
+                  type="button"
+                  class="volo-btn volo-btn-sm volo-btn-primary"
+                  onClick={() => setBatchModalTarget({ kind: "theme", items: updatableThemes })}
+                >
+                  {t("ext.update_all_btn", { n: updatableThemes.length })}
+                </button>
               </div>
             )}
 
@@ -1553,6 +2758,8 @@ export function AppearanceWorkspace({
                 const title = th.display_name || th.name || th.id;
                 const desc = th.display_description || th.description || "";
                 const hasBrokenImg = Boolean(brokenPreviews[th.id]);
+                const updCap = String(th.update_capability || "none");
+                const updSt = th.update_status || null;
                 return (
                   <div key={th.id} class={`volo-theme-card ${isActive || isMobileActive ? "active" : ""}`}>
                     <div class="volo-theme-thumb">
@@ -1592,13 +2799,59 @@ export function AppearanceWorkspace({
                         <span class="volo-badge">
                           {isBuiltin ? t("app.theme_builtin") : t("app.theme_external")}
                         </span>
+                        {updCap !== "none" && updSt?.state === "up_to_date" && (
+                          <span class="volo-badge volo-badge-ok">{t("app.ext_up_to_date")}</span>
+                        )}
                       </div>
                     </div>
                     <div class="volo-theme-body">
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" }}>
                         <strong style={{ fontSize: "15px" }}>{title}</strong>
-                        <span class="volo-help">v{th.version || "1.0.0"} · {th.author || "Volo"}</span>
+                        <span class="volo-help">
+                          v{th.version || "1.0.0"} · {th.author || "Volo"}
+                          {safeHttpUrl(th.homepage) && (
+                            <>
+                              {" · "}
+                              <a
+                                href={safeHttpUrl(th.homepage)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                style={{ color: "var(--volo-accent)" }}
+                              >
+                                ↗
+                              </a>
+                            </>
+                          )}
+                        </span>
                       </div>
+                      {updCap !== "none" && updSt?.has_update && (
+                        <div>
+                          <button
+                            type="button"
+                            class={`volo-btn volo-btn-sm ${updSt.online_updatable ? "volo-btn-primary" : ""}`}
+                            onClick={() =>
+                              setUpdModalTarget({
+                                kind: "theme",
+                                id: String(th.id),
+                                name: String(title),
+                                status: updSt,
+                              })
+                            }
+                          >
+                            {`v${th.version || "1.0.0"} → v${updSt.latest_version} · ${
+                              updSt.online_updatable ? t("app.ext_update_now") : t("app.ext_manual_update_badge")
+                            }`}
+                          </button>
+                        </div>
+                      )}
+                      {updCap !== "none" && !updSt?.has_update && updSt?.state === "error" && (
+                        <div>
+                          <span class="volo-status-pill danger" title={updSt.error || ""}>
+                            <span class="volo-status-dot" />
+                            {t("app.ext_check_err_short")}
+                          </span>
+                        </div>
+                      )}
                       <div class="volo-help" style={{ flex: 1 }}>{desc}</div>
                       <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
                         {!isActive && (
@@ -1647,6 +2900,16 @@ export function AppearanceWorkspace({
                         >
                           {t("app.theme_export_zip")}
                         </button>
+                        {updCap !== "none" && (
+                          <button
+                            type="button"
+                            class="volo-btn volo-btn-sm"
+                            disabled={checkingSingleKey === `theme:${th.id}`}
+                            onClick={() => void runSingleUpdateCheck("theme", String(th.id), String(title))}
+                          >
+                            {checkingSingleKey === `theme:${th.id}` ? t("app.ext_checking") : t("app.ext_check_one")}
+                          </button>
+                        )}
                         {schema.length > 0 && (
                           <button
                             type="button"
@@ -1850,7 +3113,14 @@ export function AppearanceWorkspace({
                 </span>
               </p>
             </div>
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={() => setRemoteInstallKind("locale")}
+              >
+                {t("ext.install_url_btn")}
+              </button>
               <UploadButton
                 accept=".json,.zip"
                 primary
@@ -1858,23 +3128,30 @@ export function AppearanceWorkspace({
                 busy={uploading}
                 label={t("app.loc_install_btn")}
                 onFile={async (f) => {
+                  const ctrl = new AbortController();
+                  locUploadAbortRef.current = ctrl;
                   setUploading(true);
+                  setUploadPct(0);
                   try {
                     const fd = new FormData();
                     fd.append("file", f);
-                    const res = await apiFetch<{ items?: any[]; locales?: any[]; site_version?: number }>("/api/admin/locales/install", {
-                      method: "POST",
-                      body: fd,
-                    });
-                    if (res.locales) syncExternalLocales(res.locales);
-                    if (res.items) setLocPacks(res.items);
-                    if (typeof res.site_version === "number" && res.site_version > 0) setSiteVer(res.site_version);
-                    await ensureLocaleLoaded(localeSig.value, true);
+                    const res = await uploadWithProgress<{ items?: any[]; locales?: any[]; site_version?: number }>(
+                      "/api/admin/locales/install",
+                      fd,
+                      setUploadPct,
+                      "POST",
+                      ctrl.signal,
+                    );
+                    applyExtensionMutationResult(res, "locale");
                     showToast(t("app.loc_installed"), "ok");
                   } catch (err: any) {
-                    showToast(err.message, "err");
+                    if (!isAbortError(err)) {
+                      showToast(err.message, "err");
+                    }
                   } finally {
+                    locUploadAbortRef.current = null;
                     setUploading(false);
+                    setUploadPct(null);
                   }
                 }}
               />
@@ -1887,10 +3164,7 @@ export function AppearanceWorkspace({
                       method: "POST",
                       body: "{}",
                     });
-                    if (res.locales) syncExternalLocales(res.locales);
-                    if (res.items) setLocPacks(res.items);
-                    if (typeof res.site_version === "number" && res.site_version > 0) setSiteVer(res.site_version);
-                    await ensureLocaleLoaded(localeSig.value, true);
+                    applyExtensionMutationResult(res, "locale");
                     showToast(t("app.loc_reloaded"), "ok");
                   } catch (err: any) {
                     showToast(err.message, "err");
@@ -1907,6 +3181,15 @@ export function AppearanceWorkspace({
               </button>
             </div>
           </div>
+          {uploading && uploadPct !== null && (
+            <div style={{ marginBottom: "12px" }}>
+              <UploadProgressBar
+                progress={uploadPct}
+                label={t("cnt.media_uploading_pct", { pct: uploadPct })}
+                onCancel={() => locUploadAbortRef.current?.abort()}
+              />
+            </div>
+          )}
 
           <div class="volo-table-wrap">
             <table class="volo-table volo-table-compact">
@@ -2031,14 +3314,12 @@ export function AppearanceWorkspace({
                                       return;
                                     }
                                     try {
-                                      const res = await apiFetch<{ items?: any[]; locales?: any[] }>(
+                                      const res = await apiFetch<{ items?: any[]; locales?: any[]; site_version?: number }>(
                                         `/api/admin/locales/${encodeURIComponent(p.code)}`,
                                         { method: "DELETE" },
                                       );
-                                      if (res.locales) syncExternalLocales(res.locales);
-                                      if (res.items) setLocPacks(res.items);
+                                      applyExtensionMutationResult(res, "locale");
                                       showToast(t("app.loc_deleted"), "ok");
-                                      void loadData(true);
                                     } catch (err: any) {
                                       showToast(err.message, "err");
                                     }
@@ -2068,11 +3349,34 @@ export function AppearanceWorkspace({
       )}
 
       {sub === "plugins" && (
-        <div class="volo-card">
+        <div
+          class={`volo-card volo-zip-dropzone ${zipDropKind === "plugin" ? "is-zip-dropover" : ""}`}
+          onDragOver={(e) => {
+            if (e.dataTransfer?.types?.includes("Files")) {
+              e.preventDefault();
+              if (zipDropKind !== "plugin") setZipDropKind("plugin");
+            }
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+              setZipDropKind(null);
+            }
+          }}
+          onDrop={(e) => {
+            setZipDropKind(null);
+            if (e.defaultPrevented || !e.dataTransfer?.files?.length) return;
+            const dropped = Array.from(e.dataTransfer.files).find((f) => /\.zip$/i.test(f.name));
+            if (!dropped) return;
+            e.preventDefault();
+            void openZipPreflight(dropped, "plugin");
+          }}
+        >
           <div class="volo-sec-head">
             <div class="volo-sec-copy">
               <h3 class="volo-card-title">{t("app.plugins_head")}</h3>
-              <p class="volo-sec-desc">{t("app.plugins_desc")}</p>
+              <p class="volo-sec-desc">
+                {t("app.plugins_desc")} · <span class="volo-help">{t("ext.drop_zip_hint")}</span>
+              </p>
             </div>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
               <input
@@ -2103,9 +3407,7 @@ export function AppearanceWorkspace({
                         { method: "POST", body: "{}" },
                       );
                     }
-                    if (Array.isArray(res?.items)) setPlugins(res!.items);
-                    else void loadData(true);
-                    if (Array.isArray(res?.cron_jobs)) setPluginCronJobs(res!.cron_jobs);
+                    applyExtensionMutationResult(res, "plugin");
                     showToast(t("app.plugins_discovered"), "ok");
                   } catch (err: any) {
                     showToast(err.message, "err");
@@ -2114,72 +3416,46 @@ export function AppearanceWorkspace({
               >
                 {t("app.plugins_discover")}
               </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                disabled={checkingUpdates}
+                onClick={() => void runBatchUpdateCheck("plugin")}
+              >
+                {checkingUpdates ? t("app.ext_checking") : t("app.ext_check_all")}
+              </button>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm"
+                onClick={() => setRemoteInstallKind("plugin")}
+              >
+                {t("app.ext_url_install_btn")}
+              </button>
               <UploadButton
                 accept=".zip"
                 primary
                 small
                 busy={uploading}
                 label={t("app.install_zip")}
-                onFile={async (f) => {
-                  const uploadPluginZip = async (overwrite: boolean) => {
-                    const fd = new FormData();
-                    fd.append("file", f);
-                    const qs = `locale=${encodeURIComponent(localeSig.value)}${overwrite ? "&overwrite=true" : ""}`;
-                    await uploadWithProgress(`/api/admin/plugins/install?${qs}`, fd, setUploadPct);
-                  };
-                  let preConfirmedOverwrite = false;
-                  const existingPluginId = await inspectZipManifestId(
-                    f,
-                    "manifest.json",
-                    plugins.map((p) => String(p.id)),
-                  );
-                  if (existingPluginId) {
-                    const ok = await openConfirm({
-                      message: t("app.confirm_overwrite_plugin"),
-                      danger: true,
-                    });
-                    if (!ok) return;
-                    preConfirmedOverwrite = true;
-                  }
-                  setUploading(true);
-                  setUploadPct(0);
-                  try {
-                    await uploadPluginZip(preConfirmedOverwrite);
-                    showToast(t("app.installed_toast"), "ok");
-                    void loadData(true);
-                  } catch (err: any) {
-                    if (!preConfirmedOverwrite && isAlreadyExistsConflict(err)) {
-                      const ok = await openConfirm({
-                        message: t("app.confirm_overwrite_plugin"),
-                        danger: true,
-                      });
-                      if (ok) {
-                        setUploadPct(0);
-                        try {
-                          await uploadPluginZip(true);
-                          showToast(t("app.installed_toast"), "ok");
-                          void loadData(true);
-                        } catch (retryErr: any) {
-                          showToast(retryErr.message, "err");
-                        }
-                      }
-                    } else {
-                      showToast(err.message, "err");
-                    }
-                  } finally {
-                    setUploading(false);
-                    setUploadPct(null);
-                  }
-                }}
+                onFile={(f) => void openZipPreflight(f, "plugin")}
               />
             </div>
           </div>
-          {uploading && uploadPct !== null && (
-            <div style={{ marginBottom: "12px" }}>
-              <UploadProgressBar
-                progress={uploadPct}
-                label={t("cnt.media_uploading_pct", { pct: uploadPct })}
-              />
+          {updatablePlugins.length >= 2 && (
+            <div
+              class="volo-ext-catalog-card"
+              style={{ alignItems: "center", marginBottom: "14px" }}
+            >
+              <span style={{ fontSize: "13px", fontWeight: 500 }}>
+                {t("ext.update_banner_msg", { n: updatablePlugins.length })}
+              </span>
+              <button
+                type="button"
+                class="volo-btn volo-btn-sm volo-btn-primary"
+                onClick={() => setBatchModalTarget({ kind: "plugin", items: updatablePlugins })}
+              >
+                {t("ext.update_all_btn", { n: updatablePlugins.length })}
+              </button>
             </div>
           )}
 
@@ -2207,6 +3483,9 @@ export function AppearanceWorkspace({
                     const chainIdx = plugins.findIndex((item) => item.id === p.id);
                     const priorityNum = typeof p.priority === "number" ? p.priority : 100;
                     const isFiltered = Boolean(pluginNeedle);
+                    const updCap = String(p.update_capability || "none");
+                    const updSt = p.update_status || null;
+                    const pDisplayName = String(resolveSchemaText(p.name) || p.id);
                     const rowCronJobs: any[] =
                       Array.isArray(p.cron_jobs) && p.cron_jobs.length > 0
                         ? p.cron_jobs
@@ -2218,6 +3497,16 @@ export function AppearanceWorkspace({
                             <div class="volo-cell-title">
                               <span>{resolveSchemaText(p.name) || p.id}</span>
                               <span class="volo-code-chip">{p.id}</span>
+                              {safeHttpUrl(p.homepage) && (
+                                <a
+                                  class="volo-code-chip"
+                                  href={safeHttpUrl(p.homepage)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                >
+                                  ↗
+                                </a>
+                              )}
                             </div>
                             {resolveSchemaText(p.description) && (
                               <div class="volo-cell-meta"><span>{resolveSchemaText(p.description)}</span></div>
@@ -2327,9 +3616,38 @@ export function AppearanceWorkspace({
                           </div>
                         </td>
                         <td class="col-cat" data-label={t("app.plugin_col_runtime")}>
-                          <span class="volo-cat-chip">
-                            {p.kind} · {p.runtime} · v{p.version}
-                          </span>
+                          <div style={{ display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-start" }}>
+                            <span class="volo-cat-chip">
+                              {p.kind} · {p.runtime} · v{p.version}
+                            </span>
+                            {updCap !== "none" && updSt?.has_update && (
+                              <button
+                                type="button"
+                                class={`volo-btn volo-btn-sm ${updSt.online_updatable ? "volo-btn-primary" : ""}`}
+                                onClick={() =>
+                                  setUpdModalTarget({
+                                    kind: "plugin",
+                                    id: String(p.id),
+                                    name: pDisplayName,
+                                    status: updSt,
+                                  })
+                                }
+                              >
+                                {`v${p.version} → v${updSt.latest_version} · ${
+                                  updSt.online_updatable ? t("app.ext_update_now") : t("app.ext_manual_update_badge")
+                                }`}
+                              </button>
+                            )}
+                            {updCap !== "none" && !updSt?.has_update && updSt?.state === "up_to_date" && (
+                              <span class="volo-badge volo-badge-ok">{t("app.ext_up_to_date")}</span>
+                            )}
+                            {updCap !== "none" && !updSt?.has_update && updSt?.state === "error" && (
+                              <span class="volo-status-pill danger" title={updSt.error || ""}>
+                                <span class="volo-status-dot" />
+                                {t("app.ext_check_err_short")}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td class="col-status" data-label={t("art.status")}>
                           <div class="volo-plugin-status-stack">
@@ -2388,6 +3706,26 @@ export function AppearanceWorkspace({
                             </button>
                             <ActionMenu
                               items={[
+                                {
+                                  label: t("app.ext_update_now"),
+                                  hidden: !(updCap !== "none" && updSt?.has_update),
+                                  onClick: () =>
+                                    setUpdModalTarget({
+                                      kind: "plugin",
+                                      id: String(p.id),
+                                      name: pDisplayName,
+                                      status: updSt,
+                                    }),
+                                },
+                                {
+                                  label:
+                                    checkingSingleKey === `plugin:${p.id}`
+                                      ? t("app.ext_checking")
+                                      : t("app.ext_check_one"),
+                                  hidden: updCap === "none",
+                                  disabled: checkingSingleKey === `plugin:${p.id}`,
+                                  onClick: () => void runSingleUpdateCheck("plugin", String(p.id), pDisplayName),
+                                },
                                 {
                                   label: t("app.plugin_set_priority"),
                                   onClick: () => openPriorityEditor(p),
@@ -2870,6 +4208,65 @@ export function AppearanceWorkspace({
           );
         })()}
       </AnimatedModal>
+
+      <RemoteInstallModal
+        open={remoteInstallKind !== null}
+        kind={remoteInstallKind || "plugin"}
+        onClose={() => setRemoteInstallKind(null)}
+        onInstalled={(res, installedKind) => {
+          applyExtensionMutationResult(res, installedKind);
+        }}
+      />
+
+      <ExtensionUpdateModal
+        target={updModalTarget}
+        onClose={() => setUpdModalTarget(null)}
+        onUpgraded={(res, upgradedKind) => {
+          applyExtensionMutationResult(res, upgradedKind);
+        }}
+      />
+
+      <BatchUpdateModal
+        target={batchModalTarget}
+        onClose={() => setBatchModalTarget(null)}
+        onItemUpgraded={(res, upgradedKind) => {
+          applyExtensionMutationResult(res, upgradedKind);
+        }}
+      />
+
+      <ZipPreflightModal
+        info={zipPreflight}
+        onClose={() => setZipPreflight(null)}
+        onCompleted={async (res, completedKind, autoAfter, pkgId) => {
+          applyExtensionMutationResult(res, completedKind);
+          if (!pkgId) return;
+          if (completedKind === "theme" && autoAfter && res?.appearance?.active_theme !== pkgId) {
+            try {
+              const actRes = await apiFetch<{ appearance?: any; version?: number }>("/api/admin/themes/activate", {
+                method: "POST",
+                body: JSON.stringify({ theme_id: pkgId, target: "desktop" }),
+              });
+              applyExtensionMutationResult(actRes, "theme");
+            } catch {
+              // Ignore post-install activation error; theme is already installed
+            }
+          } else if (completedKind === "plugin") {
+            const list = Array.isArray(res?.items) ? res.items : null;
+            const found = list ? list.find((it: any) => String(it?.id || "") === pkgId) : null;
+            if (found && Boolean(found.is_enabled) !== autoAfter) {
+              try {
+                await apiFetch(
+                  `/api/admin/plugins/${encodeURIComponent(pkgId)}/${autoAfter ? "enable" : "disable"}`,
+                  { method: "POST", body: "{}" },
+                );
+                void loadData(true);
+              } catch {
+                // Ignore post-install toggle error
+              }
+            }
+          }
+        }}
+      />
     </div>
   );
 }

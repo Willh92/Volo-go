@@ -293,15 +293,36 @@ function NavIcon({ name }: { name: string }) {
 
 function ToastBanner() {
   const cur = toastSig.value;
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = hostRef.current;
+    if (!el || !cur) return;
+    if (typeof (el as any).showPopover === "function") {
+      try {
+        (el as any).showPopover();
+      } catch {
+        // Ignore InvalidStateError if already open
+      }
+    }
+  }, [cur?.id]);
   if (!cur) return null;
   return (
     <div
+      ref={hostRef}
       key={cur.id}
+      {...({ popover: "manual" } as any)}
       class={`volo-toast is-${cur.kind} ${cur.closing ? "is-closing" : ""}`}
       role={cur.kind === "err" ? "alert" : "status"}
       aria-live={cur.kind === "err" ? "assertive" : "polite"}
       onMouseEnter={pauseToast}
       onMouseLeave={resumeToast}
+      onFocusIn={pauseToast}
+      onFocusOut={(e) => {
+        const next = (e as FocusEvent).relatedTarget as Node | null;
+        if (!next || !e.currentTarget.contains(next)) {
+          resumeToast();
+        }
+      }}
     >
       <span class="volo-toast-icon" aria-hidden="true">
         {cur.kind === "err" ? (
@@ -987,6 +1008,7 @@ function App() {
     };
     const onGlobalKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        if (document.querySelector("dialog:modal")) return;
         const inCm = (e.target as HTMLElement | null)?.closest?.(".cm-editor");
         if (!inCm && currentUserSig.value && bootConfig.mode !== "setup") {
           e.preventDefault();

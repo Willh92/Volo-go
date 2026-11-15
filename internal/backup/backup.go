@@ -34,6 +34,8 @@ const (
 	maxTotalRestoreBytes    = 2048 * 1024 * 1024 // 2 GiB total unpacked cap
 	maxExtensionSingleBytes = 32 * 1024 * 1024   // 32 MiB per extension file
 	maxExtensionTotalBytes  = 512 * 1024 * 1024  // 512 MiB total unpacked extensions cap
+	maxLocaleSingleBytes    = 4 * 1024 * 1024    // 4 MiB per locale JSON file
+	maxLocaleTotalBytes     = 64 * 1024 * 1024   // 64 MiB total unpacked locales cap
 	restoreBatchSize        = 200
 )
 
@@ -73,6 +75,7 @@ type Manifest struct {
 	CreatedAt          int64        `json:"created_at"`
 	IncludesMedia      bool         `json:"includes_media"`
 	IncludesExtensions bool         `json:"includes_extensions,omitempty"`
+	IncludesLocales    bool         `json:"includes_locales,omitempty"`
 	Files              []FileDigest `json:"files"`
 }
 
@@ -82,6 +85,7 @@ type CreateOptions struct {
 	UploadDir    string
 	PluginsDir   string
 	ThemesDir    string
+	LocalesDir   string
 }
 
 // RestoreOptions configures streaming cross-database backup restoration.
@@ -90,17 +94,19 @@ type RestoreOptions struct {
 	UploadDir          string
 	PluginsDir         string
 	ThemesDir          string
+	LocalesDir         string
 	MaxEntries         int
 	MaxSingleFileBytes int64
 	MaxTotalBytes      int64
 }
 
-// RestoreSummary reports row counts, media files, and extension files restored (or validated in DryRun).
+// RestoreSummary reports row counts, media files, extension files, and locale files restored (or validated in DryRun).
 type RestoreSummary struct {
 	SourceDialect  string           `json:"source_dialect"`
 	Tables         map[string]int64 `json:"tables"`
 	MediaFiles     int              `json:"media_files"`
 	ExtensionFiles int              `json:"extension_files,omitempty"`
+	LocaleFiles    int              `json:"locale_files,omitempty"`
 	DryRun         bool             `json:"dry_run"`
 }
 
@@ -206,6 +212,18 @@ func Create(ctx context.Context, store *sqlx.Store, w io.Writer, opts CreateOpti
 		if len(themeDigests) > 0 {
 			manifest.IncludesExtensions = true
 			manifest.Files = append(manifest.Files, themeDigests...)
+		}
+	}
+
+	if strings.TrimSpace(opts.LocalesDir) != "" {
+		localeDigests, err := streamLocalesDirToZip(ctx, zw, opts.LocalesDir)
+		if err != nil {
+			_ = zw.Close()
+			return nil, fmt.Errorf("backup: export locales: %w", err)
+		}
+		if len(localeDigests) > 0 {
+			manifest.IncludesLocales = true
+			manifest.Files = append(manifest.Files, localeDigests...)
 		}
 	}
 
@@ -635,6 +653,136 @@ func parseExtensionEntryPath(entryPath string) (kind string, extID string, relSl
 	return kind, extID, relSlash, false, nil
 }
 
+func isSafeLocaleFileName(name string) bool {
+	if len(name) < 6 || len(name) > 69 {
+		return false
+	}
+	if shouldSkipBackupTempOrHidden(name) || strings.EqualFold(name, "catalog.json") {
+		return false
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return false
+	}
+	stem := name[:len(name)-5]
+	if len(stem) == 0 || len(stem) > 64 || strings.Contains(stem, "..") {
+		return false
+	}
+	for i := 0; i < len(stem); i++ {
+		c := stem[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		if i > 0 && (c == '-' || c == '_' || c == '.') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func parseLocaleEntryPath(entryPath string) (string, error) {
+	if !strings.HasPrefix(entryPath, "locales/") {
+		return "", fmt.Errorf("backup: invalid locale archive path %q", entryPath)
+	}
+	name := strings.TrimPrefix(entryPath, "locales/")
+	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "..") {
+		return "", fmt.Errorf("backup: invalid locale filename in %q", entryPath)
+	}
+	if strings.EqualFold(name, "catalog.json") {
+		return "", fmt.Errorf("backup: reserved locale catalog entry %q rejected", entryPath)
+	}
+	if !isSafeLocaleFileName(name) {
+		return "", fmt.Errorf("backup: unsafe locale filename %q rejected", entryPath)
+	}
+	return name, nil
+}
+
+func streamLocalesDirToZip(ctx context.Context, zw *zip.Writer, localesDir string) ([]FileDigest, error) {
+	info, err := os.Lstat(localesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing symlinked locales directory %q", localesDir)
+	}
+	if !info.IsDir() {
+		return nil, nil
+	}
+	realRoot, err := filepath.EvalSymlinks(localesDir)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(realRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	var names []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !isSafeLocaleFileName(name) {
+			continue
+		}
+		p := filepath.Join(realRoot, name)
+		linfo, lErr := os.Lstat(p)
+		if lErr != nil || linfo.Mode()&os.ModeSymlink != 0 || !linfo.Mode().IsRegular() {
+			continue
+		}
+		if linfo.Size() > maxLocaleSingleBytes {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	digests := make([]FileDigest, 0, len(names))
+	buf := make([]byte, 32*1024)
+	for _, name := range names {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		srcPath := filepath.Join(realRoot, name)
+		linfo, lErr := os.Lstat(srcPath)
+		if lErr != nil || linfo.Mode()&os.ModeSymlink != 0 || !linfo.Mode().IsRegular() || linfo.Size() > maxLocaleSingleBytes {
+			continue
+		}
+		f, oErr := os.Open(srcPath)
+		if oErr != nil {
+			return nil, oErr
+		}
+		entryPath := "locales/" + name
+		hdr := &zip.FileHeader{
+			Name:     entryPath,
+			Method:   zip.Deflate,
+			Modified: linfo.ModTime().UTC(),
+		}
+		hdr.SetMode(0o644)
+		zf, cErr := zw.CreateHeader(hdr)
+		if cErr != nil {
+			_ = f.Close()
+			return nil, cErr
+		}
+		hasher := sha256.New()
+		n, copyErr := io.CopyBuffer(io.MultiWriter(zf, hasher), f, buf)
+		_ = f.Close()
+		if copyErr != nil {
+			return nil, copyErr
+		}
+		digests = append(digests, FileDigest{
+			Path:   entryPath,
+			SHA256: hex.EncodeToString(hasher.Sum(nil)),
+			Bytes:  n,
+		})
+	}
+	return digests, nil
+}
+
 // RestoreFromFile validates and streams a native Volo-go backup ZIP into the target Store
 // inside an atomic database transaction (supporting SQLite <-> PostgreSQL <-> MySQL migration).
 func RestoreFromFile(ctx context.Context, store *sqlx.Store, zipPath string, opts RestoreOptions) (*RestoreSummary, error) {
@@ -710,6 +858,7 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 	// Pass 1: Verify SHA-256 checksums, path safety, and byte quotas BEFORE touching DB or disk!
 	var totalBytes int64
 	var extensionBytes int64
+	var localeBytes int64
 	expectedMap := make(map[string]FileDigest, len(manifest.Files))
 	for _, fd := range manifest.Files {
 		cleanDecl, dErr := sanitizeBackupZipEntryName(fd.Path, false)
@@ -721,12 +870,20 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		}
 		entryMax := singleCap
 		isExt := strings.HasPrefix(fd.Path, "extensions/")
+		isLocale := strings.HasPrefix(fd.Path, "locales/")
 		if isExt {
 			if _, _, _, _, eErr := parseExtensionEntryPath(fd.Path); eErr != nil {
 				return nil, eErr
 			}
 			if maxExtensionSingleBytes < entryMax {
 				entryMax = maxExtensionSingleBytes
+			}
+		} else if isLocale {
+			if _, lErr := parseLocaleEntryPath(fd.Path); lErr != nil {
+				return nil, lErr
+			}
+			if maxLocaleSingleBytes < entryMax {
+				entryMax = maxLocaleSingleBytes
 			}
 		}
 
@@ -754,6 +911,15 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 			if extensionBytes > extTotalCap {
 				return nil, errors.New("backup: extension entries exceed unpacked safety limit")
 			}
+		} else if isLocale {
+			localeBytes += actualBytes
+			locTotalCap := int64(maxLocaleTotalBytes)
+			if totalCap < locTotalCap {
+				locTotalCap = totalCap
+			}
+			if localeBytes > locTotalCap {
+				return nil, errors.New("backup: locale entries exceed unpacked safety limit")
+			}
 		}
 		if !strings.EqualFold(actualHash, fd.SHA256) || actualBytes != fd.Bytes {
 			return nil, fmt.Errorf("backup: integrity check failed for %q (sha256/size mismatch)", fd.Path)
@@ -761,13 +927,14 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		expectedMap[fd.Path] = fd
 	}
 
-	// Fail closed if the ZIP archive contains ANY undeclared table, media, or extension stream missing from manifest.json!
+	// Fail closed if the ZIP archive contains ANY undeclared table, media, extension, or locale stream missing from manifest.json!
 	for clean, zf := range fileIndex {
 		if clean == "manifest.json" || zf == nil || zf.FileInfo().IsDir() {
 			continue
 		}
 		if strings.HasPrefix(clean, "tables/") || strings.HasPrefix(clean, "uploads/") ||
-			strings.HasPrefix(clean, "media/") || strings.HasPrefix(clean, "extensions/") {
+			strings.HasPrefix(clean, "media/") || strings.HasPrefix(clean, "extensions/") ||
+			strings.HasPrefix(clean, "locales/") {
 			if _, declared := expectedMap[clean]; !declared {
 				return nil, fmt.Errorf("backup: unsigned extra archive entry %q missing from manifest.json", clean)
 			}
@@ -792,6 +959,10 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 			} else if strings.HasPrefix(p, "extensions/") {
 				if _, _, _, skip, pErr := parseExtensionEntryPath(p); pErr == nil && !skip {
 					summary.ExtensionFiles++
+				}
+			} else if strings.HasPrefix(p, "locales/") {
+				if _, lErr := parseLocaleEntryPath(p); lErr == nil {
+					summary.LocaleFiles++
 				}
 			}
 		}
@@ -879,6 +1050,16 @@ func Restore(ctx context.Context, store *sqlx.Store, ra io.ReaderAt, size int64,
 		}
 		extractedDiskBytes += nBytes
 		summary.ExtensionFiles += nFiles
+	}
+
+	// Pass 5: Stream external locale packs (excluding catalog.json) if LocalesDir is configured
+	if strings.TrimSpace(opts.LocalesDir) != "" {
+		nFiles, nBytes, lErr := restoreLocalesDir(manifest.Files, fileIndex, opts.LocalesDir, singleCap, totalCap-extractedDiskBytes)
+		if lErr != nil {
+			return nil, lErr
+		}
+		extractedDiskBytes += nBytes
+		summary.LocaleFiles += nFiles
 	}
 
 	return summary, nil
@@ -983,15 +1164,37 @@ func restoreExtensionKind(
 	singleCap int64,
 	remainingTotal int64,
 ) (int, int64, error) {
-	prefix := "extensions/" + wantKind + "/"
-	hasMatching := false
-	for _, fd := range files {
-		if strings.HasPrefix(fd.Path, prefix) {
-			hasMatching = true
-			break
-		}
+	type stagedExtEntry struct {
+		relSlash string
+		zf       *zip.File
 	}
-	if !hasMatching {
+	prefix := "extensions/" + wantKind + "/"
+	var extOrder []string
+	byExt := make(map[string][]stagedExtEntry)
+	for _, fd := range files {
+		if !strings.HasPrefix(fd.Path, prefix) {
+			continue
+		}
+		kind, extID, relSlash, skip, pErr := parseExtensionEntryPath(fd.Path)
+		if pErr != nil {
+			return 0, 0, pErr
+		}
+		if skip || kind != wantKind {
+			continue
+		}
+		zf := fileIndex[fd.Path]
+		if zf == nil || zf.FileInfo().IsDir() {
+			continue
+		}
+		if _, seen := byExt[extID]; !seen {
+			extOrder = append(extOrder, extID)
+		}
+		byExt[extID] = append(byExt[extID], stagedExtEntry{
+			relSlash: relSlash,
+			zf:       zf,
+		})
+	}
+	if len(extOrder) == 0 {
 		return 0, 0, nil
 	}
 
@@ -1005,29 +1208,200 @@ func restoreExtensionKind(
 		entryMax = maxExtensionSingleBytes
 	}
 
+	stageDirs := make(map[string]string, len(extOrder))
+	cleanupStages := func() {
+		for _, sd := range stageDirs {
+			if sd != "" {
+				_ = os.RemoveAll(sd)
+			}
+		}
+	}
+
+	buf := make([]byte, 32*1024)
+	var restoredCount int
+	var restoredBytes int64
+	for _, extID := range extOrder {
+		targetExtDir := filepath.Join(realDestRoot, extID)
+		if err := ensureNoSymlinkAncestors(realDestRoot, targetExtDir); err != nil {
+			cleanupStages()
+			return 0, 0, err
+		}
+		stageDir, sErr := os.MkdirTemp(realDestRoot, ".volo-restore-ext-"+extID+"-*")
+		if sErr != nil {
+			cleanupStages()
+			return 0, 0, fmt.Errorf("backup: create staging dir for %s/%s: %w", wantKind, extID, sErr)
+		}
+		_ = os.Chmod(stageDir, 0o750)
+		stageDirs[extID] = stageDir
+
+		for _, entry := range byExt[extID] {
+			n, wErr := extractVerifiedZipFile(stageDir, entry.relSlash, entry.zf, entryMax, remainingTotal-restoredBytes, buf)
+			if wErr != nil {
+				cleanupStages()
+				return 0, 0, wErr
+			}
+			restoredBytes += n
+			restoredCount++
+		}
+	}
+
+	type swappedExt struct {
+		targetDir string
+		backupDir string
+	}
+	var swapped []swappedExt
+	rollbackSwapped := func() {
+		for i := len(swapped) - 1; i >= 0; i-- {
+			sw := swapped[i]
+			_ = os.RemoveAll(sw.targetDir)
+			if sw.backupDir != "" {
+				_ = renameBackupTempFile(sw.backupDir, sw.targetDir)
+			}
+		}
+	}
+
+	for _, extID := range extOrder {
+		stageDir := stageDirs[extID]
+		targetExtDir := filepath.Join(realDestRoot, extID)
+		var backupOldDir string
+		if linfo, statErr := os.Lstat(targetExtDir); statErr == nil {
+			if linfo.Mode()&os.ModeSymlink != 0 {
+				rollbackSwapped()
+				cleanupStages()
+				return 0, 0, fmt.Errorf("backup: refusing to overwrite symlinked extension dir %q", targetExtDir)
+			}
+			tmpOld, tErr := os.MkdirTemp(realDestRoot, ".volo-old-ext-"+extID+"-*")
+			if tErr != nil {
+				rollbackSwapped()
+				cleanupStages()
+				return 0, 0, fmt.Errorf("backup: prepare swap dir for %s/%s: %w", wantKind, extID, tErr)
+			}
+			_ = os.Remove(tmpOld)
+			backupOldDir = tmpOld
+			if rErr := renameBackupTempFile(targetExtDir, backupOldDir); rErr != nil {
+				rollbackSwapped()
+				cleanupStages()
+				return 0, 0, fmt.Errorf("backup: move old %s/%s aside: %w", wantKind, extID, rErr)
+			}
+		} else if !os.IsNotExist(statErr) {
+			rollbackSwapped()
+			cleanupStages()
+			return 0, 0, statErr
+		}
+
+		if rErr := renameBackupTempFile(stageDir, targetExtDir); rErr != nil {
+			if backupOldDir != "" {
+				_ = renameBackupTempFile(backupOldDir, targetExtDir)
+			}
+			rollbackSwapped()
+			cleanupStages()
+			return 0, 0, fmt.Errorf("backup: activate restored %s/%s: %w", wantKind, extID, rErr)
+		}
+		stageDirs[extID] = ""
+		swapped = append(swapped, swappedExt{
+			targetDir: targetExtDir,
+			backupDir: backupOldDir,
+		})
+	}
+
+	for _, sw := range swapped {
+		if sw.backupDir != "" {
+			_ = os.RemoveAll(sw.backupDir)
+		}
+	}
+	return restoredCount, restoredBytes, nil
+}
+
+func restoreLocalesDir(
+	files []FileDigest,
+	fileIndex map[string]*zip.File,
+	localesDir string,
+	singleCap int64,
+	remainingTotal int64,
+) (int, int64, error) {
+	hasMatching := false
+	for _, fd := range files {
+		if strings.HasPrefix(fd.Path, "locales/") {
+			hasMatching = true
+			break
+		}
+	}
+	if !hasMatching {
+		return 0, 0, nil
+	}
+
+	realLocalesRoot, err := prepareSafeRestoreDir(localesDir)
+	if err != nil {
+		return 0, 0, fmt.Errorf("backup: prepare locales dir: %w", err)
+	}
+
+	entryMax := singleCap
+	if maxLocaleSingleBytes < entryMax {
+		entryMax = maxLocaleSingleBytes
+	}
+
 	buf := make([]byte, 32*1024)
 	var restoredCount int
 	var restoredBytes int64
 	for _, fd := range files {
-		if !strings.HasPrefix(fd.Path, prefix) {
+		if !strings.HasPrefix(fd.Path, "locales/") {
 			continue
 		}
-		kind, extID, relSlash, skip, pErr := parseExtensionEntryPath(fd.Path)
-		if pErr != nil {
-			return restoredCount, restoredBytes, pErr
-		}
-		if skip || kind != wantKind {
-			continue
+		fileName, lErr := parseLocaleEntryPath(fd.Path)
+		if lErr != nil {
+			return restoredCount, restoredBytes, lErr
 		}
 		zf := fileIndex[fd.Path]
 		if zf == nil || zf.FileInfo().IsDir() {
 			continue
 		}
-		n, wErr := extractVerifiedZipFile(realDestRoot, extID+"/"+relSlash, zf, entryMax, remainingTotal-restoredBytes, buf)
-		if wErr != nil {
-			return restoredCount, restoredBytes, wErr
+		remaining := remainingTotal - restoredBytes
+		if remaining < 0 {
+			return restoredCount, restoredBytes, errors.New("backup: archive exceeds total unpacked safety limit")
 		}
-		restoredBytes += n
+		target := filepath.Join(realLocalesRoot, fileName)
+		if err := ensureNoSymlinkAncestors(realLocalesRoot, target); err != nil {
+			return restoredCount, restoredBytes, err
+		}
+		maxAllowed := entryMax
+		if remaining < maxAllowed {
+			maxAllowed = remaining
+		}
+
+		rc, oErr := zf.Open()
+		if oErr != nil {
+			return restoredCount, restoredBytes, oErr
+		}
+		tmpFile, tErr := os.CreateTemp(realLocalesRoot, ".volo-restore-locale-*.tmp")
+		if tErr != nil {
+			_ = rc.Close()
+			return restoredCount, restoredBytes, tErr
+		}
+		tmpPath := tmpFile.Name()
+		_ = tmpFile.Chmod(0o640)
+		written, copyErr := io.CopyBuffer(tmpFile, io.LimitReader(rc, maxAllowed+1), buf)
+		syncErr := tmpFile.Sync()
+		closeErr := tmpFile.Close()
+		_ = rc.Close()
+		if copyErr != nil || syncErr != nil || closeErr != nil {
+			_ = os.Remove(tmpPath)
+			if copyErr != nil {
+				return restoredCount, restoredBytes, copyErr
+			}
+			if syncErr != nil {
+				return restoredCount, restoredBytes, syncErr
+			}
+			return restoredCount, restoredBytes, closeErr
+		}
+		if written > maxAllowed {
+			_ = os.Remove(tmpPath)
+			return restoredCount, restoredBytes, fmt.Errorf("backup: extracted locale %q exceeds unpacked byte cap", zf.Name)
+		}
+		if rErr := renameBackupTempFile(tmpPath, target); rErr != nil {
+			_ = os.Remove(tmpPath)
+			return restoredCount, restoredBytes, rErr
+		}
+		restoredBytes += written
 		restoredCount++
 	}
 	return restoredCount, restoredBytes, nil

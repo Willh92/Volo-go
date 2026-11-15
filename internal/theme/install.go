@@ -2,31 +2,97 @@ package theme
 
 import (
 	"archive/zip"
-	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/Willh92/Volo-go/internal/extpkg"
 )
 
 const (
-	maxThemeZipFiles    = 512
-	maxThemeTotalBytes  = 32 << 20 // 32 MiB
-	maxThemeSingleBytes = 8 << 20  // 8 MiB
+	maxThemeZipFiles      = 512
+	maxThemeExportEntries = 500
+	maxThemeTotalBytes    = 32 << 20 // 32 MiB
+	maxThemeSingleBytes   = 8 << 20  // 8 MiB
 )
 
 var validThemeIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,62}$`)
 
+var themeExportCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32*1024)
+		return &buf
+	},
+}
+
+type installThemeZipOptions struct {
+	overwrite           bool
+	expectedThemeID     string
+	expectedPrevVersion string
+	disallowDowngrade   bool
+}
+
 // InstallZip safely extracts, validates, and compiles a theme `.zip` package into `themesDir/<id>`,
 // supporting both flat archives (`theme.json` at root) and single-folder archives (`<folder>/theme.json`).
 func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest, error) {
+	return e.InstallZipContext(context.Background(), r, size, overwrite)
+}
+
+// InstallZipContext safely extracts, validates, and installs a theme `.zip` package with pre-commit
+// context cancellation and post-swap transactional rollback if engine reload fails.
+func (e *Engine) InstallZipContext(ctx context.Context, r io.ReaderAt, size int64, overwrite bool) (Manifest, error) {
+	return e.installZipInternal(ctx, r, size, installThemeZipOptions{
+		overwrite: overwrite,
+	})
+}
+
+func sanitizeThemeZipEntry(zf *zip.File) (clean string, skip bool, err error) {
+	mode := zf.Mode()
+	if mode&os.ModeSymlink != 0 {
+		return "", false, errors.New("theme: symbolic links are forbidden inside theme archive")
+	}
+	isDir := zf.FileInfo().IsDir()
+	if !isDir && !mode.IsRegular() {
+		return "", false, fmt.Errorf("theme: non-regular entry %q is forbidden inside theme archive", zf.Name)
+	}
+
+	raw := zf.Name
+	if isDir {
+		if strings.HasSuffix(raw, "/") && !strings.HasPrefix(raw, "/") {
+			raw = strings.TrimSuffix(raw, "/")
+		}
+		if raw == "__MACOSX" || strings.HasPrefix(raw, "__MACOSX/") {
+			return "", true, nil
+		}
+	} else if strings.HasPrefix(raw, "__MACOSX/") {
+		return "", true, nil
+	}
+
+	clean, err = extpkg.SanitizeZipPath(raw)
+	if err != nil {
+		return "", false, fmt.Errorf("theme: invalid zip entry %q: %w", zf.Name, err)
+	}
+	return clean, false, nil
+}
+
+func (e *Engine) installZipInternal(ctx context.Context, r io.ReaderAt, size int64, opts installThemeZipOptions) (Manifest, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Manifest{}, err
+	}
 	if strings.TrimSpace(e.themesDir) == "" {
 		return Manifest{}, errors.New("theme: external themes directory is not configured")
 	}
@@ -46,27 +112,26 @@ func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest
 		return Manifest{}, fmt.Errorf("theme: create themes directory: %w", err)
 	}
 
-	// Detect root prefix from location of `theme.json`
+	// Validate all archive paths & modes upfront and detect root prefix from location of `theme.json`.
 	rootPrefix := ""
 	foundManifest := false
 	for _, zf := range zr.File {
-		if zf.FileInfo().IsDir() {
-			continue
+		clean, skip, sErr := sanitizeThemeZipEntry(zf)
+		if sErr != nil {
+			return Manifest{}, sErr
 		}
-		clean := normalizeZipEntry(zf.Name)
-		if clean == "" || strings.HasPrefix(clean, "__MACOSX/") {
+		if skip || zf.FileInfo().IsDir() {
 			continue
 		}
 		if clean == "theme.json" {
 			rootPrefix = ""
 			foundManifest = true
-			break
-		}
-		parts := strings.Split(clean, "/")
-		if len(parts) == 2 && parts[1] == "theme.json" {
-			rootPrefix = parts[0] + "/"
-			foundManifest = true
-			break
+		} else if !foundManifest {
+			parts := strings.Split(clean, "/")
+			if len(parts) == 2 && parts[1] == "theme.json" {
+				rootPrefix = parts[0] + "/"
+				foundManifest = true
+			}
 		}
 	}
 	if !foundManifest {
@@ -81,15 +146,20 @@ func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest
 
 	var totalExtracted int64
 	for _, zf := range zr.File {
-		mode := zf.Mode()
-		if mode&os.ModeSymlink != 0 {
-			return Manifest{}, errors.New("theme: symbolic links are forbidden inside theme archive")
+		if err := ctx.Err(); err != nil {
+			return Manifest{}, err
 		}
-		clean := normalizeZipEntry(zf.Name)
-		if clean == "" || strings.HasPrefix(clean, "__MACOSX/") {
+		clean, skip, sErr := sanitizeThemeZipEntry(zf)
+		if sErr != nil {
+			return Manifest{}, sErr
+		}
+		if skip {
 			continue
 		}
 		if rootPrefix != "" {
+			if clean+"/" == rootPrefix {
+				continue
+			}
 			if !strings.HasPrefix(clean, rootPrefix) {
 				continue
 			}
@@ -165,31 +235,78 @@ func (e *Engine) InstallZip(r io.ReaderAt, size int64, overwrite bool) (Manifest
 	if id == DefaultThemeID {
 		return Manifest{}, fmt.Errorf("theme: %q is reserved for the built-in theme", DefaultThemeID)
 	}
+	if opts.expectedThemeID != "" && id != opts.expectedThemeID {
+		return Manifest{}, fmt.Errorf("theme: archive theme.json id %q does not match expected %q", id, opts.expectedThemeID)
+	}
+	if !e.effectiveOutboundDialer().AllowLoopbackForTests && mf.Update != nil && mf.Update.URL != "" {
+		if _, uErr := extpkg.ValidatePublicHTTPURL(mf.Update.URL, false); uErr != nil {
+			return Manifest{}, fmt.Errorf("theme %q: update.url: %w", id, uErr)
+		}
+	}
+	if !extpkg.IsHostCompatible(e.effectiveHostVersion(), mf.MinHostVersion) {
+		return Manifest{}, fmt.Errorf(
+			"theme %q v%s requires host Volo-go >= %s (current: %s)",
+			id, mf.Version, mf.MinHostVersion, e.effectiveHostVersion(),
+		)
+	}
+
+	// Final pre-commit cancellation gate before atomic directory swap.
+	if err := ctx.Err(); err != nil {
+		return Manifest{}, err
+	}
+
+	e.installMu.Lock()
+	defer e.installMu.Unlock()
+
+	existingMf, hasExisting := e.getManifest(id)
+	if opts.expectedPrevVersion != "" && (!hasExisting || existingMf.Version != opts.expectedPrevVersion) {
+		return Manifest{}, fmt.Errorf("theme %q version changed concurrently (expected %s, found %s)", id, opts.expectedPrevVersion, existingMf.Version)
+	}
+	if opts.disallowDowngrade && hasExisting && strings.TrimSpace(existingMf.Version) != "" {
+		if cmp, ok := extpkg.CompareSemVer(mf.Version, existingMf.Version); !ok || cmp <= 0 {
+			return Manifest{}, fmt.Errorf("theme %q downgrade or same-version install rejected (%s -> %s)", id, existingMf.Version, mf.Version)
+		}
+	}
 
 	finalDir := filepath.Join(e.themesDir, id)
+	backupDir := filepath.Join(e.themesDir, ".theme-old-"+id)
+	hadBackup := false
+
 	if _, statErr := os.Stat(finalDir); statErr == nil {
-		if !overwrite {
+		if !opts.overwrite {
 			return Manifest{}, fmt.Errorf("theme %q already exists", id)
 		}
-		backupDir := filepath.Join(e.themesDir, ".theme-old-"+id)
 		_ = os.RemoveAll(backupDir)
 		if err := os.Rename(finalDir, backupDir); err != nil {
 			return Manifest{}, fmt.Errorf("theme: prepare overwrite: %w", err)
 		}
+		hadBackup = true
 		if err := os.Rename(stageDir, finalDir); err != nil {
 			_ = os.Rename(backupDir, finalDir)
 			return Manifest{}, fmt.Errorf("theme: activate staged directory: %w", err)
 		}
-		_ = os.RemoveAll(backupDir)
 	} else {
 		if err := os.Rename(stageDir, finalDir); err != nil {
 			return Manifest{}, fmt.Errorf("theme: install directory: %w", err)
 		}
 	}
 
-	if err := e.Reload(); err != nil {
-		return Manifest{}, err
+	if err := e.reloadLocked(); err != nil {
+		_ = os.RemoveAll(finalDir)
+		if hadBackup {
+			if rErr := os.Rename(backupDir, finalDir); rErr != nil {
+				slog.Error("theme: failed to restore backup directory during rollback", "theme_id", id, "err", rErr)
+			}
+		}
+		_ = e.reloadLocked()
+		e.invalidateUpdateStatus(id)
+		return Manifest{}, fmt.Errorf("theme %q install/upgrade failed (safely rolled back): %w", id, err)
 	}
+
+	if hadBackup {
+		_ = os.RemoveAll(backupDir)
+	}
+	e.invalidateUpdateStatus(id)
 	return mf, nil
 }
 
@@ -205,6 +322,10 @@ func (e *Engine) Uninstall(themeID string) error {
 	if strings.TrimSpace(e.themesDir) == "" {
 		return errors.New("theme: external themes directory is not configured")
 	}
+
+	e.installMu.Lock()
+	defer e.installMu.Unlock()
+
 	target := filepath.Join(e.themesDir, id)
 	rel, err := filepath.Rel(e.themesDir, target)
 	if err != nil || strings.HasPrefix(rel, "..") || strings.ContainsRune(rel, filepath.Separator) {
@@ -216,19 +337,8 @@ func (e *Engine) Uninstall(themeID string) error {
 	if err := os.RemoveAll(target); err != nil {
 		return fmt.Errorf("theme: remove directory: %w", err)
 	}
-	return e.Reload()
-}
-
-func normalizeZipEntry(raw string) string {
-	slashed := strings.ReplaceAll(raw, `\`, "/")
-	if strings.HasPrefix(slashed, "/") || strings.Contains(slashed, "../") || strings.HasSuffix(slashed, "/..") || slashed == ".." {
-		return ""
-	}
-	cleaned := strings.TrimPrefix(path.Clean("/"+slashed), "/")
-	if cleaned == "." || cleaned == "" || strings.HasPrefix(cleaned, "..") {
-		return ""
-	}
-	return cleaned
+	e.invalidateUpdateStatus(id)
+	return e.reloadLocked()
 }
 
 // ensureStagedHomeFallbackAlias validates `templates/home.html` when `templates/index.html` is omitted
@@ -256,8 +366,42 @@ func ensureStagedHomeFallbackAlias(stageDir string) error {
 	return nil
 }
 
+type themeExportSource struct {
+	srcPath string
+	rawSize int64
+	isGzip  bool
+}
+
+func resolveExportTargetPath(p string) (relOut string, isGzip bool) {
+	for _, pair := range [][2]string{
+		{"assets_gz/", "assets/"},
+		{"templates_gz/", "templates/"},
+		{"locales_gz/", "locales/"},
+	} {
+		if strings.HasPrefix(p, pair[0]) && strings.HasSuffix(p, ".gz") {
+			return pair[1] + strings.TrimSuffix(strings.TrimPrefix(p, pair[0]), ".gz"), true
+		}
+	}
+	if strings.HasSuffix(p, ".gz") {
+		return strings.TrimSuffix(p, ".gz"), true
+	}
+	return p, false
+}
+
 // ExportZip streams the specified built-in or external theme package as a standard `.zip` archive.
 func (e *Engine) ExportZip(w io.Writer, themeID string) error {
+	return e.ExportZipContext(context.Background(), themeID, w)
+}
+
+// ExportZipContext streams the specified built-in or external theme package as a standard `.zip` archive
+// using a bounded 2-pass walk and pooled 32 KiB copy buffer without buffering file contents in RAM.
+func (e *Engine) ExportZipContext(ctx context.Context, themeID string, w io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	id := strings.TrimSpace(themeID)
 	if id == "" {
 		return errors.New("theme: missing theme id")
@@ -269,109 +413,159 @@ func (e *Engine) ExportZip(w io.Writer, themeID string) error {
 		return fmt.Errorf("theme %q not found", id)
 	}
 
-	entriesByPath := make(map[string][]byte)
+	sources := make(map[string]themeExportSource)
+	var rawSelectedBytes int64
 
+	// Pass 1: collect regular file relative paths + metadata and enforce entry count & byte bounds.
 	err := fs.WalkDir(th.fsys, ".", func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if d.IsDir() || p == "." {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if p == "." {
 			return nil
 		}
 		baseName := path.Base(p)
 		if strings.HasPrefix(baseName, ".") {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
-		for _, pair := range [][2]string{
-			{"assets_gz/", "assets/"},
-			{"templates_gz/", "templates/"},
-			{"locales_gz/", "locales/"},
-		} {
-			if strings.HasPrefix(p, pair[0]) && strings.HasSuffix(p, ".gz") {
-				relOut := pair[1] + strings.TrimSuffix(strings.TrimPrefix(p, pair[0]), ".gz")
-				if _, exists := entriesByPath[relOut]; exists {
-					return nil
-				}
-				data, rErr := fs.ReadFile(th.fsys, p)
-				if rErr != nil {
-					return rErr
-				}
-				inflated, gErr := inflateThemeGzip(data, p)
-				if gErr != nil {
-					return gErr
-				}
-				entriesByPath[relOut] = inflated
-				return nil
-			}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("theme: symbolic link %q cannot be exported", p)
 		}
-		if strings.HasSuffix(p, ".gz") {
-			relOut := strings.TrimSuffix(p, ".gz")
-			if _, exists := entriesByPath[relOut]; exists {
-				return nil
-			}
-			data, rErr := fs.ReadFile(th.fsys, p)
-			if rErr != nil {
-				return rErr
-			}
-			inflated, gErr := inflateThemeGzip(data, p)
-			if gErr != nil {
-				return gErr
-			}
-			entriesByPath[relOut] = inflated
+		if d.IsDir() {
 			return nil
 		}
-		data, rErr := fs.ReadFile(th.fsys, p)
-		if rErr != nil {
-			return rErr
+		info, iErr := d.Info()
+		if iErr != nil {
+			return iErr
 		}
-		entriesByPath[p] = data
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("theme: non-regular file %q cannot be exported", p)
+		}
+
+		relOut, isGzip := resolveExportTargetPath(p)
+		cleanOut, sErr := extpkg.SanitizeZipPath(relOut)
+		if sErr != nil {
+			return fmt.Errorf("theme: invalid export path %q: %w", relOut, sErr)
+		}
+		if !isGzip && info.Size() > maxThemeSingleBytes {
+			return fmt.Errorf("theme: entry %s exceeds %d bytes", cleanOut, maxThemeSingleBytes)
+		}
+
+		if prev, exists := sources[cleanOut]; exists {
+			if isGzip || !prev.isGzip {
+				return nil
+			}
+			rawSelectedBytes -= prev.rawSize
+		} else if len(sources) >= maxThemeExportEntries {
+			return fmt.Errorf("theme: export exceeds maximum %d file entries", maxThemeExportEntries)
+		}
+
+		rawSelectedBytes += info.Size()
+		if rawSelectedBytes > maxThemeTotalBytes {
+			return fmt.Errorf("theme: export exceeds %d MiB total limit", maxThemeTotalBytes>>20)
+		}
+		sources[cleanOut] = themeExportSource{
+			srcPath: p,
+			rawSize: info.Size(),
+			isGzip:  isGzip,
+		}
 		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("theme: walk %s: %w", id, err)
 	}
-	if len(entriesByPath) == 0 {
+	if len(sources) == 0 {
 		return fmt.Errorf("theme %q has no exportable files", id)
 	}
 
-	sortedKeys := make([]string, 0, len(entriesByPath))
-	for k := range entriesByPath {
+	sortedKeys := make([]string, 0, len(sources))
+	for k := range sources {
 		sortedKeys = append(sortedKeys, k)
 	}
 	sort.Strings(sortedKeys)
 
+	bufPtr := themeExportCopyBufPool.Get().(*[]byte)
+	defer themeExportCopyBufPool.Put(bufPtr)
+	copyBuf := *bufPtr
+
+	// Pass 2: stream each selected file into zip.Writer using the pooled 32 KiB buffer.
+	var totalUncompressed int64
 	zw := zip.NewWriter(w)
-	for _, k := range sortedKeys {
+	for _, relOut := range sortedKeys {
+		if err := ctx.Err(); err != nil {
+			_ = zw.Close()
+			return err
+		}
+		src := sources[relOut]
+		f, oErr := th.fsys.Open(src.srcPath)
+		if oErr != nil {
+			_ = zw.Close()
+			return oErr
+		}
+		st, sErr := f.Stat()
+		if sErr != nil {
+			_ = f.Close()
+			_ = zw.Close()
+			return sErr
+		}
+		if !st.Mode().IsRegular() {
+			_ = f.Close()
+			_ = zw.Close()
+			return fmt.Errorf("theme: non-regular file %q cannot be exported", src.srcPath)
+		}
+
+		var reader io.Reader = f
+		var gzReader *gzip.Reader
+		if src.isGzip {
+			gr, gErr := gzip.NewReader(f)
+			if gErr != nil {
+				_ = f.Close()
+				_ = zw.Close()
+				return fmt.Errorf("decompress %s: %w", src.srcPath, gErr)
+			}
+			gzReader = gr
+			reader = gr
+		}
+
 		hdr := &zip.FileHeader{
-			Name:   k,
+			Name:   relOut,
 			Method: zip.Deflate,
 		}
 		hdr.SetMode(0o644)
 		fw, cErr := zw.CreateHeader(hdr)
 		if cErr != nil {
+			if gzReader != nil {
+				_ = gzReader.Close()
+			}
+			_ = f.Close()
 			_ = zw.Close()
 			return cErr
 		}
-		if _, wErr := fw.Write(entriesByPath[k]); wErr != nil {
+
+		written, wErr := io.CopyBuffer(fw, io.LimitReader(reader, maxThemeSingleBytes+1), copyBuf)
+		if gzReader != nil {
+			_ = gzReader.Close()
+		}
+		_ = f.Close()
+		if wErr != nil {
 			_ = zw.Close()
-			return wErr
+			return fmt.Errorf("read %s: %w", src.srcPath, wErr)
+		}
+		if written > maxThemeSingleBytes {
+			_ = zw.Close()
+			return fmt.Errorf("theme entry %s exceeds %d bytes", src.srcPath, maxThemeSingleBytes)
+		}
+		totalUncompressed += written
+		if totalUncompressed > maxThemeTotalBytes {
+			_ = zw.Close()
+			return fmt.Errorf("theme export %s exceeds %d MiB uncompressed limit", id, maxThemeTotalBytes>>20)
 		}
 	}
 	return zw.Close()
-}
-
-func inflateThemeGzip(data []byte, entryPath string) ([]byte, error) {
-	gr, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("decompress %s: %w", entryPath, err)
-	}
-	inflated, rErr := io.ReadAll(io.LimitReader(gr, maxThemeSingleBytes+1))
-	_ = gr.Close()
-	if rErr != nil {
-		return nil, fmt.Errorf("read %s: %w", entryPath, rErr)
-	}
-	if len(inflated) > maxThemeSingleBytes {
-		return nil, fmt.Errorf("theme entry %s exceeds %d bytes", entryPath, maxThemeSingleBytes)
-	}
-	return inflated, nil
 }

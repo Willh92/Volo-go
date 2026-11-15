@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"strings"
 	"sync"
@@ -491,10 +492,6 @@ func (s *Service) CompleteStaff2FA(
 	if err != nil {
 		return nil, "", ErrTOTPInvalid
 	}
-	totpSecret, err := s.keyRing.OpenString(totpCred.SecretCiphertext, "cred:totp:"+u.ID)
-	if err != nil || totpSecret == "" {
-		return nil, "", ErrTOTPInvalid
-	}
 
 	winSteps := 1
 	rememberDays := 7
@@ -512,12 +509,18 @@ func (s *Service) CompleteStaff2FA(
 
 	now := time.Now()
 	verified := false
-	if vErr := VerifyTOTPCode(u.ID, totpSecret, codeOrRecovery, now, winSteps, s.replayGuard); vErr == nil {
-		verified = true
-		_, _ = s.store.ExecContext(ctx, `UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now.UnixMilli(), totpCred.ID)
-	} else if errors.Is(vErr, ErrTOTPReplay) {
-		return nil, "", vErr
+	totpSecret, decErr := s.keyRing.OpenString(totpCred.SecretCiphertext, "cred:totp:"+u.ID)
+	if decErr != nil || totpSecret == "" {
+		slog.Warn("totp secret decryption failed (possible VOLO_SECRET_KEY mismatch); falling back to recovery code check", "user_id", u.ID)
 	} else {
+		if vErr := VerifyTOTPCode(u.ID, totpSecret, codeOrRecovery, now, winSteps, s.replayGuard); vErr == nil {
+			verified = true
+			_, _ = s.store.ExecContext(ctx, `UPDATE user_credentials SET last_used_at = ? WHERE id = ?`, now.UnixMilli(), totpCred.ID)
+		} else if errors.Is(vErr, ErrTOTPReplay) {
+			return nil, "", vErr
+		}
+	}
+	if !verified {
 		// Attempt single-use Recovery Code consumption inside a transaction
 		consumed := false
 		_ = s.store.WithTx(ctx, func(tx *sqlx.Tx) error {

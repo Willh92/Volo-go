@@ -378,7 +378,9 @@ html[data-theme="dark"] .volo-kbn-dock.solo-kanbanniang.has-bg {
   0%, 100% { transform: translate(0, 0) rotate(0); }
 }
 
-/* Auto-hide during Fullscreen Overlays / Lightboxes / Search Modals / Drawers / Composers */
+/* Auto-hide during Book Reader / Fullscreen Overlays / Lightboxes / Search Modals / Drawers / Composers */
+html:has([data-book-reader]) .solo-kanbanniang,
+body:has([data-book-reader]) .solo-kanbanniang,
 html:has(.lightbox-overlay.is-open) .solo-kanbanniang,
 html:has(#volo-lightbox.is-open) .solo-kanbanniang,
 html:has([data-search-modal]:not([hidden])) .solo-kanbanniang,
@@ -387,13 +389,138 @@ html:has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang,
 html:has(.studio-reader-drawer.is-open) .solo-kanbanniang,
 html:has(.volo-comment-composer.is-open) .solo-kanbanniang,
 html:has(dialog[open]) .solo-kanbanniang,
-body.modal-open .solo-kanbanniang {
+body.modal-open .solo-kanbanniang,
+html:has([data-book-reader]) .solo-kanbanniang-summon,
+body:has([data-book-reader]) .solo-kanbanniang-summon,
+html:has(.lightbox-overlay.is-open) .solo-kanbanniang-summon,
+html:has(#volo-lightbox.is-open) .solo-kanbanniang-summon,
+html:has([data-search-modal]:not([hidden])) .solo-kanbanniang-summon,
+html:has(#volo-search-modal:not([hidden])) .solo-kanbanniang-summon,
+html:has(#volo-toc-drawer:not([hidden])) .solo-kanbanniang-summon,
+html:has(.studio-reader-drawer.is-open) .solo-kanbanniang-summon,
+html:has(.volo-comment-composer.is-open) .solo-kanbanniang-summon,
+html:has(dialog[open]) .solo-kanbanniang-summon,
+body.modal-open .solo-kanbanniang-summon {
   visibility: hidden;
   pointer-events: none;
 }
 
+/* Compact Corner Restore Pill (.solo-kanbanniang-summon) */
+.solo-kanbanniang-summon {
+  appearance: none;
+  position: fixed;
+  bottom: max(16px, calc(env(safe-area-inset-bottom, 0px) + 12px));
+  left: 16px;
+  right: auto;
+  z-index: 42;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-inline-size: 32px;
+  min-block-size: 30px;
+  padding: 5px 12px;
+  margin: 0;
+  border-radius: 999px;
+  border: 1px solid var(--volo-line, rgba(0, 0, 0, 0.14));
+  background: var(--volo-surface, rgba(255, 255, 255, 0.92));
+  background: color-mix(in srgb, var(--volo-surface, #ffffff) 90%, transparent);
+  color: var(--volo-muted, #52665a);
+  box-shadow: var(--volo-shadow, 0 2px 10px rgba(0, 0, 0, 0.1));
+  font-family: var(--volo-font-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+  transition: color 0.16s ease, border-color 0.16s ease, background-color 0.16s ease, transform 0.14s ease;
+}
+
+.solo-kanbanniang-summon::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--volo-accent, #256751);
+  opacity: 0.85;
+  flex-shrink: 0;
+}
+
+.solo-kanbanniang-summon:hover,
+.solo-kanbanniang-summon:focus-visible {
+  color: var(--volo-accent, #256751);
+  border-color: var(--volo-accent, #256751);
+  background: var(--volo-raised, #f0f5f1);
+}
+
+.solo-kanbanniang-summon:focus-visible {
+  outline: 2px solid var(--volo-accent, #256751);
+  outline-offset: 2px;
+}
+
+.solo-kanbanniang-summon:active {
+  transform: scale(0.96);
+}
+
+.solo-kanbanniang-summon[hidden] {
+  display: none !important;
+}
+
+.solo-kanbanniang-summon[data-position="right"],
+.solo-kanbanniang-summon.volo-kbn-right {
+  right: 16px;
+  left: auto;
+  bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + 104px);
+}
+
+#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .solo-kanbanniang-summon[data-position="left"],
+html[data-podcast-open="1"] .solo-kanbanniang-summon[data-position="left"],
+body.has-podcast-mini .solo-kanbanniang-summon[data-position="left"] {
+  bottom: calc(92px + env(safe-area-inset-bottom, 0px));
+}
+
+#volo-persist-dock:has(#volo-podcast-mini:not([hidden])) .solo-kanbanniang-summon[data-position="right"],
+html[data-podcast-open="1"] .solo-kanbanniang-summon[data-position="right"],
+body.has-podcast-mini .solo-kanbanniang-summon[data-position="right"] {
+  bottom: calc(192px + env(safe-area-inset-bottom, 0px));
+}
+
+@media (max-width: 900px) {
+  body:has(.book-mobile-toc-fab:not([hidden])) .solo-kanbanniang-summon[data-position="left"],
+  .solo-kanbanniang-summon.is-book-fab-offset:not([data-position="right"]) {
+    bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+@media (pointer: coarse) {
+  .solo-kanbanniang-summon {
+    min-inline-size: 40px;
+    min-block-size: 36px;
+    padding: 7px 14px;
+  }
+}
+
+html[data-theme="dark"] .solo-kanbanniang-summon {
+  background: rgba(34, 40, 42, 0.88);
+  background: color-mix(in srgb, var(--volo-raised, #242b2d) 88%, transparent);
+  border-color: var(--volo-line, rgba(255, 255, 255, 0.16));
+  color: var(--volo-text, #dce5df);
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) .solo-kanbanniang-summon {
+    background: rgba(34, 40, 42, 0.88);
+    background: color-mix(in srgb, var(--volo-raised, #242b2d) 88%, transparent);
+    border-color: var(--volo-line, rgba(255, 255, 255, 0.16));
+    color: var(--volo-text, #dce5df);
+  }
+}
+
 @media (max-width: 800px) {
-  .solo-kanbanniang.volo-kbn-hide-mobile {
+  .solo-kanbanniang.volo-kbn-hide-mobile,
+  .solo-kanbanniang-summon.volo-kbn-hide-mobile {
     display: none !important;
   }
 }
@@ -402,13 +529,18 @@ body.modal-open .solo-kanbanniang {
   .solo-kanbanniang {
     background-image: none !important;
   }
-  .solo-kanbanniang__tool button:active {
+  .solo-kanbanniang__tool button:active,
+  .solo-kanbanniang-summon:active {
     transform: none;
+  }
+  .solo-kanbanniang-summon {
+    transition: none;
   }
 }
 
 @media print {
-  .solo-kanbanniang {
+  .solo-kanbanniang,
+  .solo-kanbanniang-summon {
     display: none !important;
   }
 }

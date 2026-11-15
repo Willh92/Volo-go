@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -728,6 +729,35 @@ func ImportSourceDatabase(
 	return rep, insp, nil
 }
 
+type importDataDirCtxKey struct{}
+
+// WithDataDir attaches the workspace DataDir to ctx so temporary migration spools stay inside DataDir instead of /tmp.
+func WithDataDir(ctx context.Context, dataDir string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, importDataDirCtxKey{}, strings.TrimSpace(dataDir))
+}
+
+func resolveSpoolDataDir(ctx context.Context, opts ImportOptions) string {
+	if ctx != nil {
+		if v, ok := ctx.Value(importDataDirCtxKey{}).(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	if up := strings.TrimSpace(opts.TargetUploadDir); up != "" {
+		cleanUp := filepath.Clean(up)
+		if strings.EqualFold(filepath.Base(cleanUp), "uploads") {
+			parent := filepath.Dir(cleanUp)
+			if parent != "" && parent != "." {
+				return parent
+			}
+		}
+		return cleanUp
+	}
+	return ""
+}
+
 func migrateNativeVoloDatabase(
 	ctx context.Context,
 	sourceStore *sqlx.Store,
@@ -736,7 +766,16 @@ func migrateNativeVoloDatabase(
 	insp *SourceDBInspection,
 	opts ImportOptions,
 ) (*ImportReport, error) {
-	spoolZip, err := os.CreateTemp("", "volo-native-db-migrate-*.zip")
+	tempDir := resolveSpoolDataDir(ctx, opts)
+	if tempDir != "" {
+		tmpSub := filepath.Join(tempDir, ".tmp")
+		if err := os.MkdirAll(tmpSub, 0o750); err == nil {
+			tempDir = tmpSub
+		} else if err := os.MkdirAll(tempDir, 0o750); err != nil {
+			tempDir = ""
+		}
+	}
+	spoolZip, err := os.CreateTemp(tempDir, "volo-native-db-migrate-*.zip")
 	if err != nil {
 		return nil, fmt.Errorf("etl: create temporary backup spool: %w", err)
 	}
@@ -881,12 +920,16 @@ func applyPostNativeMigrationOverrides(
 
 	newBase := strings.TrimRight(strings.TrimSpace(opts.NewSiteURL), "/")
 	if newBase != "" && len(opts.OldURLPrefixes) > 0 {
+		likeEsc := `ESCAPE '\'`
+		if targetStore.Dialect() != nil && targetStore.Dialect().Name() == "mysql" {
+			likeEsc = `ESCAPE '\\'`
+		}
 		sqlRewrites := []string{
-			`UPDATE articles SET content_md = REPLACE(content_md, ?, ?), summary_md = REPLACE(summary_md, ?, ?), cover_url = REPLACE(cover_url, ?, ?), audio_url = REPLACE(audio_url, ?, ?) WHERE content_md LIKE ? OR summary_md LIKE ? OR cover_url LIKE ? OR audio_url LIKE ?`,
-			`UPDATE pages SET content_md = REPLACE(content_md, ?, ?) WHERE content_md LIKE ?`,
-			`UPDATE comments SET content_md = REPLACE(content_md, ?, ?), author_url = REPLACE(author_url, ?, ?), avatar_url = REPLACE(avatar_url, ?, ?) WHERE content_md LIKE ? OR author_url LIKE ? OR avatar_url LIKE ?`,
-			`UPDATE links SET url = REPLACE(url, ?, ?), icon_url = REPLACE(icon_url, ?, ?) WHERE url LIKE ? OR icon_url LIKE ?`,
-			`UPDATE follows SET site_url = REPLACE(site_url, ?, ?), feed_url = REPLACE(feed_url, ?, ?), icon_url = REPLACE(icon_url, ?, ?) WHERE site_url LIKE ? OR feed_url LIKE ? OR icon_url LIKE ?`,
+			`UPDATE articles SET content_md = REPLACE(content_md, ?, ?), summary_md = REPLACE(summary_md, ?, ?), cover_url = REPLACE(cover_url, ?, ?), audio_url = REPLACE(audio_url, ?, ?) WHERE content_md LIKE ? ` + likeEsc + ` OR summary_md LIKE ? ` + likeEsc + ` OR cover_url LIKE ? ` + likeEsc + ` OR audio_url LIKE ? ` + likeEsc,
+			`UPDATE pages SET content_md = REPLACE(content_md, ?, ?) WHERE content_md LIKE ? ` + likeEsc,
+			`UPDATE comments SET content_md = REPLACE(content_md, ?, ?), author_url = REPLACE(author_url, ?, ?), avatar_url = REPLACE(avatar_url, ?, ?) WHERE content_md LIKE ? ` + likeEsc + ` OR author_url LIKE ? ` + likeEsc + ` OR avatar_url LIKE ? ` + likeEsc,
+			`UPDATE links SET url = REPLACE(url, ?, ?), icon_url = REPLACE(icon_url, ?, ?) WHERE url LIKE ? ` + likeEsc + ` OR icon_url LIKE ? ` + likeEsc,
+			`UPDATE follows SET site_url = REPLACE(site_url, ?, ?), feed_url = REPLACE(feed_url, ?, ?), icon_url = REPLACE(icon_url, ?, ?) WHERE site_url LIKE ? ` + likeEsc + ` OR feed_url LIKE ? ` + likeEsc + ` OR icon_url LIKE ? ` + likeEsc,
 		}
 		var rewrittenRows int64
 		for _, rawOld := range opts.OldURLPrefixes {
@@ -894,7 +937,7 @@ func applyPostNativeMigrationOverrides(
 			if oldPfx == "" || oldPfx == newBase {
 				continue
 			}
-			pat := "%" + strings.NewReplacer("%", "\\%", "_", "\\_").Replace(oldPfx) + "%"
+			pat := "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(oldPfx) + "%"
 			if res, rErr := targetStore.ExecContext(ctx, sqlRewrites[0], oldPfx, newBase, oldPfx, newBase, oldPfx, newBase, oldPfx, newBase, pat, pat, pat, pat); rErr == nil {
 				if n, _ := res.RowsAffected(); n > 0 {
 					rewrittenRows += n
@@ -933,30 +976,108 @@ func applyPostNativeMigrationOverrides(
 		return nil
 	}
 
-	var admins []domain.User
-	err := sqlx.SelectInto(ctx, targetStore, &admins,
-		`SELECT * FROM users WHERE role = ? ORDER BY created_at ASC LIMIT 1`, domain.RoleAdmin)
-	if err != nil || len(admins) == 0 {
-		return err
+	return targetStore.WithTx(ctx, func(tx *sqlx.Tx) error {
+		var admins []domain.User
+		if err := sqlx.SelectInto(ctx, tx, &admins,
+			`SELECT * FROM users WHERE role = ? ORDER BY created_at ASC LIMIT 1`, domain.RoleAdmin); err != nil || len(admins) == 0 {
+			return err
+		}
+		admin := admins[0]
+		if u := truncRunes(strings.TrimSpace(opts.AdminUsername), 64); u != "" {
+			admin.Username = u
+		}
+		if em := truncRunes(strings.ToLower(strings.TrimSpace(opts.AdminEmail)), 190); em != "" {
+			admin.Email = em
+		}
+		if dn := truncRunes(strings.TrimSpace(opts.AdminDisplayName), 128); dn != "" {
+			admin.DisplayName = dn
+		}
+		overridePass := strings.TrimSpace(opts.AdminPasswordHash) != ""
+		if ph := strings.TrimSpace(opts.AdminPasswordHash); ph != "" {
+			admin.PasswordHash = ph
+			admin.LegacyHash = ""
+			admin.Status = domain.UserStatusActive
+		}
+		nowMS := time.Now().UnixMilli()
+		admin.UpdatedAt = nowMS
+
+		// Deduplicate colliding username/email on other user rows before overriding the primary admin.
+		if admin.Username != "" {
+			var collidingUsers []domain.User
+			if err := sqlx.SelectInto(ctx, tx, &collidingUsers,
+				`SELECT * FROM users WHERE id <> ? AND LOWER(username) = LOWER(?)`,
+				admin.ID, admin.Username); err != nil {
+				return err
+			}
+			for _, cu := range collidingUsers {
+				sfx := shortDedupSuffix(cu.ID)
+				dedupName := truncRunes(cu.Username, 46) + "-migrated-" + sfx
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE users SET username = ?, updated_at = ? WHERE id = ?`,
+					dedupName, nowMS, cu.ID); err != nil {
+					return err
+				}
+			}
+		}
+		if admin.Email != "" {
+			var collidingEmails []domain.User
+			if err := sqlx.SelectInto(ctx, tx, &collidingEmails,
+				`SELECT * FROM users WHERE id <> ? AND email <> '' AND LOWER(email) = LOWER(?)`,
+				admin.ID, admin.Email); err != nil {
+				return err
+			}
+			for _, cu := range collidingEmails {
+				sfx := shortDedupSuffix(cu.ID)
+				dedupEmail := dedupEmailAddress(cu.Email, sfx)
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE users SET email = ?, updated_at = ? WHERE id = ?`,
+					dedupEmail, nowMS, cu.ID); err != nil {
+					return err
+				}
+			}
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE users SET username = ?, email = ?, display_name = ?, password_hash = ?, legacy_hash = ?, status = ?, updated_at = ? WHERE id = ?`,
+			admin.Username, admin.Email, admin.DisplayName, admin.PasswordHash, admin.LegacyHash, admin.Status, admin.UpdatedAt, admin.ID); err != nil {
+			return err
+		}
+		if overridePass {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM user_credentials WHERE user_id = ? AND kind IN ('totp', 'recovery_codes')`,
+				admin.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func shortDedupSuffix(rawID string) string {
+	clean := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return -1
+	}, rawID)
+	if len(clean) > 8 {
+		clean = clean[len(clean)-8:]
 	}
-	admin := admins[0]
-	if u := truncRunes(strings.TrimSpace(opts.AdminUsername), 64); u != "" {
-		admin.Username = u
+	if clean == "" {
+		clean = "dup"
 	}
-	if em := truncRunes(strings.ToLower(strings.TrimSpace(opts.AdminEmail)), 190); em != "" {
-		admin.Email = em
+	return clean
+}
+
+func dedupEmailAddress(email string, suffix string) string {
+	at := strings.LastIndexByte(email, '@')
+	if at <= 0 || at >= len(email)-1 {
+		return truncRunes(email, 160) + ".migrated." + suffix + "@invalid.local"
 	}
-	if dn := truncRunes(strings.TrimSpace(opts.AdminDisplayName), 128); dn != "" {
-		admin.DisplayName = dn
-	}
-	if ph := strings.TrimSpace(opts.AdminPasswordHash); ph != "" {
-		admin.PasswordHash = ph
-		admin.LegacyHash = ""
-		admin.Status = domain.UserStatusActive
-	}
-	admin.UpdatedAt = time.Now().UnixMilli()
-	_, err = targetStore.ExecContext(ctx,
-		`UPDATE users SET username = ?, email = ?, display_name = ?, password_hash = ?, legacy_hash = ?, status = ?, updated_at = ? WHERE id = ?`,
-		admin.Username, admin.Email, admin.DisplayName, admin.PasswordHash, admin.LegacyHash, admin.Status, admin.UpdatedAt, admin.ID)
-	return err
+	local := truncRunes(email[:at], 80)
+	dom := truncRunes(email[at+1:], 90)
+	return local + "+migrated-" + suffix + "@" + dom
 }

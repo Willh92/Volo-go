@@ -238,3 +238,187 @@ func TestDoctorGeoIPSmartInspectionAndCustomSecurityDir(t *testing.T) {
 		t.Fatalf("expected files summary to report active City and ignored ASN DB, got %q", geoReadyCheck.Params["files"])
 	}
 }
+
+func TestDoctorReadOnlyZeroSideEffectsAndAll8SecretStores(t *testing.T) {
+	ctx := context.Background()
+	emptyRoot := t.TempDir()
+	uninitDataDir := filepath.Join(emptyRoot, "data")
+	uninitUploadDir := filepath.Join(emptyRoot, "uploads")
+	uninitBackupDir := filepath.Join(emptyRoot, "backups")
+
+	cfgRO, err := config.LoadForDoctorWithEnviron(config.CLIOverrides{
+		EnvFile:   filepath.Join(emptyRoot, "missing.env"),
+		DataDir:   &uninitDataDir,
+		UploadDir: &uninitUploadDir,
+		BackupDir: &uninitBackupDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf("LoadForDoctorWithEnviron: %v", err)
+	}
+	repRO := Run(ctx, cfgRO, nil)
+	if !repRO.Healthy {
+		t.Fatalf("expected uninitialized read-only doctor report to remain non-fatal (warn only): %+v", repRO.Checks)
+	}
+	for _, p := range []string{uninitDataDir, uninitUploadDir, uninitBackupDir, filepath.Join(uninitDataDir, ".secret.key"), filepath.Join(uninitDataDir, "volo.db")} {
+		if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+			t.Fatalf("doctor must be 100%% read-only; unexpected path created: %s (err=%v)", p, statErr)
+		}
+	}
+
+	// Verify SQLite non-WAL (:memory: -> journal_mode=memory) emits db_sqlite_not_wal
+	memStore, err := sqlx.Open(ctx, sqlx.Options{Driver: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatalf("open memory sqlite: %v", err)
+	}
+	defer memStore.Close()
+	if err := migrate.Up(ctx, memStore); err != nil {
+		t.Fatalf("migrate memory sqlite: %v", err)
+	}
+	keyA := strings.Repeat("a", 32)
+	workRoot := t.TempDir()
+	workData := filepath.Join(workRoot, "data")
+	cfgA, err := config.LoadWithEnviron(config.CLIOverrides{
+		EnvFile:   filepath.Join(workRoot, "missing.env"),
+		DataDir:   &workData,
+		SecretKey: &keyA,
+	}, nil)
+	if err != nil {
+		t.Fatalf("load cfgA: %v", err)
+	}
+	repMem := Run(ctx, cfgA, memStore)
+	foundNotWAL := false
+	for _, c := range repMem.Checks {
+		if c.Name == "database" && c.Status == StatusWarn && c.Code == "db_sqlite_not_wal" {
+			foundNotWAL = true
+		}
+	}
+	if !foundNotWAL {
+		t.Fatalf("expected db_sqlite_not_wal warning on :memory: sqlite, got %+v", repMem.Checks)
+	}
+
+	// Populate ALL 8 encrypted stores under KeyA, verify StatusOK under KeyA, and verify each triggers secret_mismatch_warn under KeyB
+	keyB := strings.Repeat("b", 32)
+	cfgB, err := config.LoadForDoctorWithEnviron(config.CLIOverrides{
+		EnvFile:   filepath.Join(workRoot, "missing.env"),
+		DataDir:   &workData,
+		SecretKey: &keyB,
+	}, nil)
+	if err != nil {
+		t.Fatalf("load cfgB: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	checkMismatch := func(label string, setup func(), cleanup func()) {
+		t.Helper()
+		setup()
+		defer cleanup()
+
+		repOK := Run(ctx, cfgA, memStore)
+		for _, c := range repOK.Checks {
+			if c.Name == "secret_key" && c.Status != StatusOK {
+				t.Fatalf("[%s] expected secret_key OK under KeyA, got %+v", label, c)
+			}
+		}
+		repMismatch := Run(ctx, cfgB, memStore)
+		matched := false
+		for _, c := range repMismatch.Checks {
+			if c.Name == "secret_key" && c.Status == StatusWarn && c.Code == "secret_mismatch_warn" {
+				matched = true
+			}
+		}
+		if !matched {
+			t.Fatalf("[%s] expected secret_mismatch_warn under KeyB, got %+v", label, repMismatch.Checks)
+		}
+	}
+
+	// 1. data/db.json
+	checkMismatch("db.json", func() {
+		if err := config.SaveWizardDBConfig(workData, cfgA.KeyRing, config.WizardDBSelection{Driver: "sqlite", DSN: filepath.Join(workData, "volo.db")}); err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_ = os.Remove(filepath.Join(workData, "db.json"))
+	})
+
+	// 2. settings.secret_ciphertext
+	checkMismatch("settings.secret", func() {
+		ct, _ := cfgA.KeyRing.SealString("smtp-pass", "settings:notifications")
+		_, err := memStore.ExecContext(ctx, `INSERT INTO settings (domain, value_json, secret_ciphertext, version, updated_at) VALUES ('notifications', '{}', ?, 1, ?)`, ct, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_, _ = memStore.ExecContext(ctx, `DELETE FROM settings WHERE domain = 'notifications'`)
+	})
+
+	// 3. user_credentials (kind='totp')
+	_, err = memStore.ExecContext(ctx, `INSERT INTO users (id, username, email, display_name, avatar_url, bio, website_url, role, password_hash, legacy_hash, status, email_verified_at, preferred_locale, created_at, updated_at) VALUES ('u-doc', 'docadmin', 'doc@example.com', 'Doc', '', '', '', 'admin', 'h', '', 'active', ?, 'zh-CN', ?, ?)`, now, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkMismatch("user_credentials.totp", func() {
+		ct, _ := cfgA.KeyRing.SealString("JBSWY3DPEHPK3PXP", "cred:totp:u-doc")
+		_, err := memStore.ExecContext(ctx, `INSERT INTO user_credentials (id, user_id, kind, name, credential_id, secret_ciphertext, public_key_spki, cose_alg, sign_count, meta_json, created_at, last_used_at) VALUES ('c1', 'u-doc', 'totp', 'TOTP', 'totp:u-doc', ?, '', 0, 0, '{}', ?, 0)`, ct, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_, _ = memStore.ExecContext(ctx, `DELETE FROM user_credentials WHERE id = 'c1'`)
+	})
+
+	// 4. plugins.secret_ciphertext
+	checkMismatch("plugins.secret", func() {
+		ct, _ := cfgA.KeyRing.SecretBox().Seal(`{"api_key":"secret"}`)
+		_, err := memStore.ExecContext(ctx, `INSERT INTO plugins (id, kind, version, is_enabled, config_json, secret_ciphertext, circuit_state, failure_count, last_error, installed_at, updated_at) VALUES ('p1', 'external', '1.0.0', 1, '{}', ?, 'closed', 0, '', ?, ?)`, ct, now, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_, _ = memStore.ExecContext(ctx, `DELETE FROM plugins WHERE id = 'p1'`)
+	})
+
+	// 5. webhooks.secret_ciphertext
+	checkMismatch("webhooks.secret", func() {
+		ct, _ := cfgA.KeyRing.SealString("wh-sec", config.WebhookSecretAAD("w1"))
+		_, err := memStore.ExecContext(ctx, `INSERT INTO webhooks (id, name, provider, url, chat_id, events_json, secret_ciphertext, is_enabled, last_status_code, last_error, last_triggered_at, created_at, updated_at) VALUES ('w1', 'WH', 'custom', 'https://example.com/hook', '', '["*"]', ?, 1, 0, '', 0, ?, ?)`, ct, now, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_, _ = memStore.ExecContext(ctx, `DELETE FROM webhooks WHERE id = 'w1'`)
+	})
+
+	// 6. articles.password_ciphertext
+	checkMismatch("articles.password", func() {
+		ct, _ := cfgA.KeyRing.SealString("art-pass", config.ArticlePasswordAAD("a1"))
+		_, err := memStore.ExecContext(ctx, `INSERT INTO articles (id, author_id, category_id, title, slug, legacy_permalink, summary_md, content_md, cover_url, status, published_at, scheduled_at, is_pinned, allow_comment, password_ciphertext, has_content_lock, audio_url, audio_duration_sec, audio_size_bytes, audio_mime, lang, translation_group, license_override, word_count, reading_minutes, view_count, comment_count, created_at, updated_at) VALUES ('a1', 'u-doc', '', 'Protected', 'protected', '', '', 'body', '', 'published', ?, 0, 0, 1, ?, 0, '', 0, 0, '', 'zh-CN', '', '', 1, 1, 0, 0, ?, ?)`, now, ct, now, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_, _ = memStore.ExecContext(ctx, `DELETE FROM articles WHERE id = 'a1'`)
+	})
+
+	// 7. comments.notify_email_ciphertext
+	checkMismatch("comments.notify_email", func() {
+		ct, _ := cfgA.KeyRing.SealString("reader@example.com", config.CommentNotifyEmailAAD("cm1"))
+		_, err := memStore.ExecContext(ctx, `INSERT INTO comments (id, target_type, target_id, parent_id, reply_to_name, user_id, guest_id_hash, env_fp_hash, author_name, author_url, avatar_url, notify_email_ciphertext, notify_locale, client_ip, ip_masked, geo_region, content_md, status, is_deleted, created_at, updated_at) VALUES ('cm1', 'page', 'about', '', '', '', '', '', 'Reader', '', '', ?, 'zh-CN', '', '', '', 'hi', 'approved', 0, ?, ?)`, ct, now, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_, _ = memStore.ExecContext(ctx, `DELETE FROM comments WHERE id = 'cm1'`)
+	})
+
+	// 8. settings(appearance).value_json -> theme_configs[themeID][key] ("enc:v1:...")
+	checkMismatch("appearance.theme_configs", func() {
+		ct, _ := cfgA.KeyRing.SealString("theme-token", "theme.config:volo-studio:analytics_token")
+		valJSON := `{"active_theme":"volo-studio","theme_configs":{"volo-studio":{"analytics_token":"` + ct + `"}}}`
+		_, err := memStore.ExecContext(ctx, `INSERT INTO settings (domain, value_json, secret_ciphertext, version, updated_at) VALUES ('appearance', ?, '', 1, ?)`, valJSON, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}, func() {
+		_, _ = memStore.ExecContext(ctx, `DELETE FROM settings WHERE domain = 'appearance'`)
+	})
+}
